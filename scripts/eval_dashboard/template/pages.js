@@ -1107,8 +1107,8 @@ function runDoHtml(text) {
 function whatToDoHtml(run) {
   const items = [];
   if (run.verdict === "not_evaluated") {
-    // The suite's own verdict: the lost cases are listed under "Not graded"
-    // above, and the gate found nothing against the change.
+    // The suite's own verdict: every case it named is listed under "Not
+    // graded" above (runHtml), and the gate found nothing against the change.
     items.push(runDoHtml(run.do || "Retest once the environment is healthy."));
     items.push("<li>Prow reports the run red because the suite could certify nothing, not because a check failed; there is no absolute-check failure to look for in the build log.</li>");
   }
@@ -1143,14 +1143,22 @@ function runHtml(link) {
   const failed = cases.filter((c) => c.admitted && c.outcome === "failed");
   const order = { "only-this-pr": 0, null: 1, storm: 2, shared: 3 };
   failed.sort((a, b) => (order[a.cls] ?? 1) - (order[b.cls] ?? 1));
-  const lost = cases.filter((c) => c.admitted && c.outcome === "infra");
+  // The suite's not-evaluated verdict names the lost cases on the branch's
+  // roster; the dashboard's can be older and hold one of them out, and the
+  // headline and the lede name it either way, so the list does too (with
+  // the held-out tag). A named case this run has no record of (the log
+  // parsed no task for it) is listed by name under the same heading.
+  const suiteLost = new Set(run.verdict === "not_evaluated" && Array.isArray(run.not_evaluated) ? run.not_evaluated.map(String) : []);
+  const lost = cases.filter((c) => c.outcome === "infra" && (c.admitted || suiteLost.has(c.case)));
+  const lostUnrecorded = [...suiteLost].filter((name) => !cases.some((c) => c.case === name));
   const partial = cases.filter((c) => c.admitted && c.outcome === "partial");
   const passed = cases.filter((c) => c.admitted && c.outcome === "passed");
   const heldPassed = cases.filter((c) => !c.admitted && (c.outcome === "passed" || c.outcome === "partial"));
   const heldFailed = cases.filter((c) => !c.admitted && c.outcome === "failed");
   let body = "";
   if (failed.length) body += `<div class="sec"><h2>Failed gate cases · ${failed.length}</h2>${failed.map((c) => caseCard(run, c)).join("")}</div>`;
-  if (lost.length) body += `<div class="sec"><h2>Not graded · ${lost.length}</h2>${lost.map((c) => caseCard(run, c)).join("")}</div>`;
+  if (lost.length || lostUnrecorded.length) body += `<div class="sec"><h2>Not graded · ${lost.length + lostUnrecorded.length}</h2>${lost.map((c) => caseCard(run, c)).join("")}` +
+    (lostUnrecorded.length ? `<div class="passed">${lostUnrecorded.map((name) => `<span>${esc(name)}</span>`).join("")}</div><p class="mut small">Named by the suite's verdict; this run's log recorded no grading for ${lostUnrecorded.length === 1 ? "it" : "them"}.</p>` : "") + "</div>";
   if (partial.length) body += `<div class="sec"><h2>Passed on retry · ${partial.length}</h2><div class="passed">${partial.map((c) => `<span>${esc(c.case)}</span>`).join("")}</div><p class="mut small">Some repetitions failed; the gate counts a case as failed only when every graded repetition fails.</p></div>`;
   if (passed.length || heldPassed.length) body += `<div class="sec"><h2>Passed · ${passed.length + heldPassed.length}</h2><div class="passed">${passed.map((c) => `<span>${esc(c.case)}</span>`).join("")}${heldPassed.length ? `<span class="held">+${heldPassed.length} held out</span>` : ""}</div></div>`;
   if (heldFailed.length) body += `<div class="sec"><h2>Held out · failed · ${heldFailed.length}</h2><div class="passed">${heldFailed.map((c) => `<span class="held">${esc(c.case)}</span>`).join("")}</div><p class="mut small">Held-out cases are measured but never block a PR.</p></div>`;

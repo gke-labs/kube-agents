@@ -1411,6 +1411,39 @@ class BrowserTest(unittest.TestCase):
         self.assertNotIn("no cases recorded", row.group(0))
         app = dom_text(out / "run.html", query=f"build={NOT_EVALUATED_BUILD}")
         self.assertIn("Not evaluated: 1 gate case lost every repetition to infrastructure.", app)
+        # No task was parsed, so there is no card; the case the suite named
+        # is still listed under the heading the lede and "What to do" point at.
+        self.assertIn("Not graded · 1", app)
+        self.assertIn("security-overgrant-probe", app)
+        self.assertIn("recorded no grading for it", app)
+
+    def test_a_lost_case_the_dashboards_roster_holds_out_is_still_listed_as_not_graded(self):
+        # The suite's roster is the branch's; the dashboard's checkout can be
+        # older and not yet admit a case the branch lost every repetition
+        # of. The headline, the lede and the Brief row count it from the
+        # suite's list, so the run page lists it too, with the held-out tag,
+        # instead of showing the author nothing under "Not graded".
+        data = copy.deepcopy(self.data)
+        renamed = "security-overgrant-probe-next"
+        self.assertNotIn(renamed, ROSTER_AT_SPLIT)
+        for run in data["runs"]:
+            if str(run.get("build_id")) == NOT_EVALUATED_BUILD:
+                run["not_evaluated"] = [renamed]
+                for task in run["tasks"]:
+                    if task["name"] == "security-overgrant-probe":
+                        task["name"] = renamed
+        out = render_to(pathlib.Path(self.tmp.name) / "noteval-heldout", data, health=health_doc())
+        app = dom_text(out / "run.html", query=f"build={NOT_EVALUATED_BUILD}")
+        self.assertIn("Not evaluated: 1 gate case lost every repetition to infrastructure.", app)
+        self.assertIn(f"Nothing was graded for {renamed}", app)
+        self.assertIn("Not graded · 1", app)
+        card = re.search(r'<div class="case">.*?</div></div>', app, re.S)
+        self.assertIsNotNone(card, app[:400])
+        self.assertIn(renamed, card.group(0))
+        self.assertIn('class="tag held"', card.group(0))
+        self.assertNotIn("recorded no grading", app, "the run has the case's record; the card is it")
+        index = dom_text(out / "index.html")
+        self.assertIn("not evaluated · 1 case lost", index)
 
     def test_pr_view_unknown_build(self):
         app = dom_text(self.run_page, query="build=1")
