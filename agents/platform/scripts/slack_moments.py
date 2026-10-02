@@ -82,7 +82,7 @@ JOIN = frozenset({"and", "then"})
 OUR_LEAD = frozenset({"i", "we", "i've", "we've", "i’ve", "we’ve"})
 #: An outcome a label may name before "opened": "Done: opened", "Tests passed, opened".
 OUTCOME_WORD = frozenset({
-    "done", "update", "next", "result", "ready", "green", "complete", "completed", "finished",
+    "done", "update", "next", "result", "ready", "green", "complete", "completed", "finished", "passed",
 })
 #: A label naming the PR with no subject: "PR opened: <url>".
 PR_LABEL = (["pr"], ["pull", "request"])
@@ -93,17 +93,17 @@ OTHER_SUBJECT = frozenset({"he", "she", "they", "who", "which"})
 #: The worker's own earlier steps. A list rather than "-ed", which would take
 #: "Ahmed then opened" and "Fred reviewed and opened" as ours.
 OUR_VERB = frozenset({
-    "added", "adjusted", "analysed", "analyzed", "applied", "audited", "began", "bumped", "built",
+    "added", "addressed", "adjusted", "analysed", "analyzed", "applied", "audited", "began", "bumped", "built",
     "changed", "checked", "cleaned", "closed", "committed", "compared", "confirmed", "corrected",
     "created", "debugged", "decreased", "deployed", "diagnosed", "did", "disabled", "documented",
-    "drafted", "edited", "enabled", "fetched", "filed", "fixed", "found", "generated", "got",
-    "identified", "implemented", "increased", "inspected", "installed", "investigated", "kept",
+    "drafted", "edited", "enabled", "fetched", "filed", "fixed", "following", "found", "generated", "got",
+    "identified", "implemented", "increased", "inspected", "installed", "investigated", "investigating", "kept",
     "looked", "lowered", "made", "merged", "migrated", "modified", "moved", "opened", "patched",
-    "pinned", "prepared", "pulled", "pushed", "put", "raised", "ran", "re-ran", "read", "rebased",
-    "rebuilt", "reduced", "refactored", "regenerated", "removed", "renamed", "replaced",
-    "reproduced", "reran", "restarted", "restored", "reverted", "reviewed", "rewrote", "rolled",
-    "scaled", "sent", "set", "split", "submitted", "superseded", "tested", "took", "traced",
-    "tuned", "updated", "upgraded", "validated", "verified", "wrote",
+    "pinned", "prepared", "proposed", "pulled", "pushed", "put", "raised", "ran", "re-ran", "read", "rebased",
+    "rebuilt", "reduced", "refactored", "regenerated", "released", "removed", "renamed", "replaced",
+    "reproduced", "reran", "resolved", "restarted", "restored", "reverted", "reviewed", "rewrote", "rolled",
+    "scaled", "sent", "set", "shipped", "split", "submitted", "superseded", "tested", "took", "traced",
+    "tuned", "updated", "updating", "upgraded", "validated", "verified", "working", "wrote",
 })
 #: The worker's line under the headline, clipped: a note can be one long
 #: paragraph, and a Slack context element holds at most 3,000 characters.
@@ -194,7 +194,7 @@ def _a_name(clause: str) -> bool:
     step or outcome of ours ("Done", "Checked it", "Tests passed", "Following up")."""
     words = _trimmed([w.lower() for w in CLAUSE_WORD.findall(clause)])
     return bool(words) and not any(
-        w in OUR_LEAD or w in OUR_VERB or w in OUTCOME_WORD or w.endswith(("ed", "ing")) for w in words
+        w in OUR_LEAD or w in OUR_VERB or w in OUTCOME_WORD for w in words
     )
 
 
@@ -381,7 +381,8 @@ def _question(reason: str, buttons: bool) -> tuple[str, list[str], list[str]]:
         start, options = len(lines), []
     first = lines[0].strip()
     # A clipped headline keeps its whole line below it too.
-    below = 0 if len(first) > _presenter.HEADLINE_MAX else 1
+    # Measured as shown: a link's url is not on screen.
+    below = 0 if len(_headline_text(first)) > _presenter.HEADLINE_MAX else 1
     return first, [*before, *lines[below:start]], options
 
 

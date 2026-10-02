@@ -167,6 +167,17 @@ class OpenedPrTest(unittest.TestCase):
         self.assertLessEqual(len(_contexts(blocks)[0]), m.EVIDENCE_MAX)
         self.assertTrue(_contexts(blocks)[0].endswith(p.ELLIPSIS))
 
+    def test_a_name_ending_in_ed_is_someone_else(self):
+        for line in (f"Fred: opened {PR}", f"Mohammed, as usual, opened {PR}"):
+            self.assertIsNone(m.opened_pr(line), line)
+
+    def test_our_own_outcome_and_step_labels_still_open_a_pr(self):
+        for line in (
+            f"Resolved: opened {PR}", f"Tests passed, opened {PR}", f"Working on it, opened {PR}",
+            f"Addressed the review, opened {PR}",
+        ):
+            self.assertEqual(m.opened_pr(line)[0], PR, line)
+
     def test_the_opened_pr_is_found_after_a_cited_one(self):
         other = "https://github.com/acme/x/pull/300"
         self.assertEqual(m.opened_pr(f"Following up {other}, opened {PR}")[0], PR)
@@ -401,6 +412,12 @@ class NeedsYouTest(unittest.TestCase):
         blocks, _ = m.needs_you(f"Pick one?\n- short\n- {long}")
         self.assertEqual(_buttons(blocks), [])
         self.assertIn(long, _contexts(blocks)[0])
+
+    def test_a_headline_short_once_plain_is_not_repeated_below(self):
+        link = "[runbook](https://example.com/" + "a" * 150 + ")"
+        blocks, text = m.needs_you(f"Check the {link} first. Which?\n- seeded-a\n- seeded-b")
+        self.assertIn("Check the runbook first. Which?", blocks[0]["text"]["text"])
+        self.assertEqual([b for b in blocks if b["type"] == "context" and b.get("block_id") != p.WAITING_BLOCK_ID], [])
 
     def test_a_long_first_line_is_repeated_whole_below_the_clipped_headline(self):
         first = "why " * 60

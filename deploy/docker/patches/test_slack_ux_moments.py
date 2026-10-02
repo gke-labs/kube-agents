@@ -212,9 +212,16 @@ class NeedsYouTest(unittest.TestCase):
         self.assertEqual(_buttons(post["blocks"]), [])
         self.assertIn("- seeded-a\n- seeded-b", post["text"])
 
-    def test_blocking_again_settles_the_earlier_question(self):
+    def test_blocking_again_does_not_settle_the_earlier_question_itself(self):
         adapter = _Adapter()
         _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 9))
+        self.assertEqual((len(adapter.posts), adapter.updates), (2, []))
+
+    def test_blocking_again_after_the_callers_settle_replaces_the_question(self):
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        _run(runtime.settle_question(adapter, SUB))
         _run(runtime.needs_you(adapter, SUB, QUESTION, 9))
         self.assertEqual(len(adapter.posts), 2)
         self.assertEqual(len(adapter.updates), 1)
@@ -365,7 +372,8 @@ class SettleQuestionTest(unittest.TestCase):
         runtime._questions[key] = (first[0], first[1], EARLIER_TS, *first[3:])
         adapter.fail_update = True
         with self.assertLogs(runtime.logger, "WARNING"):
-            self.assertTrue(_run(runtime.needs_you(adapter, SUB, QUESTION, 9)))
+            _run(runtime.settle_question(adapter, SUB))
+        self.assertTrue(_run(runtime.needs_you(adapter, SUB, QUESTION, 9)))
         self.assertEqual(runtime._questions[key][0], 9)
         adapter.fail_update = False
         _run(runtime.settle_question(adapter, SUB))
@@ -380,7 +388,8 @@ class SettleQuestionTest(unittest.TestCase):
         runtime._questions[key] = (first[0], first[1], EARLIER_TS, *first[3:])
         adapter.fail_update = True
         with self.assertLogs(runtime.logger, "WARNING"):
-            _run(runtime.needs_you(adapter, SUB, QUESTION, 9))
+            _run(runtime.settle_question(adapter, SUB))
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 9))
         self.assertEqual(runtime.question_card("C0KAGE", EARLIER_TS), SUB["task_id"])
         self.assertEqual(runtime.question_card("C0KAGE", POSTED_TS), SUB["task_id"])
         self.assertIsNone(runtime.question_card("C0OTHER", EARLIER_TS))

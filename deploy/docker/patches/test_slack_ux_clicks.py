@@ -515,12 +515,12 @@ class RuntimeTest(unittest.TestCase):
     def _answer(self, adapter, body, action, kind=runtime.CHOICE_KIND):
         _run(runtime.answer(adapter, self._ack(adapter), body, action, kind))
 
-    def test_choice_is_the_clickers_turn_with_an_echo(self):
+    def test_choice_is_the_clickers_turn_shown_once_on_the_message(self):
         adapter = _Adapter()
         with self.assertNoLogs(runtime.logger, level="WARNING"):
             self._answer(adapter, *_choice())
-        self.assertEqual([entry[0] for entry in adapter.log], ["chat_update", "chat_postMessage", "message"])
-        update, echo, turn = (entry[1] for entry in adapter.log)
+        self.assertEqual([entry[0] for entry in adapter.log], ["chat_update", "message"])
+        update, turn = (entry[1] for entry in adapter.log)
         self.assertEqual((update["channel"], update["ts"]), (CHANNEL, MESSAGE_TS))
         actions = [b for b in update["blocks"] if b["type"] == "actions"]
         self.assertEqual(
@@ -529,7 +529,6 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(update["blocks"][-1]["elements"][0]["text"], "✓ <@U1>: Leave it")
         # The note leads the text; the message's own text stays under it for a later thread read.
         self.assertEqual(update["text"], "✓ <@U1>: Leave it\n\nfallback")
-        self.assertEqual(echo, {"channel": CHANNEL, "thread_ts": THREAD, "text": "↳ <@U1>: Leave it"})
         self.assertEqual(
             turn,
             {
@@ -548,6 +547,44 @@ class RuntimeTest(unittest.TestCase):
             self._answer(adapter, *_choice())
         turn = adapter.log[-1][1]
         self.assertEqual(turn["text"], "Leave it\n\n" + runtime.CARD_NOTE.format(card="t_e0c1"))
+
+    def test_a_clicked_session_is_titled_from_the_label_not_the_card_note(self):
+        adapter = _Adapter()
+        status = SimpleNamespace(note_ask=lambda chat, thread, text: adapter.log.append(("note_ask", (chat, thread, text))))
+        moments = SimpleNamespace(question_card=lambda channel, ts: "t_e0c1")
+        gateway = SimpleNamespace(slack_ux_moments=moments, slack_ux_status=status)
+        modules = {"gateway": gateway, "gateway.slack_ux_moments": moments, "gateway.slack_ux_status": status}
+        with mock.patch.dict(sys.modules, modules):
+            self._answer(adapter, *_choice())
+        self.assertEqual([entry[0] for entry in adapter.log], ["chat_update", "note_ask", "message"])
+        self.assertEqual(adapter.log[1][1], (CHANNEL, THREAD, "Leave it"))
+
+    def test_a_clicked_dm_thread_is_titled_from_the_label(self):
+        adapter = _Adapter()
+        titles = []
+
+        async def set_title(channel, thread, title, team_id=None):
+            titles.append((channel, thread, title, team_id))
+
+        adapter._set_assistant_thread_title = set_title
+        asks = []
+        status = SimpleNamespace(note_ask=lambda *args: asks.append(args))
+        with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_status=status), "gateway.slack_ux_status": status}):
+            _run(runtime._title_from_label(adapter, "D1", TEAM, THREAD, "Leave it"))
+            _run(runtime._title_from_label(adapter, CHANNEL, TEAM, THREAD, "Leave it"))
+        self.assertEqual(titles, [("D1", THREAD, "Leave it", TEAM)])
+        # A DM's title is upstream's, set once; offering the label as its ask would rename it.
+        self.assertEqual(asks, [(CHANNEL, THREAD, "Leave it")])
+
+    def test_a_title_failure_still_runs_the_turn(self):
+        def broken(*args):
+            raise RuntimeError("status unavailable")
+
+        status = SimpleNamespace(note_ask=broken)
+        adapter = _Adapter()
+        with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_status=status), "gateway.slack_ux_status": status}):
+            self._answer(adapter, *_choice())
+        self.assertEqual([entry[0] for entry in adapter.log], ["chat_update", "message"])
 
     def test_the_card_is_looked_up_before_the_rewrite(self):
         cards = {(CHANNEL, MESSAGE_TS): "t_e0c1"}
@@ -586,7 +623,7 @@ class RuntimeTest(unittest.TestCase):
         # And the message is still answerable by someone who is listed.
         listed = _Adapter()
         self._answer(listed, *_choice())
-        self.assertEqual(len(listed.log), 3)
+        self.assertEqual(len(listed.log), 2)
 
     def test_a_message_is_answered_once(self):
         adapter = _Adapter()
@@ -641,28 +678,26 @@ class RuntimeTest(unittest.TestCase):
     def test_label_is_escaped_in_what_slack_shows_but_not_in_the_turn(self):
         adapter = _Adapter()
         self._answer(adapter, *_choice(value="<!channel> & go"))
-        update, echo, turn = (entry[1] for entry in adapter.log)
-        self.assertEqual(echo["text"], "↳ <@U1>: &lt;!channel&gt; &amp; go")
+        update, turn = (entry[1] for entry in adapter.log)
         self.assertNotIn("<!channel>", update["blocks"][-1]["elements"][0]["text"])
         self.assertEqual(turn["text"], "<!channel> & go")
 
     def test_slacks_entities_in_the_shown_text_are_decoded_once(self):
         adapter = _Adapter()
         self._answer(adapter, *_choice(value="Logs & metrics", shown="Logs &amp; metrics &amp;lt;b&amp;gt;"))
-        _, echo, turn = (entry[1] for entry in adapter.log)
+        update, turn = (entry[1] for entry in adapter.log)
         self.assertEqual(turn["text"], "Logs & metrics &lt;b&gt;")
-        self.assertEqual(echo["text"], "↳ <@U1>: Logs &amp; metrics &amp;lt;b&amp;gt;")
+        self.assertEqual(update["blocks"][-1]["elements"][0]["text"], "✓ <@U1>: Logs &amp; metrics &amp;lt;b&amp;gt;")
 
-    def test_turn_and_echo_carry_the_shown_text_never_the_longer_value(self):
+    def test_turn_and_answer_carry_the_shown_text_never_the_longer_value(self):
         label = "Yes, roll back checkout-gateway to the previous revision in namespace prod " * 3
         button = presenter._button(label, "kage.choice.0", value=label)
         shown = button["text"]["text"]
         self.assertLess(len(shown), len(button["value"]))
         adapter = _Adapter()
         self._answer(adapter, *_choice(0, button["value"], shown=shown))
-        update, echo, turn = (entry[1] for entry in adapter.log)
+        update, turn = (entry[1] for entry in adapter.log)
         self.assertEqual(turn["text"], shown)
-        self.assertEqual(echo["text"], f"↳ <@U1>: {shown}")
         self.assertEqual(update["blocks"][-1]["elements"][0]["text"], f"✓ <@U1>: {shown}")
 
     def _card_click(self, value, label="Fix the first one", row="seeded-b and seeded-c admit privileged pods", elements=None):
@@ -684,9 +719,8 @@ class RuntimeTest(unittest.TestCase):
 
     def test_a_session_that_never_read_the_card_is_told_which_finding(self):
         # An existing session in the thread is not re-hydrated with it, so the turn itself names the row the card shows.
-        update, echo, turn = self._card_click("Fix the first one: seeded-b and seeded-c admit privileged pods")
+        update, turn = self._card_click("Fix the first one: seeded-b and seeded-c admit privileged pods")
         self.assertEqual(turn["text"], "Fix the first one: seeded-b and seeded-c admit privileged pods")
-        self.assertEqual(echo["text"], "↳ <@U1>: Fix the first one")
         self.assertEqual(update["blocks"][-1]["elements"][0]["text"], "✓ <@U1>: Fix the first one")
 
     def test_a_value_naming_a_line_the_card_does_not_show_sends_the_label(self):
@@ -698,7 +732,7 @@ class RuntimeTest(unittest.TestCase):
         ):
             with self.subTest(value=value):
                 runtime._answered.clear()
-                _update, _echo, turn = self._card_click(value)
+                _update, turn = self._card_click(value)
                 self.assertEqual(turn["text"], "Fix the first one")
 
     def test_a_value_naming_part_of_a_shown_line_sends_the_label(self):
@@ -711,12 +745,12 @@ class RuntimeTest(unittest.TestCase):
         ):
             with self.subTest(value=value):
                 runtime._answered.clear()
-                _update, _echo, turn = self._card_click(value, row=row)
+                _update, turn = self._card_click(value, row=row)
                 self.assertEqual(turn["text"], "Fix the first one")
 
     def test_a_leading_code_span_that_is_not_a_severity_stays_part_of_the_line(self):
         elements = [{"type": "text", "text": "do not", "style": {"code": True}}, {"type": "text", "text": " drain node-pool-a"}]
-        _update, _echo, turn = self._card_click("Fix the first one: drain node-pool-a", elements=elements)
+        _update, turn = self._card_click("Fix the first one: drain node-pool-a", elements=elements)
         self.assertEqual(turn["text"], "Fix the first one")
 
     def test_a_value_naming_an_emphasised_shown_line_names_it(self):
@@ -738,12 +772,12 @@ class RuntimeTest(unittest.TestCase):
         ):
             with self.subTest(value=value, elements=elements):
                 runtime._answered.clear()
-                _update, _echo, turn = self._card_click(value, elements=elements)
+                _update, turn = self._card_click(value, elements=elements)
                 self.assertEqual(turn["text"], sent)
 
     def test_the_turn_names_the_line_as_shown_not_the_values_markup(self):
         # The match ignores markup, so the value's own would reach the agent: a strikethrough cancelling "Do not".
-        _update, _echo, turn = self._card_click("Fix the first one: ~Do not~  drain node-pool-a", row="Do not drain node-pool-a")
+        _update, turn = self._card_click("Fix the first one: ~Do not~  drain node-pool-a", row="Do not drain node-pool-a")
         self.assertEqual(turn["text"], "Fix the first one: Do not drain node-pool-a")
 
     def test_a_line_with_struck_text_sends_the_label(self):
@@ -757,7 +791,7 @@ class RuntimeTest(unittest.TestCase):
         ):
             with self.subTest(value=value, elements=elements):
                 runtime._answered.clear()
-                _update, _echo, turn = self._card_click(value, elements=elements)
+                _update, turn = self._card_click(value, elements=elements)
                 self.assertEqual(turn["text"], "Fix the first one")
 
     def test_a_line_holding_an_element_with_no_text_sends_the_label(self):
@@ -771,7 +805,7 @@ class RuntimeTest(unittest.TestCase):
             elements = [{"type": "text", "text": "Page "}, element, {"type": "text", "text": " before draining"}]
             with self.subTest(element=element):
                 runtime._answered.clear()
-                _update, _echo, turn = self._card_click(value, elements=elements)
+                _update, turn = self._card_click(value, elements=elements)
                 self.assertEqual(turn["text"], "Fix the first one")
 
     def test_struck_or_textless_elements_leave_the_other_lines_matchable(self):
@@ -782,13 +816,13 @@ class RuntimeTest(unittest.TestCase):
             {"type": "text", "text": "old note", "style": {"strike": True}},
             {"type": "user", "user_id": "U9"},
         ]
-        _update, _echo, turn = self._card_click("Fix the first one: Pods admit privileged containers (runbook)", elements=elements)
+        _update, turn = self._card_click("Fix the first one: Pods admit privileged containers (runbook)", elements=elements)
         self.assertEqual(turn["text"], "Fix the first one: Pods admit privileged containers (runbook)")
 
     def test_a_cards_question_with_a_value_names_both_the_finding_and_the_card(self):
         moments = SimpleNamespace(question_card=lambda channel, ts: "t_e0c1" if (channel, ts) == (CHANNEL, MESSAGE_TS) else None)
         with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_moments=moments), "gateway.slack_ux_moments": moments}):
-            _update, _echo, turn = self._card_click("Fix the first one: seeded-b and seeded-c admit privileged pods")
+            _update, turn = self._card_click("Fix the first one: seeded-b and seeded-c admit privileged pods")
         self.assertEqual(
             turn["text"],
             "Fix the first one: seeded-b and seeded-c admit privileged pods\n\n" + runtime.CARD_NOTE.format(card="t_e0c1"),
@@ -812,7 +846,7 @@ class RuntimeTest(unittest.TestCase):
                 turn = adapter.log[-1][1]
                 self.assertEqual(turn["text"], runtime.COMMAND_GUARD + label)
                 self.assertFalse(turn["text"].lstrip().startswith(runtime.COMMAND_PREFIXES))
-                self.assertEqual(adapter.log[1][1]["text"], f"↳ <@U1>: {label}")
+                self.assertEqual(adapter.log[0][1]["blocks"][-1]["elements"][0]["text"], f"✓ <@U1>: {label}")
 
     def test_click_where_a_typed_message_is_ignored_changes_nothing(self):
         cases = {
@@ -830,14 +864,14 @@ class RuntimeTest(unittest.TestCase):
         # A channel on the list still answers.
         listed = _Adapter(allowed_channels={CHANNEL})
         self._answer(listed, *_choice())
-        self.assertEqual(len(listed.log), 3)
+        self.assertEqual(len(listed.log), 2)
 
     def test_allowed_channels_gates_channels_and_group_dms_but_not_a_one_to_one_dm(self):
         # Upstream's message handler skips the channel gate for an im; DMs are disable_dms's.
         adapter = _Adapter(allowed_channels={"C2"})
         adapter._begin_interaction = self._dm_begin(adapter)
         self._answer(adapter, *_choice())
-        self.assertEqual([entry[0] for entry in adapter.log], ["chat_update", "chat_postMessage", "message"])
+        self.assertEqual([entry[0] for entry in adapter.log], ["chat_update", "message"])
         self.assertEqual(adapter.log[-1][1]["channel"], "D1")
         for name, channel in (("a channel", CHANNEL), ("a group dm", "mpdm-alice--bob--kage-1")):
             with self.subTest(name):
@@ -851,7 +885,7 @@ class RuntimeTest(unittest.TestCase):
 
     def test_a_click_in_a_group_dm_with_dms_disabled_changes_nothing(self):
         # The gateway ignores an mpim as it does an im when DMs are disabled.
-        for disable_dms, calls in ((True, 0), (False, 3)):
+        for disable_dms, calls in ((True, 0), (False, 2)):
             with self.subTest(disable_dms=disable_dms):
                 importlib.reload(runtime)
                 adapter = _Adapter(disable_dms=disable_dms)
@@ -872,7 +906,13 @@ class RuntimeTest(unittest.TestCase):
         adapter = _Adapter()
         self._answer(adapter, *_choice(thread=None))
         self.assertEqual(adapter.log[1][1]["thread_ts"], MESSAGE_TS)
-        self.assertEqual(adapter.log[2][1]["thread_ts"], MESSAGE_TS)
+
+    def test_a_failed_rewrite_posts_the_echo_instead(self):
+        adapter = _Adapter(fail=("chat_update",))
+        with self.assertLogs(runtime.logger, level="WARNING"):
+            self._answer(adapter, *_choice())
+        self.assertEqual([entry[0] for entry in adapter.log], ["chat_postMessage", "message"])
+        self.assertEqual(adapter.log[0][1], {"channel": CHANNEL, "thread_ts": THREAD, "text": "↳ <@U1>: Leave it"})
 
     def test_failed_rewrite_and_echo_still_run_the_turn(self):
         adapter = _Adapter(fail=("chat_update", "chat_postMessage"))
@@ -967,11 +1007,11 @@ class RuntimeTest(unittest.TestCase):
                 self._incident(adapter)
                 self.assertEqual(
                     [entry[0] for entry in adapter.log],
-                    ["conversations_replies", "chat_update", "chat_postMessage", "message"],
+                    ["conversations_replies", "chat_update", "message"],
                 )
 
     def _runs(self, adapter):
-        self.assertEqual([entry[0] for entry in adapter.log], ["conversations_replies", "chat_update", "chat_postMessage", "message"])
+        self.assertEqual([entry[0] for entry in adapter.log], ["conversations_replies", "chat_update", "message"])
 
     def _drops(self, adapter):
         self.assertEqual([entry[0] for entry in adapter.log], ["conversations_replies", "chat_update"])
@@ -1256,7 +1296,7 @@ class RuntimeTest(unittest.TestCase):
         adapter = _Adapter(fail=("conversations_replies",))
         with self.assertLogs(runtime.logger, level="WARNING") as logs:
             self._incident(adapter)
-        self.assertEqual([entry[0] for entry in adapter.log], ["chat_update", "chat_postMessage", "message"])
+        self.assertEqual([entry[0] for entry in adapter.log], ["chat_update", "message"])
         self.assertTrue(any("could not check the thread" in line for line in logs.output))
 
     def test_a_check_that_raises_after_a_typed_apply_matched_counts_the_reply(self):
@@ -1406,7 +1446,7 @@ class RuntimeTest(unittest.TestCase):
     def test_a_click_on_a_card_question_does_not_read_the_thread(self):
         adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": "apply Option B", "ts": "223.000"}])
         self._answer(adapter, *_choice())
-        self.assertEqual([entry[0] for entry in adapter.log], ["chat_update", "chat_postMessage", "message"])
+        self.assertEqual([entry[0] for entry in adapter.log], ["chat_update", "message"])
 
     def test_flag_off_is_disabled(self):
         with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "0"}):
