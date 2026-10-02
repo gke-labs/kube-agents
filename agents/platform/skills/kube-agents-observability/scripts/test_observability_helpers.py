@@ -418,22 +418,17 @@ class FetchTracesTest(BrokerSessionCase):
 
 
 class CheckTokenUsageTest(BrokerSessionCase):
-    # Two pods' series, told apart by their resource labels the way the API
-    # returns them (a series with no labels at all is not a shape Monitoring
-    # answers with).
+    # What Monitoring answers once the aggregation has run: the window's
+    # increase, every series reduced into one, as one point.
     SERIES = {
         "timeSeries": [
-            {"resource": {"labels": {"pod": "a"}}, "points": [
-                {"interval": {"endTime": "2026-09-28T10:00:00Z"}, "value": {"int64Value": "50"}},
-                {"interval": {"endTime": "2026-09-28T09:00:00Z"}, "value": {"int64Value": "20"}},
-                {"interval": {"endTime": "2026-09-28T08:00:00Z"}, "value": {"int64Value": "80"}},
-            ]},
-            {"resource": {"labels": {"pod": "b"}},
-             "points": [{"interval": {"endTime": "2026-09-28T10:00:00Z"}, "value": {"doubleValue": 5.0}}]},
+            {"metric": {"type": "prometheus.googleapis.com/litellm_input_tokens_metric_total/counter"},
+             "points": [{"interval": {"startTime": "2026-09-27T10:00:00Z", "endTime": "2026-09-28T10:00:00Z"},
+                         "value": {"doubleValue": 50.0}}]},
         ]
     }
 
-    def test_reads_the_three_counters_through_the_relay_and_sums_the_deltas(self):
+    def test_reads_the_three_counters_through_the_relay_summed_on_the_server(self):
         session = self.session({RELAYED_TIME_SERIES: self.SERIES})
         code, out, err = run(check_token_usage.main, ["--project-id", PROJECT], session=session)
         self.assertEqual(0, code, err)
@@ -448,8 +443,16 @@ class CheckTokenUsageTest(BrokerSessionCase):
             filters,
         )
         for call in self.http.calls:
-            self.assertLess(call["params"]["interval.startTime"], call["params"]["interval.endTime"])
-        # 80 -> 20 is a reset (counts 20), 20 -> 50 counts 30; the one-point series counts nothing.
+            params = call["params"]
+            self.assertLess(params["interval.startTime"], params["interval.endTime"])
+            # One alignment period the width of the window, each series'
+            # delta over it, the series summed: one point, whatever the
+            # install's label cardinality, so no page to follow and no cap.
+            self.assertEqual(f"{google_api.DEFAULT_WINDOW_HOURS * 3600}s", params["aggregation.alignmentPeriod"])
+            self.assertEqual("ALIGN_DELTA", params["aggregation.perSeriesAligner"])
+            self.assertEqual("REDUCE_SUM", params["aggregation.crossSeriesReducer"])
+            self.assertNotIn("pageSize", params)
+            self.assertNotIn(google_api.PAGE_TOKEN_PARAM, params)
         self.assertEqual({"input_tokens": 50, "output_tokens": 50, "cached_input_tokens": 50}, json.loads(out))
 
     def usage(self, input_series, output_series=None, cached_series=None):
@@ -475,77 +478,30 @@ class CheckTokenUsageTest(BrokerSessionCase):
     def point(end_time, value):
         return {"interval": {"endTime": end_time}, "value": value}
 
-    def test_newest_first_points_are_sorted_before_diffing(self):
-        # The API returns newest first; without the sort 100 -> 350 reads as a
-        # reset and the delta comes out as 100.
-        result = self.usage({"timeSeries": [{"points": [
-            self.point("2026-08-19T10:05:00Z", {"doubleValue": 350.0}),
-            self.point("2026-08-19T10:00:00Z", {"doubleValue": 100.0}),
-        ]}]})
-        self.assertEqual({"input_tokens": 250, "output_tokens": 0, "cached_input_tokens": 0}, result)
-
     def test_int64_values_arrive_as_strings_and_still_count(self):
         result = self.usage({"timeSeries": []}, output_series={"timeSeries": [{"points": [
-            self.point("2026-08-19T10:00:00Z", {"int64Value": "1000"}),
-            self.point("2026-08-19T10:05:00Z", {"int64Value": "4000"}),
+            self.point("2026-08-19T10:00:00Z", {"int64Value": "3000"}),
         ]}]})
         self.assertEqual(3000, result["output_tokens"])
 
-    def test_a_counter_reset_adds_the_post_reset_value_not_a_negative(self):
-        result = self.usage({"timeSeries": [{"points": [
-            self.point("2026-08-19T10:00:00Z", {"doubleValue": 500.0}),
-            self.point("2026-08-19T10:05:00Z", {"doubleValue": 30.0}),
-        ]}]})
-        self.assertEqual(30, result["input_tokens"])
-
-    def test_deltas_sum_across_pods(self):
+    def test_more_than_one_point_or_series_in_the_reply_is_added(self):
+        # An aligned delta is additive: should Monitoring answer the window
+        # in two periods, or leave two series unreduced, the sum is still
+        # the increase over the window, never the last point alone.
         result = self.usage({"timeSeries": [
-            {"resource": {"labels": {"pod": "a"}},
-             "points": [self.point("2026-08-19T10:00:00Z", {"doubleValue": 0.0}),
-                        self.point("2026-08-19T10:05:00Z", {"doubleValue": 100.0})]},
-            {"resource": {"labels": {"pod": "b"}},
-             "points": [self.point("2026-08-19T10:00:00Z", {"doubleValue": 0.0}),
-                        self.point("2026-08-19T10:05:00Z", {"doubleValue": 42.0})]},
+            {"points": [self.point("2026-08-19T10:00:00Z", {"doubleValue": 100.0}),
+                        self.point("2026-08-19T22:00:00Z", {"doubleValue": 42.0})]},
+            {"points": [self.point("2026-08-19T22:00:00Z", {"doubleValue": 7.0})]},
         ]})
-        self.assertEqual(142, result["input_tokens"])
-
-    def test_pages_are_followed_and_a_series_split_across_them_is_one_series(self):
-        # Monitoring pages points, not series: a series can straddle a page
-        # boundary and arrive as two entries with the same labels. The
-        # second page's points count, and the step across the boundary too.
-        labels = {"metric": {"type": check_token_usage.INPUT_TOKENS_METRIC, "labels": {"key": "k1"}},
-                  "resource": {"type": "prometheus_target", "labels": {"cluster": "c"}}}
-        first = {"timeSeries": [{**labels, "points": [
-            self.point("2026-08-19T10:05:00Z", {"doubleValue": 100.0}),
-            self.point("2026-08-19T10:00:00Z", {"doubleValue": 0.0}),
-        ]}], "nextPageToken": "p2"}
-        second = {"timeSeries": [
-            {**labels, "points": [self.point("2026-08-19T10:10:00Z", {"doubleValue": 150.0})]},
-            {"metric": {"type": check_token_usage.INPUT_TOKENS_METRIC, "labels": {"key": "k2"}},
-             "resource": labels["resource"],
-             "points": [self.point("2026-08-19T10:00:00Z", {"doubleValue": 0.0}),
-                        self.point("2026-08-19T10:10:00Z", {"doubleValue": 7.0})]},
-        ]}
-        empty = {"timeSeries": []}
-        session = self.paged_session({RELAYED_TIME_SERIES: [first, second, empty, empty]})
-        code, out, err = run(check_token_usage.main, ["--project-id", PROJECT], session=session)
-        self.assertEqual(0, code, err)
-        self.assert_every_call_is_a_relayed_read_the_policy_admits()
-        # 0 -> 100 on page one, 100 -> 150 across the boundary, 0 -> 7 on the other series.
-        self.assertEqual(157, json.loads(out)["input_tokens"])
-        self.assertEqual(4, len(self.http.calls))
-        self.assertEqual("p2", self.http.calls[1]["params"][google_api.PAGE_TOKEN_PARAM])
-        self.assertNotIn(google_api.PAGE_TOKEN_PARAM, self.http.calls[0]["params"])
-        for call in self.http.calls:
-            self.assertEqual(check_token_usage.PAGE_SIZE, call["params"]["pageSize"])
+        self.assertEqual(149, result["input_tokens"])
 
     def test_a_list_that_never_runs_dry_is_a_failed_read_not_a_partial_sum(self):
-        # A sum over part of the list is a wrong number stated fluently, so
-        # the page cap exits 1 here even with points in hand.
-        page = {"timeSeries": [{"points": [
-            self.point("2026-08-19T10:00:00Z", {"doubleValue": 0.0}),
-            self.point("2026-08-19T10:05:00Z", {"doubleValue": 1.0}),
-        ]}], "nextPageToken": "again"}
+        # The reduced reply is one point, so a token on it is not a shape
+        # Monitoring answers with; should one arrive, a sum over part of the
+        # list is a wrong number stated fluently, so the page cap exits 1
+        # here even with points in hand.
+        page = {"timeSeries": [{"points": [self.point("2026-08-19T10:05:00Z", {"doubleValue": 1.0})]}],
+                "nextPageToken": "again"}
         session = self.paged_session({RELAYED_TIME_SERIES: [page] * (google_api.MAX_LIST_PAGES + 5)})
         code, out, err = run(check_token_usage.main, ["--project-id", PROJECT], session=session)
         self.assertEqual(google_api.EXIT_READ_FAILED, code)
