@@ -513,7 +513,7 @@ class FlagSetIsNextTest(unittest.TestCase):
                 self.assertIn(f'os.Getenv("{consts[const]}")', main_go)
         self.assertIn(f'"{consts["BRIDGE_CONCURRENCY_ENV_VAR"]}"', main_go)
         self.assertEqual(int(consts["BRIDGE_QUEUE_CAPACITY"]), go_int_constant(_BRIDGE_GO, "taskQueueCapacity"))
-        self.assertIn('Info("hermes bridge consuming", "profile", b.cfg.Profile)', text(_BRIDGE_GO))
+        self.assertIn('Info("hermes bridge consuming", "profile", b.cfg.Profile, ', text(_BRIDGE_GO))
         # The shape the deploy greps is the JSON handler's: `"msg":"..."` and
         # `"profile":"..."`. A text handler would print the same words in a
         # shape neither grep matches.
