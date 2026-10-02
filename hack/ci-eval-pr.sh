@@ -884,7 +884,8 @@ EVAL_RUN_STARTED_AT="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 # (LEASE_START_ENV in bench/kube_agents_bench/verifiers.py): a pull request in
 # the leased repository (EVAL_LEDGER_REPO, exported below) created at or after
 # this instant was opened by this job, since the project is leased to no one
-# else, and passes a later repetition of the same case as an in-job sibling
+# else, and passes a later repetition of a case that sets
+# accepts_in_job_sibling (the pdb and rca seats) as an in-job sibling
 # (#2016 step 3: submit-suggestion reuses the branch, so repetitions 2 and 3
 # push nothing and link repetition 1's pull request). The run's own stamp
 # above rather than the Boskos acquire, which the Prow wrapper did before
@@ -1467,8 +1468,9 @@ EVAL_LEDGER_REPO="$(eval_gitops_repo "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LED
 # Exported for the pull_request_opened check (LEASED_REPO_ENV in
 # bench/kube_agents_bench/verifiers.py), which reads it beside
 # EVAL_LEASE_STARTED_AT above: a pull request is an in-job sibling only in
-# this repository. Empty on an unmapped project, and the check then grades a
-# repetition's own push alone, as it did before.
+# this repository, and only for a case that sets accepts_in_job_sibling.
+# Empty on an unmapped project, and the check then grades a repetition's own
+# push alone, as it did before.
 export EVAL_LEDGER_REPO
 reset_audit_ledgers "lease"
 

@@ -200,7 +200,8 @@
 # unchanged. Roster line when #2016 step 3 holds -- three clean days at
 # >= 90% of graded repetitions, no all-reps collapse, infra classes the
 # harness excludes not counted. Graded as an in-job sibling since #2016
-# step 3: a job's three repetitions share the leased repository, the pool
+# step 3 (the check's accepts_in_job_sibling, set on this case and
+# rca-remediation-pr only): a job's three repetitions share the leased repository, the pool
 # sweep (hack/ci_sweep_agent_pulls.py, #1832) runs between leases, not
 # between them, and submit-suggestion reuses the branch, so repetitions 2
 # and 3 meet repetition 1's open pull request with the fix on it and push

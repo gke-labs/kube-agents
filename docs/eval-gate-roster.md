@@ -128,7 +128,7 @@ with a filed issue naming the exit condition:
   (merged 2026-09-21) it is graded by `pull_request_opened`, which rejects a pull request an
   earlier lease left behind (and, since #2016 step 3, passes one an earlier repetition of the
   same job opened in the leased repository -- the in-job sibling rule described under
-  pdb-remediation-pr below), and nothing sweeps the `*-infra` repositories between runs
+  pdb-remediation-pr below, which this case sets `accepts_in_job_sibling` to take), and nothing sweeps the `*-infra` repositories between runs
   ([#1755](https://github.com/gke-labs/kube-agents/issues/1755) item 2). Nightly since
   2026-09-22, and with pdb-remediation-pr's seat withdrawn (below) the remediation domain had
   no presubmit case, so `remediation` joined `fleet-audits` on the allowlist; pdb-remediation-pr
@@ -197,7 +197,9 @@ by a `[bot]` login (an App's, as the agent writes; the minter App's slug is not 
 so the check reads the kind of login, as the ledger reset does) on a `platform-agent/` branch in
 the repository itself (the agent's pull request as the pool sweep and `github_writes` define it;
 another App's, or one from a fork, is not) and open or merged -- this job's own, since the project
-is leased to no one else -- recorded as `in-job-sibling`; the rule that
+is leased to no one else -- recorded as `in-job-sibling`. The second rule is an option on the
+check, `accepts_in_job_sibling`, set on this case and rca-remediation-pr only: its cost (below) was
+decided for these two seats, and a case without it grades the push alone. The rule that
 passed leads the check's reason and so sits in the run record (`results.json`), where the Cases
 page can tell the two apart. A pull request an earlier lease left behind (created before the
 window), one in another repository, one a person opened, and one closed unmerged still fail. The
@@ -205,7 +207,8 @@ window is the job's, not the case's: in the nightly every PR-writing case shares
 the same App, so a repetition passes on any in-window agent-authored pull request in the leased
 repository it links, and the check cannot tell which case opened it. `hack/ci-eval-pr.sh` exports
 the window's start (its own start, inside the Boskos lease and before any agent ran) and the
-leased repository; a hand run has neither, and only the first rule applies. `pull_request_opened`'s
+leased repository; a hand run has neither, and a case without the option has no second rule, so
+only the first applies. `pull_request_opened`'s
 `accepts_stream_pull_request` is a different widening, not a third answer here: it covers only a
 fleet audit's stream, and this case has no ledger and opens submit-suggestion branches. The roster edit (step 4, an eval-crew approval) takes
 `remediation` off the `docs/designs/domains.yaml` allowlist. Until then the domain sits there

@@ -1462,9 +1462,10 @@ class PullRequestOpenedVerifier(BaseVerifier):
     WHAT IT ASSERTS. The reply names a github.com pull request URL; GitHub
     resolves it; the number is a pull request and not an issue; it lives under
     ``owner`` when one is set; it is not closed unmerged; it changes at least
-    one file; and one of two rules holds (or the third below, for a case that sets
-    ``accepts_stream_pull_request``), named first in the reason and in
-    ``raw["rule"]``:
+    one file; and one of the rules below holds, named first in the reason and
+    in ``raw["rule"]``. The first applies to every case; the second only to a
+    case that sets ``accepts_in_job_sibling``; the third only to one that sets
+    ``accepts_stream_pull_request``:
 
     * ``own-head-commit`` -- it was written (created or updated) at or after
       this run started, less ``max_clock_skew_sec``, and its head commit is no
@@ -1473,7 +1474,8 @@ class PullRequestOpenedVerifier(BaseVerifier):
       documented behaviour rather than a defect -- so the stamp alone proves
       only that somebody wrote to the pull request, and the head commit is
       what separates a run that pushed a fix from one that left a comment.
-    * ``in-job-sibling`` -- it sits in the leased project's own repository
+    * ``in-job-sibling`` -- with ``accepts_in_job_sibling``, it sits in the
+      leased project's own repository
       (``EVAL_LEDGER_REPO``), was created at or after this job's lease window
       began (``EVAL_LEASE_STARTED_AT``, the same skew allowed), was opened by
       a ``[bot]`` login (``PR_BOT_LOGIN_SUFFIX``: an App's, as the agent
@@ -1491,12 +1493,19 @@ class PullRequestOpenedVerifier(BaseVerifier):
       before it is an earlier lease's leftover and fails exactly as #1832
       intends. The window is the job's, not the case's: every PR-writing
       case in a nightly shares it and writes as the same App, so which case
-      opened a sibling is not something this check can tell.
+      opened a sibling is not something this check can tell. The option is
+      per case because the rule's cost is per case: it reads the pull
+      request, not the repetition's work, so a repetition that produced no
+      fix and linked the agent's in-window pull request passes under it as
+      the repetition that produced the same fix does. #2016 step 3 took that
+      cost for pdb-remediation-pr and rca-remediation-pr; no other case's
+      decision did, so no other case sets it.
 
     One surviving candidate is enough — a reply may link the ticket it came
     from beside the fix — and a candidate GitHub cannot answer for ends the
-    check only when no other candidate passes. With no lease window in the
-    environment (a hand run) only the first rule can pass. With
+    check only when no other candidate passes. Without ``accepts_in_job_sibling``,
+    or with no lease window in the environment (a hand run), only the first rule
+    can pass. With
     ``reuses_spent_branch`` the check also asks, under either rule, that the
     branch carried a closed pull request created during this run, that the
     candidate does not contain that one's head revision, and that the report
@@ -1562,6 +1571,16 @@ class PullRequestOpenedVerifier(BaseVerifier):
     # `/pulls?state=closed&head=` and `/pulls/{n}/commits`, so the credential
     # needs `pull_requests: read`.
     reuses_spent_branch: bool = False
+    # Also pass under the second rule: a pull request an earlier repetition of
+    # this job opened in the leased repository, which this repetition met on
+    # the branch the skill derives from the change and pushed nothing to
+    # (the docstring's in-job-sibling). Off by default because the rule reads
+    # the pull request and not the repetition's work: a repetition that
+    # produced no fix and linked that pull request passes under it too. That
+    # cost was taken for the pdb-remediation-pr and rca-remediation-pr seats
+    # (#2016 step 3) and for no other case, so only those two set it; every
+    # other `pull_request_opened` grades the repetition's own push alone.
+    accepts_in_job_sibling: bool = False
     # Measure "written since" and "head commit since" from the first unit on
     # the case's audit stream rather than the run, so a later run of the audit
     # passes on the pull request an earlier one opened and this one found
@@ -1889,7 +1908,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
 
         The first half of the test, from the issues payload; the head's half
         is :meth:`_not_agent_head`, asked once the pulls payload is read.
-        Five answers, each a clause the rejection can carry: no lease window
+        Six answers, each a clause the rejection can carry: the case does not
+        set ``accepts_in_job_sibling`` (the rule is off, whatever the
+        environment says); no lease window
         in the environment; a repository other than the leased one (nobody's
         sibling, whatever its dates); an author that is not a ``[bot]`` login
         (a person's pull request, whenever opened); created before the window
@@ -1904,6 +1925,11 @@ class PullRequestOpenedVerifier(BaseVerifier):
         a merge postdates its creation, so "merged inside the window" is
         implied by "created inside it".
         """
+        if not self.accepts_in_job_sibling:
+            return (
+                "the case does not set `accepts_in_job_sibling`, so no in-job "
+                "sibling can pass"
+            )
         if not lease_repo or lease_start is None:
             return (
                 f"no lease window in the environment ({LEASED_REPO_ENV} and "
@@ -2025,11 +2051,13 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 "read as no window"
             )
         elif lease_start is not None and "T" not in lease_raw.upper():
-            # A bare date parses as midnight and sits inside the day's bound;
-            # the script never writes one, so the shape itself is refused.
+            # A bare date parses as midnight and sits inside the day's bound,
+            # and a date and time joined by a space parses too. The script
+            # writes one shape (`date -u +%Y-%m-%dT%H:%M:%SZ`), so any other
+            # is not its stamp and is refused for the shape, named as such.
             window_fault = (
-                f"{LEASE_START_ENV}={lease_raw!r} carries no time of day, which the "
-                "script never writes, so it is read as no window"
+                f"{LEASE_START_ENV}={lease_raw!r} is not in the script's "
+                "YYYY-MM-DDTHH:MM:SSZ form, so it is read as no window"
             )
             lease_start = None
         if lease_start is not None:
@@ -2259,13 +2287,20 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     f"carries {files}"
                 )
             elif not_sibling is None:
+                # What was read, not what is inferred from it: the login, the
+                # branch, the repository and the window are the observation;
+                # "an earlier repetition's" is the conclusion the docstring
+                # draws from the lease, and a no-work repetition that linked
+                # the same pull request reads identically.
                 rule = PR_RULE_IN_JOB_SIBLING
+                head_ref = str((pull.get("head") or {}).get("ref") or "?")
                 reason = (
-                    f"{rule}: {slug} was opened at {created.isoformat()} by an earlier "
-                    f"repetition of this job (as {author}; lease window from "
-                    f"{lease_start.isoformat() if lease_start else '?'} in {lease_repo}), "
-                    f"is {'merged at ' + merged.isoformat() if merged else 'open'}, and "
-                    f"carries {files}; this repetition pushed no commit of its own (last "
+                    f"{rule}: {slug} was opened at {created.isoformat()} by {author} "
+                    f"on {head_ref} in the leased repository {lease_repo}, inside this "
+                    f"job's lease window (from "
+                    f"{lease_start.isoformat() if lease_start else '?'}) and before this "
+                    f"run started, is {'merged at ' + merged.isoformat() if merged else 'open'}, "
+                    f"and carries {files}; this repetition pushed no commit of its own (last "
                     f"written {touched.isoformat()}"
                     + (f", head commit {pushed.isoformat()}" if pushed else "")
                     + ")"
@@ -2319,8 +2354,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
             )
         return done(
             False,
-            "none of the pull request URLs the report names passes as this run's own push, "
-            f"as an in-job sibling, or as one opened or pushed to since {since_what}: "
+            "none of the pull request URLs the report names passes as this run's own push"
+            + (", as an in-job sibling" if self.accepts_in_job_sibling else "")
+            + f", or as one opened or pushed to since {since_what}: "
             + "; ".join(rejected),
         )
 

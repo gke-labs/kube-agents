@@ -10,8 +10,9 @@
 # is graded by pull_request_opened, and nothing sweeps the *-infra
 # repositories between runs, #1755 item 2; since #2016 step 3 that check
 # also passes a repetition on an in-job sibling, the pull request an earlier
-# repetition of the same job opened in the leased repository -- see the
-# accumulation paragraph below). Re-admission bar: #1189's.
+# repetition of the same job opened in the leased repository, where the case
+# sets accepts_in_job_sibling as this one and pdb-remediation-pr do -- see
+# the accumulation paragraph below). Re-admission bar: #1189's.
 # Parked 2026-08-26→27 because its cost and signal were unmeasured (the
 # 2026-08-26 run's 85-minute deadline expired before it ever started); the
 # activating pull request's own smoke run is the clean measured run it was
@@ -73,7 +74,8 @@
 # window began, open or merged; another App's or a fork's is not) and says
 # so in the reason, without being able to tell a rep that did the same work
 # from one that did none and linked the sibling (the cost #2016 step 3
-# accepts for the pdb seat),
+# accepts for the pdb seat and this case, which is why the rule is set per
+# case, accepts_in_job_sibling, and not every pull_request_opened's default),
 # where a rep that pushed passes as own-head-commit. A pull request from an
 # earlier lease -- before the window -- still fails, as #1832 intends.
 #
@@ -130,13 +132,20 @@ verification_spec:
       # Not report_contains: a substring passes on an invented URL, and on
       # the PR an earlier lease left behind. This resolves the URL and reads
       # the head commit; a rep passes on its own push (own-head-commit) or,
-      # since #2016 step 3, on the PR an earlier rep of the same job opened
-      # in the leased repository (in-job-sibling; the accumulation paragraph
-      # above says what that rule reads and what it cannot). A leftover from
-      # before this job's lease window still fails.
+      # with accepts_in_job_sibling below (#2016 step 3), on the PR an
+      # earlier rep of the same job opened in the leased repository
+      # (in-job-sibling; the accumulation paragraph above says what that
+      # rule reads and what it cannot). A leftover from before this job's
+      # lease window still fails.
       type: pull_request_opened
       # Closes the TODO this check carried: the repositories are decided.
       owner: gke-agentic
+      # The second rule is per case, because its cost is: a rep that did no
+      # work and linked the sibling passes under it too. This case and
+      # pdb-remediation-pr took that cost (#2016 step 3; the accumulation
+      # paragraph); no other case did. Off, the check grades the rep's own
+      # push alone.
+      accepts_in_job_sibling: true
   - name: rca-names-the-planted-cause
     role: objective
     # assert, not the converge default: the transcript is immutable once the

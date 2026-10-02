@@ -175,11 +175,15 @@ verification_spec:
     check:
       # Not report_contains: a substring passes on an invented URL, and on
       # the PR an earlier lease left behind. This resolves the URL and reads
-      # the head commit; a rep passes on its own push (own-head-commit) or,
-      # since #2016 step 3, on the PR an earlier rep of the same job opened
-      # in the leased repository (in-job-sibling: the skill reuses the
-      # branch, so a rep with the same fix pushes nothing). A leftover from
-      # before this job's lease window still fails.
+      # the head commit; a rep passes on its own push (own-head-commit). The
+      # in-job-sibling rule (accepts_in_job_sibling, #2016 step 3: the PR an
+      # earlier rep of the same job opened in the leased repository, which a
+      # later rep with the same fix meets and pushes nothing to) is not set
+      # here: it also passes a rep that did no work and linked that PR, a
+      # cost taken for the pdb-remediation-pr and rca-remediation-pr seats
+      # only. So a later rep whose fix is already on the branch fails here
+      # as #1832 wrote it, as does a leftover from before this job's lease
+      # window.
       type: pull_request_opened
       owner: gke-agentic
   - name: rca-names-the-oom
