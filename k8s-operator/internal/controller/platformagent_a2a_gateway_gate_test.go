@@ -683,7 +683,6 @@ func a2aGateTestReconcilerWithoutABackend(t *testing.T, agent *agentv1alpha1.Pla
 // would wait with this term deleted.
 func TestADarkGatewayKeepsTheReconcileRequeuing(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
-	t.Setenv(a2aAgentDoorEnvVar, "")
 	agent := a2aTestAgent()
 	r, cl, req := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
@@ -716,7 +715,6 @@ func TestADarkGatewayKeepsTheReconcileRequeuing(t *testing.T) {
 // parked path.
 func TestADegradedPassStillMaintainsTheA2AConditions(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
-	t.Setenv(a2aAgentDoorEnvVar, "")
 	agent := a2aTestAgent()
 	scheme := setupScheme()
 	cl := fake.NewClientBuilder().
@@ -778,7 +776,6 @@ func TestADegradedPassStillMaintainsTheA2AConditions(t *testing.T) {
 // where the two are the same code path.
 func TestTheReadyWriterReportsTheGatewayTheRenderWithheld(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
-	t.Setenv(a2aAgentDoorEnvVar, "")
 	agent := a2aTestAgent()
 	r, cl, req := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
@@ -834,7 +831,6 @@ func TestTheReadyWriterReportsTheGatewayTheRenderWithheld(t *testing.T) {
 // Secret arrives while the refusal stands.
 func TestAFailedJobPassStillMaintainsTheA2AConditions(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
-	t.Setenv(a2aAgentDoorEnvVar, "")
 	agent := a2aTestAgent()
 	r, cl, req := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
@@ -990,7 +986,6 @@ func TestAHeldProvisionJobReadsProvisioningNamingTheCallout(t *testing.T) {
 // the gateway. An install whose gateway exists pays nothing for the gate.
 func TestARunningGatewayDoesNotReadTheSecret(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
-	t.Setenv(a2aAgentDoorEnvVar, "")
 	agent := a2aTestAgent()
 	scheme := setupScheme()
 	secretReads := 0
@@ -1034,7 +1029,6 @@ func TestARunningGatewayDoesNotReadTheSecret(t *testing.T) {
 
 func TestAGatewayIsNotRenderedWithoutAChatBackend(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
-	t.Setenv(a2aAgentDoorEnvVar, "")
 	agent := a2aTestAgent()
 	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
@@ -1063,7 +1057,6 @@ func TestAGatewayIsNotRenderedWithoutAChatBackend(t *testing.T) {
 
 func TestTheDiscordSecretRendersTheGateway(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
-	t.Setenv(a2aAgentDoorEnvVar, "")
 	agent := a2aTestAgent()
 	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
@@ -1089,7 +1082,6 @@ func TestTheDiscordSecretRendersTheGateway(t *testing.T) {
 
 func TestTheInjectDoorRendersTheGatewayWithoutASecret(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "true")
-	t.Setenv(a2aAgentDoorEnvVar, "")
 	agent := a2aTestAgent()
 	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
@@ -1186,7 +1178,6 @@ func TestADarkPassRemovesTheA2ADoor(t *testing.T) {
 // because deleting the Deployment would take every session pod with it.
 func TestAnExistingGatewayKeepsReconcilingWithoutABackend(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
-	t.Setenv(a2aAgentDoorEnvVar, "")
 	agent := a2aTestAgent()
 	r, cl, _ := a2aGateTestReconciler(t, agent)
 	ctx := context.Background()
@@ -1220,7 +1211,6 @@ func TestAnExistingGatewayKeepsReconcilingWithoutABackend(t *testing.T) {
 // the reason names the key.
 func TestADiscordSecretWithoutATokenIsNotABackend(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
-	t.Setenv(a2aAgentDoorEnvVar, "")
 	agent := a2aTestAgent()
 	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
