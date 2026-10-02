@@ -49,14 +49,18 @@ RUN npm install @anthropic-ai/claude-agent-sdk@0.3.236 \
 # The temporary cluster view (operator flag A2A_SESSION_CLUSTER_VIEW): kubectl
 # and gcloud on PATH are the credential broker's shim, which forwards an argv
 # to the broker and prints its refusal as `policy rule: <rule>`. The shim is
-# stdlib Python, so python3 and nothing else is installed; no native kubectl,
-# gcloud, gh or git exist in this image, and the guard below keeps it so. With
-# the flag off the pod has no CREDENTIAL_PROXY_URL and the shim refuses with
-# that name. gh and git are deliberately not linked: the broker's session role
+# Python, so python3 is installed, with python3-yaml beside it: the shim parses
+# the kubeconfig `gcloud container clusters get-credentials` returns, and any
+# kubeconfig a `kubectl --kubeconfig=` or KUBECONFIG names, and without PyYAML
+# those crash after the broker has already run the command. Nothing else is
+# installed; no native kubectl, gcloud, gh or git exist in this image, and the
+# guard below keeps it so. With the flag off the pod has no
+# CREDENTIAL_PROXY_URL and the shim refuses with that name. gh and git are deliberately not linked: the broker's session role
 # refuses them anyway, and a name that is not on PATH is a clearer answer.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends python3 python3-yaml \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -c 'import yaml'
 COPY --chmod=0755 agents/platform/scripts/credential_proxy_client.py /usr/local/bin/credential-proxy-exec
 RUN mkdir -p /opt/credential-proxy/bin \
     && for binary in kubectl gcloud; do \
