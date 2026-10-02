@@ -280,6 +280,8 @@ _ABBREVIATION = re.compile(r"\b(?:e\.g|i\.e|vs|etc|a\.m|p\.m)\.", re.IGNORECASE)
 # What trails a bold lead whose terminal punctuation sits outside the bold.
 _LEAD_TRAIL = ".!? \t"
 _TERMINAL = ".!?"
+# What may follow a bold answer that leaves its punctuation to the detail: "**No.**", "**No**: ...".
+_LEAD_CLAUSE = (":", "\u2014", "\u2013")
 # A markdown link; chat shows its text, not its target.
 _MARKDOWN_LINK = re.compile(r"\[([^\]]*)\]\([^)\s]*\)")
 
@@ -362,10 +364,11 @@ class AnswerFirstVerifier(BaseVerifier):
             elif not (
                 inner.endswith(tuple(_TERMINAL))
                 or after[:1] in tuple(_TERMINAL)
+                or after.lstrip(" ").startswith(_LEAD_CLAUSE)
                 or not after.split("\n", 1)[0].strip()
             ):
                 defects.append(f"the bold span is not a whole sentence: {inner!r}")
-            lead_text = _normalize(inner)
+            lead_text = _normalize(_MARKDOWN_LINK.sub(r"\1", inner))
             rest = after.lstrip(_LEAD_TRAIL)
         if _ATX_HEADING.search(result):
             defects.append("carries a section heading")

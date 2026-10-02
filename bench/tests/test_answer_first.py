@@ -98,6 +98,19 @@ def test_a_bold_fragment_is_not_a_lead():
         assert "not a whole sentence" in _run(result).reason, result
 
 
+def test_a_lead_may_hand_its_punctuation_to_the_detail():
+    for result in (
+        "**No node is under memory pressure**: all three report False.",
+        "**No node is under memory pressure** \u2014 all three report False.",
+    ):
+        assert _run(result).success, result
+
+
+def test_a_link_target_is_not_part_of_the_lead():
+    outcome = _run("**The [node](https://x/memory) is fine.** It is.", lead_terms=["memory"])
+    assert "no bold lead mentions ['memory']" in outcome.reason
+
+
 def test_a_lead_on_its_own_line_needs_no_full_stop():
     assert _run("**No node is under memory pressure**\n\nAll three report False.").success
 
