@@ -99,6 +99,17 @@ class PlatformPersonaProposesInTheReply(unittest.TestCase):
         when_not = skill.index("## When NOT to Use")
         self.assertIn(SKILL_REFUSAL, skill[when_not:], "submit-suggestion's 'When NOT to Use' lost the diagnostic-request bullet")
 
+    def test_the_unattended_carve_out_names_finish_not_the_remediate_subcommand(self):
+        # fleet-audit's scheduled run promotes findings into pull requests in
+        # `finish`; `remediate` is the subcommand for a finding someone asked
+        # about. Both sentences that carve the unattended case out of the rule
+        # once named `remediate` as the scheduled path (round 4 on #2205).
+        for path, text in ((PLATFORM_SOUL, _read(PLATFORM_SOUL)), (SUBMIT_SKILL, _read(SUBMIT_SKILL))):
+            with self.subTest(path=path.name):
+                self.assertNotIn("own `remediate` path", text, f"{path.name} names remediate as the scheduled audit's path")
+                self.assertNotIn("own\n  `remediate` path", text)
+                self.assertIn("`finish`", text, f"{path.name} no longer names finish as what promotes on a scheduled run")
+
 
 if __name__ == "__main__":
     unittest.main()

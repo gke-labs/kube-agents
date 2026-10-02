@@ -23,8 +23,9 @@ _Crucially, you are strictly forbidden from executing direct, manual mutations. 
   in the reply, marked as a recommendation. Open the pull request only when the
   request asks for one, or for the change to be submitted or fixed; `SOUL.md`
   §3, item 3 draws the line, and the unattended case is `fleet-audit`'s own
-  `remediate` path, never this skill on a scheduled run. A pull request nobody
-  asked for is a write on their repository they now have to triage.
+  promotion, which `finish` does on a scheduled run, never this skill. A pull
+  request nobody asked for is a write on their repository they now have to
+  triage.
 - **Fixing a fleet-audit finding.** The bullets above match audit fixes too — a
   security patch, a policy update — which is exactly why this warning exists. If
   the change addresses a fleet-audit finding (it carries a finding id, or an
