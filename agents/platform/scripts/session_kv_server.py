@@ -537,12 +537,12 @@ _DRIFT_UNSAFE_CHARS_RE = re.compile(r"[`\r\n]")
 DRIFT_MAX_RENDERED_PATHS = 12
 
 # A stall's ledger row is graded Warning, on the watcher's scale, and claims no
-# alert quota: the stall watch's own per-tick cap is the only bound, by decision
+# alert quota: the producer's own per-tick cap is the only bound, by decision
 # (docs/designs/stall-watch-inject.md §3.4).
 STALL_SEVERITY_LABEL = "Warning"
 
-# The emoji the stall watch's "stall noticed in N more namespaces" line leads
-# with, so the alert and that line read as one signal.
+# The emoji the stall watch's "stall noticed" lines lead with, so the alert and
+# those lines read as one signal.
 STALL_ALERT_EMOJI = "🧭"
 
 # The ledger `reason` for a stall row. eod_report_generator.py excludes rows by
@@ -568,12 +568,14 @@ _STALL_DURATION_RE = re.compile(r"<1m|\d+m|\d+h\d{2}m|\d+d\d+h")
 # character the defang layer exists to keep out of the card.
 _STALL_ASSIGNEE_RE = re.compile(r"cluster-[a-z0-9-]+")
 
-# Rows a stall card lists before counting the rest, object names an alert or
-# title spells out, and the title's length: the bounds the stall watch applied
-# to the card it used to file itself.
+# Rows a stall card lists before counting the rest, and object names an alert or
+# title spells out: the bounds the stall watch applied to the card it filed
+# itself. The title's own cap is wider than that card's 120 characters because
+# the `Triage ... on project/cluster (location)` scaffolding takes about 100 of
+# them, and a cap of 120 cut the object names, the part that says what is stalled.
 STALL_MAX_RENDERED_ROWS = 60
 STALL_MAX_OBJECTS_IN_LINE = 8
-STALL_TITLE_MAX_CHARS = 120
+STALL_TITLE_MAX_CHARS = 200
 STALL_TRUNCATION_MARKER = "..."
 
 

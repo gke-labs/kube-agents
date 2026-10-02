@@ -4256,7 +4256,11 @@ class TestStallInject(unittest.TestCase):
     def test_the_query_names_the_assignee_the_watch_resolved(self):
         query = session_kv_server._build_agent_query(self._payload())
         self.assertIn("`assignee`: `cluster-example-project-prod-us-east1-us-east1`", query)
-        self.assertIn("Triage stalled controllers in checkout on example-project/prod-us-east1 (us-east1)", query)
+        self.assertIn(
+            "`Triage stalled controllers in checkout on example-project/prod-us-east1 (us-east1): "
+            "Deployment/checkout-api, Gateway/edge`",
+            query,
+        )
         self.assertIn(session_kv_server._stall_task_body(self._payload()), query)
         self.assertNotIn("Kubernetes Warning event", query)
 
