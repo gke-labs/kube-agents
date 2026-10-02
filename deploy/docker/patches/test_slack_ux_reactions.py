@@ -187,6 +187,10 @@ class ApplierTest(unittest.TestCase):
                 'self._reacting_message_ids = {"m"}',
                 'self._reacting_message_ids = {"m"}\n        self._reacting_message_ids = []',
             ),
+            "hook parameter renamed": (
+                "event: MessageEvent, outcome: ProcessingOutcome)",
+                "event: MessageEvent, result: ProcessingOutcome)",
+            ),
         }
         for name, (old, new) in drifts.items():
             with self.subTest(drift=name):

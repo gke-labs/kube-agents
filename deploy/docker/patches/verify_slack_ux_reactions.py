@@ -119,18 +119,26 @@ def check_adapter(root: Path) -> None:
     if not path.is_file():
         raise _fail(f"{path} does not exist")
     tree = ast.parse(path.read_text())
-    hooks = {
-        node.name: node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.AsyncFunctionDef) and node.name in HOOKS
-    }
+    adapter = _adapter_class(tree)
     for name in HOOKS:
-        node = hooks.get(name)
-        if node is None:
-            raise _fail(f"{ADAPTER} has no async def {name}()")
+        node = _method(adapter, name)
+        if not isinstance(node, ast.AsyncFunctionDef):
+            raise _fail(f"{ADAPTER_CLASS}.{name}() is no longer async")
         body = node.body
         if len(body) < 3 or not _is_guard(body[1], name):
             raise _fail(f"{name}() does not open with the {FLAG_ENV} guard after its docstring")
+        # The applier anchors on the docstring, so a renamed parameter leaves
+        # a guard that compiles and raises NameError on every flag-on turn.
+        signature = node.args
+        params = {a.arg for a in signature.posonlyargs + signature.args + signature.kwonlyargs}
+        params.update(a.arg for a in (signature.vararg, signature.kwarg) if a is not None)
+        guard = body[1].body[0].value.value
+        unbound = [
+            n.id for arg in [*guard.args[1:], *(k.value for k in guard.keywords)]
+            for n in ast.walk(arg) if isinstance(n, ast.Name) and n.id not in params
+        ]
+        if unbound:
+            raise _fail(f"{name}() guard passes {', '.join(unbound)}, which the hook no longer takes")
     bound = any(
         isinstance(stmt, ast.ImportFrom)
         and stmt.module == IMPORT_MODULE
@@ -140,6 +148,15 @@ def check_adapter(root: Path) -> None:
     if not bound:
         raise _fail(f"{ADAPTER} does not import {IMPORT_MODULE}.{IMPORT_NAME} as {GUARD_ALIAS}")
     _check_members(tree)
+
+
+def _adapter_class(tree: ast.Module) -> ast.ClassDef:
+    adapter = next(
+        (node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == ADAPTER_CLASS), None,
+    )
+    if adapter is None:
+        raise _fail(f"{ADAPTER} has no class {ADAPTER_CLASS}")
+    return adapter
 
 
 def _method(adapter: ast.ClassDef, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
