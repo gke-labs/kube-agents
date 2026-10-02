@@ -863,6 +863,25 @@ class RuntimeTest(unittest.TestCase):
                     self._options_incident(adapter, *labels)
                     check(adapter)
 
+    def test_a_clipped_buttons_shown_text_counts_as_its_whole_text(self):
+        # The button shows "apply Option B: Roll back checkout-gateway to the last revision that…".
+        labels = (
+            "apply Option A: Raise the limit",
+            "apply Option B: Roll back checkout-gateway to the last revision that served without OOMKills in prod",
+        )
+        cases = (
+            (self._drops, "apply Option B: Roll back checkout-gateway to the last revision that…"),
+            (self._drops, "apply B: roll back checkout-gateway to the last revision that"),
+            (self._runs, "apply B: Roll back checkout-gateway to the last revision"),
+            (self._runs, "apply A: Roll back checkout-gateway to the last revision that"),
+        )
+        for check, text in cases:
+            with self.subTest(text=text):
+                importlib.reload(runtime)
+                adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": text, "ts": "223.000"}])
+                self._options_incident(adapter, *labels)
+                check(adapter)
+
     def test_a_colon_form_with_a_hostname_slack_linked_still_counts(self):
         # Slack sends a typed hostname as <http://host|host>, and a typed url as <url>.
         labels = (

@@ -151,6 +151,9 @@ TYPED_APPLY = re.compile(
 #: or ``SINGLE_LABEL``: its capital letter, if it has one, and the option's own text.
 BUTTON_FORM = re.compile(r"apply(?: Option ([A-Z]))?: (.+)", re.DOTALL)
 
+#: What ``slack_presenter._clip`` ends a button's clipped shown text with.
+CLIPPED_END = "…"
+
 #: Slack's escapes in a message's text, undone before typed option text is compared.
 SLACK_ESCAPES = (("&lt;", "<"), ("&gt;", ">"), ("&amp;", "&"))
 
@@ -306,7 +309,8 @@ def _option_text(text: str) -> str:
 
 def _option_texts(message: dict) -> frozenset[tuple[str, str]]:
     """The incident option buttons on ``message``, each as its letter (``""`` for the single
-    button's ``apply:``) and its own text, read from the value: the shown text may be clipped."""
+    button's ``apply:``) and its own text: whole, from the value, and as the button shows it,
+    which may be clipped, with and without the clip's ellipsis."""
     found = set()
     for block in message.get("blocks") or ():
         if not isinstance(block, dict) or block.get("type") != "actions":
@@ -316,9 +320,12 @@ def _option_texts(message: dict) -> frozenset[tuple[str, str]]:
                 INCIDENT_CHOICE_PREFIX
             ):
                 continue
-            form = BUTTON_FORM.match(str(element.get("value") or ""))
-            if form:
-                found.add((form.group(1) or "", _option_text(form.group(2))))
+            shown = element.get("text")
+            shown = str(shown.get("text") or "") if isinstance(shown, dict) else ""
+            for label in (str(element.get("value") or ""), shown, shown.removesuffix(CLIPPED_END)):
+                form = BUTTON_FORM.match(label)
+                if form:
+                    found.add((form.group(1) or "", _option_text(form.group(2))))
     return frozenset(found)
 
 
