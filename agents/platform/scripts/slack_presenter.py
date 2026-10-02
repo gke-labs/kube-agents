@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import os
 import re
+from bisect import bisect_right
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
@@ -152,8 +153,8 @@ MD_LINK = re.compile(r"\[([^\]]+)\]\(([^()\s]+(?:\([^()\s]*\)[^()\s]*)*)\)")
 #: ``*italic*`` and ``_italic_``; a ``*`` inside a word (``2*3``) or unpaired (``*.tmp``) is text.
 MD_ITALIC = re.compile(r"(?<![\w*])\*(?=[^\s.])([^*\n]+?)(?<=\S)\*(?![\w*])|(?<![\w_])_(?=[^\s.])([^_\n]+?)(?<=\S)_(?![\w_])")
 #: Inline code.
-#: A code span: a backtick run, then content, then a run of the same length (CommonMark).
-MD_CODE = re.compile(r"(?<!`)(`+)([^\n]+?)(?<!`)\1(?!`)")
+#: A backtick run, which opens or closes a code span (see ``_code_spans``).
+BACKTICK_RUN = re.compile(r"`+")
 #: Holds a code span's place while the other markup is stripped; NUL never appears in an answer.
 CODE_PLACEHOLDER = re.compile(r"\x00(\d+)\x00")
 MRKDWN_ESCAPES = (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
@@ -271,23 +272,54 @@ def _plain(markdown: str) -> str:
     text = MD_LINK.sub(r"\1", text)
     text = MD_BOLD.sub(lambda m: next(g for g in m.groups() if g is not None), text)
     text = MD_ITALIC.sub(lambda m: m.group(1) or m.group(2), text)
-    return CODE_PLACEHOLDER.sub(lambda m: spans[int(m.group(1))].group(2).strip(), text).strip()
+    return CODE_PLACEHOLDER.sub(lambda m: spans[int(m.group(1))][1].strip(), text).strip()
 
 
-def _hold_code(text: str) -> tuple[str, list[re.Match]]:
-    """``text`` with each code span swapped for a placeholder, and the spans."""
-    spans: list[re.Match] = []
+def _code_spans(text: str) -> list[tuple[int, int, int]]:
+    """``(start, end, opener length)`` of each code span in ``text``, left to right.
 
-    def hold(match: re.Match) -> str:
-        spans.append(match)
-        return f"\x00{len(spans) - 1}\x00"
+    A span opens on a backtick run, or on as long a start of one as a later run on the
+    same line matches, and closes on the first later run of exactly that length
+    (CommonMark). Each line's runs are indexed by length and the closing run bisected for,
+    so a long run is not rescanned once per opening length.
+    """
+    spans: list[tuple[int, int, int]] = []
+    offset = 0
+    for line in text.split("\n"):
+        runs = [(m.start(), m.end() - m.start()) for m in BACKTICK_RUN.finditer(line)]
+        starts: dict[int, list[int]] = {}
+        for start, length in runs:
+            starts.setdefault(length, []).append(start)
+        end = 0
+        for start, length in runs:
+            if start < end:
+                continue
+            for opener in range(length, 0, -1):
+                closers = starts.get(opener, [])
+                after = bisect_right(closers, start)
+                if after < len(closers):
+                    end = closers[after] + opener
+                    spans.append((offset + start, offset + end, opener))
+                    break
+        offset += len(line) + 1
+    return spans
 
-    return MD_CODE.sub(hold, text), spans
+
+def _hold_code(text: str) -> tuple[str, list[tuple[str, str]]]:
+    """``text`` with each code span swapped for a placeholder, and each span's text and content."""
+    held: list[str] = []
+    spans: list[tuple[str, str]] = []
+    last = 0
+    for start, end, opener in _code_spans(text):
+        held += [text[last:start], f"\x00{len(spans)}\x00"]
+        spans.append((text[start:end], text[start + opener : end - opener]))
+        last = end
+    return "".join(held) + text[last:], spans
 
 
-def _restore_code(text: str, spans: list[re.Match]) -> str:
+def _restore_code(text: str, spans: list[tuple[str, str]]) -> str:
     """``text`` with each placeholder put back as its code span, backticks included."""
-    return CODE_PLACEHOLDER.sub(lambda m: spans[int(m.group(1))].group(0), text)
+    return CODE_PLACEHOLDER.sub(lambda m: spans[int(m.group(1))][0], text)
 
 
 def _clip(text: str, limit: int) -> str:

@@ -6,6 +6,7 @@ Run: python3 -m pytest agents/platform/scripts/test_slack_presenter.py
 import asyncio
 import os
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -13,6 +14,10 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import slack_presenter as sp
+
+#: A run of this many backticks took 7 seconds while a code span's closing run was
+#: searched for once per possible opening length.
+BACKTICK_REPEATS = 20_000
 
 
 class FlagTest(unittest.TestCase):
@@ -208,6 +213,15 @@ class SplitAnswerTest(unittest.TestCase):
     def test_more_abbreviations_do_not_end_the_headline(self):
         for line in ("Node pool np-1 at rev. 7 is cordoned.", "Certs expired Sept. 30 on seeded-a."):
             self.assertEqual(sp.split_answer(line), (line, []))
+
+    def test_a_long_backtick_run_stays_linear(self):
+        for line in (
+            "x " + "`" * BACKTICK_REPEATS,
+            "x " + " ".join("`" * n for n in range(1, BACKTICK_REPEATS // 100)),
+        ):
+            started = time.monotonic()
+            sp.split_answer(line)
+            self.assertLess(time.monotonic() - started, 0.5)
 
     def test_plain_leaves_code_spans_and_globs_alone(self):
         self.assertEqual(sp._plain("`__init__.py` is missing"), "__init__.py is missing")
