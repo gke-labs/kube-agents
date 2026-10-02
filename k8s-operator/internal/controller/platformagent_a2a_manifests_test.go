@@ -20,7 +20,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	goerrors "errors"
 	"fmt"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"maps"
@@ -2190,77 +2189,149 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender(t *testing.T) {
 	}
 }
 
-// TestCleanupA2AProceedsPastUnownedClusterRoleBindingToStatefulSet pins the invariant
-// that an unowned or squatted callout ClusterRoleBinding does not prevent cleanupA2A
-// from deleting the NATS StatefulSet sentinel. A permanent ownership refusal on the
-// cluster-scoped binding must be non-fatal for the rest of the teardown walk so that
-// the bus comes down cleanly and the early-exit sentinel is removed rather than leaving
-// a headless StatefulSet stranded indefinitely (#2226 / #2216).
-func TestCleanupA2AProceedsPastUnownedClusterRoleBindingToStatefulSet(t *testing.T) {
+// TestCleanupA2AHaltsBeforeStatefulSetOnPersistentClusterRoleBindingError pins
+// the invariant that an error deleting the callout's cluster-scoped
+// ClusterRoleBinding (whether an ownership refusal or an apiserver delete failure
+// such as a ValidatingAdmissionPolicy or RBAC restriction) halts cleanupA2A before
+// the NATS StatefulSet sentinel is deleted.
+//
+// The StatefulSet sentinel must remain standing across failed reconcile passes
+// so that subsequent reconciles continue driving teardown rather than early-exiting
+// and silently leaking the cluster-scoped tokenreviews/create grant behind (#2216 / #2226).
+func TestCleanupA2AHaltsBeforeStatefulSetOnPersistentClusterRoleBindingError(t *testing.T) {
 	scheme := setupScheme()
 	next := a2aTestAgent()
 	today := next.DeepCopy()
 	today.Spec.Mode = nil
 
-	cl := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(next.DeepCopy()).
-		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
-		WithInterceptorFuncs(interceptor.Funcs{
-			Patch: fakeServerSideApplyInterceptors().Patch,
-		}).
-		Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	ctx := context.Background()
-	theCalloutIsServing(t, ctx, cl, r, next)
-	if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err != nil {
-		t.Fatalf("render: %v", err)
-	}
-
 	crbName := a2aCalloutClusterRoleBindingName(next)
-	crb := &rbacv1.ClusterRoleBinding{}
-	if err := cl.Get(ctx, types.NamespacedName{Name: crbName}, crb); err != nil {
-		t.Fatalf("get ClusterRoleBinding: %v", err)
-	}
-	// Simulate an unowned / squatted ClusterRoleBinding by corrupting its instance label.
-	crb.Labels[labelInstance] = "foreign-agent"
-	if err := cl.Update(ctx, crb); err != nil {
-		t.Fatalf("update ClusterRoleBinding label: %v", err)
-	}
-
-	// Verify the StatefulSet stands prior to cleanup.
 	stsName := a2aNATSName(next)
-	sts := &appsv1.StatefulSet{}
-	if err := cl.Get(ctx, types.NamespacedName{Name: stsName, Namespace: next.Namespace}, sts); err != nil {
-		t.Fatalf("NATS StatefulSet should exist before cleanup: %v", err)
+
+	tests := []struct {
+		name       string
+		setup      func(ctx context.Context, cl client.Client)
+		failDelete func(obj client.Object) bool
+		clear      func(ctx context.Context, cl client.Client)
+	}{
+		{
+			name: "apiserver_or_admission_delete_failure",
+			failDelete: func(obj client.Object) bool {
+				return obj.GetObjectKind().GroupVersionKind().Kind == "ClusterRoleBinding" ||
+					(obj.GetName() == crbName && reflect.TypeOf(obj).Elem().Name() == "ClusterRoleBinding")
+			},
+		},
+		{
+			name: "unowned_binding_refusal",
+			setup: func(ctx context.Context, cl client.Client) {
+				crb := &rbacv1.ClusterRoleBinding{}
+				if err := cl.Get(ctx, types.NamespacedName{Name: crbName}, crb); err != nil {
+					t.Fatalf("get ClusterRoleBinding: %v", err)
+				}
+				crb.Labels[labelInstance] = "foreign-agent"
+				if err := cl.Update(ctx, crb); err != nil {
+					t.Fatalf("update ClusterRoleBinding label: %v", err)
+				}
+			},
+			clear: func(ctx context.Context, cl client.Client) {
+				crb := &rbacv1.ClusterRoleBinding{}
+				if err := cl.Get(ctx, types.NamespacedName{Name: crbName}, crb); err != nil {
+					t.Fatalf("get ClusterRoleBinding: %v", err)
+				}
+				crb.Labels[labelInstance] = instanceLabel(next.Namespace, next.Name)
+				if err := cl.Update(ctx, crb); err != nil {
+					t.Fatalf("restore ClusterRoleBinding label: %v", err)
+				}
+			},
+		},
 	}
 
-	// First cleanup pass: must return the ownership refusal error, BUT must have
-	// proceeded to delete the NATS StatefulSet rather than aborting early.
-	err := r.cleanupA2A(ctx, today.DeepCopy())
-	if err == nil {
-		t.Fatal("cleanup pass 1: want ownership refusal error, got nil")
-	}
-	if !goerrors.Is(err, errUnownedA2AClusterRoleBinding) {
-		t.Fatalf("cleanup pass 1: want errUnownedA2AClusterRoleBinding, got %v", err)
-	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			refuseDelete := true
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(next.DeepCopy()).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Patch: fakeServerSideApplyInterceptors().Patch,
+					Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+						if refuseDelete && tc.failDelete != nil && tc.failDelete(obj) {
+							return errors.NewForbidden(rbacv1.Resource("clusterrolebindings"), crbName, fmt.Errorf("denied by validating admission policy"))
+						}
+						return c.Delete(ctx, obj, opts...)
+					},
+				}).
+				Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+			ctx := context.Background()
+			theCalloutIsServing(t, ctx, cl, r, next)
+			if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err != nil {
+				t.Fatalf("render: %v", err)
+			}
+			if tc.setup != nil {
+				tc.setup(ctx, cl)
+			}
 
-	// The NATS StatefulSet MUST be gone.
-	if err := cl.Get(ctx, types.NamespacedName{Name: stsName, Namespace: next.Namespace}, sts); !errors.IsNotFound(err) {
-		t.Errorf("NATS StatefulSet survived cleanupA2A despite mode flip to today (err=%v).\n"+
-			"The ownership refusal on the foreign ClusterRoleBinding must not stand between the bus and teardown.", err)
-	}
+			// Verify StatefulSet and ClusterRoleBinding stand before cleanup.
+			sts := &appsv1.StatefulSet{}
+			if err := cl.Get(ctx, types.NamespacedName{Name: stsName, Namespace: next.Namespace}, sts); err != nil {
+				t.Fatalf("StatefulSet must exist before cleanup: %v", err)
+			}
+			crb := &rbacv1.ClusterRoleBinding{}
+			if err := cl.Get(ctx, types.NamespacedName{Name: crbName}, crb); err != nil {
+				t.Fatalf("ClusterRoleBinding must exist before cleanup: %v", err)
+			}
 
-	// The foreign ClusterRoleBinding must NOT have been deleted.
-	if err := cl.Get(ctx, types.NamespacedName{Name: crbName}, crb); err != nil {
-		t.Errorf("foreign ClusterRoleBinding was deleted or errored: %v", err)
-	}
+			// Pass 1: cleanup encounters the failure on the ClusterRoleBinding.
+			// Must return an error, and the StatefulSet MUST NOT have been deleted.
+			if err := r.cleanupA2A(ctx, today.DeepCopy()); err == nil {
+				t.Fatal("cleanup pass 1: want error, got nil")
+			}
+			if err := cl.Get(ctx, types.NamespacedName{Name: stsName, Namespace: next.Namespace}, sts); err != nil {
+				t.Fatalf("cleanup pass 1: NATS StatefulSet sentinel was deleted prematurely: %v", err)
+			}
 
-	// Second cleanup pass (subsequent reconcile): with the StatefulSet gone, no owned
-	// sentinels stand, so cleanupA2A early-exits cleanly (returns nil) instead of
-	// looping on the foreign ClusterRoleBinding refusal on every reconcile forever.
-	if err := r.cleanupA2A(ctx, today.DeepCopy()); err != nil {
-		t.Fatalf("cleanup pass 2 (resumed/subsequent reconcile): want nil early-exit, got %v", err)
+			// Pass 2: Failure persists on the subsequent reconcile pass.
+			// Because the StatefulSet sentinel is still standing, cleanupA2A enters
+			// teardown rather than early-exiting. It must fail again and the StatefulSet
+			// sentinel must STILL stand.
+			if err := r.cleanupA2A(ctx, today.DeepCopy()); err == nil {
+				t.Fatal("cleanup pass 2 (persisted failure): want error, got nil early-exit")
+			}
+			if err := cl.Get(ctx, types.NamespacedName{Name: stsName, Namespace: next.Namespace}, sts); err != nil {
+				t.Fatalf("cleanup pass 2: NATS StatefulSet sentinel was deleted prematurely: %v", err)
+			}
+
+			// Now resolve the failure.
+			refuseDelete = false
+			if tc.clear != nil {
+				tc.clear(ctx, cl)
+			}
+
+			// Pass 3: With the failure resolved, cleanupA2A completes cleanly.
+			if err := r.cleanupA2A(ctx, today.DeepCopy()); err != nil {
+				t.Fatalf("cleanup pass 3 (cleared): %v", err)
+			}
+
+			// StatefulSet and ClusterRoleBinding must now both be gone.
+			if err := cl.Get(ctx, types.NamespacedName{Name: stsName, Namespace: next.Namespace}, sts); !errors.IsNotFound(err) {
+				t.Errorf("cleanup pass 3: NATS StatefulSet survived: %v", err)
+			}
+			if err := cl.Get(ctx, types.NamespacedName{Name: crbName}, crb); !errors.IsNotFound(err) {
+				t.Errorf("cleanup pass 3: ClusterRoleBinding survived: %v", err)
+			}
+
+			var leftovers []string
+			sweepA2ALabelled(ctx, t, cl, func(kind, name string) {
+				if kind == "Secret" && name == "test-agent-a2a-nats-creds" {
+					return
+				}
+				leftovers = append(leftovers, kind+"/"+name)
+			})
+			if len(leftovers) > 0 {
+				t.Errorf("cleanup pass 3 left unexpected residue: %v", leftovers)
+			}
+		})
 	}
 }
 
