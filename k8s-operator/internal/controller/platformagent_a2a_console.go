@@ -164,6 +164,12 @@ func buildA2AConsoleDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			// One. It serves a page to whoever holds a port-forward, and a
 			// port-forward picks one pod anyway.
 			Replicas: ptr.To(int32(1)),
+			// Recreate, as the gateway is: at one replica the RollingUpdate
+			// default needs a surge Pod, which can stall under the namespace
+			// pod quota (#977, #1267). Set from the first render, because
+			// switching an applied Deployment to Recreate later trips the
+			// server-defaulted rollingUpdate block (a2aGatewayRecreateStrategyPatch).
+			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
 			Selector: &metav1.LabelSelector{MatchLabels: selector},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},

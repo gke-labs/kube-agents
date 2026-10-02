@@ -509,7 +509,7 @@ Layout:
   below)**. The demo's
   `kubectl port-forward` and the kubelet's readiness probe both enter from the node,
   which NetworkPolicy does not govern, so the ws surface stays reachable through
-  kubectl and through nothing else in-cluster. The enumeration is today's client
+  kubectl and, in-cluster, through the console server alone. The enumeration is today's client
   list, and it must grow with the components this spec designs. The auth callout was
   the first, and it landed in the same change that armed the callout rather than after
   it, for the reason that makes this rule worth having: the callout is itself a bus

@@ -253,7 +253,7 @@
       "tag": "22-slim",
       "buildArg": "NODE_IMAGE",
       "pulledBy": "a2a/Dockerfile.worker runtime stage and a2a/Dockerfile.console page build stage.",
-      "description": "Node runtime for the session worker image, which installs the agent SDK's platform package to get the harness binary."
+      "description": "Node runtime for the session worker image, which installs the agent SDK's platform package to get the harness binary, and the stage that builds the console page."
     },
     {
       "name": "python",

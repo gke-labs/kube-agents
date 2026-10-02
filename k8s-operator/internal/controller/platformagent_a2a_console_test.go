@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -60,6 +61,9 @@ func TestBuildA2AConsoleDeployment(t *testing.T) {
 	}
 	if dep.Spec.Replicas == nil || *dep.Spec.Replicas != 1 {
 		t.Errorf("replicas = %v, want 1", dep.Spec.Replicas)
+	}
+	if dep.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
+		t.Errorf("strategy = %q, want Recreate: a surge pod can stall under the namespace pod quota", dep.Spec.Strategy.Type)
 	}
 
 	pod := dep.Spec.Template.Spec
@@ -263,5 +267,34 @@ func TestReconcileA2ARendersAndRemovesTheConsole(t *testing.T) {
 	}
 	if err := cl.Get(ctx, netpol, &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
 		t.Errorf("console NetworkPolicy still present under today (err=%v)", err)
+	}
+}
+
+// The console fence outlives every other front-door object in the teardown:
+// its Deployment's Delete returns before the pod has exited, and an unfenced
+// console pod hands its password to any in-cluster caller.
+func TestTheConsoleFenceIsDeletedAfterTheConsoleAndBeforeTheBus(t *testing.T) {
+	agent := a2aTestAgent()
+	r := &PlatformAgentReconciler{}
+	pos := map[string]int{}
+	for i, e := range r.a2aNamespacedTeardown(agent) {
+		pos[fmt.Sprintf("%T/%s", e.obj, e.obj.GetName())] = i
+	}
+	idx := func(key string) int {
+		i, ok := pos[key]
+		if !ok {
+			t.Fatalf("teardown has no %s", key)
+		}
+		return i
+	}
+	fence := idx("*v1.NetworkPolicy/" + a2aConsoleNetpolName(agent))
+	if dep := idx("*v1.Deployment/" + a2aConsoleName(agent)); fence < dep {
+		t.Errorf("console fence at %d, before its Deployment at %d", fence, dep)
+	}
+	if session := idx("*v1.NetworkPolicy/" + a2aSessionNetpolName(agent)); fence < session {
+		t.Errorf("console fence at %d, before the session fence at %d", fence, session)
+	}
+	if sts := idx("*v1.StatefulSet/" + a2aNATSName(agent)); fence > sts {
+		t.Errorf("console fence at %d, after the StatefulSet sentinel at %d", fence, sts)
 	}
 }

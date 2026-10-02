@@ -1445,15 +1445,15 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 	}
 	// Default gateway cap 10 + the fixed headroom for the rest of the
 	// namespace (base stack, rollout surge, race overshoot).
-	if pods.Value() != 25 {
-		t.Fatalf("default quota = %d, want 25 (cap 10 + headroom 15)", pods.Value())
+	if pods.Value() != 26 {
+		t.Fatalf("default quota = %d, want 26 (cap 10 + headroom 16)", pods.Value())
 	}
 
 	two := 2
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &two}}
 	pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]
-	if pods.Value() != 17 {
-		t.Fatalf("tuned quota = %d, want 17 (cap 2 + headroom 15)", pods.Value())
+	if pods.Value() != 18 {
+		t.Fatalf("tuned quota = %d, want 18 (cap 2 + headroom 16)", pods.Value())
 	}
 }
 

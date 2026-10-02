@@ -2875,10 +2875,11 @@ const defaultA2AMaxSessions = 10
 // legitimately runs here: the rendered stack and its neighbors (operator,
 // agent pod, gateway, NATS, LiteLLM, dashboard), Job pods (provision, seed),
 // rollout surge doubling a Deployment for a moment, and the gateway's
-// count-then-create overshoot. Fifteen covers roughly ten standing pods plus
-// surge; if the base install grows past that, raise this before anything
-// user-visible starts failing admission.
-const a2aQuotaHeadroom = 15
+// count-then-create overshoot. Fifteen covered roughly ten standing pods plus
+// surge; the console server made it eleven, hence sixteen. If the base
+// install grows again, raise this before anything user-visible starts failing
+// admission.
+const a2aQuotaHeadroom = 16
 
 func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
 	if limits := agentTuning(agent); limits != nil && limits.MaxSessions != nil {
@@ -4503,11 +4504,10 @@ func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.Pla
 		{&corev1.Secret{ObjectMeta: injectMeta}, r.a2aReader()},
 		// The console server, with the gateway: both are front doors onto
 		// the bus, and both go before the bus they front. Its fence goes
-		// with it rather than with the NATS and session fences below, so
-		// there's never a console pod without one.
+		// later, beside the session fence, for the same reason that one is
+		// late: the Delete above returns before the pod is gone.
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aConsoleName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aConsoleName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aConsoleNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The auth callout, before the bus it authorizes for. Its Deployment
 		// goes first so it stops answering while there is still a server to
 		// answer for; the keys Secret goes with it rather than surviving like
@@ -4545,6 +4545,13 @@ func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.Pla
 		// removing it, and removing it would take a foreground delete and a
 		// wait this reconcile has no reason to block on.
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
+		// The console fence, late for the session fence's reason. The window
+		// matters more here: until the console pod exits, anything in the
+		// cluster that reaches it can read the console password off
+		// /config.json, and the creds Secret that password lives in survives
+		// the flip. The order shortens that window to the pod's exit; it does
+		// not remove it.
+		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aConsoleNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		// ResourceQuota is not a watched kind, so the read goes through
 		// a2aReader like the Secrets. Deleting it here is safe even with
