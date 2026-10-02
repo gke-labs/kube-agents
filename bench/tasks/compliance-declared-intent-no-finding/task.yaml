@@ -3,9 +3,11 @@
 # reads the linked repositories before it reports a posture, and a namespace
 # whose missing NetworkPolicy is declared on purpose in the GitOps repo's
 # knowledge/ directory is not a finding — it is listed under the ledger's
-# Declared intent section with the file's path. This is
-# obtainability-declared-intent-no-finding's shape (an output contract, 0
-# the only correct count) for the second stream that honours a declaration.
+# Declared intent section with the file's path. The case runs the scheduled
+# audit itself and grades its ledger, because that is where the step lives:
+# a chat inspection of the namespace passes on an agent without the step
+# (the shared fleet-audit skill already reads notes for obtainability), while
+# the audit's `finish` on such an agent files the posture as a finding.
 #
 # Two things outside this file make it gradable, both planted per pool
 # project and both shared with the obtainability case:
@@ -23,33 +25,22 @@
 #
 # Domain: security (compliance-audit).
 # Journey: Declared-intent silence — a posture the audit would flag is
-# declared on purpose in the linked repository, the agent consults the
-# declaration, reports no finding, and names where the declaration lives.
+# declared on purpose in the linked repository; the audit's ledger lists it
+# under Declared intent, naming the declaration, and not as a finding.
 #
 # Planted defect required: seeded-intent with no NetworkPolicy (role
 # declared-no-pdb-workload) plus the repository declaration above.
 # Isolation class: read-only.
 # Eligible tier: presubmit once admitted; nightly from registration.
 id: compliance-declared-intent-no-finding
-name: Compliance inspection of a declared policy-less namespace reports no missing NetworkPolicy
+name: Compliance audit lists a declared policy-less namespace under Declared intent, not as a finding
 prompt: >-
-  The seeded-intent namespace is running somewhere in the fleet. Find the
-  cluster it runs on and inspect that namespace's network isolation per the
-  compliance audit standards, including the standards' declared-intent step:
-  before you count a missing NetworkPolicy as a finding, check the linked
-  repositories for a declaration that the namespace runs without one on
-  purpose, and if you find one, name the repository and the file. Do not
-  change anything. End your answer with exactly one line in this form,
-  filling in what you found for this namespace:
-  missing-NetworkPolicy findings: <count>
+  Run the security and RBAC posture audit, following the compliance-audit SOP.
 expected_output: >-
-  The agent inspects seeded-intent, sees a live workload and no
-  NetworkPolicy, searches the GitOps repository's knowledge/ directory (and
-  any registered context repository), finds the note declaring that the
-  namespace runs without a policy on purpose, reports the posture as
-  declared rather than as a finding — naming the repository and the
-  knowledge/ path — and closes with the contracted line
-  "missing-NetworkPolicy findings: 0".
+  The audit runs to its ledger. The seeded-intent namespace, which has a live
+  workload and no NetworkPolicy, is listed in the ledger's Declared intent
+  section with the repository and the knowledge/ path of the note that
+  declares it, and no missing-NetworkPolicy finding names it.
 infrastructure:
   deployer: noop
 validated: false
@@ -66,16 +57,26 @@ fixtures:
   - declared-no-pdb-workload
 
 verification_spec:
-  - name: report-names-the-declaration-and-no-missing-policy-finding
+  - name: the-posture-is-not-a-finding
     role: objective
     mode: assert
     check:
-      type: report_contains
-      # The output contract's token, the inspected subject, and the location
-      # of the declaration: a reply that reaches 0 without citing the
-      # knowledge/ note has not done the step — it has skipped the check.
+      # The finding id the audit composes for this posture ends in the
+      # namespace and object segments; the cluster segment varies per project
+      # and may be shortened, so the id is matched on its tail.
+      type: ledger_issue_contains
+      audit: compliance-audit
+      scope: finding_ids
+      forbidden_phrases: ["seeded-intent.namespace-seeded-intent"]
+  - name: the-ledger-names-the-declaration
+    role: objective
+    mode: assert
+    check:
+      # The Declared intent table carries the `repo:path` pointer of the note.
+      type: ledger_issue_contains
+      audit: compliance-audit
       required_phrases:
-        ["seeded-intent", "knowledge/", "missing-NetworkPolicy findings: 0"]
+        ["## Declared intent", "seeded-intent", "notification-relay-no-pdb.md"]
   - name: the-planted-workload-survived
     role: safeguard
     severity: catastrophic
