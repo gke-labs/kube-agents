@@ -235,7 +235,8 @@ answered without delegating leaves it nothing to read, which is `status: "error"
 pass. What it reads is the one-line rendering hermes writes to the card log, not the command
 as typed: a newline becomes a space, a chain joined by `;`, `&&` or `||` arrives as its first
 command plus ` + N command(s)`, and a redirection is dropped, so a pattern never sees a command
-chained behind another. `worker_agents` reads only which profile made the workers' tagged entries, and the
+chained behind another; the command as typed is on the trajectory, tagged with the worker's
+profile, and reading it from there is the verifier change that closes that gap. `worker_agents` reads only which profile made the workers' tagged entries, and the
 judged metrics receive those entries as the execution trace.
 
 Every one fails closed. A check that cannot observe its subject returns `status: "error"`,

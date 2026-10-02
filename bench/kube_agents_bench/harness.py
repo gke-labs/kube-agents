@@ -903,11 +903,12 @@ def _worker_logs(task_ids: list[str], timeout: float) -> dict[str, _WorkerLog | 
 def _worker_commands(logs: dict[str, _WorkerLog | None] | None) -> list[dict[str, str]] | None:
     """Every terminal command the delegated workers ran, from their card logs.
 
-    The worker is a separate hermes session and its tool calls never reach
-    ``result.trajectory`` (see ``ToolCalledVerifier``), but its log records
-    each terminal command it executed -- the one check that can say which
-    route a worker took, not only what it answered. Only terminal commands
-    are visible; MCP tool calls are not.
+    The worker is a separate hermes session; its log records each terminal
+    command it executed, as hermes rendered it, and that rendering is what
+    the ``worker_commands`` verifier grades. Its tool calls as typed reach
+    ``result.trajectory`` through :func:`worker_trajectory.capture`, which
+    :meth:`_settle` runs after this read; ``tool_called`` grades those. Only
+    terminal commands are in the log; MCP tool calls are not.
 
     ``None`` when :func:`_worker_logs` read nothing or failed on any card: a
     capture that failed, or a run that delegated nothing, is not a run whose
