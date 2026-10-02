@@ -176,10 +176,14 @@ Seven read what the run produced, from this repository
 `report_contains` (phrases in the agent's answer; its `forbidden_patterns` and
 `any_of_patterns` are regular expressions searched against a line-preserving text, with each
 line's decoration folded when the check sets `fold_decoration: true` (indentation, bullets,
-numbers, headings, quotes, links, a trailing stop or mark), so a pattern anchored at both ends
+numbers, headings, quotes, links, a trailing stop or an affirming mark; a mark that hedges or
+negates the last word stays, so it reads as a wrong value), so a pattern anchored at both ends
 spells a declared line once and should keep `\n` out of its gaps, for what no substring can
 express: a banned word whose negated uses are legitimate, and a required claim whose
-subject and verb an adverb or a tense can separate), `tool_called` (calls in the
+subject and verb an adverb or a tense can separate; its `fixture_roles` names the seeded-fleet
+roles whose clusters the patterns require a line about, and a role the runner resolved no
+kubeconfig for returns `status: "error"`, the slot being absent from the project rather than
+missed by the agent), `tool_called` (calls in the
 trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
 published), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier

@@ -36,11 +36,14 @@ The load-bearing properties, in rough order of what they cost if wrong:
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 import time
 import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 import pytest
 import yaml
@@ -50,7 +53,7 @@ from devops_bench.verification.base import VERIFIERS
 from devops_bench.verification.runner import VerifierAgent
 from devops_bench.verification.spec import VerificationEntry, parse_node
 
-from kube_agents_bench import transcript, verifiers
+from kube_agents_bench import fleet, transcript, verifiers
 from kube_agents_bench.verifiers import (
     WorkerAgentsVerifier,
     WorkerCommandsVerifier,
@@ -58,6 +61,7 @@ from kube_agents_bench.verifiers import (
     PullRequestOpenedVerifier,
     ReportContainsVerifier,
     ToolCalledVerifier,
+    _fold_line_decoration,
 )
 
 from conftest import TASKS
@@ -224,6 +228,27 @@ def test_line_decoration_fold_covers_links_headings_tables_and_marks(line):
     assert v.verify(5.0).status == "pass"
 
 
+@pytest.mark.parametrize("mark", ["\U0001F6AB", "\U0001F6D1", "\U0001F44E", "\u274e", "\u26a0\ufe0f", "?", "!", "\u2026"])
+def test_line_decoration_fold_keeps_a_mark_it_does_not_name(mark):
+    # The closer list is an allowlist: a trailing symbol it does not name is
+    # part of the value, so the anchored pattern does not match.
+    _stash(f"seeded-a: control plane is zonal {mark}")
+    v = ReportContainsVerifier(
+        type="report_contains", fold_decoration=True, any_of_patterns=[r"(?m)^seeded-a: control plane is zonal$"]
+    )
+    assert v.verify(5.0).status == "fail"
+
+
+def test_footnote_fold_is_linear_on_many_overlapping_markers():
+    # Overlapping alternatives inside a possessive repeat: a line that ends
+    # in many markers and then a word must not backtrack exponentially.
+    line = "seeded-a: control plane is zonal" + " [^1]" * 60 + " x"
+    start = time.monotonic()
+    folded = _fold_line_decoration(line)
+    assert time.monotonic() - start < 1.0
+    assert folded == line
+
+
 def test_line_decoration_fold_keeps_interior_punctuation():
     _stash("- pool/a (zone-1): 100% used; 3 of 4 pods (75%) ready.")
     v = ReportContainsVerifier(
@@ -272,13 +297,34 @@ def _zonal_case_check(objective: str) -> dict:
     raise AssertionError(f"{objective} not in {_ZONAL_CASE}")
 
 
-def _zonal_case_grades(objective: str, text: str) -> bool:
+def _zonal_case_fixtures() -> list[str]:
+    return list(yaml.safe_load(_ZONAL_CASE.read_text(encoding="utf-8"))["fixtures"])
+
+
+def _fleet_dir(roles: list[str]) -> str:
+    """A runner-shaped kubeconfig directory: one file per reached role."""
+    root = tempfile.mkdtemp(prefix="zonal-fleet-")
+    for role in roles:
+        (Path(root) / f"{role}.kubeconfig").write_text("apiVersion: v1\n", encoding="utf-8")
+    return root
+
+
+_ZONAL_FLEET = _fleet_dir(_zonal_case_fixtures())
+
+
+def _zonal_case_verdict(objective: str, text: str, fleet_dir: str = _ZONAL_FLEET):
     # parse_node rather than a hand-built ReportContainsVerifier, for the
     # reason the sibling block gives: a clause the shipped entry grows later
-    # must not be silently dropped here.
+    # must not be silently dropped here. The fleet directory stands in for
+    # the runner's: every slot's role reached, unless a test says otherwise.
     v = parse_node(_zonal_case_check(objective))
     _stash(text)
-    return v.verify(5.0).status == "pass"
+    with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: fleet_dir}):
+        return v.verify(5.0)
+
+
+def _zonal_case_grades(objective: str, text: str) -> bool:
+    return _zonal_case_verdict(objective, text).status == "pass"
 
 
 _ZONAL_OBJECTIVES = (
@@ -321,6 +367,8 @@ _RIGHT_REPORT = "\n".join(_zonal_line(c) for c in _SLOTS)
         "\n".join('"' + _zonal_line(c) + '".' for c in _SLOTS),
         "- Declared lines:\n" + "\n".join("  - " + _zonal_line(c) for c in _SLOTS),
         "\n".join(_zonal_line(c) + " ✅" for c in _SLOTS),
+        "\n".join(_zonal_line(c) + " \U0001F44D" for c in _SLOTS),
+        "\n".join(_zonal_line(c) + " \u2714\ufe0f" for c in _SLOTS),
         # Per-cluster prose that opens with a slot name is neither accepted
         # nor forbidden: only a whole declared frame is read.
         "- **seeded-b** (us-central1-a): control plane is 1.32.4, one minor behind the nodes\n" + _RIGHT_REPORT,
@@ -340,6 +388,44 @@ _RIGHT_REPORT = "\n".join(_zonal_line(c) for c in _SLOTS)
 )
 def test_zonal_case_accepts_the_declared_lines_as_rendered(objective, text):
     assert _zonal_case_grades(objective, text)
+
+
+def test_zonal_case_fixtures_name_one_role_per_slot():
+    # The roles are slot stand-ins: the runner's kubeconfig per role is how
+    # the first objective tells an unreached slot from a line the agent
+    # missed, so every catalogue slot needs one and the objective names the
+    # same list.
+    catalog = json.loads(_FLEET_CATALOG.read_text(encoding="utf-8"))
+    roles = _zonal_case_fixtures()
+    assert sorted(catalog["roles"][r]["cluster_slot"] for r in roles) == sorted(_SLOT_LETTERS)
+    assert _zonal_case_check("every-seeded-cluster-has-a-declared-line")["fixture_roles"] == roles
+
+
+def test_zonal_case_errors_rather_than_fails_when_a_slot_was_not_reached():
+    roles = _zonal_case_fixtures()
+    missing = roles[-1]
+    three_slot = _fleet_dir([r for r in roles if r != missing])
+    three_lines = "\n".join(_zonal_line(c) for c in _SLOTS[:-1])
+    res = _zonal_case_verdict("every-seeded-cluster-has-a-declared-line", three_lines, three_slot)
+    assert res.status == "error"
+    assert missing in res.reason
+    # The value objectives read the lines that are there.
+    for objective in _ZONAL_OBJECTIVES[1:]:
+        assert _zonal_case_verdict(objective, three_lines, three_slot).status == "pass"
+    # With every slot reached, three lines are the agent's miss.
+    assert _zonal_case_verdict("every-seeded-cluster-has-a-declared-line", three_lines).status == "fail"
+
+
+def test_report_contains_fixture_roles_need_the_runners_directory():
+    _stash("seeded-a: fine")
+    v = ReportContainsVerifier(type="report_contains", fixture_roles=["crashloop-workload"], required_phrases=["fine"])
+    with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: _fleet_dir(["crashloop-workload"])}):
+        assert v.verify(5.0).status == "pass"
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop(fleet.FLEET_KUBECONFIG_DIR_ENV, None)
+        res = v.verify(5.0)
+    assert res.status == "error"
+    assert "crashloop-workload" in res.reason
 
 
 def test_zonal_case_patterns_name_exactly_the_catalogues_slots():
@@ -420,7 +506,27 @@ def test_zonal_case_a_wrong_or_off_vocabulary_value_on_any_seeded_line_fails_its
 
 @pytest.mark.parametrize(
     "pods",
-    ["not affected", "will be affected", "unaffected, mostly", "unaffected/affected", "unaffected [mostly]", "unaffected [no]", "unaffected?", "unaffected (?)", "unaffected\u2026", "unaffected \u274c", "unaffected ?!"],
+    [
+        "not affected",
+        "will be affected",
+        "unaffected, mostly",
+        "unaffected/affected",
+        "unaffected [mostly]",
+        "unaffected [no]",
+        "unaffected?",
+        "unaffected (?)",
+        "unaffected\u2026",
+        "unaffected \u274c",
+        "unaffected ?!",
+        # Marks the fold's closer list does not name stay on the line: a
+        # no-entry sign, a stop sign, a thumbs down, a cross mark, a warning.
+        "unaffected \U0001F6AB",
+        "unaffected \U0001F6D1",
+        "unaffected \U0001F44E",
+        "unaffected \u274e",
+        "unaffected \u26a0\ufe0f",
+        "unaffected \u26d4",
+    ],
 )
 def test_zonal_case_a_hedged_value_is_the_wrong_value(pods):
     # The forbidding pattern is the exact negation of the accepting one, so

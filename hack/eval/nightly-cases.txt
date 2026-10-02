@@ -151,9 +151,11 @@
 # three units, measured 209-1317s a repetition on its green presubmit run, so
 # this file's share is forty-five cases (135 units) of a fifty-nine-case,
 # 177-unit matrix (with the presubmit file's fourteen).
-# 2026-10-01 adds upgrades-zonal-control-plane-outage-warned: one case, three
-# units at the 200s default (a read-only chat turn, measured 3-8 minutes a
-# repetition on the dev install), so forty-seven (141) of sixty-one (183).
+# One case joined this file after that line without a tally: forty-six (138)
+# of sixty (180). 2026-10-01 adds upgrades-zonal-control-plane-outage-warned:
+# one case, three units at the 200s default (a read-only chat turn, measured
+# 3-8 minutes a repetition on the dev install), so forty-seven (141) of
+# sixty-one (183).
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:

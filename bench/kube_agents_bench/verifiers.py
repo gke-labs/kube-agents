@@ -91,6 +91,10 @@ _NO_TRANSCRIPT_REASON = (
     "agent execution (kube_agents_bench.transcript is empty), so this check "
     "could not be evaluated"
 )
+_UNREACHED_ROLE_REASON = (
+    "a cluster this check's patterns require a line about was not reached before the run, "
+    "so a missing line about it is the environment's gap, not the agent's miss"
+)
 _NO_WORKER_CALLS_REASON = (
     "no delegated worker's tool calls are in the trajectory: either no card was "
     "delegated or the worker-trajectory capture did not run, so a check scoped to "
@@ -142,7 +146,7 @@ def _normalize(text: str) -> str:
 # around a name is kept as its text, and a quote or bracket closing a name
 # goes with the opener the lead took. The trail is any run of non-word
 # characters (a stop, a list's comma or semicolon, quotes, pipes, a
-# hard-break backslash, symbols of any number of code points), a `<br>`, or
+# hard-break backslash, the affirming marks `_TRAIL_CLOSERS` names), a `<br>`, or
 # a footnote marker (`[1]`, `[^note]`, `(1)`, a superscript digit, a linked
 # `[1](url)`). A pattern anchored with ``^...$`` then spells
 # a declared line once rather than once per rendering -- the reason
@@ -157,20 +161,33 @@ _LINE_LEAD_DECORATION = re.compile(
 # A footnote marker at the end of a line: `[1]`, `[^1]`, `[^note]` (a named
 # footnote needs the caret, so a bracketed word such as `[mostly]` is a
 # value, not a marker), `(1)`, a superscript digit, or a linked `[1](url)`.
+# The named-footnote alternative excludes what the numbered one already
+# matches, and the repeat is possessive: alternatives that overlap inside
+# `(...)+$` backtrack exponentially on a line that ends in many markers and
+# then a word, and this runs on every line of a report.
 _LINE_TRAIL_FOOTNOTE = re.compile(
-    r"(?:\s*(?:\[\^?\d{1,3}\](?:\([^)\n]*\))?|\[\^[\w-]{1,20}\]|\(\d{1,3}\)|[\u00b9\u00b2\u00b3\u2070-\u2079]))+\s*$"
+    r"(?:\s*(?:\[\^?\d{1,3}\](?:\([^)\n]*\))?|\[\^(?!\d{1,3}\])[\w-]{1,20}\]|\(\d{1,3}\)|[\u00b9\u00b2\u00b3\u2070-\u2079]))++\s*$"
 )
-# What a line may end with and still be the same line: closing punctuation,
-# quotes, brackets, pipes, whitespace, a `<br>`, and symbols used as marks.
-# Not a question mark, an exclamation mark, an ellipsis or a negating mark
-# (a cross, a stop sign, a warning sign, a question or exclamation symbol):
-# those change what the last word says, so they stay and make a hedged value
-# the wrong value.
-_HEDGE_MARKS = "?!\u2026\u274c\u2716\u2718\u26d4\u1f6ab\u26a0\u2753\u2754\u2755\u2757\u2049\u203c"
-_LINE_TRAIL_DECORATION = re.compile(r"(?:(?![" + _HEDGE_MARKS + r"])[^\w\n]|<br\s*/?>)+$")
+# What a line may end with and still be the same line: whitespace, closing
+# punctuation, quotes, brackets, pipes, a hard-break backslash, a `<br>`, and
+# the marks that affirm (a check, a thumbs up, a green circle, with the
+# variation selector and joiner emoji carry). The list is the whole of it: a
+# symbol it does not name stays on the line, so a mark that hedges or negates
+# the last word (`?`, `!`, an ellipsis, a cross, a stop sign, a warning sign,
+# a thumbs down, one nobody has thought of) makes a hedged value the wrong
+# value. A denylist of negating marks would turn every mark it forgot into a
+# pass.
+_TRAIL_CLOSERS = (
+    ".,;:\"'`*_~|/\\<>)]}"
+    "\u201c\u201d\u2018\u2019\u00ab\u00bb\u2039\u203a\u2013\u2014"
+    "\u2713\u2714\u2705\u2611\ufe0f\u200d\U0001f44d\U0001f7e2"
+)
+_LINE_TRAIL_DECORATION = re.compile(r"(?:[\s" + re.escape(_TRAIL_CLOSERS) + r"]|<br\s*/?>)+$")
 # The same without a closing bracket, so a closer after a footnote marker
 # ("[1].") is taken without eating the marker's own bracket.
-_LINE_TRAIL_CLOSER = re.compile(r"(?:(?![" + _HEDGE_MARKS + r"\])])[^\w\n]|<br\s*/?>)+$")
+_LINE_TRAIL_CLOSER = re.compile(
+    r"(?:[\s" + re.escape(_TRAIL_CLOSERS.replace(")", "").replace("]", "")) + r"]|<br\s*/?>)+$"
+)
 _TRAIL_FOLD_PASSES = 3
 # A name the agent quotes or brackets instead of emphasising, with or without
 # a parenthetical inside the quotes: the lead fold has taken the opener, so
@@ -272,6 +289,12 @@ class ReportContainsVerifier(BaseVerifier):
     # stop or mark) before the pattern clauses run, so a declared line is
     # spelled once. Off by default: a case may forbid the decoration itself.
     fold_decoration: bool = False
+    # The seeded-fleet roles whose clusters the patterns require a line
+    # about, one per slot. A role the runner resolved no kubeconfig for
+    # before the run marks a slot absent from the project: the check returns
+    # ``error`` for the environment instead of charging the agent with a
+    # line about a cluster it could not see.
+    fixture_roles: list[str] = Field(default_factory=list)
     scope: Literal["final", "full"] = "final"
 
     @field_validator("forbidden_patterns", "any_of_patterns")
@@ -283,6 +306,16 @@ class ReportContainsVerifier(BaseVerifier):
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
+        for role in self.fixture_roles:
+            try:
+                kubeconfig_for_role(role)
+            except FleetRoleUnresolved as exc:
+                return VerificationResult(
+                    success=False,
+                    status="error",
+                    elapsed_time=time.monotonic() - start,
+                    reason=f"{_UNREACHED_ROLE_REASON}: {exc}",
+                )
         snap = transcript.get()
         if snap is None:
             return VerificationResult(

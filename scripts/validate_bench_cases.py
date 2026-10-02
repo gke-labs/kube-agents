@@ -575,12 +575,16 @@ def _check_types(node: Any, found: set[str]) -> None:
 
 
 def _fixture_roles(node: Any, found: set[str]) -> None:
-    """Every `fixture_role:` named anywhere in one check subtree."""
+    """Every `fixture_role:` (and `fixture_roles:` entry) named anywhere in
+    one check subtree."""
     if not isinstance(node, dict):
         return
     role = node.get("fixture_role")
     if isinstance(role, str):
         found.add(role)
+    for role in node.get("fixture_roles") or []:
+        if isinstance(role, str):
+            found.add(role)
     for child in node.get("checks") or []:
         _fixture_roles(child, found)
 

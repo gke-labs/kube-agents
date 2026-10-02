@@ -70,11 +70,21 @@ domain: upgrades
 # Who answers when this case flakes -- see bench/CONTRIBUTING.md.
 owner: maintainers
 
-# No planted defect: the case depends on the seeded clusters existing and
-# being zonal, which is the slots' shape (bench/tf/fleet/variables.tf's
-# `zone`), not a role. Listing roles here would tell the fleet owner healing
-# one of them that this case goes quiet, and it would not.
-fixtures: []
+# No planted defect is read: the case depends on the seeded clusters existing
+# and being zonal, which is the slots' shape (bench/tf/fleet/variables.tf's
+# `zone`), not a role. The four roles below are one per slot, and they are
+# how the first objective tells a cluster the agent missed from a cluster the
+# project does not have: the runner writes a kubeconfig per role before the
+# run, and a role it could not resolve makes that objective an `error` about
+# the environment (its `fixture_roles`), never a `fail` charged to the agent.
+# Healing one of these defects does not quiet the case; replacing or
+# retiring the slot's cluster does, which is what a reader of this list is
+# checking.
+fixtures:
+  - crashloop-workload
+  - version-laggard
+  - drift-outlier
+  - zonal-skew-scheduling
 
 verification_spec:
   # The declared lines are what the deterministic objectives read: one line
@@ -87,13 +97,13 @@ verification_spec:
   # judge's. How the agent decorates the line (indentation, a bullet or a
   # number, quotes, a link, a trailing stop or mark) is the verifier's to
   # fold, not the case's to enumerate: `fold_decoration: true` has
-  # `_normalize_lines` strip a line's decoration before any pattern runs. What the case does allow is the cluster's
-  # qualified id (project, slot name, location, hyphen-joined, as the
-  # profile names it) or a parenthetical after the name, because that is
-  # naming rather than decoration. The slot has to be a, b or c, the three
-  # slots `bench/tf/fleet` declares; the multi-zonal slot d is a separate
-  # change and joins this class when it lands. The host cluster or "clusters
-  # in general" does not pass. Each value objective also forbids a declared
+  # `_normalize_lines` strip a line's decoration before any pattern runs.
+  # What the case does allow around the slot name is naming rather than
+  # decoration: a qualified id (a project, a location, a kubeconfig context
+  # or a resource path joined to the name by the characters a name may hold)
+  # or a parenthetical after it. The slot has to be one of a, b, c and d,
+  # the four `bench/tf/fleet` declares, and the first objective needs a line
+  # for each. The host cluster or "clusters in general" does not pass. Each value objective also forbids a declared
   # frame whose value slot holds anything but the right word, as the exact
   # negation of what it accepts, so one right line beside a wrong or
   # off-vocabulary line for another cluster fails.
@@ -104,6 +114,14 @@ verification_spec:
     check:
       type: report_contains
       fold_decoration: true
+      # One role per slot (the case's `fixtures:` says why): a slot whose
+      # cluster the runner could not reach before the run is an `error` here,
+      # not a line the agent failed to write.
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
       # One pattern, four lookaheads: a declared frame for each of the four
       # slots, in any order, anywhere in the report.
       any_of_patterns:
