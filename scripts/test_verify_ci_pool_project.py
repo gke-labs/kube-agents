@@ -323,13 +323,16 @@ class RequiredApisTest(unittest.TestCase):
 
 
 class GkeAndCmekTest(unittest.TestCase):
-    def _clusters(self, host_state: str) -> str:
+    # The listing is `value(name,databaseEncryption.state,managedOpentelemetryConfig.scope)`:
+    # tab-separated, an unset column empty. The fleet clusters carry no scope,
+    # as bench/tf/fleet creates them.
+    def _clusters(self, host_state: str, host_scope: str = checker.HOST_OTEL_SCOPE) -> str:
         return "\n".join(
             [
-                f"{checker.HOST_CLUSTER}\t{host_state}",
-                "seeded-a\tENCRYPTED",
-                "seeded-b\tENCRYPTED",
-                "seeded-c\tENCRYPTED",
+                f"{checker.HOST_CLUSTER}\t{host_state}\t{host_scope}",
+                "seeded-a\tENCRYPTED\t",
+                "seeded-b\tENCRYPTED\t",
+                "seeded-c\tENCRYPTED\t",
             ]
         )
 
@@ -362,8 +365,91 @@ class GkeAndCmekTest(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertTrue(any("unset" in d for d in result.details), result.details)
 
+    def test_host_cluster_without_the_otel_scope_fails_and_names_the_update_command(self):
+        # 27 of the 28 pool host clusters on 2026-10-01: CMEK on, no managed
+        # OpenTelemetry scope, so the operator wired every install on them with
+        # OTEL_SDK_DISABLED=true and Cloud Trace stayed empty. The repair is
+        # the one gcloud update, per project.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(self._clusters("ENCRYPTED", host_scope="")), _ok("bucket")]
+            result = checker.check_gke_and_state("kube-agents-evals-4")
+        self.assertFalse(result.passed)
+        self.assertIn("managedOpentelemetryConfig.scope", " ".join(run.call_args_list[0].args[0]))
+        finding = next(f for f in result.findings if f.id == "gke/host-otel-scope")
+        self.assertIn("'unset'", finding.observed)
+        self.assertEqual(
+            finding.repair,
+            "gcloud container clusters update platform-agent-host --project=kube-agents-evals-4 --location=us-central1 "
+            "--managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS (docs/ci-pool-projects.md section 2)",
+        )
+        self.assertNotIn("gke/host-cmek", [f.id for f in result.findings])
+
+    def test_a_host_cluster_with_another_otel_scope_fails(self):
+        # Only the collection scope deploys the managed collector the operator
+        # discovers; an instrumentation-only scope leaves the install as silent
+        # as none.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(self._clusters("ENCRYPTED", host_scope="INSTRUMENTATION_COMPONENTS_ONLY")), _ok("bucket")]
+            result = checker.check_gke_and_state("kube-agents-evals-4")
+        self.assertFalse(result.passed)
+        finding = next(f for f in result.findings if f.id == "gke/host-otel-scope")
+        self.assertIn("'INSTRUMENTATION_COMPONENTS_ONLY'", finding.observed)
+
+    def test_an_empty_cmek_column_beside_a_scope_is_unset_cmek_not_a_shifted_scope(self):
+        # `value()` leaves an unset middle column empty between two tabs. The
+        # whitespace split the check used to do would collapse it and read the
+        # scope as the encryption state: wrong finding on the CMEK side, none
+        # on the scope side.
+        clusters = "\n".join(
+            [
+                f"{checker.HOST_CLUSTER}\t\t{checker.HOST_OTEL_SCOPE}",
+                "seeded-a\tENCRYPTED\t",
+                "seeded-b\tENCRYPTED\t",
+                "seeded-c\tENCRYPTED\t",
+            ]
+        )
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(clusters), _ok("bucket")]
+            result = checker.check_gke_and_state("kube-agents-evals-3")
+        self.assertFalse(result.passed)
+        ids = {f.id: f for f in result.findings}
+        self.assertIn("gke/host-cmek", ids)
+        self.assertIn("'unset'", ids["gke/host-cmek"].observed)
+        self.assertNotIn("gke/host-otel-scope", ids)
+
+    def test_fleet_clusters_are_not_held_to_the_otel_scope(self):
+        # Nothing reads the seeded clusters' traces, and bench/tf/fleet does not
+        # set the scope; a fleet cluster with any value, or none, is not drift.
+        clusters = "\n".join(
+            [
+                f"{checker.HOST_CLUSTER}\tENCRYPTED\t{checker.HOST_OTEL_SCOPE}",
+                "seeded-a\tENCRYPTED\t",
+                "seeded-b\tENCRYPTED\tINSTRUMENTATION_COMPONENTS_ONLY",
+                "seeded-c\tENCRYPTED",
+            ]
+        )
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(clusters), _ok("bucket")]
+            result = checker.check_gke_and_state("kube-agents-evals-3")
+        self.assertTrue(result.passed, result.details)
+        self.assertEqual(result.findings, [])
+        self.assertIn("managed-OTel scope", result.message)
+
+    def test_the_scope_provisioning_sets_is_the_one_the_verifier_requires(self):
+        # One value, defined twice: the provisioning script sets it after the
+        # apply, the verifier fails a host cluster without it and prints the
+        # update as the repair. They drift apart unless pinned.
+        script = (pathlib.Path(__file__).resolve().parent / "provision_ci_pool_project.sh").read_text()
+        self.assertIn(f'readonly HOST_OTEL_SCOPE="{checker.HOST_OTEL_SCOPE}"', script)
+        self.assertIn('--managed-otel-scope="${HOST_OTEL_SCOPE}"', script)
+        self.assertIn(f"--managed-otel-scope={checker.HOST_OTEL_SCOPE}", checker.REPAIR_HOST_OTEL_SCOPE)
+        # The script sets it on the GA surface, which min_versions.sh pins the
+        # SDK floor for; the script sources that file rather than copying the number.
+        self.assertIn('. "${SCRIPT_DIR}/installer/min_versions.sh"', script)
+        self.assertIn('version_lt "${GCLOUD_VERSION}" "${MIN_GCLOUD_VERSION}"', script)
+
     def test_missing_seeded_cluster_fails(self):
-        clusters = f"{checker.HOST_CLUSTER}\tENCRYPTED\nseeded-a\tENCRYPTED\nseeded-b\tENCRYPTED"
+        clusters = f"{checker.HOST_CLUSTER}\tENCRYPTED\t{checker.HOST_OTEL_SCOPE}\nseeded-a\tENCRYPTED\t\nseeded-b\tENCRYPTED\t"
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [_ok(clusters), _ok("bucket")]
             result = checker.check_gke_and_state("kube-agents-evals-3")
@@ -414,7 +500,7 @@ class GkeAndCmekTest(unittest.TestCase):
     def test_a_partial_cluster_listing_is_unread_not_missing_clusters(self):
         # gcloud lists the zones that answered and warns about the one that did
         # not, exit 0; a cluster absent from that list was not seen missing.
-        clusters = f"{checker.HOST_CLUSTER}\tENCRYPTED\nseeded-a\tENCRYPTED"
+        clusters = f"{checker.HOST_CLUSTER}\tENCRYPTED\t{checker.HOST_OTEL_SCOPE}\nseeded-a\tENCRYPTED\t"
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 (0, clusters, "WARNING: The following zones did not respond: us-central1-a. List results may be incomplete."),
@@ -4698,13 +4784,14 @@ class FindingsCarryRepairsTest(unittest.TestCase):
 
     def test_gke_registry_and_minter_findings_carry_their_ids_and_repairs(self):
         with mock.patch.object(checker, "run_cmd") as run:
-            run.side_effect = [_ok("platform-agent-host\tDECRYPTED\nseeded-a\t\nseeded-c\t\n"), (1, "", "ERROR: NOT_FOUND: bucket does not exist")]
+            run.side_effect = [_ok("platform-agent-host\tDECRYPTED\t\nseeded-a\t\t\nseeded-c\t\t\n"), (1, "", "ERROR: NOT_FOUND: bucket does not exist")]
             gke = checker.check_gke_and_state("kube-agents-evals-3")
         self.assertEqual(
             {f.id: f.repair for f in gke.findings},
             {
                 "gke/cluster/seeded-b": checker.REPAIR_FLEET_APPLY.format(project_id="kube-agents-evals-3"),
                 "gke/host-cmek": checker.REPAIR_HOST_CMEK,
+                "gke/host-otel-scope": checker.REPAIR_HOST_OTEL_SCOPE.format(project_id="kube-agents-evals-3"),
                 "gke/state-bucket": checker.REPAIR_STATE_BUCKET.format(project_id="kube-agents-evals-3"),
             },
         )

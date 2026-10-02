@@ -45,6 +45,7 @@ A long-lived GKE cluster hosting the Platform Agent and evaluation infrastructur
 - **Cluster Name**: `platform-agent-host`
 - **Location**: `us-central1` (regional or zonal, matching `hack/ci-env.sh`)
 - **Database Encryption**: CMEK encryption enabled (`ALL_OBJECTS_ENCRYPTION_ENABLED`). `full-install` creates the cluster this way, so any other state is drift.
+- **Managed OpenTelemetry scope**: `COLLECTION_AND_INSTRUMENTATION_COMPONENTS`. Neither google Terraform provider has a field for it, so `full-install` cannot set it; `scripts/provision_ci_pool_project.sh` sets it with one `gcloud container clusters update` after the apply, and the verifier (section 7) fails a project whose host cluster lacks it and prints that command as the repair. Without it an install on the cluster exports no traces: the operator's collector discovery finds no `gke-managed-otel` collector and starts the agent with `OTEL_SDK_DISABLED=true`, so Cloud Trace stays empty and an eval that reads the install's own traces back fails on every lease of the project.
 
 The cluster is provisioned by the `terraform/examples/full-install` composition, through its `lifecycle.sh` rather than a bare `terraform apply` — `cluster_name`, `location`, and `api_server_key` have no defaults, so the bare form fails on the missing variables:
 
@@ -62,6 +63,16 @@ KUBE_AGENTS_STATE_PREFIX="full-install/platform-agent-host" \
 ```
 
 `api_server_key` is generated the same way `hack/ci-deploy.sh` generates it when unset. It is regenerated on every apply, which is why section 8 forbids re-running the provisioning script after registration.
+
+The managed OpenTelemetry scope is the one step after the apply. The flag is on the GA `gcloud` surface from the version `MIN_GCLOUD_VERSION` in `scripts/installer/min_versions.sh` names (older SDKs carry it under `gcloud beta`), and the provisioning script checks the installed version in its Step 0 so an old SDK fails before the apply rather than after it:
+
+```bash
+gcloud container clusters update platform-agent-host \
+  --project="${PROJECT_ID}" --location=us-central1 \
+  --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS
+```
+
+Read 2026-10-01, `kube-agents-evals-2` was the one host cluster in the pool carrying the scope; every project was provisioned before the script set it, the other 27 lacked it, and installs on them had exported no traces on any lease. The command above is the hand repair for each of them, run between leases on a project Boskos holds, and it is idempotent. The verifier's `gke/host-otel-scope` finding, in the hourly pool-state scan as in a hand run, names the projects still without it.
 
 ## 3. Service accounts and IAM
 

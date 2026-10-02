@@ -21,6 +21,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# MIN_GCLOUD_VERSION and the two helpers Step 0 compares it with. The file is
+# side-effect free at source time; its require_* wrappers print through the
+# installer's print_* helpers, which this script does not define, so Step 0
+# calls the comparison directly.
+# shellcheck source=scripts/installer/min_versions.sh
+. "${SCRIPT_DIR}/installer/min_versions.sh"
 
 PROJECT_ID=""
 REGION="us-central1"
@@ -74,6 +80,14 @@ obtainability audit lists this posture under Declared intent rather than as a fi
 # The host cluster's name is not a preference: scripts/verify_ci_pool_project.py
 # asserts it, hack/ci-env.sh selects it, and the Boskos lease resolves to it.
 HOST_CLUSTER_NAME="platform-agent-host"
+# The managed OpenTelemetry collection scope Step 2.1 sets on the host cluster
+# after the apply. Neither google provider has a field for it, so full-install
+# cannot; without it the operator finds no managed collector and wires the
+# agent with OTEL_SDK_DISABLED=true, so the install exports no traces and the
+# evals that read them back fail on every lease of the project. The verifier
+# fails a project whose host cluster lacks this exact value and its tests pin
+# the two copies equal (HOST_OTEL_SCOPE in scripts/verify_ci_pool_project.py).
+readonly HOST_OTEL_SCOPE="COLLECTION_AND_INSTRUMENTATION_COMPONENTS"
 
 usage() {
   cat <<EOF
@@ -179,6 +193,25 @@ if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
   exit 1
 fi
 echo "✓ Toolchain present (gcloud, gh, git, go, jq, python3, terraform, tofu)"
+
+# Step 2.1's post-apply `clusters update --managed-otel-scope` is issued on the
+# GA surface, which gcloud grew in MIN_GCLOUD_VERSION; an older SDK fails the
+# flag's parsing after the apply, the most expensive place in the run to fail,
+# so the version is checked here. An unreadable version is a warning for the
+# reason scripts/installer/min_versions.sh gives: `gcloud version` has changed
+# shape before, and a missed regex should not refuse a usable SDK.
+GCLOUD_VERSION="$(gcloud_core_version)"
+if [ -z "${GCLOUD_VERSION}" ]; then
+  echo "⚠️ Could not determine the Google Cloud SDK version; skipping the >= ${MIN_GCLOUD_VERSION} check." >&2
+  echo "   Step 2.1 needs --managed-otel-scope on \`gcloud container clusters update\`, which arrived in ${MIN_GCLOUD_VERSION}." >&2
+elif version_lt "${GCLOUD_VERSION}" "${MIN_GCLOUD_VERSION}"; then
+  echo "FATAL: Google Cloud SDK ${GCLOUD_VERSION} is too old; ${MIN_GCLOUD_VERSION} or newer is required." >&2
+  echo "       Step 2.1 sets --managed-otel-scope on the host cluster after the apply, and the flag" >&2
+  echo "       is on the GA surface only from ${MIN_GCLOUD_VERSION}. Upgrade with: gcloud components update" >&2
+  exit 1
+else
+  echo "✓ Google Cloud SDK ${GCLOUD_VERSION} meets the minimum of ${MIN_GCLOUD_VERSION}"
+fi
 
 # The project must exist and bill. `gcloud services enable` against an unbilled
 # project fails with a message that does not obviously say "billing", so the
@@ -558,6 +591,19 @@ EOF
     KUBE_AGENTS_STATE_PREFIX="full-install/${HOST_CLUSTER_NAME}" \
     ./lifecycle.sh apply -auto-approve
   )
+
+  # The one post-apply step Terraform cannot carry (see HOST_OTEL_SCOPE above).
+  # install.sh warns and goes on when this fails; here it stops the run, under
+  # set -e: a pool project without the scope passes every lease and fails the
+  # trace evals one by one, and the verifier in Step 5 would fail it anyway.
+  # Re-running this one command repairs it.
+  echo -e "\n==> [Step 2.1] Setting the managed OpenTelemetry scope on ${HOST_CLUSTER_NAME}..."
+  gcloud container clusters update "${HOST_CLUSTER_NAME}" \
+    --project="${PROJECT_ID}" \
+    --location="${REGION}" \
+    --managed-otel-scope="${HOST_OTEL_SCOPE}" \
+    --quiet
+  echo "✓ Managed OpenTelemetry scope ${HOST_OTEL_SCOPE} set on ${HOST_CLUSTER_NAME}"
 else
   echo -e "\n==> [Step 2.1] Skipping Host GKE Cluster (--skip-host-cluster set)..."
 fi

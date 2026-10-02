@@ -332,6 +332,22 @@ EXPECTED_CLUSTERS = {HOST_CLUSTER, "seeded-a", "seeded-b", "seeded-c"}
 # name-only check would pass it.
 VALID_CMEK_STATES = {"ENCRYPTED", "ALL_OBJECTS_ENCRYPTION_ENABLED"}
 
+# The managed OpenTelemetry collection scope the host cluster must carry. The
+# operator's collector discovery (k8s-operator/internal/controller/telemetry.go)
+# finds the gke-managed-otel collector only on a cluster with this scope; on
+# any other it wires the agent with OTEL_SDK_DISABLED=true and the install
+# exports no traces, which is invisible until an eval reads them back. Neither
+# google provider has a field for it, so full-install cannot set it:
+# scripts/provision_ci_pool_project.sh sets it with a post-apply
+# `gcloud container clusters update --managed-otel-scope` (the value there is
+# a copy of this one, and the tests pin the two equal), and this is the read
+# half. The fleet clusters are not held to it: nothing reads their traces.
+HOST_OTEL_SCOPE = "COLLECTION_AND_INSTRUMENTATION_COMPONENTS"
+REPAIR_HOST_OTEL_SCOPE = (
+    f"gcloud container clusters update {HOST_CLUSTER} --project={{project_id}} --location=us-central1 "
+    f"--managed-otel-scope={HOST_OTEL_SCOPE} (docs/ci-pool-projects.md section 2)"
+)
+
 DEFAULT_GITHUB_APP_ID = 4675512
 
 # The first commit a GitOps repository needs before the broker can open a
@@ -1996,9 +2012,9 @@ def check_artifact_registry(project_id: str, project_number: str, location: str 
 
 
 def check_gke_and_state(project_id: str) -> CheckResult:
-    """Verify the host cluster, its CMEK state, the seeded clusters' names, and the state bucket.
+    """Verify the host cluster, its CMEK state and managed-OTel scope, the seeded clusters' names, and the state bucket.
 
-    Names and encryption only. Whether those clusters hold the planted fixtures is
+    Names, encryption and the host's telemetry scope only. Whether those clusters hold the planted fixtures is
     check_seeded_fleet_fixtures() below, and the two are far apart: an apply
     that created the clusters and died before the Kubernetes provider ran
     satisfies every assertion here.
@@ -2011,19 +2027,20 @@ def check_gke_and_state(project_id: str) -> CheckResult:
     clusters_checked = False
     bucket_checked = False
 
-    # name and encryption state in one listing: a separate describe would need
-    # the cluster's location, which this call is what would have told us.
+    # name, encryption state and managed-OTel scope in one listing: a separate
+    # describe would need the cluster's location, which this call is what
+    # would have told us.
     rc, out, err = run_cmd([
         "gcloud", "container", "clusters", "list",
         f"--project={project_id}",
-        "--format=value(name,databaseEncryption.state)",
+        "--format=value(name,databaseEncryption.state,managedOpentelemetryConfig.scope)",
     ])
     if rc != 0:
         if not _record_unreadable(
             err,
             f"Failed listing clusters: {err.strip()}",
             f"Could not list the clusters in {project_id}, so neither the four expected clusters nor "
-            f"{HOST_CLUSTER}'s CMEK state was checked",
+            f"{HOST_CLUSTER}'s CMEK state and managed-OTel scope were checked",
             details,
             warnings,
         ):
@@ -2032,18 +2049,23 @@ def check_gke_and_state(project_id: str) -> CheckResult:
         partial = next((line.strip() for line in err.splitlines() if PARTIAL_LISTING_RE.search(line)), err.strip())
         warnings.append(Unread(
             f"Could not list all the clusters in {project_id} ({partial}), so neither the four expected "
-            f"clusters nor {HOST_CLUSTER}'s CMEK state was checked"
+            f"clusters nor {HOST_CLUSTER}'s CMEK state and managed-OTel scope were checked"
         ))
     else:
         clusters_checked = True
 
     encryption_by_cluster = {}
+    otel_scope_by_cluster = {}
     if clusters_checked:
         for line in out.splitlines():
             if not line.strip():
                 continue
-            fields = line.split()
+            # `value()` joins its columns with tabs and leaves an unset one
+            # empty, so the split is on the tab: a whitespace split would
+            # collapse an unset CMEK state and read the scope as the state.
+            fields = line.split("\t")
             encryption_by_cluster[fields[0]] = fields[1] if len(fields) > 1 else ""
+            otel_scope_by_cluster[fields[0]] = fields[2] if len(fields) > 2 else ""
 
         missing_clusters = EXPECTED_CLUSTERS - set(encryption_by_cluster)
         if missing_clusters:
@@ -2063,6 +2085,15 @@ def check_gke_and_state(project_id: str) -> CheckResult:
                     f"{', '.join(sorted(VALID_CMEK_STATES))}; full-install creates the host cluster "
                     "encrypted, so this is drift",
                     REPAIR_HOST_CMEK,
+                )
+            scope = otel_scope_by_cluster[HOST_CLUSTER]
+            if scope != HOST_OTEL_SCOPE:
+                passed = False
+                _drift(
+                    details, findings, "gke/host-otel-scope",
+                    f"{HOST_CLUSTER} managedOpentelemetryConfig.scope is '{scope or 'unset'}', not "
+                    f"{HOST_OTEL_SCOPE}; an install on it finds no managed collector and exports no traces",
+                    REPAIR_HOST_OTEL_SCOPE.format(project_id=project_id),
                 )
 
     # `buckets describe` needs storage.buckets.get, which `storage ls` does not,
@@ -2086,11 +2117,11 @@ def check_gke_and_state(project_id: str) -> CheckResult:
     if not passed:
         message = "GKE/state resources missing"
     elif clusters_checked and bucket_checked:
-        message = f"All {len(EXPECTED_CLUSTERS)} clusters ({', '.join(sorted(EXPECTED_CLUSTERS))}), CMEK, and state bucket present"
+        message = f"All {len(EXPECTED_CLUSTERS)} clusters ({', '.join(sorted(EXPECTED_CLUSTERS))}), CMEK, managed-OTel scope, and state bucket present"
     else:
         verified = []
         unchecked = []
-        (verified if clusters_checked else unchecked).append("clusters and CMEK")
+        (verified if clusters_checked else unchecked).append("clusters, CMEK and managed-OTel scope")
         (verified if bucket_checked else unchecked).append("state bucket")
         prefix = f"{'; '.join(verified)} present; " if verified else ""
         message = f"{prefix}{'; '.join(unchecked)} not checked"
