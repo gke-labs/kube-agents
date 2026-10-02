@@ -120,12 +120,13 @@ const (
 	shellSandboxSshdPath = "/var/lib/sandbox-sshd"
 
 	// shellSandboxUser's home, from the useradd in deploy/sandbox/Dockerfile. It
-	// is writable alongside the data volume — see HERMES_WRITE_SAFE_ROOT in
-	// buildPodTemplateSpec — but it is on the container filesystem and does not
-	// survive a restart. That is deliberate: the model owns ~/.bashrc, bash
-	// sources it for a non-interactive `ssh host cmd`, and a hijack planted there
-	// should not outlive the pod. Durable work goes to the data volume, which is
-	// what TERMINAL_CWD points at.
+	// is on the container filesystem, and the image makes it root-owned with no
+	// dotfiles (#2180/#2245): every session in the pod shares it, and bash and
+	// python3 load code from it unasked, so a file one session planted there
+	// would run in every later one. Durable work goes to the data volume, which
+	// is what TERMINAL_CWD points at. HERMES_WRITE_SAFE_ROOT in
+	// buildPodTemplateSpec names only the data volume (#2284); writes to the home
+	// are refused upfront by the gateway's path prefix check.
 	shellSandboxHomePath = "/home/" + shellSandboxUser
 
 	// Hermes' ssh backend keeps a file sync over ~/.hermes: it pushes at connect

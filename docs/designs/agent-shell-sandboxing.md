@@ -1180,16 +1180,19 @@ is not the answer either: the check is opt-in and an empty value skips it entire
 which drops the guardrail rather than moving it.
 
 The operator therefore writes it out, in `buildPodTemplateSpec` and only when the
-sandbox is enabled, naming the sandbox's two writable directories: `/opt/data`, and
-`/home/agent` for the commands that land in the home. Since the sandbox's data volume
-now carries the `/opt/data` path itself, the interesting half of that is the home — but
-the value is written rather than left to the image default so the policy is visible in
-the pod spec rather than inherited from a base image two repositories away. It gives up
-no isolation. With `backend: ssh` the file tools cannot reach the agent pod's
-filesystem at all, so the roots they are checked against should describe the filesystem
-they actually write to. `TestSandboxRepointsTheWriteSafeRoot` asserts the variable is
-absent with the sandbox off, is exactly these two paths with it on, and names nothing
-that does not resolve in the sandbox.
+sandbox is enabled, naming the sandbox's writable data directory: `/opt/data`.
+Now that the sandbox home is root-owned (#2180/#2245), uid 1000 cannot write anything
+in it, so `/home/agent` is omitted (#2284). This ensures write attempts to `~` fail
+fast with "outside HERMES_WRITE_SAFE_ROOT" at the gateway's prefix check rather than
+passing and failing with `Permission denied` inside the sandbox, and refusal errors do
+not misleadingly advertise `/home/agent` as a permitted write root. The value is written
+rather than left to the image default so the policy is visible in the pod spec rather
+than inherited from a base image two repositories away. It gives up no isolation.
+With `backend: ssh` the file tools cannot reach the agent pod's filesystem at all, so
+the roots they are checked against should describe the filesystem they actually write
+to. `TestSandboxRepointsTheWriteSafeRoot` asserts the variable is absent with the
+sandbox off, is exactly `shellSandboxDataPath` with it on, and names nothing that does
+not resolve in the sandbox.
 
 One thing this does not cover: the credential denylist that sits alongside the check
 (`~/.ssh`, `~/.aws`, `~/.config/gcloud`, `~/.docker`) is still expressed against the
