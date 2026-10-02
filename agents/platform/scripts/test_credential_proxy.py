@@ -4374,6 +4374,71 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
 
         self.assertEqual(len(calls), 2)
 
+    def test_coalesce_window_expires_after_30_seconds(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+        executor.execute_internal = lambda argv, cwd=None: (
+            calls.append(list(argv))
+            or credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="",
+                stderr="",
+                duration_ms=5,
+                truncated=False,
+                timed_out=False,
+            )
+        )
+        # First call reads now at 100.0 (check) and 100.0 (record);
+        # second call reads now at 131.0 (check > 30s) and 131.0 (record).
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True), \
+             mock.patch.object(credential_proxy.time, "monotonic", side_effect=[100.0, 100.0, 131.0, 131.0]):
+            executor.refresh_forge_credential("github", "gke-agentic/infra")
+            executor.refresh_forge_credential("github", "gke-agentic/infra")
+
+        self.assertEqual(len(calls), 2)
+
+    def test_failed_refresh_for_different_org_drops_cache_entry(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+
+        def handle_call(argv, cwd=None):
+            calls.append(list(argv))
+            # Second call (org-beta) fails after potentially modifying token slot
+            if len(calls) == 2:
+                return credential_proxy.ExecutionResult(
+                    exit_code=1,
+                    stdout="",
+                    stderr="setup-git failed",
+                    duration_ms=5,
+                    truncated=False,
+                    timed_out=False,
+                )
+            return credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="",
+                stderr="",
+                duration_ms=5,
+                truncated=False,
+                timed_out=False,
+            )
+
+        executor.execute_internal = handle_call
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            # 1. First refresh for org-alpha succeeds
+            executor.refresh_forge_credential("github", "org-alpha/repo-a")
+            # 2. Second refresh for org-beta fails
+            with self.assertRaises(RuntimeError):
+                executor.refresh_forge_credential("github", "org-beta/repo-b")
+            # 3. Third refresh for org-alpha must run again because the failed refresh
+            # dropped the provider entry (preventing false coalesce onto replaced slot)
+            executor.refresh_forge_credential("github", "org-alpha/repo-a")
+
+        self.assertEqual(len(calls), 3)
+
 
 class ForgeRefreshRouteTest(unittest.TestCase):
     """What `POST /v1/forge/refresh` answers, and what it declines to say."""

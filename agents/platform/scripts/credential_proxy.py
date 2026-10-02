@@ -4468,7 +4468,14 @@ class CommandExecutor:
                 cached_org, last_refresh = current
                 if cached_org == org and (now - last_refresh) < FORGE_REFRESH_COALESCE_SECONDS:
                     return
-            self._run_forge_helper(provider, helper, [repository], "credential refresh")
+            try:
+                self._run_forge_helper(provider, helper, [repository], "credential refresh")
+            except Exception:
+                # The helper may have replaced the slot before it failed; a
+                # stale entry would coalesce the next caller onto a token that
+                # is not theirs.
+                self._refresh_cache.pop(provider, None)
+                raise
             self._refresh_cache[provider] = (org, time.monotonic())
 
     @staticmethod
