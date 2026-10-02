@@ -7043,6 +7043,50 @@ class SessionCallerBindingTest(unittest.TestCase):
         self.assertEqual(credential_proxy.CALLER_ROLE_SESSION, principal.role)
 
 
+class PrincipalPodTest(unittest.TestCase):
+    """A brokered call names the pod that made it, so it traces to a conversation."""
+
+    CALLER = "system:serviceaccount:kubeagents-system:agent-a2a-session"
+    AUDIENCE = "kubeagents-credential-proxy"
+
+    def _authenticator(self):
+        return credential_proxy.ServiceAccountAuthenticator(
+            audience_roles={self.AUDIENCE: ""},
+            allowed_callers=frozenset({self.CALLER}),
+            api_host="10.0.0.1",
+            api_port="443",
+            ca_file="",
+            token_file="/nonexistent",
+            cache_seconds=0.0,
+        )
+
+    def _review(self, extra):
+        user = {"username": self.CALLER, "uid": "sa-uid", "groups": []}
+        if extra is not None:
+            user["extra"] = extra
+        return {"status": {"authenticated": True, "audiences": [self.AUDIENCE], "user": user}}
+
+    def test_the_pod_name_comes_from_the_token_review(self):
+        principal = self._authenticator()._principal_from(
+            self._review(
+                {
+                    "authentication.kubernetes.io/pod-name": ["agent-a2a-session-abc12"],
+                    "authentication.kubernetes.io/pod-uid": ["0f1e2d3c"],
+                }
+            )
+        )
+        self.assertEqual("agent-a2a-session-abc12", principal.pod)
+        self.assertIn("pod=agent-a2a-session-abc12", principal.describe())
+        self.assertIn(self.CALLER, principal.describe())
+
+    def test_a_token_with_no_pod_binding_names_no_pod(self):
+        for extra in (None, {}, {"authentication.kubernetes.io/pod-name": []}):
+            with self.subTest(extra=extra):
+                principal = self._authenticator()._principal_from(self._review(extra))
+                self.assertEqual("", principal.pod)
+                self.assertEqual(self.CALLER, principal.describe())
+
+
 class RequiredRoleTest(unittest.TestCase):
     """Which side of the split each route belongs to.
 

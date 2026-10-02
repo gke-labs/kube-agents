@@ -597,6 +597,10 @@ CALLER_ROLE_A2A_CHAT = "a2a-chat"
 # until declarative profiles carry a session's identity and tools.
 CALLER_ROLE_SESSION = "session"
 
+# The TokenReview user.extra key under which the API server names the Pod a
+# projected token is bound to.
+TOKEN_REVIEW_POD_NAME_EXTRA = "authentication.kubernetes.io/pod-name"
+
 # Every role that exists, for the table check below. Note that two of them
 # nest: "chat" is a substring of "a2a-chat". Nothing here may compare roles in
 # a way that cannot tell those two apart.
@@ -981,6 +985,12 @@ class Principal:
     be. "" means no role was established, which is the ``NullAuthenticator``
     case and reaches every route, because that authenticator is only sound
     behind a Unix socket where the filesystem is the access control.
+
+    ``pod`` is the name of the Pod the token was projected into, from the
+    TokenReview's ``user.extra``. It is for the audit line, not for policy: a
+    session Pod is one conversation, so it is what traces a brokered command
+    back to the conversation that asked for it. "" when the token is not
+    Pod-bound.
     """
 
     workload: str
@@ -988,11 +998,15 @@ class Principal:
     groups: tuple[str, ...] = ()
     caller: str | None = None
     role: str = ""
+    pod: str = ""
 
     def describe(self) -> str:
+        described = self.workload
+        if self.pod:
+            described = f"{described} pod={self.pod}"
         if self.caller:
-            return f"{self.workload} (caller {self.caller})"
-        return self.workload
+            described = f"{described} (caller {self.caller})"
+        return described
 
 
 class NullAuthenticator:
@@ -1196,11 +1210,15 @@ class ServiceAccountAuthenticator:
         if role == CALLER_ROLE_SESSION and self.session_callers and username not in self.session_callers:
             raise AuthenticationError("the session audience is only for session callers")
         groups = user.get("groups") or []
+        extra = user.get("extra") or {}
+        pod_names = (extra.get(TOKEN_REVIEW_POD_NAME_EXTRA) or []) if isinstance(extra, dict) else []
+        pod = pod_names[0] if isinstance(pod_names, list) and pod_names else ""
         return Principal(
             workload=username,
             uid=str(user.get("uid") or ""),
             groups=tuple(str(group) for group in groups if isinstance(group, str)),
             role=role,
+            pod=pod if isinstance(pod, str) else "",
         )
 
 
