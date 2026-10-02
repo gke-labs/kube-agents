@@ -898,6 +898,9 @@ func TestTheSessionCallerIsNamedOnlyUnderTheFlag(t *testing.T) {
 	if _, found := brokerEnvValue(off.Env, "CREDENTIAL_PROXY_SESSION_AUDIENCE"); found {
 		t.Fatal("the session audience is rendered with the flag unset")
 	}
+	if _, found := brokerEnvValue(off.Env, "CREDENTIAL_PROXY_SESSION_CALLERS"); found {
+		t.Fatal("the session callers are rendered with the flag unset")
+	}
 
 	t.Setenv(a2aSessionClusterViewEnvVar, "true")
 	want := "system:serviceaccount:test-ns:test-agent,system:serviceaccount:test-ns:test-agent-shell," + sessionCaller
@@ -907,6 +910,11 @@ func TestTheSessionCallerIsNamedOnlyUnderTheFlag(t *testing.T) {
 	on := buildCredentialProxyDeployment(agent, "policy-hash").Spec.Template.Spec.Containers[0]
 	if v, _ := brokerEnvValue(on.Env, "CREDENTIAL_PROXY_SESSION_AUDIENCE"); v != credentialProxySessionAudience {
 		t.Fatalf("CREDENTIAL_PROXY_SESSION_AUDIENCE = %q, want %q", v, credentialProxySessionAudience)
+	}
+	// The binding: the broker refuses the session ServiceAccount any other
+	// audience, and the session audience to any other caller.
+	if v, _ := brokerEnvValue(on.Env, "CREDENTIAL_PROXY_SESSION_CALLERS"); v != sessionCaller {
+		t.Fatalf("CREDENTIAL_PROXY_SESSION_CALLERS = %q, want %q", v, sessionCaller)
 	}
 	if credentialProxySessionAudience == credentialProxyAudience || credentialProxySessionAudience == credentialProxyChatAudience {
 		t.Fatal("the session audience collides with another; the broker would refuse to confer the role")

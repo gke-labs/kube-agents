@@ -144,13 +144,21 @@ func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent) string {
 		fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, agentServiceAccountName(agent)),
 		fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, shellSandboxServiceAccountName(agent)),
 	}
-	// The third caller exists only under the cluster-view flag: a session
-	// pod presents the session audience, and the broker confers the
-	// session role on it and nothing wider.
+	// The third caller exists only under the cluster-view flag. It is
+	// held to the session role by CREDENTIAL_PROXY_SESSION_CALLERS, which
+	// buildCredentialProxyEnv renders beside it: the broker refuses this
+	// ServiceAccount every audience but the session one, and the session
+	// audience to every other caller.
 	if a2aSessionClusterViewEnabled(agent) {
-		callers = append(callers, fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, a2aSessionServiceAccountName(agent)))
+		callers = append(callers, a2aSessionBrokerCaller(agent))
 	}
 	return strings.Join(callers, ",")
+}
+
+// a2aSessionBrokerCaller is the TokenReview username of the session pods'
+// ServiceAccount, as the broker sees it.
+func a2aSessionBrokerCaller(agent *agentv1alpha1.PlatformAgent) string {
+	return fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, a2aSessionServiceAccountName(agent))
 }
 
 // buildAgentCredentialProxyTokenVolume projects the token the agent presents to
