@@ -41,7 +41,7 @@ expected_output: |
     this chat when it is done, without promising a time.
   - It says any change it thinks should be made comes as a pull request for the
     team to review.
-  - It invites the team to share their runbooks here anytime, as a statement,
+  - It invites the team to share their runbooks here, as a statement,
     not a question.
   - It ends on exactly one question, an offer of what to look at first. It asks
     for nothing else: no SOPs, governance or time zone, and no question
@@ -98,7 +98,7 @@ verification_spec:
       any_of_phrases: ["pull request", "as a pr", "a pr for"]
 
   # The two results checks read the reply with the invitation, "Share your
-  # team's runbooks here anytime", taken out: the patterns step over it whole,
+  # team's runbooks here", taken out: the patterns step over it whole,
   # so a word inside it is never reached however it is joined to the rest.
   # It carries "share" and "here", so on the whole reply it satisfied both
   # with no results sentence present. Each pattern is forbidden when its word
@@ -109,7 +109,7 @@ verification_spec:
     check:
       type: report_contains
       forbidden_patterns:
-        - '\A(?!(?>share\s+your\s+team[''’]s\s+runbooks\s+here\s+any\s*time|(?!share\s+your\s+team[''’]s\s+runbooks\s+here\s+any\s*time)[\s\S])*?(?!share\s+your\s+team[''’]s\s+runbooks\s+here\s+any\s*time)\b(?:post(?:s|ed|ing)?|shar(?:e|es|ed|ing)|send(?:s|ing)?)\b)'
+        - '\A(?!(?>share\s+your\s+team[''’]s\s+runbooks\s+here|(?!share\s+your\s+team[''’]s\s+runbooks\s+here)[\s\S])*?(?!share\s+your\s+team[''’]s\s+runbooks\s+here)\b(?:post(?:s|ed|ing)?|shar(?:e|es|ed|ing)|send(?:s|ing)?)\b)'
 
   - name: says-results-come-to-this-chat
     role: objective
@@ -121,10 +121,10 @@ verification_spec:
       # space or the mark: main matched a reply collapsed to one line, and
       # these patterns run line by line.
       forbidden_patterns:
-        - '\A(?!(?>share\s+your\s+team[''’]s\s+runbooks\s+here\s+any\s*time|(?!share\s+your\s+team[''’]s\s+runbooks\s+here\s+any\s*time)[\s\S])*?(?!share\s+your\s+team[''’]s\s+runbooks\s+here\s+any\s*time)(?:\shere(?:[ .,!;:)]|\n)|\(here\)|this\s+chat))'
+        - '\A(?!(?>share\s+your\s+team[''’]s\s+runbooks\s+here|(?!share\s+your\s+team[''’]s\s+runbooks\s+here)[\s\S])*?(?!share\s+your\s+team[''’]s\s+runbooks\s+here)(?:\shere(?:[ .,!;:)]|\n)|\(here\)|this\s+chat))'
 
   # The one standing invitation: the prompts' sentence, "Share your team's
-  # runbooks here anytime" ("any time" too), ended by ".", "!" or "…" past any
+  # runbooks here", ended by ".", "!" or "…" past any
   # closing bracket or quote, never "?". The reply is lowercased; any run of
   # whitespace and either apostrophe match. A required pattern, like the
   # results checks. A reworded invitation fails it, which is the accepted cost
@@ -142,7 +142,7 @@ verification_spec:
     check:
       type: report_contains
       forbidden_patterns:
-        - '\A(?![\s\S]*?\bshare\s+your\s+team[''’]s\s+runbooks\s+here\s+any\s*time[)\]"''”’]*(?:[.!…]|(?=\n)|\Z))'
+        - '\A(?![\s\S]*?\bshare\s+your\s+team[''’]s\s+runbooks\s+here[)\]"''”’]*(?:[.!…]|(?=\n)|\Z))'
 
   - name: asks-one-question-and-ends-on-it
     role: objective

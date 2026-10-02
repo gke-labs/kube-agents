@@ -70,7 +70,7 @@ _FALLBACK_IN_PROGRESS = (
     "profile name if the session gives one, never a name they type, else 'Hi there'. Say you are taking a "
     "first, read-only look at their GKE fleet, so nothing in their clusters changes, and will "
     "post what you find here when it is done; give no time. Say fixes come as pull requests for "
-    "their team to review, and that they can share their team's runbooks here anytime, as a "
+    "their team to review, and that they can share their team's runbooks here, as a "
     "statement, not a question. End on one question: is there anything they want "
     "you to look at first? Ask nothing else and do not claim to have saved anything."
 )
@@ -79,7 +79,7 @@ _FALLBACK_COMPLETED = (
     "profile name if the session gives one, never a name they type, else 'Hi there'. Say your first look at "
     "their GKE fleet is done and the summary is in this chat, and that you only read their "
     "clusters, so nothing changed. Say fixes come as pull requests for their team to review, and "
-    "that they can share their team's runbooks here anytime, as a statement, not a question. End "
+    "that they can share their team's runbooks here, as a statement, not a question. End "
     "on one question: do they want you to start on one of those findings? "
     "Ask nothing else, do not restate the report, and do not claim to have saved anything."
 )

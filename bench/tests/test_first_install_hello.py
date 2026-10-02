@@ -26,7 +26,7 @@ CASES = {
 # cases require the fallback.
 PROFILE_GREETING = "Hi Alex,"
 FALLBACK_GREETING = "Hi there,"
-INVITATION = " Share your team's runbooks here anytime."
+INVITATION = " Share your team's runbooks here."
 TIMEOUT_SEC = 5.0
 
 
@@ -92,11 +92,11 @@ def test_asking_for_runbooks_is_a_stacked_ask_and_no_invitation(case, ask):
 @pytest.mark.parametrize(
     "invitation",
     [
-        " Your team's runbooks are welcome here anytime.",
-        " Share your team's run books here anytime.",
-        " Share your team's runbooks in this chat anytime.",
-        " You can share your team's runbooks with me here anytime.",
-        " Drop any runbooks your team keeps here anytime.",
+        " Your team's runbooks are welcome here.",
+        " Share your team's run books here.",
+        " Share your team's runbooks in this chat.",
+        " You can share your team's runbooks with me here.",
+        " Drop any runbooks your team keeps here.",
     ],
 )
 def test_a_reworded_invitation_fails_the_invitation_check(case, invitation):
@@ -108,17 +108,25 @@ def test_a_reworded_invitation_fails_the_invitation_check(case, invitation):
 @pytest.mark.parametrize(
     "invitation",
     [
-        " (Share your team's runbooks here anytime.)",
-        ' "Share your team\'s runbooks here anytime."',
-        " “Share your team's runbooks here anytime.”",
-        " Share your team's runbooks here anytime…",
-        " Share your team’s runbooks here anytime.",
-        " Share  your team's\trunbooks here anytime.",
-        " Share your team's runbooks here any time.",
+        " (Share your team's runbooks here.)",
+        ' "Share your team\'s runbooks here."',
+        " “Share your team's runbooks here.”",
+        " Share your team's runbooks here…",
+        " Share your team’s runbooks here.",
+        " Share  your team's\trunbooks here.",
     ],
 )
 def test_a_closing_bracket_quote_ellipsis_or_spacing_still_ends_the_invitation(case, invitation):
     assert _failing(case, _example(case).replace(INVITATION, invitation)) == []
+
+
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize(
+    "invitation", [" Share your team's runbooks here anytime.", " Share your team's runbooks here any time."]
+)
+def test_an_invitation_promising_any_time_fails_the_invitation_check(case, invitation):
+    # Later turns have no runbook path to keep that promise.
+    assert "invites-runbooks" in _failing(case, _example(case).replace(INVITATION, invitation))
 
 
 @pytest.mark.parametrize("case", CASES)
@@ -152,8 +160,8 @@ def test_a_runbook_question_after_the_invitation_is_a_stacked_ask(case, ask):
 @pytest.mark.parametrize(
     "joined",
     [
-        " Share your team's runbooks here anytime, and is there anything you want me to look at first?",
-        " Share your team's runbooks here anytime - is there anything you want me to look at first?",
+        " Share your team's runbooks here, and is there anything you want me to look at first?",
+        " Share your team's runbooks here - is there anything you want me to look at first?",
     ],
 )
 def test_the_invitation_joined_to_the_closing_question_fails_the_invitation_check(case, joined):
@@ -165,11 +173,10 @@ def test_the_invitation_joined_to_the_closing_question_fails_the_invitation_chec
 @pytest.mark.parametrize(
     "invitation",
     [
-        " Share your team's runbooks here anytime.",
-        " Share your team’s runbooks here anytime.",
-        " Share your team's runbooks here any time.",
-        " Share your team's runbooks here anytime, and I'll be in touch.",
-        " Share your team's runbooks here anytime - I'll be in touch.",
+        " Share your team's runbooks here.",
+        " Share your team’s runbooks here.",
+        " Share your team's runbooks here, and I'll be in touch.",
+        " Share your team's runbooks here - I'll be in touch.",
     ],
 )
 def test_the_invitation_alone_does_not_say_where_results_go(invitation):
@@ -180,7 +187,7 @@ def test_the_invitation_alone_does_not_say_where_results_go(invitation):
         + invitation
         + " Is there anything you want me to look at first?"
     )
-    # A comma or dash after "anytime" also fails invites-runbooks; the results
+    # A comma or dash after "here" also fails invites-runbooks; the results
     # checks must not see the invitation's "share" and "here" either way.
     results = ["says-results-will-be-posted", "says-results-come-to-this-chat"]
     assert [name for name in _failing("first-install-hello-running", reply) if name in results] == results
@@ -191,11 +198,11 @@ def test_the_invitation_alone_does_not_say_where_results_go(invitation):
     [
         (
             " I'm only reading, so nothing in your clusters changes, and I'll post what I find here"
-            " when it's done, and share your team's runbooks here anytime."
+            " when it's done, and share your team's runbooks here."
         ),
         (
             " I'm only reading, so nothing in your clusters changes; I'll post what I find here"
-            " when it's done; share your team's runbooks here anytime."
+            " when it's done; share your team's runbooks here."
         ),
     ],
 )

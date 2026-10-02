@@ -40,7 +40,7 @@ expected_output: |
     restate the findings or say where in the chat they sit.
   - It says any change it thinks should be made comes as a pull request for the
     team to review.
-  - It invites the team to share their runbooks here anytime, as a statement,
+  - It invites the team to share their runbooks here, as a statement,
     not a question.
   - It ends on exactly one question, an offer to start on a finding. It asks for
     nothing else: no SOPs, governance or time zone, and no question about
@@ -104,7 +104,7 @@ verification_spec:
       any_of_phrases: ["in this chat", "in the chat", "posted"]
 
   # The one standing invitation: the prompts' sentence, "Share your team's
-  # runbooks here anytime" ("any time" too), ended by ".", "!" or "…" past any
+  # runbooks here", ended by ".", "!" or "…" past any
   # closing bracket or quote, never "?". The reply is lowercased; any run of
   # whitespace and either apostrophe match. A required pattern. A reworded
   # invitation fails it, which is the accepted cost of a check whose words
@@ -122,7 +122,7 @@ verification_spec:
     check:
       type: report_contains
       forbidden_patterns:
-        - '\A(?![\s\S]*?\bshare\s+your\s+team[''’]s\s+runbooks\s+here\s+any\s*time[)\]"''”’]*(?:[.!…]|(?=\n)|\Z))'
+        - '\A(?![\s\S]*?\bshare\s+your\s+team[''’]s\s+runbooks\s+here[)\]"''”’]*(?:[.!…]|(?=\n)|\Z))'
 
   - name: asks-one-question-and-ends-on-it
     role: objective
