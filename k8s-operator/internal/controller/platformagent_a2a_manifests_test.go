@@ -2575,15 +2575,16 @@ func TestCleanupA2ACostsEightReadsWhenThereIsNothingToClean(t *testing.T) {
 	if err := r.cleanupA2A(context.Background(), agent); err != nil {
 		t.Fatalf("cleanupA2A on a never-rendered install: %v", err)
 	}
-	// Seven sentinel Gets and nothing else: no per-object walk, and in
+	// Eight sentinel Gets and nothing else: no per-object walk, and in
 	// particular no Job List, which is the uncached one that ran every
 	// reconcile of every today install before this.
 	//
 	// The literal moved 3 -> 4 when the callout keys Secret joined the
-	// sentinels, 4 -> 6 when the two fences did (#2197), and 6 -> 7 when the
+	// sentinels, 4 -> 6 when the two fences did (#2197), 6 -> 7 when the
 	// inject door's fence did, for the hand-deleted pair that leaves it
-	// standing alone; the fences are Owns kinds, so those three reads come
-	// from the cache and only the two Secrets are uncached. Raising it is a
+	// standing alone, and 7 -> 8 when the console fence did, for the same
+	// reason; the fences are Owns kinds, so those four reads come from the
+	// cache and only the two Secrets are uncached. Raising it is a
 	// real decision — every today install pays it on every reconcile,
 	// forever — so it is spelled out rather than derived. The inequality
 	// below is the part that must hold whatever the literal is: the exit is
