@@ -72,7 +72,7 @@ gcloud container clusters update platform-agent-host \
   --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS
 ```
 
-Every registered project was provisioned before the script ran this step. Measured 2026-10-01, `kube-agents-evals-2`'s host cluster was the only one of the 28 mapped carrying the scope, and the rest had no traces in Cloud Trace from any lease. The command above is the hand repair for each, run between leases on a project Boskos holds, and it is idempotent. The current list is the verifier's `gke/host-otel-scope` finding, in the hourly pool-state scan as in a hand run, not the count here.
+Every registered project was provisioned before the script ran this step. Measured 2026-10-01, `kube-agents-evals-2`'s host cluster was the only one of the 28 mapped carrying the scope, and the rest had no traces in Cloud Trace from any lease. The command above is the hand repair for each, run between leases on a project Boskos holds, and it is idempotent; it was run by hand on 2026-10-02 (13:23–13:50 UTC), after which every pool host cluster, 35 at that reading, read back `COLLECTION_AND_INSTRUMENTATION_COMPONENTS`. The current list is the verifier's `gke/host-otel-scope` finding, in the hourly pool-state scan as in a hand run, not the counts here.
 
 ## 3. Service accounts and IAM
 
