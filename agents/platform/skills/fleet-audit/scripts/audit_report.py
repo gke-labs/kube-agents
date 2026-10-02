@@ -858,20 +858,29 @@ NAMESPACE_SHAPE_KIND = "Namespace"
 # would take the declared workload's token too, so a namespace holding a
 # declared workload gets manual recommendations instead of the shared file.
 SHARED_ACCOUNT_CHECK = "default-sa-automount"
+# The instruction comes first and the list of declared workloads last, so the
+# renderer's note cap clips names, never the sentence that says what to do.
 SHARED_ACCOUNT_SHIELD_NOTE = (
-    "_(A declared workload shares this namespace's `default` ServiceAccount: {declared}. "
-    "Turning automount off on the account would remove its token as well, so this stays manual: "
-    "set `automountServiceAccountToken: false` on the undeclared workloads' pod specs, or on the "
-    "account once the declared workload sets `true` on its own spec.)_"
+    "_(A declared workload shares this namespace's `default` ServiceAccount; turning automount off "
+    "on the account would remove its token as well, so this stays manual: set "
+    "`automountServiceAccountToken: false` on the undeclared workloads' pod specs, or on the "
+    "account once the declared workload sets `true` on its own spec. Declared: {declared}.)_"
 )
-# The shield's fixed opening, which marks a finding the shield demoted on any
-# later read of the document, and the reason a pull request opened for the
-# shared-account fix before the declaration is closed.
-SHARED_ACCOUNT_SHIELD_PREFIX = SHARED_ACCOUNT_SHIELD_NOTE.split("{declared}")[0]
+# How many declared workloads the note names before counting the rest.
+SHARED_ACCOUNT_SHIELD_NAMES = 3
+# The document key `shield_declared_account_siblings` files the ids it demoted
+# under, for the same run's stale-close pass; set by the harness, never read
+# off the worker's text.
+SHIELDED_FINDINGS_KEY = "remediation_shielded"
 SHARED_ACCOUNT_STALE_REASON = (
     "Closing unmerged: a workload in this namespace is now declared to need the `default` "
     "ServiceAccount's token, so the shared-account fix this pull request proposes would remove "
     "it; the remaining findings are manual, per pod spec."
+)
+SHARED_ACCOUNT_STALE_RESOLUTION = (
+    "The finding has not gone: it stays on the ledger with a manual remediation under the "
+    "shield note, and `/remediate <finding-id>` refuses it while the declaration stands. "
+    "Withdraw the declaration and the next run groups it onto a branch again."
 )
 
 # Harness-side declaration discovery (the obtainability SOP's §4a). `start`
@@ -5211,12 +5220,8 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
 
 
 def shielded_finding_ids(data: dict) -> set[str]:
-    """The ids `shield_declared_account_siblings` demoted, read back off their notes."""
-    return {
-        str(f.get("id", ""))
-        for f in data.get("findings") or []
-        if SHARED_ACCOUNT_SHIELD_PREFIX in str((f.get("remediation") or {}).get("note", ""))
-    }
+    """The ids `shield_declared_account_siblings` filed on the document this run."""
+    return {str(fid) for fid in data.get(SHIELDED_FINDINGS_KEY) or []}
 
 
 def shield_declared_account_siblings(data: dict) -> list[str]:
@@ -5243,22 +5248,26 @@ def shield_declared_account_siblings(data: dict) -> list[str]:
     if not shielded_by:
         return []
     changed: list[str] = []
+    already = shielded_finding_ids(data)
     for finding in data.get("findings") or []:
         if str(finding.get("check", "")) != SHARED_ACCOUNT_CHECK:
             continue
         declared = shielded_by.get(key_of(finding))
         if not declared:
             continue
+        fid = str(finding.get("id", ""))
+        if fid in already:
+            continue
         remediation = finding.setdefault("remediation", {})
-        names = ", ".join(
+        shown = [
             f"`{e.get('object', '')}` declared at {e.get('declaration', {}).get('repo', '')}:"
             f"{e.get('declaration', {}).get('path', '')}"
-            for e in declared
-        )
+            for e in declared[:SHARED_ACCOUNT_SHIELD_NAMES]
+        ]
+        rest = len(declared) - len(shown)
+        names = ", ".join(shown) + (f" and {rest} more" if rest > 0 else "")
         note = str(remediation.get("note", "")).strip()
         shield = SHARED_ACCOUNT_SHIELD_NOTE.format(declared=names)
-        if shield in note:
-            continue
         # A sibling the worker already filed as manual (2.7's default, since
         # few repositories declare the auto-created `default` ServiceAccount)
         # keeps its kind and gains the note. The shield goes first: the
@@ -5268,13 +5277,14 @@ def shield_declared_account_siblings(data: dict) -> list[str]:
         remediation["kind"] = "manual"
         remediation["path"] = ""
         remediation["note"] = shield + (f" {note}" if note else "")
-        fid = str(finding.get("id", ""))
         changed.append(fid)
         log(
             f"MANUAL: {fid} — {SHARED_ACCOUNT_CHECK} shares its namespace's `default` "
             f"ServiceAccount with a declared workload ({names}); the shared-account fix would "
             "remove that workload's token, so this finding is manual."
         )
+    if changed:
+        data[SHIELDED_FINDINGS_KEY] = sorted(already | set(changed))
     return changed
 
 
@@ -8813,8 +8823,14 @@ def render_stale_close_comment(
     *,
     pr_number: int | str = 0,
     reason: str = "",
+    resolution: str = "",
 ) -> str:
-    """Why a remediation pull request is being closed unmerged."""
+    """Why a remediation pull request is being closed unmerged.
+
+    `resolution` replaces the closing paragraph, which by default describes a
+    finding that stopped reproducing; a close for another reason (a shielded
+    finding, which is still on the ledger) says its own.
+    """
     stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
     out = [
         reason
@@ -8849,10 +8865,13 @@ def render_stale_close_comment(
         f"`{STALE_CLOSED_LABEL}` — a close made *here*, by the harness, is never "
         "read as a rejection of the fix.",
         "",
-        "If the finding comes back: a `critical` finding with a manifest "
-        f"remediation is re-proposed automatically on this same branch (at most "
-        f"{AUTO_PROMOTION_CAP} per run). Anything else is listed on the ledger "
-        "as awaiting `/remediate <finding-id>`, which re-opens it on request.",
+        resolution
+        or (
+            "If the finding comes back: a `critical` finding with a manifest "
+            f"remediation is re-proposed automatically on this same branch (at most "
+            f"{AUTO_PROMOTION_CAP} per run). Anything else is listed on the ledger "
+            "as awaiting `/remediate <finding-id>`, which re-opens it on request."
+        ),
         "",
         stale_closed_marker(pr_number),
     ]
@@ -10258,8 +10277,10 @@ def close_stale_remediation_prs(
         # came back; over an unjoinable body the branch is the one fact this
         # run actually established, so that is what the comment says.
         reason = ""
+        resolution = ""
         if only_shielded:
             reason = SHARED_ACCOUNT_STALE_REASON
+            resolution = SHARED_ACCOUNT_STALE_RESOLUTION
         elif persisting or not joinable:
             reason = (
                 f"Closing unmerged: the `{audit_id}` audit no longer groups its "
@@ -10298,7 +10319,7 @@ def close_stale_remediation_prs(
                 repo,
                 number,
                 render_stale_close_comment(
-                    audit_id, findings, generated_at, pr_number=number, reason=reason
+                    audit_id, findings, generated_at, pr_number=number, reason=reason, resolution=resolution
                 ),
                 what="stale-close comment",
             )
