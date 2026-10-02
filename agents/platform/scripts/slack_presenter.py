@@ -108,8 +108,9 @@ INCIDENT_WORDS = re.compile(
     re.IGNORECASE,
 )
 #: A Slack user or channel mention, stripped before the opener check so
-#: "<@U123> is it down?" still reads as a question.
-MENTION = re.compile(r"<[@#!][^>]*>")
+#: "<@U123> is it down?" still reads as a question. A token holds no "<", so a
+#: run of unclosed "<!" fails at the next one rather than scanning to the end.
+MENTION = re.compile(r"<[@#!][^<>]*>")
 FIRST_WORD = re.compile(r"[A-Za-z']+")
 
 # --- layout ----------------------------------------------------------------
@@ -193,10 +194,16 @@ ITALIC_EDGES = {
 FALLBACK_LIVE_MARKER = re.compile(r"(?<!\w)[*~]+|[*~]+(?!\w)")
 #: A text ending in one of these abbreviations has not ended its sentence.
 ABBREVIATION_END = re.compile(
-    r"(?:^|\s)(?:e\.g|i\.e|vs|approx|incl|cf|etc|esp|no|min|max|fig|rev|ver|ex|cont|"
+    r"(?:^|[\s(\[])(?:e\.g|i\.e|vs|approx|incl|cf|etc|esp|ex|fig|rev|ver|cont|"
     r"jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\.$",
     re.IGNORECASE,
 )
+#: "No.", "max." and "min." abbreviate only before a number ("Ticket No. 3", "at its max. 4
+#: pods"); "The answer is no." and "Replicas are at max." end.
+NUMBER_ABBREVIATION_END = re.compile(r"(?:^|[\s(\[#])(?:no|max|min)\.$", re.IGNORECASE)
+NUMBER_NEXT = re.compile(r"\d")
+#: How far back from a candidate end an abbreviation can start; bounds the check to the tail.
+ABBREVIATION_TAIL = 16
 #: A space-aligned clip shorter than this share of the limit drops too much; it cuts hard instead.
 CLIP_MIN_SHARE = 2
 
@@ -369,7 +376,10 @@ def _first_sentence(line: str) -> tuple[str, str]:
     """``(first sentence, the rest)`` of ``line``, not cut after an abbreviation."""
     for match in SENTENCE_END.finditer(line):
         sentence = line[: match.start()]
-        if not ABBREVIATION_END.search(sentence.rstrip("*_")):
+        stem = sentence.rstrip("*_")
+        tail = max(0, len(stem) - ABBREVIATION_TAIL)
+        numbered = NUMBER_ABBREVIATION_END.search(stem, tail) and NUMBER_NEXT.match(line, match.end())
+        if not (numbered or ABBREVIATION_END.search(stem, tail)):
             rest = line[match.end() :].strip()
             # "**One. Two.**" splits inside the bold, which would leave both halves unpaired.
             for marker, (opener, closer) in BOLD_EDGES.items():

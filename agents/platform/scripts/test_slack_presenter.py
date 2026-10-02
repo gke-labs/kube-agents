@@ -15,6 +15,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import slack_presenter as sp
 
+#: Slack's cap on a message's text, and how long one ask that size may take to read: it is
+#: read on the gateway's event loop, so every thread waits on it.
+SLACK_MESSAGE_MAX = 40_000
+ARRIVAL_BUDGET_SECONDS = 0.1
 #: A run of this many backticks took 7 seconds while a code span's closing run was
 #: searched for once per possible opening length.
 BACKTICK_REPEATS = 20_000
@@ -85,6 +89,14 @@ class ArrivalReactionTest(unittest.TestCase):
     def test_change_beats_incident_and_question(self):
         self.assertEqual(sp.arrival_reaction("prod is down, roll back now"), "hammer_and_wrench")
         self.assertEqual(sp.arrival_reaction("should we scale down?"), "hammer_and_wrench")
+
+    def test_a_run_of_unclosed_mentions_is_read_fast(self):
+        # A mention match scanning to the end from every "<" took 0.37 s on these.
+        for unit in ("<!", "<@", "<#"):
+            with self.subTest(unit=unit):
+                start = time.monotonic()
+                self.assertEqual(sp.arrival_reaction(unit * (SLACK_MESSAGE_MAX // len(unit))), "eyes")
+                self.assertLess(time.monotonic() - start, ARRIVAL_BUDGET_SECONDS)
 
 
 class SettleReactionTest(unittest.TestCase):
@@ -225,6 +237,49 @@ class SplitAnswerTest(unittest.TestCase):
         for line in ("Node pool np-1 at rev. 7 is cordoned.", "Certs expired Sept. 30 on seeded-a."):
             self.assertEqual(sp.split_answer(line), (line, []))
 
+    def test_an_abbreviation_in_parentheses_does_not_end_the_headline(self):
+        for line, headline in (
+            ("Several pods fail (e.g. Checkout) in prod. Raise it.", "Several pods fail (e.g. Checkout) in prod."),
+            ("Pods fail (i.e. Checkout). Raise it.", "Pods fail (i.e. Checkout)."),
+        ):
+            self.assertEqual(sp.split_answer(line)[0], headline)
+
+    def test_no_before_a_number_and_ex_do_not_end_the_headline(self):
+        # The incident card's headline is split_answer's first sentence of "What's wrong".
+        for line, headline in (
+            ("Ticket No. 3 is open. Second sentence.", "Ticket No. 3 is open."),
+            ("payments-api fails readiness since deploy No. 42. Restore the secret.", "payments-api fails readiness since deploy No. 42."),
+            ("See No. 3. Second sentence.", "See No. 3."),
+            ("Filed under #No. 7 on seeded-a. Then wait.", "Filed under #No. 7 on seeded-a."),
+            ("Use the default, ex. Checkout. More.", "Use the default, ex. Checkout."),
+            ("Disk is at 90% (approx. Two hours left). Then it fills.", "Disk is at 90% (approx. Two hours left)."),
+            ("Latency is high vs. Yesterday. Scale up.", "Latency is high vs. Yesterday."),
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(sp.split_answer(line)[0], headline)
+
+    def test_max_min_and_no_end_a_sentence(self):
+        for line, headline in (
+            ("Replicas are at max. Raise the HPA ceiling.", "Replicas are at max."),
+            ("Restarted after 5 min. Raise it.", "Restarted after 5 min."),
+            ("The answer is no. Checkout is down.", "The answer is no."),
+        ):
+            self.assertEqual(sp.split_answer(line)[0], headline)
+
+    def test_max_and_min_before_a_number_do_not_end_the_headline(self):
+        for line, headline in (
+            ("The pool is at its max. 4 pods are pending. Raise it.", "The pool is at its max. 4 pods are pending."),
+            ("Keep min. 2 replicas on seeded-a. Then drain.", "Keep min. 2 replicas on seeded-a."),
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(sp.split_answer(line)[0], headline)
+
+    def test_many_abbreviations_stay_linear(self):
+        line = "See e.g. A " * 4000 + "end."
+        started = time.monotonic()
+        sp.split_answer(line)
+        self.assertLess(time.monotonic() - started, 2)
+
     def test_a_long_backtick_run_stays_linear(self):
         for line in (
             "x " + "`" * BACKTICK_REPEATS,
@@ -250,11 +305,18 @@ class SplitAnswerTest(unittest.TestCase):
         self.assertEqual(sp.split_answer("Run ```a` now. Next."), ("Run ```a` now.", ["Next."]))
 
     def test_known_wrong_sentence_ends(self):
-        # Pinned as they are, not as they should be: "no" and "max" are abbreviations here,
-        # "Mr." is not, and a closing quote or parenthesis does not end a sentence.
-        for line in ("The answer is no. Pods are fine.", "Set replicas to max. Then wait.", 'Done.) Next.', 'Done." Next.'):
+        # Pinned as they are, not as they should be: "Mr." is not an abbreviation here, and a
+        # closing quote or parenthesis does not end a sentence.
+        for line in ('Done.) Next.', 'Done." Next.'):
             self.assertEqual(sp.split_answer(line), (line, []))
         self.assertEqual(sp.split_answer("Mr. Smith says hi. Next."), ("Mr.", ["Smith says hi. Next."]))
+
+    def test_a_bold_ends_at_the_nearest_marker(self):
+        # A run of three or more markers, or a "__" beside a letter that cannot close, leaves the text as written.
+        for text in ("___x___", "******a.", "__foo__bar__"):
+            with self.subTest(text=text):
+                self.assertEqual(sp._plain(text), text)
+        self.assertEqual(sp._plain("***bold*** and __init__"), "bold and init")
 
     def test_plain_leaves_code_spans_and_globs_alone(self):
         self.assertEqual(sp._plain("`__init__.py` is missing"), "__init__.py is missing")
