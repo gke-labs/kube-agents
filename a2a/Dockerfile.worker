@@ -57,15 +57,16 @@ RUN npm install @anthropic-ai/claude-agent-sdk@0.3.236 \
 # guard below keeps it so. With the flag off the pod has no
 # CREDENTIAL_PROXY_URL and the shim refuses with that name. gh and git are
 # deliberately not linked: the broker's session role refuses them anyway, and
-# a name that is not on PATH is a clearer answer.
+# a name that is not on PATH is a clearer answer. The forwarder itself lives
+# under libexec, off PATH, so the only names a shell finds are the two shims.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 python3-yaml \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -c 'import yaml'
-COPY --chmod=0755 agents/platform/scripts/credential_proxy_client.py /usr/local/bin/credential-proxy-exec
+COPY --chmod=0755 agents/platform/scripts/credential_proxy_client.py /opt/credential-proxy/libexec/credential-proxy-exec
 RUN mkdir -p /opt/credential-proxy/bin \
     && for binary in kubectl gcloud; do \
-         ln -s /usr/local/bin/credential-proxy-exec "/opt/credential-proxy/bin/${binary}"; \
+         ln -s /opt/credential-proxy/libexec/credential-proxy-exec "/opt/credential-proxy/bin/${binary}"; \
        done \
     && for binary in gcloud kubectl gh git; do \
          if command -v "${binary}" >/dev/null 2>&1; then \
