@@ -17,6 +17,14 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
+func platformAgentConflictError(name string) error {
+	return errors.NewConflict(
+		platformAgentGroupResource,
+		name,
+		fmt.Errorf("the object has been modified; please apply your changes to the latest version and try again"),
+	)
+}
+
 // TestPlatformAgentReconciler_Reconcile_ConflictOnStatusUpdateRequeuesCleanly verifies
 // that when a status update encounters an optimistic concurrency conflict (409 Conflict),
 // Reconcile handles the conflict cleanly by returning ctrl.Result{Requeue: true} and nil error,
@@ -33,11 +41,7 @@ func TestPlatformAgentReconciler_Reconcile_ConflictOnStatusUpdateRequeuesCleanly
 		Spec: agentv1alpha1.PlatformAgentSpec{},
 	}
 
-	conflictErr := errors.NewConflict(
-		schema.GroupResource{Group: "agents.gke.io", Resource: "platformagents"},
-		agent.Name,
-		fmt.Errorf("the object has been modified; please apply your changes to the latest version and try again"),
-	)
+	conflictErr := platformAgentConflictError(agent.Name)
 
 	ssa := fakeServerSideApplyInterceptors()
 	cl := fake.NewClientBuilder().
@@ -95,11 +99,7 @@ func TestPlatformAgentReconciler_Reconcile_ConflictOnCRUpdateRequeuesCleanly(t *
 		Spec: agentv1alpha1.PlatformAgentSpec{},
 	}
 
-	conflictErr := errors.NewConflict(
-		schema.GroupResource{Group: "agents.gke.io", Resource: "platformagents"},
-		agent.Name,
-		fmt.Errorf("the object has been modified; please apply your changes to the latest version and try again"),
-	)
+	conflictErr := platformAgentConflictError(agent.Name)
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -146,11 +146,7 @@ func TestPlatformAgentReconciler_Reconcile_ConflictOnBusCredentialsReadyDeferred
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 
-	conflictErr := errors.NewConflict(
-		schema.GroupResource{Group: "agents.gke.io", Resource: "platformagents"},
-		agent.Name,
-		fmt.Errorf("the object has been modified; please apply your changes to the latest version and try again"),
-	)
+	conflictErr := platformAgentConflictError(agent.Name)
 
 	ssa := fakeServerSideApplyInterceptors()
 	statusWrites := 0
@@ -259,6 +255,69 @@ func TestPlatformAgentReconciler_Reconcile_ConflictOnOwnedObjectNotSwallowed(t *
 	result, err := r.Reconcile(context.Background(), req)
 	if err == nil {
 		t.Fatalf("Reconcile returned nil error on owned object 409 conflict; want error to propagate to controller-runtime")
+	}
+	if !errors.IsConflict(err) {
+		t.Errorf("Reconcile returned err = %v; want 409 Conflict", err)
+	}
+	if result.Requeue {
+		t.Errorf("Reconcile result.Requeue = true; want false when error is returned")
+	}
+}
+
+// TestPlatformAgentReconciler_Reconcile_ConflictOnDifferentGroupNotSwallowed verifies
+// that 409 Conflict errors with an unexpected API group are not swallowed by the PlatformAgent
+// conflict net and propagate as reconciler errors to controller-runtime.
+func TestPlatformAgentReconciler_Reconcile_ConflictOnDifferentGroupNotSwallowed(t *testing.T) {
+	scheme := setupScheme()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "test-agent",
+			Namespace:  "test-ns",
+			Finalizers: []string{platformAgentFinalizer},
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{},
+	}
+
+	diffGroupErr := errors.NewConflict(
+		schema.GroupResource{Group: "other.example.com", Resource: "platformagents"},
+		agent.Name,
+		fmt.Errorf("the object has been modified"),
+	)
+
+	ssa := fakeServerSideApplyInterceptors()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: ssa.Patch,
+			SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				if subResourceName == "status" {
+					if _, ok := obj.(*agentv1alpha1.PlatformAgent); ok {
+						return diffGroupErr
+					}
+				}
+				return c.SubResource(subResourceName).Update(ctx, obj, opts...)
+			},
+		}).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client: cl,
+		Scheme: scheme,
+	}
+
+	req := ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      agent.Name,
+			Namespace: agent.Namespace,
+		},
+	}
+
+	result, err := r.Reconcile(context.Background(), req)
+	if err == nil {
+		t.Fatalf("Reconcile returned nil error on different group 409 conflict; want error to propagate to controller-runtime")
 	}
 	if !errors.IsConflict(err) {
 		t.Errorf("Reconcile returned err = %v; want 409 Conflict", err)

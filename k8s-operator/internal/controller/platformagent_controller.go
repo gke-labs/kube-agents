@@ -265,11 +265,15 @@ const (
 	reasonForbiddenVolumeMount = "ForbiddenVolumeMount"
 )
 
-var missingShellMessageMarkers = []string{
-	"/bin/sh",
-	"no such file or directory",
-	"executable file not found",
-}
+var (
+	missingShellMessageMarkers = []string{
+		"/bin/sh",
+		"no such file or directory",
+		"executable file not found",
+	}
+
+	platformAgentGroupResource = agentv1alpha1.GroupVersion.WithResource("platformagents").GroupResource()
+)
 
 // PlatformAgentReconciler reconciles a PlatformAgent object
 type PlatformAgentReconciler struct {
@@ -430,10 +434,10 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 
 // isPlatformAgentConflict reports whether err is an optimistic concurrency conflict
-// (409 Conflict) specifically on a PlatformAgent custom resource (Group: kubeagents.x-k8s.io
-// or legacy agents.gke.io, Resource/Kind: platformagents or PlatformAgent). Conflicts on owned
-// objects (ConfigMaps, Secrets, Deployments, NetworkPolicies) return false so they propagate
-// as reconciler errors and surface in controller_runtime_reconcile_errors_total (#2281).
+// (409 Conflict) specifically on a PlatformAgent custom resource (Group: kubeagents.x-k8s.io,
+// Resource/Kind: platformagents). Conflicts on owned objects (ConfigMaps, Secrets, Deployments,
+// NetworkPolicies) return false so they propagate as reconciler errors and surface in
+// controller_runtime_reconcile_errors_total (#2281).
 func isPlatformAgentConflict(err error) bool {
 	if !errors.IsConflict(err) {
 		return false
@@ -441,11 +445,7 @@ func isPlatformAgentConflict(err error) bool {
 	var statusErr *errors.StatusError
 	if goerrors.As(err, &statusErr) && statusErr.ErrStatus.Details != nil {
 		d := statusErr.ErrStatus.Details
-		isGroup := d.Group == agentv1alpha1.GroupVersion.Group || d.Group == "agents.gke.io"
-		isKind := d.Kind == "platformagents" || d.Kind == "PlatformAgent"
-		if isGroup && isKind {
-			return true
-		}
+		return d.Group == platformAgentGroupResource.Group && d.Kind == platformAgentGroupResource.Resource
 	}
 	return false
 }
