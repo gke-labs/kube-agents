@@ -8,7 +8,8 @@ completion handoff and the wake set — the third carries the incident-store
 call, which used to share the wake anchor and no longer can (below), the
 fourth routes the completion message through ``completion_text`` so
 ``KAGE_SLACK_UX`` can drop its head line on Slack, and the fifth settles the
-failure lines that flag held for the wake.
+failure lines that flag held for the wake. One more anchor is substituted
+unchanged: the ``platform_str`` binding the completion message reads.
 
 Where the sites live, as of v2026.9.14. Upstream's September decomposition
 (``fd2bfa1893``) moved the notifier's per-subscription delivery out of the
@@ -257,6 +258,11 @@ COMPLETION_CALL = (
     "_kanban_completion_text(n.head, n.title, handoff, n.platform_str)"
 )
 
+#: The completion call reads ``n.platform_str`` ahead of the flag, and no
+#: other anchor holds it. Pinned unchanged, so a rename, or a value that is no
+#: longer the lower-cased platform name, fails the build.
+PLATFORM_BINDING = '        self.platform_str = (sub["platform"] or "").lower()\n'
+
 COMPLETION_PATCHED = (
     f"{HANDOFF_INDENT}# kube-agents patch: see gateway/kanban_notifier.py\n"
     f"{HANDOFF_INDENT}return {COMPLETION_CALL}, wake_handoff, None\n"
@@ -372,6 +378,7 @@ def apply(root: Path) -> None:
     """Apply the patch under ``root``, or raise SystemExit with the reason."""
     patch = patchlib.Patch(root, RELATIVE, prefix="kanban_notifier")
     patch.refuse_if_patched(*SENTINELS)
+    patch.substitute(PLATFORM_BINDING, PLATFORM_BINDING, label="platform_str binding")
     for label, anchor, patched in EDITS:
         patch.substitute(anchor, patched, label=label)
     patch.append(TRAILER)

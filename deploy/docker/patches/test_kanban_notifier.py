@@ -1851,6 +1851,7 @@ class _KanbanNotification:
         self.wake_agent = mode in ("notify+wake", "wake")
         self.send_passive = mode != "wake"
         self.wake_kinds = set()
+        self.platform_str = (sub["platform"] or "").lower()
 
     def build_wake_text(self) -> None:
         task, sub = self.task, self.sub
@@ -2053,6 +2054,16 @@ class ApplyTest(unittest.TestCase):
             patch_tree(UPSTREAM_NOTIFIER.replace(*COMPLETION_DRIFT))
         self.assertIn("found 0", str(ctx.exception))
         self.assertIn("completion message", str(ctx.exception))
+
+    def test_an_upstream_rename_of_platform_str_fails_loudly(self):
+        # The completion call reads n.platform_str, which no anchor pins, and
+        # evaluates it before completion_text reads the flag: renamed upstream,
+        # every completed event would raise AttributeError with the flag off.
+        renamed = UPSTREAM_NOTIFIER.replace("self.platform_str =", "self.platform_name =")
+        self.assertNotIn("platform_str", renamed)
+        with self.assertRaises(SystemExit) as ctx:
+            patch_tree(renamed)
+        self.assertIn("platform_str", str(ctx.exception))
 
     def test_a_drifted_wake_step_anchor_fails_loudly(self):
         with self.assertRaises(SystemExit) as ctx:
