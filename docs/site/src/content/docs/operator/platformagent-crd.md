@@ -202,9 +202,11 @@ first is refused by a precondition rather than applied.
 If you installed with `install.sh`, one key covers both: `ENABLE_DRIFT_DETECTOR` in `install.env`
 writes the two variables together, and it defaults to `true`, so an install that says nothing gets
 the sink, topic, subscription and detector. To go without them, set `ENABLE_DRIFT_DETECTOR=false`
-in `install.env`. Put it in the file rather than passing `install.sh --enable-drift-detector=false`:
-the flag applies to the run you pass it to and is recorded nowhere, so the next run resolves the
-default and provisions the three resources again, and `upgrade.sh` takes no such flag at all. The
+in `install.env`. Put it in the file rather than relying on
+`install.sh --enable-drift-detector=false`: the run that creates `install.env` records that flag
+into it, but `install.sh` never rewrites the file afterwards, so on every later run the flag
+applies to the run you pass it to and is recorded nowhere — the next run resolves the default and
+provisions the three resources again, and `upgrade.sh` takes no such flag at all. The
 front doors regenerate `terraform.tfvars` on every run, so a value written into that file by hand
 does not survive the next one either.
 

@@ -191,8 +191,9 @@ project. A full
 upgrade over an `install.env` written before the key existed adds the Log Router sink,
 Pub/Sub topic and subscription that carry the project's GKE audit records, and starts the
 detector that reads them. That is intended — running an installer is the consent — but it
-means opting out has to be a `ENABLE_DRIFT_DETECTOR=false` line in the file. A
-`--enable-drift-detector=false` flag applies to the run it is passed to and is recorded
+means opting out has to be a `ENABLE_DRIFT_DETECTOR=false` line in the file. Only the run
+that creates `install.env` records the flag it was passed; over a file that is already
+there, a `--enable-drift-detector=false` applies to the run it is passed to and is recorded
 nowhere, so the next run resolves the default again, and `upgrade.sh` accepts no such flag
 at all. `install.sh` warns when you pass that flag over a file that does not carry the line;
 an exported `ENABLE_DRIFT_DETECTOR=false` is just as unrecorded and currently warns about

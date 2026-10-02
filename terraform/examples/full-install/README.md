@@ -226,12 +226,16 @@ trio an earlier install left behind from one another live install owns, and
 adopting the second takes it over: this install's teardown then deletes all
 three, retained records included, and until then both detectors pull the one
 subscription, which Pub/Sub splits between them, so each install reports about
-half the project's drift while both stay Ready. The guard names the three ways
-out — give this install its own three names (through the front doors,
+half the project's drift while both stay Ready. The guard names four ways out —
+give this install its own three names (through the front doors,
 `TF_VAR_drift_pubsub_topic=...` and the other two as lines in `install.env`,
-since the generator writes none of them), delete the leftovers if that is what
-they are (it prints the `gcloud` commands), or leave the detector off for this
-install with `ENABLE_DRIFT_DETECTOR=false`. The stockout trio
+since the generator writes none of them); import the trio back if it is this
+install's own and the state is what went missing, a repointed
+`KUBE_AGENTS_STATE_BUCKET` or a `terraform state rm` (it prints the
+`terraform import` commands, and running one asserts the ownership the guard
+could not establish); delete the leftovers if that is what they are (it prints
+the `gcloud` commands); or leave the detector off for this install with
+`ENABLE_DRIFT_DETECTOR=false`. The stockout trio
 (`stockout_pubsub_*`) has the same shape but is still adopted, because
 `enable_stockout_investigator` stays off unless asked for: a second install
 that turns it on names its own three. Renaming a subscription already in state is a
@@ -789,7 +793,7 @@ before Terraform runs. Adoption by name cannot tell a leftover from another
 install's live trio, and since `ENABLE_DRIFT_DETECTOR` became an install
 default it is every second install in a project that arrives at that
 ambiguity rather than only one that asked for the feature. The refusal names
-the three ways out; [Remote state](#remote-state) has them, and the cost of
+the four ways out; [Remote state](#remote-state) has them, and the cost of
 getting it wrong.
 
 Through the installer front doors the two variables are one `install.env` key,

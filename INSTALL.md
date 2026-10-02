@@ -100,8 +100,10 @@ Four behaviours worth knowing before the first run:
   subscription — and it reaches past the clusters this install manages: the sink exports the
   admin-activity audit records of every GKE cluster in the project, including clusters this
   install does not manage, and the subscription retains a copy of them for 31 days. Opt out with
-  `ENABLE_DRIFT_DETECTOR=false` in `install.env` rather than the `--enable-drift-detector=false`
-  flag, which applies to one run and is recorded nowhere. A second install in the same project
+  `ENABLE_DRIFT_DETECTOR=false` in `install.env`. A first run records the
+  `--enable-drift-detector=false` flag for you, because it is the run that writes that file; over
+  an `install.env` that already exists the flag applies to one run and is recorded nowhere, which
+  is why the line is the opt-out worth knowing. A second install in the same project
   names its own three (`TF_VAR_drift_pubsub_topic`, `_subscription`, `_sink`) or `lifecycle.sh`
   refuses its apply; see
   [the composition's README](terraform/examples/full-install/README.md).
