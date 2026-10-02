@@ -628,10 +628,12 @@ class RuntimeTest(unittest.TestCase):
         _run(presenter.ack_link_click(ack, {}, {"action_id": "kage.link.0"}))
         self.assertEqual(acks, [True])
 
-    def _incident(self, adapter, value="Apply Option B", edited=None):
+    def _incident(self, adapter, value="Apply Option B", edited=None, channel_name=None):
         body, action = _alert_choice(1, value)
         if edited:
             body["message"]["edited"] = {"user": "B1", "ts": edited}
+        if channel_name is not None:
+            body["channel"] = {"id": CHANNEL, "name": channel_name}
         self._answer(adapter, body, action)
 
     def test_the_incident_prefix_is_the_one_the_alert_buttons_carry(self):
@@ -740,6 +742,15 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(
             [(g["routing_text"], g["is_mentioned"]) for g in adapter.gated], [("apply B\n<@U0TEAMBOT>", True)],
         )
+
+    def test_a_group_dm_reaches_the_gate_as_a_dm_as_the_gateway_reads_it(self):
+        # The gateway passes is_dm for an mpim; a click's payload names a group DM "mpdm-...".
+        for name, is_dm in (("mpdm-alice--bob--kage-1", True), ("incidents", False), ("", False)):
+            with self.subTest(name=name):
+                importlib.reload(runtime)
+                adapter = _Adapter(replies=[{"type": "message", "user": "U4", "text": "apply B", "ts": "223.000"}])
+                self._incident(adapter, channel_name=name)
+                self.assertEqual([g["is_dm"] for g in adapter.gated], [is_dm])
 
     def test_a_mention_the_gateway_reads_is_passed_to_its_gate(self):
         for text in ("<@U0TEAMBOT> apply B", "@kage apply B"):

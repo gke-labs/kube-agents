@@ -106,6 +106,9 @@ COMMAND_GUARD = "\u200b"
 #: A DM channel id's first letter, as the adapter's message handler reads it.
 DM_CHANNEL_PREFIX = "D"
 
+#: A group DM's name in a click's payload, which carries no ``channel_type`` to read ``mpim`` from.
+GROUP_DM_NAME_PREFIX = "mpdm-"
+
 #: A synthetic message's ts when the payload carries no ``action_ts``.
 FALLBACK_TS = "kage-click-{ts}-{action}-{user}"
 
@@ -329,7 +332,14 @@ def _mention_text(adapter: Any, reply: dict) -> str:
     return str(detect(reply))
 
 
-async def _gateway_hears(adapter: Any, reply: dict, channel_id: str, team_id: str, thread_ts: str) -> bool:
+def _is_group_dm(body: dict) -> bool:
+    """Whether the click came from a group DM, which the gateway asks its gate about as a DM."""
+    return str((body.get("channel") or {}).get("name") or "").startswith(GROUP_DM_NAME_PREFIX)
+
+
+async def _gateway_hears(
+    adapter: Any, reply: dict, channel_id: str, team_id: str, thread_ts: str, is_dm: bool,
+) -> bool:
     """Whether the adapter's channel gate passes ``reply`` as it would a typed message: with
     the mention rules a click skips. A 1:1 DM, or no bot id yet, skips the gate there too."""
     bot_uid = adapter._team_bot_user_ids.get(team_id, adapter._bot_user_id)
@@ -339,14 +349,14 @@ async def _gateway_hears(adapter: Any, reply: dict, channel_id: str, team_id: st
     return await adapter._channel_gate_allows(
         channel_id=channel_id, routing_text=text, bot_uid=bot_uid,
         is_mentioned=f"<@{bot_uid}>" in text or bool(adapter._slack_message_matches_mention_patterns(text)),
-        is_thread_reply=True, event_thread_ts=thread_ts, user_id=reply["user"], team_id=team_id, is_dm=False,
+        is_thread_reply=True, event_thread_ts=thread_ts, user_id=reply["user"], team_id=team_id, is_dm=is_dm,
         force_process=False,
     )
 
 
 async def _applied_by_typing(
     adapter: Any, client: Any, channel_id: str, team_id: str, thread_ts: str, since: str,
-    options: frozenset[tuple[str, str]],
+    options: frozenset[tuple[str, str]], is_dm: bool,
 ) -> bool:
     """Whether a person the adapter would answer typed an apply in the thread after ``since``.
     One read; a read or an adapter check that fails answers no, so the click runs as it would
@@ -364,7 +374,7 @@ async def _applied_by_typing(
                 and _after(reply.get("ts"), since)
                 and _typed_apply(str(reply.get("text") or ""), options)
                 and adapter._is_interactive_user_authorized(reply["user"], channel_id=channel_id, team_id=team_id)
-                and await _gateway_hears(adapter, reply, channel_id, team_id, thread_ts)
+                and await _gateway_hears(adapter, reply, channel_id, team_id, thread_ts, is_dm)
             ):
                 return True
     except Exception as exc:  # noqa: BLE001 — the click still answers
@@ -401,6 +411,7 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
     client = adapter._get_client(channel_id, team_id=team_id)
     typed = action_id.startswith(INCIDENT_CHOICE_PREFIX) and await _applied_by_typing(
         adapter, client, channel_id, team_id, thread_ts, _buttons_shown(message, msg_ts), _option_texts(message),
+        _is_group_dm(body),
     )
     # Checked again: another click on this message may have landed during the read.
     if key in _answered:
