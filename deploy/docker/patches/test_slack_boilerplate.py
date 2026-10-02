@@ -13,6 +13,7 @@ exec the patched and unpatched fixtures, and compare what each sends: with the
 flag off, or for any platform but Slack, the two must be identical.
 """
 
+import ast
 import asyncio
 import importlib
 import os
@@ -35,7 +36,17 @@ import verify_slack_boilerplate as verifier
 
 DELIVERY = '''\
 """Fixture standing in for cron/scheduler_delivery.py."""
+from dataclasses import dataclass
+
 SENT = []
+
+
+@dataclass
+class _TargetDelivery:
+    job: dict
+    platform_name: str
+    chat_id: str
+    live_adapter_ready: bool = False
 
 
 def _prepare_target_delivery(target):
@@ -744,6 +755,37 @@ class ApplierTest(unittest.TestCase):
                 self.assertIn(f"reads {name}, which nothing binds", str(caught.exception))
                 path.write_text(patched)
         verifier.check_bound(self.root.dir)
+
+    def test_verifier_refuses_a_renamed_target_field(self):
+        # drive() hands cron_delivery_text a SimpleNamespace, and the helper reads
+        # through getattr with a default, so a rename upstream raises nothing.
+        applier.apply(self.root.dir)
+        path = self.root.dir / applier.DELIVERY
+        patched = path.read_text()
+        for name in verifier.TARGET_FIELDS:
+            with self.subTest(name=name):
+                old = f"    {name}: "
+                self.assertEqual(patched.count(old), 1)
+                path.write_text(patched.replace(old, f"    {name}_v2: "))
+                with self.assertRaises(SystemExit) as caught:
+                    verifier.main(self.root.dir)
+                self.assertIn(f"no longer declares {name},", str(caught.exception))
+        path.write_text(patched)
+        verifier.main(self.root.dir)
+
+    def test_target_fields_are_what_cron_delivery_text_reads(self):
+        # A new getattr in the helper would otherwise go unpinned.
+        tree = ast.parse(Path(runtime.__file__).read_text())
+        fn = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "cron_delivery_text"
+        )
+        read = {
+            node.args[1].value for node in ast.walk(fn)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr"
+            and isinstance(node.args[0], ast.Name) and node.args[0].id == "target"
+        }
+        self.assertEqual(read, set(verifier.TARGET_FIELDS))
 
     def test_verifier_refuses_a_dropped_wrapper(self):
         applier.apply(self.root.dir)
