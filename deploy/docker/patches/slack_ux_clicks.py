@@ -375,11 +375,11 @@ async def _applied_by_typing(
     options: frozenset[tuple[str, str]], is_dm: bool,
 ) -> bool:
     """Whether a person the adapter would answer typed an apply in the thread after ``since``.
-    One read, plus the cached thread-root lookup the adapter's channel gate makes; a read or an
-    adapter check that fails answers no, so the click runs as it would without the check, except
-    the channel gate failing on an authorized apply, which answers yes: running the click as
-    well would apply two options. The channel gate is asked only of a reply that passes
-    everything else, and at click time, not as it stood when the reply was typed."""
+    One read, plus the cached thread-root lookup the adapter's channel gate makes. A failed read
+    answers no, so the click runs as it would without the check; an adapter check that fails on
+    a reply that typed an option answers yes, since the gateway may already be applying it and
+    running the click as well would apply two. The channel gate is asked only of a reply that
+    passes everything else, and at click time, not as it stood when the reply was typed."""
     try:
         response = await client.conversations_replies(
             channel=channel_id, ts=thread_ts, oldest=since, limit=REPLIES_READ_MAX,
@@ -392,13 +392,14 @@ async def _applied_by_typing(
                 and (not reply.get("subtype") or reply.get("subtype") in TYPED_SUBTYPES)
                 and _after(reply.get("ts"), since)
                 and _typed_apply(str(reply.get("text") or ""), options)
-                and adapter._is_interactive_user_authorized(reply["user"], channel_id=channel_id, team_id=team_id)
             ):
                 continue
             try:
-                if await _gateway_hears(adapter, reply, channel_id, team_id, thread_ts, is_dm):
+                if adapter._is_interactive_user_authorized(
+                    reply["user"], channel_id=channel_id, team_id=team_id,
+                ) and await _gateway_hears(adapter, reply, channel_id, team_id, thread_ts, is_dm):
                     return True
-            except Exception as exc:  # noqa: BLE001 — an authorized apply is already in the thread
+            except Exception as exc:  # noqa: BLE001 — a typed apply is already in the thread
                 logger.warning(
                     "slack_ux_clicks: could not check the thread of %s; counting the typed apply: %s", thread_ts, exc,
                 )

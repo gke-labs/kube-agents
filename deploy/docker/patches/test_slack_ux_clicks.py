@@ -970,18 +970,9 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual([entry[0] for entry in adapter.log], ["chat_update", "chat_postMessage", "message"])
         self.assertTrue(any("could not check the thread" in line for line in logs.output))
 
-    def test_an_authorization_check_that_raises_runs_the_click_as_if_nothing_was_typed(self):
-        adapter = _Adapter(
-            replies=[{"type": "message", "user": "U2", "text": "apply B", "ts": "223.000"}], broken={"authorized"},
-        )
-        with self.assertLogs(runtime.logger, level="WARNING") as logs:
-            self._incident(adapter)
-        self._runs(adapter)
-        self.assertTrue(any("could not check the thread" in line for line in logs.output))
-
-    def test_a_gate_check_that_raises_after_an_authorized_apply_counts_the_reply(self):
+    def test_a_check_that_raises_after_a_typed_apply_matched_counts_the_reply(self):
         # Running the click as well would apply both the typed option and the clicked one.
-        for broken in ("patterns", "gate"):
+        for broken in ("authorized", "patterns", "gate"):
             with self.subTest(broken=broken):
                 importlib.reload(runtime)
                 adapter = _Adapter(
@@ -992,12 +983,16 @@ class RuntimeTest(unittest.TestCase):
                 self._drops(adapter)
                 self.assertTrue(any("could not check the thread" in line for line in logs.output))
 
-    def test_a_gate_check_that_raises_on_a_reply_that_is_no_apply_runs_the_click(self):
-        adapter = _Adapter(
-            replies=[{"type": "message", "user": "U2", "text": "what does B do?", "ts": "223.000"}], broken={"gate"},
-        )
-        self._incident(adapter)
-        self._runs(adapter)
+    def test_a_check_that_raises_on_a_reply_that_is_no_apply_runs_the_click(self):
+        for broken in ("authorized", "patterns", "gate"):
+            with self.subTest(broken=broken):
+                importlib.reload(runtime)
+                adapter = _Adapter(
+                    replies=[{"type": "message", "user": "U2", "text": "what does B do?", "ts": "223.000"}],
+                    broken={broken},
+                )
+                self._incident(adapter)
+                self._runs(adapter)
 
     def test_the_answered_alert_keeps_its_report_for_the_clicks_own_turn(self):
         report = "*Pod OOMKilled*\nOption A: raise the limit\nOption B: roll back checkout-gateway"
