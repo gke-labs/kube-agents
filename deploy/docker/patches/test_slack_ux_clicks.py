@@ -397,9 +397,9 @@ class _Adapter:
         self.gated.append(gate)
         if "gate" in self.broken:
             raise RuntimeError("gate failed")
-        # Upstream's ignore_other_user_mentions rule: un-mentioned and naming someone else is not for us.
-        others = set(re.findall(r"<@([UW][A-Z0-9_]+)>", gate["routing_text"])) - {gate["bot_uid"]}
-        if self.ignore_other_user_mentions and not gate["is_mentioned"] and others:
+        # Upstream's ignore_other_user_mentions rule: un-mentioned and opening on someone else is not for us.
+        lead = re.match(r"\s*<@([^>|\s]+)(?:\|[^>]*)?>", gate["routing_text"])
+        if self.ignore_other_user_mentions and not gate["is_mentioned"] and lead and lead.group(1) != gate["bot_uid"]:
             return False
         return gate["user_id"] not in self.unheard
 
@@ -696,11 +696,14 @@ class RuntimeTest(unittest.TestCase):
         self._runs(adapter)
         self.assertEqual([(g["routing_text"], g["is_mentioned"]) for g in adapter.gated], [(reply["text"], False)])
 
-        # With the flag off the same reply is the gateway's, so it drops the click.
-        importlib.reload(runtime)
-        adapter = _Adapter(replies=[reply])
-        self._incident(adapter)
-        self._drops(adapter)
+        # With the flag off the same reply is the gateway's, so it drops the click; and so is one
+        # naming someone after another token, since upstream reads only a leading mention.
+        for kwargs, text in (({}, reply["text"]), ({"ignore_other_user_mentions": True}, ":eyes: <@U0ALICE> apply B")):
+            with self.subTest(text=text, **kwargs):
+                importlib.reload(runtime)
+                adapter = _Adapter(replies=[{**reply, "text": text}], **kwargs)
+                self._incident(adapter)
+                self._drops(adapter)
 
     def test_a_mention_the_gateway_reads_is_passed_to_its_gate(self):
         for text in ("<@U0TEAMBOT> apply B", "@kage apply B"):
