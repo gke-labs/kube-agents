@@ -66,6 +66,8 @@ class App:
 class SlackAdapter:
     def __init__(self):
         self._app = App()
+        self._bot_user_id: str = ""
+        self._team_bot_user_ids, self._other = {}, {}
 
     def _handle_clarify_action(self, ack, body, action):
         return None
@@ -93,6 +95,15 @@ class SlackAdapter:
         return False
 
     def _is_interactive_user_authorized(self, user_id, *, channel_id="", user_name=None, team_id=""):
+        return True
+
+    def _slack_message_matches_mention_patterns(self, text: str) -> bool:
+        return False
+
+    async def _channel_gate_allows(
+        self, *, channel_id: str, routing_text: str, bot_uid: str, is_mentioned: bool,
+        is_thread_reply: bool, event_thread_ts, user_id: str, team_id: str, is_dm: bool,
+        force_process: bool) -> bool:
         return True
 
     async def _handle_slack_message(self, event, payload=None):
@@ -211,6 +222,15 @@ class ApplierTest(unittest.TestCase):
             ("def _is_ignored_channel(", "def _ignored(", "_is_ignored_channel"),
             ("def _is_interactive_user_authorized(", "def _is_user_authorized(", "_is_interactive_user_authorized"),
             ("user_name=None, team_id=\"\")", "user_name=None)", "_is_interactive_user_authorized no longer accepts"),
+            ("def _channel_gate_allows(", "def _channel_gate(", "_channel_gate_allows"),
+            ("    async def _channel_gate_allows(", "    def _channel_gate_allows(",
+             "_channel_gate_allows is no longer async"),
+            ("is_dm: bool,\n        force_process: bool)", "is_dm: bool)", "_channel_gate_allows no longer accepts"),
+            ("def _slack_message_matches_mention_patterns(", "def _mention_patterns(",
+             "_slack_message_matches_mention_patterns"),
+            ("        self._bot_user_id: str = \"\"\n", "", "no longer sets _bot_user_id"),
+            ("self._team_bot_user_ids, self._other = {}, {}", "self._bot_ids, self._other = {}, {}",
+             "no longer sets _team_bot_user_ids"),
             ("def _is_ignored_channel(self, channel_id)", "def _is_ignored_channel(self)",
              "_is_ignored_channel no longer accepts"),
             ("    def _is_ignored_channel(", "    async def _is_ignored_channel(",
@@ -320,10 +340,15 @@ class _Client:
 class _Adapter:
     def __init__(
         self, authorized=True, fail=(), allowed_channels=(), disable_dms=False, ignored=(), replies=(), unlisted=(),
+        unheard=(),
     ):
         self.authorized = authorized
         self.unlisted = set(unlisted)
         self.asked = []
+        self.unheard = set(unheard)
+        self.gated = []
+        self._bot_user_id = "U0BOT"
+        self._team_bot_user_ids = {TEAM: "U0TEAMBOT"}
         self.ignored = set(ignored)
         self.replies = replies
         self.log = []
@@ -358,6 +383,13 @@ class _Adapter:
     def _is_interactive_user_authorized(self, user_id, *, channel_id="", user_name=None, team_id=""):
         self.asked.append((user_id, channel_id, team_id))
         return user_id not in self.unlisted
+
+    def _slack_message_matches_mention_patterns(self, text):
+        return "@kage" in text.lower()
+
+    async def _channel_gate_allows(self, **gate):
+        self.gated.append(gate)
+        return gate["user_id"] not in self.unheard
 
     async def _handle_slack_message(self, event, payload=None):
         self.log.append(("message", event))
@@ -624,6 +656,48 @@ class RuntimeTest(unittest.TestCase):
         self._incident(adapter)
         self._runs(adapter)
         self.assertEqual(adapter.asked, [("U3", CHANNEL, TEAM)])
+
+    def test_a_typed_apply_the_gateway_would_not_hear_does_not_drop_the_click(self):
+        # A channel that requires an @-mention: the gateway ignored U4's bare "apply B".
+        adapter = _Adapter(
+            replies=[{"type": "message", "user": "U4", "text": "apply B", "ts": "223.000"}], unheard={"U4"},
+        )
+        self._incident(adapter)
+        self._runs(adapter)
+        self.assertEqual(adapter.gated, [{
+            "channel_id": CHANNEL, "routing_text": "apply B", "bot_uid": "U0TEAMBOT", "is_mentioned": False,
+            "is_thread_reply": True, "event_thread_ts": MESSAGE_TS, "user_id": "U4", "team_id": TEAM,
+            "is_dm": False, "force_process": False,
+        }])
+
+    def test_a_mention_the_gateway_reads_is_passed_to_its_gate(self):
+        for text in ("<@U0TEAMBOT> apply B", "@kage apply B"):
+            with self.subTest(text=text):
+                importlib.reload(runtime)
+                adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": text, "ts": "223.000"}])
+                self._incident(adapter)
+                self._drops(adapter)
+                self.assertEqual([g["is_mentioned"] for g in adapter.gated], [True])
+        importlib.reload(runtime)
+        adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": "<@U0BOT> apply B", "ts": "223.000"}])
+        self._incident(adapter)
+        # Another workspace's bot id is not a mention of this one.
+        self.assertEqual([g["is_mentioned"] for g in adapter.gated], [False])
+
+    def test_where_the_gateway_skips_its_channel_gate_the_check_skips_it_too(self):
+        reply = {"type": "message", "user": "U4", "text": "apply B", "ts": "223.000"}
+        adapter = _Adapter(replies=[reply], unheard={"U4"})
+        adapter._begin_interaction = self._dm_begin(adapter)
+        self._incident(adapter)
+        self._drops(adapter)
+        self.assertEqual(adapter.gated, [])
+
+        importlib.reload(runtime)
+        adapter = _Adapter(replies=[reply], unheard={"U4"})
+        adapter._bot_user_id, adapter._team_bot_user_ids = None, {}
+        self._incident(adapter)
+        self._drops(adapter)
+        self.assertEqual(adapter.gated, [])
 
     def test_a_reply_typed_before_the_options_appeared_does_not_drop_the_click(self):
         # The alert is posted at 222 and edited into its options at 230.

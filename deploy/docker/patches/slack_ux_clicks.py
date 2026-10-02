@@ -46,7 +46,8 @@ An incident alert's option buttons (``kage_incident.choice.<n>``) can also be
 answered by typing: someone replies ``apply Option B`` in the thread, the agent
 applies it, and the buttons are still there. So before such a click counts,
 the thread is read once, and if a person the adapter would answer (its own
-interactive authorization, the check the clicker passed) has replied with one
+interactive authorization, the check the clicker passed, and its channel gate
+with the mention rule the click skips) has replied with one
 of the call to action's forms (``apply``, ``apply Option B``, ``apply B``)
 since the buttons appeared, the buttons are replaced with "answered in the
 thread" and the click is dropped. The buttons appear when the alert is edited
@@ -259,11 +260,27 @@ def _typed_apply(text: str) -> bool:
     return bool(TYPED_APPLY.match(text, TYPED_LEAD.match(text).end()))
 
 
+async def _gateway_hears(adapter: Any, reply: dict, channel_id: str, team_id: str, thread_ts: str) -> bool:
+    """Whether the adapter's channel gate passes ``reply`` as it would a typed message: with
+    the mention rules a click skips. A 1:1 DM, or no bot id yet, skips the gate there too."""
+    bot_uid = adapter._team_bot_user_ids.get(team_id, adapter._bot_user_id)
+    if channel_id.startswith(DM_CHANNEL_PREFIX) or not bot_uid:
+        return True
+    text = str(reply.get("text") or "")
+    return await adapter._channel_gate_allows(
+        channel_id=channel_id, routing_text=text, bot_uid=bot_uid,
+        is_mentioned=f"<@{bot_uid}>" in text or bool(adapter._slack_message_matches_mention_patterns(text)),
+        is_thread_reply=True, event_thread_ts=thread_ts, user_id=reply["user"], team_id=team_id, is_dm=False,
+        force_process=False,
+    )
+
+
 async def _applied_by_typing(
     adapter: Any, client: Any, channel_id: str, team_id: str, thread_ts: str, since: str,
 ) -> bool:
     """Whether a person the adapter would answer typed an apply in the thread after ``since``.
-    One read; a read that fails answers no, so the click runs as it would without the check."""
+    One read; a read that fails answers no, so the click runs as it would without the check.
+    The channel gate is asked only of a reply that passes everything else."""
     try:
         response = await client.conversations_replies(
             channel=channel_id, ts=thread_ts, oldest=since, limit=REPLIES_READ_MAX,
@@ -272,16 +289,19 @@ async def _applied_by_typing(
     except Exception as exc:  # noqa: BLE001 — the click still answers
         logger.warning("slack_ux_clicks: could not read the thread of %s; running the click: %s", thread_ts, exc)
         return False
-    return any(
-        isinstance(reply, dict)
-        and reply.get("user")
-        and not reply.get("bot_id")
-        and (not reply.get("subtype") or reply.get("subtype") in TYPED_SUBTYPES)
-        and _after(reply.get("ts"), since)
-        and _typed_apply(str(reply.get("text") or ""))
-        and adapter._is_interactive_user_authorized(reply["user"], channel_id=channel_id, team_id=team_id)
-        for reply in replies
-    )
+    for reply in replies:
+        if (
+            isinstance(reply, dict)
+            and reply.get("user")
+            and not reply.get("bot_id")
+            and (not reply.get("subtype") or reply.get("subtype") in TYPED_SUBTYPES)
+            and _after(reply.get("ts"), since)
+            and _typed_apply(str(reply.get("text") or ""))
+            and adapter._is_interactive_user_authorized(reply["user"], channel_id=channel_id, team_id=team_id)
+            and await _gateway_hears(adapter, reply, channel_id, team_id, thread_ts)
+        ):
+            return True
+    return False
 
 
 async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) -> None:

@@ -12,7 +12,9 @@ Two things are checked:
    ``_begin_interaction(ack, body, action, kind)`` returning the eight fields
    :func:`slack_ux_clicks.answer` unpacks, in that order, plus
    ``_is_ignored_channel``, ``_slack_allowed_channels``, ``_slack_disable_dms``,
-   ``_get_client``, ``_handle_slack_message`` and ``_is_interactive_user_authorized``, plus ``_client_for`` for ``slack_ux_incident``, and the adapter file still reads the
+   ``_get_client``, ``_handle_slack_message``, ``_is_interactive_user_authorized``,
+   ``_channel_gate_allows`` and ``_slack_message_matches_mention_patterns``, sets
+   ``_bot_user_id`` and ``_team_bot_user_ids`` in ``__init__``, plus ``_client_for`` for ``slack_ux_incident``, and the adapter file still reads the
    ``_hermes_force_process`` marker the click's message carries.
    ``_register_bolt_handlers`` still wires the plugin
    action handlers, and the flag guard calling
@@ -55,9 +57,12 @@ ADAPTER_CLASS = "SlackAdapter"
 RUNTIME_MEMBERS = (
     "_begin_interaction", "_is_ignored_channel", "_slack_allowed_channels", "_slack_disable_dms",
     "_get_client", "_handle_slack_message", "_client_for", "_is_interactive_user_authorized",
+    "_channel_gate_allows", "_slack_message_matches_mention_patterns",
 )
+#: The instance attributes the runtime reads, set in ``__init__``.
+RUNTIME_ATTRIBUTES = ("_bot_user_id", "_team_bot_user_ids")
 #: The members the runtime awaits; every other one it calls plainly.
-ASYNC_MEMBERS = ("_begin_interaction", "_handle_slack_message")
+ASYNC_MEMBERS = ("_begin_interaction", "_handle_slack_message", "_channel_gate_allows")
 #: The event key whose ``.get()`` makes the message handler skip the mention
 #: requirement for a click's turn. Matched in the AST, so quoting does not matter.
 FORCE_MARKER = "_hermes_force_process"
@@ -74,6 +79,11 @@ CALL_SHAPES = {
     "_client_for": ((2, ()),),
     "_handle_slack_message": ((1, ()),),
     "_is_interactive_user_authorized": ((1, ("channel_id", "team_id")),),
+    "_slack_message_matches_mention_patterns": ((1, ()),),
+    "_channel_gate_allows": ((0, (
+        "channel_id", "routing_text", "bot_uid", "is_mentioned", "is_thread_reply", "event_thread_ts", "user_id",
+        "team_id", "is_dm", "force_process",
+    )),),
 }
 
 CHANNEL = "C0KAGE"
@@ -188,6 +198,20 @@ def _accepts(args: ast.arguments, positional: int, keywords: tuple[str, ...]) ->
     return not set(keywords) & set(extra)
 
 
+def _init_attributes(cls: ast.ClassDef) -> set[str]:
+    """The ``self.<name>`` attributes ``__init__`` assigns, annotated or not."""
+    init = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__"), None)
+    if init is None:
+        return set()
+    targets = [t for n in ast.walk(init) if isinstance(n, ast.Assign) for t in n.targets]
+    targets = [e for t in targets for e in (t.elts if isinstance(t, ast.Tuple) else [t])]
+    targets += [n.target for n in ast.walk(init) if isinstance(n, ast.AnnAssign)]
+    return {
+        t.attr for t in targets
+        if isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name) and t.value.id == "self"
+    }
+
+
 def check_members(tree: ast.Module) -> None:
     """The adapter members the runtime calls exist and accept its calls, and ``_begin_interaction`` has its shape."""
     classes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == ADAPTER_CLASS]
@@ -197,6 +221,9 @@ def check_members(tree: ast.Module) -> None:
     missing = [name for name in RUNTIME_MEMBERS if name not in members]
     if missing:
         raise _fail(f"{ADAPTER_CLASS} no longer has {', '.join(missing)}, which the runtime calls")
+    unset = [name for name in RUNTIME_ATTRIBUTES if name not in _init_attributes(classes[0])]
+    if unset:
+        raise _fail(f"{ADAPTER_CLASS}.__init__ no longer sets {', '.join(unset)}, which the runtime reads")
     for name, calls in CALL_SHAPES.items():
         args = _method_args(tree, members[name])
         if args is None:
@@ -300,6 +327,8 @@ class _StubAdapter:
         self.authorized = authorized
         self.log: list[tuple] = []
         self._app = _App()
+        self._bot_user_id = "U0BOT"
+        self._team_bot_user_ids: dict[str, str] = {}
 
     async def _begin_interaction(self, ack, body, action, kind, *, team_scoped=True):
         await ack()
@@ -322,6 +351,15 @@ class _StubAdapter:
 
     def _is_interactive_user_authorized(self, user_id, *, channel_id="", user_name=None, team_id=""):
         return self.authorized
+
+    def _slack_message_matches_mention_patterns(self, text):
+        return False
+
+    async def _channel_gate_allows(
+        self, *, channel_id, routing_text, bot_uid, is_mentioned, is_thread_reply, event_thread_ts, user_id,
+        team_id, is_dm, force_process,
+    ):
+        return True
 
     async def _handle_slack_message(self, event, payload=None):
         self.log.append(("message", event))
