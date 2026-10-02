@@ -2681,10 +2681,10 @@ func TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere(t *testing.T) {
 		})
 	}
 
-	for _, door := range []bool{false, true} {
-		t.Run(fmt.Sprintf("guardrail_path_door_armed_%t", door), func(t *testing.T) {
-			if door {
-				t.Setenv(a2aInjectBackendEnvVar, "true")
+	for _, door := range []string{"", a2aInjectBackendEnvVar, a2aAgentDoorEnvVar} {
+		t.Run(fmt.Sprintf("guardrail_path_door_armed_%q", door), func(t *testing.T) {
+			if door != "" {
+				t.Setenv(door, "true")
 			}
 			fences := 0
 			unobstructed := &PlatformAgentReconciler{Client: buildClient(next, 0, &fences), Scheme: scheme}

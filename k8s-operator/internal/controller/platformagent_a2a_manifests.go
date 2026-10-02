@@ -4839,6 +4839,9 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	//     the flag says, like its teardown entry: the install that has it is
 	//     the one whose operator was deployed with the flag, and the read
 	//     finds nothing on one that never was,
+	//   - the A2A door's fence, the same shape under the other flag: written
+	//     after the pair and deleted before it, left alone only by the hand,
+	//     removed on the today path by nothing but this walk,
 	//   - the callout keys Secret, which is the FIRST deletable object
 	//     reconcileA2A creates — the per-user creds Secret is created before it
 	//     and deliberately survives — so a render that died anywhere leaves this
