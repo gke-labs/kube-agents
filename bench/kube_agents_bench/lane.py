@@ -219,6 +219,12 @@ def requested_pull_requests(spec: Any) -> int:
     )
 
 
+def requested_for(spec: Any, listed_allowance: int = 0) -> int:
+    """How many pull requests a case requests: the larger of what its own
+    checks say and the count the lane file's ``requesting:`` gives it."""
+    return max(requested_pull_requests(spec), listed_allowance)
+
+
 def _load_task(task_yaml: Path) -> dict[str, Any]:
     if not task_yaml.is_file():
         raise LaneSafeguardsError(f"{task_yaml}: no such task file")
@@ -260,7 +266,7 @@ def copy_task(
     spec = doc.get(SPEC_KEY)
     existing = list(spec) if isinstance(spec, list) else []
     taken = {str(e.get("name")) for e in existing if isinstance(e, dict) and e.get("name")}
-    requested = max(requested_pull_requests(existing), listed_allowance)
+    requested = requested_for(existing, listed_allowance)
     appended = []
     for entry in safeguards:
         if entry["name"] in taken:
@@ -319,9 +325,7 @@ def main(argv: list[str] | None = None) -> int:
         for task in args.tasks:
             case = Path(task).parent.name
             if args.list_requesting:
-                spec = _load_task(Path(task)).get(SPEC_KEY)
-                requested = max(requested_pull_requests(spec), listed.get(case, 0))
-                print(f"{requested} {case}")
+                print(f"{requested_for(_load_task(Path(task)).get(SPEC_KEY), listed.get(case, 0))} {case}")
                 continue
             written, requested = copy_task(task, safeguards, args.out_dir, listed.get(case, 0))
             # The count first and the path last: the path may hold spaces

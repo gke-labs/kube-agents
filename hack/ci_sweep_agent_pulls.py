@@ -221,14 +221,17 @@ class WriteBudget:
         self.left = 0
         self.exhausted_at = None
 
-    def take(self, repo, writes_left_if_not=1):
-        if self.remaining <= 0:
+    def take(self, repo, writes_left_if_not=1, count=1):
+        """Take `count` writes together, or none: a label whose close the
+        budget could not then pay for would leave a pull request open and
+        labelled, so the two are one take."""
+        if self.remaining < count:
             if self.exhausted_at is None:
                 self.exhausted_at = repo
                 print("  write budget for this run (%d) used up at %s; the rest waits for the next run" % (self.budget, repo), file=sys.stderr)
             self.left += writes_left_if_not
             return False
-        self.remaining -= 1
+        self.remaining -= count
         return True
 
 
@@ -543,15 +546,12 @@ def close_agent_pulls(repo, authorization, bot_login, dry_run=False, budget=None
                 closed += 1
                 gone.add(ref)
                 continue
-            # The label's write and the close's are taken from the budget
-            # together, before either is made: a label spent on a pull request
-            # the close cannot then pay for would leave it open and labelled,
-            # and "labelled" and "closed" go together or not at all.
+            # The label's write and the close's are one take from the budget,
+            # before either is made: a label spent on a pull request the close
+            # cannot then pay for would leave it open and labelled, and
+            # "labelled" and "closed" go together or not at all.
             needed = WRITES_PER_PULL_REQUEST + int(audit)
-            if budget is not None and not budget.take(repo, writes_left_if_not=needed):
-                still_open.add(ref)
-                continue
-            if audit and budget is not None and not budget.take(repo, writes_left_if_not=needed):
+            if budget is not None and not budget.take(repo, writes_left_if_not=needed, count=1 + int(audit)):
                 still_open.add(ref)
                 continue
             # Each close stands alone. One that fails is reported and the sweep

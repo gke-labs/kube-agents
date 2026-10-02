@@ -1539,10 +1539,12 @@ class PullRequestOpenedVerifier(BaseVerifier):
     fix touches, so every
     later run of the audit on the stream -- this case's later repetitions, or
     another case auditing the same fleet -- finds the pull request open on it,
-    leaves it, and pushes nothing. The job's repository reset runs before the
-    units of cases that request a pull request, not between an audit stream's
-    units (docs/ci-pool-projects.md 5.5), so without the option only the first
-    unit on the stream could pass. A leftover from before the
+    leaves it, and pushes nothing. Since #2260 the job's repository reset
+    closes that pull request, labelled ``audit:stale-closed``, before each
+    unit of a case that requests one, so each unit re-proposes and opens its
+    own; the option is for runs the reset skips (no App key,
+    docs/ci-pool-projects.md 5.5), where without it only the first unit on
+    the stream could pass. A leftover from before the
     stream's first unit -- an earlier job on the pool project -- predates the
     stamp and is still rejected. The branch ties the pull request to the
     audit, not to this case's defect: another case on the same stream opens

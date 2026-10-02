@@ -1965,13 +1965,19 @@ if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ]; then
   # `<requested> <case> <path>`: the count first and the path last, so a
   # path with a space (a TMPDIR with one) cannot shift the fields read here.
   INJECT_LANE_REQUESTING="$(printf '%s\n' "${INJECT_LANE_COPIES}" | awk '$1 > 0 { printf "%s%s", sep, $2; sep = "," }')"
+  # The settle before each writer unit is the safeguard's window: a write
+  # in the last seconds of the unit before must be older than it.
+  WRITER_LAUNCH_PAUSE="${EVAL_GITHUB_WRITE_SETTLE_SECONDS}"
   echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: every task in the matrix carries the lane's safeguards (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) over BENCH_GITOPS_REPO=${BENCH_GITOPS_REPO}; copies under ${INJECT_LANE_TASKS_DIR}; cases that request a pull request, run after every other unit: ${INJECT_LANE_REQUESTING:-none}"
 else
   # The api lane runs the same second phase, for the reset's sake rather than
   # the safeguard's: reset_agent_pulls empties the repository before each
   # unit of a case that requests a pull request, which is only safe when no
-  # other unit is writing to it. Same list, read from the same files, no
-  # copies made; the task files under bench/tasks/ run as they are.
+  # other unit is writing to it. Same list, read from the same files (the
+  # lane file's `requesting:` included, so the file must parse here too), no
+  # copies made; the task files under bench/tasks/ run as they are. No window
+  # to settle, so the writer units keep the launch stagger.
+  WRITER_LAUNCH_PAUSE="${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
   if ! INJECT_LANE_REQUESTING="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.lane \
       --safeguards "${SCRIPT_DIR}/${EVAL_INJECT_LANE_SAFEGUARDS_FILE}" --list-requesting "${TASKS[@]}" \
       | awk '$1 > 0 { printf "%s%s", sep, $2; sep = "," }')"; then
@@ -2948,18 +2954,21 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
 # spent two of four lanes that way for its first twelve minutes under the
 # cost-first ordering this replaces.
 #
-# Two phases, on both lanes. On the inject lane (#2079) for the GitHub-write
-# safeguard, which dates a write and cannot sign it while every unit of the
-# run writes to one repository; on both lanes for the repository reset
-# (#2260), which empties that repository before each unit of a case that
-# requests a pull request and may only do so while nothing else writes. Such
+# Two phases on the inject lane (#2079), and since #2260 on the api lane too.
+# On the inject lane for the GitHub-write safeguard, which dates a write and
+# cannot sign it while every unit of the run writes to one repository; on
+# both lanes for the repository reset, which empties that repository before
+# each unit of a case that requests a pull request and may only do so while
+# nothing else writes. Such
 # a case (INJECT_LANE_REQUESTING, from the lane step; empty on a matrix with
 # no such case) therefore runs only after every other unit has finished: a
 # repetition of a case that requests nothing never shares the repository with
 # one that writes by design, so a write inside its window is its own or a
 # concurrent sibling's mistake, either of which is the red the safeguard
-# exists for. The second phase runs one unit at a time, and every unit in it
-# waits EVAL_GITHUB_WRITE_SETTLE_SECONDS before it starts: two requesting
+# exists for. The second phase runs one unit at a time, and on the inject
+# lane every unit in it waits EVAL_GITHUB_WRITE_SETTLE_SECONDS before it
+# starts (WRITER_LAUNCH_PAUSE, set by the lane step; the api lane, which
+# grades no window, keeps the launch stagger): two requesting
 # cases side by side would red each other's by-design pull requests (each
 # excuses only the ones its own reply names), and the safeguard's window
 # opens that many seconds before the repetition's start, so a write in the
@@ -3026,14 +3035,14 @@ profile_begin "task fan-out: $((UNIT_TOTAL + WRITER_TOTAL)) units, parallelism=$
 launch_units "${UNIT_QUEUE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
 wait
 if [ "${WRITER_TOTAL}" -gt 0 ]; then
-  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${WRITER_TOTAL} unit(s) of the cases that request a pull request (${INJECT_LANE_REQUESTING}), one at a time, each after a ${EVAL_GITHUB_WRITE_SETTLE_SECONDS}s settle"
-  launch_units "${UNIT_QUEUE_WRITERS}" 1 "${EVAL_GITHUB_WRITE_SETTLE_SECONDS}"
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${WRITER_TOTAL} unit(s) of the cases that request a pull request (${INJECT_LANE_REQUESTING}), one at a time, each after a ${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}s pause"
+  launch_units "${UNIT_QUEUE_WRITERS}" 1 "${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}"
   wait
 fi
 
 # ─── What the run left on GitHub (#2079) ─────────────────────────────────────
 # On the inject lane, once every unit is done: every pull request and branch
-# under the agent's prefix written to the leased project's repository since
+# a bot wrote to the leased project's repository since
 # this run began, in the job log by number and branch, so a red safeguard has
 # its subject named beside it and a run's leftovers are on record even when
 # no repetition graded them (a unit that died before verification). It closes

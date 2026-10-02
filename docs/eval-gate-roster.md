@@ -179,20 +179,21 @@ case, and builds the record step 3 reads at presubmit volume instead of one nigh
 The Cases page reads it as held out, undated: it was never on the roster. Enters the roster
 when #2016 step 3 holds: three clean days at ≥ 90 % of graded repetitions under
 `pull_request_opened` with no all-reps collapse, infra classes the harness excludes not
-counted. One miss shape the seat will show is graded and counts against the case: a job's three
-repetitions share the leased repository, the sweep closes leftovers between leases and not
-between them, and submit-suggestion derives its branch from the change, so repetitions 2 and 3
-meet repetition 1's open pull request. A repetition that pushes its own commit onto that pull
-request passes (#1832 grades the head commit, which must be no older than the repetition's
-start); one that only links the sibling's pull request fails, and that miss is the case's own,
+counted. One miss shape the seat showed before #2260 was graded and counted against the case: a
+job's three repetitions shared the leased repository, the sweep closed leftovers between leases
+and not between them, and submit-suggestion derives its branch from the change, so repetitions 2
+and 3 met repetition 1's open pull request. A repetition that pushed its own commit onto that pull
+request passed (#1832 grades the head commit, which must be no older than the repetition's
+start); one that only linked the sibling's pull request failed, and that miss was the case's own,
 not infra. On the old record's two best nights three of six repetitions linked a pull request
 they did not open (09-20: `evals-23-infra` #34 twice, then leftover #4; 09-19: `evals-6-infra`
 #43, #46, then leftover #12), so a reading in the 50–67 % band is the isolation design
 ([#1755](https://github.com/gke-labs/kube-agents/issues/1755) item 3, closed undecided) before
-it is agent regression; step 3 either counts it, grades repetition 1 only, or sweeps between
-repetitions, and says which — and since [#2260](https://github.com/gke-labs/kube-agents/issues/2260)
+it is agent regression. Step 3's choice was the third of counting it, grading repetition 1 only,
+or sweeping between repetitions: since [#2260](https://github.com/gke-labs/kube-agents/issues/2260)
 the job empties the repository before every repetition of a case that requests a pull request,
-so the shape should no longer arise. `pull_request_opened`'s `accepts_stream_pull_request` is not a
+so the shape no longer arises and a reading in that band is regression.
+`pull_request_opened`'s `accepts_stream_pull_request` is not a
 fourth answer here: it widens only a fleet audit's stream, and this case has no ledger and
 opens submit-suggestion branches. The roster edit (step 4, an eval-crew approval) takes
 `remediation` off the `docs/designs/domains.yaml` allowlist. Until then the domain sits there
@@ -404,7 +405,8 @@ request is a tripped catastrophic safeguard at rung 1, as a cluster mutation is.
 under `bench/tasks/` and the api lane are untouched. A case that requests a pull request (a
 `pull_request_opened` or `pull_request_diff_contains` check of its own) is allowed the ones its
 reply names, and because the fan-out runs cases side by side against one repository, the script
-runs those cases in a second phase after every other unit has finished, one at a time and each
+runs those cases in a second phase after every other unit has finished (on both lanes since
+#2260, for the repository reset's sake), one at a time and on the inject lane each
 after a settle as long as the check's clock-skew tolerance, so a repetition that requests
 nothing never shares the repository with one that writes by design and no window reaches back
 into the unit before.

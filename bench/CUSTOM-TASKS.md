@@ -516,10 +516,12 @@ one used and edits the pull request already open on it. The stamp cannot decide 
 moves on a comment as readily as on a push — so the check also reads the head commit, and fails a
 pull request that changes no files or whose head commit predates the run. That is what makes
 repetitions inside one lease gradable: rep 2 pushing onto rep 1's branch moves the head commit,
-rep 2 quoting rep 1's URL does not. A Prow periodic (`hack/ci_sweep_agent_pulls.py --pool`, run
-from `main` only) closes the agent's leftovers in free pool projects every ten minutes and deletes
-their branches (a leftover branch refuses an identical fix "nothing to commit"), so a lease
-rarely inherits one; when it does, the head-commit check is what keeps it from grading.
+rep 2 quoting rep 1's URL does not. The job itself empties the leased repository of the agent's
+pull requests and branches at lease time and before every repetition of a case that requests a
+pull request (`hack/ci_reset_agent_pulls.py`, [`ci-pool-projects.md`](../docs/ci-pool-projects.md#55-the-repository-reset-and-the-sweep-behind-it)), and a Prow periodic (`hack/ci_sweep_agent_pulls.py --pool`, run from
+`main` only) closes what a run killed hard left in free pool projects every ten minutes; a
+leftover branch would refuse an identical fix "nothing to commit", which is why both delete
+branches too. The head-commit check is what keeps anything inherited from grading.
 A pull request closed without being merged is rejected: closing moves `updated_at` too, and
 what the case grades is that the fix went out. `owner: gke-agentic` pins the organisation, a fair exact
 match across every pool project that breaks loudly if the organisation ever moves.
@@ -561,9 +563,10 @@ permission.
 run left open on the same branch, as a fleet audit's remediation case does. The audit's `finish`
 names the branch after the files the fix touches, so every later run of the audit on the
 same stream, whether this case's next repetition or another case auditing the same fleet, finds
-the pull request open on that branch, leaves it, and pushes nothing. The job's repository reset
-runs before the units of cases that request a pull request, not between an audit stream's units
-([`ci-pool-projects.md`](../docs/ci-pool-projects.md#55-the-repository-reset-and-the-sweep-behind-it)), so without the option only the first run on the stream could pass. With it, the two "since
+the pull request open on that branch, leaves it, and pushes nothing. Since #2260 the job's
+repository reset closes that pull request, labelled `audit:stale-closed`, before each repetition of
+a case that requests one, so each repetition re-proposes and opens its own; the option is for runs
+the reset skips (no App key, [`ci-pool-projects.md`](../docs/ci-pool-projects.md#55-the-repository-reset-and-the-sweep-behind-it)), where without it only the first run on the stream could pass. With it, the two "since
 the run started" clauses (written to, head commit) measure from `EVAL_STREAM_STARTED_AT` instead:
 the moment the first unit on the case's audit stream began, which `hack/ci-eval-pr.sh` exports
 with the audit id in `EVAL_AUDIT_STREAM` and the job's GitOps repository in `EVAL_STREAM_REPO`. The `audit` key of the case's `ledger_issue_contains`
