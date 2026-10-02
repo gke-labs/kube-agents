@@ -546,7 +546,7 @@ def test_the_failure_case_says_why_only_from_the_reason() -> None:
     case = yaml.safe_load(FAILURE_CASE.read_text())
     replay = card_wake.parse(case["prompt"])
     (says_why,) = [e for e in case["verification_spec"] if e["name"] == "the-reply-says-why"]
-    phrases = says_why["check"]["any_of_phrases"]
+    phrases = says_why["check"]["required_phrases"]
 
     # The wake carries the title, so a phrase it also holds is answerable unread.
     assert all(p in replay.reason for p in phrases)

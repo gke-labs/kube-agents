@@ -100,7 +100,9 @@ verification_spec:
         - '\A(?:(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*\n)*?(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*?(?<!not )(?<!n[''’]t )(?<!nothing will )(?<!no one will )(?<!nobody will )(?<!nothing else will )(?<!no one else will )(?<!nobody else will )(?<!not be )(?<!n[''’]t be )(?<!never be )(?<!not going to )(?<!n[''’]t going to )(?<!nothing is going to )(?<!no one is going to )(?<!nobody is going to )(?:re-?run|run (?:it |that |this )?again|try (?:it |that |this )?again|retry)(?: it)? (?:on its own|by itself|automatically|without (?:you |anyone )?(?:asking|having to ask))'
   # The other half of the fact: the run is over. Forgiving on purpose; any
   # one of these says the user should not wait for another attempt. A count
-  # ("twice", "both attempts") does not, so none is here.
+  # ("twice", "both attempts") does not, so none is here. Nor is a bare
+  # "stopped" or "exhausted": "the pods stopped responding" and "exhausted its
+  # 30-minute limit" describe the failure, not the end of the run.
   - name: the-reply-says-it-stopped
     role: objective
     mode: assert
@@ -110,7 +112,13 @@ verification_spec:
         - "gave up"
         - "given up"
         - "giving up"
-        - "stopped"
+        - "it stopped"
+        - "it's stopped"
+        - "it has stopped"
+        - "has now stopped"
+        - "stopped for good"
+        - "stopped running"
+        - "stopped trying"
         - "won't be retried"
         - "will not be retried"
         - "isn't being retried"
@@ -120,7 +128,8 @@ verification_spec:
         - "no more retries"
         - "out of retries"
         - "retries exhausted"
-        - "exhausted"
+        - "exhausted its retries"
+        - "exhausted its attempts"
         - "last attempt"
         - "final attempt"
         - "nothing will retry"

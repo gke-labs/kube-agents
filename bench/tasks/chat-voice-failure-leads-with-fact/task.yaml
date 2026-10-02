@@ -115,13 +115,14 @@ verification_spec:
       # An errored read returned no reason.
       require_success: true
   # The reason in the card's own words; a guessed "access" or "permission"
-  # does not match.
+  # does not match, and neither does "service account" alone, which SOUL
+  # gives every reply.
   - name: the-reply-says-why
     role: objective
     mode: assert
     check:
       type: report_contains
-      any_of_phrases: ["deployments.update", "service account"]
+      required_phrases: ["deployments.update"]
   # Anywhere in the front door's own text, not only at the start.
   - name: no-apology-let-me-know-or-narration
     role: objective

@@ -5074,6 +5074,13 @@ def test_the_final_attempt_objectives_pass_a_reply_that_says_it_stopped(final_me
         ("It stopped. I'm going to retry it.", [_SAYS_RETRIED]),
         ("It stopped. I will run it again.", [_SAYS_RETRIED]),
         ("It timed out twice.", [_SAYS_STOPPED]),
+        # "Stopped" or "exhausted" about the failure itself, not the run:
+        (
+            "The check exhausted its 30-minute limit reading the invoice-renderer logs on "
+            "bench-sandbox. Want me to try again with a longer window?",
+            [_SAYS_STOPPED],
+        ),
+        ("The check timed out because the pods stopped responding.", [_SAYS_STOPPED]),
         # A live miss: the timeout read as a retried card (gD green2 on 52b8633b).
         (
             "The check for why invoice-renderer keeps restarting timed out, so it is being retried.",
@@ -5164,7 +5171,8 @@ _FAILURE_SHOW = {"name": "kanban_show", "args": {"task_id": "t_cc52a43d"}, "resu
 # Follows the voice to the letter, then re-routes without being asked.
 _FAILURE_REROUTE = (
     "I couldn't restart **invoice-renderer** on bench-sandbox; its service account was "
-    "denied, so I've asked another agent to check who can. Retry it once they answer?\n\n"
+    "denied container.deployments.update, so I've asked another agent to check who can. "
+    "Retry it once they answer?\n\n"
     "Result of delegated task t_0dd5e7a1:\n"
     "Delegated to the cluster agent. Sorry, let me know if you need more."
 )
@@ -5300,6 +5308,12 @@ def test_the_failure_voice_objectives_pass_a_reply_that_leads_with_the_fact(fina
             "The platform agent couldn't restart invoice-renderer on bench-sandbox: it probably "
             "lacks access. " + _FAILURE_ASK,
             ["the-reply-says-why", _FAILURE_NOINT],
+        ),
+        # The identity SOUL gives every reply, without the permission it lacked.
+        (
+            "I couldn't restart invoice-renderer on bench-sandbox. My service account isn't "
+            "allowed to. " + _FAILURE_ASK,
+            ["the-reply-says-why"],
         ),
         (
             "Task t_cc52a43d is blocked and needs attention.\n\n"
