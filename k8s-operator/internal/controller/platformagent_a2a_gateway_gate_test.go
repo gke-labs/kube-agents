@@ -683,6 +683,7 @@ func a2aGateTestReconcilerWithoutABackend(t *testing.T, agent *agentv1alpha1.Pla
 // would wait with this term deleted.
 func TestADarkGatewayKeepsTheReconcileRequeuing(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "")
 	agent := a2aTestAgent()
 	r, cl, req := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
@@ -715,6 +716,7 @@ func TestADarkGatewayKeepsTheReconcileRequeuing(t *testing.T) {
 // parked path.
 func TestADegradedPassStillMaintainsTheA2AConditions(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "")
 	agent := a2aTestAgent()
 	scheme := setupScheme()
 	cl := fake.NewClientBuilder().
@@ -776,6 +778,7 @@ func TestADegradedPassStillMaintainsTheA2AConditions(t *testing.T) {
 // where the two are the same code path.
 func TestTheReadyWriterReportsTheGatewayTheRenderWithheld(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "")
 	agent := a2aTestAgent()
 	r, cl, req := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
@@ -831,6 +834,7 @@ func TestTheReadyWriterReportsTheGatewayTheRenderWithheld(t *testing.T) {
 // Secret arrives while the refusal stands.
 func TestAFailedJobPassStillMaintainsTheA2AConditions(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "")
 	agent := a2aTestAgent()
 	r, cl, req := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
@@ -986,6 +990,7 @@ func TestAHeldProvisionJobReadsProvisioningNamingTheCallout(t *testing.T) {
 // the gateway. An install whose gateway exists pays nothing for the gate.
 func TestARunningGatewayDoesNotReadTheSecret(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "")
 	agent := a2aTestAgent()
 	scheme := setupScheme()
 	secretReads := 0
