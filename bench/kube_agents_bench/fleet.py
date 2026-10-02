@@ -75,7 +75,8 @@ _SLOT_DIR = "clusters"
 # The runner's record of which slot each catalogue role lives on, one
 # `slot.<role>=<slot>` line in the context file, so this module never opens
 # the catalogue itself.
-_SLOT_KEY_FORMAT = "slot.{role}="
+_PROJECT_KEY = "project"
+_SLOT_KEY_FORMAT = "slot.{role}"
 
 # Written by hack/fleet-kubeconfigs.sh as `project=<id>`. The pool of eval
 # projects is leased at random and not every project in it necessarily carries
@@ -121,20 +122,23 @@ def available_roles(directory: str | os.PathLike[str] | None = None) -> list[str
     return sorted(name for name in names if name)
 
 
-def provisioned_project(directory: str | os.PathLike[str] | None = None) -> str | None:
-    """The project the runner fetched fleet credentials from, if it recorded one."""
-    root = directory if directory is not None else os.environ.get(FLEET_KUBECONFIG_DIR_ENV)
-    if not root:
-        return None
+def _context(root: str | os.PathLike[str]) -> dict[str, str]:
+    """The runner's context file as key -> value: `project`, `cluster.<slot>`,
+    `location.<slot>`, `slot.<role>`. Empty when the runner wrote none."""
     try:
         text = (Path(root) / _CONTEXT_FILE).read_text(encoding="utf-8")
     except OSError:
+        return {}
+    pairs = (line.split("=", 1) for line in text.splitlines() if "=" in line)
+    return {key.strip(): value.strip() for key, value in pairs if key.strip()}
+
+
+def provisioned_project(directory: str | os.PathLike[str] | None = None) -> str | None:
+    """The project id the runner resolved the fleet in, or None if it recorded none."""
+    root = directory if directory is not None else os.environ.get(FLEET_KUBECONFIG_DIR_ENV)
+    if not root:
         return None
-    for line in text.splitlines():
-        key, _, value = line.partition("=")
-        if key.strip() == "project" and value.strip():
-            return value.strip()
-    return None
+    return _context(root).get(_PROJECT_KEY) or None
 
 
 def confirmed_subjects(
@@ -186,14 +190,9 @@ def slot_of_role(role: str, directory: str | os.PathLike[str] | None = None) -> 
             f"no seeded-fleet kubeconfigs: {FLEET_KUBECONFIG_DIR_ENV} is unset, so the runner "
             f"resolved no seeded cluster before the run (hack/fleet-kubeconfigs.sh did not run)"
         )
-    key = _SLOT_KEY_FORMAT.format(role=role)
-    try:
-        lines = (Path(root) / _CONTEXT_FILE).read_text(encoding="utf-8").splitlines()
-    except OSError:
-        lines = []
-    for line in lines:
-        if line.startswith(key) and line[len(key):].strip():
-            return line[len(key):].strip()
+    slot = _context(root).get(_SLOT_KEY_FORMAT.format(role=role))
+    if slot:
+        return slot
     raise FleetRoleUnresolved(
         f"the runner recorded no slot for fixture role {role!r} in {root}/{_CONTEXT_FILE}: the role is "
         f"not in the catalogue (bench/tf/fleet/fixtures.json) the runner read, or the runner never ran there"

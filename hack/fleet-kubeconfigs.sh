@@ -490,7 +490,8 @@ write_fleet_kubeconfigs() {
   # in. "role X is unavailable" is a bug report nobody can act on; "role X is
   # unavailable in kube-agents-evals-3" is one sentence from the answer. The
   # per-slot `cluster.<slot>=` / `location.<slot>=` lines are appended below
-  # as each slot resolves.
+  # as each slot resolves, and a `slot.<role>=` line per catalog role as the
+  # role loop reads it.
   printf 'project=%s\n' "$project" >"${dir}/.fleet-context"
   chmod 600 "${dir}/${_FLEET_MARKER}" "${dir}/.fleet-context"
 

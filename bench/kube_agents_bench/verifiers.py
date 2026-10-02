@@ -208,7 +208,7 @@ _TRAIL_FOLD_PASSES = 3
 # a parenthetical inside the quotes: the lead fold has taken the opener, so
 # what is left is the name with its closer stuck to it before the colon or
 # slash that ends the name.
-_QUOTED_FIRST_NAME = re.compile(r"^([\w/._-]+(?:\s*\([^)\n]*\))?)[\"\u201c\u201d'\u2018\u2019\]>]+(?=[:/\s(])")
+_QUOTED_FIRST_NAME = re.compile(r"^([\w/._-]+(?:\s*\([^)\n]*\))?)[\"\u201c\u201d'\u2018\u2019\]>)}]+(?=[:/\s(])")
 _MARKDOWN_LINK = re.compile(r"\[([^\]\n]+)\]\([^)\n]*\)")
 # A value the agent kept inside the prompt's own delimiters (`<unavailable>`,
 # `"unaffected"`): a wrap that opens after whitespace and closes at the next
@@ -225,6 +225,7 @@ _VALUE_WRAP = re.compile(
 # decoration. A `:` before anything but a letter (`12:30`, `https://`) is
 # left alone.
 _SEPARATOR_SPACE = re.compile(r"[ \t]+(?=[:;])")
+_INNER_UNDERSCORE = re.compile(r"(?<=\w)_(?=\w)")
 _SEPARATOR_NO_SPACE = re.compile(r"([:;])(?=[a-z])")
 # Invisible format characters a model or a pasted document carries (a
 # zero-width space or joiner, a word joiner, a byte-order mark, a variation
@@ -280,10 +281,11 @@ def _normalize_lines(text: str, *, fold_decoration: bool = False) -> str:
     matches the line however the agent listed, linked or quoted it.
     """
     # `_normalize` deletes underscores as Markdown emphasis; under the fold
-    # they become hyphens instead, so a kubeconfig context
-    # (`gke_<project>_<location>_<name>`) keeps the boundary before its
-    # cluster name and `_word_` emphasis folds as decoration.
-    lines = (_normalize(line.replace("_", "-") if fold_decoration else line) for line in text.splitlines())
+    # an underscore between two word characters becomes a hyphen first, so
+    # a kubeconfig context (`gke_<project>_<location>_<name>`) keeps the
+    # boundary before its cluster name, while `_word_` emphasis, whose
+    # underscores sit at a token's edges, is still deleted.
+    lines = (_normalize(_INNER_UNDERSCORE.sub("-", line) if fold_decoration else line) for line in text.splitlines())
     if fold_decoration:
         lines = (_fold_line_decoration(line) for line in lines)
     return "\n".join(lines)

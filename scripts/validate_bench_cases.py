@@ -513,6 +513,18 @@ def bench_cases() -> dict[str, pathlib.Path]:
     return {p.parent.name: p for p in sorted(TASKS_DIR.glob("*/task.yaml"))}
 
 
+def _fixture_roles_shape(node: Any, where: str, problems: list[str]) -> None:
+    """`fixture_roles:` is a list of role slugs; a scalar would otherwise be
+    walked character by character and reported as a dozen unknown roles."""
+    if not isinstance(node, dict):
+        return
+    roles = node.get("fixture_roles")
+    if roles is not None and (not isinstance(roles, list) or not all(isinstance(r, str) for r in roles)):
+        problems.append(f"{where}: 'fixture_roles:' must be a list of role slugs")
+    for child in node.get("checks") or []:
+        _fixture_roles_shape(child, where, problems)
+
+
 def _check_assertions(node: Any, where: str, problems: list[str]) -> None:
     """Walk one check subtree, reporting nodes that cannot fail."""
     if not isinstance(node, dict):
@@ -582,9 +594,11 @@ def _fixture_roles(node: Any, found: set[str]) -> None:
     role = node.get("fixture_role")
     if isinstance(role, str):
         found.add(role)
-    for role in node.get("fixture_roles") or []:
-        if isinstance(role, str):
-            found.add(role)
+    roles = node.get("fixture_roles")
+    if isinstance(roles, list):
+        for role in roles:
+            if isinstance(role, str):
+                found.add(role)
     for child in node.get("checks") or []:
         _fixture_roles(child, found)
 
@@ -765,6 +779,7 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                 problems.append(f"{where}: entry has no 'check:' subtree")
             else:
                 _check_assertions(entry["check"], where, problems)
+                _fixture_roles_shape(entry["check"], where, problems)
                 _check_types(entry["check"], used_types)
                 _fixture_roles(entry["check"], used_roles)
 
