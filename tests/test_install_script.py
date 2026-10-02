@@ -6146,6 +6146,94 @@ echo "RC=$rc"
         self.assertNotIn('print_warning "$deployment did not report ready within ${ROLLOUT_TIMEOUT_SECS}s."', source)
 
 
+class DryRunClearsStaleImportOverridesTest(unittest.TestCase):
+    """The dry run's bare `terraform validate` and `terraform plan` read the
+    composition directly, in the checkout acquire_source_repo reuses from run
+    to run, so a lifecycle.sh import killed by a signal its EXIT trap cannot see
+    would otherwise hand them the two override files it writes around an
+    import. install.sh clears them first, through lifecycle.sh's own
+    drop_override, so the file names have one home."""
+
+    # What lifecycle.sh writes around an import and removes afterwards: the helm
+    # provider placeholder beside the composition, and the scope resolver pin
+    # inside that module's directory.
+    _PROVIDER_OVERRIDE = "providers_lifecycle_override.tf"
+    _SCOPE_OVERRIDE = "scope_resolver_lifecycle_override.tf"
+    _SCOPE_RESOLVER_SOURCE_RE = re.compile(r'module "scope_resolver" \{\s*source\s*=\s*"([^"]+)"')
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._tmp_path = pathlib.Path(tmp.name)
+        self._empty_install_env = self._tmp_path / "install.env"
+        self._empty_install_env.write_text("")
+
+    def _scratch_composition(self):
+        """A copy of lifecycle.sh in a tree shaped like the checkout's, so the
+        stale files are planted in a scratch module directory and never in the
+        checkout's."""
+        full_install = _REPO_ROOT / "terraform" / "examples" / "full-install"
+        comp = self._tmp_path / "terraform" / "examples" / "full-install"
+        comp.mkdir(parents=True)
+        shutil.copy(full_install / "lifecycle.sh", comp / "lifecycle.sh")
+        shutil.copy(_REPO_ROOT / "install.defaults.env", self._tmp_path / "install.defaults.env")
+        helpers = self._tmp_path / "scripts" / "installer"
+        helpers.mkdir(parents=True)
+        shutil.copy(_REPO_ROOT / "scripts" / "installer" / "gke_dns_endpoint.sh", helpers)
+        match = self._SCOPE_RESOLVER_SOURCE_RE.search((full_install / "main.tf").read_text())
+        assert match, "main.tf no longer sources a scope_resolver module"
+        module_dir = (comp / match.group(1)).resolve()
+        module_dir.mkdir(parents=True)
+        return comp, comp / self._PROVIDER_OVERRIDE, module_dir / self._SCOPE_OVERRIDE
+
+    def _run_in(self, comp, body):
+        setup = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
+cd "{comp}"
+{body}
+"""
+        overrides = {"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}
+        return _run_installer_bash(setup, get_isolated_test_env(overrides=overrides), cwd=comp)
+
+    def test_the_function_removes_both_stale_overrides_and_leaves_the_caller_as_it_was(self):
+        comp, provider_override, scope_override = self._scratch_composition()
+        provider_override.write_text('provider "helm" {}\n')
+        scope_override.write_text('output "members" { value = {} }\n')
+
+        proc = self._run_in(comp, 'drop_stale_import_overrides; echo "pwd=$(pwd)"; echo "unset=${NOT_SET_ANYWHERE:-still-lenient}"')
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse(provider_override.exists(), "the provider override survived")
+        self.assertFalse(scope_override.exists(), "the scope override survived")
+        # The engine's `cd` and `set -u` stayed inside the subshell.
+        self.assertIn(f"pwd={comp}", proc.stdout)
+        self.assertIn("unset=still-lenient", proc.stdout)
+
+    def test_the_function_is_quiet_with_nothing_to_remove(self):
+        comp, provider_override, scope_override = self._scratch_composition()
+        captured = self._tmp_path / "function-stderr.txt"
+        proc = self._run_in(comp, f'drop_stale_import_overrides 2>"{captured}"; echo "rc=$?"')
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("rc=0", proc.stdout)
+        self.assertEqual(captured.read_text(), "")
+
+    def test_the_dry_run_clears_them_before_its_validate_and_its_plan_and_names_neither_file(self):
+        text = _INSTALL_SH.read_text()
+        dry_run = text.index('if [ "$PARAM_DRY_RUN" = "true" ]; then\n    # A real resource preview')
+        cd_into = text.index('cd "$(tf_compose_dir "$repo_dir")"', dry_run)
+        drop = text.index("drop_stale_import_overrides\n", dry_run)
+        validate = text.index('run_with_spinner "Validating Terraform configuration" "$tf_log" validate_tf_config', dry_run)
+        plan = text.index("terraform plan -input=false -lock=false", dry_run)
+        self.assertLess(dry_run, cd_into)
+        self.assertLess(cd_into, drop)
+        self.assertLess(drop, validate)
+        self.assertLess(validate, plan)
+        # One home for the names: a rename in lifecycle.sh reaches the dry run
+        # through drop_override, not through a second copy here.
+        self.assertNotIn(self._PROVIDER_OVERRIDE, text)
+        self.assertNotIn(self._SCOPE_OVERRIDE, text)
+
+
 class ChatSubscriptionDerivationTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()

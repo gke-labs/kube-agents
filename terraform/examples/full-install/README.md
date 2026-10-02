@@ -402,7 +402,8 @@ neither means what it looks like:
 
   Remove both overrides before the next apply — they are never meant to
   survive an import, which is why `lifecycle.sh` deletes them on an `EXIT` trap
-  and again at the start of every subcommand. A plan or apply that merged the
+  and again at the start of every subcommand, and `install.sh --dry-run` deletes
+  them before its own validate and plan. A plan or apply that merged the
   scope override would resolve every declared selector to no members and plan
   the removal of the bindings those members hold, and the resolver module's
   own `terraform test` suite would assert against the pin instead of the
