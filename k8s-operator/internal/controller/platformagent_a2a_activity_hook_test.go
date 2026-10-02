@@ -28,11 +28,18 @@ import (
 )
 
 // The pod-wide activity hook and its signing key render together, and only
-// on a next install that declares a bridge sidecar: a today install, or a
-// next install with no bridge to post to, renders exactly what it did before.
+// on a next install that declares a bridge sidecar whose door the hook can
+// reach: a today install, a next install with no bridge to post to, or a
+// bridge on the cli executor or with its door off or elsewhere, renders
+// exactly what it did before.
 func TestActivityHookRendersOnlyWithABridgeOnNext(t *testing.T) {
 	bridge := []corev1.Container{{Name: "hermes-bridge", Image: "bridge:dev", Env: []corev1.EnvVar{{Name: "BRIDGE_CONCURRENCY", Value: "2"}}}}
 	other := []corev1.Container{{Name: "log-shipper", Image: "shipper:dev"}}
+	bridgeWith := func(env ...corev1.EnvVar) []corev1.Container {
+		c := bridge[0]
+		c.Env = append(append([]corev1.EnvVar(nil), c.Env...), env...)
+		return []corev1.Container{c}
+	}
 	cases := []struct {
 		name     string
 		mode     *string
@@ -43,6 +50,13 @@ func TestActivityHookRendersOnlyWithABridgeOnNext(t *testing.T) {
 		{"next without sidecars", ptr.To("next"), nil, false},
 		{"next with another sidecar", ptr.To("next"), other, false},
 		{"next with a bridge", ptr.To("next"), bridge, true},
+		{"next with an api bridge", ptr.To("next"), bridgeWith(corev1.EnvVar{Name: "BRIDGE_EXECUTOR", Value: "api"}), true},
+		{"next with the door at its default", ptr.To("next"), bridgeWith(corev1.EnvVar{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "127.0.0.1:8651"}), true},
+		{"next with a cli bridge", ptr.To("next"), bridgeWith(corev1.EnvVar{Name: "BRIDGE_EXECUTOR", Value: "cli"}), false},
+		{"next with a cli bridge by reference", ptr.To("next"), bridgeWith(
+			corev1.EnvVar{Name: "EXEC", Value: "cli"}, corev1.EnvVar{Name: "BRIDGE_EXECUTOR", Value: "$(EXEC)"}), false},
+		{"next with the door off", ptr.To("next"), bridgeWith(corev1.EnvVar{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "off"}), false},
+		{"next with the door elsewhere", ptr.To("next"), bridgeWith(corev1.EnvVar{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "127.0.0.1:9999"}), false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

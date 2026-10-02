@@ -10,9 +10,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -98,6 +101,10 @@ const (
 	// apiResponseCap bounds a successful response body read: an answer is
 	// text, and anything past this is not one.
 	apiResponseCap = 8 << 20
+	// apiURLSchemeHTTP and apiURLSchemeHTTPS are the schemes the API URL
+	// may carry; the client cannot send to anything else.
+	apiURLSchemeHTTP  = "http"
+	apiURLSchemeHTTPS = "https"
 	// DefaultAPIConnectRetry and apiConnectRetryInterval pace the retry of a
 	// refused connection: the sidecar and the agent container start
 	// together, and the bridge can be consuming before hermes's API server
@@ -112,6 +119,11 @@ const (
 // for its session's previous turn carries into finalizeAPIError.
 var errWaitingForTurn = errors.New("waiting for the session's previous turn")
 
+// errNeverConnected is what sendAPI wraps around an error when no attempt
+// got a connection: no request reached the server, so a deadline that ends
+// it is not the turn's.
+var errNeverConnected = errors.New("no connection to the hermes API server")
+
 // apiRateLimitedReasons is the set apiFailureReasonHeader is checked against:
 // the reasons apply_quiet_rate_limit_exit.py exits 75 on.
 var apiRateLimitedReasons = map[string]bool{"rate_limit": true, "billing": true}
@@ -124,12 +136,9 @@ var apiSafeContextID = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 // apiSessionID is the Hermes session a conversation's tasks share: the
 // contextId under apiSessionIDPrefix when it is path-safe, else a hash of
 // it, so a hostile or odd contextId still maps to one stable session and
-// never to a path. A task with no contextId gets its own session, keyed by
-// the task id, which is what the subprocess executor gave every task.
-func apiSessionID(contextID, taskID string) string {
-	if contextID == "" {
-		contextID = "task-" + taskID
-	}
+// never to a path. Every task has a contextId: the envelope refuses one
+// without.
+func apiSessionID(contextID string) string {
 	if len(contextID) <= apiContextIDMaxLen && apiSafeContextID.MatchString(contextID) {
 		return apiSessionIDPrefix + contextID
 	}
@@ -241,7 +250,7 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 		b.finalize(run, lib.StateFailed, "reason: bus-publish-failed at working", nil)
 		return
 	}
-	sessionID := apiSessionID(run.origin.ContextID, taskID)
+	sessionID := apiSessionID(run.origin.ContextID)
 	body, err := json.Marshal(apiChatRequest{
 		Model:    b.cfg.APIModel,
 		Messages: []apiChatMessage{{Role: "user", Content: prompt}},
@@ -270,7 +279,7 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	// payload carries, signed with the pod's shared secret, and only while
 	// this task holds the session's turn; the heartbeat runs either way,
 	// waiting included.
-	act := newSessionActivityState(sessionID)
+	act := newSessionActivityState(sessionID, b.activityLn != nil && b.cfg.ActivitySecret != "")
 	run.mu.Lock()
 	if run.state != stateRunning {
 		run.mu.Unlock()
@@ -294,15 +303,18 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	defer act.inTurn.Store(false)
 
 	resp, err := b.sendAPI(reqCtx, req, body)
-	run.mu.Lock()
-	run.cancelReq = nil
-	run.mu.Unlock()
 	if err != nil {
 		b.finalizeAPIError(run, reqCtx, err)
 		return
 	}
 	defer resp.Body.Close()
+	// cancelReq stays set through the body read: the server can send its
+	// headers before the body, and a cancel or shutdown in between must
+	// still end the request.
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, apiResponseCap))
+	run.mu.Lock()
+	run.cancelReq = nil
+	run.mu.Unlock()
 	if err != nil && reqCtx.Err() != nil {
 		b.finalizeAPIError(run, reqCtx, err)
 		return
@@ -343,17 +355,33 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 
 // sendAPI sends req, retrying a refused connection every
 // apiConnectRetryInterval for up to Config.APIConnectRetry while ctx lasts.
-// Any other error, or a response of any status, is returned as it is.
+// A response of any status is returned as it is; an error is wrapped in
+// errNeverConnected when no attempt got a connection, so no request was
+// sent.
 func (b *Bridge) sendAPI(ctx context.Context, req *http.Request, body []byte) (*http.Response, error) {
+	var connected atomic.Bool
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		GotConn: func(httptrace.GotConnInfo) { connected.Store(true) },
+	})
+	req = req.WithContext(ctx)
+	neverConnected := func(err error) error {
+		if connected.Load() {
+			return err
+		}
+		return fmt.Errorf("%w: %w", errNeverConnected, err)
+	}
 	giveUp := time.Now().Add(b.cfg.APIConnectRetry)
 	for {
 		resp, err := b.apiClient.Do(req)
-		if err == nil || !errors.Is(err, syscall.ECONNREFUSED) || time.Now().After(giveUp) {
-			return resp, err
+		if err == nil {
+			return resp, nil
+		}
+		if !errors.Is(err, syscall.ECONNREFUSED) || time.Now().After(giveUp) {
+			return nil, neverConnected(err)
 		}
 		select {
 		case <-ctx.Done():
-			return nil, err
+			return nil, neverConnected(err)
 		case <-time.After(apiConnectRetryInterval):
 		}
 		req = req.Clone(ctx)
@@ -373,6 +401,10 @@ func (b *Bridge) finalizeAPIError(run *taskRun, reqCtx context.Context, err erro
 	case reqCtx.Err() == context.DeadlineExceeded && errors.Is(err, errWaitingForTurn):
 		b.finalize(run, lib.StateFailed,
 			fmt.Sprintf("reason: deadline-exceeded - waited %s for the session's previous turn; no request was sent", b.cfg.TaskDeadline), nil)
+	case reqCtx.Err() == context.DeadlineExceeded && errors.Is(err, errNeverConnected):
+		// Infrastructure, as the refused connection past the retry window
+		// is: the deadline ended a wait for a server that never listened.
+		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-api-unreachable - task deadline %s ended before the server accepted a connection; no request was sent: %v", b.cfg.TaskDeadline, err), nil)
 	case reqCtx.Err() == context.DeadlineExceeded:
 		b.finalize(run, lib.StateFailed,
 			fmt.Sprintf("reason: deadline-exceeded - request ended after %s", b.cfg.TaskDeadline), nil)
@@ -397,8 +429,14 @@ func apiExecutorValid(cfg *Config) error {
 	if strings.TrimSpace(cfg.APIKey) == "" {
 		return fmt.Errorf("executor %q needs APIKey (the pod's API_SERVER_KEY): the API server refuses the session headers without it", ExecutorAPI)
 	}
-	if _, err := http.NewRequest(http.MethodPost, cfg.APIURL, nil); err != nil {
+	u, err := url.ParseRequestURI(cfg.APIURL)
+	if err != nil {
 		return fmt.Errorf("executor %q: APIURL %q: %w", ExecutorAPI, cfg.APIURL, err)
+	}
+	// ParseRequestURI reads "localhost:8642/v1" as scheme "localhost", so
+	// the scheme and host are what refuse a URL with no scheme.
+	if (u.Scheme != apiURLSchemeHTTP && u.Scheme != apiURLSchemeHTTPS) || u.Host == "" {
+		return fmt.Errorf("executor %q: APIURL %q: want an %s:// or %s:// URL with a host", ExecutorAPI, cfg.APIURL, apiURLSchemeHTTP, apiURLSchemeHTTPS)
 	}
 	return nil
 }

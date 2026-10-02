@@ -268,7 +268,8 @@ constructible. The component that does NOT get this for free is the worker adapt
 terminal its own predecessor's supervisor declared. Anything on `…in` for a task with a
 terminal event is acked with a warning and nothing else.
 
-**Steering:** `hermes chat -Q -q` is one-shot - there is no stdin to inject into. A
+**Steering:** the bridge sends a task's instruction once: `hermes chat -Q -q` has no stdin to
+inject into, and the `api` executor's request is already sent. A
 follow-up message to a running task is acked and answered with a non-final status
 echoing the task's current state (`working` once the subprocess spawned, `submitted`
 while still queued) whose message says the input cannot be absorbed mid-run and cancel
@@ -319,8 +320,8 @@ anyway; the cancel still arrives on the durable and kills it, the bound the brid
 had, where a read failure that dropped the task would leave it open with no terminal event.
 
 Under the `api` executor `working` is published before the request goes out, and cancel,
-shutdown and the deadline end the HTTP request where the `cli` executor kills a process group,
-with the same terminals: `canceled-by-request`, `bridge-shutdown`, `deadline-exceeded`. Ending
+shutdown and the deadline end the HTTP request, the read of the response body included, where
+the `cli` executor kills a process group, with the same terminals: `canceled-by-request`, `bridge-shutdown`, `deadline-exceeded`. Ending
 the request ends the bridge's wait; whether the server abandons the turn it was running is the
 server's. Turns on one session run one at a time; a task still waiting for the previous turn
 when its deadline passes ends `reason: deadline-exceeded - waited <d> for the session's previous
@@ -329,7 +330,7 @@ turn; no request was sent`. The failures name themselves in the status message:
 | Reason                   | When                                                                                                                                    | Eval harness class |
 | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
 | `hermes-rate-limited`    | the server answered 429 (its concurrent-run cap), or `X-Hermes-Failure-Reason` names the provider's rate limit or billing               | infrastructure     |
-| `hermes-api-unreachable` | no response: still refused after the two-minute retry, or the connection failed                                                         | infrastructure     |
+| `hermes-api-unreachable` | no response: still refused after the two-minute retry, the task's deadline passed before any connection, or the connection failed       | infrastructure     |
 | `hermes-api-failed`      | any other non-2xx answer, or a 200 whose turn Hermes marks failed; the message carries the status, session and the error or a body tail | persona            |
 | `hermes-api-unreadable`  | a 2xx answer that is not a chat completion with at least one choice                                                                     | persona            |
 | `hermes-api-read-failed` | the response body broke off mid-read                                                                                                    | persona            |
@@ -382,11 +383,13 @@ its child exits, the ones a previous incarnation left (its direct subdirectories
 bridge's own marker file, whatever their name, nothing else in it and never the directory
 itself) removed when the bridge starts, and
 none written at all when the source exists but cannot be read, since a child on a hook-only
-scope would run without the operator's pins). Under
-`cli` the hook therefore exists only in processes the bridge spawned: a kanban worker or cron
+scope would run without the operator's pins). On a sidecar declaring `BRIDGE_EXECUTOR=cli`
+the hook therefore exists only in processes the bridge spawned: a kanban worker or cron
 tick under the same profile never POSTs anywhere, a pod with no bridge has nothing to POST at,
 and nothing about the profile's shipped config or the image changes for it. The `api`
-executor needs a pod-wide entry instead, described at the end of this section.
+executor needs a pod-wide entry instead, described at the end of this section; a `cli` bridge
+that reached `cli` by the missing-key fallback rather than by declaring it still gets that
+entry, and drops its deliveries.
 
 Under `cli`, nothing in a delivery names the A2A task: hermes's own `task_id` is the kanban card or a
 fresh UUID, `cwd` and `profile` are shared by every process under the profile, and the URL
@@ -454,8 +457,9 @@ chat), and the inject door's probe is where a reader sees it.
 
 The heartbeat is a `progress` text part every `BRIDGE_PROGRESS_INTERVAL_SECONDS` (default
 60; 0 turns it off, and a count a duration cannot hold is refused with a log line and the
-default): `running 1m30s, 3 tool call(s), last mcp__gke__list_clusters`. With the door closed
-the count has nothing to move it, so the line says so instead: `running 1m30s, tool trace off`.
+default): `running 1m30s, 3 tool call(s), last mcp__gke__list_clusters`. With the door closed,
+or under `api` with no `A2A_ACTIVITY_SECRET` to check a delivery against, the count has nothing
+to move it, so the line says so instead: `running 1m30s, tool trace off`.
 The relay renders progress as one edited rolling line, so this is one chat edit per minute,
 and it is what tells a stuck task from a slow one from outside the pod.
 
@@ -463,11 +467,14 @@ Under the `api` executor there is no child to hand a key or a scope to: the turn
 the long-lived gateway process, which serves the chat platforms, cron and kanban dispatch too.
 So the operator renders the entry in the pod's managed config instead, when the CR renders
 the agent's A2A surface (`mode: next`, or a mode this operator build does not recognize) and
-declares the bridge sidecar (a sidecar whose env sets `BRIDGE_CONCURRENCY`):
+declares the bridge sidecar (a sidecar whose env sets `BRIDGE_CONCURRENCY`, and does not set
+`BRIDGE_EXECUTOR=cli` or a `BRIDGE_ACTIVITY_LISTEN` other than the default, `off` included):
 `hooks.outbound` gains `a2a-bridge-activity`, posting `pre_tool_call` and `post_tool_call` to
 `http://127.0.0.1:8651/hermes/tool-events`, signed with `A2A_ACTIVITY_SECRET`, read from the `bridge-activity-key` entry of the a2a creds
 Secret. The operator puts it in the agent container's env; the sidecar needs it in its own
-(`hack/ci-deploy.sh`'s patch adds it). Every hermes
+(`hack/ci-deploy.sh`'s patch adds it). A bridge sidecar the operator cannot see — one that
+leaves `BRIDGE_CONCURRENCY` unset or takes it through `envFrom` — gets no entry and no key, and
+an `api` bridge with the door open and no key logs a warning at start. Every hermes
 process in the pod now posts to the door, and a delivery's `session_id` is what attributes it:
 it counts for the task whose session id matches and which holds that session's turn at the
 moment, and is dropped otherwise, so a kanban worker's or a chat message's tool calls, which

@@ -301,6 +301,44 @@ func TestAPI_CancelEndsTheRequest(t *testing.T) {
 	}
 }
 
+// A cancel that lands after the server sent its headers, while the body is
+// still coming, ends the request too: the body read is the request's.
+func TestAPI_CancelAfterTheHeadersEndsTheRequest(t *testing.T) {
+	_, url := startServer(t)
+	headersSent := make(chan struct{})
+	gone := make(chan struct{})
+	stub := newAPIStub(t, func(w http.ResponseWriter, r *http.Request, c apiCall) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		close(headersSent)
+		<-r.Context().Done()
+		close(gone)
+	})
+	// A deadline far past the wait below, so only the cancel can end it.
+	startAPIBridge(t, url, stub, func(cfg *Config) { cfg.TaskDeadline = 5 * time.Minute })
+	c := gatewayClient(t, url)
+
+	origin := submitIn(t, c, "task-cancel-body", "ctx-cancel-body", "answer slowly")
+	select {
+	case <-headersSent:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the server never sent its headers")
+	}
+	// Past the header read on the bridge's side, so the cancel lands in the
+	// body read.
+	time.Sleep(200 * time.Millisecond)
+	publishCancel(t, c, origin)
+	select {
+	case <-gone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request outlived the cancel")
+	}
+	if task := waitTerminal(t, c, origin.TaskID); task.State != lib.StateCanceled {
+		t.Fatalf("state = %s (%s), want canceled", task.State, terminalReason(t, task))
+	}
+}
+
 // Each way the server can fail names itself in the terminal, with the
 // session, so a reader can find the turn in the profile's store.
 func TestAPI_FailuresAreNamed(t *testing.T) {
@@ -374,6 +412,47 @@ func TestAPI_UnreachableServerIsNamed(t *testing.T) {
 	}
 }
 
+// A deadline that ends inside the connect retry ended a wait for a server
+// that never listened: infrastructure, as past the retry window, and not a
+// turn that ran out of time.
+func TestAPI_DeadlineWhileTheServerIsAbsentIsUnreachable(t *testing.T) {
+	_, url := startServer(t)
+	stub := newAPIStub(t, nil)
+	stub.srv.Close()
+	startAPIBridge(t, url, stub, func(cfg *Config) {
+		cfg.APIConnectRetry = time.Minute
+		cfg.TaskDeadline = 2 * time.Second
+	})
+	c := gatewayClient(t, url)
+	submitIn(t, c, "task-absent", "ctx-absent", "anyone there")
+	task := waitTerminal(t, c, "task-absent")
+	want := "reason: hermes-api-unreachable - task deadline 2s ended before the server accepted a connection; no request was sent"
+	if reason := terminalReason(t, task); task.State != lib.StateFailed || !strings.HasPrefix(reason, want) {
+		t.Fatalf("state = %s reason = %q, want failed with prefix %q", task.State, reason, want)
+	}
+}
+
+func TestAPI_NewRefusesAURLItCannotSendTo(t *testing.T) {
+	_, url := startServer(t)
+	for _, apiURL := range []string{
+		"localhost:8642/v1/chat/completions",
+		"foo",
+		"ftp://127.0.0.1/v1/chat/completions",
+		"http:///v1/chat/completions",
+	} {
+		cfg := Config{NATSURL: url, Executor: ExecutorAPI, APIURL: apiURL, APIKey: testAPIKey, ScratchDir: t.TempDir()}
+		if b, err := New(testCtx(t), cfg); err == nil {
+			b.close()
+			t.Errorf("New accepted APIURL %q", apiURL)
+		}
+	}
+	for _, apiURL := range []string{"http://127.0.0.1:8642/v1/chat/completions", "https://hermes.example/v1/chat/completions"} {
+		if err := apiExecutorValid(&Config{APIURL: apiURL, APIKey: testAPIKey}); err != nil {
+			t.Errorf("apiExecutorValid(%q) = %v, want nil", apiURL, err)
+		}
+	}
+}
+
 func TestAPI_NewRefusesAMissingKeyAndAnUnknownExecutor(t *testing.T) {
 	_, url := startServer(t)
 	for _, cfg := range []Config{
@@ -392,21 +471,20 @@ func TestAPISessionID(t *testing.T) {
 	long := strings.Repeat("a", apiContextIDMaxLen+1)
 	sum := sha256.Sum256([]byte(long))
 	hashedLong := "a2a-h-" + hex.EncodeToString(sum[:])[:apiHashedSessionHexLen]
-	for _, tc := range []struct{ ctx, task, want string }{
-		{"ctx-0123abcd", "t", "a2a-ctx-0123abcd"},
-		{"", "task-9", "a2a-task-task-9"},
-		{long, "t", hashedLong},
+	for _, tc := range []struct{ ctx, want string }{
+		{"ctx-0123abcd", "a2a-ctx-0123abcd"},
+		{long, hashedLong},
 	} {
-		if got := apiSessionID(tc.ctx, tc.task); got != tc.want {
+		if got := apiSessionID(tc.ctx); got != tc.want {
 			t.Errorf("apiSessionID(%q) = %q, want %q", tc.ctx, got, tc.want)
 		}
 	}
 	// Anything that could be a path, or is not the gateway's shape, is
 	// hashed: stable, prefixed, and free of separators.
 	for _, ctx := range []string{"../etc", "a/b", `a\b`, "..", "ctx.1", "ctx 1", "ctx-é"} {
-		got := apiSessionID(ctx, "t")
-		if !strings.HasPrefix(got, "a2a-h-") || strings.ContainsAny(got, `/\. `) || got != apiSessionID(ctx, "other") {
-			t.Errorf("apiSessionID(%q) = %q, want a stable hashed id", ctx, got)
+		got := apiSessionID(ctx)
+		if !strings.HasPrefix(got, "a2a-h-") || strings.ContainsAny(got, `/\. `) {
+			t.Errorf("apiSessionID(%q) = %q, want a hashed id", ctx, got)
 		}
 	}
 }
@@ -429,6 +507,44 @@ func postDelivery(t *testing.T, url, key, sessionID, event, tool, callID string)
 		return
 	}
 	resp.Body.Close()
+}
+
+// An API task's heartbeat counts calls when a delivery can reach it (the
+// door open, with the shared key to check one against) and says the trace
+// is off when none can.
+func TestAPI_HeartbeatSaysWhetherTheTraceIsOn(t *testing.T) {
+	for _, tc := range []struct {
+		name, secret, want string
+	}{
+		{"door open with the key", "pod-wide-activity-key", "0 tool call(s)"},
+		{"door open without the key", "", "tool trace off"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, url := startServer(t)
+			var b *Bridge
+			ready := make(chan struct{})
+			lines := make(chan string, 1)
+			stub := newAPIStub(t, func(w http.ResponseWriter, _ *http.Request, c apiCall) {
+				<-ready
+				b.mu.Lock()
+				run := b.tasks[c.idempotency]
+				b.mu.Unlock()
+				lines <- run.act.Load().progressLine(time.Now())
+				writeCompletion(w, c.sessionID, "done")
+			})
+			b = startAPIBridge(t, url, stub, func(cfg *Config) {
+				cfg.ActivityListen = "127.0.0.1:0"
+				cfg.ActivitySecret = tc.secret
+			})
+			close(ready)
+			c := gatewayClient(t, url)
+			submitIn(t, c, "task-beat", "ctx-beat", "go")
+			waitTerminal(t, c, "task-beat")
+			if line := <-lines; !strings.Contains(line, tc.want) {
+				t.Fatalf("heartbeat = %q, want it to say %q", line, tc.want)
+			}
+		})
+	}
 }
 
 // The door attributes an API task's tool calls by the session the pod-wide

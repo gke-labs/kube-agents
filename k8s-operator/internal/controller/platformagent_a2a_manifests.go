@@ -370,8 +370,18 @@ const (
 	// plus ActivityPath); and the delivery timeout.
 	a2aActivityHookName       = "a2a-bridge-activity"
 	a2aActivitySecretEnvVar   = "A2A_ACTIVITY_SECRET" // #nosec G101 -- Environment variable name, not a credential
-	a2aActivityHookURL        = "http://127.0.0.1:8651/hermes/tool-events"
+	a2aActivityHookURL        = "http://" + a2aActivityDoorListen + "/hermes/tool-events"
 	a2aActivityHookTimeoutSec = 10
+
+	// The bridge sidecar's env keys and values that say its door is not
+	// the hook's (a2aBridgeDoorDeclared), each the bridge's own
+	// (a2a/cmd/hermes-bridge/main.go): the executor key and its subprocess
+	// value, and the door's listen key with its default address. An empty
+	// value reads as unset there, so it is the default here.
+	a2aBridgeExecutorEnvVar       = "BRIDGE_EXECUTOR"
+	a2aBridgeExecutorCLI          = "cli"
+	a2aBridgeActivityListenEnvVar = "BRIDGE_ACTIVITY_LISTEN"
+	a2aActivityDoorListen         = "127.0.0.1:8651"
 
 	// a2aProvisionJobNameInfix sits between the agent's name and the digest in
 	// the provision Job's name; a2aProvisionJobNameHashLength is how much of
@@ -2904,18 +2914,32 @@ func a2aBridgeConcurrency(agent *agentv1alpha1.PlatformAgent) int {
 	return n
 }
 
-// a2aBridgeDeclared reports whether the CR declares a bridge sidecar, by the
-// rule a2aBridgeWorkers uses: a sidecar whose env sets BRIDGE_CONCURRENCY.
-// The activity hook (a2aActivityHook) is rendered only then, so an install
-// with no door does not post every tool call to a closed port.
-func a2aBridgeDeclared(agent *agentv1alpha1.PlatformAgent) bool {
+// a2aBridgeDoorDeclared reports whether the CR declares a bridge sidecar
+// whose activity door the pod-wide hook can reach: a sidecar whose env sets
+// BRIDGE_CONCURRENCY (the rule a2aBridgeWorkers uses), less one whose env
+// says the door is not the hook's -- BRIDGE_EXECUTOR=cli, whose tasks carry
+// their own per-task hook and drop the pod-wide one's deliveries, or a
+// BRIDGE_ACTIVITY_LISTEN other than the address the hook posts to,
+// including "off". The activity hook (a2aActivityHook) is rendered only
+// then, so a pod whose door is closed or elsewhere does not post every tool
+// call to a closed port. A bridge this cannot see -- the key unset or taken
+// through envFrom -- gets no hook and warns at start that its API tasks
+// carry no trace.
+func a2aBridgeDoorDeclared(agent *agentv1alpha1.PlatformAgent) bool {
 	if agent == nil || agent.Spec.Deployment == nil {
 		return false
 	}
 	for _, c := range agent.Spec.Deployment.Sidecars {
-		if _, set := a2aBridgeConcurrencyValue(c); set {
-			return true
+		if _, set := a2aBridgeConcurrencyValue(c); !set {
+			continue
 		}
+		if executor, _ := a2aContainerEnvValue(c, a2aBridgeExecutorEnvVar); executor == a2aBridgeExecutorCLI {
+			continue
+		}
+		if listen, _ := a2aContainerEnvValue(c, a2aBridgeActivityListenEnvVar); listen != "" && listen != a2aActivityDoorListen {
+			continue
+		}
+		return true
 	}
 	return false
 }
@@ -2923,7 +2947,7 @@ func a2aBridgeDeclared(agent *agentv1alpha1.PlatformAgent) bool {
 // a2aActivityHookWanted is the gate for both halves of the pod-wide activity
 // hook: the managed config's entry and the agent container's signing key.
 func a2aActivityHookWanted(agent *agentv1alpha1.PlatformAgent) bool {
-	return a2aAgentSurface(agent) && a2aBridgeDeclared(agent)
+	return a2aAgentSurface(agent) && a2aBridgeDoorDeclared(agent)
 }
 
 // managedHookOutbound is one hooks.outbound entry in hermes's config.
@@ -3048,18 +3072,25 @@ func a2aBridgeEnvFromUnread(agent *agentv1alpha1.PlatformAgent) bool {
 // emits changes: the expansion is computed to read this one value, and the
 // sidecar is still copied verbatim.
 func a2aBridgeConcurrencyValue(c corev1.Container) (value string, set bool) {
+	return a2aContainerEnvValue(c, a2aBridgeConcurrencyEnvVar)
+}
+
+// a2aContainerEnvValue is name's value in c as a2aBridgeConcurrencyValue
+// describes the walk: expanded the kubelet's way, "" with set true when a
+// valueFrom entry is the last of the name.
+func a2aContainerEnvValue(c corev1.Container, name string) (value string, set bool) {
 	known := map[string]string{}
 	for _, e := range c.Env {
 		if e.ValueFrom != nil {
 			delete(known, e.Name)
-			if e.Name == a2aBridgeConcurrencyEnvVar {
+			if e.Name == name {
 				value, set = "", true
 			}
 			continue
 		}
 		v := expandEnvReferences(e.Value, known)
 		known[e.Name] = v
-		if e.Name == a2aBridgeConcurrencyEnvVar {
+		if e.Name == name {
 			value, set = v, true
 		}
 	}

@@ -1,6 +1,7 @@
 // hermes-bridge consumes tasks addressed to the platform profile and answers
-// them by invoking the hermes CLI, one subprocess per task. It runs as a
-// sidecar in the platform-agent pod. Design: a2a/docs/hermes-bridge.md.
+// them as turns on the pod's Hermes API server, or by one hermes CLI
+// subprocess per task on the cli executor. It runs as a sidecar in the
+// platform-agent pod. Design: a2a/docs/hermes-bridge.md.
 //
 // PLAYGROUND POSTURE: this deployment exists to prove the A2A fabric shape.
 // No queue-staleness guard is the playground, not the product; the stage-3

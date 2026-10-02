@@ -1,7 +1,9 @@
 // Package hermesbridge is the stand-in executor for tasks addressed to the
-// platform profile: it consumes a2a.tasks.{profile}.*.in, runs one
-// `hermes -p {profile} chat -Q -q <prompt>` per task, and publishes the payload
-// spec's lifecycle events with the output as the result artifact. It is
+// platform profile: it consumes a2a.tasks.{profile}.*.in, answers each task
+// as a turn on the pod's Hermes API server (one session per contextId) or,
+// on the cli executor, by one `hermes -p {profile} chat -Q -q <prompt>` per
+// task, and publishes the payload spec's lifecycle events with the answer as
+// the result artifact. It is
 // scaffolding for the Hermes-first world - when the stage-3 dispatcher and
 // the W4 worker adapter land, the bridge retires. Design:
 // a2a/docs/hermes-bridge.md.
@@ -120,8 +122,9 @@ type Config struct {
 	// appended as the final argument. Default: ["hermes", "-p", <profile>,
 	// "chat", "-Q", "-q"].
 	Command []string
-	// Concurrency caps simultaneous hermes subprocesses (default 2, the
-	// platform profile's concurrency in the profiles spec).
+	// Concurrency caps simultaneous tasks, hermes subprocesses or API
+	// requests (default 2, the platform profile's concurrency in the
+	// profiles spec).
 	Concurrency int
 	// TaskDeadline is the per-invocation wall-clock ceiling (default 7200s,
 	// matching the platform profile's activeDeadlineSeconds).
@@ -399,6 +402,12 @@ func (b *Bridge) Run(ctx context.Context) error {
 		return fmt.Errorf("subscribe: %w", err)
 	}
 	b.cfg.Logger.Info("hermes bridge consuming", "profile", b.cfg.Profile, "executor", b.cfg.Executor)
+	if b.cfg.Executor == ExecutorAPI && b.activityLn != nil && b.cfg.ActivitySecret == "" {
+		// The door is open but nothing can be attributed through it: the
+		// pod's hook signs with a secret this bridge was not given.
+		b.cfg.Logger.Warn("activity door open with no ActivitySecret: API tasks carry no tool trace",
+			"env", ActivitySecretEnv)
+	}
 	<-ctx.Done()
 	b.closing.Store(true)
 	sub.Stop()
@@ -616,7 +625,7 @@ func (b *Bridge) refuseSteer(ctx context.Context, run *taskRun, steer *lib.Envel
 	if run.state == statePending {
 		state = lib.StateSubmitted
 	}
-	msg := "steering received but not absorbed: the Hermes CLI runs one-shot and cannot " +
+	msg := "steering received but not absorbed: the bridge sends a task's instruction to Hermes once and cannot " +
 		"accept mid-run input. The task continues on its original instruction; cancel if that is wrong."
 	if err := b.publishStatusMessage(ctx, run, state, false, msg); err != nil {
 		b.cfg.Logger.Error("steer refusal publish failed", "task", steer.TaskID, "err", err)

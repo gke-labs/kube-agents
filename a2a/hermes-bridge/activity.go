@@ -461,6 +461,11 @@ type activityState struct {
 	sessionID string
 	inTurn    atomic.Bool
 
+	// traced says a delivery can reach this task at all: the door is open
+	// and the task has a key, or, on the API executor, the shared secret
+	// to check a session's delivery against.
+	traced bool
+
 	mu         sync.Mutex
 	open       map[string]ActivityEntry // calls started and not yet ended
 	openOrder  []string                 // their ids, in start order
@@ -498,16 +503,18 @@ func newActivityState(withKey bool) *activityState {
 		// source is unusable), so there is no error to carry.
 		_, _ = rand.Read(raw)
 		a.key = hex.EncodeToString(raw)
+		a.traced = true
 	}
 	return a
 }
 
 // newSessionActivityState is the API executor's side of the door: no key of
 // its own (the pod's hook signs with the shared secret), the session id to
-// claim deliveries by.
-func newSessionActivityState(sessionID string) *activityState {
+// claim deliveries by, and traced when the door is open with that secret.
+func newSessionActivityState(sessionID string, traced bool) *activityState {
 	a := newActivityState(false)
 	a.sessionID = sessionID
+	a.traced = traced
 	return a
 }
 
@@ -629,14 +636,15 @@ func (a *activityState) interrupted() []ActivityEntry {
 
 // progressLine is the heartbeat text: what a reader of the rolling line, or
 // of a stalled task's probe, needs to tell slow from stuck. The count only
-// moves on a delivery through the door, so with the door closed the line
+// moves on a delivery through the door, so with no delivery able to reach
+// the task (the door closed, or no secret to check one against) the line
 // says the trace is off rather than reporting zero calls from a persona
 // that may be making them.
 func (a *activityState) progressLine(now time.Time) string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	elapsed := now.Sub(a.startedAt).Round(time.Second)
-	if a.key == "" {
+	if !a.traced {
 		return fmt.Sprintf("running %s, tool trace off", elapsed)
 	}
 	line := fmt.Sprintf("running %s, %d tool call(s)", elapsed, a.calls)
