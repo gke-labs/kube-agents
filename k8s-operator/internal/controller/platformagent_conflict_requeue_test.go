@@ -3,10 +3,8 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strings"
 	"testing"
 
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -445,70 +443,6 @@ func TestPlatformAgentReconciler_Reconcile_ConflictOnDifferentKindNotSwallowed(t
 	}
 	if result.Requeue {
 		t.Errorf("Reconcile result.Requeue = true; want false when error is returned")
-	}
-}
-
-// TestPlatformAgentReconciler_Reconcile_ConflictOnBusCredentialsReadyWhenAlreadyFailing verifies
-// that when a reconcile pass is already failing (retErr != nil) and the deferred syncBusCredentialsReady
-// status write encounters a 409 conflict, the conflict is logged at V(1) and the primary error propagates.
-func TestPlatformAgentReconciler_Reconcile_ConflictOnBusCredentialsReadyWhenAlreadyFailing(t *testing.T) {
-	scheme := setupScheme()
-	agent := a2aTestAgent()
-
-	conflictErr := platformAgentConflictError(agent.Name)
-	primaryErr := fmt.Errorf("injected sa reconcile error")
-
-	ssa := fakeServerSideApplyInterceptors()
-	statusWrites := 0
-	cl := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(agent, sandboxKeysSecret(agent)).
-		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
-		WithInterceptorFuncs(interceptor.Funcs{
-			Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-				if _, ok := obj.(*corev1.ServiceAccount); ok {
-					return primaryErr
-				}
-				return ssa.Patch(ctx, cl, obj, patch, opts...)
-			},
-			SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
-				if subResourceName == "status" {
-					statusWrites++
-					if statusWrites > 1 {
-						return conflictErr
-					}
-				}
-				return c.SubResource(subResourceName).Update(ctx, obj, opts...)
-			},
-		}).
-		Build()
-
-	r := &PlatformAgentReconciler{
-		Client: cl,
-		Scheme: scheme,
-	}
-
-	req := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      agent.Name,
-			Namespace: agent.Namespace,
-		},
-	}
-
-	ctx := context.Background()
-
-	// 1st Reconcile: adds finalizer
-	if _, err := r.Reconcile(ctx, req); err != nil {
-		t.Fatalf("Reconcile 1: %v", err)
-	}
-
-	// 2nd Reconcile: fails at reconcileServiceAccount (Patch fails), deferred syncBusCredentialsReady encounters 409 conflict
-	_, err := r.Reconcile(ctx, req)
-	if err == nil {
-		t.Fatalf("Reconcile returned nil error; want primary error")
-	}
-	if !strings.Contains(err.Error(), "injected sa reconcile error") {
-		t.Errorf("Reconcile err = %v; want injected sa reconcile error", err)
 	}
 }
 
