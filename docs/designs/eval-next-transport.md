@@ -355,9 +355,11 @@ needs the front door — `agent-kanban-smoke`, which grades
 the chat profile's `kanban_create` — is a different matter: the door addresses `platform`,
 and the bridge's `cli` executor answers it with the platform profile, so
 `hack/eval/inject-lane-exclusions.txt` keeps it off this lane's matrix with the reason, and the
-api lane's roster is untouched. The bridge's default `api` executor runs the turn under the
-pod's API server, whose profile is the chat path's own (`default` on a stock install), so the premise may now hold on
-this lane; the exclusion stays until a run on that executor shows the case grading.
+api lane's roster is untouched. The lane pins that executor: `hack/ci-deploy.sh` sets
+`BRIDGE_EXECUTOR=cli` on the sidecar and its start-line wait requires `"executor":"cli"`. The
+bridge's default `api` executor runs the turn under the pod's API server, whose profile is the
+chat path's own (`default` on a stock install), so it changes which agent answers every case on
+the lane; the pin, and the exclusion, stay until cases have been graded on that executor.
 `ledger_issue_contains` finds the ledger by scanning the final message for a GitHub issue URL, so
 it works on any transport that maps a result into the final message, which both new transports
 do, and its grade depends on that mapping: the fleet-audit cases get the URL from the delegated
@@ -417,8 +419,9 @@ sidecar also carries the agent container's own environment, mounts, security con
 resources, derived from the rendered Deployment at deploy time rather than copied into the
 script: the bridge's `cli` subprocess stands in for the `hermes chat -q` a kanban worker spawns
 inside the agent container, and that is the environment such a worker inherits; under the
-default `api` executor the same copy is what carries `API_SERVER_KEY` into the sidecar. The
-patch adds one variable of its own, `A2A_ACTIVITY_SECRET` from the creds Secret's
+default `api` executor the same copy is what carries `API_SERVER_KEY` into the sidecar, which is
+why the patch pins `BRIDGE_EXECUTOR=cli` rather than leaving the choice to the key. The
+patch adds one more variable of its own, `A2A_ACTIVITY_SECRET` from the creds Secret's
 `bridge-activity-key`, because the agent container gains that entry only when the operator
 renders the sidecar the patch is declaring. The one mount not
 carried is the projected bus token, which the webhook reserves for the agent container. The

@@ -70,6 +70,7 @@ _AGENT_MANIFESTS = _CONTROLLER / "platformagent_manifests.go"
 _API_TYPES = _REPO_ROOT / "k8s-operator" / "api" / "v1alpha1" / "common_types.go"
 _BRIDGE_MAIN = _REPO_ROOT / "a2a" / "cmd" / "hermes-bridge" / "main.go"
 _BRIDGE_GO = _REPO_ROOT / "a2a" / "hermes-bridge" / "bridge.go"
+_BRIDGE_API_GO = _REPO_ROOT / "a2a" / "hermes-bridge" / "api.go"
 _OPERATOR_TEMPLATE = _REPO_ROOT / "charts" / "kube-agents" / "templates" / "operator-deployment.yaml"
 
 _AR_REPO = "us-central1-docker.pkg.dev/kube-agents-evals/kube-agents"
@@ -319,6 +320,8 @@ def render_sidecar(deployment: dict, concurrency: str = "4") -> dict:
         consts["AGENT_SHARED_STATE_SETUP_SKIP"],
         consts["BRIDGE_ACTIVITY_SECRET_ENV_VAR"],
         consts["A2A_BRIDGE_ACTIVITY_KEY"],
+        consts["BRIDGE_EXECUTOR_ENV_VAR"],
+        consts["BRIDGE_EXECUTOR_PINNED"],
     ]
     quoted = " ".join(f"'{a}'" for a in args)
     result = subprocess.run(
@@ -520,6 +523,18 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertIn("slog.New(slog.NewJSONHandler(os.Stderr, nil))", main_go)
         self.assertEqual(consts["BRIDGE_CONSUMING_LOG_MSG"], '"msg":"hermes bridge consuming"')
         self.assertEqual(consts["BRIDGE_CONSUMING_LOG_PROFILE"], f'"profile":"{go_constant(_BRIDGE_MAIN, "defaultProfile")}"')
+        # The lane pins the subprocess executor, and the start line is where the
+        # deploy proves the pin took: the variable the bridge reads, the value it
+        # accepts, and the field it logs the choice under.
+        self.assertEqual(consts["BRIDGE_EXECUTOR_ENV_VAR"], go_constant(_BRIDGE_MAIN, "executorEnv"))
+        self.assertEqual(consts["BRIDGE_EXECUTOR_PINNED"], go_constant(_BRIDGE_API_GO, "ExecutorCLI"))
+        self.assertIn('"executor", b.cfg.Executor)', text(_BRIDGE_GO))
+        self.assertEqual(consts["BRIDGE_CONSUMING_LOG_EXECUTOR"], f'"executor":"{consts["BRIDGE_EXECUTOR_PINNED"]}"')
+        self.assertIn(
+            '| grep -F "${BRIDGE_CONSUMING_LOG_MSG}" | grep -F "${BRIDGE_CONSUMING_LOG_PROFILE}" | grep -F "${BRIDGE_CONSUMING_LOG_EXECUTOR}" |',
+            text(_CI_DEPLOY),
+            "the start-line wait requires all three fields, or a bridge on the wrong executor passes it",
+        )
 
     def test_the_concurrency_default_is_the_eval_scripts_and_fits_the_queue(self) -> None:
         consts = constants()
@@ -992,6 +1007,7 @@ class SidecarPatchTest(unittest.TestCase):
                 {"name": "NATS_URL", "value": "nats://platform-agent-a2a-nats.kubeagents-system.svc:4222"},
                 {"name": "NATS_USER", "value": "bridge"},
                 {"name": "NATS_PASSWORD", "valueFrom": {"secretKeyRef": {"name": "platform-agent-a2a-nats-creds", "key": "bridge-password"}}},
+                {"name": "BRIDGE_EXECUTOR", "value": "cli"},
                 {"name": "BRIDGE_CONCURRENCY", "value": "4"},
                 {
                     "name": "A2A_ACTIVITY_SECRET",
@@ -1001,6 +1017,7 @@ class SidecarPatchTest(unittest.TestCase):
         )
         self.assertEqual(names.count("NATS_URL"), 1, "the agent's NATS_URL is replaced, not shadowed")
         self.assertEqual(names.count("AGENT_SHARED_STATE_SETUP"), 1)
+        self.assertEqual(names.count("BRIDGE_EXECUTOR"), 1)
         self.assertEqual(self.sidecar["envFrom"], [{"secretRef": {"name": "extra"}}])
 
     def test_it_mounts_what_the_agent_mounts_except_the_reserved_bus_token(self) -> None:
@@ -1032,7 +1049,7 @@ class SidecarPatchTest(unittest.TestCase):
         sidecar = render_sidecar(bare, concurrency="6")["spec"]["deployment"]["sidecars"][0]
         self.assertEqual(set(sidecar), {"name", "image", "env", "volumeMounts"})
         self.assertEqual(sidecar["volumeMounts"], [])
-        self.assertEqual([e["name"] for e in sidecar["env"]], ["AGENT_SHARED_STATE_SETUP", "NATS_URL", "NATS_USER", "NATS_PASSWORD", "BRIDGE_CONCURRENCY", "A2A_ACTIVITY_SECRET"])
+        self.assertEqual([e["name"] for e in sidecar["env"]], ["AGENT_SHARED_STATE_SETUP", "NATS_URL", "NATS_USER", "NATS_PASSWORD", "BRIDGE_EXECUTOR", "BRIDGE_CONCURRENCY", "A2A_ACTIVITY_SECRET"])
         self.assertEqual(sidecar["env"][-2]["value"], "6")
 
     def test_the_context_the_operator_renders_is_one_the_webhook_admits(self) -> None:

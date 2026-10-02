@@ -481,7 +481,10 @@ moment, and is dropped otherwise, so a kanban worker's or a chat message's tool 
 carry their own session ids, never reach an A2A trace. Kanban work the turn delegates is
 therefore absent from the trace; only the gateway profile's own calls appear. The `cli`
 executor still uses a per-task key, and a child it spawns drops the pod-wide entry from the
-managed config it is given, so a delivery is never signed twice.
+managed config it is given, so a delivery is never signed twice. The managed scope merges per
+leaf and a list is one leaf, so the rendered `hooks.outbound` replaces any list a profile sets
+in its own `config.yaml`; no profile the product ships sets one, and a profile that needs its own
+outbound hooks does not get them while the entry is rendered.
 
 Trust boundary, stated: everything in the pod is reachable from the persona's own terminal
 tool, its environment included. The shared key widens that under `api`: any process holding
