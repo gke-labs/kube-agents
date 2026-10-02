@@ -54,9 +54,9 @@ An incident alert's option buttons (``kage_incident.choice.<n>``) can also be
 answered by typing: someone replies ``apply Option B`` in the thread, the agent
 applies it, and the buttons are still there. So before such a click counts,
 the thread is read once, plus the cached thread-root lookup the adapter's
-channel gate makes, and if a person the adapter would answer (its own
-interactive authorization, the check the clicker passed, and its channel gate
-with the mention rule the click skips) has replied with one of the call to
+channel gate makes, and if a person the adapter would answer (not a bot by
+its own test, its interactive authorization, the check the clicker passed, and
+its channel gate with the mention rule the click skips) has replied with one of the call to
 action's forms (``apply``, ``apply Option B``, ``apply B``, any of them ending
 in a please or a thanks, or a button's whole text, ``apply Option B: <that
 option's text>``; a colon before anything else is not one) since the buttons appeared, the buttons are replaced with
@@ -69,8 +69,12 @@ the start; a reply typed during the diagnosis does not count. The match is a
 heuristic: the agent reads a typed reply as free text, so this guesses what it
 will apply. Those checks are made when the button is clicked, not when the
 reply was typed, so a channel or user setting changed in between is read as it
-stands at the click. A read, or one of the adapter's checks, that fails runs the click
-as if nothing had been typed. Other choice buttons are not checked.
+stands at the click. A read that fails runs the click as if nothing had been
+typed; an adapter check that answers no means that reply does not count, and
+one that raises counts it, since the agent may already be applying it. The bot
+test is the exception: the adapter makes it before any other, so one that
+raises took no turn and that reply does not count. Other choice buttons are
+not checked.
 
 A click that runs is fail-soft: a rewrite or echo that fails is logged and the
 turn still runs, because the click was the user's answer. A click dropped for a
@@ -129,7 +133,8 @@ ANSWERED_MAX = 512
 INCIDENT_CHOICE_PREFIX = "kage_incident.choice."
 
 #: Struck-through text, ``~like this~``: taken back, so removed before a reply is matched.
-TYPED_STRUCK = re.compile(r"~[^~\n]+~")
+#: Each tilde sits at a word's edge, as Slack's own strike needs: ``~3 to ~5`` is not struck.
+TYPED_STRUCK = re.compile(r"(?<![\w~])~(?=\S)[^~\n]+?(?<=\S)~(?![\w~])")
 
 #: Inline markup a reply can wrap the word in, dropped before it is matched.
 TYPED_MARKUP = str.maketrans("", "", "*_~`'\"‘’“”")
@@ -169,8 +174,10 @@ OPTION_TEXT_END = ".! "
 #: Neither part runs past a ``<``: an unclosed link is given up at the next one, not at the end of the reply.
 SLACK_LINK = re.compile(r"<(https?://[^|>\s<]+)(?:\|([^>\n<]*))?>")
 
-#: The one reply subtype that is still a person typing: "also send to channel".
-TYPED_SUBTYPES = frozenset({"thread_broadcast"})
+#: The reply subtype the adapter's inbound filter drops outright; a bot's post, ``bot_message``
+#: among them, it drops by ``_event_declares_bot_sender``, asked of each reply too. Every other
+#: subtype reaches the agent as a turn: "also send to channel", a file with a comment, a ``/me``.
+GATEWAY_DROPPED_SUBTYPES = frozenset({"message_deleted"})
 
 #: The line that replaces an alert's buttons when someone typed the apply first.
 ANSWERED_IN_THREAD = "✓ answered in the thread"
@@ -409,10 +416,14 @@ async def _applied_by_typing(
 ) -> bool:
     """Whether a person the adapter would answer typed an apply in the thread after ``since``.
     One read, plus the cached thread-root lookup the adapter's channel gate makes. A failed read
-    answers no, so the click runs as it would without the check; an adapter check that fails on
+    answers no, so the click runs as it would without the check; an adapter check that raises on
     a reply that typed an option answers yes, since the gateway may already be applying it and
-    running the click as well would apply two. The channel gate is asked only of a reply that
-    passes everything else, and at click time, not as it stood when the reply was typed."""
+    running the click as well would apply two. The bot test is the exception: the adapter makes it
+    first, so one that raises took no turn there and the reply does not count. The channel gate is
+    asked only of a reply that passes everything else, and at click time, not as it stood when the
+    reply was typed. Not mirrored: the users.info probe the adapter makes of a reply with no
+    ``client_msg_id``, and ``allow_bots``, which can let a bot's post through as a turn; neither is
+    a person typing."""
     try:
         response = await client.conversations_replies(
             channel=channel_id, ts=thread_ts, oldest=since, limit=REPLIES_READ_MAX,
@@ -421,11 +432,19 @@ async def _applied_by_typing(
             if not (
                 isinstance(reply, dict)
                 and reply.get("user")
-                and not reply.get("bot_id")
-                and (not reply.get("subtype") or reply.get("subtype") in TYPED_SUBTYPES)
+                and reply.get("subtype") not in GATEWAY_DROPPED_SUBTYPES
                 and _after(reply.get("ts"), since)
                 and _typed_apply(str(reply.get("text") or ""), options)
             ):
+                continue
+            try:
+                if adapter._event_declares_bot_sender(reply):
+                    continue
+            except Exception as exc:  # noqa: BLE001 — the adapter asks it first, so no turn ran
+                logger.warning(
+                    "slack_ux_clicks: could not tell whether a reply in %s is a bot's; not counting it: %s",
+                    thread_ts, exc,
+                )
                 continue
             try:
                 if adapter._is_interactive_user_authorized(

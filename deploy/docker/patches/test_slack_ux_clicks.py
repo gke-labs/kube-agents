@@ -102,6 +102,9 @@ class SlackAdapter:
     def _is_interactive_user_authorized(self, user_id, *, channel_id="", user_name=None, team_id=""):
         return True
 
+    def _event_declares_bot_sender(self, event: dict) -> bool:
+        return False
+
     def _slack_message_matches_mention_patterns(self, text: str) -> bool:
         return False
 
@@ -237,6 +240,11 @@ class ApplierTest(unittest.TestCase):
             ("is_dm: bool,\n        force_process: bool)", "is_dm: bool)", "_channel_gate_allows no longer accepts"),
             ("def _slack_message_matches_mention_patterns(", "def _mention_patterns(",
              "_slack_message_matches_mention_patterns"),
+            ("def _event_declares_bot_sender(", "def _declares_bot(", "_event_declares_bot_sender"),
+            ("def _event_declares_bot_sender(self, event: dict)", "def _event_declares_bot_sender(self)",
+             "_event_declares_bot_sender no longer accepts"),
+            ("    def _event_declares_bot_sender(", "    async def _event_declares_bot_sender(",
+             "_event_declares_bot_sender is now async"),
             ("def _slack_mention_detection_text(", "def _mention_text(", "_slack_mention_detection_text"),
             ("def _slack_mention_detection_text(event)", "def _slack_mention_detection_text(event, bot_uid)",
              "_slack_mention_detection_text no longer accepts"),
@@ -370,9 +378,10 @@ def _slack_mention_detection_text(event):
 class _Adapter:
     def __init__(
         self, authorized=True, fail=(), allowed_channels=(), disable_dms=False, ignored=(), replies=(), unlisted=(),
-        unheard=(), ignore_other_user_mentions=False, broken=(),
+        unheard=(), ignore_other_user_mentions=False, broken=(), api_human_users=(),
     ):
         self.broken = set(broken)
+        self.api_human_users = frozenset(api_human_users)
         self.ignore_other_user_mentions = ignore_other_user_mentions
         self.authorized = authorized
         self.unlisted = set(unlisted)
@@ -417,6 +426,18 @@ class _Adapter:
         if "authorized" in self.broken and user_id != USER:
             raise RuntimeError("allowlist unreadable")
         return user_id not in self.unlisted
+
+    def _event_declares_bot_sender(self, event):
+        # Upstream's, with _slack_api_human_users read from api_human_users.
+        if "bot" in self.broken:
+            raise RuntimeError("bot check failed")
+        if event.get("bot_id") or event.get("bot_profile") or event.get("subtype") == "bot_message":
+            return True
+        if (event.get("user_profile") or {}).get("is_bot"):
+            return True
+        if event.get("app_id") and not event.get("client_msg_id"):
+            return event.get("user") not in self.api_human_users
+        return False
 
     def _slack_message_matches_mention_patterns(self, text):
         if "patterns" in self.broken:
@@ -714,6 +735,10 @@ class RuntimeTest(unittest.TestCase):
         cases = {
             "a bot": {"type": "message", "user": "U9", "bot_id": "B1", "text": "apply Option B", "ts": "223.000"},
             "a subtype": {"type": "message", "subtype": "bot_message", "user": "U2", "text": "apply B", "ts": "223.000"},
+            "a bot profile": {"type": "message", "user": "U2", "bot_profile": {"id": "B1"}, "text": "apply B", "ts": "223.000"},
+            "a bot user": {"type": "message", "user": "U2", "user_profile": {"is_bot": True}, "text": "apply B", "ts": "223.000"},
+            "an app's post": {"type": "message", "user": "U2", "app_id": "A1", "text": "apply B", "ts": "223.000"},
+            "a deleted reply": {"type": "message", "subtype": "message_deleted", "user": "U2", "text": "apply B", "ts": "223.000"},
             "before the alert": {"type": "message", "user": "U2", "text": "apply Option A", "ts": "221.000"},
             "the alert itself": {"type": "message", "user": "U2", "text": "apply", "ts": MESSAGE_TS},
             "apply mid-sentence": {"type": "message", "user": "U2", "text": "should we apply B?", "ts": "223.000"},
@@ -964,8 +989,11 @@ class RuntimeTest(unittest.TestCase):
                 check(adapter)
 
     def test_a_struck_through_apply_does_not_drop_the_click(self):
+        # The last four are tildes Slack shows as typed, each held by one of the strike's four edge tests.
         for text, check in (("~apply B~", self._runs), ("~apply A~ apply B", self._drops), ("~no~ apply B", self._drops),
-                            ("~no~ apply B ~now~", self._drops), ("~no\n~ apply B", self._runs)):
+                            ("~no~ apply B ~now~", self._drops), ("~no\n~ apply B", self._runs),
+                            ("~no~apply B", self._runs), ("apply B~no~", self._runs), ("apply B ~ no~", self._runs),
+                            ("apply B ~no ~", self._runs)):
             with self.subTest(text=text):
                 importlib.reload(runtime)
                 adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": text, "ts": "223.000"}])
@@ -985,6 +1013,27 @@ class RuntimeTest(unittest.TestCase):
             {"type": "message", "subtype": "thread_broadcast", "user": "U2", "text": "apply B", "ts": "223.000"},
         ])
         self._incident(adapter)
+        self._drops(adapter)
+
+    def test_a_typed_apply_the_gateway_takes_as_a_turn_drops_the_click(self):
+        cases = {
+            "with a file": {"subtype": "file_share", "client_msg_id": "m1"},
+            "as a /me": {"subtype": "me_message"},
+            "from a person posting through an app": {"app_id": "A1"},
+        }
+        for name, fields in cases.items():
+            with self.subTest(name):
+                importlib.reload(runtime)
+                reply = {"type": "message", "user": "U2", "text": "apply B", "ts": "223.000", **fields}
+                adapter = _Adapter(replies=[reply], api_human_users={"U2"})
+                self._incident(adapter)
+                self._drops(adapter)
+
+    def test_a_tilde_inside_an_options_text_is_not_a_strike(self):
+        adapter = _Adapter(replies=[
+            {"type": "message", "user": "U2", "text": "apply Option C: Scale to ~3 to ~5 replicas", "ts": "223.000"},
+        ])
+        self._options_incident(adapter, "apply Option A: Restart the pod", "apply Option C: Scale to ~3 to ~5 replicas")
         self._drops(adapter)
 
     def test_a_failed_thread_read_runs_the_click_as_before(self):
@@ -1007,8 +1056,18 @@ class RuntimeTest(unittest.TestCase):
                 self._drops(adapter)
                 self.assertTrue(any("could not check the thread" in line for line in logs.output))
 
+    def test_a_bot_test_that_raises_after_a_typed_apply_does_not_count_the_reply(self):
+        # The adapter makes that test first, so it raised there too and took no turn.
+        adapter = _Adapter(
+            replies=[{"type": "message", "user": "U2", "text": "apply B", "ts": "223.000"}], broken={"bot"},
+        )
+        with self.assertLogs(runtime.logger, level="WARNING") as logs:
+            self._incident(adapter)
+        self._runs(adapter)
+        self.assertTrue(any("not counting it" in line for line in logs.output))
+
     def test_a_check_that_raises_on_a_reply_that_is_no_apply_runs_the_click(self):
-        for broken in ("authorized", "patterns", "gate"):
+        for broken in ("bot", "authorized", "patterns", "gate"):
             with self.subTest(broken=broken):
                 importlib.reload(runtime)
                 adapter = _Adapter(
