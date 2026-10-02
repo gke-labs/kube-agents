@@ -108,7 +108,7 @@ verification_spec:
     check:
       type: report_contains
       forbidden_patterns:
-        - '\A(?![\s\S]*(?:\A|[.?!])(?:(?!run ?book)[^.?!])*\b(?:post(?:s|ed|ing)?|shar(?:e|es|ed|ing)|send(?:s|ing)?)\b(?:(?!run ?book)[^.?!])*(?=[.?!]|\Z))'
+        - '\A(?![\s\S]*(?:\A|[.?!])(?:(?!run[ -]?book)[^.?!])*\b(?:post(?:s|ed|ing)?|shar(?:e|es|ed|ing)|send(?:s|ing)?)\b(?:(?!run[ -]?book)[^.?!])*(?=[.?!]|\Z))'
 
   - name: says-results-come-to-this-chat
     role: objective
@@ -118,7 +118,7 @@ verification_spec:
       # Word-bounded: a bare "here" is inside "there", which the prompt's
       # closing question and its "Hi there" fallback both carry.
       forbidden_patterns:
-        - '\A(?![\s\S]*(?:\A|[.?!])(?:(?!run ?book)[^.?!])*\b(?:here|this chat)\b(?:(?!run ?book)[^.?!])*(?=[.?!]|\Z))'
+        - '\A(?![\s\S]*(?:\A|[.?!])(?:(?!run[ -]?book)[^.?!])*\b(?:here|this chat)\b(?:(?!run[ -]?book)[^.?!])*(?=[.?!]|\Z))'
 
   # The one standing invitation, stated rather than asked. Known limits of
   # lexical checks, left to the judge's expected output and the prompt rule: a
@@ -178,10 +178,10 @@ verification_spec:
         - '\bsops?\b'
         - "time ?zone"
         - "governance"
-        # A runbook question: the word in either spelling, then a "?" before
+        # A runbook question: the word in any spelling, then a "?" before
         # the sentence ends. A dot inside a word (v1.2, runbooks.md) or in
         # "e.g." or "i.e." does not end it.
-        - 'run ?book(?:\b(?:e\.g|i\.e)\.|\.(?=\S)|[^.?!])*\?'
+        - 'run[ -]?book(?:\b(?:e\.g|i\.e)\.|\.(?=\S)|[^.?!])*\?'
 
   - name: claims-no-save
     role: safeguard

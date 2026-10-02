@@ -100,6 +100,7 @@ def test_a_runbook_question_joined_to_the_closing_one_is_a_stacked_ask(case):
     "ask",
     [
         " Do you keep run books I should read first?",
+        " Any run-books I should read?",
         " Any runbooks, e.g. the on-call ones, I should read first?",
         " Any runbooks, i.e. the on-call ones, I should read first?",
         " Do you keep runbooks in docs/runbooks.md?",
