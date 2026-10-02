@@ -13,7 +13,8 @@ Two things are checked:
    :func:`slack_ux_clicks.answer` unpacks, in that order, plus
    ``_is_ignored_channel``, ``_slack_allowed_channels``, ``_slack_disable_dms``,
    ``_get_client``, ``_handle_slack_message``, ``_is_interactive_user_authorized``,
-   ``_channel_gate_allows`` and ``_slack_message_matches_mention_patterns``, sets
+   ``_channel_gate_allows``, ``_slack_message_matches_mention_patterns`` and
+   ``_event_declares_bot_sender``, sets
    ``_bot_user_id`` and ``_team_bot_user_ids`` in ``__init__``, plus ``_client_for`` for ``slack_ux_incident``;
    the adapter file still defines ``_slack_mention_detection_text(event)`` at module level and still reads the
    ``_hermes_force_process`` marker the click's message carries.
@@ -58,7 +59,7 @@ ADAPTER_CLASS = "SlackAdapter"
 RUNTIME_MEMBERS = (
     "_begin_interaction", "_is_ignored_channel", "_slack_allowed_channels", "_slack_disable_dms",
     "_get_client", "_handle_slack_message", "_client_for", "_is_interactive_user_authorized",
-    "_channel_gate_allows", "_slack_message_matches_mention_patterns",
+    "_channel_gate_allows", "_slack_message_matches_mention_patterns", "_event_declares_bot_sender",
 )
 #: The adapter file's module-level functions the runtime calls, and how: positional arguments, keywords.
 RUNTIME_FUNCTIONS = {"_slack_mention_detection_text": (1, ())}
@@ -83,6 +84,7 @@ CALL_SHAPES = {
     "_handle_slack_message": ((1, ()),),
     "_is_interactive_user_authorized": ((1, ("channel_id", "team_id")),),
     "_slack_message_matches_mention_patterns": ((1, ()),),
+    "_event_declares_bot_sender": ((1, ()),),
     "_channel_gate_allows": ((0, (
         "channel_id", "routing_text", "bot_uid", "is_mentioned", "is_thread_reply", "event_thread_ts", "user_id",
         "team_id", "is_dm", "force_process",
@@ -367,6 +369,9 @@ class _StubAdapter:
 
     def _slack_message_matches_mention_patterns(self, text):
         return False
+
+    def _event_declares_bot_sender(self, event):
+        return bool(event.get("bot_id"))
 
     async def _channel_gate_allows(
         self, *, channel_id, routing_text, bot_uid, is_mentioned, is_thread_reply, event_thread_ts, user_id,

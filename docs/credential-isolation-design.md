@@ -115,10 +115,12 @@ OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` aler
 `FEEDBACK_PROMPT_*` switch and delay, and the `KAGE_SLACK_UX` flag —
 but only as literal values; all `valueFrom` sources are rejected. A name earns a
 place on that list only if an arbitrary value for it cannot redirect state,
-grant access, or change what code runs. `KAGE_SLACK_UX` is the nearest case: it
-switches between code paths the image already ships, which its comment there lists.
+grant access, or run code the image does not already ship. The list is
 `safeSandboxEnvOverrides` in
-`k8s-operator/internal/controller/platformagent_manifests.go` is the list.
+`k8s-operator/internal/controller/platformagent_manifests.go`. `KAGE_SLACK_UX`
+is the nearest case: it switches between Slack code paths the image already
+ships, adds no destination or credential, and writes only to Slack in the thread
+it answers; its comment in `safeSandboxEnvOverrides` lists each path.
 Reserved proxy, runtime-loader, and shell-startup variables cannot override the
 operator's managed values.
 

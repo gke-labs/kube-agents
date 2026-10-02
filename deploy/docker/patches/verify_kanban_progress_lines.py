@@ -2,9 +2,11 @@
 """Build gate for the rolling-progress-message patch.
 
 Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` immediately after
-``apply_kanban_progress_lines.py``. The applier proves its anchors matched in
-``gateway/kanban_watchers_notifier.py``; a matched anchor is the weaker half of
-every concern here, because **every** failure mode of this patch is silent:
+``apply_kanban_progress_lines.py``, and again on the final tree once
+``apply_slack_ux_incident.py`` has wrapped the notifier's adapter. The applier
+proves its anchors matched in ``gateway/kanban_watchers_notifier.py``; a matched
+anchor is the weaker half of every concern here, because **every** failure mode
+of this patch is silent:
 
 * **The wiring.** A trailer import that did not execute, or a ``deliver`` that
   no longer resolves, does not fail at build time — it raises inside the

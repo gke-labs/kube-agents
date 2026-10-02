@@ -469,7 +469,7 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(len(triage["links"]), 2)
 
     def test_a_url_slack_would_refuse_is_dropped_not_sent(self):
-        url = "https://console.cloud.google.com/logs/query;query=" + "a" * runtime.BUTTON_URL_MAX
+        url = "https://console.cloud.google.com/logs/query;query=" + "a" * presenter.BUTTON_URL_MAX
         triage = runtime.parse_triage(REPORT.replace(LOGS_URL, url))
         self.assertEqual(triage["links"], [("GKE Workloads", WORKLOADS_URL)])
 
@@ -535,6 +535,24 @@ class RuntimeTest(unittest.TestCase):
         triage = runtime.parse_triage(quoted)
         self.assertEqual(triage["choices"][0][0], "apply Option A: Roll back to 14:02")
 
+    def test_a_link_with_userinfo_gets_no_button(self):
+        spoofed = "https://console.cloud.google.com@evil.example/"
+        triage = runtime.parse_triage(REPORT.replace(LOGS_URL, spoofed))
+        self.assertEqual([label for label, _ in triage["links"]], ["GKE Workloads"])
+        for spoofed in ("https://u@evil.example/", "https://console.cloud.google.com@evil.example/"):
+            # First on the line, so the link after it is numbered from the filtered list.
+            triage = runtime.parse_triage(REPORT.replace(WORKLOADS_URL, spoofed))
+            self.assertEqual(triage["links"], [("Cloud Logs", LOGS_URL)])
+            blocks = runtime.blocks_triage(triage, [])
+            self.assertNotIn("evil.example", json.dumps(blocks))
+            self.assertNotIn("evil.example", runtime.fallback_text(triage))
+            link_action = f"{runtime.ACTION_PREFIX}.{presenter.LINK_ACTION}."
+            ids = [e["action_id"] for b in blocks if b["type"] == "actions" for e in b["elements"]]
+            self.assertEqual([i for i in ids if i.startswith(link_action)], [link_action + "0"])
+        plain = "https://console.cloud.google.com/logs/query"
+        triage = runtime.parse_triage(REPORT.replace(LOGS_URL, plain))
+        self.assertEqual(triage["links"][1], ("Cloud Logs", plain))
+
     def test_a_link_url_keeps_its_parentheses(self):
         url = "https://console.cloud.google.com/logs/query;query=(severity>=ERROR)"
         triage = runtime.parse_triage(REPORT.replace(LOGS_URL, url))
@@ -549,11 +567,11 @@ class RuntimeTest(unittest.TestCase):
 
     def test_the_url_limit_is_measured_after_encoding(self):
         base = "https://console.cloud.google.com/logs/query;query="
-        fits = base + "a" * (runtime.BUTTON_URL_MAX - len(base))
+        fits = base + "a" * (presenter.BUTTON_URL_MAX - len(base))
         triage = runtime.parse_triage(REPORT.replace(LOGS_URL, fits))
         self.assertEqual(triage["links"][1], ("Cloud Logs", fits))
         # At the limit as written, two over once ">" becomes "%3E".
-        pushed = base + ">" + "a" * (runtime.BUTTON_URL_MAX - len(base) - 1)
+        pushed = base + ">" + "a" * (presenter.BUTTON_URL_MAX - len(base) - 1)
         triage = runtime.parse_triage(REPORT.replace(LOGS_URL, pushed))
         self.assertEqual(triage["links"], [("GKE Workloads", WORKLOADS_URL)])
 
