@@ -40,6 +40,14 @@ holds the last ``ANSWERED_MAX`` answers, so only a failed rewrite followed by a
 gateway restart, or by that many later answers, lets the leftover buttons run
 again.
 
+An incident alert's option buttons (``kage_incident.choice.<n>``) can also be
+answered by typing: someone replies ``apply Option B`` in the thread, the agent
+applies it, and the buttons are still there. So before such a click counts,
+the thread is read once, and if a person (not a bot) has replied starting with
+``apply`` since the alert was posted, the buttons are replaced with "answered
+in the thread" and the click is dropped. A read that fails runs the click as
+if nothing had been typed. Other choice buttons are not checked.
+
 Fail-soft throughout: a rewrite or echo that fails is logged and the turn
 still runs, because the click was the user's answer.
 """
@@ -48,6 +56,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from collections import OrderedDict
 from typing import Any
 
@@ -89,6 +98,20 @@ FALLBACK_TS = "kage-click-{ts}-{action}-{user}"
 
 #: Bound on the answered-message map, oldest evicted first.
 ANSWERED_MAX = 512
+
+#: An incident alert's option buttons: ``slack_ux_incident.ACTION_PREFIX`` and the
+#: presenter's choice segment, copied because that module is not imported here.
+INCIDENT_CHOICE_PREFIX = "kage_incident.choice."
+
+#: A reply typed to apply an option, with or without the leading mention Slack
+#: prepends when the bot is @-mentioned.
+TYPED_APPLY = re.compile(r"^\s*(?:<@[UWB][A-Z0-9]+>\s*)?apply\b", re.IGNORECASE)
+
+#: The line that replaces an alert's buttons when someone typed the apply first.
+ANSWERED_IN_THREAD = "✓ answered in the thread"
+
+#: Slack's most replies one ``conversations.replies`` page returns.
+REPLIES_READ_MAX = 1000
 
 #: ``(channel, ts, kind)`` a click answered.
 _answered: OrderedDict[tuple, None] = OrderedDict()
@@ -179,6 +202,35 @@ def _thread_ts(body: dict, message: dict, msg_ts: str) -> str:
     return str(message.get("thread_ts") or container.get("thread_ts") or msg_ts)
 
 
+def _after(ts: Any, msg_ts: str) -> bool:
+    try:
+        return float(ts) > float(msg_ts)
+    except (TypeError, ValueError):
+        return False
+
+
+async def _applied_by_typing(client: Any, channel_id: str, thread_ts: str, msg_ts: str) -> bool:
+    """Whether a person replied ``apply ...`` in the thread after the alert. One read;
+    a read that fails answers no, so the click runs as it would without the check."""
+    try:
+        response = await client.conversations_replies(
+            channel=channel_id, ts=thread_ts, oldest=msg_ts, limit=REPLIES_READ_MAX,
+        )
+        replies = response.get("messages") or []
+    except Exception as exc:  # noqa: BLE001 — the click still answers
+        logger.warning("slack_ux_clicks: could not read the thread of %s; running the click: %s", msg_ts, exc)
+        return False
+    return any(
+        isinstance(reply, dict)
+        and reply.get("user")
+        and not reply.get("bot_id")
+        and not reply.get("subtype")
+        and _after(reply.get("ts"), msg_ts)
+        and TYPED_APPLY.match(str(reply.get("text") or ""))
+        for reply in replies
+    )
+
+
 async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) -> None:
     """Authorize a choice click, mark it answered, echo it, and run it as the clicker's turn."""
     started = await adapter._begin_interaction(ack, body, action, kind)
@@ -204,13 +256,31 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
     if key in _answered:
         logger.info("slack_ux_clicks: dropping a second %s click on %s, already answered", kind, msg_ts)
         return
+    thread_ts = _thread_ts(body, message, msg_ts)
+    client = adapter._get_client(channel_id, team_id=team_id)
+    typed = action_id.startswith(INCIDENT_CHOICE_PREFIX) and await _applied_by_typing(
+        client, channel_id, thread_ts, msg_ts,
+    )
+    # Checked again: another click on this message may have landed during the read.
+    if key in _answered:
+        logger.info("slack_ux_clicks: dropping a second %s click on %s, already answered", kind, msg_ts)
+        return
     _answered[key] = None
     while len(_answered) > ANSWERED_MAX:
         _answered.popitem(last=False)
 
-    thread_ts = _thread_ts(body, message, msg_ts)
+    if typed:
+        logger.info("slack_ux_clicks: dropping a %s click on %s, already applied in the thread", kind, msg_ts)
+        try:
+            await client.chat_update(
+                channel=channel_id, ts=msg_ts, text=ANSWERED_IN_THREAD,
+                blocks=answered_blocks(message.get("blocks"), _answered_by, ANSWERED_IN_THREAD),
+            )
+        except Exception as exc:  # noqa: BLE001 — the click is dropped either way
+            logger.warning("slack_ux_clicks: could not mark %s answered in the thread: %s", msg_ts, exc)
+        return
+
     shown = _escape(label)
-    client = adapter._get_client(channel_id, team_id=team_id)
     note = ANSWERED.format(user=user_id, label=shown)
     try:
         await client.chat_update(

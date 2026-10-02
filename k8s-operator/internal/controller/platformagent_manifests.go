@@ -4267,7 +4267,10 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	//   - Incident alerts: an incident alert's triage options post as an edit
 	//     of the alert, with a button per option and the report folded; the
 	//     Session KV database is read, read-only, to tell an alert's thread
-	//     from any other.
+	//     from any other; and before an option click counts, the alert's
+	//     thread is read once (conversations.replies, the existing token and
+	//     scopes) to see whether someone already typed apply, which drops the
+	//     click.
 	//   - Reactions: which reaction goes on an ask and when it settles.
 	allowed := map[string]struct{}{
 		"ALERT_DAILY_LIMIT_CRITICAL": {},
