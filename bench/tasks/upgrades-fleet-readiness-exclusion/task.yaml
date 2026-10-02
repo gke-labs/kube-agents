@@ -15,11 +15,17 @@
 # but WHY a member cannot take the upgrade, which is what the script's
 # `--readiness` table adds: per member, drain-blocking PodDisruptionBudgets,
 # maintenance exclusions and the window at the instant, and node-pool skew
-# against the target. The seeded fleet plants no drain-blocking PDB (the
-# reliability plant is a workload with NO PDB, and the capacity plant's PDB is
-# a safe maxUnavailable: 1), so what this case observes is the maintenance
-# rule: seeded-b's exclusion, in effect, at a scope that covers exactly the
-# upgrade its version row says it needs. The report is graded, not the tool
+# against the target. Both halves are now plantable: seeded-b carries the
+# maintenance rule (its exclusion, in effect, at a scope covering exactly the
+# upgrade its version row says it needs) AND a drain-blocking PDB,
+# pinned-batch-runner at maxUnavailable: 0. Every other budget in the fleet is
+# safe by spec, which is how the skill grades one: inference-server on seeded-a
+# and zone-pinned-api on seeded-d at maxUnavailable: 1, capacity-starved-worker
+# on seeded-d at minAvailable: 1 against four replicas; the reliability plant
+# is a workload with NO PDB. inference-server's status does read
+# disruptionsAllowed 0, because its pool holds fewer replicas than it wants
+# (bench/tf/fleet/defects-a.tf), so a report naming that budget from status
+# alone is wrong rather than thorough. The report is graded, not the tool
 # path: an agent that reads the maintenance policy any other way and reports
 # the same finding passes.
 #
@@ -42,6 +48,16 @@
 # and the version-laggard role probes no objects, so a fleet_resource_property
 # check has nothing to ground on. The fleet's scheduled reconcile owns the
 # defect's integrity. Same documented residual as upgrades-fleet-version-table.
+# readiness-drain-blocked is listed because expected_output names its budget.
+# `fixtures:` is read by scripts/validate_bench_cases.py and by whoever greps
+# for the cases a replaced cluster affects; nothing reads it at run time. So on
+# a project whose fleet predates the budget the case still runs, its four
+# report checks can pass, and the judge marks the report down for missing
+# pinned-batch-runner -- the environment, not the agent; the CI health bot's
+# fixture-state scan lists readiness-drain-blocked as not checked there. Its
+# probe, poddisruptionbudget/pinned-batch-runner, could ground a
+# fleet_resource_property safeguard that turns that absence into an error, and
+# adding one changes what this case grades, which needs its own eval run.
 id: upgrades-fleet-readiness-exclusion
 name: Fleet upgrade readiness names the maintenance exclusion holding the laggard
 prompt: >-
@@ -59,9 +75,11 @@ expected_output: >-
   NO_MINOR_UPGRADES and its end time, and stating that the exclusion holds
   back the automatic minor upgrade to its REGULAR channel default (a manual
   upgrade is not subject to it). The other members are graded against the
-  same rule and are not reported as blocked by an exclusion; no cluster is
-  reported as having a drain-blocking PodDisruptionBudget, since none exists
-  in the fleet. It says what an operator would have to change and does not
+  same rule and are not reported as blocked by an exclusion. seeded-b is also
+  reported as carrying a drain-blocking PodDisruptionBudget, pinned-batch-runner
+  in seeded-upgrade, whose maxUnavailable of 0 leaves disruptionsAllowed at 0
+  permanently, so a node drain of the pool that workload is pinned to cannot
+  complete; no other cluster carries one. It says what an operator would have to change and does not
   propose deleting the exclusion. It recommends (not performs) the upgrade
   path. It cites no CVE identifiers, because it has no vulnerability feed. No
   mutation of any kind.
@@ -79,6 +97,7 @@ owner: maintainers
 # docs/designs/bench-fleet-catalog.md is the rule.
 fixtures:
   - version-laggard
+  - readiness-drain-blocked
 
 # report_contains: a chat prompt, so the reply is what is graded. Four
 # objectives, one for each thing the reply must do: name the laggard, name the

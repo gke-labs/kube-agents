@@ -44,14 +44,21 @@ TRUSTED_DIR = "/opt/vcs/libexec/platform"
 # Where an agent is told what to run. The cluster files are here because cluster
 # profiles run in the same pod as the platform agent and reach the same sandbox —
 # cluster_preflight.sh is on the allowlist only because agents/cluster/SOUL.md
-# makes it the first command of every kanban task.
+# makes it the first command of every kanban task. The governance SOPs are what a
+# card's worker is sent to follow, and the Chat Agent's tree writes the bodies of
+# the cards it files, so both reach the same terminal. Its `.yaml` and `.json` are
+# left out: they name what the agent pod launches itself, MCP servers and no_agent
+# crons, which never run in the sandbox.
 INSTRUCTION_GLOBS = (
     "agents/platform/skills/*/SKILL.md",
     "agents/platform/SOUL.md",
     "agents/platform/AGENTS.md",
+    "agents/platform/governance/*.md",
     "agents/cluster/SOUL.md",
     "agents/cluster/AGENTS.md",
     "agents/cluster/skills/*/SKILL.md",
+    "agents/chat/**/*.md",
+    "agents/chat/**/*.py",
 )
 
 # A shared script named by its *runtime* path: `/opt/data/scripts/x.py` or

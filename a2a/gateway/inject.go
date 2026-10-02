@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -178,6 +179,27 @@ const (
 	// holds. It applies to what the GATEWAY posts, never to the prompt: the
 	// inbound text goes to the bus, not into this transcript.
 	injectMaxEntryBytes = 64 * 1024
+	// injectMaxEntryToolBytes and injectMaxEntryFieldBytes bound an activity
+	// entry's fields beside its input when the entry is over the bound.
+	injectMaxEntryToolBytes  = 256
+	injectMaxEntryFieldBytes = 128
+	// injectMaxNestedCallBytes is how much of a nested call beside its name
+	// (and of anything else inside the wrapper's input) an over-size
+	// wrapper keeps verbatim before it becomes a stand-in.
+	injectMaxNestedCallBytes = 128
+	// injectWrapperTool is hermes's tool_call wrapper, the one entry whose
+	// input the probe's cap reads into rather than replaces whole.
+	injectWrapperTool = "tool_call"
+	// injectMaxDroppedKeys is how many of an over-size entry's extra keys
+	// are named in droppedKeys; the rest are a count, so the list that says
+	// what was cut is itself bounded and the input is never charged for it.
+	injectMaxDroppedKeys = 32
+	// injectMaxActivityEntries bounds the trace a probe carries: the read
+	// route runs before and after every wait on the harness's hot loop, and
+	// a long run's trace would otherwise ride every poll whole. The newest
+	// entries are kept, since a caller reading a live run wants what it is
+	// doing now; ActivityDropped says how many older ones the cap cut.
+	injectMaxActivityEntries = 1000
 
 	// injectMaxEntries bounds one conversation's retained transcript and
 	// injectMaxConversations how many conversations are retained at once.
@@ -392,6 +414,10 @@ type conversationResponse struct {
 // probeReport is ConversationState on the wire, plus the door's own two
 // additions: the conversation's last post, which the gateway's record does
 // not hold and this transcript does, and an error for "could not look".
+// Beside the record and the terminal it carries the tool-call trace
+// (activity), which the relay never posts, and the progress line, which
+// the relay renders into the chat and this returns as the stream holds it
+// at the read.
 //
 // Nothing here is a verdict. A caller decides "nobody took this task" from
 // active, executorState "" and ageSeconds past graceSeconds; "queued and
@@ -423,6 +449,28 @@ type probeReport struct {
 	TerminalSource string `json:"terminalSource,omitempty"`
 	Result         string `json:"result,omitempty"`
 	Reason         string `json:"reason,omitempty"`
+	// Activity is the task's tool-call trace as its stream holds it, final
+	// or not: the data part of every part of the activity artifact, in
+	// arrival order (stream order for an executor that appends to one
+	// artifact id), each the executor's own JSON record of one invocation
+	// (tool, input, callId, status, durationMs, at). The relay never posts
+	// it, so this is the one place a caller sees what a run called. The
+	// key is present -- as [] when the executor called nothing -- whenever
+	// the task's stream was read, and absent when it was not (no active
+	// task, or the read failed) and on a door older than the field. A
+	// pointer to a slice rather than a slice because that is the only
+	// encoding in which those two are different things on the wire in a
+	// way every consumer keeps: a plain slice without omitempty writes
+	// null for "not read", and null and absent both decode to a nil slice
+	// in Go and to None under a Python .get, which would leave a harness
+	// unable to tell "this door cannot show calls" from "nobody called".
+	Activity *[]json.RawMessage `json:"activity,omitempty"`
+	// ActivityDropped is how many of the oldest entries injectMaxActivityEntries
+	// cut from Activity; zero, and absent, when the whole trace fits.
+	ActivityDropped int `json:"activityDropped,omitempty"`
+	// Progress is the last text part of the progress artifact -- the line
+	// the relay's rolling edit shows -- at the instant of the read.
+	Progress string `json:"progress,omitempty"`
 	// LastPost is the newest post entry on this conversation, if any: the
 	// last thing the relay said, for a caller deciding what a stalled task
 	// was doing.
@@ -1681,8 +1729,14 @@ func (a *InjectAdapter) awaitTurn(ctx context.Context, key string, prior injectC
 // task's stream, read with nothing changed (ConversationProbe). It is how a
 // caller learns, without sending a message that would itself become a turn,
 // whether any executor has touched its task, whether the task has sat queued
-// (submitted) or run (working), and how old it is against the gateway's
-// grace -- and classifies for itself. The probe runs before the wait, so a
+// (submitted) or run (working), how old it is against the gateway's grace,
+// and what the run has called so far (the activity artifact, which the relay
+// never posts) -- and classifies for itself. With task=, the probe reads that
+// task's stream whether or not the record still holds it as active: the
+// relay clears the active task when it posts the terminal, so this is how a
+// caller reads a finished run's trace after the relay has released it;
+// without task= the probe reads the record's active task, and a released
+// conversation reads as no stream at all. The probe runs before the wait, so a
 // caller that reads a terminal on the stream does not wait on the relay for
 // it, and again after any wait that blocked, so the probe in the reply
 // describes the same instant as the entries beside it: a caller classifying
@@ -1746,7 +1800,7 @@ func (a *InjectAdapter) handleConversation(w http.ResponseWriter, r *http.Reques
 	}
 	var probed *probeReport
 	if probeAsked != 0 {
-		probed = a.runProbe(r.Context(), key)
+		probed = a.runProbe(r.Context(), key, taskID)
 		probed.LastPost = a.lastPost(key)
 		if probed.Final {
 			// A terminal on the stream is the answer; nothing the relay
@@ -1764,7 +1818,7 @@ func (a *InjectAdapter) handleConversation(w http.ResponseWriter, r *http.Reques
 			if probeAsked != 0 && waited {
 				// Time moved on under the wait; the probe has to describe
 				// where the stream is now, beside the entries that are.
-				probed = a.runProbe(r.Context(), key)
+				probed = a.runProbe(r.Context(), key, taskID)
 				probed.LastPost = a.lastPost(key)
 			}
 			writeJSON(w, http.StatusOK, conversationResponse{
@@ -1790,17 +1844,18 @@ func (a *InjectAdapter) handleConversation(w http.ResponseWriter, r *http.Reques
 	}
 }
 
-// runProbe asks the gateway about a conversation and puts the answer on the
-// wire. Never a failure status: the transcript half of the reply is good
-// whatever the probe found, and a caller reads "could not look" out of the
-// report's error rather than out of a 5xx it would retry the whole poll for.
-func (a *InjectAdapter) runProbe(ctx context.Context, key string) *probeReport {
+// runProbe asks the gateway about a conversation -- the task taskID names,
+// or its active task when taskID is "" -- and puts the answer on the wire.
+// Never a failure status: the transcript half of the reply is good whatever
+// the probe found, and a caller reads "could not look" out of the report's
+// error rather than out of a 5xx it would retry the whole poll for.
+func (a *InjectAdapter) runProbe(ctx context.Context, key, taskID string) *probeReport {
 	if a.probe == nil {
 		return &probeReport{Error: "the gateway offered this door no probe"}
 	}
 	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	state, err := a.probe(ctx, key)
+	state, err := a.probe(ctx, key, taskID)
 	report := &probeReport{
 		Backend:        state.Backend,
 		InjectOnly:     state.InjectOnly,
@@ -1817,6 +1872,25 @@ func (a *InjectAdapter) runProbe(ctx context.Context, key string) *probeReport {
 		TerminalSource: string(state.TerminalSource),
 		Result:         truncateRunes(state.Result, injectMaxEntryBytes),
 		Reason:         truncateRunes(state.Reason, injectMaxEntryBytes),
+		Progress:       truncateRunes(state.Progress, injectMaxEntryBytes),
+	}
+	// Non-nil is the fact that the stream was read (ConversationState.
+	// Activity), and the pointer carries that fact onto the wire.
+	if state.Activity != nil {
+		trace := state.Activity
+		if len(trace) > injectMaxActivityEntries {
+			report.ActivityDropped = len(trace) - injectMaxActivityEntries
+			trace = trace[len(trace)-injectMaxActivityEntries:]
+		}
+		// Each entry is bounded like every other probe string: the bridge
+		// caps its inputs, the worker adapter does not, and the trace rides
+		// every poll.
+		for i := range trace {
+			if len(trace[i]) > injectMaxEntryBytes {
+				trace[i] = capActivityEntry(trace[i])
+			}
+		}
+		report.Activity = &trace
 	}
 	if !state.SubmittedAt.IsZero() {
 		report.SubmittedAt = state.SubmittedAt.UTC().Format(time.RFC3339Nano)
@@ -1826,6 +1900,147 @@ func (a *InjectAdapter) runProbe(ctx context.Context, key string) *probeReport {
 		report.Error = err.Error()
 	}
 	return report
+}
+
+// activityEntryKeys are the keys of an activity entry as both executors
+// publish it (ActivityEntry in the bridge, the worker adapter's record);
+// anything else on an over-size entry is dropped before the input is.
+var activityEntryKeys = map[string]bool{"tool": true, "input": true, "callId": true, "status": true, "errorType": true, "durationMs": true, "at": true, "dropped": true}
+
+// activityEntryNumberKeys are the entry keys whose value is a number; one
+// carrying anything else is outside the entry's shape and is dropped and
+// named like an extra key, so its bulk is never charged to the input.
+var activityEntryNumberKeys = map[string]bool{"durationMs": true, "dropped": true}
+
+// capActivityEntry replaces an over-size activity entry with a stand-in that
+// keeps what a grader reads (the tool, and a tool_call wrapper's nested
+// names) and says what was cut, in the bridge's own stand-in shape: the
+// whole input for an ordinary entry, each call's arguments for a wrapper,
+// where a call whose arguments are small is kept whole.
+func capActivityEntry(raw json.RawMessage) json.RawMessage {
+	var entry map[string]any
+	if err := json.Unmarshal(raw, &entry); err != nil {
+		return json.RawMessage(`{"tool":"","input":{"truncated":true,"bytes":` + strconv.Itoa(len(raw)) + `,"head":""}}`)
+	}
+	// First the fields beside the input, each to a small bound: an entry
+	// whose bulk is a callId or a timestamp keeps its input untouched and
+	// claims no cut of it.
+	for key, limit := range map[string]int{"tool": injectMaxEntryToolBytes, "callId": injectMaxEntryFieldBytes, "status": injectMaxEntryFieldBytes, "errorType": injectMaxEntryFieldBytes, "at": injectMaxEntryFieldBytes} {
+		if v, ok := entry[key].(string); ok {
+			entry[key] = truncateRunes(v, limit)
+		}
+	}
+	if out, err := json.Marshal(entry); err == nil && len(out) <= injectMaxEntryBytes {
+		return out
+	}
+	// Then any key outside the entry's shape (an executor's extra field, a
+	// result some adapter attached): dropped, and named, so a cut there is
+	// not charged to the input. The names are bounded too (the first
+	// injectMaxDroppedKeys, each to a field's length, then a count), so an
+	// entry whose bulk is many small extra keys ends here with its input
+	// whole and claims no cut of it.
+	var dropped []string
+	for key, v := range entry {
+		_, number := v.(float64)
+		if !activityEntryKeys[key] || (activityEntryNumberKeys[key] && !number) {
+			dropped = append(dropped, key)
+		}
+	}
+	if len(dropped) > 0 {
+		sort.Strings(dropped)
+		for _, key := range dropped {
+			delete(entry, key)
+		}
+		named := make([]string, 0, min(len(dropped), injectMaxDroppedKeys+1))
+		for _, key := range dropped[:min(len(dropped), injectMaxDroppedKeys)] {
+			named = append(named, truncateRunes(key, injectMaxEntryFieldBytes))
+		}
+		if rest := len(dropped) - injectMaxDroppedKeys; rest > 0 {
+			named = append(named, "+"+strconv.Itoa(rest)+" more")
+		}
+		entry["droppedKeys"] = named
+		if out, err := json.Marshal(entry); err == nil && len(out) <= injectMaxEntryBytes {
+			return out
+		}
+	}
+	// The input is the bulk. The tool_call wrapper keeps its nested names,
+	// each call's arguments replaced by the bridge's own stand-in shape with
+	// that call's size, and everything else inside it (a key beside calls,
+	// an element that is not a named call) kept when small and a stand-in
+	// of its own size otherwise, so every cut is said; any other input
+	// becomes the stand-in with the input's own size.
+	rawInput := entry["input"]
+	stand := map[string]any{"truncated": true, "bytes": marshalLen(rawInput), "head": ""}
+	entry["input"] = stand
+	tool, _ := entry["tool"].(string)
+	if in, ok := rawInput.(map[string]any); ok && tool == injectWrapperTool {
+		if calls, ok := in["calls"].([]any); ok {
+			kept := make(map[string]any, len(in))
+			for k, v := range in {
+				if k != "calls" {
+					kept[k] = smallOrStandIn(v)
+				}
+			}
+			names := make([]any, 0, len(calls))
+			for _, c := range calls {
+				m, isObject := c.(map[string]any)
+				n, named := m["name"].(string)
+				if !isObject || !named {
+					names = append(names, smallOrStandIn(c))
+					continue
+				}
+				// Everything of the call but its name is cut, under
+				// whatever key it sat, and the stand-in says how much;
+				// a call whose other keys are small (an empty
+				// arguments object, an id) keeps them, since there is
+				// nothing to cut.
+				call := map[string]any{"name": n}
+				size := 0
+				for k, v := range m {
+					if k != "name" {
+						size += marshalLen(v)
+					}
+				}
+				if size > injectMaxNestedCallBytes {
+					call["arguments"] = map[string]any{"truncated": true, "bytes": size, "head": ""}
+				} else {
+					for k, v := range m {
+						call[k] = v
+					}
+				}
+				names = append(names, call)
+			}
+			kept["calls"] = names
+			entry["input"] = kept
+		}
+	}
+	if out, err := json.Marshal(entry); err == nil && len(out) <= injectMaxEntryBytes {
+		return out
+	}
+	// Still over (very many nested names): the tool and the stand-in alone.
+	out, err := json.Marshal(map[string]any{"tool": tool, "input": stand})
+	if err != nil {
+		return raw[:0]
+	}
+	return out
+}
+
+// marshalLen is the JSON size of v, 0 when it does not marshal.
+func marshalLen(v any) int {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return 0
+	}
+	return len(b)
+}
+
+// smallOrStandIn keeps v when its JSON is at most injectMaxNestedCallBytes
+// and replaces it with a stand-in of its size otherwise.
+func smallOrStandIn(v any) any {
+	if n := marshalLen(v); n > injectMaxNestedCallBytes {
+		return map[string]any{"truncated": true, "bytes": n, "head": ""}
+	}
+	return v
 }
 
 // injectConversationKey validates a caller's conversation id and prefixes it.

@@ -369,9 +369,10 @@ repository through the same `resolver.py poll`, so leaving it enabled for a
 release would keep paying the 48 daily model turns the replacement exists to
 stop.
 
-Their SOPs under `../governance/` are deliberately left in place: an SOP is
-inert without a job to run it, and keeping them makes reviving a watchdog a
-roster edit rather than an archaeology exercise.
+The five retired watchdogs' SOPs are gone from `../governance/` as well — git
+history has them. An SOP is inert without a job to run it, and as written none
+of these could produce a finding on a stock install, so reviving one is a new
+SOP and a roster entry, not a restore.
 
 ## Adding a watchdog: the repository steps
 

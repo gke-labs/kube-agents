@@ -126,7 +126,7 @@ This reaches the Platform Agent directly, bypassing the front door: a request ty
 
 The other way in is the [admin console](/kube-agents/reference/admin-console/), started from a repository checkout on your own machine: its Chat page reaches the Planning Agent through the front door, so a request typed there is planned and delegated the way a chat message would be.
 
-Two things a chat-less install does not exercise. Scheduled reports and alert-driven triage are delivered only to enabled chat platforms — the delivery resolver enumerates Google Chat and Slack and nothing else — so neither arrives anywhere. And `bootstrap-inventory-delivery` waits for a human to connect over chat before it posts the first-run inventory report, so that report stays on the agent's volume at `/opt/data/INVENTORY.md`; read it with `kubectl exec` rather than waiting for it.
+Two things a chat-less install does not exercise. Scheduled reports and alert-driven triage are delivered only to enabled chat platforms — the delivery resolver enumerates Google Chat and Slack and nothing else — so neither arrives anywhere. And `bootstrap-inventory-delivery` waits for a human to connect over chat before it posts the first-run inventory report, so that report stays at `/opt/data/INVENTORY.md` on the shell sandbox pod's volume; read it with `kubectl exec -n kubeagents-system platform-agent-shell-0 -c shell -- cat /opt/data/INVENTORY.md` rather than waiting for it.
 
 ## Where to go next
 
