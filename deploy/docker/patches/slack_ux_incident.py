@@ -13,8 +13,8 @@ and the triage card's report arrives as a reply under it, so the channel
 keeps showing the alert while the diagnosis sits in the thread. With the flag
 on, the report replaces the alert in place instead: the alert message is
 edited into the report's "What's wrong" sentence, one button per option, the
-links on the report's 🔗 line as link buttons, and the whole report in a
-collapsed fold, rendered by the Slack plugin's own ``block_kit.render_blocks``,
+links on the report's 🔗 line as link buttons, and the report, up to its
+first divider, in a collapsed fold, rendered by the Slack plugin's own ``block_kit.render_blocks``,
 the renderer the threaded reply goes through when the adapter sends rich
 blocks. The message's ``text`` is the headline, the choices and then the
 whole report, because the adapter reads a thread back from ``text`` and
