@@ -234,7 +234,10 @@ func TestAParkedRefusalDoesNotReconcileContinuouslyEnvtest(t *testing.T) {
 		t.Helper()
 		for {
 			got := &agentv1alpha1.PlatformAgent{}
-			if err := reader.Get(ctx, key, got); err == nil && parked(got) {
+			if err := reader.Get(ctx, key, got); err != nil {
+				t.Fatalf("reading the PlatformAgent back via %s: %v", label, err)
+			}
+			if parked(got) {
 				return got
 			}
 			if time.Now().After(deadline) {

@@ -940,4 +940,10 @@ func TestStaleCacheLaggingInformerDoesNotWriteSyncA2AConditions(t *testing.T) {
 	if counter.writes != 0 {
 		t.Fatalf("syncA2AConditions made %d status writes on a stale cache pass, want 0: the live object already held matching status", counter.writes)
 	}
+	if len(staleAgent.Status.Conditions) == 0 {
+		t.Fatalf("syncA2AConditions did not adopt live conditions into agent; got empty conditions")
+	}
+	if staleAgent.ResourceVersion != agent.ResourceVersion {
+		t.Fatalf("syncA2AConditions did not adopt live resourceVersion into agent; got %q, want %q", staleAgent.ResourceVersion, agent.ResourceVersion)
+	}
 }

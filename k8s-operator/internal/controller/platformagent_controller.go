@@ -3272,20 +3272,35 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 		a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown) {
 		return nil
 	}
-	if r.APIReader != nil {
-		live := &agentv1alpha1.PlatformAgent{}
-		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(agent), live); err == nil {
-			wantLive := wantBusProvisioned(live, a2a)
-			if a2aGatewayConditionCurrent(live, dark) && busProvisionedConditionCurrent(live, wantLive) {
-				return nil
-			}
-		}
+	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
+		wantLive := wantBusProvisioned(live, a2a)
+		return a2aGatewayConditionCurrent(live, dark) && busProvisionedConditionCurrent(live, wantLive)
+	}) {
+		return nil
 	}
 	now := metav1.Now()
 	setA2AGatewayCondition(agent, dark, now)
 	setBusProvisionedCondition(agent, want, a2a.jobName, now)
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	return r.Status().Update(ctx, agent)
+}
+
+// liveAgentSatisfies checks whether the uncached live object already satisfies pred.
+// If it does, live state is adopted into agent (including ResourceVersion and Status)
+// so subsequent deferred writes operate on the fresh version, and returns true.
+func (r *PlatformAgentReconciler) liveAgentSatisfies(ctx context.Context, agent *agentv1alpha1.PlatformAgent, pred func(*agentv1alpha1.PlatformAgent) bool) bool {
+	if r.APIReader == nil {
+		return false
+	}
+	live := &agentv1alpha1.PlatformAgent{}
+	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(agent), live); err != nil {
+		return false
+	}
+	if pred(live) {
+		live.DeepCopyInto(agent)
+		return true
+	}
+	return false
 }
 
 // updateStatusReady writes the agent's status and returns the phase it settled on, so
@@ -4237,6 +4252,26 @@ const (
 	workloadNotRendered workloadRenderState = false
 )
 
+// degradedStatusCurrent reports whether the given PlatformAgent's status matches
+// what updateStatusDegraded would write. The comparison is keyed on phase, the Ready
+// condition's status, reason, message, and observedGeneration, plus the rendered-gated
+// VolumesDropped condition.
+func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message string, rendered workloadRenderState, hostPathDroppedMsg string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
+	if existing == nil ||
+		agent.Status.Phase != "Degraded" ||
+		existing.Status != metav1.ConditionFalse ||
+		existing.Reason != reason ||
+		existing.Message != message ||
+		existing.ObservedGeneration != agent.Generation {
+		return false
+	}
+	if !rendered {
+		return true
+	}
+	return hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg)
+}
+
 // updateStatusDegraded parks the agent on a refusal: phase Degraded, and a
 // Ready=False condition carrying the reason and message. It writes only when
 // something it is about to write differs from what the status already holds.
@@ -4261,22 +4296,6 @@ const (
 // The generation witness is the condition's observedGeneration rather than the
 // top-level field, for the reason updateStatusReady gives: a CRD that predates
 // status.observedGeneration prunes the top-level copy on every write.
-func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message string, rendered workloadRenderState, hostPathDroppedMsg string) bool {
-	existing := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
-	if existing == nil ||
-		agent.Status.Phase != "Degraded" ||
-		existing.Status != metav1.ConditionFalse ||
-		existing.Reason != reason ||
-		existing.Message != message ||
-		existing.ObservedGeneration != agent.Generation {
-		return false
-	}
-	if !rendered {
-		return true
-	}
-	return hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg)
-}
-
 //
 // rendered says whether the caller got as far as reconcileWorkload, and gates
 // the VolumesDropped condition alone -- everything else here is written either
@@ -4326,13 +4345,10 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 
 	// If the cached agent missed the status condition due to watch event lag,
 	// check the live object before attempting an Update that would conflict (409).
-	if r.APIReader != nil {
-		live := &agentv1alpha1.PlatformAgent{}
-		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(agent), live); err == nil {
-			if degradedStatusCurrent(live, reason, message, rendered, hostPathDroppedMsg) {
-				return nil
-			}
-		}
+	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
+		return degradedStatusCurrent(live, reason, message, rendered, hostPathDroppedMsg)
+	}) {
+		return nil
 	}
 
 	agent.Status.Phase = "Degraded"
