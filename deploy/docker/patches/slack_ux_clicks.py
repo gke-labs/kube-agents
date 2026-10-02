@@ -200,15 +200,24 @@ def answered_blocks(blocks: Any, answered: Any, note: str) -> list[dict]:
     return out
 
 
+def _without_choices_line(text: str) -> str:
+    """``text`` without the fallback's "Reply with one of:" line, which only its first
+    paragraph carries; the same words further down are the report's own and stay."""
+    head, _sep, rest = text.partition("\n\n")
+    head = "\n".join(line for line in head.split("\n") if not line.startswith(_presenter.CHOICES_LEAD))
+    return "\n\n".join(part for part in (head, rest) if part)
+
+
 def _answered_text(note: str, message: dict) -> str:
     """``note`` with the message's own text under it, clipped to ``SLACK_TEXT_MAX``.
 
     The adapter reads a thread back from ``text`` and top-level blocks, and an
     incident alert's report is in its ``text`` only, so replacing the text with
     the note would leave the click's own turn, and every later read of the
-    thread, without the report.
+    thread, without the report. The "Reply with one of:" line goes: it asks for
+    an answer the note already records.
     """
-    original = str(message.get("text") or "")
+    original = _without_choices_line(str(message.get("text") or ""))
     return _presenter._clip(f"{note}\n\n{original}", SLACK_TEXT_MAX) if original else note
 
 

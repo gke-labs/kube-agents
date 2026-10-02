@@ -757,6 +757,45 @@ class RuntimeTest(unittest.TestCase):
         self._answer(adapter, body, action)
         self.assertEqual(seen, [[f"✓ <@U1>: Apply Option B\n\n{report}"]])
 
+    def test_the_answered_alert_drops_its_reply_with_line_and_keeps_the_rest(self):
+        triage = {
+            "headline": "Pod OOMKilled",
+            "links": [("Cloud Logs", "https://console.cloud.google.com/logs")],
+            "choices": [("Apply Option A", "raise"), ("Apply Option B", "roll back")],
+        }
+        # The report's own line that reads like the call to action stays: only the fallback's goes.
+        report = f"Option A: raise the limit\n{presenter.CHOICES_LEAD}apply Option A or apply Option B"
+        alert = incident.message_text(triage, report)
+        self.assertEqual(alert.count(presenter.CHOICES_LEAD), 2)
+        head = incident.fallback_text(triage).rsplit("\n", 1)[0]
+        for note, check in (("✓ <@U1>: Apply Option B", ()), (runtime.ANSWERED_IN_THREAD, ("typed",))):
+            with self.subTest(note=note):
+                importlib.reload(runtime)
+                replies = [{"type": "message", "user": "U2", "text": "apply B", "ts": "223.000"}] if check else []
+                adapter = _Adapter(replies=replies)
+                body, action = _alert_choice(1, "Apply Option B")
+                body["message"]["text"] = alert
+                self._answer(adapter, body, action)
+                text = next(entry[1]["text"] for entry in adapter.log if entry[0] == "chat_update")
+                self.assertEqual(text, f"{note}\n\n{head}\n\n{report}")
+
+    def test_a_reply_with_line_alone_leaves_the_note_and_the_report(self):
+        body, action = _alert_choice(1, "Apply Option B")
+        body["message"]["text"] = f"{presenter.CHOICES_LEAD}Apply Option A\n\nthe report"
+        adapter = _Adapter()
+        self._answer(adapter, body, action)
+        update = next(entry[1] for entry in adapter.log if entry[0] == "chat_update")
+        self.assertEqual(update["text"], "✓ <@U1>: Apply Option B\n\nthe report")
+
+    def test_a_headline_quoting_the_reply_with_words_stays(self):
+        headline = f"*{presenter.CHOICES_LEAD}nobody answered*"
+        body, action = _alert_choice(1, "Apply Option B")
+        body["message"]["text"] = f"{headline}\n{presenter.CHOICES_LEAD}Apply Option A\n\nthe report"
+        adapter = _Adapter()
+        self._answer(adapter, body, action)
+        update = next(entry[1] for entry in adapter.log if entry[0] == "chat_update")
+        self.assertEqual(update["text"], f"✓ <@U1>: Apply Option B\n\n{headline}\n\nthe report")
+
     def test_typed_apply_keeps_the_report_too(self):
         adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": "apply Option B", "ts": "223.000"}])
         body, action = _alert_choice(1, "Apply Option A")
