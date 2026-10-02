@@ -2349,6 +2349,11 @@ unit_cost_hint() {
     # a plant that blocks on a card appearing, then an agent turn that waits on
     # that card finishing. A wrong hint costs packing, not correctness.
     gitops-drift-out-of-band-triage) echo 900 ;;
+    # Tofu too, and the same shape, plus a plant that waits out
+    # stall_report.py's ten-minute Deployment threshold before it posts the
+    # record and then waits for the card. 1040-1080s a repetition on a dev
+    # install on 2026-10-02.
+    autoops-controller-stall-triage) echo 1100 ;;
     # Tofu too: the plant waits for the cron job to file the sweep and for the
     # sweep's worker to file its cards and end its run (up to the stack's
     # run_wait, 900s), and the agent turn is a board read. 340-520s a

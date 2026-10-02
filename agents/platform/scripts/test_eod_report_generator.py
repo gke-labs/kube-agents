@@ -685,6 +685,28 @@ class TestLedgerLoading(unittest.TestCase):
             source,
         )
 
+    def test_stall_rows_are_not_counted_as_watcher_events(self):
+        path = self._db(
+            [
+                ("prod", "api", "OOMKilled", 1, 2),
+                ("prod", "Deployment/checkout", eod_report_generator.STALL_LEDGER_REASON, 1, 2),
+            ]
+        )
+        rows = load_intercepted_events(path, window_hours=24)
+
+        self.assertEqual(
+            [row["workload"] for row in rows],
+            ["api"],
+            "a stall row reached the event watcher's recap",
+        )
+
+    def test_the_stall_reason_matches_the_writer(self):
+        source = (Path(__file__).resolve().parent / "session_kv_server.py").read_text()
+        self.assertIn(
+            f'STALL_LEDGER_REASON = "{eod_report_generator.STALL_LEDGER_REASON}"',
+            source,
+        )
+
     def test_window_excludes_older_rows(self):
         path = self._db(
             [
