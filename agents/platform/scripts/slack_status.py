@@ -47,9 +47,11 @@ ELLIPSIS = "…"
 #: Slack markup in an ask: a user or channel mention, and a link with or
 #: without its label. Mentions go; a channel keeps its name, a link its label,
 #: and a bare link goes too, since every ``:`` and ``/`` in it would be replaced.
-MENTION = re.compile(r"<[@!][^>]*>")
-CHANNEL = re.compile(r"<#[A-Z0-9]+\|([^>]*)>")
-LINK = re.compile(r"<([^>|]+)(?:\|([^>]*))?>")
+#: No set takes ``<``: Slack never nests it, and a set that did would rescan to the
+#: end of the ask from every unclosed ``<``, quadratic on the gateway's event loop.
+MENTION = re.compile(r"<[@!][^<>]*>")
+CHANNEL = re.compile(r"<#[A-Z0-9]+\|([^<>]*)>")
+LINK = re.compile(r"<([^<>|]+)(?:\|([^<>]*))?>")
 WHITESPACE = re.compile(r"\s+")
 REPEATED_COMMA = re.compile(r"\s*,[\s,]*")
 

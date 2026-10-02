@@ -2,6 +2,7 @@
 
 import ast
 import sys
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +10,10 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import slack_status as s
+
+#: Slack's cap on a message's text, and how long a title of one that size may take.
+SLACK_MESSAGE_MAX = 40_000
+LINEAR_BUDGET_SECONDS = 1.0
 
 
 def _row(task_id="t_a", title="check payments", lines=(), status=s.TASK_RUNNING):
@@ -118,6 +123,27 @@ class SessionTest(unittest.TestCase):
     def test_title(self):
         self.assertEqual(s.session_title("<@U1> is <#C1|prod> ok: <https://a.b/c>"), "is #prod ok")
         self.assertLessEqual(len(s.session_title("x" * 200)), s.TITLE_MAX)
+
+    def test_title_keeps_what_real_markup_gives(self):
+        cases = {
+            "is <@U123> ok with <#C1|ops> and <https://x.example/a|the doc> or <https://y.example>?": (
+                "is ok with #ops and the doc or ?"
+            ),
+            "check <!here> <!subteam^S1|@oncall> kube-system/coredns: now": "check kube-system\u2215coredns, now",
+        }
+        for ask, title in cases.items():
+            with self.subTest(ask=ask):
+                self.assertEqual(s.session_title(ask), title)
+
+    def test_title_stays_linear_on_unclosed_markup(self):
+        # It runs on the gateway's event loop: a pattern that rescans to the end from every
+        # "<" took 29 s on a 40 KB ask of bare "<", stalling every thread.
+        for unit in ("<", "<!", "<@", "<#A|", "<a|"):
+            with self.subTest(unit=unit):
+                ask = unit * (SLACK_MESSAGE_MAX // len(unit))
+                start = time.monotonic()
+                s.session_title(ask)
+                self.assertLess(time.monotonic() - start, LINEAR_BUDGET_SECONDS)
 
 
 if __name__ == "__main__":
