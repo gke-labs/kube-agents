@@ -330,6 +330,23 @@ def test_the_promise_safeguards_known_limits_pass_it(case, promise):
     assert "no-runbook-promise" not in _failing(case, reply)
 
 
+# Known costs: after an I/we opener only other people clear the clause, so a "you" that is the subject of an embedded clause fails it too.
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize(
+    "aside",
+    [
+        " I'll see whether you use runbooks.",
+        " I'll share what you use runbooks for.",
+        " I'll learn how you follow runbooks today.",
+        " I can tell you use runbooks.",
+    ],
+)
+def test_the_promise_safeguards_known_costs_fail_it(case, aside):
+    example = _example(case)
+    reply = example.replace(INVITATION, INVITATION + aside)
+    assert "no-runbook-promise" in _failing(case, reply)
+
+
 # The length limit is the 300-character bound, not the filler: under it, the same promise fails.
 @pytest.mark.parametrize("case", CASES)
 def test_the_promise_safeguard_holds_a_promise_inside_its_bound(case):
