@@ -322,6 +322,28 @@ class NeedsYouTest(unittest.TestCase):
         self.assertEqual(blocks[0]["text"]["text"], "*Which namespace?*")
         self.assertEqual([b["value"] for b in _buttons(blocks)], ["default", "prod"])
 
+    def test_an_italic_question_keeps_its_buttons_and_loses_its_underscores(self):
+        blocks, text = m.needs_you("_Which cluster should I drain?_\n- seeded-a\n- seeded-b")
+        self.assertEqual(blocks[0]["text"]["text"], "*Which cluster should I drain?*")
+        self.assertEqual([b["value"] for b in _buttons(blocks)], ["seeded-a", "seeded-b"])
+        self.assertNotIn("_", text)
+        blocks, _ = m.needs_you("Which pool?\n- _gpu-pool_\n- node_pool")
+        self.assertEqual([b["value"] for b in _buttons(blocks)], ["gpu-pool", "node_pool"])
+
+    def test_a_fenced_block_before_the_question_stays_in_the_detail(self):
+        table = "```\nNAME   READY\nweb-1  0/1\n```"
+        blocks, _ = m.needs_you(f"{table}\nWhich pod should I restart?\n- web-1\n- web-2")
+        self.assertEqual(blocks[0]["text"]["text"], "*Which pod should I restart?*")
+        self.assertEqual([b["value"] for b in _buttons(blocks)], ["web-1", "web-2"])
+        self.assertEqual(_contexts(blocks), [table, m.WAITING])
+
+    def test_the_detail_fits_slacks_limit_once_escaped(self):
+        blocks, _ = m.needs_you("Question\n" + "<a> " * 400)
+        detail = _contexts(blocks)[0]
+        self.assertLessEqual(len(detail), m.DETAIL_MAX)
+        self.assertTrue(detail.endswith("…"))
+        self.assertIn("&lt;a&gt;", detail)
+
     def test_no_buttons_keeps_the_options_in_the_text(self):
         reason = "Which checkout-gateway did you mean?\n- seeded-reliability\n- seeded-debug"
         blocks, text = m.needs_you(reason, buttons=False)

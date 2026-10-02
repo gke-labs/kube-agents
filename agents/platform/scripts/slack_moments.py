@@ -104,12 +104,12 @@ OUR_VERB = frozenset({
 #: The worker's line under the headline, clipped: a note can be one long
 #: paragraph, and a Slack context element holds at most 3,000 characters.
 EVIDENCE_MAX = 300
-#: Markup a button cannot show, stripped from an option with its pair only, so
-#: a glob (``app=web-*``) or a dunder name keeps its characters.
-OPTION_MARKUP = re.compile(r"`([^`]+)`|\*\*([^*]+)\*\*")
-#: The same for the question's headline, plus a paired ``*emphasis*``.
-HEADLINE_MARKUP = re.compile(
+#: Markup a button or headline cannot show, stripped with its pair only, so a
+#: glob (``app=web-*``) or a dunder name (``__init__``) keeps its characters:
+#: ``code``, ``**bold**``, a paired ``*emphasis*`` and ``_emphasis_``.
+PAIRED_MARKUP = re.compile(
     r"`([^`]+)`|\*\*([^*]+)\*\*|(?<![\w*])\*(?=\S)([^*]+?)(?<=\S)\*(?![\w*])"
+    r"|(?<![\w_])_(?=\S)([^_]+?)(?<=\S)_(?![\w_])"
 )
 
 PR_HEADLINE = "I opened PR #{number} in {repo}. It's yours to review."
@@ -275,8 +275,8 @@ def pr_opened(url: str, repo: str, number: str, line: str) -> tuple[list[dict], 
     return _with_subline(blocks, evidence), "\n".join([_text(first, evidence), *rest])
 
 
-def _unmarked(option: str) -> str:
-    return OPTION_MARKUP.sub(lambda m: m.group(1) or m.group(2), option).strip()
+def _unmarked(text: str) -> str:
+    return PAIRED_MARKUP.sub(lambda m: next(g for g in m.groups() if g is not None), text).strip()
 
 
 def _headline_text(headline: str) -> str:
@@ -286,7 +286,7 @@ def _headline_text(headline: str) -> str:
     text = _presenter.HEADING.sub("", headline.strip())
     text = _presenter.LIST_MARKER.sub("", text)
     text = _presenter.MD_LINK.sub(r"\1", text)
-    return HEADLINE_MARKUP.sub(lambda m: m.group(1) or m.group(2) or m.group(3), text).strip()
+    return _unmarked(text)
 
 
 def _trailing_options(lines: Sequence[str]) -> tuple[int, list[str]]:
@@ -314,16 +314,32 @@ def _live_markup(text: str) -> bool:
     return "`" in text or bool(_presenter.FALLBACK_LIVE_MARKER.search(text) or _presenter.MD_ITALIC.search(text))
 
 
+def _first_text_line(lines: Sequence[str], fences: bool) -> int | None:
+    """The index of the first line with text, outside a fence when ``fences``."""
+    fence = None
+    for index, line in enumerate(lines):
+        opened = _presenter.next_fence(line, fence) if fences else None
+        if opened is None and not _presenter.FENCE.match(line) and any(
+            ch.isalnum() for ch in _presenter._plain(line)
+        ):
+            return index
+        fence = opened
+    return None
+
+
 def _question(reason: str, buttons: bool) -> tuple[str, list[str], list[str]]:
     """The reason's first line, the lines after it, and its options when they can be buttons."""
     lines = str(reason or "").strip().splitlines()
-    # A line of markup alone (a bare "```") has no text to head the question.
-    while lines and (
-        not any(ch.isalnum() for ch in _presenter._plain(lines[0])) or _presenter.FENCE.match(lines[0])
-    ):
-        lines.pop(0)
-    if not lines:
+    # The headline is the first line of text outside a fence; a line of markup
+    # alone (a bare "```") has none, and a fenced block before it stays in the
+    # detail. A fence that never closes is a stray opener, not code.
+    head = _first_text_line(lines, fences=True)
+    before = lines[:head] if head is not None and any(_presenter.FENCE.match(line) for line in lines[:head]) else []
+    if head is None:
+        head = _first_text_line(lines, fences=False)
+    if head is None:
         return "", [], []
+    lines = lines[head:]
     start, options = _trailing_options(lines)
     usable = buttons and OPTIONS_MIN <= len(options) <= OPTIONS_MAX and all(
         len(option) <= _presenter.BUTTON_TEXT_MAX for option in options
@@ -333,14 +349,22 @@ def _question(reason: str, buttons: bool) -> tuple[str, list[str], list[str]]:
     first = lines[0].strip()
     # A clipped headline keeps its whole line below it too.
     below = 0 if len(first) > _presenter.HEADLINE_MAX else 1
-    return first, lines[below:start], options
+    return first, [*before, *lines[below:start]], options
 
 
 def _detail(lines: Sequence[str]) -> str:
+    """``lines`` as one text, clipped so that it is at most :data:`DETAIL_MAX` once
+    escaped: Slack counts ``&amp;``, ``&lt;`` and ``&gt;`` against the limit."""
     text = "\n".join(lines).strip()
-    if len(text) > DETAIL_MAX:
-        text = text[: DETAIL_MAX - len(_presenter.ELLIPSIS)].rstrip() + _presenter.ELLIPSIS
-    return text
+    if len(_escape(text)) <= DETAIL_MAX:
+        return text
+    budget, end = DETAIL_MAX - len(_presenter.ELLIPSIS), 0
+    for ch in text:
+        budget -= len(_escape(ch))
+        if budget < 0:
+            break
+        end += 1
+    return text[:end].rstrip() + _presenter.ELLIPSIS
 
 
 def needs_you(reason: str, buttons: bool = True) -> tuple[list[dict], str] | None:
