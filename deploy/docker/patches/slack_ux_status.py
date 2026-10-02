@@ -793,3 +793,33 @@ async def settle_row(adapter: Any, sub: dict, kind: str) -> None:
         sender = plan
     if sender is not None:
         await _session(adapter, key, sender)
+    elif plan is None and not _lapsed.get(key):
+        await _settle_orphan(adapter, sub, key, status, done)
+
+
+async def _settle_orphan(adapter: Any, sub: dict, key: tuple, status: str | None, done: bool) -> None:
+    """Clear or suspend the session for a card no plan in this process holds.
+
+    After a gateway restart Slack still shows the Working… the old process
+    set, and no plan is left to clear it. A settled card closes the session
+    and one waiting on the user suspends it; a running or retried card leaves
+    it. :func:`set_thread_status` skips a status it already sent, so this goes
+    once, and a Planning Agent turn holding the session in this process is
+    left to clear it itself.
+    """
+    if done:
+        wanted = _status.SESSION_CLOSED
+    elif status == _status.TASK_PENDING:
+        wanted = _status.SESSION_SUSPENDED
+    else:
+        return
+    sent = _sessions.get(key)
+    setter = getattr(adapter, "_set_thread_status", None)
+    if setter is None or (sent and sent[0] == _status.SESSION_PROCESSING):
+        return
+    chat_id, thread_ts = key
+    phrase = "" if wanted == _status.SESSION_CLOSED else wanted
+    try:
+        await setter(chat_id, str(sub.get("team_id") or ""), thread_ts, phrase, PLAN_STATUS_LABEL)
+    except Exception as exc:  # noqa: BLE001 — cosmetic
+        logger.debug("slack_ux_status: setting the session status after a restart failed: %s", exc)
