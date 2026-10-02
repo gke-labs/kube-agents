@@ -184,6 +184,10 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
     team_id, action_id, _value, message, msg_ts, channel_id, _user_name, user_id = started
     label = _shown_text(action)
     if not (label and msg_ts and channel_id and user_id):
+        logger.warning(
+            "slack_ux_clicks: dropping a %s click on %s with no button text, message ts, channel or user",
+            kind, msg_ts or "an unknown message",
+        )
         return
     if _gated_out(adapter, channel_id):
         logger.info("slack_ux_clicks: ignoring a %s click in %s, which the adapter ignores", kind, channel_id)

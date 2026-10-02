@@ -432,8 +432,10 @@ class RuntimeTest(unittest.TestCase):
         adapter = _Adapter()
         body, action = _choice()
         del action["text"]
-        self._answer(adapter, body, action)
+        with self.assertLogs(runtime.logger, level="WARNING") as logs:
+            self._answer(adapter, body, action)
         self.assertEqual(adapter.log, [])
+        self.assertTrue(any("dropping a kage choice click" in line for line in logs.output))
 
     def test_command_shaped_label_is_an_answer_not_a_command(self):
         for label in ("/stop", "!approve"):
