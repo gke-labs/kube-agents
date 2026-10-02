@@ -28,7 +28,8 @@ findings count that is not of the listed ones ("I also flagged 18 issues",
 "Plus, I found 18 issues", "18 issues also need attention") or "remain" ending its clause ("18 findings remain, mostly low"), so
 "These 2 findings are the only ones; ask me for more detail" restates the list.
 A bare "22 findings" is otherwise a closing line's, not a roll-up's, unless a
-colon follows it ("4 issues in 2 namespaces: ..."). A count it states for the whole roll-up
+colon follows it ("4 issues in 2 namespaces: ...") and the count is not an offer's ("I can open 2
+issues: one per cluster"). A count it states for the whole roll-up
 wins ("18 more items: 2 high, 16 low" is 18, not 36): its "<n> more" unless,
 within two words and past no preposition or article, a scope noun follows it
 with its own findings count ("2 more clusters with 9 findings" counts
@@ -343,8 +344,17 @@ OFFER_VERB = frozenset({"fix", "open", "patch", "remediate", "address", "resolve
 #: The verbs that make a count before a colon an offer, with :data:`OFFER_MODAL`
 #: before them: "Shall I raise 2 items: ...".
 OFFER_COLON_VERB = OFFER_VERB | {"file", "raise", "create"}
-#: The verb, after an optional "also", just before an offered count.
-OFFER_TAIL = re.compile(r"(?:\balso\s+)?\b(?P<verb>[a-z]+)\s+$", re.IGNORECASE)
+#: What comes before an offer's verb: a modal, its subject, and "also" or "go
+#: ahead and" ("Would you like me to go ahead and open 2 issues: ...").
+OFFER_LEAD = re.compile(
+    r"(?:\b(?:can|could|(?:want|like)\s+me\s+to|will|would|may|might|should|shall)|['’](?:ll|d))"
+    r"\s+(?:(?:i|we|you)\s+)?(?:also\s+|go\s+ahead\s+and\s+)?$",
+    re.IGNORECASE,
+)
+#: How far back from a count before a colon :func:`_offered` reads, and how
+#: many words may stand between the offer's verb and the count ("file tickets for").
+OFFER_COLON_LOOKBACK = 64
+OFFER_OBJECT_WORDS = 3
 #: How far back from "also" :data:`OFFER_MODAL` reads.
 OFFER_LOOKBACK = 24
 #: How far back from a count :func:`_loose_rollup` reads, so a long paragraph of
@@ -417,13 +427,17 @@ def _loose_rollup(text: str, listed: int | None = None) -> bool:
 
 
 def _offered(text: str, start: int) -> bool:
-    """Whether the count at ``start`` is an offer's: a modal, maybe "also", and a verb of :data:`OFFER_COLON_VERB`."""
-    before = text[max(0, start - OFFER_LOOKBACK) : start]
-    tail = OFFER_TAIL.search(before)
-    if not tail:
-        return False
-    modal = OFFER_MODAL.search(before[: tail.start()])
-    return bool(modal) and bool(modal.group("always") or tail.group("verb").lower() in OFFER_COLON_VERB)
+    """Whether the count at ``start`` is an offer's: :data:`OFFER_LEAD`, then a verb of :data:`OFFER_COLON_VERB`.
+
+    Up to :data:`OFFER_OBJECT_WORDS` words may follow the verb ("open up 2
+    issues", "file tickets for 2 issues"); "I can see 18 issues: ..." is no offer.
+    """
+    clause = CLAUSE_BREAK.split(text[max(0, start - OFFER_COLON_LOOKBACK) : start])[-1]
+    words = list(re.finditer(r"[A-Za-z]+", clause))
+    return any(
+        word.group(0).lower() in OFFER_COLON_VERB and OFFER_LEAD.search(clause[: word.start()])
+        for word in words[-(OFFER_OBJECT_WORDS + 1) :]
+    )
 
 
 def _marked(text: str) -> bool:

@@ -280,14 +280,19 @@ async def set_thread_status(
     """
     wanted = _status.session_status(status)
     key = (str(chat_id), str(thread_ts))
+    orphan = False
     if wanted == _status.SESSION_CLOSED:
         # A Planning Agent turn ends with a clear; the thread's plan outlives it.
-        wanted = _plan_session(*key) or _orphan_waits.pop(key, "") or wanted
+        planned = _plan_session(*key)
+        orphan = not planned and key in _orphan_waits
+        wanted = planned or _orphan_waits.get(key, "") or wanted
     sent = _sessions.get(key)
     now = time.monotonic()
     if sent and sent[0] == wanted and (
         wanted != _status.SESSION_PROCESSING or now - sent[1] < SESSION_REFRESH_SECONDS
     ):
+        if orphan:
+            _orphan_waits.pop(key, None)
         return
     client = adapter._get_client(chat_id, team_id=team_id)
     try:
@@ -295,6 +300,9 @@ async def set_thread_status(
     except Exception as exc:  # noqa: BLE001 — upstream debug-logs its own failures too
         logger.debug("[Slack] agents.sessions.setStatus %s: %s", fail_label, exc)
         return
+    if orphan:
+        # Read once, and only once sent, so a refused send leaves it for the retry.
+        _orphan_waits.pop(key, None)
     if not sent or sent[0] != wanted:
         logger.info("slack_ux_status: session %s in %s/%s", wanted, chat_id, thread_ts)
     _remember(_sessions, key, (wanted, now), SESSIONS_MAX)

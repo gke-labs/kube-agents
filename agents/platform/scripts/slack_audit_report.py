@@ -572,10 +572,11 @@ def _ledger_line(report: str) -> str:
 
     The last line, the SOPs' one line. When the last is only the link, labelled
     (whatever the label says) or bare, the last unindented line above it that
-    carries a count and is not a list item: the SOPs' line sits just above the
-    link, an orienting sentence the relay turn put at the top may carry a date,
-    and a finding row, or the evidence indented under it, is not the report's
-    line. Empty when no line qualifies.
+    is not a list item and reads as an audit line (its coverage, a findings
+    total or a change count), else the last such line that carries any count:
+    an orienting sentence may carry a date, a line after the audit line may
+    list pull requests or the next run, and a finding row, or the evidence
+    indented under it, is not the report's line. Empty when no line qualifies.
     """
     lines = [line for line in report.splitlines() if line.strip()]
     if not lines:
@@ -584,10 +585,12 @@ def _ledger_line(report: str) -> str:
     last = "" if BARE_URL_LINE.match(end) or TRAILING_LEDGER.match(end) else _fallback_line(lines[-1])
     if last:
         return last
-    for line in reversed(lines[:-1]):
-        if COUNTS_DIGIT.search(line) and not line[:1].isspace() and not LIST_MARKER.match(line):
-            return _fallback_line(line)
-    return ""
+    counted = [
+        line for line in lines[:-1]
+        if COUNTS_DIGIT.search(line) and not line[:1].isspace() and not LIST_MARKER.match(line)
+    ]
+    shaped = [line for line in counted if COVERAGE.search(line) or FINDINGS_TOTAL.search(line) or CHANGE_COUNT.search(line)]
+    return _fallback_line((shaped or counted)[-1]) if counted else ""
 
 
 def headline_fallback(report: str, ref: LedgerRef) -> str | None:

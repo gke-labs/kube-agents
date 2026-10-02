@@ -753,6 +753,13 @@ class PlanTest(_RuntimeCase):
         _run(runtime.settle_row(adapter, _sub(), "completed"))
         self.assertEqual(self._sent(adapter), ["suspended", "closed"])
 
+    def test_a_wait_whose_send_fails_is_still_a_wait_on_the_next_clear(self):
+        adapter = _Adapter(_Client(fail={"setStatus"}))
+        _run(runtime.settle_row(adapter, _sub(), "blocked"))
+        adapter.client.fail.clear()
+        _run(adapter._set_thread_status(CHANNEL, TEAM, THREAD, "", "turn"))
+        self.assertEqual(self._sent(adapter), ["suspended", "suspended"])
+
     def test_a_wait_after_a_restart_sends_the_legacy_setter_only_a_clear(self):
         # Without Agent Sessions upstream's setter shows its text as is.
         adapter = _LegacyAdapter()

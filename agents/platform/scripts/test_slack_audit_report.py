@@ -685,6 +685,9 @@ class LedgerLineTest(unittest.TestCase):
             f"{LINE}\nLedger:\n<{LEDGER}>",
             f"{LINE} —\n[#231]({LEDGER})",
             f"Here's the 2026-10-02 security audit.\n{LINE}\nLedger: {LEDGER}",
+            f"{LINE}\nRemediation PRs: #240, #241.\nLedger: {LEDGER}",
+            f"{LINE}\n2 remediation pull requests are open.\nLedger: {LEDGER}",
+            f"{LINE}\nNext run 2026-10-03 06:00 UTC.\nLedger: {LEDGER}",
         ):
             with self.subTest(report=report):
                 self.assertEqual(sar.ledger_ref(report), REF)

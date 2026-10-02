@@ -92,8 +92,8 @@ the relayed line's "<n> new" count ("2 are new since the last run.") and a lead 
 the rows; then the top two findings; then the ledger link. The relayed line itself, which alone carries
 resolved counts and remediation pull requests, is left off the headline and goes
 in its thread. The relayed line is the report's last line; when that line is only the ledger link,
-the last unindented line above it that carries a count and is not a list item stands in
-for it. When the issue cannot be read, is closed (a clean run closes it without
+the last unindented, non-list line above it that reads as the audit line (its coverage, a
+findings total or a change count) stands in for it, else the last such line with any count. When the issue cannot be read, is closed (a clean run closes it without
 rewriting its title), or does not parse, the leg posts the relayed line in bold
 with the link. Not parsing includes a title of 0 findings, a "<n> new" above the
 title's count, a title whose count disagrees with the finding total the relayed
