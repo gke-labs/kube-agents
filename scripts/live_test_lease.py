@@ -853,7 +853,7 @@ MAKE_TARGETS_MUTATING = {
     "deploy", "undeploy", "install", "uninstall", "run", "dev-rebuild-agent",
     "docker-push", "mirror-images", "tf-apply", "tf-destroy",
 }
-MAKE_TARGET_PREFIXES = ("deploy-", "undeploy-", "docker-push-")
+MAKE_TARGET_PREFIXES = ("deploy-", "undeploy-")
 
 # Installer flags that print and exit without touching the install. Taking an
 # hour-long lease on a shared cluster for `./install.sh --help` is the same
