@@ -274,6 +274,11 @@ class SplitAnswerTest(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertEqual(sp.split_answer(line)[0], headline)
 
+    def test_an_answer_no_before_a_number_runs_into_the_next_sentence(self):
+        # Known limit. Ending at "no." after "is" or ":" also cuts "Deploy is no. 1 priority." and
+        # "We are no. 2 in the queue.", so "No." before a number stays a number, as "max." does.
+        self.assertEqual(sp.split_answer("The answer is no. 3 pods are down.")[0], "The answer is no. 3 pods are down.")
+
     def test_many_abbreviations_stay_linear(self):
         line = "See e.g. A " * 4000 + "end."
         started = time.monotonic()
