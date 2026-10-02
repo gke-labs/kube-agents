@@ -97,8 +97,9 @@ INCIDENT_WORDS = re.compile(
     re.IGNORECASE,
 )
 #: A Slack user or channel mention, stripped before the opener check so
-#: "<@U123> is it down?" still reads as a question.
-MENTION = re.compile(r"<[@#!][^>]*>")
+#: "<@U123> is it down?" still reads as a question. A token holds no "<", so a
+#: run of unclosed "<!" fails at the next one rather than scanning to the end.
+MENTION = re.compile(r"<[@#!][^<>]*>")
 FIRST_WORD = re.compile(r"[A-Za-z']+")
 
 

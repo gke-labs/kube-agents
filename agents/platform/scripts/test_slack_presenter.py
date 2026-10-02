@@ -5,6 +5,7 @@ Run: python3 -m pytest agents/platform/scripts/test_slack_presenter.py
 
 import os
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -12,6 +13,11 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import slack_presenter as sp
+
+#: Slack's cap on a message's text, and how long one ask that size may take to read: it is
+#: read on the gateway's event loop, so every thread waits on it.
+SLACK_MESSAGE_MAX = 40_000
+ARRIVAL_BUDGET_SECONDS = 0.1
 
 
 class FlagTest(unittest.TestCase):
@@ -76,6 +82,14 @@ class ArrivalReactionTest(unittest.TestCase):
     def test_change_beats_incident_and_question(self):
         self.assertEqual(sp.arrival_reaction("prod is down, roll back now"), "hammer_and_wrench")
         self.assertEqual(sp.arrival_reaction("should we scale down?"), "hammer_and_wrench")
+
+    def test_a_run_of_unclosed_mentions_is_read_fast(self):
+        # A mention match scanning to the end from every "<" took 0.37 s on these.
+        for unit in ("<!", "<@", "<#"):
+            with self.subTest(unit=unit):
+                start = time.monotonic()
+                self.assertEqual(sp.arrival_reaction(unit * (SLACK_MESSAGE_MAX // len(unit))), "eyes")
+                self.assertLess(time.monotonic() - start, ARRIVAL_BUDGET_SECONDS)
 
 
 class SettleReactionTest(unittest.TestCase):
