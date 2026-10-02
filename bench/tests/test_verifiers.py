@@ -2969,6 +2969,40 @@ def test_half_a_lease_window_is_no_window(token, github, lease, monkeypatch, uns
     assert "no lease window in the environment" in res.reason
 
 
+def test_a_lease_window_older_than_a_job_is_no_window(token, github, lease, monkeypatch):
+    """A stamp inherited from a shell or a stale job environment is not this
+    job's: a month-old window would admit every leftover the minter App ever
+    left in the repository, so it reads as no window and the reason says so."""
+    monkeypatch.setenv(verifiers.LEASE_START_ENV, "2026-07-01T00:00:00Z")
+    _stash_pr_report()
+    _sibling_routes(github)
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "no lease window in the environment" in res.reason
+    assert "longer than any one job's lease (24h), so not this job's window" in res.reason
+
+
+def test_a_date_only_lease_stamp_is_bounded_too(token, github, lease, monkeypatch):
+    """`2026-08-19` parses as midnight UTC; two days before the run it is past
+    the bound and reads as none, where a day-wide window would have passed
+    the day's leftovers."""
+    monkeypatch.setenv(verifiers.LEASE_START_ENV, "2026-08-19")
+    _stash_pr_report()
+    _sibling_routes(github)
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "longer than any one job's lease" in res.reason
+
+
+def test_a_lease_window_that_begins_after_the_run_is_no_window(token, github, lease, monkeypatch):
+    monkeypatch.setenv(verifiers.LEASE_START_ENV, "2026-08-21T10:00:00Z")
+    _stash_pr_report()
+    _sibling_routes(github)
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "begins after this run started" in res.reason
+
+
 def test_an_unreadable_window_start_is_no_window(token, github, lease, monkeypatch):
     """The strict reading: nothing passes as a sibling on a clock the check
     cannot parse."""

@@ -581,9 +581,10 @@ class CallSiteTest(unittest.TestCase):
         exported = src.index(f"\nexport {names['LEASED_REPO_ENV']}\n")
         # The window's start is the run's own wall-clock stamp, taken once.
         clock = src.index("EVAL_RUN_STARTED_AT=\"$(date -u +'%Y-%m-%dT%H:%M:%SZ')\"")
-        stamped = src.index(
-            f"export {names['LEASE_START_ENV']}=\"${{{names['LEASE_START_ENV']}:-${{EVAL_RUN_STARTED_AT}}}}\""
-        )
+        # ...and not inherited from the environment: a stamp from elsewhere
+        # would widen the window onto every leftover.
+        stamped = src.index(f"export {names['LEASE_START_ENV']}=\"${{EVAL_RUN_STARTED_AT}}\"")
+        self.assertNotIn(f"${{{names['LEASE_START_ENV']}:-", src)
         matrix = src.index("# 6. Task Matrix Execution Loop")
         self.assertLess(derived, exported)
         self.assertLess(exported, matrix)

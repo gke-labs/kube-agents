@@ -510,9 +510,10 @@ the runner's. Created during the run passes, and so does updated during it: the
 skill derives the branch from the change, so a later repetition pushes onto the branch the first
 one used and edits the pull request already open on it. The stamp cannot decide on its own — it
 moves on a comment as readily as on a push — so the check also reads the head commit, and fails a
-pull request that changes no files or whose head commit predates the run. That is what makes
-repetitions inside one lease gradable: rep 2 pushing onto rep 1's branch moves the head commit,
-rep 2 quoting rep 1's URL does not. A Prow periodic (`hack/ci_sweep_agent_pulls.py --pool`, run
+pull request that changes no files or whose head commit predates the run. That is the first of two
+rules, and on a hand run the only one: rep 2 pushing onto rep 1's branch moves the head commit,
+rep 2 quoting rep 1's URL does not. Inside an eval job the second rule, two paragraphs down, passes
+the quoted sibling too and names itself in the reason. A Prow periodic (`hack/ci_sweep_agent_pulls.py --pool`, run
 from `main` only) closes the agent's leftovers in free pool projects every ten minutes and deletes
 their branches (a leftover branch refuses an identical fix "nothing to commit"), so a lease
 rarely inherits one; when it does, the head-commit check is what keeps it from grading.

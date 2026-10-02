@@ -403,6 +403,11 @@ LEDGER_TOKEN_ENV_VARS = ("BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
 # two names to the script's exports.
 LEASED_REPO_ENV = "EVAL_LEDGER_REPO"
 LEASE_START_ENV = "EVAL_LEASE_STARTED_AT"
+# How far before a repetition's start the window may begin and still be this
+# job's. The script stamps it at its own start, and a nightly's last
+# repetition runs hours later, never a day; a stamp older than this came from
+# somewhere else and is read as no window (PullRequestOpenedVerifier.verify).
+LEASE_WINDOW_MAX_SEC = 24 * 3600
 
 # The two ways `pull_request_opened` passes, as the reason's first word and as
 # `raw["rule"]`, so the run record and the Cases page can tell them apart.
@@ -1800,6 +1805,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         author: str,
         lease_repo: str,
         lease_start: datetime | None,
+        fault: str | None = None,
     ) -> str | None:
         """Why a pull request is NOT an in-job sibling, or None when it is one.
 
@@ -1820,6 +1826,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
             return (
                 f"no lease window in the environment ({LEASED_REPO_ENV} and "
                 f"{LEASE_START_ENV}), so no in-job sibling can pass"
+                + (f"; {fault}" if fault else "")
             )
         if f"{owner}/{repo}".lower() != lease_repo:
             return f"not in the leased repository {lease_repo}, so not an in-job sibling"
@@ -1916,6 +1923,29 @@ class PullRequestOpenedVerifier(BaseVerifier):
             )
 
         started = datetime.fromtimestamp(snap.started_at, tz=timezone.utc)
+        # The window must be this job's: it is stamped at the script's start,
+        # and a repetition runs hours after that at most. A stamp from
+        # elsewhere (a shell, a stale job environment, a date with no time)
+        # would widen the window onto every leftover, so one outside the
+        # bounds is read as no window, with the reason.
+        window_fault: str | None = None
+        if lease_start is not None:
+            ahead = (lease_start - started).total_seconds()
+            if ahead > self.max_clock_skew_sec:
+                window_fault = (
+                    f"{LEASE_START_ENV}={lease_start.isoformat()} begins after this run "
+                    f"started ({started.isoformat()}), which no job's lease does, so it "
+                    "is read as no window"
+                )
+                lease_start = None
+            elif -ahead > LEASE_WINDOW_MAX_SEC:
+                window_fault = (
+                    f"{LEASE_START_ENV}={lease_start.isoformat()} is {-ahead / 3600:.0f}h "
+                    f"before this run started ({started.isoformat()}), longer than any one "
+                    f"job's lease ({LEASE_WINDOW_MAX_SEC // 3600}h), so not this job's "
+                    "window and read as none"
+                )
+                lease_start = None
         budget = single_call_timeout(timeout_sec)
         rejected: list[str] = []
         # A candidate the API cannot answer for only ends the check if nothing
@@ -1967,7 +1997,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
             # PR_BOT_LOGIN_SUFFIX. Missing reads as nobody, which is no bot.
             author = str((payload.get("user") or {}).get("login") or "")
             not_sibling = self._not_in_job(
-                owner, repo, created, author, lease_repo, lease_start
+                owner, repo, created, author, lease_repo, lease_start, window_fault
             )
             # Creation is not the only way a run owns a pull request: the
             # submit-suggestion skill derives the branch from the change, so a
@@ -1984,13 +2014,17 @@ class PullRequestOpenedVerifier(BaseVerifier):
             touched = updated if updated and updated > created else created
             age = (started - touched).total_seconds()
             stale_write = age > self.max_clock_skew_sec
-            if stale_write and not_sibling:
-                rejected.append(
+
+            def quoted_leftover(why: str) -> str:
+                return (
                     f"{slug}: last written at {touched.isoformat()}, {age:.0f}s "
                     f"BEFORE this run started ({started.isoformat()}) — a leftover "
                     "an earlier run opened, which this run either quoted or "
-                    f"resubmitted unchanged; {not_sibling}"
+                    f"resubmitted unchanged; {why}"
                 )
+
+            if stale_write and not_sibling:
+                rejected.append(quoted_leftover(not_sibling))
                 continue
             # What the stamp above cannot say: whether the run pushed a fix or
             # only wrote to a pull request. `updated_at` moves on a comment and
@@ -2011,14 +2045,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
             # whether it is the agent's. A candidate the first half already
             # rejected keeps that reason.
             if not_sibling is None:
-                not_sibling = self._not_agent_head(pull or payload, owner, repo)
+                not_sibling = self._not_agent_head(pull, owner, repo)
                 if not_sibling and stale_write:
-                    rejected.append(
-                        f"{slug}: last written at {touched.isoformat()}, {age:.0f}s "
-                        f"BEFORE this run started ({started.isoformat()}) — a leftover "
-                        "an earlier run opened, which this run either quoted or "
-                        f"resubmitted unchanged; {not_sibling}"
-                    )
+                    rejected.append(quoted_leftover(not_sibling))
                     continue
             if changed == 0:
                 rejected.append(
@@ -2101,7 +2130,8 @@ class PullRequestOpenedVerifier(BaseVerifier):
             )
         return done(
             False,
-            "none of the pull request URLs the report names is one this run opened: "
+            "none of the pull request URLs the report names passes as this run's own push "
+            "or as an in-job sibling: "
             + "; ".join(rejected),
         )
 
