@@ -4271,7 +4271,7 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	//     Session KV database is read, read-only, to tell an alert's thread
 	//     from any other; and before an option click counts, the alert's
 	//     thread is read once (conversations.replies, the existing token and
-	//     scopes) to see whether an authorized user typed apply since
+	//     scopes) to see whether someone the agent answers typed apply since
 	//     the options appeared, which drops the click.
 	//   - Reactions: which reaction goes on an ask and when it settles.
 	allowed := map[string]struct{}{

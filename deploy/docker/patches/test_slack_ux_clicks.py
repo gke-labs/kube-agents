@@ -17,6 +17,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -35,6 +36,10 @@ import verify_slack_ux_clicks as verifier
 UPSTREAM = '''\
 """Fixture standing in for plugins/platforms/slack/adapter.py."""
 import re
+
+
+def _slack_mention_detection_text(event):
+    return event.get("text", "")
 
 
 def _flag_getter(key):
@@ -66,6 +71,8 @@ class App:
 class SlackAdapter:
     def __init__(self):
         self._app = App()
+        self._bot_user_id: str = ""
+        self._team_bot_user_ids, self._other = {}, {}
 
     def _handle_clarify_action(self, ack, body, action):
         return None
@@ -95,6 +102,15 @@ class SlackAdapter:
     def _is_interactive_user_authorized(self, user_id, *, channel_id="", user_name=None, team_id=""):
         return True
 
+    def _slack_message_matches_mention_patterns(self, text: str) -> bool:
+        return False
+
+    async def _channel_gate_allows(
+        self, *, channel_id: str, routing_text: str, bot_uid: str, is_mentioned: bool,
+        is_thread_reply: bool, event_thread_ts, user_id: str, team_id: str, is_dm: bool,
+        force_process: bool) -> bool:
+        return True
+
     async def _handle_slack_message(self, event, payload=None):
         return bool(event.get("_hermes_force_process"))
 
@@ -116,6 +132,10 @@ USER = "U1"
 MESSAGE_TS = "222.000"
 THREAD = "111.000"
 ACTION_TS = "333.000"
+#: The longest text Slack keeps in a message; a typed reply cannot be longer.
+SLACK_TEXT_LIMIT = 40000
+#: How long matching a reply that long may take.
+FAST_SECONDS = 0.25
 
 
 def _run(coro):
@@ -211,6 +231,20 @@ class ApplierTest(unittest.TestCase):
             ("def _is_ignored_channel(", "def _ignored(", "_is_ignored_channel"),
             ("def _is_interactive_user_authorized(", "def _is_user_authorized(", "_is_interactive_user_authorized"),
             ("user_name=None, team_id=\"\")", "user_name=None)", "_is_interactive_user_authorized no longer accepts"),
+            ("def _channel_gate_allows(", "def _channel_gate(", "_channel_gate_allows"),
+            ("    async def _channel_gate_allows(", "    def _channel_gate_allows(",
+             "_channel_gate_allows is no longer async"),
+            ("is_dm: bool,\n        force_process: bool)", "is_dm: bool)", "_channel_gate_allows no longer accepts"),
+            ("def _slack_message_matches_mention_patterns(", "def _mention_patterns(",
+             "_slack_message_matches_mention_patterns"),
+            ("def _slack_mention_detection_text(", "def _mention_text(", "_slack_mention_detection_text"),
+            ("def _slack_mention_detection_text(event)", "def _slack_mention_detection_text(event, bot_uid)",
+             "_slack_mention_detection_text no longer accepts"),
+            ("def _slack_mention_detection_text(", "async def _slack_mention_detection_text(",
+             "_slack_mention_detection_text is now async"),
+            ("        self._bot_user_id: str = \"\"\n", "", "no longer sets _bot_user_id"),
+            ("self._team_bot_user_ids, self._other = {}, {}", "self._bot_ids, self._other = {}, {}",
+             "no longer sets _team_bot_user_ids"),
             ("def _is_ignored_channel(self, channel_id)", "def _is_ignored_channel(self)",
              "_is_ignored_channel no longer accepts"),
             ("    def _is_ignored_channel(", "    async def _is_ignored_channel(",
@@ -317,15 +351,36 @@ class _Client:
         self.log.append(("chat_postMessage", kwargs))
 
 
+def _slack_mention_detection_text(event):
+    """Stands in for adapter.py's module function, found through ``_Adapter``'s module: the flat
+    text plus a mention only in the blocks."""
+    def users(node):
+        if isinstance(node, list):
+            return [u for n in node for u in users(n)]
+        if not isinstance(node, dict):
+            return []
+        own = [f"<@{node['user_id']}>"] if node.get("type") == "user" else []
+        return own + users(node.get("elements", []))
+
+    flat = event.get("text", "") or ""
+    extra = [m for m in users(event.get("blocks") or []) if m not in flat]
+    return (flat.strip() + "\n" + " ".join(extra)).strip() if extra else flat
+
+
 class _Adapter:
     def __init__(
         self, authorized=True, fail=(), allowed_channels=(), disable_dms=False, ignored=(), replies=(), unlisted=(),
-        broken=(),
+        unheard=(), ignore_other_user_mentions=False, broken=(),
     ):
         self.broken = set(broken)
+        self.ignore_other_user_mentions = ignore_other_user_mentions
         self.authorized = authorized
         self.unlisted = set(unlisted)
         self.asked = []
+        self.unheard = set(unheard)
+        self.gated = []
+        self._bot_user_id = "U0BOT"
+        self._team_bot_user_ids = {TEAM: "U0TEAMBOT"}
         self.ignored = set(ignored)
         self.replies = replies
         self.log = []
@@ -362,6 +417,21 @@ class _Adapter:
         if "authorized" in self.broken and user_id != USER:
             raise RuntimeError("allowlist unreadable")
         return user_id not in self.unlisted
+
+    def _slack_message_matches_mention_patterns(self, text):
+        if "patterns" in self.broken:
+            raise RuntimeError("bad pattern")
+        return "@kage" in text.lower()
+
+    async def _channel_gate_allows(self, **gate):
+        self.gated.append(gate)
+        if "gate" in self.broken:
+            raise RuntimeError("gate failed")
+        # Upstream's ignore_other_user_mentions rule: un-mentioned and opening on someone else is not for us.
+        lead = re.match(r"\s*<@([^>|\s]+)(?:\|[^>]*)?>", gate["routing_text"])
+        if self.ignore_other_user_mentions and not gate["is_mentioned"] and lead and lead.group(1) != gate["bot_uid"]:
+            return False
+        return gate["user_id"] not in self.unheard
 
     async def _handle_slack_message(self, event, payload=None):
         self.log.append(("message", event))
@@ -598,10 +668,12 @@ class RuntimeTest(unittest.TestCase):
         _run(presenter.ack_link_click(ack, {}, {"action_id": "kage.link.0"}))
         self.assertEqual(acks, [True])
 
-    def _incident(self, adapter, value="Apply Option B", edited=None):
+    def _incident(self, adapter, value="Apply Option B", edited=None, channel_name=None):
         body, action = _alert_choice(1, value)
         if edited:
             body["message"]["edited"] = {"user": "B1", "ts": edited}
+        if channel_name is not None:
+            body["channel"] = {"id": CHANNEL, "name": channel_name}
         self._answer(adapter, body, action)
 
     def test_the_incident_prefix_is_the_one_the_alert_buttons_carry(self):
@@ -629,6 +701,14 @@ class RuntimeTest(unittest.TestCase):
         self._drops(adapter)
         update = adapter.log[1][1]
         self.assertEqual(update["blocks"][-1]["elements"][0]["text"], runtime.ANSWERED_IN_THREAD)
+
+    def test_typed_apply_is_matched_after_a_leading_mention_and_in_any_case(self):
+        for text in ("<@U0BOT> apply Option B", "  Apply option b"):
+            with self.subTest(text=text):
+                importlib.reload(runtime)
+                adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": text, "ts": "223.000"}])
+                self._incident(adapter)
+                self.assertNotIn("message", [entry[0] for entry in adapter.log])
 
     def test_what_is_not_a_human_typing_apply_after_the_alert_does_not_drop_the_click(self):
         cases = {
@@ -662,6 +742,85 @@ class RuntimeTest(unittest.TestCase):
         self._incident(adapter)
         self._runs(adapter)
         self.assertEqual(adapter.asked, [("U3", CHANNEL, TEAM)])
+        self.assertEqual(adapter.gated, [])
+
+    def test_a_typed_apply_the_gateway_would_not_hear_does_not_drop_the_click(self):
+        # A channel that requires an @-mention: the gateway ignored U4's bare "apply B".
+        adapter = _Adapter(
+            replies=[{"type": "message", "user": "U4", "text": "apply B", "ts": "223.000"}], unheard={"U4"},
+        )
+        self._incident(adapter)
+        self._runs(adapter)
+        self.assertEqual(adapter.gated, [{
+            "channel_id": CHANNEL, "routing_text": "apply B", "bot_uid": "U0TEAMBOT", "is_mentioned": False,
+            "is_thread_reply": True, "event_thread_ts": MESSAGE_TS, "user_id": "U4", "team_id": TEAM,
+            "is_dm": False, "force_process": False,
+        }])
+
+    def test_a_typed_apply_addressed_to_someone_else_does_not_drop_the_click(self):
+        reply = {"type": "message", "user": "U2", "text": "<@U0ALICE> apply B", "ts": "223.000"}
+        adapter = _Adapter(replies=[reply], ignore_other_user_mentions=True)
+        self._incident(adapter)
+        self._runs(adapter)
+        self.assertEqual([(g["routing_text"], g["is_mentioned"]) for g in adapter.gated], [(reply["text"], False)])
+
+        # With the flag off the same reply is the gateway's, so it drops the click; and so is one
+        # naming someone after another token, since upstream reads only a leading mention.
+        for kwargs, text in (({}, reply["text"]), ({"ignore_other_user_mentions": True}, ":eyes: <@U0ALICE> apply B")):
+            with self.subTest(text=text, **kwargs):
+                importlib.reload(runtime)
+                adapter = _Adapter(replies=[{**reply, "text": text}], **kwargs)
+                self._incident(adapter)
+                self._drops(adapter)
+
+    def test_a_mention_only_in_the_blocks_reaches_the_gate_as_the_gateway_reads_it(self):
+        blocks = [{"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": [
+            {"type": "user", "user_id": "U0TEAMBOT"}, {"type": "text", "text": " apply B"},
+        ]}]}]
+        reply = {"type": "message", "user": "U4", "text": "apply B", "blocks": blocks, "ts": "223.000"}
+        adapter = _Adapter(replies=[reply])
+        self._incident(adapter)
+        self.assertEqual(
+            [(g["routing_text"], g["is_mentioned"]) for g in adapter.gated], [("apply B\n<@U0TEAMBOT>", True)],
+        )
+
+    def test_a_group_dm_reaches_the_gate_as_a_dm_as_the_gateway_reads_it(self):
+        # The gateway passes is_dm for an mpim; a click's payload names a group DM "mpdm-...".
+        for name, is_dm in (("mpdm-alice--bob--kage-1", True), ("incidents", False), ("", False)):
+            with self.subTest(name=name):
+                importlib.reload(runtime)
+                adapter = _Adapter(replies=[{"type": "message", "user": "U4", "text": "apply B", "ts": "223.000"}])
+                self._incident(adapter, channel_name=name)
+                self.assertEqual([g["is_dm"] for g in adapter.gated], [is_dm])
+
+    def test_a_mention_the_gateway_reads_is_passed_to_its_gate(self):
+        for text in ("<@U0TEAMBOT> apply B", "@kage apply B"):
+            with self.subTest(text=text):
+                importlib.reload(runtime)
+                adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": text, "ts": "223.000"}])
+                self._incident(adapter)
+                self._drops(adapter)
+                self.assertEqual([g["is_mentioned"] for g in adapter.gated], [True])
+        importlib.reload(runtime)
+        adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": "<@U0BOT> apply B", "ts": "223.000"}])
+        self._incident(adapter)
+        # Another workspace's bot id is not a mention of this one.
+        self.assertEqual([g["is_mentioned"] for g in adapter.gated], [False])
+
+    def test_where_the_gateway_skips_its_channel_gate_the_check_skips_it_too(self):
+        reply = {"type": "message", "user": "U4", "text": "apply B", "ts": "223.000"}
+        adapter = _Adapter(replies=[reply], unheard={"U4"})
+        adapter._begin_interaction = self._dm_begin(adapter)
+        self._incident(adapter)
+        self._drops(adapter)
+        self.assertEqual(adapter.gated, [])
+
+        importlib.reload(runtime)
+        adapter = _Adapter(replies=[reply], unheard={"U4"})
+        adapter._bot_user_id, adapter._team_bot_user_ids = None, {}
+        self._incident(adapter)
+        self._drops(adapter)
+        self.assertEqual(adapter.gated, [])
 
     def test_a_reply_typed_before_the_options_appeared_does_not_drop_the_click(self):
         # The alert is posted at 222 and edited into its options at 230.
@@ -675,13 +834,158 @@ class RuntimeTest(unittest.TestCase):
         self._incident(adapter, edited="230.000")
         self._drops(adapter)
 
-    def test_a_colon_after_the_apply_does_not_drop_the_click(self):
+    def test_only_the_call_to_actions_forms_drop_the_click(self):
+        drops = (
+            "apply", "apply.", "Apply!", "apply B", "apply Option B",
+            "yes, apply B", "please apply B", "ok apply", "@kage apply B", "<@U0BOT> <@U0BOT2> apply B",
+            "*apply* B", "'apply'", "`apply Option A`", "&gt; apply B", "> apply B", ":white_check_mark: apply B",
+            "\u2705 apply B",
+        )
+        runs = (
+            "Apply the label later?", "apply nothing", "apply? which one", "Apply Option B - wait, not yet",
+            "apply-now", "reapply B", "applying B now", "should we apply B?", "apply a fix",
+        )
+        for text, check in [*((t, self._drops) for t in drops), *((t, self._runs) for t in runs)]:
+            with self.subTest(text=text):
+                importlib.reload(runtime)
+                adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": text, "ts": "223.000"}])
+                self._incident(adapter)
+                check(adapter)
+
+    def _options_incident(self, adapter, *labels):
+        body, action = _alert_choice(1, labels[-1])
+        triage = {"headline": "Pod OOMKilled", "links": [], "fold_title": "Options", "choices": [
+            (label, False) for label in labels
+        ]}
+        body["message"]["blocks"] = incident.blocks_triage(triage, [])
+        self._answer(adapter, body, action)
+
+    def test_a_colon_counts_only_before_that_options_own_text(self):
+        options = ("apply Option A: Raise the limit", "apply Option B: Restore the secret")
+        long_title = "Roll back checkout-gateway to the last revision that served without OOMKills in prod"
+        quoted = ("apply Option A: Don't restart it", f"apply Option B: {long_title}", "apply Option C: Scale & wait")
+        single = ("apply: Roll back checkout-gateway",)
+        cases = [
+            (options, self._drops, (
+                "apply Option B: Restore the secret", "apply b: restore  the *secret*.", "<@U0BOT> apply A: Raise the limit",
+            )),
+            (options, self._runs, (
+                "apply: no wait", "apply B: actually no, hold off", "apply A: Restore the secret",
+                "apply: Restore the secret", "apply Option B:", "apply Option B: Restore the secret, then wait",
+            )),
+            (single, self._drops, ("apply: roll back checkout-gateway",)),
+            (single, self._runs, ("apply: no wait", "apply A: Roll back checkout-gateway")),
+            # The text after the colon is matched as typed: an apostrophe, a title the button clips,
+            # and an ampersand as Slack sends it.
+            (quoted, self._drops, ("apply A: Don't restart it", f"apply B: {long_title}", "apply C: Scale &amp; wait")),
+        ]
+        for labels, check, texts in cases:
+            for text in texts:
+                with self.subTest(labels=labels, text=text):
+                    importlib.reload(runtime)
+                    adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": text, "ts": "223.000"}])
+                    self._options_incident(adapter, *labels)
+                    check(adapter)
+
+    def test_a_clipped_buttons_shown_text_counts_as_its_whole_text(self):
+        # The button shows "apply Option B: Roll back checkout-gateway to the last revision that…".
+        labels = (
+            "apply Option A: Raise the limit",
+            "apply Option B: Roll back checkout-gateway to the last revision that served without OOMKills in prod",
+        )
+        cases = (
+            (self._drops, "apply Option B: Roll back checkout-gateway to the last revision that…"),
+            (self._drops, "apply B: roll back checkout-gateway to the last revision that"),
+            (self._runs, "apply B: Roll back checkout-gateway to the last revision"),
+            (self._runs, "apply A: Roll back checkout-gateway to the last revision that"),
+        )
+        for check, text in cases:
+            with self.subTest(text=text):
+                importlib.reload(runtime)
+                adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": text, "ts": "223.000"}])
+                self._options_incident(adapter, *labels)
+                check(adapter)
+
+    def test_a_colon_form_with_a_hostname_slack_linked_still_counts(self):
+        # Slack sends a typed hostname as <http://host|host>, and a typed url as <url>.
+        labels = (
+            "apply Option A: Drain checkout.example.com", "apply Option B: Open https://grafana.example.com/d/x",
+            "apply Option C: Ping @U0BOT", "apply Option D: Drain\ncheckout",
+        )
+        cases = (
+            (self._drops, "apply A: Drain <http://checkout.example.com|checkout.example.com>"),
+            (self._drops, "apply B: Open <https://grafana.example.com/d/x>"),
+            (self._runs, "apply A: Drain <http://checkout.example.com|other.example.com>"),
+            # Only a link is unwrapped: a mention names someone, not the option's text.
+            (self._runs, "apply C: Ping <@U0BOT>"),
+            (self._drops, "apply D: Drain checkout"),
+        )
+        for check, text in cases:
+            with self.subTest(text=text):
+                importlib.reload(runtime)
+                adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": text, "ts": "223.000"}])
+                self._options_incident(adapter, *labels)
+                check(adapter)
+
+    def test_a_reply_of_unclosed_links_stays_linear(self):
+        # Each "<http://" scanned to the end of the text for a ">" that never comes.
+        options = frozenset({("A", "drain checkout.example.com")})
+        for run in ("<http://", "<http://a|", "<http://a|" + "|" * 20):
+            text = "apply A: " + run * (SLACK_TEXT_LIMIT // len(run))
+            with self.subTest(run=run[:12]):
+                start = time.monotonic()
+                self.assertFalse(runtime._typed_apply(text, options))
+                self.assertLess(time.monotonic() - start, FAST_SECONDS)
+
+    def test_a_colon_on_a_message_without_the_option_buttons_does_not_drop_the_click(self):
         adapter = _Adapter(replies=[
             {"type": "message", "user": "U2", "text": "apply option b: Restore the secret", "ts": "223.000"},
         ])
         body, action = _alert_choice(1, "Apply Option B")
+        # A button in that form that is not an incident option is not one to type.
+        body["message"]["blocks"][1]["elements"][2]["value"] = "apply Option B: Restore the secret"
         self._answer(adapter, body, action)
         self._runs(adapter)
+
+    def test_a_courtesy_after_the_option_still_counts_and_nothing_else_does(self):
+        drops = (
+            "apply B please", "apply Option B, thanks", "Apply B thank you!", "apply, please", "apply B ty",
+            "apply B. Thanks.",
+        )
+        runs = (
+            "Apply B now", "apply B please?", "apply B :+1:", "apply B please wait", "apply B thanks but not yet",
+            "apply B: please",
+        )
+        for text, check in [*((t, self._drops) for t in drops), *((t, self._runs) for t in runs)]:
+            with self.subTest(text=text):
+                importlib.reload(runtime)
+                adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": text, "ts": "223.000"}])
+                self._incident(adapter)
+                check(adapter)
+
+    def test_a_struck_through_apply_does_not_drop_the_click(self):
+        for text, check in (("~apply B~", self._runs), ("~apply A~ apply B", self._drops), ("~no~ apply B", self._drops),
+                            ("~no~ apply B ~now~", self._drops), ("~no\n~ apply B", self._runs)):
+            with self.subTest(text=text):
+                importlib.reload(runtime)
+                adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": text, "ts": "223.000"}])
+                self._incident(adapter)
+                check(adapter)
+
+    def test_a_colon_form_asked_as_a_question_does_not_drop_the_click(self):
+        for text in ("Apply B: Restore the secret?", "apply B: will it restart the pods?"):
+            with self.subTest(text=text):
+                importlib.reload(runtime)
+                adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": text, "ts": "223.000"}])
+                self._options_incident(adapter, "apply Option A: Raise the limit", "apply Option B: Restore the secret")
+                self._runs(adapter)
+
+    def test_a_typed_apply_also_sent_to_the_channel_drops_the_click(self):
+        adapter = _Adapter(replies=[
+            {"type": "message", "subtype": "thread_broadcast", "user": "U2", "text": "apply B", "ts": "223.000"},
+        ])
+        self._incident(adapter)
+        self._drops(adapter)
 
     def test_a_failed_thread_read_runs_the_click_as_before(self):
         adapter = _Adapter(fail=("conversations_replies",))
@@ -692,7 +996,7 @@ class RuntimeTest(unittest.TestCase):
 
     def test_a_check_that_raises_after_a_typed_apply_matched_counts_the_reply(self):
         # Running the click as well would apply both the typed option and the clicked one.
-        for broken in ("authorized",):
+        for broken in ("authorized", "patterns", "gate"):
             with self.subTest(broken=broken):
                 importlib.reload(runtime)
                 adapter = _Adapter(
@@ -703,6 +1007,17 @@ class RuntimeTest(unittest.TestCase):
                 self._drops(adapter)
                 self.assertTrue(any("could not check the thread" in line for line in logs.output))
 
+    def test_a_check_that_raises_on_a_reply_that_is_no_apply_runs_the_click(self):
+        for broken in ("authorized", "patterns", "gate"):
+            with self.subTest(broken=broken):
+                importlib.reload(runtime)
+                adapter = _Adapter(
+                    replies=[{"type": "message", "user": "U2", "text": "what does B do?", "ts": "223.000"}],
+                    broken={broken},
+                )
+                self._incident(adapter)
+                self._runs(adapter)
+
     def test_the_answered_alert_keeps_its_report_for_the_clicks_own_turn(self):
         report = "*Pod OOMKilled*\nOption A: raise the limit\nOption B: roll back checkout-gateway"
         adapter = _Adapter()
@@ -712,13 +1027,35 @@ class RuntimeTest(unittest.TestCase):
             seen.append([entry[1]["text"] for entry in adapter.log if entry[0] == "chat_update"])
 
         adapter._handle_slack_message = turn
-        body, action = _choice(1, "Apply Option B")
+        body, action = _alert_choice(1, "Apply Option B")
         body["message"]["text"] = report
         self._answer(adapter, body, action)
         self.assertEqual(seen, [[f"✓ <@U1>: Apply Option B\n\n{report}"]])
 
+    def test_the_answered_alert_drops_its_reply_with_line_and_keeps_the_rest(self):
+        triage = {
+            "headline": "Pod OOMKilled",
+            "links": [("Cloud Logs", "https://console.cloud.google.com/logs")],
+            "choices": [("Apply Option A", "raise"), ("Apply Option B", "roll back")],
+        }
+        # The report's own line that reads like the call to action stays: only the fallback's goes.
+        report = f"Option A: raise the limit\n{presenter.CHOICES_LEAD}apply Option A or apply Option B"
+        alert = incident.message_text(triage, report)
+        self.assertEqual(alert.count(presenter.CHOICES_LEAD), 2)
+        head = incident.fallback_text(triage).rsplit("\n", 1)[0]
+        for note, check in (("✓ <@U1>: Apply Option B", ()), (runtime.ANSWERED_IN_THREAD, ("typed",))):
+            with self.subTest(note=note):
+                importlib.reload(runtime)
+                replies = [{"type": "message", "user": "U2", "text": "apply B", "ts": "223.000"}] if check else []
+                adapter = _Adapter(replies=replies)
+                body, action = _alert_choice(1, "Apply Option B")
+                body["message"]["text"] = alert
+                self._answer(adapter, body, action)
+                text = next(entry[1]["text"] for entry in adapter.log if entry[0] == "chat_update")
+                self.assertEqual(text, f"{note}\n\n{head}\n\n{report}")
+
     def test_a_reply_with_line_alone_leaves_the_note_and_the_report(self):
-        body, action = _choice(1, "Apply Option B")
+        body, action = _alert_choice(1, "Apply Option B")
         body["message"]["text"] = f"{presenter.CHOICES_LEAD}Apply Option A\n\nthe report"
         adapter = _Adapter()
         self._answer(adapter, body, action)
@@ -727,12 +1064,19 @@ class RuntimeTest(unittest.TestCase):
 
     def test_a_headline_quoting_the_reply_with_words_stays(self):
         headline = f"*{presenter.CHOICES_LEAD}nobody answered*"
-        body, action = _choice(1, "Apply Option B")
+        body, action = _alert_choice(1, "Apply Option B")
         body["message"]["text"] = f"{headline}\n{presenter.CHOICES_LEAD}Apply Option A\n\nthe report"
         adapter = _Adapter()
         self._answer(adapter, body, action)
         update = next(entry[1] for entry in adapter.log if entry[0] == "chat_update")
         self.assertEqual(update["text"], f"✓ <@U1>: Apply Option B\n\n{headline}\n\nthe report")
+
+    def test_typed_apply_keeps_the_report_too(self):
+        adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": "apply Option B", "ts": "223.000"}])
+        body, action = _alert_choice(1, "Apply Option A")
+        body["message"]["text"] = "the report"
+        self._answer(adapter, body, action)
+        self.assertEqual(adapter.log[-1][1]["text"], f"{runtime.ANSWERED_IN_THREAD}\n\nthe report")
 
     def test_answered_text_is_clipped_to_slacks_limit_and_keeps_the_note(self):
         adapter = _Adapter()
@@ -765,6 +1109,11 @@ class RuntimeTest(unittest.TestCase):
         _run(both())
         turns = [entry[1]["text"] for entry in adapter.log if entry[0] == "message"]
         self.assertEqual(turns, ["Apply Option B"])
+
+    def test_a_click_on_a_card_question_does_not_read_the_thread(self):
+        adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": "apply Option B", "ts": "223.000"}])
+        self._answer(adapter, *_choice())
+        self.assertEqual([entry[0] for entry in adapter.log], ["chat_update", "chat_postMessage", "message"])
 
     def test_flag_off_is_disabled(self):
         with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "0"}):
