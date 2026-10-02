@@ -83,9 +83,11 @@ PASTED_BREAKDOWN_REPORT = (
     "```\n"
 )
 
-# The id on a heading or a bold line of its own, a blank line, then the
-# first row of a table or a list: ordinary Markdown for a per-trace section,
-# which puts the share two lines below the id.
+# The id on a heading or a bold line of its own, a blank line or none, then
+# a table or a list: ordinary Markdown for a per-trace section, which puts
+# the share two to four lines below the id. The table headers that say
+# neither total nor duration are the ones only the data row's own shape (a
+# duration in seconds and a share on one line) can satisfy.
 HEADING_BREAKDOWN_REPORTS = [
     "### Trace 0384e171d360c91c96df3124562dcc59\n\n"
     "| Total duration | Spans | Slowest span | Share |\n|---|---|---|---|\n"
@@ -93,7 +95,24 @@ HEADING_BREAKDOWN_REPORTS = [
     "**Trace 0384e171d360c91c96df3124562dcc59**\n\n"
     "- Total duration: 2.590s (1 span)\n"
     "- Slowest span: `api.model-default`, 2.590s, 100.0% of the trace",
+    "### Trace 0384e171d360c91c96df3124562dcc59\n\n"
+    "| Latency | Spans | Slowest span | Share |\n|---|---|---|---|\n"
+    "| 2.590s | 1 | `api.model-default` | 100.0% |",
+    "#### 0384e171d360c91c96df3124562dcc59\n"
+    "| Time | Spans | Slowest | % of trace |\n|---|---|---|---|\n"
+    "| 2.59 s | 1 | api.model-default | 100% |",
+    "**Trace `0384e171d360c91c96df3124562dcc59`**\n\n"
+    "| Seconds | Spans | Slowest span | Share |\n|:--|:--|:--|:--|\n"
+    "| 2.590 seconds | 1 | `api.model-default` (2590 ms) | 100.0% |",
 ]
+
+# A failure that happens to carry a seconds-and-share line but no id the
+# helper gave it: the id pattern is what reds it.
+TIMED_FAILURE_REPORT = (
+    "## No traces analyzed\n\n"
+    "The analyzer exited 1 after 0.4s (0% of the three requested traces came back), "
+    "so there is no slowest span to report."
+)
 
 # One row in each shape the three recorded green runs wrote: a Markdown
 # table row, a bullet naming the total, and a console link around the id.
@@ -119,7 +138,7 @@ def _objective_report_checks() -> list[ReportContainsVerifier]:
     return checks
 
 
-@pytest.mark.parametrize("report", [FAILURE_REPORT, STRAY_ID_FAILURE_REPORT])
+@pytest.mark.parametrize("report", [FAILURE_REPORT, STRAY_ID_FAILURE_REPORT, TIMED_FAILURE_REPORT])
 def test_a_failure_report_in_the_prompts_words_fails_an_objective_check(report):
     transcript.set(report, [])
     verdicts = {c.verify(5.0).status for c in _objective_report_checks()}
@@ -130,7 +149,7 @@ def test_a_stray_id_beside_a_percentage_fails_the_breakdown_check():
     # The id check in particular, not the slowest-span phrase: the stray-id
     # report says "slowest" and carries "0%", so only the row shape reds it.
     transcript.set(STRAY_ID_FAILURE_REPORT, [])
-    (id_check,) = [c for c in _objective_report_checks() if len(c.required_patterns) == 2]
+    (id_check,) = [c for c in _objective_report_checks() if len(c.required_patterns) == 3]
     res = id_check.verify(5.0)
     assert res.status == "fail", res.reason
 

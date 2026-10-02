@@ -154,10 +154,13 @@ NOT_A_PLAIN_GREP = [
 ]
 
 # The ways a worker runs the helper: the interpreter with or without a
-# version or a flag (one carrying an argument included), an executable
-# path, after a `cd`, under `timeout` with or without its own flags, `env`
-# with or without its flags and assignments, `stdbuf`, or an environment
-# assignment, inside a subshell. Each satisfies the route check on its own.
+# version or a flag (one carrying an argument included), bare or by path,
+# the script path quoted, an executable path, after a `cd`, under `timeout`
+# with or without its own flags or a unit on the duration, `env` bare or
+# as `/usr/bin/env` with or without its flags and assignments, `stdbuf`, or
+# an environment assignment, inside a subshell. Each satisfies the route
+# check on its own. The last is the stated limit: a copy that keeps the
+# `scripts/` component as well as the basename is counted.
 RUNS_THE_HELPER = [
     "python3 /opt/defaults/skills/kube-agents-observability/scripts/analyze_trace_latency.py --project-id p --hours 24 --limit 3",
     "cd /opt/data/profiles/platform/skills/kube-agents-observability && python3 ./scripts/analyze_trace_latency.py --project-id p --hours 24 --limit 3",
@@ -174,14 +177,24 @@ RUNS_THE_HELPER = [
     "stdbuf -oL python3 scripts/analyze_trace_latency.py --project-id p",
     "env -i PATH=/usr/bin PYTHONUNBUFFERED=1 python3 scripts/analyze_trace_latency.py --project-id p",
     "timeout --kill-after=5 300 python3 -X dev scripts/analyze_trace_latency.py --project-id p",
+    'python3 "/opt/defaults/skills/kube-agents-observability/scripts/analyze_trace_latency.py" --project-id p --hours 24 --limit 3',
+    "python3 '/opt/defaults/skills/kube-agents-observability/scripts/analyze_trace_latency.py' --project-id p",
+    "/usr/bin/python3 scripts/analyze_trace_latency.py --project-id p",
+    "/usr/bin/env python3 scripts/analyze_trace_latency.py --project-id p",
+    "timeout 300s python3 scripts/analyze_trace_latency.py --project-id p",
+    "timeout -s KILL 5m /opt/defaults/skills/kube-agents-observability/scripts/analyze_trace_latency.py --project-id p",
+    "python3 /tmp/scripts/analyze_trace_latency.py --project-id p",
 ]
 
-# The ways a worker reads the helper without running it, the grep of the
-# skill doc that quotes the invocation line, a `python3 -c "..."` or `-m
-# py_compile` that opens the file, and the copy it runs by another name
-# after reading; none is the helper being the route, so none satisfies the
-# check. A run under `-m pdb` or inside `sh -c '...'` is not counted either,
-# the narrow side the case states.
+# The ways a worker reads the helper without running it, under `timeout`
+# with a flag before the duration or with no duration included, the grep
+# of the skill doc that quotes the invocation line, a `python3 -c "..."` or
+# `-m py_compile` that opens the file, and the copy it runs by another
+# name, or under the helper's own basename in another directory, after
+# reading; none is the helper being the route, so none satisfies the check.
+# A run under `-m pdb`, inside `sh -c '...'`, or by bare basename from
+# inside the scripts directory is not counted either, the narrow side the
+# case states.
 READS_THE_HELPER = [
     "cat /opt/defaults/skills/kube-agents-observability/scripts/analyze_trace_latency.py",
     "head -60 /opt/defaults/skills/kube-agents-observability/scripts/analyze_trace_latency.py",
@@ -196,6 +209,15 @@ READS_THE_HELPER = [
     "python3 -m py_compile scripts/analyze_trace_latency.py",
     "python3 -m pdb scripts/analyze_trace_latency.py --project-id p",
     "sh -c 'python3 scripts/analyze_trace_latency.py --project-id p'",
+    "timeout -v 10 cat /opt/defaults/skills/kube-agents-observability/scripts/analyze_trace_latency.py",
+    "timeout --foreground 30 head -40 /opt/defaults/skills/kube-agents-observability/scripts/analyze_trace_latency.py",
+    "timeout --signal=KILL 10 less /opt/defaults/skills/kube-agents-observability/scripts/analyze_trace_latency.py",
+    "timeout -v cat /opt/defaults/skills/kube-agents-observability/scripts/analyze_trace_latency.py",
+    "timeout -v 10 cp /opt/defaults/skills/kube-agents-observability/scripts/analyze_trace_latency.py /tmp/analyze_trace_latency.py",
+    "cp /opt/defaults/skills/kube-agents-observability/scripts/analyze_trace_latency.py /tmp/analyze_trace_latency.py",
+    "python3 /tmp/analyze_trace_latency.py --project-id p",
+    "python3 analyze_trace_latency.py --project-id p",
+    "cd /opt/defaults/skills/kube-agents-observability/scripts && python3 analyze_trace_latency.py --project-id p",
 ]
 
 # The lines the verifier receives for typed commands above, as the image's
@@ -225,7 +247,10 @@ RENDERED_SAFEGUARD = [
 # The same for the route check: a run chained behind a `cd`, an `export` or
 # a `timeout` arrives as the run alone and is seen; one behind an `ls` or
 # inside a parenthesised subshell arrives as "<first> + 1 command" and is
-# not, the other limit the case header states.
+# not, the other limit the case header states. A `cd` into the scripts
+# directory followed by the bare basename arrives as the bare basename and
+# is not counted, the narrow side; a copy run under the helper's basename
+# from /tmp is the read it is.
 RENDERED_ROUTE = [
     ("python3 ./scripts/analyze_trace_latency.py --project-id p --hours 24 --limit 3", "pass"),
     ("timeout 300 python3 scripts/analyze_trace_latency.py --project-id p", "pass"),
@@ -234,6 +259,9 @@ RENDERED_ROUTE = [
     ("(cd /opt/defaults/skills/kube-agents-observability + 1 command", "fail"),
     ("ls + 1 command", "fail"),
     ("cp /opt/defaults/skills/kube-agents-observability/scripts/analyze_trace_latency.py /tmp/t.py + 1 command", "fail"),
+    ("python3 analyze_trace_latency.py --project-id p", "fail"),
+    ("python3 /tmp/analyze_trace_latency.py --project-id p", "fail"),
+    ("timeout -v 10 cat /opt/defaults/skills/kube-agents-observability/scripts/analyze_trace_latency.py", "fail"),
 ]
 
 
