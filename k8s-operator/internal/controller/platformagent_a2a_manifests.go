@@ -1978,10 +1978,13 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 		Spec: networkingv1.NetworkPolicySpec{
 			// No instance label, unlike the rest of what the operator
 			// renders, because the spawner stamps none — the selector can
-			// only name what the pods carry. Two PlatformAgents in one
-			// namespace would each fence the other's session pods with an
-			// identical rule set, so the effect is a duplicate fence rather
-			// than a gap; the bus grants still separate them at auth.
+			// only name what the pods carry. The webhook admits one
+			// PlatformAgent per cluster, so two agents' session pods never
+			// share a namespace; were that rule ever relaxed, each agent's
+			// fence would select the other's pods too, and what would then
+			// separate them is the bus grants at auth and, under the
+			// cluster-view flag, the broker's CREDENTIAL_PROXY_ALLOWED_CALLERS
+			// and session-callers binding — not this selector.
 			PodSelector: metav1.LabelSelector{
 				MatchLabels: map[string]string{
 					labelPartOf:                   a2aPartOf,

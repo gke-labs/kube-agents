@@ -484,6 +484,13 @@ func buildCredentialProxyFederationVolume(agent *agentv1alpha1.PlatformAgent) []
 // broker. buildAgentEgressNetworkPolicy enumerates the agent Pod's egress and
 // deliberately leaves this one alone.
 //
+// The session-pod peer admitted under the cluster-view flag is the bare
+// part-of/component pair, because the spawner stamps no instance label. The
+// webhook admits one PlatformAgent per cluster, so no other agent's session
+// pods share this namespace; were that rule relaxed, this fence would admit
+// them too, and what refuses them is the broker itself: TokenReview against
+// CREDENTIAL_PROXY_ALLOWED_CALLERS and the session-callers binding.
+//
 // Inert on a cluster whose CNI does not implement NetworkPolicy. It is a control
 // where it is enforced and a statement of intent where it is not.
 func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
