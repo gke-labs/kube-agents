@@ -9,11 +9,18 @@ _PLUGINS_DIR = str(Path(__file__).resolve().parents[1])
 if _PLUGINS_DIR not in sys.path:
     sys.path.insert(0, _PLUGINS_DIR)
 
+from common.audit_schema import envelope  # noqa: E402
 from common.redactor import AuditRedactor  # noqa: E402
 
 logger = logging.getLogger("hermes.plugin.tool_call_audit")
 
 _PAYLOAD_LOG_LIMIT = 2000
+# The `status` a record carries, per hook: the structured schema's vocabulary,
+# beside the per-hook fields the Admin Console already reads.
+_STATUS_STARTED = "started"
+_STATUS_COMPLETED = "completed"
+_STATUS_REQUESTED = "requested"
+_STATUS_ANSWERED = "answered"
 
 
 def _redacted_repr(value: Any) -> str:
@@ -50,8 +57,10 @@ def _serialize(value: Any) -> str:
 
 
 def _emit(event: str, fields: Dict[str, Any]) -> None:
-    record = {"audit_event": event, **fields}
-    logger.info(json.dumps(record, default=str, sort_keys=True))
+    # One JSON object per line. The envelope (common/audit_schema.py) makes the
+    # record self-describing once the fluent-bit sidecar has lifted it out of
+    # the log line; the fields are what each hook knows.
+    logger.info(json.dumps(envelope(event, fields), default=str, sort_keys=True))
 
 
 def log_pre_tool_call(
@@ -63,7 +72,13 @@ def log_pre_tool_call(
     try:
         _emit(
             "tool_call_start",
-            {"tool_name": tool_name, "task_id": task_id, "args": _serialize(args or {})},
+            {
+                "tool_name": tool_name,
+                "tool": tool_name,
+                "status": _STATUS_STARTED,
+                "task_id": task_id,
+                "args": _serialize(args or {}),
+            },
         )
     except Exception as exc:
         logger.error("Error in tool_call_audit pre_tool_call hook: %s", exc, exc_info=True)
@@ -81,6 +96,8 @@ def log_post_tool_call(
             "tool_call_end",
             {
                 "tool_name": tool_name,
+                "tool": tool_name,
+                "status": _STATUS_COMPLETED,
                 "task_id": task_id,
                 "duration_ms": duration_ms,
                 "result": _serialize(result),
@@ -101,6 +118,7 @@ def log_pre_approval_request(
         _emit(
             "approval_request",
             {
+                "status": _STATUS_REQUESTED,
                 "surface": surface,
                 "pattern_key": pattern_key,
                 "description": description,
@@ -123,6 +141,7 @@ def log_post_approval_response(
         _emit(
             "approval_response",
             {
+                "status": _STATUS_ANSWERED,
                 "surface": surface,
                 "pattern_key": pattern_key,
                 "choice": choice,
@@ -158,12 +177,16 @@ def log_pre_gateway_dispatch(
             platform = getattr(platform_obj, "value", None) or str(platform_obj)
             user_id = getattr(source, "user_id", "") or ""
 
+        principal = AuditRedactor.pseudonymise_identity(user_id)
         _emit(
             "gateway_dispatch",
             {
                 "session_id": session_id,
                 "platform": platform,
-                "user_id": AuditRedactor.pseudonymise_identity(user_id),
+                "user_id": principal,
+                # The same pseudonym under the schema's name: the one identity
+                # a turn record can name is who sent the message.
+                "principal": principal,
                 "text": _serialize(text),
             },
         )

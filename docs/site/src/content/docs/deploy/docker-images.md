@@ -183,6 +183,8 @@ The `ARG` has no default, so every build path has to pass it — the image-build
 
 Bumping Hermes means editing `tags.env` and rebuilding both agent images: the pin is a build-time base, so nothing changes in a cluster until `platform-agent` and `credential-proxy` are rebuilt and rolled out.
 
+One thing to check after the rebuilt images roll out. The `fluent-bit` sidecar lifts the audit records out of Hermes' log lines by matching the line prefix (timestamp, level, an optional session tag, the logger name), and that prefix is Hermes' to change; no test in this repository notices when it does. Once a bumped `platform-agent` is running and has made a tool call, query `jsonPayload.audit_event:*` in Logs Explorer: records mean the lift still holds, and none means the records are arriving as text under `jsonPayload.log` again, which is fixed by updating the `hermes_audit_line` parser in the operator's fluent-bit configuration, and the sample lines its test holds, to the new prefix ([Concepts → Observability](/kube-agents/concepts/observability/#tool-call-audit)).
+
 ## Private / custom registry
 
 Clusters that may only pull from an approved registry need two things: a copy of every image

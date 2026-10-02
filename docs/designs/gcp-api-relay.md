@@ -144,7 +144,10 @@ it saw must be what is forwarded; the query check is also what keeps a byte`http
    does (`path` at 256 characters, the width the exec route gives a `cwd`). The upstream
    failure cases in the table above are the verdict line in their case, naming the condition,
    and the exception type where there is one, never its message; the disabled-relay 503
-   writes `api disabled request_id=%s rule=%s`.
+   writes `api disabled request_id=%s rule=%s`. These records carry the log's envelope only;
+   the `audit` mapping the exec route attaches to its records (the site's
+   [observability page](../site/src/content/docs/concepts/observability.md#cloud-logging)) is
+   not attached on this route.
 
 Named constants, declared at the top of `credential_proxy.py` per the engineering rules:
 

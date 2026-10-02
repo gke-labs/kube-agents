@@ -4065,12 +4065,35 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// The early exit. This path runs on every reconcile of every install that
 	// is not `next` — forever, on installs that have never rendered an A2A
 	// object — so proving "nothing to do" one object at a time is a standing
-	// cost for a no-op. Four reads answer it instead of twenty-three:
+	// cost for a no-op. Seven reads answer it instead of twenty-three:
 	//
 	//   - the StatefulSet, which is deleted LAST below, so its absence means an
 	//     earlier pass ran to completion rather than dying partway,
 	//   - the gateway Deployment, which the render creates last and this
 	//     function deletes first, so it catches a pass that failed immediately,
+	//   - the NATS fence and the session fence, for the render that never
+	//     reaches reconcileA2A. reconcileAgentNetworkGuardrails applies the
+	//     fences on every refusal under mode next, so a CR refused on its
+	//     first reconcile has the fences and none of the other objects here;
+	//     without these two the exit stepped over them on the flip to today
+	//     (#2197). The NATS fence is the first object that path writes, so a
+	//     guardrail render that died anywhere leaves it; the session fence is
+	//     the last fence the teardown deletes, so a cleanup pass that died
+	//     between the two leaves it,
+	//   - the inject door's fence, for the shape neither of those two covers.
+	//     It is written after both and deleted before both, so a render or a
+	//     cleanup that dies partway always leaves one of the two standing
+	//     beside it. The hand does not die partway: an operator triaging an
+	//     EgressAllowlistRefused who deletes the NATS and session fences and
+	//     flips the CR to today before the reconcile that delete enqueued has
+	//     re-applied them hands the first today reconcile a tree holding the
+	//     inject fence alone. Nothing on the today path but this walk removes
+	//     it -- removeA2AInjectBackend runs from the next render only -- so
+	//     without this entry the exit returned, and did so again on every
+	//     reconcile after, over an owned A2A NetworkPolicy. Listed whatever
+	//     the flag says, like its teardown entry: the install that has it is
+	//     the one whose operator was deployed with the flag, and the read
+	//     finds nothing on one that never was,
 	//   - the callout keys Secret, which is the FIRST deletable object
 	//     reconcileA2A creates — the per-user creds Secret is created before it
 	//     and deliberately survives — so a render that died anywhere leaves this
@@ -4081,18 +4104,36 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	//     an operator upgraded across this change and then flipped to `today`
 	//     would otherwise step over a config Secret no later object accompanies.
 	//
-	// Without the third and fourth the exit would step over those objects and
-	// leave an A2A object on a `today` install, which is the darkness property.
-	// The first two are Owns kinds and free; the two Secret reads are uncached
-	// and happen only when the free two both miss.
+	// Without the Secrets and the fences the exit would step over those objects
+	// and leave an A2A object on a `today` install, which is the darkness
+	// property. The first five are Owns kinds and free; the two Secret reads
+	// are uncached and happen only when the free five all miss.
 	//
-	// Adding an object to reconcileA2A ahead of the keys Secret means adding it
-	// here. TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere walks every
-	// prefix of the render and is what makes forgetting it red rather than
-	// silent: without the keys Secret below, its writes 3 and 4 fail.
+	// A sentinel counts only when this CR owns it: a squatted or stale-UID
+	// object under a reserved name is not residue of this CR and is left to
+	// its owner or to the garbage collector. The walk below refuses to delete
+	// anything this CR does not own, so a present-but-unowned sentinel that
+	// counted would send every reconcile of a today install into that refusal
+	// -- the shape a next CR deleted and re-created under the same name in
+	// today mode takes, while its old fences still carry the old UID.
+	// Ownership is read off the fetched object, so the exit stays at seven
+	// Gets.
+	//
+	// Adding an object to reconcileA2A ahead of the keys Secret, or to
+	// reconcileA2ANetworkFences ahead of the NATS fence, means adding it here.
+	// TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere walks every
+	// prefix of both renders and is what makes forgetting it red rather than
+	// silent: without the keys Secret below, its writes 3 and 4 fail, and
+	// without the fences every guardrail prefix does. The inject fence is
+	// the one no prefix leaves alone;
+	// TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip is what reds
+	// without it.
 	sentinels := []a2aTeardownEntry{
 		{&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aInjectName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 	}
@@ -4100,8 +4141,11 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	for _, s := range sentinels {
 		err := s.reader.Get(ctx, client.ObjectKeyFromObject(s.obj), s.obj)
 		if err == nil {
-			anyPresent = true
-			break
+			if metav1.IsControlledBy(s.obj, agent) {
+				anyPresent = true
+				break
+			}
+			continue
 		}
 		if client.IgnoreNotFound(err) != nil {
 			return err

@@ -149,7 +149,7 @@ the assignee is the claim; do not apply `status:` labels to issues in this repos
 
 - Skills live under `agents/platform/skills/` (Platform Agent) and `agents/cluster/skills/` (Cluster Agent); each holds a `SKILL.md` for an AI agent.
 - Place a skill by persona: fleet, provisioning and GitOps-write skills go to the Platform Agent; read-only, single-cluster runtime debugging to the Cluster Agent.
-- `agents/platform/skills/gke-*` are copies of `google/skills` that `scripts/sync-upstream-skills.py` overwrites wholesale, so the prefix is reserved and a direct edit lasts until the next sync. Put a `SKILL.md` change in its `SKILL_SUBSTITUTIONS` or `SKILL_FOOTERS` and make the same edit by hand; a rerun refreshes every skill from upstream.
+- `agents/platform/skills/gke-*` are copies of `google/skills` that `scripts/sync-upstream-skills.py` overwrites wholesale, so the prefix is reserved and a direct edit lasts until the next sync. Put a `SKILL.md` change in its `SKILL_SUBSTITUTIONS` or `SKILL_FOOTERS` and make the same edit by hand; a rerun refreshes every skill, or aborts on a drifted entry.
 
 ## Engineering Rules
 
@@ -406,19 +406,19 @@ Three things to do with it:
 
 **When it runs.** On `opened`, `reopened`, and draft-marked-ready. **Pushing more commits does not
 start another review**, with one exception: a branch the bot last said does not merge gets one after
-the next push. For a fresh review of the current commit, comment `/review` on a line of its own
+the next push. For another pass over the current commit, comment `/review` on a line of its own
 (owners, members, and collaborators only): the strict pass, what the bot is certain of plus any
 high-severity finding just under that bar, marked as such. `/review all` re-reads at the first
 review's width and adds findings it believes are real without being sure. The `agent:ignore` label
 opts a pull request out and outranks both.
 
 **A human reviewer is requested only once its check passes.** The bot posts an `AI Review` check
-run alongside its review — `success` when it found nothing, `neutral` when it did — and
-`.github/workflows/auto_request_review.yml` waits for that check to go green before assigning
-anyone from `.github/auto_request_review.yml`. Opening a pull request no longer pings a human, so
-clearing the findings and commenting `/review` for a clean pass is what puts the change in front of
-a reviewer. Two exceptions: a pull request opened by a bot is assigned as soon as the check
-completes, whatever the conclusion, because Dependabot cannot re-run `/review` on itself; and an
+run, and `.github/workflows/auto_request_review.yml` waits for it to go green before assigning
+anyone from `.github/auto_request_review.yml`. A first review is green only if it found nothing; a
+later review of it holds the check on 🔴 High alone, with 🟠 Medium posted, not held
+([what the check means](docs/pull-request-workflow.md#what-the-check-means) has the cases). A green
+pass after `/review` is what reaches a reviewer. Exceptions: a pull request opened by a bot is
+assigned as soon as the check completes, whatever the conclusion, because Dependabot cannot re-run `/review` on itself; and an
 owner, member, or collaborator can comment `/request-review` (at the start of the comment) to
 assign a reviewer immediately — the override for a finding you have answered but disagree with, or
 for a review that never arrived. Nothing here changes who is picked; that is still the config file.

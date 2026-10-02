@@ -23,6 +23,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -373,6 +374,17 @@ func sweepA2ALabelled(ctx context.Context, t *testing.T, cl client.Client, visit
 	}
 	for i := range rbs.Items {
 		visit("RoleBinding", rbs.Items[i].Name)
+	}
+
+	// The fences. These are the one kind the guardrail path writes on a
+	// refusal before reconcileA2A is reached, so a sweep without them could
+	// not see the residue a refused-then-flipped install leaves (#2197).
+	var netpols networkingv1.NetworkPolicyList
+	if err := cl.List(ctx, &netpols, inNS, hasLabel); err != nil {
+		t.Fatalf("list networkpolicies: %v", err)
+	}
+	for i := range netpols.Items {
+		visit("NetworkPolicy", netpols.Items[i].Name)
 	}
 
 	// Cluster-scoped, and therefore the one that cannot be reclaimed by an

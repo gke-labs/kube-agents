@@ -15,12 +15,15 @@ from tests.testing.common import (
     INVALID_GA_RELEASE_TAGS,
     MOCK_DEFAULT_REGISTRY_PREFIX,
     create_minimal_tools_bin,
+    create_mock_git_repo,
     get_isolated_test_env,
 )
 from tests.testing.release import (
+    MOCK_CANDIDATE_RELEASE_IMAGES,
     MOCK_RELEASE_BUNDLE_VERSION,
     MOCK_REQUIRED_RELEASE_IMAGES,
     MOCK_TARGET_RELEASE_VERSION,
+    commit_required_release_images,
     create_mock_syft_binary,
 )
 
@@ -29,6 +32,12 @@ _SBOM_SCRIPT = _REPO_ROOT / "scripts" / "release" / "generate_release_sbom.sh"
 
 
 class GenerateReleaseSbomTest(unittest.TestCase):
+    def setUp(self):
+        # A repository of its own: the script reads the release's image list at
+        # the tag's commit, and this checkout carries real tags by these names.
+        self.repo_temp_dir, self.repo_dir, self.git = create_mock_git_repo()
+        self.addCleanup(self.repo_temp_dir.cleanup)
+
     def _run_script(self, args=None, env=None, bin_dir=None, cwd=None):
         cmd = ["bash", str(_SBOM_SCRIPT)] + (args or [])
         full_env = get_isolated_test_env(overrides=env, bin_dir=bin_dir)
@@ -37,7 +46,7 @@ class GenerateReleaseSbomTest(unittest.TestCase):
             capture_output=True,
             text=True,
             env=full_env,
-            cwd=cwd or str(_REPO_ROOT),
+            cwd=cwd or self.repo_dir,
         )
 
     def test_missing_tag_fails(self):
@@ -122,6 +131,39 @@ class GenerateReleaseSbomTest(unittest.TestCase):
                 self.assertTrue(img_sbom.exists(), f"Image SBOM for {img} should exist")
                 img_data = json.loads(img_sbom.read_text())
                 self.assertEqual(img_data.get("spdxVersion"), "SPDX-2.3")
+
+    def test_image_sboms_follow_the_releases_own_list(self):
+        """The release's tag commit lists fewer images than this checkout; an
+        SBOM is generated for each of those and for nothing else (#2211)."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = pathlib.Path(temp_dir)
+            bin_dir = temp_path / "bin"
+            dist_dir = temp_path / "dist"
+            target_dir = temp_path / "stage"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            (target_dir / "sample.txt").write_text("sample content")
+            create_mock_syft_binary(bin_dir)
+            release_commit = commit_required_release_images(self.repo_dir, self.git, MOCK_CANDIDATE_RELEASE_IMAGES)
+            self.git("tag", MOCK_RELEASE_BUNDLE_VERSION, release_commit)
+
+            proc = self._run_script(
+                [MOCK_RELEASE_BUNDLE_VERSION, str(target_dir)],
+                env={
+                    "DIST_DIR": str(dist_dir),
+                    "CI": "true",
+                    "REGISTRY_PREFIX": MOCK_DEFAULT_REGISTRY_PREFIX,
+                },
+                bin_dir=bin_dir,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(f"lists at {release_commit[:7]}", proc.stderr)
+            for img in MOCK_CANDIDATE_RELEASE_IMAGES:
+                self.assertTrue((dist_dir / f"{img}-{MOCK_RELEASE_BUNDLE_VERSION}.spdx.json").exists(), img)
+            for img in set(MOCK_REQUIRED_RELEASE_IMAGES) - set(MOCK_CANDIDATE_RELEASE_IMAGES):
+                self.assertFalse(
+                    (dist_dir / f"{img}-{MOCK_RELEASE_BUNDLE_VERSION}.spdx.json").exists(),
+                    f"{img} is not in the release's list",
+                )
 
     def test_image_sbom_failure_in_ci_fails(self):
         with tempfile.TemporaryDirectory() as temp_dir:

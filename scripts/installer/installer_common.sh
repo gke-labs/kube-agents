@@ -2957,6 +2957,31 @@ write_tfvars_from_state() {
     echo "# Optional AgentPlugins"
     echo "enable_pubsub_platform       = $(hcl_bool "${ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}")"
     echo "enable_stockout_investigator = $(hcl_bool "${ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}")"
+    # Written only when on, and both keys together, which is the one place in
+    # this file that omits a key rather than writing false.
+    #
+    # enable_drift_pubsub is also reachable on its own as a TF_VAR_ line in
+    # install.env, and a tfvars key beats TF_VAR_. Writing "false" here
+    # unconditionally would therefore override an install already running the
+    # ingress that way and destroy its sink, topic and subscription on the next
+    # upgrade -- from a release note nobody read. Omitted, that install is
+    # untouched; the front doors turn drift detection off again by dropping
+    # both keys, which is the ordinary teardown the other flags get from
+    # writing false.
+    # is_truthy, not a compare against the lowercase literal: every other
+    # boolean here reaches hcl_bool -> is_truthy, which takes True/yes/y/1/on,
+    # and install.env is hand-written. A string compare would read
+    # ENABLE_DRIFT_DETECTOR=True as off and silently provision nothing
+    # (install.sh says the same about GOOGLE_CHAT_ENABLED, for the same
+    # reason).
+    if is_truthy "${ENABLE_DRIFT_DETECTOR:-$DEFAULT_ENABLE_DRIFT_DETECTOR}"; then
+      echo ""
+      echo "# Out-of-band change detection: the audit-log ingress and the consumer"
+      echo "# that reads it. Both, because the detector reads the subscription the"
+      echo "# first one provisions and the composition refuses the apply otherwise."
+      echo "enable_drift_pubsub   = true"
+      echo "enable_drift_detector = true"
+    fi
   } > "${dest}.tmp"
   chmod 600 "${dest}.tmp"
   mv -f -- "${dest}.tmp" "$dest"

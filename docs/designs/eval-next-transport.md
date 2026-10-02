@@ -195,7 +195,8 @@ the adapter's side of the door and is not a sixth backend operation: a pure read
 conversation's state that mutates nothing. It returns what the session record holds for the key,
 the active task with its `SubmittedAt`, from which the age in the nobody-took-it outcome is
 computed, and `Detached`, which the harness reads after its own cancel so it never sends a
-second one and grades the timeout from a detached record, the fold of the task's stream, its
+second one and grades the timeout from a detached record (a `task=` read of a task the record
+no longer holds as active carries neither), the fold of the task's stream, its
 state none, `submitted`, `working` or a terminal with the result text, and the last posted
 message, plus the gateway's configured grace and the backend the gateway armed; the
 infrastructure paragraph below says what the harness does with it.
@@ -323,7 +324,12 @@ a trajectory item in the api path's shape, and writes one `a2a.activity` marker 
 was present at all; a probe without the key leaves the record with no marker and no calls. Which
 executor publishes `activity`, and whether the door carries it, is each component's own to state
 (the payload spec reserves the artifact; `a2a/gateway/inject.go` defines the probe body); the
-harness asks neither and grades on what the probe carried. `worker_commands` reads
+harness asks neither and grades on what the probe carried. Both executors publish it: the
+worker adapter from the `tool_use` content blocks in the stream of the coding agent it runs,
+the Hermes bridge from hermes's outbound
+webhooks (`a2a/docs/hermes-bridge.md`, "Activity"), one entry per invocation with the tool and
+its input; the bridge's entries also carry the call's status, and the bridge alone publishes a
+`progress` heartbeat. `worker_commands` reads
 the kanban worker logs by card id; on
 this path it has data only once the case runner's delegation wait is rebuilt for it (Completion
 signals), and until then a case that gates on it has no data on stage 1 either. Neither is graded

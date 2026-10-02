@@ -589,9 +589,11 @@ Five knobs need context beyond the chart:
   [`terraform/modules/drift-pubsub`](../../terraform/modules/drift-pubsub/)
   applied against the project first.
   [`terraform/examples/full-install`](../../terraform/examples/full-install/README.md#drift-audit-log-ingress)
-  does that as part of its own apply when `enable_drift_pubsub = true`; an
-  install that renders this chart without the composition applies the module
-  itself. The chart does not check, and neither does
+  does that as part of its own apply when `enable_drift_pubsub = true`, and
+  writes this value itself from `enable_drift_detector`, refusing an apply that
+  asks for the second without the first; an install that renders this chart
+  without the composition applies the module itself. The chart does not check,
+  and neither does
   the detector: enabled without a subscription to read, it comes up and retries
   a pull that cannot succeed for the life of the pod, never exits, and leaves
   the pod Ready. That is why it defaults to off.

@@ -5776,6 +5776,46 @@ class TestDeclaredIntentSearch(HarnessTestCase):
 
 # --------------------------------------------------------------------------- #
 # Harness-side declaration discovery and matching (the obtainability SOP's §4a)
+
+
+class ExplainEmptyDeclarationsTest(unittest.TestCase):
+    """The reason a note yields no declaration is the parser's own ladder, printed."""
+
+    GOOD = "---\ntype: decision\ndeclares:\n  - check: no-pdb\n    namespace: shop\n    object: Deployment/api\n---\nbody\n"
+
+    def test_each_early_return_names_its_reason_and_items_return_none(self):
+        cases = {
+            "no frontmatter": ("body only\n", "it has no frontmatter"),
+            "unclosed": ("---\ntype: decision\nbody\n", "it has no frontmatter"),
+            "invalid yaml": ("---\ntype: [\n---\n", "not valid YAML ("),
+            "pyyaml value error": ("---\ntype: decision\nreviewed: 2026-02-30\n---\n", "not valid YAML (ValueError)"),
+            "no type": ("---\ndeclares: []\n---\n", "has no `type`"),
+            # A sequence or a scalar parses cleanly and is not a mapping; the
+            # reason names the shape rather than a key the text may contain.
+            "list frontmatter": ("---\n- type: decision\n- declares: []\n---\n", "is a YAML list, not a mapping"),
+            "scalar frontmatter": ("---\njust words\n---\n", "is a YAML str, not a mapping"),
+            "no declares": ("---\ntype: decision\n---\n", "has no `declares` list"),
+            "declares not a list": ("---\ntype: decision\ndeclares: yes\n---\n", "is not a list"),
+            "declares empty": ("---\ntype: decision\ndeclares: []\n---\n", "list is empty"),
+        }
+        for label, (text, expected) in cases.items():
+            with self.subTest(label):
+                reason = audit_report.explain_empty_declarations(text)
+                self.assertIsNotNone(reason, label)
+                self.assertIn(expected, reason)
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(
+                        audit_report.parse_declarations(text, repo="acme/fleet", path="k/n.md", declarable=frozenset({"no-pdb"})),
+                        [],
+                    )
+        self.assertIsNone(audit_report.explain_empty_declarations(self.GOOD))
+
+    def test_the_explanation_logs_nothing(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            audit_report.explain_empty_declarations("---\ntype: [\n---\n")
+            audit_report.explain_empty_declarations("---\ntype: decision\ndeclares: yes\n---\n")
+        self.assertEqual(err.getvalue(), "")
 # --------------------------------------------------------------------------- #
 
 
