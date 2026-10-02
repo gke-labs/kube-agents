@@ -953,11 +953,15 @@ says so: a scheduled audit is a cron run on the Platform Agent's own roster
 (`agents/platform/cron/jobs.json`, ticked by `profile-cron-tick`), executed in a process of its own
 with no kanban card behind it and so no completion for a chat subscription to follow. The Platform
 Agent profile holds no chat destination either — it ships no `platforms:` section, and a privileged
-fleet-management profile should not acquire one — so a scheduled run's report reaches humans through
-the Tier 1 ledger and nowhere else. `silent_ok` still earns its keep on the dispatched path, where a
-person is demonstrably waiting; on the scheduled path it currently gates a delivery leg that has no
-destination. If a scheduled chat ping is ever wanted it belongs on the Chat Agent, which owns
-ingress, and it should carry a pointer — title, counts, ledger URL — not the report.
+fleet-management profile should not acquire one — so the Platform Agent's own delivery leg has no
+destination, and the Tier 1 ledger is where a scheduled run's report is read. `silent_ok` still earns
+its keep on the dispatched path, where a person is demonstrably waiting. The scheduled chat ping
+lives on the Chat Agent, which owns ingress: the cron report relay
+([`cron-report-relay.md`](cron-report-relay.md)) posts the run's one line of counts ending with the
+ledger URL. In Slack with `KAGE_SLACK_UX` on that line becomes a card built from the ledger issue:
+a headline carrying the issue's one total, any clusters the run did not scan, its top two findings
+and a link to the issue; the issue stays the report, and the card only summarises what it already
+says.
 
 ## 8. Labels
 
