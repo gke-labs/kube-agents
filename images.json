@@ -77,7 +77,7 @@
       "tagPolicy": "release",
       "override": "A2A_WORKER_IMAGE",
       "pulledBy": "The session pods the A2A gateway spawns under spec.mode: next; the operator passes its resolution to the gateway as A2A_WORKER_IMAGE.",
-      "description": "The session worker of the A2A next stack (a2a/Dockerfile.worker)."
+      "description": "The session worker of the A2A next stack (a2a/Dockerfile.worker): the agent SDK, the worker adapter, and the credential broker's shim as kubectl and gcloud for the flag-gated cluster view."
     },
     {
       "name": "a2a-authcallout",

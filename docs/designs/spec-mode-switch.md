@@ -153,6 +153,17 @@ image overrides are already decided. The operator's render tests check that the 
 renders no part of the door, and the conformance suite that every render site consults the flag
 and that the flag is not a CRD field.
 
+A second switch of the same kind: `A2A_SESSION_CLUSTER_VIEW=true` on the operator, on top of
+`spec.mode: next`, gives the session pods the gateway spawns a temporary read-only view of the
+clusters. The operator names the session ServiceAccount on the credential broker's allowed
+callers, renders a session audience the broker maps to a role that reaches the exec route for
+`kubectl` and `gcloud` only, opens the broker's ingress and the session pod's egress to each
+other, and tells the gateway, whose spawner projects the audience-bound token and enables the
+worker's shell. The session ServiceAccount gains no RBAC in either state; `kubectl` runs in the
+broker, read-only. Operator-level for the reason above: the pod executes model output, and
+widening its fence is a property of who deployed the operator. It is a demo aid until
+declarative profiles carry a session's identity and tools, and it goes when they do.
+
 ## Per-feature overrides - sketched, not built
 
 If a component later needs to graduate separately, the shape is a sibling map consulted by
