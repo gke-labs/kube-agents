@@ -218,6 +218,13 @@ class InstallerCommonTest(unittest.TestCase):
                     # a developer's exported memory mode must not steer a test.
                     "MEMORY": "",
                     "MEMORY_PROVIDER": "",
+                    # Same reasoning, and the same ${VAR:-} read in
+                    # write_tfvars_from_state. get_isolated_test_env filters
+                    # the CI names and nothing else, so without this a shell
+                    # exporting ENABLE_DRIFT_DETECTOR=true reaches every case
+                    # that does not set it -- including the arm below that
+                    # asserts the drift keys are omitted when nobody asks.
+                    "ENABLE_DRIFT_DETECTOR": "",
                     **(env or {}),
                 },
                 bin_dir=str(bin_dir),
@@ -377,6 +384,106 @@ class InstallerCommonTest(unittest.TestCase):
             gcloud_stdout="this is not JSON {",
         )
         self.assertIn("rc=2\n", proc.stdout, proc.stderr)
+
+    # ── the drift keys: written only when on, and both together ─────────────
+
+    def _drift_tfvars(self, **env):
+        """_tfvars under these keys, with a credential and an existing cluster.
+
+        API_SERVER_KEY because the generator refuses to write without one, and
+        the Autopilot describe stub because the default says the cluster does
+        not exist, which writes a different file.
+        """
+        return self._tfvars(
+            {"API_SERVER_KEY": "k", **env},
+            describe_stub=_autopilot_describe_stub(),
+        )
+
+    def test_tfvars_writes_both_drift_keys_when_the_detector_is_on(self):
+        """The ingress and the consumer travel together, on every truthy
+        spelling install.env accepts.
+
+        The composition's helm_release precondition refuses
+        enable_drift_detector without enable_drift_pubsub, so one key here has
+        to produce both. The spellings are the point of the loop: every other
+        boolean in this generator reaches is_truthy through hcl_bool, and a
+        compare against the lowercase literal would read
+        ENABLE_DRIFT_DETECTOR=True as off and provision nothing at all, which
+        is the outcome with no error and nothing to observe afterwards.
+        """
+        for value in ("true", "True", "TRUE", "yes", "y", "1", "on", " true "):
+            with self.subTest(value=value):
+                content = self._drift_tfvars(ENABLE_DRIFT_DETECTOR=value)
+                self.assertIn("enable_drift_pubsub   = true", content)
+                self.assertIn("enable_drift_detector = true", content)
+
+    def test_tfvars_omits_the_drift_keys_when_the_detector_is_off(self):
+        """Omitted rather than written false, which is this generator's one
+        boolean exception, and the reason for it.
+
+        enable_drift_pubsub is also reachable on its own as a TF_VAR_ line in
+        install.env, and terraform.tfvars beats TF_VAR_. `enable_drift_pubsub
+        = false` here would therefore override an install already running the
+        audit-log ingress that way, and the next upgrade would destroy its
+        sink, topic and subscription under -auto-approve.
+
+        The None arm is the key absent from what the case passes in. It only
+        means "unset" because _run blanks ENABLE_DRIFT_DETECTOR in the
+        isolated environment it builds; get_isolated_test_env copies the rest
+        of os.environ through, so without that blank this arm would assert
+        against whatever the developer's shell happened to export.
+        """
+        for value in ("false", "False", "no", "0", "off", "", None):
+            with self.subTest(value=value):
+                env = {} if value is None else {"ENABLE_DRIFT_DETECTOR": value}
+                content = self._drift_tfvars(**env)
+                self.assertNotIn("enable_drift_pubsub", content)
+                self.assertNotIn("enable_drift_detector", content)
+
+    def test_an_exported_value_survives_the_file_load_into_the_tfvars(self):
+        """install.env is not this generator's only input, and no front door makes it one.
+
+        install.sh's unrecorded-value guard tells the operator what upgrade.sh
+        will do with a key their install.env does not record, so that sentence
+        has to match this. `write_tfvars_from_state` reads
+        ${ENABLE_DRIFT_DETECTOR:-...} out of the environment;
+        `load_install_env` clears NAMESPACE and the seven scope keys before
+        sourcing, and upgrade.sh clears PROJECT_ID, CLUSTER_NAME and REGION;
+        ENABLE_DRIFT_DETECTOR is on neither list. So `ENABLE_DRIFT_DETECTOR=true
+        ./upgrade.sh` over a file predating the key provisions the sink, topic
+        and subscription -- on a front door with no guard on that route at all
+        -- and the next upgrade from a shell without the export writes neither
+        key and destroys them under -auto-approve.
+
+        The scope key is the contrast, and the reason this is asserted as a
+        pair: the clearing list is what decides, and a sentence claiming either
+        key comes from the file alone is true of exactly one of them.
+
+        Only load_install_env's half of that list is read here -- the body
+        sources installer_common.sh and never runs upgrade.sh. The other half
+        is pinned by test_upgrade_script.py's
+        test_the_upgrade_clearing_list_is_the_three_coordinates, which is the
+        one that fails if ENABLE_DRIFT_DETECTOR is ever added to it and the
+        guard's sentence goes stale.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            install_env = pathlib.Path(tmp) / "install.env"
+            install_env.write_text("PROJECT_ID=p\n")
+            dest = pathlib.Path(tmp) / "terraform.tfvars"
+            proc = self._run(
+                f'load_install_env "{install_env}"; write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    "ENABLE_DRIFT_DETECTOR": "true",
+                    "SCOPE_PROJECTS": "exported-project",
+                },
+                describe_stub=_autopilot_describe_stub(),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn("enable_drift_pubsub   = true", content)
+            self.assertIn("enable_drift_detector = true", content)
+            self.assertNotIn("exported-project", content)
 
     # ── the cert-manager probe: a Deployment alone cannot say whose it is ────
 
@@ -999,15 +1106,18 @@ class InstallerCommonTest(unittest.TestCase):
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertNotIn("1.27.4-gke.800", proc.stderr)
 
-    def _tfvars(self, env):
+    def _tfvars(self, env, **run_kwargs):
         """Generate a terraform.tfvars and return its text.
 
         The generator writes `<dest>.tmp` and renames it into place, so the
         destination has to be a real path in a writable directory.
+
+        `run_kwargs` reach `_run`, for a caller that needs a different stub
+        than the defaults — `_drift_tfvars` wants an Autopilot cluster.
         """
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
-            proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env)
+            proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env, **run_kwargs)
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             return dest.read_text()
 

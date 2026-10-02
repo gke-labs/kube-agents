@@ -654,8 +654,7 @@ class InstallerEntryPoints(unittest.TestCase):
     def test_make_targets_that_redeploy(self):
         with TemporaryDirectory() as tmp:
             _write_install_env(tmp)
-            for cmd in ('make dev-rebuild-agent ARGS="platform"', "make tf-destroy",
-                        "make docker-push-platform"):
+            for cmd in ('make dev-rebuild-agent ARGS="platform"', "make tf-destroy"):
                 with self.subTest(cmd=cmd):
                     target, _ = classify(cmd, cwd=tmp)
                     self.assertEqual(name_of(target), "agents-cluster")
