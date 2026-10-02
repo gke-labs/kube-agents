@@ -22,7 +22,7 @@ With the flag on, :func:`register` adds two listeners:
   whole line the message itself shows ("Fix the first one: <the first row>",
   markup and a row's severity aside) is the turn, so a session that never
   read the message is told what the click is about. Part of a line is not
-  enough: it can say the opposite of the line it came from. The echo and the answered line still show the label. A
+  enough: it can say the opposite of the line it came from. The answered line (or its echo) still shows the label. A
   label that starts like a command (``/`` or ``!``) is sent as text, since a
   choice is an answer. The click goes through the adapter's own interactive
   authorization; an unlisted user's click is logged and changes nothing, and
@@ -71,7 +71,7 @@ the thread is read once, plus the cached thread-root lookup the adapter's
 channel gate makes, and if a person the adapter would answer (not a bot by
 its own test, its interactive authorization, the check the clicker passed, and
 its channel gate with the mention rule the click skips) has replied with one of the call to
-action's forms (``apply``, ``apply Option B``, ``apply B``, any of them ending
+action's forms (``apply``, ``apply Option B``, ``apply B`` (a letter the alert offers, when its options are lettered), any of them ending
 in a please or a thanks, or a button's whole text, ``apply Option B: <that
 option's text>``; a colon before anything else is not one) since the buttons appeared, the buttons are replaced with
 "answered in the thread" and the click is dropped. Any option typed counts, not only the one
@@ -90,7 +90,7 @@ test is the exception: the adapter makes it before any other, so one that
 raises took no turn and that reply does not count. Other choice buttons are
 not checked.
 
-A click that runs is fail-soft: a rewrite or echo that fails is logged and the
+A click that runs is fail-soft: a rewrite, or the echo standing in for it, that fails is logged and the
 turn still runs, because the click was the user's answer. A click dropped for a
 typed apply runs no turn, whether or not its rewrite lands.
 """
@@ -132,10 +132,6 @@ TURN_JOIN = ": "
 #: the guard in front keeps it an answer. Zero-width, so the agent reads the label.
 COMMAND_PREFIXES = ("/", "!")
 COMMAND_GUARD = "\u200b"
-
-#: A 1:1 DM's channel id starts with this; upstream titles a DM thread from its
-#: first message, a channel thread through ``gateway/slack_ux_status.py``.
-DM_CHANNEL_PREFIX = "D"
 
 #: Added to the turn when the clicked message is a card's question.
 CARD_NOTE = "(Clicked on the question from card {card}.)"
@@ -536,8 +532,13 @@ def _typed_apply(text: str, options: frozenset[tuple[str, str]]) -> bool:
     after the colon is that option's own in ``options``. A guess at what the agent applies."""
     text = TYPED_STRUCK.sub("", text).translate(TYPED_MARKUP)
     typed = TYPED_APPLY.match(text, TYPED_LEAD.match(text).end())
-    if not typed or not typed.group(0).endswith(":"):
-        return bool(typed)
+    if not typed:
+        return False
+    if not typed.group(0).endswith(":"):
+        # A letter the alert does not offer applies nothing. A single fix (no letters) or no
+        # option read: any letter counts, since the agent may apply the one fix anyway.
+        letters = {letter for letter, _ in options if letter}
+        return not (typed.group(1) and letters) or typed.group(1).upper() in letters
     tail = SLACK_LINK.sub(lambda link: link.group(2) or link.group(1), text[typed.end():])
     return ((typed.group(1) or "").upper(), _option_text(tail)) in options
 

@@ -24,7 +24,7 @@ Two things are checked:
    the guard names is bound at module level.
 2. The runtime module, loaded by path from ``gateway/`` and driven with a stub
    adapter: flag off it registers nothing; flag on, an authorized choice click
-   rewrites the message, echoes, and reaches the message handler as the
+   rewrites the message as answered and reaches the message handler as the
    clicker's message in the thread; an unauthorized one does none of that.
 
 A click that reaches nothing raises nothing: Slack shows the button as

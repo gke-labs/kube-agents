@@ -168,13 +168,18 @@ class OpenedPrTest(unittest.TestCase):
         self.assertTrue(_contexts(blocks)[0].endswith(p.ELLIPSIS))
 
     def test_a_name_ending_in_ed_is_someone_else(self):
-        for line in (f"Fred: opened {PR}", f"Mohammed, as usual, opened {PR}"):
+        for line in (
+            f"Fred: opened {PR}", f"Mohammed, as usual, opened {PR}", f"Triggered by Renovate, opened {PR}",
+            f"Triggered by Renovate and opened {PR}", f"Rotated by cert-manager: opened {PR}",
+        ):
             self.assertIsNone(m.opened_pr(line), line)
 
     def test_our_own_outcome_and_step_labels_still_open_a_pr(self):
         for line in (
             f"Resolved: opened {PR}", f"Tests passed, opened {PR}", f"Working on it, opened {PR}",
-            f"Addressed the review, opened {PR}",
+            f"Addressed the review, opened {PR}", f"Drained node-a and opened {PR}", f"Rotated the cert, opened {PR}",
+            f"Cordoned node-b: opened {PR}", f"Fixed by bumping the chart, opened {PR}",
+            f"Fixed by hand, opened {PR}", f"Scaled by 2x and opened {PR}",
         ):
             self.assertEqual(m.opened_pr(line)[0], PR, line)
 
@@ -286,11 +291,17 @@ class NeedsYouTest(unittest.TestCase):
         self.assertEqual(_contexts(blocks)[0], "I found:\n- pod a is OOMKilled\n- pod b is Pending")
 
     def test_a_plan_after_a_proceed_question_is_not_choices(self):
-        for question in ("Shall I proceed?", "OK to go ahead?", "Should I continue?", "Do you approve?"):
+        for question in (
+            "Shall I proceed?", "OK to go ahead?", "Should I continue?", "Do you approve?", "Sound good?",
+            "Does this plan look right?", "Does the fix look good to you?", "Does the new plan look right?", "Do these look right?", "Looks OK?", "OK?", "Any objections?",
+        ):
             reason = f"Here is the fix. {question}\n1. Drain node-pool-a\n2. Upgrade to 1.31\n3. Uncordon"
             blocks, text = m.needs_you(reason)
             self.assertEqual(_buttons(blocks), [], question)
             self.assertIn("1. Drain node-pool-a", text, question)
+        for question in ("Looks good, what next?", "Looks OK, but where should I start?", "Thoughts?"):
+            blocks, _ = m.needs_you(f"{question}\n- Drain\n- Upgrade")
+            self.assertEqual(len(_buttons(blocks)), 2, question)
         blocks, _ = m.needs_you("Which step should I proceed with?\n- Drain\n- Upgrade")
         self.assertEqual([b["text"]["text"] for b in _buttons(blocks)], ["Drain", "Upgrade"])
 

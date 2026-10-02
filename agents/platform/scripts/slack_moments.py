@@ -93,17 +93,24 @@ OTHER_SUBJECT = frozenset({"he", "she", "they", "who", "which"})
 #: The worker's own earlier steps. A list rather than "-ed", which would take
 #: "Ahmed then opened" and "Fred reviewed and opened" as ours.
 OUR_VERB = frozenset({
-    "added", "addressed", "adjusted", "analysed", "analyzed", "applied", "audited", "began", "bumped", "built",
+    "added", "addressed", "adjusted", "analysed", "analyzed", "applied", "audited", "began", "bumped", "built", "cherry-picked", "cordoned",
     "changed", "checked", "cleaned", "closed", "committed", "compared", "confirmed", "corrected",
-    "created", "debugged", "decreased", "deployed", "diagnosed", "did", "disabled", "documented",
-    "drafted", "edited", "enabled", "fetched", "filed", "fixed", "following", "found", "generated", "got",
+    "created", "debugged", "decreased", "deleted", "deployed", "diagnosed", "did", "disabled", "documented",
+    "drafted", "drained", "dropped", "edited", "enabled", "fetched", "filed", "fixed", "following", "found", "generated", "got",
     "identified", "implemented", "increased", "inspected", "installed", "investigated", "investigating", "kept",
     "looked", "lowered", "made", "merged", "migrated", "modified", "moved", "opened", "patched",
-    "pinned", "prepared", "proposed", "pulled", "pushed", "put", "raised", "ran", "re-ran", "read", "rebased",
-    "rebuilt", "reduced", "refactored", "regenerated", "released", "removed", "renamed", "replaced",
-    "reproduced", "reran", "resolved", "restarted", "restored", "reverted", "reviewed", "rewrote", "rolled",
-    "scaled", "sent", "set", "shipped", "split", "submitted", "superseded", "tested", "took", "traced",
-    "tuned", "updated", "updating", "upgraded", "validated", "verified", "working", "wrote",
+    "pinned", "prepared", "proposed", "provisioned", "pulled", "pushed", "put", "raised", "ran", "re-ran", "read", "rebased",
+    "rebuilt", "reconciled", "recreated", "redeployed", "reduced", "refactored", "refreshed", "regenerated", "released", "removed", "renamed", "replaced",
+    "reproduced", "reran", "resized", "resolved", "restarted", "restored", "retried", "reverted", "reviewed", "rewrote", "rolled", "rotated",
+    "scaled", "sent", "set", "shipped", "split", "submitted", "superseded", "synced", "tagged", "tested", "took", "traced", "triggered",
+    "tuned", "uncordoned", "updated", "updating", "upgraded", "validated", "verified", "working", "wrote",
+})
+#: Steps a bot or a person gets credit for with "by": "Triggered by Renovate" is
+#: Renovate's, while "Fixed by hand" and "Scaled by 2x" are ours.
+PASSIVE_BY = "by"
+CREDITED_VERB = frozenset({
+    "created", "dropped", "filed", "generated", "merged", "raised", "retried", "reviewed", "rotated",
+    "submitted", "synced", "tagged", "triggered",
 })
 #: The worker's line under the headline, clipped: a note can be one long
 #: paragraph, and a Slack context element holds at most 3,000 characters.
@@ -138,13 +145,17 @@ OPTION_LINE = re.compile(r"^\s*(?:[-*•]|\d+[.)]|[A-Za-z][.)])\s+(.+?)\s*$")
 #: How the line right before the options must end for them to be choices; a
 #: list after "I found:" is evidence, not answers.
 QUESTION_END = "?"
-#: A yes/no question asking leave to go on ("Shall I proceed?", "OK to continue?"):
-#: a list after it is the plan, not answers, unless the question also offers a
-#: choice ("Shall I proceed with A or B?"). "How would you like to proceed?" asks
-#: for one of the options, so it is not one.
+#: A yes/no question asking leave to go on ("Shall I proceed?", "OK to continue?",
+#: "Sound good?", "Does the fix look right?"): a list after it is the plan, not
+#: answers, unless the question also offers a choice ("Shall I proceed with A or
+#: B?"). "How would you like to proceed?" asks for one of the options, so it is not one.
 PROCEED_QUESTION = re.compile(
     r"^(?:(?:shall|should|can|may)\s+(?:i|we)|(?:is\s+it\s+)?ok(?:ay)?\s+to)\b.*?\b(?:proceed|continue|go\s+ahead)\b"
-    r"|^do\s+you\s+approve\b",
+    r"|^do\s+you\s+approve\b"
+    # The informal asks only as the whole sentence: "Looks good, what next?" asks something else.
+    r"|^(?:(?:does\s+(?:this|that|it|the)|do\s+(?:these|they|those|the))(?:\s+[\w-]+){0,2}\s+)?(?:sounds?|looks?)\s+(?:good|ok(?:ay)?|right|fine)"
+    r"(?:\s+to\s+you)?\s*\?$"
+    r"|^(?:ok(?:ay)?|agreed|any\s+objections)\s*\?$",
     re.IGNORECASE,
 )
 #: Where the question's last sentence starts: "Here is the fix. Shall I proceed?"
@@ -193,9 +204,14 @@ def _a_name(clause: str) -> bool:
     """Whether ``clause`` only names someone ("Dependabot", "Renovate (bot)"): no
     step or outcome of ours ("Done", "Checked it", "Tests passed", "Following up")."""
     words = _trimmed([w.lower() for w in CLAUSE_WORD.findall(clause)])
-    return bool(words) and not any(
+    return bool(words) and (_passive(words) or not any(
         w in OUR_LEAD or w in OUR_VERB or w in OUTCOME_WORD for w in words
-    )
+    ))
+
+
+def _passive(words: list[str]) -> bool:
+    """Whether ``words`` credit a step to someone: "Triggered by Renovate", not "Fixed by hand"."""
+    return any(word in CREDITED_VERB and nxt == PASSIVE_BY for word, nxt in zip(words, words[1:]))
 
 
 def _trimmed(words: list[str]) -> list[str]:
@@ -243,6 +259,7 @@ def _ours(before: str) -> bool:
         bool(words)
         and (words[0] in OUR_LEAD or words[0] in OUR_VERB)
         and not OTHER_SUBJECT.intersection(words[1:])
+        and not _passive(words)
     )
 
 
