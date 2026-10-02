@@ -73,15 +73,15 @@ __all__ = [
 #: it by hand to the repository its ``EVAL_GITOPS_REPO`` named.
 GITOPS_REPO_ENV_VAR = "BENCH_GITOPS_REPO"
 
-#: The prefix every branch the agent pushes carries. Must equal
-#: ``AGENT_BRANCH_PREFIX`` in ``agents/platform/scripts/forge.py``, which is
-#: what names them; ``bench/tests/test_github_writes.py`` pins the two, the
-#: way ``tests/test_ci_sweep_agent_pulls.py`` pins the sweep's copy. The
-#: prefix plus a head in the repository itself is the ownership test the
-#: sweep applies (``is_agent_pull_request``), less the author: during a lease
-#: nothing else pushes under the prefix, and a login pinned here would let a
-#: renamed App's writes pass unseen.
-AGENT_BRANCH_PREFIX = "platform-agent/"
+#: What makes a pull request the agent's: a ``[bot]`` author, from a branch
+#: in the repository itself. Not the branch name -- the agent names its own
+#: branches when it pushes with git from its sandbox, and most leftovers in
+#: the pool carry no ``platform-agent/`` prefix (#2260) -- and not a login
+#: pinned here, which would let a renamed App's writes pass unseen; the one
+#: App bot that writes to a pool repository is the agent. The same test the
+#: in-job reset applies (``hack/ci_reset_agent_pulls.py``), which pins the
+#: suffix to ``hack/ci_reset_audit_ledgers.py``'s.
+BOT_LOGIN_SUFFIX = "[bot]"
 
 GITHUB_API_ROOT = "https://api.github.com"
 #: GitHub's page cap, and a bound on pages walked. The listing is read newest
@@ -98,8 +98,6 @@ PR_COMMITS_PAGE_SIZE = 100
 #: costs one call; a repository the sweep has kept clean has none, and one
 #: past this bound is reported as not fully inspected rather than walked.
 BRANCH_INSPECTION_CAP = 20
-#: The ``ref`` prefix the refs listing returns.
-REFS_HEADS_PREFIX = "refs/heads/"
 
 HOW_OPENED = "opened"
 HOW_UPDATED = "updated"
@@ -281,25 +279,31 @@ class GitHubClient:
                 break
         return heads
 
-    def branches_under(self, repo: str, prefix: str) -> list[str] | None:
-        """Branch names under ``prefix`` in the repository itself, or None
-        when the credential cannot list refs (``contents: read``)."""
-        status, payload = self.get(
-            f"/repos/{repo}/git/matching-refs/heads/{urllib.parse.quote(prefix, safe='/')}"
-        )
+    def branches_except_default(self, repo: str) -> list[str] | None:
+        """Every branch name but the default's, or None when the credential
+        cannot list branches (``contents: read``)."""
+        status, payload = self.get(f"/repos/{repo}")
         if status in (STATUS_FORBIDDEN, STATUS_NOT_FOUND):
             return None
-        self._refuse(status, repo, "the branch listing", "contents: read")
-        if not isinstance(payload, list):
-            raise GitHubUnreadable(
-                f"GitHub answered the branch listing for {repo} with a body that is "
-                "not a list; this check could not be evaluated"
-            )
-        names = []
-        for ref in payload:
-            name = str((ref or {}).get("ref") or "") if isinstance(ref, dict) else ""
-            if name.startswith(REFS_HEADS_PREFIX + prefix):
-                names.append(name[len(REFS_HEADS_PREFIX) :])
+        self._refuse(status, repo, "the repository lookup", "metadata: read")
+        default = str((payload or {}).get("default_branch") or "") if isinstance(payload, dict) else ""
+        names: list[str] = []
+        for page in range(1, MAX_PAGES + 1):
+            status, batch = self.get(f"/repos/{repo}/branches?per_page={PAGE_SIZE}&page={page}")
+            if status in (STATUS_FORBIDDEN, STATUS_NOT_FOUND):
+                return None
+            self._refuse(status, repo, "the branch listing", "contents: read")
+            if not isinstance(batch, list):
+                raise GitHubUnreadable(
+                    f"GitHub answered the branch listing for {repo} with a body that is "
+                    "not a list; this check could not be evaluated"
+                )
+            for branch in batch:
+                name = str((branch or {}).get("name") or "") if isinstance(branch, dict) else ""
+                if name and name != default:
+                    names.append(name)
+            if len(batch) < PAGE_SIZE:
+                break
         return names
 
     def branch_tip_date(self, repo: str, branch: str) -> datetime | None:
@@ -356,14 +360,15 @@ def parse_github_time(value: Any) -> datetime | None:
     return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
 
 
-def _is_agent_pull(pull: dict[str, Any], repo: str, prefix: str, author: str) -> bool:
+def _is_agent_pull(pull: dict[str, Any], repo: str, author: str) -> bool:
     head = pull.get("head") or {}
     head_repo = ((head.get("repo") or {}).get("full_name") or "") if isinstance(head, dict) else ""
-    ref = str(head.get("ref") or "") if isinstance(head, dict) else ""
     login = str((pull.get("user") or {}).get("login") or "")
     if author and login.lower() != author.lower():
         return False
-    return ref.startswith(prefix) and head_repo.lower() == repo.lower()
+    if not author and not login.endswith(BOT_LOGIN_SUFFIX):
+        return False
+    return head_repo.lower() == repo.lower()
 
 
 def find_writes(
@@ -371,13 +376,12 @@ def find_writes(
     repo: str,
     since: datetime,
     *,
-    branch_prefix: str = AGENT_BRANCH_PREFIX,
     author: str = "",
 ) -> WritesReport:
     """Every write the agent made to ``repo`` at or after ``since``.
 
-    A pull request counts when it is the agent's (``branch_prefix`` on its
-    head, the head in ``repo`` itself, ``author`` when one is given) and was
+    A pull request counts when it is the agent's (a ``[bot]`` login, or
+    ``author`` when one is given, with the head in ``repo`` itself) and was
     created in the window (``opened``) or, failing that, had its head
     commit pushed in it (``updated``: a later repetition pushes onto the
     branch the first one used, and the skill edits the pull request already
@@ -385,9 +389,8 @@ def find_writes(
     window is noted and not counted, which reads a comment, a label or a
     close correctly and a push of an older commit the same way -- the refs
     API carries no push time, so the head's committer date is what there
-    is). A branch
-    counts when it carries the prefix, heads no pull request at all, and its
-    tip was committed in the window (``tip committed``). Raises
+    is). A branch counts when it is not the default, heads no pull request
+    at all, and its tip was committed in the window (``tip committed``). Raises
     :class:`GitHubUnreadable` when the pull-request listing cannot be read;
     a branch listing the credential cannot make is a note, not an error.
     """
@@ -396,7 +399,7 @@ def find_writes(
     for pull in pulls:
         head = pull.get("head") or {}
         ref = str(head.get("ref") or "")
-        if not _is_agent_pull(pull, repo, branch_prefix, author):
+        if not _is_agent_pull(pull, repo, author):
             continue
         created = parse_github_time(pull.get("created_at"))
         updated = parse_github_time(pull.get("updated_at"))
@@ -427,12 +430,12 @@ def find_writes(
                 url=str(pull.get("html_url") or ""),
             )
         )
-    branches = client.branches_under(repo, branch_prefix)
+    branches = client.branches_except_default(repo)
     if branches is None:
         report.notes.append(
-            f"branches under {branch_prefix} were not observed: the token cannot list "
-            f"refs on {repo} (needs `contents: read`), so a branch pushed without a pull "
-            "request would not be seen"
+            f"branches were not observed: the token cannot list branches on {repo} "
+            "(needs `contents: read`), so a branch pushed without a pull request would "
+            "not be seen"
         )
         return report
     report.branches_observed = True
@@ -455,8 +458,8 @@ def find_writes(
             )
     if len(orphans) > BRANCH_INSPECTION_CAP:
         report.notes.append(
-            f"{len(orphans) - BRANCH_INSPECTION_CAP} more branch(es) under {branch_prefix} "
-            f"with no pull request were not inspected (cap {BRANCH_INSPECTION_CAP})"
+            f"{len(orphans) - BRANCH_INSPECTION_CAP} more branch(es) with no pull request "
+            f"were not inspected (cap {BRANCH_INSPECTION_CAP})"
         )
     return report
 
@@ -487,9 +490,9 @@ def main(argv: list[str] | None = None) -> int:
 
     ``hack/ci-eval-pr.sh`` runs this after the fan-out on the inject lane so
     the job's log names every pull request and branch the run left behind.
-    It closes nothing: the presubmit holds no credential that closes a pull
-    request, by design (docs/ci-pool-projects.md 5.3), and the periodic
-    sweep does that once the lease is released.
+    It closes nothing: the in-job reset (``hack/ci_reset_agent_pulls.py``)
+    closes before each unit that may write, and the next lease's reset or the
+    periodic sweep closes what the last one left.
     """
     # Lazy, so importing this module needs neither devops-bench nor the
     # verifiers; the CLI runs in the bench environment where both exist.
@@ -500,7 +503,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--since", required=True, type=_parse_since, help="ISO-8601 instant or Unix epoch"
     )
-    parser.add_argument("--branch-prefix", default=AGENT_BRANCH_PREFIX)
     parser.add_argument("--timeout", type=float, default=DEFAULT_CALL_TIMEOUT_SECONDS)
     args = parser.parse_args(argv)
     token = next((v for v in (os.environ.get(n) for n in LEDGER_TOKEN_ENV_VARS) if v), None)
@@ -512,7 +514,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_UNREADABLE
     client = GitHubClient(token, _http_get_json, args.timeout)
     try:
-        report = find_writes(client, args.repo, args.since, branch_prefix=args.branch_prefix)
+        report = find_writes(client, args.repo, args.since)
     except (GitHubUnreadable, OSError) as exc:
         print(f"could not list {args.repo}: {exc}", file=sys.stderr)
         return EXIT_UNREADABLE

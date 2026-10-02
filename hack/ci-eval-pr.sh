@@ -1043,6 +1043,11 @@ LEDGER_RESET_MINT_RETRY_DELAY=2
 # since 2026-09-22, includes issues: write on every pool repository for the
 # ledger reset. An omitted body on this endpoint means "everything granted".
 LEDGER_GRADING_MINT_BODY='{"permissions":{"issues":"read","pull_requests":"read","metadata":"read"}}'
+# What the agent-pulls reset asks for (reset_agent_pulls, below): pull_requests
+# to close, contents to delete a branch, issues to label an audit pull request
+# before its close. Narrowed to the leased repository at mint, as the ledger
+# reset's issues: write is (docs/ci-pool-projects.md 5.3).
+AGENT_PULLS_RESET_PERMISSIONS='{"pull_requests":"write","contents":"write","issues":"write"}'
 
 # Emits "<token> <expires_at>" on stdout, diagnostics on stderr, non-zero on
 # any failure -- LEDGER_MINT_RETRYABLE when another attempt could survive it,
@@ -1223,8 +1228,8 @@ fi
 # stream alone -- so repetitions 2 and 3 start as repetition 1 did, and a
 # sibling lane's stream, which has its own label, is never touched. Every
 # repetition then opens a fresh ledger, one closed issue per repetition in a
-# repository that exists to be written to; the sibling that sweeps the
-# agent's leftover pull requests is #1832's.
+# repository that exists to be written to; the agent's leftover pull requests
+# and branches are reset_agent_pulls's, below.
 #
 # Never any repository but the leased project's: the repository is the one
 # gitops_repo_for_project() in hack/ci-deploy.sh maps for PROJECT_ID (lifted
@@ -1255,9 +1260,10 @@ eval_gitops_repo() { # <project-id>
 # twice at mint, to the one repository and to issues: write. One retry on a
 # transient failure, as mint_ledger_token does; a 422 comes back on the
 # first attempt and means the grant is missing.
-ledger_reset_token() { # <owner/repo>
-  local body minted rc attempt=1
-  body="{\"repositories\":[\"${1##*/}\"],\"permissions\":{\"issues\":\"write\"}}"
+ledger_reset_token() { # <owner/repo> [permissions JSON; issues: write when omitted]
+  local body minted rc attempt=1 permissions='{"issues":"write"}'
+  [ -n "${2:-}" ] && permissions="$2"
+  body="{\"repositories\":[\"${1##*/}\"],\"permissions\":${permissions}}"
   while :; do
     # `&&` rather than `if`: the status of a failed `if` test is 0 by the
     # time the body would read it, and this needs the mint's own.
@@ -1338,6 +1344,51 @@ reset_audit_ledgers() { # <label> [audit-id]
   out="$(LEDGER_RESET_TOKEN="${token}" python3 "${SCRIPT_DIR}/ci_reset_audit_ledgers.py" "${args[@]}" 2>&1)" || rc=$?
   [ -n "${out}" ] && printf '%s\n' "${out}" | sed "s/^/Ledger reset (${label}): /"
   [ "${rc}" -eq 0 ] || echo "WARNING: Ledger reset (${label}): the helper exited ${rc}; ${scope} may keep an open ledger and this run grades against it as every run before did." >&2
+  return 0
+}
+
+# ─── Empty repository: the agent's pull requests and branches go too ─────────
+# A remediation case opens a pull request in the leased repository and nothing
+# closed it before the next lease or the next repetition, so the next agent
+# built on it instead of investigating (#2260); the periodic sweep visits free
+# projects only. hack/ci_reset_agent_pulls.py closes every open pull request a
+# [bot] login opened from a branch in the repository itself (not by branch
+# name: most leftovers carry no prefix), labels an audit's `audit:stale-closed`
+# first (#2228), deletes every branch but the default, then reads the
+# repository back. Called here at lease time, and in run_one_unit before every
+# unit of a case that requests a pull request -- in the fan-out's second
+# phase, one unit at a time, so no sibling's pull request is open to be
+# closed. Unlike the ledger reset this one fails closed: the caller returns 1
+# when the repository is not clean, and a unit does not run on it. The mint is
+# the ledger App's, narrowed to the one repository and the three writes
+# (AGENT_PULLS_RESET_PERMISSIONS); the same guards as the ledger reset's.
+reset_agent_pulls() { # <label>  -> 0 when the repository is clean, 1 when a unit must not run on it
+  local label="$1" token out rc=0 slug record
+  if [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
+    echo "Agent pulls reset (${label}): skipped, EVAL_LEDGER_APP_KEY_FILE is unset and the mounted PAT is a read credential; the repository keeps whatever the agent left"
+    return 0
+  fi
+  if [ -z "${EVAL_LEDGER_REPO:-}" ]; then
+    echo "Agent pulls reset (${label}): skipped, PROJECT_ID=${PROJECT_ID:-unset} maps to no GitOps repository (gitops_repo_for_project in hack/ci-deploy.sh)"
+    return 0
+  fi
+  if ! token="$(ledger_reset_token "${EVAL_LEDGER_REPO}" "${AGENT_PULLS_RESET_PERMISSIONS}")"; then
+    echo "WARNING: Agent pulls reset (${label}): App ${EVAL_LEDGER_APP_ID} could not mint pull_requests: write, contents: write and issues: write narrowed to ${EVAL_LEDGER_REPO}; a unit that requests a pull request does not run on a repository this could not clean. A 422 above means the installation does not hold those permissions (docs/ci-pool-projects.md 5.3)." >&2
+    return 1
+  fi
+  # One record per call beside the artifacts, named for the call, so a run
+  # carries its own proof of what each unit started on.
+  slug="$(printf '%s' "${label}" | tr -c 'A-Za-z0-9._-' '_')"
+  record="${ARTIFACT_DIR:-${ARTIFACTS:-/tmp/artifacts}}/agent-pulls-reset/${slug}.json"
+  # The token rides in the environment of this one process, never on argv.
+  out="$(AGENT_PULLS_RESET_TOKEN="${token}" python3 "${SCRIPT_DIR}/ci_reset_agent_pulls.py" \
+    --repo "${EVAL_LEDGER_REPO}" --project "${PROJECT_ID}" --build "${BUILD_ID:-local}" \
+    --scope "${label}" --record "${record}" 2>&1)" || rc=$?
+  [ -n "${out}" ] && printf '%s\n' "${out}" | sed "s/^/Agent pulls reset (${label}): /"
+  if [ "${rc}" -ne 0 ]; then
+    echo "WARNING: Agent pulls reset (${label}): the helper exited ${rc}; the repository is not clean (${record}), and a unit that requests a pull request does not run on it." >&2
+    return 1
+  fi
   return 0
 }
 
@@ -1449,6 +1500,7 @@ release_inflight_note() { # <label> <audit-id>
 
 EVAL_LEDGER_REPO="$(eval_gitops_repo "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
 reset_audit_ledgers "lease"
+reset_agent_pulls "lease" || echo "WARNING: Agent pulls reset (lease): the repository is not clean; every unit of a case that requests a pull request runs its own reset first and is marked MISSING when that fails too." >&2
 
 # For opentofu provider
 export CLOUD_PROVIDER="gcp"
@@ -1914,6 +1966,19 @@ if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ]; then
   # path with a space (a TMPDIR with one) cannot shift the fields read here.
   INJECT_LANE_REQUESTING="$(printf '%s\n' "${INJECT_LANE_COPIES}" | awk '$1 > 0 { printf "%s%s", sep, $2; sep = "," }')"
   echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: every task in the matrix carries the lane's safeguards (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) over BENCH_GITOPS_REPO=${BENCH_GITOPS_REPO}; copies under ${INJECT_LANE_TASKS_DIR}; cases that request a pull request, run after every other unit: ${INJECT_LANE_REQUESTING:-none}"
+else
+  # The api lane runs the same second phase, for the reset's sake rather than
+  # the safeguard's: reset_agent_pulls empties the repository before each
+  # unit of a case that requests a pull request, which is only safe when no
+  # other unit is writing to it. Same list, read from the same files, no
+  # copies made; the task files under bench/tasks/ run as they are.
+  if ! INJECT_LANE_REQUESTING="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.lane \
+      --safeguards "${SCRIPT_DIR}/${EVAL_INJECT_LANE_SAFEGUARDS_FILE}" --list-requesting "${TASKS[@]}" \
+      | awk '$1 > 0 { printf "%s%s", sep, $2; sep = "," }')"; then
+    echo "ERROR: could not read which cases request a pull request (kube_agents_bench.lane --list-requesting, above); the fan-out cannot order them after every other unit, so the run does not start." >&2
+    exit 1
+  fi
+  echo "cases that request a pull request, run after every other unit and each after the repository is reset: ${INJECT_LANE_REQUESTING:-none}"
 fi
 
 # The task file a unit hands devops-bench: the lane's copy when the step
@@ -2788,6 +2853,21 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     release_inflight_note "${name} rep ${rep}" "${audit_id}"
     reset_audit_ledgers "${name} rep ${rep}" "${audit_id}"
   fi
+  # The repository this unit's agent writes to, emptied of every agent pull
+  # request and every branch but the default and read back, so repetitions
+  # 2 and 3 start as 1 did and a leftover from an earlier lease is never what
+  # the agent builds on (#2260). Only for a case that requests a pull request:
+  # those run one at a time after every other unit (unit_phase), so nothing a
+  # sibling is working on is open here. Not clean: the unit does not run, the
+  # locks go back, and the repetition grades MISSING, as a unit that could not
+  # mint does.
+  if [ "$(unit_phase "${name}")" = "1" ] && ! reset_agent_pulls "${name} rep ${rep}"; then
+    [ -n "${audit_id}" ] && lock_release "${STATE_DIR}/lock-stream-${audit_id}"
+    [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
+    lock_release "${STATE_DIR}/lock-task-${name}"
+    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} did not run: the leased repository could not be reset" >&2
+    return 0
+  fi
   if [ -n "${reuse}" ]; then
     export GKE_CLUSTER_NAME="${SEEDED_TASK_CLUSTER}" CLUSTER_NAME="${SEEDED_TASK_CLUSTER}"
     export TF_VAR_cluster_name="${SEEDED_TASK_CLUSTER}" GCP_LOCATION="${SEEDED_TASK_LOCATION}"
@@ -2868,11 +2948,13 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
 # spent two of four lanes that way for its first twelve minutes under the
 # cost-first ordering this replaces.
 #
-# Two phases on the inject lane (#2079). The lane's GitHub-write safeguard
-# dates a write; it cannot sign it, and every unit of the run writes to one
-# repository. A case that requests a pull request (INJECT_LANE_REQUESTING,
-# from the lane step; empty on the api lane and on an inject matrix with no
-# such case) therefore runs only after every other unit has finished: a
+# Two phases, on both lanes. On the inject lane (#2079) for the GitHub-write
+# safeguard, which dates a write and cannot sign it while every unit of the
+# run writes to one repository; on both lanes for the repository reset
+# (#2260), which empties that repository before each unit of a case that
+# requests a pull request and may only do so while nothing else writes. Such
+# a case (INJECT_LANE_REQUESTING, from the lane step; empty on a matrix with
+# no such case) therefore runs only after every other unit has finished: a
 # repetition of a case that requests nothing never shares the repository with
 # one that writes by design, so a write inside its window is its own or a
 # concurrent sibling's mistake, either of which is the red the safeguard
@@ -2955,12 +3037,10 @@ fi
 # this run began, in the job log by number and branch, so a red safeguard has
 # its subject named beside it and a run's leftovers are on record even when
 # no repetition graded them (a unit that died before verification). It closes
-# nothing: this job holds no credential that closes a pull request, by design
-# -- a presubmit runs the pull request's own code, and the one
-# `pull_requests: write` outside a run is the periodic sweep that executes
-# `main` alone (hack/ci_sweep_agent_pulls.py; docs/ci-pool-projects.md 5.3
-# and 5.5), which closes these and deletes their branches within its
-# ten-minute interval once the lease is released. A fresh read token first:
+# nothing: the closes happen before each unit that may write
+# (reset_agent_pulls), and what the last unit left is the next lease's reset
+# or the periodic sweep's (hack/ci_sweep_agent_pulls.py; docs/ci-pool-projects.md
+# 5.3 and 5.5). A fresh read token first:
 # the one minted at preflight is hours old by now. Never fatal, and after
 # the fan-out rather than in the EXIT trap: a deadline-cut run loses this
 # line and keeps the per-repetition reasons, which is the right trade.
@@ -2970,15 +3050,15 @@ report_github_leftovers() {
   fi
   echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] GitHub writes this run left on ${BENCH_GITOPS_REPO} since ${EVAL_RUN_STARTED_AT} <<<"
   if ! mint_ledger_token "leftovers"; then
-    echo "WARNING: GitHub leftovers: no read token, so what this run wrote to ${BENCH_GITOPS_REPO} is not listed here; the periodic sweep ci-kube-agents-pull-sweep (every ten minutes, on projects Boskos reports free) still closes it once the lease is released."
+    echo "WARNING: GitHub leftovers: no read token, so what this run wrote to ${BENCH_GITOPS_REPO} is not listed here; the next lease's reset and the periodic sweep ci-kube-agents-pull-sweep still close it."
     return 0
   fi
   if ! (cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.github_writes \
       --repo "${BENCH_GITOPS_REPO}" --since "${EVAL_RUN_STARTED_AT}"); then
-    echo "WARNING: GitHub leftovers: the listing of ${BENCH_GITOPS_REPO} failed (above); the periodic sweep ci-kube-agents-pull-sweep (every ten minutes, on projects Boskos reports free) still closes what this run left once the lease is released."
+    echo "WARNING: GitHub leftovers: the listing of ${BENCH_GITOPS_REPO} failed (above); the next lease's reset and the periodic sweep ci-kube-agents-pull-sweep still close what this run left."
     return 0
   fi
-  echo "GitHub leftovers: this job closes none of them (no pull_requests: write in a presubmit, docs/ci-pool-projects.md 5.3); the periodic sweep ci-kube-agents-pull-sweep (every ten minutes, on projects Boskos reports free) closes them and deletes their branches once the lease is released. The safeguard verdict above was read during each repetition and does not depend on this listing."
+  echo "GitHub leftovers: this listing closes none of them; the next lease's reset (hack/ci_reset_agent_pulls.py) and the periodic sweep ci-kube-agents-pull-sweep close them and delete their branches. The safeguard verdict above was read during each repetition and does not depend on this listing."
 }
 report_github_leftovers
 

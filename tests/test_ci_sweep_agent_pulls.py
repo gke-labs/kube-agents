@@ -9,20 +9,24 @@ where it is allowed to run.
 
 Five properties. First, ownership: the script holds a credential that can
 write pull requests, so "which pull requests are the agent's" is a security
-question. It is the same question `is_agent_pull_request` in
-agents/platform/scripts/forge.py answers, and it needs all three of its
-conditions: a branch prefix alone is not ownership, because anyone who can fork
-can name a branch with it.
+question. Two conditions: the agent's bot as author, and the head branch in the
+repository itself, because anyone who can fork can name a branch anything. Not
+the branch name -- the agent names its own branches when it pushes with git,
+and the pool held 42 open bot pull requests off the prefix on 2026-10-01
+(#2260). An audit's pull request is labelled `audit:stale-closed` before its
+close, or the audit reads the close as a human's refusal (#2228).
 
 Second, the key. The sweep signs as the agent's own App through the copy of
 its key in each project's KMS -- the project being swept, not any other -- and
 a signature that cannot be made stops the sweep before GitHub is asked
 anything.
 
-Third, the token is narrowed at mint time -- to one repository, and to the two
-writes the sweep makes (close, delete the branch) -- so the sweep never holds
-the reach the App has. The branch goes because a leftover branch refuses the
-next lease's identical fix "nothing to commit" (#1755 item 2).
+Third, the token is narrowed at mint time -- to one repository, and to the
+three writes the sweep makes (label, close, delete the branch) -- so the sweep
+never holds the reach the App has. The branch goes because a leftover branch
+refuses the next lease's identical fix "nothing to commit" (#1755 item 2), and
+every other branch but the default goes with it: nothing else keeps branches
+in a pool repository.
 
 Fourth, which projects. The sweep takes only what Boskos hands out as free,
 holds each for as long as it takes (heartbeated), and gives every one back --
@@ -49,7 +53,7 @@ from unittest import mock
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _MODULE_PATH = _REPO_ROOT / "hack" / "ci_sweep_agent_pulls.py"
-_FORGE = _REPO_ROOT / "agents" / "platform" / "scripts" / "forge.py"
+_AUDIT_REPORT = _REPO_ROOT / "agents" / "platform" / "skills" / "fleet-audit" / "scripts" / "audit_report.py"
 _CI_DEPLOY = _REPO_ROOT / "hack" / "ci-deploy.sh"
 _PROVISION = _REPO_ROOT / "scripts" / "provision_ci_pool_project.sh"
 
@@ -75,11 +79,12 @@ MAPPING = {
 }
 
 
-def agent_pull(number=1, branch="platform-agent/fix-the-thing", author=BOT, head_repo=REPO):
+def agent_pull(number=1, branch="platform-agent/fix-the-thing", author=BOT, head_repo=REPO, labels=()):
     return {
         "number": number,
         "user": {"login": author},
         "head": {"ref": branch, "repo": {"full_name": head_repo}},
+        "labels": [{"name": name} for name in labels],
     }
 
 
@@ -123,13 +128,15 @@ class _GitHub:
     `pulls` is one list served for every repository, or a dict by repository.
     """
 
-    def __init__(self, pulls=None, mint_error=None, close_errors=None, odd_bodies=None, slug=BOT_SLUG, delete_errors=None, branches=None):
+    def __init__(self, pulls=None, mint_error=None, close_errors=None, odd_bodies=None, slug=BOT_SLUG, delete_errors=None, branches=None, label_errors=None):
         self.calls = []
         self.pulls = pulls if pulls is not None else []
-        # Branch names under the agent's prefix the repository holds, as
-        # GET /git/matching-refs/heads/platform-agent/ lists them; by default
-        # exactly the heads of `pulls` that carry the prefix.
+        # Branch names the repository holds besides its default `main`, as
+        # GET /branches lists them; by default exactly the heads of `pulls`
+        # in the repository itself.
         self.branches = branches
+        # Keyed by pull-request number: what POST /issues/<n>/labels raises.
+        self.label_errors = label_errors or {}
         self.mint_error = mint_error
         # What GET /app answers for the App the JWT names.
         self.slug = slug
@@ -172,14 +179,22 @@ class _GitHub:
             if failure is not None:
                 raise failure
             return io.BytesIO(b"{}")
-        if key.startswith("GET /repos/") and key.endswith("/git/matching-refs/heads/" + sweeper.AGENT_BRANCH_PREFIX):
-            repo = path[len("/repos/") :].split("/git/matching-refs/")[0]
+        if key.startswith("POST /repos/") and key.endswith("/labels"):
+            failure = _next(self.label_errors.get(int(key.rsplit("/", 2)[1])))
+            if failure is not None:
+                raise failure
+            return io.BytesIO(b"[]")
+        if key.startswith("GET /repos/") and "/branches?" in key:
+            repo = path[len("/repos/") :].split("/branches?")[0]
             if self.branches is None:
                 pulls = self.pulls.get(repo, []) if isinstance(self.pulls, dict) else self.pulls
-                names = [p["head"]["ref"] for p in pulls if str(p["head"]["ref"]).startswith(sweeper.AGENT_BRANCH_PREFIX) and (p.get("head") or {}).get("repo", {}) and p["head"]["repo"]["full_name"] == repo]
+                names = [p["head"]["ref"] for p in pulls if (p.get("head") or {}).get("repo", {}) and p["head"]["repo"]["full_name"] == repo]
             else:
                 names = list(self.branches)
-            return io.BytesIO(json.dumps([{"ref": "refs/heads/" + n} for n in names]).encode())
+            page = int(key.rsplit("page=", 1)[1])
+            return io.BytesIO(json.dumps([{"name": n} for n in ["main"] + names] if page == 1 else []).encode())
+        if key.startswith("GET /repos/") and key.count("/") == 3:
+            return io.BytesIO(json.dumps({"default_branch": "main"}).encode())
         if key.startswith("DELETE /repos/") and "/git/refs/heads/" in key:
             branch = urllib.parse.unquote(key.split("/git/refs/heads/", 1)[1])
             failure = _next(self.delete_errors.get(branch))
@@ -304,7 +319,7 @@ def run_pool(free, github=None, gcloud=None, mapping=None, **kwargs):
 
 
 class OwnershipTest(unittest.TestCase):
-    """All three of forge.py's conditions, each one load-bearing."""
+    """Author and head repository, each load-bearing; the branch name is not."""
 
     def test_the_agents_own_pull_request_is_owned(self):
         self.assertTrue(sweeper.is_agent_pull_request(agent_pull(), REPO, BOT))
@@ -312,8 +327,10 @@ class OwnershipTest(unittest.TestCase):
     def test_another_author_is_not(self):
         self.assertFalse(sweeper.is_agent_pull_request(agent_pull(author="some-human"), REPO, BOT))
 
-    def test_a_branch_without_the_prefix_is_not(self):
-        self.assertFalse(sweeper.is_agent_pull_request(agent_pull(branch="hotfix/urgent"), REPO, BOT))
+    def test_a_branch_of_any_name_is_owned(self):
+        # fix-payments-api-oom x29 on 2026-10-01: the agent's own git push
+        # names what it likes, and a close keyed on the prefix never saw them.
+        self.assertTrue(sweeper.is_agent_pull_request(agent_pull(branch="fix-payments-api-oom"), REPO, BOT))
 
     def test_a_fork_head_is_not(self):
         # The case the prefix alone cannot catch: anyone who can fork can name
@@ -326,12 +343,15 @@ class OwnershipTest(unittest.TestCase):
         pull["head"]["repo"] = None
         self.assertFalse(sweeper.is_agent_pull_request(pull, REPO, BOT))
 
-    def test_the_prefix_matches_the_agents(self):
-        # The script closes by this prefix, and the agent chooses branch names
-        # by forge.py's copy of it. Two constants that must agree, in files
-        # that do not read each other.
-        forge = _FORGE.read_text(encoding="utf-8")
-        self.assertIn('AGENT_BRANCH_PREFIX = "%s"' % sweeper.AGENT_BRANCH_PREFIX, forge)
+    def test_the_labels_are_the_audits(self):
+        # The audit reads the close back by these literals, in a file that
+        # does not read this one.
+        audit = _AUDIT_REPORT.read_text(encoding="utf-8")
+        self.assertIn('STALE_CLOSED_LABEL = "%s"' % sweeper.STALE_CLOSED_LABEL, audit)
+        self.assertIn('"%s",' % sweeper.AUDIT_REMEDIATION_LABEL, audit)
+        self.assertTrue(sweeper.is_audit_pull_request(agent_pull(labels=["agent:audit", "audit:remediation"])))
+        self.assertFalse(sweeper.is_audit_pull_request(agent_pull(labels=["agent:audit"])))
+        self.assertFalse(sweeper.is_audit_pull_request({"number": 1}))
 
 
 class AgentAuthorTest(unittest.TestCase):
@@ -414,12 +434,11 @@ class TokenScopeTest(unittest.TestCase):
         run_repo(github)
         self.assertEqual(github.bodies("POST /app/installations/")[0]["repositories"], ["kube-agents-evals-7-infra"])
 
-    def test_the_token_asks_for_the_two_writes_it_makes_and_nothing_else(self):
-        # Close and delete the branch. The installation also holds issues
-        # write, for the agent; a token that inherited it whole would carry it.
+    def test_the_token_asks_for_the_three_writes_it_makes_and_nothing_else(self):
+        # Label, close, delete the branch -- named, not inherited whole.
         github = _GitHub()
         run_repo(github)
-        self.assertEqual(github.bodies("POST /app/installations/")[0]["permissions"], {"pull_requests": "write", "contents": "write"})
+        self.assertEqual(github.bodies("POST /app/installations/")[0]["permissions"], {"pull_requests": "write", "contents": "write", "issues": "write"})
 
     def test_the_installation_is_resolved_from_the_repository(self):
         github = _GitHub()
@@ -438,8 +457,32 @@ class ClosingTest(unittest.TestCase):
                 agent_pull(number=5),
             ]
         )
+        self.assertEqual(run_repo(github), 3)
+        self.assertEqual(github.keys("PATCH "), ["PATCH /repos/%s/pulls/%d" % (REPO, n) for n in (1, 3, 5)])
+
+    def test_an_audit_pull_request_is_labelled_before_it_closes(self):
+        github = _GitHub(pulls=[agent_pull(number=7, labels=["agent:audit", "audit:remediation"]), agent_pull(number=8)])
         self.assertEqual(run_repo(github), 2)
-        self.assertEqual(github.keys("PATCH "), ["PATCH /repos/%s/pulls/1" % REPO, "PATCH /repos/%s/pulls/5" % REPO])
+        keys = [k for k, _ in github.calls]
+        label, close = keys.index("POST /repos/%s/issues/7/labels" % REPO), keys.index("PATCH /repos/%s/pulls/7" % REPO)
+        self.assertLess(label, close, "the label goes on before the close")
+        self.assertEqual(github.bodies("POST /repos/%s/issues/7/labels" % REPO), [{"labels": [sweeper.STALE_CLOSED_LABEL]}])
+        self.assertEqual(github.keys("POST /repos/%s/issues/8" % REPO), [], "a pull request without the audit's label is not labelled")
+
+    def test_a_label_that_will_not_stick_leaves_the_pull_request_open(self):
+        # An unlabelled close is a human's refusal to the audit, for good; an
+        # open pull request is one the next run tries again.
+        github = _GitHub(pulls=[agent_pull(number=7, labels=["audit:remediation"])], label_errors={7: _http_error(409)})
+        with self.assertRaises(sweeper.SweepError) as caught:
+            run_repo(github)
+        self.assertIn("left 1 pull request(s) open: #7", str(caught.exception))
+        self.assertEqual(github.keys("PATCH "), [])
+        self.assertEqual(github.keys("DELETE "), [])
+
+    def test_the_default_branch_is_never_deleted(self):
+        github = _GitHub(pulls=[], branches=["fix-payments-api-oom"])
+        self.assertEqual(run_repo(github), 0)
+        self.assertEqual(github.keys("DELETE "), ["DELETE /repos/%s/git/refs/heads/fix-payments-api-oom" % REPO])
 
     def test_closing_sets_the_state_and_nothing_else(self):
         github = _GitHub(pulls=[agent_pull()])
@@ -503,10 +546,10 @@ class ClosingTest(unittest.TestCase):
         self.assertEqual(github.keys("DELETE "), [])
 
     def test_a_branch_listing_that_is_not_a_list_is_a_fault(self):
-        github = _GitHub(pulls=[], odd_bodies={"GET /repos/%s/git/matching-refs/" % REPO: b'{"message": "moved"}'})
+        github = _GitHub(pulls=[], odd_bodies={"GET /repos/%s/branches?" % REPO: b'{"message": "moved"}'})
         with self.assertRaises(sweeper.SweepError) as caught:
             run_repo(github)
-        self.assertIn("list of refs", str(caught.exception))
+        self.assertIn("list of branches", str(caught.exception))
 
     def test_an_empty_repository_closes_nothing(self):
         github = _GitHub(pulls=[])
@@ -674,7 +717,7 @@ class PacingTest(unittest.TestCase):
         original = github.__call__
 
         def limited(request, timeout=None):
-            if "/git/matching-refs/" in request.full_url:
+            if "/branches?" in request.full_url:
                 raise _http_error(429, headers={"Retry-After": "30"})
             return original(request, timeout=timeout)
 
