@@ -445,10 +445,8 @@ into what is already there, per "Keep these sections current, not chronological"
 the last `/review` pass has settled, for the reason the next paragraph gives about threads: a fresh
 review brings fresh findings, and folding them in twice is the same wasted round.
 
-**Then resolve the conversations.** Pull Request Hygiene says why an open thread both blocks the
-merge and keeps the change counted as its author's outstanding work; what belongs here is the
-timing. Do it once the fixes are pushed and the last `/review` pass has settled: a fresh review
-opens fresh threads, so resolving before it lands means doing it twice.
+**Then resolve the conversations** once the fixes are pushed and the last `/review` pass has
+settled: a fresh review opens fresh threads, so resolving before it lands means doing it twice.
 
 Resolve a thread — the bot's or a human's — when you are **fully confident the issue is addressed**:
 the fix is on the pull request head and you can name the commit, or the finding is factually wrong
@@ -457,8 +455,10 @@ your working copy — a finding that looks wrong because the file it cites does 
 often a stale checkout rather than a wrong finding. Anything short of that stays open. A judgment
 call, a reviewer asking for something you chose not to do, a rebuttal nobody has answered yet —
 reply and leave it to them. Resolving says the conversation is finished; it is not a way to end a
-disagreement. Reply first, always: a resolved thread collapses, so the reply naming what changed and
-the commit that changed it is the only record the reviewer may ever see.
+disagreement. The exception is a kube-agents-bot finding you decline: the bot never returns to its
+threads, so once your reply and **Self-Review** give the reason, resolve it. Reply first, always: a
+resolved thread collapses, so the reply naming what changed and the commit that changed it is the
+only record the reviewer may ever see.
 
 ## Before Reviewing Someone Else's Pull Request
 

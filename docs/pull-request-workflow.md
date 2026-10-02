@@ -349,9 +349,9 @@ gh api repos/gke-labs/kube-agents/pulls/<number>/comments/<comment-id>/replies \
 
 ## Resolving conversations
 
-Reply first — `AGENTS.md` says why — naming what changed and the commit that changed it. Then
-resolve. A pull request carrying both `lgtm` and `approved` with a thread still open also carries
-the `do-not-merge` label,
+Reply first — `AGENTS.md` says why — naming what changed and the commit that changed it, or, for a
+kube-agents-bot finding you decline, the reason. Then resolve. A pull request carrying both `lgtm`
+and `approved` with a thread still open also carries the `do-not-merge` label,
 applied by a workflow so that Tide does not spend the queue retrying a merge GitHub will refuse;
 resolving the last thread is what removes it ([how a change merges](#how-a-change-merges)).
 
