@@ -4251,11 +4251,12 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         )
         calls = []
         started_event = threading.Event()
+        t2_queued_event = threading.Event()
 
         def slow_failing_execute(argv, cwd=None):
             calls.append(list(argv))
             started_event.set()
-            time.sleep(0.05)
+            t2_queued_event.wait(timeout=2.0)
             return credential_proxy.ExecutionResult(
                 exit_code=1,
                 stdout="",
@@ -4275,7 +4276,16 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
             except Exception as e:
                 results.append(e)
 
-        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+        real_monotonic = credential_proxy.time.monotonic
+
+        def monotonic_hook():
+            val = real_monotonic()
+            if threading.current_thread() == t2:
+                t2_queued_event.set()
+            return val
+
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True), \
+             mock.patch.object(credential_proxy.time, "monotonic", side_effect=monotonic_hook):
             t1 = threading.Thread(target=worker)
             t2 = threading.Thread(target=worker)
             t1.start()
@@ -4290,6 +4300,89 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         self.assertIsInstance(results[1], RuntimeError)
         # Helper must only execute once: waiter queued during the failure raises without re-running
         self.assertEqual(len(calls), 1)
+
+    def test_serializes_concurrent_refreshes_and_does_not_memoize_timeouts(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+        started_event = threading.Event()
+        t2_queued_event = threading.Event()
+
+        def execute_with_timeout(argv, cwd=None):
+            calls.append(list(argv))
+            if len(calls) == 1:
+                started_event.set()
+                t2_queued_event.wait(timeout=2.0)
+                return credential_proxy.ExecutionResult(
+                    exit_code=124,
+                    stdout="",
+                    stderr="command timed out after 30s",
+                    duration_ms=30000,
+                    truncated=False,
+                    timed_out=True,
+                )
+            return credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="gke-agentic/infra\n",
+                stderr="",
+                duration_ms=10,
+                truncated=False,
+                timed_out=False,
+            )
+
+        executor.execute_internal = execute_with_timeout
+        results = []
+
+        def worker():
+            try:
+                executor.refresh_forge_credential("github", "gke-agentic/infra")
+                results.append("ok")
+            except Exception as e:
+                results.append(e)
+
+        real_monotonic = credential_proxy.time.monotonic
+
+        def monotonic_hook():
+            val = real_monotonic()
+            if threading.current_thread() == t2:
+                t2_queued_event.set()
+            return val
+
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True), \
+             mock.patch.object(credential_proxy.time, "monotonic", side_effect=monotonic_hook):
+            t1 = threading.Thread(target=worker)
+            t2 = threading.Thread(target=worker)
+            t1.start()
+            started_event.wait(timeout=1.0)
+            t2.start()
+            t1.join(timeout=2.0)
+            t2.join(timeout=2.0)
+
+        # Thread 1 timed out; Thread 2 queued behind it ran the helper and succeeded.
+        self.assertEqual(len(results), 2)
+        self.assertIsInstance(results[0], TimeoutError)
+        self.assertEqual(results[1], "ok")
+        # Helper ran twice: timeout was not memoized, so waiter executed its own helper
+        self.assertEqual(len(calls), 2)
+
+    def test_run_forge_helper_raises_timeout_error_when_timed_out(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        executor.execute_internal = lambda argv, cwd=None: credential_proxy.ExecutionResult(
+            exit_code=124,
+            stdout="",
+            stderr="timed out",
+            duration_ms=30000,
+            truncated=False,
+            timed_out=True,
+        )
+        helper_path = mock.MagicMock(spec=credential_proxy.Path)
+        helper_path.is_file.return_value = True
+        with self.assertRaises(TimeoutError) as ctx:
+            executor._run_forge_helper("github", helper_path, ["repo"], "credential refresh")
+        self.assertIn("credential refresh timed out", str(ctx.exception))
 
     def test_concurrent_refreshes_for_different_orgs_do_not_share_failure(self):
         executor = credential_proxy.CommandExecutor.__new__(

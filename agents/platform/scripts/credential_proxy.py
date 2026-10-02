@@ -4490,8 +4490,7 @@ class CommandExecutor:
                 # stale entry would coalesce the next caller onto a token that
                 # is not theirs.
                 self._refresh_cache.pop(provider, None)
-                is_timeout = isinstance(e, TimeoutError) or "timed out" in str(e).lower()
-                if not is_timeout:
+                if not isinstance(e, TimeoutError):
                     self._refresh_failure_cache[failure_key] = (time.monotonic(), e)
                 raise
             self._refresh_failure_cache.pop(failure_key, None)
@@ -4544,6 +4543,8 @@ class CommandExecutor:
                 result.exit_code,
                 f": {detail[:FORGE_HELPER_LOG_DETAIL_CHARS]}" if detail else "",
             )
+            if result.timed_out:
+                raise TimeoutError(f"{action} timed out")
             raise RuntimeError(f"{action} failed")
         return result
 
