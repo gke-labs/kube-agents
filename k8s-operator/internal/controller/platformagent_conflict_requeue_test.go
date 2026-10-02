@@ -77,7 +77,7 @@ func TestPlatformAgentReconciler_Reconcile_ConflictOnStatusUpdateRequeuesCleanly
 		t.Errorf("Reconcile result.Requeue = false; want true on 409 conflict")
 	}
 	if result.RequeueAfter != 0 {
-		t.Errorf("Reconcile result.RequeueAfter = %v; want 0 (immediate requeue)", result.RequeueAfter)
+		t.Errorf("Reconcile result.RequeueAfter = %v; want 0 (rate-limited requeue via workqueue)", result.RequeueAfter)
 	}
 }
 
@@ -134,7 +134,7 @@ func TestPlatformAgentReconciler_Reconcile_ConflictOnCRUpdateRequeuesCleanly(t *
 		t.Errorf("Reconcile result.Requeue = false; want true on 409 conflict")
 	}
 	if result.RequeueAfter != 0 {
-		t.Errorf("Reconcile result.RequeueAfter = %v; want 0 (immediate requeue)", result.RequeueAfter)
+		t.Errorf("Reconcile result.RequeueAfter = %v; want 0 (rate-limited requeue via workqueue)", result.RequeueAfter)
 	}
 }
 
@@ -202,7 +202,69 @@ func TestPlatformAgentReconciler_Reconcile_ConflictOnBusCredentialsReadyDeferred
 		t.Errorf("Reconcile result.Requeue = false; want true on deferred 409 conflict")
 	}
 	if result.RequeueAfter != 0 {
-		t.Errorf("Reconcile result.RequeueAfter = %v; want 0 (immediate requeue)", result.RequeueAfter)
+		t.Errorf("Reconcile result.RequeueAfter = %v; want 0 (rate-limited requeue via workqueue)", result.RequeueAfter)
+	}
+}
+
+// TestPlatformAgentReconciler_Reconcile_ConflictOnOwnedObjectNotSwallowed verifies
+// that 409 Conflict errors on owned objects (e.g. Deployments, ConfigMaps, Secrets)
+// are NOT swallowed by the PlatformAgent conflict net and continue to propagate to
+// controller-runtime to maintain error telemetry and accurate log diagnostics (#2281).
+func TestPlatformAgentReconciler_Reconcile_ConflictOnOwnedObjectNotSwallowed(t *testing.T) {
+	scheme := setupScheme()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "test-agent",
+			Namespace:  "test-ns",
+			Finalizers: []string{platformAgentFinalizer},
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{},
+	}
+
+	ownedConflictErr := errors.NewConflict(
+		schema.GroupResource{Group: "apps", Resource: "deployments"},
+		"platform-agent",
+		fmt.Errorf("field manager conflict on deployment"),
+	)
+
+	ssa := fakeServerSideApplyInterceptors()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				// Inject 409 conflict on owned deployment SSA patch
+				if obj.GetObjectKind().GroupVersionKind().Kind == "Deployment" || obj.GetName() == "test-agent" {
+					return ownedConflictErr
+				}
+				return ssa.Patch(ctx, c, obj, patch, opts...)
+			},
+		}).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client: cl,
+		Scheme: scheme,
+	}
+
+	req := ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      agent.Name,
+			Namespace: agent.Namespace,
+		},
+	}
+
+	result, err := r.Reconcile(context.Background(), req)
+	if err == nil {
+		t.Fatalf("Reconcile returned nil error on owned object 409 conflict; want error to propagate to controller-runtime")
+	}
+	if !errors.IsConflict(err) {
+		t.Errorf("Reconcile returned err = %v; want 409 Conflict", err)
+	}
+	if result.Requeue {
+		t.Errorf("Reconcile result.Requeue = true; want false when error is returned")
 	}
 }
 

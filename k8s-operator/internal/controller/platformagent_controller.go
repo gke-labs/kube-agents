@@ -429,6 +429,27 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 
+// isPlatformAgentConflict reports whether err is an optimistic concurrency conflict
+// (409 Conflict) specifically on a PlatformAgent custom resource (Group: kubeagents.x-k8s.io
+// or legacy agents.gke.io, Resource/Kind: platformagents or PlatformAgent). Conflicts on owned
+// objects (ConfigMaps, Secrets, Deployments, NetworkPolicies) return false so they propagate
+// as reconciler errors and surface in controller_runtime_reconcile_errors_total (#2281).
+func isPlatformAgentConflict(err error) bool {
+	if !errors.IsConflict(err) {
+		return false
+	}
+	var statusErr *errors.StatusError
+	if goerrors.As(err, &statusErr) && statusErr.ErrStatus.Details != nil {
+		d := statusErr.ErrStatus.Details
+		isGroup := d.Group == agentv1alpha1.GroupVersion.Group || d.Group == "agents.gke.io"
+		isKind := d.Kind == "platformagents" || d.Kind == "PlatformAgent"
+		if isGroup && isKind {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, retErr error) {
 	log := logf.FromContext(ctx)
 
@@ -436,12 +457,18 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// (spec, finalizer, or status updates) occur when owned-object watch events
 	// race ahead of the status watch stream or when concurrent reconcile passes
 	// update the CR. Instead of letting controller-runtime log an unhandled
-	// Reconciler error and apply exponential backoff, requeue immediately so
-	// the informer cache catches up and the next pass reconciles against the
-	// fresh ResourceVersion (#2281).
+	// Reconciler error and increment reconcile_errors_total, requeue cleanly
+	// via the workqueue rate limiter so the informer cache catches up and the
+	// next pass reconciles against the fresh ResourceVersion (#2281).
+	// Owned-object conflicts (e.g. ConfigMaps, Secrets, Deployments) are not
+	// caught here and propagate as errors to preserve telemetry and diagnostics.
 	defer func() {
-		if errors.IsConflict(retErr) {
-			log.Info("PlatformAgent update conflict; requeuing cleanly", "name", req.Name, "namespace", req.Namespace)
+		if isPlatformAgentConflict(retErr) {
+			log.Info("PlatformAgent update conflict; requeuing cleanly",
+				"name", req.Name,
+				"namespace", req.Namespace,
+				"error", retErr,
+			)
 			result = ctrl.Result{Requeue: true}
 			retErr = nil
 		}
