@@ -284,6 +284,8 @@ def test_here_without_a_results_sentence_does_not_say_where_results_go(opener):
         " I'll check with you, then follow your runbooks.",
         " Happy to help you follow your runbooks.",
         " Glad to help you apply your runbooks.",
+        " I'm happy to help you follow your runbooks.",
+        " I'd be glad to walk you through applying your runbooks.",
     ],
 )
 def test_promising_to_follow_runbooks_fails_the_promise_safeguard(case, promise):
@@ -324,7 +326,10 @@ def test_a_runbook_aside_that_promises_nothing_passes_the_promise_safeguard(case
         " I'll stick to your runbooks.",
         " I'll do my best to help your team follow its runbooks.",
         " Let me help you use your runbooks.",
+        " Let me help you apply your runbooks.",
+        " If you have runbooks, I'll follow them.",
         " I'll" + " x" * 150 + " follow your runbooks.",
+        " Also," + " x" * 150 + " follow your runbooks.",
     ],
 )
 def test_the_promise_safeguards_known_limits_pass_it(case, promise):
@@ -333,8 +338,8 @@ def test_the_promise_safeguards_known_limits_pass_it(case, promise):
     assert "no-runbook-promise" not in _failing(case, reply)
 
 
-# Known costs: after a first-person opener only other people clear the clause, so a "you" that is the subject of an
-# embedded clause fails it too, and a sentence-initial imperative to the reader reads as the promise.
+# Known costs of failing closed: after a first-person opener only other people clear the clause, so a "you" that is
+# the subject of an embedded clause fails it too, and a sentence-initial imperative to the reader reads as the promise.
 @pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize(
     "aside",
@@ -346,6 +351,9 @@ def test_the_promise_safeguards_known_limits_pass_it(case, promise):
         " Happy to hear how you use runbooks.",
         " Glad to learn whether you follow runbooks.",
         " Use this chat for runbooks.",
+        " I can read them if you use runbooks.",
+        " I'm curious whether you use runbooks.",
+        " I'm only reading, so if you follow runbooks, share them here.",
     ],
 )
 def test_the_promise_safeguards_known_costs_fail_it(case, aside):
@@ -354,9 +362,11 @@ def test_the_promise_safeguards_known_costs_fail_it(case, aside):
     assert "no-runbook-promise" in _failing(case, reply)
 
 
-# The length limit is the 300-character bound, not the filler: under it, the same promise fails.
+# The length limit is the 300-character bound, not the filler: under it, the same promise fails, after a
+# first-person opener and after a sentence start alike.
 @pytest.mark.parametrize("case", CASES)
-def test_the_promise_safeguard_holds_a_promise_inside_its_bound(case):
+@pytest.mark.parametrize("opener", [" I'll", " Also,"])
+def test_the_promise_safeguard_holds_a_promise_inside_its_bound(case, opener):
     example = _example(case)
-    reply = example.replace(INVITATION, INVITATION + " I'll" + " x" * 140 + " follow your runbooks.")
+    reply = example.replace(INVITATION, INVITATION + opener + " x" * 140 + " follow your runbooks.")
     assert "no-runbook-promise" in _failing(case, reply)
