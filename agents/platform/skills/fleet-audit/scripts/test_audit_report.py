@@ -5253,8 +5253,24 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
             audit_report.validate_findings(doc, AUDIT)
         self.assertIn("declared[0].object", str(cm.exception))
         self.assertIn("allow-all", str(cm.exception))
-        doc["declared"][0]["object"] = "Namespace/payments"
-        audit_report.validate_findings(doc, AUDIT)
+        # The kind is folded as the join folds it: kubectl's spelling and a
+        # space around the slash are the namespace posture too.
+        for obj in ("Namespace/payments", "namespace/payments", "Namespace / payments"):
+            with self.subTest(obj):
+                doc["declared"][0]["object"] = obj
+                audit_report.validate_findings(doc, AUDIT)
+        # A missing object is reported as missing, not as the allow-all shape.
+        del doc["declared"][0]["object"]
+        with self.assertRaises(audit_report.ValidationError) as cm:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertNotIn("allow-all", str(cm.exception))
+
+    def test_the_apply_guard_folds_the_kind_as_the_join_does(self):
+        posture = make_finding(fid="ns", severity="major", obj="namespace/payments", check="netpol-missing")
+        doc = audit_report.validate_findings(make_doc(findings=[posture], audit=AUDIT), AUDIT)
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._netpol_declaration("Namespace/payments")])
+        self.assertEqual([f["object"] for f in moved], ["namespace/payments"])
 
     def _sa_finding(self, fid, obj, namespace="payments", cluster="prod-us-east"):
         return make_finding(fid=fid, severity="major", obj=obj, check="default-sa-automount", namespace=namespace, cluster=cluster, command="kubectl get sa default -n " + namespace, remediation={"kind": "manifest", "path": f"clusters/{cluster}/{namespace}/default-sa-automount.yaml", "note": "shared file"})
@@ -5280,6 +5296,25 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
         self.assertEqual(audit_report.remediation_groups(doc["findings"]), [[by_obj["Deployment/batch"]]])
         self.assertIn("MANUAL:", err.getvalue())
         # Idempotent: a second pass changes nothing more.
+        self.assertEqual(audit_report.shield_declared_account_siblings(doc), [])
+
+    def test_a_sibling_already_manual_still_gains_the_shield_note(self):
+        # 2.7's default is manual (few repositories declare the auto-created
+        # default ServiceAccount); its own note is the shared-account fix, so
+        # the shield text joins it rather than being skipped.
+        api = self._sa_finding("api", "Deployment/api")
+        worker = self._sa_finding("worker", "Deployment/worker")
+        worker["remediation"] = {"kind": "manual", "path": "", "note": "Set automountServiceAccountToken: false on the default ServiceAccount."}
+        doc = audit_report.validate_findings(make_doc(findings=[api, worker], audit=AUDIT), AUDIT)
+        declaration = {"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "x"}
+        with contextlib.redirect_stderr(io.StringIO()):
+            audit_report.apply_declarations(doc, [declaration])
+            changed = audit_report.shield_declared_account_siblings(doc)
+        (left,) = doc["findings"]
+        self.assertEqual(changed, [left["id"]])
+        self.assertEqual(left["remediation"]["kind"], "manual")
+        self.assertTrue(left["remediation"]["note"].startswith("Set automountServiceAccountToken: false"))
+        self.assertIn("`Deployment/api` declared at acme/fleet:knowledge/api-token.md", left["remediation"]["note"])
         self.assertEqual(audit_report.shield_declared_account_siblings(doc), [])
 
     def test_no_declared_workload_leaves_the_shared_file_alone(self):

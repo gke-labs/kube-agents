@@ -375,6 +375,9 @@ obtainability and compliance audits list both postures under Declared intent rat
 # set is the policy for it. A file that has the path but not these declares
 # nothing, and the declared-intent cases fail on that project with a
 # presence-only check green -- which is why presence alone is not the check.
+# The nightly cases that fail on a project whose note is missing or unread,
+# one per declaring stream, named in this check's messages.
+GITOPS_INTENT_NOTE_CASES = ("obtainability-declared-intent-no-finding", "compliance-declared-intent-no-finding")
 GITOPS_INTENT_NOTE_DECLARATIONS = (
     ("obtainability-audit", {"check": "no-pdb", "namespace": "seeded-intent", "object": "Deployment/notification-relay"}),
     ("compliance-audit", {"check": "netpol-missing", "namespace": "seeded-intent", "object": "Namespace/seeded-intent"}),
@@ -2488,21 +2491,20 @@ def _note_declaration_problem(body: str, repo_slug: str, audit=None) -> Optional
     # stderr; each stream's item is then matched among the entries of its own
     # check. The policy is still the audit's: a slug that leaves its stream's
     # set leaves the union, and this check rejects the note the day the audit does.
-    union = frozenset().union(*(audit.audit_declarable_checks(stream) for stream, _ in GITOPS_INTENT_NOTE_DECLARATIONS))
-    all_entries = audit.parse_declarations(body, repo=repo_slug, path=GITOPS_INTENT_NOTE_PATH, declarable=union)
+    declarable_by_stream = {stream: audit.audit_declarable_checks(stream) for stream, _ in GITOPS_INTENT_NOTE_DECLARATIONS}
     for stream, wanted_item in GITOPS_INTENT_NOTE_DECLARATIONS:
-        if wanted_item["check"] not in audit.audit_declarable_checks(stream):
+        if wanted_item["check"] not in declarable_by_stream[stream]:
             return f"{wanted_item['check']} is no longer a check {stream} lets a declaration justify"
+    union = frozenset().union(*declarable_by_stream.values())
+    all_entries = audit.parse_declarations(body, repo=repo_slug, path=GITOPS_INTENT_NOTE_PATH, declarable=union)
+    if not all_entries:
+        # The reason is the parser's own (`explain_empty_declarations` walks
+        # the ladder `parse_declarations` walks); None means the note had
+        # items and the parser skipped every one, logging a WARNING each.
+        reason = audit.explain_empty_declarations(body)
+        return reason or "the parser skipped every declares item (its WARNING lines above say why)"
+    for stream, wanted_item in GITOPS_INTENT_NOTE_DECLARATIONS:
         entries = [e for e in all_entries if str(e.get("check", "")) == wanted_item["check"]]
-        if not all_entries:
-            # The reason is the parser's own (`explain_empty_declarations` walks
-            # the ladder `parse_declarations` walks); None means the note had
-            # items and the parser skipped every one, logging a WARNING each.
-            reason = audit.explain_empty_declarations(body)
-            return reason or (
-                f"no declares item is check {wanted_item['check']} for {wanted_item['object']} in "
-                f"{wanted_item['namespace']} (the {stream} parser skipped every item; its WARNING lines above say why)"
-            )
         wanted = audit._declaration_key(wanted_item, with_cluster=False)
         matching = [e for e in entries if audit._declaration_key(e, with_cluster=False) == wanted]
         if any(audit.DECLARATION_CLUSTER_FIELD not in e for e in matching):
@@ -2582,7 +2584,7 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
             False,
             f"{repo_slug} has no {GITOPS_INTENT_NOTE_PATH}, or this token cannot read the repository "
             f"(gh answers 404 to both; the github_repo_and_app check, run alongside or with --checks, says which). If the repository is "
-            f"readable, obtainability-declared-intent-no-finding fails on this project until the note "
+            f"readable, {' and '.join(GITOPS_INTENT_NOTE_CASES)} fail on this project until the note "
             f"is seeded: {gitops_note_seed_command(repo_slug)}",
         )
 
@@ -2718,7 +2720,7 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
         False,
         f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration, but its {audit.INTENT_FILE} bounds "
         f"the audit's search to {', '.join(prefixes)}, every one of which exists, so the audit never reads the note and "
-        f"obtainability-declared-intent-no-finding fails on this project. Add `knowledge/` to that file's "
+        f"{' and '.join(GITOPS_INTENT_NOTE_CASES)} fail on this project. Add `knowledge/` to that file's "
         f"`paths`, or move the note under one of them.",
     )
 

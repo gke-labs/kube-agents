@@ -787,9 +787,10 @@ an optional `cluster`, `object` as `Kind/name` — within the paths each reposit
 case-blind lookup on `(check, cluster, namespace, object)`, then on the fleet-wide
 `(check, namespace, object)`, compared as the finding id is (`deployment/api` joins `Deployment/api`),
 the finding's `cluster` and `title` kept and the note's `repo`, `path` and title as the declaration.
-For `hpa-cannot-scale`, the one slug that names both a posture and a fault, the join moves only the
-`min == max` shape, read off the severity the SOP fixes for it (`major`); a declaration matching the
-`minor` dangling-target fault is reported on stderr and not applied.
+Two slugs name both a posture and a fault, and the join moves only the posture: for
+`hpa-cannot-scale` the `min == max` shape, read off the severity the SOP fixes for it (`major`); for
+`netpol-missing` the `Namespace/<ns>` shape. A declaration matching the `minor` dangling-target fault
+or an allow-all `NetworkPolicy/<name>` is reported on stderr and not applied.
 The worker's half is the `provisioning/` pins HCL and YAML make in the GitOps clone, which have no
 machine-readable form yet; a match there is moved here by the worker with the lines that pin the
 property as `excerpt`. A posture a `declares:` note covers is written to `findings` like any other

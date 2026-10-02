@@ -3375,15 +3375,6 @@ def validate_findings(data: object, audit_id: str) -> dict:
                     f"of governance/{audit_sop(audit_id)} names the checks it may "
                     "move; write this one under `findings`"
                 )
-            if (
-                check == NAMESPACE_SHAPE_CHECK
-                and str(entry.get("object") or "").partition("/")[0] != NAMESPACE_SHAPE_KIND
-            ):
-                raise ValidationError(
-                    f"{where}.object: {str(entry.get('object') or '')!r} — a {check} declaration "
-                    f"justifies the namespace posture (`{NAMESPACE_SHAPE_KIND}/<ns>`); the allow-all "
-                    "shape names the policy and is a fault, so it stays under `findings`"
-                )
             _require_str(entry.get("title"), f"{where}.title", allow_empty=False)
             _require_str(entry.get("cluster"), f"{where}.cluster", allow_empty=False)
             cluster = str(entry["cluster"])
@@ -3396,6 +3387,12 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 )
             _require_str(entry.get("namespace", ""), f"{where}.namespace")
             _require_str(entry.get("object"), f"{where}.object", allow_empty=False)
+            if check == NAMESPACE_SHAPE_CHECK and not _is_namespace_object(str(entry["object"])):
+                raise ValidationError(
+                    f"{where}.object: {str(entry['object'])!r} — a {check} declaration justifies "
+                    f"the namespace posture (`{NAMESPACE_SHAPE_KIND}/<ns>`); the allow-all shape "
+                    "names the policy and is a fault, so it stays under `findings`"
+                )
             for field in ("cluster", "object"):
                 if _id_segment(str(entry[field])) == ID_EMPTY_SEGMENT:
                     raise ValidationError(
@@ -4507,7 +4504,7 @@ def declared_intent_applies(data: dict) -> bool:
     one that searched and found a declaration, and the search record is the
     only thing that tells them apart — the same laundering path `checks_run`
     guards against, one field over. A stream with no `declarable` set never
-    owes it, and neither does a run on which none of the four ran: there was
+    owes it, and neither does a run on which none of its declarable checks ran: there was
     no candidate to search for.
     """
     declarable = audit_declarable_checks(str(data.get("audit") or ""))
@@ -5078,6 +5075,11 @@ def fold_searched_record(data: dict, record: dict | None) -> None:
     data[DECLARED_INTENT_SEARCHED_KEY] = current
 
 
+def _is_namespace_object(obj: str) -> bool:
+    """Whether `obj` names a Namespace, with the kind folded as the join folds it (`namespace/x`, `Namespace / x`)."""
+    return _id_segment(obj.partition("/")[0]) == _id_segment(NAMESPACE_SHAPE_KIND)
+
+
 def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
     """Move each finding a declaration covers into `declared[]`; return the moved.
 
@@ -5087,8 +5089,8 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
     against fleet-wide ones. The first entry
     wins in repository-then-path order, which is the order `start` wrote them
     in. Only a declarable check is looked up at all, so a fault stays a
-    finding whatever a note says about it — and for `hpa-cannot-scale`, the
-    one slug that names both, only the `min == max` shape moves, read off the
+    finding whatever a note says about it — and for `hpa-cannot-scale`, the first slug that names both, only the `min == max` shape moves;
+    for `netpol-missing`, the second, only the `Namespace/` shape moves, read off the
     severity §3.6 fixes for it (`DUAL_SHAPE_POSTURE_SEVERITY`); a match on the
     dangling-target fault is said on stderr and not applied. An identity the
     model already declared is left to the model's entry.
@@ -5136,7 +5138,7 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
         if (
             match is not None
             and check == NAMESPACE_SHAPE_CHECK
-            and str(finding.get("object", "")).partition("/")[0] != NAMESPACE_SHAPE_KIND
+            and not _is_namespace_object(str(finding.get("object", "")))
         ):
             # The slug names a posture on the namespace and a fault on the
             # policy, and a declaration justifies only the posture.
@@ -5202,17 +5204,22 @@ def shield_declared_account_siblings(data: dict) -> list[str]:
         if not declared:
             continue
         remediation = finding.setdefault("remediation", {})
-        if str(remediation.get("kind", "")) == "manual":
-            continue
         names = ", ".join(
             f"`{e.get('object', '')}` declared at {e.get('declaration', {}).get('repo', '')}:"
             f"{e.get('declaration', {}).get('path', '')}"
             for e in declared
         )
         note = str(remediation.get("note", "")).strip()
+        shield = SHARED_ACCOUNT_SHIELD_NOTE.format(declared=names)
+        if shield in note:
+            continue
+        # A sibling the worker already filed as manual (2.7's default, since
+        # few repositories declare the auto-created `default` ServiceAccount)
+        # keeps its kind and gains the note: its own manual text is 2.7's
+        # shared-account fix, which the reader must not follow here either.
         remediation["kind"] = "manual"
         remediation["path"] = ""
-        remediation["note"] = (f"{note} " if note else "") + SHARED_ACCOUNT_SHIELD_NOTE.format(declared=names)
+        remediation["note"] = (f"{note} " if note else "") + shield
         fid = str(finding.get("id", ""))
         changed.append(fid)
         log(
