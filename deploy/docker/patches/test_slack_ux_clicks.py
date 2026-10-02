@@ -583,6 +583,17 @@ class RuntimeTest(unittest.TestCase):
         self._answer(listed, *_choice())
         self.assertEqual(len(listed.log), 3)
 
+    def test_a_click_in_a_group_dm_with_dms_disabled_changes_nothing(self):
+        # The gateway ignores an mpim as it does an im when DMs are disabled.
+        for disable_dms, calls in ((True, 0), (False, 3)):
+            with self.subTest(disable_dms=disable_dms):
+                importlib.reload(runtime)
+                adapter = _Adapter(disable_dms=disable_dms)
+                body, action = _choice()
+                body["channel"] = {"id": CHANNEL, "name": "mpdm-alice--bob--kage-1"}
+                self._answer(adapter, body, action)
+                self.assertEqual(len(adapter.log), calls)
+
     def _dm_begin(self, adapter):
         async def begin(ack, body, action, kind, *, team_scoped=True):
             await ack()

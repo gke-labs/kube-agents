@@ -110,6 +110,7 @@ COMMAND_GUARD = "\u200b"
 DM_CHANNEL_PREFIX = "D"
 
 #: A group DM's name in a click's payload, which carries no ``channel_type`` to read ``mpim`` from.
+#: Not yet seen in a live click: a payload naming it otherwise reads as a channel, as before.
 GROUP_DM_NAME_PREFIX = "mpdm-"
 
 #: A synthetic message's ts when the payload carries no ``action_ts``.
@@ -259,16 +260,16 @@ def _shown_text(action: dict) -> str:
     return str(text.get("text") or "").strip() if isinstance(text, dict) else ""
 
 
-def _gated_out(adapter: Any, channel_id: str) -> bool:
+def _gated_out(adapter: Any, channel_id: str, body: dict) -> bool:
     """Whether the adapter would ignore a typed message in ``channel_id``: an ignored
-    channel, outside ``allowed_channels``, or a DM with DMs disabled. Checked before
-    anything is shown."""
+    channel, outside ``allowed_channels``, or a DM, 1:1 or group, with DMs disabled.
+    Checked before anything is shown."""
     if adapter._is_ignored_channel(channel_id):
         return True
     allowed = adapter._slack_allowed_channels()
     if allowed and channel_id not in allowed:
         return True
-    return channel_id.startswith(DM_CHANNEL_PREFIX) and bool(adapter._slack_disable_dms())
+    return (channel_id.startswith(DM_CHANNEL_PREFIX) or _is_group_dm(body)) and bool(adapter._slack_disable_dms())
 
 
 def _as_answer(label: str) -> str:
@@ -409,7 +410,7 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
             kind, msg_ts or "an unknown message", ", ".join(missing),
         )
         return
-    if _gated_out(adapter, channel_id):
+    if _gated_out(adapter, channel_id, body):
         logger.info("slack_ux_clicks: ignoring a %s click in %s, which the adapter ignores", kind, channel_id)
         return
     key = (channel_id, msg_ts, kind)
