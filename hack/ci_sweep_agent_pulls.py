@@ -143,9 +143,6 @@ TOKEN_PERMISSIONS = {"pull_requests": "write", "contents": "write", "issues": "w
 # GitHub's answers for a ref that is already gone: 422 "Reference does not
 # exist", or 404. Neither is a failure -- the branch is what was wanted absent.
 REF_GONE_CODES = (404, 422)
-# GitHub's answer to deleting a branch a ruleset or protection keeps: kept
-# and reported, not a fault -- a protected branch is nobody's leftover.
-BRANCH_REFUSED_CODE = 403
 
 PER_PAGE = 100
 # A bound rather than a budget: orders of magnitude above any pool repository,
@@ -451,7 +448,7 @@ def _field(payload, key, what, repo):
 CALL_FAULTS = (urllib.error.HTTPError, OSError, http.client.HTTPException, SweepError)
 
 
-def _retry_after(exc):
+def retry_after(exc):
     """Seconds GitHub asked for, bounded; the default when it named none."""
     raw = (getattr(exc, "headers", None) or {}).get(RETRY_AFTER_HEADER)
     try:
@@ -459,6 +456,9 @@ def _retry_after(exc):
     except (TypeError, ValueError):
         return RETRY_AFTER_DEFAULT_SECONDS
     return max(0, min(seconds, RETRY_AFTER_MAX_SECONDS))
+
+
+_retry_after = retry_after
 
 
 def is_rate_limited(exc):
@@ -485,7 +485,7 @@ def write(method, path, authorization, body=None):
         except urllib.error.HTTPError as exc:
             if not is_rate_limited(exc):
                 raise
-            wait = _retry_after(exc)
+            wait = retry_after(exc)
             print("  %s %s refused (%s); waiting %ds before one retry" % (method, path, boskos_pool.describe(exc), wait), file=sys.stderr)
             pause(wait)
             try:
@@ -635,14 +635,6 @@ def close_agent_pulls(repo, authorization, bot_login, dry_run=False, budget=None
             except RateLimited as exc:
                 exc.closed = closed
                 raise
-            except urllib.error.HTTPError as exc:
-                if exc.code == BRANCH_REFUSED_CODE:
-                    # A ruleset or protection keeps it: not the agent's
-                    # leftover, reported and not a fault of this repository.
-                    print("  branch %s kept, GitHub refused the delete (%s); a protected branch is not a leftover" % (ref, boskos_pool.describe(exc)))
-                    continue
-                print("  %s was not deleted (%s)" % (ref, boskos_pool.describe(exc)), file=sys.stderr)
-                undeleted.append(ref)
             except CALL_FAULTS as exc:
                 print("  %s was not deleted (%s)" % (ref, boskos_pool.describe(exc)), file=sys.stderr)
                 undeleted.append(ref)

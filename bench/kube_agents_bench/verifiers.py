@@ -2188,10 +2188,11 @@ class GitHubWritesVerifier(BaseVerifier):
     ``TranscriptSnapshot.started_at`` less ``max_clock_skew_sec``: every pull
     request a ``[bot]`` login (or ``author``) opened from a branch in the
     repository itself and that was opened or updated in the window, and every
-    branch but the default heading no pull request whose tip was committed in
-    it (the refs API carries no push time, so that is what is measured). Not
-    the branch name: the agent names its own branches when it pushes with git
-    (#2260). The repository comes from the
+    branch under ``platform-agent/`` heading no pull request whose tip was
+    committed in it (the refs API carries no push time, so that is what is
+    measured). Not the branch name for a pull request: the agent names its own
+    branches when it pushes with git (#2260); a branch carries no author, so
+    the prefix is the one mark the branch half has. The repository comes from the
     environment and not from the reply, since the reply of a run that wrote
     where it should not have may say nothing about it.
 

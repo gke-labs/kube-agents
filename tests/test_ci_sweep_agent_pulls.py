@@ -552,15 +552,6 @@ class ClosingTest(unittest.TestCase):
         run_repo(github)
         self.assertEqual(github.keys("DELETE "), ["DELETE /repos/%s/git/refs/heads/fix-payments-api-oom" % REPO])
 
-    def test_a_branch_github_refuses_to_delete_is_kept_not_a_fault(self):
-        # A ruleset or protection on it: reported, kept, and not this
-        # repository's failure, or every run would red on it for good.
-        github = _GitHub(pulls=[], branches=["release", "fix-payments-api-oom"], delete_errors={"release": _http_error(403)})
-        with mock.patch("sys.stdout", io.StringIO()) as out:
-            self.assertEqual(run_repo(github), 0)
-        self.assertIn("branch release kept, GitHub refused the delete", out.getvalue())
-        self.assertEqual(len(github.keys("DELETE ")), 2)
-
     def test_a_branch_whose_close_failed_this_run_is_not_deleted_from_under_it(self):
         github = _GitHub(pulls=[agent_pull()], close_errors={1: _http_error(409)}, branches=["platform-agent/fix-the-thing"])
         with self.assertRaises(sweeper.SweepError):

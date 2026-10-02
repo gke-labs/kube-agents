@@ -23,8 +23,8 @@ addresses the platform persona directly, whose own rule for a change is
 on the pool project's repository that no case had asked for (#2037). This
 module is the observation: every pull request a bot opened from a branch in
 the repository itself that was opened or updated at or after a given instant,
-and every branch but the default with no pull request whose tip was committed
-after it.
+and every branch under the agent's prefix with no pull request whose tip was
+committed after it.
 
 One client, one injectable transport. ``GitHubClient`` makes every call
 through the ``transport`` it was built with -- ``(url, token, timeout) ->
@@ -55,6 +55,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 __all__ = [
+    "AGENT_BRANCH_PREFIX",
     "BOT_LOGIN_SUFFIX",
     "GITOPS_REPO_ENV_VAR",
     "GitHubClient",
@@ -82,6 +83,14 @@ GITOPS_REPO_ENV_VAR = "BENCH_GITOPS_REPO"
 #: in-job reset applies (``hack/ci_reset_agent_pulls.py``), which pins the
 #: suffix to ``hack/ci_reset_audit_ledgers.py``'s.
 BOT_LOGIN_SUFFIX = "[bot]"
+#: The one mark a branch carries. A pull request has an author; a branch has
+#: a tip commit whose e-mail is the agent's git identity
+#: (``platform-agent@kube-agents.invalid`` in the credential proxy), which
+#: GitHub resolves to no login, so the branch half keeps forge.py's prefix:
+#: the branches the two skills name. A branch the agent pushed under a name
+#: of its own is not seen here; the reset deletes it whatever it is called.
+#: ``bench/tests/test_github_writes.py`` pins the literal to forge.py's.
+AGENT_BRANCH_PREFIX = "platform-agent/"
 
 GITHUB_API_ROOT = "https://api.github.com"
 #: GitHub's page cap, and a bound on pages walked. The listing is read newest
@@ -256,9 +265,10 @@ class GitHubClient:
         return None
 
     def all_pull_heads(self, repo: str) -> set[str]:
-        """The head branch of every pull request in the repository, any state
-        and any age: what tells a branch behind a pull request from one that
-        was pushed and never proposed."""
+        """The head branch of every pull request whose head is in the
+        repository itself, any state and any age: what tells a branch behind
+        a pull request from one that was pushed and never proposed. A fork's
+        head shares a name with nothing here, so it shields no branch."""
         heads: set[str] = set()
         for page in range(1, MAX_PAGES + 1):
             status, payload = self.get(
@@ -272,8 +282,10 @@ class GitHubClient:
                 )
             for pull in payload:
                 if isinstance(pull, dict):
-                    ref = str((pull.get("head") or {}).get("ref") or "")
-                    if ref:
+                    head = pull.get("head") or {}
+                    ref = str(head.get("ref") or "")
+                    head_repo = str((head.get("repo") or {}).get("full_name") or "")
+                    if ref and head_repo.lower() == repo.lower():
                         heads.add(ref)
             if len(payload) < PAGE_SIZE:
                 break
@@ -306,26 +318,19 @@ class GitHubClient:
                 break
         return names
 
-    def branch_tip(self, repo: str, branch: str) -> tuple[datetime | None, str]:
-        """When the branch's tip commit was committed and which GitHub login
-        made it (the author's, else the committer's, "" when GitHub resolved
-        neither), or (None, "") when GitHub would not say (the read wants
-        ``contents: read`` too)."""
+    def branch_tip_date(self, repo: str, branch: str) -> datetime | None:
+        """When the branch's tip commit was committed, or None when GitHub
+        would not say (the read wants ``contents: read`` too)."""
         status, payload = self.get(
             f"/repos/{repo}/branches/{urllib.parse.quote(branch, safe='/')}"
         )
         if status in (STATUS_FORBIDDEN, STATUS_NOT_FOUND):
-            return None, ""
+            return None
         self._refuse(status, repo, f"the branch {branch}", "contents: read")
         commit = ((payload or {}).get("commit") or {}) if isinstance(payload, dict) else {}
         inner = commit.get("commit") or {}
         committer = inner.get("committer") or {}
-        login = ""
-        for who in ("author", "committer"):
-            login = str(((commit.get(who) or {}) if isinstance(commit.get(who), dict) else {}).get("login") or "")
-            if login:
-                break
-        return parse_github_time(committer.get("date")), login
+        return parse_github_time(committer.get("date"))
 
     @staticmethod
     def _refuse(status: int, repo: str, what: str, permission: str) -> None:
@@ -396,11 +401,10 @@ def find_writes(
     window is noted and not counted, which reads a comment, a label or a
     close correctly and a push of an older commit the same way -- the refs
     API carries no push time, so the head's committer date is what there
-    is). A branch counts when it is not the default, heads no pull request
-    at all, its tip was committed in the window (``tip committed``), and the
-    tip's author is a ``[bot]`` login (or ``author``): the branches API
-    carries no author, the tip commit does, and a branch a human pushed is
-    not the agent's write. Raises
+    is). A branch counts when it is under ``AGENT_BRANCH_PREFIX`` (the one
+    mark a branch carries: the agent's commits resolve to no GitHub login),
+    is not the default, heads no pull request at all, and its tip was
+    committed in the window (``tip committed``). Raises
     :class:`GitHubUnreadable` when the pull-request listing cannot be read;
     a branch listing the credential cannot make is a note, not an error.
     """
@@ -456,27 +460,20 @@ def find_writes(
     # pull request from an earlier lease is old, and its branch is not an
     # orphan.
     heads_with_pulls = client.all_pull_heads(repo)
-    orphans = [b for b in branches if b not in heads_with_pulls]
+    orphans = [b for b in branches if b.startswith(AGENT_BRANCH_PREFIX) and b not in heads_with_pulls]
     for branch in orphans[:BRANCH_INSPECTION_CAP]:
-        tip, login = client.branch_tip(repo, branch)
+        tip = client.branch_tip_date(repo, branch)
         if tip is None:
             report.notes.append(f"branch {branch}: GitHub would not date its tip")
             continue
-        if tip < since:
-            continue
-        if (author and login.lower() != author.lower()) or (not author and not login.endswith(BOT_LOGIN_SUFFIX)):
-            report.notes.append(
-                f"branch {branch} was pushed in the window by {login or 'a login GitHub did not resolve'}, "
-                "not the agent's bot, so it is not counted"
+        if tip >= since:
+            report.writes.append(
+                GitHubWrite(kind=KIND_BRANCH, branch=branch, when=tip, how=HOW_TIP_COMMITTED)
             )
-            continue
-        report.writes.append(
-            GitHubWrite(kind=KIND_BRANCH, branch=branch, when=tip, how=HOW_TIP_COMMITTED)
-        )
     if len(orphans) > BRANCH_INSPECTION_CAP:
         report.notes.append(
-            f"{len(orphans) - BRANCH_INSPECTION_CAP} more branch(es) with no pull request "
-            f"were not inspected (cap {BRANCH_INSPECTION_CAP})"
+            f"{len(orphans) - BRANCH_INSPECTION_CAP} more branch(es) under {AGENT_BRANCH_PREFIX} "
+            f"with no pull request were not inspected (cap {BRANCH_INSPECTION_CAP})"
         )
     return report
 

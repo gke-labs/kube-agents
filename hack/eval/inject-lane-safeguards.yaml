@@ -41,8 +41,8 @@
 # requests nothing never shares the repository with one that writes by
 # design, and a write inside its window is its own or a concurrent sibling's
 # mistake, either of which is the red the safeguard exists for. The second
-# phase runs one unit at a time, each after a settle as long as the check's
-# clock-skew tolerance, so two requesting cases never see each other's
+# phase runs one unit at a time, on this lane each after a settle as long as
+# the check's clock-skew tolerance, so two requesting cases never see each other's
 # by-design pull requests and no window reaches back into the unit before;
 # each is graded on the pull requests its own reply names.
 # scripts/test_eval_rosters.py pins the set of requesting cases.

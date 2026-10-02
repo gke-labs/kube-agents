@@ -214,16 +214,16 @@ class ResetTest(unittest.TestCase):
         self.assertEqual(record["kept_branches"], [])
         self.assertTrue(record["clean"])
 
-    def test_a_branch_github_refuses_to_delete_is_kept_as_protected_not_a_failure(self):
-        # A ruleset or protection on it: not the agent's leftover, so the
-        # unit still runs and the record says what was kept.
+    def test_a_branch_github_refuses_to_delete_leaves_the_repository_not_clean(self):
+        # Whatever the reason -- a limit the retries outlasted, a protection,
+        # a reach the mint did not give -- a branch left is a branch the next
+        # agent would start from, so the unit does not run on it.
         github = FakeGitHub(pulls=[pull(1)], branches=["fix-payments-api-oom", "release"], fail={("DELETE", "release"): _http_error(403)})
         record, out, err = run_reset(github)
-        self.assertEqual(record["protected"], ["release"])
-        self.assertEqual(record["undeleted"], [])
+        self.assertEqual(record["undeleted"], ["release"])
         self.assertEqual(record["deleted"], ["fix-payments-api-oom"])
-        self.assertTrue(record["clean"], (out, err))
-        self.assertIn("a protected branch is not a leftover", out)
+        self.assertFalse(record["clean"])
+        self.assertIn("branch release was not deleted", err)
 
     def test_every_branch_but_the_default_goes_whatever_its_name(self):
         github = FakeGitHub(branches=["fix-payments-api-oom", "feature/add-seeded-c", "platform-agent/orphan"], default="main")
@@ -325,8 +325,18 @@ class RetryTest(unittest.TestCase):
         self.assertFalse(helper.is_rate_limited(_http_error(403)))
         self.assertTrue(helper.is_rate_limited(urllib.error.HTTPError("u", 403, "F", {"X-RateLimit-Remaining": "0"}, io.BytesIO(b""))))
         self.assertTrue(helper.is_rate_limited(urllib.error.HTTPError("u", 403, "F", {}, io.BytesIO(b'{"message":"You have exceeded a secondary rate limit"}'))))
-        self.assertEqual(helper.retry_after(urllib.error.HTTPError("u", 429, "L", {"Retry-After": "999"}, io.BytesIO(b""))), helper.RETRY_AFTER_MAX_SECONDS)
-        self.assertEqual(helper.retry_after(_http_error(429)), helper.RETRY_AFTER_DEFAULT_SECONDS)
+        self.assertEqual(helper.retry_after(urllib.error.HTTPError("u", 429, "L", {"Retry-After": "999"}, io.BytesIO(b""))), helper.sweep.RETRY_AFTER_MAX_SECONDS)
+        self.assertEqual(helper.retry_after(_http_error(429)), helper.sweep.RETRY_AFTER_DEFAULT_SECONDS)
+
+    def test_a_403_marked_only_in_its_body_waits_the_default(self):
+        # The body is read once and kept on the exception, so the mark is
+        # still there when the wait is chosen: GitHub's shape with no header.
+        github = FakeGitHub(pulls=[pull(1)], branches=["fix-payments-api-oom"])
+        limited = urllib.error.HTTPError("https://api.github.com/x", 403, "Forbidden", {}, io.BytesIO(b'{"message":"You have exceeded a secondary rate limit. Please wait."}'))
+        record, pauses = self.run_with(self.flaky([(("PATCH", f"/repos/{REPO}/pulls/1"), limited)], github))
+        self.assertEqual(record["closed"], [1])
+        self.assertIn(helper.sweep.RETRY_AFTER_DEFAULT_SECONDS, pauses)
+        self.assertNotIn(helper.RETRY_DELAYS_SECONDS[0], pauses)
 
     def test_a_refusal_is_not_tried_again(self):
         github = FakeGitHub(pulls=[pull(1)])
@@ -379,7 +389,7 @@ class MainTest(unittest.TestCase):
             self.assertEqual(rc, 1)
             record = json.loads(path.read_text())
         self.assertFalse(record["clean"])
-        self.assertIn("HTTP 403", record["error"])
+        self.assertIn("403", record["error"])
         self.assertEqual(record["scope"], "lease")
 
     def test_a_missing_token_a_guard_and_a_fault_each_have_their_code(self):
