@@ -394,7 +394,7 @@ AUDIT_STATUS_BUSY = "busy"
 # so the two cannot drift apart.
 RULE_EXECUTABLE_ALLOWLIST = "executable.allowlist"
 RULE_CALLER_EXECUTABLE = "caller.executable-role"
-RULE_CALLER_FILE_ARGUMENT = "caller.file-argument"
+RULE_CALLER_KUBECTL_FLAG = "caller.kubectl-flag"
 RULE_GIT_ARGUMENT_REFUSED = "git.argument.refused"
 RULE_GIT_WORKSPACE_LEASE = "git.workspace.lease"
 RULE_SCOPED_SA_UNMAPPED_SCOPE = "gcp.scoped-sa.unmapped-scope"
@@ -618,29 +618,108 @@ def executable_permitted(role: str, executable: str) -> bool:
     return narrowed is None or executable in narrowed
 
 
-# Arguments the session role may not pass, per executable. The broker runs
-# every command in its own container, so a flag that names a file or a URL is
-# read by the BROKER - its content-workspace clones, its policy and state
-# files, any HTTP endpoint its open egress reaches - and kubectl's decoder
-# echoes an unrecognised document back on stderr. The shell owns those clones
-# and holds git and gh anyway; the session is the caller the narrowing exists
-# to keep off them. Short flags match as a prefix too (`-fx.yaml`), long ones
-# exactly or with `=`, so `--field-selector` is not `-f`.
-SESSION_REFUSED_ARGUMENT_FLAGS: dict[str, frozenset[str]] = {
-    "kubectl": frozenset({"-f", "--filename", "-k", "--kustomize", "-R", "--recursive"}),
-    "gcloud": frozenset({"--flags-file"}),
+# The kubectl flags a session caller may pass. An allowlist, for the reason
+# command_policy gives for the read verbs: the broker runs kubectl in its own
+# container, so any flag that names a file or a URL -- `-f`, `-k`, the
+# `*-file=` output formats, and whatever a future kubectl adds -- is read by
+# the BROKER, and a denylist of spellings is something pflag's grammar walks
+# around (`-Af <path>` clusters a boolean in front of the file flag). Streaming
+# flags (`--watch`, `logs --follow`) are not here either: each holds one of the
+# broker's command slots until the deadline, and a session shares that pool
+# with the platform agent's shell. Everything not listed is refused by name,
+# so a new flag is a review rather than a hole. The shell keeps kubectl's
+# whole surface; its clones and slots are its own.
+SESSION_KUBECTL_VALUE_FLAGS: frozenset[str] = frozenset({
+    "--namespace", "--selector", "--field-selector", "--context", "--kubeconfig",
+    "--output", "--sort-by", "--container", "--tail", "--since", "--since-time",
+    "--limit-bytes", "--chunk-size", "--limit", "--for", "--timeout",
+    "--request-timeout", "--types", "--verbs", "--api-group", "--template",
+})
+SESSION_KUBECTL_BOOLEAN_FLAGS: frozenset[str] = frozenset({
+    "--all-namespaces", "--show-labels", "--show-kind", "--no-headers",
+    "--previous", "--timestamps", "--prefix", "--all-containers",
+    "--ignore-not-found", "--ignore-errors", "--show-managed-fields",
+    "--containers", "--namespaced", "--client", "--help",
+})
+# pflag shorthands the session may use, by the long flag they stand for. The
+# cluster walk below reads a single-dash token character by character, as
+# command_policy._kubectl_refuses_identity_change does: each boolean consumes
+# nothing, the first value-taking shorthand swallows the rest of the token or
+# the next argv element.
+SESSION_KUBECTL_SHORTHANDS: dict[str, str] = {
+    "n": "--namespace", "l": "--selector", "o": "--output", "c": "--container",
+    "A": "--all-namespaces", "p": "--previous", "h": "--help",
 }
+# `--output` values that are formats, not files. The `*-file=` variants
+# (`go-template-file`, `jsonpath-file`, `custom-columns-file`, `templatefile`)
+# read the named path on the broker and are not here.
+SESSION_KUBECTL_OUTPUT_FORMATS: frozenset[str] = frozenset({"json", "yaml", "wide", "name"})
+SESSION_KUBECTL_OUTPUT_PREFIXES: tuple[str, ...] = ("jsonpath=", "custom-columns=", "go-template=", "template=")
 
 
-def session_argument_refusal(role: str, argv: list[str]) -> str | None:
-    """The refused flag a session caller passed, or None.
+def _session_output_permitted(value: str) -> bool:
+    return value in SESSION_KUBECTL_OUTPUT_FORMATS or value.startswith(SESSION_KUBECTL_OUTPUT_PREFIXES)
 
-    Only the session role is narrowed; every other role keeps the executor's
-    behaviour. Returns the flag as the table spells it, for the refusal
-    message and the audit line, never the value beside it.
+
+def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
+    """The first kubectl flag a session caller may not pass, or None.
+
+    Only the session role's kubectl is narrowed; every other role and every
+    other executable keeps the executor's behaviour. Returns the flag as a
+    name (`-f`, `--output`), never the value beside it, for the refusal
+    message and the audit line.
     """
-    if role != CALLER_ROLE_SESSION or not argv:
+    if role != CALLER_ROLE_SESSION or not argv or argv[0] != "kubectl":
         return None
+    tokens = argv[1:]
+    index = 0
+    pending: str | None = None  # a value-taking flag whose value is the next token
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        if pending is not None:
+            if pending == "--output" and not _session_output_permitted(token):
+                return pending
+            pending = None
+            continue
+        if token == "--":
+            break
+        if token.startswith("--"):
+            name, separator, value = token.partition("=")
+            if name in SESSION_KUBECTL_BOOLEAN_FLAGS:
+                continue
+            if name in SESSION_KUBECTL_VALUE_FLAGS:
+                if separator:
+                    if name == "--output" and not _session_output_permitted(value):
+                        return name
+                else:
+                    pending = name
+                continue
+            return name
+        if token.startswith("-") and len(token) > 1:
+            cluster = token[1:]
+            position = 0
+            while position < len(cluster):
+                shorthand = cluster[position]
+                long_name = SESSION_KUBECTL_SHORTHANDS.get(shorthand)
+                if long_name is None:
+                    return "-" + shorthand
+                if long_name in SESSION_KUBECTL_BOOLEAN_FLAGS:
+                    position += 1
+                    continue
+                attached = cluster[position + 1:]
+                if attached.startswith("="):
+                    attached = attached[1:]
+                if attached:
+                    if long_name == "--output" and not _session_output_permitted(attached):
+                        return long_name
+                else:
+                    pending = long_name
+                break
+            continue
+        # A bare word: the verb, a resource, a name. The read-verb policy
+        # downstream decides what the verb may do.
+    return None
     refused = SESSION_REFUSED_ARGUMENT_FLAGS.get(argv[0])
     if not refused:
         return None
@@ -6162,15 +6241,15 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 },
             )
             return
-        refused_flag = session_argument_refusal(principal.role, argv)
+        refused_flag = session_kubectl_flag_refusal(principal.role, argv)
         if refused_flag is not None:
             LOGGER.warning(
-                "argument refused for role request_id=%s role=%s executable=%s flag=%s",
+                "flag refused for role request_id=%s role=%s executable=%s flag=%s",
                 request_id,
                 principal.role,
                 _sanitize_for_logging(argv[0]),
                 refused_flag,
-                extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_CALLER_FILE_ARGUMENT),
+                extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_CALLER_KUBECTL_FLAG),
             )
             self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
             self._json(
@@ -6178,10 +6257,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 {
                     "status": "blocked",
                     "code": "SECURITY_POLICY_BLOCKED",
-                    "rule": RULE_CALLER_FILE_ARGUMENT,
+                    "rule": RULE_CALLER_KUBECTL_FLAG,
                     "message": (
-                        f"The {principal.role} caller may not pass {refused_flag}: it names a file or URL "
-                        "the credential proxy, not the session, would read."
+                        f"The {principal.role} caller may pass only kubectl's inspection flags; {refused_flag} "
+                        "is not one of them (file inputs, file-backed output formats and streaming flags are "
+                        "not available to a session)."
                     ),
                 },
             )

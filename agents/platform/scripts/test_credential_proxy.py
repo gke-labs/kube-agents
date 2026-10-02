@@ -2521,41 +2521,89 @@ class SessionRoleExecutableTest(unittest.TestCase):
         self.assertEqual(403, status)
         self.assertEqual("kubernetes.read-only", body["rule"])
 
-    def test_the_table_of_refused_arguments(self):
+    def test_the_table_of_kubectl_flags(self):
+        S = credential_proxy.CALLER_ROLE_SESSION
         for role, argv, want in (
-            (credential_proxy.CALLER_ROLE_SESSION, ["kubectl", "get", "-f", "/etc/credential-proxy/policy.json"], "-f"),
-            (credential_proxy.CALLER_ROLE_SESSION, ["kubectl", "get", "-f=https://example.invalid/x.yaml"], "-f"),
-            (credential_proxy.CALLER_ROLE_SESSION, ["kubectl", "get", "-fx.yaml"], "-f"),
-            (credential_proxy.CALLER_ROLE_SESSION, ["kubectl", "get", "--filename", "x.yaml"], "--filename"),
-            (credential_proxy.CALLER_ROLE_SESSION, ["kubectl", "get", "--filename=x.yaml"], "--filename"),
-            (credential_proxy.CALLER_ROLE_SESSION, ["kubectl", "get", "-k", "overlay/"], "-k"),
-            (credential_proxy.CALLER_ROLE_SESSION, ["kubectl", "get", "--kustomize", "overlay/"], "--kustomize"),
-            (credential_proxy.CALLER_ROLE_SESSION, ["kubectl", "get", "-R", "-f", "dir/"], "-R"),
-            (credential_proxy.CALLER_ROLE_SESSION, ["kubectl", "diff", "--recursive", "--filename", "dir/"], "--recursive"),
-            (credential_proxy.CALLER_ROLE_SESSION, ["gcloud", "compute", "instances", "list", "--flags-file=x.yaml"], "--flags-file"),
-            (credential_proxy.CALLER_ROLE_SESSION, ["gcloud", "compute", "instances", "list", "--flags-file", "x.yaml"], "--flags-file"),
-            # Reads with no file argument, and the long flags that merely start
-            # with the short one, pass.
-            (credential_proxy.CALLER_ROLE_SESSION, ["kubectl", "get", "pods", "--field-selector=status.phase=Running"], None),
-            (credential_proxy.CALLER_ROLE_SESSION, ["kubectl", "get", "pods", "-o", "wide"], None),
-            (credential_proxy.CALLER_ROLE_SESSION, ["gcloud", "projects", "list", "--format=json"], None),
-            # Other roles are untouched; the shell's clones are its own.
-            (credential_proxy.CALLER_ROLE_SHELL, ["kubectl", "get", "-f", "x.yaml"], None),
-            ("", ["kubectl", "get", "-f", "x.yaml"], None),
+            # The file routes the fence exists to close, in every spelling
+            # pflag accepts: separate value, attached, `=`, and clustered
+            # behind a boolean shorthand.
+            (S, ["kubectl", "get", "-f", "/etc/credential-proxy/policy.json"], "-f"),
+            (S, ["kubectl", "get", "-f=https://example.invalid/x.yaml"], "-f"),
+            (S, ["kubectl", "get", "-fx.yaml"], "-f"),
+            (S, ["kubectl", "get", "-Af", "/etc/credential-proxy/policy.json"], "-f"),
+            (S, ["kubectl", "get", "-ARf", "dir/"], "-R"),
+            (S, ["kubectl", "get", "--filename", "x.yaml"], "--filename"),
+            (S, ["kubectl", "get", "-k", "overlay/"], "-k"),
+            (S, ["kubectl", "get", "--kustomize=overlay/"], "--kustomize"),
+            (S, ["kubectl", "get", "--recursive", "--filename", "dir/"], "--recursive"),
+            # File-backed output formats read a file on the broker too.
+            (S, ["kubectl", "get", "ns", "-o", "go-template-file=../content-workspaces/r/values.yaml"], "--output"),
+            (S, ["kubectl", "get", "ns", "-ogo-template-file=/etc/x"], "--output"),
+            (S, ["kubectl", "get", "ns", "--output=jsonpath-file=/etc/x"], "--output"),
+            (S, ["kubectl", "get", "ns", "--output", "custom-columns-file=x"], "--output"),
+            (S, ["kubectl", "get", "ns", "-o", "templatefile=x"], "--output"),
+            # Streaming flags hold a broker slot until the deadline; not for a
+            # session. `logs -f` is refused as a flag the session may not pass,
+            # not as a file.
+            (S, ["kubectl", "get", "pods", "-w"], "-w"),
+            (S, ["kubectl", "get", "pods", "--watch"], "--watch"),
+            (S, ["kubectl", "logs", "pod/x", "-f"], "-f"),
+            (S, ["kubectl", "logs", "pod/x", "--follow"], "--follow"),
+            # Unknown or unlisted flags are refused rather than guessed at.
+            (S, ["kubectl", "get", "pods", "--raw", "/api"], "--raw"),
+            (S, ["kubectl", "get", "pods", "-v=9"], "-v"),
+            (S, ["kubectl", "get", "pods", "--server=https://x"], "--server"),
+            # The inspection surface passes, in the spellings a model emits.
+            (S, ["kubectl", "get", "pods", "-n", "kubeagents-system", "--no-headers"], None),
+            (S, ["kubectl", "get", "pods", "-A", "-o", "wide"], None),
+            (S, ["kubectl", "get", "pods", "-Ao", "json"], None),
+            (S, ["kubectl", "get", "pods", "-ojson"], None),
+            (S, ["kubectl", "get", "pods", "-o=yaml", "--show-labels"], None),
+            (S, ["kubectl", "get", "pods", "-o", "jsonpath={.items[*].metadata.name}"], None),
+            (S, ["kubectl", "get", "pods", "-o", "custom-columns=NAME:.metadata.name"], None),
+            (S, ["kubectl", "get", "pods", "-o", "go-template={{range .items}}{{.metadata.name}}{{end}}"], None),
+            (S, ["kubectl", "get", "pods", "-l", "app=x", "--field-selector=status.phase=Running", "--sort-by=.metadata.name"], None),
+            (S, ["kubectl", "describe", "pod", "x", "-n", "ns", "--context=gke_p_l_c"], None),
+            (S, ["kubectl", "logs", "pod/x", "-c", "main", "--tail=50", "--since=1h", "-p", "--timestamps"], None),
+            (S, ["kubectl", "logs", "deploy/x", "--all-containers", "--prefix"], None),
+            (S, ["kubectl", "top", "pods", "-n", "ns", "--containers"], None),
+            (S, ["kubectl", "events", "-n", "ns", "--for", "pod/x", "--types=Warning"], None),
+            (S, ["kubectl", "wait", "--for=condition=Ready", "pod/x", "--timeout=30s"], None),
+            (S, ["kubectl", "rollout", "status", "deploy/x", "-n", "ns"], None),
+            (S, ["kubectl", "auth", "can-i", "get", "pods", "-n", "ns"], None),
+            (S, ["kubectl", "api-resources", "--namespaced=true", "--verbs=list"], None),
+            (S, ["kubectl", "explain", "pods.spec.containers"], None),
+            (S, ["kubectl", "version", "--client"], None),
+            (S, ["kubectl", "get", "pods", "--kubeconfig=gke_p_l_c"], None),
+            (S, ["kubectl", "--help"], None),
+            # Other roles and other executables are untouched.
+            (credential_proxy.CALLER_ROLE_SHELL, ["kubectl", "get", "-Af", "x.yaml"], None),
+            ("", ["kubectl", "get", "-o", "go-template-file=x"], None),
+            (S, ["gcloud", "projects", "list", "--format=json"], None),
         ):
             with self.subTest(role=role, argv=argv):
-                self.assertEqual(want, credential_proxy.session_argument_refusal(role, argv))
+                self.assertEqual(want, credential_proxy.session_kubectl_flag_refusal(role, argv))
 
-    def test_a_file_argument_from_a_session_is_refused_before_it_reaches_kubectl(self):
+    def test_a_clustered_file_flag_from_a_session_is_refused_before_it_reaches_kubectl(self):
         with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
             status, body = self.post_as(
                 credential_proxy.CALLER_ROLE_SESSION,
-                {"argv": ["kubectl", "get", "-f", "/etc/credential-proxy/policy.json"]},
+                {"argv": ["kubectl", "get", "-Af", "/etc/credential-proxy/policy.json"]},
             )
         self.assertEqual(403, status)
         self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
-        self.assertEqual(credential_proxy.RULE_CALLER_FILE_ARGUMENT, body["rule"])
+        self.assertEqual(credential_proxy.RULE_CALLER_KUBECTL_FLAG, body["rule"])
         self.assertIn("-f", body["message"])
+
+    def test_a_file_backed_output_format_from_a_session_is_refused(self):
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, body = self.post_as(
+                credential_proxy.CALLER_ROLE_SESSION,
+                {"argv": ["kubectl", "get", "ns", "-o", "go-template-file=/etc/credential-proxy/policy.json"]},
+            )
+        self.assertEqual(403, status)
+        self.assertEqual(credential_proxy.RULE_CALLER_KUBECTL_FLAG, body["rule"])
+        self.assertIn("--output", body["message"])
 
     def test_the_shell_still_passes_a_file_argument_to_kubectl(self):
         status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, {"argv": ["kubectl", "get", "-f", "x.yaml"]})
