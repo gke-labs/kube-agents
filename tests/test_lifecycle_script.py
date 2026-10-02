@@ -876,14 +876,15 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 1)
         self.assertIn("has no ENABLED version.", proc.stderr)
 
-    # adopt_kms's drift-pubsub block. create_cluster is false in both so the
-    # cluster CMEK half adds no targets, and the minter and stockout flags stay
-    # off, so what adopt_kms imports is exactly what the drift flag adds.
-    # gcloud exits 0, so every describe reports its resource present.
+    # The drift trio. adopt_kms must never import it, and guard_drift_adoption
+    # refuses the apply that would. create_cluster is false throughout so the
+    # cluster CMEK half adds no adoption targets, and the minter and stockout
+    # flags stay off, so what either function does with the trio is all that is
+    # left. gcloud exits 0 for "every describe finds its resource", 1 for none.
 
-    def test_adopt_kms_imports_the_drift_pubsub_trio_when_the_flag_is_on(self):
-        """The composition's default names under the module's addresses, so a
-        re-install after a partial teardown adopts rather than 409s."""
+    def test_adopt_kms_never_imports_the_drift_pubsub_trio(self):
+        """Adoption is by name and cannot tell a leftover from the trio another
+        live install owns, so this one is refused rather than adopted."""
         proc = self._run_guard(
             "adopt_kms",
             state_list="",
@@ -892,37 +893,67 @@ resource "google_service_account" "agent" {
             gcloud_stub="exit 0",
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("adopting pre-existing resource: projects/test-project/topics/platform-agent-drift-audit", proc.stdout)
-        self.assertIn("adopting pre-existing resource: projects/test-project/subscriptions/platform-agent-drift-audit-sub", proc.stdout)
-        self.assertIn("adopting pre-existing resource: projects/test-project/sinks/platform-agent-drift-audit-sink", proc.stdout)
-        self.assertIn("resource adoption complete: 3 imported", proc.stdout)
-        self.assertEqual(proc.stderr, "")
+        self.assertNotIn("drift-audit", proc.stdout)
+        self.assertNotIn("drift_pubsub", proc.stdout)
+        self.assertIn("resource adoption complete: 0 imported", proc.stdout)
 
-    def test_adopt_kms_adopts_the_drift_pubsub_trio_under_the_names_this_state_would_create(self):
-        """A second install in the project names its own trio through the
-        drift_pubsub_* variables; adopt_kms reads those, never the module's
-        defaults, so the names it imports are the ones this state owns and
-        the first install's default-named trio is left alone."""
+    def test_guard_drift_adoption_refuses_a_trio_this_state_does_not_manage(self):
+        """A second install in the project reaches the apply with all three
+        already there; importing them takes over whichever install owns them."""
         proc = self._run_guard(
-            "adopt_kms",
+            "guard_drift_adoption",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_drift_pubsub="true",
+            gcloud_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Pub/Sub topic 'platform-agent-drift-audit' already exists", proc.stderr)
+        self.assertIn("Pub/Sub subscription 'platform-agent-drift-audit-sub' already exists", proc.stderr)
+        self.assertIn("Log Router sink 'platform-agent-drift-audit-sink' already exists", proc.stderr)
+
+    def test_guard_drift_adoption_names_both_ways_out(self):
+        """Renaming and deleting are the two remedies, and which one applies
+        depends on something the guard cannot see: whether the other install
+        is still live. So it prints both, with the commands."""
+        proc = self._run_guard(
+            "guard_drift_adoption",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_drift_pubsub="true",
+            gcloud_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn('TF_VAR_drift_pubsub_topic="<a-different-name>"', proc.stderr)
+        self.assertIn('TF_VAR_drift_pubsub_subscription="<a-different-name>"', proc.stderr)
+        self.assertIn('TF_VAR_drift_pubsub_sink="<a-different-name>"', proc.stderr)
+        self.assertIn("gcloud pubsub topics delete platform-agent-drift-audit --project test-project", proc.stderr)
+        self.assertIn("gcloud pubsub subscriptions delete platform-agent-drift-audit-sub --project test-project", proc.stderr)
+        self.assertIn("gcloud logging sinks delete platform-agent-drift-audit-sink --project test-project", proc.stderr)
+        self.assertIn("ENABLE_DRIFT_DETECTOR=false", proc.stderr)
+
+    def test_guard_drift_adoption_checks_the_names_this_state_would_create(self):
+        """A second install that already named its own trio must pass: the
+        guard reads the drift_pubsub_* variables, never the module defaults,
+        so the first install's default-named trio is not what it looks for."""
+        proc = self._run_guard(
+            "guard_drift_adoption",
             state_list="",
             tfvar_create_cluster='"false"',
             tfvar_enable_drift_pubsub="true",
             tfvar_drift_topic='"second-drift-audit"',
             tfvar_drift_sub='"second-drift-audit-sub"',
             tfvar_drift_sink='"second-drift-audit-sink"',
-            gcloud_stub="exit 0",
+            gcloud_stub='if [[ "$*" == *"second-drift-audit"* ]]; then exit 1; fi; exit 0',
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("adopting pre-existing resource: projects/test-project/topics/second-drift-audit", proc.stdout)
-        self.assertIn("adopting pre-existing resource: projects/test-project/subscriptions/second-drift-audit-sub", proc.stdout)
-        self.assertIn("adopting pre-existing resource: projects/test-project/sinks/second-drift-audit-sink", proc.stdout)
-        self.assertNotIn("platform-agent-drift-audit", proc.stdout)
-        self.assertIn("resource adoption complete: 3 imported", proc.stdout)
+        self.assertEqual(proc.stderr, "")
 
-    def test_adopt_kms_skips_the_drift_pubsub_trio_already_in_state(self):
+    def test_guard_drift_adoption_passes_on_a_trio_already_in_state(self):
+        """The steady-state apply, and the one shape that proves this install
+        owns the three."""
         proc = self._run_guard(
-            "adopt_kms",
+            "guard_drift_adoption",
             state_list="module.drift_pubsub[0].google_pubsub_topic.drift_audit\n"
                        "module.drift_pubsub[0].google_pubsub_subscription.drift_audit\n"
                        "module.drift_pubsub[0].google_logging_project_sink.drift_audit",
@@ -931,23 +962,47 @@ resource "google_service_account" "agent" {
             gcloud_stub="exit 0",
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertNotIn("adopting", proc.stdout)
-        self.assertIn("resource adoption complete: 0 imported", proc.stdout)
+        self.assertEqual(proc.stderr, "")
 
-    def test_adopt_kms_never_names_the_drift_pubsub_trio_when_the_flag_is_off(self):
-        """Off is the default; an install that never set the flag must not
-        import a topic, subscription or sink that happens to share the name."""
+    def test_guard_drift_adoption_passes_on_a_first_install(self):
+        """Nothing of the three exists, which is every install into a project
+        that has none -- the common case, and it must stay silent."""
         proc = self._run_guard(
-            "adopt_kms",
+            "guard_drift_adoption",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_drift_pubsub="true",
+            gcloud_stub="exit 1",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_drift_adoption_refuses_on_one_of_the_three(self):
+        """A teardown that reached two of them leaves one, and creating that
+        one still 409s -- so a partial match is refused like a full one."""
+        proc = self._run_guard(
+            "guard_drift_adoption",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_drift_pubsub="true",
+            gcloud_stub='if [[ "$*" == *"logging sinks"* ]]; then exit 0; fi; exit 1',
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Log Router sink 'platform-agent-drift-audit-sink' already exists", proc.stderr)
+        self.assertNotIn("Pub/Sub topic", proc.stderr)
+
+    def test_guard_drift_adoption_is_a_no_op_when_the_flag_is_off(self):
+        """An install with the detector off creates none of the three, so a
+        name collision with something else in the project is not its business."""
+        proc = self._run_guard(
+            "guard_drift_adoption",
             state_list="",
             tfvar_create_cluster='"false"',
             tfvar_enable_drift_pubsub="false",
             gcloud_stub="exit 0",
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertNotIn("drift-audit", proc.stdout)
-        self.assertNotIn("drift_pubsub", proc.stdout)
-        self.assertIn("resource adoption complete: 0 imported", proc.stdout)
+        self.assertEqual(proc.stderr, "")
 
 
 class DeleteAgentCrEndpointTest(unittest.TestCase):
@@ -1753,7 +1808,7 @@ class ImportOverrideTest(unittest.TestCase):
     _IMPORT_ERROR_DETAIL = "on ../../modules/kube-agents-scope-resolver/main.tf line 249 (stub)"
     _IMPORT_FAILURE = [*_IMPORT_PREAMBLE, "|", f"| {_IMPORT_ERROR}", "|", f"|   {_IMPORT_ERROR_DETAIL}", "|"]
 
-    def _run(self, func_call, import_rc=0, enable_drift="true", enable_chat="false", import_output=None):
+    def _run(self, func_call, import_rc=0, enable_stockout="true", enable_chat="false", import_output=None):
         """Run one adoption function against stubs that record each import.
 
         Returns the process, one line per `terraform import` with its
@@ -1773,10 +1828,14 @@ class ImportOverrideTest(unittest.TestCase):
             failure.write_text("".join(f"{line}\n" for line in (import_output or self._IMPORT_FAILURE)))
             provider_override = comp / _PROVIDER_OVERRIDE
             scope_override = (comp / _scope_resolver_source() / _SCOPE_OVERRIDE).resolve()
-            # An empty state; a console that enables the drift trio (three
+            # An empty state; a console that enables the stockout trio (three
             # adopt_kms imports) or Chat (an adopt_pubsub import) and leaves
             # every other flag at null; an import that records what it saw
-            # and exits as told.
+            # and exits as told. The stockout trio rather than the drift one
+            # because adopt_kms no longer adopts drift: the three resources
+            # take one fixed name per project and the detector is now on by
+            # default, so guard_drift_adoption refuses a second install in a
+            # project where adoption would once have silently taken them.
             (bin_dir / "terraform").write_text(
                 f"#!{bash}\n"
                 'case "$1" in\n'
@@ -1786,10 +1845,10 @@ class ImportOverrideTest(unittest.TestCase):
                 "      project_id) echo '\"test-project\"' ;;\n"
                 "      location) echo '\"us-central1\"' ;;\n"
                 "      create_cluster) echo '\"false\"' ;;\n"
-                f"      enable_drift_pubsub) echo '{enable_drift}' ;;\n"
-                "      drift_pubsub_topic) echo '\"platform-agent-drift-audit\"' ;;\n"
-                "      drift_pubsub_subscription) echo '\"platform-agent-drift-audit-sub\"' ;;\n"
-                "      drift_pubsub_sink) echo '\"platform-agent-drift-audit-sink\"' ;;\n"
+                f"      enable_stockout_investigator) echo '{enable_stockout}' ;;\n"
+                "      stockout_pubsub_topic) echo '\"gke-stockout-alerts-topic\"' ;;\n"
+                "      stockout_pubsub_subscription) echo '\"gke-stockout-alerts-sub\"' ;;\n"
+                "      stockout_pubsub_sink) echo '\"gke-stockout-alerts-sink\"' ;;\n"
                 f"      enable_google_chat) echo '{enable_chat}' ;;\n"
                 "      chat_topic_name) echo '\"platform-agent-chat-events\"' ;;\n"
                 "      chat_subscription_name) echo '\"platform-agent-chat-events-sub\"' ;;\n"
@@ -1830,7 +1889,7 @@ class ImportOverrideTest(unittest.TestCase):
         ):
             with self.subTest(func_call=func_call):
                 proc, seen, _, left = self._run(
-                    func_call, enable_drift="true", enable_chat="true",
+                    func_call, enable_stockout="true", enable_chat="true",
                 )
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual(len(seen), expected_imports, seen)
@@ -1853,14 +1912,17 @@ class ImportOverrideTest(unittest.TestCase):
         for func_call in ("adopt_kms", "adopt_pubsub"):
             with self.subTest(func_call=func_call):
                 proc, seen, _, left = self._run(
-                    func_call, import_rc=1, enable_drift="true", enable_chat="true",
+                    func_call, import_rc=1, enable_stockout="true", enable_chat="true",
                 )
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertGreater(len(seen), 0)
                 for line in seen:
                     self.assertIn("provider=yes scope=yes", line)
                 self.assertEqual(left, [])
-                self.assertIn("could not import module.", proc.stderr)
+                # The address, not a prefix of it: adopt_kms's stockout trio
+                # sits at the root and adopt_pubsub's subscription inside a
+                # module, so only "could not import " is common to both.
+                self.assertIn("could not import ", proc.stderr)
                 self.assertIn("the apply will fail with a 409", proc.stderr)
                 self.assertIn("terraform import said:", proc.stderr)
                 self.assertIn(f"     | {self._IMPORT_ERROR}\n", proc.stderr)

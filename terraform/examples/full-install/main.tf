@@ -469,9 +469,10 @@ module "chat_pubsub" {
 
 # The drift detector's audit-log ingress: Log Router sink, drift-audit topic
 # and pull subscription, and the sink-writer and detector IAM. The three names
-# are composition variables, as the stockout trio's are, because lifecycle.sh
-# adopts them by name and a second install in the project has to be able to
-# name its own; the module's defaults decide the rest (retention, backoff, and
+# are composition variables, as the stockout trio's are, because a second
+# install in the project has to be able to name its own -- lifecycle.sh's
+# guard_drift_adoption refuses an apply that would otherwise find all three
+# there and import them; the module's defaults decide the rest (retention, backoff, and
 # the cluster scope, every GKE cluster in the project). The consumer,
 # k8s-operator/cmd/drift-detector, ships in the images and starts in the
 # gateway pod when the PlatformAgent sets spec.harness.driftDetector.enabled;

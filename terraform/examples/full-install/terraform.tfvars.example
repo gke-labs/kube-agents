@@ -158,8 +158,9 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # -auto-approve, with up to 31 days of retained audit records, is an explicit
 # ENABLE_DRIFT_DETECTOR=false. A second install in the
 # same project names its own trio (drift_pubsub_topic,
-# drift_pubsub_subscription, drift_pubsub_sink): lifecycle.sh adopts them by
-# name, and would adopt the first install's.
+# drift_pubsub_subscription, drift_pubsub_sink), or lifecycle.sh refuses its
+# apply: the three names are one default per project, and importing the ones
+# already there would take over whichever install owns them.
 # enable_drift_pubsub   = true
 # enable_drift_detector = true
 

@@ -199,6 +199,16 @@ class LifecyclePlanTest(unittest.TestCase):
                 self.assertIn(guard, apply_branch)
                 self.assertLess(apply_branch.index(guard), apply_idx)
 
+    def test_apply_guards_the_drift_trio_before_terraform_runs(self):
+        """The trio is adopted by name nowhere now, so the only thing standing
+        between a project's second install and the first install's audit
+        ingress is this guard running ahead of the apply."""
+        apply_branch = re.search(r"^  apply\)$(.*?)^  destroy\)$", self.text,
+                                 re.MULTILINE | re.DOTALL).group(1)
+        self.assertIn("guard_drift_adoption", apply_branch)
+        self.assertLess(apply_branch.index("guard_drift_adoption"),
+                        apply_branch.index("terraform apply"))
+
     def test_destroy_checks_the_release_namespace_before_deleting_the_cr(self):
         """delete_agent_cr looks in the configured namespace, so a wrong one skips the CR."""
         destroy_branch = re.search(r"^  destroy\)$(.*?)^  \*\)$", self.text,

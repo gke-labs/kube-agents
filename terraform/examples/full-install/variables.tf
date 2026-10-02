@@ -668,19 +668,19 @@ variable "enable_drift_pubsub" {
 }
 
 variable "drift_pubsub_topic" {
-  description = "Pub/Sub topic the drift audit-log sink publishes to. Only used when enable_drift_pubsub is true. One fixed default per project: lifecycle.sh apply adopts a topic of this name that exists but is not in state, and cannot tell one another live install in the project owns from one an earlier install left behind, so a second install that turns the flag on names its own topic, subscription and sink."
+  description = "Pub/Sub topic the drift audit-log sink publishes to. Only used when enable_drift_pubsub is true. One fixed default per project, while Terraform state is kept per cluster, so a second install in the project meets a topic of this name that exists and is not in its state. lifecycle.sh refuses that apply (guard_drift_adoption) rather than importing it, because an import cannot tell a topic an earlier install left behind from one another live install owns, and taking over the second splits the project's audit records between the two detectors and deletes all three on this install's teardown. The second install names its own topic, subscription and sink, or deletes the leftovers; the guard prints both."
   type        = string
   default     = "platform-agent-drift-audit"
 }
 
 variable "drift_pubsub_subscription" {
-  description = "Pub/Sub pull subscription the drift detector reads from. Only used when enable_drift_pubsub is true. Adopted by name the way drift_pubsub_topic is, so a second install in the project names its own."
+  description = "Pub/Sub pull subscription the drift detector reads from. Only used when enable_drift_pubsub is true. Guarded by name the way drift_pubsub_topic is, so a second install in the project names its own. This is the one of the three whose sharing is silent while both installs are up: Pub/Sub delivers each record to ONE reader of a subscription, so two detectors on this one each see about half the project's drift and both stay Ready."
   type        = string
   default     = "platform-agent-drift-audit-sub"
 }
 
 variable "drift_pubsub_sink" {
-  description = "Log Router sink exporting mutating GKE audit-log calls to the drift topic. Only used when enable_drift_pubsub is true. Adopted by name the way drift_pubsub_topic is, so a second install in the project names its own."
+  description = "Log Router sink exporting mutating GKE audit-log calls to the drift topic. Only used when enable_drift_pubsub is true. Guarded by name the way drift_pubsub_topic is, so a second install in the project names its own."
   type        = string
   default     = "platform-agent-drift-audit-sink"
 }

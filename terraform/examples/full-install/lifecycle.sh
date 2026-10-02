@@ -43,6 +43,13 @@
 #      cluster plans the key's replacement and schedules the live key's
 #      versions for destruction under -auto-approve. `guard_kms_identity`
 #      refuses the apply first.
+#   9. The drift detector's Log Router sink, drift-audit topic and subscription
+#      take one fixed default name per project while state is kept per cluster,
+#      so a second install in a project meets all three already there. Importing
+#      them hands this state whichever install owns them, and a subscription
+#      with two readers has its records SPLIT between them, so each install
+#      reports about half the project's drift until one teardown deletes the
+#      three for both. `guard_drift_adoption` refuses the apply instead.
 #
 # Usage:
 #   ./lifecycle.sh apply    [extra terraform args...]
@@ -170,10 +177,11 @@ readonly HELM_RELEASE_ADDRESS="helm_release.kube_agents"
 readonly AGENT_GSA_ADDRESS="module.kube_agents_iam.google_service_account.agent"
 readonly CHAT_SUBSCRIPTION_ADDRESS="module.chat_pubsub[0].google_pubsub_subscription.chat_events"
 readonly STATE_LOCK_MESSAGE_PATTERN='(Acquiring|Releasing) state lock\.'
-# The drift-pubsub module's three importable resources, adopted by adopt_kms
-# the way the stockout trio is. Their names are read from the composition's
+# The drift-pubsub module's three resources. Unlike the stockout trio they are
+# NOT adopted -- guard_drift_adoption refuses an apply that would import them,
+# and says there why. Their names are read from the composition's
 # drift_pubsub_topic, drift_pubsub_subscription and drift_pubsub_sink
-# variables, which main.tf passes to the module, so the name adopted is always
+# variables, which main.tf passes to the module, so the name checked is always
 # the name this state would create.
 readonly DRIFT_TOPIC_ADDRESS="module.drift_pubsub[0].google_pubsub_topic.drift_audit"
 readonly DRIFT_SUBSCRIPTION_ADDRESS="module.drift_pubsub[0].google_pubsub_subscription.drift_audit"
@@ -197,6 +205,17 @@ readonly GUARDED_SUBSCRIPTIONS=(
   "enable_google_chat|$CHAT_SUBSCRIPTION_ADDRESS|chat_subscription_name|chat_topic_name|unacknowledged Google Chat events|CHAT_SUB_NAME|CHAT_TOPIC_NAME"
   "enable_drift_pubsub|$DRIFT_SUBSCRIPTION_ADDRESS|drift_pubsub_subscription|drift_pubsub_topic|unacknowledged GKE audit records, the out-of-band changes the drift detector exists to report||"
   "enable_stockout_investigator|$STOCKOUT_SUBSCRIPTION_ADDRESS|stockout_pubsub_subscription|stockout_pubsub_topic|unacknowledged stockout alerts||"
+)
+
+# The drift trio guard_drift_adoption checks, as
+# "<state address>|<name variable>|<gcloud group>|<what to call it>". The
+# gcloud group is the whole command noun, so `gcloud $group describe <name>`
+# and `gcloud $group delete <name>` are both it plus a verb -- the three
+# resources differ in their group and in nothing else the guard needs.
+readonly DRIFT_ADOPTION_TARGETS=(
+  "$DRIFT_TOPIC_ADDRESS|drift_pubsub_topic|pubsub topics|Pub/Sub topic"
+  "$DRIFT_SUBSCRIPTION_ADDRESS|drift_pubsub_subscription|pubsub subscriptions|Pub/Sub subscription"
+  "$DRIFT_SINK_ADDRESS|drift_pubsub_sink|logging sinks|Log Router sink"
 )
 
 #
@@ -494,23 +513,10 @@ adopt_kms() {
     )
   fi
 
-  if [[ "$(tfvar enable_drift_pubsub)" == "true" ]]; then
-    # Adoption is by name, and the names are one fixed default per project,
-    # so an install that shares a project with another one names its own trio
-    # (the README's second-install section); this block cannot tell a
-    # resource an earlier install left behind from one another live install
-    # owns. As with the stockout trio, each variable has a default, so tfvar
-    # never returns empty here.
-    local drift_topic drift_sub drift_sink
-    drift_topic=$(tfvar drift_pubsub_topic)
-    drift_sub=$(tfvar drift_pubsub_subscription)
-    drift_sink=$(tfvar drift_pubsub_sink)
-    targets+=(
-      "$DRIFT_TOPIC_ADDRESS	pubsub_topic	projects/$project/topics/$drift_topic"
-      "$DRIFT_SUBSCRIPTION_ADDRESS	pubsub_sub	projects/$project/subscriptions/$drift_sub"
-      "$DRIFT_SINK_ADDRESS	logging_sink	projects/$project/sinks/$drift_sink"
-    )
-  fi
+  # The drift trio is deliberately absent. It has the same one-name-per-project
+  # shape as the stockout trio and was adopted the same way until the detector
+  # became an install default, which made every second install in a project
+  # reach this block; guard_drift_adoption refuses those instead, and says why.
 
   # Skipping both halves — cluster KMS (create_cluster or database encryption
   # off) and the minter — leaves targets empty, and macOS's bash 3.2 treats an
@@ -846,6 +852,84 @@ guard_pubsub_subscription() {
       exit 1
     fi
   done
+}
+
+# Refuse an apply that would import a drift trio this install does not own.
+#
+# The Log Router sink, drift-audit topic and pull subscription take one fixed
+# default name per project while state is kept per cluster, so a second
+# install in a project -- or a re-install after a teardown that never reached
+# them -- arrives here with all three existing in GCP and none of them in its
+# state. adopt_kms imported them until ENABLE_DRIFT_DETECTOR became an install
+# default; now that every front-door install provisions the trio, that import
+# is the ordinary path for a project's second install rather than something
+# someone opted into.
+#
+# Refused rather than adopted, for the reason check_service_account_ownership
+# gives in scripts/installer/installer_common.sh. An import cannot tell a trio
+# an earlier install left behind from one another live install owns, and
+# adopting the second puts it into THIS install's state, where this install's
+# teardown deletes it with no message on that side. The subscription is worse
+# than the GSA while both are still up: Pub/Sub delivers each record to ONE
+# reader of a subscription, so two detectors on one subscription SPLIT the
+# project's audit records and each install reports roughly half its drift,
+# staying Ready throughout. A 409 is loud; both of those are silent.
+#
+# A describe that fails for any reason other than absence -- no permission to
+# read Pub/Sub or Logging, say -- counts as absent here and lets the apply
+# report it, which is no worse than the 409 this replaced.
+guard_drift_adoption() {
+  # Assigned rather than compared inline, for the reason
+  # guard_pubsub_subscription gives: tfvar's `exit 1` kills only the
+  # substitution's subshell, so a console that cannot answer would otherwise
+  # read as "not enabled" and skip the guard.
+  local enabled
+  enabled=$(tfvar enable_drift_pubsub)
+  [[ "$enabled" == "true" ]] || return 0
+
+  load_state
+  local project
+  project=$(tfvar project_id)
+
+  local entry addr variable group noun name
+  local -a foreign=()
+  for entry in "${DRIFT_ADOPTION_TARGETS[@]}"; do
+    IFS='|' read -r addr variable group noun <<<"$entry"
+    if in_state "$addr"; then
+      continue
+    fi
+    # Every one of the three variables declares a non-empty default in
+    # variables.tf, so this is the name the apply would create.
+    name=$(tfvar "$variable")
+    # Unquoted on purpose: $group is two words of the gcloud command.
+    # shellcheck disable=SC2086
+    if gcloud $group describe "$name" --project "$project" >/dev/null 2>&1; then
+      foreign+=("$group|$noun|$name")
+    fi
+  done
+  if [[ "${#foreign[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  local line
+  for line in ${foreign[@]+"${foreign[@]}"}; do
+    IFS='|' read -r group noun name <<<"$line"
+    warn "$noun '$name' already exists in project '$project' and is not managed by this install's Terraform state."
+  done
+  warn "Applying would stop on a 409 creating them. Importing them instead is not the way out: an import cannot tell a trio an earlier install left behind from one another live install owns."
+  warn "Taking over another install's trio splits the project's audit records between the two detectors and deletes all three on this install's teardown, neither of which is reported on that side."
+  warn "If another kube-agents install in this project owns them, give this install its own three names. Through the front doors they are passthrough lines in install.env, which every front door sources with 'set -a':"
+  warn "  TF_VAR_drift_pubsub_topic=\"<a-different-name>\""
+  warn "  TF_VAR_drift_pubsub_subscription=\"<a-different-name>\""
+  warn "  TF_VAR_drift_pubsub_sink=\"<a-different-name>\""
+  warn "A hand-driven apply sets the three in terraform.tfvars instead."
+  warn "If they are left over from an install removed without uninstall.sh, delete them first:"
+  for line in ${foreign[@]+"${foreign[@]}"}; do
+    IFS='|' read -r group noun name <<<"$line"
+    warn "  gcloud $group delete $name --project $project"
+  done
+  warn "Or leave the detector off for this install: ENABLE_DRIFT_DETECTOR=false in install.env."
+  exit 1
 }
 
 # `name` is ForceNew on google_kms_key_ring and google_kms_crypto_key, neither
@@ -1243,6 +1327,7 @@ case "${1:-}" in
     guard_kms_identity
     guard_release_namespace
     guard_pubsub_subscription
+    guard_drift_adoption
     forget_unmanaged_cluster_kms
     guard_minter_key
     log "checking pre-existing GCP resources to adopt (KMS, Pub/Sub)..."
@@ -1309,7 +1394,7 @@ case "${1:-}" in
     # The line range is the header comment above, so it moves whenever that
     # comment grows. It ends at the blank comment line before `set -euo
     # pipefail`.
-    sed -n '2,68p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,75p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac
