@@ -88,6 +88,40 @@ describe("App", () => {
     expect(box.value).toBe("");
   });
 
+  it("links a conversation /new changed while the bus was still connecting", async () => {
+    setLocation("?pass=secret");
+    const handle = {
+      probeReadOnly: vi.fn(),
+      send: vi.fn(),
+      setConversation: vi.fn(),
+      close: vi.fn().mockResolvedValue(undefined),
+    };
+    let finish: () => void = () => {};
+    startBusMock.mockImplementationOnce(
+      (_config: unknown, dispatch: (e: BusEvent) => void) =>
+        new Promise((resolve) => {
+          finish = () => {
+            captured = { dispatch };
+            resolve(handle);
+          };
+        }),
+    );
+    render(<App />);
+    await waitFor(() => expect(startBusMock).toHaveBeenCalled());
+    const [, , opts] = startBusMock.mock.calls[0]!;
+    const first = (opts as { conversation: string }).conversation;
+
+    const box = (await screen.findByRole("textbox")) as HTMLTextAreaElement;
+    await userEvent.type(box, "/new{Enter}");
+    expect(handle.setConversation).not.toHaveBeenCalled();
+    await act(async () => finish());
+
+    await waitFor(() => expect(handle.setConversation).toHaveBeenCalledTimes(1));
+    const linked = handle.setConversation.mock.calls[0]![0] as string;
+    expect(linked).not.toBe(first);
+    expect(screen.getByText(new RegExp(`new conversation ${linked}`))).toBeTruthy();
+  });
+
   it("carries ?user=web through the connect form to the credential it submits", async () => {
     setLocation("?user=web");
     render(<App />);

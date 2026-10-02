@@ -204,6 +204,17 @@ describe("liveness", () => {
     expect(stale.text).toMatch(/^last checked/);
   });
 
+  it("ages an error report out like any other, so a timeout before a drop does not freeze", () => {
+    const stale = livenessOf(
+      report({ error: "timeout", checkedAt: NOW - LIVENESS_STALE_MS - 1 }),
+      NOW,
+      false,
+      "active",
+    );
+    expect(stale.kind).toBe("stale");
+    expect(stale.text).toMatch(/^last checked/);
+  });
+
   it("still reads live just under the staleness threshold", () => {
     const fresh = livenessOf(report({ waiting: 1, checkedAt: NOW - LIVENESS_STALE_MS + 1 }), NOW, false, "active");
     expect(fresh.kind).toBe("live");

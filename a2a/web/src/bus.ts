@@ -532,6 +532,7 @@ export async function startBus(
             type: "sendFailed",
             messageId,
             error: "the link dropped before the server confirmed this turn, so it may or may not have arrived - check the transcript before sending it again",
+            unconfirmed: true,
           });
         }
       });

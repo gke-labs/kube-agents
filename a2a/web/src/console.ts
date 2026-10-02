@@ -24,6 +24,8 @@ const MESSAGE_ID_PREFIX = "m-";
 const GO_SPACE = "[\\t\\n\\v\\f\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]";
 const GO_TRIM_RE = new RegExp(`^${GO_SPACE}+|${GO_SPACE}+$`, "g");
 const GO_SPACE_RE = new RegExp(GO_SPACE);
+/** A run of Go whitespace, for splitting words the way the trim bounds them. */
+export const GO_SPACE_RUN_RE = new RegExp(`${GO_SPACE}+`);
 /** a2a/gateway/text.go stopWords. */
 const STOP_WORDS = new Set(["stop", "cancel", "abort"]);
 /** a2a/gateway/text.go isDelegate's word, separators and left-trim cutset. */

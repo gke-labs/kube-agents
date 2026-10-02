@@ -129,6 +129,11 @@ export default function App() {
           return;
         }
         busHandleRef.current = handle;
+        // A /new typed while startBus was dialing changed the conversation
+        // after opts captured it.
+        if (opts.conversation !== undefined && conversationRef.current !== opts.conversation) {
+          handle.setConversation(conversationRef.current);
+        }
         saveConfig(config);
       } catch (error) {
         console.error("Failed to connect to bus:", error);

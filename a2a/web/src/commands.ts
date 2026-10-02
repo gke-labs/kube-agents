@@ -6,7 +6,7 @@
  * cap match the gateway's (a2a/gateway/console.go), so the page never shows
  * a turn as sent that the gateway would drop.
  */
-import { CONSOLE_TEXT_CAP, goTrim, textBytes } from "./console.ts";
+import { CONSOLE_TEXT_CAP, GO_SPACE_RUN_RE, goTrim, textBytes } from "./console.ts";
 import { STREAMS } from "./protocol.ts";
 import { capacities, failuresOf, recentTasks, taskTimes } from "./derive.ts";
 import type { UiState } from "./model.ts";
@@ -15,7 +15,6 @@ export { goTrim };
 
 const COMMAND_PREFIX = "/";
 const TASKS_SHOWN = 10;
-const COMMAND_SPLIT_RE = /\s+/;
 
 export type Command =
   | { name: "new" }
@@ -44,7 +43,7 @@ export const HELP_TEXT = [
 
 /** The parsed command, or null when the line's first word is not one of the page's own. */
 function parseCommand(line: string): Command | null {
-  const [word, ...rest] = line.slice(COMMAND_PREFIX.length).split(COMMAND_SPLIT_RE);
+  const [word, ...rest] = line.slice(COMMAND_PREFIX.length).split(GO_SPACE_RUN_RE);
   // Case-insensitive, so a typo like /Clear stays local instead of going out as a turn.
   const head = word.toLowerCase();
   switch (head) {
