@@ -31,7 +31,12 @@ answer belongs to, but :func:`wake_text` adds a note that the question is
 already posted, so it says nothing now and only takes the answer, typed or
 clicked (``gateway/slack_ux_clicks.py``), to the card with ``kanban_comment``
 and ``kanban_unblock``. A click's turn names the card, which
-:func:`question_card` looks up. Other block kinds keep the line.
+:func:`question_card` looks up. A typed answer can open a session the wake
+never reached, which knows the thread only by reading it back, so the
+question's ``text`` names the card too, above its buttons' "Reply with one
+of:" line: the adapter reads a thread back through ``text``, and Slack does
+not render ``text`` beside the blocks; it is the fallback for notifications
+and anywhere blocks cannot render. Other block kinds keep the line.
 
 When the card moves on, any event of it, :func:`settle_question` takes the
 buttons and "waiting on you" off the question, so a typed answer does not
@@ -84,6 +89,9 @@ WAKE_NOTE = (
     "in this notification needs saying, reply with exactly [SILENT]. When the user answers, "
     "typed or clicked, carry the answer to the card with kanban_comment, then kanban_unblock."
 )
+
+#: Added to a question's ``text``, so a session the wake never reached reads its card in the thread.
+QUESTION_CARD_NOTE = "(Question from card {card}.)"
 
 #: Bound on each in-process map, oldest evicted first.
 ANNOUNCED_MAX = 512
@@ -191,12 +199,25 @@ async def needs_you(adapter: Any, sub: dict, payload: Any, event_id: int = 0) ->
         # Still open: its settle failed or never ran. The new question takes the slot, so keep this one for a retry.
         _remember(_unsettled, (key, earlier[2]), earlier)
     blocks, text = moment
+    text = _with_card(text, key[0], any(b.get("type") == "actions" for b in blocks))
     ts = await _post(adapter, sub, blocks, text)
     if ts is None:
         return False
     entry = (int(event_id or 0), str(sub.get("chat_id") or ""), ts, blocks, text)
     _remember(_questions, key, entry)
     return True
+
+
+def _with_card(text: str, card: str, buttons: bool) -> str:
+    """``text`` naming ``card`` on the line above its buttons' "Reply with one of:" line,
+    or last without buttons: a click's rewrite drops that line only while it is the last."""
+    if not card:
+        return text
+    note = QUESTION_CARD_NOTE.format(card=card)
+    body, _nl, last = text.rpartition("\n")
+    if buttons and body and last.startswith(_presenter.CHOICES_LEAD):
+        return f"{body}\n{note}\n{last}"
+    return f"{text}\n{note}"
 
 
 def asked(sub: dict, event_id: int) -> bool:

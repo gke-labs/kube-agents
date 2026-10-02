@@ -174,6 +174,26 @@ class NeedsYouTest(unittest.TestCase):
         self.assertEqual(labels, ["seeded-a", "seeded-b"])
         self.assertEqual(adapter.posts[0]["thread_ts"], SUB["thread_id"])
 
+    def test_the_question_text_names_its_card_above_the_choices(self):
+        # A typed answer can open a session the wake never reached; it reads the card here.
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, SUB, QUESTION))
+        lines = adapter.posts[0]["text"].split("\n")
+        self.assertEqual(lines[-2], "(Question from card t_e0c1.)")
+        self.assertTrue(lines[-1].startswith("Reply with one of: "), lines)
+        self.assertNotIn("t_e0c1", str(adapter.posts[0]["blocks"]))
+
+    def test_a_question_with_no_thread_names_its_card_last(self):
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, {**SUB, "thread_id": ""}, QUESTION))
+        self.assertTrue(adapter.posts[0]["text"].endswith("- seeded-b\n(Question from card t_e0c1.)"))
+
+    def test_a_detail_line_reading_like_the_choices_line_keeps_the_card_last(self):
+        adapter = _Adapter()
+        payload = {"kind": "needs_input", "reason": "Blocked.\nDetails.\n\nReply with one of: yes or no"}
+        _run(runtime.needs_you(adapter, {**SUB, "thread_id": ""}, payload))
+        self.assertTrue(adapter.posts[0]["text"].endswith("yes or no\n(Question from card t_e0c1.)"))
+
     def test_other_kinds_and_empty_reasons_post_nothing(self):
         adapter = _Adapter()
         for payload in ({**QUESTION, "kind": "capability"}, {"kind": "needs_input", "reason": ""}, None, "x"):

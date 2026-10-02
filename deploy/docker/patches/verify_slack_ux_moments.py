@@ -134,6 +134,8 @@ async def _drive(module) -> None:
     labels = [b["text"]["text"] for b in _buttons(adapter.posts[0]["blocks"])]
     if labels != CHOICES:
         raise _fail(f"the question's buttons were {labels!r}")
+    if f"\n{module.QUESTION_CARD_NOTE.format(card=sub['task_id'])}\n" not in adapter.posts[0]["text"]:
+        raise _fail("the question's text does not name its card")
     noted = module.wake_text(sub, [_Event(BLOCKED_ID, BLOCKED)], {BLOCKED}, WAKE)
     if noted != f"{WAKE}\n\n{module.WAKE_NOTE}":
         raise _fail("the wake for the posted question does not carry the note")
@@ -155,7 +157,7 @@ def main(root: Path = Path("/opt/hermes")) -> None:
     asyncio.run(_drive(_load_runtime(root)))
     print(
         "slack_ux_moments verify: reached from kanban_progress_lines and the wake; "
-        "posts an opened PR once and a needs_input question with its choices, "
+        "posts an opened PR once and a needs_input question with its choices and card, "
         "notes the question in its wake and settles it"
     )
 

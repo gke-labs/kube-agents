@@ -1355,6 +1355,15 @@ class RuntimeTest(unittest.TestCase):
         update = next(entry[1] for entry in adapter.log if entry[0] == "chat_update")
         self.assertEqual(update["text"], f"✓ <@U1>: seeded-b\n\n{question}")
 
+    def test_a_card_questions_rewrite_keeps_the_line_naming_its_card(self):
+        body, action = _choice(1, "seeded-b", prefix="kage_needs")
+        question = "*Which cluster?*\nI found it in two.\n\nWhich one?\n(Question from card t_e0c1.)"
+        body["message"]["text"] = f"{question}\n{presenter.CHOICES_LEAD}seeded-a · seeded-b"
+        adapter = _Adapter()
+        self._answer(adapter, body, action)
+        update = next(entry[1] for entry in adapter.log if entry[0] == "chat_update")
+        self.assertEqual(update["text"], f"✓ <@U1>: seeded-b\n\n{question}")
+
     def test_typed_apply_keeps_the_report_too(self):
         adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": "apply Option B", "ts": "223.000"}])
         body, action = _alert_choice(1, "Apply Option A")
