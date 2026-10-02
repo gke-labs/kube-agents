@@ -148,12 +148,29 @@ describe("Chat", () => {
     expect(onCommand).not.toHaveBeenCalled();
   });
 
-  it("routes a slash line to onCommand and never to onSend", async () => {
+  it("routes a local command word to onCommand and never to onSend", async () => {
     const { onSend, onCommand, box } = consoleChat();
     await userEvent.type(box, "/replay gateway{Enter}");
     expect(onCommand).toHaveBeenCalledWith({ name: "replay", session: "gateway" });
     expect(onSend).not.toHaveBeenCalled();
     expect(box.value).toBe("");
+  });
+
+  it("sends /session and any other slash line to the gateway", async () => {
+    const { onSend, onCommand, box } = consoleChat();
+    await userEvent.type(box, "/session{Enter}");
+    await userEvent.type(box, "/var/log/messages is full on node-3{Enter}");
+    expect(onSend.mock.calls).toEqual([["/session"], ["/var/log/messages is full on node-3"]]);
+    expect(onCommand).not.toHaveBeenCalled();
+    expect(box.value).toBe("");
+  });
+
+  it("keeps the draft when a local command is refused", async () => {
+    const { onSend, onCommand, box } = consoleChat();
+    await userEvent.type(box, "/replay{Enter}");
+    expect(onCommand).toHaveBeenCalledWith({ name: "error", text: "usage: /replay <session>" });
+    expect(onSend).not.toHaveBeenCalled();
+    expect(box.value).toBe("/replay");
   });
 
   it("refuses a turn over the cap locally and keeps the text", () => {

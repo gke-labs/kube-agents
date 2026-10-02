@@ -8,8 +8,9 @@
  * refusal. As `console` the same button proves the credential can't write
  * anywhere on `a2a.>`.
  *
- * Lines are classified before anything touches the bus (commands.ts). A
- * slash line is never published.
+ * Lines are classified before anything touches the bus (commands.ts). The
+ * page's own command words are never published; any other line, `/session`
+ * included, is sent to the gateway.
  */
 import { useState, type KeyboardEvent } from "react";
 import type { ChatEntry, ProbeResult } from "./model.ts";
@@ -76,7 +77,8 @@ export default function Chat({
         return;
       case "command":
         onCommand?.(c.command);
-        setDraft("");
+        // A refused command keeps its text so it can be fixed.
+        if (c.command.name !== "error") setDraft("");
         return;
       case "send":
         // Only clear the box once the turn was actually accepted - refused

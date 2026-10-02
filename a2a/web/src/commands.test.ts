@@ -44,11 +44,23 @@ describe("classifyInput", () => {
     });
   });
 
-  it("refuses an unknown command locally and says nothing was sent", () => {
-    expect(classifyInput("/deploy prod")).toEqual({
-      kind: "command",
-      command: { name: "error", text: "unknown command /deploy. Nothing was sent. /help lists the commands." },
+  it("sends a slash line whose first word is not a local command, as the gateway reads it", () => {
+    expect(classifyInput("/deploy prod")).toEqual({ kind: "send", text: "/deploy prod" });
+    expect(classifyInput("/var/log/messages is full on node-3")).toEqual({
+      kind: "send",
+      text: "/var/log/messages is full on node-3",
     });
+    expect(classifyInput("/News")).toEqual({ kind: "send", text: "/News" });
+  });
+
+  it("sends /session and its forms to the gateway, which resolves them itself", () => {
+    for (const t of ["/session", "/session off", "/session check the nodes"]) {
+      expect(classifyInput(t)).toEqual({ kind: "send", text: t });
+    }
+  });
+
+  it("caps a sent slash line like any other turn", () => {
+    expect(classifyInput(`/x ${"€".repeat(6000)}`).kind).toBe("tooBig");
   });
 
   it("refuses by UTF-8 bytes, not characters", () => {
@@ -65,6 +77,7 @@ describe("classifyInput", () => {
     for (const c of ["/new", "/replay", "/tasks", "/streams", "/clear", "/help"]) {
       expect(HELP_TEXT).toContain(c);
     }
+    expect(HELP_TEXT).toContain("/session");
   });
 });
 

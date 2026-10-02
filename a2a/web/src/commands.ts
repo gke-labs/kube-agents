@@ -1,6 +1,8 @@
 /**
  * What the input box does with a line before anything touches the bus.
- * Commands are handled locally and never published. The trim and the byte
+ * The page's own command words are handled locally and never published. Any
+ * other line, slash or not, is a turn for the gateway: it resolves `/session`
+ * itself and reads every other slash word as plain text. The trim and the byte
  * cap match the gateway's (a2a/gateway/console.go), so the page never shows
  * a turn as sent that the gateway would drop.
  */
@@ -13,6 +15,7 @@ export { goTrim };
 
 const COMMAND_PREFIX = "/";
 const TASKS_SHOWN = 10;
+const COMMAND_SPLIT_RE = /\s+/;
 
 export type Command =
   | { name: "new" }
@@ -36,11 +39,12 @@ export const HELP_TEXT = [
   "/streams - stream capacity and attach state",
   "/clear - clear this transcript (the bus is untouched)",
   "/help - this list",
-  "Anything else goes to the agent.",
+  "Anything else goes to the gateway as a turn, including other slash lines such as /session.",
 ].join("\n");
 
-function parseCommand(line: string): Command {
-  const [head, ...rest] = line.slice(COMMAND_PREFIX.length).split(/\s+/);
+/** The parsed command, or null when the line's first word is not one of the page's own. */
+function parseCommand(line: string): Command | null {
+  const [head, ...rest] = line.slice(COMMAND_PREFIX.length).split(COMMAND_SPLIT_RE);
   switch (head) {
     case "new":
     case "tasks":
@@ -51,17 +55,15 @@ function parseCommand(line: string): Command {
     case "replay":
       return rest[0] ? { name: "replay", session: rest[0] } : { name: "error", text: "usage: /replay <session>" };
     default:
-      return {
-        name: "error",
-        text: `unknown command /${head}. Nothing was sent. /help lists the commands.`,
-      };
+      return null;
   }
 }
 
 export function classifyInput(raw: string): Classified {
   const text = goTrim(raw);
   if (text === "") return { kind: "empty" };
-  if (text.startsWith(COMMAND_PREFIX)) return { kind: "command", command: parseCommand(text) };
+  const command = text.startsWith(COMMAND_PREFIX) ? parseCommand(text) : null;
+  if (command !== null) return { kind: "command", command };
   const bytes = textBytes(text);
   if (bytes > CONSOLE_TEXT_CAP) return { kind: "tooBig", bytes };
   return { kind: "send", text };
