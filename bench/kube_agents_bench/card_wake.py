@@ -812,13 +812,17 @@ def merge(
     )
 
 
-def tag(planted: Planted, wake: AgentResult, settled: Settled | None = None) -> AgentResult:
-    """The failure replay's one turn, with the card, its wake and ``settled`` kept in metadata.
+def tag(
+    planted: Planted, wake: AgentResult, settled: Settled | None = None, key: str = "failure_wake"
+) -> AgentResult:
+    """A replay's one turn, with the card, its wake and ``settled`` kept in metadata under ``key``.
 
-    The reply to the wake is already the run's ``final_message``; the
-    trajectory gains :data:`SETTLED_ENTRY` and nothing else changes.
+    The failure replay's turn, or a question replay's whose wake errored
+    (``key="question_wake"``). The reply to the wake is already the run's
+    ``final_message``; the trajectory gains :data:`SETTLED_ENTRY` and nothing
+    else changes.
     """
-    metadata = {**wake.metadata, "failure_wake": _card_metadata(planted, settled)}
+    metadata = {**wake.metadata, key: _card_metadata(planted, settled)}
     return AgentResult(
         output=wake.output,
         trajectory=[*wake.trajectory, _settled_entry(planted, settled)],

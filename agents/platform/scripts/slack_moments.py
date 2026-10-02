@@ -329,7 +329,10 @@ def _first_text_line(lines: Sequence[str], fences: bool) -> int | None:
     fence = None
     for index, line in enumerate(lines):
         opened = _presenter.next_fence(line, fence) if fences else None
-        if opened is None and not _presenter.FENCE.match(line) and any(
+        # A line inside a fence, an opener or a closer is no headline; a line
+        # that opens with a code span ("```x``` is down. Which?") is text.
+        stray = not fences and _presenter._opens_fence(line)
+        if fence is None and opened is None and not stray and any(
             ch.isalnum() for ch in _presenter._plain(line)
         ):
             return index

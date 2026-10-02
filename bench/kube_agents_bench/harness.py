@@ -1661,7 +1661,7 @@ class KubeAgentsHarness(AgentHarness):
             elif not settled.archived:
                 _log.warning("card wake: card %s was not archived", planted.card)
         if answer_turn is None:
-            return card_wake.tag(planted, wake_turn, settled)
+            return card_wake.tag(planted, wake_turn, settled, "failure_wake" if failure else "question_wake")
         return card_wake.merge(planted, wake_turn, answer_turn, settled)
 
     def _execute_fresh_answer(

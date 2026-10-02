@@ -3258,6 +3258,7 @@ def test_a_question_wake_archives_its_card_when_the_wake_turn_errors(
     assert len(stub_agent.requests) == 1
     assert _archived(scripts)
     assert [s["name"] for s in result.trajectory][-1] == card_wake.SETTLED_ENTRY
+    assert "question_wake" in result.metadata and "failure_wake" not in result.metadata
 
 
 def test_a_question_wake_missing_its_answer_errors_without_planting(

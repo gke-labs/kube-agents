@@ -331,6 +331,12 @@ class NeedsYouTest(unittest.TestCase):
         self.assertEqual(blocks[0]["text"]["text"], "*Which namespace?*")
         self.assertEqual([b["value"] for b in _buttons(blocks)], ["default", "prod"])
 
+    def test_a_question_opening_with_a_code_span_heads_itself(self):
+        blocks, text = m.needs_you("```checkout-gateway``` is in two clusters. Which?\n- seeded-a\n- seeded-b")
+        self.assertIn("is in two clusters. Which?", blocks[0]["text"]["text"])
+        self.assertEqual([b["value"] for b in _buttons(blocks)], ["seeded-a", "seeded-b"])
+        self.assertIn("two clusters", text)
+
     def test_an_italic_question_keeps_its_buttons_and_loses_its_underscores(self):
         blocks, text = m.needs_you("_Which cluster should I drain?_\n- seeded-a\n- seeded-b")
         self.assertEqual(blocks[0]["text"]["text"], "*Which cluster should I drain?*")
