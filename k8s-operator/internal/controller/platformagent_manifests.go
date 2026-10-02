@@ -1265,8 +1265,8 @@ func frontDoorOverlay(agent *agentv1alpha1.PlatformAgent) map[string]any {
 }
 
 // memoryProviderIsHindsightBacked reports whether a provider talks to the in-cluster
-// Hindsight service. Keep in sync with memory_provider_uses_hindsight in
-// scripts/installer/common.sh, which decides whether to deploy it.
+// Hindsight service. Keep in sync with kube-agents.hindsightEnabled in
+// charts/kube-agents/templates/_helpers.tpl, which decides whether to deploy it.
 func memoryProviderIsHindsightBacked(provider string) bool {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case kubeAgentsMemoryProvider, "hindsight":
@@ -5194,7 +5194,27 @@ func getConfigMapHash(configMap *corev1.ConfigMap) (string, error) {
 	return fmt.Sprintf("%x", hash), nil
 }
 
-// buildFluentBitConfigMap generates the ConfigMap manifest containing fluent-bit.conf
+// buildFluentBitConfigMap generates the ConfigMap manifest containing fluent-bit.conf.
+//
+// Three parser passes run over every line the sidecar tails. gchat_event lifts
+// the chat user and session out of the gateway's own lines. The other two are
+// the audit trail's: hermes_audit_line recognises a line the tool_call_audit
+// plugin or the chat_message_audit hook wrote — Hermes' timestamp, level and
+// logger name, then one JSON object — and captures the object as audit_json;
+// audit_json then decodes it into top-level fields and drops the capture. A
+// line neither parser matches passes through untouched, and the raw line stays
+// under `log` either way, so Cloud Logging carries the record's fields as its
+// own jsonPayload keys (event_type, tool, status, ...) beside the text every
+// existing reader still greps. The lift is what makes an audit record
+// filterable without a regex; the record's shape is common/audit_schema.py's.
+//
+// The line prefix the regex reads is Hermes' own log format, which this
+// repository does not own: `%(asctime)s %(levelname)s%(session_tag)s %(name)s:
+// %(message)s` in the pinned image's hermes_logging.py, where session_tag is
+// ` [<session id>]` on a record emitted on a thread that holds a session
+// context and empty otherwise. Both forms have to match, or the records of
+// tools Hermes runs inline on the turn thread would pass through unlifted and
+// silently. TestFluentBitLiftsAuditRecordsIntoFields carries a sample of each.
 func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{
@@ -5233,6 +5253,22 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
     Preserve_Key  On
 
 [FILTER]
+    Name          parser
+    Match         agent.logs
+    Key_Name      log
+    Parser        hermes_audit_line
+    Reserve_Data  On
+    Preserve_Key  On
+
+[FILTER]
+    Name          parser
+    Match         agent.logs
+    Key_Name      audit_json
+    Parser        audit_json
+    Reserve_Data  On
+    Preserve_Key  Off
+
+[FILTER]
     Name              record_modifier
     Match             agent.logs
     Record            app agent
@@ -5247,6 +5283,15 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
     Name    gchat_event
     Format  regex
     Regex   User=(?<gchat_user>[^,\s]+),\s*Session=(?<gchat_session>[^,\s]+)
+
+[PARSER]
+    Name    hermes_audit_line
+    Format  regex
+    Regex   ^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} [A-Z]+(?: \[[^\]]*\])? hermes\.(?:plugin\.tool_call_audit|hook\.chat_message_audit): (?<audit_json>\{.*\})$
+
+[PARSER]
+    Name    audit_json
+    Format  json
 `,
 		},
 	}

@@ -1,12 +1,12 @@
 """scripts/eval_dashboard/periodics.py: the watched Prow periodics' latest
 finished builds, read from the bucket they log to, and the notes health.py carries.
 
-* `fetch` reads the pointer, walks back to a finished build, keeps the
-  artifact for a failed build, writes one <job>.json per job with a
+* `fetch` reads the pointer, walks back to a finished build, keeps the job's
+  report when the build wrote one, writes one <job>.json per job with a
   build, and nothing for a job that never ran or whose pointer is denied;
-* `assess` notes a failed build and a job whose last finished build is older
-  than its stale window, keeps `since` across ticks, and names the reconcile
-  artifact's refused and failed projects;
+* `assess` notes a failed build (the sweep's once two consecutive checks have
+  failed) and a job whose last finished build is older than its stale window,
+  keeps `since` across ticks, and names the report's failed projects;
 * the workflow fetches the readings before it adjudicates and hands the
   directory to health.py.
 """
@@ -72,7 +72,7 @@ def archive(job, builds):
         if finished is not None:
             objects[f"{root}/{build}/{periodics.FINISHED}"] = json.dumps(finished)
         if artifact is not None:
-            objects[f"{root}/{build}/{periodics.ARTIFACTS_DIR}/{periodics.RECONCILE_ARTIFACT}"] = json.dumps(artifact)
+            objects[f"{root}/{build}/{periodics.ARTIFACTS_DIR}/{periodics.WATCHED_BY_JOB[job].artifact}"] = json.dumps(artifact)
     return objects
 
 
@@ -108,7 +108,7 @@ class FetchTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             readings = periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=gsutil)
         self.assertEqual(readings[SWEEP.job]["build"], "8")
-        self.assertEqual([c[2] for c in gsutil.calls], ["cat", "cat"], "pointer and finished.json only, no ls")
+        self.assertEqual([c[2] for c in gsutil.calls], ["cat", "cat", "cat"], "pointer, finished.json and the report; no ls")
 
     def test_an_aborted_newest_build_is_walked_past_not_reported_as_failed(self):
         # Prow's sidecar writes finished.json with result ABORTED when it
@@ -208,6 +208,19 @@ class FetchTest(unittest.TestCase):
             readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=FakeGsutil(objects))
         self.assertEqual(readings[WEEKLY.job]["build"], "0099")
 
+    def test_a_passed_builds_unreadable_report_keeps_the_reading(self):
+        # The report of a passed build is only the recovery's summary: a read
+        # that fails for a reason other than NotFound warns and the reading
+        # stands without it, where a failed build's would blind the tick.
+        root = f"{periodics.LOGS_ROOT}/{WEEKLY.job}"
+        objects = archive(WEEKLY.job, {"100": (finished(NOW - timedelta(hours=1), passed=True), {"summary": {"applied": 1}})})
+        denied = FakeGsutil(objects, denied={f"{root}/100/{periodics.ARTIFACTS_DIR}/{periodics.RECONCILE_ARTIFACT}"})
+        warnings = []
+        with tempfile.TemporaryDirectory() as tmp:
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=denied, log=lambda *a, **k: warnings.append(a[0]))
+        self.assertEqual((readings[WEEKLY.job]["build"], readings[WEEKLY.job]["artifact"]), ("100", None))
+        self.assertEqual(len(warnings), 1)
+
     def test_a_missing_bucket_is_warned_not_read_as_never_ran(self):
         class NoBucket:
             def __call__(self, cmd, **kwargs):
@@ -291,12 +304,11 @@ class AssessTest(unittest.TestCase):
             readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=FakeGsutil(objects), log=lambda *a, **k: warnings.append(a[0]))
         self.assertIn("not a JSON object", warnings[0])
         self.assertEqual(periodics.reconcile_detail(readings[WEEKLY.job]["artifact"]), [f"run: {periodics.REPORT_UNREADABLE}"])
-        # A passed build's artifact is not read: nothing would name its projects.
+        # A passed build's report is read too: the recovery message says what the run did.
         passed = FakeGsutil(archive(WEEKLY.job, {"100": (finished(NOW - timedelta(hours=1), passed=True), report)}))
         with tempfile.TemporaryDirectory() as tmp:
             readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=passed)
-        self.assertIsNone(readings[WEEKLY.job]["artifact"])
-        self.assertFalse([c for c in passed.calls if c[3].endswith(periodics.RECONCILE_ARTIFACT)])
+        self.assertEqual(readings[WEEKLY.job]["artifact"], report)
         # A run that wrote no artifact is a reading without one.
         absent = archive(WEEKLY.job, {"100": (finished(NOW - timedelta(hours=1), passed=False), None)})
         with tempfile.TemporaryDirectory() as tmp:
@@ -325,6 +337,67 @@ class AssessTest(unittest.TestCase):
             self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=FakeGsutil(objects), log=lambda *a, **k: warnings.append(a[0])), {})
         self.assertIn("not a build id", warnings[0])
 
+    def test_streaks_count_consecutive_failed_checks_per_project_and_per_run(self):
+        def reading(build, passed, outcomes):
+            return {"job": SWEEP.job, "build": build, "finished_at": NOW.isoformat(timespec="seconds"), "passed": passed, "result": "SUCCESS" if passed else "FAILURE",
+                    "artifact": {"projects": len(outcomes), "closed": 0, "failed": 0, "left_for_next_run": 0, "outcomes": outcomes}}
+        fail = {"error": "HTTP 401 Unauthorized: owner mismatch"}
+        ok = {"closed": 1}
+        one = periodics.streaks({SWEEP.job: reading("1", False, {"kube-agents-evals-3": fail, "kube-agents-evals-4": ok})}, None)
+        self.assertEqual(one[SWEEP.job], {"build": "1", "projects": {"kube-agents-evals-3": 1}, "runs": 1})
+        # The same build read again on the next check counts nothing twice.
+        self.assertEqual(periodics.streaks({SWEEP.job: reading("1", False, {"kube-agents-evals-3": fail})}, one)[SWEEP.job], one[SWEEP.job])
+        # A new failed build: evals-3 again (2), evals-5 (1); evals-4, not reached, had nothing to keep.
+        two = periodics.streaks({SWEEP.job: reading("2", False, {"kube-agents-evals-3": fail, "kube-agents-evals-5": fail})}, one)
+        self.assertEqual(two[SWEEP.job], {"build": "2", "projects": {"kube-agents-evals-3": 2, "kube-agents-evals-5": 1}, "runs": 2})
+        # A failed build that did not reach evals-5 (busy) keeps its count.
+        three = periodics.streaks({SWEEP.job: reading("3", False, {"kube-agents-evals-3": fail})}, two)
+        self.assertEqual(three[SWEEP.job]["projects"], {"kube-agents-evals-3": 3, "kube-agents-evals-5": 1})
+        # A failed build in which evals-5 succeeded drops its count while another project fails the run.
+        dropped = periodics.streaks({SWEEP.job: reading("3b", False, {"kube-agents-evals-3": fail, "kube-agents-evals-5": ok})}, three)
+        self.assertEqual(dropped[SWEEP.job]["projects"], {"kube-agents-evals-3": 4})
+        # A clean build clears every count: a project it did not reach was busy, not failing.
+        four = periodics.streaks({SWEEP.job: reading("4", True, {"kube-agents-evals-3": ok})}, three)
+        self.assertEqual(four[SWEEP.job], {"build": "4", "projects": {}, "runs": 0})
+        # No reading keeps everything.
+        self.assertEqual(periodics.streaks({}, three)[SWEEP.job], three[SWEEP.job])
+
+    def test_a_single_failed_sweep_check_is_not_news_and_two_in_a_row_are(self):
+        def reading(build, passed, outcomes):
+            return {"job": SWEEP.job, "build": build, "finished_at": NOW.isoformat(timespec="seconds"), "passed": passed, "result": "SUCCESS" if passed else "FAILURE",
+                    "artifact": {"projects": len(outcomes), "closed": 0, "failed": sum(1 for o in outcomes.values() if "error" in o), "left_for_next_run": 0, "outcomes": outcomes}}
+        fail = {"error": "HTTP 401 Unauthorized: owner mismatch request by x, currently owned by "}
+        readings = {SWEEP.job: reading("1", False, {"kube-agents-evals-3": fail})}
+        streaks = periodics.streaks(readings, None)
+        self.assertEqual(periodics.assess(readings, NOW, None, streaks=streaks), {}, "one flap is not news")
+        # The second consecutive failed check is; a project that failed in both leads the detail with its count.
+        readings = {SWEEP.job: reading("2", False, {"kube-agents-evals-3": fail, "kube-agents-evals-4": fail})}
+        streaks = periodics.streaks(readings, streaks)
+        note = periodics.assess(readings, NOW, None, streaks=streaks)[SWEEP.job]
+        self.assertEqual(note["detail"], [
+            "kube-agents-evals-3: failed in 2 consecutive checks (HTTP 401 Unauthorized: owner mismatch request by x, currently owned by )",
+            "kube-agents-evals-4: HTTP 401 Unauthorized: owner mismatch request by x, currently owned by ",
+        ])
+        # A project with an old count that this build did not reach is not named as persisting.
+        readings = {SWEEP.job: reading("3", False, {"kube-agents-evals-4": fail})}
+        streaks = periodics.streaks(readings, streaks)
+        self.assertEqual(periodics.assess(readings, NOW, None, streaks=streaks)[SWEEP.job]["detail"][0], "kube-agents-evals-4: failed in 2 consecutive checks (HTTP 401 Unauthorized: owner mismatch request by x, currently owned by )")
+        # The cap bounds the merged list, and the run's own lines follow it.
+        many = {f"kube-agents-evals-{n}": fail for n in range(10, 22)}
+        readings = {SWEEP.job: dict(reading("4", False, many), artifact=dict(reading("4", False, many)["artifact"], left_for_next_run=7))}
+        streaks = periodics.streaks(readings, streaks)
+        detail = periodics.assess(readings, NOW, None, streaks=streaks)[SWEEP.job]["detail"]
+        self.assertEqual(detail[periodics.DETAIL_LIMIT], "and 7 more")
+        self.assertEqual(detail[-1], "7 write(s) left for the next run (the run's write budget)")
+        self.assertEqual(len(detail), periodics.DETAIL_LIMIT + 2)
+        # A reconcile's first failed build is news, with its own lines untouched.
+        weekly = {"job": WEEKLY.job, "build": "7", "finished_at": NOW.isoformat(timespec="seconds"), "passed": False, "result": "FAILURE",
+                  "artifact": {"outcomes": {"kube-agents-evals-3": {"outcome": "refused", "detail": "delete x"}}}}
+        streaks = periodics.streaks({WEEKLY.job: weekly}, None)
+        self.assertEqual(periodics.assess({WEEKLY.job: weekly}, NOW, None, streaks=streaks)[WEEKLY.job]["detail"], ["kube-agents-evals-3: refused (delete x)"])
+        # Without streaks (a caller that has none), a failed build is a note as before.
+        self.assertIn(SWEEP.job, periodics.assess({SWEEP.job: reading("1", False, {"kube-agents-evals-3": fail})}, NOW, None))
+
 
 class WorkflowWiring(unittest.TestCase):
     def test_the_15_minute_tick_fetches_the_readings_and_hands_them_to_health(self):
@@ -338,6 +411,69 @@ class WorkflowWiring(unittest.TestCase):
         adjudicate = next(step for step in steps if step.get("name") == "Adjudicate")
         self.assertIn("--periodics-dir work/periodics", adjudicate["run"])
         self.assertLess(names.index(fetch["name"]), names.index("Adjudicate"))
+
+    def test_the_sweeps_report_gives_the_detail_and_the_summary(self):
+        report = {"projects": 11, "closed": 0, "failed": 11, "left_for_next_run": 0, "ended_early": "GitHub refused PATCH twice (HTTP 403 Forbidden: secondary rate limit)",
+                  "outcomes": {"kube-agents-evals-%d" % n: {"error": "HTTP 403 Forbidden: secondary rate limit"} for n in range(2, 13)}}
+        lines = periodics.sweep_detail(report)
+        self.assertEqual(lines[0], "kube-agents-evals-10: HTTP 403 Forbidden: secondary rate limit")
+        self.assertEqual(lines[periodics.DETAIL_LIMIT], "and 6 more")
+        self.assertEqual(lines[-1], "run ended early: GitHub refused PATCH twice (HTTP 403 Forbidden: secondary rate limit)")
+        self.assertEqual(periodics.run_summary(SWEEP, report, passed=False), "failed in 11 of 11 project(s)")
+        partial = {"projects": 1, "closed": 2, "failed": 1, "left_for_next_run": 0, "outcomes": {"kube-agents-evals-7": {"closed": 2, "error": "GitHub refused PATCH twice"}}}
+        self.assertEqual(periodics.run_summary(SWEEP, partial, passed=False), "failed in 1 of 1 project(s) after closing 2 pull request(s)")
+        drained = {"projects": 12, "closed": 241, "failed": 0, "left_for_next_run": 30, "ended_early": None, "outcomes": {}}
+        self.assertEqual(periodics.run_summary(SWEEP, drained, passed=True), "closed 241 pull request(s) across 12 project(s), 30 write(s) left for the next run")
+        stopped = {"projects": 1, "closed": 0, "failed": 1, "left_for_next_run": 0, "ended_early": "GitHub refused PATCH twice", "skipped": ["kube-agents-evals-3", "kube-agents-evals-4"], "outcomes": {"kube-agents-evals-2": {"error": "GitHub refused PATCH twice"}}}
+        self.assertEqual(periodics.run_summary(SWEEP, stopped, passed=False), "failed in 1 of 1 project(s), 2 not swept")
+        self.assertIn("2 project(s) not swept after the run stopped: kube-agents-evals-3, kube-agents-evals-4", periodics.sweep_detail(stopped))
+        killed = {"exit": "terminated", "projects": 2, "closed": 7, "failed": 0, "left_for_next_run": 0, "outcomes": {}}
+        self.assertEqual(periodics.run_summary(SWEEP, killed, passed=False), "terminated after closing 7 pull request(s) across 2 project(s)")
+        # Failed above the project level (Boskos unreachable, the mapping): not the success wording.
+        above = {"exit": "failed", "projects": 7, "closed": 7, "failed": 0, "left_for_next_run": 0, "error": "could not reach a service (OSError: ...)", "outcomes": {}}
+        self.assertEqual(periodics.run_summary(SWEEP, above, passed=False), "the run failed after closing 7 pull request(s) across 7 project(s)")
+        self.assertEqual(periodics.sweep_detail(above), ["run: could not reach a service (OSError: ...)"])
+        self.assertEqual(periodics.sweep_detail(drained), ["30 write(s) left for the next run (the run's write budget)"])
+        self.assertEqual(periodics.run_summary(WEEKLY, {"summary": {"applied": 3, "unchanged": 9, "refused": 0}}, passed=True), "3 applied, 9 unchanged")
+        self.assertEqual(periodics.run_summary(WEEKLY, {"summary": {}}, passed=True), "nothing to do")
+        # A failed reconcile build never reads as success: the named failures
+        # lead, or the run failed above the projects.
+        self.assertEqual(periodics.run_summary(WEEKLY, {"summary": {"unchanged": 9, "refused": 3, "failed": 1}}, passed=False), "3 refused, 1 failed, 9 unchanged")
+        self.assertEqual(periodics.run_summary(WEEKLY, {"summary": {"unchanged": 9}}, passed=False), "the run failed after 9 unchanged")
+        self.assertEqual(periodics.run_summary(WEEKLY, {"summary": {}}, passed=False), "the run failed before reaching a project")
+        self.assertIsNone(periodics.run_summary(WEEKLY, None, passed=True))
+
+    def test_a_failed_sweep_note_carries_its_report_and_a_passed_one_its_summary(self):
+        report = {"projects": 3, "closed": 1, "failed": 2, "left_for_next_run": 0, "ended_early": None, "outcomes": {"kube-agents-evals-2": {"error": "HTTP 403 Forbidden: x"}, "kube-agents-evals-3": {"closed": 1}, "kube-agents-evals-4": {"error": "HTTP 502 Bad Gateway"}}}
+        failed = {"job": SWEEP.job, "build": "100", "finished_at": (NOW - timedelta(minutes=5)).isoformat(timespec="seconds"), "passed": False, "result": "FAILURE", "artifact": report}
+        notes = periodics.assess({SWEEP.job: failed}, NOW, None)
+        note = notes[SWEEP.job]
+        self.assertEqual(note["summary"], "failed in 2 of 3 project(s) after closing 1 pull request(s)")
+        self.assertEqual(note["detail"], ["kube-agents-evals-2: HTTP 403 Forbidden: x", "kube-agents-evals-4: HTTP 502 Bad Gateway"])
+        self.assertEqual((note["place"], note["absence"]), ("Eval GitOps repos", "leftover pull requests from eval runs are not being cleaned up"))
+        self.assertTrue(note["runbook"].endswith("#55-the-pull-request-sweep"))
+        passed = {"job": SWEEP.job, "build": "100", "finished_at": NOW.isoformat(timespec="seconds"), "passed": True, "result": "SUCCESS", "artifact": {"projects": 12, "closed": 241, "failed": 0, "left_for_next_run": 0, "outcomes": {}}}
+        runs = periodics.runs({SWEEP.job: passed})
+        self.assertEqual(runs[SWEEP.job], {"build": "100", "finished_at": NOW.isoformat(timespec="seconds"), "passed": True, "summary": "closed 241 pull request(s) across 12 project(s)"})
+
+    def test_every_watched_job_has_its_words_and_a_runbook_section_that_exists(self):
+        headings = (pathlib.Path(__file__).resolve().parents[1] / "docs" / "ci-pool-projects.md").read_text().splitlines()
+        # GitHub's anchor: lowercase, spaces to hyphens, punctuation dropped
+        # except hyphens and underscores; lines inside fenced code are not headings.
+        slugs = set()
+        fenced = False
+        for line in headings:
+            if line.startswith("```"):
+                fenced = not fenced
+                continue
+            if not fenced and line.startswith("#"):
+                text = line.lstrip("#").strip().lower()
+                slugs.add("".join(ch for ch in text.replace(" ", "-") if ch.isalnum() or ch in "-_"))
+        for periodic in periodics.WATCHED:
+            for field in ("place", "absence", "presence", "does", "effect", "runbook"):
+                self.assertTrue(getattr(periodic, field), f"{periodic.job} has no {field}")
+            self.assertTrue(periodic.runbook.startswith(periodics.RUNBOOK_ROOT + "docs/ci-pool-projects.md#"), periodic.runbook)
+            self.assertIn(periodic.runbook.split("#", 1)[1], slugs, f"{periodic.job}'s runbook anchor names no heading")
 
     def test_the_watched_jobs_are_the_three_periodics(self):
         # The names are the Prow job names in oss-test-infra, which nothing here

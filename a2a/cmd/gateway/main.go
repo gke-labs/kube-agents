@@ -1,4 +1,5 @@
-// The a2a chatops gateway: chat (Discord or Google Chat) in, tasks on the bus out.
+// The a2a chatops gateway: chat in (Google Chat, Slack or Discord, one
+// backend per process), tasks on the bus out.
 //
 // PLAYGROUND POSTURE: bot token as a plain Secret, no exporter, no breaker,
 // gateway sweep as the only janitor. Each has a decided design in
@@ -93,6 +94,8 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	switch backend {
 	case "gchat":
 		adapter, err = gateway.NewGoogleChatAdapter(cfg.GchatRelayURL, cfg.GchatTokenPath, log)
+	case "slack":
+		adapter, err = gateway.NewSlackAdapter(cfg.SlackBotToken, cfg.SlackAppToken, log)
 	case "":
 		// No real backend: the inject door is the only ingress, which is what
 		// lets an eval install's gateway start at all (#1660).

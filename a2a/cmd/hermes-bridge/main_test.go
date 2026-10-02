@@ -6,8 +6,10 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nats-io/nats.go"
 )
@@ -96,5 +98,61 @@ func TestEnvInt(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("envInt log record lacks %s:\n%s", want, out)
 		}
+	}
+}
+
+// The environment's "off" is the Config's empty string; anything else is an
+// address, passed through for net.Listen to judge.
+func TestActivityListenMapsOffToClosed(t *testing.T) {
+	if got := activityListen(activityListenOff); got != "" {
+		t.Errorf("activityListen(off) = %q, want empty", got)
+	}
+	if got := activityListen("127.0.0.1:9"); got != "127.0.0.1:9" {
+		t.Errorf("activityListen(addr) = %q, want the address back", got)
+	}
+}
+
+// In the environment 0 seconds is the heartbeat off; the Config's own zero is
+// its default, so the daemon has to say off in the Config's word (negative).
+func TestProgressIntervalMapsZeroToOff(t *testing.T) {
+	quiet := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	if got := progressInterval(quiet, 0); got >= 0 {
+		t.Errorf("progressInterval(0) = %v, want negative (off)", got)
+	}
+	if got := progressInterval(quiet, 30); got != 30*time.Second {
+		t.Errorf("progressInterval(30) = %v, want 30s", got)
+	}
+}
+
+// A count of seconds the duration cannot hold would wrap negative, which the
+// Config reads as off; it is refused like a non-integer instead, loudly and
+// with the default in its place. The largest count that fits is accepted
+// quietly.
+func TestProgressIntervalRefusesAnOverRangeValue(t *testing.T) {
+	over := maxDurationSeconds + 1
+	if int64(int(over)) != over {
+		t.Skip("int cannot hold an over-range second count on this platform")
+	}
+	var buf bytes.Buffer
+	loud := slog.New(slog.NewJSONHandler(&buf, nil))
+	if got := progressInterval(loud, int(over)); got != time.Duration(defaultProgressIntervalSeconds)*time.Second {
+		t.Errorf("progressInterval(over-range) = %v, want the default %ds", got, defaultProgressIntervalSeconds)
+	}
+	out := buf.String()
+	if n := strings.Count(out, "\n"); n != 1 {
+		t.Errorf("progressInterval on over-range logged %d records, want 1:\n%s", n, out)
+	}
+	for _, want := range []string{`"level":"ERROR"`, `"key":"BRIDGE_PROGRESS_INTERVAL_SECONDS"`, `"value":` + strconv.FormatInt(over, 10), `"default":` + strconv.Itoa(defaultProgressIntervalSeconds)} {
+		if !strings.Contains(out, want) {
+			t.Errorf("progressInterval log record lacks %s:\n%s", want, out)
+		}
+	}
+
+	buf.Reset()
+	if got := progressInterval(loud, int(maxDurationSeconds)); got != time.Duration(maxDurationSeconds)*time.Second || got <= 0 {
+		t.Errorf("progressInterval(largest) = %v, want it accepted", got)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("the largest count that fits was logged about:\n%s", buf.String())
 	}
 }

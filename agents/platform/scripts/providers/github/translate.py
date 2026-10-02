@@ -64,7 +64,11 @@ def proposal(node: dict[str, Any]) -> dict[str, Any]:
     `sourceRevision` is that branch's tip as of this read, and is deliberately
     a property of the read rather than of the proposal: the question it
     answers -- did anything land here after the request I am replying to -- is
-    only sound against a tip re-read at the moment of asking.
+    only sound against a tip re-read at the moment of asking. That holds while
+    the proposal is open. Once it is closed or merged GitHub stops following
+    the branch and the field is the revision it closed at, however the branch
+    moves afterwards -- which is what `branch-delete` relies on to tell a spent
+    branch from one that moved on.
     """
     if node.get("merged_at"):
         state = "merged"

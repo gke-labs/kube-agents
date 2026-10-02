@@ -337,7 +337,16 @@ artifact, and four names are reserved so renderers and audit tooling can rely on
 | `progress` | Agent-authored milestones, renderable to chat at zero model cost. Stage 1 derives these from model narration; the subagent framework spec records the deviation |
 
 Artifact names are data, so the set can grow without touching the envelope; only these
-four carry reserved semantics.
+four carry reserved semantics. An `activity` entry is one `data` part whose object carries
+`tool`, `input` when the call had one, and may carry `callId`, `status` (`completed`, `error`,
+`interrupted` for a call still open at the terminal, or `truncated` on the one entry an executor
+publishes in place of the calls missing from the trace: past its budget, failed to publish,
+or unreported at its drain; `dropped` counts them all, and a delivery the executor could not
+read or refused over its body cap is outside it, logged, the call it belonged to in the trace
+as `interrupted` when its opening delivery arrived and whole from the closing one when the
+opening one was unreadable; over the cap the closing delivery is larger still, so that call is absent), `errorType` (the executor's own word for
+an error), `durationMs` and `at`; the library
+validates the part kind (assertion 18), and a reader tolerates the keys it does not know.
 
 ## Verified identity (added 9/9)
 

@@ -25,8 +25,9 @@ the reach the App has. The branch goes because a leftover branch refuses the
 next lease's identical fix "nothing to commit" (#1755 item 2).
 
 Fourth, which projects. The sweep takes only what Boskos hands out as free,
-holds each for the seconds it takes, and gives every one back -- on success, on
-a fault, on an unmapped name. A project a run holds is never asked for.
+holds each for as long as it takes (heartbeated), and gives every one back --
+on success, on a fault, on an unmapped name. A project a run holds is never
+asked for.
 
 Fifth, a permission the organisation has withdrawn has to read as what it is.
 GitHub answers that with a 403 or a 422 whose text is about tokens; the usual
@@ -86,8 +87,32 @@ def _pad(segment):
     return segment + "=" * (-len(segment) % 4)
 
 
-def _http_error(code, url="https://api.github.com"):
-    return urllib.error.HTTPError(url, code, "reason", {}, None)
+def _http_error(code, url="https://api.github.com", body=b"", headers=None):
+    return urllib.error.HTTPError(url, code, "reason", headers or {}, io.BytesIO(body))
+
+
+def _next(failure):
+    """A failure entry: an exception raised every time, or a list consumed one
+    call at a time (None in it means that call succeeds)."""
+    if isinstance(failure, list):
+        return failure.pop(0) if failure else None
+    return failure
+
+
+_PAUSES = []
+
+
+def setUpModule():
+    # The one-second hold and the pacing are real time in production and a
+    # recorder here; the tests that assert on them read _PAUSES.
+    global _real_pause, _real_pool_pause
+    _real_pause, _real_pool_pause = sweeper.pause, sweeper.boskos_pool.pause
+    sweeper.pause = _PAUSES.append
+    sweeper.boskos_pool.pause = _PAUSES.append
+
+
+def tearDownModule():
+    sweeper.pause, sweeper.boskos_pool.pause = _real_pause, _real_pool_pause
 
 
 class _GitHub:
@@ -143,7 +168,7 @@ class _GitHub:
             page = int(key.rsplit("page=", 1)[1])
             return io.BytesIO(json.dumps(self._pulls_for(path) if page == 1 else []).encode())
         if key.startswith("PATCH /repos/"):
-            failure = self.close_errors.get(int(key.rsplit("/", 1)[1]))
+            failure = _next(self.close_errors.get(int(key.rsplit("/", 1)[1])))
             if failure is not None:
                 raise failure
             return io.BytesIO(b"{}")
@@ -157,7 +182,7 @@ class _GitHub:
             return io.BytesIO(json.dumps([{"ref": "refs/heads/" + n} for n in names]).encode())
         if key.startswith("DELETE /repos/") and "/git/refs/heads/" in key:
             branch = urllib.parse.unquote(key.split("/git/refs/heads/", 1)[1])
-            failure = self.delete_errors.get(branch)
+            failure = _next(self.delete_errors.get(branch))
             if failure is not None:
                 raise failure
             return io.BytesIO(b"")  # 204
@@ -186,6 +211,7 @@ class _Boskos:
         self.released = []
         self.resets = []
         self.order = []
+        self.beats = []
 
     def __call__(self, request, timeout=None):
         if self.error is not None:
@@ -206,9 +232,12 @@ class _Boskos:
             name = self.free.pop(0)
             self.acquired.append(name)
             return io.BytesIO(json.dumps({"name": name, "state": "cleaning"}).encode())
+        if action == "update":
+            self.beats.append(query["name"])
+            return io.BytesIO(b"")
         if action == "release":
             assert query["dest"] == "free" and query["owner"] == OWNER, query
-            failure = self.release_errors.get(query["name"])
+            failure = _next(self.release_errors.get(query["name"]))
             if failure is not None:
                 raise failure
             self.released.append(query["name"])
@@ -433,7 +462,7 @@ class ClosingTest(unittest.TestCase):
                 self.assertEqual(run_repo(github), 1)
 
     def test_a_branch_that_will_not_delete_is_reported_and_the_close_stands(self):
-        github = _GitHub(pulls=[agent_pull(number=1), agent_pull(number=2, branch="platform-agent/other")], delete_errors={"platform-agent/fix-the-thing": _http_error(403)})
+        github = _GitHub(pulls=[agent_pull(number=1), agent_pull(number=2, branch="platform-agent/other")], delete_errors={"platform-agent/fix-the-thing": _http_error(409)})
         with self.assertRaises(sweeper.SweepError) as caught:
             run_repo(github)
         self.assertIn("left 1 branch(es): platform-agent/fix-the-thing", str(caught.exception))
@@ -501,7 +530,10 @@ class CloseFailureTest(unittest.TestCase):
         self.assertEqual(github.keys("PATCH "), ["PATCH /repos/%s/pulls/%d" % (REPO, n) for n in (1, 2, 3)])
 
     def test_the_failure_names_what_was_left_open(self):
-        github = _GitHub(pulls=[agent_pull(number=7)], close_errors={7: _http_error(403)})
+        # A 403 with no rate-limit marker (an archived repository) is that
+        # pull request's failure, as any other error; only GitHub's marked
+        # burst-limit answer is waited out.
+        github = _GitHub(pulls=[agent_pull(number=7)], close_errors={7: _http_error(403, body=b'{"message":"Repository was archived so is read-only."}')})
         with self.assertRaises(sweeper.SweepError) as caught:
             run_repo(github)
         self.assertIn("#7", str(caught.exception))
@@ -531,6 +563,476 @@ class CloseFailureTest(unittest.TestCase):
         with self.assertRaises(sweeper.SweepError):
             run_repo(github)
         self.assertIn("PATCH /repos/%s/pulls/2" % REPO, github.keys("PATCH "))
+
+
+class PacingTest(unittest.TestCase):
+    """GitHub's burst limit: a second between writes, a budget per run that is
+    logged and reported when it runs out, and a refused write waited out once."""
+
+    def setUp(self):
+        del _PAUSES[:]
+
+    def test_each_write_is_followed_by_a_pause(self):
+        github = _GitHub(pulls=[agent_pull(number=1), agent_pull(number=2, branch="platform-agent/other")])
+        run_repo(github)
+        writes = [k for k, _ in github.calls if k.startswith(("PATCH ", "DELETE "))]
+        self.assertEqual(len(writes), 4)
+        self.assertEqual([p for p in _PAUSES if p == sweeper.WRITE_PAUSE_SECONDS], [sweeper.WRITE_PAUSE_SECONDS] * 4)
+
+    def test_a_dry_run_writes_nothing_and_pauses_for_nothing(self):
+        run_repo(_GitHub(pulls=[agent_pull()]), dry_run=True)
+        self.assertNotIn(sweeper.WRITE_PAUSE_SECONDS, _PAUSES)
+
+    def test_the_budget_stops_the_run_logs_it_and_leaves_the_rest(self):
+        pulls = [agent_pull(number=n, branch="platform-agent/b%d" % n) for n in (1, 2, 3)]
+        stderr = io.StringIO()
+        with mock.patch.object(sweeper, "WRITE_BUDGET_PER_RUN", 3), mock.patch("sys.stderr", stderr):
+            report = {}
+            (closed, failures, _), boskos, github = run_pool(["kube-agents-evals-7"], _GitHub(pulls=pulls), report=report)
+        # Three writes: #1's close and delete, #2's close; #2's branch and #3
+        # wait for the next run, which deletes the branch on its branch pass.
+        self.assertEqual(github.keys("PATCH "), ["PATCH /repos/%s/pulls/1" % REPO, "PATCH /repos/%s/pulls/2" % REPO])
+        self.assertEqual(len(github.keys("DELETE ")), 1)
+        self.assertEqual(closed, {"kube-agents-evals-7": 2})
+        self.assertEqual(failures, {})
+        # #2's delete, and #3's close and delete.
+        self.assertEqual(report["left"], 3)
+        self.assertIn("write budget for this run (3) used up at %s" % REPO, stderr.getvalue())
+        self.assertEqual(boskos.released, ["kube-agents-evals-7"])
+
+    def test_the_branch_pass_is_budgeted_too(self):
+        github = _GitHub(pulls=[], branches=["platform-agent/a", "platform-agent/b", "platform-agent/c"])
+        with mock.patch.object(sweeper, "WRITE_BUDGET_PER_RUN", 1), mock.patch("sys.stderr", io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
+            report = {}
+            (closed, failures, _), _, github = run_pool(["kube-agents-evals-7"], github, report=report)
+        self.assertEqual(len(github.keys("DELETE ")), 1)
+        self.assertEqual((closed, failures, report["left"]), ({"kube-agents-evals-7": 0}, {}, 2))
+
+    def test_a_hand_run_of_one_project_is_paced_but_not_budgeted(self):
+        pulls = [agent_pull(number=n, branch="platform-agent/b%d" % n) for n in (1, 2, 3)]
+        with mock.patch.object(sweeper, "WRITE_BUDGET_PER_RUN", 1):
+            self.assertEqual(run_repo(_GitHub(pulls=pulls)), 3)
+
+    def test_a_403_marked_as_the_limit_is_recognised_and_others_are_not(self):
+        self.assertTrue(sweeper.is_rate_limited(_http_error(403, headers={"Retry-After": "5"})))
+        self.assertTrue(sweeper.is_rate_limited(_http_error(403, headers={"X-RateLimit-Remaining": "0"})))
+        self.assertTrue(sweeper.is_rate_limited(_http_error(403, body=b'{"message":"You have exceeded a secondary rate limit."}')))
+        self.assertFalse(sweeper.is_rate_limited(_http_error(403, body=b'{"message":"Repository was archived so is read-only."}')))
+        # GitHub answers a limit with a 403 it marks or with a 429; a 429 needs no marker.
+        self.assertTrue(sweeper.is_rate_limited(_http_error(429, headers={"Retry-After": "5"})))
+        self.assertTrue(sweeper.is_rate_limited(_http_error(429)))
+
+    def test_a_429_ends_the_run_like_a_marked_403(self):
+        eight = "gke-agentic/kube-agents-evals-8-infra"
+        refused = _http_error(429, headers={"Retry-After": "30"})
+        github = _GitHub(pulls={REPO: [agent_pull(number=1)], eight: [agent_pull(head_repo=eight)]}, close_errors={1: [refused, refused]})
+        report = {}
+        with mock.patch("sys.stderr", io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
+            (closed, failures, _), boskos, github = run_pool(["kube-agents-evals-7", "kube-agents-evals-8"], github, report=report)
+        self.assertIn(30, _PAUSES)
+        self.assertIn("twice", report["ended_early"])
+        self.assertEqual(report["skipped"], ["kube-agents-evals-8"])
+        self.assertFalse(any("evals-8-infra" in key for key, _ in github.calls))
+
+    def test_a_limit_on_a_read_ends_the_run_too(self):
+        # The cooldown covers every repository: a 429 on a project's listing
+        # must not be that project's failure with the walk minting and listing
+        # the next one during the cooldown.
+        eight = "gke-agentic/kube-agents-evals-8-infra"
+        github = _GitHub(pulls={REPO: [agent_pull()], eight: [agent_pull(head_repo=eight)]}, odd_bodies={})
+        refused = _http_error(429, headers={"Retry-After": "30"})
+        original = github.__call__
+
+        def limited(request, timeout=None):
+            if "evals-7-infra/pulls?" in request.full_url:
+                raise refused
+            return original(request, timeout=timeout)
+
+        report = {}
+        boskos = _Boskos(["kube-agents-evals-7", "kube-agents-evals-8"])
+        with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(limited, boskos)), mock.patch("sys.stderr", io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
+            closed, failures, _ = sweeper.sweep_pool(BOSKOS, OWNER, APP_ID, MAPPING, runner=_Gcloud(), report=report)
+        self.assertIn("rate limit", failures["kube-agents-evals-7"])
+        self.assertEqual(report["skipped"], ["kube-agents-evals-8"])
+        self.assertFalse(any("evals-8-infra" in key for key, _ in github.calls), "nothing asked of the next project during the cooldown")
+        self.assertEqual(boskos.released, ["kube-agents-evals-7", "kube-agents-evals-8"])
+
+    def test_a_repository_stopped_by_the_limit_keeps_the_closes_it_made(self):
+        refused = _http_error(403, body=b"secondary rate limit", headers={"Retry-After": "1"})
+        pulls = [agent_pull(number=n, branch="platform-agent/b%d" % n) for n in (1, 2, 3)]
+        github = _GitHub(pulls=pulls, close_errors={3: [refused, refused]})
+        report = {}
+        with mock.patch("sys.stderr", io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
+            (closed, failures, _), _, _ = run_pool(["kube-agents-evals-7"], github, report=report)
+        self.assertEqual(closed, {"kube-agents-evals-7": 2}, "the two closes before the refusal are on the record")
+        self.assertIn("kube-agents-evals-7", failures)
+
+    def test_a_limit_on_the_branch_listing_after_closes_keeps_them(self):
+        # The first call after a burst of writes is where a refusal lands.
+        pulls = [agent_pull(number=n, branch="platform-agent/b%d" % n) for n in (1, 2, 3)]
+        github = _GitHub(pulls=pulls)
+        original = github.__call__
+
+        def limited(request, timeout=None):
+            if "/git/matching-refs/" in request.full_url:
+                raise _http_error(429, headers={"Retry-After": "30"})
+            return original(request, timeout=timeout)
+
+        report = {}
+        boskos = _Boskos(["kube-agents-evals-7"])
+        with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(limited, boskos)), mock.patch("sys.stderr", io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
+            closed, failures, _ = sweeper.sweep_pool(BOSKOS, OWNER, APP_ID, MAPPING, runner=_Gcloud(), report=report)
+        self.assertEqual(closed, {"kube-agents-evals-7": 3})
+        self.assertIn("kube-agents-evals-7", failures)
+
+    def test_a_limit_on_the_mint_ends_the_run_too(self):
+        eight = "gke-agentic/kube-agents-evals-8-infra"
+        github = _GitHub(pulls={REPO: [agent_pull()], eight: [agent_pull(head_repo=eight)]}, mint_error=_http_error(403, body=b'{"message":"You have exceeded a secondary rate limit"}'))
+        report = {}
+        with mock.patch("sys.stderr", io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
+            (closed, failures, _), boskos, github = run_pool(["kube-agents-evals-7", "kube-agents-evals-8"], github, report=report)
+        self.assertIn("rate limit", report["ended_early"])
+        self.assertEqual(report["skipped"], ["kube-agents-evals-8"])
+        self.assertEqual(len([k for k, _ in github.calls if k.startswith("POST /app/installations/")]), 1, "no second mint during the cooldown")
+
+    def test_a_refused_write_is_followed_by_the_pause_too(self):
+        github = _GitHub(pulls=[agent_pull(number=1), agent_pull(number=2, branch="platform-agent/other")], delete_errors={"platform-agent/fix-the-thing": _http_error(422)})
+        run_repo(github)
+        self.assertEqual([p for p in _PAUSES if p == sweeper.WRITE_PAUSE_SECONDS], [sweeper.WRITE_PAUSE_SECONDS] * 4, "four writes, four pauses, the refused delete included")
+
+    def test_a_refused_write_waits_what_github_asks_and_is_retried_once(self):
+        refused = _http_error(403, body=b'{"message":"You have exceeded a secondary rate limit"}', headers={"Retry-After": "7"})
+        github = _GitHub(pulls=[agent_pull(number=1)], close_errors={1: [refused, None]})
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr):
+            self.assertEqual(run_repo(github), 1)
+        self.assertEqual(len(github.keys("PATCH ")), 2)
+        self.assertIn(7, _PAUSES)
+        self.assertIn("secondary rate limit", stderr.getvalue())
+
+    def test_a_refusal_without_retry_after_waits_the_default_and_the_bound_holds(self):
+        self.assertEqual(sweeper._retry_after(_http_error(403)), sweeper.RETRY_AFTER_DEFAULT_SECONDS)
+        self.assertEqual(sweeper._retry_after(_http_error(403, headers={"Retry-After": "9999"})), sweeper.RETRY_AFTER_MAX_SECONDS)
+        self.assertEqual(sweeper._retry_after(_http_error(403, headers={"Retry-After": "soon"})), sweeper.RETRY_AFTER_DEFAULT_SECONDS)
+
+    def test_a_second_refusal_ends_the_run_and_the_rest_are_released_unswept(self):
+        eight = "gke-agentic/kube-agents-evals-8-infra"
+        refused = _http_error(403, body=b"secondary rate limit", headers={"Retry-After": "1"})
+        github = _GitHub(pulls={REPO: [agent_pull(number=1)], eight: [agent_pull(head_repo=eight)]}, close_errors={1: [refused, refused]})
+        report = {}
+        with mock.patch("sys.stderr", io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
+            (closed, failures, _), boskos, github = run_pool(["kube-agents-evals-7", "kube-agents-evals-8"], github, report=report)
+        self.assertIn("kube-agents-evals-7", failures)
+        self.assertIn("twice", failures["kube-agents-evals-7"])
+        self.assertNotIn("kube-agents-evals-8", closed, "the cooldown covers every repository")
+        self.assertFalse(any("evals-8-infra" in key for key, _ in github.calls))
+        self.assertEqual(boskos.released, ["kube-agents-evals-7", "kube-agents-evals-8"])
+        self.assertIn("twice", report["ended_early"])
+        self.assertEqual(report["skipped"], ["kube-agents-evals-8"])
+
+    def test_a_close_that_fails_logs_githubs_answer(self):
+        github = _GitHub(pulls=[agent_pull(number=1)], close_errors={1: _http_error(422, body=b'{"message":"Validation Failed: state"}')})
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr), self.assertRaises(sweeper.SweepError):
+            run_repo(github)
+        self.assertIn("Validation Failed", stderr.getvalue())
+
+
+class HoldTest(unittest.TestCase):
+    """Boskos reads a release back through a cache its lease write reaches a
+    moment later: a hold lasts a second, and a refused release is retried."""
+
+    def setUp(self):
+        del _PAUSES[:]
+
+    def test_the_pool_walk_heartbeats_its_holds(self):
+        # A sweep can run for minutes after a gap; the heartbeat keeps its
+        # LastUpdate fresh against the reaper and the next run's reset.
+        import time
+
+        class _Slow(_GitHub):
+            def __call__(self, request, timeout=None):
+                if "/pulls?" in request.full_url:
+                    time.sleep(0.3)
+                return super().__call__(request, timeout=timeout)
+
+        boskos = _Boskos(["kube-agents-evals-7"])
+        with mock.patch.object(sweeper.boskos_pool, "HEARTBEAT_SECONDS", 0.05), mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(_Slow(), boskos)):
+            sweeper.sweep_pool(BOSKOS, OWNER, APP_ID, MAPPING, runner=_Gcloud())
+        self.assertGreaterEqual(len(boskos.beats), 2)
+        self.assertEqual(boskos.released, ["kube-agents-evals-7"])
+
+    def test_a_release_that_fails_before_a_termination_is_on_the_record(self):
+        eight = "gke-agentic/kube-agents-evals-8-infra"
+
+        class _Terminating(_GitHub):
+            def __call__(self, request, timeout=None):
+                if "evals-8-infra" in request.full_url:
+                    raise sweeper.Terminated("signal 15")
+                return super().__call__(request, timeout=timeout)
+
+        boskos = _Boskos(["kube-agents-evals-7", "kube-agents-evals-8"], release_errors={"kube-agents-evals-7": _http_error(502, BOSKOS)})
+        report = {}
+        with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(_Terminating(pulls={REPO: [agent_pull()], eight: [agent_pull(head_repo=eight)]}), boskos)), mock.patch("sys.stderr", io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
+            with self.assertRaises(sweeper.Terminated):
+                sweeper.sweep_pool(BOSKOS, OWNER, APP_ID, MAPPING, runner=_Gcloud(), report=report)
+        self.assertIn("release failed", report["failures"]["kube-agents-evals-7"])
+
+    def test_a_heartbeat_thread_that_cannot_start_does_not_skip_the_release(self):
+        class _NoThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        boskos = _Boskos(["kube-agents-evals-7"])
+        with mock.patch.object(sweeper.boskos_pool.threading, "Thread", _NoThread), mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(_GitHub(), boskos)), mock.patch("sys.stdout", io.StringIO()):
+            with self.assertRaises(RuntimeError):
+                sweeper.sweep_pool(BOSKOS, OWNER, APP_ID, MAPPING, runner=_Gcloud())
+        self.assertEqual(boskos.released, ["kube-agents-evals-7"])
+        # And the signal hold is balanced afterwards: an unbalanced depth would
+        # leave the process's termination handlers deferred for good.
+        self.assertEqual(sweeper.boskos_pool._HOLD_DEPTH, 0)
+
+    def test_a_hold_lasts_at_least_a_second_before_its_release(self):
+        with mock.patch.object(sweeper.boskos_pool, "clock", lambda: 100.0):
+            _, boskos, _ = run_pool(["kube-agents-evals-7"])
+        self.assertEqual(boskos.released, ["kube-agents-evals-7"])
+        self.assertIn(sweeper.boskos_pool.MIN_HOLD_SECONDS, _PAUSES)
+
+    def test_a_hold_that_already_lasted_long_enough_is_released_at_once(self):
+        ticks = iter([100.0, 200.0, 200.0, 200.0])
+        with mock.patch.object(sweeper.boskos_pool, "clock", lambda: next(ticks)):
+            run_pool(["kube-agents-evals-7"])
+        self.assertNotIn(sweeper.boskos_pool.MIN_HOLD_SECONDS, _PAUSES)
+
+    def test_a_release_refused_as_owner_mismatch_is_released_again(self):
+        refused = _http_error(401, BOSKOS, body=b"owner mismatch request by ci-kube-agents-pull-sweep-1, currently owned by ")
+        boskos = _Boskos(["kube-agents-evals-7"], release_errors={"kube-agents-evals-7": [refused, None]})
+        stderr = io.StringIO()
+        with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(_GitHub(), boskos)), mock.patch("sys.stderr", stderr):
+            closed, failures, _ = sweeper.sweep_pool(BOSKOS, OWNER, APP_ID, MAPPING, runner=_Gcloud())
+        self.assertEqual(failures, {})
+        self.assertEqual(boskos.released, ["kube-agents-evals-7"])
+        self.assertIn("releasing again", stderr.getvalue())
+        self.assertIn("currently owned by", stderr.getvalue())
+
+    def test_a_release_refused_twice_is_that_projects_failure_naming_boskos_answer(self):
+        refused = _http_error(401, BOSKOS, body=b"owner mismatch request by ci-kube-agents-pull-sweep-1, currently owned by other-run")
+        boskos = _Boskos(["kube-agents-evals-7"], release_errors={"kube-agents-evals-7": [refused, refused]})
+        with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(_GitHub(), boskos)), mock.patch("sys.stderr", io.StringIO()):
+            _, failures, _ = sweeper.sweep_pool(BOSKOS, OWNER, APP_ID, MAPPING, runner=_Gcloud())
+        self.assertIn("currently owned by other-run", failures["kube-agents-evals-7"])
+        self.assertEqual(boskos.released, [])
+
+    def test_a_body_cut_short_does_not_replace_the_error_being_read(self):
+        class _Cut:
+            def read(self):
+                raise http.client.IncompleteRead(b"partial")
+
+            def close(self):
+                pass
+
+        exc = urllib.error.HTTPError("https://api.github.com/x", 429, "reason", {"Retry-After": "5"}, _Cut())
+        self.assertEqual(sweeper.boskos_pool.error_body(exc), "")
+        self.assertEqual(sweeper.boskos_pool.describe(exc), "HTTP 429 reason")
+        self.assertTrue(sweeper.is_rate_limited(exc), "the status still decides")
+
+    def test_a_release_failure_joins_the_projects_own_fault(self):
+        # A project whose sweep left a pull request open and whose release then
+        # failed: the report says both, not the release alone.
+        github = _GitHub(pulls=[agent_pull(number=1), agent_pull(number=2, branch="platform-agent/other")], close_errors={2: _http_error(409)})
+        boskos = _Boskos(["kube-agents-evals-7"], release_errors={"kube-agents-evals-7": _http_error(502, BOSKOS)})
+        with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(github, boskos)), mock.patch("sys.stderr", io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
+            closed, failures, _ = sweeper.sweep_pool(BOSKOS, OWNER, APP_ID, MAPPING, runner=_Gcloud())
+        self.assertIn("#2", failures["kube-agents-evals-7"])
+        self.assertIn("release failed", failures["kube-agents-evals-7"])
+        self.assertEqual(closed, {"kube-agents-evals-7": 1})
+
+    def test_a_release_refused_for_another_reason_is_not_retried(self):
+        boskos = _Boskos(["kube-agents-evals-7"], release_errors={"kube-agents-evals-7": _http_error(502, BOSKOS)})
+        with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(_GitHub(), boskos)), mock.patch("sys.stderr", io.StringIO()):
+            _, failures, _ = sweeper.sweep_pool(BOSKOS, OWNER, APP_ID, MAPPING, runner=_Gcloud())
+        self.assertIn("release failed", failures["kube-agents-evals-7"])
+        self.assertEqual(boskos.order.count("release"), 1)
+
+
+class ReportTest(unittest.TestCase):
+    """The run's report is written last, whatever ended it."""
+
+    def _main_with_report(self, tmp, github=None, boskos=None):
+        path = pathlib.Path(tmp) / "pull-sweep.json"
+        cluster = _Cluster(github or _GitHub(pulls=[agent_pull()]), boskos or _Boskos(["kube-agents-evals-7"]))
+        with mock.patch.object(sweeper.urllib.request, "urlopen", cluster), mock.patch.object(sweeper.subprocess, "run", _Gcloud()), mock.patch.object(sweeper.signal, "signal"), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+            rc = sweeper.main(["--pool", "--boskos-server", BOSKOS, "--boskos-owner", OWNER, "--ci-deploy-script", str(_CI_DEPLOY), "--report", str(path)])
+        return rc, json.loads(path.read_text())
+
+    def test_a_clean_run_reports_what_it_closed(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, doc = self._main_with_report(tmp)
+        self.assertEqual(rc, 0)
+        self.assertEqual((doc["exit"], doc["closed"], doc["failed"], doc["left_for_next_run"], doc["ended_early"]), ("ok", 1, 0, 0, None))
+        self.assertEqual(doc["outcomes"], {"kube-agents-evals-7": {"closed": 1}})
+
+    def test_a_failed_run_reports_the_project_and_githubs_answer(self):
+        import tempfile
+        github = _GitHub(mint_error=_http_error(422, body=b'{"message":"The permissions requested are not granted"}'))
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, doc = self._main_with_report(tmp, github)
+        self.assertEqual((rc, doc["exit"], doc["failed"]), (1, "failed", 1))
+        self.assertIn("error", doc["outcomes"]["kube-agents-evals-7"])
+        self.assertIn("not fully swept", doc["error"])
+
+    def test_a_run_terminated_mid_walk_reports_what_it_had_done(self):
+        import tempfile
+        eight = "gke-agentic/kube-agents-evals-8-infra"
+
+        class _Terminating(_GitHub):
+            def __call__(self, request, timeout=None):
+                if "evals-8-infra" in request.full_url:
+                    raise sweeper.Terminated("signal 15")
+                return super().__call__(request, timeout=timeout)
+
+        github = _Terminating(pulls={REPO: [agent_pull()], eight: [agent_pull(head_repo=eight)]})
+        boskos = _Boskos(["kube-agents-evals-7", "kube-agents-evals-8"])
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, doc = self._main_with_report(tmp, github, boskos)
+        self.assertEqual((rc, doc["exit"]), (sweeper.TERMINATED_EXIT_CODE, "terminated"))
+        # The project the signal landed in is named too, with nothing closed.
+        self.assertEqual((doc["closed"], doc["outcomes"]), (1, {"kube-agents-evals-7": {"closed": 1}, "kube-agents-evals-8": {"error": "terminated mid-sweep (signal 15)"}}))
+        self.assertEqual(boskos.released, ["kube-agents-evals-7", "kube-agents-evals-8"])
+
+    def test_a_project_with_closes_and_a_refusal_reports_both(self):
+        import tempfile
+        refused = _http_error(403, body=b"secondary rate limit", headers={"Retry-After": "1"})
+        pulls = [agent_pull(number=n, branch="platform-agent/b%d" % n) for n in (1, 2)]
+        github = _GitHub(pulls=pulls, close_errors={2: [refused, refused]})
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, doc = self._main_with_report(tmp, github)
+        self.assertEqual((rc, doc["closed"]), (1, 1))
+        self.assertEqual(doc["outcomes"]["kube-agents-evals-7"]["closed"], 1)
+        self.assertIn("twice", doc["outcomes"]["kube-agents-evals-7"]["error"])
+
+    def test_a_repository_with_one_refused_close_among_successes_keeps_its_closes(self):
+        # The ordinary partial failure: one 422 among many closes; the report
+        # carries the closes it made beside the error, as for the limit.
+        import tempfile
+        pulls = [agent_pull(number=n, branch="platform-agent/b%d" % n) for n in (1, 2, 3)]
+        github = _GitHub(pulls=pulls, close_errors={2: _http_error(422, body=b'{"message":"Validation Failed"}')})
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, doc = self._main_with_report(tmp, github)
+        self.assertEqual((rc, doc["closed"]), (1, 2))
+        self.assertEqual(doc["outcomes"]["kube-agents-evals-7"]["closed"], 2)
+        self.assertIn("#2", doc["outcomes"]["kube-agents-evals-7"]["error"])
+
+    def test_a_crash_mid_walk_reports_what_it_had_done_and_what_crashed(self):
+        import tempfile
+        eight = "gke-agentic/kube-agents-evals-8-infra"
+
+        class _Crashing(_GitHub):
+            def __call__(self, request, timeout=None):
+                if "evals-8-infra" in request.full_url:
+                    raise KeyError("boom")
+                return super().__call__(request, timeout=timeout)
+
+        github = _Crashing(pulls={REPO: [agent_pull()], eight: [agent_pull(head_repo=eight)]})
+        boskos = _Boskos(["kube-agents-evals-7", "kube-agents-evals-8"])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "pull-sweep.json"
+            with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(github, boskos)), mock.patch.object(sweeper.subprocess, "run", _Gcloud()), mock.patch.object(sweeper.signal, "signal"), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+                with self.assertRaises(KeyError):
+                    sweeper.main(["--pool", "--boskos-server", BOSKOS, "--boskos-owner", OWNER, "--ci-deploy-script", str(_CI_DEPLOY), "--report", str(path)])
+            doc = json.loads(path.read_text())
+        self.assertEqual((doc["exit"], doc["exit_code"], doc["error"]), ("error", None, "KeyError: 'boom'"))
+        self.assertEqual(doc["outcomes"], {"kube-agents-evals-7": {"closed": 1}})
+        self.assertEqual(boskos.released, ["kube-agents-evals-7", "kube-agents-evals-8"])
+
+    def test_a_termination_after_a_close_keeps_that_repositorys_closes(self):
+        # The signal lands inside a repository after one close: the report
+        # names the project, its closes, and that it was interrupted.
+        import tempfile
+        pulls = [agent_pull(number=n, branch="platform-agent/b%d" % n) for n in (1, 2)]
+
+        class _TerminatingOnSecond(_GitHub):
+            def __call__(self, request, timeout=None):
+                if request.method == "PATCH" and request.full_url.endswith("/pulls/2"):
+                    raise sweeper.Terminated("signal 15")
+                return super().__call__(request, timeout=timeout)
+
+        boskos = _Boskos(["kube-agents-evals-7"])
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, doc = self._main_with_report(tmp, _TerminatingOnSecond(pulls=pulls), boskos)
+        self.assertEqual((rc, doc["exit"], doc["closed"]), (sweeper.TERMINATED_EXIT_CODE, "terminated", 1))
+        self.assertEqual(doc["outcomes"]["kube-agents-evals-7"]["closed"], 1)
+        self.assertIn("terminated mid-sweep", doc["outcomes"]["kube-agents-evals-7"]["error"])
+        self.assertEqual(boskos.released, ["kube-agents-evals-7"])
+
+    def test_a_hand_run_terminated_after_a_close_reports_the_close_and_the_interruption(self):
+        import tempfile
+        pulls = [agent_pull(number=n, branch="platform-agent/b%d" % n) for n in (1, 2)]
+
+        class _TerminatingOnSecond(_GitHub):
+            def __call__(self, request, timeout=None):
+                if request.method == "PATCH" and request.full_url.endswith("/pulls/2"):
+                    raise sweeper.Terminated("signal 15")
+                return super().__call__(request, timeout=timeout)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "pull-sweep.json"
+            with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(_TerminatingOnSecond(pulls=pulls))), mock.patch.object(sweeper.subprocess, "run", _Gcloud()), mock.patch.object(sweeper.signal, "signal"), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+                rc = sweeper.main(["--project", PROJECT, "--ci-deploy-script", str(_CI_DEPLOY), "--report", str(path)])
+            doc = json.loads(path.read_text())
+        self.assertEqual((rc, doc["exit"], doc["closed"]), (sweeper.TERMINATED_EXIT_CODE, "terminated", 1))
+        self.assertEqual(doc["outcomes"][PROJECT]["closed"], 1)
+        self.assertIn("terminated mid-sweep", doc["outcomes"][PROJECT]["error"])
+
+    def test_a_hand_run_with_no_mapping_does_not_blame_its_project(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            script = pathlib.Path(tmp) / "ci-deploy.sh"
+            script.write_text("#!/bin/bash\necho no mapping here\n")
+            path = pathlib.Path(tmp) / "pull-sweep.json"
+            with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(_GitHub())), mock.patch.object(sweeper.subprocess, "run", _Gcloud()), mock.patch.object(sweeper.signal, "signal"), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+                rc = sweeper.main(["--project", PROJECT, "--ci-deploy-script", str(script), "--report", str(path)])
+            doc = json.loads(path.read_text())
+        self.assertEqual((rc, doc["exit"], doc["projects"], doc["failed"]), (1, "failed", 0, 0))
+        self.assertIn("mapping", doc["error"])
+
+    def test_a_hand_run_refused_twice_exits_one_and_reports_it(self):
+        import tempfile
+        refused = _http_error(403, body=b"secondary rate limit", headers={"Retry-After": "1"})
+        github = _GitHub(pulls=[agent_pull(number=1)], close_errors={1: [refused, refused]})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "pull-sweep.json"
+            with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(github)), mock.patch.object(sweeper.subprocess, "run", _Gcloud()), mock.patch.object(sweeper.signal, "signal"), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+                rc = sweeper.main(["--project", PROJECT, "--ci-deploy-script", str(_CI_DEPLOY), "--report", str(path)])
+            doc = json.loads(path.read_text())
+        self.assertEqual((rc, doc["exit"]), (1, "failed"))
+        self.assertIn("twice", doc["ended_early"])
+        self.assertIn("error", doc["outcomes"][PROJECT])
+
+    def test_a_hand_run_with_one_refused_close_reports_its_closes_and_its_fault(self):
+        import tempfile
+        pulls = [agent_pull(number=n, branch="platform-agent/b%d" % n) for n in (1, 2, 3)]
+        github = _GitHub(pulls=pulls, close_errors={2: _http_error(422, body=b'{"message":"Validation Failed"}')})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "pull-sweep.json"
+            with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(github)), mock.patch.object(sweeper.subprocess, "run", _Gcloud()), mock.patch.object(sweeper.signal, "signal"), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+                rc = sweeper.main(["--project", PROJECT, "--ci-deploy-script", str(_CI_DEPLOY), "--report", str(path)])
+            doc = json.loads(path.read_text())
+        self.assertEqual((rc, doc["exit"], doc["closed"], doc["failed"]), (1, "failed", 2, 1))
+        self.assertEqual(doc["outcomes"][PROJECT]["closed"], 2)
+        self.assertIn("#2", doc["outcomes"][PROJECT]["error"])
+
+    def test_no_report_path_and_no_artifacts_dir_writes_nothing(self):
+        with mock.patch.dict(sweeper.os.environ, {}, clear=True):
+            self.assertIsNone(sweeper.default_report_path())
+        # And main without a path and without the variable writes nothing:
+        # ExitCodeTest._main asserts write_report is never called on that path.
+        with mock.patch.dict(sweeper.os.environ, {sweeper.ARTIFACTS_ENV: "/tmp/artifacts"}):
+            self.assertEqual(sweeper.default_report_path(), "/tmp/artifacts/pull-sweep.json")
 
 
 class MintFailureTest(unittest.TestCase):
@@ -745,11 +1247,14 @@ class ExitCodeTest(unittest.TestCase):
         cluster = _Cluster(github or _GitHub(), boskos or _Boskos(["kube-agents-evals-7"]))
         # The handler main() installs is process-wide; patched so the unittest
         # runner keeps its own SIGTERM behaviour after this class.
-        with mock.patch.object(sweeper.urllib.request, "urlopen", cluster), mock.patch.object(
+        # No --report, and no ARTIFACTS from the shell: a run here writes no file.
+        env = {k: v for k, v in sweeper.os.environ.items() if k != sweeper.ARTIFACTS_ENV}
+        with mock.patch.dict(sweeper.os.environ, env, clear=True), mock.patch.object(sweeper.urllib.request, "urlopen", cluster), mock.patch.object(
             sweeper.subprocess, "run", gcloud or _Gcloud()
-        ), mock.patch.object(sweeper.signal, "signal") as installed:
+        ), mock.patch.object(sweeper.signal, "signal") as installed, mock.patch.object(sweeper, "write_report") as written:
             rc = sweeper.main(argv + ["--ci-deploy-script", str(_CI_DEPLOY)])
         installed.assert_called_once_with(sweeper.signal.SIGTERM, sweeper._terminate)
+        written.assert_not_called()
         return rc
 
     def test_a_clean_pool_sweep_exits_zero(self):

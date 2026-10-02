@@ -1,0 +1,74 @@
+
+## 2026-09-29T14:34:07Z [cgroup/before-mode] G container node-pools describe v1-pool --cluster upg-14b --zone us-central1-a --format=value(version,config.effectiveCgroupMode)
+WARNING: Node pool v1-pool is running cgroupv1 which is deprecated. Please use cgroupv2 instead. For additional details, please refer to https://cloud.google.com/kubernetes-engine/docs/how-to/migrate-cgroupv2
+1.34.11-gke.1056000	EFFECTIVE_CGROUP_MODE_V1
+## exit 0
+
+## 2026-09-29T14:34:08Z [cgroup/before-pods] K -n scen get pods -l app=legacy-jvm-v1 -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,PHASE:.status.phase,RESTARTS:.status.containerStatuses[0].restartCount,LAST:.status.containerStatuses[0].lastState.terminated.reason,EXIT:.status.containerStatuses[0].lastState.terminated.exitCode
+NAME                            NODE                                PHASE     RESTARTS   LAST     EXIT
+legacy-jvm-v1-6c5f68468-9md2p   gke-upg-14b-v1-pool-4922a2a8-rv7t   Running   0          <none>   <none>
+## exit 0
+
+## 2026-09-29T14:34:08Z [cgroup/before-log] K -n scen logs deploy/legacy-jvm-v1 --tail=3
+max=127729664
+OOM caught
+## exit 0
+## 2026-09-29T14:43:04Z [cgroup/note] attempt the node upgrade of the cgroup v1 pool to 1.35.8-gke.1380000
+
+## 2026-09-29T14:43:04Z [cgroup/pool-upgrade] G container clusters upgrade upg-14b --node-pool v1-pool --cluster-version 1.35.8-gke.1380000 --zone us-central1-a --quiet
+ERROR: (gcloud.container.clusters.upgrade) ResponseError: code=400, message=Node pools using cgroupv1 cannot be upgraded to GKE version 1.35.8-gke.1380000. To unblock, migrate node pool to cgroupv2. Learn more: https://cloud.google.com/kubernetes-engine/docs/how-to/migrate-cgroupv2.
+## exit 1
+
+## 2026-09-29T14:43:07Z [cgroup/after-upgrade-attempt] G container node-pools describe v1-pool --cluster upg-14b --zone us-central1-a --format=value(version,config.effectiveCgroupMode)
+WARNING: Node pool v1-pool is running cgroupv1 which is deprecated. Please use cgroupv2 instead. For additional details, please refer to https://cloud.google.com/kubernetes-engine/docs/how-to/migrate-cgroupv2
+1.34.11-gke.1056000	EFFECTIVE_CGROUP_MODE_V1
+## exit 0
+## 2026-09-29T14:43:09Z [cgroup/note] pool still cgroup v1: run the migration GKE asks for
+
+## 2026-09-29T14:43:09Z [cgroup/migrate] G container node-pools update v1-pool --cluster upg-14b --zone us-central1-a --system-config-from-file bench/upgrade-scenarios/evidence/14c/cgroup-v2.yaml --quiet
+Updating node pool v1-pool...
+.......................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................done.
+Updated [https://container.googleapis.com/v1/projects/<PROJECT_ID>/zones/us-central1-a/clusters/upg-14b/nodePools/v1-pool].
+## exit 0
+
+## 2026-09-29T14:50:12Z [cgroup/after-mode] G container node-pools describe v1-pool --cluster upg-14b --zone us-central1-a --format=value(version,config.effectiveCgroupMode)
+1.34.11-gke.1056000	EFFECTIVE_CGROUP_MODE_V2
+## exit 0
+
+## 2026-09-29T14:50:13Z [cgroup/after-pods] K -n scen get pods -l app=legacy-jvm-v1 -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,PHASE:.status.phase,RESTARTS:.status.containerStatuses[0].restartCount,LAST:.status.containerStatuses[0].lastState.terminated.reason,EXIT:.status.containerStatuses[0].lastState.terminated.exitCode
+NAME                            NODE                                PHASE     RESTARTS   LAST        EXIT
+legacy-jvm-v1-6c5f68468-xq87r   gke-upg-14b-v1-pool-4922a2a8-cej9   Running   5          OOMKilled   137
+## exit 0
+
+## 2026-09-29T14:50:14Z [cgroup/after-log] K -n scen logs deploy/legacy-jvm-v1 --tail=3
+max=2084569088
+## exit 0
+
+## 2026-09-29T14:50:14Z [cgroup/after-events] K -n scen get events --field-selector involvedObject.kind=Pod --sort-by=.lastTimestamp -o custom-columns=T:.lastTimestamp,R:.reason,O:.involvedObject.name,M:.message
+T                      R           O                               M
+2026-09-29T14:22:50Z   Scheduled   legacy-jvm-59856b7d48-xqzm7     Successfully assigned scen/legacy-jvm-59856b7d48-xqzm7 to gke-upg-14b-work-pool-5cd7df67-t5wg
+2026-09-29T14:22:51Z   Scheduled   fixed-jvm-655ddd94fc-8zzvw      Successfully assigned scen/fixed-jvm-655ddd94fc-8zzvw to gke-upg-14b-work-pool-5cd7df67-t5wg
+2026-09-29T14:22:51Z   Pulling     legacy-jvm-59856b7d48-xqzm7     Pulling image "eclipse-temurin:11.0.15_10-jdk"
+2026-09-29T14:22:52Z   Pulling     fixed-jvm-655ddd94fc-8zzvw      Pulling image "eclipse-temurin:11.0.16_8-jdk"
+2026-09-29T14:23:17Z   Pulled      fixed-jvm-655ddd94fc-8zzvw      Successfully pulled image "eclipse-temurin:11.0.16_8-jdk" in 18.675s (25.146s including waiting). Image size: 241017880 bytes.
+2026-09-29T14:23:17Z   Created     fixed-jvm-655ddd94fc-8zzvw      Created container: jvm
+2026-09-29T14:23:17Z   Started     fixed-jvm-655ddd94fc-8zzvw      Started container jvm
+2026-09-29T14:23:17Z   Pulled      legacy-jvm-59856b7d48-xqzm7     Successfully pulled image "eclipse-temurin:11.0.15_10-jdk" in 18.488s (25.966s including waiting). Image size: 236632203 bytes.
+2026-09-29T14:32:06Z   Scheduled   legacy-jvm-v1-6c5f68468-9md2p   Successfully assigned scen/legacy-jvm-v1-6c5f68468-9md2p to gke-upg-14b-v1-pool-4922a2a8-rv7t
+2026-09-29T14:32:07Z   Pulling     legacy-jvm-v1-6c5f68468-9md2p   Pulling image "eclipse-temurin:11.0.15_10-jdk"
+2026-09-29T14:32:15Z   Created     legacy-jvm-v1-6c5f68468-9md2p   Created container: jvm
+2026-09-29T14:32:15Z   Started     legacy-jvm-v1-6c5f68468-9md2p   Started container jvm
+2026-09-29T14:32:15Z   Pulled      legacy-jvm-v1-6c5f68468-9md2p   Successfully pulled image "eclipse-temurin:11.0.15_10-jdk" in 8.534s (8.534s including waiting). Image size: 236632203 bytes.
+2026-09-29T14:39:56Z   Started     legacy-jvm-59856b7d48-xqzm7     Started container jvm
+2026-09-29T14:39:56Z   Created     legacy-jvm-59856b7d48-xqzm7     Created container: jvm
+2026-09-29T14:45:33Z   Killing     legacy-jvm-v1-6c5f68468-9md2p   Stopping container jvm
+2026-09-29T14:45:33Z   Scheduled   legacy-jvm-v1-6c5f68468-xq87r   Successfully assigned scen/legacy-jvm-v1-6c5f68468-xq87r to gke-upg-14b-v1-pool-4922a2a8-cej9
+2026-09-29T14:45:35Z   Pulling     legacy-jvm-v1-6c5f68468-xq87r   Pulling image "eclipse-temurin:11.0.15_10-jdk"
+2026-09-29T14:46:06Z   Pulled      legacy-jvm-v1-6c5f68468-xq87r   Successfully pulled image "eclipse-temurin:11.0.15_10-jdk" in 13.023s (31.186s including waiting). Image size: 236632203 bytes.
+2026-09-29T14:48:38Z   BackOff     legacy-jvm-59856b7d48-xqzm7     Back-off restarting failed container jvm in pod legacy-jvm-59856b7d48-xqzm7_scen(9a9e1199-816b-46d4-b51d-cd761ef1819d)
+2026-09-29T14:49:31Z   Created     legacy-jvm-v1-6c5f68468-xq87r   Created container: jvm
+2026-09-29T14:49:31Z   Started     legacy-jvm-v1-6c5f68468-xq87r   Started container jvm
+2026-09-29T14:49:31Z   Pulled      legacy-jvm-v1-6c5f68468-xq87r   Container image "eclipse-temurin:11.0.15_10-jdk" already present on machine
+2026-09-29T14:50:14Z   Pulled      legacy-jvm-59856b7d48-xqzm7     Container image "eclipse-temurin:11.0.15_10-jdk" already present on machine
+2026-09-29T14:50:14Z   BackOff     legacy-jvm-v1-6c5f68468-xq87r   Back-off restarting failed container jvm in pod legacy-jvm-v1-6c5f68468-xq87r_scen(65347ecf-0521-4dd4-9b60-8526906fa872)
+## exit 0

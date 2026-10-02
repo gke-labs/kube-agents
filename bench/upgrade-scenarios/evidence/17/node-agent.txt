@@ -1,0 +1,26 @@
+
+## 2026-09-29T14:59:02Z [node-agent/before-ds] K -n scen get ds node-agent
+NAME         DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE   NODE SELECTOR   AGE
+node-agent   1         1         1       1            1           team=legacy     2m2s
+## exit 0
+
+## 2026-09-29T14:59:03Z [node-agent/before-consumer] K -n scen logs deploy/consumer --tail=2
+agent-ok
+agent-ok
+## exit 0
+
+## 2026-09-29T15:14:59Z [node-agent/after-ds] K -n scen get ds node-agent
+NAME         DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE   NODE SELECTOR   AGE
+node-agent   0         0         0       0            0           team=legacy     17m
+## exit 0
+
+## 2026-09-29T15:14:59Z [node-agent/after-consumer] K -n scen logs deploy/consumer --tail=3
+AGENT-UNREACHABLE
+wget: can't connect to remote host (10.128.0.59): Connection refused
+AGENT-UNREACHABLE
+## exit 0
+
+## 2026-09-29T15:15:00Z [node-agent/node-labels] K get nodes -l role=work -L team
+NAME                                  STATUS   ROLES    AGE     VERSION               TEAM
+gke-upg-17b-work-pool-5a2fc819-9lu0   Ready    <none>   5m30s   v1.35.8-gke.1380000   
+## exit 0

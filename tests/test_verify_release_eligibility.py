@@ -10,9 +10,10 @@ import subprocess
 import tempfile
 import unittest
 
-from tests.testing.common import get_isolated_test_env
+from tests.testing.common import MOCK_DEFAULT_REGISTRY_PREFIX, get_isolated_test_env
 from tests.testing.release import (
     INVALID_GA_RELEASE_TAGS,
+    MOCK_CANDIDATE_RELEASE_IMAGES,
     MOCK_COLLIDING_RELEASE_TAG,
     MOCK_EMERGENCY_OVERRIDE_REASON,
     MOCK_NONEXISTENT_REF,
@@ -21,6 +22,8 @@ from tests.testing.release import (
     MOCK_LINE_PATCH_RELEASE_TAG,
     MOCK_TARGET_RELEASE_LINE,
     MOCK_TARGET_RELEASE_TAG,
+    commit_required_release_images,
+    create_mock_docker_binary,
     create_mock_gh_binary,
 )
 
@@ -389,6 +392,31 @@ exit {docker_exit}
         finally:
             temp_dir.cleanup()
 
+    def test_a_candidate_from_before_the_list_grew_is_eligible_on_its_own_images(self):
+        """The script runs from a checkout of main whose list may be longer than
+        the candidate's. The images it requires are the ones the candidate's own
+        common.sh lists -- what its publish run built -- not this checkout's
+        (#2211). The docker mock holds exactly the candidate's images."""
+        temp_dir, repo_dir, git, _, bin_dir = self._create_mock_repo()
+        try:
+            candidate = commit_required_release_images(repo_dir, git, MOCK_CANDIDATE_RELEASE_IMAGES)
+            git("tag", "-a", MOCK_LATEST_STAGING_TAG, candidate, "-m", f"Promoted {MOCK_LATEST_STAGING_TAG}")
+            create_mock_docker_binary(
+                bin_dir,
+                existing_images=[f"{MOCK_DEFAULT_REGISTRY_PREFIX}/{img}:{candidate}" for img in MOCK_CANDIDATE_RELEASE_IMAGES],
+            )
+            proc = self._run_verify_script(
+                repo_dir,
+                args=[MOCK_TARGET_RELEASE_TAG, candidate],
+                env={"REGISTRY_PREFIX": MOCK_DEFAULT_REGISTRY_PREFIX},
+                bin_dir=bin_dir,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("ELIGIBLE: Found staging promotion tag", proc.stdout)
+            self.assertIn(f"lists at {candidate[:7]}", proc.stderr)
+        finally:
+            temp_dir.cleanup()
+
     def test_blocked_when_no_staging_promotion_tag(self):
         temp_dir, repo_dir, _, commit_sha, bin_dir = self._create_mock_repo()
         try:
@@ -693,6 +721,32 @@ exit {docker_exit}
         self.assertIn("candidate is the line's own", proc.stdout)
         self.assertIn("Found RC validation tag(s)", proc.stdout)
         self.assertIn(f"rc_2609290000_{head[:7]}_validated", proc.stdout)
+
+    def test_a_line_cut_before_the_list_grew_is_eligible_on_its_own_images(self):
+        """The case that does not heal itself: a release line opened from a commit
+        before the list grew carries the shorter list for its life, and main's
+        checkout, running this script, must hold it to that list (#2211)."""
+        repo_dir, git, bin_dir, _, _ = self._line_repo()
+        git("switch", f"release/{MOCK_TARGET_RELEASE_LINE}")
+        head = commit_required_release_images(repo_dir, git, MOCK_CANDIDATE_RELEASE_IMAGES, "fix: a backport on the old list")
+        git("switch", "main")
+        git("tag", "-a", f"rc_2609290000_{head[:7]}_validated", "-m", "validated", head)
+        create_mock_docker_binary(
+            bin_dir,
+            existing_images=[f"{MOCK_DEFAULT_REGISTRY_PREFIX}/{img}:{head}" for img in MOCK_CANDIDATE_RELEASE_IMAGES],
+        )
+        proc = self._run_verify_script(
+            repo_dir,
+            env={
+                "RELEASE_VERSION": MOCK_LINE_PATCH_RELEASE_TAG,
+                "RELEASE_LINE": MOCK_TARGET_RELEASE_LINE,
+                "REGISTRY_PREFIX": MOCK_DEFAULT_REGISTRY_PREFIX,
+            },
+            bin_dir=bin_dir,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("candidate is the line's own", proc.stdout)
+        self.assertIn(f"lists at {head[:7]}", proc.stderr)
 
     def test_a_line_is_blocked_by_a_staging_tag_or_a_hand_typed_marker_alone(self):
         """The line's gate is the RC pipeline's own name for the commit, not the rc_*_validated

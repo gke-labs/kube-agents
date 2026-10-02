@@ -89,6 +89,10 @@ It is optional at install time: leave the prompt empty and set it later from Sla
 
 A scheduled brief posts flat in that channel, never inside a thread. `/sethome` also records whichever thread it happened to be typed in, and threading every scheduled report under one ageing thread leaves only the first one visible — so cron delivery drops the thread deliberately. A job that wants its output in a thread names an explicit `deliver=` target instead.
 
+### Reactions
+
+By default the agent follows the Hermes Slack adapter: it adds 👀 to your message when it starts and ✅ or ❌ when the turn ends. Setting `KAGE_SLACK_UX=true` in the `PlatformAgent` CR's `spec.deployment.env` (the chart's `platformAgent.deployment.env`) changes two things. The first reaction names the kind of ask, picked from its words before any model call: 👀 for a question or check, 🛠️ for a change, 📋 for the board, 🚨 for an incident. The second reaction goes beside it when the work actually settles, rather than when the turn ends: ✅ done, ⏸️ waiting on you, ❌ failed. For work the agent hands to the board, that is when every card the turn opened for your message has finished, along with any follow-up cards those cards' workers filed in the thread: ✅ if all of them completed, ❌ if any gave up or the turn itself failed. A follow-up that had already given up when the card above it completed posts its own failure line in the thread and leaves your message ✅. ⏸️ can come first and stay, since a card that waits on you runs on once answered: your answer gets its own reaction when its turn ends, and the card's outcome lands on the message that started it. A cancelled turn adds no second reaction, and neither does work still running when the agent restarts, nor a card closed or archived by hand rather than finishing. No reaction is ever removed. The flag is off by default, and with it off nothing changes.
+
 ## Proactive alerts (both channels)
 
 The harness doesn't only reply to messages. A cluster event posted to the in-pod triage endpoint (`inject_message` in [`agents/platform/scripts/session_kv_server.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/session_kv_server.py)) opens a thread unprompted: it posts the alert first, then runs the triage turn in the thread that alert created. The first-run inventory report arrives the same way, into the thread `bootstrap_onboarding` bound. Where an unprompted message lands:
@@ -132,7 +136,7 @@ This reaches the Platform Agent directly, bypassing the front door: a request ty
 
 The other way in is the [admin console](/kube-agents/reference/admin-console/), started from a repository checkout on your own machine: its Chat page reaches the Planning Agent through the front door, so a request typed there is planned and delegated the way a chat message would be.
 
-Two things a chat-less install does not exercise. Scheduled reports and alert-driven triage are delivered only to enabled chat platforms — the delivery resolver enumerates Google Chat and Slack and nothing else — so neither arrives anywhere. And `bootstrap-inventory-delivery` waits for a human to connect over chat before it posts the first-run inventory report, so that report stays on the agent's volume at `/opt/data/INVENTORY.md`; read it with `kubectl exec` rather than waiting for it.
+Two things a chat-less install does not exercise. Scheduled reports and alert-driven triage are delivered only to enabled chat platforms — the delivery resolver enumerates Google Chat and Slack and nothing else — so neither arrives anywhere. And `bootstrap-inventory-delivery` waits for a human to connect over chat before it posts the first-run inventory report, so that report stays at `/opt/data/INVENTORY.md` on the shell sandbox pod's volume; read it with `kubectl exec -n kubeagents-system platform-agent-shell-0 -c shell -- cat /opt/data/INVENTORY.md` rather than waiting for it.
 
 ## Where to go next
 

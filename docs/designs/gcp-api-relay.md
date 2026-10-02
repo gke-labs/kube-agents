@@ -6,8 +6,8 @@ The Platform Agent's shell, file tools and code execution run in the shell sandb
 ServiceAccount carries no cloud identity. Every credentialed call the model's code makes goes
 through the credential broker, and until this route the broker spoke one shape: an argv for
 `kubectl`, `gcloud`, `gh` or `git`, checked against an allowlist and executed on the broker's
-side. No `gcloud` command reads Monitoring time series, so a collector that will need a week
-of per-pod usage has no sanctioned path to it.
+side. No `gcloud` command reads Monitoring time series, so the cost audit's collector, which
+needs a week of per-pod usage, had no sanctioned path to it.
 
 The broker now speaks a second shape: an HTTP relay for **read-only Google Cloud REST calls**.
 The sandbox sends an unauthenticated `GET` for a Google API URL to the broker; the broker
@@ -144,7 +144,10 @@ it saw must be what is forwarded; the query check is also what keeps a byte`http
    does (`path` at 256 characters, the width the exec route gives a `cwd`). The upstream
    failure cases in the table above are the verdict line in their case, naming the condition,
    and the exception type where there is one, never its message; the disabled-relay 503
-   writes `api disabled request_id=%s rule=%s`.
+   writes `api disabled request_id=%s rule=%s`. These records carry the log's envelope only;
+   the `audit` mapping the exec route attaches to its records (the site's
+   [observability page](../site/src/content/docs/concepts/observability.md#cloud-logging)) is
+   not attached on this route.
 
 Named constants, declared at the top of `credential_proxy.py` per the engineering rules:
 
@@ -421,8 +424,8 @@ branch:
    with an `api blocked` line naming the rule.
 3. From the gateway pod, the same `curl` with the gateway's token returns 403
    `CALLER_ROLE_FORBIDDEN`.
-4. Follows with the consumer, not with this change: once a collector reads usage through
-   `ApiSession`, a `fleet-wide-cost-analysis` run's document carries a `scope.clusters` entry
+4. With the consumer, `fleet_waste.py`, reading usage through `ApiSession`: a
+   `fleet-wide-cost-analysis` run's document carries a `scope.clusters` entry
    whose `checks_run` names the `overrequest` check and whose `limitations` is empty, which
    is the state the SOP describes as a complete 3.1.
 
@@ -435,26 +438,26 @@ On `main` now: `agents/platform/scripts/api_policy.py`, the `/v1/gcp/` route and
 tests above, and the route's mention in the documents that enumerate the broker's paths — the
 site's `reference/security-and-iam.md` and `reference/credential-isolation.md`,
 `docs/credential-isolation-design.md`, `docs/security-requirements.md` and the role table
-paragraph of `agent-shell-sandboxing.md`. It is useful without a consumer: any script in the
-sandbox can read the three Monitoring shapes through it today.
+paragraph of `agent-shell-sandboxing.md`. Any script in the sandbox can read the three
+Monitoring shapes through it.
 
-What follows is the consumer's side, and it is a contract rather than code on `main`: a
-collector that needs Monitoring history obtains its `requests`-shaped session from
+The first consumer is `agents/platform/skills/fleet-audit/scripts/fleet_waste.py`, the cost audit's collector,
+and the contract it follows binds any later one: a collector that needs Monitoring history obtains its `requests`-shaped session from
 `ApiSession()` instead of from `google.auth`, keeps its URL literals as the real endpoints,
 and treats a relay 403 — whose body names the `gcp.api.*` rule — as that cluster's
 `limitations` note rather than as zero usage, which is the reading the cost SOP already
 prescribes for a usage check that did not run. Nothing in the sandbox can use `google.auth`,
-so a consumer written that way has no second path to remove.
+so inside it the relay is the only path. `fleet_waste.py` falls back to Application Default
+Credentials only when `CREDENTIAL_PROXY_URL` is unset, which is a run outside the sandbox.
 
 ## Rejected alternatives
 
 - **Keep sampling with proxied `kubectl top`.** Needs nothing new and is already allowed; it
-  is what the cost SOP's §3.1 does today, three samples about five minutes apart over a
-  ten-minute window, and the SOP's own
-  sampling-honesty paragraph says what that cannot see — a nightly batch peak, a weekday
-  curve. A week of history is what the follow-up collector adds so a proposed request value
-  rests on more than one Monday morning; the sampling stays as the fallback where the relay
-  answers with a `limitations` note.
+  is what the cost SOP's §3.1 did before its collector, three samples about five minutes
+  apart over a ten-minute window, which cannot see a nightly batch peak or a weekday curve. A
+  week of history lets a proposed request value rest on more than one Monday morning. Where
+  the relay refuses, the usage checks are a `limitations` note rather than a sampled
+  fallback, because a point sample is the evidence the week replaced.
 - **Ship `google-auth` in the sandbox.** The import would succeed and the call would fail with
   the unbound identity. The sandbox Dockerfile does not install the package for that reason.
 - **Run the Monitoring read on the gateway as a `no_agent` job.** Works only because the

@@ -1419,6 +1419,246 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             f"Expected valid 40-character SHA or SemVer tag, got: {proc.stdout.strip()}",
         )
 
+    def _release_line_checkout(self, temp_dir):
+        """A kube-agents checkout shaped like a release line: this branch's install.sh
+        stamped 0.2.0 and tagged on A, a backport B on top of it, and an unrelated
+        commit U, carrying the same stamped script, that descends from neither."""
+        repo_path = pathlib.Path(temp_dir)
+        git = lambda *args: subprocess.run(["git", *args], cwd=str(repo_path), check=True, capture_output=True, text=True).stdout.strip()
+
+        def stamped_tree():
+            (repo_path / "scripts" / "installer").mkdir(parents=True, exist_ok=True)
+            (repo_path / "scripts" / "installer" / "installer_common.sh").write_text("# marker\n")
+            text = _INSTALL_SH.read_text().replace('BAKED_RELEASE_VERSION=""', 'BAKED_RELEASE_VERSION="0.2.0"', 1)
+            (repo_path / "install.sh").write_text(text)
+
+        git("init", "-q", "-b", "main")
+        git("config", "user.name", "Test")
+        git("config", "user.email", "test@example.com")
+        git("config", "commit.gpgsign", "false")
+        stamped_tree()
+        git("add", ".")
+        git("commit", "-q", "-m", "chore(release): stamp release version 0.2.0")
+        stamp = git("rev-parse", "HEAD")
+        git("tag", "0.2.0", stamp)
+        git("switch", "-q", "-c", "release/0.2")
+        (repo_path / "backport.txt").write_text("fix\n")
+        git("add", "backport.txt")
+        git("commit", "-q", "-m", "fix: backport")
+        backport = git("rev-parse", "HEAD")
+        git("switch", "-q", "--orphan", "elsewhere")
+        stamped_tree()
+        (repo_path / "other.txt").write_text("x\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "chore: unrelated")
+        unrelated = git("rev-parse", "HEAD")
+        git("switch", "-q", "release/0.2")
+        return repo_path, git, stamp, backport, unrelated
+
+    def _run_fixture_install_func(self, repo_path, func_call):
+        """Source the fixture's own stamped install.sh, so BASH_SOURCE names it: the
+        checkout's script is the one running, as when an operator runs ./install.sh."""
+        setup = f"KUBE_AGENTS_SOURCE_ONLY=true source ./install.sh\n{func_call}\n"
+        overrides = {"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}
+        return _run_installer_bash(setup, get_isolated_test_env(overrides=overrides), cwd=repo_path)
+
+    def test_a_release_line_checkout_past_its_stamp_defaults_to_its_own_head(self):
+        """The backport carries the previous release's baked version, but it is not that
+        release: run from it, install.sh defaults the way a main checkout does, to its
+        own HEAD, whose images the merge onto the line built, and verification passes on
+        that tag. The stamp's own commit still defaults to the release, and an unrelated
+        commit with the baked version still defaults to it and is refused as a source
+        mismatch."""
+        with tempfile.TemporaryDirectory(prefix="release-line-checkout-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+
+            past = self._run_fixture_install_func(repo_path, 'default_image_tag "."; echo "label=$(default_image_tag_label ".")"')
+            self.assertEqual(past.returncode, 0, past.stderr)
+            lines = past.stdout.strip().splitlines()
+            self.assertEqual(lines[0], backport)
+            self.assertIn("release line 0.2 checkout", lines[1])
+            self.assertIn("1 commit(s) past release 0.2.0", lines[1])
+
+            resolved = self._run_fixture_install_func(
+                repo_path,
+                'tag=""; resolve_effective_image_tag tag "." "" && echo "tag=$tag" && verify_local_source_ref "." "$tag" && echo "verified"',
+            )
+            self.assertEqual(resolved.returncode, 0, resolved.stdout + resolved.stderr)
+            self.assertIn(f"tag={backport}", resolved.stdout)
+            self.assertIn("verified", resolved.stdout)
+            self.assertNotIn("mismatch", resolved.stdout + resolved.stderr)
+
+            # Asked for the release by name from the backport: refused, and told what the
+            # checkout is rather than that it is unrelated.
+            named = self._run_fixture_install_func(repo_path, 'verify_local_source_ref "." "0.2.0"')
+            self.assertNotEqual(named.returncode, 0)
+            self.assertIn("mismatch", named.stdout + named.stderr)
+            self.assertIn(f"release line 0.2 at {backport[:7]}, 1 commit(s) past release 0.2.0", named.stdout + named.stderr)
+            self.assertIn("with no --image-tag and IMAGE_TAG unset", named.stdout + named.stderr)
+            self.assertIn(f"--image-tag {backport}", named.stdout + named.stderr)
+            self.assertNotIn("neither that release's commit", named.stdout + named.stderr)
+
+            git("switch", "-q", "--detach", stamp)
+            at_stamp = self._run_fixture_install_func(repo_path, 'default_image_tag "."; default_image_tag_label "."')
+            self.assertEqual(at_stamp.stdout.strip().splitlines(), ["0.2.0", "official release 0.2.0"])
+
+            git("switch", "-q", "--detach", unrelated)
+            off = self._run_fixture_install_func(
+                repo_path, 'default_image_tag "."; tag=""; resolve_effective_image_tag tag "." "" && verify_local_source_ref "." "$tag"'
+            )
+            self.assertEqual(off.stdout.strip().splitlines()[0], "0.2.0")
+            self.assertNotEqual(off.returncode, 0)
+            self.assertIn("mismatch", off.stdout + off.stderr)
+            # Tag present, history complete, own script running: no fetch would change
+            # the answer, and the hint does not name one.
+            self.assertIn("neither that release's commit nor a descendant of it", off.stdout + off.stderr)
+            self.assertNotIn("git fetch", off.stdout + off.stderr)
+
+    def test_a_line_checkout_in_a_release_named_directory_still_defaults_to_its_head(self):
+        """The archive-directory rule (step 3) must not hand the release back once the
+        checkout is recognised as a line past it: a clone named kube-agents-0.2.0, the
+        name the rollback page uses, later moved onto the line, defaults to HEAD."""
+        with tempfile.TemporaryDirectory(prefix="release-line-named-") as temp_dir:
+            named = pathlib.Path(temp_dir) / "kube-agents-0.2.0"
+            named.mkdir()
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(named)
+            proc = self._run_fixture_install_func(repo_path, 'default_image_tag "."; default_image_tag_label "."')
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            lines = proc.stdout.strip().splitlines()
+            self.assertEqual(lines[0], backport)
+            self.assertIn("release line 0.2 checkout", lines[1])
+
+    def test_a_line_checkouts_install_sh_run_from_inside_another_checkout_still_defaults_to_its_head(self):
+        """The release-line read judges the script's own checkout, which is the tree
+        acquire_source_repo installs from, not the working directory: one checkout's
+        install.sh invoked by path from inside another kube-agents checkout resolves
+        as it would from its own directory, and the source check passes on that tag."""
+        with tempfile.TemporaryDirectory(prefix="release-line-elsewhere-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+            other = pathlib.Path(temp_dir) / "other-checkout"
+            (other / "scripts" / "installer").mkdir(parents=True)
+            (other / "scripts" / "installer" / "installer_common.sh").write_text("# marker\n")
+            (other / "install.sh").write_text(_INSTALL_SH.read_text())
+            setup = (
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{repo_path}/install.sh"\n'
+                'default_image_tag "."; echo "label=$(default_image_tag_label ".")"; '
+                f'tag=""; resolve_effective_image_tag tag "." "" && verify_local_source_ref "{repo_path}" "$tag" && echo verified\n'
+            )
+            proc = _run_installer_bash(setup, get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}), cwd=other)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            lines = proc.stdout.strip().splitlines()
+            self.assertEqual(lines[0], backport)
+            self.assertIn("release line 0.2 checkout", lines[1])
+            self.assertIn("verified", proc.stdout)
+            self.assertNotIn("--image-tag and IMAGE_TAG unset", proc.stdout + proc.stderr)
+
+    def test_a_piped_release_installer_keeps_its_release_whatever_checkout_it_resolves_to(self):
+        """The baked version belongs to the running script. A release's install.sh that is
+        not the checkout's own file (piped, or run from another directory) keeps its release
+        as the default even when the checkout it resolves its sources to is a line past that
+        release, and the source check then fetches or refuses as before."""
+        with tempfile.TemporaryDirectory(prefix="release-line-piped-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+            proc = self._run_install_func('BAKED_RELEASE_VERSION="0.2.0"; default_image_tag "."; default_image_tag_label "."', cwd=repo_path)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip().splitlines(), ["0.2.0", "official release 0.2.0"])
+            # The refusal that follows says the running script is not this checkout's,
+            # not to fetch anything: the tags are here.
+            piped = self._run_install_func('BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "." "0.2.0"', cwd=repo_path)
+            self.assertNotEqual(piped.returncode, 0)
+            self.assertIn("is not this checkout's", piped.stdout + piped.stderr)
+            self.assertIn("run its own ./install.sh", piped.stdout + piped.stderr)
+            self.assertNotIn("git fetch", piped.stdout + piped.stderr)
+            # Tagless but stamped: the piped installer still leads with "run the checkout's
+            # own install.sh", naming the fetch that would also be needed, rather than a
+            # fetch alone that leaves the piped copy unable to recognise the checkout.
+            git("tag", "-d", "0.2.0")
+            tagless = self._run_install_func('BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "." "0.2.0"', cwd=repo_path)
+            self.assertNotEqual(tagless.returncode, 0)
+            self.assertIn("run its own ./install.sh", tagless.stdout + tagless.stderr)
+            self.assertIn("once you fetch the tags (git fetch --tags)", tagless.stdout + tagless.stderr)
+            # Standing in a checkout that lacks the tag and the stamp, the piped installer's
+            # refusal does not tell the operator their checkout's scripts carry the release.
+            (repo_path / "install.sh").write_text(_INSTALL_SH.read_text())
+            refused = self._run_install_func('BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "." "0.2.0"', cwd=repo_path)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("is not present in the current checkout", refused.stdout + refused.stderr)
+            self.assertNotIn("release line", refused.stdout + refused.stderr)
+            self.assertNotIn("git fetch --tags", refused.stdout + refused.stderr)
+
+    def test_a_line_checkout_without_the_release_tag_is_refused_and_told_to_fetch_it(self):
+        """Without the tag the shape cannot be recognised, so the baked default and the
+        refusal stand; the refusal says why and what to do."""
+        with tempfile.TemporaryDirectory(prefix="release-line-tagless-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+            git("tag", "-d", "0.2.0")
+            proc = self._run_fixture_install_func(
+                repo_path, 'default_image_tag "."; tag=""; resolve_effective_image_tag tag "." "" && verify_local_source_ref "." "$tag"'
+            )
+            self.assertEqual(proc.stdout.strip().splitlines()[0], "0.2.0")
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("git fetch --tags", proc.stdout + proc.stderr)
+            self.assertNotIn("--unshallow", proc.stdout + proc.stderr)
+            self.assertIn(f"--image-tag {backport}", proc.stdout + proc.stderr)
+
+    def test_a_shallow_line_clone_is_told_to_unshallow_and_is_recognised_once_it_does(self):
+        """`git fetch --tags` alone does not mend a --depth 1 clone of the line: the tag
+        arrives but HEAD's parents stay behind the graft, so the ancestry walk fails and
+        the run lands in the mismatch refusal. That refusal names the shallow history;
+        after `git fetch --unshallow` the checkout is recognised."""
+        with tempfile.TemporaryDirectory(prefix="release-line-shallow-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+            shallow = pathlib.Path(temp_dir) / "shallow"
+            subprocess.run(["git", "clone", "-q", "--depth", "1", "--branch", "release/0.2", f"file://{repo_path}", str(shallow)], check=True)
+            sgit = lambda *args: subprocess.run(["git", *args], cwd=str(shallow), check=True, capture_output=True, text=True).stdout.strip()
+            probe = 'default_image_tag "."; tag=""; resolve_effective_image_tag tag "." "" && verify_local_source_ref "." "$tag"'
+
+            tagless = self._run_fixture_install_func(shallow, probe)
+            self.assertNotEqual(tagless.returncode, 0)
+            self.assertIn("git fetch --tags", tagless.stdout + tagless.stderr)
+            self.assertIn("git fetch --unshallow", tagless.stdout + tagless.stderr)
+
+            sgit("fetch", "-q", "--tags", "origin")
+            self.assertEqual(sgit("rev-parse", "--is-shallow-repository"), "true")
+            tagged = self._run_fixture_install_func(shallow, probe)
+            self.assertNotEqual(tagged.returncode, 0)
+            self.assertIn("Source/image version mismatch", tagged.stdout + tagged.stderr)
+            self.assertIn("git fetch --unshallow", tagged.stdout + tagged.stderr)
+            self.assertNotIn("git fetch --tags", tagged.stdout + tagged.stderr)
+
+            sgit("fetch", "-q", "--unshallow", "origin")
+            deep = self._run_fixture_install_func(shallow, 'default_image_tag "."; verify_local_source_ref "." "$(default_image_tag ".")" && echo verified')
+            self.assertEqual(deep.returncode, 0, deep.stdout + deep.stderr)
+            self.assertEqual(deep.stdout.strip().splitlines()[0], backport)
+            self.assertIn("verified", deep.stdout)
+
+            # A shallow clone deep enough to hold the release is recognised, and asked
+            # for the release by name it is told what it is, not to unshallow.
+            enough = pathlib.Path(temp_dir) / "deep-enough"
+            subprocess.run(["git", "clone", "-q", "--depth", "2", "--branch", "release/0.2", f"file://{repo_path}", str(enough)], check=True)
+            subprocess.run(["git", "fetch", "-q", "--tags", "origin"], cwd=str(enough), check=True)
+            self.assertEqual(subprocess.run(["git", "rev-parse", "--is-shallow-repository"], cwd=str(enough), capture_output=True, text=True).stdout.strip(), "true")
+            recognised = self._run_fixture_install_func(enough, 'default_image_tag "."')
+            self.assertEqual(recognised.stdout.strip(), backport)
+            by_name = self._run_fixture_install_func(enough, 'verify_local_source_ref "." "0.2.0"')
+            self.assertNotEqual(by_name.returncode, 0)
+            self.assertIn("release line 0.2 at", by_name.stdout + by_name.stderr)
+            self.assertNotIn("--unshallow", by_name.stdout + by_name.stderr)
+
+    def test_the_stamp_line_is_read_with_the_same_grammar_as_upgrade_sh(self):
+        """release_version_of_source_tree strips quotes and whitespace; install.sh reads the
+        tree's stamp the same way, so one tree is a line checkout to both front doors."""
+        for spelling in ("BAKED_RELEASE_VERSION='0.2.0'", 'BAKED_RELEASE_VERSION="0.2.0" ', "BAKED_RELEASE_VERSION=0.2.0"):
+            with self.subTest(spelling=spelling), tempfile.TemporaryDirectory(prefix="release-line-grammar-") as temp_dir:
+                repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+                text = (repo_path / "install.sh").read_text().replace('BAKED_RELEASE_VERSION="0.2.0"', spelling, 1)
+                (repo_path / "install.sh").write_text(text)
+                git("commit", "-q", "-am", "chore: respell the stamp")
+                head = git("rev-parse", "HEAD")
+                proc = self._run_fixture_install_func(repo_path, 'default_image_tag "."')
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout.strip(), head)
+
     def test_default_image_tag_resolves_semver_when_multiple_tags_present(self):
         """Verifies default_image_tag prefers numeric SemVer tag over rc_*_validated tags on the same commit."""
         temp_dir, repo_dir, git = create_mock_git_repo()
@@ -5284,8 +5524,10 @@ class UnrecordedInterviewAnswersAreReportedTest(unittest.TestCase):
         source = _INSTALL_SH.read_text()
         body = source.split("warn_unrecorded_interview_answers() {")[1]
         # The key list itself, not the comment above it that names these two as
-        # the examples of what to leave out.
-        keys = body.split("for key in ")[1].split("; do")[0]
+        # the examples of what to leave out. The list is an array so that the
+        # cache priming and the loop read one copy of it, so this reads the
+        # array literal rather than the `for` line.
+        keys = body.split("local interview_keys=(")[1].split(")")[0]
         self.assertIn("MEMORY", keys, "sanity: the list was located")
         self.assertNotIn("ENABLE_GKE_BACKUP_PLAN", keys)
         self.assertNotIn("GVISOR_POOL_NAME", keys)
@@ -6209,6 +6451,24 @@ echo "$rc" > "{rc_file}"
         self.assertIn("the wrapped output", log_file.read_text())
 
 
+def _env_without_ambient_drift_keys(overrides=None, asked_for=None):
+    """get_isolated_test_env, minus the two keys the drift guards read.
+
+    get_isolated_test_env starts from os.environ, so anything exported in the
+    shell that runs pytest reaches the script under test. For most keys that
+    is harmless. These two are the guards' own inputs: an exported
+    ENABLE_DRIFT_DETECTOR arrives at parse_args indistinguishable from an
+    operator's choice, and every assertion below about the unset default then
+    turns on whose machine is running. Dropped unless the caller asked for
+    them, in which case the caller's value is the point of the test.
+    """
+    env = get_isolated_test_env(overrides=overrides)
+    for key in ("ENABLE_DRIFT_DETECTOR", "TF_VAR_enable_drift_pubsub"):
+        if key not in (asked_for or {}):
+            env.pop(key, None)
+    return env
+
+
 class DomainScopedFlagsTest(unittest.TestCase):
     """The CLI surface issue #1540 defines.
 
@@ -6225,6 +6485,15 @@ class DomainScopedFlagsTest(unittest.TestCase):
         installer_common.sh is sourced too, in the order main() does it:
         source_provisioning_helpers runs at step 2, so every function reached
         below has is_truthy and the DEFAULT_* set by the time it runs.
+
+        stdin is /dev/null for the reason _run_installer_bash gives, applied
+        ahead of the need: the reader executes install.env, so a line of it
+        that reads standard input would block a developer running this module
+        from a shell while CI, whose fd 0 is already closed, stayed green. No
+        QUOTING_SPELLINGS row does -- the two ending in `cat` are pipelines,
+        where `cat` reads the pipe and gets EOF when the assignment exits --
+        but a row that did would hang forty evaluations deep with nothing on
+        screen.
         """
         with tempfile.TemporaryDirectory() as tmp:
             env_file = pathlib.Path(tmp) / "install.env"
@@ -6240,7 +6509,8 @@ class DomainScopedFlagsTest(unittest.TestCase):
                 ["bash", "-c", script],
                 capture_output=True,
                 text=True,
-                env=get_isolated_test_env(overrides=overrides),
+                stdin=subprocess.DEVNULL,
+                env=_env_without_ambient_drift_keys(overrides, env),
                 cwd=str(_REPO_ROOT),
             )
 
@@ -6303,6 +6573,7 @@ class DomainScopedFlagsTest(unittest.TestCase):
         "--enable-gke-backup-plan": "PARAM_ENABLE_GKE_BACKUP_PLAN",
         "--enable-pubsub-platform": "PARAM_ENABLE_PUBSUB_PLATFORM",
         "--enable-stockout-investigator": "PARAM_ENABLE_STOCKOUT_INVESTIGATOR",
+        "--enable-drift-detector": "PARAM_ENABLE_DRIFT_DETECTOR",
         "--enable-google-chat": "PARAM_ENABLE_GOOGLE_CHAT",
         "--enable-slack": "PARAM_ENABLE_SLACK",
     }
@@ -6539,6 +6810,985 @@ class DomainScopedFlagsTest(unittest.TestCase):
             combined = proc.stdout + proc.stderr
             self.assertIn("applies to this run only", combined)
             self.assertIn("records no ENABLE_GKE_BACKUP_PLAN", combined)
+
+    def test_the_drift_detector_flag_says_so_when_it_beats_a_recorded_value(self):
+        """Reversing this one destroys the audit-log ingress and its backlog.
+
+        ENABLE_DRIFT_DETECTOR is the one key write_tfvars_from_state writes two
+        tfvars keys from, and the only boolean it omits rather than writing
+        false. A later run without it therefore writes neither key,
+        enable_drift_pubsub falls back to its default, and the apply destroys
+        the sink, topic and subscription along with whatever the subscription
+        was still retaining. install.sh applies with -auto-approve, so that
+        plan is never put in front of anyone.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("ENABLE_DRIFT_DETECTOR=false\n")
+            proc = self._parse(
+                "--enable-drift-detector",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("applies to this run only", combined)
+            self.assertIn("ENABLE_DRIFT_DETECTOR=false", combined)
+            self.assertIn("subscription", combined)
+            # Destruction, not merely a stopped detector: this install has no
+            # TF_VAR_enable_drift_pubsub line, so dropping the two tfvars keys
+            # takes the ingress with them. The test below is the same run with
+            # that line present, and the two strings have to differ.
+            self.assertIn("the apply destroys", combined)
+            self.assertIn(
+                "repeat --enable-drift-detector on every later install.sh run",
+                combined,
+            )
+            # The remedy has to name upgrade.sh, because it takes no
+            # --enable-drift-detector: an operator who reads "repeat the flag"
+            # and does exactly that keeps the ingress across install.sh re-runs
+            # and loses it on their first upgrade, which is the run this
+            # warning exists to head off.
+            self.assertIn("upgrade.sh takes no such flag", combined)
+            # And it has to say what upgrade.sh regenerates from, correctly.
+            # "from the file alone" was wrong: write_tfvars_from_state reads
+            # ${ENABLE_DRIFT_DETECTOR:-...} out of the environment, and
+            # upgrade.sh clears only PROJECT_ID, CLUSTER_NAME and REGION before
+            # sourcing install.env over whatever it inherited, so an exported
+            # value provisions the sink, topic and subscription on that front
+            # door with no guard on it at all -- and the next upgrade from a
+            # shell without the export destroys them. Telling the operator that
+            # route does not exist is the one thing this sentence must not do.
+            # test_an_exported_value_survives_the_file_load_into_the_tfvars in
+            # tests/test_installer_common.py pins the behaviour it describes.
+            self.assertIn("whatever the calling shell still exports", combined)
+            self.assertNotIn("from the file alone", combined)
+
+    def test_the_drift_detector_warning_reaches_an_exported_value(self):
+        """The environment is a supported route, and it bypassed the guard.
+
+        installer_common.sh documents precedence as install.defaults.env → an
+        exported environment variable → install.env → a flag, and install.env
+        only outranks the export for a key it actually assigns. So
+        `ENABLE_DRIFT_DETECTOR=true ./install.sh` over a file predating the key
+        provisions the sink, topic and subscription, and the next upgrade.sh --
+        run from a shell without that export, reading the file alone --
+        destroys them under -auto-approve. A guard keyed on "was the flag
+        typed" cannot see this run at all.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\n")
+            proc = self._parse(
+                "-y",
+                "resolve_shared_defaults\n"
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+                env={"ENABLE_DRIFT_DETECTOR": "true"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("applies to this run only", combined)
+            self.assertIn("records no ENABLE_DRIFT_DETECTOR", combined)
+            self.assertIn("a later run without it writes neither", combined)
+            self.assertIn("the apply destroys", combined)
+
+    def test_turning_the_drift_detector_off_says_this_apply_destroys_them(self):
+        """The consequence is not symmetrical, and the timing inverts with it.
+
+        Turning the key on leaves the loss for a later run. Turning it off over
+        a file that records it on does the destroying in THIS apply -- the run
+        writes neither tfvars key -- and the later run re-reads the file and
+        provisions them again, empty. Told the deferred story here, the
+        operator reads "a later run destroys it" at the moment it is going.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("ENABLE_DRIFT_DETECTOR=true\n")
+            proc = self._parse(
+                "--enable-drift-detector=false",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("applies to this run only", combined)
+            self.assertIn("this apply destroys", combined)
+            self.assertNotIn("a later run without it writes neither", combined)
+
+    def test_turning_it_off_repeats_the_flag_with_the_value_that_was_typed(self):
+        """A bare boolean flag means true, so the remedy has to carry =false.
+
+        flag_bool_value reads --enable-drift-detector with no `=` as true.
+        "repeat --enable-drift-detector on every later install.sh run" therefore
+        told an operator who had just typed =false to do the opposite: following
+        it re-provisions the ingress this very run dropped, and the file, still
+        recording true, leaves the guard silent the next time round.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("ENABLE_DRIFT_DETECTOR=true\n")
+            proc = self._parse(
+                "--enable-drift-detector=false",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("repeat --enable-drift-detector=false on", combined)
+            self.assertNotIn("repeat --enable-drift-detector on", combined)
+
+    def test_the_repeated_flag_carries_its_value_for_every_boolean_key(self):
+        """The fix belongs to the helper, not to the drift call site.
+
+        ENABLE_GKE_BACKUP_PLAN is the other boolean through here and had the
+        same inverted remedy. Asserting it is what stops a later reader moving
+        the value-rendering into bootstrap_install_env_file's drift branch,
+        where the next boolean key added would inherit the bug again.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("ENABLE_GKE_BACKUP_PLAN=true\n")
+            proc = self._parse(
+                "--enable-gke-backup-plan=false",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("repeat --enable-gke-backup-plan=false on", combined)
+            self.assertNotIn("repeat --enable-gke-backup-plan on", combined)
+
+    def test_the_repeated_flag_is_canonical_even_when_the_value_is_not(self):
+        """The remedy has to be a command the installer accepts.
+
+        The chosen value does not have to arrive as a flag. PARAM_* is seeded
+        from the environment verbatim, so `ENABLE_GKE_BACKUP_PLAN=no
+        ./install.sh` reaches here as the string `no` -- which is_truthy reads
+        as off, and which validate_bool_flag_value refuses: it matches only the
+        literals `true` and `false` and exits 1 with "must be either true or
+        false". Pasting the spelling back would print a remedy that aborts the
+        run it is telling the operator to make. The warning line above already
+        names what was given; this line renders the canonical spelling of it.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("NAMESPACE=kubeagents-system\n")
+            proc = self._parse(
+                "",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+                env={"ENABLE_GKE_BACKUP_PLAN": "no"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("records no ENABLE_GKE_BACKUP_PLAN", combined)
+            self.assertIn("repeat --enable-gke-backup-plan=false on", combined)
+            self.assertNotIn("repeat --enable-gke-backup-plan=no", combined)
+
+    def test_a_hand_written_tf_var_ingress_is_not_reported_as_destroyed(self):
+        """Nothing is destroyed on the one install most likely to read this.
+
+        TF_VAR_enable_drift_pubsub=true in install.env was the only front-door
+        route to the ingress before this key existed, and it still works:
+        write_tfvars_from_state omits both drift keys rather than writing
+        false, deliberately, and a tfvars key beats TF_VAR_. So dropping them
+        stops the detector and leaves the sink, topic and subscription
+        standing. Telling that operator their audit records are about to be
+        deleted is how a warning gets discounted.
+
+        The guard reads the line out of the file. load_install_env is called
+        here anyway because the real run reaches the guard with the same value
+        already in the environment — bootstrap_install_env sources install.env
+        at startup, and the interactive path reloads it with load_install_env
+        before opening the panel, both under `set -a`. So this is the call
+        order where the two sources agree, and the test below is the one where
+        they do not.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text(
+                "ENABLE_DRIFT_DETECTOR=false\nTF_VAR_enable_drift_pubsub=true\n"
+            )
+            proc = self._parse(
+                "--enable-drift-detector",
+                f'load_install_env "{destination}"\n'
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("applies to this run only", combined)
+            self.assertIn("a later run without it writes neither", combined)
+            self.assertIn("keeps the Log Router sink", combined)
+            self.assertNotIn("destroys", combined)
+
+    def test_a_commented_tf_var_ingress_line_is_read_the_way_bash_reads_it(self):
+        """A trailing `# comment` is not part of the value, and bash agrees.
+
+        install.env is sourced, so `TF_VAR_enable_drift_pubsub=true # keeps
+        the ingress on` puts `true` in the environment and Terraform sees the
+        ingress asked for. Reading everything after the first `=` gives
+        `true # keeps the ingress on`, is_truthy strips all whitespace and
+        matches the whole string, and the guard falls to the destroyed-ingress
+        consequence -- telling the operator whose sink survives that their
+        audit records are going. That is the falsehood the round before this
+        one removed, arriving back through the reader.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text(
+                "ENABLE_DRIFT_DETECTOR=false\n"
+                "TF_VAR_enable_drift_pubsub=true # keeps the ingress on\n"
+            )
+            proc = self._parse(
+                "--enable-drift-detector",
+                f'load_install_env "{destination}"\n'
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("keeps the Log Router sink", combined)
+            self.assertNotIn("destroys", combined)
+
+    def test_a_commented_recorded_value_does_not_invent_a_reversal(self):
+        """The same read, the other way round, on the key the guard compares.
+
+        `ENABLE_DRIFT_DETECTOR=true # on` is `true` to bash, so a run that
+        passes --enable-drift-detector agrees with the file and there is
+        nothing to announce. Read with the comment attached, the recorded value
+        is off, the chosen value is on, and the guard warns about a reversal
+        the next run cannot perform.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("ENABLE_DRIFT_DETECTOR=true # on\n")
+            proc = self._parse(
+                "--enable-drift-detector",
+                f'load_install_env "{destination}"\n'
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertNotIn("applies to this run only", combined)
+
+    # Every spelling a review round found, as (key, what the file says). The
+    # reader sources the file rather than parsing it, so this no longer has to
+    # anticipate anything -- it is the regression record of what a parser got
+    # wrong, kept because a future reader that stops sourcing would have to
+    # rediscover the whole list.
+    #
+    # Three groups. A to K are where the value ends: a '#' starts a comment
+    # only at the start of a word, not mid-word, inside either quote, or
+    # backslash-escaped, which is how %q writes SLACK_HOME_CHANNEL="#gke-alerts".
+    # L to AD are whether bash assigns at all: a word after the value can make
+    # the assignment a one-command prefix and leave the key unset (P to S, AC),
+    # unless the word is a second assignment (T) or an argument to `export`
+    # (U, W); a redirection leaves it standing but does not end the command, so
+    # a pipeline or a background job after one still takes it away (X, Y); and
+    # `&>` and `>&` are single operators, not the `&` that backgrounds (Z, AB).
+    # AE onwards are the ones only a shell can answer: expansions, substitution,
+    # a reassignment further down, `declare` and `readonly`, a continued line,
+    # and two keys off one `export`.
+    #
+    # AL stays here although an install.env spelled that way never finishes a
+    # run: `main` exports the resolved value of every key it owns, and the
+    # export fails on a readonly name. This table is about the reader agreeing
+    # with bash, not about what the front door will run, so the row is right
+    # where the recorded-spellings list next to
+    # test_a_spelling_only_bash_sees_still_counts_as_recorded leaves it out.
+    #
+    # AS is the one only *this* shell can answer. install.defaults.env is
+    # sourced without `set -a`, so DEFAULT_* are unexported, and a reader that
+    # evaluates the file in a `bash -c` child reads AS empty where both live
+    # readers read `true`.
+    #
+    # `&>>` is left out. bash 4 reads it as one operator and bash 3.2 -- which
+    # is what macOS ships -- as `&>` followed by a stray `>`, a syntax error
+    # that aborts the source at that line and takes every row after it with it.
+    # The reader and load_install_env still agree about such a file, because
+    # both of them source it and both stop in the same place; what cannot go in
+    # this table is a row whose effect is the rest of the table.
+    #
+    # AE expands KUBE_AGENTS_INSTALL_ENV rather than HOME for that same reason.
+    # The class it is here for is "an exported variable the calling shell
+    # holds", and HOME is that variable on a developer's machine and not in
+    # every runner: a systemd system unit or a container with no passwd entry
+    # has none, install.sh runs under `set -u`, and `$HOME` then aborts the
+    # source at AE and empties every row below it -- so the failure surfaces as
+    # a mismatch at AS rather than as anything naming HOME.
+    # TheCloneDirectoryNeedsHomeOnlyWhenCloningTest is where that environment
+    # is the subject; here it was only the carrier. _parse puts
+    # KUBE_AGENTS_INSTALL_ENV in the child's environment on every call, so the
+    # row tests the same expansion against a variable this suite guarantees.
+    QUOTING_SPELLINGS = [
+        ("A", "A=true # comment"),
+        ("B", "B=#hash"),
+        ("C", "C=x#y"),
+        ("D", 'D="a # b"'),
+        ("E", "E=x\\#y"),
+        ("F", "F='a # b'"),
+        ("G", "G=true   "),
+        ("H", 'H="a "'),
+        ("I", "I=trailing\\ space\\ "),
+        ("J", "J='a' # after a quote"),
+        ("K", "K=  "),
+        ("L", "L=true; export L"),
+        ("M", "M=true && true"),
+        ("N", "N=true > /dev/null"),
+        ("O", "O=true 2>/dev/null"),
+        ("P", "P= true"),
+        ("Q", "Q=true true"),
+        ("R", "R=true | cat"),
+        ("S", "S=true &"),
+        ("T", "T=true SECOND_ASSIGNMENT=2"),
+        ("U", "export U=true ANOTHER_ASSIGNMENT=2"),
+        ("W", "export W=true ANOTHER_ASSIGNMENT"),
+        ("X", "X=true 2>/dev/null | cat"),
+        ("Y", "Y=true >/dev/null &"),
+        ("Z", "Z=true &>/dev/null"),
+        ("AB", "AB=true >&2"),
+        ("AC", "AC=true THIRD_ASSIGNMENT=2 true"),
+        ("AD", "AD=a>/dev/null"),
+        ("AE", "AE=$KUBE_AGENTS_INSTALL_ENV"),
+        ("AF", 'AF="${NOPE:-true}"'),
+        ("AG", "AG=$(printf true)"),
+        ("AH", "AH=`printf true`"),
+        ("AJ", "AJ=first\nAJ=true"),
+        ("AK", "declare -x AK=true"),
+        ("AL", "readonly AL=true"),
+        ("AM", "AM=one\\\ntwo"),
+        ("AN", "AN=~"),
+        ("AQ", "export AQ=true AR=2"),
+        ("AR", "export AQ=true AR=2"),
+        ("AS", "AS=$DEFAULT_ENABLE_GVISOR"),
+    ]
+
+    def test_the_recorded_value_is_what_sourcing_the_file_would_assign(self):
+        """bash is the authority, because bash is the other reader.
+
+        load_install_env sources install.env, so every guard that compares a
+        recorded value against a chosen one is comparing against what bash put
+        in the environment. recorded_install_env_value sources it too, which is
+        what makes the two agree on the spelling nobody thought of; this is the
+        test that the sourcing stays sourcing, and it fails on the day someone
+        replaces it with a parser that is right about the table and wrong about
+        the next line anyone writes.
+
+        The yardstick is load_install_env itself rather than a `source` this
+        test writes, because a reader can match a `source` and still miss what
+        the install reads back. Both live readers source inside a function, and
+        `declare -x K=v` there is a local that is gone when the function
+        returns — so a top-level yardstick and a top-level reader agree on
+        `true` for a line the install never sees.
+        """
+        keys = [key for key, _ in self.QUOTING_SPELLINGS]
+        # dict.fromkeys: AQ and AR are two keys off one line, and writing that
+        # line twice would be harmless but puzzling to read.
+        lines = list(dict.fromkeys(line for _, line in self.QUOTING_SPELLINGS))
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "spellings.env"
+            env_file.write_text("\n".join(lines) + "\n")
+            body = "\n".join(
+                [
+                    f'for k in {" ".join(keys)}; do',
+                    f'  printf "READER\\t%s\\t[%s]\\n" "$k" "$(recorded_install_env_value \'{env_file}\' "$k")"',
+                    "done",
+                    # Unset first, as the reader does inside its subshell, so
+                    # that an exported P or R in the shell running pytest
+                    # cannot answer for a row whose whole point is that it
+                    # assigns nothing. Without this the yardstick reads the
+                    # ambient environment and the row fails against a reader
+                    # that was right. Nothing here is readonly yet: AL becomes
+                    # so only when the next line sources the file.
+                    f'unset {" ".join(keys)}',
+                    # load_install_env, not a top-level `source`. The scope is
+                    # part of the answer: `declare -x AK=true` is a global at
+                    # the top level of a script and a local inside a function,
+                    # so a top-level yardstick agrees with a top-level reader
+                    # about a key that neither live reader ever leaves behind.
+                    f"load_install_env '{env_file}'",
+                    f'for k in {" ".join(keys)}; do',
+                    # ${!k-}, not ${!k}: install.sh runs under set -u, and P
+                    # through S, X, Y and AC are spellings that leave the key
+                    # unset, which is the point of them. Empty is also what the
+                    # reader returns for a key the file never mentions, so the
+                    # comparison below is between the same two answers.
+                    '  printf "BASH\\t%s\\t[%s]\\n" "$k" "${!k-}"',
+                    "done",
+                ]
+            )
+            proc = self._parse("", body)
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        seen = {"READER": {}, "BASH": {}}
+        for line in proc.stdout.splitlines():
+            if "\t" in line and line.split("\t", 1)[0] in seen:
+                which, key, value = line.split("\t", 2)
+                seen[which][key] = value
+        for key in keys:
+            with self.subTest(spelling=key):
+                self.assertIn(key, seen["BASH"], proc.stdout)
+                self.assertEqual(
+                    seen["BASH"][key],
+                    seen["READER"].get(key),
+                    f"recorded_install_env_value disagrees with sourcing the file for {key}",
+                )
+        # Pinned separately, because agreement alone does not catch the way
+        # this went wrong: move the reader back to a top-level `source` and a
+        # top-level yardstick moves with it, both reporting `true` for a line
+        # whose value dies with the function that read it. `declare -x` is the
+        # one row in the table where the scope decides the answer.
+        self.assertEqual(
+            "[]",
+            seen["BASH"]["AK"],
+            "a `declare -x` line assigns a function-local, so neither live "
+            f"reader keeps it: {proc.stdout}",
+        )
+        # AS is the row that fails if the reader ever evaluates the file in a
+        # child process again, and it only carries that weight while the
+        # yardstick is non-empty: DEFAULT_ENABLE_GVISOR has to be a variable
+        # this shell holds and does not export. Asserted rather than assumed,
+        # because a default that moved would leave the row agreeing on empty
+        # and testing nothing.
+        self.assertNotEqual(
+            "[]",
+            seen["BASH"]["AS"],
+            "AS tests nothing unless install.defaults.env still sets "
+            f"DEFAULT_ENABLE_GVISOR: {proc.stdout}",
+        )
+
+    def test_reading_many_keys_evaluates_the_file_once(self):
+        """install.env is shell, so an evaluation can cost a network call.
+
+        A value that is a command substitution fetching a secret is a
+        documented shape, and the interview guard asks about twenty-three
+        keys. A reader that sources per key ran that command twenty-three
+        times per interactive re-run, with the exit swallowed and the value
+        silently empty on any one of them that failed.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "counting.env"
+            marks = pathlib.Path(tmp) / "marks"
+            env_file.write_text(f'printf x >> "{marks}"\nA=1\nB=2\nC=3\n')
+            # D is the key that makes this test reach the live callers' shape.
+            # Asking for exactly the keys the file defines leaves every one of
+            # them answered, and a reader that evaluates the file a second
+            # time for the unanswered ones would short-circuit before doing
+            # it -- so the assertion below would hold for a reader that does
+            # evaluate twice. Both real callers ask about a key the file will
+            # often not have: bootstrap_install_env_file asks for
+            # TF_VAR_enable_drift_pubsub alongside ENABLE_DRIFT_DETECTOR, and
+            # install.sh writes no TF_VAR_ key at all;
+            # warn_unrecorded_interview_answers asks for
+            # PLATFORM_AGENT_CUSTOM_ROLES, which install.sh writes only when
+            # PLATFORM_AGENT_PERMISSION_SET is `custom`.
+            keys = "A B C D"
+            proc = self._parse(
+                "",
+                "\n".join(
+                    [
+                        f"read_recorded_install_env_values '{env_file}' {keys}",
+                        f"for k in {keys}; do",
+                        f"  printf '%s\\n' "
+                        f'"$(recorded_install_env_value \'{env_file}\' "$k")"',
+                        f'  install_env_records_key \'{env_file}\' "$k" '
+                        '|| printf "unrecorded %s\\n" "$k"',
+                        "done",
+                    ]
+                ),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertEqual(
+                ["unrecorded D"],
+                [l for l in proc.stdout.splitlines() if l.startswith("unrecorded")],
+                f"only D is absent from the file: {proc.stdout}",
+            )
+            self.assertEqual(
+                "x",
+                marks.read_text(),
+                "four values and four presence tests, one of them for a key "
+                "the file does not assign, and one evaluation of the file: "
+                f"{proc.stdout}",
+            )
+
+    def test_a_second_file_is_not_answered_from_the_first_ones_cache(self):
+        """The cache is keyed on the file, and nothing else would notice.
+
+        No caller in install.sh reads two files in one run today: the drift
+        branch and the interview guard are both handed the same path. That is
+        what makes this worth pinning rather than dropping -- a cache whose
+        invalidation is never exercised is a cache that answers the wrong
+        file's value on the day a third caller arrives, and the failure is a
+        guard quietly comparing against a file the operator did not name.
+
+        Each read is primed in this shell first, because that is the shape
+        that can go wrong: a bare `$(recorded_install_env_value ...)` primes
+        inside a subshell that then exits, so it would re-evaluate the right
+        file every time and pass with the invalidation deleted.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            first = pathlib.Path(tmp) / "first.env"
+            second = pathlib.Path(tmp) / "second.env"
+            first.write_text("A=from-first\n")
+            second.write_text("A=from-second\n")
+            proc = self._parse(
+                "",
+                "\n".join(
+                    [
+                        line
+                        for path in (first, second, first)
+                        for line in (
+                            f"read_recorded_install_env_values '{path}' A",
+                            f"printf '%s\\n' \"$(recorded_install_env_value '{path}' A)\"",
+                        )
+                    ]
+                ),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertEqual(
+                ["from-first", "from-second", "from-first"],
+                proc.stdout.split(),
+                f"the cache outlived the file it was keyed on: {proc.stdout}",
+            )
+
+    def test_a_line_that_expands_its_own_key_still_records(self):
+        """The unset and `set -u` are each right and together wrong.
+
+        The reader unsets every requested key before sourcing, so that what it
+        reports is what the file assigns rather than what the caller's
+        environment already held. install.sh runs under `set -u`, which the
+        subshell inherits. A file line that expands a key before assigning it
+        -- `K="$K,extra"`, the documented way to append to a list -- is then
+        the one place in the install where that key is unbound: the live
+        readers do not unset, so the same line is answered by whatever the
+        operator exported and the install carries on with a value.
+
+        Left under -u the assignment fails and the key stays unset, so the
+        reader reports the file as recording no K while the install is using
+        the K it records -- and every guard built on it inverts. The interview
+        guard stops warning about an answer the file really does not pin,
+        bootstrap_install_env_file stops seeing a detector the operator wrote
+        down, and nothing says why.
+
+        The neighbours are in the file because the batch is the unit: one
+        evaluation answers every key asked for, and a failure that aborted the
+        source would take the keys around it down too. It does not -- an
+        unbound expansion under -u fails that command, not the shell -- and
+        pinning BEFORE and AFTER is what would catch a fix that bought the
+        self-referential line by making the rest unreadable.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "self-referential.env"
+            env_file.write_text('BEFORE=1\nSELF="$SELF,extra"\nAFTER=1\n')
+            keys = "BEFORE SELF AFTER"
+            proc = self._parse(
+                "",
+                "\n".join(
+                    [
+                        # Exported into the sourcing shell on purpose: this is
+                        # the state the live readers are in, and it is what
+                        # makes the unset the only reason SELF is unbound. A
+                        # reader that stopped unsetting would pass this test
+                        # while reporting the caller's value instead of the
+                        # file's, which the value assertion below catches.
+                        "export SELF=from-the-environment",
+                        f"read_recorded_install_env_values '{env_file}' {keys}",
+                        f"for k in {keys}; do",
+                        f'  install_env_records_key \'{env_file}\' "$k" '
+                        '&& printf "records %s=[%s]\\n" "$k" '
+                        f'"$(recorded_install_env_value \'{env_file}\' "$k")" '
+                        '|| printf "unrecorded %s\\n" "$k"',
+                        "done",
+                    ]
+                ),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertEqual(
+                [],
+                [l for l in proc.stdout.splitlines() if l.startswith("unrecorded")],
+                f"the file assigns all three: {proc.stdout}",
+            )
+            # Empty-then-appended, not `from-the-environment,extra`: the unset
+            # is still in force, so what is reported is the file's own answer
+            # with nothing standing behind it. That is the honest one -- a line
+            # spelled this way pins no value, and the interview guard warning
+            # that this run's answer is unrecorded is correct rather than
+            # spurious.
+            self.assertIn(
+                "records SELF=[,extra]",
+                proc.stdout,
+                f"the unset must survive the fix for -u: {proc.stdout}",
+            )
+
+    def test_turning_it_off_on_a_tf_var_ingress_says_the_detector_stops(self):
+        """Both axes at once: the destroying is now, and nothing is destroyed.
+
+        The direction says this apply is where the change lands, and the
+        TF_VAR_ line says what lands is a stopped detector over an ingress that
+        goes on retaining records nothing reads. Either half alone gets the
+        sentence wrong.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text(
+                "ENABLE_DRIFT_DETECTOR=true\nTF_VAR_enable_drift_pubsub=true\n"
+            )
+            proc = self._parse(
+                "--enable-drift-detector=false",
+                f'load_install_env "{destination}"\n'
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("it stops the detector now", combined)
+            self.assertIn("keeps the Log Router sink", combined)
+            self.assertNotIn("destroys", combined)
+            self.assertNotIn("a later run without it writes neither", combined)
+
+    def test_an_exported_tf_var_ingress_is_still_reported_as_destroyed(self):
+        """The environment is not the file, and only the file survives the run.
+
+        An operator who provisioned the ingress with
+        `TF_VAR_enable_drift_pubsub=true ./install.sh` and recorded nothing has
+        the variable in this shell, indistinguishable from the sourced line --
+        nothing unsets TF_VAR_* between the two. But their next upgrade.sh from
+        a clean shell has neither the export nor a tfvars key, so
+        write_tfvars_from_state omits both, enable_drift_pubsub falls to its
+        false default, and the apply destroys the sink, topic and subscription
+        with the records retained there. A guard reading the environment would
+        promise that operator the opposite, and cite a line their install.env
+        does not contain.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("ENABLE_DRIFT_DETECTOR=false\n")
+            proc = self._parse(
+                "--enable-drift-detector",
+                f'load_install_env "{destination}"\n'
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+                env={"TF_VAR_enable_drift_pubsub": "true"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("the apply destroys", combined)
+            self.assertNotIn("keeps the Log Router sink", combined)
+
+    def test_turning_it_off_over_a_file_that_never_asked_says_nothing(self):
+        """Nothing diverges, so the destroyed-ingress line would be a lie.
+
+        A file with no ENABLE_DRIFT_DETECTOR line and a typed `=false` agree:
+        this run writes neither tfvars key and so would every later run. The
+        helper's unrecorded branch fires on any non-empty value, so the call
+        site has to withhold the value rather than let it print.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\n")
+            proc = self._parse(
+                "--enable-drift-detector=false",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertNotIn("ENABLE_DRIFT_DETECTOR", proc.stdout + proc.stderr)
+
+    def test_turning_it_off_over_an_exported_value_is_still_a_reversal(self):
+        """A silent file is not the same as nobody asking for the detector.
+
+        install.sh seeds PARAM_ENABLE_DRIFT_DETECTOR from an exported
+        ENABLE_DRIFT_DETECTOR (`PARAM_ENABLE_DRIFT_DETECTOR="${ENABLE_DRIFT_DETECTOR:-}"`,
+        with the rest of the PARAM defaults), which is the documented route that predates the
+        flag, so an operator can have provisioned the ingress from a shell
+        export with nothing in install.env to show for it. Typing `=false` over
+        that is the reversal this guard exists to announce and the worst one it
+        has: the =false binds this run only, and the next run from the same
+        shell re-reads the export, writes both keys and provisions the sink,
+        topic and subscription again -- empty, billing, and nothing said. The
+        recorded value alone cannot see it, so the test above (which withholds
+        the value when the file never asked) must not swallow this one.
+
+        The snippet re-exports ENABLE_DRIFT_DETECTOR from the chosen value
+        before calling the guard because main() does, a hundred lines before
+        it reaches bootstrap_install_env_file. Without that line the test
+        passes on a guard that reads the live environment, and production --
+        where the export has already landed -- stays silent on the one
+        population this branch exists for.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\n")
+            proc = self._parse(
+                "--enable-drift-detector=false",
+                'export ENABLE_DRIFT_DETECTOR="$PARAM_ENABLE_DRIFT_DETECTOR"\n'
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+                env={"ENABLE_DRIFT_DETECTOR": "true"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("this apply destroys", combined)
+            # Named, because "a later run without the flag" is ambiguous when
+            # the file is silent: the operator has to be told it is their own
+            # shell that brings the detector back, not a line they can edit.
+            self.assertIn("this shell exports", combined)
+
+    def test_turning_it_off_on_an_exported_tf_var_ingress_names_the_export(self):
+        """Whether this apply destroys the trio is a question about this apply.
+
+        Terraform reads TF_VAR_ out of the environment the front door hands it,
+        and nothing between here and the apply unsets TF_VAR_* -- load_install_env
+        clears NAMESPACE and the five SCOPE_ keys, upgrade.sh three more. So an
+        exported TF_VAR_enable_drift_pubsub keeps the sink, topic and
+        subscription through this run exactly as a file line would, and telling
+        that operator their audit records are being deleted is false. The
+        turning-on direction is the contrast and stays as it was
+        (test_an_exported_tf_var_ingress_is_still_reported_as_destroyed) --
+        that sentence is about a later run from an unknown shell, where only
+        the file line counts.
+
+        No caveat here, and that is the assertion. The file records the
+        detector on, so the run from a clean shell the caveat warns about
+        re-reads that line, writes both drift tfvars keys and provisions the
+        ingress -- which is what the rest of this same sentence promises when
+        it says a later run starts the detector again. The caveat holds only
+        where the shell is the last thing holding the trio up, which is the
+        test below.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("ENABLE_DRIFT_DETECTOR=true\n")
+            proc = self._parse(
+                "--enable-drift-detector=false",
+                f'load_install_env "{destination}"\n'
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+                env={"TF_VAR_enable_drift_pubsub": "true"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("it stops the detector now", combined)
+            self.assertIn("keeps the Log Router sink", combined)
+            self.assertIn("this shell's environment", combined)
+            self.assertNotIn("records neither key as on", combined)
+            self.assertNotIn("destroys them", combined)
+
+    def test_the_caveat_lands_when_the_shell_is_holding_up_both_halves(self):
+        """The one arrangement where the next clean shell really does take it.
+
+        Nothing in install.env: the detector is on because this shell exports
+        ENABLE_DRIFT_DETECTOR, and the ingress stands because the same shell
+        exports TF_VAR_enable_drift_pubsub. A later run from a shell with
+        neither reads neither, writes neither tfvars key, and
+        enable_drift_pubsub falls to its false default -- so the caveat is the
+        whole warning, and the sentence it joins names the export rather than
+        the file as what brings the detector back.
+
+        Both exports, which is the assertion this test exists for. A later run
+        that drops only TF_VAR_enable_drift_pubsub and keeps
+        ENABLE_DRIFT_DETECTOR=true seeds PARAM_ENABLE_DRIFT_DETECTOR, and
+        write_tfvars_from_state writes `enable_drift_pubsub = true` from it
+        (test_tfvars_writes_both_drift_keys_when_the_detector_is_on in
+        tests/test_installer_common.py) -- the trio is provisioned, not
+        destroyed. A caveat naming the TF_VAR_ export alone would promise that
+        operator a loss they do not take, and contradict its own next clause,
+        which tells them a later run re-reads the export and starts the
+        detector again.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\n")
+            proc = self._parse(
+                "--enable-drift-detector=false",
+                f'load_install_env "{destination}"\n'
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+                env={
+                    "ENABLE_DRIFT_DETECTOR": "true",
+                    "TF_VAR_enable_drift_pubsub": "true",
+                },
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("it stops the detector now", combined)
+            self.assertIn("this shell's environment", combined)
+            self.assertIn("records neither key as on", combined)
+            self.assertIn(
+                "keeping either ENABLE_DRIFT_DETECTOR or "
+                "TF_VAR_enable_drift_pubsub keeps them",
+                combined,
+            )
+            self.assertIn("from a shell exporting neither destroys them", combined)
+            # The wording this replaced, pinned as absent: it named the TF_VAR_
+            # export alone and so told an operator whose later shell keeps
+            # ENABLE_DRIFT_DETECTOR that their audit records go, which is the
+            # opposite of what that run does.
+            self.assertNotIn("from a shell without that export", combined)
+            self.assertIn("this shell exports", combined)
+
+    def test_an_unchosen_drift_detector_key_stays_empty_and_says_nothing(self):
+        """Empty through resolve_shared_defaults is what keeps this quiet.
+
+        warn_flag_beats_unrecorded_file_value reads an empty value as "nobody
+        chose". PARAM_ENABLE_GKE_BACKUP_PLAN relies on that and nothing fills
+        it; this key is deliberately left out of resolve_shared_defaults for
+        the same reason. Filled with DEFAULT_ENABLE_DRIFT_DETECTOR, it would
+        fire the destroyed-ingress warning on every install over a file
+        predating the key, which is every install there is.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\n")
+            # The emptiness is read out of the same run that asserts the
+            # silence, rather than from a second subprocess: _parse already
+            # sources install.sh with the environment this needs -- the drift
+            # keys scrubbed, and KUBE_AGENTS_INSTALL_ENV pinned so that
+            # INSTALL_ENV_FILE cannot fall to the install.env beside install.sh
+            # and be sourced under `set -a` before the PARAM is seeded.
+            #
+            # Printed between the two calls, because bootstrap_install_env_file
+            # is downstream of the question: what is asserted is what
+            # resolve_shared_defaults left, not what survived the write.
+            #
+            # The marker carries the value and not the key's name, so the
+            # silence assertion below still reads the whole of stdout.
+            proc = self._parse(
+                "-y",
+                "resolve_shared_defaults\n"
+                'printf "unchosen=[%s]\\n" "$PARAM_ENABLE_DRIFT_DETECTOR"\n'
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertIn(
+                "unchosen=[]",
+                proc.stdout,
+                f"resolve_shared_defaults must leave this one empty: {proc.stdout}",
+            )
+            self.assertNotIn("ENABLE_DRIFT_DETECTOR", proc.stdout + proc.stderr)
+
+    def test_the_drift_detector_warning_reads_both_sides_as_booleans(self):
+        """A recorded `True` and a flagged `true` agree, and say nothing.
+
+        The key travels the same routes ENABLE_GKE_BACKUP_PLAN does — a
+        hand-written install.env, and a GitHub variable copied in verbatim by
+        render_install_env.sh — so a string comparison would hand the operator
+        a destroyed-ingress warning for a reversal that cannot happen.
+        """
+        for recorded in ("True", "yes", "1", "on"):
+            with self.subTest(recorded=recorded):
+                with tempfile.TemporaryDirectory() as tmp:
+                    destination = pathlib.Path(tmp) / "existing.env"
+                    destination.write_text(f"ENABLE_DRIFT_DETECTOR={recorded}\n")
+                    proc = self._parse(
+                        "--enable-drift-detector=true",
+                        f'bootstrap_install_env_file "{destination}" v1.2.3',
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                    combined = proc.stdout + proc.stderr
+                    self.assertNotIn("ENABLE_DRIFT_DETECTOR", combined)
+
+    def test_a_spelling_only_bash_sees_still_counts_as_recorded(self):
+        """One reader decides both "does the file record it" and "as what".
+
+        These three lines all assign the key. Two of them defeat the
+        `^[[:space:]]*(export[[:space:]]+)?KEY=` pattern the guard used to test
+        presence with: the key second on one `export`, and a plain assignment
+        after a `;`. While the value came from sourcing and presence came from
+        that pattern, a file spelled either way and recording exactly the
+        flagged value earned `records no ENABLE_DRIFT_DETECTOR` on every
+        flagless run, followed by the destroyed-ingress consequence for a
+        reversal the next run cannot perform — it re-reads the same line.
+
+        The third, a leading-whitespace assignment, does match that pattern:
+        `^[[:space:]]*` admits it. It is in the list anyway, because the claim
+        is that one reader answers both halves for every spelling bash accepts
+        — which has to include the spellings the grep already got right. A
+        reader that bought the first two by losing this one would not be an
+        improvement, and nothing else here would catch that.
+
+        Three spellings are deliberately not in the list, for three reasons.
+        `declare -x` assigns a local inside the function both live readers
+        source from, so the file really does not record it, and the reader
+        agreeing with the pattern there is correct rather than lucky.
+        `readonly` does record it — it makes a global, and the parity table's
+        AL row pins the reader reading it back — but a file spelled that way
+        never reaches this guard: `main` exports the resolved value later
+        (`export ENABLE_DRIFT_DETECTOR=...`), which fails on a readonly name
+        and, under `set -e`, aborts the run. That is true of every key the
+        install exports, ENABLE_PUBSUB_PLATFORM included, so it is a property
+        of install.env rather than of this flag — but certifying the spelling
+        here would say the front door accepts a file it stops on.
+
+        The third is `: ${ENABLE_DRIFT_DETECTOR:=true}`, and the reason is the
+        reader's own `unset`. Neither live reader unsets the key, so the `:=`
+        fires only when the calling shell has not already set it: over an
+        exported ENABLE_DRIFT_DETECTOR the install reads the export and the
+        reader reads `true`, and certifying the spelling here would say the
+        two agree where they do not.
+        test_the_reader_and_the_install_diverge_on_a_default_assignment pins
+        that divergence rather than hiding it, and the `unset` comment in
+        install.sh says why the reader keeps it anyway.
+
+        Nothing is warned about and the value is read back as `true`, which is
+        the second half of the claim: a reader that found the line and mis-read
+        the value would clear the presence assertion alone.
+        """
+        for line in (
+            "export TF_VAR_enable_drift_pubsub=true ENABLE_DRIFT_DETECTOR=true",
+            "PROJECT_ID=p; ENABLE_DRIFT_DETECTOR=true",
+            "  ENABLE_DRIFT_DETECTOR=true",
+        ):
+            with self.subTest(line=line):
+                with tempfile.TemporaryDirectory() as tmp:
+                    destination = pathlib.Path(tmp) / "existing.env"
+                    destination.write_text(line + "\n")
+                    proc = self._parse(
+                        "--enable-drift-detector=true",
+                        f'bootstrap_install_env_file "{destination}" v1.2.3\n'
+                        f"printf 'VALUE=[%s]\\n' "
+                        f"\"$(recorded_install_env_value '{destination}' ENABLE_DRIFT_DETECTOR)\"",
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                    self.assertNotIn(
+                        "records no ENABLE_DRIFT_DETECTOR",
+                        proc.stdout + proc.stderr,
+                    )
+                    self.assertIn("VALUE=[true]", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_the_reader_and_the_install_diverge_on_a_default_assignment(self):
+        """The one class the reader's `unset` answers differently, pinned.
+
+        `read_recorded_install_env_values` unsets each key before sourcing, so
+        that a value coming back means the *file* assigned it rather than the
+        caller's shell — the distinction the drift guard is built on. Neither
+        live reader does that: `bootstrap_install_env` and `load_install_env`
+        source over whatever the shell already holds. For every spelling whose
+        result does not depend on the key's prior state the two agree, which is
+        what the parity table asserts across its rows. For `:=` and `:-` they
+        cannot: the expansion fires in the reader, whose subshell just unset
+        the key, and does not fire in the install, which still holds the
+        export.
+
+        So the reader answers what a later run from a shell that does not set
+        the key will read from the file, and that is the question the guard
+        asks — a later run is from an unknown shell. It is not the same as what
+        *this* run read, and install.sh's contract comment no longer says it
+        is.
+
+        Asserted rather than fixed. Dropping the `unset` would make an exported
+        key indistinguishable from a recorded line, which is the defect the
+        first round of this branch's review opened with; keeping both answers
+        needs two evaluations and a caller that knows which it wants, and that
+        is a change with its own argument. What must not happen silently is
+        someone reading the parity table as covering this: every row there is
+        compared with the key unset on both sides, so the table agrees on
+        exactly the condition the live install does not establish.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text(": ${ENABLE_DRIFT_DETECTOR:=true}\n")
+            proc = self._parse(
+                "-y",
+                f'printf \'READER=[%s]\\n\' "$(recorded_install_env_value '
+                f"'{destination}' ENABLE_DRIFT_DETECTOR)\"\n"
+                f'load_install_env "{destination}" >/dev/null 2>&1\n'
+                "printf 'INSTALL=[%s]\\n' \"${ENABLE_DRIFT_DETECTOR-}\"",
+                env={"ENABLE_DRIFT_DETECTOR": "false"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            # The file's `:=` fires for the reader, which unset the key first.
+            self.assertIn("READER=[true]", combined, combined)
+            # And does not for the install, which sources over the export.
+            self.assertIn("INSTALL=[false]", combined, combined)
 
     def test_a_flag_that_agrees_with_the_recorded_value_is_not_warned_about(self):
         """Nothing is overridden, so there is nothing to lose by omitting it.
@@ -6922,6 +8172,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
         "--enable-gke-backup-plan",
         "--enable-pubsub-platform",
         "--enable-stockout-investigator",
+        "--enable-drift-detector",
         "--enable-hermes-dashboard",
     ]
 
@@ -6965,6 +8216,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
         "--enable-gke-backup-plan": "ENABLE_GKE_BACKUP_PLAN",
         "--enable-pubsub-platform": "ENABLE_PUBSUB_PLATFORM",
         "--enable-stockout-investigator": "ENABLE_STOCKOUT_INVESTIGATOR",
+        "--enable-drift-detector": "ENABLE_DRIFT_DETECTOR",
     }
 
     def test_a_spelling_seeded_from_install_env_is_never_judged(self):
@@ -7389,10 +8641,15 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
              'resolve_shared_defaults\n'
              'PARAM_DRY_RUN=false; PARAM_MEMORY=file\n' + script],
             capture_output=True, text=True,
-            env=get_isolated_test_env(overrides={
+            # The drift keys scrubbed for the same reason DomainScopedFlagsTest
+            # scrubs them: this class drives bootstrap_install_env_file over a
+            # file recording only scope keys, and the silence-asserting cases
+            # here would see the new drift branch warn about a flag the shell
+            # supplied. No case in this class passes either key through `env=`.
+            env=_env_without_ambient_drift_keys({
                 "PROJECT_ID": "p", "CLUSTER_NAME": "c", "REGION": "us-central1",
                 **(env or {}),
-            }),
+            }, env),
             cwd=str(_REPO_ROOT),
         )
 

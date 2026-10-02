@@ -375,6 +375,22 @@ data:
         Preserve_Key  On
 
     [FILTER]
+        Name          parser
+        Match         agent.logs
+        Key_Name      log
+        Parser        hermes_audit_line
+        Reserve_Data  On
+        Preserve_Key  On
+
+    [FILTER]
+        Name          parser
+        Match         agent.logs
+        Key_Name      audit_json
+        Parser        audit_json
+        Reserve_Data  On
+        Preserve_Key  Off
+
+    [FILTER]
         Name              record_modifier
         Match             agent.logs
         Record            app agent
@@ -389,6 +405,15 @@ data:
         Name    gchat_event
         Format  regex
         Regex   User=(?<gchat_user>[^,\s]+),\s*Session=(?<gchat_session>[^,\s]+)
+
+    [PARSER]
+        Name    hermes_audit_line
+        Format  regex
+        Regex   ^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} [A-Z]+(?: \[[^\]]*\])? hermes\.(?:plugin\.tool_call_audit|hook\.chat_message_audit): (?<audit_json>\{.*\})$
+
+    [PARSER]
+        Name    audit_json
+        Format  json
 kind: ConfigMap
 metadata:
   labels:

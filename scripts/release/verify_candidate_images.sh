@@ -15,7 +15,16 @@ fi
 registry_prefix="$(get_registry_prefix)"
 echo "🔍 Checking candidate container images in GHCR for commit ${COMMIT_SHA} (${registry_prefix})..."
 
-for img_name in "${REQUIRED_RELEASE_IMAGES[@]}"; do
+# The candidate's own list: the names its scripts/release/common.sh carries,
+# which are the images its publish run built (required_release_images_at).
+candidate_images=()
+while IFS= read -r img_name; do candidate_images+=("${img_name}"); done < <(required_release_images_at "${COMMIT_SHA}")
+if [ "${#candidate_images[@]}" -eq 0 ]; then
+  echo "❌ ERROR: no required release images resolved for commit ${COMMIT_SHA}." >&2
+  exit 1
+fi
+
+for img_name in "${candidate_images[@]}"; do
   target_img="${registry_prefix}/${img_name}:${COMMIT_SHA}"
 
   echo "Checking image '${target_img}'..."

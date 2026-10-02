@@ -9,15 +9,26 @@ user first spoke in, bound by the ``bootstrap_onboarding`` plugin).
 Delivery happens exactly once, and only when discovery has finished AND a
 human has connected:
 
-- ``INVENTORY.md`` present  -> the background scan has produced the report.
 - ``.user_aligned`` present -> a human has opened the chat (set by the plugin;
   never by a background task — see the plugin README).
 - ``.bootstrap_completed`` absent -> the report has not been delivered yet.
+- ``INVENTORY.md`` present  -> the background scan has produced the report.
+
+The two markers are this pod's, and are checked first. The report is not: the
+prioritization worker writes it through its terminal, and with the shell
+sandbox on that terminal is the sandbox pod, whose data volume this pod does
+not mount. So the report is read over ``sandbox_exec.read_bytes`` when the
+sandbox is on, and from ``HERMES_HOME`` when it is off, and only once both
+markers say a delivery is due — the ssh read is the one check with a cost.
 
 When all three hold, the script claims delivery, prints ``INVENTORY.md``
-(delivered verbatim), sets the report aside, and removes the two onboarding
-cron jobs. Otherwise it prints nothing, which the ``no_agent`` cron path treats
-as a silent run (no message).
+(delivered verbatim) and sets the report aside where it was read. Otherwise it
+prints nothing, which the ``no_agent`` cron path treats as a silent run (no
+message). A report it cannot read, or one over ``REPORT_MAX_BYTES``, fails the
+run instead (exit 1), which the scheduler posts as an alert; an unreachable
+sandbox stays silent and is retried on the next tick. The first run
+``RETIRE_AFTER_SECONDS`` or more after a delivery removes the two onboarding
+cron jobs; ``_retire_jobs`` says why the delivering run cannot.
 
 The claim is what makes "exactly once" true rather than merely likely.
 ``.bootstrap_completed`` is created with ``O_CREAT | O_EXCL`` *before* anything
@@ -34,8 +45,12 @@ exactly what the user sees. The sweep's complete findings are a different file
 """
 
 import os
+import subprocess
 import sys
+import time
 from pathlib import Path
+
+import sandbox_exec
 
 SCAN_JOB_ID = "bootstrap-inventory-scan"
 DELIVERY_JOB_ID = "bootstrap-inventory-delivery"
@@ -44,18 +59,72 @@ DELIVERY_JOB_ID = "bootstrap-inventory-delivery"
 # of a sweep that can take many minutes over a whole fleet, and a chat message
 # is easy to lose; keeping it means a re-send is a `cat`, not a re-scan.
 DELIVERED_REPORT_NAME = "INVENTORY.delivered.md"
+REPORT_NAME = "INVENTORY.md"
+
+# The sandbox's data volume, whatever HERMES_HOME says on this side: the same
+# path by construction (deploy/sandbox/Dockerfile), and a separate constant
+# because it names a directory on the far side of the connection.
+SANDBOX_HOME = "/opt/data"
+
+# Far above the report the prioritization stage writes, which is sized for one
+# chat message. It bounds what one tick moves over ssh; a report past it is
+# refused rather than cut, since a truncated report would be delivered as whole.
+REPORT_MAX_BYTES = 256 * 1024
+SANDBOX_TIMEOUT_SECONDS = 30
+
+# How old ``.bootstrap_completed`` must be before a run removes the jobs. A
+# younger marker may belong to a racing run that is still delivering (see the
+# claim in the module docstring), and removing the delivery job under it would discard its
+# report. Far above that run's post-claim work: a stdout write and one archive
+# over ssh bounded by SANDBOX_TIMEOUT_SECONDS.
+RETIRE_AFTER_SECONDS = 300
+
+# By absolute path, so no PATH entry picks the binary. A function defined under
+# this name in the ~/.bashrc the model owns still shadows it, since bash allows a
+# slash in a function name; that loses only the rename, as the claim comes first.
+REMOTE_MV = "/bin/mv"
 
 
 def _data_dir() -> Path:
     return Path(os.environ.get("HERMES_HOME", "/opt/data"))
 
 
-def _should_deliver(data_dir: Path) -> bool:
-    """True only when the report is ready, a human is present, and it has not
-    been delivered yet."""
-    if (data_dir / ".bootstrap_completed").exists():
-        return False
-    return (data_dir / "INVENTORY.md").exists() and (data_dir / ".user_aligned").exists()
+def _awaiting_delivery(data_dir: Path) -> bool:
+    """True when a human is present; main() has already returned on a delivered report.
+
+    The marker lives on this pod, so this costs one stat; it runs before the
+    report read, which may cross into the sandbox.
+    """
+    return (data_dir / ".user_aligned").exists()
+
+
+def _completed_at(data_dir: Path) -> float | None:
+    """When the delivery claim was taken, or None if it has not been."""
+    try:
+        return (data_dir / ".bootstrap_completed").stat().st_mtime
+    except FileNotFoundError:
+        return None
+
+
+def _read_report(data_dir: Path, in_sandbox: bool) -> bytes | None:
+    """Up to ``REPORT_MAX_BYTES + 1`` bytes of the report, or None if there is none.
+
+    Raises ``sandbox_exec.SandboxUnavailable`` or ``subprocess.TimeoutExpired``
+    when the sandbox did not answer, ``sandbox_exec.SandboxReadFailed`` when the
+    read ran and did not return the report, and ``OSError`` when the local file
+    could not be read.
+    """
+    if in_sandbox:
+        return sandbox_exec.read_bytes(
+            f"{SANDBOX_HOME}/{REPORT_NAME}",
+            max_bytes=REPORT_MAX_BYTES + 1,
+            timeout=SANDBOX_TIMEOUT_SECONDS,
+        )
+    try:
+        with open(data_dir / REPORT_NAME, "rb") as handle:
+            return handle.read(REPORT_MAX_BYTES + 1)
+    except FileNotFoundError:
+        return None
 
 
 def _claim_delivery(data_dir: Path) -> bool:
@@ -82,30 +151,60 @@ def _claim_delivery(data_dir: Path) -> bool:
     return True
 
 
-def _cleanup(data_dir: Path) -> None:
+def _archive_report(data_dir: Path, in_sandbox: bool) -> None:
+    """Rename the delivered report to ``DELIVERED_REPORT_NAME`` where it was read."""
+    if not in_sandbox:
+        try:
+            report = data_dir / REPORT_NAME
+            if report.exists():
+                report.replace(data_dir / DELIVERED_REPORT_NAME)
+        except OSError as e:
+            sys.stderr.write(f"bootstrap_delivery: could not archive INVENTORY.md: {e}\n")
+        return
+    # As the terminal's login: the sandbox's /opt/data is that account's and
+    # mode 755, so the default login cannot rename inside it.
+    try:
+        moved = sandbox_exec.run(
+            [REMOTE_MV, "-f", "--", f"{SANDBOX_HOME}/{REPORT_NAME}", f"{SANDBOX_HOME}/{DELIVERED_REPORT_NAME}"],
+            principal=sandbox_exec.TERMINAL_PRINCIPAL,
+            timeout=SANDBOX_TIMEOUT_SECONDS,
+        )
+    except Exception as e:
+        sys.stderr.write(f"bootstrap_delivery: could not archive INVENTORY.md in the sandbox: {e}\n")
+        return
+    if moved.returncode != 0:
+        sys.stderr.write(
+            "bootstrap_delivery: could not archive INVENTORY.md in the sandbox: "
+            f"{(moved.stderr or '').strip()}\n"
+        )
+
+
+def _cleanup(data_dir: Path, in_sandbox: bool) -> None:
     """Tidy up after the report has been emitted to stdout.
 
     Onboarding is already marked complete by the delivery claim, so everything
     here is best-effort: a cleanup hiccup must never turn a delivered report
-    into a reported failure. Even if job removal fails, ``.bootstrap_completed``
-    keeps both jobs inert.
+    into a reported failure.
 
     The report is renamed, not deleted — see ``DELIVERED_REPORT_NAME``. Moving
-    it out of the way still matters: the scan job treats a present
-    ``INVENTORY.md`` as "discovery already done", so leaving it in place would
-    make a later, deliberate re-run of onboarding a no-op.
+    it out of the way still matters: the sweep and prioritization SOPs, which
+    run where the report is, treat a present ``INVENTORY.md`` as "already done",
+    so leaving it in place would make a later, deliberate re-run of onboarding a
+    no-op.
     """
-    try:
-        report = data_dir / "INVENTORY.md"
-        if report.exists():
-            report.replace(data_dir / DELIVERED_REPORT_NAME)
-    except OSError as e:
-        sys.stderr.write(f"bootstrap_delivery: could not archive INVENTORY.md: {e}\n")
+    _archive_report(data_dir, in_sandbox)
 
-    # Remove the onboarding jobs in-process. Self-removing the delivery job
-    # mid-run is safe: the scheduler delivers this run's stdout from the job
-    # dict it cached at tick time, and a subsequent mark_job_run on a missing
-    # job simply logs a warning (see the plugin README, "Architectural Rules").
+
+def _retire_jobs() -> None:
+    """Remove both onboarding cron jobs, in-process.
+
+    Only a run with nothing to deliver may call this. Removing a job while it
+    runs drops the run's fire claim, and the scheduler then discards that run's
+    output instead of posting it. So the run that delivers the report leaves
+    both jobs in place, and a later run, which finds ``.bootstrap_completed``
+    and has nothing to post, removes them and loses nothing. The delivery job
+    goes last because removing it ends this run.
+    """
     try:
         from cron.jobs import remove_job  # type: ignore import-not-found
     except Exception:
@@ -121,16 +220,43 @@ def main(data_dir: Path | None = None) -> int:
     if data_dir is None:
         data_dir = _data_dir()
 
-    if not _should_deliver(data_dir):
-        return 0  # silent run — nothing to deliver yet (or already delivered)
+    completed = _completed_at(data_dir)
+    if completed is not None:
+        if time.time() - completed >= RETIRE_AFTER_SECONDS:
+            _retire_jobs()
+        return 0
+
+    if not _awaiting_delivery(data_dir):
+        return 0  # silent run — nobody to deliver to yet
+
+    try:
+        in_sandbox = sandbox_exec.sandbox_enabled()
+    except sandbox_exec.SandboxMisconfigured as e:
+        sys.stderr.write(f"bootstrap_delivery: cannot tell where INVENTORY.md is: {e}\n")
+        return 1
 
     # Read before claiming, so a read failure leaves no claim behind to undo
     # and the next tick retries cleanly.
     try:
-        content = (data_dir / "INVENTORY.md").read_text(encoding="utf-8")
-    except OSError as e:
+        raw = _read_report(data_dir, in_sandbox)
+    except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired) as e:
+        # Silent, and retried next tick: a non-zero exit is posted to the
+        # user's chat as a failure alert on every tick. A lasting fault (a
+        # rejected key, a changed host key, no ``ssh_host``) lands here too; the
+        # agent's terminal shares that key and host, so it fails there too.
+        sys.stderr.write(f"bootstrap_delivery: the shell sandbox did not answer: {e}\n")
+        return 0
+    except (OSError, sandbox_exec.SandboxMisconfigured, sandbox_exec.SandboxReadFailed) as e:
         sys.stderr.write(f"bootstrap_delivery: could not read INVENTORY.md: {e}\n")
         return 1
+    if raw is None:
+        return 0  # silent run — the report is not written yet
+    if len(raw) > REPORT_MAX_BYTES:
+        sys.stderr.write(
+            f"bootstrap_delivery: INVENTORY.md is larger than {REPORT_MAX_BYTES} bytes; not delivering it\n"
+        )
+        return 1
+    content = raw.decode("utf-8", errors="replace")
 
     # The cheap check above is advisory; this is the decision. Nothing may be
     # written to stdout before it succeeds.
@@ -142,7 +268,7 @@ def main(data_dir: Path | None = None) -> int:
 
     # Cleanup runs only after the report is safely on stdout (already captured
     # by the scheduler), so removing INVENTORY.md here cannot truncate delivery.
-    _cleanup(data_dir)
+    _cleanup(data_dir, in_sandbox)
     return 0
 
 

@@ -29,7 +29,7 @@ SANDBOX_IMAGE_ARGS := $(foreach v,$(SANDBOX_IMAGE_VARS),$(if $($(v)),--build-arg
 KUBE_AGENTS_VERSION ?= dev
 VERSION_ARG := --build-arg KUBE_AGENTS_VERSION=$(KUBE_AGENTS_VERSION)
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox docker-push docker-push-agents docker-push-credential-proxy docker-push-sandbox dev-rebuild-agent mirror-images images-check status prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests e2e-test-deps test-e2e test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-audience docs-check-context-budget chart-sync chart-check iac-parity-check tfvar-check tf-apply tf-destroy coverage coverage-check test-integration conformance
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-audience docs-check-context-budget chart-sync chart-check iac-parity-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-check test-integration conformance
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -75,20 +75,6 @@ docker-build-sandbox: ## Build the agent shell sandbox image.
 docker-smoke-sandbox: docker-build-sandbox ## Build the sandbox image and exercise it over ssh.
 	deploy/sandbox/smoke-test.sh $(REPO)/agent-sandbox:latest
 
-# Docker pushes
-docker-push: docker-push-agents docker-push-credential-proxy docker-push-sandbox ## Build and push every image to $$REPO.
-docker-push-agents: $(foreach agent,$(AGENTS),docker-push-$(agent)) ## Build and push the agent images.
-
-.PHONY: $(foreach agent,$(AGENTS),docker-push-$(agent))
-$(foreach agent,$(AGENTS),docker-push-$(agent)): docker-push-%: docker-build-%
-	docker push $(REPO)/$*-agent:latest
-
-docker-push-credential-proxy: docker-build-credential-proxy ## Build and push the credential-proxy image.
-	docker push $(REPO)/credential-proxy:latest
-
-docker-push-sandbox: docker-build-sandbox ## Build and push the agent shell sandbox image.
-	docker push $(REPO)/agent-sandbox:latest
-
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
 	@chmod +x scripts/installer/*.sh scripts/dev/*.sh 2>/dev/null || true
 	@./scripts/dev/dev_rebuild_agent.sh $(ARGS)
@@ -101,10 +87,6 @@ mirror-images: ## Mirror the images in images.json into MIRROR_PREFIX (e.g. make
 
 images-check: ## Verify images.json still matches every pin it mirrors, that the Go builder pin matches k8s-operator/go.mod, and that the chart renders nothing off a public registry when mirrored (CI runs this).
 	@./hack/check-image-inventory.sh
-
-
-status: ## Show the working tree status.
-	git status
 
 # Prefer an installed `prettier` over `npx prettier`, falling back to npx where
 # there is none (CI installs a pinned version first). npx re-resolves the
@@ -314,7 +296,7 @@ endef
 # The same packages as `import` names rather than distribution names, because
 # that is what the preflight below can actually test for: python-dotenv imports
 # as `dotenv` and pyyaml as `yaml`.
-PYTHON_TEST_IMPORTS := fastapi httpx mcp dotenv plotly pydantic streamlit uvicorn websockets yaml
+PYTHON_TEST_IMPORTS := fastapi httpx markdown_it mcp dotenv plotly pydantic streamlit uvicorn websockets yaml
 
 test-python-deps: ## Install the third-party imports `make test-python` needs.
 	@python3 -m pip install -r requirements-test.txt
@@ -322,12 +304,8 @@ test-python-deps: ## Install the third-party imports `make test-python` needs.
 e2e-tests: ## Run the live E2E promotion test suite against the target GKE cluster.
 	@./scripts/release/execute_e2e_tests.sh
 
-test-e2e: e2e-tests ## Alias for e2e-tests.
-
 test-e2e-deps: ## Install dependencies required to run the E2E test suite.
 	@python3 -m pip install -r tests/e2e/requirements.txt
-
-e2e-test-deps: test-e2e-deps ## Alias for test-e2e-deps.
 
 # One command for "is this branch landable": everything a PR must pass, ordered
 # so the cheapest check fails first.
@@ -338,7 +316,7 @@ e2e-test-deps: test-e2e-deps ## Alias for test-e2e-deps.
 # editable, which pulls devops-bench from a pinned git SHA over the network.
 # verify stays offline-runnable; the bench suite gates in CI (bench-tests job)
 # and runs locally with `make test-bench`.
-verify: ## Run everything a PR must pass offline: go build, go vet, go test, python tests, the conformance suite. The bench suite needs network; run `make test-bench` separately.
+verify: ## Run everything a PR must pass offline: go build, go vet, go test, python tests, the conformance suite, the Terraform module tests. The bench suite needs network; run `make test-bench` separately.
 	@echo "==> go build"; cd k8s-operator && go build ./...
 	@echo "==> go vet";   cd k8s-operator && go vet ./...
 	@echo "==> go test";  cd k8s-operator && go test ./...
@@ -348,6 +326,7 @@ verify: ## Run everything a PR must pass offline: go build, go vet, go test, pyt
 	@echo "==> python (k8s-operator)"; $(MAKE) --no-print-directory -C k8s-operator test-python
 	@echo "==> python (everything else)"; $(MAKE) --no-print-directory test-python
 	@echo "==> conformance"; $(MAKE) --no-print-directory conformance
+	@echo "==> terraform test"; $(MAKE) --no-print-directory terraform-test
 	@echo "==> verify OK"
 
 test-python: ## Run every Python unit-test directory in PYTHON_TEST_DIRS, the operator's included.
@@ -641,11 +620,47 @@ iac-parity-check: ## Verify DNS egress rule parity across static NetworkPolicy c
 tfvar-check: ## Run lifecycle.sh's tfvar() against a real terraform console for every variable it reads and fail on any unnormalised shape (CI runs this).
 	@./hack/check-tfvar-console.sh
 
+# The version mock_provider needs; the install floor the modules declare is
+# lower, and a binary below this reads two green suites as a parse error, so
+# it is named up front, the way test-python names a missing import.
+TERRAFORM_TEST_MIN_VERSION := 1.7.0
+
+# Every module and composition that carries a tests/ directory -- the set
+# the validate job initialises -- against mocked providers, so a plan-time
+# rule -- a precondition, a postcondition on a read, the set of bindings a
+# declaration plans -- runs rather than being grepped for
+# (tests/test_scope_iam.py pins the text; these pin the behaviour). A
+# directory without tests/ is skipped, and a new one's tests/ is reached with
+# no edit here; tests/test_terraform_module_tests.py pins the loop, the step
+# and that no test file sits outside it. Every directory runs even after one
+# fails and the failures are named again at the end, for the reason
+# test-python gives: a red run that hides the next suite's result costs a CI
+# round trip to discover.
+terraform-test: ## Run each terraform/{modules,examples}/*/tests suite under `terraform test` with mocked providers; no cloud call (CI runs this; needs terraform >= 1.7 for mock_provider).
+	@command -v terraform >/dev/null 2>&1 || { echo "terraform-test: terraform is required (>= $(TERRAFORM_TEST_MIN_VERSION), for mock_provider); none on PATH" >&2; exit 1; }; \
+	version="$$(terraform version 2>/dev/null | sed -n '1s/^Terraform v//p')"; \
+	if [ -z "$$version" ]; then \
+	  echo "terraform-test: could not read a Terraform version from \`terraform version\` (first line is not 'Terraform vX.Y.Z'); is PATH's terraform a shim or another binary?" >&2; exit 1; \
+	fi; \
+	if [ "$$(printf '%s\n' "$(TERRAFORM_TEST_MIN_VERSION)" "$$version" | sort -V | head -n1)" != "$(TERRAFORM_TEST_MIN_VERSION)" ]; then \
+	  echo "terraform-test: terraform $$version is too old; mock_provider needs >= $(TERRAFORM_TEST_MIN_VERSION) (the install floor is lower, the suites are not)" >&2; exit 1; \
+	fi; \
+	failed=""; for dir in terraform/modules/*/ terraform/examples/*/; do \
+	  if [ -d "$$dir/tests" ]; then \
+	    echo "Testing $$dir..."; \
+	    (cd "$$dir" && terraform init -backend=false -input=false >/dev/null && terraform test) || failed="$$failed $$dir"; \
+	  fi; \
+	done; \
+	if [ -n "$$failed" ]; then echo "Failing Terraform test directories:$$failed"; exit 1; fi
+
 tf-apply: ## Apply terraform/examples/full-install, adopting KMS resources a previous destroy left behind.
 	@./terraform/examples/full-install/lifecycle.sh apply $(ARGS)
 
 tf-destroy: ## Destroy terraform/examples/full-install, clearing the finalizer, backups, and deletion protection first.
 	@./terraform/examples/full-install/lifecycle.sh destroy $(ARGS)
+
+fleet-audit-view: ## Render the fleet-audit report store from the agent pod (e.g. make fleet-audit-view ARGS="--flagged").
+	@python3 scripts/fleet_audit_status_view.py $(ARGS)
 
 # Deliberately not reached through PYTHON_TEST_DIRS: those globs live and die
 # by someone remembering them, and a conformance suite whose CI entry depends

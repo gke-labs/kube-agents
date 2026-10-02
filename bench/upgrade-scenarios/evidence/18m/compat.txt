@@ -1,0 +1,112 @@
+
+## 2026-09-29T17:13:45Z [compat/v133-cu124-init] K -n scen logs compat-cu124-v133 -c copy-compat
+libcuda.so
+libcuda.so.1
+libcuda.so.550.54.15
+libcudadebugger.so.1
+libcudadebugger.so.550.54.15
+libnvidia-nvvm.so
+libnvidia-nvvm.so.4
+libnvidia-nvvm.so.550.54.15
+libnvidia-pkcs11-openssl3.so.550.54.15
+libnvidia-pkcs11.so.550.54.15
+libnvidia-ptxjitcompiler.so.1
+libnvidia-ptxjitcompiler.so.550.54.15
+## exit 0
+
+## 2026-09-29T17:13:46Z [compat/v133-cu124] K -n scen logs compat-cu124-v133
+Defaulted container "probe" out of: probe, copy-compat (init)
+driver=535.309.01 compat=libcuda.so.550.54.15
+torch 2.6.0+cu124 cuda 12.4 available True
+## exit 0
+
+## 2026-09-29T17:13:47Z [compat/v133-cu130-init] K -n scen logs compat-cu130-v133 -c copy-compat
+libcuda.so
+libcuda.so.1
+libcuda.so.580.65.06
+libcudadebugger.so.1
+libcudadebugger.so.580.65.06
+libnvidia-gpucomp.so.580.65.06
+libnvidia-nvvm.so
+libnvidia-nvvm.so.4
+libnvidia-nvvm.so.580.65.06
+libnvidia-nvvm70.so.4
+libnvidia-pkcs11-openssl3.so.580.65.06
+libnvidia-ptxjitcompiler.so.1
+libnvidia-ptxjitcompiler.so.580.65.06
+## exit 0
+
+## 2026-09-29T17:13:48Z [compat/v133-cu130] K -n scen logs compat-cu130-v133
+Defaulted container "probe" out of: probe, copy-compat (init)
+driver=535.309.01 compat=libcuda.so.580.65.06
+torch 2.10.0+cu130 cuda 13.0 available True
+## exit 0
+
+## 2026-09-29T17:13:49Z [compat/v133-pods] K -n scen get pods -l app=compat-probe -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,PHASE:.status.phase,EXIT:.status.containerStatuses[0].state.terminated.exitCode
+NAME                NODE                                  PHASE       EXIT
+compat-cu124-v133   gke-upg-18m-work-pool-ee9ba8ee-sw4q   Succeeded   0
+compat-cu130-v133   gke-upg-18m-work-pool-ee9ba8ee-sw4q   Succeeded   0
+## exit 0
+
+## 2026-09-29T17:13:50Z [compat/v133-node] K get nodes -l role=work -o custom-columns=NAME:.metadata.name,VER:.status.nodeInfo.kubeletVersion,GPU:.status.allocatable.nvidia\.com/gpu
+NAME                                  VER                    GPU
+gke-upg-18m-work-pool-ee9ba8ee-sw4q   v1.33.13-gke.1721000   2
+## exit 0
+
+## 2026-09-29T17:26:40Z [compat/v134-cu124-init] K -n scen logs compat-cu124-v134 -c copy-compat
+libcuda.so
+libcuda.so.1
+libcuda.so.550.54.15
+libcudadebugger.so.1
+libcudadebugger.so.550.54.15
+libnvidia-nvvm.so
+libnvidia-nvvm.so.4
+libnvidia-nvvm.so.550.54.15
+libnvidia-pkcs11-openssl3.so.550.54.15
+libnvidia-pkcs11.so.550.54.15
+libnvidia-ptxjitcompiler.so.1
+libnvidia-ptxjitcompiler.so.550.54.15
+## exit 0
+
+## 2026-09-29T17:26:41Z [compat/v134-cu124] K -n scen logs compat-cu124-v134
+Defaulted container "probe" out of: probe, copy-compat (init)
+driver=580.173.02 compat=libcuda.so.550.54.15
+/opt/conda/lib/python3.11/site-packages/torch/cuda/__init__.py:129: UserWarning: CUDA initialization: Unexpected error from cudaGetDeviceCount(). Did you run some cuda functions before calling NumCudaDevices() that might have already set an error? Error 803: system has unsupported display driver / cuda driver combination (Triggered internally at /pytorch/c10/cuda/CUDAFunctions.cpp:109.)
+  return torch._C._cuda_getDeviceCount() > 0
+torch 2.6.0+cu124 cuda 12.4 available False
+## exit 0
+
+## 2026-09-29T17:26:42Z [compat/v134-cu130-init] K -n scen logs compat-cu130-v134 -c copy-compat
+libcuda.so
+libcuda.so.1
+libcuda.so.580.65.06
+libcudadebugger.so.1
+libcudadebugger.so.580.65.06
+libnvidia-gpucomp.so.580.65.06
+libnvidia-nvvm.so
+libnvidia-nvvm.so.4
+libnvidia-nvvm.so.580.65.06
+libnvidia-nvvm70.so.4
+libnvidia-pkcs11-openssl3.so.580.65.06
+libnvidia-ptxjitcompiler.so.1
+libnvidia-ptxjitcompiler.so.580.65.06
+## exit 0
+
+## 2026-09-29T17:26:43Z [compat/v134-cu130] K -n scen logs compat-cu130-v134
+Defaulted container "probe" out of: probe, copy-compat (init)
+driver=580.173.02 compat=libcuda.so.580.65.06
+/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:184: UserWarning: CUDA initialization: Unexpected error from cudaGetDeviceCount(). Did you run some cuda functions before calling NumCudaDevices() that might have already set an error? Error 803: system has unsupported display driver / cuda driver combination (Triggered internally at /pytorch/c10/cuda/CUDAFunctions.cpp:119.)
+  return torch._C._cuda_getDeviceCount() > 0
+torch 2.10.0+cu130 cuda 13.0 available False
+## exit 0
+
+## 2026-09-29T17:26:44Z [compat/v134-pods] K -n scen get pods -l app=compat-probe -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,PHASE:.status.phase,EXIT:.status.containerStatuses[0].state.terminated.exitCode
+NAME                NODE                                  PHASE    EXIT
+compat-cu124-v134   gke-upg-18m-work-pool-ee9ba8ee-vufi   Failed   3
+compat-cu130-v134   gke-upg-18m-work-pool-ee9ba8ee-vufi   Failed   3
+## exit 0
+
+## 2026-09-29T17:26:45Z [compat/v134-node] K get nodes -l role=work -o custom-columns=NAME:.metadata.name,VER:.status.nodeInfo.kubeletVersion,GPU:.status.allocatable.nvidia\.com/gpu
+NAME                                  VER                    GPU
+gke-upg-18m-work-pool-ee9ba8ee-vufi   v1.34.11-gke.1056000   2
+## exit 0
