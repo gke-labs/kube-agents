@@ -170,7 +170,8 @@ NOT_A_PLAIN_GREP = [
 
 # The ways a worker runs the helper: the interpreter with or without a
 # version or a flag (one carrying an argument included), bare or by path,
-# the script path quoted, an executable path, after a `cd`, under `timeout`
+# the script path quoted whole or by segment (`"$DIR"/scripts/...`, the
+# ShellCheck idiom, with or without the interpreter), an executable path, after a `cd`, under `timeout`
 # with or without its own flags or a unit on the duration, `env` bare or
 # as `/usr/bin/env` with or without its flags and assignments, `stdbuf`, or
 # an environment assignment (its value bare, quoted with a space inside, or
@@ -203,6 +204,9 @@ RUNS_THE_HELPER = [
     'PROJECT=$(gcloud config get-value project) python3 scripts/analyze_trace_latency.py --project-id "$PROJECT"',
     "PYTHONWARNINGS='ignore, default' python3 scripts/analyze_trace_latency.py --project-id p",
     'env PROJECT=$(gcloud config get-value project) PYTHONWARNINGS="ignore" python3 scripts/analyze_trace_latency.py --project-id "$PROJECT"',
+    'python3 "$SKILL_DIR"/scripts/analyze_trace_latency.py --project-id p',
+    'python3 "${SKILL_DIR}"/scripts/analyze_trace_latency.py --project-id "$PROJECT" --hours 24',
+    '"$SKILL_DIR"/scripts/analyze_trace_latency.py --project-id p',
 ]
 
 # The ways a worker reads the helper without running it, under `timeout`
@@ -213,9 +217,14 @@ RUNS_THE_HELPER = [
 # reading; none is the helper being the route, so none satisfies the check.
 # A run under `-m pdb`, inside `sh -c '...'`, or by bare basename from
 # inside the scripts directory is not counted either, the narrow side the
-# case states; and a worker's own script in an interpreter flag's argument
+# case states; a worker's own script in an interpreter flag's argument
 # slot with the helper's path behind it is the script running, not the
-# helper, since only `-W` and `-X` take a separate argument.
+# helper, since only `-W` and `-X` take a separate argument, and a bare
+# `-W` or `-X` with the helper's path in its slot is the same inversion
+# (CPython reads the path as the option's value and runs the next word);
+# and a read whose path is written behind a substitution's closing
+# backtick, `` cat `pwd`/scripts/... ``, is a read, since the backtick
+# before the path ends a substitution rather than starting a command.
 READS_THE_HELPER = [
     "cat /opt/defaults/skills/kube-agents-observability/scripts/analyze_trace_latency.py",
     "head -60 /opt/defaults/skills/kube-agents-observability/scripts/analyze_trace_latency.py",
@@ -242,6 +251,12 @@ READS_THE_HELPER = [
     "python3 -u /tmp/mine.py scripts/analyze_trace_latency.py --project-id p",
     "python3 -B /tmp/mine.py /opt/defaults/skills/kube-agents-observability/scripts/analyze_trace_latency.py",
     "python3 -- /tmp/mine.py scripts/analyze_trace_latency.py --project-id p",
+    "python3 -W scripts/analyze_trace_latency.py /tmp/mine.py",
+    "python3 -X /opt/defaults/skills/kube-agents-observability/scripts/analyze_trace_latency.py /tmp/mine.py",
+    "cat `pwd`/scripts/analyze_trace_latency.py",
+    'head -40 `dirname "$0"`/scripts/analyze_trace_latency.py',
+    "cat `pwd`/../scripts/analyze_trace_latency.py",
+    'cat "$SKILL_DIR"/scripts/analyze_trace_latency.py',
 ]
 
 # The lines the verifier receives for typed commands above, as the image's
