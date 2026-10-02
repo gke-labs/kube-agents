@@ -1,14 +1,16 @@
-"""The eval job exports the run's GitOps repository under the name the diff check reads.
+"""The eval job's lease-time export of the run's GitOps repository, under the name the diff check reads.
 
 `pull_request_diff_contains` binds the pull request a reply names to the
-repository the run's agent writes to when `BENCH_GITOPS_REPO` is set;
-`hack/ci-eval-pr.sh` sets it with the deploy's precedence, a developer's
-`EVAL_GITOPS_REPO` first (its `none` opt-out meaning no repository) and then
-the project mapping the deploy and the ledger reset use, right after that
-mapping is resolved for the lease. The
-export is lifted out of the shipped script and run under bash with the
-resolver stubbed, and the variable's name is pinned to the verifier's
-constant, so neither side can rename it alone.
+repository the run's agent writes to when `BENCH_GITOPS_REPO` is set.
+`hack/ci-eval-pr.sh` first sets it right after the project mapping is
+resolved for the lease, with the deploy's precedence: a developer's
+`EVAL_GITOPS_REPO` when set (its `none` opt-out meaning no repository), else
+the mapping the deploy and the ledger reset use. That block is what is lifted
+out of the shipped script here and run under bash with the resolver stubbed,
+and it is the value the api lane's verifier reads. The inject lane's own step
+re-exports the same name later, reading `none` as the mapping and refusing to
+start without one; that writer is outside these tests, and the name pin below
+holds the verifier's constant to the lease-time export alone.
 """
 
 import pathlib
@@ -41,7 +43,13 @@ def sentinel_line() -> str:
 
 
 def run_block(mapped: bool, developer_override: str = "") -> subprocess.CompletedProcess:
-    resolver = f'eval_gitops_repo() {{ echo "{_MAPPED}"; }}' if mapped else "eval_gitops_repo() { return 1; }"
+    # The mapped stub answers for the lease's PROJECT_ID only, so the block
+    # has to hand the resolver that variable to get the mapping back.
+    resolver = (
+        f'eval_gitops_repo() {{ [ "$1" = "$PROJECT_ID" ] && echo "{_MAPPED}"; }}'
+        if mapped
+        else "eval_gitops_repo() { return 1; }"
+    )
     override = f'EVAL_GITOPS_REPO="{developer_override}"' if developer_override else "unset EVAL_GITOPS_REPO"
     script = f"""set -euo pipefail
 {sentinel_line()}
@@ -64,8 +72,7 @@ class GitOpsRepoExportTest(unittest.TestCase):
     def test_an_unmapped_project_exports_an_empty_value_and_the_run_goes_on(self) -> None:
         result = run_block(mapped=False)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("REPO=", result.stdout)
-        self.assertNotIn("REPO=<unset>", result.stdout)
+        self.assertIn("REPO=\n", result.stdout)
 
     def test_a_developers_override_wins_as_it_does_for_the_deploy(self) -> None:
         result = run_block(mapped=True, developer_override=_OVERRIDE)

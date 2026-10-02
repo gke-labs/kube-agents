@@ -325,6 +325,24 @@ def test_a_pull_request_outside_the_runs_repository_is_rejected_when_the_run_nam
     assert check().verify(5.0).status == "pass"
 
 
+def test_a_bound_repository_outside_the_pinned_owner_is_the_runs_error_not_the_replys(token, github, monkeypatch):
+    """A developer's `EVAL_GITOPS_REPO` on a hand-driven run binds the check
+    to `me/my-infra` while the case pins `gke-agentic`: no URL can pass both,
+    so the entry errors naming the variable, as `github_writes` does for the
+    same variable, rather than recording a fail against the reply."""
+    stash()
+    route_pull(github, 39)
+    monkeypatch.setenv("BENCH_GITOPS_REPO", "me/my-infra")
+    res = check().verify(5.0)
+    assert res.status == "error"
+    assert "BENCH_GITOPS_REPO=me/my-infra is not under gke-agentic" in res.reason
+    assert "the run is misconfigured" in res.reason
+    # With no owner pinned the bind alone decides, as before.
+    res = check(owner="").verify(5.0)
+    assert res.status == "fail"
+    assert "not in me/my-infra, the repository this run writes to" in res.reason
+
+
 def test_a_human_pull_request_or_a_fork_is_not_the_agents_proposal(token, github):
     stash()
     pull = fixture("pull-39.json")
@@ -407,6 +425,57 @@ def test_a_files_name_does_not_count(token, github):
         ],
     )
     assert check().verify(5.0).status == "pass"
+
+
+def test_a_phrase_is_matched_inside_one_run_of_consecutive_added_lines(token, github):
+    """Added lines that are not adjacent in the file are not adjacent here.
+    `minAvailable:` ending one file's added lines beside `1` opening the
+    next file's read as `minAvailable: 1` once the newline between them was
+    collapsed, and the same across a hunk boundary or a context line inside
+    one file. Two added lines that ARE adjacent in the file still read as
+    one, since the file does too."""
+    stash()
+    github.routes[f"{API}/pulls/39"] = (200, fixture("pull-39.json"))
+    files = f"{API}/pulls/39/files?per_page=100&page=1"
+    # Across a file boundary: neither file carries the forbidden phrase.
+    github.routes[files] = (
+        200,
+        [
+            {"filename": "a.yaml", "status": "added", "patch": "@@ -0,0 +1,3 @@\n+kind: PodDisruptionBudget\n+  selector:\n+  minAvailable:"},
+            {"filename": "b.yaml", "status": "added", "patch": "@@ -0,0 +1 @@\n+1 replica is enough"},
+        ],
+    )
+    res = check(forbidden_phrases=["minAvailable: 1"]).verify(5.0)
+    assert res.status == "pass", res.reason
+    # Across a hunk boundary inside one file: the same two halves, not one.
+    github.routes[files] = (
+        200,
+        [
+            {"filename": "pdb.yaml", "status": "modified", "patch": "@@ -1,2 +1,4 @@\n kind: PodDisruptionBudget\n+  selector:\n+  minAvailable:\n@@ -9 +11 @@\n+1"},
+        ],
+    )
+    res = check(required_phrases=["selector"], forbidden_phrases=["minAvailable: 1"]).verify(5.0)
+    assert res.status == "pass", res.reason
+    # Across a context line: a required phrase split by it is absent.
+    github.routes[files] = (
+        200,
+        [
+            {"filename": "pdb.yaml", "status": "modified", "patch": "@@ -1,3 +1,5 @@\n+kind:\n unrelated: line\n+PodDisruptionBudget\n+  selector:\n+  minAvailable: 1"},
+        ],
+    )
+    res = check(required_phrases=["kind: PodDisruptionBudget", "selector"]).verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "required phrases absent from its diff: ['kind: PodDisruptionBudget']" in res.reason
+    # Two adjacent added lines are one text: the scalar on the next line is
+    # how the file reads.
+    github.routes[files] = (
+        200,
+        [
+            {"filename": "pdb.yaml", "status": "added", "patch": "@@ -0,0 +1,4 @@\n+kind:\n+  PodDisruptionBudget\n+  selector:\n+  minAvailable: 1"},
+        ],
+    )
+    res = check(required_phrases=["kind: PodDisruptionBudget", "selector"]).verify(5.0)
+    assert res.status == "pass", res.reason
 
 
 def test_the_nouns_must_share_one_file(token, github):

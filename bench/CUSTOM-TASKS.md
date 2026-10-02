@@ -589,7 +589,9 @@ proposal where the persona put it: the phrases of `report_contains`, matched the
 that the underscore is kept on both sides (in a diff it separates identifiers rather than marking
 emphasis, so a snake_case comment is not the camelCase manifest), over
 the added lines of one changed file at a time (a manifest is one file, so the kind, its selector and
-the budget key must share one; a forbidden phrase anywhere in the diff rejects), never the file
+the budget key must share one; a forbidden phrase anywhere in the diff rejects), each phrase inside
+one run of consecutive added lines (two halves of a phrase on either side of a context line, a hunk
+or a file boundary are not one phrase), never the file
 names, which would let a path carry the nouns with no manifest behind it. A case writes the two places as one `any`; an arm over the whole transcript
 (`scope: full`) is left out on purpose, since it would pass on an interim message that names the
 nouns while planning, the progress-prose false pass that scope is documented to produce above:

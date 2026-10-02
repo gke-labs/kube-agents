@@ -1460,6 +1460,9 @@ EVAL_LEDGER_REPO="$(eval_gitops_repo "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LED
 # job runs this is the project mapping), its "none" as no repository at all,
 # else the mapping the deploy and the ledger reset use. Empty when none of
 # those names one, in which case those checks bind by organisation alone.
+# Final on the api lane only: the inject lane's step below re-exports the
+# name with "none" read as the mapping, since its write safeguard cannot
+# run without a repository.
 case "${EVAL_GITOPS_REPO:-}" in
   "") BENCH_GITOPS_REPO="${EVAL_LEDGER_REPO}" ;;
   "${EVAL_GITOPS_REPO_OFF_SENTINEL}") BENCH_GITOPS_REPO="" ;;

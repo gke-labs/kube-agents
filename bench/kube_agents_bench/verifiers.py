@@ -2153,7 +2153,10 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
     reads it there: the same phrase semantics as ``report_contains``, over
     the added lines of one changed file at a time -- a manifest is one file,
     so the kind, its selector and the budget key must share one, while a
-    forbidden phrase anywhere in the diff rejects -- never the file names.
+    forbidden phrase anywhere in the diff rejects -- never the file names,
+    and each phrase inside one run of consecutive added lines, so that two
+    halves of a phrase separated by a context line, a hunk or a file are
+    not read as one.
 
     WHAT IT ASSERTS, AND WHAT IT DOES NOT. The reply names a github.com pull
     request URL under ``owner`` and, when the run was told the repository it
@@ -2232,10 +2235,11 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
 
     def _diff(
         self, owner: str, repo: str, number: int, token: str, budget: float
-    ) -> tuple[list[tuple[str, str]] | None, str | None, list[str]]:
-        """``(files, None, notes)`` when read -- one ``(name, added lines)``
-        per changed file, since a manifest is one file and the phrases are
-        matched within one -- ``(None, reason, notes)`` when the candidate
+    ) -> tuple[list[tuple[str, list[str]]] | None, str | None, list[str]]:
+        """``(files, None, notes)`` when read -- one ``(name, runs)`` per
+        changed file, each run the text of one stretch of consecutive added
+        lines, since a manifest is one file and the phrases are matched
+        within one -- ``(None, reason, notes)`` when the candidate
         could not be evaluated, ``(None, None, notes)`` when it is not a
         gradable pull request (absent, an issue, closed unmerged); the notes
         say why."""
@@ -2301,15 +2305,27 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
                 if not isinstance(patch, str):
                     notes.append(f"{name}: no patch served (binary or too large)")
                     patch = ""
-                added = [
-                    line[len(_DIFF_ADDED_PREFIX) :]
-                    for line in patch.split(_DIFF_LINE_SEPARATOR)
-                    if line.startswith(_DIFF_ADDED_PREFIX)
-                ]
                 # Added lines only, never the file name: a path such as
                 # `PodDisruptionBudget-selector-notes.md` would otherwise
                 # supply the manifest's nouns with no manifest behind it.
-                added_by_file.append((name, "\n".join(added)))
+                # One text per run of consecutive added lines, cut where a
+                # context line, a removed line or a hunk header interrupts
+                # them: the normaliser collapses the newline between joined
+                # lines, so `minAvailable:` ending one run beside `1` opening
+                # the next would otherwise read as `minAvailable: 1`, which
+                # no reading of the file supports. Two added lines that ARE
+                # adjacent in the file stay one text, as the file reads.
+                runs: list[str] = []
+                current: list[str] = []
+                for line in patch.split(_DIFF_LINE_SEPARATOR):
+                    if line.startswith(_DIFF_ADDED_PREFIX):
+                        current.append(line[len(_DIFF_ADDED_PREFIX) :])
+                    elif current:
+                        runs.append("\n".join(current))
+                        current = []
+                if current:
+                    runs.append("\n".join(current))
+                added_by_file.append((name, runs))
             if len(files) < _PR_FILES_PAGE_SIZE:
                 break
         else:
@@ -2366,6 +2382,19 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
         budget = single_call_timeout(timeout_sec)
         any_of = [_normalize_diff(p) for p in self.any_of_phrases]
         bound_repo = os.environ.get(_GITOPS_REPO_ENV_VAR, "").strip()
+        # The two binds read against each other first: a run bound to a
+        # repository outside the pinned organisation (a developer's
+        # EVAL_GITOPS_REPO on a hand-driven api-lane run) can pass no URL,
+        # which is the run's configuration and not the reply's doing, so it
+        # is the same error github_writes reports for the same variable.
+        if bound_repo and self.owner and bound_repo.split("/", 1)[0].lower() != self.owner.lower():
+            return done(
+                False,
+                f"{_GITOPS_REPO_ENV_VAR}={bound_repo} is not under {self.owner}, the "
+                "organisation this check is pinned to; the run is misconfigured, so this "
+                "check could not be evaluated",
+                status="error",
+            )
         rejected: list[str] = []
         unresolved: list[str] = []
         for owner, repo, number in seen:
@@ -2395,14 +2424,23 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
             # edit with `selector:`, a README that says "PodDisruptionBudget"
             # and a values file with `minAvailable:` are three files and no
             # manifest. A forbidden phrase anywhere in the diff still rejects.
-            whole = _normalize_diff("\n".join(text for _, text in files))
-            present_forbidden = [p for p in self.forbidden_phrases if _normalize_diff(p) in whole]
+            # Each phrase is matched inside one run of consecutive added
+            # lines (`_diff`), so a context line, a hunk boundary or a file
+            # boundary between two halves of a phrase is a boundary here too.
+            hays = [(name, [_normalize_diff(run) for run in runs]) for name, runs in files]
+
+            def found(phrase: str, where: list[tuple[str, list[str]]]) -> bool:
+                return any(phrase in hay for _, file_hays in where for hay in file_hays)
+
+            present_forbidden = [
+                p for p in self.forbidden_phrases if found(_normalize_diff(p), hays)
+            ]
             carrier: str | None = None
             closest: tuple[str, list[str], bool] | None = None
-            for name, text in files:
-                hay = _normalize_diff(text)
-                missing = [p for p in self.required_phrases if _normalize_diff(p) not in hay]
-                any_ok = not any_of or any(p in hay for p in any_of)
+            for name, file_hays in hays:
+                here = [(name, file_hays)]
+                missing = [p for p in self.required_phrases if not found(_normalize_diff(p), here)]
+                any_ok = not any_of or any(found(p, here) for p in any_of)
                 if not missing and any_ok:
                     carrier = name
                     break
