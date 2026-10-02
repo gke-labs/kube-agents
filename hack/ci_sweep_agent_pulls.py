@@ -543,7 +543,15 @@ def close_agent_pulls(repo, authorization, bot_login, dry_run=False, budget=None
                 closed += 1
                 gone.add(ref)
                 continue
-            if budget is not None and not budget.take(repo, writes_left_if_not=WRITES_PER_PULL_REQUEST + int(audit)):
+            # The label's write and the close's are taken from the budget
+            # together, before either is made: a label spent on a pull request
+            # the close cannot then pay for would leave it open and labelled,
+            # and "labelled" and "closed" go together or not at all.
+            needed = WRITES_PER_PULL_REQUEST + int(audit)
+            if budget is not None and not budget.take(repo, writes_left_if_not=needed):
+                still_open.add(ref)
+                continue
+            if audit and budget is not None and not budget.take(repo, writes_left_if_not=needed):
                 still_open.add(ref)
                 continue
             # Each close stands alone. One that fails is reported and the sweep
@@ -556,9 +564,6 @@ def close_agent_pulls(repo, authorization, bot_login, dry_run=False, budget=None
             try:
                 if audit:
                     write("POST", "/repos/%s/issues/%s/labels" % (repo, number), authorization, {"labels": [STALE_CLOSED_LABEL]})
-                    if budget is not None and not budget.take(repo, writes_left_if_not=WRITES_PER_PULL_REQUEST):
-                        still_open.add(ref)
-                        continue
                 write(
                     "PATCH",
                     "/repos/%s/pulls/%s" % (repo, number),

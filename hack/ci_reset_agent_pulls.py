@@ -150,19 +150,18 @@ def _head_ref(pull: dict) -> str:
     return str((pull.get("head") or {}).get("ref") or "")
 
 
-def reset(repo: str, project: str, build: str, scope: str, token: str, dry_run: bool) -> dict:
-    """Close, delete, read back. Returns the record; `clean` says whether the
-    repository is now what a unit may start on."""
-    ledgers.expected_repo(repo, project)
-    started = time.time()
-    record: dict = {
+def new_record(repo: str, project: str, build: str, scope: str, dry_run: bool) -> dict:
+    """What a call reports, before anything is read: the caller writes it on
+    every exit, so the reset that faulted is the one with a record too."""
+    return {
         "schema_version": RECORD_SCHEMA_VERSION,
         "repo": repo,
         "project": project,
         "build": build,
         "scope": scope,
         "dry_run": dry_run,
-        "started_at": time.strftime(ISO_UTC_FORMAT, time.gmtime(started)),
+        "started_at": time.strftime(ISO_UTC_FORMAT, time.gmtime(time.time())),
+        "error": None,
         "open_before": 0,
         "kept_open": [],
         "labelled": [],
@@ -176,6 +175,14 @@ def reset(repo: str, project: str, build: str, scope: str, token: str, dry_run: 
         "branches_after": None,
         "clean": False,
     }
+
+
+def reset(repo: str, project: str, build: str, scope: str, token: str, dry_run: bool, record: dict | None = None) -> dict:
+    """Close, delete, read back. Fills and returns the record; `clean` says
+    whether the repository is now what a unit may start on."""
+    if record is None:
+        record = new_record(repo, project, build, scope, dry_run)
+    ledgers.expected_repo(repo, project)
     pulls = open_pulls(repo, token)
     agent_pulls = [pull for pull in pulls if is_agent_pull_request(pull, repo)]
     agent_numbers = {pull.get("number") for pull in agent_pulls}
@@ -270,24 +277,28 @@ def main(argv: list[str] | None = None) -> int:
     if not token:
         print(f"ERROR: {TOKEN_ENV} is not set; nothing to authenticate with", file=sys.stderr)
         return 2
-    record = None
+    record = new_record(args.repo, args.project, args.build, args.scope, args.dry_run)
     try:
-        record = reset(args.repo, args.project, args.build, args.scope, token, args.dry_run)
+        reset(args.repo, args.project, args.build, args.scope, token, args.dry_run, record)
     except ResetError as exc:
+        record["error"] = str(exc)
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     except urllib.error.HTTPError as exc:
+        record["error"] = f"GitHub answered HTTP {exc.code} ({exc.reason}) reading {args.repo}"
         print(
-            f"ERROR: GitHub answered HTTP {exc.code} ({exc.reason}) reading {args.repo}; "
-            "a 403 or 404 here is the token's reach, not an empty repository",
+            f"ERROR: {record['error']}; a 403 or 404 here is the token's reach, not an empty repository",
             file=sys.stderr,
         )
         return 1
     except OSError as exc:
-        print(f"ERROR: could not reach api.github.com ({type(exc).__name__}: {exc})", file=sys.stderr)
+        record["error"] = f"could not reach api.github.com ({type(exc).__name__}: {exc})"
+        print(f"ERROR: {record['error']}", file=sys.stderr)
         return 1
     finally:
-        if args.record and record is not None:
+        # On every exit, the faulted ones included: the record is the
+        # artifact the shell step names as evidence.
+        if args.record:
             write_record(args.record, record)
     if args.dry_run:
         return 0

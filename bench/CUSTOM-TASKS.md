@@ -561,8 +561,9 @@ permission.
 run left open on the same branch, as a fleet audit's remediation case does. The audit's `finish`
 names the branch after the files the fix touches, so every later run of the audit on the
 same stream, whether this case's next repetition or another case auditing the same fleet, finds
-the pull request open on that branch, leaves it, and pushes nothing. The presubmit holds no
-credential to close it between runs ([`ci-pool-projects.md`](../docs/ci-pool-projects.md#53-what-actually-bounds-where-a-run-can-write)), so without the option only the first run on the stream could pass. With it, the two "since
+the pull request open on that branch, leaves it, and pushes nothing. The job's repository reset
+runs before the units of cases that request a pull request, not between an audit stream's units
+([`ci-pool-projects.md`](../docs/ci-pool-projects.md#55-the-repository-reset-and-the-sweep-behind-it)), so without the option only the first run on the stream could pass. With it, the two "since
 the run started" clauses (written to, head commit) measure from `EVAL_STREAM_STARTED_AT` instead:
 the moment the first unit on the case's audit stream began, which `hack/ci-eval-pr.sh` exports
 with the audit id in `EVAL_AUDIT_STREAM` and the job's GitOps repository in `EVAL_STREAM_REPO`. The `audit` key of the case's `ledger_issue_contains`
@@ -631,9 +632,9 @@ push is read against the head commit and noted, not counted. And the branch list
 in the reason, not an error, and the check grades on pull requests alone. An unreadable pull-request listing — a 401, a denial, a repository the
 credential cannot see, an API it could not reach — is `status: "error"`, never a pass. Every call
 goes through one client with an injectable transport (`bench/kube_agents_bench/github_writes.py`),
-and the same module lists a run's leftovers for the job log after the fan-out; it closes nothing,
-because the presubmit holds no credential that closes a pull request
-([`docs/ci-pool-projects.md`](../docs/ci-pool-projects.md), 5.3 and 5.5).
+and the same module lists a run's leftovers for the job log after the fan-out; it closes nothing:
+the job's repository reset does, before each unit that may write
+([`docs/ci-pool-projects.md`](../docs/ci-pool-projects.md), 5.5).
 
 ##### Addressing a seeded-fleet fixture by role
 

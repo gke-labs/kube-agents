@@ -21,10 +21,10 @@ Nothing said whether it wrote to GitHub. Through the inject door the eval
 addresses the platform persona directly, whose own rule for a change is
 ``submit-suggestion``, and the first matrix run through it left pull requests
 on the pool project's repository that no case had asked for (#2037). This
-module is the observation: every pull request under the agent's branch
-prefix, with its head in the repository itself, that was opened or updated at
-or after a given instant, and every such branch with no pull request whose
-tip was committed after it.
+module is the observation: every pull request a bot opened from a branch in
+the repository itself that was opened or updated at or after a given instant,
+and every branch but the default with no pull request whose tip was committed
+after it.
 
 One client, one injectable transport. ``GitHubClient`` makes every call
 through the ``transport`` it was built with -- ``(url, token, timeout) ->
@@ -55,7 +55,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 __all__ = [
-    "AGENT_BRANCH_PREFIX",
+    "BOT_LOGIN_SUFFIX",
     "GITOPS_REPO_ENV_VAR",
     "GitHubClient",
     "GitHubUnreadable",

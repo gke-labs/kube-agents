@@ -479,6 +479,17 @@ class ClosingTest(unittest.TestCase):
         self.assertEqual(github.keys("PATCH "), [])
         self.assertEqual(github.keys("DELETE "), [])
 
+    def test_an_audit_label_is_not_spent_without_the_closes_write(self):
+        # One write left: the label alone would leave the pull request open
+        # and labelled, so neither is made and the next run pays for all three.
+        github = _GitHub(pulls=[agent_pull(number=7, labels=["audit:remediation"])])
+        with mock.patch.object(sweeper, "WRITE_BUDGET_PER_RUN", 1), mock.patch("sys.stderr", io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
+            report = {}
+            (closed, failures, _), _, github = run_pool(["kube-agents-evals-7"], github, report=report)
+        self.assertEqual(github.keys("POST /repos/"), [])
+        self.assertEqual(github.keys("PATCH "), [])
+        self.assertEqual((closed, failures, report["left"]), ({"kube-agents-evals-7": 0}, {}, 3))
+
     def test_the_default_branch_is_never_deleted(self):
         github = _GitHub(pulls=[], branches=["fix-payments-api-oom"])
         self.assertEqual(run_repo(github), 0)

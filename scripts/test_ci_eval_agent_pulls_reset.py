@@ -73,7 +73,7 @@ class FakeGitHub:
 
     def __init__(self, pulls=(), branches=(), default="main", fail=None, stubborn=()):
         self.open = {p["number"]: p for p in pulls}
-        self.branches = ["main", *branches]
+        self.branches = [default, *branches]
         self.default = default
         self.calls = []
         # {("PATCH", number) | ("POST", number) | ("DELETE", branch): exception}
@@ -207,8 +207,7 @@ class ResetTest(unittest.TestCase):
         self.assertTrue(record["clean"])
 
     def test_the_default_branch_is_read_not_assumed(self):
-        github = FakeGitHub(branches=["main-2"], default="main-2")
-        github.branches = ["main-2", "main"]
+        github = FakeGitHub(branches=["main"], default="main-2")
         record, _, _ = run_reset(github)
         self.assertEqual(record["deleted"], ["main"])
         self.assertEqual(github.branches, ["main-2"])
@@ -272,6 +271,21 @@ class MainTest(unittest.TestCase):
             record = json.loads(path.read_text())
         self.assertEqual((record["scope"], record["closed"], record["deleted"], record["clean"]), ("lease", [1], ["fix-payments-api-oom"], True))
         self.assertEqual(record["schema_version"], helper.RECORD_SCHEMA_VERSION)
+
+    def test_a_faulted_reset_still_writes_its_record(self):
+        # The shell step names the record as evidence when the helper exits
+        # non-zero, so the reset that faulted must have one too.
+        def denied(method, path, token, body=None):
+            raise _http_error(403)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "lease.json"
+            rc, _, _ = self.run_main(denied, "--scope", "lease", "--record", str(path))
+            self.assertEqual(rc, 1)
+            record = json.loads(path.read_text())
+        self.assertFalse(record["clean"])
+        self.assertIn("HTTP 403", record["error"])
+        self.assertEqual(record["scope"], "lease")
 
     def test_a_missing_token_a_guard_and_a_fault_each_have_their_code(self):
         self.assertEqual(self.run_main(FakeGitHub(), token="")[0], 2)
