@@ -1102,6 +1102,12 @@ def fixture_digest_line(health: dict) -> str | None:
             f" ({', '.join(roles)}); a red on a case that depends on {plural(len(roles), 'it', 'them')} there is the fixture, not the code."
         )
     unchecked = f", {total - checked} not checked" if total > checked else ""
+    unread = int(block.get("unread_units") or 0)
+    if unread:
+        # A project counts as checked when one role was read; a role the scan
+        # could not read (never planted, or its probe failed) is not a fixture
+        # in its designed state.
+        return f"🧭 *Seeded fleet:* {checked} of {total} pool projects checked at {when}, no drift in what was read; {unread} {plural(unread, 'role')} not read{unchecked}."
     return f"🧭 *Seeded fleet:* {checked} of {total} pool projects checked at {when}, every fixture in its designed state{unchecked}."
 
 

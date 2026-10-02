@@ -12,7 +12,7 @@ digest (docs/ci-health.md, "The seeded-fleet scan").
 
 Per project, in a temporary directory of its own:
 
-    hack/fleet-kubeconfigs.sh       discover the trio, publish one kubeconfig per role
+    hack/fleet-kubeconfigs.sh       discover the fleet, publish one kubeconfig per role
     hack/fleet-fixture-state.py     assert each published role's designed state,
                                     --wait 0, --report so the verdicts arrive as JSON
 

@@ -676,7 +676,8 @@ the code, that a retest waits for the re-apply, and `Tracking
 #NNN`; the gate comment's health box carries the same sentence on a red run
 while the condition lasts; the 9 AM digest always carries one line on the
 latest scan (`🧭 Seeded fleet: 30 of 30 pool projects checked at 8:00 AM ET,
-every fixture in its designed state`, or the drifted projects and roles, or
+every fixture in its designed state`, or how many roles it could not read on
+the projects it checked, or the drifted projects and roles, or
 that the scan is stale or could see nothing). The tracking issue is filed for
 the fleet owner, labelled `presubmit-gate`: `Seeded fleet drift:
 crashloop-workload out of designed state on 3 pool projects since Mon 9:00 AM

@@ -330,7 +330,7 @@ def test_in_roster_mode_a_listed_case_would_admit_reads_the_same_as_record_mode(
     assert doc["record_verdict"] == "would-admit"
     assert doc["admission_reason"] == (
         BRIDGE_SENTENCE + "; the record would admit it: 21/21 screening runs "
-        "across 7 recorded run(s) (bar 95% over 20)"
+        "across 7 recorded run(s) (bar 90% over 20)"
     )
     assert doc["rung_name"] == "COLLAPSE" and doc["blocking"] is True
 

@@ -1814,7 +1814,7 @@ function trendRecordHtml(rec) {
     ? `${rec.passes}/${rec.runs} across ${plural(rec.lines, "night")} at the current key, ${Math.max(0, (bar.min_runs || 20) - rec.runs)} more runs before the window is full`
     : rec.state === "cut"
       ? `${rec.passes}/${rec.runs} across ${plural(rec.lines, "night")} at the current key inside this read; the store may hold older records at this key that admission pools and this page did not read`
-      : `${rec.passes}/${rec.runs} across ${plural(rec.lines, "night")} at the current key against a bar of ${pct(bar.rate || 0.95)} over ${bar.min_runs || 20}`;
+      : `${rec.passes}/${rec.runs} across ${plural(rec.lines, "night")} at the current key against a bar of ${pct(bar.rate || 0.9)} over ${bar.min_runs || 20}`;
   return `<p class="rec"><b>Record today: ${esc(words[rec.state] || rec.state)}.</b> ${esc(detail)} <span class="mut">(as of ${esc(et(parseIso(rec.as_of)))}; the roster decides, the record informs)</span></p>`;
 }
 

@@ -87,7 +87,7 @@ Second, many cases per journey. One case per domain proves the domain is covered
 
 #### The seeded fleet
 
-Three standing GKE clusters per eval project, carrying defects we planted (`bench/tf/fleet`). Three and not two, because the drift audit compares each cluster against the fleet majority, and two clusters have no majority.
+Four standing GKE clusters per eval project, carrying defects we planted (`bench/tf/fleet`). At least three, because the drift audit compares each cluster against the fleet majority, and two clusters have no majority; the fourth is multi-zonal, because a single-zone cluster cannot carry a zonal skew.
 
 | Planted defect                          | Case it feeds | Usable from |
 | --------------------------------------- | ------------- | ----------- |
@@ -100,11 +100,13 @@ Three standing GKE clusters per eval project, carrying defects we planted (`benc
 | Idle node pool                          | Cost          | day 7       |
 | Unattached disks                        | Cost          | day 30      |
 
+The table is the original fleet. The upgrade-readiness drain fixtures on the second cluster and the zonal-skew fixtures on the fourth, with the rest of the roles, are in [`bench-fleet-catalog.md`](bench-fleet-catalog.md), which is canonical for the list.
+
 Four properties matter:
 
 - **Every defect is one an SOP demonstrably flags.** Planting a defect no SOP looks for is the mistake to catch in review. Because we planted them, the checks that matter can be exact rather than judged.
 - **The fleet is standing and read-only, not disposable.** The agent has no write path to a cluster: it reports, and proposes fixes as pull requests. So the fleet is applied once per project and shared by every pull request that leases it. No case may mutate it. The harness enforces the read side: `bench/tf/fleet` provisions `seeded-fleet-reader`, `hack/fleet-kubeconfigs.sh` writes every role kubeconfig as that account or writes nothing, and a run stops rather than read the fleet on `prowjob-default-sa`, which holds `container.admin` on every eval project ([`bench-fleet-catalog.md`](bench-fleet-catalog.md), "Read-only"). What is still convention is that no case mutates the fleet through any other path. Drift is the same story: `bench/tf/fleet/README.md` names a scheduled re-apply as the design: `hack/fleet_reconcile.py`, under a Boskos hold per project, applying only creates and in-place updates ([`ci-pool-projects.md`](../ci-pool-projects.md) §6.2). Remediation cases run here for the same reason: a proposed fix is a pull request, checkable without anything on the cluster changing.
-- **Fixtures are named by role, never by cluster.** Each eval project gets its own trio from the same module, so cases say `hpa-saturated` or `idle-nodepool`, never a cluster name or a project id. A case written once runs anywhere.
+- **Fixtures are named by role, never by cluster.** Each eval project gets its own set from the same module, so cases say `hpa-saturated` or `idle-nodepool`, never a cluster name or a project id. A case written once runs anywhere.
 - **The clock cannot be cheated.** `creationTimestamp` is server-set, and the cost SOP filters server-side, so the "usable from" column is a real wait. A fixture that has not aged in yet is dormant, not failing. The fleet README carries the dates.
 
 A presubmit run gets six hours of wall-clock and the nightly gets eight (§4.4). Compute is deliberately not the constraint.
@@ -159,21 +161,21 @@ The ladder above is per case. Run it unchanged over hundreds of cases and the su
 
 Our cases will not be 99.9% reliable, and a gate that reds seven pull requests in eight is ignored within two days. So the suite verdict is not "every case passed." It is these five rules:
 
-| Rule            | What it means                                                                                                      |
-| --------------- | ------------------------------------------------------------------------------------------------------------------ |
-| **Admission**   | A case cannot block anyone until it has proved it is reliable: 20 runs against `main`, at least 19 of them passing |
-| **Repetitions** | Every case runs **3 times** on every pull request. One number, no re-run tier                                      |
-| **Aggregate**   | Across all admitted cases, the pull request's pass rate must be non-inferior to `main`'s                           |
-| **Collapse**    | An admitted case that fails **all three** of its runs reds the job on its own                                      |
-| **Coverage**    | An admitted case that lost **all three** of its runs to infrastructure makes the run not evaluated, never green    |
+| Rule            | What it means                                                                                                       |
+| --------------- | ------------------------------------------------------------------------------------------------------------------- |
+| **Admission**   | A case cannot block anyone until it has proved it is reliable: 20 runs against `main`, at least 90% of them passing |
+| **Repetitions** | Every case runs **3 times** on every pull request. One number, no re-run tier                                       |
+| **Aggregate**   | Across all admitted cases, the pull request's pass rate must be non-inferior to `main`'s                            |
+| **Collapse**    | An admitted case that fails **all three** of its runs reds the job on its own                                       |
+| **Coverage**    | An admitted case that lost **all three** of its runs to infrastructure makes the run not evaluated, never green     |
 
-A worked example. Your pull request touches a prompt. A case that passed 19 of its 20 screening runs on `main` runs 3 times here. Fails one or two of them: nothing happens on its own, and all three results feed the aggregate. Fails all three: it has collapsed, and that one case reds the job. A case that passes 19 times in 20 does not fail three in a row by chance.
+A worked example. Your pull request touches a prompt. A case that passed 18 of its 20 screening runs on `main` runs 3 times here. Fails one or two of them: nothing happens on its own, and all three results feed the aggregate. Fails all three: it has collapsed, and that one case reds the job. A case that passes 18 times in 20 does not fail three in a row by chance.
 
 Rungs 1–3 and 5 are untouched by all of this. Authority, missing evidence and provenance are absolute and per case, and never average out (the never-ran record is not an exception to this: it is excluded from the rate, not averaged into it). Admission scopes rung 4 and rung 6 — the quality rungs — and nothing else. An unadmitted case cannot red the job on quality; it can still red it on any of the other four.
 
 Rung 2 is not hypothetical, and it is what kept the audit scenarios commented out in `TASKS` in `hack/ci-eval-pr.sh` rather than merely reporting. Their `ledger_issue_contains` checks returned `status: "error"` without an `issues: read` credential the Prow job supplied, which drops `VerificationCoverage` below the gate's 1.0 floor by design; the job mounts one now; the canary `compliance-rbac-overgrant` ran on every presubmit until 2026-09-22, when the presubmit became the blocking roster only and the never-admitted canary joined the other audit scenarios in the nightly tier (`hack/eval/nightly-cases.txt`), where those had been kept on cost, and back in the presubmit, held out, since 2026-09-29 (#2013). Separately, every `resource_property` safeguard in the corpus reads the ambient kubeconfig, which is not the seeded clusters', so those catastrophic checks error too. A case whose checks cannot run reds the job for every open pull request, admitted or not. That is rung 2 working, not misfiring — but it means "landing a case is free" is only true of its score.
 
-Every number here is a starting point. Three runs, all-three-fail for collapse, 19 of 20 for admission, and the non-inferiority margin are set to be tuned, not defended. The way to tune them is to run the suite twice against `main`, see how much it moves when nothing has changed, and set the bars above that. If a real regression is getting through, add repetitions before loosening a threshold. A looser threshold buys detection with false reds, and a gate that reds pull requests it should not is a gate people learn to ignore.
+Every number here is a starting point. Three runs, all-three-fail for collapse, 90% over 20 for admission, and the non-inferiority margin are set to be tuned, not defended. The way to tune them is to run the suite twice against `main`, see how much it moves when nothing has changed, and set the bars above that. Admission was tuned that way once: it started at 19 of 20 (0.95), a number nobody had chosen from data, and on 2026-09-29 (#1493) moved to 0.90 to match the roster page's bar after the store's four clean nights since oss-test-infra#2707 were read for movement. Under `EVAL_ADMISSION_MODE=roster`, the default, that bar is advisory: the roster decides who blocks, and the record's would-admit / would-demote beside it is the sentence a roster edit cites. If a real regression is getting through, add repetitions before loosening a threshold. A looser threshold buys detection with false reds, and a gate that reds pull requests it should not is a gate people learn to ignore.
 
 #### Pinning and baselines
 
