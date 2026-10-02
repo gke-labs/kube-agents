@@ -31,10 +31,14 @@ DEFAULT_HOURS = 24
 # under its own deadline (CREDENTIAL_PROXY_TIMEOUT_SECONDS, 300 s by default,
 # in credential_proxy.py) measured from when the command starts, after up to
 # COMMAND_SLOT_WAIT_SECONDS (60 s) queued for a slot, while this clock starts
-# before the shim has connected. This value sits above both together, so the
-# broker's answer, the output or its own timeout notice, arrives here rather
-# than the shim being killed first with no stderr from either side; the test
-# module reads both numbers from the broker's source and holds the ordering.
+# before the shim has connected. This value sits above both together at the
+# broker's defaults, so the broker's answer, the output or its own timeout
+# notice, arrives here rather than the shim being killed first with no
+# stderr from either side; the test module reads both numbers from the
+# broker's source and holds the ordering. The deadline is a knob the broker
+# reads at startup and the sandbox cannot see, so on a broker run with a
+# longer one this limit fires first, and the message below says only what
+# is known here: the helper's own limit passed.
 GCLOUD_TIMEOUT_SECONDS = 420
 # The broker caps a relayed command's stdout; past the cap the shim writes the
 # cut body, prints this line on stderr and exits as the command did. The cut
@@ -81,8 +85,10 @@ def read_entries(project_id: str, hours: int) -> list:
         raise RuntimeError(f"{GCLOUD} was not found on PATH: {exc}") from exc
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(
-            f"the credential broker did not answer gcloud logging read within "
-            f"{GCLOUD_TIMEOUT_SECONDS}s, past the command deadline it enforces itself"
+            f"gcloud logging read did not return within {GCLOUD_TIMEOUT_SECONDS}s, this helper's "
+            f"own limit; it sits above the credential broker's default command deadline and slot "
+            f"wait, so at the defaults the broker went quiet, while a broker configured with a "
+            f"longer deadline may still have been working"
         ) from exc
     if completed.returncode != 0:
         raise RuntimeError(

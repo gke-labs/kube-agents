@@ -56,9 +56,14 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 
 def parse_timestamp(ts_str):
-    """A Cloud Trace timestamp, nanosecond precision and offset spellings included."""
-    if not ts_str:
-        return datetime.now(timezone.utc)
+    """A Cloud Trace timestamp, nanosecond precision and offset spellings included.
+
+    None for anything that is not a non-empty string: the API types the field
+    as an RFC 3339 string, and a span carrying something else is skipped by
+    the caller rather than crashing the breakdown part-way through.
+    """
+    if not isinstance(ts_str, str) or not ts_str:
+        return None
     ts_str = ts_str.replace("Z", "+00:00")
     if "." in ts_str:
         base, fraction_tz = ts_str.split(".", 1)
@@ -90,12 +95,10 @@ def print_breakdown(trace_id: str, spans: list) -> None:
     trace_end = None
     span_durations = []
     for span in spans:
-        start_t_str = span.get("startTime")
-        end_t_str = span.get("endTime")
-        if not start_t_str or not end_t_str:
+        start_t = parse_timestamp(span.get("startTime"))
+        end_t = parse_timestamp(span.get("endTime"))
+        if start_t is None or end_t is None:
             continue
-        start_t = parse_timestamp(start_t_str)
-        end_t = parse_timestamp(end_t_str)
         span_durations.append((span.get("name", "unknown"), (end_t - start_t).total_seconds()))
         if trace_start is None or start_t < trace_start:
             trace_start = start_t

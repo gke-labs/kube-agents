@@ -14,6 +14,12 @@ TIME_SERIES_URL = "https://monitoring.googleapis.com/v3/projects/{project}/timeS
 INPUT_TOKENS_METRIC = "prometheus.googleapis.com/litellm_input_tokens_metric_total/counter"
 OUTPUT_TOKENS_METRIC = "prometheus.googleapis.com/litellm_output_tokens_metric_total/counter"
 CACHED_INPUT_TOKENS_METRIC = "prometheus.googleapis.com/litellm_input_cached_tokens_metric_total/counter"
+# Points per page (`timeSeries.list` counts points, not series, at the
+# default FULL view). Monitoring's own page holds 100,000 when no size is
+# sent, which crosses the relay's 8 MiB response cap long before it; a day
+# of counter points at this size relays in a fraction of that, and the pages
+# are followed, so the sum covers the whole window or fails saying why.
+PAGE_SIZE = 10000
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -36,11 +42,23 @@ def parse_value(pt) -> float:
     return val
 
 
-def counter_delta(data: dict) -> float:
-    """The summed increase across every series, counter resets counted from zero."""
+def series_key(ts: dict) -> str:
+    """What identifies one series across pages: its metric and resource labels."""
+    return json.dumps({"metric": ts.get("metric"), "resource": ts.get("resource")}, sort_keys=True)
+
+
+def counter_delta(series: list) -> float:
+    """The summed increase across every series, counter resets counted from zero.
+
+    A page boundary can fall inside one series, which then arrives as two
+    entries with the same labels; their points are joined before the diff,
+    or the step across the boundary would be lost.
+    """
+    points_by_series: dict[str, list] = {}
+    for ts in series:
+        points_by_series.setdefault(series_key(ts), []).extend(ts.get("points", []))
     total_delta = 0
-    for ts in data.get("timeSeries", []):
-        points = ts.get("points", [])
+    for points in points_by_series.values():
         if len(points) < 2:
             continue
         points.sort(key=lambda x: (x.get("interval") or {}).get("endTime", ""))
@@ -59,9 +77,10 @@ def get_token_delta(session, project_id: str, metric_name: str, start_str: str, 
         "filter": f'metric.type="{metric_name}"',
         "interval.startTime": start_str,
         "interval.endTime": end_str,
+        "pageSize": PAGE_SIZE,
     }
     url = TIME_SERIES_URL.format(project=urllib.parse.quote(project_id, safe=""))
-    return counter_delta(google_api.get_json(session, url, params=params))
+    return counter_delta(google_api.get_paginated(session, url, params=params, items_key="timeSeries", whole=True))
 
 
 def main(argv=None, session=None) -> int:
