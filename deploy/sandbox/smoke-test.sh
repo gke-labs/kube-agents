@@ -358,6 +358,15 @@ print(\" \".join(bad) or \"clean\")
 ssh-keygen -q -t ed25519 -N '' -f "$WORK/rogue" -C sandbox-smoke-rogue
 check "the agent's authorized_keys is root's" "644 root" \
   "$("${SSH[@]}" 'stat -c "%a %U" ~/.ssh/authorized_keys' 2>&1)"
+# The directory as well as the file. Replacing a file takes write on the
+# directory rather than on the file, so with an agent-owned .ssh the model could
+# move the root-owned file aside and write its own in its place, and the append
+# below would still be refused. Moved straight back if it ever succeeds, so the
+# rest of the run keeps a working login.
+check "the agent's .ssh is root's" "755 root" \
+  "$("${SSH[@]}" 'stat -c "%a %U" ~/.ssh' 2>&1)"
+check "the model cannot move authorized_keys aside" "Permission denied" \
+  "$("${SSH[@]}" 'mv ~/.ssh/authorized_keys ~/.ssh/aside && mv ~/.ssh/aside ~/.ssh/authorized_keys && echo moved' 2>&1)"
 "${SSH[@]}" "printf '%s\n' '$(cat "$WORK/rogue.pub")' >> ~/.ssh/authorized_keys" >/dev/null 2>&1
 check "the model cannot authorise a new key for its own account" "Permission denied" \
   "$(ssh -i "$WORK/rogue" "${SSH_OPTS[@]:2}" agent@127.0.0.1 whoami 2>&1)"
