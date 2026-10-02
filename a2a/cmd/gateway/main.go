@@ -138,9 +138,9 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	case "slack":
 		adapter, err = gateway.NewSlackAdapter(cfg.SlackBotToken, cfg.SlackAppToken, log)
 	case "":
-		// No real backend: the inject door and the console are the only
-		// ingresses, which is what lets an eval install's gateway start at
-		// all (#1660).
+		// No real backend: the doors (inject, A2A) and the console are the
+		// only ingresses, which is what lets an eval install's gateway start
+		// at all (#1660).
 	default:
 		adapter, err = gateway.NewDiscordAdapter(cfg.DiscordToken, log)
 	}

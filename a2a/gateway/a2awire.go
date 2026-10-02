@@ -129,7 +129,8 @@ type a2aIDParams struct {
 // door re-serialises, so it carries its own type, embedding lib.Message.
 type a2aMessage struct {
 	lib.Message
-	Kind string `json:"kind"`
+	Kind     string         `json:"kind"`
+	Metadata map[string]any `json:"metadata,omitempty"`
 }
 
 // a2aMessageObject is the same type at the top level: an agent Message the

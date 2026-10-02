@@ -244,7 +244,7 @@ func New(o Options) (*Gateway, error) {
 		// two must not be silence.
 		if o.Config.A2ADoorArmed() {
 			log.Warn("the gateway is running on the inject and A2A doors alone: no Discord token, Slack pair or Chat relay is armed, " +
-				"so nothing but the two doors can reach this install (the read route still reports inject-only)")
+				"so nothing but the two doors and the console can reach this install (the read route still reports inject-only)")
 		} else {
 			log.Warn("the gateway is running on the inject door alone: no Discord token, Slack pair or Chat relay is armed, " +
 				"so nothing but the eval door can reach this install (inject-only)")

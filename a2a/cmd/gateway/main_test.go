@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +24,18 @@ const startTestServerReadyTimeout = 10 * time.Second
 // dials once with no retry-on-failed-connect, so a refused port fails the
 // dial immediately rather than waiting out a timeout.
 const unreachableNATSURL = "nats://127.0.0.1:1"
+
+// TestMain clears every door knob for the package: the cases below pin what
+// changes which FromEnv error fires, and a developer's exported door pair
+// (what running the gateway locally with a door needs) would otherwise skip
+// the "no chat backend" refusal or add a token refusal before the dial. One
+// place, so the next knob cannot reopen this per test.
+func TestMain(m *testing.M) {
+	for _, k := range []string{"A2A_DOOR_LISTEN", "A2A_DOOR_TOKEN", "A2A_DOOR_PRINCIPAL_MAP", "A2A_DOOR_PUBLIC_URL", "A2A_INJECT_LISTEN", "A2A_INJECT_TOKEN", "A2A_INJECT_PRINCIPAL_MAP"} {
+		os.Unsetenv(k)
+	}
+	os.Exit(m.Run())
+}
 
 // realMain's first call is gateway.FromEnv, and every case below is refused
 // there, so none of them dials NATS. Each case pins A2A_CHAT_DISPLAY_MODE to

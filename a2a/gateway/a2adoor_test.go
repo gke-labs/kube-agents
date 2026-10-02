@@ -167,7 +167,6 @@ func (r *a2aRig) rawRPC(t *testing.T, token, caller, method string, params any) 
 	return out, res.StatusCode
 }
 
-// sendParams builds message/send params for one text.
 // a2aTestClient bounds every request: a blocking send the door holds for
 // a2aBlockingWait must fail the test in under a minute, not five.
 var a2aTestClient = &http.Client{Timeout: 60 * time.Second}
@@ -225,6 +224,7 @@ func collect(t *testing.T, ch <-chan asyncRPC) rpcResponse {
 	return rpcResponse{}
 }
 
+// sendParams builds message/send params for one text.
 func sendParams(text, messageID, contextID string, blocking bool) map[string]any {
 	msg := map[string]any{
 		"role":      "user",
@@ -716,32 +716,128 @@ func TestA2ACardURLFollowsTheRequestWhenNoPublicURLIsSet(t *testing.T) {
 	}
 }
 
-// TestA2ARetainedResultsStayUnderTheBudget: deliverables are bounded across
-// tasks, oldest dropped first, each dropped Task saying so.
-func TestA2ARetainedResultsStayUnderTheBudget(t *testing.T) {
+// TestA2ARetainedBytesStayUnderTheBudget: what the door keeps per task
+// (the caller's text, the posts, the result) is summed across tasks and
+// bounded; past the budget the oldest tasks are gone whole, the newest is
+// never the one to go, and the caller-only shape (big asks, no executor)
+// is bounded the same as the result shape.
+func TestA2ARetainedBytesStayUnderTheBudget(t *testing.T) {
 	d := bareDoor(t)
 	key := a2aConversationKey(a2aTestCaller, "big")
-	each := a2aMaxResultBytes - 1
-	n := a2aResultBudgetBytes/each + 2
+	ask := strings.Repeat("a", 200*1024)
+	n := a2aRetainedBudgetBytes/len(ask) + 3
 	for i := 0; i < n; i++ {
 		id := fmt.Sprintf("task-%d", i)
+		d.mu.Lock()
+		d.conversationLocked(key).pending = lib.Message{Role: a2aRoleUser, Parts: textParts(ask), MessageID: id}
+		d.mu.Unlock()
 		d.TaskStarted(key, id)
-		d.TaskDelivered(key, id, strings.Repeat("r", each))
-		d.TaskTerminal(key, id, lib.StateCompleted, TerminalFromExecutor, "")
 	}
 	d.mu.Lock()
-	total := d.resultBytes
+	total, held := d.retainedBytes, len(d.tasks)
+	_, oldest := d.tasks["task-0"]
+	_, newest := d.tasks[fmt.Sprintf("task-%d", n-1)]
 	d.mu.Unlock()
-	if total > a2aResultBudgetBytes {
-		t.Fatalf("retained %d bytes of results, budget %d", total, a2aResultBudgetBytes)
+	if total > a2aRetainedBudgetBytes {
+		t.Fatalf("retained %d bytes, budget %d", total, a2aRetainedBudgetBytes)
 	}
-	oldest := d.taskObject("task-0")
-	if len(oldest.Artifacts) != 0 || oldest.Metadata["resultEvicted"] != true {
-		t.Errorf("the oldest task kept its artifact under budget pressure: %d artifacts, metadata %v", len(oldest.Artifacts), oldest.Metadata)
+	if oldest || !newest || held >= n {
+		t.Errorf("oldest kept=%v newest kept=%v held=%d of %d; want the oldest evicted whole and the newest kept", oldest, newest, held, n)
 	}
-	newest := d.taskObject(fmt.Sprintf("task-%d", n-1))
-	if len(newest.Artifacts) != 1 || newest.Metadata["resultEvicted"] != nil {
-		t.Errorf("the newest task lost its artifact: %d artifacts, metadata %v", len(newest.Artifacts), newest.Metadata)
+	// Results count too, and a task that is only results is bounded alike.
+	d2 := bareDoor(t)
+	each := a2aMaxResultBytes - 1
+	m := a2aRetainedBudgetBytes/each + 2
+	for i := 0; i < m; i++ {
+		id := fmt.Sprintf("r-%d", i)
+		d2.TaskStarted(key, id)
+		d2.TaskDelivered(key, id, strings.Repeat("r", each))
+	}
+	d2.mu.Lock()
+	total2 := d2.retainedBytes
+	_, first := d2.tasks["r-0"]
+	d2.mu.Unlock()
+	if total2 > a2aRetainedBudgetBytes || first {
+		t.Errorf("results: retained %d (budget %d), oldest kept=%v", total2, a2aRetainedBudgetBytes, first)
+	}
+	if obj := d2.taskObject(fmt.Sprintf("r-%d", m-1)); len(obj.Artifacts) != 0 && obj.Status.State == lib.StateCompleted {
+		t.Errorf("unexpected shape: %+v", obj.Status)
+	}
+}
+
+// TestA2ATurnLogIsBoundedInBytesAndSaysSo: one conversation's turn log is
+// bounded by bytes as well as entries, and a reply whose head fell off the
+// window is marked rather than returned as whole.
+func TestA2ATurnLogIsBoundedInBytesAndSaysSo(t *testing.T) {
+	d := bareDoor(t)
+	key := a2aConversationKey(a2aTestCaller, "ctx-1")
+	user := lib.Message{Role: a2aRoleUser, Parts: textParts("go"), MessageID: "m-1", ContextID: "ctx-1"}
+	prior, ok := d.claimTurn(context.Background(), key, a2aTestCaller, "ctx-1", user, time.Now().Add(a2aSubmitWait))
+	if !ok {
+		t.Fatal("claim")
+	}
+	chunk := strings.Repeat("c", 1900)
+	for i := 0; i < a2aMaxTurnPostBytes/len(chunk)+8; i++ {
+		if _, err := d.Post(key, chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d.mu.Lock()
+	logBytes := d.conversations[key].turnPosts.bytes
+	d.mu.Unlock()
+	if logBytes > a2aMaxTurnPostBytes {
+		t.Fatalf("turn log holds %d bytes, bound %d", logBytes, a2aMaxTurnPostBytes)
+	}
+	d.TurnFinished(key)
+	_, reply, rerr := d.awaitTurn(context.Background(), key, prior, time.Now().Add(time.Second))
+	if rerr != nil || reply == nil {
+		t.Fatalf("reply=%+v err=%+v", reply, rerr)
+	}
+	if reply.Metadata["postsEvicted"] != true {
+		t.Errorf("a reply missing its head is not marked: metadata=%v", reply.Metadata)
+	}
+}
+
+// TestA2AFollowUpOnACancelledTaskIsRefused: a follow-up naming a task whose
+// cancel is published but unconfirmed is refused at the door (the gateway
+// would route it as a new task or a steer of the next one), as is a
+// follow-up on a task that is no longer the conversation's active one.
+func TestA2AFollowUpOnACancelledTaskIsRefused(t *testing.T) {
+	r := startA2ARig(t)
+	task := taskOf(t, r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("long job", "m-1", "ctx-1", false)))
+	r.awaitTask(t, "platform")
+	if resp := r.rpc(t, a2aTestCaller, a2aMethodCancel, map[string]any{"id": task.ID}); resp.Error != nil {
+		t.Fatalf("cancel: %+v", resp.Error)
+	}
+	params := sendParams("also check the PDBs", "m-2", "ctx-1", false)
+	params["message"].(map[string]any)["taskId"] = task.ID
+	resp := r.rpc(t, a2aTestCaller, a2aMethodSend, params)
+	if resp.Error == nil || resp.Error.Code != rpcInvalidParams || !strings.Contains(resp.Error.Message, "cancel is pending") {
+		t.Fatalf("a follow-up on a cancelled task was not refused as such: %+v", resp)
+	}
+	// Not the active task: a bare door, task A then task B on one conversation.
+	d := bareDoor(t)
+	key := a2aConversationKey(a2aTestCaller, "ctx-2")
+	d.TaskStarted(key, "task-A")
+	d.TaskStarted(key, "task-B")
+	if got := d.activeTaskOf(key); got != "task-B" {
+		t.Fatalf("activeTaskOf = %q", got)
+	}
+}
+
+// TestA2ACardURLTakesTheFirstForwardedValue: behind two forwarding hops the
+// headers are lists; the first element is used and the scheme is validated.
+func TestA2ACardURLTakesTheFirstForwardedValue(t *testing.T) {
+	d := bareDoor(t)
+	req := httptest.NewRequest(http.MethodGet, "http://door.internal"+a2aCardPath, nil)
+	req.Header.Set("X-Forwarded-Proto", "https, http")
+	req.Header.Set("X-Forwarded-Host", "a2a.example.com, 10.8.0.5:8098")
+	if got := d.rpcURLFor(req); got != "https://a2a.example.com"+a2aRPCPath {
+		t.Errorf("list-valued forwarded headers gave %q", got)
+	}
+	req.Header.Set("X-Forwarded-Proto", "javascript")
+	if got := d.rpcURLFor(req); got != "http://a2a.example.com"+a2aRPCPath {
+		t.Errorf("an invalid forwarded scheme was reflected: %q", got)
 	}
 }
 
@@ -1001,6 +1097,9 @@ func TestA2ACancelPublishesAKindCancel(t *testing.T) {
 	}
 	if len(cancelEnv.Authority) == 0 {
 		t.Error("the cancel carries no authority block")
+	}
+	if empty := r.rpc(t, a2aTestCaller, a2aMethodCancel, map[string]any{"id": ""}); empty.Error == nil || empty.Error.Code != rpcInvalidParams {
+		t.Errorf("tasks/cancel with an empty id: %+v, want -32602 as tasks/get answers", empty)
 	}
 	// A retry by the owner (a lost response, a client timeout) is answered
 	// with the task, not -32002: the cancel is on the bus already.

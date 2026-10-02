@@ -102,14 +102,22 @@ const (
 	// deliverable is cut at a rune boundary and the Task says so in
 	// metadata.resultTruncatedFrom; history still carries the chunks whole.
 	a2aMaxResultBytes = 4 << 20
-	// a2aResultBudgetBytes bounds the deliverables the door retains across
-	// all tasks, oldest dropped first (the Task then says resultEvicted and
-	// renders no artifact; history keeps the chunks). Sized against the
-	// gateway's 512Mi pod: the task cap alone would allow 4096 × 4 MiB.
-	a2aResultBudgetBytes = 64 << 20
-	a2aMaxPostsPerTask   = 256
-	a2aMaxTurnPosts      = 64
-	a2aMaxSubmissions    = injectSeenCap
+	// a2aRetainedBudgetBytes bounds everything the door keeps per task,
+	// summed across tasks: the caller's text, every post under the task and
+	// the deliverable. Past it the oldest tasks are evicted whole (the
+	// protocol's "not found", as under a2aMaxTasks), never the newest. The
+	// counts above bound entries; this bounds the bytes behind them, sized
+	// against the gateway's 512Mi pod. Turn logs and parked replies have
+	// their own byte bounds below for the same reason.
+	a2aRetainedBudgetBytes = 64 << 20
+	// a2aMaxTurnPostBytes bounds one conversation's turn log; past it the
+	// oldest posts go and the reply says so (metadata.postsEvicted).
+	a2aMaxTurnPostBytes = 64 << 10
+	// a2aMaxParkedReplyBytes bounds the reply kept for a retried message id.
+	a2aMaxParkedReplyBytes = 8 << 10
+	a2aMaxPostsPerTask     = 256
+	a2aMaxTurnPosts        = 64
+	a2aMaxSubmissions      = injectSeenCap
 
 	// a2aSubmitWait bounds how long message/send waits for the gateway to
 	// say what it did with the message - the same bound as the inject door,
@@ -163,8 +171,9 @@ type a2aTask struct {
 	// resultCutFrom is the deliverable's length when it exceeded
 	// a2aMaxResultBytes; zero when it was kept whole.
 	resultCutFrom int
-	// resultEvicted: the deliverable was dropped under a2aResultBudgetBytes.
-	resultEvicted bool
+	// bytes is what this task costs the retained budget: the caller's
+	// text, the posts and the result.
+	bytes int
 	// cancelPublished: a cancel for this task reached the bus, so a retried
 	// tasks/cancel is answered with the task, not refused.
 	cancelPublished bool
@@ -219,13 +228,16 @@ type a2aPrior struct {
 type a2aPostLog struct {
 	posts []a2aPost
 	total int
+	bytes int
 }
 
 func (l *a2aPostLog) add(p a2aPost) {
 	l.posts = append(l.posts, p)
 	l.total++
-	if len(l.posts) > a2aMaxTurnPosts {
-		l.posts = l.posts[len(l.posts)-a2aMaxTurnPosts:]
+	l.bytes += len(p.text)
+	for len(l.posts) > 1 && (len(l.posts) > a2aMaxTurnPosts || l.bytes > a2aMaxTurnPostBytes) {
+		l.bytes -= len(l.posts[0].text)
+		l.posts = l.posts[1:]
 	}
 }
 
@@ -274,13 +286,13 @@ type A2ADoor struct {
 	convOrder     []string
 	tasks         map[string]*a2aTask
 	taskOrder     []string
-	// resultBytes is the retained deliverables' total, for the budget.
-	resultBytes int
-	submissions map[string]*a2aOutcome
-	subOrder    []string
-	directOf    map[string]string
-	directOrder []string
-	nextID      int
+	// retainedBytes is the tasks' bytes summed, for the budget.
+	retainedBytes int
+	submissions   map[string]*a2aOutcome
+	subOrder      []string
+	directOf      map[string]string
+	directOrder   []string
+	nextID        int
 	// notify is closed and replaced whenever anything changes; see the
 	// inject door for why one channel serves the whole adapter.
 	notify chan struct{}
@@ -302,8 +314,8 @@ type A2ADoor struct {
 type A2ADoorOptions struct {
 	// PublicURL is the URL the agent card advertises for the JSON-RPC
 	// endpoint: what a client reaches this door at, which behind a
-	// port-forward or an ingress is not the listen address. Empty renders
-	// http://<listen>/a2a.
+	// port-forward or an ingress is not the listen address. Empty makes the
+	// card advertise the address it was fetched from (rpcURLFor).
 	PublicURL string
 	// DefaultAddressee is the gateway's default destination, which is the
 	// one skill the card lists until profiles supply a catalog.
@@ -450,10 +462,15 @@ func (d *A2ADoor) rpcURLFor(r *http.Request) string {
 	if r.TLS != nil {
 		scheme = "https"
 	}
-	if p := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); p != "" {
+	// Both headers are lists on the wire once two hops forward; the first
+	// element is the client-facing one. The scheme is one of two values,
+	// not whatever a hop wrote.
+	proto, _, _ := strings.Cut(r.Header.Get("X-Forwarded-Proto"), ",")
+	if p := strings.TrimSpace(proto); p == "http" || p == "https" {
 		scheme = p
 	}
-	host := strings.TrimSpace(r.Header.Get("X-Forwarded-Host"))
+	fhost, _, _ := strings.Cut(r.Header.Get("X-Forwarded-Host"), ",")
+	host := strings.TrimSpace(fhost)
 	if host == "" {
 		host = r.Host
 	}
@@ -637,8 +654,19 @@ func (d *A2ADoor) send(r *http.Request, handler func(InboundMessage), req rpcReq
 		if task.terminal {
 			return rpcFail(req.ID, rpcInvalidParams, "task "+msg.TaskID+" is over; start a new one", nil)
 		}
+		if task.cancelPublished {
+			// The gateway holds a cancelled task detached until the executor
+			// confirms, and routes a follow-up on it as a new task or as a
+			// steer of the next one; neither is what the caller named.
+			return rpcFail(req.ID, rpcInvalidParams, "a cancel is pending on task "+msg.TaskID+"; start a new one", nil)
+		}
 		if contextID != "" && contextID != task.contextID {
 			return rpcFail(req.ID, rpcInvalidParams, "message.contextId does not match the task's", nil)
+		}
+		if active := d.activeTaskOf(task.key); active != "" && active != task.id {
+			// Same reason: the gateway steers whatever is active, so a
+			// follow-up on an earlier task would be delivered to a later one.
+			return rpcFail(req.ID, rpcInvalidParams, "task "+msg.TaskID+" is not the conversation's active task ("+active+"); follow up on that one or start a new task", nil)
 		}
 		contextID = task.contextID
 	}
@@ -787,6 +815,9 @@ func (d *A2ADoor) cancel(r *http.Request, handler func(InboundMessage), req rpcR
 	if rerr != nil {
 		return rpcFail(req.ID, rerr.Code, rerr.Message, nil)
 	}
+	if strings.TrimSpace(params.ID) == "" {
+		return rpcFail(req.ID, rpcInvalidParams, "id is required", nil)
+	}
 	task, ok := d.taskFor(params.ID, caller)
 	if !ok {
 		return rpcFail(req.ID, a2aErrTaskNotFound, "no such task for this caller: "+params.ID, nil)
@@ -912,8 +943,8 @@ func (d *A2ADoor) awaitTurn(ctx context.Context, key string, prior a2aPrior, dea
 				return "", nil, &rpcError{Code: a2aErrAuthenticationFail,
 					Message: "the door's principal map does not carry this caller; nothing was started"}
 			}
-			if posts, _ := conv.turnPosts.since(prior.posts); len(posts) > 0 {
-				reply := d.messageObjectLocked(conv, posts)
+			if posts, evicted := conv.turnPosts.since(prior.posts); len(posts) > 0 {
+				reply := d.messageObjectLocked(conv, posts, evicted)
 				d.mu.Unlock()
 				return "", reply, nil
 			}
@@ -946,8 +977,11 @@ func (d *A2ADoor) awaitCancel(ctx context.Context, key string, prior a2aPrior, d
 		}
 		if conv.turns > prior.turns {
 			note := "the turn ended without a cancel reaching the bus"
-			if posts, _ := conv.turnPosts.since(prior.posts); len(posts) > 0 {
+			if posts, evicted := conv.turnPosts.since(prior.posts); len(posts) > 0 {
 				note += ": " + posts[len(posts)-1].text
+				if evicted {
+					note += " (earlier posts of this turn were evicted)"
+				}
 			}
 			d.mu.Unlock()
 			return false, note
@@ -1023,8 +1057,30 @@ func (d *A2ADoor) completeOutcome(o *a2aOutcome, taskID string, message *a2aMess
 		return
 	default:
 	}
+	if message != nil {
+		// A retry's answer is kept per named submission; bounded so the
+		// submissions cap is a byte bound too.
+		text := joinTextParts(message.Parts)
+		if len(text) > a2aMaxParkedReplyBytes {
+			bounded := *message
+			bounded.Parts = textParts(truncateRunes(text, a2aMaxParkedReplyBytes))
+			message = &bounded
+		}
+	}
 	o.taskID, o.message, o.err = taskID, message, err
 	close(o.done)
+}
+
+// activeTaskOf is the id of the task the relay is posting under on a
+// conversation, or "" (none, terminal, or no longer held).
+func (d *A2ADoor) activeTaskOf(key string) string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	conv := d.conversations[key]
+	if conv == nil || conv.active == nil || conv.active.terminal || d.tasks[conv.active.id] != conv.active {
+		return ""
+	}
+	return conv.active.id
 }
 
 // taskFor is the caller-scoped lookup.
@@ -1132,11 +1188,14 @@ func (d *A2ADoor) Post(conversation, text string) (string, error) {
 			task.lineID, task.line = id, text
 		} else {
 			task.posts = append(task.posts, post)
+			d.chargeLocked(task, len(text))
 			if len(task.posts) > a2aMaxPostsPerTask {
+				d.chargeLocked(task, -len(task.posts[0].text))
 				task.posts = task.posts[1:]
 			}
 		}
 		task.updated = time.Now()
+		d.enforceBudgetLocked(task)
 	}
 	if conv.busy {
 		conv.turnPosts.add(post)
@@ -1209,19 +1268,19 @@ func (d *A2ADoor) TaskStarted(conversation, taskID string) {
 		user: conv.pending, state: lib.StateSubmitted, created: now, updated: now,
 	}
 	task.user.TaskID = taskID
-	if _, exists := d.tasks[taskID]; !exists {
+	if prev, exists := d.tasks[taskID]; exists {
+		d.retainedBytes -= prev.bytes
+	} else {
 		d.taskOrder = append(d.taskOrder, taskID)
 		for len(d.taskOrder) > a2aMaxTasks {
-			if old := d.tasks[d.taskOrder[0]]; old != nil {
-				d.resultBytes -= len(old.result)
-			}
-			delete(d.tasks, d.taskOrder[0])
-			d.taskOrder = d.taskOrder[1:]
+			d.evictOldestTaskLocked(task)
 		}
 	}
 	d.tasks[taskID] = task
+	d.chargeLocked(task, len(joinTextParts(task.user.Parts)))
 	conv.active = task
 	conv.tasks.add(taskID)
+	d.enforceBudgetLocked(task)
 	d.wakeLocked()
 }
 
@@ -1282,22 +1341,43 @@ func (d *A2ADoor) TaskDelivered(conversation, taskID, result string) {
 		task.resultCutFrom = len(result)
 		result = truncateRunes(result, a2aMaxResultBytes)
 	}
-	d.resultBytes += len(result) - len(task.result)
+	d.chargeLocked(task, len(result)-len(task.result))
 	task.result = result
 	task.delivered = true
-	task.resultEvicted = false
 	task.updated = time.Now()
-	// The budget: drop the oldest retained deliverables, never this one.
-	for i := 0; d.resultBytes > a2aResultBudgetBytes && i < len(d.taskOrder); i++ {
-		old := d.tasks[d.taskOrder[i]]
-		if old == nil || old == task || old.result == "" {
-			continue
-		}
-		d.resultBytes -= len(old.result)
-		old.result = ""
-		old.resultEvicted = true
-	}
+	d.enforceBudgetLocked(task)
 	d.wakeLocked()
+}
+
+// chargeLocked moves a task's retained bytes by delta. Caller holds d.mu.
+func (d *A2ADoor) chargeLocked(task *a2aTask, delta int) {
+	task.bytes += delta
+	d.retainedBytes += delta
+}
+
+// enforceBudgetLocked evicts the oldest tasks whole while the retained
+// bytes exceed the budget, never the one just touched. Caller holds d.mu.
+func (d *A2ADoor) enforceBudgetLocked(keep *a2aTask) {
+	for d.retainedBytes > a2aRetainedBudgetBytes && len(d.taskOrder) > 1 {
+		if d.tasks[d.taskOrder[0]] == keep {
+			return
+		}
+		d.evictOldestTaskLocked(keep)
+	}
+}
+
+// evictOldestTaskLocked drops the oldest task from the door's memory and
+// its bytes from the budget. Caller holds d.mu.
+func (d *A2ADoor) evictOldestTaskLocked(keep *a2aTask) {
+	if len(d.taskOrder) == 0 {
+		return
+	}
+	oldest := d.taskOrder[0]
+	if old := d.tasks[oldest]; old != nil && old != keep {
+		d.retainedBytes -= old.bytes
+		delete(d.tasks, oldest)
+	}
+	d.taskOrder = d.taskOrder[1:]
 }
 
 // CancelPublished records that a cancel reached the bus.
@@ -1366,7 +1446,7 @@ func (d *A2ADoor) taskObjectLocked(task *a2aTask) a2aTaskObject {
 		history = append(history, a2aMessage{Message: lib.Message{Role: a2aRoleAgent, Parts: textParts(p.text), MessageID: p.id, TaskID: task.id, ContextID: task.contextID}, Kind: a2aKindMessage})
 	}
 	var artifacts []lib.Artifact
-	if state == lib.StateCompleted && task.delivered && !task.resultEvicted {
+	if state == lib.StateCompleted && task.delivered {
 		// The deliverable the relay handed over whole (TaskDelivered); the
 		// posts are the same text in chat-sized chunks and stay history.
 		// One artifact, named as the bus names it. A completed task the
@@ -1377,9 +1457,6 @@ func (d *A2ADoor) taskObjectLocked(task *a2aTask) a2aTaskObject {
 	metadata := map[string]any{"backend": a2aBackend}
 	if task.resultCutFrom > 0 {
 		metadata["resultTruncatedFrom"] = task.resultCutFrom
-	}
-	if task.resultEvicted {
-		metadata["resultEvicted"] = true
 	}
 	if task.terminal {
 		metadata["terminalSource"] = string(task.source)
@@ -1392,7 +1469,7 @@ func (d *A2ADoor) taskObjectLocked(task *a2aTask) a2aTaskObject {
 
 // messageObjectLocked renders a turn's posts as one agent Message. Caller
 // holds d.mu.
-func (d *A2ADoor) messageObjectLocked(conv *a2aConversation, posts []a2aPost) *a2aMessageObject {
+func (d *A2ADoor) messageObjectLocked(conv *a2aConversation, posts []a2aPost, evicted bool) *a2aMessageObject {
 	texts := make([]string, 0, len(posts))
 	for _, p := range posts {
 		texts = append(texts, p.text)
@@ -1401,8 +1478,14 @@ func (d *A2ADoor) messageObjectLocked(conv *a2aConversation, posts []a2aPost) *a
 	if len(posts) > 0 {
 		id = posts[len(posts)-1].id
 	}
-	return &a2aMessageObject{
+	reply := &a2aMessageObject{
 		Message: lib.Message{Role: a2aRoleAgent, Parts: textParts(strings.Join(texts, "\n")), MessageID: id, ContextID: conv.contextID},
 		Kind:    a2aKindMessage,
 	}
+	if evicted {
+		// The head of this turn's posts fell off the log; say so rather
+		// than return a tail as the whole, as the artifact cut is marked.
+		reply.Metadata = map[string]any{"postsEvicted": true}
+	}
+	return reply
 }

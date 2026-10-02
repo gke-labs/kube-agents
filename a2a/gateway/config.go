@@ -170,7 +170,7 @@ type Config struct {
 	// A2ADoorPublicURL is the URL the agent card advertises for the door's
 	// JSON-RPC endpoint (A2A_DOOR_PUBLIC_URL): what a client reaches it at,
 	// which behind a port-forward or an ingress is not the listen address.
-	// Empty renders http://<listen>/a2a.
+	// Empty makes the card advertise the address it was fetched from.
 	A2ADoorPublicURL string
 
 	// DisplayMode is the existing Chat integration's default-vs-debug split
@@ -471,7 +471,7 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_INJECT_TOKEN is required when A2A_INJECT_LISTEN is set: the inject door authenticates every request with a bearer token, because neither its loopback bind nor the NetworkPolicy in front of it governs the port-forward path its caller uses")
 	}
 	if cfg.A2ADoorListen != "" && cfg.A2ADoorToken == "" {
-		return nil, fmt.Errorf("A2A_DOOR_TOKEN is required when A2A_DOOR_LISTEN is set: the A2A door authenticates every request with a bearer token, for the reason the inject door does; see Config.A2ADoorToken")
+		return nil, fmt.Errorf("A2A_DOOR_TOKEN is required when A2A_DOOR_LISTEN is set: the A2A door authenticates every RPC request with a bearer token (the agent card alone is open), for the reason the inject door does; see Config.A2ADoorToken")
 	}
 	// Only when the spawn path is armed: a gateway that spawns nothing has
 	// no session identity to name, and demanding one would break every
