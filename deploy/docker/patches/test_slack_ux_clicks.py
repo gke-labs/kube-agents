@@ -340,8 +340,9 @@ class _Client:
 class _Adapter:
     def __init__(
         self, authorized=True, fail=(), allowed_channels=(), disable_dms=False, ignored=(), replies=(), unlisted=(),
-        unheard=(),
+        unheard=(), ignore_other_user_mentions=False,
     ):
+        self.ignore_other_user_mentions = ignore_other_user_mentions
         self.authorized = authorized
         self.unlisted = set(unlisted)
         self.asked = []
@@ -389,6 +390,10 @@ class _Adapter:
 
     async def _channel_gate_allows(self, **gate):
         self.gated.append(gate)
+        # Upstream's ignore_other_user_mentions rule: un-mentioned and naming someone else is not for us.
+        others = set(re.findall(r"<@([UW][A-Z0-9_]+)>", gate["routing_text"])) - {gate["bot_uid"]}
+        if self.ignore_other_user_mentions and not gate["is_mentioned"] and others:
+            return False
         return gate["user_id"] not in self.unheard
 
     async def _handle_slack_message(self, event, payload=None):
@@ -669,6 +674,19 @@ class RuntimeTest(unittest.TestCase):
             "is_thread_reply": True, "event_thread_ts": MESSAGE_TS, "user_id": "U4", "team_id": TEAM,
             "is_dm": False, "force_process": False,
         }])
+
+    def test_a_typed_apply_addressed_to_someone_else_does_not_drop_the_click(self):
+        reply = {"type": "message", "user": "U2", "text": "<@U0ALICE> apply B", "ts": "223.000"}
+        adapter = _Adapter(replies=[reply], ignore_other_user_mentions=True)
+        self._incident(adapter)
+        self._runs(adapter)
+        self.assertEqual([(g["routing_text"], g["is_mentioned"]) for g in adapter.gated], [(reply["text"], False)])
+
+        # With the flag off the same reply is the gateway's, so it drops the click.
+        importlib.reload(runtime)
+        adapter = _Adapter(replies=[reply])
+        self._incident(adapter)
+        self._drops(adapter)
 
     def test_a_mention_the_gateway_reads_is_passed_to_its_gate(self):
         for text in ("<@U0TEAMBOT> apply B", "@kage apply B"):
