@@ -272,8 +272,8 @@ check(
     "[…]" not in no_summary_tail,
 )
 check(
-    "a status line that is not the report is kept",
-    "Cataloged all 9" in notifier._kanban_handoff_with_result(
+    "a status line that is not the report gives way to it too",
+    "Cataloged all 9" not in notifier._kanban_handoff_with_result(
         "\nCataloged all 9 cron jobs.", _ClippedTask()
     ),
 )

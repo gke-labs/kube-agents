@@ -147,12 +147,18 @@ __all__ = [
 # for reports that outgrow a status line.
 #
 # Appending cannot fix that — only the caller of the clip can decide the clip
-# was a mistake — so the hook returns the finished tail instead. When the status
-# line is merely a clipped prefix of the report, it is dropped and the report is
-# sent once, whole. That branch got *more* reachable, not less, when
-# ``tools/kanban_result_required.py`` began folding a whitespace-only
-# ``summary`` to ``None`` to stop ``complete_task`` indexing line zero of a
-# blank string and wedging the card.
+# was a mistake — so the hook returns the finished tail instead.
+#
+# The status line goes whenever there is a report to send
+# -------------------------------------------------------
+# A worker's ``summary`` is the one-line status of its card, and the report
+# stanza (``tools/kanban_report_format.py``) asks the ``result`` to open on one
+# bold sentence answering the ask. Those are the same sentence twice: a health
+# check arrived as the summary, then the result's bold lead saying it again.
+# So when a report goes out, it goes out alone, whether the status line was a
+# clipped prefix of it or a separate sentence. The status line still carries a
+# card that closed with nothing in ``result``, or with a ``result`` the status
+# line already contains.
 #
 # Length is safe on both platforms this harness ships to. The notifier calls
 # ``adapter.send()`` directly, and ``send()`` chunks: the Slack adapter declares
@@ -332,25 +338,8 @@ def _log_result_shape(task: object, result: object) -> None:
         logger.debug("[kanban] result-shape check failed", exc_info=True)
 
 
-def _is_clipped_prefix_of(delivered: str, body: str) -> bool:
-    """Whether ``delivered`` is just the opening of ``body``, possibly clipped.
-
-    Written as a prefix test rather than an equality test against
-    ``clip_handoff(body)`` so it still holds if the notifier's status line is
-    built some other way. Upstream's own version of that line was a raw
-    ``lines[0][:160]`` slice before the clip wiring replaced it, and either
-    shape is the same fact about the message: the reader has seen this text
-    already, and is about to see all of it.
-    """
-    head = _normalise(delivered)
-    marker = _normalise(ELLIPSIS)
-    if marker and head.endswith(marker):
-        head = head[: -len(marker)].rstrip()
-    return bool(head) and _normalise(body).startswith(head)
-
-
 def handoff_with_result(delivered: object, task: object) -> str:
-    """Return the completion message's whole tail: status line and report.
+    """Return the completion message's whole tail: the report, or the status line.
 
     Replaces the notifier's ``handoff`` — see the comment block above for why
     appending to it cannot work. ``delivered`` is what the notifier built,
@@ -367,11 +356,7 @@ def handoff_with_result(delivered: object, task: object) -> str:
         result = getattr(task, "result", None)
         _log_result_shape(task, result)
         block = result_block(text, result)
-        if not block:
-            return text
-        if _is_clipped_prefix_of(text, str(result).strip()):
-            return block
-        return text + block
+        return block or text
     except Exception:  # pragma: no cover - defensive
         return text
 

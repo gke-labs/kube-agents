@@ -118,9 +118,14 @@ verbatim into the requester's chat thread, where Slack renders it as blocks
 and Google Chat flattens headings to bold, drops tables, and splits anything
 past 4000 characters across messages:
 
-- Lead with the answer: what is true, or what is wrong and what you want done.
-  Then the detail. Do not narrate the request back or how you investigated.
-- Use `##` for sections. Never `#` — the chat message already shows the card
+- Open with one bold sentence that answers what was asked — what is true, or
+  what is wrong and what you want done. Then one or two plain sentences of the
+  evidence that settles it, and an offer only if there is a next step. Say it
+  once: no recap of the lead, and do not narrate the request back or how you
+  investigated.
+- A question gets that paragraph and nothing more: no sections, no list of the
+  commands you ran. Use `##` for sections only when the card asks for a list or
+  a report. Never `#` — the chat message already shows the card
   title, so an H1 renders as a second, duplicate banner — and no `###`: Google
   Chat flattens every level to bold, so a sub-level is invisible there. If you
   are triaging an incident, SOUL.md §7 fixes the sections; use exactly those.
@@ -135,7 +140,7 @@ past 4000 characters across messages:
   keep it to a few short columns and never let the table be the only place a
   fact lives — Google Chat drops it.
 - Wrap raw values — ids, paths, epochs, durations, counts — in backticks.
-- When knowledge or documentation lookups (e.g. Developer Knowledge MCP or web search) are used, conclude with a `## Sources` section citing the tools and documentation sources used.
+- When knowledge or documentation lookups (e.g. Developer Knowledge MCP or web search) are used, conclude with a `## Sources` section citing the tools and documentation sources used. The commands and cluster reads you ran are not sources.
 - Do not use `=== Title ===`, `1. SECTION`, or hand-aligned columns. Slack
   renders those as flat text.\
 """

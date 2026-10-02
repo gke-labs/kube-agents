@@ -231,10 +231,15 @@ class HandoffWithResultTest(unittest.TestCase):
         for delivered in (None, ""):
             self.assertIn("cron-job-1", handoff_with_result(delivered, _Task(INCIDENT_RESULT)))
 
-    def test_the_summary_branch_keeps_the_status_line_and_adds_the_report(self):
+    def test_the_summary_branch_sends_the_report_without_the_status_line(self):
+        # The status line and the report's bold lead are one verdict said twice.
         tail = notifier_tail(INCIDENT_SUMMARY, _Task(INCIDENT_RESULT))
-        self.assertIn(INCIDENT_SUMMARY, tail)
+        self.assertNotIn(INCIDENT_SUMMARY, tail)
         self.assertEqual(tail.count(INCIDENT_RESULT), 1)
+
+    def test_a_status_line_the_result_already_holds_is_kept(self):
+        status = "\nAll 3 nodes ready."
+        self.assertEqual(handoff_with_result(status, _Task("All 3 nodes ready.")), status)
 
 
 #: Card ``t_3ba2166a`` as it actually closed on 2026-08-09: a report that meant
@@ -516,16 +521,16 @@ class ClipBoundaryTest(unittest.TestCase):
             with self.subTest(length=length):
                 body = report_of_length(length)
                 tail = notifier_tail(INCIDENT_SUMMARY, _Task(body))
-                self.assertIn(INCIDENT_SUMMARY, tail)
+                self.assertNotIn(INCIDENT_SUMMARY, tail)
                 self.assert_delivered_once(tail, body)
 
-    def test_a_status_line_that_is_not_the_report_is_never_dropped(self):
-        # The distinction the fix turns on: a clipped prefix of the report is
-        # redundant, a summary that happens to be long is not.
+    def test_a_status_line_that_is_not_the_report_gives_way_to_it_too(self):
+        # A clipped prefix of the report and a separate summary are both a
+        # second copy of the verdict the report opens on.
         summary = report_of_length(DEFAULT_LIMIT * 2).replace("cron-job", "audit-step")
         body = report_of_length(DEFAULT_LIMIT * 4)
         tail = notifier_tail(summary, _Task(body))
-        self.assertIn("audit-step-1 ", tail)
+        self.assertNotIn("audit-step-1 ", tail)
         self.assert_delivered_once(tail, body)
 
 
