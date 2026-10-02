@@ -2876,9 +2876,11 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// checks the path prefix in the agent process before the write is routed
 	// anywhere. Now that the sandbox home (/home/agent) is root-owned (#2180/#2245),
 	// uid 1000 cannot write anything in it, so /home/agent is omitted here (#2284):
-	// writes to `~` fail fast with "outside HERMES_WRITE_SAFE_ROOT" at the gateway's
-	// prefix check rather than passing and failing with "Permission denied" in the
-	// sandbox, and the denial message does not list /home/agent as a writable root.
+	// write attempts naming /home/agent/... fail fast with "outside HERMES_WRITE_SAFE_ROOT"
+	// at the gateway's prefix check rather than passing and failing with "Permission denied"
+	// in the sandbox (writes to `~` expand in the agent process against HOME under /opt/data/home
+	// and are admitted under /opt/data), and the denial message does not list /home/agent
+	// as a writable root.
 	// The value is written out rather than left to the image default so the policy is
 	// visible in the pod spec. It gives up no isolation: with backend: ssh the file
 	// tools cannot reach the agent's own filesystem to begin with.

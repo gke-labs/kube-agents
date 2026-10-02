@@ -994,9 +994,9 @@ func TestAgentPodStagesTheClientKey(t *testing.T) {
 // file_safety.py checks the path prefix in the agent process before routing writes.
 // Now that the sandbox home is root-owned (#2180/#2245), uid 1000 cannot write anything
 // in it, so HERMES_WRITE_SAFE_ROOT names only shellSandboxDataPath (#2284).
-// This ensures write attempts to ~ fail fast with "outside HERMES_WRITE_SAFE_ROOT"
-// rather than failing in the sandbox with "Permission denied", and does not list
-// /home/agent as a permitted write root.
+// This ensures write attempts naming /home/agent/... fail fast with "outside HERMES_WRITE_SAFE_ROOT"
+// at the gateway's prefix check rather than failing in the sandbox with "Permission denied",
+// and does not list /home/agent as a permitted write root.
 func TestSandboxRepointsTheWriteSafeRoot(t *testing.T) {
 	safeRoot := func(pod corev1.PodSpec) (string, bool) {
 		for _, c := range pod.Containers {
