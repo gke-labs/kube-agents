@@ -110,9 +110,9 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _cards(*ids, board="default", status="running", creator=None):
+def _cards(*ids, board="default", status="running", creator=None, gave_up=False):
     """A board read: open cards as ``{(board, id): _Card}``."""
-    return {(board, task): runtime._Card(status, creator) for task in ids}
+    return {(board, task): runtime._Card(status, creator, gave_up) for task in ids}
 
 
 class _Root:
@@ -212,16 +212,18 @@ class ApplierTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             verifier.check_adapter(self.root.dir)
 
-    def test_verifier_reads_the_methods_off_the_adapter_class(self):
-        # A same-shaped _react defined above the adapter must not mask a
-        # reordered one on the adapter itself.
+    def test_verifier_reads_the_members_off_the_adapter_class(self):
+        # A mixin above the adapter keeps the expected shape; the adapter's own
+        # _react swaps timestamp and emoji, which the runtime would call wrong.
         applier.apply(self.root.dir)
         path = self.root.dir / applier.RELATIVE
         patched = path.read_text()
-        signature = "async def _react(self, channel, timestamp, emoji, team_id, *, remove):"
-        drifted = patched.replace(signature, "async def _react(self, timestamp, channel, emoji, team_id, *, remove):")
-        mixin = f"class Mixin:\n    {signature}\n        return True\n\n\nclass SlackAdapter"
-        drifted = drifted.replace("class SlackAdapter", mixin, 1)
+        mixin = "class _Mixin:\n    async def _react(self, channel, timestamp, emoji, team_id, *, remove):\n        pass\n\n\n"
+        drifted = patched.replace(
+            "async def _react(self, channel, timestamp, emoji, team_id, *, remove):",
+            "async def _react(self, channel, emoji, timestamp, team_id, *, remove):",
+        ).replace("class SlackAdapter", mixin + "class SlackAdapter", 1)
+        self.assertNotEqual(drifted, patched)
         path.write_text(drifted)
         with self.assertRaises(SystemExit):
             verifier.check_adapter(self.root.dir)
@@ -316,11 +318,19 @@ class RuntimeTest(unittest.TestCase):
 
         async def open_cards(chat_id, thread_id):
             self.board_args.append((chat_id, thread_id))
-            return self.boards.pop(0)
+            return self.boards.pop(0) if self.boards else {}
 
         cards = mock.patch.object(runtime, "open_cards", open_cards)
         cards.start()
         self.addCleanup(cards.stop)
+        self.lineage = {}
+
+        async def thread_lineage(chat_id, thread_id):
+            return self.lineage
+
+        lineage = mock.patch.object(runtime, "thread_lineage", thread_lineage)
+        lineage.start()
+        self.addCleanup(lineage.stop)
 
     def _turn(self, text, before, after, outcome="success", adapter=None):
         adapter = adapter or _Stub()
@@ -413,6 +423,142 @@ class RuntimeTest(unittest.TestCase):
         # The stale card finishing later touches nothing.
         _run(runtime.settle_delegated(adapter, self._sub("t_old"), "gave_up"))
         self.assertEqual(len(adapter.calls), 2)
+
+    def test_a_follow_up_the_cards_worker_files_after_the_turn_holds_the_settle(self):
+        # t_a's worker files t_b with parents=[t_a]: absent at the turn's end,
+        # open on the board when t_a completes.
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        self.boards[:] = [{**_cards("t_b", status="todo", creator="t_a"), **_cards("t_other", creator="t_x")}]
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
+        # Another worker's card is not this ask's.
+        _run(runtime.settle_delegated(adapter, self._sub("t_other"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
+        _run(runtime.settle_delegated(adapter, self._sub("t_b"), "gave_up"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("x", False)])
+
+    def test_a_follow_up_filed_under_a_completed_follow_up_holds_the_settle(self):
+        # t_b, filed by t_a's worker, has completed; t_c, filed by t_b's worker,
+        # is still open. Only the lineage read still carries t_b.
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        self.lineage = {("default", "t_a"): None, ("default", "t_b"): "t_a", ("default", "t_c"): "t_b"}
+        self.boards[:] = [{**_cards("t_c", status="todo", creator="t_b"), **_cards("t_other", creator="t_x")}]
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
+        _run(runtime.settle_delegated(adapter, self._sub("t_c"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("white_check_mark", False)])
+
+    def test_a_card_under_a_parked_follow_up_does_not_hold_the_settle(self):
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        self.boards[:] = [{
+            **_cards("t_b", status="blocked", creator="t_a", gave_up=True),
+            **_cards("t_c", status="todo", creator="t_b"),
+        }]
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("white_check_mark", False)])
+        self.assertEqual(runtime._deferred, {})
+
+    def test_a_card_under_an_open_follow_up_waits_for_that_follow_up(self):
+        # t_g, filed by t_b's worker, is t_b's to carry: t_a's completion holds
+        # t_b alone, and t_g's give-up before t_b completes leaves t_g parked.
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        self.boards[:] = [{**_cards("t_b", creator="t_a"), **_cards("t_g", creator="t_b")}]
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
+        _run(runtime.settle_delegated(adapter, self._sub("t_g"), "gave_up"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
+        self.boards[:] = [_cards("t_g", status="blocked", creator="t_b", gave_up=True)]
+        _run(runtime.settle_delegated(adapter, self._sub("t_b"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("white_check_mark", False)])
+
+    def test_a_card_under_an_open_follow_up_blocked_on_the_user_pauses_at_that_follow_up(self):
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        self.boards[:] = [{**_cards("t_b", creator="t_a"), **_cards("t_g", status="blocked", creator="t_b")}]
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
+        self.boards[:] = [_cards("t_g", status="blocked", creator="t_b")]
+        _run(runtime.settle_delegated(adapter, self._sub("t_b"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("double_vertical_bar", False)])
+
+    def test_a_completed_card_still_read_as_open_holds_its_follow_ups(self):
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        self.boards[:] = [{**_cards("t_a"), **_cards("t_b", status="todo", creator="t_a")}]
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
+
+    def test_a_card_past_the_depth_cap_does_not_hold_the_settle(self):
+        depth = runtime.LINEAGE_DEPTH
+        adapter = self._turn("fix it", {}, _cards("t_0"))
+        self.lineage = {("default", f"t_{n}"): f"t_{n - 1}" for n in range(1, depth + 2)}
+        self.boards[:] = [_cards(f"t_{depth + 1}", status="todo", creator=f"t_{depth}")]
+        _run(runtime.settle_delegated(adapter, self._sub("t_0"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("white_check_mark", False)])
+        adapter = self._turn("fix it", {}, _cards("t_0"))
+        self.boards[:] = [_cards(f"t_{depth}", status="todo", creator=f"t_{depth - 1}")]
+        _run(runtime.settle_delegated(adapter, self._sub("t_0"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
+
+    def test_an_unreadable_board_skips_the_lineage_read(self):
+        reads = []
+
+        async def thread_lineage(chat_id, thread_id):
+            reads.append((chat_id, thread_id))
+            return {}
+
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        self.boards[:] = [None]
+        with mock.patch.object(runtime, "thread_lineage", thread_lineage):
+            _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
+        self.assertEqual(reads, [])
+        self.assertEqual(adapter.calls[-1], ("white_check_mark", False))
+
+    def test_the_lineage_walk_stops_at_its_depth_cap_and_on_a_cycle(self):
+        chain = {("default", f"t_{n}"): f"t_{n - 1}" for n in range(1, runtime.LINEAGE_DEPTH + 2)}
+        found = runtime._descendants(("default", "t_0"), chain)
+        self.assertEqual(found, {("default", f"t_{n}") for n in range(1, runtime.LINEAGE_DEPTH + 1)})
+        cycle = {("default", "t_a"): "t_b", ("default", "t_b"): "t_a"}
+        self.assertEqual(runtime._descendants(("default", "t_a"), cycle), {("default", "t_a"), ("default", "t_b")})
+        # Another board's card of the same id is not a descendant.
+        self.assertEqual(runtime._descendants(("default", "t_a"), {("b2", "t_b"): "t_a"}), set())
+        # Nor is anything under a card still open, which is itself still found.
+        under = {("default", "t_b"): "t_a", ("default", "t_c"): "t_b"}
+        self.assertEqual(runtime._descendants(("default", "t_a"), under, frozenset({("default", "t_b")})), {("default", "t_b")})
+
+    def test_a_follow_up_blocked_on_the_user_holds_the_settle_and_pauses_it(self):
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        self.boards[:] = [_cards("t_b", status="blocked", creator="t_a")]
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("double_vertical_bar", False)])
+        _run(runtime.settle_delegated(adapter, self._sub("t_b"), "gave_up"))
+        self.assertEqual(adapter.calls[-1], ("x", False))
+
+    def test_a_follow_up_parked_by_a_give_up_does_not_hold_the_settle(self):
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        self.boards[:] = [_cards("t_b", status="blocked", creator="t_a", gave_up=True)]
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("white_check_mark", False)])
+
+    def test_a_give_up_does_not_wait_on_a_follow_up_it_gates(self):
+        # t_b waits on t_a reaching done, and a card that gave up is parked.
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        self.boards[:] = [_cards("t_b", status="todo", creator="t_a")]
+        reads = len(self.board_args)
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "gave_up"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("x", False)])
+        self.assertEqual(len(self.board_args), reads)
+
+    def test_a_follow_up_whose_creator_closed_within_the_turn_is_its(self):
+        # t_a opened and completed before the notifier reported it: absent from
+        # both reads and from the turn's finishes, but its follow-up is the turn's.
+        adapter = self._turn("fix it", {}, _cards("t_b", creator="t_a"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
+        _run(runtime.settle_delegated(adapter, self._sub("t_b"), "gave_up"))
+        self.assertEqual(adapter.calls[-1], ("x", False))
+
+    def test_an_unreadable_board_at_the_finish_settles_as_before(self):
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        self.boards[:] = [None]
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
+        self.assertEqual(adapter.calls[-1], ("white_check_mark", False))
 
     def test_two_asks_in_one_thread_settle_on_their_own_cards(self):
         log = []
@@ -628,14 +774,27 @@ class OpenCardsQueryTest(unittest.TestCase):
             "CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT);"
             "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);"
             "INSERT INTO task_events VALUES (1,'a','created','{\"creator_task_id\": null}'),"
-            " (2,'b','created','{\"creator_task_id\": \"c\"}'),(3,'b','blocked','{\"creator_task_id\": \"x\"}');"
-            "INSERT INTO tasks VALUES ('a','running'),('b','blocked'),('c','done'),('d','archived'),('e','ready');"
+            " (2,'b','created','{\"creator_task_id\": \"c\"}'),(3,'b','blocked','{\"creator_task_id\": \"x\"}'),"
+            " (4,'f','blocked','{}'),(5,'f','gave_up','{}'),(6,'g','gave_up','{}'),(7,'g','blocked','{}'),"
+            " (8,'h','gave_up','{}'),(9,'h','unblocked','{}'),(10,'i','gave_up','{}');"
+            "INSERT INTO tasks VALUES ('a','running'),('b','blocked'),('c','done'),('d','archived'),('e','ready'),"
+            " ('f','blocked'),('g','blocked'),('h','ready'),('i','running');"
             "INSERT INTO kanban_notify_subs VALUES"
             " ('a','slack','C1','111.000'),('b','slack','C1','111.000'),('c','slack','C1','111.000'),"
-            " ('d','slack','C1','111.000'),('e','slack','C1','222.000'),('a','telegram','C1','111.000');"
+            " ('d','slack','C1','111.000'),('e','slack','C1','222.000'),('a','telegram','C1','111.000'),"
+            " ('f','slack','C1','111.000'),('g','slack','C1','111.000'),('h','slack','C1','111.000'),"
+            " ('i','slack','C1','111.000');"
         )
         rows = conn.execute(runtime.OPEN_CARDS_SQL, ("slack", "C1", "111.000")).fetchall()
-        self.assertEqual(sorted(rows), [("a", "running", None), ("b", "blocked", "c")])
+        # f's latest stop is a give-up; g gave up, was retried, and blocked on the user;
+        # h gave up and was unblocked; i gave up and was moved back to running without one.
+        self.assertEqual(
+            sorted(rows),
+            [
+                ("a", "running", None, 0), ("b", "blocked", "c", 0), ("f", "blocked", None, 1),
+                ("g", "blocked", None, 0), ("h", "ready", None, 0), ("i", "running", None, 0),
+            ],
+        )
 
     def _fake_hermes(self, paths, rows, reads, broken=()):
         """``hermes_cli`` modules listing ``paths`` as boards, each database returning ``rows``."""
@@ -677,11 +836,14 @@ class OpenCardsQueryTest(unittest.TestCase):
         Path(default).touch()
         Path(b2).touch()
         paths = {"default": default, "alias": default, "b2": b2}
-        rows = {default: [("t_a", "running", None)], b2: [("t_b", "running", None), ("t_c", "blocked", "t_b")]}
+        rows = {
+            default: [("t_a", "running", None, None)],
+            b2: [("t_b", "running", None, None), ("t_c", "blocked", "t_b", 1)],
+        }
         reads = []
         with mock.patch.dict(sys.modules, self._fake_hermes(paths, rows, reads)):
             found = runtime._query_open_cards("C1", "111.000")
-        self.assertEqual(found, {**_cards("t_a"), **_cards("t_b", board="b2"), **_cards("t_c", board="b2", status="blocked", creator="t_b")})
+        self.assertEqual(found, {**_cards("t_a"), **_cards("t_b", board="b2"), **_cards("t_c", board="b2", status="blocked", creator="t_b", gave_up=True)})
         self.assertEqual([path for path, _ in reads], [default, b2])
         self.assertEqual(reads[0][1], ("slack", "C1", "111.000"))
 
@@ -690,7 +852,7 @@ class OpenCardsQueryTest(unittest.TestCase):
         Path(good).touch()
         reads = []
         paths = {"default": good, "b3": absent}
-        with mock.patch.dict(sys.modules, self._fake_hermes(paths, {good: [("t_a", "running", None)]}, reads)):
+        with mock.patch.dict(sys.modules, self._fake_hermes(paths, {good: [("t_a", "running", None, None)]}, reads)):
             found = runtime._query_open_cards("C1", "111.000")
         self.assertEqual(found, _cards("t_a"))
         # b3 has no database: never connected to, so never created.
@@ -702,7 +864,11 @@ class OpenCardsQueryTest(unittest.TestCase):
         good, bad = self._databases("good.db", "bad.db")
         Path(good).touch()
         Path(bad).touch()
-        hermes = self._fake_hermes({"default": good, "b2": bad}, {good: [("t_a", "running", None)]}, [], broken={"b2"})
+        paths, rows = {"default": good, "b2": bad}, {good: [("t_a", "running", None, None)], bad: []}
+        # The same boards read whole: the None below is the broken board's.
+        with mock.patch.dict(sys.modules, self._fake_hermes(paths, rows, [])):
+            self.assertEqual(_run(runtime.open_cards("C1", "111.000")), _cards("t_a"))
+        hermes = self._fake_hermes(paths, rows, [], broken={"b2"})
         with mock.patch.dict(sys.modules, hermes):
             self.assertIsNone(_run(runtime.open_cards("C1", "111.000")))
         hermes["hermes_cli.kanban_db"].list_boards = mock.Mock(side_effect=RuntimeError("locked"))
@@ -712,6 +878,18 @@ class OpenCardsQueryTest(unittest.TestCase):
     def test_read_failure_is_none(self):
         with mock.patch.object(runtime, "_query_open_cards", side_effect=RuntimeError("locked")):
             self.assertIsNone(_run(runtime.open_cards("C1", "111.000")))
+
+    def test_lineage_reads_closed_cards_and_a_failure_is_empty(self):
+        good, = self._databases("good.db")
+        Path(good).touch()
+        reads = []
+        rows = {good: [("t_a", None), ("t_b", "t_a")]}
+        with mock.patch.dict(sys.modules, self._fake_hermes({"default": good}, rows, reads)):
+            found = _run(runtime.thread_lineage("C1", "111.000"))
+        self.assertEqual(found, {("default", "t_a"): None, ("default", "t_b"): "t_a"})
+        self.assertEqual(reads, [(good, ("slack", "C1", "111.000"))])
+        with mock.patch.object(runtime, "_query_thread_lineage", side_effect=RuntimeError("locked")):
+            self.assertEqual(_run(runtime.thread_lineage("C1", "111.000")), {})
 
 
 class MissingPresenterTest(unittest.TestCase):
