@@ -4487,7 +4487,7 @@ type a2aTeardownEntry struct {
 // from a test. That is what lets the cost test assert the early exit is cheaper
 // than the walk it skips, instead of restating how long the walk is and going
 // stale the next time the render grows a step.
-func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.PlatformAgent) []a2aTeardownEntry {
+func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.PlatformAgent) []a2aTeardownEntry {
 	injectMeta := metav1.ObjectMeta{Name: a2aInjectName(agent), Namespace: agent.Namespace}
 	return []a2aTeardownEntry{
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
@@ -4509,7 +4509,7 @@ func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.Pla
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aConsoleName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aConsoleName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The auth callout, before the bus it authorizes for. Its Deployment
-		// goes first so it stops answering while there is still a server to
+		// goes first so its deletion is initiated while there is still a server to
 		// answer for; the keys Secret goes with it rather than surviving like
 		// the per-user creds, because a flip back to today and forward again
 		// re-renders nats.conf anyway, and a stale issuer is the one thing
@@ -4525,12 +4525,25 @@ func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.Pla
 		// would mount a token for it, and leaving it behind would leave a
 		// mintable bus identity in a namespace that no longer runs a bus.
 		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionServiceAccountName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		// The identity map is deleted BEFORE the callout keys Secret.
+		// In reconcileA2A the keys Secret is created first and acts as the
+		// sentinel covering the map; deleting the map first ensures that if a
+		// cleanup pass dies on the map delete, the keys Secret is still standing
+		// to prevent the next pass from early-exiting.
 		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		// ServiceAccount is an Owns() kind, so this read is cached and free.
 		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
+	}
+}
+
+// a2aBusTeardown returns the namespaced NATS bus objects (Service, NetworkPolicy fences,
+// config Secret, ResourceQuota). They are deleted strictly after the callout ClusterRoleBinding
+// and provision Jobs, and immediately before the NATS StatefulSet sentinel.
+func (r *PlatformAgentReconciler) a2aBusTeardown(agent *agentv1alpha1.PlatformAgent) []a2aTeardownEntry {
+	return []a2aTeardownEntry{
 		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
 		// NetworkPolicy is an Owns() kind (the agent's own policy), so the
 		// cached reads are free.
@@ -4558,11 +4571,15 @@ func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.Pla
 		// session pods still draining (see the function comment): a quota
 		// only gates admission, never running pods.
 		{&corev1.ResourceQuota{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionQuotaName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
-		// LAST, deliberately: the StatefulSet is this function's sentinel. The
-		// early exit above treats its absence as "an earlier pass reached the
-		// end", which is only true while nothing is deleted after it.
-		{&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
 	}
+}
+
+func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.PlatformAgent) []a2aTeardownEntry {
+	pre := r.a2aPreBusTeardown(agent)
+	bus := r.a2aBusTeardown(agent)
+	out := make([]a2aTeardownEntry, 0, len(pre)+len(bus))
+	out = append(out, pre...)
+	return append(out, bus...)
 }
 
 // cleanupA2A returns the dark stack to dark when the mode is not next. The
@@ -4579,7 +4596,8 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// The early exit. This path runs on every reconcile of every install that
 	// is not `next` — forever, on installs that have never rendered an A2A
 	// object — so proving "nothing to do" one object at a time is a standing
-	// cost for a no-op. Eight reads answer it instead of twenty-six:
+	// cost for a no-op. Eight reads answer it instead of walking every object
+	// in the teardown sequence:
 	//
 	//   - the StatefulSet, which is deleted LAST below, so its absence means an
 	//     earlier pass ran to completion rather than dying partway,
@@ -4683,38 +4701,74 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	//
 	// Those uncached reads are the standing cost of this path, which runs on
 	// every reconcile of every today install — see the note on the sweep below.
-	for _, entry := range r.a2aNamespacedTeardown(agent) {
-		obj := entry.obj
-		if err := entry.reader.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
-			if client.IgnoreNotFound(err) != nil {
-				return err
-			}
-			continue
-		}
-		if !metav1.IsControlledBy(obj, agent) {
-			return fmt.Errorf("refusing to delete unowned A2A %T %s/%s", obj, obj.GetNamespace(), obj.GetName())
-		}
-		if err := client.IgnoreNotFound(r.Delete(ctx, obj)); err != nil {
+
+	// 1. Namespaced objects before the bus (gateway, inject, callout, session identities).
+	// Deleted first so the services built on top of the bus are initiated and stopped
+	// before the bus itself.
+	for _, entry := range r.a2aPreBusTeardown(agent) {
+		if err := r.deleteOwnedA2AObject(ctx, agent, entry.obj, entry.reader); err != nil {
 			return err
 		}
 	}
 
-	// The callout's ClusterRoleBinding. Cluster-scoped, so it carries no
+	// 2. The callout's ClusterRoleBinding. Cluster-scoped, so it carries no
 	// owner reference — the garbage collector treats a cluster-scoped object
 	// owned by a namespaced one as an orphan and deletes it at once — which
 	// means nothing reclaims it but this. Left behind, it is an A2A-named
 	// ClusterRoleBinding on an install that is supposed to look like it has
 	// never heard of A2A, and it is the darkness property's most visible
 	// residue: cluster-scoped objects are exactly what a security reviewer
-	// lists first. The ownership refusal above cannot apply, so it is matched
-	// on its labels instead.
+	// lists first.
+	//
+	// Ordered after the callout Deployment in the teardown walk so its
+	// deletion has been initiated before its authorization is reaped, and
+	// before the NATS bus resources and StatefulSet sentinel below so that
+	// a pass dying on this delete leaves the bus whole and the sentinel
+	// standing to resume cleanup (#2216).
+	//
+	// An unowned or squatted binding is skipped (leaving it to its owner) rather
+	// than returning a fatal error that would wedge teardown forever.
+	// However, any error deleting an owned binding (e.g. admission webhook
+	// refusal or RBAC restriction) remains fatal: teardown halts here with the
+	// entire NATS bus (Service, NetworkPolicy fences, config Secret, StatefulSet)
+	// still standing and protected, preserving the sentinel to retry next pass.
 	if err := r.deleteA2ACalloutClusterRoleBinding(ctx, agent); err != nil {
 		return err
 	}
 
-	// Provision Jobs carry a content hash in the name, one per generation
+	// 3. Provision Jobs carry a content hash in the name, one per generation
 	// that has been rendered here; a mode flip removes every generation.
-	return r.deleteA2AProvisionJobs(ctx, agent, "")
+	// Ordered before the NATS bus resources and StatefulSet sentinel below so
+	// that a pass dying during Job cleanup leaves the bus intact and the
+	// sentinel standing (#2216).
+	if err := r.deleteA2AProvisionJobs(ctx, agent, ""); err != nil {
+		return err
+	}
+
+	// 4. The NATS bus namespaced objects (Service, NetworkPolicy fences,
+	// config Secret, ResourceQuota).
+	for _, entry := range r.a2aBusTeardown(agent) {
+		if err := r.deleteOwnedA2AObject(ctx, agent, entry.obj, entry.reader); err != nil {
+			return err
+		}
+	}
+
+	// 5. LAST, deliberately: the StatefulSet is this function's sentinel. The
+	// early exit above treats its absence as "an earlier pass reached the
+	// end", which is only true while nothing is deleted after it.
+	return r.deleteA2ANATSStatefulSet(ctx, agent)
+}
+
+// deleteA2ANATSStatefulSet reaps the NATS StatefulSet.
+//
+// LAST, deliberately: the StatefulSet is cleanupA2A's sentinel. The early exit
+// treats its absence as "an earlier pass reached the end", which is only true
+// while nothing is deleted after it. It is placed after the callout
+// ClusterRoleBinding, provision Jobs, and NATS bus resources so that a pass
+// dying anywhere earlier leaves the StatefulSet standing to resume cleanup (#2216).
+func (r *PlatformAgentReconciler) deleteA2ANATSStatefulSet(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}
+	return r.deleteOwnedA2AObject(ctx, agent, sts, r.Client)
 }
 
 // deleteA2AProvisionJobs deletes this agent's provision Jobs, found by label
@@ -4773,8 +4827,17 @@ func (r *PlatformAgentReconciler) deleteA2ACalloutClusterRoleBinding(ctx context
 	}
 	// Ownership by label, since the refusal the named objects get cannot
 	// apply: there is no owner reference to check.
+	// An unowned or squatted binding is not residue of this CR and is left
+	// to its owner; refusing to delete it must not wedge teardown or retry
+	// forever (the same skip-and-continue discipline deleteA2AProvisionJobs
+	// uses for unowned Jobs).
 	if crb.Labels[labelInstance] != instanceLabel(agent.Namespace, agent.Name) {
-		return fmt.Errorf("refusing to delete unowned A2A ClusterRoleBinding %s", crb.Name)
+		logf.FromContext(ctx).Info("skipping unowned A2A callout ClusterRoleBinding",
+			"binding", crb.Name,
+			"instance", crb.Labels[labelInstance],
+			"expectedInstance", instanceLabel(agent.Namespace, agent.Name),
+		)
+		return nil
 	}
 	return client.IgnoreNotFound(r.Delete(ctx, crb))
 }

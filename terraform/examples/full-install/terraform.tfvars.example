@@ -97,6 +97,14 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # Output tokens the gateway asks for on a request that names none; 0 renders
 # nothing. For a self-hosted backend whose prompt and output share one window.
 # model_max_tokens   = 0
+# Redaction of every request body the gateway forwards to the provider; off by
+# default. ip_action is pseudonym, mask or off. See variables.tf.
+# litellm_redaction = {
+#   enabled     = true
+#   ip_action   = "pseudonym"
+#   allow_cidrs = ["127.0.0.0/8"]
+#   rules       = [{ name = "cluster-name", literal = "prod-eu-1", action = "pseudonym" }]
+# }
 
 # Vertex AI / Model Garden instead of an API-key provider — see variables.tf.
 # vertex_project_id defaults to the install's project; vertex_location defaults

@@ -294,7 +294,10 @@ func TestTheConsoleFenceIsDeletedAfterTheConsoleAndBeforeTheBus(t *testing.T) {
 	if session := idx("*v1.NetworkPolicy/" + a2aSessionNetpolName(agent)); fence < session {
 		t.Errorf("console fence at %d, before the session fence at %d", fence, session)
 	}
-	if sts := idx("*v1.StatefulSet/" + a2aNATSName(agent)); fence > sts {
+	// cleanupA2A deletes the StatefulSet sentinel after this whole walk, so
+	// being in the walk is being before it. Should the StatefulSet move back
+	// into the walk, the order still has to hold.
+	if sts, ok := pos["*v1.StatefulSet/"+a2aNATSName(agent)]; ok && fence > sts {
 		t.Errorf("console fence at %d, after the StatefulSet sentinel at %d", fence, sts)
 	}
 }

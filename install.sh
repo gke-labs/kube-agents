@@ -505,6 +505,11 @@ PARAM_MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-}"
 # Empty takes DEFAULT_MODEL_MAX_TOKENS (0, no budget) in the tfvars generator,
 # as an empty MODEL_DEFAULT_NAME takes the provider's default model.
 PARAM_MODEL_MAX_TOKENS="${MODEL_MAX_TOKENS:-}"
+# Empty takes the DEFAULT_LITELLM_REDACTION_* values in the tfvars generator.
+# The rules have no flag and are read from LITELLM_REDACTION_RULES directly.
+PARAM_LITELLM_REDACTION_ENABLED="${LITELLM_REDACTION_ENABLED:-}"
+PARAM_LITELLM_REDACTION_IP_ACTION="${LITELLM_REDACTION_IP_ACTION:-}"
+PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS="${LITELLM_REDACTION_IP_ALLOW_CIDRS:-}"
 PARAM_USER_PROFILE_ENABLED="${USER_PROFILE_ENABLED:-}"
 # Slack, seeded from the loaded configuration exactly as Google Chat is above,
 # and for the same reason: the chat interview reads these rather than the
@@ -559,6 +564,16 @@ Flags for AI Agents & Automation:
                                 whose prompt and output share one window
                                 (default: DEFAULT_MODEL_MAX_TOKENS, currently 0:
                                 no max_tokens is rendered)
+  --litellm-redaction[=BOOL]    Redact every request body the gateway forwards to the
+                                provider: credentials, IP literals and the rules in
+                                LITELLM_REDACTION_RULES (install.env only)
+                                (default: DEFAULT_LITELLM_REDACTION_ENABLED, currently false)
+  --litellm-redaction-ip-action=ACTION
+                                What redaction does with IP literals: pseudonym | mask | off
+                                (default: DEFAULT_LITELLM_REDACTION_IP_ACTION, currently pseudonym)
+  --litellm-redaction-ip-allow-cidrs=LIST
+                                Comma- or space-separated networks, in CIDR form, whose
+                                addresses the model still sees
   --vertex-project-id=ID        GCP project serving Vertex AI models (default: --gcp-project-id)
   --vertex-location=LOCATION    Vertex AI serving location, a region or "global"
                                 (default: DEFAULT_VERTEX_LOCATION, currently global)
@@ -760,7 +775,9 @@ validate_bool_flag_value() {
 # project" in silence: applied, an empty --scope-projects= would revoke the
 # scoped projects' roles and retire their profiles while install.env still
 # named them, and the next upgrade would add them back. Refused, like an empty
-# toggle; the file is where a scope is emptied on purpose.
+# toggle; the file is where a scope is emptied on purpose. The two gateway
+# redaction value flags take the same check: empty, they would replace the
+# recorded IP action or allowlist for one run without a word.
 require_scope_flag_value() {
   local flag="$1" value="${2:-}" key
   # A value that is nothing but separators (`,`, a space) renders the same
@@ -773,6 +790,8 @@ require_scope_flag_value() {
     --scope-shared-vpc-hosts) key="SCOPE_SHARED_VPC_HOSTS" ;;
     --scope-metrics-scopes) key="SCOPE_METRICS_SCOPES" ;;
     --scope-exclude-projects) key="SCOPE_EXCLUDE_PROJECTS" ;;
+    --litellm-redaction-ip-action) key="LITELLM_REDACTION_IP_ACTION" ;;
+    --litellm-redaction-ip-allow-cidrs) key="LITELLM_REDACTION_IP_ALLOW_CIDRS" ;;
     *) key="SCOPE_EXCLUDE_CLUSTERS" ;;
   esac
   print_error "${flag}= was given an empty value."
@@ -795,6 +814,15 @@ parse_args() {
       --model-provider=*) PARAM_MODEL_PROVIDER="${1#*=}"; shift ;;
       --model-default-name=*) PARAM_MODEL_DEFAULT_NAME="${1#*=}"; shift ;;
       --model-max-tokens=*) PARAM_MODEL_MAX_TOKENS="${1#*=}"; shift ;;
+      --litellm-redaction|--litellm-redaction=*)
+        PARAM_LITELLM_REDACTION_ENABLED="$(flag_bool_value "$1")"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_LITELLM_REDACTION_ENABLED"; shift ;;
+      --litellm-redaction-ip-action=*)
+        PARAM_LITELLM_REDACTION_IP_ACTION="${1#*=}"; PARAM_LITELLM_REDACTION_IP_ACTION_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_LITELLM_REDACTION_IP_ACTION"; shift ;;
+      --litellm-redaction-ip-allow-cidrs=*)
+        PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS="${1#*=}"
+        require_scope_flag_value "${1%%=*}" "$PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS"; shift ;;
       --vertex-project-id=*) PARAM_VERTEX_PROJECT_ID="${1#*=}"; shift ;;
       --vertex-location=*) PARAM_VERTEX_LOCATION="${1#*=}"; shift ;;
       --vertex-manage-serving-project=*) PARAM_VERTEX_MANAGE_SERVING_PROJECT="${1#*=}"; shift ;;
@@ -1884,6 +1912,23 @@ bootstrap_install_env_file() {
       "$drift_detector_consequence" \
       true \
       "every later install.sh run -- and upgrade.sh takes no such flag, regenerating tfvars from the file and from whatever the calling shell still exports, so the file is the only remedy that does not depend on which shell runs the upgrade"
+    # Gateway redaction: a flag turns it on for this run, and the next
+    # upgrade.sh or --menu apply regenerates from the file.
+    warn_flag_beats_unrecorded_file_value "$destination" LITELLM_REDACTION_ENABLED --litellm-redaction \
+      "${PARAM_LITELLM_REDACTION_ENABLED:-}" \
+      "A later run without it renders gateway redaction from what the file records, so the next upgrade.sh or --menu apply turns off redaction this run turned on." \
+      true \
+      "every later install.sh run"
+    warn_flag_beats_unrecorded_file_value "$destination" LITELLM_REDACTION_IP_ACTION --litellm-redaction-ip-action \
+      "${PARAM_LITELLM_REDACTION_IP_ACTION:-}" \
+      "A later run without it takes the IP action the file records, or pseudonym when it records none." \
+      false \
+      "every later install.sh run"
+    warn_flag_beats_unrecorded_file_value "$destination" LITELLM_REDACTION_IP_ALLOW_CIDRS --litellm-redaction-ip-allow-cidrs \
+      "${PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS:-}" \
+      "A later run without it takes the networks the file records, and the model stops seeing the addresses only this run allowed." \
+      false \
+      "every later install.sh run"
     # The scope keys: a flag applies its declaration for this run, and the
     # next full upgrade regenerates from the file, so a project the file does
     # not name is dropped again, its bindings revoked and its profiles retired.
@@ -1932,6 +1977,10 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" MODEL_PROVIDER "${MODEL_PROVIDER:-}"
   write_env_var "$tmp" MODEL_DEFAULT_NAME "${MODEL_DEFAULT_NAME:-}"
   write_env_var "$tmp" MODEL_MAX_TOKENS "${MODEL_MAX_TOKENS:-}"
+  write_env_var "$tmp" LITELLM_REDACTION_ENABLED "${LITELLM_REDACTION_ENABLED:-$DEFAULT_LITELLM_REDACTION_ENABLED}"
+  write_env_var "$tmp" LITELLM_REDACTION_IP_ACTION "${LITELLM_REDACTION_IP_ACTION:-$DEFAULT_LITELLM_REDACTION_IP_ACTION}"
+  write_env_var "$tmp" LITELLM_REDACTION_IP_ALLOW_CIDRS "${LITELLM_REDACTION_IP_ALLOW_CIDRS:-}"
+  write_env_var "$tmp" LITELLM_REDACTION_RULES "${LITELLM_REDACTION_RULES:-}"
   write_env_var "$tmp" VERTEX_PROJECT_ID "${VERTEX_PROJECT_ID:-}"
   write_env_var "$tmp" VERTEX_LOCATION "${VERTEX_LOCATION:-}"
   write_env_var "$tmp" VERTEX_MANAGE_SERVING_PROJECT "${VERTEX_MANAGE_SERVING_PROJECT:-}"
@@ -3648,6 +3697,18 @@ validate_model_max_tokens() {
   fi
 }
 
+# --litellm-redaction-ip-action: refused here so the message names the flag.
+# The tfvars generator checks again, while redaction is on, for upgrade.sh and
+# the menu, which regenerate from install.env without this interview. Needs
+# installer_common.sh sourced.
+validate_litellm_redaction_ip_action() {
+  local value="${PARAM_LITELLM_REDACTION_IP_ACTION:-$DEFAULT_LITELLM_REDACTION_IP_ACTION}"
+  if ! is_valid_redaction_ip_action "$value"; then
+    print_error "--litellm-redaction-ip-action must be one of pseudonym, mask, off, got '${value}'."
+    return 1
+  fi
+}
+
 # Validates explicit values for existing-cluster opt-in flags (loud like --enable-gvisor)
 validate_existing_cluster_opt_in_flags() {
   if { [ "${PARAM_MIGRATE_NODE_POOLS_PASSED:-false}" = "true" ] || [ -n "${PARAM_MIGRATE_NODE_POOLS:-}" ]; } && \
@@ -4913,6 +4974,23 @@ main() {
   fi
   local model_max_tokens="${PARAM_MODEL_MAX_TOKENS:-${MODEL_MAX_TOKENS:-}}"
   validate_model_max_tokens || exit 1
+  local redaction_ip_action="${PARAM_LITELLM_REDACTION_IP_ACTION:-$DEFAULT_LITELLM_REDACTION_IP_ACTION}"
+  # Checked here as well as in the generator, so a bad value stops the run
+  # before the rest of the interview rather than after it. A misspelt toggle is
+  # refused rather than read as off. While redaction is off the recorded IP
+  # action and rules are inert, as in the generator; an IP action typed on this
+  # run is checked either way.
+  local redaction_enabled="${PARAM_LITELLM_REDACTION_ENABLED:-$DEFAULT_LITELLM_REDACTION_ENABLED}"
+  if ! is_bool_spelling "$redaction_enabled"; then
+    print_error "LITELLM_REDACTION_ENABLED='${redaction_enabled}' is neither true nor false. Fix it in install.env."
+    exit 1
+  fi
+  if is_truthy "$redaction_enabled" || [ "${PARAM_LITELLM_REDACTION_IP_ACTION_PASSED:-false}" = "true" ]; then
+    validate_litellm_redaction_ip_action || exit 1
+  fi
+  if is_truthy "$redaction_enabled" && [ -n "${LITELLM_REDACTION_RULES:-}" ]; then
+    hcl_redaction_rules "$LITELLM_REDACTION_RULES" >/dev/null || exit 1
+  fi
 
   # Vertex authenticates with Workload Identity rather than an API key, so these
   # two are the only credentials it needs. The project defaults to the install
@@ -5533,6 +5611,9 @@ main() {
   export MODEL_PROVIDER="$model_provider"
   export MODEL_DEFAULT_NAME="$model_default_name"
   export MODEL_MAX_TOKENS="$model_max_tokens"
+  export LITELLM_REDACTION_ENABLED="$redaction_enabled"
+  export LITELLM_REDACTION_IP_ACTION="$redaction_ip_action"
+  export LITELLM_REDACTION_IP_ALLOW_CIDRS="$PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS"
   export VERTEX_PROJECT_ID="$vertex_project_id"
   export VERTEX_LOCATION="$vertex_location"
   export VERTEX_MANAGE_SERVING_PROJECT="$vertex_manage_serving_project"

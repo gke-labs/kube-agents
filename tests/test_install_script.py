@@ -994,6 +994,17 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("MAX=4096", proc.stdout)
 
+    def test_parse_args_litellm_redaction_flags_are_read(self):
+        cmd = (
+            "parse_args --litellm-redaction --litellm-redaction-ip-action=mask "
+            "--litellm-redaction-ip-allow-cidrs=127.0.0.0/8,fd00::/8; "
+            'echo "ON=$PARAM_LITELLM_REDACTION_ENABLED ACTION=$PARAM_LITELLM_REDACTION_IP_ACTION '
+            'CIDRS=$PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS"'
+        )
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("ON=true ACTION=mask CIDRS=127.0.0.0/8,fd00::/8", proc.stdout)
+
     def test_model_max_tokens_defaults_to_unset(self):
         cmd = 'echo "MAX=[$PARAM_MODEL_MAX_TOKENS]"'
         proc = self._run_install_func(cmd)
@@ -4971,6 +4982,181 @@ class ModelMaxTokensPersistsThroughInstallEnvTest(unittest.TestCase):
         self.assertLess(exported, bootstrap)
 
 
+class LitellmRedactionPersistsThroughInstallEnvTest(unittest.TestCase):
+    """The same walk for the LITELLM_REDACTION_* keys: the first run records
+    what main() exported, the next run's parameter block and environment read
+    it back, and the rules survive the %q quoting as the JSON they were."""
+
+    _bootstrap_with_export = ModelMaxTokensPersistsThroughInstallEnvTest._bootstrap_with_export
+    _read_back = ModelMaxTokensPersistsThroughInstallEnvTest._read_back
+
+    _RULES = '[{"name":"cluster-name","literal":"prod eu 1","action":"pseudonym"},{"name":"p","pattern":"a${b}\\\\d"}]'
+    _EXPORTS = (
+        'export LITELLM_REDACTION_ENABLED=true LITELLM_REDACTION_IP_ACTION=mask '
+        'LITELLM_REDACTION_IP_ALLOW_CIDRS="127.0.0.0/8, fd00::/8"; '
+        f"export LITELLM_REDACTION_RULES='{_RULES}'"
+    )
+
+    @staticmethod
+    def _env(overrides):
+        env = get_isolated_test_env(overrides=overrides)
+        for key in (
+            "LITELLM_REDACTION_ENABLED",
+            "LITELLM_REDACTION_IP_ACTION",
+            "LITELLM_REDACTION_IP_ALLOW_CIDRS",
+            "LITELLM_REDACTION_RULES",
+        ):
+            env.pop(key, None)
+        env.update(overrides)
+        return env
+
+    def test_the_first_run_records_the_export_and_the_next_run_reads_it_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(tmp, self._EXPORTS)
+            out = self._read_back(
+                dest,
+                'echo "ON=[$PARAM_LITELLM_REDACTION_ENABLED] ACTION=[$PARAM_LITELLM_REDACTION_IP_ACTION]"; '
+                'echo "CIDRS=[$PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS]"; '
+                "bash -c 'printf \"RULES=[%s]\\n\" \"$LITELLM_REDACTION_RULES\"'",
+            )
+            self.assertIn("ON=[true] ACTION=[mask]", out)
+            self.assertIn("CIDRS=[127.0.0.0/8, fd00::/8]", out)
+            self.assertIn(f"RULES=[{self._RULES}]", out)
+
+    def test_an_unset_value_is_recorded_as_the_default_and_reads_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(tmp, ":")
+            text = dest.read_text()
+            self.assertIn("LITELLM_REDACTION_ENABLED=false\n", text)
+            self.assertIn("LITELLM_REDACTION_IP_ACTION=pseudonym\n", text)
+            self.assertIn("LITELLM_REDACTION_IP_ALLOW_CIDRS=''\n", text)
+            self.assertIn("LITELLM_REDACTION_RULES=''\n", text)
+
+    def test_a_flag_on_a_later_run_beats_the_recorded_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(tmp, self._EXPORTS)
+            out = self._read_back(
+                dest,
+                "parse_args --litellm-redaction=false --litellm-redaction-ip-action=off; "
+                'echo "ON=[$PARAM_LITELLM_REDACTION_ENABLED] ACTION=[$PARAM_LITELLM_REDACTION_IP_ACTION]"',
+            )
+            self.assertIn("ON=[false] ACTION=[off]", out)
+
+    def test_the_ip_action_validator_names_the_flag_and_refuses_anything_else(self):
+        for value, ok in (("pseudonym", True), ("mask", True), ("off", True), ("hash", False), ("OFF", False)):
+            with self.subTest(value=value):
+                proc = subprocess.run(
+                    ["bash", "-c",
+                     f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                     "source scripts/installer/installer_common.sh\n"
+                     f"parse_args --litellm-redaction-ip-action={value}; validate_litellm_redaction_ip_action"],
+                    capture_output=True, text=True, env=self._env({}), cwd=str(_REPO_ROOT),
+                )
+                if ok:
+                    self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                else:
+                    self.assertNotEqual(proc.returncode, 0)
+                    self.assertIn("--litellm-redaction-ip-action must be one of", proc.stdout + proc.stderr)
+
+    def test_an_empty_value_flag_is_refused_rather_than_replacing_the_recorded_one(self):
+        for flag, key in (
+            ("--litellm-redaction-ip-action", "LITELLM_REDACTION_IP_ACTION"),
+            ("--litellm-redaction-ip-allow-cidrs", "LITELLM_REDACTION_IP_ALLOW_CIDRS"),
+        ):
+            with self.subTest(flag=flag):
+                proc = subprocess.run(
+                    ["bash", "-c",
+                     f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                     f'parse_args {flag}=; echo "PASSED"'],
+                    capture_output=True, text=True, env=self._env({key: "mask"}), cwd=str(_REPO_ROOT),
+                )
+                self.assertNotIn("PASSED", proc.stdout)
+                self.assertIn(f"{flag}= was given an empty value", proc.stdout + proc.stderr)
+                self.assertIn(f"set {key}= (empty) in install.env", proc.stdout + proc.stderr)
+
+    def test_a_typed_ip_action_is_marked_so_main_checks_it_with_redaction_off(self):
+        proc = subprocess.run(
+            ["bash", "-c",
+             f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+             "source scripts/installer/installer_common.sh\n"
+             'parse_args --litellm-redaction-ip-action=hash; echo "PASSED=$PARAM_LITELLM_REDACTION_IP_ACTION_PASSED"\n'
+             "validate_litellm_redaction_ip_action"],
+            capture_output=True, text=True, env=self._env({}), cwd=str(_REPO_ROOT),
+        )
+        self.assertIn("PASSED=true", proc.stdout)
+        self.assertNotEqual(proc.returncode, 0)
+
+    def _bootstrap_over(self, tmp, recorded, script):
+        existing = pathlib.Path(tmp) / "install.env"
+        existing.write_text(recorded)
+        existing.chmod(0o600)
+        proc = subprocess.run(
+            ["bash", "-c",
+             f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+             "source scripts/installer/installer_common.sh\n"
+             "resolve_shared_defaults\n"
+             "PARAM_DRY_RUN=false; PARAM_MEMORY=file\n"
+             f'{script}\nbootstrap_install_env_file "{existing}" some-tag'],
+            capture_output=True, text=True, cwd=str(_REPO_ROOT),
+            env=self._env({"KUBE_AGENTS_INSTALL_ENV": str(existing), "PROJECT_ID": "p",
+                           "CLUSTER_NAME": "c", "REGION": "us-central1"}),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(existing.read_text(), recorded, "an existing install.env is never rewritten")
+        return proc.stdout + proc.stderr
+
+    def test_a_flag_over_a_file_that_does_not_record_it_warns_that_the_next_upgrade_reverts_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._bootstrap_over(
+                tmp, "PROJECT_ID=p\n",
+                'PARAM_LITELLM_REDACTION_ENABLED=true; PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS="10.0.0.0/8 fd00::/8"',
+            )
+        self.assertIn("--litellm-redaction=true applies to this run only", out)
+        self.assertIn("records no LITELLM_REDACTION_ENABLED", out)
+        self.assertIn("turns off redaction this run turned on", out)
+        self.assertIn("Set LITELLM_REDACTION_ENABLED=true in", out)
+        self.assertIn("Set LITELLM_REDACTION_IP_ALLOW_CIDRS=10.0.0.0/8\\ fd00::/8 in", out)
+
+    def test_a_run_that_agrees_with_the_file_is_silent(self):
+        # PARAM_* is seeded from the file, and a recorded yes reads as true.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._bootstrap_over(
+                tmp, "LITELLM_REDACTION_ENABLED=yes\nLITELLM_REDACTION_IP_ACTION=mask\n",
+                "PARAM_LITELLM_REDACTION_ENABLED=true; PARAM_LITELLM_REDACTION_IP_ACTION=mask",
+            )
+        self.assertNotIn("applies to this run only", out)
+
+    def test_main_validates_then_exports_before_the_generator_and_the_bootstrap(self):
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        seed_line = 'local redaction_ip_action="${PARAM_LITELLM_REDACTION_IP_ACTION:-$DEFAULT_LITELLM_REDACTION_IP_ACTION}"'
+        validate_line = "validate_litellm_redaction_ip_action || exit 1"
+        export_lines = (
+            'export LITELLM_REDACTION_ENABLED="$redaction_enabled"',
+            'export LITELLM_REDACTION_IP_ACTION="$redaction_ip_action"',
+            'export LITELLM_REDACTION_IP_ALLOW_CIDRS="$PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS"',
+        )
+        rules_line = 'hcl_redaction_rules "$LITELLM_REDACTION_RULES" >/dev/null || exit 1'
+        toggle_line = 'if ! is_bool_spelling "$redaction_enabled"; then'
+        gate_line = 'if is_truthy "$redaction_enabled" || [ "${PARAM_LITELLM_REDACTION_IP_ACTION_PASSED:-false}" = "true" ]; then'
+        for line in (seed_line, validate_line, rules_line, toggle_line, gate_line, *export_lines):
+            self.assertIn(line, text[main_start:], f"main() no longer carries: {line}")
+        # The early checks stop the run before the rest of the interview.
+        gitops_step = text.index('print_step "8. GitOps Infrastructure Repository Setup"', main_start)
+        for line in (toggle_line, gate_line, validate_line, rules_line):
+            self.assertLess(text.index(line, main_start), gitops_step, line)
+        seed = text.index(seed_line, main_start)
+        validated = text.index(validate_line, main_start)
+        generator = text.index('write_tfvars_from_state "$tfvars_file" "$image_tag"', main_start)
+        bootstrap = text.index('bootstrap_install_env_file "$INSTALL_ENV_FILE" "$image_tag"', main_start)
+        self.assertLess(seed, validated)
+        for line in export_lines:
+            exported = text.index(line, main_start)
+            self.assertLess(validated, exported)
+            self.assertLess(exported, generator)
+            self.assertLess(exported, bootstrap)
+
+
 class FrontDoorsAgreeOnTheRepositoryTest(unittest.TestCase):
     """Each front door clones the install sources before it has a checkout to
     read the URL from, so each carries the URL; this pins the three equal."""
@@ -8262,6 +8448,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
         "--enable-stockout-investigator",
         "--enable-drift-detector",
         "--enable-hermes-dashboard",
+        "--litellm-redaction",
     ]
 
     def _parse_args(self, *args, **env_overrides):
@@ -8305,6 +8492,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
         "--enable-pubsub-platform": "ENABLE_PUBSUB_PLATFORM",
         "--enable-stockout-investigator": "ENABLE_STOCKOUT_INVESTIGATOR",
         "--enable-drift-detector": "ENABLE_DRIFT_DETECTOR",
+        "--litellm-redaction": "LITELLM_REDACTION_ENABLED",
     }
 
     def test_a_spelling_seeded_from_install_env_is_never_judged(self):

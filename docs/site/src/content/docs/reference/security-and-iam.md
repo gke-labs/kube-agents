@@ -178,7 +178,7 @@ With `MODEL_PROVIDER=vertex_ai` the LiteLLM gateway gets its own KSA (`kubeagent
 
 ### What leaves for the model provider
 
-The gateway is the one point every provider request transits, and the chart can make it redact those requests: `litellm.redaction.enabled=true` runs the shared `AuditRedactor` as a LiteLLM pre-call hook, masking the built-in credential shapes and masking or pseudonymising IP literals and any operator-named identifiers before the body leaves the cluster. It is off by default, it covers request bodies only, and a pseudonymised identifier is one the agent can no longer act on; [Inference gateway](/kube-agents/concepts/inference-gateway/#redaction-at-the-gateway) owns the rules, the actions and that limitation.
+The gateway is the one point every provider request transits, and the chart can make it redact those requests: `litellm.redaction.enabled=true` (`LITELLM_REDACTION_ENABLED=true` in `install.env`, or the Terraform example's `litellm_redaction` variable) runs the shared `AuditRedactor` as a LiteLLM pre-call hook, masking the built-in credential shapes and masking or pseudonymising IP literals and any operator-named identifiers before the body leaves the cluster. It is off by default, it covers request bodies only, and a pseudonymised identifier is one the agent can no longer act on; [Inference gateway](/kube-agents/concepts/inference-gateway/#redaction-at-the-gateway) owns the rules, the actions and that limitation.
 
 ### Each A2A session pod is its own bus identity
 
