@@ -23,7 +23,7 @@ import (
 //
 // Instead of a cold `hermes chat -Q` per task, the bridge POSTs the task's
 // text to the Hermes API server in the same pod, which runs it under the
-// gateway's default profile, the persona that answers the same message on
+// gateway's own profile (default on a stock install), the persona that answers the same message on
 // the chat path, delegating through kanban. Two headers make the turn part
 // of a conversation rather than a one-off: X-Hermes-Session-Key, the
 // long-term-memory scope, and X-Hermes-Session-Id, the session whose history

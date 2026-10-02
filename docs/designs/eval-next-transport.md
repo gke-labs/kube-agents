@@ -355,7 +355,7 @@ the chat profile's `kanban_create` — is a different matter: the door addresses
 and the bridge's `cli` executor answers it with the platform profile, so
 `hack/eval/inject-lane-exclusions.txt` keeps it off this lane's matrix with the reason, and the
 api lane's roster is untouched. The bridge's default `api` executor runs the turn under the
-pod's API server, whose profile is the chat path's `default` one, so the premise may now hold on
+pod's API server, whose profile is the chat path's own (`default` on a stock install), so the premise may now hold on
 this lane; the exclusion stays until a run on that executor shows the case grading.
 `ledger_issue_contains` finds the ledger by scanning the final message for a GitHub issue URL, so
 it works on any transport that maps a result into the final message, which both new transports

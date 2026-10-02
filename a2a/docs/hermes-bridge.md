@@ -207,8 +207,8 @@ letters, digits, `_` and `-`, or is longer than 128 characters, is replaced by `
 hex characters of its SHA-256, so an odd one still maps to one session and never to a path. A
 task with no `contextId` gets a session of its own, `a2a-task-<task id>`.
 
-The turn runs under the API server's profile, the gateway's `default` one that answers the
-same message on the chat path and delegates through kanban, not under `BRIDGE_PROFILE`. Two
+The turn runs under the API server's profile, the gateway's own (`default` on a stock install,
+the Planning Agent) that answers the same message on the chat path and delegates through kanban, not under `BRIDGE_PROFILE`. Two
 tasks in one session are serialized: the second waits for the first's turn to end, as a second
 chat message waits in a chat platform's session. Tasks in different sessions run side by side
 up to `BRIDGE_CONCURRENCY`, and a task waiting for its session's turn holds a worker.
@@ -454,7 +454,7 @@ process in the pod now posts to the door, and a delivery's `session_id` is what 
 it counts for the task whose session id matches and which holds that session's turn at the
 moment, and is dropped otherwise, so a kanban worker's or a chat message's tool calls, which
 carry their own session ids, never reach an A2A trace. Kanban work the turn delegates is
-therefore absent from the trace; only the default profile's own calls appear. The `cli`
+therefore absent from the trace; only the gateway profile's own calls appear. The `cli`
 executor still uses a per-task key, and a child it spawns drops the pod-wide entry from the
 managed config it is given, so a delivery is never signed twice.
 
