@@ -1217,8 +1217,9 @@ Mutation(
          'Audience:          "kubeagents-credential-proxy",'),
         "test_C1_a_session_pod_carries_no_kubernetes_identity",
         "mint the session pod's broker token for the shell's audience instead "
-        "of the session one, which the broker maps to the shell role: git, gh, "
-        "the forge and workspace routes and the API relay. The fence test "
+        "of the session one. The broker's session-callers binding would refuse "
+        "that token at authentication, so this is the fence test's own layer "
+        "being checked, not the broker's. The fence test "
         "accepts exactly two audiences by constant name, the bus and the "
         "broker's session audience; a literal third is a destination the "
         "fence never admitted, and this is the quiet version because the pod "
@@ -1235,6 +1236,17 @@ Mutation(
         "TokenReview names the singular, so every session pod's kubectl is "
         "refused as an unknown audience -- with both Go suites green, because "
         "each module's test compares its constant to itself",
+    ),
+    Mutation(
+        "C1-shim-token-env-renamed-in-the-spawner",
+        "a2a/gateway/spawn.go",
+        ('Name: "CREDENTIAL_PROXY_TOKEN_FILE"', 'Name: "CREDENTIAL_PROXY_TOKEN_PATH"'),
+        "test_C1_the_session_broker_audience_and_view_env_agree_across_the_module_boundary",
+        "rename the shim's token-file variable in the module that sets it. The "
+        "shim keeps reading CREDENTIAL_PROXY_TOKEN_FILE, finds nothing, sends no "
+        "Authorization header, and every brokered command from every session "
+        "pod is a 401 -- with the Go suite and the Python suite both green, "
+        "because neither names the other's spelling",
     ),
     Mutation(
         "C1-cluster-view-env-renamed-on-the-gateway-side",

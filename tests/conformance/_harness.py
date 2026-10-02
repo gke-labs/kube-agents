@@ -273,6 +273,12 @@ SOURCES: dict[str, Source] = {
     # The gateway's env contract with the operator (module a2a reading what
     # module k8s-operator renders). C1 pins the cluster-view names across the
     # boundary; the anchors are the two names and a long-standing neighbour.
+    # The broker's shim, which the worker image carries as kubectl/gcloud and
+    # the spawner configures through three env names it spells itself.
+    "credential_proxy_client": Source(
+        "agents/platform/scripts/credential_proxy_client.py",
+        ("CREDENTIAL_PROXY_URL", "CREDENTIAL_PROXY_TOKEN_FILE", "HERMES_HOME"),
+    ),
     "a2a_gateway_config": Source(
         "a2a/gateway/config.go",
         ("A2A_DEFAULT_ADDRESSEE", "A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL"),

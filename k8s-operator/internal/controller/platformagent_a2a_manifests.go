@@ -1898,7 +1898,8 @@ func a2aSessionNetpolName(agent *agentv1alpha1.PlatformAgent) string {
 // the delegation path was the way around the agent's own allowlist.
 //
 // Deny-by-default with three destinations, which is the whole of a worker's
-// job description:
+// job description (plus a fourth, the credential broker on its one port, only
+// under the operator's cluster-view flag; see the rule at the end):
 //
 //	DNS       — name resolution for the two peers below, same peer set the
 //	            agent's egress policy uses so the two cannot drift on what DNS

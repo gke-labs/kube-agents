@@ -1072,6 +1072,20 @@ class C1IsolationIsStructural(unittest.TestCase):
                 one(r'Name:\s*"%s"' % name, a2a_manifests, "the operator's render of %s" % name)
                 one(r'os\.Getenv\("%s"\)' % name, config, "the gateway's read of %s" % name)
 
+        # The shim's half: the spawner sets three names and the client reads
+        # three names, in a Go module and a Python script that share nothing.
+        # A rename on either side ships green and the first kubectl of the
+        # first flag-on session fails with "CREDENTIAL_PROXY_URL is not
+        # configured", a 401, or a kubeconfig filed under /opt/data.
+        shim = h.text("credential_proxy_client")
+        for name in ("CREDENTIAL_PROXY_URL", "CREDENTIAL_PROXY_TOKEN_FILE", "HERMES_HOME"):
+            with self.subTest(env=name):
+                one(r'Name:\s*"%s"' % name, spawner, "the spawner's render of %s" % name)
+                self.assertTrue(
+                    re.search(r'environ(?:\.get)?\(\s*"%s"' % name, shim) or re.search(r'getenv\(\s*"%s"' % name, shim),
+                    "the shim no longer reads %s by that name" % name,
+                )
+
     def test_C1_the_reserved_bus_token_file_env_is_spelled_the_same_in_both_modules(
         self,
     ) -> None:
