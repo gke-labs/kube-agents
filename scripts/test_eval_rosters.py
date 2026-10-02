@@ -110,6 +110,7 @@ ADDED_AFTER_THE_SPLIT = [
 # Appended at the tail of the nightly file.
 ADDED_AT_THE_TAIL = [
     "chat-routing-own-cluster-namespaces",
+    "chat-reset-history-names-the-command",  # the front door's reset-request reply, #2189
 ]
 MOVED_TO_NIGHTLY = [
     "cluster-agent-pending-replicas-capped-pool",

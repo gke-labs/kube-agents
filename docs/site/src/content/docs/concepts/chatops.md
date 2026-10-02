@@ -67,6 +67,8 @@ Slack only routes a leading-slash message to the app's slash handler if that sla
 
 Until you do, a typed `/hermes <subcommand>` arrives as an ordinary channel message rather than a command. The `legacy_slash_commands` plugin on the Planning Agent profile unwraps that form before the gateway resolves it, so `/hermes sethome` behaves as `/sethome` either way — registering the slashes adds Slack's autocomplete, not the behaviour. The plugin's [README](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/plugins/legacy_slash_commands/README.md) is the design of record.
 
+`/new` (alias `/reset`) starts a fresh session and history, after the gateway asks the user to confirm. Asking the Planning Agent in words to reset the chat gets that command named back: the agent cannot clear a conversation itself and does not claim to. `/undo` is disabled on this profile, because rewinding the chat reverses nothing a specialist has done.
+
 ### Home channel
 
 `SLACK_HOME_CHANNEL` designates the channel an unprompted message lands in when no user thread is involved. Set it to a monitoring/oncall channel your team already watches.
