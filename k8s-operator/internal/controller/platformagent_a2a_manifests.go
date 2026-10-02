@@ -41,6 +41,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	goerrors "errors"
 	"fmt"
 	"os"
 	"regexp"
@@ -4194,8 +4195,22 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// callout has stopped answering before its authorization is reaped, and
 	// before the StatefulSet sentinel below so that a pass dying on this
 	// delete leaves the sentinel standing to resume cleanup (#2216).
+	//
+	// An ownership refusal here is non-fatal for the rest of the walk: a
+	// squatted or foreign-owned ClusterRoleBinding will never be deleted by
+	// this operator, so letting its refusal abort teardown before the
+	// StatefulSet is deleted would leave a running NATS StatefulSet stranded
+	// with its Service and config Secret already gone, on every reconcile.
+	// We record the refusal, proceed to reap provision Jobs and the StatefulSet,
+	// and return the error after. Transient API errors on an owned binding
+	// remain fatal so the StatefulSet sentinel stands to retry.
+	var crbRefusal error
 	if err := r.deleteA2ACalloutClusterRoleBinding(ctx, agent); err != nil {
-		return err
+		if goerrors.Is(err, errUnownedA2AClusterRoleBinding) {
+			crbRefusal = err
+		} else {
+			return err
+		}
 	}
 
 	// Provision Jobs carry a content hash in the name, one per generation
@@ -4209,7 +4224,11 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// LAST, deliberately: the StatefulSet is this function's sentinel. The
 	// early exit above treats its absence as "an earlier pass reached the
 	// end", which is only true while nothing is deleted after it.
-	return r.deleteA2ANATSStatefulSet(ctx, agent)
+	if err := r.deleteA2ANATSStatefulSet(ctx, agent); err != nil {
+		return err
+	}
+
+	return crbRefusal
 }
 
 // deleteA2ANATSStatefulSet reaps the NATS StatefulSet.
@@ -4272,6 +4291,10 @@ func (r *PlatformAgentReconciler) deleteA2AProvisionJobs(ctx context.Context, ag
 	return nil
 }
 
+// errUnownedA2AClusterRoleBinding is returned when deleteA2ACalloutClusterRoleBinding
+// encounters a ClusterRoleBinding whose instance label does not match the agent.
+var errUnownedA2AClusterRoleBinding = goerrors.New("refusing to delete unowned A2A ClusterRoleBinding")
+
 // deleteA2ACalloutClusterRoleBinding reaps the callout's cluster-scoped grant.
 //
 // Called from two places, because there are two ways the next stack goes away:
@@ -4287,7 +4310,7 @@ func (r *PlatformAgentReconciler) deleteA2ACalloutClusterRoleBinding(ctx context
 	// Ownership by label, since the refusal the named objects get cannot
 	// apply: there is no owner reference to check.
 	if crb.Labels[labelInstance] != instanceLabel(agent.Namespace, agent.Name) {
-		return fmt.Errorf("refusing to delete unowned A2A ClusterRoleBinding %s", crb.Name)
+		return fmt.Errorf("%w %s", errUnownedA2AClusterRoleBinding, crb.Name)
 	}
 	return client.IgnoreNotFound(r.Delete(ctx, crb))
 }
