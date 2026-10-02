@@ -1029,6 +1029,7 @@ func TestARunningGatewayDoesNotReadTheSecret(t *testing.T) {
 
 func TestAGatewayIsNotRenderedWithoutAChatBackend(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "")
 	agent := a2aTestAgent()
 	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
@@ -1041,8 +1042,10 @@ func TestAGatewayIsNotRenderedWithoutAChatBackend(t *testing.T) {
 	if !state.gatewayDark {
 		t.Fatal("the render did not report the gateway withheld for want of a backend")
 	}
-	if !strings.Contains(state.gatewayDarkReason, a2aDiscordBotSecretName) || !strings.Contains(state.gatewayDarkReason, a2aInjectBackendEnvVar) {
-		t.Errorf("the reason does not name what would render the gateway: %q", state.gatewayDarkReason)
+	for _, remedy := range []string{a2aDiscordBotSecretName, a2aInjectBackendEnvVar, a2aAgentDoorEnvVar} {
+		if !strings.Contains(state.gatewayDarkReason, remedy) {
+			t.Errorf("the reason does not name %s as something that would render the gateway: %q", remedy, state.gatewayDarkReason)
+		}
 	}
 	if state.gatewayHeld {
 		t.Error("the callout gate was consulted for a gateway that is dark; the backend question comes first")
@@ -1055,6 +1058,7 @@ func TestAGatewayIsNotRenderedWithoutAChatBackend(t *testing.T) {
 
 func TestTheDiscordSecretRendersTheGateway(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "")
 	agent := a2aTestAgent()
 	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
@@ -1080,6 +1084,7 @@ func TestTheDiscordSecretRendersTheGateway(t *testing.T) {
 
 func TestTheInjectDoorRendersTheGatewayWithoutASecret(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "true")
+	t.Setenv(a2aAgentDoorEnvVar, "")
 	agent := a2aTestAgent()
 	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
@@ -1096,11 +1101,87 @@ func TestTheInjectDoorRendersTheGatewayWithoutASecret(t *testing.T) {
 	}
 }
 
+// TestTheA2ADoorRendersTheGatewayWithoutASecret: the A2A door is a backend
+// to the render the way the inject door is (gke-labs#2252 step 1). The
+// gateway binary accepts A2A_DOOR_LISTEN as its ingress (a2a/gateway/config.go,
+// "no chat backend"), so an install that arms the door alone must get its
+// gateway, or the door is a flag that renders four objects around a
+// Deployment that never exists.
+func TestTheA2ADoorRendersTheGatewayWithoutASecret(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "true")
+	agent := a2aTestAgent()
+	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	state, err := r.reconcileA2A(ctx, agent)
+	if err != nil {
+		t.Fatalf("reconcileA2A: %v", err)
+	}
+	if state.gatewayDark {
+		t.Fatalf("the A2A door is armed and the gateway is reported dark (%q); a door-only install would never get a gateway", state.gatewayDarkReason)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err != nil {
+		t.Fatalf("the gateway Deployment was not rendered with the A2A door armed: %v", err)
+	}
+	// And the door's own objects came with it, so the rendered gateway has
+	// the listener's token, map, Service and fence, not a bare flag.
+	for _, obj := range a2aDoorRenderedKinds() {
+		if err := cl.Get(ctx, types.NamespacedName{Name: a2aDoorName(agent), Namespace: agent.Namespace}, obj); err != nil {
+			t.Errorf("%T %s was not rendered beside the gateway: %v", obj, a2aDoorName(agent), err)
+		}
+	}
+}
+
+// TestADarkPassRemovesTheA2ADoor: the withheld path tears down what the flags
+// no longer arm, for the A2A door as for the inject door. The sequence that
+// reaches it: the door armed, the gateway rendered on it, the Deployment gone
+// (a rollout taken away by hand), then the flag off -- the next pass is dark
+// and must not leave the door's Service, map, token and fence behind.
+func TestADarkPassRemovesTheA2ADoor(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "true")
+	agent := a2aTestAgent()
+	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	if state, err := r.reconcileA2A(ctx, agent); err != nil || state.gatewayDark {
+		t.Fatalf("precondition: the door-only gateway renders (state=%+v err=%v)", state, err)
+	}
+	gw := &appsv1.Deployment{}
+	key := types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(ctx, key, gw); err != nil {
+		t.Fatalf("precondition: %v", err)
+	}
+	doorKey := types.NamespacedName{Name: a2aDoorName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(ctx, doorKey, &corev1.Service{}); err != nil {
+		t.Fatalf("precondition: the door's Service was not rendered, so this test proves nothing: %v", err)
+	}
+	if err := cl.Delete(ctx, gw); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv(a2aAgentDoorEnvVar, "")
+	state, err := r.reconcileA2A(ctx, agent)
+	if err != nil {
+		t.Fatalf("reconcileA2A with the flag off and no gateway: %v", err)
+	}
+	if !state.gatewayDark {
+		t.Fatal("the pass after the flag went off is not dark; nothing arms a backend")
+	}
+	for _, obj := range a2aDoorRenderedKinds() {
+		if err := cl.Get(ctx, doorKey, obj); !errors.IsNotFound(err) {
+			t.Errorf("%T %s survived the dark pass (err=%v)", obj, doorKey.Name, err)
+		}
+	}
+}
+
 // TestAnExistingGatewayKeepsReconcilingWithoutABackend: creation only. Taking
 // the Secret away from a running gateway must not withhold its reconcile,
 // because deleting the Deployment would take every session pod with it.
 func TestAnExistingGatewayKeepsReconcilingWithoutABackend(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "")
 	agent := a2aTestAgent()
 	r, cl, _ := a2aGateTestReconciler(t, agent)
 	ctx := context.Background()
@@ -1134,6 +1215,7 @@ func TestAnExistingGatewayKeepsReconcilingWithoutABackend(t *testing.T) {
 // the reason names the key.
 func TestADiscordSecretWithoutATokenIsNotABackend(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "")
 	agent := a2aTestAgent()
 	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()

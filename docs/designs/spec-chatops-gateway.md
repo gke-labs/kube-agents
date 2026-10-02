@@ -1260,9 +1260,12 @@ port-forward or an ingress is not the listen address. The operator renders the d
 it renders the inject door, under its own operator-level flag (`A2A_AGENT_DOOR=true`, never a
 CRD field): a loopback bind on its own port, its own one-entry map admitting one caller, a
 token Secret minted once, a ClusterIP Service for the port-forward, and the gateway fence
-under the door's own name, so each door comes and goes with its own flag. The identity
-classes above are what will let it be rendered on an install a customer reaches; until then
-it is a dev and eval door like the other.
+under the door's own name, so each door comes and goes with its own flag. The render counts
+the door as a backend the way it counts the inject door (`a2aGatewayBackend`): a `mode: next`
+install with no `discord-bot` Secret and this door armed gets its gateway rather than the
+`NoChatBackend` condition, which is what the gateway's own start-up check already accepts. The
+identity classes above are what will let it be rendered on an install a customer reaches; until
+then it is a dev and eval door like the other.
 
 ## What stage 2 builds from this doc
 

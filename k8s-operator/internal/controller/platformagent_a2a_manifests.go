@@ -3842,16 +3842,18 @@ type a2aProvisionState struct {
 // its Deployment without one is a crash loop by construction; the render
 // asks first. The answers, in the order the gateway itself accepts them:
 // the inject door armed on the operator (the eval install's case, #1660's
-// decision that the door alone is an ingress); the discord-bot Secret
-// present in the namespace. The Google Chat relay joins here when the
-// operator renders it (#1705), and the A2A door when its render lands.
+// decision that the door alone is an ingress); the A2A door armed on the
+// operator (the agent-caller install, gke-labs#2252 step 1, the same
+// decision: the gateway accepts A2A_DOOR_LISTEN as its ingress); the
+// discord-bot Secret present in the namespace. The Google Chat relay joins
+// here when the operator renders it (#1705).
 //
 // The Secret is read through a2aReader, uncached, for the reason every other
 // Secret read here is (see removeA2AInjectBackend): the operator ships
 // secrets with get only, and a cached Get would start a cluster-wide
 // informer whose LIST is forbidden.
 func (r *PlatformAgentReconciler) a2aGatewayBackend(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, string, error) {
-	if a2aInjectBackendEnabled() {
+	if a2aInjectBackendEnabled() || a2aAgentDoorEnabled() {
 		return true, "", nil
 	}
 	secret := &corev1.Secret{}
@@ -3866,13 +3868,15 @@ func (r *PlatformAgentReconciler) a2aGatewayBackend(ctx context.Context, agent *
 		// check exists to prevent. Withheld, with the key named.
 		return false, fmt.Sprintf("the %s Secret in %s carries no %q key, so the A2A gateway has no chat backend and its "+
 			"Deployment is not rendered: put the Discord bot token under that key; an eval install arms the inject door "+
-			"(%s=true on the operator) instead", a2aDiscordBotSecretName, agent.Namespace, a2aDiscordBotTokenKey, a2aInjectBackendEnvVar), nil
+			"(%s=true on the operator) or the A2A door (%s=true) instead",
+			a2aDiscordBotSecretName, agent.Namespace, a2aDiscordBotTokenKey, a2aInjectBackendEnvVar, a2aAgentDoorEnvVar), nil
 	case !errors.IsNotFound(err):
 		return false, "", err
 	}
 	return false, fmt.Sprintf("no chat backend is configured for the A2A gateway, so its Deployment is not rendered: "+
-		"create the %s Secret (key %s) in %s; an eval install arms the inject door (%s=true on the operator) instead",
-		a2aDiscordBotSecretName, a2aDiscordBotTokenKey, agent.Namespace, a2aInjectBackendEnvVar), nil
+		"create the %s Secret (key %s) in %s; an eval install arms the inject door (%s=true on the operator) "+
+		"or the A2A door (%s=true) instead",
+		a2aDiscordBotSecretName, a2aDiscordBotTokenKey, agent.Namespace, a2aInjectBackendEnvVar, a2aAgentDoorEnvVar), nil
 }
 
 // a2aSessionDNSClusterIPs is the resolved cluster DNS VIP list for the session
@@ -4297,6 +4301,9 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 			state.gatewayDarkReason = why
 			logf.FromContext(ctx).Info("withholding the A2A gateway: no chat backend is configured", "deployment", dep.Name)
 			if err := r.removeA2AInjectBackend(ctx, agent); err != nil {
+				return state, err
+			}
+			if err := r.removeA2AAgentDoor(ctx, agent); err != nil {
 				return state, err
 			}
 			return state, nil
