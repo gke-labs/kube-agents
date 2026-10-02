@@ -398,7 +398,7 @@ func (b *Bridge) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("subscribe: %w", err)
 	}
-	b.cfg.Logger.Info("hermes bridge consuming", "profile", b.cfg.Profile)
+	b.cfg.Logger.Info("hermes bridge consuming", "profile", b.cfg.Profile, "executor", b.cfg.Executor)
 	<-ctx.Done()
 	b.closing.Store(true)
 	sub.Stop()

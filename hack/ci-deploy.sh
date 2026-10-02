@@ -1213,11 +1213,12 @@ gate_cr_not_degraded() {
 # Renders the merge patch that declares the bridge sidecar on the CR, from the
 # agent container the operator rendered (the agent Deployment's JSON on stdin).
 #
-# The bridge's subprocess stands in for the `hermes chat -q` a kanban worker
-# spawns inside the agent container, so the sidecar gets that container's
+# The bridge's cli subprocess stands in for the `hermes chat -q` a kanban
+# worker spawns inside the agent container, and its default api executor needs
+# that container's API_SERVER_KEY, so the sidecar gets that container's
 # environment, envFrom, mounts, security context and resources rather than a
 # list written here that would drift from the operator's render the next time
-# it changes. Two subtractions and one addition. The projected bus token mount
+# it changes. Two subtractions and two additions. The projected bus token mount
 # is dropped: the webhook reserves that volume for the agent container and
 # refuses a sidecar naming it (and the callout could not tell the two apart
 # anyway; the bridge doc's "Bus user and grants" says why it stays a
@@ -1227,13 +1228,17 @@ gate_cr_not_degraded() {
 # BRIDGE_CONCURRENCY -- and AGENT_SHARED_STATE_SETUP=skip, so the image's
 # entrypoint runs its container-local init, waits for the owner's
 # config.yaml, enters $HERMES_HOME and execs the bridge, as it does for the
-# dashboard container. The pull policy is the agent container's too, so the
-# same tag is fetched the same way.
+# dashboard container. The second addition is A2A_ACTIVITY_SECRET from the
+# creds Secret's bridge-activity-key, the key the tool-call hook signs with:
+# the operator adds it to the agent container only once a bridge sidecar is
+# declared, so the copy above cannot carry it. The pull policy is the agent
+# container's too, so the same tag is fetched the same way.
 #
 # Arguments, in order: the agent container's name, the sidecar's name, its
 # image, then the bus URL, user and the creds Secret's name and key, the
-# concurrency, the reserved volume name, and the entrypoint switch's name and
-# value. Positional so the test can call it the way the step does.
+# concurrency, the reserved volume name, the entrypoint switch's name and
+# value, and the activity key's variable and Secret key. Positional so the
+# test can call it the way the step does.
 render_mode_next_sidecar_patch() {
   python3 -c '
 import json
