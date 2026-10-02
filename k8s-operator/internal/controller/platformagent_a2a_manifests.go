@@ -42,6 +42,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"regexp"
 	"strconv"
@@ -374,13 +375,15 @@ const (
 	a2aActivityHookURL        = "http://" + a2aActivityDoorListen + "/hermes/tool-events"
 	a2aActivityHookTimeoutSec = 10
 
-	// The bridge sidecar's env keys and values that say its door is not
-	// the hook's (a2aBridgeDoorDeclared), each the bridge's own
-	// (a2a/cmd/hermes-bridge/main.go): the executor key and its subprocess
-	// value, and the door's listen key with its default address. An empty
+	// The bridge sidecar's env keys and values the hook's gate reads
+	// (a2aBridgeDoorDeclared), each the bridge's own
+	// (a2a/cmd/hermes-bridge/main.go): the executor key and its API value,
+	// the key whose presence picks that executor when the executor key is
+	// unset, and the door's listen key with its default address. An empty
 	// value reads as unset there, so it is the default here.
 	a2aBridgeExecutorEnvVar       = "BRIDGE_EXECUTOR"
-	a2aBridgeExecutorCLI          = "cli"
+	a2aBridgeExecutorAPI          = "api"
+	a2aBridgeAPIServerKeyEnvVar   = "API_SERVER_KEY"
 	a2aBridgeActivityListenEnvVar = "BRIDGE_ACTIVITY_LISTEN"
 	a2aActivityDoorListen         = "127.0.0.1:8651"
 
@@ -1018,6 +1021,11 @@ var a2aCredsKeys = []string{
 
 // a2aActivityHookEvents are the hook events the door reads.
 var a2aActivityHookEvents = []string{"pre_tool_call", "post_tool_call"}
+
+// a2aWildcardListenHosts are the listen hosts that bind every interface, the
+// hook's loopback address included: the empty host (":8651") and the IPv4
+// and IPv6 unspecified addresses.
+var a2aWildcardListenHosts = map[string]bool{"": true, "0.0.0.0": true, "::": true}
 
 // a2aProvisionedStreams is every JetStream stream the provision Job creates, and
 // the exact set seed's $JS.API grant is scoped to. KV buckets are streams named
@@ -2917,16 +2925,18 @@ func a2aBridgeConcurrency(agent *agentv1alpha1.PlatformAgent) int {
 }
 
 // a2aBridgeDoorDeclared reports whether the CR declares a bridge sidecar
-// whose activity door the pod-wide hook can reach: a sidecar whose env sets
-// BRIDGE_CONCURRENCY (the rule a2aBridgeWorkers uses), less one whose env
-// says the door is not the hook's -- BRIDGE_EXECUTOR=cli, whose tasks carry
-// their own per-task hook and drop the pod-wide one's deliveries, or a
-// BRIDGE_ACTIVITY_LISTEN other than the address the hook posts to,
-// including "off". The activity hook (a2aActivityHook) is rendered only
-// then, so a pod whose door is closed or elsewhere does not post every tool
-// call to a closed port. A bridge this cannot see -- the key unset or taken
-// through envFrom -- gets no hook and warns at start that its API tasks
-// carry no trace.
+// that runs the API executor with its activity door where the pod-wide hook
+// posts: a sidecar whose env sets BRIDGE_CONCURRENCY (the rule
+// a2aBridgeWorkers uses), whose executor resolves to api the way the
+// bridge's bridgeExecutor resolves it, and whose BRIDGE_ACTIVITY_LISTEN
+// receives 127.0.0.1:8651. A cli bridge, declared or reached by the
+// missing-key fallback, gives each task its own hook and drops the pod-wide
+// one's deliveries; a door closed ("off") or on another port would take a
+// failed POST per tool call. The activity hook (a2aActivityHook) is rendered
+// only for a sidecar this can read: a BRIDGE_EXECUTOR or
+// BRIDGE_ACTIVITY_LISTEN supplied through valueFrom, or an executor key left
+// unset with API_SERVER_KEY taken through envFrom, gets no hook, and its
+// API tasks report that they carry no trace.
 func a2aBridgeDoorDeclared(agent *agentv1alpha1.PlatformAgent) bool {
 	if agent == nil || agent.Spec.Deployment == nil {
 		return false
@@ -2935,15 +2945,54 @@ func a2aBridgeDoorDeclared(agent *agentv1alpha1.PlatformAgent) bool {
 		if _, set := a2aBridgeConcurrencyValue(c); !set {
 			continue
 		}
-		if executor, _ := a2aContainerEnvValue(c, a2aBridgeExecutorEnvVar); executor == a2aBridgeExecutorCLI {
+		if !a2aBridgeRunsAPIExecutor(c) {
 			continue
 		}
-		if listen, _ := a2aContainerEnvValue(c, a2aBridgeActivityListenEnvVar); listen != "" && listen != a2aActivityDoorListen {
+		listen, _, opaque := a2aContainerEnvLookup(c, a2aBridgeActivityListenEnvVar)
+		if opaque || !a2aActivityListenReachesHook(listen) {
 			continue
 		}
 		return true
 	}
 	return false
+}
+
+// a2aBridgeRunsAPIExecutor is bridgeExecutor read from c's env: a non-empty
+// BRIDGE_EXECUTOR decides, and unset or empty it is api exactly when
+// API_SERVER_KEY is present and not blank. A key supplied through valueFrom
+// counts as present, since a secretKeyRef to a missing key fails the pod
+// rather than starting it keyless; an executor supplied through valueFrom
+// cannot be read here and is not api.
+func a2aBridgeRunsAPIExecutor(c corev1.Container) bool {
+	executor, _, opaque := a2aContainerEnvLookup(c, a2aBridgeExecutorEnvVar)
+	if opaque {
+		return false
+	}
+	if executor != "" {
+		return executor == a2aBridgeExecutorAPI
+	}
+	key, _, keyOpaque := a2aContainerEnvLookup(c, a2aBridgeAPIServerKeyEnvVar)
+	return keyOpaque || strings.TrimSpace(key) != ""
+}
+
+// a2aActivityListenReachesHook reports whether a bridge door bound to listen
+// receives the hook's POST to a2aActivityDoorListen: empty is the bridge's
+// default, which is that address; otherwise the port must match and the host
+// must be the hook's own or a wildcard that includes it. "off" and anything
+// that is not host:port do not.
+func a2aActivityListenReachesHook(listen string) bool {
+	if listen == "" {
+		return true
+	}
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return false
+	}
+	hookHost, hookPort, _ := net.SplitHostPort(a2aActivityDoorListen)
+	if port != hookPort {
+		return false
+	}
+	return host == hookHost || a2aWildcardListenHosts[host]
 }
 
 // a2aActivityHookWanted is the gate for both halves of the pod-wide activity
@@ -3081,22 +3130,30 @@ func a2aBridgeConcurrencyValue(c corev1.Container) (value string, set bool) {
 // describes the walk: expanded the kubelet's way, "" with set true when a
 // valueFrom entry is the last of the name.
 func a2aContainerEnvValue(c corev1.Container, name string) (value string, set bool) {
+	value, set, _ = a2aContainerEnvLookup(c, name)
+	return value, set
+}
+
+// a2aContainerEnvLookup is a2aContainerEnvValue that also says whether the
+// last entry of the name is a valueFrom, whose value is read in the pod and
+// not here.
+func a2aContainerEnvLookup(c corev1.Container, name string) (value string, set, opaque bool) {
 	known := map[string]string{}
 	for _, e := range c.Env {
 		if e.ValueFrom != nil {
 			delete(known, e.Name)
 			if e.Name == name {
-				value, set = "", true
+				value, set, opaque = "", true, true
 			}
 			continue
 		}
 		v := expandEnvReferences(e.Value, known)
 		known[e.Name] = v
 		if e.Name == name {
-			value, set = v, true
+			value, set, opaque = v, true, false
 		}
 	}
-	return value, set
+	return value, set, opaque
 }
 
 // expandEnvReferences follows the kubelet's expansion.Expand

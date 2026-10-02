@@ -408,6 +408,12 @@ func (b *Bridge) Run(ctx context.Context) error {
 		b.cfg.Logger.Warn("activity door open with no ActivitySecret: API tasks carry no tool trace",
 			"env", ActivitySecretEnv)
 	}
+	if b.cfg.Executor == ExecutorAPI && b.activityLn != nil && !activityHookReaches(b.activityLn.Addr()) {
+		// The pod's hook posts to one address, and the operator renders it
+		// only for a door there; a door elsewhere hears nothing.
+		b.cfg.Logger.Warn("activity door not where the pod-wide hook posts: API tasks carry no tool trace",
+			"listen", b.activityLn.Addr().String(), "hook", DefaultActivityListen)
+	}
 	<-ctx.Done()
 	b.closing.Store(true)
 	sub.Stop()
@@ -622,7 +628,9 @@ func (b *Bridge) refuseSteer(ctx context.Context, run *taskRun, steer *lib.Envel
 		return
 	}
 	state := lib.StateWorking
-	if run.state == statePending {
+	if run.state == statePending || (b.cfg.Executor == ExecutorAPI && run.act.Load() == nil) {
+		// Queued, or on the API executor still waiting for its session's
+		// turn: working has not been published.
 		state = lib.StateSubmitted
 	}
 	msg := "steering received but not absorbed: the bridge sends a task's instruction to Hermes once and cannot " +

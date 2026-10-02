@@ -790,7 +790,7 @@ terminal status message the bridge and the worker adapter write as `reason: <tok
 because a failed terminal is not always the persona's failure: the harness reads the token and
 classifies the executors' own reasons (`bridge-shutdown`, `bridge-queue-overflow`,
 `bus-publish-failed`, `spawn-failed`, `bridge-died-without-terminal-event`, `hermes-rate-limited`,
-`hermes-api-unreachable`, `worker-evicted`, `bus-subscribe-failed`), a `rejected` terminal and a `canceled-before-start` as infrastructure,
+`hermes-api-unreachable`, `hermes-api-refused`, `session-busy`, `worker-evicted`, `bus-subscribe-failed`), a `rejected` terminal and a `canceled-before-start` as infrastructure,
 and grades the persona's (`hermes-exited-nonzero`, `deadline-exceeded`, `hermes-api-failed`,
 `hermes-api-unreadable`, `hermes-api-read-failed`) and any reason it does not
 know; a `canceled` after the harness's own cancel is the graded timeout. An eval install that

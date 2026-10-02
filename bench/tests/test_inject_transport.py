@@ -1940,6 +1940,8 @@ def test_the_infrastructure_reasons_are_the_executors_own() -> None:
         "bus-subscribe-failed",
         "hermes-rate-limited",
         "hermes-api-unreachable",
+        "hermes-api-refused",
+        "session-busy",
     }
     assert not inject.INFRASTRUCTURE_REASONS & inject.PERSONA_REASONS
 

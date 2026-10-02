@@ -183,8 +183,10 @@ readonly A2A_BRIDGE_PASSWORD_KEY="bridge-password"
 # The key that signs the agent's pod-wide tool-call hook, and the env both the
 # agent and the bridge read it from (a2aBridgeActivityKey and
 # a2aActivitySecretEnvVar). The operator adds it to the agent container only
-# once the sidecar is declared, so the copy of the agent's env below predates
-# it and the sidecar names it itself. Optional, as the operator renders it.
+# for a sidecar that runs the api executor, so under the cli pin below the
+# agent never carries it and the bridge's per-task keys sign instead; the
+# sidecar names it itself so that lifting the pin needs no edit here.
+# Optional, as the operator renders it.
 readonly A2A_BRIDGE_ACTIVITY_KEY="bridge-activity-key"
 readonly BRIDGE_ACTIVITY_SECRET_ENV_VAR="A2A_ACTIVITY_SECRET"
 # The bridge's own env (a2a/cmd/hermes-bridge/main.go), the entrypoint switch

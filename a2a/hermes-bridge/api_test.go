@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -46,29 +47,32 @@ type apiStub struct {
 func newAPIStub(t *testing.T, handle func(w http.ResponseWriter, r *http.Request, c apiCall)) *apiStub {
 	t.Helper()
 	s := &apiStub{handle: handle}
-	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req apiChatRequest
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		c := apiCall{
-			auth:        r.Header.Get("Authorization"),
-			sessionKey:  r.Header.Get(apiSessionKeyHeader),
-			sessionID:   r.Header.Get(apiSessionIDHeader),
-			idempotency: r.Header.Get(apiIdempotencyHeader),
-		}
-		if len(req.Messages) > 0 {
-			c.prompt = req.Messages[len(req.Messages)-1].Content
-		}
-		s.mu.Lock()
-		s.calls = append(s.calls, c)
-		s.mu.Unlock()
-		if s.handle != nil {
-			s.handle(w, r, c)
-			return
-		}
-		writeCompletion(w, c.sessionID, "answer to "+c.prompt)
-	}))
+	s.srv = httptest.NewServer(http.HandlerFunc(s.serve))
 	t.Cleanup(s.srv.Close)
 	return s
+}
+
+// serve records the call and answers it with handle, or with an echo.
+func (s *apiStub) serve(w http.ResponseWriter, r *http.Request) {
+	var req apiChatRequest
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	c := apiCall{
+		auth:        r.Header.Get("Authorization"),
+		sessionKey:  r.Header.Get(apiSessionKeyHeader),
+		sessionID:   r.Header.Get(apiSessionIDHeader),
+		idempotency: r.Header.Get(apiIdempotencyHeader),
+	}
+	if len(req.Messages) > 0 {
+		c.prompt = req.Messages[len(req.Messages)-1].Content
+	}
+	s.mu.Lock()
+	s.calls = append(s.calls, c)
+	s.mu.Unlock()
+	if s.handle != nil {
+		s.handle(w, r, c)
+		return
+	}
+	writeCompletion(w, c.sessionID, "answer to "+c.prompt)
 }
 
 func (s *apiStub) seen() []apiCall {
@@ -99,8 +103,18 @@ func startAPIBridge(t *testing.T, url string, stub *apiStub, mutate func(*Config
 	if mutate != nil {
 		mutate(&cfg)
 	}
+	hookAtTheTestDoor(t)
 	b, _ := startBridgeConfig(t, cfg, nil)
 	return b
+}
+
+// hookAtTheTestDoor makes the test's door, on a port the kernel picked,
+// stand in for the address the pod-wide hook posts to.
+func hookAtTheTestDoor(t *testing.T) {
+	t.Helper()
+	prev := activityHookReaches
+	activityHookReaches = func(net.Addr) bool { return true }
+	t.Cleanup(func() { activityHookReaches = prev })
 }
 
 // submitIn is submit with the caller's contextId, so two tasks can share a
@@ -243,12 +257,50 @@ func TestAPI_DeadlineWhileWaitingIsNamed(t *testing.T) {
 	if task.State != lib.StateFailed {
 		t.Fatalf("state = %s, want failed", task.State)
 	}
-	want := "reason: deadline-exceeded - waited 2s for the session's previous turn; no request was sent"
+	want := "reason: session-busy - waited 2s for the session's previous turn; no request was sent"
 	if reason := terminalReason(t, task); reason != want {
 		t.Fatalf("reason = %q, want %q", reason, want)
 	}
 	if n := len(stub.seen()); n != 0 {
 		t.Fatalf("requests = %d, want 0: the waiter never reached the server", n)
+	}
+	if trail := eventTrail(t, replayEvents(t, url, "task-waiter")); slices.Contains(trail, string(lib.StateWorking)) {
+		t.Fatalf("events = %v, want no working: the waiter never started a turn", trail)
+	}
+}
+
+// A cancel that reaches a task still waiting for its session's turn ends it
+// as one cancelled out of the queue: no request was sent, nothing ran.
+func TestAPI_CancelWhileWaitingIsBeforeStart(t *testing.T) {
+	_, url := startServer(t)
+	stub := newAPIStub(t, nil)
+	b := startAPIBridge(t, url, stub, nil)
+	release := b.turns.acquire(context.Background(), "a2a-ctx-cwait")
+	if release == nil {
+		t.Fatal("could not take the session's turn")
+	}
+	t.Cleanup(release)
+	c := gatewayClient(t, url)
+	origin := submitIn(t, c, "task-cwait", "ctx-cwait", "second")
+	waitFor(t, 10*time.Second, "the task queued on the session", func() bool {
+		b.turns.mu.Lock()
+		defer b.turns.mu.Unlock()
+		slot, ok := b.turns.slots["a2a-ctx-cwait"]
+		return ok && slot.refs == 2
+	})
+	publishCancel(t, c, origin)
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCanceled {
+		t.Fatalf("state = %s, want canceled", task.State)
+	}
+	if reason := terminalReason(t, task); reason != canceledBeforeStartReason {
+		t.Fatalf("reason = %q, want %q", reason, canceledBeforeStartReason)
+	}
+	if n := len(stub.seen()); n != 0 {
+		t.Fatalf("requests = %d, want 0", n)
+	}
+	if trail := eventTrail(t, replayEvents(t, url, origin.TaskID)); slices.Contains(trail, string(lib.StateWorking)) {
+		t.Fatalf("events = %v, want no working", trail)
 	}
 }
 
@@ -375,6 +427,14 @@ func TestAPI_FailuresAreNamed(t *testing.T) {
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = io.WriteString(w, "boom")
 		}, "reason: hermes-api-failed - HTTP 500; session: a2a-ctx-fail; body tail: boom"},
+		{"key refused", func(w http.ResponseWriter, _ *http.Request, _ apiCall) {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"error":{"message":"Invalid API key"}}`)
+		}, "reason: hermes-api-refused - HTTP 401; session: a2a-ctx-fail; body tail: "},
+		{"profile refused", func(w http.ResponseWriter, _ *http.Request, _ apiCall) {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"error":"Unknown or unconfigured profile"}`)
+		}, "reason: hermes-api-refused - HTTP 404; session: a2a-ctx-fail; body tail: "},
 		{"no choices", func(w http.ResponseWriter, _ *http.Request, _ apiCall) {
 			_, _ = io.WriteString(w, `{"choices":[]}`)
 		}, "reason: hermes-api-unreadable - HTTP 200; session: a2a-ctx-fail"},
@@ -547,6 +607,57 @@ func TestAPI_HeartbeatSaysWhetherTheTraceIsOn(t *testing.T) {
 	}
 }
 
+// A door open with the key but not where the pod-wide hook posts hears no
+// call, so its heartbeat says the trace is off rather than counting zero.
+func TestAPI_DoorElsewhereIsUntraced(t *testing.T) {
+	_, url := startServer(t)
+	var b *Bridge
+	ready := make(chan struct{})
+	lines := make(chan string, 1)
+	stub := newAPIStub(t, func(w http.ResponseWriter, _ *http.Request, c apiCall) {
+		<-ready
+		b.mu.Lock()
+		run := b.tasks[c.idempotency]
+		b.mu.Unlock()
+		lines <- run.act.Load().progressLine(time.Now())
+		writeCompletion(w, c.sessionID, "done")
+	})
+	b = startAPIBridge(t, url, stub, func(cfg *Config) {
+		cfg.ActivityListen = "127.0.0.1:0"
+		cfg.ActivitySecret = "pod-wide-activity-key"
+	})
+	activityHookReaches = doorReceivesHook
+	close(ready)
+	c := gatewayClient(t, url)
+	submitIn(t, c, "task-elsewhere", "ctx-elsewhere", "go")
+	waitTerminal(t, c, "task-elsewhere")
+	if line := <-lines; !strings.Contains(line, "tool trace off") {
+		t.Fatalf("heartbeat = %q, want it to say the trace is off", line)
+	}
+}
+
+// The pod-wide hook posts to DefaultActivityListen alone: a door hears it on
+// that port, bound to that host or to a wildcard.
+func TestDoorReceivesHook(t *testing.T) {
+	cases := []struct {
+		addr net.Addr
+		want bool
+	}{
+		{&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8651}, true},
+		{&net.TCPAddr{IP: net.IPv4zero, Port: 8651}, true},
+		{&net.TCPAddr{IP: net.IPv6unspecified, Port: 8651}, true},
+		{&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9999}, false},
+		{&net.TCPAddr{IP: net.ParseIP("127.0.0.2"), Port: 8651}, false},
+		{&net.TCPAddr{IP: net.ParseIP("10.0.0.1"), Port: 8651}, false},
+		{&net.UnixAddr{Name: "/tmp/door", Net: "unix"}, false},
+	}
+	for _, tc := range cases {
+		if got := doorReceivesHook(tc.addr); got != tc.want {
+			t.Errorf("doorReceivesHook(%s) = %v, want %v", tc.addr, got, tc.want)
+		}
+	}
+}
+
 // The door attributes an API task's tool calls by the session the pod-wide
 // hook's payload names, signed with the shared key. A call in another
 // session, or signed with another key, is not the task's.
@@ -646,10 +757,10 @@ func TestAPI_DoorAttributesToTheTurnHolderNotTheWaiter(t *testing.T) {
 	waitFor(t, 10*time.Second, "the holder's request", func() bool { return len(stub.seen()) == 1 })
 	submitIn(t, c, "task-waiter", "ctx-queue", "second")
 	waitFor(t, 10*time.Second, "the waiter queued on the session", func() bool {
-		b.mu.Lock()
-		defer b.mu.Unlock()
-		r, ok := b.tasks["task-waiter"]
-		return ok && r.act.Load() != nil
+		b.turns.mu.Lock()
+		defer b.turns.mu.Unlock()
+		slot, ok := b.turns.slots["a2a-ctx-queue"]
+		return ok && slot.refs == 2
 	})
 	fireOnce.Do(func() { close(fire) })
 
@@ -702,7 +813,7 @@ func TestAPI_AServerThatStartsLateStillAnswers(t *testing.T) {
 	addr := l.Addr().String()
 	l.Close()
 	stub := &apiStub{}
-	stub.srv = httptest.NewUnstartedServer(newAPIStub(t, nil).srv.Config.Handler)
+	stub.srv = httptest.NewUnstartedServer(http.HandlerFunc(stub.serve))
 	cfg := Config{
 		NATSURL: url, Executor: ExecutorAPI, APIURL: "http://" + addr + "/v1/chat/completions", APIKey: testAPIKey,
 		TaskDeadline: 20 * time.Second, KillGrace: 500 * time.Millisecond,
@@ -721,5 +832,8 @@ func TestAPI_AServerThatStartsLateStillAnswers(t *testing.T) {
 	task := waitTerminal(t, c, "task-early")
 	if task.State != lib.StateCompleted {
 		t.Fatalf("state = %s (%s), want completed once the server came up", task.State, terminalReason(t, task))
+	}
+	if n := len(stub.seen()); n != 1 {
+		t.Fatalf("server saw %d request(s), want 1: a refused connection sent nothing", n)
 	}
 }

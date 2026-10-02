@@ -206,14 +206,15 @@ server loads the session's history from its own store before the turn and append
 so the second task in a thread sees the first. The session id is `a2a-` plus the task's
 `contextId`, which the gateway mints once per backend conversation. A `contextId` that is not
 letters, digits, `_` and `-`, or is longer than 128 characters, is replaced by `a2a-h-` and 32
-hex characters of its SHA-256, so an odd one still maps to one session and never to a path. A
-task with no `contextId` gets a session of its own, `a2a-task-<task id>`.
+hex characters of its SHA-256, so an odd one still maps to one session and never to a path. Every
+task has a `contextId`: the envelope refuses one without.
 
 The turn runs under the API server's profile, the gateway's own (`default` on a stock install,
 the Planning Agent) that answers the same message on the chat path and delegates through kanban, not under `BRIDGE_PROFILE`. Two
 tasks in one session are serialized: the second waits for the first's turn to end, as a second
 chat message waits in a chat platform's session. Tasks in different sessions run side by side
-up to `BRIDGE_CONCURRENCY`, and a task waiting for its session's turn holds a worker.
+up to `BRIDGE_CONCURRENCY`, and a task waiting for its session's turn holds a worker and stays
+`submitted` until its turn starts.
 
 The sidecar starts with the agent container, so the bridge can be consuming before the API
 server listens. A refused connection is retried every second for two minutes; it never reached
@@ -319,23 +320,26 @@ that fails, a bus error or its 10s bound, is logged and the run spawns
 anyway; the cancel still arrives on the durable and kills it, the bound the bridge always
 had, where a read failure that dropped the task would leave it open with no terminal event.
 
-Under the `api` executor `working` is published before the request goes out, and cancel,
+Under the `api` executor `working` is published when the task's turn starts, and cancel,
 shutdown and the deadline end the HTTP request, the read of the response body included, where
 the `cli` executor kills a process group, with the same terminals: `canceled-by-request`, `bridge-shutdown`, `deadline-exceeded`. Ending
 the request ends the bridge's wait; whether the server abandons the turn it was running is the
 server's. Turns on one session run one at a time; a task still waiting for the previous turn
-when its deadline passes ends `reason: deadline-exceeded - waited <d> for the session's previous
-turn; no request was sent`. The failures name themselves in the status message:
+when its deadline passes ends `reason: session-busy - waited <d> for the session's previous
+turn; no request was sent`, and one cancelled while waiting ends `canceled-before-start`. The
+failures name themselves in the status message:
 
-| Reason                   | When                                                                                                                                    | Eval harness class |
-| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
-| `hermes-rate-limited`    | the server answered 429 (its concurrent-run cap), or `X-Hermes-Failure-Reason` names the provider's rate limit or billing               | infrastructure     |
-| `hermes-api-unreachable` | no response: still refused after the two-minute retry, the task's deadline passed before any connection, or the connection failed       | infrastructure     |
-| `hermes-api-failed`      | any other non-2xx answer, or a 200 whose turn Hermes marks failed; the message carries the status, session and the error or a body tail | persona            |
-| `hermes-api-unreadable`  | a 2xx answer that is not a chat completion with at least one choice                                                                     | persona            |
-| `hermes-api-read-failed` | the response body broke off mid-read                                                                                                    | persona            |
-| `request-encode-failed`  | the bridge could not encode the request; a bridge fault, not expected in practice                                                       | graded (unlisted)  |
-| `request-build-failed`   | the bridge could not build the request; the URL is checked at start, so likewise                                                        | graded (unlisted)  |
+| Reason                   | When                                                                                                                              | Eval harness class |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
+| `hermes-rate-limited`    | the server answered 429 (its concurrent-run cap), or `X-Hermes-Failure-Reason` names the provider's rate limit or billing         | infrastructure     |
+| `hermes-api-unreachable` | no response: still refused after the two-minute retry, the task's deadline passed before any connection, or the connection failed | infrastructure     |
+| `hermes-api-refused`     | any other 4xx answer: the server refused the request before running a turn                                                        | infrastructure     |
+| `session-busy`           | the deadline passed while the task waited for the session's previous turn; no request was sent                                    | infrastructure     |
+| `hermes-api-failed`      | a 5xx answer, or a 200 whose turn Hermes marks failed; the message carries the status, session and the error or a body tail       | persona            |
+| `hermes-api-unreadable`  | a 2xx answer that is not a chat completion with at least one choice                                                               | persona            |
+| `hermes-api-read-failed` | the response body broke off mid-read                                                                                              | persona            |
+| `request-encode-failed`  | the bridge could not encode the request; a bridge fault, not expected in practice                                                 | graded (unlisted)  |
+| `request-build-failed`   | the bridge could not build the request; the URL is checked at start, so likewise                                                  | graded (unlisted)  |
 
 ## Sizing against the eval harness
 
@@ -387,9 +391,7 @@ scope would run without the operator's pins). On a sidecar declaring `BRIDGE_EXE
 the hook therefore exists only in processes the bridge spawned: a kanban worker or cron
 tick under the same profile never POSTs anywhere, a pod with no bridge has nothing to POST at,
 and nothing about the profile's shipped config or the image changes for it. The `api`
-executor needs a pod-wide entry instead, described at the end of this section; a `cli` bridge
-that reached `cli` by the missing-key fallback rather than by declaring it still gets that
-entry, and drops its deliveries.
+executor needs a pod-wide entry instead, described at the end of this section.
 
 Under `cli`, nothing in a delivery names the A2A task: hermes's own `task_id` is the kanban card or a
 fresh UUID, `cwd` and `profile` are shared by every process under the profile, and the URL
@@ -467,14 +469,20 @@ Under the `api` executor there is no child to hand a key or a scope to: the turn
 the long-lived gateway process, which serves the chat platforms, cron and kanban dispatch too.
 So the operator renders the entry in the pod's managed config instead, when the CR renders
 the agent's A2A surface (`mode: next`, or a mode this operator build does not recognize) and
-declares the bridge sidecar (a sidecar whose env sets `BRIDGE_CONCURRENCY`, and does not set
-`BRIDGE_EXECUTOR=cli` or a `BRIDGE_ACTIVITY_LISTEN` other than the default, `off` included):
+declares a bridge sidecar (a sidecar whose env sets `BRIDGE_CONCURRENCY`) that runs `api` and
+whose door the entry reaches. It runs `api` by the bridge's own rule: `BRIDGE_EXECUTOR=api`, or
+that entry empty and `API_SERVER_KEY` non-blank or taken from a reference. The door is reached
+when `BRIDGE_ACTIVITY_LISTEN` is unset or names the hook's port on `127.0.0.1` or a wildcard
+host. With several bridge sidecars, every one must qualify; a value the operator cannot read
+(`BRIDGE_EXECUTOR` or `BRIDGE_ACTIVITY_LISTEN` through `valueFrom`) disqualifies. Then
 `hooks.outbound` gains `a2a-bridge-activity`, posting `pre_tool_call` and `post_tool_call` to
-`http://127.0.0.1:8651/hermes/tool-events`, signed with `A2A_ACTIVITY_SECRET`, read from the `bridge-activity-key` entry of the a2a creds
-Secret. The operator puts it in the agent container's env; the sidecar needs it in its own
-(`hack/ci-deploy.sh`'s patch adds it). A bridge sidecar the operator cannot see — one that
-leaves `BRIDGE_CONCURRENCY` unset or takes it through `envFrom` — gets no entry and no key, and
-an `api` bridge with the door open and no key logs a warning at start. Every hermes
+`http://127.0.0.1:8651/hermes/tool-events`, signed with `A2A_ACTIVITY_SECRET`, read from the
+`bridge-activity-key` entry of the a2a creds Secret. The operator puts it in the agent
+container's env; the sidecar needs it in its own. A `cli` bridge, including one that fell back
+to `cli` for want of a key, gets no entry and no key, and so does a bridge sidecar the operator
+cannot see, one that leaves `BRIDGE_CONCURRENCY` unset or takes it through `envFrom`. An `api`
+bridge with the door open and no key logs a warning at start, and so does one whose door is not
+where the hook posts; either reports `tool trace off`. Every hermes
 process in the pod now posts to the door, and a delivery's `session_id` is what attributes it:
 it counts for the task whose session id matches and which holds that session's turn at the
 moment, and is dropped otherwise, so a kanban worker's or a chat message's tool calls, which

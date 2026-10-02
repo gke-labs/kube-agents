@@ -339,6 +339,13 @@ REASON_HERMES_RATE_LIMITED = "hermes-rate-limited"
 # or the request failed in transport. No answer came back, so there is
 # nothing to grade.
 REASON_HERMES_API_UNREACHABLE = "hermes-api-unreachable"
+# The API server refused the request with a 4xx other than 429 (a wrong key, a
+# missing route, a malformed body): it answers before any agent runs, so the
+# prompt never reached the persona.
+REASON_HERMES_API_REFUSED = "hermes-api-refused"
+# The task waited out its deadline behind an earlier turn in the same session
+# and was never sent: the persona never saw the prompt.
+REASON_SESSION_BUSY = "session-busy"
 INFRASTRUCTURE_REASONS = frozenset(
     {
         REASON_BRIDGE_SHUTDOWN,
@@ -350,12 +357,14 @@ INFRASTRUCTURE_REASONS = frozenset(
         REASON_BUS_SUBSCRIBE_FAILED,
         REASON_HERMES_RATE_LIMITED,
         REASON_HERMES_API_UNREACHABLE,
+        REASON_HERMES_API_REFUSED,
+        REASON_SESSION_BUSY,
     }
 )
 # The persona's reasons, graded: the hermes turn exited non-zero, or ran past
 # the bridge's own deadline; under the api executor, the API server answered
-# with an error, an unparseable completion, or a body that broke off mid-read
-# -- the turn's own failure, as a non-zero exit is for the subprocess. Listed
+# with a 5xx or a failed 200, an unparseable completion, or a body that broke
+# off mid-read -- the turn's own failure, as a non-zero exit is for the subprocess. Listed
 # for the record and the tests; an unknown token lands in the same class, so
 # nothing here is consulted to grade.
 REASON_HERMES_EXITED_NONZERO = "hermes-exited-nonzero"

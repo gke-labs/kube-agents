@@ -234,20 +234,15 @@ func apiTurnFailed(out *apiChatResponse) bool {
 }
 
 // runTaskAPI is runTask for ExecutorAPI. The lifecycle is the subprocess
-// path's: working first, one terminal from this goroutine, cancel and the
-// deadline end the request rather than a process group, and shutdown names
-// itself.
+// path's: working when the turn starts, one terminal from this goroutine,
+// cancel and the deadline end the request rather than a process group, and
+// shutdown names itself.
 func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	taskID := run.origin.TaskID
 	prompt, ok := promptFromMessage(run.origin.Payload)
 	if !ok {
 		b.finalize(run, lib.StateRejected,
 			"reason: no-text-parts - the submission message carries nothing hermes can be asked", nil)
-		return
-	}
-	if err := run.exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
-		b.cfg.Logger.Error("working publish failed", "task", taskID, "err", err)
-		b.finalize(run, lib.StateFailed, "reason: bus-publish-failed at working", nil)
 		return
 	}
 	sessionID := apiSessionID(run.origin.ContextID)
@@ -275,32 +270,46 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	req.Header.Set(apiSessionIDHeader, sessionID)
 	req.Header.Set(apiIdempotencyHeader, taskID)
 
-	// The door's side of this task: attributed by the session id the hook
-	// payload carries, signed with the pod's shared secret, and only while
-	// this task holds the session's turn; the heartbeat runs either way,
-	// waiting included.
-	act := newSessionActivityState(sessionID, b.activityLn != nil && b.cfg.ActivitySecret != "")
 	run.mu.Lock()
 	if run.state != stateRunning {
 		run.mu.Unlock()
 		return
 	}
-	run.act.Store(act)
 	run.cancelReq = cancelReq
-	go b.runActivity(run)
 	if run.canceled.Load() {
 		cancelReq()
 	}
 	run.mu.Unlock()
 
+	// A task behind its session's previous turn has not started: it stays
+	// submitted, with no heartbeat, until the turn is its own, so nothing
+	// reads a wait as a run.
 	release := b.turns.acquire(reqCtx, sessionID)
 	if release == nil {
 		b.finalizeAPIError(run, reqCtx, errWaitingForTurn)
 		return
 	}
 	defer release()
+	if err := run.exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		b.cfg.Logger.Error("working publish failed", "task", taskID, "err", err)
+		b.finalize(run, lib.StateFailed, "reason: bus-publish-failed at working", nil)
+		return
+	}
+
+	// The door's side of this task: attributed by the session id the hook
+	// payload carries, signed with the pod's shared secret, and only while
+	// this task holds the session's turn.
+	act := newSessionActivityState(sessionID, b.apiTraced())
 	act.inTurn.Store(true)
 	defer act.inTurn.Store(false)
+	run.mu.Lock()
+	if run.state != stateRunning {
+		run.mu.Unlock()
+		return
+	}
+	run.act.Store(act)
+	go b.runActivity(run)
+	run.mu.Unlock()
 
 	resp, err := b.sendAPI(reqCtx, req, body)
 	if err != nil {
@@ -325,8 +334,14 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		reason := "hermes-api-failed"
-		if resp.StatusCode == apiRateLimitedStatus || apiRateLimitedReasons[resp.Header.Get(apiFailureReasonHeader)] {
+		switch {
+		case resp.StatusCode == apiRateLimitedStatus || apiRateLimitedReasons[resp.Header.Get(apiFailureReasonHeader)]:
 			reason = "hermes-rate-limited"
+		case resp.StatusCode >= http.StatusBadRequest && resp.StatusCode < http.StatusInternalServerError:
+			// The server refuses a request in 4xx before an agent runs
+			// (the key, the session headers, the profile, the body); a
+			// turn that ran and failed answers 5xx.
+			reason = "hermes-api-refused"
 		}
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: %s - HTTP %d; session: %s; body tail: %s",
 			reason, resp.StatusCode, sessionID, tail(string(raw), apiBodyTailBytes)), nil)
@@ -394,13 +409,17 @@ func (b *Bridge) sendAPI(ctx context.Context, req *http.Request, body []byte) (*
 // shutdown and the deadline each end reqCtx, so they are read first.
 func (b *Bridge) finalizeAPIError(run *taskRun, reqCtx context.Context, err error) {
 	switch {
+	case run.canceled.Load() && errors.Is(err, errWaitingForTurn):
+		// Nothing was sent: the task was still waiting for its turn, the
+		// API executor's queue.
+		b.finalize(run, lib.StateCanceled, canceledBeforeStartReason, nil)
 	case run.canceled.Load():
 		b.finalize(run, lib.StateCanceled, "reason: canceled-by-request", nil)
 	case b.closing.Load():
 		b.finalize(run, lib.StateFailed, shutdownReason, nil)
 	case reqCtx.Err() == context.DeadlineExceeded && errors.Is(err, errWaitingForTurn):
 		b.finalize(run, lib.StateFailed,
-			fmt.Sprintf("reason: deadline-exceeded - waited %s for the session's previous turn; no request was sent", b.cfg.TaskDeadline), nil)
+			fmt.Sprintf("reason: session-busy - waited %s for the session's previous turn; no request was sent", b.cfg.TaskDeadline), nil)
 	case reqCtx.Err() == context.DeadlineExceeded && errors.Is(err, errNeverConnected):
 		// Infrastructure, as the refused connection past the retry window
 		// is: the deadline ended a wait for a server that never listened.

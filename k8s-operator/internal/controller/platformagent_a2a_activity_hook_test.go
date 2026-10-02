@@ -33,13 +33,23 @@ import (
 // bridge on the cli executor or with its door off or elsewhere, renders
 // exactly what it did before.
 func TestActivityHookRendersOnlyWithABridgeOnNext(t *testing.T) {
-	bridge := []corev1.Container{{Name: "hermes-bridge", Image: "bridge:dev", Env: []corev1.EnvVar{{Name: "BRIDGE_CONCURRENCY", Value: "2"}}}}
+	key := corev1.EnvVar{Name: "API_SERVER_KEY", Value: "k"}
+	keyRef := corev1.EnvVar{Name: "API_SERVER_KEY", ValueFrom: &corev1.EnvVarSource{
+		SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "s"}, Key: "API_SERVER_KEY"}}}
+	fromField := func(name string) corev1.EnvVar {
+		return corev1.EnvVar{Name: name, ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}}
+	}
+	keyless := []corev1.Container{{Name: "hermes-bridge", Image: "bridge:dev", Env: []corev1.EnvVar{{Name: "BRIDGE_CONCURRENCY", Value: "2"}}}}
 	other := []corev1.Container{{Name: "log-shipper", Image: "shipper:dev"}}
-	bridgeWith := func(env ...corev1.EnvVar) []corev1.Container {
-		c := bridge[0]
+	keylessWith := func(env ...corev1.EnvVar) []corev1.Container {
+		c := keyless[0]
 		c.Env = append(append([]corev1.EnvVar(nil), c.Env...), env...)
 		return []corev1.Container{c}
 	}
+	bridgeWith := func(env ...corev1.EnvVar) []corev1.Container {
+		return keylessWith(append([]corev1.EnvVar{key}, env...)...)
+	}
+	bridge := bridgeWith()
 	cases := []struct {
 		name     string
 		mode     *string
@@ -57,6 +67,17 @@ func TestActivityHookRendersOnlyWithABridgeOnNext(t *testing.T) {
 			corev1.EnvVar{Name: "EXEC", Value: "cli"}, corev1.EnvVar{Name: "BRIDGE_EXECUTOR", Value: "$(EXEC)"}), false},
 		{"next with the door off", ptr.To("next"), bridgeWith(corev1.EnvVar{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "off"}), false},
 		{"next with the door elsewhere", ptr.To("next"), bridgeWith(corev1.EnvVar{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "127.0.0.1:9999"}), false},
+		{"next with the door on every interface", ptr.To("next"), bridgeWith(corev1.EnvVar{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "0.0.0.0:8651"}), true},
+		{"next with the door on the empty host", ptr.To("next"), bridgeWith(corev1.EnvVar{Name: "BRIDGE_ACTIVITY_LISTEN", Value: ":8651"}), true},
+		{"next with the door on the IPv6 wildcard", ptr.To("next"), bridgeWith(corev1.EnvVar{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "[::]:8651"}), true},
+		{"next with the door on another host", ptr.To("next"), bridgeWith(corev1.EnvVar{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "10.0.0.1:8651"}), false},
+		{"next with the door from valueFrom", ptr.To("next"), bridgeWith(fromField("BRIDGE_ACTIVITY_LISTEN")), false},
+		{"next with a keyless bridge", ptr.To("next"), keyless, false},
+		{"next with a blank key", ptr.To("next"), keylessWith(corev1.EnvVar{Name: "API_SERVER_KEY", Value: " "}), false},
+		{"next with the key from a Secret", ptr.To("next"), keylessWith(keyRef), true},
+		{"next with a keyless api bridge", ptr.To("next"), keylessWith(corev1.EnvVar{Name: "BRIDGE_EXECUTOR", Value: "api"}), true},
+		{"next with an empty executor and a key", ptr.To("next"), bridgeWith(corev1.EnvVar{Name: "BRIDGE_EXECUTOR", Value: ""}), true},
+		{"next with the executor from valueFrom", ptr.To("next"), bridgeWith(fromField("BRIDGE_EXECUTOR")), false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

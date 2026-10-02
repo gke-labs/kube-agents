@@ -53,6 +53,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -508,9 +509,37 @@ func newActivityState(withKey bool) *activityState {
 	return a
 }
 
+// activityHookReaches reports whether a door bound at addr receives the
+// pod-wide hook's POSTs; a variable so a test's door, on a port the kernel
+// picked, can stand in for the hook's.
+var activityHookReaches = doorReceivesHook
+
+// doorReceivesHook reports whether a door bound at addr receives a POST to
+// DefaultActivityListen, the only address the operator's pod-wide hook
+// posts to: the same port, on that host or a wildcard that includes it. A
+// door elsewhere is open, but no API task's call can reach it.
+func doorReceivesHook(addr net.Addr) bool {
+	tcp, ok := addr.(*net.TCPAddr)
+	if !ok {
+		return false
+	}
+	host, port, err := net.SplitHostPort(DefaultActivityListen)
+	if err != nil || strconv.Itoa(tcp.Port) != port {
+		return false
+	}
+	return tcp.IP.IsUnspecified() || tcp.IP.Equal(net.ParseIP(host))
+}
+
+// apiTraced says an API task's calls can reach the door: it is open where
+// the hook posts, and the bridge holds the secret the hook signs with.
+func (b *Bridge) apiTraced() bool {
+	return b.activityLn != nil && b.cfg.ActivitySecret != "" && activityHookReaches(b.activityLn.Addr())
+}
+
 // newSessionActivityState is the API executor's side of the door: no key of
 // its own (the pod's hook signs with the shared secret), the session id to
-// claim deliveries by, and traced when the door is open with that secret.
+// claim deliveries by, and traced when the door can hear the pod-wide hook
+// and holds its secret (apiTraced).
 func newSessionActivityState(sessionID string, traced bool) *activityState {
 	a := newActivityState(false)
 	a.sessionID = sessionID
