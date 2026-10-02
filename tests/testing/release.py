@@ -1,6 +1,7 @@
 """Release pipeline specific test constants and fixtures."""
 
 import pathlib
+import re
 
 from tests.testing.common import (
     INVALID_GA_RELEASE_TAGS,
@@ -24,6 +25,65 @@ MOCK_REQUIRED_RELEASE_IMAGES = [
     "a2a-authcallout",
     "hermes-bridge",
 ]
+
+# A list from before the growths: what a candidate or a release line cut
+# before #1068 and #2206 carries in its own common.sh. Shorter than
+# MOCK_REQUIRED_RELEASE_IMAGES on purpose, so a gate reading this checkout's
+# list refuses it and one reading the candidate's accepts it.
+MOCK_CANDIDATE_RELEASE_IMAGES = [
+    "k8s-operator",
+    "platform-agent",
+]
+# A list longer than this checkout's: a release line that grew its list by
+# backport. The candidate's list wins in this direction too.
+MOCK_GROWN_RELEASE_IMAGES = MOCK_REQUIRED_RELEASE_IMAGES + ["backported-image"]
+
+# The parse tests/test_promotion_pipeline_wiring.py applies to common.sh and
+# `required_release_images_in_text` in common.sh mirrors: one copy here, so
+# the wiring test and the pin test in test_release_common.py cannot drift.
+REQUIRED_RELEASE_IMAGES_BLOCK_RE = re.compile(r"REQUIRED_RELEASE_IMAGES=\((.*?)\)", re.S)
+REQUIRED_RELEASE_IMAGES_ENTRY_RE = re.compile(r"^\s*\"([^\"\s]+)\"\s*$", re.M)
+REQUIRED_RELEASE_IMAGES_PATH = "scripts/release/common.sh"
+
+
+def parse_required_release_images(common_sh_text):
+    """The names REQUIRED_RELEASE_IMAGES lists in a common.sh text, in order.
+
+    Raises ValueError naming what is wrong when the block is missing, an entry
+    is not one double-quoted name on its own line, a name repeats, or the
+    block is empty. Each of those is a list the release gate must not act on.
+    """
+    block = REQUIRED_RELEASE_IMAGES_BLOCK_RE.search(common_sh_text)
+    if block is None:
+        raise ValueError("REQUIRED_RELEASE_IMAGES not found in common.sh")
+    entries = [line for line in block.group(1).splitlines() if line.strip()]
+    required = REQUIRED_RELEASE_IMAGES_ENTRY_RE.findall(block.group(1))
+    if len(set(required)) != len(entries):
+        raise ValueError("an entry of REQUIRED_RELEASE_IMAGES was not read (unquoted, two on one line, or a duplicate)")
+    if not required:
+        raise ValueError("REQUIRED_RELEASE_IMAGES is empty")
+    return required
+
+
+def write_required_release_images(repo_dir, images):
+    """Writes a scripts/release/common.sh under repo_dir carrying only the
+    list, in the shape the wiring test reads. Returns its path."""
+    path = pathlib.Path(repo_dir) / REQUIRED_RELEASE_IMAGES_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = "".join(f'  "{img}"\n' for img in images)
+    path.write_text(f"#!/usr/bin/env bash\nexport REQUIRED_RELEASE_IMAGES=(\n{body})\n")
+    return path
+
+
+def commit_required_release_images(repo_dir, git, images, message="build: set the release image list"):
+    """Commits a scripts/release/common.sh listing `images` at HEAD of the
+    mock repository and returns the new commit: a candidate whose own list is
+    `images`, whatever the checkout running the scripts lists."""
+    write_required_release_images(repo_dir, images)
+    git("add", REQUIRED_RELEASE_IMAGES_PATH)
+    git("commit", "-m", message)
+    return git("rev-parse", "HEAD").stdout.strip()
+
 
 MOCK_INITIAL_VERSION = "0.1.0"
 MOCK_BASE_TAG_PRE_1_0 = "0.1.4"

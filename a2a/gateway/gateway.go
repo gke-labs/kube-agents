@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,6 +15,22 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/nats-io/nats.go/jetstream"
+)
+
+// sessionProfile is the AgentProfile a /session conversation runs as - the
+// conversation front door of spec-subagent-profiles.md (a2a/profiles/chat.yaml).
+const sessionProfile = "chat"
+
+// sessionKindDM is the SessionRecord.Kind of a direct message, the one Slack
+// surface that carries every message without a mention.
+const sessionKindDM = "dm"
+
+// What retireIncarnation posts when the previous task cannot be closed on
+// the bus, by what the caller was about to do: three callers start a task,
+// one leaves the route, and the user needs to hear which did not happen.
+const (
+	retireRefusalNotStarted = "⚠️ not started: could not close the previous task on the bus; try again in a moment"
+	retireRefusalStillOn    = "⚠️ could not close the previous task on the bus; the session route is still on and its pod still there — try `/session off` again in a moment"
 )
 
 // turnTimeout bounds one handler turn — an inbound message or a relay
@@ -617,11 +634,28 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// reading of "any update on the rollout" would steal a NEW task to
 	// replay a dead one, so the cost argument inverts there too.
 	wideStatus := !rec.AddressedToOwnSession() && !(active != nil && active.Detached)
+	// A slash command resolves before everything else (architecture 02,
+	// "Chat entrypoints"): it is not a status ask, not a stop, and never a
+	// steer. Text only - a programmatic cancel keeps its intent whatever
+	// its text says.
+	sessionRest, sessionCmd := isSessionCommand(msg.Text)
+	if sessionCmd && g.spawner != nil && g.cfg.DefaultAddressee == RouteSession &&
+		sessionRest != "" && !isSessionOff(sessionRest) {
+		// Post-flip, every conversation is a session already, so
+		// "/session <text>" is <text>: the ordinary turn it would have been
+		// without the prefix, not a confirmation that drops the ask.
+		msg.Text, sessionCmd = sessionRest, false
+	}
 	// An explicit cancel from a backend that can express one is read before
 	// the text is read at all: it is not an ask, and a program must never
-	// have to spell "stop" to reach a control path.
+	// have to spell "stop" to reach a control path. Read after the strip
+	// above, so a post-flip "/session stop" is the stop it unwraps to.
 	stopping := msg.Intent == IntentCancel || isStop(msg.Text)
 	switch {
+	case msg.Intent == "" && sessionCmd:
+		if !g.sessionCommand(ctx, rec, msg, backend, sessionRest, principal, authority) {
+			return
+		}
 	case msg.Intent == "" && active != nil && isStatusQuery(msg.Text, wideStatus):
 		g.answerStatusByReplay(ctx, rec)
 	case stopping && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
@@ -675,54 +709,21 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			// supervisor and owes its terminal `canceled` BEFORE the delete
 			// (the one deletion rule in Session lifecycle); a refusal here
 			// precedes every route mutation, so the record is untouched.
-			if rec.PodName != "" {
-				if !g.closeDetachedBeforeDelete(ctx, rec) {
-					g.post(rec.Key, "⚠️ not started: could not close the previous task on the bus; try again in a moment")
-					return
-				}
-				if err := g.spawner.Delete(ctx, rec.PodName); err != nil {
-					g.log.Warn("previous incarnation delete failed; pod may linger",
-						"pod", rec.PodName, "err", err)
-				}
-				rec.PodName = ""
+			if !g.retireIncarnation(ctx, rec, "delegate", retireRefusalNotStarted) {
+				return
 			}
 			if rec.Profile == "" {
-				rec.Profile = "chat"
+				rec.Profile = sessionProfile
 			}
 			rec.BusSession = mintSessionName(rec.Profile)
 			rec.Addressee = rec.BusSession
 			msg.Text = rest
 		} else if rec.SessionRouted {
-			// Every new task on the session route gets a fresh incarnation.
-			// The worker adapter is one task per process, so a lingering
-			// PodName names an executor that can never serve this task -
-			// publishing toward it wedges the conversation with a task
-			// nothing will run and nothing will terminate (S9 review
-			// finding). Retire it the way Delegate does: supervisor
-			// terminal for a detached task first, then the delete, then
-			// the successor. The cap holds here too, or Delegate refusals
-			// just push the flood one affordance over.
-			if g.refuseAtSessionCap(ctx, rec, rec.PodName != "") {
+			// Every new task on the session route gets a fresh incarnation;
+			// freshIncarnation says why and holds the cap.
+			if !g.freshIncarnation(ctx, rec) {
 				return
 			}
-			if rec.PodName != "" {
-				if !g.closeDetachedBeforeDelete(ctx, rec) {
-					g.post(rec.Key, "⚠️ not started: could not close the previous task on the bus; try again in a moment")
-					return
-				}
-				// Spawner-nil is the W4-rollback shape: the record is
-				// session-routed but nothing can manage pods. Clear the
-				// binding and degrade the way this path always did.
-				if g.spawner != nil {
-					if err := g.spawner.Delete(ctx, rec.PodName); err != nil {
-						g.log.Warn("previous incarnation delete failed; pod may linger",
-							"pod", rec.PodName, "err", err)
-					}
-				}
-				rec.PodName = ""
-			}
-			rec.BusSession = mintSessionName(rec.Profile)
-			rec.Addressee = rec.BusSession
 		} else {
 			// Re-home after a delegated task: a plain ask on a fixed-route
 			// conversation always goes to the configured addressee, never
@@ -745,19 +746,11 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 				// old pod holds a cap slot sweep can never reclaim. Same
 				// supervisor rule as the Delegate branch: a detached
 				// task's terminal is published before its pod goes.
-				if rec.PodName != "" {
-					if !g.closeDetachedBeforeDelete(ctx, rec) {
-						g.post(rec.Key, "⚠️ not started: could not close the previous task on the bus; try again in a moment")
-						return
-					}
-					if err := g.spawner.Delete(ctx, rec.PodName); err != nil {
-						g.log.Warn("pre-flip incarnation delete failed; pod may linger",
-							"pod", rec.PodName, "err", err)
-					}
-					rec.PodName = ""
+				if !g.retireIncarnation(ctx, rec, "pre-flip upgrade", retireRefusalNotStarted) {
+					return
 				}
 				rec.SessionRouted = true
-				rec.Profile = "chat"
+				rec.Profile = sessionProfile
 				rec.BusSession = mintSessionName(rec.Profile)
 				rec.Addressee = rec.BusSession
 			}
@@ -879,13 +872,32 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 }
 
 // probeConversation is the ConversationProbe the gateway offers a ProbeSink:
-// the session record for one conversation and the state of its active
-// task's stream, as they stand. A pure read, as ConversationProbe requires:
+// the session record for one conversation and the state of one task's
+// stream, as they stand. A pure read, as ConversationProbe requires:
 // no lock, no heal, no post, no publish, no write. It does not take the
 // session lock because it needs nothing the lock protects -- the KV read is
 // atomic and the stream replay is its own snapshot -- and holding it would
 // let a slow read delay the turn the caller is waiting on.
-func (g *Gateway) probeConversation(ctx context.Context, key string) (ConversationState, error) {
+//
+// Which task: the one taskID names when the caller gives one, else the
+// record's active task. A caller names the task it is grading, and the
+// record stops holding that task the moment the relay posts its terminal
+// (relayTerminal clears ActiveTask) -- which is exactly when an eval
+// harness assembles its record -- so a read of the active task alone
+// answers a finished run with no stream at all. The record's task history
+// still knows the addressee the task's subjects carried (AddresseeFor, the
+// relay's own replay choice) and the stream is durable, so the named read
+// is the same read the active one is. Active and the fields beside it
+// describe the record's active task only when it is the task being read; a
+// named task the record no longer holds reports Active false with zero
+// SubmittedAt and Age, and its stream. A task the record never held, active
+// or in its history, is not read at all: the door's token admits its holder
+// to conversations, not to every task on a shared addressee, and an id that
+// is not the record's is never formatted into a subject. A conversation with no record has
+// had no turn, so no task of it was ever published: the empty state, not a
+// read against the configured default addressee, which may be the
+// RouteSession sentinel -- a route, never a subject.
+func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (ConversationState, error) {
 	state := ConversationState{
 		Backend:    g.backend,
 		InjectOnly: g.backend == injectBackend,
@@ -895,27 +907,64 @@ func (g *Gateway) probeConversation(ctx context.Context, key string) (Conversati
 	if err != nil {
 		return state, fmt.Errorf("session lookup: %w", err)
 	}
-	if rec == nil || rec.ActiveTask == nil {
+	if rec == nil {
 		return state, nil
 	}
 	active := rec.ActiveTask
-	state.Active = true
-	state.TaskID = active.TaskID
-	state.SubmittedAt = active.SubmittedAt
-	state.Detached = active.Detached
-	if !active.SubmittedAt.IsZero() {
-		state.Age = time.Since(active.SubmittedAt)
+	if taskID == "" {
+		if active == nil {
+			return state, nil
+		}
+		taskID = active.TaskID
 	}
-	// Against the addressee the task's own subjects carried: after a
-	// Delegate re-home rec.Addressee is not it (the relay's terminal replay
-	// makes the same choice).
-	addressee := rec.AddresseeFor(active.TaskID)
-	task, terminalSubject, terr := g.client.TasksGetAttributed(ctx, addressee, active.TaskID)
+	state.TaskID = taskID
+	// A named task is read only when this conversation owns it: the active
+	// task, or one in the record's own history. The door's token admits a
+	// caller to conversations under its prefix, not to every task on the
+	// addressee, and AddresseeFor's fallback for an unknown id is the
+	// record's addressee - on a fixed-addressee install the same `platform`
+	// every conversation shares - so an unowned id must never reach the
+	// bus. It also keeps the query string off the subject builder: an id
+	// that is not in the record is never formatted into a NATS subject, so
+	// a wildcard is a miss, not a replay of the whole addressee. A task
+	// older than the history cap reads as unknown, which is the price.
+	var addressee string
+	switch {
+	case active != nil && active.TaskID == taskID:
+		state.Active = true
+		state.SubmittedAt = active.SubmittedAt
+		state.Detached = active.Detached
+		if !active.SubmittedAt.IsZero() {
+			state.Age = time.Since(active.SubmittedAt)
+		}
+		// Against the addressee the task's own subjects carried: after a
+		// Delegate re-home rec.Addressee is not it (the relay's terminal
+		// replay makes the same choice).
+		addressee = rec.AddresseeFor(taskID)
+	default:
+		ref, owned := rec.TaskRefFor(taskID)
+		if !owned {
+			return state, nil
+		}
+		addressee = ref.Addressee
+	}
+	task, terminalSubject, terr := g.client.TasksGetAttributed(ctx, addressee, taskID)
 	switch {
 	case terr == nil:
 		state.ExecutorState = task.State
 		state.Final = task.Final
 		state.ReachedWorking = slices.Contains(task.StatusHistory, lib.StateWorking)
+		// The trace and the progress line as they stand, final or not: a
+		// caller watching a running task reads what it has called so far.
+		// Non-nil from here on even when empty, because "read and found
+		// nothing" is a fact about the executor and nil is not.
+		state.Activity = make([]json.RawMessage, 0)
+		for _, p := range artifactParts(task, lib.ArtifactActivity) {
+			if p.Kind == "data" && len(p.Data) != 0 {
+				state.Activity = append(state.Activity, p.Data)
+			}
+		}
+		state.Progress = lastTextPart(artifactParts(task, lib.ArtifactProgress))
 		if task.Final {
 			// The fold's terminal, with whose word it is: the events
 			// subject is the executor's, the supervisor subject the
@@ -923,7 +972,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key string) (Conversati
 			// only the executor's; a supervisor terminal says an executor
 			// died or never ran, which is the install's.
 			state.TerminalSource = TerminalFromExecutor
-			if terminalSubject == lib.TaskSupervisorSubject(addressee, active.TaskID) {
+			if terminalSubject == lib.TaskSupervisorSubject(addressee, taskID) {
 				state.TerminalSource = TerminalFromSupervisor
 			}
 			if art := task.Artifact(lib.ArtifactResult); art != nil {
@@ -941,9 +990,173 @@ func (g *Gateway) probeConversation(ctx context.Context, key string) (Conversati
 		// A transport failure cannot rule out events, so it is not "no
 		// executor": the caller learns that the gateway could not look,
 		// never that nothing is there.
-		return state, fmt.Errorf("reading task %s on %s: %w", active.TaskID, addressee, terr)
+		return state, fmt.Errorf("reading task %s on %s: %w", taskID, addressee, terr)
 	}
 	return state, nil
+}
+
+// retireIncarnation deletes the record's lingering session pod before a
+// successor is minted or the route is left. Delete rather than just untrack:
+// once PodName clears, reap can never find the pod again, and sweep only
+// sees terminal phases - a wedged Running pod would hold its bus credential
+// forever. A detached task's supervisor terminal is owed BEFORE the delete
+// (the one deletion rule in Session lifecycle); false means that terminal
+// could not be published, a post has said so, and nothing was touched.
+// Spawner-nil is the W4-rollback shape: the record names a pod nothing can
+// manage, so the binding is cleared and the path degrades as it always did.
+func (g *Gateway) retireIncarnation(ctx context.Context, rec *SessionRecord, why, refusal string) bool {
+	if rec.PodName == "" {
+		return true
+	}
+	if !g.closeDetachedBeforeDelete(ctx, rec) {
+		g.post(rec.Key, refusal)
+		return false
+	}
+	if g.spawner != nil {
+		if err := g.spawner.Delete(ctx, rec.PodName); err != nil {
+			g.log.Warn(why+": incarnation delete failed; pod may linger", "pod", rec.PodName, "err", err)
+		}
+	}
+	rec.PodName = ""
+	return true
+}
+
+// freshIncarnation retires the previous session pod, if any, and mints the
+// next incarnation's name as the record's addressee. The worker adapter is
+// one task per process, so a lingering PodName names an executor that can
+// never serve the next task; publishing toward it wedges the conversation
+// (S9 review finding). Retire it the way Delegate does: supervisor terminal
+// for a detached task first, then the delete, then the successor. The cap
+// holds here too, or Delegate refusals just push the flood one affordance
+// over.
+//
+// False means the turn was refused - at the cap, or because the previous
+// task could not be closed on the bus - and a post has already said so.
+// Nothing below the last refusal has run, so the caller returns without a
+// Put and whatever it set in memory beforehand never persists.
+func (g *Gateway) freshIncarnation(ctx context.Context, rec *SessionRecord) bool {
+	if g.refuseAtSessionCap(ctx, rec, rec.PodName != "") {
+		return false
+	}
+	if !g.retireIncarnation(ctx, rec, "session route", retireRefusalNotStarted) {
+		return false
+	}
+	rec.BusSession = mintSessionName(rec.Profile)
+	rec.Addressee = rec.BusSession
+	return true
+}
+
+// sessionCommand resolves the one slash command the gateway owns:
+// "/session" marks the conversation session-routed, "/session <text>" marks
+// it and runs <text> as the first turn, "/session off" releases the
+// incarnation and re-homes to the default addressee. Deterministic, like
+// every other affordance here; it names a route, not a handle, and it is
+// resolved before status, stop and steer (spec-chatops-gateway, "Sessions by
+// default"). It reports whether the record is to be written back: true for
+// every answered turn, including the informational replies (a turn is a turn,
+// and the idle clock moves as it does for "nothing is running"); false only
+// when the turn was refused part-way (the cap, or a previous task that could
+// not be closed) and the in-memory route change must not persist.
+func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg InboundMessage, backend, rest, principal string, authority []byte) bool {
+	off := isSessionOff(rest)
+	// The way back is answered even with no spawner: a record left
+	// session-routed after A2A_SPAWN_SESSIONS was disarmed (the W4-rollback
+	// shape) would otherwise publish every ask to an addressee nothing
+	// serves, with no user-reachable way out. retireIncarnation tolerates a
+	// nil spawner; only the on-forms need one.
+	if g.spawner == nil && !(off && rec.SessionRouted) {
+		g.post(rec.Key, "🤷 sessions are not enabled on this install")
+		return true
+	}
+	if g.cfg.DefaultAddressee == RouteSession {
+		// Post-flip: every conversation is a session already.
+		if off {
+			g.post(rec.Key, "ℹ️ sessions are the default on this install; there is nothing to turn off")
+		} else {
+			g.post(rec.Key, "ℹ️ this conversation is already a session")
+		}
+		return true
+	}
+	running := rec.ActiveTask != nil && !rec.ActiveTask.Detached
+	if off {
+		if !rec.SessionRouted {
+			g.post(rec.Key, "ℹ️ not on the session route; nothing to turn off")
+			return true
+		}
+		if running && rec.AddressedToOwnSession() {
+			// The refusal protects a running SESSION task's pod: retiring it
+			// would delete the pod out from under the task. A platform task
+			// running on a record that was marked mid-task has no pod to
+			// lose and keeps its addressee, so the way back goes through.
+			g.post(rec.Key, "⚠️ a session task is still running — `stop` it first, then `/session off`")
+			return true
+		}
+		if !g.retireIncarnation(ctx, rec, "session off", retireRefusalStillOn) {
+			return false
+		}
+		rec.SessionRouted = false
+		rec.Profile = ""
+		rec.BusSession = ""
+		rec.Addressee = g.cfg.DefaultAddressee
+		g.log.Info("session route off", "conversation", rec.Key, "addressee", rec.Addressee)
+		g.post(rec.Key, "↩️ session route off — back to `"+g.cfg.DefaultAddressee+"`")
+		return true
+	}
+	if rec.SessionRouted && rest == "" {
+		g.post(rec.Key, "ℹ️ already on the session route")
+		return true
+	}
+	if isStop(rest) {
+		// "/session stop" is almost certainly the way back misspelled. It
+		// must never become a task whose text reads "stop" - the same rule
+		// the stopping case below enforces for a bare "stop".
+		g.post(rec.Key, "ℹ️ to leave the session route say `/session off`; to stop a running task say `stop`")
+		return true
+	}
+	rec.SessionRouted = true
+	if rec.Profile == "" {
+		rec.Profile = sessionProfile
+	}
+	g.log.Info("session route on", "conversation", rec.Key, "firstTurn", rest != "", "taskRunning", running)
+	switch {
+	case rest == "" && running:
+		// Truthful about the order: the next message steers the running
+		// task (the steer case below), so it is the one after the task
+		// ends that opens the pod.
+		g.post(rec.Key, "🧵 session route on — the running task finishes first; the message after it opens a session pod; `/session off` returns to `"+g.cfg.DefaultAddressee+"`")
+		return true
+	case rest == "":
+		g.post(rec.Key, sessionOnAck(backend, rec.Kind, g.cfg.DefaultAddressee))
+		return true
+	case running && rec.AddressedToOwnSession():
+		// Already on the route with its own task running: the text is what
+		// a plain message would have been, a steer into that task.
+		msg.Text = rest
+		g.steerTask(ctx, rec, msg, authority)
+		return true
+	case running:
+		g.post(rec.Key, "🧵 session route on — a task is still running, so that message was not sent; send it again when the task finishes")
+		return true
+	}
+	msg.Text = rest
+	if !g.freshIncarnation(ctx, rec) {
+		return false
+	}
+	g.startTask(ctx, rec, msg, principal, authority)
+	return true
+}
+
+// sessionOnAck is the reply to a bare /session. It promises what the backend
+// will deliver: the Slack adapter forwards an unmentioned channel-thread
+// reply only once the gateway has started a task in that thread, and a
+// /session binding starts none, so in a Slack channel the next message needs
+// the mention. DMs carry every message; the other backends route the next
+// message on their own rules.
+func sessionOnAck(backend, kind, defaultAddressee string) string {
+	if backend == slackBackend && kind != sessionKindDM {
+		return "🧵 session route on — mention me in your next message to open a session pod (a Slack thread carries unmentioned replies only once a task has started); `/session off` returns to `" + defaultAddressee + "`"
+	}
+	return "🧵 session route on — your next message opens a session pod; `/session off` returns to `" + defaultAddressee + "`"
 }
 
 // hasSession is the SessionLookup the gateway offers a SessionLookupSink:
@@ -1005,6 +1218,25 @@ func (g *Gateway) hasSession(ctx context.Context, conversation string) (bool, ti
 		}
 	}
 	return false, time.Time{}, nil
+}
+
+// artifactParts is every part under one reserved artifact name, artifact by
+// artifact in first-appearance order and each artifact's parts in arrival
+// order (which is stream order for an executor that appends to one
+// artifact id, as both executors do), across every artifact the fold holds under it -- not the first
+// alone (Task.Artifact). The fold keys on artifactId when an update carries
+// one, so an executor that gives each activity update its own id leaves the
+// fold holding several artifacts named activity, and the trace is all of
+// them; an executor that appends onto one id leaves one, and this reads the
+// same.
+func artifactParts(task *lib.Task, name string) []lib.Part {
+	var parts []lib.Part
+	for i := range task.Artifacts {
+		if task.Artifacts[i].Name == name {
+			parts = append(parts, task.Artifacts[i].Parts...)
+		}
+	}
+	return parts
 }
 
 // observeTaskStarted and observeTaskTerminal tell an adapter that implements

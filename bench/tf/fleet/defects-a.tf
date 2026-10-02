@@ -64,8 +64,9 @@ resource "kubernetes_namespace_v1" "seeded_capacity" {
 # so one drain can still take both replicas at once; that is the finding.
 # Asserted by obtainability-planted-pdb and by
 # cluster-agent-healthy-workload-no-finding, which uses this workload for the
-# opposite property: its runtime state is clean, so it is the fleet's only
-# fixture that lets a case ask whether the agent invents a fault. That case
+# opposite property: its runtime state is clean, so it is one of the
+# fixtures (with notification-relay in seeded-intent) that let a case ask
+# whether the agent invents a fault. That case
 # additionally asserts the container image and the absence of a
 # rollout-restart annotation, so it is not only the replica count and the
 # missing budget that are load-bearing here now.
@@ -115,6 +116,66 @@ resource "kubernetes_deployment_v1" "checkout_gateway" {
         }
         container {
           name  = "gateway"
+          image = "registry.k8s.io/pause:3.9"
+          resources {
+            requests = { cpu = "10m", memory = "16Mi" }
+            limits   = { memory = "32Mi" }
+          }
+        }
+      }
+    }
+  }
+}
+
+# Declared posture (reliability): two replicas, no PodDisruptionBudget, in a
+# namespace of its own. The same shape as checkout-gateway above, planted so
+# that a repository declaration can cover it without touching the cases
+# that grade checkout-gateway's missing budget: the obtainability SOP's
+# declared-intent step (4a) lists a declared posture under the ledger's
+# Declared intent section instead of as a finding, and
+# obtainability-declared-intent-no-finding asserts exactly that on this
+# workload. Nothing else reads this namespace.
+resource "kubernetes_namespace_v1" "seeded_intent" {
+  metadata {
+    name   = "seeded-intent"
+    labels = local.fleet_labels
+  }
+  depends_on = [google_container_node_pool.seeded_a_default]
+}
+
+resource "kubernetes_deployment_v1" "notification_relay" {
+  metadata {
+    name      = "notification-relay"
+    namespace = kubernetes_namespace_v1.seeded_intent.metadata[0].name
+  }
+  spec {
+    replicas = 2
+    selector {
+      match_labels = { app = "notification-relay" }
+    }
+    template {
+      metadata {
+        labels = { app = "notification-relay" }
+      }
+      spec {
+        topology_spread_constraint {
+          max_skew           = 1
+          topology_key       = "kubernetes.io/hostname"
+          when_unsatisfiable = "ScheduleAnyway"
+          label_selector {
+            match_labels = { app = "notification-relay" }
+          }
+        }
+        automount_service_account_token = false
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name  = "relay"
           image = "registry.k8s.io/pause:3.9"
           resources {
             requests = { cpu = "10m", memory = "16Mi" }
@@ -338,6 +399,7 @@ resource "kubernetes_network_policy_v1" "default_deny" {
     reliability = kubernetes_namespace_v1.seeded_reliability.metadata[0].name
     debug       = kubernetes_namespace_v1.seeded_debug.metadata[0].name
     capacity    = kubernetes_namespace_v1.seeded_capacity.metadata[0].name
+    intent      = kubernetes_namespace_v1.seeded_intent.metadata[0].name
   }
 
   metadata {
@@ -353,8 +415,9 @@ resource "kubernetes_network_policy_v1" "default_deny" {
 
 # Reliability SOP 3.3 background closure: inference-server runs at two or
 # more desired replicas with no PodDisruptionBudget, which is exactly the
-# planted checkout-gateway defect -- but only checkout-gateway is the
-# fixture. maxUnavailable: 1 is the SOP's own structurally-safe shape; a PDB
+# planted checkout-gateway defect -- but the fixtures are checkout-gateway
+# and (declared) notification-relay, not this. maxUnavailable: 1 is the
+# SOP's own structurally-safe shape; a PDB
 # governs evictions only, so the stockout fixture (a scheduling gap) is
 # untouched. The HPA's desired count is a load calculation and differs
 # between projects (3/2/3 across the three eval projects on 2026-08-24), so

@@ -4650,6 +4650,63 @@ def _note_excerpt(front: dict, text: str, path: str) -> str:
     return clip_text(path, MAX_TITLE_CHARS)
 
 
+def _read_declares(text: str, *, where: str | None) -> tuple[dict | None, list | None, str | None]:
+    """`(frontmatter, declares, reason)`: the note's `declares` list, or why there is none.
+
+    The one ladder every reader of a note walks. `parse_declarations` walks it
+    with `where` set and logs the two shapes the SOP promises a WARNING for
+    (frontmatter that is not YAML, a `declares` that is not a list); the pool
+    verifier walks it with `where` None to print the reason to an operator, so
+    the explanation it gives is this function's and cannot drift from the
+    parser's. `reason` is None when `declares` is a non-empty list, which may
+    still yield nothing once each item is checked.
+    """
+    import yaml
+
+    front_text = split_frontmatter(text)
+    if front_text is None:
+        return None, None, "it has no frontmatter: the first line must be `---` and a `---` or `...` line must close it"
+    try:
+        front = yaml.safe_load(front_text)
+    except (yaml.YAMLError, ValueError, RecursionError) as exc:
+        # The other two are PyYAML's own, raised outside the `YAMLError`
+        # tree: an unquoted `2026-02-30` or `T25:00` is resolved as a
+        # timestamp and built with `datetime`, which raises `ValueError`,
+        # and the pure-Python loader composes nested flow collections
+        # recursively, so a few hundred nested `[` raise `RecursionError`.
+        # Left uncaught either would cost the repository its entry, not the
+        # note its declaration.
+        if where is not None:
+            log(f"WARNING: {where}: frontmatter is not valid YAML ({exc}); no declaration read from it.")
+        return None, None, f"its frontmatter is not valid YAML ({type(exc).__name__})"
+    if not isinstance(front, dict):
+        return None, None, f"its frontmatter is a YAML {type(front).__name__}, not a mapping, so it is not an OKF note"
+    if OKF_TYPE_KEY not in front:
+        return None, None, f"its frontmatter has no `{OKF_TYPE_KEY}`, so it is not an OKF note"
+    declares = front.get(DECLARES_KEY)
+    if declares is None:
+        return front, None, f"its frontmatter has no `{DECLARES_KEY}` list"
+    if not isinstance(declares, list):
+        if where is not None:
+            log(f"WARNING: {where}: `{DECLARES_KEY}` must be a list of items; none read.")
+        return front, None, f"its `{DECLARES_KEY}` is not a list"
+    if not declares:
+        return front, [], f"its `{DECLARES_KEY}` list is empty"
+    return front, declares, None
+
+
+def explain_empty_declarations(text: str) -> str | None:
+    """Why `parse_declarations` would read no item from `text`, or None when it has items to check.
+
+    For the pool verifier, which prints the reason to an operator: the same
+    ladder `parse_declarations` walks, without its log lines. None means the
+    note has `declares` items, so an empty result from the parser is the
+    items' own doing, and the parser logged a WARNING per item.
+    """
+    _front, _declares, reason = _read_declares(text, where=None)
+    return reason
+
+
 def parse_declarations(
     text: str, *, repo: str, path: str, declarable: frozenset[str]
 ) -> list[dict]:
@@ -4667,31 +4724,9 @@ def parse_declarations(
     warning; a file with no frontmatter, no `type` or no `declares` yields
     nothing and says nothing, because most notes are not declarations.
     """
-    import yaml
-
     where = f"{repo}:{path}"
-    front_text = split_frontmatter(text)
-    if front_text is None:
-        return []
-    try:
-        front = yaml.safe_load(front_text)
-    except (yaml.YAMLError, ValueError, RecursionError) as exc:
-        # The other two are PyYAML's own, raised outside the `YAMLError`
-        # tree: an unquoted `2026-02-30` or `T25:00` is resolved as a
-        # timestamp and built with `datetime`, which raises `ValueError`,
-        # and the pure-Python loader composes nested flow collections
-        # recursively, so a few hundred nested `[` raise `RecursionError`.
-        # Left uncaught either would cost the repository its entry, not the
-        # note its declaration.
-        log(f"WARNING: {where}: frontmatter is not valid YAML ({exc}); no declaration read from it.")
-        return []
-    if not isinstance(front, dict) or OKF_TYPE_KEY not in front:
-        return []
-    declares = front.get(DECLARES_KEY)
-    if declares is None:
-        return []
-    if not isinstance(declares, list):
-        log(f"WARNING: {where}: `{DECLARES_KEY}` must be a list of items; none read.")
+    front, declares, _reason = _read_declares(text, where=where)
+    if not declares:
         return []
     excerpt = _note_excerpt(front, text, path)
     out: list[dict] = []
@@ -4953,6 +4988,15 @@ def search_tree(
 
 def _declaration_key(entry: dict, *, with_cluster: bool) -> tuple:
     """The tuple a declaration and a finding are joined on: the finding id's segments.
+
+    Also called by scripts/verify_ci_pool_project.py (`_note_declaration_problem`),
+    which loads this module by path to read a pool repository's declared-intent
+    note exactly as the audit would. It also reaches `parse_declarations`,
+    `explain_empty_declarations`, `audit_declarable_checks`,
+    `read_intent_paths`, `_under_prefixes`, `DECLARATION_CLUSTER_FIELD` and
+    `INTENT_FILE` (the verifier's `_AUDIT_REPORT_SYMBOLS` is the list);
+    renaming any of them turns that check into "Not checked" on every
+    operator run until the verifier follows.
 
     Each field goes through `_id_segment`, the reduction `derive_finding_id`
     applies, because the ledger's identity is the standard the join has to

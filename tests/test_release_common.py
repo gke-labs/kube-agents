@@ -26,14 +26,20 @@ from tests.testing.common import (
 )
 from tests.testing.release import (
     INVALID_GA_RELEASE_TAGS,
+    MOCK_CANDIDATE_RELEASE_IMAGES,
+    MOCK_GROWN_RELEASE_IMAGES,
     MOCK_REQUIRED_RELEASE_IMAGES,
     MOCK_SAMPLE_COMMIT_SHA,
     MOCK_SAMPLE_SHORT_SHA,
     MOCK_LINE_PATCH_RELEASE_TAG,
     MOCK_TARGET_RELEASE_LINE,
     MOCK_TARGET_RELEASE_TAG,
+    REQUIRED_RELEASE_IMAGES_PATH,
+    commit_required_release_images,
     create_mock_docker_binary,
     create_mock_ghcr_curl_binary,
+    parse_required_release_images,
+    write_required_release_images,
 )
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -2191,6 +2197,209 @@ class RegistryImageProbeTest(unittest.TestCase):
                 env={"REGISTRY_PREFIX": MOCK_DEFAULT_REGISTRY_PREFIX},
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
+
+
+class RequiredReleaseImagesAtCandidateTest(unittest.TestCase):
+    """The required image list is the candidate's, not this checkout's (#2211).
+
+    release-publish.yml checks out `main` and runs these scripts against a
+    candidate commit. The candidate's images were built by its own publish run
+    from its own REQUIRED_RELEASE_IMAGES, so a candidate from before the list
+    grew (#1068, #2206) has every image it was published with and none of the
+    newer names, and a gate reading main's list refuses it. On main that
+    clears with the next publish; on a release line cut before the growth it
+    never does. `required_release_images_at` reads the list at the candidate,
+    and falls back to this checkout's -- the old behaviour -- only when the
+    candidate's cannot be read, saying so.
+    """
+
+    _REGISTRY = {"REGISTRY_PREFIX": MOCK_DEFAULT_REGISTRY_PREFIX}
+
+    def _run(self, func_call, cwd, bin_dir=None, env=None):
+        full_env = get_isolated_test_env(overrides=env, bin_dir=bin_dir)
+        return subprocess.run(
+            ["bash", "-c", f'source "{_COMMON_SH}"\n{func_call}'],
+            capture_output=True,
+            text=True,
+            env=full_env,
+            cwd=cwd,
+        )
+
+    def _repo(self):
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        return temp_dir, repo_dir, git
+
+    def _docker_with(self, temp_dir, images, sha):
+        """A docker mock whose registry holds exactly `images` at `:<sha>`."""
+        bin_dir = pathlib.Path(temp_dir.name) / "bin"
+        create_mock_docker_binary(
+            bin_dir,
+            existing_images=[f"{MOCK_DEFAULT_REGISTRY_PREFIX}/{img}:{sha}" for img in images],
+        )
+        return str(bin_dir)
+
+    def test_the_gate_accepts_a_candidate_with_every_image_its_own_list_names(self):
+        """Red before the fix: the gate asked for this checkout's longer list."""
+        self.assertGreater(len(MOCK_REQUIRED_RELEASE_IMAGES), len(MOCK_CANDIDATE_RELEASE_IMAGES))
+        temp_dir, repo_dir, git = self._repo()
+        candidate = commit_required_release_images(repo_dir, git, MOCK_CANDIDATE_RELEASE_IMAGES)
+        bin_dir = self._docker_with(temp_dir, MOCK_CANDIDATE_RELEASE_IMAGES, candidate)
+
+        proc = self._run(f'check_commit_images_exist "{candidate}"', cwd=repo_dir, bin_dir=bin_dir, env=self._REGISTRY)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(
+            f"the {len(MOCK_CANDIDATE_RELEASE_IMAGES)} {REQUIRED_RELEASE_IMAGES_PATH} lists at {candidate[:7]}",
+            proc.stderr,
+        )
+
+    def test_the_gate_still_refuses_a_candidate_missing_one_of_its_own_images(self):
+        temp_dir, repo_dir, git = self._repo()
+        candidate = commit_required_release_images(repo_dir, git, MOCK_CANDIDATE_RELEASE_IMAGES)
+        bin_dir = self._docker_with(temp_dir, MOCK_CANDIDATE_RELEASE_IMAGES[:-1], candidate)
+
+        proc = self._run(f'check_commit_images_exist "{candidate}"', cwd=repo_dir, bin_dir=bin_dir, env=self._REGISTRY)
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_the_candidates_list_wins_when_it_is_longer_than_this_checkouts(self):
+        """A release line that grew its list by backport is held to every name
+        it has, however old the main these scripts run from."""
+        temp_dir, repo_dir, git = self._repo()
+        candidate = commit_required_release_images(repo_dir, git, MOCK_GROWN_RELEASE_IMAGES)
+
+        # Every name this checkout lists is published, the backported one is not.
+        bin_dir = self._docker_with(temp_dir, MOCK_REQUIRED_RELEASE_IMAGES, candidate)
+        proc = self._run(f'check_commit_images_exist "{candidate}"', cwd=repo_dir, bin_dir=bin_dir, env=self._REGISTRY)
+        self.assertNotEqual(proc.returncode, 0, "the checkout's shorter list must not vouch for the candidate")
+
+        bin_dir = self._docker_with(temp_dir, MOCK_GROWN_RELEASE_IMAGES, candidate)
+        proc = self._run(f'check_commit_images_exist "{candidate}"', cwd=repo_dir, bin_dir=bin_dir, env=self._REGISTRY)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_find_latest_built_commit_walks_back_to_a_pre_growth_commit(self):
+        """The self-healing case: with the post-growth commit's publish not yet
+        done, the newest commit whose own images are all there is the one
+        before the growth. Red before the fix: nothing in history qualified."""
+        temp_dir, repo_dir, git = self._repo()
+        older = commit_required_release_images(repo_dir, git, MOCK_CANDIDATE_RELEASE_IMAGES, "build: the list before the growth")
+        newer = commit_required_release_images(repo_dir, git, MOCK_REQUIRED_RELEASE_IMAGES, "build(a2a): the list after the growth")
+        bin_dir = self._docker_with(temp_dir, MOCK_CANDIDATE_RELEASE_IMAGES, older)
+
+        proc = self._run("find_latest_built_commit", cwd=repo_dir, bin_dir=bin_dir, env=self._REGISTRY)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), older)
+        self.assertIn(f"Images not ready yet in GHCR for commit {newer[:7]}", proc.stderr)
+
+    def test_the_fallback_is_this_checkouts_list_and_says_why(self):
+        """Every way the candidate's list cannot be read falls back to this
+        checkout's whole list -- never an empty one -- with the reason on stderr."""
+        temp_dir, repo_dir, git = self._repo()
+        no_file = git("rev-parse", "HEAD").stdout.strip()
+        path = pathlib.Path(repo_dir) / REQUIRED_RELEASE_IMAGES_PATH
+        path.parent.mkdir(parents=True)
+        path.write_text("#!/usr/bin/env bash\necho no list here\n")
+        git("add", REQUIRED_RELEASE_IMAGES_PATH)
+        git("commit", "-m", "build: a common.sh without the array")
+        no_array = git("rev-parse", "HEAD").stdout.strip()
+        write_required_release_images(repo_dir, [])
+        git("add", REQUIRED_RELEASE_IMAGES_PATH)
+        git("commit", "-m", "build: an empty array")
+        empty_array = git("rev-parse", "HEAD").stdout.strip()
+        unreadable = f"{REQUIRED_RELEASE_IMAGES_PATH} at {{sha}} has no readable REQUIRED_RELEASE_IMAGES"
+        cases = [
+            ("", "no candidate commit named"),
+            (MOCK_SAMPLE_COMMIT_SHA, f"commit {MOCK_SAMPLE_COMMIT_SHA[:7]} is not in this repository"),
+            (no_file, f"{no_file[:7]} has no {REQUIRED_RELEASE_IMAGES_PATH}"),
+            (no_array, unreadable.format(sha=no_array[:7])),
+            (empty_array, unreadable.format(sha=empty_array[:7])),
+        ]
+        for sha, reason in cases:
+            with self.subTest(sha=sha[:7] or "<none>"):
+                proc = self._run(f'required_release_images_at "{sha}"', cwd=repo_dir)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout.split(), MOCK_REQUIRED_RELEASE_IMAGES)
+                self.assertIn(reason, proc.stderr)
+                self.assertIn(
+                    f"using the {len(MOCK_REQUIRED_RELEASE_IMAGES)} this checkout's {REQUIRED_RELEASE_IMAGES_PATH} lists",
+                    proc.stderr,
+                )
+
+    def test_the_text_parse_matches_the_wiring_tests(self):
+        """common.sh's parse and tests/test_promotion_pipeline_wiring.py's are
+        two implementations of one rule; a shape one accepts and the other
+        rejects is how the gate and the wiring check would come to disagree
+        about what the list says."""
+        real = _COMMON_SH.read_text()
+        shapes = {
+            "this checkout's common.sh": real,
+            "two names": 'export REQUIRED_RELEASE_IMAGES=(\n  "a"\n  "b-c"\n)\n',
+            "names beside the parens": 'export REQUIRED_RELEASE_IMAGES=("a"\n  "b")\n',
+            "blank lines inside": 'export REQUIRED_RELEASE_IMAGES=(\n\n  "a"\n\n)\n',
+            "a comment inside": 'export REQUIRED_RELEASE_IMAGES=(\n  # the operator\n  "a"\n)\n',
+            "two on one line": 'export REQUIRED_RELEASE_IMAGES=(\n  "a" "b"\n)\n',
+            "unquoted": 'export REQUIRED_RELEASE_IMAGES=(\n  a\n)\n',
+            "a duplicate": 'export REQUIRED_RELEASE_IMAGES=(\n  "a"\n  "a"\n)\n',
+            "empty": "export REQUIRED_RELEASE_IMAGES=()\n",
+            "absent": "echo nothing\n",
+        }
+        accepted = 0
+        for label, text in shapes.items():
+            with self.subTest(shape=label):
+                try:
+                    expected = parse_required_release_images(text)
+                except ValueError:
+                    expected = None
+                with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as handle:
+                    handle.write(text)
+                self.addCleanup(os.unlink, handle.name)
+                proc = self._run(f'required_release_images_in_text < "{handle.name}"', cwd=str(_REPO_ROOT))
+                if expected is None:
+                    self.assertNotEqual(proc.returncode, 0, f"bash accepted what the wiring test rejects: {proc.stdout!r}")
+                    self.assertEqual(proc.stdout, "")
+                else:
+                    accepted += 1
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertEqual(proc.stdout.split(), expected)
+        self.assertEqual(accepted, 4, "the shapes cover both verdicts")
+        sourced = self._run('printf "%s\\n" "${REQUIRED_RELEASE_IMAGES[@]}"', cwd=str(_REPO_ROOT))
+        self.assertEqual(sourced.stdout.split(), parse_required_release_images(real), "the parse reads the array bash sources")
+
+    def test_the_version_keyed_read_is_the_tags_list_or_says_there_is_no_tag(self):
+        """Signing and the SBOMs are handed only the version; the list is the
+        one the version's tag commit carries, and without the tag the notice
+        names the tag before the fallback names the list."""
+        temp_dir, repo_dir, git = self._repo()
+        proc = self._run(f'required_release_images_for_release "{MOCK_TARGET_RELEASE_TAG}"', cwd=repo_dir)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"No tag '{MOCK_TARGET_RELEASE_TAG}' in this repository", proc.stderr)
+        self.assertIn("no candidate commit named", proc.stderr)
+        self.assertEqual(proc.stdout.split(), MOCK_REQUIRED_RELEASE_IMAGES)
+
+        release_commit = commit_required_release_images(repo_dir, git, MOCK_CANDIDATE_RELEASE_IMAGES)
+        git("tag", MOCK_TARGET_RELEASE_TAG, release_commit)
+        proc = self._run(f'required_release_images_for_release "{MOCK_TARGET_RELEASE_TAG}"', cwd=repo_dir)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("No tag", proc.stderr)
+        self.assertIn(f"lists at {release_commit[:7]}", proc.stderr)
+        self.assertEqual(proc.stdout.split(), MOCK_CANDIDATE_RELEASE_IMAGES)
+
+    def test_promote_release_images_promotes_the_candidates_list(self):
+        temp_dir, repo_dir, git = self._repo()
+        candidate = commit_required_release_images(repo_dir, git, MOCK_CANDIDATE_RELEASE_IMAGES)
+        bin_dir = pathlib.Path(temp_dir.name) / "bin"
+        create_mock_docker_binary(bin_dir)
+
+        proc = self._run(
+            f'promote_release_images "{candidate}" "{MOCK_TARGET_RELEASE_TAG}"',
+            cwd=repo_dir,
+            bin_dir=str(bin_dir),
+            env={"CI": "true"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        for img in MOCK_CANDIDATE_RELEASE_IMAGES:
+            self.assertIn(f"Promoted {img} to {MOCK_TARGET_RELEASE_TAG}", proc.stdout)
+        for img in set(MOCK_REQUIRED_RELEASE_IMAGES) - set(MOCK_CANDIDATE_RELEASE_IMAGES):
+            self.assertNotIn(f"Promoting {img}", proc.stdout, f"{img} is not in the candidate's list")
 
 
 if __name__ == "__main__":

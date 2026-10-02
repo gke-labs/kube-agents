@@ -54,6 +54,7 @@ def _plan(*changes):
 UPDATE_ONLY = _plan((["update"], "google_container_cluster.seeded_b"))
 CREATE_AND_UPDATE = _plan((["create"], "google_compute_disk.orphan"), (["update"], "google_container_cluster.seeded_b"), (["no-op"], "google_service_account.fleet_reader"))
 REPLACE = _plan((["delete", "create"], "google_container_node_pool.seeded_a_idle"), (["update"], "google_container_cluster.seeded_b"))
+REPLACE_NO_SURGE = _plan((["delete", "create"], "google_container_node_pool.no_surge_pool"), (["update"], "google_container_cluster.seeded_b"))
 DELETE = _plan((["delete"], "google_compute_disk.orphan"))
 FORGET = _plan((["forget"], "google_compute_disk.orphan"), (["update"], "google_container_cluster.seeded_b"))
 KNOWN = {P7, P8}
@@ -89,6 +90,18 @@ class _Tofu:
 
     def verbs(self):
         return [call[1] for call in self.calls]
+
+
+def setUpModule():
+    # boskos_pool holds every lease a second before releasing it (its cache
+    # lag); the reconcile's holds last minutes, so nothing here depends on it.
+    global _real_pool_pause
+    _real_pool_pause = boskos_pool.pause
+    boskos_pool.pause = lambda seconds: None
+
+
+def tearDownModule():
+    boskos_pool.pause = _real_pool_pause
 
 
 class _Boskos:
@@ -143,7 +156,7 @@ class PlanInspectionTest(unittest.TestCase):
         tofu = _Tofu({P7: UPDATE_ONLY})
         outcome, detail = reconcile.reconcile_project(P7, runner=tofu)
         self.assertEqual(outcome, reconcile.OUTCOME_APPLIED)
-        self.assertEqual(detail, "0 to add, 1 to change, 0 refused")
+        self.assertEqual(detail, "0 to add, 1 to change, 0 to replace, 0 refused")
         self.assertEqual(tofu.verbs(), ["init", "plan", "show", "apply"])
         self.assertEqual(tofu.calls[3][-1], tofu.calls[2][-1], "apply takes the plan file show inspected")
         self.assertIn("-var=project_id=%s" % P7, tofu.calls[1])
@@ -169,7 +182,7 @@ class PlanInspectionTest(unittest.TestCase):
         # The orphan disk a cleanup deleted comes back; that is the point.
         tofu = _Tofu({P7: CREATE_AND_UPDATE})
         outcome, detail = reconcile.reconcile_project(P7, runner=tofu)
-        self.assertEqual((outcome, detail), (reconcile.OUTCOME_APPLIED, "1 to add, 1 to change, 0 refused"))
+        self.assertEqual((outcome, detail), (reconcile.OUTCOME_APPLIED, "1 to add, 1 to change, 0 to replace, 0 refused"))
 
     def test_a_replace_is_refused_and_named_before_anything_is_applied(self):
         tofu = _Tofu({P7: REPLACE})
@@ -177,6 +190,15 @@ class PlanInspectionTest(unittest.TestCase):
         self.assertEqual(outcome, reconcile.OUTCOME_REFUSED)
         self.assertIn("delete+create google_container_node_pool.seeded_a_idle", detail)
         self.assertNotIn("apply", tofu.verbs())
+
+    def test_the_no_surge_pool_replace_is_applied_and_counted(self):
+        # The one replacement the stack asks for on purpose: the pool is replaced
+        # at a minor roll because an in-place update waits out its budget.
+        tofu = _Tofu({P7: REPLACE_NO_SURGE})
+        outcome, detail = reconcile.reconcile_project(P7, runner=tofu)
+        self.assertEqual(outcome, reconcile.OUTCOME_APPLIED)
+        self.assertIn("1 to replace", detail)
+        self.assertIn("apply", tofu.verbs())
 
     def test_a_delete_is_refused(self):
         tofu = _Tofu({P7: DELETE})
@@ -352,6 +374,68 @@ class LeaseTest(unittest.TestCase):
         boskos = _Boskos(free=[P7], release_errors={P7: _http_error(500, BOSKOS)})
         with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
             outcomes = reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known=KNOWN)
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_FAILED)
+        self.assertIn("release failed", outcomes[P7][1])
+
+    def test_a_release_that_fails_before_a_termination_is_on_the_record(self):
+        # The report main writes on the way out must not say a project was
+        # applied when its release failed and it sits in the hold state.
+        def tofu(argv, **_):
+            if "kube-agents-evals-8-tf-state" in " ".join(argv):
+                raise boskos_pool.Terminated("signal 2")
+            if argv[1] == "plan":
+                return subprocess.CompletedProcess(argv, reconcile.PLAN_HAS_CHANGES, "", "")
+            if argv[1] == "show":
+                return subprocess.CompletedProcess(argv, 0, UPDATE_ONLY, "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        boskos = _Boskos(free=[P7, P8], release_errors={P7: _http_error(502, BOSKOS)})
+        outcomes = {}
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+            with self.assertRaises(boskos_pool.Terminated):
+                reconcile.reconcile_pool(BOSKOS, OWNER, len(KNOWN), runner=tofu, known=KNOWN, outcomes=outcomes)
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_FAILED)
+        self.assertIn("release failed", outcomes[P7][1])
+
+    def test_a_terminated_project_whose_release_also_fails_keeps_its_interrupted_outcome(self):
+        # The force-unlock hint must survive: the release failure joins the
+        # interrupted reason rather than replacing it.
+        def tofu(argv, **_):
+            if "kube-agents-evals-8-tf-state" in " ".join(argv):
+                raise boskos_pool.Terminated("signal 2")
+            if argv[1] == "plan":
+                return subprocess.CompletedProcess(argv, reconcile.PLAN_HAS_CHANGES, "", "")
+            if argv[1] == "show":
+                return subprocess.CompletedProcess(argv, 0, UPDATE_ONLY, "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        boskos = _Boskos(free=[P7, P8], release_errors={P8: _http_error(502, BOSKOS)})
+        outcomes = {}
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+            with self.assertRaises(boskos_pool.Terminated):
+                reconcile.reconcile_pool(BOSKOS, OWNER, len(KNOWN), runner=tofu, known=KNOWN, outcomes=outcomes)
+        self.assertEqual(outcomes[P8][0], reconcile.OUTCOME_INTERRUPTED)
+        self.assertIn("force-unlock", outcomes[P8][1])
+        self.assertIn("release failed", outcomes[P8][1])
+
+    def test_a_named_projects_release_failure_before_a_termination_is_on_the_record(self):
+        # The hourly's path (reconcile_named): a release refused, then a
+        # termination raised by the unblock, must still record the failure.
+        class _Boskos_signalling_release(_Boskos):
+            def __call__(self, request, timeout=None):
+                if "/release?" in request.full_url:
+                    os.kill(os.getpid(), signal.SIGINT)
+                return super().__call__(request, timeout)
+
+        boskos = _Boskos_signalling_release(free=[P7], release_errors={P7: _http_error(502, BOSKOS)})
+        outcomes = {}
+        previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+        try:
+            with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+                with self.assertRaises(boskos_pool.Terminated):
+                    reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known=KNOWN, outcomes=outcomes)
+        finally:
+            signal.signal(signal.SIGINT, previous)
         self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_FAILED)
         self.assertIn("release failed", outcomes[P7][1])
 
@@ -627,6 +711,34 @@ class HoldTest(unittest.TestCase):
         self.assertEqual(boskos.acquired, [P7])
         self.assertEqual(boskos.released, [P7], "acquired, then given back")
         self.assertEqual(tofu.calls, [], "never applied")
+
+    def test_a_second_termination_during_the_release_after_one_in_the_acquire_still_releases(self):
+        # The first signal lands during the acquire and is raised by the
+        # unblock; the release that follows must still run under held signals,
+        # so a second signal during it is deferred rather than skipping it.
+        seen = []
+
+        class _Boskos_two_signals(_Boskos):
+            def __call__(self, request, timeout=None):
+                if "/release?" in request.full_url:
+                    seen.append(signal.getsignal(signal.SIGINT))
+                    os.kill(os.getpid(), signal.SIGINT)
+                out = super().__call__(request, timeout)
+                if "/acquirebystate?" in request.full_url:
+                    os.kill(os.getpid(), signal.SIGINT)
+                return out
+
+        boskos = _Boskos_two_signals(free=[P7])
+        previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+        try:
+            with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
+                with self.assertRaises(boskos_pool.Terminated):
+                    reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known=KNOWN)
+        finally:
+            signal.signal(signal.SIGINT, previous)
+        self.assertEqual(boskos.released, [P7], "the release ran despite the second signal")
+        self.assertEqual(seen, [boskos_pool._defer], "the release ran under held signals")
+        self.assertEqual(boskos_pool._HOLD_DEPTH, 0)
 
     def test_a_termination_as_the_release_arms_its_deferral_still_releases(self):
         # The moment between the hold's finally starting and its handlers

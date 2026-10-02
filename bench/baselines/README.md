@@ -233,7 +233,11 @@ still owed.
 
 A case is admitted when its pooled evidence at the **current** key holds at
 least `EVAL_ADMISSION_MIN_RUNS` runs (default 20) at a rate of at least
-`EVAL_ADMISSION_RATE` (default 0.95).
+`EVAL_ADMISSION_RATE` (default 0.90 since 2026-09-29, #1493: the roster page's
+own bar of ≥ 90 % of graded repetitions, set from the store's night-to-night
+movement; 18 of 20, or 19 of a 21-run window). Under `EVAL_ADMISSION_MODE=roster`,
+the default, the rate is advisory: it decides the record's sentence beside the
+roster's answer, never which cases block.
 
 Short of that the gate says so in the case's own words, and the four states are
 distinct on purpose:
@@ -243,7 +247,7 @@ distinct on purpose:
 | Nothing at this key     | `no screening evidence for this case yet`           |
 | Evidence at an old key  | `stale: …`, never compared against                  |
 | Fewer than the min runs | `collecting: 9/9 runs recorded … 11 more needed`    |
-| At the bar, below rate  | `screened at 17/21 …, below the bar of 95% over 20` |
+| At the bar, below rate  | `screened at 17/21 …, below the bar of 90% over 20` |
 
 Only the last is a problem with the case. The middle two are the store filling
 up, which is the ordinary state of a new case and of every case after a version

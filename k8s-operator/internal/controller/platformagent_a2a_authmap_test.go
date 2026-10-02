@@ -295,7 +295,10 @@ func TestTheRenderTimeMapCheckRefusesWhatTheCalloutWouldRefuse(t *testing.T) {
 				ServiceAccount: "system:serviceaccount:kubeagents-system:agent-a2a-gateway",
 				User:           "gateway",
 				Account:        a2aAccountApp,
-				Grants:         a2aAuthMapGrants{Publish: []string{"a2a.tasks.>"}},
+				Grants: a2aAuthMapGrants{
+					Publish:   []string{"a2a.tasks.>"},
+					Subscribe: []string{"_INBOX.gateway.>"},
+				},
 			},
 			{
 				ServiceAccount: "system:serviceaccount:kubeagents-system:agent-a2a-session",
@@ -325,6 +328,18 @@ func TestTheRenderTimeMapCheckRefusesWhatTheCalloutWouldRefuse(t *testing.T) {
 		},
 		"an entry with neither grants nor narrowing": func(ids []a2aAuthMapIdentity) []a2aAuthMapIdentity {
 			ids[0].Grants = a2aAuthMapGrants{}
+			return ids
+		},
+		// The half-empty shapes, which are the ones that look like a
+		// working entry. An empty allow list is minted as unrestricted on
+		// that side, so dropping either half of a render widens the
+		// principal rather than narrowing it.
+		"an entry whose publish grants were dropped": func(ids []a2aAuthMapIdentity) []a2aAuthMapIdentity {
+			ids[0].Grants.Publish = nil
+			return ids
+		},
+		"an entry whose subscribe grants were dropped": func(ids []a2aAuthMapIdentity) []a2aAuthMapIdentity {
+			ids[0].Grants.Subscribe = nil
 			return ids
 		},
 		"an entry in the system account": func(ids []a2aAuthMapIdentity) []a2aAuthMapIdentity {

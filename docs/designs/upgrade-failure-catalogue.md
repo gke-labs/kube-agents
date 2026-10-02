@@ -15,7 +15,9 @@ checks are chosen from, and its
 cited below. Each entry except 15 was also planted on a throwaway GKE cluster and the cluster
 upgraded; entry 15's symptom was produced on a cluster already on the new behaviour. What happened,
 entry by entry, and the scripts that did it are in
-[`bench/upgrade-scenarios/README.md`](../../bench/upgrade-scenarios/README.md).
+[`bench/upgrade-scenarios/README.md`](../../bench/upgrade-scenarios/README.md), and
+[`upgrade-failure-reproductions.md`](upgrade-failure-reproductions.md) lines each entry up with its script,
+its verdict and what the seeded fleet holds for it.
 
 ## For a reader who does not run Kubernetes
 

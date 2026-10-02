@@ -1234,17 +1234,20 @@ narrowed by anything.
 as well, named in 59 files across `agents/`, and the alternative was a sandbox path that
 no existing SOP, skill or model-written script would resolve. The cost is one path naming
 two different directories on two different volumes, and one rule that follows from it:
-**no handoff may assume write-here-read-there.** Nothing is copied between them and
-nothing can read across, so a script that writes `/opt/data/x` in the agent pod and reads
+**no handoff may assume write-here-read-there.** Only what the sentences below name crosses between
+them, so a script that writes `/opt/data/x` in the agent pod and reads
 `/opt/data/x` through the shell gets a missing file — and, unlike before, gets it without
-the path itself looking wrong. One thing crosses, and only one: a file a finished card
-names in `artifacts` is copied sandbox-to-gateway for the length of its delivery and
-deleted after, which is
+the path itself looking wrong. What crosses sandbox-to-gateway is read by name. A file a finished card names in `artifacts` is copied for the length of its
+delivery and deleted after, which is
 [declared writeback](#three-problems-deferred-and-what-has-already-been-ruled-out-for-them)
-built for that one caller. Nothing crosses the other way, and nothing crosses because a path
+built for that one caller. The onboarding report is read by `bootstrap_delivery.py` once
+its markers say a delivery is due, as the bootstrap onboarding section below describes.
+What crosses the other way is `sandbox_mirror.py`'s work, described above: it copies the
+working directories once on first start, and on every start and each new profile it creates
+the profile's working directories and copies each Cluster Agent's identity file. Nothing
+crosses because a path
 happened to match. The entrypoint writes a `.sandbox` marker into the
-sandbox's copy, which is how a script or a person tells which side they are on. The
-bootstrap inventory handoff is the known case; it has its own issue.
+sandbox's copy, which is how a script or a person tells which side they are on.
 
 The kubeconfig the platform MCP server writes stays out of `/opt/data` for the reason
 under [The SSH principal cannot be the shell user](#the-ssh-principal-cannot-be-the-shell-user):
@@ -1716,9 +1719,12 @@ agent-side servers and their tests — `platform_mcp_server.py`, `session_kv_ser
 wholesale would put a file named `credential_proxy.py` inside the sandbox, which is the
 wrong thing for a reviewer to find even though it is inert there. So the image gets an
 explicit allowlist: `sandbox_exec.py`, `forge.py`, `pr_triggers.py`,
-`github_token_refresh.py`, `gitops_workspace.py`, `gke_endpoint.py`, `cluster_preflight.sh`
-and `stall_report.py` — the entry points an agent is told to run, plus the transitive
-closure of what they import.
+`github_token_refresh.py`, `gitops_workspace.py`, `gke_endpoint.py`, `cluster_preflight.sh`,
+`stall_report.py` and `inventory_findings.py` — the entry points an agent is told to run,
+plus the transitive closure of what they import. Only `inventory_findings.py extract` works
+there: `register` and `ranked` call the Session KV server on the agent pod's loopback and
+exit 13 from the sandbox, and the prioritization SOP answers that exit by ranking from its own
+scores and writing the report without the findings queue.
 
 **The test for whether a script qualifies is what it needs, not how it is called.** An
 earlier version of this proposed "shell call sites, and absent from every `jobs.json`",
@@ -1730,8 +1736,9 @@ qualifying question is the one the cron section below already asks — does it n
 agent-pod-only resources: the `hermes` binary, the profiles tree, the session or kanban
 databases, Hermes' own Python namespace.
 
-Two scripts fail an agent that runs them from the shell: `cluster_agent_profile.py` and
-`cluster_agent_reconcile.py`. Each gets a stub at its path in the sandbox that prints why it cannot run there and exits non-zero. Leaving the
+Three scripts fail an agent that runs them from the shell: `cluster_agent_profile.py`,
+`cluster_agent_reconcile.py`, and `eod_report_generator.py`, which reads the session
+database and is named by its SOP for a hand run. Each gets a stub at its path in the sandbox that prints why it cannot run there and exits non-zero. Leaving the
 path empty was the other option and reads worse — the model gets `No such file or
 directory`, concludes the image is broken, and spends a turn proving it. The fuller
 answer for the profile scripts is an MCP tool, since the MCP server runs in the agent
@@ -1742,10 +1749,11 @@ deleting a profile still has no tool.
 None of this is held together by review.
 [`test_sandbox_delivery.py`](../../agents/platform/scripts/test_sandbox_delivery.py)
 reads the allowlist out of the Dockerfile and checks it against the agents' own
-instructions: every shared script named by a runtime path is baked or stubbed, the
-allowlist is closed under import, and nothing on it names an interpreter the sandbox
-does not have. Adding a skill that calls a new shared script fails that test rather
-than failing in a pod.
+instructions, which include the governance SOPs a card's worker follows and the Planning
+Agent's tree (`agents/chat/`) that writes those cards: every shared script named by a runtime path is
+baked or stubbed, the allowlist is closed under import, and nothing on it names an
+interpreter the sandbox does not have. Adding a skill that calls a new shared script
+fails that test rather than failing in a pod.
 
 **`SETTINGS.md` is mounted, at `/opt/data/SETTINGS.md`.** Its content is per-install:
 the operator renders it from `spec.integration.github.gitRepo` into an
@@ -1814,14 +1822,14 @@ into that directory and then register a cron job pointing at it. With file tools
 to the sandbox it cannot, which raises the stakes on the `sync_back` channel above:
 whatever that syncs back must not be able to land in a scripts directory.
 
-What it does break is bootstrap onboarding, and quietly. The inventory pipeline
+What it broke was bootstrap onboarding, and quietly. The inventory pipeline
 straddles the boundary in the wrong direction: `INVENTORY.raw.md` is written by the
 `platform` kanban worker and `INVENTORY.md` by the prioritization worker — both agent
-turns, so both writes now go to the sandbox, where `/opt/data` neither exists nor is
-writable. The readers did not move. `bootstrap_delivery.py` and `bootstrap_scan_gate.py`
-are `no_agent` scripts hardcoding `/opt/data/INVENTORY*.md` on the PVC, so the delivery
-job ticks every minute against a file that will never appear. A silent run is its normal
-no-op, so onboarding simply never delivers and nothing logs an error.
+turns, so both writes go to the sandbox's `/opt/data`. The readers did not move.
+`bootstrap_delivery.py` and `bootstrap_scan_gate.py` were `no_agent` scripts that read
+`/opt/data/INVENTORY*.md` on the PVC, so the delivery job ticked every minute against a
+file that never appeared there. A silent run is its normal no-op, so onboarding never
+delivered and nothing logged an error.
 
 **Moving the scripts into the sandbox was the obvious fix and does not work.** The
 mechanism is sound — `subprocess.run(capture_output=True)` returns stdout verbatim and
@@ -1860,6 +1868,27 @@ sandbox — so the split is one function, `run_resolver_poll`, becoming an `ssh`
 That split is now the smaller half of what has already happened. `resolver.py` reaches
 `gh` through `sandbox_exec.run`, so every `gh` call the poll makes executes in the
 sandbox today; what is left to move is the script around them.
+
+`bootstrap_delivery.py` takes the same shape. Its gating markers, `.user_aligned` and
+`.bootstrap_completed`, are written agent-side and stay on the PVC, so it checks them
+first; only once they say a delivery is due does it read `INVENTORY.md` out of the
+sandbox with `sandbox_exec.read_bytes`, claim the delivery on the PVC, print the report,
+and rename it to `INVENTORY.delivered.md` in the sandbox. The rename connects as `agent`,
+for the reason `kanban_workspace_gc.py` does below: the sandbox's `/opt/data` is
+`agent:agent 755`. An unreachable sandbox is a silent run retried on the next tick,
+because a failing `no_agent` script posts an alert to the user's chat on every tick it
+fails. A read that reaches the sandbox and does not return the report fails the run with
+the reason, as an unreadable report does on the agent pod, instead of waiting on it
+silently. The next tick reads again, so a passing read failure clears and a lasting one alerts on
+each tick until it is fixed. `bootstrap_scan_gate.py`'s decision needs no change: `.bootstrap_scan_filed` is on
+the PVC from the moment the card is filed, so the report files it also checks add
+nothing. Its sweep card still calls `/opt/data/INVENTORY.md` the Chat Agent's home,
+which is wrong about the pod and right about the path the worker must write.
+
+The one agent-pod reader whose behaviour the move changes is the onboarding plugin. It
+picks its first greeting by checking `INVENTORY.md` on the PVC, so with the sandbox on it always greets
+as though the scan were still running. The report still arrives on the next delivery
+tick.
 
 #### Nothing collects the sandbox's finished workspaces, so a cron job does
 
@@ -1903,8 +1932,8 @@ sandbox has `/opt/data/tmp/t_384aaaba` and `/opt/data/gitops/t_dc3f1647`, and a
 used only to narrow that set, never to add to it, so the account the model owns can at
 worst hide a directory from the sweep.
 
-It connects as `agent` rather than `hermes`, which is the one place in the repository
-that does, and the reason is permissions: the workspaces are `agent:agent 755` to the
+It connects as `agent` rather than `hermes`, as `cluster_agent_profile.py` and
+`bootstrap_delivery.py` also do, and the reason is permissions: the workspaces are `agent:agent 755` to the
 leaves, so uid 1001 cannot unlink inside them. The alternative was a shared group, a
 setgid workspaces root and a `umask 002` for every session, which grants the trusted
 account standing write access to the model's tree in order to delete from it — a wider
@@ -2220,11 +2249,13 @@ are questions about this pod that a file in the other one cannot answer.
 
 Reading that as the general answer would be a mistake. It crosses what one
 notifier was already going to deliver, at one moment in a card's life, into a
-directory nothing else reads. Every other agent-side reader still looks on the
-gateway's volume and still finds nothing, and generalising this — a tool the model
-can call to bring a file across on demand, with a landing directory that persists
-past a single delivery — is a decision about the boundary that still wants its own
-design.
+directory nothing else reads. The one other agent-side reader that crosses is
+`bootstrap_delivery.py`, which reads the single file it posts, `INVENTORY.md`, by
+name once its markers say a delivery is due, and lands nothing on disk. Every other
+agent-side reader still looks on the gateway's volume and still finds nothing, and
+generalising either — a tool the model can call to bring a file across on demand,
+with a landing directory that persists past a single delivery — is a decision about
+the boundary that still wants its own design.
 
 ### Three of the proxy's five roles move
 
@@ -2865,20 +2896,13 @@ get-credentials` and `kubectl` behind it on every tick, and `github_token_refres
   `_thread_kubeconfig_path` still describes the older check and is what is left to update.
 - **The cluster-agent kubeconfig has nowhere to go yet, and onboarding now fails
   earlier than that.** `cluster_agent_profile.py` writes a profile home on the agent
-  pod's PVC and shells out to `hermes`, so it is one of the two scripts the sandbox
+  pod's PVC and shells out to `hermes`, so it is one of the three scripts the sandbox
   stubs rather than bakes. The four skills that tell the model to run it by its runtime
   path therefore stop at the stub's message instead of reaching the kubeconfig problem
   at all. Both want the same fix — per-profile directories on the sandbox side, and an
   MCP tool that lets the model ask the agent pod to create a profile rather than
   running a script that has to live there. Inventing that layout inside a call site was
   the alternative, and it is how two layouts end up shipping.
-- **The bootstrap handoff is designed and unimplemented.** `no_agent` scripts stay in the
-  agent pod, and six of them (`kanban-workspace-gc`, `cluster-agent-reconcile`,
-  `stall-watch`, `github-repo-watcher` and `chat-delivery-watch` through `forge.py`, and
-  `github_token_refresh.py`'s forward) reach the sandbox through `sandbox_exec` from a
-  shipped roster, so cron against a sandboxed agent is exercised.
-  What is not is the bootstrap handoff the section above specifies. Onboarding is broken
-  until it lands, and broken silently.
 - **Delegated subagents.** Whether a subagent spawned mid-turn inherits the SSH
   backend, or falls back to a local shell in the agent pod, is unexercised. A fallback
   would be a hole rather than a degradation.

@@ -931,55 +931,95 @@ def periodic_news(health: dict, prev: dict | None) -> dict[str, dict]:
 
 
 def periodic_clears(health: dict, prev: dict | None) -> list[str]:
-    """The jobs the space was told about that a reading now shows clean."""
+    """The jobs the space was told about whose latest read build passed. Read
+    and not noted is not enough: a failed build under the job's threshold
+    writes no note either, and is not a recovery."""
     told = (prev or {}).get("periodics_told") or {}
     current = health.get("periodics") or {}
     read = set(health.get("periodics_read") or [])
-    return sorted(job for job in told if job in read and job not in current)
+    runs = health.get("periodics_runs") or {}
+    return sorted(job for job in told if job in read and job not in current and (runs.get(job) or {}).get("passed"))
+
+
+def _job_words(job: str, note: dict | None = None) -> dict:
+    """The message words for a job: from its note when there is one, else from
+    the watched table, else the bare job name (a job the table no longer lists)."""
+    periodic = periodics.WATCHED_BY_JOB.get(job)
+    words = {
+        "label": periodic.label if periodic else job,
+        "place": periodic.place if periodic else job,
+        "absence": periodic.absence if periodic else "its runs are failing",
+        "presence": periodic.presence if periodic else "its runs pass again",
+        "does": periodic.does if periodic else "",
+        "effect": periodic.effect if periodic else "",
+        "runbook": periodic.runbook if periodic else "",
+    }
+    for key in words:
+        if note and note.get(key):
+            words[key] = note[key]
+    return words
+
+
+def _periodic_footer(words: dict, history_url: str) -> str:
+    runbook = f"Runbook: {words['runbook']} · " if words.get("runbook") else ""
+    return f"{runbook}Build: {history_url}"
 
 
 def render_periodic(health: dict, prev: dict | None) -> str:
-    """One block per job with news: what failed, the projects it names, where
-    the recovery is written, and the job's history."""
+    """One block per job with news, four lines each: where and what stopped
+    happening; which job, what it does, which run and how it failed; what that
+    costs and the scope; the runbook and the build."""
     blocks = []
     for job, note in sorted(periodic_news(health, prev).items()):
         when = clock(parse_iso(note.get("finished_at")))
+        words = _job_words(job, note)
+        does = f"`{job}` {words['does']}." if words.get("does") else f"`{job}`."
+        effect = f"Effect: {words['effect']} {periodics.SCOPE_LINE}" if words.get("effect") else periodics.SCOPE_LINE
+        footer = _periodic_footer(words, note["history_url"])
         if note.get("verdict") == periodics.VERDICT_STALE:
             if note.get("finished_at"):
-                blocks.append(
-                    f"⚪ *{note['label']} stopped* — last finished run {when}; `{job}` has finished nothing in {note['stale_after_h']}h."
-                    f" If the next one doesn't land, it needs checking.\n{note['history_url']}"
-                )
+                middle = f"Its last finished run was {when} (build {note['build']}); nothing has finished in {note['stale_after_h']}h. If the next one doesn't land, it needs checking."
             else:
-                blocks.append(
-                    f"⚪ *{note['label']}: last run's finish time unreadable* — build {note['build']} finished, but its finished.json gives no time for it,"
-                    f" so the {note['stale_after_h']}h window cannot be measured. Someone check the job.\n{note['history_url']}"
-                )
+                middle = f"Build {note['build']} finished, but its finished.json gives no time for it, so the {note['stale_after_h']}h window cannot be measured. Someone check the job."
+            blocks.append("\n".join([f"⚪ *{words['place']}: {words['label']} has stopped running.*", f"{does} {middle}", effect, footer]))
             continue
         dry = " (a dry run: nothing was applied)" if note.get("dry_run") else ""
-        lines = [f"🟠 *{note['label']} failed* — build {note['build']} at {when}{dry}."]
+        how = f": {note['summary']}" if note.get("summary") else ""
+        lines = [f"🟠 *{words['place']}: {words['absence']}.*", f"{does} Its {when} run (build {note['build']}){dry} failed{how}."]
         lines.extend(f"- {line}" for line in note.get("detail") or [])
-        lines.append(f"Recovery: {note['doc']}.")
-        lines.append(note["history_url"])
+        lines.append(effect)
+        lines.append(footer)
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
 
 
 def render_periodic_clear(health: dict, prev: dict | None) -> str:
-    return "\n".join(
-        f"✅ *{periodics.WATCHED_BY_JOB[job].label if job in periodics.WATCHED_BY_JOB else job} passed again* — its latest run finished clean."
-        for job in periodic_clears(health, prev)
-    )
+    """One line per job that passed again: where, what resumed, and what the
+    run did when its report says."""
+    lines = []
+    runs = health.get("periodics_runs") or {}
+    for job in periodic_clears(health, prev):
+        words = _job_words(job)
+        run = runs.get(job) or {}
+        when = clock(parse_iso(run.get("finished_at"))) if run.get("finished_at") else None
+        did = run.get("summary")
+        # A clear needs a passed build on record, and a passed build has a
+        # finish time (none is STALE and noted), so `when` is always there.
+        # The job by name: the two reconciles share a place and a presence.
+        tail = f" `{job}`'s {when} run (build {run.get('build')}): {did}." if did else f" `{job}`'s {when} run (build {run.get('build')}) finished clean."
+        lines.append(f"✅ *{words['place']}: {words['presence']}.*{tail}")
+    return "\n".join(lines)
 
 
 def periodic_digest_lines(health: dict) -> list[str]:
     lines = []
-    for _, note in sorted((health.get("periodics") or {}).items()):
+    for job, note in sorted((health.get("periodics") or {}).items()):
+        words = _job_words(job, note)
         if note.get("verdict") == periodics.VERDICT_STALE:
-            last = f"no finished run since {clock(parse_iso(note.get('finished_at')))}" if note.get("finished_at") else f"build {note['build']} finished at a time its finished.json does not give"
-            lines.append(f"⚪ {note['label']}: {last}.")
+            last = f"last finished run {clock(parse_iso(note.get('finished_at')))}" if note.get("finished_at") else f"build {note['build']} finished at a time its finished.json does not give"
+            lines.append(f"⚪ {words['place']}: {words['label']} has stopped running; {last}.")
         else:
-            lines.append(f"🟠 {note['label']}: build {note['build']} failed {clock(parse_iso(note.get('finished_at')))}; {note['history_url']}")
+            lines.append(f"🟠 {words['place']}: {words['absence']} (build {note['build']} failed {clock(parse_iso(note.get('finished_at')))}); {note['history_url']}")
     return lines
 
 
@@ -1061,6 +1101,12 @@ def fixture_digest_line(health: dict) -> str | None:
             f" ({', '.join(roles)}); a red on a case that depends on {plural(len(roles), 'it', 'them')} there is the fixture, not the code."
         )
     unchecked = f", {total - checked} not checked" if total > checked else ""
+    unread = int(block.get("unread_units") or 0)
+    if unread:
+        # A project counts as checked when one role was read; a role the scan
+        # could not read (never planted, or its probe failed) is not a fixture
+        # in its designed state.
+        return f"🧭 *Seeded fleet:* {checked} of {total} pool projects checked at {when}, no drift in what was read; {unread} {plural(unread, 'role')} not read{unchecked}."
     return f"🧭 *Seeded fleet:* {checked} of {total} pool projects checked at {when}, every fixture in its designed state{unchecked}."
 
 

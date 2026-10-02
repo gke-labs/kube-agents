@@ -762,14 +762,14 @@ class SeededFleetFixturesTest(unittest.TestCase):
         self.assertIn("not checked", result.message)
 
     def test_unresolved_with_no_warning_at_all_still_fails(self):
-        # The hole the excuse opened, and the reason it now wants positive
+        # The hole the excuse opened, and the reason it wants positive
         # evidence rather than the absence of a contrary warning. A seeded
         # cluster that keeps its name and loses its labels never enters the
-        # listing: no per-cluster warning names it (:215 fires only for a
-        # LABELLED cluster), `labelled` stays non-zero so :406 is silent, the
-        # other slots resolve so :411 is silent, and its roles increment
-        # `unresolved` with nothing printed. check_gke_and_state matches by
-        # name and passes it, so this check is the only one that can fail it.
+        # listing, so no per-cluster warning names it. The script now names
+        # the empty slot (the missing-slot test above); this pins that a
+        # count with no warning at all still fails. check_gke_and_state
+        # matches by name and passes it, so this check is the only one that
+        # can fail it.
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok("v1.30.0"),
@@ -777,6 +777,33 @@ class SeededFleetFixturesTest(unittest.TestCase):
             ]
             result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
         self.assertFalse(result.passed, result.message)
+
+    def test_one_unreachable_cluster_does_not_excuse_a_missing_slot(self):
+        # A project applied before the catalog declared slot d, on a run where
+        # seeded-c's credentials were refused. The unreachable-cluster note is
+        # real, but it is about seeded-c; slot d's three roles are unresolved
+        # because no cluster exists for them, which the script now says. Read
+        # together, the verdict must be the one the same project gets with
+        # seeded-c reachable, not "not checked".
+        catalog = json.loads(checker._FLEET_CATALOG.read_text(encoding="utf-8"))["roles"]
+        on = lambda slot: sum(1 for r in catalog.values() if r["cluster_slot"] == slot)
+        missing = on("c") + on("d")
+        stderr = "\n".join([
+            "WARNING: no credentials for seeded cluster seeded-c in kube-agents-evals-5: "
+            "ERROR: (gcloud.container.clusters.get-credentials) deadline exceeded",
+            "WARNING: project kube-agents-evals-5 has no labelled seeded cluster for slot 'd' "
+            "(a name ending in '-d'), so every check naming a role on it will report status=error.",
+            self._summary(self._roles() - missing, unresolved=missing),
+        ])
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok("v1.30.0"),
+                (0, "", stderr),
+                (0, "", self._state(self._roles() - missing)),
+            ]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertFalse(result.passed, result.message)
+        self.assertEqual("Seeded fleet incomplete", result.message)
 
     def test_a_skipped_cluster_is_a_visibility_limit_too(self):
         # hack/fleet-kubeconfigs.sh:386. Not a refusal, but the slot ends up
@@ -998,7 +1025,7 @@ class SeededFleetFixturesTest(unittest.TestCase):
         text = checker._FLEET_KUBECONFIGS.read_text(encoding="utf-8")
         wrong = checker._FLEET_LOOKED_AND_FOUND_WRONG.pattern.split("|")
         unreachable = checker._FLEET_UNREACHABLE.pattern.split("|")
-        self.assertEqual(4, len(wrong))
+        self.assertEqual(5, len(wrong))
         self.assertEqual(3, len(unreachable))
         for phrase in [*wrong, *unreachable, checker._FLEET_COULD_NOT_LOOK.pattern]:
             with self.subTest(phrase=phrase):
@@ -1040,7 +1067,7 @@ class ArtifactRegistryTest(unittest.TestCase):
 
     # `gcloud container clusters list --format=value(...)` is tab-separated, and
     # "default" is what the API reports for a pool that was never given an
-    # account. The seeded trio is in the listing on a real project and must not
+    # account. The seeded fleet is in the listing on a real project and must not
     # influence the result.
     _NODES = "platform-agent-host\tdefault"
     _NODES_WITH_FLEET = (
@@ -1383,7 +1410,7 @@ class ArtifactRegistryTest(unittest.TestCase):
         self.assertTrue(result.passed, result.details)
 
     def test_seeded_fleet_node_accounts_are_not_asserted(self):
-        # The trio runs its own account and pulls no kube-agents image. Holding
+        # The fleet runs its own account and pulls no kube-agents image. Holding
         # it to the host cluster's requirement would fail every real project.
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
@@ -1449,6 +1476,470 @@ class ArtifactRegistryTest(unittest.TestCase):
         self.assertIn("roles/artifactregistry.reader", checker.AR_PULLER_ROLES)
         self.assertNotIn("roles/artifactregistry.reader", checker.AR_WRITER_ROLES)
         self.assertTrue(checker.AR_WRITER_ROLES < checker.AR_PULLER_ROLES)
+
+
+class GitopsDeclarationNoteTest(unittest.TestCase):
+    _NOTE_PATH = "knowledge/notification-relay-no-pdb.md"
+
+    @staticmethod
+    def _contents(body: str, sha: str = "abc") -> str:
+        return json.dumps({"sha": sha, "path": "knowledge/notification-relay-no-pdb.md", "content": base64.b64encode(body.encode()).decode()})
+
+    _INTENT_ABSENT = _fail("gh: Not Found (HTTP 404)")
+
+    def test_a_repository_with_the_note_passes(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(self._contents(checker.GITOPS_INTENT_NOTE_CONTENT + "\n")), self._INTENT_ABSENT]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertTrue(result.passed, result.message)
+        self.assertEqual([], result.warnings)
+        self.assertIn(f"repos/gke-agentic/kube-agents-evals-3-infra/contents/{self._NOTE_PATH}", " ".join(run.call_args_list[0].args[0]))
+        # The second read is the intent file, whose 404 means the whole tree is searched.
+        self.assertIn("/contents/.kube-agents/intent.yaml", " ".join(run.call_args_list[1].args[0]))
+
+    _PREFIX_PRESENT = _ok('[{"name": "main.tf", "type": "file"}]')
+
+    def test_an_intent_file_that_leaves_the_note_outside_its_paths_fails(self):
+        # The audit reads notes only under the intent file's paths; a note the
+        # verifier can fetch by path is one the audit never reads then. Its
+        # membership rule is the audit's `_under_prefixes`, so a prefix that
+        # IS the note's path admits it. The failing shape reads its one
+        # prefix back (present); the passing shapes never need to.
+        good = checker.GITOPS_INTENT_NOTE_CONTENT + "\n"
+        shapes = (
+            ("paths: [provisioning/]\n", False),
+            ("paths: [knowledge/]\n", True),
+            ("paths: [knowledge]\n", True),
+            ("paths: [knowledge/notification-relay-no-pdb.md]\n", True),
+            ("not: yaml: [\n", True),
+        )
+        for paths, expected_pass in shapes:
+            with self.subTest(paths), mock.patch.object(checker, "run_cmd") as run:
+                run.side_effect = [_ok(self._contents(good)), _ok(paths), self._PREFIX_PRESENT]
+                result = checker.check_gitops_declaration("kube-agents-evals-3")
+                self.assertEqual(expected_pass, result.passed, (paths, result.message))
+                if not expected_pass:
+                    self.assertIn("bounds the audit's search to provisioning", result.message)
+                    self.assertNotIn("-f sha=", result.message)
+                    self.assertEqual(3, run.call_count)
+                else:
+                    self.assertEqual(2, run.call_count)
+
+    def test_a_bound_whose_prefix_names_nothing_is_discarded_as_the_audit_discards_it(self):
+        # The audit applies a bound only when every prefix names something at
+        # the commit; a stale one sends it to the whole tree, note included.
+        # A symlink at the last component counts as nothing, as the walk never
+        # enters one. An unreadable prefix leaves the verdict unknown.
+        good = checker.GITOPS_INTENT_NOTE_CONTENT + "\n"
+        two = "paths: [provisioning/, ops/]\n"
+        cases = {
+            "absent": ([_fail("gh: Not Found (HTTP 404)")], True, "discards the bound"),
+            "symlink": ([_ok('{"type": "symlink", "target": "../elsewhere"}')], True, "discards the bound"),
+            "second absent": ([self._PREFIX_PRESENT, _fail("gh: Not Found (HTTP 404)")], True, "names `ops`"),
+            "both present": ([self._PREFIX_PRESENT, self._PREFIX_PRESENT], False, "every one of which exists"),
+            "unread": ([_fail("gh: HTTP 502")], True, "Not checked"),
+            "timeout naming a -404- project": ([_fail("timed out after 30s: gh api repos/gke-agentic/kube-agents-evals-404-infra/contents/provisioning/")], True, "Not checked"),
+        }
+        for label, (probes, expected_pass, phrase) in cases.items():
+            with self.subTest(label), mock.patch.object(checker, "run_cmd") as run:
+                run.side_effect = [_ok(self._contents(good)), _ok(two)] + probes
+                result = checker.check_gitops_declaration("kube-agents-evals-404" if "404" in label else "kube-agents-evals-3")
+                self.assertEqual(expected_pass, result.passed, (label, result.message))
+                self.assertIn(phrase, result.message)
+                if phrase == "Not checked":
+                    self.assertFalse(result.read)
+                    self.assertIn("`provisioning`", result.warnings[0])
+
+    def test_every_read_on_the_path_classifies_a_failure_the_same_way(self):
+        # One reader: a 409 (an empty repository) or a 422 is a failure on the
+        # note, on the raw re-read, on the intent file and on a prefix alike,
+        # never an unread; a 404 on the raw re-read is the note gone.
+        good = checker.GITOPS_INTENT_NOTE_CONTENT + "\n"
+        large = json.dumps({"sha": "abc", "path": self._NOTE_PATH, "encoding": "none", "content": "", "size": 2_000_000})
+        conflict = _fail("gh: Git Repository is empty. (HTTP 409)")
+        cases = {
+            "intent file": ([_ok(self._contents(good)), conflict], ".kube-agents/intent.yaml"),
+            "prefix": ([_ok(self._contents(good)), _ok("paths: [provisioning/]\n"), conflict], "`provisioning`"),
+            "raw re-read": ([_ok(large), conflict], "read raw"),
+        }
+        for label, (reads, what) in cases.items():
+            with self.subTest(label), mock.patch.object(checker, "run_cmd") as run:
+                run.side_effect = reads
+                result = checker.check_gitops_declaration("kube-agents-evals-3")
+                self.assertFalse(result.passed, (label, result.message))
+                self.assertEqual([], result.warnings)
+                self.assertIn("Could not read", result.message)
+                self.assertIn(what, result.message)
+                self.assertIn("HTTP 409", result.message)
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(large), _fail("gh: Not Found (HTTP 404)")]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertFalse(result.passed)
+        self.assertIn("has no knowledge/notification-relay-no-pdb.md", result.message)
+
+    def test_a_prefix_is_percent_encoded_so_the_probe_reads_the_audits_path(self):
+        # The audit's reader admits `#` in a prefix; unencoded, gh's URL parser
+        # drops it as a fragment and the probe reads `docs`, not `docs#archive`.
+        good = checker.GITOPS_INTENT_NOTE_CONTENT + "\n"
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(self._contents(good)), _ok("paths: [docs#archive]\n"), _fail("gh: Not Found (HTTP 404)")]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertTrue(result.passed, result.message)
+        probe = " ".join(run.call_args_list[2].args[0])
+        self.assertIn("contents/docs%23archive", probe)
+        self.assertNotIn("docs#archive", probe)
+
+    def test_an_intent_file_that_is_not_utf8_is_no_bound_as_the_audit_reads_it(self):
+        # run_cmd decodes strictly; a Latin-1 byte in the intent file raised out
+        # of the verifier. The audit's reader catches it and searches the whole
+        # tree, so the verdict is a pass that says so.
+        undecodable = UnicodeDecodeError("utf-8", b"\xe9", 0, 1, "invalid start byte")
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(self._contents(checker.GITOPS_INTENT_NOTE_CONTENT + "\n")), undecodable]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertTrue(result.passed, result.message)
+        self.assertIn("not UTF-8", result.message)
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [undecodable]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertFalse(result.passed)
+        self.assertIn("Could not read", result.message)
+        large = json.dumps({"sha": "abc", "path": self._NOTE_PATH, "encoding": "none", "content": "", "size": 2_000_000})
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(large), undecodable]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertFalse(result.passed)
+        self.assertIn("read raw", result.message)
+        self.assertIn("not UTF-8", result.message)
+
+    def test_an_unwritable_temp_directory_is_unverified_not_the_intent_files_fault(self):
+        # The intent file is handed to the audit's reader through a temp tree;
+        # a scratch area this machine cannot write is a machine fault.
+        with mock.patch.object(checker, "run_cmd") as run, mock.patch.object(
+            checker.tempfile, "TemporaryDirectory", side_effect=FileNotFoundError("No usable temporary directory found")
+        ):
+            run.side_effect = [_ok(self._contents(checker.GITOPS_INTENT_NOTE_CONTENT + "\n")), _ok("paths: [knowledge/]\n")]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertTrue(result.passed)
+        self.assertEqual("Not checked", result.message)
+        self.assertIn("temporary directory", result.warnings[0])
+
+    def test_no_workspace_paths_leaves_the_check_unverified_like_no_pyyaml(self):
+        # read_intent_paths imports workspace_paths lazily; a checkout without
+        # it is a machine fault the loader proves, not a repository's fault.
+        with mock.patch.object(checker, "run_cmd") as run, mock.patch.dict(sys.modules, {"workspace_paths": None}):
+            run.side_effect = [_ok(self._contents(checker.GITOPS_INTENT_NOTE_CONTENT + "\n"))]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertTrue(result.passed)
+        self.assertEqual("Not checked", result.message)
+        self.assertIn("workspace_paths", result.warnings[0])
+
+    def test_an_intent_read_that_times_out_on_a_404_project_is_unverified_not_absent(self):
+        # The same `\b404\b`-in-the-command-line trap as the note read, on
+        # the bound's read: a timeout must not read as "no intent file".
+        err = "timed out after 30s: gh api -H Accept: application/vnd.github.raw+json repos/gke-agentic/kube-agents-evals-404-infra/contents/.kube-agents/intent.yaml"
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(self._contents(checker.GITOPS_INTENT_NOTE_CONTENT + "\n")), _fail(err)]
+            result = checker.check_gitops_declaration("kube-agents-evals-404")
+        self.assertTrue(result.passed)
+        self.assertEqual("Not checked", result.message)
+        self.assertFalse(result.read)
+        self.assertIn("intent.yaml", result.warnings[0])
+
+    def test_an_intent_file_the_reader_raises_on_fails_without_a_traceback(self):
+        # PyYAML's safe constructors raise KeyError on `!!bool maybe`, outside
+        # the set read_intent_paths catches; the audit stops on the same file.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(self._contents(checker.GITOPS_INTENT_NOTE_CONTENT + "\n")), _ok("paths: !!bool maybe\n")]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertFalse(result.passed)
+        self.assertIn("KeyError", result.message)
+        self.assertIn("intent.yaml", result.message)
+        self.assertNotIn("-f sha=", result.message)
+
+    def test_an_unreadable_intent_file_is_unverified(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(self._contents(checker.GITOPS_INTENT_NOTE_CONTENT + "\n")), _fail("gh: HTTP 502")]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertTrue(result.passed)
+        self.assertEqual("Not checked", result.message)
+        self.assertIn("intent.yaml", result.warnings[0])
+
+    def test_a_note_over_the_inline_limit_is_read_raw(self):
+        # The contents API returns encoding "none" and no content for a file
+        # over 1 MiB; the check reads the body raw rather than parse "" and
+        # print a replace command over a note the audit would have joined.
+        good = checker.GITOPS_INTENT_NOTE_CONTENT + "\n"
+        large = json.dumps({"sha": "abc", "path": self._NOTE_PATH, "encoding": "none", "content": "", "size": 2_000_000})
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(large), _ok(good), self._INTENT_ABSENT]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertTrue(result.passed, result.message)
+        self.assertIn("application/vnd.github.raw", " ".join(run.call_args_list[1].args[0]))
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(large), _fail("gh: HTTP 502")]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertTrue(result.passed)
+        self.assertEqual("Not checked", result.message)
+
+    def test_a_missing_note_fails_naming_both_readings_and_the_seed_command(self):
+        # A project registered before the note existed: provisioning is not
+        # re-run on it, so the verifier is what says the file is owed. gh
+        # answers 404 for a private repository the token cannot see too, so
+        # the message says so rather than prescribing a PUT that would 404 alike.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_fail("gh: Not Found (HTTP 404)")]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertFalse(result.passed)
+        self.assertIn("or this token cannot read the repository", result.message)
+        self.assertIn("obtainability-declared-intent-no-finding", result.message)
+        self.assertIn(f"gh api -X PUT repos/gke-agentic/kube-agents-evals-3-infra/contents/{self._NOTE_PATH}", result.message)
+        # The printed repair carries the note inline: an operator's shell has no
+        # GITOPS_INTENT_NOTE_CONTENT, and a PUT of an unset variable writes an
+        # empty file the audit reads as no declaration.
+        self.assertIn("object: Deployment/notification-relay", result.message)
+        self.assertNotIn("$GITOPS_INTENT_NOTE_CONTENT", result.message)
+        self.assertNotIn("-f sha=", result.message)
+
+    def test_a_transient_read_failure_is_unverified_not_failed(self):
+        # Through _record_unreadable like every other read: a 502 is a read
+        # that did not happen, so the check passes with an Unread warning and
+        # the run exits 2.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_fail("gh: HTTP 502")]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertTrue(result.passed)
+        self.assertEqual("Not checked", result.message)
+        self.assertEqual(1, len(result.warnings))
+        self.assertIsInstance(result.warnings[0], checker.Unread)
+        self.assertFalse(result.read)
+
+    def test_gh_transport_failures_are_unverified_not_failed(self):
+        # gh's DNS/connection failures are not in gcloud's vocabulary; a network
+        # blip during a pool sweep must read as unverified, not as a failed project.
+        errs = (
+            "error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com",
+            'Get "https://api.github.com/repos/gke-agentic/kube-agents-evals-3-infra/contents/knowledge/notification-relay-no-pdb.md": dial tcp 140.82.112.5:443: connect: connection refused',
+            'Get "https://api.github.com/...": dial tcp 140.82.112.5:443: i/o timeout',
+            "net/http: TLS handshake timeout",
+            # The other dial failures gh prints raw, one of them on a `-404-`
+            # project whose id sits in the URL the error embeds.
+            'Get "https://api.github.com/repos/gke-agentic/kube-agents-evals-404-infra/contents/knowledge/notification-relay-no-pdb.md": dial tcp 140.82.112.5:443: connect: network is unreachable',
+            "dial tcp 140.82.112.5:443: connect: no route to host",
+            'Get "https://api.github.com/...": unexpected EOF',
+            'Get "https://api.github.com/repos/gke-agentic/kube-agents-evals-404-infra/contents/knowledge/notification-relay-no-pdb.md": EOF',
+            'Get "https://api.github.com/...": http: server closed idle connection',
+            # Shapes no allow-list names: gh's raw `Get "<url>": <error>` line
+            # is transport whatever the error says, and a `-404-` in its URL
+            # is not a 404.
+            'Get "https://api.github.com/repos/gke-agentic/kube-agents-evals-404-infra/contents/knowledge/notification-relay-no-pdb.md": dial tcp 140.82.112.5:443: connect: connection timed out',
+            'Get "https://api.github.com/...": x509: certificate signed by unknown authority',
+            'Get "https://api.github.com/...": write: broken pipe',
+        )
+        for err in errs:
+            with self.subTest(err[:40]), mock.patch.object(checker, "run_cmd") as run:
+                run.side_effect = [_fail(err)]
+                result = checker.check_gitops_declaration("kube-agents-evals-404" if "-404-" in err else "kube-agents-evals-3")
+                self.assertNotIn("-X PUT", result.message)
+                self.assertTrue(result.passed, err)
+                self.assertEqual("Not checked", result.message)
+                self.assertIsInstance(result.warnings[0], checker.Unread)
+
+    def test_a_read_that_failed_for_another_reason_fails_the_check(self):
+        # `gh api .../contents/<path>` on a repository with no commits answers
+        # 409, which is neither a denial nor a transient: the sibling reads
+        # fail on it, so this one does too rather than filing it as unread.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_fail("gh: Git Repository is empty. (HTTP 409)")]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertFalse(result.passed)
+        self.assertEqual([], result.warnings)
+        self.assertIn("HTTP 409", result.message)
+
+    def test_a_note_the_audit_parser_rejects_fails_with_a_replacing_command(self):
+        # The file is there but the audit reads no declaration from it: no
+        # frontmatter, an unclosed one, no `type`, no `declares` list, or a
+        # list without the fixture's item. Each fails, and the repair names the
+        # blob's sha so the PUT replaces rather than 422s.
+        good = checker.GITOPS_INTENT_NOTE_CONTENT
+        rejected = {
+            "empty": "\n",
+            "unclosed": good.replace("---\n\n`notification", "\n`notification", 1),
+            "no type": good.replace("type: decision\n", ""),
+            "list frontmatter": "---\n- type: decision\n- declares: [{check: no-pdb, namespace: seeded-intent, object: Deployment/notification-relay}]\n---\n\nA list where a mapping belongs.\n",
+            "no declares": good.replace("declares:", "declared:"),
+            "other object": good.replace("Deployment/notification-relay", "Deployment/checkout-gateway"),
+            "strings but no structure": "---\ncheck: no-pdb namespace: seeded-intent object: Deployment/notification-relay\n---\n",
+            # The parser skips an item whose cluster is empty, and keys one
+            # naming a cluster to that cluster alone; neither is the fixture's
+            # fleet-wide note.
+            "empty cluster": good.replace("    object: Deployment/notification-relay", "    object: Deployment/notification-relay\n    cluster: \"\""),
+            "another cluster": good.replace("    object: Deployment/notification-relay", "    object: Deployment/notification-relay\n    cluster: seeded-b"),
+            # PyYAML raises ValueError, not YAMLError, for this; the audit's
+            # parser catches it and reads nothing, and so must this check
+            # rather than ending the run in a traceback.
+            "unquoted impossible date": good.replace("type: decision\n", "type: decision\nreviewed: 2026-02-30\n"),
+            # Silent in the parser too: a null and an empty list both return
+            # nothing without a WARNING, so the diagnosis must not promise one.
+            "null declares": good[: good.index("declares:")] + "declares:\n---\n" + good[good.index("---\n\n`notification") + 4 :],
+            "empty declares": good[: good.index("declares:")] + "declares: []\n---\n" + good[good.index("---\n\n`notification") + 4 :],
+            "declares is a mapping": good[: good.index("declares:")] + "declares:\n  check: no-pdb\n---\n" + good[good.index("---\n\n`notification") + 4 :],
+            "declares is a scalar": good[: good.index("declares:")] + "declares: yes\n---\n" + good[good.index("---\n\n`notification") + 4 :],
+            # PyYAML's safe constructors raise KeyError / AttributeError on these,
+            # outside the set the audit's parser catches; the file is the cause,
+            # so the check fails rather than reporting the machine unverified.
+            "tagged bool the constructor rejects": good.replace("type: decision\n", "type: !!bool maybe\n"),
+            "tagged timestamp the constructor rejects": good.replace("type: decision\n", "type: decision\nreviewed: !!timestamp later\n"),
+        }
+        # The reason the message gives for the shapes the audit's parser is
+        # silent about, so the operator is not sent to look for a WARNING that
+        # was never logged.
+        reasons = {
+            "empty": "it has no frontmatter",
+            "unclosed": "it has no frontmatter",
+            "no type": "has no `type`",
+            "list frontmatter": "is a YAML list, not a mapping",
+            "no declares": "has no `declares` list",
+            "other object": "no declares item is check no-pdb",
+            "strings but no structure": "not valid YAML",
+            "empty cluster": "the parser skipped every item",
+            "another cluster": "name cluster seeded-b",
+            "unquoted impossible date": "not valid YAML (ValueError)",
+            "null declares": "has no `declares` list",
+            "empty declares": "`declares` list is empty",
+            "declares is a mapping": "is not a list",
+            "declares is a scalar": "is not a list",
+            "tagged bool the constructor rejects": "the audit's parser raises on it (KeyError",
+            "tagged timestamp the constructor rejects": "the audit's parser raises on it (AttributeError",
+        }
+        for label, body in rejected.items():
+            with self.subTest(label), mock.patch.object(checker, "run_cmd") as run, mock.patch("sys.stderr", new=io.StringIO()):
+                run.side_effect = [_ok(self._contents(body, sha="deadbeef"))]
+                result = checker.check_gitops_declaration("kube-agents-evals-3")
+                self.assertFalse(result.passed, label)
+                self.assertIn("the audit reads no declaration from it", result.message)
+                self.assertIn(reasons[label], result.message, label)
+                self.assertIn("-f sha=deadbeef", result.message)
+        # And what the audit accepts, this accepts: the `...` closer and the
+        # spellings the join key folds to one.
+        accepted = {
+            "dots closer": good.replace("---\n\n`notification", "...\n\n`notification", 1),
+            "kubectl spelling": good.replace("Deployment/notification-relay", "deployment/notification-relay"),
+            "spaces round the slash": good.replace("Deployment/notification-relay", "Deployment / notification-relay"),
+            "crlf": good.replace("\n", "\r\n"),
+            # The audit files clustered items under their cluster and the rest
+            # fleet-wide, and a finding falls through to the fleet-wide entry,
+            # so a clustered item ahead of the fleet-wide one is still joined.
+            "clustered item before the fleet-wide one": good.replace(
+                "declares:\n",
+                "declares:\n  - check: no-pdb\n    namespace: seeded-intent\n    object: Deployment/notification-relay\n    cluster: seeded-b\n",
+            ),
+        }
+        for label, body in accepted.items():
+            with self.subTest(label), mock.patch.object(checker, "run_cmd") as run:
+                run.side_effect = [_ok(self._contents(body)), self._INTENT_ABSENT]
+                result = checker.check_gitops_declaration("kube-agents-evals-3")
+                self.assertTrue(result.passed, label)
+                # Not the unverified branch: a parser exception on this shape
+                # would also pass, with a warning.
+                self.assertEqual([], result.warnings, label)
+
+    def test_no_pyyaml_leaves_the_check_unverified_with_the_note_intact(self):
+        # audit_report.py imports PyYAML lazily, so the module loads on a
+        # machine without it; the loader has to import PyYAML itself, or the
+        # first failure lands inside the read of a correct note and the
+        # operator is told to overwrite it.
+        import sys
+        with mock.patch.object(checker, "run_cmd") as run, mock.patch.dict(sys.modules, {"yaml": None}):
+            run.side_effect = [_ok(self._contents(checker.GITOPS_INTENT_NOTE_CONTENT + "\n"))]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertTrue(result.passed)
+        self.assertEqual("Not checked", result.message)
+        self.assertIn("ModuleNotFoundError", result.warnings[0])
+        self.assertNotIn("Replace it", result.message)
+
+    def test_a_renamed_audit_symbol_leaves_the_check_unverified(self):
+        # A rename upstream is a loader failure, named, never a bad note.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = pathlib.Path(tmp) / "audit_report.py"
+            stub.write_text("def parse_declarations(*a, **k):\n    return []\n")
+            with mock.patch.object(checker, "run_cmd") as run, mock.patch.object(checker, "_AUDIT_REPORT", stub):
+                run.side_effect = [_ok(self._contents(checker.GITOPS_INTENT_NOTE_CONTENT + "\n"))]
+                result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertTrue(result.passed)
+        self.assertEqual("Not checked", result.message)
+        self.assertIn("AttributeError", result.warnings[0])
+
+    def test_a_timeout_naming_a_404_project_is_unverified_not_absent(self):
+        # run_cmd's timeout text embeds the command line and so the project id;
+        # `\b404\b` matched `-404-` and reported the note absent with a PUT.
+        err = "timed out after 30s: gh api repos/gke-agentic/kube-agents-evals-404-infra/contents/knowledge/notification-relay-no-pdb.md"
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_fail(err)]
+            result = checker.check_gitops_declaration("kube-agents-evals-404")
+        self.assertTrue(result.passed)
+        self.assertEqual("Not checked", result.message)
+        self.assertNotIn("Seed it", result.message)
+
+    def test_a_parser_that_cannot_run_leaves_the_check_unverified(self):
+        # No PyYAML, or the audit script missing from the tree: a fact about
+        # the machine, not the note, so the check is unread rather than failed
+        # and the run exits 2 instead of ending in a traceback.
+        for label, exc in (("no PyYAML", ModuleNotFoundError("No module named 'yaml'")), ("no audit script", FileNotFoundError("audit_report.py"))):
+            with self.subTest(label), mock.patch.object(checker, "run_cmd") as run, mock.patch.object(checker, "_load_audit_report", side_effect=exc):
+                run.side_effect = [_ok(self._contents(checker.GITOPS_INTENT_NOTE_CONTENT + "\n"))]
+                result = checker.check_gitops_declaration("kube-agents-evals-3")
+                self.assertTrue(result.passed, label)
+                self.assertEqual("Not checked", result.message)
+                self.assertEqual(1, len(result.warnings))
+                self.assertIsInstance(result.warnings[0], checker.Unread)
+                self.assertIn(type(exc).__name__, result.warnings[0])
+                self.assertFalse(result.read)
+
+    def test_the_printed_repair_command_puts_the_note_provisioning_seeds(self):
+        # The command is meant to be pasted: run it through bash with `gh`
+        # stubbed to echo its argv, and check the decoded content is the note
+        # plus the trailing newline the script's printf adds, and that the
+        # audit's parser joins it. An apostrophe added to the note text later
+        # breaks the paste while every substring assertion stays green; this
+        # is what catches it.
+        import subprocess as sp
+        import tempfile
+        command = checker.gitops_note_seed_command("gke-agentic/kube-agents-evals-3-infra", sha="deadbeef")
+        with tempfile.TemporaryDirectory() as tmp:
+            gh = pathlib.Path(tmp) / "gh"
+            gh.write_text("#!/bin/bash\nfor a in \"$@\"; do printf '%s\\0' \"$a\"; done\n")
+            gh.chmod(0o755)
+            proc = sp.run(["bash", "-c", command], capture_output=True, env={**os.environ, "PATH": f"{tmp}:{os.environ['PATH']}"})
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        argv = proc.stdout.decode().split("\0")[:-1]
+        self.assertEqual(["api", "-X", "PUT", "repos/gke-agentic/kube-agents-evals-3-infra/contents/knowledge/notification-relay-no-pdb.md"], argv[:4])
+        fields = dict(argv[i + 1].split("=", 1) for i in range(len(argv)) if argv[i] == "-f")
+        self.assertEqual(checker.GITOPS_INTENT_NOTE_MESSAGE, fields["message"])
+        self.assertEqual("deadbeef", fields["sha"])
+        body = base64.b64decode(fields["content"]).decode()
+        self.assertEqual(checker.GITOPS_INTENT_NOTE_CONTENT + "\n", body)
+        self.assertIsNone(checker._note_declaration_problem(body, "gke-agentic/kube-agents-evals-3-infra"))
+
+    def test_the_declarable_set_is_the_audits(self):
+        # The check asks the audit which slugs a note may justify; the fixture's
+        # check has to be one of them, or the note it seeds declares nothing.
+        audit = checker._load_audit_report()
+        self.assertIn(checker.GITOPS_INTENT_NOTE_DECLARATION["check"], audit.audit_declarable_checks(checker.GITOPS_INTENT_NOTE_AUDIT))
+
+    def test_the_note_the_verifier_names_is_the_one_provisioning_seeds(self):
+        # One note, defined twice: the script seeds it, the verifier reads it
+        # back and prints it as the repair. They drift apart unless pinned.
+        script = (pathlib.Path(__file__).resolve().parent / "provision_ci_pool_project.sh").read_text()
+        for name, value in (
+            ("GITOPS_INTENT_NOTE_PATH", checker.GITOPS_INTENT_NOTE_PATH),
+            ("GITOPS_INTENT_NOTE_MESSAGE", checker.GITOPS_INTENT_NOTE_MESSAGE),
+        ):
+            self.assertIn(f'{name}="{value}"', script, name)
+        self.assertIn(f"readonly GITOPS_INTENT_NOTE_CONTENT='{checker.GITOPS_INTENT_NOTE_CONTENT}'", script)
+        # The content the verifier expects is one the audit's parser joins.
+        self.assertIsNone(checker._note_declaration_problem(checker.GITOPS_INTENT_NOTE_CONTENT + "\n", "gke-agentic/x-infra"))
 
 
 class GithubAppInstallationTest(unittest.TestCase):
@@ -3576,6 +4067,7 @@ class RunChecksTest(unittest.TestCase):
              mock.patch.object(checker, "check_gke_and_state", return_value=checker.CheckResult("g", True)), \
              mock.patch.object(checker, "check_seeded_fleet_fixtures", return_value=checker.CheckResult("f", True)), \
              mock.patch.object(checker, "check_github_repo_and_app", return_value=checker.CheckResult("h", True)), \
+             mock.patch.object(checker, "check_gitops_declaration", return_value=checker.CheckResult("n", True)), \
              mock.patch.object(checker, "check_ledger_read_credential", return_value=checker.CheckResult("l", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-3")
@@ -3598,6 +4090,7 @@ class RunChecksTest(unittest.TestCase):
              mock.patch.object(checker, "check_gke_and_state", return_value=checker.CheckResult("g", True)), \
              mock.patch.object(checker, "check_seeded_fleet_fixtures", return_value=checker.CheckResult("f", True)), \
              mock.patch.object(checker, "check_github_repo_and_app", return_value=checker.CheckResult("h", True)), \
+             mock.patch.object(checker, "check_gitops_declaration", return_value=checker.CheckResult("n", True)), \
              mock.patch.object(checker, "check_ledger_read_credential", return_value=checker.CheckResult("l", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-6")
@@ -3616,7 +4109,7 @@ class ChecksSelectionTest(unittest.TestCase):
     def _mocks(self):
         return {
             name: mock.patch.object(checker, name, return_value=checker.CheckResult(name, True))
-            for name in ("check_codebase_mapping", "check_gke_and_state", "check_seeded_fleet_fixtures", "check_github_repo_and_app", "check_ledger_read_credential", "check_warm_cache_readers")
+            for name in ("check_codebase_mapping", "check_gke_and_state", "check_seeded_fleet_fixtures", "check_github_repo_and_app", "check_gitops_declaration", "check_ledger_read_credential", "check_warm_cache_readers")
         }
 
     def test_parse_checks_orders_and_refuses_unknown_ids(self):
@@ -3660,12 +4153,12 @@ class ChecksSelectionTest(unittest.TestCase):
              mock.patch.object(checker, "check_artifact_registry", return_value=checker.CheckResult("a", True)) as ar, \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)) as minter, \
              mocks["check_codebase_mapping"] as mapping, mocks["check_gke_and_state"] as gke, mocks["check_seeded_fleet_fixtures"] as fleet, \
-             mocks["check_github_repo_and_app"] as app, mocks["check_ledger_read_credential"] as ledger, \
+             mocks["check_github_repo_and_app"] as app, mocks["check_gitops_declaration"] as note, mocks["check_ledger_read_credential"] as ledger, \
              mocks["check_warm_cache_readers"] as warm, mock.patch.object(checker, "run_cmd", side_effect=AssertionError("a check ran a real command")):
             results = checker.run_checks("kube-agents-evals-3", checks=list(checker.POOL_STATE_CHECKS))
             self.assertEqual(warm.call_count, 0, "the warm-cache check is not in the scan's set")
             self.assertEqual([r.check_id for r in results], list(checker.POOL_STATE_CHECKS))
-            for never in (mapping, fleet, app, ledger):
+            for never in (mapping, fleet, app, note, ledger):
                 never.assert_not_called()
             minter.assert_called_once_with("kube-agents-evals-3", checker.DEFAULT_GITHUB_APP_ID, "us-central1", probe_app=False)
             everything = checker.run_checks("kube-agents-evals-3")
@@ -3700,9 +4193,9 @@ class ChecksSelectionTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd", side_effect=[(0, "me@example.com\n", ""), (127, "", "no gh")]):
             self.assertEqual(len(checker.check_toolchain(needs_gh=True)), 1)
         self.assertFalse(checker.GITHUB_CHECKS.intersection(checker.POOL_STATE_CHECKS))
-        # Only the repo-and-app check shells out to gh; the minter and ledger
-        # checks read GitHub over urllib and KMS over gcloud.
-        self.assertEqual(checker.GITHUB_CHECKS, {checker.CHECK_GITHUB_REPO_AND_APP})
+        # The repo-and-app and declared-intent-note checks shell out to gh; the
+        # minter and ledger checks read GitHub over urllib and KMS over gcloud.
+        self.assertEqual(checker.GITHUB_CHECKS, {checker.CHECK_GITHUB_REPO_AND_APP, checker.CHECK_GITOPS_DECLARATION})
 
 
 class ReportDocumentTest(unittest.TestCase):
