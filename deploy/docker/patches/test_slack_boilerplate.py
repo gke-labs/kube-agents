@@ -261,6 +261,12 @@ class GatewayBusyMixin:
             f"mid-turn. Wait for the current response or `/stop` first."
         )
 
+    async def _busy_goal_command(self, event, quick_key, source):
+        return "Agent is running — use /goal status / pause / clear / wait mid-run, or /stop before setting a new goal."
+
+    async def _busy_loop_command(self, event, quick_key, source):
+        return "Agent is running — use /loop status / pause / stop mid-run, or /stop before setting a new loop."
+
     async def _busy_steer_command(self, event, running_agent, steer_text):
         def _queue_fallback(reply: str) -> str:
             return reply
@@ -419,6 +425,11 @@ def _non_conversational_metadata(metadata, platform=None):
 
 
 class GatewayRunner:
+    _BUSY_REJECT_TEXT = {
+        "model": "Agent is running — wait or /stop first, then switch models.",
+        "codex-runtime": "Agent is running — wait or /stop first, then change runtime.",
+        "moa": "Agent is running — wait or /stop first, then run /moa."}
+
     def _status_action_gerund(self) -> str:
         return "restarting" if self._restart_requested else "shutting down"
 
@@ -438,6 +449,17 @@ def _gateway_provider_error_reply(text):
     return (
         "⚠️ The model provider failed after retries. I kept raw provider details "
         "out of chat; check gateway logs for diagnostics.")
+'''
+
+SLASH_COMMANDS_GOALS = '''\
+"""Fixture standing in for gateway/slash_commands_goals.py."""
+
+
+class GatewaySlashCommandsGoalsMixin:
+    def _idle_cached_agent_or_error(self, event, verb):
+        if event.source in self._running_agents:
+            return event.source, None, f"Agent is running — wait for the turn to finish, then /{verb}."
+        return event.source, None, None
 '''
 
 SLACK_ADAPTER = '''\
@@ -493,6 +515,7 @@ FIXTURES = {
     verifier.RUN_INBOUND: RUN_INBOUND,
     verifier.RUN_TURN_RUNNER: RUN_TURN_RUNNER,
     verifier.RUN: RUN,
+    verifier.SLASH_COMMANDS_GOALS: SLASH_COMMANDS_GOALS,
     "gateway/platforms/base.py": PLATFORMS_BASE,
     "agent/onboarding.py": ONBOARDING,
 }
@@ -964,6 +987,13 @@ class SystemReplyTest(unittest.TestCase):
                 "Restarting now. Send me a message in a minute or two.",
                 runtime.STOPPED,
                 "I'm in the middle of something — try `/model` again once I've answered.",
+                "I'm in the middle of something — try `/codex-runtime` again once I've answered.",
+                "I'm in the middle of something — try `/moa` again once I've answered.",
+                "I'm in the middle of something — try `/refine` again once I've answered.",
+                ("I'm in the middle of something — `/goal status`, `pause`, `clear` and `wait` work now; "
+                 "set a new goal once I've answered."),
+                ("I'm in the middle of something — `/loop status`, `pause` and `stop` work now; "
+                 "start a new loop once I've answered."),
                 "Got it — I'll pick this up next.",
                 runtime.STEER_FAILED,
                 "Still running `make build`.",
@@ -1002,6 +1032,19 @@ class SystemReplyTest(unittest.TestCase):
         self.assertEqual(self._sent(self.adapter, long_steer, FLAG_ON), long_steer)
         preview = f"{steer}check\nthe ingress too'"
         self.assertNotEqual(self._sent(self.adapter, preview, FLAG_ON), preview)
+
+    def test_command_specific_busy_refusals_name_the_command(self):
+        for text, command in (
+            ("Agent is running — wait or /stop first, then switch models.", "/model"),
+            ("Agent is running — wait or /stop first, then change runtime.", "/codex-runtime"),
+            ("Agent is running — wait or /stop first, then run /moa.", "/moa"),
+            ("Agent is running — wait for the turn to finish, then /review.", "/review"),
+        ):
+            with self.subTest(text=text):
+                sent = self._sent(self.adapter, text, FLAG_ON)
+                self.assertEqual(sent, runtime.BUSY_RETRY.format(command=command))
+                for word in verifier.SYSTEM_LEFTOVERS:
+                    self.assertNotIn(word, sent)
 
     def test_restart_reply_drops_the_console_command_and_the_notice_promise(self):
         with mock.patch.dict(os.environ, FLAG_ON):

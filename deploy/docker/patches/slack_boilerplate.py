@@ -129,6 +129,11 @@ STEER_PREVIEW_MAX = 63
 #: ``_status_action_gerund()``'s values, as the drain replies say them on Slack.
 DRAIN_WHO = {"restarting": "I'm restarting", "shutting down": "I'm going offline for a moment"}
 
+#: A command refused mid-turn, as Slack hears it.
+BUSY_RETRY = "I'm in the middle of something — try `{command}` again once I've answered."
+#: Each of ``_BUSY_REJECT_TEXT``'s endings (gateway/run.py) and the command it refuses.
+BUSY_REJECT_COMMANDS = {"switch models": "/model", "change runtime": "/codex-runtime", "run /moa": "/moa"}
+
 #: The gateway's other system replies, each matched whole, and what Slack is
 #: sent instead. A callable gets the match; a string is sent as it stands.
 SYSTEM_REWORDS: tuple[tuple[re.Pattern, Any], ...] = (
@@ -158,7 +163,21 @@ SYSTEM_REWORDS: tuple[tuple[re.Pattern, Any], ...] = (
     # A slash command sent mid-turn, and /steer (gateway/run_busy.py).
     (re.compile(r"⏳ Agent is running — `(?P<command>/[^`\n]+)` can't run mid-turn\. "
                 r"Wait for the current response or `/stop` first\."),
-     lambda m: f"I'm in the middle of something — try `{m['command']}` again once I've answered."),
+     lambda m: BUSY_RETRY.format(command=m["command"])),
+    # The commands with their own mid-turn refusal: /model, /codex-runtime and
+    # /moa (gateway/run.py), /goal and /loop (gateway/run_busy.py), /refine and
+    # /review (gateway/slash_commands_goals.py).
+    (re.compile(r"Agent is running — wait or /stop first, then (?P<action>switch models|change runtime|run /moa)\."),
+     lambda m: BUSY_RETRY.format(command=BUSY_REJECT_COMMANDS[m["action"]])),
+    (re.compile(r"Agent is running — wait for the turn to finish, then (?P<command>/(?:refine|review))\."),
+     lambda m: BUSY_RETRY.format(command=m["command"])),
+    (re.compile(r"Agent is running — use /goal status / pause / clear / wait mid-run, "
+                r"or /stop before setting a new goal\."),
+     ("I'm in the middle of something — `/goal status`, `pause`, `clear` and `wait` work now; "
+      "set a new goal once I've answered.")),
+    (re.compile(r"Agent is running — use /loop status / pause / stop mid-run, or /stop before setting a new loop\."),
+     ("I'm in the middle of something — `/loop status`, `pause` and `stop` work now; "
+      "start a new loop once I've answered.")),
     (re.compile(rf"⏩ Steer queued — arrives after the next tool call: '.{{0,{STEER_PREVIEW_MAX}}}'", re.DOTALL),
      "Got it — I'll fold this into what I'm working on now."),
     (re.compile(r"(?:Agent still starting|No active agent) — /steer queued for the next turn\."),

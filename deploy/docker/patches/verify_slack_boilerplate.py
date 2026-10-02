@@ -96,7 +96,7 @@ BUSY_DETAILS = ("", " (3 min elapsed, running: terminal)")
 DRAIN_FN = "_send_busy_drain_notice"
 
 #: What the mid-turn slash-command and /steer replies interpolate.
-BUSY_ENV = {"name": "model", "preview": "check the ingress too"}
+BUSY_ENV = {"name": "model", "preview": "check the ingress too", "verb": "refine"}
 
 #: Hermes' English catalog, where the /restart and /stop replies live, the
 #: module that looks each key up, and the arguments each is formatted with.
@@ -113,6 +113,7 @@ LOCALE_REPLIES = {
 RUN_INBOUND = "gateway/run_inbound.py"
 RUN_TURN_RUNNER = "gateway/run_turn_runner.py"
 RUN = "gateway/run.py"
+SLASH_COMMANDS_GOALS = "gateway/slash_commands_goals.py"
 #: The method whose return value the drain replies interpolate.
 ACTION_FN = "_status_action_gerund"
 BACKGROUND_FN = "_format_process_running_message"
@@ -144,6 +145,7 @@ SYSTEM_LITERALS = (
     (RUN_BUSY, "Agent still starting — /steer", 1),
     (RUN_BUSY, "No active agent — /steer", 1),
     (RUN_BUSY, "⚠️ Steer failed", 1),
+    (RUN_BUSY, "Agent is running —", 2),
     (RUN_INBOUND, "⏳ Gateway", 3),
     (RUN_INBOUND, "⏳ This agent is draining", 1),
     (RUN_INBOUND, "⏳ Another turn is still running", 1),
@@ -154,6 +156,8 @@ SYSTEM_LITERALS = (
     (RUN, "⏱️ The model provider is rate-limiting", 1),
     (RUN, "⚠️ The model server is not responding", 1),
     (RUN, "⚠️ The model provider failed after retries", 1),
+    (RUN, "Agent is running —", 3),
+    (SLASH_COMMANDS_GOALS, "Agent is running —", 1),
 )
 #: Left on a reworded reply, any of these means the rewording missed.
 SYSTEM_LEFTOVERS = (
