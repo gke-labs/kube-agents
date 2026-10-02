@@ -814,7 +814,9 @@ incident's `passes_leases`, and the advice, the Chat sentence, the digest line
 and the issue body then say that no run reds from it and a 403 on one of those
 projects is the change's to read; when such a finding fires beside one that
 does red a run, the 403 sentence names the latter and its projects and the
-exception follows it.
+exception follows it. When only such findings fire, the message's header reads
+`pool drifted, runs unaffected` in place of `flaky`: the other DEGRADED headers
+mean "retest" by that word, and this one has nothing to retest for.
 
 **What never fails the bot.** A missing `gcloud`, a project the bot cannot read, a
 verifier past the per-project ceiling (300 s; the verifier's own deadline is 270 s in,

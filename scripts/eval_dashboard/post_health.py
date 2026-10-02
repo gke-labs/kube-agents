@@ -248,6 +248,12 @@ POOL_PASSES_LEASES = (
 POOL_PASSES_LEASES_TAIL = " {findings} reds no run; a red is the pool's only on a project with one of the other findings."
 POOL_RETEST = "Retest once the pool owner has run the repair."
 POOL_NO_RETEST = "Nothing on a pull request waits for the repair."
+# The change post's header for the condition. DEGRADED's is "flaky" because
+# every other condition's remedy is a retest, and render_change's other
+# branches inline it; a drift made only of findings a leased run passes with
+# asks for no retest, so its header says so before the sentence does.
+POOL_DRIFT_HEADER = "🟡 *Smoke gate: flaky*"
+POOL_DRIFT_SILENT_HEADER = "🟡 *Smoke gate: pool drifted, runs unaffected*"
 POOL_DIGEST_REDS_RUNS = " a 403 from a run that leased one of them is the pool's, not the code."
 POOL_DIGEST_PASSES_LEASES = " no run reds from that; a 403 on one of them is the code's to read."
 
@@ -674,10 +680,16 @@ def pool_drift_sentence(health: dict, since: str) -> str:
     return head + POOL_REDS_RUNS + (POOL_PASSES_LEASES_TAIL.format(findings=", ".join(silent)) if silent else "")
 
 
+def pool_drift_passes_leases(health: dict) -> bool:
+    """Whether every firing pool finding is one a leased run passes with:
+    the one split the header and the retest line both turn on."""
+    loud, silent = _pool_findings_split(health.get("incident") or {})
+    return bool(silent) and not loud
+
+
 def pool_drift_retest(health: dict) -> str:
     """Whether a pull request has anything to wait for."""
-    loud, silent = _pool_findings_split(health.get("incident") or {})
-    return POOL_NO_RETEST if silent and not loud else POOL_RETEST
+    return POOL_NO_RETEST if pool_drift_passes_leases(health) else POOL_RETEST
 
 
 def cause_sentence(health: dict) -> str:
@@ -751,7 +763,8 @@ def render_change(health: dict, prev: dict | None, issue: dict | None = None) ->
     elif condition == CONDITION_POOL_DRIFT:
         tag = issue_tag(issue)
         tracking = f" Tracking {tag}." if tag else ""
-        lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)} {pool_drift_retest(health)} {POOL_REPAIR_HINT}{tracking}"]
+        header = POOL_DRIFT_SILENT_HEADER if pool_drift_passes_leases(health) else POOL_DRIFT_HEADER
+        lines = [f"{header} — {cause_sentence(health)} {pool_drift_retest(health)} {POOL_REPAIR_HINT}{tracking}"]
     else:
         lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)}  Passing runs still count; if yours died before any test ran, retest."]
     lines.append(incident_link(health))

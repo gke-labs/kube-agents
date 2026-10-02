@@ -2137,9 +2137,12 @@ class PoolDrift(RunHarness):
         # the pool for as long as the repair takes.
         rc, err = self.tick(pool_drift(findings=(SILENT_FINDING,), passes_leases=(SILENT_FINDING,)), T14, environ=self.environ())
         self.assertEqual(rc, 0, err)
+        # The header turns on the same split as the sentence: a gate nothing
+        # waits on is not "flaky", the word the other DEGRADED headers mean
+        # "retest" by.
         self.assertEqual(
             self.opener.texts[0].splitlines()[0],
-            f"🟡 *Smoke gate: flaky* — pool finding {SILENT_FINDING} on 3 pool projects since 9:00 AM ET;"
+            f"🟡 *Smoke gate: pool drifted, runs unaffected* — pool finding {SILENT_FINDING} on 3 pool projects since 9:00 AM ET;"
             f" no run reds from {SILENT_FINDING}: an install there passes its lease with that gap,"
             " so a 403 or a missing-resource red on one of those projects is the code's to read, not the pool's."
             f" Nothing on a pull request waits for the repair. {post_health.POOL_REPAIR_HINT} Tracking #1300.",
@@ -2158,6 +2161,9 @@ class PoolDrift(RunHarness):
             " a 403 or a missing-resource red from a run that leased one of those projects is the pool's, not the code."
             f" {SILENT_FINDING} reds no run; a red is the pool's only on a project with one of the other findings.",
         )
+        # Beside a finding that reds runs the header stays the retest one.
+        self.assertTrue(post_health.render_change(doc, None).startswith(f"{post_health.POOL_DRIFT_HEADER} — pool findings"), post_health.render_change(doc, None))
+        self.assertEqual(post_health.pool_drift_retest(doc), post_health.POOL_RETEST)
         self.assertEqual(post_health.pool_drift_retest(doc), post_health.POOL_RETEST)
         body = post_health.gate_issue.render_pool_drift_body(doc, "Mon 9:00 AM ET", "brief")
         self.assertIn("that red is the pool's, not the pull request's", body)
