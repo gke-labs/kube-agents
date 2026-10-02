@@ -143,11 +143,16 @@ type a2aTask struct {
 	// after TaskStarted, which startTask makes the placeholder), and line
 	// its current text. Everything else the relay posts under this task is
 	// in posts, in order - the deliverable last, on a completed terminal.
-	lineID  string
-	line    string
-	posts   []a2aPost
-	created time.Time
-	updated time.Time
+	lineID string
+	line   string
+	posts  []a2aPost
+	// result is the deliverable, handed over whole by the relay
+	// (DeliverableObserver) before it posts it in chunks; delivered says
+	// it arrived, so an empty result is distinguishable from none.
+	result    string
+	delivered bool
+	created   time.Time
+	updated   time.Time
 }
 
 // a2aConversation is one caller's context: the turn accounting message/send
@@ -159,15 +164,21 @@ type a2aConversation struct {
 	contextID string
 	// busy is the one-turn-at-a-time guard: the counters below are per
 	// conversation, so a second submission waits for the first turn to end
-	// before it can read them.
+	// before it can read them. Set when a message is handed over and
+	// cleared by TurnFinished, not by the send that returns on the task's
+	// accept: the turn runs on past the accept (a session spawn is seconds),
+	// and a claim inside that gap would read counters one turn short and
+	// be answered from the first turn's end.
 	busy    bool
 	turns   int
 	drops   int
 	cancels int
 	// active is the task the relay is posting under, set at TaskStarted and
-	// cleared at TaskTerminal. tasks is every task id in order.
+	// cleared at TaskTerminal. tasks is the task ids in order, bounded the
+	// way the inject door bounds its logs: a waiter indexes by position and
+	// is told when its position was evicted past.
 	active *a2aTask
-	tasks  []string
+	tasks  injectIDLog
 	// turnPosts is every post the gateway made during the turn in flight,
 	// whatever task it was filed under, reset when a turn is claimed. It is
 	// what a turn that started no task answers with: a steer's
@@ -591,7 +602,6 @@ func (d *A2ADoor) send(r *http.Request, handler func(InboundMessage), req rpcReq
 		TaskID:       msg.TaskID,
 	})
 	taskID, reply, rerr := d.awaitTurn(turnCtx, key, prior, deadline)
-	d.releaseTurn(key)
 	d.completeOutcome(outcome, taskID, reply, rerr)
 	if rerr != nil {
 		d.log.Info("a2a: the door started nothing for a message/send",
@@ -602,7 +612,10 @@ func (d *A2ADoor) send(r *http.Request, handler func(InboundMessage), req rpcReq
 		return rpcOK(req.ID, reply)
 	}
 	if blocking {
-		d.awaitTerminal(turnCtx, taskID, time.Now().Add(a2aBlockingWait))
+		// On the request's context, not the turn's: the submission is
+		// settled above, a retry is answered from it, and a client that has
+		// gone has nothing to deliver the terminal to.
+		d.awaitTerminal(r.Context(), taskID, time.Now().Add(a2aBlockingWait))
 	}
 	return rpcOK(req.ID, d.taskObject(taskID))
 }
@@ -680,7 +693,12 @@ func (d *A2ADoor) cancel(r *http.Request, handler func(InboundMessage), req rpcR
 	messageID := a2aInboundIDPrefix + randHex(messageIDHexWidth)
 	user := lib.Message{Role: a2aRoleUser, Parts: textParts("stop"), MessageID: messageID, ContextID: contextID, TaskID: params.ID}
 	deadline := time.Now().Add(a2aSubmitWait)
-	prior, ok := d.claimTurn(r.Context(), key, caller, contextID, user, deadline)
+	// The claim is taken on a context the client cannot end, for the
+	// inject door's reason: a caller that gives up while an earlier turn
+	// still runs has still asked for the stop, and a cancel never handed
+	// over leaves the stray running with nobody to stop it. The bound alone
+	// ends the claim; the wait below stays on the request's context.
+	prior, ok := d.claimTurn(context.WithoutCancel(r.Context()), key, caller, contextID, user, deadline)
 	if !ok {
 		return rpcFail(req.ID, rpcInternalError, earlierTurnNote(), nil)
 	}
@@ -695,7 +713,6 @@ func (d *A2ADoor) cancel(r *http.Request, handler func(InboundMessage), req rpcR
 		TaskID:       params.ID,
 	})
 	published, note := d.awaitCancel(r.Context(), key, prior, deadline)
-	d.releaseTurn(key)
 	if !published {
 		return rpcFail(req.ID, a2aErrTaskNotCancelable, note, nil)
 	}
@@ -714,10 +731,22 @@ func (d *A2ADoor) claimTurn(ctx context.Context, key, caller, contextID string, 
 		conv.contextID = contextID
 		d.noteDirectLocked(caller, key)
 		if !conv.busy {
+			if time.Until(deadline) < turnTimeout {
+				// The slot is free, but too late: handed over now, this
+				// turn would have less than the turnTimeout handleInbound
+				// runs under, and the wait's deadline would fall while the
+				// turn was still legitimately running -- a refusal pinned
+				// under the message id for a message the gateway goes on
+				// to act on. A refusal has to mean nothing started, so the
+				// message is not handed over at all (the inject door's
+				// claimTurn, which handleInbound's routing relies on).
+				d.mu.Unlock()
+				return a2aPrior{}, false
+			}
 			conv.busy = true
 			conv.pending = user
 			conv.turnPosts = nil
-			prior := a2aPrior{turns: conv.turns, drops: conv.drops, cancels: conv.cancels, tasks: len(conv.tasks)}
+			prior := a2aPrior{turns: conv.turns, drops: conv.drops, cancels: conv.cancels, tasks: conv.tasks.total}
 			d.mu.Unlock()
 			return prior, true
 		}
@@ -727,16 +756,6 @@ func (d *A2ADoor) claimTurn(ctx context.Context, key, caller, contextID string, 
 			return a2aPrior{}, false
 		}
 	}
-}
-
-func (d *A2ADoor) releaseTurn(key string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if conv, ok := d.conversations[key]; ok {
-		conv.busy = false
-		conv.pending = lib.Message{}
-	}
-	d.wakeLocked()
 }
 
 // sleep waits for a wakeup, the poll interval, the deadline or the context,
@@ -768,8 +787,11 @@ func (d *A2ADoor) awaitTurn(ctx context.Context, key string, prior a2aPrior, dea
 	for {
 		d.mu.Lock()
 		conv := d.conversationLocked(key)
-		if len(conv.tasks) > prior.tasks {
-			taskID := conv.tasks[prior.tasks]
+		if taskID, evicted := conv.tasks.at(prior.tasks); evicted {
+			d.mu.Unlock()
+			return "", nil, &rpcError{Code: rpcInternalError,
+				Message: "the door evicted this turn's task id while the turn ran; poll tasks/get by the ids you hold"}
+		} else if taskID != "" {
 			task := d.tasks[taskID]
 			if task != nil && (task.accepted || task.terminal) || conv.turns > prior.turns {
 				d.mu.Unlock()
@@ -898,12 +920,29 @@ func (d *A2ADoor) conversationLocked(key string) *a2aConversation {
 		return conv
 	}
 	if len(d.convOrder) >= a2aMaxConversations {
-		oldest := d.convOrder[0]
-		d.convOrder = d.convOrder[1:]
-		if old, ok := d.conversations[oldest]; ok && old.caller != "" && d.directOf[old.caller] == oldest {
-			delete(d.directOf, old.caller)
+		// Evict the oldest IDLE conversation: one with no turn in flight
+		// and no task the relay is posting under. A live one evicted here
+		// would be re-minted with zeroed counters on the next touch, and a
+		// waiter that read its counts before the eviction would classify
+		// from the new incarnation as though nothing had moved, the
+		// one-turn guard would admit a second message, and the relay's
+		// posts would find no task to attach to. Live conversations are
+		// bounded by the turns and tasks in flight, which the gateway caps
+		// itself (A2A_MAX_SESSIONS, the per-conversation serial queue), so
+		// when every record is live the cap is left behind rather than
+		// broken.
+		for i, candidate := range d.convOrder {
+			old := d.conversations[candidate]
+			if old != nil && (old.busy || old.active != nil) {
+				continue
+			}
+			d.convOrder = append(d.convOrder[:i], d.convOrder[i+1:]...)
+			if old != nil && old.caller != "" && d.directOf[old.caller] == candidate {
+				delete(d.directOf, old.caller)
+			}
+			delete(d.conversations, candidate)
+			break
 		}
-		delete(d.conversations, oldest)
 	}
 	conv := &a2aConversation{key: key}
 	d.conversations[key] = conv
@@ -982,8 +1021,8 @@ func (d *A2ADoor) Edit(conversation, messageID, text string) error {
 	}
 	// The terminal edit can land after TaskTerminal cleared active on a
 	// path that orders them the other way; find the line by id.
-	for i := len(conv.tasks) - 1; i >= 0; i-- {
-		if task := d.tasks[conv.tasks[i]]; task != nil && task.lineID == messageID {
+	for i := len(conv.tasks.ids) - 1; i >= 0; i-- {
+		if task := d.tasks[conv.tasks.ids[i]]; task != nil && task.lineID == messageID {
 			task.line = text
 			task.updated = time.Now()
 			break
@@ -1037,7 +1076,7 @@ func (d *A2ADoor) TaskStarted(conversation, taskID string) {
 	}
 	d.tasks[taskID] = task
 	conv.active = task
-	conv.tasks = append(conv.tasks, taskID)
+	conv.tasks.add(taskID)
 	d.wakeLocked()
 }
 
@@ -1078,6 +1117,25 @@ func (d *A2ADoor) TaskTerminal(conversation, taskID string, state lib.TaskState,
 	d.wakeLocked()
 }
 
+// TaskDelivered records the deliverable the relay hands over whole before
+// posting it in chunks (DeliverableObserver). It is the task's one artifact;
+// the posts stay what they are, the task's history.
+func (d *A2ADoor) TaskDelivered(conversation, taskID, result string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	task, ok := d.tasks[taskID]
+	if !ok {
+		conv := d.conversationLocked(conversation)
+		task = &a2aTask{id: taskID, key: conversation, contextID: conv.contextID, caller: conv.caller, created: time.Now()}
+		d.tasks[taskID] = task
+		d.taskOrder = append(d.taskOrder, taskID)
+	}
+	task.result = truncateRunes(result, injectMaxEntryBytes)
+	task.delivered = true
+	task.updated = time.Now()
+	d.wakeLocked()
+}
+
 // CancelPublished records that a cancel reached the bus.
 func (d *A2ADoor) CancelPublished(conversation, taskID string) {
 	d.mu.Lock()
@@ -1096,11 +1154,16 @@ func (d *A2ADoor) MessageDropped(conversation, authorID string) {
 	d.wakeLocked()
 }
 
-// TurnFinished records the end of a turn.
+// TurnFinished records the end of a turn and frees the slot the claim took:
+// the gateway's deferred observeTurnFinished is the one place the turn is
+// known to be over, whichever way it went.
 func (d *A2ADoor) TurnFinished(conversation string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.conversationLocked(conversation).turns++
+	conv := d.conversationLocked(conversation)
+	conv.turns++
+	conv.busy = false
+	conv.pending = lib.Message{}
 	d.wakeLocked()
 }
 
@@ -1110,7 +1173,7 @@ func (d *A2ADoor) taskObject(taskID string) a2aTaskObject {
 	defer d.mu.Unlock()
 	task, ok := d.tasks[taskID]
 	if !ok {
-		return a2aTaskObject{ID: taskID, Kind: a2aKindTask, Status: lib.TaskStatus{State: "unknown"}}
+		return a2aTaskObject{ID: taskID, Kind: a2aKindTask, Status: a2aTaskStatus{State: "unknown"}}
 	}
 	return d.taskObjectLocked(task)
 }
@@ -1120,28 +1183,30 @@ func (d *A2ADoor) taskObjectLocked(task *a2aTask) a2aTaskObject {
 	if state == "" {
 		state = lib.StateSubmitted
 	}
-	status := lib.TaskStatus{State: state, TS: task.updated.UTC().Format(time.RFC3339Nano)}
+	status := a2aTaskStatus{State: state, TS: task.updated.UTC().Format(time.RFC3339Nano)}
 	line := task.line
 	if task.terminal && task.reason != "" {
 		line = task.reason
 	}
 	if line != "" {
-		status.Message = &lib.Message{Role: a2aRoleAgent, Parts: textParts(line), MessageID: task.lineID, TaskID: task.id, ContextID: task.contextID}
+		status.Message = &a2aMessage{Role: a2aRoleAgent, Parts: textParts(line), MessageID: task.lineID, TaskID: task.id, ContextID: task.contextID, Kind: a2aKindMessage}
 	}
-	history := make([]lib.Message, 0, 1+len(task.posts))
+	history := make([]a2aMessage, 0, 1+len(task.posts))
 	if task.user.MessageID != "" {
-		history = append(history, task.user)
+		u := task.user
+		history = append(history, a2aMessage{Role: u.Role, Parts: u.Parts, MessageID: u.MessageID, TaskID: u.TaskID, ContextID: u.ContextID, Kind: a2aKindMessage})
 	}
 	for _, p := range task.posts {
-		history = append(history, lib.Message{Role: a2aRoleAgent, Parts: textParts(p.text), MessageID: p.id, TaskID: task.id, ContextID: task.contextID})
+		history = append(history, a2aMessage{Role: a2aRoleAgent, Parts: textParts(p.text), MessageID: p.id, TaskID: task.id, ContextID: task.contextID, Kind: a2aKindMessage})
 	}
 	var artifacts []lib.Artifact
-	if state == lib.StateCompleted && len(task.posts) > 0 {
-		// The deliverable is what the relay posted last before the
-		// terminal edit; earlier posts under the task are notices. One
-		// artifact, named as the bus names it.
-		last := task.posts[len(task.posts)-1]
-		artifacts = []lib.Artifact{{ArtifactID: task.id + "-result", Name: lib.ArtifactResult, Parts: textParts(last.text)}}
+	if state == lib.StateCompleted && task.delivered {
+		// The deliverable the relay handed over whole (TaskDelivered); the
+		// posts are the same text in chat-sized chunks and stay history.
+		// One artifact, named as the bus names it. A completed task the
+		// relay handed nothing for (a non-text result, a heal with no
+		// artifact on the stream) renders no artifact rather than a guess.
+		artifacts = []lib.Artifact{{ArtifactID: task.id + "-result", Name: lib.ArtifactResult, Parts: textParts(task.result)}}
 	}
 	metadata := map[string]any{"backend": a2aBackend}
 	if task.terminal {

@@ -191,6 +191,17 @@ type TaskObserver interface {
 //
 // Both are called on the conversation's inbox worker, like TaskStarted:
 // record and return.
+// DeliverableObserver is told the text a completed task delivered, once,
+// before the relay posts it. The relay posts a result in chat-sized chunks
+// (g.post, discordChunk), so an adapter whose caller is a program cannot
+// rebuild the deliverable from the posts it sees; this hands it over whole,
+// and the heal path hands over the artifact the stream carries. Optional,
+// like the observers above: the gateway asserts for it on the adapter it
+// drives, and the side-door composite forwards it to the owning door.
+type DeliverableObserver interface {
+	TaskDelivered(conversation, taskID, result string)
+}
+
 type InboundObserver interface {
 	MessageDropped(conversation, authorID string)
 	TurnFinished(conversation string)

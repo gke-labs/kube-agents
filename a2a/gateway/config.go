@@ -153,8 +153,9 @@ type Config struct {
 	// nothing and competes for nothing. See a2a/gateway/a2adoor.go.
 	A2ADoorListen string
 
-	// A2ADoorToken is the bearer token the door requires on every request
-	// (A2A_DOOR_TOKEN). No unauthenticated mode, for the inject door's
+	// A2ADoorToken is the bearer token the door requires on every RPC
+	// request (A2A_DOOR_TOKEN); the agent card is the one unauthenticated
+	// route. No unauthenticated mode for the RPCs, for the inject door's
 	// reason: the port-forward path is served from inside the pod, past
 	// the NetworkPolicy.
 	A2ADoorToken string

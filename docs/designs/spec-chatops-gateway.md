@@ -1216,12 +1216,19 @@ is what a chat user would have read. The rolling progress line (`startTask`'s pl
 the relay edits) is `status.message`; the state is `submitted` from `TaskStarted`, `working` from
 the first edit, and the terminal state from `TaskTerminal`, whose reason - the executor's
 terminal status message, verbatim, which is `reason: <token>` on a failure - replaces the line
-on a terminal that carries one. Every other post under
-the task is an agent message in `history`, after the caller's own. On a completed terminal the
-last post before the terminal edit is the deliverable, and it is the task's one artifact, named
-`result` as the bus names it. `metadata.terminalSource` carries whose word the terminal is, for
-the reason the inject door's read route carries it. A2A clients read exactly `status`,
-`artifacts` and `history`, so nothing here is invented for them.
+on a terminal that carries one. Every other post under the task is an agent message in
+`history`, after the caller's own; every message inside the Task carries the binding's
+`kind: "message"`, which the bus payload's own message struct does not. On a completed terminal
+the task's one artifact, named `result` as the bus names it, is the deliverable the relay hands
+the door whole before it posts it in chat-sized chunks (`DeliverableObserver`; the heal path
+hands over the artifact the stream carries), so the chunks stay history and the artifact is
+never inferred from a post's position. A completed task the relay handed nothing for (a
+non-text result) renders no artifact. `metadata.terminalSource` carries whose word the terminal
+is, for the reason the inject door's read route carries it. A2A clients read exactly `status`,
+`artifacts` and `history`, so nothing here is invented for them. Not mapped yet: an executor's
+non-final `input-required` reaches `history` as the relay's ask line, not `status.state`, which
+stays `working`; no executor in this tree publishes it, and the streaming change carries status
+events through as they come.
 
 **Conversation.** `a2a:<caller>:<contextId>`, kind `dm`. The caller is part of the key so two
 callers naming the same `contextId` do not share a conversation; a caller that sends none is

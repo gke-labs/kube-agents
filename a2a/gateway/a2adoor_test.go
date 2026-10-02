@@ -261,6 +261,214 @@ func (r *a2aRig) getUntil(t *testing.T, caller, taskID, what string, cond func(a
 	return last
 }
 
+// TestA2AResultArtifactIsWholeWhenTheRelayChunksIt: the relay posts a
+// result in chat-sized chunks (discordChunk), one Post per chunk, and the
+// composite delivers each to the door. The artifact is the deliverable the
+// relay handed over whole (DeliverableObserver), not the last chunk; the
+// chunks are the task's history.
+func TestA2AResultArtifactIsWholeWhenTheRelayChunksIt(t *testing.T) {
+	primary := newFakeAdapter()
+	r := startA2ARigWith(t, func(door *A2ADoor) Adapter {
+		return WithSideDoors(primary, []DoorSpec{A2ADoorSpec(door)}, nil)
+	})
+	report := strings.Repeat("fleet report line with enough text to need several chunks\n", 120)
+	if len(report) <= 2*discordChunk {
+		t.Fatalf("the fixture is %d bytes; it has to exceed two chunks (%d) to prove anything", len(report), 2*discordChunk)
+	}
+	go func() {
+		origin := r.awaitTask(t, "platform")
+		r.complete(t, origin, report)
+	}()
+	task := taskOf(t, r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("audit the fleet", "m-1", "", true)))
+	if task.Status.State != lib.StateCompleted {
+		t.Fatalf("state = %q, want completed", task.Status.State)
+	}
+	if len(task.Artifacts) != 1 || joinTextParts(task.Artifacts[0].Parts) != report {
+		got := ""
+		if len(task.Artifacts) == 1 {
+			got = joinTextParts(task.Artifacts[0].Parts)
+		}
+		t.Fatalf("the result artifact is %d bytes, want the whole %d-byte deliverable (artifacts=%d)", len(got), len(report), len(task.Artifacts))
+	}
+	chunks := 0
+	for _, m := range task.History {
+		// chatChunks cuts at a newline, so a later chunk starts with one.
+		if m.Role == a2aRoleAgent && strings.HasPrefix(strings.TrimSpace(joinTextParts(m.Parts)), "fleet report line") {
+			chunks++
+		}
+	}
+	if chunks < 3 {
+		t.Errorf("history carries %d result chunks, want the relay's chunked posts (>= 3)", chunks)
+	}
+}
+
+// TestA2ATaskMessagesCarryTheKindDiscriminator: every Message inside a Task
+// (status.message, each history entry) goes out with kind: "message", as
+// the top-level reply already does; lib.Message has no kind and is not
+// what the door puts on the wire.
+func TestA2ATaskMessagesCarryTheKindDiscriminator(t *testing.T) {
+	r := startA2ARig(t)
+	go func() {
+		origin := r.awaitTask(t, "platform")
+		r.complete(t, origin, "done")
+	}()
+	resp := r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("kinds?", "m-1", "", true))
+	raw, err := json.Marshal(resp.Result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var obj struct {
+		Kind   string `json:"kind"`
+		Status struct {
+			Message map[string]any `json:"message"`
+		} `json:"status"`
+		History []map[string]any `json:"history"`
+	}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatal(err)
+	}
+	if obj.Kind != a2aKindTask {
+		t.Fatalf("result kind = %q", obj.Kind)
+	}
+	if obj.Status.Message == nil || obj.Status.Message["kind"] != a2aKindMessage {
+		t.Errorf("status.message = %v, want kind %q", obj.Status.Message, a2aKindMessage)
+	}
+	if len(obj.History) < 2 {
+		t.Fatalf("history = %v, want the ask and the answer", obj.History)
+	}
+	for i, m := range obj.History {
+		if m["kind"] != a2aKindMessage {
+			t.Errorf("history[%d] = %v, want kind %q", i, m, a2aKindMessage)
+		}
+	}
+}
+
+// bareDoor is a door with no listener and no gateway, for the tests that
+// drive its state machine directly.
+func bareDoor(t *testing.T) *A2ADoor {
+	t.Helper()
+	d, err := NewA2ADoor("127.0.0.1:0", a2aTestToken, A2ADoorOptions{DefaultAddressee: "platform"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
+// TestA2ATurnSlotIsHeldUntilTurnFinished: the accept returns message/send,
+// but the turn runs on (a session spawn is seconds); the slot frees on
+// TurnFinished, so a second claim inside the gap waits rather than reading
+// counters one turn short.
+func TestA2ATurnSlotIsHeldUntilTurnFinished(t *testing.T) {
+	d := bareDoor(t)
+	key := a2aConversationKey(a2aTestCaller, "ctx-1")
+	user := lib.Message{Role: a2aRoleUser, Parts: textParts("go"), MessageID: "m-1", ContextID: "ctx-1"}
+	if _, ok := d.claimTurn(context.Background(), key, a2aTestCaller, "ctx-1", user, time.Now().Add(a2aSubmitWait)); !ok {
+		t.Fatal("the first claim on an idle conversation was refused")
+	}
+	d.TaskStarted(key, "task-1")
+	d.TaskAccepted(key, "task-1")
+	busy := func() bool {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return d.conversations[key].busy
+	}
+	if !busy() {
+		t.Fatal("the slot was released at the accept; a second send in the accept-to-turn-end gap would be answered from the first turn's end")
+	}
+	d.TurnFinished(key)
+	if busy() {
+		t.Fatal("TurnFinished did not free the slot")
+	}
+	if _, ok := d.claimTurn(context.Background(), key, a2aTestCaller, "ctx-1", user, time.Now().Add(a2aSubmitWait)); !ok {
+		t.Fatal("a claim after the turn ended was refused")
+	}
+}
+
+// TestA2AClaimRefusesWithLessThanATurnLeft: a free slot with less than
+// turnTimeout of the bound left is not handed over, so a refusal can never
+// be pinned for a message the gateway goes on to act on (the premise
+// handleInbound's routing states for both doors).
+func TestA2AClaimRefusesWithLessThanATurnLeft(t *testing.T) {
+	d := bareDoor(t)
+	key := a2aConversationKey(a2aTestCaller, "ctx-1")
+	user := lib.Message{Role: a2aRoleUser, Parts: textParts("go"), MessageID: "m-1", ContextID: "ctx-1"}
+	start := time.Now()
+	if _, ok := d.claimTurn(context.Background(), key, a2aTestCaller, "ctx-1", user, time.Now().Add(turnTimeout/2)); ok {
+		t.Fatal("a claim with half a turn left of its bound was handed over")
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Errorf("the refusal took %s; it should not wait out the bound", time.Since(start))
+	}
+	d.mu.Lock()
+	busy := d.conversations[key].busy
+	d.mu.Unlock()
+	if busy {
+		t.Error("the refused claim left the slot taken")
+	}
+}
+
+// TestA2ACapEvictsIdleConversationsNotLive: at the cap, the oldest IDLE
+// conversation goes; one with a turn in flight or a task the relay posts
+// under keeps its record, so its waiter and the relay never read a fresh
+// incarnation with zeroed counters.
+func TestA2ACapEvictsIdleConversationsNotLive(t *testing.T) {
+	d := bareDoor(t)
+	busyKey := a2aConversationKey(a2aTestCaller, "busy")
+	activeKey := a2aConversationKey(a2aTestCaller, "active")
+	user := lib.Message{Role: a2aRoleUser, Parts: textParts("go"), MessageID: "m-1"}
+	if _, ok := d.claimTurn(context.Background(), busyKey, a2aTestCaller, "busy", user, time.Now().Add(a2aSubmitWait)); !ok {
+		t.Fatal("claim")
+	}
+	d.mu.Lock()
+	active := d.conversationLocked(activeKey)
+	d.mu.Unlock()
+	d.TaskStarted(activeKey, "task-live")
+	d.mu.Lock()
+	busy := d.conversations[busyKey]
+	for i := 0; i < a2aMaxConversations+16; i++ {
+		d.conversationLocked(a2aConversationKey(a2aTestCaller, fmt.Sprintf("idle-%d", i)))
+	}
+	n := len(d.conversations)
+	sameBusy := d.conversations[busyKey] == busy
+	sameActive := d.conversations[activeKey] == active
+	_, oldestIdle := d.conversations[a2aConversationKey(a2aTestCaller, "idle-0")]
+	d.mu.Unlock()
+	if !sameBusy || !sameActive {
+		t.Fatalf("a live conversation was evicted at the cap (busy kept=%v, active kept=%v)", sameBusy, sameActive)
+	}
+	if n != a2aMaxConversations {
+		t.Errorf("%d conversations held, want the cap %d", n, a2aMaxConversations)
+	}
+	if oldestIdle {
+		t.Error("the oldest idle conversation survived while the cap was enforced")
+	}
+}
+
+// TestA2AConversationTaskLogIsBounded: a caller that keeps one contextId for
+// the life of the pod does not grow the conversation's task log without
+// bound; a waiter positioned past the eviction is told so rather than
+// answered from the wrong id.
+func TestA2AConversationTaskLogIsBounded(t *testing.T) {
+	d := bareDoor(t)
+	key := a2aConversationKey(a2aTestCaller, "forever")
+	n := injectMaxEntries + 10
+	for i := 0; i < n; i++ {
+		d.TaskStarted(key, fmt.Sprintf("task-%d", i))
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	conv := d.conversations[key]
+	if conv.tasks.total != n || len(conv.tasks.ids) != injectMaxEntries {
+		t.Fatalf("log total=%d ids=%d, want total %d and ids capped at %d", conv.tasks.total, len(conv.tasks.ids), n, injectMaxEntries)
+	}
+	if _, evicted := conv.tasks.at(0); !evicted {
+		t.Error("a waiter at position 0 is not told its id was evicted")
+	}
+	if id, evicted := conv.tasks.at(n - 1); evicted || id != fmt.Sprintf("task-%d", n-1) {
+		t.Errorf("at(last) = %q evicted=%v", id, evicted)
+	}
+}
+
 // TestA2ACardIsServedWithoutAToken: discovery reads the card before it knows
 // which scheme to present, so the card is the one unauthenticated route, and
 // it says the endpoint wants a bearer token.
@@ -562,11 +770,11 @@ func TestA2ADoorRefusesToBuildWithoutAToken(t *testing.T) {
 // TestA2AConfigGuards: the door alone starts a gateway, and a listen address
 // without a token is refused.
 func TestA2AConfigGuards(t *testing.T) {
-	t.Setenv("NATS_URL", "nats://127.0.0.1:4222")
+	// setBaseEnv first, so a developer's exported knobs (a Slack pair, a
+	// door map path, a spawn flag) cannot leak into either FromEnv below.
+	setBaseEnv(t)
 	t.Setenv("A2A_ATTRIBUTION_SALT", "test-salt")
 	t.Setenv("DISCORD_TOKEN", "")
-	t.Setenv("A2A_GCHAT_RELAY_URL", "")
-	t.Setenv("A2A_INJECT_LISTEN", "")
 	t.Setenv("A2A_DOOR_LISTEN", "127.0.0.1:9999")
 	t.Setenv("A2A_DOOR_TOKEN", "")
 	if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), "A2A_DOOR_TOKEN") {

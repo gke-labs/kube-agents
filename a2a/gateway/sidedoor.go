@@ -107,12 +107,6 @@ func (s *sideDoorAdapter) doorFor(conversation string) SideDoor {
 	return nil
 }
 
-// forDoor reports whether a conversation belongs to the inject door. Kept
-// for the tests that ask the question of the single-door composite.
-func forDoor(conversation string) bool {
-	return strings.HasPrefix(conversation, injectKeyPrefix)
-}
-
 // Run delivers from every ingress until ctx is done, or until any stops on
 // its own.
 //
@@ -264,6 +258,18 @@ func (s *sideDoorAdapter) CancelPublished(conversation, taskID string) {
 		door.CancelPublished(conversation, taskID)
 	} else if observer, ok := s.primaryObserver(); ok {
 		observer.CancelPublished(conversation, taskID)
+	}
+}
+
+// TaskDelivered routes like the TaskObserver calls: the owning door, else
+// the primary when it implements DeliverableObserver.
+func (s *sideDoorAdapter) TaskDelivered(conversation, taskID, result string) {
+	if door := s.doorFor(conversation); door != nil {
+		if observer, ok := door.(DeliverableObserver); ok {
+			observer.TaskDelivered(conversation, taskID, result)
+		}
+	} else if observer, ok := s.primary.(DeliverableObserver); ok {
+		observer.TaskDelivered(conversation, taskID, result)
 	}
 }
 

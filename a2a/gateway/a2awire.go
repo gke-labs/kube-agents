@@ -122,13 +122,35 @@ type a2aIDParams struct {
 	Metadata      map[string]any `json:"metadata,omitempty"`
 }
 
+// a2aMessage is a Message as the door emits it inside a Task: lib.Message's
+// fields plus the `kind` discriminator the JSON-RPC binding requires on every
+// Message. lib.Message has none because the bus carries kind on the envelope
+// and its payload structs are views, never re-serialised onto a wire; the
+// door re-serialises, so it carries its own type. a2aMessageObject is the
+// same shape for a top-level reply.
+type a2aMessage struct {
+	Role      string     `json:"role"`
+	Parts     []lib.Part `json:"parts"`
+	MessageID string     `json:"messageId"`
+	TaskID    string     `json:"taskId,omitempty"`
+	ContextID string     `json:"contextId,omitempty"`
+	Kind      string     `json:"kind"`
+}
+
+// a2aTaskStatus is lib.TaskStatus with the door's Message type.
+type a2aTaskStatus struct {
+	State   lib.TaskState `json:"state"`
+	Message *a2aMessage   `json:"message,omitempty"`
+	TS      string        `json:"timestamp,omitempty"`
+}
+
 // a2aTaskObject is the A2A Task as the door returns it.
 type a2aTaskObject struct {
 	ID        string         `json:"id"`
 	ContextID string         `json:"contextId"`
-	Status    lib.TaskStatus `json:"status"`
+	Status    a2aTaskStatus  `json:"status"`
 	Artifacts []lib.Artifact `json:"artifacts,omitempty"`
-	History   []lib.Message  `json:"history,omitempty"`
+	History   []a2aMessage   `json:"history,omitempty"`
 	Metadata  map[string]any `json:"metadata,omitempty"`
 	Kind      string         `json:"kind"`
 }

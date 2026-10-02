@@ -290,9 +290,12 @@ func New(o Options) (*Gateway, error) {
 			return nil, err
 		}
 		a2aAudience = a2aPM.Section(a2aPrincipalPrefix, injectEvalPrincipalPrefix)
-		if a2aPM.Len() == 0 {
-			log.Warn("the A2A door's principal map is empty; every message through it will be dropped at verification",
-				"path", o.Config.A2ADoorPrincipalMapPath)
+		// Counted on the section the door honours, not the raw file: a map
+		// whose lines forgot the a2a: prefix or point outside eval: has
+		// entries and admits nobody.
+		if a2aAudience.Len() == 0 {
+			log.Warn("the A2A door's principal map carries no a2a: entry mapped to an eval: identity; every message through it will be dropped at verification",
+				"path", o.Config.A2ADoorPrincipalMapPath, "entries", a2aPM.Len())
 		}
 	}
 	gchatAllowed := map[string]bool{}
@@ -901,6 +904,17 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		if terminalSubject == lib.TaskSupervisorSubject(addressee, active.TaskID) {
 			source = TerminalFromSupervisor
 		}
+		// The deliverable too, from the stream, for the same program: the
+		// status card posted above never carries the result's text, and
+		// a door that inferred its artifact from the last post would hand
+		// the card over as the answer.
+		if task.State == lib.StateCompleted {
+			if art := task.Artifact(lib.ArtifactResult); art != nil {
+				if result := joinTextParts(art.Parts); result != "" {
+					g.observeTaskDelivered(rec.Key, active.TaskID, result)
+				}
+			}
+		}
 		g.observeTaskTerminal(rec.Key, active.TaskID, task.State, source, finalMessageText(task))
 		healed, healedSource = true, source
 	case isTaskNotFound(err) && !active.SubmittedAt.IsZero() &&
@@ -1324,6 +1338,14 @@ func (g *Gateway) observeTaskStarted(conversation, taskID string) {
 func (g *Gateway) observeTaskTerminal(conversation, taskID string, state lib.TaskState, source TerminalSource, reason string) {
 	if observer, ok := g.adapter.(TaskObserver); ok {
 		observer.TaskTerminal(conversation, taskID, state, source, reason)
+	}
+}
+
+// observeTaskDelivered hands a DeliverableObserver the completed task's
+// result whole, before the relay posts it in chunks. See the interface.
+func (g *Gateway) observeTaskDelivered(conversation, taskID, result string) {
+	if observer, ok := g.adapter.(DeliverableObserver); ok {
+		observer.TaskDelivered(conversation, taskID, result)
 	}
 }
 
