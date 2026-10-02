@@ -17,6 +17,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -131,6 +132,10 @@ USER = "U1"
 MESSAGE_TS = "222.000"
 THREAD = "111.000"
 ACTION_TS = "333.000"
+#: The longest text Slack keeps in a message; a typed reply cannot be longer.
+SLACK_TEXT_LIMIT = 40000
+#: How long matching a reply that long may take.
+FAST_SECONDS = 0.25
 
 
 def _run(coro):
@@ -876,6 +881,16 @@ class RuntimeTest(unittest.TestCase):
                 adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": text, "ts": "223.000"}])
                 self._options_incident(adapter, *labels)
                 check(adapter)
+
+    def test_a_reply_of_unclosed_links_stays_linear(self):
+        # Each "<http://" scanned to the end of the text for a ">" that never comes.
+        options = frozenset({("A", "drain checkout.example.com")})
+        for run in ("<http://", "<http://a|", "<http://a|" + "|" * 20):
+            text = "apply A: " + run * (SLACK_TEXT_LIMIT // len(run))
+            with self.subTest(run=run[:12]):
+                start = time.monotonic()
+                self.assertFalse(runtime._typed_apply(text, options))
+                self.assertLess(time.monotonic() - start, FAST_SECONDS)
 
     def test_a_colon_on_a_message_without_the_option_buttons_does_not_drop_the_click(self):
         adapter = _Adapter(replies=[

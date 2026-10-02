@@ -158,7 +158,8 @@ SLACK_ESCAPES = (("&lt;", "<"), ("&gt;", ">"), ("&amp;", "&"))
 OPTION_TEXT_END = ".! "
 
 #: A link Slack made of a typed url or hostname: ``<url|as typed>``, or ``<url>`` when the url was typed.
-SLACK_LINK = re.compile(r"<(https?://[^|>]+)(?:\|([^>]*))?>")
+#: Neither part runs past a ``<``: an unclosed link is given up at the next one, not at the end of the reply.
+SLACK_LINK = re.compile(r"<(https?://[^|>\s<]+)(?:\|([^>\n<]*))?>")
 
 #: The one reply subtype that is still a person typing: "also send to channel".
 TYPED_SUBTYPES = frozenset({"thread_broadcast"})
