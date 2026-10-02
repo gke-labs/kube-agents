@@ -370,7 +370,8 @@ class RuntimeTest(unittest.TestCase):
 
     def test_choice_is_the_clickers_turn_with_an_echo(self):
         adapter = _Adapter()
-        self._answer(adapter, *_choice())
+        with self.assertNoLogs(runtime.logger, level="WARNING"):
+            self._answer(adapter, *_choice())
         self.assertEqual([entry[0] for entry in adapter.log], ["chat_update", "chat_postMessage", "message"])
         update, echo, turn = (entry[1] for entry in adapter.log)
         self.assertEqual((update["channel"], update["ts"]), (CHANNEL, MESSAGE_TS))
@@ -435,7 +436,7 @@ class RuntimeTest(unittest.TestCase):
         with self.assertLogs(runtime.logger, level="WARNING") as logs:
             self._answer(adapter, body, action)
         self.assertEqual(adapter.log, [])
-        self.assertTrue(any("dropping a kage choice click" in line for line in logs.output))
+        self.assertTrue(any("dropping a kage choice click" in line and "no button text" in line for line in logs.output))
 
     def test_command_shaped_label_is_an_answer_not_a_command(self):
         for label in ("/stop", "!approve"):
@@ -496,8 +497,10 @@ class RuntimeTest(unittest.TestCase):
 
     def test_empty_label_does_nothing(self):
         adapter = _Adapter()
-        self._answer(adapter, *_choice(value="  "))
+        with self.assertLogs(runtime.logger, level="WARNING") as logs:
+            self._answer(adapter, *_choice(value="  "))
         self.assertEqual(adapter.log, [])
+        self.assertTrue(any("with no button text" in line for line in logs.output))
 
     def test_link_click_is_acked_only(self):
         acks = []

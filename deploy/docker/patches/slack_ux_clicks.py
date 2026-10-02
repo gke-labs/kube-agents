@@ -183,10 +183,15 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
         return
     team_id, action_id, _value, message, msg_ts, channel_id, _user_name, user_id = started
     label = _shown_text(action)
-    if not (label and msg_ts and channel_id and user_id):
+    missing = [
+        name
+        for name, field in (("button text", label), ("message ts", msg_ts), ("channel", channel_id), ("user", user_id))
+        if not field
+    ]
+    if missing:
         logger.warning(
-            "slack_ux_clicks: dropping a %s click on %s with no button text, message ts, channel or user",
-            kind, msg_ts or "an unknown message",
+            "slack_ux_clicks: dropping a %s click on %s with no %s",
+            kind, msg_ts or "an unknown message", ", ".join(missing),
         )
         return
     if _gated_out(adapter, channel_id):
