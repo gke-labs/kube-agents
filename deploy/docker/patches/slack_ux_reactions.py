@@ -339,8 +339,8 @@ def _creator_unseen(before: dict, after: dict, finished: dict) -> bool:
 
     The closed case is not only a link in a chain: an earlier ask's follow-up
     that gave up within the turn but is not in the end read (filed after its
-    snapshot, or archived) has no creator in either read, and counted as the
-    turn's it would turn the ask ❌.
+    snapshot) has no creator in either read, and counted as the turn's it
+    would turn the ask ❌.
     """
     return any(
         card not in after or (after[card].creator and (card[0], after[card].creator) not in after)
