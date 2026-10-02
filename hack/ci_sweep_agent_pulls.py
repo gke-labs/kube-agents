@@ -143,6 +143,9 @@ TOKEN_PERMISSIONS = {"pull_requests": "write", "contents": "write", "issues": "w
 # GitHub's answers for a ref that is already gone: 422 "Reference does not
 # exist", or 404. Neither is a failure -- the branch is what was wanted absent.
 REF_GONE_CODES = (404, 422)
+# GitHub's answer to deleting a branch a ruleset or protection keeps: kept
+# and reported, not a fault -- a protected branch is nobody's leftover.
+BRANCH_REFUSED_CODE = 403
 
 PER_PAGE = 100
 # A bound rather than a budget: orders of magnitude above any pool repository,
@@ -542,7 +545,11 @@ def close_agent_pulls(repo, authorization, bot_login, dry_run=False, budget=None
         deferred = set()
         for pull in pulls:
             if not is_agent_pull_request(pull, repo, bot_login):
-                still_open.add(str((pull.get("head") or {}).get("ref") or ""))
+                # Only a head in this repository keeps a branch here: a fork's
+                # head shares a name with nothing the branch pass could reach.
+                head = pull.get("head") or {}
+                if str((head.get("repo") or {}).get("full_name") or "").lower() == repo.lower():
+                    still_open.add(str(head.get("ref") or ""))
                 continue
             number = pull["number"]
             ref = pull["head"]["ref"]
@@ -628,6 +635,14 @@ def close_agent_pulls(repo, authorization, bot_login, dry_run=False, budget=None
             except RateLimited as exc:
                 exc.closed = closed
                 raise
+            except urllib.error.HTTPError as exc:
+                if exc.code == BRANCH_REFUSED_CODE:
+                    # A ruleset or protection keeps it: not the agent's
+                    # leftover, reported and not a fault of this repository.
+                    print("  branch %s kept, GitHub refused the delete (%s); a protected branch is not a leftover" % (ref, boskos_pool.describe(exc)))
+                    continue
+                print("  %s was not deleted (%s)" % (ref, boskos_pool.describe(exc)), file=sys.stderr)
+                undeleted.append(ref)
             except CALL_FAULTS as exc:
                 print("  %s was not deleted (%s)" % (ref, boskos_pool.describe(exc)), file=sys.stderr)
                 undeleted.append(ref)

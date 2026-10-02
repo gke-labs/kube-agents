@@ -94,9 +94,9 @@ MAX_PAGES = 10
 #: page, whose number the pulls endpoint's commit total gives, as
 #: ``pull_request_opened`` reads it.
 PR_COMMITS_PAGE_SIZE = 100
-#: How many prefixed branches with no pull request are dated per check. Each
-#: costs one call; a repository the sweep has kept clean has none, and one
-#: past this bound is reported as not fully inspected rather than walked.
+#: How many branches with no pull request are dated per check. Each costs
+#: one call; a repository the reset has kept clean has none, and one past
+#: this bound is reported as not fully inspected rather than walked.
 BRANCH_INSPECTION_CAP = 20
 
 HOW_OPENED = "opened"
@@ -306,19 +306,26 @@ class GitHubClient:
                 break
         return names
 
-    def branch_tip_date(self, repo: str, branch: str) -> datetime | None:
-        """When the branch's tip commit was committed, or None when GitHub
-        would not say (the read wants ``contents: read`` too)."""
+    def branch_tip(self, repo: str, branch: str) -> tuple[datetime | None, str]:
+        """When the branch's tip commit was committed and which GitHub login
+        made it (the author's, else the committer's, "" when GitHub resolved
+        neither), or (None, "") when GitHub would not say (the read wants
+        ``contents: read`` too)."""
         status, payload = self.get(
             f"/repos/{repo}/branches/{urllib.parse.quote(branch, safe='/')}"
         )
         if status in (STATUS_FORBIDDEN, STATUS_NOT_FOUND):
-            return None
+            return None, ""
         self._refuse(status, repo, f"the branch {branch}", "contents: read")
         commit = ((payload or {}).get("commit") or {}) if isinstance(payload, dict) else {}
         inner = commit.get("commit") or {}
         committer = inner.get("committer") or {}
-        return parse_github_time(committer.get("date"))
+        login = ""
+        for who in ("author", "committer"):
+            login = str(((commit.get(who) or {}) if isinstance(commit.get(who), dict) else {}).get("login") or "")
+            if login:
+                break
+        return parse_github_time(committer.get("date")), login
 
     @staticmethod
     def _refuse(status: int, repo: str, what: str, permission: str) -> None:
@@ -390,7 +397,10 @@ def find_writes(
     close correctly and a push of an older commit the same way -- the refs
     API carries no push time, so the head's committer date is what there
     is). A branch counts when it is not the default, heads no pull request
-    at all, and its tip was committed in the window (``tip committed``). Raises
+    at all, its tip was committed in the window (``tip committed``), and the
+    tip's author is a ``[bot]`` login (or ``author``): the branches API
+    carries no author, the tip commit does, and a branch a human pushed is
+    not the agent's write. Raises
     :class:`GitHubUnreadable` when the pull-request listing cannot be read;
     a branch listing the credential cannot make is a note, not an error.
     """
@@ -448,14 +458,21 @@ def find_writes(
     heads_with_pulls = client.all_pull_heads(repo)
     orphans = [b for b in branches if b not in heads_with_pulls]
     for branch in orphans[:BRANCH_INSPECTION_CAP]:
-        tip = client.branch_tip_date(repo, branch)
+        tip, login = client.branch_tip(repo, branch)
         if tip is None:
             report.notes.append(f"branch {branch}: GitHub would not date its tip")
             continue
-        if tip >= since:
-            report.writes.append(
-                GitHubWrite(kind=KIND_BRANCH, branch=branch, when=tip, how=HOW_TIP_COMMITTED)
+        if tip < since:
+            continue
+        if (author and login.lower() != author.lower()) or (not author and not login.endswith(BOT_LOGIN_SUFFIX)):
+            report.notes.append(
+                f"branch {branch} was pushed in the window by {login or 'a login GitHub did not resolve'}, "
+                "not the agent's bot, so it is not counted"
             )
+            continue
+        report.writes.append(
+            GitHubWrite(kind=KIND_BRANCH, branch=branch, when=tip, how=HOW_TIP_COMMITTED)
+        )
     if len(orphans) > BRANCH_INSPECTION_CAP:
         report.notes.append(
             f"{len(orphans) - BRANCH_INSPECTION_CAP} more branch(es) with no pull request "

@@ -42,6 +42,7 @@ JSON beside the job's artifacts, so every run carries its own proof;
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import pathlib
@@ -67,13 +68,29 @@ REF_GONE_CODES = (404, 422)
 # A second between writes, GitHub's published burst limit for an App. A lease
 # with a dozen leftovers costs under a minute; the sweep paces the same way.
 WRITE_PAUSE_SECONDS = 1.0
-# A transient answer -- a 5xx, a 429, a connection that dropped or timed out
-# -- is tried again, twice, 2 s then 8 s apart, as the ledger mint is: this
-# fails closed, so one such answer would otherwise grade a repetition MISSING
-# on a GitHub hiccup. A 4xx other than 429 is the request's fault and is not.
+# A transient answer -- a 5xx, a connection that dropped, timed out or was
+# cut short mid-read -- is tried again, twice, 2 s then 8 s apart, as the
+# ledger mint is: this fails closed, so one such answer would otherwise grade
+# a repetition MISSING on a GitHub hiccup. A refusal GitHub marks as its burst
+# limit (a 429, or a 403 with a Retry-After, a spent X-RateLimit-Remaining or
+# a body naming a limit) waits what GitHub asks, as the sweep does, a minute
+# when it names nothing and two at most. Any other 4xx is the request's fault
+# and is not retried.
 RETRY_DELAYS_SECONDS = (2, 8)
 RETRYABLE_STATUS_FLOOR = 500
 TOO_MANY_REQUESTS = 429
+RATE_LIMITED_CODE = 403
+RETRY_AFTER_HEADER = "Retry-After"
+RATELIMIT_REMAINING_HEADER = "X-RateLimit-Remaining"
+RATE_LIMIT_BODY_MARKERS = ("rate limit", "abuse detection")
+RETRY_AFTER_DEFAULT_SECONDS = 60
+RETRY_AFTER_MAX_SECONDS = 120
+# GitHub's answer to deleting a branch a ruleset or protection keeps: not a
+# leftover the agent made, so kept and reported rather than failing the unit.
+BRANCH_REFUSED_CODE = 403
+# What a GitHub call can raise: urllib's HTTPError, the socket's OSError, and
+# http.client's own faults for a response cut short, which urllib passes on.
+CALL_FAULTS = (urllib.error.HTTPError, OSError, http.client.HTTPException)
 RECORD_SCHEMA_VERSION = 1
 ISO_UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -81,20 +98,48 @@ pause = time.sleep
 ResetError = ledgers.ResetError
 
 
+def is_rate_limited(exc: urllib.error.HTTPError) -> bool:
+    """A 429, or a 403 GitHub marks as its burst limit rather than a permission."""
+    if exc.code == TOO_MANY_REQUESTS:
+        return True
+    if exc.code != RATE_LIMITED_CODE:
+        return False
+    headers = getattr(exc, "headers", None) or {}
+    if headers.get(RETRY_AFTER_HEADER) is not None or str(headers.get(RATELIMIT_REMAINING_HEADER, "")).strip() == "0":
+        return True
+    try:
+        body = exc.read().decode("utf-8", "replace").lower()
+    except (OSError, ValueError, AttributeError):
+        body = ""
+    return any(marker in body for marker in RATE_LIMIT_BODY_MARKERS)
+
+
+def retry_after(exc: urllib.error.HTTPError) -> int:
+    """Seconds GitHub asked for, bounded; the default when it named none."""
+    raw = (getattr(exc, "headers", None) or {}).get(RETRY_AFTER_HEADER)
+    try:
+        seconds = int(raw)
+    except (TypeError, ValueError):
+        return RETRY_AFTER_DEFAULT_SECONDS
+    return max(0, min(seconds, RETRY_AFTER_MAX_SECONDS))
+
+
 def transient(exc: BaseException) -> bool:
     if isinstance(exc, urllib.error.HTTPError):
-        return exc.code >= RETRYABLE_STATUS_FLOOR or exc.code == TOO_MANY_REQUESTS
-    return isinstance(exc, OSError)
+        return exc.code >= RETRYABLE_STATUS_FLOOR or is_rate_limited(exc)
+    return isinstance(exc, (OSError, http.client.HTTPException))
 
 
 def call(method: str, path: str, token: str, body: dict | None = None):
     """One GitHub call, tried again after a transient answer."""
-    for attempt, delay in enumerate((*RETRY_DELAYS_SECONDS, None)):
+    for delay in (*RETRY_DELAYS_SECONDS, None):
         try:
             return ledgers.api(method, path, token, body)
-        except (urllib.error.HTTPError, OSError) as exc:
+        except CALL_FAULTS as exc:
             if delay is None or not transient(exc):
                 raise
+            if isinstance(exc, urllib.error.HTTPError) and is_rate_limited(exc):
+                delay = retry_after(exc)
             print(f"  {method} {path} answered {exc}; trying again in {delay}s", file=sys.stderr)
             pause(delay)
     raise AssertionError("unreachable")
@@ -176,6 +221,13 @@ def _head_ref(pull: dict) -> str:
     return str((pull.get("head") or {}).get("ref") or "")
 
 
+def _head_in_repo(pull: dict, repo: str) -> bool:
+    """The head branch lives in the repository itself, not in a fork: only
+    that branch is one the branch pass could delete from under a pull request."""
+    head = pull.get("head") or {}
+    return str((head.get("repo") or {}).get("full_name") or "").lower() == repo.lower()
+
+
 def new_record(repo: str, project: str, build: str, scope: str, dry_run: bool) -> dict:
     """What a call reports, before anything is read: the caller writes it on
     every exit, so the reset that faulted is the one with a record too."""
@@ -197,6 +249,7 @@ def new_record(repo: str, project: str, build: str, scope: str, dry_run: bool) -
         "deleted": [],
         "undeleted": [],
         "kept_branches": [],
+        "protected": [],
         "open_after": None,
         "branches_after": None,
         "clean": False,
@@ -213,14 +266,16 @@ def reset(repo: str, project: str, build: str, scope: str, token: str, dry_run: 
     agent_pulls = [pull for pull in pulls if is_agent_pull_request(pull, repo)]
     agent_numbers = {pull.get("number") for pull in agent_pulls}
     record["open_before"] = len(agent_pulls)
-    # Heads an open pull request that stays still needs: a human's, or one of
-    # the agent's that would not close below.
+    # Heads in this repository an open pull request that stays still needs: a
+    # human's, or one of the agent's that would not close below. A fork's head
+    # shares a name with nothing here, so it keeps no branch.
     heads_in_use: set[str] = set()
     for pull in pulls:
         if pull.get("number") not in agent_numbers:
             record["kept_open"].append(pull.get("number"))
             print(f"  #{pull.get('number', '?')} left open, not the agent's ({_head_ref(pull)})")
-            heads_in_use.add(_head_ref(pull))
+            if _head_in_repo(pull, repo):
+                heads_in_use.add(_head_ref(pull))
     for pull in agent_pulls:
         number = pull["number"]
         ref = _head_ref(pull)
@@ -237,7 +292,7 @@ def reset(repo: str, project: str, build: str, scope: str, token: str, dry_run: 
                 write("POST", f"/repos/{repo}/issues/{number}/labels", token, {"labels": [STALE_CLOSED_LABEL]})
                 record["labelled"].append(number)
             write("PATCH", f"/repos/{repo}/pulls/{number}", token, {"state": "closed"})
-        except (urllib.error.HTTPError, OSError) as exc:
+        except CALL_FAULTS as exc:
             print(f"  #{number} did not close ({exc})", file=sys.stderr)
             record["unclosed"].append(number)
             heads_in_use.add(ref)
@@ -256,7 +311,17 @@ def reset(repo: str, project: str, build: str, scope: str, token: str, dry_run: 
             continue
         try:
             delete_branch(repo, name, token)
-        except (urllib.error.HTTPError, OSError) as exc:
+        except urllib.error.HTTPError as exc:
+            if exc.code == BRANCH_REFUSED_CODE:
+                # A ruleset or protection keeps it: not the agent's leftover,
+                # and not a reason to refuse the unit, so reported and kept.
+                print(f"  branch {name} kept, GitHub refused the delete ({exc}); a protected branch is not a leftover")
+                record["protected"].append(name)
+                continue
+            print(f"  branch {name} was not deleted ({exc})", file=sys.stderr)
+            record["undeleted"].append(name)
+            continue
+        except (OSError, http.client.HTTPException) as exc:
             print(f"  branch {name} was not deleted ({exc})", file=sys.stderr)
             record["undeleted"].append(name)
             continue
@@ -268,8 +333,9 @@ def reset(repo: str, project: str, build: str, scope: str, token: str, dry_run: 
     # what the unit's agent would find.
     after_pulls = open_pulls(repo, token)
     still_agent = [pull["number"] for pull in after_pulls if is_agent_pull_request(pull, repo)]
-    heads_after = {_head_ref(pull) for pull in after_pulls}
-    still_branches = [name for name in branches(repo, token) if name != default and name not in heads_after]
+    heads_after = {_head_ref(pull) for pull in after_pulls if _head_in_repo(pull, repo)}
+    kept = heads_after | set(record["protected"])
+    still_branches = [name for name in branches(repo, token) if name != default and name not in kept]
     record["open_after"] = len(still_agent)
     record["branches_after"] = len(still_branches)
     record["clean"] = not still_agent and not still_branches
@@ -317,7 +383,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    except OSError as exc:
+    except (OSError, http.client.HTTPException) as exc:
         record["error"] = f"could not reach api.github.com ({type(exc).__name__}: {exc})"
         print(f"ERROR: {record['error']}", file=sys.stderr)
         return 1

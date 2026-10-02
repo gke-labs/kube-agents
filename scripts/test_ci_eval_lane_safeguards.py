@@ -112,6 +112,7 @@ def run_step(env: dict | None = None, tasks: list[str] | None = None, lane_file:
             'echo "REPO=${BENCH_GITOPS_REPO-<unset>}"',
             'echo "REQUESTING=${INJECT_LANE_REQUESTING-<unset>}"',
             'echo "DIR=${INJECT_LANE_TASKS_DIR-<unset>}"',
+            'echo "PAUSE=${WRITER_LAUNCH_PAUSE-<unset>}"',
             'for t in "${TASKS[@]}"; do n="$(basename "$(dirname "${t}")")"; echo "PATH ${n} $(unit_task_path "${t}" "${n}")"; done',
         ]
     )
@@ -164,6 +165,10 @@ class ApiLaneUntouchedTest(unittest.TestCase):
                     self.assertEqual(path, f"./tasks/{name}/task.yaml")
                 self.assertNotIn("carries the lane's safeguards", result.stdout)
                 self.assertIn("each after the repository is reset", result.stdout)
+                # The writer phase on this lane grades no window, so its units
+                # keep the launch stagger, not the inject lane's settle.
+                self.assertEqual(value(result, "PAUSE"), "5")
+                self.assertEqual(value(result, "PAUSE"), lifted_block(r"^readonly EVAL_UNIT_LAUNCH_STAGGER_SECONDS=(\d+)\n").split("=")[1].strip())
 
     def test_a_lane_file_that_cannot_be_read_stops_the_api_lane_too(self):
         # The requesting list is what orders the second phase, and the reset
@@ -178,6 +183,8 @@ class InjectLaneTest(unittest.TestCase):
         result = run_step({"AGENT_TRANSPORT": "inject", "EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(value(result, "REPO"), "gke-agentic/kube-agents-evals-21-infra")
+        # This lane's writer units wait the safeguard's settle, not the stagger.
+        self.assertEqual(value(result, "PAUSE"), "120")
         scratch = pathlib.Path(value(result, "DIR"))
         self.assertTrue(scratch.is_dir())
         paths = dict(line.split(" ", 1) for line in tagged(result, "PATH"))

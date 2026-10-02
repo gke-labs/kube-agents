@@ -1257,7 +1257,8 @@ eval_gitops_repo() { # <project-id>
 }
 
 # Emits the token on stdout, nothing else; diagnostics on stderr. Narrowed
-# twice at mint, to the one repository and to issues: write. One retry on a
+# twice at mint, to the one repository and to the permissions asked for
+# (issues: write when none are named). One retry on a
 # transient failure, as mint_ledger_token does; a 422 comes back on the
 # first attempt and means the grant is missing.
 ledger_reset_token() { # <owner/repo> [permissions JSON; issues: write when omitted]

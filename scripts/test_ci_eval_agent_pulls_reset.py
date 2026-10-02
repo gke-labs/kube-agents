@@ -20,6 +20,7 @@ lifted out of the script):
 
 from __future__ import annotations
 
+import http.client
 import importlib.util
 import io
 import json
@@ -199,6 +200,31 @@ class ResetTest(unittest.TestCase):
         self.assertEqual(record["deleted"], ["b2"])
         self.assertFalse(record["clean"])
 
+    def test_a_fork_pull_requests_head_name_shields_no_branch_here(self):
+        # A human's pull request from a fork named like a leftover branch in
+        # this repository keeps nothing: only a head in the repository itself
+        # is one the branch pass could pull from under a pull request.
+        github = FakeGitHub(
+            pulls=[pull(9, author="a-human", branch="fix-payments-api-oom", head_repo="someone/kube-agents-evals-2-infra")],
+            branches=["fix-payments-api-oom"],
+        )
+        record, _, _ = run_reset(github)
+        self.assertEqual(record["kept_open"], [9])
+        self.assertEqual(record["deleted"], ["fix-payments-api-oom"])
+        self.assertEqual(record["kept_branches"], [])
+        self.assertTrue(record["clean"])
+
+    def test_a_branch_github_refuses_to_delete_is_kept_as_protected_not_a_failure(self):
+        # A ruleset or protection on it: not the agent's leftover, so the
+        # unit still runs and the record says what was kept.
+        github = FakeGitHub(pulls=[pull(1)], branches=["fix-payments-api-oom", "release"], fail={("DELETE", "release"): _http_error(403)})
+        record, out, err = run_reset(github)
+        self.assertEqual(record["protected"], ["release"])
+        self.assertEqual(record["undeleted"], [])
+        self.assertEqual(record["deleted"], ["fix-payments-api-oom"])
+        self.assertTrue(record["clean"], (out, err))
+        self.assertIn("a protected branch is not a leftover", out)
+
     def test_every_branch_but_the_default_goes_whatever_its_name(self):
         github = FakeGitHub(branches=["fix-payments-api-oom", "feature/add-seeded-c", "platform-agent/orphan"], default="main")
         record, _, _ = run_reset(github)
@@ -281,6 +307,27 @@ class RetryTest(unittest.TestCase):
         record, _ = self.run_with(self.flaky([(("PATCH", f"/repos/{REPO}/pulls/1"), OSError("connection reset"))], github))
         self.assertEqual((record["closed"], record["unclosed"]), ([1], []))
 
+    def test_a_response_cut_short_is_tried_again(self):
+        # http.client's own faults are not OSErrors and urllib passes them on
+        # unwrapped; a close that meets one is retried like a dropped socket.
+        github = FakeGitHub(pulls=[pull(1)], branches=["fix-payments-api-oom"])
+        record, pauses = self.run_with(self.flaky([(("PATCH", f"/repos/{REPO}/pulls/1"), http.client.IncompleteRead(b""))], github))
+        self.assertEqual((record["closed"], record["unclosed"]), ([1], []))
+        self.assertIn(helper.RETRY_DELAYS_SECONDS[0], pauses)
+
+    def test_a_403_github_marks_as_its_limit_waits_what_it_asks(self):
+        github = FakeGitHub(pulls=[pull(1)], branches=["fix-payments-api-oom"])
+        limited = urllib.error.HTTPError("https://api.github.com/x", 403, "Forbidden", {"Retry-After": "7"}, io.BytesIO(b""))
+        record, pauses = self.run_with(self.flaky([(("PATCH", f"/repos/{REPO}/pulls/1"), limited)], github))
+        self.assertEqual(record["closed"], [1])
+        self.assertIn(7, pauses)
+        # A 403 that carries none of the limit's marks is a refusal.
+        self.assertFalse(helper.is_rate_limited(_http_error(403)))
+        self.assertTrue(helper.is_rate_limited(urllib.error.HTTPError("u", 403, "F", {"X-RateLimit-Remaining": "0"}, io.BytesIO(b""))))
+        self.assertTrue(helper.is_rate_limited(urllib.error.HTTPError("u", 403, "F", {}, io.BytesIO(b'{"message":"You have exceeded a secondary rate limit"}'))))
+        self.assertEqual(helper.retry_after(urllib.error.HTTPError("u", 429, "L", {"Retry-After": "999"}, io.BytesIO(b""))), helper.RETRY_AFTER_MAX_SECONDS)
+        self.assertEqual(helper.retry_after(_http_error(429)), helper.RETRY_AFTER_DEFAULT_SECONDS)
+
     def test_a_refusal_is_not_tried_again(self):
         github = FakeGitHub(pulls=[pull(1)])
         record, pauses = self.run_with(self.flaky([(("PATCH", f"/repos/{REPO}/pulls/1"), _http_error(403))], github))
@@ -351,6 +398,13 @@ class MainTest(unittest.TestCase):
         rc, _, err = self.run_main(unreachable)
         self.assertEqual(rc, 1)
         self.assertIn("could not reach api.github.com", err)
+
+        def cut_short(method, path, token, body=None):
+            raise http.client.IncompleteRead(b"")
+
+        rc, _, err = self.run_main(cut_short)
+        self.assertEqual(rc, 1, "an http.client fault is a reported fault, never a traceback")
+        self.assertIn("IncompleteRead", err)
 
     def test_dry_run_is_zero_whatever_it_finds(self):
         self.assertEqual(self.run_main(FakeGitHub(pulls=[pull(1)]), "--dry-run")[0], 0)

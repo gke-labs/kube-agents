@@ -49,6 +49,7 @@ API = f"https://api.github.com/repos/{REPO}"
 # (17:32:18Z); #38 (2026-09-25T00:39:54Z) and #37 are the previous leases'.
 RUN_START = datetime(2026, 9, 25, 17, 20, 0, tzinfo=timezone.utc)
 PR39_URL = f"https://github.com/{REPO}/pull/39"
+BOT = "kube-agents-evals-token-minter[bot]"
 WINDOWED_LISTING = f"{API}/pulls?state=all&sort=updated&direction=desc&per_page=100&page=1"
 WHOLE_LISTING = f"{API}/pulls?state=all&per_page=100&page=1"
 REPO_LOOKUP = API
@@ -357,11 +358,11 @@ def test_a_branch_with_no_pull_request_pushed_in_the_window_is_a_write(env, gith
     for name in ("add-checkout-gateway-pdb", "checkout-gateway-pdb", "checkout-gateway-pdb-new", "fix-payments-api"):
         github.routes[f"{API}/branches/platform-agent/{name}"] = (
             200,
-            {"commit": {"commit": {"committer": {"date": "2026-09-20T00:00:00Z"}}}},
+            {"commit": {"author": {"login": BOT}, "commit": {"committer": {"date": "2026-09-20T00:00:00Z"}}}},
         )
     github.routes[f"{API}/branches/platform-agent/fix-checkout-gateway-pdb"] = (
         200,
-        {"commit": {"commit": {"committer": {"date": "2026-09-25T17:41:00Z"}}}},
+        {"commit": {"author": {"login": BOT}, "commit": {"committer": {"date": "2026-09-25T17:41:00Z"}}}},
     )
     res = check().verify(5.0)
     assert res.status == "pass", res.reason
@@ -371,6 +372,26 @@ def test_a_branch_with_no_pull_request_pushed_in_the_window_is_a_write(env, gith
     ]
     # The default branch is never an orphan to date.
     assert f"{API}/branches/main" not in github.calls
+
+
+def test_a_branch_a_human_pushed_in_the_window_is_not_the_agents(env, github):
+    """The branches API carries no author; the tip commit does. A branch a
+    developer pushed during a local run is noted, not counted."""
+    stash()
+    route_listing(github, "pulls-empty.json")
+    route_branches(github, ["platform-agent/fix-checkout-gateway-pdb", "hotfix-by-hand"])
+    github.routes[f"{API}/branches/platform-agent/fix-checkout-gateway-pdb"] = (
+        200,
+        {"commit": {"author": {"login": "a-human"}, "commit": {"committer": {"date": "2026-09-25T17:41:00Z"}}}},
+    )
+    github.routes[f"{API}/branches/hotfix-by-hand"] = (
+        200,
+        {"commit": {"author": None, "committer": {"login": BOT}, "commit": {"committer": {"date": "2026-09-25T17:41:00Z"}}}},
+    )
+    res = check().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert res.raw["unrequested"] == ["branch hotfix-by-hand tip committed at 2026-09-25T17:41:00+00:00, no pull request"]
+    assert "branch platform-agent/fix-checkout-gateway-pdb was pushed in the window by a-human, not the agent's bot" in res.reason
 
 
 def test_a_branch_behind_a_pull_request_is_not_dated_again(env, github):
@@ -404,7 +425,7 @@ def test_orphan_branches_past_the_cap_are_reported_not_walked(env, github, monke
     route_branches(github)
     github.routes[f"{API}/branches/platform-agent/add-checkout-gateway-pdb"] = (
         200,
-        {"commit": {"commit": {"committer": {"date": "2026-09-20T00:00:00Z"}}}},
+        {"commit": {"author": {"login": BOT}, "commit": {"committer": {"date": "2026-09-20T00:00:00Z"}}}},
     )
     res = check().verify(5.0)
     assert res.status == "fail"
