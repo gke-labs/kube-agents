@@ -349,6 +349,9 @@ func New(o Options) (*Gateway, error) {
 	if o.Config.DefaultAddressee == RouteSession && g.spawner == nil {
 		return nil, fmt.Errorf("A2A_DEFAULT_ADDRESSEE=%s requires A2A_SPAWN_SESSIONS=true: without a spawner the sentinel would publish tasks to a literal %q addressee no executor owns", RouteSession, RouteSession)
 	}
+	if o.Config.SessionClusterView && o.Config.CredentialProxyURL == "" {
+		return nil, fmt.Errorf("A2A_SESSION_CLUSTER_VIEW=true requires A2A_CREDENTIAL_PROXY_URL: a session pod with the view and no broker address would have wrappers that dial nothing")
+	}
 	return g, nil
 }
 
