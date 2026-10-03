@@ -1142,6 +1142,18 @@ def test_a_dead_gateway_on_the_opening_tunnel_is_infra_not_an_answer(
     assert len(attempts) == harness._MAX_TRANSPORT_FAILURES
 
 
+def test_agent_url_skips_the_tunnel(stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch) -> None:
+    """From inside the cluster the Service is reachable directly."""
+    monkeypatch.setenv("AGENT_URL", f"http://127.0.0.1:{stub_agent.server_address[1]}/")
+    monkeypatch.setenv("AGENT_LOCAL_PORT", "1")  # the tunnel's port; nothing listens there
+
+    result = KubeAgentsHarness().run("prompt")
+
+    assert not result.has_errors()
+    assert stub_agent.last_request is not None
+    assert stub_agent.session_lookups
+
+
 def test_a_tunnel_that_establishes_on_retry_reaches_the_answer(
     stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3131,3 +3143,18 @@ def test_an_errored_run_still_stamps_a_start(
 
     assert result.has_errors()
     assert transcript.get().started_at > 0.0
+
+
+def test_bench_run_writes_the_trajectory(
+    stub_agent: _StubAgentServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from kube_agents_bench import run
+
+    monkeypatch.setenv("PROJECT_ID", "kind")
+    task = tmp_path / "task.yaml"
+    task.write_text("prompt: Which repositories does {{PROJECT_ID}} use?\n")
+
+    assert run.main([str(task), str(tmp_path / "out")]) == 0
+
+    doc = json.loads((tmp_path / "out" / "trajectory.json").read_text())
+    assert doc["input"][0]["content"][0]["text"] == "Which repositories does kind use?"
