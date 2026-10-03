@@ -191,6 +191,11 @@ class SessionTest(unittest.TestCase):
             with self.subTest(ask=ask):
                 self.assertEqual(s.session_title(ask), title)
 
+    def test_a_typographic_hyphen_stays_a_hyphen(self):
+        for hyphen in ("\u2010", "\u2011"):
+            with self.subTest(char=f"U+{ord(hyphen):04X}"):
+                self.assertEqual(s.session_title(f"kube{hyphen}system restarts"), "kube-system restarts")
+
     def test_no_character_slack_refused_survives(self):
         for refused in RENAME_REFUSED:
             with self.subTest(char=f"U+{ord(refused):04X}"):
