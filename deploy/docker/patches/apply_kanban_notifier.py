@@ -8,7 +8,8 @@ completion handoff and the wake set — the third carries the incident-store
 call, which used to share the wake anchor and no longer can (below), the
 fourth routes the completion message through ``completion_text`` so
 ``KAGE_SLACK_UX`` can drop its head line on Slack, and the fifth settles the
-failure lines that flag held for the wake.
+failure lines that flag held for the wake. One more anchor is substituted
+unchanged: the ``platform_str`` binding the completion message reads.
 
 Where the sites live, as of v2026.9.14. Upstream's September decomposition
 (``fd2bfa1893``) moved the notifier's per-subscription delivery out of the
@@ -257,6 +258,12 @@ COMPLETION_CALL = (
     "_kanban_completion_text(n.head, n.title, handoff, n.platform_str)"
 )
 
+#: The completion call reads ``n.platform_str`` ahead of the flag, and no
+#: other anchor holds it. Pinned unchanged, so an upstream that stops binding
+#: platform_str here fails the build instead of raising AttributeError on every
+#: completion.
+PLATFORM_BINDING = '        self.platform_str = (sub["platform"] or "").lower()\n'
+
 COMPLETION_PATCHED = (
     f"{HANDOFF_INDENT}# kube-agents patch: see gateway/kanban_notifier.py\n"
     f"{HANDOFF_INDENT}return {COMPLETION_CALL}, wake_handoff, None\n"
@@ -348,8 +355,9 @@ TRAILER = (
     ")\n"
 )
 
-#: Text that only exists after a successful run. All five anchors are
-#: destroyed by their own replacement, so a re-run would already fail on
+#: Text that only exists after a successful run. All five edited anchors
+#: are destroyed by their own replacement (the platform_str pin is not, which is
+#: why these run first), so a re-run would already fail on
 #: "found 0" — but that message blames upstream drift for what is actually a
 #: duplicated build step, and before the old delivery applier grew this guard a
 #: second pass exited 0 and left a second hook call and a second trailer import
@@ -372,6 +380,7 @@ def apply(root: Path) -> None:
     """Apply the patch under ``root``, or raise SystemExit with the reason."""
     patch = patchlib.Patch(root, RELATIVE, prefix="kanban_notifier")
     patch.refuse_if_patched(*SENTINELS)
+    patch.substitute(PLATFORM_BINDING, PLATFORM_BINDING, label="platform_str binding")
     for label, anchor, patched in EDITS:
         patch.substitute(anchor, patched, label=label)
     patch.append(TRAILER)

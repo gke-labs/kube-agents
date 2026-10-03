@@ -23,7 +23,10 @@ Four things are checked:
    Every name a hook reads is bound where it runs (``patchlib.unbound``):
    most are evaluated with the flag off too, so an upstream rename of
    ``content`` or ``turn_ctx`` would otherwise raise ``NameError`` on every
-   cron delivery, Slack send or heartbeat.
+   cron delivery, Slack send or heartbeat. ``cron_delivery_text`` reads its
+   target's attributes through ``getattr`` with a default, so upstream's
+   target class must still declare each one: renamed, Slack would quietly get
+   the wrapped report back with nothing failing.
 2. The notices themselves. Each interrupting notice is read out of the patched
    source, rendered, and handed to ``system_text``: with the flag on it must
    come back reworded. ``system_text`` passes text it does not recognise
@@ -70,6 +73,13 @@ DELIVER_FN = "_deliver_result"
 SEND_LANES = ("_deliver_via_live_adapter", "_deliver_standalone")
 TARGET_TEXT = "target_text"
 WRAPPER_HEADER = "Cronjob Response: "
+TARGET_CLASS = "_TargetDelivery"
+TARGET_FACTORY = "_prepare_target_delivery"
+#: What ``cron_delivery_text`` reads off a target. ``drive`` below passes a
+#: SimpleNamespace, so only this check ties the names to upstream's class. Only
+#: ``platform_name`` changes what is sent; the other two feed a log line, and are
+#: pinned anyway so a read the helper makes is never left to a default.
+TARGET_FIELDS = ("platform_name", "chat_id", "job")
 
 RUN_TURN = "gateway/run_turn.py"
 HEARTBEAT_FN = "_run_agent_notify_long_running"
@@ -296,6 +306,37 @@ def check_delivery(root: Path) -> None:
             raise _fail(f"{DELIVER_FN}() does not send {TARGET_TEXT} through {lane}()")
     if WRAPPER_HEADER not in ast.unparse(fn):
         raise _fail(f"{DELIVER_FN}() no longer builds the cron wrapper; the Chat relay routes on it")
+
+
+def check_target_fields(root: Path) -> None:
+    # Fields declared on the class itself only: a field moved to a base class or
+    # turned into a property refuses the build, loudly, until this is re-derived.
+    tree = _tree(root, DELIVERY)
+    sources = [
+        node for node in ast.walk(_function(tree, DELIVER_FN, DELIVERY))
+        if isinstance(node, ast.Assign) and [ast.unparse(t) for t in node.targets] == ["t"]
+    ]
+    if [ast.unparse(node.value.func) for node in sources if isinstance(node.value, ast.Call)] != [TARGET_FACTORY]:
+        raise _fail(f"{DELIVER_FN}() no longer binds t once, from {TARGET_FACTORY}()")
+    factory = _function(tree, TARGET_FACTORY, DELIVERY)
+    if factory.returns is None or TARGET_CLASS not in ast.unparse(factory.returns):
+        raise _fail(f"{TARGET_FACTORY}() is no longer annotated to return {TARGET_CLASS}")
+    classes = [
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == TARGET_CLASS
+    ]
+    if len(classes) != 1:
+        raise _fail(f"{DELIVERY} defines {TARGET_CLASS} {len(classes)} times, expected 1")
+    fields = {
+        node.target.id for node in classes[0].body
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    }
+    missing = [name for name in TARGET_FIELDS if name not in fields]
+    if missing:
+        raise _fail(
+            f"{TARGET_CLASS} no longer declares {', '.join(missing)}, which cron_delivery_text "
+            "reads through getattr with a default; renamed upstream, it reads the default with nothing failing"
+        )
 
 
 def check_heartbeat(root: Path) -> None:
@@ -640,6 +681,7 @@ def drive(module, notices: list[str], replies: list[str]) -> None:
 
 def main(root: Path = Path("/opt/hermes")) -> None:
     check_delivery(root)
+    check_target_fields(root)
     check_heartbeat(root)
     notices = check_notices(root)
     replies = check_system(root) + check_locale(root)
@@ -654,7 +696,8 @@ def main(root: Path = Path("/opt/hermes")) -> None:
         f"notices and {len(replies)} system replies reworded, exception text kept out of the "
         "steer and auth failure replies where they are built, and both back-online notices, the "
         "session-database warnings and the busy-input hint kept off Slack; every name the hooks read "
-        "is bound; flag off and every other platform unchanged"
+        "is bound, and upstream's cron target still declares every field the helper reads; flag off and "
+        "every other platform unchanged"
     )
 
 
