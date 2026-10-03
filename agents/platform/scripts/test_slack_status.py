@@ -49,8 +49,11 @@ CHECKED_END = 0x2FFFF
 SURROGATES = range(0xD800, 0xE000)
 
 
-def _row(task_id="t_a", title="check payments", lines=(), status=s.TASK_RUNNING):
-    return SimpleNamespace(task_id=task_id, title=title, lines=list(lines), status=status)
+def _row(task_id="t_a", title="check payments", lines=(), status=s.TASK_RUNNING, **extra):
+    # As the runtime keeps a row: every line a note unless said otherwise, the last one current.
+    extra.setdefault("note", lines[-1] if lines else "")
+    extra.setdefault("steps", len(lines))
+    return SimpleNamespace(task_id=task_id, title=title, lines=list(lines), status=status, **extra)
 
 
 class StandaloneTest(unittest.TestCase):
@@ -124,6 +127,86 @@ class TaskCardTest(unittest.TestCase):
         self.assertLessEqual(len(step), s.STEP_TEXT_MAX + 2)
 
 
+class RowTitleTest(unittest.TestCase):
+    def test_a_running_card_shows_its_latest_note(self):
+        self.assertEqual(s.row_title(_row(lines=["reading pod state in seeded-a"])), "reading pod state in seeded-a")
+
+    def test_a_step_count_once_there_is_more_than_one(self):
+        row = _row(lines=["found it on seeded-a", "reading pod state in seeded-a"])
+        self.assertEqual(s.row_title(row), "reading pod state in seeded-a · step 2 ▸")
+
+    def test_the_count_goes_past_the_steps_kept(self):
+        row = _row(lines=[f"n{i}" for i in range(s.STEPS_MAX)], steps=9)
+        self.assertEqual(s.row_title(row), "n5 · step 9 ▸")
+
+    def test_a_completed_card_shows_its_result(self):
+        row = _row(lines=["reading version"], status=s.TASK_COMPLETE, result="seeded-a · 1.33.4 = default")
+        self.assertEqual(s.row_title(row), "seeded-a · 1.33.4 = default")
+
+    def test_a_completed_card_with_no_result_shows_its_title(self):
+        # Not its last note: "reading version" beside a tick would claim the reading was the result.
+        self.assertEqual(s.row_title(_row(lines=["reading version"], status=s.TASK_COMPLETE)), "check payments")
+
+    def test_a_pending_card_is_waiting_on_you(self):
+        self.assertEqual(s.row_title(_row(lines=["found two"], status=s.TASK_PENDING)), "waiting on you")
+
+    def test_a_failed_card_shows_where_it_stopped_with_no_count(self):
+        self.assertEqual(s.row_title(_row(lines=["a", "Archived"], status=s.TASK_ERROR)), "Archived")
+
+    def test_the_rows_note_not_its_last_line_is_where_the_card_is(self):
+        # The runtime says which line is the note, so neither a move nor a note's wording decides it.
+        row = _row(lines=["reading logs", "→ todo"], steps=1, note="reading logs")
+        self.assertEqual(s.row_title(row), "reading logs")
+        self.assertEqual(s.row_title(_row(lines=["→ ready"], status=s.TASK_ERROR, note="")), "check payments")
+        row = _row(lines=["draining nodes", "→ rolling back"], steps=2, note="→ rolling back")
+        self.assertEqual(s.row_title(row), "→ rolling back · step 2 ▸")
+
+    def test_no_notes_shows_the_title_or_the_id(self):
+        self.assertEqual(s.row_title(_row()), "check payments")
+        self.assertEqual(s.row_title(_row(title=" ")), "t_a")
+
+    def test_several_rows_lead_with_the_cards_title(self):
+        rows = [
+            _row("t_a", "seeded-a", status=s.TASK_COMPLETE, result="1.33.4 = default"),
+            _row("t_b", "seeded-b", status=s.TASK_PENDING),
+            _row("t_c", "seeded-c", lines=["reading version"]),
+        ]
+        tasks = s.plan_blocks(None, rows)[0]["tasks"]
+        self.assertEqual(
+            [t["title"] for t in tasks],
+            ["seeded-a · 1.33.4 = default", "seeded-b · waiting on you", "seeded-c · reading version"],
+        )
+
+    def test_a_clipped_note_keeps_its_count(self):
+        title = s.row_title(_row(lines=["x", "word " * 100]))
+        self.assertLessEqual(len(title), s.ROW_TITLE_MAX)
+        self.assertTrue(title.endswith(s.ELLIPSIS + " · step 2 ▸"), title)
+
+    def test_a_long_note_that_reads_like_a_count_clips_as_a_note(self):
+        row = _row(lines=["step 2 of the rollout: " + "x" * 300], steps=1, note="step 2 of the rollout: " + "x" * 300)
+        title = s.row_title(row, several=True)
+        self.assertLessEqual(len(title), s.ROW_TITLE_MAX)
+        self.assertTrue(title.startswith("check payments · step 2 of the rollout"), title)
+
+    def test_a_long_card_title_leaves_room_for_the_state(self):
+        name = "word " * 60
+        running = s.row_title(_row(title=name, lines=["a", "b", "reading pod state"]), several=True)
+        self.assertTrue(running.endswith(" · reading pod state · step 3 ▸"), running)
+        pending = s.row_title(_row(title=name, status=s.TASK_PENDING), several=True)
+        self.assertTrue(pending.endswith(s.ELLIPSIS + " · waiting on you"), pending)
+        self.assertLessEqual(len(pending), s.ROW_NAME_MAX + len(" · waiting on you"))
+
+    def test_a_long_result_is_clipped(self):
+        title = s.row_title(_row(status=s.TASK_COMPLETE, result="word " * 100), several=True)
+        self.assertLessEqual(len(title), s.ROW_TITLE_MAX)
+        self.assertTrue(title.startswith("check payments · word"))
+
+    def test_the_details_still_carry_the_trail(self):
+        task = s.plan_blocks(None, [_row(lines=["a", "b"])])[0]["tasks"][0]
+        items = task["details"]["elements"][0]["elements"]
+        self.assertEqual([i["elements"][0]["text"] for i in items], ["✓ a", "◌ b"])
+
+
 class PlanTest(unittest.TestCase):
     def test_the_plan_is_one_block_with_no_stop(self):
         # Stop is deferred: /stop would end the turn and leave the cards running.
@@ -144,14 +227,14 @@ class PlanTest(unittest.TestCase):
 
     def test_text(self):
         rows = [_row(lines=["a", "b"]), _row("t_b", "check seeded-b", status=s.TASK_ERROR)]
-        self.assertEqual(s.plan_text("is it up?", rows), "is it up?\n◌ check payments · b\n✗ check seeded-b")
+        self.assertEqual(s.plan_text("is it up?", rows), "is it up?\n◌ check payments · b · step 2 ▸\n✗ check seeded-b")
 
     def test_text_escapes_slack_markup(self):
         # The text field is parsed: an unescaped "<!here>" broadcasts and a "<url|label>" relabels a link.
         rows = [_row(title="R&D: roll back", lines=["see <!here> <https://evil.example|docs>"])]
         self.assertEqual(
             s.plan_text(None, rows),
-            "R&amp;D: roll back\n◌ R&amp;D: roll back · see &lt;!here&gt; &lt;https://evil.example|docs&gt;",
+            "R&amp;D: roll back\n◌ see &lt;!here&gt; &lt;https://evil.example|docs&gt;",
         )
         blocks = s.plan_blocks(None, rows)
         self.assertEqual(blocks[0]["title"], "R&D: roll back", "blocks carry rich text, which Slack does not parse")
