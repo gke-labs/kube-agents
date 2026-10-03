@@ -1,7 +1,8 @@
 // Dev seeder: provisions the four streams on the local dev bus and replays a
 // plausible beat-3 exchange so the UI has something to show — one completed
 // task in history, then (with --live) a second task streamed with real gaps
-// so the rail's pulses and the transcript's chunk-merging can be watched.
+// so the status strip's activity LEDs and the transcript's chunk-merging can
+// be watched.
 //
 // Run:  nats-server -c dev/nats.conf   (in another terminal)
 //       node dev/seed.mjs --live
