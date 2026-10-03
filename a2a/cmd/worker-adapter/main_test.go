@@ -94,6 +94,74 @@ func TestDefaultToolSurfaceNeedsNoEgressTheFenceDenies(t *testing.T) {
 	}
 }
 
+// TestClusterViewAllowsBashAndSaysInspectOnly: A2A_CLUSTER_VIEW=true is the
+// spawner telling the adapter the pod has the broker's read-only wrappers;
+// Bash joins the surface and the system prompt says what the fence is.
+func TestClusterViewAllowsBashAndSaysInspectOnly(t *testing.T) {
+	for _, key := range []string{"A2A_ALLOWED_TOOLS", "A2A_HARNESS_CMD", "A2A_HARNESS_EXTRA_ARGS"} {
+		t.Setenv(key, "")
+		_ = os.Unsetenv(key)
+	}
+	flags := func(argv []string) (allowed, disallowed, prompt string) {
+		for i, arg := range argv {
+			if i+1 >= len(argv) {
+				break
+			}
+			switch arg {
+			case "--allowedTools":
+				allowed = argv[i+1]
+			case "--disallowedTools":
+				disallowed = argv[i+1]
+			case "--append-system-prompt":
+				prompt = argv[i+1]
+			}
+		}
+		return
+	}
+	t.Setenv(lib.EnvClusterView, "")
+	_ = os.Unsetenv(lib.EnvClusterView)
+	allowed, disallowed, prompt := flags(harnessCommand())
+	if strings.Contains(allowed, "Bash") || !strings.Contains(disallowed, "Bash") || prompt != "" {
+		t.Fatalf("view off: allowed=%q disallowed=%q prompt=%q", allowed, disallowed, prompt)
+	}
+	t.Setenv(lib.EnvClusterView, "true")
+	allowed, disallowed, prompt = flags(harnessCommand())
+	if !strings.Contains(allowed, "Bash(kubectl:*)") || !strings.Contains(allowed, "Bash(gcloud:*)") || strings.Contains(disallowed, "Bash") {
+		t.Fatalf("view on: allowed=%q disallowed=%q", allowed, disallowed)
+	}
+	// Confined to the two shims: a bare Bash would let the harness run node,
+	// python3 or a loop against the keyless inference gateway the fence admits.
+	for _, tool := range strings.Split(allowed, ",") {
+		if tool == "Bash" {
+			t.Fatalf("view on allows bare Bash: %q", allowed)
+		}
+	}
+	for _, still := range []string{"Edit", "NotebookEdit"} {
+		if !strings.Contains(disallowed, still) {
+			t.Errorf("view on dropped %s from the disallowed list", still)
+		}
+	}
+	if prompt != clusterViewPrompt || !strings.Contains(prompt, "policy rule") {
+		t.Fatalf("view on prompt = %q", prompt)
+	}
+	// An A2A_ALLOWED_TOOLS override without Bash wins over the view: Bash
+	// stays disallowed, and the prompt that tells the model to use it is
+	// not appended.
+	t.Setenv("A2A_ALLOWED_TOOLS", "Read,Grep")
+	allowed, disallowed, prompt = flags(harnessCommand())
+	if allowed != "Read,Grep" || !strings.Contains(disallowed, "Bash") || prompt != "" {
+		t.Fatalf("view on, override without Bash: allowed=%q disallowed=%q prompt=%q", allowed, disallowed, prompt)
+	}
+	// One that names Bash, bare or as a pattern, gets the view.
+	for _, override := range []string{"Read,Bash", "Read Bash(kubectl:*)"} {
+		t.Setenv("A2A_ALLOWED_TOOLS", override)
+		allowed, disallowed, prompt = flags(harnessCommand())
+		if allowed != override || strings.Contains(disallowed, "Bash") || prompt != clusterViewPrompt {
+			t.Fatalf("view on, override %q: allowed=%q disallowed=%q prompt=%q", override, allowed, disallowed, prompt)
+		}
+	}
+}
+
 // originSeq is the join between the two halves the origin-sequence fix already
 // pins: the spawner renders lib.EnvOriginSeq (spawn_test.go) and the adapter
 // honours Config.OriginSeq / Config.OriginSeqStated (adapter_origin_cap_test.go,

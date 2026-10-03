@@ -274,6 +274,15 @@ type Config struct {
 	// earlier and in one place.
 	SessionServiceAccount string
 
+	// SessionClusterView gives spawned session pods the temporary read-only
+	// cluster view: a projected token for the credential broker's session
+	// audience, the broker's URL, and Bash in the worker. Rendered by the
+	// operator under its A2A_SESSION_CLUSTER_VIEW flag; off, the pod is
+	// exactly the inert one. CredentialProxyURL is where the shim dials;
+	// New refuses the view without it.
+	SessionClusterView bool
+	CredentialProxyURL string
+
 	// StrictEventsWriter makes the `…events` writer-class agreement check a
 	// refusal instead of a counted advisory (A2A_STRICT_EVENTS_WRITER=true).
 	// It ships false: for one TASKS retention window after an install takes
@@ -354,6 +363,8 @@ func FromEnv() (*Config, error) {
 
 		SessionServiceAccount: os.Getenv("A2A_SESSION_SERVICE_ACCOUNT"),
 		StrictEventsWriter:    os.Getenv("A2A_STRICT_EVENTS_WRITER") == "true",
+		SessionClusterView:    os.Getenv("A2A_SESSION_CLUSTER_VIEW") == "true",
+		CredentialProxyURL:    os.Getenv("A2A_CREDENTIAL_PROXY_URL"),
 	}
 	cfg.GchatRelayURL = os.Getenv("A2A_GCHAT_RELAY_URL")
 	cfg.GchatTokenPath = envOr("A2A_GCHAT_TOKEN_PATH", defaultGchatTokenPath)

@@ -1218,6 +1218,35 @@ func TestBuildA2AGatewaySpawnArming(t *testing.T) {
 	}
 }
 
+// TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag: the spawner widens
+// the session pod only when the operator says so, and it needs the broker
+// URL to do it.
+func TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag(t *testing.T) {
+	agent := a2aTestAgent()
+	envOf := func() map[string]corev1.EnvVar {
+		env := map[string]corev1.EnvVar{}
+		for _, e := range buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env {
+			env[e.Name] = e
+		}
+		return env
+	}
+	t.Setenv(a2aSessionClusterViewEnvVar, "")
+	off := envOf()
+	for _, name := range []string{"A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL"} {
+		if _, ok := off[name]; ok {
+			t.Errorf("%s rendered with the flag off", name)
+		}
+	}
+	t.Setenv(a2aSessionClusterViewEnvVar, "true")
+	on := envOf()
+	if on["A2A_SESSION_CLUSTER_VIEW"].Value != "true" {
+		t.Errorf("A2A_SESSION_CLUSTER_VIEW = %+v, want true", on["A2A_SESSION_CLUSTER_VIEW"])
+	}
+	if on["A2A_CREDENTIAL_PROXY_URL"].Value != credentialProxyBaseURL(agent) {
+		t.Errorf("A2A_CREDENTIAL_PROXY_URL = %+v, want %s", on["A2A_CREDENTIAL_PROXY_URL"], credentialProxyBaseURL(agent))
+	}
+}
+
 func TestBuildA2ASessionNetworkPolicy(t *testing.T) {
 	np := buildA2ASessionNetworkPolicy(a2aTestAgent(), []string{"10.96.0.10"})
 
@@ -1315,6 +1344,33 @@ func TestBuildA2ASessionNetworkPolicy(t *testing.T) {
 				t.Errorf("egress rule %d crosses namespaces: %+v", i+1, peer)
 			}
 		}
+	}
+}
+
+// TestSessionNetworkPolicyReachesTheBrokerOnlyUnderTheFlag: a fourth egress
+// rule, to the broker pod on its one port, present exactly when the view is
+// on; off, the fence is the three rules TestBuildA2ASessionNetworkPolicy pins.
+func TestSessionNetworkPolicyReachesTheBrokerOnlyUnderTheFlag(t *testing.T) {
+	agent := a2aTestAgent()
+	t.Setenv(a2aSessionClusterViewEnvVar, "")
+	if got := len(buildA2ASessionNetworkPolicy(agent, []string{"10.96.0.10"}).Spec.Egress); got != 3 {
+		t.Fatalf("flag off: %d egress rules, want 3", got)
+	}
+	t.Setenv(a2aSessionClusterViewEnvVar, "true")
+	np := buildA2ASessionNetworkPolicy(agent, []string{"10.96.0.10"})
+	if len(np.Spec.Egress) != 4 {
+		t.Fatalf("flag on: %d egress rules, want 4", len(np.Spec.Egress))
+	}
+	if len(np.Spec.Ingress) != 0 {
+		t.Fatalf("the view opened ingress: %+v", np.Spec.Ingress)
+	}
+	broker := np.Spec.Egress[3]
+	if len(broker.Ports) != 1 || broker.Ports[0].Port.IntValue() != credentialProxyPort {
+		t.Fatalf("broker rule ports = %+v, want %d only", broker.Ports, credentialProxyPort)
+	}
+	if len(broker.To) != 1 || broker.To[0].PodSelector == nil ||
+		!reflect.DeepEqual(broker.To[0].PodSelector.MatchLabels, credentialProxySelector(agent)) {
+		t.Fatalf("broker rule peer = %+v, want the broker pod selector %v", broker.To, credentialProxySelector(agent))
 	}
 }
 

@@ -40,6 +40,14 @@ package lib
 const (
 	EnvOriginSeq     = "A2A_ORIGIN_SEQ"
 	OriginSeqUnknown = "unknown"
+	// EnvClusterView is the spawner telling the worker that this pod has
+	// the credential broker's read-only kubectl/gcloud wrappers on PATH
+	// (the operator's A2A_SESSION_CLUSTER_VIEW flag, rendered onto the
+	// gateway and translated here per pod). Literal "true" is on. One
+	// constant for both ends, like EnvOriginSeq above: a spelling that
+	// drifted would leave a pod with the token and the shims but no Bash,
+	// and nothing would say so.
+	EnvClusterView = "A2A_CLUSTER_VIEW"
 )
 
 const (
