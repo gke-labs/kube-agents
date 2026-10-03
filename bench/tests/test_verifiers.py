@@ -3815,6 +3815,18 @@ def test_an_in_lease_sibling_on_a_pre_lease_tip_is_not_a_sibling(token, github, 
     assert "head commit 2026-08-20T12:00:00+00:00 predates this job's lease window" in res.reason
 
 
+def test_an_in_lease_sibling_with_an_undated_head_is_not_a_sibling(token, github, lease):
+    """The pre-lease clause needs the head's date; a sibling whose commits page
+    GitHub answers 404 is not shown to be this lease's, so it fails."""
+    _stash_pr_report()
+    _sibling_routes(github)
+    for url in [u for u in github.routes if "/commits" in u]:
+        github.routes[url] = (404, {})
+    res = _sibling_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "the GitHub API gives no date for its head commit" in res.reason
+
+
 def test_a_same_day_date_only_lease_stamp_is_no_window(token, github, lease, monkeypatch):
     """`2026-08-21` on a run that started at 09:00 that day parses as midnight,
     nine hours before the run and inside the day's bound; the shape is refused

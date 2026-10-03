@@ -538,7 +538,7 @@ hands back repetition 1's URL -- correct work with no commit of its own, which t
 pdb-remediation-pr seat's second live run read as 1/3 (#2016 step 3). So a pull request in the
 leased project's own repository, created at or after this job's lease window began (less the same
 skew), opened by a `[bot]` login on a `platform-agent/` branch in the repository itself, with a
-head commit no older than the window, and open or merged, passes as an in-job sibling: the project is leased to no one else in that window, so the
+head commit GitHub dates no earlier than the window, and open or merged, passes as an in-job sibling: the project is leased to no one else in that window, so the
 agent's pull request in it is this job's. The head test is the pool sweep's and `github_writes`'
 definition of the agent's pull request (`AGENT_BRANCH_PREFIX`, the head in the repository and not
 a fork), so Dependabot's, a workflow's or another installed App's pull request in the window is

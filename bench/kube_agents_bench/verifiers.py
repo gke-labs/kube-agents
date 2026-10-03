@@ -2390,6 +2390,17 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     f"carries {files}"
                 )
             elif not_sibling is None:
+                # An undated head is not shown to be this lease's, so the
+                # pre-lease clause above could not be asked: a date the API
+                # would not give is not evidence, as for a payload with no head.
+                if pushed is None:
+                    rejected.append(
+                        f"{slug}: last written at {touched.isoformat()}, before "
+                        f"{since_what}, and the GitHub API gives no date for its "
+                        "head commit, so it is not shown to be this lease's and "
+                        "not an in-job sibling"
+                    )
+                    continue
                 # What was read, not what is inferred from it: the login, the
                 # branch, the repository and the window are the observation;
                 # "an earlier repetition's" is the conclusion the docstring
