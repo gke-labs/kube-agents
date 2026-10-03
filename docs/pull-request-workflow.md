@@ -426,9 +426,19 @@ authoritative about it. Read it there when the answer matters, and
 
 The two labels are the two people:
 
-- **`lgtm` is the reviewer's.** A GitHub "Approve" review sets it, and so does `/lgtm` in a comment.
-  This is what the auto-requested human reviewer is being asked for. Prow does not take an `/lgtm`
-  from the pull request's own author, so every change needs one other person however it is approved.
+- **`lgtm` is the reviewer's.** A GitHub "Approve" review sets it, and so does `/lgtm` in a comment
+  — from an account the [`OWNERS`](../OWNERS) files name under `reviewers` or `approvers` for one of
+  the changed paths, and from nobody else. The configuration lists this repository under
+  `owners.skip_collaborators`, so Prow ignores collaborator and organisation-member status for this
+  label: the `triage` the contributor agents hold does not make Prow set it, and anyone outside those
+  lists is answered with "adding LGTM is restricted to approvers and reviewers in OWNERS files",
+  whether they approved, requested changes, or typed the command. The reviewer half of that walk
+  falls through [`hack/OWNERS`](../hack/OWNERS), which sets `no_parent_owners` but names no
+  reviewers, so a change to the two presubmit roster files alone takes its `lgtm` from anyone in the
+  root lists as well as from `eval-crew`, while its `approved` stays `eval-crew`'s alone — the reason
+  the root approvers are repeated under `reviewers`. This is what the auto-requested human reviewer
+  is being asked for. Prow does not take an `/lgtm` from the pull request's own author, so every
+  change needs one other person from those lists however it is approved.
   `trusted_team_for_sticky_lgtm: Googlers` is configured, which means a push after the label lands
   strips it again unless the author is in that team, and the reviewer has to give it a second time.
 - **`approved` is an `OWNERS` approver's.** `/approve`, from someone in the `OWNERS` file governing
@@ -621,8 +631,9 @@ robot that reviews under a user account re-reviews every push and files its foll
 `COMMENTED`, so a `CHANGES_REQUESTED` it once filed would otherwise stand for the life of the pull
 request and the check-run path would never request a human, and a review request outstanding to it
 is answered by the robot and cleared, so it counts as nobody asked. An approval from outside
-`OWNERS` is not a hand-off: it cannot produce the `approved` label, so it counts no more than a
-comment. Of these reasons, `/request-review` skips the verdict check alone (it also bypasses the
+`approvers` is not a hand-off: it cannot produce the `approved` label, so the auto-request counts it
+no more than a comment and still asks someone who can `/approve`. Of these reasons, `/request-review`
+skips the verdict check alone (it also bypasses the
 `AI Review` gate, per `AGENTS.md`) — a person has already read the pull request and asked — and when
 one of the other reasons still declines it, the comment gets 😕 and the run a warning annotation
 naming the reason. A periodic
