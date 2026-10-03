@@ -3549,8 +3549,8 @@ def test_an_in_job_sibling_passes_with_its_own_reason(token, github, lease):
     once rep 1's fix is on it rep 2 pushes nothing and hands back rep 1's URL:
     correct work with no commit of its own. Inside the lease window, in the
     leased repository, and open, that is this job's pull request and passes --
-    under the second rule, named first so the Cases page and the run record
-    can tell it from a rep that pushed."""
+    under the second rule, named first so the run record can tell it from a
+    rep that pushed."""
     _stash_pr_report()
     _sibling_routes(github)
     res = _sibling_check().verify(5.0)

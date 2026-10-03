@@ -502,7 +502,8 @@ _LEASE_STAMP_SHAPE = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z"
 LEASE_WINDOW_MAX_SEC = 24 * 3600
 
 # The three ways `pull_request_opened` passes, as the reason's first word and
-# as `raw["rule"]`, so the run record and the Cases page can tell them apart.
+# as `raw["rule"]`, so the run record (`results.json`) can tell them apart; the
+# dashboard's Cases page drops a passing repetition's reason and cannot.
 PR_RULE_OWN_HEAD_COMMIT = "own-head-commit"
 PR_RULE_IN_JOB_SIBLING = "in-job-sibling"
 PR_RULE_STREAM_PULL_REQUEST = "stream-pull-request"

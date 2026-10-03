@@ -203,8 +203,9 @@ another App's, or one from a fork, is not) and open or merged -- this job's own,
 is leased to no one else -- recorded as `in-job-sibling`. The second rule is an option on the
 check, `accepts_in_job_sibling`, set on this case and rca-remediation-pr only: its cost (below) was
 decided for these two seats, and a case without it grades the push alone. The rule that
-passed leads the check's reason and so sits in the run record (`results.json`), where the Cases
-page can tell the two apart. A pull request an earlier lease left behind (created before the
+passed leads the check's reason in the run record (`results.json`, `verification_report[]`),
+which is where the two are counted apart; the Cases page shows a passing repetition without its
+reason, so it cannot. A pull request an earlier lease left behind (created before the
 window), one in another repository, one a person opened, and one closed unmerged still fail. The
 window is the job's, not the case's: in the nightly every PR-writing case shares it and writes as
 the same App, so a repetition passes on any in-window agent-authored pull request in the leased
