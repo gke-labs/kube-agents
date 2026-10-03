@@ -553,6 +553,69 @@ class RepositoryMappingTest(unittest.TestCase):
         self.assertEqual(result.stdout.count("UNMAPPED"), 2, result.stdout)
 
 
+FAKE_CURL = textwrap.dedent(
+    """\
+    #!/usr/bin/env bash
+    printf '%s\\n' "$@" > "$FAKE_CURL_ARGS"
+    printf '%s' "$FAKE_CURL_CODE"
+    exit "$FAKE_CURL_RC"
+    """
+)
+
+
+class LeaseCheckTest(unittest.TestCase):
+    """lease_held_by_this_job, lifted out of the script and run against a
+    stand-in curl: only Boskos's 200 for PROJECT_ID as this job's owner
+    confirms the lease, so only it lets the window be stamped."""
+
+    def check(self, code: str, rc: int = 0) -> tuple[int, list[str]]:
+        with tempfile.TemporaryDirectory() as tmp:
+            curl = pathlib.Path(tmp) / "curl"
+            curl.write_text(FAKE_CURL, encoding="utf-8")
+            curl.chmod(0o755)
+            args = pathlib.Path(tmp) / "args"
+            body = "\n".join(
+                [
+                    lifted_line(r"^readonly EVAL_LEASE_CHECK_TIMEOUT_SECONDS=.*$"),
+                    lifted_line(r"^readonly EVAL_LEASE_CHECK_STATE=.*$"),
+                    lifted("lease_held_by_this_job"),
+                    "lease_held_by_this_job",
+                ]
+            )
+            result = run_bash(
+                body,
+                {
+                    "PATH": f"{tmp}:{os.environ['PATH']}",
+                    "FAKE_CURL_ARGS": str(args),
+                    "FAKE_CURL_CODE": code,
+                    "FAKE_CURL_RC": str(rc),
+                    "BOSKOS_HOST": "http://boskos.test",
+                    "BOSKOS_OWNER_NAME": "pull-smoke-42",
+                    "BOSKOS_RESOURCE_NAME": "the-acquired-project",
+                    "PROJECT_ID": "the-pinned-project",
+                },
+            )
+            return result.returncode, args.read_text(encoding="utf-8").splitlines()
+
+    def test_a_200_confirms_the_lease_on_the_project_this_run_writes_to(self):
+        rc, args = self.check("200")
+        self.assertEqual(rc, 0)
+        self.assertIn(
+            "http://boskos.test/update?name=the-pinned-project&owner=pull-smoke-42&state=busy",
+            args,
+        )
+        self.assertEqual(args[args.index("--max-time") + 1], "10")
+
+    def test_anything_but_a_200_is_no_lease(self):
+        for code, rc in (("401", 0), ("404", 0), ("409", 0), ("500", 0), ("000", 28), ("", 7)):
+            with self.subTest(code=code, rc=rc):
+                self.assertEqual(self.check(code, rc)[0], 1)
+
+    def test_only_the_last_three_digits_of_curls_code_count(self):
+        self.assertEqual(self.check("200000")[0], 1)
+        self.assertEqual(self.check("000200")[0], 0)
+
+
 class CallSiteTest(unittest.TestCase):
     """Where the two resets sit in the script, by its text."""
 
@@ -585,14 +648,17 @@ class CallSiteTest(unittest.TestCase):
         # would widen the window onto every leftover.
         stamped = src.index(f"export {names['LEASE_START_ENV']}=\"${{EVAL_RUN_STARTED_AT}}\"")
         self.assertNotIn(f"${{{names['LEASE_START_ENV']}:-", src)
-        # ...and only inside Prow: a hand run holds no lease, so it clears
-        # any inherited stamp and exports none, and the verifier reads no window.
+        # ...and only when Boskos confirms this job holds the lease: any
+        # inherited stamp is cleared, and the export sits under the Prow gate
+        # and the lease check (LeaseCheckTest pins the check's answers).
         cleared = src.index(f"\nunset {names['LEASE_START_ENV']}\n")
         gate = src.index('if [ -n "${JOB_NAME:-}" ] && [ -n "${BUILD_ID:-}" ]; then', cleared)
+        held = src.index("  if lease_held_by_this_job; then\n", gate)
         self.assertLess(clock, cleared)
         self.assertLess(cleared, gate)
-        self.assertLess(gate, stamped)
-        self.assertEqual(src[stamped:].split("\n", 2)[1], "fi")
+        self.assertLess(gate, held)
+        self.assertEqual(src[held:stamped].count("\n"), 1)
+        self.assertEqual(src[stamped:].split("\n", 2)[1], "  else")
         matrix = src.index("# 6. Task Matrix Execution Loop")
         self.assertLess(derived, exported)
         self.assertLess(exported, matrix)

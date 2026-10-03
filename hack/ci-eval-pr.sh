@@ -53,6 +53,13 @@ readonly EVAL_INJECT_LANE_SAFEGUARDS_FILE="eval/inject-lane-safeguards.yaml"
 readonly EVAL_UNIT_LAUNCH_STAGGER_SECONDS=5
 readonly EVAL_GITHUB_WRITE_SETTLE_SECONDS=120
 
+# The lease check before the pull_request_opened window is stamped
+# (lease_held_by_this_job): one Boskos /update for PROJECT_ID as this job's
+# owner, in the state boskos_heartbeat.sh holds every kube-agents lease in.
+# Capped so a slow Boskos costs the run seconds; a timeout is no window.
+readonly EVAL_LEASE_CHECK_TIMEOUT_SECONDS=10
+readonly EVAL_LEASE_CHECK_STATE="busy"
+
 # What `bench-gate suite` exits, and writes as `outcome` in eval-verdict.json,
 # when the run could not be evaluated: an admitted case lost every repetition
 # to infrastructure, or every case did. Both are bench/kube_agents_bench/
@@ -895,13 +902,31 @@ EVAL_RUN_STARTED_AT="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 # environment: a stamp set elsewhere (a shell, a stale job environment, a
 # date with no time) would widen the window onto every leftover, and the
 # verifier reads one older than a day as no window at all. Exported only
-# inside Prow, under the same gate as the Boskos names above: a hand run holds
-# no lease, so against a pool project a concurrent Prow job's pull request
-# would pass as this run's sibling. Unset, the verifier reads no window and
-# grades only a repetition's own push.
+# when Boskos confirms this job holds PROJECT_ID's lease: being in Prow is not
+# enough, because a project pinned in hack/ci-env.sh during onboarding, or the
+# default one there, is not the project the wrapper leased, and a hand run
+# leases nothing -- in each a concurrent job's pull request would pass as this
+# run's sibling. Unset, the verifier reads no window and grades only a
+# repetition's own push; the job itself goes on either way.
+lease_held_by_this_job() {
+  # PROJECT_ID, not BOSKOS_RESOURCE_NAME: the question is whether the project
+  # this run writes to is this job's, whichever one the wrapper acquired.
+  # Only the owner gets 200; 401 is another owner, 404 an unleased name, and
+  # curl's "000" a timeout or no Boskos. curl -w can emit more than three
+  # digits when a connection dies after headers, hence the last three.
+  local code
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time "${EVAL_LEASE_CHECK_TIMEOUT_SECONDS}" \
+    -X POST "${BOSKOS_HOST}/update?name=${PROJECT_ID}&owner=${BOSKOS_OWNER_NAME}&state=${EVAL_LEASE_CHECK_STATE}" \
+    2>/dev/null)" || true
+  [ "${code:(-3)}" = "200" ]
+}
 unset EVAL_LEASE_STARTED_AT
 if [ -n "${JOB_NAME:-}" ] && [ -n "${BUILD_ID:-}" ]; then
-  export EVAL_LEASE_STARTED_AT="${EVAL_RUN_STARTED_AT}"
+  if lease_held_by_this_job; then
+    export EVAL_LEASE_STARTED_AT="${EVAL_RUN_STARTED_AT}"
+  else
+    echo "=== Boskos did not confirm this job holds ${PROJECT_ID}'s lease: no lease window, so pull_request_opened grades only a repetition's own push ==="
+  fi
 fi
 echo "=== [${EVAL_RUN_STARTED_AT}] Running PR Smoke Test Evaluation for PR #${PR_ID} in Namespace: ${TARGET_NAMESPACE} ==="
 

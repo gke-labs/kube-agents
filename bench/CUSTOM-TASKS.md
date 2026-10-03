@@ -551,9 +551,10 @@ request in the leased repository it links, and the check cannot tell which case 
 check reads the window from two environment names
 `hack/ci-eval-pr.sh` exports, `EVAL_LEDGER_REPO` (the leased `*-infra` repository, the slug the
 ledger reset uses) and `EVAL_LEASE_STARTED_AT` (the script's own start, ISO-8601 UTC, inside the
-Boskos lease and before any agent ran, exported only inside a Prow job). Either unset -- the
-second always is on a hand run, which holds no lease -- or the option not set on the check, and
-only the head-commit rule applies. A pull request created before the window, or opened in it on a tip from before it, is an
+Boskos lease and before any agent ran, exported only when Boskos confirms this job holds the
+lease on the project the run writes to). Either unset -- the second always is on a hand run, or on
+a project the job did not lease -- or the option not set on the check, and only the head-commit
+rule applies. A pull request created before the window, or opened in it on a tip from before it, is an
 earlier lease's leftover and fails exactly as before; one in another repository is nobody's sibling; one a person
 opened is not the agent's; one closed unmerged is rejected before either rule is asked; and an
 empty one fails under both.

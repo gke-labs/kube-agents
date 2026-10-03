@@ -2000,7 +2000,8 @@ class PullRequestOpenedVerifier(BaseVerifier):
         sibling, whatever its dates); an author that is not a ``[bot]`` login
         (a person's pull request, whenever opened); created before the window
         began, less ``max_clock_skew_sec`` -- an earlier lease's leftover;
-        created at or after this run started -- this repetition's own, which
+        created at or after this run started, less ``max_clock_skew_sec`` --
+        this repetition's own, which
         the first rule grades on its push, so a pull request this run opened
         on a branch whose tip it did not move is the #1832 rejection it
         always was and never "an earlier repetition's".
