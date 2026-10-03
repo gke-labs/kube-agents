@@ -198,7 +198,13 @@ variable "scope" {
     because nothing is inherited through either; a project attached or
     linked after the apply reads denied until the next one. A lookup the
     planning identity cannot make fails the plan with the selector named,
-    before anything is applied.
+    before anything is applied. `max_projects` is spec.scope.maxProjects, the
+    most projects the reconcile lists per run (100 by default): the module
+    refuses a plan whose explicit projects and selector members exceed it
+    (while a selector is declared or the cap is below its default), the
+    resolver refuses a single selector past it (and a Shared VPC host past
+    500 service projects, one page of the Compute API's answer, whatever the
+    cap), and the chart renders it on the CR, all from this one value.
   EOT
   type = object({
     projects         = optional(list(string), [])
@@ -206,6 +212,7 @@ variable "scope" {
     organizations    = optional(list(string), [])
     shared_vpc_hosts = optional(list(string), [])
     metrics_scopes   = optional(list(string), [])
+    max_projects     = optional(number, 100)
     exclude = optional(object({
       projects = optional(list(string), [])
       clusters = optional(list(object({

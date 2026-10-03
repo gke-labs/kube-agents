@@ -2439,9 +2439,10 @@ than starting a proxy that fails every command.
 Federation returns access tokens. GitHub is reached through a different kind of
 credential: `github_token_refresh.py` presents a Google **ID** token to the token broker,
 whose scope rule matches on `assertion.email`, and the broker answers with a
-repository-scoped installation token. Under the metadata server `gcloud auth
-print-identity-token` mints that ID token. Under an `external_account` credential the same
-command refuses outright — _Invalid account type for `--audiences`. Requires valid service
+repository-scoped installation token. Without a federated credential the script asks the
+metadata server for that ID token directly, and runs `gcloud auth print-identity-token` only
+when the metadata server answers nothing usable or is twice too slow. Under an `external_account` credential
+that gcloud command refuses outright — _Invalid account type for `--audiences`. Requires valid service
 account._ — so a federated broker could reach GCP and not GitHub, which surfaces as
 `could not read Username for 'https://github.com'` from a `git` that never had a
 credential helper configured.
@@ -2459,7 +2460,7 @@ email, which is what
 [`configmap.yaml.template`](../../k8s-operator/config/integrations/github/configmap.yaml.template)
 already matches on — so no broker-side configuration changes when an install moves the
 proxy into the sandbox pod. The function returns `None` under any other credential type,
-which leaves every other placement on the gcloud path unchanged.
+which leaves every other placement on the metadata-server path, with gcloud behind it.
 
 `wif_credentials.py` is on the sandbox image's allowlist COPY as well as the proxy's,
 because `github_token_refresh.py` imports it at module scope and that script is baked into
@@ -2483,9 +2484,10 @@ Emptying the gateway pod of credentials breaks the one class of work that still 
 there. A roster entry marked `no_agent` runs as a Python subprocess on the gateway rather
 than as a model turn, and at the time touched neither the terminal backend nor the
 sandbox. `refresh_git_credentials` in `agents/platform/scripts/github_token_refresh.py`
-prefers `CREDENTIAL_PROXY_URL` and falls back to `gcloud auth print-identity-token`; with
-the variable gone from the gateway and no `gcloud` in the agent image, both branches are
-now dead and the job fails with `No such file or directory: 'gcloud'`. On the reference
+prefers `CREDENTIAL_PROXY_URL` and, at the time, fell back to `gcloud auth
+print-identity-token` (it now asks the metadata server first); with the variable gone from
+the gateway and no `gcloud` in the agent image, both branches were dead and the job failed
+with `No such file or directory: 'gcloud'`. On the reference
 install this surfaced as the shipped GitHub repo watcher failing on every ten-minute tick
 from the moment these images went live. Model-driven crons are unaffected: their shell work
 runs on the sandbox terminal backend, where the shims reach the broker's Service.

@@ -367,6 +367,7 @@ data:
       "organizations": [],
       "sharedVpcHosts": [],
       "metricsScopes": [],
+      "maxProjects": 100,
       "exclude": {
         "projects": [],
         "clusters": []

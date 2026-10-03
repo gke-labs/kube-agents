@@ -272,7 +272,22 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	case lib.StateCanceled:
 		g.post(rec.Key, "🛑 canceled")
 	case lib.StateRejected:
-		g.post(rec.Key, "🚫 the executor rejected the task")
+		// Same shape as failed above, and for the same reason. Both
+		// executors put the cause in the terminal message -- a capability
+		// refusal names the rule the verifier returned, and an unreachable
+		// verifier says so -- and a bare "rejected" sends the user looking
+		// at their own prompt for a fault that is in the install. Before
+		// the capability check only an empty submission reached rejected,
+		// where there was nothing useful to add; now an outage does.
+		reason := ""
+		if s.Status.Message != nil {
+			reason = joinTextParts(s.Status.Message.Parts)
+		}
+		if reason != "" {
+			g.post(rec.Key, "🚫 the executor rejected the task: "+reason)
+		} else {
+			g.post(rec.Key, "🚫 the executor rejected the task")
+		}
 	}
 
 	if active := rec.ActiveTask; active != nil && active.TaskID == taskID {

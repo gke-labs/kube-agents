@@ -6830,6 +6830,7 @@ class DomainScopedFlagsTest(unittest.TestCase):
         "--scope-organizations": ("PARAM_SCOPE_ORGANIZATIONS", "987654321098"),
         "--scope-shared-vpc-hosts": ("PARAM_SCOPE_SHARED_VPC_HOSTS", "shared-net-host"),
         "--scope-metrics-scopes": ("PARAM_SCOPE_METRICS_SCOPES", "observability-hub"),
+        "--scope-max-projects": ("PARAM_SCOPE_MAX_PROJECTS", "250"),
         "--scope-exclude-projects": ("PARAM_SCOPE_EXCLUDE_PROJECTS", "*-sandbox"),
         "--scope-exclude-clusters": ("PARAM_SCOPE_EXCLUDE_CLUSTERS", "payments-staging/us-central1/scratch"),
     }
@@ -9082,7 +9083,7 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
             cwd=str(_REPO_ROOT),
         )
 
-    def test_a_first_install_records_the_seven_keys_even_when_empty(self):
+    def test_a_first_install_records_the_eight_keys_even_when_empty(self):
         with tempfile.TemporaryDirectory() as tmp:
             dest = pathlib.Path(tmp) / "new.install.env"
             loaded = pathlib.Path(tmp) / "loaded.install.env"
@@ -9101,6 +9102,7 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_ORGANIZATIONS=''$", re.MULTILINE))
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_SHARED_VPC_HOSTS=shared-net-host$", re.MULTILINE))
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_METRICS_SCOPES=''$", re.MULTILINE))
+            self.assertRegex(proc.stdout, re.compile(r"^SCOPE_MAX_PROJECTS=''$", re.MULTILINE))
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_EXCLUDE_PROJECTS=''$", re.MULTILINE))
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_EXCLUDE_CLUSTERS=''$", re.MULTILINE))
 
@@ -9223,6 +9225,7 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
                           ("--scope-organizations", "SCOPE_ORGANIZATIONS"),
                           ("--scope-shared-vpc-hosts", "SCOPE_SHARED_VPC_HOSTS"),
                           ("--scope-metrics-scopes", "SCOPE_METRICS_SCOPES"),
+                          ("--scope-max-projects", "SCOPE_MAX_PROJECTS"),
                           ("--scope-exclude-projects", "SCOPE_EXCLUDE_PROJECTS"),
                           ("--scope-exclude-clusters", "SCOPE_EXCLUDE_CLUSTERS")):
             for value in ("", ",", " ", " , "):
@@ -9245,7 +9248,7 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
         )
         help_text = proc.stdout + proc.stderr
         for flag in ("--scope-projects=IDS", "--scope-folders=IDS", "--scope-organizations=IDS",
-                     "--scope-shared-vpc-hosts=IDS", "--scope-metrics-scopes=IDS",
+                     "--scope-shared-vpc-hosts=IDS", "--scope-metrics-scopes=IDS", "--scope-max-projects=N",
                      "--scope-exclude-projects=IDS", "--scope-exclude-clusters=TRIPLES"):
             with self.subTest(flag=flag):
                 self.assertIn(flag, help_text)
@@ -9409,7 +9412,7 @@ print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-cent
         self.assertIn("The live-scope check does not run here", self.text)
         handoff = self.text[self.text.index("The live-scope check does not run here"):]
         handoff = handoff[:handoff.index("3. Out-of-Terraform post-apply steps")]
-        for phrase in ("SCOPE_PROJECTS, SCOPE_FOLDERS,", "SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES and the two exclusions",
+        for phrase in ("SCOPE_PROJECTS, SCOPE_FOLDERS,", "SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_MAX_PROJECTS and the two exclusions",
                        "the reconcile", "retires what it drops", "record it first", "preflight above does not refuse on this route"):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, handoff)

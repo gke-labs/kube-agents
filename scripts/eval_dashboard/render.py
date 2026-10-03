@@ -853,6 +853,7 @@ def compact_run(run: dict, verdict: dict, at: dict | None) -> dict:
         "ceiling_reps": verdict.get("ceiling_reps", 0),
         "do": verdict.get("do", ""),
         "cases": verdict["cases"],
+        "not_evaluated": list(verdict.get("not_evaluated") or []),
         "health_at": at,
     }
     # Only when the record carries the key: the Brief's recovery count out of

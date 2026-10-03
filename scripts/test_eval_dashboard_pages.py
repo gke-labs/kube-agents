@@ -48,6 +48,9 @@ OUTAGE_SINCE = "2026-09-08T09:00:00+00:00"
 # 1274, finished 09-08 10:39:30Z = Tue 6:39 AM ET.
 SETUP_DEATHS_SINCE = "2026-09-07T15:00:00+00:00"
 SETUP_DEATH_BUILD = "2097273589702070272"
+# The one derived run in the fixture (SCHEMA.md, Fixtures): the suite's
+# not-evaluated verdict, re-dated into the outage window.
+NOT_EVALUATED_BUILD = "2097362141184626688"
 SETUP_DEATH_LABEL = "PR #1274 at Tue 6:39 AM ET"
 HOSTILE_PR = "<<script>script>"
 # The poll-timing tests run the page's setInterval this many times faster, so
@@ -1502,6 +1505,73 @@ class BrowserTest(unittest.TestCase):
         self.assertNotIn("Read the build log", app)
         self.assertNotIn("died during setup", app)
 
+    def test_pr_view_not_evaluated_run(self):
+        # The suite's own verdict: neither the hard-failure page ("Read the
+        # build log") nor the PR's ("Fix the PR."), and the lost case sits
+        # under Not graded.
+        app = dom_text(self.run_page, query=f"build={NOT_EVALUATED_BUILD}")
+        self.assertIn("Not evaluated: 1 gate case lost every repetition to infrastructure.", app)
+        self.assertIn("Not graded · 1", app)
+        self.assertIn("<b>Retest once the environment is healthy.</b>", app)
+        self.assertIn("no absolute-check failure", app)
+        for absent in ("Read the build log", "Fix the PR.", "absolute rule", "Nothing right now."):
+            self.assertNotIn(absent, app)
+        index = dom_text(self.index)
+        self.assertIn('class="runrow v-not_evaluated"', index)
+        self.assertIn("not evaluated · 1 case lost", index)
+
+    def test_brief_row_of_a_not_evaluated_run_with_no_tasks_says_so(self):
+        # classify_run keeps the suite's verdict for a record with the field
+        # and no parsed tasks (test_eval_dashboard_classify.py), and the run
+        # page headlines it "Not evaluated"; the Brief's row used to reach the
+        # unmeasured branch first and read "no cases recorded" under a
+        # v-not_evaluated border. The three surfaces agree.
+        data = copy.deepcopy(self.data)
+        for run in data["runs"]:
+            if str(run.get("build_id")) == NOT_EVALUATED_BUILD:
+                run["tasks"] = []
+        out = render_to(pathlib.Path(self.tmp.name) / "noteval-notasks", data, health=health_doc())
+        index = dom_text(out / "index.html")
+        row = re.search(r'<a class="runrow v-not_evaluated"[^>]*>.*?</a>', index, re.S)
+        self.assertIsNotNone(row, index[:400])
+        self.assertIn("not evaluated · 1 case lost", row.group(0))
+        self.assertNotIn("no cases recorded", row.group(0))
+        app = dom_text(out / "run.html", query=f"build={NOT_EVALUATED_BUILD}")
+        self.assertIn("Not evaluated: 1 gate case lost every repetition to infrastructure.", app)
+        # No task was parsed, so there is no card; the case the suite named
+        # is still listed under the heading the lede and "What to do" point at.
+        self.assertIn("Not graded · 1", app)
+        self.assertIn("security-overgrant-probe", app)
+        self.assertIn("recorded no grading for it", app)
+
+    def test_a_lost_case_the_dashboards_roster_holds_out_is_still_listed_as_not_graded(self):
+        # The suite's roster is the branch's; the dashboard's checkout can be
+        # older and not yet admit a case the branch lost every repetition
+        # of. The headline, the lede and the Brief row count it from the
+        # suite's list, so the run page lists it too, with the held-out tag,
+        # instead of showing the author nothing under "Not graded".
+        data = copy.deepcopy(self.data)
+        renamed = "security-overgrant-probe-next"
+        self.assertNotIn(renamed, ROSTER_AT_SPLIT)
+        for run in data["runs"]:
+            if str(run.get("build_id")) == NOT_EVALUATED_BUILD:
+                run["not_evaluated"] = [renamed]
+                for task in run["tasks"]:
+                    if task["name"] == "security-overgrant-probe":
+                        task["name"] = renamed
+        out = render_to(pathlib.Path(self.tmp.name) / "noteval-heldout", data, health=health_doc())
+        app = dom_text(out / "run.html", query=f"build={NOT_EVALUATED_BUILD}")
+        self.assertIn("Not evaluated: 1 gate case lost every repetition to infrastructure.", app)
+        self.assertIn(f"Nothing was graded for {renamed}", app)
+        self.assertIn("Not graded · 1", app)
+        card = re.search(r'<div class="case">.*?</div></div>', app, re.S)
+        self.assertIsNotNone(card, app[:400])
+        self.assertIn(renamed, card.group(0))
+        self.assertIn('class="tag held"', card.group(0))
+        self.assertNotIn("recorded no grading", app, "the run has the case's record; the card is it")
+        index = dom_text(out / "index.html")
+        self.assertIn("not evaluated · 1 case lost", index)
+
     def test_pr_view_unknown_build(self):
         app = dom_text(self.run_page, query="build=1")
         self.assertIn(f"No run with that id in the last {render.RUN_VIEW_DAYS} days.", app)
@@ -1777,6 +1847,30 @@ class CasesAndGridPagesTest(unittest.TestCase):
         self.assertIn("no eval banner · job SUCCESS", app)
         self.assertNotIn("javascript:", app)
         self.assertNotIn('href="hostile', app)
+
+
+
+class NotEvaluatedVerdictTest(unittest.TestCase):
+    """The fourth verdict (classify.py: the suite itself could not evaluate
+    the run) travels through brief.json and the pages know its token."""
+
+    def test_the_brief_carries_the_verdict_and_the_lost_cases(self):
+        data = load_fixture()
+        data["generated_at"] = NOW
+        data["cases"] = [{"name": n, "active": True} for n in CRASHLOOP_TRIO]
+        brief = render.brief_document(data, render.normalize_health(health_doc()), None, None)
+        run = next(r for r in brief["runs"] if r["build"] == NOT_EVALUATED_BUILD)
+        self.assertEqual(run["verdict"], "not_evaluated")
+        self.assertEqual(run["not_evaluated"], ["security-overgrant-probe"])
+        self.assertTrue(run["headline"].startswith("Not evaluated: 1 gate case lost every repetition"))
+        self.assertTrue(run["do"].startswith("Retest once the environment is healthy."))
+        other = next(r for r in brief["runs"] if r["build"] == "2097282860221206528")
+        self.assertEqual(other["not_evaluated"], [], "every other verdict carries the empty list")
+
+    def test_pages_js_and_the_template_know_the_token(self):
+        script = PAGES_JS.read_text()
+        self.assertIn('run.verdict === "not_evaluated"', script)
+        self.assertIn(".runrow.v-not_evaluated", (PAGES_JS.parent / "page.html.tmpl").read_text())
 
 
 if __name__ == "__main__":

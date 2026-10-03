@@ -16,6 +16,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	workeradapter "github.com/gke-labs/kube-agents/a2a/worker-adapter"
 )
@@ -46,8 +47,18 @@ func TestASessionAdapterRunsAWholeTaskUnderItsOwnGrants(t *testing.T) {
 	defer cancel()
 
 	provisionTasksStream(t, h)
+	provisionCapBucket(t, h)
+	startCapabilityVerifier(t, ctx, h)
+
 	const taskID = "task-e2e-1"
-	submitAs(t, h, podA, taskID, "do the thing")
+	// The gateway mints this task's capability at ingress and the submission
+	// carries the reference, which is the whole of what makes the run below
+	// a run rather than a refusal: the adapter checks with the verifier
+	// before it looks at the prompt, and a task with no capability is
+	// rejected pre-spend. So this harness now exercises the capability path
+	// on every pass, not only when somebody writes a test for it.
+	ref := mintAs(t, h, taskID, podA, adapterScope)
+	submitAs(t, h, podA, taskID, "do the thing", &ref)
 
 	res, err := workeradapter.Run(ctx, workeradapter.Config{
 		NATSURL:      h.url,
@@ -56,6 +67,7 @@ func TestASessionAdapterRunsAWholeTaskUnderItsOwnGrants(t *testing.T) {
 		TaskID:       taskID,
 		Profile:      "chat",
 		Session:      podA,
+		Scope:        adapterScope,
 		HarnessCommand: harnessStub(t, `
 echo '{"type":"assistant","message":{"content":[{"type":"text","text":"working on it"}]}}'
 echo '{"type":"result","subtype":"success","result":"the thing is done"}'
@@ -165,13 +177,22 @@ func TestASessionAdapterRunsAWholeTaskAtTheNamedOriginSequence(t *testing.T) {
 	defer cancel()
 
 	provisionTasksStream(t, h)
+	provisionCapBucket(t, h)
+	startCapabilityVerifier(t, ctx, h)
+
 	const taskID = "task-origin-seq"
 	const decoyCorrelation = "corr-decoy-steer"
 	const originCorrelation = "corr-real-submission"
 
+	// Only the submission carries the capability. The decoy is a steer, and
+	// a steer never carries one -- so if the adapter read the head of the
+	// subject instead of the named sequence it would find no authority block
+	// and refuse, which is a second way this test fails when the mechanism
+	// under test is broken.
+	ref := mintAs(t, h, taskID, podA, adapterScope)
 	decoySeq := publishInboundAs(t, h, podA, taskID, decoyCorrelation,
-		"IGNORE THIS. It is the steer a scanning worker would execute as the request.")
-	originSeq := publishInboundAs(t, h, podA, taskID, originCorrelation, "do the thing")
+		"IGNORE THIS. It is the steer a scanning worker would execute as the request.", nil)
+	originSeq := publishInboundAs(t, h, podA, taskID, originCorrelation, "do the thing", &ref)
 	if originSeq <= decoySeq {
 		t.Fatalf("the submission landed at sequence %d, at or before the decoy at %d; the decoy is supposed to be the head of the subject or this test proves nothing", originSeq, decoySeq)
 	}
@@ -190,6 +211,7 @@ func TestASessionAdapterRunsAWholeTaskAtTheNamedOriginSequence(t *testing.T) {
 		TaskID:       taskID,
 		Profile:      "chat",
 		Session:      podA,
+		Scope:        adapterScope,
 		// What the gateway renders into the pod, from its own PubAck.
 		OriginSeq:       originSeq,
 		OriginSeqStated: true,
@@ -299,8 +321,11 @@ func TestASessionAdapterRefusesAnEvictedOriginRatherThanBeingRefusedByTheBus(t *
 	provisionTasksStreamCapped(t, h, 1)
 	const taskID = "task-origin-evicted"
 
-	originSeq := publishInboundAs(t, h, podA, taskID, "corr-real-submission", "the originating request")
-	steerSeq := publishInboundAs(t, h, podA, taskID, "corr-steer", "a steer sent later")
+	// No capability on either message, and none needed: the adapter refuses
+	// on the evicted origin before it has an envelope to read an authority
+	// block out of. A minted one here would be a prop the run never reaches.
+	originSeq := publishInboundAs(t, h, podA, taskID, "corr-real-submission", "the originating request", nil)
+	steerSeq := publishInboundAs(t, h, podA, taskID, "corr-steer", "a steer sent later", nil)
 	if steerSeq <= originSeq {
 		t.Fatalf("the steer landed at %d, not after the submission at %d", steerSeq, originSeq)
 	}
@@ -373,9 +398,16 @@ func TestASessionAdapterCannotRunAnotherSessionsTask(t *testing.T) {
 	defer cancel()
 
 	provisionTasksStream(t, h)
+	provisionCapBucket(t, h)
+	startCapabilityVerifier(t, ctx, h)
+
 	const taskID = "task-e2e-2"
-	// The task belongs to podA, and podA's pod is where it would run.
-	submitAs(t, h, podA, taskID, "do the thing")
+	// The task belongs to podA, and podA's pod is where it would run. Its
+	// capability names podA as the delegate, so the credential is not the
+	// only thing standing in podB's way — but the credential is what stops
+	// it first, and that is what this test is about.
+	ref := mintAs(t, h, taskID, podA, adapterScope)
+	submitAs(t, h, podA, taskID, "do the thing", &ref)
 
 	// The adapter's own log, captured, because half of what this test is
 	// checking is whether an operator could tell what happened. A refused
@@ -396,6 +428,7 @@ func TestASessionAdapterCannotRunAnotherSessionsTask(t *testing.T) {
 		TaskID:         taskID,
 		Profile:        "chat",
 		Session:        podA,
+		Scope:          adapterScope,
 		HarnessCommand: harnessStub(t, `echo '{"type":"result","subtype":"success","result":"stolen"}'`),
 		HarnessEnv:     os.Environ(),
 		TaskDeadline:   15 * time.Second,
@@ -572,6 +605,13 @@ func provisionTasksStreamCapped(t *testing.T, h *harness, perSubject int64) {
 	}
 }
 
+// adapterScope is the resource path both halves of these runs agree on. The
+// gateway mints under it and the executor checks against it; spelling it once
+// here is the test's version of the single capability.NamespaceScope helper the
+// two binaries share, and a test that let them drift would pass while the
+// deployment refused every task.
+var adapterScope = capability.NamespaceScope("kubeagents-system")
+
 // sessionConsumerConfig reads back the config of one of the session's named
 // consumers, as the gateway, which may look at the task plane the session may
 // only write to.
@@ -599,6 +639,47 @@ func sessionConsumerConfig(t *testing.T, h *harness, session, role string) jetst
 	return cons.CachedInfo().Config
 }
 
+// provisionCapBucket creates the `cap` bucket as the gateway. In the
+// deployment the provision Job does this; here the point is only that the
+// bucket exists before a verifier binds it, and the provisioner's own grants
+// are asserted next door in capability_conformance_test.go.
+func provisionCapBucket(t *testing.T, h *harness) {
+	t.Helper()
+	js, err := jetstream.New(gatewayConn(t, h))
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: capability.Bucket, History: 1,
+	}); err != nil {
+		t.Fatalf("provisioning the cap bucket: %v", err)
+	}
+}
+
+// mintAs writes a task's root capability as the gateway, through the real
+// Minter and over the gateway's one grant on this path. A hand-written entry
+// would skip the subject the whole design rests on.
+func mintAs(t *testing.T, h *harness, taskID, delegate string, scope capability.Scope) capability.Ref {
+	t.Helper()
+	js, err := jetstream.New(gatewayConn(t, h))
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	ref, err := capability.NewMinter(js).Mint(ctx, taskID, capability.Entry{
+		Tier:     capability.TierDeveloperTeam,
+		Scope:    scope,
+		Delegate: delegate,
+	})
+	if err != nil {
+		t.Fatalf("minting the task capability as the gateway: %v", err)
+	}
+	return ref
+}
+
 // submitAs publishes a task's submission as the gateway and hands back the
 // TASKS stream sequence the server assigned it.
 //
@@ -611,9 +692,13 @@ func sessionConsumerConfig(t *testing.T, h *harness, session, role string) jetst
 // of nothing: it would agree with a stream that happens to be numbered from
 // one and would go on agreeing if the plumbing that carries the real sequence
 // were cut.
-func submitAs(t *testing.T, h *harness, addressee, taskID, text string) uint64 {
+//
+// A nil ref renders no authority block at all, which is the pre-capability
+// gateway's envelope and the shape the executor refuses when the capability is
+// required.
+func submitAs(t *testing.T, h *harness, addressee, taskID, text string, ref *capability.Ref) uint64 {
 	t.Helper()
-	return publishInboundAs(t, h, addressee, taskID, "corr-"+taskID, text)
+	return publishInboundAs(t, h, addressee, taskID, "corr-"+taskID, text, ref)
 }
 
 // publishInboundAs puts one kind:message envelope on a task's `…in` subject as
@@ -629,7 +714,7 @@ func submitAs(t *testing.T, h *harness, addressee, taskID, text string) uint64 {
 // It publishes through JetStream rather than core NATS so there is a PubAck to
 // read the sequence off. The gateway's own publish is a JetStream publish for
 // the same reason.
-func publishInboundAs(t *testing.T, h *harness, addressee, taskID, correlationID, text string) uint64 {
+func publishInboundAs(t *testing.T, h *harness, addressee, taskID, correlationID, text string, ref *capability.Ref) uint64 {
 	t.Helper()
 	payload, err := json.Marshal(lib.Message{
 		Role: "user", Parts: []lib.Part{{Kind: "text", Text: text}},
@@ -638,10 +723,19 @@ func publishInboundAs(t *testing.T, h *harness, addressee, taskID, correlationID
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
+	opts := []lib.EnvelopeOption{lib.WithTo(lib.Party{Session: addressee})}
+	if ref != nil {
+		authority, err := json.Marshal(map[string]any{
+			"grants": map[string]any{"capability": *ref},
+		})
+		if err != nil {
+			t.Fatalf("authority block: %v", err)
+		}
+		opts = append(opts, lib.WithAuthority(authority))
+	}
 	env, err := lib.NewMessageEnvelope(
 		lib.Party{Session: "gateway", AgentType: "a2a-gateway"},
-		taskID, "ctx-"+taskID, correlationID, payload,
-		lib.WithTo(lib.Party{Session: addressee}))
+		taskID, "ctx-"+taskID, correlationID, payload, opts...)
 	if err != nil {
 		t.Fatalf("submission envelope: %v", err)
 	}

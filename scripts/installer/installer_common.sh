@@ -81,6 +81,13 @@ unset _gke_dns_endpoint_helper
 # Request timeout for kubectl probes against live clusters in the installer.
 readonly KUBECTL_PROBE_REQUEST_TIMEOUT="10s"
 
+# ─── Scope cap ─────────────────────────────────────
+# The bounds the PlatformAgent puts on spec.scope.maxProjects (SCOPE_MAX_PROJECTS),
+# and its default, which the live-scope check reads an absent key as.
+readonly SCOPE_MAX_PROJECTS_MIN=1
+readonly SCOPE_MAX_PROJECTS_MAX=5000
+readonly SCOPE_MAX_PROJECTS_DEFAULT=100
+
 # ─── Helm Release Management Defaults ─────────────────────────────────────────
 # Operation timeout for an in-flight Helm install/upgrade across deploy workflows (10m).
 readonly HELM_OPERATION_TIMEOUT_DEFAULT=600
@@ -528,7 +535,7 @@ load_install_env() {
   # and the Day-2 menu the file is the only way in. A value inherited from the
   # shell would declare a project the file does not record, and the next run
   # from a clean shell would drop it again and retire its profiles.
-  unset SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_SHARED_VPC_HOSTS SCOPE_METRICS_SCOPES SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
+  unset SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_SHARED_VPC_HOSTS SCOPE_METRICS_SCOPES SCOPE_MAX_PROJECTS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
   [ -n "$file" ] && [ -f "$file" ] || return 1
   # Checked before sourcing: a stray quote would otherwise abort the caller
   # through its ERR trap with a bash parse error naming no file.
@@ -915,10 +922,11 @@ hcl_csv_list() {
   printf '%s]' "$out"
 }
 
-# The seven SCOPE_* keys as the composition's `scope` object: `projects`,
+# The eight SCOPE_* keys as the composition's `scope` object: `projects`,
 # `folders`, `organizations`, `shared_vpc_hosts`, `metrics_scopes` and
 # `exclude.projects` are lists like every other list key, `exclude.clusters`
-# is one project/location/cluster triple per entry. Always a full block, empty
+# is one project/location/cluster triple per entry, `max_projects` is the cap,
+# written only when SCOPE_MAX_PROJECTS is set. Always a full block, empty
 # lists included -- the reconcile reads an emptied projects list as the
 # declaration that drops projects, a container or selector leaving the list as
 # the declaration that retires its members, and a missing block as no
@@ -927,8 +935,31 @@ hcl_csv_list() {
 # require_scope_container_ids, and the patterns, caps and repeats the CRD
 # enforces are the module variable's validations, which fail the plan before
 # any binding.
+# SCOPE_MAX_PROJECTS is empty (the default cap) or a whole number within the
+# bounds the CRD puts on spec.scope.maxProjects, or the run stops before a
+# file is written and names the key and the bounds: the module's validation
+# would otherwise name neither. The digit count is checked before the
+# arithmetic: bash's base#digits wraps at 2^64 without a word, so a twenty-digit
+# value could otherwise read as one inside the bounds. $1 the value.
+require_scope_max_projects() {
+  local value="${1:-}" digits
+  [ -n "$value" ] || return 0
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    digits="$(printf '%s' "$value" | sed 's/^0*//')"
+    [ -n "$digits" ] || digits=0
+    if [ "${#digits}" -le "${#SCOPE_MAX_PROJECTS_MAX}" ] && [ "$((10#$digits))" -ge "$SCOPE_MAX_PROJECTS_MIN" ] && [ "$((10#$digits))" -le "$SCOPE_MAX_PROJECTS_MAX" ]; then
+      return 0
+    fi
+  fi
+  print_error "SCOPE_MAX_PROJECTS='${value}' is not a whole number from ${SCOPE_MAX_PROJECTS_MIN} to ${SCOPE_MAX_PROJECTS_MAX}, the bounds the PlatformAgent puts on spec.scope.maxProjects. Set one, or leave it empty for the default (${SCOPE_MAX_PROJECTS_DEFAULT}), in install.env."
+  return 1
+}
+
+# $8, the cap, is written only when set: unset, the module's and the CRD's
+# default (100) apply, and a tfvars that names no cap keeps reading the default
+# an operator never chose.
 hcl_scope_block() {
-  local projects="${1:-}" folders="${2:-}" organizations="${3:-}" shared_vpc_hosts="${4:-}" metrics_scopes="${5:-}" exclude_projects="${6:-}" exclude_clusters="${7:-}"
+  local projects="${1:-}" folders="${2:-}" organizations="${3:-}" shared_vpc_hosts="${4:-}" metrics_scopes="${5:-}" exclude_projects="${6:-}" exclude_clusters="${7:-}" max_projects="${8:-}"
   local clusters="[" first=true entry project location cluster had_noglob=false
   local IFS=$', \t\n'
   case "$-" in *f*) had_noglob=true ;; esac
@@ -942,9 +973,13 @@ hcl_scope_block() {
   done
   $had_noglob || set +f
   clusters+="]"
-  printf 'scope = {\n  projects         = %s\n  folders          = %s\n  organizations    = %s\n  shared_vpc_hosts = %s\n  metrics_scopes   = %s\n  exclude = {\n    projects = %s\n    clusters = %s\n  }\n}\n' \
+  printf 'scope = {\n  projects         = %s\n  folders          = %s\n  organizations    = %s\n  shared_vpc_hosts = %s\n  metrics_scopes   = %s\n' \
     "$(hcl_csv_list "$projects")" "$(hcl_csv_list "$folders")" "$(hcl_csv_list "$organizations")" \
-    "$(hcl_csv_list "$shared_vpc_hosts")" "$(hcl_csv_list "$metrics_scopes")" \
+    "$(hcl_csv_list "$shared_vpc_hosts")" "$(hcl_csv_list "$metrics_scopes")"
+  if [ -n "$max_projects" ]; then
+    printf '  max_projects     = %s\n' "$max_projects"
+  fi
+  printf '  exclude = {\n    projects = %s\n    clusters = %s\n  }\n}\n' \
     "$(hcl_csv_list "$exclude_projects")" "$clusters"
 }
 
@@ -1069,14 +1104,16 @@ require_scope_cluster_triples() {
 #      holds the served one, and the retry must not read that as a hand edit;
 #   K  the scope the SCOPE_* keys declare now.
 #
-# Refused when L is present and non-empty, L != R and L != K: the CR carries a
+# Refused when L is present and non-empty (a list, an exclusion, or a cap off
+# the CRD's default), L != R and L != K: the CR carries a
 # declaration the installer did not write and the keys do not reproduce. Every
 # other case passes -- nothing live to protect; L == R, the installer wrote it
 # and the keys are the new declaration, emptying it included; L == K, the
 # operator recorded it. No PlatformAgent type served, no CR, no release: pass.
 # L, R and K are the projects, folders, organisations, Shared VPC hosts,
-# Metrics Scopes and exclusions: every list the chart renders, since a list it
-# renders is one the apply replaces.
+# Metrics Scopes and exclusions, every list the chart renders, since a list it
+# renders is one the apply replaces, and the cap, which the apply sets the same
+# way (a CR at the CRD's default reads as the key unset).
 # Anything that stops the read -- no context for this install in the
 # kubeconfig, the CR or the record unreadable -- is a refusal, because the
 # apply itself needs no kubeconfig (the helm provider authenticates with a
@@ -1145,7 +1182,8 @@ print(max(served) if served else "")
 import json, re, sys
 cr_text, record_text, served_text = sys.stdin.read().split("\x1e\n", 2)
 ok, refuse = sys.argv[1], sys.argv[2]
-keys = sys.argv[3:10]
+keys = sys.argv[3:11]
+default_cap = int(sys.argv[11])
 
 def split(value):
     return [item for item in re.split(r"[,\s]+", value) if item]
@@ -1162,13 +1200,17 @@ def normalise(scope):
         "organizations": sorted(set(scope.get("organizations") or [])),
         "sharedVpcHosts": sorted(set(scope.get("sharedVpcHosts") or [])),
         "metricsScopes": sorted(set(scope.get("metricsScopes") or [])),
+        "maxProjects": int(scope.get("maxProjects") or default_cap),
         "exclude": {"projects": sorted(set(exclude.get("projects") or [])), "clusters": clusters},
     }
 
 def is_empty(scope):
+    # Nothing live to protect: no list, no exclusion, and the cap at the default
+    # the CRD sets, which is what the apply renders for a key left unset.
     return not (scope["projects"] or scope["folders"] or scope["organizations"]
                 or scope["sharedVpcHosts"] or scope["metricsScopes"]
-                or scope["exclude"]["projects"] or scope["exclude"]["clusters"])
+                or scope["exclude"]["projects"] or scope["exclude"]["clusters"]
+                or scope["maxProjects"] != default_cap)
 
 items = json.loads(cr_text).get("items") or []
 if len(items) > 1:
@@ -1192,6 +1234,7 @@ declared = normalise({
     "organizations": split(keys[2]),
     "sharedVpcHosts": split(keys[3]),
     "metricsScopes": split(keys[4]),
+    "maxProjects": int(keys[7]) if keys[7].strip() else default_cap,
     "exclude": {
         "projects": split(keys[5]),
         "clusters": [dict(zip(("projectId", "location", "clusterName"), t.split("/"))) for t in split(keys[6])],
@@ -1209,7 +1252,10 @@ print("SCOPE_SHARED_VPC_HOSTS=" + json.dumps(" ".join(live["sharedVpcHosts"])))
 print("SCOPE_METRICS_SCOPES=" + json.dumps(" ".join(live["metricsScopes"])))
 print("SCOPE_EXCLUDE_PROJECTS=" + json.dumps(" ".join(live["exclude"]["projects"])))
 print("SCOPE_EXCLUDE_CLUSTERS=" + json.dumps(" ".join("/".join(c) for c in live["exclude"]["clusters"])))
-' "$SCOPE_VERDICT_OK" "$SCOPE_VERDICT_REFUSE" "${SCOPE_PROJECTS:-}" "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" "${SCOPE_SHARED_VPC_HOSTS:-}" "${SCOPE_METRICS_SCOPES:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" 2>"$err_file")"; then
+# Always among the lines: when the cap is why the compare refused, the key the
+# operator has to change may be one they must blank, not set.
+print("SCOPE_MAX_PROJECTS=" + json.dumps(str(live["maxProjects"]) if live["maxProjects"] != default_cap else ""))
+' "$SCOPE_VERDICT_OK" "$SCOPE_VERDICT_REFUSE" "${SCOPE_PROJECTS:-}" "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" "${SCOPE_SHARED_VPC_HOSTS:-}" "${SCOPE_METRICS_SCOPES:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" "${SCOPE_MAX_PROJECTS:-}" "$SCOPE_MAX_PROJECTS_DEFAULT" 2>"$err_file")"; then
     _scope_check_failed "$mode" "the live and recorded scope could not be compared: $(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
     local rc=$?
     rm -f "$err_file"
@@ -2869,6 +2915,7 @@ write_tfvars_from_state() {
   # terraform with a message naming neither the key nor the entry.
   require_scope_cluster_triples "${SCOPE_EXCLUDE_CLUSTERS:-}" || return 1
   require_scope_container_ids "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" || return 1
+  require_scope_max_projects "${SCOPE_MAX_PROJECTS:-}" || return 1
   # Checked here for the MODEL_MAX_TOKENS reason: upgrade.sh and uninstall.sh
   # regenerate from install.env without install.sh's checks. A misspelt toggle
   # is refused rather than read as off, which would forward requests
@@ -2981,13 +3028,13 @@ write_tfvars_from_state() {
     echo "# The projects, folders, organisations, Shared VPC hosts and Metrics Scopes"
     echo "# beyond project_id whose GKE clusters get a Cluster Agent, and what to leave"
     echo "# unmanaged (SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS,"
-    echo "# SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_EXCLUDE_PROJECTS,"
+    echo "# SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_MAX_PROJECTS, SCOPE_EXCLUDE_PROJECTS,"
     echo "# SCOPE_EXCLUDE_CLUSTERS in install.env). Always written, so this file states"
     echo "# the declaration the composition renders either way, empty lists included; an"
     echo "# emptied list is the declaration that drops what it named."
     hcl_scope_block "${SCOPE_PROJECTS:-}" "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" \
       "${SCOPE_SHARED_VPC_HOSTS:-}" "${SCOPE_METRICS_SCOPES:-}" \
-      "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}"
+      "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" "${SCOPE_MAX_PROJECTS:-}"
     echo ""
     local chat_topic="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
     local chat_sub="${CHAT_SUB_NAME:-$DEFAULT_CHAT_SUB_NAME}"

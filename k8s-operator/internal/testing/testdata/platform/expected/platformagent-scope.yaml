@@ -371,6 +371,7 @@ data:
       "metricsScopes": [
         "ops-metrics"
       ],
+      "maxProjects": 100,
       "exclude": {
         "projects": [
           "*-sandbox"

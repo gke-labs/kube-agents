@@ -37,8 +37,9 @@ what the pool does and does not bound.
 ## Projects, folders, organisations and selectors in scope
 
 `scope` mirrors `spec.scope` on the `PlatformAgent`: `projects`, `folders`, `organizations`,
-`shared_vpc_hosts`, `metrics_scopes`, `exclude.projects` and `exclude.clusters`, with the same
-caps and patterns the CRD enforces, checked at plan time. Each
+`shared_vpc_hosts`, `metrics_scopes`, `max_projects` (the resolved-set cap, 1 to 5000, 100 by
+default, which the whole-set precondition in `main.tf` tests the counted set against; design §6), `exclude.projects` and
+`exclude.clusters`, with the same caps and patterns the CRD enforces, checked at plan time. Each
 project in `projects` other than `project_id` gets the read allowlist in `scope.tf`
 (`roles/container.clusterViewer`, `roles/container.viewer`, `roles/compute.viewer`,
 `roles/monitoring.viewer`, `roles/logging.viewer`, `roles/iam.securityReviewer`) intersected with

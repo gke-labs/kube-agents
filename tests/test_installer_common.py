@@ -12,6 +12,7 @@ import pathlib
 import re
 import shutil
 import stat
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -698,13 +699,13 @@ class InstallerCommonTest(unittest.TestCase):
             env_file = pathlib.Path(tmp) / "install.env"
             env_file.write_text("PROJECT_ID=p\n")
             stray = {"SCOPE_PROJECTS": "stray-project", "SCOPE_EXCLUDE_PROJECTS": "*-stray",
-                     "SCOPE_EXCLUDE_CLUSTERS": "s/l/c"}
-            probe = 'echo "P=${SCOPE_PROJECTS:-unset} X=${SCOPE_EXCLUDE_PROJECTS:-unset} C=${SCOPE_EXCLUDE_CLUSTERS:-unset}"'
+                     "SCOPE_EXCLUDE_CLUSTERS": "s/l/c", "SCOPE_MAX_PROJECTS": "250"}
+            probe = 'echo "P=${SCOPE_PROJECTS:-unset} X=${SCOPE_EXCLUDE_PROJECTS:-unset} C=${SCOPE_EXCLUDE_CLUSTERS:-unset} M=${SCOPE_MAX_PROJECTS:-unset}"'
             proc = self._run(f'load_install_env "{env_file}"; {probe}', env=stray)
-            self.assertIn("P=unset X=unset C=unset", proc.stdout, proc.stderr)
-            env_file.write_text("PROJECT_ID=p\nSCOPE_PROJECTS=from-the-file\n")
+            self.assertIn("P=unset X=unset C=unset M=unset", proc.stdout, proc.stderr)
+            env_file.write_text("PROJECT_ID=p\nSCOPE_PROJECTS=from-the-file\nSCOPE_MAX_PROJECTS=300\n")
             proc = self._run(f'load_install_env "{env_file}"; {probe}', env=stray)
-            self.assertIn("P=from-the-file X=unset C=unset", proc.stdout, proc.stderr)
+            self.assertIn("P=from-the-file X=unset C=unset M=300", proc.stdout, proc.stderr)
 
     def test_service_account_ownership_still_refuses_on_a_clean_absence(self):
         proc = self._run(
@@ -2959,6 +2960,44 @@ class ScopeKeysReachTheTfvarsTest(unittest.TestCase):
         content = self._tfvars(self._scope_env())
         self.assertIn(self.EMPTY_BLOCK, content)
 
+    def test_the_cap_is_written_only_when_set(self):
+        # Unset, the CRD's and the module's default apply and the block names
+        # no cap; set, it is written where the module's object carries it.
+        self.assertNotIn("max_projects", self._tfvars(self._scope_env()))
+        content = self._tfvars(self._scope_env(SCOPE_MAX_PROJECTS="250"))
+        self.assertIn("  metrics_scopes   = []\n  max_projects     = 250\n  exclude = {\n", content)
+
+    def test_a_malformed_cap_in_install_env_stops_the_writer_before_a_file_exists(self):
+        # upgrade.sh and the Day-2 menu reach the generator without install.sh's
+        # parameter block, so the writer checks the value itself.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=self._scope_env(SCOPE_MAX_PROJECTS="lots"))
+            self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+            self.assertIn("SCOPE_MAX_PROJECTS='lots' is not a whole number from 1 to 5000", proc.stdout + proc.stderr)
+            self.assertFalse(dest.exists())
+
+    def test_a_cap_outside_the_crds_bounds_stops_the_run_naming_the_key(self):
+        for bad in ("0", "abc", "5001", "2.5", "-3", " 12", "18446744073709551716"):
+            with self.subTest(bad=bad):
+                proc = subprocess.run(
+                    ["bash", "-c",
+                     'print_error() { echo "ERROR: $*"; }; print_info() { :; }; print_warning() { :; }; print_success() { :; }\n'
+                     f'source "{_INSTALLER_COMMON}"\nrequire_scope_max_projects {shlex.quote(bad)}; echo "rc=$?"'],
+                    capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+                )
+                self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+                self.assertIn(f"SCOPE_MAX_PROJECTS='{bad}' is not a whole number from 1 to 5000", proc.stdout)
+        for good in ("", "1", "250", "5000", "0250"):
+            with self.subTest(good=good):
+                proc = subprocess.run(
+                    ["bash", "-c",
+                     'print_error() { echo "ERROR: $*"; }; print_info() { :; }; print_warning() { :; }; print_success() { :; }\n'
+                     f'source "{_INSTALLER_COMMON}"\nrequire_scope_max_projects {shlex.quote(good)}; echo "rc=$?"'],
+                    capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+                )
+                self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
+
     def test_the_keys_are_carried_verbatim_into_the_block(self):
         content = self._tfvars(self._scope_env(
             SCOPE_PROJECTS="payments-prod, payments-staging",
@@ -3160,6 +3199,49 @@ class PreApplyScopeCheckTest(unittest.TestCase):
             "SCOPE_EXCLUDE_CLUSTERS": "p2-project/us-central1/c1, p2-project/us-central1/c1",
         })
         self._assert_rc(proc, 0)
+
+    def test_a_cap_alone_on_a_scope_less_cr_is_a_hand_edit(self):
+        # A CR whose only hand edit is the cap is not "nothing live to protect": the apply
+        # would render the default over it. It is refused with the key among the lines
+        # until the key records it; the default alone is still an empty declaration.
+        capped_only = '{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"maxProjects":250}}}]}'
+        proc = self._run(capped_only, "norelease")
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_PROJECTS=""', proc.stdout)
+        self.assertIn('INFO:   SCOPE_MAX_PROJECTS="250"', proc.stdout)
+        self._assert_rc(self._run(capped_only, "norelease", keys={"SCOPE_MAX_PROJECTS": "250"}), 0)
+        self._assert_rc(self._run(capped_only.replace("250", "100"), "norelease"), 0)
+
+    def test_a_cap_set_on_the_cr_by_hand_is_a_hand_edit_until_the_key_records_it(self):
+        # The cap is part of the declaration: a CR whose maxProjects differs from
+        # what the record and the keys say is refused, with the key among the
+        # lines; one at the CRD's default reads as unset, since the API server
+        # defaults the field on every CR that carries a scope block.
+        capped = _LIVE_SCOPE_CR.replace('"projects":["p3-project","p2-project"],', '"projects":["p3-project","p2-project"],"maxProjects":250,')
+        record = ('{"platformAgent":{"scope":{"projects":["p2-project","p3-project"],"exclude":{"projects":[],'
+                  '"clusters":[{"projectId":"p2-project","location":"us-central1","clusterName":"c1"}]}}}}')
+        proc = self._run(capped, record)
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_MAX_PROJECTS="250"', proc.stdout)
+        self._assert_rc(self._run(capped, record, keys={"SCOPE_PROJECTS": "p2-project p3-project",
+                                                       "SCOPE_EXCLUDE_CLUSTERS": "p2-project/us-central1/c1",
+                                                       "SCOPE_MAX_PROJECTS": "250"}), 0)
+        self._assert_rc(self._run(capped, record.replace('"projects":["p2-project","p3-project"],', '"projects":["p2-project","p3-project"],"maxProjects":250,')), 0)
+        defaulted = _LIVE_SCOPE_CR.replace('"projects":["p3-project","p2-project"],', '"projects":["p3-project","p2-project"],"maxProjects":100,')
+        self._assert_rc(self._run(defaulted, record), 0)
+        proc = self._run(defaulted, "norelease")
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_MAX_PROJECTS=""', proc.stdout)
+        # The key is among the lines even when the live cap is the default, because it
+        # may be the one key the operator has to blank: a record and keys at 250 beside
+        # a CR the API server re-defaulted refuse on the cap alone, and the lines the
+        # refusal prints must not reproduce the install.env that was refused.
+        recorded_at_250 = record.replace('"projects":["p2-project","p3-project"],', '"projects":["p2-project","p3-project"],"maxProjects":250,')
+        proc = self._run(defaulted, recorded_at_250, keys={"SCOPE_PROJECTS": "p2-project p3-project",
+                                                           "SCOPE_EXCLUDE_CLUSTERS": "p2-project/us-central1/c1",
+                                                           "SCOPE_MAX_PROJECTS": "250"})
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_MAX_PROJECTS=""', proc.stdout)
 
     def test_a_scope_the_installer_wrote_may_be_changed_or_emptied(self):
         # L == R: the record shows the installer rendered it; the keys are the
