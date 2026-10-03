@@ -8,7 +8,11 @@
 # roster only (#1023), moved to the nightly with the other held-out cases
 # (434/681 graded presubmit repetitions 2026-09-15 to 09-22; since #1780 it
 # is graded by pull_request_opened, and nothing sweeps the *-infra
-# repositories between runs, #1755 item 2). Re-admission bar: #1189's.
+# repositories between runs, #1755 item 2; since #2016 step 3 that check
+# also passes a repetition on an in-job sibling, the pull request an earlier
+# repetition of the same job opened in the leased repository, where the case
+# sets accepts_in_job_sibling as this one and pdb-remediation-pr do -- see
+# the accumulation paragraph below). Re-admission bar: #1189's.
 # Parked 2026-08-26→27 because its cost and signal were unmeasured (the
 # 2026-08-26 run's 85-minute deadline expired before it ever started); the
 # activating pull request's own smoke run is the clean measured run it was
@@ -62,6 +66,18 @@
 # job usually inherits none, its own reps accumulate within it, and the
 # head-commit check keeps an inherited one out of grading -- which is why this
 # scenario asserts on the PR URL its own run produced rather than on repo state.
+# Within a job the accumulation is graded as such since #2016 step 3: the
+# skill reuses the branch, so a later rep with the same fix pushes nothing
+# and links the earlier rep's pull request; pull_request_opened passes that
+# as an in-job sibling (opened by a [bot] login on a platform-agent/ branch
+# in the leased *-infra repository itself at or after this job's lease
+# window began, open or merged; another App's or a fork's is not) and says
+# so in the reason, without being able to tell a rep that did the same work
+# from one that did none and linked the sibling (the cost #2016 step 3
+# accepts for the pdb seat and this case, which is why the rule is set per
+# case, accepts_in_job_sibling, and not every pull_request_opened's default),
+# where a rep that pushed passes as own-head-commit. A pull request from an
+# earlier lease -- before the window -- still fails, as #1832 intends.
 #
 # Isolation class: read-only on the cluster; unbounded write to the eval
 # GitOps repo. Presubmit-eligible on the same terms as the audit scenarios
@@ -114,11 +130,22 @@ verification_spec:
     mode: assert
     check:
       # Not report_contains: a substring passes on an invented URL, and on
-      # the PR an earlier rep opened. This resolves the URL and reads the head
-      # commit, so a rep that only quoted an earlier rep's PR fails.
+      # the PR an earlier lease left behind. This resolves the URL and reads
+      # the head commit; a rep passes on its own push (own-head-commit) or,
+      # with accepts_in_job_sibling below (#2016 step 3), on the PR an
+      # earlier rep of the same job opened in the leased repository
+      # (in-job-sibling; the accumulation paragraph above says what that
+      # rule reads and what it cannot). A leftover from before this job's
+      # lease window still fails.
       type: pull_request_opened
       # Closes the TODO this check carried: the repositories are decided.
       owner: gke-agentic
+      # The second rule is per case, because its cost is: a rep that did no
+      # work and linked the sibling passes under it too. This case and
+      # pdb-remediation-pr took that cost (#2016 step 3; the accumulation
+      # paragraph); no other case did. Off, the check grades the rep's own
+      # push alone.
+      accepts_in_job_sibling: true
   - name: rca-names-the-planted-cause
     role: objective
     # assert, not the converge default: the transcript is immutable once the

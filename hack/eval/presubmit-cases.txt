@@ -199,16 +199,19 @@
 # 420-1929s a repetition measured; hinted at 1250 in unit_cost_hint,
 # unchanged. Roster line when #2016 step 3 holds -- three clean days at
 # >= 90% of graded repetitions, no all-reps collapse, infra classes the
-# harness excludes not counted. One graded miss shape is the case's own and
-# counts: a job's three repetitions share the leased repository and the
-# pool sweep (hack/ci_sweep_agent_pulls.py, #1832) runs between leases, not
-# between them, so repetitions 2 and 3 meet repetition 1's open pull
-# request; one that pushes its own commit onto it passes (#1832 grades the
-# head commit), one that only links its sibling's pull request fails. Read
-# a 50-67% day as that before reading it as regression; step 3 decides
-# whether to count it, grade repetition 1 only, or sweep between
-# repetitions. remediation stays on the docs/designs/domains.yaml
-# allowlist until then.
+# harness excludes not counted. Graded as an in-job sibling since #2016
+# step 3 (the check's accepts_in_job_sibling, set on this case and
+# rca-remediation-pr only): a job's three repetitions share the leased repository, the pool
+# sweep (hack/ci_sweep_agent_pulls.py, #1832) runs between leases, not
+# between them, and submit-suggestion reuses the branch, so repetitions 2
+# and 3 meet repetition 1's open pull request with the fix on it and push
+# nothing; pull_request_opened passes a repetition on its own head commit
+# (own-head-commit) or on a pull request a [bot] login opened on a
+# platform-agent/ branch in the leased *-infra repository itself at or after
+# this job's lease window began (in-job-sibling), and names which; an
+# earlier lease's leftover, a person's or another App's pull request, and a
+# fork's still fail. remediation
+# stays on the docs/designs/domains.yaml allowlist until then.
 ./tasks/pdb-remediation-pr/task.yaml
 
 # Moved out to nightly-cases.txt, for the record:

@@ -53,6 +53,13 @@ readonly EVAL_INJECT_LANE_SAFEGUARDS_FILE="eval/inject-lane-safeguards.yaml"
 readonly EVAL_UNIT_LAUNCH_STAGGER_SECONDS=5
 readonly EVAL_GITHUB_WRITE_SETTLE_SECONDS=120
 
+# The lease check before the pull_request_opened window is stamped
+# (lease_held_by_this_job): one Boskos /update for PROJECT_ID as this job's
+# owner, in the state boskos_heartbeat.sh holds every kube-agents lease in.
+# Capped so a slow Boskos costs the run seconds; a timeout is no window.
+readonly EVAL_LEASE_CHECK_TIMEOUT_SECONDS=10
+readonly EVAL_LEASE_CHECK_STATE="busy"
+
 # What `bench-gate suite` exits, and writes as `outcome` in eval-verdict.json,
 # when the run could not be evaluated: an admitted case lost every repetition
 # to infrastructure, or every case did. Both are bench/kube_agents_bench/
@@ -880,6 +887,47 @@ START_TIME=$SECONDS
 # fan-out asks GitHub what was written since this run began, and GitHub's
 # stamps are wall clock.
 EVAL_RUN_STARTED_AT="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+# When this job's lease window began, for the pull_request_opened check
+# (LEASE_START_ENV in bench/kube_agents_bench/verifiers.py): a pull request in
+# the leased repository (EVAL_LEDGER_REPO, exported below) created at or after
+# this instant was opened by this job, since the project is leased to no one
+# else, and passes a later repetition of a case that sets
+# accepts_in_job_sibling (the pdb and rca seats) as an in-job sibling
+# (#2016 step 3: submit-suggestion reuses the branch, so repetitions 2 and 3
+# push nothing and link repetition 1's pull request). The run's own stamp
+# above rather than the Boskos acquire, which the Prow wrapper did before
+# this script started: this instant is inside the lease and no agent has run
+# in the project before it, so nothing this job opened is excluded and
+# nothing an earlier lease left is included. Not inherited from the
+# environment: a stamp set elsewhere (a shell, a stale job environment, a
+# date with no time) would widen the window onto every leftover, and the
+# verifier reads one older than a day as no window at all. Exported only
+# when Boskos confirms this job holds PROJECT_ID's lease: being in Prow is not
+# enough, because a project pinned in hack/ci-env.sh during onboarding, or the
+# default one there, is not the project the wrapper leased, and a hand run
+# leases nothing -- in each a concurrent job's pull request would pass as this
+# run's sibling. Unset, the verifier reads no window and grades only a
+# repetition's own push; the job itself goes on either way.
+lease_held_by_this_job() {
+  # PROJECT_ID, not BOSKOS_RESOURCE_NAME: the question is whether the project
+  # this run writes to is this job's, whichever one the wrapper acquired.
+  # Only the owner gets 200; 401 is another owner, 404 an unleased name, and
+  # curl's "000" a timeout or no Boskos. curl -w can emit more than three
+  # digits when a connection dies after headers, hence the last three.
+  local code
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time "${EVAL_LEASE_CHECK_TIMEOUT_SECONDS}" \
+    -X POST "${BOSKOS_HOST}/update?name=${PROJECT_ID}&owner=${BOSKOS_OWNER_NAME}&state=${EVAL_LEASE_CHECK_STATE}" \
+    2>/dev/null)" || true
+  [ "${code:(-3)}" = "200" ]
+}
+unset EVAL_LEASE_STARTED_AT
+if [ -n "${JOB_NAME:-}" ] && [ -n "${BUILD_ID:-}" ]; then
+  if lease_held_by_this_job; then
+    export EVAL_LEASE_STARTED_AT="${EVAL_RUN_STARTED_AT}"
+  else
+    echo "=== Boskos did not confirm this job holds ${PROJECT_ID}'s lease: no lease window, so pull_request_opened grades only a repetition's own push ==="
+  fi
+fi
 echo "=== [${EVAL_RUN_STARTED_AT}] Running PR Smoke Test Evaluation for PR #${PR_ID} in Namespace: ${TARGET_NAMESPACE} ==="
 
 # 2. Cluster Auth
@@ -1448,6 +1496,13 @@ release_inflight_note() { # <label> <audit-id>
 }
 
 EVAL_LEDGER_REPO="$(eval_gitops_repo "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
+# Exported for the pull_request_opened check (LEASED_REPO_ENV in
+# bench/kube_agents_bench/verifiers.py), which reads it beside
+# EVAL_LEASE_STARTED_AT above: a pull request is an in-job sibling only in
+# this repository, and only for a case that sets accepts_in_job_sibling.
+# Empty on an unmapped project, and the check then grades a repetition's own
+# push alone, as it did before.
+export EVAL_LEDGER_REPO
 reset_audit_ledgers "lease"
 
 # For opentofu provider
@@ -2041,7 +2096,8 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # it the last unit, by minutes. No Prow deadline change rides with this
 # activation. (The same pull request first moved pdb-remediation-pr in
 # beside it, hinted at 1250, and withdrew that before merge: its record was
-# graded by the check #1780 replaced; nightly-cases.txt carries the note.)
+# graded by the check #1780 replaced; the presubmit file carries the 09-22
+# withdrawal note, beside the held-out seat it opened on 2026-09-28.)
 #
 # Later on 2026-09-22 the presubmit became the BLOCKING ROSTER ONLY (#1023,
 # the eval crew's call): the seven held-out cases it had been running

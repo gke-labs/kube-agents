@@ -481,6 +481,45 @@ LEDGER_AUDIT_IDS = frozenset(
 # LedgerIssueContainsVerifier's docstring for what it has to be.
 LEDGER_TOKEN_ENV_VARS = ("BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
 
+# The job's lease window, from the environment, for `pull_request_opened`:
+# the repository the leased project's GitOps writes go to
+# (`gke-agentic/<project>-infra`, the slug hack/ci-eval-pr.sh derives for its
+# ledger resets and exports) and the UTC instant the window began (ISO-8601;
+# hack/ci-eval-pr.sh stamps its own start, which is inside the Boskos lease
+# and before any agent has run in the project). Both set is what lets the
+# check tell a pull request an earlier repetition of THIS job opened from one
+# an earlier lease left behind; either unset -- a hand run -- and only a
+# repetition's own push passes. scripts/test_ci_eval_ledger_reset.py pins the
+# two names to the script's exports.
+LEASED_REPO_ENV = "EVAL_LEDGER_REPO"
+LEASE_START_ENV = "EVAL_LEASE_STARTED_AT"
+# The one shape `hack/ci-eval-pr.sh` writes for it; the sibling rule refuses any other.
+_LEASE_STAMP_SHAPE = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z"
+# How far before a repetition's start the window may begin and still be this
+# job's. The script stamps it at its own start, and a nightly's last
+# repetition runs hours later, never a day; a stamp older than this came from
+# somewhere else and is read as no window (PullRequestOpenedVerifier.verify).
+LEASE_WINDOW_MAX_SEC = 24 * 3600
+
+# The three ways `pull_request_opened` passes, as the reason's first word and
+# as `raw["rule"]`, so the run record (`results.json`) can tell them apart; the
+# dashboard's Cases page drops a passing repetition's reason and cannot.
+PR_RULE_OWN_HEAD_COMMIT = "own-head-commit"
+PR_RULE_IN_JOB_SIBLING = "in-job-sibling"
+PR_RULE_STREAM_PULL_REQUEST = "stream-pull-request"
+
+# Who may have opened an in-job sibling: a GitHub App's bot, which is the only
+# kind of login the agent writes as (the minter App, hack/ci-deploy.sh's
+# EVAL_GITHUB_APP_ID). The App's slug is deliberately not written out anywhere
+# in this repository -- hack/ci_sweep_agent_pulls.py reads it with GET /app
+# under a JWT signed by the pool project's KMS key, which the eval runners do
+# not hold -- so the check tests the kind of login, as
+# hack/ci_reset_audit_ledgers.py does for the ledger issues, not the name. That
+# keeps a human's pull request opened in the window out; a sibling case's
+# agent pull request in the same nightly lease shares the App and is not told
+# apart here (docs/eval-gate-roster.md says so).
+PR_BOT_LOGIN_SUFFIX = "[bot]"
+
 # When the first unit on the case's audit stream began, in epoch seconds, and
 # which audit that stream is; hack/ci-eval-pr.sh exports both for a case that
 # writes a ledger. Read only by PullRequestOpenedVerifier's
@@ -1507,22 +1546,55 @@ class PullRequestOpenedVerifier(BaseVerifier):
 
     WHAT IT ASSERTS. The reply names a github.com pull request URL; GitHub
     resolves it; the number is a pull request and not an issue; it lives under
-    ``owner`` when one is set; it is not closed unmerged; it was written --
-    created or updated -- at or after this run started, less
-    ``max_clock_skew_sec``; it changes at least one file; and its head commit
-    is no older than the same start. Updating counts because the skill reuses a
-    branch and edits the pull request already open on it, which is the
-    documented behaviour rather than a defect -- so the stamp alone proves only
-    that somebody wrote to the pull request, and the head commit is what
-    separates a run that pushed a fix from one that left a comment. That is
-    also what makes reps inside a job gradable: rep 2 pushing onto rep 1's
-    branch moves the head commit, rep 2 quoting rep 1's URL does not. One
-    surviving candidate is enough — a reply may link the ticket it came from
-    beside the fix — and a candidate GitHub cannot answer for ends the check
-    only when no other candidate passes. With ``reuses_spent_branch`` it also
-    asks that the branch carried a closed pull request created during this
-    run, that the candidate does not contain that one's head revision, and
-    that the report names that one too.
+    ``owner`` when one is set; it is not closed unmerged; it changes at least
+    one file; and one of the rules below holds, named first in the reason and
+    in ``raw["rule"]``. The first applies to every case; the second only to a
+    case that sets ``accepts_in_job_sibling``; the third only to one that sets
+    ``accepts_stream_pull_request``:
+
+    * ``own-head-commit`` -- it was written (created or updated) at or after
+      this run started, less ``max_clock_skew_sec``, and its head commit is no
+      older than the same start. Updating counts because the skill reuses a
+      branch and edits the pull request already open on it, which is the
+      documented behaviour rather than a defect -- so the stamp alone proves
+      only that somebody wrote to the pull request, and the head commit is
+      what separates a run that pushed a fix from one that left a comment.
+    * ``in-job-sibling`` -- with ``accepts_in_job_sibling``, it sits in the
+      leased project's own repository
+      (``EVAL_LEDGER_REPO``), was created at or after this job's lease window
+      began (``EVAL_LEASE_STARTED_AT``, the same skew allowed), was opened by
+      a ``[bot]`` login (``PR_BOT_LOGIN_SUFFIX``: an App's, as the agent
+      writes; not a person's) on a head branch under ``AGENT_BRANCH_PREFIX``
+      in the repository itself (the agent's, as the pool sweep and
+      ``github_writes`` recognise it; not another App's, not a fork's), and
+      is open or merged. The skill derives the
+      branch from the change, so once repetition 1's fix is on it,
+      repetitions 2 and 3 of the same job push nothing, ``gh pr create``
+      answers "already exists", and the skill hands back repetition 1's
+      URL: correct work with no commit of its own, the 1/3 the held-out
+      seat's second live run read (#2016 step 3). The
+      project is leased to no one else during the window, so a pull request
+      the agent opened inside it in that repository is this job's; one opened
+      before it is an earlier lease's leftover and fails exactly as #1832
+      intends. The window is the job's, not the case's: every PR-writing
+      case in a nightly shares it and writes as the same App, so which case
+      opened a sibling is not something this check can tell. The option is
+      per case because the rule's cost is per case: it reads the pull
+      request, not the repetition's work, so a repetition that produced no
+      fix and linked the agent's in-window pull request passes under it as
+      the repetition that produced the same fix does. #2016 step 3 took that
+      cost for pdb-remediation-pr and rca-remediation-pr; no other case's
+      decision did, so no other case sets it.
+
+    One surviving candidate is enough — a reply may link the ticket it came
+    from beside the fix — and a candidate GitHub cannot answer for ends the
+    check only when no other candidate passes. Without ``accepts_in_job_sibling``,
+    or with no lease window in the environment (a hand run), only the first rule
+    can pass. With
+    ``reuses_spent_branch`` the check also asks, under either rule, that the
+    branch carried a closed pull request created during this run, that the
+    candidate does not contain that one's head revision, and that the report
+    names that one too.
 
     With ``accepts_stream_pull_request`` the two "since this run started"
     clauses measure instead from when the first unit on the case's audit
@@ -1584,6 +1656,16 @@ class PullRequestOpenedVerifier(BaseVerifier):
     # `/pulls?state=closed&head=` and `/pulls/{n}/commits`, so the credential
     # needs `pull_requests: read`.
     reuses_spent_branch: bool = False
+    # Also pass under the second rule: a pull request an earlier repetition of
+    # this job opened in the leased repository, which this repetition met on
+    # the branch the skill derives from the change and pushed nothing to
+    # (the docstring's in-job-sibling). Off by default because the rule reads
+    # the pull request and not the repetition's work: a repetition that
+    # produced no fix and linked that pull request passes under it too. That
+    # cost was taken for the pdb-remediation-pr and rca-remediation-pr seats
+    # (#2016 step 3) and for no other case, so only those two set it; every
+    # other `pull_request_opened` grades the repetition's own push alone.
+    accepts_in_job_sibling: bool = False
     # Measure "written since" and "head commit since" from the first unit on
     # the case's audit stream rather than the run, so a later run of the audit
     # passes on the pull request an earlier one opened and this one found
@@ -1896,6 +1978,101 @@ class PullRequestOpenedVerifier(BaseVerifier):
             return changed, _parse_github_time(committer.get("date")), payload, listing, None
         return changed, None, payload, listing, None
 
+    def _not_in_job(
+        self,
+        owner: str,
+        repo: str,
+        created: datetime,
+        author: str,
+        lease_repo: str,
+        lease_start: datetime | None,
+        started: datetime,
+        fault: str | None = None,
+    ) -> str | None:
+        """Why a pull request is NOT an in-job sibling, or None when it is one.
+
+        The first half of the test, from the issues payload; the head's half
+        is :meth:`_not_agent_head`, asked once the pulls payload is read.
+        Six answers, each a clause the rejection can carry: the case does not
+        set ``accepts_in_job_sibling`` (the rule is off, whatever the
+        environment says); no lease window
+        in the environment; a repository other than the leased one (nobody's
+        sibling, whatever its dates); an author that is not a ``[bot]`` login
+        (a person's pull request, whenever opened); created before the window
+        began, less ``max_clock_skew_sec`` -- an earlier lease's leftover;
+        created at or after this run started, less ``max_clock_skew_sec`` --
+        this repetition's own, which
+        the first rule grades on its push, so a pull request this run opened
+        on a branch whose tip it did not move is the #1832 rejection it
+        always was and never "an earlier repetition's".
+        The author is tested before the date so a person's pull request is
+        named as such whichever side of the window it sits. Open-or-merged
+        is the caller's: closed unmerged is rejected before this is asked, and
+        a merge postdates its creation, so "merged inside the window" is
+        implied by "created inside it".
+        """
+        if not self.accepts_in_job_sibling:
+            return (
+                "the case does not set `accepts_in_job_sibling`, so no in-job "
+                "sibling can pass"
+            )
+        if not lease_repo or lease_start is None:
+            return (
+                f"no lease window in the environment ({LEASED_REPO_ENV} and "
+                f"{LEASE_START_ENV}), so no in-job sibling can pass"
+                + (f"; {fault}" if fault else "")
+            )
+        if f"{owner}/{repo}".lower() != lease_repo:
+            return f"not in the leased repository {lease_repo}, so not an in-job sibling"
+        if not author.endswith(PR_BOT_LOGIN_SUFFIX):
+            return (
+                f"opened by {author or '?'}, not a {PR_BOT_LOGIN_SUFFIX} login as the "
+                "agent's are, so a person's pull request and not an in-job sibling"
+            )
+        early = (lease_start - created).total_seconds()
+        if early > self.max_clock_skew_sec:
+            return (
+                f"opened at {created.isoformat()}, {early:.0f}s before this job's "
+                f"lease window began ({lease_start.isoformat()}), so an earlier "
+                "lease's leftover and not an in-job sibling"
+            )
+        if (started - created).total_seconds() <= self.max_clock_skew_sec:
+            return (
+                f"opened at {created.isoformat()}, during this run, so this "
+                "repetition's own pull request, graded on its push and not as an "
+                "in-job sibling"
+            )
+        return None
+
+    @staticmethod
+    def _not_agent_head(pull: dict, owner: str, repo: str) -> str | None:
+        """Why the pull request's head is NOT the agent's, or None when it is.
+
+        The second half of the sibling test, asked once the pulls payload is
+        in hand (the issues payload carries no head). A ``[bot]`` login alone
+        is any App's: Dependabot, a workflow, another App installed on the
+        repository. The agent's pull requests are the ones the pool sweep and
+        ``github_writes`` recognise as its: a head branch under
+        ``AGENT_BRANCH_PREFIX`` (the prefix ``forge.py`` gives every agent
+        branch) in the repository itself, not a fork. A payload with no head
+        is nobody's: an observation the API would not give is not evidence.
+        """
+        head = pull.get("head") if isinstance(pull.get("head"), dict) else {}
+        ref = str(head.get("ref") or "")
+        head_repo = str((head.get("repo") or {}).get("full_name") or "")
+        if not ref.startswith(github_writes.AGENT_BRANCH_PREFIX):
+            return (
+                f"its head branch {ref or '?'} is not under {github_writes.AGENT_BRANCH_PREFIX}, "
+                "the prefix every agent branch carries, so another App's pull request "
+                "and not an in-job sibling"
+            )
+        if head_repo.lower() != f"{owner}/{repo}".lower():
+            return (
+                f"its head {head_repo or '?'}:{ref} is not in {owner}/{repo} itself, so "
+                "not a pull request the agent pushed and not an in-job sibling"
+            )
+        return None
+
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
 
@@ -1924,6 +2101,12 @@ class PullRequestOpenedVerifier(BaseVerifier):
         )
         if not token:
             return done(False, _NO_TOKEN_REASON, status="error")
+        # The job's lease window; see LEASED_REPO_ENV. An unparseable stamp is
+        # no window, which is the strict reading: nothing passes as a sibling
+        # on a clock the check cannot read.
+        lease_repo = (os.environ.get(LEASED_REPO_ENV) or "").strip().lower()
+        lease_raw = (os.environ.get(LEASE_START_ENV) or "").strip()
+        lease_start = _parse_github_time(lease_raw)
 
         seen: list[tuple[str, str, int]] = []
         for owner, repo, number in _PULL_URL_RE.findall(snap.final_message):
@@ -1941,9 +2124,52 @@ class PullRequestOpenedVerifier(BaseVerifier):
             )
 
         started = datetime.fromtimestamp(snap.started_at, tz=timezone.utc)
+        skew = self.max_clock_skew_sec
+        # The window must be this job's: it is stamped at the script's start,
+        # and a repetition runs hours after that at most. A stamp from
+        # elsewhere (a shell, a stale job environment, a date with no time)
+        # would widen the window onto every leftover, so one outside the
+        # bounds is read as no window, with the reason.
+        window_fault: str | None = None
+        if lease_raw and lease_start is None:
+            window_fault = (
+                f"{LEASE_START_ENV}={lease_raw!r} is not an ISO-8601 stamp, so it is "
+                "read as no window"
+            )
+        elif lease_start is not None and not re.fullmatch(_LEASE_STAMP_SHAPE, lease_raw):
+            # The script writes one shape (`date -u +%Y-%m-%dT%H:%M:%SZ`).
+            # Other stamps parse and mean something else: a bare date is
+            # midnight, a date and time joined by a space is the same instant
+            # in another spelling, an hour-only `T08Z` is the top of the hour,
+            # and a zone-less time is read as UTC whatever the writer meant.
+            # So the shape is tested, not the letter T, and any other is
+            # refused for the shape, named as such.
+            window_fault = (
+                f"{LEASE_START_ENV}={lease_raw!r} is not in the script's "
+                "YYYY-MM-DDTHH:MM:SSZ form, so it is read as no window"
+            )
+            lease_start = None
+        if lease_start is not None:
+            ahead = (lease_start - started).total_seconds()
+            if ahead > skew:
+                window_fault = (
+                    f"{LEASE_START_ENV}={lease_start.isoformat()} begins after this run "
+                    f"started ({started.isoformat()}), which no job's lease does, so it "
+                    "is read as no window"
+                )
+                lease_start = None
+            elif -ahead > LEASE_WINDOW_MAX_SEC:
+                window_fault = (
+                    f"{LEASE_START_ENV}={lease_start.isoformat()} is {-ahead / 3600:.0f}h "
+                    f"before this run started ({started.isoformat()}), longer than any one "
+                    f"job's lease ({LEASE_WINDOW_MAX_SEC // 3600}h), so not this job's "
+                    "window and read as none"
+                )
+                lease_start = None
         # The floor every "since" clause below measures from: the run, or with
         # accepts_stream_pull_request the stream's first unit, when the harness
-        # exported one.
+        # exported one. The third rule (class docstring); the in-job sibling
+        # rule above is the second, and the two are decided apart.
         since, since_what = started, "this run started"
         stream_branch = ""
         if self.accepts_stream_pull_request and not _stream_audit():
@@ -2025,6 +2251,17 @@ class PullRequestOpenedVerifier(BaseVerifier):
             if created is None:
                 rejected.append(f"{slug}: GitHub returned no readable created_at")
                 continue
+            # The second rule (class docstring): a pull request this job's
+            # earlier repetition opened in the leased repository passes with
+            # no push of its own. Decided here, applied at the two places the
+            # first rule would reject it, so a candidate that meets the first
+            # rule is still recorded as own-head-commit.
+            # `user.login` is on both endpoints' payloads; an App's ends in
+            # PR_BOT_LOGIN_SUFFIX. Missing reads as nobody, which is no bot.
+            author = str((payload.get("user") or {}).get("login") or "")
+            not_sibling = self._not_in_job(
+                owner, repo, created, author, lease_repo, lease_start, started, window_fault
+            )
             # Creation is not the only way a run owns a pull request: the
             # submit-suggestion skill derives the branch from the change, so a
             # later rep pushes onto the branch the first one used, `gh pr
@@ -2039,17 +2276,23 @@ class PullRequestOpenedVerifier(BaseVerifier):
             updated = _parse_github_time(payload.get("updated_at"))
             touched = updated if updated and updated > created else created
             age = (since - touched).total_seconds()
-            if age > self.max_clock_skew_sec:
-                rejected.append(
+            stale_write = age > skew
+
+            def quoted_leftover(why: str) -> str:
+                return (
                     f"{slug}: last written at {touched.isoformat()}, {age:.0f}s "
                     f"BEFORE {since_what} ({since.isoformat()}) — a leftover "
                     "an earlier run opened, which this run either quoted or "
-                    "resubmitted unchanged"
+                    f"resubmitted unchanged; {why}"
                 )
+
+            if stale_write and not_sibling:
+                rejected.append(quoted_leftover(not_sibling))
                 continue
             # What the stamp above cannot say: whether the run pushed a fix or
             # only wrote to a pull request. `updated_at` moves on a comment and
-            # on a label. The head commit moves on neither.
+            # on a label. The head commit moves on neither. Read for a sibling
+            # too: an empty pull request carries no fix whoever opened it.
             try:
                 changed, pushed, pull, listing, unevaluable = self._head_push(
                     owner, repo, number, payload, token, budget
@@ -2060,25 +2303,67 @@ class PullRequestOpenedVerifier(BaseVerifier):
             if unevaluable:
                 unresolved.append(unevaluable)
                 continue
+            # The sibling test's second half needs the pulls payload, which
+            # is in hand only now: the login said an App, the head says
+            # whether it is the agent's. A candidate the first half already
+            # rejected keeps that reason.
+            if not_sibling is None:
+                not_sibling = self._not_agent_head(pull, owner, repo)
+                if not_sibling and stale_write:
+                    rejected.append(quoted_leftover(not_sibling))
+                    continue
             if changed == 0:
                 rejected.append(
                     f"{slug}: changes no files, so it carries no proposed fix"
                 )
                 continue
-            if pushed and (since - pushed).total_seconds() > self.max_clock_skew_sec:
+            stale_head = bool(pushed) and (since - pushed).total_seconds() > skew
+            # The sibling test's last clause: where the head commit came from.
+            # A pull request opened inside the window on a tip from before it
+            # carries an earlier lease's commit, so it fails for every
+            # repetition that links it, as it does for the one that opened it.
+            if (
+                not_sibling is None
+                and pushed
+                and lease_start is not None
+                and (lease_start - pushed).total_seconds() > skew
+            ):
+                not_sibling = (
+                    f"head commit {pushed.isoformat()} predates this job's lease "
+                    f"window ({lease_start.isoformat()}), so an earlier lease's "
+                    "commit and not an in-job sibling"
+                )
+            if stale_head and not_sibling:
                 rejected.append(
                     f"{slug}: its head commit dates from {pushed.isoformat()}, "
                     f"before {since_what} ({since.isoformat()}) — this run "
-                    "wrote to a pull request an earlier one pushed the fix to"
+                    f"wrote to a pull request an earlier one pushed the fix to; {not_sibling}"
                 )
                 continue
-            # Only the widened window needs the branch: a pull request this
-            # run wrote and pushed to is this run's whatever it is called.
-            skew = self.max_clock_skew_sec
-            if stream_branch and (
-                (started - touched).total_seconds() > skew
-                or (pushed and (started - pushed).total_seconds() > skew)
-            ):
+            # Which rule is passing. Written and pushed during this run is the
+            # first, whatever the pull request is called. For a case on an
+            # audit stream with the option, the stream rule decides every
+            # other candidate, ahead of the sibling rule: it is the narrower
+            # of the two (the stamp bounds when, the branch is what makes the
+            # pull request the stream's rather than another case's in the
+            # same repository), and inside a Prow job the lease window always
+            # encloses the stream's, so the sibling rule alone would admit a
+            # superset and the branch guard would never run. Otherwise a
+            # stale write or head the sibling rule excused is the second.
+            written_in_run = (started - touched).total_seconds() <= skew
+            pushed_in_run = not pushed or (started - pushed).total_seconds() <= skew
+            own = written_in_run and pushed_in_run
+            if stream_branch and not own:
+                # The stream's own time bound: the sibling rule above excused a
+                # write or head before the stream began, which the lease window
+                # admits and the stream's does not.
+                if stale_write or stale_head:
+                    rejected.append(
+                        f"{slug}: last written or pushed to before {since_what} "
+                        f"({since.isoformat()}), so not this audit stream's; the "
+                        "job's lease window does not stand in for the stream's"
+                    )
+                    continue
                 if f"{owner}/{repo}".lower() != _stream_repo():
                     rejected.append(
                         f"{slug}: last written or pushed to before this run "
@@ -2087,7 +2372,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                         "the same audit stream, not this one's"
                     )
                     continue
-                head = str(((pull or payload).get("head") or {}).get("ref") or "")
+                head = str((pull.get("head") or {}).get("ref") or "")
                 if not head.startswith(stream_branch):
                     rejected.append(
                         f"{slug}: last written or pushed to before this run "
@@ -2097,6 +2382,58 @@ class PullRequestOpenedVerifier(BaseVerifier):
                         "case's pull request, not the stream's"
                     )
                     continue
+            files = (
+                f"{changed if changed is not None else 'an unreported number of'} changed file(s)"
+            )
+            merged = _parse_github_time(merged_at)
+            if own:
+                rule = PR_RULE_OWN_HEAD_COMMIT
+                reason = (
+                    f"{rule}: {slug} was {'opened' if touched == created else 'updated'} "
+                    f"at {touched.isoformat()}, during this run, and carries {files}"
+                )
+            elif stream_branch:
+                rule = PR_RULE_STREAM_PULL_REQUEST
+                reason = (
+                    f"{rule}: {slug} was {'opened' if touched == created else 'updated'} "
+                    f"at {touched.isoformat()}, by an earlier run on this audit stream "
+                    f"(found already open; {since_what} at {since.isoformat()}), and "
+                    f"carries {files}"
+                )
+            elif not_sibling is None:
+                # An undated head is not shown to be this lease's, so the
+                # pre-lease clause above could not be asked: a date the API
+                # would not give is not evidence, as for a payload with no head.
+                if pushed is None:
+                    rejected.append(
+                        f"{slug}: last written at {touched.isoformat()}, before "
+                        f"{since_what}, and the GitHub API gives no date for its "
+                        "head commit, so it is not shown to be this lease's and "
+                        "not an in-job sibling"
+                    )
+                    continue
+                # What was read, not what is inferred from it: the login, the
+                # branch, the repository and the window are the observation;
+                # "an earlier repetition's" is the conclusion the docstring
+                # draws from the lease, and a no-work repetition that linked
+                # the same pull request reads identically.
+                rule = PR_RULE_IN_JOB_SIBLING
+                head_ref = str((pull.get("head") or {}).get("ref") or "?")
+                reason = (
+                    f"{rule}: {slug} was opened at {created.isoformat()} by {author} "
+                    f"on {head_ref} in the leased repository {lease_repo}, inside this "
+                    f"job's lease window (from "
+                    f"{lease_start.isoformat() if lease_start else '?'}) and before this "
+                    f"run started, is {'merged at ' + merged.isoformat() if merged else 'open'}, "
+                    f"and carries {files}; this repetition pushed no commit of its own (last "
+                    f"written {touched.isoformat()}"
+                    + (f", head commit {pushed.isoformat()}" if pushed else "")
+                    + ")"
+                )
+            else:
+                # Unreachable by construction: a stale candidate is either the
+                # stream's (above) or the sibling rule's, or was rejected.
+                raise AssertionError(f"{slug}: stale candidate passed under no rule")
             if self.reuses_spent_branch:
                 try:
                     rejection, unevaluable = self._spent_before(
@@ -2113,29 +2450,23 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 if rejection:
                     rejected.append(rejection)
                     continue
-            # Within the skew allowance a pull request a hair older than the
-            # run is still this run's; "an earlier repetition" only when the
-            # widened window is what admitted it.
-            during = (
-                "during this run"
-                if since == started or (started - touched).total_seconds() <= self.max_clock_skew_sec
-                else f"by an earlier run on this audit stream (found already open; "
-                f"{since_what} at {since.isoformat()})"
-            )
             return done(
                 True,
-                f"{slug} was {'opened' if touched == created else 'updated'} at "
-                f"{touched.isoformat()}, {during}, and carries "
-                f"{changed if changed is not None else 'an unreported number of'} "
-                "changed file(s)"
+                reason
                 + (", on a branch this run's closed pull request had used"
                    if self.reuses_spent_branch else ""),
                 raw={
+                    "rule": rule,
                     "pull_request": slug,
+                    "author": author or None,
                     "created_at": created.isoformat(),
                     "updated_at": updated.isoformat() if updated else None,
+                    "merged_at": merged.isoformat() if merged else None,
                     "changed_files": changed,
                     "head_committed_at": pushed.isoformat() if pushed else None,
+                    "lease_started_at": lease_start.isoformat() if lease_start else None,
+                    "leased_repository": lease_repo or None,
+                    "since": since.isoformat(),
                 },
             )
 
@@ -2148,8 +2479,10 @@ class PullRequestOpenedVerifier(BaseVerifier):
             )
         return done(
             False,
-            "none of the pull request URLs the report names was opened or "
-            f"pushed to since {since_what}: " + "; ".join(rejected),
+            "none of the pull request URLs the report names passes as this run's own push"
+            + (", as an in-job sibling" if self.accepts_in_job_sibling else "")
+            + f", or as one opened or pushed to since {since_what}: "
+            + "; ".join(rejected),
         )
 
 

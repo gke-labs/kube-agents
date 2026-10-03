@@ -458,7 +458,9 @@
 # writers -- it files a pull request through submit-suggestion on every
 # repetition -- and, since #1780 (merged 2026-09-21), graded by
 # pull_request_opened, which rejects a pull request last written before the
-# run started; nothing sweeps the *-infra repositories between runs (#1755
+# run started unless it is this job's own earlier repetition's (the in-job
+# sibling rule, #2016 step 3, which this case sets accepts_in_job_sibling to
+# take; bench/CUSTOM-TASKS.md owns it); nothing sweeps the *-infra repositories between runs (#1755
 # item 2), and on #1780's own head it went 0/3 on a leftover. 434/681
 # (63.7%) in the window. Priced at 700s. Re-admission bar: #1189's.
 ./tasks/rca-remediation-pr/task.yaml

@@ -23,15 +23,29 @@
 # ~40 runs a day.
 # WHAT IT NEEDS. #2016 step 3: three clean days at >= 90 % of graded
 # repetitions under pull_request_opened, no all-reps collapse, infra classes
-# the harness excludes not counted. One graded miss shape is this case's
-# own and counts: the job's three repetitions share the leased repository
-# and the pool sweep (#1832) runs between leases, not between them, so
-# repetitions 2 and 3 meet repetition 1's open pull request; a repetition
-# that pushes its own commit onto it passes (#1832 grades the head
-# commit), one that only links its sibling's pull request fails. Read a
-# 50-67% day as that before reading it as regression; step 3 decides
-# whether to count it, grade repetition 1 only, or sweep between
-# repetitions. Then step 4 adds the roster line and takes remediation off
+# the harness excludes not counted. Graded as an in-job sibling since #2016
+# step 3 (the check's accepts_in_job_sibling, set on this case and
+# rca-remediation-pr only): the job's three repetitions share the leased repository, the pool
+# sweep (#1832) runs between leases, not between them, and submit-suggestion
+# derives its branch from the change, so repetitions 2 and 3 meet repetition
+# 1's open pull request with the fix already on it and push nothing (the
+# seat's second live run read 1/3 on exactly that). pull_request_opened
+# passes a repetition either on its own head commit (#1832's rule) or on a
+# pull request in the leased *-infra repository opened by a [bot] login on a
+# platform-agent/ branch in the repository itself (the agent's, as the pool
+# sweep decides it) at or after this job's lease window began and open or
+# merged -- this job's own, since the project is leased to no one else -- and
+# names which in the reason (own-head-commit / in-job-sibling). A pull
+# request an earlier lease left behind, one in another repository, one a
+# person or another App opened, one on a fork, or one closed unmerged still
+# fails. What the sibling rule cannot see is whether this repetition did the
+# work: a rep that produced no fix and links its sibling's pull request
+# passes as a sibling too; that cost is accepted for the seat (#2016 step 3)
+# because the first rule would fail the correct no-push rep, and the record
+# names the rule so the two can be counted apart. It is accepted here and
+# on rca-remediation-pr, which is why the rule is an option the check sets
+# per case and not every pull_request_opened's default.
+# Then step 4 adds the roster line and takes remediation off
 # the allowlist (docs/eval-gate-roster.md has the entry). Measured before
 # the 2026-09-15 move: 7/9 across three presubmit
 # builds; misses are #1097 and #1590, 980-1929s a repetition on 2026-09-14;
@@ -130,12 +144,21 @@ verification_spec:
     mode: assert
     check:
       # Not report_contains: a substring passes on an invented URL, and on
-      # the PR an earlier rep opened. This resolves the URL and reads the head
-      # commit, so a rep that only quoted an earlier rep's PR fails.
+      # the PR an earlier lease left behind. This resolves the URL and reads
+      # the head commit; a rep passes on its own push (own-head-commit) or,
+      # with accepts_in_job_sibling below (#2016 step 3), on the PR an
+      # earlier rep of the same job opened in the leased repository
+      # (in-job-sibling; the header says what that rule reads and what it
+      # cannot). A leftover from before this job's lease window still fails.
       type: pull_request_opened
       # gke-agentic/<project>-infra on every pool project, so the org half is a
       # fair exact match and breaks loudly if the org moves.
       owner: gke-agentic
+      # The second rule is per case, because its cost is: a rep that did no
+      # work and linked the sibling passes under it too. This seat took that
+      # cost (#2016 step 3; the header); rca-remediation-pr is the only other
+      # case that did. Off, the check grades the rep's own push alone.
+      accepts_in_job_sibling: true
   - name: the-fix-names-the-workload-and-the-budget
     role: objective
     # assert, not the converge default: the transcript is immutable once the

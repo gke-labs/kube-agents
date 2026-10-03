@@ -2631,9 +2631,22 @@ def _pr_payload(
 ) -> dict:
     """What either endpoint returns. The issues endpoint marks a pull request
     with a `pull_request` sub-object; the pulls endpoint returns `head`."""
-    body = {"number": 7, "created_at": created_at, "updated_at": updated_at or created_at}
+    body = {
+        "number": 7,
+        "created_at": created_at,
+        "updated_at": updated_at or created_at,
+        # The agent writes as the minter App, so its pull requests carry the
+        # App's bot login; the slug itself is not pinned anywhere (verifiers.py
+        # PR_BOT_LOGIN_SUFFIX), so any App's will do here.
+        "user": {"login": _AGENT_LOGIN},
+    }
     body["pull_request" if as_issue else "head"] = {"ref": "platform-agent/fix"}
+    if not as_issue:
+        body["head"]["repo"] = {"full_name": f"gke-agentic/{_PR_REPO}"}
     return body
+
+
+_AGENT_LOGIN = "pool-minter[bot]"
 
 
 _PR_HEAD_SHA = "2d206b1ead215bab99f78a9305a9f3083d75cd58"
@@ -2646,9 +2659,12 @@ def _pr_head_routes(
     changed_files: int = 3,
     repo: str = _PR_REPO,
     head_ref: str = "platform-agent/fix",
+    head_repo: str | None = None,
 ) -> None:
     """Route the reads `_head_push` makes: the pulls payload for the file count
-    and the page of the commit listing the head sits on."""
+    and the page of the commit listing the head sits on. The head is the
+    agent's unless a test says otherwise: a `platform-agent/` branch in the
+    repository itself, which is what the sibling rule's second half reads."""
     pulls = _pr_api("pulls", repo=repo)
     github.routes[pulls] = (
         200,
@@ -2656,7 +2672,11 @@ def _pr_head_routes(
             "number": 7,
             "changed_files": changed_files,
             "commits": 1,
-            "head": {"ref": head_ref, "sha": _PR_HEAD_SHA},
+            "head": {
+                "ref": head_ref,
+                "sha": _PR_HEAD_SHA,
+                "repo": {"full_name": f"gke-agentic/{head_repo or repo}"},
+            },
         },
     )
     github.routes[f"{pulls}/commits?per_page=100&page=1"] = (
@@ -2687,6 +2707,10 @@ def test_pr_pass_reads_the_pull_request_this_run_opened(token, github):
     assert res.status == "pass", res.reason
     assert "2026-08-21T09:00:30" in res.reason
     assert "3 changed file(s)" in res.reason
+    # Which of the two rules passed it leads the reason and is in the raw
+    # record, with or without a lease window in the environment.
+    assert res.reason.startswith("own-head-commit: ")
+    assert res.raw["rule"] == "own-head-commit"
     # The issues endpoint answers, so the pulls one is read for the file count
     # rather than as a fallback, and the commits page dates the head.
     assert [url for url, _ in github.calls] == [
@@ -2702,12 +2726,20 @@ def test_a_previous_reps_pull_request_is_a_fail(token, github):
     to link within the same job. The
     URL, the repository and the number are all identical to a real pass; the
     stamps are what tell them apart, and a run that only quotes the URL moves
-    neither of them."""
+    neither of them. With no lease window in the environment -- a hand run --
+    that is the whole story, whether or not the case takes the sibling rule;
+    the reason names which of the two kept the rule out. The tests under
+    `the second rule` below are the presubmit's."""
     _stash_pr_report()
     github.routes[_pr_api()] = (200, _pr_payload("2026-08-20T09:00:30Z"))
     res = _pr_check().verify(5.0)
     assert res.status == "fail"
     assert "BEFORE this run started" in res.reason
+    assert "the case does not set `accepts_in_job_sibling`" in res.reason
+    res = _pr_check(accepts_in_job_sibling=True).verify(5.0)
+    assert res.status == "fail"
+    assert "BEFORE this run started" in res.reason
+    assert "no lease window in the environment" in res.reason
 
 
 # An hour before _RUN_START: the first unit on this case's audit stream began then.
@@ -2841,6 +2873,51 @@ def test_another_audits_branch_is_not_this_streams(token, github, stream):
         head_ref="platform-agent/fix-compliance-audit-netpol-0123abcd",
     )
     assert _pr_check(accepts_stream_pull_request=True).verify(5.0).status == "fail"
+
+
+def test_another_audits_branch_is_not_this_streams_inside_a_lease_window_either(token, github, stream, lease):
+    """The stream rule decides a stream case's stale candidates ahead of the
+    sibling rule: inside a Prow job the lease window encloses the stream's,
+    so the sibling rule alone would admit another audit's branch and the
+    branch guard would never run."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(
+        github,
+        "2026-08-21T08:19:50Z",
+        head_ref="platform-agent/fix-compliance-audit-netpol-0123abcd",
+    )
+    res = _pr_check(accepts_stream_pull_request=True, accepts_in_job_sibling=True).verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "not one this audit stream's `finish` names" in res.reason
+
+
+def test_the_streams_own_pull_request_is_recorded_as_the_streams_inside_a_lease_window(token, github, stream, lease):
+    """And the stream's own happy case names its rule in the record, not the
+    sibling's, so the two can be counted apart."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:19:50Z", head_ref=f"platform-agent/fix-{_STREAM_AUDIT}-netpol-0123abcd")
+    res = _pr_check(accepts_stream_pull_request=True, accepts_in_job_sibling=True).verify(5.0)
+    assert res.status == "pass", res.reason
+    assert res.reason.startswith("stream-pull-request: ")
+    assert res.raw["rule"] == "stream-pull-request"
+
+
+def test_a_pull_request_from_before_the_stream_is_not_the_streams_inside_a_lease_window(
+    token, github, stream, lease, monkeypatch
+):
+    """With both options set, the lease window does not stand in for the
+    stream's: a pull request opened after the lease began but before the
+    stream did fails, as it does with the stream option alone."""
+    stream_start = datetime(2026, 8, 21, 8, 30, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setenv(verifiers.STREAM_STARTED_ENV_VAR, str(stream_start))
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:10:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:09:50Z", head_ref=_STREAM_BRANCH)
+    res = _pr_check(accepts_stream_pull_request=True, accepts_in_job_sibling=True).verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "the job's lease window does not stand in for the stream's" in res.reason
 
 
 def test_this_runs_own_pull_request_needs_no_stream_branch(token, github, stream):
@@ -3438,6 +3515,444 @@ def test_a_pull_request_that_changes_no_files_is_a_fail(token, github):
     res = _pr_check().verify(5.0)
     assert res.status == "fail", res.reason
     assert "changes no files" in res.reason
+
+
+# --- the second rule: a pull request an earlier repetition of THIS job opened
+
+
+_LEASE_START = "2026-08-21T08:00:00Z"  # an hour before _RUN_START
+_SIBLING_OPENED = "2026-08-21T08:30:00Z"  # inside the window, before this run
+
+
+def _sibling_check(**kw):
+    """The check as the two seats write it: `accepts_in_job_sibling` set."""
+    kw.setdefault("accepts_in_job_sibling", True)
+    return _pr_check(**kw)
+
+
+@pytest.fixture
+def lease(monkeypatch):
+    """The presubmit's environment: the leased repository and the window's start,
+    the two names `hack/ci-eval-pr.sh` exports (pinned to the script's text by
+    scripts/test_ci_eval_ledger_reset.py)."""
+    monkeypatch.setenv(verifiers.LEASED_REPO_ENV, f"gke-agentic/{_PR_REPO}")
+    monkeypatch.setenv(verifiers.LEASE_START_ENV, _LEASE_START)
+
+
+def _sibling_routes(github, *, repo: str = _PR_REPO, state: dict | None = None, **head) -> None:
+    """Rep 1's pull request as rep 2 meets it: opened inside the lease window,
+    before this run, never written to since, head commit rep 1's."""
+    payload = _pr_payload(_SIBLING_OPENED) | (state or {})
+    github.routes[_pr_api(repo=repo)] = (200, payload)
+    _pr_head_routes(github, "2026-08-21T08:29:50Z", repo=repo, **head)
+
+
+def test_own_head_commit_still_passes_inside_a_lease_window(token, github, lease):
+    """A rep that pushed onto the sibling's branch is graded by the first rule,
+    not the second: the record says which."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload(_SIBLING_OPENED, "2026-08-21T09:04:00Z"))
+    _pr_head_routes(github, "2026-08-21T09:03:50Z")
+    res = _sibling_check().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert res.reason.startswith("own-head-commit: ")
+    assert res.raw["rule"] == "own-head-commit"
+    assert res.raw["lease_started_at"] == "2026-08-21T08:00:00+00:00"
+
+
+def test_an_in_job_sibling_passes_with_its_own_reason(token, github, lease):
+    """#2016 step 3. submit-suggestion derives the branch from the change, so
+    once rep 1's fix is on it rep 2 pushes nothing and hands back rep 1's URL:
+    correct work with no commit of its own. Inside the lease window, in the
+    leased repository, and open, that is this job's pull request and passes --
+    under the second rule, named first so the run record can tell it from a
+    rep that pushed."""
+    _stash_pr_report()
+    _sibling_routes(github)
+    res = _sibling_check().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert res.reason.startswith("in-job-sibling: ")
+    # The reason names what was read -- login, branch, repository, window --
+    # not "an earlier repetition's", which is the conclusion and not the
+    # observation: a no-work repetition that linked it reads the same.
+    assert (
+        f"opened at 2026-08-21T08:30:00+00:00 by {_AGENT_LOGIN} on platform-agent/fix "
+        f"in the leased repository gke-agentic/{_PR_REPO}"
+    ) in res.reason
+    assert "lease window (from 2026-08-21T08:00:00+00:00) and before this run started" in res.reason
+    assert "is open" in res.reason
+    assert "pushed no commit of its own" in res.reason
+    assert res.raw["rule"] == "in-job-sibling"
+    assert res.raw["leased_repository"] == f"gke-agentic/{_PR_REPO}"
+    assert res.raw["author"] == _AGENT_LOGIN
+    # The file count is still read: an empty sibling is no fix either.
+    assert "3 changed file(s)" in res.reason
+
+
+def test_an_in_job_sibling_merged_in_the_window_passes(token, github, lease):
+    _stash_pr_report()
+    _sibling_routes(github, state={"state": "closed", "merged_at": "2026-08-21T08:40:00Z"})
+    res = _sibling_check().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert res.reason.startswith("in-job-sibling: ")
+    assert "is merged at 2026-08-21T08:40:00+00:00" in res.reason
+    assert res.raw["merged_at"] == "2026-08-21T08:40:00+00:00"
+
+
+def test_a_pre_lease_leftover_still_fails_inside_a_lease_window(token, github, lease):
+    """What #1832 intends stays: a pull request an earlier lease left behind is
+    nobody's sibling, and the reason says why the second rule did not apply."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-20T09:00:30Z"))
+    _pr_head_routes(github, "2026-08-20T09:00:20Z")
+    res = _sibling_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "BEFORE this run started" in res.reason
+    assert "before this job's lease window began (2026-08-21T08:00:00+00:00)" in res.reason
+    assert "earlier lease's leftover" in res.reason
+
+
+def test_a_pull_request_in_another_repository_is_not_a_sibling(token, github, lease):
+    """Same organisation, same dates, a different project's repository: the
+    lease says nothing about it, so only the first rule could pass it, and a
+    head commit older than the run fails that."""
+    other = "kube-agents-evals-5-infra"
+    _stash_pr_report(f"Fix proposed: https://github.com/gke-agentic/{other}/pull/7")
+    _sibling_routes(github, repo=other)
+    res = _sibling_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert f"not in the leased repository gke-agentic/{_PR_REPO}" in res.reason
+
+
+def test_a_pull_request_a_person_opened_in_the_window_is_not_a_sibling(token, github, lease):
+    """review-sweepreps F1. The window is the job's and the lease keeps other
+    jobs out, not people: a human can open a pull request in the leased
+    repository during it. The agent writes as an App, so its login ends in
+    [bot]; a person's does not, and the rep fails naming who opened it."""
+    _stash_pr_report()
+    _sibling_routes(github, state={"user": {"login": "jayantid"}})
+    res = _sibling_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "opened by jayantid, not a [bot] login" in res.reason
+    assert "not an in-job sibling" in res.reason
+
+
+def test_another_app_s_pull_request_in_the_window_is_not_a_sibling(token, github, lease):
+    """A [bot] login is any App's. Dependabot, a workflow or another App
+    installed on the repository can open a pull request in the leased
+    repository inside the window; the agent's are the ones on a
+    platform-agent/ branch in the repository itself, as the pool sweep and
+    github_writes decide it, and a rep that links another App's fails naming
+    the branch."""
+    _stash_pr_report()
+    _sibling_routes(
+        github,
+        state={"user": {"login": "dependabot[bot]"}},
+        head_ref="dependabot/terraform/google-7.1.0",
+    )
+    res = _sibling_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "its head branch dependabot/terraform/google-7.1.0 is not under platform-agent/" in res.reason
+    assert "another App's pull request and not an in-job sibling" in res.reason
+
+
+def test_an_agent_branch_in_a_fork_is_not_a_sibling(token, github, lease):
+    """The prefix alone is a name anyone can use on a fork; the agent pushes
+    to the repository itself."""
+    _stash_pr_report()
+    _sibling_routes(github, head_repo="someone-else-fork")
+    res = _sibling_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert f"its head gke-agentic/someone-else-fork:platform-agent/fix is not in gke-agentic/{_PR_REPO} itself" in res.reason
+
+
+def test_a_pulls_payload_with_no_head_is_not_a_sibling(token, github, lease):
+    """An observation the API would not give is not evidence that the pull
+    request is the agent's."""
+    _stash_pr_report()
+    _sibling_routes(github)
+    pulls = _pr_api("pulls")
+    status, body = github.routes[pulls]
+    github.routes[pulls] = (status, {k: v for k, v in body.items() if k != "head"})
+    res = _sibling_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "its head branch ? is not under platform-agent/" in res.reason
+
+
+def test_another_app_s_pull_request_still_passes_on_its_own_head_commit(token, github, lease):
+    """The head test narrows the second rule only: a pull request written and
+    pushed during this run passes under the first, whoever opened it, as a
+    person's does."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload(_SIBLING_OPENED, "2026-08-21T09:04:00Z") | {"user": {"login": "dependabot[bot]"}})
+    _pr_head_routes(github, "2026-08-21T09:03:50Z", head_ref="dependabot/terraform/google-7.1.0")
+    res = _sibling_check().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert res.reason.startswith("own-head-commit: ")
+
+
+def test_a_pull_request_with_no_author_is_not_a_sibling(token, github, lease):
+    """A payload without `user` reads as nobody, and nobody is not a bot."""
+    _stash_pr_report()
+    payload = _pr_payload(_SIBLING_OPENED)
+    del payload["user"]
+    github.routes[_pr_api()] = (200, payload)
+    _pr_head_routes(github, "2026-08-21T08:29:50Z")
+    res = _sibling_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "opened by ?, not a [bot] login" in res.reason
+
+
+def test_a_person_s_pull_request_still_passes_on_its_own_head_commit(token, github, lease):
+    """The author test belongs to the sibling rule alone: a hand run against a
+    dev install pushes with a personal token, and the first rule grades the
+    push as it always has."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload() | {"user": {"login": "jayantid"}})
+    _pr_head_routes(github)
+    res = _sibling_check().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert res.reason.startswith("own-head-commit: ")
+    assert res.raw["author"] == "jayantid"
+
+
+def test_an_in_job_pull_request_closed_unmerged_still_fails(token, github, lease):
+    """Closed without merging is rejected before either rule is asked: the
+    objective is that the fix went out, and a closed sibling's did not."""
+    _stash_pr_report()
+    _sibling_routes(github, state={"state": "closed"})
+    res = _sibling_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "closed without being merged" in res.reason
+
+
+def test_an_in_job_sibling_that_changes_no_files_still_fails(token, github, lease):
+    _stash_pr_report()
+    _sibling_routes(github, changed_files=0)
+    res = _sibling_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "changes no files" in res.reason
+
+
+def test_a_sibling_only_commented_on_passes_as_a_sibling_inside_the_window(token, github, lease):
+    """The comment case: `updated_at` moved during this run, the head commit is
+    rep 1's. Outside a lease window that fails (the test above); inside one
+    the pull request is this job's, and the second rule names it."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload(_SIBLING_OPENED, "2026-08-21T09:04:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:29:50Z")
+    res = _sibling_check().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert res.reason.startswith("in-job-sibling: ")
+    assert "head commit 2026-08-21T08:29:50+00:00" in res.reason
+
+
+def test_the_sibling_rule_allows_the_same_skew_as_the_run_clock(token, github, lease):
+    """Opened seconds before the stamped window start is GitHub's clock against
+    the runner's, the gap `max_clock_skew_sec` exists for."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T07:59:30Z"))
+    _pr_head_routes(github, "2026-08-21T07:59:20Z")
+    assert _sibling_check().verify(5.0).status == "pass"
+    assert _sibling_check(max_clock_skew_sec=10).verify(5.0).status == "fail"
+
+
+@pytest.mark.parametrize(
+    "unset",
+    [verifiers.LEASED_REPO_ENV, verifiers.LEASE_START_ENV],
+    ids=["no-repository", "no-window-start"],
+)
+def test_half_a_lease_window_is_no_window(token, github, lease, monkeypatch, unset):
+    monkeypatch.delenv(unset)
+    _stash_pr_report()
+    _sibling_routes(github)
+    res = _sibling_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "no lease window in the environment" in res.reason
+
+
+def test_a_lease_window_older_than_a_job_is_no_window(token, github, lease, monkeypatch):
+    """A stamp inherited from a shell or a stale job environment is not this
+    job's: a month-old window would admit every leftover the minter App ever
+    left in the repository, so it reads as no window and the reason says so."""
+    monkeypatch.setenv(verifiers.LEASE_START_ENV, "2026-07-01T00:00:00Z")
+    _stash_pr_report()
+    _sibling_routes(github)
+    res = _sibling_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "no lease window in the environment" in res.reason
+    assert "longer than any one job's lease (24h), so not this job's window" in res.reason
+
+
+def test_a_date_only_lease_stamp_is_refused_whatever_the_day(token, github, lease, monkeypatch):
+    """`2026-08-19` parses as midnight UTC, two days before the run and past
+    the bound; it is refused for its shape before the bound is asked, since
+    the script writes one shape and a bare date is not it."""
+    monkeypatch.setenv(verifiers.LEASE_START_ENV, "2026-08-19")
+    _stash_pr_report()
+    _sibling_routes(github)
+    res = _sibling_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "is not in the script's YYYY-MM-DDTHH:MM:SSZ form, so it is read as no window" in res.reason
+
+
+def test_a_lease_window_that_begins_after_the_run_is_no_window(token, github, lease, monkeypatch):
+    monkeypatch.setenv(verifiers.LEASE_START_ENV, "2026-08-21T10:00:00Z")
+    _stash_pr_report()
+    _sibling_routes(github)
+    res = _sibling_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "begins after this run started" in res.reason
+
+
+def test_a_pull_request_this_run_opened_on_a_pre_run_tip_is_not_a_sibling(token, github, lease):
+    """A pull request created during this run on a branch whose tip this run
+    did not move: #1832's rejection, not "an earlier repetition's". The
+    sibling rule is for rep 1's pull request, created before this run."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T09:00:30Z"))
+    _pr_head_routes(github, "2026-08-21T08:29:50Z")
+    res = _sibling_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "this run wrote to a pull request an earlier one pushed the fix to" in res.reason
+    assert "opened at 2026-08-21T09:00:30+00:00, during this run, so this repetition's own pull request" in res.reason
+
+
+def test_an_in_lease_sibling_on_a_pre_lease_tip_is_not_a_sibling(token, github, lease):
+    """A pull request opened inside the window on a branch whose tip predates
+    it carries an earlier lease's commit: refused for a later repetition, as
+    it is for the one that opened it."""
+    _stash_pr_report()
+    _sibling_routes(github)
+    _pr_head_routes(github, "2026-08-20T12:00:00Z")
+    res = _sibling_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "this run wrote to a pull request an earlier one pushed the fix to" in res.reason
+    assert "head commit 2026-08-20T12:00:00+00:00 predates this job's lease window" in res.reason
+
+
+def test_an_in_lease_sibling_with_an_undated_head_is_not_a_sibling(token, github, lease):
+    """The pre-lease clause needs the head's date; a sibling whose commits page
+    GitHub answers 404 is not shown to be this lease's, so it fails."""
+    _stash_pr_report()
+    _sibling_routes(github)
+    for url in [u for u in github.routes if "/commits" in u]:
+        github.routes[url] = (404, {})
+    res = _sibling_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "the GitHub API gives no date for its head commit" in res.reason
+
+
+def test_a_same_day_date_only_lease_stamp_is_no_window(token, github, lease, monkeypatch):
+    """`2026-08-21` on a run that started at 09:00 that day parses as midnight,
+    nine hours before the run and inside the day's bound; the shape is refused
+    instead, since the script writes one shape and a bare date is not it."""
+    monkeypatch.setenv(verifiers.LEASE_START_ENV, "2026-08-21")
+    _stash_pr_report()
+    _sibling_routes(github)
+    res = _sibling_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "is not in the script's YYYY-MM-DDTHH:MM:SSZ form, so it is read as no window" in res.reason
+
+
+def test_an_unreadable_window_start_is_no_window(token, github, lease, monkeypatch):
+    """The strict reading: nothing passes as a sibling on a clock the check
+    cannot parse."""
+    monkeypatch.setenv(verifiers.LEASE_START_ENV, "yesterday-ish")
+    _stash_pr_report()
+    _sibling_routes(github)
+    res = _sibling_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    # ...and the reason names the value, not the two variables' absence.
+    assert "EVAL_LEASE_STARTED_AT='yesterday-ish' is not an ISO-8601 stamp, so it is read as no window" in res.reason
+
+
+def test_the_leased_repository_is_matched_case_insensitively(token, github, lease, monkeypatch):
+    monkeypatch.setenv(verifiers.LEASED_REPO_ENV, f"GKE-Agentic/{_PR_REPO.upper()}")
+    _stash_pr_report()
+    _sibling_routes(github)
+    assert _sibling_check().verify(5.0).status == "pass"
+
+
+@pytest.mark.parametrize(
+    "stamp",
+    ["2026-08-21 08:00:00Z", "2026-08-21T08Z", "2026-08-21T08:00:00"],
+    ids=["space-joined", "hour-only", "zone-less"],
+)
+def test_a_stamp_outside_the_scripts_shape_is_refused_for_its_shape(token, github, lease, monkeypatch, stamp):
+    """Each of these parses (`_parse_github_time` reads all three as 08:00Z)
+    and each is a shape the script never writes; the hour-only and zone-less
+    ones carry a `T`, which is why the test is the shape and not the letter.
+    The reason says the shape, not something the stamp does not lack."""
+    monkeypatch.setenv(verifiers.LEASE_START_ENV, stamp)
+    _stash_pr_report()
+    _sibling_routes(github)
+    res = _sibling_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert f"EVAL_LEASE_STARTED_AT={stamp!r} is not in the script's YYYY-MM-DDTHH:MM:SSZ form, so it is read as no window" in res.reason
+    assert "no time of day" not in res.reason
+    assert "is not an ISO-8601 stamp" not in res.reason
+
+
+def test_the_sibling_rule_is_off_unless_the_case_sets_it(token, github, lease):
+    """The rule's cost is per case -- a repetition that did no work and linked
+    the agent's in-window pull request passes under it -- and #2016 step 3
+    took that cost for two seats, not for every case that grades a pull
+    request. So the check asks for `accepts_in_job_sibling`. Without it, rep
+    1's pull request inside the window is #1832's rejection as it always was,
+    the clause names the option and not the environment, and the closing line
+    offers only the rules the case can pass under."""
+    _stash_pr_report()
+    _sibling_routes(github)
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "BEFORE this run started" in res.reason
+    assert "the case does not set `accepts_in_job_sibling`, so no in-job sibling can pass" in res.reason
+    assert "no lease window" not in res.reason
+    assert "passes as this run's own push, or as one opened or pushed to since this run started:" in res.reason
+    assert "as an in-job sibling" not in res.reason
+
+
+def test_without_the_option_the_window_is_still_recorded_and_the_push_still_passes(token, github, lease):
+    """Off means the second rule is not asked; the first is graded as before,
+    and the record still carries the environment it ran in."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload(_SIBLING_OPENED, "2026-08-21T09:04:00Z"))
+    _pr_head_routes(github, "2026-08-21T09:03:50Z")
+    res = _pr_check().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert res.raw["rule"] == "own-head-commit"
+    assert res.raw["lease_started_at"] == "2026-08-21T08:00:00+00:00"
+
+
+def test_exactly_the_two_seats_set_the_sibling_option():
+    """Pins the case files to the decision: pdb-remediation-pr and
+    rca-remediation-pr took the rule's cost (#2016 step 3); a third case
+    setting it needs its own decision, and one of the two dropping it would
+    put that seat back on the 1/3 it read."""
+    tasks = sorted((Path(__file__).resolve().parents[1] / "tasks").glob("*/task.yaml"))
+    assert tasks, "no task specs found"
+    setting: set[str] = set()
+    grading = 0
+
+    def walk(node, case):
+        nonlocal grading
+        if not isinstance(node, dict):
+            return
+        for child in node.get("checks") or []:
+            walk(child, case)
+        if node.get("type") != "pull_request_opened":
+            return
+        grading += 1
+        if node.get("accepts_in_job_sibling"):
+            setting.add(case)
+
+    for path in tasks:
+        spec = yaml.safe_load(path.read_text())
+        for entry in spec.get("verification_spec") or []:
+            walk(entry.get("check"), path.parent.name)
+    assert grading >= 3, grading  # the parse must not silently find nothing
+    assert setting == {"pdb-remediation-pr", "rca-remediation-pr"}, sorted(setting)
 
 
 def test_a_transport_failure_dating_the_head_commit_is_unresolved_not_a_crash(token, github):
