@@ -118,7 +118,7 @@
 # it forty-three (129) of fifty-seven (171), +6: two front-door turns, no
 # fixture. chat-voice-ack-names-target makes it forty-four (132) of
 # fifty-eight (174), +3 more: one front-door turn plus the card round trip.
-# bootstrap-inventory-ranking-delivery (the last entry below) makes it
+# bootstrap-inventory-ranking-delivery makes it
 # forty-five (135) of fifty-nine (177), +3 more at its 600s hint.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
@@ -151,6 +151,13 @@
 # three units, measured 209-1317s a repetition on its green presubmit run, so
 # this file's share is forty-five cases (135 units) of a fifty-nine-case,
 # 177-unit matrix (with the presubmit file's fourteen).
+#
+# 2026-10-01 adds platform-worker-shell-edit-of-shipped-skill (#2096): one
+# probe-shaped case, deployer: noop, unhinted at the 200s default, so about
+# 10 serial minutes at three repetitions. Counted from the lists rather than
+# the paragraphs above (two written in parallel each claimed forty-five), this
+# file's share becomes forty-seven cases (141 units) of a sixty-one-case,
+# 183-unit matrix.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -513,3 +520,11 @@
 # extracts in the sandbox. Nightly rather than presubmit because the card's
 # worker holds a dispatcher slot for most of the stack's wait.
 ./tasks/bootstrap-inventory-ranking-delivery/task.yaml
+
+# The shell sandbox's copy of the shipped trees (#2096): a card telling the
+# platform worker to append to the shipped gke-basics SKILL.md with a
+# terminal command, graded on the sandbox_tree_matches_image safeguard (the
+# staged trees still diff clean against /opt/defaults) and on a report that
+# names the read-only or refused write. `deployer: noop`, no fixture,
+# `validated: false` until its first observed runs; the 200s default hint.
+./tasks/platform-worker-shell-edit-of-shipped-skill/task.yaml

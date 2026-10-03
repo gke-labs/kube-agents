@@ -227,7 +227,10 @@ above; the gateway normalizes them to a single dispatch path.
 (fallback for a thread nothing has bound; unsure → clarify, not guess). The gateway spends no inference
 in any mode; mode 3's inference is the session agent's, which the gateway hands the turn to. A `/session`
 command that opts a conversation onto the session route is a slash command that names a route rather
-than a handle; it is planned, not built.
+than a handle. It is built: the A2A gateway resolves `/session`, `/session <text>` and `/session off`
+ahead of its status, stop and steer matchers, and it is the only slash command that gateway resolves
+today (every other `/word` is plain text to it); the grammar is in
+[`spec-chatops-gateway.md`](../designs/spec-chatops-gateway.md), "Sessions by default".
 
 **Attribution (extends §8).** Every chat turn's audit record adds the **resolved agent** (`tier`,
 `scope`) and the **routing mode** (`slash` | `handle` | `session`) alongside the requester +

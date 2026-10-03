@@ -336,14 +336,23 @@ type scopeDeclaration struct {
 	// and retires nothing, because the ordinary way a block goes missing is a write
 	// through an older operator's webhook, not an operator dropping every project. An
 	// empty `projects` list in a present block is the declaration that drops projects.
-	Present        bool                    `json:"present"`
-	Projects       []string                `json:"projects"`
-	Folders        []string                `json:"folders"`
-	Organizations  []string                `json:"organizations"`
-	SharedVpcHosts []string                `json:"sharedVpcHosts"`
-	MetricsScopes  []string                `json:"metricsScopes"`
-	Exclude        scopeExcludeDeclaration `json:"exclude"`
+	Present        bool     `json:"present"`
+	Projects       []string `json:"projects"`
+	Folders        []string `json:"folders"`
+	Organizations  []string `json:"organizations"`
+	SharedVpcHosts []string `json:"sharedVpcHosts"`
+	MetricsScopes  []string `json:"metricsScopes"`
+	// MaxProjects is the resolved-set cap in force: spec.scope.maxProjects, or its
+	// default when the field is unset, so the reconcile reads the cap it runs under
+	// from the file rather than from a constant of its own.
+	MaxProjects int32                   `json:"maxProjects"`
+	Exclude     scopeExcludeDeclaration `json:"exclude"`
 }
+
+// defaultScopeMaxProjects is the CRD's default for spec.scope.maxProjects, rendered
+// when the field is unset (a CR admitted before the field existed is served without
+// it until the CRD defaults it on the next write).
+const defaultScopeMaxProjects int32 = 100
 
 type scopeExcludeDeclaration struct {
 	Projects []string                        `json:"projects"`
@@ -370,10 +379,14 @@ func renderScopeJSON(agent *agentv1alpha1.PlatformAgent) string {
 		Organizations:  append([]string{}, scope.Organizations...),
 		SharedVpcHosts: append([]string{}, scope.SharedVpcHosts...),
 		MetricsScopes:  append([]string{}, scope.MetricsScopes...),
+		MaxProjects:    defaultScopeMaxProjects,
 		Exclude: scopeExcludeDeclaration{
 			Projects: []string{},
 			Clusters: []agentv1alpha1.ScopeClusterRef{},
 		},
+	}
+	if scope.MaxProjects != nil {
+		decl.MaxProjects = *scope.MaxProjects
 	}
 	if scope.Exclude != nil {
 		decl.Exclude.Projects = append(decl.Exclude.Projects, scope.Exclude.Projects...)
@@ -2459,6 +2472,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		sidecars = stripContainerMountsNamed(sidecars, droppedSources)
 		sidecarVolumes = a2aStripBusCredentialSources(sidecarVolumes, agent.Name)
 		extraVolumes = a2aStripBusCredentialSources(extraVolumes, agent.Name)
+
+		// Last, after every strip: the executor environment the pod cannot
+		// resolve for itself. Ordering is not incidental -- the strips above
+		// remove what a sidecar must not hold, and this adds what one that
+		// executes tasks cannot run without. See a2aExecutorSidecarEnv.
+		sidecars = a2aExecutorSidecarEnv(sidecars)
 	}
 
 	homeDir := "/opt/data"
@@ -4289,6 +4308,9 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		"OTEL_SDK_DISABLED":           {},
 		"OTEL_SERVICE_NAME":           {},
 	}
+	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
+	// default suggested prompts (`apply_slack_agent_view.py`), under the same
+	// bound: fixed strings in the image, chosen by the flag and nothing else.
 	var result []corev1.EnvVar
 	for _, env := range custom {
 		// Only literal values are copied. A ValueFrom source can reference a

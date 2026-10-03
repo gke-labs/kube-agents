@@ -35,6 +35,21 @@ _UPGRADE_SH = _REPO_ROOT / "upgrade.sh"
 _LONG_LIVED = ("autopush", "staging")
 
 
+def _executable_lines(chunk):
+    """A shell chunk with its comment lines dropped.
+
+    Asking whether a dispatch branch calls a helper by searching the raw text
+    answers a different question: the branches here name the helpers they
+    deliberately do not run, in the comments explaining why, and a call
+    someone commented out while debugging still reads as present. Both
+    failures are silent in the direction that matters -- a commented-out
+    guard keeps its test green. LifecyclePlanTest.setUp strips the plan
+    branch for the first of those reasons; this is the same filter, shared.
+    """
+    return "\n".join(line for line in chunk.splitlines()
+                     if not line.lstrip().startswith("#"))
+
+
 def _doc(path):
     return yaml.safe_load(path.read_text())
 
@@ -198,6 +213,42 @@ class LifecyclePlanTest(unittest.TestCase):
             with self.subTest(guard=guard):
                 self.assertIn(guard, apply_branch)
                 self.assertLess(apply_branch.index(guard), apply_idx)
+
+    def test_apply_guards_the_drift_trio_before_terraform_runs(self):
+        """The trio is adopted by name nowhere now, so the only thing standing
+        between a project's second install and the first install's audit
+        ingress is this guard running ahead of the apply."""
+        apply_branch = _executable_lines(
+            re.search(r"^  apply\)$(.*?)^  destroy\)$", self.text,
+                      re.MULTILINE | re.DOTALL).group(1))
+        self.assertIn("guard_drift_adoption", apply_branch)
+        self.assertLess(apply_branch.index("guard_drift_adoption"),
+                        apply_branch.index("terraform apply"))
+
+    def test_the_drift_guard_is_in_no_branch_but_apply(self):
+        """`plan` reports without changing anything and `destroy` creates
+        nothing, so neither can reach the 409 the guard pre-empts, and a guard
+        that refused either would stop a read-only report and a teardown over
+        a collision they do not cause. Read from the dispatch, because a
+        misplaced guard exits 1 wherever it sits and looks right doing it.
+
+        Comments stripped per branch: `plan)` documents the adopters it
+        deliberately does not run by naming them, so the next line added
+        there in that style would report `plan` as guarded -- and `*)`, whose
+        usage text is not a split point because `*` is not `\\w`, is read as
+        part of `destroy)`."""
+        dispatch = self.text[self.text.index('case "${1:-}" in'):]
+        # re.split keeps the captured branch names, so the result is
+        # [preamble, name, body, name, body, ...].
+        branches = re.split(r"^  (\w[\w-]*)\)$", dispatch, flags=re.MULTILINE)
+        guarded = {
+            branches[i]: "guard_drift_adoption" in _executable_lines(branches[i + 1])
+            for i in range(1, len(branches) - 1, 2)
+        }
+        for branch in ("apply", "plan", "destroy"):
+            with self.subTest(branch=branch):
+                self.assertIn(branch, guarded, guarded)
+        self.assertEqual([name for name, called in guarded.items() if called], ["apply"])
 
     def test_destroy_checks_the_release_namespace_before_deleting_the_cr(self):
         """delete_agent_cr looks in the configured namespace, so a wrong one skips the CR."""

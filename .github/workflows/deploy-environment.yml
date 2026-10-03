@@ -149,6 +149,7 @@ jobs:
           USER_PROFILE_ENABLED: ${{ vars.USER_PROFILE_ENABLED }}
           ENABLE_PUBSUB_PLATFORM: ${{ vars.ENABLE_PUBSUB_PLATFORM }}
           ENABLE_STOCKOUT_INVESTIGATOR: ${{ vars.ENABLE_STOCKOUT_INVESTIGATOR }}
+          ENABLE_DRIFT_DETECTOR: ${{ vars.ENABLE_DRIFT_DETECTOR }}
         run: ./scripts/release/validate_and_log_deploy_summary.sh
 
       - name: Authenticate to GCP via Workload Identity Federation (WIF)
@@ -261,6 +262,9 @@ jobs:
           USER_PROFILE_ENABLED: ${{ vars.USER_PROFILE_ENABLED }}
           ENABLE_PUBSUB_PLATFORM: ${{ vars.ENABLE_PUBSUB_PLATFORM }}
           ENABLE_STOCKOUT_INVESTIGATOR: ${{ vars.ENABLE_STOCKOUT_INVESTIGATOR }}
+          # Unset takes install.sh's default, which is on. Here so that a rebuilt
+          # environment can decline it, matching what the reconcile path reads.
+          ENABLE_DRIFT_DETECTOR: ${{ vars.ENABLE_DRIFT_DETECTOR }}
           # The GitOps repository the agent targets, and the one the token minter
           # scopes its tokens to. Deliberately NOT vars.GH_ORG/vars.GH_REPO: that
           # pair names the RELEASE repository, so reusing it here would scope a

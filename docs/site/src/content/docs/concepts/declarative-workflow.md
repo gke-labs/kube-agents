@@ -5,7 +5,7 @@ sidebar:
   order: 7
 ---
 
-The Platform Agent's `SOUL.md` forbids direct infrastructure mutations. When the agent has a fix in mind — a policy update, a node pool tweak, a security patch, a namespace addition — it doesn't `kubectl apply`. It writes the change into your **GitOps repo** as a **pull request** via the `submit-suggestion` skill. The short-lived GitHub token that push needs is minted on demand by **Minty** on the credential side of the boundary; it never enters the container the agent's shell runs in.
+The Platform Agent's `SOUL.md` forbids direct infrastructure mutations. When the agent has a change to make — a policy update, a node pool tweak, a security patch, a namespace addition — and someone asked for it, it doesn't `kubectl apply`. It writes the change into your **GitOps repo** as a **pull request** via the `submit-suggestion` skill. The short-lived GitHub token that push needs is minted on demand by **Minty** on the credential side of the boundary; it never enters the container the agent's shell runs in.
 
 ## Why
 
@@ -18,7 +18,7 @@ The Platform Agent's `SOUL.md` forbids direct infrastructure mutations. When the
 
 Source: [`agents/platform/skills/submit-suggestion/`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills/submit-suggestion).
 
-The agent invokes this skill whenever an SOP or on-request task decides "propose a change". The pod holds no checkout of its own; the skill's helper makes one, from the repository URL the agent resolves on startup out of the `$GITOPS_STATE_CONFIGMAP` ConfigMap (per `SOUL.md §1`). The flow:
+The agent invokes this skill when an SOP or a request asks for a change to be submitted. A question answered with a recommendation ("investigate and report", "what would you change") keeps the manifest in the reply; the pull request is opened only when someone asks for it, and a scheduled audit's pull requests come from `fleet-audit`'s own promotion, never from this skill (`SOUL.md` §3). The pod holds no checkout of its own; the skill's helper makes one, from the repository URL the agent resolves on startup out of the `$GITOPS_STATE_CONFIGMAP` ConfigMap (per `SOUL.md` §1). The flow:
 
 1. Runs `python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py prepare --branch platform-agent/<change_type>-<target_id>` (e.g. `platform-agent/upgrade-policy-baseline`). That brings the repository down into a private copy, cuts the topic branch off the default branch, and prints the workspace path as JSON. The path is spelled from `$HERMES_HOME` because the skill is reached from a kanban card as well as from a cron turn, and only a cron turn starts in the profile directory.
 2. Applies the change **inside the printed workspace** (file writes, YAML patches), then stages **only** the specific files it edited — `git add .` / `git add -A` are explicitly forbidden — and commits using Conventional Commit messages.

@@ -1,5 +1,5 @@
-"""Tests for the home-root sync and the database tripwire in
-deploy/sandbox/entrypoint.sh.
+"""Tests for the home-root sync, the image-tree staging and its read-only
+mount gate, and the database tripwire in deploy/sandbox/entrypoint.sh.
 
     python3 -m unittest discover -s tests -p 'test_*.py'
 
@@ -17,6 +17,12 @@ is why it survived review and a live upgrade: the platform profile is agent-owne
 the shell works, every skill works. It fails only when something creates a sibling
 of `platform` — which is what sandbox_mirror.py does for each of the agent pod's
 other profiles, so the migration aborts and the model's files never arrive.
+
+The image trees (skills, scripts, governance) are the opposite case: they must
+never be handed to the sandboxed account. So the chown stub records the owner
+beside each path, and the tests below say which owner each path gets. Whether a
+tree is a read-only mount is read from a mount table, which the tests replace
+with a file of their own through SANDBOX_MOUNTINFO.
 """
 
 import os
@@ -31,18 +37,31 @@ import unittest
 _REPO = pathlib.Path(__file__).resolve().parents[1]
 _ENTRYPOINT = _REPO / "deploy" / "sandbox" / "entrypoint.sh"
 
-# The script exits non-zero well after the part under test: step 3 refuses an
-# sshd state directory this test has no way to create root-owned. Everything
-# asserted here happens at step 1a, above that.
+# The script exits non-zero well after the part under test: step 2 refuses a
+# missing authorized_keys, which this test never provides. Everything asserted
+# here happens at step 1a or 1b, above that.
+#
+# One `owner path` line per path. Flags (-R) are skipped; the first operand is
+# the owner and every later one is a path it was applied to.
 _CHOWN_STUB = """#!/bin/sh
+owner=""
 for arg in "$@"; do
   case "$arg" in
-    -*|*:*) ;;
-    *) echo "$arg" >>"$CHOWN_LOG" ;;
+    -*) ;;
+    *)
+      if [ -z "$owner" ]; then
+        owner="$arg"
+      else
+        echo "$owner $arg" >>"$CHOWN_LOG"
+      fi
+      ;;
   esac
 done
 exit 0
 """
+
+_TREES = ("skills", "scripts", "governance")
+_PREPARE = "--prepare-image-trees"
 
 # Drops -o/-g -- the real ones need root -- and keeps the directory creation the
 # loop depends on. Deliberately NOT a passthrough to /usr/bin/install: stubbing
@@ -84,6 +103,12 @@ class _SandboxEntrypointHarness(unittest.TestCase):
         self.defaults = self.tmp / "defaults"
         (self.defaults / "scripts").mkdir(parents=True)
         (self.defaults / "scripts" / "forge.py").write_text("# placeholder\n")
+        (self.defaults / "skills" / "fleet-audit" / "scripts").mkdir(parents=True)
+        (self.defaults / "skills" / "fleet-audit" / "scripts" / "audit_report.py").write_text(
+            "# placeholder\n"
+        )
+        (self.defaults / "governance").mkdir()
+        (self.defaults / "governance" / "compliance_audit_sop.md").write_text("# SOP\n")
 
         self.chown_log = self.tmp / "chown.log"
         bin_dir = self.tmp / "bin"
@@ -94,8 +119,17 @@ class _SandboxEntrypointHarness(unittest.TestCase):
             stub.chmod(0o755)
         self.bin_dir = bin_dir
 
-    def _run(self, home_roots: str) -> list[str]:
+    def _run(
+        self, home_roots: str, *args: str, extra_env: dict[str, str] | None = None
+    ) -> list[tuple[str, str]]:
+        """Run the entrypoint and return the (owner, path) pairs it chowned.
+
+        The completed process is kept on self.result for the exit code and log.
+        """
         env = dict(os.environ)
+        # A developer shell that happens to export these must not change the mode.
+        env.pop("SANDBOX_IMAGE_TREES", None)
+        env.pop("SANDBOX_MOUNTINFO", None)
         env.update(
             {
                 "PATH": f"{self.bin_dir}{os.pathsep}{env['PATH']}",
@@ -109,8 +143,9 @@ class _SandboxEntrypointHarness(unittest.TestCase):
                 "SANDBOX_AUTHORIZED_KEYS": str(self.tmp / "absent-keys"),
             }
         )
-        subprocess.run(
-            ["bash", str(_ENTRYPOINT)],
+        env.update(extra_env or {})
+        self.result = subprocess.run(
+            ["bash", str(_ENTRYPOINT), *args],
             env=env,
             capture_output=True,
             text=True,
@@ -118,7 +153,23 @@ class _SandboxEntrypointHarness(unittest.TestCase):
         )
         if not self.chown_log.exists():
             return []
-        return [line for line in self.chown_log.read_text().splitlines() if line]
+        pairs = []
+        for line in self.chown_log.read_text().splitlines():
+            if line:
+                owner, path = line.split(" ", 1)
+                pairs.append((owner, path))
+        return pairs
+
+    def _tree_paths(self) -> list[pathlib.Path]:
+        """Every <home>/<tree> for the operator's two home roots."""
+        return [
+            home / tree
+            for home in (self.data, self.data / "profiles" / "platform")
+            for tree in _TREES
+        ]
+
+    def _under(self, path: str, root: pathlib.Path) -> bool:
+        return path == str(root) or path.startswith(f"{root}/")
 
 
 class SandboxEntrypointHomeRootsTest(_SandboxEntrypointHarness):
@@ -126,7 +177,7 @@ class SandboxEntrypointHomeRootsTest(_SandboxEntrypointHarness):
         """`profiles/platform` must leave $DATA/profiles agent-owned too."""
         chowned = self._run(". profiles/platform")
         self.assertIn(
-            str(self.data / "profiles"),
+            ("agent:agent", str(self.data / "profiles")),
             chowned,
             "the parent of a nested home root was left with the entrypoint's own "
             "ownership; sandbox_mirror.py cannot create the other profiles' homes "
@@ -139,7 +190,7 @@ class SandboxEntrypointHomeRootsTest(_SandboxEntrypointHarness):
         parent = str(self.data.parent)
         self.assertNotIn(
             parent,
-            chowned,
+            [path for _, path in chowned],
             "the walk escaped $DATA and chowned its parent, which belongs to the "
             "image rather than to the model",
         )
@@ -148,7 +199,7 @@ class SandboxEntrypointHomeRootsTest(_SandboxEntrypointHarness):
         """Nothing here is special-cased to one level of nesting."""
         chowned = self._run("profiles/a/b/c")
         for component in ("profiles", "profiles/a", "profiles/a/b"):
-            self.assertIn(str(self.data / component), chowned, component)
+            self.assertIn(("agent:agent", str(self.data / component)), chowned, component)
 
     def _displaced(self, path: pathlib.Path) -> list[pathlib.Path]:
         return sorted(p for p in path.parent.iterdir() if p.name.startswith(f"{path.name}.displaced"))
@@ -283,14 +334,19 @@ class SandboxEntrypointDatabaseTripwireTest(_SandboxEntrypointHarness):
         self.assertTrue(planted.is_dir(), "the fabricated database was left in place")
 
     def test_the_model_can_still_clear_its_own_home(self) -> None:
-        """The tripwire is uid 1000's, like every other name on the volume.
+        """Nothing step 1b makes is undeletable, in the fallback run.
 
-        Root-owned and mode 0555 also makes sqlite3 raise, and it makes the
-        directory undeletable from inside the model's own home -- which breaks
-        the plain `rm -rf /opt/data/profiles` that sections 9 and 10 of
-        deploy/sandbox/smoke-test.sh plant with, and that sandbox_mirror.py
-        needs to replace a profile home. The directory is the mechanism; the
+        This run has SANDBOX_IMAGE_TREES unset, so nothing is mounted and the
+        trees are plain root-owned copies; the test host owns every file, so
+        rmtree succeeding shows only that the tripwire is an ordinary directory
+        with a mode its owner can remove. That is the property: root-owned and
+        0555 would also make sqlite3 raise, and would add an undeletable name
+        to the model's home for nothing. The directory is the mechanism; the
         mode never was.
+
+        Under the operator the home roots and the trees are mount points, and
+        `rm -rf /opt/data/profiles` fails partway on purpose. That is for
+        deploy/sandbox/smoke-test.sh to show, not this test.
         """
         self._run(". profiles/platform")
         shutil.rmtree(self.data / "profiles")
@@ -306,7 +362,10 @@ class SandboxEntrypointDatabaseTripwireTest(_SandboxEntrypointHarness):
         chowned = self._run(". profiles/platform")
         for board in self._boards():
             with self.subTest(board=str(board)):
-                self.assertIn(str(board / "NOT-THE-AGENT-POD-DATABASE.txt"), chowned)
+                self.assertIn(
+                    ("agent:agent", str(board / "NOT-THE-AGENT-POD-DATABASE.txt")),
+                    chowned,
+                )
 
     def test_the_tripwire_is_not_rebuilt_on_every_start(self) -> None:
         """A pod recycle must not churn the volume it is protecting."""
@@ -321,6 +380,217 @@ class SandboxEntrypointDatabaseTripwireTest(_SandboxEntrypointHarness):
             marker.is_file(),
             "step 1b tore down a tripwire it had already put there",
         )
+
+
+class SandboxEntrypointPrepareModeTest(_SandboxEntrypointHarness):
+    """--prepare-image-trees, which the operator's init container runs.
+
+    It stages every image tree into every home root, root-owned, heals what
+    would otherwise become a mount point through a planted link, and exits
+    before anything that writes outside $DATA.
+    """
+
+    def _assert_same_tree(self, expected: pathlib.Path, actual: pathlib.Path) -> None:
+        self.assertTrue(actual.is_dir() and not actual.is_symlink(), f"{actual} is not a directory")
+        want = sorted(p.relative_to(expected) for p in expected.rglob("*"))
+        got = sorted(p.relative_to(actual) for p in actual.rglob("*"))
+        self.assertEqual(want, got, f"{actual} does not match {expected}")
+        for rel in want:
+            if (expected / rel).is_file():
+                self.assertEqual((expected / rel).read_bytes(), (actual / rel).read_bytes(), str(rel))
+
+    def test_every_tree_is_staged_in_both_homes_and_owned_by_root(self) -> None:
+        chowned = self._run(". profiles/platform", _PREPARE)
+        self.assertEqual(0, self.result.returncode, self.result.stderr)
+        for tree in self._tree_paths():
+            with self.subTest(tree=str(tree)):
+                self._assert_same_tree(self.defaults / tree.name, tree)
+                self.assertIn(("root:root", str(tree)), chowned)
+                handed = [p for owner, p in chowned if owner != "root:root" and self._under(p, tree)]
+                self.assertEqual([], handed, "part of an image tree was handed to the model")
+                for path in (tree, *tree.rglob("*")):
+                    self.assertEqual(0, path.stat().st_mode & 0o022, f"{path} is group- or other-writable")
+
+    def test_the_home_roots_are_still_the_models(self) -> None:
+        """Only the trees are root's; the model writes everything else in its home."""
+        chowned = self._run(". profiles/platform", _PREPARE)
+        for home in (self.data, self.data / "profiles", self.data / "profiles" / "platform"):
+            self.assertIn(("agent:agent", str(home)), chowned, str(home))
+
+    def test_an_old_copy_is_replaced_not_merged(self) -> None:
+        """A volume from before this change holds agent-owned trees the model may have edited."""
+        for tree in (self.data / "scripts", self.data / "profiles" / "platform" / "scripts"):
+            tree.mkdir(parents=True)
+            (tree / "forge.py").write_text("# planted\n")
+            (tree / "witness.py").write_text("# planted helper\n")
+
+        self._run(". profiles/platform", _PREPARE)
+
+        for tree in (self.data / "scripts", self.data / "profiles" / "platform" / "scripts"):
+            with self.subTest(tree=str(tree)):
+                self.assertFalse((tree / "witness.py").exists(), "the planted helper survived")
+                self.assertEqual("# placeholder\n", (tree / "forge.py").read_text())
+
+    def _assert_link_healed(self, relative: str) -> None:
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "sentinel").write_text("not the sandbox's")
+        link = self.data / relative
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(outside)
+
+        chowned = self._run(". profiles/platform", _PREPARE)
+
+        self.assertEqual(0, self.result.returncode, self.result.stderr)
+        self.assertFalse(link.is_symlink(), f"the symlink at {relative} survived")
+        self.assertTrue(link.is_dir(), f"{relative} was not recreated as a directory")
+        self.assertIn(f"removed a symlink at {link}", self.result.stderr)
+        self.assertEqual(["sentinel"], sorted(p.name for p in outside.iterdir()))
+        self.assertEqual("not the sandbox's", (outside / "sentinel").read_text())
+        escaped = [p for _, p in chowned if not self._under(p, self.data)]
+        self.assertEqual([], escaped, "something outside $DATA was chowned")
+        for tree in self._tree_paths():
+            self._assert_same_tree(self.defaults / tree.name, tree)
+
+    def test_a_symlink_at_profiles_is_removed(self) -> None:
+        self._assert_link_healed("profiles")
+
+    def test_a_symlink_at_a_home_root_is_removed(self) -> None:
+        self._assert_link_healed("profiles/platform")
+
+    def test_a_symlink_at_a_tree_path_is_removed(self) -> None:
+        """The tree path itself becomes a mount point, so a link there would be followed."""
+        self._assert_link_healed("profiles/platform/scripts")
+
+    def test_a_file_where_a_home_root_belongs_is_moved_aside(self) -> None:
+        (self.data / "profiles").mkdir()
+        planted = self.data / "profiles" / "platform"
+        planted.write_text("not a directory")
+
+        self._run(". profiles/platform", _PREPARE)
+
+        self.assertEqual(0, self.result.returncode, self.result.stderr)
+        self.assertTrue(planted.is_dir(), "the home root was not recreated")
+        moved = [p for p in planted.parent.iterdir() if p.name.startswith("platform.displaced")]
+        self.assertEqual(1, len(moved), moved)
+        self._assert_same_tree(self.defaults / "scripts", planted / "scripts")
+
+    def test_it_exits_before_writing_anything_outside_data(self) -> None:
+        """The init container has a read-only root filesystem and no key mounted.
+
+        Reaching step 2 would fail on the missing authorized_keys; exiting 0
+        with no complaint about it is how this shows it stopped before.
+        """
+        self._run(". profiles/platform", _PREPARE)
+        self.assertEqual(0, self.result.returncode, self.result.stderr)
+        self.assertNotIn("authorized_keys", self.result.stderr)
+        self.assertFalse((self.data / ".sandbox").exists(), "the marker is the shell's to write")
+        self.assertFalse((self.data / "kanban.db").exists(), "the tripwire is the shell's to write")
+
+    def test_it_refuses_an_image_with_no_trees(self) -> None:
+        """Exiting 0 here would leave the shell's read-only mounts empty."""
+        shutil.rmtree(self.defaults)
+        self._run(". profiles/platform", _PREPARE)
+        self.assertNotEqual(0, self.result.returncode)
+
+
+class SandboxEntrypointReadOnlyMountGateTest(_SandboxEntrypointHarness):
+    """Default mode with SANDBOX_IMAGE_TREES=read-only-mounts, as the operator sets it.
+
+    The trees were staged by the init container and are mounted read-only, so
+    step 1a must not touch them. It checks the mount table instead, and a tree
+    that is missing from it or mounted writable stops the start.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        # What the init container leaves behind.
+        self._run(". profiles/platform", _PREPARE)
+        self.assertEqual(0, self.result.returncode, self.result.stderr)
+        self.chown_log.unlink()
+        self.witness = self.data / "profiles" / "platform" / "scripts" / "witness"
+        self.witness.write_text("staged by the init container")
+        self.mountinfo = self.tmp / "mountinfo"
+
+    def _write_mountinfo(self, options: dict[pathlib.Path, str], pins: bool = True) -> None:
+        lines = [f"30 1 0:30 / {self.data} rw,relatime - ext4 /dev/sdb rw"]
+        if pins:
+            options = {self.data / "profiles": "rw,relatime", self.data / "profiles" / "platform": "rw,relatime", **options}
+        for n, (path, opts) in enumerate(options.items()):
+            lines.append(f"{40 + n} 30 0:30 /{path.relative_to(self.data)} {path} {opts} - ext4 /dev/sdb rw")
+        self.mountinfo.write_text("\n".join(lines) + "\n")
+
+    def _run_gated(self) -> list[tuple[str, str]]:
+        return self._run(
+            ". profiles/platform",
+            extra_env={
+                "SANDBOX_IMAGE_TREES": "read-only-mounts",
+                "SANDBOX_MOUNTINFO": str(self.mountinfo),
+            },
+        )
+
+    def test_read_only_trees_are_left_alone(self) -> None:
+        self._write_mountinfo({tree: "ro,relatime" for tree in self._tree_paths()})
+        chowned = self._run_gated()
+        self.assertTrue(self.witness.is_file(), "step 1a restaged a tree that is a read-only mount")
+        for tree in self._tree_paths():
+            touched = [pair for pair in chowned if self._under(pair[1], tree)]
+            self.assertEqual([], touched, f"{tree} was chowned")
+        # Past the gate: the run went on to step 2 and stopped at the missing key.
+        self.assertIn("no authorized_keys", self.result.stderr)
+
+    def test_a_writable_tree_stops_the_start(self) -> None:
+        trees = self._tree_paths()
+        options = {tree: "ro,relatime" for tree in trees}
+        options[trees[4]] = "rw,relatime"
+        self._write_mountinfo(options)
+        self._run_gated()
+        self.assertNotEqual(0, self.result.returncode)
+        self.assertIn(f"{trees[4]} is not a read-only mount", self.result.stderr)
+        self.assertNotIn("no authorized_keys", self.result.stderr)
+
+    def test_a_missing_tree_mount_stops_the_start(self) -> None:
+        """No mount at all is as bad as a writable one."""
+        trees = self._tree_paths()
+        self._write_mountinfo({tree: "ro,relatime" for tree in trees[:-1]})
+        self._run_gated()
+        self.assertNotEqual(0, self.result.returncode)
+        self.assertIn(f"{trees[-1]} is not a read-only mount", self.result.stderr)
+
+    def test_a_missing_pin_stops_the_start(self) -> None:
+        """Read-only trees under a profiles/ that is not a mount point can be renamed away with it."""
+        options = {tree: "ro,relatime" for tree in self._tree_paths()}
+        options[self.data / "profiles" / "platform"] = "rw,relatime"
+        self._write_mountinfo(options, pins=False)
+        self._run_gated()
+        self.assertNotEqual(0, self.result.returncode)
+        self.assertIn(f"{self.data / 'profiles'} is not a mount point", self.result.stderr)
+        self.assertNotIn("no authorized_keys", self.result.stderr)
+
+    def test_ro_is_matched_as_an_option_not_a_substring(self) -> None:
+        trees = self._tree_paths()
+        options = {tree: "ro,relatime" for tree in trees}
+        options[trees[0]] = "rw,errors=remount-ro"
+        self._write_mountinfo(options)
+        self._run_gated()
+        self.assertNotEqual(0, self.result.returncode)
+        self.assertIn(f"{trees[0]} is not a read-only mount", self.result.stderr)
+
+    def test_an_unknown_mode_stops_the_start(self) -> None:
+        self._run(". profiles/platform", extra_env={"SANDBOX_IMAGE_TREES": "read-only"})
+        self.assertNotEqual(0, self.result.returncode)
+        self.assertIn("not a mode this image knows", self.result.stderr)
+
+    def test_with_the_mode_unset_the_trees_are_root_owned_copies(self) -> None:
+        """The fallback outside the operator's StatefulSet: restage, root-owned."""
+        chowned = self._run(". profiles/platform")
+        self.assertFalse(self.witness.exists(), "the fallback did not restage the tree")
+        for tree in self._tree_paths():
+            with self.subTest(tree=str(tree)):
+                self.assertIn(("root:root", str(tree)), chowned)
+                handed = [p for owner, p in chowned if owner != "root:root" and self._under(p, tree)]
+                self.assertEqual([], handed, "the fallback handed an image tree to the model")
+        self.assertIn("rename a tree aside", self.result.stderr)
 
 
 class SandboxEntrypointForwardedEnvTest(unittest.TestCase):

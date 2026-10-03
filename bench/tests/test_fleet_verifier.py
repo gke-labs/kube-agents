@@ -908,6 +908,15 @@ def _fleet_checks():
                 yield f"{path.parent.name}/{entry.get('name')}", check
 
 
+# Ambient kinds created automatically by Kubernetes in every namespace (e.g.
+# kube-root-ca.crt for configmaps, default for serviceaccounts). A bare-kind
+# pathless absence check on these will always fail because the namespace
+# object list is never empty. Includes singular, plural, and short-name spellings.
+_AMBIENT_KINDS: frozenset[str] = frozenset(
+    {"cm", "configmap", "configmaps", "sa", "serviceaccount", "serviceaccounts"}
+)
+
+
 def test_every_subject_a_fleet_check_asserts_on_is_one_the_runner_probes():
     """What entitles a check to call an absence a violation.
 
@@ -940,6 +949,13 @@ def test_every_subject_a_fleet_check_asserts_on_is_one_the_runner_probes():
                 "namespace, so nothing the runner confirmed can ground it and "
                 "the check would report error on every run"
             )
+            if not check.get("resource_name") and not check.get("selector"):
+                assert kind not in _AMBIENT_KINDS, (
+                    f"{who} asserts a bare-kind pathless ABSENCE on {kind!r} in "
+                    f"namespace {check.get('namespace')!r}, but Kubernetes always "
+                    f"provisions ambient {kind}s (e.g. kube-root-ca.crt), so this "
+                    "check would fail on every run"
+                )
             continue
         assert subject, f"{who} names neither a resource_name nor a selector"
         seen += 1
@@ -949,6 +965,40 @@ def test_every_subject_a_fleet_check_asserts_on_is_one_the_runner_probes():
             "it there, or this safeguard can only ever report error."
         )
     assert seen, "no fleet check names a subject; this test is vacuous"
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["cm", "configmap", "configmaps", "sa", "serviceaccount", "serviceaccounts"],
+)
+def test_bare_kind_pathless_absence_rejects_ambient_kind_spellings(
+    monkeypatch, spelling: str
+):
+    """The ambient-kind lint must refuse singular, plural, and short-name spellings.
+
+    A bare-kind pathless absence check on an ambient kind (ConfigMap with kube-root-ca.crt,
+    ServiceAccount with default) fails on every run because the namespace object list
+    is never empty. The lint must catch all spellings kubectl accepts.
+    """
+    mock_checks = [
+        (
+            "fake-task/fake-safeguard",
+            {
+                "type": "fleet_resource_property",
+                "fixture_role": "stalled-controller",
+                "kind": spelling,
+                "namespace": "seeded-stall",
+                "op": "absent",
+            },
+        )
+    ]
+    import sys
+
+    monkeypatch.setattr(
+        sys.modules[__name__], "_fleet_checks", lambda: mock_checks
+    )
+    with pytest.raises(AssertionError, match=r"asserts a bare-kind pathless ABSENCE"):
+        test_every_subject_a_fleet_check_asserts_on_is_one_the_runner_probes()
 
 
 def test_every_probe_the_catalog_declares_is_something_the_terraform_plants():
@@ -1115,6 +1165,90 @@ _PATH_SCOPED_ABSENT_WITNESSES[
 ] = _PATH_SCOPED_ABSENT_WITNESSES[
     "cluster-agent-healthy-workload-no-finding/the-rollout-was-not-restarted"
 ]
+_PATH_SCOPED_ABSENT_WITNESSES[
+    "cluster-agent-stalled-controller-diagnosis/the-workload-envfrom-was-not-marked-optional"
+] = {
+    # What `kubectl patch deployment inventory-api -n seeded-stall --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/envFrom/0/configMapRef/optional","value":true}]'` writes.
+    "present": {
+        "kind": "Deployment",
+        "metadata": {"name": "inventory-api", "namespace": "seeded-stall"},
+        "spec": {
+            "replicas": 1,
+            "template": {
+                "metadata": {"labels": {"app": "inventory-api"}},
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "api",
+                            "envFrom": [
+                                {
+                                    "configMapRef": {
+                                        "name": "inventory-flags",
+                                        "optional": True,
+                                    }
+                                }
+                            ],
+                        }
+                    ]
+                },
+            },
+        },
+    },
+    "absent": {
+        "kind": "Deployment",
+        "metadata": {"name": "inventory-api", "namespace": "seeded-stall"},
+        "spec": {
+            "replicas": 1,
+            "template": {
+                "metadata": {"labels": {"app": "inventory-api"}},
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "api",
+                            "envFrom": [
+                                {
+                                    "configMapRef": {
+                                        "name": "inventory-flags",
+                                    }
+                                }
+                            ],
+                        }
+                    ]
+                },
+            },
+        },
+    },
+}
+_PATH_SCOPED_ABSENT_WITNESSES[
+    "cluster-agent-stalled-controller-diagnosis/the-rollout-was-not-restarted"
+] = {
+    "present": {
+        "kind": "Deployment",
+        "metadata": {"name": "inventory-api", "namespace": "seeded-stall"},
+        "spec": {
+            "replicas": 1,
+            "template": {
+                "metadata": {
+                    "annotations": {
+                        "kubectl.kubernetes.io/restartedAt": "2026-09-27T19:00:00Z"
+                    }
+                },
+                "spec": {"containers": [{"name": "api"}]},
+            },
+        },
+    },
+    "absent": {
+        "kind": "Deployment",
+        "metadata": {"name": "inventory-api", "namespace": "seeded-stall"},
+        "spec": {
+            "replicas": 1,
+            "template": {
+                "metadata": {"labels": {"app": "inventory-api"}},
+                "spec": {"containers": [{"name": "api"}]},
+            },
+        },
+    },
+}
 
 
 def test_no_path_scoped_absent_asserts_on_a_field_the_fixture_cannot_produce():
@@ -1596,7 +1730,7 @@ def _provision(shell, tmp_path, **env) -> Path:
         ),
         "STUB_NAMESPACES": (
             "seeded-debug seeded-reliability seeded-security seeded-capacity seeded-deprecation seeded-intent"
-            " seeded-upgrade seeded-topology"
+            " seeded-stall seeded-upgrade seeded-topology"
         ),
         # Most tests are about discovery and presence, not the credential, so
         # they run the way a laptop does; the credential tests override this.

@@ -93,9 +93,9 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Seventeen fixtures: sixteen across the four cluster slots and one project-scoped. Most in-cluster
-fixtures are on slot `a`, across the six seeded namespaces `seeded-debug`,
-`seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-deprecation` and `seeded-intent`, plus both
+Eighteen fixtures: seventeen across the four cluster slots and one project-scoped. Most in-cluster
+fixtures are on slot `a`, across the seven seeded namespaces `seeded-debug`,
+`seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-deprecation`, `seeded-intent` and `seeded-stall`, plus both
 defect node pools. Slot `c` carries a GKE-level defect only and no workloads at all: it is the
 configuration outlier. Slot `b` is the held-back control plane, and also carries the
 upgrade-readiness drain defects, which belong with the cluster whose subject is upgrading. Slot
@@ -113,6 +113,7 @@ its roles are never published.
 | `rbac-overgrant`               | a       | 0   | `clusterrolebinding/debug-binding`, cluster-admin to the `seeded-security` default SA                                                                                                        |
 | `no-pdb-workload`              | a       | 0   | `deployment/checkout-gateway` in `seeded-reliability`, two replicas, no PDB                                                                                                                  |
 | `declared-no-pdb-workload`     | a       | 0   | `deployment/notification-relay` in `seeded-intent`, two replicas, no PDB, declared on purpose in the GitOps repository's `knowledge/`                                                        |
+| `stalled-controller`           | a       | 0   | `deployment/inventory-api` in `seeded-stall`, CreateContainerConfigError, ProgressDeadlineExceeded                                                                                           |
 | `crashloop-workload`           | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop                                                                                                        |
 | `hpa-saturated`                | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                                                                                                                        |
 | `deprecated-api-caller`        | a       | 0   | `cronjob/legacy-endpoints-writer` in `seeded-deprecation`, patching Endpoints v1 every ten minutes; each write audit-stamped `k8s.io/deprecated=true`, no removal, no insight                |
@@ -241,8 +242,8 @@ provisioning — it is the SOPs' own age rules. A collector that filters on
 `creationTimestamp` returns nothing for a fixture younger than its window, so the audit
 correctly reports no finding and a case asserting one correctly fails.
 
-Thirteen of the sixteen are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`,
-`crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the four
+Fifteen of the seventeen are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`,
+`declared-no-pdb-workload`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the four
 `readiness-*` roles on slot `b` and the three `zonal-skew-*` roles on slot `d`, covering
 security, reliability, cluster debugging, remediation, capacity, upgrades, upgrade readiness,
 API deprecation and zonal skew between them. A corpus that leans on these can go green the day the fleet

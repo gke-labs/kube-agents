@@ -12957,7 +12957,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--prefix",
         default=None,
         metavar="REPO_PATH",
-        help="Restrict the search to this directory.",
+        help="Restrict the search to this directory or file, a path rather than a glob.",
     )
     grep_parser.add_argument(
         "--regex", action="store_true", help="Treat --pattern as a regular expression."
