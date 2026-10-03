@@ -288,7 +288,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
     @patch("github_token_refresh.subprocess.run")
     @patch("github_token_refresh.urllib.request.urlopen")
     @patch("gitops_workspace.get_managed_github_repos")
-    def test_scoped_repositories_printed_to_stdout_on_success(
+    def test_scoped_repositories_attached_to_token_and_not_printed_to_stdout(
         self, get_managed_github_repos, urlopen, run
     ):
         get_managed_github_repos.return_value = [
@@ -316,8 +316,11 @@ class GitHubTokenRefreshTest(unittest.TestCase):
                 token = refresh_git_credentials("owner/repo1")
 
         self.assertEqual("fake-installation-token", token)
-        self.assertEqual("owner/repo1\nowner/repo2\n", out.getvalue())
-        self.assertNotIn("other-org/repo3", out.getvalue())
+        self.assertEqual("", out.getvalue())
+        self.assertEqual(
+            ("owner/repo1", "owner/repo2"),
+            getattr(token, "scoped_repositories", ()),
+        )
 
     @patch("github_token_refresh.log")
     @patch("github_token_refresh.subprocess.run")
@@ -978,6 +981,21 @@ class ReadOnlyMintTest(unittest.TestCase):
             with patch("github_token_refresh.refresh_git_credentials") as refresh:
                 main()
         refresh.assert_called_once_with("org/repo")
+
+    @patch("github_token_refresh.subprocess.run")
+    def test_main_prints_scoped_repositories_to_stdout_on_success(self, run):
+        out = io.StringIO()
+        with patch.object(sys, "argv", ["github_token_refresh.py", "owner/repo1"]):
+            with patch(
+                "github_token_refresh.refresh_git_credentials",
+                return_value=github_token_refresh.RefreshToken(
+                    "fake-token", ("owner/repo1", "owner/repo2")
+                ),
+            ) as refresh:
+                with patch("sys.stdout", out):
+                    main()
+        refresh.assert_called_once_with("owner/repo1")
+        self.assertEqual("owner/repo1\nowner/repo2\n", out.getvalue())
 
 
 class MetadataIdentityTest(unittest.TestCase):

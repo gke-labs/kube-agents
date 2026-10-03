@@ -4746,6 +4746,55 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
 
         self.assertEqual(len(calls), 3)
 
+    def test_successful_refresh_clears_failure_memo_for_earlier_queued_waiter(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+
+        def handle_call(argv, cwd=None):
+            calls.append(list(argv))
+            if len(calls) == 1:
+                return credential_proxy.ExecutionResult(
+                    exit_code=1,
+                    stdout="",
+                    stderr="temporary helper outage",
+                    duration_ms=5,
+                    truncated=False,
+                    timed_out=False,
+                )
+            return credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="gke-agentic/infra\n" if len(calls) == 2 else "gke-agentic/other\n",
+                stderr="",
+                duration_ms=5,
+                truncated=False,
+                timed_out=False,
+            )
+
+        executor.execute_internal = handle_call
+
+        # Call 1 for gke-agentic/infra fails at 100.0 (queued_at=100.0, now=100.0, failed_at=100.0)
+        # Call 2 for gke-agentic/infra succeeds at 101.0 (queued_at=101.0, now=101.0, success_at=101.0)
+        #   -> clears failure memo at L4501 and records scope {gke-agentic/infra}
+        # Call 3 for gke-agentic/other queued at 50.0 (before Call 1 failed), acquires lock at 102.0:
+        #   -> not in scope {gke-agentic/infra}, so does not coalesce
+        #   -> failure memo was cleared on Call 2 success, so Call 3 does not raise stale error
+        #   -> Call 3 executes helper and succeeds (len(calls) == 3)
+        # If L4501 is deleted, Call 3 finds Call 1's memo (100.0 >= 50.0) and raises RuntimeError.
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True), \
+             mock.patch.object(credential_proxy.time, "monotonic", side_effect=[
+                 100.0, 100.0, 100.0,  # Call 1: queued_at, now, failed_at
+                 101.0, 101.0, 101.0,  # Call 2: queued_at, now, success_at
+                 50.0, 102.0, 102.0,   # Call 3: queued_at, now, success_at
+             ]):
+            with self.assertRaises(RuntimeError):
+                executor.refresh_forge_credential("github", "gke-agentic/infra")
+            executor.refresh_forge_credential("github", "gke-agentic/infra")
+            executor.refresh_forge_credential("github", "gke-agentic/other")
+
+        self.assertEqual(len(calls), 3)
+
 
 class ForgeRefreshRouteTest(unittest.TestCase):
     """What `POST /v1/forge/refresh` answers, and what it declines to say."""

@@ -620,6 +620,21 @@ def mint_read_only_token(target_repo: str | None) -> str:
     return token
 
 
+class RefreshToken(str):
+    """An installation token that carries the repositories it was scoped for."""
+
+    scoped_repositories: tuple[str, ...]
+
+    def __new__(
+        cls,
+        token: str,
+        scoped_repositories: tuple[str, ...] | list[str] = (),
+    ) -> "RefreshToken":
+        obj = super().__new__(cls, token)
+        obj.scoped_repositories = tuple(scoped_repositories)
+        return obj
+
+
 def refresh_git_credentials(
     target_repo: str | None = None,
     *,
@@ -661,7 +676,7 @@ def refresh_git_credentials(
                     log(
                         f"GitHub credentials refreshed in credential sidecar for {repository}."
                     )
-                    return ""
+                    return RefreshToken("", ())
                 raise RuntimeError(
                     f"Credential sidecar rejected refresh: HTTP {response.status}"
                 )
@@ -710,7 +725,7 @@ def refresh_git_credentials(
                 f"(exit {completed.returncode}): {(completed.stderr or '').strip()}"
             )
         log(f"GitHub credentials refreshed through the shell sandbox for {repository}.")
-        return ""
+        return RefreshToken("", ())
 
     oidc_token = broker_oidc_token()
 
@@ -805,10 +820,8 @@ def refresh_git_credentials(
             f"Failed to configure GitHub auth in gh CLI: {describe_failure(e)}"
         ) from e
 
-    for r in repositories_to_scope:
-        print(f"{org_name}/{r}".lower())
-
-    return token
+    scoped = tuple(f"{org_name}/{r}".lower() for r in repositories_to_scope)
+    return RefreshToken(token, scoped)
 
 
 def main():
@@ -828,7 +841,11 @@ def main():
         if args.read_only:
             print(mint_read_only_token(args.repository), end="")
             return
-        refresh_git_credentials(args.repository)
+        token = refresh_git_credentials(args.repository)
+        scoped = getattr(token, "scoped_repositories", None)
+        if isinstance(scoped, (list, tuple, set, frozenset)):
+            for r in scoped:
+                print(r)
     except Exception as e:
         log(f"FATAL: Failed to refresh git credentials: {e}")
         sys.exit(1)
