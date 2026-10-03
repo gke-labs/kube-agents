@@ -171,7 +171,9 @@ _warned_missing = False
 class _Row:
     """One card's row. A plain class, for the reason ``slack_ux_reactions._Ask`` is."""
 
-    __slots__ = ("archived", "last_event_id", "lines", "result", "status", "steps", "task_id", "title")
+    __slots__ = (
+        "archived", "last_event_id", "lines", "note", "result", "status", "steps", "task_id", "title",
+    )
 
     def __init__(self, task_id: str, title: str) -> None:
         self.task_id = task_id
@@ -180,6 +182,10 @@ class _Row:
         #: Every note the row took, past the last :data:`slack_status.STEPS_MAX`
         #: kept; a dashboard move is not one. A new plan starts it again.
         self.steps = 0
+        #: The latest of those notes, or :data:`ARCHIVED_NOTE` once archived by
+        #: hand: what a running or failed row's title shows. A move lands in
+        #: ``lines`` without touching it.
+        self.note = ""
         #: The completed event's summary line, which the settled row shows; the
         #: card's title when it is empty.
         self.result = ""
@@ -613,6 +619,7 @@ def _move(row: _Row, kind: str, result: str = "") -> bool:
             return False  # archived after it finished: its row stands
         # Archived by hand: nothing else will settle the row.
         row.lines = [*row.lines, ARCHIVED_NOTE][-_status.STEPS_MAX:]
+        row.note = ARCHIVED_NOTE
         row.status = _status.TASK_ERROR
         row.archived = True
         return True
@@ -780,9 +787,10 @@ async def deliver_row(
         row = plan.rows[card] = _Row(card, title)
     if event_id and event_id <= row.last_event_id:
         return True  # an at-least-once replay already on the row
-    previous = (list(row.lines), row.steps, row.status, row.last_event_id)
+    previous = (list(row.lines), row.steps, row.note, row.status, row.last_event_id)
     row.lines = [*row.lines, line][-_status.STEPS_MAX:]
     row.steps += 1
+    row.note = line
     row.status = _status.TASK_RUNNING
     row.last_event_id = max(row.last_event_id, event_id)
     if not await _render(adapter, key, plan):
@@ -790,7 +798,7 @@ async def deliver_row(
             # Never shown, so no event could settle it: the card is rolling now.
             del plan.rows[card]
         else:
-            row.lines, row.steps, row.status, row.last_event_id = previous
+            row.lines, row.steps, row.note, row.status, row.last_event_id = previous
         _roll(adapter, key, plan, card)
         if plan.ts:
             await _session(adapter, key, plan)

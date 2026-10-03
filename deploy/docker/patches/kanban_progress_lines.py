@@ -221,8 +221,9 @@ def result_line(kind: str, payload: object) -> str:
 
     Upstream's ``completed`` event carries the first line of the worker's
     handoff summary, or of its result when it gave no summary
-    (``_completed_event_payload`` in ``hermes_cli/kanban_db.py``), so the row needs nothing new from the worker. A Markdown heading's ``#``
-    marks are dropped, a ``#1234`` kept; the line is clipped as a progress note is.
+    (``_completed_event_payload`` in ``hermes_cli/kanban_db.py``), so the row
+    needs nothing new from the worker. A Markdown heading's ``#`` marks are
+    dropped, a ``#1234`` kept; the line is clipped as a progress note is.
     """
     if kind != "completed" or not isinstance(payload, dict):
         return ""

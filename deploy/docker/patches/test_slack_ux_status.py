@@ -571,7 +571,7 @@ class PlanTest(_RuntimeCase):
         adapter.client.fail.add("update")
         self.assertFalse(self._note(adapter, 2, "reading metrics"))
         row = runtime._plans[(CHANNEL, THREAD)].rows["t_a"]
-        self.assertEqual((row.lines, row.steps, row.last_event_id), (["reading logs"], 1, 1))
+        self.assertEqual((row.lines, row.steps, row.note, row.last_event_id), (["reading logs"], 1, "reading logs", 1))
 
     def test_a_fallen_back_plan_is_retried_once_its_cards_settle(self):
         adapter = _Adapter(_Client(fail={"post"}))
@@ -686,6 +686,18 @@ class PlanTest(_RuntimeCase):
         self.assertTrue(self._move(adapter, 1, "ready"))
         self.assertEqual((adapter.calls, runtime._plans), ([], {}))
 
+    def test_a_move_is_never_the_rows_title_whatever_its_wording(self):
+        # A status event with no status falls back to upstream's own move line, which has no "→ ".
+        adapter = _Adapter()
+        self._note(adapter, 1, "reading logs")
+        _run(runtime.deliver_row(adapter, _sub(), 2, "check payments", "🔄 moved", ""))
+        self._move(adapter, 3, "todo")
+        task = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"][0]
+        self.assertEqual(task["title"], "reading logs")
+        self._note(adapter, 4, "→ rolling back the node pool")
+        task = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"][0]
+        self.assertEqual(task["title"], "→ rolling back the node pool · step 2 ▸")
+
     def test_a_move_joins_the_trail_and_leaves_a_settled_row_settled(self):
         adapter = _Adapter()
         self._note(adapter, 1, "reading logs", task="t_a")
@@ -711,7 +723,7 @@ class PlanTest(_RuntimeCase):
         adapter.client.fail.add("update")
         self.assertFalse(self._move(adapter, 2, "review"))
         row = runtime._plans[(CHANNEL, THREAD)].rows["t_a"]
-        self.assertEqual((row.lines, row.steps, row.last_event_id), (["reading logs"], 1, 1))
+        self.assertEqual((row.lines, row.steps, row.note, row.last_event_id), (["reading logs"], 1, "reading logs", 1))
 
     def test_a_move_for_a_card_rolling_on_a_set_aside_plan_goes_to_its_rolling_message(self):
         async def scenario(adapter):

@@ -17,8 +17,9 @@ its one-line result once complete, "waiting on you" while pending, and the
 card's title when there is none of those; in a plan of several rows it leads
 with the card's title, so the rows stay told apart. The plan carries no Stop
 button yet: ``/stop`` interrupts only the Planning Agent's turn and would leave
-the cards running. :func:`plan_text` is the same plan as plain text, for the message's ``text`` field, with ``&``,
-``<`` and ``>`` escaped since Slack parses that field.
+the cards running. :func:`plan_text` is the same plan as plain text, for the
+message's ``text`` field, with ``&``, ``<`` and ``>`` escaped since Slack
+parses that field.
 
 The session (:func:`session_status`, :func:`session_title`):
 ``agents.sessions.setStatus`` accepts ``processing``, ``suspended`` or
@@ -98,12 +99,8 @@ ROW_MARKERS = {
     TASK_ERROR: "✗",
 }
 NOTE_SEPARATOR = " · "
-#: How a dashboard move reads on a row (``kanban_progress_lines.rolling_line``):
-#: a step in its details, but not where the card is, so never its title.
-MOVE_MARK = "→ "
 #: A running row's step count, after its latest note, once it has more than one.
 STEP_COUNT = "step {count} ▸"
-STEP_COUNT_PREFIX = STEP_COUNT.split("{", 1)[0]
 #: A pending row's title: the card asked the user something, or its review waits on them.
 WAITING_ON_YOU = "waiting on you"
 #: What the text fallback escapes, ``&`` first, as Hermes's ``format_message``
@@ -210,19 +207,21 @@ def task_card(task_id: str, title: str, lines: Sequence[str], status: str) -> di
     return card
 
 
-def _lead(row: Any) -> str:
-    """Where the card is, for its row's title, or ``""`` to show the card's title alone."""
+def _lead(row: Any) -> tuple[str, str]:
+    """Where the card is and its step count, for its row's title; ``""`` for either it lacks.
+
+    The row's ``note`` says which line is where the card is, so a line that
+    only moved the card is never taken for it, whatever its wording.
+    """
     if row.status == TASK_PENDING:
-        return WAITING_ON_YOU
+        return WAITING_ON_YOU, ""
     if row.status == TASK_COMPLETE:
-        return str(getattr(row, "result", "") or "").strip()
-    notes = [note for note in _notes(row.lines) if not note.startswith(MOVE_MARK)]
-    if not notes:
-        return ""
-    count = max(int(getattr(row, "steps", 0) or 0), len(notes))
-    if row.status == TASK_RUNNING and count > 1:
-        return notes[-1] + NOTE_SEPARATOR + STEP_COUNT.format(count=count)
-    return notes[-1]
+        return str(getattr(row, "result", "") or "").strip(), ""
+    note = _clip(str(getattr(row, "note", "") or "").strip(), STEP_TEXT_MAX)
+    count = int(getattr(row, "steps", 0) or 0)
+    if note and row.status == TASK_RUNNING and count > 1:
+        return note, STEP_COUNT.format(count=count)
+    return note, ""
 
 
 def row_title(row: Any, several: bool = False) -> str:
@@ -232,15 +231,15 @@ def row_title(row: Any, several: bool = False) -> str:
     row shows the card's title, or its id when that is blank.
     """
     name = str(row.title or "").strip() or str(row.task_id)
-    lead = _lead(row)
+    lead, count = _lead(row)
     if not lead:
         return _clip(name, ROW_TITLE_MAX)
     if several:
         lead = name + NOTE_SEPARATOR + lead
-    head, sep, count = lead.rpartition(NOTE_SEPARATOR)
-    if len(lead) > ROW_TITLE_MAX and row.status == TASK_RUNNING and count.startswith(STEP_COUNT_PREFIX):
-        return _clip(head, ROW_TITLE_MAX - len(sep + count)) + sep + count
-    return _clip(lead, ROW_TITLE_MAX)
+    if not count:
+        return _clip(lead, ROW_TITLE_MAX)
+    tail = NOTE_SEPARATOR + count
+    return _clip(lead, ROW_TITLE_MAX - len(tail)) + tail
 
 
 def plan_title(title: str | None, rows: Sequence[Any]) -> str:
@@ -262,9 +261,10 @@ def plan_blocks(title: str | None, rows: Sequence[Any]) -> list[dict]:
     """The status message's blocks: one ``plan``.
 
     ``rows`` are objects with ``task_id``, ``title``, ``lines`` and ``status``,
-    and optionally ``result`` (a completed card's one line) and ``steps`` (how
+    and optionally ``result`` (a completed card's one line), ``steps`` (how
     many notes the card has given, past the :data:`STEPS_MAX` kept, moves not
-    counted), in the
+    counted) and ``note`` (the line a running or failed row's title shows;
+    without it the row shows the card's title), in the
     order the cards first reported; past :data:`ROWS_MAX` the oldest are dropped.
     """
     rows = list(rows)[-ROWS_MAX:]

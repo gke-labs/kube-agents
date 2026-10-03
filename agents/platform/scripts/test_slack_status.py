@@ -17,6 +17,9 @@ LINEAR_BUDGET_SECONDS = 1.0
 
 
 def _row(task_id="t_a", title="check payments", lines=(), status=s.TASK_RUNNING, **extra):
+    # As the runtime keeps a row: every line a note unless said otherwise, the last one current.
+    extra.setdefault("note", lines[-1] if lines else "")
+    extra.setdefault("steps", len(lines))
     return SimpleNamespace(task_id=task_id, title=title, lines=list(lines), status=status, **extra)
 
 
@@ -117,10 +120,13 @@ class RowTitleTest(unittest.TestCase):
     def test_a_failed_card_shows_where_it_stopped_with_no_count(self):
         self.assertEqual(s.row_title(_row(lines=["a", "Archived"], status=s.TASK_ERROR)), "Archived")
 
-    def test_a_move_is_never_where_the_card_is(self):
-        row = _row(lines=["reading logs", "→ todo"], steps=1)
+    def test_the_rows_note_not_its_last_line_is_where_the_card_is(self):
+        # The runtime says which line is the note, so neither a move nor a note's wording decides it.
+        row = _row(lines=["reading logs", "→ todo"], steps=1, note="reading logs")
         self.assertEqual(s.row_title(row), "reading logs")
-        self.assertEqual(s.row_title(_row(lines=["→ ready"], status=s.TASK_ERROR)), "check payments")
+        self.assertEqual(s.row_title(_row(lines=["→ ready"], status=s.TASK_ERROR, note="")), "check payments")
+        row = _row(lines=["draining nodes", "→ rolling back"], steps=2, note="→ rolling back")
+        self.assertEqual(s.row_title(row), "→ rolling back · step 2 ▸")
 
     def test_no_notes_shows_the_title_or_the_id(self):
         self.assertEqual(s.row_title(_row()), "check payments")
@@ -142,6 +148,12 @@ class RowTitleTest(unittest.TestCase):
         title = s.row_title(_row(lines=["x", "word " * 100]))
         self.assertLessEqual(len(title), s.ROW_TITLE_MAX)
         self.assertTrue(title.endswith(s.ELLIPSIS + " · step 2 ▸"), title)
+
+    def test_a_long_note_that_reads_like_a_count_clips_as_a_note(self):
+        row = _row(lines=["step 2 of the rollout: " + "x" * 300], steps=1, note="step 2 of the rollout: " + "x" * 300)
+        title = s.row_title(row, several=True)
+        self.assertLessEqual(len(title), s.ROW_TITLE_MAX)
+        self.assertTrue(title.startswith("check payments · step 2 of the rollout"), title)
 
     def test_a_long_result_is_clipped(self):
         title = s.row_title(_row(status=s.TASK_COMPLETE, result="word " * 100), several=True)
