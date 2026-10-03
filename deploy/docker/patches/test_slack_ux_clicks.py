@@ -1189,6 +1189,23 @@ class RuntimeTest(unittest.TestCase):
                     self._options_incident(adapter, *labels)
                     check(adapter)
 
+    def test_a_bare_apply_counts_only_for_a_letter_the_alert_offers(self):
+        options = ("apply Option A: Raise the limit", "apply Option B: Restore the secret")
+        single = ("apply: Roll back checkout-gateway",)
+        cases = [
+            (options, self._drops, ("apply B", "apply option a", "apply")),
+            (options, self._runs, ("apply D", "apply Option C")),
+            # A single fix has no letter to check a typed one against; the agent may apply it anyway.
+            (single, self._drops, ("apply", "apply A")),
+        ]
+        for labels, check, texts in cases:
+            for text in texts:
+                with self.subTest(labels=labels, text=text):
+                    importlib.reload(runtime)
+                    adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": text, "ts": "223.000"}])
+                    self._options_incident(adapter, *labels)
+                    check(adapter)
+
     def test_a_clipped_buttons_shown_text_counts_as_its_whole_text(self):
         # The button shows "apply Option B: Roll back checkout-gateway to the last revision that…".
         labels = (
