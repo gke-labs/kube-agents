@@ -1821,11 +1821,12 @@ The operator's StatefulSet does this in two steps, from constants in
 [`shell_sandbox_manifests.go`](../../k8s-operator/internal/controller/shell_sandbox_manifests.go).
 An init container, `prepare-image-trees`, runs the sandbox image with
 `--prepare-image-trees` and mounts only the data volume, at `/opt/data`. For each home
-root, `/opt/data` and `/opt/data/profiles/platform`, it removes a symlink or moves aside
-a non-directory on every path that is about to become a mount point, then replaces
-`skills`, `scripts` and `governance` with fresh copies from `/opt/defaults`, owned by
-root and not writable by group or other. It exits before writing anything to the root
-filesystem. The shell container then mounts each of the six `<home>/<tree>` paths as a
+root, `/opt/data` and `/opt/data/profiles/platform`, it removes a symlink on every path
+that is about to become a mount point and moves aside a non-directory where a home root
+belongs. It then deletes whatever is at `skills`, `scripts` and `governance`, file or
+directory, and puts fresh copies from `/opt/defaults` there, owned by root and not
+writable by group or other. It refuses to run when `/opt/defaults` holds no tree, and it
+exits before writing anything to the root filesystem. The shell container then mounts each of the six `<home>/<tree>` paths as a
 read-only `subPath` of the same volume, and mounts `profiles` and `profiles/platform`
 read-write over themselves. Kubelet resolves a container's `subPath` mounts when it
 creates that container, which is after the init container has finished, and no model
@@ -1844,7 +1845,10 @@ The shell's entrypoint does not assume the mounts are there. The operator sets
 `SANDBOX_IMAGE_TREES=read-only-mounts` on the shell container, and with it set the
 entrypoint requires every `<home>/<tree>` to appear in `/proc/self/mountinfo` as a mount
 point with `ro` in its options, and every directory between `/opt/data` and a home to be
-a mount point. If one does not, it exits 1 naming the path and the sandbox does not start, so a missing mount fails as loudly as a writable one. The cost is
+a mount point. If one does not, it exits 1 naming the path and the sandbox does not
+start, so a missing mount fails as loudly as a writable one. It also refuses to start when
+`/opt/defaults` holds no tree, missing or empty, since the per-tree check would then pass
+with nothing to check. The cost is
 that a mount problem takes the whole shell down instead of running with the gap.
 `SANDBOX_HOME_ROOTS` is set on both containers from the same constant that generates the
 mounts, so the init container stages exactly the paths the shell checks.

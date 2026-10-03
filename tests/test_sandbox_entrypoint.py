@@ -493,6 +493,14 @@ class SandboxEntrypointPrepareModeTest(_SandboxEntrypointHarness):
         self._run(". profiles/platform", _PREPARE)
         self.assertNotEqual(0, self.result.returncode)
 
+    def test_it_refuses_an_image_whose_defaults_are_empty(self) -> None:
+        """An empty /opt/defaults stages nothing: as bad as a missing one."""
+        shutil.rmtree(self.defaults)
+        self.defaults.mkdir()
+        self._run(". profiles/platform", _PREPARE)
+        self.assertNotEqual(0, self.result.returncode)
+        self.assertIn("no image trees under", self.result.stderr)
+
 
 class SandboxEntrypointReadOnlyMountGateTest(_SandboxEntrypointHarness):
     """Default mode with SANDBOX_IMAGE_TREES=read-only-mounts, as the operator sets it.
@@ -575,6 +583,25 @@ class SandboxEntrypointReadOnlyMountGateTest(_SandboxEntrypointHarness):
         self._run_gated()
         self.assertNotEqual(0, self.result.returncode)
         self.assertIn(f"{trees[0]} is not a read-only mount", self.result.stderr)
+
+    def test_a_missing_defaults_stops_the_start(self) -> None:
+        """No /opt/defaults at all is as vacuous as an empty one."""
+        self._write_mountinfo({tree: "ro,relatime" for tree in self._tree_paths()})
+        shutil.rmtree(self.defaults)
+        self._run_gated()
+        self.assertNotEqual(0, self.result.returncode)
+        self.assertIn("no image trees under", self.result.stderr)
+        self.assertNotIn("no authorized_keys", self.result.stderr)
+
+    def test_an_empty_defaults_stops_the_start(self) -> None:
+        """With no trees to iterate, the per-tree check would pass vacuously."""
+        self._write_mountinfo({tree: "ro,relatime" for tree in self._tree_paths()})
+        for entry in self.defaults.iterdir():
+            shutil.rmtree(entry)
+        self._run_gated()
+        self.assertNotEqual(0, self.result.returncode)
+        self.assertIn("no image trees under", self.result.stderr)
+        self.assertNotIn("no authorized_keys", self.result.stderr)
 
     def test_an_unknown_mode_stops_the_start(self) -> None:
         self._run(". profiles/platform", extra_env={"SANDBOX_IMAGE_TREES": "read-only"})

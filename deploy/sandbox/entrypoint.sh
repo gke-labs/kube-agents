@@ -234,6 +234,16 @@ mount_point_exists() {
   awk -v path="$1" '$5 == path { found = 1 } END { exit !found }' "$SANDBOX_MOUNTINFO"
 }
 
+# Whether $DEFAULTS holds at least one tree. The loops over "$DEFAULTS"/* skip
+# an unmatched glob, so an empty $DEFAULTS would stage nothing and check nothing
+# while every step still reported success.
+defaults_hold_a_tree() {
+  for entry in "$DEFAULTS"/*; do
+    [ -e "$entry" ] && return 0
+  done
+  return 1
+}
+
 # 1. The model's durable directory. A PVC mounts over the image's /opt/data and
 #    arrives owned by root, so the agent could not write to it. Not recursive:
 #    only the mount point needs fixing, and a recursive chown over a volume that
@@ -254,9 +264,9 @@ chown agent:agent "$DATA"
 # It exits before the marker below and before steps 2 to 4, so it writes
 # nothing outside $DATA: no authorized_keys, no host keys, no sshd drop-in.
 if [ "${1:-}" = "$PREPARE_IMAGE_TREES_ARG" ]; then
-  if [ ! -d "$DEFAULTS" ]; then
-    log "no $DEFAULTS in this image: there are no image trees to stage, and the"
-    log "shell container's read-only mounts over them would be empty."
+  if [ ! -d "$DEFAULTS" ] || ! defaults_hold_a_tree; then
+    log "no image trees under $DEFAULTS in this image: there is nothing to stage, and"
+    log "the shell container's read-only mounts over them would be empty."
     exit 1
   fi
   for root in $SANDBOX_HOME_ROOTS; do
@@ -329,6 +339,13 @@ chown agent:agent "$DATA/.sandbox"
 #     by the machine-home path and by the profile-home path the SOPs use. They
 #     are copies rather than symlinks so that each is a real directory the
 #     operator can mount read-only on its own.
+# Under the operator the per-tree check below is the guarantee, and with no
+# tree under $DEFAULTS, missing or empty, it would check nothing and pass.
+if [ "$SANDBOX_IMAGE_TREES" = "$IMAGE_TREES_READ_ONLY_MOUNTS" ] && ! defaults_hold_a_tree; then
+  log "no image trees under $DEFAULTS, so there is nothing to check the read-only"
+  log "mounts against. Refusing to start; the image is broken."
+  exit 1
+fi
 if [ -d "$DEFAULTS" ]; then
   for root in $SANDBOX_HOME_ROOTS; do
     home="$(home_for_root "$root")"

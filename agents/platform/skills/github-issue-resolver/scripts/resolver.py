@@ -55,13 +55,15 @@ BROKER_UNREACHABLE = "BROKER_UNREACHABLE"
 
 # Which copy of this file the forwarded `poll` runs, and it is deliberately not
 # the one the model has. The image also bakes the skills tree into
-# /opt/defaults/skills and the entrypoint syncs it onto the volume under
-# $HERMES_HOME (/opt/data in the sandbox), but that tree is `chown agent:agent`:
-# uid 1000 can rewrite it and the edit stands until the next restart. `_forward`
-# crosses as `hermes`, which holds the cron's credential and a 0700 home the
-# model must not be able to author into, so it must not execute anything the
-# model can write -- the rule deploy/sandbox/Dockerfile states above its
-# /opt/defaults chown. So the forwarded path is the root-owned staging the
+# /opt/defaults/skills and the entrypoint stages it onto the volume under
+# $HERMES_HOME (/opt/data in the sandbox). Under the operator that copy is
+# root-owned and mounted read-only, but it sits on the model's volume: outside
+# the operator the model can rename the tree aside and put its own there, and
+# older entrypoints gave it to uid 1000. `_forward` crosses as `hermes`, which
+# holds the cron's credential and a 0700 home the model must not be able to
+# author into, so it must not execute anything the model can write -- the rule
+# deploy/sandbox/Dockerfile states above its /opt/defaults chown. So the
+# forwarded path is the root-owned staging the
 # Dockerfile builds, whose whole import closure is staged with it and checked at
 # build time by deploy/sandbox/trusted-closure-guard.py. Same constant, same
 # reason and the same directory as `forge.SANDBOX_FORGE`.
