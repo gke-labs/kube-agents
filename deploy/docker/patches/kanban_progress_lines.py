@@ -210,6 +210,15 @@ SETTLING_KINDS = (
 
 #: A Markdown heading's marks, which a completed card's result line drops.
 HEADING_MARKS = re.compile(r"^#{1,6}\s+")
+#: A Markdown link or image, which the result line reduces to its text: the
+#: row's title is plain text, so ``[PR #12](url)`` would land verbatim.
+LINK_MARKS = re.compile(r"!?\[([^\]]+)\]\([^)\s]*\)")
+#: A code span's backticks, which the result line drops.
+CODE_MARKS = re.compile(r"(?<!`)`([^`]+)`(?!`)")
+#: Bold and italic stars around a run of text, which the result line drops. A
+#: star touching a word, a path or a dot is a glob or arithmetic and stays, as
+#: do underscores, so ``logs/*/*.json``, ``2*3`` and ``seeded_a`` survive.
+EMPHASIS_MARKS = re.compile(r"(?<![\w*./])(\*\*|\*)(?=[^\s./*_])(.+?)(?<=\S)\1(?![\w*/])")
 
 #: Attribute the map hangs off on the watcher instance. Same lazily-initialised
 #: pattern as upstream's ``_kanban_sub_fail_counts``.
@@ -222,12 +231,15 @@ def result_line(kind: str, payload: object) -> str:
     Upstream's ``completed`` event carries the first line of the worker's
     handoff summary, or of its result when it gave no summary
     (``_completed_event_payload`` in ``hermes_cli/kanban_db.py``), so the row
-    needs nothing new from the worker. A Markdown heading's ``#`` marks are
+    needs nothing new from the worker. The title it becomes is plain text, so
+    a heading's ``#`` marks, a link's URL and bold, italic and code marks are
     dropped, a ``#1234`` kept; the line is clipped as a progress note is.
     """
     if kind != "completed" or not isinstance(payload, dict):
         return ""
-    return progress_note({"note": HEADING_MARKS.sub("", str(payload.get("summary") or "").strip())})
+    line = HEADING_MARKS.sub("", str(payload.get("summary") or "").strip())
+    line = EMPHASIS_MARKS.sub(r"\2", CODE_MARKS.sub(r"\1", LINK_MARKS.sub(r"\1", line)))
+    return progress_note({"note": line})
 
 
 def rolling_line(kind: str, payload: object) -> str:

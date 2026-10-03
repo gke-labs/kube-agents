@@ -155,6 +155,14 @@ class RowTitleTest(unittest.TestCase):
         self.assertLessEqual(len(title), s.ROW_TITLE_MAX)
         self.assertTrue(title.startswith("check payments · step 2 of the rollout"), title)
 
+    def test_a_long_card_title_leaves_room_for_the_state(self):
+        name = "word " * 60
+        running = s.row_title(_row(title=name, lines=["a", "b", "reading pod state"]), several=True)
+        self.assertTrue(running.endswith(" · reading pod state · step 3 ▸"), running)
+        pending = s.row_title(_row(title=name, status=s.TASK_PENDING), several=True)
+        self.assertTrue(pending.endswith(s.ELLIPSIS + " · waiting on you"), pending)
+        self.assertLessEqual(len(pending), s.ROW_NAME_MAX + len(" · waiting on you"))
+
     def test_a_long_result_is_clipped(self):
         title = s.row_title(_row(status=s.TASK_COMPLETE, result="word " * 100), several=True)
         self.assertLessEqual(len(title), s.ROW_TITLE_MAX)

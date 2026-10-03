@@ -113,6 +113,9 @@ TEXT_ESCAPES = (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
 #: bound on rows so a runaway fan-out cannot outgrow the message.
 PLAN_TITLE_MAX = 256
 ROW_TITLE_MAX = 256
+#: A card's title ahead of its state in a plan of several, so a long one
+#: cannot crowd the state out of the row.
+ROW_NAME_MAX = 80
 STEPS_MAX = 6
 ROWS_MAX = 20
 STEP_TEXT_MAX = 300
@@ -227,15 +230,16 @@ def _lead(row: Any) -> tuple[str, str]:
 def row_title(row: Any, several: bool = False) -> str:
     """A row's title: where its card is, after the card's title in a plan of ``several`` rows.
 
-    A step count is kept whole when the note is clipped. With nothing to say the
-    row shows the card's title, or its id when that is blank.
+    A step count is kept whole when the note is clipped, and the card's title
+    is clipped to :data:`ROW_NAME_MAX` ahead of it. With nothing to say the row
+    shows the card's title, or its id when that is blank.
     """
     name = str(row.title or "").strip() or str(row.task_id)
     lead, count = _lead(row)
     if not lead:
         return _clip(name, ROW_TITLE_MAX)
     if several:
-        lead = name + NOTE_SEPARATOR + lead
+        lead = _clip(name, ROW_NAME_MAX) + NOTE_SEPARATOR + lead
     if not count:
         return _clip(lead, ROW_TITLE_MAX)
     tail = NOTE_SEPARATOR + count

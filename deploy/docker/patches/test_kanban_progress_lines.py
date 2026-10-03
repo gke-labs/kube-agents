@@ -406,6 +406,28 @@ class ResultLineTest(unittest.TestCase):
         self.assertEqual(result_line("completed", {"summary": "## Both pods are up"}), "Both pods are up")
         self.assertEqual(result_line("completed", {"summary": "#1234 merged"}), "#1234 merged")
 
+    def test_inline_marks_are_reduced_to_their_text(self):
+        summary = "## Fixed — see [PR #12](https://github.com/o/r/pull/12)"
+        self.assertEqual(result_line("completed", {"summary": summary}), "Fixed — see PR #12")
+        self.assertEqual(result_line("completed", {"summary": "**Both pods are up**"}), "Both pods are up")
+        self.assertEqual(
+            result_line("completed", {"summary": "`kube-system/coredns` is *healthy*"}),
+            "kube-system/coredns is healthy",
+        )
+        summary = "![graph](https://x/y.png) `.env` **Done**."
+        self.assertEqual(result_line("completed", {"summary": summary}), "graph .env Done.")
+
+    def test_identifiers_and_arithmetic_keep_their_characters(self):
+        for summary in (
+            "seeded_a and __init__ are current",
+            "2*3*4 replicas",
+            "a * b",
+            "Cleaned gs://bkt/logs/*/2026/*.json",
+            "Applied *.yaml* overlays",
+            "Files *_test.go and *.go* skipped",
+        ):
+            self.assertEqual(result_line("completed", {"summary": summary}), summary)
+
     def test_a_long_summary_is_clipped_as_a_note_is(self):
         self.assertLessEqual(len(result_line("completed", {"summary": "word " * 100})), DEFAULT_NOTE_LIMIT)
 
