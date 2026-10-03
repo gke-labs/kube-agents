@@ -192,6 +192,16 @@ toolsets:
 agent:
   max_turns: 250
 
+# Per-file character cap Hermes puts on a context file (SOUL.md, AGENTS.md) when it
+# builds the system prompt. Unset, the cap is 6% of the model window, and a flat
+# 20,000 whenever the window is unknown or reported small. SOUL.md here is well past
+# 20,000, and Hermes keeps only the head and tail of a file over the cap, so the
+# middle of the persona would silently drop out of the prompt. 100,000 leaves room
+# for every shipped context file and is still about 25k tokens at most. Pinned in
+# all three profile configs (chat, platform, cluster), because each profile reads
+# its own; tests/test_context_file_cap.py fails when a shipped file outgrows it.
+context_file_max_chars: 100000
+
 # Per-turn web_search ceiling. Hermes defaults to 50, and the docstring on that
 # default is right about interactive sessions: fifty searches in one turn is
 # pathological. It is not right about a kanban worker. Those are spawned

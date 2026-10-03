@@ -17,6 +17,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -44,8 +45,8 @@ func startServer(t *testing.T) *natsserver.Server {
 	return s
 }
 
-// provision creates the TASKS stream and session-state bucket the way the W6
-// operator's provision Job does.
+// provision creates the TASKS stream and the session-state and cap buckets
+// the way the W6 operator's provision Job does.
 func provision(t *testing.T, url string) {
 	t.Helper()
 	nc, err := nats.Connect(url)
@@ -69,6 +70,11 @@ func provision(t *testing.T, url string) {
 	}
 	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: lib.SessionStateBucket}); err != nil {
 		t.Fatalf("create session-state: %v", err)
+	}
+	// `nats kv add cap`, history 1: one live revision per key, which is what
+	// the chain walk's revision pinning is written against.
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: capability.Bucket, History: 1}); err != nil {
+		t.Fatalf("create cap: %v", err)
 	}
 }
 
@@ -206,6 +212,14 @@ type rig struct {
 // to a test principal, and runs it.
 func startRig(t *testing.T) *rig {
 	t.Helper()
+	return startRigWith(t, nil)
+}
+
+// startRigWith is startRig with one hook into the Config the gateway is built
+// from, for the cases that have to arm a switch before Run starts rather than
+// reach into a running gateway.
+func startRigWith(t *testing.T, tweak func(*Config)) *rig {
+	t.Helper()
 	s := startServer(t)
 	url := s.ClientURL()
 	provision(t, url)
@@ -236,6 +250,9 @@ func startRig(t *testing.T) *rig {
 		DefaultAddressee: "platform",
 		IdleTTL:          30 * time.Minute,
 		AttributionSalt:  []byte("test-salt"),
+	}
+	if tweak != nil {
+		tweak(cfg)
 	}
 	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord"})
 	if err != nil {
@@ -375,9 +392,7 @@ func TestNewTaskRoutesToPlatformWithMintedIdsAndAuthority(t *testing.T) {
 	if auth.Audience.Conversation != "discord:g1/thread1" || !auth.Audience.RosterComplete {
 		t.Fatalf("audience = %+v", auth.Audience)
 	}
-	if string(auth.Grants) != "null" {
-		t.Fatalf("grants must stay null, got %s", auth.Grants)
-	}
+	assertRootCapability(t, r, auth, origin.TaskID, "platform")
 
 	var m lib.Message
 	if err := json.Unmarshal(origin.Payload, &m); err != nil {
@@ -532,6 +547,23 @@ func TestMessageDuringWorkingIsSteeringOnSameTask(t *testing.T) {
 	if auth.Requester.Principal == originAuth.Requester.Principal {
 		t.Fatal("steer must be attributed to its own sender")
 	}
+	// ...and to the same capability. One task is one capability, and the
+	// reason is the reference rather than the ceiling: Ref pins a key AND a
+	// revision, the executor resolved THAT pair when the task opened, and a
+	// second mint per turn would hand it a root it never resolved. The
+	// verifier walks what the envelope names, so the steer would be checked
+	// against an entry whose arrival nothing ordered against the work already
+	// in flight.
+	//
+	// Not a ceiling difference. A steerer has no ceiling of their own here --
+	// mintCapability fills Tier and Scope from install-wide config and varies
+	// only Delegate, so a re-mint on this turn would produce the same bound
+	// with a different revision. An earlier version of this comment said the
+	// re-mint would substitute "the steerer's ceiling for the submitter's",
+	// which reads as a per-requester bound that this tree does not have.
+	if string(auth.Grants) != string(originAuth.Grants) {
+		t.Fatalf("the steer carries a different capability:\n  steer  %s\n  origin %s", auth.Grants, originAuth.Grants)
+	}
 	// The steer is acknowledged in-channel - silent absorption looked like
 	// a dropped message live.
 	waitFor(t, "steer acknowledgement", func() bool {
@@ -655,12 +687,8 @@ func TestRosterCapAndPseudonyms(t *testing.T) {
 	for i := range big {
 		big[i] = fmt.Sprintf("u%d", i)
 	}
-	raw := BuildAuthority(ps, pm, "test:bnaylor", "discord", "1001", "principal-map",
+	auth := BuildAuthority(ps, pm.Resolve, "test:bnaylor", "discord", "1001", "principal-map",
 		"discord:g/x", "group", big, true)
-	var auth Authority
-	if err := json.Unmarshal(raw, &auth); err != nil {
-		t.Fatal(err)
-	}
 	if len(auth.Audience.Roster) != rosterCap {
 		t.Fatalf("roster len = %d, want %d", len(auth.Audience.Roster), rosterCap)
 	}
@@ -869,6 +897,54 @@ func TestTasklessHealPersistsAcrossCapRefusal(t *testing.T) {
 	if rec.ActiveTask != nil {
 		t.Fatalf("release announced but not written: %+v", rec.ActiveTask)
 	}
+}
+
+// A refusal reaches chat with the cause the executor named. gke-labs#1884
+// put a capability check in front of every task, so an unreachable verifier
+// now lands as `rejected` where only an empty submission used to -- and a
+// bare "the executor rejected the task" sends the user to re-read their own
+// prompt for a fault that is in the install. Asserted on the reason the
+// verifier outage produces, not on any refusal, because that is the one the
+// bare line was actively misleading about.
+func TestARejectedTaskPostsTheReasonTheExecutorGave(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-rejected"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-1", Text: "start"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateSubmitted, false); err != nil {
+		t.Fatal(err)
+	}
+
+	const reason = "reason: capability-refused - the verifier could not be reached"
+	payload, err := json.Marshal(lib.StatusUpdate{
+		TaskID: origin.TaskID, ContextID: origin.ContextID,
+		Status: lib.TaskStatus{State: lib.StateRejected, Message: &lib.Message{
+			Role: "agent", MessageID: "msg-reject",
+			Parts: []lib.Part{{Kind: "text", Text: reason}},
+		}},
+		Final: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewStatusUpdateEnvelope(lib.Party{Session: "platform"}, origin.TaskID, origin.ContextID, origin.CorrelationID, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.bus.Publish(ctx, lib.TaskEventsSubject("platform", origin.TaskID), env); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "the refusal posts with its reason", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if strings.Contains(p, reason) {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 func TestLongFailureReasonIsChunkedUnderTheCap(t *testing.T) {
@@ -1553,5 +1629,706 @@ func TestHealedExecutorTerminalCountsAsActivity(t *testing.T) {
 	}
 	if held, _, err := r.g.hasSession(ctx, conv); err != nil || !held {
 		t.Fatalf("after the heal posted the answer the thread must still be a session thread: held=%v err=%v", held, err)
+	}
+}
+
+// sessionRigTurn is the one conversation these tests share per rig; a
+// helper keeps the InboundMessage shape out of every assertion.
+func sessionRigTurn(r *rig, conv, id, text string) {
+	r.adapter.inbox <- InboundMessage{
+		Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: id, Text: text,
+	}
+}
+
+func postedContaining(r *rig, needle string) func() bool {
+	return func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if strings.Contains(p, needle) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// TestSessionCommandMarksTheRouteAndTheNextMessageSpawns: a bare /session
+// spawns nothing itself (each new task is a fresh incarnation, so an eager
+// pod would be retired by the first message); it marks the record and the
+// next plain message opens the pod with its text as the task.
+func TestSessionCommandMarksTheRouteAndTheNextMessageSpawns(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-s1"
+	sessionRigTurn(r, conv, "s-100", "/session")
+	waitFor(t, "ack", postedContaining(r, "session route on"))
+	if got := len(spawn.calls()); got != 0 {
+		t.Fatalf("/session spawned %d pods; it must spawn none", got)
+	}
+	rec, err := r.g.reg.Get(context.Background(), conv)
+	if err != nil || rec == nil {
+		t.Fatalf("record: %v %v", rec, err)
+	}
+	if !rec.SessionRouted || rec.Profile != "chat" {
+		t.Fatalf("record not session-routed after /session: %+v", rec)
+	}
+	ctxID := rec.ContextID
+
+	sessionRigTurn(r, conv, "s-101", "what is running in kubeagents-system")
+	waitFor(t, "spawn", func() bool { return len(spawn.calls()) == 1 })
+	call := spawn.calls()[0]
+	if !strings.HasPrefix(call.Session, "chat-") {
+		t.Fatalf("session %q not chat-<animal>-<hex>", call.Session)
+	}
+	origin := r.awaitTask(t, call.Session)
+	var m lib.Message
+	if err := json.Unmarshal(origin.Payload, &m); err != nil {
+		t.Fatal(err)
+	}
+	if got := joinTextParts(m.Parts); got != "what is running in kubeagents-system" {
+		t.Fatalf("task text = %q", got)
+	}
+	rec, _ = r.g.reg.Get(context.Background(), conv)
+	if rec.ContextID != ctxID {
+		t.Fatalf("contextId changed across /session: %s -> %s", ctxID, rec.ContextID)
+	}
+}
+
+// TestSessionCommandWithTextRunsItAsTheFirstTurn: "/session <text>" marks the
+// route and spawns once, with <text> as the task.
+func TestSessionCommandWithTextRunsItAsTheFirstTurn(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-s2"
+	sessionRigTurn(r, conv, "s-110", "/session list the pods in ns x")
+	waitFor(t, "spawn", func() bool { return len(spawn.calls()) == 1 })
+	origin := r.awaitTask(t, spawn.calls()[0].Session)
+	var m lib.Message
+	if err := json.Unmarshal(origin.Payload, &m); err != nil {
+		t.Fatal(err)
+	}
+	if got := joinTextParts(m.Parts); got != "list the pods in ns x" {
+		t.Fatalf("task text = %q, want the command stripped", got)
+	}
+	rec, _ := r.g.reg.Get(context.Background(), conv)
+	if rec == nil || !rec.SessionRouted {
+		t.Fatalf("record not session-routed: %+v", rec)
+	}
+}
+
+// TestSessionOffReleasesThePodAndRehomes: once the session task is done,
+// /session off deletes the incarnation, clears the route, and the next plain
+// message is a platform task.
+func TestSessionOffReleasesThePodAndRehomes(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-s3"
+	sessionRigTurn(r, conv, "s-120", "/session first task")
+	waitFor(t, "spawn", func() bool { return len(spawn.calls()) == 1 })
+	call := spawn.calls()[0]
+	origin := r.awaitTask(t, call.Session)
+	exec := r.execFor(t, origin, call.Session)
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateSubmitted, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "terminal relayed", postedContaining(r, "non-text result"))
+
+	sessionRigTurn(r, conv, "s-121", "/session off")
+	waitFor(t, "off ack", postedContaining(r, "session route off"))
+	waitFor(t, "incarnation deleted", func() bool {
+		d := spawn.deleted()
+		return len(d) == 1 && d[0] == call.Session
+	})
+	rec, _ := r.g.reg.Get(ctx, conv)
+	if rec.SessionRouted || rec.PodName != "" || rec.BusSession != "" || rec.Addressee != "platform" {
+		t.Fatalf("record after /session off: %+v", rec)
+	}
+
+	sessionRigTurn(r, conv, "s-122", "how is the fleet?")
+	rehomed := r.awaitTask(t, "platform")
+	if rehomed.To == nil || rehomed.To.Session != "platform" {
+		t.Fatalf("re-home failed: %+v", rehomed.To)
+	}
+	if got := len(spawn.calls()); got != 1 {
+		t.Fatalf("plain ask after /session off spawned: %d spawns", got)
+	}
+}
+
+// TestSessionOffRefusesWhileASessionTaskRuns: the way back never kills a
+// running task silently; the user stops it first.
+func TestSessionOffRefusesWhileASessionTaskRuns(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-s4"
+	sessionRigTurn(r, conv, "s-130", "/session long task")
+	waitFor(t, "spawn", func() bool { return len(spawn.calls()) == 1 })
+	call := spawn.calls()[0]
+	origin := r.awaitTask(t, call.Session)
+	exec := r.execFor(t, origin, call.Session)
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+
+	sessionRigTurn(r, conv, "s-131", "/session off")
+	waitFor(t, "refusal", postedContaining(r, "still running"))
+	if d := spawn.deleted(); len(d) != 0 {
+		t.Fatalf("/session off deleted %v while the task ran", d)
+	}
+	rec, _ := r.g.reg.Get(ctx, conv)
+	if !rec.SessionRouted || rec.ActiveTask == nil || rec.ActiveTask.Detached {
+		t.Fatalf("record changed by a refused /session off: %+v", rec)
+	}
+}
+
+// TestSessionOffOffTheRouteIsNotAStop: on a fixed-route conversation with a
+// platform task running, "/session off" is answered, not forwarded as a
+// stop and not steered into the task.
+func TestSessionOffOffTheRouteIsNotAStop(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-s5"
+	sessionRigTurn(r, conv, "s-140", "check the fleet")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	sessionRigTurn(r, conv, "s-141", "/session off")
+	waitFor(t, "answer", postedContaining(r, "not on the session route"))
+	for _, e := range inSubjectEnvelopes(t, r.url, "platform") {
+		if e.EnvelopeID == origin.EnvelopeID {
+			continue
+		}
+		t.Fatalf("/session off reached the platform task's in subject as %s", e.Kind)
+	}
+	rec, _ := r.g.reg.Get(ctx, conv)
+	if rec.ActiveTask == nil || rec.ActiveTask.Detached {
+		t.Fatalf("the platform task was cancelled by /session off: %+v", rec.ActiveTask)
+	}
+	if len(spawn.calls()) != 0 {
+		t.Fatal("/session off spawned")
+	}
+}
+
+// TestSessionCommandWithoutSpawnerIsNotAnAffordance: with the spawner dark,
+// /session answers that sessions are off and routes nothing.
+func TestSessionCommandWithoutSpawnerIsNotAnAffordance(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-s6"
+	sessionRigTurn(r, conv, "s-150", "/session")
+	waitFor(t, "answer", postedContaining(r, "not enabled"))
+	if got := len(inSubjectEnvelopes(t, r.url, "platform")); got != 0 {
+		t.Fatalf("/session published %d envelope(s) to platform", got)
+	}
+	rec, _ := r.g.reg.Get(context.Background(), conv)
+	if rec != nil && rec.SessionRouted {
+		t.Fatalf("record marked session-routed with no spawner: %+v", rec)
+	}
+}
+
+// TestSessionCommandOnSessionDefaultChangesNothing: where the default is
+// already the session route, both forms are answered and nothing is minted.
+func TestSessionCommandOnSessionDefaultChangesNothing(t *testing.T) {
+	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
+	conv := "discord:g1/thread-s7"
+	sessionRigTurn(r, conv, "s-160", "/session")
+	waitFor(t, "answer", postedContaining(r, "already a session"))
+	sessionRigTurn(r, conv, "s-161", "/session off")
+	waitFor(t, "answer", postedContaining(r, "the default on this install"))
+	if got := len(spawn.calls()); got != 0 {
+		t.Fatalf("spawned %d", got)
+	}
+}
+
+// TestSessionCommandWithTextHonoursTheCap: a refused first turn leaves no
+// half-written record - the cap post is the only reply.
+func TestSessionCommandWithTextHonoursTheCap(t *testing.T) {
+	r, spawn := startRigWithSpawnerCap(t, "platform", 1)
+	spawn.mu.Lock()
+	spawn.live = 1
+	spawn.mu.Unlock()
+	conv := "discord:g1/thread-s8"
+	sessionRigTurn(r, conv, "s-170", "/session first task")
+	waitFor(t, "cap refusal", postedContaining(r, "not started: 1 session worker is already running (cap 1)"))
+	if got := len(spawn.calls()); got != 0 {
+		t.Fatalf("spawned %d past the cap", got)
+	}
+	rec, _ := r.g.reg.Get(context.Background(), conv)
+	if rec != nil && rec.SessionRouted {
+		t.Fatalf("refused /session <text> persisted the route: %+v", rec)
+	}
+}
+
+// TestSessionCommandIgnoredOnAnExplicitCancel: a programmatic cancel is a
+// cancel whatever its text says.
+func TestSessionCommandIgnoredOnAnExplicitCancel(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-s9"
+	sessionRigTurn(r, conv, "s-180", "check the fleet")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	r.adapter.inbox <- InboundMessage{
+		Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "s-181",
+		Text: "/session", Intent: IntentCancel,
+	}
+	waitFor(t, "cancel detached the task", func() bool {
+		rec, _ := r.g.reg.Get(context.Background(), conv)
+		return rec != nil && rec.ActiveTask != nil && rec.ActiveTask.Detached
+	})
+	rec, _ := r.g.reg.Get(context.Background(), conv)
+	if rec.SessionRouted || len(spawn.calls()) != 0 {
+		t.Fatalf("a cancel was read as /session: %+v", rec)
+	}
+}
+
+// TestSessionCommandWhileAPlatformTaskRunsSaysSo: a bare /session during a
+// platform task marks the route but must not promise that the next message
+// opens a pod - that message steers the running task. The reply says the
+// task finishes first, and the message after it is the one that spawns.
+func TestSessionCommandWhileAPlatformTaskRunsSaysSo(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-s10"
+	sessionRigTurn(r, conv, "s-190", "check the fleet")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	sessionRigTurn(r, conv, "s-191", "/session")
+	waitFor(t, "ack", postedContaining(r, "after it opens a session pod"))
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "your next message opens a session pod") {
+			t.Fatalf("promised the next message opens a pod while a task runs: %q", p)
+		}
+	}
+	rec, _ := r.g.reg.Get(ctx, conv)
+	if !rec.SessionRouted || rec.ActiveTask == nil || rec.ActiveTask.Detached {
+		t.Fatalf("record after /session during a task: %+v", rec)
+	}
+	if len(spawn.calls()) != 0 {
+		t.Fatal("spawned during a running platform task")
+	}
+}
+
+// TestSessionCommandWithTextWhileATaskRunsHoldsTheText: the route turns on,
+// the text is not sent, and the reply says so.
+func TestSessionCommandWithTextWhileATaskRunsHoldsTheText(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-s11"
+	sessionRigTurn(r, conv, "s-200", "check the fleet")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	sessionRigTurn(r, conv, "s-201", "/session list the pods")
+	waitFor(t, "held", postedContaining(r, "that message was not sent"))
+	for _, e := range inSubjectEnvelopes(t, r.url, "platform") {
+		if e.EnvelopeID == origin.EnvelopeID {
+			continue
+		}
+		t.Fatalf("the held text reached the platform task as %s", e.Kind)
+	}
+	rec, _ := r.g.reg.Get(ctx, conv)
+	if !rec.SessionRouted || len(spawn.calls()) != 0 {
+		t.Fatalf("record %+v, spawns %d", rec, len(spawn.calls()))
+	}
+}
+
+// TestSessionCommandTwiceIsAnsweredOnce: a second bare /session on a routed
+// conversation is answered and changes nothing.
+func TestSessionCommandTwiceIsAnsweredOnce(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-s12"
+	sessionRigTurn(r, conv, "s-210", "/session")
+	waitFor(t, "ack", postedContaining(r, "session route on"))
+	sessionRigTurn(r, conv, "s-211", "/session")
+	waitFor(t, "already", postedContaining(r, "already on the session route"))
+	if len(spawn.calls()) != 0 {
+		t.Fatal("a repeated /session spawned")
+	}
+}
+
+// TestSessionStopIsAHintNotATask: "/session stop" must never mint a task
+// whose text reads "stop"; it points at /session off.
+func TestSessionStopIsAHintNotATask(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-s13"
+	sessionRigTurn(r, conv, "s-220", "/session stop")
+	waitFor(t, "hint", postedContaining(r, "`/session off`"))
+	if len(spawn.calls()) != 0 {
+		t.Fatal("/session stop spawned a task")
+	}
+	rec, _ := r.g.reg.Get(context.Background(), conv)
+	if rec != nil && rec.SessionRouted {
+		t.Fatalf("/session stop marked the route: %+v", rec)
+	}
+}
+
+// TestSessionInfoRepliesStillCountAsActivity: an informational /session
+// reply is a turn like "nothing is running" - the idle clock moves.
+func TestSessionInfoRepliesStillCountAsActivity(t *testing.T) {
+	r, _ := startRigWithSpawner(t)
+	conv := "discord:g1/thread-s14"
+	sessionRigTurn(r, conv, "s-230", "/session off")
+	waitFor(t, "answer", postedContaining(r, "not on the session route"))
+	sessionRigTurn(r, conv, "s-231", "/session")
+	waitFor(t, "ack", postedContaining(r, "session route on"))
+	// The ack is persisted; take its clock, then let only an informational
+	// reply move it.
+	rec, _ := r.g.reg.Get(context.Background(), conv)
+	if rec == nil || !rec.SessionRouted {
+		t.Fatalf("record after the ack: %+v", rec)
+	}
+	first := rec.LastActivity
+	time.Sleep(30 * time.Millisecond)
+	sessionRigTurn(r, conv, "s-232", "/session")
+	waitFor(t, "already", postedContaining(r, "already on the session route"))
+	time.Sleep(50 * time.Millisecond)
+	rec, _ = r.g.reg.Get(context.Background(), conv)
+	if !rec.LastActivity.After(first) {
+		t.Fatalf("informational reply did not move LastActivity: %s then %s", first, rec.LastActivity)
+	}
+}
+
+// TestSessionStatusIsAFirstTurn: the spec's sentence - "/session status" is
+// /session with the text "status", a first turn, not a status ask.
+func TestSessionStatusIsAFirstTurn(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-s15"
+	sessionRigTurn(r, conv, "s-240", "/session status")
+	waitFor(t, "spawn", func() bool { return len(spawn.calls()) == 1 })
+	origin := r.awaitTask(t, spawn.calls()[0].Session)
+	var m lib.Message
+	if err := json.Unmarshal(origin.Payload, &m); err != nil {
+		t.Fatal(err)
+	}
+	if got := joinTextParts(m.Parts); got != "status" {
+		t.Fatalf("task text = %q", got)
+	}
+}
+
+// TestSessionOffWorksWithoutASpawner: a record left session-routed after the
+// spawner was disarmed (the W4-rollback shape) must still have its way back,
+// or every message in that conversation publishes to an addressee nothing
+// serves until the operator re-arms.
+func TestSessionOffWorksWithoutASpawner(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-s16"
+	rec := &SessionRecord{Key: conv, ContextID: "ctx-s16", Kind: "group", SessionRouted: true, Profile: "chat",
+		BusSession: "chat-otter-dead", Addressee: "chat-otter-dead", LastActivity: time.Now().UTC()}
+	if err := r.g.reg.Put(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+	sessionRigTurn(r, conv, "s-250", "/session off")
+	waitFor(t, "off ack", postedContaining(r, "session route off"))
+	got, _ := r.g.reg.Get(context.Background(), conv)
+	if got.SessionRouted || got.Addressee != "platform" || got.BusSession != "" {
+		t.Fatalf("record after /session off with no spawner: %+v", got)
+	}
+	sessionRigTurn(r, conv, "s-251", "how is the fleet?")
+	if env := r.awaitTask(t, "platform"); env.To == nil || env.To.Session != "platform" {
+		t.Fatalf("not re-homed: %+v", env.To)
+	}
+	// The on-form stays refused: nothing can spawn.
+	sessionRigTurn(r, conv, "s-252", "/session")
+	waitFor(t, "not enabled", postedContaining(r, "not enabled"))
+}
+
+// TestHasSessionDoesNotCountATaskLessRoutedRecord: the Slack adapter's rule
+// stands - a session thread is one the gateway has started a task in. A
+// /session binding alone does not make one, because the adapter caches the
+// registry's answer and nothing but a started task overwrites it; promising
+// otherwise is a promise the adapter cannot keep.
+func TestHasSessionDoesNotCountATaskLessRoutedRecord(t *testing.T) {
+	r, _ := startRigWithSpawner(t)
+	ctx := context.Background()
+	bound := &SessionRecord{Key: "slack:channel/C1/1.1", ContextID: "ctx-f", Kind: "group", SessionRouted: true, Profile: "chat",
+		LastActivity: time.Now().UTC()}
+	if err := r.g.reg.Put(ctx, bound); err != nil {
+		t.Fatal(err)
+	}
+	if held, _, _ := r.g.hasSession(ctx, bound.Key); held {
+		t.Fatal("a task-less session-routed record counted as a session thread")
+	}
+}
+
+// TestSessionWithTextOnSessionDefaultRunsTheText: where every conversation
+// is a session already, "/session <text>" is <text>, an ordinary turn - not a
+// confirmation that silently drops the ask.
+func TestSessionWithTextOnSessionDefaultRunsTheText(t *testing.T) {
+	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
+	conv := "discord:g1/thread-s17"
+	sessionRigTurn(r, conv, "s-260", "/session list the pods in ns x")
+	waitFor(t, "spawn", func() bool { return len(spawn.calls()) == 1 })
+	origin := r.awaitTask(t, spawn.calls()[0].Session)
+	var m lib.Message
+	if err := json.Unmarshal(origin.Payload, &m); err != nil {
+		t.Fatal(err)
+	}
+	if got := joinTextParts(m.Parts); got != "list the pods in ns x" {
+		t.Fatalf("task text = %q, want the command stripped", got)
+	}
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "already a session") {
+			t.Fatalf("the text form was answered as a bare /session: %q", p)
+		}
+	}
+}
+
+// TestSessionOffDuringAPlatformTaskRehomesWithoutStopping: the off-refusal
+// protects a running SESSION task's pod; a platform task has no pod to lose,
+// so the way back goes through and leaves that task running.
+func TestSessionOffDuringAPlatformTaskRehomesWithoutStopping(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-s18"
+	sessionRigTurn(r, conv, "s-270", "check the fleet")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	sessionRigTurn(r, conv, "s-271", "/session")
+	waitFor(t, "ack", postedContaining(r, "after it opens a session pod"))
+	sessionRigTurn(r, conv, "s-272", "/session off")
+	waitFor(t, "off ack", postedContaining(r, "session route off"))
+	rec, _ := r.g.reg.Get(ctx, conv)
+	if rec.SessionRouted || rec.Addressee != "platform" || rec.ActiveTask == nil || rec.ActiveTask.Detached {
+		t.Fatalf("record after /session off during a platform task: %+v", rec)
+	}
+	for _, e := range inSubjectEnvelopes(t, r.url, "platform") {
+		if e.EnvelopeID != origin.EnvelopeID {
+			t.Fatalf("/session off reached the platform task as %s", e.Kind)
+		}
+	}
+	if len(spawn.calls()) != 0 {
+		t.Fatal("spawned")
+	}
+}
+
+// TestPostFlipSessionStopIsAStop: on a session-default install the stripped
+// "/session stop" must be the stop it unwraps to - a cancel on the running
+// task, never a steer whose text reads "stop" and never a new task.
+func TestPostFlipSessionStopIsAStop(t *testing.T) {
+	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
+	conv := "discord:g1/thread-s19"
+	sessionRigTurn(r, conv, "s-280", "check the fleet")
+	waitFor(t, "spawn", func() bool { return len(spawn.calls()) == 1 })
+	call := spawn.calls()[0]
+	origin := r.awaitTask(t, call.Session)
+	exec := r.execFor(t, origin, call.Session)
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	sessionRigTurn(r, conv, "s-281", "/session stop")
+	waitFor(t, "cancel detached the task", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		return rec != nil && rec.ActiveTask != nil && rec.ActiveTask.Detached
+	})
+	for _, e := range inSubjectEnvelopes(t, r.url, call.Session) {
+		if e.EnvelopeID == origin.EnvelopeID {
+			continue
+		}
+		if e.Kind == lib.KindMessage {
+			t.Fatalf("/session stop reached the session task as a message (steer): %s", string(e.Payload))
+		}
+	}
+	if got := len(spawn.calls()); got != 1 {
+		t.Fatalf("/session stop spawned: %d spawns", got)
+	}
+}
+
+// TestSessionWithTextOnARunningSessionSteers: already on the route with its
+// own task running, "/session <text>" is what a plain message would be - a
+// steer into that task - not an ack that drops the text.
+func TestSessionWithTextOnARunningSessionSteers(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-s20"
+	sessionRigTurn(r, conv, "s-290", "/session long task")
+	waitFor(t, "spawn", func() bool { return len(spawn.calls()) == 1 })
+	call := spawn.calls()[0]
+	origin := r.awaitTask(t, call.Session)
+	exec := r.execFor(t, origin, call.Session)
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	sessionRigTurn(r, conv, "s-291", "/session make it about NATS")
+	waitFor(t, "steer on the session in subject", func() bool {
+		for _, e := range inSubjectEnvelopes(t, r.url, call.Session) {
+			var sm lib.Message
+			if e.Kind == lib.KindMessage && e.EnvelopeID != origin.EnvelopeID &&
+				json.Unmarshal(e.Payload, &sm) == nil && joinTextParts(sm.Parts) == "make it about NATS" {
+				return true
+			}
+		}
+		return false
+	})
+	if got := len(spawn.calls()); got != 1 {
+		t.Fatalf("a steer spawned: %d", got)
+	}
+}
+
+// TestSessionOnAckTellsSlackChannelsToMention: the Slack adapter forwards an
+// unmentioned thread reply only once a task has started there, so the ack
+// after a bare /session in a Slack channel must not promise that the next
+// message opens the pod - it asks for the mention. DMs and every other
+// backend keep the plain promise.
+func TestSessionOnAckTellsSlackChannelsToMention(t *testing.T) {
+	slackChannel := sessionOnAck("slack", "group", "platform")
+	if !strings.Contains(slackChannel, "mention") || strings.Contains(slackChannel, "your next message opens") {
+		t.Fatalf("slack channel ack = %q", slackChannel)
+	}
+	for _, c := range [][2]string{{"slack", "dm"}, {"discord", "group"}, {"gchat", "group"}, {"inject", "group"}} {
+		ack := sessionOnAck(c[0], c[1], "platform")
+		if !strings.Contains(ack, "your next message opens a session pod") || strings.Contains(ack, "mention") {
+			t.Fatalf("%s/%s ack = %q", c[0], c[1], ack)
+		}
+	}
+	if !strings.Contains(sessionOnAck("discord", "group", "platform"), "`platform`") {
+		t.Fatal("the ack does not name the default addressee")
+	}
+}
+
+// assertRootCapability is the DoD's first clause in unit form: grants is not
+// null, it names the key the gateway minted for this task, and the entry is
+// really there at the pinned revision with the addressee as its delegate.
+//
+// It resolves through the same Resolver the verifier runs, against the same
+// real bucket, so what is under test is the write the gateway performed and
+// not the struct it marshalled.
+func assertRootCapability(t *testing.T, r *rig, auth Authority, taskID, delegate string) {
+	t.Helper()
+	if string(auth.Grants) == "null" || len(auth.Grants) == 0 {
+		t.Fatalf("grants is null; the task carries no capability")
+	}
+	var grants AuthorityGrants
+	if err := json.Unmarshal(auth.Grants, &grants); err != nil {
+		t.Fatalf("grants: %v", err)
+	}
+	ref := grants.Capability
+	if want := "root." + taskID; ref.Key != want {
+		t.Fatalf("capability key = %q, want %q", ref.Key, want)
+	}
+	if ref.Revision == 0 {
+		t.Fatalf("capability reference is not pinned to a revision: %+v", ref)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	store, err := capability.NewStore(ctx, r.client.JetStream())
+	if err != nil {
+		t.Fatalf("cap store: %v", err)
+	}
+	res := &capability.Resolver{Store: store}
+
+	entry, err := res.Resolve(ctx, delegate, ref)
+	if err != nil {
+		t.Fatalf("the delegate could not resolve its own capability: %v", err)
+	}
+	if entry.Delegate != delegate {
+		t.Fatalf("delegate = %q, want %q", entry.Delegate, delegate)
+	}
+	if entry.Tier != capability.TierDeveloperTeam {
+		t.Fatalf("tier = %q, want the narrow default", entry.Tier)
+	}
+	if entry.Scope == "" {
+		t.Fatal("scope is empty; the ceiling was never applied")
+	}
+
+	// Same reference, wrong holder. The block travels on a bus other
+	// principals read, so possession of the reference must not be the test.
+	if _, err := res.Resolve(ctx, "somebody-else", ref); err == nil {
+		t.Fatal("a principal the root does not name resolved it anyway")
+	} else if !errors.Is(err, capability.ErrRefused) {
+		t.Fatalf("wrong holder refused for the wrong reason: %v", err)
+	}
+}
+
+// deleteCapBucket takes the capability bucket away, the way deleteTasksStream
+// takes the task stream away: it is how an install that never provisioned the
+// bucket, or a gateway whose $KV.cap.root.* grant is missing, looks from here.
+func deleteCapBucket(t *testing.T, url string) {
+	t.Helper()
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := js.DeleteKeyValue(ctx, capability.Bucket); err != nil {
+		t.Fatalf("delete cap bucket: %v", err)
+	}
+}
+
+// TestAMintFailureRefusesTheTurn covers the armed half of the mint-failure
+// branch, which had no test: every other gateway test provisions the cap
+// bucket in provision(), so Mint never fails and neither arm was reachable.
+//
+// Enforcement on is the default, and the contract is that a gateway which
+// cannot mint refuses rather than passes. The alternative -- send it anyway --
+// is not a smaller failure: the executor refuses the capability-less
+// submission regardless, one round trip and (on the session route) one pod
+// later, with the reason surfacing in a different component's log than the
+// one the operator is reading.
+func TestAMintFailureRefusesTheTurn(t *testing.T) {
+	r := startRig(t)
+	deleteCapBucket(t, r.url)
+	conv := "discord:g1/thread-mint-refuses"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "do a thing"}
+
+	waitFor(t, "the refusal to be posted", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if strings.Contains(p, "could not mint") {
+				return true
+			}
+		}
+		return false
+	})
+	// And nothing went to an executor: the refusal is the whole outcome.
+	if envs := inSubjectEnvelopes(t, r.url, "platform"); len(envs) != 0 {
+		t.Fatalf("a submission was published despite the mint failing: %d envelope(s) on the in subject", len(envs))
+	}
+}
+
+// TestAMintFailureUnderCapabilityOptionalSendsGrantsNull covers the relaxed
+// twin -- the mixed-version window, and the only path in the tree that reaches
+// an executor with grants null. It is asserted because it is the one way a
+// capability-less submission is legitimate, so a regression that reached it by
+// accident (the return dropped, the condition inverted) would otherwise look
+// exactly like correct behaviour.
+func TestAMintFailureUnderCapabilityOptionalSendsGrantsNull(t *testing.T) {
+	r := startRigWith(t, func(c *Config) { c.CapabilityOptional = true })
+	deleteCapBucket(t, r.url)
+	conv := "discord:g1/thread-mint-relaxed"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "do a thing"}
+
+	var env *lib.Envelope
+	waitFor(t, "the submission to reach the executor anyway", func() bool {
+		envs := inSubjectEnvelopes(t, r.url, "platform")
+		if len(envs) == 0 {
+			return false
+		}
+		env = envs[0]
+		return true
+	})
+	var auth Authority
+	if err := json.Unmarshal(env.Authority, &auth); err != nil {
+		t.Fatalf("authority: %v", err)
+	}
+	if string(auth.Grants) != "null" {
+		t.Fatalf("grants = %s, want null -- this is the one path that may carry no capability", auth.Grants)
 	}
 }

@@ -427,6 +427,56 @@ func TestSideDoorForwardsObserverAndLookupToASlackPrimary(t *testing.T) {
 	}
 }
 
+// TestMuxForwardsObserverAndLookupToASlackPrimary: in production the Slack
+// adapter sits behind the console mux, alone or with the inject door above
+// it, so the gateway's TaskStarted and SetSessionLookup reach the mux first.
+// Dropping them there leaves no thread ever marked and the registry never
+// wired, and every unmentioned reply in a session thread drops.
+func TestMuxForwardsObserverAndLookupToASlackPrimary(t *testing.T) {
+	for _, withDoor := range []bool{false, true} {
+		t.Run(map[bool]string{false: "mux on top", true: "door above the mux"}[withDoor], func(t *testing.T) {
+			a := newTestSlackAdapter(&fakeSlackAPI{})
+			mux, err := NewMultiAdapter(slackBackend, consoleBackend, map[string]Adapter{slackBackend: a, consoleBackend: newFakeAdapter()}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var top Adapter = mux
+			if withDoor {
+				door, err := NewInjectAdapter("127.0.0.1:0", "side-door-test-token", time.Minute, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				top = WithSideDoor(mux, door, nil)
+			}
+			observer, ok := top.(TaskObserver)
+			if !ok {
+				t.Fatal("the stack must implement TaskObserver")
+			}
+			observer.TaskStarted("slack:C1/9.0", "task-chat")
+			observer.TaskStarted("console:tab-1", "task-console")
+			if len(a.sessionThreads) != 1 || !a.sessionThreads["C1/9.0"] {
+				t.Fatalf("TaskStarted did not reach the Slack adapter alone: sessionThreads = %v", a.sessionThreads)
+			}
+			observer.TaskAccepted("slack:C1/9.0", "task-chat")
+			observer.CancelPublished("slack:C1/9.0", "task-chat")
+			observer.TaskTerminal("slack:C1/9.0", "task-chat", lib.StateCompleted, TerminalFromExecutor, "")
+			observer.TaskStarted("noprefix", "task-x")
+
+			sink, ok := top.(SessionLookupSink)
+			if !ok {
+				t.Fatal("the stack must implement SessionLookupSink")
+			}
+			sink.SetSessionLookup(func(context.Context, string) (bool, time.Time, error) { return true, time.Time{}, nil }, 7*time.Minute)
+			a.mu.Lock()
+			forwarded, ttl := a.sessions != nil, a.sessionTTL
+			a.mu.Unlock()
+			if !forwarded || ttl != 7*time.Minute {
+				t.Fatalf("SetSessionLookup did not reach the Slack adapter: forwarded=%v ttl=%v", forwarded, ttl)
+			}
+		})
+	}
+}
+
 // TestSlackSessionMarkExpiresOnTheIdleTTL: a true in sessionThreads is not
 // forever. It is stamped when written, and once the stamp is sessionTTL old
 // the next unmentioned reply re-asks the registry and takes its answer,
@@ -888,6 +938,208 @@ func TestToMrkdwn(t *testing.T) {
 		"<!channel> deploy done": "&lt;!channel&gt; deploy done",
 		"ping <@U999> now":       "ping &lt;@U999&gt; now",
 		"a & b < c":              "a &amp; b &lt; c",
+	}
+	for in, want := range cases {
+		if got := toMrkdwn(in); got != want {
+			t.Errorf("toMrkdwn(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestToMrkdwnConvertsProseAfterAChunkedFence: Gateway.post splits a result
+// with chatChunks(text, discordChunk) and the adapter translates each chunk
+// on its own, so the chunker closes a fenced block it cuts and reopens it in
+// the next chunk (TestChatChunksKeepFencesBalanced). The prose after the
+// block then converts -- bold and links -- rather than riding to the end of
+// the chunk as the content of a fence opened by the block's orphan closer.
+// The fence lines before it are untouched.
+func TestToMrkdwnConvertsProseAfterAChunkedFence(t *testing.T) {
+	big := "```\n" + strings.Repeat("log line\n", 300) + "```\n**Summary:** see [runbook](https://x.example/r)"
+	chunks := chatChunks(big, discordChunk)
+	last := chunks[len(chunks)-1]
+	if !strings.HasSuffix(last, "**Summary:** see [runbook](https://x.example/r)") {
+		t.Fatalf("the last chunk does not carry the summary: %q", last)
+	}
+	got := toMrkdwn(last)
+	wantTail := "```\n*Summary:* see <https://x.example/r|runbook>"
+	if !strings.HasSuffix(got, wantTail) {
+		t.Errorf("the summary after the cut block was not converted:\n got %q\nwant suffix %q", got, wantTail)
+	}
+	fence := strings.TrimSuffix(last, "**Summary:** see [runbook](https://x.example/r)")
+	if !strings.HasPrefix(got, fence) {
+		t.Errorf("the fence lines before the summary were altered:\n got %q\nwant prefix %q", got, fence)
+	}
+}
+
+// TestToMrkdwnRewritesBoldOnlyOnClosedPairs: the bold rewrite used to be a
+// whole-string "**" -> "*", and executor output is full of "**" that is not
+// bold -- a Python **kwargs, a **/*.yaml glob, a horizontal rule -- so the
+// user read an altered answer. A pair is "**" on both sides of
+// one-line content that starts and ends on a non-space, non-star character;
+// "***" on both sides is the bold-italic form and becomes *_x_*. Anything
+// else -- an opener that never closes on its line, a triple closed by a
+// double, stars around spaces -- is left as written. Code spans (fenced,
+// double-backtick, inline) are verbatim, and the only rewrite that reaches
+// them is the control-sequence escaping, which is not a markdown rule.
+func TestToMrkdwnRewritesBoldOnlyOnClosedPairs(t *testing.T) {
+	cases := map[string]string{
+		// The issue's rows: none of these is a bold pair.
+		"**kwargs":                "**kwargs",
+		"**/*.yaml":               "**/*.yaml",
+		"a ** b":                  "a ** b",
+		"***":                     "***",
+		"def f(*args, **kwargs):": "def f(*args, **kwargs):",
+		// Bold-italic is the one triple that is a pair, and a single star
+		// inside a pair is emphasis inside it, not a second pair.
+		"***x***":                     "*_x_*",
+		"**Note: *not* recommended**": "*Note: *not* recommended*",
+		// Code spans are verbatim: inline, double-backtick, fenced, and a
+		// fence that never closes (it runs to the end, as CommonMark reads it).
+		"`**x**`":                              "`**x**`",
+		"``a ` **x**``":                        "``a ` **x**``",
+		"```\n**x**\n```":                      "```\n**x**\n```",
+		"```yaml\npaths: [\"**/*.yaml\"]\n```": "```yaml\npaths: [\"**/*.yaml\"]\n```",
+		"```\nunclosed fence **x**":            "```\nunclosed fence **x**",
+		// A pair beside a code span is still rewritten; the span is not.
+		"**a** and `**b**` and **c**":                "*a* and `**b**` and *c*",
+		"**bold** then ```**code**``` then **bold**": "*bold* then ```**code**``` then *bold*",
+		// A pair that wraps a code span still converts (only its own stars
+		// change), a link whose label holds a code span still converts, and
+		// a link written inside a code span is code, not a link.
+		"**`kubectl get pods`**":    "*`kubectl get pods`*",
+		"see **`values.yaml`** for": "see *`values.yaml`* for",
+		// And still converts when the span it wraps holds a `**` of its
+		// own: the closer is sought outside code spans, so the span's
+		// stars are neither a closer nor altered. The same span with no
+		// pair around it, or with an opener that never closes, is as
+		// written.
+		"**`**kwargs`**":                            "*`**kwargs`*",
+		"use **`**kwargs`** for":                    "use *`**kwargs`* for",
+		"**see `a**b`**":                            "*see `a**b`*",
+		"pass `**kwargs` through":                   "pass `**kwargs` through",
+		"**`**kwargs` unclosed":                     "**`**kwargs` unclosed",
+		"[`kubectl`](https://x.example/p)":          "<https://x.example/p|`kubectl`>",
+		"run `[x](https://x.example/p)` as written": "run `[x](https://x.example/p)` as written",
+		// Escaping is not a markdown rule and still reaches code: a
+		// prompt-injected <!channel> in a code span must not ping the room.
+		"<!channel> in `**code**`": "&lt;!channel&gt; in `**code**`",
+		// One exponent is not a pair; two on a line are one to CommonMark
+		// as well, and the adapter reads the markdown rather than guessing
+		// at Python. Pinned so the residue is a decision, not a surprise.
+		"2**8":            "2**8",
+		"x = a**2 + b**2": "x = a*2 + b*2",
+		// Not pairs: an opener that closes on a later line, stars around
+		// spaces, a triple closed by a double and the reverse.
+		"**open here\nclosed** there": "**open here\nclosed** there",
+		"** x **":                     "** x **",
+		"***x**":                      "***x**",
+		"**x***":                      "**x***",
+		// Single-star and underscore emphasis are not this rewrite's: Slack
+		// reads *x* as bold and _x_ as italic, and both pass through as today.
+		"*x* and _y_": "*x* and _y_",
+		// A markdown link's destination is never altered: a pair whose stars
+		// sit inside it is left alone, while a pair that wraps the whole
+		// link still converts, since only its own stars change.
+		"[doc](https://x.example/**a**/b)": "<https://x.example/**a**/b|doc>",
+		"**[doc](https://x.example/p)**":   "*<https://x.example/p|doc>*",
+		// A `**` inside a code span does not open a pair, and one inside a
+		// link's destination does not close one: the pair is read from the
+		// stars outside both, as CommonMark reads it (`a**b**` is bold b).
+		"`**`a**b**":                           "`**`a*b*",
+		"**x [doc](https://x.example/**a) y**": "*x <https://x.example/**a|doc> y*",
+		// A bare URL is not a shape the adapter recognises (Slack auto-links
+		// it), so a closed pair inside one is rewritten exactly as before.
+		"see https://x.example/**a**/b": "see https://x.example/*a*/b",
+	}
+	for in, want := range cases {
+		if got := toMrkdwn(in); got != want {
+			t.Errorf("toMrkdwn(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestToMrkdwnRefusesURLShapedLabelsNamingAnotherHost: Slack renders a
+// link's label, so [https://good.example](https://evil.example) read as a
+// link to good.example that opened evil.example -- the pipe refusal
+// (TestToMrkdwnRefusesPipesInsideLinkURLs) closes only the split-at-pipe
+// route to the same display. A label that is itself URL-shaped and names a
+// host other than the destination's is refused: the markdown is left as
+// written, escaped, and no <...|...> is produced. The check is on the host,
+// case-insensitively and without the port, for every URL a label carries
+// anywhere in it, read as the label renders (emphasis and code marks and
+// invisible format characters removed); a label that is prose is prose.
+func TestToMrkdwnRefusesURLShapedLabelsNamingAnotherHost(t *testing.T) {
+	cases := map[string]string{
+		"[https://good.example](https://evil.example)":            "[https://good.example](https://evil.example)",
+		"[https://good.example/path](https://evil.example/login)": "[https://good.example/path](https://evil.example/login)",
+		"[http://good.example](https://evil.example)":             "[http://good.example](https://evil.example)",
+		// The same host is an honest label, whatever the case or path.
+		"[https://x.example/p](https://x.example/p)":     "<https://x.example/p|https://x.example/p>",
+		"[HTTPS://X.EXAMPLE/p](https://x.example/q?a=1)": "<https://x.example/q?a=1|HTTPS://X.EXAMPLE/p>",
+		// The URL is found anywhere in the label, so wrapping it in bold,
+		// italic, a space or escaped angle brackets does not get it past
+		// the check, and userinfo that reads as one host and parses as the
+		// other is refused outright.
+		"[**https://good.example**](https://evil.example)":          "[**https://good.example**](https://evil.example)",
+		"[_https://good.example_](https://evil.example)":            "[_https://good.example_](https://evil.example)",
+		"[ https://good.example](https://evil.example)":             "[ https://good.example](https://evil.example)",
+		"[<https://good.example>](https://evil.example)":            "[&lt;https://good.example&gt;](https://evil.example)",
+		"[https://good.example@evil.example](https://evil.example)": "[https://good.example@evil.example](https://evil.example)",
+		// A mark inside the URL renders away, so the label is read without
+		// it: after the scheme, splitting the scheme, or a zero-width space
+		// in it. A space after the scheme leaves a claim with no host.
+		"[https://**good.example**](https://evil.example)":   "[https://**good.example**](https://evil.example)",
+		"[https://*good.example*](https://evil.example)":     "[https://*good.example*](https://evil.example)",
+		"[https://_good.example_](https://evil.example)":     "[https://_good.example_](https://evil.example)",
+		"[https://`good.example`](https://evil.example)":     "[https://`good.example`](https://evil.example)",
+		"[**https**://good.example](https://evil.example)":   "[**https**://good.example](https://evil.example)",
+		"[https:**//**good.example](https://evil.example)":   "[https:**//**good.example](https://evil.example)",
+		"[`https`://good.example](https://evil.example)":     "[`https`://good.example](https://evil.example)",
+		"[https:/\u200b/good.example](https://evil.example)": "[https:/\u200b/good.example](https://evil.example)",
+		"[https:// good.example](https://evil.example)":      "[https:// good.example](https://evil.example)",
+		// Every URL in the label is checked, not the first.
+		"[https://evil.example or https://good.example](https://evil.example)": "[https://evil.example or https://good.example](https://evil.example)",
+		// The same host, bolded, on another port, or followed by sentence
+		// punctuation, is still an honest label.
+		"[**https://x.example**](https://x.example/p)":        "<https://x.example/p|*https://x.example*>",
+		"[https://good.example](https://good.example:8443/x)": "<https://good.example:8443/x|https://good.example>",
+		"[Read https://x.example.](https://x.example)":        "<https://x.example|Read https://x.example.>",
+		"[https://x.example, the docs](https://x.example/p)":  "<https://x.example/p|https://x.example, the docs>",
+		// A bare hostname is not URL-shaped; that label is prose to this
+		// check, the same as "the doc". So is a scheme Slack would not
+		// auto-link; the check reads a URL, not a lookalike.
+		"[good.example](https://evil.example)":        "<https://evil.example|good.example>",
+		"[https:/good.example](https://evil.example)": "<https://evil.example|https:/good.example>",
+		// A refused link beside an honest one: only the honest one converts.
+		"[ok](https://x.example/p) and [https://good.example](https://evil.example)": "<https://x.example/p|ok> and [https://good.example](https://evil.example)",
+	}
+	for in, want := range cases {
+		got := toMrkdwn(in)
+		if got != want {
+			t.Errorf("toMrkdwn(%q) = %q, want %q", in, got, want)
+		}
+		// Belt and braces, for the URL-shaped labels: no live link to the
+		// other host survives.
+		if strings.Contains(in, "https://good.example") && strings.Contains(got, "<https://evil.example") {
+			t.Errorf("toMrkdwn(%q) = %q produced a live link whose label names another host", in, got)
+		}
+	}
+}
+
+// TestToMrkdwnKeepsBalancedParenthesesInLinkURLs: the URL class used to end
+// at the first ")", so a Wikipedia-style destination with a parenthesised
+// segment converted to a link to a 404 with a stray ")" after it. CommonMark
+// admits balanced parentheses in a destination; one level is admitted here,
+// and the pipe refusal still holds inside the group.
+func TestToMrkdwnKeepsBalancedParenthesesInLinkURLs(t *testing.T) {
+	cases := map[string]string{
+		"[Foo](https://en.wikipedia.org/wiki/Foo_(bar))":                "<https://en.wikipedia.org/wiki/Foo_(bar)|Foo>",
+		"[Foo](https://en.wikipedia.org/wiki/Foo_(bar)) and (an aside)": "<https://en.wikipedia.org/wiki/Foo_(bar)|Foo> and (an aside)",
+		"[a](https://x.example/p) (b)":                                  "<https://x.example/p|a> (b)",
+		// Unbalanced: not a link, left as written.
+		"[a](https://x.example/(p)": "[a](https://x.example/(p)",
+		// A pipe inside the group is still refused.
+		"[a](https://x.example/p(q|https://good.example))": "[a](https://x.example/p(q|https://good.example))",
 	}
 	for in, want := range cases {
 		if got := toMrkdwn(in); got != want {

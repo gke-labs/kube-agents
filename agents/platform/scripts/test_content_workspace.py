@@ -1577,6 +1577,39 @@ class ReadVerbCeilingTest(unittest.TestCase):
             ),
         )
 
+    def test_a_listing_names_symlinked_files_once_across_pages(self):
+        """`read` refuses a symlink, so it is never an entry; a caller rebuilding
+        the tree from entries alone would hold less than a clone and not know."""
+        tree = self.workspace.tree
+        outside = self.base / "outside.yaml"
+        outside.write_text("kind: Secret\n")
+        (tree / "manifests" / "1a.yaml").symlink_to(outside)
+        (tree / "manifests" / "9.yaml").symlink_to(tree / "manifests" / "0.yaml")
+        (tree / "linked-dir").symlink_to(tree / "manifests", target_is_directory=True)
+        (tree / "rel-dir").symlink_to("manifests", target_is_directory=True)
+        (tree / "manifests" / "8.yaml").symlink_to(tree / "gone.yaml")
+        with mock.patch.object(content_workspace, "max_entries", lambda: 2):
+            pages, cursor = [], None
+            while True:
+                page = self.store.list(self.handle(), after=cursor)
+                pages.append(page)
+                if not page["truncated"]:
+                    break
+                cursor = page["entries"][-1]["path"]
+        self.assertEqual(
+            [[], ["manifests/1a.yaml"], ["manifests/9.yaml"]],
+            [page["symlinks"] for page in pages],
+        )
+        listed = [e["path"] for page in pages for e in page["entries"]]
+        self.assertNotIn("manifests/1a.yaml", listed)
+        # A dangling link is no file a clone could read, so it is not named;
+        # the walk does not enter a link to a directory, but names it once.
+        self.assertFalse(any(p.startswith("linked-dir") for p in listed))
+        self.assertEqual(
+            [{"path": "linked-dir", "target": ""}, {"path": "rel-dir", "target": "manifests"}],
+            [link for page in pages for link in page["symlinkedDirectories"]],
+        )
+
     def test_a_truncated_listing_says_so_and_pages_from_its_last_entry(self):
         with mock.patch.object(content_workspace, "max_entries", lambda: 2):
             first = self.store.list(self.handle())
@@ -1798,6 +1831,16 @@ class GrepTest(unittest.TestCase):
         )
         self.assertEqual(2, self.store.grep(handle, "kind: S.rvice", regex=True)["total"])
         self.assertEqual(2, self.store.grep(handle, "KIND: SERVICE", ignore_case=True)["total"])
+
+    def test_a_prefix_is_a_path_rather_than_a_pattern(self):
+        # Unquoted, `[prod]-crds.yaml` is a glob matching `p-crds.yaml` and
+        # not itself, so a search of that one file would answer "no match".
+        (self.tree / "[prod]-crds.yaml").write_text("kind: Service\n")
+        (self.tree / "p-crds.yaml").write_text("kind: Service\n")
+        real_git_runner(["git", "add", "-A"], self.tree)
+        real_git_runner(["git", "commit", "-m", "glob"], self.tree)
+        answer = self.store.grep(self.workspace.handle, "kind: Service", "[prod]-crds.yaml")
+        self.assertEqual(["[prod]-crds.yaml"], [m["path"] for m in answer["matches"]])
 
     def test_a_search_that_hit_the_ceiling_does_not_look_complete(self):
         handle = self.workspace.handle

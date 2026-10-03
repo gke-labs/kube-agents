@@ -30,13 +30,15 @@ the narrowest role) with `monitoring.googleapis.com` enabled there, and
 `resourcemanager.projects.get` on each monitored project. A 200 whose body is not the document the
 module reads (a JSON object of the documented shape; a list, a string or `null` decode too and are
 refused as well) is refused rather than read as an empty selector, since an empty selector on the
-next apply is every member's bindings revoked. A selector that resolves to more than 100 projects,
-less the members an `exclude_projects` entry names exactly, is refused too. The reconcile lists at
-most that many projects of the whole resolved set, the management project included, and reads the
+next apply is every member's bindings revoked. A selector that resolves to more than `member_cap` projects
+(the declared `spec.scope.maxProjects`, 100 by default), less the members an `exclude_projects`
+entry names exactly, is refused too; a Shared VPC host with more than 500 service projects, one page
+of the Compute API's answer, is refused whatever `member_cap` is, since the plan cannot follow a second
+page. The reconcile lists at most `member_cap` projects of the whole resolved set, the management project included, and reads the
 rest `over-cap` with nothing created under them, so a single selector past it cannot fit whatever
 else is declared, and refusing it at its read spares the naming reads, one per monitored project;
 the cap on the whole set, the management project, `scope.projects` and every selector's members
-together, is `kube-agents-iam`'s precondition while a selector is declared, since only that module sees all three. A monitored project the identity cannot name, or whose ID
+together, is `kube-agents-iam`'s precondition while a selector is declared or the cap is below its default, since only that module sees all three. A monitored project the identity cannot name, or whose ID
 the scope cannot carry (a legacy domain-scoped ID), is left out by naming its project number in `exclude_projects`, the scope's `exclude.projects`, which the reconcile matches against the number on every row a scope named, so the member leaves the set whether or not a run had named it; that is the only entry of that list this module acts on, and the only exclusion that keeps a monitored project out of the bindings: the reconcile
 has to name a monitored project, with the agent's own grant in it, before it can match an ID
 entry, so `kube-agents-iam` leaves the grant of a monitored project excluded by ID in place. A service project of a Shared VPC host with such an ID has no number to be excluded by, so it is left out of `members` on its own, listed in `uncarriable_members`, and warned about by a `check` block on every plan, while the host's other service projects are bound as usual; a monitored project the Monitoring API should ever name by such an ID rather than by number takes the same path. IDs and globs are the callers': `kube-agents-iam` withholds the grant of a Shared VPC service
@@ -56,9 +58,19 @@ told so rather than getting the host bound and its members not.
 ## Inputs and output
 
 `shared_vpc_hosts` and `metrics_scopes` are project IDs, with the CRD's pattern; `exclude_projects`
-is the scope's exclude list. `members` maps each selector's snapshot name (`sharedVpcHosts/<host>`,
+is the scope's exclude list; `member_cap` is the declared resolved-set cap (`spec.scope.maxProjects`,
+100 by default), past which a single selector is refused. `members` maps each selector's snapshot name (`sharedVpcHosts/<host>`,
 `metricsScopes/<scope>`) to the sorted project IDs it reaches, the shape `kube-agents-iam` takes and
 the one the reconcile's `fleet_scope.json` `containers` array can be read beside.
+
+[`lifecycle.sh`](../../examples/full-install/lifecycle.sh) in the full-install composition writes a
+gitignored `scope_resolver_lifecycle_override.tf` into this directory for the duration of each
+`terraform import`, pinning `data.http.scope_monitored_project` to no instances and the `members`
+output to an empty list per declared selector; its unit tests fail on a rename of either, and the
+composition's README says why the file exists. The script removes the file again, but one left by a
+`lifecycle.sh` killed outright would be merged silently into the next `terraform test` here, where
+every assertion on resolved members fails against the pin rather than the module. `make
+terraform-test` refuses to run a suite beside such a file and names it; remove the file first.
 
 ## Tests
 

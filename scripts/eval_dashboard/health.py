@@ -93,6 +93,10 @@ SHARED_BREAK = "shared_break"
 STORM = "storm"
 SETUP_DEATHS = "setup_deaths"
 LOST_PODS = "lost_pods"
+# runs[].eval_outcome, as the collector writes it from the suite's own
+# eval-verdict.json (SCHEMA.md): the run could not be evaluated. Carried on
+# Run for gate_comment.py; no rule here reads it.
+EVAL_OUTCOME_NOT_EVALUATED = "not_evaluated"
 FIXTURE_DRIFT = "fixture_drift"
 # Rule 3e (#1967): the hourly pool-state scan found a pool project no longer
 # shaped the way the verifier requires -- a role missing or extra, an API
@@ -553,6 +557,9 @@ TRIM_REASON_CHARS = 96
 # them; absent stays absent: how the build ended, and the eval's own verdict,
 # which is what tells a deadline kill from a long red.
 ENDED_FIELDS = ("has_build_log", "pod_phase", "pod_node", "pod_last_event", "merge_conflict", "eval_verdict")
+# The suite's own verdict (SCHEMA.md, `eval_outcome`): kept by --trim so a
+# fixture cut from a data.json holding a not-evaluated run replays as one.
+SUITE_FIELDS = ("eval_outcome", "not_evaluated")
 
 UTC = timezone.utc
 
@@ -644,7 +651,7 @@ class Task:
 
 
 class Run:
-    __slots__ = ("build_id", "duration", "eval_verdict", "eval_verdict_recorded", "finished", "has_build_log", "merge_conflict", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
+    __slots__ = ("build_id", "duration", "eval_verdict", "eval_verdict_recorded", "finished", "has_build_log", "merge_conflict", "not_evaluated", "not_evaluated_cases", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
 
     def __init__(self, run: dict):
         self.build_id = str(run.get("build_id") or "")
@@ -672,6 +679,15 @@ class Run:
         # without the key is unknown, not "no verdict": it never makes a kill.
         self.eval_verdict = run.get("eval_verdict") if isinstance(run.get("eval_verdict"), str) else None
         self.eval_verdict_recorded = "eval_verdict" in run
+        # True when the suite's own verdict said the run could not be
+        # evaluated (SCHEMA.md, `eval_outcome`), with the case ids it named.
+        # Absent reads as a run the suite graded, as every record did before
+        # the field existed. Keyed on Prow's FAILURE like the other shapes
+        # below: the suite prints its line minutes before the job ends, so a
+        # build Prow aborted in that tail carries the field and is an abort.
+        self.not_evaluated = self.result == RUN_FAILURE and run.get("eval_outcome") == EVAL_OUTCOME_NOT_EVALUATED
+        named = run.get("not_evaluated")
+        self.not_evaluated_cases = [str(c) for c in named if isinstance(c, str)] if isinstance(named, list) else []
 
     @property
     def full(self) -> bool:
@@ -1222,8 +1238,12 @@ def pr_caused_reds(full_runs, roster: Roster) -> int:
     for run in full_runs:
         # A killed run that recorded cases (#1875) stays in the population --
         # its collapse still makes another PR's red shared -- but is never the
-        # PR's own: the kill is the gate's, whatever those cases did.
-        if run.result != RUN_FAILURE or run.deadline_kill:
+        # PR's own: the kill is the gate's, whatever those cases did. So does a
+        # run the suite could not evaluate (SCHEMA.md, `eval_outcome`): the
+        # suite certified nothing, its roster may not have counted the case
+        # the dashboard's admits, and the run page and the Reds tile already
+        # count it among the gate's.
+        if run.result != RUN_FAILURE or run.deadline_kill or run.not_evaluated:
             continue
         mine = run.collapsed_cases() & roster.at(run.started or run.finished)
         if mine and all(prs_by_case[case] == {run.pr} for case in mine):
@@ -2429,7 +2449,7 @@ def trim(data: dict, start: datetime, end: datetime, source: str) -> dict:
             # Kept as written so a fixture cut from a two-tier data.json
             # replays the same filter the live tick applies.
             entry[tiers.TIER_KEY] = run[tiers.TIER_KEY]
-        for key in ENDED_FIELDS:
+        for key in ENDED_FIELDS + SUITE_FIELDS:
             if key in run:
                 entry[key] = run[key]
         runs.append(entry)

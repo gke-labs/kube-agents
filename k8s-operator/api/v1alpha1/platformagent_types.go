@@ -136,6 +136,23 @@ type ScopeSpec struct {
 	// +optional
 	MetricsScopes []string `json:"metricsScopes,omitempty"`
 
+	// MaxProjects caps the resolved set the reconcile lists on each run, the
+	// management project included: explicit projects, selector members and
+	// container members fill it in a fixed order, and a project past it reads
+	// over-cap (profiles kept, nothing created). The reconcile sizes its listing
+	// workers and budget from it, and the bootstrap gate its ceiling, so an estate
+	// of a few hundred projects declares the number it has rather than reading half
+	// of itself over-cap. The MaxItems=100 cap on each declared list is unchanged: a
+	// hand-written list past a hundred entries is the shape folders exist for. The
+	// install's Terraform refuses a plan whose explicit projects and selector
+	// members exceed it (while a selector is declared or the cap is below its
+	// default), and renders the same value here from its scope input.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=5000
+	// +kubebuilder:default=100
+	// +optional
+	MaxProjects *int32 `json:"maxProjects,omitempty"`
+
 	// Exclude subtracts projects and clusters after every selector has
 	// contributed.
 	// +optional

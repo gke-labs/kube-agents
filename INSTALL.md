@@ -81,7 +81,7 @@ on freshly created clusters (no Terraform field exists) and the GitHub App priva
 one place; see
 [Shared defaults live in `installer_common.sh`](scripts/installer/README.md#shared-defaults-live-in-installer_commonsh).
 
-Three behaviours worth knowing before the first run:
+Four behaviours worth knowing before the first run:
 
 - **The image/source ref defaults to the release version (in release checkouts and bundles) or the checkout's `HEAD` commit SHA (on `main`)**, and must be a SemVer release tag or a full 40-character commit SHA. Provisioning refuses to start from a dirty or mismatched checkout so the scripts and the container image stay on one revision; pass `--allow-unverified-source` to override that while iterating on the installer itself. Do not install from a `main` checkout when targeting an official release: manifests and CRD schemas on `main` diverge from older releases, and `verify_local_source_ref` blocks mismatched revisions to prevent broken installations.
 - **The agent's GCP IAM permission set defaults to `read-only`**, matching the provisioner. It
@@ -94,6 +94,19 @@ Three behaviours worth knowing before the first run:
   on — so the sandbox costs nothing there. On a Standard cluster it provisions a `gvisor-pool`
   node pool of one `e2-standard-4` per zone. Pass `--enable-gvisor=false` to run on the standard
   container runtime.
+- **Out-of-band change detection is on**, because a cluster reconciled from a GitOps repository is
+  one where a change made outside that repository is worth reporting, and nothing else here
+  reports it. It costs three GCP resources — a Log Router sink, a Pub/Sub topic and a pull
+  subscription — and it reaches past the clusters this install manages: the sink exports the
+  admin-activity audit records of every GKE cluster in the project, including clusters this
+  install does not manage, and the subscription retains a copy of them for 31 days. Opt out with
+  `ENABLE_DRIFT_DETECTOR=false` in `install.env`. A first run records the
+  `--enable-drift-detector=false` flag for you, because it is the run that writes that file; over
+  an `install.env` that already exists the flag applies to one run and is recorded nowhere, which
+  is why the line is the opt-out worth knowing. A second install in the same project
+  names its own three (`TF_VAR_drift_pubsub_topic`, `_subscription`, `_sink`) or `lifecycle.sh`
+  refuses its apply; see
+  [the composition's README](terraform/examples/full-install/README.md).
 
 ### Generate-Only Mode (Recommended for Existing Infrastructure)
 

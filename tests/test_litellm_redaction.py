@@ -490,5 +490,58 @@ class TestChartRender(unittest.TestCase):
                 self.assertIn(needle, proc.stderr)
 
 
+class TestCompositionWiring(unittest.TestCase):
+    """terraform/examples/full-install's litellm_redaction, read as text (the
+    terraform binary is not a suite dependency). Its validations fail the plan
+    on what the chart would fail the helm_release apply on, so each accepted
+    set is pinned to the chart's own."""
+
+    _COMPOSITION = _REPO_ROOT / "terraform" / "examples" / "full-install"
+
+    def setUp(self) -> None:
+        variables = (self._COMPOSITION / "variables.tf").read_text()
+        start = variables.index('variable "litellm_redaction" {')
+        self.variable = variables[start : variables.index("\n}\n", start)]
+        self.main_tf = (self._COMPOSITION / "main.tf").read_text()
+        self.chart = (_CHART / "templates" / "litellm.yaml").read_text()
+
+    def test_the_variable_accepts_what_the_chart_accepts(self) -> None:
+        for chart_literal, variable_literal in (
+            ('(list "mask" "pseudonym" "off")', 'contains(["mask", "pseudonym", "off"], var.litellm_redaction.ip_action)'),
+            ('(list "mask" "pseudonym")', 'contains(["mask", "pseudonym"], r.action == null ? "mask" : r.action)'),
+            ("`^[A-Za-z0-9][A-Za-z0-9_.\\-]*$`", 'regex("^[A-Za-z0-9][A-Za-z0-9_.-]*$", r.name)'),
+        ):
+            with self.subTest(chart_literal=chart_literal):
+                self.assertIn(chart_literal, self.chart)
+                self.assertIn(variable_literal, self.variable)
+
+    def test_every_validation_applies_only_while_enabled(self) -> None:
+        # The chart reads none of these while redaction is off, so a leftover
+        # value must not stop a plan, an upgrade or a destroy.
+        conditions = [line for line in self.variable.splitlines() if line.strip().startswith("condition")]
+        self.assertEqual(len(conditions), 5)
+        for line in conditions:
+            with self.subTest(line=line):
+                self.assertIn("condition     = !var.litellm_redaction.enabled || ", line)
+
+    def test_redaction_reaches_the_chart_only_while_enabled_without_null_rule_keys(self) -> None:
+        # Off, the litellm values must not change, or every existing install's
+        # gateway rolls on upgrade; a null rule key fails the chart's checks.
+        self.assertIn("var.litellm_redaction.enabled ? {\n        redaction = {", self.main_tf)
+        # The chart value names, which the chart reads with defaults: a
+        # misspelt key would drop the setting without an error.
+        for line in (
+            "enabled = true",
+            "action     = var.litellm_redaction.ip_action",
+            "allowCidrs = var.litellm_redaction.allow_cidrs",
+        ):
+            self.assertIn(line, self.main_tf)
+        self.assertIn('(dict "ip" (dict "action" $ipAction "allowCidrs" ($ip.allowCidrs', self.chart)
+        self.assertIn(
+            "rules = [for r in var.litellm_redaction.rules : { for k, v in r : k => v if v != null }]",
+            self.main_tf,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

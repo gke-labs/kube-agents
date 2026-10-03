@@ -711,6 +711,16 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # See the module docstring in
 # deploy/docker/patches/apply_google_chat_attachment_notice.py.
 #
+# Slack agent view, behind KAGE_SLACK_UX (off by default; off leaves both files
+# behaving as upstream). With it on, --agent-view describes the app by its
+# --name, and the adapter answers a new thread or DM open with three suggested
+# prompts when platforms.slack.extra.suggested_prompts is unset. The default
+# stays assistant view: agent view is one-way in Slack. Runs after the
+# reactions-scope patch below because both edit slack_cli.py; the verifier
+# drives the real manifest command and prompt reader with the flag off and on.
+# Rides this COPY and RUN too.
+# See the module docstring in deploy/docker/patches/apply_slack_agent_view.py.
+#
 # Slack: ask for the reactions scope the adapter already spends. `hermes slack
 # manifest` is the only description of the Slack app an installer ever writes --
 # the operator pastes that JSON in and clicks Save -- and its bot_scopes list
@@ -788,6 +798,8 @@ COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      agents/platform/scripts/slack_presenter.py \
      agents/platform/scripts/slack_status.py \
      deploy/docker/patches/patchlib.py \
+     deploy/docker/patches/apply_slack_agent_view.py \
+     deploy/docker/patches/verify_slack_agent_view.py \
      /tmp/message-surface/
 RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis.py /opt/hermes && \
     grep -q "_CODE_SENTINEL_RE" /opt/hermes/plugins/platforms/slack/block_kit.py && \
@@ -808,6 +820,10 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_boilerplate.py /opt/hermes && \
     grep -qF "_kage_slack_boilerplate.cron_delivery_text" /opt/hermes/cron/scheduler_delivery.py && \
     cd /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_agent_view.py /opt/hermes && \
+    grep -qF "def _kage_slack_ux_on(" /opt/hermes/hermes_cli/slack_cli.py && \
+    grep -qF "_KAGE_SUGGESTED_PROMPTS = " /opt/hermes/plugins/platforms/slack/adapter.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_agent_view.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_code_emphasis.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_google_chat_attachment_notice.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_reactions_scope.py && \
@@ -1889,8 +1905,9 @@ COPY agents/platform/plugins/ agents/chat/plugins/ /tmp/repo-plugins/
 #     AGENTS.md, CAPABILITIES.md, governance/, cron/ and config.yaml sit beside
 #     skills/ and are force-synced into the platform profile on every boot by
 #     entrypoint step 2.6, and the cluster template's personas are re-copied into
-#     every cluster-* profile by its continuation. A rewritten SOUL.md is more
-#     load-bearing than any single SKILL.md.
+#     every cluster-* profile by its continuation, which also back-fills every
+#     key its config.yaml adds. A rewritten SOUL.md is more load-bearing than any
+#     single SKILL.md.
 #   - /opt/hermes/plugins (barriered by the stage's first RUN; listed for
 #     what it covers). It is the only path Hermes resolves plugins from, holding
 #     Python imported into the agent's own process — a strictly stronger capability
@@ -2086,6 +2103,14 @@ RUN set -eu; \
 # than its own because the chain is at the layer ceiling. It fails the build when
 # the copy stops working, and only warns when Hermes resolves ssh without the copy,
 # because the copy still agrees then and a failure would block the Hermes bump.
+#
+# It also asks that Hermes for the context-file cap each profile's shipped
+# config.yaml gives it, on the unknown-window path (no context_length), and fails
+# the build if that profile's SOUL.md is longer. Hermes keeps only the head and
+# tail of a file over the cap, so a persona that outgrows it, or a renamed or
+# ignored context_file_max_chars, would otherwise drop the middle of the prompt
+# with nothing but a log line. Each check runs in a scratch HERMES_HOME holding a
+# copy of the template's config.yaml, so Hermes writes nothing into the template.
 RUN set -eu; \
     if [ -e /opt/credential-proxy ]; then \
       echo "credential-proxy shims are back in the agent image: /opt/credential-proxy exists" >&2; \
@@ -2097,7 +2122,21 @@ RUN set -eu; \
         exit 1; \
       fi; \
     done; \
-    /opt/hermes/.venv/bin/python3 /opt/defaults/scripts/terminal_env_pin.py --build-check
+    /opt/hermes/.venv/bin/python3 /opt/defaults/scripts/terminal_env_pin.py --build-check; \
+    for profile in /opt/chat-template:/opt/defaults /opt/platform-template:/opt/platform-template /opt/cluster-template:/opt/cluster-template; do \
+      config_dir="${profile%%:*}"; soul="${profile#*:}/SOUL.md"; \
+      scratch="$(mktemp -d)"; \
+      cp "${config_dir}/config.yaml" "${scratch}/config.yaml"; \
+      HERMES_HOME="${scratch}" /opt/hermes/.venv/bin/python3 -c "\
+import pathlib, sys; \
+from agent.prompt_builder import _get_context_file_max_chars; \
+soul, config = sys.argv[1], sys.argv[2]; \
+size = len(pathlib.Path(soul).read_text(encoding='utf-8').strip()); \
+cap = _get_context_file_max_chars(); \
+assert size <= cap, '%s is %d chars, over the %d-char context-file cap Hermes takes from %s, so the prompt would carry it truncated' % (soul, size, cap, config)" \
+        "${soul}" "${config_dir}/config.yaml"; \
+      rm -rf "${scratch}"; \
+    done
 
 USER 10000:10000
 

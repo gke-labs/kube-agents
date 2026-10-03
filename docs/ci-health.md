@@ -51,7 +51,8 @@ every other page unaffected; a tick that cannot download that last read at all
 store was not read for that tick, and the next tick recovers. The read reaches two weeks past the page's 90-day
 window so the first drawn night's admission window is as whole as the gate's.
 The same tick comments on each pull request whose run went red, whose
-build node went away, or whose run Prow killed at the deadline (`gate_comment.py`), files the tracking issue a new
+build node went away, whose run Prow killed at the deadline, or whose run
+the suite could not evaluate (`gate_comment.py`), files the tracking issue a new
 OUTAGE lacks or the one a build-cluster node loss, a seeded-fixture drift or a
 pool-project drift owes its owner (`gate_issue.py`), and appends `health.json`
 to a history feed. A second job in the same workflow, on its own hourly cron,
@@ -433,10 +434,11 @@ link the runbook section (`docs/ci-pool-projects.md`, 5.5 and 6.2).
 Each tick, `scripts/eval_dashboard/gate_comment.py` finds the
 `pull-kube-agents-smoke-test` runs in `data.json` that finished since its last
 tick and concluded `FAILURE` with at least one graded repetition — not aborted
-runs, not setup deaths, not a suite that lost every repetition to a storm — and
+runs, not setup deaths, not a suite that lost every repetition to a storm, and
+not a run the suite itself marked not evaluated (`runs[].eval_outcome`) — and
 leaves one comment on each pull request (the newest red run per pull request
-when there are several). Two shapes outside that filter also get one, below:
-a lost pod and a deadline kill.
+when there are several). Three shapes outside that filter also get one, below:
+a not-evaluated run, a lost pod and a deadline kill.
 
 - a heading, `❌ Smoke gate: failed · 3 of 14 cases`, or `· hard failure` when
   the run failed with no gate case failing all of its repetitions (an absolute
@@ -480,16 +482,36 @@ delegation-ceiling condition above: DEGRADED under its own name, its own
 message and advice, so a fleet-wide worker stall (#1879) is named here rather
 than read only as "not evaluated" on every pull request.
 
-A run the suite marked **not evaluated** because one admitted case lost every
-repetition to infrastructure while other cases were graded is, to this filter,
-a `FAILURE` with graded repetitions and no gate case failing all of its
-repetitions, so it draws the comment with the hard-failure heading. The comment
-does not read the suite's `outcome`; the banner at the top of that run's
-`eval-verdict.md` is what says the run is not a finding against the change.
+Three other shapes get a comment, each one line with the same marker and
+dedupe. A run the suite marked **not evaluated** — an admitted case, or every
+case, lost every repetition to infrastructure, so `hack/ci-eval-pr.sh` exited
+2 and Prow recorded a `FAILURE`; a build Prow aborted after the suite's line
+carries the field and gets no comment, like any abort — is not a red to the tick: the collector
+recorded the suite's `outcome` on the run (`runs[].eval_outcome`,
+`SCHEMA.md`), so the comment names the cases the suite listed in
+`runs[].not_evaluated` and says nothing about the change is implied:
 
-Two shapes the red comment does not cover get one of their own. The first is a lost pod (the
-build node went away under the job, #1478). It is one line, same marker and
-dedupe:
+```text
+### ⚪ Smoke gate: run not evaluated
+
+> `security-overgrant-probe` lost every repetition to infrastructure before
+> the agent could be graded. The suite could certify nothing, so Prow reports
+> the run red; nothing was graded for it and nothing about your change is
+> implied. Retest once the environment is healthy. [Details →](run.html#build=<build id>)
+
+Ran 27 min on evals-11 · build log
+```
+
+When every recorded case was lost the box says so instead of naming them.
+While `health.json`'s condition is `storm` it adds "a quota storm is declared
+on the gate right now" and links the brief. A gate case that failed every
+graded repetition on the same run (the dashboard's roster can be newer than
+the branch's) is named in a second sentence, with its transcript to read
+before retesting; the heading stays ⚪, because the suite is the verdict's
+owner.
+
+The second is a lost pod (the build node went away under the job, #1478), a
+zero-task run:
 
 ```text
 ### ⚪ Smoke gate: run lost
@@ -507,7 +529,7 @@ runs on M PRs that lost their build node") and the incident brief link. Prow's
 build-log page shows the pod's events. Setup deaths and conflicted merges stay
 silent; the build log says which it was.
 
-The second is a run Prow killed at the job deadline with no verdict (#1894),
+The third is a run Prow killed at the job deadline with no verdict (#1894),
 whether or not some cases finished first: the same one-line shape under `⚪
 Smoke gate: run killed at the deadline`, saying when it was killed and that no
 verdict was reached. While `health.json`'s condition is `deadline_kill` the box
@@ -683,7 +705,9 @@ the fleet owner, labelled `presubmit-gate`: `Seeded fleet drift:
 crashloop-workload out of designed state on 3 pool projects since Mon 9:00 AM
 ET`, with the roles, per project the assertion and what was observed, the
 window, the evidence, and the reconcile — re-apply `bench/tf/fleet` in each
-project named (`bench/tf/fleet/README.md`, "State and reconcile") — and the
+project named (`bench/tf/fleet/README.md`, "State and reconcile"; for `stalled-controller`
+drift where an in-cluster heal started the container, hand-delete the pod in `seeded-stall`
+and replace the Deployment if the condition persists) — and the
 line "Filed automatically by the smoke health bot; the fleet owner should
 re-apply the stack in the projects named; the bot will not close it." An open
 `presubmit-gate` issue that already names every drifted role is adopted
@@ -712,11 +736,14 @@ first shows up as a 403 in an agent transcript on whichever pull request leased
 the project (#1927: a role missing on all 30 projects for two weeks). The
 `fixture-state-scan` job runs the verifier on a clock instead. After the fleet
 scan, every hour, `scripts/eval_dashboard/pool_state.py` runs
-`verify_ci_pool_project.py --checks project_and_apis,iam,artifact_registry,gke_and_state,token_minter_kms --report`
+`verify_ci_pool_project.py --checks project_and_apis,iam,artifact_registry,gke_and_state,gitops_default_branch,token_minter_kms --report`
 against every pool project, seven at a time, and publishes
 `gs://kube-agents-dashboards/evals/pool-state.json` beside `fixture-state.json`.
 The verifier is the one implementation; the scan runs it and reads its report.
-Left out: the fleet fixtures (the fleet scan reads those), the warm-cache reader grants in the Prow project (`warm_cache`), the GitHub-reading checks
+`gitops_default_branch` is the one GitHub read: the project's private `*-infra` repository must default to `main` (a default left on an agent branch makes every rca write a no-op; the finding is `gitops/default-branch`, the repair the `gh api -X PATCH` that moves it back, run by an owner of gke-agentic because the field needs repository admin), read with the credential the job's `GITOPS_METADATA_READ_TOKEN` secret puts in `GH_TOKEN` and "not checked" with that reason while the secret is unset.
+
+The secret is a fine-grained personal access token: resource owner `gke-agentic`, repository access the pool's `*-infra` repositories picked one by one (a fine-grained token has no wildcard, so a new pool project's repository is added to the token's list before the project is registered, as `docs/ci-pool-projects.md` 5.4 does for the ledger App's installation), permission Repository -> Metadata: read-only and nothing else, expiry one year at most. Whoever creates it records their name and the expiry date here: held by _(unset)_, expires _(unset)_. Its expiry is silent by design: the check goes "not checked" on every project and the hourly digest reads "35 checks not read in full", with no alert and no issue, so the owner puts the renewal on a calendar. The durable form is the one 5.4 chose for the ledger read, a third App holding Metadata: read-only on the selected repositories, its PEM as the repository secret and `actions/create-github-app-token` in the step exporting `GH_TOKEN`; the verifier reads only `GH_TOKEN`, so that swap is a workflow-step and docs change.
+Left out: the fleet fixtures (the fleet scan reads those), the warm-cache reader grants in the Prow project (`warm_cache`), the other GitHub-reading checks
 (`github_repo_and_app`, `gitops_declaration`, `ledger_read_credential`; each needs a credential the bot must not hold), the minter check's signing half (`token_minter`; the scan runs `token_minter_kms`), the mapping (about the checkout).
 
 **The document.** `pool-state.json` has the fleet scan's shape. Per project,
@@ -765,7 +792,11 @@ document: the same finding on the same project in two consecutive scans, or on
 a scan that could read the incident's checks on its projects no longer shows the
 findings, and a scan that is missing, stale, blind or could not read one of them
 holds it with a note. A scan older than 3 hours is ignored; one that could check
-no project is `pool_state.unknown`, said once by the poster and never a drift. An
+no project is `pool_state.unknown`, said once by the poster and never a drift. A
+project counts as checked when one of its GCP reads happened; the default-branch
+read alone does not count, since it runs with the job's own GitHub credential
+whatever gcloud answered, so a pool whose publisher roles are gone still scans as
+`pool_state.unknown` once the secret exists. An
 extra role is drift like a missing one.
 
 **What it posts.** One Chat message naming the findings and how many projects,

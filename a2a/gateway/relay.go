@@ -226,7 +226,11 @@ func (g *Gateway) applyArtifact(rec *SessionRecord, rs *relayState, taskID strin
 // whose word the terminal is, read off the subject it arrived on.
 func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *relayState, taskID string, s lib.StatusUpdate, source TerminalSource) {
 	result := joinTextParts(rs.result)
-	if result == "" && s.Status.State == lib.StateCompleted {
+	// The console never posts the deliverable (see the StateCompleted arm), so
+	// replaying the stream to recover it would buy nothing. Checking here and
+	// not there is the difference between skipping the replay and paying for
+	// one whose result is then dropped.
+	if result == "" && s.Status.State == lib.StateCompleted && !isConsoleConversation(rec.Key) {
 		// Render state is cache; if a restart lost it, the stream still has
 		// everything. Replay against the addressee the task's own subjects
 		// carried - after a Delegate re-home, rec.Addressee is not it.
@@ -244,7 +248,17 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if result == "" {
 			result = "(completed with a non-text result; see the stream)"
 		}
-		g.post(rec.Key, result)
+		// The console renders answers straight off TASKS, so posting the
+		// deliverable here too would show it twice and put a burst of
+		// answer-sized frames on a subject documented to carry only notices
+		// (console.go and spec-chatops-gateway.md, "The console adapter").
+		// The other terminal arms below are notices, not answers, and go to
+		// every backend. Chat backends have no TASKS view, so for them this
+		// post IS the answer. The replay above is skipped for the same
+		// backends, so reaching here with an empty result costs nothing.
+		if !isConsoleConversation(rec.Key) {
+			g.post(rec.Key, result)
+		}
 	case lib.StateFailed:
 		reason := ""
 		if s.Status.Message != nil {
@@ -258,7 +272,22 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	case lib.StateCanceled:
 		g.post(rec.Key, "🛑 canceled")
 	case lib.StateRejected:
-		g.post(rec.Key, "🚫 the executor rejected the task")
+		// Same shape as failed above, and for the same reason. Both
+		// executors put the cause in the terminal message -- a capability
+		// refusal names the rule the verifier returned, and an unreachable
+		// verifier says so -- and a bare "rejected" sends the user looking
+		// at their own prompt for a fault that is in the install. Before
+		// the capability check only an empty submission reached rejected,
+		// where there was nothing useful to add; now an outage does.
+		reason := ""
+		if s.Status.Message != nil {
+			reason = joinTextParts(s.Status.Message.Parts)
+		}
+		if reason != "" {
+			g.post(rec.Key, "🚫 the executor rejected the task: "+reason)
+		} else {
+			g.post(rec.Key, "🚫 the executor rejected the task")
+		}
 	}
 
 	if active := rec.ActiveTask; active != nil && active.TaskID == taskID {
@@ -390,7 +419,9 @@ func terminalLine(state lib.TaskState, progress string) string {
 	}[state]
 	line := fmt.Sprintf("%s **%s**", icon, state)
 	// No tail on completed: the result is posted as its own message right
-	// before this edit, and the worker adapter's progress deviation (no
+	// before this edit on every backend that posts one at all (the console
+	// does not - it reads answers off TASKS), and the worker adapter's
+	// progress deviation (no
 	// explicit progress tool — assistant text becomes `progress`, the final
 	// text becomes `result`) makes the last narration routinely BE the
 	// result on a single-turn task, so keeping it rendered the answer

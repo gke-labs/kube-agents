@@ -26,6 +26,57 @@ from tests.testing.common import create_minimal_tools_bin, get_isolated_test_env
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _LIFECYCLE_SH = _REPO_ROOT / "terraform" / "examples" / "full-install" / "lifecycle.sh"
+_FULL_INSTALL = _LIFECYCLE_SH.parent
+
+# The two files lifecycle.sh writes around a `terraform import` and removes
+# afterwards: the helm provider placeholder beside the composition, and the
+# scope resolver pin inside that module's own directory.
+_PROVIDER_OVERRIDE = "providers_lifecycle_override.tf"
+_SCOPE_OVERRIDE = "scope_resolver_lifecycle_override.tf"
+_SCOPE_RESOLVER_SOURCE_RE = re.compile(r'module "scope_resolver" \{\s*source\s*=\s*"([^"]+)"')
+_OVERRIDE_DATA_RE = re.compile(r'^data "(\w+)" "(\w+)"', re.MULTILINE)
+_OVERRIDE_OUTPUT_RE = re.compile(r'^output "(\w+)"', re.MULTILINE)
+# The members pin is keyed on the module's own variables (var.<name>) under
+# the selector names the module's output uses (<prefix>/${...}).
+_OVERRIDE_VAR_RE = re.compile(r"\bvar\.(\w+)")
+_OVERRIDE_KEY_RE = re.compile(r'"(\w+)/\$\{')
+# The README's hand-run import recipe writes the scope override itself: the
+# path it writes to, and the heredoc body up to the terminator.
+_README_SCOPE_OVERRIDE_RE = re.compile(
+    r"^\s*cat > (\S+" + re.escape(_SCOPE_OVERRIDE) + r") <<'EOF'\n(.*?)^\s*EOF$",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+def _scope_resolver_source():
+    """The path main.tf sources the scope resolver module from, relative to the composition."""
+    match = _SCOPE_RESOLVER_SOURCE_RE.search((_FULL_INSTALL / "main.tf").read_text())
+    assert match, "main.tf no longer sources a scope_resolver module"
+    return match.group(1)
+
+
+def _override_body(text):
+    """An override's lines less comments and blank lines, each stripped."""
+    return [line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+
+
+def _scratch_composition(root):
+    """A copy of lifecycle.sh in a tree shaped like the checkout's.
+
+    What the script resolves relative to its own directory is there: the
+    install defaults and the endpoint helper three levels up, and the scope
+    resolver module's directory where main.tf sources it, so an import
+    override lands in the scratch tree and never in the checkout's module.
+    """
+    comp = root / "terraform" / "examples" / "full-install"
+    comp.mkdir(parents=True)
+    shutil.copy(_LIFECYCLE_SH, comp / "lifecycle.sh")
+    shutil.copy(_REPO_ROOT / "install.defaults.env", root / "install.defaults.env")
+    helpers = root / "scripts" / "installer"
+    helpers.mkdir(parents=True)
+    shutil.copy(_REPO_ROOT / "scripts" / "installer" / "gke_dns_endpoint.sh", helpers)
+    (comp / _scope_resolver_source()).resolve().mkdir(parents=True)
+    return comp
 
 
 class LifecycleScriptGuardTest(unittest.TestCase):
@@ -825,14 +876,15 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 1)
         self.assertIn("has no ENABLED version.", proc.stderr)
 
-    # adopt_kms's drift-pubsub block. create_cluster is false in both so the
-    # cluster CMEK half adds no targets, and the minter and stockout flags stay
-    # off, so what adopt_kms imports is exactly what the drift flag adds.
-    # gcloud exits 0, so every describe reports its resource present.
+    # The drift trio. adopt_kms must never import it, and guard_drift_adoption
+    # refuses the apply that would. create_cluster is false throughout so the
+    # cluster CMEK half adds no adoption targets, and the minter and stockout
+    # flags stay off, so what either function does with the trio is all that is
+    # left. gcloud exits 0 for "every describe finds its resource", 1 for none.
 
-    def test_adopt_kms_imports_the_drift_pubsub_trio_when_the_flag_is_on(self):
-        """The composition's default names under the module's addresses, so a
-        re-install after a partial teardown adopts rather than 409s."""
+    def test_adopt_kms_never_imports_the_drift_pubsub_trio(self):
+        """Adoption is by name and cannot tell a leftover from the trio another
+        live install owns, so this one is refused rather than adopted."""
         proc = self._run_guard(
             "adopt_kms",
             state_list="",
@@ -841,37 +893,77 @@ resource "google_service_account" "agent" {
             gcloud_stub="exit 0",
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("adopting pre-existing resource: projects/test-project/topics/platform-agent-drift-audit", proc.stdout)
-        self.assertIn("adopting pre-existing resource: projects/test-project/subscriptions/platform-agent-drift-audit-sub", proc.stdout)
-        self.assertIn("adopting pre-existing resource: projects/test-project/sinks/platform-agent-drift-audit-sink", proc.stdout)
-        self.assertIn("resource adoption complete: 3 imported", proc.stdout)
-        self.assertEqual(proc.stderr, "")
+        self.assertNotIn("drift-audit", proc.stdout)
+        self.assertNotIn("drift_pubsub", proc.stdout)
+        self.assertIn("resource adoption complete: 0 imported", proc.stdout)
 
-    def test_adopt_kms_adopts_the_drift_pubsub_trio_under_the_names_this_state_would_create(self):
-        """A second install in the project names its own trio through the
-        drift_pubsub_* variables; adopt_kms reads those, never the module's
-        defaults, so the names it imports are the ones this state owns and
-        the first install's default-named trio is left alone."""
+    def test_guard_drift_adoption_refuses_a_trio_this_state_does_not_manage(self):
+        """A second install in the project reaches the apply with all three
+        already there; importing them takes over whichever install owns them."""
         proc = self._run_guard(
-            "adopt_kms",
+            "guard_drift_adoption",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_drift_pubsub="true",
+            gcloud_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Pub/Sub topic 'platform-agent-drift-audit' already exists", proc.stderr)
+        self.assertIn("Pub/Sub subscription 'platform-agent-drift-audit-sub' already exists", proc.stderr)
+        self.assertIn("Log Router sink 'platform-agent-drift-audit-sink' already exists", proc.stderr)
+
+    def test_guard_drift_adoption_names_every_way_out(self):
+        """Rename, import, delete, or go without -- and which one applies
+        depends on the thing the guard cannot see: whose trio this is. So it
+        prints all four, with the commands for the three that have any.
+
+        The count is the assertion. A refusal that names three of them reads
+        as complete to the operator it stops, who then takes the closest fit
+        rather than the right one -- deleting a trio they could have imported
+        is the expensive direction."""
+        proc = self._run_guard(
+            "guard_drift_adoption",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_drift_pubsub="true",
+            gcloud_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn('TF_VAR_drift_pubsub_topic="<a-different-name>"', proc.stderr)
+        self.assertIn('TF_VAR_drift_pubsub_subscription="<a-different-name>"', proc.stderr)
+        self.assertIn('TF_VAR_drift_pubsub_sink="<a-different-name>"', proc.stderr)
+        self.assertIn("gcloud pubsub topics delete platform-agent-drift-audit --project test-project", proc.stderr)
+        self.assertIn("gcloud pubsub subscriptions delete platform-agent-drift-audit-sub --project test-project", proc.stderr)
+        self.assertIn("gcloud logging sinks delete platform-agent-drift-audit-sink --project test-project", proc.stderr)
+        self.assertIn(
+            "terraform import 'module.drift_pubsub[0].google_pubsub_topic.drift_audit' "
+            "projects/test-project/topics/platform-agent-drift-audit",
+            proc.stderr,
+        )
+        self.assertIn("ENABLE_DRIFT_DETECTOR=false", proc.stderr)
+
+    def test_guard_drift_adoption_checks_the_names_this_state_would_create(self):
+        """A second install that already named its own trio must pass: the
+        guard reads the drift_pubsub_* variables, never the module defaults,
+        so the first install's default-named trio is not what it looks for."""
+        proc = self._run_guard(
+            "guard_drift_adoption",
             state_list="",
             tfvar_create_cluster='"false"',
             tfvar_enable_drift_pubsub="true",
             tfvar_drift_topic='"second-drift-audit"',
             tfvar_drift_sub='"second-drift-audit-sub"',
             tfvar_drift_sink='"second-drift-audit-sink"',
-            gcloud_stub="exit 0",
+            gcloud_stub='if [[ "$*" == *"second-drift-audit"* ]]; then exit 1; fi; exit 0',
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("adopting pre-existing resource: projects/test-project/topics/second-drift-audit", proc.stdout)
-        self.assertIn("adopting pre-existing resource: projects/test-project/subscriptions/second-drift-audit-sub", proc.stdout)
-        self.assertIn("adopting pre-existing resource: projects/test-project/sinks/second-drift-audit-sink", proc.stdout)
-        self.assertNotIn("platform-agent-drift-audit", proc.stdout)
-        self.assertIn("resource adoption complete: 3 imported", proc.stdout)
+        self.assertEqual(proc.stderr, "")
 
-    def test_adopt_kms_skips_the_drift_pubsub_trio_already_in_state(self):
+    def test_guard_drift_adoption_passes_on_a_trio_already_in_state(self):
+        """The steady-state apply, and the one shape that proves this install
+        owns the three."""
         proc = self._run_guard(
-            "adopt_kms",
+            "guard_drift_adoption",
             state_list="module.drift_pubsub[0].google_pubsub_topic.drift_audit\n"
                        "module.drift_pubsub[0].google_pubsub_subscription.drift_audit\n"
                        "module.drift_pubsub[0].google_logging_project_sink.drift_audit",
@@ -880,23 +972,102 @@ resource "google_service_account" "agent" {
             gcloud_stub="exit 0",
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertNotIn("adopting", proc.stdout)
-        self.assertIn("resource adoption complete: 0 imported", proc.stdout)
+        self.assertEqual(proc.stderr, "")
 
-    def test_adopt_kms_never_names_the_drift_pubsub_trio_when_the_flag_is_off(self):
-        """Off is the default; an install that never set the flag must not
-        import a topic, subscription or sink that happens to share the name."""
+    def test_guard_drift_adoption_passes_on_a_first_install(self):
+        """Nothing of the three exists, which is every install into a project
+        that has none -- the common case, and it must stay silent."""
         proc = self._run_guard(
-            "adopt_kms",
+            "guard_drift_adoption",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_drift_pubsub="true",
+            gcloud_stub="exit 1",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_drift_adoption_refuses_on_one_of_the_three(self):
+        """A teardown that reached two of them leaves one, and creating that
+        one still 409s -- so a partial match is refused like a full one."""
+        proc = self._run_guard(
+            "guard_drift_adoption",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_drift_pubsub="true",
+            gcloud_stub='if [[ "$*" == *"logging sinks"* ]]; then exit 0; fi; exit 1',
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Log Router sink 'platform-agent-drift-audit-sink' already exists", proc.stderr)
+        self.assertNotIn("Pub/Sub topic", proc.stderr)
+
+    def test_guard_drift_adoption_is_a_no_op_when_the_flag_is_off(self):
+        """An install with the detector off creates none of the three, so a
+        name collision with something else in the project is not its business."""
+        proc = self._run_guard(
+            "guard_drift_adoption",
             state_list="",
             tfvar_create_cluster='"false"',
             tfvar_enable_drift_pubsub="false",
             gcloud_stub="exit 0",
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertNotIn("drift-audit", proc.stdout)
-        self.assertNotIn("drift_pubsub", proc.stdout)
-        self.assertIn("resource adoption complete: 0 imported", proc.stdout)
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_drift_adoption_prints_an_import_per_foreign_resource(self):
+        """The other way to reach this refusal is a single install whose state
+        went missing, where deleting the trio is the lossy answer and importing
+        it is the right one. Only the resources actually found get a line: an
+        import for something that is not there fails, and a reader who copies
+        all three cannot tell which."""
+        proc = self._run_guard(
+            "guard_drift_adoption",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_drift_pubsub="true",
+            gcloud_stub='if [[ "$*" == *"logging sinks"* ]]; then exit 0; fi; exit 1',
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(
+            "terraform import 'module.drift_pubsub[0].google_logging_project_sink.drift_audit' "
+            "projects/test-project/sinks/platform-agent-drift-audit-sink",
+            proc.stderr,
+        )
+        self.assertNotIn("google_pubsub_topic.drift_audit'", proc.stderr)
+        self.assertNotIn("google_pubsub_subscription.drift_audit'", proc.stderr)
+
+    def test_guard_drift_adoption_import_ids_match_each_resource_type(self):
+        """projects/<project>/<collection>/<name>, and the collection differs
+        per resource. A single wrong one is a command that errors at the end of
+        a refusal, where nobody will read it as the guard's fault."""
+        proc = self._run_guard(
+            "guard_drift_adoption",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_drift_pubsub="true",
+            gcloud_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("projects/test-project/topics/platform-agent-drift-audit", proc.stderr)
+        self.assertIn("projects/test-project/subscriptions/platform-agent-drift-audit-sub", proc.stderr)
+        self.assertIn("projects/test-project/sinks/platform-agent-drift-audit-sink", proc.stderr)
+
+    def test_guard_drift_adoption_refuses_when_the_console_cannot_answer(self):
+        """A terraform console that cannot evaluate enable_drift_pubsub must
+        stop the run, not read as "not enabled" and wave the apply through.
+        tfvar's own `exit 1` only kills a command substitution's subshell,
+        which is why the guard assigns the value before comparing it."""
+        proc = self._run_guard(
+            "guard_drift_adoption",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_drift_pubsub="true",
+            gcloud_stub="exit 0",
+            console_fail_var="enable_drift_pubsub",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("could not evaluate var.enable_drift_pubsub", proc.stderr)
+
 
 
 class DeleteAgentCrEndpointTest(unittest.TestCase):
@@ -1456,13 +1627,7 @@ class LifecycleSubcommandFilterTest(unittest.TestCase):
         Returns the composition directory, the environment, and the file
         every stub call is logged to.
         """
-        comp = root / "terraform" / "examples" / "full-install"
-        comp.mkdir(parents=True)
-        shutil.copy(_LIFECYCLE_SH, comp / "lifecycle.sh")
-        shutil.copy(_REPO_ROOT / "install.defaults.env", root / "install.defaults.env")
-        helpers = root / "scripts" / "installer"
-        helpers.mkdir(parents=True)
-        shutil.copy(_REPO_ROOT / "scripts" / "installer" / "gke_dns_endpoint.sh", helpers)
+        comp = _scratch_composition(root)
         bin_dir = create_minimal_tools_bin(root)
         fixture = root / "terraform-output.txt"
         fixture.write_text(output)
@@ -1532,6 +1697,36 @@ class LifecycleSubcommandFilterTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self._assert_hidden(proc.stdout, "~")
         self.assertIn("-auto-approve", self._terraform_call(calls, "apply"))
+
+    def test_plan_apply_and_destroy_remove_a_stale_import_override_first(self):
+        """A lifecycle.sh killed mid-import leaves both override files behind.
+
+        Merged into a plan or apply, the scope one resolves every declared
+        selector to no members and plans the removal of their bindings, so the
+        script removes the pair before any subcommand reads the configuration.
+        """
+        for args in (["plan"], ["apply", "-auto-approve"], ["destroy", "-auto-approve"]):
+            with self.subTest(args=args), tempfile.TemporaryDirectory() as tmp:
+                comp, env, calls = self._sandbox(pathlib.Path(tmp), _UPDATE_PLAN, 0)
+                stale = [
+                    comp / _PROVIDER_OVERRIDE,
+                    comp / _scope_resolver_source() / _SCOPE_OVERRIDE,
+                ]
+                for path in stale:
+                    path.write_text("# left behind by an interrupted import\n")
+                proc = subprocess.run(
+                    [shutil.which("bash"), str(comp / "lifecycle.sh"), *args],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    cwd=str(comp),
+                    timeout=60,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn(f"terraform {args[0]}", calls.read_text())
+                for path in stale:
+                    self.assertFalse(path.exists(), f"{path.name} survived {args[0]}")
 
     def _run_with_a_terminal(self, args, stdin_is_terminal=True, answer=None, extra_env=None):
         """Run lifecycle.sh with stdout and stderr on a terminal.
@@ -1650,6 +1845,224 @@ class LifecycleSubcommandFilterTest(unittest.TestCase):
         self.assertIn("`plan`, `apply` and `destroy` hide helm_release's `metadata` block", proc.stdout)
         self.assertEqual(lines[-1], "default kube-agents/<cluster_name>>. Unset, state stays local as before.")
         self.assertNotIn("set -euo pipefail", proc.stdout)
+
+
+class ImportOverrideTest(unittest.TestCase):
+    """What adopt_kms and adopt_pubsub write around each `terraform import`.
+
+    `terraform import` evaluates the whole configuration with every resource
+    not yet in state unknown, and two things in it refuse that walk: the helm
+    provider built from the cluster's endpoint, and the scope resolver module's
+    monitored-project lookup, whose for_each is keyed on a read the walk never
+    makes. lifecycle.sh writes an override for each, the second into the
+    module's own directory, for the duration of the import, and removes both
+    afterwards whether the import succeeded or not. Every run here uses a
+    scratch copy of the tree, so the module override is written beside a
+    scratch module directory and never into the checkout's.
+    """
+
+    # What a failed import prints, shaped like Terraform's: the lines a
+    # successful import prints too, then the error box.
+    _IMPORT_PREAMBLE = [
+        'module.m.google_kms_key_ring.k[0]: Importing from ID "projects/p/locations/l/keyRings/r"...',
+        "module.m.google_kms_key_ring.k[0]: Import prepared!",
+        "  Prepared google_kms_key_ring for import",
+        "module.m.google_kms_key_ring.k[0]: Refreshing state... [id=projects/p/locations/l/keyRings/r]",
+    ]
+    _IMPORT_ERROR = "Error: Invalid for_each argument (stub)"
+    _IMPORT_ERROR_DETAIL = "on ../../modules/kube-agents-scope-resolver/main.tf line 249 (stub)"
+    _IMPORT_FAILURE = [*_IMPORT_PREAMBLE, "|", f"| {_IMPORT_ERROR}", "|", f"|   {_IMPORT_ERROR_DETAIL}", "|"]
+
+    def _run(self, func_call, import_rc=0, enable_stockout="true", enable_chat="false", import_output=None):
+        """Run one adoption function against stubs that record each import.
+
+        Returns the process, one line per `terraform import` with its
+        arguments and whether each override file existed at that moment, the
+        scope override's text as the last import saw it, and the two paths the
+        files were at. A failing import prints `import_output` (the realistic
+        transcript above by default) to stderr before exiting `import_rc`.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            comp = _scratch_composition(root)
+            bin_dir = create_minimal_tools_bin(root)
+            bash = shutil.which("bash")
+            imports = root / "imports"
+            captured = root / "captured-scope-override.tf"
+            failure = root / "import-failure.txt"
+            failure.write_text("".join(f"{line}\n" for line in (import_output or self._IMPORT_FAILURE)))
+            provider_override = comp / _PROVIDER_OVERRIDE
+            scope_override = (comp / _scope_resolver_source() / _SCOPE_OVERRIDE).resolve()
+            # An empty state; a console that enables the stockout trio (three
+            # adopt_kms imports) or Chat (an adopt_pubsub import) and leaves
+            # every other flag at null; an import that records what it saw
+            # and exits as told. The stockout trio rather than the drift one
+            # because adopt_kms no longer adopts drift: the three resources
+            # take one fixed name per project and the detector is now on by
+            # default, so guard_drift_adoption refuses a second install in a
+            # project where adoption would once have silently taken them.
+            (bin_dir / "terraform").write_text(
+                f"#!{bash}\n"
+                'case "$1" in\n'
+                "  state) exit 0 ;;\n"
+                "  console) read -r expr\n"
+                '    case "${expr#var.}" in\n'
+                "      project_id) echo '\"test-project\"' ;;\n"
+                "      location) echo '\"us-central1\"' ;;\n"
+                "      create_cluster) echo '\"false\"' ;;\n"
+                f"      enable_stockout_investigator) echo '{enable_stockout}' ;;\n"
+                "      stockout_pubsub_topic) echo '\"gke-stockout-alerts-topic\"' ;;\n"
+                "      stockout_pubsub_subscription) echo '\"gke-stockout-alerts-sub\"' ;;\n"
+                "      stockout_pubsub_sink) echo '\"gke-stockout-alerts-sink\"' ;;\n"
+                f"      enable_google_chat) echo '{enable_chat}' ;;\n"
+                "      chat_topic_name) echo '\"platform-agent-chat-events\"' ;;\n"
+                "      chat_subscription_name) echo '\"platform-agent-chat-events-sub\"' ;;\n"
+                "      *) echo null ;;\n"
+                "    esac ;;\n"
+                "  import)\n"
+                f'    provider=no; [ -f "{provider_override}" ] && provider=yes\n'
+                f'    scope=no; [ -f "{scope_override}" ] && scope=yes\n'
+                f'    echo "import ${{*:2}} provider=$provider scope=$scope" >> "{imports}"\n'
+                f'    [ -f "{scope_override}" ] && cp "{scope_override}" "{captured}"\n'
+                f'    [ {import_rc} -eq 0 ] || cat "{failure}" >&2\n'
+                f"    exit {import_rc} ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            # Every describe succeeds: each candidate exists and is adopted.
+            (bin_dir / "gcloud").write_text(f"#!{bash}\nexit 0\n")
+            for stub in ("terraform", "gcloud"):
+                (bin_dir / stub).chmod(0o755)
+            proc = subprocess.run(
+                [bash, "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source ./lifecycle.sh\n{func_call}\n'],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                env={"PATH": str(bin_dir), "HOME": str(root)},
+                cwd=str(comp),
+                timeout=60,
+            )
+            seen = imports.read_text().splitlines() if imports.exists() else []
+            text = captured.read_text() if captured.exists() else ""
+            left = [path.name for path in (provider_override, scope_override) if path.exists()]
+            return proc, seen, text, left
+
+    def test_both_overrides_exist_for_every_import_and_neither_survives_it(self):
+        for func_call, expected_imports, summary in (
+            ("adopt_kms", 3, "resource adoption complete: 3 imported"),
+            ("adopt_pubsub", 1, "Pub/Sub adoption complete: 1 imported"),
+        ):
+            with self.subTest(func_call=func_call):
+                proc, seen, _, left = self._run(
+                    func_call, enable_stockout="true", enable_chat="true",
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(len(seen), expected_imports, seen)
+                for line in seen:
+                    self.assertIn("provider=yes scope=yes", line)
+                    # Terraform colours its output even into a pipe; the
+                    # error a failed import prints must not carry escapes.
+                    self.assertIn(" -no-color ", line)
+                    self.assertIn(" -input=false ", line)
+                self.assertEqual(left, [])
+                self.assertIn(summary, proc.stdout)
+                self.assertEqual(proc.stderr, "")
+
+    def test_a_failed_import_prints_terraforms_error_and_still_removes_both_overrides(self):
+        """The warning alone cannot say why; before this, the error went to /dev/null
+        and the first sign of trouble was the apply's 409. What is printed is
+        the transcript from its first Error line on, indented under the
+        warning: the import-prepared and refreshing lines above it are what a
+        successful import prints too."""
+        for func_call in ("adopt_kms", "adopt_pubsub"):
+            with self.subTest(func_call=func_call):
+                proc, seen, _, left = self._run(
+                    func_call, import_rc=1, enable_stockout="true", enable_chat="true",
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertGreater(len(seen), 0)
+                for line in seen:
+                    self.assertIn("provider=yes scope=yes", line)
+                self.assertEqual(left, [])
+                # The address, not a prefix of it: adopt_kms's stockout trio
+                # sits at the root and adopt_pubsub's subscription inside a
+                # module, so only "could not import " is common to both.
+                self.assertIn("could not import ", proc.stderr)
+                self.assertIn("the apply will fail with a 409", proc.stderr)
+                self.assertIn("terraform import said:", proc.stderr)
+                self.assertIn(f"     | {self._IMPORT_ERROR}\n", proc.stderr)
+                self.assertIn(self._IMPORT_ERROR_DETAIL, proc.stderr)
+                self.assertLess(proc.stderr.index("could not import"), proc.stderr.index(self._IMPORT_ERROR))
+                for line in self._IMPORT_PREAMBLE:
+                    self.assertNotIn(line.strip(), proc.stderr)
+                self.assertNotIn("imported", proc.stdout.replace("0 imported", ""))
+
+    def test_a_failed_import_with_no_error_line_is_printed_whole(self):
+        """Trimming to the first Error line must not hide an output that has none."""
+        odd = ["something the stub cannot explain", "and a second line of it"]
+        proc, seen, _, left = self._run("adopt_kms", import_rc=1, import_output=odd)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertGreater(len(seen), 0)
+        self.assertEqual(left, [])
+        self.assertIn("terraform import said:", proc.stderr)
+        for line in odd:
+            self.assertIn(f"     {line}\n", proc.stderr)
+
+    def test_the_scope_override_pins_blocks_the_module_defines(self):
+        """An override of a block the module does not define fails every import
+        with "Missing data resource to override", so a rename in the module
+        has to reach here; this is where it fails first."""
+        _, seen, text, _ = self._run("adopt_kms")
+        self.assertGreater(len(seen), 0)
+        module = (_FULL_INSTALL / _scope_resolver_source()).resolve()
+        # The checkout's module, less any import override an interrupted
+        # lifecycle.sh left in it: that file defines the very blocks this test
+        # looks for, and would make a rename in the module pass here.
+        module_text = "".join(
+            path.read_text() for path in sorted(module.glob("*.tf")) if not path.name.endswith("_override.tf")
+        )
+        data_blocks = _OVERRIDE_DATA_RE.findall(text)
+        outputs = _OVERRIDE_OUTPUT_RE.findall(text)
+        self.assertEqual(len(data_blocks), 1, text)
+        self.assertEqual(len(outputs), 1, text)
+        for provider, name in data_blocks:
+            self.assertIn(f'data "{provider}" "{name}"', module_text)
+            self.assertRegex(text, rf'data "{provider}" "{name}" \{{\s*for_each\s*=\s*toset\(\[\]\)')
+        for name in outputs:
+            self.assertIn(f'output "{name}"', module_text)
+            self.assertRegex(text, rf'output "{name}" \{{\s*value\s*=\s*merge\(')
+        # The pin keys an empty member list under each declared selector's
+        # name, so the IAM module's per-selector precondition holds during
+        # the import: every variable it reads is one the module declares, and
+        # every key prefix is one the module's own output builds.
+        variables = _OVERRIDE_VAR_RE.findall(text)
+        self.assertEqual(sorted(variables), ["metrics_scopes", "shared_vpc_hosts"], text)
+        for name in variables:
+            self.assertIn(f'variable "{name}"', module_text)
+        prefixes = _OVERRIDE_KEY_RE.findall(text)
+        self.assertEqual(sorted(prefixes), ["metricsScopes", "sharedVpcHosts"], text)
+        for prefix in prefixes:
+            self.assertIn(f'"{prefix}/${{', module_text)
+        self.assertEqual(text.count("=> []"), len(prefixes), text)
+
+    def test_the_readme_recipe_writes_the_scope_override_the_script_writes(self):
+        """The README's BackupPlan import recipe carries its own copy of the
+        override, because lifecycle.sh exposes no import subcommand to borrow.
+        A rename that reaches the script's heredoc has to reach the recipe too,
+        or the next operator who follows it gets "Missing data resource to
+        override" from a document that was correct when written."""
+        _, seen, text, _ = self._run("adopt_kms")
+        self.assertGreater(len(seen), 0)
+        readme = (_FULL_INSTALL / "README.md").read_text()
+        recipes = _README_SCOPE_OVERRIDE_RE.findall(readme)
+        self.assertEqual(len(recipes), 1, "the README writes the scope override once, in the BackupPlan recipe")
+        path, body = recipes[0]
+        self.assertEqual(
+            pathlib.PurePosixPath(path),
+            pathlib.PurePosixPath(_scope_resolver_source()) / _SCOPE_OVERRIDE,
+        )
+        # Line for line, less the script's comment header: the recipe omits it.
+        self.assertEqual(_override_body(body), _override_body(text))
 
 
 if __name__ == "__main__":

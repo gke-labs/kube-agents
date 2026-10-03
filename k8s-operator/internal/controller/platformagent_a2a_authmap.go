@@ -247,9 +247,13 @@ func encodeA2AJSON(v any, indent string) ([]byte, error) {
 //     credential reborn. This is the rule most likely to be tripped by an
 //     ordinary-looking edit to sessionIdentity, and the reason this function
 //     exists.
-//   - An entry with no grants and no narrowing produces a client that connects
-//     and then hangs on its first reply, which is the hardest failure in this
-//     system to read from the outside.
+//   - A non-narrowed entry MUST carry grants on BOTH sides. An empty allow
+//     list is nats-server's spelling of "unrestricted", not of "nothing", and
+//     the two sides are decided separately, so an entry that lost just its
+//     publish list is a principal that may publish to every subject on the bus
+//     while its subscribes stay correctly narrow. That is the hardest failure
+//     in this system to read from the outside, because the connection behaves
+//     normally in every other respect.
 //   - The account becomes the audience of the user JWT the callout signs, so
 //     it decides which account a connection lands in. Only APP is mintable;
 //     SYS above all is not.
@@ -276,8 +280,17 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity) error {
 		hasGrants := len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0
 		switch id.Narrowing {
 		case "":
-			if !hasGrants {
-				return fmt.Errorf("identity %d: user %q has no grants and does not narrow, so it would connect and then hang on its first reply", i, id.User)
+			// Per side, because nats-server is per side. An empty allow
+			// list is its spelling of "unrestricted", not of "nothing",
+			// so a render that dropped one side would hand this
+			// principal the whole subject space on that side while the
+			// other stayed correctly narrow. The callout refuses this
+			// (ParseIdentityMap, and again at the mint); refusing it
+			// here too is what keeps the two ends from disagreeing,
+			// which is the whole point of this function.
+			if len(id.Grants.Publish) == 0 || len(id.Grants.Subscribe) == 0 {
+				return fmt.Errorf("identity %d: user %q has %d publish and %d subscribe grants and does not narrow; an empty side is minted as unrestricted on that side, not as closed",
+					i, id.User, len(id.Grants.Publish), len(id.Grants.Subscribe))
 			}
 		case a2aNarrowingPod:
 			if hasGrants {

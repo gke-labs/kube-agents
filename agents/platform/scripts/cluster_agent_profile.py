@@ -27,7 +27,14 @@ from pathlib import Path
 
 import sandbox_exec
 from gke_endpoint import dns_endpoint_args
-from profile_scaffold import HERMES_BIN, backfill_cron_file, ensure_profile, overlay_template
+from profile_scaffold import (
+    HERMES_BIN,
+    backfill_cron_file,
+    ensure_profile,
+    is_scaffolded,
+    overlay_template,
+    profiles_base,
+)
 
 TEMPLATE_DIR = Path(os.environ.get("CLUSTER_TEMPLATE_DIR", "/opt/cluster-template"))
 SHARED_PLUGINS_DIR = Path(os.environ.get("SHARED_PLUGINS_DIR", "/opt/defaults/plugins"))
@@ -50,7 +57,7 @@ SANDBOX_MIRROR_TIMEOUT_SECONDS = 120
 ENV_HERMES_OTEL_ENABLED = "HERMES_OTEL_ENABLED"
 ENV_OTEL_SDK_DISABLED = "OTEL_SDK_DISABLED"
 # Hermes stores each profile at $HERMES_HOME/profiles/<name> (persists on the data PVC).
-PROFILES_BASE = HERMES_HOME / "profiles"
+PROFILES_BASE = profiles_base(HERMES_HOME)
 
 # Files/dirs from the template to overlay onto the created profile home.
 OVERLAY_ITEMS = ("SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skills")
@@ -131,9 +138,9 @@ def _inject_cluster_identity(home: Path, project: str, cluster: str, location: s
 
 
 def read_cluster_identity(home: Path) -> dict[str, str] | None:
-    """Read the ``cluster_identity`` block written into a profile's ``config.yaml``.
+    """Read the ``cluster_identity`` block stamped in ``config.yaml``.
 
-    Returns the ``{project, cluster, location}`` dict, or ``None`` if the config is
+    Returns ``{"project": ..., "cluster": ..., "location": ...}``, or None if
     missing/unparseable or the block is absent/incomplete. Raises if the config
     cannot be read (permissions, encoding) or parses to something other than a
     mapping. This is the robust, machine-readable inverse of
@@ -456,7 +463,7 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     # It stays informational even so: the pin the runtime honours is KUBECONFIG
     # in the profile's .env (step 3b), not this line. Repointing an agent means
     # re-running this scaffold, not editing USER.md.
-    (home / "USER.md").write_text(
+    (home / USER_MD_NAME).write_text(
         "# Cluster Agent Context\n\n"
         "This Cluster Agent is permanently scoped to the following GKE cluster:\n\n"
         f"- project: {project}\n"
@@ -514,14 +521,38 @@ def list_profiles() -> list[str]:
     )
 
 
+def is_ready_profile(home: Path) -> bool:
+    """A profile the dispatcher can hand a card to and its worker can serve.
+
+    is_scaffolded, not is_dir: a plugin mount point can leave a directory under
+    profiles/ that Hermes never registered, and a card assigned to it never runs.
+    The scaffold artifacts too: create_profile registers the profile and stamps its
+    identity before it fetches the credential and writes USER.md, so a scaffold that
+    stopped in between is registered, and its worker blocks at preflight.
+    """
+    return is_scaffolded(home) and (home / USER_MD_NAME).is_file()
+
+
+def list_ready_profiles() -> list[str]:
+    """Return sorted names of active, fully scaffolded Cluster Agent profiles."""
+    if not PROFILES_BASE.is_dir():
+        return []
+    return sorted(
+        p.name
+        for p in PROFILES_BASE.iterdir()
+        if p.is_dir() and p.name not in RESERVED_PROFILES and is_ready_profile(p)
+    )
+
+
 def cmd_delete(args: argparse.Namespace) -> None:
     name = profile_name(args.project, args.cluster, args.location)
     delete_profile(name)
     print(name)
 
 
-def cmd_list(_args: argparse.Namespace) -> None:
-    for name in list_profiles():
+def cmd_list(args: argparse.Namespace) -> None:
+    profiles = list_profiles() if getattr(args, "all", False) else list_ready_profiles()
+    for name in profiles:
         print(name)
 
 
@@ -536,7 +567,7 @@ def cmd_name(args: argparse.Namespace) -> None:
     print(profile_name(args.project, args.cluster, args.location))
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Manage per-cluster Cluster Agent Hermes profiles.")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -551,8 +582,17 @@ def main() -> None:
         sp.add_argument("--cluster", required=True)
         sp.add_argument("--location", required=True)
 
-    sub.add_parser("list", help="List existing cluster profiles")
+    list_parser = sub.add_parser("list", help="List active, fully scaffolded cluster profiles")
+    list_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Include incomplete/unscaffolded profiles (default: False, lists only ready profiles)",
+    )
+    return parser
 
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
     handlers = {"create": cmd_create, "delete": cmd_delete, "list": cmd_list, "name": cmd_name}
     handlers[args.command](args)

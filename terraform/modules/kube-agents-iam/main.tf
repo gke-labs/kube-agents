@@ -40,14 +40,14 @@ resource "google_service_account" "agent" {
     # The whole resolved set, as far as a plan can count it (scope.tf,
     # scope_listed_projects): the reconcile lists at most the cap and reads
     # the rest over-cap, so the members past it would be bound for nothing.
-    # The resolver's own bound is per selector; this is the sum. Held only
-    # while a selector is declared: without one the count is the CRD's own
-    # list cap plus the management project, a declaration the plan admitted
-    # before the selectors existed, and a plan that declares no selector
-    # changes nothing about it.
+    # The resolver's own bound is per selector; this is the sum. Held while a
+    # selector is declared or the cap is declared below its default: without
+    # either the count is the CRD's own list cap plus the management project,
+    # a declaration the plan admitted before the selectors and the declared
+    # cap existed, and such a plan changes nothing about it.
     precondition {
-      condition     = length(local.scope_selector_names) == 0 || length(local.scope_listed_projects) <= local.scope_resolved_set_cap
-      error_message = "The management project, scope.projects and the projects scope.shared_vpc_hosts and scope.metrics_scopes resolve to come to ${length(local.scope_listed_projects)} once each, past the reconcile's resolved-set cap of ${local.scope_resolved_set_cap} (RESOLVED_SET_CAP in cluster_agent_reconcile.py): the reconcile lists the first ${local.scope_resolved_set_cap} of them, in that order, and reads the rest over-cap with nothing created under them, so their read roles would be reach the agent never uses. Declare fewer projects, a narrower selector, or a folder that holds them (a container's members are listed after these and bound on the container, not one by one). An exclude.projects entry lowers this count only when it names a project exactly: by ID for an entry in scope.projects or any selector member, and by number for a monitored project the selector alone reaches, which the resolver leaves out before naming it. A project both in scope.projects and monitored by a declared Metrics Scope that is excluded by its number alone is dropped by the reconcile but counted here, because the plan does not name a number the exclusion keeps it from reading; drop it from scope.projects, which the exclusion makes redundant. A glob is applied by the reconcile alone."
+      condition     = (length(local.scope_selector_names) == 0 && var.scope.max_projects == local.scope_default_cap) || length(local.scope_listed_projects) <= local.scope_resolved_set_cap
+      error_message = "The management project, scope.projects and the projects scope.shared_vpc_hosts and scope.metrics_scopes resolve to come to ${length(local.scope_listed_projects)} once each, past the resolved-set cap of ${local.scope_resolved_set_cap} (scope.max_projects, spec.scope.maxProjects on the CR): the reconcile lists the first ${local.scope_resolved_set_cap} of them, in that order, and reads the rest over-cap with nothing created under them, so their read roles would be reach the agent never uses. Raise scope.max_projects, declare fewer projects, a narrower selector, or a folder that holds them (a container's members are listed after these and bound on the container, not one by one). An exclude.projects entry lowers this count only when it names a project exactly: by ID for an entry in scope.projects or any selector member, and by number for a monitored project the selector alone reaches, which the resolver leaves out before naming it. A project both in scope.projects and monitored by a declared Metrics Scope that is excluded by its number alone is dropped by the reconcile but counted here, because the plan does not name a number the exclusion keeps it from reading; drop it from scope.projects, which the exclusion makes redundant. A glob is applied by the reconcile alone."
     }
   }
 }

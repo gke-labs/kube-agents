@@ -168,10 +168,11 @@ lint-python: ## Run ruff's error rules over every Python file (the set tests/tes
 # glob, so they had never once run in CI. defaults/hooks is here for the same
 # reason -- the plugins glob does not reach it, so the chat_message_audit hook
 # was untestable-by-CI however many tests it grew. Discovery is then run once
-# per directory rather than once over the tree, because most of them are not
-# packages (incident_context is the exception, and per-directory discovery
-# still collects it) -- `unittest discover` pointed at agents/platform/skills finds
-# nothing and still exits 0, which reads as a passing suite. That also keeps
+# per file, rooted at the file's own directory, rather than once over the
+# tree, because most of those directories are not packages (incident_context
+# is the exception, and discovery rooted there still collects it) --
+# `unittest discover` pointed at agents/platform/skills finds nothing and still
+# exits 0, which reads as a passing suite. Rooting at the directory also keeps
 # deploy/docker, deploy/docker/patches and each deploy/docker/plugins/<name>
 # separate, which they must be: those tests import their subject by bare module
 # name, which only resolves with their own directory as the discovery root.
@@ -185,7 +186,7 @@ lint-python: ## Run ruff's error rules over every Python file (the set tests/tes
 # rather than beside it. The one thing that costs: the injector seam shells out
 # to `go test`, so every job that expands this list needs a Go toolchain on
 # PATH or those tests skip themselves and the sweep reports green without them.
-PYTHON_TEST_DIRS := $(sort $(dir \
+PYTHON_TEST_FILES := $(sort \
 	$(wildcard admin_console/tests/test_*.py) \
 	$(wildcard agents/*/skills/*/scripts/test_*.py) \
 	$(wildcard agents/*/scripts/test_*.py) \
@@ -201,7 +202,33 @@ PYTHON_TEST_DIRS := $(sort $(dir \
 	$(wildcard scripts/test_*.py) \
 	$(wildcard tests/integration/test_*.py) \
 	$(wildcard tests/test_*.py) \
-	$(wildcard tests/memory/test_*.py)))
+	$(wildcard tests/memory/test_*.py))
+
+# The directories those files span. The rest of the repository -- AGENTS.md
+# "Where Tests Go", docs/testing-map.md, scripts/test_test_discovery.py --
+# calls the wildcards above the PYTHON_TEST_DIRS globs, and that is still what
+# they are: a directory is in this list because one of them reached a file in
+# it, so a test directory no glob reaches is still missing from here, which is
+# what the discovery test reads.
+PYTHON_TEST_DIRS := $(sort $(dir $(PYTHON_TEST_FILES)))
+
+# Derived, so it is not an input. While the sweep ran per directory, a
+# command-line `PYTHON_TEST_DIRS=tests/` narrowed it to that directory. The
+# sweep now reads PYTHON_TEST_FILES and nothing else, so the same override
+# would still be accepted -- a command-line value beats the assignment above,
+# and the discovery test's wrapper would print it as the whole list -- while
+# both targets ran the full tree: the caller asks for one directory and
+# silently pays for every file. Refused instead, naming the variable that does
+# narrow a run. `file` is the origin the assignment above gives it; a command
+# line, an `override`, or `make -e` reads as anything else. The example says
+# `echo`, not `ls`: pasted into the next make, `ls` with two or more matches
+# and a pipe for stdout prints one path per line, the variable arrives holding
+# newlines, and make ends a recipe command at each one -- the first line of
+# test-python became an unterminated `if [ -z "tests/test_a.py` and the target
+# stopped on a shell syntax error that named neither variable.
+ifneq ($(origin PYTHON_TEST_DIRS),file)
+$(error PYTHON_TEST_DIRS is derived from PYTHON_TEST_FILES and the sweep does not read it; narrow a run with PYTHON_TEST_FILES instead, for example PYTHON_TEST_FILES="$$(echo tests/test_*.py)")
+endif
 
 # What both callers of the sweep below -- test-python and coverage -- export as
 # PYTHONPATH, prepended to whatever the caller already has. Declared once
@@ -209,7 +236,7 @@ PYTHON_TEST_DIRS := $(sort $(dir \
 # resolved imports differently from the suite it claims to mirror. Nothing
 # depended on the difference yet, which is exactly why it went unnoticed -- the
 # coverage target tolerates a failing directory, so a test that needed the
-# missing entries would have been swallowed by the "failing test directories"
+# missing entries would have been swallowed by the "failing test files"
 # note. Now that the same run produces the required verdict, that drift would
 # read as a test that passes locally under `make test-python` and fails in CI.
 #
@@ -217,78 +244,94 @@ PYTHON_TEST_DIRS := $(sort $(dir \
 # runs in structural too, which is the other half of measuring the same suite.
 PYTHON_TEST_PATH := $(CURDIR):$(CURDIR)/agentplugins/lib:$(CURDIR)/agentplugins/pubsub-platform
 
-# How many of those directories `test-python` and `coverage` run at once. They
-# are separate `python3` processes that share nothing -- each cd's into its own
+# How many of those files `test-python` and `coverage` run at once. They are
+# separate `python3` processes that share nothing -- each cd's into its own
 # directory, servers in the seam tier bind port 0, and fixtures go through
-# tempfile -- so the sweep costs its slowest single directory rather than the
-# sum of all of them. Four directories are most of that sum, so the win is
-# large and then flat: raising this past a handful buys nothing.
+# tempfile. The sweep used to run one worker per directory, which cost its
+# slowest single directory however many workers there were: on CI's four,
+# tests/ alone took ten of the job's twelve minutes while the other three sat
+# idle. Per file, the shards spread across the workers and the sweep costs
+# about the total divided by this number, down to the slowest single file.
 #
 # Set it to 1 to serialise. That is for reproducing a failure you suspect is
 # concurrency's doing, or for a machine you need the cores back on -- not for
-# readability, since the sweep captures each directory's output either way:
+# readability, since the sweep captures each file's output either way:
 #   make test-python PYTHON_TEST_JOBS=1
 PYTHON_TEST_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 
-# The sweep over PYTHON_TEST_DIRS that `test-python` and `coverage` both run.
-# $(1) is the command executed inside each directory, and it is the only thing
-# the two callers differ by.
+# The sweep over PYTHON_TEST_FILES that `test-python` and `coverage` both run.
+# $(1) is the discovery command, without its pattern, and it is the only thing
+# the two callers differ by. The macro appends `-p <file name>` and runs the
+# command from the file's directory, so discovery is still rooted where the
+# per-directory sweep rooted it -- the import path, the fixture paths and the
+# package recursion are what that run gave the file -- and the pattern narrows
+# the collection to the one file.
 #
 # One macro rather than two loops because that mirroring is load-bearing and
 # used to be only asserted in a comment: a coverage target that walks the
-# directories differently measures a different suite than the one that gates,
-# and nothing would say so. Sharing the sweep makes it structural.
+# files differently measures a different suite than the one that gates, and
+# nothing would say so. Sharing the sweep makes it structural.
 #
-# Contract: leaves `$$failed` set to a space-separated list of the directories
-# whose command exited non-zero, empty when none did. The caller decides what
-# that means -- test-python exits 1, coverage prints a note and carries on.
+# Contract: leaves `$$failed` set to a space-separated list of the files whose
+# command exited non-zero, empty when none did. The caller decides what that
+# means -- test-python exits 1, coverage prints a note and carries on.
 #
 # Two properties the sequential loop had, kept by different means now that the
-# directories run concurrently. Every directory still runs even after another
-# fails: xargs keeps going, and each worker records its own verdict in a file
-# because a variable assigned in a subprocess cannot come back to the parent.
-# And each directory's output still arrives as a labelled block, because it is
-# captured to its own file and printed afterwards in PYTHON_TEST_DIRS order --
-# concurrent writers to one stream interleave mid-line and the "==> dir" headers
-# stop meaning anything. What that costs is progress, and a run killed mid-sweep
-# (a CI cancellation, a step timeout) loses the captured output entirely, so
-# each worker prints a line as it finishes to leave something behind.
+# files run concurrently. Every file still runs even after another fails:
+# xargs keeps going, and each worker records its own verdict in a file because
+# a variable assigned in a subprocess cannot come back to the parent. And each
+# file's output still arrives as a labelled block, because it is captured to
+# its own file and printed afterwards in PYTHON_TEST_FILES order -- concurrent
+# writers to one stream interleave mid-line and the "==> file" headers stop
+# meaning anything. What that costs is progress, and a run killed mid-sweep (a
+# CI cancellation, a step timeout) loses the captured output entirely, so each
+# worker prints a line as it finishes to leave something behind.
 #
-# The verdict file is per-directory and read as fail-closed: a directory whose
-# .rc is missing or non-zero counts as failed. One shared append-only file would
-# be shorter, but a failed append -- a full TMPDIR, which 25 concurrent suites
-# make likelier than the old loop did -- would silently drop a red directory and
-# let the gate pass. Absence has to mean failure, not success.
+# The verdict file is per-file and read as fail-closed: a file whose .rc is
+# missing or non-zero counts as failed. One shared append-only file would be
+# shorter, but a failed append -- a full TMPDIR, which hundreds of concurrent
+# shards make likelier than the old loop did -- would silently drop a red file
+# and let the gate pass. Absence has to mean failure, not success.
+#
+# The worker refuses a path that is not a regular file before discovery runs.
+# A directory, or a file that is not there, would otherwise reach `discover -p`
+# as a pattern that matches nothing, and Python 3.11 exits 0 on an empty
+# collection: the shard reads green having run nothing. The globs above only
+# ever produce files that exist; a hand-typed PYTHON_TEST_FILES=tests/, the
+# old per-directory habit on the new variable, is how such a path arrives.
 #
 # $(1) is interpolated into a single-quoted sh -c string, so it must not contain
 # a single quote. It also must not contain a comma: $(call) splits arguments on
 # commas before the body ever sees them, so `python3 -c "import os, sys"` would
 # arrive silently truncated at the comma. Both callers avoid each.
-define sweep_python_test_dirs
+define sweep_python_test_files
 work=$$(mktemp -d); \
 trap 'rm -rf "$$work"' EXIT INT TERM; \
 export work; \
-printf '%s\n' $(PYTHON_TEST_DIRS) | xargs -P $(PYTHON_TEST_JOBS) -I{} sh -c ' \
-	dir="$$1"; \
-	stem="$$work/$$(printf "%s" "$$dir" | tr "/" "_")"; \
-	if (cd "$$dir" && $(1)) >"$$stem.log" 2>&1; then \
-		rc=0; printf "    ok  %s\n" "$$dir"; \
+printf '%s\n' $(PYTHON_TEST_FILES) | xargs -P $(PYTHON_TEST_JOBS) -I{} sh -c ' \
+	file="$$1"; \
+	dir="$$(dirname "$$file")"; \
+	name="$$(basename "$$file")"; \
+	stem="$$work/$$(printf "%s" "$$file" | tr "/" "_")"; \
+	if ( [ -f "$$file" ] || { echo "not a file: $$file"; exit 1; }; \
+	     cd "$$dir" && $(1) -p "$$name" ) >"$$stem.log" 2>&1; then \
+		rc=0; printf "    ok  %s\n" "$$file"; \
 	else \
-		rc=1; printf "  FAIL  %s\n" "$$dir"; \
+		rc=1; printf "  FAIL  %s\n" "$$file"; \
 	fi; \
 	echo "$$rc" >"$$stem.rc" \
 ' _ {}; \
 echo; \
 failed=""; \
-for dir in $(PYTHON_TEST_DIRS); do \
-	echo "==> $$dir"; \
-	stem="$$work/$$(printf "%s" "$$dir" | tr "/" "_")"; \
+for file in $(PYTHON_TEST_FILES); do \
+	echo "==> $$file"; \
+	stem="$$work/$$(printf "%s" "$$file" | tr "/" "_")"; \
 	if [ -f "$$stem.log" ]; then \
 		cat "$$stem.log"; \
 	else \
-		echo "no output captured -- this directory never ran"; \
+		echo "no output captured -- this file never ran"; \
 	fi; \
-	[ "$$(cat "$$stem.rc" 2>/dev/null)" = "0" ] || failed="$$failed $$dir"; \
+	[ "$$(cat "$$stem.rc" 2>/dev/null)" = "0" ] || failed="$$failed $$file"; \
 done; \
 failed=$${failed# }
 endef
@@ -329,16 +372,16 @@ verify: ## Run everything a PR must pass offline: go build, go vet, go test, pyt
 	@echo "==> terraform test"; $(MAKE) --no-print-directory terraform-test
 	@echo "==> verify OK"
 
-test-python: ## Run every Python unit-test directory in PYTHON_TEST_DIRS, the operator's included.
-	@if [ -z "$(PYTHON_TEST_DIRS)" ]; then \
-		echo "Error: the PYTHON_TEST_DIRS globs matched no test_*.py files."; \
+test-python: ## Run every Python unit-test file in PYTHON_TEST_FILES, the operator's included.
+	@if [ -z "$(PYTHON_TEST_FILES)" ]; then \
+		echo "Error: the PYTHON_TEST_FILES globs matched no test_*.py files."; \
 		echo "Either the tests moved or the globs are stale -- failing rather than reporting success."; \
 		exit 1; \
 	fi
 # Named up front rather than left to surface as an ImportError inside one
-# directory's discovery, where a missing package reads like a broken test. This
+# file's discovery, where a missing package reads like a broken test. This
 # is a warning and not a hard stop because the two failures are independent: a
-# machine that cannot install `mcp` can still run every other directory, and
+# machine that cannot install `mcp` can still run every other file, and
 # refusing to start would throw away that signal to report something the
 # developer already knows. The exit status below still fails, so CI cannot go
 # green on a suite whose modules never imported.
@@ -353,24 +396,24 @@ test-python: ## Run every Python unit-test directory in PYTHON_TEST_DIRS, the op
 		echo "         Install them with:  make test-python-deps"; \
 		echo; \
 	fi
-# Every directory runs even after one fails, and the failures are named again at
-# the end. This loop was `set -e` over a plain `for`, which stopped at the first
-# failing directory -- and since the list is sorted, agents/platform/scripts
-# failing meant deploy/docker/patches (the largest suite in the repository, 599
-# tests) never ran at all, while the output still ended in a familiar-looking
-# failure. A red run that hides four green directories is survivable; one that
-# hides an untested directory is not.
+# Every file runs even after one fails, and the failures are named again at
+# the end. This loop was `set -e` over a plain `for` of directories, which
+# stopped at the first failing one -- and since the list is sorted,
+# agents/platform/scripts failing meant deploy/docker/patches (the largest
+# suite in the repository, 599 tests) never ran at all, while the output still
+# ended in a familiar-looking failure. A red run that hides four green
+# directories is survivable; one that hides an untested directory is not.
 #
-# Both survive the move to concurrency; sweep_python_test_dirs says how.
+# Both survive the move to concurrency; sweep_python_test_files says how.
 	@export PYTHONPATH="$(PYTHON_TEST_PATH):$${PYTHONPATH:-}"; \
-	$(call sweep_python_test_dirs,python3 -m unittest discover -p "test_*.py"); \
+	$(call sweep_python_test_files,python3 -m unittest discover); \
 	missing=""; \
 	for mod in $(PYTHON_TEST_IMPORTS); do \
 		python3 -c "import $$mod" >/dev/null 2>&1 || missing="$$missing $$mod"; \
 	done; \
 	if [ -n "$$failed" ]; then \
 		echo; \
-		echo "Failing test directories: $$failed"; \
+		echo "Failing test files: $$failed"; \
 		if [ -n "$$missing" ]; then \
 			echo "Missing third-party imports:$$missing -- run: make test-python-deps"; \
 		fi; \
@@ -378,34 +421,35 @@ test-python: ## Run every Python unit-test directory in PYTHON_TEST_DIRS, the op
 	fi
 
 # Coverage runs the same suite the same way -- literally the same sweep as
-# test-python, through sweep_python_test_dirs, with `coverage run` in place of
+# test-python, through sweep_python_test_files, with `coverage run` in place of
 # `python3`. That mirroring is the point: a coverage target that discovers tests
 # any other way measures a different suite. Two things differ. COVERAGE_ROOT
 # pins the measured tree to the repository root (the sweep cd's into each
-# directory, and .coveragerc reads the variable because `source` cannot be
-# relative from seventeen places), and COVERAGE_FILE parks every per-directory
-# data file in one place for `coverage combine`. By default a failing directory
-# is reported but does not stop the measurement, so a red directory cannot hide
-# the number for the others.
+# file's directory, and .coveragerc reads the variable because `source` cannot
+# be relative from seventeen places), and COVERAGE_FILE parks every per-file
+# data file in one place for `coverage combine`. By default a failing file is
+# reported but does not stop the measurement, so a red file cannot hide the
+# number for the others.
 #
 # Concurrency needs nothing extra here: .coveragerc already sets parallel = True,
 # so each process writes its own data file suffixed with host and pid and the
 # `coverage combine` below merges them. That setting was there for the
-# per-directory loop, and it is the same property concurrent directories need.
+# per-directory loop, and it is the same property concurrent files need; the
+# data files multiply from a few dozen to a few hundred, which combine absorbs.
 #
-# COVERAGE_STRICT=1 makes the target fail at the end when any directory failed,
+# COVERAGE_STRICT=1 makes the target fail at the end when any file failed,
 # which is what lets one run serve as both the verdict and the meter. CI's
 # required job sets it, so the verdict and the number come from one execution
 # rather than a measured run beside an unmeasured one on the same interpreter;
 # the one other run of the sweep in CI is on the agent image's Python, which is
 # a different question, not a second meter. The default stays 0 because
-# a local run against a tree with known-red directories should still print a
+# a local run against a tree with known-red files should still print a
 # total. The failing list travels through a file because each recipe line is its
 # own shell: the sweep leaves `$$failed` set in the shell that called it, and
 # the check at the bottom of the target runs in a different one.
 COVERAGE_DIR := .coverage-data
 COVERAGE_STRICT ?= 0
-COVERAGE_FAILED_FILE := failed-dirs.txt
+COVERAGE_FAILED_FILE := failed-files.txt
 # Named rather than written literally in the four places below so a test can
 # point one run's output somewhere else. tests/ is itself a PYTHON_TEST_DIR, so
 # a test that invoked this target with the defaults would `rm -rf` the data
@@ -417,8 +461,8 @@ COVERAGE_GO_XML ?= coverage-go.xml
 coverage: ## Measure unit-test coverage; writes coverage.xml (and coverage-go.xml when tooling allows).
 	@rm -rf $(COVERAGE_DIR) $(COVERAGE_XML) $(COVERAGE_GO_XML)
 	@mkdir -p $(COVERAGE_DIR)
-	@if [ -z "$(strip $(PYTHON_TEST_DIRS))" ]; then \
-		echo "ERROR: PYTHON_TEST_DIRS expanded to nothing; the globs above are stale."; \
+	@if [ -z "$(strip $(PYTHON_TEST_FILES))" ]; then \
+		echo "ERROR: PYTHON_TEST_FILES expanded to nothing; the globs above are stale."; \
 		exit 1; \
 	fi
 # Validated here rather than beside the gate it controls, which runs last: a
@@ -432,7 +476,7 @@ coverage: ## Measure unit-test coverage; writes coverage.xml (and coverage-go.xm
 		   exit 1;; \
 	esac
 # The same preflight test-python runs, and here for the same reason: a missing
-# package surfaces as an ImportError inside one directory's discovery, where it
+# package surfaces as an ImportError inside one file's discovery, where it
 # reads like a broken test rather than a missing install. Duplicated rather than
 # factored out because a `define` would have to be expanded by both targets and
 # the indirection costs more than the six lines. A warning, not a hard stop --
@@ -451,9 +495,9 @@ coverage: ## Measure unit-test coverage; writes coverage.xml (and coverage-go.xm
 	fi
 	@export COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage; \
 	export PYTHONPATH="$(PYTHON_TEST_PATH):$${PYTHONPATH:-}"; \
-	$(call sweep_python_test_dirs,python3 -m coverage run --rcfile=$(CURDIR)/.coveragerc -m unittest discover -p "test_*.py"); \
+	$(call sweep_python_test_files,python3 -m coverage run --rcfile=$(CURDIR)/.coveragerc -m unittest discover); \
 	if [ -n "$$failed" ]; then \
-		echo "Note: failing test directories (their coverage is still recorded): $$failed"; \
+		echo "Note: failing test files (their coverage is still recorded): $$failed"; \
 	fi; \
 	printf '%s' "$$failed" > $(COVERAGE_DIR)/$(COVERAGE_FAILED_FILE)
 	@COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage \
@@ -494,7 +538,7 @@ coverage: ## Measure unit-test coverage; writes coverage.xml (and coverage-go.xm
 # all run by the time it fails, so a red run still leaves coverage.xml on disk
 # for the CI job to upload and the coverage comment to be posted from.
 	@if [ "$(COVERAGE_STRICT)" = "1" ] && [ -s $(COVERAGE_DIR)/$(COVERAGE_FAILED_FILE) ]; then \
-		echo "FAIL (COVERAGE_STRICT=1) -- failing test directories: $$(cat $(COVERAGE_DIR)/$(COVERAGE_FAILED_FILE))"; \
+		echo "FAIL (COVERAGE_STRICT=1) -- failing test files: $$(cat $(COVERAGE_DIR)/$(COVERAGE_FAILED_FILE))"; \
 		exit 1; \
 	fi
 
@@ -647,6 +691,11 @@ terraform-test: ## Run each terraform/{modules,examples}/*/tests suite under `te
 	fi; \
 	failed=""; for dir in terraform/modules/*/ terraform/examples/*/; do \
 	  if [ -d "$$dir/tests" ]; then \
+	    stale="$$(ls "$$dir"*_override.tf 2>/dev/null)"; \
+	    if [ -n "$$stale" ]; then \
+	      echo "terraform-test: $$dir holds an override file that terraform test would merge silently, so its assertions would run against the override rather than the module; remove it first (lifecycle.sh writes one around each import and removes it, unless killed outright):" >&2; \
+	      printf '  %s\n' $$stale >&2; failed="$$failed $$dir"; continue; \
+	    fi; \
 	    echo "Testing $$dir..."; \
 	    (cd "$$dir" && terraform init -backend=false -input=false >/dev/null && terraform test) || failed="$$failed $$dir"; \
 	  fi; \
