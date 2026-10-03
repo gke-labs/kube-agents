@@ -958,6 +958,9 @@ class RuntimeTest(unittest.TestCase):
             runtime.INCIDENT_CHOICE_PREFIX, f"{incident.ACTION_PREFIX}.{presenter.CHOICE_ACTION}."
         )
 
+    def test_the_recommended_suffix_is_the_one_the_alert_buttons_carry(self):
+        self.assertEqual(runtime.INCIDENT_RECOMMENDED_SUFFIX, incident.RECOMMENDED_SUFFIX)
+
     def test_a_typed_apply_strikes_the_buttons_and_drops_the_click(self):
         typed = {"type": "message", "user": "U2", "text": "apply Option B", "ts": "223.000"}
         adapter = _Adapter(replies=[{"type": "message", "bot_id": "B1", "text": "alert", "ts": MESSAGE_TS}, typed])
@@ -1243,6 +1246,18 @@ class RuntimeTest(unittest.TestCase):
         self._answer(adapter, body, action)
         turn = next(entry[1] for entry in adapter.log if entry[0] == "message")
         self.assertEqual(turn["text"], "Restore the secret")
+
+    def test_a_button_from_before_titles_still_sends_what_it_shows(self):
+        reply = "apply Option B: Restore the secret"
+        for shown, sent in ((reply, reply), ("apply Option B: Restore the…", "apply Option B: Restore the…")):
+            with self.subTest(shown=shown):
+                runtime._answered.clear()
+                body, action = _alert_choice(1, reply)
+                action["text"]["text"] = shown
+                adapter = _Adapter()
+                self._answer(adapter, body, action)
+                turn = next(entry[1] for entry in adapter.log if entry[0] == "message")
+                self.assertEqual(turn["text"], sent)
 
     def test_an_incident_click_offers_the_title_as_the_threads_ask(self):
         adapter = _Adapter()

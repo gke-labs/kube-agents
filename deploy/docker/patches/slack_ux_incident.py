@@ -24,7 +24,7 @@ skips the edited alert, and a typed ``apply`` there finds the report through
 the ``incidents`` row below.
 
 A button's text is the option's title, with `` (recommended)`` after the
-recommended one's when there is more than one; its value is the reply the
+recommended one's (the single-fix shape has none); its value is the reply the
 report's call to action asks for, ``apply Option B: <title>`` (``apply:
 <title>`` for the single-fix shape), and that is what ``slack_ux_clicks``
 sends as the clicker's message in the thread. Typing ``apply`` still works:

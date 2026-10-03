@@ -120,7 +120,9 @@ grant access, or run code the image does not already ship. The list is
 `k8s-operator/internal/controller/platformagent_manifests.go`. `KAGE_SLACK_UX`
 is the nearest case: it switches between Slack code paths the image already
 ships, adds no destination or credential, and writes only to Slack, in the
-channels and threads the gateway already serves; its comment in
+channels and threads the gateway already serves, apart from the title of an
+event alert's thread, which it records on that alert's routing row in the local
+Session KV database; its comment in
 `safeSandboxEnvOverrides` lists each path.
 Reserved proxy, runtime-loader, and shell-startup variables cannot override the
 operator's managed values.

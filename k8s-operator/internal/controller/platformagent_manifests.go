@@ -4281,14 +4281,19 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// or a credential. Its writes go only to Slack, in the channels and threads
 	// the gateway already serves, among them a reaction on an ask, a click's
 	// rewrite of the clicked message and its echo, and an incident alert's edit
-	// into its options. Each effect it switches, one per change that ships it:
+	// into its options, apart from one: the title of an event alert's thread,
+	// recorded on that alert's own routing row in the local Session KV
+	// database. Each effect it switches, one per change that ships it:
 	//
 	//   - Clicks: a click on a choice runs as the clicker's turn under the
 	//     adapter's own authorization, echoed in the same thread.
-	//   - Incident alerts: an incident alert's triage options post as an edit
-	//     of the alert, with a button per option and the report folded; the
-	//     Session KV database is read, read-only, to tell an alert's thread
-	//     from any other; and before an option click counts, the alert's
+	//   - Incident alerts: a crashloop alert posts to Slack as a one-line
+	//     headline, and the event watcher records a title for the alert's
+	//     thread on its routing row, which the thread status reads; an
+	//     incident alert's triage options post as an edit of the alert, with a
+	//     button per option and the report folded; the Session KV database is
+	//     otherwise read, read-only, to tell an alert's thread from any other
+	//     and to read that title; and before an option click counts, the alert's
 	//     thread is read once (conversations.replies, the existing token and
 	//     scopes) to see whether someone the agent answers typed apply since
 	//     the options appeared, which drops the click.

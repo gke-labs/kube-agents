@@ -966,6 +966,22 @@ class TestAlertTitleRecord(unittest.TestCase):
     def test_a_missing_row_is_not_an_error(self):
         session_kv_server._record_alert_title("k8s-evt-none", "x")
 
+    def test_the_gateway_reads_the_title_recorded(self):
+        import importlib.util
+        import sqlite3
+
+        patches = Path(__file__).resolve().parents[3] / "deploy" / "docker" / "patches"
+        spec = importlib.util.spec_from_file_location("slack_ux_incident_reader", patches / "slack_ux_incident.py")
+        reader = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(reader)
+        with sqlite3.connect(temp_db_path) as conn:
+            conn.execute(
+                "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                ("k8s-evt-t2", json.dumps({"platform": "slack", "chat_id": "C1", "thread_id": "2.0"})),
+            )
+        session_kv_server._record_alert_title("k8s-evt-t2", "payments-api crashloop in seeded-debug")
+        self.assertEqual(reader.alert_title("C1", "2.0", temp_db_path), "payments-api crashloop in seeded-debug")
+
 
 class TestSessionKvServerAuth(unittest.TestCase):
     """The auth boundary, route by route.
