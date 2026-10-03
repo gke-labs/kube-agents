@@ -537,8 +537,8 @@ producing the same fix has nothing to push, `gh pr create` answers "already exis
 hands back repetition 1's URL -- correct work with no commit of its own, which the held-out
 pdb-remediation-pr seat's second live run read as 1/3 (#2016 step 3). So a pull request in the
 leased project's own repository, created at or after this job's lease window began (less the same
-skew), opened by a `[bot]` login on a `platform-agent/` branch in the repository itself, and open
-or merged, passes as an in-job sibling: the project is leased to no one else in that window, so the
+skew), opened by a `[bot]` login on a `platform-agent/` branch in the repository itself, with a
+head commit no older than the window, and open or merged, passes as an in-job sibling: the project is leased to no one else in that window, so the
 agent's pull request in it is this job's. The head test is the pool sweep's and `github_writes`'
 definition of the agent's pull request (`AGENT_BRANCH_PREFIX`, the head in the repository and not
 a fork), so Dependabot's, a workflow's or another installed App's pull request in the window is
@@ -552,8 +552,8 @@ check reads the window from two environment names
 `hack/ci-eval-pr.sh` exports, `EVAL_LEDGER_REPO` (the leased `*-infra` repository, the slug the
 ledger reset uses) and `EVAL_LEASE_STARTED_AT` (the script's own start, ISO-8601 UTC, inside the
 Boskos lease and before any agent ran). Either unset -- a hand run against a dev install -- or the
-option not set on the check, and only the head-commit rule applies. A pull request created before the window is an earlier lease's
-leftover and fails exactly as before; one in another repository is nobody's sibling; one a person
+option not set on the check, and only the head-commit rule applies. A pull request created before the window, or opened in it on a tip from before it, is an
+earlier lease's leftover and fails exactly as before; one in another repository is nobody's sibling; one a person
 opened is not the agent's; one closed unmerged is rejected before either rule is asked; and an
 empty one fails under both.
 

@@ -2317,6 +2317,21 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 )
                 continue
             stale_head = bool(pushed) and (since - pushed).total_seconds() > skew
+            # The sibling test's last clause: where the head commit came from.
+            # A pull request opened inside the window on a tip from before it
+            # carries an earlier lease's commit, so it fails for every
+            # repetition that links it, as it does for the one that opened it.
+            if (
+                not_sibling is None
+                and pushed
+                and lease_start is not None
+                and (lease_start - pushed).total_seconds() > skew
+            ):
+                not_sibling = (
+                    f"head commit {pushed.isoformat()} predates this job's lease "
+                    f"window ({lease_start.isoformat()}), so an earlier lease's "
+                    "commit and not an in-job sibling"
+                )
             if stale_head and not_sibling:
                 rejected.append(
                     f"{slug}: its head commit dates from {pushed.isoformat()}, "

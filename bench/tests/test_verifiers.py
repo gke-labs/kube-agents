@@ -3802,6 +3802,19 @@ def test_a_pull_request_this_run_opened_on_a_pre_run_tip_is_not_a_sibling(token,
     assert "opened at 2026-08-21T09:00:30+00:00, during this run, so this repetition's own pull request" in res.reason
 
 
+def test_an_in_lease_sibling_on_a_pre_lease_tip_is_not_a_sibling(token, github, lease):
+    """A pull request opened inside the window on a branch whose tip predates
+    it carries an earlier lease's commit: refused for a later repetition, as
+    it is for the one that opened it."""
+    _stash_pr_report()
+    _sibling_routes(github)
+    _pr_head_routes(github, "2026-08-20T12:00:00Z")
+    res = _sibling_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "this run wrote to a pull request an earlier one pushed the fix to" in res.reason
+    assert "head commit 2026-08-20T12:00:00+00:00 predates this job's lease window" in res.reason
+
+
 def test_a_same_day_date_only_lease_stamp_is_no_window(token, github, lease, monkeypatch):
     """`2026-08-21` on a run that started at 09:00 that day parses as midnight,
     nine hours before the run and inside the day's bound; the shape is refused

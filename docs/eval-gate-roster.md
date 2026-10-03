@@ -206,7 +206,7 @@ decided for these two seats, and a case without it grades the push alone. The ru
 passed leads the check's reason in the run record (`results.json`, `verification_report[]`),
 which is where the two are counted apart; the Cases page shows a passing repetition without its
 reason, so it cannot. A pull request an earlier lease left behind (created before the
-window), one in another repository, one a person opened, and one closed unmerged still fail. The
+window, or opened in it on a tip from before it), one in another repository, one a person opened, and one closed unmerged still fail. The
 window is the job's, not the case's: in the nightly every PR-writing case shares it and writes as
 the same App, so a repetition passes on any in-window agent-authored pull request in the leased
 repository it links, and the check cannot tell which case opened it. `hack/ci-eval-pr.sh` exports
