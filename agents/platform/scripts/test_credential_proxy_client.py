@@ -8,6 +8,7 @@ Run:  python3 agents/platform/scripts/test_credential_proxy_client.py
 """
 
 import base64
+import http.client
 import io
 import json
 import os
@@ -23,6 +24,13 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
 import credential_proxy_client
+
+try:
+    import tools.terminal_hints as terminal_hints
+    HAS_HERMES = True
+except ImportError:
+    terminal_hints = None  # type: ignore[assignment]
+    HAS_HERMES = False
 
 
 class RecordingResponse(io.BytesIO):
@@ -1216,6 +1224,81 @@ class TestCallerCredential(SubmittedPayloadTestCase):
         with patch.dict("os.environ", {"CREDENTIAL_PROXY_TOKEN_FILE": str(path)}, clear=False):
             with self.assertRaises(credential_proxy_client.TokenUnavailable):
                 credential_proxy_client.authorization_headers()
+
+
+class TestExecutePolicyBlocked(unittest.TestCase):
+    """When the credential proxy blocks a command under security policy.
+
+    The shim must return EXIT_SECURITY_POLICY_BLOCKED (77, EX_NOPERM from
+    sysexits.h) rather than 126. Exit 126 is treated by the agent runtime as
+    'file found but not executable - chmod +x it' and attaches a hint that
+    invites the model to seek local workarounds for a policy boundary (#2179).
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.token_path = self.tmp / "token"
+        self.token_path.write_text("valid-token\n")
+
+    def test_security_policy_blocked_returns_77_and_prints_rule(self):
+        refusal_payload = {
+            "code": "SECURITY_POLICY_BLOCKED",
+            "message": "kubectl delete is not permitted.",
+            "rule": "kubernetes.read-only",
+        }
+        body = json.dumps(refusal_payload).encode("utf-8")
+        error_file = io.BytesIO(body)
+        http_error = urllib.error.HTTPError(
+            url="http://proxy/v1/exec",
+            code=403,
+            msg="Forbidden",
+            hdrs=http.client.HTTPMessage(),
+            fp=error_file,
+        )
+
+        def fake_open(request, *args, **kwargs):
+            raise http_error
+
+        stderr = io.StringIO()
+        environ = {
+            "CREDENTIAL_PROXY_TOKEN_FILE": str(self.token_path),
+            "KUBECONFIG": "",
+            "HERMES_HOME": str(self.tmp),
+        }
+        with patch.dict("os.environ", environ, clear=False):
+            with patch.object(credential_proxy_client, "open_broker_request", fake_open):
+                with patch("sys.stderr", new=stderr):
+                    exit_code = credential_proxy_client.execute(
+                        "http://proxy", ["kubectl", "delete", "pod", "mypod"]
+                    )
+
+        self.assertEqual(77, exit_code)
+        self.assertEqual(credential_proxy_client.EXIT_SECURITY_POLICY_BLOCKED, exit_code)
+        err = stderr.getvalue()
+        self.assertIn("kubectl delete is not permitted.", err)
+        self.assertIn("policy rule: kubernetes.read-only", err)
+
+    @unittest.skipUnless(HAS_HERMES, "needs hermes-agent runtime (tools.terminal_hints) importable")
+    def test_exit_77_receives_no_runtime_execution_hint(self):
+        # Hermes Agent's tools.terminal_hints defines hints for failed commands.
+        # Exit 126 was annotated with:
+        #   "Exit 126: the file was found but is not executable — `chmod +x` it..."
+        # Exit 77 must not trigger any runtime hint on the refusal output.
+        assert terminal_hints is not None
+        output = "Command blocked for security reasons.\npolicy rule: kubernetes.read-only\n"
+        hint = terminal_hints.annotate_failure("kubectl delete pod mypod", 77, output)
+        self.assertIsNone(
+            hint,
+            f"Exit 77 must not produce an execution/file-permission hint, got: {hint!r}",
+        )
+        # Verify sabotage: 126 WOULD have produced the misleading hint
+        hint_126 = terminal_hints.annotate_failure("kubectl delete pod mypod", 126, output)
+        self.assertIsNotNone(hint_126)
+        self.assertTrue(
+            any(term in hint_126.lower() for term in ("chmod", "executable", "interpreter")),
+            f"Exit 126 should advise execution or file permission resolution, got: {hint_126!r}",
+        )
 
 
 class TestConnectTimeout(unittest.TestCase):
