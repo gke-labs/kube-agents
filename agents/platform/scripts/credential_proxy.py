@@ -698,6 +698,15 @@ def required_roles(path: str) -> tuple[str, ...]:
 # imposes anyway.
 MANAGED_REPOSITORY_CACHE_SECONDS = 30.0
 
+# A successful forge credential refresh satisfies subsequent refresh requests
+# for the same provider arriving within this window, for any repository the
+# helper reported as scoped into the token it installed -- avoiding redundant
+# token mints when concurrent cron jobs wake on the same tick. A repository
+# outside that reported set runs the helper again, and because the forge CLI
+# holds a single token slot per provider (e.g. github.com), the new mint's
+# scope replaces the previous one's coalesce window entirely.
+FORGE_REFRESH_COALESCE_SECONDS = 30.0
+
 # What `repository_role` answers. `managed` is a repository in `managed_repos`,
 # whatever else it is in; `context` is one in `context_repos` alone; the third
 # is neither. Only the content workspace's clone reads the answer.
@@ -3880,6 +3889,11 @@ class CommandExecutor:
         # rare and the server is threaded, so a single lock is cheaper than the
         # bookkeeping needed to make it per-cluster.
         self._kubeconfig_lock = threading.Lock()
+        # Serialises forge credential refreshes so concurrent callers do not
+        # race on the global .gitconfig lock file or forge CLI state.
+        self._forge_refresh_lock = threading.Lock()
+        self._last_forge_refresh: dict[str, tuple[float, frozenset[str]]] = {}
+        self._last_forge_refresh_failure: dict[tuple[str, str], tuple[float, Exception]] = {}
         trusted_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         self.executables = {
             name: shutil.which(name, path=trusted_path)
@@ -4432,6 +4446,24 @@ class CommandExecutor:
             argv, result.exit_code, result.stdout, result.stderr
         )
 
+    @property
+    def _refresh_lock(self) -> threading.Lock:
+        if getattr(self, "_forge_refresh_lock", None) is None:
+            self._forge_refresh_lock = threading.Lock()
+        return self._forge_refresh_lock
+
+    @property
+    def _refresh_cache(self) -> dict[str, tuple[float, frozenset[str]]]:
+        if getattr(self, "_last_forge_refresh", None) is None:
+            self._last_forge_refresh = {}
+        return self._last_forge_refresh
+
+    @property
+    def _refresh_failure_cache(self) -> dict[tuple[str, str], tuple[float, Exception]]:
+        if getattr(self, "_last_forge_refresh_failure", None) is None:
+            self._last_forge_refresh_failure = {}
+        return self._last_forge_refresh_failure
+
     def refresh_forge_credential(self, provider: str, repository: str) -> None:
         """Make this install's credential for `repository` current, or raise.
 
@@ -4448,9 +4480,43 @@ class CommandExecutor:
         helper = self._forge_helper(provider)
         if not repository_is_managed(repository):
             raise PermissionError(f"{repository} is not a repository this install manages")
-        self._run_forge_helper(
-            provider, helper, [repository], "credential refresh", log_success=True
-        )
+        clean_repo = repository.strip().lower()
+        org = clean_repo.split("/", 1)[0] if "/" in clean_repo else clean_repo
+        failure_key = (provider, org)
+        queued_at = time.monotonic()
+        with self._refresh_lock:
+            now = time.monotonic()
+            current = self._refresh_cache.get(provider)
+            if current is not None:
+                last_refresh, cached_scoped = current
+                if clean_repo in cached_scoped and (now - last_refresh) < FORGE_REFRESH_COALESCE_SECONDS:
+                    return
+            failure = self._refresh_failure_cache.get(failure_key)
+            if failure is not None:
+                failed_at, exc = failure
+                if failed_at >= queued_at:
+                    raise exc
+            try:
+                result = self._run_forge_helper(
+                    provider, helper, [repository], "credential refresh", log_success=True
+                )
+            except Exception as e:
+                # The helper may have replaced the slot before it failed; a
+                # stale entry would coalesce the next caller onto a token that
+                # is not theirs.
+                self._refresh_cache.pop(provider, None)
+                if not isinstance(e, TimeoutError):
+                    self._refresh_failure_cache[failure_key] = (time.monotonic(), e)
+                raise
+            self._refresh_failure_cache.pop(failure_key, None)
+            scoped = frozenset(
+                line.strip().lower()
+                for line in (result.stdout or "").splitlines()
+                if line.strip()
+            )
+            if not scoped:
+                scoped = frozenset([clean_repo])
+            self._refresh_cache[provider] = (time.monotonic(), scoped)
 
     @staticmethod
     def _forge_helper(provider: str) -> Path:
@@ -4500,6 +4566,8 @@ class CommandExecutor:
                 result.exit_code,
                 f": {detail}" if detail else "",
             )
+            if result.timed_out:
+                raise TimeoutError(f"{action} timed out")
             raise RuntimeError(f"{action} failed")
         if log_success and detail:
             LOGGER.info("%s %s: %s", provider, action, detail)
