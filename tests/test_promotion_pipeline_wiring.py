@@ -487,7 +487,7 @@ class PromotionPipelineWiringTest(unittest.TestCase):
                     for step in steps
                     if str(step.get("uses", "")).startswith("actions/create-github-app-token@")
                 )
-                self.assertIn("RELEASE_BOT_APP_ID", token_step["with"]["app-id"])
+                self.assertIn("RELEASE_BOT_APP_ID", token_step["with"]["client-id"])
                 self.assertIn("RELEASE_BOT_APP_PRIVATE_KEY", token_step["with"]["private-key"])
                 self.assertEqual(token_step["with"].get("permission-contents"), "write")
                 self.assertEqual(token_step["with"].get("permission-workflows"), "write")
@@ -839,12 +839,32 @@ class ReleaseBotTokenWiringTest(unittest.TestCase):
                     for job in (doc.get("jobs") or {}).values()
                     for step in (job.get("steps") or [])
                     if str(step.get("uses", "")).startswith("actions/create-github-app-token@")
-                    and "RELEASE_BOT_APP_ID" in str(step.get("with", {}).get("app-id", ""))
+                    and any(
+                        "RELEASE_BOT_APP_ID" in str(step.get("with", {}).get(key, ""))
+                        for key in ("client-id", "app-id")
+                    )
                 ]
                 self.assertTrue(token_steps, f"expected at least one release bot token step in {name}")
                 for step in token_steps:
                     self.assertEqual(step["with"].get("permission-contents"), "write")
                     self.assertEqual(step["with"].get("permission-workflows"), "write")
+
+    def test_no_token_mint_uses_the_deprecated_app_id_input(self):
+        """create-github-app-token v3.1.0 deprecated `app-id` for `client-id`, and the
+        next major that drops it would break every mint at once. The permissions
+        guard above matches either key so that a step reintroduced with `app-id` is
+        still checked; this is the test that says it must not be reintroduced."""
+        for path in sorted(p for glob in ("*.yml", "*.yaml") for p in _WORKFLOWS.glob(glob)):
+            with self.subTest(workflow=path.name):
+                doc = _doc(path)
+                offenders = [
+                    f"{job_name}/{step.get('id') or step.get('name') or '?'}"
+                    for job_name, job in ((doc.get("jobs") or {}).items())
+                    for step in (job.get("steps") or [])
+                    if str(step.get("uses", "")).startswith("actions/create-github-app-token@")
+                    and any(str(key).lower() == "app-id" for key in (step.get("with") or {}))
+                ]
+                self.assertEqual(offenders, [], f"steps in {path.name} still mint with the deprecated app-id input")
 
 
 if __name__ == "__main__":

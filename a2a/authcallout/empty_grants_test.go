@@ -30,6 +30,36 @@ import (
 // cannot produce grants has to say so out of band. These tests pin the
 // places that now do.
 
+// The derivation refuses rather than returning the empty set. The inputs here
+// cannot reach sessionGrants through authorize — validSessionName accepts only
+// a dot-free DNS-1123 label, and every such string also satisfies capability's
+// checkToken — so this is the unreachable branch asserted directly, which is
+// the only way to assert it at all.
+func TestSessionGrantsRefusesRatherThanReturningAnEmptySet(t *testing.T) {
+	for _, pod := range []string{"has.dots", "has*star", "has>gt", "has space", ""} {
+		g, err := sessionGrants(pod)
+		if err == nil {
+			t.Errorf("sessionGrants(%q) = %+v, nil; want an error", pod, g)
+			continue
+		}
+		if len(g.Publish) != 0 || len(g.Subscribe) != 0 {
+			t.Errorf("sessionGrants(%q) returned grants alongside its error: %+v", pod, g)
+		}
+	}
+}
+
+// A well-formed pod still derives both sides, so the refusal above is not
+// refusing everything.
+func TestSessionGrantsStillDerivesBothSidesForAWellFormedPod(t *testing.T) {
+	g, err := sessionGrants(podA)
+	if err != nil {
+		t.Fatalf("sessionGrants(%q): %v", podA, err)
+	}
+	if len(g.Publish) == 0 || len(g.Subscribe) == 0 {
+		t.Fatalf("sessionGrants(%q) = %+v, want both sides populated", podA, g)
+	}
+}
+
 // The map refuses an entry with either side empty, per side rather than across
 // both. The `publish: []` case is the one the old `||` check admitted: it has
 // grants, so it passed, and it minted an unrestricted publisher.

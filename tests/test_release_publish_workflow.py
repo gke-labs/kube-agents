@@ -182,7 +182,7 @@ class ReleasePublishWorkflowTest(unittest.TestCase):
             for step in steps
             if str(step.get("uses", "")).startswith("actions/create-github-app-token@")
         )
-        self.assertIn("RELEASE_BOT_APP_ID", token_step["with"]["app-id"])
+        self.assertIn("RELEASE_BOT_APP_ID", token_step["with"]["client-id"])
         self.assertIn("RELEASE_BOT_APP_PRIVATE_KEY", token_step["with"]["private-key"])
         self.assertEqual(token_step["with"].get("permission-contents"), "write")
         self.assertEqual(token_step["with"].get("permission-workflows"), "write")

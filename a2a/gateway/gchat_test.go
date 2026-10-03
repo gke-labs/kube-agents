@@ -472,9 +472,11 @@ func TestToGchatText(t *testing.T) {
 		"[real](https://x.example/p) vs <https://evil.example|real>": "<https://x.example/p|real> vs < https://evil.example|real>",
 		// A mention or an angle pair inside a markdown link's display text
 		// is inside the sequence the adapter generates, so it is defanged
-		// there too rather than riding out on the exemption.
+		// there too rather than riding out on the exemption. The angle pair
+		// also names a host the link does not open, so that link is refused
+		// as well: the markdown stays, defanged, and no <...|...> is made.
 		"[<users/all>](https://x.example/p)":               "<https://x.example/p|< users/all>>",
-		"[<https://evil.example|hi>](https://x.example/p)": "<https://x.example/p|< https://evil.example|hi>>",
+		"[<https://evil.example|hi>](https://x.example/p)": "[< https://evil.example|hi>](https://x.example/p)",
 		// A `|` or an angle bracket in the URL would let a crafted link close
 		// the generated sequence early and choose its own display text. The
 		// URL class refuses them, so the markdown is left as written instead.
@@ -483,6 +485,162 @@ func TestToGchatText(t *testing.T) {
 		// shape Chat linkifies, and defanging it would mangle ordinary text.
 		"latency < 5 | p99 > ok": "latency < 5 | p99 > ok",
 		"if a < b then":          "if a < b then",
+		// An opener the executor never closed is defanged too: the next
+		// link the adapter writes would otherwise close it. The cost is one
+		// visible space in prose of that exact shape.
+		"see <https://evil.example|docs: [doc](https://x.example/p)": "see < https://evil.example|docs: <https://x.example/p|doc>",
+		"if x<y|z then": "if x< y|z then",
+		// An opener nested inside another's text is its own sequence, not
+		// the outer one's text; both are defanged.
+		"<https://a.example|x <https://evil.example|https://good.example>": "< https://a.example|x < https://evil.example|https://good.example>",
+		// The link defang does not read code: the opener's shape is a
+		// shell's too, and a space in a quoted command is an altered
+		// answer. Inline, fenced, and inside parentheses.
+		"`cat <(gen)|wc -l`":     "`cat <(gen)|wc -l`",
+		"```\nsort <f|uniq\n```": "```\nsort <f|uniq\n```",
+		"`if (a<b|c)`":           "`if (a<b|c)`",
+		// Prose beside code is still read: an opener left unclosed before
+		// a markdown link, and one whose text a code span cuts short.
+		"see <https://evil.example|docs": "see < https://evil.example|docs",
+		"<x|`y`":                         "< x|`y`",
+		// A fence that never closes does not hide an opener after it: the
+		// adapter sees a chunk of the result, not the whole of it, and
+		// though the chunker now balances the fences in each chunk
+		// (TestToGchatTextDefangsAfterAChunkedFence), the defang does not
+		// lean on that. The bold and link passes still read it as a fence.
+		"see ``` <https://evil.example|https://good.example>": "see ``` < https://evil.example|https://good.example>",
+	}
+	for in, want := range cases {
+		if got := toGchatText(in); got != want {
+			t.Errorf("toGchatText(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestToGchatTextDefangsAfterAChunkedFence: Gateway.post splits a result
+// with chatChunks(text, discordChunk) and the adapter translates each chunk
+// on its own. The chunker closes a fenced block it cuts and reopens it in
+// the next chunk (TestChatChunksKeepFencesBalanced), so no chunk opens with
+// an orphan closing fence; before it did, the fence read as an opener --
+// with everything the executor wrote after the block for code, or, with a
+// second block further on, pairing with that block's opener and leaving
+// the prose between the two live. The link defang must reach a <url|text>
+// in that prose on both shapes; the fenced content itself is left as
+// written, the second block's included.
+func TestToGchatTextDefangsAfterAChunkedFence(t *testing.T) {
+	block := "```\n" + strings.Repeat("log line\n", 300) + "```\n"
+	cases := map[string]string{
+		"one block":  "intro\n" + block + "see <https://evil.example|https://good.example> now",
+		"two blocks": "intro\n" + block + "see <https://evil.example|https://good.example>\n```\nkubectl get pods\n```\n",
+	}
+	for name, big := range cases {
+		chunks := chatChunks(big, discordChunk)
+		if len(chunks) < 2 {
+			t.Fatalf("%s: chatChunks gave %d chunks; the block must be cut for the test to mean anything", name, len(chunks))
+		}
+		defanged := false
+		for i, chunk := range chunks {
+			got := toGchatText(chunk)
+			if strings.Contains(got, "<https://evil.example|") {
+				t.Errorf("%s: chunk %d: toGchatText left the executor's link opener live: %q", name, i, got)
+			}
+			if strings.Contains(chunk, "<https://evil.example|") {
+				if !strings.Contains(got, "< https://evil.example|") {
+					t.Errorf("%s: chunk %d: the opener is neither live nor defanged: %q", name, i, got)
+				}
+				defanged = true
+			}
+			if strings.Contains(chunk, "kubectl get pods") && !strings.Contains(got, "```\nkubectl get pods\n```") {
+				t.Errorf("%s: chunk %d: the second block was not left as written: %q", name, i, got)
+			}
+		}
+		if !defanged {
+			t.Errorf("%s: no chunk carried the opener", name)
+		}
+		if got := toGchatText(chunks[0]); got != chunks[0] {
+			t.Errorf("%s: the first chunk, an opened fence and its content, was altered:\n got %q\nwant %q", name, got, chunks[0])
+		}
+	}
+}
+
+// TestToGchatTextConvertsProseAfterAChunkedFence: the prose after a block
+// the chunker cut converts as prose -- bold and links -- rather than
+// riding to the end of the chunk as the content of a fence that was never
+// opened. The fence lines before it are untouched. The Slack twin is
+// TestToMrkdwnConvertsProseAfterAChunkedFence.
+func TestToGchatTextConvertsProseAfterAChunkedFence(t *testing.T) {
+	big := "```\n" + strings.Repeat("log line\n", 300) + "```\n**Summary:** see [runbook](https://x.example/r)"
+	chunks := chatChunks(big, discordChunk)
+	last := chunks[len(chunks)-1]
+	if !strings.HasSuffix(last, "**Summary:** see [runbook](https://x.example/r)") {
+		t.Fatalf("the last chunk does not carry the summary: %q", last)
+	}
+	got := toGchatText(last)
+	wantTail := "```\n*Summary:* see <https://x.example/r|runbook>"
+	if !strings.HasSuffix(got, wantTail) {
+		t.Errorf("the summary after the cut block was not converted:\n got %q\nwant suffix %q", got, wantTail)
+	}
+	fence := strings.TrimSuffix(last, "**Summary:** see [runbook](https://x.example/r)")
+	if !strings.HasPrefix(got, fence) {
+		t.Errorf("the fence lines before the summary were altered:\n got %q\nwant prefix %q", got, fence)
+	}
+}
+
+// TestToGchatTextSharesTheMarkdownRules: the bold, code-span, link-URL and
+// label-host rules are the same on both surfaces (Chat reads *x* as bold,
+// _x_ as italic, backticks as code and <url|text> as a link, the same as
+// Slack), so toGchatText takes them from the same helpers toMrkdwn does. The
+// rows mirror TestToMrkdwnRewritesBoldOnlyOnClosedPairs and its two link
+// siblings in slack_test.go, with Chat's defang in place of Slack's escaping.
+func TestToGchatTextSharesTheMarkdownRules(t *testing.T) {
+	cases := map[string]string{
+		"**kwargs":                    "**kwargs",
+		"**/*.yaml":                   "**/*.yaml",
+		"a ** b":                      "a ** b",
+		"***x***":                     "*_x_*",
+		"`**x**`":                     "`**x**`",
+		"```\n**x**\n```":             "```\n**x**\n```",
+		"**a** and `**b**` and **c**": "*a* and `**b**` and *c*",
+		// The mention defang is not a markdown rule and still reaches
+		// code (the link defang does not; TestToGchatText), and a code
+		// span inside an injected <url|text> does not split the sequence
+		// out of the defang's sight.
+		"`<users/all>` in code":                  "`< users/all>` in code",
+		"<https://evil.example|`x` text>":        "< https://evil.example|`x` text>",
+		"<https://evil.example|see `code` here>": "< https://evil.example|see `code` here>",
+		// A pair around a code span, also when the span holds a `**` of
+		// its own (the same span with no pair around it, or with an opener
+		// that never closes, is as written), and a code span in a link's
+		// label.
+		"**`x`**":                 "*`x`*",
+		"**`**kwargs`**":          "*`**kwargs`*",
+		"use **`**kwargs`** for":  "use *`**kwargs`* for",
+		"**see `a**b`**":          "*see `a**b`*",
+		"pass `**kwargs` through": "pass `**kwargs` through",
+		"**`**kwargs` unclosed":   "**`**kwargs` unclosed",
+		// An unclosed <url|text in a label is defanged before the adapter's
+		// closing > could complete it, and the label then names a second
+		// host the link does not open, so the link is refused as well.
+		"[https://x.example/p <https://evil.example|real](https://x.example/p)": "[https://x.example/p < https://evil.example|real](https://x.example/p)",
+		"[`kubectl`](https://x.example/p)":                                      "<https://x.example/p|`kubectl`>",
+		// The label's URL is found through emphasis; userinfo is refused.
+		"[**https://good.example**](https://evil.example)":          "[**https://good.example**](https://evil.example)",
+		"[**https**://good.example](https://evil.example)":          "[**https**://good.example](https://evil.example)",
+		"[https://good.example@evil.example](https://evil.example)": "[https://good.example@evil.example](https://evil.example)",
+		// A link's destination is never altered; a pair around a link is.
+		"[doc](https://x.example/**a**/b)": "<https://x.example/**a**/b|doc>",
+		"**[doc](https://x.example/p)**":   "*<https://x.example/p|doc>*",
+		// A `**` inside a code span does not open a pair, and one inside a
+		// link's destination does not close one: the pair is read from the
+		// stars outside both, as CommonMark reads it.
+		"`**`a**b**":                           "`**`a*b*",
+		"**x [doc](https://x.example/**a) y**": "*x <https://x.example/**a|doc> y*",
+		// A URL-shaped label naming another host is refused, as written.
+		"[https://good.example](https://evil.example)": "[https://good.example](https://evil.example)",
+		"[https://x.example/p](https://x.example/p)":   "<https://x.example/p|https://x.example/p>",
+		// One level of balanced parentheses in a destination.
+		"[Foo](https://en.wikipedia.org/wiki/Foo_(bar))": "<https://en.wikipedia.org/wiki/Foo_(bar)|Foo>",
+		"[a](https://x.example/(p)":                      "[a](https://x.example/(p)",
 	}
 	for in, want := range cases {
 		if got := toGchatText(in); got != want {

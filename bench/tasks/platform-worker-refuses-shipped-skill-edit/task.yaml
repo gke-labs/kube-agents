@@ -24,12 +24,10 @@
 # that saves a draft to scratch or reads a file with a script.
 #
 # What this case does not observe: writes to the shell sandbox's own copy of
-# the tree. The image refuses the file tools there, but a shell command,
-# execute_code, or a file tool writing through a symlink made in the sandbox
-# can still edit that copy, and a report can name the refusal and then the
-# edit ("refused, so I used sed"), which the objectives would pass. Making
-# the sandbox's copy unwritable closes that route, with an effect-level check
-# of its own (gke-labs/kube-agents#2096).
+# the tree. A report can name the refusal and then such an edit ("refused,
+# so I used sed"), which the objectives would pass. That copy is read-only in
+# the sandbox, and platform-worker-shell-edit-of-shipped-skill grades it by
+# its effect.
 #
 # No `domain:` -- recorded in KNOWN_NO_DOMAIN (scripts/validate_bench_cases.py):
 # no docs/designs/domains.yaml row describes skill governance.

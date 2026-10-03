@@ -1,7 +1,10 @@
 import email.message
 import io
 import os
+import socket
+import subprocess
 import sys
+import threading
 import unittest
 import urllib.error
 from pathlib import Path
@@ -17,7 +20,26 @@ from github_token_refresh import (
 )
 
 
+class _Clock:
+    """A stand-in for time.monotonic: the given readings, then the last one forever."""
+
+    def __init__(self, readings, then):
+        self._readings = list(readings)
+        self._then = then
+
+    def __call__(self):
+        return self._readings.pop(0) if self._readings else self._then
+
+
 class GitHubTokenRefreshTest(unittest.TestCase):
+    def setUp(self):
+        # These tests describe the gcloud path. The metadata server is asked
+        # before it and would otherwise take the generic urlopen mocks below for
+        # its own answer; MetadataIdentityTest covers it.
+        no_metadata = patch("github_token_refresh.metadata_identity_token", return_value=None)
+        no_metadata.start()
+        self.addCleanup(no_metadata.stop)
+
     @patch("github_token_refresh.subprocess.run")
     def test_get_current_git_repo_https(self, run):
         res = MagicMock()
@@ -202,10 +224,10 @@ class GitHubTokenRefreshTest(unittest.TestCase):
     @patch("github_token_refresh.wif_credentials.fetch_identity_token")
     @patch("github_token_refresh.subprocess.run")
     @patch("github_token_refresh.urllib.request.urlopen")
-    def test_metadata_server_placement_still_asks_gcloud(self, urlopen, run, fetch):
-        # Every placement other than the co-located one. fetch_identity_token
-        # returns None off a metadata-server identity, and this path has to stay
-        # exactly as it was.
+    def test_a_host_with_neither_identity_source_still_asks_gcloud(self, urlopen, run, fetch):
+        # A host with neither a federated credential nor a metadata server
+        # (setUp): fetch_identity_token returns None and gcloud is the last
+        # resort, exactly as it was.
         fetch.return_value = None
         run.return_value = MagicMock(stdout="gcloud.id.token\n")
         response = MagicMock()
@@ -731,8 +753,16 @@ class SandboxForwardTest(unittest.TestCase):
     """The gateway pod holds nothing that can mint, so it forwards.
 
     Without this branch a `no_agent` cron job on the gateway falls through to
-    the direct mint and dies on a `gcloud` that is not installed there.
+    the direct mint, which would mint on the pod the credential split exists
+    to keep empty.
     """
+
+    def setUp(self):
+        # The direct mint these tests fall through to would otherwise GET the
+        # real metadata address from whatever host runs the suite.
+        no_metadata = patch("github_token_refresh.metadata_identity_token", return_value=None)
+        no_metadata.start()
+        self.addCleanup(no_metadata.stop)
 
     def _sandbox(self, enabled, completed=None):
         import subprocess
@@ -866,6 +896,14 @@ class RefreshCredentialsOnceTest(unittest.TestCase):
 class ReadOnlyMintTest(unittest.TestCase):
     """`--read-only`: one repository, the read scope, straight to Minty, nothing installed."""
 
+    def setUp(self):
+        # These tests describe the gcloud path. The metadata server is asked
+        # before it and would otherwise take the generic urlopen mocks below for
+        # its own answer; MetadataIdentityTest covers it.
+        no_metadata = patch("github_token_refresh.metadata_identity_token", return_value=None)
+        no_metadata.start()
+        self.addCleanup(no_metadata.stop)
+
     @patch("github_token_refresh.wif_credentials.fetch_identity_token", return_value=None)
     @patch("github_token_refresh.subprocess.run")
     @patch("github_token_refresh.urllib.request.urlopen")
@@ -940,6 +978,399 @@ class ReadOnlyMintTest(unittest.TestCase):
             with patch("github_token_refresh.refresh_git_credentials") as refresh:
                 main()
         refresh.assert_called_once_with("org/repo")
+
+
+class MetadataIdentityTest(unittest.TestCase):
+    """The identity token comes from the metadata server directly; gcloud is the fallback."""
+
+    MINTY = github_token_refresh.TOKEN_BROKER_URL
+    METADATA = github_token_refresh.METADATA_IDENTITY_URL
+
+    def setUp(self):
+        github_token_refresh.identity_note.update(minted="", fell_through="")
+        # A credential file configured on the host running the suite would
+        # route these tests to gcloud; the one test about that sets its own.
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for name in github_token_refresh.CREDENTIAL_FILE_VARIABLES:
+            os.environ.pop(name, None)
+
+    def _urlopen(self, metadata, minty=b"ghs_installation_token"):
+        """A urlopen that answers the metadata server from `metadata` and Minty with `minty`.
+
+        `metadata` is a list consumed one answer per call: bytes are a body
+        (a list of bytes is a body delivered in those chunks; a tuple of a
+        body and a number is a Content-Length answer that closed with that
+        many bytes still owed), an exception instance is raised. The same
+        fake is installed as `metadata_open`,
+        the proxy-less opener the metadata GET goes through, for the test's
+        duration.
+        """
+        answers = list(metadata)
+        self.metadata_calls = []
+
+        def fake(request, timeout=None):
+            url = request.full_url
+            response = MagicMock()
+            response.status = 200
+            response.__enter__.return_value = response
+            if url.startswith(self.METADATA):
+                self.metadata_calls.append(request)
+                self.assertEqual("Google", request.headers["Metadata-flavor"])
+                self.assertEqual(github_token_refresh.METADATA_TIMEOUT_SECONDS, timeout)
+                answer = answers.pop(0)
+                if isinstance(answer, BaseException):
+                    raise answer
+                owed = 0
+                if isinstance(answer, tuple):
+                    answer, owed = answer
+                chunks = answer if isinstance(answer, list) else [answer]
+                # read1(n) hands out the chunks, one per receive, then EOF;
+                # `length` is what a Content-Length answer still owes then.
+                response.read1.side_effect = chunks + [b""]
+                response.length = owed
+            else:
+                self.assertEqual(self.MINTY, url)
+                response.read.return_value = minty
+            return response
+
+        opener = patch("github_token_refresh.metadata_open", fake)
+        opener.start()
+        self.addCleanup(opener.stop)
+        return fake
+
+    @patch("github_token_refresh.log")
+    @patch("github_token_refresh.wif_credentials.fetch_identity_token", return_value=None)
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    def test_the_metadata_server_is_asked_before_gcloud(self, urlopen, run, fetch, log):
+        urlopen.side_effect = self._urlopen([b"eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJhY2NvdW50cy5nb29nbGUuY29tIn0.c2lnbmF0dXJlLXNpZ25hdHVyZS1zaWduYXR1cmU\n"])
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}, clear=False):
+            token = refresh_git_credentials("owner/repository")
+
+        self.assertEqual("ghs_installation_token", token)
+        # The branch that minted is on the last line too: the sidecar keeps
+        # the tail of this output.
+        last = str(log.call_args.args[0])
+        self.assertTrue(last.startswith("GitHub authentication successfully configured"), last)
+        self.assertIn("(identity token from the metadata server in ", last)
+        self.assertNotIn(
+            "print-identity-token",
+            " ".join(str(call.args[0]) for call in run.call_args_list),
+        )
+        self.assertEqual(
+            "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJhY2NvdW50cy5nb29nbGUuY29tIn0.c2lnbmF0dXJlLXNpZ25hdHVyZS1zaWduYXR1cmU", urlopen.call_args.args[0].headers["X-oidc-token"]
+        )
+
+    def test_the_metadata_request_names_the_audience_and_the_full_format(self):
+        seen = []
+
+        def fake(request, timeout=None):
+            seen.append(request)
+            raise urllib.error.URLError(ConnectionRefusedError(111, "refused"))
+
+        with patch("github_token_refresh.metadata_open", fake), patch("github_token_refresh.log"):
+            self.assertIsNone(github_token_refresh.metadata_identity_token(self.MINTY))
+        self.assertIn(f"audience={urllib.parse.quote(self.MINTY, safe='')}", seen[0].full_url)
+        self.assertIn("format=full", seen[0].full_url)
+        self.assertEqual("Google", seen[0].headers["Metadata-flavor"])
+
+    def test_the_metadata_opener_sends_nothing_through_an_http_proxy(self):
+        # The broker forwards HTTP_PROXY into this helper for its GitHub and
+        # Minty traffic; the link-local metadata address must not take it. The
+        # opener is built at import, so the module is reloaded with a proxy in
+        # the environment: the default opener then carries a ProxyHandler for
+        # it, and the metadata opener must carry none. (build_opener drops a
+        # ProxyHandler that has no proxies to handle.)
+        import importlib
+
+        def http_proxies(opener):
+            # Only the http entry: the host running the suite may carry other
+            # *_proxy variables of its own.
+            return [h.proxies.get("http") for h in opener.handlers if isinstance(h, urllib.request.ProxyHandler)]
+
+        with patch.dict(os.environ, {"http_proxy": "http://egress.invalid:3128"}):
+            try:
+                module = importlib.reload(github_token_refresh)
+                self.assertEqual(["http://egress.invalid:3128"], http_proxies(urllib.request.build_opener()))
+                self.assertEqual([], http_proxies(module.metadata_open.__self__))
+            finally:
+                importlib.reload(github_token_refresh)
+
+    @patch("github_token_refresh.log")
+    @patch("github_token_refresh.time.sleep")
+    def test_a_short_dotted_body_is_not_a_token(self, sleep, log):
+        # Three runs with two dots is not a JWT: a JWT's header is a JSON
+        # object, so it begins `eyJ`, and no segment is three characters.
+        for body in (b"x.y.z", b"1.2.3", b"ok.ok.ok", b"abcdefghij.abcdefghij.abcdefghij"):
+            with self.subTest(body=body):
+                self._urlopen([body])
+                self.assertIsNone(github_token_refresh.metadata_identity_token(self.MINTY))
+                self.assertIn("body is not a JWT", str(log.call_args.args[0]))
+        sleep.assert_not_called()
+
+    @patch("github_token_refresh.log")
+    @patch("github_token_refresh.wif_credentials.fetch_identity_token", return_value=None)
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    def test_a_configured_credential_file_keeps_the_identity_on_gcloud(self, urlopen, run, fetch, log):
+        # gcloud pointed at a key file presents that account, not the
+        # instance's; the metadata server must not outrank it.
+        urlopen.side_effect = self._urlopen([])
+
+        def fake_run(cmd, **kwargs):
+            if "print-identity-token" in cmd:
+                return MagicMock(stdout="gcloud.id.token\n")
+            return MagicMock()
+
+        run.side_effect = fake_run
+        for name in github_token_refresh.CREDENTIAL_FILE_VARIABLES:
+            with self.subTest(variable=name):
+                with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "", name: "/var/run/key.json"}):
+                    refresh_git_credentials("owner/repository")
+                self.assertEqual([], self.metadata_calls)
+                self.assertEqual("gcloud.id.token", urlopen.call_args.args[0].headers["X-oidc-token"])
+                lines = [str(call.args[0]) for call in log.call_args_list]
+                self.assertTrue(any(f"{name} names a credential file" in line for line in lines), lines)
+                self.assertIn(f"through gcloud in", lines[-1])
+                self.assertIn(f"({name} names a credential file)", lines[-1])
+                os.environ.pop(name, None)
+
+    @patch("github_token_refresh.log")
+    @patch("github_token_refresh.time.sleep")
+    def test_a_textual_error_page_is_not_a_token(self, sleep, log):
+        # Whatever answers at the address with a 200 that is not a JWT: an
+        # egress proxy's page, a captive gateway. It falls through, no retry.
+        self._urlopen([b"<html><title>403 Forbidden</title></html>"])
+        self.assertIsNone(github_token_refresh.metadata_identity_token(self.MINTY))
+        sleep.assert_not_called()
+        line = str(log.call_args.args[0])
+        self.assertIn("body is not a JWT", line)
+        self.assertIn("asking gcloud", line)
+
+    @patch("github_token_refresh.log")
+    @patch("github_token_refresh.time.sleep")
+    def test_an_attempt_that_outlives_its_bound_is_given_up_on_and_retried(self, sleep, log):
+        # A peer that is slow between socket operations (a header byte at a
+        # time, a dripping body) never trips the socket timeout; the wall-clock
+        # bound around the attempt is what ends it, as a slow answer: retried
+        # once, then given up on.
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def stuck(request, timeout=None):
+            release.wait()
+            raise urllib.error.URLError(ConnectionResetError("released"))
+
+        with patch("github_token_refresh.metadata_open", stuck), patch.object(
+            github_token_refresh, "METADATA_TIMEOUT_SECONDS", 0.05
+        ):
+            self.assertIsNone(github_token_refresh.metadata_identity_token(self.MINTY))
+        sleep.assert_called_once_with(github_token_refresh.METADATA_RETRY_DELAY_SECONDS)
+        lines = [str(call.args[0]) for call in log.call_args_list]
+        self.assertIn("attempt 1 timed out; retrying", lines[0])
+        self.assertIn("attempt still running after 0.05s", lines[-1])
+
+    def test_the_metadata_opener_follows_no_redirect(self):
+        # A 3xx from the address is an error that falls through, not a hop to
+        # somewhere else under its own timeouts.
+        opener = github_token_refresh.metadata_open.__self__
+        redirectors = [h for h in opener.handlers if isinstance(h, urllib.request.HTTPRedirectHandler)]
+        self.assertEqual(1, len(redirectors))
+        self.assertIsNone(redirectors[0].redirect_request(None, None, 302, "Found", {}, "http://elsewhere.invalid/"))
+
+    @patch("github_token_refresh.log")
+    @patch("github_token_refresh.time.sleep")
+    def test_a_token_cut_short_by_an_early_close_is_not_a_token(self, sleep, log):
+        # Content-Length 1104, 900 bytes sent, then a clean close: read1 says
+        # EOF without raising, and the cut fell inside the signature, so the
+        # shape check alone would pass it. It falls through, no retry.
+        head = "eyJ" + "a" * 20 + "." + "b" * 30 + "." + "c" * 845
+        self._urlopen([(head.encode(), 204)])
+        self.assertIsNone(github_token_refresh.metadata_identity_token(self.MINTY))
+        sleep.assert_not_called()
+        line = str(log.call_args.args[0])
+        self.assertIn("IncompleteRead", line)
+        self.assertIn("asking gcloud", line)
+
+    @patch("github_token_refresh.log")
+    @patch("github_token_refresh.time.sleep")
+    def test_a_body_larger_than_a_token_is_not_a_token(self, sleep, log):
+        self._urlopen([[b"a" * 1024] * 9])
+        self.assertIsNone(github_token_refresh.metadata_identity_token(self.MINTY))
+        sleep.assert_not_called()
+        self.assertIn("larger than a token", str(log.call_args.args[0]))
+
+    @patch("github_token_refresh.time.sleep")
+    @patch("github_token_refresh.wif_credentials.fetch_identity_token", return_value=None)
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    def test_one_slow_metadata_answer_is_retried_not_failed(self, urlopen, run, fetch, sleep):
+        # urlopen raises a bare timeout while reading and wraps one raised while
+        # connecting in URLError; both are slow answers and both are retried.
+        urlopen.side_effect = self._urlopen(
+            [urllib.error.URLError(socket.timeout("timed out")), b"eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJhY2NvdW50cy5nb29nbGUuY29tIn0.c2lnbmF0dXJlLXNpZ25hdHVyZS1zaWduYXR1cmU"]
+        )
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}, clear=False):
+            refresh_git_credentials("owner/repository")
+
+        self.assertEqual(
+            "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJhY2NvdW50cy5nb29nbGUuY29tIn0.c2lnbmF0dXJlLXNpZ25hdHVyZS1zaWduYXR1cmU", urlopen.call_args.args[0].headers["X-oidc-token"]
+        )
+        sleep.assert_called_once_with(github_token_refresh.METADATA_RETRY_DELAY_SECONDS)
+        self.assertNotIn(
+            "print-identity-token",
+            " ".join(str(call.args[0]) for call in run.call_args_list),
+        )
+
+    @patch("github_token_refresh.log")
+    @patch("github_token_refresh.time.sleep")
+    @patch("github_token_refresh.wif_credentials.fetch_identity_token", return_value=None)
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    def test_no_metadata_server_falls_through_to_gcloud_and_says_so(
+        self, urlopen, run, fetch, sleep, log
+    ):
+        refused = urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+        urlopen.side_effect = self._urlopen([refused])
+
+        def fake_run(cmd, **kwargs):
+            if "print-identity-token" in cmd:
+                return MagicMock(stdout="gcloud.id.token\n")
+            return MagicMock()
+
+        run.side_effect = fake_run
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}, clear=False):
+            refresh_git_credentials("owner/repository")
+
+        self.assertEqual(
+            "gcloud.id.token", urlopen.call_args.args[0].headers["X-oidc-token"]
+        )
+        lines = [str(call.args[0]) for call in log.call_args_list]
+        self.assertTrue(any("no identity token from the metadata server" in line and "Connection refused" in line for line in lines), lines)
+        self.assertTrue(any(line.startswith("Minted the broker OIDC token through gcloud in") for line in lines), lines)
+        # A refusal is a definite no: not retried, no pause.
+        self.assertEqual(1, len(self.metadata_calls))
+        sleep.assert_not_called()
+
+    @patch("github_token_refresh.log")
+    @patch("github_token_refresh.time.sleep")
+    @patch("github_token_refresh.wif_credentials.fetch_identity_token", return_value=None)
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    def test_an_error_status_from_the_metadata_server_falls_through_to_gcloud(
+        self, urlopen, run, fetch, sleep, log
+    ):
+        # An unannotated ServiceAccount, or a placement whose federated shape
+        # fetch_identity_token declines: the endpoint answers an error status.
+        not_found = urllib.error.HTTPError(self.METADATA, 404, "Not Found", email.message.Message(), io.BytesIO(b""))
+        urlopen.side_effect = self._urlopen([not_found])
+
+        def fake_run(cmd, **kwargs):
+            if "print-identity-token" in cmd:
+                return MagicMock(stdout="gcloud.id.token\n")
+            return MagicMock()
+
+        run.side_effect = fake_run
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}, clear=False):
+            refresh_git_credentials("owner/repository")
+
+        self.assertEqual(
+            "gcloud.id.token", urlopen.call_args.args[0].headers["X-oidc-token"]
+        )
+        lines = [str(call.args[0]) for call in log.call_args_list]
+        self.assertTrue(any("no identity token from the metadata server" in line and "404" in line for line in lines), lines)
+        sleep.assert_not_called()
+        self.assertIn("through gcloud in", lines[-1])
+        self.assertIn("(the metadata server gave none: HTTP Error 404", lines[-1])
+
+    @patch("github_token_refresh.time.sleep")
+    def test_an_empty_metadata_body_is_no_token(self, sleep):
+        self._urlopen([b"  \n"])
+        self.assertIsNone(github_token_refresh.metadata_identity_token(self.MINTY))
+        self.assertEqual(1, len(self.metadata_calls))
+        sleep.assert_not_called()
+
+    @patch("github_token_refresh.log")
+    @patch("github_token_refresh.time.sleep")
+    def test_a_bare_read_timeout_is_retried_and_an_empty_body_after_it_is_named_as_such(self, sleep, log):
+        # A timeout raised while reading arrives bare, not wrapped in URLError;
+        # it is retried like the connect shape. The empty body that follows is
+        # what the log names, not the timeout before it.
+        self._urlopen([socket.timeout("timed out"), b""])
+        self.assertIsNone(github_token_refresh.metadata_identity_token(self.MINTY))
+        self.assertEqual(2, len(self.metadata_calls))
+        sleep.assert_called_once_with(github_token_refresh.METADATA_RETRY_DELAY_SECONDS)
+        lines = [str(call.args[0]) for call in log.call_args_list]
+        self.assertIn("attempt 1 timed out; retrying", lines[0])
+        self.assertIn("empty token", lines[-1])
+        self.assertNotIn("timed out", lines[-1])
+
+    @patch("github_token_refresh.log")
+    @patch("github_token_refresh.time.sleep")
+    @patch("github_token_refresh.time.monotonic")
+    def test_a_slow_then_recovered_mint_reports_the_whole_steps_time(self, clock, sleep, log):
+        # The first attempt times out at 3 s, the retry answers in 70 ms: the
+        # line says what the step cost, not what the last attempt did.
+        # The step's start, the timeout's reason stamp, then the line.
+        clock.side_effect = _Clock([100.0, 103.0], 103.57)
+        self._urlopen([socket.timeout("timed out"), b"eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJhY2NvdW50cy5nb29nbGUuY29tIn0.c2lnbmF0dXJlLXNpZ25hdHVyZS1zaWduYXR1cmU"])
+        self.assertEqual("eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJhY2NvdW50cy5nb29nbGUuY29tIn0.c2lnbmF0dXJlLXNpZ25hdHVyZS1zaWduYXR1cmU", github_token_refresh.metadata_identity_token(self.MINTY))
+        self.assertEqual(
+            "Minted the broker OIDC token from the metadata server in 3.57s (attempt 2).",
+            str(log.call_args.args[0]),
+        )
+
+    @patch("github_token_refresh.log")
+    @patch("github_token_refresh.time.sleep")
+    def test_a_body_that_is_not_utf8_falls_through_instead_of_raising(self, sleep, log):
+        # Whatever answers in the metadata address's place (a proxy's binary
+        # error page) is not a token; it falls through to gcloud like a 404.
+        self._urlopen([b"\xff\xfe\x00binary"])
+        self.assertIsNone(github_token_refresh.metadata_identity_token(self.MINTY))
+        self.assertEqual(1, len(self.metadata_calls))
+        sleep.assert_not_called()
+        line = str(log.call_args.args[0])
+        self.assertIn("asking gcloud", line)
+        self.assertIn("codec can't decode", line)
+
+    @patch("github_token_refresh.metadata_identity_token", return_value=None)
+    @patch("github_token_refresh.wif_credentials.fetch_identity_token", return_value=None)
+    @patch("github_token_refresh.subprocess.run")
+    def test_a_gcloud_failure_names_its_stderr_and_its_timeout(self, run, fetch, metadata):
+        run.side_effect = [
+            subprocess.CalledProcessError(
+                1, ["gcloud", "auth", "print-identity-token", "--audiences=x"],
+                stderr="ERROR: Invalid account type for `--audiences`.",
+            ),
+            subprocess.TimeoutExpired(["gcloud", "auth", "print-identity-token"], 5),
+        ]
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}, clear=False):
+            with self.assertRaises(RuntimeError) as cm:
+                refresh_git_credentials("owner/repository")
+
+        message = str(cm.exception)
+        self.assertIn("Failed to retrieve Google OIDC token via gcloud", message)
+        self.assertIn("Invalid account type", message)
+        self.assertIn("timed out after 5 seconds", message)
+
+    @patch("github_token_refresh.wif_credentials.fetch_identity_token", return_value=None)
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    def test_a_gh_login_failure_keeps_what_gh_printed(self, urlopen, run, fetch):
+        urlopen.side_effect = self._urlopen([b"eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJhY2NvdW50cy5nb29nbGUuY29tIn0.c2lnbmF0dXJlLXNpZ25hdHVyZS1zaWduYXR1cmU"])
+        run.side_effect = subprocess.CalledProcessError(
+            1, ["gh", "auth", "login", "--with-token"],
+            stderr="error validating token: HTTP 401: Bad credentials",
+        )
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}, clear=False):
+            with self.assertRaises(RuntimeError) as cm:
+                refresh_git_credentials("owner/repository")
+
+        self.assertIn("Failed to configure GitHub auth in gh CLI", str(cm.exception))
+        self.assertIn("Bad credentials", str(cm.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

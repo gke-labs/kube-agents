@@ -174,7 +174,7 @@ The seeded fleet's fixture role(s) below are present but not in the state the ca
 
 {evidence}
 
-**Reconcile:** re-apply `bench/tf/fleet` in each project named (`bench/tf/fleet/README.md`, "State and reconcile"), then wait for the next hourly scan or run `python3 scripts/verify_ci_pool_project.py --project-id <project>`.
+**Reconcile:** re-apply `bench/tf/fleet` in each project named (`bench/tf/fleet/README.md`, "State and reconcile"), then wait for the next hourly scan or run `python3 scripts/verify_ci_pool_project.py --project-id <project>`. (For `stalled-controller` drift where the workload started during an in-cluster heal, re-apply plans no changes: delete the pod in `seeded-stall` and if the condition reason remains `NewReplicaSetAvailable`, replace the Deployment rather than `rollout restart`.)
 
 Incident brief: {brief}
 
