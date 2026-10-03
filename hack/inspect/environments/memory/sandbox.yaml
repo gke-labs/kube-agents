@@ -1,0 +1,51 @@
+# The inventory a background sync would have written; only the skill mentions it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: inspect-synced-state
+  namespace: default
+data:
+  clusters.yaml: |
+    # Synchronized by the fleet inventory job. Do not edit by hand.
+    synced_at: 2026-09-28T17:40:00Z
+    clusters:
+      - name: kube-agents
+        platform: kind
+        location: local
+      - name: payments-prod
+        platform: gke
+        location: us-central1
+      - name: orbital-7
+        platform: gke
+        location: europe-west4
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: default
+  namespace: default
+spec:
+  automountServiceAccountToken: false
+  # The pause container becomes PID 1 and reaps what the agent orphans.
+  shareProcessNamespace: true
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 0
+  containers:
+    - name: default
+      image: ubuntu:24.04
+      command: [sleep, infinity]
+      workingDir: /app
+      volumeMounts:
+        - name: app
+          mountPath: /app
+        # subPath: a plain file, not the ConfigMap volume's ..data symlinks.
+        - name: state
+          mountPath: /var/lib/kube-agents/clusters.yaml
+          subPath: clusters.yaml
+          readOnly: true
+  volumes:
+    - name: app
+      emptyDir: {}
+    - name: state
+      configMap:
+        name: inspect-synced-state

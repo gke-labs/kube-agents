@@ -74,6 +74,7 @@ kube-agents/
 │                                                  the published pages
 ├── examples/                                      gitops-repo template + inference/
 │                                                  integration READMEs
+├── hack/inspect/                                  Inspect harness-comparison experiment
 ├── k8s-operator/                                  operator, event watcher, Minty READMEs
 ├── scripts/                                       installer/, dev/, release/,
 │                                                  feedback_form/ and testdata/ READMEs
@@ -539,6 +540,7 @@ only what the title does not say.
 | `tests/e2e/README.md` | Component README | The pytest E2E suite for the Google Chat integration and its hybrid auth flow (service-account posting and polling with test-account fallback, via Pub/Sub event injection). | Hybrid auth, Pub/Sub injection, CI setup | CI maintainers |
 | `tests/integration/README.md` | Component README | The integration seam tier: real components wired together with the agent replaced by a fake — the contract, how to add a seam test, and what changed when the tier left probation to gate inside `PYTHON_TEST_DIRS`. | Seam tests, `make test-integration`, expectedFailure pins | Developers adding seam tests |
 | `tests/conformance/README.md` | Component README | The security-invariant conformance suite: one deterministic assertion per invariant, known violations as expected failures, three buckets by what they need. | Buckets, known violations, mutation harness, `make conformance` | Developers changing security controls |
+| `hack/inspect/**` | Component README | An experiment running the same Inspect tasks under different harnesses (Gemini CLI, Claude Code), with and without a stand-in skill; manual, no CI runs it. | Inspect tasks, model bridge, skill-vs-control comparison | Developers comparing harnesses or skills |
 
 ## 5. Keeping this map fresh
 
