@@ -511,9 +511,18 @@ Every workflow behind one of those contexts also runs for a pull request whose b
 branch, and `tests/test_merge_group_triggers.py` fails if one is filtered back to `main`. A backport
 pull request branches from `upstream/release/<X.Y>` and targets it; the release runbook in
 `scripts/release/README.md` ("Patch releases from a release line") is what happens after it merges.
-Which contexts a `release/` branch _requires_ is a repository setting like `main`'s, read back with
-the same command and the branch substituted, URL-encoded (`release%2F0.8`); no `release/` branch
-carries one today, and a line needs it before its first backport merges.
+A `release/` branch requires the same contexts, but through a ruleset rather than its branch
+protection rule, so the command above prints nothing for a line: its protection rule has no
+`required_status_checks` at all. Read a line's contexts back with the branch substituted,
+URL-encoded:
+
+```bash
+gh api repos/gke-labs/kube-agents/rules/branches/release%2F0.8 \
+  --jq '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context'
+```
+
+The runbook section above says why the two differ, which three settings carry a line's
+protection, and what has to follow when `main`'s set changes.
 
 **A green smoke run stays valid when `main` moves — usually.** Tide credits a Prow presubmit only
 against the base SHA it ran on — crier records it as a `BaseSHA:<sha>` suffix on the commit status
