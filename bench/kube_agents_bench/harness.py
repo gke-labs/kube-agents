@@ -27,6 +27,8 @@ Registration is the ``devops_bench.agents`` entry point in ``pyproject.toml``,
 so importing this module has no side effects.
 
 Environment:
+    AGENT_URL: The agent's base URL, e.g. ``http://platform-agent.kubeagents-system:8642``
+        from inside the cluster, to use instead of spawning a port-forward.
     AGENT_LOCAL_PORT: Local side of the port-forward (default ``8642``). The
         remote side is always the Service's 8642 and is not configurable.
     AGENT_API_PATH: Request path (default ``/v1/responses``).
@@ -36,6 +38,8 @@ Environment:
     AGENT_CONTAINER: Container to exec into when reading back a delegated card's
         artifacts and its workers' session stores, and when clearing its state
         (default ``platform-agent``).
+    AGENT_POD: Pod to exec into instead of the Service, e.g. the eval pod
+        the agent runs in as a sidecar.
     AGENT_MODEL_NAME: ``model`` field sent to the endpoint (default
         ``model-default``, the name the operator pins on ``/v1/models`` via
         ``API_SERVER_MODEL_NAME`` and the one LiteLLM actually serves).
@@ -465,10 +469,13 @@ def _agent_shell(script: str, timeout: float) -> str:
     Best effort: a missing binary, an unreachable cluster or a non-zero exit all
     return ``""``, because neither caller is worth failing a run over.
     """
+    pod = os.environ.get("AGENT_POD")
+    target, *flags = _kubectl_target()
     cmd = [
         "kubectl",
         "exec",
-        *_kubectl_target(),
+        f"pod/{pod}" if pod else target,
+        *flags,
         "-c",
         os.environ.get("AGENT_CONTAINER", "platform-agent"),
         "--",
@@ -631,7 +638,7 @@ _TOTAL_BUCKETS = ("input", "cached", "cache_write", "output")
 def _canonical_session_tokens(
     tokens: dict[str, Any],
     session_id: str,
-    local_port: int,
+    base_url: str,
     headers: dict[str, str],
     timeout: float,
 ) -> None:
@@ -644,7 +651,7 @@ def _canonical_session_tokens(
     """
     quoted = urllib.parse.quote(session_id, safe="")
     probe = urllib.request.Request(
-        f"http://127.0.0.1:{local_port}/api/sessions/{quoted}", headers=headers, method="GET"
+        f"{base_url}/api/sessions/{quoted}", headers=headers, method="GET"
     )
     try:
         with _OPENER.open(probe, timeout=timeout) as response:
@@ -1429,6 +1436,8 @@ class KubeAgentsHarness(AgentHarness):
             worker_commands=result.metadata.get("worker_commands"),
             worker_capture_gaps=worker_trajectory.gaps(result.metadata.get("worker_trajectory")),
         )
+        if out := os.environ.get("BENCH_OUTPUT_DIR"):
+            transcript.dump(Path(out) / "trajectory.json", prompt)
         return result
 
     def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
@@ -1469,8 +1478,10 @@ class KubeAgentsHarness(AgentHarness):
         # which repetition voting cannot absorb. INFRA instead drops the
         # repetition from the denominator, the class terminal 429s join
         # via #1095's _RETRYABLE_STATUSES entry.
+        base_url = os.environ.get("AGENT_URL", "").rstrip("/")
+        own_tunnel = not base_url
         transport_failures = 0
-        while True:
+        while own_tunnel:
             try:
                 _ensure_port_forward(local_port)
                 break
@@ -1493,7 +1504,8 @@ class KubeAgentsHarness(AgentHarness):
 
         # 127.0.0.1 rather than localhost, matching _port_open's probe host: a
         # v4/v6 mismatch would make the probe and the request disagree.
-        url = f"http://127.0.0.1:{local_port}{api_path}"
+        base_url = base_url or f"http://127.0.0.1:{local_port}"
+        url = f"{base_url}{api_path}"
         headers = {"Content-Type": "application/json"}
         token = os.environ.get("PLATFORM_AGENT_TOKEN")
         if token:
@@ -1506,6 +1518,10 @@ class KubeAgentsHarness(AgentHarness):
             "conversation": _run_id(),
             "input": prompt,
         }
+
+        def _respawn_tunnel() -> None:
+            if own_tunnel:
+                _reset_port_forward(local_port)
 
         # Same shape as the status-turn retry in _await_delegated_work: count
         # the transport failures, log each one against the ceiling, respawn the
@@ -1543,7 +1559,7 @@ class KubeAgentsHarness(AgentHarness):
                         f"tunnel log: {_tail(_pf_log_path(local_port))}"
                     )
                 try:
-                    _reset_port_forward(local_port)
+                    _respawn_tunnel()
                 except RuntimeError as pf_exc:
                     # Counted, not returned: a forward that will not come back
                     # is the same outage, and the loop's own ceiling ends it.
@@ -1553,9 +1569,6 @@ class KubeAgentsHarness(AgentHarness):
 
             def _status_turn(poll: str, turn_timeout: float) -> tuple[AgentResult, str]:
                 return _post_turn(url, {**body, "input": poll}, headers, turn_timeout)
-
-            def _respawn_tunnel() -> None:
-                _reset_port_forward(local_port)
 
             try:
                 session_id = (
@@ -1595,7 +1608,7 @@ class KubeAgentsHarness(AgentHarness):
             _canonical_session_tokens(
                 result.tokens,
                 session_id,
-                local_port,
+                base_url,
                 headers,
                 min(timeout, _SESSION_LOOKUP_TIMEOUT),
             )
