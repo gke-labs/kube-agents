@@ -12,7 +12,9 @@
 #   1. The fixture. seeded-token (role declared-token-workload,
 #      bench/tf/fleet/fixtures.json): token-reader and token-sidecar, one
 #      replica each on the namespace's default ServiceAccount with the token
-#      mounted, behind a default-deny policy so neither trips 2.6.
+#      mounted, behind a default-deny policy and at the restricted profile's
+#      container settings, so 2.7 is the only check that names them: the
+#      first objective forbids the declared workload's object in every id.
 #   2. The declaration. knowledge/notification-relay-no-pdb.md in each pool
 #      project's GitOps repo (gke-agentic/<project>-infra), whose `declares:`
 #      frontmatter carries {check: default-sa-automount, namespace:
