@@ -2,10 +2,12 @@
 """
 upgrade_readiness.py — the rules behind `fleet_upgrade_report.py --readiness`.
 
-Pure functions over data the report script has already read: the PodDisruptionBudgets
-and workloads of one cluster, its `maintenancePolicy`, and its node-pool versions. Nothing
+Pure functions over data the report script has already read: the PodDisruptionBudgets,
+workloads, webhook configurations and EndpointSlices of one cluster, its
+`maintenancePolicy`, and its node-pool versions. Nothing
 here runs a command or touches a clock; the caller passes the instant to evaluate at. The
-three rules are the ones the governance SOPs define in prose:
+first three rules are the ones the governance SOPs define in prose; the fourth has no SOP
+check yet and is stated here:
 
 - a drain-blocking PDB, `obtainability_audit_sop.md` §3.4: `maxUnavailable` 0 or `0%`, or
   `minAvailable` at or above the matched workloads' replica total (an integer, or a
@@ -14,7 +16,13 @@ three rules are the ones the governance SOPs define in prose:
   `security_patch_orchestrator_sop.md` §3.8, and the maintenance window's state at the
   instant, §3.7;
 - node-pool version skew against the target control plane, §3.2: more than two minors, or
-  a different major, blocks the control-plane upgrade until the pool moves.
+  a different major, blocks the control-plane upgrade until the pool moves;
+- a fail-closed admission webhook whose backend the API server cannot reach (no Service,
+  no Service port for the webhook's port, or no ready endpoint behind that port), graded
+  on its rules: one that can match what a node upgrade needs (the replacement pods'
+  create, binding and status, the old pods' deletion, the eviction, the nodes' create,
+  cordon, status and deletion, the kubelet's lease) breaks the upgrade; one that matches none of those is a current outage for what it does match
+  and is reported, not graded.
 """
 
 import re
@@ -123,6 +131,56 @@ SKEW_NOT_APPLICABLE = "n/a"
 SKEW_AUTOPILOT_REASON = "Autopilot: Google owns the node pools"
 SKEW_NO_TARGET_REASON = "no target to measure against"
 SKEW_MAJOR_DIFFERS = "major version differs from the target"
+
+# Fail-closed webhooks. admissionregistration.k8s.io/v1 defaults `failurePolicy` to Fail,
+# so an absent field grades as Fail. Only a webhook whose backend is a Service in the
+# cluster is graded: a URL backend is outside what the read can see, so it is counted in
+# the JSON (GKE installs two of its own on every cluster, so a note would say nothing).
+WEBHOOK_CONFIG_KINDS = ("ValidatingWebhookConfiguration", "MutatingWebhookConfiguration")
+SERVICE_KIND = "Service"
+ENDPOINTSLICE_KIND = "EndpointSlice"
+SERVICE_NAME_LABEL = "kubernetes.io/service-name"
+FAILURE_POLICY_FAIL = "Fail"
+# The API server resolves a webhook's Service the same way for either routing mode: the
+# Service must exist and carry a port equal to `clientConfig.service.port` (443 when
+# unset); endpoint routing then picks a ready endpoint from the EndpointSlices whose port
+# carries that Service port's name. An endpoint with no `ready` condition counts as ready,
+# as the EndpointSlice API says a consumer must assume.
+DEFAULT_WEBHOOK_PORT = 443
+BACKEND_NO_SERVICE = "Service {service} does not exist"
+BACKEND_NO_PORT = "Service {service} has no port {port}"
+BACKEND_NO_ENDPOINTS = "Service {service} has no ready endpoints on port {port}"
+# What a node upgrade needs admitted, as (API group, resource, operation, scope). For the
+# pods: the replacement created, bound by the scheduler (`pods/binding`), its status written
+# by the kubelet (`pods/status`), and the old pod deleted once it terminates. The eviction the
+# drain issues. For the nodes: the new one registering and reporting status, the old one
+# cordoned and then deleted. The kubelet's heartbeat lease, created and renewed. A rule that
+# can match any of these puts the webhook in the upgrade's path. `namespaceSelector`, `objectSelector` and
+# `matchConditions` are not evaluated: a webhook they narrow is still reported as able to
+# match, which errs toward naming it.
+SCOPE_NAMESPACED = "Namespaced"
+SCOPE_CLUSTER = "Cluster"
+SCOPE_ANY = "*"
+WILDCARD = "*"
+ALL_RESOURCES_AND_SUBRESOURCES = "*/*"
+UPGRADE_PATH_TARGETS = (
+    ("", "pods", "CREATE", SCOPE_NAMESPACED),
+    ("", "pods/binding", "CREATE", SCOPE_NAMESPACED),
+    ("", "pods/status", "UPDATE", SCOPE_NAMESPACED),
+    ("", "pods", "DELETE", SCOPE_NAMESPACED),
+    ("", "pods/eviction", "CREATE", SCOPE_NAMESPACED),
+    ("", "nodes", "CREATE", SCOPE_CLUSTER),
+    ("", "nodes", "UPDATE", SCOPE_CLUSTER),
+    ("", "nodes/status", "UPDATE", SCOPE_CLUSTER),
+    ("", "nodes", "DELETE", SCOPE_CLUSTER),
+    ("coordination.k8s.io", "leases", "CREATE", SCOPE_NAMESPACED),
+    ("coordination.k8s.io", "leases", "UPDATE", SCOPE_NAMESPACED),
+)
+UPGRADE_PATH_LABEL = "{operation} {resource}"
+WEBHOOK_NAME_FORMAT = "{config}/{webhook}"
+WEBHOOK_SERVICE_FORMAT = "{namespace}/{name}"
+WEBHOOK_FINDING_FORMAT = "{webhook} ({config_kind}): failurePolicy Fail and {reason}; matches {matches}"
+WEBHOOK_OUTAGE_MATCHES = "nothing a node upgrade needs, so it fails its own requests now without breaking the upgrade"
 
 
 # ---------------------------------------------------------------------------- PDBs
@@ -578,14 +636,155 @@ def evaluate_skew(target, pools: list[dict], autopilot: bool) -> dict:
     }
 
 
+# ---------------------------------------------------------------------- webhooks
+
+
+def split_webhook_items(items: list) -> tuple[list[dict], list[dict], list[dict]]:
+    """(webhook configurations, Services, EndpointSlices) from a mixed `items` list."""
+    configs, services, slices = [], [], []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("kind")
+        if kind in WEBHOOK_CONFIG_KINDS:
+            configs.append(item)
+        elif kind == SERVICE_KIND:
+            services.append(item)
+        elif kind == ENDPOINTSLICE_KIND:
+            slices.append(item)
+    return configs, services, slices
+
+
+def _named(items: list[dict], namespace: str, name: str) -> dict | None:
+    for item in items:
+        meta = item.get("metadata") or {}
+        if meta.get("namespace") == namespace and meta.get("name") == name:
+            return item
+    return None
+
+
+def backend_problem(service_ref: dict, services: list[dict], slices: list[dict]) -> str | None:
+    """Why the API server cannot reach this webhook's Service, or None when it can.
+
+    The Service must exist and carry a port equal to the webhook's port; the ready count is
+    over the endpoints of the Service's EndpointSlices whose port has that Service port's
+    name (an unnamed single port matches an unnamed slice port)."""
+    namespace, name = service_ref.get("namespace", ""), service_ref.get("name", "")
+    label = WEBHOOK_SERVICE_FORMAT.format(namespace=namespace, name=name)
+    port = service_ref.get("port") or DEFAULT_WEBHOOK_PORT
+    service = _named(services, namespace, name)
+    if service is None:
+        return BACKEND_NO_SERVICE.format(service=label)
+    service_ports = [p for p in (service.get("spec") or {}).get("ports") or [] if isinstance(p, dict) and p.get("port") == port]
+    if not service_ports:
+        return BACKEND_NO_PORT.format(service=label, port=port)
+    port_name = service_ports[0].get("name") or ""
+    ready = 0
+    for slice_ in slices:
+        meta = slice_.get("metadata") or {}
+        if meta.get("namespace") != namespace or (meta.get("labels") or {}).get(SERVICE_NAME_LABEL) != name:
+            continue
+        if not any(isinstance(p, dict) and (p.get("name") or "") == port_name for p in slice_.get("ports") or []):
+            continue
+        for endpoint in slice_.get("endpoints") or []:
+            if isinstance(endpoint, dict) and (endpoint.get("conditions") or {}).get("ready") is not False:
+                ready += 1
+    if not ready:
+        return BACKEND_NO_ENDPOINTS.format(service=label, port=port)
+    return None
+
+
+def _resource_matches(spec: str, target: str) -> bool:
+    """RuleWithOperations `resources` semantics: `*` is every resource but no subresource,
+    `*/*` every resource and subresource, `pods/*` every subresource of pods."""
+    if spec == ALL_RESOURCES_AND_SUBRESOURCES:
+        return True
+    resource, _, sub = target.partition("/")
+    spec_resource, slash, spec_sub = spec.partition("/")
+    if spec_resource not in (resource, WILDCARD):
+        return False
+    if not sub:
+        return not slash
+    return bool(slash) and spec_sub in (sub, WILDCARD)
+
+
+def upgrade_path_matches(hook: dict) -> list[str]:
+    """The operations a node upgrade needs that this webhook's rules can match, as labels."""
+    matched = []
+    for group, resource, operation, scope in UPGRADE_PATH_TARGETS:
+        for rule in hook.get("rules") or []:
+            if not isinstance(rule, dict):
+                continue
+            rule_scope = rule.get("scope") or SCOPE_ANY
+            if rule_scope not in (SCOPE_ANY, scope):
+                continue
+            if not ({WILDCARD, group} & set(rule.get("apiGroups") or [])):
+                continue
+            if not ({WILDCARD, operation} & set(rule.get("operations") or [])):
+                continue
+            if not any(isinstance(spec, str) and _resource_matches(spec, resource) for spec in rule.get("resources") or []):
+                continue
+            matched.append(UPGRADE_PATH_LABEL.format(operation=operation, resource=resource))
+            break
+    return matched
+
+
+def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]) -> dict:
+    """Fail-closed webhooks whose backend is unreachable, split by whether they break an upgrade.
+
+    `blocking`: the webhook's rules can match an operation a node upgrade needs, so the
+    upgrade cannot complete cleanly while its backend is down (replacement pods refused,
+    the eviction or the cordon refused, the new node unable to register or heartbeat).
+    `outage`: the backend is unreachable but the rules match none of those; its requests
+    fail now and the member is not graded on it. Fail-open webhooks are counted
+    (`fail_open`), and so are fail-closed webhooks with a URL backend (`url_backends`),
+    which nothing read here can check.
+    """
+    result = {"blocking": [], "outage": [], "evaluated": 0, "fail_open": 0, "url_backends": 0}
+    for config in configs:
+        config_kind = config.get("kind")
+        config_name = (config.get("metadata") or {}).get("name", "")
+        for hook in config.get("webhooks") or []:
+            if not isinstance(hook, dict):
+                continue
+            if hook.get("failurePolicy", FAILURE_POLICY_FAIL) != FAILURE_POLICY_FAIL:
+                result["fail_open"] += 1
+                continue
+            service_ref = (hook.get("clientConfig") or {}).get("service")
+            if not isinstance(service_ref, dict):
+                result["url_backends"] += 1
+                continue
+            result["evaluated"] += 1
+            reason = backend_problem(service_ref, services, slices)
+            if reason is None:
+                continue
+            matches = upgrade_path_matches(hook)
+            finding = {
+                "webhook": WEBHOOK_NAME_FORMAT.format(config=config_name, webhook=hook.get("name", "")),
+                "config_kind": config_kind,
+                "config": config_name,
+                "name": hook.get("name", ""),
+                "service": WEBHOOK_SERVICE_FORMAT.format(namespace=service_ref.get("namespace", ""), name=service_ref.get("name", "")),
+                "reason": reason,
+                "upgrade_path": matches,
+            }
+            result["blocking" if matches else "outage"].append(finding)
+    return result
+
+
+def describe_webhook_finding(finding: dict) -> str:
+    matches = LIST_SEPARATOR.join(finding["upgrade_path"]) if finding["upgrade_path"] else WEBHOOK_OUTAGE_MATCHES
+    return WEBHOOK_FINDING_FORMAT.format(webhook=finding["webhook"], config_kind=finding["config_kind"], reason=finding["reason"], matches=matches)
+
+
 # ------------------------------------------------------------------------- verdict
 
 
-def readiness_status(pdbs: dict | None, maintenance: dict, skew: dict, target_known: bool) -> str:
+def readiness_status(pdbs: dict | None, webhooks: dict | None, maintenance: dict, skew: dict, target_known: bool) -> str:
     """`blocked` beats `unknown` beats `ready`: a definite blocker is reported whatever else
     could not be evaluated, and a member is `ready` only when every rule was evaluated."""
-    if (pdbs and pdbs["blocking"]) or maintenance["blocking_exclusions"] or skew["blocking"]:
+    if (pdbs and pdbs["blocking"]) or (webhooks and webhooks["blocking"]) or maintenance["blocking_exclusions"] or skew["blocking"]:
         return READINESS_BLOCKED
-    if pdbs is None or not target_known or maintenance["undecided_exclusions"] or skew["unknown"]:
+    if pdbs is None or webhooks is None or not target_known or maintenance["undecided_exclusions"] or skew["unknown"]:
         return READINESS_UNKNOWN
     return READINESS_READY

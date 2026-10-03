@@ -1,6 +1,6 @@
 ---
 name: fleet-upgrade-verification
-description: Reports every GKE cluster's control-plane and node-pool versions against a target version or each cluster's release-channel default, naming the members that lag and by how many minors; run again during a rollout, it shows which members started, completed or stalled since the previous run; with --readiness, it also grades each member on what would stop the upgrade, naming drain-blocking PodDisruptionBudgets, maintenance exclusions and windows, and node-pool version skew. Scans the linked GitOps repositories' manifests for apiVersions the target removes, with each hit's replacement. Read-only against GCP, the clusters and Git, from gcloud container, kubectl get and repository reads, keeping only its own record of each run and per-member kubeconfig files; the executed counterpart to gke-upgrades' advice.
+description: Reports every GKE cluster's control-plane and node-pool versions against a target version or each cluster's release-channel default, naming the members that lag and by how many minors; run again during a rollout, it shows which members started, completed or stalled since the previous run; with --readiness, it also grades each member on what would stop the upgrade, naming drain-blocking PodDisruptionBudgets, fail-closed admission webhooks in the upgrade's path with an unreachable backend, maintenance exclusions and windows, and node-pool version skew. Scans the linked GitOps repositories' manifests for apiVersions the target removes, with each hit's replacement. Read-only against GCP, the clusters and Git, from gcloud container, kubectl get and repository reads, keeping only its own record of each run and per-member kubeconfig files; the executed counterpart to gke-upgrades' advice.
 ---
 
 # Fleet upgrade verification
@@ -13,8 +13,9 @@ fleet is from a release-channel default, or whether the repositories are ready f
 version. Run the version report again during a rollout and it also says, per member, what changed
 since the previous run and which members have stopped moving (see "Track a rollout across runs").
 With `--readiness` it also says, per member, what would stop the upgrade: a PodDisruptionBudget
-that blocks every node drain, a maintenance exclusion or window, or node pools too far below the
-target (see "Check upgrade readiness"). For upgrade plans, runbooks and checklists, use the
+that blocks every node drain, a fail-closed admission webhook in the upgrade's path whose
+backend is unreachable, a maintenance exclusion or window, or node pools too far below the target
+(see "Check upgrade readiness"). For upgrade plans, runbooks and checklists, use the
 `gke-upgrades` skill; it links back here when the question is one these two scripts answer.
 
 "Version skew" here is the gap between a member's versions and the target. It is not
@@ -47,7 +48,7 @@ Neither reads versions against a target.
 
 The script runs `gcloud container clusters list`, `gcloud container get-server-config` and
 `gcloud config get-value project`, each with a 60-second timeout, and with `--readiness` one
-`gcloud container clusters get-credentials` and one `kubectl get` per member. It changes nothing
+`gcloud container clusters get-credentials` and two `kubectl get` per member. It changes nothing
 in GCP or in any cluster; the only things it writes are its own record under
 `/opt/data/state/fleet-upgrade-verification/`, the per-member kubeconfig files `--readiness`
 needs, and the `--output` file. A failed or timed-out read is listed under the table and sets
@@ -137,9 +138,9 @@ members missing this run.
 `--readiness` adds a second table after the version table, one row per member, graded against
 the same target as the member's version row, and a `readiness` object per member in the JSON
 (`members[].readiness`, with a top-level `readiness` block holding the instant evaluated and a
-count per verdict). Without the flag nothing changes. Three rules, each derived from a governance
-SOP check and named beside it; the maintenance rule departs from its SOP where the two differ,
-and says so below:
+count per verdict). Without the flag nothing changes. The rules below each name the governance
+SOP check they derive from, except the webhook rule, which has no SOP check yet; the maintenance
+rule departs from its SOP where the two differ, and says so:
 
 - **Drain-blocking PDBs** (`obtainability_audit_sop.md` §3.4). For each member the script runs
   `gcloud container clusters get-credentials` into a kubeconfig of its own under
@@ -162,6 +163,27 @@ and says so below:
   does not include (a bare ReplicaSet, a custom controller), which is noted so it is never
   silently `ready`. DaemonSets are never matched: a drain deletes their pods rather than evicting
   them.
+- **Fail-closed webhooks**, from a second read with the same kubeconfig: `kubectl get
+validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices -A -o json`.
+  It is a read of its own so that a failure there grades only this rule `unknown` and never costs
+  the PDB result. A webhook is graded when its `failurePolicy` is `Fail` (or absent, which
+  `admissionregistration.k8s.io/v1` defaults to `Fail`) and its backend is a Service the API
+  server cannot reach: the Service does not exist, no Service port equals the webhook's port (443
+  when unset), or no ready endpoint sits behind that port in the Service's EndpointSlices (an
+  endpoint without a `ready` condition counts as ready, as the API requires). Such a webhook
+  rejects every request its rules match, and what it matches decides the grade. When a rule can
+  match something a node upgrade needs — the replacement pods' creation, scheduling (`pods/binding`) and status, the old pods' deletion, the eviction the drain issues, the nodes' registration, cordon, status and deletion, the kubelet's lease — the
+  member is `blocked`: the workloads it gates lose their pods on the drain and cannot get them
+  back, a budget over one of them also stalls the drain, and a gate on evictions or nodes stops
+  the drain itself. When no rule matches any of those, the webhook is still a current outage for
+  what it does match and the cell names it, but it does not grade the member. Rules are matched on
+  API group, operation, resource (with the API's `*`, `*/*` and `pods/*` semantics) and scope;
+  `namespaceSelector`, `objectSelector` and `matchConditions` are not evaluated, so a webhook they
+  narrow is reported as able to match. The cell names the configuration, the webhook, the reason
+  and what it matches; each JSON finding carries `reason` and `upgrade_path`,
+  split into `blocking` and `outage`. A fail-closed webhook with a URL backend is counted in the
+  JSON (`url_backends`) and never graded, because nothing read here says whether the URL answers;
+  GKE installs two on every cluster. Fail-open webhooks are counted in the JSON (`fail_open`).
 - **Maintenance** (`security_patch_orchestrator_sop.md` §3.7 and §3.8), evaluated at `--at`, an
   RFC 3339 instant, by default now. An exclusion in effect blocks when its scope covers the upgrade
   the target needs: `NO_UPGRADES` (the default when the record carries no scope) always;
@@ -256,7 +278,10 @@ as one that is stuck, and the elapsed time is what lets the user tell them apart
 baseline line means there is nothing to compare yet; say when to run again. When the run printed
 a readiness table, paste it too and name each `blocked` member with what blocks it as the table
 states it: the PDB by `namespace/name` with its field and workload, the exclusion by name with
-its scope and end time and that it holds back automatic upgrades only, the pool with its skew.
+its scope and end time and that it holds back automatic upgrades only, the webhook as
+`configuration/webhook` with its configuration kind, why its backend is unreachable and what it
+matches, the pool with its skew. A webhook the cell lists as matching nothing a node upgrade
+needs is an outage to report, not a blocker.
 Say what the operator has to change before the upgrade can proceed; do not change it, and do not
 propose deleting an exclusion. When the question is a target version's readiness, paste each
 repository's deprecation section too, with its source line, and state the floor and target the

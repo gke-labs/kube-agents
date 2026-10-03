@@ -168,6 +168,11 @@ KNOWN_UNREGISTERED = {
 # the issue; the entry goes when the fixture lands and the case moves to the
 # nightly file in the same pull request.
 FIXTURE_NOT_READY = {
+    "upgrades-fleet-readiness-failclosed-webhook": (
+        "#1826: the readiness-failclosed-webhook role on slot b (a fail-closed webhook "
+        "whose Service does not exist); bench/tf/fleet on main does not plant it until "
+        "that change merges and the pool projects are re-applied"
+    ),
     "b-0011-gitops": (
         "#1307: the GitOps fix-cycle pilot; needs a leaderboard GitOps repository "
         "and its credentials in the pool projects (the case takes the repository, "

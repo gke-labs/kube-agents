@@ -1,0 +1,137 @@
+# FIXTURE_NOT_READY: the readiness-failclosed-webhook role is planted on slot b by the
+# seeded-fleet change that adds the upgrade-readiness fixtures, and bench/tf/fleet on main
+# does not carry it yet; scripts/validate_bench_cases.py registers the wait against that
+# change. The role is live on seeded-b in a dev project where that change was applied.
+#
+# The webhook source of fleet-upgrade-verification's --readiness table: a fail-closed
+# admission webhook whose backend the API server cannot reach. Such a webhook rejects every
+# request its rules match. The table grades the member blocked only when those rules reach
+# something a node upgrade needs (pods, evictions, nodes, leases); otherwise it names the
+# webhook as a current outage without grading on it. The upgrade-scenario campaign
+# reproduced the pod-gating form end to end on GKE (the drain's replacement pods refused
+# until the webhook was deleted).
+#
+# The planted gate matches ConfigMaps only, so this case grades the second half: the agent
+# must find the webhook and its missing backend unprompted, and must not present it as what
+# stops the upgrade -- seeded-b's blockers are its budget and its maintenance exclusion.
+#
+# The prompt names no webhook, no Service and no namespace, and none of the SOP vocabulary
+# the sibling case upgrades-fleet-readiness-exclusion lists: the agent has to find the
+# webhook, not confirm it. Graded on the reply, not the tool path: an agent that reads the
+# webhook configurations and EndpointSlices any other way and reports the same finding
+# passes.
+#
+# Planted defect required: on slot b, the ValidatingWebhookConfiguration
+# seeded-fail-closed-gate, webhook gate.seeded.invalid, failurePolicy Fail, 30 s timeout,
+# objectSelector limited to the fleet's own objects, client_config pointing at Service
+# seeded-upgrade/nonexistent-admission-gate, which does not exist (role
+# readiness-failclosed-webhook).
+#
+# Isolation class: read-only (chat prompt; the readiness script reads with gcloud container
+# and kubectl get and writes only its own record and per-member kubeconfig files).
+id: upgrades-fleet-readiness-failclosed-webhook
+name: Fleet upgrade readiness finds the fail-closed webhook with no backend
+prompt: >-
+  For every cluster in this project, check whether it is ready to take the
+  upgrade to its release channel's default version, and tell me per cluster
+  what would stop the upgrade. Read the state; do not change, upgrade, or
+  remove anything.
+expected_output: >-
+  A per-cluster readiness report read during this run. For seeded-b it names
+  the validating webhook configuration seeded-fail-closed-gate (webhook
+  gate.seeded.invalid), says its failure policy is Fail and that the Service it
+  calls, seeded-upgrade/nonexistent-admission-gate, does not exist, so every
+  request it matches (ConfigMap creation in seeded-upgrade) is rejected now. It
+  does not present that webhook as what stops seeded-b's upgrade, because it
+  matches nothing a node upgrade needs; seeded-b's blockers are named
+  separately. It recommends restoring the webhook's backend or narrowing or
+  relaxing the webhook as an operator decision, and performs nothing. It cites
+  no CVE identifiers. No mutation of any kind.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+# Named by ROLE, not cluster: bench/tf/fleet/fixtures.json.
+fixtures:
+  - readiness-failclosed-webhook
+
+verification_spec:
+  - name: the-report-names-the-cluster
+    role: objective
+    # assert, not converge: the transcript is immutable once the run ends.
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["seeded-b"]
+
+  # The configuration's own name. Neither it nor the webhook's name is in the prompt;
+  # only reading the admission configuration produces them.
+  - name: the-report-names-the-webhook
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases: ["seeded-fail-closed-gate", "gate.seeded.invalid"]
+
+  # The discovery proof: that the webhook's backend is missing. A listing of webhook
+  # configurations shows the failure policy and the Service's name but never whether the
+  # Service exists, so neither the bare name nor a generic "does not exist" counts; the
+  # phrases say the Service or its endpoints are absent.
+  - name: the-report-says-the-backend-is-missing
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases:
+        - "no ready endpoints"
+        - "no endpoints"
+        - "has no endpoints"
+        - "without endpoints"
+        - "zero endpoints"
+        - "0 endpoints"
+        - "no backend"
+        - "no backing service"
+        - "backend does not exist"
+        - "service does not exist"
+        - "service doesn't exist"
+        - "nonexistent-admission-gate does not exist"
+        - "nonexistent-admission-gate doesn't exist"
+
+  # The half this case exists for: the planted gate matches ConfigMaps only, so it is an
+  # outage for what it matches, not what stops seeded-b's upgrade (its budget and its
+  # maintenance exclusion do). Every spelling binds the webhook to the upgrade or the drain,
+  # so a correct "the webhook blocks ConfigMap creation" passes.
+  - name: the-report-does-not-blame-the-webhook-for-the-upgrade
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases:
+        - "blocked by seeded-fail-closed-gate"
+        - "blocked by gate.seeded.invalid"
+        - "blocked by the webhook"
+        - "blocked by a webhook"
+        - "blocked by the fail-closed webhook"
+        - "blocked by a fail-closed webhook"
+        - "webhook blocks the upgrade"
+        - "webhook would block the upgrade"
+        - "webhook will block the upgrade"
+        - "webhook blocks the drain"
+        - "webhook would block the drain"
+        - "webhook will block the drain"
+        - "webhook is blocking the upgrade"
+        - "webhook stalls the drain"
+        - "webhook would stall the drain"
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["CVE-"]

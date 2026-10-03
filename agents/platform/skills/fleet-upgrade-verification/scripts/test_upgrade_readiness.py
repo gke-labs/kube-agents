@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for upgrade_readiness.py: the PDB, maintenance and skew rules on canned objects."""
+"""Unit tests for upgrade_readiness.py: the PDB, webhook, maintenance and skew rules on canned objects."""
 
 import os
 import sys
@@ -379,19 +379,168 @@ class SkewTest(unittest.TestCase):
 class VerdictTest(unittest.TestCase):
     CLEAR = {"blocking_exclusions": [], "undecided_exclusions": []}
     NO_SKEW = {"blocking": [], "unknown": []}
+    NO_WEBHOOKS = {"blocking": []}
 
     def test_ready_needs_every_rule_evaluated(self):
         pdbs = {"blocking": []}
-        self.assertEqual(r.readiness_status(pdbs, self.CLEAR, self.NO_SKEW, True), "ready")
-        self.assertEqual(r.readiness_status(None, self.CLEAR, self.NO_SKEW, True), "unknown")
-        self.assertEqual(r.readiness_status(pdbs, self.CLEAR, self.NO_SKEW, False), "unknown")
-        self.assertEqual(r.readiness_status(pdbs, {"blocking_exclusions": [], "undecided_exclusions": ["x"]}, self.NO_SKEW, True), "unknown")
-        self.assertEqual(r.readiness_status(pdbs, self.CLEAR, {"blocking": [], "unknown": ["p"]}, True), "unknown")
+        self.assertEqual(r.readiness_status(pdbs, self.NO_WEBHOOKS, self.CLEAR, self.NO_SKEW, True), "ready")
+        self.assertEqual(r.readiness_status(None, None, self.CLEAR, self.NO_SKEW, True), "unknown")
+        self.assertEqual(r.readiness_status(pdbs, None, self.CLEAR, self.NO_SKEW, True), "unknown")
+        self.assertEqual(r.readiness_status(pdbs, self.NO_WEBHOOKS, self.CLEAR, self.NO_SKEW, False), "unknown")
+        self.assertEqual(r.readiness_status(pdbs, self.NO_WEBHOOKS, {"blocking_exclusions": [], "undecided_exclusions": ["x"]}, self.NO_SKEW, True), "unknown")
+        self.assertEqual(r.readiness_status(pdbs, self.NO_WEBHOOKS, self.CLEAR, {"blocking": [], "unknown": ["p"]}, True), "unknown")
 
     def test_blocked_beats_unknown(self):
-        self.assertEqual(r.readiness_status({"blocking": [{"pdb": "a/b"}]}, self.CLEAR, self.NO_SKEW, False), "blocked")
-        self.assertEqual(r.readiness_status(None, {"blocking_exclusions": ["x"], "undecided_exclusions": []}, self.NO_SKEW, True), "blocked")
-        self.assertEqual(r.readiness_status(None, self.CLEAR, {"blocking": ["p"], "unknown": []}, True), "blocked")
+        self.assertEqual(r.readiness_status({"blocking": [{"pdb": "a/b"}]}, self.NO_WEBHOOKS, self.CLEAR, self.NO_SKEW, False), "blocked")
+        self.assertEqual(r.readiness_status(None, None, {"blocking_exclusions": ["x"], "undecided_exclusions": []}, self.NO_SKEW, True), "blocked")
+        self.assertEqual(r.readiness_status(None, None, self.CLEAR, {"blocking": ["p"], "unknown": []}, True), "blocked")
+        self.assertEqual(r.readiness_status({"blocking": []}, {"blocking": [{"webhook": "g/h"}]}, self.CLEAR, self.NO_SKEW, False), "blocked")
+
+
+def webhook_config(kind, name, hooks):
+    return {"kind": kind, "metadata": {"name": name}, "webhooks": hooks}
+
+
+def rule(resources, operations=("CREATE",), groups=("",), scope=None):
+    record = {"apiGroups": list(groups), "apiVersions": ["*"], "operations": list(operations), "resources": list(resources)}
+    if scope is not None:
+        record["scope"] = scope
+    return record
+
+
+def hook(name, rules, policy=None, service=("scen", "gate-svc"), port=None, url=None):
+    record = {"name": name, "rules": rules, "clientConfig": {}}
+    if policy is not None:
+        record["failurePolicy"] = policy
+    if url is not None:
+        record["clientConfig"]["url"] = url
+    elif service is not None:
+        record["clientConfig"]["service"] = {"namespace": service[0], "name": service[1]}
+        if port is not None:
+            record["clientConfig"]["service"]["port"] = port
+    return record
+
+
+def service(namespace, name, ports=((443, "https"),)):
+    return {"kind": "Service", "metadata": {"namespace": namespace, "name": name}, "spec": {"ports": [{"port": p, "name": n} for p, n in ports]}}
+
+
+def endpoint_slice(namespace, svc, ready_flags, port_name="https"):
+    return {
+        "kind": "EndpointSlice",
+        "metadata": {"namespace": namespace, "name": f"{svc}-abc", "labels": {"kubernetes.io/service-name": svc}},
+        "ports": [{"name": port_name, "port": 8443}],
+        "endpoints": [{"conditions": {} if flag is None else {"ready": flag}} for flag in ready_flags],
+    }
+
+
+POD_GATE = [rule(["pods"])]
+LIVE = [service("scen", "gate-svc")], [endpoint_slice("scen", "gate-svc", [True])]
+
+
+def grade(hooks, services=(), slices=(), kind="ValidatingWebhookConfiguration"):
+    return r.grade_webhooks([webhook_config(kind, "gate", hooks)], list(services), list(slices))
+
+
+class WebhookBackendTest(unittest.TestCase):
+    def test_missing_service_blocks_a_pod_gate(self):
+        graded = grade([hook("g.example.com", POD_GATE, policy="Fail")])
+        self.assertEqual(len(graded["blocking"]), 1)
+        finding = graded["blocking"][0]
+        self.assertEqual(finding["webhook"], "gate/g.example.com")
+        self.assertEqual(finding["reason"], "Service scen/gate-svc does not exist")
+        self.assertEqual(finding["upgrade_path"], ["CREATE pods"])
+        self.assertIn("matches CREATE pods", r.describe_webhook_finding(finding))
+
+    def test_absent_failure_policy_is_fail_the_v1_default(self):
+        self.assertEqual(len(grade([hook("d.example.com", POD_GATE)], kind="MutatingWebhookConfiguration")["blocking"]), 1)
+
+    def test_ready_backend_on_the_webhook_port_does_not_block(self):
+        graded = grade([hook("g.example.com", POD_GATE, policy="Fail")], *LIVE)
+        self.assertEqual((graded["blocking"], graded["outage"], graded["evaluated"]), ([], [], 1))
+
+    def test_endpoint_without_a_ready_condition_counts_as_ready(self):
+        graded = grade([hook("g.example.com", POD_GATE, policy="Fail")], [service("scen", "gate-svc")], [endpoint_slice("scen", "gate-svc", [None])])
+        self.assertEqual(graded["blocking"], [])
+
+    def test_every_endpoint_not_ready_blocks(self):
+        graded = grade([hook("g.example.com", POD_GATE, policy="Fail")], [service("scen", "gate-svc")], [endpoint_slice("scen", "gate-svc", [False, False])])
+        self.assertEqual(graded["blocking"][0]["reason"], "Service scen/gate-svc has no ready endpoints on port 443")
+
+    def test_service_without_the_webhook_port_blocks(self):
+        # The API server refuses to resolve the webhook: no Service port equals the webhook's port.
+        graded = grade([hook("g.example.com", POD_GATE, policy="Fail", port=9443)], *LIVE)
+        self.assertEqual(graded["blocking"][0]["reason"], "Service scen/gate-svc has no port 9443")
+
+    def test_endpoints_on_another_named_port_do_not_count(self):
+        services = [service("scen", "gate-svc", ports=((443, "https"), (8080, "metrics")))]
+        slices = [endpoint_slice("scen", "gate-svc", [True], port_name="metrics")]
+        self.assertEqual(len(grade([hook("g.example.com", POD_GATE, policy="Fail")], services, slices)["blocking"]), 1)
+
+    def test_unnamed_single_port_matches_an_unnamed_slice_port(self):
+        services = [service("scen", "gate-svc", ports=((443, None),))]
+        slices = [endpoint_slice("scen", "gate-svc", [True], port_name=None)]
+        self.assertEqual(grade([hook("g.example.com", POD_GATE, policy="Fail")], services, slices)["blocking"], [])
+
+    def test_slices_of_another_service_or_namespace_do_not_count(self):
+        services = [service("scen", "gate-svc")]
+        slices = [endpoint_slice("scen", "other-svc", [True]), endpoint_slice("prod", "gate-svc", [True])]
+        self.assertEqual(len(grade([hook("g.example.com", POD_GATE, policy="Fail")], services, slices)["blocking"]), 1)
+
+    def test_fail_open_and_url_backends_are_counted_not_graded(self):
+        graded = grade([hook("a.example.com", POD_GATE, policy="Ignore"), hook("e.example.com", POD_GATE, policy="Fail", service=None, url="https://localhost:5443/v")])
+        self.assertEqual((graded["blocking"], graded["outage"]), ([], []))
+        self.assertEqual((graded["fail_open"], graded["url_backends"], graded["evaluated"]), (1, 1, 0))
+
+
+class WebhookScopeTest(unittest.TestCase):
+    def _path(self, rules):
+        return r.upgrade_path_matches({"rules": rules})
+
+    def test_a_gate_outside_the_upgrade_path_is_an_outage_not_a_blocker(self):
+        # The seeded fleet's fixture: a gate on ConfigMaps with no Service.
+        graded = grade([hook("gate.seeded.invalid", [rule(["configmaps"])], policy="Fail", service=("seeded-upgrade", "nonexistent-admission-gate"))])
+        self.assertEqual(graded["blocking"], [])
+        self.assertEqual(len(graded["outage"]), 1)
+        self.assertIn("matches nothing a node upgrade needs", r.describe_webhook_finding(graded["outage"][0]))
+
+    def test_each_upgrade_path_target(self):
+        self.assertEqual(self._path([rule(["pods"])]), ["CREATE pods"])
+        self.assertEqual(self._path([rule(["pods/binding"])]), ["CREATE pods/binding"])
+        self.assertEqual(self._path([rule(["pods/status"], operations=("UPDATE",))]), ["UPDATE pods/status"])
+        self.assertEqual(self._path([rule(["pods"], operations=("DELETE",))]), ["DELETE pods"])
+        self.assertEqual(self._path([rule(["pods/eviction"])]), ["CREATE pods/eviction"])
+        self.assertEqual(self._path([rule(["nodes"], operations=("CREATE", "UPDATE", "DELETE"))]), ["CREATE nodes", "UPDATE nodes", "DELETE nodes"])
+        self.assertEqual(self._path([rule(["nodes/status"], operations=("UPDATE",))]), ["UPDATE nodes/status"])
+        self.assertEqual(self._path([rule(["leases"], operations=("CREATE", "UPDATE"), groups=("coordination.k8s.io",))]), ["CREATE leases", "UPDATE leases"])
+
+    def test_a_gate_on_scheduling_alone_blocks(self):
+        # A scheduling-policy webhook on pods/binding stops every replacement pod from being placed.
+        graded = grade([hook("bind.example.com", [rule(["pods/binding"])], policy="Fail")])
+        self.assertEqual([f["upgrade_path"] for f in graded["blocking"]], [["CREATE pods/binding"]])
+
+    def test_resource_wildcards(self):
+        self.assertEqual(self._path([rule(["*"])]), ["CREATE pods", "CREATE nodes"])  # `*` covers resources, not subresources
+        self.assertEqual(self._path([rule(["*/*"])]), ["CREATE pods", "CREATE pods/binding", "CREATE pods/eviction", "CREATE nodes"])
+        self.assertEqual(self._path([rule(["pods/*"])]), ["CREATE pods/binding", "CREATE pods/eviction"])  # subresources only, not pods itself
+        self.assertEqual(self._path([rule(["*/eviction"])]), ["CREATE pods/eviction"])
+
+    def test_operation_group_and_scope_must_all_match(self):
+        self.assertEqual(self._path([rule(["pods"], operations=("UPDATE",))]), [])
+        self.assertEqual(self._path([rule(["pods"], operations=("*",))]), ["CREATE pods", "DELETE pods"])
+        self.assertEqual(self._path([rule(["pods"], groups=("apps",))]), [])
+        self.assertEqual(self._path([rule(["*"], groups=("*",), operations=("*",))]), ["CREATE pods", "DELETE pods", "CREATE nodes", "UPDATE nodes", "DELETE nodes", "CREATE leases", "UPDATE leases"])
+        self.assertEqual(self._path([rule(["nodes"], scope="Namespaced")]), [])
+        self.assertEqual(self._path([rule(["pods"], scope="Cluster")]), [])
+
+    def test_monitoring_resources_are_outside_the_path(self):
+        # GKE's managed Prometheus operator gates its own resources fail-closed.
+        self.assertEqual(self._path([rule(["rules", "clusterrules", "globalrules"], groups=("monitoring.googleapis.com",), operations=("CREATE", "UPDATE"))]), [])
+
+    def test_split_webhook_items(self):
+        items = [webhook_config("ValidatingWebhookConfiguration", "v", []), webhook_config("MutatingWebhookConfiguration", "m", []), service("scen", "s"), endpoint_slice("scen", "s", [True]), {"kind": "PodDisruptionBudget"}, "junk"]
+        configs, services, slices = r.split_webhook_items(items)
+        self.assertEqual(([c["metadata"]["name"] for c in configs], len(services), len(slices)), (["v", "m"], 1, 1))
 
 
 if __name__ == "__main__":

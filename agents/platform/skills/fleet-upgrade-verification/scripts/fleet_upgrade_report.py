@@ -15,7 +15,8 @@ since that run, and flags an unchanged, behind member as `stalled` while a rollo
 active (another member moved, or `--rollout-in-progress` was passed).
 
 With `--readiness`, each member is also graded on whether it can take the upgrade to its
-target: drain-blocking PodDisruptionBudgets (read with one `kubectl get` per member after
+target: drain-blocking PodDisruptionBudgets and fail-closed admission webhooks with an
+unreachable backend in the upgrade's path (read with two `kubectl get` per member after
 `gcloud container clusters get-credentials` into a per-target kubeconfig), a maintenance
 exclusion in effect whose scope covers the upgrade, the maintenance window's state at
 `--at`, and node-pool version skew against the target control plane. The rules live in
@@ -187,7 +188,10 @@ VERSION_PAIR_SEPARATOR = " / "
 # workspace, which is why the default is not /tmp. `--kubeconfig-dir` overrides it.
 KUBECTL = "kubectl"
 KUBECTL_TIMEOUT_SECONDS = 60
+# Two reads, so a failure listing the webhook side (a large EndpointSlice list timing out, a
+# custom role without webhook-configuration reads) costs the webhook rule only, never the PDBs.
 KUBECTL_RESOURCES = "pdb,deploy,statefulset"
+KUBECTL_WEBHOOK_RESOURCES = "validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices"
 KUBECONFIG_ENV = "KUBECONFIG"
 HERMES_HOME_ENV = "HERMES_HOME"
 DEFAULT_HERMES_HOME = "/opt/data"
@@ -211,6 +215,7 @@ READINESS_COLUMNS = (
     "location",
     "readiness",
     "drain-blocking PDBs",
+    "fail-closed webhooks",
     "maintenance",
     "node-pool skew",
     "note",
@@ -465,51 +470,71 @@ def get_credentials_cmd(cluster: dict, project: str) -> list[str]:
     ]
 
 
-def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> tuple[list | None, str | None, str]:
-    """(items, error, kubeconfig): the PDBs and workloads of one member, read through kubectl.
+def _kubectl_items(resources: str, env: dict) -> tuple[list | None, str | None]:
+    """(items, error) from one `kubectl get <resources> -A -o json` under `env`."""
+    cmd = [KUBECTL, "get", resources, "-A", "-o", "json"]
+    rc, stdout, stderr = run_cmd(cmd, KUBECTL_TIMEOUT_SECONDS, env)
+    if rc != 0:
+        return None, f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}"
+    try:
+        data = json.loads(stdout) if stdout.strip() else {}
+    except ValueError as e:
+        return None, f"{' '.join(cmd)} returned unparsable JSON: {e}"
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return None, f"{' '.join(cmd)} returned no items list"
+    return items, None
 
-    `get-credentials` writes the member's kubeconfig, then one `kubectl get` reads every
-    PodDisruptionBudget, Deployment and StatefulSet. Either command failing is the error;
-    the member is then graded `unknown` on the PDB rule and the run exits 1.
+
+def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> dict:
+    """The objects of one member the readiness rules read, via kubectl.
+
+    `get-credentials` writes the member's kubeconfig; then one `kubectl get` reads every
+    PodDisruptionBudget, Deployment and StatefulSet, and a second reads the webhook
+    configurations, Services and EndpointSlices. Returns `items`/`error` for the first,
+    `webhook_items`/`webhook_error` for the second, and `kubeconfig`. A failed
+    `get-credentials` fails both; otherwise each read fails alone, grading only its own
+    rule `unknown`, and any failure makes the run exit 1.
     """
     path = kubeconfig_path(kubeconfig_dir, project, cluster.get("name", ""), cluster.get("location", ""))
+    result = {"items": None, "error": None, "webhook_items": None, "webhook_error": None, "credentials_error": None, "kubeconfig": path}
     try:
         os.makedirs(kubeconfig_dir, exist_ok=True)
     except OSError as e:
-        return None, f"cannot create kubeconfig directory {kubeconfig_dir}: {e}", path
+        result["error"] = result["webhook_error"] = result["credentials_error"] = f"cannot create kubeconfig directory {kubeconfig_dir}: {e}"
+        return result
     env = {**os.environ, KUBECONFIG_ENV: path}
     cmd = get_credentials_cmd(cluster, project)
     rc, _, stderr = run_cmd(cmd, GCLOUD_TIMEOUT_SECONDS, env)
     if rc != 0:
-        return None, f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}", path
-    cmd = [KUBECTL, "get", KUBECTL_RESOURCES, "-A", "-o", "json"]
-    rc, stdout, stderr = run_cmd(cmd, KUBECTL_TIMEOUT_SECONDS, env)
-    if rc != 0:
-        return None, f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}", path
-    try:
-        data = json.loads(stdout) if stdout.strip() else {}
-    except ValueError as e:
-        return None, f"{' '.join(cmd)} returned unparsable JSON: {e}", path
-    items = data.get("items") if isinstance(data, dict) else None
-    if not isinstance(items, list):
-        return None, f"{' '.join(cmd)} returned no items list", path
-    return items, None, path
+        result["error"] = result["webhook_error"] = result["credentials_error"] = f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}"
+        return result
+    result["items"], result["error"] = _kubectl_items(KUBECTL_RESOURCES, env)
+    result["webhook_items"], result["webhook_error"] = _kubectl_items(KUBECTL_WEBHOOK_RESOURCES, env)
+    return result
 
 
-def assess_readiness(cluster: dict, member: dict, items: list | None, read_error: str | None, at: datetime, kubeconfig: str) -> dict:
-    """The member's `readiness` object: the three rules against the row's target."""
+def assess_readiness(cluster: dict, member: dict, read: dict, at: datetime) -> dict:
+    """The member's `readiness` object: every rule against the row's target."""
     target = parse_version(member["target_version"]) if member["target_version"] else None
     master = parse_version(member["control_plane_version"])
     pools = [{"name": p["name"], "version": p["version"], "parsed": parse_version(p["version"])} for p in member["node_pools"]]
     autopilot = bool((cluster.get("autopilot") or {}).get("enabled"))
+    items, read_error, webhook_items = read["items"], read["error"], read["webhook_items"]
     pdbs = None if items is None else readiness.grade_pdbs(*readiness.split_items(items))
+    webhooks = None if webhook_items is None else readiness.grade_webhooks(*readiness.split_webhook_items(webhook_items))
     maintenance = readiness.evaluate_maintenance(cluster.get("maintenancePolicy"), at, member["target_version"], target, master, pools)
     skew = readiness.evaluate_skew(target, pools, autopilot)
-    status = readiness.readiness_status(pdbs, maintenance, skew, target is not None)
+    status = readiness.readiness_status(pdbs, webhooks, maintenance, skew, target is not None)
 
     notes = []
-    if read_error:
-        notes.append("cluster read failed; PDBs not graded")
+    if read["credentials_error"]:
+        notes.append("credentials for the cluster could not be fetched; PDBs and webhooks not graded")
+    else:
+        if read_error:
+            notes.append("PDB read failed; PDBs not graded")
+        if read["webhook_error"]:
+            notes.append("webhook read failed; webhooks not graded")
     if target is None:
         notes.append("no target; exclusion scope and skew not graded")
     if pdbs:
@@ -531,10 +556,12 @@ def assess_readiness(cluster: dict, member: dict, items: list | None, read_error
     return {
         "status": status,
         "evaluated_at": at.astimezone(timezone.utc).strftime(TIMESTAMP_FORMAT),
-        "kubeconfig": kubeconfig,
+        "kubeconfig": read["kubeconfig"],
         "read_error": read_error,
+        "webhook_read_error": read["webhook_error"],
         "autopilot": autopilot,
         "pdbs": pdbs,
+        "webhooks": webhooks,
         "maintenance": maintenance,
         "skew": skew,
         "note": NOTE_SEPARATOR.join(notes),
@@ -561,10 +588,10 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
                 continue
             member = grade_member(cluster, project, explicit_target, cache)
             if readiness_options is not None:
-                items, read_error, path = read_cluster_objects(cluster, project, readiness_options["kubeconfig_dir"])
-                if read_error is not None:
-                    errors.append({"project": project, "location": member["location"], "cluster": member["cluster"], "message": read_error})
-                member["readiness"] = assess_readiness(cluster, member, items, read_error, readiness_options["at"], path)
+                read = read_cluster_objects(cluster, project, readiness_options["kubeconfig_dir"])
+                for message in dict.fromkeys(m for m in (read["error"], read["webhook_error"]) if m):   # a credentials failure fills both with one message
+                    errors.append({"project": project, "location": member["location"], "cluster": member["cluster"], "message": message})
+                member["readiness"] = assess_readiness(cluster, member, read, readiness_options["at"])
             members.append(member)
     errors.extend(cache.errors)
     members.sort(key=lambda m: (m["project"], m["location"], m["cluster"]))
@@ -640,6 +667,18 @@ def _pdb_cell(r: dict) -> str:
     return NOTE_SEPARATOR.join(readiness.describe_finding(f) for f in r["pdbs"]["blocking"])
 
 
+def _webhook_cell(r: dict) -> str:
+    """Upgrade-path findings first; unreachable-backend webhooks outside the path after them,
+    since they are an outage now even though they do not grade the member."""
+    webhooks = r["webhooks"]
+    if webhooks is None:
+        return READINESS_READ_FAILED_CELL
+    findings = webhooks["blocking"] + webhooks["outage"]
+    if not findings:
+        return READINESS_NONE_CELL
+    return NOTE_SEPARATOR.join(readiness.describe_webhook_finding(f) for f in findings)
+
+
 def _maintenance_cell(r: dict) -> str:
     parts = []
     for e in r["maintenance"]["exclusions"]:
@@ -685,14 +724,14 @@ def render_readiness(report: dict) -> str:
     ]
     for m in report["members"]:
         r = m["readiness"]
-        row = (m["project"], m["cluster"], m["location"], r["status"], _pdb_cell(r), _maintenance_cell(r), _skew_cell(r), r["note"])
+        row = (m["project"], m["cluster"], m["location"], r["status"], _pdb_cell(r), _webhook_cell(r), _maintenance_cell(r), _skew_cell(r), r["note"])
         lines.append("| " + " | ".join(_cell(v) for v in row) + " |")
     summary = report["readiness"]["summary"]
     lines.append("")
     lines.append(
         f"Readiness at {report['readiness']['evaluated_at']}: "
         + ", ".join(f"{summary[s]} {s}" for s in readiness.READINESS_ORDER)
-        + "; a maintenance exclusion holds back GKE's automatic upgrades only, a drain-blocking PDB or skew any upgrade."
+        + "; a maintenance exclusion holds back GKE's automatic upgrades only, a drain-blocking PDB, a fail-closed webhook in the upgrade's path with an unreachable backend, or skew any upgrade."
     )
     return "\n".join(lines)
 
@@ -938,7 +977,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", help="Path to write the report as JSON.")
     parser.add_argument("--state-dir", default=DEFAULT_STATE_DIR, help=f"Directory holding one record per target from the previous run (default: {DEFAULT_STATE_DIR}).")
     parser.add_argument("--rollout-in-progress", action="store_true", help="Assert a rollout is under way, so an unchanged, behind member is flagged stalled even when no other member moved.")
-    parser.add_argument("--readiness", action="store_true", help="Also grade each member's readiness for the upgrade: drain-blocking PDBs (one kubectl read per member), maintenance exclusions and window, node-pool skew.")
+    parser.add_argument("--readiness", action="store_true", help="Also grade each member's readiness for the upgrade: drain-blocking PDBs and fail-closed webhooks in the upgrade's path with an unreachable backend (two kubectl reads per member), maintenance exclusions and window, node-pool skew.")
     parser.add_argument("--at", help="RFC 3339 instant to evaluate maintenance exclusions and the window at (default: now). Only with --readiness.")
     parser.add_argument("--kubeconfig-dir", help="Directory for the per-member kubeconfig files --readiness writes (default: $HERMES_HOME/.kubeconfigs).")
     args = parser.parse_args(argv)
