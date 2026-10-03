@@ -1275,7 +1275,7 @@ spec:
             - name: HERMES_HOME_MODE
               value: "2770"
             - name: HERMES_WRITE_SAFE_ROOT
-              value: /opt/data:/home/agent
+              value: /opt/data
             - name: TERMINAL_CWD
               value: /opt/data
             - name: CREDENTIAL_PROXY_URL
