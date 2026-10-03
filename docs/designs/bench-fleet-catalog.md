@@ -93,9 +93,9 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Eighteen fixtures: seventeen across the four cluster slots and one project-scoped. Most in-cluster
-fixtures are on slot `a`, across the seven seeded namespaces `seeded-debug`,
-`seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-deprecation`, `seeded-intent` and `seeded-stall`, plus both
+Nineteen fixtures: eighteen across the four cluster slots and one project-scoped. Most in-cluster
+fixtures are on slot `a`, across the eight seeded namespaces `seeded-debug`,
+`seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-deprecation`, `seeded-intent`, `seeded-token` and `seeded-stall`, plus both
 defect node pools. Slot `c` carries a GKE-level defect only and no workloads at all: it is the
 configuration outlier. Slot `b` is the held-back control plane, and also carries the
 upgrade-readiness drain defects, which belong with the cluster whose subject is upgrading. Slot
@@ -108,26 +108,27 @@ baseline. **Slot `d` carries it too, and has to**: `hack/fleet-kubeconfigs.sh` d
 filtering on that label together with `managed-by`, so a cluster without it is never listed and
 its roles are never published.
 
-| Role                           | Slot    | Day | What is planted                                                                                                                                                                              |
-| ------------------------------ | ------- | --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `rbac-overgrant`               | a       | 0   | `clusterrolebinding/debug-binding`, cluster-admin to the `seeded-security` default SA                                                                                                        |
-| `no-pdb-workload`              | a       | 0   | `deployment/checkout-gateway` in `seeded-reliability`, two replicas, no PDB                                                                                                                  |
-| `declared-no-pdb-workload`     | a       | 0   | `deployment/notification-relay` in `seeded-intent`, two replicas, no PDB, declared on purpose in the GitOps repository's `knowledge/`                                                        |
-| `stalled-controller`           | a       | 0   | `deployment/inventory-api` in `seeded-stall`, CreateContainerConfigError, ProgressDeadlineExceeded                                                                                           |
-| `crashloop-workload`           | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop                                                                                                        |
-| `hpa-saturated`                | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                                                                                                                        |
-| `deprecated-api-caller`        | a       | 0   | `cronjob/legacy-endpoints-writer` in `seeded-deprecation`, patching Endpoints v1 every ten minutes; each write audit-stamped `k8s.io/deprecated=true`, no removal, no insight                |
-| `idle-nodepool`                | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                                                                                                                          |
-| `orphan-disks`                 | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                                                                                                                             |
-| `version-laggard`              | b       | 0   | Control plane one minor behind the REGULAR channel default                                                                                                                                   |
-| `drift-outlier`                | c       | 1   | Master authorized networks absent, where a, b and d carry an open block                                                                                                                      |
-| `readiness-surge-blocked`      | b       | 0   | `no-surge-pool`, `maxSurge 0` / `maxUnavailable 1`, tainted `seeded-role=no-surge`                                                                                                           |
-| `readiness-pinned-workload`    | b       | 0   | `deployment/pinned-batch-runner` in `seeded-upgrade`, one replica pinned to that pool                                                                                                        |
-| `readiness-drain-blocked`      | b       | 0   | `poddisruptionbudget/pinned-batch-runner` in `seeded-upgrade`, `maxUnavailable: 0`, so `disruptionsAllowed` is 0 permanently                                                                 |
-| `readiness-failclosed-webhook` | b       | 0   | `seeded-fail-closed-gate`, `failurePolicy: Fail` with a 30-second timeout and no backend                                                                                                     |
-| `zonal-skew-scheduling`        | d       | 0   | `deployment/zone-pinned-api` in `seeded-topology`, two replicas, `ScheduleAnyway` zonal spread plus a required single-zone nodeAffinity                                                      |
-| `zonal-skew-volume`            | d       | 0   | `statefulset/zone-bound-store` in `seeded-topology`, two replicas on `seeded-zonal-pd`, a class pinned to the first zone                                                                     |
-| `zonal-skew-capacity`          | d       | 0   | `deployment/capacity-starved-worker` in `seeded-topology`, four replicas at 500m against an e2-small the sponge keeps full and an e2-standard-2 that fits one to three, so some stay Pending |
+| Role                           | Slot    | Day | What is planted                                                                                                                                                                                                                   |
+| ------------------------------ | ------- | --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `rbac-overgrant`               | a       | 0   | `clusterrolebinding/debug-binding`, cluster-admin to the `seeded-security` default SA                                                                                                                                             |
+| `no-pdb-workload`              | a       | 0   | `deployment/checkout-gateway` in `seeded-reliability`, two replicas, no PDB                                                                                                                                                       |
+| `declared-no-pdb-workload`     | a       | 0   | `deployment/notification-relay` in `seeded-intent`, two replicas, no PDB, in a namespace with no NetworkPolicy; both declared on purpose in the GitOps repository's `knowledge/`                                                  |
+| `declared-token-workload`      | a       | 0   | `deployment/token-reader` and `deployment/token-sidecar` in `seeded-token`, on the default ServiceAccount with the token mounted; `token-reader` declared on purpose in the GitOps repository's `knowledge/`, `token-sidecar` not |
+| `stalled-controller`           | a       | 0   | `deployment/inventory-api` in `seeded-stall`, CreateContainerConfigError, ProgressDeadlineExceeded                                                                                                                                |
+| `crashloop-workload`           | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop                                                                                                                                             |
+| `hpa-saturated`                | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                                                                                                                                                             |
+| `deprecated-api-caller`        | a       | 0   | `cronjob/legacy-endpoints-writer` in `seeded-deprecation`, patching Endpoints v1 every ten minutes; each write audit-stamped `k8s.io/deprecated=true`, no removal, no insight                                                     |
+| `idle-nodepool`                | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                                                                                                                                                               |
+| `orphan-disks`                 | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                                                                                                                                                                  |
+| `version-laggard`              | b       | 0   | Control plane one minor behind the REGULAR channel default                                                                                                                                                                        |
+| `drift-outlier`                | c       | 1   | Master authorized networks absent, where a, b and d carry an open block                                                                                                                                                           |
+| `readiness-surge-blocked`      | b       | 0   | `no-surge-pool`, `maxSurge 0` / `maxUnavailable 1`, tainted `seeded-role=no-surge`                                                                                                                                                |
+| `readiness-pinned-workload`    | b       | 0   | `deployment/pinned-batch-runner` in `seeded-upgrade`, one replica pinned to that pool                                                                                                                                             |
+| `readiness-drain-blocked`      | b       | 0   | `poddisruptionbudget/pinned-batch-runner` in `seeded-upgrade`, `maxUnavailable: 0`, so `disruptionsAllowed` is 0 permanently                                                                                                      |
+| `readiness-failclosed-webhook` | b       | 0   | `seeded-fail-closed-gate`, `failurePolicy: Fail` with a 30-second timeout and no backend                                                                                                                                          |
+| `zonal-skew-scheduling`        | d       | 0   | `deployment/zone-pinned-api` in `seeded-topology`, two replicas, `ScheduleAnyway` zonal spread plus a required single-zone nodeAffinity                                                                                           |
+| `zonal-skew-volume`            | d       | 0   | `statefulset/zone-bound-store` in `seeded-topology`, two replicas on `seeded-zonal-pd`, a class pinned to the first zone                                                                                                          |
+| `zonal-skew-capacity`          | d       | 0   | `deployment/capacity-starved-worker` in `seeded-topology`, four replicas at 500m against an e2-small the sponge keeps full and an e2-standard-2 that fits one to three, so some stay Pending                                      |
 
 The `inference-server` HPA under `hpa-saturated` does not compute a stable desired
 replica count. Read on 2026-08-24, `status.desiredReplicas` on `seeded-a` was 3 in
@@ -242,8 +243,8 @@ provisioning — it is the SOPs' own age rules. A collector that filters on
 `creationTimestamp` returns nothing for a fixture younger than its window, so the audit
 correctly reports no finding and a case asserting one correctly fails.
 
-Fifteen of the seventeen are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`,
-`declared-no-pdb-workload`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the four
+Sixteen of the eighteen are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`,
+`declared-no-pdb-workload`, `declared-token-workload`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the four
 `readiness-*` roles on slot `b` and the three `zonal-skew-*` roles on slot `d`, covering
 security, reliability, cluster debugging, remediation, capacity, upgrades, upgrade readiness,
 API deprecation and zonal skew between them. A corpus that leans on these can go green the day the fleet

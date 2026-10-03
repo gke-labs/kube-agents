@@ -170,6 +170,13 @@ AUDITS: dict[str, AuditSpec] = {
             "lb-world-open",
             "anonymous-rbac-binding",
         ),
+        # The two compliance checks that judge a posture an owner may choose:
+        # a namespace that talks to nothing and so carries no NetworkPolicy
+        # (2.6, the zero-policy and partial-coverage shapes, which name the
+        # namespace; the allow-all shape names the policy and is a fault),
+        # and a workload that needs the API token the default ServiceAccount
+        # mounts (2.7). Every other check is a fault no declaration excuses.
+        declarable=("netpol-missing", "default-sa-automount"),
     ),
     "security-patch-orchestrator": AuditSpec(
         "Upgrade & Patch Readiness Audit",
@@ -839,6 +846,36 @@ DUAL_SHAPE_CHECK = "hpa-cannot-scale"
 # finding whatever a note declares. The withhold keeps taking both shapes: it
 # errs toward holding a finding back, the join would err toward silencing one.
 DUAL_SHAPE_POSTURE_SEVERITY = "major"
+# 2.6 `netpol-missing` names two shapes as well: the zero-policy and partial
+# postures name the namespace and may be declared; the allow-all shape names
+# the policy and is a fault. The object's kind tells them apart.
+NAMESPACE_SHAPE_CHECK = "netpol-missing"
+NAMESPACE_SHAPE_KIND = "Namespace"
+# 2.7 `default-sa-automount` is declared per workload and fixed per namespace
+# (one `default` ServiceAccount). A fix that merges for an undeclared sibling
+# would take the declared workload's token too, so a namespace holding a
+# declared workload gets manual recommendations instead of the shared file.
+SHARED_ACCOUNT_CHECK = "default-sa-automount"
+# The instruction comes first and the list of declared workloads last, so the
+# renderer's note cap clips names, never the sentence that says what to do.
+SHARED_ACCOUNT_SHIELD_NOTE = (
+    "_(A declared workload shares this namespace's `default` ServiceAccount; turning automount off "
+    "on the account would remove its token as well, so this stays manual: set "
+    "`automountServiceAccountToken: false` on the undeclared workloads' pod specs, or on the "
+    "account once the declared workload sets `true` on its own spec. Declared: {declared}.)_"
+)
+# How many declared workloads the note names before counting the rest.
+SHARED_ACCOUNT_SHIELD_NAMES = 3
+SHARED_ACCOUNT_STALE_REASON = (
+    "Closing unmerged: a workload in this namespace is now declared to need the `default` "
+    "ServiceAccount's token, so the shared-account fix this pull request proposes would remove "
+    "it; the remaining findings are manual, per pod spec."
+)
+SHARED_ACCOUNT_STALE_RESOLUTION = (
+    "The finding has not gone: it stays on the ledger with a manual remediation under the "
+    "shield note, and `/remediate <finding-id>` refuses it while the declaration stands. "
+    "Withdraw the declaration and the next run groups it onto a branch again."
+)
 
 # Harness-side declaration discovery (the obtainability SOP's §4a). `start`
 # reads every repository the step must search, collects the declarations it
@@ -3364,6 +3401,12 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 )
             _require_str(entry.get("namespace", ""), f"{where}.namespace")
             _require_str(entry.get("object"), f"{where}.object", allow_empty=False)
+            if check == NAMESPACE_SHAPE_CHECK and not _is_namespace_object(str(entry["object"])):
+                raise ValidationError(
+                    f"{where}.object: {str(entry['object'])!r} — a {check} declaration justifies "
+                    f"the namespace posture (`{NAMESPACE_SHAPE_KIND}/<ns>`); the allow-all shape "
+                    "names the policy and is a fault, so it stays under `findings`"
+                )
             for field in ("cluster", "object"):
                 if _id_segment(str(entry[field])) == ID_EMPTY_SEGMENT:
                     raise ValidationError(
@@ -4475,7 +4518,7 @@ def declared_intent_applies(data: dict) -> bool:
     one that searched and found a declaration, and the search record is the
     only thing that tells them apart — the same laundering path `checks_run`
     guards against, one field over. A stream with no `declarable` set never
-    owes it, and neither does a run on which none of the four ran: there was
+    owes it, and neither does a run on which none of its declarable checks ran: there was
     no candidate to search for.
     """
     declarable = audit_declarable_checks(str(data.get("audit") or ""))
@@ -4527,7 +4570,9 @@ def withhold_unsearched_postures(data: dict, record: dict | None) -> list[dict]:
 
     What goes: every finding whose check is declarable, the dangling-target
     `hpa-cannot-scale` fault included, because it shares its slug with the
-    `min == max` posture and this side cannot tell them apart. What stays: the
+    `min == max` posture and this side cannot tell them apart; the allow-all
+    `NetworkPolicy/` fault of `netpol-missing` stays, because its object does
+    tell it apart (`_is_namespace_object`). What stays: the
     faults, and every `declared[]` entry, each of which cites the file it
     read. The withheld findings are filed on the document under
     `postures_withheld`, with the repositories not searched, so that
@@ -4551,8 +4596,15 @@ def withhold_unsearched_postures(data: dict, record: dict | None) -> list[dict]:
     kept: list[dict] = []
     withheld: list[dict] = []
     for finding in data.get("findings") or []:
-        target = withheld if str(finding.get("check", "")) in declarable else kept
-        target.append(finding)
+        check = str(finding.get("check", ""))
+        # The allow-all `NetworkPolicy/` fault shares netpol-missing's slug and
+        # is told apart by its object, as the join tells it apart, so it
+        # publishes; the hpa dual-shape fault cannot be told apart here and
+        # is held with the postures (see the docstring).
+        posture = check in declarable and not (
+            check == NAMESPACE_SHAPE_CHECK and not _is_namespace_object(str(finding.get("object", "")))
+        )
+        (withheld if posture else kept).append(finding)
     data["findings"] = kept
     data[POSTURES_WITHHELD_KEY] = {
         "findings": withheld,
@@ -4745,10 +4797,15 @@ def parse_declarations(
             continue
         check = item["check"].strip()
         if check not in declarable:
-            log(
-                f"WARNING: {item_where}: {check!r} is not a check a declaration may "
-                "justify; skipped."
-            )
+            if any(check in spec.declarable for spec in AUDITS.values()):
+                # Another stream's posture: the note is read by every stream
+                # and each takes its own items, so this is not a malformed item.
+                log(f"NOTE: {item_where}: {check!r} is another stream's posture; not this one's to move.")
+            else:
+                log(
+                    f"WARNING: {item_where}: {check!r} is not a check a declaration may "
+                    "justify; skipped."
+                )
             continue
         raw_object = item["object"].strip()
         # Each side of the slash on its own: `Deployment / api` is a hand-typed
@@ -5041,6 +5098,11 @@ def fold_searched_record(data: dict, record: dict | None) -> None:
     data[DECLARED_INTENT_SEARCHED_KEY] = current
 
 
+def _is_namespace_object(obj: str) -> bool:
+    """Whether `obj` names a Namespace, with the kind folded as the join folds it (`namespace/x`, `Namespace / x`)."""
+    return _id_segment(obj.partition("/")[0]) == _id_segment(NAMESPACE_SHAPE_KIND)
+
+
 def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
     """Move each finding a declaration covers into `declared[]`; return the moved.
 
@@ -5050,8 +5112,8 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
     against fleet-wide ones. The first entry
     wins in repository-then-path order, which is the order `start` wrote them
     in. Only a declarable check is looked up at all, so a fault stays a
-    finding whatever a note says about it — and for `hpa-cannot-scale`, the
-    one slug that names both, only the `min == max` shape moves, read off the
+    finding whatever a note says about it — and for `hpa-cannot-scale`, the first slug that names both, only the `min == max` shape moves;
+    for `netpol-missing`, the second, only the `Namespace/` shape moves, read off the
     severity §3.6 fixes for it (`DUAL_SHAPE_POSTURE_SEVERITY`); a match on the
     dangling-target fault is said on stderr and not applied. An identity the
     model already declared is left to the model's entry.
@@ -5096,6 +5158,20 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
                 "stands and the finding publishes."
             )
             match = None
+        if (
+            match is not None
+            and check == NAMESPACE_SHAPE_CHECK
+            and not _is_namespace_object(str(finding.get("object", "")))
+        ):
+            # The slug names a posture on the namespace and a fault on the
+            # policy, and a declaration justifies only the posture.
+            log(
+                f"DECLARATION NOT APPLIED: {finding.get('id', '')} — {check} on "
+                f"{finding.get('object', '')} is the allow-all fault (SOP §2.6), which no "
+                f"declaration excuses; the posture names `{NAMESPACE_SHAPE_KIND}/<ns>`. "
+                f"{match.get('repo', '')}:{match.get('path', '')} stands and the finding publishes."
+            )
+            match = None
         if match is None or derive_finding_id(finding) in already:
             kept.append(finding)
             continue
@@ -5122,6 +5198,104 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
         data["findings"] = kept
         data["declared"] = declared
     return moved
+
+
+def _shield_sources(data: dict, declarations: list[dict]) -> dict[tuple[str, str], list[tuple[str, str, str]]]:
+    """Declared 2.7 workloads by `(cluster, namespace)`, folded as the finding id folds them.
+
+    Two sources, because each misses what the other has: the document's
+    `declared[]` holds what the worker reported and a declaration moved, and
+    `start`'s declarations hold what the owner declared whether or not the
+    worker reported that workload at all. A fleet-wide declaration (no
+    `cluster`) is keyed under the empty cluster and reaches every cluster.
+    Each value is `(object, repo, path)`, de-duplicated.
+    """
+    sources: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
+
+    def add(cluster: str, namespace: str, obj: str, repo: str, path: str) -> None:
+        key = (_id_segment(cluster), _id_segment(namespace))
+        entry = (obj, repo, path)
+        bucket = sources.setdefault(key, [])
+        if entry not in bucket:
+            bucket.append(entry)
+
+    for entry in data.get("declared") or []:
+        if str(entry.get("check", "")) != SHARED_ACCOUNT_CHECK:
+            continue
+        declaration = entry.get("declaration") or {}
+        add(
+            str(entry.get("cluster", "")),
+            str(entry.get("namespace") or ""),
+            str(entry.get("object", "")),
+            str(declaration.get("repo", "")),
+            str(declaration.get("path", "")),
+        )
+    for entry in declarations:
+        if _id_segment(str(entry.get("check", ""))) != _id_segment(SHARED_ACCOUNT_CHECK):
+            continue
+        add(
+            str(entry.get(DECLARATION_CLUSTER_FIELD, "") or ""),
+            str(entry.get("namespace") or ""),
+            str(entry.get("object", "")),
+            str(entry.get("repo", "")),
+            str(entry.get("path", "")),
+        )
+    return sources
+
+
+def shield_declared_account_siblings(data: dict, declarations: list[dict] | None = None) -> list[str]:
+    """Keep a declared 2.7 workload's token by making its siblings' fixes manual.
+
+    `default-sa-automount` is declared per workload and remediated per
+    namespace: the shared `default` ServiceAccount gets
+    `automountServiceAccountToken: false`, which removes the token from every
+    workload that does not set `true` on its own spec, the declared one
+    included. So where a namespace holds a declared workload, each remaining
+    finding in it keeps its evidence and recommendation and loses the shared
+    file: `kind: manual`, with a note naming the declared workload and the two
+    ways to fix the rest. The declared workloads come from `declared[]` and
+    from `start`'s declarations (`_shield_sources`), so a declared workload
+    the worker left out of the document still protects its namespace.
+    Returns the ids changed, each logged; the caller carries them to the
+    stale-close pass, and nothing in the document records them.
+    """
+    shielded_by = _shield_sources(data, list(declarations or []))
+    if not shielded_by:
+        return []
+    changed: list[str] = []
+    for finding in data.get("findings") or []:
+        if str(finding.get("check", "")) != SHARED_ACCOUNT_CHECK:
+            continue
+        namespace = _id_segment(str(finding.get("namespace") or ""))
+        declared = list(shielded_by.get((_id_segment(str(finding.get("cluster", ""))), namespace), []))
+        for entry in shielded_by.get((_id_segment(""), namespace), []):
+            if entry not in declared:
+                declared.append(entry)
+        if not declared:
+            continue
+        fid = str(finding.get("id", ""))
+        remediation = finding.setdefault("remediation", {})
+        shown = [f"`{obj}` declared at {repo}:{path}" for obj, repo, path in declared[:SHARED_ACCOUNT_SHIELD_NAMES]]
+        rest = len(declared) - len(shown)
+        names = ", ".join(shown) + (f" and {rest} more" if rest > 0 else "")
+        note = str(remediation.get("note", "")).strip()
+        shield = SHARED_ACCOUNT_SHIELD_NOTE.format(declared=names)
+        # A sibling the worker already filed as manual (2.7's default, since
+        # few repositories declare the auto-created `default` ServiceAccount)
+        # keeps its kind and gains the note. The shield goes first: the
+        # worker's own text is 2.7's shared-account fix, and the renderer
+        # clips a long note from the end, so the part that must survive and
+        # be read first is the one that says not to apply it.
+        remediation["kind"] = "manual"
+        remediation["path"] = ""
+        remediation["note"] = shield + (f" {note}" if note else "")
+        changed.append(fid)
+        log(
+            f"MANUAL: {fid} — {SHARED_ACCOUNT_CHECK} shares its namespace's `default` "
+            f"ServiceAccount with a declared workload ({names}); the shared-account fix would "
+            "remove that workload's token, so this finding is manual."
+        )
+    return changed
 
 
 class ContainmentError(ValidationError):
@@ -8658,8 +8832,14 @@ def render_stale_close_comment(
     *,
     pr_number: int | str = 0,
     reason: str = "",
+    resolution: str = "",
 ) -> str:
-    """Why a remediation pull request is being closed unmerged."""
+    """Why a remediation pull request is being closed unmerged.
+
+    `resolution` replaces the closing paragraph, which by default describes a
+    finding that stopped reproducing; a close for another reason (a shielded
+    finding, which is still on the ledger) says its own.
+    """
     stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
     out = [
         reason
@@ -8694,10 +8874,13 @@ def render_stale_close_comment(
         f"`{STALE_CLOSED_LABEL}` — a close made *here*, by the harness, is never "
         "read as a rejection of the fix.",
         "",
-        "If the finding comes back: a `critical` finding with a manifest "
-        f"remediation is re-proposed automatically on this same branch (at most "
-        f"{AUTO_PROMOTION_CAP} per run). Anything else is listed on the ledger "
-        "as awaiting `/remediate <finding-id>`, which re-opens it on request.",
+        resolution
+        or (
+            "If the finding comes back: a `critical` finding with a manifest "
+            f"remediation is re-proposed automatically on this same branch (at most "
+            f"{AUTO_PROMOTION_CAP} per run). Anything else is listed on the ledger "
+            "as awaiting `/remediate <finding-id>`, which re-opens it on request."
+        ),
         "",
         stale_closed_marker(pr_number),
     ]
@@ -9793,8 +9976,15 @@ def close_stale_remediation_prs(
     generated_at: datetime,
     *,
     branch_by_finding: dict[str, str] | None = None,
+    shielded_ids: set[str] | None = None,
 ) -> list[str]:
     """Close every open remediation PR the current findings no longer justify.
+
+    A third reason, `shielded_ids`: a pull request whose only persisting
+    findings `shield_declared_account_siblings` demoted this run proposes the
+    shared-account fix for a namespace that now holds a declared workload, so
+    it is closed with that reason rather than left open as the only fix there
+    is — merging it would be the harm the shield exists to prevent.
 
     Two reasons a pull request is stale, and the second one is why this cannot
     just read the hidden block. A pull request is stale when every finding it
@@ -9817,6 +10007,7 @@ def close_stale_remediation_prs(
     """
     closed: list[str] = []
     branch_by_finding = branch_by_finding or {}
+    shielded_ids = shielded_ids or set()
     live_branches = set(branch_by_finding.values())
     for pr in prs:
         if str(pr.get("state", "")).upper() != "OPEN":
@@ -9840,8 +10031,9 @@ def close_stale_remediation_prs(
         # an unjoinable body: that is "cannot tell", not "none of them", and the
         # branch rule below is the only one allowed to act on it.
         persisting = [fid for fid in covered if fid in current_ids] if joinable else []
+        only_shielded = bool(persisting) and all(fid in shielded_ids for fid in persisting)
         if not orphaned:
-            if not covered or not joinable or persisting:
+            if not covered or not joinable or (persisting and not only_shielded):
                 continue
 
         # An orphaned branch means the work *moved* only if the work still has
@@ -9852,7 +10044,7 @@ def close_stale_remediation_prs(
         # of the fix that exists anywhere. Closing it destroys reviewed work to
         # correct a grouping that never changed, and points the reviewer at a
         # replacement branch that was never pushed.
-        stranded = sorted(fid for fid in persisting if fid not in branch_by_finding)
+        stranded = sorted(fid for fid in persisting if fid not in branch_by_finding and fid not in shielded_ids)
         if orphaned and stranded:
             log(
                 f"PR #{number} covers {', '.join(stranded)}, which still "
@@ -9888,7 +10080,11 @@ def close_stale_remediation_prs(
         # came back; over an unjoinable body the branch is the one fact this
         # run actually established, so that is what the comment says.
         reason = ""
-        if persisting or not joinable:
+        resolution = ""
+        if only_shielded:
+            reason = SHARED_ACCOUNT_STALE_REASON
+            resolution = SHARED_ACCOUNT_STALE_RESOLUTION
+        elif persisting or not joinable:
             reason = (
                 f"Closing unmerged: the `{audit_id}` audit no longer groups its "
                 f"findings onto `{head}`. The set of files this fix would touch "
@@ -9925,7 +10121,7 @@ def close_stale_remediation_prs(
                 repo,
                 number,
                 render_stale_close_comment(
-                    audit_id, findings, generated_at, pr_number=number, reason=reason
+                    audit_id, findings, generated_at, pr_number=number, reason=reason, resolution=resolution
                 ),
                 what="stale-close comment",
             )
@@ -10195,19 +10391,24 @@ def read_run_record(audit_id: str, repo: str | None = None) -> dict | None:
 
 def join_harness_declarations(
     data: dict, record: dict | None, audit_id: str, repo: str | None
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     """Fold `start`'s search into the document and apply its declarations.
 
     What `finish` — real and dry — and `remediate` share, in the one order
     that is right: the record's `searched` joins the document's
     `declared_intent_searched`, then every finding a filed declaration covers
-    moves to `declared[]`, each move logged. Returns the ids that moved so a
-    caller can refuse one by name. Run on a validated document, after
-    `load_findings`, so the ids are the derived ones.
+    moves to `declared[]`, each move logged, then a declared 2.7 workload's
+    siblings go manual. Returns the ids that moved, so a caller can refuse
+    one by name, and the ids the shield changed, for the stale-close pass;
+    neither list is written into the document, so neither can arrive in it.
+    Run on a validated document, after `load_findings`, so the ids are the
+    derived ones.
     """
     fold_searched_record(data, record)
-    moved = apply_declarations(data, read_declarations(audit_id, repo=repo))
-    return [str(finding.get("id", "")) for finding in moved]
+    declarations = read_declarations(audit_id, repo=repo)
+    moved = apply_declarations(data, declarations)
+    shielded = shield_declared_account_siblings(data, declarations)
+    return [str(finding.get("id", "")) for finding in moved], shielded
 
 
 def load_findings(path: str, audit_id: str) -> dict:
@@ -11434,7 +11635,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
     # them would contradict it.
     repo_hint = opt_repo if args.dry_run else resolve_repo(audit_id=audit_id, repo=opt_repo)
     record = read_run_record(audit_id, repo=repo_hint)
-    declared_ids = set(join_harness_declarations(data, record, audit_id, repo_hint))
+    declared_ids = set(join_harness_declarations(data, record, audit_id, repo_hint)[0])
     withheld_ids = set(finding_ids(withhold_unsearched_postures(data, record)))
     findings = list(data["findings"])
     covered = [fid for fid in args.finding if fid in declared_ids]
@@ -11763,7 +11964,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # order matters: a posture a declaration covers moves to `declared[]`,
     # where it cites the file it was read from, and only what is left is
     # measured against the search record.
-    join_harness_declarations(data, record, audit_id, repo_hint)
+    shielded_ids = set(join_harness_declarations(data, record, audit_id, repo_hint)[1])
     withheld = withhold_unsearched_postures(data, record)
     if withheld:
         log(
@@ -12088,7 +12289,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 # not stale either: a pull request whose finding never reached
                 # a ledger body — opened by `/remediate`, or on a finding the
                 # body budget dropped — is still a fix for a live condition.
-                repo, audit_id, remediation_prs, still_flagged, previous_titles, {}, now
+                repo, audit_id, remediation_prs, still_flagged, previous_titles, {}, now,
+                shielded_ids=shielded_ids,
             )
         )
         if existing_issue and answers_remediate:
@@ -12630,6 +12832,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 for group in remediation_groups(findings)
                 for finding in group
             },
+            shielded_ids=shielded_ids,
         )
 
     prs_opened = _open_promoted_prs(

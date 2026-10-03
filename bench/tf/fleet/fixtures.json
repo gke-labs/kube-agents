@@ -457,7 +457,7 @@
       "cluster_slot": "a",
       "namespace": "seeded-intent",
       "probes": ["deployment/notification-relay"],
-      "fixture": "notification-relay Deployment, two replicas, no PodDisruptionBudget in the namespace; the workload a repository declaration covers, so the declared-intent case silences nothing another case grades",
+      "fixture": "notification-relay Deployment, two replicas, no PodDisruptionBudget, in a namespace with no NetworkPolicy; both postures a repository declaration covers, so the declared-intent cases silence nothing another case grades",
       "state": [
         {
           "subject": "deployment/notification-relay",
@@ -471,6 +471,45 @@
           "path": null,
           "op": "absent",
           "why": "a PodDisruptionBudget anyone adds to seeded-intent removes the posture the declaration covers, and the case then grades nothing"
+        },
+        {
+          "subject": "networkpolicy?",
+          "path": null,
+          "op": "absent",
+          "why": "a NetworkPolicy anyone adds to seeded-intent removes the compliance posture the declaration covers, and that case then grades nothing"
+        }
+      ]
+    },
+    "declared-token-workload": {
+      "cluster_slot": "a",
+      "namespace": "seeded-token",
+      "probes": [
+        "deployment/token-reader",
+        "deployment/token-sidecar",
+        "serviceaccount/default"
+      ],
+      "fixture": "token-reader and token-sidecar Deployments on the namespace's default ServiceAccount with the token mounted, behind a default-deny NetworkPolicy; token-reader is declared on purpose in the GitOps repository's knowledge/ note and token-sidecar is not, so the compliance audit lists one under Declared intent, keeps the other as a finding, and does not propose the shared-account fix that would remove the declared token",
+      "state": [
+        {
+          "subject": "deployment/token-reader",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 1,
+          "why": "the posture is a running workload that keeps its token; a Pending replica is not a posture"
+        },
+        {
+          "subject": "deployment/token-sidecar",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 1,
+          "why": "the sibling finding is a running workload; Pending makes it a fault of another kind"
+        },
+        {
+          "subject": "serviceaccount/default",
+          "path": "automountServiceAccountToken",
+          "op": "eq",
+          "value": true,
+          "why": "the shared-account fix anyone applies removes both tokens and the posture with them, and the case then grades nothing"
         }
       ]
     }
