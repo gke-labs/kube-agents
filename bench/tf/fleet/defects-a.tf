@@ -251,6 +251,15 @@ resource "kubernetes_deployment_v1" "token_reader" {
         container {
           name  = "app"
           image = "registry.k8s.io/pause:3.9"
+          # Compliance SOP 2.11's two container-level settings, so 2.7 is the
+          # only check that names these workloads: the case forbids the
+          # declared workload's object in every finding id.
+          security_context {
+            allow_privilege_escalation = false
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
           resources {
             requests = { cpu = "10m", memory = "16Mi" }
             limits   = { memory = "32Mi" }
@@ -289,6 +298,15 @@ resource "kubernetes_deployment_v1" "token_sidecar" {
         container {
           name  = "app"
           image = "registry.k8s.io/pause:3.9"
+          # Compliance SOP 2.11's two container-level settings, so 2.7 is the
+          # only check that names these workloads: the case forbids the
+          # declared workload's object in every finding id.
+          security_context {
+            allow_privilege_escalation = false
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
           resources {
             requests = { cpu = "10m", memory = "16Mi" }
             limits   = { memory = "32Mi" }
