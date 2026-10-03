@@ -296,6 +296,37 @@ def healthy_world(*projects):
             "deployment/capacity-starved-worker": {"status": {"readyReplicas": 1, "replicas": 4}},
             "deployment/first-zone-sponge": {"spec": {"replicas": 6}},
             "pod?app=capacity-starved-worker": _pods(_pod(restarts=0, last_reason=None), _pod(restarts=0, last_reason=None, phase="Pending")),
+            # seeded-a's five upgrade-failure shapes, each in its designed state:
+            # the pod runs (or the claim is bound) and the planted property is
+            # still there. The property is the defect; the Running pod says the
+            # before-state is live rather than already broken.
+            "namespace/seeded-shapes": {"metadata": {"name": "seeded-shapes"}},
+            "deployment/cache-on-emptydir": {
+                "spec": {"template": {"spec": {"volumes": [{"name": "queue", "emptyDir": {}}]}}},
+                "status": {"readyReplicas": 1, "replicas": 1},
+            },
+            "pod?app=cache-on-emptydir": _pods(_pod(restarts=0, last_reason=None)),
+            "deployment/arch-pinned-worker": {
+                "spec": {"template": {"spec": {"nodeSelector": {"beta.kubernetes.io/arch": "amd64"}}}},
+                "status": {"readyReplicas": 1, "replicas": 1},
+            },
+            "pod?app=arch-pinned-worker": _pods(_pod(restarts=0, last_reason=None)),
+            "daemonset/node-runtime-probe": {
+                "spec": {"template": {"spec": {"volumes": [{"name": "sock", "hostPath": {"path": "/run/containerd/containerd.sock", "type": "Socket"}}]}}},
+                "status": {"desiredNumberScheduled": 2, "numberReady": 2},
+            },
+            "persistentvolumeclaim/intree-pd": {"spec": {"volumeName": "intree-pd"}, "status": {"phase": "Bound"}},
+            "persistentvolume/intree-pd": {
+                "spec": {"gcePersistentDisk": {"pdName": "seeded-a-intree-pd", "fsType": "ext4"}, "claimRef": {"namespace": "seeded-shapes", "name": "intree-pd"}},
+                "status": {"phase": "Bound"},
+            },
+            "deployment/intree-pd-reader": {"status": {"readyReplicas": 1, "replicas": 1}},
+            "pod?app=intree-pd-reader": _pods(_pod(restarts=0, last_reason=None)),
+            "deployment/legacy-registry-pull": {
+                "spec": {"template": {"spec": {"containers": [{"name": "pause", "image": "k8s.gcr.io/pause:3.9", "imagePullPolicy": "Always"}]}}},
+                "status": {"readyReplicas": 1, "replicas": 1},
+            },
+            "pod?app=legacy-registry-pull": _pods(_pod(restarts=0, last_reason=None)),
         },
         "describe": {project: {"seeded-b": _cluster_b(), "seeded-c": {"currentMasterVersion": "1.34.1-gke.1"}} for project in projects},
         "server_config": {"channels": [{"channel": "REGULAR", "defaultVersion": "1.34.1-gke.1"}]},
@@ -375,10 +406,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 19, "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 24, "drifted": 0, "absent": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 19, "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 24, "drifted": 0, "absent": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -432,7 +463,7 @@ class Drift(ScanHarness):
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 37, "drifted": 1, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 47, "drifted": 1, "absent": 0, "not_checked": 0})
 
 
 class NotChecked(ScanHarness):

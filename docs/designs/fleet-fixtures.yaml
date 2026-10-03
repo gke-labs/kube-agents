@@ -283,6 +283,53 @@ fixtures:
       alone is set by healthy webhooks. Selectors confine it so it rejects no
       other scenario's writes.
 
+  - role: node-local-state
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/cache-on-emptydir
+    namespace: seeded-shapes
+    defect: >-
+      cache-on-emptydir Deployment (one replica) whose queue directory is an emptyDir: the stamp it writes at start is state that lives on the node and does not survive the node rebuild an upgrade performs
+
+  - role: deprecated-label-selector
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/arch-pinned-worker
+    namespace: seeded-shapes
+    defect: >-
+      arch-pinned-worker Deployment (one replica) with a nodeSelector on beta.kubernetes.io/arch, a label deprecated since 1.14 that the kubelet still sets; the pod schedules today and never again once a node image drops the label
+
+  - role: containerd-socket-agent
+    slot: a
+    available_from_day: 0
+    objects:
+      - daemonset/node-runtime-probe
+    namespace: seeded-shapes
+    defect: >-
+      node-runtime-probe DaemonSet mounting the containerd socket from the host, read-only, on the default pool: the agent shape a containerd major change or a CRI API removal breaks
+
+  - role: intree-pd-volume
+    slot: a
+    available_from_day: 0
+    objects:
+      - persistentvolumeclaim/intree-pd
+      - persistentvolume/intree-pd
+      - deployment/intree-pd-reader
+    namespace: seeded-shapes
+    defect: >-
+      intree-pd PersistentVolume written against the in-tree gcePersistentDisk plugin over the fleet's own disk, bound by the intree-pd claim in seeded-shapes; it attaches only through CSI migration
+
+  - role: retired-registry-image
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/legacy-registry-pull
+    namespace: seeded-shapes
+    defect: >-
+      legacy-registry-pull Deployment (one replica) pulling k8s.gcr.io/pause:3.9 with imagePullPolicy Always: a retired registry hostname that answers by redirect today, so every node rebuild pulls it again from a host that may stop
+
   - role: zonal-skew-scheduling
     slot: d
     available_from_day: 0

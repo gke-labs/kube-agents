@@ -2,9 +2,9 @@
   "schema_version": 2,
   "description": "Role catalog for the seeded fleet. A scenario names a fixture ROLE; the runner (hack/fleet-kubeconfigs.sh) discovers the leased project's seeded clusters by label, matches each to a slot below, confirms every object in the role's `probes` list is present, and only then writes that role's kubeconfig. Nothing outside this file may address a seeded cluster or an eval project directly: each project carries its own set, so a case written against one must run unchanged against all of them. Names, prefix and location are deliberately absent -- they are the Terraform's business and are read back off the discovered clusters. See README.md, 'Addressing a fixture by role'. One sanctioned exception, which discovers by these same labels and the trailing -<slot> name rule: hack/ci-eval-pr.sh section 3b reuses the slot-c cluster as the gpu-stress-test log-fixture subject -- it mutates nothing in-cluster, writes only project-level Cloud Logging entries that name the cluster, and falls back to a per-run cluster when slot c is absent, not RUNNING, or its default namespace is not empty. hack/fleet-fixture-state.py discovers nothing: it reads the slot's cluster name and location back out of the `.fleet-context` file the runner wrote, for the `cluster` state subjects below.",
   "probe_syntax": "Each probe is `<kind>/<name>` or `<kind>?<label-selector>`, read against the role's `namespace` when it has one. A role's namespace is probed implicitly. A probe is the runner's promise that the object was THERE before the agent ran, and it is the only thing that entitles a check to call the same object's later absence a violation rather than an environment that was never ready -- so every subject a task.yaml asserts on must appear here, which bench/tests/test_fleet_verifier.py enforces in both directions. A role with an empty list confirms nothing, and its checks can never blame the run for an absence.",
-  "state_syntax": "Presence is not state (#1278: every probe passed while payments-api sat Pending on 30 projects). Each `state` entry is one assertion about the DESIGNED observable state of a role whose probes passed, evaluated by hack/fleet-fixture-state.py after the runner publishes the role: `subject` is a probe-shaped `<kind>/<name>`, `<kind>?<label-selector>` or bare `<kind>?` (every object of that kind in the role's namespace), or the word `cluster` for the GKE cluster carrying the role, read with `clusters describe` on the name the runner recorded; `path` is a dotted field path with `[*]`, `[N]` or `[?(@.key=='value')]` steps; `op` is `eq`, `ge`, `any_eq`, `any_ge`, `none_eq` (each with a `value`), `absent` (no value, no objects or no values at the path), `after_now` (an RFC 3339 timestamp still ahead), or `minor_behind_channel_default` (cluster subject only: the minor is `value` behind the cluster's own release channel default); `why` says what the cases lose when it fails. A role whose fixture is present but fails any assertion is DRIFTED: scripts/verify_ci_pool_project.py fails the project, and the script writes `<role>.drift` beside the role's kubeconfig, one failed assertion per line with what was observed (#1544). The presubmit does not run this pass and never acts on a drift; a scheduled scan of every pool project from the CI health bot is the follow-up on #1550. A role with an empty list asserts nothing beyond presence.",
+  "state_syntax": "Presence is not state (#1278: every probe passed while payments-api sat Pending on 30 projects). Each `state` entry is one assertion about the DESIGNED observable state of a role whose probes passed, evaluated by hack/fleet-fixture-state.py after the runner publishes the role: `subject` is a probe-shaped `<kind>/<name>`, `<kind>?<label-selector>` or bare `<kind>?` (every object of that kind in the role's namespace), or the word `cluster` for the GKE cluster carrying the role, read with `clusters describe` on the name the runner recorded; `path` is a dotted field path with `[*]`, `[N]` or `[?(@.key=='value')]` steps; `op` is `eq`, `ge`, `any_eq`, `any_ge`, `none_eq` (each with a `value`), `absent` (no value, no objects or no values at the path), `after_now` (an RFC 3339 timestamp still ahead), or `minor_behind_channel_default` (cluster subject only: the minor is `value` behind the cluster's own release channel default); `why` says what the cases lose when it fails. A role whose fixture is present but fails any assertion is DRIFTED: scripts/verify_ci_pool_project.py fails the project, and the script writes `<role>.drift` beside the role's kubeconfig, one failed assertion per line with what was observed (#1544). The presubmit does not run this pass and never acts on a drift; a scheduled scan of every pool project from the CI health bot is the follow-up on #1550. A role with an empty list asserts nothing beyond presence. A `value` may be an object or an empty object; it is compared whole, so an assertion on `nodeSelector` names every key the fixture sets and an `emptyDir` with no fields is `{}`.",
   "cluster_slots": {
-    "a": "The five seeded workload namespaces, plus the idle and pinned node pools.",
+    "a": "The eight seeded workload namespaces, plus the idle and pinned node pools.",
     "b": "Control plane held one minor behind the REGULAR channel default, plus the upgrade-readiness drain defects.",
     "c": "The consistency outlier: no master authorized networks.",
     "d": "Multi-zonal: nodes in two zones, carrying the zonal-skew fixtures. The only slot whose shape is the fixture."
@@ -532,6 +532,135 @@
           "op": "eq",
           "value": "128Mi",
           "why": "a resize anyone applies removes the posture the declaration covers, and the case then grades nothing"
+        }
+      ]
+    },
+    "node-local-state": {
+      "cluster_slot": "a",
+      "namespace": "seeded-shapes",
+      "probes": ["deployment/cache-on-emptydir"],
+      "fixture": "cache-on-emptydir Deployment (one replica) whose queue directory is an emptyDir: the stamp it writes at start is state that lives on the node and does not survive the node rebuild an upgrade performs",
+      "state": [
+        {
+          "subject": "pod?app=cache-on-emptydir",
+          "path": "status.phase",
+          "op": "any_eq",
+          "value": "Running",
+          "why": "the before-state is a running pod holding state on its node; a Pending pod holds nothing a rebuild could lose"
+        },
+        {
+          "subject": "deployment/cache-on-emptydir",
+          "path": "spec.template.spec.volumes[?(@.name=='queue')].emptyDir",
+          "op": "any_eq",
+          "value": {},
+          "why": "the emptyDir is the defect. Move the queue to a PersistentVolumeClaim and the rebuild loses nothing -- the fixture is healed while the pod still runs"
+        }
+      ]
+    },
+    "deprecated-label-selector": {
+      "cluster_slot": "a",
+      "namespace": "seeded-shapes",
+      "probes": ["deployment/arch-pinned-worker"],
+      "fixture": "arch-pinned-worker Deployment (one replica) with a nodeSelector on beta.kubernetes.io/arch, a label deprecated since 1.14 that the kubelet still sets; the pod schedules today and never again once a node image drops the label",
+      "state": [
+        {
+          "subject": "pod?app=arch-pinned-worker",
+          "path": "status.phase",
+          "op": "any_eq",
+          "value": "Running",
+          "why": "the before-state is a pod that schedules on today's label; a pod already Pending is the after-state, not the fixture"
+        },
+        {
+          "subject": "deployment/arch-pinned-worker",
+          "path": "spec.template.spec.nodeSelector",
+          "op": "eq",
+          "value": {
+            "beta.kubernetes.io/arch": "amd64"
+          },
+          "why": "the selector on the beta label is the defect. Replace the key with kubernetes.io/arch, or drop it, and no node image change can strand the pod -- healed while every probe still passes"
+        }
+      ]
+    },
+    "containerd-socket-agent": {
+      "cluster_slot": "a",
+      "namespace": "seeded-shapes",
+      "probes": ["daemonset/node-runtime-probe"],
+      "fixture": "node-runtime-probe DaemonSet mounting the containerd socket from the host, read-only, on the default pool: the agent shape a containerd major change or a CRI API removal breaks",
+      "state": [
+        {
+          "subject": "daemonset/node-runtime-probe",
+          "path": "status.numberReady",
+          "op": "any_ge",
+          "value": 1,
+          "why": "an agent that is not running on any node holds no socket; the before-state needs at least one node where the mount succeeded"
+        },
+        {
+          "subject": "daemonset/node-runtime-probe",
+          "path": "spec.template.spec.volumes[?(@.name=='sock')].hostPath.path",
+          "op": "any_eq",
+          "value": "/run/containerd/containerd.sock",
+          "why": "the socket mount is the defect. An agent reading the CRI through the kubelet's API instead has nothing a runtime change can take away"
+        }
+      ]
+    },
+    "intree-pd-volume": {
+      "cluster_slot": "a",
+      "namespace": "seeded-shapes",
+      "probes": [
+        "persistentvolumeclaim/intree-pd",
+        "persistentvolume/intree-pd",
+        "deployment/intree-pd-reader"
+      ],
+      "fixture": "intree-pd PersistentVolume written against the in-tree gcePersistentDisk plugin over the fleet's own disk, bound by the intree-pd claim in seeded-shapes and mounted by the intree-pd-reader Deployment, so the attach goes through CSI migration",
+      "state": [
+        {
+          "subject": "persistentvolumeclaim/intree-pd",
+          "path": "status.phase",
+          "op": "eq",
+          "value": "Bound",
+          "why": "an unbound claim says the disk or the volume is gone, which is the after-state of a different failure; the fixture is a volume that binds today through migration"
+        },
+        {
+          "subject": "persistentvolumeclaim/intree-pd",
+          "path": "spec.volumeName",
+          "op": "eq",
+          "value": "intree-pd",
+          "why": "the claim has to be bound to the in-tree volume, not to a CSI volume a storage class provisioned in its place -- that would be the heal"
+        },
+        {
+          "subject": "persistentvolume/intree-pd",
+          "path": "spec.csi",
+          "op": "absent",
+          "why": "the in-tree source is the defect. A volume recreated on the PD CSI driver carries spec.csi and attaches without migration -- the heal, with the claim still Bound"
+        },
+        {
+          "subject": "pod?app=intree-pd-reader",
+          "path": "status.phase",
+          "op": "any_eq",
+          "value": "Running",
+          "why": "the attach is the before-state: a Running pod with the claim mounted shows CSI migration still carries the in-tree volume. A pod stuck in ContainerCreating is the after-state the entry describes"
+        }
+      ]
+    },
+    "retired-registry-image": {
+      "cluster_slot": "a",
+      "namespace": "seeded-shapes",
+      "probes": ["deployment/legacy-registry-pull"],
+      "fixture": "legacy-registry-pull Deployment (one replica) pulling k8s.gcr.io/pause:3.9 with imagePullPolicy Always: a retired registry hostname that answers by redirect today, so every node rebuild pulls it again from a host that may stop",
+      "state": [
+        {
+          "subject": "pod?app=legacy-registry-pull",
+          "path": "status.phase",
+          "op": "any_eq",
+          "value": "Running",
+          "why": "the before-state is an image that still pulls; ImagePullBackOff is the after-state the catalogue describes, not the fixture"
+        },
+        {
+          "subject": "deployment/legacy-registry-pull",
+          "path": "spec.template.spec.containers[*].image",
+          "op": "any_eq",
+          "value": "k8s.gcr.io/pause:3.9",
+          "why": "the retired hostname is the defect. Repointing the image at registry.k8s.io heals it while the pod keeps running"
         }
       ]
     }
