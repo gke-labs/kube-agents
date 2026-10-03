@@ -766,12 +766,11 @@ and the tool refusing is what decides it. It costs
 less than the earlier paragraph priced a read-only tree at: entrypoint step
 2.6a replaces every specialist profile's `skills/` from the image on each
 start, so what `skill_manage` authors there was never durable. The sandbox's
-copy of the same trees is still writable by what runs in the sandbox (a shell
-command, `execute_code`, or a file tool writing through a symlink made there,
-which the gateway-side guard cannot see) for as long as that sandbox pod runs;
-that edit never reaches the gateway and is replaced from the image when the
-sandbox restarts. Leaving that copy root-owned would close it
-(gke-labs/kube-agents#2096).
+copy of the same trees is closed at the sandbox end instead: it is root-owned
+and mounted read-only, so what runs there (a shell command, `execute_code`, or
+a file tool writing through a symlink made there, which the gateway-side guard
+cannot see) cannot rewrite it either; see "The delivered trees are read-only
+mounts" below.
 
 Two things the sandbox-end closure does not close. Skills are not the only executable content under
 `~/.hermes`, so the guarantee rests on the directory being unwritable rather
@@ -1198,15 +1197,18 @@ wrong if the sandbox ever holds credentials of its own.
 
 ### Where the model's files go
 
-The sandbox has three directories that matter and only one of them keeps anything.
+The directories that matter in the sandbox are these. The `<tree>` row is `skills`, `scripts` and `governance`, under both `/opt/data` and
+`/opt/data/profiles/platform`; see
+[The delivered trees are read-only mounts](#the-delivered-trees-are-read-only-mounts).
 
-| Path                    | Backing                        | Owner    | What it is                      |
-| ----------------------- | ------------------------------ | -------- | ------------------------------- |
-| `/opt/data`             | `data` PVC                     | uid 1000 | the model's work                |
-| `/home/agent`           | the container's ephemeral disk | uid 1000 | the login's home                |
-| `/home/hermes`          | the container's ephemeral disk | uid 1001 | the trusted principal's home    |
-| `/var/lib/sandbox-sshd` | `sshd` PVC                     | root     | the host keys                   |
-| `/opt/vcs/libexec`      | the image                      | root     | what the trusted principal runs |
+| Path                    | Backing                        | Owner    | What it is                        |
+| ----------------------- | ------------------------------ | -------- | --------------------------------- |
+| `/opt/data`             | `data` PVC                     | uid 1000 | the model's work                  |
+| `/opt/data/<tree>`      | `data` PVC, read-only mounts   | root     | the image's skills, scripts, SOPs |
+| `/home/agent`           | the container's ephemeral disk | uid 1000 | the login's home                  |
+| `/home/hermes`          | the container's ephemeral disk | uid 1001 | the trusted principal's home      |
+| `/var/lib/sandbox-sshd` | `sshd` PVC                     | root     | the host keys                     |
+| `/opt/vcs/libexec`      | the image                      | root     | what the trusted principal runs   |
 
 **The homes are ephemeral on purpose.** `agent` owns `/home/agent/.bashrc`, bash sources
 it for a non-interactive `ssh host cmd`, and the model can delete Debian's
@@ -1256,18 +1258,20 @@ can author is arbitrary code execution as `hermes`. `/opt/data` is now durable a
 as model-writable, which makes it a worse place for that file rather than a better one.
 
 **The same rule reaches what an agent-pod caller executes here, not just what it reads.**
-The shared scripts are staged twice. `/opt/data/scripts` is the model's copy — that is
-the path every SKILL.md names, the entrypoint replaces it from the image on each start,
-and an edit the model makes to it stands until then. `/opt/vcs/libexec/platform` is the
-second copy, root-owned and mode 0755, and it is the one a caller that logs in as
-`hermes` runs: the pull-request and issue crons forward a forge verb into this container
-rather than holding a forge CLI themselves, and running the model's copy over that
-session would be the credential handed to whatever the model last wrote there. The whole
-import closure is staged, because `sys.path[0]` is the script's own directory and a
-module missing from the root-owned copy would be found in the model's one instead. The
-build proves the staging is complete by importing each entry point and reading `__file__`
-off every module that loaded: one that resolved outside the root-owned copy and the
-standard library fails the image. What those scripts put on `sys.path` themselves — the
+The shared scripts are staged twice. `/opt/data/scripts` is the copy every SKILL.md
+names. Under the operator it is a read-only mount the model cannot edit or move; outside
+the operator's StatefulSet it is a root-owned copy inside a directory the model owns, so
+the model can rename it aside and put its own in its place until the next start.
+`/opt/vcs/libexec/platform` is the second copy, root-owned and mode 0755, and it is the
+one a caller that logs in as `hermes` runs: the pull-request and issue crons forward a
+forge verb into this container rather than holding a forge CLI themselves, and running
+the data volume's copy over that session would hand the credential to whatever sits at
+that path. The read-only mount narrows that to the fallback, and the second copy stays
+as defence in depth. The whole import closure is staged, because `sys.path[0]` is the
+script's own directory and a module missing from the root-owned copy would be found in
+the data volume's one instead. The build proves the staging is complete by importing
+each entry point and reading `__file__` off every module that loaded: one that resolved
+outside the root-owned copy and the standard library fails the image. What those scripts put on `sys.path` themselves — the
 two agent-pod directories they use to find their siblings — is left off when the file
 they are running from is the root-owned copy, so a gap a later edit opens has nothing
 model-writable to fall through to.
@@ -1326,10 +1330,11 @@ prevent — so it exits `EXIT_FATAL`, the container refuses to start, and
 exits `EXIT_RETRY`: the entrypoint warns and the agent starts.
 
 The dividing line is who can provoke the failure, not how bad it looks. Everything under
-the sandbox's `/opt/data` is owned by uid 1000 and the volume outlives the pod, so the model
-decides what the next root-run start finds there — and while any non-zero exit was fatal, a
-single `touch /opt/data/scratch` or `rm -f /opt/data/.sandbox` from a sandbox shell was a
-permanent `CrashLoopBackOff` on the gateway. Nothing on either side cleared it, and the
+the sandbox's `/opt/data` except the image's trees is owned by uid 1000 and the volume
+outlives the pod, so the model decides what the next root-run start finds there — and
+while any non-zero exit was fatal, a single `touch /opt/data/scratch` or
+`rm -f /opt/data/.sandbox` from a sandbox shell was a permanent `CrashLoopBackOff` on
+the gateway. Nothing on either side cleared it, and the
 agent could not repair what had to be running to be asked. Nothing has been copied at either
 of those points, so nothing is lost by coming up without them and retrying next start.
 
@@ -1391,13 +1396,14 @@ reconcile that would take the agent down with it.
 
 ### What persists, and for how long
 
-| Thing             | Mechanism                                 | Lifetime               |
-| ----------------- | ----------------------------------------- | ---------------------- |
-| Files             | the sandbox's `data` volume, `/opt/data`  | the sandbox's lifetime |
-| Working directory | in-band stdout marker, tracked in Hermes  | the task's environment |
-| Environment vars  | `export -p` snapshot file in the sandbox  | the sandbox's lifetime |
-| Shell processes   | nothing — every call is a fresh `bash -c` | one command            |
-| Background jobs   | only if explicitly detached               | until the pod restarts |
+| Thing                 | Mechanism                                 | Lifetime                     |
+| --------------------- | ----------------------------------------- | ---------------------------- |
+| Files                 | the sandbox's `data` volume, `/opt/data`  | the sandbox's lifetime       |
+| Skills, scripts, SOPs | the image, staged read-only on the volume | re-staged at every pod start |
+| Working directory     | in-band stdout marker, tracked in Hermes  | the task's environment       |
+| Environment vars      | `export -p` snapshot file in the sandbox  | the sandbox's lifetime       |
+| Shell processes       | nothing — every call is a fresh `bash -c` | one command                  |
+| Background jobs       | only if explicitly detached               | until the pod restarts       |
 
 Sandbox lifetime should be tied to the agent, not to the conversation. The agent is a
 long-running operator, not a session; a per-conversation sandbox would throw away
@@ -1648,14 +1654,14 @@ that expects to _read_ something the agent pod put at `/opt/data` still finds no
 Enumerating what the sandbox legitimately needs sorts the references into six classes
 with four delivery mechanisms.
 
-| What                                         | Where it comes from                                | Why                                           |
-| -------------------------------------------- | -------------------------------------------------- | --------------------------------------------- |
-| Persona (`SOUL.md`, `AGENTS.md`)             | stays in the agent pod                             | read into the prompt, never through the shell |
-| Skills, including their `scripts/`           | baked at `/opt/defaults`, synced by the entrypoint | the existing sync delivers the wrong tree     |
-| Governance SOPs                              | the same bake and sync                             | static, versioned with the repo               |
-| The shell-invoked subset of `scripts/`       | the same bake and sync, as an allowlist            | static, and the subset is small               |
-| `SETTINGS.md`                                | ConfigMap mounted into the sandbox pod             | per-install content, rendered by the operator |
-| Outputs (`INVENTORY.md`, scratch workspaces) | written to `/opt/data` at runtime                  | data, not delivery                            |
+| What                                         | Where it comes from                                      | Why                                           |
+| -------------------------------------------- | -------------------------------------------------------- | --------------------------------------------- |
+| Persona (`SOUL.md`, `AGENTS.md`)             | stays in the agent pod                                   | read into the prompt, never through the shell |
+| Skills, including their `scripts/`           | baked at `/opt/defaults`, staged read-only on the volume | the existing sync delivers the wrong tree     |
+| Governance SOPs                              | the same bake and staging                                | static, versioned with the repo               |
+| The shell-invoked subset of `scripts/`       | the same bake and staging, as an allowlist               | static, and the subset is small               |
+| `SETTINGS.md`                                | ConfigMap mounted into the sandbox pod                   | per-install content, rendered by the operator |
+| Outputs (`INVENTORY.md`, scratch workspaces) | written to `/opt/data` at runtime                        | data, not delivery                            |
 
 **The persona stays behind, and that is a property rather than an omission.** Nothing
 writes `SOUL.md` through the shell. The only writer is
@@ -1692,20 +1698,22 @@ and puts it in the prompt, and every path a `SKILL.md` then names resolves throu
 `HERMES_HOME` or `TERMINAL_CWD` — both `/opt/data` in the sandbox, and both the baked
 tree.
 
-**Skills, governance and the shared scripts are baked, and synced onto the volume by
-the entrypoint.** Baking them at `/opt/data` directly does not work: the StatefulSet
+**Skills, governance and the shared scripts are baked, and staged onto the volume at
+every pod start.** Baking them at `/opt/data` directly does not work: the StatefulSet
 mounts a PVC over that path and the image's copy disappears under it. This is the
 problem the agent image already solved, and the sandbox uses the same shape — the
-image stages at `/opt/defaults`, and `deploy/sandbox/entrypoint.sh` copies it onto the
-volume on every start, before sshd is exec'd.
+image stages at `/opt/defaults`, and `deploy/sandbox/entrypoint.sh`, run as an init
+container, copies it onto the volume before the shell container starts. The shell
+container then mounts each tree read-only.
 
-The sync replaces rather than merges. Copying over the top leaves a skill deleted from
-the image, or a script renamed in it, sitting on the volume for as long as the PVC
-lives and looking current. That makes the trees image-owned, and they are not the
-model's to change: the personas forbid it, because an edit made anyway is run by every
-later session in the pod until the next restart. To debug a script, copy it to
-`/opt/data/scratch` and run the copy. Model-written files belong in `/opt/data/scratch`
-and `/opt/data/gitops`, which the sync does not touch.
+The staging replaces rather than merges. Copying over the top leaves a skill deleted
+from the image, or a script renamed in it, sitting on the volume for as long as the PVC
+lives and looking current. That makes the trees image-owned, and the shell sees them
+root-owned and read-only: the model's write to a file fails with `Permission denied`,
+and creating or removing one fails with `Read-only file system`, as does any write by
+root. To debug a script, copy it to `/opt/data/scratch` and run the copy.
+Model-written files belong in `/opt/data/scratch` and `/opt/data/gitops`, which the
+staging does not touch.
 
 Extending Hermes' sync to cover governance and scripts was the alternative, and it
 keeps one mechanism instead of two. It was rejected before the measurement above and
@@ -1800,6 +1808,113 @@ file or directory` naming an interpreter rather than the script. They now use
 in the four imports a third-party module, so neither image cares which Python answers;
 `python:3.14-slim` has no `/usr/bin/python3` at all, so there was nothing to fall
 through to.
+
+#### The delivered trees are read-only mounts
+
+A tree the model can write is a tree it can rewrite for the agent. A `SKILL.md` it edits
+is instructions the next worker follows, and a script it edits under `/opt/data/scripts`
+runs the next time a skill names it. Re-staging undoes an edit only at the next pod
+start, and every command until then runs the model's version. So under the operator the
+model cannot change the trees at all.
+
+The operator's StatefulSet does this in two steps, from constants in
+[`shell_sandbox_manifests.go`](../../k8s-operator/internal/controller/shell_sandbox_manifests.go).
+An init container, `prepare-image-trees`, runs the sandbox image with
+`--prepare-image-trees` and mounts only the data volume, at `/opt/data`. For each home
+root, `/opt/data` and `/opt/data/profiles/platform`, it removes a symlink or moves aside
+a non-directory on every path that is about to become a mount point, then replaces
+`skills`, `scripts` and `governance` with fresh copies from `/opt/defaults`, owned by
+root and not writable by group or other. It exits before writing anything to the root
+filesystem. The shell container then mounts each of the six `<home>/<tree>` paths as a
+read-only `subPath` of the same volume, and mounts `profiles` and `profiles/platform`
+read-write over themselves. Kubelet resolves a container's `subPath` mounts when it
+creates that container, which is after the init container has finished, and no model
+code runs in the pod before then.
+
+That turns each route the model had into an error. A write to a staged file (`>>`, a
+file tool writing through a symlink in scratch) gets `EACCES`, because the model does
+not own it; creating or removing a file in a tree (`sed -i`'s temporary file, `rm`)
+gets `EROFS`, which is also what a uid that passes the permission check gets, root
+included. The shell has no `CAP_SYS_ADMIN` to remount. Renaming or removing a tree
+gets `EBUSY`, because the tree is a mount point. Renaming `profiles` or
+`profiles/platform` gets `EBUSY` for the same reason, and `/opt/data` is the volume's
+own mount point.
+
+The shell's entrypoint does not assume the mounts are there. The operator sets
+`SANDBOX_IMAGE_TREES=read-only-mounts` on the shell container, and with it set the
+entrypoint requires every `<home>/<tree>` to appear in `/proc/self/mountinfo` as a mount
+point with `ro` in its options, and every directory between `/opt/data` and a home to be
+a mount point. If one does not, it exits 1 naming the path and the sandbox does not start, so a missing mount fails as loudly as a writable one. The cost is
+that a mount problem takes the whole shell down instead of running with the gap.
+`SANDBOX_HOME_ROOTS` is set on both containers from the same constant that generates the
+mounts, so the init container stages exactly the paths the shell checks.
+
+**The ancestors are mount points because `rename(2)` checks only the entry it renames.**
+Linux's `vfs_rename` and gVisor's `PrepareRenameDentry` both refuse to move a mount point,
+and neither looks at what is mounted below the directory being moved. Without the two
+self-mounts, `mv /opt/data/profiles /opt/data/x && mkdir -p
+/opt/data/profiles/platform/scripts` succeeds: the read-only mounts travel with the
+renamed directory, and the path every SOP names is now a directory the model created.
+Every directory strictly between `/opt/data` and a tree has to be a mount of the data
+volume for the tree mounts to hold. An operator test asserts that for every read-only
+tree mount the builder renders, so a home added without its pins fails the tests.
+
+**Root ownership alone does not hold.** A root-owned tree stops an in-place edit, but
+`/opt/data` and the home roots belong to uid 1000, and renaming an entry needs write
+permission on the directory that holds it, not on the entry. The model could move the
+root-owned tree aside, create its own at the same path, and the next command would run
+it. Making the parent directories root-owned or sticky instead changes the ownership
+rules for all of `/opt/data`, which the model needs to own, and keeps the guarantee in
+the entrypoint's bash rather than in the pod spec.
+
+**Image volumes were not used.** A Kubernetes `image` volume would mount the trees
+read-only straight from an OCI image, with no staging step. GKE Autopilot's Warden does
+not admit them, they are not enabled by default below Kubernetes 1.35, and they mount
+`noexec`, so a shared script could not run by its path.
+
+**The source is the data volume, not an `emptyDir`.** Staging into three `emptyDir`
+volumes would keep the tree bytes off the model's PVC, but it depends on an `emptyDir`
+written by an init container reaching the shell container intact under gVisor, which has
+not been tested. The ancestor pins are `subPath` mounts of the data volume anyway, so
+staging on it uses one mechanism for both. It also adds no pod volume and no
+`sizeLimit`, and it keeps a rollback simple: an older entrypoint runs as root, so its
+`rm -rf` and `cp` replace root-owned trees as readily as agent-owned ones. A volume that
+still holds agent-owned copies from an older sandbox has them replaced in place rather
+than hidden under a mount.
+
+**The pins cost a filesystem boundary.** `/opt/data`, `/opt/data/profiles` and
+`/opt/data/profiles/platform` are separate mounts, so `rename(2)` from one to another
+returns `EXDEV` (`Invalid cross-device link`). `mv` falls back to a copy and a delete;
+`os.replace` and `os.rename` do not. Every `os.replace` in the shipped scripts renames a
+temporary file inside one directory, so none of them crosses. `rm -rf /opt/data/profiles`
+from the shell stops partway, at the first mount point.
+
+**Outside the operator's StatefulSet the trees are only root-owned.** With
+`SANDBOX_IMAGE_TREES` unset (a plain `docker run`, or an operator from before the mounts)
+nothing made the mounts, so the entrypoint stages the trees itself as root-owned copies
+and logs that rename-aside is still possible. In-place edits are refused there; moving a
+tree aside is not.
+
+**The operator and the sandbox image move together.** An operator that renders the init
+container needs a sandbox image that knows `--prepare-image-trees`. A CR or
+`AGENT_SANDBOX_IMAGE` that pins an older sandbox image under this operator leaves the
+init container failing and the shell never starting: the older entrypoint ignores the
+argument, runs its own staging, and exits on the `authorized_keys` the init container
+does not mount, so the error names a missing key rather than the version skew. The other direction is safe: a
+newer image under an older operator gets no `SANDBOX_IMAGE_TREES` and takes the
+fallback.
+
+**The home directory is not covered.** `/home/agent` is owned by uid 1000 and lasts as
+long as the shell container, the same lifetime a tree edit had before the mounts. A
+module in the user site-packages directory, or a shell startup file, is code that later
+`agent` sessions run without any tree changing. Closing that is separate work: a
+root-owned home, or `PYTHONNOUSERSITE` and a fixed `BASH_ENV` in the session
+environment.
+
+**`/opt/defaults` is root-owned in the image.** It is the source every start copies
+from, and several shared scripts append `/opt/defaults/scripts` to `sys.path`, so a
+writable `/opt/defaults` would let the model shadow a module those scripts import. The
+build fails if anything under it is not owned by root or is writable by group or other.
 
 #### Cron scripts stay in the agent pod and reach into the sandbox from there
 
@@ -2875,6 +2990,10 @@ anyway is in [The Session KV store](#the-session-kv-store).
   of the `sync_back` question above.
 - **Whether `sync_back` should be on at all.** Stated above as an open decision, not
   a resolved one.
+- **The read-only tree mounts under gVisor.** The entrypoint's gate reads
+  `/proc/self/mountinfo`, so it depends on the sentry listing the `subPath` mounts with
+  `ro`, and the `EBUSY` on the trees and their pinned ancestors depends on its rename
+  check. Both follow from the sentry's code and have not been run on a sandboxed pod.
 - **Whether the operator should own the sandbox at all**, or whether it belongs to a
   second controller with its own lifecycle. Reconciling it alongside the gateway is
   the smaller change and the one sketched; it also means a bad sandbox spec is a

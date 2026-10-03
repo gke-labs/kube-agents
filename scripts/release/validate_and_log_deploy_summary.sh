@@ -66,4 +66,7 @@ echo "Memory Provider:            ${MEMORY_PROVIDER:-<NOT SET>}"
 echo "User Profile Enabled:       ${USER_PROFILE_ENABLED:-<NOT SET>}"
 echo "Pub/Sub Platform Plugin:    ${ENABLE_PUBSUB_PLATFORM:-<DEFAULT (false)>}"
 echo "Stockout Investigator:      ${ENABLE_STOCKOUT_INVESTIGATOR:-<DEFAULT (false)>}"
+# The one line here whose unset case provisions rather than skips: the default
+# is true, and it is a Log Router sink over every cluster in the project.
+echo "GitOps Drift Detector:      ${ENABLE_DRIFT_DETECTOR:-<DEFAULT (true)>}"
 echo "======================================================================"

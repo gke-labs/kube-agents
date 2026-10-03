@@ -79,6 +79,7 @@ _FLUENT_BIT_CONTAINER = "fluent-bit"
 _AGENT_API_AUTH_CONTAINER = "agent-api-auth"
 _SANDBOX_CLEANUP_CONTAINER = "sandbox-credential-cleanup"
 _SANDBOX_SSH_KEY_CONTAINER = "sandbox-ssh-key"
+_PREPARE_IMAGE_TREES_CONTAINER = "prepare-image-trees"
 
 _KIND_STATEFULSET = "StatefulSet"
 _KIND_DEPLOYMENT = "Deployment"
@@ -190,6 +191,9 @@ _IGNORED_CONTAINERS: dict[str, str] = {
     ),
     _container_key(_GATEWAY_WORKLOAD_KEY, _SANDBOX_SSH_KEY_CONTAINER): (
         "ordinary init container, requests less than the gateway pod's container sum"
+    ),
+    _container_key(_SHELL_WORKLOAD_KEY, _PREPARE_IMAGE_TREES_CONTAINER): (
+        "ordinary init container, requests less than the shell container"
     ),
 }
 

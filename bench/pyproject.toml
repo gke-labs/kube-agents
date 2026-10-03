@@ -43,7 +43,8 @@ kubeagents = "kube_agents_bench.harness:KubeAgentsHarness"
 # the per-run transcript stash (kube_agents_bench/transcript.py), which is what
 # makes report-text, tool-trace and published-artifact checks possible without
 # an upstream change; fleet_resource_property reads cluster state, but the
-# cluster of a seeded-fleet fixture ROLE rather than the ambient one.
+# cluster of a seeded-fleet fixture ROLE rather than the ambient one;
+# sandbox_tree_matches_image execs into the agent's own shell sandbox pod.
 #
 # A key already in the registry when the scan runs is SKIPPED (see
 # devops_bench.core.registry), and upstream registers `resource_property` at
@@ -60,6 +61,7 @@ github_writes = "kube_agents_bench.verifiers:GitHubWritesVerifier"
 ledger_issue_contains = "kube_agents_bench.verifiers:LedgerIssueContainsVerifier"
 pull_request_opened = "kube_agents_bench.verifiers:PullRequestOpenedVerifier"
 report_contains = "kube_agents_bench.verifiers:ReportContainsVerifier"
+sandbox_tree_matches_image = "kube_agents_bench.verifiers:SandboxTreeMatchesImageVerifier"
 worker_commands = "kube_agents_bench.verifiers:WorkerCommandsVerifier"
 tool_called = "kube_agents_bench.verifiers:ToolCalledVerifier"
 
