@@ -23,6 +23,7 @@ MOCK_REQUIRED_RELEASE_IMAGES = [
     "a2a-gateway",
     "a2a-worker",
     "a2a-authcallout",
+    "a2a-verifier",
     "hermes-bridge",
 ]
 

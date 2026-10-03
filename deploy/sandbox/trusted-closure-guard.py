@@ -9,18 +9,20 @@ at the top of the COPY block in the Dockerfile.
 `-P` and a `PYTHONPATH` of the trusted directory alone are not enough to show
 that, and the comment that said they were is what this file replaces. Both
 `resolver.py` and `vcs_client.py` append `/opt/defaults/scripts` and
-`/opt/data/scripts` to `sys.path` at import time -- the first of those is
-populated at build time and `chown agent:agent` at runtime -- so a module that
-loads after them can resolve from an agent-owned directory and an import-only
-check still passes. What proves the closure is where each module actually came
+`/opt/data/scripts` to `sys.path` at import time. Both are root-owned now, and
+the second is a read-only mount under the operator, but the image also runs
+outside the operator and under older entrypoints that gave them to uid 1000,
+so this holds the closure without relying on either: a module that loads after
+them could resolve from one of those directories and an import-only check would
+still pass. What proves the closure is where each module actually came
 from, so that is what is checked: import the entry points, then read `__file__`
 off everything that got loaded.
 
 The second thing checked is `sys.path` itself, after everything has loaded.
 The trusted copies drop `/opt/defaults/scripts` and `/opt/data/scripts` from
 the path when they find themselves under the trusted directory; a module that
-put either back -- under any spelling -- would leave a uid-1000-writable
-directory for a *deferred* import to resolve from, which the `__file__` walk
+put either back -- under any spelling -- would leave a directory outside the
+trusted copy for a *deferred* import to resolve from, which the `__file__` walk
 above cannot see because that import has not happened yet.
 
 A failure here means a module in the closure was not added to the COPY list,

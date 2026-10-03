@@ -272,7 +272,9 @@ RUN apt-get update && \
 # empty read-only volume over this path (shellSandboxHermesHomePath in
 # k8s-operator/internal/controller/shell_sandbox_manifests.go), which makes the
 # rmdir EBUSY. A build of this image run outside that StatefulSet keeps the mode
-# and loses the guarantee.
+# and loses the guarantee. The image trees under /opt/data use the same pattern
+# for the same reason: root-owned files, and a read-only mount over each tree so
+# the model cannot swap the directory (deploy/sandbox/entrypoint.sh, step 1a).
 #
 # The far end degrades quietly, which is why this works from one side.
 # _ensure_remote_dirs runs `mkdir -p` and ignores the exit status; the push then
@@ -357,11 +359,12 @@ COPY --chmod=0755 deploy/sandbox/entrypoint.sh /usr/local/bin/sandbox-entrypoint
 COPY --chmod=0755 deploy/sandbox/session-command.sh /usr/local/bin/sandbox-session-command
 
 # What the agent's shell actually reads and runs, staged at /opt/defaults for the
-# entrypoint to force-sync onto the volume. Same two-part arrangement as the agent
-# image (deploy/shared/docker-entrypoint.sh steps 2a/2b): a PVC mounts over
+# entrypoint to copy onto the volume (step 1a). Same two-part arrangement as the
+# agent image (deploy/shared/docker-entrypoint.sh steps 2a/2b): a PVC mounts over
 # /opt/data and would otherwise shadow anything baked there, so the image keeps its
 # copy somewhere the mount cannot reach and the entrypoint puts it in place on
-# every start.
+# every start -- under the operator, from the init container, before the shell
+# mounts each tree read-only.
 #
 # It has to be here at all because the shell moved. A SKILL.md tells the model to
 # run `"$HERMES_HOME"/scripts/github_token_refresh.py`; before #737 that resolved
@@ -521,12 +524,20 @@ COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/eo
 # design has these executed directly, so the mode has to say so. The agent image
 # does exactly this to the same tree.
 #
-# Then ownership. /opt/data is agent-owned and the entrypoint copies these into it,
-# so the model can edit what it runs and lose the edit at the next restart — the
-# same contract the agent pod's force-sync gives. That is not a trust boundary: the
-# `hermes` principal must never execute anything under /opt/data, because uid 1000
-# owns that mount point and can rename any directory in it aside. What `hermes`
-# runs comes off PATH, out of root-owned /opt/credential-proxy/bin.
+# Then ownership, which is root's, and a guard that fails the build if any of it
+# is not. The model runs these files and so does the agent pod's code over ssh,
+# so neither this staging copy nor the copies the entrypoint makes of it may be
+# something uid 1000 can change. Most skill scripts and several shared ones
+# append /opt/defaults/scripts to `sys.path` to find their siblings (audit_report,
+# vcs and vcs_client among them); an agent-owned directory there would let the
+# model supply any module the earlier entries miss. The copies under /opt/data are
+# root-owned too, and under the operator each tree is also a read-only mount;
+# deploy/sandbox/entrypoint.sh, step 1a, has why the mount is needed as well.
+#
+# Still not a trust boundary for the `hermes` principal, which must never
+# execute anything under /opt/data: the model owns the rest of that volume. What
+# `hermes` runs comes off PATH, out of root-owned /opt/credential-proxy/bin, and
+# the scripts it forwards to are the separate copy under /opt/vcs/libexec below.
 RUN find /opt/defaults -name '__pycache__' -type d -prune -exec rm -rf {} + && \
     find /opt/defaults -name 'test_*.py' -type f -delete && \
     find /opt/defaults -type d -name tests -prune -exec rm -rf {} + && \
@@ -534,10 +545,14 @@ RUN find /opt/defaults -name '__pycache__' -type d -prune -exec rm -rf {} + && \
         echo "the files above name the agent image's venv interpreter, which does not exist here" >&2; \
         exit 1; \
     fi && \
-    chown -R agent:agent /opt/defaults && \
+    chown -R root:root /opt/defaults && \
     chmod -R u=rwX,go=rX /opt/defaults && \
     find /opt/defaults/scripts -type f -exec chmod 755 {} + && \
-    find /opt/defaults/skills -path '*/scripts/*' -type f -exec chmod 755 {} +
+    find /opt/defaults/skills -path '*/scripts/*' -type f -exec chmod 755 {} + && \
+    if find /opt/defaults \( ! -user root -o -perm /022 \) -print | grep .; then \
+        echo "the paths above under /opt/defaults are not root-owned, or are group- or other-writable" >&2; \
+        exit 1; \
+    fi
 
 # The trusted principal's own copy of the forwarded scripts. Root-owned.
 #
@@ -546,14 +561,15 @@ RUN find /opt/defaults -name '__pycache__' -type d -prune -exec rm -rf {} + && \
 # script here. Two of them cross: forge.py for every forge verb
 # (agents/platform/scripts/forge.py, `_forward`) and resolver.py for the issues
 # sweep's `poll` (github-issue-resolver, `_forward_to_sandbox`). The copy under
-# /opt/data is the model's: uid 1000 owns that mount, can rewrite any file in
-# it, and the edit lives until the next restart -- section 4b of
-# deploy/sandbox/smoke-test.sh plants one on purpose. Forwarding to that copy
-# would run the model's code with the cron's credential, which is exactly the
-# rule the block above states one caller short of keeping. So the forwarded
-# path is this one instead, outside every directory the agent can write. The
-# model's own copy stays where its instructions say it is; nothing about what
-# an agent runs changes here.
+# /opt/data is root-owned and, under the operator, a read-only mount, but it
+# sits on the model's volume: uid 1000 owns that volume's mount point and the
+# homes around each tree, and a run outside the operator's StatefulSet has no
+# mount to stop it renaming a tree aside and putting its own in its place.
+# Forwarding to that copy would stake the cron's credential on all of that
+# holding, which is exactly the rule the block above states one caller short of
+# keeping. So the forwarded path is this one instead, outside every volume the
+# agent can write, as defence in depth. The model's own copy stays where its
+# instructions say it is; nothing about what an agent runs changes here.
 #
 # The whole import closure is staged, not just the two entry points:
 # `sys.path[0]` is the script's own directory, so a module missing here would be

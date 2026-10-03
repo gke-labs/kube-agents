@@ -217,6 +217,10 @@ COPY --chmod=0644 deploy/docker/patches/kanban_handoff_clip.py /opt/hermes/gatew
 # text cap all degrade to one-message-per-note, which is exactly what shipped
 # before and so looks like nothing is wrong. verify_kanban_progress_lines.py
 # therefore drives the patched runtime rather than grepping it.
+# With KAGE_SLACK_UX on, a Slack card's message settles to its last line, a
+# failure the wake will explain is held, and a recovery drops a held line; for
+# those it imports gateway/kanban_notifier.py at delivery time, a file copied in
+# further down, so an image without it reads as flag off.
 # The _WAKE_KINDS grep below pins upstream's module-level tuple as upstream
 # text, and nothing more: apply_kanban_notifier.py further down this stage
 # wraps the line that reads the tuple, not the tuple itself, so it is still in
@@ -246,6 +250,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-progress/apply_kanban_progress_lin
     grep -qF '"heartbeat": _fmt_heartbeat,' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q 'note = _progress_note(ev.payload)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q '_send_res = await _progress_deliver(' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF 'await _progress_silent_event(self, ev)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -qF 'self.runner, adapter, sub, ev.kind, ev, msg, metadata,' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -qF 'self.progress_header = f"{self.board_tag}{tag}"' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q 'from gateway.kanban_progress_lines import deliver as _progress_deliver' /opt/hermes/gateway/kanban_watchers_notifier.py && \
@@ -486,10 +491,11 @@ RUN cd /opt/hermes && \
 # One patch for the kanban notifier's terminal-event path, because clipping the
 # handoff, delivering `result`, and deciding whether to wake the creator are
 # three edits to the same few lines of what is now
-# gateway/kanban_watchers_notifier.py. Three appliers meant four anchors into
-# one function and four ways for an upstream edit to break the build; this is
-# three -- the handoff, the wake set, and the incident row, which shared the
-# wake anchor until upstream split the per-event send loop from the wake step.
+# gateway/kanban_watchers_notifier.py. One applier owns all five anchors in
+# that file -- the handoff, the wake set, the incident row (which shared the
+# wake anchor until upstream split the per-event send loop from the wake step),
+# the completion message, and the wake step's outcome -- so an upstream edit
+# that breaks one fails one build step that names it.
 #   * Clip: upstream hard-slices the handoff at 200/160 characters and discards
 #     every line after the first, which delivered a severed GitHub link -- a
 #     ledger URL cut to ".../is" -- on 2026-08-03. Both slices are swapped for a
@@ -519,6 +525,12 @@ RUN cd /opt/hermes && \
 #     instead, riding the next user message's api_content sidecar: no model
 #     turn, ~70 tokens, no new config key -- it fires only where
 #     kanban.wake_on_events suppressed a wake.
+#   * Quiet (KAGE_SLACK_UX, Slack only; flag off is upstream's text): the
+#     completion message drops its `done` head line, and a failure line the
+#     creator's wake will explain is held rather than posted. The wake step
+#     drops it once the wake is admitted for its kind, and posts it if the wake
+#     raises or never asked for the kind, so a failed wake does not by itself
+#     leave the failure untold (the module's section 6 lists what still does).
 #
 # The wake edit is now three greps rather than one because v2026.8.13 gave the
 # subscription its own `delivery_mode`, so the patched line is a parenthesized
@@ -572,6 +584,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-notifier/apply_kanban_notifier.py 
     grep -qF 'wake_configured=self.wake_agent,' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q "_kanban_note_suppressed(" /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -qF '_kanban_store_incident(ev, self.task, self.sub, posted=self.send_passive)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF 'return _kanban_completion_text(n.head, n.title, handoff, n.platform_str)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF '_kanban_tell_unexplained(self.runner, self.adapter, self.sub, set(), self._owner_scope)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 -c "\
 import sys; from gateway.kanban_notifier import DEFAULT_WAKE_KINDS; \
 sys.exit('heartbeat is in DEFAULT_WAKE_KINDS: every mid-run progress note would wake the card creator for a full LLM turn') if 'heartbeat' in DEFAULT_WAKE_KINDS else None" && \
@@ -747,6 +761,25 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # upstream's body untouched. slack_presenter.py is staged here only so the
 # verifier can import it; the image ships it under /opt/defaults/scripts. Also
 # rides this COPY and RUN. See deploy/docker/patches/slack_ux_reactions.py.
+#
+# Slack: with KAGE_SLACK_UX on, send agents.sessions.setStatus the enum it
+# accepts (processing/suspended/closed) instead of Hermes's free-text phrase,
+# which it refuses on every call; title a channel thread's session after its
+# first ask; and show a thread's delegated cards as one plan message with a row
+# per card, edited in place. The status setter and the message-event builder
+# gain a guard handing over to gateway/slack_ux_status.py; kanban_progress_lines
+# calls it for a Slack card. slack_status.py is staged for the verifier as
+# slack_presenter.py is. Also rides this COPY and RUN. See
+# deploy/docker/patches/slack_ux_status.py.
+# Same flag, same block: gateway/slack_boilerplate.py keeps Hermes' own
+# boilerplate off Slack -- the cron wrapper (other targets, and the Chat relay
+# that routes on it, keep it), the opt-in heartbeat's tool trace (generic
+# phrase instead), the back-online notices, session-database warnings and
+# busy-input hint (not sent), and the restart/shutdown notices, slash-command
+# replies and other system replies (reworded in SlackAdapter.send and
+# edit_message; the steer and auth failure replies are replaced where they
+# are built, so no exception text reaches Slack). See
+# deploy/docker/patches/slack_boilerplate.py.
 COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/verify_slack_code_emphasis.py \
      deploy/docker/patches/apply_google_chat_attachment_notice.py \
@@ -756,7 +789,14 @@ COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/apply_slack_ux_reactions.py \
      deploy/docker/patches/verify_slack_ux_reactions.py \
      deploy/docker/patches/slack_ux_reactions.py \
+     deploy/docker/patches/apply_slack_ux_status.py \
+     deploy/docker/patches/verify_slack_ux_status.py \
+     deploy/docker/patches/slack_ux_status.py \
+     deploy/docker/patches/apply_slack_boilerplate.py \
+     deploy/docker/patches/verify_slack_boilerplate.py \
+     deploy/docker/patches/slack_boilerplate.py \
      agents/platform/scripts/slack_presenter.py \
+     agents/platform/scripts/slack_status.py \
      deploy/docker/patches/patchlib.py \
      deploy/docker/patches/apply_slack_agent_view.py \
      deploy/docker/patches/verify_slack_agent_view.py \
@@ -773,6 +813,12 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
     install -m 0644 /tmp/message-surface/slack_ux_reactions.py /opt/hermes/gateway/slack_ux_reactions.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_ux_reactions.py /opt/hermes && \
     grep -qF "_kage_slack_ux.enabled()" /opt/hermes/plugins/platforms/slack/adapter.py && \
+    install -m 0644 /tmp/message-surface/slack_ux_status.py /opt/hermes/gateway/slack_ux_status.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_ux_status.py /opt/hermes && \
+    grep -qF "_kage_slack_status.enabled()" /opt/hermes/plugins/platforms/slack/adapter.py && \
+    install -m 0644 /tmp/message-surface/slack_boilerplate.py /opt/hermes/gateway/slack_boilerplate.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_boilerplate.py /opt/hermes && \
+    grep -qF "_kage_slack_boilerplate.cron_delivery_text" /opt/hermes/cron/scheduler_delivery.py && \
     cd /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_agent_view.py /opt/hermes && \
     grep -qF "def _kage_slack_ux_on(" /opt/hermes/hermes_cli/slack_cli.py && \
@@ -782,6 +828,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_google_chat_attachment_notice.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_reactions_scope.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_reactions.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_status.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_boilerplate.py && \
     rm -rf /tmp/message-surface
 
 # Perf: hide worker-only kanban tools from orchestrator profiles. Upstream gates

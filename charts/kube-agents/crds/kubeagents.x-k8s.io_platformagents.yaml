@@ -10251,6 +10251,24 @@ spec:
                       maxItems: 100
                       type: array
                       x-kubernetes-list-type: set
+                    maxProjects:
+                      default: 100
+                      description: |-
+                        MaxProjects caps the resolved set the reconcile lists on each run, the
+                        management project included: explicit projects, selector members and
+                        container members fill it in a fixed order, and a project past it reads
+                        over-cap (profiles kept, nothing created). The reconcile sizes its listing
+                        workers and budget from it, and the bootstrap gate its ceiling, so an estate
+                        of a few hundred projects declares the number it has rather than reading half
+                        of itself over-cap. The MaxItems=100 cap on each declared list is unchanged: a
+                        hand-written list past a hundred entries is the shape folders exist for. The
+                        install's Terraform refuses a plan whose explicit projects and selector
+                        members exceed it (while a selector is declared or the cap is below its
+                        default), and renders the same value here from its scope input.
+                      format: int32
+                      maximum: 5000
+                      minimum: 1
+                      type: integer
                     metricsScopes:
                       description: |-
                         MetricsScopes lists Cloud Monitoring Metrics Scope scoping-project IDs; every

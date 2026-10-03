@@ -115,7 +115,9 @@ OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` aler
 `FEEDBACK_PROMPT_*` switch and delay, and the `KAGE_SLACK_UX` flag —
 but only as literal values; all `valueFrom` sources are rejected. A name earns a
 place on that list only if an arbitrary value for it cannot redirect state,
-grant access, or change what code runs; `safeSandboxEnvOverrides` in
+grant access, or change what code runs. `KAGE_SLACK_UX` is the nearest case: it
+switches between code paths the image already ships, which its comment there lists.
+`safeSandboxEnvOverrides` in
 `k8s-operator/internal/controller/platformagent_manifests.go` is the list.
 Reserved proxy, runtime-loader, and shell-startup variables cannot override the
 operator's managed values.
@@ -938,12 +940,24 @@ file and never a `.git` it can write into.
   crash or restart and are visible to both containers' next boot. The log
   shipper gets no `/tmp`: it buffers in memory
   and keeps its tail database on its own volume. Containers supplied through
-  `spec.deployment.sidecars`/`initContainers` are appended to the Pod as
-  written; the webhook does not require a read-only root of them, so a CR can
-  still add a writable container to this Pod.
+  `spec.deployment.sidecars`/`initContainers` are appended to the Pod
+  substantially as written; the webhook does not require a read-only root of
+  them, so a CR can still add a writable container to this Pod. "As written"
+  is not literal under `spec.mode: next`: the A2A render strips reserved-name
+  volume mounts and bus-credential mounts from a sidecar, and writes two env
+  names onto it because both feed the capability check rather than the
+  container's own configuration - `A2A_CAPABILITY_REQUIRED` as an override
+  that discards a CR value, `POD_NAMESPACE` as a default a CR value beats.
+  Neither edit touches the container's filesystem posture, which is what this
+  bullet is about.
 - A policy ConfigMap hash is placed on the Pod template to trigger rollout when
   command policy changes.
-- The operator reports Ready only when every workload it renders is ready.
+- The operator reports Ready only when every workload it renders is ready, with
+  one deliberate exception: under `mode: next` the capability verifier is not
+  counted. It is a request-path workload, and a rollout of it should not flip a
+  serving install to Provisioning. Because an install whose verifier is down
+  refuses every submission, it reports itself through the `A2AVerifier`
+  condition instead, which an install can be Ready and still carry.
 
 ## Deployment and Migration
 

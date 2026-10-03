@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"io"
 	"net"
 	"net/http"
@@ -109,6 +110,8 @@ func startAPIBridgeReaching(t *testing.T, url string, stub *apiStub, mutate func
 		APIKey:       testAPIKey,
 		TaskDeadline: 20 * time.Second,
 		KillGrace:    500 * time.Millisecond,
+		// Armed, as startBridgeCap's are: the scope mintFor writes.
+		Scope: capability.NamespaceScope(""),
 	}
 	if mutate != nil {
 		mutate(&cfg)
@@ -125,7 +128,8 @@ func startAPIBridgeReaching(t *testing.T, url string, stub *apiStub, mutate func
 func submitIn(t *testing.T, c *lib.Client, taskID, contextID, prompt string) *lib.Envelope {
 	t.Helper()
 	env, err := lib.NewMessageEnvelope(gatewayParty, taskID, contextID, "corr-"+taskID,
-		messagePayload(t, taskID, contextID, prompt), lib.WithTo(lib.Party{Session: "platform"}))
+		messagePayload(t, taskID, contextID, prompt), lib.WithTo(lib.Party{Session: "platform"}),
+		lib.WithAuthority(authorityFor(t, mintFor(t, c, taskID, "platform"))))
 	if err != nil {
 		t.Fatalf("submission envelope: %v", err)
 	}
@@ -819,6 +823,7 @@ func TestAPI_AServerThatStartsLateStillAnswers(t *testing.T) {
 	cfg := Config{
 		NATSURL: url, Executor: ExecutorAPI, APIURL: "http://" + addr + "/v1/chat/completions", APIKey: testAPIKey,
 		TaskDeadline: 20 * time.Second, KillGrace: 500 * time.Millisecond,
+		Scope: capability.NamespaceScope(""),
 	}
 	startBridgeConfig(t, cfg, nil)
 	c := gatewayClient(t, url)

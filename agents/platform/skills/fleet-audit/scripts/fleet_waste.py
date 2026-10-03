@@ -227,7 +227,8 @@ NO_TARGET_REASON = (
 # Where a GitOps clone keeps the manifests applied to one cluster:
 # `clusters/<cluster>/...`, so a path shorter than two parts names no cluster.
 # Copied from `collect.py` rather than imported: every collector in this
-# directory runs standalone under `python3 <file>`, and each one that has
+# directory runs standalone under `python3 <file>` (`main` imports `collect`
+# for a workspace that is not a clone, and only then), and each one that has
 # needed a constant a sibling also declares has duplicated it (`SYSTEM_NAMESPACES`
 # is the same value in three of them). Keep these three in step with
 # `collect.py`'s if the repository layout moves.
@@ -265,6 +266,10 @@ RELEASE_KEY_RELEASE = "release"
 # because `release_declarations` is a copy of `collect.py`'s and the copy is
 # kept identical, not trimmed to what one stream happens to use.
 RELEASE_KEY_NAMESPACE = "namespace"
+# What `collect.broker_mirror` leaves in a content-mode mirror a file that could
+# hold a release was withheld from; `release_declarations` then answers nothing
+# rather than part.
+MIRROR_RELEASES_WITHHELD_MARKER = ".git/collect-releases-withheld"
 # Where a values override goes, per reconciler. Argo CD accepts both a YAML
 # string (`values`) and a structured block (`valuesObject`); this names the one
 # already in the file, and `valuesObject` when neither is, because a structured
@@ -4669,8 +4674,11 @@ def release_declarations(root: Path) -> dict[tuple, dict]:
     which holds the full reasoning, the three key shapes, and why `ApplicationSet`
     is deliberately not indexed.
 
-    Returns `{}` when PyYAML is absent or the clone is unreadable.
+    Returns `{}` when PyYAML is absent, the clone is unreadable, or a
+    content-mode mirror carries MIRROR_RELEASES_WITHHELD_MARKER.
     """
+    if (root / MIRROR_RELEASES_WITHHELD_MARKER).exists():
+        return {}
     try:
         import yaml  # noqa: PLC0415 -- optional; absence disables the annotation
     except ImportError:
@@ -6429,7 +6437,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--workspace",
         help=(
-            "the GitOps clone `audit_report.py start` made, so each candidate "
+            "the GitOps workspace `audit_report.py start` made -- a clone, or in "
+            "content mode the scratch directory, whose repository is then read "
+            "through the broker -- so each candidate "
             "carries where the repository declares its object -- or, for a "
             "workload a chart renders, where it declares that chart release; "
             "omit and no candidate is annotated"
@@ -6447,7 +6457,16 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         workspace = None
-    manifest = collect_fleet(args.project, workspace=workspace)
+    if workspace is None or (workspace / GIT_DIR_NAME).exists():
+        manifest = collect_fleet(args.project, workspace=workspace)
+    else:
+        # Possibly content mode: no clone, so `collect.py`'s mirror decides
+        # which tree to index. Imported here rather than at the top so a run
+        # without one stays standalone.
+        import collect  # noqa: PLC0415
+
+        with collect.indexed_workspace(workspace) as indexed:
+            manifest = collect_fleet(args.project, workspace=indexed)
     print(json.dumps(manifest, indent=2))
     return 1 if manifest.get("error") else 0
 

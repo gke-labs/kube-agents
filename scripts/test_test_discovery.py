@@ -112,7 +112,7 @@ class TestEveryTestFileRuns(unittest.TestCase):
             [],
             "\n\nThese directories hold test_*.py files that never run in CI:\n  "
             + "\n  ".join(orphans)
-            + "\n\nEither add a matching wildcard to PYTHON_TEST_DIRS in the "
+            + "\n\nEither add a matching wildcard to PYTHON_TEST_FILES in the "
             "Makefile, or add the directory to EXCLUDED in this file with the "
             "reason it must not run there.",
         )

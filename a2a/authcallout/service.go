@@ -325,7 +325,11 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 			// The user is named for the pod, so `connz`, the $SYS
 			// advisories and the line below all say which session —
 			// otherwise every session on the bus is called "session".
-			grants, user = sessionGrants(att.PodName), att.PodName
+			g, err := sessionGrants(att.PodName)
+			if err != nil {
+				return "", nil, "", fmt.Errorf("%s narrows on the pod, but %w", att.ServiceAccount, err)
+			}
+			grants, user = g, att.PodName
 		default:
 			return "", nil, "", fmt.Errorf("%s names narrowing %q, which this callout does not implement", att.ServiceAccount, id.Narrowing)
 		}

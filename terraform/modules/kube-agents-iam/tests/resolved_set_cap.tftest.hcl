@@ -1,8 +1,10 @@
 # The whole-set cap: the management project, scope.projects and every
 # selector's members, once each and less an exact exclude entry, may not
-# exceed what the reconcile lists (RESOLVED_SET_CAP), and the precondition
-# holds only while a selector is declared. tests/test_scope_iam.py pins the
-# number to the reconcile's; these cases pin how it is counted.
+# exceed what the reconcile lists (the declared scope.max_projects, the
+# reconcile's RESOLVED_SET_CAP as its default), and the precondition holds
+# while a selector is declared or the cap is below its default.
+# tests/test_scope_iam.py pins the default to the reconcile's; these cases pin
+# how it is counted and which caps bind.
 
 mock_provider "google" {}
 
@@ -164,5 +166,122 @@ run "a_container_is_not_counted" {
   assert {
     condition     = length(local.scope_listed_projects) == 100
     error_message = "the count is ${length(local.scope_listed_projects)}, not 100"
+  }
+}
+
+# The cap is the declaration's: scope.max_projects (spec.scope.maxProjects)
+# replaces the default, so three explicit projects beside a selector fit a
+# cap of 4 and are refused under 3; the count itself does not move.
+run "a_declared_cap_is_the_one_the_plan_counts_against" {
+  command = plan
+
+  variables {
+    scope = {
+      projects       = ["team-a", "team-b"]
+      metrics_scopes = ["scoping-proj1"]
+      max_projects   = 4
+    }
+    scope_selector_members = { "metricsScopes/scoping-proj1" = ["scoping-proj1"] }
+  }
+
+  assert {
+    condition     = length(local.scope_listed_projects) == 4 && local.scope_resolved_set_cap == 4
+    error_message = "the count is ${length(local.scope_listed_projects)} against a cap of ${local.scope_resolved_set_cap}"
+  }
+}
+
+run "a_declared_cap_below_the_count_is_refused" {
+  command = plan
+
+  variables {
+    scope = {
+      projects       = ["team-a", "team-b"]
+      metrics_scopes = ["scoping-proj1"]
+      max_projects   = 3
+    }
+    scope_selector_members = { "metricsScopes/scoping-proj1" = ["scoping-proj1"] }
+  }
+
+  expect_failures = [google_service_account.agent]
+}
+
+# The CRD's bounds, held at the variable: zero, a fraction and a value past
+# 5000 are refused before any read, one run each.
+run "a_cap_of_zero_is_refused_at_the_variable" {
+  command = plan
+
+  variables {
+    scope = { projects = ["team-a"], max_projects = 0 }
+  }
+
+  expect_failures = [var.scope]
+}
+
+run "a_fractional_cap_is_refused_at_the_variable" {
+  command = plan
+
+  variables {
+    scope = { projects = ["team-a"], max_projects = 1.5 }
+  }
+
+  expect_failures = [var.scope]
+}
+
+run "a_cap_past_the_crds_maximum_is_refused_at_the_variable" {
+  command = plan
+
+  variables {
+    scope = { projects = ["team-a"], max_projects = 5001 }
+  }
+
+  expect_failures = [var.scope]
+}
+
+# A cap below the default holds the precondition even without a selector: the
+# admission the plan kept for the CRD's hundred explicit projects is for the
+# default cap alone, and four projects under a declared cap of two would
+# otherwise bind roles the reconcile never uses.
+run "a_declared_cap_below_the_default_holds_without_a_selector" {
+  command = plan
+
+  variables {
+    scope = { projects = ["team-a", "team-b", "team-c", "team-d"], max_projects = 2 }
+  }
+
+  expect_failures = [google_service_account.agent]
+}
+
+run "the_default_cap_without_a_selector_still_admits_the_crds_hundred" {
+  command = plan
+
+  variables {
+    scope = { projects = [for i in range(100) : format("team-%03d", i)], max_projects = 100 }
+  }
+
+  assert {
+    condition     = length(local.scope_listed_projects) == 101
+    error_message = "the count is ${length(local.scope_listed_projects)}, not 101"
+  }
+}
+
+# The direction the cap exists for: raised above the default, a count the default
+# would refuse fits. 1 + 100 + 50 = 151 under a cap of 200.
+run "a_cap_above_the_default_admits_what_fits_it" {
+  command = plan
+
+  variables {
+    scope = {
+      projects       = [for i in range(100) : format("team-%03d", i)]
+      metrics_scopes = ["scoping-proj1"]
+      max_projects   = 200
+    }
+    scope_selector_members = {
+      "metricsScopes/scoping-proj1" = concat(["scoping-proj1"], [for i in range(49) : format("monitored-proj-%04d", i + 1)])
+    }
+  }
+
+  assert {
+    condition     = length(local.scope_listed_projects) == 151 && local.scope_resolved_set_cap == 200
+    error_message = "the count is ${length(local.scope_listed_projects)} against a cap of ${local.scope_resolved_set_cap}"
   }
 }
