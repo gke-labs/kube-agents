@@ -68,7 +68,6 @@ TITLE_REPLACEMENTS = {
     "—": " - ",
     "―": " - ",
     "−": "-",
-    "…": "...",
     "‘": "'",
     "’": "'",
     "[": "(",
@@ -206,8 +205,8 @@ def session_title(text: Any) -> str:
     title = MENTION.sub(" ", str(text or ""))
     title = CHANNEL.sub(r"\1", title)
     title = LINK.sub(lambda m: m.group(2) or " ", title)
-    title = SLASH_IN_NAME.sub("-", title)
-    title = "".join(map(_title_char, unicodedata.normalize("NFKC", title)))
+    title = unicodedata.normalize("NFKC", title)
+    title = "".join(map(_title_char, SLASH_IN_NAME.sub("-", title)))
     title = WHITESPACE.sub(" ", title)
     title = REPEATED_COMMA.sub(", ", title).strip(" ,")
     return _clip(title, TITLE_MAX, TITLE_ELLIPSIS)

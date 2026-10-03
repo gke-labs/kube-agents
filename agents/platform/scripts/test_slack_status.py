@@ -182,6 +182,15 @@ class SessionTest(unittest.TestCase):
             with self.subTest(ask=ask):
                 self.assertEqual(s.session_title(ask), title)
 
+    def test_a_slash_between_words_joins_them_whatever_their_spelling(self):
+        cases = {
+            "cafe\u0301/bar restarts": "caf\u00e9-bar restarts",
+            "kube-system\uff0fcoredns restarts": "kube-system-coredns restarts",
+        }
+        for ask, title in cases.items():
+            with self.subTest(ask=ask):
+                self.assertEqual(s.session_title(ask), title)
+
     def test_no_character_slack_refused_survives(self):
         for refused in RENAME_REFUSED:
             with self.subTest(char=f"U+{ord(refused):04X}"):
