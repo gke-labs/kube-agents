@@ -1930,12 +1930,10 @@ does not mount, so the error names a missing key rather than the version skew. T
 newer image under an older operator gets no `SANDBOX_IMAGE_TREES` and takes the
 fallback.
 
-**The home directory is not covered.** `/home/agent` is owned by uid 1000 and lasts as
-long as the shell container, the same lifetime a tree edit had before the mounts. A
-module in the user site-packages directory, or a shell startup file, is code that later
-`agent` sessions run without any tree changing. Closing that is separate work: a
-root-owned home, or `PYTHONNOUSERSITE` and a fixed `BASH_ENV` in the session
-environment.
+**The home directory is covered by its ownership, not by a mount.** A module in the
+user site-packages directory, or a shell startup file, would be code that later `agent`
+sessions run without any tree changing. The image makes `/home/agent` root-owned with
+no dotfiles instead; see [The agent home is root-owned](#the-agent-home-is-root-owned).
 
 **`/opt/defaults` is root-owned in the image.** It is the source every start copies
 from, and several shared scripts append `/opt/defaults/scripts` to `sys.path`, so a
