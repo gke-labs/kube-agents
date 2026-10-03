@@ -36,18 +36,32 @@ import (
 // worth being blunt about why.** It signs the user JWTs that carry the publish
 // and subscribe permissions the server then enforces, so it does not merely
 // authenticate connections — it decides what every connection may do. Whoever
-// holds it can issue themselves a user with any grants at all, including read
-// across the capability bucket the envelope design reserves. It wants
-// gateway-grade custody, a rotation story and a compromise runbook, not the
-// handling a thing described as "authenticating connections" would get. The
-// capability envelope design (architecture 09, "one cryptographic key does
-// exist") owns that analysis; this is the object it is talking about.
+// holds it can issue themselves a user with any grants at all — publish on
+// $KV.cap.root.> and read on $KV.cap.>, which mints any capability and reads
+// every capability in flight. That path has no crypto behind it: subject
+// permissions ARE the integrity control for the capability envelope, and this
+// key is what signs them. It wants gateway-grade custody, a rotation story and
+// a compromise runbook, not the handling a thing described as "authenticating
+// connections" would get. The capability envelope design (architecture 09, "one
+// cryptographic key does exist") owns that analysis; this is the object it is
+// talking about.
 //
-// So: the seeds live in their own Secret, mounted by the callout Deployment and
-// by nothing else. They are deliberately NOT in the per-user creds Secret,
-// which the gateway, the agent pod and the session spawner all read.
+// So: the seeds live in their own Secret, read by the callout Deployment and by
+// nothing else. They are deliberately NOT in the per-user creds Secret, which
+// the gateway, the agent pod and the session spawner all read.
 //
 // The server holds only the public halves, in nats.conf. It never sees a seed.
+//
+// What custody this actually has, measured against a live install rather than
+// asserted (2026-09-09): one consumer, and no ServiceAccount in the namespace
+// except the operator's own can read a Secret there — not the gateway, not the
+// session pods, not the shell. Three gaps stand open and are deliberately not
+// closed here: the seeds reach the callout as environment variables rather than
+// a projected file (see the Deployment); the cluster has no application-layer
+// secrets encryption, so this sits in etcd under disk encryption alone; and
+// there is no rotation runbook, because CreateOnce below is structural —
+// rotating means restarting NATS, since the server refuses a config reload that
+// touches auth_callout. Nothing revokes an already-issued user JWT either.
 
 const (
 	// a2aCalloutIssuerSeedKey is the account seed (SA...) the callout signs

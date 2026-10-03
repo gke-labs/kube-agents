@@ -396,7 +396,7 @@ def build_parser() -> argparse.ArgumentParser:
     searcher = commands.add_parser("grep", help="search the tracked files")
     searcher.add_argument("--handle", required=True)
     searcher.add_argument("--pattern", required=True)
-    searcher.add_argument("--prefix")
+    searcher.add_argument("--prefix", help="a directory or file, a path rather than a glob")
     searcher.add_argument("--regex", action="store_true", help="POSIX extended regex")
     searcher.add_argument("--ignore-case", action="store_true")
     searcher.set_defaults(func=handle_grep)

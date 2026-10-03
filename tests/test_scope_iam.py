@@ -11,6 +11,7 @@ terraform/modules/*/tests/ (`make terraform-test`), against mocked providers.
 Run: python3 -m unittest discover -s tests -p 'test_scope_iam.py' -v
 """
 
+import json
 import pathlib
 import re
 import unittest
@@ -287,7 +288,7 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         # exactly (by ID for a service project, by number for a monitored
         # project), so the exclusion the message offers as a remedy lowers the
         # count it is tested against.
-        self.assertIn("scope_selector_member_cap       = 100", self.resolver_tf)
+        self.assertIn("scope_selector_member_cap       = var.member_cap", self.resolver_tf)
         self.assertIn('try(resource.type, "") == local.scope_xpn_resource_type_project && !contains(var.exclude_projects, try(resource.id, ""))])) <= local.scope_selector_member_cap', host)
         self.assertIn('if !contains(var.exclude_projects, try(regex(local.scope_monitored_project_name_pattern, row.name)["project"], ""))])) <= local.scope_selector_member_cap', scope)
         self.assertNotIn("length(try(jsondecode(self.response_body).monitoredProjects, [])) <= local.scope_selector_member_cap", scope)
@@ -360,16 +361,27 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         reconcile = (_REPO_ROOT / "agents" / "platform" / "scripts" / "cluster_agent_reconcile.py").read_text()
         cap = re.search(r"^RESOLVED_SET_CAP = (\d+)$", reconcile, re.MULTILINE)
         self.assertIsNotNone(cap, "cluster_agent_reconcile.py has no RESOLVED_SET_CAP")
-        self.assertIn(f"scope_resolved_set_cap = {cap.group(1)}", self.scope_tf)
-        self.assertIn(f"scope_selector_member_cap       = {cap.group(1)}", self.resolver_tf)
+        # The cap is the declaration's (scope.max_projects, spec.scope.maxProjects); its
+        # default in both modules is the reconcile's constant, so an install that declares
+        # none is planned against the number the reconcile lists.
+        self.assertIn("scope_resolved_set_cap = var.scope.max_projects", self.scope_tf)
+        iam_variables = (_REPO_ROOT / "terraform" / "modules" / "kube-agents-iam" / "variables.tf").read_text()
+        self.assertIn(f"max_projects     = optional(number, {cap.group(1)})", iam_variables)
+        self.assertIn("scope_selector_member_cap       = var.member_cap", self.resolver_tf)
+        resolver_variables = (_REPO_ROOT / "terraform" / "modules" / "kube-agents-scope-resolver" / "variables.tf").read_text()
+        member_cap = re.search(r'variable "member_cap" \{.*?default     = (\d+)', resolver_variables, re.DOTALL)
+        self.assertIsNotNone(member_cap, "the resolver has no member_cap variable with a default")
+        self.assertEqual(member_cap.group(1), cap.group(1))
         self.assertIn("toset([var.project_id]),", self.scope_tf)
         self.assertIn("toset([for project in var.scope.projects : project if !contains(var.scope.exclude.projects, project)]),", self.scope_tf)
         self.assertIn("for project in flatten([for name in local.scope_selector_names : lookup(var.scope_selector_members, name, [])]) : project\n      if !contains(var.scope.exclude.projects, project)\n", self.scope_tf)
-        # Held while a selector is declared, and not otherwise: an install with
-        # the CRD's hundred explicit projects and no selector planned before this
-        # precondition existed, and a plan that declares no selector must not
-        # start refusing it.
-        self.assertIn("condition     = length(local.scope_selector_names) == 0 || length(local.scope_listed_projects) <= local.scope_resolved_set_cap", self.main_tf)
+        # Held while a selector is declared or the cap is below its default: an
+        # install with the CRD's hundred explicit projects, no selector and the
+        # default cap planned before this precondition existed and must not start
+        # being refused; a cap the operator declared below the default is theirs
+        # to be held to with or without a selector.
+        self.assertIn("condition     = (length(local.scope_selector_names) == 0 && var.scope.max_projects == local.scope_default_cap) || length(local.scope_listed_projects) <= local.scope_resolved_set_cap", self.main_tf)
+        self.assertIn(f"scope_default_cap = {cap.group(1)}", self.scope_tf)
         self.assertIn("A glob is applied by the reconcile alone", self.main_tf)
         # The by-number form lowers the count on the selector leg only: an explicit
         # project the reconcile drops by its number is counted, and the message says so
@@ -419,6 +431,7 @@ class ScopeVariableMirrorsTheCrdTest(unittest.TestCase):
                      "organizations    = optional(list(string), [])",
                      "shared_vpc_hosts = optional(list(string), [])",
                      "metrics_scopes   = optional(list(string), [])",
+                     "max_projects     = optional(number, 100)",
                      "clusters = optional(list(object({",
                      "nullable = false",
                      "default  = {}"):
@@ -490,6 +503,40 @@ class ScopeVariableMirrorsTheCrdTest(unittest.TestCase):
                 self.assertIn(rule, self.variable)
 
 
+class ScopeCapBoundsMirrorTheCrdTest(unittest.TestCase):
+    """spec.scope.maxProjects's bounds and default are written in six places; the CRD is
+    the source, and each copy is read against it so a bound moved on the CRD alone reds."""
+
+    def setUp(self):
+        crd = yaml.safe_load((_REPO_ROOT / "charts" / "kube-agents" / "crds" / "kubeagents.x-k8s.io_platformagents.yaml").read_text())
+        scope = crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]["scope"]["properties"]
+        self.minimum, self.maximum, self.default = scope["maxProjects"]["minimum"], scope["maxProjects"]["maximum"], scope["maxProjects"]["default"]
+
+    def test_the_chart_schema_carries_the_crds_bounds(self):
+        schema = json.loads((_REPO_ROOT / "charts" / "kube-agents" / "values.schema.json").read_text())
+        cap = schema["properties"]["platformAgent"]["properties"]["scope"]["properties"]["maxProjects"]
+        self.assertEqual((cap["minimum"], cap["maximum"]), (self.minimum, self.maximum))
+
+    def test_both_modules_validate_the_crds_bounds_and_default_to_its_default(self):
+        iam = (_MODULE / "variables.tf").read_text()
+        resolver = (_REPO_ROOT / "terraform" / "modules" / "kube-agents-scope-resolver" / "variables.tf").read_text()
+        self.assertIn(f"var.scope.max_projects >= {self.minimum} && var.scope.max_projects <= {self.maximum}", iam)
+        self.assertIn(f"max_projects     = optional(number, {self.default})", iam)
+        self.assertIn(f"var.member_cap >= {self.minimum} && var.member_cap <= {self.maximum}", resolver)
+        self.assertIn(f"default     = {self.default}", resolver[resolver.index('variable "member_cap"'):])
+
+    def test_the_installer_the_operator_and_the_reconcile_carry_the_same_numbers(self):
+        common = (_REPO_ROOT / "scripts" / "installer" / "installer_common.sh").read_text()
+        self.assertIn(f"readonly SCOPE_MAX_PROJECTS_MIN={self.minimum}\n", common)
+        self.assertIn(f"readonly SCOPE_MAX_PROJECTS_MAX={self.maximum}\n", common)
+        self.assertIn(f"readonly SCOPE_MAX_PROJECTS_DEFAULT={self.default}\n", common)
+        self.assertIn(f"{self.minimum} to {self.maximum}, {self.default} when", (_REPO_ROOT / "install.sh").read_text())
+        self.assertIn(f"const defaultScopeMaxProjects int32 = {self.default}",
+                      (_REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_manifests.go").read_text())
+        reconcile = (_REPO_ROOT / "agents" / "platform" / "scripts" / "cluster_agent_reconcile.py").read_text()
+        self.assertIn(f"RESOLVED_SET_CAP = {self.default}\n", reconcile)
+
+
 class ScopeReachesBothHalvesTest(unittest.TestCase):
     """One variable feeds the module's bindings and the chart's CR block."""
 
@@ -503,7 +550,8 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
                      "folders          = optional(list(string), [])",
                      "organizations    = optional(list(string), [])",
                      "shared_vpc_hosts = optional(list(string), [])",
-                     "metrics_scopes   = optional(list(string), [])"):
+                     "metrics_scopes   = optional(list(string), [])",
+                     "max_projects     = optional(number, 100)"):
             with self.subTest(line=line):
                 self.assertIn(line, variable)
         self.assertIn("nullable = false", variable)
@@ -530,7 +578,8 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
         # module output or a local derived from either makes an input unknown
         # on a first install, and the for_each keyed on it fails the plan.
         inputs = re.findall(r"^\s*(\w+)\s*=\s*(.+?)\s*$", body, re.MULTILINE)
-        self.assertEqual({key for key, _ in inputs}, {"source", "shared_vpc_hosts", "metrics_scopes", "exclude_projects", "quota_project"})
+        self.assertEqual({key for key, _ in inputs}, {"source", "shared_vpc_hosts", "metrics_scopes", "exclude_projects", "quota_project", "member_cap"})
+        self.assertIn(("member_cap", "var.scope.max_projects"), inputs)
         for key, value in inputs:
             if key != "source":
                 with self.subTest(input=key):
@@ -548,6 +597,7 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
         self.assertIn("organizations  = var.scope.organizations", body)
         self.assertIn("sharedVpcHosts = var.scope.shared_vpc_hosts", body)
         self.assertIn("metricsScopes  = var.scope.metrics_scopes", body)
+        self.assertIn("maxProjects    = var.scope.max_projects", body)
         self.assertIn("projects = var.scope.exclude.projects", body)
         for key in ("projectId   = cluster.project_id",
                     "location    = cluster.location",

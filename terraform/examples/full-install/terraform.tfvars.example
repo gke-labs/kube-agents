@@ -97,6 +97,14 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # Output tokens the gateway asks for on a request that names none; 0 renders
 # nothing. For a self-hosted backend whose prompt and output share one window.
 # model_max_tokens   = 0
+# Redaction of every request body the gateway forwards to the provider; off by
+# default. ip_action is pseudonym, mask or off. See variables.tf.
+# litellm_redaction = {
+#   enabled     = true
+#   ip_action   = "pseudonym"
+#   allow_cidrs = ["127.0.0.0/8"]
+#   rules       = [{ name = "cluster-name", literal = "prod-eu-1", action = "pseudonym" }]
+# }
 
 # Vertex AI / Model Garden instead of an API-key provider — see variables.tf.
 # vertex_project_id defaults to the install's project; vertex_location defaults
@@ -144,12 +152,15 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # will not start the detector on one. See the README before turning either on.
 # The installer front doors write both of these from one install.env key,
 # ENABLE_DRIFT_DETECTOR, and regenerate this file on every run, so a value
-# written here by hand belongs to a hand-driven apply -- and is planned away
-# under -auto-approve, with up to 31 days of retained audit records, the next
-# time a front door runs without that key. A second install in the
+# written here by hand belongs to a hand-driven apply. That key defaults to
+# true, so a front-door run that says nothing about it rewrites both of these
+# to true rather than dropping them; what plans the trio away under
+# -auto-approve, with up to 31 days of retained audit records, is an explicit
+# ENABLE_DRIFT_DETECTOR=false. A second install in the
 # same project names its own trio (drift_pubsub_topic,
-# drift_pubsub_subscription, drift_pubsub_sink): lifecycle.sh adopts them by
-# name, and would adopt the first install's.
+# drift_pubsub_subscription, drift_pubsub_sink), or lifecycle.sh refuses its
+# apply: the three names are one default per project, and importing the ones
+# already there would take over whichever install owns them.
 # enable_drift_pubsub   = true
 # enable_drift_detector = true
 
@@ -182,6 +193,7 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 #   organizations    = []
 #   shared_vpc_hosts = ["shared-vpc-host"]
 #   metrics_scopes   = []
+#   max_projects     = 100 # the most projects the reconcile lists per run (spec.scope.maxProjects)
 #   exclude = {
 #     projects = ["*-sandbox"]
 #     clusters = [

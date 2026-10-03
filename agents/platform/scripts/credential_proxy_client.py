@@ -891,13 +891,27 @@ class Listing(list):
     A plain list, so every existing caller keeps working, carrying the two
     fields that say whether it is the whole answer. A listing that stops at the
     broker's ceiling and looks complete is how a caller ends up asking `read`
-    for a path it inferred rather than one it saw.
+    for a path it inferred rather than one it saw. `symlinks` names the files
+    in the page's range that `read` refuses and so are never entries, and
+    `symlinked_directories` the links to directories the listing does not
+    enter, each a `{"path", "target"}` mapping.
     """
 
-    def __init__(self, entries, total: int = 0, truncated: bool = False) -> None:
+    def __init__(
+        self,
+        entries,
+        total: int = 0,
+        truncated: bool = False,
+        symlinks=(),
+        symlinked_directories=(),
+    ) -> None:
         super().__init__(entries)
         self.total = total or len(self)
         self.truncated = truncated
+        # Symlinked files in this page's range, which `read` refuses and so
+        # are never entries; a broker older than the field reports none.
+        self.symlinks = list(symlinks)
+        self.symlinked_directories = list(symlinked_directories)
 
 
 def default_caller_label() -> str:
@@ -1017,7 +1031,10 @@ class Workspace:
         """One page of tracked names. `after` is the last path of the page before.
 
         `total` on the result counts what is still in scope after the cursor, so
-        a caller pages until `truncated` is false.
+        a caller pages until `truncated` is false. `symlinks` on the result
+        names the symlinked files the page's range holds, each once across the
+        pages; a caller rebuilding the tree needs them to know what it lacks,
+        and `symlinked_directories` the links to directories with their targets.
         """
         payload = {"handle": self.handle}
         if prefix:
@@ -1029,6 +1046,8 @@ class Workspace:
             result.get("entries", []),
             total=result.get("total", 0),
             truncated=bool(result.get("truncated")),
+            symlinks=result.get("symlinks") or [],
+            symlinked_directories=result.get("symlinkedDirectories") or [],
         )
 
     def grep(

@@ -94,6 +94,12 @@ class ScopeBlockShapeTest(unittest.TestCase):
             with self.subTest(line=key):
                 self.assertIn(key, self.template)
 
+    def test_the_cap_renders_only_when_the_value_carries_it(self):
+        # Like the keyed lists: a release record from before the chart knew the
+        # key must not patch the CRD's default over a cap set on the CR by hand.
+        self.assertIn('{{- if hasKey $scope "maxProjects" }}\n    maxProjects: {{ $scope.maxProjects | int }}\n    {{- end }}',
+                      self.template)
+
     def test_the_chart_default_is_null(self):
         values = yaml.safe_load((_CHART / "values.yaml").read_text())
         self.assertIn("scope", values["platformAgent"])
@@ -158,6 +164,17 @@ class ScopeBlockRenderTest(unittest.TestCase):
 
     def test_a_populated_value_reaches_the_block_verbatim(self):
         self.assertEqual(self._scope_of(self._render("-f", self._values_file(POPULATED))), POPULATED)
+
+    def test_the_cap_renders_as_an_integer_when_set_and_not_otherwise(self):
+        with_cap = {**POPULATED, "maxProjects": 250}
+        rendered = self._scope_of(self._render("-f", self._values_file(with_cap)))
+        self.assertEqual(rendered["maxProjects"], 250)
+        self.assertNotIn("maxProjects", self._scope_of(self._render("-f", self._values_file(POPULATED))))
+        # The schema holds the CRD's bounds, so a value the CR would refuse fails the render.
+        for bad in ("0", "5001"):
+            with self.subTest(bad=bad):
+                proc = self._render("-f", self._values_file(POPULATED), "--set", f"platformAgent.scope.maxProjects={bad}")
+                self.assertNotEqual(proc.returncode, 0)
 
     def test_a_null_set_by_the_caller_renders_no_block(self):
         # A null deletes the key from the coalesced values, the same as never

@@ -73,8 +73,10 @@ type Envelope struct {
 // EnvelopeOption mutates an envelope at construction.
 type EnvelopeOption func(*Envelope)
 
-// WithAuthority sets the advisory authority block. Gateway ingress path only;
-// every other producer leaves it null.
+// WithAuthority sets the authority block. `requester` and `audience` in it are
+// advisory; `grants` is not -- it is a reference the executor resolves through
+// the capability verifier before it spends anything (09 §3). Gateway ingress
+// path only; every other producer leaves it null.
 func WithAuthority(authority json.RawMessage) EnvelopeOption {
 	return func(e *Envelope) { e.Authority = authority }
 }

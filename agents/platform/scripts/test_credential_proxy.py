@@ -4138,15 +4138,50 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         # `_execute` bounds output at CREDENTIAL_PROXY_MAX_OUTPUT_BYTES, 4 MiB by
         # default, which is not a log line -- and this path runs on every failed
         # cron tick.
-        _, logs = self._refresh(self._failure("x" * 5000))
+        # The tail: the helper names the failure on its last line, after the
+        # steps that ran before it.
+        _, logs = self._refresh(self._failure("x" * 5000 + "FATAL: why"))
 
         detail = logs[0].split("github credential refresh exited 1: ", 1)[1]
-        self.assertEqual(detail, "x" * 1000)
+        self.assertEqual(1000, len(detail))
+        self.assertTrue(detail.endswith("FATAL: why"))
 
     def test_omits_the_detail_when_stderr_is_empty(self):
         _, logs = self._refresh(self._failure("   \n"))
 
         self.assertTrue(logs[0].endswith("github credential refresh exited 1"))
+
+    def test_a_successful_refresh_logs_what_the_helper_said_at_info(self):
+        # The helper names the branch that minted the identity token and how
+        # long it took; a refresh that fell through to gcloud and still
+        # succeeded is visible only from this line.
+        said = (
+            "[SRE-AUTH] WARNING: no identity token from the metadata server (HTTP Error 404: Not Found after 0.01s); asking gcloud.\n"
+            "[SRE-AUTH] Minted the broker OIDC token through gcloud in 1.20s.\n"
+            "[SRE-AUTH] GitHub authentication successfully configured for repository: gke-agentic/infra\n"
+        )
+        executor = credential_proxy.CommandExecutor.__new__(credential_proxy.CommandExecutor)
+        executor.execute_internal = lambda argv: credential_proxy.ExecutionResult(
+            exit_code=0, stdout="", stderr=said, duration_ms=5, truncated=False, timed_out=False
+        )
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                executor.refresh_forge_credential("github", "gke-agentic/infra")
+        line = [entry for entry in logs.output if "github credential refresh: " in entry]
+        self.assertEqual(1, len(line), logs.output)
+        self.assertIn("asking gcloud", line[0])
+        self.assertIn("through gcloud in 1.20s", line[0])
+        self.assertTrue(line[0].startswith("INFO:"))
+
+    def test_a_successful_read_only_mint_logs_nothing(self):
+        # One per clone of a context repository; only the refresh asks for the
+        # success line.
+        executor = credential_proxy.CommandExecutor.__new__(credential_proxy.CommandExecutor)
+        executor.execute_internal = lambda argv: credential_proxy.ExecutionResult(
+            exit_code=0, stdout="ghs_token", stderr="[SRE-AUTH] Minted a read-only installation token for repository: o/r\n", duration_ms=5, truncated=False, timed_out=False
+        )
+        with self.assertNoLogs(credential_proxy.LOGGER, level="INFO"):
+            executor._run_forge_helper("github", Path(__file__), ["o/r", "--read-only"], "read-only credential mint")
 
     def test_redacts_token_shapes_out_of_the_detail(self):
         token = "ghs_" + "A" * 36

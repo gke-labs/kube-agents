@@ -626,21 +626,20 @@ class CompletenessGuardTest(unittest.TestCase):
         self.assertIn("restarts Always", message)
 
     def test_the_ignored_containers_are_the_goldens_ordinary_init_containers(self):
-        """The list covers exactly today's non-sidecar init containers, nothing stale."""
+        """The list covers exactly today's non-sidecar init containers, nothing stale.
+
+        Every pod-bearing workload in the golden counts, not only the gateway: the
+        shell sandbox StatefulSet has an ordinary init container of its own.
+        """
         docs = [doc for doc in yaml.safe_load_all(gcf._GOLDEN_MANIFEST.read_text()) if doc]
-        gateway = _gateway_pod_spec(docs)
         ordinary_init = {
-            container["name"]
-            for container in gateway.get("initContainers", [])
+            gcf._container_key(gcf._workload_key(doc["kind"], doc["metadata"]["name"]), container["name"])
+            for doc in docs
+            if doc.get("kind") in gcf._POD_BEARING_KINDS
+            for container in gcf._pod_spec(doc).get("initContainers", [])
             if container.get("restartPolicy") != "Always"
         }
-        self.assertEqual(
-            set(gcf._IGNORED_CONTAINERS),
-            {
-                gcf._container_key(gcf._GATEWAY_WORKLOAD_KEY, name)
-                for name in ordinary_init
-            },
-        )
+        self.assertEqual(set(gcf._IGNORED_CONTAINERS), ordinary_init)
 
     def test_the_guard_reads_every_pod_bearing_kind(self):
         """A Job or DaemonSet the operator starts rendering has to fail the guard too."""

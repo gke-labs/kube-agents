@@ -270,14 +270,17 @@ readonly MODE_NEXT_REPORT_LOG_LINES=30
 readonly MODE_NEXT_ENTRYPOINT_SCAN_LINES=400
 readonly MODE_NEXT_ENTRYPOINT_MATCH_LINES=40
 # The operator's override variables (a2aGatewayImage and a2aWorkerImage in
-# platformagent_a2a_manifests.go, a2aCalloutImage in platformagent_a2a_callout.go)
-# and the repository names step 4 pushes the builds under.
+# platformagent_a2a_manifests.go, a2aCalloutImage in platformagent_a2a_callout.go,
+# a2aVerifierImage in platformagent_a2a_verifier.go) and the repository names
+# step 4 pushes the builds under.
 readonly A2A_GATEWAY_IMAGE_ENV_VAR="A2A_GATEWAY_IMAGE"
 readonly A2A_CALLOUT_IMAGE_ENV_VAR="A2A_CALLOUT_IMAGE"
 readonly A2A_WORKER_IMAGE_ENV_VAR="A2A_WORKER_IMAGE"
+readonly A2A_VERIFIER_IMAGE_ENV_VAR="A2A_VERIFIER_IMAGE"
 readonly A2A_GATEWAY_IMAGE_NAME="a2a-gateway"
 readonly A2A_CALLOUT_IMAGE_NAME="a2a-authcallout"
 readonly A2A_WORKER_IMAGE_NAME="a2a-worker"
+readonly A2A_VERIFIER_IMAGE_NAME="a2a-verifier"
 # The bridge image goes to the CR as the sidecar's image, not to the operator:
 # the operator renders no bridge, so its images.json entry has no override.
 readonly A2A_BRIDGE_IMAGE_NAME="hermes-bridge"
@@ -812,8 +815,9 @@ else
     A2A_GATEWAY_URI="${AR_REPO}/${A2A_GATEWAY_IMAGE_NAME}:${TAG}"
     A2A_CALLOUT_URI="${AR_REPO}/${A2A_CALLOUT_IMAGE_NAME}:${TAG}"
     A2A_WORKER_URI="${AR_REPO}/${A2A_WORKER_IMAGE_NAME}:${TAG}"
+    A2A_VERIFIER_URI="${AR_REPO}/${A2A_VERIFIER_IMAGE_NAME}:${TAG}"
     A2A_BRIDGE_URI="${AR_REPO}/${A2A_BRIDGE_IMAGE_NAME}:${TAG}"
-    A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI}"
+    A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI}"
     A2A_OPERATOR_ENV_ARGS=(
       --set-string "operator.extraEnv[0].name=${A2A_GATEWAY_IMAGE_ENV_VAR}"
       --set-string "operator.extraEnv[0].value=${A2A_GATEWAY_URI}"
@@ -821,10 +825,16 @@ else
       --set-string "operator.extraEnv[1].value=${A2A_CALLOUT_URI}"
       --set-string "operator.extraEnv[2].name=${A2A_WORKER_IMAGE_ENV_VAR}"
       --set-string "operator.extraEnv[2].value=${A2A_WORKER_URI}"
-      --set-string "operator.extraEnv[3].name=${A2A_INJECT_BACKEND_ENV_VAR}"
-      --set-string "operator.extraEnv[3].value=${A2A_INJECT_BACKEND_ON}"
+      # The verifier is on the request path: unoverridden it stays on a
+      # private dev registry a leased eval project cannot pull, the Deployment
+      # never comes up, and every executor refuses every task -- an eval that
+      # reads as a broken product rather than a missing override.
+      --set-string "operator.extraEnv[3].name=${A2A_VERIFIER_IMAGE_ENV_VAR}"
+      --set-string "operator.extraEnv[3].value=${A2A_VERIFIER_URI}"
+      --set-string "operator.extraEnv[4].name=${A2A_INJECT_BACKEND_ENV_VAR}"
+      --set-string "operator.extraEnv[4].value=${A2A_INJECT_BACKEND_ON}"
     )
-    echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout and worker images and the Hermes bridge sidecar"
+    echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout, worker and verifier images and the Hermes bridge sidecar"
   fi
   gcloud builds submit --config="deploy/docker/cloudbuild-ci.yaml" \
     --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}" \
@@ -1018,6 +1028,22 @@ echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
 # removes the CR whole, so the flip-back-with-sidecar failure the bridge doc
 # names never arises here.
 #
+# The verifier is gated too, and gated LAST of everything here, which is not
+# where its dependency would put it. Its precondition is the provisioning Job
+# -- it binds the capability bucket at boot and exits when it cannot, so until
+# the Job has created the bucket it crash-loops -- but its deadline is the
+# first submission, which is hack/ci-eval-pr.sh, after this step. Waiting on
+# it right after the Job would put a kubelet restart backoff of up to five
+# minutes AHEAD of the sidecar patch this script has yet to issue, and so add
+# that backoff to the deploy; waiting on it at the end spends the same backoff
+# alongside the two agent rollouts and the bridge coming up, and still answers
+# the only question that matters, which is whether the verifier is answering
+# before anything asks it. Gated rather than reported because every executor
+# turns an unanswered Check into a terminal rejection: a verifier still in
+# backoff when the eval starts does not slow a case down, it refuses it, and
+# the whole eval reads as a broken product (the same reason the slice pins
+# A2A_VERIFIER_IMAGE through operator.extraEnv at all).
+#
 # Reported, not gated: the A2A gateway Deployment. It used to exit on start
 # without a chat backend (#1660); the inject door is one, so it now starts,
 # but no pool-project run has shown it coming up yet and a gateway that is
@@ -1034,6 +1060,15 @@ dump_mode_next_state() {
   kubectl get pods,jobs,networkpolicies,pvc -n "${NAMESPACE}" -l "${A2A_PART_OF_SELECTOR}" || true
   kubectl get events -n "${NAMESPACE}" --sort-by=.lastTimestamp | tail -"${MODE_NEXT_DIAG_EVENT_LINES}" || true
   kubectl logs -n "${NAMESPACE}" "deployment/${OPERATOR_DEPLOYMENT_NAME}" --tail="${MODE_NEXT_DIAG_LOG_LINES}" || true
+  # The verifier's own log, on every failure path and not only its gate's.
+  # Its one durable failure -- it could not bind the capability bucket, so it
+  # exited -- is a line in this log and nowhere else: `describe` shows a
+  # CrashLoopBackOff without the reason, and the CR's A2AVerifier condition
+  # says zero replicas are ready without saying why. Previous as well as
+  # current, because by the time anything reads this the container that
+  # printed it has usually already been restarted.
+  kubectl logs -n "${NAMESPACE}" "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier" --tail="${MODE_NEXT_DIAG_LOG_LINES}" 2>/dev/null || true
+  kubectl logs -n "${NAMESPACE}" "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier" --previous --tail="${MODE_NEXT_DIAG_LOG_LINES}" 2>/dev/null || true
 }
 
 # Waits for the operator to create the workload, then for its rollout; on
@@ -1363,6 +1398,11 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     exit 1
   fi
   echo "✓ bridge consuming $((BRIDGE_LOG_START - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the patch: ${BRIDGE_CONSUMING}"
+
+  # Last, for the reason in this step's header: the bucket it needs exists by
+  # now, and the backoff it may still be in has been running against the two
+  # rollouts above rather than in front of them.
+  gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier"
 
   # What the run has to show for itself, for the artifact log: the CR status,
   # the stack the mode rendered, the ungated gateway, and the entrypoint's
