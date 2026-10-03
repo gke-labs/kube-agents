@@ -256,6 +256,10 @@ resource "kubernetes_deployment_v1" "token_reader" {
           # declared workload's object in every finding id.
           security_context {
             allow_privilege_escalation = false
+            # Set here as well: the provider writes this block with
+            # runAsNonRoot false when it is unset, which overrides the
+            # pod-level true and is the explicit-false shape 2.11 flags.
+            run_as_non_root = true
             capabilities {
               drop = ["ALL"]
             }
@@ -303,6 +307,10 @@ resource "kubernetes_deployment_v1" "token_sidecar" {
           # declared workload's object in every finding id.
           security_context {
             allow_privilege_escalation = false
+            # Set here as well: the provider writes this block with
+            # runAsNonRoot false when it is unset, which overrides the
+            # pod-level true and is the explicit-false shape 2.11 flags.
+            run_as_non_root = true
             capabilities {
               drop = ["ALL"]
             }
