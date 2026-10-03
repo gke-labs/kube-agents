@@ -211,8 +211,8 @@ window is the job's, not the case's: in the nightly every PR-writing case shares
 the same App, so a repetition passes on any in-window agent-authored pull request in the leased
 repository it links, and the check cannot tell which case opened it. `hack/ci-eval-pr.sh` exports
 the window's start (its own start, inside the Boskos lease and before any agent ran) and the
-leased repository; a hand run has neither, and a case without the option has no second rule, so
-only the first applies. `pull_request_opened`'s
+leased repository; a hand run holds no lease, so it gets no window, and a case without the option
+has no second rule, so only the first applies. `pull_request_opened`'s
 `accepts_stream_pull_request` is a different widening, not a third answer here: it covers only a
 fleet audit's stream, and this case has no ledger and opens submit-suggestion branches. The roster edit (step 4, an eval-crew approval) takes
 `remediation` off the `docs/designs/domains.yaml` allowlist. Until then the domain sits there

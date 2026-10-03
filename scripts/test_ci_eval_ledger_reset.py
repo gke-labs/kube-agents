@@ -585,6 +585,14 @@ class CallSiteTest(unittest.TestCase):
         # would widen the window onto every leftover.
         stamped = src.index(f"export {names['LEASE_START_ENV']}=\"${{EVAL_RUN_STARTED_AT}}\"")
         self.assertNotIn(f"${{{names['LEASE_START_ENV']}:-", src)
+        # ...and only inside Prow: a hand run holds no lease, so it clears
+        # any inherited stamp and exports none, and the verifier reads no window.
+        cleared = src.index(f"\nunset {names['LEASE_START_ENV']}\n")
+        gate = src.index('if [ -n "${JOB_NAME:-}" ] && [ -n "${BUILD_ID:-}" ]; then', cleared)
+        self.assertLess(clock, cleared)
+        self.assertLess(cleared, gate)
+        self.assertLess(gate, stamped)
+        self.assertEqual(src[stamped:].split("\n", 2)[1], "fi")
         matrix = src.index("# 6. Task Matrix Execution Loop")
         self.assertLess(derived, exported)
         self.assertLess(exported, matrix)

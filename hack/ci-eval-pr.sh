@@ -894,9 +894,15 @@ EVAL_RUN_STARTED_AT="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 # nothing an earlier lease left is included. Not inherited from the
 # environment: a stamp set elsewhere (a shell, a stale job environment, a
 # date with no time) would widen the window onto every leftover, and the
-# verifier reads one older than a day as no window at all. Outside Prow it
-# is this shell's start, as harmless.
-export EVAL_LEASE_STARTED_AT="${EVAL_RUN_STARTED_AT}"
+# verifier reads one older than a day as no window at all. Exported only
+# inside Prow, under the same gate as the Boskos names above: a hand run holds
+# no lease, so against a pool project a concurrent Prow job's pull request
+# would pass as this run's sibling. Unset, the verifier reads no window and
+# grades only a repetition's own push.
+unset EVAL_LEASE_STARTED_AT
+if [ -n "${JOB_NAME:-}" ] && [ -n "${BUILD_ID:-}" ]; then
+  export EVAL_LEASE_STARTED_AT="${EVAL_RUN_STARTED_AT}"
+fi
 echo "=== [${EVAL_RUN_STARTED_AT}] Running PR Smoke Test Evaluation for PR #${PR_ID} in Namespace: ${TARGET_NAMESPACE} ==="
 
 # 2. Cluster Auth

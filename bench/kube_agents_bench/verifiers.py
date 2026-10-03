@@ -2353,6 +2353,16 @@ class PullRequestOpenedVerifier(BaseVerifier):
             pushed_in_run = not pushed or (started - pushed).total_seconds() <= skew
             own = written_in_run and pushed_in_run
             if stream_branch and not own:
+                # The stream's own time bound: the sibling rule above excused a
+                # write or head before the stream began, which the lease window
+                # admits and the stream's does not.
+                if stale_write or stale_head:
+                    rejected.append(
+                        f"{slug}: last written or pushed to before {since_what} "
+                        f"({since.isoformat()}), so not this audit stream's; the "
+                        "job's lease window does not stand in for the stream's"
+                    )
+                    continue
                 if f"{owner}/{repo}".lower() != _stream_repo():
                     rejected.append(
                         f"{slug}: last written or pushed to before this run "

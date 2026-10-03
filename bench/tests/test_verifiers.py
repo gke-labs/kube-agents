@@ -2904,6 +2904,22 @@ def test_the_streams_own_pull_request_is_recorded_as_the_streams_inside_a_lease_
     assert res.raw["rule"] == "stream-pull-request"
 
 
+def test_a_pull_request_from_before_the_stream_is_not_the_streams_inside_a_lease_window(
+    token, github, stream, lease, monkeypatch
+):
+    """With both options set, the lease window does not stand in for the
+    stream's: a pull request opened after the lease began but before the
+    stream did fails, as it does with the stream option alone."""
+    stream_start = datetime(2026, 8, 21, 8, 30, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setenv(verifiers.STREAM_STARTED_ENV_VAR, str(stream_start))
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:10:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:09:50Z", head_ref=_STREAM_BRANCH)
+    res = _pr_check(accepts_stream_pull_request=True, accepts_in_job_sibling=True).verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "the job's lease window does not stand in for the stream's" in res.reason
+
+
 def test_this_runs_own_pull_request_needs_no_stream_branch(token, github, stream):
     """The branch only gates what the widened window admits."""
     _stash_pr_report()
