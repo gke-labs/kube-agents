@@ -185,8 +185,10 @@ kanban:
   # t_c31a1f00, for nothing. Worse than nothing, now: the answer the notifier
   # posts is verbatim, and a paraphrase of it can only lose detail.
   #
-  # The failure kinds stay: they deliver a terse status line and no more, and
-  # the front door genuinely has to decide what to do about them.
+  # The failure kinds stay: they deliver a terse status line at most (none in
+  # Slack with KAGE_SLACK_UX on, where the woken turn tells the failure, or a
+  # blocked card's question posts instead), and the front door genuinely has
+  # to decide what to do about them.
   #
   # This key governs push-capable adapters only. The notifier skips its own
   # send() for an adapter with no push channel (the API server) because that

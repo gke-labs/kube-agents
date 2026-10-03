@@ -22,13 +22,17 @@ published* carry the finding — for the fleet audits, whose SOPs deliberately
 keep the chat reply to one line — is the *pull request* the reply links one
 this run opened rather than an earlier one, and did the run *write* to the
 case's GitOps repository at all (``github_writes``, the question the cluster
-safeguards cannot answer). They read the per-run stash in
+safeguards cannot answer), and what a card-wake replay's planted card ended as
+(``replay_card``, read from the trajectory the harness records), and whether
+the front door's reply is one the gateway would suppress (``reply_is_silent``).
+They read the per-run stash in
 :mod:`kube_agents_bench.transcript`, and they fail closed: an empty
 stash is ``status="error"`` — the check could not be evaluated — never a pass
 or a fail, so ``VerificationCoverage`` drops below 1.0 and the gate catches
 it.
 
-The exception, ``fleet_resource_property``, does read cluster state, and exists
+Two read state instead. ``bootstrap_fanout`` reads the agent pod's board and
+profiles. ``fleet_resource_property`` reads a fleet cluster, and exists
 because upstream's ``resource_property`` reads the WRONG cluster and cannot
 tell a missing fixture from a missing cluster. See
 :class:`FleetResourcePropertyVerifier`.
@@ -70,7 +74,7 @@ from devops_bench.verification.base import (
 )
 from devops_bench.verification.verifiers import ResourcePropertyVerifier
 
-from kube_agents_bench import discovery, github_writes, onboarding, transcript
+from kube_agents_bench import card_wake, discovery, gateway_silence, github_writes, onboarding, transcript
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -87,6 +91,8 @@ __all__ = [
     "GitHubWritesVerifier",
     "LedgerIssueContainsVerifier",
     "PullRequestOpenedVerifier",
+    "ReplayCardVerifier",
+    "ReplyIsSilentVerifier",
     "ReportContainsVerifier",
     "SandboxTreeMatchesImageVerifier",
     "ToolCalledVerifier",
@@ -803,6 +809,144 @@ class WorkerAgentsVerifier(BaseVerifier):
             elapsed_time=time.monotonic() - start,
             reason=f"all {len(self.required_agents)} required profile pattern(s) matched; workers ran as {agents}",
         )
+
+
+_NO_REPLAY_CARD_REASON = (
+    f"no {card_wake.SETTLED_ENTRY} entry in the trajectory: the prompt was not a "
+    "card-wake replay, so there is no planted card to read"
+)
+_REPLAY_CARD_UNREAD_REASON = (
+    "the replay's card could not be read before it was archived (the read "
+    "failed, or no card carried the run's key), so its status and comments "
+    "are unknown"
+)
+_REPLAY_DECOY_UNREAD_REASON = (
+    "the replay's decoy card could not be read (the prompt was not a "
+    "session: fresh replay, or no card carried the decoy's key), so its status is unknown"
+)
+
+
+@VERIFIERS.register("replay_card")
+class ReplayCardVerifier(BaseVerifier):
+    """Checks the card a card-wake replay planted, as the run left it.
+
+    :mod:`kube_agents_bench.card_wake` reads the planted card's status and
+    comments just before archiving it and records them as the trajectory's
+    ``card_wake_settled`` harness entry. ``tool_called`` sees that the agent
+    called ``kanban_unblock``, not which card it unblocked; this reads the
+    planted card itself.
+
+    ``status_in`` / ``status_not_in``: the card's final status must be one of
+    the first and none of the second. ``comment_phrases``: each must appear,
+    case-insensitively, in at least one of the card's comments.
+    ``decoy_status_in``: a fresh-session replay's decoy card, blocked on the
+    same question, must end in one of these; ``tool_called`` passes on an
+    unblock of the decoy, and this does not.
+
+    Fails closed: no entry (not a replay) or an entry whose card was not read
+    is ``status="error"``.
+    """
+
+    type: Literal["replay_card"]
+    status_in: list[str] = Field(default_factory=list)
+    status_not_in: list[str] = Field(default_factory=list)
+    comment_phrases: list[str] = Field(default_factory=list)
+    decoy_status_in: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _asserts_something(self) -> ReplayCardVerifier:
+        if not (self.status_in or self.status_not_in or self.comment_phrases or self.decoy_status_in):
+            raise ValueError("replay_card needs status_in, status_not_in, comment_phrases or decoy_status_in")
+        return self
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+
+        def error(reason: str) -> VerificationResult:
+            return VerificationResult(
+                success=False, status="error", elapsed_time=time.monotonic() - start, reason=reason
+            )
+
+        snap = transcript.get()
+        if snap is None:
+            return error(_NO_TRANSCRIPT_REASON)
+        entries = [e for e in snap.trajectory if e.get("name") == card_wake.SETTLED_ENTRY]
+        if not entries:
+            return error(_NO_REPLAY_CARD_REASON)
+        settled = entries[-1].get("result")
+        if not isinstance(settled, dict):
+            return error(_REPLAY_CARD_UNREAD_REASON)
+        status = settled.get("status")
+        if not isinstance(status, str):
+            # A card found but not read back: ``status_not_in`` would pass it.
+            return error(_REPLAY_CARD_UNREAD_REASON)
+        comments = [str(c.get("body", "")) for c in settled.get("comments") or [] if isinstance(c, dict)]
+        problems = []
+        if self.status_in and status not in self.status_in:
+            problems.append(f"status {status!r} is not one of {self.status_in}")
+        if status in self.status_not_in:
+            problems.append(f"status {status!r} is one of {self.status_not_in}")
+        missing = [p for p in self.comment_phrases if not any(p.casefold() in c.casefold() for c in comments)]
+        if missing:
+            problems.append(f"no comment contains {missing} ({len(comments)} comment(s))")
+        if self.decoy_status_in:
+            decoy = settled.get("decoy_status")
+            if not isinstance(decoy, str):
+                return error(_REPLAY_DECOY_UNREAD_REASON)
+            if decoy not in self.decoy_status_in:
+                problems.append(f"decoy card status {decoy!r} is not one of {self.decoy_status_in}")
+        if problems:
+            return VerificationResult(
+                success=False, elapsed_time=time.monotonic() - start, reason="; ".join(problems)
+            )
+        return VerificationResult(
+            success=True,
+            elapsed_time=time.monotonic() - start,
+            reason=f"the replay's card ended {status!r} with {len(comments)} comment(s) matching",
+        )
+
+
+# How much of a reply the gateway would post a failing reason quotes.
+_REPLY_QUOTE_CHARS = 200
+
+
+@VERIFIERS.register("reply_is_silent")
+class ReplyIsSilentVerifier(BaseVerifier):
+    """Passes when the gateway would post nothing for the run's closing message.
+
+    Grades the raw ``final_message`` with Hermes's own silence predicate
+    (:mod:`kube_agents_bench.gateway_silence`), not ``report_contains``'s
+    normalized text: that drops backticks, and the gateway posts a backticked
+    ``[SILENT]``. A blank reply fails, because the gateway posts an
+    empty-response warning for it.
+    """
+
+    type: Literal["reply_is_silent"]
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+        snap = transcript.get()
+        if snap is None:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_TRANSCRIPT_REASON,
+            )
+        reply = snap.final_message
+        if gateway_silence.is_intentional_silence_response(reply):
+            return VerificationResult(
+                success=True,
+                elapsed_time=time.monotonic() - start,
+                reason=f"the gateway suppresses the reply {reply.strip()!r}",
+            )
+        posted = reply.strip()[:_REPLY_QUOTE_CHARS]
+        reason = (
+            f"the gateway would post the reply: {posted!r}"
+            if posted
+            else "the reply was blank, which the gateway posts as an empty-response warning"
+        )
+        return VerificationResult(success=False, elapsed_time=time.monotonic() - start, reason=reason)
 
 
 def _agent_shell(script: str, timeout: float) -> str:

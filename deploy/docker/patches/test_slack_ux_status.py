@@ -1113,8 +1113,9 @@ class PlanTest(_RuntimeCase):
 
     def test_a_card_answered_beside_a_newer_plan_ends_on_its_own_timer(self):
         # The answered plan is armed well after the newer plan, so the newer
-        # plan's lapse is not what ends its processing.
-        hold = 0.2
+        # plan's lapse is not what ends its processing. Every step sits at
+        # least 150 ms from the timer it must precede or follow.
+        hold = 0.5
 
         async def scenario(adapter):
             await runtime.deliver_row(adapter, _sub("t_w"), 1, "check payments", "asking")
@@ -1122,10 +1123,10 @@ class PlanTest(_RuntimeCase):
             await asyncio.sleep(hold * 2)
             await runtime.deliver_row(adapter, _sub("t_b"), 2, "check checkout", "reading logs")
             await runtime.settle_row(adapter, _sub("t_b"), "blocked")
-            await asyncio.sleep(hold * 0.6)
+            await asyncio.sleep(hold * 0.5)
             await runtime.settle_row(adapter, _sub("t_w"), "unblocked")
             self.assertEqual(adapter.calls[-1], ("setStatus", "processing"))
-            await asyncio.sleep(hold * 0.6)
+            await asyncio.sleep(hold * 0.7)
             self.assertEqual(adapter.calls[-1], ("setStatus", "processing"), "the newer plan lapsed")
             await asyncio.sleep(hold * 1.5)
             self.assertEqual(adapter.calls[-1], ("setStatus", "suspended"))
