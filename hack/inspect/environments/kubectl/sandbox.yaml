@@ -1,0 +1,52 @@
+# The agent's only Kubernetes credential: list namespaces.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: inspect-namespace-reader
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: inspect-namespace-reader
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: inspect-namespace-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: inspect-namespace-reader
+subjects:
+  - kind: ServiceAccount
+    name: inspect-namespace-reader
+    namespace: default
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: default
+  namespace: default
+spec:
+  serviceAccountName: inspect-namespace-reader
+  # The pause container becomes PID 1 and reaps what the agent orphans.
+  shareProcessNamespace: true
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 0
+  containers:
+    - name: default
+      # Built from ./Dockerfile; see the README.
+      image: kube-agents-inspect-kubectl:v1.33.1
+      command: [sleep, infinity]
+      workingDir: /app
+      volumeMounts:
+        - name: app
+          mountPath: /app
+  volumes:
+    - name: app
+      emptyDir: {}

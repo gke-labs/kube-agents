@@ -157,3 +157,7 @@ examples/gitops-repo/*/**
   examples/gitops-repo/knowledge/cluster-blueprint/standard-gke.md
   examples/gitops-repo/knowledge/index.md
   examples/gitops-repo/policy/README.md
+
+hack/inspect/**
+  hack/inspect/README.md
+  hack/inspect/skills/fleet-inventory/SKILL.md

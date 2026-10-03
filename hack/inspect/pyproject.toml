@@ -1,0 +1,13 @@
+[project]
+name = "kube-agents-inspect"
+version = "0.0.0"
+requires-python = ">=3.12"
+dependencies = [
+  "inspect-ai==0.3.272",
+  "inspect-swe==0.2.71",
+  "google-genai==2.25.0",
+  "anthropic==1.9.0",
+]
+
+[tool.uv]
+package = false
