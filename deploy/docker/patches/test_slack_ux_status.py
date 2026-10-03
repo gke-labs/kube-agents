@@ -131,6 +131,17 @@ class _Client:
         return await self._record("update", kw["blocks"])
 
 
+class _SlowClient(_Client):
+    """A client whose next ``chat_update`` waits ``slow`` seconds first."""
+
+    slow = 0.0
+
+    async def chat_update(self, **kw):
+        delay, self.slow = self.slow, 0.0
+        await asyncio.sleep(delay)
+        return await super().chat_update(**kw)
+
+
 class _Root:
     """A throwaway Hermes root holding the fixture adapter and the runtime module."""
 
@@ -970,6 +981,38 @@ class PlanTest(_RuntimeCase):
             _run(scenario(adapter))
         self.assertEqual([v for n, v in adapter.calls if n == "setStatus"], ["processing", "closed"])
         self.assertNotIn((CHANNEL, THREAD), runtime._plans)
+
+    def test_a_lapse_due_during_a_notes_render_keeps_the_plan(self):
+        # The note lands within one chat.update of the hold running out.
+        async def scenario(adapter):
+            await runtime.deliver_row(adapter, _sub("t_a"), 1, "check payments", "reading logs")
+            await asyncio.sleep(0.1)
+            adapter.client.slow = 0.6  # the hold runs out 0.2 s into this render
+            await runtime.deliver_row(adapter, _sub("t_a"), 2, "check payments", "reading metrics")
+            await runtime.deliver_row(adapter, _sub("t_a"), 3, "check payments", "restarting")
+
+        adapter = _Adapter(_SlowClient())
+        with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.3):
+            _run(scenario(adapter))
+        self.assertEqual(self._kinds(adapter).count("post"), 1)
+        self.assertNotIn((CHANNEL, THREAD), runtime._lapsed)
+
+    def test_an_expiry_due_while_an_unblocked_row_renders_keeps_its_plan(self):
+        async def scenario(adapter):
+            await runtime.deliver_row(adapter, _sub("t_a"), 1, "check payments", "asking")
+            await runtime.settle_row(adapter, _sub("t_a"), "blocked")
+            await asyncio.sleep(0.4)  # set aside at 0.1 s; its expiry is due at 0.5 s
+            adapter.client.slow = 0.25
+            await runtime.settle_row(adapter, _sub("t_a"), "unblocked")
+            await runtime.deliver_row(adapter, _sub("t_a"), 2, "check payments", "restarting")
+
+        adapter = _Adapter(_SlowClient())
+        with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.1), mock.patch.object(
+            runtime, "SET_ASIDE_MAX_SECONDS", 0.4,
+        ):
+            _run(scenario(adapter))
+        self.assertEqual(self._kinds(adapter).count("post"), 1)
+        self.assertIn((CHANNEL, THREAD), runtime._plans)
 
     def test_a_card_after_a_lapse_starts_a_new_plan(self):
         # t_a's terminal event was lost; t_b must not land on its stale plan.
