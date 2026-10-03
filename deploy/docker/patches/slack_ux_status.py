@@ -157,12 +157,13 @@ UNBLOCKED_KIND = "unblocked"
 #: ``blocked`` event instead.
 MOVE_KINDS = {"review": "review_requested"}
 
-#: Bounds on the in-process maps, oldest evicted first.
-SESSIONS_MAX = 512
-ASKS_MAX = 512
 #: The error ``agents.sessions.rename`` answers for a title holding a character
 #: it refuses, as opposed to a thread with no session yet or a network fault.
 RENAME_REFUSED_ERROR = "invalid_name"
+
+#: Bounds on the in-process maps, oldest evicted first.
+SESSIONS_MAX = 512
+ASKS_MAX = 512
 PLANS_MAX = 256
 #: Set-aside plans kept per thread. :func:`_set_aside` drops the oldest quiet
 #: one with no card waiting first; one dropped stops settling its rows and

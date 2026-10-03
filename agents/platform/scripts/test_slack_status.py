@@ -196,6 +196,25 @@ class SessionTest(unittest.TestCase):
             with self.subTest(char=f"U+{ord(hyphen):04X}"):
                 self.assertEqual(s.session_title(f"kube{hyphen}system restarts"), "kube-system restarts")
 
+    def test_a_slash_after_a_word_ending_in_a_mark_joins_it(self):
+        for left in ("\u0939\u0948", "\u0e43\u0e0a\u0e48", "\u0915\u093f", "q\u0303"):
+            with self.subTest(word=left):
+                self.assertEqual(s.session_title(f"{left}/coredns ok"), f"{left}-coredns ok")
+
+    def test_a_slash_beside_a_dropped_character_does_not_join(self):
+        self.assertEqual(s.session_title("pods \u2182/x ok"), "pods x ok")
+
+    def test_marks_on_a_refused_character_go_with_it(self):
+        cases = {
+            "\u2b50\ufe0f deploy": "deploy",
+            "#\ufe0f\u20e3 rollout": "rollout",
+            "\u203c\ufe0f\u20e3/x now": "!! x now",
+            "\u26a0\ufe0f deploy": "\u26a0\ufe0f deploy",
+        }
+        for ask, title in cases.items():
+            with self.subTest(ask=ask):
+                self.assertEqual(s.session_title(ask), title)
+
     def test_no_character_slack_refused_survives(self):
         for refused in RENAME_REFUSED:
             with self.subTest(char=f"U+{ord(refused):04X}"):

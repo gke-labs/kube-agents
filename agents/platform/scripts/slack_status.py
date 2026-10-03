@@ -52,9 +52,10 @@ SESSION_STATUSES = frozenset({SESSION_PROCESSING, SESSION_SUSPENDED, SESSION_CLO
 #: an ask is likely to hold becomes an ASCII stand-in from
 #: :data:`TITLE_REPLACEMENTS`; a format character such as a zero-width joiner
 #: is dropped, and any other becomes a space.
-#: A slash between two words becomes a hyphen (:data:`SLASH_IN_NAME`), so
+#: A slash between two word characters (:func:`_word_char`) becomes a hyphen, so
 #: ``kube-system/coredns`` stays one name rather than two alternatives; one that
-#: leads a path like ``/metrics`` becomes a space. A clipped title ends on
+#: leads a path like ``/metrics`` becomes a space. A combining mark goes with
+#: its base, so one on a refused character is dropped. A clipped title ends on
 #: :data:`TITLE_ELLIPSIS`, since "…" is refused.
 TITLE_MAX = 80
 TITLE_KEPT = frozenset(" -'\"&|_!?.,()=“”")
@@ -103,7 +104,6 @@ MENTION = re.compile(r"<[@!][^<>]*>")
 CHANNEL = re.compile(r"<#[A-Z0-9]+\|([^<>]*)>")
 LINK = re.compile(r"<([^<>|]+)(?:\|([^<>]*))?>")
 WHITESPACE = re.compile(r"\s+")
-SLASH_IN_NAME = re.compile(r"(?<=\w)/(?=\w)")
 REPEATED_COMMA = re.compile(r"\s*,[\s,]*")
 
 # --- the plan --------------------------------------------------------------
@@ -185,14 +185,39 @@ def _clip(text: str, limit: int, ellipsis: str = ELLIPSIS) -> str:
     return cut.rstrip(" ,") + ellipsis
 
 
+def _word_char(char: str) -> bool:
+    """Whether ``char`` is part of a word: a letter, a decimal digit, ``_`` or a combining mark."""
+    return char.isalpha() or char.isdecimal() or char == "_" or unicodedata.category(char).startswith("M")
+
+
 def _title_char(char: str) -> str:
     """``char`` if ``agents.sessions.rename`` accepts it, else its stand-in, nothing or a space."""
     category = unicodedata.category(char)
-    if char.isalpha() or char.isdecimal() or char in TITLE_KEPT or category.startswith("M"):
+    if _word_char(char) or char in TITLE_KEPT:
         return char
     if category in TITLE_EMOJI_CATEGORIES and any(low <= ord(char) <= high for low, high in TITLE_EMOJI):
         return char
     return TITLE_REPLACEMENTS.get(char, "" if category == "Cf" else " ")
+
+
+def _title_chars(title: str) -> str:
+    """``title`` with each character through :func:`_title_char`, a slash between words joined.
+
+    A combining mark is kept only on a letter, digit or emoji kept as itself, the bases Slack was
+    measured to accept one on; on any other it is dropped with its base.
+    """
+    out: list[str] = []
+    marks_kept = after_word = False
+    for i, char in enumerate(title):
+        if unicodedata.category(char).startswith("M"):
+            out.append(char if marks_kept else "")
+            continue
+        joins = char == "/" and after_word and i + 1 < len(title) and _word_char(title[i + 1])
+        stand_in = "-" if joins else _title_char(char)
+        after_word = stand_in == char and _word_char(char)
+        marks_kept = stand_in == char and char not in TITLE_KEPT
+        out.append(stand_in)
+    return "".join(out)
 
 
 def session_title(text: Any) -> str:
@@ -207,7 +232,7 @@ def session_title(text: Any) -> str:
     title = CHANNEL.sub(r"\1", title)
     title = LINK.sub(lambda m: m.group(2) or " ", title)
     title = unicodedata.normalize("NFKC", title)
-    title = "".join(map(_title_char, SLASH_IN_NAME.sub("-", title)))
+    title = _title_chars(title)
     title = WHITESPACE.sub(" ", title)
     title = REPEATED_COMMA.sub(", ", title).strip(" ,")
     return _clip(title, TITLE_MAX, TITLE_ELLIPSIS)
