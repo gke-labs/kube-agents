@@ -22,7 +22,14 @@ With the flag on, :func:`register` adds two listeners:
   whole line the message itself shows ("Fix the first one: <the first row>",
   markup and a row's severity aside) is the turn, so a session that never
   read the message is told what the click is about. Part of a line is not
-  enough: it can say the opposite of the line it came from. The answered line (or its echo) still shows the label. A
+  enough: it can say the opposite of the line it came from. The answered line (or its echo) still shows the label.
+  An incident option button is the other exception: it shows the option's
+  title (`` (recommended)`` after the recommended one's) and its value is the
+  reply the report's call to action asks for, ``apply Option B: <that
+  title>``, which is the turn when its title is the one shown, whole or as
+  the clip shows it. The shown title, without the suffix, is what the
+  answered line says ("@user picked: <title>"), the echo carries and the
+  thread is offered as its ask. A
   label that starts like a command (``/`` or ``!``) is sent as text, since a
   choice is an answer. The click goes through the adapter's own interactive
   authorization; an unlisted user's click is logged and changes nothing, and
@@ -124,6 +131,8 @@ CHOICE_KIND = "kage choice"
 #: thread instead when that rewrite fails, so a click always shows once.
 ECHO = "↳ <@{user}>: {label}"
 ANSWERED = "✓ <@{user}>: {label}"
+#: The answered line for an incident option.
+PICKED = "<@{user}> picked: {label}"
 
 #: Joins a label to the shown line its value names.
 TURN_JOIN = ": "
@@ -166,6 +175,9 @@ ANSWERED_MAX = 512
 #: presenter's choice segment, copied because that module is not imported here.
 INCIDENT_CHOICE_PREFIX = "kage_incident.choice."
 
+#: ``slack_ux_incident.RECOMMENDED_SUFFIX``, copied for the same reason.
+INCIDENT_RECOMMENDED_SUFFIX = " (recommended)"
+
 #: Struck-through text, ``~like this~``: taken back, so removed before a reply is matched.
 #: Each tilde sits at a word's edge, as Slack's own strike needs: ``~3 to ~5`` is not struck.
 TYPED_STRUCK = re.compile(r"(?<![\w~])~(?=\S)[^~\n]+?(?<=\S)~(?![\w~])")
@@ -191,8 +203,9 @@ TYPED_APPLY = re.compile(
     re.IGNORECASE,
 )
 
-#: An incident option button's value, its whole label, ``slack_ux_incident.OPTION_LABEL``
-#: or ``SINGLE_LABEL``: its capital letter, if it has one, and the option's own text.
+#: An incident option button's value, ``slack_ux_incident.OPTION_REPLY`` or ``SINGLE_REPLY``
+#: (and its shown text too, on an alert edited before the button showed only the title): its
+#: capital letter, if it has one, and the option's own text.
 BUTTON_FORM = re.compile(r"apply(?: Option ([A-Z]))?: (.+)", re.DOTALL)
 
 #: What ``slack_presenter._clip`` ends a button's clipped shown text with.
@@ -422,6 +435,16 @@ def _turn(label: str, value: Any, message: dict) -> str:
     return label if shown is None else label + TURN_JOIN + " ".join(shown.split())
 
 
+def _incident_turn(picked: str, value: Any) -> str:
+    """An incident option's turn: ``value`` when it is a reply naming the title ``picked`` shows, else ``picked``."""
+    form = BUTTON_FORM.fullmatch(value) if isinstance(value, str) else None
+    if form is None:
+        return picked
+    title = form.group(2)
+    clipped = picked.endswith(CLIPPED_END) and title.startswith(picked.removesuffix(CLIPPED_END))
+    return value if picked in (value, title) or clipped else picked
+
+
 def _gated_out(adapter: Any, channel_id: str, body: dict) -> bool:
     """Whether the adapter would ignore a typed message in ``channel_id``: an ignored
     channel or group DM outside ``allowed_channels``, or a DM, 1:1 or group, with
@@ -508,7 +531,7 @@ def _option_text(text: str) -> str:
 def _option_texts(message: dict) -> frozenset[tuple[str, str]]:
     """The incident option buttons on ``message``, each as its letter (``""`` for the single
     button's ``apply:``) and its own text: whole, from the value, and as the button shows it,
-    which may be clipped, with and without the clip's ellipsis."""
+    which may be clipped, with and without the clip's ellipsis and the recommended suffix."""
     found = set()
     for block in message.get("blocks") or ():
         if not isinstance(block, dict) or block.get("type") != "actions":
@@ -524,6 +547,11 @@ def _option_texts(message: dict) -> frozenset[tuple[str, str]]:
                 form = BUTTON_FORM.match(label)
                 if form:
                     found.add((form.group(1) or "", _option_text(form.group(2))))
+            value_form = BUTTON_FORM.fullmatch(str(element.get("value") or ""))
+            if value_form and not BUTTON_FORM.match(shown):
+                title = shown.removesuffix(INCIDENT_RECOMMENDED_SUFFIX)
+                for text in (title, title.removesuffix(CLIPPED_END)):
+                    found.add((value_form.group(1) or "", _option_text(text)))
     return frozenset(found)
 
 
@@ -674,15 +702,18 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
             logger.warning("slack_ux_clicks: could not mark %s answered in the thread: %s", msg_ts, exc)
         return
 
+    incident = action_id.startswith(INCIDENT_CHOICE_PREFIX)
+    if incident:
+        label = label.removesuffix(INCIDENT_RECOMMENDED_SUFFIX)
     shown = _presenter._escape(label)
-    note = ANSWERED.format(user=user_id, label=shown)
+    note = (PICKED if incident else ANSWERED).format(user=user_id, label=shown)
     # Before the awaits: a card that moves on in between settles its question and forgets it.
     card = _question_card(channel_id, msg_ts)
     rewritten = False
     try:
         await client.chat_update(
             channel=channel_id, ts=msg_ts,
-            text=_answered_text(note, message, not action_id.startswith(INCIDENT_CHOICE_PREFIX)),
+            text=_answered_text(note, message, not incident),
             blocks=answered_blocks(message.get("blocks"), _answered_by, note),
         )
         rewritten = True
@@ -707,7 +738,7 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
     synthetic = {
         "type": "message",
         "user": user_id,
-        "text": _turn_text(_turn(label, value, message), card),
+        "text": _turn_text(_incident_turn(label, value) if incident else _turn(label, value, message), card),
         "channel": channel_id,
         # The click's own ts keeps the deduplicator from conflating this turn
         # with the echo or the clicked message, as a reaction trigger's does.
