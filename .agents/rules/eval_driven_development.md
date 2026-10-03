@@ -10,8 +10,7 @@ Any pull request that changes what an agent does: a prompt, an SOP, a skill, a t
 path an agent takes, or a fix for something an agent did wrong. A chart, operator, image or
 configuration change that alters agent behaviour counts; "infrastructure" here means the pool
 projects, the seeded fleet, Prow and the workflows. Exempt: docs, CI, that infrastructure, and the
-bench harness itself (`bench/kube_agents_bench/`, `hack/ci-eval-pr.sh`). An exempt change says so
-in one line under **Live validation** in the pull request body.
+bench harness itself (`bench/kube_agents_bench/`, `hack/ci-eval-pr.sh`).
 
 The loop needs a dev project with kube-agents installed ([`INSTALL.md`](../../INSTALL.md)),
 refreshed to the commit under test: build the images with `deploy/docker/cloudbuild-ci.yaml`
@@ -21,12 +20,10 @@ and tag, as [`scripts/dev/dev_rebuild_agent.sh`](../../scripts/dev/dev_rebuild_a
 INSTALL.md "Method 3" is the local-iteration path). `hack/ci-deploy.sh` itself is the presubmit's path and assumes its
 secrets. For cases that read the seeded fleet, whether through `fixtures:` or by naming
 `seeded-a`/`-b`/`-c` directly, the fleet must be applied to the dev project once
-([`bench/tf/fleet/README.md`](../../bench/tf/fleet/README.md)). Every contributor, human or
-agent, is expected to have one. A stock install sandboxes the agent, which the harness's
-`kubectl port-forward` cannot reach; [`bench/README.md`](../../bench/README.md#sandboxed-installs)
-has the ways round that. There is no path around the loop: a pull request that changes agent
-behaviour without eval evidence is not ready for review; being one change in a stack is not an
-exception, and "What does not count" says why.
+([`bench/tf/fleet/README.md`](../../bench/tf/fleet/README.md)). A stock install sandboxes the
+agent, which the harness's `kubectl port-forward` cannot reach;
+[`bench/README.md`](../../bench/README.md#sandboxed-installs) has the ways round that. Every pull
+request that changes agent behaviour must include the eval case that covers it.
 
 ## The loop
 
@@ -61,20 +58,17 @@ set `FLEET_READONLY_SA=seeded-fleet-reader@<project>.iam.gserviceaccount.com` �
 grants token-creator to the CI identities only, and `roles/owner` does not include it. Without the fleet the case
 fails every time with the fleet phrases absent, which is broken, not red.
 
-It must fail, and fail for the reason your change addresses. Keep the failing entry from
-`verification_report[]` in the run's `results.json` (its `status` and `reason`) and the line of the
-agent's report that shows the gap; the pull request quotes both. A case that passes before the
-change proves nothing about it. A case that fails for an unrelated reason (a missing fixture, a
-token, a 429) is not red, it is broken; fix that first or pick another case.
+Verify that the case fails on `main` for the reason your change addresses. A case that passes
+before the change proves nothing about it. A case that fails for an unrelated reason (a missing
+fixture, a token, a 429) is broken, not red; fix that first or pick another case.
 
 **2. Implement.**
 
-**3. Green.** Deploy the branch to the same install (take the lease first if the install is
-shared: [`pre_pr_review.md`](pre_pr_review.md), "Live validation") and run the same case three
-times, the presubmit's repetition count; `devops-bench` runs a task once per invocation. All three
-must pass on the deterministic checks; a judged score moving is not a pass. The check that was red
-is the one that goes green: loosening the check in between is a new red, not a green. Keep the three
-run directories; the pull request cites them.
+**3. Green.** Deploy the branch to the same install (if the install is shared, take the lease first
+— see [`docs/designs/live-test-lease.md`](../../docs/designs/live-test-lease.md)) and run the same
+case three times, the presubmit's repetition count; `devops-bench` runs a task once per invocation.
+All three must pass on the deterministic checks; a judged score moving is not a pass. The check that
+was red is the one that goes green: loosening the check in between is a new red, not a green.
 
 **4. Register.** A new case is registered in `hack/eval/nightly-cases.txt` in the same pull
 request, with `owner:` set and a `docs/designs/domains.yaml` slug (or a reviewed
@@ -103,46 +97,24 @@ case that fails for a broken fixture is broken, not red), then register it with
 failing is the declared outcome and is reported as `EXPECTED_FAIL`, never `FAILED`; collapse
 (rung 4) and the judged comparison (rung 6) skip it; and passing every repetition reds the job
 (rung 5) until the marker is flipped. The pull request that closes the gap therefore removes the
-marker in the same diff, and its **Live validation** is the loop above with the red already on
-record. Registration follows the same rule as any case, and a marked case is never added to
-the blocking roster. `make bench-case-check` rejects a marker that is not a bare YAML boolean:
-`expected_fail: "false"` is a string, and `bench-gate` would otherwise refuse it only after the
-cluster lease.
+marker in the same diff. Registration follows the same rule as any case, and a marked case is never
+added to the blocking roster. `make bench-case-check` rejects a marker that is not a bare YAML
+boolean: `expected_fail: "false"` is a string, and `bench-gate` would otherwise refuse it only
+after the cluster lease.
 
-Do not mark a case for your own change to flip. The red-to-green run inside one pull request is
-the record; a marked case waiting for a fix is a placeholder that reds the job the moment anyone's
-change happens to fix it, which is the right behaviour for a gap with an owner and noise for a gap
-you are about to close.
-
-## What the pull request records
-
-Under **Testing → Live validation** in the template, which for a change to agent behaviour
-is this loop and nothing less:
-
-- the case id, and whether it is new or existing;
-- red: the install and the `main` commit it ran against, the failing check and its reason, one
-  line of the agent's report;
-- green: the three runs (directories or a one-line summary each) against the branch's build;
-- where the case is registered, or the one-line exemption.
+Do not mark a case for your own change to flip. A marked case waiting for a fix is a placeholder
+that reds the job the moment anyone's change happens to fix it, which is the right behaviour for a
+gap with an owner and noise for a gap you are about to close.
 
 ## What does not count
 
 - A unit test with a mocked model. That is a test; it goes where
   [`AGENTS.md`](../../AGENTS.md) "Where Tests Go" says, and it does not replace the case.
-- A case run once, or a green you did not see. Three passing runs, observed.
-- A red you did not see. If you cannot run the case before the change, you do not know it tests
-  the change.
-- A case deferred to another pull request in a stack, in either direction. The change merges with
-  this pull request, so the case merges with it. "The next one carries it" is a hand-off nobody has
-  accepted, and two bodies that each point at the other leave `main` holding a change no case
-  covers. No form of the hand-off survives: the sibling would have to merge first for the case to
-  reach `main` at all, and once it has, the case is registered there and step 1 is available to you
-  unchanged — run it red against that `main`, implement, green three times. So where the behaviour
-  genuinely cannot be observed until a sibling lands, the answer is merge order rather than a
-  hand-off. Wait for the sibling, then run the loop. Where the dependency runs both ways — neither
-  change observable without the other, so neither can merge first — they are one change and go in
-  one pull request that carries the case. The reviewer's thread stays open until this pull request
-  carries its own red.
+- A case deferred to another pull request in a stack. The change merges with this pull request, so
+  the case (or the removal of `expected_fail: true` on an existing case) must land with it. Where
+  the behaviour genuinely cannot be observed until a sibling lands, merge the prerequisite sibling
+  first and then include the case here; where neither change is observable without the other, they
+  are one change and belong in one pull request.
 
 ## Finding a case
 

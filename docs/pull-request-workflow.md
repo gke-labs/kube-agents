@@ -6,7 +6,7 @@ automated review, the labels Tide merges on, re-running a check that flaked, and
 at any point in between.
 
 **Owns:** the mechanics. Every _requirement_ — that you scan for duplicate work, run the pre-PR
-review passes, live-test the change, resolve every thread — is stated in
+review passes, resolve every thread — is stated in
 [`AGENTS.md`](../AGENTS.md) and stays there. This page is what you open at the moment you carry one
 out. When the two disagree, `AGENTS.md` is right and this page needs fixing.
 

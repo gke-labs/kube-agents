@@ -25,21 +25,20 @@ either hang the subagent or have it answer on my behalf.
 ## Phase −1 — Pre-flight: is this review already covered? (main loop)
 
 Every PR here is read by `kube-agents-bot` on the way in, and the repo requires the author to have
-run `review-adversarial` over their own diff and written the disposition into the body before
-opening. When both of those happened and neither has gone stale, a third hostile read usually buys
-nothing — so find that out before spending it.
+run `review-adversarial` over their own diff before opening. When the bot's review is clean and has
+not gone stale, another hostile read usually buys nothing — so find that out before spending it.
 
 This phase runs **in the main loop, before any subagent exists**, for two reasons. Its output is a
 question for me, and a subagent has no way to ask one. And it is pure GitHub API — no worktree, no
-fetch, no diff read — so it costs two calls per PR, plus one per merge sitting after the bot's
+fetch, no diff read — so it costs one call per PR, plus one per merge sitting after the bot's
 review, which is nearly always none or one.
 
-### The two queries
+### The query
 
-The repo is named literally in both: Phase −1 runs before Phase 0 defines `$REPO`.
+The repo is named literally: Phase −1 runs before Phase 0 defines `$REPO`.
 
 ```bash
-# Signal 1, in one call: the head SHA, the bot's reviews with the commit each one
+# In one call: the head SHA, the bot's reviews with the commit each one
 # actually read, the commit graph, and the open threads. The filter reports the
 # commits *after* the review's commit, which is what the currency test needs.
 gh api graphql -f query='
@@ -61,9 +60,6 @@ query($pr:Int!){repository(owner:"gke-labs",name:"kube-agents"){pullRequest(numb
          else "since:\n  " + ($cs[$i+1:] | map("\(.oid[0:7]) parents=\(.parents.totalCount)\(if .parents.totalCount > 1 then " p2=" + .parents.nodes[1].oid[0:7] else "" end) \(.messageHeadline)") | join("\n  "))
          end)
    end)'
-
-# Signal 2: the PR description. Read it yourself — see below.
-gh pr view <N> --repo gke-labs/kube-agents --json title,body -q '.title, .body'
 ```
 
 Use GraphQL for the reviews rather than `gh api repos/$REPO/pulls/<N>/reviews`: the REST endpoint
@@ -84,7 +80,7 @@ All three page sizes are caps rather than promises:
   `since: … not among those N commits`. That lands on stale either way, which is the safe direction,
   but when `commits=100` say "could not confirm currency" rather than "force-pushed".
 
-### Signal 1 — a current, clean bot review
+### A current, clean bot review
 
 Three things must hold.
 
@@ -146,44 +142,14 @@ papering over:
 **Nothing left open.** No unresolved review thread. An open thread is outstanding work by the repo's
 own merge rules, however clean the latest review reads.
 
-### Signal 2 — the author reviewed and tested it themselves
-
-Read the body. Two of its sections are what AGENTS.md's "Pull Request Hygiene" requires before a
-pull request is opened at all, and a `fix`-type pull request owes a third:
-
-- **`## Self-Review`** — the disposition list from the author's own pre-PR passes, merged:
-  `review-adversarial` and `review-docs-drift`, both on every change. What they looked for, what
-  kind of context each pass ran in, what it found, and for each finding whether
-  they fixed it or decided not to and why. This is the signal that matters most here, because it is
-  the only one that says somebody already read this diff hostilely.
-- **`### Live validation`** (and the `## Testing` section around it) — that the change was actually
-  exercised. `Not live-tested` with a stated reason is a filled section.
-- **`## Bug Fix: Preventing Recurrence`**, on a `fix` only (the title's Conventional Commit type)
-  — the guard that now fails if the bug returns, per `.agents/rules/pre_pr_review.md`. "Not a bug
-  fix" on a `fix` is unfilled.
-
-Judge them by reading, not by measuring. A section holding only the template's HTML comment,
-whitespace, or a bare `-` is unfilled — but so is a paragraph that says "reviewed it, looks fine",
-because the bar AGENTS.md sets is that "no findings" counts **only alongside what was looked for**.
-Length settles neither question. Watch for the section heading appearing in prose elsewhere in the
-body, which is why this is a read rather than a regex: a PR that discusses the `## Self-Review`
-section is not a PR that filled one in.
-
-When a section is missing or unanswered, Signal 2 fails — say so plainly, since that is the first
-thing the review would report anyway.
-
-Do not reach for the author's inline comments as a substitute. Authors here do not leave top-level
-inline comments on their own diffs; what you see under an author's name are replies to bot threads,
-which is engagement with a review rather than one.
-
 ### The verdicts
 
-| Verdict   | When                                                                    | What you do                                                                  |
-| --------- | ----------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| `skip`    | Draft, closed, or merged                                                | Report it and stop — no queries argued, no subagent                          |
-| `covered` | Signal 1 in full, plus Signal 2                                         | Report the evidence and **ask me** before reviewing                          |
-| `partial` | Clean bot review but stale, or Signal 2 missing, or a thread still open | Report it, name exactly what is missing, and offer a narrower or a full pass |
-| `review`  | No clean bot review — the bot found issues, or never ran                | Proceed to fan-out with no prompt                                            |
+| Verdict   | When                                                     | What you do                                                                  |
+| --------- | -------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `skip`    | Draft, closed, or merged                                 | Report it and stop — no queries argued, no subagent                          |
+| `covered` | Clean, current bot review with no unresolved threads     | Report the evidence and **ask me** before reviewing                          |
+| `partial` | Clean bot review but stale, or a thread still open       | Report it, name exactly what is missing, and offer a narrower or a full pass |
+| `review`  | No clean bot review — the bot found issues, or never ran | Proceed to fan-out with no prompt                                            |
 
 `skip` is the same judgement Phase 2 makes and the same one it reports; making it here as well just
 saves spawning a subagent to reach it. A draft is the author saying they are not asking yet.
@@ -195,9 +161,6 @@ the evidence in front of me before you spend anything:
 
 - the bot review's first line, its width, and its date;
 - its commit versus the head, and what the commits in between are, if any;
-- what the Self-Review section says it looked for and found, in a line or two;
-- the Live-validation section in one line — what the author says they exercised;
-- on a `fix`, the guard the recurrence section names, in one line;
 - for `partial`, the single thing that is missing.
 
 Then offer three choices: **skip it**, **review only what landed since `<sha>`** — the bot review's
@@ -399,17 +362,14 @@ condition I was never asked about is not.
 
 A merge conflict is **not** a skip reason. Neither is an unmergeable `mergeStateStatus`.
 
-**Do not re-litigate coverage.** Phase −1 already weighed the bot's verdict and the author's
-evidence — either it found no coverage worth raising, or it raised it and was told to go ahead. You
-were spawned either way, so a clean bot review is not a skip reason at this point, and neither is a
-thorough Self-Review section. Review at the mode you were given.
+**Do not re-litigate coverage.** Phase −1 already weighed the bot's verdict — either it found no
+coverage worth raising, or it raised it and was told to go ahead. You were spawned either way, so a
+clean bot review is not a skip reason at this point. Review at the mode you were given.
 
-Both are still worth reading, for a different purpose. The Self-Review section is where AGENTS.md
-tells every reviewer to start — it says where the author's own pass stopped, so yours can start
-there — and the bot's review says what a second reader already cleared. Neither is a reason to drop
-a finding of your own; both are a reason to be able to say why they missed it. A finding on a line
-the bot passed, or one the author rejected with a reason, needs the skill's step 5 to answer them
-rather than talk past them.
+The bot's review is still worth reading, for a different purpose: it says what a second reader
+already cleared. That is not a reason to drop a finding of your own, but it is a reason to be able
+to say why the bot missed it. A finding on a line the bot passed needs the skill's step 5 to answer
+it rather than talk past it.
 
 Otherwise proceed. If a prior review exists but new commits landed, review the current head in full
 and note in your report which findings from the prior review the new commits resolved. Read the

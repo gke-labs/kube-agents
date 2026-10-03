@@ -203,7 +203,7 @@ also touches `.github/workflows/`, `hack/`, or the pool scripts — is a prompt 
 page is a runbook: the site is for people running kube-agents on their own clusters, and
 `.agents/rules/documentation.md` names the homes a maintainer page goes to instead.
 `review-docs-drift` is the exhaustive form of that check and the author is required to have
-run it before opening — which is a reason to read what they reported, not a reason to skip this
+run it before opening — which is not a reason to skip this
 angle. **Prose this change makes false is a finding on the same footing as a bug**, not a style
 note: a comment, a document, an in-tree statement that described the old behaviour and now
 describes something that no longer ships. Name the passage and the mechanism in the change that
@@ -218,31 +218,7 @@ cite the rule when it applies. Judge by whether a change serves the stated inten
 it is — a big diff that does one thing is in scope, and a three-line change that does a second
 thing is not.
 
-Read the pull request's **Self-Review** and **Testing** sections when there is a body, and on a
-`fix`-type pull request its **Bug Fix: Preventing Recurrence** section. `AGENTS.md` is canonical
-for what the first two owe a reviewer — "What any reviewer reads first" for the Self-Review, and
-the live-validation bullet under Pull Request Hygiene with `.agents/rules/pre_pr_review.md` for
-Testing — and `pre_pr_review.md` for the third. What this angle adds is that they are claims
-the tree can check: every path, script, or command the Testing section credits must exist and do
-what it is credited with, and a guard or test the description says covers a case must reach that
-case. A claim the diff does not support is the finding "What any reviewer reads first" describes;
-a recurrence section left empty or answered "Not a bug fix" on a `fix` is the one
-`pre_pr_review.md` describes. One exception: on a preflight re-run of your own branch the
-Self-Review is the previous round's dispositions, and `review-preflight` §7 says a fresh pass is
-not handed those — read it on a reviewer's or a bot's pass, withhold it on a re-run of your own.
-
-A section that hands a required artifact to another pull request has not answered, and no rule
-opens the route for either artifact it is usually tried on. "The PR that installs it carries the
-eval case" — `.agents/rules/eval_driven_development.md`, "What does not count", says the answer to
-a stack is merge order, so the sibling lands first and this pull request runs the loop against the
-`main` that includes it; where neither change is observable without the other, they are one change
-and belong in one pull request. "Live-tested in the next one" —
-`.agents/rules/pre_pr_review.md` gives exercising the change, or "Not live-tested" with the
-reason, and nothing else. The deferral is
-visible in the body alone, so raise it whether or not you can reach the sibling, and say which of
-those two is owed. Angle J follows the hand-off where `gh` is available.
-
-Then check that the intent is actually tested: for each behaviour the change claims, name the test
+Check that the intent is actually tested: for each behaviour the change claims, name the test
 that would fail if that behaviour regressed. Where there is none, the candidate is the untested
 behaviour, not the absent test — say which regression would ship silently. Bug fixes without a
 regression test, and new error paths nothing exercises, are the usual cases.
@@ -275,16 +251,8 @@ usually applies here unchanged — apply it rather than rediscovering it. A near
 that has diverged is itself a finding: name which copy carries the fix and which does not, because
 merge order then decides whether the fix survives. Where one change is a superset of another,
 say so — reviewing the subset in isolation spends effort on a diff that may never merge. And where
-this body hands a required artifact to a sibling, open that sibling and see what it actually
-carries rather than reading the hand-off as a disposition. Neither artifact has a route, as Angle I
-says: for the eval case quote `.agents/rules/eval_driven_development.md`, "What does not count" —
-and where the sibling has already merged, its case is on `main`, so this pull request owed a red
-against it; for live validation quote `.agents/rules/pre_pr_review.md`, whose only alternative to
-exercising the change is "Not live-tested" and the reason, which no sibling's body supplies. Two
-bodies that each point at the other is the sharper form, because both merge and the artifact
-reaches `main` in neither. A hand-off points backwards as often as forwards, so fetch a named
-sibling that has already merged rather than concluding from the listing that there is none, and
-check that what it carries exercises this diff rather than only the sibling's own.
+a pull request defers its required eval case to a sibling PR instead of shipping the case in the
+diff, cite `.agents/rules/eval_driven_development.md` ("What does not count").
 
 For the cleanup, altitude, conventions, scope, and sibling candidates the `failure_scenario` states
 the concrete cost — what is duplicated, wasted, harder to maintain, out of scope, or which rule or
@@ -354,13 +322,9 @@ Every surviving finding gets a disposition, and there are only two:
 now know about, so fix it. A PLAUSIBLE one is a mechanism you could not pin down, and rewriting
 working code to chase it is how a self-review makes a change worse than it started: the temptation
 to "fix" something that was already right is the characteristic failure of reviewing your own work,
-and it is strongest on the lines you were least sure about. Write it into the section as an open
-question, say what would settle it, and leave the code alone unless the answer arrives. Recording a
-PLAUSIBLE finding you did not act on is a complete disposition — it hands the reviewer the doubt
-instead of a silent edit.
-
-When the review is your own, before opening a pull request, that disposition list **is** the PR
-body's **Self-Review** section. See `AGENTS.md`, "Pull Request Hygiene".
+and it is strongest on the lines you were least sure about. Report it to the user as an open
+question, say what would settle it, and leave the code alone unless the answer arrives. Do not
+paste the self-review disposition list into the PR body.
 
 # Severity
 
@@ -372,7 +336,7 @@ A review bot running this file writes its severity in the host's own words, and 
 - **BLOCKER** — merging it breaks something for everyone: a release or CI path, a running install,
   a credential's scope or reach. Must not merge as it stands.
 - **HIGH** — a defect a user or operator reaches in ordinary use, introduced or unmasked by this
-  change; or a claim in the description, the Self-Review, or the docs that the diff contradicts.
+  change; or a claim in the description or the docs that the diff contradicts.
   Fix before merge, or argue the reason in the disposition.
 - **MEDIUM** — a real defect on a narrow or unusual path, a degraded but not broken behaviour, or a
   behaviour the change claims that nothing tests. Fix, or file it and say so.
