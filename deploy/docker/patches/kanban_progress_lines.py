@@ -89,6 +89,7 @@ lost message would become a stuttering one.
 from __future__ import annotations
 
 import logging
+import re
 import unicodedata
 from typing import Any, Optional, Sequence
 
@@ -207,9 +208,25 @@ SETTLING_KINDS = (
     "review_requested",
 )
 
+#: A Markdown heading's marks, which a completed card's result line drops.
+HEADING_MARKS = re.compile(r"^#{1,6}\s+")
+
 #: Attribute the map hangs off on the watcher instance. Same lazily-initialised
 #: pattern as upstream's ``_kanban_sub_fail_counts``.
 _ATTR = "_kanban_progress_messages"
+
+
+def result_line(kind: str, payload: object) -> str:
+    """A completed card's one-line result for its plan row, or ``""``.
+
+    Upstream's ``completed`` event carries the first line of the worker's
+    handoff summary (``_completed_event_payload`` in ``hermes_cli/kanban_db.py``),
+    so the row needs nothing new from the worker. A Markdown heading's ``#``
+    marks are dropped, a ``#1234`` kept; the line is clipped as a progress note is.
+    """
+    if kind != "completed" or not isinstance(payload, dict):
+        return ""
+    return progress_note({"note": HEADING_MARKS.sub("", str(payload.get("summary") or "").strip())})
 
 
 def rolling_line(kind: str, payload: object) -> str:
@@ -449,9 +466,9 @@ async def _plan_row(
         return False
 
 
-async def _settle_plan_row(plan: Any, adapter: Any, sub: dict, kind: str) -> None:
+async def _settle_plan_row(plan: Any, adapter: Any, sub: dict, kind: str, result: str = "") -> None:
     try:
-        await plan.settle_row(adapter, sub, kind)
+        await plan.settle_row(adapter, sub, kind, result)
     except Exception as exc:  # noqa: BLE001 — cosmetic, like the rolling settle
         logger.debug("kanban progress: settling the plan row for %s failed: %s", sub.get("task_id"), exc)
 
@@ -615,7 +632,7 @@ async def deliver(
     if kind not in ROLLING_KINDS:
         plan = _slack_plan(quiet)
         if plan is not None:
-            await _settle_plan_row(plan, adapter, sub, kind)
+            await _settle_plan_row(plan, adapter, sub, kind, result_line(kind, getattr(ev, "payload", None)))
         if entry and entry["message_id"] and entry["lines"]:
             settled = entry["lines"][-1:] if quiet else entry["lines"]
             try:

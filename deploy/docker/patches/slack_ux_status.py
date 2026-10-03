@@ -171,12 +171,18 @@ _warned_missing = False
 class _Row:
     """One card's row. A plain class, for the reason ``slack_ux_reactions._Ask`` is."""
 
-    __slots__ = ("archived", "last_event_id", "lines", "status", "task_id", "title")
+    __slots__ = ("archived", "last_event_id", "lines", "result", "status", "steps", "task_id", "title")
 
     def __init__(self, task_id: str, title: str) -> None:
         self.task_id = task_id
         self.title = title
         self.lines: list[str] = []
+        #: Every note the row took, past the last :data:`slack_status.STEPS_MAX`
+        #: kept; a dashboard move is not one. A new plan starts it again.
+        self.steps = 0
+        #: The completed event's summary line, which the settled row shows; the
+        #: card's title when it is empty.
+        self.result = ""
         self.status = ""
         self.last_event_id = 0
         self.archived = False
@@ -598,7 +604,7 @@ def _settled(plan: _Plan) -> bool:
     return not plan.rolling and not any(_live(row) for row in plan.rows.values())
 
 
-def _move(row: _Row, kind: str) -> bool:
+def _move(row: _Row, kind: str, result: str = "") -> bool:
     """Apply a terminal or silent event to the card's row; False when it moves nothing."""
     if row.archived:
         return False  # upstream never unarchives, so a later event is a redelivery
@@ -615,6 +621,8 @@ def _move(row: _Row, kind: str) -> bool:
     if status is None or (kind == UNBLOCKED_KIND and row.status not in resumable):
         return False  # nothing to move, or an unblocked replay
     row.status = status
+    if status == _status.TASK_COMPLETE:
+        row.result = result
     return True
 
 
@@ -631,7 +639,7 @@ def _park(plan: _Plan, card: str, status: str | None, done: bool) -> bool:
 
 
 async def _settle_lapsed(
-    adapter: Any, key: tuple, card: str, kind: str, status: str | None, done: bool,
+    adapter: Any, key: tuple, card: str, kind: str, status: str | None, done: bool, result: str = "",
 ) -> _Plan | None:
     """Settle the card on the plans the lapse set aside.
 
@@ -650,7 +658,7 @@ async def _settle_lapsed(
         if done:
             old.rolling.discard(card)
         row = old.rows.get(card)
-        if row is not None and _move(row, kind):
+        if row is not None and _move(row, kind, result):
             await _render(adapter, key, old)
             if row.status == _status.TASK_RUNNING:
                 resumed = old
@@ -680,6 +688,7 @@ async def _settle_lapsed(
 
 async def _settle_current(
     adapter: Any, key: tuple, plan: _Plan, card: str, kind: str, status: str | None, done: bool,
+    result: str = "",
 ) -> bool:
     """Settle the card on the thread's current plan; True when anything moved."""
     unrolled = done and card in plan.rolling
@@ -687,7 +696,7 @@ async def _settle_current(
     if done:
         plan.rolling.discard(card)
     row = plan.rows.get(card)
-    moved = row is not None and _move(row, kind)
+    moved = row is not None and _move(row, kind, result)
     if not (moved or unrolled or parked):
         return False
     plan.touched = time.monotonic()
@@ -771,8 +780,9 @@ async def deliver_row(
         row = plan.rows[card] = _Row(card, title)
     if event_id and event_id <= row.last_event_id:
         return True  # an at-least-once replay already on the row
-    previous = (list(row.lines), row.status, row.last_event_id)
+    previous = (list(row.lines), row.steps, row.status, row.last_event_id)
     row.lines = [*row.lines, line][-_status.STEPS_MAX:]
+    row.steps += 1
     row.status = _status.TASK_RUNNING
     row.last_event_id = max(row.last_event_id, event_id)
     if not await _render(adapter, key, plan):
@@ -780,7 +790,7 @@ async def deliver_row(
             # Never shown, so no event could settle it: the card is rolling now.
             del plan.rows[card]
         else:
-            row.lines, row.status, row.last_event_id = previous
+            row.lines, row.steps, row.status, row.last_event_id = previous
         _roll(adapter, key, plan, card)
         if plan.ts:
             await _session(adapter, key, plan)
@@ -791,15 +801,18 @@ async def deliver_row(
     return True
 
 
-async def settle_row(adapter: Any, sub: dict, kind: str) -> None:
-    """Settle the card's row after a terminal event, on the thread's plan and on any set aside."""
+async def settle_row(adapter: Any, sub: dict, kind: str, result: str = "") -> None:
+    """Settle the card's row after a terminal event, on the thread's plan and on any set aside.
+
+    ``result`` is a completed card's one line, which its row shows once settled.
+    """
     key = _thread(sub)
     card = str(sub.get("task_id") or "")
     status = _status.task_status(kind)
     done = kind == ARCHIVED_KIND or status in (_status.TASK_COMPLETE, _status.TASK_ERROR)
-    sender = await _settle_lapsed(adapter, key, card, kind, status, done)
+    sender = await _settle_lapsed(adapter, key, card, kind, status, done, result)
     plan = _plans.get(key)
-    if plan is not None and await _settle_current(adapter, key, plan, card, kind, status, done) and plan.ts:
+    if plan is not None and await _settle_current(adapter, key, plan, card, kind, status, done, result) and plan.ts:
         sender = plan
     if sender is not None:
         await _session(adapter, key, sender)

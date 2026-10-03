@@ -571,7 +571,7 @@ class PlanTest(_RuntimeCase):
         adapter.client.fail.add("update")
         self.assertFalse(self._note(adapter, 2, "reading metrics"))
         row = runtime._plans[(CHANNEL, THREAD)].rows["t_a"]
-        self.assertEqual((row.lines, row.last_event_id), (["reading logs"], 1))
+        self.assertEqual((row.lines, row.steps, row.last_event_id), (["reading logs"], 1, 1))
 
     def test_a_fallen_back_plan_is_retried_once_its_cards_settle(self):
         adapter = _Adapter(_Client(fail={"post"}))
@@ -596,6 +596,17 @@ class PlanTest(_RuntimeCase):
         self.assertEqual(blocks[0]["tasks"][0]["status"], "complete")
         self.assertEqual(adapter.calls[3], ("setStatus", "closed"))
         self.assertNotIn((CHANNEL, THREAD), runtime._plans)
+
+    def test_a_row_reads_as_its_current_step_then_its_result(self):
+        adapter = _Adapter()
+        last = slack_status.STEPS_MAX + 2
+        for event_id in range(1, last + 1):
+            self._note(adapter, event_id, f"note {event_id}")
+        running = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"][0]
+        self.assertEqual(running["title"], f"note {last} · step {last} ▸")
+        _run(runtime.settle_row(adapter, _sub(), "completed", "both pods are up"))
+        done = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"][0]
+        self.assertEqual((done["status"], done["title"]), ("complete", "both pods are up"))
 
     def test_a_waiting_row_keeps_the_plan(self):
         adapter = _Adapter()
@@ -700,7 +711,7 @@ class PlanTest(_RuntimeCase):
         adapter.client.fail.add("update")
         self.assertFalse(self._move(adapter, 2, "review"))
         row = runtime._plans[(CHANNEL, THREAD)].rows["t_a"]
-        self.assertEqual((row.lines, row.last_event_id), (["reading logs"], 1))
+        self.assertEqual((row.lines, row.steps, row.last_event_id), (["reading logs"], 1, 1))
 
     def test_a_move_for_a_card_rolling_on_a_set_aside_plan_goes_to_its_rolling_message(self):
         async def scenario(adapter):
@@ -1005,13 +1016,14 @@ class PlanTest(_RuntimeCase):
         async def scenario(adapter):
             await runtime.deliver_row(adapter, _sub(), 1, "check payments", "reading logs")
             await asyncio.sleep(0.2)
-            await runtime.settle_row(adapter, _sub(), "completed")
+            await runtime.settle_row(adapter, _sub(), "completed", "both pods are up")
 
         adapter = _Adapter()
         with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05):
             _run(scenario(adapter))
         self.assertEqual(self._kinds(adapter), ["post", "setStatus", "setStatus", "update"])
-        self.assertEqual(adapter.calls[-1][1][0]["tasks"][0]["status"], "complete")
+        task = adapter.calls[-1][1][0]["tasks"][0]
+        self.assertEqual((task["status"], task["title"]), ("complete", "both pods are up"))
         self.assertEqual(adapter.calls[2], ("setStatus", "closed"))
         self.assertEqual(runtime._lapsed, {})
 

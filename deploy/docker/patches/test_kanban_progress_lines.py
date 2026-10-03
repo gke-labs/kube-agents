@@ -30,6 +30,7 @@ from kanban_progress_lines import (
     deliver,
     progress_note,
     render,
+    result_line,
     rolling_line,
     silent_event,
     slack_line,
@@ -395,6 +396,23 @@ class RollingLineTest(unittest.TestCase):
         for kind in ("completed", "blocked", "crashed", "timed_out", "gave_up"):
             with self.subTest(kind=kind):
                 self.assertEqual(rolling_line(kind, {"note": "x"}), "")
+
+
+class ResultLineTest(unittest.TestCase):
+    def test_a_completed_event_gives_its_summary_line(self):
+        self.assertEqual(result_line("completed", {"summary": " seeded-a is current. "}), "seeded-a is current.")
+
+    def test_a_heading_loses_its_marks(self):
+        self.assertEqual(result_line("completed", {"summary": "## Both pods are up"}), "Both pods are up")
+        self.assertEqual(result_line("completed", {"summary": "#1234 merged"}), "#1234 merged")
+
+    def test_a_long_summary_is_clipped_as_a_note_is(self):
+        self.assertLessEqual(len(result_line("completed", {"summary": "word " * 100})), DEFAULT_NOTE_LIMIT)
+
+    def test_nothing_without_a_summary_or_for_another_kind(self):
+        self.assertEqual(result_line("completed", {"summary": None}), "")
+        self.assertEqual(result_line("completed", None), "")
+        self.assertEqual(result_line("gave_up", {"summary": "x"}), "")
 
 
 class RenderTest(unittest.TestCase):
@@ -1017,6 +1035,7 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
         self.rows = []
         self.moves = []
         self.settled = []
+        self.results = []
         self.flag = True
         self.plan = True
         self.takes = True
@@ -1029,8 +1048,9 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
                 raise test.takes
             return test.takes
 
-        async def settle_row(adapter, sub, kind):
+        async def settle_row(adapter, sub, kind, result=""):
             test.settled.append((sub["task_id"], kind))
+            test.results.append(result)
 
         async def settle_delegated(adapter, sub, kind, board=None):
             return None
@@ -1068,8 +1088,14 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
             [("t_e0c1", 1, "check seeded-a", "Checking seeded-a."), ("t_e0c1", 2, "check seeded-a", "Reading pod state.")],
         )
         self.assertEqual(self.settled, [("t_e0c1", "completed")])
+        self.assertEqual(self.results, [""], "the completed event carried no summary")
         self.assertEqual([content for _chat, content, _id in adapter.sent], ["Both pods are up."])
         self.assertEqual(adapter.edits, [])
+
+    async def test_a_completed_cards_summary_settles_its_row(self):
+        completed = SimpleNamespace(id=3, kind="completed", payload={"summary": "seeded-a · 1.33.4 = default"})
+        await deliver(SimpleNamespace(), _Adapter(), SLACK_SUB, "completed", completed, "Done.", None, HEADER)
+        self.assertEqual(self.results, ["seeded-a · 1.33.4 = default"])
 
     async def test_a_plan_that_refuses_falls_back_to_the_rolling_line(self):
         # The fallback is the flag-on rolling line: the trail settles to its last line.
@@ -1177,7 +1203,7 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.settled, [])
 
     async def test_a_silent_event_never_raises(self):
-        async def boom(adapter, sub, kind):
+        async def boom(adapter, sub, kind, result=""):
             raise RuntimeError("slack down")
 
         sys.modules["gateway.slack_ux_status"].settle_row = boom
