@@ -15,9 +15,9 @@ the card runs. Slack's task statuses are ``pending``, ``in_progress``,
 latest note while it runs (with a step count past one) or after it failed,
 its one-line result once complete, "waiting on you" while pending, and the
 card's title when there is none of those; in a plan of several rows it leads
-with the card's title, so the rows stay told apart. The plan carries no Stop button yet: ``/stop`` interrupts only
-the Planning Agent's turn and would leave the cards running. :func:`plan_text`
-is the same plan as plain text, for the message's ``text`` field, with ``&``,
+with the card's title, so the rows stay told apart. The plan carries no Stop
+button yet: ``/stop`` interrupts only the Planning Agent's turn and would leave
+the cards running. :func:`plan_text` is the same plan as plain text, for the message's ``text`` field, with ``&``,
 ``<`` and ``>`` escaped since Slack parses that field.
 
 The session (:func:`session_status`, :func:`session_title`):

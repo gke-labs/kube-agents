@@ -220,8 +220,8 @@ def result_line(kind: str, payload: object) -> str:
     """A completed card's one-line result for its plan row, or ``""``.
 
     Upstream's ``completed`` event carries the first line of the worker's
-    handoff summary (``_completed_event_payload`` in ``hermes_cli/kanban_db.py``),
-    so the row needs nothing new from the worker. A Markdown heading's ``#``
+    handoff summary, or of its result when it gave no summary
+    (``_completed_event_payload`` in ``hermes_cli/kanban_db.py``), so the row needs nothing new from the worker. A Markdown heading's ``#``
     marks are dropped, a ``#1234`` kept; the line is clipped as a progress note is.
     """
     if kind != "completed" or not isinstance(payload, dict):
@@ -615,7 +615,8 @@ async def deliver(
     ``gateway/kanban_notifier.py`` has the retry and the gaps it leaves. Beyond
     the terminal path, the card's progress goes on its row in the thread's plan rather than in a
     rolling message of its own, with the rolling message as the fallback when
-    the plan cannot be posted; ``title`` is the card's, for the row. See
+    the plan cannot be posted; ``title`` is the card's, which the row leads with
+    in a plan of several or falls back to. See
     ``gateway/slack_ux_status.py``. Every line it posts, holds or edits keeps
     the ``@assignee`` and drops the board tag and ``Kanban <id>``
     (:func:`slack_line`).
