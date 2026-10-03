@@ -55,9 +55,11 @@ Two tiers, meant to be read in order **01 → 09**:
 - **Foundational (north star) — 01–04, 09:** _what_ we are building and _why_.
 - **Buildable (bridging) — 05–08:** _how_ it is assembled.
 
-09 sits in the first tier rather than the second because it presumes agents are separate workloads,
-and that topology does not exist yet. It is agreed as the design; it is not in the build sequence
-below and nothing in it is built.
+09 sits in the first tier rather than the second because it presumes agents are separate workloads.
+**Amended 9/9:** one hop of that topology now exists — the chatops gateway spawns a session pod per
+task — and 09's mechanism is built and enforcing across it. The multi-hop fan-out 09 draws still
+does not exist, so attenuation ships with no production caller. 09 §0 states the boundary; read it
+before taking any section of 09 as either a plan or a fact.
 
 | #   | Document                                                       | Covers                                                                                                                                                                                                                                           |
 | --- | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -71,7 +73,7 @@ below and nothing in it is built.
 | 07  | [Implementation roadmap](07-implementation-roadmap.md)         | The phased build (current → end state), per-phase acceptance criteria, the verification loop, the definition of done, and risks                                                                                                                  |
 | 08  | [Agent runtime & identity](08-agent-runtime-and-identity.md)   | The thin kube-agents controller (the extended `k8s-operator/`) reconciling each `Agent` CR (Hermes harness) into an isolated pod with a per-pod read-only Workload-Identity SA, on Scion's per-pod model; what is deferred as hardening, and why |
 |     | _Buildable (bridging) above · north star below_                |                                                                                                                                                                                                                                                  |
-| 09  | [The capability envelope](09-capability-envelope.md)           | How a request's authority travels between agents once they are separate workloads: the attenuating capability, what enforces it at each hop, and why it needs no cryptographic key. **Not built** — no such topology yet                         |
+| 09  | [The capability envelope](09-capability-envelope.md)           | How a request's authority travels between agents once they are separate workloads: the attenuating capability, what enforces it at each hop, and why it needs no cryptographic key. **Armed on the a2a plane 9/9** — see §0 for what shipped     |
 
 Each document opens with a **TL;DR** and carries a **Goals / Non-goals** section and a
 **Verification** section of concrete, mostly-runnable checks.
@@ -87,9 +89,10 @@ To build kube-agents end-to-end from this design set:
    how a request's authority survives the hops between agents, once there are any.
 2. **Build by phase, verify, iterate.** Follow [07](07-implementation-roadmap.md) §2. After each
    phase, run its **acceptance criteria** _and_ the **Verification** checks of every spec the phase
-   touched (02 §10, 03 §11, 04 §9, 05 §8, 06 §10, 08 §7). 09 is absent from that list on purpose:
-   it is north-star, nothing in it is built, and its Verification suite has nothing to run against
-   yet. Wire it in with the phase that builds it. Do not advance a phase — or open the final
+   touched (02 §10, 03 §11, 04 §9, 05 §8, 06 §10, 08 §7, and 09 §9). **09 joined that list 9/9**,
+   when the first hop was built: its Verification suite now has something to run against, split
+   between `a2a/capability` and the permissions invariants in `tests/conformance/`. The bullets in
+   §9 that describe a second hop still have nothing to run against, and §0 says which. Do not advance a phase — or open the final
    PR — until its checks pass. The verification loop is defined in
    [07](07-implementation-roadmap.md) §5.
 3. **Decisions are already made — don't re-litigate.** Every decision is stated in its home spec
