@@ -882,8 +882,9 @@ class TestSlackIncidentAlert(unittest.TestCase):
 
     def test_the_title_says_what_happened_in_which_cluster(self):
         self.assertEqual(self._title(), "payments-api crashloop in seeded-debug")
-        self.assertEqual(self._title("BackOff", self.PULL), "payments-api BackOff in seeded-debug")
-        self.assertEqual(self._title("OOMKilled", ""), "payments-api OOMKilled in seeded-debug")
+        self.assertEqual(self._title("CrashLoopBackOff", ""), "payments-api crashloop in seeded-debug")
+        self.assertIsNone(self._title("BackOff", self.PULL))
+        self.assertIsNone(self._title("OOMKilled", ""))
         self.assertEqual(self._title(cluster=""), "payments-api crashloop")
 
     @patch.object(session_kv_server, "trigger_agent_troubleshooter")

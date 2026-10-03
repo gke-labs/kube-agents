@@ -491,8 +491,7 @@ CRASHLOOP_REASON = "CrashLoopBackOff"
 BACKOFF_REASON = "BackOff"
 IMAGE_PULL_MARKER = "pulling image"
 SLACK_CRASHLOOP_ALERT = "🚨 **{workload} in {cluster} keeps crashing.** Looking now."
-CRASHLOOP_TITLE_WORD = "crashloop"
-ALERT_TITLE = "{workload} {what}"
+ALERT_TITLE = "{workload} crashloop"
 ALERT_TITLE_CLUSTER = " in {cluster}"
 ALERT_TITLE_KEY = "title"
 
@@ -857,11 +856,10 @@ def _slack_alert_message(workload: str, cluster: str, reason: str, message: str)
 
 
 def _alert_session_title(workload: str, cluster: str, reason: str, message: str) -> str | None:
-    """The Slack session title for an alert's thread with KAGE_SLACK_UX on, else None."""
-    if not (slack_presenter.enabled() and workload):
+    """The Slack session title for a crashloop alert's thread with KAGE_SLACK_UX on, else None."""
+    if not (slack_presenter.enabled() and workload and _is_crashloop(reason, message)):
         return None
-    what = CRASHLOOP_TITLE_WORD if _is_crashloop(reason, message) else reason
-    title = ALERT_TITLE.format(workload=workload, what=what)
+    title = ALERT_TITLE.format(workload=workload)
     return title + ALERT_TITLE_CLUSTER.format(cluster=cluster) if cluster else title
 
 
