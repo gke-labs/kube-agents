@@ -1082,6 +1082,11 @@ func (in *ScopeSpec) DeepCopyInto(out *ScopeSpec) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
+	if in.MaxProjects != nil {
+		in, out := &in.MaxProjects, &out.MaxProjects
+		*out = new(int32)
+		**out = **in
+	}
 	if in.Exclude != nil {
 		in, out := &in.Exclude, &out.Exclude
 		*out = new(ScopeExcludeSpec)

@@ -131,6 +131,16 @@ litellm:
         pattern: "my-proj-[0-9]+"
 ```
 
+Through `install.sh`, set `LITELLM_REDACTION_ENABLED=true` in `install.env` or pass `--litellm-redaction`. `LITELLM_REDACTION_IP_ACTION` (`--litellm-redaction-ip-action`) and `LITELLM_REDACTION_IP_ALLOW_CIDRS` (`--litellm-redaction-ip-allow-cidrs`, comma- or space-separated) set the IP layer, and `LITELLM_REDACTION_RULES` holds the rules as a JSON array in single quotes, with no flag. The same settings as above:
+
+```bash
+LITELLM_REDACTION_ENABLED=true
+LITELLM_REDACTION_IP_ALLOW_CIDRS=127.0.0.0/8
+LITELLM_REDACTION_RULES='[{"name":"cluster-name","literal":"prod-eu-1","action":"pseudonym"},{"name":"project","pattern":"my-proj-[0-9]+"}]'
+```
+
+They reach the Terraform example as its `litellm_redaction` variable (`enabled`, `ip_action`, `allow_cidrs`, `rules`), which renders the chart values above only while `enabled` is true; a `litellm.redaction` key in `extra_helm_values` still wins. On an installed system, set the keys in `install.env` and re-run `upgrade.sh`, or use `install.sh --menu` and **Save & Apply**; there is no menu entry for them. The kustomize dev copy (`make -C k8s-operator deploy-litellm`) carries no redaction: install through the chart or `install.sh` to have it.
+
 A pseudonym is the first twelve hex characters of an HMAC-SHA256 over the value, keyed by `SESSION_KV_SALT` from the credentials Secret (the same mechanism that pseudonymises chat identities). The same value maps to the same token in every request while the salt holds, so the model can still tell two pods apart and correlate an address across turns; nothing maps a token back. Without the salt the gateway still redacts, with a per-pod salt the redactor warns about, so tokens stop matching across replicas and restarts.
 
 **Pseudonymisation is not reversible, and that limits what the agent can do with a pseudonymised value.** The model never sees `10.0.0.5`; it sees `[ip:3fa9c2d1e0b4]`, and a `kubectl` command or a chat answer it writes from that token names an address that does not exist, so the tool call fails or the answer is useless. Pseudonymise identifiers the agent only needs to reason _about_; keep the ones it must act on in `allowCidrs`, use `off`, or accept that those tasks degrade. Masking has the same limit without the correlation.

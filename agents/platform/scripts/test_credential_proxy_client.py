@@ -1092,7 +1092,13 @@ class WorkspaceReadVerbsTest(unittest.TestCase):
             {
                 "list": [
                     {"entries": ["a/0.yaml", "a/1.yaml"], "total": 3, "truncated": True},
-                    {"entries": ["a/2.yaml"], "total": 1, "truncated": False},
+                    {
+                        "entries": ["a/2.yaml"],
+                        "symlinks": ["a/1b.yaml"],
+                        "symlinkedDirectories": [{"path": "a/linked", "target": "../b"}],
+                        "total": 1,
+                        "truncated": False,
+                    },
                 ]
             }
         )
@@ -1100,9 +1106,16 @@ class WorkspaceReadVerbsTest(unittest.TestCase):
         self.assertEqual(["a/0.yaml", "a/1.yaml"], list(first))
         self.assertTrue(first.truncated)
         self.assertEqual(3, first.total)
+        # A broker older than the field reports no symlinks rather than failing.
+        self.assertEqual([], first.symlinks)
+        self.assertEqual([], first.symlinked_directories)
 
         second = workspace.list(prefix="a", after=first[-1])
         self.assertFalse(second.truncated)
+        self.assertEqual(["a/1b.yaml"], second.symlinks)
+        self.assertEqual(
+            [{"path": "a/linked", "target": "../b"}], second.symlinked_directories
+        )
         self.assertEqual(
             {"handle": self.HANDLE, "prefix": "a", "after": "a/1.yaml"},
             self.calls[2][1],

@@ -203,6 +203,12 @@ jobs:
           ENABLE_GKE_BACKUP_PLAN: ${{ vars.ENABLE_GKE_BACKUP_PLAN }}
           ENABLE_PUBSUB_PLATFORM: ${{ vars.ENABLE_PUBSUB_PLATFORM }}
           ENABLE_STOCKOUT_INVESTIGATOR: ${{ vars.ENABLE_STOCKOUT_INVESTIGATOR }}
+          # Unset leaves the key out of install.env and the shipped default (true)
+          # answers for it, which is the behaviour either way. It is here so that
+          # an environment CAN say false: the renderer rewrites install.env on
+          # every reconcile, so a line added to that file by hand does not survive
+          # to the next run and this variable is the only durable opt-out.
+          ENABLE_DRIFT_DETECTOR: ${{ vars.ENABLE_DRIFT_DETECTOR }}
           PLATFORM_AGENT_PERMISSION_SET: ${{ vars.PLATFORM_AGENT_PERMISSION_SET }}
           PLATFORM_AGENT_CUSTOM_ROLES: ${{ vars.PLATFORM_AGENT_CUSTOM_ROLES }}
           MEMORY_PROVIDER: ${{ vars.MEMORY_PROVIDER }}

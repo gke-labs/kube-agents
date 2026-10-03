@@ -148,6 +148,7 @@ ADDED_AFTER_THE_MOVE = [
     "bootstrap-inventory-ranking-delivery",  # the onboarding prioritization stage, #2143
     "chat-question-wake-stays-silent",  # SOUL §2 step 5's already-posted rule
     "chat-question-typed-answer-fresh-session",  # a typed answer from a new thread session
+    "platform-worker-shell-edit-of-shipped-skill",  # the sandbox's image trees, #2096
 ]
 
 # Admitted after the split, each by a pull request that cited the record

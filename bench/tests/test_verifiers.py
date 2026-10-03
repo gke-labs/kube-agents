@@ -1363,6 +1363,50 @@ def test_tool_called_sees_through_the_tool_call_wrapper():
     assert ToolCalledVerifier(type="tool_called", tool_names=["tool_call"], scope="workers").verify(5.0).status == "pass"
 
 
+def test_tool_called_sees_through_tool_call_wrapper_direct_name_shape():
+    # The recorded trajectory shape from worker session store: args has a top-level name
+    trajectory = [
+        {"name": "kanban_create", "args": {}, "status": "completed"},
+        {
+            "name": "tool_call",
+            "args": {
+                "name": "mcp__gke__get_k8s_resource",
+                "arguments": {
+                    "namespace": "checkout",
+                    "resourceType": "pod",
+                },
+            },
+            "status": "completed",
+            "agent": "platform",
+        },
+        {
+            "name": "tool_call",
+            "args": {"name": "mcp__platform_control__list_cluster_profiles", "arguments": {}},
+            "status": "completed",
+            "agent": "platform",
+        },
+        {"name": "kanban_complete", "args": {}, "status": "completed", "agent": "platform"},
+    ]
+    transcript.set("done", trajectory)
+    v1 = ToolCalledVerifier(
+        type="tool_called", tool_names=["mcp__gke__get_k8s_resource"], scope="workers"
+    )
+    assert v1.verify(5.0).status == "pass"
+
+    v2 = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["mcp__platform_control__list_cluster_profiles"],
+        scope="workers",
+    )
+    assert v2.verify(5.0).status == "pass"
+
+    # Uncalled tool returns fail
+    v3 = ToolCalledVerifier(
+        type="tool_called", tool_names=["mcp__gke__delete_k8s_resource"], scope="workers"
+    )
+    assert v3.verify(5.0).status == "fail"
+
+
 def test_tool_call_wrapper_with_malformed_args_matches_nothing():
     transcript.set(
         "done",
@@ -1395,6 +1439,99 @@ def test_tool_called_workers_scope_counts_only_the_tagged_entries():
     assert router_only.verify(5.0).status == "fail"
 
 
+def test_tool_called_workers_scope_filters_by_agent():
+    multi_agent_trajectory = [
+        {"name": "kanban_create", "args": {}, "status": "completed"},
+        {
+            "name": "mcp__gke__get_k8s_resource",
+            "args": {"name": "payments-api"},
+            "status": "completed",
+            "agent": "platform",
+        },
+        {
+            "name": "mcp__gke__get_k8s_resource",
+            "args": {"name": "payments-api"},
+            "status": "completed",
+            "agent": "cluster-seeded-a-east",
+        },
+    ]
+    transcript.set("done", multi_agent_trajectory)
+    # Filtered by agent: platform sees exactly 1 call
+    platform_only = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["mcp__gke__get_k8s_resource"],
+        scope="workers",
+        agent="platform",
+    ).verify(5.0)
+    assert platform_only.status == "pass" and platform_only.raw == {"matching_calls": 1}
+    assert "for agent 'platform'" in platform_only.reason
+
+    # Filtered by agent: cluster sees 1 call with regex
+    cluster_only = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["mcp__gke__get_k8s_resource"],
+        scope="workers",
+        agent=r"cluster-.+",
+    ).verify(5.0)
+    assert cluster_only.status == "pass" and cluster_only.raw == {"matching_calls": 1}
+
+    # If platform did not call the tool, minimum_calls=1 fails
+    no_cluster = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["nonexistent_tool"],
+        scope="workers",
+        agent="platform",
+    ).verify(5.0)
+    assert no_cluster.status == "fail" and no_cluster.raw == {"matching_calls": 0}
+
+
+def test_tool_called_agent_selector_matching_no_worker_is_fail():
+    multi_agent_trajectory = [
+        {"name": "kanban_create", "args": {}, "status": "completed"},
+        {
+            "name": "mcp__gke__get_k8s_resource",
+            "args": {"name": "payments-api"},
+            "status": "completed",
+            "agent": "cluster-seeded-a-east",
+        },
+    ]
+    transcript.set("done", multi_agent_trajectory)
+    res = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["mcp__gke__get_k8s_resource"],
+        scope="workers",
+        agent="platform",
+    ).verify(5.0)
+    assert res.status == "fail"
+    assert res.raw == {"matching_calls": 0}
+    assert "no worker trajectory entries matched agent selector" in res.reason
+    assert "seen agents: ['cluster-seeded-a-east']" in res.reason
+
+
+def test_tool_called_agent_selector_matching_no_worker_with_capture_gaps_is_error():
+    multi_agent_trajectory = [
+        {"name": "kanban_create", "args": {}, "status": "completed"},
+        {
+            "name": "mcp__gke__get_k8s_resource",
+            "args": {"name": "payments-api"},
+            "status": "completed",
+            "agent": "cluster-seeded-a-east",
+        },
+    ]
+    gap = "no session store for profile platform"
+    transcript.set("done", multi_agent_trajectory, worker_capture_gaps=[gap])
+    res = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["mcp__gke__get_k8s_resource"],
+        scope="workers",
+        agent="platform",
+    ).verify(5.0)
+    assert res.status == "error"
+    assert not res.success
+    assert gap in res.reason
+    assert "no worker trajectory entries matched agent selector 'platform'" in res.reason
+
+
 def test_tool_called_all_scope_counts_both():
     transcript.set("done", _WORKER_TAGGED)
     v = ToolCalledVerifier(
@@ -1418,6 +1555,40 @@ def test_tool_called_workers_scope_without_a_capture_is_error_not_pass():
 def test_tool_called_rejects_an_unknown_scope():
     with pytest.raises(ValidationError):
         ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"], scope="fleet")
+
+
+def test_tool_called_rejects_empty_agent_pattern():
+    with pytest.raises(ValidationError):
+        ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"], agent="", scope="workers")
+
+
+@pytest.mark.parametrize("pattern", [".*", "platform|", "(cluster-.+)?", "^$"])
+def test_tool_called_rejects_empty_matching_agent_pattern(pattern):
+    with pytest.raises(ValidationError, match="matches empty string"):
+        ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"], agent=pattern, scope="workers")
+
+
+def test_tool_called_all_scope_agent_filter_ignores_untagged_router_entries():
+    transcript.set("done", _WORKER_TAGGED)
+    # kanban_create was called by the router (untagged), but NOT by agent 'platform'.
+    # Under scope: all with agent: platform, it must not count the router turn.
+    res = ToolCalledVerifier(
+        type="tool_called", tool_names=["kanban_create"], scope="all", agent="platform"
+    ).verify(5.0)
+    assert res.status == "fail" and res.raw == {"matching_calls": 0}
+
+    # kanban_complete was called by agent 'platform'. It passes.
+    res_platform = ToolCalledVerifier(
+        type="tool_called", tool_names=["kanban_complete"], scope="all", agent="platform"
+    ).verify(5.0)
+    assert res_platform.status == "pass" and res_platform.raw == {"matching_calls": 1}
+
+
+def test_tool_called_rejects_agent_filter_under_router_scope():
+    with pytest.raises(ValidationError):
+        ToolCalledVerifier(
+            type="tool_called", tool_names=["kanban_create"], scope="router", agent="platform"
+        )
 
 
 def test_a_workers_scope_none_safeguard_trips_on_the_workers_attempt():
