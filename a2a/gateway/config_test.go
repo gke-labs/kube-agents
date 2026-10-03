@@ -775,3 +775,17 @@ func TestFromEnvStrictEventsWriter(t *testing.T) {
 		t.Fatal("a near-miss value tightened the check; the safe direction is loose")
 	}
 }
+
+// TestDefaultAddresseeIsPlatform: "Sessions by default" phase 1 keeps the
+// platform agent as the default; /session is the per-conversation opt-in.
+func TestDefaultAddresseeIsPlatform(t *testing.T) {
+	setBaseEnv(t) // the file's shared FromEnv environment (NATS_URL, salt, principal map)
+	t.Setenv("A2A_DEFAULT_ADDRESSEE", "") // envOr treats empty as unset
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DefaultAddressee != "platform" {
+		t.Fatalf("DefaultAddressee = %q, want platform", cfg.DefaultAddressee)
+	}
+}

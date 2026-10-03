@@ -205,6 +205,7 @@ func a2aIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 		bridgeIdentity(),
 		seedIdentity(),
 		webIdentity(),
+		consoleIdentity(),
 		sysIdentity(),
 	}
 }
@@ -241,6 +242,9 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		// name different buckets is an authorization failure at runtime with
 		// a green suite.
 		"$KV.session-state.>",
+		// The console adapter's notices (spec-chatops-gateway.md, "The
+		// console adapter"): core NATS, one subject per conversation.
+		"chat.console.*.out",
 	}
 	publish = append(publish, a2aGatewayJetStreamGrants()...)
 	publish = append(publish,
@@ -290,6 +294,7 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			"a2a.agents.>",
 			"agents.hb.>",
 			"$KV.session-state.>",
+			"chat.console.*.in",
 			"_INBOX.gateway.>",
 		},
 	}
@@ -632,14 +637,15 @@ func seedIdentity() a2aIdentity {
 	}
 }
 
-// web: the read surface, the one user meant to face a browser, and the only
-// user whose credential is published to one by design.
+// web: the read surface, and one of the two users whose credential is
+// published to a browser by design - console is the other, and unlike this
+// one it can publish.
 //
 // STATIC, permanently. A browser holds no Kubernetes ServiceAccount token and
 // there is no mechanism by which it could, so this principal can never move to
 // the callout. It is not a residue awaiting a card; it is the shape of the
-// thing. What the callout does change is that this is now the ONLY credential
-// in the deployment a browser is ever handed.
+// thing. What the callout does change is that the credentials a browser is
+// ever handed are now exactly these two, both static for the same reason.
 //
 // "Read-only" is not expressible as a subject list — subject permissions cannot
 // see a request body, and JetStream puts the reach there — so the JS API grants
@@ -652,8 +658,8 @@ func webIdentity() a2aIdentity {
 	return a2aIdentity{
 		user:    "web",
 		account: a2aAccountApp,
-		comment: "the read surface, and the only credential published to a browser by\n" +
-			"design. STATIC permanently: a browser holds no ServiceAccount token and\n" +
+		comment: "the read surface, and one of the two credentials published to a\n" +
+			"browser by design - console is the other. STATIC permanently: a browser holds no ServiceAccount token and\n" +
 			"there is no mechanism by which it could. Read-only is not expressible as\n" +
 			"a subject list - JetStream puts the reach in the request BODY - so the JS\n" +
 			"API grants are enumerated per stream and there is no ack grant.",
@@ -682,6 +688,62 @@ func webIdentity() a2aIdentity {
 		subscribe: []string{
 			"a2a.>",
 			"_INBOX.web.>",
+		},
+	}
+}
+
+// console: the web console's credential - the read surface plus one narrow
+// publish, the inbound chat subject the gateway's console adapter subscribes.
+//
+// STATIC permanently, for web's reason: a browser holds no ServiceAccount
+// token. What makes this credential a chat identity rather than a read
+// credential is the grant on chat.console.*.in: only this user can reach
+// that subject, so the gateway takes a frame there as coming from the
+// principal nats:console with no mapping table in between (the same
+// subject-derived identity every other writer on this bus has). One shared
+// principal is the posture until the account split makes it one per person.
+//
+// The console holds no JetStream verb on any KV_* stream, STREAM.INFO
+// included: STREAM.INFO accepts a subjects_filter in its request body and
+// answers with one entry per matching subject, so {"subjects_filter":">"} on
+// KV_session-state lists every key, which is every conversation and task id.
+// There is no sizes-only route to grant, so the capacity tiles that wanted
+// bucket sizes wait for one.
+func consoleIdentity() a2aIdentity {
+	return a2aIdentity{
+		user:    "console",
+		account: a2aAccountApp,
+		comment: "the web console: web's read surface plus one publish, chat.console.*.in,\n" +
+			"which is the gateway's console adapter's inbound subject. STATIC for\n" +
+			"web's reason. No JetStream verb on any KV_* stream: STREAM.INFO's\n" +
+			"subjects_filter would list every key.",
+		auth:     a2aAuthStatic,
+		credsKey: a2aConsolePasswordKey,
+		publish: []string{
+			"$JS.API.INFO",
+			"$JS.API.STREAM.INFO.TASKS",
+			"$JS.API.STREAM.INFO.DIRECTORY",
+			"$JS.API.STREAM.INFO.TOPICS-STATE",
+			"$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+			"$JS.API.CONSUMER.CREATE.TASKS.>",
+			"$JS.API.CONSUMER.CREATE.DIRECTORY.>",
+			"$JS.API.CONSUMER.CREATE.TOPICS-STATE.>",
+			"$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>",
+			"$JS.API.CONSUMER.INFO.TASKS.*",
+			"$JS.API.CONSUMER.INFO.DIRECTORY.*",
+			"$JS.API.CONSUMER.INFO.TOPICS-STATE.*",
+			"$JS.API.CONSUMER.INFO.TOPICS-JOURNAL.*",
+			"$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
+			"$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
+			"$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
+			"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
+			"chat.console.*.in",
+			"_INBOX.console.>",
+		},
+		subscribe: []string{
+			"a2a.>",
+			"chat.console.*.out",
+			"_INBOX.console.>",
 		},
 	}
 }

@@ -52,7 +52,10 @@ install without the interview.
   LiteLLM routes `model-default` to (set the matching `*_api_key` variable);
   `model_default_name` overrides the per-provider default model;
   `model_max_tokens` (default `0`, meaning none) sets the output-token budget
-  the gateway asks for on a request that names none.
+  the gateway asks for on a request that names none; `litellm_redaction`
+  (off by default) redacts every request body the gateway forwards to the
+  provider, and `install.sh` sets it from the `LITELLM_REDACTION_*` keys in
+  `install.env`.
 - Two `random_password` values added to that Secret rather than asked for:
   `SESSION_KV_API_KEY`, the bearer token for the pod-local Session KV server,
   and `SESSION_KV_SALT`, the HMAC salt that pseudonymises chat identities.
@@ -212,18 +215,30 @@ KSA back to the default and re-shares the identity silently, and there is no
 `guard_ksa_identity` to refuse that the way `guard_gsa_identity` refuses the
 GSA's destroy-and-recreate. The `agent_service_account_id` description in
 `variables.tf` carries the limits to read before relying on any of this.
-The drift audit-log ingress has the same one-default-per-project shape, with
-adoption in place of a collision: with `enable_drift_pubsub` on,
-`drift_pubsub_topic`, `drift_pubsub_subscription` and `drift_pubsub_sink` each
-default to one name, and `lifecycle.sh apply` imports a resource of that name
-that exists but is not in its state, which it cannot tell from one the other
-live install owns. A second install that turns the flag on names all three
-(through the front doors, `TF_VAR_drift_pubsub_topic=...` and the other two as
-lines in `install.env`, since the generator writes none of them) or leaves the
-flag off; otherwise its apply adopts the first install's topic, subscription
-and sink into its own state, and its teardown removes them, retained messages
-included. The stockout trio (`stockout_pubsub_*`) is adopted the same way and
-carries the same requirement. Renaming a subscription already in state is a
+The drift audit-log ingress has the same one-default-per-project shape, and
+this one every second install meets, because `ENABLE_DRIFT_DETECTOR` defaults
+to `true`: `drift_pubsub_topic`, `drift_pubsub_subscription` and
+`drift_pubsub_sink` each default to one name, so the second install reaches its
+first apply with all three already in the project and none of them in its
+state. `lifecycle.sh apply` refuses it — `guard_drift_adoption`, before
+Terraform runs — rather than importing them, because an import cannot tell a
+trio an earlier install left behind from one another live install owns, and
+adopting the second takes it over: this install's teardown then deletes all
+three, retained records included, and until then both detectors pull the one
+subscription, which Pub/Sub splits between them, so each install reports about
+half the project's drift while both stay Ready. The guard names four ways out —
+give this install its own three names (through the front doors,
+`TF_VAR_drift_pubsub_topic=...` and the other two as lines in `install.env`,
+since the generator writes none of them); import the trio back if it is this
+install's own and the state is what went missing, a repointed
+`KUBE_AGENTS_STATE_BUCKET` or a `terraform state rm` (it prints the
+`terraform import` commands, and running one asserts the ownership the guard
+could not establish); delete the leftovers if that is what they are (it prints
+the `gcloud` commands); or leave the detector off for this install with
+`ENABLE_DRIFT_DETECTOR=false`. The stockout trio
+(`stockout_pubsub_*`) has the same shape but is still adopted, because
+`enable_stockout_investigator` stays off unless asked for: a second install
+that turns it on names its own three. Renaming a subscription already in state is a
 different failure, and `guard_pubsub_subscription` refuses it for the Chat,
 drift and stockout subscriptions alike, while the feature's flag is on: `name`
 and `topic` are ForceNew on `google_pubsub_subscription`, so the apply would
@@ -246,7 +261,7 @@ gcloud storage cp gs://<bucket>/<prefix>/default.tfstate#<generation> \
 
 If the state is gone entirely, import the cluster back before anything else —
 `terraform import 'module.gke_cluster.google_container_cluster.<autopilot|standard>[0]' projects/<project>/locations/<location>/clusters/<cluster_name>`,
-with the provider override the BackupPlan recipe below uses — and then re-run
+with the two overrides the BackupPlan recipe below writes — and then re-run
 `lifecycle.sh apply` against the same tfvars: KMS adoption is automatic, and
 `terraform import` covers the rest. Without that import the apply is refused up
 front (`guard_cluster_ownership`, [below](#recovering-from-an-interrupted-apply))
@@ -355,13 +370,23 @@ neither means what it looks like:
   with "could not evaluate var.project_id". Restore the tfvars the install used
   before either recipe.
 
-  The import itself needs the placeholder Helm provider `adopt-kms` writes for
-  its own imports, and `lifecycle.sh` exposes no generic import subcommand to
-  borrow — so write it yourself. `terraform import` configures every provider
-  before it does anything, and the `helm` provider here is built from
-  `module.gke_cluster.cluster_endpoint`; the override was needed in practice even
-  with the cluster already in state. The filename suffix is what makes Terraform
-  treat it as an override, so keep it:
+  The import itself needs the two overrides `adopt-kms` writes for its own
+  imports, and `lifecycle.sh` exposes no generic import subcommand to borrow —
+  so write them yourself. `terraform import` configures every provider before
+  it does anything, and the `helm` provider here is built from
+  `module.gke_cluster.cluster_endpoint`; that override was needed in practice
+  even with the cluster already in state. The same walk leaves every resource
+  not in state unknown, so the scope resolver module's monitored-project
+  lookup, whose `for_each` is keyed on a read the walk never makes, refuses the
+  import (`Invalid for_each argument`) until it is pinned to an empty set, and
+  the IAM module keys its scope bindings on that module's `members` output,
+  unknown for the same reason once a Shared VPC host or Metrics Scope is
+  declared. The second file pins both, the lookup to no instances and
+  `members` to an empty list under each declared selector's name (the IAM
+  module's precondition wants an entry per selector, so a bare `{}` would warn
+  on every import), and goes into the module's own directory because
+  Terraform merges override files per module. The filename suffix is what
+  makes Terraform treat each as an override, so keep it:
 
   ```bash
   cat > providers_lifecycle_override.tf <<'EOF'
@@ -372,13 +397,33 @@ neither means what it looks like:
     }
   }
   EOF
+  cat > ../../modules/kube-agents-scope-resolver/scope_resolver_lifecycle_override.tf <<'EOF'
+  data "http" "scope_monitored_project" {
+    for_each = toset([])
+  }
+
+  output "members" {
+    value = merge(
+      { for host in var.shared_vpc_hosts : "sharedVpcHosts/${host}" => [] },
+      { for scope in var.metrics_scopes : "metricsScopes/${scope}" => [] },
+    )
+  }
+  EOF
   terraform import 'module.gke_backup_plan[0].google_gke_backup_backup_plan.this' \
     "projects/<project>/locations/<region>/backupPlans/<cluster_name>-backup-plan"
-  rm -f providers_lifecycle_override.tf
+  rm -f providers_lifecycle_override.tf \
+    ../../modules/kube-agents-scope-resolver/scope_resolver_lifecycle_override.tf
   ```
 
-  Remove the override before the next apply — it is never meant to survive an
-  import, which is why `lifecycle.sh` deletes it on an `EXIT` trap.
+  Remove both overrides before the next apply — they are never meant to
+  survive an import, which is why `lifecycle.sh` deletes them on an `EXIT` trap
+  and again at the start of every subcommand, and `install.sh --dry-run` deletes
+  them before its own validate and plan. A plan or apply that merged the
+  scope override would resolve every declared selector to no members and plan
+  the removal of the bindings those members hold, and the resolver module's
+  own `terraform test` suite would assert against the pin instead of the
+  module, which is why `make terraform-test` refuses to run beside the file
+  and names it.
 
 - **A retry that would create a cluster that already exists.** State left by an
   apply that died before the cluster finished creating can hold a managed
@@ -742,18 +787,20 @@ does not (`driftDetectorEnabled` in
 matches it against each audit record's `project_id`, which is always the ID) —
 without it the ingress bills for a stream nothing reads.
 
-`lifecycle.sh apply` adopts a topic, subscription or sink of those
-names left behind by an earlier install before applying, the way it adopts
-the stockout trio, so a re-install does not 409 on them. That adoption is by
-name and cannot tell a leftover from another install's live trio, so a second
-install in the same project that turns the flag on sets its own three names
-first ([Remote state](#remote-state)).
+`lifecycle.sh apply` refuses rather than adopting when a topic, subscription
+or sink of those names already exists outside its state — `guard_drift_adoption`,
+before Terraform runs. Adoption by name cannot tell a leftover from another
+install's live trio, and since `ENABLE_DRIFT_DETECTOR` became an install
+default it is every second install in a project that arrives at that
+ambiguity rather than only one that asked for the feature. The refusal names
+the four ways out; [Remote state](#remote-state) has them, and the cost of
+getting it wrong.
 
-Through the installer front doors the two variables are one `install.env` key.
-`ENABLE_DRIFT_DETECTOR=true` (also `install.sh --enable-drift-detector`) writes
-both into the generated `terraform.tfvars`, which is the only order the
-precondition accepts. Off, it writes neither — the one boolean in that
-generated file omitted rather than written `false`. `enable_drift_pubsub` is
+Through the installer front doors the two variables are one `install.env` key,
+`ENABLE_DRIFT_DETECTOR`, and it defaults to `true`: an install that says nothing
+about it writes both into the generated `terraform.tfvars`, which is the only
+order the precondition accepts. `ENABLE_DRIFT_DETECTOR=false` writes neither —
+the one boolean in that generated file omitted rather than written `false`. `enable_drift_pubsub` is
 reachable on its own as a `TF_VAR_enable_drift_pubsub=true` line in
 `install.env`, the same channel `agent_ksa_name` uses (every front door sources
 that file with `set -a`, and Terraform reads `TF_VAR_*` where the generated file
@@ -763,15 +810,19 @@ of retained audit records nothing has acknowledged — for removal under
 `-auto-approve`, from a release note nobody read. Omission is what leaves it
 alone.
 
-Which makes turning the key off two different things. On an install that has
-only ever had the key, dropping it returns both variables to their `false`
+Which makes turning the key off two different things — and note that dropping
+the line is not one of them. Absence resolves to the shipped `true`, so a
+deleted `ENABLE_DRIFT_DETECTOR` line provisions the trio rather than destroying
+it, the opposite of every other key in that file. Only an explicit
+`ENABLE_DRIFT_DETECTOR=false` turns the feature off. On an install that has only
+ever had the key, writing that `false` returns both variables to their `false`
 defaults and the next apply destroys the sink, topic and subscription, retained
 messages included — the ordinary teardown the other flags get, and the same
 `-auto-approve` destroy the paragraph above describes, arriving this time
 because it was asked for. Nothing refuses it: `guard_pubsub_subscription`
 checks the name only while the flag is on, because switching the feature off is
 a teardown it reads as deliberate rather than the rename it guards against. On
-an install carrying the `TF_VAR_` line, dropping the key stops the detector and
+an install carrying the `TF_VAR_` line, that same `false` stops the detector and
 leaves the ingress running, still exporting and still billing.
 
 **Manual steps that no IaC can perform** — canonical walkthrough:
@@ -827,14 +878,15 @@ make tf-apply       # or: ./terraform/examples/full-install/lifecycle.sh apply
 
 What each one does that raw Terraform cannot:
 
-| Asymmetry                                                                                              | Handled by                                                                                                                                   |
-| ------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| KMS key rings and keys can never be deleted, so the next apply 409s                                    | `tf-apply` imports the survivors before applying (`lifecycle.sh adopt-kms`)                                                                  |
-| The `PlatformAgent` finalizer strands the CR and hangs the namespace                                   | `tf-destroy` deletes the CR and waits, force-clearing the finalizer if wedged                                                                |
-| A `BackupPlan` cannot be deleted while it owns backups                                                 | `tf-destroy` purges the plan's backups first                                                                                                 |
-| `deletion_protection = true` cannot be overridden by a destroy alone                                   | `tf-destroy` applies it as `false`, then destroys                                                                                            |
-| A Pub/Sub topic or subscription that already exists makes the create 409                               | `tf-apply` imports it first (`adopt_pubsub`), so a topic created in the Cloud console while wiring up Google Chat does not block the install |
-| The stockout and drift topics, subscriptions and sinks survive a partial teardown and 409 the same way | `tf-apply` imports whichever of them exist by name when their flags are on (`adopt_kms`, alongside the KMS resources)                        |
+| Asymmetry                                                                                                | Handled by                                                                                                                                   |
+| -------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| KMS key rings and keys can never be deleted, so the next apply 409s                                      | `tf-apply` imports the survivors before applying (`lifecycle.sh adopt-kms`)                                                                  |
+| The `PlatformAgent` finalizer strands the CR and hangs the namespace                                     | `tf-destroy` deletes the CR and waits, force-clearing the finalizer if wedged                                                                |
+| A `BackupPlan` cannot be deleted while it owns backups                                                   | `tf-destroy` purges the plan's backups first                                                                                                 |
+| `deletion_protection = true` cannot be overridden by a destroy alone                                     | `tf-destroy` applies it as `false`, then destroys                                                                                            |
+| A Pub/Sub topic or subscription that already exists makes the create 409                                 | `tf-apply` imports it first (`adopt_pubsub`), so a topic created in the Cloud console while wiring up Google Chat does not block the install |
+| The stockout topic, subscription and sink survive a partial teardown and 409 the same way                | `tf-apply` imports whichever of them exist by name when the flag is on (`adopt_kms`, alongside the KMS resources)                            |
+| The drift trio does too, but the detector is on by default, so every second install in a project hits it | `tf-apply` refuses instead of importing (`guard_drift_adoption`): an import cannot tell a leftover from another live install's trio          |
 
 The chart also carries a `pre-delete` hook that removes the CR and waits for
 its finalizer, so a plain `helm uninstall` is safe on its own; `tf-destroy`

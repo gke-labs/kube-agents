@@ -19,15 +19,18 @@ Per project, in a temporary directory of its own:
 
 The checks are the verifier's POOL_STATE_CHECKS: the project and its APIs,
 IAM, Artifact Registry, the clusters and state bucket, and the KMS half of
-the token minter. Every read runs as the bot itself
-(eval-dashboard-publisher@kube-agents-prow), which needs the project-level
-read roles bench/tf/fleet grants it (`pool_state_readers`); a project without
-them scans as "not checked" with gcloud's own words. Not run here: the fleet
+the token minter, and the GitOps repository's default branch. Every GCP
+read runs as the bot itself (eval-dashboard-publisher@kube-agents-prow),
+which needs the project-level read roles bench/tf/fleet grants it
+(`pool_state_readers`); a project without them scans as "not checked" with
+gcloud's own words. The default-branch read is one `gh api` call per private
+repository with whatever GitHub credential the job puts in GH_TOKEN, and is
+"not checked" with that reason while it carries none. Not run here: the fleet
 fixtures (fixture_state.py already does), the warm-cache reader grants in the
-Prow project (warm_cache), the GitHub-reading checks (github_repo_and_app,
-gitops_declaration, ledger_read_credential; each needs a credential the bot
-must not hold), the minter check's signing half (token_minter; the scan runs
-token_minter_kms), the mapping (about the checkout, not the project).
+Prow project (warm_cache), the GitHub-reading checks that need a credential
+the bot must not hold (github_repo_and_app, gitops_declaration,
+ledger_read_credential), the minter check's signing half (token_minter; the
+scan runs token_minter_kms), the mapping (about the checkout, not the project).
 
 The project list is `gitops_repo_for_project()` in hack/ci-deploy.sh, read
 the way fixture_state.py reads it. Nothing here fails the bot's run: a
@@ -341,15 +344,26 @@ def _read_checks(entry: dict, whole: bool) -> list[str]:
     return sorted(out)
 
 
+def _gcp_read_checks(entry: dict) -> list[str]:
+    """The GCP reads among the checks read on one project: what "checked"
+    means. The default-branch read (`gitops_default_branch`) runs with the
+    job's own GitHub credential whatever gcloud answered, so a healthy one
+    says nothing about the project; counting it would let a pool whose
+    publisher roles are gone (#1927, the shape `pool_state.unknown` exists
+    for) scan as fully checked with a footnote."""
+    return [c for c in _read_checks(entry, whole=False) if c in verifier.GCP_CHECKS]
+
+
 def unread_units(document: dict | None) -> int:
     """How many checks were not read in full on projects the scan did check:
     not checked at all, or read in part with the rest refused (healthy or
     drifted with `unread`). The digest's "every one shaped as the verifier
-    requires" is only as true as this is zero."""
+    requires" is only as true as this is zero. A project no GCP read reached
+    is blind, not partial, whatever the GitHub read said."""
     count = 0
     for project, entry in _entries(document):
         checks = entry.get(KEY_CHECKS) if isinstance(entry, dict) else None
-        if not isinstance(checks, dict) or not _read_checks(entry, whole=False):
+        if not isinstance(checks, dict) or not _gcp_read_checks(entry):
             continue
         for verdict in checks.values():
             if not isinstance(verdict, dict):
@@ -407,9 +421,10 @@ def check_of(document: dict | None, project: str, finding_id: str) -> str:
 
 
 def checked_projects(document: dict | None) -> int:
-    """Projects where at least one check read anything; a partial read is
-    not a blind scan."""
-    return sum(1 for _, entry in _entries(document) if _read_checks(entry, whole=False))
+    """Projects where at least one GCP check read anything; a partial read
+    is not a blind scan, and the GitHub read alone is not a read of the
+    project (`_gcp_read_checks`)."""
+    return sum(1 for _, entry in _entries(document) if _gcp_read_checks(entry))
 
 
 def _project_reason(entry: dict) -> str | None:

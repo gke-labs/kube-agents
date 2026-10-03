@@ -221,9 +221,11 @@ class InstallerCommonTest(unittest.TestCase):
                     # Same reasoning, and the same ${VAR:-} read in
                     # write_tfvars_from_state. get_isolated_test_env filters
                     # the CI names and nothing else, so without this a shell
-                    # exporting ENABLE_DRIFT_DETECTOR=true reaches every case
+                    # exporting ENABLE_DRIFT_DETECTOR=false reaches every case
                     # that does not set it -- including the arm below that
-                    # asserts the drift keys are omitted when nobody asks.
+                    # asserts the drift keys are written when nobody asks.
+                    # Blanking it is "unset", which that arm wants: `:-` takes
+                    # the default for an empty value as well as an absent one.
                     "ENABLE_DRIFT_DETECTOR": "",
                     **(env or {}),
                 },
@@ -427,18 +429,42 @@ class InstallerCommonTest(unittest.TestCase):
         audit-log ingress that way, and the next upgrade would destroy its
         sink, topic and subscription under -auto-approve.
 
-        The None arm is the key absent from what the case passes in. It only
-        means "unset" because _run blanks ENABLE_DRIFT_DETECTOR in the
-        isolated environment it builds; get_isolated_test_env copies the rest
-        of os.environ through, so without that blank this arm would assert
-        against whatever the developer's shell happened to export.
+        Every arm here is an explicit opt-out, because that is the only way to
+        reach the off branch now that DEFAULT_ENABLE_DRIFT_DETECTOR is true.
+        The companion below owns the arms that say nothing.
         """
-        for value in ("false", "False", "no", "0", "off", "", None):
+        for value in ("false", "False", "no", "0", "off"):
+            with self.subTest(value=value):
+                content = self._drift_tfvars(ENABLE_DRIFT_DETECTOR=value)
+                self.assertNotIn("enable_drift_pubsub", content)
+                self.assertNotIn("enable_drift_detector", content)
+
+    def test_tfvars_writes_both_drift_keys_when_nobody_says_anything(self):
+        """Saying nothing provisions the trio, which is what flipping
+        DEFAULT_ENABLE_DRIFT_DETECTOR to true means and the one arm that
+        proves the generator reads the default rather than a literal.
+
+        Both arms are "unset" to the `${ENABLE_DRIFT_DETECTOR:-...}` the gate
+        expands: `:-` takes the default for an empty value as well as an
+        absent one, so an install.env carrying `ENABLE_DRIFT_DETECTOR=` gets
+        the detector, not the off branch. The None arm only means "absent"
+        because _run blanks ENABLE_DRIFT_DETECTOR in the isolated environment
+        it builds; get_isolated_test_env copies the rest of os.environ
+        through, so without that blank this arm would assert against whatever
+        the developer's shell happened to export.
+
+        This is also what an install predating the key gets: its install.env
+        records no choice, so the next run of either front door reads the
+        default here and provisions the sink, topic and subscription. That is
+        the intended behaviour -- running an installer is the consent -- and
+        this case is where it is pinned.
+        """
+        for value in ("", None):
             with self.subTest(value=value):
                 env = {} if value is None else {"ENABLE_DRIFT_DETECTOR": value}
                 content = self._drift_tfvars(**env)
-                self.assertNotIn("enable_drift_pubsub", content)
-                self.assertNotIn("enable_drift_detector", content)
+                self.assertIn("enable_drift_pubsub   = true", content)
+                self.assertIn("enable_drift_detector = true", content)
 
     def test_an_exported_value_survives_the_file_load_into_the_tfvars(self):
         """install.env is not this generator's only input, and no front door makes it one.
@@ -988,6 +1014,123 @@ class InstallerCommonTest(unittest.TestCase):
                     self.assertIn("rc=1", proc.stdout, proc.stderr)
                     self.assertIn("MODEL_MAX_TOKENS", proc.stderr + proc.stdout)
                     self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
+
+    # Empty reads as unset, so a developer's own exported value cannot stand in.
+    _REDACTION_UNSET = {
+        "LITELLM_REDACTION_ENABLED": "",
+        "LITELLM_REDACTION_IP_ACTION": "",
+        "LITELLM_REDACTION_IP_ALLOW_CIDRS": "",
+        "LITELLM_REDACTION_RULES": "",
+    }
+
+    def test_tfvars_carry_litellm_redaction(self):
+        # Off writes the toggle alone: the other keys are inert, so a leftover
+        # value is neither read nor checked. The composition renders nothing
+        # into the chart while enabled is false.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for env, expected in (
+                ({}, "litellm_redaction = { enabled = false }\n"),
+                (
+                    {
+                        "LITELLM_REDACTION_ENABLED": "off",
+                        "LITELLM_REDACTION_IP_ACTION": "hash",
+                        "LITELLM_REDACTION_RULES": "not json",
+                    },
+                    "litellm_redaction = { enabled = false }\n",
+                ),
+                (
+                    {
+                        "LITELLM_REDACTION_ENABLED": "yes",
+                        "LITELLM_REDACTION_IP_ACTION": "off",
+                        "LITELLM_REDACTION_IP_ALLOW_CIDRS": "127.0.0.0/8, fd00::/8 10.0.0.0/8",
+                        "LITELLM_REDACTION_RULES": '[{"name":"cluster-name","literal":"prod-eu-1","action":"pseudonym"}]',
+                    },
+                    "litellm_redaction = {\n"
+                    "  enabled     = true\n"
+                    '  ip_action   = "off"\n'
+                    '  allow_cidrs = ["127.0.0.0/8", "fd00::/8", "10.0.0.0/8"]\n'
+                    '  rules       = [{ name = "cluster-name", literal = "prod-eu-1", action = "pseudonym" }]\n'
+                    "}\n",
+                ),
+            ):
+                with self.subTest(env=env):
+                    proc = self._run(
+                        f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", **self._REDACTION_UNSET, **env},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    self.assertIn(expected, dest.read_text())
+
+    def test_tfvars_escape_litellm_redaction_rules_for_hcl(self):
+        # A regular expression may hold ${ or %{, which HCL reads as a
+        # template, as well as backslashes and quotes.
+        rules = json.dumps([{"name": "tmpl", "pattern": 'a${b}%{c}\\d"\n'}])
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    **self._REDACTION_UNSET,
+                    "LITELLM_REDACTION_ENABLED": "true",
+                    "LITELLM_REDACTION_RULES": rules,
+                },
+                describe_stub="printf '\\n'; exit 0",
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn(
+                '  rules       = [{ name = "tmpl", pattern = "a$${b}%%{c}\\\\d\\"\\n" }]\n',
+                dest.read_text(),
+            )
+
+    def test_tfvars_refuse_litellm_redaction_values_terraform_cannot_take(self):
+        # upgrade.sh and uninstall.sh regenerate from install.env without
+        # install.sh's checks, so the generator names the key and writes nothing.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for key, value, message in (
+                ("LITELLM_REDACTION_ENABLED", "ture", "is neither true nor false"),
+                ("LITELLM_REDACTION_ENABLED", "enabled", "is neither true nor false"),
+                ("LITELLM_REDACTION_IP_ACTION", "hash", "is not one of mask, pseudonym, off"),
+                ("LITELLM_REDACTION_IP_ACTION", "OFF", "is not one of mask, pseudonym, off"),
+                ("LITELLM_REDACTION_RULES", "not json", "is not valid JSON"),
+                ("LITELLM_REDACTION_RULES", '{"name":"x","literal":"y"}', "must be a JSON array"),
+                ("LITELLM_REDACTION_RULES", '["x"]', "entry 0 is not an object"),
+                ("LITELLM_REDACTION_RULES", '[{"name":"x","literl":"y"}]', "unknown key(s) ['literl']"),
+                ("LITELLM_REDACTION_RULES", '[{"literal":"prod-eu-1"}]', "entry 0 has no name"),
+                ("LITELLM_REDACTION_RULES", "[{}]", "entry 0 has no name"),
+                ("LITELLM_REDACTION_RULES", '[{"name":"x","literal":7}]', "entry 0: literal must be a string"),
+                ("LITELLM_REDACTION_RULES", '[{"name":"x","literal":"\\ud800"}]', "entry 0: literal is not valid UTF-8 text"),
+            ):
+                with self.subTest(key=key, value=value):
+                    proc = self._run(
+                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                        env={
+                            "API_SERVER_KEY": "k",
+                            **self._REDACTION_UNSET,
+                            "LITELLM_REDACTION_ENABLED": "true",
+                            key: value,
+                        },
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn(f"{key}", proc.stderr)
+                    self.assertIn(message, proc.stderr)
+                    self.assertNotIn("Traceback", proc.stderr + proc.stdout)
+                    self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
+
+    def test_a_rules_refusal_reaches_the_operator_through_the_command_substitution(self):
+        # The generator captures hcl_redaction_rules' output, so its message
+        # must go to stderr even with the real print_error, which writes to
+        # stdout.
+        proc = self._run(
+            "print_error() { echo \"ERROR: $*\"; }\n"
+            'rc=0; out="$(hcl_redaction_rules "not json")" || rc=$?; echo "rc=$rc out=[$out]"'
+        )
+        self.assertIn("rc=1 out=[]", proc.stdout)
+        self.assertIn("LITELLM_REDACTION_RULES is not valid JSON", proc.stderr)
 
     def test_tfvars_gvisor_on_autopilot_asks_for_runtime_class_only(self):
         # enable_gvisor_node_pool fails the plan on Autopilot, which ships the

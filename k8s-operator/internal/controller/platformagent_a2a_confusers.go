@@ -74,17 +74,52 @@ func renderA2AStaticUser(id a2aIdentity, password string) string {
 	b.WriteString(a2aUserBlockIndent + "  user: " + id.user + "\n")
 	b.WriteString(a2aUserBlockIndent + `  password: "` + password + "\"\n")
 
-	// $SYS's user holds the system account's own privileges and carries no
-	// subject lists; a permissions block with empty allow lists would deny it
-	// everything.
+	// Three cases, and only the middle one is a judgement call.
+	//
+	// NEITHER side: no permissions block at all. Note what this is NOT: an
+	// empty "permissions {}" block would not close the user down. It parses to
+	// a non-nil *Permissions with both sides nil (parseUserPermissions,
+	// server/opts.go, builds &Permissions{} up front and fills only the keys it
+	// finds), setPermissions then sets c.perms from it, and
+	// pubAllowedFullCheck's second disjunct reads nil/nil as unrestricted. An
+	// absent block and an empty block both mean "no restrictions", by two
+	// different routes. Omitting it is therefore not a denial; it is how sys
+	// gets the $SYS account's own privileges, which is what sys is for. That is
+	// safe because sys is the only identity with neither side, and
+	// TestSysIsTheOnlyStaticIdentityWithNoSubjectsOfItsOwn keeps it that way --
+	// a second one would be handed the whole subject space silently, which is
+	// exactly the defect the rest of this function closes.
+	//
+	// BOTH sides: render both allow lists, which is every static user today.
+	//
+	// Exactly ONE side: the empty side gets an explicit deny rather than
+	// nothing. An absent key is not an empty allow list -- parseUserPermissions
+	// (server/opts.go) sets only the side it finds, and a side it never set is
+	// unrestricted, so rendering publish-only would hand that user the whole
+	// subject space to subscribe to. This is the same defect the callout's
+	// identity map validator refuses, except that this half of the render has
+	// no validator at all, so it is written closed here instead of caught
+	// later. No static identity is one-sided today, so this changes nothing
+	// about what ships; it changes what a future one-sided identity would ship.
 	if len(id.publish) > 0 || len(id.subscribe) > 0 {
 		b.WriteString(a2aUserBlockIndent + "  permissions {\n")
-		b.WriteString(renderA2ASubjectList(a2aSubjectListIndent, "publish", id.publish))
-		b.WriteString(renderA2ASubjectList(a2aSubjectListIndent, "subscribe", id.subscribe))
+		b.WriteString(renderA2ASubjectListOrDenyAll(a2aSubjectListIndent, "publish", id.publish))
+		b.WriteString(renderA2ASubjectListOrDenyAll(a2aSubjectListIndent, "subscribe", id.subscribe))
 		b.WriteString(a2aUserBlockIndent + "  }\n")
 	}
 	b.WriteString(a2aUserBlockIndent + "}\n")
 	return b.String()
+}
+
+// renderA2ASubjectListOrDenyAll renders one side of a permissions block, and
+// is the form to use whenever the other side may be populated. An empty list
+// becomes `deny = [">"]` -- the server's own spelling of "nothing", and the
+// only way to say it, since omitting the key says "everything" instead.
+func renderA2ASubjectListOrDenyAll(indent, kind string, subjects []string) string {
+	if len(subjects) == 0 {
+		return indent + kind + ` { deny = [">"] }` + "\n"
+	}
+	return renderA2ASubjectList(indent, kind, subjects)
 }
 
 func renderA2ASubjectList(indent, kind string, subjects []string) string {

@@ -56,7 +56,7 @@ the agent a usable kubectl context) when it has the complete triple; with one mi
 | `memory.provider`                              | string | Memory provider implementation. Default `multiuser_memory`; `none` for none. See below.                                                                                                                                           |
 | `memory.userProfileEnabled`                    | bool   | Toggle per-user memory profiling. Default `false`.                                                                                                                                                                                |
 | `eventWatcher.enabled`                         | bool   | Start the `k8s-event-watcher`. Default `true`; `false` is the emergency stop for an event storm (see below).                                                                                                                      |
-| `driftDetector.enabled`                        | bool   | Start the `drift-detector`. Default `false`, because it needs a Pub/Sub subscription no stock install creates. See below.                                                                                                         |
+| `driftDetector.enabled`                        | bool   | Start the `drift-detector`. Default `false`, because it needs a Pub/Sub subscription a hand-written CR or a Helm-only install does not create; `install.sh` creates one and sets this to `true` unless told otherwise. See below. |
 | `driftDetector.subscription`                   | string | Pub/Sub subscription the detector pulls audit records from. Unset takes the detector's own default, which is the name the Terraform module creates.                                                                               |
 | `driftDetector.gitopsManagers`                 | string | Comma-separated `managedFields` field managers belonging to your GitOps controller, matched exactly — `argocd-controller`, `flux`. Unset means no card is ever annotated as possibly already reconciled.                          |
 | `tuning.<persona>.apiMaxRetries`               | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                                                                                             |
@@ -187,17 +187,32 @@ watcher posts to — so a change someone made to a cluster by hand arrives on th
 control plane, CI, and every service account are dropped alike; on a busy cluster that is the
 overwhelming majority of the stream.
 
-**It is off unless you ask for it, the opposite of the watcher.** The subscription it reads does not
-exist in a stock install: the audit log sink, topic, and subscription come from the
-`drift-pubsub` Terraform module, which the
+**Through `install.sh` it is on unless you turn it off; the field itself still defaults to
+`false`.** The two layers differ on purpose — the field is what a hand-written CR or a Helm-only
+install sets, and neither of those creates a subscription for the detector to read, so the API
+default stays off and the installer is what turns it on. It is not free either, and what it costs is
+GCP resources rather than cluster resources: the subscription it reads comes with an audit log sink
+and a Pub/Sub topic, all three from the `drift-pubsub` Terraform module, and the sink exports the
+admin-activity audit records of every GKE cluster in the project. The
 [`terraform/examples/full-install`](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install)
-composition instantiates only when you set `enable_drift_pubsub = true`, and the field below is
-written only when you set `enable_drift_detector = true` alongside it. Asking for the second
-without the first is refused by a precondition rather than applied. If you installed with
-`install.sh`, ask for both at once with `ENABLE_DRIFT_DETECTOR=true` in `install.env` (or
-`install.sh --enable-drift-detector`), which writes both variables together; the front doors
-regenerate `terraform.tfvars` on every run, so a value written into that file by hand does not
-survive the next one.
+composition instantiates the module when you set `enable_drift_pubsub = true`, and writes the field
+below when you set `enable_drift_detector = true` alongside it. Asking for the second without the
+first is refused by a precondition rather than applied.
+
+If you installed with `install.sh`, one key covers both: `ENABLE_DRIFT_DETECTOR` in `install.env`
+writes the two variables together, and it defaults to `true`, so an install that says nothing gets
+the sink, topic, subscription and detector. To go without them, set `ENABLE_DRIFT_DETECTOR=false`
+in `install.env`. Put it in the file rather than relying on
+`install.sh --enable-drift-detector=false`: the run that creates `install.env` records that flag
+into it, but `install.sh` never rewrites the file afterwards, so on every later run the flag
+applies to the run you pass it to and is recorded nowhere — the next run resolves the default and
+provisions the three resources again, and `upgrade.sh` takes no such flag at all. The
+front doors regenerate `terraform.tfvars` on every run, so a value written into that file by hand
+does not survive the next one either.
+
+This reaches an install created before the key existed. Its `install.env` records no choice, so the
+next `install.sh` or `upgrade.sh` run resolves the default and provisions the three resources —
+`upgrade.sh --plan` shows them as additions before you apply.
 
 An install that has neither provisioned the ingress nor applied the module by hand has nothing for
 the detector to pull. Setting this field there anyway — which now takes a hand-edited CR or chart
@@ -464,7 +479,7 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
 #### `shellSandbox`
 
 - `enabled` — the agent's shell runs in a StatefulSet of its own, reached over SSH with the keypair in the agent's credential Secret (`SANDBOX_SSH_PRIVATE_KEY` and its public half in `<name>-shell-authorized-keys`). **This is not a toggle: `false` is refused** with `Degraded`/`ShellSandboxCannotBeDisabled`, which changes nothing about the running workload. Absent or `true` are the same thing. With no keypair the sandbox Pod cannot start at all — the Secret it mounts is not optional — so the operator reports `Degraded`/`ShellSandboxKeysMissing` rather than leaving the Pod in `ContainerCreating` with the reason only in a Pod event. `install.sh`, `upgrade.sh` and the Terraform composition generate the pair; a bare `helm install` that passes none, or a kustomize install (INSTALL.md Method 2) that skipped its Step 2, reaches that state.
-- `image` — overrides the sandbox image. Empty takes the operator's default.
+- `image` — overrides the sandbox image. Empty takes the operator's default. A pinned image must be at least as new as the operator: the operator runs the image's entrypoint in an init container that stages the image-shipped trees, and an older image does not have that mode, so the sandbox Pod never starts.
 - `runtimeClassName` — runs the sandbox Pod under a sandboxed container runtime, `gvisor` being the one GKE offers. Unset by default. Separate from [`spec.deployment.availability.runtimeClassName`](#specdeployment), which governs the agent Pod: that Pod holds SQLite databases whose WAL mode gVisor corrupts on the gofer-backed mount, and setting the agent Pod's field pins Hermes' own databases to the DELETE journal mode (the Session KV store is not covered; see `availability.runtimeClassName` under [`spec.deployment`](#specdeployment)), while the sandbox Pod holds none — so an install can sandbox the untrusted Pod without sandboxing, or slowing, the trusted one. On GKE Standard the cluster needs a node pool created with `--sandbox type=gvisor`; Autopilot ships the RuntimeClass natively. A RuntimeClass the cluster does not have leaves the CR `Degraded` naming it, rather than a Pod sitting `Pending`.
 
 The GitHub-writing skills hand the credential broker file content and a commit message rather than a directory both sides mount, so the agent never holds a `.git`. There is no field for it: the broker keeps the checkout on its own state volume, which closes git's config-driven exec surface — a hook, a pager, a `filter.*.clean`, an `ext::` transport — and an install that could turn that off would be choosing to keep it open.
@@ -831,12 +846,12 @@ by an overlay merged into an image-built base at startup. The `default` profile 
 takes the operator's settings by _two_ routes at once — an overlay merged into its config, and a
 read-only **managed scope** pinned over it.
 
-| Profile                                                       | Delivery                                                                                                                                                   | Who owns the file                                      |
-| ------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
-| `default`                                                     | Image-built base, writable on the PVC + `profile-default.overlay.yaml` merged at startup + a narrow set of keys pinned read-only at `/etc/hermes`          | Agent owns the file, operator the pins                 |
-| `platform`                                                    | Image-built base + `profile-platform.overlay.yaml` merged at startup                                                                                       | Image owns the base, operator the overlay              |
-| `platform`, with [`platformFrontDoor`](#platformfrontdoor) on | The same two inputs, but the base is back-filled rather than force-synced — and the `/etc/hermes` pins land here too, because that mount is machine-global | Agent owns the file, operator the overlay and the pins |
-| `cluster-*`                                                   | Image-built base + `profileclass-cluster.overlay.yaml`, plus `profile-<name>.overlay.yaml` if one exists                                                   | Image owns the base, operator the overlay              |
+| Profile                                                       | Delivery                                                                                                                                                                   | Who owns the file                                      |
+| ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| `default`                                                     | Image-built base, writable on the PVC + `profile-default.overlay.yaml` merged at startup + a narrow set of keys pinned read-only at `/etc/hermes`                          | Agent owns the file, operator the pins                 |
+| `platform`                                                    | Image-built base + `profile-platform.overlay.yaml` merged at startup                                                                                                       | Image owns the base, operator the overlay              |
+| `platform`, with [`platformFrontDoor`](#platformfrontdoor) on | The same two inputs, but the base is back-filled rather than force-synced — and the `/etc/hermes` pins land here too, because that mount is machine-global                 | Agent owns the file, operator the overlay and the pins |
+| `cluster-*`                                                   | Image-built base, copied when the profile is scaffolded and back-filled at startup + `profileclass-cluster.overlay.yaml`, plus `profile-<name>.overlay.yaml` if one exists | Image owns the base, operator the overlay              |
 
 A cluster profile is the only one that can take two overlays: the class overlay carries
 `tuning.cluster`, which applies to all of them, and a plugin targeting one specific cluster produces
@@ -967,12 +982,19 @@ alone. Its overlay merges after that back-fill as it always did. Everything else
 that profile — the persona files, `cron/`, `skills/`, `governance/`, `hindsight/` — still
 force-syncs either way.
 
+A `cluster-*` profile's `config.yaml` is never force-synced: it carries the `cluster_identity`
+stamp the cluster reconciler matches the profile to its cluster by, and an overwrite would strip
+it. It is back-filled from the cluster template instead, on the same fill-only terms — keys the
+template declares and the live file has lost are restored at the next start, and `cluster_identity`
+and every value the file already holds are left alone, except the retired `memory.provider` key,
+which the entrypoint drops. The persona files and `skills/` beside it still force-sync.
+
 One value inside both of these files does follow the image: the `User-Agent` header that the
 remote MCP servers' `args` carry (see [the config reference](/kube-agents/reference/config/)). The
 back-fill recurses only through mappings and that value lives in a list, so it would otherwise stay
 as the image that scaffolded the profile spelled it for the life of the volume. At every start the
 entrypoint sets it to the image template's in each cluster profile's `config.yaml`, and in the
-platform profile's when it is the front door, and changes nothing else in the file.
+platform profile's when it is the front door, and the repair changes nothing else in the file.
 
 **Merge semantics.** These differ between the two mechanisms, which is the easiest thing to get
 wrong here. In a startup **overlay** — every profile including `default` — maps merge recursively,

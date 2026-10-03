@@ -277,8 +277,8 @@ was being fixed (gke-labs/kube-agents-bot#191 has the measurement).
 - **First review of a pull request:** `success` only on "No findings" (low-severity items folded
   into the body do not count); `neutral` under `Found N issues` when anything held.
 - **Any later review of the same pull request**, once the bot has reviewed it at an earlier commit
-  and can read that round back: only 🔴 High holds, and the description thread if the body still
-  owes a section. 🟠 Medium findings are still posted as threads with their fix and still
+  and can read that round back: only 🔴 High holds, and the description finding if the body still
+  owes an answer, whether or not its thread is resolved. 🟠 Medium findings are still posted as threads with their fix and still
   counted in the title, but the check is `success` under `Found N issues, none holding`, and the
   review body carries a _Second look_ sentence beside the bar it applied. A Medium here needs no
   further round: fix it, or answer it in its thread and resolve — the thread still has to be
@@ -289,8 +289,10 @@ was being fixed (gke-labs/kube-agents-bot#191 has the measurement).
   reviews listing past its page cap, or a last-reviewed commit with no manifest in its bucket); the
   bot's log line `not a second look at …` is the only tell.
 - **`/review` on a commit the bot already reviewed** re-cuts that review at whichever bar it
-  recorded, without reading again: it neither earns nor loses the second look.
-- **`neutral` on any round** also covers the description thread, a change not fully checked, a
+  recorded, without reading again: it neither earns nor loses the second look. Of the description
+  it re-checks only that no section is missing or empty; `/review fresh` reads the commit and the
+  body again.
+- **`neutral` on any round** also covers the description finding, a change not fully checked, a
   review that broke, and a push since the last review (the pushed commit carries the previous title
   and no verdict).
 
@@ -347,9 +349,11 @@ gh api repos/gke-labs/kube-agents/pulls/<number>/comments/<comment-id>/replies \
 
 ## Resolving conversations
 
-Reply first — `AGENTS.md` says why — naming what changed and the commit that changed it. Then
-resolve. A pull request carrying both `lgtm` and `approved` with a thread still open also carries
-the `do-not-merge` label,
+Reply first — `AGENTS.md` says why — naming what changed and the commit that changed it, or, for a
+`kube-agents-bot` finding you decline with a user in the loop, the reason, which **Self-Review**
+gives too. Then resolve, except the description thread, which waits for the body edit described
+below. A pull request carrying both `lgtm` and `approved` with a thread still open also carries the
+`do-not-merge` label,
 applied by a workflow so that Tide does not spend the queue retrying a merge GitHub will refuse;
 resolving the last thread is what removes it ([how a change merges](#how-a-change-merges)).
 
@@ -375,14 +379,14 @@ query($pr: Int!) {
   reply to \(.comments.nodes[0].databaseId) — \(.comments.nodes[0].author.login): \(.comments.nodes[0].body | split("\n")[0])
   replies so far: \(.comments.nodes | length - 1)"'
 
-# Per thread, once the reply naming the fix is posted:
+# Per thread, once the reply is posted:
 gh api graphql -f query='
 mutation($thread: ID!) {
   resolveReviewThread(input: {threadId: $thread}) { thread { isResolved } }
 }' -f thread='<PRRT_...>'
 ```
 
-Four ways that goes wrong quietly:
+Five ways that goes wrong quietly:
 
 - `first: 100` is a cap, not a promise. A long-lived pull request can carry more threads than that;
   page for the rest, or say you only looked at the first hundred rather than reporting the branch
@@ -395,6 +399,17 @@ Four ways that goes wrong quietly:
   handled.
 - `unresolveReviewThread`, same `threadId`, is the undo. Use it the moment the user disagrees with
   something you resolved.
+- No unresolved threads does not mean the bot is answered. Its finding about the pull request
+  description opens one thread, whose first comment starts `<!-- kube-agents-bot:description -->`,
+  and only editing the body answers it. After that, every review that still finds the body owing an
+  answer — a section missing, empty, contradicted by the tree, or judged not to answer — repeats the
+  finding in its summary body, under **The pull request description is still unanswered.**, and
+  opens a new thread only for a section no earlier thread named. A pull request with every thread
+  resolved can therefore still hold the `AI Review` check. Resolve the description thread only after
+  the body is edited. Editing the body starts no review, and a plain `/review` on an unchanged commit
+  is a re-cut that checks only for missing and empty sections, so comment `/review fresh` and read
+  the body of a review newer than your edit, with the first poll command in
+  [Waiting for it](#waiting-for-it), before reporting the pull request clear.
 
 ## How a change merges
 

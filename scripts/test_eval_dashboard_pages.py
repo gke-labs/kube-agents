@@ -61,6 +61,70 @@ if _REFRESH_MATCH is None:
 PAGE_REFRESH_MS = int(_REFRESH_MATCH.group(1))
 # Boot, then two polls, then half an interval of slack, on the sped-up clock.
 TWO_POLLS_BUDGET_MS = (2 * PAGE_REFRESH_MS + PAGE_REFRESH_MS // 2) // TIMER_SPEEDUP
+# dom_html's budget when a test names none: boot and the refresh after it;
+# the first poll is far outside it unless the page's timers are sped up.
+DEFAULT_BUDGET_MS = 3000
+# fast_timers_page names its copies with this stem suffix and writes this shim
+# into them.
+FAST_TIMERS_SUFFIX = "-fast"
+FAST_TIMERS_SHIM = ("<script>(() => { const native = window.setInterval;"
+                    f" window.setInterval = (fn, ms, ...rest) => native(fn, ms / {TIMER_SPEEDUP}, ...rest); }})();</script>")
+# bare_anchor_page names its copies with this stem suffix and writes this
+# shim into their <head>, so the page's own script, which runs after it,
+# reads #<anchor> from location.hash as it would from a reader's bare-anchor
+# link; the URL Chrome is launched on carries no fragment. A fragment-only
+# URL resolves against the document's, so a query string on the launch URL
+# stays. replaceState fires no hashchange, so the boot renderAll(true) is
+# the one render that scrolls. What the shim removes is the fragment on the
+# launch URL, the half of the old shape Chrome reads before the page exists;
+# the document URL carries the anchor once the shim has run, so Blink's
+# end-of-parse fragment step still sees it. Which half stalls is unknown,
+# and the flake tracker is the judge of this shape as it was of the last.
+BARE_ANCHOR_SUFFIX = "-anchor-"
+BARE_ANCHOR_SHIM = '<script>history.replaceState(null, "", "#{anchor}");</script>'
+# The first line of the page's own inline script, which follows the shims
+# and #app in the document; dom_text's slice ends there.
+PAGE_SCRIPT_MARKER = "<script>\n/* The Brief"
+# What Chrome's URL parser removes from both ends of its input before it
+# parses (WHATWG URL, "basic URL parser", step 1: C0 controls and space),
+# besides tab, CR and LF anywhere. CPython's urlsplit removes the same
+# three anywhere and the leading run only; it keeps a trailing run, so
+# "#gate " is `gate ` to Python and `gate` to Chrome. launched_anchor trims
+# the URL the way Chrome does before it parses, and every reading of a
+# launched URL's anchor goes through it.
+URL_C0_CONTROL_OR_SPACE = "".join(map(chr, range(0x21)))
+# The Brief's bare view anchors (#gate, #agent), each the id of a section
+# and the fragment a reader's old links carry. dom_html refuses one on the
+# launch URL on every budget: that shape is the one constant across every
+# recorded stall of headless Chrome on CI (#2202, #2227, #2278), and no fix
+# that kept it has held. The guard knows these two ids, not every id on the
+# page; no other call in the suite names an element in a fragment.
+def brief_view_anchors(pages_js: str) -> frozenset:
+    """PAGE.views' values from pages.js's text, a flat object of quoted
+    strings. Any other shape raises, so a reshaped literal fails the import
+    rather than the guard: the match cannot cross a nested brace, where one
+    stopping at the first `}` would read a nested value's first strings as
+    the anchors, keep the import quiet, and let the views after it reach
+    Chrome as bare fragments."""
+    match = re.search(r"^\s*views:\s*\{([^{}]*)\}", pages_js, re.MULTILINE)
+    if match is None:
+        raise RuntimeError(f"{PAGES_JS}: PAGE.views is not a flat object literal; dom_html cannot tell a bare view anchor")
+    anchors = frozenset(re.findall(r'"([^"]+)"', match.group(1)))
+    if not anchors:
+        raise RuntimeError(f"{PAGES_JS}: PAGE.views names no quoted view; dom_html cannot tell a bare view anchor")
+    return anchors
+
+
+BRIEF_VIEW_ANCHORS = brief_view_anchors(PAGES_JS.read_text())
+# The Cases page's one polled call, in
+# test_cases_page_sorts_filters_and_the_hash_highlight: a row fragment,
+# the bare case name, under boot and two polls on the page's real clock.
+# The element it scrolls to is id="case-<name>" (pages.js renders the row
+# and reads the hash through linkState's caseHash), so Chrome's native
+# anchor matches nothing and the call has no stall on record. The call
+# site and DomHtmlGuardTest's kept list read these two names, not copies.
+CASES_ROW_ANCHOR = "#cluster-agent-crashloop-evidence-chain"
+CASES_TWO_POLLS_BUDGET_MS = 130000
 # Below this the page may not finish booting inside the budget, and the
 # scroll-once test would pass or fail on load time rather than on the poll.
 MIN_TWO_POLLS_BUDGET_MS = 1000
@@ -150,13 +214,39 @@ def strict_date_parse_page(page: pathlib.Path) -> pathlib.Path:
     return copy
 
 
-def dom_html(page: pathlib.Path, query: str = "", fragment: str = "", budget_ms: int = 3000) -> str:
+def launched_anchor(url: str) -> str:
+    """The anchor Chrome reads from ``url``: the URL trimmed of C0 controls
+    and spaces at both ends, as Chrome trims its input, then parsed and its
+    fragment percent-decoded, as Chrome's anchor step and pages.js decode.
+    dom_html's guard and DomHtmlGuardTest's assertions on a launched URL
+    all read the anchor through this one function, so Python's parse and
+    Chrome's are reconciled in one place: the next way the two disagree
+    is fixed here, not found again in a guard that reads one of them."""
+    return urllib.parse.unquote(urllib.parse.urlparse(url.strip(URL_C0_CONTROL_OR_SPACE)).fragment)
+
+
+def dom_html(page: pathlib.Path, query: str = "", fragment: str = "", budget_ms: int = DEFAULT_BUDGET_MS) -> str:
     """The whole document after the script ran, via headless Chrome. From
     file:// every fetch fails, which is the condition a host that answers
     an XHR with a login redirect puts the pages in. ``budget_ms`` is the
     virtual time the page is given; timers fire inside it, so a budget past
-    PAGE.refreshMs runs the poll too."""
+    PAGE.refreshMs runs the poll too. A bare view anchor (#gate) is refused
+    on every budget: the Brief's view anchors reach Chrome's launch URL
+    from no call. The guard reads the URL it is about to launch as Chrome
+    reads it (launched_anchor), not the ``fragment`` argument, so a `#`
+    inside ``query``, a percent-encoded anchor (#%67ate) and a trailing
+    space or C0 control Chrome trims off (`#gate `), each of which Chrome
+    reads as the anchor, are refused too. A test that needs the bare-anchor
+    path sets the hash from inside the page with bare_anchor_page."""
     url = page.as_uri() + (f"?{query}" if query else "") + fragment
+    anchor = launched_anchor(url)
+    if anchor in BRIEF_VIEW_ANCHORS:
+        written = url.partition("#")[2]
+        raise ValueError(
+            f"#{anchor} (written {written!r}): a bare view anchor on Chrome's launch URL is the shape in every stall of headless Chrome "
+            f"on CI (#2227, #2278) and is refused on every budget, however it reaches the URL; "
+            f"use #view={anchor}, or bare_anchor_page(page, {anchor!r})"
+        )
     result = subprocess.run(
         [chrome(), "--headless", "--disable-gpu", "--no-sandbox", f"--virtual-time-budget={budget_ms}", "--dump-dom", url],
         capture_output=True, text=True, timeout=90, check=False,
@@ -174,17 +264,41 @@ def scroll_counting_page(page: pathlib.Path) -> pathlib.Path:
     return copy
 
 
+def scrolls(html: str) -> "re.Match[str] | None":
+    """The scroll count a scroll_counting_page recorded, or None when
+    nothing scrolled."""
+    return re.search(r'<body[^>]*data-scrolls="(\d+)"', html)
+
+
 def fast_timers_page(page: pathlib.Path) -> pathlib.Path:
     """A copy of the rendered page whose setInterval runs TIMER_SPEEDUP
     times faster, so the poll every PAGE.refreshMs fires inside a short
     virtual-time budget. A budget spanning real polls (130 s) on a URL whose
     fragment names an element on the page (#gate) intermittently stalled
-    headless Chrome's virtual clock on CI until the wall-clock timeout;
-    bare anchors on short budgets have a clean record."""
-    shim = ("<script>(() => { const native = window.setInterval;"
-            f" window.setInterval = (fn, ms, ...rest) => native(fn, ms / {TIMER_SPEEDUP}, ...rest); }})();</script>")
-    copy = page.with_name(page.stem + "-fast" + page.suffix)
-    copy.write_text(page.read_text().replace("<head>", "<head>" + shim, 1))
+    headless Chrome's virtual clock on CI until the wall-clock timeout. The
+    sped-up clock alone did not remove the stall: #gate under
+    TWO_POLLS_BUDGET_MS stalled the same way, and then #gate on the default
+    budget, the first poll outside it, stalled too. So no call puts a bare
+    view anchor on the launch URL, whatever the budget: dom_html refuses
+    one, and bare_anchor_page sets the hash from inside the page instead."""
+    copy = page.with_name(page.stem + FAST_TIMERS_SUFFIX + page.suffix)
+    copy.write_text(page.read_text().replace("<head>", "<head>" + FAST_TIMERS_SHIM, 1))
+    return copy
+
+
+def bare_anchor_page(page: pathlib.Path, anchor: str) -> pathlib.Path:
+    """A copy of the rendered page that puts the bare view anchor ``anchor``
+    (a PAGE.views value: "gate", "agent") on its own URL with
+    history.replaceState before the page's script runs, so linkState reads
+    it as it reads a reader's `#gate` link while the URL handed to Chrome
+    carries no fragment (BARE_ANCHOR_SHIM says what that does and does not
+    remove). A fragment that is not a view anchor is passed to dom_html as
+    a fragment instead."""
+    anchor = anchor.lstrip("#")
+    if anchor not in BRIEF_VIEW_ANCHORS:
+        raise ValueError(f"#{anchor} is not a bare view anchor ({', '.join(sorted(BRIEF_VIEW_ANCHORS))}); pass it to dom_html as a fragment")
+    copy = page.with_name(page.stem + BARE_ANCHOR_SUFFIX + anchor + page.suffix)
+    copy.write_text(page.read_text().replace("<head>", "<head>" + BARE_ANCHOR_SHIM.format(anchor=anchor), 1))
     return copy
 
 
@@ -194,7 +308,7 @@ def dom_text(page: pathlib.Path, query: str = "", fragment: str = "") -> str:
     start = html.find('<div id="app">')
     # Slice up to the page's own inline script (its first comment line), not
     # the first <script> tag: an injected tag inside #app must stay visible.
-    end = html.find("<script>\n/* The Brief", start)
+    end = html.find(PAGE_SCRIPT_MARKER, start)
     return html[start:end]
 
 
@@ -562,6 +676,169 @@ ROSTER_AT_SPLIT = frozenset({
     "cluster-agent-crashloop-evidence-chain",
     "agent-kanban-smoke",
 })
+
+
+class DomHtmlGuardTest(unittest.TestCase):
+    """dom_html's refusal of a bare view anchor on every budget, the parse
+    of PAGE.views it reads the anchors from, and the page copy that carries
+    the anchor instead. All are decided before Chrome runs, so they hold on
+    a host without one, and the admitted calls are checked against a mocked
+    subprocess."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        data = load_fixture()
+        data["generated_at"] = NOW
+        out = render_to(cls.tmp.name, data, health=health_doc())
+        cls.index = out / "index.html"
+        cls.cases = out / render.CASES_PAGE
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    @staticmethod
+    def no_chrome():
+        """subprocess.run replaced, so a call the guard admits is recorded
+        and never launches a browser: the refused shapes below are the
+        ones that stalled CI, and a guard that let one through must fail
+        the test, not hang it."""
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        return unittest.mock.patch.object(subprocess, "run", return_value=completed)
+
+    def test_a_bare_view_anchor_is_refused_on_every_budget(self):
+        # Every budget the suite uses, on a plain copy and a sped-up one,
+        # and on the copy that already carries the anchor: the default
+        # budget is the one the last recorded stall ran on (#2278), after
+        # the guard before this one admitted it as being outside the poll.
+        pages = (scroll_counting_page(self.index),
+                 scroll_counting_page(fast_timers_page(self.index)),
+                 fast_timers_page(scroll_counting_page(self.index)),
+                 clock_page(self.index, NOW),
+                 bare_anchor_page(self.index, "gate"))
+        budgets = (DEFAULT_BUDGET_MS, TWO_POLLS_BUDGET_MS, CASES_TWO_POLLS_BUDGET_MS)
+        with self.no_chrome() as run:
+            for page in pages:
+                for anchor in sorted(BRIEF_VIEW_ANCHORS):
+                    for budget_ms in budgets:
+                        with self.subTest(page=page.name, anchor=anchor, budget_ms=budget_ms):
+                            with self.assertRaises(ValueError) as refused:
+                                dom_html(page, fragment=f"#{anchor}", budget_ms=budget_ms)
+                            self.assertIn(f"use #view={anchor}, or bare_anchor_page(page, '{anchor}')", str(refused.exception))
+            with self.assertRaises(ValueError):
+                dom_html(self.index, fragment="#gate")  # the default budget, by default
+        self.assertEqual(run.call_count, 0, "a refused call never reaches Chrome")
+
+    def test_the_guard_reads_the_launch_url_not_the_fragment_argument(self):
+        # The anchor can reach the launch URL without being the `fragment`
+        # argument: a `#` inside `query` is a fragment to Chrome, a
+        # percent-encoded view id is decoded by Chrome's anchor step and by
+        # pages.js alike, and a trailing space or C0 control is trimmed off
+        # the URL by Chrome where Python's parse keeps it in the fragment.
+        # All are refused, by the anchor of the URL about to be launched as
+        # Chrome reads it, and none reaches the mocked Chrome. The encoded
+        # `#` a urlencode'd query carries (%23) is not a fragment and stays
+        # admitted, as do the view= form and an encoded trailing space
+        # (%20), which Chrome does not trim and which matches no view.
+        refused = [
+            {"query": "cases=cluster-agent-crashloop-debug#gate"},
+            {"query": "cases=cluster-agent-crashloop-debug#agent", "budget_ms": TWO_POLLS_BUDGET_MS},
+            {"fragment": "#%67ate"},
+            {"fragment": "#a%67ent"},
+            {"query": "cases=x#%67ate"},
+            {"fragment": "#gate "},
+            {"query": "cases=x#agent\x0b"},
+        ]
+        admitted = [
+            {"query": urllib.parse.urlencode({"cases": "x#gate"})},
+            {"fragment": "#view=gate"},
+            {"query": urllib.parse.urlencode({"cases": "x#gate"}), "fragment": "#view=agent"},
+            {"fragment": "#gate%20"},
+        ]
+        with self.no_chrome() as run:
+            for call in refused:
+                with self.subTest(call=call):
+                    with self.assertRaises(ValueError) as error:
+                        dom_html(self.index, **call)
+                    self.assertIn("bare_anchor_page(page, ", str(error.exception))
+            self.assertEqual(run.call_count, 0, "a refused call never reaches Chrome")
+            for call in admitted:
+                with self.subTest(call=call):
+                    dom_html(self.index, **call)
+        self.assertEqual(run.call_count, len(admitted))
+        for call, invocation in zip(admitted, run.call_args_list):
+            self.assertNotIn(launched_anchor(invocation.args[0][-1]), BRIEF_VIEW_ANCHORS, call)
+
+    def test_the_bare_anchor_page_carries_the_anchor_and_takes_only_a_view(self):
+        # The shim sits in <head>, before the page's data and script, and
+        # names the anchor; a fragment outside PAGE.views has no section to
+        # land on and is refused, so a row anchor or a typo cannot be shimmed
+        # past the guard.
+        for anchor in sorted(BRIEF_VIEW_ANCHORS):
+            with self.subTest(anchor=anchor):
+                text = bare_anchor_page(self.index, anchor).read_text()
+                shim = BARE_ANCHOR_SHIM.format(anchor=anchor)
+                self.assertEqual(text.count(shim), 1)
+                self.assertLess(text.index(shim), text.index("</head>"))
+                self.assertLess(text.index(shim), text.index(PAGE_SCRIPT_MARKER))
+                self.assertEqual(bare_anchor_page(self.index, f"#{anchor}").read_text(), text, "a leading # is the same anchor")
+        for anchor in ("view=gate", CASES_ROW_ANCHOR, "case-gate", ""):
+            with self.subTest(anchor=anchor):
+                with self.assertRaises(ValueError) as refused:
+                    bare_anchor_page(self.index, anchor)
+                self.assertIn("not a bare view anchor", str(refused.exception))
+
+    def test_a_reshaped_views_literal_fails_the_import_not_the_guard(self):
+        # The guard refuses exactly the anchors the parse found, so a parse
+        # that misreads a reshaped literal loses an anchor with no test
+        # noticing: a match stopping at the first `}` reads the nested
+        # literal below as {"gate", "Gate"}, non-empty, and a bare #agent
+        # then reaches Chrome. The parse must raise instead,
+        # naming the file, as it does for a literal with no quoted value.
+        flat = 'const PAGE = {\n  views: { gate: "gate", agent: "agent" },\n  refreshMs: 60000,\n};\n'
+        nested = ('const PAGE = {\n  views: { gate: { id: "gate", label: "Gate" }, agent: { id: "agent", label: "Agent" } },\n'
+                  '  refreshMs: 60000,\n};\n')
+        unquoted = 'const PAGE = {\n  views: { gate: GATE, agent: AGENT },\n};\n'
+        self.assertEqual(brief_view_anchors(flat), frozenset({"gate", "agent"}))
+        for shape, text in (("nested", nested), ("unquoted", unquoted), ("empty", "const PAGE = {\n  views: {},\n};\n")):
+            with self.subTest(shape=shape):
+                with self.assertRaises(RuntimeError) as refused:
+                    brief_view_anchors(text)
+                self.assertIn(str(PAGES_JS), str(refused.exception))
+
+    def test_the_calls_the_suite_keeps_reach_chrome(self):
+        # The calls the suite makes that the guard is about, each on the
+        # page copy its call site uses: the Brief's two under the sped-up
+        # clock, the bare anchor through its page copy with no fragment on
+        # the command line, the same copy under the old query form, and the
+        # Cases page's row anchor, which is the bare case name (its element
+        # is case-<name>), not a fragment naming the element. The Cases
+        # shape reads the call site's constants so the list cannot drift
+        # from the call.
+        fast = scroll_counting_page(fast_timers_page(self.index))
+        anchored = scroll_counting_page(bare_anchor_page(self.index, "gate"))
+        cases = scroll_counting_page(self.cases)
+        kept = [
+            (fast, {"fragment": "#since=2026-09-07T14:00:00Z&view=gate", "budget_ms": TWO_POLLS_BUDGET_MS}),
+            (fast, {"budget_ms": TWO_POLLS_BUDGET_MS}),
+            (anchored, {}),
+            (anchored, {"query": "cases=cluster-agent-crashloop-debug&since=2026-09-07T14%3A00%3A00Z"}),
+            (cases, {"fragment": CASES_ROW_ANCHOR, "budget_ms": CASES_TWO_POLLS_BUDGET_MS}),
+        ]
+        self.assertFalse(CASES_ROW_ANCHOR.lstrip("#").startswith("case-"), "the Cases call names the row by case name; case-<name> is the element id")
+        with self.no_chrome() as run:
+            for page, call in kept:
+                dom_html(page, **call)
+        self.assertEqual(run.call_count, len(kept))
+        for (page, call), invocation in zip(kept, run.call_args_list):
+            argv = invocation.args[0]
+            self.assertIn(f"--virtual-time-budget={call.get('budget_ms', DEFAULT_BUDGET_MS)}", argv, call)
+            query = f"?{call['query']}" if call.get("query") else ""
+            self.assertEqual(argv[-1], page.as_uri() + query + call.get("fragment", ""), call)
+            self.assertNotIn(launched_anchor(argv[-1]), BRIEF_VIEW_ANCHORS, call)
+            if page is anchored:
+                self.assertNotIn("#", argv[-1], "the shimmed copy's URL carries no fragment")
 
 
 @unittest.skipUnless(chrome(), "headless Chrome not found")
@@ -1021,8 +1298,10 @@ class BrowserTest(unittest.TestCase):
 
     def test_past_incident_through_the_old_query_form(self):
         # Links posted before the fragment form still open the same incident.
+        # The bare #gate those links carried is set from inside the page;
+        # Chrome's URL keeps the query and carries no fragment.
         query = urllib.parse.urlencode({"cases": ",".join(CRASHLOOP_TRIO), "since": "2026-09-07T14:00:00Z", "until": "2026-09-08T01:00:00Z"})
-        app = dom_text(self.index, query=query, fragment="#gate")
+        app = dom_text(bare_anchor_page(self.index, "gate"), query=query)
         self.assert_past_outage_window(app, "query form")
         fragment = "#since=2026-09-07T14:00:00Z&until=2026-09-08T01:00:00Z&cases=" + ",".join(CRASHLOOP_TRIO) + "&view=gate"
         self.assertEqual(app, dom_text(self.index, fragment=fragment), "both forms render the same page")
@@ -1056,7 +1335,7 @@ class BrowserTest(unittest.TestCase):
         app = dom_text(self.index, fragment="#view=agent")
         self.assertIn("The last 24 hours in numbers", app)
         self.assertIn('id="agent"', app)
-        self.assertEqual(app, dom_text(self.index, fragment="#agent"), "the old bare anchor selects the same view")
+        self.assertEqual(app, dom_text(bare_anchor_page(self.index, "agent")), "the old bare anchor selects the same view")
         self.assertIn('href="index.html#view=agent"', app, "the footer link is the fragment form")
 
     def test_a_view_scrolls_once_on_navigation_and_not_on_the_poll(self):
@@ -1064,10 +1343,20 @@ class BrowserTest(unittest.TestCase):
         # they fit in a short budget. The section is scrolled to once; the
         # polls, which re-render the page, must not pull a reader back to it.
         page = fast_timers_page(scroll_counting_page(self.index))
-        scrolls = lambda html: re.search(r'<body[^>]*data-scrolls="(\d+)"', html)
         self.assertEqual(scrolls(dom_html(page, fragment="#since=2026-09-07T14:00:00Z&view=gate", budget_ms=TWO_POLLS_BUDGET_MS)).group(1), "1")
-        self.assertEqual(scrolls(dom_html(page, fragment="#gate", budget_ms=TWO_POLLS_BUDGET_MS)).group(1), "1", "the bare anchor, the same way")
         self.assertIsNone(scrolls(dom_html(page, budget_ms=TWO_POLLS_BUDGET_MS)), "no view, no scroll")
+
+    def test_the_bare_anchor_scrolls_once(self):
+        # The bare anchor selects the view the same way (#gate and view=gate
+        # reach the same link.view in linkState), so the poll test above
+        # covers its poll. The hash is set from inside the page: #gate on
+        # Chrome's command line stalled it on CI under TWO_POLLS_BUDGET_MS
+        # with the fast-timer shim (#2227, after #2202's sped-up clock) and
+        # then on the default budget, the first poll outside it (#2278), so
+        # dom_html refuses the shape on every budget and this is the one
+        # path left to the bare-anchor render.
+        page = scroll_counting_page(bare_anchor_page(self.index, "gate"))
+        self.assertEqual(scrolls(dom_html(page)).group(1), "1", "the bare anchor, the same way")
 
     def test_hostile_parameters_never_reach_the_dom(self):
         for form in ({"query": "cases=%3Cimg%20src%3Dx%3E&since=%3Cscript%3E"}, {"fragment": "#cases=%3Cimg%20src%3Dx%3E&since=%3Cscript%3E&view=%3Cb%3E"}):
@@ -1099,11 +1388,12 @@ class BrowserTest(unittest.TestCase):
 
     def test_the_current_outage_opened_through_its_own_link_is_still_live(self):
         scope = "since=2026-09-08T09:00:00Z&cases=" + ",".join(CRASHLOOP_TRIO)
-        forms = (("fragment form", {"fragment": f"#{scope}&view=gate"}), ("old query form", {"query": scope, "fragment": "#gate"}))
+        forms = (("fragment form", lambda page: dom_text(page, fragment=f"#{scope}&view=gate")),
+                 ("old query form", lambda page: dom_text(bare_anchor_page(page, "gate"), query=scope)))
         nohist = render_to(pathlib.Path(self.tmp.name) / "nohist-live", self.data, health=health_doc())
         for label, page in (("with history", self.index), ("without history", nohist / "index.html")):
-            for form, args in forms:
-                app = dom_text(page, **args)
+            for form, render_form in forms:
+                app = render_form(page)
                 self.assertIn("OUTAGE · since Tue 5:00 AM ET", app, f"{label}, {form}")
                 self.assertNotIn("PAST", app, f"{label}, {form}")
                 self.assertNotIn("This incident is over", app, f"{label}, {form}")
@@ -1382,8 +1672,7 @@ class CasesAndGridPagesTest(unittest.TestCase):
         self.assertEqual(dom_text(self.cases_page, fragment="#sort=name&show=held"), dom_text(self.cases_page, query="sort=name&show=held"), "the fragment form reads the same")
         # The row is scrolled to once, on navigation; the polls that follow
         # re-render without pulling the reader back to it.
-        scrolls = re.search(r'<body[^>]*data-scrolls="(\d+)"', dom_html(scroll_counting_page(self.cases_page), fragment="#cluster-agent-crashloop-evidence-chain", budget_ms=130000))
-        self.assertEqual(scrolls.group(1), "1")
+        self.assertEqual(scrolls(dom_html(scroll_counting_page(self.cases_page), fragment=CASES_ROW_ANCHOR, budget_ms=CASES_TWO_POLLS_BUDGET_MS)).group(1), "1")
         clicked = dom_text(clicked_page(self.cases_page, 'button[data-toggle="retired"]'))
         self.assertIn('id="case-retired-probe"', clicked)
 

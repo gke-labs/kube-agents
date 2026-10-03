@@ -246,9 +246,10 @@ because YAML reads the bare word as a boolean and the render refuses it) and
 `litellm.redaction.ip.allowCidrs` govern IP literals; `litellm.redaction.rules`
 adds named `literal` or `pattern` rules with a `mask` or `pseudonym` action, and
 a name, action or source the chart does not accept fails the render. Off by
-default, and the rendered config is unchanged while it is; the feature is
-chart-only, so with it on the gateway diverges from the kustomize dev base,
-which carries no redaction. The site's
+default, and the rendered config is unchanged while it is. `install.sh` sets it
+from the `LITELLM_REDACTION_*` keys in `install.env`, through the Terraform
+example's `litellm_redaction` variable; the kustomize dev base carries no
+redaction, so with it on the gateway diverges from that base. The site's
 [inference gateway page](../../docs/site/src/content/docs/concepts/inference-gateway.md)
 owns what is redacted, what is not (responses, chat egress) and why a
 pseudonymised identifier is one the agent cannot act on; the site's

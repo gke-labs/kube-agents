@@ -469,9 +469,10 @@ module "chat_pubsub" {
 
 # The drift detector's audit-log ingress: Log Router sink, drift-audit topic
 # and pull subscription, and the sink-writer and detector IAM. The three names
-# are composition variables, as the stockout trio's are, because lifecycle.sh
-# adopts them by name and a second install in the project has to be able to
-# name its own; the module's defaults decide the rest (retention, backoff, and
+# are composition variables, as the stockout trio's are, because a second
+# install in the project has to be able to name its own -- lifecycle.sh's
+# guard_drift_adoption refuses an apply that would otherwise find all three
+# there and import them; the module's defaults decide the rest (retention, backoff, and
 # the cluster scope, every GKE cluster in the project). The consumer,
 # k8s-operator/cmd/drift-detector, ships in the images and starts in the
 # gateway pod when the PlatformAgent sets spec.harness.driftDetector.enabled;
@@ -705,6 +706,19 @@ resource "helm_release" "kube_agents" {
           }
           projectId = local.vertex_project
           location  = local.vertex_location
+        }
+      } : {},
+      # Only while on, so an install that never turns redaction on renders the
+      # gateway ConfigMap, and its checksum, exactly as before. Unset rule keys
+      # are dropped: yamlencode writes them as null, which the chart refuses.
+      var.litellm_redaction.enabled ? {
+        redaction = {
+          enabled = true
+          ip = {
+            action     = var.litellm_redaction.ip_action
+            allowCidrs = var.litellm_redaction.allow_cidrs
+          }
+          rules = [for r in var.litellm_redaction.rules : { for k, v in r : k => v if v != null }]
         }
       } : {}
     )
