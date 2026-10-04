@@ -2890,18 +2890,19 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  "HERMES_HOME_MODE",
 		Value: hermesHomeMode,
 	})
-	// The Hermes base image sets HERMES_WRITE_SAFE_ROOT=/opt/data, which is the agent's
-	// own home while the shell is local. agent/file_safety.py checks the path prefix in
-	// the agent process before the write is routed anywhere, so with the shell in the
-	// sandbox this has to name sandbox paths or write_file and patch return "Write
-	// denied" for everything — which is how the earlier value was found wrong on a
-	// live install. The sandbox's data volume carries the same /opt/data path
-	// deliberately. /home/agent is listed too, but current sandbox images make it
-	// root-owned (deploy/sandbox/Dockerfile), so a write there passes this check and
-	// then fails on the directory's mode. The value is written out rather than left
-	// to the image default so the policy is visible in the pod spec. It gives up no
-	// isolation: with backend: ssh
-	// the file tools cannot reach the agent's own filesystem to begin with.
+	// The Hermes base image sets HERMES_WRITE_SAFE_ROOT=/opt/data, which matches
+	// the sandbox data volume path (shellSandboxDataPath). agent/file_safety.py
+	// checks the path prefix in the agent process before the write is routed
+	// anywhere. The ephemeral sandbox home (/home/agent) is root-owned in the
+	// container image (deploy/sandbox/Dockerfile, #2245) and is not a durable write
+	// destination, so it is omitted here (#2284): write attempts naming
+	// /home/agent/... fail fast with "outside HERMES_WRITE_SAFE_ROOT" at the
+	// gateway's prefix check rather than failing on directory mode in the sandbox.
+	// (Writes to `~` expand in the agent process against HOME under the data volume
+	// — by default /opt/data/home — and are admitted under /opt/data).
+	// The value is written out rather than left to the image default so the policy is
+	// visible in the pod spec. It gives up no isolation: with backend: ssh the file
+	// tools cannot reach the agent's own filesystem to begin with.
 	//
 	// TERMINAL_CWD is what stops the agent working in a directory that does not
 	// survive a restart. Hermes' ssh backend defaults cwd to `~`
@@ -2914,7 +2915,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// for. A managed-scope value could not be narrowed by anything.
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "HERMES_WRITE_SAFE_ROOT",
-		Value: strings.Join([]string{shellSandboxDataPath, shellSandboxHomePath}, ":"),
+		Value: shellSandboxDataPath,
 	})
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "TERMINAL_CWD",

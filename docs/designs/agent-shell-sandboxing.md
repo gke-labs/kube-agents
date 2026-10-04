@@ -1180,17 +1180,20 @@ is not the answer either: the check is opt-in and an empty value skips it entire
 which drops the guardrail rather than moving it.
 
 The operator therefore writes it out, in `buildPodTemplateSpec` and only when the
-sandbox is enabled, naming `/opt/data` and `/home/agent`. The home was writable when
-this was written and is root-owned now (see
-[The agent home is root-owned](#the-agent-home-is-root-owned)), so a write there
-passes this check and then fails on the directory's mode. The value is written rather
-than left to the image default so the policy is visible in
-the pod spec rather than inherited from a base image two repositories away. It gives up
-no isolation. With `backend: ssh` the file tools cannot reach the agent pod's
-filesystem at all, so the roots they are checked against should describe the filesystem
-they actually write to. `TestSandboxRepointsTheWriteSafeRoot` asserts the variable is
-absent with the sandbox off, is exactly these two paths with it on, and names nothing
-that does not resolve in the sandbox.
+sandbox is enabled, naming the sandbox's writable data directory: `/opt/data`.
+The home is root-owned in the container image (see
+[The agent home is root-owned](#the-agent-home-is-root-owned)) and is not a durable write
+destination, so `/home/agent` is omitted here (#2284). This ensures write attempts naming
+`/home/agent/...` fail fast with "outside HERMES_WRITE_SAFE_ROOT" at the gateway's
+prefix check rather than failing on directory mode in the sandbox, and refusal errors
+do not list the ephemeral home as an allowed root. (Writes to `~` expand in the agent
+process against `HOME` under the data volume — by default `/opt/data/home` — and are
+admitted under `/opt/data`). The value is written rather than left to the image default so
+the policy is visible in the pod spec rather than inherited from a base image two
+repositories away. It gives up no isolation. With `backend: ssh` the file tools cannot
+reach the agent pod's filesystem at all, so the roots they are checked against should
+describe the filesystem they actually write to. `TestSandboxRepointsTheWriteSafeRoot`
+asserts the variable is exactly `shellSandboxDataPath` on the agent container.
 
 One thing this does not cover: the credential denylist that sits alongside the check
 (`~/.ssh`, `~/.aws`, `~/.config/gcloud`, `~/.docker`) is still expressed against the

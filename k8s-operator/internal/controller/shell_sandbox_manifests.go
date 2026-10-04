@@ -127,8 +127,9 @@ const (
 	// dotfiles: every session in the pod shares it, and bash and python3 load
 	// code from it unasked, so a file one session planted there would run in
 	// every later one. Durable work goes to the data volume, which is what
-	// TERMINAL_CWD points at. HERMES_WRITE_SAFE_ROOT in buildPodTemplateSpec still
-	// names it; a write there fails on the mode instead.
+	// TERMINAL_CWD points at. HERMES_WRITE_SAFE_ROOT in buildPodTemplateSpec names
+	// only the data volume (#2284); write attempts naming the home fail fast at
+	// the gateway prefix check.
 	shellSandboxHomePath = "/home/" + shellSandboxUser
 
 	// Hermes' ssh backend keeps a file sync over ~/.hermes: it pushes at connect
