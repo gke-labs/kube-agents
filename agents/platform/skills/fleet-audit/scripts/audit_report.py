@@ -631,6 +631,9 @@ FINDING_MARKER_RE = re.compile(
 # `FINDING_MARKER_RE` matching it. Model text cannot forge it: every free-text
 # field passes through `publishable_text`, which escapes every comment opener.
 NEW_MARKER = "<!-- finding-new -->"
+# How a finding's heading line starts (`_finding_identity_lines`); the marker
+# goes on the line after it.
+FINDING_HEADING = "#### "
 # The `Where:` line `render_finding` writes under every heading above: the
 # cluster, the namespace (or the cluster-scoped placeholder) and the object.
 # Read back by `parse_finding_locations` so a later run can ask whether it
@@ -2371,15 +2374,16 @@ def report_finding_titles(envelope: dict | None) -> dict[str, str]:
     }
 
 
-def report_filed(envelope: dict | None) -> tuple[set[str], set[str]] | None:
-    """(every finding id, every skipped cluster) the stored run filed, or None.
+def report_filed(envelope: dict | None) -> tuple[set[str], set[tuple[str, str]]] | None:
+    """(every finding id, every (cluster, check) run) the stored run filed, or None.
 
     Wider than the body's hidden block, which names only what the body
     rendered: a finding the budget cut, a posture withheld for want of a
-    search, and one in a carried ledger document were all filed. A finding on
-    a cluster that run skipped was not looked for, so is unknown rather than
-    new. None without a stored document, as for a memory seeded from the
-    issue body, which cannot say what the body left out.
+    search, and one in a carried ledger document were all filed. A finding
+    whose check that run did not run on its cluster -- the cluster skipped,
+    the check timed out or inapplicable -- was not looked for, so is unknown
+    rather than new. None without a stored document, as for a memory seeded
+    from the issue body, which cannot say what the body left out.
     """
     envelope = envelope or {}
     documents = [
@@ -2390,19 +2394,17 @@ def report_filed(envelope: dict | None) -> tuple[set[str], set[str]] | None:
     if not documents:
         return None
     ids: set[str] = set()
-    skipped: set[str] = set()
+    looked: set[tuple[str, str]] = set()
     for document in documents:
         findings = document.get("findings")
         filed = (findings if isinstance(findings, list) else []) + postures_withheld(document)
         ids.update(str(f["id"]) for f in filed if isinstance(f, dict) and f.get("id"))
         scope = document.get("scope")
-        entries = scope.get("skipped") if isinstance(scope, dict) else None
-        skipped.update(
-            str(entry["cluster"]).strip()
-            for entry in (entries if isinstance(entries, list) else [])
-            if isinstance(entry, dict) and entry.get("cluster")
-        )
-    return ids, skipped
+        clusters = scope.get("clusters") if isinstance(scope, dict) else None
+        for cluster in clusters if isinstance(clusters, list) else []:
+            name = str(cluster.get("name", "")).strip() if isinstance(cluster, dict) else ""
+            looked.update((name, check) for check in checks_ran(cluster) if name)
+    return ids, looked
 
 
 def base_branch() -> str:
@@ -5364,8 +5366,8 @@ def parse_finding_locations(body: str | None) -> dict[str, dict[str, str]]:
     """Recover {finding id: {title, cluster, namespace, object}} from a previous body.
 
     `parse_finding_titles` names a resolved finding; this reads the rest of its
-    heading block — the `Where:` line `render_finding` writes directly under
-    it — so a later run can ask whether it looked at that object again. Only
+    heading block — the `Where:` line `render_finding` writes under it, after
+    a `NEW_MARKER` line when there is one — so a later run can ask whether it looked at that object again. Only
     the harness writes these lines, in one shape, so a block whose `Where:`
     line is missing or does not parse is left out rather than guessed at.
     """
@@ -7081,9 +7083,9 @@ def render_finding(
         str(finding.get("object", "")),
     )
     if new:
-        # Under the heading, before the `Where:` line: the anchor, a blank line
-        # and the heading come first.
-        lines[3:3] = ["", NEW_MARKER]
+        # Under the heading, before the `Where:` line.
+        heading = next(i for i, line in enumerate(lines) if line.startswith(FINDING_HEADING))
+        lines[heading + 1 : heading + 1] = ["", NEW_MARKER]
     lines.append(f"- **Impact:** {clip_text(finding.get('impact', ''), MAX_TEXT_CHARS)}")
     # The id is repeated here, not left to the index alone: it is the string
     # `/remediate` takes, and the decision to ask for a fix is made at the
@@ -12557,9 +12559,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
 
     title = issue_title(audit_id, findings)
     # Marked before rendering, because the marker is part of the body: the
-    # findings the last run filed nowhere (`report_filed`), on a cluster it
-    # looked at. Narrower than `compute_delta`'s `new`, which joins against the
-    # rendered block alone and so counts a finding the last body cut for space.
+    # findings the last run filed nowhere (`report_filed`) although it ran
+    # their check on their cluster. Narrower than `compute_delta`'s `new`,
+    # which joins against the rendered block alone and so counts a finding the
+    # last body cut for space, or one nobody looked for.
     # None, marking nothing, when that is not knowable: a first run (no ledger
     # to measure against, where everything would read as new), a lost or
     # seeded memory, or a block written under another identity scheme, where
@@ -12570,7 +12573,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             str(f.get("id", ""))
             for f in findings
             if str(f.get("id", "")) not in filed[0] | set(previous_ids)
-            and str(f.get("cluster", "")).strip() not in filed[1]
+            and (str(f.get("cluster", "")).strip(), str(f.get("check", "")).strip()) in filed[1]
         }
         if filed is not None
         else None

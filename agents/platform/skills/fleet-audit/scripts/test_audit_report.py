@@ -3391,8 +3391,9 @@ class TestPublishedBodies(HarnessTestCase):
 class TestNewMarker(HarnessTestCase):
     """The per-finding `NEW_MARKER` the Slack card reads for its "new" tag.
 
-    Written only where the run can say what the last one carried; a finding
-    wrongly called new is the failure, so an unknown delta marks nothing.
+    Written only where the run can say what the last one filed and looked at;
+    a finding wrongly called new is the failure, so an unknown delta marks
+    nothing.
     """
 
     @staticmethod
@@ -3401,11 +3402,22 @@ class TestNewMarker(HarnessTestCase):
             r"<!-- finding:(\S+?) -->\n\n" + re.escape(audit_report.NEW_MARKER), body
         )
 
-    def refresh(self, previous_body, doc):
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+    def remember(self, rendered, filed=(), scope=None):
+        """Leave the store a previous run wrote: `rendered` in its body, `filed` too, over `scope`."""
+        self.seed_report(published_body(make_doc(findings=rendered), generated_at=NOW))
+        latest = self.store_dir() / "latest.json"
+        envelope = json.loads(latest.read_text(encoding="utf-8"))
+        envelope["document"] = {
+            "findings": [
+                {"id": derived_id(fid=f["id"], cluster=f["cluster"])}
+                for f in [*rendered, *filed]
+            ],
+            "scope": scope if scope is not None else make_doc()["scope"],
         }
+        latest.write_text(json.dumps(envelope), encoding="utf-8")
+
+    def finish(self, doc):
+        self.harness.replies = {"issue list": self.issue_list()}
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.assertEqual(self.run_finish(doc), 0, self.err)
         (body,) = self.harness.bodies_for("issue", "edit")
@@ -3424,17 +3436,9 @@ class TestNewMarker(HarnessTestCase):
         self.assertNotIn(audit_report.NEW_MARKER, body)
 
     def test_a_known_delta_marks_the_new_findings_and_only_them(self):
-        previous = published_body(
-            make_doc(findings=[make_finding(fid="a", title="Alpha finding")]),
-            generated_at=NOW,
-        )
-        doc = make_doc(
-            findings=[
-                make_finding(fid="a", title="Alpha finding"),
-                make_finding(fid="b", title="Bravo finding"),
-            ]
-        )
-        body = self.refresh(previous, doc)
+        alpha = make_finding(fid="a", title="Alpha finding")
+        self.remember([alpha])
+        body = self.finish(make_doc(findings=[alpha, make_finding(fid="b", title="Bravo finding")]))
         self.assertEqual(self.marked(body), [derived_id(fid="b")])
         self.assertEqual(body.count(audit_report.NEW_MARKER), 1)
         # The marker sits between the heading and its `Where:` line, and both
@@ -3456,48 +3460,79 @@ class TestNewMarker(HarnessTestCase):
 
     def test_a_block_under_another_identity_scheme_marks_nothing(self):
         # Every id looks new across a scheme change, so none is marked.
-        previous = '## Findings\n\n<!-- audit-findings: ["wra-something-old"] -->\n'
-        body = self.refresh(previous, make_doc())
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps(
+                {"body": '## Findings\n\n<!-- audit-findings: ["wra-something-old"] -->\n'}
+            ),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        (body,) = self.harness.bodies_for("issue", "edit")
         self.assertNotIn(audit_report.NEW_MARKER, body)
 
     def test_a_finding_the_last_body_cut_for_space_is_not_new(self):
         # The hidden block names only what the body rendered; the stored
-        # document says `b` was filed too, so it is not new this run.
-        previous = published_body(
-            make_doc(findings=[make_finding(fid="a", title="Alpha finding")]),
-            generated_at=NOW,
-        )
-        self.seed_report(previous)
-        latest = self.store_dir() / "latest.json"
-        envelope = json.loads(latest.read_text(encoding="utf-8"))
-        envelope["document"] = {
-            "findings": [{"id": derived_id(fid="a")}, {"id": derived_id(fid="b")}]
-        }
-        latest.write_text(json.dumps(envelope), encoding="utf-8")
-        self.harness.replies = {"issue list": self.issue_list()}
-        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        # document says `b` was filed too.
+        alpha = make_finding(fid="a", title="Alpha finding")
+        bravo = make_finding(fid="b", title="Bravo finding")
+        self.remember([alpha], filed=[bravo])
+        self.assertNotIn(audit_report.NEW_MARKER, self.finish(make_doc(findings=[alpha, bravo])))
+
+    def test_a_finding_on_a_cluster_the_last_run_skipped_is_not_new(self):
+        alpha = make_finding(fid="a", title="Alpha finding")
+        scope = make_doc(
+            clusters=[{"name": "prod-us-east"}],
+            skipped=[{"cluster": "stage-eu", "reason": "unreachable"}],
+        )["scope"]
+        self.remember([alpha], scope=scope)
         doc = make_doc(
             findings=[
-                make_finding(fid="a", title="Alpha finding"),
-                make_finding(fid="b", title="Bravo finding"),
+                alpha,
+                make_finding(fid="b", title="Bravo finding", cluster="stage-eu"),
+                make_finding(fid="c", title="Charlie finding"),
             ]
         )
-        self.assertEqual(self.run_finish(doc), 0, self.err)
-        (body,) = self.harness.bodies_for("issue", "edit")
-        self.assertNotIn(audit_report.NEW_MARKER, body)
+        self.assertEqual(self.marked(self.finish(doc)), [derived_id(fid="c")])
 
-    def test_the_filed_set_is_everything_the_last_run_filed(self):
+    def test_a_finding_whose_check_the_last_run_did_not_run_is_not_new(self):
+        # The last run reached prod-us-east but its netpol check did not run
+        # there (timed out, say), so nothing it found there is known new.
+        alpha = make_finding(fid="a", title="Alpha finding", cluster="stage-eu")
+        others = [c for c in audit_report.audit_checks(AUDIT) if c != "netpol-missing"]
+        scope = make_doc(
+            clusters=[{"name": "prod-us-east", "checks_run": others}, {"name": "stage-eu"}]
+        )["scope"]
+        self.remember([alpha], scope=scope)
+        doc = make_doc(
+            findings=[
+                alpha,
+                make_finding(fid="b", title="Bravo finding"),
+                make_finding(fid="c", title="Charlie finding", cluster="stage-eu"),
+            ]
+        )
+        self.assertEqual(self.marked(self.finish(doc)), [derived_id(fid="c", cluster="stage-eu")])
+
+    def test_the_filed_set_is_everything_the_last_run_filed_and_ran(self):
         withheld = audit_report.POSTURES_WITHHELD_KEY
         envelope = {
             "document": {
                 "findings": [{"id": "a"}, "junk", {"title": "no id"}],
                 withheld: {"findings": [{"id": "w"}]},
-                "scope": {"skipped": [{"cluster": " seeded-c ", "reason": "x"}, {}]},
+                "scope": {
+                    "clusters": [
+                        {"name": " seeded-a ", "checks_run": [{"check": "rbac"}, "junk"]},
+                        {"checks_run": [{"check": "orphan"}]},
+                        "junk",
+                    ],
+                    "skipped": [{"cluster": "seeded-c", "reason": "x"}],
+                },
             },
             "ledger_document": {"findings": [{"id": "carried"}]},
         }
         self.assertEqual(
-            audit_report.report_filed(envelope), ({"a", "w", "carried"}, {"seeded-c"})
+            audit_report.report_filed(envelope),
+            ({"a", "w", "carried"}, {("seeded-a", "rbac")}),
         )
 
     def test_a_memory_without_a_document_files_nothing_knowable(self):
@@ -3506,32 +3541,6 @@ class TestNewMarker(HarnessTestCase):
         self.assertIsNone(
             audit_report.report_filed({"ledger_body": "x", "seeded_from_ledger": True})
         )
-
-    def test_a_finding_on_a_cluster_the_last_run_skipped_is_not_new(self):
-        previous = published_body(
-            make_doc(findings=[make_finding(fid="a", title="Alpha finding")]),
-            generated_at=NOW,
-        )
-        self.seed_report(previous)
-        latest = self.store_dir() / "latest.json"
-        envelope = json.loads(latest.read_text(encoding="utf-8"))
-        envelope["document"] = {
-            "findings": [{"id": derived_id(fid="a")}],
-            "scope": {"skipped": [{"cluster": "stage-eu", "reason": "unreachable"}]},
-        }
-        latest.write_text(json.dumps(envelope), encoding="utf-8")
-        self.harness.replies = {"issue list": self.issue_list()}
-        self.touch("clusters/prod-us-east/payments-netpol.yaml")
-        doc = make_doc(
-            findings=[
-                make_finding(fid="a", title="Alpha finding"),
-                make_finding(fid="b", title="Bravo finding", cluster="stage-eu"),
-                make_finding(fid="c", title="Charlie finding"),
-            ]
-        )
-        self.assertEqual(self.run_finish(doc), 0, self.err)
-        (body,) = self.harness.bodies_for("issue", "edit")
-        self.assertEqual(self.marked(body), [derived_id(fid="c")])
 
     def test_the_marker_is_charged_against_the_body_budget(self):
         finding = make_finding(fid="a", title="Alpha finding")

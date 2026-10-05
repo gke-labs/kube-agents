@@ -37,7 +37,7 @@ its last URL; its line can only withhold them.
 
 The headline carries one number, the count of the most severe findings
 present: "<Name>: 2 critical findings", the name as the title writes it.
-Every critical finding is listed under it, or the top two of a lower
+Up to ``CRITICAL_ROWS_MAX`` critical findings are listed under it, or the top two of a lower
 severity when there is none, a new one tagged "· _new_"; the body's summary
 line ("7 findings: 2 critical, 1 major, 4 minor.") counts the rest by severity
 ("5 more (1 major, 4 minor) are in the ledger issue."). The clusters the
@@ -194,6 +194,8 @@ LEDGER_LABEL = "agent:audit"
 
 #: The rows when nothing is critical: the top of the most severe level present.
 TOP_FINDINGS = 2
+#: The most critical rows a card lists; the rest are counted in its "more" line.
+CRITICAL_ROWS_MAX = 10
 #: A finding row: as long as the headline, shorter than a report row (``ROW_TEXT_MAX``).
 FINDING_ROW_MAX = HEADLINE_MAX
 #: The fallback's bold line when the issue could not be read; the SOPs' lines run to about 200 characters.
@@ -613,12 +615,13 @@ def _row(finding: Finding) -> dict:
 
 
 def _card(parsed: AuditReport) -> Card:
-    """The card: its headline counts the most severe findings present, every one listed when
-    they are critical and the top two otherwise; a line counts the rest by severity."""
+    """The card: its headline counts the most severe findings present, listing up to
+    :data:`CRITICAL_ROWS_MAX` when they are critical and the top two otherwise; a line counts
+    the rest by severity."""
     totals = parsed.totals
     severity = next(level for level in SEVERITIES if totals[level])
     listed = [finding for finding in parsed.findings if finding.severity == severity]
-    shown = listed if severity == CRITICAL else listed[:TOP_FINDINGS]
+    shown = listed[: CRITICAL_ROWS_MAX if severity == CRITICAL else TOP_FINDINGS]
     count = totals[severity]
     headline = CARD_HEADLINE.format(name=parsed.name, count=count, severity=severity, noun=FINDINGS_NOUN[count != 1])
     left = {level: totals[level] - (len(shown) if level == severity else 0) for level in SEVERITIES}

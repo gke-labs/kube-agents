@@ -656,11 +656,14 @@ headroom for the trailing marker and for anything a later section appends.
   characters) it is left out rather than truncated, since a partial complete list would be the same
   ambiguity with a different name.
 - **A finding new since the last run is marked where the run knows it.** A `<!-- finding-new -->`
-  line under a finding's heading says this run's delta counts it as new, so the Slack card can tag
-  it. It is worked out before rendering, as this run's findings less the previous marker's ids,
-  which on the rendered findings is exactly `new`. A run that cannot say what the last one carried
-  writes none: a first run, a lost report store, and a previous marker under another identity
-  scheme, where every id would look new. An absent marker never means "not new".
+  line under a finding's heading says the last run did not file it although it ran the finding's
+  check on its cluster, so the Slack card can tag it. It is worked out before rendering, against
+  everything the last run filed in its stored report rather than the hidden block alone: a finding
+  the last body cut for space, or a posture it withheld, is not new, and nor is one whose check that
+  run did not run on its cluster (skipped, timed out, or inapplicable). That makes it narrower than
+  the delta's `new`. A run that cannot say what the last one filed writes none: a first run, a lost
+  or seeded report store, and a previous marker under another identity scheme, where every id would
+  look new. An absent marker never means "not new".
 - **The delta comment is capped and ordered by severity.** Both of its lists cap at 50 rows, and the
   `new` list is sorted severity-first before the cap applies — an alphabetical cut decides what a
   reader sees by the first letter of a finding id, which is how a critical ends up under "…and 40
@@ -965,8 +968,8 @@ its keep on the dispatched path, where a person is demonstrably waiting. The sch
 lives on the Chat Agent, which owns ingress: the cron report relay
 ([`cron-report-relay.md`](cron-report-relay.md)) posts the run's one line of counts ending with the
 ledger URL. In Slack with `KAGE_SLACK_UX` on that line becomes a card built from the ledger issue:
-a headline carrying the issue's critical count, every critical finding (tagged new where the body
-marks it so), a count of the rest, any clusters the run did not scan, and a link to the issue; the
+a headline carrying the issue's critical count, up to ten critical findings (tagged new where the
+body marks it so), a count of the rest, any clusters the run did not scan, and a link to the issue; the
 issue stays the report, and the card only summarises what it already says.
 
 ## 8. Labels

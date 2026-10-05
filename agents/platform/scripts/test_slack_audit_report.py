@@ -192,6 +192,15 @@ class HeadlineFromIssueTest(unittest.TestCase):
         body = BODY.replace("- **Where:** `seeded-a` — `x`\n", "- **Where:** `seeded-a` — `x`\n\n<!-- finding-new -->\n", 1)
         self.assertNotIn("_new_", sar.headline_from_issue(dict(ISSUE, body=body), REF, REPORT))
 
+    def test_criticals_past_the_row_cap_are_counted(self):
+        count = sar.CRITICAL_ROWS_MAX + 3
+        body = f"### Critical ({count})\n\n" + "".join(finding(f"c{i}", f"c{i}") for i in range(count))
+        title = f"[audit] Security & RBAC Posture Audit — {count} findings ({count} critical)"
+        lines = sar.headline_from_issue(dict(ISSUE, title=title, body=body), REF, f"Security audit: {count} new — {LEDGER}").splitlines()
+        self.assertEqual(lines[0], f"**Security & RBAC Posture Audit: {count} critical findings**")
+        self.assertEqual(lines[sar.CRITICAL_ROWS_MAX], f"`critical` c{sar.CRITICAL_ROWS_MAX - 1}")
+        self.assertEqual(lines[sar.CRITICAL_ROWS_MAX + 1], "3 more (3 critical) are in the ledger issue.")
+
     def test_a_title_cannot_carry_the_tag_itself(self):
         body = BODY.replace(
             "seeded-c: a ClusterRole grants `*` on secrets",
