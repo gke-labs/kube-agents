@@ -41,11 +41,11 @@ With the flag on, :func:`register` adds two listeners:
   goes above the message's text, which is kept: an incident report is in that
   text and nowhere a later read of the thread looks); only when Slack refuses
   that rewrite is the same line posted in the thread instead, since a bot token
-  cannot post as the user. The question the click answers, the message's first
-  line of text, is then offered as the thread's first ask (the label for an
-  incident option or a message with no text), so a thread nobody titled yet
-  is named for what was asked rather than for the button or the card note in
-  the turn. The label is fed
+  cannot post as the user. The message's first line of text (a question's
+  headline; a failure reply's bold lead) is then offered as the thread's first
+  ask (the label for an incident option or a message with no text), so a thread
+  nobody titled yet is named for the message rather than for the button or the
+  card note in the turn. The label is fed
   to the adapter's message handler as that user's message in that thread, the
   path a reaction trigger already takes. That path applies the channel and user checks a typed message gets, so a click
   can do nothing its clicker could not do by typing the label.
@@ -509,8 +509,8 @@ def _question_card(channel_id: str, msg_ts: str) -> str:
 
 
 def _asked(message: dict) -> str:
-    """The question a click answers: the first line of ``message``'s text, without the
-    "Reply with one of:" line, or ``""`` when it has none."""
+    """The first line of ``message``'s text without the "Reply with one of:" line (a
+    question's headline; a failure reply's bold lead), or ``""`` when it has none."""
     return _without_choices_line(str(message.get("text") or ""), True).split("\n", 1)[0].strip()
 
 

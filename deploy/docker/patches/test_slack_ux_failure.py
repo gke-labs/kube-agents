@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -34,7 +35,7 @@ FLAG_ENV = "KAGE_SLACK_UX"
 
 def _event(internal=True, platform="slack", chat_id="C0KAGE", thread_id="1700000000.000100"):
     source = SimpleNamespace(platform=SimpleNamespace(value=platform), chat_id=chat_id, thread_id=thread_id)
-    return SimpleNamespace(internal=internal, source=source)
+    return SimpleNamespace(internal=internal, source=source, timestamp=datetime.now())
 
 
 def _render(content):
@@ -84,6 +85,8 @@ class PresentTest(unittest.TestCase):
             "- a list item. Retry?",
             "1. Restart the pod.\n2. Check the logs.\nRetry?",
             "2) Check the logs. Retry?",
+            "Can't reach `api`'s pods. Retry?",
+            "Lost `api`, then retried. Retry?",
         ):
             with self.subTest(reply=reply):
                 bolded, _ = runtime.present(reply)
@@ -117,6 +120,10 @@ class PresentTest(unittest.TestCase):
             "How should I proceed?",
             "Retry on seeded-a, or check seeded-b first?",
             "Should I retry or stop?",
+            "What\u2019s next?",
+            "How's that?",
+            "So, which one should I use?",
+            "Anything else?",
         ):
             with self.subTest(question):
                 self.assertEqual(runtime.present("It failed. " + question)[1], "")
@@ -173,12 +180,30 @@ class MarkTest(FlagOn):
 
     def test_a_wake_queued_behind_a_user_turn_carries_the_mark_to_its_reply(self):
         # The follow-up's final goes out under the outer turn's event, the user's.
+        outer = _event(internal=False)
         runtime.note_wake(SUB, {"gave_up"}, WAKE)
         runtime.drop(_event().source, _event())
-        blocks = self.draw(_event(internal=False))
+        blocks = self.draw(outer)
         self.assertTrue(blocks[0]["text"]["text"].startswith("**I couldn't find seeded-z.**"))
         self.assertEqual(len(_buttons(blocks)), 1)
         self.assertEqual(self.draw(_event()), _render(REPLY))
+
+    def test_a_carried_mark_the_follow_up_never_sent_does_not_draw_a_later_user_turn(self):
+        # A [SILENT] or streamed wake reply never reaches the outer send.
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        runtime.drop(_event().source, _event())
+        later = _event(internal=False)
+        later.timestamp += timedelta(seconds=1)
+        self.assertEqual(self.draw(later), _render(REPLY))
+        self.assertEqual(runtime._carried, {})
+
+    def test_a_carried_mark_outlives_a_second_failure_wake(self):
+        outer = _event(internal=False)
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        runtime.drop(_event().source, _event())
+        runtime.note_wake(SUB, {"blocked"}, WAKE)
+        self.assertEqual(len(_buttons(self.draw(outer))), 1)
+        self.assertEqual(len(_buttons(self.draw(_event()))), 1)
 
     def test_a_user_message_queued_after_a_carried_wake_drops_the_mark(self):
         runtime.note_wake(SUB, {"gave_up"}, WAKE)

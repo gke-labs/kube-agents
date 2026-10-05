@@ -36,10 +36,12 @@ instead). The next final reply sent for an internal event in that thread takes
 the mark, within :data:`MARK_TTL_SECONDS`; a reply the user's own message
 prompted never does. A message queued behind a running turn runs as a follow-up
 whose reply is sent under that turn's event, which may be the user's: a queued
-wake carries the mark to that reply (:func:`drop`), while a queued user's
+wake carries the mark to that reply (:func:`drop`), taken by the wake's own turn
+or an event that arrived before the wake was drained, while a queued user's
 message drops it, so the wake's reply is drawn as the failure's and the user's
-is not. Outside a thread the reply keeps its question
-as text, since a click answers in the thread it was clicked in. Kanban pings and moments are
+is not. A carried mark the follow-up never sent (a ``[SILENT]`` or streamed
+reply) is dropped by the thread's next final rather than drawing a later message
+of the user's. Outside a thread the reply keeps its question as text, since a click answers in the thread it was clicked in. Kanban pings and moments are
 not finals and never look. The marks are this process's, so a restart between a
 wake and its reply drops the look, not the reply.
 
@@ -58,6 +60,7 @@ import logging
 import re
 import time
 from collections import OrderedDict
+from datetime import datetime
 from typing import Any, Callable, Iterable, Optional
 
 logger = logging.getLogger(__name__)
@@ -90,7 +93,14 @@ MARKUP = re.compile(r"[*_~`<>\[\]|]")
 CODE_SPAN = re.compile(r"`[^`\n]+`")
 #: A question that asks for a word rather than a yes: an open one, by its first
 #: word, or an either/or. Its click would post the question back as the answer.
-OPEN_OPENERS = frozenset({"what", "what's", "whats", "which", "who", "whom", "whose", "when", "where", "why", "how"})
+OPEN_OPENERS = frozenset(
+    {"what", "whats", "which", "who", "whom", "whose", "when", "where", "why", "how", "anything"}
+)
+#: Words skipped before the opener ("So, which one?"), and what is stripped off it.
+OPENER_FILLERS = frozenset({"so", "and", "then", "ok", "okay"})
+OPENER_PUNCTUATION = ",;:"
+OPENER_CONTRACTION = "'s"
+CURLY_APOSTROPHE = "\u2019"
 EITHER_OR = re.compile(r"\bor\b", re.IGNORECASE)
 #: How a sentence ends, so a soft-wrapped lead is not joined past its end.
 SENTENCE_ENDS = (".", "!", "?")
@@ -103,8 +113,9 @@ MESSAGE_BLOCKS_MAX = 50
 
 #: Marked threads, ``(chat_id, thread_id) -> monotonic time``.
 _marks: "OrderedDict[tuple[str, str], float]" = OrderedDict()
-#: Marks a queued wake carried to its follow-up's reply, taken whatever event that reply goes out under.
-_carried: "OrderedDict[tuple[str, str], float]" = OrderedDict()
+#: Marks a queued wake carried to its follow-up's reply, ``(chat_id, thread_id) ->
+#: (mark time, when carried)``: taken under any event that arrived before the carry.
+_carried: "OrderedDict[tuple[str, str], tuple[float, datetime]]" = OrderedDict()
 
 #: The marked thread's id ("" outside a thread) for the length of one marked final's send.
 _marked: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("kage_failure_reply", default=None)
@@ -137,7 +148,6 @@ def note_wake(sub: dict, wake_kinds: Iterable[str], text: str) -> None:
             return
         key = _key(sub.get("chat_id"), sub.get("thread_id"))
         _marks.pop(key, None)
-        _carried.pop(key, None)
         if _wake_note() in (text or ""):
             return
         _marks[key] = time.monotonic()
@@ -159,8 +169,10 @@ def begin(event: Any) -> Optional[contextvars.Token]:
             return None
         key = _key(source.chat_id, getattr(source, "thread_id", None))
         carried = _carried.pop(key, None)
-        noted = _marks.pop(key, None) if getattr(event, "internal", False) else None
-        noted = carried if carried is not None else noted
+        internal = getattr(event, "internal", False)
+        noted = _marks.pop(key, None) if internal else None
+        if carried is not None and (internal or _arrived_by(event, carried[1])):
+            noted = carried[0]
         if noted is None or time.monotonic() - noted > MARK_TTL_SECONDS:
             return None
         return _marked.set(key[1])
@@ -184,11 +196,17 @@ def drop(source: Any, pending_event: Any) -> None:
         if not getattr(pending_event, "internal", False):
             _carried.pop(key, None)
         elif noted is not None:
-            _carried[key] = noted
+            _carried[key] = (noted, datetime.now())
             while len(_carried) > MARKS_MAX:
                 _carried.popitem(last=False)
     except Exception:
         logger.warning("slack_ux_failure: carrying or clearing the follow-up's mark failed", exc_info=True)
+
+
+def _arrived_by(event: Any, moment: datetime) -> bool:
+    """Whether ``event`` arrived by ``moment``, as ``MessageEvent.timestamp`` records it."""
+    arrived = getattr(event, "timestamp", None)
+    return isinstance(arrived, datetime) and arrived.tzinfo is None and arrived <= moment
 
 
 def end(token: Optional[contextvars.Token]) -> None:
@@ -235,16 +253,26 @@ def present(content: str) -> tuple[str, str]:
     if not question or MARKUP.search(question) or len(question) > _presenter.BUTTON_TEXT_MAX:
         return bolded, ""
     word = question.split()[0]
-    if word.lower() in OPEN_OPENERS or EITHER_OR.search(question):
+    if _opener(question) in OPEN_OPENERS or EITHER_OR.search(question):
         return bolded, ""
     if LOWERABLE.match(word):
         question = question[0].lower() + question[1:]
     return bolded, question
 
 
+def _opener(question: str) -> str:
+    """The word ``question`` opens on, lowered, past a filler ("So, which") and without a trailing 's."""
+    for word in question.replace(CURLY_APOSTROPHE, "'").lower().split():
+        word = word.strip(OPENER_PUNCTUATION)
+        if word not in OPENER_FILLERS:
+            return word.removesuffix(OPENER_CONTRACTION)
+    return ""
+
+
 def _bold(sentence: str) -> Optional[str]:
     """``sentence`` with each run of words outside its code spans in bold, or None
-    when markup sits outside a code span or no run holds a word."""
+    when markup sits outside a code span, a bolded run touches a span without a
+    space between (Slack would show the ``*`` as typed), or no run holds a word."""
     runs, spans = CODE_SPAN.split(sentence), CODE_SPAN.findall(sentence)
     if any(MARKUP.search(run) for run in runs):
         return None
@@ -252,6 +280,8 @@ def _bold(sentence: str) -> Optional[str]:
     for i, run in enumerate(runs):
         core = run.strip()
         if any(c.isalnum() for c in core):
+            if (i > 0 and not run[:1].isspace()) or (i < len(spans) and not run[-1:].isspace()):
+                return None
             start = run.index(core)
             run = f"{run[:start]}**{core}**{run[start + len(core):]}"
         out.append(run + (spans[i] if i < len(spans) else ""))

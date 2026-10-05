@@ -25,6 +25,7 @@ import importlib.util
 import os
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -97,7 +98,7 @@ def _event(internal: bool = True):
     source = SimpleNamespace(
         platform=SimpleNamespace(value="slack"), chat_id=SUB["chat_id"], thread_id=SUB["thread_id"]
     )
-    return SimpleNamespace(internal=internal, source=source)
+    return SimpleNamespace(internal=internal, source=source, timestamp=datetime.now())
 
 
 def _render(content: str) -> list:
@@ -136,9 +137,10 @@ def drive(module) -> None:
         module.drop(_event().source, _event(internal=False))
         if _draw(module, _event()) != _render(REPLY):
             raise _fail("a queued follow-up's reply was drawn as the failure's")
+        outer = _event(internal=False)
         module.note_wake(SUB, {"gave_up"}, "wake")
         module.drop(_event().source, _event())
-        carried = _draw(module, _event(internal=False))
+        carried = _draw(module, outer)
         if not carried[0]["text"]["text"].startswith(LEAD):
             raise _fail("a wake queued behind the user's turn lost the failure's look")
     finally:
