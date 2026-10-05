@@ -330,6 +330,60 @@ fixtures:
     defect: >-
       legacy-registry-pull Deployment (one replica) pulling k8s.gcr.io/pause:3.9 with imagePullPolicy Always: a retired registry hostname that answers by redirect today, so every node rebuild pulls it again from a host that may stop
 
+  - role: moving-admission-default
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/baseline-edge-worker
+    namespace: seeded-defaults
+    defect: >-
+      seeded-defaults namespace with Pod Security Admission pinned to enforce baseline at version latest, so the rule set applied to its workloads changes at every minor without anyone editing it; baseline-edge-worker (one replica) is admitted by today's baseline
+
+  - role: stale-client-skew
+    slot: a
+    available_from_day: 0
+    objects:
+      - cronjob/stale-kubectl-client
+    namespace: seeded-shapes
+    defect: >-
+      stale-kubectl-client CronJob running kubectl v1.29.0 against seeded-a's control plane every ten minutes: a client several minors outside the supported skew that still succeeds today
+
+  - role: cgroup-blind-runtime
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/cgroup-blind-jvm
+    namespace: seeded-shapes
+    defect: >-
+      cgroup-blind-jvm Deployment (one replica) running eclipse-temurin 8u302, a JDK 8 from before cgroup v2 support, under a memory limit
+
+  - role: multi-process-container
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/multi-process-worker
+    namespace: seeded-shapes
+    defect: >-
+      multi-process-worker Deployment (one replica): a shell supervisor forking two workers under one memory limit, the shape a cgroup v2 node with a 1.28+ kubelet OOM-kills whole
+
+  - role: node-image-coupled-agent
+    slot: a
+    available_from_day: 0
+    objects:
+      - daemonset/cni-shaped-agent
+    namespace: seeded-shapes
+    defect: >-
+      cni-shaped-agent DaemonSet on the default pool in the shape of a network plugin: host networking and the node's CNI configuration directory mounted read-only
+
+  - role: cuda-pinned-gpu-job
+    slot: a
+    available_from_day: 0
+    objects:
+      - cronjob/cuda-pinned-trainer
+    namespace: seeded-shapes
+    defect: >-
+      cuda-pinned-trainer CronJob, suspended: requests one GPU on an nvidia-l4 pool with an image pinned to CUDA 12.2, so its manifest carries the driver dependency without ever running
+
   - role: zonal-skew-scheduling
     slot: d
     available_from_day: 0

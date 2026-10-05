@@ -321,6 +321,29 @@ def _healthy_world() -> dict:
                 "status": {"readyReplicas": 1, "replicas": 1},
             },
             "pod?app=legacy-registry-pull": _pods(_pod(restarts=0, last_reason=None)),
+            # the six group-5 shapes: an admission pin to the moving rule set, a stale
+            # client, a pre-cgroup-v2 JVM, a multi-process container, a
+            # network-plugin-shaped agent and a suspended GPU job.
+            "namespace/seeded-defaults": {"metadata": {"name": "seeded-defaults", "labels": {"kubernetes.io/metadata.name": "seeded-defaults", "managed-by": "kube-agents-seeded-fleet", "pod-security.kubernetes.io/enforce": "baseline", "pod-security.kubernetes.io/enforce-version": "latest", "pod-security.kubernetes.io/warn": "baseline", "pod-security.kubernetes.io/warn-version": "latest"}}},
+            "deployment/baseline-edge-worker": {"status": {"readyReplicas": 1, "replicas": 1}},
+            "pod?app=baseline-edge-worker": _pods(_pod(restarts=0, last_reason=None)),
+            "cronjob/stale-kubectl-client": {"spec": {"schedule": "*/10 * * * *", "suspend": False, "jobTemplate": {"spec": {"template": {"spec": {"containers": [{"name": "kubectl", "image": "registry.k8s.io/kubectl:v1.29.0"}]}}}}}},
+            "job?app=stale-kubectl-client": {"items": [{"status": {"succeeded": 1, "conditions": [{"type": "Complete", "status": "True"}]}}]},
+            "deployment/cgroup-blind-jvm": {
+                "spec": {"template": {"spec": {"containers": [{"name": "jvm", "image": "docker.io/library/eclipse-temurin:8u302-b08-jre", "resources": {"limits": {"memory": "192Mi"}}}]}}},
+                "status": {"readyReplicas": 1, "replicas": 1},
+            },
+            "pod?app=cgroup-blind-jvm": _pods(_pod(restarts=0, last_reason=None)),
+            "deployment/multi-process-worker": {
+                "spec": {"template": {"spec": {"containers": [{"name": "supervisor", "command": ["sh", "-c", "sleep infinity & sleep infinity & wait"], "resources": {"limits": {"memory": "32Mi"}}}]}}},
+                "status": {"readyReplicas": 1, "replicas": 1},
+            },
+            "pod?app=multi-process-worker": _pods(_pod(restarts=0, last_reason=None)),
+            "daemonset/cni-shaped-agent": {
+                "spec": {"template": {"spec": {"hostNetwork": True, "volumes": [{"name": "cni-conf", "hostPath": {"path": "/etc/cni/net.d", "type": "Directory"}}]}}},
+                "status": {"desiredNumberScheduled": 2, "numberReady": 2},
+            },
+            "cronjob/cuda-pinned-trainer": {"spec": {"schedule": "0 3 * * *", "suspend": True, "jobTemplate": {"spec": {"template": {"spec": {"nodeSelector": {"cloud.google.com/gke-accelerator": "nvidia-l4"}, "containers": [{"name": "trainer", "image": "docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04"}]}}}}}},
         },
         "describe": {
             "seeded-b": _cluster_b(),
@@ -517,7 +540,7 @@ class PassTest(_Harness):
     def test_a_healthy_fleet_converges_on_the_first_pass(self):
         done = self.run_script(_healthy_world())
         assert done.returncode == 0, done.stderr
-        assert "Seeded-fleet fixture state: 24 role(s) in their designed state, 0 drifted, 0 not checked (project kube-agents-evals)" in done.stderr
+        assert "Seeded-fleet fixture state: 30 role(s) in their designed state, 0 drifted, 0 not checked (project kube-agents-evals)" in done.stderr
         assert self.drift_files() == {}
         assert "WARNING" not in done.stderr
         # One read per distinct subject, and the channel default once.
@@ -547,7 +570,7 @@ class PassTest(_Harness):
         ]
         done = self.run_script(world, "--wait", "20", "--interval", "0.1")
         assert done.returncode == 0, done.stderr
-        assert "24 role(s) in their designed state, 0 drifted" in done.stderr
+        assert "30 role(s) in their designed state, 0 drifted" in done.stderr
         assert self.drift_files() == {}
         # Only the pending role is re-read; converged roles are not asked again.
         assert self.log.read_text().count("get deployment checkout-gateway") == 1
@@ -568,7 +591,7 @@ class PassTest(_Harness):
         world["kubectl"]["deployment/checkout-gateway"] = "UNREACHABLE"
         done = self.run_script(world)
         assert done.returncode == 0, done.stderr
-        assert "23 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
+        assert "29 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
         assert self.drift_files() == {}
         assert "WARNING: fixture role 'no-pdb-workload' could not be checked" in done.stderr
         assert "Unable to connect" in done.stderr
@@ -594,7 +617,7 @@ class PassTest(_Harness):
         ]
         done = self.run_script(world, "--wait", "20", "--interval", "0.1")
         assert done.returncode == 0, done.stderr
-        assert "24 role(s) in their designed state, 0 drifted, 0 not checked" in done.stderr
+        assert "30 role(s) in their designed state, 0 drifted, 0 not checked" in done.stderr
 
     def test_a_read_failure_beside_a_failed_assertion_is_still_drift(self):
         world = _healthy_world()
@@ -618,7 +641,7 @@ class PassTest(_Harness):
     def test_the_idle_pool_needs_a_ready_tainted_node(self):
         world = _healthy_world()
         done = self.run_script(world)
-        assert "24 role(s) in their designed state" in done.stderr, done.stderr
+        assert "30 role(s) in their designed state" in done.stderr, done.stderr
         # The label key carries a slash: the subject is a selector, not kind/name.
         assert "get node -l cloud.google.com/gke-nodepool=idle-batch-pool" in self.log.read_text()
         world["kubectl"]["node?cloud.google.com/gke-nodepool=idle-batch-pool"] = {"items": [_node(ready="False")]}
@@ -638,7 +661,7 @@ class PassTest(_Harness):
     def test_a_retained_failed_writer_job_is_drift(self):
         world = _healthy_world()
         done = self.run_script(world)
-        assert "24 role(s) in their designed state" in done.stderr, done.stderr
+        assert "30 role(s) in their designed state" in done.stderr, done.stderr
         # The Jobs are read by label, in the role's namespace; nothing named.
         assert "get job -l app=legacy-endpoints-writer -n seeded-deprecation" in self.log.read_text()
         # failedJobsHistoryLimit 1: one retained failure is what a broken caller leaves.
@@ -670,7 +693,7 @@ class PassTest(_Harness):
         registry that still exists, a CSI-provisioned volume) reads as drift."""
         world = _healthy_world()
         done = self.run_script(world)
-        assert "24 role(s) in their designed state" in done.stderr, done.stderr
+        assert "30 role(s) in their designed state" in done.stderr, done.stderr
         heals = {
             "node-local-state": (
                 "deployment/cache-on-emptydir",
@@ -691,6 +714,31 @@ class PassTest(_Harness):
                 "persistentvolume/intree-pd",
                 {"spec": {"csi": {"driver": "pd.csi.storage.gke.io", "volumeHandle": "projects/p/zones/z/disks/seeded-a-intree-pd"}}, "status": {"phase": "Bound"}},
                 "persistentvolume/intree-pd spec.csi absent: observed",
+            ),
+            "moving-admission-default": (
+                "namespace/seeded-defaults",
+                {"metadata": {"name": "seeded-defaults", "labels": {"kubernetes.io/metadata.name": "seeded-defaults", "managed-by": "kube-agents-seeded-fleet", "pod-security.kubernetes.io/enforce": "baseline", "pod-security.kubernetes.io/enforce-version": "v1.34", "pod-security.kubernetes.io/warn": "baseline", "pod-security.kubernetes.io/warn-version": "v1.34"}}},
+                "namespace/seeded-defaults metadata.labels eq",
+            ),
+            "stale-client-skew": (
+                "cronjob/stale-kubectl-client",
+                {"spec": {"schedule": "*/10 * * * *", "suspend": False, "jobTemplate": {"spec": {"template": {"spec": {"containers": [{"name": "kubectl", "image": "registry.k8s.io/kubectl:v1.33.0"}]}}}}}},
+                'spec.jobTemplate.spec.template.spec.containers[*].image any_eq "registry.k8s.io/kubectl:v1.29.0": observed "registry.k8s.io/kubectl:v1.33.0"',
+            ),
+            "cgroup-blind-runtime": (
+                "deployment/cgroup-blind-jvm",
+                {"spec": {"template": {"spec": {"containers": [{"name": "jvm", "image": "docker.io/library/eclipse-temurin:8u442-b06-jre", "resources": {"limits": {"memory": "192Mi"}}}]}}}, "status": {"readyReplicas": 1, "replicas": 1}},
+                'image any_eq "docker.io/library/eclipse-temurin:8u302-b08-jre": observed "docker.io/library/eclipse-temurin:8u442-b06-jre"',
+            ),
+            "node-image-coupled-agent": (
+                "daemonset/cni-shaped-agent",
+                {"spec": {"template": {"spec": {"hostNetwork": False, "volumes": [{"name": "cni-conf", "hostPath": {"path": "/etc/cni/net.d", "type": "Directory"}}]}}}, "status": {"desiredNumberScheduled": 2, "numberReady": 2}},
+                "spec.template.spec.hostNetwork eq true: observed false",
+            ),
+            "cuda-pinned-gpu-job": (
+                "cronjob/cuda-pinned-trainer",
+                {"spec": {"schedule": "0 3 * * *", "suspend": False, "jobTemplate": {"spec": {"template": {"spec": {"nodeSelector": {"cloud.google.com/gke-accelerator": "nvidia-l4"}, "containers": [{"name": "trainer", "image": "docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04"}]}}}}}},
+                "spec.suspend eq true: observed false",
             ),
             "retired-registry-image": (
                 "deployment/legacy-registry-pull",
@@ -765,7 +813,7 @@ class PassTest(_Harness):
     def test_a_context_without_the_slots_cluster_is_not_checked(self):
         (self.fleet / ".fleet-context").write_text("project=kube-agents-evals\n")
         done = self.run_script(_healthy_world())
-        assert "21 role(s) in their designed state, 0 drifted, 3 not checked" in done.stderr
+        assert "27 role(s) in their designed state, 0 drifted, 3 not checked" in done.stderr
         assert "records no cluster for slot" in done.stderr
 
     def test_only_published_roles_are_asserted(self):
@@ -810,7 +858,7 @@ class PassTest(_Harness):
         }
         done = subprocess.run([sys.executable, str(_SCRIPT)], capture_output=True, text=True, env=env, check=False)
         assert done.returncode == 0, done.stderr
-        assert "24 role(s) in their designed state" in done.stderr
+        assert "30 role(s) in their designed state" in done.stderr
 
     def test_stalled_controller_fixture_detects_drift_on_missing_deadline(self):
         world = _healthy_world()
@@ -900,8 +948,10 @@ class ReportTest(_Harness):
         self.assertEqual(
             states,
             {
+                "cgroup-blind-runtime": "converged",
                 "containerd-socket-agent": "converged",
                 "crashloop-workload": "converged",
+                "cuda-pinned-gpu-job": "converged",
                 "declared-no-pdb-workload": "converged",
                 "declared-overrequest-workload": "converged",
                 "declared-token-workload": "converged",
@@ -911,7 +961,10 @@ class ReportTest(_Harness):
                 "hpa-saturated": "converged",
                 "idle-nodepool": "unpublished",
                 "intree-pd-volume": "converged",
+                "moving-admission-default": "converged",
+                "multi-process-container": "converged",
                 "no-pdb-workload": "drifted",
+                "node-image-coupled-agent": "converged",
                 "node-local-state": "converged",
                 "rbac-overgrant": "converged",
                 "readiness-drain-blocked": "converged",
@@ -919,6 +972,7 @@ class ReportTest(_Harness):
                 "readiness-pinned-workload": "converged",
                 "readiness-surge-blocked": "converged",
                 "retired-registry-image": "converged",
+                "stale-client-skew": "converged",
                 "stalled-controller": "converged",
                 "version-laggard": "converged",
                 "zonal-skew-capacity": "converged",
@@ -930,7 +984,7 @@ class ReportTest(_Harness):
         self.assertTrue(doc["roles"]["drift-outlier"]["detail"][0].startswith("cluster: clusters describe seeded-c failed"), doc["roles"]["drift-outlier"])
         self.assertEqual(doc["roles"]["idle-nodepool"], {"cluster_slot": "a", "state": "unpublished", "detail": []})
         self.assertEqual(doc["roles"]["version-laggard"]["cluster_slot"], "b")
-        self.assertEqual(doc["summary"], {"converged": 21, "drifted": 1, "unchecked": 1})
+        self.assertEqual(doc["summary"], {"converged": 27, "drifted": 1, "unchecked": 1})
         self.assertIn("1 drifted, 1 not checked", done.stderr)
 
     def test_without_the_flag_no_report_is_written(self):
