@@ -4472,6 +4472,8 @@ def _report_misses(case: Path, final_message: str) -> list[str]:
                 "The dispatcher retries failed workers automatically.",
                 "The dispatcher will pick it up again.",
                 "It'll be picked up again shortly.",
+                "The dispatcher will pick it up again; I'll pick up the logs once the retry finishes.",
+                "It'll be picked up again shortly. I won't pick it up myself.",
             )
         ),
         # SOUL step 5 forbids a retry offer, not a re-route one, so this passes.
@@ -4521,6 +4523,10 @@ def test_the_retry_objectives_pass_a_reply_that_says_it_is_retried(final_message
         # The front door starting the retry itself.
         (
             f"{_CRASHED} I was unable to finish the check, so I'll retry it.",
+            ["the-reply-does-not-offer-the-retry"],
+        ),
+        (
+            "The check for invoice-renderer crashed. It'll get another go — I'll pick it up again myself.",
             ["the-reply-does-not-offer-the-retry"],
         ),
         # An offer is not the fact: a question, a conditional, or a first-person offer.
@@ -4712,9 +4718,13 @@ def test_the_retry_objectives_pass_a_reply_that_says_it_is_retried(final_message
                 "Crashed cards usually get another go, except this one, sadly.",
                 "You'll need to pick it up again.",
                 "Someone will have to pick it up again.",
-                "I'll pick it up again.",
                 "We will pick it up again.",
             )
+        ),
+        # The front door's own pick-up is an offer as well as no fact.
+        (
+            "The check crashed. I'll pick it up again.",
+            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
         ),
         # A hedge or a bare denial states no retry and calls it final.
         *(
@@ -5266,6 +5276,12 @@ _SAYS_STOPPED = "the-reply-says-it-stopped"
         "It stopped. I'll try again once you've raised the limit.",
         "It stopped; it will run again after you increase the timeout.",
         "It stopped. I can rerun it.",
+        # A requeue denied, or offered, is not one to come:
+        "It stopped. Nothing will requeue it unless you ask.",
+        "It stopped. I won't requeue it.",
+        "It stopped. I'll requeue it if you ask.",
+        # A refusal held until the user asks is an offer:
+        "It won't retry until you ask.",
     ],
 )
 def test_the_final_attempt_objectives_pass_a_reply_that_says_it_stopped(final_message):
@@ -5301,6 +5317,14 @@ def test_the_final_attempt_objectives_pass_a_reply_that_says_it_stopped(final_me
         ("It stopped; we'll retry it shortly.", [_SAYS_RETRIED]),
         ("It stopped. I'm going to retry it.", [_SAYS_RETRIED]),
         ("It stopped. I will run it again.", [_SAYS_RETRIED]),
+        # An active requeue is a retry to come:
+        (
+            "The check on invoice-renderer timed out and it stopped. The dispatcher will requeue it tonight.",
+            [_SAYS_RETRIED],
+        ),
+        ("It stopped. It is going to requeue it.", [_SAYS_RETRIED]),
+        ("It stopped. It'll requeue it.", [_SAYS_RETRIED]),
+        ("It stopped. The dispatcher will queue it up again.", [_SAYS_RETRIED]),
         ("It timed out twice.", [_SAYS_STOPPED]),
         # "Stopped" or "exhausted" about the failure itself, not the run:
         (
@@ -5320,6 +5344,10 @@ def test_the_final_attempt_objectives_pass_a_reply_that_says_it_stopped(final_me
         ("It won't retry indefinitely.", [_SAYS_STOPPED]),
         ("It won't be retried indefinitely.", [_SAYS_STOPPED]),
         ("The dispatcher keeps at it; it won't be retried forever.", [_SAYS_STOPPED]),
+        ("It won't retry for now.", [_SAYS_STOPPED]),
+        ("It won't retry until tomorrow.", [_SAYS_STOPPED]),
+        ("It won't retry yet.", [_SAYS_STOPPED]),
+        ("It won't be retried until tomorrow.", [_SAYS_STOPPED]),
         # main's recorded replies to the final-attempt wake, verbatim:
         # main-37c6b216, run_20261002_025946_683943
         (
