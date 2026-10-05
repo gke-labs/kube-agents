@@ -550,7 +550,7 @@ class ScanGateTest(unittest.TestCase):
         self.assertEqual(out, "")
 
     def test_body_leaves_the_raw_file_and_ranking_to_the_hand_off(self):
-        """The worker fans out and completes; bootstrap_handoff.py does the rest.
+        """The worker lists the fleet and completes; bootstrap_handoff.py does the rest.
 
         Asked to wait, compile and hand off, the worker had no tool that waits,
         typed the raw file without its findings block, and filed the ranking card
@@ -600,8 +600,8 @@ class ScanGateTest(unittest.TestCase):
         """
         body = bootstrap_scan_gate._task_body()
         self.assertIn(bootstrap_scan_gate.RECONCILE_SCRIPT_NAME, body)  # roster first
-        self.assertIn("audit the clusters no call covers", body)  # no silent hole
-        self.assertIn("Step 2 — fan out", body)  # one child per cluster
+        self.assertIn("audit the clusters the list does not cover", body)  # no silent hole
+        self.assertIn("do not fan out; the gate has", body)  # the gate files one card per cluster
         # The fleet list is how the hand-off names a cluster nobody reported on.
         self.assertIn("`fleet`", body)
         self.assertNotIn("aggregation card", body)
@@ -624,10 +624,13 @@ class ScanGateTest(unittest.TestCase):
         self.assertNotIn("us-central1-a", hashed)
         step2 = self._step_2(bootstrap_scan_gate._task_body())
         prefix = bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX
-        self.assertIn(f"kanban_create(assignee='{short}', idempotency_key='{prefix}{short}'", step2)
-        self.assertIn(f"kanban_create(assignee='{hashed}', idempotency_key='{prefix}{hashed}'", step2)
-        self.assertIn("title='Report cluster inventory: `prod` (`proj`, `us-east4`)'", step2)
-        self.assertEqual(step2.count("kanban_create("), 2)
+        agents = {a["name"]: a for a in bootstrap_scan_gate.cluster_agents()}
+        self.assertEqual(sorted(agents), sorted([short, hashed]))
+        self.assertEqual(agents[short]["key"], f"{prefix}{short}")
+        self.assertEqual(agents[hashed]["key"], f"{prefix}{hashed}")
+        self.assertEqual(agents[short]["title"], "Report cluster inventory: `prod` (`proj`, `us-east4`)")
+        self.assertIn(f"`{short}`", step2)
+        self.assertIn(f"`{hashed}`", step2)
         self.assertNotIn("/opt/hermes", step2)
         self.assertNotIn("profile list", step2)
 
@@ -636,8 +639,7 @@ class ScanGateTest(unittest.TestCase):
         # shared key hands the second Cluster Agent the first one's card.
         self._cluster_agent("proj-a", "prod", "us-central1")
         self._cluster_agent("proj-b", "prod", "us-central1")
-        step2 = self._step_2(bootstrap_scan_gate._task_body())
-        keys = re.findall(r"idempotency_key='([^']+)'", step2)
+        keys = [a["key"] for a in bootstrap_scan_gate.cluster_agents()]
         self.assertEqual(len(keys), 2)
         self.assertEqual(len(set(keys)), 2)
 
@@ -648,10 +650,9 @@ class ScanGateTest(unittest.TestCase):
         # directory name differs, which the key must follow.
         first = self._cluster_agent("proj-a", "b", "us-central1")
         second = self._cluster_agent("proj", "a-b", "us-central1", name="cluster-proj-a-b-us-central1-2")
-        step2 = self._step_2(bootstrap_scan_gate._task_body())
         prefix = bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX
         self.assertEqual(
-            re.findall(r"idempotency_key='([^']+)'", step2), [f"{prefix}{first}", f"{prefix}{second}"]
+            [a["key"] for a in bootstrap_scan_gate.cluster_agents()], [f"{prefix}{first}", f"{prefix}{second}"]
         )
 
     def test_step_2_leaves_out_what_is_not_a_cluster_agent(self):
@@ -670,19 +671,17 @@ class ScanGateTest(unittest.TestCase):
             (unstamped / marker).write_text("")
         with contextlib.redirect_stderr(io.StringIO()):
             step2 = self._step_2(bootstrap_scan_gate._task_body())
-        self.assertNotIn("kanban_create(", step2)
+            self.assertEqual(bootstrap_scan_gate.cluster_agents(), [])
         self.assertIn("    (none)", step2)
-        self.assertIn("If no calls are listed above", step2)
+        self.assertIn("If the list above is `(none)`", step2)
 
-    def test_the_fan_out_calls_wait_on_the_sweep(self):
-        # The sweep completes at fan-out, and the #1174 guard refuses that
-        # completion over a card it filed unless the card names it as a parent.
-        # Nothing reads the audits from the sweep any more; the hand-off does.
+    def test_the_sweep_is_told_not_to_file_cluster_cards(self):
+        # The gate files them: asked to make the calls itself, the worker once
+        # completed saying it had fanned out to seven clusters and had filed none.
         self._cluster_agent("proj", "prod", "us-east4")
         step2 = self._step_2(bootstrap_scan_gate._task_body())
-        calls = [line for line in step2.splitlines() if "kanban_create(" in line]
-        self.assertEqual(len(calls), 1)
-        self.assertIn("parents=[<this card's id>]", calls[0])
+        self.assertIn("Do not create cluster cards", step2)
+        self.assertNotIn("kanban_create(", step2)
 
     def test_step_2_leaves_out_a_profile_whose_scaffold_did_not_finish(self):
         # Hermes never registered the first, so a card assigned to it is never
@@ -693,10 +692,8 @@ class ScanGateTest(unittest.TestCase):
         half_built = self._cluster_agent("proj", "half", "us-east4", artifacts=())
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
-            step2 = self._step_2(bootstrap_scan_gate._task_body())
-        calls = [line for line in step2.splitlines() if "kanban_create(" in line]
-        self.assertEqual(len(calls), 1)
-        self.assertIn(f"assignee='{ready}'", calls[0])
+            names = [a["name"] for a in bootstrap_scan_gate.cluster_agents()]
+        self.assertEqual(names, [ready])
         self.assertIn(f"{unregistered}: scaffold not finished", stderr.getvalue())
         self.assertIn(f"{half_built}: scaffold not finished", stderr.getvalue())
 
@@ -719,10 +716,8 @@ class ScanGateTest(unittest.TestCase):
         (bad / "config.yaml").write_text("- a\n")
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
-            step2 = self._step_2(bootstrap_scan_gate._task_body())
-        calls = [line for line in step2.splitlines() if "kanban_create(" in line]
-        self.assertEqual(len(calls), 1)
-        self.assertIn(f"assignee='{good}'", calls[0])
+            names = [a["name"] for a in bootstrap_scan_gate.cluster_agents()]
+        self.assertEqual(names, [good])
         self.assertIn("cluster-broken: ", stderr.getvalue())
         self.assertNotIn("cluster-broken: scaffold not finished", stderr.getvalue())
 
@@ -742,10 +737,8 @@ class ScanGateTest(unittest.TestCase):
 
         stderr = io.StringIO()
         with mock.patch.object(Path, "is_file", _is_file), contextlib.redirect_stderr(stderr):
-            step2 = self._step_2(bootstrap_scan_gate._task_body())
-        calls = [line for line in step2.splitlines() if "kanban_create(" in line]
-        self.assertEqual(len(calls), 1)
-        self.assertIn(f"assignee='{good}'", calls[0])
+            names = [a["name"] for a in bootstrap_scan_gate.cluster_agents()]
+        self.assertEqual(names, [good])
         self.assertIn(f"skipping Cluster Agent {locked}: [Errno {errno.EACCES}] Permission denied", stderr.getvalue())
 
     def test_the_card_lists_the_roster_the_reconcile_left(self):
@@ -774,7 +767,7 @@ class ScanGateTest(unittest.TestCase):
             self._run()
         self.assertEqual(len(filed), 1)
         args = shlex.split(filed[0])
-        self.assertIn(f"kanban_create(assignee='{created[0]}'", args[args.index("--body") + 1])
+        self.assertIn(f"`{created[0]}`", args[args.index("--body") + 1])
 
     def test_body_forbids_improvising_around_a_failed_step(self):
         """The 32-call roster loop is what this prevents.
@@ -787,7 +780,7 @@ class ScanGateTest(unittest.TestCase):
         body = bootstrap_scan_gate._task_body()
         self.assertIn("treat its answer as empty", body)
         self.assertIn("do not improvise", body.lower())
-        self.assertIn("exactly once", body)
+        self.assertIn("Discovery steps run ONCE", body)
 
     def test_reconcile_runs_before_the_sweep_is_filed(self):
         """A sweep filed against a not-yet-reconciled roster fans out to nobody.
@@ -1036,15 +1029,24 @@ class ScanGateTest(unittest.TestCase):
         # The root card is guarded by a marker and a key; the cards it spawns
         # are guarded only by what these instructions tell the worker to set.
         name = self._cluster_agent("proj", "prod", "us-east4")
-        body = bootstrap_scan_gate._task_body()
-        self.assertIn(f"{bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX}{name}", body)
+        keys = [a["key"] for a in bootstrap_scan_gate.cluster_agents()]
+        self.assertEqual(keys, [f"{bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX}{name}"])
 
     def test_a_filed_sweep_runs_the_hand_off_instead_of_filing(self):
         (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n")
         with mock.patch.object(bootstrap_scan_gate.bootstrap_handoff, "hand_off") as hand_off:
             rc, out = self._run()
         self.assertEqual((rc, out, self.filed), (0, "", []))
-        hand_off.assert_called_once_with(self.d, self.d / SCAN_FILED, bootstrap_scan_gate._parse_task_id)
+        hand_off.assert_called_once_with(
+            self.d, self.d / SCAN_FILED, bootstrap_scan_gate._parse_task_id, roster=bootstrap_scan_gate.cluster_agents
+        )
+
+    def test_filing_the_sweep_files_the_cluster_cards_in_the_same_tick(self):
+        with mock.patch.object(bootstrap_scan_gate.bootstrap_handoff, "hand_off") as hand_off:
+            self._run()
+        self.assertEqual(len(self.filed), 1)
+        hand_off.assert_called_once()
+        self.assertIs(hand_off.call_args.kwargs["roster"], bootstrap_scan_gate.cluster_agents)
 
     def test_a_failing_hand_off_does_not_fail_the_cron_run(self):
         (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n")

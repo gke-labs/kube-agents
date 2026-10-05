@@ -15,7 +15,7 @@
 # The scenario driver for bench/tasks/bootstrap-inventory-ranking-delivery:
 # plant a fixed INVENTORY.raw.md (inventory-raw.txt beside this file) on the
 # shell sandbox's data volume, file the `bootstrap-inventory-prioritize` card
-# the discovery sweep's worker files once it has written that file, wait until
+# the onboarding gate's hand-off files once it has written that file, wait until
 # the card's worker has ended its run itself, or `run_wait` has passed, and
 # then arm the delivery job by touching `.user_aligned`, the marker the
 # onboarding plugin touches when a person first chats. The delivery job then

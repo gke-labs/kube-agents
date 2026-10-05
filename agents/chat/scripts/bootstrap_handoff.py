@@ -1,11 +1,12 @@
 """The onboarding sweep's hand-off to ranking, run by ``bootstrap_scan_gate.py``.
 
-After the gate files the sweep card, the sweep's worker fans the audit out to
-one ``bootstrap-inventory-cluster-*`` card per Cluster Agent and completes. This
-module is what happens next, once a minute on the gate's tick: it waits for
-those cards to settle, writes ``INVENTORY.raw.md`` from their structured
-``metadata``, and files the ``bootstrap-inventory-prioritize`` card that ranks
-it into the report the user receives.
+After the gate files the sweep card, this module runs once a minute on the
+gate's tick: it files one ``bootstrap-inventory-cluster-*`` card per Cluster
+Agent, waits for those cards and the sweep to settle, writes
+``INVENTORY.raw.md`` from their structured ``metadata``, and files the
+``bootstrap-inventory-prioritize`` card that ranks it into the report the user
+receives. The sweep's worker only lists the fleet and audits any cluster with
+no Cluster Agent.
 
 It is code rather than SOP text because each of the three steps is mechanical
 and the worker could not do them reliably: it has no tool that waits
@@ -42,8 +43,14 @@ PRIORITIZE_INSTRUCTIONS_PATHS = (
     "/opt/platform-template/governance/inventory_prioritize_sop.md",
 )
 PRIORITIZE_TITLE = "Prioritize the onboarding inventory report"
+CLUSTER_AUDIT_INSTRUCTIONS_PATHS = (
+    "/opt/data/profiles/platform/governance/cluster_inventory_audit_sop.md",
+    "/opt/platform-template/governance/cluster_inventory_audit_sop.md",
+)
 
 HANDOFF_MARKER = ".bootstrap_handoff_filed"
+MARKER_FIELD = re.compile(r"^(\w+)=(\S*)$")
+MARKER_LINE = re.compile(r"^\s*(\w+)\s*=\s*(\S+)\s*$")
 BOARD_FILE = "kanban.db"
 SQLITE_BUSY_TIMEOUT_SECONDS = 10
 
@@ -123,7 +130,17 @@ def _read_marker(path: Path) -> dict[str, str]:
         text = path.read_text(encoding="utf-8")
     except OSError:
         return {}
-    return dict(field.split("=", 1) for field in text.split() if "=" in field)
+    fields = {}
+    for line in text.splitlines():
+        for part in line.split():
+            # Tolerates `key = value` as a person types it into a marker by hand.
+            match = MARKER_FIELD.match(part) if "=" in part else None
+            if match:
+                fields[match.group(1)] = match.group(2)
+        match = MARKER_LINE.match(line)
+        if match and match.group(2):
+            fields.setdefault(match.group(1), match.group(2))
+    return fields
 
 
 def _metadata(conn: sqlite3.Connection, task_id: str) -> dict:
@@ -167,6 +184,7 @@ def read_board(board: Path, sweep_id: str) -> dict | None:
                  "block_reason": _block_reason(conn, sweep_id) if status == BLOCKED else ""}
         clusters = []
         archived = 0
+        archived_keys = set()
         for tid, cstatus, key, title in conn.execute(
             "SELECT id, status, idempotency_key, title FROM tasks WHERE idempotency_key LIKE ? "
             "AND created_at >= ? ORDER BY created_at, id",
@@ -174,13 +192,14 @@ def read_board(board: Path, sweep_id: str) -> dict | None:
         ).fetchall():
             if cstatus == ARCHIVED:
                 archived += 1
+                archived_keys.add(key)
                 continue
             clusters.append({
                 "id": tid, "status": cstatus, "key": key, "title": title or "",
                 "metadata": _metadata(conn, tid) if cstatus == DONE else {},
-                "block_reason": _block_reason(conn, tid) if cstatus == BLOCKED else "",
+                "block_reason": _block_reason(conn, tid) if cstatus in (BLOCKED, TRIAGE) else "",
             })
-        return {"sweep": sweep, "clusters": clusters, "archived_clusters": archived}
+        return {"sweep": sweep, "clusters": clusters, "archived_clusters": archived, "archived_keys": archived_keys}
     except sqlite3.Error as e:
         _log(f"cannot read the board: {e}")
         return None
@@ -191,10 +210,9 @@ def read_board(board: Path, sweep_id: str) -> dict | None:
 def settled(state: dict) -> bool:
     """True once the sweep is done and no cluster card has more to give.
 
-    A blocked sweep is not settled: blocked before its fan-out it has filed no
-    cards yet, and blocked after it its cards, which name it as their parent,
-    cannot start. Either way the deadline hands off what there is, which leaves
-    a person time to unblock it first.
+    A blocked sweep is not settled: it may still list the fleet or audit a
+    cluster with no Cluster Agent once unblocked. The deadline hands off what
+    there is, which leaves a person time to unblock it first.
     """
     return state["sweep"]["status"] == DONE and all(c["status"] in SETTLED for c in state["clusters"])
 
@@ -324,6 +342,8 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
                 f"{_cell(card['title'] or card['key'])} ({card['id']}): {card['status']} — "
                 f"{_cell(card['block_reason'] or NO_REASON)}"
             )
+        elif card["status"] in (FAILED, CANCELLED):
+            gaps.append(f"{_cell(card['title'] or card['key'])} ({card['id']}): {card['status']} before it reported")
         else:
             gaps.append(f"{_cell(card['title'] or card['key'])} ({card['id']}): still {_cell(card['status'])} when the hand-off ran")
     for meta in _list(sweep["metadata"].get("clusters")):
@@ -366,6 +386,8 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
             )
     if not fleet:
         gaps.append("the sweep reported no fleet list, so clusters with no Cluster Agent may be missing")
+    for agent in state.get("unfiled", []):
+        gaps.append(f"{_cell(agent['title'])}: the gate could not file this Cluster Agent's card")
     if state.get("archived_clusters"):
         gaps.append(f"{state['archived_clusters']} cluster card(s) were archived before they reported")
     if timed_out:
@@ -511,38 +533,81 @@ def _prioritize_body() -> str:
     )
 
 
-def file_prioritize(parse_task_id) -> str | None:
+def _cluster_body(agent: dict) -> str:
+    paths = "\n".join(f"  - {p}" for p in CLUSTER_AUDIT_INSTRUCTIONS_PATHS)
+    return (
+        f"Audit {agent['cluster_label']}, the cluster you are pinned to, for first-time onboarding. Follow "
+        f"the single-cluster audit SOP, reading whichever of these exists:\n{paths}\n\n"
+        "Complete this card with the structured `metadata` that SOP specifies; the onboarding gate reads "
+        "it into the inventory report. Never block this card: record anything you could not do in `gaps` "
+        "and complete."
+    )
+
+
+def _create(parse_task_id, assignee: str, key: str, title: str, body: str) -> str | None:
     try:
         from hermes_cli.kanban import run_slash
     except Exception as e:  # noqa: BLE001 - kanban unavailable; retry next tick
         _log(f"kanban API unavailable: {e}")
         return None
     cmd = (
-        f"create --json --assignee {shlex.quote(ASSIGNEE)} "
-        f"--idempotency-key {shlex.quote(PRIORITIZE_KEY)} "
-        f"--body {shlex.quote(_prioritize_body())} {shlex.quote(PRIORITIZE_TITLE)}"
+        f"create --json --assignee {shlex.quote(assignee)} --idempotency-key {shlex.quote(key)} "
+        f"--body {shlex.quote(body)} {shlex.quote(title)}"
     )
     try:
         out = str(run_slash(cmd)).strip()
     except Exception as e:  # noqa: BLE001 - never fail the cron run
-        _log(f"could not file the ranking card: {e}")
+        _log(f"could not file {key}: {e}")
         return None
     task_id = parse_task_id(out)
     if not task_id:
-        _log(f"could not read a task id from the board response: {out}")
+        _log(f"could not read a task id from the board response for {key}: {out}")
     return task_id
+
+
+def file_cluster_cards(state: dict, roster: list, parse_task_id) -> list:
+    """File a card for every Cluster Agent on the roster that has none for this sweep.
+
+    The gate, not the sweep's worker, is the one creator of these cards: asked
+    to make the calls itself, the worker once completed saying it had fanned out
+    to seven clusters having filed none, and the report that followed called
+    the fleet clean. Re-run every tick until the hand-off, so a create that
+    failed is retried; the idempotency key keeps a retry from filing twice, and
+    a card someone archived is not filed again. Returns how many it filed and
+    the agents still without a card.
+    """
+    have = {c["key"] for c in state["clusters"]} | state.get("archived_keys", set())
+    filed, unfiled = 0, []
+    for agent in roster:
+        if agent["key"] in have:
+            continue
+        if _create(parse_task_id, agent["name"], agent["key"], agent["title"], _cluster_body(agent)):
+            filed += 1
+        else:
+            unfiled.append(agent)
+    return filed, unfiled
+
+
+def file_prioritize(parse_task_id) -> str | None:
+    return _create(parse_task_id, ASSIGNEE, PRIORITIZE_KEY, PRIORITIZE_TITLE, _prioritize_body())
 
 
 def _record(marker: Path, sweep_id: str, task_id: str, now: float) -> None:
     marker.write_text(f"sweep={sweep_id}\ntask_id={task_id}\nfiled_at={int(now)}\n", encoding="utf-8")
 
 
-def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, now: float | None = None) -> str | None:
-    """Advance the hand-off one tick. Returns the ranking card id once filed."""
+def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, roster=None, now: float | None = None) -> str | None:
+    """Advance the hand-off one tick. Returns the ranking card id once filed.
+
+    ``roster`` is the gate's list of ready Cluster Agents (or a callable that
+    returns it), each ``{name, key, title, cluster_label}``; their cards are
+    filed here, once per sweep.
+    """
     now = time.time() if now is None else now
     filed = _read_marker(scan_marker)
     sweep_id = filed.get("task_id", "")
     if not sweep_id:
+        _log(f"{scan_marker} names no task_id; nothing to hand off")
         return None
     marker = data_dir / HANDOFF_MARKER
     done = _read_marker(marker)
@@ -559,14 +624,21 @@ def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, now: float | None
     if state["sweep"]["status"] == ARCHIVED or (state["archived_clusters"] and not state["clusters"]):
         _log(f"sweep {sweep_id} or all of its cluster cards are archived; not handing off")
         return None
+    agents = (roster() if callable(roster) else roster) or []
+    filed_now, unfiled = file_cluster_cards(state, agents, parse_task_id)
+    if filed_now:
+        # The cards just filed have not run; nothing is settled this tick.
+        return None
+    state["unfiled"] = unfiled
     try:
         filed_at = float(filed["filed_at"])
     except (KeyError, ValueError):
         # A marker written by hand may carry only the card id; its own
         # timestamp is when the sweep was filed, near enough.
         filed_at = scan_marker.stat().st_mtime
-    timed_out = not settled(state) and now - filed_at >= deadline(state)
-    if not settled(state) and not timed_out:
+    ready = settled(state) and not unfiled
+    timed_out = not ready and now - filed_at >= deadline(state)
+    if not ready and not timed_out:
         return None
     if not write_raw(data_dir, compose(state, timed_out, now)):
         return None

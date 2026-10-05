@@ -20,9 +20,10 @@ longer the reason this lives here.)
 So this runs as a ``no_agent`` script — a plain subprocess, not bound by the
 Chat Agent's toolset denylist — and files the sweep as a **kanban task assigned
 to** ``platform``, the privileged specialist. The dispatcher spawns that worker
-with its full toolset; the worker fans the audit out to the Cluster Agents and
-completes its own card. On this job's later ticks ``bootstrap_handoff.py`` waits
-for their cards, writes the raw findings, and files the prioritization card.
+with its full toolset; the worker lists the fleet, audits any cluster with no
+Cluster Agent, and completes its own card. ``bootstrap_handoff.py``, on this
+job's ticks, files one audit card per Cluster Agent, waits for them, writes the
+raw findings, and files the prioritization card.
 
 Filing is once-only, and this job owns that guarantee locally: the id of the
 card it filed is recorded in ``.bootstrap_scan_filed``, and while that marker
@@ -41,7 +42,7 @@ per-cluster child cards plus an aggregation card and finished, so the board
 said "done" while the disk said "no report" for the whole sweep, which is
 indistinguishable from "never scanned" — and a 1-minute job with no memory of
 its own re-filed the sweep, once a minute, for as long as the real work took.
-The sweep card completes at fan-out again, and the
+The sweep card completes long before the audits do, and the
 raw file and the prioritization card come from the hand-off minutes later, so
 board-done/disk-empty is the normal middle of a sweep. Only a marker written at
 file time covers every case.
@@ -79,8 +80,8 @@ SCAN_TASK_TITLE = "First-time environment discovery: write the onboarding invent
 # Second line of defence only — see the module docstring. The marker below is
 # the actual guarantee.
 SCAN_IDEMPOTENCY_KEY = "bootstrap-inventory-scan"
-# Propagated to the cards the worker fans out to, so a duplicate root card (if
-# one ever slips through) still cannot produce a duplicate sweep underneath it.
+# The per-Cluster-Agent audit cards the hand-off files, so a retried create, or a
+# duplicate root card if one ever slips through, cannot file a second audit.
 CLUSTER_IDEMPOTENCY_KEY_PREFIX = "bootstrap-inventory-cluster-"
 # The card that ranks the raw findings into the short report the user receives. It is
 # a separate card so it runs in a fresh context that sees the raw findings and nothing
@@ -176,10 +177,11 @@ def _reconcile_script(data_dir: Path) -> Path:
     return data_dir / "scripts" / RECONCILE_SCRIPT_NAME
 
 
-def _cluster_agent_calls() -> list[str]:
-    """One exact ``kanban_create`` call per Cluster Agent, for Step 2 of the card.
+def cluster_agents() -> list[dict]:
+    """The ready Cluster Agents, one ``{name, key, title, cluster_label}`` each.
 
-    The gate reads the roster because the sweep's worker cannot. The worker's
+    The gate files one card per entry itself (``bootstrap_handoff``) and lists
+    them in the sweep card. It reads the roster because the sweep's worker cannot. The worker's
     ``terminal`` runs in the shell sandbox, which has no ``hermes``, and whose
     ``/opt/data/profiles`` is a mirror that leaves out every ``config.yaml``
     (so no ``cluster_identity``) and keeps profiles the reconcile has pruned.
@@ -223,7 +225,7 @@ def _cluster_agent_calls() -> list[str]:
     except Exception as e:  # noqa: BLE001 - never fail the cron run; see the docstring
         sys.stderr.write(f"bootstrap_scan_gate: could not read the Cluster Agent roster: {e}\n")
         return []
-    calls = []
+    agents = []
     for name in names:
         home = cap.profile_home(name)
         # The probe is inside the try: the image's Python re-raises an is_file()
@@ -249,13 +251,14 @@ def _cluster_agent_calls() -> list[str]:
         # Keyed by the profile name: the identity fields all allow hyphens, so
         # joining them with hyphens gives two clusters one key, and the board
         # answers the second create with the first card.
-        calls.append(
-            f"kanban_create(assignee='{name}', "
-            f"idempotency_key='{CLUSTER_IDEMPOTENCY_KEY_PREFIX}{name}', "
-            f"title='Report cluster inventory: `{identity['cluster']}` (`{identity['project']}`, "
-            f"`{identity['location']}`)', parents=[<this card's id>], body=<the instructions below>)"
-        )
-    return calls
+        label = f"`{identity['cluster']}` (`{identity['project']}`, `{identity['location']}`)"
+        agents.append({
+            "name": name,
+            "key": f"{CLUSTER_IDEMPOTENCY_KEY_PREFIX}{name}",
+            "title": f"Report cluster inventory: {label}",
+            "cluster_label": label,
+        })
+    return agents
 
 
 def _unlisted_projects(data_dir: Path) -> list[tuple[str, str]]:
@@ -522,7 +525,7 @@ def _task_body() -> str:
     lifecycle_holds = "the scope and its exclusions" if multi else "the `RECONCILE_EXCLUDE` opt-out"
     instruction_list = "\n".join(f"  - {p}" for p in INSTRUCTIONS_PATHS)
     cluster_audit_list = "\n".join(f"  - {p}" for p in CLUSTER_AUDIT_INSTRUCTIONS_PATHS)
-    calls = "\n".join(f"    {c}" for c in _cluster_agent_calls()) or "    (none)"
+    roster = "\n".join(f"    - `{a['name']}`: {a['cluster_label']}" for a in cluster_agents()) or "    (none)"
     return (
         "First-time onboarding discovery sweep. Follow the inventory SOP, reading whichever "
         "of these exists:\n"
@@ -556,31 +559,18 @@ def _task_body() -> str:
         "onboarding runs once, and a report saying discovery failed is worth more than a thin "
         "one that reads as a clean fleet.\n\n"
         f"{_scope_gap_paragraph(_data_dir())}"
-        "**Step 2 — fan out.** These are the Cluster Agents, one card each, read from the "
-        "profiles when this card was filed. Make every call below exactly once, all of them "
-        "up front, with this card's own id in `parents`:\n\n"
-        f"{calls}\n\n"
-        "This list is the roster. Do not look it up yourself: your terminal runs in a sandbox "
-        "that has neither `hermes` nor the profiles' configuration, so anything you list there "
-        "is incomplete. `parents` holds the cards until this one completes, which is what lets "
-        "you complete it in Step 4 without waiting for them. "
-        "**If no calls are listed above, there are no Cluster Agents: skip the rest of "
-        "this step and audit every cluster yourself in Step 3.** That is the normal case for a "
-        "single-cluster install and it is not an error.\n\n"
-        "Each card's body must "
-        "send that agent to the single-cluster audit SOP, reading whichever of these exists:\n"
-        f"{cluster_audit_list}\n\n"
-        "and tell it to complete its card with the structured `metadata` that SOP specifies. "
-        "**Point at the SOP; do not describe the checks in the card body.** Both the checks and "
-        "the `metadata` shape are specific, and a body written freehand loses them: what comes "
-        "back is a topology listing with no findings in it.\n\n"
-        "**Use those exact idempotency keys.** This is onboarding: it must happen once. The "
-        "keys are what guarantees that a retry, a second dispatch, or a duplicate of this "
-        "card re-attaches to the sweep already in flight instead of launching a second "
-        "fleet-wide scan on top of it.\n\n"
-        "**Step 3 — audit the clusters no call covers**, following Steps 2 to 4 of the "
-        "single-cluster audit SOP (its own numbering) for each, and record each in that SOP's "
-        "`metadata` shape. Usually there are none.\n\n"
+        "**Step 2 — do not fan out; the gate has.** This gate files one audit card per Cluster "
+        "Agent itself, read from the profiles when this card was filed:\n\n"
+        f"{roster}\n\n"
+        "**Do not create cluster cards, and do not look the roster up yourself:** your terminal "
+        "runs in a sandbox that has neither `hermes` nor the profiles' configuration. **If the "
+        "list above is `(none)`, there are no Cluster Agents: audit every cluster yourself in "
+        "Step 3.** That is the normal case for a single-cluster install and it is not an "
+        "error.\n\n"
+        "**Step 3 — audit the clusters the list does not cover**, following Steps 2 to 4 of the "
+        "single-cluster audit SOP (its own numbering) for each, reading whichever of these "
+        f"exists:\n{cluster_audit_list}\n\n"
+        "and record each in that SOP's `metadata` shape. Usually there are none.\n\n"
         "**Step 4 — complete this card now. Do not wait for the per-cluster cards, do not write "
         f"`{RAW_INVENTORY_PATH}` or `{INVENTORY_PATH}`, and do not file a ranking card.** The "
         "onboarding gate waits for the per-cluster cards, writes the raw findings from their "
@@ -685,18 +675,24 @@ def main(data_dir: Path | None = None) -> int:
     marker = data_dir / SCAN_FILED_MARKER
     if marker.exists():
         if not (data_dir / COMPLETED_MARKER).exists():
-            try:
-                bootstrap_handoff.hand_off(data_dir, marker, _parse_task_id)
-            except Exception as e:  # noqa: BLE001 - never fail the cron run; the next tick retries
-                sys.stderr.write(f"bootstrap_scan_gate: hand-off failed: {e!r}\n")
+            _hand_off(data_dir, marker)
         return 0
     if should_skip(data_dir):
         return 0  # silent no-op: already filed, scanned, or delivered
     if not ensure_cluster_agents(data_dir):
         return 0  # roster not ready; the next tick retries, no marker written
-    file_scan_task(data_dir)
+    if file_scan_task(data_dir):
+        # Files the Cluster Agents' cards now rather than a tick later.
+        _hand_off(data_dir, marker)
     # Stdout stays empty on purpose — this job never speaks to the user.
     return 0
+
+
+def _hand_off(data_dir: Path, marker: Path) -> None:
+    try:
+        bootstrap_handoff.hand_off(data_dir, marker, _parse_task_id, roster=cluster_agents)
+    except Exception as e:  # noqa: BLE001 - never fail the cron run; the next tick retries
+        sys.stderr.write(f"bootstrap_scan_gate: hand-off failed: {e!r}\n")
 
 
 if __name__ == "__main__":

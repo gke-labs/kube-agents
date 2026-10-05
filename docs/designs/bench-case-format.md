@@ -201,8 +201,7 @@ Six read the install under test, all from the same file. `bootstrap_fanout` comp
 cards the onboarding discovery sweep filed, read from the agent pod's board, against the
 Cluster Agent profiles on its disk. Its `require` is `one_card_per_cluster_agent` (exactly
 one card per ready profile with a cluster identity, keyed and assigned to it, and no cluster
-card for anything else) or `every_card_waits_on_the_sweep` (every cluster card has the sweep as
-a parent, so the sweep can complete at fan-out).
+card for anything else).
 
 `bootstrap_handoff` reads both ends of the sweep's hand-off to the prioritization stage. Its
 `require` is `raw_report_has_findings_block` (the sandbox's own `inventory_findings.py` parses

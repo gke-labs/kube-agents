@@ -528,7 +528,7 @@
 
 # The onboarding discovery sweep's fan-out (#1872) and the gate's hand-off to
 # ranking: re-arms the bootstrap-inventory-scan gate on the install under test,
-# grades the cards the sweep's worker files against the Cluster Agent roster,
+# grades the cluster cards filed for the sweep against the Cluster Agent roster,
 # then the raw report's findings block (parsed by the sandbox's own
 # inventory_findings.py) and the keyed bootstrap-inventory-prioritize card.
 # Nightly rather than presubmit because the sweep's cards take dispatcher slots

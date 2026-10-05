@@ -1,9 +1,9 @@
 # Single-Cluster Inventory Audit (`bootstrap-inventory-cluster-<profile>`)
 
 **Purpose:** The per-cluster half of first-time environment discovery, performed by a Cluster Agent
-on the one cluster it is pinned to. The Platform Agent fans this out during
-`bootstrap-inventory-scan` (`inventory.md`), and the onboarding gate's hand-off script collects the
-results from every card; this SOP covers only what one Cluster Agent does with its own cluster.
+on the one cluster it is pinned to. The onboarding gate files this card, one per Cluster Agent, during
+`bootstrap-inventory-scan`, and collects the results from every card; this SOP covers only what one
+Cluster Agent does with its own cluster.
 
 You are one of several agents auditing in parallel. **Report your findings on your card and write
 nothing to shared state.** Specifically: do not write `/opt/data/INVENTORY.raw.md` or

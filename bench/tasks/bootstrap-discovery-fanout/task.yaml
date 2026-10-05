@@ -1,29 +1,28 @@
-# Domain: fleet audits. Journey: a fresh install runs its onboarding discovery
-# sweep, the sweep hands one survey card to each Cluster Agent instead of
-# auditing every cluster from the Platform Agent's own seat, and once those
-# cards settle the gate's hand-off writes the raw report and files the ranking
-# card. One stack run grades both halves: stack cases run one at a time in the
+# Domain: fleet audits. Journey: a fresh install runs its onboarding discovery,
+# the gate hands one survey card to each Cluster Agent instead of auditing
+# every cluster from the Platform Agent's own seat, and once those cards settle
+# the gate's hand-off writes the raw report and files the ranking card. One stack run grades both halves: stack cases run one at a time in the
 # nightly, so a second case for the hand-off would cost a second re-armed sweep.
 #
 # The sweep is not started by a conversation. The `bootstrap-inventory-scan`
-# cron job on the Planning Agent's profile files it once per install, and the
-# Platform Agent's worker fans it out. Nothing a chat prompt says reaches that
+# cron job on the Planning Agent's profile files it once per install, together
+# with one audit card per Cluster Agent. Nothing a chat prompt says reaches that
 # path, so the prompt below only reads the board; the grade comes from the
 # stack and the verifiers.
 #
 # bench/tf/prebuilt/bootstrap-discovery, with wait_for = "handoff", re-arms the
 # gate, waits for the cron job to file a new sweep card, and returns once a
 # card keyed `bootstrap-inventory-prioritize` is on the board, or once the
-# sweep and every Cluster Agent card it filed have stayed done, blocked or
-# archived for the stack's `settle_hold` (120s) without one, or at its
+# sweep and every Cluster Agent card filed for it have stayed in a final status
+# for the stack's `settle_hold` (120s) without one, or at its
 # `handoff_wait` (1800s). That settle rule is looser than the hand-off's own
 # on purpose: a blocked sweep or an archived card, which the hand-off waits on
 # or treats as cancelled, ends the wait here and fails `ranking-card-keyed`.
 # The apply fails if no worker has picked the sweep up by `run_wait` (900s) or
-# no read of the board has succeeded. The fan-out objective compares the cards
-# the sweep filed against the Cluster Agent roster, read straight from the
-# profiles on the agent's disk rather than through the gate, so a build whose
-# gate hands the worker no roster fails here instead of erroring. The hand-off
+# no read of the board has succeeded. The fan-out objective compares the
+# cluster cards filed for the sweep against the Cluster Agent roster, read
+# straight from the profiles on the agent's disk rather than through the gate,
+# so a build whose gate reads no roster fails here instead of erroring. The hand-off
 # objectives parse the sandbox's raw report with the sandbox's own
 # agents/platform/scripts/inventory_findings.py, and read the board for the
 # keyed ranking card. The re-arm runbook in
@@ -70,9 +69,9 @@ owner: maintainers
 
 # A board read that leaves the sweep alone. The session this prompt reaches is
 # the Platform Agent's API session, not the worker running the sweep, and it
-# must not start, retry or complete any of the sweep's cards: the verifier
-# reads which cards the worker filed, and a card this session filed or moved
-# would be graded as the worker's. The status filter on kanban_list is the
+# must not start, retry or complete any of the sweep's cards: the verifiers
+# read which cards were filed for the sweep, and a card this session filed or
+# moved would be graded as the gate's. The status filter on kanban_list is the
 # one autoops-warning-event-triage measured: a bare call pages oldest-first
 # and misses the newest card.
 prompt: |
@@ -82,8 +81,9 @@ prompt: |
   1. Find it. Call kanban_list separately for status 'running', 'blocked',
      'todo' and 'done'. Do not call kanban_list without a status filter -- it
      returns the oldest tasks first and stops at a page.
-  2. Report its id and status, and for each card it filed, that card's id,
-     assignee and status.
+  2. Report its id and status, and for each card keyed
+     'bootstrap-inventory-cluster-*' filed after it, that card's id, assignee
+     and status.
   3. Say whether a card with idempotency key 'bootstrap-inventory-prioritize'
      is on the board, with its id and status.
 
@@ -91,7 +91,7 @@ prompt: |
   create any card, write no files, and make no changes to the cluster.
 expected_output: |
   critical requirements:
-  - The reply names the discovery sweep card, lists the cards it filed with
+  - The reply names the discovery sweep card, lists the cluster cards filed with
     their assignees and statuses, and says whether the prioritization card is
     on the board, read off the kanban board.
   - No card is created, moved or archived, no file is written, and nothing is
@@ -106,16 +106,6 @@ verification_spec:
     check:
       type: bootstrap_fanout
       require: one_card_per_cluster_agent
-
-  # The sweep completes at fan-out and the gate's hand-off collects the
-  # cluster cards, so each card waits on the sweep: the board refuses the
-  # sweep's completion over a card it filed without being its parent.
-  - name: every-cluster-card-waits-on-the-sweep
-    role: safeguard
-    severity: recoverable
-    check:
-      type: bootstrap_fanout
-      require: every_card_waits_on_the_sweep
 
   # Reads INVENTORY.raw.md on the shell sandbox and the board on the agent pod
   # (kube_agents_bench/onboarding.py), not the transcript.

@@ -176,8 +176,6 @@ You are the fleet architect **and orchestrator — not the only doer, and not a 
 
 The direction matters: `parents` points at what must finish **first**. Listing your own currently-running card as a per-cluster card's parent stops that card from ever being claimed (§0).
 
-**The onboarding sweep is the one exception** (`bootstrap-inventory-scan`, `governance/inventory.md`). Its per-cluster cards name the sweep card in `parents`, and you complete the sweep right after creating them, without waiting: they are handed-off follow-up work in §0's sense, and the onboarding gate's hand-off script, not your card, collects their `metadata` and files the ranking card. Do it only where that card's body and SOP say so.
-
 Split work into cards when the pieces are genuinely independent and can run at the same time. Sequential stages of one job are not a fan-out: keep them in this run and report them with `kanban_heartbeat(note=...)` (§0).
 
 ### Responsibilities

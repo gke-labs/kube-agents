@@ -1,25 +1,13 @@
 # First-Time Environment Discovery & Inventory Scan (`bootstrap-inventory-scan`)
 
-**Purpose:** Starts the first-time GKE environment discovery on initial agent boot: enumerate the
-fleet, hand one audit card to each cluster's Cluster Agent, audit any cluster that has none, and
-complete.
+**Purpose:** The fleet half of first-time GKE environment discovery: enumerate the fleet, audit any
+cluster that has no Cluster Agent, and complete.
 
-You do not write the report. Once the per-cluster cards settle, the onboarding gate
-(`bootstrap_handoff.py`, a script) writes their structured `metadata` into
-`/opt/data/INVENTORY.raw.md` and files the card that ranks it into the report delivered to chat as
-`/opt/data/INVENTORY.md`. Your job is to make sure every cluster is either handed to a Cluster Agent,
-audited by you, or named as a gap.
-
----
-
-## Pre-Execution Check
-
-1. **Verify Status:** Check `test -e /opt/data/INVENTORY.raw.md` with an absolute path. **Do not run
-   relative directory search patterns (`search_files`): your working directory is a subfolder where
-   `/opt/data/` files are not listed.**
-   - If it exists, discovery already ran and was handed off: complete this card with a one-line
-     `result` saying so, and do nothing else.
-   - Otherwise proceed.
+You do not fan out and you do not write the report. The onboarding gate (`bootstrap_scan_gate.py`
+and `bootstrap_handoff.py`, scripts) files one audit card per Cluster Agent itself, and once those
+cards settle it writes their structured `metadata`, with yours, into `/opt/data/INVENTORY.raw.md`
+and files the card that ranks it into the report delivered to chat as `/opt/data/INVENTORY.md`. Your
+job is the fleet list, the clusters no Cluster Agent covers, and the gaps.
 
 ---
 
@@ -36,59 +24,28 @@ Use native Google Cloud CLI (`gcloud`) and Kubernetes (`kubectl`) read-only comm
 
 ---
 
-## Step 2: Fan the per-cluster audit out to the Cluster Agents
+## Step 2: Do not fan out; the gate has
 
-The workload audit is single-cluster runtime work, so each cluster's own Cluster Agent runs it, not
-you (`SOUL.md` §6). **Your card lists one `kanban_create` call per Cluster Agent: make exactly
-those calls and no others.** The gate read them from the Cluster Agent profiles when it filed this
-card and kept only the ones ready to take a card, so a roster you look up yourself does not match
-it. If the card lists none, there are no
-Cluster Agents: skip to Step 3 and audit every cluster from Step 1 yourself. Make the calls **all up
-front, in one burst, each with this card's id in `parents`**. Each has this shape:
-
-```
-kanban_create(
-  assignee='<the Cluster Agent profile>',
-  idempotency_key='bootstrap-inventory-cluster-<the Cluster Agent profile>',
-  title='Report cluster inventory: `<cluster>` (`<project>`, `<location>`)',
-  parents=[<this card's id>],
-  body=<the instructions below>,
-)
-```
-
-The body must send that agent to the single-cluster SOP, reading whichever of these exists:
-
-- `/opt/data/profiles/platform/governance/cluster_inventory_audit_sop.md`
-- `/opt/platform-template/governance/cluster_inventory_audit_sop.md`
-
-and tell it to complete its card with the structured `metadata` that SOP specifies.
-
-`parents` holds the per-cluster cards until this card completes. That is what lets you complete it
-in Step 4 straight away: the board refuses a completion while cards this card filed are unfinished,
-unless this card is their parent. They start as soon as you complete.
-
-**Point at the SOP; do not summarise it in the card body.** The checks are specific — probes,
-requests and limits and the resulting QoS class, HPA coverage, `privileged` / `hostPID` /
-`hostNetwork`, ResourceQuotas, LimitRanges, NetworkPolicies, Workload Identity — and so is the
-`metadata` shape the hand-off reads. A body written freehand loses both, and what comes
-back is a topology listing with no findings in it. That has been observed: four cards completed in
-under two minutes each, every one of them with no `metadata` at all, and the fleet report that
-followed named zero problems on a fleet that had them.
+Your card lists the Cluster Agents the gate filed an audit card for, one each, read from their
+profiles when it filed this card. **Do not create cluster cards, and do not look the roster up
+yourself** — your terminal runs in a sandbox without the profiles' configuration, so a roster you
+list there does not match. If the card lists none, there are no Cluster Agents: audit every cluster
+from Step 1 yourself in Step 3.
 
 **Do not create, repair, or delete a Cluster Agent profile.** Profile lifecycle belongs to
 `cluster_agent_reconcile.py`, which holds the scope and its exclusions and the create/prune
 rules; a profile you create by hand is one the next reconcile run may immediately prune, and you
-will loop. A cluster no call on your card covers is yours to audit in Step 3 — or, if you cannot
+will loop. A cluster the list on your card does not cover is yours to audit in Step 3 — or, if you cannot
 reach it, an entry in `gaps` saying so.
 
 ---
 
-## Step 3: Audit the clusters no call covers
+## Step 3: Audit the clusters the list does not cover
 
 **A cluster with no Cluster Agent has no card, and you audit it here yourself.** Those are the
-clusters Step 1 listed that no `kanban_create` call on your card names: all of them when the card
+clusters Step 1 listed that the list on your card does not name: all of them when the card
 lists none, and usually none otherwise, because the reconcile gives every listed cluster a profile.
-Take the set from the card's calls, not from a roster you look up. Follow Steps 2 to 4 of
+Take the set from the card's list, not from a roster you look up. Follow Steps 2 to 4 of
 `cluster_inventory_audit_sop.md` for each, and record what you find in that SOP's Step 5 `metadata`
 shape: Step 2 is the control-plane topology, and Steps 3 and 4 are the probes, requests/limits and
 QoS, HPA, security context, namespace governance, addons, observability and hardening checks the

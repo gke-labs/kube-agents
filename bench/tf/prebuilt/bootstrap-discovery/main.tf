@@ -20,10 +20,10 @@
 # whatever Cluster Agent cards it is going to file, which is what the case
 # grades. Short of that, it hands whatever the worker filed to the verifier
 # at `run_wait`, or fails the apply if no worker has picked the sweep up by
-# then or no read of the board has succeeded. In the default mode it does
-# not wait for the Cluster Agent cards: the sweep completes at fan-out, and
-# the gate's hand-off collects them. The destroy archives them, and
-# archiving a running card ends its worker.
+# then or no read of the board has succeeded. That default mode predates the
+# gate filing the Cluster Agent cards itself and grades only the sweep's own
+# run; the case uses wait_for = "handoff". The destroy archives every card,
+# and archiving a running card ends its worker.
 #
 # With wait_for = "handoff", step 4 instead waits for the hand-off to the
 # ranking stage: it returns once a card keyed `bootstrap-inventory-prioritize`

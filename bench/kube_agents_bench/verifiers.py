@@ -966,12 +966,13 @@ def _agent_shell(script: str, timeout: float) -> str:
 
 @VERIFIERS.register("bootstrap_fanout")
 class BootstrapFanoutVerifier(BaseVerifier):
-    """Checks the cards the onboarding discovery sweep's worker filed.
+    """Checks the cluster cards filed for the onboarding discovery sweep.
 
-    The sweep card is filed by a cron job rather than by the conversation, so
-    neither the transcript nor the harness's delegation capture sees it; this
-    reads the card, its worker's children and the Cluster Agent roster off the
-    agent's disk (:mod:`kube_agents_bench.discovery`).
+    The onboarding gate, a cron job, files the sweep card and one card per
+    Cluster Agent, so neither the transcript nor the harness's delegation
+    capture sees them; this reads the sweep, the ``bootstrap-inventory-cluster-*``
+    cards created at or after it, and the Cluster Agent roster off the agent's
+    disk (:mod:`kube_agents_bench.discovery`).
 
     ``require``:
 
@@ -979,22 +980,15 @@ class BootstrapFanoutVerifier(BaseVerifier):
       finished scaffolding and has a cluster identity got exactly one
       ``bootstrap-inventory-cluster-*`` card, assigned to it and keyed by its
       profile name, and no such card went anywhere else.
-    - ``every_card_waits_on_the_sweep``: every ``bootstrap-inventory-cluster-*``
-      card names the sweep as a parent. The sweep completes right after the
-      fan-out and the gate's hand-off collects the cards, and the board refuses
-      that completion over a card the sweep filed without being its parent; a
-      refused worker that cannot wait blocks its card instead.
 
     Fails closed: an unreadable pod, no sweep marker, a board that cannot be
-    queried, or a sweep card the board does not know is ``status="error"``,
-    and so is an empty roster for ``one_card_per_cluster_agent``.
-    ``every_card_waits_on_the_sweep`` does not read the roster, so an empty one
-    is not an error for it. A ``fail`` from an earlier poll outranks a final
-    read that errors.
+    queried, a sweep card the board does not know, or an empty roster is
+    ``status="error"``. A ``fail`` from an earlier poll outranks a final read
+    that errors.
     """
 
     type: Literal["bootstrap_fanout"]
-    require: Literal["one_card_per_cluster_agent", "every_card_waits_on_the_sweep"]
+    require: Literal["one_card_per_cluster_agent"]
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         read_timeout = min(single_call_timeout(timeout_sec), _FANOUT_READ_TIMEOUT_SEC)
@@ -1033,12 +1027,6 @@ class BootstrapFanoutVerifier(BaseVerifier):
             if str(c.get("key") or "").startswith(discovery.CLUSTER_KEY_PREFIX)
         ]
         where = f"sweep {sweep.get('id')} ({sweep.get('status')})"
-        if self.require == "every_card_waits_on_the_sweep":
-            free = [c["id"] for c in cards if sweep.get("id") not in (c.get("parents") or [])]
-            if free:
-                return "fail", f"{where}: cluster card(s) {free} do not name the sweep as a parent", payload
-            return "pass", f"{where}: all {len(cards)} cluster card(s) wait on the sweep", payload
-
         roster = payload.get("roster") or []
         if not roster:
             unidentified = payload.get("unidentified") or []

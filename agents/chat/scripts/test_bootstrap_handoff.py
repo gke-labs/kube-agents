@@ -79,6 +79,15 @@ class SharedNamesTest(unittest.TestCase):
         self.assertEqual(h.RAW_PATH, g.RAW_INVENTORY_PATH)
         self.assertEqual(h.REPORT_PATH, g.INVENTORY_PATH)
         self.assertEqual(h.PRIORITIZE_INSTRUCTIONS_PATHS, g.PRIORITIZE_INSTRUCTIONS_PATHS)
+        self.assertEqual(h.CLUSTER_AUDIT_INSTRUCTIONS_PATHS, g.CLUSTER_AUDIT_INSTRUCTIONS_PATHS)
+
+
+class MarkerTest(unittest.TestCase):
+    def test_a_hand_written_marker_with_spaces_still_names_the_sweep(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "m"
+            path.write_text("task_id = t_abc\nfiled_at=123\n")
+            self.assertEqual(h._read_marker(path), {"task_id": "t_abc", "filed_at": "123"})
 
 
 class FindingLinesTest(unittest.TestCase):
@@ -233,6 +242,15 @@ class ComposeTest(unittest.TestCase):
         clusters = _all_done() + [("t_c", "cancelled", None, ""), ("t_f", "failed", None, "")]
         self.assertTrue(h.settled(self._state(clusters)))
 
+    def test_a_failed_or_cancelled_card_says_so(self):
+        text = h.compose(self._state([("t_f", "failed", None, ""), ("t_c", "cancelled", None, "")]), timed_out=False, now=NOW)
+        self.assertIn("(t_f): failed before it reported", text)
+        self.assertIn("(t_c): cancelled before it reported", text)
+
+    def test_a_card_in_triage_keeps_its_block_reason(self):
+        text = h.compose(self._state([("t_t", "triage", None, "HTTP 429 rate limit")]), timed_out=False, now=NOW)
+        self.assertIn("(t_t): triage — HTTP 429 rate limit", text)
+
     def test_no_findings_still_writes_an_empty_block(self):
         clusters = [("t_5ca49c4e", "done", _metadata()["t_5ca49c4e"], "")]
         text = h.compose(self._state(clusters), timed_out=False, now=NOW)
@@ -269,6 +287,11 @@ class HandOffTest(unittest.TestCase):
 
     def _run(self, now=NOW):
         return h.hand_off(self.d, self.scan_marker, None, now=now)
+
+    def _run_roster(self, roster, now=NOW):
+        import bootstrap_scan_gate
+
+        return h.hand_off(self.d, self.scan_marker, bootstrap_scan_gate._parse_task_id, roster=roster, now=now)
 
     def _run_with_parser(self):
         import bootstrap_scan_gate
@@ -343,6 +366,58 @@ class HandOffTest(unittest.TestCase):
         _board(self.board, sweep_meta={"clusters": 5, "fleet": "x"}, clusters=[("t_odd", "done", meta, "")])
         self.assertEqual(self._run(), "t_rank1")
         inventory_findings.parse_block((self.d / "INVENTORY.raw.md").read_text())
+
+    def _agent(self, tid):
+        return {"name": f"cluster-{tid}", "key": f"{h.CLUSTER_KEY_PREFIX}{tid}",
+                "title": f"Report cluster inventory: {tid}", "cluster_label": f"`{tid}`"}
+
+    def _stub_kanban(self, sent, reply='{"id": "t_new"}'):
+        kanban = types.ModuleType("hermes_cli.kanban")
+        kanban.run_slash = lambda cmd: sent.append(cmd) or reply
+        pkg = types.ModuleType("hermes_cli")
+        pkg.kanban = kanban
+        return mock.patch.dict(sys.modules, {"hermes_cli": pkg, "hermes_cli.kanban": kanban})
+
+    def test_the_gate_files_a_card_for_each_cluster_agent_without_one(self):
+        _board(self.board, clusters=_all_done()[:1])
+        have = _all_done()[0][0]
+        sent = []
+        roster = [self._agent(have), self._agent("t_missing")]
+        with self._stub_kanban(sent):
+            self.assertIsNone(self._run_roster(roster))
+        self.assertEqual(len(sent), 1)
+        argv = shlex.split(sent[0])
+        self.assertEqual(argv[argv.index("--idempotency-key") + 1], f"{h.CLUSTER_KEY_PREFIX}t_missing")
+        self.assertEqual(argv[argv.index("--assignee") + 1], "cluster-t_missing")
+        self.assertIn("cluster_inventory_audit_sop.md", argv[argv.index("--body") + 1])
+        self.assertEqual(self.filed, [])
+
+    def test_a_sweep_that_filed_no_cards_does_not_report_a_clean_fleet(self):
+        # The live failure: a done sweep with no cluster cards at all.
+        _board(self.board, clusters=[])
+        sent = []
+        with self._stub_kanban(sent):
+            self.assertIsNone(self._run_roster([self._agent("t_a"), self._agent("t_b")]))
+        self.assertEqual(len(sent), 2)
+        self.assertFalse((self.d / "INVENTORY.raw.md").exists())
+        self.assertEqual(self.filed, [])
+
+    def test_an_archived_cluster_card_is_not_filed_again(self):
+        _board(self.board, clusters=_all_done() + [("t_gone", "archived", None, "")])
+        sent = []
+        roster = [self._agent(tid) for tid, _, _, _ in _all_done()] + [self._agent("t_gone")]
+        with self._stub_kanban(sent):
+            self.assertEqual(self._run_roster(roster), "t_rank1")
+        self.assertEqual(sent, [])
+
+    def test_a_card_the_gate_could_not_file_holds_the_hand_off_then_is_a_gap(self):
+        _board(self.board, clusters=_all_done())
+        roster = [self._agent(tid) for tid, _, _, _ in _all_done()] + [self._agent("t_lost")]
+        with self._stub_kanban([], reply="board unavailable"):
+            self.assertIsNone(self._run_roster(roster))
+            limit = h.DEADLINE_SECONDS + h.DEADLINE_PER_CARD_SECONDS * len(_all_done())
+            self.assertEqual(self._run_roster(roster, now=NOW - 60 + limit), "t_rank1")
+        self.assertIn("Report cluster inventory: t_lost: the gate could not file", (self.d / "INVENTORY.raw.md").read_text())
 
     def test_the_ranking_card_is_filed_with_its_key(self):
         _board(self.board, clusters=_all_done())

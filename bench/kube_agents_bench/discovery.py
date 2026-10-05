@@ -17,8 +17,9 @@
 The sweep card is filed by the ``bootstrap-inventory-scan`` cron job, not by
 the conversation a case drives, so nothing in the transcript names it. What
 it did is on the agent's data volume: the card id in
-``.bootstrap_scan_filed``, the cards its worker filed in the board's
-``kanban_worker_children``, and the Cluster Agent roster under ``profiles/``.
+``.bootstrap_scan_filed``, the cluster cards the gate filed for it (keyed
+``bootstrap-inventory-cluster-*`` and created at or after it), and the
+Cluster Agent roster under ``profiles/``.
 This module reads all three in one ``kubectl exec``, the way
 :mod:`kube_agents_bench.board` reads card statuses.
 
@@ -111,18 +112,17 @@ for name in names:
 
 try:
     conn = sqlite3.connect("file:%s/%s?mode=ro" % (ROOT, BOARD), uri=True, timeout=SQLITE_BUSY_TIMEOUT)
-    row = conn.execute("SELECT id, status FROM tasks WHERE id = ?", (sweep_id,)).fetchone()
+    row = conn.execute("SELECT id, status, created_at FROM tasks WHERE id = ?", (sweep_id,)).fetchone()
     if row is None:
         fail("the sweep card %s named by %s is not on the board" % (sweep_id, MARKER))
     out["sweep"] = {"id": row[0], "status": row[1]}
-    # The board creates kanban_worker_children when a worker first files a card.
-    rows = []
-    if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'kanban_worker_children'").fetchone():
-        rows = conn.execute(
-            "SELECT t.id, t.assignee, t.idempotency_key, t.status FROM kanban_worker_children w "
-            "JOIN tasks t ON t.id = w.child_id WHERE w.creator_id = ? ORDER BY w.created_at, t.id",
-            (sweep_id,),
-        ).fetchall()
+    # The gate files the cluster cards, so they are found by key and time, not
+    # by which worker created them.
+    rows = conn.execute(
+        "SELECT id, assignee, idempotency_key, status FROM tasks WHERE substr(idempotency_key, 1, ?) = ? "
+        "AND created_at >= ? ORDER BY created_at, id",
+        (len(PREFIX), PREFIX, row[2]),
+    ).fetchall()
     for tid, assignee, key, status in rows:
         parents = [p for (p,) in conn.execute("SELECT parent_id FROM task_links WHERE child_id = ?", (tid,))]
         out["children"].append(

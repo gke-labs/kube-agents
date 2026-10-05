@@ -37,7 +37,7 @@ The shipped path is four stages, described in full by the
 [`bootstrap_onboarding` README](../../agents/chat/defaults/plugins/bootstrap_onboarding/README.md)
 and the site's [ChatOps concepts page](../site/src/content/docs/concepts/chatops.md), which are
 canonical for it. In outline: `bootstrap_scan_gate.py` files a kanban card to `platform`; that
-worker follows `inventory.md` and fans the audit out to the Cluster Agents; once their cards settle,
+worker follows `inventory.md` and lists the fleet, while the gate files one audit card per Cluster Agent; once their cards settle,
 `bootstrap_handoff.py` writes the complete findings to `/opt/data/INVENTORY.raw.md`; a
 second card follows `inventory_prioritize_sop.md`, collapsing duplicates and ranking everything
 before rendering at most five items to `/opt/data/INVENTORY.md`; `bootstrap_delivery.py` posts that
