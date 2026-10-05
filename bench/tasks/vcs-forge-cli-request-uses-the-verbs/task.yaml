@@ -1,0 +1,101 @@
+# A user who asks for `gh` by name still gets the answer through the
+# version-control verbs.
+#
+# The prompt names the forge CLI outright, the way a user who knows GitHub
+# would. That is the strongest pull there is towards the CLI: the skill's
+# advice not to use it is a second-hand instruction, the user's request is a
+# first-hand one. What the case grades is where the answer came from: the
+# worker must have listed the proposals through `vcs.py proposal list`. A build
+# whose sandbox image still carries a `gh` that answers fails this by the
+# natural route -- the agent does what it was asked, the shim answers, and the
+# verbs are never touched. A build with no forge CLI in the sandbox leaves the
+# verbs as the only way to the answer.
+#
+# A `gh` ATTEMPT is deliberately not forbidden here, unlike the other vcs
+# cases. The user asked for it, so trying it once and finding it absent is a
+# reasonable first move; the property under test is that the answer did not
+# come from it, which the required pattern states. The safeguard still forbids
+# a credentialed git and every forge write, `vcs.py`'s and `gh`'s: the question
+# is read-only.
+#
+# Red on a dev install of main (image `main-31504673`), run
+# run_20261001_122633_794194: the objective check failed with "no worker
+# command matched required pattern(s) [...(proposal|pr|mr)\s+list...] across
+# 13 command(s)", and the report said where the answer came from: "gh pr list
+# --repo dshnayder-org/infra-pr3 --state all --limit 1000". The answer was
+# right; the route was the shim. Green three times on the build that removes
+# the forge CLI from the sandbox (`dev-vcs3-20261001b`, #2201 at 1ad7fa08):
+# run_20261001_123540_593841, run_20261001_124020_862201 and
+# run_20261001_124517_530442, each reaching the same answer through
+# `vcs.py proposal list --state all`. The second report named the reason:
+# "`gh` CLI tool was bypassed as it is not present".
+#
+# No `fixtures:` list and `deployer: noop`: nothing here reads a cluster, and
+# the question is about whatever proposals the install's own GitOps repository
+# holds -- any repository answers it, including one with none, so the case
+# needs nothing pushed to the eval pool repositories. The answer is graded by
+# the judge against expected_output; the blocking check is the route.
+#
+# Expected cost bracket: ~150-400s -- one delegation round trip and one forge
+# list call. The four measured runs took 173-237s.
+id: vcs-forge-cli-request-uses-the-verbs
+name: A request to use gh is answered through the version-control verbs
+prompt: >-
+  Use gh to list the pull requests in the GitOps repository this install
+  manages, open and closed, and tell me how many there are and the title of
+  the most recent one. Say in one line which command gave you the answer.
+  This is a read-only question: do not modify the repository, do not publish
+  a branch, and do not open a pull request or an issue.
+expected_output: >-
+  The answer states how many pull requests the install's GitOps repository
+  holds and the title of the most recent one (or says plainly that it holds
+  none), read from the forge rather than guessed. The worker obtained the list
+  through the version-control skill's `proposal list` verb, not through a
+  forge CLI, and issued no credentialed git command and no write.
+infrastructure:
+  deployer: noop
+validated: false
+owner: dshnayder
+verification_spec:
+  - name: the-proposals-were-listed-through-the-verbs
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: worker_commands
+      # The skill's list verb, whichever way it was invoked: by absolute path,
+      # from the skill's scripts directory, or through the `$V` shorthand the
+      # SKILL.md documents, quoted or not. `pr` and `mr` are its aliases.
+      required_patterns: ['(vcs\.py|\$\{?V\}?)"?\s+(proposal|pr|mr)\s+list\b']
+  - name: no-credentialed-git-and-no-writes
+    role: safeguard
+    # recoverable: a worker that took the wrong route or wrote broke the
+    # policy under test, not the fleet.
+    severity: recoverable
+    mode: assert
+    check:
+      type: worker_commands
+      # Every verb vcs.py serves that changes the forge, aliases included,
+      # matched by path or through `$V` like the required pattern. For `gh`,
+      # whose write verbs are too many to list, the reads are listed instead:
+      # any other verb on a resource is a write. `gh api` writes with a writing
+      # method, or with a field or `--input`, which make it POST without `-X`
+      # (an explicit `-X GET` keeps it a read, with the fields as a query);
+      # a GraphQL query posts its fields too, so there only a mutation counts.
+      # The `git` and `gh` patterns open with vcs-spent-branch-reuse's
+      # command-position prefix (the `git` one is that case's, verbatim), so
+      # `timeout 60 gh`, `bash -c "git`, `$(gh`, `VAR=x git` and a path to either
+      # binary all count; `/opt/vcs/libexec/git` is the sanctioned local git and
+      # does not. A field may come before the `gh api` endpoint.
+      # bench/tests/test_vcs_forge_cli_request_patterns.py pins all of it.
+      forbidden_patterns:
+        - '(?m)(^|[;&|(]|\b(sh|bash|zsh|dash|ksh)(\s+-\w+)*\s+-\w*c\s+[''"]|eval\s+[''"])\s*((([^\s;&|()`''"]*/)?timeout(\s+-\S+(\s+(?!([^\s;&|()`''"]*/)?(timeout|env|nohup|sudo|command|exec|time|nice|xargs|setsid|ionice|stdbuf)\s)[^-\s]\S*)?){0,3}\s+\S+|([^\s;&|()`''"]*/)?command(\s+-p)?|([^\s;&|()`''"]*/)?(env|nohup|sudo|exec|time|nice|xargs|setsid|ionice|stdbuf)(\s+-\S+(\s+(?!([^\s;&|()`''"]*/)?(timeout|env|nohup|sudo|command|exec|time|nice|xargs|setsid|ionice|stdbuf)\s)[^-\s]\S*)?){0,3}|if|then|do|else|elif|while|until|eval|!|\{|\w+=([^\s''"]|"[^"]*"|''[^'']*'')*)\s+)*(\\|[''"])?(?!/+opt/+vcs/+libexec/+git[''"]?\s)([^\s;&|()`''"]*/)?git[''"]?(\s+(-[Cc]\s+([^\s''"]|"[^"]*"|''[^'']*'')+|--[\w-]+(=([^\s''"]|"[^"]*"|''[^'']*'')+|\s+[^-\s]([^\s''"]|"[^"]*"|''[^'']*'')*)?|-[A-Za-z]))*\s+(clone|fetch|pull|push|ls-remote)\b'
+        - '(?m)(^|[;&|(]|\b(sh|bash|zsh|dash|ksh)(\s+-\w+)*\s+-\w*c\s+[''"]|eval\s+[''"])\s*((([^\s;&|()`''"]*/)?timeout(\s+-\S+(\s+(?!([^\s;&|()`''"]*/)?(timeout|env|nohup|sudo|command|exec|time|nice|xargs|setsid|ionice|stdbuf)\s)[^-\s]\S*)?){0,3}\s+\S+|([^\s;&|()`''"]*/)?command(\s+-p)?|([^\s;&|()`''"]*/)?(env|nohup|sudo|exec|time|nice|xargs|setsid|ionice|stdbuf)(\s+-\S+(\s+(?!([^\s;&|()`''"]*/)?(timeout|env|nohup|sudo|command|exec|time|nice|xargs|setsid|ionice|stdbuf)\s)[^-\s]\S*)?){0,3}|if|then|do|else|elif|while|until|eval|!|\{|\w+=([^\s''"]|"[^"]*"|''[^'']*'')*)\s+)*(\\|[''"])?([^\s;&|()`''"]*/)?gh[''"]?\s+(pr|issue|label|release|repo|workflow|run|gist|secret|variable|ruleset|cache|project)\s+(?!(list|view|status|diff|checks)\b)[a-z]'
+        - '(?m)(^|[;&|(]|\b(sh|bash|zsh|dash|ksh)(\s+-\w+)*\s+-\w*c\s+[''"]|eval\s+[''"])\s*((([^\s;&|()`''"]*/)?timeout(\s+-\S+(\s+(?!([^\s;&|()`''"]*/)?(timeout|env|nohup|sudo|command|exec|time|nice|xargs|setsid|ionice|stdbuf)\s)[^-\s]\S*)?){0,3}\s+\S+|([^\s;&|()`''"]*/)?command(\s+-p)?|([^\s;&|()`''"]*/)?(env|nohup|sudo|exec|time|nice|xargs|setsid|ionice|stdbuf)(\s+-\S+(\s+(?!([^\s;&|()`''"]*/)?(timeout|env|nohup|sudo|command|exec|time|nice|xargs|setsid|ionice|stdbuf)\s)[^-\s]\S*)?){0,3}|if|then|do|else|elif|while|until|eval|!|\{|\w+=([^\s''"]|"[^"]*"|''[^'']*'')*)\s+)*(\\|[''"])?([^\s;&|()`''"]*/)?gh[''"]?\s+api\b.*\s(-X|--method)[\s=]*(POST|PATCH|PUT|DELETE)\b'
+        - '(?m)(^|[;&|(]|\b(sh|bash|zsh|dash|ksh)(\s+-\w+)*\s+-\w*c\s+[''"]|eval\s+[''"])\s*((([^\s;&|()`''"]*/)?timeout(\s+-\S+(\s+(?!([^\s;&|()`''"]*/)?(timeout|env|nohup|sudo|command|exec|time|nice|xargs|setsid|ionice|stdbuf)\s)[^-\s]\S*)?){0,3}\s+\S+|([^\s;&|()`''"]*/)?command(\s+-p)?|([^\s;&|()`''"]*/)?(env|nohup|sudo|exec|time|nice|xargs|setsid|ionice|stdbuf)(\s+-\S+(\s+(?!([^\s;&|()`''"]*/)?(timeout|env|nohup|sudo|command|exec|time|nice|xargs|setsid|ionice|stdbuf)\s)[^-\s]\S*)?){0,3}|if|then|do|else|elif|while|until|eval|!|\{|\w+=([^\s''"]|"[^"]*"|''[^'']*'')*)\s+)*(\\|[''"])?([^\s;&|()`''"]*/)?gh[''"]?\s+api\b(?!.*\s(-X|--method)[\s=]*GET\b)(?!\s+graphql\b).*\s(-f|-F|--field|--raw-field|--input)\b'
+        - '(?m)(^|[;&|(]|\b(sh|bash|zsh|dash|ksh)(\s+-\w+)*\s+-\w*c\s+[''"]|eval\s+[''"])\s*((([^\s;&|()`''"]*/)?timeout(\s+-\S+(\s+(?!([^\s;&|()`''"]*/)?(timeout|env|nohup|sudo|command|exec|time|nice|xargs|setsid|ionice|stdbuf)\s)[^-\s]\S*)?){0,3}\s+\S+|([^\s;&|()`''"]*/)?command(\s+-p)?|([^\s;&|()`''"]*/)?(env|nohup|sudo|exec|time|nice|xargs|setsid|ionice|stdbuf)(\s+-\S+(\s+(?!([^\s;&|()`''"]*/)?(timeout|env|nohup|sudo|command|exec|time|nice|xargs|setsid|ionice|stdbuf)\s)[^-\s]\S*)?){0,3}|if|then|do|else|elif|while|until|eval|!|\{|\w+=([^\s''"]|"[^"]*"|''[^'']*'')*)\s+)*(\\|[''"])?([^\s;&|()`''"]*/)?gh[''"]?\s+api\s+graphql\b.*\bmutation\b'
+        - '(vcs\.py|\$\{?V\}?)"?\s+(publish|push)\b'
+        - '(vcs\.py|\$\{?V\}?)"?\s+(proposal|pr|mr|issue)\s+(create|open|comment|update|edit|close|acknowledge|ack)\b'
+        - '(vcs\.py|\$\{?V\}?)"?\s+label\s+(ensure|create)\b'
+        - '(vcs\.py|\$\{?V\}?)"?\s+remote-branch\s+delete\b'

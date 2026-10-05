@@ -1930,8 +1930,8 @@ class WatchedPeriodics(RunHarness):
         self.assertTrue(text.startswith("🟠 *Eval GitOps repos: leftover pull requests from eval runs are not being cleaned up.*\n`ci-kube-agents-pull-sweep` runs every ten minutes and closes the pull requests the agent opened during eval runs"), text)
         self.assertIn("Its 9:40 AM ET run (build 100) failed: failed in 11 of 11 project(s).", text)
         self.assertIn("- 3 write(s) left for the next run (the run's write budget)", text)
-        self.assertIn("Effect: pull requests pile up in those repos, and eval cases that open one can link an old one and fail. CI eval infrastructure only.", text)
-        self.assertIn("#55-the-pull-request-sweep", text)
+        self.assertIn("Effect: pull requests a run left behind stay open until the project's next lease, whose reset closes them. CI eval infrastructure only.", text)
+        self.assertIn("#55-the-repository-reset-and-the-sweep-behind-it", text)
         clean = health("GREEN")
         clean["periodics"], clean["periodics_read"] = {}, [sweep]
         clean["periodics_runs"] = {sweep: {"build": "101", "finished_at": "2026-09-14T13:50:00+00:00", "passed": True, "summary": "closed 241 pull request(s) across 12 project(s)"}}

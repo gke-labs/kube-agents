@@ -495,7 +495,8 @@ class TestSandboxRouting(unittest.TestCase):
         self.assertEqual(captured["argv"][0], "ssh")
         target = [a for a in captured["argv"] if "@" in a]
         self.assertEqual(len(target), 1)
-        # Not terminal.ssh_user: that account's ~/.bashrc is the model's, and
+        # Not terminal.ssh_user: on older sandbox images that account's
+        # ~/.bashrc is the model's, and
         # bash sources it for a non-interactive `ssh host cmd`.
         self.assertTrue(target[0].startswith("hermes@"))
         self.assertNotIn("agent@", " ".join(captured["argv"]))

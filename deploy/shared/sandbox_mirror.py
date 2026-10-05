@@ -375,8 +375,9 @@ SERVER_ALIVE_COUNT_MAX = 3
 
 # The ceiling on any single ssh call, and the reason it exists is the far side
 # rather than the network. sshd runs the login shell for a non-interactive
-# command too, so it sources ~/.bashrc -- a file the sandbox image deliberately
-# leaves writable by the model. A `sleep infinity` at the top of it makes every
+# command too, so it sources ~/.bashrc -- a file the model could write in
+# sandbox images built before /home/agent was made root-owned, which an install
+# can still pin. A `sleep infinity` at the top of it makes every
 # call here hang forever, and this script runs in the gateway's entrypoint
 # before `exec "$@"`, so the hang is the whole agent, permanently, across
 # restarts. Neither ConnectTimeout nor the keepalives above cover it: the
@@ -561,8 +562,9 @@ def remote(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            # Not strict UTF-8. The far side's shell startup files are writable
-            # by the model, so one non-UTF-8 byte echoed from ~/.bashrc would
+            # Not strict UTF-8. On older sandbox images the far side's shell
+            # startup files are writable by the model, so one non-UTF-8 byte
+            # echoed from ~/.bashrc would
             # otherwise raise UnicodeDecodeError out of the decode and take the
             # whole mirror down on every start.
             errors="replace",

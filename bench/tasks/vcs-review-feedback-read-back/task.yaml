@@ -86,9 +86,9 @@
 # out from the forge that it landed.
 #
 # WHAT IT LEAVES BEHIND: one open pull request per run on the GitOps
-# repository, permanently -- the same unbounded accumulation
-# rca-remediation-pr accepts, and for the same reason: nothing closes a pull
-# request opened through submit-suggestion. Every run writes the same path on
+# repository, until the job's reset (hack/ci_reset_agent_pulls.py, #2260)
+# closes it before the next repetition of a case that requests one, or the
+# next lease -- submit-suggestion itself closes nothing. Every run writes the same path on
 # its own branch, which never merges, so the runs do not collide. The case
 # asserts on its own run's output rather than on repository state, so the pile
 # does not make it flake.
@@ -146,14 +146,14 @@ verification_spec:
     mode: assert
     check:
       type: worker_commands
-      # A command word, not a substring: `/opt/vcs/libexec/git` is the
-      # sanctioned local git and must not trip this; a bare `git clone` or any
-      # `gh` at the start of a command or after a shell join must.
+      # A command word, not a substring: `git log` on the working copy is the
+      # sanctioned local git and must not trip this; a `git clone` or any `gh`
+      # at the start of a command or after a shell join must.
       forbidden_patterns:
         - '(^|&&|;|\|)\s*gh\s'
         - '(^|&&|;|\|)\s*git\s+(clone|fetch|pull|push|ls-remote)\b'
-  # The commit step runs `/opt/vcs/libexec/git` and `submit_suggestion.py` by
-  # path. A worker runs as `hermes chat -q`, where the command scanner refuses
+  # The commit step runs `git` and `submit_suggestion.py` as the programs
+  # themselves. A worker runs as `hermes chat -q`, where the command scanner refuses
   # a command whose program is a shell variable (`$G add`, `"$S" prepare`) and
   # the refusal is final; a skill that teaches the variable form costs every
   # pull-request-opening worker its first attempts at the step.
@@ -184,7 +184,8 @@ verification_spec:
       # `[[ -n "$A" && ! "$N" -gt 0 ]]` is not read as a program.
       # The second is the assignment, which is how a multi-line call's
       # `G=...` then `$G add` shows up once its lines are joined; capturing
-      # git's output, `SHA=$(/opt/vcs/libexec/git rev-parse HEAD)`, is not one.
+      # git's output, `SHA=$(git rev-parse HEAD)`, is not one. The value is
+      # `git` by name or by any path, or `submit_suggestion.py` by any path.
       # Not seen: a variable command that is neither the chain's first shown
       # command nor in the same call as its assignment, since the summary
       # drops a chain's later commands, a loop's body among them, and its
@@ -203,7 +204,7 @@ verification_spec:
       # the same unlisted wrappers and wrapper arguments.
       forbidden_patterns:
         - '((^|[;&|]|\$\()\s*((if|then|else|elif|do|while|until|time|xargs|exec|env|nohup|command)\s+(-\S+\s+)*|!\s+)*|\s(if|then|else|elif|do|while|until|time)\s+(-\S+\s+)*((if|then|else|elif|do|while|until|time|xargs|exec|env|nohup|command)\s+(-\S+\s+)*|!\s+)*)"?\$\{?[A-Za-z_]\w*\}?"?\s+(-{1,2}(?!(eq|ne|gt|ge|lt|le|nt|ot|ef)\b)[A-Za-z]|(add|am|apply|bisect|blame|branch|cat-file|checkout|cherry-pick|clean|clone|commit|config|describe|diff|diff-tree|fetch|for-each-ref|format-patch|gc|grep|init|log|ls-files|ls-remote|ls-tree|merge|merge-base|mv|notes|pull|push|rebase|reflog|remote|reset|restore|rev-list|rev-parse|revert|rm|show|show-ref|stash|status|submodule|switch|symbolic-ref|tag|update-ref|worktree|prepare|submit)\b)'
-        - '(^|[\s;&|(])[A-Za-z_]\w*=(?!"?(\$\(|`)/opt/vcs/libexec/git[\s)`])\S*(/opt/vcs/libexec/git|submit_suggestion\.py)\b'
+        - '(^|[\s;&|(])[A-Za-z_]\w*=(?!"?(\$\(|`))"?(\S*/)?(git|submit_suggestion\.py)(?![\w.-])'
   - name: the-pull-request-is-real-and-this-runs
     role: objective
     mode: assert

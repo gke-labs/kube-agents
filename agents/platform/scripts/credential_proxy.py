@@ -3440,6 +3440,15 @@ def forge_registry() -> providers.Registry:
         return _forge_registry
 
 
+# What `/v1/exec` runs for the sandbox, enforced here because the client is
+# only a convenience: anything holding the sandbox's token can post its own
+# argv. Neither `git` nor any forge CLI is on it: a repository and a forge are
+# reached through the verbs, which run them on the broker's own behalf. `git`
+# here would run under the broker's credential helper, and a read such as
+# `ls-remote` is no write for a lease to fence.
+EXEC_ROUTE_EXECUTABLES = ("gcloud", "kubectl")
+
+
 def broker_executables() -> tuple[str, ...]:
     """What the credentialed process may run at all.
 
@@ -3450,13 +3459,14 @@ def broker_executables() -> tuple[str, ...]:
     read as one decision and was two.
 
     `gcloud` and `kubectl` are on both: the agent names them and this process
-    runs them. `git` is on both for now -- the broker issues it on its own
-    behalf for the verbs, and the sandbox shim still forwards it for the
-    shipped callers, whose move onto the verbs is what retires the forwarding
-    (see deploy/sandbox/Dockerfile). What this list decides on its own is the
-    forge CLI: one is here only if some forge this install built declares one,
-    so an install whose forges all speak HTTP grants no forge binary rather
-    than inheriting the union of every binary any forge could want.
+    runs them. `git` and any forge CLI are here for the broker's own use -- it
+    issues them on its own behalf for the verbs. `/v1/exec` refuses both
+    (`EXEC_ROUTE_EXECUTABLES`), so a sandbox caller that composes its own
+    request reaches neither. What this list
+    decides on its own is the forge CLI: one is here only if some forge this
+    install built declares one, so an install whose forges all speak HTTP
+    grants no forge binary rather than inheriting the union of every binary
+    any forge could want.
     """
     return ("gcloud", "kubectl", "git", *providers.Registry().executables)
 
@@ -6006,7 +6016,15 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             _sanitize_for_logging(argv[0]),
             extra=audit(AUDIT_STATUS_STARTED),
         )
-        if argv[0] not in CommandExecutor.ALLOWED_EXECUTABLES:
+        # Decided once, before any gate: every outcome below is counted under
+        # the same two labels. An executable outside the image's allowlist is
+        # counted as `other`; one the image has but this route refuses (git)
+        # is counted under its own name.
+        tool_label, subcommand_label = _tool_labels(argv)
+        if (
+            argv[0] not in CommandExecutor.ALLOWED_EXECUTABLES
+            or argv[0] not in EXEC_ROUTE_EXECUTABLES
+        ):
             LOGGER.warning(
                 "executable blocked request_id=%s executable=%s",
                 request_id,

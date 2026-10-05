@@ -454,7 +454,10 @@ if [ ! -r "$AUTHORIZED_KEYS_SRC" ]; then
   log "Mount the sandbox key secret there, or set SANDBOX_AUTHORIZED_KEYS."
   exit 1
 fi
-install -m 0600 -o agent -g agent "$AUTHORIZED_KEYS_SRC" /home/agent/.ssh/authorized_keys
+# Root-owned, like the home and the .ssh above it (deploy/sandbox/Dockerfile):
+# a file the agent owns is one the model can add a key of its own to. 0644
+# because sshd reads it as the user it is authenticating.
+install -m 0644 -o root -g root "$AUTHORIZED_KEYS_SRC" /home/agent/.ssh/authorized_keys
 # The same key also authorises `hermes`, the principal trusted agent-pod code
 # connects as instead of `agent`. The Dockerfile comment on that account says
 # why the two cannot be the same login. Nothing else here needs changing: the
@@ -546,12 +549,12 @@ done
 #    gitops_workspace.agent_home() reads PLATFORM_AGENT_HOME to decide where a
 #    leased clone goes. sshd starts sessions with neither.
 SANDBOX_SSHD_DROPIN=/etc/ssh/sshd_config.d/10-sandbox-env.conf
-SANDBOX_PATH=/opt/credential-proxy/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
-# /opt/vcs/libexec is deliberately not on this list. The image carries a second,
-# credential-free git there for the version-control skill, and the skill reaches
-# it by absolute path; putting its directory ahead of the shim would take the
-# name `git` from every caller that means the shim, so that PATH edit travels
-# with those callers. deploy/sandbox/Dockerfile has the argument.
+SANDBOX_PATH=/opt/vcs/bin:/opt/credential-proxy/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+# /opt/vcs/bin holds the only `git` in the sandbox, the credential-free wrapper
+# (deploy/sandbox/vcs-git.sh); /opt/credential-proxy/bin holds gcloud and
+# kubectl and nothing named git or gh, so the order between the two decides
+# nothing. Login shells get the same prepend from /etc/profile.d/vcs-path.sh,
+# because /etc/profile overwrites this PATH before profile.d runs.
 setenv_args="PATH=\"$SANDBOX_PATH\" HERMES_HOME=\"$DATA\" PLATFORM_AGENT_HOME=\"$DATA\""
 # CREDENTIAL_PROXY_TOKEN_FILE is a path, not a token: the file it names is a
 # projected volume, and forwarding the name is what lets the client read it. It
@@ -591,9 +594,9 @@ if ! sshd -t; then
   exit 1
 fi
 if [ -z "${CREDENTIAL_PROXY_URL:-}" ]; then
-  log "CREDENTIAL_PROXY_URL is unset — kubectl, gcloud, gh and git will report"
-  log "that they are not configured. Expected until #737 Part C makes the"
-  log "credential proxy reachable from outside the agent pod."
+  log "CREDENTIAL_PROXY_URL is unset — kubectl and gcloud will report that"
+  log "they are not configured, and the version-control verbs cannot reach the"
+  log "broker."
 fi
 
 log "ready; starting $*"

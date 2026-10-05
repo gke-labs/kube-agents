@@ -225,6 +225,7 @@ def verb_proposal_list(arguments) -> dict:
             "page": arguments.page,
             "source": arguments.source,
             "target": arguments.target,
+            "labels": arguments.labels or None,
         },
     )
 
@@ -507,6 +508,7 @@ def build_parser() -> argparse.ArgumentParser:
     plist.add_argument("--state", default="open", choices=["open", "closed", "all"])
     plist.add_argument("--source", help="only proposals from this branch")
     plist.add_argument("--target", help="only proposals onto this branch")
+    plist.add_argument("--labels", nargs="*", help="only proposals carrying all of these")
     plist.add_argument("-n", "--limit", type=int)
     plist.add_argument("--page", type=int, help="the next page, when the last answer said truncated")
     repo_option(plist).set_defaults(run=verb_proposal_list)

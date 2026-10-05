@@ -6,7 +6,9 @@ leased project's mapping, materialises every task in the matrix as
 entries appended, and `unit_task_path` hands devops-bench that copy; on any
 other transport the step exports nothing, copies nothing and the helper is
 the identity, so the api lane's matrix and task files are byte for byte what
-they were. The step is lifted out of the shipped script and run under bash
+they were -- it only reads the same file for which cases request a pull
+request, since #2260 runs those in the second phase on both lanes for the
+repository reset's sake. The step is lifted out of the shipped script and run under bash
 over the real files, with `uv run python -m kube_agents_bench.lane` answered
 by the real module under python3, so the assertions are against the code
 that ships rather than a copy of it.
@@ -60,8 +62,16 @@ def lifted_block(pattern: str) -> str:
 
 
 def constants() -> str:
-    return lifted_block(r"^readonly EVAL_INJECT_LANE_SAFEGUARDS_FILE=[^\n]*\n") + lifted_block(
-        r"^readonly EVAL_INJECT_TRANSPORT=[^\n]*\n"
+    # The two pacing constants as well: the step picks the writer phase's
+    # launch pause from them per lane (WRITER_LAUNCH_PAUSE).
+    return "".join(
+        lifted_block(pattern)
+        for pattern in (
+            r"^readonly EVAL_INJECT_LANE_SAFEGUARDS_FILE=[^\n]*\n",
+            r"^readonly EVAL_INJECT_TRANSPORT=[^\n]*\n",
+            r"^readonly EVAL_UNIT_LAUNCH_STAGGER_SECONDS=[^\n]*\n",
+            r"^readonly EVAL_GITHUB_WRITE_SETTLE_SECONDS=[^\n]*\n",
+        )
     )
 
 
@@ -102,6 +112,7 @@ def run_step(env: dict | None = None, tasks: list[str] | None = None, lane_file:
             'echo "REPO=${BENCH_GITOPS_REPO-<unset>}"',
             'echo "REQUESTING=${INJECT_LANE_REQUESTING-<unset>}"',
             'echo "DIR=${INJECT_LANE_TASKS_DIR-<unset>}"',
+            'echo "PAUSE=${WRITER_LAUNCH_PAUSE-<unset>}"',
             'for t in "${TASKS[@]}"; do n="$(basename "$(dirname "${t}")")"; echo "PATH ${n} $(unit_task_path "${t}" "${n}")"; done',
         ]
     )
@@ -137,25 +148,34 @@ def spec_names(task_yaml: pathlib.Path) -> list[str]:
 
 
 class ApiLaneUntouchedTest(unittest.TestCase):
+    """The api lane's task files and matrix are what they were; what it
+    shares with the inject lane since #2260 is the second phase, so it reads
+    the lane file for the requesting list and nothing else."""
+
     def test_no_export_no_copy_and_the_helper_is_the_identity(self):
         for env in ({}, {"AGENT_TRANSPORT": "api"}):
             with self.subTest(env=env):
                 result = run_step(env)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(value(result, "REPO"), "<unset>")
-                self.assertEqual(value(result, "REQUESTING"), "")
+                self.assertEqual(value(result, "REQUESTING"), requesting_among(presubmit_tasks()))
                 self.assertEqual(value(result, "DIR"), "")
                 for line in tagged(result, "PATH"):
                     name, path = line.split(" ", 1)
                     self.assertEqual(path, f"./tasks/{name}/task.yaml")
                 self.assertNotIn("carries the lane's safeguards", result.stdout)
-                self.assertNotIn(str(LANE_FILE), result.stdout)
+                self.assertIn("each after the repository is reset", result.stdout)
+                # The writer phase on this lane grades no window, so its units
+                # keep the launch stagger, not the inject lane's settle.
+                self.assertEqual(value(result, "PAUSE"), "5")
+                self.assertEqual(value(result, "PAUSE"), lifted_block(r"^readonly EVAL_UNIT_LAUNCH_STAGGER_SECONDS=(\d+)\n").split("=")[1].strip())
 
-    def test_the_lane_file_is_not_read_on_the_api_lane(self):
-        # A missing file is fine where the step does not run, which is what
-        # "the api lane is untouched" has to mean for the file too.
+    def test_a_lane_file_that_cannot_be_read_stops_the_api_lane_too(self):
+        # The requesting list is what orders the second phase, and the reset
+        # before a writer unit is only safe inside it: no list, no run.
         result = run_step({"AGENT_TRANSPORT": "api"}, lane_file=pathlib.Path("/nonexistent/lane.yaml"))
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not read which cases request a pull request", result.stderr)
 
 
 class InjectLaneTest(unittest.TestCase):
@@ -163,6 +183,8 @@ class InjectLaneTest(unittest.TestCase):
         result = run_step({"AGENT_TRANSPORT": "inject", "EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(value(result, "REPO"), "gke-agentic/kube-agents-evals-21-infra")
+        # This lane's writer units wait the safeguard's settle, not the stagger.
+        self.assertEqual(value(result, "PAUSE"), "120")
         scratch = pathlib.Path(value(result, "DIR"))
         self.assertTrue(scratch.is_dir())
         paths = dict(line.split(" ", 1) for line in tagged(result, "PATH"))
@@ -306,7 +328,7 @@ class TwoPhaseFanOutTest(unittest.TestCase):
         others_ended = [i for i, line in enumerate(lines) if line.startswith("END ") and not line.startswith(("END w", "END v"))]
         self.assertEqual(len(others_ended), 4)
         self.assertLess(max(others_ended), first_writer)
-        self.assertTrue(any("every other unit is done; launching the 4 unit(s)" in line and "one at a time, each after a 1s settle" in line for line in lines))
+        self.assertTrue(any("every other unit is done; launching the 4 unit(s)" in line and "one at a time, each after a 1s pause" in line for line in lines))
         # The second phase is serial: every writer unit ends before the next
         # starts, whichever case it belongs to.
         writer_lines = [lines[i] for i in writers]
@@ -360,11 +382,11 @@ class WiringTest(unittest.TestCase):
         self.assertIn("python -m kube_agents_bench.github_writes", report)
         self.assertIn('--since "${EVAL_RUN_STARTED_AT}"', report)
         self.assertIn('mint_ledger_token "leftovers"', report)
-        # Named, not implied: the job closes nothing.
+        # Named, not implied: the listing closes nothing.
         self.assertIn("closes none of them", report)
         call = src.index("\nreport_github_leftovers\n")
         # After both phases of the fan-out have been waited for.
-        self.assertLess(src.index('launch_units "${UNIT_QUEUE_WRITERS}" 1 "${EVAL_GITHUB_WRITE_SETTLE_SECONDS}"\n  wait\nfi\n'), call)
+        self.assertLess(src.index('launch_units "${UNIT_QUEUE_WRITERS}" 1 "${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}"\n  wait\nfi\n'), call)
         self.assertLess(call, src.index("# ─── Per-case verdicts"))
         self.assertLess(src.index("EVAL_RUN_STARTED_AT=\"$(date"), src.index("# 2. Cluster Auth"))
 

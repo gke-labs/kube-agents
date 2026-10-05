@@ -1805,10 +1805,9 @@ if [ -n "$BOOTSTRAP_LOCK_FD" ]; then
 fi
 
 # 4.5 The scratch directory scripts stage files in — the fleet audit's findings
-# JSON, and the `gh --body-file` payloads github_scan_gate._post_body hands to
-# the credential sidecar. The audit's own bodies no longer come through here:
-# they travel on stdin (audit_report.BODY_STDIN), which is where the remaining
-# body-file caller should end up too.
+# JSON. Nothing posted to a forge comes through here any more: the audit and
+# github_scan_gate._post_body both hand their text to a verb as a field, which
+# crosses to the credential sidecar on stdin.
 # Created HERE, deterministically and under this script's umask-0002 discipline
 # (the header comment on the #955 UID split), rather than lazily by whichever
 # process reaches it first with whatever umask it happens to carry: the sandbox

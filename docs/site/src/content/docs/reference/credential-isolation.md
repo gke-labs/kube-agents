@@ -47,7 +47,7 @@ flowchart TB
 
 The credential runtime also opens one TCP listener of its own, on port 8766: metrics only, serving the broker's Prometheus counters ([Concepts → Observability](/kube-agents/concepts/observability/)), holding no route, credential or policy, and answering at most sixteen connections at a time with a ten-second deadline on each, so a peer that reaches the port cannot exhaust the process that holds the credentials. The broker's NetworkPolicy admits the sandbox and the gateway on 8765 and pods in the `gke-gmp-system` namespace, where the managed-Prometheus collector runs, on 8766, and nothing else on either.
 
-The sandbox image contains only **wrapper binaries** for `gcloud`, `kubectl`, `gh`, and `git`. A wrapper sends the executable name and argument array to Envoy at the broker Service; the credential runtime executes the corresponding real CLI and returns output and exit status. It never evaluates an agent-supplied shell command, and the runtime's Unix socket is mounted only in the broker Pod, so the sandbox cannot bypass Envoy. The real credential-aware CLIs ship in a separate `credential-proxy` image that neither the gateway nor the sandbox runs.
+The sandbox image contains **wrapper binaries** only for `gcloud` and `kubectl`. Forge access (issues, pull requests, publishing revisions) goes through the version-control broker's verbs, and the sandbox's `git` is a local hardened binary with no credential and no network transport. A wrapper sends the executable name and argument array to Envoy at the broker Service; the credential runtime executes the corresponding real CLI and returns output and exit status. It never evaluates an agent-supplied shell command, and the runtime's Unix socket is mounted only in the broker Pod, so the sandbox cannot bypass Envoy. The real credential-aware CLIs ship in a separate `credential-proxy` image that neither the gateway nor the sandbox runs.
 
 **The broker authenticates every caller.** A projected ServiceAccount token, one hour long, with an audience chosen per pod (`kubeagents-credential-proxy` for the sandbox, `kubeagents-credential-proxy-chat` for the gateway), presented as a bearer header and verified with a Kubernetes `TokenReview`; the audience is what tells the broker which caller it is serving. Every path on the credentialed listener except `/healthz` requires it, and an unidentified caller gets an undifferentiated `401`; the metrics-only listener on 8766 is unauthenticated, like `/healthz`, because its scraper, the managed-Prometheus collector, holds no caller token and the broker's NetworkPolicy is what bounds who reaches the port; it serves counters with static labels and holds no route, credential or policy. `CREDENTIAL_PROXY_ALLOWED_CALLERS` names the two ServiceAccounts served: the sandbox's, where credentialed commands originate, and the gateway's, because the chat relays use the same listener.
 
@@ -106,7 +106,7 @@ Pod-wide `automountServiceAccountToken` is `false` everywhere. The broker's own 
 
 ## Request paths
 
-- **CLI commands** — only `gcloud`, `kubectl`, `gh`, and `git` are accepted. The proxy rejects known credential-disclosure, credential-replacement, and self-modification operations, and the GitHub write path (see below); interactive TTY programs, unbounded streaming, sandbox-only file paths, and background processes fail closed.
+- **CLI commands** — the sandbox forwards only `gcloud` and `kubectl`; the broker also runs `git`, and the forge CLI of any configured forge that declares one, on its own behalf for the version-control verbs. The proxy rejects known credential-disclosure, credential-replacement, and self-modification operations, and the GitHub write path (see below); interactive TTY programs, unbounded streaming, sandbox-only file paths, and background processes fail closed.
 - **Cloud API reads** — `GET /v1/gcp/<host>/<path>` relays one Google REST read named in `api_policy.API_READ_ROUTES` (Cloud Monitoring and Managed Prometheus reads today) on the broker's identity, with the caller's headers dropped and the credential-substituting query keys stripped; another host, a write, a sibling path or a token endpoint is refused with a `gcp.api.*` rule. `credential_proxy_client.ApiSession` is the client. See [`designs/gcp-api-relay.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/gcp-api-relay.md).
 - **Chat** — Slack and Google Chat adapters send credential-free payloads to Envoy; the credential runtime owns the platform tokens and performs the external API calls, enforcing user allowlists and payload limits.
 - **PlatformAgent API** — the Service targets port 8643 on `agent-api-auth` in the gateway Pod, which validates the external bearer key and forwards to the agent API on loopback (port 8642) with a non-secret sentinel. The real key never reaches `platform-agent`.
@@ -201,10 +201,10 @@ At that point the allowlist covers DNS (selector peers, the resolved cluster DNS
 
 - DuckDuckGo web search, which `deploy/shared/defaults/config.yaml` turns on for every profile (`web.backend: ddgs`), and the `browser` toolset, which only the Chat Agent disables;
 - the `gke` and `developer_knowledge` MCP servers, which proxy `container.googleapis.com` and `developerknowledge.googleapis.com`;
-- `github.com` reached directly from the sandbox — not the `gh` and `git` wrappers, which go through the broker;
+- `github.com` reached directly from the sandbox — not the version-control verbs, which go through the broker;
 - the metadata lookup in `cluster_agent_reconcile.py`, which is how that script finds the management project (`RECONCILE_PROJECT`, the old override, is pinned empty in the managed `.env`; a project other than the pod's belongs in `spec.scope.projects`). It fails soft after a five-second timeout and falls back to `gcloud config get-value project`, a broker call that is on the allowlist, so the cost is the timeout on each tick, provided the broker's configured project is the pod's own: a fallback answer that differs from the previous run's management project is treated as unresolved rather than as a changed management project.
 
-Credentialed `gcloud`, `kubectl`, `gh` and `git` would be unaffected either way: they are wrappers that call the broker, and the broker is on the list.
+Credentialed `gcloud` and `kubectl`, and the version-control verbs, would be unaffected either way: they call the broker, and the broker is on the list.
 
 None of that would be accidental. A headless browser with unrestricted egress is the exfiltration path, so the capabilities this would remove are the same ones that make the control worth having. Weigh it as a trade rather than a regression, when it arrives.
 
@@ -230,7 +230,7 @@ It is also why this is one policy object and not two. There is no deny rule in N
 
 ## Troubleshooting
 
-**Every CLI in the sandbox reports `credential proxy unavailable`.** The `gcloud`, `kubectl`, `gh`, and `git` commands inside `<name>-shell` are wrappers that forward to the broker Service. When nothing is listening at the other end, all four fail the same way:
+**Every CLI in the sandbox reports `credential proxy unavailable`.** The `gcloud` and `kubectl` commands inside `<name>-shell` are wrappers that forward to the broker Service. When nothing is listening at the other end, both fail the same way:
 
 ```text
 credential proxy unavailable: [Errno 111] Connection refused

@@ -67,7 +67,7 @@ CARD = "t_verify"
 PLAN_TS = "1700000000.000200"
 PHRASE = "is thinking..."
 ASK = "why is <#C1|payments> slow: check /metrics"
-TITLE = "why is #payments slow, check \u2215metrics"
+TITLE = "why is payments slow, check metrics"
 
 
 def _fail(detail: str) -> SystemExit:

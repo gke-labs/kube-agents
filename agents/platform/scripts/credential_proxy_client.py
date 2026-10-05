@@ -25,7 +25,13 @@ from pathlib import Path
 # forges an install configured, so a forge CLI appears there and only there:
 # the broker is where that CLI runs. The overlap is not an invariant and these
 # two lists are not to be folded together.
-SUPPORTED_EXECUTABLES = ("kubectl", "gcloud", "gh", "git")
+#
+# `gh` and `git` are not here. The forge is reached through the version-control
+# verbs, and a forwarded git ran in the broker's filesystem rather than the
+# caller's, so a shim on either name answered a command about a tree the agent
+# had never seen. docs/designs/version-control-support.md, "One git in the
+# sandbox".
+SUPPORTED_EXECUTABLES = ("kubectl", "gcloud")
 
 # How long to wait to reach the broker. Bounds the connect only — see
 # BrokerConnection.
@@ -190,22 +196,17 @@ def authorization_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 # Only these read KUBECONFIG: kubectl to pick a context, gcloud to write one in
-# `container clusters get-credentials`. `git` and `gh` ignore the variable, so
-# resolving it for them buys nothing and costs plenty — an unreadable kubeconfig
-# is a hard failure, which would turn a stray KUBECONFIG into a refused `gh pr
-# create`.
+# `container clusters get-credentials`. Today that is every executable this
+# client runs; it stays a separate list because an unreadable kubeconfig is a
+# hard failure, and a later executable that ignores the variable should not be
+# refused over one.
 KUBECONFIG_AWARE = frozenset({"kubectl", "gcloud"})
 
 # Flags whose value may be `-`, meaning "read the document from stdin". This is
 # the whole list the shipped skills use: kubectl's `-f`/`--filename` and
-# `--patch-file`, and gh's `--body-file`.
-#
-# `gh`'s `-F` short form is deliberately absent, and every caller that used to
-# pass it now spells `--body-file` instead. It is not a synonym: `gh api -F
-# key=value` sets a typed field, so matching it here would forward fd 0 for an
-# API call that never asked for it. When a new call site needs a document from
-# stdin, widen it to the long flag rather than adding the short one.
-STDIN_FILE_FLAGS = frozenset({"-f", "--filename", "--patch-file", "--body-file"})
+# `--patch-file`. When a new call site needs a document from stdin, add its long
+# flag; a short one is too easily a different flag on another CLI.
+STDIN_FILE_FLAGS = frozenset({"-f", "--filename", "--patch-file"})
 
 
 def reads_stdin(argv: list[str]) -> bool:
