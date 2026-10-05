@@ -90,12 +90,10 @@ MARKS_MAX = 256
 ACTION_ID_PREFIX = "kage_failure"
 
 #: What the button is cut from: the reply's last sentence, when it is one
-#: question with no markup. ``[^.!?]`` keeps it one sentence.
-TRAILING_QUESTION = re.compile(r"(?:^|(?<=[.!?])\s+)([^.!?\n]+)\?\s*$")
+#: question with no markup, after a sentence end or on a line of its own.
+#: ``[^.!?]`` keeps it one sentence.
+TRAILING_QUESTION = re.compile(r"(?:^|(?<=[.!?])\s+|\n\s*)([^.!?\n]+)\?\s*$")
 MARKUP = re.compile(r"[*_~`<>\[\]|]")
-#: An inline code span as upstream's ``format_message`` protects one: kept as code
-#: inside a bold lead, with the words around it bolded and the span itself not.
-CODE_SPAN = re.compile(r"`[^`\n]+`")
 #: A question that asks for a word rather than a yes: an open one, by its first
 #: word or a question word anywhere in it ("Can you tell me which cluster?"), a
 #: request for something ("Could you share the namespace?"), or an either/or. Its
@@ -291,43 +289,47 @@ def end(token: Optional[contextvars.Token]) -> None:
 def present(content: str) -> tuple[str, str]:
     """``(content with its first sentence in bold, offer label or "")``.
 
-    A first sentence soft-wrapped onto the next lines is joined onto one line
-    and bolded whole, as ``slack_presenter.split_answer`` reads it; a list item,
-    heading or fence does not continue it. A code span in it stays code, with
-    the words on either side bolded and the span not (``**Couldn't find**
-    `seeded-z`.``). The bold is left off when the first line opens with other
-    markup, a heading or a list marker, or the first sentence holds markup
-    outside its code spans, since a ``*`` inside would unpair. The offer is the
-    last sentence when it is one yes/no question with no markup, not on a list
-    item or heading line, that fits a button, with the ``?`` dropped and its
-    first letter lowered unless that would change a word that is capitalised
-    anyway ("I", "OK", "API").
+    A first sentence soft-wrapped onto the next lines is bolded line by line,
+    since Slack shows each line as written; a line that opens on a capital, a
+    list item, heading or fence does not continue it. A code span in it, found
+    as ``slack_presenter`` finds one, stays code, with the words on either side
+    bolded and the span not (``**Couldn't find** `seeded-z`.``). The bold is
+    left off when the first line opens with other markup, a heading or a list
+    marker, or the first sentence holds markup outside its code spans, since a
+    ``*`` inside would unpair. The offer is the last sentence when it is one
+    yes/no question with no markup, not on a list item or heading line nor
+    carrying on the line above, that fits a button, with the ``?`` dropped and
+    its first letter lowered unless that would change a word that is
+    capitalised anyway ("I", "OK", "API").
     """
     text = content or ""
     lead = text.lstrip()
     indent = text[: len(text) - len(lead)]
     lines = lead.split("\n")
-    first, taken = lines[0], 1
+    taken = 1
     while (
         taken < len(lines)
-        and not first.rstrip().endswith(SENTENCE_ENDS)
-        and not _presenter._first_sentence(first)[1]
-        and _continues(lines[taken])
+        and not _presenter._first_sentence(_presenter._hold_code(lines[taken - 1])[0])[1]
+        and _wraps(lines[taken - 1], lines[taken])
     ):
-        first = f"{first.rstrip()} {lines[taken].strip()}"
         taken += 1
-    sentence, rest = _presenter._first_sentence(first)
-    strong = _bold(sentence) if sentence else None
-    if strong and not (_presenter.LIST_MARKER.match(lines[0]) or _presenter.HEADING.match(lines[0])):
-        bolded = indent + "\n".join([strong + (f" {rest}" if rest else "")] + lines[taken:])
+    # A period inside a code span does not end the sentence.
+    held, spans = _presenter._hold_code(lines[taken - 1])
+    sentence, rest = (_presenter._restore_code(part, spans) for part in _presenter._first_sentence(held))
+    strong = [_bold(line) for line in lines[: taken - 1]] + [_bold(sentence) if sentence else None]
+    if all(strong) and not (_presenter.LIST_MARKER.match(lines[0]) or _presenter.HEADING.match(lines[0])):
+        strong[-1] += f" {rest}" if rest else ""
+        bolded = indent + "\n".join(strong + lines[taken:])
     else:
         bolded = text
     match = TRAILING_QUESTION.search(text.rstrip())
     question = match.group(1).strip() if match else ""
     if not question or MARKUP.search(question) or len(question) > _presenter.BUTTON_TEXT_MAX:
         return bolded, ""
-    last = text.rstrip().rsplit("\n", 1)[-1]
+    *above, last = text.rstrip().rsplit("\n", 2)[-2:]
     if _presenter.LIST_MARKER.match(last) or _presenter.HEADING.match(last):
+        return bolded, ""
+    if above and text[: match.start(1)].rstrip(" \t").endswith("\n") and _wraps(above[0], last):
         return bolded, ""
     word = question.split()[0]
     if (
@@ -355,7 +357,9 @@ def _bold(sentence: str) -> Optional[str]:
     """``sentence`` with each run of words outside its code spans in bold, or None
     when markup sits outside a code span, a bolded run touches a span without a
     space between (Slack would show the ``*`` as typed), or no run holds a word."""
-    runs, spans = CODE_SPAN.split(sentence), CODE_SPAN.findall(sentence)
+    held, spans = _presenter._hold_code(sentence)
+    parts = _presenter.CODE_PLACEHOLDER.split(held)
+    runs, spans = parts[0::2], [spans[int(i)][0] for i in parts[1::2]]
     if any(MARKUP.search(run) for run in runs):
         return None
     out = []
@@ -369,6 +373,16 @@ def _bold(sentence: str) -> Optional[str]:
         out.append(run + (spans[i] if i < len(spans) else ""))
     strong = "".join(out)
     return strong if "**" in strong else None
+
+
+def _wraps(above: str, line: str) -> bool:
+    """Whether ``line`` carries on a sentence ``above`` left open at its end, rather
+    than starting one of its own or a block."""
+    return (
+        not above.rstrip().endswith(SENTENCE_ENDS)
+        and _continues(line)
+        and not line.lstrip()[:1].isupper()
+    )
 
 
 def _continues(line: str) -> bool:

@@ -6,8 +6,9 @@ has run, with ``slack_presenter.py`` staged beside this script.
 
 Two things are checked:
 
-1. The five calls are in place: ``build_wake_text`` calls ``note_wake`` after
-   the moments wake-text line, ``_process_message_background`` calls ``start``
+1. The five calls are in place, read from the parsed tree inside the function
+   that must make each: ``build_wake_text`` calls ``note_wake`` after the
+   moments wake-text line, ``_process_message_background`` calls ``start``
    after its processing-start hook, ``send_final_ledgered`` brackets its send
    with ``begin`` and ``end``, ``SlackAdapter._maybe_blocks`` hands upstream's
    renamed body to ``maybe_blocks``, and ``_run_agent_queued_followup`` calls
@@ -42,18 +43,22 @@ IMPORT_NAME = "slack_ux_failure"
 ALIAS = "_kage_slack_failure"
 
 NOTIFIER = "gateway/kanban_watchers_notifier.py"
+NOTE_WAKE = "_kage_slack_failure.note_wake(self.sub, self.wake_kinds, self.synth)"
+#: Each file's inserted statements, by the function that must make them.
 CALLS = {
-    NOTIFIER: ("_kage_slack_failure.note_wake(self.sub, self.wake_kinds, self.synth)",),
-    "gateway/platforms/base.py": (
-        "_kage_slack_failure.start(event)",
-        "_kage_failure_token = _kage_slack_failure.begin(event)",
-        "_kage_slack_failure.end(_kage_failure_token)",
-    ),
-    "plugins/platforms/slack/adapter.py": (
-        "return _kage_slack_failure.maybe_blocks(content, self._kage_upstream_maybe_blocks)",
-        "def _kage_upstream_maybe_blocks(self, content: str) -> Optional[list]:",
-    ),
-    "gateway/run_turn.py": ("_kage_slack_failure.drop(turn_ctx.source, pending_event)",),
+    NOTIFIER: {"build_wake_text": (NOTE_WAKE,)},
+    "gateway/platforms/base.py": {
+        "_process_message_background": ("_kage_slack_failure.start(event)",),
+        "send_final_ledgered": (
+            "_kage_failure_token = _kage_slack_failure.begin(event)",
+            "_kage_slack_failure.end(_kage_failure_token)",
+        ),
+    },
+    "plugins/platforms/slack/adapter.py": {
+        "_maybe_blocks": ("return _kage_slack_failure.maybe_blocks(content, self._kage_upstream_maybe_blocks)",),
+        "_kage_upstream_maybe_blocks": (),
+    },
+    "gateway/run_turn.py": {"_run_agent_queued_followup": ("_kage_slack_failure.drop(turn_ctx.source, pending_event)",)},
 }
 MOMENTS_LINE = "self.synth = _kage_moments_wake_text("
 
@@ -73,29 +78,56 @@ def _fail(detail: str) -> SystemExit:
 
 
 def check_callers(root: Path) -> None:
-    for rel, calls in CALLS.items():
+    for rel, functions in CALLS.items():
         path = root / rel
-        text = path.read_text() if path.is_file() else ""
-        for call in calls:
-            if call not in text:
-                raise _fail(f"{rel} does not carry {call!r}")
+        tree = ast.parse(path.read_text() if path.is_file() else "")
+        # Read from the tree, so a call left only in a comment or a string does not count.
+        for function, calls in functions.items():
+            made = _statements_in(tree, function)
+            if made is None:
+                raise _fail(f"{rel} defines no {function}")
+            for call in calls:
+                if call not in made:
+                    raise _fail(f"{rel}'s {function} does not make {call!r}")
         # A call compiles without its import and raises NameError only when it runs.
         if not any(
             isinstance(stmt, ast.ImportFrom)
             and stmt.module == IMPORT_MODULE
             and any(a.name == IMPORT_NAME and a.asname == ALIAS for a in stmt.names)
-            for stmt in ast.parse(text).body
+            for stmt in tree.body
         ):
             raise _fail(f"{rel} does not import {IMPORT_MODULE}.{IMPORT_NAME} as {ALIAS}")
         # An anchor pins the text it replaces, not the names the inserted call reads.
-        tree = ast.parse(text)
         for stmt in _calling_statements(tree):
             unbound = patchlib.unbound(tree, stmt)
             if unbound:
                 raise _fail(f"{rel} calls {ALIAS} with {', '.join(unbound)}, which nothing binds there")
-    notifier = (root / NOTIFIER).read_text()
-    if MOMENTS_LINE not in notifier or notifier.index(MOMENTS_LINE) > notifier.index(CALLS[NOTIFIER][0]):
+    lines = {
+        ast.unparse(stmt): stmt.lineno
+        for stmt in ast.walk(ast.parse((root / NOTIFIER).read_text()))
+        if isinstance(stmt, (ast.Expr, ast.Assign))
+    }
+    moments = [line for code, line in lines.items() if code.startswith(MOMENTS_LINE)]
+    if not moments or min(moments) > lines[NOTE_WAKE]:
         raise _fail("note_wake does not follow the moments note on the wake")
+
+
+def _statements_in(tree: ast.Module, function: str) -> "set[str] | None":
+    """The simple statements the functions named ``function`` make, as ``ast.unparse``
+    writes them, or None when ``tree`` defines no such function."""
+    found = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function
+    ]
+    if not found:
+        return None
+    return {
+        ast.unparse(stmt)
+        for node in found
+        for stmt in ast.walk(node)
+        if isinstance(stmt, (ast.Expr, ast.Assign, ast.Return))
+    }
 
 
 def _calling_statements(tree: ast.Module) -> list[ast.stmt]:

@@ -179,18 +179,47 @@ class PresentTest(unittest.TestCase):
             with self.subTest(question):
                 self.assertEqual(runtime.present("It failed. " + question)[1], "")
 
-    def test_a_soft_wrapped_first_sentence_is_bolded_whole(self):
+    def test_a_soft_wrapped_first_sentence_is_bolded_whole_on_its_own_lines(self):
         for reply, bolded in {
             "I couldn't find\nseeded-z. The fleet has seeded-a.\nCheck it there?":
-                "**I couldn't find seeded-z.** The fleet has seeded-a.\nCheck it there?",
+                "**I couldn't find**\n**seeded-z.** The fleet has seeded-a.\nCheck it there?",
             "I couldn't find\nseeded-z.\nThe fleet has seeded-a.":
-                "**I couldn't find seeded-z.**\nThe fleet has seeded-a.",
+                "**I couldn't find**\n**seeded-z.**\nThe fleet has seeded-a.",
             "The check stopped on\n- seeded-a\n- seeded-b":
                 "**The check stopped on**\n- seeded-a\n- seeded-b",
             "The check stopped\n\nIt will retry.": "**The check stopped**\n\nIt will retry.",
         }.items():
             with self.subTest(reply=reply):
                 self.assertEqual(runtime.present(reply)[0], bolded)
+
+    def test_lines_that_each_start_on_a_capital_stay_lines(self):
+        reply = "Deploy failed\nPod: api-7f\nReason: OOMKilled\nRetry with more memory?"
+        self.assertEqual(
+            runtime.present(reply),
+            ("**Deploy failed**\nPod: api-7f\nReason: OOMKilled\nRetry with more memory?", "retry with more memory"),
+        )
+
+    def test_a_question_on_its_own_line_after_a_list_or_an_open_line_is_offered(self):
+        for reply in (
+            "I couldn't find seeded-z. The fleet has:\n- seeded-a\n- seeded-b\n\nCheck it there?",
+            "I couldn't find seeded-z. The fleet has:\n- seeded-a\n- seeded-b\nCheck it there?",
+            "I couldn't find seeded-z on:\nCheck it there?",
+        ):
+            with self.subTest(reply=reply):
+                self.assertEqual(runtime.present(reply)[1], "check it there")
+
+    def test_a_question_that_carries_on_the_line_above_offers_nothing(self):
+        self.assertEqual(runtime.present("It stopped. Should I check it\nthere?")[1], "")
+
+    def test_a_code_span_is_read_as_the_presenter_reads_it(self):
+        for reply, want in {
+            "The pod says `Back-off restarting. See logs` and exits. Retry?": (
+                "**The pod says** `Back-off restarting. See logs` **and exits.** Retry?"
+            ),
+            "The image ``a`b`` is missing. Retry?": "**The image** ``a`b`` **is missing.** Retry?",
+        }.items():
+            with self.subTest(reply=reply):
+                self.assertEqual(runtime.present(reply), (want, "retry"))
 
     def test_the_offer_keeps_words_capitalised_anyway(self):
         for question, label in {
@@ -334,6 +363,17 @@ class MarkTest(FlagOn):
         wake = _turn()
         runtime.drop(_event().source, None)
         self.assertEqual(self.draw(wake), _render(REPLY))
+
+    def test_the_next_turn_starting_drops_an_unsent_claim(self):
+        # The wake's reply was [SILENT]; a sibling wake's turn, or a user message queued
+        # before the claim, runs next.
+        for internal in (True, False):
+            with self.subTest(internal=internal):
+                runtime.note_wake(SUB, {"gave_up"}, WAKE)
+                queued = _earlier(internal=internal)
+                _turn()
+                runtime.start(queued)
+                self.assertEqual(self.draw(queued), _render(REPLY))
 
     def test_an_event_with_text_and_no_message_id_does_not_take_a_claim(self):
         # A Slack slash command carries no message id.
@@ -481,6 +521,23 @@ class ApplyTest(unittest.TestCase):
                     verifier.check_callers(self.root)
                 self.assertIn("does not import gateway.slack_ux_failure", str(ctx.exception))
                 path.write_text(patched)
+
+    def test_the_verifier_refuses_a_call_left_only_in_a_comment(self):
+        applier.apply(self.root)
+        path = self.root / applier.BASE
+        call = "_kage_slack_failure.start(event)"
+        path.write_text(path.read_text().replace(call, f"pass  # {call}"))
+        with self.assertRaises(SystemExit) as ctx:
+            verifier.check_callers(self.root)
+        self.assertIn(f"_process_message_background does not make {call!r}", str(ctx.exception))
+
+    def test_the_verifier_refuses_a_call_made_in_another_function(self):
+        applier.apply(self.root)
+        path = self.root / applier.BASE
+        path.write_text(path.read_text().replace("_process_message_background", "_elsewhere"))
+        with self.assertRaises(SystemExit) as ctx:
+            verifier.check_callers(self.root)
+        self.assertIn("defines no _process_message_background", str(ctx.exception))
 
     def test_the_verifier_refuses_a_call_reading_a_name_nothing_binds(self):
         path = self.root / applier.RUN_TURN
