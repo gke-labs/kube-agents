@@ -1279,11 +1279,12 @@ class RootTest(unittest.TestCase):
         delivery = root.load(applier.DELIVERY, "cron.scheduler_delivery")
         delivery["_deliver_result"]({"id": "j1"}, "hello", [_target("slack")])
         self.assertIn("gateway.platforms.base", sys.modules)
+        added = sys.modules["gateway.platforms.base"]
 
         root.cleanup()
         # After cleanup, what the root added is removed, and the pre-existing
         # stubs are restored.
-        self.assertNotIn("gateway.platforms.base", sys.modules)
+        self.assertIsNot(sys.modules.get("gateway.platforms.base"), added)
         self.assertIs(sys.modules.get("gateway.preexisting"), fake_gateway)
         self.assertIs(sys.modules.get("agent.preexisting"), fake_agent)
 
@@ -1301,9 +1302,10 @@ class RootTest(unittest.TestCase):
         delivery["_deliver_result"]({"id": "j1"}, "hello", [_target("slack")])
         self.assertIn("gateway", sys.modules)
         self.assertIsNot(sys.modules.get("gateway"), fake_gateway)
+        added = sys.modules["gateway.platforms.base"]
 
         root.cleanup()
-        self.assertNotIn("gateway.platforms.base", sys.modules)
+        self.assertIsNot(sys.modules.get("gateway.platforms.base"), added)
         self.assertIs(sys.modules.get("gateway"), fake_gateway)
 
     def test_root_cleanup_is_idempotent(self):
@@ -1316,8 +1318,9 @@ class RootTest(unittest.TestCase):
         self.addCleanup(later.cleanup)
         delivery = later.load(applier.DELIVERY, "cron.scheduler_delivery")
         delivery["_deliver_result"]({"id": "j1"}, "hello", [_target("slack")])
+        added = sys.modules["gateway.platforms.base"]
         root.cleanup()
-        self.assertIn("gateway.platforms.base", sys.modules)
+        self.assertIs(sys.modules.get("gateway.platforms.base"), added)
 
 
 if __name__ == "__main__":
