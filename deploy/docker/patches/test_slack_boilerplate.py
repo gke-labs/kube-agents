@@ -534,6 +534,7 @@ class _Root:
     """A throwaway Hermes root holding the fixtures and the runtime module."""
 
     def __init__(self):
+        self._cleaned = False
         self.dir = Path(tempfile.mkdtemp())
         for relative, text in FIXTURES.items():
             path = self.dir / relative
@@ -565,7 +566,13 @@ class _Root:
         return namespace
 
     def cleanup(self):
-        sys.path.remove(str(self.dir))
+        if self._cleaned:
+            return
+        self._cleaned = True
+        try:
+            sys.path.remove(str(self.dir))
+        except ValueError:
+            pass
         self._forget_gateway()
         sys.modules.update(self._saved_modules)
         shutil.rmtree(self.dir, ignore_errors=True)
@@ -1257,6 +1264,7 @@ class RootTest(unittest.TestCase):
         self.addCleanup(sys.modules.pop, "agent.preexisting", None)
 
         root = _Root()
+        self.addCleanup(root.cleanup)
         # During the root's lifetime, pre-existing modules are cleared so the
         # fixture tree imports cleanly.
         self.assertNotIn("gateway.preexisting", sys.modules)
@@ -1280,6 +1288,7 @@ class RootTest(unittest.TestCase):
         self.addCleanup(sys.modules.pop, "gateway", None)
 
         root = _Root()
+        self.addCleanup(root.cleanup)
         self.assertNotIn("gateway", sys.modules)
 
         delivery = root.load(applier.DELIVERY, "cron.scheduler_delivery")
@@ -1290,6 +1299,13 @@ class RootTest(unittest.TestCase):
         root.cleanup()
         self.assertNotIn("gateway.platforms.base", sys.modules)
         self.assertIs(sys.modules.get("gateway"), fake_gateway)
+
+    def test_root_cleanup_is_idempotent(self):
+        root = _Root()
+        self.addCleanup(root.cleanup)
+        root.cleanup()
+        # Repeated calls should not raise ValueError (e.g. sys.path.remove)
+        root.cleanup()
 
 
 if __name__ == "__main__":
