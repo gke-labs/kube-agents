@@ -28,7 +28,8 @@ is the headline, links and choices as plain mrkdwn, for the message's ``text``
 field.
 :func:`blocks_answer` lays a headline, links and choices out as blocks; its
 callers are ``slack_moments``, which lays out the messages ``slack_ux_moments``
-posts, and ``slack_ux_failure``, which adds a failure reply's offer button. :func:`with_side_bar` puts every block below the headline in one legacy
+posts, and ``slack_ux_failure``, which adds a failure reply's offer button.
+:func:`with_side_bar` puts every block below the headline in one legacy
 attachment whose ``color`` is the side bar, for ``slack_ux_moments`` posting and
 settling a moment and ``slack_ux_clicks`` rewriting one; :func:`message_blocks`
 and :func:`side_bar_color` read a click's echoed message back.

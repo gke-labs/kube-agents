@@ -112,15 +112,26 @@ class MarkTest(FlagOn):
         self.assertEqual(button["value"], "check it there")
         self.assertRegex(button["action_id"], slack_presenter.CHOICE_ACTION_ID_PATTERN)
 
-    def test_a_queued_follow_up_drops_the_mark(self):
+    def test_a_queued_user_message_drops_the_mark(self):
         runtime.note_wake(SUB, {"gave_up"}, WAKE)
-        runtime.drop(_event().source)
+        runtime.drop(_event().source, _event(internal=False))
         self.assertEqual(self.draw(_event()), _render(REPLY))
 
-    def test_a_later_wake_clears_the_mark(self):
+    def test_a_queued_wake_keeps_the_mark(self):
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        runtime.drop(_event().source, _event())
+        self.assertEqual(len(_buttons(self.draw(_event()))), 1)
+
+    def test_a_sibling_wake_leaves_the_mark(self):
         runtime.note_wake(SUB, {"gave_up"}, WAKE)
         runtime.note_wake(SUB, {"completed"}, "Task t_f2 completed.")
-        self.assertEqual(self.draw(_event()), _render(REPLY))
+        self.assertEqual(len(_buttons(self.draw(_event()))), 1)
+
+    def test_outside_a_thread_the_lead_is_bold_and_the_question_stays_text(self):
+        runtime.note_wake({**SUB, "thread_id": None}, {"gave_up"}, WAKE)
+        blocks = self.draw(_event(thread_id=None))
+        self.assertTrue(blocks[0]["text"]["text"].startswith("**I couldn't find seeded-z.**"))
+        self.assertEqual(_buttons(blocks), [])
 
     def test_a_wake_whose_question_is_posted_clears_the_mark(self):
         runtime.note_wake(SUB, {"gave_up"}, WAKE)
@@ -208,7 +219,7 @@ class ApplyTest(unittest.TestCase):
             applier.SLACK_ADAPTER: "from typing import Optional\n\n\nclass S:\n"
             + applier.BLOCKS_ANCHOR
             + "        return None\n",
-            applier.RUN_TURN: "class R:\n    async def _run_agent_queued_followup(self, turn_ctx):\n"
+            applier.RUN_TURN: "class R:\n    async def _run_agent_queued_followup(self, turn_ctx, pending_event):\n"
             + applier.FOLLOWUP_ANCHOR
             + "        return None\n",
         }

@@ -30,19 +30,20 @@ a later read of the thread is unchanged, question included.
 Which reply is the wake's: :func:`note_wake` marks the subscription's thread
 when a Slack wake carries ``blocked``, ``crashed``, ``timed_out`` or
 ``gave_up``, unless ``gateway/slack_ux_moments.py`` noted the question already
-posted (that wake is answered with ``[SILENT]``). Any later wake in the thread
-clears the mark first, so it lives until the next wake at most. The next final
-reply sent for an internal event in that thread takes the mark, within
-:data:`MARK_TTL_SECONDS`; a reply the user's own message prompted never does.
-A user message queued behind the wake turn runs as a follow-up whose reply is
-sent under the wake's event, so the follow-up drops the mark (:func:`drop`) and
-neither reply is drawn as the failure's. Kanban pings and moments are
+posted (that wake is answered with ``[SILENT]``, so it clears the thread's mark
+instead). The next final reply sent for an internal event in that thread takes
+the mark, within :data:`MARK_TTL_SECONDS`; a reply the user's own message
+prompted never does. A message queued behind a running turn runs as a follow-up
+whose reply is sent under that turn's event: a queued wake's reply is the wake's
+and keeps the mark, while a user's message drops it (:func:`drop`), so neither
+reply is drawn as the failure's. Outside a thread the reply keeps its question
+as text, since a click answers in the thread it was clicked in. Kanban pings and moments are
 not finals and never look. The marks are this process's, so a restart between a
 wake and its reply drops the look, not the reply.
 
 A reply that arrives as edits to a streamed message, rather than through
 ``send_final_ledgered``, is drawn as upstream draws it, and its mark waits for
-the next wake or the TTL.
+the TTL or the thread's next failure wake.
 
 Fail-soft: anything that raises is logged and the reply goes out as upstream
 renders it.
@@ -92,8 +93,8 @@ MESSAGE_BLOCKS_MAX = 50
 #: Marked threads, ``(chat_id, thread_id) -> monotonic time``.
 _marks: "OrderedDict[tuple[str, str], float]" = OrderedDict()
 
-#: Set for the length of one marked final's send.
-_marked: contextvars.ContextVar[bool] = contextvars.ContextVar("kage_failure_reply", default=False)
+#: The marked thread's id ("" outside a thread) for the length of one marked final's send.
+_marked: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("kage_failure_reply", default=None)
 
 
 def enabled() -> bool:
@@ -119,10 +120,10 @@ def note_wake(sub: dict, wake_kinds: Iterable[str], text: str) -> None:
     try:
         if str(sub.get("platform") or "").strip().lower() != SLACK_PLATFORM:
             return
-        key = _key(sub.get("chat_id"), sub.get("thread_id"))
-        _marks.pop(key, None)
         if not FAILURE_KINDS & set(wake_kinds or ()) or not enabled():
             return
+        key = _key(sub.get("chat_id"), sub.get("thread_id"))
+        _marks.pop(key, None)
         if _wake_note() in (text or ""):
             return
         _marks[key] = time.monotonic()
@@ -141,19 +142,20 @@ def begin(event: Any) -> Optional[contextvars.Token]:
         platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", ""))
         if str(platform or "").lower() != SLACK_PLATFORM:
             return None
-        noted = _marks.pop(_key(source.chat_id, getattr(source, "thread_id", None)), None)
+        key = _key(source.chat_id, getattr(source, "thread_id", None))
+        noted = _marks.pop(key, None)
         if noted is None or time.monotonic() - noted > MARK_TTL_SECONDS:
             return None
-        return _marked.set(True)
+        return _marked.set(key[1])
     except Exception:
         logger.warning("slack_ux_failure: reading the final's thread failed", exc_info=True)
         return None
 
 
-def drop(source: Any) -> None:
-    """Clear the mark on ``source``'s thread, for a queued follow-up sent under the wake's event."""
+def drop(source: Any, pending_event: Any) -> None:
+    """Clear the mark on ``source``'s thread when the queued follow-up is a user's message."""
     try:
-        if _marks and source is not None:
+        if _marks and source is not None and not getattr(pending_event, "internal", False):
             _marks.pop(_key(source.chat_id, getattr(source, "thread_id", None)), None)
     except Exception:
         logger.warning("slack_ux_failure: clearing the follow-up's thread failed", exc_info=True)
@@ -194,14 +196,15 @@ def present(content: str) -> tuple[str, str]:
 
 def maybe_blocks(content: str, render: Callable[[str], Optional[list]]) -> Optional[list]:
     """``render(content)``, or for a marked reply its :func:`present` form plus the offer."""
-    if not _marked.get():
+    thread = _marked.get()
+    if thread is None:
         return render(content)
     try:
         bolded, label = present(content)
         blocks = render(bolded)
         if blocks is None:
             return render(content)
-        if label and len(blocks) < MESSAGE_BLOCKS_MAX:
+        if label and thread and len(blocks) < MESSAGE_BLOCKS_MAX:
             blocks = list(blocks) + _presenter.blocks_answer("", choices=[label], action_id_prefix=ACTION_ID_PREFIX)
         return blocks
     except Exception:

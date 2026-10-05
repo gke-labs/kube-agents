@@ -15,7 +15,7 @@ Two things are checked:
    mock 06's reply to a ``gave_up`` wake is drawn with its first sentence in
    bold and one choice button reading "check it there", a second reply in the
    thread is drawn as upstream draws it, a reply the user's own message
-   prompted is never marked, and a queued follow-up clears the mark.
+   prompted is never marked, and a queued user message clears the mark.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ CALLS = {
         "return _kage_slack_failure.maybe_blocks(content, self._kage_upstream_maybe_blocks)",
         "def _kage_upstream_maybe_blocks(self, content: str) -> Optional[list]:",
     ),
-    "gateway/run_turn.py": ("_kage_slack_failure.drop(turn_ctx.source)",),
+    "gateway/run_turn.py": ("_kage_slack_failure.drop(turn_ctx.source, pending_event)",),
 }
 MOMENTS_LINE = "self.synth = _kage_moments_wake_text("
 
@@ -121,7 +121,7 @@ def drive(module) -> None:
         if _draw(module, _event(internal=False)) != _render(REPLY):
             raise _fail("a reply to the user's own message was drawn as the failure's")
         module.note_wake(SUB, {"gave_up"}, "wake")
-        module.drop(_event().source)
+        module.drop(_event().source, _event(internal=False))
         if _draw(module, _event()) != _render(REPLY):
             raise _fail("a queued follow-up's reply was drawn as the failure's")
     finally:
@@ -133,7 +133,7 @@ def main(root: Path = Path("/opt/hermes")) -> None:
     drive(_load_runtime(root))
     print(
         "slack_ux_failure verify: marked from the wake, bracketed in the final send, "
-        "drawn in _maybe_blocks, dropped by a queued follow-up; a failure reply leads in bold and offers its question once"
+        "drawn in _maybe_blocks, dropped by a queued user message; a failure reply leads in bold and offers its question once"
     )
 
 
