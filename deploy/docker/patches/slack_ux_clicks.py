@@ -510,8 +510,14 @@ def _question_card(channel_id: str, msg_ts: str) -> str:
 
 def _asked(message: dict) -> str:
     """The first line of ``message``'s text without the "Reply with one of:" line (a
-    question's headline; a failure reply's bold lead), or ``""`` when it has none."""
-    return _without_choices_line(str(message.get("text") or ""), True).split("\n", 1)[0].strip()
+    question's headline; a failure reply's bold lead), or ``""`` when it has none.
+
+    Decoded as the button label is, and without the ``*`` a question's headline is
+    stored in, so a title reads "Scale replicas > 3?" rather than ``*…&gt; 3?*``."""
+    line = _without_choices_line(str(message.get("text") or ""), True).split("\n", 1)[0].strip()
+    if len(line) > 2 and line[0] == line[-1] == "*":
+        line = line[1:-1].strip()
+    return _unescape(line)
 
 
 async def _offer_title(adapter: Any, channel_id: str, team_id: str, thread_ts: str, title: str) -> None:

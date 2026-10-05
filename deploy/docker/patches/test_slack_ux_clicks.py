@@ -599,6 +599,16 @@ class RuntimeTest(unittest.TestCase):
             self._answer(adapter, body, action)
         self.assertEqual(asks, [(CHANNEL, THREAD, "Post the release notes now?")])
 
+    def test_a_clicked_session_is_titled_from_the_question_as_it_reads(self):
+        adapter = _Adapter()
+        asks = []
+        status = SimpleNamespace(note_ask=lambda *args: asks.append(args))
+        body, action = _choice(value="Scale it")
+        body["message"]["text"] = "*Scale replicas &gt; 3 &amp; restart?*\n\nReply with one of: Scale it, Wait"
+        with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_status=status), "gateway.slack_ux_status": status}):
+            self._answer(adapter, body, action)
+        self.assertEqual(asks, [(CHANNEL, THREAD, "Scale replicas > 3 & restart?")])
+
     def test_a_clicked_session_with_no_question_text_is_titled_from_the_label_not_the_card_note(self):
         adapter = _Adapter()
         status = SimpleNamespace(note_ask=lambda chat, thread, text: adapter.log.append(("note_ask", (chat, thread, text))))
@@ -654,6 +664,22 @@ class RuntimeTest(unittest.TestCase):
         adapter._get_client = lambda chat_id, team_id=None: client
         with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_moments=moments), "gateway.slack_ux_moments": moments}):
             self._answer(adapter, *_choice())
+        self.assertEqual(adapter.log[-1][1]["text"], "Leave it\n\n" + runtime.CARD_NOTE.format(card="t_e0c1"))
+
+    def test_the_card_is_looked_up_before_the_clickers_name(self):
+        cards = {(CHANNEL, MESSAGE_TS): "t_e0c1"}
+        moments = SimpleNamespace(question_card=lambda channel, ts: cards.get((channel, ts)))
+        adapter = _Adapter()
+        resolve = adapter._resolve_user_name
+
+        async def settle_then_resolve(*args, **kwargs):
+            cards.clear()  # the card settled while users.info was in flight
+            return await resolve(*args, **kwargs)
+
+        adapter._resolve_user_name = settle_then_resolve
+        with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_moments=moments), "gateway.slack_ux_moments": moments}):
+            self._answer(adapter, *_choice())
+        self.assertTrue(adapter.named)
         self.assertEqual(adapter.log[-1][1]["text"], "Leave it\n\n" + runtime.CARD_NOTE.format(card="t_e0c1"))
 
     def test_a_click_on_any_other_message_is_the_label_alone(self):
