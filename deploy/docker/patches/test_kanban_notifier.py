@@ -2066,7 +2066,7 @@ class ApplyTest(unittest.TestCase):
         self.assertIn("platform_str", str(ctx.exception))
 
     def test_a_platform_str_binding_moved_out_of_init_fails_loudly(self):
-        # The line still occurs once, so only the scope check sees the move.
+        # The line still occurs once, so substitute's count does not see the move.
         binding = '        self.platform_str = (sub["platform"] or "").lower()\n'
         moved = UPSTREAM_NOTIFIER.replace(binding, "").replace(
             "    def build_wake_text(self) -> None:\n        task, sub = self.task, self.sub\n",

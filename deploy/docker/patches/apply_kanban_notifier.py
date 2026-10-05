@@ -429,8 +429,13 @@ def expect_platform_binding(patch: patchlib.Patch) -> None:
     The statement found must also be the binding itself, so the text sitting in
     a comment or a string on another assignment's line does not pass. Python
     keeps the last binding, so the class and the constructor must each be the
-    only binding of their name in their scope, in any branch or form
-    (``_bindings``), and no ``return`` or ``raise`` may come before the binding.
+    only name binding in their scope, in any branch (``_bindings``: defs,
+    classes, stored names, named imports and handlers), and no ``return`` or
+    ``raise`` may come before the binding. A constructor replaced or wrapped
+    without binding the name (an attribute assignment, a decorator, a star
+    import) is not counted here; ``verify_kanban_notifier.py`` constructs a
+    notification at build time and checks ``platform_str`` on it. A subclass
+    upstream constructs in the class's place is outside both.
     """
     offset = patch.source.index(PLATFORM_BINDING)
     lineno = patch.source.count("\n", 0, offset) + 1
