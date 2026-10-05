@@ -296,11 +296,12 @@ def present(content: str) -> tuple[str, str]:
     heading or fence does not continue it. A code span in it stays code, with
     the words on either side bolded and the span not (``**Couldn't find**
     `seeded-z`.``). The bold is left off when the first line opens with other
-    markup, a heading or a list marker, or the first sentence holds markup outside its code
-    spans, since a ``*`` inside would unpair. The offer is the last sentence when it is
-    one yes/no question with no markup that fits a button, with the ``?``
-    dropped and its first letter lowered unless that would change a word that
-    is capitalised anyway ("I", "OK", "API").
+    markup, a heading or a list marker, or the first sentence holds markup
+    outside its code spans, since a ``*`` inside would unpair. The offer is the
+    last sentence when it is one yes/no question with no markup, not on a list
+    item or heading line, that fits a button, with the ``?`` dropped and its
+    first letter lowered unless that would change a word that is capitalised
+    anyway ("I", "OK", "API").
     """
     text = content or ""
     lead = text.lstrip()
@@ -324,6 +325,9 @@ def present(content: str) -> tuple[str, str]:
     match = TRAILING_QUESTION.search(text.rstrip())
     question = match.group(1).strip() if match else ""
     if not question or MARKUP.search(question) or len(question) > _presenter.BUTTON_TEXT_MAX:
+        return bolded, ""
+    last = text.rstrip().rsplit("\n", 1)[-1]
+    if _presenter.LIST_MARKER.match(last) or _presenter.HEADING.match(last):
         return bolded, ""
     word = question.split()[0]
     if (

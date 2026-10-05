@@ -149,6 +149,16 @@ class PresentTest(unittest.TestCase):
             with self.subTest(reply=reply):
                 self.assertEqual(runtime.present(reply)[1], "")
 
+    def test_a_question_on_a_list_item_or_heading_offers_nothing(self):
+        for reply in (
+            "Two options.\n- Retry on seeded-a?\n- Stop here?",
+            "It stopped.\n- Stop here?",
+            "It stopped.\n2. Stop here?",
+            "It stopped.\n## Retry?",
+        ):
+            with self.subTest(reply=reply):
+                self.assertEqual(runtime.present(reply)[1], "")
+
     def test_a_question_that_needs_a_word_offers_nothing(self):
         for question in (
             "What would you like me to do?",
