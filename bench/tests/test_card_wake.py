@@ -527,8 +527,13 @@ def test_merge_records_no_answer_reply_for_an_errored_answer_turn() -> None:
 
 
 def test_merge_keeps_the_reply_of_an_answer_turn_that_parsed_with_warnings() -> None:
-    call = {"type": "tool_call", "name": "kanban_unblock"}
-    answer = AgentResult(output="[SILENT]", trajectory=[call], errors=["tool output without a matching call"])
+    # No tool call parsed, so only final_message says the turn replied.
+    answer = AgentResult(
+        output="[SILENT]",
+        trajectory=[],
+        errors=["tool output without a matching call"],
+        metadata={"final_message": "[SILENT]"},
+    )
 
     merged = card_wake.merge(_PLANTED, _result("[SILENT]", [], {}), answer)
 

@@ -824,8 +824,9 @@ def _settled_entry(planted: Planted, settled: Settled | None, answer_reply: str 
 
 def _no_reply(turn: AgentResult) -> bool:
     """Whether ``turn`` errored with nothing parsed, as ``AgentResult.errored`` builds one:
-    its ``output`` is the error, not a reply. A parsed turn's warnings leave its reply."""
-    return bool(turn.errors) and not turn.trajectory
+    its ``output`` is the error, not a reply. A parsed turn always carries ``final_message``,
+    so its warnings leave its reply."""
+    return bool(turn.errors) and "final_message" not in turn.metadata
 
 
 def merge(
