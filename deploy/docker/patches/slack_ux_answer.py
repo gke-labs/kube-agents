@@ -24,8 +24,8 @@ blocks, never a fold's.
 The first sentence is ``slack_presenter.split_lead``'s, the sentence
 ``slack_presenter.split_answer`` takes its headline from. A bold headline is
 plain text with its code spans kept as code, so an answer it cannot carry whole
-keeps the upstream post: one whose first line is a heading, a list item or a
-code fence, or whose first sentence is longer than ``HEADLINE_MAX``, runs onto
+keeps the upstream post: one whose first line is a heading, a list item, a
+code fence, a quote or a table row, one opening on a bold label, or whose first sentence is longer than ``HEADLINE_MAX``, runs onto
 a second line, or holds a link or a mention. So does one with nothing after
 that sentence, one longer than :data:`FOLD_TEXT_MAX`, a
 fold ``block_kit`` cannot render or that would hold a block outside
@@ -35,8 +35,9 @@ logs why; a failed post falls back to the upstream send. A closing question post
 the fold, unfolded, so an offer is never hidden. The folded post
 carries what upstream's adds: link-preview settings, ``reply_broadcast``, the
 feedback buttons, the status clear and the reply tracking for the thread. An incident report
-that edits its alert never reaches this send, and one whose edit fails opens
-with a heading, so it keeps the upstream post here too.
+that edits its alert never reaches this send, and a report a reply can act on
+(``kanban_notifier.actionable_report``) keeps the upstream post here whatever it
+opens on, so its options are never folded away.
 """
 
 from __future__ import annotations
@@ -84,8 +85,10 @@ LOSES_CONTENT = re.compile(r"\]\(|https?://|<[@#!]", re.IGNORECASE)
 CODE_MARK = "\x01"
 #: Emphasis markers split_lead may close at the cut, longest first.
 MARKERS = ("**", "__", "*", "_")
-#: Where a sentence in the answer's last line starts: after a sentence end and its space.
-SENTENCE_START = re.compile(r"(?<=[.!?])\s+(?=\S)")
+#: A bold label opening the answer ("**Memory check**: ..."): a phrase of more than one word,
+#: closed without a stop and followed by a colon or a dash. It is not a sentence, and the eval's
+#: ``answer_first`` fails it too; a one-word answer ("**No**: ...") is one.
+BOLD_LABEL = re.compile(r"^(\*\*|__)(?=\S)([^\n]*?\s[^\n]*?)(?<=[^\s.!?])\1[ \t]*[:\u2014\u2013]")
 #: A line that is not a prose sentence: a quote or a table row, besides :data:`NOT_PROSE`.
 NOT_PROSE_LINE = re.compile(r"^\s*[>|]")
 #: A line that ends its sentence, so the next line starts a new one.
@@ -145,6 +148,8 @@ def split(answer: str) -> tuple[list[tuple[str, bool]], str] | None:
     opener = answer.lstrip("\n")
     if NOT_PROSE.match(opener) or NOT_PROSE_LINE.match(opener):
         return _refuse("it opens with a heading, a list item, a code fence, a quote or a table row")
+    if BOLD_LABEL.match(opener):
+        return _refuse("it opens with a bold label, not a sentence")
     lead, _body = _presenter.split_lead(answer)
     if LOSES_CONTENT.search(lead):
         return _refuse("the first sentence holds a link or a mention")
@@ -166,10 +171,11 @@ def split(answer: str) -> tuple[list[tuple[str, bool]], str] | None:
     if not first_line.startswith(written):
         return _refuse("the first sentence runs onto a second line")
     tail = first_line[len(written):].strip()
-    rest = "\n".join(part for part in (reopen + tail if tail else "", after) if part).strip()
+    rest = "\n".join(part for part in (tail, after) if part).strip()
     if not rest:
         return _refuse("nothing follows the first sentence")
-    return headline, rest
+    # The reopened marker leads whatever the rest is, a wrapped run's second line included.
+    return headline, reopen + rest
 
 
 def trailing_question(rest: str) -> tuple[str, str]:
@@ -189,7 +195,7 @@ def trailing_question(rest: str) -> tuple[str, str]:
     ):
         return rest, ""
     joined = " ".join(line.strip() for line in question_lines)
-    starts = [match.end() for match in SENTENCE_START.finditer(joined)]
+    starts = _presenter.sentence_starts(joined)
     cut = starts[-1] if starts else 0
     kept = "\n".join(part for part in ("\n".join(lines[:first]), joined[:cut].rstrip()) if part).strip()
     return kept, joined[cut:].strip()
@@ -258,6 +264,12 @@ class _AnswerFolder:
 
     async def _post(self, content: str, metadata: Any) -> Any:
         """The folded post's result, or None when it is refused and the upstream send should run."""
+        from gateway.kanban_notifier import actionable_report
+
+        # A report a reply can act on keeps its options and call to action in sight, whatever it
+        # opens on: the predicate the incident editor and the incidents store read it by.
+        if actionable_report(content):
+            return _refuse("it is a report with options to act on")
         parts = split(content)
         if parts is None:
             return None

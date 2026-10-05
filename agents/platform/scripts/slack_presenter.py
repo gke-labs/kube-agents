@@ -220,6 +220,9 @@ NUMBER_NEXT = re.compile(r"\d")
 ABBREVIATION_TAIL = 16
 #: A space-aligned clip shorter than this share of the limit drops too much; it cuts hard instead.
 CLIP_MIN_SHARE = 2
+#: Stands in for each character of a code span while :func:`sentence_starts` looks for sentence
+#: ends, keeping offsets: :func:`_hold_code`'s placeholder character, so it reads as that does.
+CODE_FILLER = "\x00"
 
 
 def enabled() -> bool:
@@ -395,16 +398,33 @@ def _closes_own_run(stem: str, closer: str) -> bool:
     return False
 
 
+def _ends_sentence(line: str, match: re.Match) -> bool:
+    """Whether ``match``, a :data:`SENTENCE_END` in ``line``, ends a sentence rather than an abbreviation."""
+    sentence = line[: match.start()]
+    stem = sentence.rstrip("*_")
+    tail = max(0, len(stem) - ABBREVIATION_TAIL)
+    numbered = NUMBER_ABBREVIATION_END.search(stem, tail) and NUMBER_NEXT.match(line, match.end())
+    # An emphasis run this sentence opened and closes right after the stop ends it, whatever
+    # word it ends on.
+    return _closes_own_run(stem, sentence[len(stem) :]) or not (numbered or ABBREVIATION_END.search(stem, tail))
+
+
+def sentence_starts(line: str) -> list[int]:
+    """The offsets in ``line`` where a sentence after the first starts, by :func:`_first_sentence`'s rules.
+
+    A stop inside a code span ends nothing, and neither does one after an abbreviation.
+    """
+    masked = line
+    for start, end, _opener in _code_spans(line):
+        masked = masked[:start] + CODE_FILLER * (end - start) + masked[end:]
+    return [match.end() for match in SENTENCE_END.finditer(masked) if _ends_sentence(masked, match)]
+
+
 def _first_sentence(line: str) -> tuple[str, str]:
     """``(first sentence, the rest)`` of ``line``, not cut after an abbreviation."""
     for match in SENTENCE_END.finditer(line):
-        sentence = line[: match.start()]
-        stem = sentence.rstrip("*_")
-        tail = max(0, len(stem) - ABBREVIATION_TAIL)
-        numbered = NUMBER_ABBREVIATION_END.search(stem, tail) and NUMBER_NEXT.match(line, match.end())
-        # An emphasis run this sentence opened and closes right after the stop ends it, whatever
-        # word it ends on.
-        if _closes_own_run(stem, sentence[len(stem) :]) or not (numbered or ABBREVIATION_END.search(stem, tail)):
+        if _ends_sentence(line, match):
+            sentence = line[: match.start()]
             rest = line[match.end() :].strip()
             # "**One. Two.**" splits inside the bold, which would leave both halves unpaired.
             for marker, (opener, closer) in BOLD_EDGES.items():

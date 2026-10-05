@@ -84,6 +84,13 @@ HEADLINE = "Checkout is slow because the payments pool is at its limit."
 REST = "The pool has 4 nodes and all of them are above 90% CPU.\n\n- Scale the pool to 6 nodes.\n- Then watch p99 latency."
 ANSWER = f"{HEADLINE} {REST}"
 REPORT = "## What's wrong\n\nCheckout is slow.\n\n## Why\n\nThe pool is full."
+#: A closing offer, which posts after the fold, unfolded.
+QUESTION = "Should I scale the pool to 6 nodes?"
+#: A report a reply can act on that opens on a bold sentence: it keeps the upstream post.
+OPTIONS_REPORT = (
+    "**Checkout is down because the pool is exhausted.** It has 4 nodes.\n\n"
+    "## What to do\n\n- **Option A (scale):** add two nodes.\n- **To authorize:** reply 'apply'"
+)
 #: What the stub's format_message prefixes, so the post shows it ran.
 MRKDWN_MARK = "mrkdwn:"
 
@@ -277,15 +284,15 @@ class _StubAdapter:
         return SimpleNamespace(success=True, message_id=None, error=None)
 
 
-def _plugin_fold(root: Path) -> list[dict]:
-    """``REST`` as the Slack plugin's block_kit renders it through the stub's format_message."""
+def _plugin_blocks(root: Path, markdown: str) -> list[dict]:
+    """``markdown`` as the Slack plugin's block_kit renders it through the stub's format_message."""
     spec = importlib.util.spec_from_file_location("slack_ux_answer_verify_block_kit", root / BLOCK_KIT)
     block_kit = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(block_kit)
-    return block_kit.sanitize_blocks(block_kit.render_blocks(REST, mrkdwn_fn=_StubAdapter().format_message))
+    return block_kit.sanitize_blocks(block_kit.render_blocks(markdown, mrkdwn_fn=_StubAdapter().format_message))
 
 
-async def _drive(module, expected_fold: list[dict]) -> None:
+async def _drive(module, expected_fold: list[dict], expected_question: list[dict]) -> None:
     event = SimpleNamespace(kind="completed")
     task = SimpleNamespace(result=ANSWER)
     sub = {"chat_id": CHANNEL, "thread_id": THREAD_TS}
@@ -312,9 +319,19 @@ async def _drive(module, expected_fold: list[dict]) -> None:
         if fold.get("type") != "container" or not expected_fold or fold.get("child_blocks") != expected_fold:
             raise _fail("the rest was not folded through the Slack plugin's block_kit")
         adapter = _StubAdapter()
-        await module.adapter_for(adapter, "slack", event, task, sub).send(CHANNEL, REPORT, metadata=metadata)
-        if adapter.log != [("send", REPORT)]:
-            raise _fail(f"a report opening with a heading made {adapter.log!r}")
+        await module.adapter_for(adapter, "slack", event, task, sub).send(
+            CHANNEL, f"{ANSWER}\n\n{QUESTION}", metadata=metadata
+        )
+        blocks = adapter.log[0][1]["blocks"] if adapter.log and adapter.log[0][0] == "chat_postMessage" else []
+        if len(blocks) != 3 or len(expected_question) != 1 or blocks[2] != expected_question[0]:
+            raise _fail(f"a closing question did not post after the fold as block_kit renders it: {adapter.log!r}")
+        if blocks[1].get("child_blocks") != expected_fold:
+            raise _fail("a closing question changed what was folded")
+        for what, report in (("opening with a heading", REPORT), ("with options to act on", OPTIONS_REPORT)):
+            adapter = _StubAdapter()
+            await module.adapter_for(adapter, "slack", event, task, sub).send(CHANNEL, report, metadata=metadata)
+            if adapter.log != [("send", report)]:
+                raise _fail(f"a report {what} made {adapter.log!r}")
     finally:
         os.environ.pop(FLAG_ENV, None)
 
@@ -323,10 +340,13 @@ def main(root: Path = Path("/opt/hermes")) -> None:
     check_notifier(root)
     check_adapter(root)
     module = _load_runtime(root)
-    asyncio.run(_drive(module, _plugin_fold(root)))
+    # The runtime imports gateway.kanban_notifier when it decides.
+    sys.path.insert(0, str(root))
+    asyncio.run(_drive(module, _plugin_blocks(root, REST), _plugin_blocks(root, QUESTION)))
     print(
         "slack_ux_answer verify: the notifier's deliver takes adapter_for()'s adapter inside the incident one; "
-        "off it is the notifier's own, on a finished answer posts its first sentence bold and the rest folded"
+        "off it is the notifier's own, on a finished answer posts its first sentence bold, the rest folded and a "
+        "closing question after the fold, and a report with options posts whole"
     )
 
 

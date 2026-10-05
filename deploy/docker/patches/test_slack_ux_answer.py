@@ -26,6 +26,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import apply_slack_ux_answer as applier
 import apply_slack_ux_incident as incident_applier
+import kanban_notifier
 import slack_presenter as presenter
 import slack_ux_answer as runtime
 import slack_ux_incident as incident
@@ -138,6 +139,18 @@ class SplitTest(unittest.TestCase):
             ([("Two pods fail.", False)], "**Both exit 137.** Raise the limit."),
         )
 
+    def test_a_bold_run_cut_at_a_wrap_reopens_on_the_next_line(self):
+        self.assertEqual(
+            runtime.split("**Two pods fail.\nBoth exit 137.** Raise the limit."),
+            ([("Two pods fail.", False)], "**Both exit 137.** Raise the limit."),
+        )
+
+    def test_a_one_word_bold_answer_before_a_colon_folds(self):
+        self.assertEqual(
+            runtime.split("**No**: all 12 are Running. Two restarted today."),
+            ([("No: all 12 are Running.", False)], "Two restarted today."),
+        )
+
     def test_a_code_span_in_the_lead_stays_code(self):
         headline, rest = runtime.split("**One pod is failing: `web-1` is CrashLoopBackOff.** It exits 137.")
         self.assertEqual(
@@ -171,7 +184,9 @@ class SplitTest(unittest.TestCase):
             "a bare url": "The dashboard is https://example.com/d. It shows the spike.",
             "a mention": "<@U123> owns this pool. Ask them first.",
             "a wrapped sentence": "Checkout is slow because the\npayments pool is full. Scale it.",
-            "a bold lead with no full stop": "**No pods are failing**: all 12 are Running.",
+            "a bold label alone": "**No pods are failing**: all 12 are Running.",
+            "a bold label and more": "**No pods are failing**: all 12 are Running. Two restarted today.",
+            "a bold label and a dash": "**Memory check** \u2014 no node is under pressure. All 3 checked.",
             "an overlong sentence": ("word " * 40).strip() + ". Then more.",
             "a single sentence": "Checkout is healthy.",
             "nothing": "",
@@ -202,6 +217,20 @@ class TrailingQuestionTest(unittest.TestCase):
                 ("All above 90% CPU.", "Want me to scale the pool?"),
             ),
             "after a line that ends": ("The pool is full.\nWant me to scale it?", ("The pool is full.", "Want me to scale it?")),
+            "holding i.e.": (
+                f"{REST}\n\nWant me to scale it, i.e. add two nodes?",
+                (REST, "Want me to scale it, i.e. add two nodes?"),
+            ),
+            "holding approx. before a number": (
+                "The pool is full. Want me to scale it to approx. 6 nodes?",
+                ("The pool is full.", "Want me to scale it to approx. 6 nodes?"),
+            ),
+            "holding pod no. 3": ("It restarted. Want me to watch pod no. 3?", ("It restarted.", "Want me to watch pod no. 3?")),
+            "a stop in a code span": (
+                "It restarted. Want me to roll back to `v1.2`?",
+                ("It restarted.", "Want me to roll back to `v1.2`?"),
+            ),
+            "after a bold sentence": ("**Done.** Open a PR?", ("**Done.**", "Open a PR?")),
         }
         for what, (rest, expected) in cases.items():
             with self.subTest(what):
@@ -268,6 +297,11 @@ class SendTest(unittest.TestCase):
         self.block_kit = mock.patch.object(runtime, "_load_block_kit", return_value=BLOCK_KIT)
         self.block_kit.start()
         self.addCleanup(self.block_kit.stop)
+        modules = mock.patch.dict(
+            sys.modules, {"gateway": types.ModuleType("gateway"), "gateway.kanban_notifier": kanban_notifier}
+        )
+        modules.start()
+        self.addCleanup(modules.stop)
 
     def send(self, adapter, content=ANSWER, chat_id=CHANNEL):
         wrapped = runtime.adapter_for(
@@ -342,6 +376,18 @@ class SendTest(unittest.TestCase):
             self.send(adapter, content=answer)
         self.assertEqual([entry[0] for entry in adapter.log], ["send"])
         self.assertIn("table", logs.output[0])
+
+    def test_a_report_with_options_takes_the_upstream_send_whatever_it_opens_on(self):
+        adapter = _Adapter()
+        report = (
+            "**Checkout is down because the pool is exhausted.** It has 4 nodes.\n\n"
+            "## What to do\n\n- **Option A (scale):** add two nodes.\n- **To authorize:** reply 'apply'"
+        )
+        self.assertTrue(kanban_notifier.actionable_report(report))
+        with self.assertLogs(runtime.logger) as logs:
+            self.send(adapter, content=report)
+        self.assertEqual(adapter.log, [("send", CHANNEL, report, METADATA)])
+        self.assertIn("options", logs.output[0])
 
     def test_a_failed_post_takes_the_upstream_send(self):
         adapter = _Adapter(fail_post=True)
