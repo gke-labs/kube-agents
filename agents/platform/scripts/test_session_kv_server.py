@@ -935,6 +935,12 @@ class TestSlackIncidentAlertDelivery(unittest.TestCase):
                          [("google_chat", "alert"), ("slack", "slack alert")])
         session_kv_server._record_alert_title.assert_called_once_with("s1", "the title")
 
+    def test_the_title_is_recorded_before_the_turn_starts(self):
+        session_kv_server._start_agent_turn.side_effect = (
+            lambda *_args: session_kv_server._record_alert_title.assert_called_once_with("s1", "the title"))
+        self._run(lambda platform, _msg: None if platform == "google_chat" else "1712345678.000100")
+        session_kv_server._start_agent_turn.assert_called_once()
+
     def test_a_google_chat_thread_gets_neither(self):
         alert = self._run(lambda _platform, _msg: "spaces/AAA/threads/T1")
         self.assertEqual([c.args for c in alert.call_args_list], [("google_chat", "alert")])
