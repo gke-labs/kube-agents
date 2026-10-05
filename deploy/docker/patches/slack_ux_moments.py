@@ -42,9 +42,10 @@ and anywhere blocks cannot render. Other block kinds keep the line.
 When the card moves on, any event of it, :func:`settle_question` takes the
 buttons and "waiting on you" off the question, so a typed answer does not
 leave them live. An event that means the card resumed (:data:`ANSWERED_KINDS`)
-also reads the thread once for that answer: the first reply after the question
+also reads the thread for that answer: the first reply after the question
 from a person the adapter would answer, not a bot, and through its channel gate,
-that no other question in the thread was shown with, and before the card asked again, becomes
+that no other question in the thread was shown with, and for a question retried
+after the card asked again, before the card's next question it still holds, becomes
 the same "✓ <name>: <words>" line a click leaves (the words as plain text on
 one line, without the user mentions it opens with, an unlabeled one elsewhere as ``@`` and
 the person's name, clipped to ``TYPED_ANSWER_MAX``).
