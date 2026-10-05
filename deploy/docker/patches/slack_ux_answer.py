@@ -86,8 +86,10 @@ CODE_MARK = "\x01"
 MARKERS = ("**", "__", "*", "_")
 #: Where a sentence in the answer's last line starts: after a sentence end and its space.
 SENTENCE_START = re.compile(r"(?<=[.!?])\s+(?=\S)")
-#: A last line that is not a prose sentence: a quote or a table row, besides :data:`NOT_PROSE`.
+#: A line that is not a prose sentence: a quote or a table row, besides :data:`NOT_PROSE`.
 NOT_PROSE_LINE = re.compile(r"^\s*[>|]")
+#: A line that ends its sentence, so the next line starts a new one.
+LINE_ENDS_SENTENCE = re.compile(r"[.!?:][*_`)\]\"']*\s*$")
 #: Upstream's per-post ``config.extra`` switches the folded post carries as well.
 REPLY_BROADCAST = "reply_broadcast"
 #: The Slack adapter module's link-preview helper, read from the adapter's own module.
@@ -140,8 +142,9 @@ def split(answer: str) -> tuple[list[tuple[str, bool]], str] | None:
     """
     if len(answer) > FOLD_TEXT_MAX:
         return _refuse(f"longer than {FOLD_TEXT_MAX} characters")
-    if NOT_PROSE.match(answer.lstrip("\n")):
-        return _refuse("it opens with a heading, a list item or a code fence")
+    opener = answer.lstrip("\n")
+    if NOT_PROSE.match(opener) or NOT_PROSE_LINE.match(opener):
+        return _refuse("it opens with a heading, a list item, a code fence, a quote or a table row")
     lead, _body = _presenter.split_lead(answer)
     if LOSES_CONTENT.search(lead):
         return _refuse("the first sentence holds a link or a mention")
@@ -174,13 +177,22 @@ def trailing_question(rest: str) -> tuple[str, str]:
 
     A question folded away under :data:`FOLD_TITLE` is one nobody sees, so it posts after the fold.
     """
-    before, _, last_line = rest.rstrip().rpartition("\n")
-    if not last_line.endswith("?") or NOT_PROSE.match(last_line) or NOT_PROSE_LINE.match(last_line):
+    lines = rest.rstrip().split("\n")
+    first = len(lines) - 1
+    # A soft-wrapped question starts on an earlier line of its paragraph: walk back to a line
+    # that ends a sentence, a blank line, or the start.
+    while first and lines[first - 1].strip() and not LINE_ENDS_SENTENCE.search(lines[first - 1]):
+        first -= 1
+    question_lines = lines[first:]
+    if not question_lines[-1].endswith("?") or any(
+        NOT_PROSE.match(line) or NOT_PROSE_LINE.match(line) for line in question_lines
+    ):
         return rest, ""
-    starts = [match.end() for match in SENTENCE_START.finditer(last_line)]
+    joined = " ".join(line.strip() for line in question_lines)
+    starts = [match.end() for match in SENTENCE_START.finditer(joined)]
     cut = starts[-1] if starts else 0
-    kept = "\n".join(part for part in (before, last_line[:cut].rstrip()) if part).strip()
-    return kept, last_line[cut:].strip()
+    kept = "\n".join(part for part in ("\n".join(lines[:first]), joined[:cut].rstrip()) if part).strip()
+    return kept, joined[cut:].strip()
 
 
 def render_fold(rest: str, mrkdwn_fn: Any = None) -> list[dict] | None:

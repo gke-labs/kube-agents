@@ -162,6 +162,8 @@ class SplitTest(unittest.TestCase):
     def test_answers_the_headline_cannot_carry_whole_are_refused(self):
         refused = {
             "a heading": "## Summary\n\nCheckout is slow. The pool is full.",
+            "a quote": "> Checkout is slow.\n\nThe pool is full.",
+            "a table row": "| pod | state |\n| --- | --- |\n\nAll Running.",
             "a list item": "- Checkout is slow. The pool is full.",
             "a numbered item": "1. Checkout is slow. The pool is full.",
             "a code fence": "```\nkubectl get pods\n```\n\nThat lists them.",
@@ -191,13 +193,29 @@ class TrailingQuestionTest(unittest.TestCase):
             "after a sentence": ("The pool is full. Want me to scale it?", ("The pool is full.", "Want me to scale it?")),
             "on its own line": (f"{REST}\n\nShould I open a PR?", (REST, "Should I open a PR?")),
             "alone": ("Want me to watch it?", ("", "Want me to watch it?")),
+            "soft-wrapped": (
+                f"{REST}\n\nWant me to scale the pool\nto 6 nodes?",
+                (REST, "Want me to scale the pool to 6 nodes?"),
+            ),
+            "wrapped after a sentence": (
+                "All above 90% CPU. Want me to scale\nthe pool?",
+                ("All above 90% CPU.", "Want me to scale the pool?"),
+            ),
+            "after a line that ends": ("The pool is full.\nWant me to scale it?", ("The pool is full.", "Want me to scale it?")),
         }
         for what, (rest, expected) in cases.items():
             with self.subTest(what):
                 self.assertEqual(runtime.trailing_question(rest), expected)
 
     def test_anything_else_stays_in_the_fold(self):
-        for rest in (REST, "- Is it the pool?", "> Why did it fail?", "Did it fail? It did."):
+        for rest in (
+            REST,
+            "- Is it the pool?",
+            "> Why did it fail?",
+            "Did it fail? It did.",
+            "- Is it the pool or\n  the node?",
+            "> Why did it\n> fail?",
+        ):
             with self.subTest(rest):
                 self.assertEqual(runtime.trailing_question(rest), (rest, ""))
 
