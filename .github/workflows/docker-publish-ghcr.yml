@@ -208,8 +208,10 @@ jobs:
             ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/gke-stockout-investigator:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/gke-stockout-investigator:${{ github.sha }}
 
-      # The A2A next stack: four images built from the a2a/ module root (each
-      # Dockerfile's header says so) and the Hermes bridge sidecar, which is
+      # The A2A next stack: the gateway, the callout and the verifier built from
+      # the a2a/ module root, the worker from the repository root (it copies the
+      # broker shim from agents/platform/scripts; each Dockerfile's header says
+      # which) and the Hermes bridge sidecar, which is
       # FROM the platform-agent image this same job pushed under this commit's
       # tag, never a registry default (a2a/Dockerfile.hermes-bridge refuses to
       # build without the arg). Hence its place after the platform step. The
@@ -232,7 +234,7 @@ jobs:
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         id: build-a2a-worker
         with:
-          context: a2a
+          context: .
           file: a2a/Dockerfile.worker
           platforms: linux/amd64
           push: true

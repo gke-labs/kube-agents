@@ -47,9 +47,10 @@ One more source exists in the tree but is dark by default: the a2a chatops gatew
 (`a2a/gateway/spawn.go`) stamps `app.kubernetes.io/component: a2a-session` and
 `app.kubernetes.io/part-of: a2a-next` on the session pods it spawns, and it spawns them only
 under `spec.mode: next`, where the operator renders `A2A_SPAWN_SESSIONS`. The values are
-load-bearing the same way Hindsight's are, and for four consumers rather than two: the gateway's
+load-bearing the same way Hindsight's are, and for more consumers: the gateway's
 session cap counts pods and its sweeper lists them by exactly this pair, the operator's bus fence
-admits them to NATS by it, and the operator's session egress policy selects them by it — and a
+admits them to NATS by it, the operator's session egress policy selects them by it, and under the
+operator's `A2A_SESSION_CLUSTER_VIEW` flag the credential broker's ingress policy admits them by it — and a
 NetworkPolicy that selects nothing looks exactly like one that is
 working. `part-of` is deliberately not `kube-agents`: a session pod is spawned per conversation at
 runtime rather than installed, so it stays out of the footprint query above and is reaped by its
