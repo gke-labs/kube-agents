@@ -600,6 +600,18 @@ async def _set_aside(adapter: Any, key: tuple, plan: _Plan) -> None:
         posted = next((old for old in reversed(evicted) if old.ts), None)
         if posted is not None:
             await _session(adapter, old_key, posted)
+        elif _status is not None and _sessions.get(old_key, ("", 0))[0] == _status.SESSION_SUSPENDED:
+            await _close_unposted(adapter, old_key, evicted[-1].team_id)
+
+
+async def _close_unposted(adapter: Any, key: tuple, team_id: str) -> None:
+    setter = getattr(adapter, "_set_thread_status", None)
+    if not (key[0] and key[1]) or setter is None:
+        return
+    try:
+        await setter(key[0], team_id, key[1], "", PLAN_STATUS_LABEL)
+    except Exception as exc:  # noqa: BLE001 — cosmetic
+        logger.debug("slack_ux_status: closing evicted unposted plan's session failed: %s", exc)
 
 
 async def _keep(adapter: Any, key: tuple, plan: _Plan) -> None:
@@ -616,6 +628,9 @@ async def _keep(adapter: Any, key: tuple, plan: _Plan) -> None:
         if old.ts:
             logger.info("slack_ux_status: evicting the plan in %s/%s; closing its session", *old_key)
             await _session(adapter, old_key, old)
+        elif _status is not None and _sessions.get(old_key, ("", 0))[0] == _status.SESSION_SUSPENDED:
+            logger.info("slack_ux_status: evicting the unposted plan in %s/%s; closing its session", *old_key)
+            await _close_unposted(adapter, old_key, old.team_id)
 
 
 def _roll(adapter: Any, key: tuple, plan: _Plan, card: str) -> None:
@@ -868,7 +883,7 @@ async def settle_row(adapter: Any, sub: dict, kind: str, result: str = "") -> No
             else:
                 return
             setter = getattr(adapter, "_set_thread_status", None)
-            if not (key[0] and key[1]) or setter is None or (sent and sent[0] == _status.SESSION_PROCESSING and phrase == ""):
+            if not (key[0] and key[1]) or setter is None:
                 return
             team_id = str(sub.get("team_id") or (plans[0].team_id if plans else ""))
             try:

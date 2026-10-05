@@ -655,6 +655,49 @@ class PlanTest(_RuntimeCase):
         with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05):
             _run(scenario(adapter))
 
+    def test_an_unblocked_card_on_unposted_plan_sends_processing_and_clears_on_completion(self):
+        # When a card blocks on an unposted plan, it suspends. When it unblocks,
+        # it sends processing. When it completes, the session must clear to closed
+        # rather than being suppressed by a sent[0] == processing guard.
+        adapter = _Adapter(_Client(fail={"post"}))
+        self.assertFalse(self._note(adapter, 1, "reading logs"))
+        _run(runtime.settle_row(adapter, _sub(), "blocked"))
+        self.assertEqual(self._sent(adapter), ["suspended"])
+        _run(runtime.settle_row(adapter, _sub(), "unblocked"))
+        self.assertEqual(self._sent(adapter), ["suspended", "processing"])
+        _run(runtime.settle_row(adapter, _sub(), "completed"))
+        self.assertEqual(self._sent(adapter), ["suspended", "processing", "closed"])
+
+    def test_an_unposted_suspended_plan_closes_on_keep_eviction(self):
+        # An unposted plan holding suspended must close its session if evicted at PLANS_MAX.
+        adapter = _Adapter(_Client(fail={"post"}))
+        with mock.patch.object(runtime, "PLANS_MAX", 1):
+            self.assertFalse(self._note(adapter, 1, "a", task="t_a"))
+            _run(runtime.settle_row(adapter, _sub("t_a"), "blocked"))
+            self.assertEqual(self._sent(adapter), ["suspended"])
+            # Evict by starting another plan on another thread
+            _run(runtime.deliver_row(adapter, _sub("t_b", thread="2.0"), 2, "two", "b"))
+            self.assertEqual(self._sent(adapter), ["suspended", "closed"])
+
+    def test_an_unposted_suspended_plan_closes_on_lapsed_eviction(self):
+        # An unposted plan holding suspended that lapsed into _lapsed must close
+        # its session if evicted from _lapsed at PLANS_MAX.
+        async def scenario(adapter):
+            self.assertFalse(await runtime.deliver_row(adapter, _sub("t_a", thread="1.0"), 1, "a", "logs"))
+            await runtime.settle_row(adapter, _sub("t_a", thread="1.0"), "blocked")
+            self.assertEqual(self._sent(adapter), ["suspended"])
+            await asyncio.sleep(0.1)
+            self.assertIn((CHANNEL, "1.0"), runtime._lapsed)
+            # Evict (CHANNEL, "1.0") from _lapsed by lapsing a second thread
+            self.assertFalse(await runtime.deliver_row(adapter, _sub("t_b", thread="2.0"), 2, "b", "logs"))
+            await asyncio.sleep(0.1)
+            self.assertNotIn((CHANNEL, "1.0"), runtime._lapsed)
+            self.assertEqual(self._sent(adapter), ["suspended", "closed"])
+
+        adapter = _Adapter(_Client(fail={"post"}))
+        with mock.patch.object(runtime, "PLANS_MAX", 1), mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05):
+            _run(scenario(adapter))
+
     def test_no_thread_or_no_client_is_not_taken(self):
         self.assertFalse(_run(runtime.deliver_row(_Adapter(), _sub(thread=""), 1, "t", "x")))
         self.assertFalse(_run(runtime.deliver_row(SimpleNamespace(), _sub(), 1, "t", "x")))
