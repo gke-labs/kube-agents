@@ -48,6 +48,8 @@ kube-agents/
 │       ├── governance/                            cron-run SOP playbooks + the
 │       │                                          first-run inventory-scan and
 │       │                                          report-prioritization SOPs
+│       ├── capabilities/                          per-capability criteria defaults
+│       │                                          the agent tunes at runtime
 │       └── skills/                                SKILL.md bundles + the
 │                                                  gke-compute-classes references
 ├── a2a/docs/                                      design notes kept beside the A2A

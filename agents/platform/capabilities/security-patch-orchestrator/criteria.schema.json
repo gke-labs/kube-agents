@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Upgrade & Patch Readiness Audit criteria",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "pool_skew_critical_minors": {
+      "type": "integer",
+      "minimum": 3,
+      "maximum": 10,
+      "default": 3,
+      "description": "Check 3.2: a node pool this many minors or more behind its control plane is critical; from two minors up to it is major. GKE's documented skew ceiling is two, which is why the minimum is three: below that the critical rung would overlap the fixed two-minor and one-minor rungs."
+    },
+    "fleet_spread_min_minors": {
+      "type": "integer",
+      "minimum": 2,
+      "maximum": 10,
+      "default": 2,
+      "description": "Check 3.3: emit the fleet-spread finding when the newest and oldest control-plane minors differ by at least this many."
+    },
+    "blocking_exclusion_min_days": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 365,
+      "default": 30,
+      "description": "Check 3.8: an upgrade-blocking maintenance exclusion that ends further out than this many days is flagged even on a cluster with no outstanding version finding."
+    },
+    "deprecated_image_types": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 64
+      },
+      "maxItems": 32,
+      "default": ["COS", "UBUNTU", "WINDOWS_SAC"],
+      "description": "Check 3.9: node image types flagged as deprecated regardless of whether the location still offers them. Compared case-insensitively."
+    }
+  }
+}
