@@ -807,8 +807,8 @@ or an allow-all `NetworkPolicy/<name>` is reported on stderr and not applied.
 The worker's half is the `provisioning/` pins HCL and YAML make in the GitOps clone, which have no
 machine-readable form yet; a match there is moved here by the worker with the lines that pin the
 property as `excerpt`. A posture a `declares:` note covers is written to `findings` like any other
-and the join moves it; a candidate the worker leaves out because it found the note itself gives the
-join nothing to move, and the declaration never reaches the ledger.
+and the join moves it; a candidate the worker leaves out because it found the note itself is
+declared by `finish` from the collector's manifest when a note covers it, and logged as such.
 
 What the shape enforces:
 
@@ -924,7 +924,10 @@ Every row above says "reproduces", and that is not an accident: **a finding that
 is not in the document at all**, so it has no row in the ledger to carry a state. Two further states
 exist in the code — `resolved` and `resolved-merged` — but neither is ever rendered here. A
 resolution is announced in the delta comment, by id and title recovered from the previous run's stored report, and
-the finding's open pull request is closed as stale. A resolution whose fix had already **merged** is
+the finding's open pull request is closed as stale. The compliance stream has a third close: a pull
+request whose remaining findings are all shielded (SOP 2.7, a declared workload sharing the `default`
+ServiceAccount) is closed with that reason, and those findings stay on the ledger as `manual` rather
+than becoming promotable again. A resolution whose fix had already **merged** is
 the ordinary, expected ending, so nothing extra is closed and nothing extra is said.
 
 Three of the five are easy to misread:

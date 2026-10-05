@@ -25,7 +25,7 @@ hard enum — add new types by PR):
 | `observation`       | A durable finding worth sharing       |
 
 An entry of any type may also carry `declares:`, a list of `{check, namespace, object}` items (plus
-`cluster` for a one-cluster choice) naming a posture the `obtainability-audit` stream lists under
+`cluster` for a one-cluster choice) naming a posture a declaring audit stream (`obtainability-audit`, `compliance-audit`) lists under
 _Declared intent_ instead of reporting (`../README.md`, "Declared intent").
 
 ## Entries

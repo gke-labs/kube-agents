@@ -868,12 +868,10 @@ SHARED_ACCOUNT_SHIELD_NOTE = (
 )
 # How many declared workloads the note names before counting the rest.
 SHARED_ACCOUNT_SHIELD_NAMES = 3
-# The kinds a 2.7 declaration may name, folded as `_object_kind_segment`
-# folds them: 2.7 is declared per workload, and an item naming the namespace
-# or the account covers no workload's token, so it shields nothing.
-SHARED_ACCOUNT_WORKLOAD_KINDS = frozenset(
-    {"deployment", "statefulset", "daemonset", "cronjob", "job", "pod", "replicaset"}
-)
+# The kinds a 2.7 declaration may name: collect.py's COMPLIANCE_WORKLOAD_KINDS,
+# the set `check_default_sa_automount` walks, folded as `_object_kind_segment`
+# folds them. An item naming anything else covers no workload's token.
+SHARED_ACCOUNT_WORKLOAD_KINDS = frozenset({"deployment", "statefulset", "daemonset", "cronjob", "pod"})
 SHARED_ACCOUNT_STALE_REASON = (
     "Closing unmerged: a workload in this namespace is now declared to need the `default` "
     "ServiceAccount's token, so the shared-account fix this pull request proposes would remove "
@@ -882,7 +880,8 @@ SHARED_ACCOUNT_STALE_REASON = (
 SHARED_ACCOUNT_STALE_RESOLUTION = (
     "The finding has not gone: it stays on the ledger with a manual remediation under the "
     "shield note, and `/remediate <finding-id>` refuses it while the declaration stands. "
-    "Withdraw the declaration and the next run groups it onto a branch again."
+    "Withdraw the declaration and the next run lists it with the shared-account manifest fix "
+    "again, awaiting `/remediate`."
 )
 
 # Harness-side declaration discovery (the obtainability SOP's §4a). `start`
@@ -3428,6 +3427,16 @@ def validate_findings(data: object, audit_id: str) -> dict:
                     f"the namespace posture (`{NAMESPACE_SHAPE_KIND}/<ns>`); the allow-all shape "
                     "names the policy and is a fault, so it stays under `findings`"
                 )
+            if (
+                check == SHARED_ACCOUNT_CHECK
+                and _object_kind_segment(str(entry["object"])) not in SHARED_ACCOUNT_WORKLOAD_KINDS
+            ):
+                raise ValidationError(
+                    f"{where}.object: {str(entry['object'])!r} — a {check} declaration names the "
+                    "workload that keeps its token (`Kind/name` of a "
+                    f"{', '.join(sorted(SHARED_ACCOUNT_WORKLOAD_KINDS))}); the namespace or the "
+                    "account covers no workload"
+                )
             for field in ("cluster", "object"):
                 if _id_segment(str(entry[field])) == ID_EMPTY_SEGMENT:
                     raise ValidationError(
@@ -5129,6 +5138,100 @@ def _object_kind_segment(obj: str) -> str:
     return _id_segment(obj).partition("-")[0]
 
 
+def _declaration_lookup(declarations: list[dict]) -> tuple[dict, dict]:
+    """`start`'s declarations keyed as the join compares them: cluster-scoped, then fleet-wide."""
+    scoped: dict[tuple, dict] = {}
+    fleet_wide: dict[tuple, dict] = {}
+    for entry in declarations:
+        has_cluster = bool(entry.get(DECLARATION_CLUSTER_FIELD))
+        target = scoped if has_cluster else fleet_wide
+        target.setdefault(_declaration_key(entry, with_cluster=has_cluster), entry)
+    return scoped, fleet_wide
+
+
+def _declaration_covers(item: dict, scoped: dict, fleet_wide: dict, declarable) -> dict | None:
+    """The declaration that justifies `item` (a finding or a collector candidate), or None.
+
+    The dual-shape rules of `apply_declarations`, without its stderr lines: a
+    declaration moves only the `min == max` shape of `hpa-cannot-scale` and
+    only the `Namespace/` shape of `netpol-missing`.
+    """
+    check = str(item.get("check", ""))
+    if check not in declarable:
+        return None
+    match = scoped.get(_declaration_key(item, with_cluster=True)) or fleet_wide.get(
+        _declaration_key(item, with_cluster=False)
+    )
+    if match is None:
+        return None
+    if check == DUAL_SHAPE_CHECK and str(item.get("severity", "")) != DUAL_SHAPE_POSTURE_SEVERITY:
+        return None
+    if check == NAMESPACE_SHAPE_CHECK and not _is_namespace_object(str(item.get("object", ""))):
+        return None
+    return match
+
+
+def declare_collector_candidates(data: dict, declarations: list[dict], manifest: dict | None) -> list[str]:
+    """Move a collector candidate the document never reported under `declared[]` when a declaration covers it.
+
+    `apply_declarations` can only move what the worker wrote. A worker that
+    reads the note and drops the declared workload instead of reporting it
+    (the omission SOP §3a warns against) leaves no finding to move, and the
+    collector, which reads the fleet and not the repository, goes on emitting
+    the candidate: without this step `still_flagged_ids` would hold it on the
+    ledger beside a sibling whose note says it is declared, and the stale-close
+    pass would keep the namespace's shared-account pull request open for it.
+    So a candidate that no finding and no `declared[]` entry already carries,
+    and that a declaration covers under the same rules, is declared from the
+    manifest, each move logged. Returns the ids declared this way.
+    """
+    if not declarations or manifest is None:
+        return []
+    declarable = audit_declarable_checks(str(data.get("audit") or ""))
+    scoped, fleet_wide = _declaration_lookup(declarations)
+    # Only a cluster the document read: `declared[]` entries the validator
+    # accepts name one of `scope.clusters`, and an entry built here must too.
+    audited = {
+        str(cluster.get("name", ""))
+        for cluster in (data.get("scope") or {}).get("clusters") or []
+        if isinstance(cluster, dict)
+    }
+    declared = list(data.get("declared") or [])
+    known = {derive_finding_id(f) for f in data.get("findings") or []} | {
+        derive_finding_id(e) for e in declared
+    }
+    added: list[str] = []
+    for entry, candidate in _candidates(manifest):
+        keyed = {**candidate, "cluster": str(candidate.get("cluster") or entry.get("name") or "")}
+        identity = derive_finding_id(keyed)
+        if identity in known or keyed["cluster"] not in audited:
+            continue
+        match = _declaration_covers(keyed, scoped, fleet_wide, declarable)
+        if match is None:
+            continue
+        known.add(identity)
+        declared.append(
+            {
+                "check": str(keyed.get("check", "")),
+                "cluster": keyed["cluster"],
+                "namespace": str(keyed.get("namespace") or ""),
+                "object": str(keyed.get("object", "")),
+                "title": f"{keyed.get('check', '')} on {keyed.get('object', '')}: a collector candidate the document did not report",
+                "declaration": {field: str(match.get(field, "")) for field in DECLARATION_FIELDS},
+            }
+        )
+        added.append(_shorten_id(identity))
+        log(
+            f"DECLARED: {_shorten_id(identity)} — {keyed.get('check', '')} on "
+            f"{keyed['cluster']}/{keyed.get('namespace') or '(cluster)'}/{keyed.get('object', '')} "
+            f"is a collector candidate the document did not report and is declared at "
+            f"{match.get('repo', '')}:{match.get('path', '')}; listed under Declared intent."
+        )
+    if added:
+        data["declared"] = declared
+    return added
+
+
 def _is_namespace_object(obj: str) -> bool:
     """Whether `obj` names a Namespace, on the same folding the join uses."""
     return _object_kind_segment(obj) == _id_segment(NAMESPACE_SHAPE_KIND)
@@ -5239,12 +5342,13 @@ def _shield_sources(data: dict, declarations: list[dict]) -> dict[tuple[str, str
     `start`'s declarations hold what the owner declared whether or not the
     worker reported that workload at all. A fleet-wide declaration (no
     `cluster`) is keyed under the empty cluster and reaches every cluster.
-    Each value is `(object, repo, path)`, de-duplicated on the folded object
-    (the first spelling is kept for display), and an item whose object is not
-    a workload kind is logged and left out: it covers no workload's token.
+    Each value is `(object, repo, path)`, one per folded object (the first
+    spelling and the first note that declared it are kept for display), and an
+    item whose object is not a workload kind is logged and left out: it covers
+    no workload's token.
     """
     sources: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
-    seen: set[tuple[str, str, str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
 
     def add(cluster: str, namespace: str, obj: str, repo: str, path: str) -> None:
         if _object_kind_segment(obj) not in SHARED_ACCOUNT_WORKLOAD_KINDS:
@@ -5256,7 +5360,7 @@ def _shield_sources(data: dict, declarations: list[dict]) -> dict[tuple[str, str
             )
             return
         key = (_id_segment(cluster), _id_segment(namespace))
-        folded = key + (_id_segment(obj), repo + ":" + path)
+        folded = key + (_id_segment(obj),)
         if folded in seen:
             return
         seen.add(folded)
@@ -5311,9 +5415,9 @@ def shield_declared_account_siblings(data: dict, declarations: list[dict] | None
             continue
         namespace = _id_segment(str(finding.get("namespace") or ""))
         declared = list(shielded_by.get((_id_segment(str(finding.get("cluster", ""))), namespace), []))
-        named = {(_id_segment(obj), repo, path) for obj, repo, path in declared}
+        named = {_id_segment(obj) for obj, _repo, _path in declared}
         for entry in shielded_by.get((_id_segment(""), namespace), []):
-            if (_id_segment(entry[0]), entry[1], entry[2]) not in named:
+            if _id_segment(entry[0]) not in named:
                 declared.append(entry)
         if not declared:
             continue
@@ -10638,16 +10742,19 @@ def read_run_record(audit_id: str, repo: str | None = None) -> dict | None:
 
 
 def join_harness_declarations(
-    data: dict, record: dict | None, audit_id: str, repo: str | None
+    data: dict, record: dict | None, audit_id: str, repo: str | None, manifest: dict | None = None
 ) -> tuple[list[str], list[str]]:
     """Fold `start`'s search into the document and apply its declarations.
 
     What `finish` — real and dry — and `remediate` share, in the one order
     that is right: the record's `searched` joins the document's
     `declared_intent_searched`, then every finding a filed declaration covers
-    moves to `declared[]`, each move logged, then a declared 2.7 workload's
-    siblings go manual. Returns the ids that moved, so a caller can refuse
-    one by name, and the ids the shield changed, for the stale-close pass;
+    moves to `declared[]`, each move logged, then a covered collector
+    candidate the document left out is declared from `manifest` (when the
+    caller has one), then a declared 2.7 workload's siblings go manual.
+    Returns the ids that moved or were declared from the manifest, so a
+    caller can refuse one by name, and the ids the shield changed, for the
+    stale-close pass;
     neither list is written into the document, so neither can arrive in it.
     Run on a validated document, after `load_findings`, so the ids are the
     derived ones.
@@ -10655,8 +10762,9 @@ def join_harness_declarations(
     fold_searched_record(data, record)
     declarations = read_declarations(audit_id, repo=repo)
     moved = apply_declarations(data, declarations)
+    from_manifest = declare_collector_candidates(data, declarations, manifest)
     shielded = shield_declared_account_siblings(data, declarations)
-    return [str(finding.get("id", "")) for finding in moved], shielded
+    return [str(finding.get("id", "")) for finding in moved] + from_manifest, shielded
 
 
 def load_findings(path: str, audit_id: str) -> dict:
@@ -11899,7 +12007,19 @@ def handle_remediate(args: argparse.Namespace) -> None:
     # them would contradict it.
     repo_hint = opt_repo if args.dry_run else resolve_repo(audit_id=audit_id, repo=opt_repo)
     record = read_run_record(audit_id, repo=repo_hint)
-    declared_ids = set(join_harness_declarations(data, record, audit_id, repo_hint)[0])
+    # The same hold `finish` applies from the collector manifest, when the
+    # caller has one. An id the document lacks and the collector still flags
+    # is held on the ledger, not a typo, and the answer says which.
+    manifest_file = getattr(args, "manifest_file", None)
+    if manifest_file is not None and not str(manifest_file).strip():
+        # The same refusal `finish` gives: an empty path is a flag the caller
+        # meant to pass, not the absence of one.
+        raise ValidationError(
+            "--manifest-file: give the path of the manifest the collector "
+            "wrote; an empty path is not the same as running without one."
+        )
+    manifest = load_manifest(manifest_file, audit_id) if manifest_file is not None else None
+    declared_ids = set(join_harness_declarations(data, record, audit_id, repo_hint, manifest=manifest)[0])
     withheld_ids = set(finding_ids(withhold_unsearched_postures(data, record)))
     findings = list(data["findings"])
     covered = [fid for fid in args.finding if fid in declared_ids]
@@ -11921,22 +12041,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
         )
 
     by_id = {str(f.get("id", "")): f for f in findings}
-    # The same hold `finish` applies from the collector manifest, when the
-    # caller has one. An id the document lacks and the collector still flags
-    # is held on the ledger, not a typo, and the answer says which.
-    manifest_file = getattr(args, "manifest_file", None)
-    if manifest_file is not None and not str(manifest_file).strip():
-        # The same refusal `finish` gives: an empty path is a flag the caller
-        # meant to pass, not the absence of one.
-        raise ValidationError(
-            "--manifest-file: give the path of the manifest the collector "
-            "wrote; an empty path is not the same as running without one."
-        )
-    still_flagged = (
-        still_flagged_ids(load_manifest(manifest_file, audit_id), data)
-        if manifest_file is not None
-        else set()
-    )
+    still_flagged = still_flagged_ids(manifest, data) if manifest is not None else set()
     collector_held = [fid for fid in args.finding if fid not in by_id and fid in still_flagged]
     if collector_held:
         # This command reads no ledger body, so it cannot say whether the
@@ -12238,7 +12343,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # order matters: a posture a declaration covers moves to `declared[]`,
     # where it cites the file it was read from, and only what is left is
     # measured against the search record.
-    shielded_ids = set(join_harness_declarations(data, record, audit_id, repo_hint)[1])
+    shielded_ids = set(join_harness_declarations(data, record, audit_id, repo_hint, manifest=manifest)[1])
     withheld = withhold_unsearched_postures(data, record)
     if withheld:
         log(

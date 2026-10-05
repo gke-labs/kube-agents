@@ -14,7 +14,7 @@ gitops-repo/
 ├── fleet/                         # project-level policy; platform-tier Agent CR + identity
 ├── knowledge/                     # OKF base (§5) — never applied to a cluster
 ├── policy/                        # admission policies (ValidatingAdmissionPolicy; Gatekeeper/Kyverno)
-├── .kube-agents/intent.yaml       # where the obtainability audit looks for declared-intent notes
+├── .kube-agents/intent.yaml       # where the declaring audits look for declared-intent notes
 └── .github/workflows/             # the actuation pipeline config (customer's CI/CD)
 ```
 

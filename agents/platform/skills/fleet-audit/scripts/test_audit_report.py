@@ -5436,6 +5436,17 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
             with self.subTest(obj):
                 doc["declared"][0]["object"] = obj
                 audit_report.validate_findings(doc, AUDIT)
+        # A 2.7 entry names the workload that keeps its token; the namespace or
+        # the account covers none, and the shield would ignore the entry.
+        for obj in ("Namespace/payments", "ServiceAccount/default"):
+            with self.subTest(obj):
+                doc["declared"][0].update({"check": "default-sa-automount", "object": obj})
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(doc, AUDIT)
+                self.assertIn("names the workload", str(cm.exception))
+        doc["declared"][0].update({"check": "default-sa-automount", "object": "Deployment/api"})
+        audit_report.validate_findings(doc, AUDIT)
+        doc["declared"][0].update({"check": "netpol-missing", "object": "Namespace/payments"})
         # A missing object is reported as missing, not as the allow-all shape.
         del doc["declared"][0]["object"]
         with self.assertRaises(audit_report.ValidationError) as cm:
@@ -5548,6 +5559,42 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
             audit_report.shield_declared_account_siblings(both, [declaration])
         (left,) = both["findings"]
         self.assertEqual(left["remediation"]["note"].count("declared at acme/fleet:knowledge/api-token.md"), 1)
+        # Two notes declaring the same workload name it once, under the first.
+        twice = audit_report.validate_findings(make_doc(findings=[self._sa_finding("worker", "Deployment/worker")], audit=AUDIT), AUDIT)
+        second = dict(declaration, path="knowledge/also-api.md")
+        with contextlib.redirect_stderr(io.StringIO()):
+            audit_report.shield_declared_account_siblings(twice, [declaration, second])
+        note = twice["findings"][0]["remediation"]["note"]
+        self.assertEqual(note.count("`Deployment/api` declared at"), 1)
+        self.assertIn("knowledge/api-token.md", note)
+
+    def test_candidates_are_declared_from_the_manifest_under_the_same_shape_rules(self):
+        posture = {"check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments", "object": "Namespace/payments", "severity": "major", "excerpt": "no policy"}
+        fault = {"check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments", "object": "NetworkPolicy/allow-everything", "severity": "minor", "excerpt": "allow all"}
+        reported = {"check": "default-sa-automount", "cluster": "prod-us-east", "namespace": "payments", "object": "Deployment/api", "severity": "major", "excerpt": "automount"}
+        manifest = {"clusters": [{"name": "prod-us-east", "candidates": [posture, fault, reported]}]}
+        declarations = [
+            {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/payments", "repo": "acme/fleet", "path": "knowledge/payments.md", "excerpt": "x"},
+            {"check": "netpol-missing", "namespace": "payments", "object": "NetworkPolicy/allow-everything", "repo": "acme/fleet", "path": "knowledge/payments.md", "excerpt": "x"},
+            {"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "x"},
+        ]
+        api = self._sa_finding("api", "Deployment/api")
+        doc = audit_report.validate_findings(make_doc(findings=[api], audit=AUDIT), AUDIT)
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, declarations)
+            added = audit_report.declare_collector_candidates(doc, declarations, manifest)
+        # api was reported and moved by apply_declarations, so it is not added
+        # again; the namespace posture is declared from the manifest; the
+        # allow-all fault never is.
+        self.assertEqual([f["object"] for f in moved], ["Deployment/api"])
+        self.assertEqual(added, [audit_report._shorten_id(audit_report.derive_finding_id({**posture}))])
+        self.assertEqual(sorted(e["object"] for e in doc["declared"]), ["Deployment/api", "Namespace/payments"])
+        self.assertEqual(audit_report.declare_collector_candidates(doc, declarations, manifest), [])
+        self.assertEqual(audit_report.declare_collector_candidates(doc, declarations, None), [])
+        # A candidate on a cluster the document did not read is not declared:
+        # the validator holds `declared[]` to `scope.clusters`, and so does this.
+        elsewhere = {"clusters": [{"name": "rogue-cluster", "candidates": [dict(posture, cluster="rogue-cluster")]}]}
+        self.assertEqual(audit_report.declare_collector_candidates(doc, declarations, elsewhere), [])
 
     def test_a_declaration_naming_no_workload_shields_nothing(self):
         # 2.7 is declared per workload. An item that copies the 2.6 shape, or
@@ -16126,6 +16173,38 @@ class TestFinishManifestFlag(HarnessTestCase):
         comment = " ".join(self.harness.bodies_for("proposal-*"))
         self.assertIn("declared to need the `default` ServiceAccount's token", comment)
         self.assertNotIn("PR #9 covers", self.err)
+
+    def test_a_declared_candidate_the_worker_omits_is_declared_from_the_manifest(self):
+        # The omission SOP §3a warns against: the owner declared api, the worker
+        # read the note and dropped api instead of reporting it. The collector
+        # still emits api's candidate. Without declaring it from the manifest,
+        # api would be held on the ledger beside worker's shield note and the
+        # shared-account pull request would stay open for it.
+        path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
+        api = make_finding(fid="api", check="default-sa-automount", obj="Deployment/api", title="api", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        worker = make_finding(fid="worker", check="default-sa-automount", obj="Deployment/worker", title="worker", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        previous_body = published_body(make_doc(findings=[api, worker], audit=AUDIT), generated_at=NOW)
+        self.declaring_replies(previous_body)
+        api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
+        worker_id = derived_id(check="default-sa-automount", obj="Deployment/worker")
+        self.harness.replies["proposal-list"] = proposals_view(
+            [pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([api_id, worker_id]))]
+        )
+        self.touch(path)
+        audit_report.write_declarations(AUDIT, "acme/fleet", [{"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}])
+        doc = make_doc(findings=[worker], audit=AUDIT)
+        manifest = _full_manifest(audit=AUDIT, candidates=[self.account_candidate("Deployment/api"), self.account_candidate("Deployment/worker")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn(f"DECLARED: {api_id}", self.err)
+        self.assertIn("collector candidate the document did not report", self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
+        comment = " ".join(self.harness.bodies_for("proposal-*"))
+        self.assertIn("declared to need the `default` ServiceAccount's token", comment)
+        ledger = " ".join(self.harness.bodies_for("issue-*"))
+        self.assertIn("`payments/Deployment/api`", ledger)
+        self.assertNotIn(f"PR #9 covers", self.err)
 
     def test_a_worker_cannot_mark_a_sibling_shielded_from_the_document(self):
         # Same pull request, no declaration anywhere: a document that carries

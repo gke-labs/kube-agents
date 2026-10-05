@@ -345,7 +345,7 @@
 # security ledger: no finding id for the namespace, and a Declared intent row
 # naming the note. Red on main's images (the finding published), three greens
 # on the branch's, on a dev install. One case, three units: this file's share
-# is forty-seven cases (141 units) of a sixty-one-case, 183-unit matrix (with
+# is forty-nine cases (147 units) of a sixty-three-case, 189-unit matrix (with
 # the presubmit file's fourteen). deployer: noop, read-only over the seeded fleet.
 ./tasks/compliance-declared-intent-no-finding/task.yaml
 
@@ -355,8 +355,8 @@
 # grades the ledger: the declared workload under Declared intent, the sibling
 # still a finding with a manual fix naming the declared one. Red on main's
 # images (both published as findings), three greens on the branch's, on a dev
-# install. One case, three units: this file's share is forty-eight cases
-# (144 units) of a sixty-two-case, 186-unit matrix (with the presubmit file's
+# install. One case, three units: this file's share is fifty cases
+# (150 units) of a sixty-four-case, 192-unit matrix (with the presubmit file's
 # fourteen). deployer: noop, read-only over the seeded fleet.
 ./tasks/compliance-declared-token-shields-siblings/task.yaml
 
