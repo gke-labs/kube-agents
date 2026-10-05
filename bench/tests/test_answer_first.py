@@ -146,6 +146,28 @@ def test_a_soft_wrapped_sentence_counts_once():
     assert outcome.success, outcome.reason
 
 
+def test_a_sentence_ending_inside_a_closer_counts():
+    bolded = (
+        "**All pods run.** **No node is under pressure.** **Two jobs completed.** "
+        "**Three nodes were checked.** **Want me to watch it?**"
+    )
+    assert "5 sentences, over 4" in _run(bolded).reason
+    outcome = _run("**Every node is fine.** All three report *False.*\nWant me to watch it?", max_sentences=3)
+    assert outcome.success, outcome.reason
+    assert "4 sentences, over 3" in _run(
+        "**Every node is fine.** They report **False.**\nTwo jobs completed.\nWatch it?", max_sentences=3
+    ).reason
+
+
+def test_a_stop_before_a_lowercase_letter_ends_no_sentence():
+    for result in (
+        "**Pods are fine—i.e. none restart.** All three nodes report False.",
+        "**Still running... no restarts.** All three nodes report False.",
+    ):
+        outcome = _run(result)
+        assert outcome.success, (result, outcome.reason)
+
+
 def test_a_hash_line_in_a_fence_is_not_a_heading():
     outcome = _run("**Every node is fine.** Run this:\n\n```\n# list nodes\nkubectl get nodes\n```")
     assert outcome.success, outcome.reason
@@ -157,6 +179,15 @@ def test_a_link_counts_as_its_text():
     assert _run(f"**The [cluster]({url}) is fine.** All three nodes report False.").success
     long = f"**The [{'cluster ' * 80}]({url}) is fine.** All three nodes report False."
     assert "characters, over 600" in _run(long).reason
+
+
+def test_bold_and_code_markers_count_as_nothing():
+    body = " ".join(f"`v{i}`" for i in range(30))
+    result = f"**It is fine.** {body} {'x' * (600 - len('It is fine. ') - len(body.replace('`', '')) - 1)}"
+    assert len(result) > 600
+    outcome = _run(result)
+    assert outcome.success, outcome.reason
+    assert "characters, over 600" in _run(result + "y").reason
 
 
 def test_the_caps_count_characters_and_sentences():

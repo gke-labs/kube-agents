@@ -287,13 +287,20 @@ _ATX_HEADING = re.compile(r"^ {0,3}#{1,6} ", re.MULTILINE)
 # A fenced block, dropped before the heading check: a "# comment" in a snippet is no heading
 # (kanban_report_format.py's ``_FENCE``).
 _FENCE = re.compile(r"```.*?```", re.DOTALL)
-# A sentence ends at terminal punctuation followed by whitespace; a line break
-# ends one too, so each bullet counts.
-_SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+|\n+")
-_INNER_SENTENCE_BREAK = re.compile(r"[.!?]\s+\S")
-# A line break inside a soft-wrapped sentence: after a line that has not ended, before a line
-# that is not blank, a list item or a heading. It joins, as slack_presenter.split_lead does.
-_SOFT_WRAP = re.compile(r"(?<=[^.!?:\s])[ \t]*\n(?=[ \t]*\S)(?![ \t]*(?:[-*+]|\d+[.)]|#{1,6})\s)")
+# Where the fold ends a sentence: terminal punctuation, an emphasis closer after it allowed,
+# then whitespace and anything but a lowercase letter. Copied from slack_presenter.py's
+# ``SENTENCE_END``; keep the two the same.
+_SENTENCE_END = re.compile(r"(?:(?<=[.!?])|(?<=[.!?][*_])|(?<=[.!?]\*\*)|(?<=[.!?]__))\s+(?=[^\sa-z])")
+# A line break ends a sentence too, so each bullet counts.
+_SENTENCE_BREAK = re.compile(_SENTENCE_END.pattern + r"|\n+")
+_INNER_SENTENCE_BREAK = _SENTENCE_END
+# A line break inside a soft-wrapped sentence: after a line that has not ended (a stop, with or
+# without an emphasis closer, or a colon), before a line that is not blank, a list item or a
+# heading. It joins, as slack_presenter.split_lead does.
+_SOFT_WRAP = re.compile(
+    r"(?<=\S)(?<![.!?:])(?<![.!?][*_])(?<![.!?]\*\*)(?<![.!?]__)"
+    r"[ \t]*\n(?=[ \t]*\S)(?![ \t]*(?:[-*+]|\d+[.)]|#{1,6})\s)"
+)
 # Abbreviations whose dots end no sentence; their dots are dropped before counting. The
 # fold's own tables, copied from slack_presenter.py's ``ABBREVIATION_END`` and
 # ``NUMBER_ABBREVIATION_END`` (no/max/min abbreviate only before a number), plus a.m./p.m.
@@ -312,6 +319,8 @@ _LEAD_CLAUSE = (":", "\u2014", "\u2013")
 _WHITESPACE = re.compile(r"\s")
 # A markdown link; chat shows its text, not its target.
 _MARKDOWN_LINK = re.compile(r"\[([^\]]*)\]\([^)\s]*\)")
+# Bold and code markers, which chat renders rather than shows.
+_UNSHOWN_MARKUP = re.compile(r"\*\*|`")
 
 
 def _delivered_results(final_message: str) -> list[str]:
@@ -351,7 +360,7 @@ class AnswerFirstVerifier(BaseVerifier):
     Every delivered result must pass: the lead is a bold span opening the
     result and holding one whole sentence; no ATX heading anywhere; at most
     ``max_chars`` characters as chat shows them, a markdown link counting as
-    its text, and ``max_sentences`` sentences, a bullet counting as one and a
+    its text and bold and code markers not at all, and ``max_sentences`` sentences, a bullet counting as one and a
     soft-wrapped sentence as one; and no sentence
     after the lead matching any of ``recap_patterns``, regexes searched in each
     later sentence's normalized text, which name the ways a restated verdict
@@ -405,7 +414,7 @@ class AnswerFirstVerifier(BaseVerifier):
             rest = after.lstrip(_LEAD_TRAIL)
         if _ATX_HEADING.search(_FENCE.sub("", result)):
             defects.append("carries a section heading")
-        shown = len(_MARKDOWN_LINK.sub(r"\1", result))
+        shown = len(_UNSHOWN_MARKUP.sub("", _MARKDOWN_LINK.sub(r"\1", result)))
         if shown > self.max_chars:
             defects.append(f"{shown} characters, over {self.max_chars}")
         later = _sentences(rest)
