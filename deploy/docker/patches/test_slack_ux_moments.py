@@ -602,6 +602,22 @@ class SettleQuestionTest(unittest.TestCase):
         note = adapter.updates[0]["blocks"][-1]["elements"][0]["text"]
         self.assertEqual(note, "✓ Priya: seeded-b, ask @Sam ops or @Priya or @U8")
 
+    def test_a_mention_whose_name_lookup_fails_keeps_its_id(self):
+        adapter = _Adapter()
+        resolve = adapter._resolve_user_name
+
+        async def flaky(user_id, chat_id="", team_id=""):
+            if user_id == "U9":
+                raise RuntimeError("user_not_found")
+            return await resolve(user_id, chat_id, team_id)
+
+        adapter._resolve_user_name = flaky
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        adapter.replies = [{"ts": "1700000000.000400", "user": "U7", "text": ", <@U0BOT> seeded-b, ask <@U9>"}]
+        _run(runtime.settle_question(adapter, SUB))
+        note = adapter.updates[0]["blocks"][-1]["elements"][0]["text"]
+        self.assertEqual(note, "✓ Priya: seeded-b, ask @U9")
+
     def test_a_click_whose_rewrite_failed_settles_without_a_typed_line(self):
         adapter = _Adapter()
         _run(runtime.needs_you(adapter, SUB, QUESTION, 3))

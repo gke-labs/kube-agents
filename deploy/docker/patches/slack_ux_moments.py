@@ -45,8 +45,8 @@ leave them live. An event that means the card resumed (:data:`ANSWERED_KINDS`)
 also reads the thread once for that answer: the first reply after the question
 from a person the adapter would answer, not a bot, and through its channel gate, becomes
 the same "✓ <name>: <words>" line a click leaves (the words as plain text on
-one line, without the user mentions it opens with and with any other as ``@`` and the
-person's name, clipped to ``TYPED_ANSWER_MAX``).
+one line, without the user mentions it opens with, an unlabeled one elsewhere as ``@`` and
+the person's name, clipped to ``TYPED_ANSWER_MAX``).
 A card that moved on any other way, or with nobody replying, a read that fails, or a question a click answered whose rewrite
 failed (the click posted its line in the thread) settles without the line. A question a click already answered
 was rewritten by the click and is left alone, as is one whose rewrite is still
@@ -126,12 +126,13 @@ TYPED_SUBTYPES = frozenset({"thread_broadcast", "file_share", "me_message"})
 #: A Slack entity in a reply's text: a link, a mention or a special mention, with an optional label.
 SLACK_ENTITY = re.compile(r"<([^<>|]*)(?:\|([^<>]*))?>")
 
-#: The user mentions a reply opens with, such as the agent's in a channel that requires one.
-#: They address the reply, so they are not part of the answer its line shows.
 #: An unlabeled user mention inside a reply's words, shown as ``@`` and the person's name.
 USER_MENTION = re.compile(r"<@([A-Z0-9]+)>")
 #: The characters that would end an entity's label early, read as spaces in a name put in one.
 MENTION_LABEL_UNSAFE = str.maketrans("|<>", "   ")
+
+#: The user mentions a reply opens with, such as the agent's in a channel that requires one.
+#: They address the reply, so they are not part of the answer its line shows.
 LEADING_MENTIONS = re.compile(r"^(?:[\s,:]*<@[A-Z0-9]+(?:\|[^<>]*)?>)+[\s,:]*")
 
 #: Added to a question's ``text``, so a session the wake never reached reads its card in the thread.
