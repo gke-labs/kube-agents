@@ -329,6 +329,12 @@ def test_with_the_module_the_question_posts_once_and_the_wake_carries_the_note(
         f"[kanban] Task {planted.card} blocked; needs attention.\n"
         f"Assignee: @{card_wake.WAKE_ASSIGNEE}\n\n{_moments_note()}"
     )
+    # The question's choices sit inside the side bar's attachment, so the
+    # replay's capture of it is what lets a fresh session read them.
+    (side_bar,) = planted.post["attachments"]
+    assert side_bar["color"] == "#ECB22E"
+    assert "seeded-a" in json.dumps(side_bar["blocks"])
+    assert "seeded-a" not in json.dumps(planted.post["blocks"])
     card = _board(tmp_path)["tasks"][planted.card]
     assert card["status"] == "blocked"
     assert card["created_by"] == card_wake.CARD_CREATOR
