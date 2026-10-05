@@ -27,11 +27,11 @@ Each line gives the entry, its verdict from the harness, the script the verdict 
 the seeded fleet on `main` holds for it. The fleet can carry a before-state only, and only one that GKE's own node rebuilds do not erase.
 
 1. [A PodDisruptionBudget forbids the eviction](#1-a-poddisruptionbudget-forbids-the-eviction):
-   reproduced; `scenarios/01.sh`; none shaped to block a drain on `main`.
+   reproduced; `scenarios/01.sh`; `readiness-drain-blocked` on seeded-b.
 2. [No spare capacity for the displaced pods](#2-no-spare-capacity-for-the-displaced-pods):
-   reproduced; `scenarios/02.sh`; no role on `main`.
+   reproduced; `scenarios/02.sh`; `readiness-surge-blocked` on seeded-b.
 3. [Every replica in one zone or on one node](#3-every-replica-in-one-zone-or-on-one-node):
-   reproduced; `scenarios/03.sh`; no role on `main`.
+   reproduced; `scenarios/03.sh`; the three `zonal-skew-*` roles on seeded-d.
 4. [Data on the node is gone](#4-data-on-the-node-is-gone): reproduced; `scenarios/04.sh`; no role
    on `main`.
 5. [Maintenance window too short, or an exclusion ends
@@ -41,8 +41,7 @@ the seeded fleet on `main` holds for it. The fleet can carry a before-state only
    `scenarios/06.sh`; no standing role possible; `deprecated-api-caller` stands in with a different
    label.
 7. [A fail-closed webhook whose backend is not
-   up](#7-a-fail-closed-webhook-whose-backend-is-not-up): reproduced; `scenarios/07.sh`; no role on
-   `main`.
+   up](#7-a-fail-closed-webhook-whose-backend-is-not-up): reproduced; `scenarios/07.sh`; `readiness-failclosed-webhook` on seeded-b.
 8. [A default changes in the new minor](#8-a-default-changes-in-the-new-minor): reproduced;
    `scenarios/08.sh`; version-bound, not for the fleet.
 9. [A feature is deprecated but still served](#9-a-feature-is-deprecated-but-still-served): no break
@@ -86,11 +85,10 @@ Harness: `scenarios/01.sh`; `bash run.sh 01`. Reproduced: the budget refused GKE
 429 to the container-engine robot in the audit log), GKE force-killed the pod 61 minutes after the
 pool upgrade began, and the operation read DONE while the replacement was still Pending.
 
-Fleet: `readiness-drain-blocked` on seeded-b (`pinned-batch-runner`'s `maxUnavailable: 0` budget, with
-`readiness-pinned-workload` the one-replica Deployment it protects) carries it. Seeded-a's
-`inference-server` budget reads `disruptionsAllowed` 0 at runtime as a side effect of its pinned
-pool, which the readiness check's spec-shape rule does not count. A budget
-shaped that way on seeded-b would carry the entry.
+Fleet: `readiness-drain-blocked` on seeded-b (`pinned-batch-runner`'s `maxUnavailable: 0` budget;
+`readiness-pinned-workload` is the role of the one-replica Deployment it protects) carries it.
+Seeded-a's `inference-server` budget reads `disruptionsAllowed` 0 at runtime as a side effect of its
+pinned pool, which the readiness check's spec-shape rule does not count.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/01.sh`, evidence
 `bench/upgrade-scenarios/evidence/01/budget.txt`, and item 1 of the harness README. Detection, where
@@ -132,7 +130,7 @@ Harness: `scenarios/04.sh` (`upg-04b`); `bash run.sh 04`. Reproduced: an emptyDi
 control-plane upgrade and was replaced after the node rebuild, and nothing reported the loss; only
 emptyDir was tested, not hostPath or Local SSD.
 
-Fleet: no role on `main`, and none would hold: an `emptyDir` stamp is exactly what the fleet's own node rebuilds erase, so the before-state would become the after-state at GKE's next patch.
+Fleet: no role on `main`. An `emptyDir` stamp would not hold, since the fleet's own node rebuilds erase it, but the volume source itself (a workload whose queue is an `emptyDir`) does, and that is the shape the catalogue's coverage section designs.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/04.sh`, evidence
 `bench/upgrade-scenarios/evidence/04/node-data.txt`, and item 4 of the harness README. Detection,
@@ -243,7 +241,7 @@ Harness: `scenarios/12.sh` (`upg-12b`); `bash run.sh 12`. Reproduced in GKE's fo
 a label set by hand stayed Pending after the rebuilt node came back without it, and GKE reported
 DONE; whether a minor still drops a standard label was not checked.
 
-Fleet: no role on `main`, and none would hold: a hand-set node label does not survive the node rebuild GKE's own patch upgrades perform, which is the break itself, so the fixture would plant the after-state.
+Fleet: no role on `main`. A hand-set node label would not hold through the node rebuild GKE's own patch upgrades perform, but a selector on a built-in deprecated label the kubelet still sets (`beta.kubernetes.io/arch`) does, and that is the designed shape.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/12.sh`, evidence
 `bench/upgrade-scenarios/evidence/12/label.txt`, and item 12 of the harness README. Detection, where
@@ -256,8 +254,9 @@ Harness: `scenarios/13.sh` and `13b.sh`; `bash run.sh 13b`. Reproduced: a patch-
 inside 1.31 moved containerd from 1.7.34 to 2.0.10 and a v1alpha2 CRI client broke; run 13 found the
 newest 1.31 patch already on containerd 2.0, so the runtime moves with a patch, not a minor.
 
-Fleet: no role on `main`; the REGULAR clusters already run containerd 2, so a role there could hold
-only the wreckage.
+Fleet: no role on `main`. The REGULAR clusters already run containerd 2, so a runtime-version fixture
+could hold only the wreckage, but an agent mounting the containerd socket holds on any runtime, and
+that is the designed shape.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/13b.sh`, evidence
 `bench/upgrade-scenarios/evidence/13b/runtime.txt`, and item 13 of the harness README. Detection,
@@ -315,7 +314,7 @@ only where a hand-set label was, the rebuilt node lacked the label, the DaemonSe
 the client on the new node got Connection refused, with the operation DONE; GKE's own node agents
 cannot be broken from outside.
 
-Fleet: no role on `main`, and none would hold: the hand-set label the DaemonSet selects on is what a node rebuild drops, so GKE's own patch upgrades would turn the fixture into the after-state.
+Fleet: no role on `main`. A hand-set label the DaemonSet selects on is what a node rebuild drops, so that shape would turn into the after-state, but a host-network agent mounting the CNI configuration directory holds, and that is the designed shape.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/17.sh`, evidence
 `bench/upgrade-scenarios/evidence/17/node-agent.txt`, and item 17 of the harness README. Detection,
@@ -333,7 +332,7 @@ forward-compatibility libraries a planted pod forced (Error 803). The upgrade re
 catalogue's condition rather than creating it, and two runs lost their only GPU node to a stockout
 mid-upgrade while the operation read DONE.
 
-Fleet: never the fleet, which carries no accelerator.
+Fleet: no role on `main`, and the fleet carries no accelerator, so nothing GPU-bound can run; a suspended job that requests a GPU and pins a CUDA version holds as a manifest, and that is the designed shape.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/18k.sh` (`18m.sh` repeats it in another zone; both
 source `18.sh`; the forward-compatibility round is `bench/upgrade-scenarios/compat-probe.sh`),
