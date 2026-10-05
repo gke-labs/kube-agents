@@ -86,7 +86,7 @@ verification_spec:
       fixture_roles:
         - readiness-failclosed-webhook
       any_of_patterns:
-        - '(?m)^(?:(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*[-_/])?seeded-b(?![a-z0-9])(?:-(?:africa|asia|australia|europe|me|northamerica|southamerica|us)-[a-z]+\d+(?:-[a-z])?)?(?:\s*\([^)\n]*\))?: upgrade blockers: [^;\n]+; fail-closed webhooks with no backend: [^;\n]+; any of them blocks the upgrade: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: upgrade blockers: [^;\n]+; fail-closed webhooks with no backend: [^;\n]+; any of them blocks the upgrade: (?:yes|no)$'
 
   # The discovery proof. Neither the configuration's name nor the webhook's is in the
   # prompt; only reading the admission configuration and finding its Service missing puts
@@ -100,9 +100,9 @@ verification_spec:
       fixture_roles:
         - readiness-failclosed-webhook
       any_of_patterns:
-        - '(?m)^(?:(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*[-_/])?seeded-b(?![a-z0-9])(?:-(?:africa|asia|australia|europe|me|northamerica|southamerica|us)-[a-z]+\d+(?:-[a-z])?)?(?:\s*\([^)\n]*\))?: upgrade blockers: [^;\n]+; fail-closed webhooks with no backend: [^;\n]*(?<![a-z0-9-])seeded-fail-closed-gate(?![a-z0-9-])[^;\n]*; any of them blocks the upgrade: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: upgrade blockers: [^;\n]+; fail-closed webhooks with no backend: [^;\n]*(?<![a-z0-9-])seeded-fail-closed-gate(?![a-z0-9-])[^;\n]*; any of them blocks the upgrade: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^(?:(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*[-_/])?seeded-b(?![a-z0-9])(?:-(?:africa|asia|australia|europe|me|northamerica|southamerica|us)-[a-z]+\d+(?:-[a-z])?)?(?:\s*\([^)\n]*\))?: upgrade blockers: [^;\n]+; fail-closed webhooks with no backend: none; any of them blocks the upgrade: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: upgrade blockers: [^;\n]+; fail-closed webhooks with no backend: none; any of them blocks the upgrade: (?:yes|no)$'
 
   # The half this case exists for: the planted gate matches ConfigMaps only, so it is an
   # outage for what it matches, not what stops seeded-b's upgrade (its budget and its
@@ -117,10 +117,10 @@ verification_spec:
       fixture_roles:
         - readiness-failclosed-webhook
       any_of_patterns:
-        - '(?m)^(?:(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*[-_/])?seeded-b(?![a-z0-9])(?:-(?:africa|asia|australia|europe|me|northamerica|southamerica|us)-[a-z]+\d+(?:-[a-z])?)?(?:\s*\([^)\n]*\))?: upgrade blockers: (?![^;\n]*(?<![a-z0-9-])seeded-fail-closed-gate(?![a-z0-9-]))(?![^;\n]*webhook)[^;\n]+; fail-closed webhooks with no backend: [^;\n]+; any of them blocks the upgrade: no$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: upgrade blockers: (?![^;\n]*(?<![a-z0-9-])seeded-fail-closed-gate(?![a-z0-9-]))(?![^;\n]*webhook)[^;\n]+; fail-closed webhooks with no backend: [^;\n]+; any of them blocks the upgrade: no$'
       forbidden_patterns:
-        - '(?m)^(?:(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*[-_/])?seeded-b(?![a-z0-9])(?:-(?:africa|asia|australia|europe|me|northamerica|southamerica|us)-[a-z]+\d+(?:-[a-z])?)?(?:\s*\([^)\n]*\))?: upgrade blockers: [^;\n]*(?:(?<![a-z0-9-])seeded-fail-closed-gate(?![a-z0-9-])|webhook)[^;\n]*; fail-closed webhooks with no backend: [^;\n]+; any of them blocks the upgrade: (?:yes|no)$'
-        - '(?m)^(?:(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*[-_/])?seeded-b(?![a-z0-9])(?:-(?:africa|asia|australia|europe|me|northamerica|southamerica|us)-[a-z]+\d+(?:-[a-z])?)?(?:\s*\([^)\n]*\))?: upgrade blockers: [^;\n]+; fail-closed webhooks with no backend: [^;\n]+; any of them blocks the upgrade: yes$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: upgrade blockers: [^;\n]*(?:(?<![a-z0-9-])seeded-fail-closed-gate(?![a-z0-9-])|webhook)[^;\n]*; fail-closed webhooks with no backend: [^;\n]+; any of them blocks the upgrade: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: upgrade blockers: [^;\n]+; fail-closed webhooks with no backend: [^;\n]+; any of them blocks the upgrade: yes$'
 
   # The blockers that do stop seeded-b are named: its drain-blocking budget and its minor
   # hold are the readiness report's own findings, so a line that says "none" has not read
@@ -134,7 +134,7 @@ verification_spec:
       fixture_roles:
         - readiness-failclosed-webhook
       any_of_patterns:
-        - '(?m)^(?:(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*[-_/])?seeded-b(?![a-z0-9])(?:-(?:africa|asia|australia|europe|me|northamerica|southamerica|us)-[a-z]+\d+(?:-[a-z])?)?(?:\s*\([^)\n]*\))?: upgrade blockers: (?![^;\n]*\bnone\b)[^;\n]*(?:pinned-batch-runner|hold-the-minor-lag|poddisruptionbudget|pdb|budget|exclusion|maintenance)[^;\n]*; fail-closed webhooks with no backend: [^;\n]+; any of them blocks the upgrade: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: upgrade blockers: (?![^;\n]*\bnone\b)[^;\n]*(?:pinned-batch-runner|hold-the-minor-lag|poddisruptionbudget|pdb|budget|exclusion|maintenance)[^;\n]*; fail-closed webhooks with no backend: [^;\n]+; any of them blocks the upgrade: (?:yes|no)$'
 
   - name: no-invented-cves
     role: objective
