@@ -10,9 +10,10 @@ Four files:
 ``note_wake(self.sub, self.wake_kinds, self.synth)``, so a Slack failure wake
 marks its thread before the wake is delivered.
 
-``gateway/platforms/base.py``: ``send_final_ledgered`` brackets its
-``_send_with_retry`` with ``begin(event)`` and ``end(token)``, so the send of a
-marked thread's next internal final runs marked.
+``gateway/platforms/base.py``: ``_process_message_background`` calls
+``start(event)`` after its processing-start hook, so a wake turn claims its
+thread's mark; ``send_final_ledgered`` brackets its ``_send_with_retry`` with
+``begin(event)`` and ``end(token)``, so the send of that turn's reply runs marked.
 
 ``plugins/platforms/slack/adapter.py``: upstream's ``_maybe_blocks`` is renamed
 ``_kage_upstream_maybe_blocks`` and a ``_maybe_blocks`` that hands it to
@@ -20,10 +21,9 @@ marked thread's next internal final runs marked.
 both draw a marked reply.
 
 ``gateway/run_turn.py``: ``_run_agent_queued_followup`` calls
-``drop(turn_ctx.source, pending_event)`` just before it runs the follow-up. The
-follow-up's reply is sent under the outer turn's event, so a user message
-queued behind a wake turn drops the wake's mark, and a wake queued behind a
-user's turn carries its mark to that reply.
+``drop(turn_ctx.source, pending_event)`` just before it runs the follow-up: the
+same claim as ``start``, for a turn that does not pass through
+``_process_message_background``.
 
 With the flag off nothing is marked and every call returns upstream's result.
 What the flag changes, and why, is in the module docstring of
@@ -78,6 +78,13 @@ FINAL_PATCHED = (
     "            _kage_slack_failure.end(_kage_failure_token)\n"
 )
 
+START_ANCHOR = '            await self._run_processing_hook("on_processing_start", event)\n'
+START_PATCHED = START_ANCHOR + (
+    "            # kube-agents patch: a failure wake's turn claims its thread's mark;\n"
+    "            # see gateway/slack_ux_failure.py.\n"
+    "            _kage_slack_failure.start(event)\n"
+)
+
 SLACK_ADAPTER = "plugins/platforms/slack/adapter.py"
 
 BLOCKS_ANCHOR = "    def _maybe_blocks(self, content: str) -> Optional[list]:\n"
@@ -94,9 +101,8 @@ RUN_TURN = "gateway/run_turn.py"
 
 FOLLOWUP_ANCHOR = '        await _run_followup_processing_hook(_hook_adapter, pending_event, "on_processing_start")\n'
 FOLLOWUP_PATCHED = FOLLOWUP_ANCHOR + (
-    "        # kube-agents patch: this follow-up's reply goes out under the outer turn's\n"
-    "        # event, so a user's message drops a failure wake's mark and a queued\n"
-    "        # wake carries it to that reply; see\n"
+    "        # kube-agents patch: a queued failure wake's turn claims its thread's\n"
+    "        # mark, and a user's message clears an older one; see\n"
     "        # gateway/slack_ux_failure.py.\n"
     "        _kage_slack_failure.drop(turn_ctx.source, pending_event)\n"
 )
@@ -112,6 +118,7 @@ def apply(root: Path) -> None:
     base = patchlib.Patch(root, BASE, prefix=PREFIX)
     base.refuse_if_patched(BUILD_MARKER)
     base.substitute(FINAL_ANCHOR, FINAL_PATCHED, label="send_final_ledgered send")
+    base.substitute(START_ANCHOR, START_PATCHED, label="_process_message_background processing hook")
     base.append(GATEWAY_IMPORT)
 
     slack_adapter = patchlib.Patch(root, SLACK_ADAPTER, prefix=PREFIX)
@@ -125,7 +132,7 @@ def apply(root: Path) -> None:
     run_turn.append(GATEWAY_IMPORT)
 
     notifier.commit("1 anchor, 1 import")
-    base.commit("1 anchor, 1 import")
+    base.commit("2 anchors, 1 import")
     slack_adapter.commit("1 anchor, 1 import")
     run_turn.commit("1 anchor, 1 import")
 

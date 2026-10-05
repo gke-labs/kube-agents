@@ -37,7 +37,27 @@ USER_MESSAGE_ID = "1700000001.000200"
 def _event(internal=True, platform="slack", chat_id="C0KAGE", thread_id="1700000000.000100"):
     source = SimpleNamespace(platform=SimpleNamespace(value=platform), chat_id=chat_id, thread_id=thread_id)
     message_id = None if internal else USER_MESSAGE_ID
-    return SimpleNamespace(internal=internal, source=source, message_id=message_id, timestamp=datetime.now())
+    return SimpleNamespace(internal=internal, source=source, message_id=message_id, text="", timestamp=datetime.now())
+
+
+def _later(**kwargs):
+    event = _event(**kwargs)
+    event.timestamp += timedelta(seconds=1)
+    return event
+
+
+def _earlier(**kwargs):
+    event = _event(**kwargs)
+    event.timestamp -= timedelta(seconds=1)
+    return event
+
+
+def _turn(when=0, **kwargs):
+    """An event whose turn has started, ``when`` seconds from now."""
+    event = _event(**kwargs)
+    event.timestamp += timedelta(seconds=when)
+    runtime.start(event)
+    return event
 
 
 def _lane_event(ledger_message_id=None):
@@ -170,17 +190,27 @@ class PresentTest(unittest.TestCase):
 class MarkTest(FlagOn):
     def test_a_failure_wake_marks_its_thread_and_its_reply_is_drawn(self):
         runtime.note_wake(SUB, {"gave_up"}, WAKE)
-        blocks = self.draw(_event())
+        blocks = self.draw(_turn())
         self.assertTrue(blocks[0]["text"]["text"].startswith("**I couldn't find seeded-z.**"))
         (button,) = _buttons(blocks)
         self.assertEqual(button["text"]["text"], "check it there")
         self.assertEqual(button["value"], "check it there")
         self.assertRegex(button["action_id"], slack_presenter.CHOICE_ACTION_ID_PATTERN)
 
+    def test_a_reply_needs_its_turn_to_have_claimed_the_mark(self):
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        self.assertEqual(self.draw(_event()), _render(REPLY))
+
     def test_a_queued_user_message_drops_the_mark(self):
         runtime.note_wake(SUB, {"gave_up"}, WAKE)
-        runtime.drop(_event().source, _event(internal=False))
-        self.assertEqual(self.draw(_event()), _render(REPLY))
+        runtime.drop(_event().source, _later(internal=False))
+        self.assertEqual(runtime._marks, {})
+        self.assertEqual(self.draw(_turn()), _render(REPLY))
+
+    def test_a_user_turn_starting_after_the_mark_drops_it(self):
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        runtime.start(_later(internal=False))
+        self.assertEqual(self.draw(_turn()), _render(REPLY))
 
     def test_a_queued_wake_keeps_the_mark(self):
         runtime.note_wake(SUB, {"gave_up"}, WAKE)
@@ -195,15 +225,13 @@ class MarkTest(FlagOn):
         blocks = self.draw(outer)
         self.assertTrue(blocks[0]["text"]["text"].startswith("**I couldn't find seeded-z.**"))
         self.assertEqual(len(_buttons(blocks)), 1)
-        self.assertEqual(self.draw(_event()), _render(REPLY))
+        self.assertEqual(self.draw(_turn()), _render(REPLY))
 
     def test_a_carried_mark_the_follow_up_never_sent_does_not_draw_a_later_user_turn(self):
         # A [SILENT] or streamed wake reply never reaches the outer send.
         runtime.note_wake(SUB, {"gave_up"}, WAKE)
         runtime.drop(_event().source, _event())
-        later = _event(internal=False)
-        later.timestamp += timedelta(seconds=1)
-        self.assertEqual(self.draw(later), _render(REPLY))
+        self.assertEqual(self.draw(_later(internal=False)), _render(REPLY))
         self.assertEqual(runtime._carried, {})
 
     def test_a_carried_mark_outlives_a_second_failure_wake(self):
@@ -212,14 +240,14 @@ class MarkTest(FlagOn):
         runtime.drop(_event().source, _event())
         runtime.note_wake(SUB, {"blocked"}, WAKE)
         self.assertEqual(len(_buttons(self.draw(outer))), 1)
-        self.assertEqual(len(_buttons(self.draw(_event()))), 1)
+        self.assertEqual(len(_buttons(self.draw(_turn()))), 1)
 
     def test_a_user_message_queued_after_a_carried_wake_drops_the_mark(self):
         runtime.note_wake(SUB, {"gave_up"}, WAKE)
         runtime.drop(_event().source, _event())
-        runtime.drop(_event().source, _event(internal=False))
+        runtime.drop(_event().source, _later(internal=False))
         self.assertEqual(self.draw(_event(internal=False)), _render(REPLY))
-        self.assertEqual(self.draw(_event()), _render(REPLY))
+        self.assertEqual(self.draw(_turn()), _render(REPLY))
 
     def test_a_wake_with_a_message_queued_behind_it_keeps_its_look(self):
         # U1 runs; the wake and then U2 queue behind it.
@@ -228,35 +256,72 @@ class MarkTest(FlagOn):
         self.assertEqual(self.draw(_lane_event(USER_MESSAGE_ID)), _render(REPLY))
         runtime.drop(_event().source, _event())
         self.assertEqual(len(_buttons(self.draw(_lane_event()))), 1)
-        later = _event(internal=False)
-        later.timestamp += timedelta(seconds=1)
-        runtime.drop(_event().source, later)
+        runtime.drop(_event().source, _later(internal=False))
         self.assertEqual(self.draw(outer), _render(REPLY))
 
     def test_a_wake_turn_with_a_user_message_queued_behind_it_keeps_its_look(self):
         runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        wake = _turn()
         self.assertEqual(len(_buttons(self.draw(_lane_event()))), 1)
-        runtime.drop(_event().source, _event(internal=False))
-        self.assertEqual(self.draw(_event()), _render(REPLY))
+        runtime.drop(_event().source, _later(internal=False))
+        self.assertEqual(self.draw(wake), _render(REPLY))
 
     def test_a_user_message_queued_before_the_wake_leaves_its_mark(self):
         outer = _event(internal=False)
-        queued = _event(internal=False)
-        queued.timestamp -= timedelta(seconds=1)
+        queued = _earlier(internal=False)
         runtime.note_wake(SUB, {"gave_up"}, WAKE)
         runtime.drop(_event().source, queued)
         self.assertEqual(self.draw(_lane_event(USER_MESSAGE_ID)), _render(REPLY))
         runtime.drop(_event().source, _event())
         self.assertEqual(len(_buttons(self.draw(outer))), 1)
 
+    def test_a_wake_running_when_a_failure_wake_queues_behind_it_stays_plain(self):
+        running = _turn(when=-1)
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        self.assertEqual(self.draw(_lane_event()), _render(REPLY))
+        runtime.drop(_event().source, _event())
+        self.assertEqual(len(_buttons(self.draw(running))), 1)
+
+    def test_a_wake_queued_ahead_of_a_failure_wake_stays_plain(self):
+        outer = _event(internal=False)
+        ahead = _earlier()
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        runtime.drop(_event().source, ahead)
+        self.assertEqual(self.draw(_lane_event()), _render(REPLY))
+        runtime.drop(_event().source, _event())
+        self.assertEqual(len(_buttons(self.draw(outer))), 1)
+
+    def test_two_failure_wakes_in_a_row_each_keep_their_look(self):
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        first = _turn()
+        runtime.note_wake(SUB, {"crashed"}, WAKE)
+        self.assertEqual(len(_buttons(self.draw(_lane_event()))), 1)
+        runtime.drop(_event().source, _event())
+        self.assertEqual(len(_buttons(self.draw(first))), 1)
+
+    def test_a_follow_up_with_no_queued_event_claims_nothing(self):
+        # A /steer or interrupt follow-up runs with no pending event.
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        runtime.drop(_event().source, None)
+        self.assertEqual(self.draw(_lane_event()), _render(REPLY))
+        self.assertEqual(len(_buttons(self.draw(_turn()))), 1)
+
+    def test_an_event_with_text_and_no_message_id_does_not_take_a_claim(self):
+        # A Slack slash command carries no message id.
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        _turn()
+        command = _later(internal=False)
+        command.message_id, command.text = None, "/hermes status"
+        self.assertEqual(self.draw(command), _render(REPLY))
+
     def test_a_sibling_wake_leaves_the_mark(self):
         runtime.note_wake(SUB, {"gave_up"}, WAKE)
         runtime.note_wake(SUB, {"completed"}, "Task t_f2 completed.")
-        self.assertEqual(len(_buttons(self.draw(_event()))), 1)
+        self.assertEqual(len(_buttons(self.draw(_turn()))), 1)
 
     def test_outside_a_thread_the_lead_is_bold_and_the_question_stays_text(self):
         runtime.note_wake({**SUB, "thread_id": None}, {"gave_up"}, WAKE)
-        blocks = self.draw(_event(thread_id=None))
+        blocks = self.draw(_turn(thread_id=None))
         self.assertTrue(blocks[0]["text"]["text"].startswith("**I couldn't find seeded-z.**"))
         self.assertEqual(_buttons(blocks), [])
 
@@ -267,8 +332,8 @@ class MarkTest(FlagOn):
 
     def test_the_mark_is_taken_once(self):
         runtime.note_wake(SUB, {"blocked"}, WAKE)
-        self.draw(_event())
-        self.assertEqual(self.draw(_event()), _render(REPLY))
+        self.draw(_turn())
+        self.assertEqual(self.draw(_turn()), _render(REPLY))
 
     def test_unmarked_sends_render_as_upstream(self):
         cases = {
@@ -282,13 +347,15 @@ class MarkTest(FlagOn):
             with self.subTest(name):
                 runtime._marks.clear()
                 runtime.note_wake(SUB, kinds, text)
+                event.timestamp = datetime.now() + timedelta(seconds=1)
+                runtime.start(event)
                 self.assertEqual(self.draw(event), _render(REPLY))
 
     def test_a_mark_past_its_ttl_is_dropped(self):
         with mock.patch.object(runtime.time, "monotonic", return_value=1000.0):
             runtime.note_wake(SUB, {"gave_up"}, WAKE)
         with mock.patch.object(runtime.time, "monotonic", return_value=1000.0 + runtime.MARK_TTL_SECONDS + 1):
-            self.assertEqual(self.draw(_event()), _render(REPLY))
+            self.assertEqual(self.draw(_turn()), _render(REPLY))
 
     def test_marks_are_capped_oldest_first(self):
         for i in range(runtime.MARKS_MAX + 1):
@@ -298,12 +365,12 @@ class MarkTest(FlagOn):
 
     def test_a_render_that_declines_keeps_upstreams_answer(self):
         runtime.note_wake(SUB, {"gave_up"}, WAKE)
-        self.assertIsNone(self.draw(_event(), render=lambda content: None))
+        self.assertIsNone(self.draw(_turn(), render=lambda content: None))
 
     def test_a_message_at_the_block_cap_keeps_its_question_as_text(self):
         runtime.note_wake(SUB, {"gave_up"}, WAKE)
         full = lambda content: _render(content) * runtime.MESSAGE_BLOCKS_MAX  # noqa: E731
-        self.assertEqual(_buttons(self.draw(_event(), render=full)), [])
+        self.assertEqual(_buttons(self.draw(_turn(), render=full)), [])
 
     def test_a_render_that_raises_falls_back_to_the_reply_as_written(self):
         runtime.note_wake(SUB, {"gave_up"}, WAKE)
@@ -316,11 +383,11 @@ class MarkTest(FlagOn):
             return _render(content)
 
         with self.assertLogs(runtime.logger, "WARNING"):
-            self.assertEqual(self.draw(_event(), render=render), _render(REPLY))
+            self.assertEqual(self.draw(_turn(), render=render), _render(REPLY))
 
     def test_the_mark_does_not_outlive_the_send(self):
         runtime.note_wake(SUB, {"gave_up"}, WAKE)
-        self.draw(_event())
+        self.draw(_turn())
         self.assertFalse(runtime._marked.get())
 
 
@@ -342,7 +409,12 @@ class ApplyTest(unittest.TestCase):
             applier.NOTIFIER: "class N:\n    def build_wake_text(self):\n" + applier.WAKE_ANCHOR,
             applier.BASE: "class B:\n    async def send_final_ledgered(self, event):\n"
             + applier.FINAL_ANCHOR
-            + "        return result\n",
+            + "        return result\n\n"
+            + "    async def _process_message_background(self, event, session_key):\n"
+            + "        try:\n"
+            + applier.START_ANCHOR
+            + "        finally:\n"
+            + "            pass\n",
             applier.SLACK_ADAPTER: "from typing import Optional\n\n\nclass S:\n"
             + applier.BLOCKS_ANCHOR
             + "        return None\n",

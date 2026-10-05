@@ -25,7 +25,7 @@ import importlib.util
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -39,6 +39,7 @@ NOTIFIER = "gateway/kanban_watchers_notifier.py"
 CALLS = {
     NOTIFIER: ("_kage_slack_failure.note_wake(self.sub, self.wake_kinds, self.synth)",),
     "gateway/platforms/base.py": (
+        "_kage_slack_failure.start(event)",
         "_kage_failure_token = _kage_slack_failure.begin(event)",
         "_kage_slack_failure.end(_kage_failure_token)",
     ),
@@ -56,6 +57,8 @@ REPLY = (
 LEAD = "**I couldn't find seeded-z.**"
 LABEL = "check it there"
 USER_MESSAGE_ID = "1700000001.000200"
+#: How much later than the mark a user's message arrives, so the two never tie.
+LATER = timedelta(seconds=1)
 SUB = {"platform": "slack", "chat_id": "C0KAGE", "thread_id": "1700000000.000100", "task_id": "t_verify"}
 
 
@@ -95,12 +98,20 @@ def _load_runtime(root: Path):
     return module
 
 
-def _event(internal: bool = True):
+def _event(internal: bool = True, later: bool = False):
     source = SimpleNamespace(
         platform=SimpleNamespace(value="slack"), chat_id=SUB["chat_id"], thread_id=SUB["thread_id"]
     )
     message_id = None if internal else USER_MESSAGE_ID
-    return SimpleNamespace(internal=internal, source=source, message_id=message_id, timestamp=datetime.now())
+    arrived = datetime.now() + (LATER if later else timedelta())
+    return SimpleNamespace(internal=internal, source=source, message_id=message_id, text="", timestamp=arrived)
+
+
+def _started(module):
+    """A wake event whose turn has started."""
+    event = _event()
+    module.start(event)
+    return event
 
 
 def _render(content: str) -> list:
@@ -123,21 +134,21 @@ def drive(module) -> None:
     os.environ[FLAG_ENV] = "1"
     try:
         module.note_wake(SUB, {"gave_up"}, "wake")
-        blocks = _draw(module, _event())
+        blocks = _draw(module, _started(module))
         buttons = [e for b in blocks if b.get("type") == "actions" for e in b["elements"]]
         if not blocks[0]["text"]["text"].startswith(LEAD):
             raise _fail(f"the reply's lead is not bold: {blocks[0]!r}")
         pattern = re.compile(module._presenter.CHOICE_ACTION_ID_PATTERN)
         if [b["text"]["text"] for b in buttons] != [LABEL] or not pattern.search(buttons[0]["action_id"]):
             raise _fail(f"the reply's offer was {buttons!r}")
-        if _draw(module, _event()) != _render(REPLY):
+        if _draw(module, _started(module)) != _render(REPLY):
             raise _fail("a second reply in the thread was drawn as the failure's")
         module.note_wake(SUB, {"gave_up"}, "wake")
         if _draw(module, _event(internal=False)) != _render(REPLY):
             raise _fail("a reply to the user's own message was drawn as the failure's")
         module.note_wake(SUB, {"gave_up"}, "wake")
-        module.drop(_event().source, _event(internal=False))
-        if _draw(module, _event()) != _render(REPLY):
+        module.drop(_event().source, _event(internal=False, later=True))
+        if _draw(module, _started(module)) != _render(REPLY):
             raise _fail("a queued follow-up's reply was drawn as the failure's")
         outer = _event(internal=False)
         module.note_wake(SUB, {"gave_up"}, "wake")
@@ -146,8 +157,9 @@ def drive(module) -> None:
         if not carried[0]["text"]["text"].startswith(LEAD):
             raise _fail("a wake queued behind the user's turn lost the failure's look")
         lane = _event(internal=False)
-        lane.message_id, lane.ledger_message_id = None, None
+        lane.message_id, lane.ledger_message_id, lane.text = None, None, ""
         module.note_wake(SUB, {"gave_up"}, "wake")
+        _started(module)
         queued = _draw(module, lane)
         if not queued[0]["text"]["text"].startswith(LEAD):
             raise _fail("a wake turn with a follow-up queued behind it lost the failure's look")
@@ -159,8 +171,9 @@ def main(root: Path = Path("/opt/hermes")) -> None:
     check_callers(root)
     drive(_load_runtime(root))
     print(
-        "slack_ux_failure verify: marked from the wake, bracketed in the final send, "
-        "drawn in _maybe_blocks, dropped by a queued user message and carried by a queued wake; a failure reply leads in bold and offers its question once"
+        "slack_ux_failure verify: marked from the wake, claimed when its turn starts, "
+        "bracketed in the final send, drawn in _maybe_blocks, dropped by a later user "
+        "message; a failure reply leads in bold and offers its question once"
     )
 
 

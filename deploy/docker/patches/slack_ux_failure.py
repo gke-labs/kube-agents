@@ -1,13 +1,13 @@
 """Lead a failure reply with its fact in bold, and offer its closing question as a button.
 
 Installed into the image at ``/opt/hermes/gateway/slack_ux_failure.py``.
-``apply_slack_ux_failure.py`` wires four calls: the kanban notifier's
-``build_wake_text`` calls :func:`note_wake`, ``send_final_ledgered`` brackets
-its send with :func:`begin` and :func:`end`, ``SlackAdapter._maybe_blocks``
-hands its rendering to :func:`maybe_blocks`, and ``_run_agent_queued_followup``
-calls :func:`drop`. With ``KAGE_SLACK_UX`` off
-:func:`note_wake` records nothing, so no reply is marked and every call returns
-what upstream would have.
+``apply_slack_ux_failure.py`` wires five calls: the kanban notifier's
+``build_wake_text`` calls :func:`note_wake`, ``_process_message_background``
+calls :func:`start`, ``send_final_ledgered`` brackets its send with
+:func:`begin` and :func:`end`, ``SlackAdapter._maybe_blocks`` hands its
+rendering to :func:`maybe_blocks`, and ``_run_agent_queued_followup`` calls
+:func:`drop`. With ``KAGE_SLACK_UX`` off :func:`note_wake` records nothing, so
+no reply is marked and every call returns what upstream would have.
 
 Upstream, and why it changes
 ----------------------------
@@ -22,34 +22,37 @@ only when it ends on a yes/no question.
 With the flag on, the Slack reply to such a wake is drawn with its first
 sentence in bold and, when it ends on one short yes/no question, a choice button
 carrying that question ("check it there"). An open question ("Which namespace
-should it use?") or an either/or stays text, since it needs a word, not a click. A click is the clicker answering in
-the thread with the button's text (``gateway/slack_ux_clicks.py``), so the
-Planning Agent reads it as the user saying yes. The words are the agent's; only
-how they are drawn changes. The ``text`` Slack keeps for notifications and for
-a later read of the thread is unchanged, question included.
+should it use?") or an either/or stays text, since it needs a word, not a
+click. A click is the clicker answering in the thread with the button's text
+(``gateway/slack_ux_clicks.py``), so the Planning Agent reads it as the user
+saying yes. The words are the agent's; only how they are drawn changes. The
+``text`` Slack keeps for notifications and for a later read of the thread is
+unchanged, question included.
 
 Which reply is the wake's: :func:`note_wake` marks the subscription's thread
 when a Slack wake carries ``blocked``, ``crashed``, ``timed_out`` or
 ``gave_up``, unless ``gateway/slack_ux_moments.py`` noted the question already
 posted (that wake is answered with ``[SILENT]``, so it clears the thread's mark
-instead). The next final reply sent for the wake's turn in that thread takes
-the mark, within :data:`MARK_TTL_SECONDS`; a reply the user's own message
-prompted never does. A wake's turn is an internal event or, when a follow-up is
-queued behind it, the fresh event Hermes sends its reply under, which carries no
-inbound message id. A message queued behind a running turn runs as a follow-up
-whose reply is sent under that turn's event, which may be the user's: a queued
-wake carries the mark to that reply (:func:`drop`), taken by the wake's own turn
-or an event that arrived before the wake was drained, while a queued user's
-message drops a mark noted before it arrived, so the wake's reply is drawn as the failure's and the user's
-is not. A carried mark the follow-up never sent (a ``[SILENT]`` or streamed
-reply) is dropped by the thread's next final rather than drawing a later message
-of the user's. Outside a thread the reply keeps its question as text, since a click answers in the thread it was clicked in. Kanban pings and moments are
-not finals and never look. The marks are this process's, so a restart between a
-wake and its reply drops the look, not the reply.
+instead). The wake's turn claims the mark when it starts (:func:`start`, or
+:func:`drop` for a follow-up drained from behind a running turn), and the next
+final reply sent for that turn takes the claim within :data:`MARK_TTL_SECONDS`.
+Hermes sends that reply under the wake's internal event, under the empty event
+it builds for a reply with a follow-up queued behind it, or, when the wake ran
+as a follow-up, under the outer turn's event, which may be the user's. A turn
+that does not claim never looks: a user's turn starting after the mark was
+noted clears it, a turn that was already running or queued when the mark was
+noted leaves it for the wake's own turn, and a reply the user's own message
+prompted never takes a claim. A claim the turn never sent (a ``[SILENT]`` or
+streamed reply) is dropped at the thread's next turn start or by its next final
+rather than drawing a later message of the user's. Outside a thread the reply
+keeps its question as text, since a click answers in the thread it was clicked
+in. Kanban pings and moments are not finals and never look. The marks are this
+process's, so a restart between a wake and its reply drops the look, not the
+reply.
 
 A reply that arrives as edits to a streamed message, rather than through
-``send_final_ledgered``, is drawn as upstream draws it, and its mark waits for
-the TTL or the thread's next failure wake.
+``send_final_ledgered``, is drawn as upstream draws it, and its claim is
+dropped as an unsent one is.
 
 Fail-soft: anything that raises is logged and the reply goes out as upstream
 renders it.
@@ -160,25 +163,25 @@ def note_wake(sub: dict, wake_kinds: Iterable[str], text: str) -> None:
 
 
 def begin(event: Any) -> Optional[contextvars.Token]:
-    """Mark this send when ``event`` is a wake's turn in a marked thread, or the
-    turn a queued wake's mark was carried to (:func:`drop`); see :func:`end`."""
+    """Mark this send when its turn claimed a mark (:func:`start`); see :func:`end`.
+
+    The claim is taken by the wake turn's own reply: under its internal event, under
+    the fresh event Hermes sends it under when a follow-up is queued behind it, or,
+    for a wake queued behind a user's turn, under that turn's event.
+    """
     try:
         source = getattr(event, "source", None)
-        if not (_marks or _carried) or source is None:
+        if not _carried or source is None:
             return None
-        platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", ""))
-        if str(platform or "").lower() != SLACK_PLATFORM:
+        key = _slack_key(source)
+        if key is None:
             return None
-        key = _key(source.chat_id, getattr(source, "thread_id", None))
         carried = _carried.pop(key, None)
-        wake = getattr(event, "internal", False) or _queued_wake_reply(event)
-        noted = None
-        if carried is not None and (wake or _arrived_by(event, carried[1])):
-            noted = carried[0]
-        elif wake:
-            mark = _marks.pop(key, None)
-            noted = mark[0] if mark else None
-        if noted is None or time.monotonic() - noted > MARK_TTL_SECONDS:
+        if carried is None:
+            return None
+        if not (getattr(event, "internal", False) or _queued_reply(event) or _arrived_by(event, carried[1])):
+            return None
+        if time.monotonic() - carried[0] > MARK_TTL_SECONDS:
             return None
         return _marked.set(key[1])
     except Exception:
@@ -186,41 +189,58 @@ def begin(event: Any) -> Optional[contextvars.Token]:
         return None
 
 
-def drop(source: Any, pending_event: Any) -> None:
-    """Carry the mark on ``source``'s thread to the queued follow-up's reply when the
-    follow-up is internal, or clear it when it is a user's message that arrived
-    after the mark was noted.
+def start(event: Any) -> None:
+    """A turn for ``event`` is starting: a wake claims its thread's mark for its reply,
+    and a user's message clears a mark noted before it arrived.
 
-    The follow-up's reply goes out under the outer turn's event, which a wake
-    queued behind a user's turn would otherwise never be marked under. A mark
-    noted after the user's message is a wake still to come, and stays.
+    Any earlier claim is dropped, since the turn that held it is over. A mark noted
+    after ``event`` arrived belongs to a wake still to come, and stays.
     """
     try:
+        source = getattr(event, "source", None)
         if not (_marks or _carried) or source is None:
             return
-        key = _key(source.chat_id, getattr(source, "thread_id", None))
-        if not getattr(pending_event, "internal", False):
-            _carried.pop(key, None)
-            mark = _marks.get(key)
-            if mark is not None and not _arrived_by(pending_event, mark[1]):
+        key = _slack_key(source)
+        if key is None:
+            return
+        _carried.pop(key, None)
+        mark = _marks.get(key)
+        if mark is None:
+            return
+        if not getattr(event, "internal", False):
+            if not _arrived_by(event, mark[1]):
                 del _marks[key]
             return
-        mark = _marks.pop(key, None)
-        if mark is not None:
-            _carried[key] = (mark[0], datetime.now())
-            while len(_carried) > MARKS_MAX:
-                _carried.popitem(last=False)
+        if not _noted_by(event, mark[1]):
+            return
+        del _marks[key]
+        _carried[key] = (mark[0], datetime.now())
+        while len(_carried) > MARKS_MAX:
+            _carried.popitem(last=False)
     except Exception:
-        logger.warning("slack_ux_failure: carrying or clearing the follow-up's mark failed", exc_info=True)
+        logger.warning("slack_ux_failure: claiming or clearing the turn's mark failed", exc_info=True)
 
 
-def _queued_wake_reply(event: Any) -> bool:
-    """Whether ``event`` is the fresh one Hermes sends a finished turn's reply under
-    when a follow-up is queued, for a turn with no inbound message: a wake's."""
+def drop(source: Any, pending_event: Any) -> None:
+    """:func:`start` for a follow-up drained from behind the turn on ``source``."""
+    start(pending_event)
+
+
+def _slack_key(source: Any) -> Optional[tuple[str, str]]:
+    platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", ""))
+    if str(platform or "").lower() != SLACK_PLATFORM:
+        return None
+    return _key(source.chat_id, getattr(source, "thread_id", None))
+
+
+def _queued_reply(event: Any) -> bool:
+    """Whether ``event`` is the empty one Hermes sends a finished turn's reply under when
+    a follow-up is queued behind it, for a turn with no inbound message."""
     return not (
         getattr(event, "internal", False)
         or getattr(event, "message_id", None)
         or getattr(event, "ledger_message_id", None)
+        or getattr(event, "text", "")
     )
 
 
@@ -228,6 +248,14 @@ def _arrived_by(event: Any, moment: datetime) -> bool:
     """Whether ``event`` arrived by ``moment``, as ``MessageEvent.timestamp`` records it."""
     arrived = getattr(event, "timestamp", None)
     return isinstance(arrived, datetime) and arrived.tzinfo is None and arrived <= moment
+
+
+def _noted_by(event: Any, moment: datetime) -> bool:
+    """Whether ``moment`` is no later than ``event``'s arrival; true when it has none."""
+    arrived = getattr(event, "timestamp", None)
+    if not isinstance(arrived, datetime) or arrived.tzinfo is not None:
+        return True
+    return moment <= arrived
 
 
 def end(token: Optional[contextvars.Token]) -> None:
