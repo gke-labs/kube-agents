@@ -3595,21 +3595,21 @@ class TestNewMarker(HarnessTestCase):
         latest.write_text(json.dumps(envelope), encoding="utf-8")
 
     def finish(self, doc):
-        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.replies = {"issue-list": self.issue_list()}
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.assertEqual(self.run_finish(doc), 0, self.err)
-        (body,) = self.harness.bodies_for("issue", "edit")
+        (body,) = self.harness.bodies_for("issue-update")
         return body
 
     def test_a_first_run_marks_nothing(self):
         # No ledger to measure against: everything would read as new.
         self.harness.replies = {
-            "issue list": "[]",
-            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.assertEqual(self.run_finish(make_doc()), 0, self.err)
-        (body,) = self.harness.bodies_for("issue", "create")
+        (body,) = self.harness.bodies_for("issue-create")
         self.assertIn("<!-- finding:", body)
         self.assertNotIn(audit_report.NEW_MARKER, body)
 
@@ -3628,25 +3628,25 @@ class TestNewMarker(HarnessTestCase):
 
     def test_an_unknown_delta_marks_nothing(self):
         # The ledger is open but its body cannot be read, so there is no memory.
-        self.harness.replies = {"issue list": self.issue_list()}
-        self.harness.failures = {"--json body": 1}
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.harness.failures = {"issue-view !comments": 1}
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.assertEqual(self.run_finish(make_doc()), 0, self.err)
-        (body,) = self.harness.bodies_for("issue", "edit")
+        (body,) = self.harness.bodies_for("issue-update")
         self.assertIn("<!-- finding:", body)
         self.assertNotIn(audit_report.NEW_MARKER, body)
 
     def test_a_block_under_another_identity_scheme_marks_nothing(self):
         # Every id looks new across a scheme change, so none is marked.
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps(
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view(
                 {"body": '## Findings\n\n<!-- audit-findings: ["wra-something-old"] -->\n'}
             ),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.assertEqual(self.run_finish(make_doc()), 0, self.err)
-        (body,) = self.harness.bodies_for("issue", "edit")
+        (body,) = self.harness.bodies_for("issue-update")
         self.assertNotIn(audit_report.NEW_MARKER, body)
 
     def test_a_finding_the_last_body_cut_for_space_is_not_new(self):
