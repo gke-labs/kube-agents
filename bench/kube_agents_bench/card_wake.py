@@ -886,8 +886,8 @@ def tag(
 ) -> AgentResult:
     """A replay's one turn, with the card, its wake and ``settled`` kept in metadata under ``key``.
 
-    The failure replay's turn, or a question replay's whose wake errored
-    (``key="question_wake"``). The reply to the wake is already the run's
+    The failure replay's turn, or a question replay's whose wake errored with
+    no reply (:func:`no_reply`, ``key="question_wake"``). The reply to the wake is already the run's
     ``final_message``; the trajectory gains :data:`SETTLED_ENTRY` and nothing
     else changes.
     """

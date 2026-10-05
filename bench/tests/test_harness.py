@@ -3433,6 +3433,20 @@ def test_a_fresh_session_replay_puts_a_posted_wake_reply_in_the_thread(
     assert messages[-1]["user"] == card_wake.STUB_BOT
 
 
+def test_a_fresh_session_replay_sends_the_answer_after_a_wake_that_warned(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _fresh_shell(scripts))
+    stub_agent.turns = [_turn("junk", _text("[SILENT]")), _answer_turn()]  # type: ignore[arg-type]
+
+    result = KubeAgentsHarness().run(_FRESH_PROMPT)
+
+    wake, answer = stub_agent.requests
+    assert wake["conversation"] != answer["conversation"]
+    assert result.trajectory[-1]["args"]["answer_reply"] == "Passed seeded-b to the card."
+
+
 def test_a_fresh_session_replay_whose_context_failed_in_the_image_sends_no_answer(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
 ) -> None:
