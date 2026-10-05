@@ -176,9 +176,10 @@ Ten read what the run produced, from this repository
 `report_contains` (phrases in the agent's answer; its `forbidden_patterns` are
 regular expressions, for a banned word whose negated uses are legitimate and
 which no substring can express), `answer_first` (each delivered card result, raw:
-it opens on one bold sentence carrying the case's `lead_terms`, has no heading, stays
+it opens on one bold sentence, has no heading, stays
 under its character and sentence caps, and no later sentence matches a
-`recap_patterns` regex), `tool_called` (calls in the
+`recap_patterns` regex; each of the case's `lead_terms` appears in at least one result's
+lead), `tool_called` (calls in the
 trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
 published), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier
