@@ -257,6 +257,12 @@ const (
 	// reason a2aInjectBackendEnvVar is: the pod executes model output, and
 	// what widens its fence is a property of who deployed the operator.
 	a2aSessionClusterViewEnvVar = "A2A_SESSION_CLUSTER_VIEW"
+	// The platform agent's trusted-human allowlists, handed to the gateway
+	// so a session's request to delegate to the platform agent is checked
+	// against the same lists the agent's own adapters enforce. Spelled the
+	// same in a2a/gateway/allowlist.go; the conformance suite pins it.
+	a2aTargetAllowedUsersGchatEnvVar = "A2A_TARGET_ALLOWED_USERS_GCHAT"
+	a2aTargetAllowedUsersSlackEnvVar = "A2A_TARGET_ALLOWED_USERS_SLACK"
 
 	// a2aInjectListenEnvVar is what the operator renders onto the gateway to
 	// select the backend; a2aInjectListenHost and a2aInjectPort are the
@@ -1002,6 +1008,41 @@ func a2aStrictEventsWriter() string {
 // here "relaxed" is the shut door.
 func a2aInjectBackendEnabled() bool {
 	return os.Getenv(a2aInjectBackendEnvVar) == "true"
+}
+
+// a2aTargetAllowlistEnv renders the CR's Chat and Slack allowlists for the
+// gateway. An absent or empty list renders nothing: the gateway reads no var
+// as "all authenticated users", which is what the CR field promises.
+func a2aTargetAllowlistEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	integ := agent.Spec.Integration
+	if integ == nil {
+		return nil
+	}
+	join := func(ids []string, lower bool) string {
+		var out []string
+		for _, id := range ids {
+			if id = strings.TrimSpace(id); id == "" {
+				continue
+			}
+			if lower {
+				id = strings.ToLower(id)
+			}
+			out = append(out, id)
+		}
+		return strings.Join(out, ",")
+	}
+	var env []corev1.EnvVar
+	if integ.GoogleChat != nil {
+		if v := join(integ.GoogleChat.AllowedUsers, true); v != "" {
+			env = append(env, corev1.EnvVar{Name: a2aTargetAllowedUsersGchatEnvVar, Value: v})
+		}
+	}
+	if integ.Slack != nil {
+		if v := join(integ.Slack.AllowedUsers, false); v != "" {
+			env = append(env, corev1.EnvVar{Name: a2aTargetAllowedUsersSlackEnvVar, Value: v})
+		}
+	}
+	return env
 }
 
 // a2aSessionClusterViewEnabled reports whether this install's session pods
@@ -3957,7 +3998,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							// name, so the render and the spawner must agree
 							// or every session is refused at connect.
 							{Name: "A2A_SESSION_SERVICE_ACCOUNT", Value: a2aSessionServiceAccountName(agent)},
-						}, append(injectEnv, clusterViewEnv...)...),
+						}, append(injectEnv, append(clusterViewEnv, a2aTargetAllowlistEnv(agent)...)...)...),
 						Ports: injectPorts,
 						VolumeMounts: append([]corev1.VolumeMount{{
 							Name: "principal-map", MountPath: "/etc/a2a/principal-map", ReadOnly: true,
