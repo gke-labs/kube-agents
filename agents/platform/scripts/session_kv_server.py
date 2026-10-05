@@ -2295,6 +2295,8 @@ CRON_RELAY_CALLER_TIMEOUT_S = 360
 CRON_RELAY_POSTS_BUDGET_S = CRON_RELAY_CALLER_TIMEOUT_S // 2
 AUDIT_TEXT_SEND_RESERVE_S = 60
 AUDIT_BLOCKS_MIN_POST_S = 5
+# The relay_detail clause for a Slack headline whose full report did not follow it.
+AUDIT_FOLD_LOST = "the Slack headline posted but not the full report under it"
 # With less than this left of the posts' budget the ledger is not fetched and
 # the leg posts the composed message as text: the fetch's bound, plus time for
 # the send after it.
@@ -2826,20 +2828,22 @@ def _fetch_ledger_issue(ref: slack_audit_report.LedgerRef) -> dict | None:
     return issue if isinstance(issue, dict) else None
 
 
-def _post_audit_fold(profile: str, job_id: str, message: str, chat_id: str, thread_id: str, deadline: float) -> None:
-    """Post `message`, the full report, under its Slack headline.
+def _post_audit_fold(profile: str, job_id: str, message: str, chat_id: str, thread_id: str, deadline: float) -> bool:
+    """Post `message`, the full report, under its Slack headline; whether it posted.
 
     The send takes what is left of the posts' `deadline`, and is skipped with
     less than the minimum left. A skip or a failure is logged, not raised: the
-    headline has already landed, so the leg counts as delivered either way, and
+    headline has already landed, so the leg counts as delivered, degraded, and
     the incident row still stores the full report for the thread's replies.
     """
     left = deadline - time.monotonic()
     if left < AUDIT_BLOCKS_MIN_POST_S:
         logger.error(f"Relay for {profile}/{job_id}: no time left to post the full report under the Slack headline")
-        return
+        return False
     if not _send_to_chat("slack", message, chat_id or _slack_home_channel(), thread_id, timeout=left):
         logger.error(f"Relay for {profile}/{job_id}: Slack headline posted but not the full report under it")
+        return False
+    return True
 
 
 def _post_audit_blocks(
@@ -3081,6 +3085,8 @@ def relay_cron_report(
     # Legs whose Block Kit post landed with no ts to thread under: delivered,
     # with nothing to register or fold into.
     unthreaded: list[str] = []
+    # Whether a delivered headline lost the full report it folds.
+    fold_lost = False
     for platform in platforms:
         leg_chat_id, leg_thread_id = known_threads.get(platform, ("", ""))
         try:
@@ -3104,12 +3110,14 @@ def relay_cron_report(
         # The blocks leave out the report's line as the text headline does, so they lose what it loses.
         if headline and slack_audit_report.needs_fold(composed, headline.text):
             if new_thread_id:
-                _post_audit_fold(profile, job_id, message, leg_chat_id, new_thread_id, posts_deadline)
+                if not _post_audit_fold(profile, job_id, message, leg_chat_id, new_thread_id, posts_deadline):
+                    fold_lost = True
             else:
                 logger.warning(
                     f"Relay for {profile}/{job_id}: no thread to post the full report in, "
                     f"so its resolved count and pull request links reach {platform} nowhere"
                 )
+                fold_lost = fold_lost or posted is not None
         if new_thread_id:
             threads[platform] = new_thread_id
         elif posted is not None:
@@ -3123,6 +3131,8 @@ def relay_cron_report(
                 f"Relay for {profile}/{job_id}: report composed but not delivered to {platform}"
             )
 
+    if fold_lost:
+        degraded = "; ".join(filter(None, (degraded, AUDIT_FOLD_LOST)))
     undelivered = [p for p in platforms if p not in threads and p not in unthreaded]
     if not threads:
         if unthreaded:

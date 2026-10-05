@@ -144,7 +144,9 @@ can take most of that. So the ledger read, the Block Kit posts and the posts int
 the headline's thread share a budget of half that timeout from the route's start:
 the Block Kit posts stop short of it with room left for the text send, a thread
 post with too little of it left is skipped and logged, and when too little is left
-to read the ledger the composed message goes out as text in one send.
+to read the ledger the composed message goes out as text in one send. A headline
+whose full report did not follow it, skipped, refused or with no ts to thread
+under, still counts as delivered, with `"relay": "degraded"`.
 
 ## Why the Chat Agent composes but does not send
 
@@ -644,8 +646,9 @@ every one of them is visible to a job author:
   unnoticed. So the degradation is stated twice: the posted message is prefixed
   `[unrelayed]`, naming the profile and job, and the response body carries
   `"relay": "degraded"` next to `"status": "delivered"`.
-  `relay` has one cause today, and both callers had hard-coded the sentence for
-  it, so the body also carries `relay_detail`: the route's own wording, which
+  The other cause is a Slack headline whose full report did not post under it.
+  Both callers had hard-coded the sentence for the first cause, so the body also
+  carries `relay_detail`: the route's own wording, which
   names the cause and never a platform, and which lets a second cause land in
   the route without a client change.
   A send that lands on one platform and not another is a different case, and not

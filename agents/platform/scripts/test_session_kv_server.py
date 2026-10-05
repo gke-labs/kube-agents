@@ -3772,6 +3772,8 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertTrue(any("posted to slack with no ts" in m for m in logs.output))
         self.assertTrue(any("no thread to post the full report in" in m for m in logs.output))
+        self.assertEqual(response.json()["relay"], "degraded")
+        self.assertIn("not the full report", response.json()["relay_detail"])
 
     def test_blocks_posted_with_no_ts_are_not_undelivered_beside_another_leg(self):
         self._blocks_on()
@@ -3781,8 +3783,9 @@ class TestSlackAuditHeadline(unittest.TestCase):
 
     def test_the_thread_posts_take_what_is_left_of_the_posts_budget(self):
         self._blocks_on()
-        _, calls = self._post_at(100, lambda *a, **k: self.BLOCKS_TS)
+        response, calls = self._post_at(100, lambda *a, **k: self.BLOCKS_TS)
         self.assertAlmostEqual(calls[0].kwargs["timeout"], session_kv_server.CRON_RELAY_POSTS_BUDGET_S - 100)
+        self.assertEqual(response.json()["relay"], "ok")
 
     def test_a_thread_post_with_no_time_left_is_skipped_and_named(self):
         self._blocks_on()
@@ -3795,13 +3798,16 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self.assertEqual(response.json()["status"], "delivered")
         self.assertEqual(calls, [])
         self.assertTrue(any("no time left to post the full report" in m for m in logs.output))
+        self.assertIn("not the full report", response.json()["relay_detail"])
 
     def test_a_failed_thread_post_names_what_it_lost(self):
         self._blocks_on()
         self.SLACK_THREAD = self.BLOCKS_TS  # the fake refuses posts into the blocks' thread
         with self.assertLogs(session_kv_server.logger, "ERROR") as logs:
-            self._post(blocks_post=lambda *a, **k: self.BLOCKS_TS, fold_ok=False)
+            response, _ = self._post(blocks_post=lambda *a, **k: self.BLOCKS_TS, fold_ok=False)
         self.assertTrue(any("not the full report under it" in m for m in logs.output))
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertIn("not the full report", response.json()["relay_detail"])
 
     def test_no_time_left_for_the_blocks_posts_text(self):
         self._blocks_on()
