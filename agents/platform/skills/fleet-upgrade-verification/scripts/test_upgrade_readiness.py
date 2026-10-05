@@ -522,7 +522,12 @@ class WebhookScopeTest(unittest.TestCase):
     def test_resource_wildcards(self):
         self.assertEqual(self._path([rule(["*"])]), ["CREATE pods", "CREATE nodes"])  # `*` covers resources, not subresources
         self.assertEqual(self._path([rule(["*/*"])]), ["CREATE pods", "CREATE pods/binding", "CREATE pods/eviction", "CREATE nodes"])
-        self.assertEqual(self._path([rule(["pods/*"])]), ["CREATE pods/binding", "CREATE pods/eviction"])  # subresources only, not pods itself
+        # `pods/*` is pods and its subresources, as the API server reads a `*` subresource.
+        self.assertEqual(self._path([rule(["pods/*"])]), ["CREATE pods", "CREATE pods/binding", "CREATE pods/eviction"])
+        self.assertEqual(self._path([rule(["pods/*"], operations=("DELETE",))]), ["DELETE pods"])
+        self.assertEqual(self._path([rule(["nodes/*"], operations=("CREATE", "UPDATE", "DELETE"))]), ["CREATE nodes", "UPDATE nodes", "UPDATE nodes/status", "DELETE nodes"])
+        # A gate on `leases/*` with a dead backend refuses every kubelet heartbeat: a blocker, not an outage.
+        self.assertEqual(self._path([rule(["leases/*"], operations=("CREATE", "UPDATE"), groups=("coordination.k8s.io",))]), ["CREATE leases", "UPDATE leases"])
         self.assertEqual(self._path([rule(["*/eviction"])]), ["CREATE pods/eviction"])
 
     def test_operation_group_and_scope_must_all_match(self):

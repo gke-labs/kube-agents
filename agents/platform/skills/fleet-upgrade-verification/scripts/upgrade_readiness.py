@@ -695,8 +695,11 @@ def backend_problem(service_ref: dict, services: list[dict], slices: list[dict])
 
 
 def _resource_matches(spec: str, target: str) -> bool:
-    """RuleWithOperations `resources` semantics: `*` is every resource but no subresource,
-    `*/*` every resource and subresource, `pods/*` every subresource of pods."""
+    """RuleWithOperations `resources` semantics, as the API server's matcher reads them:
+    `*` is every resource but no subresource, `*/*` every resource and subresource, and
+    `pods/*` is pods together with every subresource of pods -- a `*` subresource also
+    matches a request that has none, so `leases/*` reaches the lease writes a kubelet
+    heartbeat makes."""
     if spec == ALL_RESOURCES_AND_SUBRESOURCES:
         return True
     resource, _, sub = target.partition("/")
@@ -704,7 +707,7 @@ def _resource_matches(spec: str, target: str) -> bool:
     if spec_resource not in (resource, WILDCARD):
         return False
     if not sub:
-        return not slash
+        return not slash or spec_sub == WILDCARD
     return bool(slash) and spec_sub in (sub, WILDCARD)
 
 

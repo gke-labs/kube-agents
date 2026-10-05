@@ -1127,6 +1127,10 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual(by_name["robot-host"]["status"], "blocked")
         self.assertEqual(by_name["seeded-b"]["status"], "blocked")
         self.assertIsNone(by_name["seeded-a"]["webhooks"])
+        # An API server the first read could not reach is not asked a second time: one
+        # kubectl call for seeded-a, two for each of the other members.
+        self.assertEqual(len([c for c in fake.calls if c[:2] == ["kubectl", "get"]]), 5)
+        self.assertTrue(by_name["seeded-a"]["webhook_read_error"].startswith(report.WEBHOOK_READ_SKIPPED))
         self.assertEqual([e["cluster"] for e in data["errors"]], ["seeded-a", "seeded-a"])
         self.assertIn("- read failed for p1 (us-central1-a) cluster seeded-a: kubectl get pdb,deploy,statefulset -A -o json failed (1)", text)
         self.assertIn("| read failed | read failed |", text)
@@ -1149,6 +1153,15 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual([e["cluster"] for e in data["errors"]], ["seeded-b"])
         self.assertIn("credentials for the cluster could not be fetched", b["note"])
         self.assertNotIn("read failed", b["note"])
+
+    def test_an_unwritable_kubeconfig_dir_is_a_directory_error_not_a_credentials_error(self):
+        # `--kubeconfig-dir` is operator-chosen, so an unwritable path is ordinary input and
+        # the note has to send the operator to the path, not to IAM.
+        read = report.read_cluster_objects({"name": "c", "location": "l"}, "p", os.path.join(os.devnull, "kubeconfigs"))
+        self.assertIsNotNone(read["directory_error"])
+        self.assertIsNone(read["credentials_error"])
+        self.assertIn("cannot create kubeconfig directory", read["error"])
+        self.assertEqual(read["error"], read["webhook_error"])
 
     def test_webhook_read_failure_leaves_the_pdb_rule_graded(self):
         fake = FakeReadinessCommands(self.clusters, {}, self.objects, failing_webhook_read=["robot-host"])

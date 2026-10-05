@@ -209,6 +209,12 @@ VERSION_PAIR_SEPARATOR = " / "
 # workspace, which is why the default is not /tmp. `--kubeconfig-dir` overrides it.
 KUBECTL = "kubectl"
 KUBECTL_TIMEOUT_SECONDS = 60
+# Error text from the first `kubectl get` that says the API server itself could not be
+# reached, in which case the second read against the same kubeconfig would only spend a
+# second timeout to fail the same way.
+UNREACHABLE_MARKERS = ("timed out after", "Unable to connect to the server", "i/o timeout", "connection refused", "no such host")
+WEBHOOK_READ_SKIPPED = "skipped: the PDB read could not reach the API server"
+NOTE_DIRECTORY_FAILED = "kubeconfig directory could not be created; PDBs and webhooks not graded"
 # Two reads, so a failure listing the webhook side (a large EndpointSlice list timing out, a
 # custom role without webhook-configuration reads) costs the webhook rule only, never the PDBs.
 KUBECTL_RESOURCES = "pdb,deploy,statefulset"
@@ -583,15 +589,17 @@ def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> di
     PodDisruptionBudget, Deployment and StatefulSet, and a second reads the webhook
     configurations, Services and EndpointSlices. Returns `items`/`error` for the first,
     `webhook_items`/`webhook_error` for the second, and `kubeconfig`. A failed
-    `get-credentials` fails both; otherwise each read fails alone, grading only its own
-    rule `unknown`, and any failure makes the run exit 1.
+    `get-credentials` fails both, and so does a kubeconfig directory that cannot be created
+    (`directory_error`); a first read that could not reach the API server skips the second
+    rather than spend a second timeout on it; otherwise each read fails alone, grading only
+    its own rule `unknown`, and any failure makes the run exit 1.
     """
     path = kubeconfig_path(kubeconfig_dir, project, cluster.get("name", ""), cluster.get("location", ""))
-    result = {"items": None, "error": None, "webhook_items": None, "webhook_error": None, "credentials_error": None, "kubeconfig": path}
+    result = {"items": None, "error": None, "webhook_items": None, "webhook_error": None, "credentials_error": None, "directory_error": None, "kubeconfig": path}
     try:
         os.makedirs(kubeconfig_dir, exist_ok=True)
     except OSError as e:
-        result["error"] = result["webhook_error"] = result["credentials_error"] = f"cannot create kubeconfig directory {kubeconfig_dir}: {e}"
+        result["error"] = result["webhook_error"] = result["directory_error"] = f"cannot create kubeconfig directory {kubeconfig_dir}: {e}"
         return result
     env = {**os.environ, KUBECONFIG_ENV: path}
     cmd = get_credentials_cmd(cluster, project)
@@ -600,6 +608,9 @@ def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> di
         result["error"] = result["webhook_error"] = result["credentials_error"] = f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}"
         return result
     result["items"], result["error"] = _kubectl_items(KUBECTL_RESOURCES, env)
+    if result["error"] and any(marker in result["error"] for marker in UNREACHABLE_MARKERS):
+        result["webhook_error"] = f"{WEBHOOK_READ_SKIPPED} ({result['error']})"
+        return result
     result["webhook_items"], result["webhook_error"] = _kubectl_items(KUBECTL_WEBHOOK_RESOURCES, env)
     return result
 
@@ -618,7 +629,9 @@ def assess_readiness(cluster: dict, member: dict, read: dict, at: datetime) -> d
     status = readiness.readiness_status(pdbs, webhooks, maintenance, skew, target is not None)
 
     notes = []
-    if read["credentials_error"]:
+    if read.get("directory_error"):
+        notes.append(NOTE_DIRECTORY_FAILED)
+    elif read["credentials_error"]:
         notes.append("credentials for the cluster could not be fetched; PDBs and webhooks not graded")
     else:
         if read_error:
