@@ -1,6 +1,6 @@
 # Slack Stop: cancel the turn and the cards, and say what changed
 
-Status: proposed. Builds on the Slack status line (`deploy/docker/patches/slack_ux_status.py`), which
+Status: proposed; the reply wording is pending maintainer approval. Builds on the Slack status line (`deploy/docker/patches/slack_ux_status.py`), which
 owns the agent session's status and the thread's plan rows.
 
 Slack's agent view puts a Stop button beside "working…". Pressing it stops everything the thread
@@ -231,6 +231,8 @@ names no cluster. Several targets are joined "seeded-a or seeded-b" up to three,
 "3 clusters". With no target, the clause is dropped ("Nothing changed."). Several writes are one
 line each under a single "Stopped." The reply is one message in the thread.
 
+The replies below are pending maintainer approval; none is final until signed off.
+
 | Case                                                             | Reply                                                                                                                           |
 | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
 | Checked, nothing changed                                         | Stopped. Nothing changed in seeded-a.                                                                                           |
@@ -254,7 +256,7 @@ Slack. The existing `STOPPED` reword in `slack_boilerplate.py` ("Stopped. Send m
 you want to carry on.") is replaced by these on Slack, because it says nothing about the cards. A
 stopped card's plan row reads "Stopped" in its detail, with the ✗ icon.
 
-**For sign-off:** "Nothing changed in seeded-a" is the mock's wording, and it reads as a claim about
+**Pending maintainer approval:** "Nothing changed in seeded-a" is the mock's wording, and it reads as a claim about
 the cluster, while the check covers only this thread's writes. "Stopped. I didn't change anything in
 seeded-a." says exactly what was checked. The eval accepts whichever is chosen; the table above uses
 the mock's until decided.
