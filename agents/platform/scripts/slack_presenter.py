@@ -10,8 +10,9 @@ gateway. Its callers include the gateway patches for reactions
 session status (``slack_ux_status``, which reads only :func:`enabled`), moments
 (``slack_ux_moments``, which reads :func:`enabled` and lays out through
 ``slack_moments``), incident triage (``slack_ux_incident``), button clicks
-(``slack_ux_clicks``) and the harness-message patch (``slack_boilerplate``,
-which reads only :func:`enabled`).
+(``slack_ux_clicks``), failure replies (``slack_ux_failure``, which bolds
+with ``_first_sentence`` and adds its offer with :func:`blocks_answer`) and the
+harness-message patch (``slack_boilerplate``, which reads only :func:`enabled`).
 Every caller reaches it through ``PYTHONPATH=/opt/defaults/scripts``, which the
 operator sets on the agent container.
 
@@ -26,8 +27,9 @@ rows by ``_actions``; :func:`fallback_text`
 is the headline, links and choices as plain mrkdwn, for the message's ``text``
 field.
 :func:`blocks_answer` lays a headline, links and choices out as blocks; its
-caller is ``slack_moments``, which lays out the messages ``slack_ux_moments``
-posts. :func:`with_side_bar` puts every block below the headline in one legacy
+callers are ``slack_moments``, which lays out the messages ``slack_ux_moments``
+posts, and ``slack_ux_failure``, which adds a failure reply's offer button.
+:func:`with_side_bar` puts every block below the headline in one legacy
 attachment whose ``color`` is the side bar, for ``slack_ux_moments`` posting and
 settling a moment and ``slack_ux_clicks`` rewriting one; :func:`message_blocks`
 and :func:`side_bar_color` read a click's echoed message back.

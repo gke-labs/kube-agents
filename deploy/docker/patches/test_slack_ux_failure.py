@@ -1,0 +1,241 @@
+"""Host tests for the KAGE_SLACK_UX failure-reply module. No Hermes install required.
+
+Run: python3 -m pytest deploy/docker/patches/test_slack_ux_failure.py
+"""
+
+import os
+import shutil
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+HERE = Path(__file__).resolve().parent
+SCRIPTS = HERE.parents[2] / "agents" / "platform" / "scripts"
+sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(SCRIPTS))
+
+import apply_slack_ux_failure as applier
+import slack_presenter
+import slack_ux_failure as runtime
+import slack_ux_moments
+import verify_slack_ux_failure as verifier
+
+#: Mock 06's reply, verbatim.
+REPLY = (
+    "I couldn't find seeded-z. The fleet has seeded-a, -b and -c. checkout-gateway runs on seeded-a. Check it there?"
+)
+SUB = {"task_id": "t_f1", "platform": "slack", "chat_id": "C0KAGE", "thread_id": "1700000000.000100"}
+WAKE = "Task t_f1 gave up."
+FLAG_ENV = "KAGE_SLACK_UX"
+
+
+def _event(internal=True, platform="slack", chat_id="C0KAGE", thread_id="1700000000.000100"):
+    source = SimpleNamespace(platform=SimpleNamespace(value=platform), chat_id=chat_id, thread_id=thread_id)
+    return SimpleNamespace(internal=internal, source=source)
+
+
+def _render(content):
+    return [{"type": "section", "text": {"type": "mrkdwn", "text": content}}]
+
+
+def _buttons(blocks):
+    return [e for b in blocks or () if b.get("type") == "actions" for e in b["elements"]]
+
+
+class FlagOn(unittest.TestCase):
+    def setUp(self):
+        runtime._marks.clear()
+        patcher = mock.patch.dict(os.environ, {FLAG_ENV: "1"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(runtime._marks.clear)
+
+    def draw(self, event, content=REPLY, render=_render):
+        token = runtime.begin(event)
+        try:
+            return runtime.maybe_blocks(content, render)
+        finally:
+            runtime.end(token)
+
+
+class PresentTest(unittest.TestCase):
+    def test_mock_06_gets_a_bold_lead_and_its_question_as_the_offer(self):
+        bolded, label = runtime.present(REPLY)
+        self.assertTrue(bolded.startswith("**I couldn't find seeded-z.** The fleet has"))
+        self.assertTrue(bolded.endswith("Check it there?"))
+        self.assertEqual(label, "check it there")
+
+    def test_a_reply_that_ends_on_a_statement_offers_nothing(self):
+        bolded, label = runtime.present("The check crashed. It's being retried.")
+        self.assertEqual(bolded, "**The check crashed.** It's being retried.")
+        self.assertEqual(label, "")
+
+    def test_a_lead_holding_markup_is_left_plain(self):
+        for reply in ("*Already bold.* Retry?", "`seeded-z` is gone. Retry?", "- a list item. Retry?"):
+            with self.subTest(reply=reply):
+                bolded, _ = runtime.present(reply)
+                self.assertEqual(bolded, reply)
+
+    def test_a_question_that_does_not_fit_a_button_or_holds_markup_offers_nothing(self):
+        long_question = "Want me to " + "really " * 12 + "try again?"
+        for reply in (f"It stopped. {long_question}", "It stopped. Retry on `seeded-a`?", "It stopped?\nNo."):
+            with self.subTest(reply=reply):
+                self.assertEqual(runtime.present(reply)[1], "")
+
+    def test_the_offer_keeps_words_capitalised_anyway(self):
+        for question, label in {
+            "Retry it?": "retry it",
+            "I can retry it?": "I can retry it",
+            "I'll retry it?": "I'll retry it",
+            "OK to retry?": "OK to retry",
+            "A retry?": "a retry",
+        }.items():
+            with self.subTest(question):
+                self.assertEqual(runtime.present("It failed. " + question)[1], label)
+
+    def test_a_lone_question_is_both_lead_and_offer(self):
+        self.assertEqual(
+            runtime.present("Try again on seeded-a?"), ("**Try again on seeded-a?**", "try again on seeded-a")
+        )
+
+
+class MarkTest(FlagOn):
+    def test_a_failure_wake_marks_its_thread_and_its_reply_is_drawn(self):
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        blocks = self.draw(_event())
+        self.assertTrue(blocks[0]["text"]["text"].startswith("**I couldn't find seeded-z.**"))
+        (button,) = _buttons(blocks)
+        self.assertEqual(button["text"]["text"], "check it there")
+        self.assertEqual(button["value"], "check it there")
+        self.assertRegex(button["action_id"], slack_presenter.CHOICE_ACTION_ID_PATTERN)
+
+    def test_a_queued_user_message_drops_the_mark(self):
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        runtime.drop(_event().source, _event(internal=False))
+        self.assertEqual(self.draw(_event()), _render(REPLY))
+
+    def test_a_queued_wake_keeps_the_mark(self):
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        runtime.drop(_event().source, _event())
+        self.assertEqual(len(_buttons(self.draw(_event()))), 1)
+
+    def test_a_sibling_wake_leaves_the_mark(self):
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        runtime.note_wake(SUB, {"completed"}, "Task t_f2 completed.")
+        self.assertEqual(len(_buttons(self.draw(_event()))), 1)
+
+    def test_outside_a_thread_the_lead_is_bold_and_the_question_stays_text(self):
+        runtime.note_wake({**SUB, "thread_id": None}, {"gave_up"}, WAKE)
+        blocks = self.draw(_event(thread_id=None))
+        self.assertTrue(blocks[0]["text"]["text"].startswith("**I couldn't find seeded-z.**"))
+        self.assertEqual(_buttons(blocks), [])
+
+    def test_a_wake_whose_question_is_posted_clears_the_mark(self):
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        runtime.note_wake(SUB, {"blocked"}, WAKE + " " + slack_ux_moments.WAKE_NOTE)
+        self.assertEqual(runtime._marks, {})
+
+    def test_the_mark_is_taken_once(self):
+        runtime.note_wake(SUB, {"blocked"}, WAKE)
+        self.draw(_event())
+        self.assertEqual(self.draw(_event()), _render(REPLY))
+
+    def test_unmarked_sends_render_as_upstream(self):
+        cases = {
+            "completed wake": ({"completed"}, WAKE, _event()),
+            "question already posted": ({"blocked"}, f"{WAKE}\n\n{slack_ux_moments.WAKE_NOTE}", _event()),
+            "the user's own message": ({"gave_up"}, WAKE, _event(internal=False)),
+            "another thread": ({"gave_up"}, WAKE, _event(thread_id="1700000000.000999")),
+            "another platform": ({"gave_up"}, WAKE, _event(platform="google_chat")),
+        }
+        for name, (kinds, text, event) in cases.items():
+            with self.subTest(name):
+                runtime._marks.clear()
+                runtime.note_wake(SUB, kinds, text)
+                self.assertEqual(self.draw(event), _render(REPLY))
+
+    def test_a_mark_past_its_ttl_is_dropped(self):
+        with mock.patch.object(runtime.time, "monotonic", return_value=1000.0):
+            runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        with mock.patch.object(runtime.time, "monotonic", return_value=1000.0 + runtime.MARK_TTL_SECONDS + 1):
+            self.assertEqual(self.draw(_event()), _render(REPLY))
+
+    def test_marks_are_capped_oldest_first(self):
+        for i in range(runtime.MARKS_MAX + 1):
+            runtime.note_wake({**SUB, "thread_id": str(i)}, {"gave_up"}, WAKE)
+        self.assertEqual(len(runtime._marks), runtime.MARKS_MAX)
+        self.assertNotIn(("C0KAGE", "0"), runtime._marks)
+
+    def test_a_render_that_declines_keeps_upstreams_answer(self):
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        self.assertIsNone(self.draw(_event(), render=lambda content: None))
+
+    def test_a_message_at_the_block_cap_keeps_its_question_as_text(self):
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        full = lambda content: _render(content) * runtime.MESSAGE_BLOCKS_MAX  # noqa: E731
+        self.assertEqual(_buttons(self.draw(_event(), render=full)), [])
+
+    def test_a_render_that_raises_falls_back_to_the_reply_as_written(self):
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        seen = []
+
+        def render(content):
+            seen.append(content)
+            if content != REPLY:
+                raise ValueError("boom")
+            return _render(content)
+
+        with self.assertLogs(runtime.logger, "WARNING"):
+            self.assertEqual(self.draw(_event(), render=render), _render(REPLY))
+
+    def test_the_mark_does_not_outlive_the_send(self):
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        self.draw(_event())
+        self.assertFalse(runtime._marked.get())
+
+
+class FlagOff(unittest.TestCase):
+    def test_nothing_is_marked(self):
+        runtime._marks.clear()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(FLAG_ENV, None)
+            runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        self.assertEqual(runtime._marks, {})
+        self.assertIsNone(runtime.begin(_event()))
+
+
+class ApplyTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root)
+        files = {
+            applier.NOTIFIER: "class N:\n    def build_wake_text(self):\n" + applier.WAKE_ANCHOR,
+            applier.BASE: "class B:\n    async def send_final_ledgered(self, event):\n"
+            + applier.FINAL_ANCHOR
+            + "        return result\n",
+            applier.SLACK_ADAPTER: "from typing import Optional\n\n\nclass S:\n"
+            + applier.BLOCKS_ANCHOR
+            + "        return None\n",
+            applier.RUN_TURN: "class R:\n    async def _run_agent_queued_followup(self, turn_ctx, pending_event):\n"
+            + applier.FOLLOWUP_ANCHOR
+            + "        return None\n",
+        }
+        for rel, text in files.items():
+            (self.root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / rel).write_text(text)
+
+    def test_each_file_gets_its_call_and_a_second_run_is_refused(self):
+        applier.apply(self.root)
+        for rel in (applier.NOTIFIER, applier.BASE, applier.SLACK_ADAPTER, applier.RUN_TURN):
+            self.assertIn(applier.BUILD_MARKER, (self.root / rel).read_text())
+        self.assertIn("def _kage_upstream_maybe_blocks(", (self.root / applier.SLACK_ADAPTER).read_text())
+        verifier.check_callers(self.root)
+        with self.assertRaises(SystemExit):
+            applier.apply(self.root)
+
+
+if __name__ == "__main__":
+    unittest.main()
