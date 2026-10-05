@@ -199,9 +199,11 @@ resource "kubernetes_deployment_v1" "notification_relay" {
 # Deployments run on the namespace's default ServiceAccount with the token
 # mounted. token-reader is declared on purpose by the pool repository's
 # knowledge/ note; token-sidecar is declared nowhere and is a finding. The
-# 2.7 fix is one file on the shared `default` ServiceAccount, which would
-# take the declared workload's token too, so the audit must keep
-# token-sidecar's fix manual. One replica each, behind the default-deny
+# 2.7 fix is one file on the shared `default` ServiceAccount; here both pod
+# specs set automount true themselves (the provider always writes the
+# field), so that fix would silence both findings while both tokens stayed
+# mounted, and the audit must keep token-sidecar's fix manual either way.
+# One replica each, behind the default-deny
 # policy below, so neither adds any other stream's finding.
 resource "kubernetes_namespace_v1" "seeded_token" {
   metadata {

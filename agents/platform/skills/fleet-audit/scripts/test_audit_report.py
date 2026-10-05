@@ -18,6 +18,7 @@ import io
 import json
 import fcntl
 import os
+import pathlib
 import stat
 import re
 import shutil
@@ -5625,12 +5626,15 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
 
     def test_an_incomplete_search_withholds_the_namespace_posture_and_publishes_the_allow_all_fault(self):
         posture = make_finding(fid="ns", severity="major", obj="Namespace/payments", check="netpol-missing")
+        # A spelling the code cannot classify is held with the postures: the
+        # withhold errs toward holding, the join toward not silencing.
+        odd = make_finding(fid="odd", severity="major", obj="ns/billing", check="netpol-missing", namespace="billing")
         fault = make_finding(fid="open", severity="minor", obj="NetworkPolicy/allow-everything", check="netpol-missing")
-        doc = audit_report.validate_findings(make_doc(findings=[posture, fault], audit=AUDIT), AUDIT)
+        doc = audit_report.validate_findings(make_doc(findings=[posture, odd, fault], audit=AUDIT), AUDIT)
         doc.pop(audit_report.DECLARED_INTENT_SEARCHED_KEY, None)
         with contextlib.redirect_stderr(io.StringIO()):
             withheld = audit_report.withhold_unsearched_postures(doc, None)
-        self.assertEqual([f["object"] for f in withheld], ["Namespace/payments"])
+        self.assertEqual(sorted(f["object"] for f in withheld), ["Namespace/payments", "ns/billing"])
         self.assertEqual([f["object"] for f in doc["findings"]], ["NetworkPolicy/allow-everything"])
 
     def test_no_declared_workload_leaves_the_shared_file_alone(self):
@@ -16205,6 +16209,28 @@ class TestFinishManifestFlag(HarnessTestCase):
         ledger = " ".join(self.harness.bodies_for("issue-*"))
         self.assertIn("`payments/Deployment/api`", ledger)
         self.assertNotIn(f"PR #9 covers", self.err)
+
+    def test_remediate_refuses_a_shielded_sibling_and_a_declared_candidate_it_omitted(self):
+        # The human's route runs the same join: with start's declaration filed
+        # and the manifest given, the sibling is shielded (manual, refused) and
+        # the omitted declared candidate is declared (refused as declared).
+        path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
+        worker = make_finding(fid="worker", check="default-sa-automount", obj="Deployment/worker", title="worker", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        self.touch(path)
+        pathlib.Path(audit_report.declarations_path_for(AUDIT)).parent.mkdir(parents=True, exist_ok=True)
+        audit_report.write_declarations(AUDIT, "acme/fleet", [{"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}])
+        findings_file = self.write_findings(make_doc(findings=[worker], audit=AUDIT))
+        manifest = self.manifest_file(_full_manifest(audit=AUDIT, candidates=[self.account_candidate("Deployment/api"), self.account_candidate("Deployment/worker")]))
+        api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
+        worker_id = derived_id(check="default-sa-automount", obj="Deployment/worker")
+        rc = self.run_main(["remediate", "--audit", AUDIT, "--findings-file", findings_file, "--finding", worker_id, "--manifest-file", manifest, "--repo", "acme/fleet"])
+        self.assertEqual(rc, 2, self.err)
+        self.assertIn("MANUAL:", self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+        rc = self.run_main(["remediate", "--audit", AUDIT, "--findings-file", findings_file, "--finding", api_id, "--manifest-file", manifest, "--repo", "acme/fleet"])
+        self.assertEqual(rc, 2, self.err)
+        self.assertIn("declared", self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
 
     def test_a_worker_cannot_mark_a_sibling_shielded_from_the_document(self):
         # Same pull request, no declaration anywhere: a document that carries

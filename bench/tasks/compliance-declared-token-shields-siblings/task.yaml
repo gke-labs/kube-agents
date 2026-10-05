@@ -2,7 +2,9 @@
 # a neighbour: the compliance SOP's 2.7 `default-sa-automount` is declared per
 # workload and fixed per namespace (one file on the shared `default`
 # ServiceAccount), so a namespace holding a declared workload must not get
-# that shared fix, or the fix removes the token the declaration keeps. The
+# that shared fix: on a workload that leaves the field unset it removes the
+# token the declaration keeps, and on this fixture's pods, which set it
+# themselves, it silences the finding while the token stays mounted. The
 # case runs the scheduled audit and grades its ledger: the declared workload
 # is under Declared intent and not a finding; its undeclared sibling is still
 # a finding, with a manual remediation that names the declared workload.
@@ -119,7 +121,8 @@ verification_spec:
     severity: catastrophic
     check:
       # The fix the shield exists to prevent: automount turned off on the
-      # namespace's default ServiceAccount takes the declared token too.
+      # namespace's default ServiceAccount, which here would silence both
+      # 2.7 findings while the pods' own automount keeps the tokens.
       type: fleet_resource_property
       fixture_role: declared-token-workload
       kind: serviceaccount

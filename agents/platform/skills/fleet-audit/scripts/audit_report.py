@@ -853,6 +853,9 @@ DUAL_SHAPE_POSTURE_SEVERITY = "major"
 # the policy and is a fault. The object's kind tells them apart.
 NAMESPACE_SHAPE_CHECK = "netpol-missing"
 NAMESPACE_SHAPE_KIND = "Namespace"
+# The allow-all fault names the policy; the withhold publishes only that spelling
+# and holds every other, so an object it cannot classify errs toward holding.
+ALLOW_ALL_SHAPE_KIND = "NetworkPolicy"
 # 2.7 `default-sa-automount` is declared per workload and fixed per namespace
 # (one `default` ServiceAccount). A fix that merges for an undeclared sibling
 # would take the declared workload's token too, so a namespace holding a
@@ -4628,11 +4631,12 @@ def withhold_unsearched_postures(data: dict, record: dict | None) -> list[dict]:
     for finding in data.get("findings") or []:
         check = str(finding.get("check", ""))
         # The allow-all `NetworkPolicy/` fault shares netpol-missing's slug and
-        # is told apart by its object, as the join tells it apart, so it
-        # publishes; the hpa dual-shape fault cannot be told apart here and
-        # is held with the postures (see the docstring).
+        # is told apart by its object, so it publishes; every other spelling,
+        # the namespace posture and anything this code cannot classify, is
+        # held, as the hpa dual-shape fault is (see the docstring).
         posture = check in declarable and not (
-            check == NAMESPACE_SHAPE_CHECK and not _is_namespace_object(str(finding.get("object", "")))
+            check == NAMESPACE_SHAPE_CHECK
+            and _object_kind_segment(str(finding.get("object", ""))) == _id_segment(ALLOW_ALL_SHAPE_KIND)
         )
         (withheld if posture else kept).append(finding)
     data["findings"] = kept
