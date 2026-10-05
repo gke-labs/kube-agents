@@ -80,8 +80,9 @@ SANDBOX_TIMEOUT_SECONDS = 30
 RETIRE_AFTER_SECONDS = 300
 
 # By absolute path, so no PATH entry picks the binary. A function defined under
-# this name in the ~/.bashrc the model owns still shadows it, since bash allows a
-# slash in a function name; that loses only the rename, as the claim comes first.
+# this name in a ~/.bashrc the model wrote, which older sandbox images allow,
+# still shadows it, since bash allows a slash in a function name; that loses only
+# the rename, as the claim comes first.
 REMOTE_MV = "/bin/mv"
 
 

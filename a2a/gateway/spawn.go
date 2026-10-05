@@ -102,6 +102,25 @@ const (
 	sessionNameHexWidth    = 4
 	supervisorCorrHexWidth = 6
 
+	// The temporary cluster view (Config.SessionClusterView). The token is
+	// for the credential broker's session audience and nothing else - the
+	// API server refuses a token minted for another audience, which is why
+	// projecting it does not undo AutomountServiceAccountToken: false. 0444
+	// because the kubelet writes it as root and the worker reads it as uid
+	// 1000 (the shell sandbox's buildShellSandboxCredentialProxyTokenVolume
+	// argues the same). Spelled identically in credential_proxy.py and the
+	// operator's platformagent_broker_split.go.
+	credentialProxySessionAudience        = "kubeagents-credential-proxy-session" // #nosec G101 -- audience name
+	credentialProxyTokenVolume            = "credential-proxy-token"              // #nosec G101 -- volume name
+	credentialProxyTokenMountPath         = "/var/run/secrets/kubeagents/credential-proxy"
+	credentialProxyTokenFile              = "token"
+	credentialProxyTokenMode              = 0444
+	credentialProxyTokenExpirationSeconds = 3600
+	// sessionHermesHome is where the shim files the kubeconfig artefacts
+	// get-credentials returns ($HERMES_HOME/.kubeconfigs); the pod's
+	// scratch emptyDir, the one writable place.
+	sessionHermesHome = "/scratch"
+
 	labelPartOf = "app.kubernetes.io/part-of"
 	partOfValue = "a2a-next"
 	labelRole   = "app.kubernetes.io/component"
@@ -295,8 +314,10 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 			// Still false, and now more load-bearing than before. Automount
 			// would add a SECOND token to the pod — default-audience, not
 			// pod-bound, and usable against the API server. The projected
-			// volume below is the only credential a session gets, and it is
-			// good for one thing.
+			// volume(s) below are the only credentials a session gets: the
+			// bus token always, and under the cluster view, the credential
+			// broker's session-audience token too — both audience-bound,
+			// neither usable against the API server.
 			AutomountServiceAccountToken: ptr.To(false),
 			// The adapter's deadline sits below this by construction (its
 			// contract, and podDeadlineGrace's comment): a healthy adapter
@@ -347,6 +368,27 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 					// to have one, and only the second is unremarkable
 					// (lib.EnvOriginSeq).
 					{Name: lib.EnvOriginSeq, Value: originSeqValue(originSeq)},
+					// The capability contract's two halves, rendered the same
+					// way and for the same reason.
+					//
+					// Scope, because the gateway MINTS under its resolved
+					// AuthorityScope and the executor CHECKS against its own:
+					// they are compared, not merely both present, so a session
+					// pod left to default would derive `namespace/-` — the
+					// scope that contains nothing — and refuse every task with
+					// a message that reads like a capability bug rather than a
+					// missing variable. It cannot derive the real one either:
+					// no POD_NAMESPACE rides here, deliberately, because the
+					// value that has to match is the gateway's resolved
+					// setting and not whatever namespace the pod landed in.
+					//
+					// Required, because a mixed-version install needs both
+					// halves relaxed together. One switch on the gateway
+					// Deployment arms or relaxes the executor too, so there is
+					// no state where the gateway mints nothing and the
+					// executor insists on a capability.
+					{Name: "A2A_AUTHORITY_SCOPE", Value: string(s.cfg.AuthorityScope)},
+					{Name: "A2A_CAPABILITY_REQUIRED", Value: strconv.FormatBool(!s.cfg.CapabilityOptional)},
 				},
 				Resources: corev1.ResourceRequirements{
 					Requests: corev1.ResourceList{
@@ -403,6 +445,27 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 				},
 			},
 		},
+	}
+	if s.cfg.SessionClusterView {
+		c := &pod.Spec.Containers[0]
+		c.Env = append(c.Env,
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_URL", Value: s.cfg.CredentialProxyURL},
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_TOKEN_FILE", Value: credentialProxyTokenMountPath + "/" + credentialProxyTokenFile},
+			corev1.EnvVar{Name: "HERMES_HOME", Value: sessionHermesHome},
+			corev1.EnvVar{Name: lib.EnvClusterView, Value: "true"},
+		)
+		c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: credentialProxyTokenVolume, MountPath: credentialProxyTokenMountPath, ReadOnly: true})
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+			Name: credentialProxyTokenVolume,
+			VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+				DefaultMode: ptr.To(int32(credentialProxyTokenMode)),
+				Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+					Audience:          credentialProxySessionAudience,
+					ExpirationSeconds: ptr.To(int64(credentialProxyTokenExpirationSeconds)),
+					Path:              credentialProxyTokenFile,
+				}}},
+			}},
+		})
 	}
 	created, err := s.client.CoreV1().Pods(s.cfg.Namespace).Create(ctx, pod, metav1.CreateOptions{})
 	if err != nil {

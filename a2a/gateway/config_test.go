@@ -8,10 +8,13 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/capability"
 )
 
 // setBaseEnv pins the required env plus empty values for every optional
@@ -792,5 +795,84 @@ func TestDefaultAddresseeIsPlatform(t *testing.T) {
 	}
 	if cfg.DefaultAddressee != "platform" {
 		t.Fatalf("DefaultAddressee = %q, want platform", cfg.DefaultAddressee)
+	}
+}
+
+// The gateway half of the capability switch, asserted through FromEnv rather
+// than through a Config literal. The mint side and the check side are
+// rendered from one variable so they cannot drift, which only holds if each
+// end reads it the same way; this is the gateway end of that claim.
+func TestFromEnvCapabilityOptionalOnlyOnExactlyFalse(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		set   bool
+		want  bool
+	}{
+		{name: "a default install sets nothing", set: false, want: false},
+		{name: "empty is not consent", value: "", set: true, want: false},
+		{name: "the rollout window", value: "false", set: true, want: true},
+		{name: "explicitly required", value: "true", set: true, want: false},
+		{name: "a typo enforces", value: "False", set: true, want: false},
+		{name: "so does a lie", value: "0", set: true, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setBaseEnv(t)
+			t.Setenv("A2A_CAPABILITY_REQUIRED", tc.value)
+			if !tc.set {
+				if err := os.Unsetenv("A2A_CAPABILITY_REQUIRED"); err != nil {
+					t.Fatalf("could not unset: %v", err)
+				}
+			}
+			cfg, err := FromEnv()
+			if err != nil {
+				t.Fatalf("FromEnv: %v", err)
+			}
+			if cfg.CapabilityOptional != tc.want {
+				t.Errorf("CapabilityOptional = %v, want %v with A2A_CAPABILITY_REQUIRED=%q (set=%v)",
+					cfg.CapabilityOptional, tc.want, tc.value, tc.set)
+			}
+		})
+	}
+}
+
+// TestAMalformedPodNamespaceIsAGatewayBootFailure covers the gateway's share
+// of a rule that all three components reading POD_NAMESPACE now get from
+// capability.ValidateNamespace. The gateway is the one with the most to lose:
+// it MINTS, so a ceiling built from a namespace nobody validated is inherited
+// by every hop of every task the install ever runs.
+//
+// The second row is why this is not redundant with the Entry check that
+// follows it. "a/b/c" builds "namespace/a/b/c", which Entry.Validate accepts
+// as namespace=a plus a second pair b/c — so before this check the gateway
+// booted clean and minted against a ceiling nobody chose. The first row
+// Entry.Validate would already have caught; keeping both is what shows the
+// check is doing work the existing one did not.
+//
+// The scope is set explicitly on the last row to pin the deliberate choice
+// that an explicit A2A_AUTHORITY_SCOPE does not excuse a malformed namespace:
+// it only stops the namespace from reaching the ceiling, and the gateway
+// reads POD_NAMESPACE for more than that.
+func TestAMalformedPodNamespaceIsAGatewayBootFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		namespace string
+		scope     capability.Scope
+		wantErr   bool
+	}{
+		{name: "odd separators are refused by the scope check too", namespace: "team/x", wantErr: true},
+		{name: "even separators validate as a different ceiling", namespace: "a/b/c", wantErr: true},
+		{name: "a real namespace boots", namespace: "kubeagents-system"},
+		{name: "an explicit scope does not excuse it", namespace: "team/x",
+			scope: capability.Scope("namespace/kubeagents-system"), wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Config{Namespace: tc.namespace, AuthorityScope: tc.scope}
+			c.defaultCapabilityCeiling()
+			if err := c.validateCapabilityCeiling(); (err != nil) != tc.wantErr {
+				t.Fatalf("validateCapabilityCeiling with Namespace=%q scope=%q err = %v, wantErr %v",
+					tc.namespace, tc.scope, err, tc.wantErr)
+			}
+		})
 	}
 }

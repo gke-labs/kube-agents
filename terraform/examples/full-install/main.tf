@@ -366,6 +366,7 @@ module "scope_resolver" {
   shared_vpc_hosts = var.scope.shared_vpc_hosts
   metrics_scopes   = var.scope.metrics_scopes
   exclude_projects = var.scope.exclude.projects
+  member_cap       = var.scope.max_projects
   # The consumer project of the reads: the management project, whose APIs
   # this composition enables (and install.sh pre-enables before a first apply,
   # since the reads run in the plan).
@@ -469,9 +470,10 @@ module "chat_pubsub" {
 
 # The drift detector's audit-log ingress: Log Router sink, drift-audit topic
 # and pull subscription, and the sink-writer and detector IAM. The three names
-# are composition variables, as the stockout trio's are, because lifecycle.sh
-# adopts them by name and a second install in the project has to be able to
-# name its own; the module's defaults decide the rest (retention, backoff, and
+# are composition variables, as the stockout trio's are, because a second
+# install in the project has to be able to name its own -- lifecycle.sh's
+# guard_drift_adoption refuses an apply that would otherwise find all three
+# there and import them; the module's defaults decide the rest (retention, backoff, and
 # the cluster scope, every GKE cluster in the project). The consumer,
 # k8s-operator/cmd/drift-detector, ships in the images and starts in the
 # gateway pod when the PlatformAgent sets spec.harness.driftDetector.enabled;
@@ -815,6 +817,7 @@ resource "helm_release" "kube_agents" {
         organizations  = var.scope.organizations
         sharedVpcHosts = var.scope.shared_vpc_hosts
         metricsScopes  = var.scope.metrics_scopes
+        maxProjects    = var.scope.max_projects
         exclude = {
           projects = var.scope.exclude.projects
           clusters = [

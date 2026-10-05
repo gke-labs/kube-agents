@@ -1988,8 +1988,8 @@ class GitArgumentRefusalTest(unittest.TestCase):
         self.assertIsNotNone(git_argument_violation(["git", "commit", "-c", "HEAD"]))
 
 
-class GitLeaseGateWiringTest(unittest.TestCase):
-    """The gate as the agent meets it — over HTTP, through /v1/exec."""
+class _ExecRouteServer(unittest.TestCase):
+    """A proxy serving /v1/exec on loopback, with an empty policy."""
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -2023,6 +2023,25 @@ class GitLeaseGateWiringTest(unittest.TestCase):
                 return response.status, json.loads(response.read())
         except urllib.error.HTTPError as error:
             return error.code, json.loads(error.read())
+
+
+class GitLeaseGateWiringTest(_ExecRouteServer):
+    """The git gates over HTTP, through /v1/exec.
+
+    `/v1/exec` refuses `git` outright (`ExecRouteRefusesGitTest`), so these
+    put it back on the route to reach the gates behind that refusal: they are
+    what stands if `git` is ever admitted there again.
+    """
+
+    def setUp(self):
+        patcher = mock.patch.object(
+            credential_proxy,
+            "EXEC_ROUTE_EXECUTABLES",
+            (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "git"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        super().setUp()
 
     def test_an_unleased_commit_comes_back_as_a_policy_block(self):
         # The shim renders `SECURITY_POLICY_BLOCKED` as a refusal the agent can
@@ -2097,6 +2116,35 @@ class GitLeaseGateWiringTest(unittest.TestCase):
         self.assertEqual("completed", body["status"])
         self.assertTrue(len(executed_argvs) > 0)
         self.assertEqual(["git", "status", "--porcelain"], executed_argvs[0])
+
+
+class ExecRouteRefusesGitTest(_ExecRouteServer):
+    """`git` posted to /v1/exec never runs, leased workspace or not.
+
+    The broker's `git` carries its credential helper, so a read the lease gate
+    does not fence -- `ls-remote` of a private repository -- would answer under
+    the broker's credential. A sandbox reaches a repository through the verbs.
+    """
+
+    def assert_refused(self, argv, cwd):
+        status, body = self.post({"argv": argv, "cwd": cwd})
+        self.assertEqual(403, status)
+        self.assertEqual("executable.allowlist", body["rule"])
+
+    def test_a_read_the_lease_gate_does_not_fence_is_refused(self):
+        workspace = CredentialProxyHandler.executor.workspace_dir
+        self.assert_refused(
+            ["git", "ls-remote", "https://github.com/acme/private.git"], str(workspace)
+        )
+
+    def test_a_leased_command_is_refused_too(self):
+        workspace = (
+            CredentialProxyHandler.executor.workspace_dir / "gitops" / "t_card"
+        )
+        (workspace / "acme__fleet").mkdir(parents=True)
+        (workspace / ".lease").write_text('{"lease": "t_card"}', encoding="utf-8")
+        self.assert_refused(["git", "status", "--porcelain"], str(workspace / "acme__fleet"))
+        self.assertNotIn("git", credential_proxy.EXEC_ROUTE_EXECUTABLES)
 
 
 class ExecRouteCapacityTest(unittest.TestCase):
@@ -2439,6 +2487,295 @@ class ExecRouteCapacityTest(unittest.TestCase):
         self.assertEqual("pods\n", body["stdout"])
         self.assertEqual(1, len(seen))
         self.assertIsInstance(seen[0], socket.socket)
+
+
+class SessionSlotCapTest(unittest.TestCase):
+    """A session's share of the broker's command pool is bounded on its own."""
+
+    def test_the_limit_comes_from_the_env_with_a_default(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(credential_proxy.DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS, credential_proxy.session_slot_limit_from_env())
+        with mock.patch.dict(os.environ, {credential_proxy.ENV_SESSION_MAX_CONCURRENT_COMMANDS: "5"}, clear=True):
+            self.assertEqual(5, credential_proxy.session_slot_limit_from_env())
+        for bad in ("0", "-1", "two"):
+            with self.subTest(bad=bad):
+                with mock.patch.dict(os.environ, {credential_proxy.ENV_SESSION_MAX_CONCURRENT_COMMANDS: bad}, clear=True):
+                    with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                        self.assertEqual(
+                            credential_proxy.DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS,
+                            credential_proxy.session_slot_limit_from_env(),
+                        )
+
+    def test_only_the_session_role_is_counted_and_the_count_releases(self):
+        slots = credential_proxy.SessionSlots(1)
+        with slots.acquire(credential_proxy.CALLER_ROLE_SESSION):
+            with self.assertRaises(credential_proxy.CommandSlotUnavailable) as refused:
+                with slots.acquire(credential_proxy.CALLER_ROLE_SESSION):
+                    pass
+            self.assertIn("session", str(refused.exception))
+            # The shell and a roleless caller are not counted against it.
+            with slots.acquire(credential_proxy.CALLER_ROLE_SHELL):
+                with slots.acquire(""):
+                    pass
+        # Released on exit, so the next session command is admitted.
+        with slots.acquire(credential_proxy.CALLER_ROLE_SESSION):
+            pass
+
+    def test_a_second_concurrent_session_command_is_answered_busy(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        policy_path = Path(temp_dir.name) / "policy.json"
+        policy_path.write_text(json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8")
+        CredentialProxyHandler.policy = Policy.load(str(policy_path))
+        CredentialProxyHandler.executor = CommandExecutor(
+            timeout_seconds=10, max_output_bytes=4096, state_dir=str(Path(temp_dir.name) / "state"), scoped_pool=None
+        )
+        stub_dir = Path(temp_dir.name) / "bin"
+        stub_dir.mkdir()
+        stub = stub_dir / "kubectl"
+        stub.write_text("#!/bin/bash\nsleep 2\necho pods\n", encoding="utf-8")
+        stub.chmod(0o755)
+        CredentialProxyHandler.executor.executables["kubectl"] = str(stub)
+        CredentialProxyHandler.max_request_bytes = 65536
+        CredentialProxyHandler.enforce_read_only = True
+        CredentialProxyHandler.session_slots = credential_proxy.SessionSlots(1)
+        self.addCleanup(setattr, CredentialProxyHandler, "session_slots", None)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+        # One patch for every thread: the role rides on a request header, so
+        # concurrent requests cannot overwrite each other's principal.
+        def authenticated(handler):
+            return credential_proxy.Principal(
+                workload="system:serviceaccount:ns:x", uid="u", groups=(), role=handler.headers.get("X-Test-Role", "")
+            )
+
+        def post_as(role):
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/v1/exec",
+                data=json.dumps({"argv": ["kubectl", "get", "pods"]}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "X-Test-Role": role},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request) as response:
+                    return response.status, json.loads(response.read())
+            except urllib.error.HTTPError as error:
+                with error:
+                    return error.code, json.loads(error.read())
+
+        results = {}
+        def run(name, role):
+            results[name] = post_as(role)
+        with mock.patch.object(CredentialProxyHandler, "_authenticated", authenticated):
+            first = threading.Thread(target=run, args=("first", credential_proxy.CALLER_ROLE_SESSION))
+            first.start()
+            time.sleep(0.5)
+            second = threading.Thread(target=run, args=("second", credential_proxy.CALLER_ROLE_SESSION))
+            shell = threading.Thread(target=run, args=("shell", credential_proxy.CALLER_ROLE_SHELL))
+            second.start(); shell.start()
+            for thread in (first, second, shell):
+                thread.join(timeout=15)
+        self.assertEqual(200, results["first"][0], results["first"])
+        self.assertEqual(503, results["second"][0], results["second"])
+        self.assertEqual("CREDENTIAL_PROXY_BUSY", results["second"][1]["code"])
+        self.assertIn("session", results["second"][1]["error"])
+        self.assertEqual(200, results["shell"][0], results["shell"])
+
+
+class SessionRoleExecutableTest(unittest.TestCase):
+    """The session caller runs kubectl and gcloud through the broker and nothing else."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        policy_path = Path(self.temp_dir.name) / "policy.json"
+        policy_path.write_text(json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8")
+        CredentialProxyHandler.policy = Policy.load(str(policy_path))
+        CredentialProxyHandler.executor = CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=4096,
+            state_dir=str(Path(self.temp_dir.name) / "state"),
+            scoped_pool=None,
+        )
+        stub_dir = Path(self.temp_dir.name) / "bin"
+        stub_dir.mkdir()
+        for name in ("kubectl", "git"):
+            stub = stub_dir / name
+            stub.write_text("#!/bin/bash\necho ran-$0\n", encoding="utf-8")
+            stub.chmod(0o755)
+            CredentialProxyHandler.executor.executables[name] = str(stub)
+        CredentialProxyHandler.max_request_bytes = 65536
+        CredentialProxyHandler.enforce_read_only = True
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def post_as(self, role, payload):
+        principal = credential_proxy.Principal(
+            workload="system:serviceaccount:ns:agent-a2a-session", uid="u", groups=(), role=role
+        )
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.server.server_port}/v1/exec",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with mock.patch.object(CredentialProxyHandler, "_authenticated", return_value=principal):
+            try:
+                with urllib.request.urlopen(request) as response:
+                    return response.status, json.loads(response.read())
+            except urllib.error.HTTPError as error:
+                with error:
+                    return error.code, json.loads(error.read())
+
+    def test_the_table(self):
+        for role, executable, want in (
+            (credential_proxy.CALLER_ROLE_SESSION, "kubectl", True),
+            (credential_proxy.CALLER_ROLE_SESSION, "gcloud", True),
+            (credential_proxy.CALLER_ROLE_SESSION, "git", False),
+            (credential_proxy.CALLER_ROLE_SESSION, "gh", False),
+            (credential_proxy.CALLER_ROLE_SHELL, "git", True),
+            ("", "gh", True),
+        ):
+            with self.subTest(role=role, executable=executable):
+                self.assertEqual(want, credential_proxy.executable_permitted(role, executable))
+
+    def test_git_from_a_session_is_refused_by_the_route_before_the_role(self):
+        # /v1/exec admits only EXEC_ROUTE_EXECUTABLES for every role, so a
+        # session asking for git meets the route's own refusal first; the role
+        # check below is never reached for an executable the route refuses.
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION, {"argv": ["git", "status"]})
+        self.assertEqual(403, status)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
+        self.assertEqual(credential_proxy.RULE_EXECUTABLE_ALLOWLIST, body["rule"])
+
+    def test_the_role_check_stands_behind_the_route(self):
+        # Widen the route the way the git-routing tests do and the session is
+        # still held to its two CLIs, with the rule the shim prints, while the
+        # shell runs what the route now carries. This is what the role check
+        # buys once the route list and the session list are the same two names.
+        routed = (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "git")
+        with mock.patch.object(credential_proxy, "EXEC_ROUTE_EXECUTABLES", routed):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                status, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION, {"argv": ["git", "status"]})
+            self.assertEqual(403, status)
+            self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
+            self.assertEqual(credential_proxy.RULE_CALLER_EXECUTABLE, body["rule"])
+            self.assertIn("session", body["message"])
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, {"argv": ["git", "status"]})
+            self.assertEqual(200, status, body)
+
+    def test_a_read_from_a_session_runs(self):
+        status, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION, {"argv": ["kubectl", "get", "pods"]})
+        self.assertEqual(200, status, body)
+        self.assertEqual(0, body["exitCode"])
+
+    def test_a_mutation_from_a_session_is_refused_read_only(self):
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, body = self.post_as(
+                credential_proxy.CALLER_ROLE_SESSION, {"argv": ["kubectl", "delete", "pod", "x"]}
+            )
+        self.assertEqual(403, status)
+        self.assertEqual("kubernetes.read-only", body["rule"])
+
+    def test_the_table_of_kubectl_flags(self):
+        S = credential_proxy.CALLER_ROLE_SESSION
+        for role, argv, want in (
+            # The file routes the fence exists to close, in every spelling
+            # pflag accepts: separate value, attached, `=`, and clustered
+            # behind a boolean shorthand.
+            (S, ["kubectl", "get", "-f", "/etc/credential-proxy/policy.json"], "-f"),
+            (S, ["kubectl", "get", "-f=https://example.invalid/x.yaml"], "-f"),
+            (S, ["kubectl", "get", "-fx.yaml"], "-f"),
+            (S, ["kubectl", "get", "-Af", "/etc/credential-proxy/policy.json"], "-f"),
+            (S, ["kubectl", "get", "-ARf", "dir/"], "-R"),
+            (S, ["kubectl", "get", "--filename", "x.yaml"], "--filename"),
+            (S, ["kubectl", "get", "-k", "overlay/"], "-k"),
+            (S, ["kubectl", "get", "--kustomize=overlay/"], "--kustomize"),
+            (S, ["kubectl", "get", "--recursive", "--filename", "dir/"], "--recursive"),
+            # File-backed output formats read a file on the broker too.
+            (S, ["kubectl", "get", "ns", "-o", "go-template-file=../content-workspaces/r/values.yaml"], "--output"),
+            (S, ["kubectl", "get", "ns", "-ogo-template-file=/etc/x"], "--output"),
+            (S, ["kubectl", "get", "ns", "--output=jsonpath-file=/etc/x"], "--output"),
+            (S, ["kubectl", "get", "ns", "--output", "custom-columns-file=x"], "--output"),
+            (S, ["kubectl", "get", "ns", "-o", "templatefile=x"], "--output"),
+            # Streaming flags hold a broker slot until the deadline; not for a
+            # session. `logs -f` is refused as a flag the session may not pass,
+            # not as a file.
+            (S, ["kubectl", "get", "pods", "-w"], "-w"),
+            (S, ["kubectl", "get", "pods", "--watch"], "--watch"),
+            (S, ["kubectl", "logs", "pod/x", "-f"], "-f"),
+            (S, ["kubectl", "logs", "pod/x", "--follow"], "--follow"),
+            # Unknown or unlisted flags are refused rather than guessed at.
+            (S, ["kubectl", "get", "pods", "--raw", "/api"], "--raw"),
+            (S, ["kubectl", "get", "pods", "-v=9"], "-v"),
+            (S, ["kubectl", "get", "pods", "--server=https://x"], "--server"),
+            # The inspection surface passes, in the spellings a model emits.
+            (S, ["kubectl", "get", "pods", "-n", "kubeagents-system", "--no-headers"], None),
+            (S, ["kubectl", "get", "pods", "-A", "-o", "wide"], None),
+            (S, ["kubectl", "get", "pods", "-Ao", "json"], None),
+            (S, ["kubectl", "get", "pods", "-ojson"], None),
+            (S, ["kubectl", "get", "pods", "-o=yaml", "--show-labels"], None),
+            (S, ["kubectl", "get", "pods", "-o", "jsonpath={.items[*].metadata.name}"], None),
+            (S, ["kubectl", "get", "pods", "-o", "custom-columns=NAME:.metadata.name"], None),
+            (S, ["kubectl", "get", "pods", "-o", "go-template={{range .items}}{{.metadata.name}}{{end}}"], None),
+            (S, ["kubectl", "get", "pods", "-l", "app=x", "--field-selector=status.phase=Running", "--sort-by=.metadata.name"], None),
+            (S, ["kubectl", "describe", "pod", "x", "-n", "ns", "--context=gke_p_l_c"], None),
+            (S, ["kubectl", "logs", "pod/x", "-c", "main", "--tail=50", "--since=1h", "-p", "--timestamps"], None),
+            (S, ["kubectl", "logs", "deploy/x", "--all-containers", "--prefix"], None),
+            (S, ["kubectl", "top", "pods", "-n", "ns", "--containers"], None),
+            (S, ["kubectl", "events", "-n", "ns", "--for", "pod/x", "--types=Warning"], None),
+            (S, ["kubectl", "rollout", "history", "deploy/x", "-n", "ns"], None),
+            # The two read verbs that wait, and the two flags that name a
+            # bound, hold a broker slot past its one-shot deadline.
+            (S, ["kubectl", "wait", "--for=condition=Ready", "pod/x"], "wait"),
+            (S, ["kubectl", "rollout", "status", "deploy/x", "-n", "ns"], "rollout status"),
+            (S, ["kubectl", "-n", "ns", "rollout", "status", "deploy/x"], "rollout status"),
+            (S, ["kubectl", "get", "pods", "--timeout=5m"], "--timeout"),
+            (S, ["kubectl", "get", "pods", "--request-timeout", "0"], "--request-timeout"),
+            (S, ["kubectl", "auth", "can-i", "get", "pods", "-n", "ns"], None),
+            (S, ["kubectl", "api-resources", "--namespaced=true", "--verbs=list"], None),
+            (S, ["kubectl", "explain", "pods.spec.containers"], None),
+            (S, ["kubectl", "version", "--client"], None),
+            (S, ["kubectl", "get", "pods", "--kubeconfig=gke_p_l_c"], None),
+            (S, ["kubectl", "--help"], None),
+            # Other roles and other executables are untouched.
+            (credential_proxy.CALLER_ROLE_SHELL, ["kubectl", "get", "-Af", "x.yaml"], None),
+            ("", ["kubectl", "get", "-o", "go-template-file=x"], None),
+            (S, ["gcloud", "projects", "list", "--format=json"], None),
+        ):
+            with self.subTest(role=role, argv=argv):
+                self.assertEqual(want, credential_proxy.session_kubectl_flag_refusal(role, argv))
+
+    def test_a_clustered_file_flag_from_a_session_is_refused_before_it_reaches_kubectl(self):
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, body = self.post_as(
+                credential_proxy.CALLER_ROLE_SESSION,
+                {"argv": ["kubectl", "get", "-Af", "/etc/credential-proxy/policy.json"]},
+            )
+        self.assertEqual(403, status)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
+        self.assertEqual(credential_proxy.RULE_CALLER_KUBECTL_FLAG, body["rule"])
+        self.assertIn("-f", body["message"])
+
+    def test_a_file_backed_output_format_from_a_session_is_refused(self):
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, body = self.post_as(
+                credential_proxy.CALLER_ROLE_SESSION,
+                {"argv": ["kubectl", "get", "ns", "-o", "go-template-file=/etc/credential-proxy/policy.json"]},
+            )
+        self.assertEqual(403, status)
+        self.assertEqual(credential_proxy.RULE_CALLER_KUBECTL_FLAG, body["rule"])
+        self.assertIn("--output", body["message"])
+
+    def test_the_shell_still_passes_a_file_argument_to_kubectl(self):
+        status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, {"argv": ["kubectl", "get", "-f", "x.yaml"]})
+        self.assertEqual(200, status, body)
 
 
 class CommandExecutorTest(unittest.TestCase):
@@ -4138,15 +4475,50 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         # `_execute` bounds output at CREDENTIAL_PROXY_MAX_OUTPUT_BYTES, 4 MiB by
         # default, which is not a log line -- and this path runs on every failed
         # cron tick.
-        _, logs = self._refresh(self._failure("x" * 5000))
+        # The tail: the helper names the failure on its last line, after the
+        # steps that ran before it.
+        _, logs = self._refresh(self._failure("x" * 5000 + "FATAL: why"))
 
         detail = logs[0].split("github credential refresh exited 1: ", 1)[1]
-        self.assertEqual(detail, "x" * 1000)
+        self.assertEqual(1000, len(detail))
+        self.assertTrue(detail.endswith("FATAL: why"))
 
     def test_omits_the_detail_when_stderr_is_empty(self):
         _, logs = self._refresh(self._failure("   \n"))
 
         self.assertTrue(logs[0].endswith("github credential refresh exited 1"))
+
+    def test_a_successful_refresh_logs_what_the_helper_said_at_info(self):
+        # The helper names the branch that minted the identity token and how
+        # long it took; a refresh that fell through to gcloud and still
+        # succeeded is visible only from this line.
+        said = (
+            "[SRE-AUTH] WARNING: no identity token from the metadata server (HTTP Error 404: Not Found after 0.01s); asking gcloud.\n"
+            "[SRE-AUTH] Minted the broker OIDC token through gcloud in 1.20s.\n"
+            "[SRE-AUTH] GitHub authentication successfully configured for repository: gke-agentic/infra\n"
+        )
+        executor = credential_proxy.CommandExecutor.__new__(credential_proxy.CommandExecutor)
+        executor.execute_internal = lambda argv: credential_proxy.ExecutionResult(
+            exit_code=0, stdout="", stderr=said, duration_ms=5, truncated=False, timed_out=False
+        )
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                executor.refresh_forge_credential("github", "gke-agentic/infra")
+        line = [entry for entry in logs.output if "github credential refresh: " in entry]
+        self.assertEqual(1, len(line), logs.output)
+        self.assertIn("asking gcloud", line[0])
+        self.assertIn("through gcloud in 1.20s", line[0])
+        self.assertTrue(line[0].startswith("INFO:"))
+
+    def test_a_successful_read_only_mint_logs_nothing(self):
+        # One per clone of a context repository; only the refresh asks for the
+        # success line.
+        executor = credential_proxy.CommandExecutor.__new__(credential_proxy.CommandExecutor)
+        executor.execute_internal = lambda argv: credential_proxy.ExecutionResult(
+            exit_code=0, stdout="ghs_token", stderr="[SRE-AUTH] Minted a read-only installation token for repository: o/r\n", duration_ms=5, truncated=False, timed_out=False
+        )
+        with self.assertNoLogs(credential_proxy.LOGGER, level="INFO"):
+            executor._run_forge_helper("github", Path(__file__), ["o/r", "--read-only"], "read-only credential mint")
 
     def test_redacts_token_shapes_out_of_the_detail(self):
         token = "ghs_" + "A" * 36
@@ -4201,6 +4573,564 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
             with self.assertRaises(RuntimeError) as raised:
                 executor.refresh_forge_credential("gitlab", "gke-agentic/infra")
         self.assertIn("gitlab", str(raised.exception))
+
+    def test_serializes_concurrent_refreshes_and_coalesces_second_caller(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+        started_event = threading.Event()
+
+        def slow_execute(argv, cwd=None):
+            calls.append(list(argv))
+            started_event.set()
+            time.sleep(0.05)
+            return credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="",
+                stderr="",
+                duration_ms=50,
+                truncated=False,
+                timed_out=False,
+            )
+
+        executor.execute_internal = slow_execute
+        results = []
+
+        def worker():
+            try:
+                executor.refresh_forge_credential("github", "gke-agentic/infra")
+                results.append("ok")
+            except Exception as e:
+                results.append(e)
+
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            t1 = threading.Thread(target=worker)
+            t2 = threading.Thread(target=worker)
+            t1.start()
+            started_event.wait(timeout=1.0)
+            t2.start()
+            t1.join(timeout=2.0)
+            t2.join(timeout=2.0)
+
+        self.assertEqual(results, ["ok", "ok"])
+        # Only one helper execution occurred because the second caller coalesced.
+        self.assertEqual(len(calls), 1)
+
+    def test_serializes_concurrent_refreshes_and_fails_queued_waiter_without_rerunning(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+        started_event = threading.Event()
+        t2_queued_event = threading.Event()
+
+        def slow_failing_execute(argv, cwd=None):
+            calls.append(list(argv))
+            started_event.set()
+            t2_queued_event.wait(timeout=2.0)
+            return credential_proxy.ExecutionResult(
+                exit_code=1,
+                stdout="",
+                stderr="Minty unavailable",
+                duration_ms=50,
+                truncated=False,
+                timed_out=False,
+            )
+
+        executor.execute_internal = slow_failing_execute
+        results = []
+
+        def worker():
+            try:
+                executor.refresh_forge_credential("github", "gke-agentic/infra")
+                results.append("ok")
+            except Exception as e:
+                results.append(e)
+
+        real_monotonic = credential_proxy.time.monotonic
+
+        def monotonic_hook():
+            val = real_monotonic()
+            if threading.current_thread() == t2:
+                t2_queued_event.set()
+            return val
+
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True), \
+             mock.patch.object(credential_proxy.time, "monotonic", side_effect=monotonic_hook):
+            t1 = threading.Thread(target=worker)
+            t2 = threading.Thread(target=worker)
+            t1.start()
+            started_event.wait(timeout=1.0)
+            t2.start()
+            t1.join(timeout=2.0)
+            t2.join(timeout=2.0)
+
+        # Both callers must fail with the helper error
+        self.assertEqual(len(results), 2)
+        self.assertIsInstance(results[0], RuntimeError)
+        self.assertIsInstance(results[1], RuntimeError)
+        # Helper must only execute once: waiter queued during the failure raises without re-running
+        self.assertEqual(len(calls), 1)
+
+    def test_serializes_concurrent_refreshes_and_does_not_memoize_timeouts(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+        started_event = threading.Event()
+        t2_queued_event = threading.Event()
+
+        def execute_with_timeout(argv, cwd=None):
+            calls.append(list(argv))
+            if len(calls) == 1:
+                started_event.set()
+                t2_queued_event.wait(timeout=2.0)
+                return credential_proxy.ExecutionResult(
+                    exit_code=124,
+                    stdout="",
+                    stderr="command timed out after 30s",
+                    duration_ms=30000,
+                    truncated=False,
+                    timed_out=True,
+                )
+            return credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="gke-agentic/infra\n",
+                stderr="",
+                duration_ms=10,
+                truncated=False,
+                timed_out=False,
+            )
+
+        executor.execute_internal = execute_with_timeout
+        results = []
+
+        def worker():
+            try:
+                executor.refresh_forge_credential("github", "gke-agentic/infra")
+                results.append("ok")
+            except Exception as e:
+                results.append(e)
+
+        real_monotonic = credential_proxy.time.monotonic
+
+        def monotonic_hook():
+            val = real_monotonic()
+            if threading.current_thread() == t2:
+                t2_queued_event.set()
+            return val
+
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True), \
+             mock.patch.object(credential_proxy.time, "monotonic", side_effect=monotonic_hook):
+            t1 = threading.Thread(target=worker)
+            t2 = threading.Thread(target=worker)
+            t1.start()
+            started_event.wait(timeout=1.0)
+            t2.start()
+            t1.join(timeout=2.0)
+            t2.join(timeout=2.0)
+
+        # Thread 1 timed out; Thread 2 queued behind it ran the helper and succeeded.
+        self.assertEqual(len(results), 2)
+        self.assertIsInstance(results[0], TimeoutError)
+        self.assertEqual(results[1], "ok")
+        # Helper ran twice: timeout was not memoized, so waiter executed its own helper
+        self.assertEqual(len(calls), 2)
+
+    def test_run_forge_helper_raises_timeout_error_when_timed_out(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        executor.execute_internal = lambda argv, cwd=None: credential_proxy.ExecutionResult(
+            exit_code=124,
+            stdout="",
+            stderr="timed out",
+            duration_ms=30000,
+            truncated=False,
+            timed_out=True,
+        )
+        helper_path = mock.MagicMock(spec=credential_proxy.Path)
+        helper_path.is_file.return_value = True
+        with self.assertRaises(TimeoutError) as ctx:
+            executor._run_forge_helper("github", helper_path, ["repo"], "credential refresh")
+        self.assertIn("credential refresh timed out", str(ctx.exception))
+
+    def test_concurrent_refreshes_for_different_orgs_do_not_share_failure(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+        started_event = threading.Event()
+        t2_queued_event = threading.Event()
+
+        def execute_side_effect(argv, cwd=None):
+            calls.append(list(argv))
+            if "org-alpha/repo-a" in argv:
+                started_event.set()
+                t2_queued_event.wait(timeout=2.0)
+                return credential_proxy.ExecutionResult(
+                    exit_code=1,
+                    stdout="",
+                    stderr="Minty unavailable for alpha",
+                    duration_ms=50,
+                    truncated=False,
+                    timed_out=False,
+                )
+            return credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="org-beta/repo-b\n",
+                stderr="",
+                duration_ms=10,
+                truncated=False,
+                timed_out=False,
+            )
+
+        executor.execute_internal = execute_side_effect
+        results = {}
+
+        def worker(repo):
+            try:
+                executor.refresh_forge_credential("github", repo)
+                results[repo] = "ok"
+            except Exception as e:
+                results[repo] = e
+
+        real_monotonic = credential_proxy.time.monotonic
+
+        def monotonic_hook():
+            val = real_monotonic()
+            if threading.current_thread() == t2:
+                t2_queued_event.set()
+            return val
+
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True), \
+             mock.patch.object(credential_proxy.time, "monotonic", side_effect=monotonic_hook):
+            t1 = threading.Thread(target=worker, args=("org-alpha/repo-a",))
+            t2 = threading.Thread(target=worker, args=("org-beta/repo-b",))
+            t1.start()
+            started_event.wait(timeout=1.0)
+            t2.start()
+            t1.join(timeout=2.0)
+            t2.join(timeout=2.0)
+
+        # Worker 1 failed with helper error; Worker 2 succeeded for its own org
+        self.assertIsInstance(results["org-alpha/repo-a"], RuntimeError)
+        self.assertEqual(results["org-beta/repo-b"], "ok")
+        # Helper ran twice: once for alpha (which failed) and once for beta (which succeeded)
+        self.assertEqual(len(calls), 2)
+
+    def test_coalesces_subsequent_refresh_within_coalesce_window(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+        executor.execute_internal = lambda argv, cwd=None: (
+            calls.append(list(argv))
+            or credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="",
+                stderr="",
+                duration_ms=5,
+                truncated=False,
+                timed_out=False,
+            )
+        )
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            executor.refresh_forge_credential("github", "gke-agentic/infra")
+            # Immediate second call for the same repo (differing only in casing/spaces)
+            executor.refresh_forge_credential("github", " GKE-AGENTIC/INFRA ")
+
+        self.assertEqual(len(calls), 1)
+
+    def test_distinct_repositories_in_same_org_coalesce_when_in_minted_scope(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+        executor.execute_internal = lambda argv, cwd=None: (
+            calls.append(list(argv))
+            or credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="gke-agentic/repo-a\ngke-agentic/repo-b\n",
+                stderr="",
+                duration_ms=5,
+                truncated=False,
+                timed_out=False,
+            )
+        )
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            executor.refresh_forge_credential("github", "gke-agentic/repo-a")
+            # When helper scoped both repos into the token, second repo coalesces
+            executor.refresh_forge_credential("github", "gke-agentic/repo-b")
+
+        self.assertEqual(len(calls), 1)
+
+    def test_sibling_repository_not_in_minted_scope_runs_and_does_not_coalesce(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+        executor.execute_internal = lambda argv, cwd=None: (
+            calls.append(list(argv))
+            or credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="gke-agentic/repo-a\n",
+                stderr="",
+                duration_ms=5,
+                truncated=False,
+                timed_out=False,
+            )
+        )
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            executor.refresh_forge_credential("github", "gke-agentic/repo-a")
+            # Helper scoped only repo-a (e.g. expansion failed or repo-b not yet registered),
+            # so repo-b does NOT coalesce and executes helper
+            executor.refresh_forge_credential("github", "gke-agentic/repo-b")
+
+        self.assertEqual(len(calls), 2)
+
+    def test_managed_repos_expansion_growth_two_call_sequence(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+
+        def grow_scope(argv, cwd=None):
+            calls.append(list(argv))
+            if len(calls) == 1:
+                return credential_proxy.ExecutionResult(
+                    exit_code=0,
+                    stdout="gke-agentic/repo-a\n",
+                    stderr="",
+                    duration_ms=5,
+                    truncated=False,
+                    timed_out=False,
+                )
+            return credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="gke-agentic/repo-a\ngke-agentic/repo-b\n",
+                stderr="",
+                duration_ms=5,
+                truncated=False,
+                timed_out=False,
+            )
+
+        executor.execute_internal = grow_scope
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            # 1. repo-a refreshed at t=0 when token only scoped repo-a
+            executor.refresh_forge_credential("github", "gke-agentic/repo-a")
+            self.assertEqual(len(calls), 1)
+
+            # 2. repo-b arrives; not in cached scope, so it runs helper
+            executor.refresh_forge_credential("github", "gke-agentic/repo-b")
+            self.assertEqual(len(calls), 2)
+
+            # 3. repo-a arrives within coalesce window; now in expanded scope, coalesces
+            executor.refresh_forge_credential("github", "gke-agentic/repo-a")
+            self.assertEqual(len(calls), 2)
+
+    def test_distinct_organizations_both_run_and_invalidate_coalesce(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+        executor.execute_internal = lambda argv, cwd=None: (
+            calls.append(list(argv))
+            or credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="",
+                stderr="",
+                duration_ms=5,
+                truncated=False,
+                timed_out=False,
+            )
+        )
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            executor.refresh_forge_credential("github", "org-alpha/repo-a")
+            # Different organization replaces the pod-wide slot and must run
+            executor.refresh_forge_credential("github", "org-beta/repo-b")
+            # Requesting org-alpha again must run because org-beta replaced the slot
+            executor.refresh_forge_credential("github", "org-alpha/repo-a")
+
+        self.assertEqual(len(calls), 3)
+
+    def test_cold_start_does_not_coalesce_at_monotonic_zero(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+        executor.execute_internal = lambda argv, cwd=None: (
+            calls.append(list(argv))
+            or credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="",
+                stderr="",
+                duration_ms=5,
+                truncated=False,
+                timed_out=False,
+            )
+        )
+        # Simulate cold node start where time.monotonic() < 30s
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True), \
+             mock.patch.object(credential_proxy.time, "monotonic", return_value=5.0):
+            executor.refresh_forge_credential("github", "gke-agentic/infra")
+
+        self.assertEqual(len(calls), 1)
+
+    def test_failed_refresh_does_not_coalesce_next_attempt(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+
+        def fail_then_succeed(argv, cwd=None):
+            calls.append(list(argv))
+            if len(calls) == 1:
+                return credential_proxy.ExecutionResult(
+                    exit_code=1,
+                    stdout="",
+                    stderr="transient error",
+                    duration_ms=5,
+                    truncated=False,
+                    timed_out=False,
+                )
+            return credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="",
+                stderr="",
+                duration_ms=5,
+                truncated=False,
+                timed_out=False,
+            )
+
+        executor.execute_internal = fail_then_succeed
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            with self.assertRaises(RuntimeError):
+                executor.refresh_forge_credential("github", "gke-agentic/infra")
+            # Second attempt must run and succeed, not coalesce the failure
+            executor.refresh_forge_credential("github", "gke-agentic/infra")
+
+        self.assertEqual(len(calls), 2)
+
+    def test_coalesce_window_expires_after_30_seconds(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+        executor.execute_internal = lambda argv, cwd=None: (
+            calls.append(list(argv))
+            or credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="",
+                stderr="",
+                duration_ms=5,
+                truncated=False,
+                timed_out=False,
+            )
+        )
+        # Call 1 at 100.0: runs helper (reads: queued_at=100.0, check=100.0, record=100.0)
+        # Call 2 at 120.0: within 30s window (reads: queued_at=120.0, check=120.0; coalesces and returns)
+        # Call 3 at 140.0: 40s after Call 1, 20s after Call 2 (reads: queued_at=140.0, check=140.0, record=140.0)
+        # A fixed window runs the helper on Call 1 and Call 3 (len(calls) == 2).
+        # A sliding window (if cache write was hoisted above the coalesce return) would record 120.0 on Call 2,
+        # causing Call 3 (140.0 - 120.0 = 20s < 30s) to coalesce (len(calls) == 1).
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True), \
+             mock.patch.object(credential_proxy.time, "monotonic", side_effect=[100.0, 100.0, 100.0, 120.0, 120.0, 140.0, 140.0, 140.0]):
+            executor.refresh_forge_credential("github", "gke-agentic/infra")
+            executor.refresh_forge_credential("github", "gke-agentic/infra")
+            executor.refresh_forge_credential("github", "gke-agentic/infra")
+
+        self.assertEqual(len(calls), 2)
+
+    def test_failed_refresh_for_different_org_drops_cache_entry(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+
+        def handle_call(argv, cwd=None):
+            calls.append(list(argv))
+            # Second call (org-beta) fails after potentially modifying token slot
+            if len(calls) == 2:
+                return credential_proxy.ExecutionResult(
+                    exit_code=1,
+                    stdout="",
+                    stderr="setup-git failed",
+                    duration_ms=5,
+                    truncated=False,
+                    timed_out=False,
+                )
+            return credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="",
+                stderr="",
+                duration_ms=5,
+                truncated=False,
+                timed_out=False,
+            )
+
+        executor.execute_internal = handle_call
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            # 1. First refresh for org-alpha succeeds
+            executor.refresh_forge_credential("github", "org-alpha/repo-a")
+            # 2. Second refresh for org-beta fails
+            with self.assertRaises(RuntimeError):
+                executor.refresh_forge_credential("github", "org-beta/repo-b")
+            # 3. Third refresh for org-alpha must run again because the failed refresh
+            # dropped the provider entry (preventing false coalesce onto replaced slot)
+            executor.refresh_forge_credential("github", "org-alpha/repo-a")
+
+        self.assertEqual(len(calls), 3)
+
+    def test_successful_refresh_clears_failure_memo_for_earlier_queued_waiter(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+
+        def handle_call(argv, cwd=None):
+            calls.append(list(argv))
+            if len(calls) == 1:
+                return credential_proxy.ExecutionResult(
+                    exit_code=1,
+                    stdout="",
+                    stderr="temporary helper outage",
+                    duration_ms=5,
+                    truncated=False,
+                    timed_out=False,
+                )
+            return credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="gke-agentic/infra\n" if len(calls) == 2 else "gke-agentic/other\n",
+                stderr="",
+                duration_ms=5,
+                truncated=False,
+                timed_out=False,
+            )
+
+        executor.execute_internal = handle_call
+
+        # Call 1 for gke-agentic/infra fails at 100.0 (queued_at=100.0, now=100.0, failed_at=100.0)
+        # Call 2 for gke-agentic/infra succeeds at 101.0 (queued_at=101.0, now=101.0, success_at=101.0)
+        #   -> clears failure memo at L4501 and records scope {gke-agentic/infra}
+        # Call 3 for gke-agentic/other queued at 50.0 (before Call 1 failed), acquires lock at 102.0:
+        #   -> not in scope {gke-agentic/infra}, so does not coalesce
+        #   -> failure memo was cleared on Call 2 success, so Call 3 does not raise stale error
+        #   -> Call 3 executes helper and succeeds (len(calls) == 3)
+        # If L4501 is deleted, Call 3 finds Call 1's memo (100.0 >= 50.0) and raises RuntimeError.
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True), \
+             mock.patch.object(credential_proxy.time, "monotonic", side_effect=[
+                 100.0, 100.0, 100.0,  # Call 1: queued_at, now, failed_at
+                 101.0, 101.0, 101.0,  # Call 2: queued_at, now, success_at
+                 50.0, 102.0, 102.0,   # Call 3: queued_at, now, success_at
+             ]):
+            with self.assertRaises(RuntimeError):
+                executor.refresh_forge_credential("github", "gke-agentic/infra")
+            executor.refresh_forge_credential("github", "gke-agentic/infra")
+            executor.refresh_forge_credential("github", "gke-agentic/other")
+
+        self.assertEqual(len(calls), 3)
 
 
 class ForgeRefreshRouteTest(unittest.TestCase):
@@ -6448,8 +7378,25 @@ class ExecAuditLineCannotBeForgedTest(unittest.TestCase):
         self._assert_single_line_records("executable blocked")
 
     def test_a_newline_in_the_cwd_writes_no_second_record(self):
-        self._post({"requestId": "ok", "argv": ["git", "status"], "cwd": "/tmp/a\nb"})
+        # The lease refusal is the one record that logs the cwd. It sits behind
+        # the route's refusal of `git`, so admit `git` to reach it.
+        routed = (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "git")
+        with mock.patch.object(credential_proxy, "EXEC_ROUTE_EXECUTABLES", routed):
+            self._post({"requestId": "ok", "argv": ["git", "status"], "cwd": "/tmp/a\nb"})
         self._assert_single_line_records("git lease refused")
+
+    def test_a_forge_cli_the_broker_runs_is_refused_on_exec(self):
+        # The broker runs `gh` for its own verbs, so it is on ALLOWED_EXECUTABLES.
+        # A sandbox caller that posts its own argv must still not reach it: the
+        # sandbox reaches a forge only through the verbs.
+        allowed = (*CommandExecutor.ALLOWED_EXECUTABLES, "gh")
+        with mock.patch.object(CommandExecutor, "ALLOWED_EXECUTABLES", allowed):
+            self._post({"requestId": "ok", "argv": ["gh", "pr", "create"], "cwd": "/tmp"})
+        self.assertTrue(
+            any("executable blocked" in m and "executable=gh" in m for m in self.records),
+            self.records,
+        )
+        self.assertNotIn("gh", credential_proxy.EXEC_ROUTE_EXECUTABLES)
 
 
 class AuditLogSurvivesAHostileRequestTest(unittest.TestCase):
@@ -6884,6 +7831,139 @@ class AudienceRoleTest(unittest.TestCase):
         self.assertEqual([self.SHELL, self.CHAT], captured["body"]["spec"]["audiences"])
 
 
+class SessionCallerBindingTest(unittest.TestCase):
+    """The session ServiceAccount and the session audience go together.
+
+    The role comes from the audience, and a pod picks the audience it projects.
+    Without a binding, a pod running as the session ServiceAccount that
+    projected the shell audience would get the shell role; the binding refuses
+    that, and refuses the session audience to anyone else.
+    """
+
+    SHELL = "kubeagents-credential-proxy"
+    CHAT = "kubeagents-credential-proxy-chat"
+    SESSION = "kubeagents-credential-proxy-session"
+    AGENT = "system:serviceaccount:kubeagents-system:agent"
+    SESSION_SA = "system:serviceaccount:kubeagents-system:agent-a2a-session"
+
+    def _authenticator(self, session_callers=frozenset({SESSION_SA})):
+        return credential_proxy.ServiceAccountAuthenticator(
+            audience_roles={
+                self.SHELL: credential_proxy.CALLER_ROLE_SHELL,
+                self.CHAT: credential_proxy.CALLER_ROLE_CHAT,
+                self.SESSION: credential_proxy.CALLER_ROLE_SESSION,
+            },
+            allowed_callers=frozenset({self.AGENT, self.SESSION_SA}),
+            session_callers=session_callers,
+            api_host="10.0.0.1",
+            api_port="443",
+            ca_file="",
+            token_file="/nonexistent",
+            cache_seconds=0.0,
+        )
+
+    def _review(self, username, audience):
+        return {
+            "status": {
+                "authenticated": True,
+                "audiences": [audience],
+                "user": {"username": username, "uid": "sa-uid", "groups": []},
+            }
+        }
+
+    def test_a_session_caller_presenting_the_shell_audience_is_refused(self):
+        with self.assertRaisesRegex(
+            credential_proxy.AuthenticationError, "only the session audience"
+        ):
+            self._authenticator()._principal_from(self._review(self.SESSION_SA, self.SHELL))
+
+    def test_a_session_caller_presenting_the_chat_audience_is_refused(self):
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            self._authenticator()._principal_from(self._review(self.SESSION_SA, self.CHAT))
+
+    def test_a_session_caller_presenting_the_session_audience_is_the_session_role(self):
+        principal = self._authenticator()._principal_from(
+            self._review(self.SESSION_SA, self.SESSION)
+        )
+        self.assertEqual(credential_proxy.CALLER_ROLE_SESSION, principal.role)
+
+    def test_another_caller_presenting_the_session_audience_is_refused(self):
+        with self.assertRaisesRegex(
+            credential_proxy.AuthenticationError, "only for session callers"
+        ):
+            self._authenticator()._principal_from(self._review(self.AGENT, self.SESSION))
+
+    def test_the_shell_caller_keeps_the_shell_role(self):
+        principal = self._authenticator()._principal_from(self._review(self.AGENT, self.SHELL))
+        self.assertEqual(credential_proxy.CALLER_ROLE_SHELL, principal.role)
+
+    def test_with_no_session_callers_named_the_audience_alone_decides(self):
+        # The upgrade case: a broker rendered by an operator that names no
+        # session callers behaves as it did before the binding existed.
+        principal = self._authenticator(frozenset())._principal_from(
+            self._review(self.AGENT, self.SESSION)
+        )
+        self.assertEqual(credential_proxy.CALLER_ROLE_SESSION, principal.role)
+
+
+class PrincipalPodTest(unittest.TestCase):
+    """A brokered call names the pod that made it, so it traces to a conversation."""
+
+    CALLER = "system:serviceaccount:kubeagents-system:agent-a2a-session"
+    AUDIENCE = "kubeagents-credential-proxy"
+
+    def _authenticator(self):
+        return credential_proxy.ServiceAccountAuthenticator(
+            audience_roles={self.AUDIENCE: ""},
+            allowed_callers=frozenset({self.CALLER}),
+            api_host="10.0.0.1",
+            api_port="443",
+            ca_file="",
+            token_file="/nonexistent",
+            cache_seconds=0.0,
+        )
+
+    def _review(self, extra):
+        user = {"username": self.CALLER, "uid": "sa-uid", "groups": []}
+        if extra is not None:
+            user["extra"] = extra
+        return {"status": {"authenticated": True, "audiences": [self.AUDIENCE], "user": user}}
+
+    def test_the_pod_name_comes_from_the_token_review(self):
+        principal = self._authenticator()._principal_from(
+            self._review(
+                {
+                    "authentication.kubernetes.io/pod-name": ["agent-a2a-session-abc12"],
+                    "authentication.kubernetes.io/pod-uid": ["0f1e2d3c"],
+                }
+            )
+        )
+        self.assertEqual("agent-a2a-session-abc12", principal.pod)
+        # The pod rides on the principal and in the audit record's own field,
+        # never in describe(): that string is the `principal` field of every
+        # tool_execution_audit record, and the shell's calls carry a pod name
+        # too, so a composite there would change an identity every filter
+        # keys on.
+        self.assertEqual(principal.pod, "agent-a2a-session-abc12")
+        self.assertEqual(self.CALLER, principal.describe())
+        record = credential_proxy._tool_audit(
+            credential_proxy.AUDIT_STATUS_STARTED, "req-1", principal.describe(), "kubectl", "get", pod=principal.pod
+        )
+        self.assertEqual(record["pod"], "agent-a2a-session-abc12")
+        self.assertEqual(record["principal"], self.CALLER)
+        bare = credential_proxy._tool_audit(
+            credential_proxy.AUDIT_STATUS_STARTED, "req-2", self.CALLER, "kubectl", "get", pod=""
+        )
+        self.assertNotIn("pod", bare)
+
+    def test_a_token_with_no_pod_binding_names_no_pod(self):
+        for extra in (None, {}, {"authentication.kubernetes.io/pod-name": []}):
+            with self.subTest(extra=extra):
+                principal = self._authenticator()._principal_from(self._review(extra))
+                self.assertEqual("", principal.pod)
+                self.assertEqual(self.CALLER, principal.describe())
+
+
 class RequiredRoleTest(unittest.TestCase):
     """Which side of the split each route belongs to.
 
@@ -6895,12 +7975,18 @@ class RequiredRoleTest(unittest.TestCase):
     """
 
     def test_the_shell_routes(self):
-        for path in ("/v1/exec", "/v1/github/refresh", "/v1/workspace/open"):
+        for path in ("/v1/github/refresh", "/v1/workspace/open"):
             with self.subTest(path=path):
                 self.assertEqual(
                     (credential_proxy.CALLER_ROLE_SHELL,),
                     credential_proxy.required_roles(path),
                 )
+
+    def test_the_exec_route_admits_the_shell_and_the_session(self):
+        self.assertEqual(
+            (credential_proxy.CALLER_ROLE_SHELL, credential_proxy.CALLER_ROLE_SESSION),
+            credential_proxy.required_roles("/v1/exec"),
+        )
 
     def test_the_chat_routes(self):
         for path in ("/v1/chat/slack/events", "/v1/chat/google/api"):
@@ -7042,6 +8128,23 @@ class RolePermitsTest(unittest.TestCase):
                 handler, principal = self._handler(path, "")
                 self.assertTrue(handler._role_permits(principal))
                 self.assertEqual([], handler.replies)
+
+    def test_the_session_reaches_exec_and_nothing_else(self):
+        handler, principal = self._handler("/v1/exec", credential_proxy.CALLER_ROLE_SESSION)
+        self.assertTrue(handler._role_permits(principal))
+        self.assertEqual([], handler.replies)
+        for path in (
+            "/v1/vcs/probe", "/v1/workspace/open", "/v1/forge/refresh", "/v1/github/refresh",
+            credential_proxy.API_RELAY_PREFIX + "monitoring.googleapis.com/v3/x",
+            "/v1/chat/slack/api", "/v1/chat/api", "/v1/chat/a2a/events",
+        ):
+            with self.subTest(path=path):
+                handler, principal = self._handler(path, credential_proxy.CALLER_ROLE_SESSION)
+                with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                    self.assertFalse(handler._role_permits(principal))
+                status, payload = handler.replies[0]
+                self.assertEqual(HTTPStatus.FORBIDDEN, status)
+                self.assertEqual("CALLER_ROLE_FORBIDDEN", payload["code"])
 
 
 class ManagedRepositoryGateTest(unittest.TestCase):
@@ -7217,6 +8320,86 @@ class BuildAuthenticatorTest(unittest.TestCase):
         with mock.patch.dict(os.environ, environment, clear=True):
             authenticator = credential_proxy.build_authenticator()
         self.assertEqual({"kubeagents-credential-proxy": ""}, authenticator.audience_roles)
+
+    def test_the_session_audience_confers_its_own_role(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            "CREDENTIAL_PROXY_SESSION_AUDIENCE": "aud-session",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(
+            authenticator.audience_roles,
+            {
+                credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE: credential_proxy.CALLER_ROLE_SHELL,
+                "aud-chat": credential_proxy.CALLER_ROLE_CHAT,
+                "aud-session": credential_proxy.CALLER_ROLE_SESSION,
+            },
+        )
+
+    def test_the_session_audience_means_nothing_without_the_chat_split(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_SESSION_AUDIENCE": "aud-session",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(
+            authenticator.audience_roles, {credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE: ""}
+        )
+        self.assertTrue(any("CREDENTIAL_PROXY_SESSION_AUDIENCE" in line for line in logs.output))
+
+    def test_a_session_audience_equal_to_another_is_refused_with_a_warning(self):
+        for clash in (credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE, "aud-chat"):
+            environment = {
+                "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+                "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
+                "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+                "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+                "CREDENTIAL_PROXY_SESSION_AUDIENCE": clash,
+            }
+            with self.subTest(clash=clash):
+                with mock.patch.dict(os.environ, environment, clear=True):
+                    with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                        authenticator = credential_proxy.build_authenticator()
+                self.assertNotIn(credential_proxy.CALLER_ROLE_SESSION, authenticator.audience_roles.values())
+                self.assertTrue(any("CREDENTIAL_PROXY_SESSION_AUDIENCE" in line for line in logs.output))
+
+    def test_the_session_callers_are_read_from_the_environment(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent,system:serviceaccount:ns:agent-a2a-session",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            "CREDENTIAL_PROXY_SESSION_AUDIENCE": "aud-session",
+            "CREDENTIAL_PROXY_SESSION_CALLERS": " system:serviceaccount:ns:agent-a2a-session , ",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(
+            frozenset({"system:serviceaccount:ns:agent-a2a-session"}),
+            authenticator.session_callers,
+        )
+
+    def test_a_session_audience_without_session_callers_warns(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            "CREDENTIAL_PROXY_SESSION_AUDIENCE": "aud-session",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(frozenset(), authenticator.session_callers)
+        self.assertTrue(any("CREDENTIAL_PROXY_SESSION_CALLERS" in line for line in logs.output))
 
 
 class ServeRefusesAnUnauthenticatedTCPListenerTest(unittest.TestCase):

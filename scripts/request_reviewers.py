@@ -246,8 +246,9 @@ def _owners_entries(owners_file, aliases):
     pair where a `None` regex applies to every path under the directory. As in
     Prow, a file with `filters:` is read as a filtered file and a top-level
     `approvers:` beside them is ignored. `reviewers`, `labels` and the rest of
-    Prow's schema are ignored too: only an approver's verdict can move the pull
-    request, so only approvers matter here.
+    Prow's schema are ignored too: a `reviewers` entry's verdict can move `lgtm`,
+    but only an approver's produces `approved`, the label this script exists
+    to get a pull request, so only approvers matter here.
     """
     owners = _read_yaml(owners_file)
     entries = []

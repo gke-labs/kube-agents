@@ -117,7 +117,8 @@ MAX_STAGED_ARTIFACTS = 16
 
 #: Per-read ssh timeout. ``sandbox_exec.run`` passes ``timeout=None`` when it is
 #: given none, and the login shell it reaches sources a ``~/.bashrc`` the model
-#: owns -- an unbounded read is a hang this code chose. Generous for 8 MiB of
+#: owns on older sandbox images -- an unbounded read is a hang this code chose.
+#: Generous for 8 MiB of
 #: base64 over a pod-to-pod hop; short enough that a sandbox rolling under us
 #: costs the delivery rather than the notifier.
 STAGE_READ_TIMEOUT_SECONDS = 30.0
@@ -500,7 +501,8 @@ def install() -> None:
             # `_stage` blocks: up to sixteen ssh round trips, each of which can
             # sit for `STAGE_READ_TIMEOUT_SECONDS`. On the event loop that is
             # every chat connection this gateway holds, frozen, because a card
-            # completed -- and the far side runs a `~/.bashrc` the model owns.
+            # completed -- and on older sandbox images the far side runs a
+            # `~/.bashrc` the model owns.
             staged, directory = await asyncio.to_thread(_stage, wanted)
         except Exception:
             LOGGER.warning(

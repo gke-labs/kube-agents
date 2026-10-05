@@ -8,6 +8,7 @@ deleted.
 """
 
 import json
+import time
 from datetime import datetime, timezone
 import os
 import shutil
@@ -150,9 +151,14 @@ class ReconcileTest(HomesMixin):
 
 
 def _name_for(identity_kwargs, identities):
-    """Reverse-map an identity dict back to its profile name for the existence stub."""
+    """Reverse-map an identity dict back to its profile name for the existence stub.
+
+    The prune's describe passes a `timeout` the identity does not carry; it is not
+    part of the identity.
+    """
+    identity = {k: v for k, v in identity_kwargs.items() if k != "timeout"}
     for name, ident in identities.items():
-        if ident == identity_kwargs:
+        if ident == identity:
             return name
     raise KeyError(identity_kwargs)
 
@@ -877,10 +883,19 @@ class ScopeTest(HomesMixin):
         retiring = next(p for p in self._snapshot()["projects"] if p["id"] == "gone")
         self.assertEqual((retiring["state"], retiring["clusters"]), (rec.STATE_RETIRING, 1))
         os.environ.pop(rec.SCOPE_FILE_ENV, None)
+        described: list = []
+
+        def exists(project, cluster, location, timeout=None):
+            described.append(cluster)
+            return True
+
         report, _, deleted = self._run({"projects": []}, {self.MGMT: []},
-                                       profiles=["cluster-g"], identities=gone_profile)
+                                       profiles=["cluster-g"], identities=gone_profile, exists=exists)
         self.assertEqual(deleted, ["cluster-g"])
         self.assertEqual([p for p in self._snapshot()["projects"] if p["id"] == "gone"], [])
+        # The scope prune is on the strength of the declaration; the profile's cluster is
+        # not described (its project has usually lost the read roles by now).
+        self.assertEqual(described, [])
 
     def test_a_profile_the_scope_never_produced_is_kept_and_listed_unmanaged(self):
         # Condition (3) fails: no previous snapshot names the project.
@@ -1275,6 +1290,120 @@ class ScopeTest(HomesMixin):
         self.assertEqual(report["retiring"], ["p2"])
         self.assertEqual(rows["team-a"]["state"], rec.STATE_IN_SCOPE)
 
+    def test_the_cap_is_the_declarations_max_projects(self):
+        # spec.scope.maxProjects, rendered into the declaration, replaces the fixed constant:
+        # the management project and two explicit projects fit a cap of 3, the rest read
+        # over-cap, and the snapshot records the cap in force beside the declaration.
+        scope = {"projects": ["alpha", "beta", "gamma", "delta"], rec.SCOPE_MAX_PROJECTS_KEY: 3}
+        listings = {p: [(p, "c", "us-central1")] for p in [self.MGMT, "alpha", "beta", "gamma", "delta"]}
+        report, created, _ = self._run(scope, listings)
+        self.assertEqual(sorted(p for p, _c, _l in created), sorted([self.MGMT, "alpha", "beta"]))
+        self.assertEqual(report["projects"]["gamma"], rec.OUTCOME_OVER_CAP)
+        self.assertEqual(report["projects"]["delta"], rec.OUTCOME_OVER_CAP)
+        self.assertEqual(report["maxProjects"], 3)
+        snap = self._snapshot()
+        self.assertEqual(snap[rec.SCOPE_MAX_PROJECTS_KEY], 3)
+        self.assertEqual(snap["declared"][rec.SCOPE_MAX_PROJECTS_KEY], 3)
+
+    def test_a_declaration_without_a_cap_or_with_a_bad_one_reads_the_default(self):
+        # A render from an operator that predates the field carries no key; a value that is
+        # not a positive integer (a string, zero, a boolean) is not a cap either. Both read
+        # as the default, never as no cap.
+        listings = {self.MGMT: []}
+        for declared in ({}, {rec.SCOPE_MAX_PROJECTS_KEY: "lots"}, {rec.SCOPE_MAX_PROJECTS_KEY: 0},
+                         {rec.SCOPE_MAX_PROJECTS_KEY: True}, {rec.SCOPE_MAX_PROJECTS_KEY: -5}):
+            with self.subTest(declared=declared):
+                report, _, _ = self._run(declared, listings)
+                self.assertEqual(report["maxProjects"], rec.RESOLVED_SET_CAP)
+                self.assertEqual(self._snapshot()[rec.SCOPE_MAX_PROJECTS_KEY], rec.RESOLVED_SET_CAP)
+
+    def test_the_workers_and_the_budget_scale_with_the_cap(self):
+        # Workers first, up to their ceiling, then the budget: a cap of 200 lists with twice
+        # the workers in the same budget; past 400 the workers are capped and the budget
+        # grows a round at a time.
+        per_default = rec.LIST_WORKERS
+        self.assertEqual(rec._list_workers(rec.RESOLVED_SET_CAP), per_default)
+        self.assertEqual(rec._list_workers(rec.RESOLVED_SET_CAP // 2), per_default)
+        self.assertEqual(rec._list_workers(2 * rec.RESOLVED_SET_CAP), 2 * per_default)
+        self.assertEqual(2 * per_default, rec.LIST_WORKERS_MAX, "the ceiling is twice the default until #1913 measures the sandbox")
+        self.assertEqual(rec._list_workers(4 * rec.RESOLVED_SET_CAP), rec.LIST_WORKERS_MAX)
+        self.assertEqual(rec._list_workers(50 * rec.RESOLVED_SET_CAP), rec.LIST_WORKERS_MAX)
+        budget = rec.LIST_BUDGET_SECONDS
+        self.assertEqual(rec._list_budget_seconds(rec.RESOLVED_SET_CAP), budget)
+        self.assertEqual(rec._list_budget_seconds(2 * rec.RESOLVED_SET_CAP), budget)
+        self.assertEqual(rec._list_budget_seconds(4 * rec.RESOLVED_SET_CAP), 2 * budget)
+        self.assertEqual(rec._list_budget_seconds(5 * rec.RESOLVED_SET_CAP), 3 * budget)
+        self.assertEqual(rec._list_budget_seconds(10 * rec.RESOLVED_SET_CAP), 5 * budget)
+        self.assertEqual(rec._prune_budget_seconds(5 * rec.RESOLVED_SET_CAP), 3 * rec.PRUNE_BUDGET_SECONDS)
+        # The prune's budget follows the profiles too, per describe rather than per round
+        # of workers: the sandbox's CPU serialises the describes, so 120 profiles get the
+        # sequential walk's time whatever the worker count, and eight stay on the floor.
+        self.assertEqual(rec._prune_budget_seconds(rec.RESOLVED_SET_CAP, 120), 120 * rec.PRUNE_SECONDS_PER_DESCRIBE)
+        self.assertEqual(rec._prune_budget_seconds(rec.RESOLVED_SET_CAP, 8), rec.PRUNE_BUDGET_SECONDS)
+
+    def test_each_describe_takes_the_budget_left_not_its_full_timeout(self):
+        # The bounded map cuts each describe's timeout to the budget remaining, so no
+        # worker outlives the deadline by more than the grace; the first round's finding
+        # was describes still at DESCRIBE_TIMEOUT_SECONDS past the prune deadline.
+        seen: list = []
+
+        def exists(project, cluster, location, timeout=None):
+            seen.append(timeout)
+            return True
+
+        ids = {f"cluster-{i}": _identity(self.MGMT, f"c{i}") for i in range(3)}
+        with mock.patch.object(rec, "PRUNE_BUDGET_SECONDS", 2), mock.patch.object(rec, "PRUNE_SECONDS_PER_DESCRIBE", 0.5):
+            self._run({}, {self.MGMT: []}, profiles=list(ids), identities=ids, exists=exists)
+        self.assertEqual(len(seen), 3)
+        self.assertTrue(all(t is not None and 0 < t <= 2 for t in seen), seen)
+        # And it is the budget left, not DESCRIBE_TIMEOUT_SECONDS: under the pool a
+        # describe waits for the sandbox CPU its pool-mates hold, and the 30 s cut read 44
+        # of 120 live clusters as unknown on a two-CPU sandbox at eight workers.
+        seen.clear()
+        with mock.patch.object(rec, "PRUNE_BUDGET_SECONDS", 50), mock.patch.object(rec, "DESCRIBE_TIMEOUT_SECONDS", 1):
+            self._run({}, {self.MGMT: []}, profiles=list(ids), identities=ids, exists=exists)
+        self.assertTrue(all(t is not None and 1 < t <= 50 for t in seen), seen)
+        with mock.patch.object(rec.sandbox_exec, "run") as run:
+            rec._cluster_exists("p", "c", "us-central1", timeout=7)
+        self.assertEqual(run.call_args.kwargs["timeout"], 7)
+
+
+    def test_prune_describes_run_in_parallel_under_their_own_budget(self):
+        # Three profiles, one whose describe stalls past the prune budget: the stalled one
+        # reads inconclusive and is kept, the other two are judged, and the run does not
+        # wait out the stall (the walk used to be sequential at 30 s per stalled cluster).
+        ids = {"cluster-a": _identity(self.MGMT, "a"), "cluster-b": _identity(self.MGMT, "b"),
+               "cluster-c": _identity(self.MGMT, "c")}
+
+        def exists(project, cluster, location, timeout=None):
+            if cluster == "a":
+                time.sleep(0.6)
+            return True if cluster != "c" else False
+
+        listings = {self.MGMT: [(self.MGMT, "b", "us-central1")]}
+        started = time.monotonic()
+        with mock.patch.object(rec, "PRUNE_BUDGET_SECONDS", 0.2), mock.patch.object(rec, "PRUNE_SECONDS_PER_DESCRIBE", 0.05), \
+                mock.patch.object(rec, "LIST_GRACE_SECONDS", 0.05):
+            report, _, deleted = self._run({}, listings, profiles=list(ids), identities=ids, exists=exists)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.55, "the run waited out a stalled describe")
+        self.assertEqual(report["skipped_error"], ["cluster-a"])
+        self.assertEqual(report["kept"], ["cluster-b"])
+        self.assertEqual(deleted, ["cluster-c"])
+
+    def test_an_excluded_cluster_is_pruned_without_a_describe(self):
+        calls: list = []
+
+        def exists(project, cluster, location, timeout=None):
+            calls.append(cluster)
+            return True
+
+        ids = {"cluster-a": _identity(self.MGMT, "a"), "cluster-b": _identity(self.MGMT, "b")}
+        scope = {"exclude": {"projects": [], "clusters": [{"projectId": self.MGMT, "location": "us-central1", "clusterName": "a"}]}}
+        report, _, deleted = self._run(scope, {self.MGMT: []}, profiles=list(ids), identities=ids, exists=exists)
+        self.assertEqual(deleted, ["cluster-a"])
+        self.assertEqual(calls, ["b"])
+
     def test_a_project_that_moved_into_an_over_cap_folder_is_kept_not_retired(self):
         # x was reached through F1; it moves to F2, whose membership crosses the cap. The run
         # knows x is under F2, so x is carried over-cap rather than judged absent.
@@ -1321,7 +1450,7 @@ class ScopeTest(HomesMixin):
         members = {"team-a": [("team-a", "prod", "us-central1"), ("team-a", "dev", "us-central1")]}
         probes: list[tuple] = []
 
-        def describe(project, cluster, location):
+        def describe(project, cluster, location, timeout=None):
             probes.append((project, cluster))
             rec._denied_this_run.add(project)
             return None
@@ -1737,7 +1866,7 @@ class ScopeTest(HomesMixin):
         members = {"team-a": [("team-a", "prod", "us-central1")], "team-b": [("team-b", "old", "us-central1")],
                    "team-c": [("team-c", "live", "us-central1")]}
 
-        def probe(project, cluster, location):
+        def probe(project, cluster, location, timeout=None):
             if project == "team-a":
                 rec._denied_this_run.add(project)
                 return None
@@ -1811,7 +1940,7 @@ class ScopeTest(HomesMixin):
         members = {"team-a": [("team-a", "prod", "us-central1")]}
         ids = {"cluster-a": _identity("team-a", "prod")}
 
-        def describe(project, cluster, location):
+        def describe(project, cluster, location, timeout=None):
             rec._denied_this_run.add(project)
             return None
         report, _, _ = self._run({"folders": ["123456789012"]}, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
@@ -2175,7 +2304,7 @@ class ScopeTest(HomesMixin):
     def _recording_exists(self):
         calls: list = []
 
-        def exists(project, cluster, location):
+        def exists(project, cluster, location, timeout=None):
             calls.append((project, cluster, location))
             return True
         return exists, calls

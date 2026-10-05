@@ -327,6 +327,10 @@ func New(o Options) (*Gateway, error) {
 	if o.Config.SessionTTL <= 0 {
 		o.Config.SessionTTL = defaultSessionTTL
 	}
+	o.Config.defaultCapabilityCeiling()
+	if err := o.Config.validateCapabilityCeiling(); err != nil {
+		return nil, err
+	}
 	g := &Gateway{
 		turnBudget:     turnTimeout,
 		cfg:            o.Config,
@@ -382,6 +386,9 @@ func New(o Options) (*Gateway, error) {
 	}
 	if o.Config.DefaultAddressee == RouteSession && g.spawner == nil {
 		return nil, fmt.Errorf("A2A_DEFAULT_ADDRESSEE=%s requires A2A_SPAWN_SESSIONS=true: without a spawner the sentinel would publish tasks to a literal %q addressee no executor owns", RouteSession, RouteSession)
+	}
+	if o.Config.SessionClusterView && o.Config.CredentialProxyURL == "" {
+		return nil, fmt.Errorf("A2A_SESSION_CLUSTER_VIEW=true requires A2A_CREDENTIAL_PROXY_URL: a session pod with the view and no broker address would have wrappers that dial nothing")
 	}
 	return g, nil
 }
@@ -1140,7 +1147,7 @@ func (g *Gateway) freshIncarnation(ctx context.Context, rec *SessionRecord) bool
 // and the idle clock moves as it does for "nothing is running"); false only
 // when the turn was refused part-way (the cap, or a previous task that could
 // not be closed) and the in-memory route change must not persist.
-func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg InboundMessage, backend, rest, principal string, authority []byte) bool {
+func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg InboundMessage, backend, rest, principal string, authority Authority) bool {
 	off := isSessionOff(rest)
 	// The way back is answered even with no spawner: a record left
 	// session-routed after A2A_SPAWN_SESSIONS was disarmed (the W4-rollback
@@ -1470,7 +1477,7 @@ func isMaxBytes(err error) bool {
 
 // startTask mints the identifiers, publishes the submission, and posts the
 // placeholder the relay will edit.
-func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, principal string, authority []byte) {
+func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, principal string, authority Authority) {
 	taskID := "task-" + randHex(taskIDHexWidth)
 	// correlationId is minted here and nowhere else — the originating user
 	// interaction (payload spec field rule).
@@ -1487,6 +1494,30 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		"conversation", msg.Conversation,
 		"addressee", rec.Addressee)
 
+	// The root capability, minted before anything is published. The
+	// gateway allocates the taskId and the addressee in the same breath, so
+	// the entry can name the principal that will serve the request before
+	// that principal's credential exists — which is the property 09 §5 says
+	// both delegate rules need and nothing in the design set provided.
+	//
+	// A mint that fails refuses the turn. The alternative is a submission
+	// with no capability, which the executor refuses anyway, one round trip
+	// and a pod later, with the reason in a different component's log.
+	capRef, err := g.mintCapability(ctx, taskID, rec.Addressee)
+	if err != nil {
+		g.log.Error("capability mint failed", "taskId", taskID, "addressee", rec.Addressee, "err", err)
+		if !g.cfg.CapabilityOptional {
+			g.post(rec.Key, "⚠️ not started: could not mint this task's capability")
+			return
+		}
+		// The mixed-version window, and the only path that reaches an
+		// executor with grants null. Loud: an install left here has the
+		// control switched off on both sides at once.
+		g.log.Warn("A2A_CAPABILITY_REQUIRED=false; sending this task with no capability",
+			"taskId", taskID, "addressee", rec.Addressee)
+		capRef = nil
+	}
+
 	payload, err := messagePayload(msg.Text, taskID, rec.ContextID)
 	if err != nil {
 		g.log.Error("message payload build failed", "err", err)
@@ -1494,7 +1525,7 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	}
 	env, err := lib.NewMessageEnvelope(gatewayParty, taskID, rec.ContextID, correlationID, payload,
 		lib.WithTo(lib.Party{Session: rec.Addressee}),
-		lib.WithAuthority(authority))
+		lib.WithAuthority(authority.Render(capRef)))
 	if err != nil {
 		g.log.Error("envelope build failed", "err", err)
 		return
@@ -1520,8 +1551,9 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	// executor's submitted event must never race the mapping, because the
 	// relay acks what it cannot route and the durable won't redeliver it.
 	rec.ActiveTask = &ActiveTask{TaskID: taskID, CorrelationID: correlationID, StatusMsgID: statusMsgID,
-		Ask: truncateRunes(msg.Text, askCap), SubmittedAt: time.Now()}
-	rec.Tasks = append(rec.Tasks, TaskRef{ID: taskID, Addressee: rec.Addressee, CorrelationID: correlationID})
+		Ask: truncateRunes(msg.Text, askCap), SubmittedAt: time.Now(), Capability: capRef}
+	rec.Tasks = append(rec.Tasks, TaskRef{ID: taskID, Addressee: rec.Addressee,
+		CorrelationID: correlationID, Capability: capRef})
 	rec.LastTaskActivity = time.Now().UTC()
 	if len(rec.Tasks) > taskHistoryCap {
 		rec.Tasks = rec.Tasks[len(rec.Tasks)-taskHistoryCap:]
@@ -1591,16 +1623,19 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 // follow-up on the same taskId — injected, absorbed at the executor's next
 // turn boundary (decided 8/24). It reuses the task's correlationId; the
 // steer is attributed by its own envelope and authority block.
-func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, authority []byte) {
+func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, authority Authority) {
 	active := rec.ActiveTask
 	payload, err := messagePayload(msg.Text, active.TaskID, rec.ContextID)
 	if err != nil {
 		g.log.Error("steer payload build failed", "err", err)
 		return
 	}
+	// One task, one capability: the steer rides the reference minted at
+	// submission rather than a fresh one. A second root for the same request
+	// would be a second thing to revoke.
 	env, err := lib.NewMessageEnvelope(gatewayParty, active.TaskID, rec.ContextID, active.CorrelationID, payload,
 		lib.WithTo(lib.Party{Session: rec.Addressee}),
-		lib.WithAuthority(authority))
+		lib.WithAuthority(authority.Render(active.Capability)))
 	if err != nil {
 		g.log.Error("steer envelope build failed", "err", err)
 		return
@@ -1629,11 +1664,11 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 // would otherwise wedge the conversation forever. The gateway never forges a
 // terminal event for a task it doesn't supervise; it just stops letting that
 // task serialize new ones.
-func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority []byte) {
+func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority Authority) {
 	active := rec.ActiveTask
 	env, err := lib.NewCancelEnvelope(gatewayParty, active.TaskID, rec.ContextID, active.CorrelationID,
 		lib.WithTo(lib.Party{Session: rec.Addressee}),
-		lib.WithAuthority(authority))
+		lib.WithAuthority(authority.Render(active.Capability)))
 	if err != nil {
 		g.log.Error("cancel envelope build failed", "err", err)
 		return
@@ -1669,12 +1704,13 @@ func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority 
 // nothing to stop -- while the submission is still on the in subject, and the
 // bridge's durable consumer delivers from the start of the stream, so a
 // bridge that binds later within retention would run the stale prompt. The
-// cancel bounds that run. It rides the task's own chain (the history entry
-// keeps the correlation id and the addressee), is recorded on the history
+// cancel bounds that run. It rides the task's own chain and its own authority
+// (the history entry keeps the correlation id, the addressee and the
+// capability), is recorded on the history
 // entry like any published cancel, and detaches nothing, because nothing is
 // active. A task this conversation never held is refused: the gateway does
 // not publish cancels for tasks it did not start.
-func (g *Gateway) cancelNamedTask(ctx context.Context, rec *SessionRecord, taskID string, authority []byte) {
+func (g *Gateway) cancelNamedTask(ctx context.Context, rec *SessionRecord, taskID string, authority Authority) {
 	ref, held := rec.TaskRefFor(taskID)
 	if !held {
 		g.post(rec.Key, fmt.Sprintf("🤷 this conversation never held task `%s`; nothing sent", taskID))
@@ -1694,7 +1730,7 @@ func (g *Gateway) cancelNamedTask(ctx context.Context, rec *SessionRecord, taskI
 	}
 	env, err := lib.NewCancelEnvelope(gatewayParty, taskID, rec.ContextID, ref.CorrelationID,
 		lib.WithTo(lib.Party{Session: ref.Addressee}),
-		lib.WithAuthority(authority))
+		lib.WithAuthority(authority.Render(ref.Capability)))
 	if err != nil {
 		g.log.Error("cancel envelope build failed", "taskId", taskID, "err", err)
 		return

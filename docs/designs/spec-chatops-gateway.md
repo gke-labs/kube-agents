@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects, but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription) - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); not yet the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, or the default flip
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects, but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription) - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); not yet the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, or the default flip; the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default, retired by declarative profiles or by gateway-side `AllowedUsers` enforcement, whichever lands first) is built
 
 ## Purpose
 
@@ -271,6 +271,15 @@ holds for a delegation too. The audit record for a session-routed turn names the
 session at the gateway; the child task's envelope names the target, the session that asked,
 and the same requester.
 
+One exception stands while its flag is on: the session pod's temporary read-only cluster view
+(`spec-mode-switch.md`, "Switches inside `next`") lets a session read clusters through the
+credential broker directly, with the platform agent's scope and no child task, so the only gate
+between the requester and that read is the gateway's ingress allowlist, not the target's
+`AllowedUsers`. Today both admit the same people. The view retires when declarative profiles
+carry a session's identity and tools or when the gateway enforces the target agent's
+`AllowedUsers` ([architecture 07](../architecture/07-implementation-roadmap.md)), whichever lands
+first; after the second, a session holding the view would be a way around that check.
+
 Delegation ends the turn. A session's turn is a conversation turn, bounded at thirty minutes
 by the `chat` profile's own deadline, and the executors it delegates to run to two hours; the
 two do not nest. When the session delegates, its turn completes with a reply that says so
@@ -318,7 +327,9 @@ long-lived sessions. Four operations:
 
 **Spawn.** First message in a conversation creates the pod: the demo's reference worker
 shape (no ambient k8s credentials, scratch on emptyDir, 250m/512Mi requests; egress
-fenced (8/31) to DNS, the bus, and LiteLLM - the deployment spec owns the policy),
+fenced (8/31) to DNS, the bus, and LiteLLM, except, under the operator's
+`A2A_SESSION_CLUSTER_VIEW` flag, the credential broker (`spec-mode-switch.md`) - the
+deployment spec owns the policy),
 running the headless harness behind a thin shim that bridges bus envelopes to the CLI's
 stream-json stdin/stdout. Model auth, as shipped (amended 8/31): the worker talks to
 the install's own LiteLLM, in-namespace, with no _cloud_ credential at all - the spawned
@@ -456,9 +467,16 @@ verified how, in front of whom:
     "roster": ["hmac:9f4c21…", "hmac:77d0e2…"],
     "rosterComplete": true
   },
-  "grants": null
+  "grants": {
+    "capability": { "key": "root.task-9f3c4b…", "revision": 412 }
+  }
 }
 ```
+
+`grants` is `null` on a turn with no task behind it - a status ask, a refusal the gateway
+answers itself. On a submission it carries the reference above and nothing else: not the
+tier, not the scope. See the payload spec's Authority section for what a consumer may do
+with it, which is resolve it, never read it.
 
 **Identifiers in `authority` are pseudonymous (decided 8/24).** Principals, subjects,
 and roster entries are HMAC-SHA256 with the install's salt before anything is written to
@@ -467,7 +485,10 @@ metadata (`docs/designs/audit-logging-user-attribution.md`). The bus holds label
 content at rest for the whole retention window, so it gets the same treatment as the
 session KV. The plaintext join lives in the gateway's local ingress log, and the
 gateway resolves plaintext at the boundaries that need it - `openDirect` now, the
-lowest-common-denominator grant computation when the authority work lands.
+lowest-common-denominator grant computation if it is ever built. That one is still
+unbuilt (9/9): the authority work landed as the capability envelope, which answers
+"may this task do this" per task rather than computing a grant set per principal, so
+it does not reach this boundary.
 
 **The salt is `SESSION_KV_SALT`, the one the install already provisions** (settled
 8/31). It is generated once into `platform-agent-secrets`, deliberately never
@@ -520,8 +541,10 @@ there are what carry it.
   the two hashes are equal there (as in the example above). `verifiedBy`
   names the mechanism that checked it at ingress.
 - `audience` is a snapshot of the room at the moment of the ask (see group chats below).
-- `grants` is reserved for the attenuating capability token when the authority work
-  lands. Until then it is null and the field is advisory.
+- `grants` carries the attenuating capability's **reference** - a key in the `cap` bucket
+  and the revision the write returned - and never the capability itself. Armed 9/9. It is
+  null on any turn with no task behind it, and null on a submission is a refusal, not a
+  pass.
 
 How `principal` gets established depends on the backend, and the three are not equal:
 
@@ -544,21 +567,32 @@ How `principal` gets established depends on the backend, and the three are not e
 
 **What advisory means, stated plainly:** the gateway verifies the requester at ingress,
 but nothing stops another bus client from publishing an envelope with an invented
-`authority` block. So consumers MUST NOT authorize on it yet. It is carried now for the
-audit trail and for parity testing.
+`authority` block. **That is still true of `requester` and `audience`, permanently.**
+They are the audit trail and consumers MUST NOT authorize on them, ever.
 
-**Corrected 9/9: it does not become decision-grade "when `identity` arms."** `identity`
+**Corrected 9/9: it did not become decision-grade "when `identity` arms."** `identity`
 never arms; see above. And subject-derived publisher identity, which did land for the
 task plane on 9/9, is not enough on its own either - it says which principal wrote the
 bytes, while `authority` claims which human asked. An executor writing its own
 `…events` subject is the legitimate writer of that subject and can still put any
-`authority` block it likes in the envelope. What `authority` needs is a rule binding
-the block to the one publisher entitled to originate it, on subjects only that
-publisher writes; that is the authority half of the consumer rule, and it is still
-owed.
+`authority` block it likes in the envelope.
 
-The payload spec has carried this rule since 0.3: `authority` is populate-by-gateway-only,
-consumers forbidden from deciding on it, libraries pass it through untouched.
+**Armed 9/9, and not by the rule that paragraph predicted.** The answer is not a rule
+about who may originate the block - such a rule would have to be enforced by consumers
+reading a field, which is the shape being refused. `grants` carries a reference to an
+entry in a KV bucket the gateway is the only principal permitted to write, and a consumer
+does not read the entry (no broker may read the store at all) or trust the block. It
+hands the reference to the verifier, which authenticates the caller from the subject it
+arrived on and answers whether a verb is permitted. So an executor is free to write any
+`authority` block it likes, and it buys nothing: an invented reference names a key the
+gateway never wrote, and a stolen one names a capability whose `delegate` is a different
+principal. Both are refused, by the verifier and by the server's own subject permissions
+rather than by an honour system.
+
+The payload spec's Authority section states the consumer rule and its four conditions;
+the mechanism is `docs/architecture/09-capability-envelope.md`. What survives from 0.3
+unchanged: `authority` is populate-by-gateway-only and libraries pass it through
+untouched.
 
 ## Group chats: who is in the room
 
@@ -741,8 +775,9 @@ not be silent about it.
   "stop" is indistinguishable from an intent. It lands on the bus as the same `kind: cancel`
   envelope the text route publishes. The body may name the task (`taskId`, the id the POST
   answered with); named, the cancel is published whether or not the record still holds the task
-  as active, from the task's history entry (its addressee and correlation id), and refused for a
-  task the conversation never held. The harness sends it after a read has classified the task,
+  as active, from the task's history entry (its addressee, correlation id and capability),
+  and refused for a task the conversation never held. The harness sends it after a read has
+  classified the task,
   never before, and in every outcome that leaves an active task - `working` at the budget (a
   graded timeout), queued for the whole budget, never taken by any executor, and a read that
   could not classify - always naming the task. The classification is the read's and never the
@@ -790,8 +825,9 @@ terminal status message the bridge and the worker adapter write as `reason: <tok
 because a failed terminal is not always the persona's failure: the harness reads the token and
 classifies the executors' own reasons (`bridge-shutdown`, `bridge-queue-overflow`,
 `bus-publish-failed`, `spawn-failed`, `bridge-died-without-terminal-event`, `hermes-rate-limited`,
-`worker-evicted`, `bus-subscribe-failed`), a `rejected` terminal and a `canceled-before-start` as infrastructure,
-and grades the persona's (`hermes-exited-nonzero`, `deadline-exceeded`) and any reason it does not
+`hermes-api-unreachable`, `hermes-api-refused`, `session-busy`, `worker-evicted`, `bus-subscribe-failed`), a `rejected` terminal and a `canceled-before-start` as infrastructure,
+and grades the persona's (`hermes-exited-nonzero`, `deadline-exceeded`, `hermes-api-failed`,
+`hermes-api-unreadable`, `hermes-api-read-failed`) and any reason it does not
 know; a `canceled` after the harness's own cancel is the graded timeout. An eval install that
 declares the bridge sidecar sets `BRIDGE_CONCURRENCY` to at least the harness's parallelism
 (`EVAL_TASK_PARALLELISM`), because the bridge publishes `submitted` when it queues a task behind
@@ -1098,9 +1134,24 @@ section gives - and neither is the console adapter, which has no durable to spli
 `verifiedBy` is `slack-socket-mode+principal-map`: Slack authenticated the sender over
 the socket and asserted the `user_id`, our table joined it to a principal. Rendering
 into mrkdwn is a narrow deterministic translation of the two forms the relay emits
-(bold, links); the legacy Hermes converter stays where it is. Everything posted is
-escaped first (`&`, `<`, `>`) - relayed text is executor-authored, ie model output,
-and an unescaped `<!channel>` in a result would ping the room.
+(bold, links); the legacy Hermes converter stays where it is. The translation leaves
+code spans as written, converts bold only on a closed `**` pair, never alters a
+link's destination, and refuses a link whose label carries a URL naming a host other
+than the one it opens. Everything posted is escaped first (`&`, `<`, `>`) - relayed
+text is executor-authored, ie model output, and an unescaped `<!channel>` in a result
+would ping the room. The Google Chat adapter applies the same markdown rules behind its
+own defang, in two halves: the link defang reads prose, link text and an unclosed fence
+but not a closed code span or fenced block; the mention defang reads everything, code
+included. The adapters translate each chunk of a result alone, so the chunker closes a
+fenced block it cuts and reopens it with a bare fence at the start of the next chunk,
+reading the cut with the same code-span parse the adapters use: every chunk is balanced on
+its fences, so a cut block never leaks its closer into the next chunk, the fences added stay
+within the chunk cap, and the text between them is the original, byte for byte. The
+guarantee covers fenced blocks only: a cut inside a multi-line double-backtick span, or a
+hard cut that lands inside a mid-line fence opener, still leaves the next chunk parsing
+differently from the whole, a display defect tracked as a follow-up. The opener's language tag is not carried onto the
+reopened fence (it is the rest of the opener's line, unbounded), so a continuation chunk
+loses the tag on Discord.
 
 ## The console adapter (added 9/23)
 
@@ -1287,14 +1338,16 @@ then it is a dev and eval door like the other.
 - The gateway: Discord, Google Chat and Slack adapters, session manager (spawn / stream
   / reap / rehydrate / sweep), bus client, KV session registry.
 - The session pod shim: bus-to-stream-json bridge, event mapping.
-- The `authority` block, populated at ingress, advisory.
+- The `authority` block, populated at ingress: `requester` and `audience` advisory,
+  `grants` decision-grade by resolution.
 - Roster tracking and the `openDirect` primitive.
 
-Not in stage 2: the classifier, the LCD permissions tool, `grants`, anything that makes
-`authority` decision-grade, and the transition work "Sessions by default" names (the
-gateway-minted child task, the `chat` profile's skills, the warm
-pool). (The gchat and slack adapters were on this list until 9/5 and 9/4 respectively;
-each now has its own section above.)
+Not in stage 2: the classifier, the LCD permissions tool, and the transition work
+"Sessions by default" names (the gateway-minted child task, the `chat` profile's skills,
+the warm pool). (The gchat and slack adapters were on this list until 9/5 and 9/4
+respectively; each now has its own section above. `grants` and "anything that makes
+`authority` decision-grade" were on it until 9/9, when they landed - the bullet above is
+what replaced them. The `/session` opt-in came off when it shipped.)
 
 ## Inherited from the kanban retirement (added 8/24)
 

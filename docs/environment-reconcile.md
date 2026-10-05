@@ -105,9 +105,20 @@ on any install, keyed on the `install.env` names in the table's second column;
 [`scripts/installer/README.md`](../scripts/installer/README.md#the-install-configuration-installenv)
 states it for users.
 
+`ENABLE_DRIFT_DETECTOR` is the exception to the paragraph above, and the only one:
+its shipped default is `true`, so an omission provisions rather than destroys — a
+Log Router sink exporting every GKE cluster in the project, a Pub/Sub topic and a
+subscription that retains a copy of those records for 31 days. Nothing is lost by
+leaving it unset, and an environment that wants the detector need not set it. It is
+in the table because it is the only way to say no: the reconcile regenerates
+`install.env` from these variables on every run, so the `ENABLE_DRIFT_DETECTOR=false`
+line that is the opt-out everywhere else does not survive to the next one here.
+
 Required for a **plan** as much as for an apply: the reconcile renders `--strict`
-before it branches on the mode, so until an environment carries all twelve the daily
-drift report goes red on it rather than reporting no drift.
+before it branches on the mode, so until an environment carries all twelve required
+settings the daily drift report goes red on it rather than reporting no drift.
+`ENABLE_DRIFT_DETECTOR` is not among the twelve — a strict render does not ask for
+it, for the reason in the paragraph above.
 
 | GitHub variable                 | install.env key                 | Notes                                                                                                                                               |
 | ------------------------------- | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -123,6 +134,7 @@ drift report goes red on it rather than reporting no drift.
 | `ENABLE_GKE_BACKUP_PLAN`        | `ENABLE_GKE_BACKUP_PLAN`        | Absent destroys the backup plan                                                                                                                     |
 | `ENABLE_PUBSUB_PLATFORM`        | `ENABLE_PUBSUB_PLATFORM`        | Absent removes the adapter plugin unless `ENABLE_STOCKOUT_INVESTIGATOR` keeps it; the Pub/Sub API it enabled stays on and nothing else is destroyed |
 | `ENABLE_STOCKOUT_INVESTIGATOR`  | `ENABLE_STOCKOUT_INVESTIGATOR`  | Absent destroys log sink and stockout alerts topic/sub                                                                                              |
+| `ENABLE_DRIFT_DETECTOR`         | `ENABLE_DRIFT_DETECTOR`         | The one that runs the other way: absent **provisions** the drift Log Router sink, topic and subscription, because the shipped default is `true`     |
 
 Required when the integration they belong to is switched on, because an empty
 allowlist is not "no opinion" — the operator reads an absent list as allow-all,

@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"io"
 	"log/slog"
 	"net"
@@ -74,6 +75,13 @@ func startBridgeCfg(t *testing.T, url string, command []string, mutate func(*Con
 		TaskDeadline:   20 * time.Second,
 		KillGrace:      500 * time.Millisecond,
 		ActivityListen: "127.0.0.1:0",
+		// The activity tests are lifecycle tests: they run with the
+		// capability control armed, like the sidecar does, so they need
+		// the scope the submission's capability is minted at. Resolved
+		// here rather than defaulted in startBridgeConfig, because an
+		// executor that invents its own scope is answering the question
+		// it was asked to pose.
+		Scope: capability.NamespaceScope(""),
 	}
 	if mutate != nil {
 		mutate(&cfg)
