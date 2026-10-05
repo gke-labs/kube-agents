@@ -689,9 +689,13 @@ class WorkerCommandsVerifier(BaseVerifier):
 
     Limits, stated so a case is not written against them: only terminal
     commands are visible, not MCP tool calls; only delegated workers' logs
-    are read, never the router's; and a command the shell resolved through an
-    alias appears as typed. Fails closed like its siblings -- a run with no
-    captured worker commands is ``status="error"``, not a pass.
+    are read, never the router's; a command the shell resolved through an
+    alias appears as typed; and a pattern reads the characters on the line,
+    so a word the command splits with an empty quote or a backslash inside
+    it (``compute''Metadata``) is one word to the shell and none to the
+    pattern -- the trajectory read above, splitting the typed command into
+    words, closes this with the chain gap. Fails closed like its siblings --
+    a run with no captured worker commands is ``status="error"``, not a pass.
     """
 
     type: Literal["worker_commands"]
