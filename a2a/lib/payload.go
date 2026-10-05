@@ -46,6 +46,11 @@ const (
 	ArtifactThinking = "thinking"
 	ArtifactActivity = "activity"
 	ArtifactProgress = "progress"
+	// ArtifactDelegate is the session's request to the gateway to mint a
+	// child task: one data part {"addressee","text"} on the session's own
+	// task events. Reserved so the relay and the adapter spell it once
+	// (spec-a2a-payloads.md, "Reserved artifact names").
+	ArtifactDelegate = "delegate"
 )
 
 // The A2A object shapes below carry only the fields the library consults.
