@@ -1672,7 +1672,7 @@ class KubeAgentsHarness(AgentHarness):
         wake_turn: AgentResult,
         workspace_path: Path | None,
     ) -> AgentResult:
-        """Send the typed answer on a new conversation that starts from the thread's context.
+        """Send the answer on a new conversation that starts from the thread's context.
 
         The wake reply joins the thread only when the gateway would post it.
         A context the image cannot format is infrastructure or an error, as

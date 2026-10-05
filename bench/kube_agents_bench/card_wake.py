@@ -11,7 +11,8 @@ the conversation that filed it, and the front door's reply follows
 question is already posted, unless something else in the notification needs
 saying, otherwise the question in its own words. The user's answer then goes
 to the card
-with ``kanban_comment`` and ``kanban_unblock`` (§1.5, **Unblock**). On an image
+with ``kanban_comment`` and ``kanban_unblock``, and the reply to it is exactly
+``[SILENT]`` (§1.5, **Unblock**). On an image
 whose gateway carries a Slack moments module (``gateway/slack_ux_moments.py``)
 with ``KAGE_SLACK_UX`` on, that module's ``needs_you`` posts the question in
 the Slack thread itself before the wake is built. None of that is reachable
@@ -24,8 +25,8 @@ board and blocks it on ``needs_input`` with the case's question, posts the
 question through ``needs_you`` with a stub Slack client where the image has
 that module, and builds the wake with the image's own notifier. An image that
 has the module but posts nothing is broken, not red. The harness then sends
-that wake as the first turn and the case's typed answer as the second, on one
-conversation (:meth:`KubeAgentsHarness._execute_card_wake`).
+that wake as the first turn and the case's answer (typed, or with
+``answer_by: click`` the click's turn) as the second, on one conversation (:meth:`KubeAgentsHarness._execute_card_wake`).
 
 **A card that blocked or gave up.** On the API server a ``blocked`` or
 ``gave_up`` card wakes the conversation that filed it through the notifier's
@@ -48,7 +49,7 @@ Slack does when the thread has no live session for the answer to land in
 (it expired, the gateway restarted, or sessions are per user): the new
 session starts from the thread as Hermes' cold start reads it, the ask that
 opened the thread, the question posted in it and the front door's reply to
-the wake when it was not silent, then the typed answer with the sender
+the wake when it was not silent, then the answer with the sender
 prefix a shared thread session carries. The in-pod context script
 (:func:`context_command`) formats those messages with the image's own
 ``SlackAdapter._format_thread_context``, so the new session reads the
@@ -130,8 +131,9 @@ __all__ = [
 ]
 
 # First lines of the two replay prompts. The ``key: value`` lines under each
-# are its fields (:data:`_QUESTION_FIELDS`, :data:`_FAILURE_FIELDS`); anything
-# else is ignored.
+# are its fields (:data:`_QUESTION_FIELDS` with the optional
+# :data:`SESSION_FIELD` and :data:`ANSWER_BY_FIELD`, :data:`_FAILURE_FIELDS`);
+# anything else is ignored.
 QUESTION_DIRECTIVE = "[bench:slack-question-wake]"
 FAILURE_DIRECTIVE = "[bench:card-failure-wake]"
 _QUESTION_FIELDS = ("title", "question", "options", "answer")
@@ -620,7 +622,7 @@ def archive_command(key: str) -> str:
 
 
 def thread_messages(replay: Replay, planted: Planted, wake_reply: str) -> list[dict]:
-    """The thread as Slack would hold it before the typed answer, oldest first.
+    """The thread as Slack would hold it before the answer, oldest first.
 
     The ask that opened it, the question the stub took (when the image posts
     one) and the front door's reply to the wake, left out when it is ``""``:

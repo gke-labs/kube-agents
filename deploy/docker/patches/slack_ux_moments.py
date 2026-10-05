@@ -42,10 +42,11 @@ and anywhere blocks cannot render. Other block kinds keep the line.
 When the card moves on, any event of it, :func:`settle_question` takes the
 buttons and "waiting on you" off the question, so a typed answer does not
 leave them live, and reads the thread once for that answer: the first reply
-after the question from a person, not a bot, becomes the same "✓ <name>:
-<words>" line a click leaves (the words on one line, clipped to
-``TYPED_ANSWER_MAX``). A card that moved on with nobody replying, or a read
-that fails, settles without the line. A question a click already answered
+after the question from a person the adapter would answer, not a bot, becomes
+the same "✓ <name>: <words>" line a click leaves (the words as plain text on
+one line, clipped to ``TYPED_ANSWER_MAX``). A card that moved on with nobody
+replying, a read that fails, or a question a click answered whose rewrite
+failed (the click posted its line in the thread) settles without the line. A question a click already answered
 was rewritten by the click and is left alone; one whose rewrite failed is
 settled here. The
 notifier delivers at least once, so a ``blocked`` event replayed after its
@@ -62,6 +63,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from collections import OrderedDict
 from collections.abc import Iterable
 from typing import Any
@@ -108,6 +110,13 @@ TYPED_ANSWER_MAX = 80
 
 #: Replies the settle reads after a question, looking for its typed answer.
 REPLIES_READ_MAX = 50
+
+#: The reply subtypes a person typing leaves, besides none: "also send to channel", a file
+#: with a comment, a ``/me``. A join or any other event in the thread is not an answer.
+TYPED_SUBTYPES = frozenset({"thread_broadcast", "file_share", "me_message"})
+
+#: A Slack entity in a reply's text: a link, a mention or a special mention, with an optional label.
+SLACK_ENTITY = re.compile(r"<([^<>|]*)(?:\|([^<>]*))?>")
 
 #: Added to a question's ``text``, so a session the wake never reached reads its card in the thread.
 QUESTION_CARD_NOTE = "(Question from card {card}.)"
@@ -257,14 +266,14 @@ def question_card(channel: str, ts: str) -> str | None:
     return None
 
 
-def _clicked(channel: str, ts: str) -> bool:
-    """Whether a click in this process already answered the message."""
+def _clicked(channel: str, ts: str, rewritten: bool = True) -> bool:
+    """Whether a click in this process already answered the message, and with ``rewritten`` rewrote it."""
     try:
         from gateway import slack_ux_clicks
     except ImportError:
         return False
     try:
-        return bool(slack_ux_clicks.answered(channel, ts))
+        return bool((slack_ux_clicks.answered if rewritten else slack_ux_clicks.clicked)(channel, ts))
     except Exception:  # noqa: BLE001 — read as unanswered; the settle is cosmetic
         return False
 
@@ -293,15 +302,26 @@ def _after(ts: Any, since: str) -> bool:
         return False
 
 
-def _by_a_person(adapter: Any, reply: Any) -> bool:
+def _by_a_person(adapter: Any, reply: Any, channel: str, team_id: str) -> bool:
+    """Whether ``reply`` is a person the adapter would answer typing, as a click's check asks it."""
     if not (isinstance(reply, dict) and reply.get("user") and str(reply.get("text") or "").strip()):
         return False
-    if reply.get("bot_id") or reply.get("subtype"):
+    if reply.get("bot_id") or (reply.get("subtype") and reply.get("subtype") not in TYPED_SUBTYPES):
         return False
     try:
-        return not adapter._event_declares_bot_sender(reply)
-    except Exception:  # noqa: BLE001 — no bot_id and no subtype already read as a person
-        return True
+        return not adapter._event_declares_bot_sender(reply) and bool(
+            adapter._is_interactive_user_authorized(reply["user"], channel_id=channel, team_id=team_id)
+        )
+    except Exception:  # noqa: BLE001 — not counted; the question settles without the line
+        return False
+
+
+def _plain(text: str) -> str:
+    """``text`` with Slack's entities as their label or inner text, and its three escapes decoded."""
+    text = SLACK_ENTITY.sub(lambda m: m.group(2) or m.group(1), text)
+    for raw, escaped in reversed(_presenter.MRKDWN_ESCAPES):
+        text = text.replace(escaped, raw)
+    return text
 
 
 async def _typed_note(adapter: Any, client: Any, sub: dict, channel: str, ts: str) -> str:
@@ -315,11 +335,12 @@ async def _typed_note(adapter: Any, client: Any, sub: dict, channel: str, ts: st
     except Exception as exc:  # noqa: BLE001 — cosmetic; the question settles without the line
         logger.info("slack_ux_moments: reading the answer to %s failed: %s", ts, exc)
         return ""
+    team_id = str(sub.get("team_id") or "")
     for reply in sorted(replies, key=lambda r: float(r["ts"])):
-        if _by_a_person(adapter, reply):
-            words = _presenter._clip(" ".join(str(reply["text"]).split()), TYPED_ANSWER_MAX)
-            team_id = str(sub.get("team_id") or "")
-            return ANSWERED.format(who=await _who(adapter, str(reply["user"]), channel, team_id), label=words)
+        if _by_a_person(adapter, reply, channel, team_id):
+            words = _presenter._clip(" ".join(_plain(str(reply["text"])).split()), TYPED_ANSWER_MAX)
+            who = await _who(adapter, str(reply["user"]), channel, team_id)
+            return ANSWERED.format(who=who, label=_presenter._escape(words))
     return ""
 
 
@@ -330,7 +351,8 @@ async def _settled(adapter: Any, sub: dict, entry: tuple) -> bool:
         return True
     try:
         client = adapter._get_client(channel, team_id=sub.get("team_id") or None)
-        note = await _typed_note(adapter, client, sub, channel, ts)
+        # A click whose rewrite failed posted its own line; a later reply is not the answer.
+        note = "" if _clicked(channel, ts, rewritten=False) else await _typed_note(adapter, client, sub, channel, ts)
         settled_text = _without_choices(text)
         await client.chat_update(
             channel=channel,

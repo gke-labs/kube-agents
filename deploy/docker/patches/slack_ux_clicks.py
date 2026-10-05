@@ -278,6 +278,11 @@ def answered(channel_id: str, msg_ts: str) -> bool:
     return (str(channel_id), str(msg_ts), CHOICE_KIND) in _rewritten
 
 
+def clicked(channel_id: str, msg_ts: str) -> bool:
+    """Whether a choice click in this process answered the message, whether or not its rewrite landed."""
+    return (str(channel_id), str(msg_ts), CHOICE_KIND) in _answered
+
+
 def _answered_by(other: str) -> bool:
     """Whether ``other`` is one of the buttons a choice click answers: every choice."""
     return bool(_presenter.CHOICE_ACTION_ID_PATTERN.search(other))

@@ -645,6 +645,8 @@ class RuntimeTest(unittest.TestCase):
         with self.assertLogs(runtime.logger, level="WARNING"):
             self._answer(adapter, *_choice(1, "Leave it"))
         self.assertFalse(runtime.answered(CHANNEL, MESSAGE_TS), "a question the click did not rewrite reads settled")
+        self.assertTrue(runtime.clicked(CHANNEL, MESSAGE_TS), "a click whose rewrite failed still answered it")
+        self.assertFalse(runtime.clicked("C0OTHER", MESSAGE_TS))
 
     def test_two_clicks_at_once_run_one_turn(self):
         adapter = _Adapter()
@@ -943,7 +945,7 @@ class RuntimeTest(unittest.TestCase):
                 self._answer(adapter, *_choice())
                 self.assertEqual(adapter.log[0][1]["blocks"][-1]["elements"][0]["text"], "✓ <@U1>: Leave it")
 
-    def test_failed_rewrite_and_echo_still_run_the_turn(self):
+    def test_failed_rewrite_and_answered_line_still_run_the_turn(self):
         adapter = _Adapter(fail=("chat_update", "chat_postMessage"))
         with self.assertLogs(runtime.logger, level="WARNING"):
             self._answer(adapter, *_choice())

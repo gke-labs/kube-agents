@@ -84,7 +84,13 @@ class _Adapter:
         self.fail_update = False
         self.replies = []
         self.reads = []
+        self.unauthorized = set()
 
+    def _event_declares_bot_sender(self, event):
+        return False
+
+    def _is_interactive_user_authorized(self, user, channel_id="", team_id=""):
+        return user not in self.unauthorized
 
     def _get_client(self, chat_id, team_id=None):
         self.teams.append(team_id)
@@ -387,7 +393,7 @@ class SettleQuestionTest(unittest.TestCase):
         async def answerer(adapter_, user, channel, team_id=""):
             return f"name-of-{user}-in-{channel}-{team_id}"
 
-        clicks = SimpleNamespace(answerer=answerer, answered=lambda channel, ts: False)
+        clicks = SimpleNamespace(answerer=answerer, answered=lambda channel, ts: False, clicked=lambda channel, ts: False)
         with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_clicks=clicks), "gateway.slack_ux_clicks": clicks}):
             _run(runtime.settle_question(adapter, SUB))
         note = adapter.updates[0]["blocks"][-1]["elements"][0]["text"]
@@ -409,6 +415,37 @@ class SettleQuestionTest(unittest.TestCase):
                 self.assertNotEqual(update["blocks"][-1]["type"], "context")
                 self.assertNotIn("✓", update["text"])
                 self.assertEqual(runtime._questions, {})
+
+    def test_a_typed_answer_counts_only_a_person_the_adapter_answers(self):
+        adapter = _Adapter()
+        adapter.unauthorized = {"U9"}
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        adapter.replies = [
+            {"ts": "1700000000.000400", "user": "U9", "text": "+1 same here"},
+            {"ts": "1700000000.000410", "user": "U7", "subtype": "message_deleted", "text": "seeded-a"},
+            {"ts": "1700000000.000420", "user": "U7", "subtype": "thread_broadcast", "text": "seeded-b"},
+        ]
+        _run(runtime.settle_question(adapter, SUB))
+        self.assertEqual(adapter.updates[0]["blocks"][-1]["elements"][0]["text"], "✓ <@U7>: seeded-b")
+
+    def test_a_typed_answer_shows_slack_entities_as_plain_text(self):
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        adapter.replies = [{"ts": "1700000000.000400", "user": "U7",
+                            "text": "<!channel> <https://example.com/x|seeded-b> &amp; <@U8> &lt;b&gt;"}]
+        _run(runtime.settle_question(adapter, SUB))
+        note = adapter.updates[0]["blocks"][-1]["elements"][0]["text"]
+        self.assertEqual(note, "✓ <@U7>: !channel seeded-b &amp; @U8 &lt;b&gt;")
+
+    def test_a_click_whose_rewrite_failed_settles_without_a_typed_line(self):
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        adapter.replies = [{"ts": "1700000000.000400", "user": "U8", "text": "thanks"}]
+        clicks = SimpleNamespace(answered=lambda channel, ts: False, clicked=lambda channel, ts: True)
+        with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_clicks=clicks), "gateway.slack_ux_clicks": clicks}):
+            _run(runtime.settle_question(adapter, SUB))
+        self.assertNotEqual(adapter.updates[0]["blocks"][-1]["type"], "context")
+        self.assertEqual(adapter.reads, [])
 
     def test_a_question_with_no_thread_reads_nothing(self):
         adapter = _Adapter()
