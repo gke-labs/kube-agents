@@ -723,6 +723,11 @@
                 "type": "string"
               }
             },
+            "maxProjects": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 5000
+            },
             "exclude": {
               "type": "object",
               "additionalProperties": false,

@@ -477,42 +477,57 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         to report as absent while the served config still carried it.
         """
         source = h.text("a2a_identities")
+        consts = cls._go_string_consts(source, h.text("a2a_jetstream_grants"))
         grants = {}
         for builder in re.findall(r"^func (\w+Identity)\(", source, re.MULTILINE):
             body = h.go_function_body(source, builder)
-            user = re.search(r'user:\s*"([^"]+)"', body)
-            if user is None:
-                # A5's two halves of the old `worker` name themselves through
-                # constants, because the operator renders one of them into an
-                # env var the `a2a` CLI reads back. Resolve the constant out of
-                # the same file rather than reporting the builder as nameless.
-                ref = re.search(r"user:\s*(a2a\w+),", body)
-                if ref is None:
-                    raise AssertionError(f"{builder} renders no user name")
-                user = re.search(rf'\n\t{ref.group(1)} = "([^"]+)"', source)
-                if user is None:
-                    raise AssertionError(
-                        f"{builder} names its user through {ref.group(1)}, which this file does not declare"
-                    )
+            # A5's two halves of the old `worker` name themselves through
+            # constants, because the operator renders one of them into an env
+            # var the `a2a` CLI reads back, and the verifier does the same so
+            # that the callout contract and the render agree on one spelling.
+            # Resolve the expression rather than reporting either as nameless.
+            expr = re.search(r"\n\t\tuser:\s*(\S+?),", body)
+            if expr is None:
+                raise AssertionError(f"{builder} renders no user name")
+            name = cls._resolve_expr(expr.group(1), consts)
+            if name is None:
+                raise AssertionError(
+                    f"{builder} names its user as `{expr.group(1)}`, which this test cannot resolve"
+                )
             field = re.search(r"\n\t\tpublish:\s*(\[\]string\{.*?\n\t\t\}|\w+),", body, re.DOTALL)
             if field is None:
-                grants[user.group(1)] = ([], True)
+                grants[name] = ([], True)
             elif field.group(1).startswith("[]string{"):
-                grants[user.group(1)] = (re.findall(r'"([^"]+)"', field.group(1)), True)
+                # Entry by entry rather than scraping every quoted run out of
+                # the block, because a concatenated entry scraped that way
+                # yields its fragments -- `_INBOX.` and `.>` as two separate
+                # "grants", neither of which is a subject anything holds.
+                literal = field.group(1)
+                inner = re.sub(r"//[^\n]*", "", literal[literal.index("{") + 1 : literal.rindex("}")])
+                read, complete = [], True
+                for element in inner.split(","):
+                    if not element.strip():
+                        continue
+                    value = cls._resolve_expr(element, consts)
+                    if value is None:
+                        complete = False
+                    else:
+                        read.append(value)
+                grants[name] = (read, complete)
             else:
-                name = field.group(1)
+                var = field.group(1)
                 regions = re.findall(
-                    rf"\n\t{name} :?= (?:append\({name}, )?\[?\]?string?\{{?(.*?)\n\t[}}\)]",
+                    rf"\n\t{var} :?= (?:append\({var}, )?\[?\]?string?\{{?(.*?)\n\t[}}\)]",
                     body,
                     re.DOTALL,
                 )
                 if not regions:
-                    raise AssertionError(f"{builder} builds `{name}` in a shape this test cannot read")
+                    raise AssertionError(f"{builder} builds `{var}` in a shape this test cannot read")
                 # Comments inside these blocks quote the very subjects they
                 # explain the absence of, so they are stripped before reading.
                 bare = [re.sub(r"//[^\n]*", "", r) for r in regions]
                 read = [g for r in bare for g in re.findall(r'"([^"]+)"', r)]
-                resolved, complete = cls._resolve_local_publish(body, name)
+                resolved, complete = cls._resolve_local_publish(body, var)
                 if complete:
                     # Every literal the naive scan saw must survive into the
                     # resolved reading -- as a whole grant, or as a piece of
@@ -524,11 +539,11 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
                     missing = [g for g in read if not any(g in r for r in resolved)]
                     if missing:
                         raise AssertionError(
-                            f"{builder}: resolving `{name}` lost {missing}; the resolver is not reading every append"
+                            f"{builder}: resolving `{var}` lost {missing}; the resolver is not reading every append"
                         )
-                    grants[user.group(1)] = (resolved, True)
+                    grants[name] = (resolved, True)
                 else:
-                    grants[user.group(1)] = (read, False)
+                    grants[name] = (read, False)
         return grants
 
     @staticmethod
@@ -654,8 +669,16 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         """
         conf = h.text("a2a_rendered_nats_conf")
         grants = {}
+        # The allow list alone, terminated on its own `]` rather than on the
+        # close of the `publish` block: a principal with a deny list has a
+        # second bracketed list inside that block, and reading to the block's
+        # end would report every denied subject as a grant. Subjects never
+        # contain `]`, so the character class cannot run past the list it is
+        # reading. Denies narrow what follows, so ignoring them can only
+        # over-report writers, and an over-report of this set fails loudly
+        # rather than passing quietly.
         for block in re.finditer(
-            r"user:\s*(\S+).*?publish\s*\{\s*allow\s*=\s*\[(.*?)\]\s*\}", conf, re.DOTALL
+            r"user:\s*(\S+).*?publish\s*\{\s*allow\s*=\s*\[([^\]]*)\]", conf, re.DOTALL
         ):
             grants[block.group(1)] = re.findall(r'"([^"]+)"', block.group(2))
         return grants
@@ -708,7 +731,7 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         assertion in this class vacuously.
         """
         grants = self._rendered_publish_grants()
-        for user in ("gateway", "agent", "bridge", "web", "seed", "provision"):
+        for user in ("gateway", "agent", "bridge", "web", "seed", "provision", "verifier"):
             self.assertIn(user, grants, f"{user} is no longer a rendered principal")
             self.assertTrue(grants[user], f"{user} renders no publish grants; the tests below go vacuous")
         self.assertEqual([], grants["session"], "the session entry's empty lists are load-bearing")

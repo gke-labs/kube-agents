@@ -1988,8 +1988,8 @@ class GitArgumentRefusalTest(unittest.TestCase):
         self.assertIsNotNone(git_argument_violation(["git", "commit", "-c", "HEAD"]))
 
 
-class GitLeaseGateWiringTest(unittest.TestCase):
-    """The gate as the agent meets it — over HTTP, through /v1/exec."""
+class _ExecRouteServer(unittest.TestCase):
+    """A proxy serving /v1/exec on loopback, with an empty policy."""
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -2023,6 +2023,25 @@ class GitLeaseGateWiringTest(unittest.TestCase):
                 return response.status, json.loads(response.read())
         except urllib.error.HTTPError as error:
             return error.code, json.loads(error.read())
+
+
+class GitLeaseGateWiringTest(_ExecRouteServer):
+    """The git gates over HTTP, through /v1/exec.
+
+    `/v1/exec` refuses `git` outright (`ExecRouteRefusesGitTest`), so these
+    put it back on the route to reach the gates behind that refusal: they are
+    what stands if `git` is ever admitted there again.
+    """
+
+    def setUp(self):
+        patcher = mock.patch.object(
+            credential_proxy,
+            "EXEC_ROUTE_EXECUTABLES",
+            (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "git"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        super().setUp()
 
     def test_an_unleased_commit_comes_back_as_a_policy_block(self):
         # The shim renders `SECURITY_POLICY_BLOCKED` as a refusal the agent can
@@ -2097,6 +2116,35 @@ class GitLeaseGateWiringTest(unittest.TestCase):
         self.assertEqual("completed", body["status"])
         self.assertTrue(len(executed_argvs) > 0)
         self.assertEqual(["git", "status", "--porcelain"], executed_argvs[0])
+
+
+class ExecRouteRefusesGitTest(_ExecRouteServer):
+    """`git` posted to /v1/exec never runs, leased workspace or not.
+
+    The broker's `git` carries its credential helper, so a read the lease gate
+    does not fence -- `ls-remote` of a private repository -- would answer under
+    the broker's credential. A sandbox reaches a repository through the verbs.
+    """
+
+    def assert_refused(self, argv, cwd):
+        status, body = self.post({"argv": argv, "cwd": cwd})
+        self.assertEqual(403, status)
+        self.assertEqual("executable.allowlist", body["rule"])
+
+    def test_a_read_the_lease_gate_does_not_fence_is_refused(self):
+        workspace = CredentialProxyHandler.executor.workspace_dir
+        self.assert_refused(
+            ["git", "ls-remote", "https://github.com/acme/private.git"], str(workspace)
+        )
+
+    def test_a_leased_command_is_refused_too(self):
+        workspace = (
+            CredentialProxyHandler.executor.workspace_dir / "gitops" / "t_card"
+        )
+        (workspace / "acme__fleet").mkdir(parents=True)
+        (workspace / ".lease").write_text('{"lease": "t_card"}', encoding="utf-8")
+        self.assert_refused(["git", "status", "--porcelain"], str(workspace / "acme__fleet"))
+        self.assertNotIn("git", credential_proxy.EXEC_ROUTE_EXECUTABLES)
 
 
 class ExecRouteCapacityTest(unittest.TestCase):
@@ -4138,15 +4186,50 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         # `_execute` bounds output at CREDENTIAL_PROXY_MAX_OUTPUT_BYTES, 4 MiB by
         # default, which is not a log line -- and this path runs on every failed
         # cron tick.
-        _, logs = self._refresh(self._failure("x" * 5000))
+        # The tail: the helper names the failure on its last line, after the
+        # steps that ran before it.
+        _, logs = self._refresh(self._failure("x" * 5000 + "FATAL: why"))
 
         detail = logs[0].split("github credential refresh exited 1: ", 1)[1]
-        self.assertEqual(detail, "x" * 1000)
+        self.assertEqual(1000, len(detail))
+        self.assertTrue(detail.endswith("FATAL: why"))
 
     def test_omits_the_detail_when_stderr_is_empty(self):
         _, logs = self._refresh(self._failure("   \n"))
 
         self.assertTrue(logs[0].endswith("github credential refresh exited 1"))
+
+    def test_a_successful_refresh_logs_what_the_helper_said_at_info(self):
+        # The helper names the branch that minted the identity token and how
+        # long it took; a refresh that fell through to gcloud and still
+        # succeeded is visible only from this line.
+        said = (
+            "[SRE-AUTH] WARNING: no identity token from the metadata server (HTTP Error 404: Not Found after 0.01s); asking gcloud.\n"
+            "[SRE-AUTH] Minted the broker OIDC token through gcloud in 1.20s.\n"
+            "[SRE-AUTH] GitHub authentication successfully configured for repository: gke-agentic/infra\n"
+        )
+        executor = credential_proxy.CommandExecutor.__new__(credential_proxy.CommandExecutor)
+        executor.execute_internal = lambda argv: credential_proxy.ExecutionResult(
+            exit_code=0, stdout="", stderr=said, duration_ms=5, truncated=False, timed_out=False
+        )
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                executor.refresh_forge_credential("github", "gke-agentic/infra")
+        line = [entry for entry in logs.output if "github credential refresh: " in entry]
+        self.assertEqual(1, len(line), logs.output)
+        self.assertIn("asking gcloud", line[0])
+        self.assertIn("through gcloud in 1.20s", line[0])
+        self.assertTrue(line[0].startswith("INFO:"))
+
+    def test_a_successful_read_only_mint_logs_nothing(self):
+        # One per clone of a context repository; only the refresh asks for the
+        # success line.
+        executor = credential_proxy.CommandExecutor.__new__(credential_proxy.CommandExecutor)
+        executor.execute_internal = lambda argv: credential_proxy.ExecutionResult(
+            exit_code=0, stdout="ghs_token", stderr="[SRE-AUTH] Minted a read-only installation token for repository: o/r\n", duration_ms=5, truncated=False, timed_out=False
+        )
+        with self.assertNoLogs(credential_proxy.LOGGER, level="INFO"):
+            executor._run_forge_helper("github", Path(__file__), ["o/r", "--read-only"], "read-only credential mint")
 
     def test_redacts_token_shapes_out_of_the_detail(self):
         token = "ghs_" + "A" * 36
@@ -6448,8 +6531,25 @@ class ExecAuditLineCannotBeForgedTest(unittest.TestCase):
         self._assert_single_line_records("executable blocked")
 
     def test_a_newline_in_the_cwd_writes_no_second_record(self):
-        self._post({"requestId": "ok", "argv": ["git", "status"], "cwd": "/tmp/a\nb"})
+        # The lease refusal is the one record that logs the cwd. It sits behind
+        # the route's refusal of `git`, so admit `git` to reach it.
+        routed = (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "git")
+        with mock.patch.object(credential_proxy, "EXEC_ROUTE_EXECUTABLES", routed):
+            self._post({"requestId": "ok", "argv": ["git", "status"], "cwd": "/tmp/a\nb"})
         self._assert_single_line_records("git lease refused")
+
+    def test_a_forge_cli_the_broker_runs_is_refused_on_exec(self):
+        # The broker runs `gh` for its own verbs, so it is on ALLOWED_EXECUTABLES.
+        # A sandbox caller that posts its own argv must still not reach it: the
+        # sandbox reaches a forge only through the verbs.
+        allowed = (*CommandExecutor.ALLOWED_EXECUTABLES, "gh")
+        with mock.patch.object(CommandExecutor, "ALLOWED_EXECUTABLES", allowed):
+            self._post({"requestId": "ok", "argv": ["gh", "pr", "create"], "cwd": "/tmp"})
+        self.assertTrue(
+            any("executable blocked" in m and "executable=gh" in m for m in self.records),
+            self.records,
+        )
+        self.assertNotIn("gh", credential_proxy.EXEC_ROUTE_EXECUTABLES)
 
 
 class AuditLogSurvivesAHostileRequestTest(unittest.TestCase):

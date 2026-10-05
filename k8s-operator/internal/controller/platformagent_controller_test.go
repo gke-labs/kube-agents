@@ -4929,7 +4929,7 @@ func TestABrokenNativeSidecarIsReportedDegraded(t *testing.T) {
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
-	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent)
+	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent, true)
 
 	if phase != "Degraded" {
 		t.Errorf("phase = %q, want Degraded -- a pod stuck in Init reports as healthy", phase)
@@ -4979,7 +4979,7 @@ func TestInitContainerPluginStagingFailureReportsDegraded(t *testing.T) {
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
-	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent)
+	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent, true)
 
 	if phase != "Degraded" {
 		t.Errorf("phase = %q, want Degraded", phase)
@@ -6545,7 +6545,7 @@ func TestGetDeploymentStatusDetails_TerminatingPodSkipped(t *testing.T) {
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
-	phase, _, _ := r.getDeploymentStatusDetails(context.Background(), agent)
+	phase, _, _ := r.getDeploymentStatusDetails(context.Background(), agent, true)
 	// Terminating pod must be skipped, leaving default phase Provisioning.
 	if phase == "Degraded" {
 		t.Errorf("getDeploymentStatusDetails returned Degraded for a terminating pod")
@@ -6580,7 +6580,7 @@ func TestGetDeploymentStatusDetails_NonStagingTerminatedIgnored(t *testing.T) {
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
-	phase, _, _ := r.getDeploymentStatusDetails(context.Background(), agent)
+	phase, _, _ := r.getDeploymentStatusDetails(context.Background(), agent, true)
 	// Non-staging container terminated should not trigger Degraded in getDeploymentStatusDetails.
 	if phase == "Degraded" {
 		t.Errorf("getDeploymentStatusDetails returned Degraded for non-staging terminated container")
@@ -6616,7 +6616,7 @@ func TestGetDeploymentStatusDetails_StagingInitTerminatedReportsDegraded(t *test
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
-	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent)
+	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent, true)
 	if phase != "Degraded" {
 		t.Errorf("expected phase Degraded, got %q", phase)
 	}
@@ -6662,7 +6662,7 @@ func TestGetDeploymentStatusDetails_A2AGatewayFaultReportsDegraded(t *testing.T)
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
-	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent)
+	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent, true)
 
 	if phase != "Degraded" {
 		t.Errorf("phase = %q, want Degraded -- a gateway that cannot pull its image is a fault, not provisioning", phase)
@@ -6707,7 +6707,7 @@ func TestGetDeploymentStatusDetails_A2AGatewayNotScannedOnATodayInstall(t *testi
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
-	phase, reason, _ := r.getDeploymentStatusDetails(context.Background(), agent)
+	phase, reason, _ := r.getDeploymentStatusDetails(context.Background(), agent, true)
 
 	if phase == "Degraded" {
 		t.Errorf("phase = Degraded (reason %q) -- a today install has no A2A gateway to be degraded by", reason)

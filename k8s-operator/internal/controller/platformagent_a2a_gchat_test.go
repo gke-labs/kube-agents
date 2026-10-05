@@ -225,7 +225,7 @@ func TestAnUnarmedGatewayRendersAsBefore(t *testing.T) {
 				names = append(names, e.Name)
 			}
 			want := []string{"NATS_URL", "NATS_USER", "NATS_PASSWORD", "DISCORD_TOKEN", "A2A_MAX_SESSIONS",
-				"A2A_SPAWN_SESSIONS", "A2A_WORKER_IMAGE", a2aStrictEventsWriterEnvVar, "POD_NAMESPACE",
+				"A2A_SPAWN_SESSIONS", "A2A_WORKER_IMAGE", a2aStrictEventsWriterEnvVar, a2aCapabilityRequiredEnvVar, "POD_NAMESPACE",
 				"SESSION_KV_SALT", "A2A_OWNER_DEPLOYMENT", "A2A_SESSION_SERVICE_ACCOUNT"}
 			if strings.Join(names, ",") != strings.Join(want, ",") {
 				t.Errorf("unarmed env order %v, want %v", names, want)

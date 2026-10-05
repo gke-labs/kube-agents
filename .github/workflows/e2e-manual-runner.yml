@@ -106,7 +106,12 @@ jobs:
     name: Run E2E (${{ inputs.test_suite }} on ${{ inputs.github_environment }})
     runs-on: ubuntu-latest
     environment: ${{ inputs.github_environment }}
-    timeout-minutes: 45
+    # Covers ~5m of runner setup, wait_for_gke_readiness.sh's litellm (420s) and
+    # gateway (1500s) gates paid up to twice each (64m), and up to 60m for
+    # `--suite all` across all five E2E test files (matching the five-file suite
+    # allowance in staging-promotion-pipeline.yml). Held by
+    # SiblingGatewayRolloutGatesTest in tests/test_gateway_rollout_budgets.py.
+    timeout-minutes: 130
 
     env:
       CLOUDSDK_PYTHON: "/usr/bin/python3"

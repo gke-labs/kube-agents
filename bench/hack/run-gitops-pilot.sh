@@ -84,7 +84,7 @@ readonly SHELL_STATEFULSET="platform-agent-shell"
 readonly SHELL_PVCS="data-platform-agent-shell-0 sshd-platform-agent-shell-0"
 readonly OWNED_PVCS="platform-agent-data system-metadata"
 readonly CR_REMOVE_TIMEOUT=600s
-readonly CR_READY_TIMEOUT=900s
+readonly CR_READY_TIMEOUT=1500s
 readonly PVC_GONE_TIMEOUT_SEC=300
 readonly PVC_POLL_INTERVAL_SEC=5
 # The branch a repository is left on after a run (the stack restores it).
@@ -98,10 +98,10 @@ readonly SWEEP_MD="integrity-sweep.md"
 readonly RESULTS_DIR="./results"
 # Rollout wait after the reset re-creates the agent: the data volume is
 # ReadWriteOnce, so the new pod waits for the old one to release it, then
-# cold-starts (plugin and skill sync, MCP discovery). Fifteen minutes covers
-# the worst case the pilot saw (run 10, 2026-09-15: the startup probe was still
-# failing at ten).
-readonly GATEWAY_ROLLOUT_TIMEOUT=900s
+# cold-starts (plugin and skill sync, MCP discovery). Twenty-five minutes
+# matches the gateway rollout gate over the 905s startupProbe budget (#2087;
+# pilot run 10 on 2026-09-15 saw the startup probe still failing at ten).
+readonly GATEWAY_ROLLOUT_TIMEOUT=1500s
 
 : "${GCP_PROJECT_ID:?set GCP_PROJECT_ID to the project that hosts the task cluster of a run}"
 : "${AGENT_HOST_CONTEXT:?set AGENT_HOST_CONTEXT to the kubectl context of the cluster running the platform agent}"

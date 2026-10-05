@@ -40,9 +40,11 @@ What does *not* come across, and why the list below is a denylist:
     ``.kubeconfigs``, ``kubeconfig.yaml``. The sandbox exists so that code the
     model runs cannot reach these.
   - The trees the sandbox image already delivers — ``skills``, ``governance``,
-    ``scripts``. The sandbox entrypoint replaces those from ``/opt/defaults`` on
-    every start, so copying the agent pod's copies over them would be undone at
-    the next restart at best and would shadow a newer image at worst.
+    ``scripts``. The sandbox stages those from ``/opt/defaults`` on every pod
+    start, and under the operator the shell sees them as read-only mounts, so
+    a copy from the agent pod would fail against the mount there, would be
+    undone at the next restart elsewhere, and would shadow a newer image at
+    worst.
 
 A denylist rather than an allowlist because of which way each one fails. An
 allowlist of ``scratch`` and ``gitops`` would have silently dropped ``infra``,
@@ -97,11 +99,12 @@ SKELETON_DIRS = ("artifacts", "gitops", "plans", "scratch", "tmp", "workspace")
 # the copy again and `--skip-old-files` keeps whatever already landed.
 #
 # The dividing line is not "how bad does this look" but "who can make it
-# happen". Everything below /opt/data on the sandbox is owned by uid 1000, so a
-# failure the model can provoke -- a layout the push cannot handle, a marker it
-# deleted -- must not be fatal, or a prompt injection stops the agent for good
-# and the repair needs the agent that is no longer running. Nothing has been
-# copied at any of those points, so nothing is lost by coming up without them.
+# happen". Everything below /opt/data on the sandbox except the image's trees
+# is owned by uid 1000, so a failure the model can provoke -- a layout the push
+# cannot handle, a marker it deleted -- must not be fatal, or a prompt
+# injection stops the agent for good and the repair needs the agent that is no
+# longer running. Nothing has been copied at any of those points, so nothing is
+# lost by coming up without them.
 #
 # EXIT_FATAL holds the gateway container down, and it is left for what running
 # the script again cannot fix: no tar on PATH, and an unhandled exception,
@@ -126,9 +129,11 @@ DISPLACED_STAMP_FORMAT = "%Y%m%dT%H%M%S"
 # take the gateway with it. Permanent because nothing on the sandbox side
 # reaches a skeleton path -- that entrypoint displaces a non-directory at a
 # *home root*, where its own `install -d` would trip on one, and rewrites only
-# the trees it ships in /opt/defaults. A plain file at `scratch` survives every
-# recycle. Symlinks are displaced here too, including one pointing at a
-# directory, which `[ -d ]` alone would accept.
+# the trees it ships in /opt/defaults. Under the operator /opt/data/profiles and
+# /opt/data/profiles/platform are mount points and are always directories, so
+# only a cluster-profile home can still need displacing here. A plain file at
+# `scratch` survives every recycle. Symlinks are displaced here too, including
+# one pointing at a directory, which `[ -d ]` alone would accept.
 SKELETON_SHELL = """
 for target in {targets}; do
   displace=0
@@ -199,11 +204,12 @@ HERMES_RUNTIME = frozenset(
 # scripts the model wrote straight into $HOME stay on the agent pod's volume.
 PROCESS_HOME = "home"
 
-# Staged at /opt/defaults in the sandbox image and copied onto the volume by
-# its entrypoint on every start. Copying the agent pod's would overwrite a
-# current tree with an older one, and the sandbox's copy is the one the shell
-# reads. Keep this in step with what deploy/sandbox/Dockerfile actually stages;
-# the sandbox delivers these three and nothing else.
+# Staged at /opt/defaults in the sandbox image and copied onto the volume,
+# root-owned, on every pod start; under the operator the shell container mounts
+# each one read-only, so a write into it fails there. Copying the agent pod's
+# would overwrite a current tree with an older one, and the sandbox's copy is
+# the one the shell reads. Keep this in step with what deploy/sandbox/Dockerfile
+# actually stages; the sandbox delivers these three and nothing else.
 IMAGE_OWNED = frozenset({"governance", "scripts", "skills"})
 
 # Also withheld, but for the opposite reason: nothing delivers these to the
@@ -369,8 +375,9 @@ SERVER_ALIVE_COUNT_MAX = 3
 
 # The ceiling on any single ssh call, and the reason it exists is the far side
 # rather than the network. sshd runs the login shell for a non-interactive
-# command too, so it sources ~/.bashrc -- a file the sandbox image deliberately
-# leaves writable by the model. A `sleep infinity` at the top of it makes every
+# command too, so it sources ~/.bashrc -- a file the model could write in
+# sandbox images built before /home/agent was made root-owned, which an install
+# can still pin. A `sleep infinity` at the top of it makes every
 # call here hang forever, and this script runs in the gateway's entrypoint
 # before `exec "$@"`, so the hang is the whole agent, permanently, across
 # restarts. Neither ConnectTimeout nor the keepalives above cover it: the
@@ -555,8 +562,9 @@ def remote(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            # Not strict UTF-8. The far side's shell startup files are writable
-            # by the model, so one non-UTF-8 byte echoed from ~/.bashrc would
+            # Not strict UTF-8. On older sandbox images the far side's shell
+            # startup files are writable by the model, so one non-UTF-8 byte
+            # echoed from ~/.bashrc would
             # otherwise raise UnicodeDecodeError out of the decode and take the
             # whole mirror down on every start.
             errors="replace",
@@ -601,7 +609,9 @@ def push_skeleton(ssh: list[str], remote_root: str, homes: list[str]) -> None:
     that runs on every container start.
 
     Targets are pushed parent-first, so a home root that has to be displaced is
-    a directory again before its own skeleton is created inside it.
+    a directory again before its own skeleton is created inside it. Under the
+    operator the machine home and ``profiles/platform`` are mount points, so
+    they are always directories and never need it; a cluster-profile home can.
     """
     targets = []
     for home in homes:
@@ -1036,11 +1046,12 @@ def main(argv: list[str] | None = None) -> int:
     # Not fatal, and this is the one call where that distinction earns its keep.
     # The sandbox has no start ordering against this pod, so it can be
     # rescheduled between wait_for_sandbox answering and this line running --
-    # and everything under its /opt/data is owned by uid 1000, so the model can
-    # also leave the layout in a state the push refuses. Either way nothing has
-    # been copied yet, so nothing is lost by coming up without the layout and
-    # pushing it on the next start. Holding the gateway down instead handed a
-    # prompt injection a way to stop the agent for good.
+    # and everything under its /opt/data except the image's trees is owned by
+    # uid 1000, so the model can also leave the layout in a state the push
+    # refuses. Either way nothing has been copied yet, so nothing is lost by
+    # coming up without the layout and pushing it on the next start. Holding the
+    # gateway down instead handed a prompt injection a way to stop the agent for
+    # good.
     try:
         push_skeleton(ssh, args.remote_root, homes)
     except RuntimeError as exc:

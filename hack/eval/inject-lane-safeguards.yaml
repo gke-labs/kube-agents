@@ -3,8 +3,10 @@
 # AGENT_TRANSPORT=inject (the switch it exports under EVAL_MODE_NEXT=1) to a
 # copy of each task file before devops-bench reads it
 # (bench/kube_agents_bench/lane.py). The task files under bench/tasks/ are
-# untouched and the api lane is byte for byte what it was: on any other
-# transport the script does not read this file at all.
+# untouched and the api lane's matrix is byte for byte what it was: on any
+# other transport the script reads this file for `requesting:` only, to run
+# the cases that request a pull request in the second phase below (#2260),
+# and appends nothing.
 #
 # Why a lane-level list. Through the inject door the eval addresses the
 # platform persona directly, which opens its pull requests through
@@ -33,12 +35,14 @@
 # dates writes, it cannot sign them, and the fan-out runs cases side by side
 # against one repository. So hack/ci-eval-pr.sh runs the cases that request a
 # pull request (the same leaf count as the allowance above) in a second
-# phase, after every other unit has finished: a repetition of a case that
+# phase, after every other unit has finished, on both lanes since #2260
+# because the repository reset before each of those units needs the same
+# quiet: a repetition of a case that
 # requests nothing never shares the repository with one that writes by
 # design, and a write inside its window is its own or a concurrent sibling's
 # mistake, either of which is the red the safeguard exists for. The second
-# phase runs one unit at a time, each after a settle as long as the check's
-# clock-skew tolerance, so two requesting cases never see each other's
+# phase runs one unit at a time, on this lane each after a settle as long as
+# the check's clock-skew tolerance, so two requesting cases never see each other's
 # by-design pull requests and no window reaches back into the unit before;
 # each is graded on the pull requests its own reply names.
 # scripts/test_eval_rosters.py pins the set of requesting cases.

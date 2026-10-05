@@ -151,6 +151,25 @@ func TestRenderScopeJSONRendersSelectorsSorted(t *testing.T) {
 	}
 }
 
+func TestRenderScopeJSONCarriesTheCapInForce(t *testing.T) {
+	// The reconcile reads the cap it runs under from the file: the CRD's default
+	// when spec.scope.maxProjects is unset (and when there is no scope block at
+	// all), the declared value otherwise.
+	withoutScope := &agentv1alpha1.PlatformAgent{}
+	if !strings.Contains(renderScopeJSON(withoutScope), `"maxProjects": 100`) {
+		t.Fatalf("a CR without a scope block must render the default cap:\n%s", renderScopeJSON(withoutScope))
+	}
+	unset := &agentv1alpha1.PlatformAgent{Spec: agentv1alpha1.PlatformAgentSpec{Scope: &agentv1alpha1.ScopeSpec{Projects: []string{"p"}}}}
+	if !strings.Contains(renderScopeJSON(unset), `"maxProjects": 100`) {
+		t.Fatalf("an unset maxProjects must render the default cap:\n%s", renderScopeJSON(unset))
+	}
+	cap := int32(250)
+	declared := &agentv1alpha1.PlatformAgent{Spec: agentv1alpha1.PlatformAgentSpec{Scope: &agentv1alpha1.ScopeSpec{MaxProjects: &cap}}}
+	if !strings.Contains(renderScopeJSON(declared), `"maxProjects": 250`) {
+		t.Fatalf("a declared maxProjects must render as declared:\n%s", renderScopeJSON(declared))
+	}
+}
+
 func TestRenderScopeJSONExcludeOnlyIsRendered(t *testing.T) {
 	// An install migrating only its exclusions still needs them applied.
 	scope := &agentv1alpha1.ScopeSpec{Exclude: &agentv1alpha1.ScopeExcludeSpec{
