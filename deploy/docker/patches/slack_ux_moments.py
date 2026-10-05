@@ -100,10 +100,10 @@ WAKE_NOTE = (
     "already shows who answered and what."
 )
 
-#: The answered line a typed answer gets, as ``slack_ux_clicks.ANSWERED``, and its
-#: mention when the clicks module is missing.
+#: The answered line a typed answer gets, as ``slack_ux_clicks.CLICKED``, and its
+#: name when the clicks module is missing.
 ANSWERED = "✓ {who}: {label}"
-MENTION = "<@{user}>"
+NAMELESS = "Someone"
 
 #: A typed answer's words on its answered line are clipped to this.
 TYPED_ANSWER_MAX = 80
@@ -285,14 +285,22 @@ def _without_choices(text: str) -> str:
     return body.rstrip("\n") if body and last.startswith(_presenter.CHOICES_LEAD) else text
 
 
-async def _who(adapter: Any, user: str, channel: str, team_id: str) -> str:
-    """The answerer's name as a click's answered line gives it, else a mention."""
+async def _who(adapter: Any, reply: dict, channel: str, team_id: str) -> str:
+    """The answerer's name as a click's answered line gives it: never a mention or their id.
+
+    The reply's own ``user_profile`` stands in for a click's handle when ``users.info``
+    names nobody, which the adapter caches for a user whose lookup once failed.
+    """
+    profile = reply.get("user_profile") or {}
+    shown = profile.get("display_name") or profile.get("real_name") or profile.get("name") or ""
     try:
         from gateway import slack_ux_clicks
 
-        return await slack_ux_clicks.answerer(adapter, user, channel, team_id)
-    except Exception:  # noqa: BLE001 — the mention still names them
-        return MENTION.format(user=user)
+        return await slack_ux_clicks.clicker_name(
+            adapter, {"user": {"name": str(shown)}}, str(reply["user"]), channel, team_id,
+        )
+    except Exception:  # noqa: BLE001 — the line still names someone
+        return NAMELESS
 
 
 def _after(ts: Any, since: str) -> bool:
@@ -339,7 +347,7 @@ async def _typed_note(adapter: Any, client: Any, sub: dict, channel: str, ts: st
     for reply in sorted(replies, key=lambda r: float(r["ts"])):
         if _by_a_person(adapter, reply, channel, team_id):
             words = _presenter._clip(" ".join(_plain(str(reply["text"])).split()), TYPED_ANSWER_MAX)
-            who = await _who(adapter, str(reply["user"]), channel, team_id)
+            who = await _who(adapter, reply, channel, team_id)
             return ANSWERED.format(who=who, label=_presenter._escape(words))
     return ""
 

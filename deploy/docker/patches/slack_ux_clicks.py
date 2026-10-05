@@ -30,8 +30,8 @@ With the flag on, :func:`register` adds two listeners:
   ``allowed_channels`` gates channels and group DMs, never a 1:1 DM, which
   only ``disable_dms`` gates, as upstream's message handler does.
   Then the message is rewritten with the choice buttons replaced by
-  a line naming who chose what ("✓ <name>: label", the name as the workspace
-  shows it, a mention when it cannot be read; the same line goes above the
+  a line naming who chose what ("✓ <name>: label", by the clicker's display
+  name, then real name, then handle, never a mention or an id; the same line goes above the
   message's text, which is kept: an incident report is in that text and
   nowhere a later read of the thread looks); only when Slack refuses that
   rewrite is the same line posted in the thread instead, since a bot token
@@ -122,10 +122,10 @@ FLAG_ON_VALUES = frozenset({"1", "true", "yes", "on"})
 CHOICE_KIND = "kage choice"
 
 #: The line that replaces the answered buttons, posted in the thread instead
-#: when that rewrite fails, so a click always shows once. ``who`` is the
-#: answerer's name (:func:`answerer`), or :data:`MENTION` when it cannot be read.
-ANSWERED = "✓ {who}: {label}"
-MENTION = "<@{user}>"
+#: when that rewrite fails, so a click always shows once; naming the clicker as plain text.
+CLICKED = "✓ {name}: {label}"
+#: The clicker when Slack names them nowhere: never their raw id.
+NAMELESS_CLICKER = "Someone"
 
 #: Joins a label to the shown line its value names.
 TURN_JOIN = ": "
@@ -313,19 +313,23 @@ def answered_blocks(blocks: Any, answered: Any, note: str) -> list[dict]:
     return out[: MESSAGE_BLOCKS_MAX - 1] + [{"type": "context", "elements": [_clamped_text(note_text)]}]
 
 
-async def answerer(adapter: Any, user_id: str, channel_id: str, team_id: str = "") -> str:
-    """How the answered line names ``user_id``: their name as the adapter resolves it, escaped, else a mention.
+async def clicker_name(adapter: Any, body: dict, user_id: str, channel_id: str, team_id: str) -> str:
+    """The clicker's name as an answered line shows it, escaped: never a mention or their id.
 
-    The adapter's resolver caches, and answers with the id itself when users.info fails.
+    The adapter's ``_resolve_user_name`` reads ``users.info`` once per user and
+    caches the answer, preferring the display name, then the real name, then the
+    handle. It answers with the id when the call fails, so the click's own
+    handle stands in then.
     """
-    resolve = getattr(adapter, "_resolve_user_name", None)
-    name = ""
-    if resolve is not None:
-        try:
-            name = str(await resolve(user_id, chat_id=channel_id, team_id=team_id) or "")
-        except Exception:  # noqa: BLE001 — the mention still names them
-            name = ""
-    return _presenter._escape(name) if name and name != user_id else MENTION.format(user=user_id)
+    try:
+        name = str(await adapter._resolve_user_name(user_id, chat_id=channel_id, team_id=team_id) or "").strip()
+    except Exception as exc:  # noqa: BLE001 — the click still answers
+        logger.debug("slack_ux_clicks: could not name %s: %s", user_id, exc)
+        name = ""
+    if not name or name == user_id:
+        user = body.get("user") or {}
+        name = str(user.get("username") or user.get("name") or "").strip()
+    return _presenter._escape(name) if name and name != user_id else NAMELESS_CLICKER
 
 
 def _clamped_text(obj: Any) -> Any:
@@ -697,7 +701,7 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
         return
 
     shown = _presenter._escape(label)
-    note = ANSWERED.format(who=await answerer(adapter, user_id, channel_id, team_id), label=shown)
+    note = CLICKED.format(name=await clicker_name(adapter, body, user_id, channel_id, team_id), label=shown)
     # Before the awaits: a card that moves on in between settles its question and forgets it.
     card = _question_card(channel_id, msg_ts)
     rewritten = False

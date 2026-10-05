@@ -19,6 +19,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(SCRIPTS))
 
 import apply_slack_ux_moments as applier
+import slack_ux_clicks as clicks
 import slack_ux_moments as runtime
 import verify_slack_ux_moments as verifier
 
@@ -85,6 +86,10 @@ class _Adapter:
         self.replies = []
         self.reads = []
         self.unauthorized = set()
+        self.names = {"U7": "Priya"}
+
+    async def _resolve_user_name(self, user_id, chat_id="", team_id=""):
+        return self.names.get(user_id, user_id)
 
     def _event_declares_bot_sender(self, event):
         return False
@@ -335,6 +340,11 @@ class SettleQuestionTest(unittest.TestCase):
     def setUp(self):
         runtime._questions.clear()
         runtime._unsettled.clear()
+        # The image installs the clicks module as gateway.slack_ux_clicks; the answered line comes from it.
+        gateway = mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_clicks=clicks),
+                                                "gateway.slack_ux_clicks": clicks})
+        gateway.start()
+        self.addCleanup(gateway.stop)
 
     def test_rewrites_the_question_without_buttons_or_the_waiting_line(self):
         adapter = _Adapter()
@@ -378,9 +388,9 @@ class SettleQuestionTest(unittest.TestCase):
         _run(runtime.settle_question(adapter, SUB))
         update = adapter.updates[0]
         self.assertEqual(update["blocks"][-1], {
-            "type": "context", "elements": [{"type": "mrkdwn", "text": "✓ <@U7>: seeded-b please"}]})
+            "type": "context", "elements": [{"type": "mrkdwn", "text": "✓ Priya: seeded-b please"}]})
         head, _sep, rest = update["text"].partition("\n\n")
-        self.assertEqual(head, "✓ <@U7>: seeded-b please")
+        self.assertEqual(head, "✓ Priya: seeded-b please")
         self.assertIn("Which cluster?", rest)
         self.assertEqual(adapter.reads, [
             {"channel": "C0KAGE", "ts": SUB["thread_id"], "oldest": POSTED_TS, "limit": runtime.REPLIES_READ_MAX}])
@@ -390,10 +400,10 @@ class SettleQuestionTest(unittest.TestCase):
         _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
         adapter.replies = [{"ts": "1700000000.000400", "user": "U7", "text": "seeded-b " + "word " * 40}]
 
-        async def answerer(adapter_, user, channel, team_id=""):
+        async def clicker_name(adapter_, body, user, channel, team_id):
             return f"name-of-{user}-in-{channel}-{team_id}"
 
-        clicks = SimpleNamespace(answerer=answerer, answered=lambda channel, ts: False, clicked=lambda channel, ts: False)
+        clicks = SimpleNamespace(clicker_name=clicker_name, answered=lambda channel, ts: False, clicked=lambda channel, ts: False)
         with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_clicks=clicks), "gateway.slack_ux_clicks": clicks}):
             _run(runtime.settle_question(adapter, SUB))
         note = adapter.updates[0]["blocks"][-1]["elements"][0]["text"]
@@ -401,6 +411,28 @@ class SettleQuestionTest(unittest.TestCase):
         self.assertEqual(who, "✓ name-of-U7-in-C0KAGE-T1")
         self.assertLessEqual(len(words), runtime.TYPED_ANSWER_MAX)
         self.assertTrue(words.startswith("seeded-b word"))
+
+    def test_a_typed_answer_falls_back_to_its_profile_then_someone_never_a_mention(self):
+        for case, profile, modules, name in (
+            ("the reply's profile", {"display_name": "", "real_name": "Priya R"}, None, "Priya R"),
+            ("no profile", None, None, "Someone"),
+            ("no clicks module", {"real_name": "Priya R"},
+             {"gateway": SimpleNamespace(), "gateway.slack_ux_clicks": None}, "Someone"),
+        ):
+            with self.subTest(case=case):
+                runtime._questions.clear()
+                adapter = _Adapter()
+                adapter.names = {}
+                _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+                reply = {"ts": "1700000000.000400", "user": "U7", "text": "seeded-b"}
+                if profile is not None:
+                    reply["user_profile"] = profile
+                adapter.replies = [reply]
+                with mock.patch.dict(sys.modules, modules or {}):
+                    _run(runtime.settle_question(adapter, SUB))
+                note = adapter.updates[0]["blocks"][-1]["elements"][0]["text"]
+                self.assertEqual(note, f"✓ {name}: seeded-b")
+                self.assertNotIn("<@", adapter.updates[0]["text"])
 
     def test_no_reply_or_a_failed_read_settles_without_the_line(self):
         for replies in ([], [{"ts": "1700000000.000400", "user": "U0BOT", "bot_id": "B1", "text": "On it."}],
@@ -426,7 +458,7 @@ class SettleQuestionTest(unittest.TestCase):
             {"ts": "1700000000.000420", "user": "U7", "subtype": "thread_broadcast", "text": "seeded-b"},
         ]
         _run(runtime.settle_question(adapter, SUB))
-        self.assertEqual(adapter.updates[0]["blocks"][-1]["elements"][0]["text"], "✓ <@U7>: seeded-b")
+        self.assertEqual(adapter.updates[0]["blocks"][-1]["elements"][0]["text"], "✓ Priya: seeded-b")
 
     def test_a_typed_answer_shows_slack_entities_as_plain_text(self):
         adapter = _Adapter()
@@ -435,7 +467,7 @@ class SettleQuestionTest(unittest.TestCase):
                             "text": "<!channel> <https://example.com/x|seeded-b> &amp; <@U8> &lt;b&gt;"}]
         _run(runtime.settle_question(adapter, SUB))
         note = adapter.updates[0]["blocks"][-1]["elements"][0]["text"]
-        self.assertEqual(note, "✓ <@U7>: !channel seeded-b &amp; @U8 &lt;b&gt;")
+        self.assertEqual(note, "✓ Priya: !channel seeded-b &amp; @U8 &lt;b&gt;")
 
     def test_a_click_whose_rewrite_failed_settles_without_a_typed_line(self):
         adapter = _Adapter()
