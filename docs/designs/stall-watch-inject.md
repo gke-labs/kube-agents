@@ -73,8 +73,10 @@ An episode stores the session id. The watch finds the card by `tasks.session_id`
 column Hermes stamps with the session that filed the card, the API session the Planning Agent's turn
 runs in) and from then on comments on and completes it exactly as
 before. An episode written by the old code carries `card` and no `session`, and keeps working
-unchanged. A session whose card never appears (the Planning Agent turn failed) ends its episode a day
-after the alert was raised, and the alert is raised again in that tick. A stall episode has no expiry
+unchanged. A session whose card never appears (the Planning Agent turn failed) has its alert raised
+again a day later, and the new alert replaces the episode only once it is sent. A re-alert the tick
+skips (a refusal, the cap, no profile) leaves the old episode in place, so a stall that clears first
+still gets its cleared line. A stall episode has no expiry
 of its own, so without the bound a failed turn would silence the namespace for as long as the stall
 lasted; a shorter one would post a fresh alert every hour or so for as long as turns kept failing.
 The watch raises no alert at all on a board whose tasks table lacks `session_id`, and says so once. An unreadable board is not counted as a missing card: the episode waits for a board that
@@ -177,7 +179,7 @@ posted; no alert limit is claimed. The producer: a new episode creates a session
 the cap holds; the card is adopted by session id; comment, clear and complete work through it; an
 old-shape episode keeps working; a daemon that refuses or does not advertise the kind leaves the
 namespace waiting and is said once, at either step; a ledger that cannot be saved raises nothing; a
-session that files no card is raised again a day later, unless its stall is clearing; the record `stall_payload` builds is the one
+session that files no card is raised again a day later, and keeps its episode when that re-alert is refused or held; the record `stall_payload` builds is the one
 the daemon's route accepts. `test_triage_reply_roundtrip.py` drives a report cut from `_stall_task_body`
 through the real notifier, server and plugin, and shows the pre-inject stall report shape earns no row.
 

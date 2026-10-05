@@ -321,8 +321,8 @@ INJECT_KINDS_KEY = "inject_kinds"
 SESSION_ID_KEY = "sessionID"
 MESSAGE_KEY = "message"
 STATUS_KEY = "status"
-#: An alert whose session has filed no card a day after it was raised ends its
-#: episode, so the stall is raised again: the Planning Agent turn it started
+#: An alert whose session has filed no card a day after it was raised is raised
+#: again, and the new alert replaces its episode: the Planning Agent turn it started
 #: failed, and a stall can outlast that by days. A day rather than a few ticks,
 #: because a shorter retry posts a fresh "digging down" alert every hour or so
 #: for as long as the turns keep failing.
@@ -1052,7 +1052,9 @@ def open_session() -> str:
         if INJECT_KIND not in (session_kv(HEALTHZ_PATH).get(INJECT_KINDS_KEY) or []):
             raise AlertRefused(f"the Session KV server does not advertise the {INJECT_KIND} inject kind")
         session_id = session_kv(SESSIONS_PATH, method="POST").get(SESSION_ID_KEY)
-    except (OSError, ValueError) as exc:  # URLError and HTTPError are OSErrors
+    except urllib.error.HTTPError as exc:
+        raise AlertRefused(f"the Session KV server answered with an error: {exc}") from exc
+    except (OSError, ValueError) as exc:  # URLError is an OSError
         raise AlertRefused(f"the Session KV server could not be reached: {exc}") from exc
     if not session_id:
         raise AlertRefused("the Session KV server returned no session id")
@@ -1224,8 +1226,8 @@ def scope_rows(state: dict, scope: str) -> list[dict]:
 
 
 def would_raise(state: dict, sweep: Sweep, scope: str) -> bool:
-    """Whether a scope with no episode is a candidate for an alert this tick:
-    read this tick, with a row not on its way out."""
+    """Whether a scope is a candidate for an alert this tick: read this tick,
+    with a row not on its way out."""
     return scope in sweep.read_scopes and any(not e.get("missed") for e in scope_rows(state, scope))
 
 
@@ -1288,12 +1290,13 @@ def comment_pending(episode: dict, namespace: str) -> None:
         episode["pending"] = []
 
 
-def adopt_cards(state: dict, sweep: Sweep, now: str) -> None:
-    """Look up the card each open alert's session filed. An alert whose session
-    has filed none UNFILED_ALERT_RETRY_SECONDS after it was raised ends its
-    episode, so the scope is a candidate again and its alert is raised again in
-    this same tick."""
+def adopt_cards(state: dict, now: str) -> set[str]:
+    """Look up the card each open alert's session filed, and return the scopes
+    whose session has filed none UNFILED_ALERT_RETRY_SECONDS after the alert.
+    Their episodes stay until a new alert replaces them or the clearing step
+    ends them, so a skipped re-alert still leaves the clear to be said."""
     episodes = state.setdefault(EPISODES_KEY, {})
+    expired: set[str] = set()
     for scope in sorted(episodes):
         episode = episodes[scope]
         if episode.get("card") or not episode.get(SESSION_KEY):
@@ -1307,11 +1310,16 @@ def adopt_cards(state: dict, sweep: Sweep, now: str) -> None:
             waited = (datetime.fromisoformat(now) - datetime.fromisoformat(str(episode.get("opened_at")))).total_seconds()
         except (ValueError, TypeError):  # TypeError: a hand-edited time with no timezone
             waited = UNFILED_ALERT_RETRY_SECONDS
-        # Ended only when the stall is raised again this tick; otherwise the
-        # clearing step, or a later tick, owns the episode.
-        if waited >= UNFILED_ALERT_RETRY_SECONDS and would_raise(state, sweep, scope):
-            sys.stderr.write(f"stall_watch: session {episode[SESSION_KEY]} filed no card for {scope} since {episode.get('opened_at')}; its episode ends and the alert is raised again\n")
-            end_episode(state, scope)
+        if waited >= UNFILED_ALERT_RETRY_SECONDS:
+            expired.add(scope)
+    return expired
+
+
+def restore_episode(episodes: dict, scope: str, previous: dict | None) -> None:
+    if previous is None:
+        episodes.pop(scope, None)
+    else:
+        episodes[scope] = previous
 
 
 def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scope: dict, now: str, *, dry_run: bool = False, persist=None) -> list[str]:
@@ -1327,15 +1335,15 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
     the same alerts again on every tick that follows."""
     episodes = state.setdefault(EPISODES_KEY, {})
     lines: list[str] = []
-    if not dry_run:
-        adopt_cards(state, sweep, now)
-    # Every scope read this tick that has rows and no episode is a candidate,
-    # whether its objects appeared now or it has waited: past the cap, after a
-    # refused alert, or with no profile. Oldest first sighting first.
+    expired = set() if dry_run else adopt_cards(state, now)
+    # Every scope read this tick that has rows and no episode, or an episode
+    # whose alert expired with no card, is a candidate, whether its objects
+    # appeared now or it has waited: past the cap, after a refused alert, or
+    # with no profile. Oldest first sighting first.
     candidates = dict(new_by_scope)
     for entry in state["stalls"].values():
         scope = scope_key(entry["cluster"], entry["namespace"])
-        if scope not in candidates and scope not in episodes and would_raise(state, sweep, scope):
+        if scope not in candidates and (scope not in episodes or scope in expired) and would_raise(state, sweep, scope):
             candidates[scope] = []
     raised = held = 0
     refusal: str | None = None
@@ -1344,7 +1352,9 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
         new_rows = candidates[scope]
         cid, namespace = split_scope(scope)
         project, name, location = split_cluster_id(cid)
-        episode = episodes.get(scope)
+        # An expired episode is replaced only by an alert that is sent.
+        previous = episodes.get(scope)
+        episode = None if scope in expired else previous
         # An alert carries every object the scope holds, not only the ones that
         # appeared this tick.
         seen = {(r["object"], r["heuristic"], r["detail"]) for r in new_rows}
@@ -1412,11 +1422,11 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
         except RecordRefused as exc:
             # This record's fault, not the server's: the next namespace in line
             # still gets its alert.
-            episodes.pop(scope, None)
+            restore_episode(episodes, scope, previous)
             sys.stderr.write(f"stall_watch: no alert for {scope}: {exc}\n")
             continue
         except AlertRefused as exc:
-            episodes.pop(scope, None)
+            restore_episode(episodes, scope, previous)
             refusal = str(exc)
             sys.stderr.write(f"stall_watch: no alert for {scope}: {refusal}\n")
             continue

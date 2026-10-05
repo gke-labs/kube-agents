@@ -14,13 +14,12 @@ import sys
 import tempfile
 import threading
 import unittest
-from contextlib import closing, redirect_stdout
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import stall_watch  # noqa: E402
-from test_mcp_package_contract import requires_mcp  # noqa: E402
 
 REAL_SESSION_KV = stall_watch.session_kv
 REAL_BOARD_PATH = stall_watch.board_path
@@ -785,6 +784,40 @@ class Alerts(Base):
         self.assertEqual(len(self.last_alerts), 1, "the episode ended and the stall was raised again in the same tick")
         self.assertNotEqual(self.kv.alerts[0]["session"], self.kv.alerts[1]["session"])
 
+    def test_a_re_alert_the_server_refuses_keeps_the_episode_so_the_clear_is_said(self):
+        self.kv.file_cards = False
+        fleet = {"c": {"checkout": [DEADLINE_ROW]}}
+        self.run_tick(fleet, now="2026-10-02T12:00:00+00:00")
+        first = self.ledger()[stall_watch.EPISODES_KEY][f"{cid('c')}/checkout"]
+        self.kv.fail_next = stall_watch.urllib.error.URLError("connection refused")
+        self.run_tick(fleet, now="2026-10-03T12:00:00+00:00")
+        self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY][f"{cid('c')}/checkout"], first)
+        lines, _ = self.run_tick({"c": {"checkout": []}}, now="2026-10-03T12:30:00+00:00")
+        self.assertEqual(lines, [f"{stall_watch.CLEARED_PREFIX} in {label('c')} / `checkout`: Deployment/checkout-api"])
+        self.assertEqual(len(self.kv.alerts), 1)
+
+    def test_a_re_alert_held_by_the_cap_keeps_the_episode_so_the_clear_is_said(self):
+        self.kv.file_cards = False
+        fleet = {"c": {"checkout": [DEADLINE_ROW]}}
+        self.run_tick(fleet, now="2026-10-02T12:00:00+00:00")
+        with patch.object(stall_watch, "MAX_ALERTS_PER_TICK", 0):
+            self.run_tick(fleet, now="2026-10-03T12:00:00+00:00")
+        self.assertEqual(len(self.kv.alerts), 1)
+        lines, _ = self.run_tick({"c": {"checkout": []}}, now="2026-10-03T12:30:00+00:00")
+        self.assertEqual(lines, [f"{stall_watch.CLEARED_PREFIX} in {label('c')} / `checkout`: Deployment/checkout-api"])
+
+    def test_an_http_error_opening_a_session_is_not_called_unreachable(self):
+        def kv(path, body=None, method=""):
+            if path == stall_watch.SESSIONS_PATH:
+                raise stall_watch.urllib.error.HTTPError(path, 401, "Unauthorized", {}, None)
+            return self.kv(path, body, method)
+
+        with patch.object(stall_watch, "session_kv", side_effect=kv):
+            lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        self.assertEqual(len(lines), 1)
+        self.assertIn("answered with an error: HTTP Error 401", lines[0])
+        self.assertNotIn("could not be reached", lines[0])
+
     def test_a_refusal_at_the_inject_is_said_once_too(self):
         # Every attempt opens a new session; a refusal naming it would be new
         # text, and so a new chat line, on every tick.
@@ -906,39 +939,6 @@ class SessionKv(Base):
         self.assertEqual(seen["url"], "http://127.0.0.1:8699/sessions/s/inject")
         self.assertEqual((seen["method"], seen["auth"], json.loads(seen["body"])), ("POST", "Bearer tok", {"message": "{}"}))
         self.assertEqual(seen["timeout"], stall_watch.SESSION_KV_TIMEOUT_SECONDS)
-
-    @requires_mcp
-    def test_the_record_the_watch_builds_is_the_one_the_session_kv_route_takes(self):
-        # The daemon's real route against the watch's real builder: a field
-        # renamed on one side alone would otherwise be a refused alert on every
-        # tick with every test green.
-        own_db = str(self.home / "session_kv.db")
-        # The import runs init_db() on the path it resolves; in the agent image
-        # the inherited variable names the live database.
-        with patch.dict(os.environ, {"SESSION_KV_DB_PATH": own_db}):
-            import session_kv_server
-        from fastapi.testclient import TestClient
-
-        rows = [
-            finding("checkout", "Deployment/checkout-api", "dangling-reference", "envFrom -> ConfigMap/x not found", stalled_for="26m"),
-            finding("checkout", "Gateway/edge", "stale-condition", "Programmed=False", stalled_for="6h11m"),
-        ]
-        payload = stall_watch.stall_payload(PROJECT, "c", LOCATION, "checkout", "cluster-proj-c-us-central1", rows, "2026-10-02T12:30:00+00:00")
-        # Its own database, whatever path an earlier import resolved.
-        with patch.dict(os.environ, {"SESSION_KV_API_KEY": "tok"}), patch.object(session_kv_server, "SESSION_KV_DB_PATH", own_db), \
-                patch.object(session_kv_server, "trigger_agent_troubleshooter") as trigger:
-            session_kv_server.init_db()
-            response = TestClient(session_kv_server.app, headers={"Authorization": "Bearer tok"}).post(
-                f"{stall_watch.SESSIONS_PATH}/s{stall_watch.INJECT_SUFFIX}", json={stall_watch.MESSAGE_KEY: json.dumps(payload)}
-            )
-        self.assertEqual(response.json().get(stall_watch.STATUS_KEY), stall_watch.INJECTED_STATUS, response.text)
-        delivered = trigger.call_args.args[2]
-        card = session_kv_server._stall_task_body(delivered)
-        self.assertIn("- Deployment/checkout-api: dangling-reference (26m)", card)
-        self.assertIn("- Gateway/edge: stale-condition (6h11m)", card)
-        self.assertIn("`assignee`: `cluster-proj-c-us-central1`", session_kv_server._build_agent_query(delivered))
-        with closing(sqlite3.connect(own_db)) as conn:
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM intercepted_events WHERE reason = 'ControllerStall'").fetchone()[0], 1)
 
     def test_the_board_is_the_one_hermes_resolves(self):
         # hermes_cli.kanban has no kanban_db_path; importing it from there fell

@@ -101,8 +101,8 @@ KV server refuses an alert, said once until the reason changes, with a line
 when alerts are raised again. It also carries the sweep-failed and sweep-recovered lines
 every roster entry owes. A new stall's notice is the alert the Session KV server
 posts. A namespace whose alert has produced no card a day after it was raised
-(the Planning Agent's turn failed) has its episode ended and its alert raised
-again in that tick; a shorter retry would post a fresh alert every hour or so
+(the Planning Agent's turn failed) has its alert raised again, and the new
+alert replaces the episode once it is sent; a shorter retry would post a fresh alert every hour or so
 for as long as the turns kept failing. Alerts are not raised at all on a board
 whose tasks table has no `session_id` column, since the card an alert produces
 could not be found. The watch saves its ledger before each inject and fails
