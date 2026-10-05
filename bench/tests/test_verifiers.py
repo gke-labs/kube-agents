@@ -6785,3 +6785,73 @@ def test_the_chat_voice_patterns_cross_a_line_break_as_they_did_on_the_flat_text
     v = ReportContainsVerifier(type="report_contains", any_of_patterns=_any_of_patterns_of(case_name))
     transcript.set(final_message, [], final_message=final_message)
     assert v.verify(1.0).success is matches, final_message
+
+
+# ------------------------------- the fail-closed webhook readiness case's lines
+#
+# The readiness case's declared line, read out of its task file: seeded-b's
+# gate must sit in the "no backend" slot and never among the blockers, and
+# the yes/no must be no. Same fold and grounding as the zonal case.
+
+_WEBHOOK_CASE = TASKS / "upgrades-fleet-readiness-failclosed-webhook" / "task.yaml"
+_WEBHOOK_SPEC = yaml.safe_load(_WEBHOOK_CASE.read_text(encoding="utf-8"))
+_WEBHOOK_OBJECTIVES = (
+    "seeded-b-has-a-declared-line",
+    "seeded-b-names-the-gate-as-a-webhook-with-no-backend",
+    "seeded-b-does-not-blame-the-gate-for-the-upgrade",
+    "seeded-b-names-a-real-blocker",
+)
+
+
+def _webhook_case_verdict(objective: str, text: str):
+    check = next(e["check"] for e in _WEBHOOK_SPEC["verification_spec"] if e["name"] == objective)
+    v = parse_node(check)
+    _stash(text)
+    with tempfile.TemporaryDirectory(prefix="webhook-fleet-") as root:
+        _write_fleet_dir(Path(root), list(_WEBHOOK_SPEC["fixtures"]))
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            return v.verify(5.0)
+
+
+def _webhook_line(blockers="PodDisruptionBudget pinned-batch-runner, maintenance exclusion hold-the-minor-lag", hooks="seeded-fail-closed-gate", blocks="no") -> str:
+    return f"seeded-b: upgrade blockers: {blockers}; fail-closed webhooks with no backend: {hooks}; any of them blocks the upgrade: {blocks}"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        _webhook_line(),
+        "- " + _webhook_line() + ".",
+        "**" + _webhook_line() + "**",
+        "haoxuw-gke-dev-seeded-b-us-central1-a: " + _webhook_line().split(": ", 1)[1],
+        _webhook_line(hooks="seeded-fail-closed-gate (gate.seeded.invalid)"),
+        _webhook_line(blockers="hold-the-minor-lag exclusion"),
+    ],
+)
+def test_webhook_readiness_declared_line_accepted(text):
+    for objective in _WEBHOOK_OBJECTIVES:
+        assert _webhook_case_verdict(objective, text).status == "pass", (objective, text)
+
+
+@pytest.mark.parametrize(
+    "text, failing",
+    [
+        # the gate listed among the blockers, in any wording
+        (_webhook_line(blockers="PDB pinned-batch-runner, seeded-fail-closed-gate"), "seeded-b-does-not-blame-the-gate-for-the-upgrade"),
+        (_webhook_line(blockers="the fail-closed webhook and the exclusion"), "seeded-b-does-not-blame-the-gate-for-the-upgrade"),
+        # yes to the question
+        (_webhook_line(blocks="yes"), "seeded-b-does-not-blame-the-gate-for-the-upgrade"),
+        # the gate not found
+        (_webhook_line(hooks="none"), "seeded-b-names-the-gate-as-a-webhook-with-no-backend"),
+        # no blocker named at all
+        (_webhook_line(blockers="none"), "seeded-b-names-a-real-blocker"),
+        # a hedged value
+        (_webhook_line(blocks="probably no"), "seeded-b-has-a-declared-line"),
+        # prose with the same words, no declared line
+        ("seeded-b is blocked by its budget; seeded-fail-closed-gate has no backend and does not block the upgrade.", "seeded-b-has-a-declared-line"),
+        # another cluster's line only
+        (_webhook_line().replace("seeded-b:", "seeded-a:"), "seeded-b-has-a-declared-line"),
+    ],
+)
+def test_webhook_readiness_declared_line_refused(text, failing):
+    assert _webhook_case_verdict(failing, text).status != "pass", (failing, text)
