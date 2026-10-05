@@ -753,11 +753,12 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # See the module docstring in
 # deploy/docker/patches/apply_slack_reactions_scope.py.
 #
-# Slack: with KAGE_SLACK_UX on, react to each ask by its kind (eyes, hammer and
-# wrench, clipboard, rotating light) and add a settle reaction beside it when
-# the work ends, never removing one -- the credential proxy refuses reactions.remove,
-# so upstream's eyes-for-a-tick swap leaves both. The two hooks gain a guard
-# that hands over to gateway/slack_ux_reactions.py; with the flag off they run
+# Slack: with KAGE_SLACK_UX on, track how the work each ask started settles,
+# reacting only with an x on one whose work failed (SHOW_ARRIVAL and
+# SHOWN_SETTLES hold the rest back), never removing one -- the credential
+# proxy refuses reactions.remove, so upstream's eyes-for-a-tick swap leaves
+# both. The two hooks gain a guard that hands over to
+# gateway/slack_ux_reactions.py; with the flag off they run
 # upstream's body untouched. slack_presenter.py is staged here only so the
 # verifier can import it; the image ships it under /opt/defaults/scripts. Also
 # rides this COPY and RUN. See deploy/docker/patches/slack_ux_reactions.py.
