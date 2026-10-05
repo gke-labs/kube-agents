@@ -25,6 +25,8 @@ HEADING_PADDING = 60000
 MARKER_REPEATS = 8000
 #: A relayed line of this many unclosed "<!" (96 KB) took 2 seconds while a mention scanned past a "<".
 MENTION_REPEATS = 48000
+#: A title of this many "new" tags; matching the run as one group was quadratic in it.
+TAG_REPEATS = 20000
 #: The link pass of Hermes' ``SlackAdapter.format_message``, which every text post goes through:
 #: whatever it matches reaches Slack as a live ``<url|label>`` link.
 HERMES_TEXT_LINK = re.compile(r"(?<!!)\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)")
@@ -208,6 +210,16 @@ class HeadlineFromIssueTest(unittest.TestCase):
         )
         lines = sar.headline_from_issue(dict(ISSUE, body=body), REF, REPORT).splitlines()
         self.assertEqual(lines[2], "`critical` seeded-c: a ClusterRole grants `*` on secrets")
+        for claim in (" ·  _new_", " • _new_", " — _NEW_", " · _new_.", " *new*", " · _new_ — _new_"):
+            with self.subTest(claim=claim):
+                body = BODY.replace("seeded-c: a ClusterRole grants `*` on secrets", "seeded-c: secrets" + claim)
+                lines = sar.headline_from_issue(dict(ISSUE, body=body), REF, REPORT).splitlines()
+                self.assertEqual(lines[2], "`critical` seeded-c: secrets")
+        for kept in ("seeded-c: the foo_new_ deployment", "seeded-c: renewed"):
+            with self.subTest(kept=kept):
+                body = BODY.replace("seeded-c: a ClusterRole grants `*` on secrets", kept)
+                lines = sar.headline_from_issue(dict(ISSUE, body=body), REF, REPORT).splitlines()
+                self.assertEqual(lines[2], f"`critical` {kept}")
 
     def test_the_tag_survives_a_title_clipped_to_the_row(self):
         title = "x" * 400
@@ -231,6 +243,15 @@ class HeadlineFromIssueTest(unittest.TestCase):
             sar.headline_from_issue(issue, REF).splitlines(),
             ["**Workload Reliability Audit: 3 major findings**", "`major` a", "`major` b", "3 more (1 major, 2 minor) are in the ledger issue.", LINK],
         )
+
+    def test_a_summary_count_no_section_lists_does_not_lead(self):
+        body = (
+            "3 findings: 1 critical, 1 major, 1 minor.\n\n### Major (1)\n\n"
+            + finding("a", "a") + "\n### Minor (1)\n\n" + finding("d", "d")
+        )
+        issue = dict(ISSUE, title="[audit] Workload Reliability Audit — 3 findings (0 critical)", body=body)
+        lines = sar.headline_from_issue(issue, REF).splitlines()
+        self.assertEqual(lines[:2], ["**Workload Reliability Audit: 1 major finding**", "`major` a"])
 
     def test_without_a_summary_the_sections_are_counted(self):
         body = BODY.replace("7 findings: 2 critical, 1 major, 4 minor.\n\n", "")
@@ -269,6 +290,9 @@ class HeadlineFromIssueTest(unittest.TestCase):
     def test_a_closed_ledger_under_a_line_counting_findings_does_not_parse(self):
         self.assertIsNone(sar.headline_from_issue(dict(ISSUE, state="closed"), REF, REPORT))
         self.assertIsNone(sar.headline_from_issue(dict(ISSUE, state="closed"), REF, f"Audit: 7 findings — {LEDGER}"))
+        self.assertIsNone(
+            sar.headline_from_issue(dict(ISSUE, state="closed"), REF, f"Workload Reliability Audit: 2 critical — {LEDGER}")
+        )
         self.assertIsNone(sar.headline_from_issue(dict(ISSUE, state=""), REF, ""))
         self.assertIsNone(sar.headline_from_issue(dict(ISSUE, state="closed", labels=["bug"]), REF, ""))
     def test_an_issue_without_the_ledger_label_does_not_parse(self):
@@ -631,6 +655,14 @@ class HeadlineFromIssueTest(unittest.TestCase):
         start = time.monotonic()
         sar._row_text(mentions)
         self.assertLess(time.monotonic() - start, FAST_SECONDS)
+
+    def test_a_title_of_repeated_tags_stays_linear(self):
+        # A pattern matching the tag run as one group took 27 seconds on 20,000 tags before a word.
+        for title in ("_new_ " * TAG_REPEATS + "x", " · _new_" * TAG_REPEATS):
+            with self.subTest(title=title[-8:]):
+                start = time.monotonic()
+                sar._untagged(title)
+                self.assertLess(time.monotonic() - start, FAST_SECONDS)
 
     def test_unclosed_mentions_survive_into_the_fallback_headline(self):
         # The headline reads only LINE_READ_MAX of the line, so this is fast

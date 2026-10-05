@@ -128,6 +128,11 @@ FINDING_HEADING = re.compile(
 #: lines aside, when the run measured the finding as new since the last.
 NEW_MARKER = re.compile(r"\n(?:[ \t]*\n)*[ \t]*<!--[ \t]*finding-new[ \t]*-->[ \t]*$", re.MULTILINE)
 NEW_TAG = " · _new_"
+#: A title's own trailing "new" tag in any spelling (``·  _new_``, ``• *new*``, ``— _NEW_.``),
+#: which only the marker may add; searched for in the last TAG_CLAIM_REACH characters only,
+#: so a title of thousands of tags is stripped one at a time rather than rescanned from each.
+TAG_CLAIM = re.compile(r"[\s·•—–-]+[_*]new[_*][\s.]*\Z", re.IGNORECASE)
+TAG_CLAIM_REACH = 64
 #: A code fence line, opening or closing: a finding's evidence command sits in one.
 FENCE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
 #: A finding heading: a fence with no closer before it is one the model left open.
@@ -172,6 +177,8 @@ FINDINGS_TOTAL = re.compile(r"\b(?P<count>\d{1,9}|no|zero)\s+findings?\b", re.IG
 #: The other counts an SOP line states for a run that changed its ledger:
 #: "<n> resolved", and a count by severity ("2 critical, 6 major").
 CHANGE_COUNT = re.compile(r"\b(?P<count>\d{1,9})\s+(?:new|resolved|critical|major|minor)\b", re.IGNORECASE)
+#: A count by severity alone ("2 critical"), which a clean run's line never states above 0.
+SEVERITY_COUNT = re.compile(r"\b(?P<count>\d{1,9})\s+(?:critical|major|minor)\b", re.IGNORECASE)
 #: A line describing a clean, held or carried run, which leaves the ledger open
 #: over the last run's title even when it counts the carried findings by severity.
 ZERO_FINDING_RUN = re.compile(r"\b(?:clean|held|carried|nothing\s+reproduced)\b", re.IGNORECASE)
@@ -546,7 +553,7 @@ def _clean_name(issue: dict, report: str) -> str | None:
     if not title:
         return None
     line = _ledger_line(report)
-    if (_findings_total(line) or 0) or (_new_count(line) or 0):
+    if (_findings_total(line) or 0) or (_new_count(line) or 0) or any(int(n) for n in SEVERITY_COUNT.findall(line)):
         return None
     return _row_text(title.group("name")).strip()
 
@@ -605,11 +612,11 @@ def _unreached(parsed: AuditReport) -> str:
 
 def _untagged(title: str) -> str:
     """`title` without a trailing "new" tag of its own, which only the marker may add."""
-    tag = NEW_TAG.strip()
-    title = title.rstrip()
-    while title.endswith(tag):
-        title = title[: -len(tag)].rstrip()
-    return title
+    # The space ahead lets a title that is only a tag match a separator.
+    text = " " + title.rstrip()
+    while match := TAG_CLAIM.search(text, max(0, len(text) - TAG_CLAIM_REACH)):
+        text = text[: match.start()]
+    return text[1:].rstrip()
 
 
 def _row(finding: Finding) -> dict:
@@ -623,7 +630,12 @@ def _card(parsed: AuditReport) -> Card:
     :data:`CRITICAL_ROWS_MAX` when they are critical and the top two otherwise; a line counts
     the rest by severity."""
     totals = parsed.totals
-    severity = next(level for level in SEVERITIES if totals[level])
+    # The most severe level the body lists leads, so a count no section backs cannot give a rowless card.
+    listed_levels = {finding.severity for finding in parsed.findings}
+    severity = next(
+        (level for level in SEVERITIES if totals[level] and level in listed_levels),
+        next(level for level in SEVERITIES if totals[level]),
+    )
     listed = [finding for finding in parsed.findings if finding.severity == severity]
     shown = listed[: CRITICAL_ROWS_MAX if severity == CRITICAL else TOP_FINDINGS]
     count = totals[severity]
