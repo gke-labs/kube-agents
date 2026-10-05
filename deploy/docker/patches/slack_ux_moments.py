@@ -95,15 +95,21 @@ WAKE_NOTE = (
     "The specialist's question is already posted to the user as its own message, in the "
     "specialist's words. Do not restate, paraphrase or acknowledge it. If nothing else "
     "in this notification needs saying, reply with exactly [SILENT]. When the user answers, "
-    "typed or clicked, carry the answer to the card with kanban_comment, then kanban_unblock, "
-    "and reply with exactly [SILENT] unless they also asked something else: the question "
-    "already shows who answered and what."
+    "typed or clicked, carry the answer to the card with kanban_comment, then kanban_unblock. "
+    "Once kanban_unblock succeeds, reply with exactly [SILENT] unless they also asked something "
+    "else: the question already shows who answered and what. If it failed, say so."
 )
 
 #: The answered line a typed answer gets, as ``slack_ux_clicks.CLICKED``, and its
 #: name when the clicks module is missing.
 ANSWERED = "✓ {who}: {label}"
 NAMELESS = "Someone"
+
+#: The card events that mean its question was answered: it was unblocked, so it resumed.
+#: Any other (archived, dragged to done, gave up) settles the question without a typed line.
+ANSWERED_KINDS = frozenset({"unblocked", "claimed", "heartbeat"})
+#: What :func:`settle_question` assumes when it is not told the event.
+UNBLOCKED_KIND = "unblocked"
 
 #: A typed answer's words on its answered line are clipped to this.
 TYPED_ANSWER_MAX = 80
@@ -310,15 +316,22 @@ def _after(ts: Any, since: str) -> bool:
         return False
 
 
-def _by_a_person(adapter: Any, reply: Any, channel: str, team_id: str) -> bool:
-    """Whether ``reply`` is a person the adapter would answer typing, as a click's check asks it."""
+async def _by_a_person(adapter: Any, reply: Any, channel: str, team_id: str, thread: str) -> bool:
+    """Whether ``reply`` is a person the adapter would answer typing, as a click's check asks it:
+    not a bot, authorized, and through the channel gate with its mention rules. A group DM is asked
+    as a channel, since the subscription does not say which it is, so there it may count too few.
+    Without the clicks module, whose gate check this borrows, no reply counts."""
     if not (isinstance(reply, dict) and reply.get("user") and str(reply.get("text") or "").strip()):
         return False
     if reply.get("bot_id") or (reply.get("subtype") and reply.get("subtype") not in TYPED_SUBTYPES):
         return False
     try:
-        return not adapter._event_declares_bot_sender(reply) and bool(
-            adapter._is_interactive_user_authorized(reply["user"], channel_id=channel, team_id=team_id)
+        from gateway import slack_ux_clicks
+
+        return (
+            not adapter._event_declares_bot_sender(reply)
+            and bool(adapter._is_interactive_user_authorized(reply["user"], channel_id=channel, team_id=team_id))
+            and await slack_ux_clicks._gateway_hears(adapter, reply, channel, team_id, thread, False)
         )
     except Exception:  # noqa: BLE001 — not counted; the question settles without the line
         return False
@@ -345,14 +358,14 @@ async def _typed_note(adapter: Any, client: Any, sub: dict, channel: str, ts: st
         return ""
     team_id = str(sub.get("team_id") or "")
     for reply in sorted(replies, key=lambda r: float(r["ts"])):
-        if _by_a_person(adapter, reply, channel, team_id):
+        if await _by_a_person(adapter, reply, channel, team_id, thread):
             words = _presenter._clip(" ".join(_plain(str(reply["text"])).split()), TYPED_ANSWER_MAX)
             who = await _who(adapter, reply, channel, team_id)
             return ANSWERED.format(who=who, label=_presenter._escape(words))
     return ""
 
 
-async def _settled(adapter: Any, sub: dict, entry: tuple) -> bool:
+async def _settled(adapter: Any, sub: dict, entry: tuple, kind: str = UNBLOCKED_KIND) -> bool:
     """Rewrite one question without its buttons, under its typed answer's line; True once it needs nothing more."""
     _event_id, channel, ts, blocks, text = entry
     if not ts or _clicked(channel, ts):
@@ -360,7 +373,9 @@ async def _settled(adapter: Any, sub: dict, entry: tuple) -> bool:
     try:
         client = adapter._get_client(channel, team_id=sub.get("team_id") or None)
         # A click whose rewrite failed posted its own line; a later reply is not the answer.
-        note = "" if _clicked(channel, ts, rewritten=False) else await _typed_note(adapter, client, sub, channel, ts)
+        # So does a card that moved on unanswered.
+        answered = kind in ANSWERED_KINDS and not _clicked(channel, ts, rewritten=False)
+        note = await _typed_note(adapter, client, sub, channel, ts) if answered else ""
         settled_text = _without_choices(text)
         await client.chat_update(
             channel=channel,
@@ -374,8 +389,11 @@ async def _settled(adapter: Any, sub: dict, entry: tuple) -> bool:
     return True
 
 
-async def settle_question(adapter: Any, sub: dict) -> None:
+async def settle_question(adapter: Any, sub: dict, kind: str = UNBLOCKED_KIND) -> None:
     """Take the buttons and "waiting on you" off the card's open question, if it has one.
+
+    ``kind`` is the card event that moved it on; only one in :data:`ANSWERED_KINDS` puts a
+    typed reply's line on the question.
 
     The question is forgotten only once the rewrite succeeds (or a click has
     answered it), so a failed rewrite is retried on the card's next event and
@@ -384,12 +402,12 @@ async def settle_question(adapter: Any, sub: dict) -> None:
     """
     key = _sub_key(sub)
     for stale_key, stale in [item for item in _unsettled.items() if item[0][0] == key]:
-        if await _settled(adapter, sub, stale) and _unsettled.get(stale_key) is stale:
+        if await _settled(adapter, sub, stale, kind) and _unsettled.get(stale_key) is stale:
             _unsettled.pop(stale_key, None)
     entry = _questions.get(key)
     if entry is None:
         return
-    if await _settled(adapter, sub, entry) and _questions.get(key) is entry:
+    if await _settled(adapter, sub, entry, kind) and _questions.get(key) is entry:
         _questions.pop(key, None)
 
 

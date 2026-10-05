@@ -3206,6 +3206,29 @@ def test_a_question_wake_sends_the_wake_then_the_answer_on_one_conversation(
     assert _archived(scripts)
 
 
+_CLICK_TURN = f"seeded-b\n\n(Clicked on the question from card {_REPLAY_CARD}.)"
+
+
+def test_an_answer_by_click_sends_the_click_turn_not_the_typed_answer(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    planted = json.dumps(
+        {"card": _REPLAY_CARD, "wake": _REPLAY_WAKE, "posted": 1, "click": _CLICK_TURN, "error": None}
+    )
+    scripts: list[str] = []
+    monkeypatch.setattr(
+        harness, "_agent_shell", _replay_shell(scripts, plant_reply=f"{card_wake.REPLAY_PRESENT}\n{planted}")
+    )
+    stub_agent.turns = [_turn(_text("[SILENT]")), _answer_turn()]
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT + "answer_by: click\n")
+
+    assert not result.has_errors()
+    assert [r["input"] for r in stub_agent.requests] == [_REPLAY_WAKE, _CLICK_TURN]
+    assert stub_agent.requests[0]["conversation"] == stub_agent.requests[1]["conversation"]
+    assert result.trajectory[-1]["args"]["answer_reply"] == "Passed seeded-b to the card."
+
+
 def test_the_next_run_gets_a_fresh_conversation_after_a_question_wake(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
 ) -> None:

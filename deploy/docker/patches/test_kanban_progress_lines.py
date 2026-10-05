@@ -1222,6 +1222,7 @@ class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
         self.posts_question = True
         self.settled = []
         self.questions_settled = []
+        self.question_kinds = []
         self.asked_event = 0
         test = self
 
@@ -1238,8 +1239,9 @@ class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
         async def settle_delegated(adapter, sub, kind, board=None):
             test.settled.append((sub["task_id"], kind))
 
-        async def settle_question(adapter, sub):
+        async def settle_question(adapter, sub, kind):
             test.questions_settled.append(sub["task_id"])
+            test.question_kinds.append(kind)
 
         reactions = SimpleNamespace(enabled=lambda: test.flag, settle_delegated=settle_delegated)
         moments = SimpleNamespace(
@@ -1322,9 +1324,10 @@ class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
             await silent_event(SimpleNamespace(sub=SLACK_SUB, adapter=_Adapter()), SimpleNamespace(kind=kind))
         await silent_event(SimpleNamespace(sub=SLACK_SUB, adapter=_Adapter()), SimpleNamespace(kind="heartbeat"))
         self.assertEqual(self.questions_settled, ["t_e0c1"] * 2)
+        self.assertEqual(self.question_kinds, ["unblocked", "archived"], "the settle is told which event it was")
 
     async def test_a_failed_settle_still_delivers(self):
-        async def settle_question(adapter, sub):
+        async def settle_question(adapter, sub, kind):
             raise RuntimeError("boom")
 
         self.modules["gateway.slack_ux_moments"].settle_question = settle_question

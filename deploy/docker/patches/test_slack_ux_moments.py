@@ -87,6 +87,19 @@ class _Adapter:
         self.reads = []
         self.unauthorized = set()
         self.names = {"U7": "Priya"}
+        # No bot id yet: the channel gate is skipped, as the clicks module skips it.
+        self._bot_user_id = ""
+        self._team_bot_user_ids = {}
+        self.gated = []
+
+    def _slack_message_matches_mention_patterns(self, text):
+        return False
+
+    async def _channel_gate_allows(self, *, channel_id, routing_text, bot_uid, is_mentioned, is_thread_reply,
+                                   event_thread_ts, user_id, team_id, is_dm, force_process):
+        """A gate set to require a mention in threads."""
+        self.gated.append({"routing_text": routing_text, "is_mentioned": is_mentioned})
+        return is_mentioned
 
     async def _resolve_user_name(self, user_id, chat_id="", team_id=""):
         return self.names.get(user_id, user_id)
@@ -100,6 +113,11 @@ class _Adapter:
     def _get_client(self, chat_id, team_id=None):
         self.teams.append(team_id)
         return _Client(self)
+
+
+def _slack_mention_detection_text(event):
+    """adapter.py's helper, which the clicks module finds through the gate's globals."""
+    return event.get("text", "")
 
 
 def _event(event_id, kind="blocked"):
@@ -403,7 +421,11 @@ class SettleQuestionTest(unittest.TestCase):
         async def clicker_name(adapter_, body, user, channel, team_id):
             return f"name-of-{user}-in-{channel}-{team_id}"
 
-        clicks = SimpleNamespace(clicker_name=clicker_name, answered=lambda channel, ts: False, clicked=lambda channel, ts: False)
+        async def hears(*args):
+            return True
+
+        clicks = SimpleNamespace(clicker_name=clicker_name, answered=lambda channel, ts: False,
+                                 clicked=lambda channel, ts: False, _gateway_hears=hears)
         with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_clicks=clicks), "gateway.slack_ux_clicks": clicks}):
             _run(runtime.settle_question(adapter, SUB))
         note = adapter.updates[0]["blocks"][-1]["elements"][0]["text"]
@@ -416,8 +438,9 @@ class SettleQuestionTest(unittest.TestCase):
         for case, profile, modules, name in (
             ("the reply's profile", {"display_name": "", "real_name": "Priya R"}, None, "Priya R"),
             ("no profile", None, None, "Someone"),
+            # Without the clicks module the reply cannot be put through the channel gate, so it is not counted.
             ("no clicks module", {"real_name": "Priya R"},
-             {"gateway": SimpleNamespace(), "gateway.slack_ux_clicks": None}, "Someone"),
+             {"gateway": SimpleNamespace(), "gateway.slack_ux_clicks": None}, None),
         ):
             with self.subTest(case=case):
                 runtime._questions.clear()
@@ -430,9 +453,38 @@ class SettleQuestionTest(unittest.TestCase):
                 adapter.replies = [reply]
                 with mock.patch.dict(sys.modules, modules or {}):
                     _run(runtime.settle_question(adapter, SUB))
-                note = adapter.updates[0]["blocks"][-1]["elements"][0]["text"]
-                self.assertEqual(note, f"✓ {name}: seeded-b")
-                self.assertNotIn("<@", adapter.updates[0]["text"])
+                update = adapter.updates[0]
+                if name is None:
+                    self.assertNotIn("✓", update["text"])
+                else:
+                    self.assertEqual(update["blocks"][-1]["elements"][0]["text"], f"✓ {name}: seeded-b")
+                self.assertNotIn("<@", update["text"])
+
+    def test_only_a_card_that_resumed_credits_a_typed_reply(self):
+        for kind in ("archived", "status", "completed", "gave_up", "unblocked", "claimed", "heartbeat"):
+            with self.subTest(kind=kind):
+                runtime._questions.clear()
+                adapter = _Adapter()
+                _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+                adapter.replies = [{"ts": "1700000000.000400", "user": "U7", "text": "hold on, checking"}]
+                _run(runtime.settle_question(adapter, SUB, kind))
+                update = adapter.updates[0]
+                self.assertEqual(_buttons(update["blocks"]), [])
+                self.assertEqual("✓" in update["text"], kind in runtime.ANSWERED_KINDS)
+                self.assertEqual(bool(adapter.reads), kind in runtime.ANSWERED_KINDS)
+                self.assertEqual(runtime._questions, {})
+
+    def test_a_typed_reply_the_channel_gate_drops_is_not_the_answer(self):
+        adapter = _Adapter()
+        adapter._bot_user_id = "U0BOT"
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        adapter.replies = [
+            {"ts": "1700000000.000400", "user": "U7", "text": "hmm, seeded-a?"},
+            {"ts": "1700000000.000500", "user": "U7", "text": "<@U0BOT> seeded-b"},
+        ]
+        _run(runtime.settle_question(adapter, SUB))
+        self.assertEqual(adapter.updates[0]["blocks"][-1]["elements"][0]["text"], "✓ Priya: @U0BOT seeded-b")
+        self.assertEqual([g["routing_text"] for g in adapter.gated], ["hmm, seeded-a?", "<@U0BOT> seeded-b"])
 
     def test_no_reply_or_a_failed_read_settles_without_the_line(self):
         for replies in ([], [{"ts": "1700000000.000400", "user": "U0BOT", "bot_id": "B1", "text": "On it."}],

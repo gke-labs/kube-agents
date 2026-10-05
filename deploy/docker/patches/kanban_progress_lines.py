@@ -510,7 +510,7 @@ async def _settle_question(moments: Any, adapter: Any, sub: dict, kind: str) -> 
     if moments is None:
         return
     try:
-        await moments.settle_question(adapter, sub)
+        await moments.settle_question(adapter, sub, kind)
     except Exception as exc:  # noqa: BLE001 — cosmetic; the card has moved on
         logger.debug("kanban progress: settling the question for %s failed: %s", sub.get("task_id"), exc)
 

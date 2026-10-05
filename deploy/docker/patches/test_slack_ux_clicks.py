@@ -605,22 +605,34 @@ class RuntimeTest(unittest.TestCase):
             self._answer(adapter, *_choice())
         self.assertEqual([entry[0] for entry in adapter.log], ["chat_update", "message"])
 
-    def test_the_card_is_looked_up_before_the_rewrite(self):
-        cards = {(CHANNEL, MESSAGE_TS): "t_e0c1"}
-        moments = SimpleNamespace(question_card=lambda channel, ts: cards.get((channel, ts)))
-        adapter = _Adapter()
-        client = _Client(adapter.log)
-        update = client.chat_update
+    def test_the_card_is_looked_up_before_the_name_lookup_and_the_rewrite(self):
+        for during in ("the name lookup", "the rewrite"):
+            with self.subTest(during=during):
+                importlib.reload(runtime)
+                cards = {(CHANNEL, MESSAGE_TS): "t_e0c1"}
+                moments = SimpleNamespace(question_card=lambda channel, ts: cards.get((channel, ts)))
+                adapter = _Adapter()
+                client = _Client(adapter.log)
+                update = client.chat_update
+                resolve = adapter._resolve_user_name
 
-        async def settle_then_update(**kwargs):
-            cards.clear()  # the card moved on and its question was settled meanwhile
-            await update(**kwargs)
+                # The card moves on and its question is settled meanwhile.
+                async def settle_then_update(**kwargs):
+                    if during == "the rewrite":
+                        cards.clear()
+                    await update(**kwargs)
 
-        client.chat_update = settle_then_update
-        adapter._get_client = lambda chat_id, team_id=None: client
-        with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_moments=moments), "gateway.slack_ux_moments": moments}):
-            self._answer(adapter, *_choice())
-        self.assertEqual(adapter.log[-1][1]["text"], "Leave it\n\n" + runtime.CARD_NOTE.format(card="t_e0c1"))
+                async def settle_then_resolve(user_id, chat_id="", team_id=""):
+                    if during == "the name lookup":
+                        cards.clear()
+                    return await resolve(user_id, chat_id=chat_id, team_id=team_id)
+
+                client.chat_update = settle_then_update
+                adapter._resolve_user_name = settle_then_resolve
+                adapter._get_client = lambda chat_id, team_id=None: client
+                with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_moments=moments), "gateway.slack_ux_moments": moments}):
+                    self._answer(adapter, *_choice())
+                self.assertEqual(adapter.log[-1][1]["text"], "Leave it\n\n" + runtime.CARD_NOTE.format(card="t_e0c1"))
 
     def test_a_click_on_any_other_message_is_the_label_alone(self):
         moments = SimpleNamespace(question_card=lambda channel, ts: None)
