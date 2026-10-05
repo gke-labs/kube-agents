@@ -737,13 +737,13 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
     incident = action_id.startswith(INCIDENT_CHOICE_PREFIX)
     if incident:
         label = label.removesuffix(INCIDENT_RECOMMENDED_SUFFIX)
+    # Before the awaits: a card that moves on in between settles its question and forgets it.
+    card = _question_card(channel_id, msg_ts)
     shown = _presenter._escape(label)
     note = (
         CLICKED.format(name=await clicker_name(adapter, body, user_id, channel_id, team_id), label=shown)
         if incident else ANSWERED.format(user=user_id, label=shown)
     )
-    # Before the awaits: a card that moves on in between settles its question and forgets it.
-    card = _question_card(channel_id, msg_ts)
     rewritten = False
     try:
         await client.chat_update(
