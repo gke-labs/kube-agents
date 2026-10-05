@@ -30,7 +30,8 @@ The wake still runs, since it is how the Planning Agent learns which card an
 answer belongs to, but :func:`wake_text` adds a note that the question is
 already posted, so it says nothing now and only takes the answer, typed or
 clicked (``gateway/slack_ux_clicks.py``), to the card with ``kanban_comment``
-and ``kanban_unblock``. A click's turn names the card, which
+and ``kanban_unblock``, and says nothing after that either: the question
+shows who answered and what. A click's turn names the card, which
 :func:`question_card` looks up. A typed answer can open a session the wake
 never reached, which knows the thread only by reading it back, so the
 question's ``text`` names the card too, above its buttons' "Reply with one
@@ -40,8 +41,13 @@ and anywhere blocks cannot render. Other block kinds keep the line.
 
 When the card moves on, any event of it, :func:`settle_question` takes the
 buttons and "waiting on you" off the question, so a typed answer does not
-leave them live. A question a click already answered was rewritten by the
-click and is left alone; one whose rewrite failed is settled here. The
+leave them live, and reads the thread once for that answer: the first reply
+after the question from a person, not a bot, becomes the same "✓ <name>:
+<words>" line a click leaves (the words on one line, clipped to
+``TYPED_ANSWER_MAX``). A card that moved on with nobody replying, or a read
+that fails, settles without the line. A question a click already answered
+was rewritten by the click and is left alone; one whose rewrite failed is
+settled here. The
 notifier delivers at least once, so a ``blocked`` event replayed after its
 question posted (:func:`asked`) neither settles nor reposts it. A question
 whose settle failed when the card asked again is kept and retried with the
@@ -87,8 +93,21 @@ WAKE_NOTE = (
     "The specialist's question is already posted to the user as its own message, in the "
     "specialist's words. Do not restate, paraphrase or acknowledge it. If nothing else "
     "in this notification needs saying, reply with exactly [SILENT]. When the user answers, "
-    "typed or clicked, carry the answer to the card with kanban_comment, then kanban_unblock."
+    "typed or clicked, carry the answer to the card with kanban_comment, then kanban_unblock, "
+    "and reply with exactly [SILENT] unless they also asked something else: the question "
+    "already shows who answered and what."
 )
+
+#: The answered line a typed answer gets, as ``slack_ux_clicks.ANSWERED``, and its
+#: mention when the clicks module is missing.
+ANSWERED = "✓ {who}: {label}"
+MENTION = "<@{user}>"
+
+#: A typed answer's words on its answered line are clipped to this.
+TYPED_ANSWER_MAX = 80
+
+#: Replies the settle reads after a question, looking for its typed answer.
+REPLIES_READ_MAX = 50
 
 #: Added to a question's ``text``, so a session the wake never reached reads its card in the thread.
 QUESTION_CARD_NOTE = "(Question from card {card}.)"
@@ -257,15 +276,67 @@ def _without_choices(text: str) -> str:
     return body.rstrip("\n") if body and last.startswith(_presenter.CHOICES_LEAD) else text
 
 
+async def _who(adapter: Any, user: str, channel: str, team_id: str) -> str:
+    """The answerer's name as a click's answered line gives it, else a mention."""
+    try:
+        from gateway import slack_ux_clicks
+
+        return await slack_ux_clicks.answerer(adapter, user, channel, team_id)
+    except Exception:  # noqa: BLE001 — the mention still names them
+        return MENTION.format(user=user)
+
+
+def _after(ts: Any, since: str) -> bool:
+    try:
+        return float(ts) > float(since)
+    except (TypeError, ValueError):
+        return False
+
+
+def _by_a_person(adapter: Any, reply: Any) -> bool:
+    if not (isinstance(reply, dict) and reply.get("user") and str(reply.get("text") or "").strip()):
+        return False
+    if reply.get("bot_id") or reply.get("subtype"):
+        return False
+    try:
+        return not adapter._event_declares_bot_sender(reply)
+    except Exception:  # noqa: BLE001 — no bot_id and no subtype already read as a person
+        return True
+
+
+async def _typed_note(adapter: Any, client: Any, sub: dict, channel: str, ts: str) -> str:
+    """The answered line for the first reply a person typed after the question, or "" for none."""
+    thread = str(sub.get("thread_id") or "")
+    if not thread:
+        return ""
+    try:
+        response = await client.conversations_replies(channel=channel, ts=thread, oldest=ts, limit=REPLIES_READ_MAX)
+        replies = [r for r in response.get("messages") or [] if _after((r or {}).get("ts"), ts)]
+    except Exception as exc:  # noqa: BLE001 — cosmetic; the question settles without the line
+        logger.info("slack_ux_moments: reading the answer to %s failed: %s", ts, exc)
+        return ""
+    for reply in sorted(replies, key=lambda r: float(r["ts"])):
+        if _by_a_person(adapter, reply):
+            words = _presenter._clip(" ".join(str(reply["text"]).split()), TYPED_ANSWER_MAX)
+            team_id = str(sub.get("team_id") or "")
+            return ANSWERED.format(who=await _who(adapter, str(reply["user"]), channel, team_id), label=words)
+    return ""
+
+
 async def _settled(adapter: Any, sub: dict, entry: tuple) -> bool:
-    """Rewrite one question without its buttons; True once it needs nothing more."""
+    """Rewrite one question without its buttons, under its typed answer's line; True once it needs nothing more."""
     _event_id, channel, ts, blocks, text = entry
     if not ts or _clicked(channel, ts):
         return True
     try:
         client = adapter._get_client(channel, team_id=sub.get("team_id") or None)
+        note = await _typed_note(adapter, client, sub, channel, ts)
+        settled_text = _without_choices(text)
         await client.chat_update(
-            channel=channel, ts=ts, text=_without_choices(text), blocks=_moments.needs_you_settled(blocks)
+            channel=channel,
+            ts=ts,
+            text=f"{note}\n\n{settled_text}" if note else settled_text,
+            blocks=_moments.needs_you_settled(blocks, note),
         )
     except Exception as exc:  # noqa: BLE001 — cosmetic; the next event retries
         logger.warning("slack_ux_moments: settling the question %s failed: %s", ts, exc)

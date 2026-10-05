@@ -907,12 +907,41 @@ class RuntimeTest(unittest.TestCase):
         self._answer(adapter, *_choice(thread=None))
         self.assertEqual(adapter.log[1][1]["thread_ts"], MESSAGE_TS)
 
-    def test_a_failed_rewrite_posts_the_echo_instead(self):
+    def test_a_failed_rewrite_posts_the_answered_line_instead(self):
         adapter = _Adapter(fail=("chat_update",))
         with self.assertLogs(runtime.logger, level="WARNING"):
             self._answer(adapter, *_choice())
         self.assertEqual([entry[0] for entry in adapter.log], ["chat_postMessage", "message"])
-        self.assertEqual(adapter.log[0][1], {"channel": CHANNEL, "thread_ts": THREAD, "text": "↳ <@U1>: Leave it"})
+        self.assertEqual(adapter.log[0][1], {"channel": CHANNEL, "thread_ts": THREAD, "text": "✓ <@U1>: Leave it"})
+
+    def test_the_answered_line_names_the_clicker_as_the_workspace_shows_them(self):
+        adapter = _Adapter()
+        asked = []
+
+        async def resolve(user_id, chat_id="", team_id=""):
+            asked.append((user_id, chat_id, team_id))
+            return "Jayanti <P>"
+
+        adapter._resolve_user_name = resolve
+        self._answer(adapter, *_choice())
+        update = adapter.log[0][1]
+        self.assertEqual(update["blocks"][-1]["elements"][0]["text"], "✓ Jayanti &lt;P&gt;: Leave it")
+        self.assertEqual(asked, [(USER, CHANNEL, TEAM)])
+
+    def test_an_unreadable_name_falls_back_to_the_mention(self):
+        for answer in ("", USER, RuntimeError("users.info")):
+            with self.subTest(answer=answer):
+                importlib.reload(runtime)
+                adapter = _Adapter()
+
+                async def resolve(user_id, chat_id="", team_id="", answer=answer):
+                    if isinstance(answer, Exception):
+                        raise answer
+                    return answer
+
+                adapter._resolve_user_name = resolve
+                self._answer(adapter, *_choice())
+                self.assertEqual(adapter.log[0][1]["blocks"][-1]["elements"][0]["text"], "✓ <@U1>: Leave it")
 
     def test_failed_rewrite_and_echo_still_run_the_turn(self):
         adapter = _Adapter(fail=("chat_update", "chat_postMessage"))

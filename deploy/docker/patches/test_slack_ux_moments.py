@@ -68,6 +68,12 @@ class _Client:
             raise RuntimeError("message_not_found")
         self.adapter.updates.append(kwargs)
 
+    async def conversations_replies(self, **kwargs):
+        self.adapter.reads.append(kwargs)
+        if isinstance(self.adapter.replies, Exception):
+            raise self.adapter.replies
+        return {"messages": self.adapter.replies}
+
 
 class _Adapter:
     def __init__(self, fail=False):
@@ -76,6 +82,8 @@ class _Adapter:
         self.teams = []
         self.fail = fail
         self.fail_update = False
+        self.replies = []
+        self.reads = []
 
 
     def _get_client(self, chat_id, team_id=None):
@@ -348,6 +356,66 @@ class SettleQuestionTest(unittest.TestCase):
         _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
         _run(runtime.settle_question(adapter, SUB))
         _run(runtime.settle_question(adapter, SUB))
+        self.assertEqual(len(adapter.updates), 1)
+
+    def test_a_typed_answer_leaves_the_line_a_click_would(self):
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        adapter.replies = [
+            {"ts": SUB["thread_id"], "user": "U7", "text": "is checkout-gateway restarting?"},
+            {"ts": POSTED_TS, "user": "U0BOT", "bot_id": "B1", "text": "Which cluster?"},
+            {"ts": "1700000000.000500", "user": "U8", "text": "seeded-a, I think"},
+            {"ts": "1700000000.000400", "user": "U0BOT", "bot_id": "B1", "text": "On it."},
+            {"ts": "1700000000.000450", "user": "U7", "subtype": "channel_join", "text": "joined"},
+            {"ts": "1700000000.000460", "user": "U7", "text": "seeded-b\n  please"},
+        ]
+        _run(runtime.settle_question(adapter, SUB))
+        update = adapter.updates[0]
+        self.assertEqual(update["blocks"][-1], {
+            "type": "context", "elements": [{"type": "mrkdwn", "text": "✓ <@U7>: seeded-b please"}]})
+        head, _sep, rest = update["text"].partition("\n\n")
+        self.assertEqual(head, "✓ <@U7>: seeded-b please")
+        self.assertIn("Which cluster?", rest)
+        self.assertEqual(adapter.reads, [
+            {"channel": "C0KAGE", "ts": SUB["thread_id"], "oldest": POSTED_TS, "limit": runtime.REPLIES_READ_MAX}])
+
+    def test_a_typed_answer_is_named_and_clipped_as_a_click_is(self):
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        adapter.replies = [{"ts": "1700000000.000400", "user": "U7", "text": "seeded-b " + "word " * 40}]
+
+        async def answerer(adapter_, user, channel, team_id=""):
+            return f"name-of-{user}-in-{channel}-{team_id}"
+
+        clicks = SimpleNamespace(answerer=answerer, answered=lambda channel, ts: False)
+        with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_clicks=clicks), "gateway.slack_ux_clicks": clicks}):
+            _run(runtime.settle_question(adapter, SUB))
+        note = adapter.updates[0]["blocks"][-1]["elements"][0]["text"]
+        who, _sep, words = note.partition(": ")
+        self.assertEqual(who, "✓ name-of-U7-in-C0KAGE-T1")
+        self.assertLessEqual(len(words), runtime.TYPED_ANSWER_MAX)
+        self.assertTrue(words.startswith("seeded-b word"))
+
+    def test_no_reply_or_a_failed_read_settles_without_the_line(self):
+        for replies in ([], [{"ts": "1700000000.000400", "user": "U0BOT", "bot_id": "B1", "text": "On it."}],
+                        RuntimeError("missing_scope")):
+            with self.subTest(replies=replies):
+                runtime._questions.clear()
+                adapter = _Adapter()
+                _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+                adapter.replies = replies
+                _run(runtime.settle_question(adapter, SUB))
+                update = adapter.updates[0]
+                self.assertNotEqual(update["blocks"][-1]["type"], "context")
+                self.assertNotIn("✓", update["text"])
+                self.assertEqual(runtime._questions, {})
+
+    def test_a_question_with_no_thread_reads_nothing(self):
+        adapter = _Adapter()
+        sub = {**SUB, "thread_id": ""}
+        _run(runtime.needs_you(adapter, sub, QUESTION, 3))
+        _run(runtime.settle_question(adapter, sub))
+        self.assertEqual(adapter.reads, [])
         self.assertEqual(len(adapter.updates), 1)
 
     def test_a_question_a_click_answered_is_left_alone(self):
