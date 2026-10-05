@@ -2644,13 +2644,31 @@ class SessionRoleExecutableTest(unittest.TestCase):
             with self.subTest(role=role, executable=executable):
                 self.assertEqual(want, credential_proxy.executable_permitted(role, executable))
 
-    def test_git_from_a_session_is_refused_with_a_rule_the_shim_prints(self):
+    def test_git_from_a_session_is_refused_by_the_route_before_the_role(self):
+        # /v1/exec admits only EXEC_ROUTE_EXECUTABLES for every role, so a
+        # session asking for git meets the route's own refusal first; the role
+        # check below is never reached for an executable the route refuses.
         with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
             status, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION, {"argv": ["git", "status"]})
         self.assertEqual(403, status)
         self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
-        self.assertEqual(credential_proxy.RULE_CALLER_EXECUTABLE, body["rule"])
-        self.assertIn("session", body["message"])
+        self.assertEqual(credential_proxy.RULE_EXECUTABLE_ALLOWLIST, body["rule"])
+
+    def test_the_role_check_stands_behind_the_route(self):
+        # Widen the route the way the git-routing tests do and the session is
+        # still held to its two CLIs, with the rule the shim prints, while the
+        # shell runs what the route now carries. This is what the role check
+        # buys once the route list and the session list are the same two names.
+        routed = (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "git")
+        with mock.patch.object(credential_proxy, "EXEC_ROUTE_EXECUTABLES", routed):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                status, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION, {"argv": ["git", "status"]})
+            self.assertEqual(403, status)
+            self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
+            self.assertEqual(credential_proxy.RULE_CALLER_EXECUTABLE, body["rule"])
+            self.assertIn("session", body["message"])
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, {"argv": ["git", "status"]})
+            self.assertEqual(200, status, body)
 
     def test_a_read_from_a_session_runs(self):
         status, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION, {"argv": ["kubectl", "get", "pods"]})
@@ -2757,10 +2775,6 @@ class SessionRoleExecutableTest(unittest.TestCase):
 
     def test_the_shell_still_passes_a_file_argument_to_kubectl(self):
         status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, {"argv": ["kubectl", "get", "-f", "x.yaml"]})
-        self.assertEqual(200, status, body)
-
-    def test_the_shell_still_runs_git(self):
-        status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, {"argv": ["git", "status"]})
         self.assertEqual(200, status, body)
 
 

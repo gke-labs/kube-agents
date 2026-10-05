@@ -613,10 +613,11 @@ TOKEN_REVIEW_POD_NAME_EXTRA = "authentication.kubernetes.io/pod-name"
 # a way that cannot tell those two apart.
 CALLER_ROLES = (CALLER_ROLE_SHELL, CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT, CALLER_ROLE_SESSION)
 
-# Which executables a role may hand to /v1/exec. A role absent here keeps the
-# executor's whole allowlist; the session role is narrowed to the two CLIs
-# that reach a cluster read-only. git and gh spend the installation token on
-# the artifact plane and are the shell's alone.
+# Which executables a role may hand to /v1/exec. A role absent here keeps
+# whatever the route carries (`EXEC_ROUTE_EXECUTABLES`); the session role is
+# narrowed to the two CLIs that reach a cluster read-only. Today the route
+# carries exactly those two, so this check stands behind the route's own
+# refusal: widening the route never widens a session.
 ROLE_EXECUTABLES: dict[str, frozenset[str]] = {
     CALLER_ROLE_SESSION: frozenset({"kubectl", "gcloud"}),
 }
