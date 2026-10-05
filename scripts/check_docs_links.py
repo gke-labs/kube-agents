@@ -104,7 +104,9 @@ LINKED_IMAGE_RE = re.compile(rf"\[{IMAGE_RE}\]{LINK_DESTINATION_RE}")
 # with a bracketed word are not read as one. An autolink, `<https://...>`,
 # which reaches a document only when it is a repository blob URL.
 HREF_RE = re.compile(r"""\bhref=(?P<quote>["'])(?P<target>[^\n]*?)(?P=quote)""")
-REFERENCE_DEFINITION_RE = re.compile(rf"""^\s{{0,3}}\[(?!\^)[^\]]+\]:\s*<?(?P<target>[^\s<>]+)>?(?:\s+{LINK_TITLE_RE})?\s*\Z""")
+# A definition stands at most three spaces in: four columns is indented code,
+# and a tab reaches the fourth column, so a tab-indented one is code too.
+REFERENCE_DEFINITION_RE = re.compile(rf"""^ {{0,3}}\[(?!\^)[^\]]+\]:\s*<?(?P<target>[^\s<>]+)>?(?:\s+{LINK_TITLE_RE})?\s*\Z""")
 AUTOLINK_RE = re.compile(r"<(?P<target>https?://[^\s<>]+)>")
 
 SKIP_PREFIXES = (
@@ -155,12 +157,15 @@ FENCE_RE = re.compile(r"^\s*(```|~~~)")
 # paragraph inside the quote. Reading a span one line at a time was wrong in
 # the unsafe direction once comments were stripped too: a `<!--` quoted in a span that wraps
 # stayed visible and opened a comment that swallowed the rest of the
-# document, links included.
+# document, links included. A block boundary is believed at any indent, in
+# spaces or tabs, for the reason a comment opener is (below): CommonMark
+# measures an item's indent from the enclosing item, the checker tracks no
+# items, and an item nested four spaces under `10.` is an item to a renderer.
 BACKTICK_RUN_RE = re.compile(r"`+")
 ONE_LINE_BLOCK = r"#{1,6}(?:\s|$)|\||(?P<rule>[-*_])(?:\s*(?P=rule)){2,}\s*$"
-ONE_LINE_BLOCK_RE = re.compile(rf"^ {{0,3}}(?:{ONE_LINE_BLOCK})")
-BLOCK_OPENER_RE = re.compile(rf"^ {{0,3}}(?:[-*+](?:\s|$)|\d{{1,9}}[.)](?:\s|$)|>|{ONE_LINE_BLOCK})")
-QUOTE_MARKER_RE = re.compile(r"^ {0,3}>[ \t]?")
+ONE_LINE_BLOCK_RE = re.compile(rf"^[ \t]*(?:{ONE_LINE_BLOCK})")
+BLOCK_OPENER_RE = re.compile(rf"^[ \t]*(?:[-*+](?:\s|$)|\d{{1,9}}[.)](?:\s|$)|>|{ONE_LINE_BLOCK})")
+QUOTE_MARKER_RE = re.compile(r"^[ \t]*>[ \t]?")
 
 # HTML and MDX comments, for the same reason again: a link an author commented
 # out instead of deleting renders nowhere, so it reaches no document -- the
@@ -198,9 +203,10 @@ HTML_COMMENT = ("<!--", "-->")
 MDX_COMMENT = ("{/*", "*/}")
 MDX_SUFFIX = ".mdx"
 # What may stand before an opener on its line for it to open a block rather
-# than inline HTML: indentation, any number of blockquote markers, one list
-# marker with the whitespace that makes it one.
-BLOCK_PREFIX_RE = re.compile(r"^[ \t]*(?:>[ \t]*)*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?$")
+# than inline HTML: indentation and any sequence of container markers, a
+# blockquote's `>` or a list marker with the whitespace that makes it one, in
+# any order, since an item may open a quote and items nest.
+BLOCK_PREFIX_RE = re.compile(r"^[ \t]*(?:>[ \t]*|(?:[-*+]|\d{1,9}[.)])[ \t]+)*$")
 # What a span or a comment leaves behind: a space, not "", so what stood
 # either side of it cannot be glued into a link that was never written, plus
 # every line break it covered, so line numbers hold.

@@ -135,13 +135,15 @@ SITE_LISTED_LINES = ("# listed", f"[routed]({cdl.SITE_ROUTE_PREFIX}reference/rou
 # autolink. Each fixture is reached by one of them and nothing else. The
 # carrier of the last two is a root file, reached by shape; its footnote and
 # its quoted `href` are specimens, not links, so neither reaches a document
-# nor reads as a broken one.
+# nor reads as a broken one, and a definition behind a tab is indented code,
+# so the document it names is reached by nothing.
 SITE_CARDED = SITE + "install/carded.md"
 REF_DEFINED_ONLY = "docs/ref-defined.md"
 REF_SINGLE_QUOTED_TITLE = "docs/ref-single-quoted.md"  # a definition with a 'title'
 REF_PARENTHESISED_TITLE = "docs/ref-parenthesised.md"  # a definition with a (title)
 LINK_PARENTHESISED_TITLE = "docs/link-parenthesised.md"  # an inline link with a (title)
 AUTOLINKED_ONLY = "docs/autolinked.md"
+REF_TAB_INDENTED = "docs/ref-tab-indented.md"  # defined behind a tab: indented code, no link
 OTHER_FORMS = "other-forms.md"
 SITE_INDEX_CARD_LINES = (
     "import { LinkCard } from '@astrojs/starlight/components';",
@@ -160,6 +162,8 @@ OTHER_FORMS_LINES = (
     f"<{cdl.REPO_BLOB_URL_PREFIXES[0]}{AUTOLINKED_ONLY}>",
     "[^1]: footnote",
     '`<a href="specimen.md">`',
+    "",
+    f"\t[indented]: {REF_TAB_INDENTED}",
 )
 # Links written inside a comment. An HTML comment in the middle of a line, one
 # that opens its line and closes on it, one spanning lines (holding a Markdown
@@ -210,13 +214,18 @@ COMMENTS_LINES = (
 # position rule a later closer anywhere in the document was enough to believe
 # the opener, it swallowed every paragraph up to that closer, and a green
 # broken-link check said nothing about the links it never read. The `.mdx`
-# file checks the MDX opener the same way.
+# file checks the MDX opener the same way. Each file ends with an opener alone
+# on its line that no later closer answers: the one departure from CommonMark
+# the checker makes on purpose, text rather than a block to the end of the
+# file, so the links after it are read.
 STRAY_OPENER = "stray-opener.md"  # a root file, reached by shape
 STRAY_OPENER_MDX = "stray-opener.mdx"
 HIDDEN_ACROSS_BLANK = "docs/hidden-across-blank.md"
 HIDDEN_IN_PARAGRAPH = "docs/hidden-in-paragraph.md"
 LIVE_AFTER_STRAY_OPENER = "docs/live-after-stray-opener.md"
 LIVE_AFTER_STRAY_MDX_OPENER = "docs/live-after-stray-mdx-opener.md"
+LIVE_AFTER_STRAY_BLOCK_OPENER = "docs/live-after-stray-block-opener.md"
+LIVE_AFTER_STRAY_MDX_BLOCK_OPENER = "docs/live-after-stray-mdx-block-opener.md"
 STRAY_OPENER_GONE_LINE = "and [gone](nowhere.md) is a broken link, while one that <!-- closes in"
 STRAY_OPENER_LINES = (
     "# stray opener",
@@ -230,6 +239,11 @@ STRAY_OPENER_LINES = (
     f"[hidden]({HIDDEN_ACROSS_BLANK})",
     "",
     "-->",
+    "",
+    "<!--",
+    "",
+    f"an opener alone on its line that nothing later closes is text too, so [live]({LIVE_AFTER_STRAY_BLOCK_OPENER})",
+    "reaches, where CommonMark would read a block to the end of the file.",
 )
 STRAY_OPENER_MDX_LINES = (
     "# stray opener",
@@ -238,6 +252,10 @@ STRAY_OPENER_MDX_LINES = (
     f"[live]({LIVE_AFTER_STRAY_MDX_OPENER}) reaches.",
     "",
     "{/* a comment closed on its own line, later in the file */}",
+    "",
+    "{/*",
+    "",
+    f"[live]({LIVE_AFTER_STRAY_MDX_BLOCK_OPENER}) reaches after a line-opening opener nothing closes.",
 )
 # A backtick left unpaired in a list item, a table row or a heading, or in the
 # paragraph before a blockquote or a thematic break. A renderer parses each of
@@ -247,6 +265,9 @@ STRAY_OPENER_MDX_LINES = (
 # wrapped item keeps the case the paragraph read exists for: a span that wraps
 # onto a plain continuation line is still one span. The rule is underscores:
 # dashes under a paragraph would be a setext heading, and stars a list item.
+# The last two items nest one four spaces in and one behind a tab: a renderer
+# measures the nesting from the parent item, so each is an item of its own
+# and its link is live; measured from the line start, each was a continuation.
 BLOCK_BOUNDARIES = "block-boundaries.md"  # a root file, reached by shape
 LIVE_IN_NEXT_ITEM = "docs/live-in-next-item.md"
 LIVE_IN_NEXT_ROW = "docs/live-in-next-row.md"
@@ -254,6 +275,8 @@ LIVE_UNDER_HEADING = "docs/live-under-heading.md"
 LIVE_AFTER_ITEM_WRAP = "docs/live-after-item-wrap.md"
 LIVE_IN_QUOTE = "docs/live-in-quote.md"
 LIVE_UNDER_RULE = "docs/live-under-rule.md"
+LIVE_IN_DEEP_ITEM = "docs/live-in-deep-item.md"  # nested four spaces under `10.`
+LIVE_IN_TAB_ITEM = "docs/live-in-tab-item.md"  # nested behind a tab
 BLOCK_BOUNDARIES_GONE_LINE = f"| [live]({LIVE_IN_NEXT_ROW}) and [gone](nowhere.md) | `y` |"
 BLOCK_BOUNDARIES_LINES = (
     "# block boundaries",
@@ -276,6 +299,11 @@ BLOCK_BOUNDARIES_LINES = (
     "a lone ` before a rule",
     "___",
     f"[live]({LIVE_UNDER_RULE}) and `code` under the rule",
+    "",
+    "10. an item with a literal ` in it",
+    f"    - nested four spaces in, [live]({LIVE_IN_DEEP_ITEM}) and `code`",
+    "- an item with a literal ` in it",
+    f"\t- nested behind a tab, [live]({LIVE_IN_TAB_ITEM}) and `code`",
 )
 # A span and an inline comment that wrap from one blockquote line to the next.
 # A renderer strips the markers and reads the quote's lines as one paragraph,
@@ -283,8 +311,11 @@ BLOCK_BOUNDARIES_LINES = (
 # is live, the link inside the comment renders nowhere and the link after the
 # comment's closer is live. Read a `>` line at a time, each backtick was
 # unpaired and the opener was text: the specimen was reported as a broken
-# link and the hidden document was reached.
+# link and the hidden document was reached. The quoted item at the end pins
+# the boundary inside the quote: a lone backtick in the quoted paragraph
+# before it must not pair with the item's span and hide the item's link.
 QUOTE_WRAP = "quote-wrap.md"  # a root file, reached by shape
+LIVE_IN_QUOTED_ITEM = "docs/live-in-quoted-item.md"  # after a quoted lone backtick
 LIVE_AFTER_QUOTED_SPAN = "docs/live-after-quoted-span.md"
 HIDDEN_IN_QUOTED_COMMENT = "docs/hidden-in-quoted-comment.md"
 LIVE_AFTER_QUOTED_COMMENT = "docs/live-after-quoted-comment.md"
@@ -296,6 +327,9 @@ QUOTE_WRAP_LINES = (
     ">",
     f"> prose before a comment <!-- [hidden]({HIDDEN_IN_QUOTED_COMMENT})",
     f"> --> and [live]({LIVE_AFTER_QUOTED_COMMENT}) after its closer",
+    ">",
+    "> a quoted paragraph with a lone ` marker",
+    f"> - a quoted item after it links [live]({LIVE_IN_QUOTED_ITEM}) and `code`",
 )
 # A comment opener alone on its line under a numbered item's continuation,
 # four spaces in. CommonMark measures the block indent from the item, so the
@@ -322,16 +356,19 @@ INDENTED_OPENER_LINES = (
 )
 # A comment opener that is the first content of its line behind what
 # CommonMark lets stand before a block: a tab of indentation, a list marker, a
-# blockquote marker. Each opens an HTML block, as the space-indented opener
-# above does, so the comment runs across blank lines to its closer and the
-# links inside render nowhere, and a closer on the opener's own line still
-# takes the rest of that line with it. Read as inline HTML, the opener whose
-# closer sat past a blank line was text and its links were live.
+# blockquote marker, an item that opens a quote, an item nested in an item.
+# Each opens an HTML block, as the space-indented opener above does, so the
+# comment runs across blank lines to its closer and the links inside render
+# nowhere, and a closer on the opener's own line still takes the rest of that
+# line with it. Read as inline HTML, the opener whose closer sat past a blank
+# line was text and its links were live.
 BLOCK_OPENERS = "block-openers.md"  # a root file, reached by shape
 HIDDEN_UNDER_TAB = "docs/hidden-under-tab.md"
 HIDDEN_IN_ITEM = "docs/hidden-in-item.md"
 HIDDEN_IN_QUOTE = "docs/hidden-in-quote.md"
 HIDDEN_ON_ITEM_LINE = "docs/hidden-on-item-line.md"
+HIDDEN_IN_QUOTED_ITEM = "docs/hidden-in-quoted-item.md"  # an item that opens a quote
+HIDDEN_IN_NESTED_ITEM = "docs/hidden-in-nested-item.md"  # an item nested in an item
 LIVE_AFTER_BLOCK_OPENERS = "docs/live-after-block-openers.md"
 BLOCK_OPENERS_LINES = (
     "# block openers",
@@ -355,6 +392,16 @@ BLOCK_OPENERS_LINES = (
     "> -->",
     "",
     f"2. <!-- a note --> [hidden]({HIDDEN_ON_ITEM_LINE}) [gone](nowhere.md) is raw HTML to the end of the line",
+    "",
+    "- > <!--",
+    f"  > [hidden]({HIDDEN_IN_QUOTED_ITEM})",
+    "  >",
+    "  > -->",
+    "",
+    "1. - <!--",
+    f"     [hidden]({HIDDEN_IN_NESTED_ITEM})",
+    "",
+    "     -->",
     "",
     f"- and [live]({LIVE_AFTER_BLOCK_OPENERS}) in the next item reaches.",
 )
@@ -560,11 +607,11 @@ class SyntheticRepoTest(unittest.TestCase):
         _write(self.root, cdl.SITE_CONFIG, "\n".join(SITE_CONFIG_LINES) + "\n")
         self._track(
             SITE_INDEX, SITE_CARDED, REF_DEFINED_ONLY, REF_SINGLE_QUOTED_TITLE, REF_PARENTHESISED_TITLE,
-            LINK_PARENTHESISED_TITLE, AUTOLINKED_ONLY, OTHER_FORMS,
+            LINK_PARENTHESISED_TITLE, AUTOLINKED_ONLY, REF_TAB_INDENTED, OTHER_FORMS,
         )
         _write(self.root, SITE_INDEX, "\n".join(SITE_INDEX_CARD_LINES) + "\n")
         _write(self.root, OTHER_FORMS, "\n".join(OTHER_FORMS_LINES) + "\n")
-        self.assertEqual(self._unlinked(), [])
+        self.assertEqual(self._unlinked(), [f"{REF_TAB_INDENTED}: {cdl.UNLINKED_MESSAGE}"])
         self.assertEqual(cdl.check_file(self.root / OTHER_FORMS, cdl.tracked_paths()), [])
 
     def test_a_link_inside_a_comment_reaches_nothing_and_breaks_nothing(self) -> None:
@@ -591,6 +638,7 @@ class SyntheticRepoTest(unittest.TestCase):
         self._track(
             STRAY_OPENER, STRAY_OPENER_MDX, HIDDEN_ACROSS_BLANK, HIDDEN_IN_PARAGRAPH,
             LIVE_AFTER_STRAY_OPENER, LIVE_AFTER_STRAY_MDX_OPENER,
+            LIVE_AFTER_STRAY_BLOCK_OPENER, LIVE_AFTER_STRAY_MDX_BLOCK_OPENER,
         )
         _write(self.root, STRAY_OPENER, "\n".join(STRAY_OPENER_LINES) + "\n")
         _write(self.root, STRAY_OPENER_MDX, "\n".join(STRAY_OPENER_MDX_LINES) + "\n")
@@ -609,7 +657,7 @@ class SyntheticRepoTest(unittest.TestCase):
     def test_a_backtick_does_not_pair_across_a_block_boundary(self) -> None:
         self._track(
             BLOCK_BOUNDARIES, LIVE_IN_NEXT_ITEM, LIVE_IN_NEXT_ROW, LIVE_UNDER_HEADING, LIVE_AFTER_ITEM_WRAP,
-            LIVE_IN_QUOTE, LIVE_UNDER_RULE,
+            LIVE_IN_QUOTE, LIVE_UNDER_RULE, LIVE_IN_DEEP_ITEM, LIVE_IN_TAB_ITEM,
         )
         _write(self.root, BLOCK_BOUNDARIES, "\n".join(BLOCK_BOUNDARIES_LINES) + "\n")
         self.assertEqual(self._unlinked(), [])
@@ -620,7 +668,10 @@ class SyntheticRepoTest(unittest.TestCase):
         )
 
     def test_a_span_or_a_comment_wraps_across_the_lines_of_one_blockquote(self) -> None:
-        self._track(QUOTE_WRAP, LIVE_AFTER_QUOTED_SPAN, HIDDEN_IN_QUOTED_COMMENT, LIVE_AFTER_QUOTED_COMMENT)
+        self._track(
+            QUOTE_WRAP, LIVE_AFTER_QUOTED_SPAN, HIDDEN_IN_QUOTED_COMMENT, LIVE_AFTER_QUOTED_COMMENT,
+            LIVE_IN_QUOTED_ITEM,
+        )
         _write(self.root, QUOTE_WRAP, "\n".join(QUOTE_WRAP_LINES) + "\n")
         self.assertEqual(self._unlinked(), [f"{HIDDEN_IN_QUOTED_COMMENT}: {cdl.UNLINKED_MESSAGE}"])
         self.assertEqual(cdl.check_file(self.root / QUOTE_WRAP, cdl.tracked_paths()), [])
@@ -634,14 +685,16 @@ class SyntheticRepoTest(unittest.TestCase):
     def test_an_opener_behind_a_tab_a_list_marker_or_a_quote_marker_is_a_block_comment(self) -> None:
         self._track(
             BLOCK_OPENERS, HIDDEN_UNDER_TAB, HIDDEN_IN_ITEM, HIDDEN_IN_QUOTE, HIDDEN_ON_ITEM_LINE,
-            LIVE_AFTER_BLOCK_OPENERS,
+            HIDDEN_IN_QUOTED_ITEM, HIDDEN_IN_NESTED_ITEM, LIVE_AFTER_BLOCK_OPENERS,
         )
         _write(self.root, BLOCK_OPENERS, "\n".join(BLOCK_OPENERS_LINES) + "\n")
         self.assertEqual(
             self._unlinked(),
             [
                 f"{HIDDEN_IN_ITEM}: {cdl.UNLINKED_MESSAGE}",
+                f"{HIDDEN_IN_NESTED_ITEM}: {cdl.UNLINKED_MESSAGE}",
                 f"{HIDDEN_IN_QUOTE}: {cdl.UNLINKED_MESSAGE}",
+                f"{HIDDEN_IN_QUOTED_ITEM}: {cdl.UNLINKED_MESSAGE}",
                 f"{HIDDEN_ON_ITEM_LINE}: {cdl.UNLINKED_MESSAGE}",
                 f"{HIDDEN_UNDER_TAB}: {cdl.UNLINKED_MESSAGE}",
             ],
