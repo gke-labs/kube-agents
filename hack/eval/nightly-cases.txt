@@ -121,9 +121,7 @@
 # bootstrap-inventory-ranking-delivery makes it
 # forty-five (135) of fifty-nine (177), +3 more at its 600s hint.
 # platform-worker-shell-edit-of-shipped-skill (listed below) makes it
-# forty-six (138) of sixty (180), +3 more at the 200s default, and
-# chat-voice-answer-first forty-seven (141) of sixty-one (183), +3 more:
-# one front-door turn plus the card round trip.
+# forty-six (138) of sixty (180), +3 more at the 200s default.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
 # answer it plainly: 1734-2693 serial minutes of work at a realised
@@ -169,6 +167,12 @@
 # repetitions measured 173-237s). Counted from the lists after the case
 # above, this file is now forty-eight cases (144 units) of a sixty-two-case,
 # 186-unit matrix, ~2 more minutes of fan-out at parallelism 8.
+#
+# 2026-10-05 adds chat-voice-answer-first: one case, three units, deployer:
+# noop at the 200s default, about 10 serial minutes. Counted from the lists
+# rather than the paragraphs above (cases added since were not counted here),
+# this file is now fifty-one cases (153 units) of a sixty-five-case, 195-unit
+# matrix with the presubmit file's fourteen.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
