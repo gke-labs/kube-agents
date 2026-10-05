@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "deploy" / "shared"))
 
 import cluster_agent_profile as cap  # noqa: E402
+import terminal_env_pin  # noqa: E402
 
 MAX = cap.MAX_NAME_LEN  # 63
 
@@ -200,11 +201,22 @@ class CreateProfileTest(unittest.TestCase):
         # predicate itself is covered in test_gke_endpoint.py.
         self.dns_args = []
         self._patch(cap, "dns_endpoint_args", lambda *a, **k: self.dns_args)
+        # The managed terminal pin needs Hermes, which is not installed here; its own
+        # behaviour is covered in tests/test_terminal_env_pin.py and at image build.
+        self.pinned = []
+        self.pin_error = None
+        self._patch(terminal_env_pin, "pin", self._fake_pin)
 
     def _patch(self, obj, attr, value):
         original = getattr(obj, attr)
         setattr(obj, attr, value)
         self.addCleanup(setattr, obj, attr, original)
+
+    def _fake_pin(self, home):
+        self.pinned.append((Path(home), (Path(home) / "USER.md").exists()))
+        if self.pin_error:
+            raise self.pin_error
+        return True
 
     def _fake_ensure_profile(self, name, description, hermes_home):
         home = Path(hermes_home) / "profiles" / name
@@ -266,6 +278,28 @@ class CreateProfileTest(unittest.TestCase):
         # worker at a file that is not there.
         env_file = self.profile / ".env"
         self.assertNotIn("KUBECONFIG", env_file.read_text() if env_file.exists() else "")
+
+    def test_pins_the_managed_terminal_before_writing_user_md(self):
+        self.create()
+        self.assertEqual([(self.profile, False)], self.pinned)
+        self.assertTrue((self.profile / "USER.md").exists())
+
+    def test_a_failed_terminal_pin_leaves_the_profile_unfinished(self):
+        """USER.md is what reconcile and the roster read as "finished".
+
+        A re-scaffold starts with the USER.md an earlier run wrote, so a failed pin
+        has to remove it, or the profile keeps counting as usable while its
+        scheduled runs would not use the managed terminal.
+        """
+        self.create()
+        self.pin_error = terminal_env_pin.PinError("Hermes resolves TERMINAL_ENV='local'")
+
+        with self.assertRaises(SystemExit) as caught:
+            self.create()
+
+        self.assertIn(self.name, str(caught.exception))
+        self.assertIn("TERMINAL_ENV='local'", str(caught.exception))
+        self.assertFalse((self.profile / "USER.md").exists())
 
     def test_the_kubeconfig_is_looked_for_where_kubectl_will_run(self):
         """With a sandbox the file is on its volume, not on this one."""
@@ -521,6 +555,184 @@ class CreateProfileTest(unittest.TestCase):
         cfg = self.plugin_config()
         self.assertFalse(cfg["enabled"])
         self.assertEqual(cfg["backends"], [])
+
+
+class ResolveProfilesBaseTest(unittest.TestCase):
+    def test_resolves_when_hermes_home_is_set(self):
+        import importlib
+        try:
+            with mock.patch.dict(os.environ, {"HERMES_HOME": "/custom/data"}, clear=True):
+                reloaded = importlib.reload(cap)
+                self.assertEqual(reloaded.HERMES_HOME, Path("/custom/data"))
+                self.assertEqual(reloaded.PROFILES_BASE, Path("/custom/data/profiles"))
+                self.assertEqual(reloaded._run_env()["HERMES_HOME"], "/custom/data")
+        finally:
+            importlib.reload(cap)
+
+    def test_resolves_default_when_no_env_set(self):
+        import importlib
+        try:
+            with mock.patch.dict(os.environ, {}, clear=True):
+                reloaded = importlib.reload(cap)
+                self.assertEqual(reloaded.HERMES_HOME, Path("/opt/data"))
+                self.assertEqual(reloaded.PROFILES_BASE, Path("/opt/data/profiles"))
+                self.assertEqual(reloaded._run_env()["HERMES_HOME"], "/opt/data")
+        finally:
+            importlib.reload(cap)
+
+
+class ListProfilesTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="cap-list-test-"))
+        self.patcher = mock.patch.object(cap, "PROFILES_BASE", self.tmp)
+        self.patcher.start()
+
+    def tearDown(self):
+        self.patcher.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_nonexistent_directory_returns_empty(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        self.assertEqual(cap.list_profiles(), [])
+
+    def test_filters_reserved_and_files(self):
+        (self.tmp / "default").mkdir()
+        (self.tmp / "platform").mkdir()
+        (self.tmp / "not-a-dir.txt").touch()
+        (self.tmp / "cluster-beta").mkdir()
+        (self.tmp / "cluster-alpha").mkdir()
+
+        self.assertEqual(cap.list_profiles(), ["cluster-alpha", "cluster-beta"])
+
+    def test_cmd_list_prints_ready_sorted_by_default(self):
+        for name in ("cluster-zeta", "cluster-beta"):
+            p = self.tmp / name
+            p.mkdir(parents=True, exist_ok=True)
+            (p / "profile.yaml").touch()
+            (p / "USER.md").write_text("- project: p\n- cluster: c\n- location: l\n", encoding="utf-8")
+            (p / "config.yaml").write_text(
+                "cluster_identity:\n  project: p\n  cluster: c\n  location: l\n",
+                encoding="utf-8",
+            )
+        (self.tmp / "cluster-incomplete").mkdir()
+        (self.tmp / "cluster-incomplete" / "config.yaml").write_text(
+            "cluster_identity:\n  project: p\n  cluster: c\n  location: l\n",
+            encoding="utf-8",
+        )
+
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            cap.cmd_list(mock.MagicMock(all=False))
+        self.assertEqual(out.getvalue(), "cluster-beta\ncluster-zeta\n")
+
+        out_all = io.StringIO()
+        with mock.patch("sys.stdout", out_all):
+            cap.cmd_list(mock.MagicMock(all=True))
+        self.assertEqual(out_all.getvalue(), "cluster-beta\ncluster-incomplete\ncluster-zeta\n")
+
+    def test_build_parser_list_all(self):
+        parser = cap.build_parser()
+        args = parser.parse_args(["list"])
+        self.assertFalse(args.all)
+        args_all = parser.parse_args(["list", "--all"])
+        self.assertTrue(args_all.all)
+
+
+class ListReadyProfilesTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="cap-ready-test-"))
+        self.patcher = mock.patch.object(cap, "PROFILES_BASE", self.tmp)
+        self.patcher.start()
+
+    def tearDown(self):
+        self.patcher.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _scaffold(self, name: str, user_md: bool = True, identity: bool = True, scaffolded: bool = True):
+        p = self.tmp / name
+        p.mkdir(parents=True, exist_ok=True)
+        if scaffolded:
+            (p / "profile.yaml").touch()
+        if user_md:
+            (p / "USER.md").write_text("- project: p\n- cluster: c\n- location: l\n", encoding="utf-8")
+        if identity:
+            (p / "config.yaml").write_text(
+                "cluster_identity:\n  project: p\n  cluster: c\n  location: l\n",
+                encoding="utf-8",
+            )
+        return p
+
+    def test_ready_profiles_filters_incomplete_scaffolds(self):
+        self._scaffold("cluster-ready")
+        self._scaffold("cluster-no-user", user_md=False, identity=True)
+        self._scaffold("cluster-unregistered", scaffolded=False)
+        self._scaffold("default")
+        self._scaffold("platform")
+
+        self.assertEqual(cap.list_ready_profiles(), ["cluster-ready"])
+
+    def test_ready_profiles_does_not_probe_sandbox_or_call_kubeconfig_landed(self):
+        self._scaffold("cluster-ready")
+        with mock.patch.object(cap, "kubeconfig_landed", side_effect=AssertionError("kubeconfig_landed should not be called")):
+            self.assertEqual(cap.list_ready_profiles(), ["cluster-ready"])
+
+    def test_ready_profiles_tolerates_corrupt_config_yaml(self):
+        self._scaffold("cluster-ready")
+        p_corrupt = self._scaffold("cluster-corrupt", user_md=True, identity=False)
+        (p_corrupt / "config.yaml").write_text("invalid yaml: {{\n", encoding="utf-8")
+
+        # Ready profiles match the dispatcher capability: scaffolded and USER.md present
+        self.assertEqual(cap.list_ready_profiles(), ["cluster-corrupt", "cluster-ready"])
+
+    def test_read_cluster_identity_robustness(self):
+        # 1. Nonexistent directory
+        self.assertIsNone(cap.read_cluster_identity(self.tmp / "nonexistent"))
+
+        # 2. Scalar and list YAML raise AttributeError per docstring specification
+        p1 = self.tmp / "p1"
+        p1.mkdir()
+        (p1 / "config.yaml").write_text("scalar_value\n", encoding="utf-8")
+        with self.assertRaises(AttributeError):
+            cap.read_cluster_identity(p1)
+
+        (p1 / "config.yaml").write_text("[item1, item2]\n", encoding="utf-8")
+        with self.assertRaises(AttributeError):
+            cap.read_cluster_identity(p1)
+
+        # 3. Non-dict cluster_identity
+        (p1 / "config.yaml").write_text("cluster_identity: 12345\n", encoding="utf-8")
+        self.assertIsNone(cap.read_cluster_identity(p1))
+
+        # 4. Incomplete fields
+        (p1 / "config.yaml").write_text("cluster_identity:\n  project: p\n", encoding="utf-8")
+        self.assertIsNone(cap.read_cluster_identity(p1))
+
+        # 5. Invalid YAML syntax
+        (p1 / "config.yaml").write_text("{{invalid-yaml\n", encoding="utf-8")
+        self.assertIsNone(cap.read_cluster_identity(p1))
+
+        # 6. Valid cluster_identity
+        (p1 / "config.yaml").write_text(
+            "cluster_identity:\n  project: p\n  cluster: c\n  location: l\n", encoding="utf-8"
+        )
+        self.assertEqual(
+            cap.read_cluster_identity(p1),
+            {"project": "p", "cluster": "c", "location": "l"},
+        )
+
+        # 7. Non-UTF-8 bytes raises UnicodeDecodeError
+        p_bin = self.tmp / "p_bin"
+        p_bin.mkdir()
+        (p_bin / "config.yaml").write_bytes(b"\xff\xfe")
+        with self.assertRaises(UnicodeDecodeError):
+            cap.read_cluster_identity(p_bin)
+
+        # 8. Directory config.yaml raises OSError
+        p_dir = self.tmp / "p_dir"
+        p_dir.mkdir()
+        (p_dir / "config.yaml").mkdir()
+        with self.assertRaises(OSError):
+            cap.read_cluster_identity(p_dir)
 
 
 if __name__ == "__main__":

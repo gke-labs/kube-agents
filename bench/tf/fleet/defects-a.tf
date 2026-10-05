@@ -56,6 +56,14 @@ resource "kubernetes_namespace_v1" "seeded_capacity" {
   depends_on = [google_container_node_pool.pinned_inference_pool]
 }
 
+resource "kubernetes_namespace_v1" "seeded_stall" {
+  metadata {
+    name   = "seeded-stall"
+    labels = local.fleet_labels
+  }
+  depends_on = [google_container_node_pool.seeded_a_default]
+}
+
 # Defect (reliability): two replicas, no PodDisruptionBudget. Two, not one,
 # deliberately: the reliability SOP's no-pdb check (3.3) flags only
 # `spec.replicas >= 2` with no matching PDB and explicitly does NOT flag
@@ -64,8 +72,9 @@ resource "kubernetes_namespace_v1" "seeded_capacity" {
 # so one drain can still take both replicas at once; that is the finding.
 # Asserted by obtainability-planted-pdb and by
 # cluster-agent-healthy-workload-no-finding, which uses this workload for the
-# opposite property: its runtime state is clean, so it is the fleet's only
-# fixture that lets a case ask whether the agent invents a fault. That case
+# opposite property: its runtime state is clean, so it is one of the
+# fixtures (with notification-relay in seeded-intent) that let a case ask
+# whether the agent invents a fault. That case
 # additionally asserts the container image and the absence of a
 # rollout-restart annotation, so it is not only the replica count and the
 # missing budget that are load-bearing here now.
@@ -115,6 +124,66 @@ resource "kubernetes_deployment_v1" "checkout_gateway" {
         }
         container {
           name  = "gateway"
+          image = "registry.k8s.io/pause:3.9"
+          resources {
+            requests = { cpu = "10m", memory = "16Mi" }
+            limits   = { memory = "32Mi" }
+          }
+        }
+      }
+    }
+  }
+}
+
+# Declared posture (reliability): two replicas, no PodDisruptionBudget, in a
+# namespace of its own. The same shape as checkout-gateway above, planted so
+# that a repository declaration can cover it without touching the cases
+# that grade checkout-gateway's missing budget: the obtainability SOP's
+# declared-intent step (4a) lists a declared posture under the ledger's
+# Declared intent section instead of as a finding, and
+# obtainability-declared-intent-no-finding asserts exactly that on this
+# workload. Nothing else reads this namespace.
+resource "kubernetes_namespace_v1" "seeded_intent" {
+  metadata {
+    name   = "seeded-intent"
+    labels = local.fleet_labels
+  }
+  depends_on = [google_container_node_pool.seeded_a_default]
+}
+
+resource "kubernetes_deployment_v1" "notification_relay" {
+  metadata {
+    name      = "notification-relay"
+    namespace = kubernetes_namespace_v1.seeded_intent.metadata[0].name
+  }
+  spec {
+    replicas = 2
+    selector {
+      match_labels = { app = "notification-relay" }
+    }
+    template {
+      metadata {
+        labels = { app = "notification-relay" }
+      }
+      spec {
+        topology_spread_constraint {
+          max_skew           = 1
+          topology_key       = "kubernetes.io/hostname"
+          when_unsatisfiable = "ScheduleAnyway"
+          label_selector {
+            match_labels = { app = "notification-relay" }
+          }
+        }
+        automount_service_account_token = false
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name  = "relay"
           image = "registry.k8s.io/pause:3.9"
           resources {
             requests = { cpu = "10m", memory = "16Mi" }
@@ -325,6 +394,63 @@ resource "kubernetes_horizontal_pod_autoscaler_v2" "inference_server" {
   }
 }
 
+# Defect (cluster debugging, stall detection): a Deployment whose container
+# references a ConfigMap (inventory-flags) that does not exist through
+# envFrom. Its pods sit in CreateContainerConfigError, restartCount stays 0,
+# and the Deployment never progresses. Once progressDeadlineSeconds (120s,
+# under the verifier's 300s FLEET_STATE_WAIT_SECONDS) elapses, the Deployment
+# controller marks the Progressing condition False with reason
+# ProgressDeadlineExceeded. stall_report.py reports it as a dangling-reference.
+# Asserted by cluster-agent-stalled-controller-diagnosis.
+resource "kubernetes_deployment_v1" "inventory_api" {
+  metadata {
+    name      = "inventory-api"
+    namespace = kubernetes_namespace_v1.seeded_stall.metadata[0].name
+  }
+  spec {
+    replicas                  = 1
+    progress_deadline_seconds = 120
+    selector {
+      match_labels = { app = "inventory-api" }
+    }
+    template {
+      metadata {
+        labels = { app = "inventory-api" }
+      }
+      spec {
+        # SOP 2.7, as on checkout-gateway.
+        automount_service_account_token = false
+        # SOP 2.11, as on checkout-gateway.
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name  = "api"
+          image = "registry.k8s.io/pause:3.9"
+          resources {
+            requests = { cpu = "10m", memory = "16Mi" }
+            limits   = { memory = "32Mi" }
+          }
+          env_from {
+            config_map_ref {
+              name = "inventory-flags"
+            }
+          }
+        }
+      }
+    }
+  }
+
+  # The deployment never becomes Ready -- that is the defect. Without this,
+  # every apply of the stack blocks on a rollout that cannot finish and the
+  # scheduled reconcile reads as a provisioning failure.
+  wait_for_rollout = false
+}
+
 # Compliance SOP 2.6 flags any non-system namespace that has workloads and
 # zero NetworkPolicies. The planted workloads use no network at all (a pause
 # container, a memory bomb, a CPU burn), so a default-deny policy closes the
@@ -338,6 +464,8 @@ resource "kubernetes_network_policy_v1" "default_deny" {
     reliability = kubernetes_namespace_v1.seeded_reliability.metadata[0].name
     debug       = kubernetes_namespace_v1.seeded_debug.metadata[0].name
     capacity    = kubernetes_namespace_v1.seeded_capacity.metadata[0].name
+    intent      = kubernetes_namespace_v1.seeded_intent.metadata[0].name
+    stall       = kubernetes_namespace_v1.seeded_stall.metadata[0].name
   }
 
   metadata {
@@ -353,8 +481,9 @@ resource "kubernetes_network_policy_v1" "default_deny" {
 
 # Reliability SOP 3.3 background closure: inference-server runs at two or
 # more desired replicas with no PodDisruptionBudget, which is exactly the
-# planted checkout-gateway defect -- but only checkout-gateway is the
-# fixture. maxUnavailable: 1 is the SOP's own structurally-safe shape; a PDB
+# planted checkout-gateway defect -- but the fixtures are checkout-gateway
+# and (declared) notification-relay, not this. maxUnavailable: 1 is the
+# SOP's own structurally-safe shape; a PDB
 # governs evictions only, so the stockout fixture (a scheduling gap) is
 # untouched. The HPA's desired count is a load calculation and differs
 # between projects (3/2/3 across the three eval projects on 2026-08-24), so

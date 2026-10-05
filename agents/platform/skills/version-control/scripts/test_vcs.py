@@ -764,6 +764,16 @@ class CollaborationTest(VcsTestCase):
         self.assertNotIn("source", payload)
         self.assertNotIn("target", payload)
 
+    def test_proposal_list_filters_by_labels_at_the_forge(self):
+        code, _ = self.run_vcs("proposal", "list", "--labels", "audit:a1", "audit:remediation")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            self.broker.payload("proposal-list")["labels"], ["audit:a1", "audit:remediation"]
+        )
+        code, _ = self.run_vcs("proposal", "list")
+        self.assertEqual(code, 0)
+        self.assertNotIn("labels", self.broker.payload("proposal-list"))
+
     def test_identity_says_when_the_login_is_an_automations(self):
         code, _ = self.run_vcs("identity", "--login", "renovate", "--bot")
         self.assertEqual(code, 0)
@@ -772,6 +782,21 @@ class CollaborationTest(VcsTestCase):
         code, _ = self.run_vcs("identity", "--login", "renovate")
         self.assertEqual(code, 0)
         self.assertNotIn("bot", self.broker.payload("identity"))
+
+    def test_remote_branch_view_and_delete_carry_the_branch_and_revision(self):
+        code, _ = self.run_vcs("remote-branch", "view", "platform-agent/fix")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.broker.payload("branch-view")["branch"], "platform-agent/fix")
+        code, _ = self.run_vcs(
+            "remote-branch", "delete", "platform-agent/fix", "--revision", "a" * 40
+        )
+        self.assertEqual(code, 0)
+        payload = self.broker.payload("branch-delete")
+        self.assertEqual((payload["branch"], payload["revision"]), ("platform-agent/fix", "a" * 40))
+
+    def test_remote_branch_delete_will_not_go_without_the_revision_it_read(self):
+        with self.assertRaises(SystemExit):
+            self.run_vcs("remote-branch", "delete", "platform-agent/fix")
 
     def test_issue_list_carries_state_and_labels(self):
         code, _ = self.run_vcs(
@@ -989,11 +1014,9 @@ class SkillTextTest(unittest.TestCase):
         # Review finding: every command reaches the sandbox as a fresh
         # non-interactive `bash -c`, which does not expand aliases, so an
         # aliased `git` followed by `git log` ran the credentialed shim. The
-        # skill points at the path, or at an exported variable, which the
-        # sandbox's environment snapshot does carry.
+        # name is the local git's now, so nothing needs aliasing.
         text = (Path(__file__).resolve().parents[1] / "SKILL.md").read_text()
         self.assertNotIn("alias git", text)
-        self.assertIn("/opt/vcs/libexec/git", text)
 
 class LocalGitTest(VcsTestCase):
     def test_a_missing_local_git_names_the_fallback(self):
@@ -1093,9 +1116,16 @@ class AbstractionTest(unittest.TestCase):
 
         parser = vcs.build_parser()
         commands = parser._subparsers._group_actions[0].choices  # noqa: SLF001
+        # The two spelled otherwise. `branch` is the local verb and takes a
+        # branch name, so `branch view` would be a branch called "view".
+        spelled_otherwise = {
+            "branch-view": ("remote-branch", "view"),
+            "branch-delete": ("remote-branch", "delete"),
+        }
         for verb in vcs_broker.route_table(mock.Mock()):
             # `proposal-create` is `proposal create`: the hyphen is the space.
             command, _, action = verb.partition("-")
+            command, action = spelled_otherwise.get(verb, (command, action))
             with self.subTest(verb=verb):
                 self.assertIn(command, commands)
                 if not action:

@@ -872,7 +872,8 @@ Mutation(
     Mutation(
         "D1-principal-not-logged",
         "agents/platform/scripts/credential_proxy.py",
-        ("            _sanitize_for_logging(principal.describe(), max_length=512),", "            \"-\","),
+        ("        principal_label = _sanitize_for_logging(principal.describe(), max_length=PRINCIPAL_LOG_LENGTH)",
+         "        principal_label = \"-\""),
         "test_D1_the_exec_route_records_a_principal",
         "drop the principal from the exec record while refactoring a handler "
         "that does not yet read it",
@@ -1210,6 +1211,55 @@ Mutation(
         "exactly the path the worker reads",
     ),
     Mutation(
+        "C1-session-token-for-a-third-audience",
+        "a2a/gateway/spawn.go",
+        ("Audience:          credentialProxySessionAudience,",
+         'Audience:          "kubeagents-credential-proxy",'),
+        "test_C1_a_session_pod_carries_no_kubernetes_identity",
+        "mint the session pod's broker token for the shell's audience instead "
+        "of the session one. The broker's session-callers binding would refuse "
+        "that token at authentication, so this is the fence test's own layer "
+        "being checked, not the broker's. The fence test "
+        "accepts exactly two audiences by constant name, the bus and the "
+        "broker's session audience; a literal third is a destination the "
+        "fence never admitted, and this is the quiet version because the pod "
+        "still holds exactly two tokens at exactly the paths the clients read",
+    ),
+    Mutation(
+        "C1-session-broker-audience-renamed-in-the-spawner",
+        "a2a/gateway/spawn.go",
+        ('credentialProxySessionAudience        = "kubeagents-credential-proxy-session"',
+         'credentialProxySessionAudience        = "kubeagents-credential-proxy-sessions"'),
+        "test_C1_the_session_broker_audience_and_view_env_agree_across_the_module_boundary",
+        "pluralise the audience in the module that projects it. The operator "
+        "keeps telling the broker to accept the singular, the broker's "
+        "TokenReview names the singular, so every session pod's kubectl is "
+        "refused as an unknown audience -- with both Go suites green, because "
+        "each module's test compares its constant to itself",
+    ),
+    Mutation(
+        "C1-shim-token-env-renamed-in-the-spawner",
+        "a2a/gateway/spawn.go",
+        ('Name: "CREDENTIAL_PROXY_TOKEN_FILE"', 'Name: "CREDENTIAL_PROXY_TOKEN_PATH"'),
+        "test_C1_the_session_broker_audience_and_view_env_agree_across_the_module_boundary",
+        "rename the shim's token-file variable in the module that sets it. The "
+        "shim keeps reading CREDENTIAL_PROXY_TOKEN_FILE, finds nothing, sends no "
+        "Authorization header, and every brokered command from every session "
+        "pod is a 401 -- with the Go suite and the Python suite both green, "
+        "because neither names the other's spelling",
+    ),
+    Mutation(
+        "C1-cluster-view-env-renamed-on-the-gateway-side",
+        "a2a/gateway/config.go",
+        ('os.Getenv("A2A_SESSION_CLUSTER_VIEW")', 'os.Getenv("A2A_SESSION_VIEW")'),
+        "test_C1_the_session_broker_audience_and_view_env_agree_across_the_module_boundary",
+        "shorten the flag's name in the module that reads it. The operator "
+        "still renders the long name, so the gateway reads false and spawns "
+        "today's pod on every flag-on install, and nothing says so: the "
+        "quietest drift of the three, which is why it is pinned beside the "
+        "audience",
+    ),
+    Mutation(
         "C1-session-account-gets-rbac",
         "k8s-operator/internal/controller/platformagent_a2a_callout.go",
         ("""\t\tRoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: a2aCalloutName(agent)},
@@ -1254,6 +1304,13 @@ Mutation(
     Mutation(
         "A3-second-supervisor-writer",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        # This anchor's neighbour moves. gke-labs/kube-agents#1316 re-indented
+        # it and A5 renamed the principal out from under it, and each time the
+        # mutation went STALE -- which reports as silence, indistinguishable
+        # from a mutation that has nothing to say, against the one test that
+        # pins the supervisor subject to a single writer. Re-verify this pair
+        # against the file, not against the sweep's survived count, whenever
+        # the bridge's grant list is touched.
         ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
          '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"a2a.tasks.*.*.supervisor",\n\t\t"$KV.runtime-state.>",'),
         "test_A3_the_supervisor_subject_has_exactly_one_writer",

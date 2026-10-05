@@ -263,8 +263,10 @@ SITE_CONVENTION_PAGES = frozenset({"404.md"})
 
 # Uniform families a reader reaches by browsing the directory and that no page
 # links member by member: the agents' runtime material (personas, SOPs, skills
-# and their references, the onboarding templates) and the GitOps template's
-# per-directory documents. `*` stays inside one path segment; `**` crosses
+# and their references, the onboarding templates), the GitOps template's
+# per-directory documents, and the integrity sweep's report and adjudication
+# written beside each committed run record under a bench task's `evidence/`.
+# `*` stays inside one path segment; `**` crosses
 # segments; neither matches a segment that starts with a dot, so a nested
 # dot-directory (`examples/gitops-repo/.github/`) is content a family does not
 # cover. A new document in one of these directories needs no link; a new
@@ -276,6 +278,7 @@ LINK_EXEMPT_FAMILY_GLOBS = (
     "agents/platform/governance/*.md",
     "agents/platform/skills/*/SKILL.md",
     "agents/platform/skills/*/references/*.md",
+    "bench/tasks/*/evidence/*/*.md",
     "examples/gitops-repo/*/**",
 )
 
@@ -294,12 +297,7 @@ UNLINKED_ALLOWLIST = frozenset(
     {
         "a2a/persona/platform/skills/a2a-topics/SKILL.md",
         "agents/chat/AGENTS.md",
-        "agents/platform/docs/autoops-architecture.md",
-        "docs/designs/design_537148738.md",
-        "docs/designs/e2e-testing-harness.md",
         "docs/designs/fleet-anomaly-detection-checks.md",
-        "docs/designs/semver-deployment-versioning.md",
-        "docs/designs/upgrade-readiness-checks.md",
     }
 )
 

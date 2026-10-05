@@ -7,11 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -38,6 +40,12 @@ type ActiveTask struct {
 	// StatusMsgID is the backend message the relay edits — the rolling
 	// progress line.
 	StatusMsgID string `json:"statusMsgId,omitempty"`
+	// Capability pins this task's root entry in the `cap` bucket: the key
+	// and the revision the mint returned. Every envelope the gateway sends
+	// toward this task carries it, and it is on the record rather than in
+	// memory so a gateway restart does not orphan a running task from its
+	// own authority.
+	Capability *capability.Ref `json:"capability,omitempty"`
 	// Detached means the user said stop but no terminal event has arrived
 	// (the executor may be dead and platform tasks have no janitor yet, W3
 	// retarget). A detached task no longer serializes the session; its events,
@@ -49,15 +57,24 @@ type ActiveTask struct {
 // bucket: contextId, current pod, bus session name, last activity, roster.
 // Runtime state is not git and not pod annotations; KV is the house answer.
 type SessionRecord struct {
-	Key          string      `json:"key"`
-	ContextID    string      `json:"contextId"`
-	BusSession   string      `json:"busSession,omitempty"`
-	PodName      string      `json:"podName,omitempty"`
-	Addressee    string      `json:"addressee"`
-	Kind         string      `json:"kind"`
-	LastActivity time.Time   `json:"lastActivity"`
-	Roster       []string    `json:"roster,omitempty"`
-	ActiveTask   *ActiveTask `json:"activeTask,omitempty"`
+	Key          string    `json:"key"`
+	ContextID    string    `json:"contextId"`
+	BusSession   string    `json:"busSession,omitempty"`
+	PodName      string    `json:"podName,omitempty"`
+	Addressee    string    `json:"addressee"`
+	Kind         string    `json:"kind"`
+	LastActivity time.Time `json:"lastActivity"`
+	// LastTaskActivity is when a task last started or, from an executor's
+	// terminal, ended in this session. It is what the Slack adapter's
+	// session-thread rule bounds on (Gateway.hasSession), separately from
+	// LastActivity, which every verified turn moves: a "@bot stop" with
+	// nothing running is activity for the reap but must not re-admit a
+	// thread whose last task ended hours ago. Zero on records written before
+	// the field existed, which reads as "no task activity": such a thread
+	// needs a fresh mention after the upgrade, once.
+	LastTaskActivity time.Time   `json:"lastTaskActivity,omitempty"`
+	Roster           []string    `json:"roster,omitempty"`
+	ActiveTask       *ActiveTask `json:"activeTask,omitempty"`
 	// SessionRouted marks a conversation on the session-pod route: the
 	// addressee is a bus session name minted fresh per incarnation, and
 	// Profile names the AgentProfile the incarnations run as.
@@ -70,7 +87,9 @@ type SessionRecord struct {
 	Tasks []TaskRef `json:"tasks,omitempty"`
 }
 
-// TaskRef names one historical task and the addressee it ran under.
+// TaskRef names one historical task and the authority it ran under: the
+// addressee, the correlation id that threads its envelopes, and the
+// capability it was minted with. A cancel is rebuilt from these.
 type TaskRef struct {
 	ID        string `json:"id"`
 	Addressee string `json:"addressee"`
@@ -78,6 +97,12 @@ type TaskRef struct {
 	// task the record has released can still ride the task's own chain.
 	// Empty on entries written before it was recorded.
 	CorrelationID string `json:"correlationId,omitempty"`
+	// Capability is the task's, kept past ActiveTask for the same reason
+	// CorrelationID is: a cancel for a task the record has released still
+	// carries the task's own authority rather than none. Nil on entries
+	// written before the mint existed, which render `grants: null` — the
+	// same block a pre-mint gateway sent, and no executor checks a cancel.
+	Capability *capability.Ref `json:"capability,omitempty"`
 	// Canceled records that the gateway published a cancel for this task —
 	// set only after the publish succeeded, so a true here means the cancel
 	// is on the stream. It is what lets a supervisor path reached long
@@ -274,6 +299,22 @@ func (r *Registry) DropTask(ctx context.Context, taskID string) error {
 	return kv.Delete(ctx, taskKey(taskID))
 }
 
+// DeleteSession retires a session record once its retention horizon has passed.
+// In JetStream KV under --history=1, kv.Delete publishes a KV-Operation: DEL
+// marker that displaces the record value while retaining a ~100-byte tombstone
+// on the key's subject. This bounds bucket growth to a marker per conversation
+// rather than accumulating full records, rosters, and task histories.
+func (r *Registry) DeleteSession(ctx context.Context, sessionKey string) error {
+	kv, err := r.kv(ctx)
+	if err != nil {
+		return err
+	}
+	if err := kv.Delete(ctx, kvKey(sessionKey)); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
+		return fmt.Errorf("session %s: %w", sessionKey, err)
+	}
+	return nil
+}
+
 // SessionForTask resolves the task index, or "" if the task is unknown.
 func (r *Registry) SessionForTask(ctx context.Context, taskID string) (string, error) {
 	kv, err := r.kv(ctx)
@@ -290,30 +331,81 @@ func (r *Registry) SessionForTask(ctx context.Context, taskID string) (string, e
 	return string(entry.Value()), nil
 }
 
-// Sessions lists every session record — the reap loop's scan.
-func (r *Registry) Sessions(ctx context.Context) ([]*SessionRecord, error) {
+// SessionCallback is invoked for each session record in a scan.
+// Returning false halts the scan early without error.
+type SessionCallback func(rec *SessionRecord) (bool, error)
+
+// ScanSessions streams session records via a callback, starting from the given cursor.
+// It supports cursor resumption across passes: keys are sorted lexicographically,
+// and when cursor is non-empty, records with keys <= cursor are skipped.
+// If the scan reaches the end of the bucket, it returns nextCursor="", done=true, err=nil.
+// If the scan is interrupted (by timeout, context cancellation, or callback returning false),
+// it returns the last successfully visited key as nextCursor, done=false, and any error.
+func (r *Registry) ScanSessions(ctx context.Context, cursor string, cb SessionCallback) (nextCursor string, done bool, err error) {
 	kv, err := r.kv(ctx)
 	if err != nil {
-		return nil, err
+		return "", false, err
 	}
 	lister, err := kv.ListKeysFiltered(ctx, "sessions.>")
 	if err != nil {
-		return nil, err
+		return "", false, err
 	}
-	var recs []*SessionRecord
+	defer func() {
+		_ = lister.Stop()
+	}()
+
+	var keys []string
 	for key := range lister.Keys() {
+		if ctx.Err() != nil {
+			return cursor, false, ctx.Err()
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	lastVisited := cursor
+	for _, key := range keys {
+		if cursor != "" && key <= cursor {
+			continue
+		}
+		if ctx.Err() != nil {
+			return lastVisited, false, ctx.Err()
+		}
 		entry, err := kv.Get(ctx, key)
 		if errors.Is(err, jetstream.ErrKeyNotFound) {
 			continue
 		}
 		if err != nil {
-			return nil, err
+			return lastVisited, false, err
 		}
 		var rec SessionRecord
 		if err := json.Unmarshal(entry.Value(), &rec); err != nil {
 			continue // a malformed record must not kill the reaper
 		}
-		recs = append(recs, &rec)
+		cont, err := cb(&rec)
+		if err != nil {
+			return lastVisited, false, err
+		}
+		if ctx.Err() != nil {
+			return lastVisited, false, ctx.Err()
+		}
+		lastVisited = key
+		if !cont {
+			return lastVisited, false, nil
+		}
+	}
+	return "", true, nil
+}
+
+// Sessions lists every session record.
+func (r *Registry) Sessions(ctx context.Context) ([]*SessionRecord, error) {
+	var recs []*SessionRecord
+	_, _, err := r.ScanSessions(ctx, "", func(rec *SessionRecord) (bool, error) {
+		recs = append(recs, rec)
+		return true, nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return recs, nil
 }

@@ -27,12 +27,12 @@ sides: `sandbox_enabled()` is false over there.
 Two things about this module are load-bearing and easy to undo by accident.
 
 It connects as `hermes`, not as `terminal.ssh_user`. That setting is the login
-Hermes gives the model's shell, and it owns its own home directory in the
-sandbox; bash sources `~/.bashrc` even for a non-interactive `ssh host cmd`, so
-a caller authenticating as it would run the model's startup file before its own
-command and could be handed forged output as a trusted tool result. Debian's
-stock non-interactive guard at the top of `.bashrc` hides this, and the model
-can delete the guard. `deploy/sandbox/Dockerfile` creates the second account.
+Hermes gives the model's shell: a caller authenticating as it shares a uid with
+every process the model starts and works in directories the model owns, so it
+could be handed forged output as a trusted tool result. The first route found
+was `~/.bashrc`, which bash sources even for a non-interactive `ssh host cmd`;
+current images make the home root-owned, but sandbox images built before that
+let the model write it. `deploy/sandbox/Dockerfile` creates the second account.
 
 It does not build the ssh subprocess environment from `os.environ`. The agent
 pod holds `API_SERVER_KEY` and `SESSION_KV_API_KEY`, and `_run_env()` in
@@ -72,17 +72,18 @@ SANDBOX_PRINCIPAL = "hermes"
 # line rather than a second credential, and the separation the module docstring
 # describes is the only thing keeping them apart.
 #
-# Two writers pass it, both for the same reason: they have to write inside a
+# Three writers pass it, all for the same reason: they have to write inside a
 # tree that is `agent:agent` to the leaves, which uid 1001 cannot do.
 # `kanban_workspace_gc.py` unlinks scratch workspaces; `cluster_agent_profile.py`
-# writes one profile's kubeconfig. The alternative in either case — loosening
-# the modes so a shared group could reach in — buys a wider grant than the
-# narrower login does, and leaves uid 1001 writing into a tree uid 1000 owns,
-# which is a symlink-follow waiting to happen.
+# writes one profile's kubeconfig; `bootstrap_delivery.py` renames the delivered
+# onboarding report. The alternative in any case — loosening the modes so a
+# shared group could reach in — buys a wider grant than the narrower login does,
+# and leaves uid 1001 writing into a tree uid 1000 owns, which is a
+# symlink-follow waiting to happen.
 #
-# What makes it safe there does not generalise: neither writer consumes the
+# What makes it safe there does not generalise: no writer consumes the
 # command's output as a fact about the cluster, and a `.bashrc` that hijacked
-# either would be doing to uid 1000's own files what uid 1000 can already do. A
+# one would be doing to uid 1000's own files what uid 1000 can already do. A
 # caller that reads a command's output and believes it must use the default.
 #
 # `read_bytes` is the exception, and it is this module's own default rather than
@@ -95,26 +96,38 @@ TERMINAL_PRINCIPAL = "agent"
 
 # The marker `read_bytes` prints before its payload, so a login shell that
 # writes to stdout cannot corrupt the file. `agent` sources ~/.bashrc even for
-# `ssh host cmd`, and the model owns that file: anything it echoes lands in
+# `ssh host cmd`, and in sandbox images built before the home was root-owned the
+# model owns that file: anything it echoes lands in
 # front of the base64 and turns a readable report into a decode error. Slicing
 # at the marker discards the chatter instead. A model that echoes the marker
 # itself only truncates its own file, which is a paste it could have corrupted
 # by writing the file differently.
 _READ_MARKER = "--- sandbox-exec read ---"
 
-# `read_bytes`' exit code for a path that is not a readable regular file, as
-# distinct from the shell failing for any other reason. Both answer None; the
-# split is what lets a caller log the difference.
+# `read_bytes`' exit code for a path with nothing at it that the reading login
+# can see. It is the only failed
+# read that answers None: a caller polling for a file it expects has to tell
+# "not written yet" from "written and unreadable", and wait only on the first.
+_READ_ABSENT = 5
+
+# `read_bytes`' exit code for a path that holds something other than a readable
+# regular file, as distinct from the shell failing for any other reason.
 _READ_UNREADABLE = 3
 
 # `read_bytes`' exit code for a file that was a readable regular file when it
-# was tested and could not be read through to the cap anyway -- unlinked or
-# replaced in between, an I/O error, a mode change, no scratch space to land it
-# in. It exists because the read and the encode cannot be a pipeline: the
+# was tested and could not be read through to the cap anyway -- replaced in
+# between, an I/O error, a mode change, no scratch space to land it in; a file
+# unlinked in between exits `_READ_ABSENT` instead. It exists because the read and the encode cannot be a pipeline: the
 # pipeline's status is the encoder's, `base64` exits 0 on the empty input a
 # failed `head` hands it, and a failed read would arrive here as a successful
 # zero-byte file and be delivered as the report.
 _READ_INCOMPLETE = 4
+
+# How much of a failed read's stderr `SandboxReadFailed` carries, from the end.
+# The login shell runs first, and on older sandbox images the model owns its
+# startup file, so the stream has no natural bound, and the failing command's
+# own message comes last.
+_READ_STDERR_CHARS = 200
 
 MANAGED_CONFIG_PATH = os.environ.get("HERMES_MANAGED_CONFIG_PATH", "/etc/hermes/config.yaml")
 
@@ -150,6 +163,8 @@ _KNOWN_HOSTS_NAME = "known_hosts"
 # one failing, which is the only signal available: a wrapper that appended its
 # own exit-code sentinel to stdout would corrupt the output of every command
 # that returns anything but text.
+_SSH_FAILURE_EXIT = 255
+
 _SSH_LEVEL_ERRORS = re.compile(
     r"(ssh: connect to host|Connection (refused|closed|timed out|reset)|"
     r"Could not resolve hostname|Permission denied \(publickey|"
@@ -192,6 +207,15 @@ class SandboxMisconfigured(RuntimeError):
 
     Raised rather than defaulted, because the default is the agent pod and
     running there is the thing the sandbox exists to prevent.
+    """
+
+
+class SandboxReadFailed(RuntimeError):
+    """`read_bytes` reached the sandbox and did not get the file back.
+
+    Something other than a readable regular file is at the path, the read
+    failed partway, the remote shell exited non-zero, or the output did not
+    survive the trip.
     """
 
 
@@ -430,7 +454,7 @@ def run(argv: list[str], *, remote_env: dict[str, str] | None = None,
                        principal=principal)
     completed = subprocess.run(command, capture_output=True, text=True,
                                timeout=timeout, env=_client_env(), **stdin_kwargs)
-    if completed.returncode == 255 and _SSH_LEVEL_ERRORS.search(completed.stderr or ""):
+    if completed.returncode == _SSH_FAILURE_EXIT and _SSH_LEVEL_ERRORS.search(completed.stderr or ""):
         raise SandboxUnavailable(
             f"could not reach the shell sandbox: {(completed.stderr or '').strip()}"
         )
@@ -451,11 +475,10 @@ def read_bytes(path: str, *, max_bytes: int, principal: str = TERMINAL_PRINCIPAL
                config_path: str | None = None) -> bytes | None:
     """Up to `max_bytes` bytes of `path` in the sandbox, or None.
 
-    None is "there is nothing to read here": not a regular file, not readable,
-    or output that did not survive the trip. `SandboxUnavailable` is the other
-    answer and means the sandbox was never reached, which a caller may want to
-    retry. A caller that treats both the same is welcome to; keeping them apart
-    is what lets one of them be logged as a fault.
+    None is "nothing at this path that the reading login can see".
+    `SandboxReadFailed` is "the read ran and did not return the file".
+    `SandboxUnavailable` means the sandbox was never reached or ssh itself
+    failed, so nothing is known about the path and a caller may want to retry.
 
     Reads at most `max_bytes`, and bounds the transfer as well as the result:
     the cap is applied by `head` on the far side, so a caller asking for 32 KiB
@@ -463,7 +486,7 @@ def read_bytes(path: str, *, max_bytes: int, principal: str = TERMINAL_PRINCIPAL
     to tell "at the limit" from "over it", the way a local capped read does.
 
     `principal` defaults to `TERMINAL_PRINCIPAL`, which is NOT this module's
-    default and is deliberate. The other two callers that name it pass it to
+    default and is deliberate. The other callers that name it pass it to
     write inside an `agent`-owned tree; this one passes it to read with no more
     privilege than whoever wrote the file had. Every deliverable in the sandbox
     is written by the model's own shell, which logs in as `terminal.ssh_user` --
@@ -496,24 +519,41 @@ def read_bytes(path: str, *, max_bytes: int, principal: str = TERMINAL_PRINCIPAL
     sandbox is configured. Call it behind `sandbox_enabled()`.
     """
     quoted = shlex.quote(path)
+    # Every failed test asks again whether anything is there, so a file removed
+    # partway reads as absent rather than as a fault. `-L` keeps a dangling
+    # symlink out of "absent": left at a path a caller polls, it would read as
+    # "not written yet" forever.
+    absent = f'[ -e {quoted} ] || [ -L {quoted} ] || exit {_READ_ABSENT}'
     script = (
+        f'{absent}; '
         f'if [ ! -f {quoted} ] || [ ! -r {quoted} ]; then '
-        f'exit {_READ_UNREADABLE}; fi; '
+        f'{absent}; exit {_READ_UNREADABLE}; fi; '
         f'scratch=$(mktemp) || exit {_READ_INCOMPLETE}; '
         f"trap 'rm -f \"$scratch\"' EXIT; "
         f'head -c {int(max_bytes)} -- {quoted} > "$scratch" '
-        f'|| exit {_READ_INCOMPLETE}; '
+        f'|| {{ {absent}; exit {_READ_INCOMPLETE}; }}; '
         f'printf "%s\\n" {shlex.quote(_READ_MARKER)}; '
         f'base64 -w0 < "$scratch"'
     )
     completed = run(["sh", "-c", script], principal=principal, timeout=timeout,
                     path=config_path)
-    if completed.returncode != 0:
+    if completed.returncode == _READ_ABSENT:
         return None
+    if completed.returncode == _READ_UNREADABLE:
+        raise SandboxReadFailed(f"{path} is not a readable regular file")
+    stderr = (completed.stderr or "").strip()[-_READ_STDERR_CHARS:]
+    if completed.returncode == _SSH_FAILURE_EXIT:
+        # The script never exits 255, so this is ssh failing with a message
+        # `run` does not recognise, and the script may never have run.
+        raise SandboxUnavailable(f"ssh failed reading {path}: {stderr}")
+    if completed.returncode != 0:
+        raise SandboxReadFailed(
+            f"reading {path} exited {completed.returncode}: {stderr}"
+        )
     _, marker, encoded = (completed.stdout or "").partition(_READ_MARKER)
     if not marker:
-        return None
+        raise SandboxReadFailed(f"reading {path} printed no payload")
     try:
         return base64.b64decode(encoded.strip(), validate=True)
-    except (ValueError, binascii.Error):
-        return None
+    except (ValueError, binascii.Error) as exc:
+        raise SandboxReadFailed(f"{path} did not arrive intact: {exc}") from exc

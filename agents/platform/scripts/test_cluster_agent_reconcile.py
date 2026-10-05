@@ -8,6 +8,7 @@ deleted.
 """
 
 import json
+import time
 from datetime import datetime, timezone
 import os
 import shutil
@@ -150,9 +151,14 @@ class ReconcileTest(HomesMixin):
 
 
 def _name_for(identity_kwargs, identities):
-    """Reverse-map an identity dict back to its profile name for the existence stub."""
+    """Reverse-map an identity dict back to its profile name for the existence stub.
+
+    The prune's describe passes a `timeout` the identity does not carry; it is not
+    part of the identity.
+    """
+    identity = {k: v for k, v in identity_kwargs.items() if k != "timeout"}
     for name, ident in identities.items():
-        if ident == identity_kwargs:
+        if ident == identity:
             return name
     raise KeyError(identity_kwargs)
 
@@ -877,10 +883,19 @@ class ScopeTest(HomesMixin):
         retiring = next(p for p in self._snapshot()["projects"] if p["id"] == "gone")
         self.assertEqual((retiring["state"], retiring["clusters"]), (rec.STATE_RETIRING, 1))
         os.environ.pop(rec.SCOPE_FILE_ENV, None)
+        described: list = []
+
+        def exists(project, cluster, location, timeout=None):
+            described.append(cluster)
+            return True
+
         report, _, deleted = self._run({"projects": []}, {self.MGMT: []},
-                                       profiles=["cluster-g"], identities=gone_profile)
+                                       profiles=["cluster-g"], identities=gone_profile, exists=exists)
         self.assertEqual(deleted, ["cluster-g"])
         self.assertEqual([p for p in self._snapshot()["projects"] if p["id"] == "gone"], [])
+        # The scope prune is on the strength of the declaration; the profile's cluster is
+        # not described (its project has usually lost the read roles by now).
+        self.assertEqual(described, [])
 
     def test_a_profile_the_scope_never_produced_is_kept_and_listed_unmanaged(self):
         # Condition (3) fails: no previous snapshot names the project.
@@ -1139,7 +1154,7 @@ class ScopeTest(HomesMixin):
                 # Honours the timeout the way gcloud's would: sleeps no longer than it.
                 time.sleep(min(1.5, timeout if timeout is not None else 1.5))
             return [], rec.OUTCOME_OK
-        baseline = threading.active_count()
+        before = set(threading.enumerate())
         start = time.monotonic()
         with mock.patch.object(rec, "LIST_BUDGET_SECONDS", 0.3), mock.patch.object(rec, "LIST_GRACE_SECONDS", 0.05):
             report, _, deleted = self._run({"projects": ["slow", "quick"]}, lister,
@@ -1153,7 +1168,8 @@ class ScopeTest(HomesMixin):
         # by more than the grace: the interpreter joins the pool's threads at exit.
         self.assertLessEqual(cuts["slow"], 1.0)
         time.sleep(1.2)
-        self.assertEqual(threading.active_count(), baseline)
+        # Threads, not a count: an earlier test's pool worker can still be exiting when this starts.
+        self.assertEqual([t for t in threading.enumerate() if t not in before], [])
 
     # ---- phase 2: folders and organisations through Cloud Asset Inventory ----
 
@@ -1274,6 +1290,120 @@ class ScopeTest(HomesMixin):
         self.assertEqual(report["retiring"], ["p2"])
         self.assertEqual(rows["team-a"]["state"], rec.STATE_IN_SCOPE)
 
+    def test_the_cap_is_the_declarations_max_projects(self):
+        # spec.scope.maxProjects, rendered into the declaration, replaces the fixed constant:
+        # the management project and two explicit projects fit a cap of 3, the rest read
+        # over-cap, and the snapshot records the cap in force beside the declaration.
+        scope = {"projects": ["alpha", "beta", "gamma", "delta"], rec.SCOPE_MAX_PROJECTS_KEY: 3}
+        listings = {p: [(p, "c", "us-central1")] for p in [self.MGMT, "alpha", "beta", "gamma", "delta"]}
+        report, created, _ = self._run(scope, listings)
+        self.assertEqual(sorted(p for p, _c, _l in created), sorted([self.MGMT, "alpha", "beta"]))
+        self.assertEqual(report["projects"]["gamma"], rec.OUTCOME_OVER_CAP)
+        self.assertEqual(report["projects"]["delta"], rec.OUTCOME_OVER_CAP)
+        self.assertEqual(report["maxProjects"], 3)
+        snap = self._snapshot()
+        self.assertEqual(snap[rec.SCOPE_MAX_PROJECTS_KEY], 3)
+        self.assertEqual(snap["declared"][rec.SCOPE_MAX_PROJECTS_KEY], 3)
+
+    def test_a_declaration_without_a_cap_or_with_a_bad_one_reads_the_default(self):
+        # A render from an operator that predates the field carries no key; a value that is
+        # not a positive integer (a string, zero, a boolean) is not a cap either. Both read
+        # as the default, never as no cap.
+        listings = {self.MGMT: []}
+        for declared in ({}, {rec.SCOPE_MAX_PROJECTS_KEY: "lots"}, {rec.SCOPE_MAX_PROJECTS_KEY: 0},
+                         {rec.SCOPE_MAX_PROJECTS_KEY: True}, {rec.SCOPE_MAX_PROJECTS_KEY: -5}):
+            with self.subTest(declared=declared):
+                report, _, _ = self._run(declared, listings)
+                self.assertEqual(report["maxProjects"], rec.RESOLVED_SET_CAP)
+                self.assertEqual(self._snapshot()[rec.SCOPE_MAX_PROJECTS_KEY], rec.RESOLVED_SET_CAP)
+
+    def test_the_workers_and_the_budget_scale_with_the_cap(self):
+        # Workers first, up to their ceiling, then the budget: a cap of 200 lists with twice
+        # the workers in the same budget; past 400 the workers are capped and the budget
+        # grows a round at a time.
+        per_default = rec.LIST_WORKERS
+        self.assertEqual(rec._list_workers(rec.RESOLVED_SET_CAP), per_default)
+        self.assertEqual(rec._list_workers(rec.RESOLVED_SET_CAP // 2), per_default)
+        self.assertEqual(rec._list_workers(2 * rec.RESOLVED_SET_CAP), 2 * per_default)
+        self.assertEqual(2 * per_default, rec.LIST_WORKERS_MAX, "the ceiling is twice the default until #1913 measures the sandbox")
+        self.assertEqual(rec._list_workers(4 * rec.RESOLVED_SET_CAP), rec.LIST_WORKERS_MAX)
+        self.assertEqual(rec._list_workers(50 * rec.RESOLVED_SET_CAP), rec.LIST_WORKERS_MAX)
+        budget = rec.LIST_BUDGET_SECONDS
+        self.assertEqual(rec._list_budget_seconds(rec.RESOLVED_SET_CAP), budget)
+        self.assertEqual(rec._list_budget_seconds(2 * rec.RESOLVED_SET_CAP), budget)
+        self.assertEqual(rec._list_budget_seconds(4 * rec.RESOLVED_SET_CAP), 2 * budget)
+        self.assertEqual(rec._list_budget_seconds(5 * rec.RESOLVED_SET_CAP), 3 * budget)
+        self.assertEqual(rec._list_budget_seconds(10 * rec.RESOLVED_SET_CAP), 5 * budget)
+        self.assertEqual(rec._prune_budget_seconds(5 * rec.RESOLVED_SET_CAP), 3 * rec.PRUNE_BUDGET_SECONDS)
+        # The prune's budget follows the profiles too, per describe rather than per round
+        # of workers: the sandbox's CPU serialises the describes, so 120 profiles get the
+        # sequential walk's time whatever the worker count, and eight stay on the floor.
+        self.assertEqual(rec._prune_budget_seconds(rec.RESOLVED_SET_CAP, 120), 120 * rec.PRUNE_SECONDS_PER_DESCRIBE)
+        self.assertEqual(rec._prune_budget_seconds(rec.RESOLVED_SET_CAP, 8), rec.PRUNE_BUDGET_SECONDS)
+
+    def test_each_describe_takes_the_budget_left_not_its_full_timeout(self):
+        # The bounded map cuts each describe's timeout to the budget remaining, so no
+        # worker outlives the deadline by more than the grace; the first round's finding
+        # was describes still at DESCRIBE_TIMEOUT_SECONDS past the prune deadline.
+        seen: list = []
+
+        def exists(project, cluster, location, timeout=None):
+            seen.append(timeout)
+            return True
+
+        ids = {f"cluster-{i}": _identity(self.MGMT, f"c{i}") for i in range(3)}
+        with mock.patch.object(rec, "PRUNE_BUDGET_SECONDS", 2), mock.patch.object(rec, "PRUNE_SECONDS_PER_DESCRIBE", 0.5):
+            self._run({}, {self.MGMT: []}, profiles=list(ids), identities=ids, exists=exists)
+        self.assertEqual(len(seen), 3)
+        self.assertTrue(all(t is not None and 0 < t <= 2 for t in seen), seen)
+        # And it is the budget left, not DESCRIBE_TIMEOUT_SECONDS: under the pool a
+        # describe waits for the sandbox CPU its pool-mates hold, and the 30 s cut read 44
+        # of 120 live clusters as unknown on a two-CPU sandbox at eight workers.
+        seen.clear()
+        with mock.patch.object(rec, "PRUNE_BUDGET_SECONDS", 50), mock.patch.object(rec, "DESCRIBE_TIMEOUT_SECONDS", 1):
+            self._run({}, {self.MGMT: []}, profiles=list(ids), identities=ids, exists=exists)
+        self.assertTrue(all(t is not None and 1 < t <= 50 for t in seen), seen)
+        with mock.patch.object(rec.sandbox_exec, "run") as run:
+            rec._cluster_exists("p", "c", "us-central1", timeout=7)
+        self.assertEqual(run.call_args.kwargs["timeout"], 7)
+
+
+    def test_prune_describes_run_in_parallel_under_their_own_budget(self):
+        # Three profiles, one whose describe stalls past the prune budget: the stalled one
+        # reads inconclusive and is kept, the other two are judged, and the run does not
+        # wait out the stall (the walk used to be sequential at 30 s per stalled cluster).
+        ids = {"cluster-a": _identity(self.MGMT, "a"), "cluster-b": _identity(self.MGMT, "b"),
+               "cluster-c": _identity(self.MGMT, "c")}
+
+        def exists(project, cluster, location, timeout=None):
+            if cluster == "a":
+                time.sleep(0.6)
+            return True if cluster != "c" else False
+
+        listings = {self.MGMT: [(self.MGMT, "b", "us-central1")]}
+        started = time.monotonic()
+        with mock.patch.object(rec, "PRUNE_BUDGET_SECONDS", 0.2), mock.patch.object(rec, "PRUNE_SECONDS_PER_DESCRIBE", 0.05), \
+                mock.patch.object(rec, "LIST_GRACE_SECONDS", 0.05):
+            report, _, deleted = self._run({}, listings, profiles=list(ids), identities=ids, exists=exists)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.55, "the run waited out a stalled describe")
+        self.assertEqual(report["skipped_error"], ["cluster-a"])
+        self.assertEqual(report["kept"], ["cluster-b"])
+        self.assertEqual(deleted, ["cluster-c"])
+
+    def test_an_excluded_cluster_is_pruned_without_a_describe(self):
+        calls: list = []
+
+        def exists(project, cluster, location, timeout=None):
+            calls.append(cluster)
+            return True
+
+        ids = {"cluster-a": _identity(self.MGMT, "a"), "cluster-b": _identity(self.MGMT, "b")}
+        scope = {"exclude": {"projects": [], "clusters": [{"projectId": self.MGMT, "location": "us-central1", "clusterName": "a"}]}}
+        report, _, deleted = self._run(scope, {self.MGMT: []}, profiles=list(ids), identities=ids, exists=exists)
+        self.assertEqual(deleted, ["cluster-a"])
+        self.assertEqual(calls, ["b"])
+
     def test_a_project_that_moved_into_an_over_cap_folder_is_kept_not_retired(self):
         # x was reached through F1; it moves to F2, whose membership crosses the cap. The run
         # knows x is under F2, so x is carried over-cap rather than judged absent.
@@ -1320,7 +1450,7 @@ class ScopeTest(HomesMixin):
         members = {"team-a": [("team-a", "prod", "us-central1"), ("team-a", "dev", "us-central1")]}
         probes: list[tuple] = []
 
-        def describe(project, cluster, location):
+        def describe(project, cluster, location, timeout=None):
             probes.append((project, cluster))
             rec._denied_this_run.add(project)
             return None
@@ -1736,7 +1866,7 @@ class ScopeTest(HomesMixin):
         members = {"team-a": [("team-a", "prod", "us-central1")], "team-b": [("team-b", "old", "us-central1")],
                    "team-c": [("team-c", "live", "us-central1")]}
 
-        def probe(project, cluster, location):
+        def probe(project, cluster, location, timeout=None):
             if project == "team-a":
                 rec._denied_this_run.add(project)
                 return None
@@ -1810,7 +1940,7 @@ class ScopeTest(HomesMixin):
         members = {"team-a": [("team-a", "prod", "us-central1")]}
         ids = {"cluster-a": _identity("team-a", "prod")}
 
-        def describe(project, cluster, location):
+        def describe(project, cluster, location, timeout=None):
             rec._denied_this_run.add(project)
             return None
         report, _, _ = self._run({"folders": ["123456789012"]}, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
@@ -2174,7 +2304,7 @@ class ScopeTest(HomesMixin):
     def _recording_exists(self):
         calls: list = []
 
-        def exists(project, cluster, location):
+        def exists(project, cluster, location, timeout=None):
             calls.append((project, cluster, location))
             return True
         return exists, calls
@@ -2429,12 +2559,261 @@ class ScopeTest(HomesMixin):
         self.assertNotIn("222", report["projects"])
 
     def test_excluding_the_bare_number_drops_a_member_the_run_could_not_name(self):
-        report, created, _ = self._run({"metricsScopes": ["mon-proj"], "exclude": {"projects": ["333"]}},
-                                       {self.MGMT: [(self.MGMT, "m", "us-central1")]},
-                                       selectors={self.SCOPE: (["333"], rec.OUTCOME_OK)}, numbers={"333": (None, rec.OUTCOME_DENIED)})
+        # An excluded number whose naming call is refused (the install path withheld the
+        # grant on that entry) is dropped on the number, and is neither reported as unnamed
+        # nor a hold on the prune: the number is the declaration speaking.
+        with mock.patch.object(rec, "log") as logged:
+            report, created, _ = self._run({"metricsScopes": ["mon-proj"], "exclude": {"projects": ["333"]}},
+                                           {self.MGMT: [(self.MGMT, "m", "us-central1")]},
+                                           selectors={self.SCOPE: (["333"], rec.OUTCOME_OK)}, numbers={"333": (None, rec.OUTCOME_DENIED)})
         self.assertEqual(created, [(self.MGMT, "m", "us-central1")])
         self.assertEqual(sorted(report["projects"]), [self.MGMT])
         self.assertNotIn("333", {p["id"] for p in self._snapshot()["projects"]})
+        self.assertNotIn("prune is held", " ".join(str(c) for c in logged.call_args_list))
+        self.assertEqual(self._snapshot()["containers"], [{"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}])
+
+    def test_excluding_the_number_drops_a_member_a_past_run_named_once_its_grant_is_gone(self):
+        # Run N named 111 as team-a and listed it. The operator then names 111 in
+        # exclude.projects and applies: the install path withholds team-a's grant on that
+        # entry, so this run's naming call is refused and the member is keyed under the ID
+        # the snapshot remembers. The entry has to match that row by its number, or the
+        # project reads denied under its ID on every tick, profiles kept, instead of leaving.
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": [self.SCOPE], "state": rec.STATE_IN_SCOPE, rec.NUMBER_KEY: "111"}],
+                             containers=[{"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}])
+        ids = {"cluster-a": _identity("team-a", "prod")}
+        declaration = {"metricsScopes": ["mon-proj"], "exclude": {"projects": ["111"]}}
+        report, created, deleted = self._run(declaration, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
+                                             selectors={self.SCOPE: (["111"], rec.OUTCOME_OK)},
+                                             numbers={"111": (None, rec.OUTCOME_DENIED)})
+        self.assertEqual((created, deleted), ([], []))
+        self.assertNotIn("team-a", report["projects"])
+        self.assertEqual(report["retiring"], ["team-a"])
+        row = next(p for p in self._snapshot()["projects"] if p["id"] == "team-a")
+        self.assertEqual((row["state"], row[rec.NUMBER_KEY]), (rec.STATE_RETIRING, "111"))
+        # The same entry keeps the member out when the selector's own lookup fails and its
+        # previous members are carried frozen.
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": [self.SCOPE], "state": rec.STATE_IN_SCOPE, rec.NUMBER_KEY: "111"}],
+                             containers=[{"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}])
+        report, _, _ = self._run(declaration, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
+                                 selectors={self.SCOPE: (None, rec.OUTCOME_DENIED)})
+        self.assertNotIn("team-a", report["projects"])
+
+    def test_excluding_the_number_drops_the_project_on_the_explicit_and_container_routes_too(self):
+        # team-a is monitored by the scope (number 111), declared in `projects` and under a
+        # declared folder; 111 is excluded. The explicit and folder routes reach it by ID, so
+        # the entry has to be tied to the ID: by naming the number, which the grant those
+        # routes carry allows, whether or not a past row kept it. Without that the project
+        # stays fully managed with nothing saying the entry matched nothing.
+        ids = {"cluster-a": _identity("team-a", "prod")}
+        declaration = {"projects": ["team-a"], "folders": ["123456789012"], "metricsScopes": ["mon-proj"],
+                       "exclude": {"projects": ["111"]}}
+        members = {"team-a": [("team-a", "prod", "us-central1")]}
+        # `numberless`: the row a run before the scope was declared wrote, explicit and under
+        # the folder with no number; the scope and the number entry arrive in one edit, so the
+        # tie is this run's naming pass alone. The retire hold has to see that tie as the
+        # resolution did, or the project is held a day as an index lag with its profile kept,
+        # the declaration having named it.
+        for previous in (None, "named", "numberless"):
+            with self.subTest(previous_row=previous):
+                if previous:
+                    row = {"id": "team-a", "via": ["explicit", self.FOLDER, self.SCOPE], "state": rec.STATE_IN_SCOPE,
+                           rec.NUMBER_KEY: "111"}
+                    if previous == "numberless":
+                        row = {"id": "team-a", "via": ["explicit", self.FOLDER], "state": rec.STATE_IN_SCOPE}
+                    self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE}, row],
+                                         containers=[{"id": self.FOLDER, "outcome": rec.OUTCOME_OK, "projects": 1}]
+                                         + ([{"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}] if previous == "named" else []))
+                report, created, deleted = self._run(declaration, {self.MGMT: [], "team-a": members["team-a"]},
+                                                     profiles=["cluster-a"], identities=ids,
+                                                     searches={self.FOLDER: (members, rec.OUTCOME_OK)},
+                                                     selectors={self.SCOPE: (["111"], rec.OUTCOME_OK)},
+                                                     numbers={"111": ("team-a", rec.OUTCOME_OK)})
+                self.assertEqual((created, deleted), ([], []))
+                self.assertNotIn("team-a", report["projects"])
+                # In scope last run: retiring now, its profile kept until the next clean run.
+                self.assertEqual(report["retiring"], ["team-a"] if previous else [])
+                snap = self._snapshot()
+                self.assertEqual([u["reason"] for u in snap["unmanaged"]],
+                                 ["left the scope this run; retiring, pruned on the next clean run" if previous else "never in scope"])
+                if previous:
+                    row = next(p for p in snap["projects"] if p["id"] == "team-a")
+                    self.assertEqual((row["state"], row[rec.NUMBER_KEY]), (rec.STATE_RETIRING, "111"))
+        # A snapshot that no longer carries the row (the project dropped last run, nothing
+        # to retire) still drops it: the naming pass ties the number every run.
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE}])
+        report, _, _ = self._run(declaration, {self.MGMT: [], "team-a": members["team-a"]},
+                                 searches={self.FOLDER: (members, rec.OUTCOME_OK)},
+                                 selectors={self.SCOPE: (["111"], rec.OUTCOME_OK)},
+                                 numbers={"111": ("team-a", rec.OUTCOME_OK)})
+        self.assertNotIn("team-a", report["projects"])
+        # An ID no run can tie to the number (the naming call refused, no row kept) is beyond
+        # the entry's reach on those routes: the number matches the bare-number row a
+        # selector keys it under, and that only.
+        declaration["exclude"]["projects"].append("222")
+        report, created, _ = self._run(declaration, {self.MGMT: [], "team-b": [("team-b", "x", "us-central1")]},
+                                       searches={self.FOLDER: ({"team-b": [("team-b", "x", "us-central1")]}, rec.OUTCOME_OK)},
+                                       selectors={self.SCOPE: (["222"], rec.OUTCOME_OK)})
+        self.assertIn("team-b", report["projects"])
+        self.assertNotIn("222", report["projects"])
+
+    def test_a_transient_naming_failure_does_not_re_admit_a_project_excluded_by_number(self):
+        # team-a is explicit, under a declared folder and monitored (111); 111 is excluded. Once
+        # the exclusion has held for a run the project has no row, so the number -> ID pair has
+        # to live somewhere else: the snapshot's `numbers` memo. On a run whose naming call is
+        # cut, the memo ties the number and the project stays out; without it the explicit and
+        # folder routes would admit it, create its profiles, and the next run would retire them.
+        declaration = {"projects": ["team-a"], "folders": ["123456789012"], "metricsScopes": ["mon-proj"],
+                       "exclude": {"projects": ["111"]}}
+        members = {"team-a": [("team-a", "prod", "us-central1")]}
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE}])
+        report, created, _ = self._run(declaration, {self.MGMT: [], "team-a": members["team-a"]},
+                                       searches={self.FOLDER: (members, rec.OUTCOME_OK)},
+                                       selectors={self.SCOPE: (["111"], rec.OUTCOME_OK)},
+                                       numbers={"111": ("team-a", rec.OUTCOME_OK)})
+        self.assertEqual((created, sorted(report["projects"])), ([], [self.MGMT]))
+        self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
+        self.assertEqual(rec._previous_numbers(self._snapshot()), {"111": "team-a"})
+        # A tick that consults no selector keeps every pair, as it carries the last declaration
+        # and every row: the CR without its scope block, a render from before the selector
+        # keys, and an unreadable file. Each would otherwise forget the one pair no row holds.
+        self._run({rec.SCOPE_PRESENT_KEY: False}, {self.MGMT: []})
+        self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
+        (Path(self._tmp.name) / "scope.json").write_text(json.dumps(
+            {rec.SCOPE_PRESENT_KEY: True, "projects": ["team-a"], "folders": ["123456789012"], "organizations": [],
+             "exclude": {"projects": ["111"], "clusters": []}}), encoding="utf-8")
+        self._run(None, {self.MGMT: [], "team-a": members["team-a"]}, searches={self.FOLDER: (members, rec.OUTCOME_OK)})
+        self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
+        (Path(self._tmp.name) / "scope.json").write_text("{not json", encoding="utf-8")
+        self._run(None, {self.MGMT: []})
+        self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
+        for naming in (rec.OUTCOME_UNREACHABLE, rec.OUTCOME_DENIED):
+            with self.subTest(naming=naming), mock.patch.object(rec, "log") as logged:
+                report, created, _ = self._run(declaration, {self.MGMT: [], "team-a": members["team-a"]},
+                                               searches={self.FOLDER: (members, rec.OUTCOME_OK)},
+                                               selectors={self.SCOPE: (["111"], rec.OUTCOME_OK)},
+                                               numbers={"111": (None, naming)})
+                self.assertEqual((created, sorted(report["projects"]), report["retiring"]), ([], [self.MGMT], []))
+                logs = " ".join(str(c) for c in logged.call_args_list)
+                self.assertNotIn("prune", logs)
+                self.assertNotIn("could not be named", logs)
+                # The pair outlives the run that could not name it, for the next one.
+                self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
+        # The pair also serves the other direction: the exclusion lifted while the naming call
+        # is refused, the member is reported under its ID rather than by number with the prune
+        # held, the identity being one a run has named.
+        with mock.patch.object(rec, "log") as logged:
+            report, created, _ = self._run({"metricsScopes": ["mon-proj"]}, {self.MGMT: []},
+                                           selectors={self.SCOPE: (["111"], rec.OUTCOME_OK)},
+                                           numbers={"111": (None, rec.OUTCOME_DENIED)})
+        self.assertEqual((report["projects"].get("team-a"), created), (rec.OUTCOME_DENIED, []))
+        self.assertNotIn("111", report["projects"])
+        self.assertNotIn("prune is held", " ".join(str(c) for c in logged.call_args_list))
+        # The memo follows what needs the tie: kept while a lookup fails (what it would report
+        # is unknown), kept while the entry names the number although the scope no longer
+        # reports it, and dropped once neither holds.
+        self._run(declaration, {self.MGMT: []}, selectors={self.SCOPE: (None, rec.OUTCOME_UNREACHABLE)})
+        self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
+        self._run(declaration, {self.MGMT: []}, selectors={self.SCOPE: ([], rec.OUTCOME_OK)})
+        self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
+        self._run({**declaration, "exclude": {"projects": []}}, {self.MGMT: []}, selectors={self.SCOPE: ([], rec.OUTCOME_OK)})
+        self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {})
+        # No run has ever named the number and this one cannot: the entry drops the member by
+        # number alone, and the log says the ID routes are beyond it until a run names it. A
+        # refusal is the install path having withheld the grant, which no route lists without,
+        # and stays silent.
+        for naming, said in ((rec.OUTCOME_UNREACHABLE, True), (rec.OUTCOME_DENIED, False)):
+            with self.subTest(never_named=naming), mock.patch.object(rec, "log") as logged:
+                self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE}])
+                report, _, _ = self._run(declaration, {self.MGMT: []},
+                                         searches={self.FOLDER: ({}, rec.OUTCOME_OK)},
+                                         selectors={self.SCOPE: (["111"], rec.OUTCOME_OK)}, numbers={"111": (None, naming)})
+                self.assertNotIn("111", report["projects"])
+                logs = " ".join(str(c) for c in logged.call_args_list)
+                self.assertEqual("reaches no route that names the project by ID" in logs, said, naming)
+                self.assertNotIn("prune", logs)
+
+    def test_an_entry_naming_a_number_only_a_row_tied_keeps_the_tie_past_the_row(self):
+        # team-a was named 111 once (the row keeps it) and has since left the Metrics Scope, so
+        # the memo no longer holds the pair; the operator now excludes 111 while team-a is still
+        # explicit with profiles. The entry drops team-a on the row's number and retires it, the
+        # profiles go on the next clean run, and the row with them: the memo has to keep the
+        # pair for as long as the entry stands, or the third run, finding no row and no pair,
+        # admits team-a again and scaffolds the profiles it just deleted.
+        ids = {"cluster-a": _identity("team-a", "prod")}
+        declaration = {"projects": ["team-a"], "metricsScopes": ["mon-proj"], "exclude": {"projects": ["111"]}}
+        listings = {self.MGMT: [], "team-a": [("team-a", "prod", "us-central1")]}
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": ["explicit", self.SCOPE], "state": rec.STATE_IN_SCOPE, rec.NUMBER_KEY: "111"}],
+                             containers=[{"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}])
+        report, created, deleted = self._run(declaration, listings, profiles=["cluster-a"], identities=ids,
+                                             selectors={self.SCOPE: ([], rec.OUTCOME_OK)})
+        self.assertEqual((created, deleted, report["retiring"]), ([], [], ["team-a"]))
+        self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
+        report, created, deleted = self._run(declaration, listings, profiles=["cluster-a"], identities=ids,
+                                             selectors={self.SCOPE: ([], rec.OUTCOME_OK)})
+        self.assertEqual((created, deleted), ([], ["cluster-a"]))
+        snap = self._snapshot()
+        self.assertNotIn("team-a", {p["id"] for p in snap["projects"]})
+        self.assertEqual(snap[rec.NUMBERS_KEY], {"111": "team-a"})
+        for _ in range(2):
+            report, created, _ = self._run(declaration, listings, selectors={self.SCOPE: ([], rec.OUTCOME_OK)})
+            self.assertEqual((created, sorted(report["projects"])), ([], [self.MGMT]))
+            self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
+        # The entry withdrawn, the number unreported: the pair leaves, and team-a is explicit again.
+        report, created, _ = self._run({"projects": ["team-a"], "metricsScopes": ["mon-proj"]}, listings,
+                                       selectors={self.SCOPE: ([], rec.OUTCOME_OK)})
+        self.assertEqual((created, self._snapshot()[rec.NUMBERS_KEY]), ([("team-a", "prod", "us-central1")], {}))
+
+    def test_a_glob_never_matches_a_project_number(self):
+        # `*[0-9]*` is written against IDs, to keep numbered sandboxes out. Now that a number
+        # matches on every route, a glob that happens to match twelve digits would drop every
+        # monitored project once a run had named it, and retire its profiles, while the install
+        # path (an exact filter) kept the binding. A number matches an entry by equality alone,
+        # tied to an ID or keyed bare, on the explicit route, the selector route and the retire hold.
+        ids = {"cluster-a": _identity("team-a", "prod")}
+        declaration = {"projects": ["team-a"], "metricsScopes": ["mon-proj"], "exclude": {"projects": ["*[0-9]*"]}}
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": ["explicit", self.SCOPE], "state": rec.STATE_IN_SCOPE, rec.NUMBER_KEY: "461802785698"}],
+                             containers=[{"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}])
+        report, created, deleted = self._run(declaration, {self.MGMT: [], "team-a": [("team-a", "prod", "us-central1")],
+                                                           "team1-dev": [("team1-dev", "x", "us-central1")]},
+                                             profiles=["cluster-a"], identities=ids,
+                                             selectors={self.SCOPE: (["461802785698", "222"], rec.OUTCOME_OK)},
+                                             numbers={"461802785698": ("team-a", rec.OUTCOME_OK), "222": ("team1-dev", rec.OUTCOME_OK)})
+        self.assertEqual((report["projects"].get("team-a"), report["retiring"], deleted), (rec.OUTCOME_OK, [], []))
+        self.assertIn("cluster-a", report["kept"])
+        self.assertNotIn("team1-dev", report["projects"])  # the glob still matches the ID it was written for
+        self.assertEqual(created, [])
+        self.assertEqual(self._snapshot()["ignoredExcludes"], [])
+        # A bare-number key is a number too: the glob leaves the unnamed member, and its hold, alone.
+        with mock.patch.object(rec, "log") as logged:
+            report, _, _ = self._run({"metricsScopes": ["mon-proj"], "exclude": {"projects": ["*3*"]}}, {self.MGMT: []},
+                                     selectors={self.SCOPE: (["333"], rec.OUTCOME_OK)}, numbers={"333": (None, rec.OUTCOME_DENIED)})
+        self.assertEqual(report["projects"].get("333"), rec.OUTCOME_DENIED)
+        self.assertIn("prune is held", " ".join(str(c) for c in logged.call_args_list))
+        self.assertEqual(rec._excluded_by("333", ["*3*"]), None)
+        self.assertEqual(rec._excluded_by("333", ["333"]), "333")
+
+    def test_an_entry_naming_the_management_projects_number_is_ignored_and_recorded(self):
+        # The scope monitors the management project too, and the operator's number entry
+        # names it: ignored like an entry that names its ID, and recorded the same way, on the
+        # run that names the number and on a later one whose naming call is refused, when the
+        # tie is the row's.
+        declaration = {"metricsScopes": ["mon-proj"], "exclude": {"projects": ["999"]}}
+        for numbers in ({"999": (self.MGMT, rec.OUTCOME_OK)}, {"999": (None, rec.OUTCOME_DENIED)}):
+            with self.subTest(numbers=numbers), mock.patch.object(rec, "log") as logged:
+                report, created, _ = self._run(declaration, {self.MGMT: [(self.MGMT, "m", "us-central1")]},
+                                               selectors={self.SCOPE: (["999"], rec.OUTCOME_OK)}, numbers=numbers)
+                self.assertEqual(created, [(self.MGMT, "m", "us-central1")])
+                self.assertEqual(report["projects"], {self.MGMT: rec.OUTCOME_OK})
+                snap = self._snapshot()
+                self.assertEqual(snap["ignoredExcludes"], [{"project": self.MGMT, "pattern": "999"}])
+                row = next(p for p in snap["projects"] if p["id"] == self.MGMT)
+                self.assertEqual((row["via"], row[rec.NUMBER_KEY]), (["management", self.SCOPE], "999"))
+                self.assertIn(f"matches the management project {self.MGMT} by its number 999",
+                              " ".join(str(c) for c in logged.call_args_list))
 
     def test_a_row_written_under_the_bare_number_is_no_mapping(self):
         self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},

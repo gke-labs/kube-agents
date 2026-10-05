@@ -77,8 +77,7 @@ def _clear_mount_skeleton(home: Path) -> bool:
 
 # Absolute, because a kanban worker's terminal runs with a stripped environment in
 # which /opt/hermes/.venv/bin is not on PATH — a bare `hermes` raises ENOENT there
-# while working fine from an interactive shell. Same trap as `_roster_command` in
-# agents/chat/scripts/bootstrap_scan_gate.py.
+# while working fine from an interactive shell.
 HERMES_BIN = os.environ.get("HERMES_BIN") or "/opt/hermes/.venv/bin/hermes"
 
 
@@ -191,10 +190,10 @@ def merge_cron_store(
     job is treated as if the image did not carry it, so the volume's copy — or
     its deliberate absence — stands. The default profile needs that, because
     two of the jobs it ships **delete themselves**: `bootstrap_delivery.py`
-    calls `remove_job` on the onboarding pair once the report is delivered.
-    Merging that roster unfiltered would resurrect both on the next pod
-    restart, and they would then poll once a minute forever, no-op on the
-    `.bootstrap_completed` marker, and record a scheduler execution every time.
+    calls `remove_job` on the onboarding pair on a run after the one that
+    delivers the report. Merging that roster unfiltered would resurrect both
+    on every pod restart, only for the delivery job to find the old
+    `.bootstrap_completed` marker and remove both again on its first tick.
     Naming the ids keeps the force-merge to the entries whose definition the
     image genuinely owns; the platform profile passes nothing here and merges
     its whole roster as before.

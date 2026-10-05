@@ -182,7 +182,7 @@ class ReleasePublishWorkflowTest(unittest.TestCase):
             for step in steps
             if str(step.get("uses", "")).startswith("actions/create-github-app-token@")
         )
-        self.assertIn("RELEASE_BOT_APP_ID", token_step["with"]["app-id"])
+        self.assertIn("RELEASE_BOT_APP_ID", token_step["with"]["client-id"])
         self.assertIn("RELEASE_BOT_APP_PRIVATE_KEY", token_step["with"]["private-key"])
         self.assertEqual(token_step["with"].get("permission-contents"), "write")
         self.assertEqual(token_step["with"].get("permission-workflows"), "write")
@@ -211,6 +211,15 @@ class ReleasePublishWorkflowTest(unittest.TestCase):
                 return step
         self.fail(f"step {name!r} not found in job {job!r}")
 
+
+    def test_a_release_line_dispatch_reaches_the_gate_and_the_two_resolving_steps(self):
+        """`release_line` is read by the gate (to refuse the resolver modes) and by the
+        two steps that pick the candidate and the base; nothing after the tag needs it."""
+        self.assertIn("release_line", self.triggers["workflow_dispatch"]["inputs"])
+        for job, step in ((_GATE_JOB, "Decide"), (_PUBLISH_JOB, "Calculate Next Release Version"), (_PUBLISH_JOB, "Verify Release Eligibility")):
+            with self.subTest(step=step):
+                self.assertEqual(self._step(job, step)["env"]["RELEASE_LINE"], "${{ inputs.release_line }}")
+        self.assertNotIn("RELEASE_LINE", self._step(_PUBLISH_JOB, "Create Git Tag").get("env", {}))
 
 if __name__ == "__main__":
     unittest.main()

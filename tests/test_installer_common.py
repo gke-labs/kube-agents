@@ -12,6 +12,7 @@ import pathlib
 import re
 import shutil
 import stat
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -218,6 +219,15 @@ class InstallerCommonTest(unittest.TestCase):
                     # a developer's exported memory mode must not steer a test.
                     "MEMORY": "",
                     "MEMORY_PROVIDER": "",
+                    # Same reasoning, and the same ${VAR:-} read in
+                    # write_tfvars_from_state. get_isolated_test_env filters
+                    # the CI names and nothing else, so without this a shell
+                    # exporting ENABLE_DRIFT_DETECTOR=false reaches every case
+                    # that does not set it -- including the arm below that
+                    # asserts the drift keys are written when nobody asks.
+                    # Blanking it is "unset", which that arm wants: `:-` takes
+                    # the default for an empty value as well as an absent one.
+                    "ENABLE_DRIFT_DETECTOR": "",
                     **(env or {}),
                 },
                 bin_dir=str(bin_dir),
@@ -377,6 +387,130 @@ class InstallerCommonTest(unittest.TestCase):
             gcloud_stdout="this is not JSON {",
         )
         self.assertIn("rc=2\n", proc.stdout, proc.stderr)
+
+    # ── the drift keys: written only when on, and both together ─────────────
+
+    def _drift_tfvars(self, **env):
+        """_tfvars under these keys, with a credential and an existing cluster.
+
+        API_SERVER_KEY because the generator refuses to write without one, and
+        the Autopilot describe stub because the default says the cluster does
+        not exist, which writes a different file.
+        """
+        return self._tfvars(
+            {"API_SERVER_KEY": "k", **env},
+            describe_stub=_autopilot_describe_stub(),
+        )
+
+    def test_tfvars_writes_both_drift_keys_when_the_detector_is_on(self):
+        """The ingress and the consumer travel together, on every truthy
+        spelling install.env accepts.
+
+        The composition's helm_release precondition refuses
+        enable_drift_detector without enable_drift_pubsub, so one key here has
+        to produce both. The spellings are the point of the loop: every other
+        boolean in this generator reaches is_truthy through hcl_bool, and a
+        compare against the lowercase literal would read
+        ENABLE_DRIFT_DETECTOR=True as off and provision nothing at all, which
+        is the outcome with no error and nothing to observe afterwards.
+        """
+        for value in ("true", "True", "TRUE", "yes", "y", "1", "on", " true "):
+            with self.subTest(value=value):
+                content = self._drift_tfvars(ENABLE_DRIFT_DETECTOR=value)
+                self.assertIn("enable_drift_pubsub   = true", content)
+                self.assertIn("enable_drift_detector = true", content)
+
+    def test_tfvars_omits_the_drift_keys_when_the_detector_is_off(self):
+        """Omitted rather than written false, which is this generator's one
+        boolean exception, and the reason for it.
+
+        enable_drift_pubsub is also reachable on its own as a TF_VAR_ line in
+        install.env, and terraform.tfvars beats TF_VAR_. `enable_drift_pubsub
+        = false` here would therefore override an install already running the
+        audit-log ingress that way, and the next upgrade would destroy its
+        sink, topic and subscription under -auto-approve.
+
+        Every arm here is an explicit opt-out, because that is the only way to
+        reach the off branch now that DEFAULT_ENABLE_DRIFT_DETECTOR is true.
+        The companion below owns the arms that say nothing.
+        """
+        for value in ("false", "False", "no", "0", "off"):
+            with self.subTest(value=value):
+                content = self._drift_tfvars(ENABLE_DRIFT_DETECTOR=value)
+                self.assertNotIn("enable_drift_pubsub", content)
+                self.assertNotIn("enable_drift_detector", content)
+
+    def test_tfvars_writes_both_drift_keys_when_nobody_says_anything(self):
+        """Saying nothing provisions the trio, which is what flipping
+        DEFAULT_ENABLE_DRIFT_DETECTOR to true means and the one arm that
+        proves the generator reads the default rather than a literal.
+
+        Both arms are "unset" to the `${ENABLE_DRIFT_DETECTOR:-...}` the gate
+        expands: `:-` takes the default for an empty value as well as an
+        absent one, so an install.env carrying `ENABLE_DRIFT_DETECTOR=` gets
+        the detector, not the off branch. The None arm only means "absent"
+        because _run blanks ENABLE_DRIFT_DETECTOR in the isolated environment
+        it builds; get_isolated_test_env copies the rest of os.environ
+        through, so without that blank this arm would assert against whatever
+        the developer's shell happened to export.
+
+        This is also what an install predating the key gets: its install.env
+        records no choice, so the next run of either front door reads the
+        default here and provisions the sink, topic and subscription. That is
+        the intended behaviour -- running an installer is the consent -- and
+        this case is where it is pinned.
+        """
+        for value in ("", None):
+            with self.subTest(value=value):
+                env = {} if value is None else {"ENABLE_DRIFT_DETECTOR": value}
+                content = self._drift_tfvars(**env)
+                self.assertIn("enable_drift_pubsub   = true", content)
+                self.assertIn("enable_drift_detector = true", content)
+
+    def test_an_exported_value_survives_the_file_load_into_the_tfvars(self):
+        """install.env is not this generator's only input, and no front door makes it one.
+
+        install.sh's unrecorded-value guard tells the operator what upgrade.sh
+        will do with a key their install.env does not record, so that sentence
+        has to match this. `write_tfvars_from_state` reads
+        ${ENABLE_DRIFT_DETECTOR:-...} out of the environment;
+        `load_install_env` clears NAMESPACE and the seven scope keys before
+        sourcing, and upgrade.sh clears PROJECT_ID, CLUSTER_NAME and REGION;
+        ENABLE_DRIFT_DETECTOR is on neither list. So `ENABLE_DRIFT_DETECTOR=true
+        ./upgrade.sh` over a file predating the key provisions the sink, topic
+        and subscription -- on a front door with no guard on that route at all
+        -- and the next upgrade from a shell without the export writes neither
+        key and destroys them under -auto-approve.
+
+        The scope key is the contrast, and the reason this is asserted as a
+        pair: the clearing list is what decides, and a sentence claiming either
+        key comes from the file alone is true of exactly one of them.
+
+        Only load_install_env's half of that list is read here -- the body
+        sources installer_common.sh and never runs upgrade.sh. The other half
+        is pinned by test_upgrade_script.py's
+        test_the_upgrade_clearing_list_is_the_three_coordinates, which is the
+        one that fails if ENABLE_DRIFT_DETECTOR is ever added to it and the
+        guard's sentence goes stale.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            install_env = pathlib.Path(tmp) / "install.env"
+            install_env.write_text("PROJECT_ID=p\n")
+            dest = pathlib.Path(tmp) / "terraform.tfvars"
+            proc = self._run(
+                f'load_install_env "{install_env}"; write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    "ENABLE_DRIFT_DETECTOR": "true",
+                    "SCOPE_PROJECTS": "exported-project",
+                },
+                describe_stub=_autopilot_describe_stub(),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn("enable_drift_pubsub   = true", content)
+            self.assertIn("enable_drift_detector = true", content)
+            self.assertNotIn("exported-project", content)
 
     # ── the cert-manager probe: a Deployment alone cannot say whose it is ────
 
@@ -565,13 +699,13 @@ class InstallerCommonTest(unittest.TestCase):
             env_file = pathlib.Path(tmp) / "install.env"
             env_file.write_text("PROJECT_ID=p\n")
             stray = {"SCOPE_PROJECTS": "stray-project", "SCOPE_EXCLUDE_PROJECTS": "*-stray",
-                     "SCOPE_EXCLUDE_CLUSTERS": "s/l/c"}
-            probe = 'echo "P=${SCOPE_PROJECTS:-unset} X=${SCOPE_EXCLUDE_PROJECTS:-unset} C=${SCOPE_EXCLUDE_CLUSTERS:-unset}"'
+                     "SCOPE_EXCLUDE_CLUSTERS": "s/l/c", "SCOPE_MAX_PROJECTS": "250"}
+            probe = 'echo "P=${SCOPE_PROJECTS:-unset} X=${SCOPE_EXCLUDE_PROJECTS:-unset} C=${SCOPE_EXCLUDE_CLUSTERS:-unset} M=${SCOPE_MAX_PROJECTS:-unset}"'
             proc = self._run(f'load_install_env "{env_file}"; {probe}', env=stray)
-            self.assertIn("P=unset X=unset C=unset", proc.stdout, proc.stderr)
-            env_file.write_text("PROJECT_ID=p\nSCOPE_PROJECTS=from-the-file\n")
+            self.assertIn("P=unset X=unset C=unset M=unset", proc.stdout, proc.stderr)
+            env_file.write_text("PROJECT_ID=p\nSCOPE_PROJECTS=from-the-file\nSCOPE_MAX_PROJECTS=300\n")
             proc = self._run(f'load_install_env "{env_file}"; {probe}', env=stray)
-            self.assertIn("P=from-the-file X=unset C=unset", proc.stdout, proc.stderr)
+            self.assertIn("P=from-the-file X=unset C=unset M=300", proc.stdout, proc.stderr)
 
     def test_service_account_ownership_still_refuses_on_a_clean_absence(self):
         proc = self._run(
@@ -882,6 +1016,123 @@ class InstallerCommonTest(unittest.TestCase):
                     self.assertIn("MODEL_MAX_TOKENS", proc.stderr + proc.stdout)
                     self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
 
+    # Empty reads as unset, so a developer's own exported value cannot stand in.
+    _REDACTION_UNSET = {
+        "LITELLM_REDACTION_ENABLED": "",
+        "LITELLM_REDACTION_IP_ACTION": "",
+        "LITELLM_REDACTION_IP_ALLOW_CIDRS": "",
+        "LITELLM_REDACTION_RULES": "",
+    }
+
+    def test_tfvars_carry_litellm_redaction(self):
+        # Off writes the toggle alone: the other keys are inert, so a leftover
+        # value is neither read nor checked. The composition renders nothing
+        # into the chart while enabled is false.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for env, expected in (
+                ({}, "litellm_redaction = { enabled = false }\n"),
+                (
+                    {
+                        "LITELLM_REDACTION_ENABLED": "off",
+                        "LITELLM_REDACTION_IP_ACTION": "hash",
+                        "LITELLM_REDACTION_RULES": "not json",
+                    },
+                    "litellm_redaction = { enabled = false }\n",
+                ),
+                (
+                    {
+                        "LITELLM_REDACTION_ENABLED": "yes",
+                        "LITELLM_REDACTION_IP_ACTION": "off",
+                        "LITELLM_REDACTION_IP_ALLOW_CIDRS": "127.0.0.0/8, fd00::/8 10.0.0.0/8",
+                        "LITELLM_REDACTION_RULES": '[{"name":"cluster-name","literal":"prod-eu-1","action":"pseudonym"}]',
+                    },
+                    "litellm_redaction = {\n"
+                    "  enabled     = true\n"
+                    '  ip_action   = "off"\n'
+                    '  allow_cidrs = ["127.0.0.0/8", "fd00::/8", "10.0.0.0/8"]\n'
+                    '  rules       = [{ name = "cluster-name", literal = "prod-eu-1", action = "pseudonym" }]\n'
+                    "}\n",
+                ),
+            ):
+                with self.subTest(env=env):
+                    proc = self._run(
+                        f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", **self._REDACTION_UNSET, **env},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    self.assertIn(expected, dest.read_text())
+
+    def test_tfvars_escape_litellm_redaction_rules_for_hcl(self):
+        # A regular expression may hold ${ or %{, which HCL reads as a
+        # template, as well as backslashes and quotes.
+        rules = json.dumps([{"name": "tmpl", "pattern": 'a${b}%{c}\\d"\n'}])
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    **self._REDACTION_UNSET,
+                    "LITELLM_REDACTION_ENABLED": "true",
+                    "LITELLM_REDACTION_RULES": rules,
+                },
+                describe_stub="printf '\\n'; exit 0",
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn(
+                '  rules       = [{ name = "tmpl", pattern = "a$${b}%%{c}\\\\d\\"\\n" }]\n',
+                dest.read_text(),
+            )
+
+    def test_tfvars_refuse_litellm_redaction_values_terraform_cannot_take(self):
+        # upgrade.sh and uninstall.sh regenerate from install.env without
+        # install.sh's checks, so the generator names the key and writes nothing.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for key, value, message in (
+                ("LITELLM_REDACTION_ENABLED", "ture", "is neither true nor false"),
+                ("LITELLM_REDACTION_ENABLED", "enabled", "is neither true nor false"),
+                ("LITELLM_REDACTION_IP_ACTION", "hash", "is not one of mask, pseudonym, off"),
+                ("LITELLM_REDACTION_IP_ACTION", "OFF", "is not one of mask, pseudonym, off"),
+                ("LITELLM_REDACTION_RULES", "not json", "is not valid JSON"),
+                ("LITELLM_REDACTION_RULES", '{"name":"x","literal":"y"}', "must be a JSON array"),
+                ("LITELLM_REDACTION_RULES", '["x"]', "entry 0 is not an object"),
+                ("LITELLM_REDACTION_RULES", '[{"name":"x","literl":"y"}]', "unknown key(s) ['literl']"),
+                ("LITELLM_REDACTION_RULES", '[{"literal":"prod-eu-1"}]', "entry 0 has no name"),
+                ("LITELLM_REDACTION_RULES", "[{}]", "entry 0 has no name"),
+                ("LITELLM_REDACTION_RULES", '[{"name":"x","literal":7}]', "entry 0: literal must be a string"),
+                ("LITELLM_REDACTION_RULES", '[{"name":"x","literal":"\\ud800"}]', "entry 0: literal is not valid UTF-8 text"),
+            ):
+                with self.subTest(key=key, value=value):
+                    proc = self._run(
+                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                        env={
+                            "API_SERVER_KEY": "k",
+                            **self._REDACTION_UNSET,
+                            "LITELLM_REDACTION_ENABLED": "true",
+                            key: value,
+                        },
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn(f"{key}", proc.stderr)
+                    self.assertIn(message, proc.stderr)
+                    self.assertNotIn("Traceback", proc.stderr + proc.stdout)
+                    self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
+
+    def test_a_rules_refusal_reaches_the_operator_through_the_command_substitution(self):
+        # The generator captures hcl_redaction_rules' output, so its message
+        # must go to stderr even with the real print_error, which writes to
+        # stdout.
+        proc = self._run(
+            "print_error() { echo \"ERROR: $*\"; }\n"
+            'rc=0; out="$(hcl_redaction_rules "not json")" || rc=$?; echo "rc=$rc out=[$out]"'
+        )
+        self.assertIn("rc=1 out=[]", proc.stdout)
+        self.assertIn("LITELLM_REDACTION_RULES is not valid JSON", proc.stderr)
+
     def test_tfvars_gvisor_on_autopilot_asks_for_runtime_class_only(self):
         # enable_gvisor_node_pool fails the plan on Autopilot, which ships the
         # gvisor RuntimeClass natively. Passing ENABLE_GVISOR straight through
@@ -999,15 +1250,18 @@ class InstallerCommonTest(unittest.TestCase):
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertNotIn("1.27.4-gke.800", proc.stderr)
 
-    def _tfvars(self, env):
+    def _tfvars(self, env, **run_kwargs):
         """Generate a terraform.tfvars and return its text.
 
         The generator writes `<dest>.tmp` and renames it into place, so the
         destination has to be a real path in a writable directory.
+
+        `run_kwargs` reach `_run`, for a caller that needs a different stub
+        than the defaults — `_drift_tfvars` wants an Autopilot cluster.
         """
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
-            proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env)
+            proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env, **run_kwargs)
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             return dest.read_text()
 
@@ -2683,9 +2937,11 @@ class ScopeKeysReachTheTfvarsTest(unittest.TestCase):
 
     EMPTY_BLOCK = (
         "scope = {\n"
-        "  projects      = []\n"
-        "  folders       = []\n"
-        "  organizations = []\n"
+        "  projects         = []\n"
+        "  folders          = []\n"
+        "  organizations    = []\n"
+        "  shared_vpc_hosts = []\n"
+        "  metrics_scopes   = []\n"
         "  exclude = {\n"
         "    projects = []\n"
         "    clusters = []\n"
@@ -2695,6 +2951,7 @@ class ScopeKeysReachTheTfvarsTest(unittest.TestCase):
 
     def _scope_env(self, **keys):
         env = {"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "",
+               "SCOPE_SHARED_VPC_HOSTS": "", "SCOPE_METRICS_SCOPES": "",
                "SCOPE_EXCLUDE_PROJECTS": "", "SCOPE_EXCLUDE_CLUSTERS": ""}
         env.update(keys)
         return env
@@ -2703,19 +2960,61 @@ class ScopeKeysReachTheTfvarsTest(unittest.TestCase):
         content = self._tfvars(self._scope_env())
         self.assertIn(self.EMPTY_BLOCK, content)
 
+    def test_the_cap_is_written_only_when_set(self):
+        # Unset, the CRD's and the module's default apply and the block names
+        # no cap; set, it is written where the module's object carries it.
+        self.assertNotIn("max_projects", self._tfvars(self._scope_env()))
+        content = self._tfvars(self._scope_env(SCOPE_MAX_PROJECTS="250"))
+        self.assertIn("  metrics_scopes   = []\n  max_projects     = 250\n  exclude = {\n", content)
+
+    def test_a_malformed_cap_in_install_env_stops_the_writer_before_a_file_exists(self):
+        # upgrade.sh and the Day-2 menu reach the generator without install.sh's
+        # parameter block, so the writer checks the value itself.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=self._scope_env(SCOPE_MAX_PROJECTS="lots"))
+            self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+            self.assertIn("SCOPE_MAX_PROJECTS='lots' is not a whole number from 1 to 5000", proc.stdout + proc.stderr)
+            self.assertFalse(dest.exists())
+
+    def test_a_cap_outside_the_crds_bounds_stops_the_run_naming_the_key(self):
+        for bad in ("0", "abc", "5001", "2.5", "-3", " 12", "18446744073709551716"):
+            with self.subTest(bad=bad):
+                proc = subprocess.run(
+                    ["bash", "-c",
+                     'print_error() { echo "ERROR: $*"; }; print_info() { :; }; print_warning() { :; }; print_success() { :; }\n'
+                     f'source "{_INSTALLER_COMMON}"\nrequire_scope_max_projects {shlex.quote(bad)}; echo "rc=$?"'],
+                    capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+                )
+                self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+                self.assertIn(f"SCOPE_MAX_PROJECTS='{bad}' is not a whole number from 1 to 5000", proc.stdout)
+        for good in ("", "1", "250", "5000", "0250"):
+            with self.subTest(good=good):
+                proc = subprocess.run(
+                    ["bash", "-c",
+                     'print_error() { echo "ERROR: $*"; }; print_info() { :; }; print_warning() { :; }; print_success() { :; }\n'
+                     f'source "{_INSTALLER_COMMON}"\nrequire_scope_max_projects {shlex.quote(good)}; echo "rc=$?"'],
+                    capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+                )
+                self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
+
     def test_the_keys_are_carried_verbatim_into_the_block(self):
         content = self._tfvars(self._scope_env(
             SCOPE_PROJECTS="payments-prod, payments-staging",
             SCOPE_FOLDERS="123456789012 210987654321",
             SCOPE_ORGANIZATIONS="987654321098",
+            SCOPE_SHARED_VPC_HOSTS="shared-net-host, shared-net-host-2",
+            SCOPE_METRICS_SCOPES="observability-hub",
             SCOPE_EXCLUDE_PROJECTS="*-sandbox kube-agents-demo-0[2-9]",
             SCOPE_EXCLUDE_CLUSTERS="payments-staging/us-central1/scratch-cluster,p2/us-east1-b/c2",
         ))
         self.assertIn(
             "scope = {\n"
-            '  projects      = ["payments-prod", "payments-staging"]\n'
-            '  folders       = ["123456789012", "210987654321"]\n'
-            '  organizations = ["987654321098"]\n'
+            '  projects         = ["payments-prod", "payments-staging"]\n'
+            '  folders          = ["123456789012", "210987654321"]\n'
+            '  organizations    = ["987654321098"]\n'
+            '  shared_vpc_hosts = ["shared-net-host", "shared-net-host-2"]\n'
+            '  metrics_scopes   = ["observability-hub"]\n'
             "  exclude = {\n"
             '    projects = ["*-sandbox", "kube-agents-demo-0[2-9]"]\n'
             '    clusters = [{ project_id = "payments-staging", location = "us-central1", cluster_name = "scratch-cluster" }, '
@@ -2781,6 +3080,8 @@ _LIVE_SCOPE_LINES = (
     'SCOPE_PROJECTS="p2-project p3-project"',
     'SCOPE_FOLDERS=""',
     'SCOPE_ORGANIZATIONS=""',
+    'SCOPE_SHARED_VPC_HOSTS=""',
+    'SCOPE_METRICS_SCOPES=""',
     'SCOPE_EXCLUDE_PROJECTS=""',
     'SCOPE_EXCLUDE_CLUSTERS="p2-project/us-central1/c1"',
 )
@@ -2848,6 +3149,7 @@ class PreApplyScopeCheckTest(unittest.TestCase):
                 path.chmod(path.stat().st_mode | stat.S_IEXEC)
             env = {"PROJECT_ID": "test-project", "CLUSTER_NAME": "test-cluster", "REGION": "us-central1",
                    "SCOPE_PROJECTS": "", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "",
+                   "SCOPE_SHARED_VPC_HOSTS": "", "SCOPE_METRICS_SCOPES": "",
                    "SCOPE_EXCLUDE_PROJECTS": "", "SCOPE_EXCLUDE_CLUSTERS": ""}
             env.update(keys or {})
             body = (
@@ -2897,6 +3199,49 @@ class PreApplyScopeCheckTest(unittest.TestCase):
             "SCOPE_EXCLUDE_CLUSTERS": "p2-project/us-central1/c1, p2-project/us-central1/c1",
         })
         self._assert_rc(proc, 0)
+
+    def test_a_cap_alone_on_a_scope_less_cr_is_a_hand_edit(self):
+        # A CR whose only hand edit is the cap is not "nothing live to protect": the apply
+        # would render the default over it. It is refused with the key among the lines
+        # until the key records it; the default alone is still an empty declaration.
+        capped_only = '{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"maxProjects":250}}}]}'
+        proc = self._run(capped_only, "norelease")
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_PROJECTS=""', proc.stdout)
+        self.assertIn('INFO:   SCOPE_MAX_PROJECTS="250"', proc.stdout)
+        self._assert_rc(self._run(capped_only, "norelease", keys={"SCOPE_MAX_PROJECTS": "250"}), 0)
+        self._assert_rc(self._run(capped_only.replace("250", "100"), "norelease"), 0)
+
+    def test_a_cap_set_on_the_cr_by_hand_is_a_hand_edit_until_the_key_records_it(self):
+        # The cap is part of the declaration: a CR whose maxProjects differs from
+        # what the record and the keys say is refused, with the key among the
+        # lines; one at the CRD's default reads as unset, since the API server
+        # defaults the field on every CR that carries a scope block.
+        capped = _LIVE_SCOPE_CR.replace('"projects":["p3-project","p2-project"],', '"projects":["p3-project","p2-project"],"maxProjects":250,')
+        record = ('{"platformAgent":{"scope":{"projects":["p2-project","p3-project"],"exclude":{"projects":[],'
+                  '"clusters":[{"projectId":"p2-project","location":"us-central1","clusterName":"c1"}]}}}}')
+        proc = self._run(capped, record)
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_MAX_PROJECTS="250"', proc.stdout)
+        self._assert_rc(self._run(capped, record, keys={"SCOPE_PROJECTS": "p2-project p3-project",
+                                                       "SCOPE_EXCLUDE_CLUSTERS": "p2-project/us-central1/c1",
+                                                       "SCOPE_MAX_PROJECTS": "250"}), 0)
+        self._assert_rc(self._run(capped, record.replace('"projects":["p2-project","p3-project"],', '"projects":["p2-project","p3-project"],"maxProjects":250,')), 0)
+        defaulted = _LIVE_SCOPE_CR.replace('"projects":["p3-project","p2-project"],', '"projects":["p3-project","p2-project"],"maxProjects":100,')
+        self._assert_rc(self._run(defaulted, record), 0)
+        proc = self._run(defaulted, "norelease")
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_MAX_PROJECTS=""', proc.stdout)
+        # The key is among the lines even when the live cap is the default, because it
+        # may be the one key the operator has to blank: a record and keys at 250 beside
+        # a CR the API server re-defaulted refuse on the cap alone, and the lines the
+        # refusal prints must not reproduce the install.env that was refused.
+        recorded_at_250 = record.replace('"projects":["p2-project","p3-project"],', '"projects":["p2-project","p3-project"],"maxProjects":250,')
+        proc = self._run(defaulted, recorded_at_250, keys={"SCOPE_PROJECTS": "p2-project p3-project",
+                                                           "SCOPE_EXCLUDE_CLUSTERS": "p2-project/us-central1/c1",
+                                                           "SCOPE_MAX_PROJECTS": "250"})
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_MAX_PROJECTS=""', proc.stdout)
 
     def test_a_scope_the_installer_wrote_may_be_changed_or_emptied(self):
         # L == R: the record shows the installer rendered it; the keys are the
@@ -2957,22 +3302,38 @@ class PreApplyScopeCheckTest(unittest.TestCase):
         older = '{"platformAgent":{"scope":{"projects":[],"exclude":{"projects":[],"clusters":[]}}}}'
         self._assert_rc(self._run(only_containers, older), 1)
 
-    def test_selectors_on_the_live_cr_are_reported_and_never_weighed(self):
-        # sharedVpcHosts and metricsScopes (phase 3) have no installer key and
-        # the chart renders neither, so an apply leaves them alone: a CR
-        # carrying only selectors passes with a note, and a refused mixed edit
-        # still prints the lines it can reproduce plus the note.
+    def test_a_hand_declared_selector_is_protected_like_a_project(self):
+        # The chart renders sharedVpcHosts and metricsScopes now, so an apply
+        # over a CR that carries one the record and the keys do not is the
+        # same silent replace as for a project: refused, with the two lines
+        # that reproduce it, passed once the keys carry it, and never a note
+        # about a key the installer lacks.
         only_selectors = ('{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"sharedVpcHosts":["shared-net-host"],'
                           '"metricsScopes":["observability-hub"]}}}]}')
         proc = self._run(only_selectors, "norelease")
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_SHARED_VPC_HOSTS="shared-net-host"', proc.stdout)
+        self.assertIn('INFO:   SCOPE_METRICS_SCOPES="observability-hub"', proc.stdout)
+        self.assertNotIn("has no key for", proc.stdout)
+        proc = self._run(only_selectors, "norelease",
+                         keys={"SCOPE_SHARED_VPC_HOSTS": "shared-net-host", "SCOPE_METRICS_SCOPES": "observability-hub"})
         self._assert_rc(proc, 0)
-        self.assertIn("also declares sharedVpcHosts: shared-net-host metricsScopes: observability-hub, which the installer has no key for yet", proc.stdout)
+        self.assertNotIn("has no key for", proc.stdout)
+        # A record that carries the selectors makes the keys the new
+        # declaration, dropping them included; a record from before the chart
+        # rendered them (the container keys only) does not account for them.
+        record = ('{"platformAgent":{"scope":{"projects":[],"folders":[],"organizations":[],"sharedVpcHosts":["shared-net-host"],'
+                  '"metricsScopes":["observability-hub"],"exclude":{"projects":[],"clusters":[]}}}}')
+        self._assert_rc(self._run(only_selectors, record), 0)
+        between = ('{"platformAgent":{"scope":{"projects":[],"folders":[],"organizations":[],'
+                   '"exclude":{"projects":[],"clusters":[]}}}}')
+        self._assert_rc(self._run(only_selectors, between), 1)
         mixed = ('{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"projects":["p2-project"],'
                  '"sharedVpcHosts":["shared-net-host"]}}}]}')
         proc = self._run(mixed, "norelease")
         self._assert_rc(proc, 1)
         self.assertIn('INFO:   SCOPE_PROJECTS="p2-project"', proc.stdout)
-        self.assertIn("also declares sharedVpcHosts: shared-net-host, which the installer has no key for yet", proc.stdout)
+        self.assertIn('INFO:   SCOPE_SHARED_VPC_HOSTS="shared-net-host"', proc.stdout)
 
     def test_a_hand_edit_after_the_installer_wrote_it_is_refused(self):
         # L != R (p3-project and the exclusion were added by hand) and L != K.
@@ -3045,6 +3406,98 @@ _GOOGLE_CREDENTIAL_VARIABLES = (
     "CLOUDSDK_AUTH_ACCESS_TOKEN", "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE", "CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT",
     "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE", "STUB_PROPERTY_IMPERSONATE", "STUB_PROPERTY_TOKEN_FILE",
 )
+
+
+class ScopeSelectorApisTest(unittest.TestCase):
+    """enable_scope_selector_apis: silent with no selector declared; with one,
+    lists the management project's enabled APIs and enables whichever of the
+    APIs the plan-time resolution of that selector reads is off (Resource
+    Manager and Monitoring for a Metrics Scope, Compute for a Shared VPC host,
+    the composition's own split), since the reads run in the plan and the
+    composition enables the APIs only in the apply that follows. Nothing is
+    called when they are on; a listing that fails enables every API the
+    declared selectors read; an enable that fails is a warning, not an abort."""
+
+    ALL = "cloudresourcemanager.googleapis.com monitoring.googleapis.com compute.googleapis.com"
+
+    def _run(self, keys, enabled=ALL, list_fails=False, enable_fails=False):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            log = pathlib.Path(tmp) / "gcloud.log"
+            log.write_text("")
+            listing = "exit 1" if list_fails else "printf '%s\\n' " + " ".join(enabled.split()) + "; exit 0"
+            (bin_dir / "gcloud").write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                f'  *"services list --enabled"*) {listing} ;;\n'
+                f'  *"services enable"*) echo "$*" >>"$GCLOUD_LOG"; exit {1 if enable_fails else 0} ;;\n'
+                "esac\nexit 1\n"
+            )
+            (bin_dir / "gcloud").chmod(0o755)
+            env = {"PROJECT_ID": "test-project", "SCOPE_SHARED_VPC_HOSTS": "", "SCOPE_METRICS_SCOPES": "",
+                   "GCLOUD_LOG": str(log)}
+            env.update(keys)
+            body = (
+                "set -u\n"
+                'print_info() { echo "INFO: $*"; }; print_error() { echo "ERROR: $*"; }\n'
+                'print_warning() { echo "WARN: $*"; }; print_success() { :; }\n'
+                f'source "{_INSTALLER_COMMON}"\n'
+                'trap \'echo TRAP-FIRED\' ERR; set -eEo pipefail; enable_scope_selector_apis; echo "rc=$?"\n'
+            )
+            proc = subprocess.run(["bash", "-c", body], capture_output=True, text=True,
+                                  env=get_isolated_test_env(overrides=env, bin_dir=str(bin_dir)), cwd=str(_REPO_ROOT))
+            return proc, log.read_text()
+
+    def test_no_selector_calls_nothing(self):
+        proc, calls = self._run({"SCOPE_PROJECTS": "p2-project", "SCOPE_FOLDERS": "123456789012"}, list_fails=True)
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertEqual(calls, "")
+        self.assertNotIn("INFO", proc.stdout)
+
+    def test_every_api_already_on_calls_nothing(self):
+        # A re-run or a Day-2 apply of an existing install: the previous apply
+        # enabled all three, so no enable and no line.
+        proc, calls = self._run({"SCOPE_METRICS_SCOPES": "observability-hub"})
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertEqual(calls, "")
+        self.assertNotIn("INFO", proc.stdout)
+
+    def test_only_the_apis_that_are_off_and_that_the_declared_selector_reads_are_enabled(self):
+        # Monitoring on, Resource Manager and Compute off: a Metrics Scope wants Resource
+        # Manager alone (Compute is not among its reads, as the composition's API list
+        # says), a Shared VPC host Compute alone, and both declared want both.
+        cases = (({"SCOPE_METRICS_SCOPES": "observability-hub"}, "cloudresourcemanager.googleapis.com"),
+                 ({"SCOPE_SHARED_VPC_HOSTS": "shared-net-host, other-host"}, "compute.googleapis.com"),
+                 ({"SCOPE_METRICS_SCOPES": "observability-hub", "SCOPE_SHARED_VPC_HOSTS": "shared-net-host"},
+                  "cloudresourcemanager.googleapis.com compute.googleapis.com"))
+        for keys, expected in cases:
+            with self.subTest(keys=keys):
+                proc, calls = self._run(keys, enabled="monitoring.googleapis.com container.googleapis.com")
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertEqual(calls, f"services enable {expected} --project=test-project\n")
+                self.assertIn(f"INFO: Enabling {expected.replace(' ', ', ')} in project 'test-project'", proc.stdout)
+
+    def test_a_listing_that_fails_enables_every_api_the_declared_selectors_read(self):
+        cases = (({"SCOPE_METRICS_SCOPES": "observability-hub"}, "cloudresourcemanager.googleapis.com monitoring.googleapis.com"),
+                 ({"SCOPE_SHARED_VPC_HOSTS": "shared-net-host"}, "compute.googleapis.com"),
+                 ({"SCOPE_METRICS_SCOPES": "observability-hub", "SCOPE_SHARED_VPC_HOSTS": "shared-net-host"}, self.ALL))
+        for keys, expected in cases:
+            with self.subTest(keys=keys):
+                proc, calls = self._run(keys, list_fails=True)
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertEqual(calls, f"services enable {expected} --project=test-project\n")
+                self.assertIn("could not be listed", proc.stdout)
+
+    def test_an_enable_that_fails_warns_and_goes_on(self):
+        # Under the front doors' set -eE and ERR trap: the plan reports a
+        # disabled API with the same command as its remedy, and gcloud's active
+        # account need not be the one Terraform applies with.
+        proc, calls = self._run({"SCOPE_METRICS_SCOPES": "observability-hub"}, enabled="monitoring.googleapis.com", enable_fails=True)
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("TRAP-FIRED", proc.stdout)
+        self.assertIn("WARN: Could not enable cloudresourcemanager.googleapis.com in project 'test-project'", proc.stdout)
+        self.assertIn("gcloud services enable cloudresourcemanager.googleapis.com --project=test-project", proc.stdout)
 
 
 class ScopeContainerPreflightTest(unittest.TestCase):

@@ -694,6 +694,12 @@ class ConfigBackfillTest(unittest.TestCase):
         self.assertEqual(live["monitoring"]["install_id"], "abc123")
         for key in ("toolsets", "platform_toolsets", "kanban", "agent"):
             self.assertIn(key, live, f"{key} was lost to the managed strip and not restored")
+        self.assertEqual(
+            live.get("context_file_max_chars"),
+            template["context_file_max_chars"],
+            "a default profile from before the context-file cap was pinned did not take it, "
+            "so its SOUL.md stays on Hermes's 20,000-char fallback",
+        )
 
 
 class RemoteMcpUserAgentRepairTest(unittest.TestCase):
@@ -870,19 +876,25 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
         self.assertIn("skipped", proc.stderr)
 
     def test_the_shipped_cluster_loop_repairs_a_profile_on_the_volume(self):
-        """The cluster call site, run rather than read: the loop over profiles/cluster-*.
+        """The cluster call sites, run rather than read: the loop over profiles/cluster-*.
 
-        The regex test below proves the call is spelled right; this proves the guard in
-        front of it and the loop around it reach a real profile directory, which is the
-        path that had no test at all — a wrong variable in that guard ships with the
+        The regex tests prove the calls are spelled right; this proves the guards in
+        front of them and the loop around them reach a real profile directory, which is
+        the path that had no test at all — a wrong variable in a guard ships with the
         suite green, and the symptom is exactly the one the helper exists to fix. The
         block is lifted by its opener like step 2.6b's; the skills sync it also calls
         returns at once because the fixture template has no skills/ directory, and the
         cron back-fill is skipped because no scaffold script is in scope.
+
+        The profile on the volume predates the context-file cap, so the back-fill has a
+        key to add, and it runs before the User-Agent repair rewrites the same file: the
+        two must not undo each other, and neither may touch `cluster_identity`. Every
+        helper the block calls is defined, because a missing one fails as
+        command-not-found behind its `|| echo WARN` and the test would stay green.
         """
         block = _extract_shell_block('if [ -d "$CLUSTER_TEMPLATE" ]; then')
         script = "set -e\n"
-        for name in ("sync_profile_skills", "repair_remote_mcp_user_agent"):
+        for name in ("sync_profile_skills", "backfill_config_from_template", "repair_remote_mcp_user_agent"):
             script += _extract_shell_function(name) + "\n"
         script += block
         with tempfile.TemporaryDirectory() as tmp:
@@ -893,8 +905,10 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
             (template_dir / "SOUL.md").write_text("persona\n", encoding="utf-8")
             profile = root / "data" / "profiles" / "cluster-p-c-us-central1"
             profile.mkdir(parents=True)
+            scaffolded = self._scaffolded_cluster_profile(self._OLD_HEADER)
+            del scaffolded["context_file_max_chars"]
             (profile / "config.yaml").write_text(
-                yaml.safe_dump(self._scaffolded_cluster_profile(self._OLD_HEADER), sort_keys=False),
+                yaml.safe_dump(scaffolded, sort_keys=False),
                 encoding="utf-8",
             )
             venv = root / "install" / ".venv" / "bin"
@@ -926,8 +940,15 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
                     f"the loop left {name} on the header it was scaffolded with",
                 )
         self.assertEqual(live["cluster_identity"], self._IDENTITY)
+        self.assertEqual(
+            live.get("context_file_max_chars"),
+            template["context_file_max_chars"],
+            "a cluster profile from before the context-file cap was pinned did not take it",
+        )
         self.assertEqual(persona, "persona\n", "the persona copy beside the repair stopped running")
+        self.assertIn("config backfill", proc.stdout)
         self.assertIn("User-Agent repair", proc.stdout)
+        self.assertNotIn("WARN", proc.stderr)
 
     def test_the_two_profiles_that_are_not_force_synced_both_take_the_repair(self):
         """The call sites, read off the source: the cluster loop and the front-door fill.
@@ -950,6 +971,39 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
             ],
             f"expected the cluster loop and step 2.6b to be the only callers, found {calls}",
         )
+
+
+class ImageOwnedForceSyncTest(unittest.TestCase):
+    """Step 2a overwrites a PVC copy that `cp -u` would keep because it looks newer.
+
+    The onboarding prompts are graded by the first-install-hello eval cases, and
+    bootstrap_onboarding reads the PVC copy first, so a stale one would be what is graded.
+    """
+
+    def test_a_newer_stale_pvc_copy_of_each_onboarding_prompt_is_replaced(self):
+        lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+        start = next(i for i, line in enumerate(lines) if line.startswith("# 2a. "))
+        end = next(i for i in range(start, len(lines)) if lines[i] == "fi")
+        names = ("onboarding/scan_in_progress.md", "onboarding/scan_completed.md")
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            for name in names:
+                (image / name).parent.mkdir(parents=True, exist_ok=True)
+                (image / name).write_text("image\n", encoding="utf-8")
+                (pvc / name).parent.mkdir(parents=True, exist_ok=True)
+                (pvc / name).write_text("stale\n", encoding="utf-8")
+                future = time.time() + 3600
+                os.utime(pvc / name, (future, future))
+            block = "\n".join(lines[start : end + 1]).replace("/opt/defaults", str(image))
+            subprocess.run(
+                ["bash", "-c", block],
+                env={**os.environ, "TARGET_DIR": str(pvc)},
+                check=True,
+                timeout=30,
+            )
+            for name in names:
+                self.assertEqual((pvc / name).read_text(encoding="utf-8"), "image\n", name)
 
 
 class ManagedScopeAssertionTest(unittest.TestCase):
@@ -1553,31 +1607,45 @@ class PlatformFrontDoorTest(unittest.TestCase):
         )
 
     def test_step_2_6b_fills_the_platform_config_with_step_2ds_own_program(self):
-        """One program, two callers — asserted on the source, not on a copy of it.
+        """One program, three callers — asserted on the source, not on a copy of it.
 
         The rule step 2.6b needs is exactly step 2d's: restore a key the image declares
         and the live file has lost, never overrule one the agent wrote. Re-implementing
         it here is the failure this catches, because the second copy would drift towards
-        the three-way merge that #658 removed — and the two files it governs are the two
-        an agent writes to, so a divergence surfaces as `/sethome` sticking on one
-        profile and not the other.
+        the three-way merge that #658 removed — and two of the files it governs are the
+        two an agent writes to, so a divergence surfaces as `/sethome` sticking on one
+        profile and not the other. The cluster loop is the third caller, for profiles
+        whose config.yaml carries a `cluster_identity` stamp and so is never
+        force-synced. Each caller names its template and its live file, so one wired to
+        the wrong pair is what this checks.
         """
         source = _ENTRYPOINT.read_text(encoding="utf-8")
-        callers = [
+        # Every mention of the helper on a non-comment line, wherever on the line and
+        # however many per line: a call after `if …; then` or `&&` is still a caller.
+        call_lines = [
             line.strip()
             for line in source.splitlines()
-            if line.strip().startswith("backfill_config_from_template")
-            and not line.strip().endswith("() {")
+            if not line.lstrip().startswith("#")
+            for _ in re.findall(r"\bbackfill_config_from_template\b(?!\(\))", line)
         ]
-        self.assertEqual(
-            len(callers),
-            2,
-            f"expected step 2d and step 2.6b to be the only callers, found {callers}",
-        )
-        self.assertIn(
-            "$PLATFORM_TEMPLATE/config.yaml",
+        calls = re.findall(
+            r"^\s*backfill_config_from_template\s*\\?\s*\n?\s*\"([^\"]+)\"\s+\"([^\"]+)\"",
             source,
-            "step 2.6b must fill from the platform profile's image template",
+            re.MULTILINE,
+        )
+        self.assertEqual(
+            sorted(calls),
+            [
+                ("$CHAT_TEMPLATE_CONFIG", "$TARGET_DIR/config.yaml"),
+                ("$CLUSTER_TEMPLATE/config.yaml", "$d/config.yaml"),
+                ("$PLATFORM_TEMPLATE/config.yaml", "$TARGET_DIR/profiles/platform/config.yaml"),
+            ],
+            f"expected step 2d, the cluster loop and step 2.6b to be the only callers, found {calls}",
+        )
+        self.assertEqual(
+            len(call_lines),
+            len(calls),
+            f"a caller whose arguments the pattern above cannot read: {call_lines}",
         )
 
     def test_step_2_6b_runs_only_at_the_front_door_and_only_on_the_primary(self):
@@ -2000,6 +2068,96 @@ class SandboxMirrorGateTest(unittest.TestCase):
         self.assertFalse(invoked)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("REACHED-EXEC", proc.stdout)
+
+
+_TERMINAL_PIN_ASSIGNMENT = 'TERMINAL_ENV_PIN_SCRIPT="/opt/defaults/scripts/terminal_env_pin.py"'
+_TERMINAL_PIN_OPENER = (
+    'if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$TERMINAL_ENV_PIN_SCRIPT" ]; then'
+)
+
+
+class TerminalEnvPinGateTest(unittest.TestCase):
+    """Step 4b pins every profile's scheduled-run terminal, and is fatal.
+
+    The host never has the image path, so every other entrypoint test skips this block.
+    The block is extracted from its `if` so the script path can point at a temp file.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._BLOCK = _extract_shell_block(_TERMINAL_PIN_OPENER)
+
+    def _run(self, rc=0, primary="1", install_script=True):
+        """Run the shipped block with a python3 that exits `rc`.
+
+        Returns `(proc, argv, script, target)`; `argv` is what the interpreter was called
+        with, or None when it never ran.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            target = tmp / "data"
+            target.mkdir()
+            script = tmp / "terminal_env_pin.py"
+            if install_script:
+                script.write_text("", encoding="utf-8")
+
+            marker = tmp / "invoked"
+            python = tmp / "hermes" / ".venv" / "bin" / "python3"
+            python.parent.mkdir(parents=True)
+            python.write_text(
+                f'#!/bin/sh\necho "$@" >"{marker}"\nexit {rc}\n',
+                encoding="utf-8",
+            )
+            python.chmod(0o755)
+
+            proc = subprocess.run(
+                ["sh", "-c", f"set -e\n{self._BLOCK}\necho REACHED-EXEC\n"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={
+                    **os.environ,
+                    "TARGET_DIR": str(target),
+                    "INSTALL_DIR": str(tmp / "hermes"),
+                    "IS_BOOTSTRAP_PRIMARY": primary,
+                    "TERMINAL_ENV_PIN_SCRIPT": str(script),
+                },
+            )
+            argv = marker.read_text(encoding="utf-8").split() if marker.exists() else None
+            return proc, argv, script, target
+
+    def test_a_failed_pin_ends_start_up(self):
+        proc, argv, _, _ = self._run(rc=1)
+        self.assertIsNotNone(argv, "the pin never ran, so this asserts nothing")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("REACHED-EXEC", proc.stdout)
+        self.assertIn("refusing to start", proc.stderr)
+
+    def test_a_clean_pin_sweeps_every_profile_and_leaves_start_up_alone(self):
+        """Without --sweep only $TARGET_DIR is pinned, and named profiles stay on local."""
+        proc, argv, script, target = self._run(rc=0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+        self.assertEqual(argv, [str(script), "--hermes-home", str(target), "--sweep"])
+
+    def test_a_non_primary_replica_does_not_run_it(self):
+        """Run with a pin that would fail, so dropping the gate fails loudly."""
+        proc, argv, _, _ = self._run(rc=1, primary="0")
+        self.assertIsNone(argv)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_a_host_without_the_script_is_not_a_failure(self):
+        proc, argv, _, _ = self._run(rc=1, install_script=False)
+        self.assertIsNone(argv)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_the_script_runs_from_the_image_copy(self):
+        """The PVC copy under $TARGET_DIR is writable by the agent; the image copy is not."""
+        lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+        opener = lines.index(_TERMINAL_PIN_OPENER)
+        self.assertEqual(lines[opener - 1], _TERMINAL_PIN_ASSIGNMENT)
 
 
 class A2AModeProbeTest(unittest.TestCase):

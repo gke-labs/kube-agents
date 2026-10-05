@@ -23,7 +23,7 @@ name: A2A Module Tests
 # run. Keep the `paths:` list and the `a2a:` filter below identical.
 on:
   pull_request:
-    branches: [main]
+    branches: [main, "release/**"]
   push:
     branches: [main]
     paths:

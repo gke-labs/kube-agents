@@ -846,6 +846,12 @@ function runsListHtml(inWindow, inc, title) {
     // cases all passed, "all gate cases passed".
     if (run.cls === "deadline-kill") note = `<span class="chip inf">killed at the deadline${measured(run) ? `, ${plural((run.cases || []).length, "case")} recorded first` : ""}</span>`;
     else if (run.setup_death) note = '<span class="chip inf">died in setup</span>';
+    // The suite's own verdict (classify.py), cases recorded or not: nothing
+    // was graded for the lost cases, so neither "all gate cases passed" nor
+    // a failure chip is true, and a record with the field and no parsed
+    // tasks is still that verdict on the run page it links to, not "no
+    // cases recorded".
+    else if (run.verdict === "not_evaluated") note = `<span class="chip inf">not evaluated · ${esc(plural((run.not_evaluated || []).length, "case"))} lost</span>`;
     else if (!measured(run)) note = `<span class="chip inf">${run.result === "ABORTED" ? "aborted" : "no cases recorded"}</span>`;
     // A run whose every recorded case went ungraded (a storm, or every
     // worker at the delegation ceiling) passed nothing; the chips say why.
@@ -869,12 +875,17 @@ function numbers(sinceMs, untilMs) {
   const green = done.filter(isGreen);
   const reds = done.length - green.length;
   const own = done.filter((r) => !isGreen(r) && r.verdict === "red").length;
+  // Named inside the gate's reds, where health.py's infra_reds (the daily
+  // digest's "N infra") also counts them: its pr_caused_reds never takes a
+  // not-evaluated run, collapsed gate case or not, so the two surfaces agree
+  // on the number; the tile just says how many the suite could not evaluate.
+  const notEvaluated = done.filter((r) => r.verdict === "not_evaluated").length;
   const deaths = all.filter((r) => r.setup_death).length;
   const walls = done.map((r) => (parseIso(r.finished) ?? 0) - (parseIso(r.started) ?? 0)).filter((w) => w > 0).sort((a, b) => a - b);
   const p = (q) => (walls.length ? walls[Math.round(q * (walls.length - 1))] : null);
   let reps = 0, lost = 0;
   for (const run of full) for (const c of run.cases || []) { reps += repTotal(c.reps); lost += c.reps.infra; }
-  return { full: full.length, prs: new Set(full.map((r) => r.pr).filter((x) => x != null)).size, green: green.length, reds, own, infra: reds - own + deaths, deaths, p50: p(0.5), p90: p(0.9), lostShare: reps ? lost / reps : null, aborted: all.filter((r) => !concluded(r)).length };
+  return { full: full.length, prs: new Set(full.map((r) => r.pr).filter((x) => x != null)).size, green: green.length, reds, own, infra: reds - own + deaths, notEvaluated, deaths, p50: p(0.5), p90: p(0.9), lostShare: reps ? lost / reps : null, aborted: all.filter((r) => !concluded(r)).length };
 }
 
 function tile(key, value, detail) {
@@ -886,7 +897,7 @@ function numbersHtml(sinceMs, untilMs) {
   return `<div class="tiles">` +
     tile("Runs", `${n.full}`, `${plural(n.prs, "PR")} · ${n.aborted} aborted or unfinished`) +
     tile("Green", n.full ? `${n.green}<small>/ ${n.green + n.reds}</small>` : "—", n.green + n.reds ? `${pct(n.green / (n.green + n.reds))} of concluded runs` : "no concluded runs") +
-    tile("Reds", `${n.reds}`, `${n.own} look like the PR · ${n.infra} the gate's (incl. ${n.deaths} setup ${n.deaths === 1 ? "death" : "deaths"})`) +
+    tile("Reds", `${n.reds}`, `${n.own} look like the PR · ${n.infra} the gate's (incl. ${n.deaths} setup ${n.deaths === 1 ? "death" : "deaths"}${n.notEvaluated ? `, ${n.notEvaluated} not evaluated` : ""})`) +
     tile("Wall clock", n.p50 != null ? `${Math.round(n.p50 / 60000)}<small>min p50</small>` : "—", n.p90 != null ? `${Math.round(n.p90 / 60000)} min p90` : "no timings") +
     tile("Reps lost", n.lostShare != null ? `${(100 * n.lostShare).toFixed(1)}<small>%</small>` : "—", "429s and empty records, over all repetitions") +
     `</div>`;
@@ -1095,8 +1106,14 @@ function runDoHtml(text) {
 
 function whatToDoHtml(run) {
   const items = [];
+  if (run.verdict === "not_evaluated") {
+    // The suite's own verdict: every case it named is listed under "Not
+    // graded" above (runHtml), and the gate found nothing against the change.
+    items.push(runDoHtml(run.do || "Retest once the environment is healthy."));
+    items.push("<li>Prow reports the run red because the suite could certify nothing, not because a check failed; there is no absolute-check failure to look for in the build log.</li>");
+  }
   // A deadline kill keeps its `do` whether or not cases finished before it.
-  if ((!measured(run) || run.cls === "deadline-kill") && run.do) items.push(runDoHtml(run.do));
+  else if ((!measured(run) || run.cls === "deadline-kill") && run.do) items.push(runDoHtml(run.do));
   else if (run.setup_death || (!measured(run) && run.verdict === "infra")) items.push("<li><b>Retest.</b> Nothing ran, so nothing here is about your change.</li>");
   else if (!measured(run) && run.verdict === "green") items.push("<li><b>Nothing.</b> The gate revalidated this branch's earlier green run.</li>");
   else if (!measured(run)) items.push("<li><b>Read the build log.</b> The failure is before the eval loop; a broken image build or deploy on this branch looks like this.</li>");
@@ -1126,14 +1143,22 @@ function runHtml(link) {
   const failed = cases.filter((c) => c.admitted && c.outcome === "failed");
   const order = { "only-this-pr": 0, null: 1, storm: 2, shared: 3 };
   failed.sort((a, b) => (order[a.cls] ?? 1) - (order[b.cls] ?? 1));
-  const lost = cases.filter((c) => c.admitted && c.outcome === "infra");
+  // The suite's not-evaluated verdict names the lost cases on the branch's
+  // roster; the dashboard's can be older and hold one of them out, and the
+  // headline and the lede name it either way, so the list does too (with
+  // the held-out tag). A named case this run has no record of (the log
+  // parsed no task for it) is listed by name under the same heading.
+  const suiteLost = new Set(run.verdict === "not_evaluated" && Array.isArray(run.not_evaluated) ? run.not_evaluated.map(String) : []);
+  const lost = cases.filter((c) => c.outcome === "infra" && (c.admitted || suiteLost.has(c.case)));
+  const lostUnrecorded = [...suiteLost].filter((name) => !cases.some((c) => c.case === name));
   const partial = cases.filter((c) => c.admitted && c.outcome === "partial");
   const passed = cases.filter((c) => c.admitted && c.outcome === "passed");
   const heldPassed = cases.filter((c) => !c.admitted && (c.outcome === "passed" || c.outcome === "partial"));
   const heldFailed = cases.filter((c) => !c.admitted && c.outcome === "failed");
   let body = "";
   if (failed.length) body += `<div class="sec"><h2>Failed gate cases · ${failed.length}</h2>${failed.map((c) => caseCard(run, c)).join("")}</div>`;
-  if (lost.length) body += `<div class="sec"><h2>Not graded · ${lost.length}</h2>${lost.map((c) => caseCard(run, c)).join("")}</div>`;
+  if (lost.length || lostUnrecorded.length) body += `<div class="sec"><h2>Not graded · ${lost.length + lostUnrecorded.length}</h2>${lost.map((c) => caseCard(run, c)).join("")}` +
+    (lostUnrecorded.length ? `<div class="passed">${lostUnrecorded.map((name) => `<span>${esc(name)}</span>`).join("")}</div><p class="mut small">Named by the suite's verdict; this run's log recorded no grading for ${lostUnrecorded.length === 1 ? "it" : "them"}.</p>` : "") + "</div>";
   if (partial.length) body += `<div class="sec"><h2>Passed on retry · ${partial.length}</h2><div class="passed">${partial.map((c) => `<span>${esc(c.case)}</span>`).join("")}</div><p class="mut small">Some repetitions failed; the gate counts a case as failed only when every graded repetition fails.</p></div>`;
   if (passed.length || heldPassed.length) body += `<div class="sec"><h2>Passed · ${passed.length + heldPassed.length}</h2><div class="passed">${passed.map((c) => `<span>${esc(c.case)}</span>`).join("")}${heldPassed.length ? `<span class="held">+${heldPassed.length} held out</span>` : ""}</div></div>`;
   if (heldFailed.length) body += `<div class="sec"><h2>Held out · failed · ${heldFailed.length}</h2><div class="passed">${heldFailed.map((c) => `<span class="held">${esc(c.case)}</span>`).join("")}</div><p class="mut small">Held-out cases are measured but never block a PR.</p></div>`;
@@ -1814,7 +1839,7 @@ function trendRecordHtml(rec) {
     ? `${rec.passes}/${rec.runs} across ${plural(rec.lines, "night")} at the current key, ${Math.max(0, (bar.min_runs || 20) - rec.runs)} more runs before the window is full`
     : rec.state === "cut"
       ? `${rec.passes}/${rec.runs} across ${plural(rec.lines, "night")} at the current key inside this read; the store may hold older records at this key that admission pools and this page did not read`
-      : `${rec.passes}/${rec.runs} across ${plural(rec.lines, "night")} at the current key against a bar of ${pct(bar.rate || 0.95)} over ${bar.min_runs || 20}`;
+      : `${rec.passes}/${rec.runs} across ${plural(rec.lines, "night")} at the current key against a bar of ${pct(bar.rate || 0.9)} over ${bar.min_runs || 20}`;
   return `<p class="rec"><b>Record today: ${esc(words[rec.state] || rec.state)}.</b> ${esc(detail)} <span class="mut">(as of ${esc(et(parseIso(rec.as_of)))}; the roster decides, the record informs)</span></p>`;
 }
 

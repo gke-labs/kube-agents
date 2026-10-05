@@ -4,13 +4,17 @@ import (
 	"bytes"
 	"crypto/hkdf"
 	"crypto/sha256"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/capability"
 )
 
 // setBaseEnv pins the required env plus empty values for every optional
@@ -21,10 +25,13 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("NATS_URL", "nats://127.0.0.1:4222")
 	t.Setenv("NATS_PASSWORD", "pw")
 	t.Setenv("DISCORD_TOKEN", "x")
+	t.Setenv("SLACK_BOT_TOKEN", "")
+	t.Setenv("SLACK_APP_TOKEN", "")
 	t.Setenv("SESSION_KV_SALT", "")
 	t.Setenv("A2A_ATTRIBUTION_SALT", "")
 	t.Setenv("A2A_TASK_DEADLINE_SECONDS", "")
 	t.Setenv("A2A_ASK_TTL", "")
+	t.Setenv("A2A_SESSION_TTL", "")
 	t.Setenv("A2A_FIRST_EVENT_GRACE", "")
 	t.Setenv("A2A_OWNER_DEPLOYMENT", "")
 	t.Setenv("A2A_MAX_SESSIONS", "")
@@ -295,6 +302,164 @@ func TestFromEnvAskTTL(t *testing.T) {
 	}
 }
 
+// TestFromEnvBackendSelection: exactly one chat backend per gateway
+// process — two gateways bound to one relay durable split event deliveries
+// (Options.RelayDurable), so a second backend is a second Deployment, and
+// zero backends is a gateway with no front door. Socket Mode needs both
+// Slack tokens, so half a pair refuses too.
+func TestFromEnvBackendSelection(t *testing.T) {
+	setBaseEnv(t)
+
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Backend() != "discord" {
+		t.Fatalf("Backend() = %q, want discord", cfg.Backend())
+	}
+
+	t.Setenv("DISCORD_TOKEN", "")
+	t.Setenv("SLACK_BOT_TOKEN", "xoxb-1")
+	t.Setenv("SLACK_APP_TOKEN", "xapp-1")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Backend() != "slack" {
+		t.Fatalf("Backend() = %q, want slack", cfg.Backend())
+	}
+
+	t.Setenv("DISCORD_TOKEN", "x")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("two backends accepted; one relay durable means one backend per gateway")
+	}
+
+	t.Setenv("DISCORD_TOKEN", "")
+	t.Setenv("SLACK_BOT_TOKEN", "")
+	t.Setenv("SLACK_APP_TOKEN", "")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("no backend accepted")
+	}
+
+	t.Setenv("SLACK_BOT_TOKEN", "xoxb-1")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("half a Slack token pair accepted; Socket Mode needs both")
+	}
+}
+
+// TestFromEnvSessionTTL: the bound on idle session records in session-state —
+// absent means 7 days (well past TASKS 72h retention), and a sub-72h
+// value or invalid format refuses at boot.
+func TestFromEnvSessionTTL(t *testing.T) {
+	setBaseEnv(t)
+
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SessionTTL != 7*24*time.Hour {
+		t.Fatalf("default SessionTTL = %v, want 168h", cfg.SessionTTL)
+	}
+
+	t.Setenv("A2A_SESSION_TTL", "96h")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SessionTTL != 96*time.Hour {
+		t.Fatalf("SessionTTL = %v, want 96h", cfg.SessionTTL)
+	}
+
+	for _, bad := range []string{"71h", "48h", "30m", "junk"} {
+		t.Setenv("A2A_SESSION_TTL", bad)
+		if _, err := FromEnv(); err == nil {
+			t.Fatalf("A2A_SESSION_TTL=%q accepted", bad)
+		}
+	}
+
+	// Refusal when SessionTTL <= TaskDeadline
+	t.Setenv("A2A_SESSION_TTL", "96h")
+	t.Setenv("A2A_TASK_DEADLINE_SECONDS", fmt.Sprintf("%d", int((100*time.Hour).Seconds())))
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("expected refusal when SessionTTL <= TaskDeadline, got nil")
+	}
+}
+
+// pairs are exactly what a hand-enumerated switch leaves a hole in — the
+// two-backend switch this merged from only knew about one pair, and a fourth
+// backend must not be addable with a combination nobody checked. Exactly one
+// real backend armed is the only accepted shape; zero, any pair, all three,
+// and any half Slack pair all refuse. The door is the other axis: it is not
+// a backend, so it must sit beside any ONE of the three without displacing
+// it, count as an ingress on its own, and change none of the refusals.
+func TestFromEnvBackendCombinations(t *testing.T) {
+	const (
+		discord = "x"
+		bot     = "xoxb-1"
+		app     = "xapp-1"
+		relay   = "http://relay.ns.svc:8081"
+		door    = ":8099"
+	)
+	for _, d := range []string{"", discord} {
+		for _, b := range []string{"", bot} {
+			for _, a := range []string{"", app} {
+				for _, g := range []string{"", relay} {
+					for _, i := range []string{"", door} {
+						name := fmt.Sprintf("discord=%t/bot=%t/app=%t/gchat=%t/door=%t", d != "", b != "", a != "", g != "", i != "")
+						t.Run(name, func(t *testing.T) {
+							setBaseEnv(t)
+							t.Setenv("DISCORD_TOKEN", d)
+							t.Setenv("SLACK_BOT_TOKEN", b)
+							t.Setenv("SLACK_APP_TOKEN", a)
+							t.Setenv("A2A_GCHAT_RELAY_URL", g)
+							t.Setenv("A2A_INJECT_LISTEN", i)
+							if i != "" {
+								t.Setenv("A2A_INJECT_TOKEN", "s3cret")
+							}
+
+							// A half Slack pair is a typo, never a choice.
+							halfPair := (b != "") != (a != "")
+							armed := 0
+							want := ""
+							if g != "" {
+								armed, want = armed+1, "gchat"
+							}
+							if b != "" {
+								armed, want = armed+1, "slack"
+							}
+							if d != "" {
+								armed, want = armed+1, "discord"
+							}
+							// The door alone is an ingress (decided 2026-09-17,
+							// see FromEnv); with nothing else armed Backend()
+							// is "" rather than a real backend's name.
+							doorOnly := armed == 0 && i != ""
+
+							cfg, err := FromEnv()
+							if halfPair || (armed != 1 && !doorOnly) {
+								if err == nil {
+									t.Fatalf("FromEnv() accepted %s (armed=%d, halfPair=%t); backend = %q",
+										name, armed, halfPair, cfg.Backend())
+								}
+								return
+							}
+							if err != nil {
+								t.Fatalf("FromEnv() refused %s: %v", name, err)
+							}
+							if got := cfg.Backend(); got != want {
+								t.Fatalf("Backend() = %q, want %q: the door must not displace or stand in for a real backend", got, want)
+							}
+							if cfg.InjectArmed() != (i != "") {
+								t.Fatalf("InjectArmed() = %t with A2A_INJECT_LISTEN=%q", cfg.InjectArmed(), i)
+							}
+						})
+					}
+				}
+			}
+		}
+	}
+}
+
 // TestFromEnvFirstEventGrace: the bound on a task with no events at all —
 // absent means 10m (the pod deadline's pre-start budget), and a sub-minute
 // value refuses at boot.
@@ -468,6 +633,9 @@ func TestFromEnvTheDoorSitsBesideARealBackend(t *testing.T) {
 		{"beside the chat relay", map[string]string{
 			"DISCORD_TOKEN": "", "A2A_GCHAT_RELAY_URL": "http://relay.ns.svc:8081",
 		}, gchatBackend},
+		{"beside the slack pair", map[string]string{
+			"DISCORD_TOKEN": "", "SLACK_BOT_TOKEN": "xoxb-1", "SLACK_APP_TOKEN": "xapp-1",
+		}, slackBackend},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			setBaseEnv(t)
@@ -609,5 +777,98 @@ func TestFromEnvStrictEventsWriter(t *testing.T) {
 	}
 	if cfg.StrictEventsWriter {
 		t.Fatal("a near-miss value tightened the check; the safe direction is loose")
+	}
+}
+
+// TestDefaultAddresseeIsPlatform: "Sessions by default" phase 1 keeps the
+// platform agent as the default; /session is the per-conversation opt-in.
+func TestDefaultAddresseeIsPlatform(t *testing.T) {
+	setBaseEnv(t)                         // the file's shared FromEnv environment (NATS_URL, salt, principal map)
+	t.Setenv("A2A_DEFAULT_ADDRESSEE", "") // envOr treats empty as unset
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DefaultAddressee != "platform" {
+		t.Fatalf("DefaultAddressee = %q, want platform", cfg.DefaultAddressee)
+	}
+}
+
+// The gateway half of the capability switch, asserted through FromEnv rather
+// than through a Config literal. The mint side and the check side are
+// rendered from one variable so they cannot drift, which only holds if each
+// end reads it the same way; this is the gateway end of that claim.
+func TestFromEnvCapabilityOptionalOnlyOnExactlyFalse(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		set   bool
+		want  bool
+	}{
+		{name: "a default install sets nothing", set: false, want: false},
+		{name: "empty is not consent", value: "", set: true, want: false},
+		{name: "the rollout window", value: "false", set: true, want: true},
+		{name: "explicitly required", value: "true", set: true, want: false},
+		{name: "a typo enforces", value: "False", set: true, want: false},
+		{name: "so does a lie", value: "0", set: true, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setBaseEnv(t)
+			t.Setenv("A2A_CAPABILITY_REQUIRED", tc.value)
+			if !tc.set {
+				if err := os.Unsetenv("A2A_CAPABILITY_REQUIRED"); err != nil {
+					t.Fatalf("could not unset: %v", err)
+				}
+			}
+			cfg, err := FromEnv()
+			if err != nil {
+				t.Fatalf("FromEnv: %v", err)
+			}
+			if cfg.CapabilityOptional != tc.want {
+				t.Errorf("CapabilityOptional = %v, want %v with A2A_CAPABILITY_REQUIRED=%q (set=%v)",
+					cfg.CapabilityOptional, tc.want, tc.value, tc.set)
+			}
+		})
+	}
+}
+
+// TestAMalformedPodNamespaceIsAGatewayBootFailure covers the gateway's share
+// of a rule that all three components reading POD_NAMESPACE now get from
+// capability.ValidateNamespace. The gateway is the one with the most to lose:
+// it MINTS, so a ceiling built from a namespace nobody validated is inherited
+// by every hop of every task the install ever runs.
+//
+// The second row is why this is not redundant with the Entry check that
+// follows it. "a/b/c" builds "namespace/a/b/c", which Entry.Validate accepts
+// as namespace=a plus a second pair b/c — so before this check the gateway
+// booted clean and minted against a ceiling nobody chose. The first row
+// Entry.Validate would already have caught; keeping both is what shows the
+// check is doing work the existing one did not.
+//
+// The scope is set explicitly on the last row to pin the deliberate choice
+// that an explicit A2A_AUTHORITY_SCOPE does not excuse a malformed namespace:
+// it only stops the namespace from reaching the ceiling, and the gateway
+// reads POD_NAMESPACE for more than that.
+func TestAMalformedPodNamespaceIsAGatewayBootFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		namespace string
+		scope     capability.Scope
+		wantErr   bool
+	}{
+		{name: "odd separators are refused by the scope check too", namespace: "team/x", wantErr: true},
+		{name: "even separators validate as a different ceiling", namespace: "a/b/c", wantErr: true},
+		{name: "a real namespace boots", namespace: "kubeagents-system"},
+		{name: "an explicit scope does not excuse it", namespace: "team/x",
+			scope: capability.Scope("namespace/kubeagents-system"), wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Config{Namespace: tc.namespace, AuthorityScope: tc.scope}
+			c.defaultCapabilityCeiling()
+			if err := c.validateCapabilityCeiling(); (err != nil) != tc.wantErr {
+				t.Fatalf("validateCapabilityCeiling with Namespace=%q scope=%q err = %v, wantErr %v",
+					tc.namespace, tc.scope, err, tc.wantErr)
+			}
+		})
 	}
 }

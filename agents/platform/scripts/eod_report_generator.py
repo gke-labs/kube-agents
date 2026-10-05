@@ -37,6 +37,8 @@ DEFAULT_EXCLUDE_NAMESPACES = frozenset({"kube-system", "kube-public", "kube-node
 # two spellings agree, so a rename that misses this copy fails there rather than
 # silently folding drift rows back into the watcher's totals.
 DRIFT_LEDGER_REASON = "OutOfBandChange"
+# The same for the stall watch's rows, and copied for the same reason.
+STALL_LEDGER_REASON = "ControllerStall"
 
 
 def excluded_namespaces() -> FrozenSet[str]:
@@ -244,7 +246,8 @@ def load_intercepted_events(
                 # alerts went to chat", the clusters in the fan-in header — and
                 # a drift record is not an event the watcher forwarded. Folding
                 # the two together would inflate all of them with no way for the
-                # reader to separate them again.
+                # reader to separate them again. The stall watch's rows, under
+                # `reason = 'ControllerStall'`, are excluded for the same reason.
                 #
                 # Excluded rather than reported separately because this recap
                 # could not say anything useful about a drift row if it kept it:
@@ -256,9 +259,9 @@ def load_intercepted_events(
                     f"severity, occurrences, notified, created_at, {delivery_col} "
                     "FROM intercepted_events "
                     "WHERE created_at >= datetime('now', ?) "
-                    "AND reason != ? "
+                    "AND reason NOT IN (?, ?) "
                     "ORDER BY created_at DESC",
-                    (f"-{int(window_hours)} hours", DRIFT_LEDGER_REASON),
+                    (f"-{int(window_hours)} hours", DRIFT_LEDGER_REASON, STALL_LEDGER_REASON),
                 )
                 rows = cursor.fetchall()
             finally:

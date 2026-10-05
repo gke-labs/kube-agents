@@ -62,8 +62,12 @@ RC_TAG="${RC_TAG:-}"
 
 if [ -z "${RC_TAG}" ]; then
   release_fetch_tags
-  RC_TAG="$(git tag -l --sort=-v:refname "${RC_TAG_GLOB}" 2>/dev/null |
-    grep -v '_validated$' | head -n 1 || echo "")"
+  # Newest by name among the candidates on main. A release line's rc_ tags
+  # share the namespace and would otherwise be the newest of all the moment one
+  # is cut; the eval grades main's candidates, and a line pins its own with RC_TAG.
+  rc_candidates="$(list_tags_on_main "${RC_TAG_GLOB}")" || exit 1
+  rc_candidates="$(grep -v '_validated$' <<<"${rc_candidates}" || true)"
+  RC_TAG="$(head -n 1 <<<"${rc_candidates}")"
   if [ -z "${RC_TAG}" ]; then
     echo "❌ ERROR: no ${RC_TAG_GLOB} tag found. Set RC_TAG explicitly, or wait for rc-scheduler.yml to cut a candidate." >&2
     exit 1
@@ -102,8 +106,14 @@ fi
 # main commit with no images at all. The candidate is normally chosen because
 # its images exist, so this firing means something moved underneath it.
 #
-# All six of REQUIRED_RELEASE_IMAGES, deliberately, though an eval install
-# renders only four of them — both plugins default to enabled=false. The gate
+# All of REQUIRED_RELEASE_IMAGES as the candidate's own common.sh lists it
+# (required_release_images_at, which check_commit_images_exist reads; the
+# diagnostic below walks the same list, since this tree may be a newer main
+# whose list has grown past the candidate's), deliberately, though an eval
+# install on this path renders only the operator, the agent, the proxy and the sandbox: both
+# plugins default to enabled=false, and the A2A next-stack images and the
+# bridge belong to a mode: next install, which this path refuses
+# (hack/ci-deploy.sh, RC_COMMIT_SHA with EVAL_MODE_NEXT). The gate
 # asks "is this commit published", and that is the release path's question with
 # the release path's answer; a shorter list here would be a second definition of
 # a published commit, disagreeing with verify_release_eligibility.sh about which
@@ -113,13 +123,14 @@ fi
 registry_prefix="$(get_registry_prefix)"
 if ! check_commit_images_exist "${RC_COMMIT_SHA}"; then
   echo "❌ ERROR: ${registry_prefix} is missing at least one of the required images at ${RC_COMMIT_SHA:0:7}:" >&2
-  for img in "${REQUIRED_RELEASE_IMAGES[@]}"; do
+  # 2>/dev/null: the gate just printed which list this is.
+  while IFS= read -r img; do
     if registry_image_exists "${registry_prefix}/${img}:${RC_COMMIT_SHA}"; then
       echo "   ✓ ${img}" >&2
     else
       echo "   ✗ ${img}" >&2
     fi
-  done
+  done < <(required_release_images_at "${RC_COMMIT_SHA}" 2>/dev/null)
   exit 1
 fi
 

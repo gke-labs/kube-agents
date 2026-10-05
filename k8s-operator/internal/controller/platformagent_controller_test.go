@@ -19,13 +19,17 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
+	"github.com/go-logr/logr/funcr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -1003,7 +1007,128 @@ func TestPlatformAgentReconciler_Reconcile_InvalidGitHubOrg(t *testing.T) {
 
 	degradedCond := meta.FindStatusCondition(updatedAgent.Status.Conditions, "Degraded")
 	if degradedCond == nil || degradedCond.Status != metav1.ConditionTrue || degradedCond.Reason != "InvalidGitRepoURL" {
-		t.Errorf("expected Degraded condition True with reason InvalidGitRepoURL, got %v", degradedCond)
+		t.Fatalf("expected Degraded condition True with reason InvalidGitRepoURL, got %v", degradedCond)
+	}
+	// The problem list names only the org, so the message has to say that
+	// the repository on that forge is withheld too.
+	if !strings.Contains(degradedCond.Message, "nor is the repository on a refused forge") {
+		t.Errorf("Degraded message does not say the repository on the refused forge is withheld: %q", degradedCond.Message)
+	}
+}
+
+// One refused entry beside accepted ones degrades the CR, but the accepted
+// ones — the gitops repository included — are still seeded, so the message must
+// not say GitOps is disabled.
+func TestPlatformAgentReconciler_Reconcile_OneRefusedEntryKeepsItsNeighbours(t *testing.T) {
+	scheme := setupScheme()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-one-refused", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Provider: agentv1alpha1.GitProviderGitHub, Namespace: "gke-labs"}},
+					Repositories: []agentv1alpha1.RepositorySpec{
+						{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleGitOps},
+						{Forge: "github", Repository: "docs", Namespace: "platform_team", Role: agentv1alpha1.RepositoryRoleContext},
+					},
+				},
+			},
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+	for i := 1; i <= 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i, err)
+		}
+	}
+
+	updated := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	degraded := meta.FindStatusCondition(updated.Status.Conditions, "Degraded")
+	if degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != conditionReasonInvalidGitRepoURL {
+		t.Fatalf("expected Degraded True/InvalidGitRepoURL, got %v", degraded)
+	}
+	if strings.Contains(degraded.Message, "GitOps disabled") || !strings.Contains(degraded.Message, "refused entries are not seeded") ||
+		strings.Contains(degraded.Message, "no managed repository") {
+		t.Errorf("Degraded message must say only the refused entries are left out, got %q", degraded.Message)
+	}
+
+	cm := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: agent.Name + "-gitops-state", Namespace: agent.Namespace}, cm); err != nil {
+		t.Fatalf("failed to get gitops-state ConfigMap: %v", err)
+	}
+	if !strings.Contains(cm.Data["managed_repos"], "https://github.com/gke-labs/infra") {
+		t.Errorf("the accepted gitops repository must still be seeded, managed_repos = %q", cm.Data["managed_repos"])
+	}
+	if strings.Contains(cm.Data["context_repos"], "docs") {
+		t.Errorf("the refused context repository must not be seeded, context_repos = %q", cm.Data["context_repos"])
+	}
+}
+
+// A refused gitops repository keeps the accepted managed ones out of
+// managed_repos too, and the problem list names none of them, so the message
+// has to say it.
+func TestPlatformAgentReconciler_Reconcile_ARefusedGitOpsRepositorySaysManagedAreWithheld(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-gitops-refused", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Provider: agentv1alpha1.GitProviderGitHub, Namespace: "gke-labs"}},
+					Repositories: []agentv1alpha1.RepositorySpec{
+						{Forge: "github", Repository: "in fra", Role: agentv1alpha1.RepositoryRoleGitOps},
+						{Forge: "github", Repository: "apps", Role: agentv1alpha1.RepositoryRoleManaged},
+					},
+				},
+			},
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
+		},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+	for i := 1; i <= 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i, err)
+		}
+	}
+	updated := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	degraded := meta.FindStatusCondition(updated.Status.Conditions, "Degraded")
+	if degraded == nil || degraded.Reason != conditionReasonInvalidGitRepoURL {
+		t.Fatalf("expected Degraded InvalidGitRepoURL, got %v", degraded)
+	}
+	if !strings.Contains(degraded.Message, "no managed repository is seeded while the gitops repository is refused") {
+		t.Errorf("Degraded message does not say the managed repositories are withheld: %q", degraded.Message)
+	}
+	cm := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: agent.Name + "-gitops-state", Namespace: agent.Namespace}, cm); err != nil {
+		t.Fatalf("failed to get gitops-state ConfigMap: %v", err)
+	}
+	if strings.Contains(cm.Data["managed_repos"], "apps") {
+		t.Errorf("managed_repos = %q; the managed repository must be withheld", cm.Data["managed_repos"])
 	}
 }
 
@@ -3279,7 +3404,10 @@ func TestReconcileGitopsStateConfigMap(t *testing.T) {
 		t.Errorf("expected ConfigMap to retain its data, but got %v", verifyCM.Data)
 	}
 
-	// 4. Updating CR spec with a new repo should append it to the existing ConfigMap
+	// 4. Updating the CR's GitOps repository adds it to the existing ConfigMap,
+	// first rather than last: agent-side consumers fall back to the first
+	// managed entry for the GitOps repository, so appending would leave the
+	// previous first entry answering for it.
 	agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
 		IntegrationSpec: agentv1alpha1.IntegrationSpec{
 			GitHub: &agentv1alpha1.GitHubSpec{
@@ -3295,7 +3423,7 @@ func TestReconcileGitopsStateConfigMap(t *testing.T) {
 	if err := fakeClient.Get(ctx, cmKey, &verifyCM); err != nil {
 		t.Fatalf("failed to get ConfigMap after third reconcile: %v", err)
 	}
-	expectedMergedJSON := `[{"type":"github","url":"some-repo"},{"type":"github","url":"https://github.com/test-org/new-repo"}]`
+	expectedMergedJSON := `[{"type":"github","url":"https://github.com/test-org/new-repo"},{"type":"github","url":"some-repo"}]`
 	if verifyCM.Data["managed_repos"] != expectedMergedJSON {
 		t.Errorf("expected ConfigMap to contain merged repos, but got %v", verifyCM.Data["managed_repos"])
 	}
@@ -4801,7 +4929,7 @@ func TestABrokenNativeSidecarIsReportedDegraded(t *testing.T) {
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
-	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent)
+	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent, true)
 
 	if phase != "Degraded" {
 		t.Errorf("phase = %q, want Degraded -- a pod stuck in Init reports as healthy", phase)
@@ -4851,7 +4979,7 @@ func TestInitContainerPluginStagingFailureReportsDegraded(t *testing.T) {
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
-	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent)
+	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent, true)
 
 	if phase != "Degraded" {
 		t.Errorf("phase = %q, want Degraded", phase)
@@ -5015,6 +5143,136 @@ func TestSyncGithubTokenMinterConfigMap(t *testing.T) {
 
 	if _, exists := updatedCM.Data["forbidden-repo.yaml"]; exists {
 		t.Errorf("expected cross-org forbidden-repo.yaml to be skipped when primaryOrg is inferred from GitRepo")
+	}
+
+	// 5. The only github forge has a namespace GitHub refuses. Its primary org
+	// is empty, which would accept every organisation, so the sync must leave
+	// the policies as they were rather than widen them to other-org.
+	before := updatedCM.DeepCopy()
+	agentBadForge := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-bad-forge", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Provider: agentv1alpha1.GitProviderGitHub, Namespace: "test_org"}},
+				},
+			},
+		},
+	}
+	err = r.syncGithubTokenMinterConfigMap(ctx, agentBadForge, `[{"type":"github","url":"https://github.com/test-org/repo-1"},{"type":"github","url":"https://github.com/other-org/other-repo"}]`, "")
+	if err != nil {
+		t.Fatalf("syncGithubTokenMinterConfigMap with an invalid forge failed: %v", err)
+	}
+	if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, updatedCM); err != nil {
+		t.Fatalf("failed to get updated ConfigMap: %v", err)
+	}
+	if _, exists := updatedCM.Data["other-repo.yaml"]; exists {
+		t.Errorf("an invalid forge namespace must not turn the org scope off, got other-repo.yaml")
+	}
+	if !reflect.DeepEqual(updatedCM.Data, before.Data) {
+		t.Errorf("an invalid forge namespace must leave the policies as they were, got %v", updatedCM.Data)
+	}
+
+	// 6. A valid github forge with no namespace, whose only repository the agent
+	// writes to is refused: nothing accepted is left to read the organisation
+	// from, so the sync must again leave the policies alone.
+	agentRefusedRepo := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-refused-repo", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					Forges:       []agentv1alpha1.ForgeSpec{{Name: "github", Provider: agentv1alpha1.GitProviderGitHub}},
+					Repositories: []agentv1alpha1.RepositorySpec{{Forge: "github", Repository: "test-org/in fra", Role: agentv1alpha1.RepositoryRoleGitOps}},
+				},
+			},
+		},
+	}
+	if err := r.syncGithubTokenMinterConfigMap(ctx, agentRefusedRepo, `[{"type":"github","url":"https://github.com/test-org/repo-1"},{"type":"github","url":"https://github.com/other-org/other-repo"}]`, ""); err != nil {
+		t.Fatalf("syncGithubTokenMinterConfigMap with a refused repository failed: %v", err)
+	}
+	if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, updatedCM); err != nil {
+		t.Fatalf("failed to get updated ConfigMap: %v", err)
+	}
+	if !reflect.DeepEqual(updatedCM.Data, before.Data) {
+		t.Errorf("a refused write repository must leave the policies as they were, got %v", updatedCM.Data)
+	}
+
+	// 7. A refusal must not move the organisation to what validation left
+	// standing either: another forge's namespace, or a managed repository's
+	// organisation. Either would scope the sync to other-org and prune the
+	// policy of test-org's repository, which was working. Nor may a
+	// declaration that does not resolve at all widen it: an empty organisation
+	// would render a policy for other-org's repository.
+	for name, integration := range map[string]agentv1alpha1.IntegrationSpec{
+		"both spellings at once": {
+			GitHub: &agentv1alpha1.GitHubSpec{Org: "test-org", GitRepo: "repo-1"},
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Provider: agentv1alpha1.GitProviderGitHub, Namespace: "test-org"}},
+		},
+		"a typo in the gitops forge's namespace": {
+			Forges: []agentv1alpha1.ForgeSpec{
+				{Name: "ours", Provider: agentv1alpha1.GitProviderGitHub, Namespace: "test-org_"},
+				{Name: "upstream", Provider: agentv1alpha1.GitProviderGitHub, Namespace: "other-org"},
+			},
+			Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "ours", Repository: "repo-1", Role: agentv1alpha1.RepositoryRoleGitOps},
+				{Forge: "upstream", Repository: "other-repo", Role: agentv1alpha1.RepositoryRoleContext},
+			},
+		},
+		"a typo in the gitops repository": {
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Provider: agentv1alpha1.GitProviderGitHub}},
+			Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "test-org/repo 1", Role: agentv1alpha1.RepositoryRoleGitOps},
+				{Forge: "github", Repository: "other-org/other-repo", Role: agentv1alpha1.RepositoryRoleManaged},
+			},
+		},
+	} {
+		agentMoved := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent-moved", Namespace: "test-ns"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: integration},
+			},
+		}
+		if err := r.syncGithubTokenMinterConfigMap(ctx, agentMoved, `[{"type":"github","url":"https://github.com/test-org/repo-1"},{"type":"github","url":"https://github.com/other-org/other-repo"}]`, ""); err != nil {
+			t.Fatalf("%s: syncGithubTokenMinterConfigMap failed: %v", name, err)
+		}
+		if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, updatedCM); err != nil {
+			t.Fatalf("%s: failed to get updated ConfigMap: %v", name, err)
+		}
+		if !reflect.DeepEqual(updatedCM.Data, before.Data) {
+			t.Errorf("%s must leave the policies as they were, got %v", name, updatedCM.Data)
+		}
+	}
+
+	// 8. An integration block with no forge declaration at all -- chat only --
+	// resolves to nil, and the sync must still run.
+	agentChatOnly := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-chat-only", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{Slack: &agentv1alpha1.SlackSpec{}},
+		},
+	}
+	if err := r.syncGithubTokenMinterConfigMap(ctx, agentChatOnly, `[{"type":"github","url":"https://github.com/test-org/repo-1"}]`, ""); err != nil {
+		t.Fatalf("syncGithubTokenMinterConfigMap with a chat-only integration failed: %v", err)
+	}
+}
+
+// Each refused repository adds a problem that can quote up to 2048 characters,
+// and the CRD caps a condition message at 32768: the list must be bounded or
+// the whole status write fails.
+func TestGitProblemListIsBounded(t *testing.T) {
+	var problems []error
+	for i := 0; i < 64; i++ {
+		problems = append(problems, fmt.Errorf("integration.repositories[%d].repository: %s", i, strings.Repeat("c", 4000)))
+	}
+	got := gitProblemList(stderrors.Join(problems...))
+	if len(got) > hostPathDroppedEntryBudget+64 {
+		t.Errorf("gitProblemList is %d characters, want at most about %d", len(got), hostPathDroppedEntryBudget)
+	}
+	if !strings.Contains(got, "repositories[0]") || !strings.Contains(got, "more") {
+		t.Errorf("gitProblemList must name the first problem and count the rest, got %q", got[:200])
+	}
+	if one := gitProblemList(stderrors.New("integration.github.gitRepo: bad")); one != "integration.github.gitRepo: bad" {
+		t.Errorf("a single problem must be listed as it is, got %q", one)
 	}
 }
 
@@ -5525,6 +5783,346 @@ func TestSyncGithubTokenMinterConfigMap_UnparseableListLeavesTheConfigMapAlone(t
 	}
 }
 
+func TestSyncGithubTokenMinterConfigMap_AnUnreadableEntryKeepsEveryTrackedPolicy(t *testing.T) {
+	// repo-x's entry is a spelling an earlier release rewrote and this one
+	// refuses. Nothing says which tracked policy it was, so the sync must not
+	// prune -- here that would revoke repo-x's working policy -- while it still
+	// adds the policy for a repository it can read.
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{Org: "test-org"},
+				},
+			},
+		},
+	}
+	const trackedPolicy = "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-x'\n"
+	minterCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "github-token-minter-config",
+			Namespace:   "test-ns",
+			Annotations: map[string]string{AnnotationManagedMinterKeys: "repo-x.yaml"},
+		},
+		Data: map[string]string{
+			"default.yaml": minterTemplateWithReadScope,
+			"repo-x.yaml":  trackedPolicy,
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, minterCM).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	managed := `[{"type":"github","url":"ssh://git@github.com:test-org/repo-x"},{"type":"github","url":"https://github.com/test-org/repo-1"}]`
+	if err := r.syncGithubTokenMinterConfigMap(ctx, agent, managed, ""); err != nil {
+		t.Fatalf("syncGithubTokenMinterConfigMap() = %v", err)
+	}
+	got := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, got); err != nil {
+		t.Fatalf("failed to get ConfigMap: %v", err)
+	}
+	if got.Data["repo-x.yaml"] != trackedPolicy {
+		t.Errorf("repo-x.yaml was pruned or rewritten while an entry could not be read: got %q", got.Data["repo-x.yaml"])
+	}
+	if !strings.Contains(got.Annotations[AnnotationManagedMinterKeys], "repo-x.yaml") {
+		t.Errorf("repo-x.yaml dropped from the ownership annotation: %q", got.Annotations[AnnotationManagedMinterKeys])
+	}
+	if _, ok := got.Data["repo-1.yaml"]; !ok {
+		t.Error("repo-1.yaml was not added; an unreadable entry must stop only the pruning")
+	}
+}
+
+// A credential in a hand-written entry stays out of the operator's log, from
+// an entry it cannot read and from one it reads but skips for its organisation.
+func TestMinterBareReposLogsNoEntryValue(t *testing.T) {
+	const secret = "ghp_notarealtoken"
+	var logged strings.Builder
+	logger := funcr.New(func(prefix, args string) { logged.WriteString(args + "\n") }, funcr.Options{Verbosity: 1})
+	repos := `[{"type":"github","url":"https://x:` + secret + `@github.com:test-org/held"},` +
+		`{"type":"github","url":"https://x:` + secret + `@github.com/other-org/app"},` +
+		`{"type":"gitlab","url":"https://x:` + secret + `@gitlab.com/g/p"},` +
+		`{"type":"github","url":"https://github.com/test-org/repo-1"}]`
+	bare, unreadable, err := minterBareRepos(logger, repos, "test-org", gitopsStateManagedReposKey)
+	if err != nil {
+		t.Fatalf("minterBareRepos() = %v", err)
+	}
+	if !slices.Equal(bare, []string{"repo-1"}) || !slices.Equal(unreadable, []string{"managed_repos[0]"}) {
+		t.Errorf("minterBareRepos() = (%v, %v), expected ([repo-1], [managed_repos[0]])", bare, unreadable)
+	}
+	if strings.Contains(logged.String(), secret) {
+		t.Errorf("log quotes an entry's credential:\n%s", logged.String())
+	}
+}
+
+// The unreadable entries are named by list and index, so the message is
+// bounded whatever the ConfigMap holds; past minterHeldEntriesShown it counts
+// the rest.
+func TestMinterHeldMessageNamesEntriesByPosition(t *testing.T) {
+	msg := minterHeldMessage("held-gitops-state", []string{"managed_repos[0]", "managed_repos[3]", "context_repos[1]", "context_repos[2]"})
+	for _, want := range []string{"managed_repos[0]", "managed_repos[3]", "context_repos[1]", "and 1 more"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message = %q, expected it to contain %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "context_repos[2]") {
+		t.Errorf("message = %q names more than %d entries", msg, minterHeldEntriesShown)
+	}
+}
+
+// The agent reads a URL through urlsplit, which drops a query and a fragment,
+// does not check a port and allowlists no scheme, so it uses these entries. The minter counts
+// them too, rather than holding every policy for an entry that works.
+func TestMinterBareReposReadsWhatTheAgentReads(t *testing.T) {
+	repos := `[{"type":"github","url":"https://github.com/test-org/repo-q?ref=main"},` +
+		`{"type":"github","url":"https://github.com/test-org/repo-f#main"},` +
+		`{"type":"github","url":"https://x@github.com:99999/test-org/repo-p?a#b"},` +
+		// urlsplit's hostname ends at the first colon, whatever follows it.
+		`{"type":"github","url":"https://github.com:abc/test-org/repo-a"},` +
+		`{"type":"github","url":"https://github.com:owner/test-org/repo-o"},` +
+		// urlsplit deletes tabs and line breaks before it splits.
+		`{"type":"github","url":"https://github.com/test-org/repo-t\t?x"},` +
+		`{"type":"github","url":"git+ssh://git@github.com/test-org/re\npo-n"},` +
+		// The agent's bound counts code points, not bytes.
+		`{"type":"github","url":"git+ssh://` + strings.Repeat("é", 200) + `@github.com/test-org/repo-u"},` +
+		// urlsplit allowlists no scheme.
+		`{"type":"github","url":"git+ssh://git@github.com/test-org/repo-g"},` +
+		`{"type":"github","url":"file://github.com/test-org/repo-l"},` +
+		// One segment once the slot is gone, which the agent skips too.
+		`{"type":"github","url":"https://github.com:test-org/one"},` +
+		// Dropping the query leaves no repository, as it does for the agent.
+		`{"type":"github","url":"https://github.com?x=/test-org/gone"},` +
+		// A `#` ends the authority, so the host is evil.example either way.
+		`{"type":"github","url":"https://evil.example#@github.com/test-org/evil"},` +
+		// No host, and over the agent's length bound: the agent skips both.
+		`{"type":"github","url":"file:///github.com/test-org/nohost"},` +
+		`{"type":"github","url":"https://github.com/test-org/long?` + strings.Repeat("x", agentRepoRefMaxLength) + `"},` +
+		// A bracket without its pair in the netloc is an invalid IPv6 URL to
+		// urlsplit, wherever it sits.
+		`{"type":"github","url":"https://[x@github.com/test-org/open"},` +
+		`{"type":"github","url":"git+ssh://a]b@github.com/test-org/close"},` +
+		`{"type":"github","url":"https://[TOKEN]@github.com/test-org/paired"}]`
+	bare, unreadable, err := minterBareRepos(logr.Discard(), repos, "test-org", gitopsStateManagedReposKey)
+	if err != nil {
+		t.Fatalf("minterBareRepos() = %v", err)
+	}
+	if want := []string{"repo-a", "repo-f", "repo-g", "repo-l", "repo-n", "repo-o", "repo-p", "repo-q", "repo-t", "repo-u"}; !slices.Equal(bare, want) {
+		t.Errorf("bare = %v, expected %v", bare, want)
+	}
+	if want := []string{"managed_repos[10]", "managed_repos[11]", "managed_repos[12]", "managed_repos[13]", "managed_repos[14]", "managed_repos[15]", "managed_repos[16]", "managed_repos[17]"}; !slices.Equal(unreadable, want) {
+		t.Errorf("unreadable = %v, expected %v", unreadable, want)
+	}
+}
+
+// TestReconcile_ARefusedDeclarationHoldsGitHubOrgAndLogsNoValue drives the
+// reconcile wiring TestARefusedGitHubScopeKeepsTheLiveGitHubOrg cannot: the
+// held organisation reaches the applied gateway, and the warning names the
+// refused field without writing its token to the log.
+func TestReconcile_ARefusedDeclarationHoldsGitHubOrgAndLogsNoValue(t *testing.T) {
+	scheme := setupScheme()
+	const secret = "ghp_notarealtoken"
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "held", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{GitRepo: "https://x:" + secret + "@github.com:gke-labs/infra"},
+				},
+			},
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
+		},
+	}
+	live := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "held-gateway", Namespace: "test-ns"},
+		Spec: appsv1.DeploymentSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name: appNamePlatformAgent,
+				Env:  []corev1.EnvVar{{Name: "GITHUB_ORG", Value: "gke-labs"}},
+			}},
+		}}},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, live, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "held", Namespace: "test-ns"}}
+	var logged strings.Builder
+	ctx := logr.NewContext(context.Background(), funcr.New(func(prefix, args string) { logged.WriteString(args + "\n") }, funcr.Options{}))
+	for range 2 {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile() = %v", err)
+		}
+	}
+
+	dep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(live), dep); err != nil {
+		t.Fatalf("get gateway: %v", err)
+	}
+	if got, _ := envValue(containerNamed(t, dep, appNamePlatformAgent), "GITHUB_ORG"); got != "gke-labs" {
+		t.Errorf("applied GITHUB_ORG = %q, expected the held gke-labs", got)
+	}
+	if strings.Contains(logged.String(), secret) {
+		t.Errorf("reconcile log quotes the refused value's credential:\n%s", logged.String())
+	}
+	if !strings.Contains(logged.String(), "integration.github.gitRepo") {
+		t.Errorf("reconcile log does not name the refused field:\n%s", logged.String())
+	}
+}
+
+func TestReconcile_AnUnreadableEntryReportsTheHeldPruning(t *testing.T) {
+	// The hold keeps repo-x's policy, which is right, but a revocation that
+	// silently does not happen has to be on the status: Degraded names the
+	// entry while Ready keeps what the workload says, and fixing the entry
+	// clears it.
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "held", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{Org: "test-org"},
+				},
+			},
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
+		},
+	}
+	// A hand-written clone URL with a credential, in a spelling this release
+	// refuses. The blank entry ahead of it is dropped, and must not shift the
+	// index the message names it by.
+	const secret = "ghp_notarealtoken"
+	const unreadable = "https://x:" + secret + "@github.com:test-org/repo-y"
+	state := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "held-gitops-state", Namespace: "test-ns"},
+		Data: map[string]string{
+			"managed_repos": `[{"type":"github","url":""},{"type":"github","url":"` + unreadable + `"},{"type":"github","url":"https://github.com/test-org/repo-1"}]`,
+		},
+	}
+	minterCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "github-token-minter-config",
+			Namespace:   "test-ns",
+			Annotations: map[string]string{AnnotationManagedMinterKeys: "repo-x.yaml"},
+		},
+		Data: map[string]string{"default.yaml": minterTemplateWithReadScope, "repo-x.yaml": "tracked"},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, state, minterCM, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "held", Namespace: "test-ns"}}
+	ctx := context.Background()
+	reconcile := func() *agentv1alpha1.PlatformAgent {
+		t.Helper()
+		for range 2 {
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("Reconcile() = %v", err)
+			}
+		}
+		got := &agentv1alpha1.PlatformAgent{}
+		if err := cl.Get(ctx, req.NamespacedName, got); err != nil {
+			t.Fatalf("get agent: %v", err)
+		}
+		return got
+	}
+
+	got := reconcile()
+	degraded := meta.FindStatusCondition(got.Status.Conditions, "Degraded")
+	if degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != conditionReasonMinterPruningHeld {
+		t.Fatalf("Degraded = %v, expected True/%s", degraded, conditionReasonMinterPruningHeld)
+	}
+	if !strings.Contains(degraded.Message, "managed_repos[1]") {
+		t.Errorf("Degraded message %q does not name the held entry by its position", degraded.Message)
+	}
+	if strings.Contains(degraded.Message, secret) {
+		t.Errorf("Degraded message %q quotes the entry's credential", degraded.Message)
+	}
+	if ready := meta.FindStatusCondition(got.Status.Conditions, "Ready"); ready == nil || ready.Reason == conditionReasonMinterPruningHeld {
+		t.Errorf("Ready = %v; the hold is reported on Degraded only", ready)
+	}
+	if got.Status.Phase == "Degraded" {
+		t.Error("phase is Degraded; the workload is not")
+	}
+
+	fixed := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(state), fixed); err != nil {
+		t.Fatalf("get state: %v", err)
+	}
+	fixed.Data["managed_repos"] = `[{"type":"github","url":"https://github.com/test-org/repo-1"}]`
+	if err := cl.Update(ctx, fixed); err != nil {
+		t.Fatalf("update state: %v", err)
+	}
+	got = reconcile()
+	if degraded := meta.FindStatusCondition(got.Status.Conditions, "Degraded"); degraded != nil {
+		t.Errorf("Degraded = %v after the entry was fixed, expected none", degraded)
+	}
+	minter := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(minterCM), minter); err != nil {
+		t.Fatalf("get minter: %v", err)
+	}
+	if _, ok := minter.Data["repo-x.yaml"]; ok {
+		t.Error("repo-x.yaml was not pruned once every entry read")
+	}
+}
+
+func TestSyncGithubTokenMinterConfigMap_AnotherForgesEntryDoesNotHoldPruning(t *testing.T) {
+	// A gitlab-typed entry is not an unreadable GitHub spelling: repo-x left
+	// managed_repos, so its tracked policy is pruned as it would be without
+	// the gitlab entry, and the entry gets no policy of its own.
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{Org: "test-org"},
+				},
+			},
+		},
+	}
+	minterCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "github-token-minter-config",
+			Namespace:   "test-ns",
+			Annotations: map[string]string{AnnotationManagedMinterKeys: "repo-x.yaml"},
+		},
+		Data: map[string]string{
+			"default.yaml": minterTemplateWithReadScope,
+			"repo-x.yaml":  "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-x'\n",
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, minterCM).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	managed := `[{"type":"github","url":"https://github.com/test-org/repo-1"},{"type":"gitlab","url":"https://gitlab.com/test-org/project"}]`
+	contextRepos := `[{"type":"gitlab","url":"https://gitlab.com/test-org/docs"}]`
+	if err := r.syncGithubTokenMinterConfigMap(ctx, agent, managed, contextRepos); err != nil {
+		t.Fatalf("syncGithubTokenMinterConfigMap() = %v", err)
+	}
+	got := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, got); err != nil {
+		t.Fatalf("failed to get ConfigMap: %v", err)
+	}
+	if _, ok := got.Data["repo-x.yaml"]; ok {
+		t.Error("repo-x.yaml survived: a gitlab-typed entry held the pruning")
+	}
+	if _, ok := got.Data["repo-1.yaml"]; !ok {
+		t.Error("repo-1.yaml was not added")
+	}
+	for _, key := range []string{"project.yaml", "docs.yaml"} {
+		if _, ok := got.Data[key]; ok {
+			t.Errorf("%s was rendered for a gitlab-typed entry", key)
+		}
+	}
+}
+
 func TestPlatformAgentReconciler_Reconcile_UnrecognizedMode(t *testing.T) {
 	scheme := setupScheme()
 
@@ -5806,6 +6404,92 @@ func TestIsGKEAutopilot(t *testing.T) {
 	}
 }
 
+// TestSameManagedRepoComparesIdentityNotSpelling covers the dedup that decides
+// whether the seeded GitOps repository is already in the state ConfigMap. A
+// string comparison made `https://github.com/gke-labs/kube-agents.git` and
+// `git@github.com:gke-labs/kube-agents.git` two entries for one repository, and
+// the agent then held two write locks on the same remote.
+func TestSameManagedRepoComparesIdentityNotSpelling(t *testing.T) {
+	seeded := agentv1alpha1.ManagedRepoEntry{
+		Type: agentv1alpha1.GitProviderGitHub,
+		URL:  "https://github.com/gke-labs/kube-agents",
+	}
+	same := []string{
+		"https://github.com/gke-labs/kube-agents",
+		"https://github.com/gke-labs/kube-agents.git",
+		"git@github.com:gke-labs/kube-agents.git",
+		"ssh://git@github.com/gke-labs/kube-agents",
+		"http://github.com/gke-labs/kube-agents",
+		"gke-labs/kube-agents",
+		"github.com/gke-labs/kube-agents",
+		// The agent trims the separator run after a lifted host, so this is
+		// the seeded repository to it too.
+		"github.com//gke-labs/kube-agents",
+		"HTTPS://GitHub.com/gke-labs/kube-agents",
+	}
+	for _, url := range same {
+		t.Run(url, func(t *testing.T) {
+			existing := agentv1alpha1.ManagedRepoEntry{Type: agentv1alpha1.GitProviderGitHub, URL: url}
+			if !sameManagedRepo(existing, seeded) {
+				t.Errorf("sameManagedRepo(%q, %q) = false, expected true", url, seeded.URL)
+			}
+		})
+	}
+
+	different := []agentv1alpha1.ManagedRepoEntry{
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://github.com/gke-labs/other"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://github.com/other/kube-agents"},
+		// GitHub folds case, but the agent's `--repo` allowlists compare the
+		// spelling, so this entry does not stand in for the declared one.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://github.com/GKE-Labs/Kube-Agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "GKE-Labs/kube-agents"},
+		// A different forge is a different repository however the paths line up,
+		// and an unresolvable spelling must not collapse into the seeded entry.
+		{Type: "gitlab", URL: "https://gitlab.com/gke-labs/kube-agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "not a url at all"},
+		// The agent reads a GitHub entry only on github.com, so another spelling
+		// of the host is not the seeded repository: it is one the agent skips.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://www.github.com/gke-labs/kube-agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "ssh://git@ssh.github.com/gke-labs/kube-agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "www.github.com/gke-labs/kube-agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "ssh.github.com/gke-labs/kube-agents"},
+		// The agent matches the type exactly, so this entry is one it skips even
+		// though the URL is the seeded one byte for byte.
+		{Type: "GitHub", URL: "https://github.com/gke-labs/kube-agents"},
+		// git and this parser read the host after the last `@`, the agent after
+		// the first, so it reads this one as host `b@github.com` and skips it.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "a@b@github.com:gke-labs/kube-agents"},
+		// The provider drops the user before lifting a schemeless host; the
+		// agent lifts only a bare `github.com/`, so it skips this one.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "git@github.com/gke-labs/kube-agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "x-access-token@github.com//gke-labs/kube-agents"},
+		// An empty user, or a colon ahead of the `@`, is no user the agent
+		// reads: it takes `@github.com` or `:x@github.com` as the host.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "@github.com:gke-labs/kube-agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: ":x@github.com/gke-labs/kube-agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: ":@github.com/gke-labs/kube-agents"},
+		// The agent refuses a value over 256 characters before it parses it, so
+		// a long credential in the userinfo makes an entry it skips.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://x-access-token:" + strings.Repeat("t", 240) + "@github.com/gke-labs/kube-agents"},
+		// U+0130 lowers to `i` under Unicode case mapping, but it is another
+		// host on the wire, and the agent's str.lower() does not fold it.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://gİthub.com/gke-labs/kube-agents"},
+		// urlsplit refuses a bracket without its pair, the userinfo included.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://[x@github.com/gke-labs/kube-agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://a]b@github.com/gke-labs/kube-agents"},
+		// Paired, the agent still refuses it: the host must then be an
+		// address literal.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://[TOKEN]@github.com/gke-labs/kube-agents"},
+	}
+	for _, existing := range different {
+		t.Run(existing.Type+" "+existing.URL, func(t *testing.T) {
+			if sameManagedRepo(existing, seeded) {
+				t.Errorf("sameManagedRepo(%+v, %q) = true, expected false", existing, seeded.URL)
+			}
+		})
+	}
+}
+
 func TestClusterImageVolumeSupport_TransientFailureFailsClosedWithoutCaching(t *testing.T) {
 	// When K8s >= 1.35 but isGKEAutopilot suffers a transient error, clusterImageVolumeSupport
 	// must return supported=false, determined=false (fails closed and not cached).
@@ -5861,7 +6545,7 @@ func TestGetDeploymentStatusDetails_TerminatingPodSkipped(t *testing.T) {
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
-	phase, _, _ := r.getDeploymentStatusDetails(context.Background(), agent)
+	phase, _, _ := r.getDeploymentStatusDetails(context.Background(), agent, true)
 	// Terminating pod must be skipped, leaving default phase Provisioning.
 	if phase == "Degraded" {
 		t.Errorf("getDeploymentStatusDetails returned Degraded for a terminating pod")
@@ -5896,7 +6580,7 @@ func TestGetDeploymentStatusDetails_NonStagingTerminatedIgnored(t *testing.T) {
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
-	phase, _, _ := r.getDeploymentStatusDetails(context.Background(), agent)
+	phase, _, _ := r.getDeploymentStatusDetails(context.Background(), agent, true)
 	// Non-staging container terminated should not trigger Degraded in getDeploymentStatusDetails.
 	if phase == "Degraded" {
 		t.Errorf("getDeploymentStatusDetails returned Degraded for non-staging terminated container")
@@ -5932,7 +6616,7 @@ func TestGetDeploymentStatusDetails_StagingInitTerminatedReportsDegraded(t *test
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
-	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent)
+	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent, true)
 	if phase != "Degraded" {
 		t.Errorf("expected phase Degraded, got %q", phase)
 	}
@@ -5978,7 +6662,7 @@ func TestGetDeploymentStatusDetails_A2AGatewayFaultReportsDegraded(t *testing.T)
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
-	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent)
+	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent, true)
 
 	if phase != "Degraded" {
 		t.Errorf("phase = %q, want Degraded -- a gateway that cannot pull its image is a fault, not provisioning", phase)
@@ -6023,9 +6707,200 @@ func TestGetDeploymentStatusDetails_A2AGatewayNotScannedOnATodayInstall(t *testi
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
-	phase, reason, _ := r.getDeploymentStatusDetails(context.Background(), agent)
+	phase, reason, _ := r.getDeploymentStatusDetails(context.Background(), agent, true)
 
 	if phase == "Degraded" {
 		t.Errorf("phase = Degraded (reason %q) -- a today install has no A2A gateway to be degraded by", reason)
+	}
+}
+
+// TestReconcileGitopsStateMergesBothListsKeepingUnmodelledFields covers the
+// seeding of context repositories into an existing ConfigMap. The merge used
+// to re-marshal the whole list through ManagedRepoEntry, which models only
+// type and url; on context_repos that would silently strip the `ref` an
+// administrator pinned, the first time the CR declared one more repository.
+func TestReconcileGitopsStateMergesBothListsKeepingUnmodelledFields(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "merge-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: agentv1alpha1.IntegrationSpec{
+				Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Namespace: "gke-labs"}},
+				Repositories: []agentv1alpha1.RepositorySpec{
+					{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleGitOps},
+					{Forge: "github", Repository: "kubernetes/kubernetes", Role: agentv1alpha1.RepositoryRoleContext},
+				},
+			}},
+		},
+	}
+	const pinned = `{"type":"github","url":"https://github.com/gke-labs/docs","ref":"release"}`
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "merge-agent-gitops-state", Namespace: "test-ns"},
+		Data: map[string]string{
+			// Already present under another spelling: must not be appended twice.
+			"managed_repos": `[{"type":"github","url":"git@github.com:gke-labs/infra.git"}]`,
+			"context_repos": `[` + pinned + `]`,
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, cm).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	if err := r.reconcileGitopsStateConfigMap(context.Background(), agent); err != nil {
+		t.Fatalf("reconcileGitopsStateConfigMap() = %v", err)
+	}
+	got := &corev1.ConfigMap{}
+	if err := cl.Get(context.Background(), types.NamespacedName{Name: cm.Name, Namespace: cm.Namespace}, got); err != nil {
+		t.Fatal(err)
+	}
+	if want := `[{"type":"github","url":"git@github.com:gke-labs/infra.git"}]`; got.Data["managed_repos"] != want {
+		t.Errorf("managed_repos = %s, expected it untouched: %s", got.Data["managed_repos"], want)
+	}
+	want := `[` + pinned + `,{"type":"github","url":"https://github.com/kubernetes/kubernetes"}]`
+	if got.Data["context_repos"] != want {
+		t.Errorf("context_repos = %s, expected %s", got.Data["context_repos"], want)
+	}
+}
+
+// A GitOps repository the list lacks goes first. The entries carry no role and
+// the agent falls back to the first managed entry for its GitOps repository,
+// so appending would leave the previous one answering for it.
+func TestReconcileGitopsStatePutsANewGitOpsRepositoryFirst(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "order-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: agentv1alpha1.IntegrationSpec{
+				Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Namespace: "gke-labs"}},
+				Repositories: []agentv1alpha1.RepositorySpec{
+					{Forge: "github", Repository: "apps", Role: agentv1alpha1.RepositoryRoleManaged},
+					{Forge: "github", Repository: "infra-v2", Role: agentv1alpha1.RepositoryRoleGitOps},
+				},
+			}},
+		},
+	}
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "order-agent-gitops-state", Namespace: "test-ns"},
+		Data: map[string]string{
+			"managed_repos": `[{"type":"github","url":"https://github.com/gke-labs/infra"}]`,
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, cm).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	if err := r.reconcileGitopsStateConfigMap(context.Background(), agent); err != nil {
+		t.Fatalf("reconcileGitopsStateConfigMap() = %v", err)
+	}
+	got := &corev1.ConfigMap{}
+	if err := cl.Get(context.Background(), types.NamespacedName{Name: cm.Name, Namespace: cm.Namespace}, got); err != nil {
+		t.Fatal(err)
+	}
+	want := `[{"type":"github","url":"https://github.com/gke-labs/infra-v2"},` +
+		`{"type":"github","url":"https://github.com/gke-labs/infra"},` +
+		`{"type":"github","url":"https://github.com/gke-labs/apps"}]`
+	if got.Data["managed_repos"] != want {
+		t.Errorf("managed_repos = %s, expected %s", got.Data["managed_repos"], want)
+	}
+
+	// Once present it is never moved: the order is the administrator's.
+	if err := r.reconcileGitopsStateConfigMap(context.Background(), agent); err != nil {
+		t.Fatalf("second reconcileGitopsStateConfigMap() = %v", err)
+	}
+	if err := cl.Get(context.Background(), types.NamespacedName{Name: cm.Name, Namespace: cm.Namespace}, got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Data["managed_repos"] != want {
+		t.Errorf("second reconcile changed managed_repos to %s", got.Data["managed_repos"])
+	}
+}
+
+// TestARefusedGitHubScopeKeepsTheLiveGitHubOrg covers an upgrade from a release
+// that accepted a spelling this one refuses. The minter keeps its policies
+// while the declaration is refused; the gateway keeps its GITHUB_ORG the same
+// way, so the pod neither rolls nor loses the agent's cross-organisation guard.
+func TestARefusedGitHubScopeKeepsTheLiveGitHubOrg(t *testing.T) {
+	scheme := setupScheme()
+	agentWith := func(gitRepo string) *agentv1alpha1.PlatformAgent {
+		return &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+					IntegrationSpec: agentv1alpha1.IntegrationSpec{
+						GitHub: &agentv1alpha1.GitHubSpec{GitRepo: gitRepo},
+					},
+				},
+			},
+		}
+	}
+	live := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-gateway", Namespace: "test-ns"},
+		Spec: appsv1.DeploymentSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name: appNamePlatformAgent,
+				Env:  []corev1.EnvVar{{Name: "GITHUB_ORG", Value: "gke-labs"}},
+			}},
+		}}},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(live).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	for _, refused := range []string{
+		"https://github.com:gke-labs/infra",
+		"ssh://git@github.com:gke-labs/infra",
+	} {
+		agent := agentWith(refused)
+		held, err := r.heldGitHubOrg(ctx, agent)
+		if err != nil || held != "gke-labs" {
+			t.Errorf("%s: heldGitHubOrg() = %q, %v, expected the live gke-labs", refused, held, err)
+		}
+		dep := buildDeployment(agent, "", "", "", "", nil, renderOptions{heldGitHubOrg: held})
+		if got, _ := envValue(containerNamed(t, dep, appNamePlatformAgent), "GITHUB_ORG"); got != "gke-labs" {
+			t.Errorf("%s: rendered GITHUB_ORG = %q, expected the held gke-labs", refused, got)
+		}
+	}
+
+	// A declaration that names the organisation renders its own, whatever
+	// the live pod carries.
+	accepted := agentWith("https://github.com/other-org/infra")
+	if held, _ := r.heldGitHubOrg(ctx, accepted); held != "" {
+		t.Errorf("heldGitHubOrg() = %q for an accepted declaration, expected nothing held", held)
+	}
+	dep := buildDeployment(accepted, "", "", "", "", nil, renderOptions{})
+	if got, _ := envValue(containerNamed(t, dep, appNamePlatformAgent), "GITHUB_ORG"); got != "other-org" {
+		t.Errorf("rendered GITHUB_ORG = %q, expected other-org", got)
+	}
+
+	// Nothing live holds nothing.
+	empty := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build(), Scheme: scheme}
+	if held, err := empty.heldGitHubOrg(ctx, agentWith("https://github.com:gke-labs/infra")); held != "" || err != nil {
+		t.Errorf("heldGitHubOrg() = %q, %v with no live gateway, expected nothing", held, err)
+	}
+
+	// A storage switch renders the other workload kind while the old one still
+	// runs: the old one is what holds the value.
+	switched := agentWith("https://github.com:gke-labs/infra")
+	switched.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Availability: &agentv1alpha1.AvailabilitySpec{Replicas: ptr.To(int32(2))},
+		Storages: []agentv1alpha1.StorageSpec{{
+			Name:        "gateway-data",
+			MountPath:   "/srv/gateway-data",
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+		}},
+	}
+	if !useStatefulSet(switched) {
+		t.Fatal("test setup: the switched agent does not select a StatefulSet")
+	}
+	if held, err := r.heldGitHubOrg(ctx, switched); held != "gke-labs" || err != nil {
+		t.Errorf("heldGitHubOrg() = %q, %v across a storage switch, expected the live gke-labs", held, err)
+	}
+
+	// A read that fails is returned, never taken for "nothing live": the render
+	// would drop the variable, and the next pass would read the loss back.
+	failing := &PlatformAgentReconciler{Scheme: scheme, Client: interceptor.NewClient(cl, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			return errors.NewServiceUnavailable("apiserver is restarting")
+		},
+	})}
+	if held, err := failing.heldGitHubOrg(ctx, agentWith("https://github.com:gke-labs/infra")); err == nil {
+		t.Errorf("heldGitHubOrg() = %q with a failing read, expected an error", held)
 	}
 }

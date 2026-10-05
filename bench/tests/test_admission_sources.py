@@ -207,7 +207,7 @@ def test_the_aggregate_is_reported_against_main_and_reds_only_when_armed(
     rc, md = suite(tmp_path, *docs, extra=["--min-scored", "9"])
     assert rc == 0
     assert "**GREEN**" in md
-    assert "Admitted-case pass rate: 55.6% (main: 100.0%, margin 5.0%)" in md
+    assert "Admitted-case pass rate: 55.6% (main: 100.0%, margin 10.0%)" in md
     assert "aggregate advisory: suite pass rate 0.556 is below main's 1.000" in md
     assert "not armed" in md
 
@@ -227,7 +227,7 @@ def test_a_demoted_case_counts_on_neither_side_of_the_aggregate(record_mode, tmp
     ]
     rc, md = suite(tmp_path, *docs, extra=["--min-scored", "3"])
     assert rc == 0
-    assert "Admitted-case pass rate: 100.0% (main: 100.0%, margin 5.0%)" in md
+    assert "Admitted-case pass rate: 100.0% (main: 100.0%, margin 10.0%)" in md
 
 
 def test_the_column_appears_when_the_record_decided_even_with_no_store_configured(
@@ -330,7 +330,7 @@ def test_in_roster_mode_a_listed_case_would_admit_reads_the_same_as_record_mode(
     assert doc["record_verdict"] == "would-admit"
     assert doc["admission_reason"] == (
         BRIDGE_SENTENCE + "; the record would admit it: 21/21 screening runs "
-        "across 7 recorded run(s) (bar 95% over 20)"
+        "across 7 recorded run(s) (bar 90% over 20)"
     )
     assert doc["rung_name"] == "COLLAPSE" and doc["blocking"] is True
 
@@ -396,7 +396,7 @@ def test_in_roster_mode_a_listed_case_the_record_would_demote_counts_on_both_sid
     rc, md = suite(tmp_path, *docs, extra=["--min-scored", "3"])
     assert rc == 0, md
     # main: (12 + 9) / (21 + 9) = 70.0%
-    assert "Admitted-case pass rate: 100.0% (main: 70.0%, margin 5.0%)" in md
+    assert "Admitted-case pass rate: 100.0% (main: 70.0%, margin 10.0%)" in md
 
 
 def test_the_columns_appear_in_roster_mode_when_the_record_holds_a_full_window_and_no_store_is_configured(

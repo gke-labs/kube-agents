@@ -140,7 +140,7 @@ fi
 # here reverts to failing after the teardown.
 INSTALL_REFUSAL_STATUS=0
 
-for _bool_var in ENABLE_GKE_BACKUP_PLAN ENABLE_GVISOR HERMES_DASHBOARD_ENABLED; do
+for _bool_var in ENABLE_GKE_BACKUP_PLAN ENABLE_GVISOR HERMES_DASHBOARD_ENABLED ENABLE_DRIFT_DETECTOR; do
   [ -n "${!_bool_var:-}" ] || continue
   _canonical="$(canonical_bool "${!_bool_var}")"
   case "$_canonical" in
@@ -292,6 +292,15 @@ fi
 
 if [ -n "${HERMES_DASHBOARD_ENABLED:-}" ]; then
   INSTALL_ARGS+=(--enable-hermes-dashboard="$(canonical_bool "${HERMES_DASHBOARD_ENABLED}")")
+fi
+
+# Unset omits the flag and install.sh's own default answers, which for this one
+# is on. The flag is worth passing anyway: this is a fresh install, so it is the
+# one run that records the choice into the install.env it creates -- which is
+# then overwritten by the next reconcile, hence the variable rather than the
+# file as the durable answer.
+if [ -n "${ENABLE_DRIFT_DETECTOR:-}" ]; then
+  INSTALL_ARGS+=(--enable-drift-detector="$(canonical_bool "${ENABLE_DRIFT_DETECTOR}")")
 fi
 
 if [ -n "${MODEL_PROVIDER:-}" ]; then

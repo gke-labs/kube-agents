@@ -43,7 +43,7 @@ Approving the scope takes more than the Admin console, per Google's [app-authent
 
 - **Google Chat API Event Suppression**: Google Chat API does not generate Pub/Sub interaction events for messages posted programmatically via `spaces.messages.create` to prevent infinite bot loops.
 - **Hybrid Test Flow**:
-  1. **Pre-Flight (when `kubectl` is reachable)**: Waits up to `GATEWAY_ROLLOUT_TIMEOUT_SEC` (default `900`s) for `deployment/platform-agent-gateway` in `AGENT_NAMESPACE` (or `NAMESPACE`, default `kubeagents-system`) to finish any rolling restart before posting.
+  1. **Pre-Flight (when `kubectl` is reachable)**: Waits up to `GATEWAY_ROLLOUT_TIMEOUT_SEC` (default `1500`s) for `deployment/platform-agent-gateway` in `AGENT_NAMESPACE` (or `NAMESPACE`, default `kubeagents-system`) to finish any rolling restart before posting.
   2. **Step 1**: Test runner posts a prompt via Service Account WIF to establish a real Google Chat Space Thread ID (`spaces/{SPACE_ID}/threads/{THREAD_ID}`).
   3. **Step 2**: Test runner constructs a valid Google Chat event payload referencing the real Thread ID and authorized test identity (`TEST_USER_EMAIL`), publishing it directly to Pub/Sub topic `platform-agent-chat-events`.
   4. **Step 3**: **Hermes Agent** in GKE receives the Pub/Sub event, computes a well-known, predictable answer that can be validated deterministically, and posts the reply into the real space thread.
@@ -155,7 +155,7 @@ gcloud auth application-default login --scopes="https://www.googleapis.com/auth/
 
 ### Step 3: Run pytest
 
-Optional cluster pre-flight environment variables: `AGENT_NAMESPACE` (or `NAMESPACE`, default `kubeagents-system`), `KUBE_CONTEXT`, and `GATEWAY_ROLLOUT_TIMEOUT_SEC` (default `900`).
+Optional cluster pre-flight environment variables: `AGENT_NAMESPACE` (or `NAMESPACE`, default `kubeagents-system`), `KUBE_CONTEXT`, and `GATEWAY_ROLLOUT_TIMEOUT_SEC` (default `1500`).
 
 ```bash
 pytest tests/e2e/gchat_agent_test.py -v -s

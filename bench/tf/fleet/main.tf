@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The seeded dirty fleet: three small standing clusters whose defects are the
+# The seeded dirty fleet: four small standing clusters whose defects are the
 # fixtures the Phase 2 presubmit scenarios assert on. Everything here is
 # planted on purpose; "fixing" any of it breaks a test. README.md is the
 # defect-to-scenario map, and the scheduled re-apply of this stack is what
@@ -33,18 +33,18 @@ locals {
   # SOP resolves a cluster's environment from `.resourceLabels.environment`
   # FIRST, before any name-keyword inference, and cohorts are keyed on
   # (mode, environment) with unknown-environment clusters kept in their own
-  # cohort, never merged. Labeling all three `environment = seeded` --
-  # a literal the SOP's synonym table passes through unchanged -- makes the
-  # drift cohort exactly {seeded-a, seeded-b, seeded-c} no matter what else
+  # cohort, never merged. Labeling every cluster here `environment = seeded`
+  # -- a literal the SOP's synonym table passes through unchanged -- makes the
+  # drift cohort exactly {seeded-a, ..., seeded-d} no matter what else
   # exists in the project: platform-agent-host and the transient eval-pr*
   # clusters carry no environment label, land in the unknown cohort, and
   # never vote on this fleet's baseline. Without this, a 2/2 authorized-
   # networks split against an unlabeled neighbour has no majority and the
   # consistency scenario has no finding. Label-resolved also means no
-  # "inferred environment" severity step, which the r = 2/3 math cannot
+  # "inferred environment" severity step, which the r = 3/4 math cannot
   # spare. The value "seeded" is reserved for this fleet: labeling any
-  # other cluster in the project with it would add a fourth voter and
-  # change the arithmetic.
+  # other cluster in the project with it would add a voter and change the
+  # arithmetic (seeded_d's block below works it for the fourth).
   cluster_labels = merge(local.fleet_labels, {
     "environment" = "seeded"
   })
@@ -110,8 +110,9 @@ resource "google_project_iam_member" "fleet_nodes_artifact_registry_reader" {
 # read-shaped token validation API), and no container.secrets.* at all -- so
 # this account cannot read a Secret on platform-agent-host either. It is
 # project-scoped because IAM is where GKE authorization starts; the fleet
-# stack's kubernetes provider only reaches seeded-a, so an RBAC-level grant
-# could not cover b and c.
+# stack configures a kubernetes provider only for the clusters it plants
+# objects on, and seeded-c has none, so an RBAC-level grant could not cover
+# every cluster.
 #
 # hack/fleet-kubeconfigs.sh binds it by minting an access token
 # (FLEET_READONLY_SA), which is why the token-creator grant below exists.
@@ -140,6 +141,43 @@ resource "google_service_account_iam_member" "fleet_reader_token_creators" {
   service_account_id = google_service_account.fleet_reader.name
   role               = "roles/iam.serviceAccountTokenCreator"
   member             = each.value
+}
+
+# ---------------------------------------------------------------------------
+# The pool-state scan's read on the project (#1967).
+#
+# The CI health bot's other hourly scan runs scripts/verify_ci_pool_project.py's
+# read-only checks against every pool project as the bot itself, so it needs
+# project-level read here: the project and its IAM policy, the service
+# accounts' policies, the service listing, the cluster listing, the
+# repository, the key and its policy, the state bucket's metadata. These
+# roles cover every read those checks make on the project; none writes. The
+# warm-cache repository's policy in the Prow project stays unread. They live in this
+# stack, beside the reader's token-creator grant, because this is the one
+# stack every pool project applies: a project provisioned after this landed
+# gets the grant with no separate step, and one applied before it is one
+# re-apply, or the loop in docs/ci-health.md ("The pool-state scan").
+locals {
+  # Kept equal to POOL_STATE_READER_ROLES in scripts/verify_ci_pool_project.py
+  # by scripts/test_verify_ci_pool_project.py.
+  pool_state_reader_roles = [
+    "roles/iam.securityReviewer",
+    "roles/container.clusterViewer",
+    "roles/artifactregistry.reader",
+    "roles/cloudkms.viewer",
+    "roles/storage.bucketViewer",
+  ]
+  pool_state_reader_grants = {
+    for pair in setproduct(var.pool_state_readers, local.pool_state_reader_roles) :
+    "${pair[0]} ${pair[1]}" => { member = pair[0], role = pair[1] }
+  }
+}
+
+resource "google_project_iam_member" "pool_state_readers" {
+  for_each = local.pool_state_reader_grants
+  project  = var.project_id
+  role     = each.value.role
+  member   = each.value.member
 }
 
 # seeded-b is held one minor version behind whatever the REGULAR channel
@@ -173,10 +211,12 @@ resource "google_service_account_iam_member" "fleet_reader_token_creators" {
 # GKE auto-upgrades -- the lag is gone for good and the fix is replacing
 # the cluster (`tofu apply -replace=google_container_cluster.seeded_b`).
 # That replacement is not free: the drift SOP drops a cluster under 24h old
-# from every cohort, which takes the comparable cohort from three to two,
-# under its 3-cluster floor -- so the drift audit emits nothing for the
-# WHOLE fleet for a day and consistency-drift-outlier goes red everywhere.
-# Schedule it accordingly; the README's activation timeline has the detail.
+# from every cohort, which takes the comparable cohort from four to three,
+# still at its 3-cluster floor, so seeded-c stays outvoted 2/3. On a project
+# whose fleet predates seeded-d it takes the cohort from three to two, under
+# the floor -- so the drift audit emits nothing for the WHOLE fleet for a day
+# and consistency-drift-outlier goes red there. Schedule it accordingly; the
+# README's activation timeline has the detail.
 # The seeded_b comment and the README carry the full account.
 data "google_container_engine_versions" "fleet" {
   location = var.zone
@@ -198,9 +238,10 @@ locals {
 }
 
 # ---------------------------------------------------------------------------
-# The three clusters. A carries every namespace-level defect; B is the
-# version laggard; C is the consistency outlier. One file-level rule: a
-# defect lives on exactly one cluster, so a scenario red points at one place.
+# The drift cohort: A carries every namespace-level defect; B is the version
+# laggard; C is the consistency outlier. seeded-d is at the bottom of this
+# file and is deliberately not one of them. One file-level rule: a defect
+# lives on exactly one cluster, so a scenario red points at one place.
 # ---------------------------------------------------------------------------
 
 resource "google_container_cluster" "seeded_a" {
@@ -553,7 +594,7 @@ resource "google_container_node_pool" "seeded_b_default" {
 # normalizes to OFF -- absence on one cluster against an ON majority is the
 # finding (SOP 4.5, base critical, the severity that survives a
 # three-cluster cohort's two ladder steps). Two agree, one differs: the
-# reason this fleet is three clusters and not two. Everything else on C
+# reason this fleet is at least three clusters and not two. Everything else on C
 # deliberately matches its peers, so C is an outlier on exactly one facet
 # and the split-cluster guard never mistakes it for an uncohorted cluster.
 resource "google_container_cluster" "seeded_c" {
@@ -636,4 +677,156 @@ resource "google_compute_disk" "orphan_pd" {
   zone  = var.zone
 
   labels = local.fleet_labels
+}
+
+# ---------------------------------------------------------------------------
+# seeded-d: the multi-zonal cluster, and the only one whose SHAPE is the
+# fixture. The anomaly-detection checks have to tell one cause of zonal skew
+# from another, and a cluster whose nodes are all in one zone has no zonal
+# distribution to skew -- a, b and c are each `location = var.zone` with a
+# single-zone pool, so no amount of in-cluster planting produces the signal.
+#
+# Zonal control plane with `node_locations` across two zones, not a regional
+# cluster: the fleet is standing, and a regional control plane would triple
+# the node floor for a property nothing here needs. Two e2-small nodes, one
+# per zone, is the minimum shape on which "the pods are all in one zone" is a
+# true statement about a real cluster.
+# ---------------------------------------------------------------------------
+
+resource "google_container_cluster" "seeded_d" {
+  name     = "${var.cluster_prefix}-d"
+  location = var.zone
+
+  # The shape. A zonal cluster with node_locations is multi-zonal: one control
+  # plane in var.zone, nodes in both. var.second_zone defaults to a sibling of
+  # var.zone's region, and the variable's description says why the pair has to
+  # stay in one region.
+  node_locations = [var.second_zone]
+
+  remove_default_node_pool = true
+  initial_node_count       = 1
+
+  # local.cluster_labels, the same as a, b and c. The runner has no other way to
+  # find this cluster: hack/fleet-kubeconfigs.sh discovers slots with
+  # `resourceLabels.environment=seeded AND resourceLabels.managed-by=...`, so a
+  # cluster without the environment label is never listed, never resolves to a
+  # slot, and its roles are never published -- which fails the fleet-presence
+  # check on every pool project, and the runner can only say that no labelled
+  # cluster resolved to slot d, not why, because nothing about the cluster was
+  # ever seen.
+  #
+  # That makes seeded-d a fourth voter in the drift cohort, which the locals
+  # block at the top of this file warns about, so the arithmetic is worked here
+  # rather than hoped for. The cohort is keyed on environment (drift SOP 2.3)
+  # and the ladder walks one step at r < 0.90 and another at r < 0.80 (SOP
+  # 3.5). The planted facet is authorized-networks, base critical: at three
+  # clusters it is 2/3 = 0.67, two steps, surviving as minor. At four, with
+  # seeded-d configured like seeded-a and seeded-b, it is 3/4 = 0.75 -- still
+  # two steps, still minor, and consistency-drift-outlier grades the same.
+  # What is NOT safe is leaving the block off: 2/4 = 0.5 is below SOP 3.3's
+  # 2/3 threshold, so there is no baseline, no finding, and that scenario reds.
+  # The master_authorized_networks_config below is therefore load-bearing.
+  #
+  # The other base-critical facets stay uniform at 4/4: neither private nodes
+  # nor database encryption is configured on any cluster in this stack. Every
+  # lower-severity facet is dropped by the ladder at 0.75 exactly as it was at
+  # 0.67, so no facet gains a finding because a fourth cluster arrived.
+  resource_labels     = local.cluster_labels
+  deletion_protection = false
+
+  logging_config {
+    enable_components = ["SYSTEM_COMPONENTS", "WORKLOADS"]
+  }
+
+  # The same background closure a and c carry: enrolled with a window, so the
+  # upgrade SOP's no-channel and no-maintenance-window checks stay quiet here
+  # and the only findings this cluster produces are the ones it is for.
+  release_channel {
+    channel = "REGULAR"
+  }
+
+  maintenance_policy {
+    daily_maintenance_window {
+      start_time = "03:00"
+    }
+  }
+
+  workload_identity_config {
+    workload_pool = "${var.project_id}.svc.id.goog"
+  }
+
+  # Matches seeded-a and seeded-b so the authorized-networks drift facet keeps
+  # a majority -- see the resource_labels comment above for the arithmetic.
+  # Like theirs, this is also a declared compliance 2.10 background finding;
+  # README.md's accepted-background table carries the row.
+  master_authorized_networks_config {
+    cidr_blocks {
+      cidr_block   = "0.0.0.0/0"
+      display_name = "open-for-eval"
+    }
+  }
+}
+
+# One pool per zone, deliberately unequal. The capacity fixture in
+# defects-d.tf needs one node that can never hold a worker and one that can
+# always hold at least one but never all four, and which node GKE's own
+# system Deployments land on is a scheduler choice that flips at cluster
+# creation and after a drain. Sizes settle it where placement cannot: the
+# first zone's node is an e2-small (940m allocatable) that the zone-pinned
+# fixtures and the sponge keep full, the second zone's an e2-standard-2
+# (1930m) that keeps at least 800m free under any system set and can never
+# fit four 500m workers. Not an e2-medium: every shared-core E2 size reports
+# the same 940m allocatable to Kubernetes, which the first apply showed, so
+# only a dedicated-core size makes the second node larger. A single multi-zonal pool cannot have two machine types, so
+# each pool carries its own node_locations. Not the whole standing cost of
+# the cluster: GKE charges a management fee per Standard cluster whatever
+# its topology, and README.md's accounting puts the fees at most of the
+# fleet's monthly total. A fourth cluster costs that fee plus these two nodes.
+resource "google_container_node_pool" "seeded_d_default" {
+  name           = "default-pool"
+  location       = var.zone
+  node_locations = [var.zone]
+  cluster        = google_container_cluster.seeded_d.name
+  node_count     = 1
+
+  node_config {
+    machine_type    = "e2-small"
+    disk_size_gb    = 20
+    resource_labels = local.fleet_labels
+    service_account = google_service_account.fleet_nodes.email
+    oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
+
+    metadata = {
+      disable-legacy-endpoints = "true"
+    }
+  }
+}
+
+# The second zone's node, a size up; see the comment on the default pool.
+resource "google_container_node_pool" "seeded_d_second" {
+  name           = "second-zone-pool"
+  location       = var.zone
+  node_locations = [var.second_zone]
+  cluster        = google_container_cluster.seeded_d.name
+  node_count     = 1
+
+  node_config {
+    machine_type    = "e2-standard-2"
+    disk_size_gb    = 20
+    resource_labels = local.fleet_labels
+    service_account = google_service_account.fleet_nodes.email
+    oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
+
+    metadata = {
+      disable-legacy-endpoints = "true"
+    }
+  }
 }

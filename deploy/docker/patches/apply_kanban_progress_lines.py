@@ -2,7 +2,7 @@
 """Wire gateway/kanban_progress_lines.py into the Hermes source tree.
 
 Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. One locator and
-three anchored edits in ``gateway/kanban_watchers_notifier.py``, one locator
+four anchored edits in ``gateway/kanban_watchers_notifier.py``, one locator
 and one anchor for the heartbeat formatter, two anchors in
 ``tools/kanban_tools_schemas.py``, plus an appended import — with the same
 guarantee as the other patches in that file: every anchor must be found
@@ -155,22 +155,51 @@ SEND_PATCHED = (
     "        # edits the message the card already has instead of posting\n"
     "        # another, so a five-milestone card pings the space once rather\n"
     "        # than five times. A terminal event settles that message and then\n"
-    "        # posts its own, which is the notification people want. Any\n"
+    "        # posts its own, which is the notification people want (with\n"
+    "        # KAGE_SLACK_UX on, a failure the wake explains is held). Any\n"
     "        # platform that cannot edit falls back to this same send(). The\n"
     "        # return value keeps send()'s shape, so the SendResult check below\n"
     "        # and the failure accounting are both unchanged. The map is hung\n"
     "        # off the runner: this object is rebuilt for every delivery.\n"
-    "        # See gateway/kanban_progress_lines.py.\n"
+    "        # See gateway/kanban_progress_lines.py. The board slug tells a\n"
+    "        # KAGE_SLACK_UX settle reaction which board the card is on\n"
+    "        # (gateway/slack_ux_reactions.py), and the title names the\n"
+    "        # card's row in a KAGE_SLACK_UX plan (gateway/slack_ux_status.py).\n"
     "        _send_res = await _progress_deliver(\n"
     "            self.runner, adapter, sub, ev.kind, ev, msg, metadata,\n"
-    "            header=self.progress_header,\n"
+    "            header=self.progress_header, board=self.board_slug,\n"
+    "            title=self.title,\n"
     "        )\n"
+)
+
+# --- a silent kind still moves the plan -------------------------------------
+#
+# ``archived`` and ``unblocked`` are claimed but have no formatter, so
+# ``_send_pings`` skips them before the send above and ``deliver`` never sees
+# them. A KAGE_SLACK_UX plan needs both: an archived card's row would run
+# forever, an unblocked one wait on the user. The hook runs only for a skipped
+# event, before the skip, and never raises. ``self`` and ``ev`` are the loop's.
+
+SILENT_ANCHOR = (
+    "            msg = self.format_event(ev)\n"
+    "            if msg is None:\n"
+    "                continue\n"
+)
+
+SILENT_PATCHED = (
+    "            msg = self.format_event(ev)\n"
+    "            if msg is None:\n"
+    "                # kube-agents patch: a silent kind still moves the card's row\n"
+    "                # in a KAGE_SLACK_UX plan. See gateway/kanban_progress_lines.py.\n"
+    "                await _progress_silent_event(self, ev)\n"
+    "                continue\n"
 )
 
 IMPORT_LINE = (
     "\n\n# kube-agents patch: see gateway/kanban_progress_lines.py\n"
     "from gateway.kanban_progress_lines import progress_note as _progress_note\n"
     "from gateway.kanban_progress_lines import deliver as _progress_deliver\n"
+    "from gateway.kanban_progress_lines import silent_event as _progress_silent_event\n"
 )
 
 # --- tell the model what a note actually does -------------------------------
@@ -249,8 +278,9 @@ def apply(root: Path) -> None:
         FORMATTERS_ANCHOR, FORMATTERS_PATCHED, label="heartbeat formatter entry"
     )
     notifier.substitute(SEND_ANCHOR, SEND_PATCHED, label="notifier send")
+    notifier.substitute(SILENT_ANCHOR, SILENT_PATCHED, label="silent-kind skip")
     notifier.append(IMPORT_LINE)
-    notifier.commit("2 locators, 3 anchors")
+    notifier.commit("2 locators, 4 anchors")
 
     schemas = patchlib.Patch(root, SCHEMAS_RELATIVE, prefix=PREFIX)
     schemas.substitute(SCHEMA_ANCHOR, SCHEMA_PATCHED, label="heartbeat description")

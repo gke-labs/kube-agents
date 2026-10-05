@@ -108,10 +108,10 @@ misconfigurations:
   # destroys per run, never in an install.
   - id: KSV-0014
     paths:
-      - "bench/tf/prebuilt/b-0011-gitops/manifests/**"
+      - "bench/tf/prebuilt/gitops-fix-cycle/manifests/**"
   - id: KSV-0118
     paths:
-      - "bench/tf/prebuilt/b-0011-gitops/manifests/**"
+      - "bench/tf/prebuilt/gitops-fix-cycle/manifests/**"
   # Ignore GCP-0053 and GCP-0061 on the seeded fleet only: the public control
   # plane with a 0.0.0.0/0 authorized-networks block (seeded-a/-b) and the
   # absent block (seeded-c) are deliberately planted eval fixtures -- the

@@ -790,7 +790,10 @@ report_partial_verdict() {
 # cut-off night keeps (#1491). collect_gateway_log follows for the same reason
 # collect_bench_results runs on green: a green nightly whose repetitions ran to
 # the delegation ceiling used to leave no gateway log to say whether the worker
-# was starved by 429s or a stuck dispatcher.
+# was starved by 429s or a stuck dispatcher. collect_agent_pod_diagnostics
+# follows it: a pod replaced mid-run starts a fresh gateway log, and the
+# pod and event watch it stops, the previous containers and the restart
+# record are what say why.
 #
 # `set +e` is load-bearing, not tidying. errexit stays in force inside an EXIT
 # trap, so on any failing exit the `(exit "${exit_code}")` below returns
@@ -810,6 +813,7 @@ profile_and_dump_on_exit() {
   collect_bench_results
   report_partial_verdict
   collect_gateway_log
+  collect_agent_pod_diagnostics
   profile_report "${exit_code}"
   (exit "${exit_code}")
   dump_prow_artifacts_on_failure
@@ -977,6 +981,9 @@ export BENCH_AGENT_TYPE="cli"
 export AGENT_TARGET="kubeagents"
 export BENCH_PARALLEL="false"
 export AGENT_CLUSTER_CONTEXT="gke_${PROJECT_ID}_${REGION}_${HOST_CLUSTER_NAME}"
+# From here to the EXIT trap, a replaced agent pod or restarted container is
+# on record however early it happens (collect_agent_pod_diagnostics).
+start_agent_pod_watch
 export AGENT_SERVICE_NAME="platform-agent"
 export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
 # The harness's default delegation wait (1800s) sits INSIDE the compliance
@@ -1036,6 +1043,11 @@ LEDGER_RESET_MINT_RETRY_DELAY=2
 # since 2026-09-22, includes issues: write on every pool repository for the
 # ledger reset. An omitted body on this endpoint means "everything granted".
 LEDGER_GRADING_MINT_BODY='{"permissions":{"issues":"read","pull_requests":"read","metadata":"read"}}'
+# What the agent-pulls reset asks for (reset_agent_pulls, below): pull_requests
+# to close, contents to delete a branch, issues to label an audit pull request
+# before its close. Narrowed to the leased repository at mint, as the ledger
+# reset's issues: write is (docs/ci-pool-projects.md 5.3).
+AGENT_PULLS_RESET_PERMISSIONS='{"pull_requests":"write","contents":"write","issues":"write"}'
 
 # Emits "<token> <expires_at>" on stdout, diagnostics on stderr, non-zero on
 # any failure -- LEDGER_MINT_RETRYABLE when another attempt could survive it,
@@ -1216,8 +1228,8 @@ fi
 # stream alone -- so repetitions 2 and 3 start as repetition 1 did, and a
 # sibling lane's stream, which has its own label, is never touched. Every
 # repetition then opens a fresh ledger, one closed issue per repetition in a
-# repository that exists to be written to; the sibling that sweeps the
-# agent's leftover pull requests is #1832's.
+# repository that exists to be written to; the agent's leftover pull requests
+# and branches are reset_agent_pulls's, below.
 #
 # Never any repository but the leased project's: the repository is the one
 # gitops_repo_for_project() in hack/ci-deploy.sh maps for PROJECT_ID (lifted
@@ -1245,12 +1257,14 @@ eval_gitops_repo() { # <project-id>
 }
 
 # Emits the token on stdout, nothing else; diagnostics on stderr. Narrowed
-# twice at mint, to the one repository and to issues: write. One retry on a
+# twice at mint, to the one repository and to the permissions asked for
+# (issues: write when none are named). One retry on a
 # transient failure, as mint_ledger_token does; a 422 comes back on the
 # first attempt and means the grant is missing.
-ledger_reset_token() { # <owner/repo>
-  local body minted rc attempt=1
-  body="{\"repositories\":[\"${1##*/}\"],\"permissions\":{\"issues\":\"write\"}}"
+ledger_reset_token() { # <owner/repo> [permissions JSON; issues: write when omitted]
+  local body minted rc attempt=1 permissions='{"issues":"write"}'
+  [ -n "${2:-}" ] && permissions="$2"
+  body="{\"repositories\":[\"${1##*/}\"],\"permissions\":${permissions}}"
   while :; do
     # `&&` rather than `if`: the status of a failed `if` test is 0 by the
     # time the body would read it, and this needs the mint's own.
@@ -1331,6 +1345,51 @@ reset_audit_ledgers() { # <label> [audit-id]
   out="$(LEDGER_RESET_TOKEN="${token}" python3 "${SCRIPT_DIR}/ci_reset_audit_ledgers.py" "${args[@]}" 2>&1)" || rc=$?
   [ -n "${out}" ] && printf '%s\n' "${out}" | sed "s/^/Ledger reset (${label}): /"
   [ "${rc}" -eq 0 ] || echo "WARNING: Ledger reset (${label}): the helper exited ${rc}; ${scope} may keep an open ledger and this run grades against it as every run before did." >&2
+  return 0
+}
+
+# ─── Empty repository: the agent's pull requests and branches go too ─────────
+# A remediation case opens a pull request in the leased repository and nothing
+# closed it before the next lease or the next repetition, so the next agent
+# built on it instead of investigating (#2260); the periodic sweep visits free
+# projects only. hack/ci_reset_agent_pulls.py closes every open pull request a
+# [bot] login opened from a branch in the repository itself (not by branch
+# name: most leftovers carry no prefix), labels an audit's `audit:stale-closed`
+# first (#2228), deletes every branch but the default, then reads the
+# repository back. Called here at lease time, and in run_one_unit before every
+# unit of a case that requests a pull request -- in the fan-out's second
+# phase, one unit at a time, so no sibling's pull request is open to be
+# closed. Unlike the ledger reset this one fails closed: the caller returns 1
+# when the repository is not clean, and a unit does not run on it. The mint is
+# the ledger App's, narrowed to the one repository and the three writes
+# (AGENT_PULLS_RESET_PERMISSIONS); the same guards as the ledger reset's.
+reset_agent_pulls() { # <label>  -> 0 when the repository is clean, 1 when a unit must not run on it
+  local label="$1" token out rc=0 slug record
+  if [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
+    echo "Agent pulls reset (${label}): skipped, EVAL_LEDGER_APP_KEY_FILE is unset and the mounted PAT is a read credential; the repository keeps whatever the agent left"
+    return 0
+  fi
+  if [ -z "${EVAL_LEDGER_REPO:-}" ]; then
+    echo "Agent pulls reset (${label}): skipped, PROJECT_ID=${PROJECT_ID:-unset} maps to no GitOps repository (gitops_repo_for_project in hack/ci-deploy.sh)"
+    return 0
+  fi
+  if ! token="$(ledger_reset_token "${EVAL_LEDGER_REPO}" "${AGENT_PULLS_RESET_PERMISSIONS}")"; then
+    echo "WARNING: Agent pulls reset (${label}): App ${EVAL_LEDGER_APP_ID} could not mint pull_requests: write, contents: write and issues: write narrowed to ${EVAL_LEDGER_REPO}; a unit that requests a pull request does not run on a repository this could not clean. A 422 above means the installation does not hold those permissions (docs/ci-pool-projects.md 5.3)." >&2
+    return 1
+  fi
+  # One record per call beside the artifacts, named for the call, so a run
+  # carries its own proof of what each unit started on.
+  slug="$(printf '%s' "${label}" | tr -c 'A-Za-z0-9._-' '_')"
+  record="${ARTIFACT_DIR:-${ARTIFACTS:-/tmp/artifacts}}/agent-pulls-reset/${slug}.json"
+  # The token rides in the environment of this one process, never on argv.
+  out="$(AGENT_PULLS_RESET_TOKEN="${token}" python3 "${SCRIPT_DIR}/ci_reset_agent_pulls.py" \
+    --repo "${EVAL_LEDGER_REPO}" --project "${PROJECT_ID}" --build "${BUILD_ID:-local}" \
+    --scope "${label}" --record "${record}" 2>&1)" || rc=$?
+  [ -n "${out}" ] && printf '%s\n' "${out}" | sed "s/^/Agent pulls reset (${label}): /"
+  if [ "${rc}" -ne 0 ]; then
+    echo "WARNING: Agent pulls reset (${label}): the helper exited ${rc}; the repository is not clean (${record}), and a unit that requests a pull request does not run on it." >&2
+    return 1
+  fi
   return 0
 }
 
@@ -1442,6 +1501,7 @@ release_inflight_note() { # <label> <audit-id>
 
 EVAL_LEDGER_REPO="$(eval_gitops_repo "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
 reset_audit_ledgers "lease"
+reset_agent_pulls "lease" || echo "WARNING: Agent pulls reset (lease): the repository is not clean; every unit of a case that requests a pull request runs its own reset first and is marked MISSING when that fails too." >&2
 
 # For opentofu provider
 export CLOUD_PROVIDER="gcp"
@@ -1860,8 +1920,9 @@ fi
 # refuses to start the lane without one: a lane whose safeguard cannot name
 # its repository would grade every repetition as an errored check. Applied on
 # the inject lane only; on the api lane the copy is never made and the file
-# is never read, so that lane's matrix and task files stay byte for byte what
-# they were. bench/kube_agents_bench/lane.py refuses a lane entry whose name
+# is read for `requesting:` alone (the second phase, below), so that lane's
+# matrix and task files stay byte for byte what they were.
+# bench/kube_agents_bench/lane.py refuses a lane entry whose name
 # a case already declares -- devops-bench would refuse the duplicate as a
 # parse error on every repetition of that case, after the lease -- and
 # scripts/test_eval_rosters.py pins the file's shape and the set of cases
@@ -1906,7 +1967,26 @@ if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ]; then
   # `<requested> <case> <path>`: the count first and the path last, so a
   # path with a space (a TMPDIR with one) cannot shift the fields read here.
   INJECT_LANE_REQUESTING="$(printf '%s\n' "${INJECT_LANE_COPIES}" | awk '$1 > 0 { printf "%s%s", sep, $2; sep = "," }')"
+  # The settle before each writer unit is the safeguard's window: a write
+  # in the last seconds of the unit before must be older than it.
+  WRITER_LAUNCH_PAUSE="${EVAL_GITHUB_WRITE_SETTLE_SECONDS}"
   echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: every task in the matrix carries the lane's safeguards (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) over BENCH_GITOPS_REPO=${BENCH_GITOPS_REPO}; copies under ${INJECT_LANE_TASKS_DIR}; cases that request a pull request, run after every other unit: ${INJECT_LANE_REQUESTING:-none}"
+else
+  # The api lane runs the same second phase, for the reset's sake rather than
+  # the safeguard's: reset_agent_pulls empties the repository before each
+  # unit of a case that requests a pull request, which is only safe when no
+  # other unit is writing to it. Same list, read from the same files (the
+  # lane file's `requesting:` included, so the file must parse here too), no
+  # copies made; the task files under bench/tasks/ run as they are. No window
+  # to settle, so the writer units keep the launch stagger.
+  WRITER_LAUNCH_PAUSE="${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
+  if ! INJECT_LANE_REQUESTING="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.lane \
+      --safeguards "${SCRIPT_DIR}/${EVAL_INJECT_LANE_SAFEGUARDS_FILE}" --list-requesting "${TASKS[@]}" \
+      | awk '$1 > 0 { printf "%s%s", sep, $2; sep = "," }')"; then
+    echo "ERROR: could not read which cases request a pull request (kube_agents_bench.lane --list-requesting, above); the fan-out cannot order them after every other unit, so the run does not start." >&2
+    exit 1
+  fi
+  echo "cases that request a pull request, run after every other unit and each after the repository is reset: ${INJECT_LANE_REQUESTING:-none}"
 fi
 
 # The task file a unit hands devops-bench: the lane's copy when the step
@@ -2117,11 +2197,16 @@ export EVAL_JUDGED_MARGIN="${EVAL_JUDGED_MARGIN:-0.5}"
 
 # Whether the suite aggregate -- admitted-case pass rate against main's, over
 # at least EVAL_AGGREGATE_MIN_SCORED repetitions -- may red the job. Unset,
-# the default, it is computed and written into the verdict but cannot block:
-# the 0.05 margin has never been measured against how much an unchanged pull
-# request moves the aggregate on main, and arming a flat margin before the
-# store can say is arming a guess. Set it to 1 in the Prow job config, not
-# here, once the store holds enough nights to size it.
+# the default, it is computed and written into the verdict but cannot block.
+# The margin (EVAL_AGGREGATE_MARGIN, default 0.10 in bench-gate) was measured
+# on 2026-09-29 against 94 green presubmit runs and four clean nightlies: no
+# unchanged pull request fell more than 0.063 below main, so 0.10 reds none
+# of them; at main's rate that night (0.924) it reds the seventh failed
+# repetition out of 36, the sixth once main sits near 0.94. Arming is a Prow-config
+# decision, not a default here: one `EVAL_AGGREGATE_ARMED=1` line in the
+# presubmit's job config in oss-test-infra flips it, and
+# docs/eval-gate-roster.md ("The whole-suite rate") carries the recipe and
+# what the author sees when it fires.
 export EVAL_AGGREGATE_ARMED="${EVAL_AGGREGATE_ARMED:-}"
 
 # Reads infrastructure.stack out of a task file. The loop uses it to decide
@@ -2337,6 +2422,21 @@ unit_cost_hint() {
     # a plant that blocks on a card appearing, then an agent turn that waits on
     # that card finishing. A wrong hint costs packing, not correctness.
     gitops-drift-out-of-band-triage) echo 900 ;;
+    # Tofu too, and the same shape, plus a plant that waits out
+    # stall_report.py's ten-minute Deployment threshold before it posts the
+    # record and then waits for the card. 1040-1080s a repetition on a dev
+    # install on 2026-10-02.
+    autoops-controller-stall-triage) echo 1100 ;;
+    # Tofu too: the plant waits for the cron job to file the sweep and for the
+    # sweep's worker to file its cards and end its run (up to the stack's
+    # run_wait, 900s), and the agent turn is a board read. 340-520s a
+    # repetition on 2026-09-28.
+    bootstrap-discovery-fanout) echo 600 ;;
+    # Tofu too: the plant files one card and waits for its worker to run the
+    # prioritization SOP and end its run (up to the stack's run_wait, 900s),
+    # and the agent turn is a board read. Unmeasured; priced below the band
+    # above because one card's worker is the whole of the wait.
+    bootstrap-inventory-ranking-delivery) echo 600 ;;
     # The nightly-only full audits: 600-1300s a repetition on 2026-08-26,
     # planted-pdb's 962s the one clean measurement. Priced with the 900 band
     # so a nightly run launches them first. fleet-cost-idle-pool joined the
@@ -2401,6 +2501,12 @@ unit_cost_hint() {
     # (710/710/735/1325s, 2026-09-23): the platform worker fans out to every
     # Cluster Agent profile in the fleet before the payments-api one reports.
     cluster-agent-delegation-profile-lookup) echo 720 ;;
+    # Two prepare/submit rounds and a close. Measured on `dev-1918-69fd3893`:
+    # 587-1512s a repetition, 937s the middle one.
+    vcs-spent-branch-reuse) echo 1000 ;;
+    # One delegation and one forge list call. Measured on `dev-vcs3-20261001b`:
+    # 173-237s a repetition over three runs, 225s the middle one.
+    vcs-forge-cli-request-uses-the-verbs) echo 240 ;;
     *) echo 200 ;;
   esac
 }
@@ -2763,6 +2869,21 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     release_inflight_note "${name} rep ${rep}" "${audit_id}"
     reset_audit_ledgers "${name} rep ${rep}" "${audit_id}"
   fi
+  # The repository this unit's agent writes to, emptied of every agent pull
+  # request and every branch but the default and read back, so repetitions
+  # 2 and 3 start as 1 did and a leftover from an earlier lease is never what
+  # the agent builds on (#2260). Only for a case that requests a pull request:
+  # those run one at a time after every other unit (unit_phase), so nothing a
+  # sibling is working on is open here. Not clean: the unit does not run, the
+  # locks go back, and the repetition grades MISSING, as a unit that could not
+  # mint does.
+  if [ "$(unit_phase "${name}")" = "1" ] && ! reset_agent_pulls "${name} rep ${rep}"; then
+    [ -n "${audit_id}" ] && lock_release "${STATE_DIR}/lock-stream-${audit_id}"
+    [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
+    lock_release "${STATE_DIR}/lock-task-${name}"
+    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} did not run: the leased repository could not be reset" >&2
+    return 0
+  fi
   if [ -n "${reuse}" ]; then
     export GKE_CLUSTER_NAME="${SEEDED_TASK_CLUSTER}" CLUSTER_NAME="${SEEDED_TASK_CLUSTER}"
     export TF_VAR_cluster_name="${SEEDED_TASK_CLUSTER}" GCP_LOCATION="${SEEDED_TASK_LOCATION}"
@@ -2779,6 +2900,32 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   export AGENT_DELEGATION_TIMEOUT
   local start end dir run_task
   run_task="$(unit_task_path "${task}" "${name}")"
+  # When the first unit on this case's audit stream began, and which audit it
+  # is, for pull_request_opened's accepts_stream_pull_request
+  # (bench/kube_agents_bench/verifiers.py). A fleet audit opens its remediation
+  # pull request once and later runs on the stream find it open and leave it,
+  # whichever case they are; only a unit of a case that requests a pull
+  # request resets the repository first (reset_agent_pulls above, 5.5), so a
+  # stream whose cases request none keeps it between units. Written once, by the first unit to get
+  # here, under the stream lock that serializes them; a pull request older
+  # than it is not this job's, and one the stamp admits must sit on the
+  # audit's remediation branch in this job's GitOps repository
+  # (EVAL_STREAM_REPO), so a sibling job's pull request on the same audit in
+  # another pool repository is not this one's. A case with no
+  # `ledger_issue_contains` audit key has no stream and gets none of them.
+  # The repository takes the deploy's precedence, as the inject lane's does:
+  # a developer's EVAL_GITOPS_REPO is where the agent was told to write.
+  if [ -n "${audit_id}" ]; then
+    local window="${STATE_DIR}/stream-${audit_id}.window" stream_repo="${EVAL_LEDGER_REPO:-}"
+    if [ -n "${EVAL_GITOPS_REPO:-}" ] && [ "${EVAL_GITOPS_REPO}" != "none" ]; then
+      stream_repo="${EVAL_GITOPS_REPO}"
+    fi
+    [ -s "${window}" ] || date -u +%s > "${window}"
+    EVAL_STREAM_STARTED_AT="$(cat "${window}")"
+    export EVAL_STREAM_STARTED_AT EVAL_AUDIT_STREAM="${audit_id}" EVAL_STREAM_REPO="${stream_repo}"
+  else
+    unset EVAL_STREAM_STARTED_AT EVAL_AUDIT_STREAM EVAL_STREAM_REPO
+  fi
   start="$(_now_ms)"
   (cd "${BENCH_DIR}" && uv run devops-bench "${run_task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
   end="$(_now_ms)"
@@ -2818,16 +2965,21 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
 # spent two of four lanes that way for its first twelve minutes under the
 # cost-first ordering this replaces.
 #
-# Two phases on the inject lane (#2079). The lane's GitHub-write safeguard
-# dates a write; it cannot sign it, and every unit of the run writes to one
-# repository. A case that requests a pull request (INJECT_LANE_REQUESTING,
-# from the lane step; empty on the api lane and on an inject matrix with no
-# such case) therefore runs only after every other unit has finished: a
+# Two phases on the inject lane (#2079), and since #2260 on the api lane too.
+# On the inject lane for the GitHub-write safeguard, which dates a write and
+# cannot sign it while every unit of the run writes to one repository; on
+# both lanes for the repository reset, which empties that repository before
+# each unit of a case that requests a pull request and may only do so while
+# nothing else writes. Such
+# a case (INJECT_LANE_REQUESTING, from the lane step; empty on a matrix with
+# no such case) therefore runs only after every other unit has finished: a
 # repetition of a case that requests nothing never shares the repository with
 # one that writes by design, so a write inside its window is its own or a
 # concurrent sibling's mistake, either of which is the red the safeguard
-# exists for. The second phase runs one unit at a time, and every unit in it
-# waits EVAL_GITHUB_WRITE_SETTLE_SECONDS before it starts: two requesting
+# exists for. The second phase runs one unit at a time, and on the inject
+# lane every unit in it waits EVAL_GITHUB_WRITE_SETTLE_SECONDS before it
+# starts (WRITER_LAUNCH_PAUSE, set by the lane step; the api lane, which
+# grades no window, keeps the launch stagger): two requesting
 # cases side by side would red each other's by-design pull requests (each
 # excuses only the ones its own reply names), and the safeguard's window
 # opens that many seconds before the repetition's start, so a write in the
@@ -2880,7 +3032,8 @@ launch_units() { # <queue: "REP COST IDX" lines> <parallelism> <seconds before e
     done
     # Staggered, so N units do not open their first model call in the same
     # second -- burst 429s at the model quota are the fan-out's failure mode;
-    # in the second phase the pause is the write-settle instead.
+    # in the second phase the pause is the lane's writer pause instead (the
+    # settle on the inject lane, this stagger on the api lane).
     sleep "${pause}"
     echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/${EVAL_REPETITIONS}"
     UNIT_SEQ=$((${UNIT_SEQ:-0} + 1))
@@ -2894,23 +3047,21 @@ profile_begin "task fan-out: $((UNIT_TOTAL + WRITER_TOTAL)) units, parallelism=$
 launch_units "${UNIT_QUEUE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
 wait
 if [ "${WRITER_TOTAL}" -gt 0 ]; then
-  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${WRITER_TOTAL} unit(s) of the cases that request a pull request (${INJECT_LANE_REQUESTING}), one at a time, each after a ${EVAL_GITHUB_WRITE_SETTLE_SECONDS}s settle"
-  launch_units "${UNIT_QUEUE_WRITERS}" 1 "${EVAL_GITHUB_WRITE_SETTLE_SECONDS}"
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${WRITER_TOTAL} unit(s) of the cases that request a pull request (${INJECT_LANE_REQUESTING}), one at a time, each after a ${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}s pause"
+  launch_units "${UNIT_QUEUE_WRITERS}" 1 "${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}"
   wait
 fi
 
 # ─── What the run left on GitHub (#2079) ─────────────────────────────────────
 # On the inject lane, once every unit is done: every pull request and branch
-# under the agent's prefix written to the leased project's repository since
+# a bot wrote to the leased project's repository since
 # this run began, in the job log by number and branch, so a red safeguard has
 # its subject named beside it and a run's leftovers are on record even when
 # no repetition graded them (a unit that died before verification). It closes
-# nothing: this job holds no credential that closes a pull request, by design
-# -- a presubmit runs the pull request's own code, and the one
-# `pull_requests: write` outside a run is the periodic sweep that executes
-# `main` alone (hack/ci_sweep_agent_pulls.py; docs/ci-pool-projects.md 5.3
-# and 5.5), which closes these and deletes their branches within its
-# ten-minute interval once the lease is released. A fresh read token first:
+# nothing: the closes happen before each unit that may write
+# (reset_agent_pulls), and what the last unit left is the next lease's reset
+# or the periodic sweep's (hack/ci_sweep_agent_pulls.py; docs/ci-pool-projects.md
+# 5.3 and 5.5). A fresh read token first:
 # the one minted at preflight is hours old by now. Never fatal, and after
 # the fan-out rather than in the EXIT trap: a deadline-cut run loses this
 # line and keeps the per-repetition reasons, which is the right trade.
@@ -2920,15 +3071,15 @@ report_github_leftovers() {
   fi
   echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] GitHub writes this run left on ${BENCH_GITOPS_REPO} since ${EVAL_RUN_STARTED_AT} <<<"
   if ! mint_ledger_token "leftovers"; then
-    echo "WARNING: GitHub leftovers: no read token, so what this run wrote to ${BENCH_GITOPS_REPO} is not listed here; the periodic sweep ci-kube-agents-pull-sweep (every ten minutes, on projects Boskos reports free) still closes it once the lease is released."
+    echo "WARNING: GitHub leftovers: no read token, so what this run wrote to ${BENCH_GITOPS_REPO} is not listed here; the next lease's reset and the periodic sweep ci-kube-agents-pull-sweep still close it."
     return 0
   fi
   if ! (cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.github_writes \
       --repo "${BENCH_GITOPS_REPO}" --since "${EVAL_RUN_STARTED_AT}"); then
-    echo "WARNING: GitHub leftovers: the listing of ${BENCH_GITOPS_REPO} failed (above); the periodic sweep ci-kube-agents-pull-sweep (every ten minutes, on projects Boskos reports free) still closes what this run left once the lease is released."
+    echo "WARNING: GitHub leftovers: the listing of ${BENCH_GITOPS_REPO} failed (above); the next lease's reset and the periodic sweep ci-kube-agents-pull-sweep still close what this run left."
     return 0
   fi
-  echo "GitHub leftovers: this job closes none of them (no pull_requests: write in a presubmit, docs/ci-pool-projects.md 5.3); the periodic sweep ci-kube-agents-pull-sweep (every ten minutes, on projects Boskos reports free) closes them and deletes their branches once the lease is released. The safeguard verdict above was read during each repetition and does not depend on this listing."
+  echo "GitHub leftovers: this listing closes none of them; the next lease's reset (hack/ci_reset_agent_pulls.py) and the periodic sweep ci-kube-agents-pull-sweep close them and delete their branches. The safeguard verdict above was read during each repetition and does not depend on this listing."
 }
 report_github_leftovers
 
@@ -3035,11 +3186,12 @@ fi
 # nothing against the change to debug either. Prow reds 2 as it reds 1, which
 # is right: a run that proved nothing does not merge. The distinct status and
 # the `outcome` in eval-verdict.json are for the artifact and for the
-# release-candidate lane, which reports NOT RUN rather than RED on them. The
-# dashboard and the health bot do not read either yet: they classify this
-# run from the final line's `Failed` word and from Prow's FAILURE, so until
-# #1782 they still call it red; the banner in eval-verdict.md is what says
-# otherwise. --baseline-rate is not passed: the rate is computed from the
+# release-candidate lane, which reports NOT RUN rather than RED on them, and
+# for the dashboard: scripts/eval_dashboard/collect.py reads the artifact for
+# a build whose final line carries NOT EVALUATED and records the outcome on
+# the run for the infrastructure-loss shape (the transport shape below stays
+# a plain RED there), which is what keeps the run page and the health bot's
+# comment from calling it a hard failure. --baseline-rate is not passed: the rate is computed from the
 # store, per admitted case at its own version key. While the store holds
 # nothing, and until EVAL_AGGREGATE_ARMED is set to 1, the aggregate stays
 # advisory and the markdown says so, rather than implying a comparison that

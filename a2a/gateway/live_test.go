@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/slack-go/slack"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -45,6 +46,7 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 	url := os.Getenv("A2A_LIVE_NATS_URL")
 	gwPass := os.Getenv("A2A_LIVE_GATEWAY_PASSWORD")
 	brPass := os.Getenv("A2A_LIVE_BRIDGE_PASSWORD")
+	consolePass := os.Getenv("A2A_LIVE_CONSOLE_PASSWORD") // empty: install predates the console identity; beat 3 skips
 	if url == "" || gwPass == "" || brPass == "" {
 		t.Skip("live NATS env not set; see comment")
 	}
@@ -79,6 +81,21 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 		t.Fatal(err)
 	}
 	adapter := newFakeAdapter()
+	var gwAdapter Adapter = adapter
+	var inProcConsole *ConsoleAdapter
+	if consolePass != "" {
+		console, err := NewConsoleAdapter(url,
+			[]nats.Option{nats.UserInfo("gateway", gwPass), nats.CustomInboxPrefix("_INBOX.gateway")}, slog.Default())
+		if err != nil {
+			t.Fatalf("console adapter: %v", err)
+		}
+		defer console.Close()
+		inProcConsole = console
+		gwAdapter, err = NewMultiAdapter("discord", "console", map[string]Adapter{"discord": adapter, "console": console}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	cfg := &Config{
 		NATSURL:          url,
 		PrincipalMapPath: mapFile,
@@ -86,7 +103,7 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 		IdleTTL:          30 * time.Minute,
 		AttributionSalt:  []byte("live-test-salt"),
 	}
-	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord", RelayDurable: liveTestRelayDurable})
+	g, err := New(Options{Client: client, Adapter: gwAdapter, Config: cfg, Backend: "discord", RelayDurable: liveTestRelayDurable})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,6 +171,80 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 		}
 		return false
 	})
+
+	// Beat 3 shape: a console frame under the console user's real grants
+	// becomes a task with backend console, and the gateway's notice lands on
+	// the conversation's .out subject.
+	if consolePass != "" {
+		browser, err := nats.Connect(url, nats.UserInfo("console", consolePass), nats.CustomInboxPrefix("_INBOX.console"))
+		if err != nil {
+			t.Fatalf("connect as console: %v", err)
+		}
+		defer browser.Close()
+		token := "livetest-" + strings.ToLower(randHex(4))
+		out, err := browser.SubscribeSync("chat.console." + token + ".out")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = browser.Flush()
+		consoleMarker := "console live " + time.Now().UTC().Format(time.RFC3339)
+		frame, _ := json.Marshal(ConsoleInFrame{MessageID: "c1", Text: consoleMarker})
+		if err := browser.Publish("chat.console."+token+".in", frame); err != nil {
+			t.Fatal(err)
+		}
+		_ = browser.Flush()
+		var consoleTask *lib.Envelope
+		waitFor(t, "console task on the real TASKS stream", func() bool {
+			task, err := findLatestLiveTask("bridge", brPass, url)
+			if err != nil || task == nil {
+				return false
+			}
+			var m lib.Message
+			if json.Unmarshal(task.Payload, &m) != nil || joinTextParts(m.Parts) != consoleMarker {
+				return false
+			}
+			consoleTask = task
+			return true
+		})
+		var auth Authority
+		if err := json.Unmarshal(consoleTask.Authority, &auth); err != nil || auth.Requester.Backend != consoleBackend {
+			t.Errorf("console task authority = %+v (%v)", auth, err)
+		}
+		// The placeholder / progress notice reaches the browser on .out —
+		// and it has to be THIS adapter's. `chat.console.*.in` is core NATS
+		// with no queue group, so the install's own gateway holds an equal
+		// subscription and answers the same frame; accepting any frame here
+		// would let the deployed gateway satisfy a beat that is supposed to
+		// exercise the in-process adapter's subscription under the console
+		// grants. Notice ids are `c-<bootID>-<n>` with bootID minted per
+		// adapter (console.go:105), so the prefix is the discriminator.
+		wantPrefix := "c-" + inProcConsole.bootID + "-"
+		deadline := time.Now().Add(30 * time.Second)
+		sawForeign := false
+		held := false
+		for time.Now().Before(deadline) {
+			m, err := out.NextMsg(time.Until(deadline))
+			if err != nil {
+				break
+			}
+			var f ConsoleOutFrame
+			if json.Unmarshal(m.Data, &f) != nil {
+				continue
+			}
+			if strings.HasPrefix(f.MessageID, wantPrefix) {
+				held = true
+				break
+			}
+			sawForeign = true
+		}
+		if !held {
+			t.Errorf("no notice from the in-process console adapter on .out (saw a frame from another gateway: %v)", sawForeign)
+		}
+		if sawForeign {
+			t.Logf("note: another gateway answered the same frame on %s — expected against an install running this branch", token)
+		}
+		t.Log("console beat held: frame under console grants -> task with backend console -> notice on .out from this adapter")
+	}
 
 	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "live result: grants hold"}}}); err != nil {
 		t.Fatal(err)
@@ -718,4 +809,77 @@ func waitLive(t *testing.T, what string, timeout time.Duration, cond func() bool
 		time.Sleep(2 * time.Second)
 	}
 	t.Fatalf("timed out waiting for %s", what)
+}
+
+// TestLiveSlackAdapter exercises every Slack Web API surface the adapter
+// uses — auth.test, the socket connect, chat.postMessage into a thread,
+// chat.update, conversations.members — against a real workspace, proving
+// the app manifest's scopes are sufficient. The inbound path (a human
+// typing at the bot) is the manual half of the DoD; the C1 validation
+// runbook drives it.
+//
+// Skipped unless the env is set:
+//
+//	SLACK_LIVE_BOT_TOKEN=xoxb-… SLACK_LIVE_APP_TOKEN=xapp-… \
+//	SLACK_LIVE_CHANNEL=C… go test ./gateway -run TestLiveSlack -v -count=1
+//
+// The channel must already have the bot invited. SLACK_LIVE_USER (a human
+// user id) is optional and adds the openDirect check.
+func TestLiveSlackAdapter(t *testing.T) {
+	botToken := os.Getenv("SLACK_LIVE_BOT_TOKEN")
+	appToken := os.Getenv("SLACK_LIVE_APP_TOKEN")
+	channel := os.Getenv("SLACK_LIVE_CHANNEL")
+	if botToken == "" || appToken == "" || channel == "" {
+		t.Skip("live Slack env not set; see comment")
+	}
+
+	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	a, err := NewSlackAdapter(botToken, appToken, log)
+	if err != nil {
+		t.Fatalf("NewSlackAdapter: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- a.Run(ctx, func(InboundMessage) {}) }()
+	select {
+	case err := <-errCh:
+		t.Fatalf("adapter exited during connect: %v", err)
+	case <-time.After(5 * time.Second):
+		// Socket is up (or still dialing without a fatal error); good enough
+		// to exercise the Web API surface.
+	}
+
+	// Root a thread the way a channel mention would: the ask's own ts.
+	_, rootTS, err := a.api.PostMessage(channel,
+		slack.MsgOptionText("a2a live test root "+time.Now().UTC().Format(time.RFC3339), false))
+	if err != nil {
+		t.Fatalf("root post: %v", err)
+	}
+	conv := slackConversationID("channel", channel, rootTS)
+
+	ts, err := a.Post(conv, "⏳ **submitted…** [design](https://example.com/spec)")
+	if err != nil || ts == "" {
+		t.Fatalf("threaded post: ts=%q err=%v", ts, err)
+	}
+	if err := a.Edit(conv, ts, "⚙️ **working** — live edit"); err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+	ids, complete, err := a.Roster(conv)
+	if err != nil || len(ids) == 0 {
+		t.Fatalf("roster: ids=%v complete=%v err=%v", ids, complete, err)
+	}
+	if user := os.Getenv("SLACK_LIVE_USER"); user != "" {
+		dm, err := a.OpenDirect(user)
+		if err != nil || !strings.HasPrefix(dm, slackDMPrefix) {
+			t.Fatalf("openDirect: %q err=%v", dm, err)
+		}
+	}
+
+	cancel()
+	// RunContext returns on cancel; any error here is the shutdown's. Run
+	// also waits on its event pump now, so this receive is the live proof
+	// that the goroutine is gone rather than merely told to go.
+	<-errCh
 }

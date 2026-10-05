@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -38,6 +39,16 @@ const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token"
 // the inject: prefix and a colon is not a legal ConfigMap key.
 const defaultInjectPrincipalMapPath = "/etc/a2a/inject-principal-map/principals"
 
+// The session-pod image when A2A_WORKER_IMAGE is unset, which is only a
+// gateway run outside the operator: the operator renders that env from its
+// own resolution (a2aWorkerImage in platformagent_a2a_manifests.go), and
+// hack/check-image-inventory.sh holds this repository to images.json's
+// a2a-worker entry.
+const (
+	defaultWorkerRepository = "ghcr.io/gke-labs/kube-agents/a2a-worker"
+	defaultWorkerTag        = "latest"
+)
+
 // The display-mode values, matching the GoogleChatSpec.Mode enum.
 const (
 	displayModeDefault = "default"
@@ -53,6 +64,10 @@ const defaultTaskDeadline = 30 * time.Minute
 // the horizon rationale.
 const defaultAskTTL = 24 * time.Hour
 
+// defaultSessionTTL is what SessionTTL means when unset (7 days, sitting
+// comfortably beyond TASKS stream's 72h retention).
+const defaultSessionTTL = 7 * 24 * time.Hour
+
 // defaultFirstEventGrace is what FirstEventGrace means when unset; the
 // field's comment carries the sizing rationale.
 const defaultFirstEventGrace = 10 * time.Minute
@@ -66,7 +81,18 @@ type Config struct {
 	NATSPassword string
 	DiscordToken string
 
-	// PrincipalMapPath is the mounted principal-map ConfigMap.
+	// SlackBotToken and SlackAppToken arm the Slack backend: Socket Mode
+	// needs both (xoxb- drives the Web API, xapp- the outbound websocket —
+	// no inbound endpoint, nothing to expose). Exactly one backend may be
+	// configured per gateway process: two gateways bound to one relay
+	// durable split event deliveries (Options.RelayDurable), so a second
+	// backend is a second Deployment with its own durable, not a second
+	// adapter here.
+	SlackBotToken string
+	SlackAppToken string
+
+	// PrincipalMapPath is the mounted principal map — Discord's test
+	// ConfigMap or Slack's admin-owned Secret; same on-disk shape either way.
 	PrincipalMapPath string
 
 	// GchatRelayURL is the credential proxy's relay base URL — the gchat
@@ -140,8 +166,9 @@ type Config struct {
 	// lazily so that an install with it off never depends on the RBAC.
 	SpawnSessions bool
 
-	// IdleTTL is the reap threshold since the last user message (decided
-	// 8/24: 30 minutes, config-backed).
+	// IdleTTL is the reap threshold since the session's last activity: a
+	// verified turn, or an executor ending a live task (decided 8/24: 30
+	// minutes, config-backed; the task's end counts since 2026-09-30).
 	IdleTTL time.Duration
 
 	// AttributionSalt keys the HMAC pseudonyms in authority blocks. The
@@ -189,6 +216,19 @@ type Config struct {
 	// a status card can echo the ask.
 	AskTTL time.Duration
 
+	// SessionTTL bounds the lifetime of idle session records in session-state
+	// (A2A_SESSION_TTL). The session record holds contextId across pod
+	// incarnations. Once a session has no active pod and has seen no activity
+	// for longer than SessionTTL, its record is deleted from KV (leaving a
+	// ~100-byte tombstone marker under the bucket's --history=1 limit),
+	// bounding session-state growth to a marker per conversation rather than
+	// accumulating multi-KB session records, rosters, and task histories
+	// (including sessions with stale or abandoned active tasks whose executors
+	// never completed, while preserving tasks actively running within
+	// TaskDeadline). Unset means 7 days (168h), sitting comfortably past
+	// TASKS' 72h retention horizon.
+	SessionTTL time.Duration
+
 	// FirstEventGrace bounds how long an active task with NOTHING on its
 	// events subject may hold a conversation's serialization
 	// (A2A_FIRST_EVENT_GRACE). Every other bound assumes a pod: the adapter's
@@ -235,6 +275,15 @@ type Config struct {
 	// earlier and in one place.
 	SessionServiceAccount string
 
+	// SessionClusterView gives spawned session pods the temporary read-only
+	// cluster view: a projected token for the credential broker's session
+	// audience, the broker's URL, and Bash in the worker. Rendered by the
+	// operator under its A2A_SESSION_CLUSTER_VIEW flag; off, the pod is
+	// exactly the inert one. CredentialProxyURL is where the shim dials;
+	// New refuses the view without it.
+	SessionClusterView bool
+	CredentialProxyURL string
+
 	// StrictEventsWriter makes the `…events` writer-class agreement check a
 	// refusal instead of a counted advisory (A2A_STRICT_EVENTS_WRITER=true).
 	// It ships false: for one TASKS retention window after an install takes
@@ -243,6 +292,32 @@ type Config struct {
 	// every recent task non-terminal. Flip it no earlier than one retention
 	// window (72h at the dev default) after the split reaches the install.
 	StrictEventsWriter bool
+
+	// AuthorityTier and AuthorityScope are what the gateway mints a task's
+	// root capability at: the ceiling for this agent, from which every hop
+	// can only narrow.
+	//
+	// They come from the environment because there is nowhere better yet.
+	// 02-agent-personas §9 puts `tier` and `scope` on the Agent CRD, and
+	// that CRD does not exist — PlatformAgent carries neither, and inventing
+	// them on it is an API change this card is not. The operator renders
+	// neither — so the defaults below are what every rendered install runs
+	// on, not a local-run convenience, and they are deliberately the
+	// narrowest thing that could be true: the ceiling an operator has not
+	// chosen must not be a generous one.
+	AuthorityTier  capability.Tier
+	AuthorityScope capability.Scope
+
+	// CapabilityOptional relaxes exactly one thing: what happens when this
+	// gateway cannot mint. Zero value — the safe one — refuses the turn.
+	// Set, a mint failure logs and the envelope goes out with `grants: null`,
+	// which is the pre-A3b shape, for an install whose bus has no `cap`
+	// bucket yet. The executor has the matching knob and the operator renders
+	// both from A2A_CAPABILITY_REQUIRED, so the two halves cannot drift.
+	//
+	// It is NOT a switch for enforcement. A capability that exists is always
+	// checked, and no configuration makes a refused verb run.
+	CapabilityOptional bool
 
 	// MaxSessions caps how many session pods run concurrently, gateway-wide
 	// (A2A_MAX_SESSIONS). "Delegate:" makes pod creation user-triggerable and
@@ -265,19 +340,21 @@ type Config struct {
 	MaxSessions int
 }
 
-// Backend names the REAL chat backend this config arms: "gchat", "discord",
-// or "" when the inject side door is the only way in. FromEnv refuses more
-// than one real backend, so the order here only decides what a hand-built
-// Config means.
+// Backend names the REAL chat backend this config arms: "gchat", "slack",
+// "discord", or "" when the inject side door is the only way in. FromEnv
+// refuses more than one real backend, so the order here only decides what a
+// hand-built Config means.
 //
 // The door is deliberately not one of the answers. It can be armed beside
-// either backend, so "which backend is this gateway" and "is the door open"
+// any one backend, so "which backend is this gateway" and "is the door open"
 // are two questions, and collapsing them is what would make the door
 // exclusive again.
 func (c *Config) Backend() string {
 	switch {
 	case c.GchatRelayURL != "":
 		return gchatBackend
+	case c.SlackBotToken != "":
+		return slackBackend
 	case c.DiscordToken != "":
 		return discordBackend
 	case c.InjectListen != "":
@@ -303,14 +380,21 @@ func FromEnv() (*Config, error) {
 		NATSUser:         os.Getenv("NATS_USER"),
 		NATSPassword:     os.Getenv("NATS_PASSWORD"),
 		DiscordToken:     os.Getenv("DISCORD_TOKEN"),
+		SlackBotToken:    os.Getenv("SLACK_BOT_TOKEN"),
+		SlackAppToken:    os.Getenv("SLACK_APP_TOKEN"),
 		PrincipalMapPath: envOr("A2A_PRINCIPAL_MAP", "/etc/a2a/principal-map"),
 		DefaultAddressee: envOr("A2A_DEFAULT_ADDRESSEE", "platform"),
 		SpawnSessions:    os.Getenv("A2A_SPAWN_SESSIONS") == "true",
 		Namespace:        envOr("POD_NAMESPACE", "kubeagents-system"),
-		WorkerImage:      envOr("A2A_WORKER_IMAGE", "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/worker-next:latest"),
+		WorkerImage:      envOr("A2A_WORKER_IMAGE", defaultWorkerRepository+":"+defaultWorkerTag),
 
 		SessionServiceAccount: os.Getenv("A2A_SESSION_SERVICE_ACCOUNT"),
 		StrictEventsWriter:    os.Getenv("A2A_STRICT_EVENTS_WRITER") == "true",
+		SessionClusterView:    os.Getenv("A2A_SESSION_CLUSTER_VIEW") == "true",
+		CredentialProxyURL:    os.Getenv("A2A_CREDENTIAL_PROXY_URL"),
+		AuthorityTier:         capability.Tier(envOr("A2A_AUTHORITY_TIER", string(capability.TierDeveloperTeam))),
+		AuthorityScope:        capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
+		CapabilityOptional:    capability.OptionalFromEnv(),
 	}
 	cfg.GchatRelayURL = os.Getenv("A2A_GCHAT_RELAY_URL")
 	cfg.GchatTokenPath = envOr("A2A_GCHAT_TOKEN_PATH", defaultGchatTokenPath)
@@ -330,16 +414,24 @@ func FromEnv() (*Config, error) {
 	if cfg.NATSURL == "" {
 		return nil, fmt.Errorf("NATS_URL is required")
 	}
-	// One REAL backend per gateway process, chosen by which variable is set.
-	// A silent default here would make a two-backend misconfiguration a
+	// Socket Mode needs the whole Slack pair; half a pair is a typo, not a
+	// choice, so it refuses rather than silently running another backend.
+	if (cfg.SlackBotToken != "") != (cfg.SlackAppToken != "") {
+		return nil, fmt.Errorf("SLACK_BOT_TOKEN and SLACK_APP_TOKEN arm Slack together; only one is set")
+	}
+	// One REAL backend per gateway process, chosen by which credential is
+	// set. A silent default here would make a two-backend misconfiguration a
 	// working Discord gateway that quietly never consumes Chat — refuse both
-	// directions instead. Counted rather than enumerated pairwise: with a
-	// third backend the pairs are the easy thing to leave a hole in, and the
-	// fourth (Slack, #1248) must not be addable with a combination nobody
-	// checked. Adding a backend is one entry in this list.
+	// directions instead. Counted rather than enumerated pairwise: with three
+	// backends the pairs are the easy thing to leave a hole in, and a fourth
+	// must not be addable with a combination nobody checked. Adding a backend
+	// is one entry in this list.
 	var armed []string
 	if cfg.GchatRelayURL != "" {
 		armed = append(armed, "A2A_GCHAT_RELAY_URL")
+	}
+	if cfg.SlackBotToken != "" {
+		armed = append(armed, "the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair")
 	}
 	if cfg.DiscordToken != "" {
 		armed = append(armed, "DISCORD_TOKEN")
@@ -366,10 +458,10 @@ func FromEnv() (*Config, error) {
 		// because a next install whose relay URL failed to render looks the
 		// same. The spec's test-backend section states the same decision.
 		if cfg.InjectListen == "" {
-			return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), or A2A_INJECT_LISTEN (the dev-only inject side door)")
+			return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair (Socket Mode), or A2A_INJECT_LISTEN (the dev-only inject side door)")
 		}
 	default:
-		return nil, fmt.Errorf("more than one chat backend is configured (%s): one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend. The inject side door (A2A_INJECT_LISTEN) is not a backend in this sense and may sit beside either", strings.Join(armed, ", "))
+		return nil, fmt.Errorf("more than one chat backend is configured (%s): one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend. The inject side door (A2A_INJECT_LISTEN) is not a backend in this sense and may sit beside any one of them", strings.Join(armed, ", "))
 	}
 	// Fail closed: a door with no token would be reachable by anything that
 	// reaches the listener, and the port-forward path the runner uses is
@@ -384,6 +476,13 @@ func FromEnv() (*Config, error) {
 	// bridge-only install.
 	if cfg.SpawnSessions && cfg.SessionServiceAccount == "" {
 		return nil, fmt.Errorf("A2A_SESSION_SERVICE_ACCOUNT is required when A2A_SPAWN_SESSIONS is true; session pods authenticate to the bus as it, and there is no safe default")
+	}
+	cfg.defaultCapabilityCeiling()
+	// Validated at boot rather than at mint: a bad tier or scope would
+	// otherwise surface as every task failing to start, one refusal at a
+	// time, with the cause in the gateway's logs and not the operator's.
+	if err := cfg.validateCapabilityCeiling(); err != nil {
+		return nil, err
 	}
 	// The addressee is a subject token; validate at boot, not per-message.
 	// The "session" sentinel passes by construction; whether a spawner backs
@@ -430,6 +529,19 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_ASK_TTL %q is under the 1m floor; it would erase the ask from status cards while the task runs", askTTL)
 	}
 	cfg.AskTTL = at
+
+	sessionTTL := envOr("A2A_SESSION_TTL", defaultSessionTTL.String())
+	st, err := time.ParseDuration(sessionTTL)
+	if err != nil {
+		return nil, fmt.Errorf("A2A_SESSION_TTL %q: %w", sessionTTL, err)
+	}
+	if st < 72*time.Hour {
+		return nil, fmt.Errorf("A2A_SESSION_TTL %q is under the 72h floor; it must sit beyond TASKS stream retention (72h)", sessionTTL)
+	}
+	if st <= cfg.TaskDeadline {
+		return nil, fmt.Errorf("A2A_SESSION_TTL %q must exceed A2A_TASK_DEADLINE_SECONDS (%v)", sessionTTL, cfg.TaskDeadline)
+	}
+	cfg.SessionTTL = st
 
 	grace := envOr("A2A_FIRST_EVENT_GRACE", defaultFirstEventGrace.String())
 	fg, err := time.ParseDuration(grace)
@@ -485,4 +597,39 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// defaultCapabilityCeiling fills the tier and scope the gateway mints under.
+// Tests and embedders build Config directly, bypassing FromEnv, and the
+// ceiling is inherited by every hop of every task, so the unset value has to
+// be the narrowest thing that is certainly true rather than the widest thing
+// that would work.
+func (c *Config) defaultCapabilityCeiling() {
+	if c.AuthorityTier == "" {
+		c.AuthorityTier = capability.TierDeveloperTeam
+	}
+	if c.AuthorityScope == "" {
+		c.AuthorityScope = capability.NamespaceScope(c.Namespace)
+	}
+}
+
+// validateCapabilityCeiling runs the ceiling through the same validation a
+// minted entry gets, so a bad tier or scope is a boot failure the operator
+// sees rather than a per-task refusal in the gateway's log.
+func (c *Config) validateCapabilityCeiling() error {
+	// The namespace first, because it is the rung the default ceiling is
+	// built from and Entry.Validate cannot speak for it: a namespace with an
+	// even number of separators makes a scope that validates cleanly as a
+	// DIFFERENT ceiling, so running the Entry check alone would pass the
+	// gateway out of boot minting against something nobody chose. Checked
+	// even when A2A_AUTHORITY_SCOPE is set, because an explicit scope does
+	// not make a malformed namespace correct -- it only hides it here.
+	if err := capability.ValidateNamespace(c.Namespace); err != nil {
+		return fmt.Errorf("POD_NAMESPACE: %w", err)
+	}
+	e := capability.Entry{Tier: c.AuthorityTier, Scope: c.AuthorityScope, Delegate: "boot-check"}
+	if err := e.Validate(); err != nil {
+		return fmt.Errorf("A2A_AUTHORITY_TIER/A2A_AUTHORITY_SCOPE: %w", err)
+	}
+	return nil
 }

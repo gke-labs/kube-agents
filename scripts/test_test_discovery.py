@@ -48,8 +48,10 @@ EXCLUDED = {
     # of its tests and errors on both. Runs under `make test-bench`.
     "bench/tests": "pytest-native, runs under make test-bench",
     # Live GKE cluster E2E test suite; pytest-native, requires live cluster, Workload Identity,
-    # and KMS. Runs under `make test-e2e` in e2e-run.yml and e2e-manual-runner.yml.
-    "tests/e2e": "live cluster E2E suite, runs under make test-e2e",
+    # and KMS. e2e-run.yml and e2e-manual-runner.yml run
+    # scripts/release/execute_e2e_tests.sh directly; `make e2e-tests` is the
+    # local entry to the same script.
+    "tests/e2e": "live cluster E2E suite, runs through scripts/release/execute_e2e_tests.sh",
     # Live black-box CUJ journeys against a provisioned kube-agents install;
     # they open an admin portal and talk to a deployed agent, so they are
     # deliberately manual: `uv run --project bench pytest -s bench/cuj`.
@@ -110,7 +112,7 @@ class TestEveryTestFileRuns(unittest.TestCase):
             [],
             "\n\nThese directories hold test_*.py files that never run in CI:\n  "
             + "\n  ".join(orphans)
-            + "\n\nEither add a matching wildcard to PYTHON_TEST_DIRS in the "
+            + "\n\nEither add a matching wildcard to PYTHON_TEST_FILES in the "
             "Makefile, or add the directory to EXCLUDED in this file with the "
             "reason it must not run there.",
         )

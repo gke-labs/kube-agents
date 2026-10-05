@@ -302,3 +302,12 @@ def test_token_file_fallback(tmp_path: Any) -> None:
 )
 def test_repo_slug(url: str, slug: str) -> None:
     assert gitops.repo_slug(url) == slug
+
+
+def test_application_defaults_to_the_run_branch_task() -> None:
+    """Without GITOPS_ARGO_APP the Application is the task named by the run branch."""
+    env = {**ENV, "GITOPS_RUN_BRANCH": "run/eval-pr1/b-0022b"}
+    env.pop("GITOPS_ARGO_APP", None)
+    gh = FakeGitHub(pulls=[[]], details=[], checks=[])
+    _, record, _ = _run(env, gh, [])
+    assert record["application"] == "argocd/b-0022b"

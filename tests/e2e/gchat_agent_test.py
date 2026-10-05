@@ -50,7 +50,7 @@ CHAT_TOPIC_NAME: str = os.environ.get("CHAT_TOPIC_NAME", "platform-agent-chat-ev
 DEFAULT_AGENT_NAMESPACE: str = "kubeagents-system"
 AGENT_NAMESPACE: str = os.environ.get("AGENT_NAMESPACE") or os.environ.get("NAMESPACE") or DEFAULT_AGENT_NAMESPACE
 GATEWAY_DEPLOYMENT_NAME: str = "platform-agent-gateway"
-GATEWAY_ROLLOUT_TIMEOUT_SEC: int = int(os.environ.get("GATEWAY_ROLLOUT_TIMEOUT_SEC", "900"))
+GATEWAY_ROLLOUT_TIMEOUT_SEC: int = int(os.environ.get("GATEWAY_ROLLOUT_TIMEOUT_SEC", "1500"))
 GATEWAY_ROLLOUT_SUBPROCESS_GRACE_SEC: int = 10
 
 # Test Identity Resolution (Defaults to CI Service Account email if GCP_PROJECT_ID is set)

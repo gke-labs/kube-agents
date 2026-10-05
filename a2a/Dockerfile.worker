@@ -1,21 +1,22 @@
-# worker-next: the session-pod image - the harness's native binary plus the
+# a2a-worker: the session-pod image - the harness's native binary plus the
 # worker adapter as the entry point.
 #
 # PLAYGROUND POSTURE: this image authenticates to the bus with a static
 # per-component NATS user and reaches the model through the install's
 # LiteLLM with no per-worker credential. Each of these has a decided design
 # in the specs (auth callout, Vertex/WI per profile); none of them gates
-# "Adam can play." Static creds are the playground, not the product.
+# "Adam can play." Static creds are the playground, not the product. The
+# temporary cluster view (A2A_SESSION_CLUSTER_VIEW) is the other playground
+# posture here: it is a stopgap, not the product.
 
-# Build from the a2a/ module root:
-#   docker build -f Dockerfile.worker -t <registry>/worker-next:<tag> .
+# Build from the REPOSITORY root (the shim client below lives outside a2a/):
+#   docker build -f a2a/Dockerfile.worker -t <registry>/a2a-worker:<tag> .
 
 # Bases come from images.json, the repo's image inventory, spelled the way
 # a2a/Dockerfile.gateway spells them so `make mirror-images` and the pinning
-# there cover this build too. The exemption in the header above is for the four
-# PUBLISHED a2a images, whose registry is a stage-1 dev one; it does not reach
-# the bases they are built from, which a mirrored or air-gapped build has to be
-# able to resolve like any other.
+# there cover this build too, and the published image is the inventory's
+# a2a-worker entry; a mirrored or air-gapped build has to be able to resolve
+# the bases like any other.
 ARG GOLANG_IMAGE=golang
 ARG GOLANG_VERSION=1.27-alpine
 ARG NODE_IMAGE=node
@@ -28,9 +29,9 @@ FROM ${GOLANG_IMAGE}:${GOLANG_VERSION} AS build
 # fetches a newer one instead of failing the build (#1138).
 ENV GOTOOLCHAIN=local
 WORKDIR /src
-COPY go.mod go.sum ./
+COPY a2a/go.mod a2a/go.sum ./
 RUN go mod download
-COPY . .
+COPY a2a/ .
 RUN CGO_ENABLED=0 GOOS=linux \
     go build -trimpath -ldflags="-w -s" -o /out/worker-adapter ./cmd/worker-adapter
 
@@ -44,6 +45,35 @@ WORKDIR /app
 # version these stream-json shapes were proved against.
 RUN npm install @anthropic-ai/claude-agent-sdk@0.3.236 \
     && npm cache clean --force
+
+# The temporary cluster view (operator flag A2A_SESSION_CLUSTER_VIEW): kubectl
+# and gcloud on PATH are the credential broker's shim, which forwards an argv
+# to the broker and prints its refusal as `policy rule: <rule>`. The shim is
+# Python, so python3 is installed, with python3-yaml beside it: the shim parses
+# the kubeconfig `gcloud container clusters get-credentials` returns, and any
+# kubeconfig a `kubectl --kubeconfig=` or KUBECONFIG names, and without PyYAML
+# those crash after the broker has already run the command. Nothing else is
+# installed; no native kubectl, gcloud, gh or git exist in this image, and the
+# guard below keeps it so. With the flag off the pod has no
+# CREDENTIAL_PROXY_URL and the shim refuses with that name. gh and git are
+# deliberately not linked: the broker's session role refuses them anyway, and
+# a name that is not on PATH is a clearer answer. The forwarder itself lives
+# under libexec, off PATH, so the only names a shell finds are the two shims.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 python3-yaml \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -c 'import yaml'
+COPY --chmod=0755 agents/platform/scripts/credential_proxy_client.py /opt/credential-proxy/libexec/credential-proxy-exec
+RUN mkdir -p /opt/credential-proxy/bin \
+    && for binary in kubectl gcloud; do \
+         ln -s /opt/credential-proxy/libexec/credential-proxy-exec "/opt/credential-proxy/bin/${binary}"; \
+       done \
+    && for binary in gcloud kubectl gh git; do \
+         if command -v "${binary}" >/dev/null 2>&1; then \
+           echo "unexpected credential-aware CLI in the worker image: ${binary}" >&2; exit 1; \
+         fi; \
+       done
+ENV PATH="/opt/credential-proxy/bin:${PATH}"
 
 COPY --from=build /out/worker-adapter /usr/local/bin/worker-adapter
 

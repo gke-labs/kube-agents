@@ -90,16 +90,21 @@ class SpecToolRegistryTest(unittest.TestCase):
     """Every tool name in a verification spec exists in a live registry."""
 
     # Hermes-image built-in tools this repository references but does not
-    # define: the kanban pool. Evidence of each lives in the image patches
-    # (deploy/docker/patches/*kanban*); a name added here needs the same.
-    HERMES_BUILTIN_TOOLS = {
-        "kanban_create",
-        "kanban_list",
-        "kanban_show",
-        "kanban_complete",
-        "kanban_block",
-        "kanban_heartbeat",
+    # define: the kanban pool, and the skill writer the image gates. Evidence
+    # of each lives in the image patches that touch them, and only in its own
+    # family's files (HERMES_BUILTIN_EVIDENCE); a name added here needs the same.
+    HERMES_BUILTIN_EVIDENCE = {
+        "*kanban*": {
+            "kanban_create",
+            "kanban_list",
+            "kanban_show",
+            "kanban_complete",
+            "kanban_block",
+            "kanban_heartbeat",
+        },
+        "*skill_manage_image_owned*": {"skill_manage"},
     }
+    HERMES_BUILTIN_TOOLS = set().union(*HERMES_BUILTIN_EVIDENCE.values())
 
     # Tools behind a remote MCP proxy (`/opt/mcp-remote/dist/proxy.js <url>`),
     # as (server alias, tool): nothing in this repository can enumerate them,
@@ -113,6 +118,9 @@ class SpecToolRegistryTest(unittest.TestCase):
         # #1765: the 50-a-day Developer Knowledge method the personas forbid
         # and knowledge-grounding-sources-probe's safeguard names.
         ("developer_knowledge", "answer_query"),
+        # #953: read-only workload existence inspection across clusters
+        ("gke", "get_k8s_resource"),
+        ("gke", "describe_k8s_resource"),
     }
     REMOTE_TOOL_EVIDENCE = (
         "agents/platform/SOUL.md",
@@ -256,18 +264,37 @@ class SpecToolRegistryTest(unittest.TestCase):
             "can never trip, which is a silent-green gate: " + ", ".join(unresolved),
         )
 
+    @staticmethod
+    def _names_builtin(name, corpus):
+        """Whether the corpus names the tool as a call or a quoted name.
+
+        A bare substring is not enough: `skill_manage` is part of the patch
+        module's own file name, which every file of that family imports. A
+        kanban tool also counts by its quoted action (`"create"`), the form
+        the kanban patches dispatch on.
+        """
+        root = name.removeprefix("kanban_")
+        forms = [f"{name}(", f"'{name}'", f'"{name}"']
+        if root != name:
+            forms += [f"'{root}'", f'"{root}"']
+        return any(form in corpus for form in forms)
+
     def test_the_builtin_allowlist_still_has_evidence_in_the_image_patches(self):
         patches = REPO_ROOT / "deploy" / "docker" / "patches"
-        corpus = "\n".join(
-            p.read_text(errors="replace") for p in patches.glob("*kanban*")
-        )
-        for name in sorted(self.HERMES_BUILTIN_TOOLS):
-            root = name.removeprefix("kanban_")
-            self.assertTrue(
-                name in corpus or f"'{root}'" in corpus or f'"{root}"' in corpus,
-                f"{name} is allowlisted as a hermes builtin but the image "
-                "patches carry no evidence of it — stale allowlist entry",
-            )
+        for pattern, names in sorted(self.HERMES_BUILTIN_EVIDENCE.items()):
+            corpus = "\n".join(p.read_text(errors="replace") for p in patches.glob(pattern))
+            for name in sorted(names):
+                self.assertTrue(
+                    self._names_builtin(name, corpus),
+                    f"{name} is allowlisted as a hermes builtin but the {pattern} "
+                    "image patches carry no evidence of it — stale allowlist entry",
+                )
+
+    def test_builtin_evidence_is_a_call_or_a_quoted_name(self):
+        self.assertFalse(self._names_builtin("skill_manage", "from tools.skill_manage_image_owned import x"))
+        self.assertTrue(self._names_builtin("skill_manage", "raw = smt.skill_manage(**kwargs)"))
+        self.assertTrue(self._names_builtin("kanban_create", 'if action == "create":'))
+        self.assertFalse(self._names_builtin("skill_manage", 'if action == "create":'))
 
 
     def test_the_remote_allowlist_still_has_evidence_in_the_agent_text(self):

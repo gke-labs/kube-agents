@@ -15,7 +15,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 - `.agents/rules/`: Repository-level rules an agent follows, one file per family: the code (`core_engineering.md`), workflows (`github_actions.md`), the pre-PR passes (`pre_pr_review.md`), eval-driven development (`eval_driven_development.md`), docs (`documentation.md`). This file states each rule and links there; the split keeps `AGENTS.md` inside the budget `scripts/check_context_budget.py` enforces.
 - `a2a/`: Go module for the agent-to-agent bus — wire-protocol library and `a2a` topics CLI per `docs/designs/spec-a2a-payloads.md`, plus agent profiles, persona, gateway and auth-callout.
 - `charts/`: Canonical Helm charts (`kube-agents`) for deploying the Kube-Agents operator and profiles.
-- `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `chat-pubsub`, `github-minter`, `gke-backup-plan`, `drift-pubsub`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top.
+- `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `kube-agents-scope-resolver`, `chat-pubsub`, `github-minter`, `gke-backup-plan`, `drift-pubsub`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top.
 - `deploy/`: Deployment infrastructure code (Dockerfile, Kustomize bases, shared runtime assets).
 - `docs/`: Documentation.
   - `site/`: The published documentation site (Astro + Starlight) — the canonical home for
@@ -34,7 +34,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 
 ## Where Tests Go
 
-Tests live in eleven places here, with different runners and different answers to "does this catch a
+Tests live in many places, with different runners and different answers to "does this catch a
 regression before merge". Choosing the wrong one rarely fails loudly — the test runs somewhere you
 did not expect, or nowhere at all, and the suite reports green around it.
 
@@ -61,12 +61,12 @@ did not expect, or nowhere at all, and the suite reports green around it.
 - **Yes, and it is the release gate** — `tests/e2e/`, which the release-candidate pipeline runs on a
   schedule. Adding to it holds up releases rather than pull requests.
 
-One rule holds wherever it lands: a new test directory only runs if a `PYTHON_TEST_DIRS` glob in the
+One rule holds wherever it lands: a new Python test directory only runs if a `PYTHON_TEST_DIRS` glob in the
 `Makefile` reaches it, and a directory the globs miss fails nothing — it sits unexecuted while the
 suite reports green around it. Add the glob in the same change — `tests/conformance/` excepted,
 deliberately; its README says why.
 
-The eleven homes, what runs each, and how far "runs on a pull request" is from "gates a merge" are in
+The homes, what runs each, and how far "runs on a pull request" is from "gates a merge" are in
 [`docs/testing-map.md`](docs/testing-map.md).
 
 ## Agent Setup & Integration
@@ -149,7 +149,7 @@ the assignee is the claim; do not apply `status:` labels to issues in this repos
 
 - Skills live under `agents/platform/skills/` (Platform Agent) and `agents/cluster/skills/` (Cluster Agent); each holds a `SKILL.md` for an AI agent.
 - Place a skill by persona: fleet, provisioning and GitOps-write skills go to the Platform Agent; read-only, single-cluster runtime debugging to the Cluster Agent.
-- `agents/platform/skills/gke-*` are copies of `google/skills` that `scripts/sync-upstream-skills.py` overwrites wholesale, so the prefix is reserved and a direct edit lasts until the next sync. Put a `SKILL.md` change in its `SKILL_SUBSTITUTIONS` or `SKILL_FOOTERS` and make the same edit by hand; a rerun refreshes every skill from upstream.
+- `agents/platform/skills/gke-*` are copies of `google/skills` that `scripts/sync-upstream-skills.py` overwrites wholesale, so the prefix is reserved and a direct edit lasts until the next sync. Put a `SKILL.md` change in its `SKILL_SUBSTITUTIONS` or `SKILL_FOOTERS` and make the same edit by hand; a rerun refreshes every skill, or aborts on a drifted entry.
 
 ## Engineering Rules
 
@@ -341,8 +341,8 @@ Agents with a user in the loop follow this file.
 - **Local Validation Checks:** Before committing, run what your change touches — `prettier --write`
   on changed Markdown and YAML, `make shellcheck` on changed shell scripts, a local Docker build of
   the agent runner, the image-layer budget if you added a `RUN` or `COPY` to
-  `deploy/docker/Dockerfile`, and `go build` inside whichever Go module you touched
-  (`k8s-operator/`, `a2a/`).
+  `deploy/docker/Dockerfile`, `go build` inside whichever Go module you touched
+  (`k8s-operator/`, `a2a/`), and `make terraform-test` on a changed Terraform module.
   Each has a constraint that costs a CI run to rediscover — the pinned prettier version, the
   mandatory `--platform linux/amd64`, the layer ceiling that only fails after merge. The
   commands and those reasons are in
@@ -403,19 +403,19 @@ Three things to do with it:
 
 **When it runs.** On `opened`, `reopened`, and draft-marked-ready. **Pushing more commits does not
 start another review**, with one exception: a branch the bot last said does not merge gets one after
-the next push. For a fresh review of the current commit, comment `/review` on a line of its own
+the next push. For another pass over the current commit, comment `/review` on a line of its own
 (owners, members, and collaborators only): the strict pass, what the bot is certain of plus any
 high-severity finding just under that bar, marked as such. `/review all` re-reads at the first
 review's width and adds findings it believes are real without being sure. The `agent:ignore` label
 opts a pull request out and outranks both.
 
 **A human reviewer is requested only once its check passes.** The bot posts an `AI Review` check
-run alongside its review — `success` when it found nothing, `neutral` when it did — and
-`.github/workflows/auto_request_review.yml` waits for that check to go green before assigning
-anyone from `.github/auto_request_review.yml`. Opening a pull request no longer pings a human, so
-clearing the findings and commenting `/review` for a clean pass is what puts the change in front of
-a reviewer. Two exceptions: a pull request opened by a bot is assigned as soon as the check
-completes, whatever the conclusion, because Dependabot cannot re-run `/review` on itself; and an
+run, and `.github/workflows/auto_request_review.yml` waits for it to go green before assigning
+anyone from `.github/auto_request_review.yml`. A first review is green only if it found nothing; a
+later review of it holds the check on 🔴 High alone, with 🟠 Medium posted, not held
+([the cases](docs/pull-request-workflow.md#what-the-check-means)). A green
+pass after `/review` is what reaches a reviewer. Exceptions: a pull request opened by a bot is
+assigned as soon as the check completes, whatever the conclusion, because Dependabot cannot re-run `/review` on itself; and an
 owner, member, or collaborator can comment `/request-review` (at the start of the comment) to
 assign a reviewer immediately — the override for a finding you have answered but disagree with, or
 for a review that never arrived. Nothing here changes who is picked; that is still the config file.
@@ -442,10 +442,8 @@ into what is already there, per "Keep these sections current, not chronological"
 the last `/review` pass has settled, for the reason the next paragraph gives about threads: a fresh
 review brings fresh findings, and folding them in twice is the same wasted round.
 
-**Then resolve the conversations.** Pull Request Hygiene says why an open thread both blocks the
-merge and keeps the change counted as its author's outstanding work; what belongs here is the
-timing. Do it once the fixes are pushed and the last `/review` pass has settled: a fresh review
-opens fresh threads, so resolving before it lands means doing it twice.
+**Then resolve the conversations** once the fixes are pushed and the last `/review` pass has
+settled: a fresh review opens fresh threads, so resolving before it lands means doing it twice.
 
 Resolve a thread — the bot's or a human's — when you are **fully confident the issue is addressed**:
 the fix is on the pull request head and you can name the commit, or the finding is factually wrong
@@ -454,8 +452,10 @@ your working copy — a finding that looks wrong because the file it cites does 
 often a stale checkout rather than a wrong finding. Anything short of that stays open. A judgment
 call, a reviewer asking for something you chose not to do, a rebuttal nobody has answered yet —
 reply and leave it to them. Resolving says the conversation is finished; it is not a way to end a
-disagreement. Reply first, always: a resolved thread collapses, so the reply naming what changed and
-the commit that changed it is the only record the reviewer may ever see.
+disagreement. The exception, with a user in the loop, is a `kube-agents-bot` finding you decline,
+bar the description one: the bot never replies or resolves, so once your reply and **Self-Review**
+give the reason, resolve it. Reply first, always: a resolved thread collapses, so the reply is the
+only record a reviewer may ever see.
 
 ## Before Reviewing Someone Else's Pull Request
 

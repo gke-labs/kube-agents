@@ -1,0 +1,22 @@
+
+## 2026-09-29T15:05:29Z [node-data/before] K -n scen exec deploy/scratch -- cat /data/created
+Tue Sep 29 14:54:54 UTC 2026
+## exit 0
+
+## 2026-09-29T15:15:52Z [node-data/before-pool] K -n scen exec deploy/scratch -- cat /data/created
+Tue Sep 29 14:54:54 UTC 2026
+## exit 0
+
+## 2026-09-29T15:15:53Z [node-data/before-pool-pod] K -n scen get pods -l app=scratch -o wide
+NAME                       READY   STATUS    RESTARTS   AGE   IP           NODE                                  NOMINATED NODE   READINESS GATES
+scratch-58d58ff7f5-bxb22   1/1     Running   0          21m   10.30.97.4   gke-upg-04b-work-pool-21b7e1b2-dh11   <none>           <none>
+## exit 0
+
+## 2026-09-29T15:22:00Z [node-data/after] K -n scen exec deploy/scratch -- cat /data/created
+Tue Sep 29 15:17:26 UTC 2026
+## exit 0
+
+## 2026-09-29T15:22:01Z [node-data/pods] K -n scen get pods -l app=scratch -o wide
+NAME                       READY   STATUS    RESTARTS   AGE     IP            NODE                                  NOMINATED NODE   READINESS GATES
+scratch-58d58ff7f5-5njp5   1/1     Running   0          4m52s   10.30.98.13   gke-upg-04b-work-pool-21b7e1b2-1cml   <none>           <none>
+## exit 0

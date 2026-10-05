@@ -81,6 +81,13 @@ unset _gke_dns_endpoint_helper
 # Request timeout for kubectl probes against live clusters in the installer.
 readonly KUBECTL_PROBE_REQUEST_TIMEOUT="10s"
 
+# ─── Scope cap ─────────────────────────────────────
+# The bounds the PlatformAgent puts on spec.scope.maxProjects (SCOPE_MAX_PROJECTS),
+# and its default, which the live-scope check reads an absent key as.
+readonly SCOPE_MAX_PROJECTS_MIN=1
+readonly SCOPE_MAX_PROJECTS_MAX=5000
+readonly SCOPE_MAX_PROJECTS_DEFAULT=100
+
 # ─── Helm Release Management Defaults ─────────────────────────────────────────
 # Operation timeout for an in-flight Helm install/upgrade across deploy workflows (10m).
 readonly HELM_OPERATION_TIMEOUT_DEFAULT=600
@@ -185,6 +192,17 @@ readonly SCOPE_PROBE_NOT_A_PERMISSION_ANSWER_PATTERN="SERVICE_DISABLED|has not b
 # may well be held, so it is not a permission answer either, and the remedy
 # is the token's scope, not a grant.
 readonly SCOPE_PROBE_TOKEN_SCOPE_PATTERN="insufficient authentication scopes|ACCESS_TOKEN_SCOPE_INSUFFICIENT"
+# The APIs the plan-time resolution of a selector reads
+# (terraform/modules/kube-agents-scope-resolver), per selector kind, billed to
+# the management project, which the resolver sends as the quota project: a
+# Metrics Scope's reads use the Monitoring and Resource Manager APIs, a Shared
+# VPC host's the Compute API, the same split the composition's API list makes
+# (terraform/examples/full-install/main.tf). The reads run in the plan and the
+# composition enables the APIs only in the apply that follows, so
+# enable_scope_selector_apis enables the ones not yet on before an install.sh
+# apply, and the dry-run skips its plan while one is off.
+readonly SCOPE_METRICS_SCOPE_APIS="cloudresourcemanager.googleapis.com monitoring.googleapis.com"
+readonly SCOPE_SHARED_VPC_HOST_APIS="compute.googleapis.com"
 # The three answers a container permission probe gives.
 readonly SCOPE_PROBE_GRANTED=0
 readonly SCOPE_PROBE_DENIED=1
@@ -291,6 +309,12 @@ is_valid_model_provider() {
 # reaches terraform.tfvars as a bare word HCL cannot parse.
 is_non_negative_integer() {
   [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+# LITELLM_REDACTION_IP_ACTION: what the gateway does with IP literals, the
+# chart's litellm.redaction.ip.action.
+is_valid_redaction_ip_action() {
+  [[ "${1:-}" =~ ^(mask|pseudonym|off)$ ]]
 }
 
 # The GCP IAM role bundles the install knows how to grant. Kubernetes RBAC is
@@ -403,6 +427,18 @@ is_truthy() {
   esac
 }
 
+# A spelling is_truthy reads as true, or one that plainly means false. For a
+# security toggle whose off state must not be reachable by a typo.
+is_bool_spelling() {
+  is_truthy "${1:-}" && return 0
+  local val="${1:-}"
+  val="${val//[[:space:]]/}"
+  case "$val" in
+    [Ff][Aa][Ll][Ss][Ee] | [Nn][Oo] | [Nn] | 0 | [Oo][Ff][Ff]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Checks if GKE databaseEncryption.state is a valid CMEK-encrypted state.
 #   - ENCRYPTED: Standard CMEK database encryption state in GKE
 #   - ALL_OBJECTS_ENCRYPTION_ENABLED: GKE 1.35+ Application-layer Secrets Encryption
@@ -499,7 +535,7 @@ load_install_env() {
   # and the Day-2 menu the file is the only way in. A value inherited from the
   # shell would declare a project the file does not record, and the next run
   # from a clean shell would drop it again and retire its profiles.
-  unset SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
+  unset SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_SHARED_VPC_HOSTS SCOPE_METRICS_SCOPES SCOPE_MAX_PROJECTS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
   [ -n "$file" ] && [ -f "$file" ] || return 1
   # Checked before sourcing: a stray quote would otherwise abort the caller
   # through its ERR trap with a bash parse error naming no file.
@@ -691,30 +727,6 @@ save_var() {
   chmod 600 "$VARS_FILE" 2>/dev/null || true
 
   umask "$old_umask"
-}
-
-save_secret_var() {
-  local var_name=$1
-  local var_val=$2
-  export "${var_name}=${var_val}"
-  if [ "${DRY_RUN:-0}" -eq 1 ]; then
-    return 0
-  fi
-  if is_truthy "${PERSIST_SECRETS_ON_DISK:-$DEFAULT_PERSIST_SECRETS_ON_DISK}"; then
-    save_var "$var_name" "$var_val"
-  else
-    if [ -f "$VARS_FILE" ]; then
-      local old_umask
-      old_umask=$(umask)
-      umask 077
-      chmod 600 "$VARS_FILE" 2>/dev/null || true
-      grep -E -v "^[[:space:]]*export[[:space:]]+${var_name}=" "$VARS_FILE" > "$VARS_FILE.tmp" 2>/dev/null || true
-      chmod 600 "$VARS_FILE.tmp" 2>/dev/null || true
-      mv "$VARS_FILE.tmp" "$VARS_FILE"
-      chmod 600 "$VARS_FILE" 2>/dev/null || true
-      umask "$old_umask"
-    fi
-  fi
 }
 
 # ─── Locations ────────────────────────────────────────────────────────────────
@@ -910,19 +922,44 @@ hcl_csv_list() {
   printf '%s]' "$out"
 }
 
-# The five SCOPE_* keys as the composition's `scope` object: `projects`,
-# `folders`, `organizations` and `exclude.projects` are lists like every other
-# list key, `exclude.clusters` is one project/location/cluster triple per
-# entry. Always a full block, empty lists included -- the reconcile reads an
-# emptied projects list as the declaration that drops projects, a container
-# leaving the list as the declaration that retires its members, and a missing
-# block as no declaration (docs/designs/multi-project-scope.md §7). Shape
-# only: the caller has already run require_scope_cluster_triples and
+# The eight SCOPE_* keys as the composition's `scope` object: `projects`,
+# `folders`, `organizations`, `shared_vpc_hosts`, `metrics_scopes` and
+# `exclude.projects` are lists like every other list key, `exclude.clusters`
+# is one project/location/cluster triple per entry, `max_projects` is the cap,
+# written only when SCOPE_MAX_PROJECTS is set. Always a full block, empty
+# lists included -- the reconcile reads an emptied projects list as the
+# declaration that drops projects, a container or selector leaving the list as
+# the declaration that retires its members, and a missing block as no
+# declaration (docs/designs/multi-project-scope.md §7). Shape only: the caller
+# has already run require_scope_cluster_triples and
 # require_scope_container_ids, and the patterns, caps and repeats the CRD
 # enforces are the module variable's validations, which fail the plan before
 # any binding.
+# SCOPE_MAX_PROJECTS is empty (the default cap) or a whole number within the
+# bounds the CRD puts on spec.scope.maxProjects, or the run stops before a
+# file is written and names the key and the bounds: the module's validation
+# would otherwise name neither. The digit count is checked before the
+# arithmetic: bash's base#digits wraps at 2^64 without a word, so a twenty-digit
+# value could otherwise read as one inside the bounds. $1 the value.
+require_scope_max_projects() {
+  local value="${1:-}" digits
+  [ -n "$value" ] || return 0
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    digits="$(printf '%s' "$value" | sed 's/^0*//')"
+    [ -n "$digits" ] || digits=0
+    if [ "${#digits}" -le "${#SCOPE_MAX_PROJECTS_MAX}" ] && [ "$((10#$digits))" -ge "$SCOPE_MAX_PROJECTS_MIN" ] && [ "$((10#$digits))" -le "$SCOPE_MAX_PROJECTS_MAX" ]; then
+      return 0
+    fi
+  fi
+  print_error "SCOPE_MAX_PROJECTS='${value}' is not a whole number from ${SCOPE_MAX_PROJECTS_MIN} to ${SCOPE_MAX_PROJECTS_MAX}, the bounds the PlatformAgent puts on spec.scope.maxProjects. Set one, or leave it empty for the default (${SCOPE_MAX_PROJECTS_DEFAULT}), in install.env."
+  return 1
+}
+
+# $8, the cap, is written only when set: unset, the module's and the CRD's
+# default (100) apply, and a tfvars that names no cap keeps reading the default
+# an operator never chose.
 hcl_scope_block() {
-  local projects="${1:-}" folders="${2:-}" organizations="${3:-}" exclude_projects="${4:-}" exclude_clusters="${5:-}"
+  local projects="${1:-}" folders="${2:-}" organizations="${3:-}" shared_vpc_hosts="${4:-}" metrics_scopes="${5:-}" exclude_projects="${6:-}" exclude_clusters="${7:-}" max_projects="${8:-}"
   local clusters="[" first=true entry project location cluster had_noglob=false
   local IFS=$', \t\n'
   case "$-" in *f*) had_noglob=true ;; esac
@@ -936,9 +973,73 @@ hcl_scope_block() {
   done
   $had_noglob || set +f
   clusters+="]"
-  printf 'scope = {\n  projects      = %s\n  folders       = %s\n  organizations = %s\n  exclude = {\n    projects = %s\n    clusters = %s\n  }\n}\n' \
+  printf 'scope = {\n  projects         = %s\n  folders          = %s\n  organizations    = %s\n  shared_vpc_hosts = %s\n  metrics_scopes   = %s\n' \
     "$(hcl_csv_list "$projects")" "$(hcl_csv_list "$folders")" "$(hcl_csv_list "$organizations")" \
+    "$(hcl_csv_list "$shared_vpc_hosts")" "$(hcl_csv_list "$metrics_scopes")"
+  if [ -n "$max_projects" ]; then
+    printf '  max_projects     = %s\n' "$max_projects"
+  fi
+  printf '  exclude = {\n    projects = %s\n    clusters = %s\n  }\n}\n' \
     "$(hcl_csv_list "$exclude_projects")" "$clusters"
+}
+
+# LITELLM_REDACTION_RULES, a JSON array of rule objects, as an HCL list for the
+# composition's litellm_redaction.rules. Shape only -- a list of objects whose
+# keys are name, pattern, literal and action, each a string; the name, the one
+# source and the action are the variable's validations. Strings are re-escaped
+# rather than copied: a regular expression may hold ${ or %{, which HCL would
+# read as a template. Prints nothing and returns 1, naming the key, on a value
+# it cannot use. Caller defines print_error.
+hcl_redaction_rules() {
+  local rules_json="${1:-}" out
+  if ! out="$(trap - ERR; printf '%s' "$rules_json" | python3 -c '
+import json, sys
+try:
+    rules = json.load(sys.stdin)
+except ValueError as e:
+    sys.exit(f"is not valid JSON ({e})")
+if not isinstance(rules, list):
+    sys.exit("must be a JSON array of rule objects")
+def hcl(s):
+    out = []
+    for ch in s:
+        if ch in "\\\"":
+            out.append("\\" + ch)
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ord(ch) < 0x20 or ord(ch) == 0x7f:
+            out.append("\\u%04x" % ord(ch))
+        else:
+            out.append(ch)
+    return "\"" + "".join(out).replace("${", "$${").replace("%{", "%%{") + "\""
+items = []
+for i, rule in enumerate(rules):
+    if not isinstance(rule, dict):
+        sys.exit(f"entry {i} is not an object")
+    if "name" not in rule:
+        sys.exit(f"entry {i} has no name; every rule needs one")
+    unknown = sorted(set(rule) - {"name", "pattern", "literal", "action"})
+    if unknown:
+        sys.exit(f"entry {i} has unknown key(s) {unknown}; a rule takes name, pattern or literal, and action")
+    for key, value in rule.items():
+        if not isinstance(value, str):
+            sys.exit(f"entry {i}: {key} must be a string")
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            sys.exit(f"entry {i}: {key} is not valid UTF-8 text (a lone \\u surrogate escape?)")
+    items.append("{ " + ", ".join(f"{k} = {hcl(v)}" for k, v in rule.items()) + " }")
+print("[" + ", ".join(items) + "]")
+' 2>&1)"; then
+    # To stderr: the caller runs this inside $(...), which would swallow it.
+    print_error "LITELLM_REDACTION_RULES ${out}. Fix it in install.env; the site's inference-gateway page shows the rule format." >&2
+    return 1
+  fi
+  printf '%s' "$out"
 }
 
 # Every SCOPE_FOLDERS and SCOPE_ORGANIZATIONS entry is a bare numeric ID, or
@@ -1003,15 +1104,16 @@ require_scope_cluster_triples() {
 #      holds the served one, and the retry must not read that as a hand edit;
 #   K  the scope the SCOPE_* keys declare now.
 #
-# Refused when L is present and non-empty, L != R and L != K: the CR carries a
+# Refused when L is present and non-empty (a list, an exclusion, or a cap off
+# the CRD's default), L != R and L != K: the CR carries a
 # declaration the installer did not write and the keys do not reproduce. Every
 # other case passes -- nothing live to protect; L == R, the installer wrote it
 # and the keys are the new declaration, emptying it included; L == K, the
 # operator recorded it. No PlatformAgent type served, no CR, no release: pass.
-# L, R and K are the projects, folders, organisations and exclusions; the
-# sharedVpcHosts and metricsScopes selectors phase 3 added are reported when
-# the CR carries them and never weighed, because the chart renders neither
-# and an apply leaves them as they are.
+# L, R and K are the projects, folders, organisations, Shared VPC hosts,
+# Metrics Scopes and exclusions, every list the chart renders, since a list it
+# renders is one the apply replaces, and the cap, which the apply sets the same
+# way (a CR at the CRD's default reads as the key unset).
 # Anything that stops the read -- no context for this install in the
 # kubeconfig, the CR or the record unreadable -- is a refusal, because the
 # apply itself needs no kubeconfig (the helm provider authenticates with a
@@ -1080,7 +1182,8 @@ print(max(served) if served else "")
 import json, re, sys
 cr_text, record_text, served_text = sys.stdin.read().split("\x1e\n", 2)
 ok, refuse = sys.argv[1], sys.argv[2]
-keys = sys.argv[3:8]
+keys = sys.argv[3:11]
+default_cap = int(sys.argv[11])
 
 def split(value):
     return [item for item in re.split(r"[,\s]+", value) if item]
@@ -1095,12 +1198,19 @@ def normalise(scope):
         "projects": sorted(set(scope.get("projects") or [])),
         "folders": sorted(set(scope.get("folders") or [])),
         "organizations": sorted(set(scope.get("organizations") or [])),
+        "sharedVpcHosts": sorted(set(scope.get("sharedVpcHosts") or [])),
+        "metricsScopes": sorted(set(scope.get("metricsScopes") or [])),
+        "maxProjects": int(scope.get("maxProjects") or default_cap),
         "exclude": {"projects": sorted(set(exclude.get("projects") or [])), "clusters": clusters},
     }
 
 def is_empty(scope):
+    # Nothing live to protect: no list, no exclusion, and the cap at the default
+    # the CRD sets, which is what the apply renders for a key left unset.
     return not (scope["projects"] or scope["folders"] or scope["organizations"]
-                or scope["exclude"]["projects"] or scope["exclude"]["clusters"])
+                or scope["sharedVpcHosts"] or scope["metricsScopes"]
+                or scope["exclude"]["projects"] or scope["exclude"]["clusters"]
+                or scope["maxProjects"] != default_cap)
 
 items = json.loads(cr_text).get("items") or []
 if len(items) > 1:
@@ -1110,16 +1220,8 @@ if live_raw is None:
     print(ok)
     sys.exit(0)
 live = normalise(live_raw)
-# The two selectors phase 3 added to the CR. The chart renders neither and
-# the installer has no key for them, so an apply leaves them as they are; they
-# are reported on the second output line, never weighed in the verdict.
-containers = " ".join(
-    k + ": " + " ".join(sorted(set(live_raw.get(k) or [])))
-    for k in ("sharedVpcHosts", "metricsScopes") if live_raw.get(k)
-)
 if is_empty(live):
     print(ok)
-    print(containers)
     sys.exit(0)
 def recorded(text):
     raw = ((json.loads(text or "{}") or {}).get("platformAgent") or {}).get("scope")
@@ -1130,24 +1232,30 @@ declared = normalise({
     "projects": split(keys[0]),
     "folders": split(keys[1]),
     "organizations": split(keys[2]),
+    "sharedVpcHosts": split(keys[3]),
+    "metricsScopes": split(keys[4]),
+    "maxProjects": int(keys[7]) if keys[7].strip() else default_cap,
     "exclude": {
-        "projects": split(keys[3]),
-        "clusters": [dict(zip(("projectId", "location", "clusterName"), t.split("/"))) for t in split(keys[4])],
+        "projects": split(keys[5]),
+        "clusters": [dict(zip(("projectId", "location", "clusterName"), t.split("/"))) for t in split(keys[6])],
     },
 })
 if live in records or live == declared:
     print(ok)
-    print(containers)
     sys.exit(0)
 print(refuse)
-print(containers)
 print(items[0]["metadata"]["name"])
 print("SCOPE_PROJECTS=" + json.dumps(" ".join(live["projects"])))
 print("SCOPE_FOLDERS=" + json.dumps(" ".join(live["folders"])))
 print("SCOPE_ORGANIZATIONS=" + json.dumps(" ".join(live["organizations"])))
+print("SCOPE_SHARED_VPC_HOSTS=" + json.dumps(" ".join(live["sharedVpcHosts"])))
+print("SCOPE_METRICS_SCOPES=" + json.dumps(" ".join(live["metricsScopes"])))
 print("SCOPE_EXCLUDE_PROJECTS=" + json.dumps(" ".join(live["exclude"]["projects"])))
 print("SCOPE_EXCLUDE_CLUSTERS=" + json.dumps(" ".join("/".join(c) for c in live["exclude"]["clusters"])))
-' "$SCOPE_VERDICT_OK" "$SCOPE_VERDICT_REFUSE" "${SCOPE_PROJECTS:-}" "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" 2>"$err_file")"; then
+# Always among the lines: when the cap is why the compare refused, the key the
+# operator has to change may be one they must blank, not set.
+print("SCOPE_MAX_PROJECTS=" + json.dumps(str(live["maxProjects"]) if live["maxProjects"] != default_cap else ""))
+' "$SCOPE_VERDICT_OK" "$SCOPE_VERDICT_REFUSE" "${SCOPE_PROJECTS:-}" "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" "${SCOPE_SHARED_VPC_HOSTS:-}" "${SCOPE_METRICS_SCOPES:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" "${SCOPE_MAX_PROJECTS:-}" "$SCOPE_MAX_PROJECTS_DEFAULT" 2>"$err_file")"; then
     _scope_check_failed "$mode" "the live and recorded scope could not be compared: $(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
     local rc=$?
     rm -f "$err_file"
@@ -1155,15 +1263,9 @@ print("SCOPE_EXCLUDE_CLUSTERS=" + json.dumps(" ".join("/".join(c) for c in live[
   fi
   rm -f "$err_file"
   first_line="${verdict%%$'\n'*}"
-  local containers lines cr_name
-  lines="${verdict#*$'\n'}"
-  [ "$lines" != "$verdict" ] || lines=""
-  containers="${lines%%$'\n'*}"
-  if [ -n "$containers" ]; then
-    print_info "The PlatformAgent also declares ${containers}, which the installer has no key for yet; this apply renders neither selector and leaves them as they are."
-  fi
   [ "$first_line" != "$SCOPE_VERDICT_OK" ] || return 0
-  lines="${lines#*$'\n'}"
+  local lines cr_name
+  lines="${verdict#*$'\n'}"
   cr_name="${lines%%$'\n'*}"
   lines="${lines#*$'\n'}"
   if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
@@ -1272,6 +1374,67 @@ check_scope_container_access() {
   for entry in "${failures[@]}"; do print_error "Refusing to apply: ${entry}"; done
   print_info "Nothing was changed. Fix what is named above, or edit SCOPE_FOLDERS and SCOPE_ORGANIZATIONS in install.env, and re-run."
   return 1
+}
+
+# Prints, space-separated, the APIs the plan reads for the selectors the
+# environment declares (SCOPE_METRICS_SCOPE_APIS for SCOPE_METRICS_SCOPES,
+# SCOPE_SHARED_VPC_HOST_APIS for SCOPE_SHARED_VPC_HOSTS); nothing when neither
+# is declared.
+scope_selector_apis() {
+  local apis=""
+  if [[ "${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]]; then
+    apis="$SCOPE_METRICS_SCOPE_APIS"
+  fi
+  if [[ "${SCOPE_SHARED_VPC_HOSTS:-}" == *[![:space:],]* ]]; then
+    apis+="${apis:+ }$SCOPE_SHARED_VPC_HOST_APIS"
+  fi
+  printf '%s' "$apis"
+}
+
+# Prints the APIs of scope_selector_apis not enabled in project $1,
+# space-separated (nothing when all are on); returns 1 when the listing
+# failed, and the caller decides what that means. Read through gcloud's
+# active account, whose answer does not depend on who asks.
+scope_selector_apis_missing() {
+  local project="$1" enabled api missing=""
+  enabled="$(trap - ERR; gcloud services list --enabled --project "$project" --format='value(config.name)' 2>/dev/null)" || return 1
+  for api in $(scope_selector_apis); do
+    grep -qx "$api" <<<"$enabled" || missing+="${missing:+ }$api"
+  done
+  printf '%s' "$missing"
+}
+
+# Enables, in the management project, whichever of the APIs the plan-time
+# resolution of the declared Shared VPC hosts or Metrics Scopes reads
+# (scope_selector_apis) is not enabled yet. The reads run in the plan and are
+# billed to that project, and the composition enables the APIs only in the
+# apply that follows, so a first install that declared a selector would
+# otherwise be refused at plan with the API reported disabled. Nothing is
+# called when every API is on already, which is every re-run and every Day-2
+# apply of an existing install, and nothing when no selector is declared. The
+# enable runs as gcloud's active account, like the KMS enablement beside it;
+# a failure is a warning and the run goes on, because the plan reports a
+# disabled API with the same command as the remedy, and an account that
+# cannot enable services may still not be the one Terraform applies with.
+# Runs where the apply is about to happen, never on a plan or a generate-only
+# run, whose handoff names the command instead. $1 the project (PROJECT_ID by
+# default). Caller defines print_info / print_warning.
+enable_scope_selector_apis() {
+  [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]] || return 0
+  local project="${1:-${PROJECT_ID:-}}" missing rc=0
+  missing="$(scope_selector_apis_missing "$project")" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    missing="$(scope_selector_apis)"
+    print_info "The enabled APIs of project '${project}' could not be listed; enabling ${missing// /, }, which the plan's lookup of the declared Shared VPC host or Metrics Scope reads and which is idempotent..."
+  elif [ -z "$missing" ]; then
+    return 0
+  else
+    print_info "Enabling ${missing// /, } in project '${project}': the plan resolves the declared Shared VPC host or Metrics Scope through it, before the apply that would otherwise enable it..."
+  fi
+  # shellcheck disable=SC2086
+  if ! (trap - ERR; gcloud services enable $missing --project="$project"); then
+    print_warning "Could not enable ${missing// /, } in project '${project}' as gcloud's active account. If the plan is refused with the API reported disabled, enable it with an account that can (gcloud services enable ${missing} --project=${project}) and re-run."
+  fi
 }
 
 # The credentials the google provider will apply with, read in its own order
@@ -2752,6 +2915,28 @@ write_tfvars_from_state() {
   # terraform with a message naming neither the key nor the entry.
   require_scope_cluster_triples "${SCOPE_EXCLUDE_CLUSTERS:-}" || return 1
   require_scope_container_ids "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" || return 1
+  require_scope_max_projects "${SCOPE_MAX_PROJECTS:-}" || return 1
+  # Checked here for the MODEL_MAX_TOKENS reason: upgrade.sh and uninstall.sh
+  # regenerate from install.env without install.sh's checks. A misspelt toggle
+  # is refused rather than read as off, which would forward requests
+  # unredacted while the file says otherwise. While it is off the other three
+  # keys are inert, as they are in the chart, and are neither read nor checked.
+  local redaction_enabled="${LITELLM_REDACTION_ENABLED:-$DEFAULT_LITELLM_REDACTION_ENABLED}"
+  if ! is_bool_spelling "$redaction_enabled"; then
+    print_error "LITELLM_REDACTION_ENABLED='${redaction_enabled}' is neither true nor false. Fix it in install.env."
+    return 1
+  fi
+  local redaction_ip_action="" redaction_rules="[]"
+  if is_truthy "$redaction_enabled"; then
+    redaction_ip_action="${LITELLM_REDACTION_IP_ACTION:-$DEFAULT_LITELLM_REDACTION_IP_ACTION}"
+    if ! is_valid_redaction_ip_action "$redaction_ip_action"; then
+      print_error "LITELLM_REDACTION_IP_ACTION='${redaction_ip_action}' is not one of mask, pseudonym, off. Fix it in install.env."
+      return 1
+    fi
+    if [ -n "${LITELLM_REDACTION_RULES:-}" ]; then
+      redaction_rules="$(hcl_redaction_rules "$LITELLM_REDACTION_RULES")" || return 1
+    fi
+  fi
 
   local old_umask
   old_umask="$(umask)"
@@ -2805,6 +2990,19 @@ write_tfvars_from_state() {
     echo "vertex_location    = $(hcl_str "${VERTEX_LOCATION:-}")"
     echo "vertex_manage_serving_project = $(hcl_bool "${VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}")"
     echo ""
+    echo "# Gateway redaction (LITELLM_REDACTION_* in install.env). The composition"
+    echo "# renders nothing into the chart while enabled is false."
+    if is_truthy "$redaction_enabled"; then
+      echo "litellm_redaction = {"
+      echo "  enabled     = true"
+      echo "  ip_action   = $(hcl_str "$redaction_ip_action")"
+      echo "  allow_cidrs = $(hcl_csv_list "${LITELLM_REDACTION_IP_ALLOW_CIDRS:-}")"
+      echo "  rules       = ${redaction_rules}"
+      echo "}"
+    else
+      echo "litellm_redaction = { enabled = false }"
+    fi
+    echo ""
     if is_truthy "${PERSIST_SECRETS_ON_DISK:-$DEFAULT_PERSIST_SECRETS_ON_DISK}"; then
       echo "api_server_key    = $(hcl_str "${API_SERVER_KEY:-}")"
       echo "gemini_api_key    = $(hcl_str "${GEMINI_API_KEY:-}")"
@@ -2827,14 +3025,16 @@ write_tfvars_from_state() {
       echo "project_roles  = $(hcl_csv_list "${PLATFORM_AGENT_CUSTOM_ROLES:-}")"
     fi
     echo ""
-    echo "# The projects, folders and organisations beyond project_id whose GKE clusters"
-    echo "# get a Cluster Agent, and what to leave unmanaged (SCOPE_PROJECTS, SCOPE_FOLDERS,"
-    echo "# SCOPE_ORGANIZATIONS, SCOPE_EXCLUDE_PROJECTS, SCOPE_EXCLUDE_CLUSTERS in"
-    echo "# install.env). Always written, so this file states the declaration the"
-    echo "# composition renders either way, empty lists included; an emptied list is the"
-    echo "# declaration that drops what it named."
+    echo "# The projects, folders, organisations, Shared VPC hosts and Metrics Scopes"
+    echo "# beyond project_id whose GKE clusters get a Cluster Agent, and what to leave"
+    echo "# unmanaged (SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS,"
+    echo "# SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_MAX_PROJECTS, SCOPE_EXCLUDE_PROJECTS,"
+    echo "# SCOPE_EXCLUDE_CLUSTERS in install.env). Always written, so this file states"
+    echo "# the declaration the composition renders either way, empty lists included; an"
+    echo "# emptied list is the declaration that drops what it named."
     hcl_scope_block "${SCOPE_PROJECTS:-}" "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" \
-      "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}"
+      "${SCOPE_SHARED_VPC_HOSTS:-}" "${SCOPE_METRICS_SCOPES:-}" \
+      "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" "${SCOPE_MAX_PROJECTS:-}"
     echo ""
     local chat_topic="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
     local chat_sub="${CHAT_SUB_NAME:-$DEFAULT_CHAT_SUB_NAME}"
@@ -2891,6 +3091,31 @@ write_tfvars_from_state() {
     echo "# Optional AgentPlugins"
     echo "enable_pubsub_platform       = $(hcl_bool "${ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}")"
     echo "enable_stockout_investigator = $(hcl_bool "${ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}")"
+    # Written only when on, and both keys together, which is the one place in
+    # this file that omits a key rather than writing false.
+    #
+    # enable_drift_pubsub is also reachable on its own as a TF_VAR_ line in
+    # install.env, and a tfvars key beats TF_VAR_. Writing "false" here
+    # unconditionally would therefore override an install already running the
+    # ingress that way and destroy its sink, topic and subscription on the next
+    # upgrade -- from a release note nobody read. Omitted, that install is
+    # untouched; the front doors turn drift detection off again by dropping
+    # both keys, which is the ordinary teardown the other flags get from
+    # writing false.
+    # is_truthy, not a compare against the lowercase literal: every other
+    # boolean here reaches hcl_bool -> is_truthy, which takes True/yes/y/1/on,
+    # and install.env is hand-written. A string compare would read
+    # ENABLE_DRIFT_DETECTOR=True as off and silently provision nothing
+    # (install.sh says the same about GOOGLE_CHAT_ENABLED, for the same
+    # reason).
+    if is_truthy "${ENABLE_DRIFT_DETECTOR:-$DEFAULT_ENABLE_DRIFT_DETECTOR}"; then
+      echo ""
+      echo "# Out-of-band change detection: the audit-log ingress and the consumer"
+      echo "# that reads it. Both, because the detector reads the subscription the"
+      echo "# first one provisions and the composition refuses the apply otherwise."
+      echo "enable_drift_pubsub   = true"
+      echo "enable_drift_detector = true"
+    fi
   } > "${dest}.tmp"
   chmod 600 "${dest}.tmp"
   mv -f -- "${dest}.tmp" "$dest"

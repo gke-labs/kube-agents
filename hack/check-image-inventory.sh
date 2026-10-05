@@ -40,8 +40,9 @@ readonly LABEL_MIRRORED="a mirrored install"
 # slash and a colon in it — cannot tell an image from any other reference-like
 # value: githubMinter's ISSUER_ALLOWLIST is two https:// URLs joined by a comma
 # and matches that shape exactly, so it was reported as an image rendered
-# outside the mirror (#1139). The chart emits three names the pattern below
-# catches: PLATFORM_AGENT_IMAGE, AGENT_SANDBOX_IMAGE and FLUENT_BIT_IMAGE.
+# outside the mirror (#1139). The chart emits four names the pattern below
+# catches: OPERATOR_IMAGE, PLATFORM_AGENT_IMAGE, AGENT_SANDBOX_IMAGE and
+# FLUENT_BIT_IMAGE.
 readonly IMAGE_ENV_NAME_RE='^[[:space:]]*-[[:space:]]+name:[[:space:]]*[A-Z0-9_]*_IMAGE[[:space:]]*$'
 readonly VALUE_FIELD_RE='^[[:space:]]*value:[[:space:]]*'
 
@@ -143,23 +144,23 @@ check_base_image golang k8s-operator/Dockerfile GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static k8s-operator/Dockerfile DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image python examples/inference-replay/replay-proxy/Dockerfile PYTHON_IMAGE PYTHON_VERSION
 check_base_image python deploy/sandbox/Dockerfile PYTHON_IMAGE PYTHON_VERSION
-# The a2a images. All parameterize their builder bases: the auth callout on
-# this branch, the gateway on main in #1334.
+# The a2a images. All parameterize their builder bases: the auth callout and
+# the gateway already did, the worker arrived with #1334, and the capability
+# verifier is added here.
 check_base_image golang a2a/Dockerfile.authcallout GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static a2a/Dockerfile.authcallout DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image golang a2a/Dockerfile.gateway GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static a2a/Dockerfile.gateway DISTROLESS_IMAGE DISTROLESS_VERSION
+check_base_image golang a2a/Dockerfile.verifier GOLANG_IMAGE GOLANG_VERSION
+check_base_image distroless-static a2a/Dockerfile.verifier DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image golang a2a/Dockerfile.worker GOLANG_IMAGE GOLANG_VERSION
 check_base_image node a2a/Dockerfile.worker NODE_IMAGE NODE_VERSION
-# The Hermes bridge sidecar (a2a/Dockerfile.hermes-bridge) is deliberately NOT
-# an inventory entry, and only its builder base is checked. This script guards
-# the images an install pulls; the bridge is an eval-only image that
-# deploy/docker/cloudbuild-ci.yaml builds under EVAL_MODE_NEXT=1 for the
-# presubmit's install and nothing else pulls (a2a/docs/hermes-bridge.md,
-# provenance; the A2A owner's condition on #1661). Its runtime base is the
-# platform-agent image of the same build, passed as a build arg with no
-# default, so there is no runtime pin here to compare against either. It
-# joins the inventory at stage-2 graduation, if it graduates.
+# The Hermes bridge sidecar (a2a/Dockerfile.hermes-bridge) has only its
+# builder base to compare: its runtime base is the platform-agent image of the
+# same build, passed as a build arg with no default, so there is no runtime
+# pin in the Dockerfile. The image itself is a first-party inventory entry
+# (hermes-bridge), published by the release workflow beside the three A2A
+# images.
 check_base_image golang a2a/Dockerfile.hermes-bridge GOLANG_IMAGE GOLANG_VERSION
 
 # The Go builder and k8s-operator/go.mod's `go` directive must name the same
@@ -212,6 +213,7 @@ check_go_directive deploy/docker/Dockerfile GOLANG_VERSION
 check_go_directive k8s-operator/Dockerfile GOLANG_VERSION
 check_go_directive a2a/Dockerfile.authcallout GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.gateway GOLANG_VERSION a2a/go.mod
+check_go_directive a2a/Dockerfile.verifier GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.worker GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.hermes-bridge GOLANG_VERSION a2a/go.mod
 
@@ -243,15 +245,19 @@ jq -r '.images[] | select(.tagFrom) | "\(.name)\t\(.tagFrom.file)\t\(.tagFrom.ke
 #    them (#1557). The constants keep Docker Hub's short spelling because that
 #    is the string the operator renders into the pod template; the comparison
 #    is on the normalised form, the same way check 1 reads a Dockerfile ARG.
-#    The first-party next defaults (gateway, worker, callout) fit the same
-#    description and are deliberately not here: they are not inventory
-#    entries, so there is nothing to hold them to until the stack graduates.
+#    The first-party next defaults (gateway, worker, callout, capability
+#    verifier) are release images with no fixed tag in the inventory, so the
+#    operator compiles in the bare image name and takes registry and tag from
+#    its own or the agent image; the second check below holds each name to the
+#    inventory's entry, and that entry's repository to the name under the
+#    agent image's registry, which is what the operator renders when nothing
+#    overrides it.
 # ---------------------------------------------------------------------------
 check_operator_pin() {
   local name=$1 gofile=$2 constant=$3
   local want got
   want="$(normalise "$(repo_of "$name")"):$(pin_of "$name")"
-  got="$(sed -n "s/^[[:space:]]*${constant}[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$gofile" | head -n1)"
+  got="$(sed -n "s|^[[:space:]]*${constant}[[:space:]]*=[[:space:]]*\"\([^\"]*\)\"[[:space:]]*\(//.*\)\{0,1\}\$|\1|p" "$gofile" | head -n1)"
   [ "$(normalise "$got")" = "$want" ] ||
     fail "$gofile: $constant is '${got:-<unset>}', but $INVENTORY has '$want' for '$name'."
 }
@@ -259,6 +265,43 @@ check_operator_pin() {
 check_operator_pin fluent-bit k8s-operator/internal/controller/manifest_helpers.go fallbackFluentBitImage
 check_operator_pin nats k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2ANATSImage
 check_operator_pin nats-box k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2AProvisionImage
+
+# A compiled image name for a release image the operator renders: the
+# constant must be the inventory entry's name, and the entry's repository
+# must be that name beside platform-agent's, since the operator derives the
+# registry from the agent image and never from the constant. Each capture
+# below takes a lone string literal (a trailing comment allowed) and nothing
+# else, so a constant built by concatenation reads as unset rather than as
+# its first piece.
+check_compiled_image_name() {
+  local name=$1 gofile=$2 constant=$3
+  local want_repo got
+  want_repo="$(dirname "$(repo_of platform-agent)")/${name}"
+  got="$(sed -n "s|^[[:space:]]*${constant}[[:space:]]*=[[:space:]]*\"\([^\"]*\)\"[[:space:]]*\(//.*\)\{0,1\}\$|\1|p" "$gofile" | head -n1)"
+  [ "$got" = "$name" ] ||
+    fail "$gofile: $constant is '${got:-<unset>}', but $INVENTORY names the image '$name'."
+  [ "$(repo_of "$name")" = "$want_repo" ] ||
+    fail "$INVENTORY: '$name' has repository '$(repo_of "$name")', but the operator renders it as '$want_repo' (the name beside platform-agent) when nothing overrides it."
+}
+
+# A compiled repository for a release image: the constant must be the
+# inventory's repository, character for character, since the tag is not the
+# constant's to know. The gateway binary keeps its own copy of the worker
+# repository for a run outside the operator, which it concatenates whole.
+check_compiled_repository() {
+  local name=$1 gofile=$2 constant=$3
+  local want got
+  want="$(repo_of "$name")"
+  got="$(sed -n "s|^[[:space:]]*${constant}[[:space:]]*=[[:space:]]*\"\([^\"]*\)\"[[:space:]]*\(//.*\)\{0,1\}\$|\1|p" "$gofile" | head -n1)"
+  [ "$got" = "$want" ] ||
+    fail "$gofile: $constant is '${got:-<unset>}', but $INVENTORY has repository '$want' for '$name'."
+}
+
+check_compiled_image_name a2a-gateway k8s-operator/internal/controller/platformagent_a2a_manifests.go a2aGatewayImageName
+check_compiled_image_name a2a-worker k8s-operator/internal/controller/platformagent_a2a_manifests.go a2aWorkerImageName
+check_compiled_image_name a2a-authcallout k8s-operator/internal/controller/platformagent_a2a_callout.go a2aCalloutImageName
+check_compiled_image_name a2a-verifier k8s-operator/internal/controller/platformagent_a2a_verifier.go a2aVerifierImageName
+check_compiled_repository a2a-worker a2a/gateway/config.go defaultWorkerRepository
 
 # ---------------------------------------------------------------------------
 # 3. The chart. Rendering it is the only way to see what it actually pulls:

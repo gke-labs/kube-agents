@@ -18,6 +18,8 @@ package controller
 
 import (
 	"fmt"
+	"path"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -169,6 +171,185 @@ func TestShellSandboxStatefulSetHasNoKubernetesCredential(t *testing.T) {
 	}
 	if !mount.ReadOnly {
 		t.Errorf("expected %q to be mounted read-only", shellSandboxHermesHomeVolume)
+	}
+	// The init container runs as root with CHOWN, so it reaches less than the
+	// shell does: the data volume and nothing else.
+	for _, init := range pod.InitContainers {
+		for _, m := range init.VolumeMounts {
+			if m.Name != shellSandboxDataVolume {
+				t.Errorf("init container %q mounts %q; it may mount only %q", init.Name, m.Name, shellSandboxDataVolume)
+			}
+		}
+	}
+}
+
+// shellSandboxImageTreeTestContainers returns the rendered init container and
+// shell container.
+func shellSandboxImageTreeTestContainers(t *testing.T) (corev1.Container, corev1.Container) {
+	t.Helper()
+	pod := buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "http://broker:8080", "settings-hash").Spec.Template.Spec
+	if len(pod.InitContainers) != 1 || len(pod.Containers) != 1 {
+		t.Fatalf("expected one init container and one container, got %d and %d", len(pod.InitContainers), len(pod.Containers))
+	}
+	return pod.InitContainers[0], pod.Containers[0]
+}
+
+// The trusted side runs the shipped scripts and loads the shipped skills by
+// path, so a tree the model can write is a tree it can plant code in. Each one
+// has to be a read-only mount of its own, and no writable mount may sit on top
+// of it.
+func TestShellSandboxImageTreesAreReadOnlyMounts(t *testing.T) {
+	_, shell := shellSandboxImageTreeTestContainers(t)
+	byPath := map[string]corev1.VolumeMount{}
+	for _, m := range shell.VolumeMounts {
+		byPath[m.MountPath] = m
+	}
+	for _, home := range shellSandboxImageTreeHomes {
+		for _, tree := range shellSandboxImageTrees {
+			subPath := path.Join(home, tree)
+			treePath := path.Join(shellSandboxDataPath, subPath)
+			m, ok := byPath[treePath]
+			if !ok {
+				t.Errorf("expected a mount at %s", treePath)
+				continue
+			}
+			if m.Name != shellSandboxDataVolume || m.SubPath != subPath || !m.ReadOnly {
+				t.Errorf("expected %s to be a read-only mount of %q with subPath %q, got %#v",
+					treePath, shellSandboxDataVolume, subPath, m)
+			}
+			for _, other := range shell.VolumeMounts {
+				if !other.ReadOnly && (other.MountPath == treePath || strings.HasPrefix(other.MountPath, treePath+"/")) {
+					t.Errorf("writable mount %#v covers the image tree %s", other, treePath)
+				}
+			}
+		}
+	}
+}
+
+// rename(2) checks only the dentry it renames, so a read-only tree under a
+// renamable directory moves away with it and a writable tree can be made at the
+// old path. Every directory between the data root and a tree has to be a mount
+// point too. Generic on purpose: a home added to shellSandboxImageTreeHomes
+// without its pins fails here.
+func TestShellSandboxPinsEveryAncestorOfAnImageTree(t *testing.T) {
+	_, shell := shellSandboxImageTreeTestContainers(t)
+	byPath := map[string]corev1.VolumeMount{}
+	for _, m := range shell.VolumeMounts {
+		byPath[m.MountPath] = m
+	}
+	var trees int
+	for _, m := range shell.VolumeMounts {
+		if m.Name != shellSandboxDataVolume || !m.ReadOnly {
+			continue
+		}
+		trees++
+		for dir := path.Dir(m.MountPath); dir != shellSandboxDataPath; dir = path.Dir(dir) {
+			if !strings.HasPrefix(dir, shellSandboxDataPath+"/") {
+				t.Fatalf("read-only data mount %s is not under %s", m.MountPath, shellSandboxDataPath)
+			}
+			pin, ok := byPath[dir]
+			wantSubPath := strings.TrimPrefix(dir, shellSandboxDataPath+"/")
+			if !ok || pin.Name != shellSandboxDataVolume || pin.SubPath != wantSubPath {
+				t.Errorf("%s sits above the read-only mount %s, so it must be a mount of %q with subPath %q; got %#v",
+					dir, m.MountPath, shellSandboxDataVolume, wantSubPath, pin)
+			}
+		}
+	}
+	if want := len(shellSandboxImageTreeHomes) * len(shellSandboxImageTrees); trees != want {
+		t.Errorf("expected %d read-only data mounts, got %d", want, trees)
+	}
+}
+
+// The subPaths above are resolved when kubelet creates the shell container, so
+// the trees have to be staged, root-owned, before that. The init container that
+// does it runs as root with CHOWN, and must hold nothing else.
+func TestShellSandboxPreparesImageTreesBeforeTheShell(t *testing.T) {
+	init, shell := shellSandboxImageTreeTestContainers(t)
+	if init.Name != shellSandboxImageTreesInitContainerName {
+		t.Errorf("expected the init container %q, got %q", shellSandboxImageTreesInitContainerName, init.Name)
+	}
+	if init.Image != shell.Image {
+		t.Errorf("the init container must stage what the shell's image ships: image %q, shell %q", init.Image, shell.Image)
+	}
+	if init.Command != nil || !slices.Equal(init.Args, []string{"--prepare-image-trees"}) {
+		t.Errorf("expected the image's entrypoint with args [--prepare-image-trees], got command %v args %v", init.Command, init.Args)
+	}
+	if len(init.VolumeMounts) != 1 {
+		t.Fatalf("expected the data volume and nothing else, got %#v", init.VolumeMounts)
+	}
+	if m := init.VolumeMounts[0]; m.Name != shellSandboxDataVolume || m.MountPath != shellSandboxDataPath || m.SubPath != "" || m.ReadOnly {
+		t.Errorf("expected %q writable at %s with no subPath, got %#v", shellSandboxDataVolume, shellSandboxDataPath, m)
+	}
+	for _, e := range init.Env {
+		if e.Name != shellSandboxHomeRootsEnvVar {
+			t.Errorf("the init container needs only %s, got %s", shellSandboxHomeRootsEnvVar, e.Name)
+		}
+	}
+	if len(init.EnvFrom) != 0 {
+		t.Errorf("the init container must take no env from a Secret or ConfigMap, got %#v", init.EnvFrom)
+	}
+	sc := init.SecurityContext
+	if sc == nil || sc.Capabilities == nil {
+		t.Fatal("expected a securityContext with capabilities on the init container")
+	}
+	if !slices.Equal(sc.Capabilities.Drop, []corev1.Capability{"ALL"}) {
+		t.Errorf("expected drop [ALL], got %v", sc.Capabilities.Drop)
+	}
+	added := slices.Clone(sc.Capabilities.Add)
+	slices.Sort(added)
+	if !slices.Equal(added, []corev1.Capability{"CHOWN", "DAC_OVERRIDE", "FOWNER"}) {
+		t.Errorf("expected add [CHOWN DAC_OVERRIDE FOWNER], got %v", sc.Capabilities.Add)
+	}
+	if sc.ReadOnlyRootFilesystem == nil || !*sc.ReadOnlyRootFilesystem {
+		t.Error("the prepare mode writes nothing outside the data volume, so the root filesystem must be read-only")
+	}
+	if sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
+		t.Error("expected allowPrivilegeEscalation: false")
+	}
+	if sc.SeccompProfile == nil || sc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+		t.Errorf("expected the RuntimeDefault seccomp profile, got %+v", sc.SeccompProfile)
+	}
+	// Mirrors the shell: neither sets a uid, so both run as the image's root.
+	if sc.RunAsUser != nil || sc.RunAsNonRoot != nil {
+		t.Errorf("the entrypoint needs root to chown; got runAsUser %v runAsNonRoot %v", sc.RunAsUser, sc.RunAsNonRoot)
+	}
+	if init.Resources.Requests == nil || init.Resources.Limits == nil {
+		t.Fatal("expected both resource requests and limits: the baseline quota rejects a pod that omits either")
+	}
+	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+		initRequest, shellRequest := init.Resources.Requests[name], shell.Resources.Requests[name]
+		if initRequest.Cmp(shellRequest) >= 0 {
+			t.Errorf("the init container's %s request %s must stay below the shell's %s, or the chart footprint undercounts",
+				name, initRequest.String(), shellRequest.String())
+		}
+	}
+}
+
+// The mounts and the entrypoint's gate are two expressions of one list, and the
+// entrypoint reads its half from these variables.
+func TestShellSandboxImageTreeEnvAgrees(t *testing.T) {
+	init, shell := shellSandboxImageTreeTestContainers(t)
+	envOf := func(c corev1.Container) map[string]string {
+		out := map[string]string{}
+		for _, e := range c.Env {
+			out[e.Name] = e.Value
+		}
+		return out
+	}
+	initEnv, shellEnv := envOf(init), envOf(shell)
+	if got := shellEnv["SANDBOX_IMAGE_TREES"]; got != "read-only-mounts" {
+		t.Errorf("expected SANDBOX_IMAGE_TREES=read-only-mounts on the shell, got %q", got)
+	}
+	if _, ok := initEnv["SANDBOX_IMAGE_TREES"]; ok {
+		t.Error("SANDBOX_IMAGE_TREES selects the shell's gate; the init container has no use for it")
+	}
+	if !slices.Equal(shellSandboxImageTreeHomes, []string{"", "profiles/platform"}) {
+		t.Errorf("the entrypoint's SANDBOX_HOME_ROOTS default is \". profiles/platform\"; homes are %q", shellSandboxImageTreeHomes)
+	}
+	for name, env := range map[string]map[string]string{"init": initEnv, "shell": shellEnv} {
+		if got := env["SANDBOX_HOME_ROOTS"]; got != ". profiles/platform" {
+			t.Errorf("expected SANDBOX_HOME_ROOTS=%q on the %s container, got %q", ". profiles/platform", name, got)
+		}
 	}
 }
 
@@ -342,9 +523,13 @@ func TestShellSandboxMountsMatchTheImage(t *testing.T) {
 	if len(containers) != 1 {
 		t.Fatalf("expected a single container, got %d", len(containers))
 	}
+	// Whole-volume mounts only: the data volume also appears as the image-tree
+	// subPath mounts, which TestShellSandboxImageTreesAreReadOnlyMounts covers.
 	mounts := map[string]corev1.VolumeMount{}
 	for _, m := range containers[0].VolumeMounts {
-		mounts[m.Name] = m
+		if m.SubPath == "" {
+			mounts[m.Name] = m
+		}
 	}
 	if got := mounts[shellSandboxKeysVolume]; got.MountPath != shellSandboxKeysPath || !got.ReadOnly {
 		t.Errorf("expected %s mounted read-only at %s, got %#v", shellSandboxKeysVolume, shellSandboxKeysPath, got)
@@ -1236,11 +1421,12 @@ func TestSandboxWrappersPostToTheBrokerService(t *testing.T) {
 	}
 }
 
-func TestCredentialProxyNetworkPolicyAdmitsOnlyTheSandboxAndTheGateway(t *testing.T) {
-	// The standalone pod holds every credential the install has, and its endpoint
-	// authenticates no caller — so this policy is the whole boundary in front of
-	// it. Untested, a refactor can widen it back to the namespace and nothing
-	// fails.
+func TestCredentialProxyNetworkPolicyAdmitsOnlyTheSandboxTheGatewayAndTheScrape(t *testing.T) {
+	// The standalone pod holds every credential the install has, so this policy
+	// is the whole boundary in front of its credentialed port. Untested, a
+	// refactor can widen it back to the namespace and nothing fails. The one
+	// peer from outside the namespace is the managed-Prometheus collector, and
+	// it is admitted to the metrics-only port alone.
 	agent := shellSandboxTestAgent()
 	np := buildCredentialProxyNetworkPolicy(agent)
 
@@ -1251,8 +1437,8 @@ func TestCredentialProxyNetworkPolicyAdmitsOnlyTheSandboxAndTheGateway(t *testin
 		t.Fatal("an empty podSelector applies the policy to every pod in the namespace")
 	}
 
-	if len(np.Spec.Ingress) != 1 {
-		t.Fatalf("expected exactly one ingress rule, got %d", len(np.Spec.Ingress))
+	if len(np.Spec.Ingress) != 2 {
+		t.Fatalf("expected exactly two ingress rules (the callers, the collector), got %d", len(np.Spec.Ingress))
 	}
 	in := np.Spec.Ingress[0]
 	if len(in.From) != 2 {
@@ -1277,6 +1463,46 @@ func TestCredentialProxyNetworkPolicyAdmitsOnlyTheSandboxAndTheGateway(t *testin
 
 	if len(in.Ports) != 1 || in.Ports[0].Port.IntValue() != credentialProxyPort {
 		t.Errorf("expected ingress only on %d, got %#v", credentialProxyPort, in.Ports)
+	}
+
+	// The collector, on the metrics-only port and nothing else. A rule of its
+	// own rather than a third peer above: a peer on the first rule would reach
+	// the credentialed port, and that widening is what this test refuses.
+	scrape := np.Spec.Ingress[1]
+	if len(scrape.From) != 1 || scrape.From[0].NamespaceSelector == nil ||
+		scrape.From[0].NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] != "gke-gmp-system" ||
+		scrape.From[0].PodSelector != nil || scrape.From[0].IPBlock != nil {
+		t.Errorf("expected the second rule to admit every pod in gke-gmp-system and nothing narrower, got %#v", scrape.From)
+	}
+	if len(scrape.Ports) != 1 || scrape.Ports[0].Port.IntValue() != int(credentialProxyMetricsPort) {
+		t.Errorf("expected the collector admitted on %d alone, got %#v", credentialProxyMetricsPort, scrape.Ports)
+	}
+}
+
+// TestCredentialProxyNetworkPolicyAdmitsSessionPodsOnlyUnderTheFlag: a third
+// caller peer on the credentialed port, present exactly when the view is on.
+func TestCredentialProxyNetworkPolicyAdmitsSessionPodsOnlyUnderTheFlag(t *testing.T) {
+	agent := shellSandboxTestAgent()
+	agent.Spec.Mode = ptr.To("next")
+	t.Setenv(a2aSessionClusterViewEnvVar, "")
+	if got := len(buildCredentialProxyNetworkPolicy(agent).Spec.Ingress[0].From); got != 2 {
+		t.Fatalf("flag off: %d caller peers, want 2", got)
+	}
+	t.Setenv(a2aSessionClusterViewEnvVar, "true")
+	in := buildCredentialProxyNetworkPolicy(agent).Spec.Ingress[0]
+	if len(in.From) != 3 {
+		t.Fatalf("flag on: %d caller peers, want 3", len(in.From))
+	}
+	peer := in.From[2]
+	if peer.PodSelector == nil || peer.NamespaceSelector != nil || peer.IPBlock != nil {
+		t.Fatalf("session peer reaches outside the namespace: %#v", peer)
+	}
+	want := map[string]string{labelPartOf: a2aPartOf, "app.kubernetes.io/component": a2aSessionComponent}
+	if !reflect.DeepEqual(peer.PodSelector.MatchLabels, want) {
+		t.Fatalf("session peer selector = %v, want %v", peer.PodSelector.MatchLabels, want)
+	}
+	if len(in.Ports) != 1 || in.Ports[0].Port.IntValue() != credentialProxyPort {
+		t.Fatalf("session peer admitted on %#v, want %d only", in.Ports, credentialProxyPort)
 	}
 }
 

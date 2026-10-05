@@ -367,6 +367,7 @@ data:
       "organizations": [],
       "sharedVpcHosts": [],
       "metricsScopes": [],
+      "maxProjects": 100,
       "exclude": {
         "projects": [],
         "clusters": []
@@ -419,6 +420,22 @@ data:
         Preserve_Key  On
 
     [FILTER]
+        Name          parser
+        Match         agent.logs
+        Key_Name      log
+        Parser        hermes_audit_line
+        Reserve_Data  On
+        Preserve_Key  On
+
+    [FILTER]
+        Name          parser
+        Match         agent.logs
+        Key_Name      audit_json
+        Parser        audit_json
+        Reserve_Data  On
+        Preserve_Key  Off
+
+    [FILTER]
         Name              record_modifier
         Match             agent.logs
         Record            app agent
@@ -433,6 +450,15 @@ data:
         Name    gchat_event
         Format  regex
         Regex   User=(?<gchat_user>[^,\s]+),\s*Session=(?<gchat_session>[^,\s]+)
+
+    [PARSER]
+        Name    hermes_audit_line
+        Format  regex
+        Regex   ^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} [A-Z]+(?: \[[^\]]*\])? hermes\.(?:plugin\.tool_call_audit|hook\.chat_message_audit): (?<audit_json>\{.*\})$
+
+    [PARSER]
+        Name    audit_json
+        Format  json
 kind: ConfigMap
 metadata:
   labels:
@@ -636,6 +662,10 @@ spec:
               value: us-central1-a
             - name: KUBE_CONTEXT_NAME
               value: gke_example-project_us-central1-a_cluster-a
+            - name: SANDBOX_IMAGE_TREES
+              value: read-only-mounts
+            - name: SANDBOX_HOME_ROOTS
+              value: . profiles/platform
           image: ghcr.io/gke-labs/kube-agents/agent-sandbox:latest
           name: shell
           ports:
@@ -680,7 +710,67 @@ spec:
             - mountPath: /etc/gitops
               name: gitops-state-volume
               readOnly: true
+            - mountPath: /opt/data/profiles
+              name: data
+              subPath: profiles
+            - mountPath: /opt/data/profiles/platform
+              name: data
+              subPath: profiles/platform
+            - mountPath: /opt/data/skills
+              name: data
+              readOnly: true
+              subPath: skills
+            - mountPath: /opt/data/scripts
+              name: data
+              readOnly: true
+              subPath: scripts
+            - mountPath: /opt/data/governance
+              name: data
+              readOnly: true
+              subPath: governance
+            - mountPath: /opt/data/profiles/platform/skills
+              name: data
+              readOnly: true
+              subPath: profiles/platform/skills
+            - mountPath: /opt/data/profiles/platform/scripts
+              name: data
+              readOnly: true
+              subPath: profiles/platform/scripts
+            - mountPath: /opt/data/profiles/platform/governance
+              name: data
+              readOnly: true
+              subPath: profiles/platform/governance
       enableServiceLinks: false
+      initContainers:
+        - args:
+            - --prepare-image-trees
+          env:
+            - name: SANDBOX_HOME_ROOTS
+              value: . profiles/platform
+          image: ghcr.io/gke-labs/kube-agents/agent-sandbox:latest
+          name: prepare-image-trees
+          resources:
+            limits:
+              cpu: 500m
+              memory: 256Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              add:
+                - CHOWN
+                - DAC_OVERRIDE
+                - FOWNER
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - mountPath: /opt/data
+              name: data
       serviceAccountName: platformagent-shell
       shareProcessNamespace: false
       volumes:
@@ -922,6 +1012,10 @@ spec:
               value: /var/lib/credential-proxy
             - name: CREDENTIAL_PROXY_UNIX_SOCKET
               value: /var/run/credential-proxy/backend.sock
+            - name: CREDENTIAL_PROXY_PORT
+              value: "8765"
+            - name: CREDENTIAL_PROXY_METRICS_PORT
+              value: "8766"
             - name: KUBECONFIG
               value: /var/run/event-watcher/watcher.config
             - name: KSA_TOKEN_FILE
@@ -981,6 +1075,8 @@ spec:
           ports:
             - containerPort: 8765
               name: cred-proxy
+            - containerPort: 8766
+              name: cred-metrics
           readinessProbe:
             failureThreshold: 3
             httpGet:
@@ -1111,6 +1207,13 @@ spec:
       ports:
         - port: 8765
           protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 8766
+          protocol: TCP
   podSelector:
     matchLabels:
       app: platformagent-credential-proxy
@@ -1137,7 +1240,7 @@ metadata:
       name: platformagent
       uid: ""
 spec:
-  progressDeadlineSeconds: 1200
+  progressDeadlineSeconds: 1800
   replicas: 3
   selector:
     matchLabels:
@@ -1300,7 +1403,7 @@ spec:
                   $API_SERVER_KEY" http://127.0.0.1:8642/api/sessions?limit=1; rc=$?;
                   [ "$rc" -eq 0 ] && exit 0; [ "$rc" -eq 7 ] && [ "$ENABLE_LEADER_ELECTION"
                   = "true" ] && exit 0; exit "$rc"'
-            failureThreshold: 60
+            failureThreshold: 90
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 5

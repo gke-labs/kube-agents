@@ -16,6 +16,10 @@ cannot work there. This holds the allowlist to three properties:
   - it is closed under import, so nothing on it fails at its first `import`,
   - nothing on it names an interpreter the sandbox image does not have.
 
+It also holds the image trees to the operator: the trees the Dockerfile stages
+under /opt/defaults and the entrypoint's home roots have to be the ones
+k8s-operator mounts read-only, or the entrypoint's mount gate stops the sandbox.
+
 Run: python3 agents/platform/scripts/test_sandbox_delivery.py
 """
 
@@ -35,6 +39,10 @@ REPO = Path(__file__).resolve().parents[3]
 SCRIPTS = REPO / "agents/platform/scripts"
 SKILL_SCRIPTS = REPO / "agents/platform/skills"
 DOCKERFILE = REPO / "deploy/sandbox/Dockerfile"
+ENTRYPOINT = REPO / "deploy/sandbox/entrypoint.sh"
+SHELL_SANDBOX_MANIFESTS = (
+    REPO / "k8s-operator/internal/controller/shell_sandbox_manifests.go"
+)
 
 # The second staging directory: root-owned, and the one the agent pod's crons
 # run over ssh. Everything else here is about what the *model* can run; this is
@@ -44,14 +52,21 @@ TRUSTED_DIR = "/opt/vcs/libexec/platform"
 # Where an agent is told what to run. The cluster files are here because cluster
 # profiles run in the same pod as the platform agent and reach the same sandbox —
 # cluster_preflight.sh is on the allowlist only because agents/cluster/SOUL.md
-# makes it the first command of every kanban task.
+# makes it the first command of every kanban task. The governance SOPs are what a
+# card's worker is sent to follow, and the Chat Agent's tree writes the bodies of
+# the cards it files, so both reach the same terminal. Its `.yaml` and `.json` are
+# left out: they name what the agent pod launches itself, MCP servers and no_agent
+# crons, which never run in the sandbox.
 INSTRUCTION_GLOBS = (
     "agents/platform/skills/*/SKILL.md",
     "agents/platform/SOUL.md",
     "agents/platform/AGENTS.md",
+    "agents/platform/governance/*.md",
     "agents/cluster/SOUL.md",
     "agents/cluster/AGENTS.md",
     "agents/cluster/skills/*/SKILL.md",
+    "agents/chat/**/*.md",
+    "agents/chat/**/*.py",
 )
 
 # A shared script named by its *runtime* path: `/opt/data/scripts/x.py` or
@@ -146,9 +161,12 @@ def forwarded_paths() -> dict[str, str]:
     }
 
 
-# Where the agent pod's copy of a shared script looks for its siblings. Both are
-# chowned to `agent` at boot, so neither may be on the import path of the copy
-# the sandbox runs as `hermes`.
+# Where the agent pod's copy of a shared script looks for its siblings. Neither
+# may be on the import path of the copy the sandbox runs as `hermes`. /opt/data
+# is the model's volume. /opt/defaults is root-owned in the sandbox image now,
+# and its copies under /opt/data are root-owned read-only mounts, but both stay
+# off the trusted path as defence in depth: the trusted copy should not depend
+# on the model's volume, or on a staging directory, staying locked.
 AGENT_WRITABLE = ("/opt/data", "/opt/defaults")
 
 
@@ -233,6 +251,47 @@ def trusted_path_report() -> dict:
     )
     assert done.returncode == 0, done.stderr
     return json.loads(done.stdout.strip().splitlines()[-1])
+
+
+def go_string_slice(name: str) -> list[str]:
+    """The elements of `name = []string{...}` in the shell sandbox manifests."""
+    text = SHELL_SANDBOX_MANIFESTS.read_text()
+    match = re.search(rf"\b{name}\s*=\s*\[\]string\{{(.*?)\}}", text, re.S)
+    assert match, f"{name} not found in {SHELL_SANDBOX_MANIFESTS.relative_to(REPO)}"
+    body = re.sub(r"//[^\n]*", "", match.group(1))
+    return re.findall(r'"([^"]*)"', body)
+
+
+def go_string_const(name: str) -> str:
+    """The value of `name = "..."` in the shell sandbox manifests."""
+    text = SHELL_SANDBOX_MANIFESTS.read_text()
+    match = re.search(rf'\b{name}\s*=\s*"([^"]*)"', text)
+    assert match, f"{name} not found in {SHELL_SANDBOX_MANIFESTS.relative_to(REPO)}"
+    return match.group(1)
+
+
+def dockerfile_image_trees() -> set[str]:
+    """The top-level directories the Dockerfile's COPY lines create under /opt/defaults."""
+    joined = re.sub(r"\\\n\s*", " ", DOCKERFILE.read_text())
+    trees: set[str] = set()
+    for line in joined.splitlines():
+        if not line.startswith("COPY "):
+            continue
+        for token in line.split():
+            if token.startswith("/opt/defaults/"):
+                trees.add(token[len("/opt/defaults/"):].split("/")[0])
+    return trees
+
+
+def entrypoint_home_roots() -> list[str]:
+    """The entrypoint's SANDBOX_HOME_ROOTS default, with `.` spelled "" as in Go."""
+    match = re.search(
+        r'^SANDBOX_HOME_ROOTS="\$\{SANDBOX_HOME_ROOTS:-([^}]*)\}"$',
+        ENTRYPOINT.read_text(),
+        re.M,
+    )
+    assert match, "SANDBOX_HOME_ROOTS default not found in deploy/sandbox/entrypoint.sh"
+    return ["" if root == "." else root for root in match.group(1).split()]
 
 
 def local_imports(path: Path, universe: set[str]) -> set[str]:
@@ -359,8 +418,8 @@ class SandboxDelivery(unittest.TestCase):
         """A module missing here is not an error: it is found under /opt/data.
 
         `sys.path[0]` is the script's own directory, so the fallback is silent
-        and it is the agent-owned copy -- the boundary gone with nothing to show
-        for it. deploy/sandbox/trusted-closure-guard.py catches this at build
+        and it is the data volume's copy -- the boundary gone with nothing to
+        show for it. deploy/sandbox/trusted-closure-guard.py catches this at build
         time by reading `__file__` off what actually loaded; this catches it at
         review time, on a tree nobody has to build.
         """
@@ -440,6 +499,45 @@ class SandboxDelivery(unittest.TestCase):
             )
         report = json.loads(done.stdout.strip().splitlines()[-1])
         self.assertEqual(report["on_path"], {"leaky": ["/opt/data/scripts"]})
+
+    def test_the_operator_mounts_the_trees_the_image_stages(self):
+        """The Go constants, the Dockerfile and the entrypoint name the same trees and homes.
+
+        The operator builds one read-only mount per home and tree from
+        shellSandboxImageTrees and shellSandboxImageTreeHomes, and the entrypoint
+        refuses to start unless every tree it finds in /opt/defaults, in every
+        home, is one of those mounts. A tree added to the image and not to the
+        constant stops the sandbox; one added to the constant and not the image
+        is an empty read-only directory where a skill expects files.
+        """
+        self.assertEqual(
+            sorted(go_string_slice("shellSandboxImageTrees")),
+            sorted(dockerfile_image_trees()),
+            "shellSandboxImageTrees in shell_sandbox_manifests.go and the "
+            "/opt/defaults/<tree> destinations in deploy/sandbox/Dockerfile differ",
+        )
+        self.assertEqual(
+            go_string_slice("shellSandboxImageTreeHomes"),
+            entrypoint_home_roots(),
+            "shellSandboxImageTreeHomes in shell_sandbox_manifests.go and the "
+            "SANDBOX_HOME_ROOTS default in deploy/sandbox/entrypoint.sh differ",
+        )
+
+    def test_the_operator_and_the_entrypoint_agree_on_the_mode(self):
+        """SANDBOX_IMAGE_TREES is set from the Go constant and matched by the entrypoint."""
+        mode = go_string_const("shellSandboxImageTreesMode")
+        text = ENTRYPOINT.read_text()
+        self.assertRegex(
+            text,
+            rf'(?m)^IMAGE_TREES_READ_ONLY_MOUNTS="{re.escape(mode)}"$',
+            f"deploy/sandbox/entrypoint.sh does not name `{mode}` as "
+            "IMAGE_TREES_READ_ONLY_MOUNTS, so it would refuse the operator's value",
+        )
+        self.assertRegex(
+            text,
+            r'(?m)^\s*"\$IMAGE_TREES_READ_ONLY_MOUNTS"\)$',
+            "deploy/sandbox/entrypoint.sh has no case for IMAGE_TREES_READ_ONLY_MOUNTS",
+        )
 
     def test_nothing_baked_names_the_agent_images_interpreter(self):
         """`#!/opt/hermes/.venv/bin/python3` resolves in one image and not the other.

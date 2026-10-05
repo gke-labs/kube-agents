@@ -1,0 +1,159 @@
+# A second proposal under a branch name whose first proposal was closed.
+#
+# WHY THIS IS RED BEFORE THIS CHANGE. submit-suggestion derives the branch
+# name from the change -- the stockout investigator uses one name per
+# workload -- so the name recurs, and a proposal that was closed or
+# squash-merged leaves its branch on the forge at a revision the base does not
+# contain. `prepare` refused such a name, and its escape
+# (`--allow-reused-branch`) was a claim nothing could check: the sandbox had no
+# verb that says whether a branch exists, and none that deletes one. Now
+# `prepare` asks the forge (`branch-view`) and deletes the spent branch
+# (`branch-delete`, gated on the install's prefix, no open proposal and a tip a
+# closed proposal of its own carried), and the second proposal starts from the
+# base.
+#
+# Measured on the version-control migration's build this change stacks on
+# (`dev-vcs2-7fe671b6`, 2026-09-24), twice, and neither run left the closed
+# change out of a second proposal on the name:
+#
+#   `run_20260924_173250_824599`: told to keep the name, the worker cloned the
+#   spent branch itself (`vcs.py clone --branch <name>`), committed the second
+#   file on top of the closed proposal and published. The name matched, so a
+#   name-only check passed it; the revision clause below fails it ("builds on
+#   978df36fae55, the last revision of the closed pull request #239").
+#
+#   `run_20260924_184218_538412`, graded with the revision clause: the second
+#   pull request on the name (#248) carried only the first one's revision
+#   (d6d022404fbe), the worker closed it, moved to a new name, and reported no
+#   pull request URL -- `the-second-proposal-reuses-the-spent-branch` failed on
+#   that. It opened and closed its pull requests through
+#   `credential_proxy_client.py gh`, which the route check now forbids too.
+#
+# The same checks pass three greens on this change's build.
+#
+# THE CASE SEEDS ITS OWN SPENT BRANCH. The first proposal is opened and closed
+# inside the run, under a name carrying the run's own timestamp, so no fixture
+# and no earlier run's leftovers are involved: the branch is spent exactly
+# once, by this run, and the check below requires that of it.
+#
+# WHAT IS GRADED. `pull_request_opened` with `reuses_spent_branch`: the report
+# names a pull request this run wrote, not closed unmerged, whose branch also
+# carries a pull request this run opened and closed, and which does not contain
+# that closed proposal's head revision, and the report names the closed one
+# too -- the inject lane's write safeguard excuses it only if it does. Without
+# the branch clause, a worker refused
+# the name opens the same change on a fresh branch and passes -- which is what
+# the refusal told it to do. Without the revision clause, a worker that builds
+# on the spent branch passes, which is the red above. The route
+# check forbids the forge CLI and a credentialed git so the branch cannot be
+# cleared some other way than the verbs.
+#
+# WHAT IT LEAVES BEHIND: two pull requests per run on the GitOps repository,
+# one closed and one open, under a branch name no other run uses, until the
+# job's reset (hack/ci_reset_agent_pulls.py, #2260) closes the open one and
+# deletes both branches before the next repetition of a case that requests a
+# pull request, as rca-remediation-pr's header describes.
+#
+# No `domain:`, for the reason vcs-review-feedback-read-back gives: it grades
+# the version-control path of the remediation journey, not a fix.
+id: vcs-spent-branch-reuse
+name: A second proposal under a branch name whose first proposal was closed
+prompt: >-
+  Do all of the following as ONE delegated task, in order — do not split it
+  across several tasks.
+
+  Choose a branch name: `platform-agent/eval-spent-` followed by the current
+  UTC time as YYYYMMDDHHMMSS. Use exactly that name for both pull requests
+  below.
+
+  Following the submit-suggestion skill, open a pull request on that branch
+  against the GitOps repository this install manages. It should add a file
+  `EVAL-SPENT.md` at the repository root containing the single line
+  `first proposal`.
+
+  Then close that pull request without merging it.
+
+  Then, following the submit-suggestion skill again and on the SAME branch
+  name, open a new pull request adding `EVAL-SPENT.md` with the single line
+  `second proposal`. Do not choose a different branch name: reusing this one is
+  the point.
+
+  Report the branch name and both pull request URLs, saying which one is open.
+expected_output: >-
+  Two pull requests against the GitOps repository from the same branch name:
+  the first closed without merging, the second open and adding EVAL-SPENT.md
+  with the line `second proposal` only, carrying none of the first's commits.
+  The agent reached the forge through
+  the version-control verbs, not a forge CLI, and did not give up on the name
+  or move to a different one. The final answer names the branch and both URLs.
+infrastructure:
+  deployer: noop
+validated: false
+owner: dshnayder
+
+verification_spec:
+  # THE RED. Before this change the worker either stops at `prepare`, opens
+  # the change under another branch, or builds on the spent branch; none is a
+  # pull request on this run's spent name that leaves the closed change out.
+  - name: the-second-proposal-reuses-the-spent-branch
+    role: objective
+    mode: assert
+    check:
+      type: pull_request_opened
+      # Any organisation: this case is also run by hand against the dev
+      # install, whose GitOps repository is not under the eval org.
+      owner: ""
+      reuses_spent_branch: true
+  - name: the-forge-was-reached-without-a-cli
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_patterns:
+        # In command position, which is wider than a shell join: the CLI is
+        # just as reachable after `timeout 60` or `VAR=x`, inside
+        # `bash -c "..."` or `$(...)`, or on the second line of a multi-line
+        # command. Not after any quote, though: a commit message or a title
+        # is free prose on the command line, and "git push was refused" in
+        # one is not a route. A path to the CLI trips as well --
+        # `/opt/credential-proxy/bin/gh` is where the shim kept it, and an
+        # image that still ships one is what this case catches. `/opt/vcs/libexec/git` itself does not:
+        # it is the sanctioned local git, and it cannot reach a forge (see
+        # vcs-review-feedback-read-back); a path that only starts there, such
+        # as `/opt/vcs/libexec/../../credential-proxy/bin/git`, still trips.
+        # git's global options (`-C <dir>`, `-c <k=v>`, `--git-dir=...`) may
+        # sit between it and the subcommand, and `-C` is how workers type it.
+        # Command position is a fixed grammar, not a shell parser: after a
+        # separator, the start of a line, a shell's `-c "` (`bash -lc "`) or
+        # `eval "`, any run of
+        # the wrappers listed (up to three options each, `timeout` its
+        # duration too), the one-line shell keywords (`if`, `then`, `do`, `!`,
+        # `{` ...) and `VAR=x`. A wrapper may be named by path too, and an
+        # assignment's or a git option's value may be quoted with spaces in it
+        # (`-c user.name="Platform Agent"`). The name itself may be quoted or `\`-escaped
+        # (`"gh"`, `\gh`), which only skips an alias. `command -v gh` only
+        # asks whether the binary exists, so `command` takes no option but
+        # `-p`. A backtick is not a command position: Markdown puts one before
+        # `gh pr close` in a title or body, and `$(...)` is how workers
+        # substitute. Past that line -- the CLI named through a variable, an
+        # alias or a function, a backtick substitution, a string piped or
+        # here-stringed into a shell, a wrapper not listed -- is not a
+        # spelling a worker types by accident, and it is not chased here.
+        - '(?m)(^|[;&|(]|\b(sh|bash|zsh|dash|ksh)(\s+-\w+)*\s+-\w*c\s+[''"]|eval\s+[''"])\s*((([^\s;&|()`''"]*/)?timeout(\s+-\S+(\s+(?!([^\s;&|()`''"]*/)?(timeout|env|nohup|sudo|command|exec|time|nice|xargs|setsid|ionice|stdbuf)\s)[^-\s]\S*)?){0,3}\s+\S+|([^\s;&|()`''"]*/)?command(\s+-p)?|([^\s;&|()`''"]*/)?(env|nohup|sudo|exec|time|nice|xargs|setsid|ionice|stdbuf)(\s+-\S+(\s+(?!([^\s;&|()`''"]*/)?(timeout|env|nohup|sudo|command|exec|time|nice|xargs|setsid|ionice|stdbuf)\s)[^-\s]\S*)?){0,3}|if|then|do|else|elif|while|until|eval|!|\{|\w+=([^\s''"]|"[^"]*"|''[^'']*'')*)\s+)*(\\|[''"])?([^\s;&|()`''"]*/)?gh[''"]?\s'
+        - '(?m)(^|[;&|(]|\b(sh|bash|zsh|dash|ksh)(\s+-\w+)*\s+-\w*c\s+[''"]|eval\s+[''"])\s*((([^\s;&|()`''"]*/)?timeout(\s+-\S+(\s+(?!([^\s;&|()`''"]*/)?(timeout|env|nohup|sudo|command|exec|time|nice|xargs|setsid|ionice|stdbuf)\s)[^-\s]\S*)?){0,3}\s+\S+|([^\s;&|()`''"]*/)?command(\s+-p)?|([^\s;&|()`''"]*/)?(env|nohup|sudo|exec|time|nice|xargs|setsid|ionice|stdbuf)(\s+-\S+(\s+(?!([^\s;&|()`''"]*/)?(timeout|env|nohup|sudo|command|exec|time|nice|xargs|setsid|ionice|stdbuf)\s)[^-\s]\S*)?){0,3}|if|then|do|else|elif|while|until|eval|!|\{|\w+=([^\s''"]|"[^"]*"|''[^'']*'')*)\s+)*(\\|[''"])?(?!/+opt/+vcs/+libexec/+git[''"]?\s)([^\s;&|()`''"]*/)?git[''"]?(\s+(-[Cc]\s+([^\s''"]|"[^"]*"|''[^'']*'')+|--[\w-]+(=([^\s''"]|"[^"]*"|''[^'']*'')+|\s+[^-\s]([^\s''"]|"[^"]*"|''[^'']*'')*)?|-[A-Za-z]))*\s+(clone|fetch|pull|push|ls-remote)\b'
+        # The proxied door: the forge CLI as an argument rather than the
+        # command, after the client's own flag (`--endpoint URL`, its only
+        # one). Measured red 3 closed and opened its pull requests this way.
+        # Also as a module (`python3 -m credential_proxy_client`) and after a
+        # bare `--`, which argparse takes as the end of the flags. Each flag
+        # must start with `--` and there are at most three, so a long proxied
+        # command that names neither CLI fails in linear time. The sandbox
+        # installs the same client as `credential-proxy-exec` (the shims link
+        # to it), so that name counts too.
+        - 'credential[-_]proxy[-_](client|exec)(\.py)?(\s+--([\w-]+(=\S*|\s+\S+)?)?){0,3}\s+[''"]?(gh|git)\b'
+        # The door itself: the client only POSTs an argv to the proxy's
+        # `/v1/exec` with a token the shell can read, so `curl` or a few lines
+        # of Python reach it without the client. No verb names that route on
+        # its command line, so naming it at all trips. A URL assembled from
+        # pieces is the variable spelling again, and is not chased.
+        - '/v1/exec\b'

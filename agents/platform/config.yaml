@@ -171,11 +171,17 @@ toolsets:
   - kanban
 
 # Per-turn tool-calling iteration budget. Hermes defaults to 90, which the fleet
-# audits outgrow: the cost audit runs ten checks against every cluster and the
-# drift audit twenty, plus enumeration, the SOP read, and the publish harness.
-# Three separate runs died on `Iteration budget exhausted (90/90)` — reported as
-# a `timed_out` kanban event, though the run was actively heartbeating and no
-# clock ran out. 250 is roughly triple the observed near-miss.
+# audits outgrew when each ran its checks cluster by cluster: three separate runs
+# died on `Iteration budget exhausted (90/90)` — reported as a `timed_out` kanban
+# event, though the run was actively heartbeating and no clock ran out. Most
+# streams, cost and drift among them, now run one collector script that reads
+# the whole fleet in a single call, so a clean run costs the SOP read, the
+# collector, the recommendations and the publish harness. What still scales
+# with the fleet is the Compute Engine and networking audits, which have no
+# collector yet, and the by-hand fallback the SOPs prescribe for every cluster
+# or project a collector marks `unreachable` or `gate-failed` — a bad day on a
+# large fleet is the old per-cluster loop over part of it. 250, roughly triple
+# the observed near-miss, is kept as headroom for those paths.
 #
 # This belongs here rather than in the operator's generated root config because
 # both ways an audit can start read *this* file and not the root one: a cron run
@@ -185,6 +191,16 @@ toolsets:
 # Agents on the default 90, where nothing has ever approached the ceiling.
 agent:
   max_turns: 250
+
+# Per-file character cap Hermes puts on a context file (SOUL.md, AGENTS.md) when it
+# builds the system prompt. Unset, the cap is 6% of the model window, and a flat
+# 20,000 whenever the window is unknown or reported small. SOUL.md here is well past
+# 20,000, and Hermes keeps only the head and tail of a file over the cap, so the
+# middle of the persona would silently drop out of the prompt. 100,000 leaves room
+# for every shipped context file and is still about 25k tokens at most. Pinned in
+# all three profile configs (chat, platform, cluster), because each profile reads
+# its own; tests/test_context_file_cap.py fails when a shipped file outgrows it.
+context_file_max_chars: 100000
 
 # Per-turn web_search ceiling. Hermes defaults to 50, and the docstring on that
 # default is right about interactive sessions: fifty searches in one turn is

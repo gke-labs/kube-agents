@@ -24,6 +24,8 @@ import re
 import sys
 import tempfile
 import unittest
+
+import yaml
 from pathlib import Path
 from unittest import mock
 
@@ -55,6 +57,7 @@ CONFIG = {
         "enable_group_assignment": False,
         "number_of_reviewers": 1,
         "last_files_match_only": True,
+        "robot_accounts": ["kyber775"],
     },
 }
 
@@ -70,7 +73,7 @@ LIVE_CONFIG = REPO_ROOT / rr.DEFAULT_CONFIG_PATH
 # approval, and `NON_APPROVER` is outside it, so the same review from him
 # does not.
 APPROVERS = {"bradhoekstra", "jayantid", "toshiowang", "dshnayder", "bnaylor"}
-NON_APPROVER = "kyber775"
+NON_APPROVER = "outside-contributor"
 
 # The root OWNERS, OWNERS_ALIASES and hack/OWNERS as they stand, for the walk
 # tests that need a tree they can also mutate.
@@ -246,6 +249,54 @@ class ConfigValidationTest(unittest.TestCase):
     def test_an_unsupported_glob_in_the_files_map_is_refused(self):
         with self.assertRaises(ValueError):
             rr.validate_config({"files": {"{a,b}/**": ["repository-owners"]}})
+
+    def test_robot_accounts_must_be_a_list_of_logins(self):
+        # Both comparisons the list feeds are exact against GitHub's `login`,
+        # so a decorated or mistyped entry would pass a non-empty check and
+        # then match nothing, silently: the shape is what is validated. Only
+        # the shape: what comes after the first character is GitHub's to rule
+        # on, and an Enterprise Managed User's `handle_shortcode` or an older
+        # account's underscore is a login GitHub issued.
+        for good in (["kyber775"], ["a"], ["k-y-b-3"], ["A" * 39], ["a" + "-b" * 19], ["reviewbot_acme"], ["legacy_user"], ["kyber-"], ["ky--ber"]):
+            rr.validate_config({"options": {"robot_accounts": good}})
+        rr.validate_config({"options": {}})
+        # The hyphenated lengths matter: a pattern that counts repetitions rather
+        # than characters lets `a-b-b-…` run to 77 characters.
+        for bad in ("kyber775", [{"login": "kyber775"}], [""], [7], ["@kyber775"], ["kyber775 "], ["kyber775[bot]"], ["org/kyber775"], ["kyber.bot"], ["-kyber"], ["_kyber"], ["A" * 40], ["a" + "-b" * 20], ["a" + "-b" * 38]):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                rr.validate_config({"options": {"robot_accounts": bad}})
+        self.assertEqual(rr.robot_accounts({"options": {"robot_accounts": ["Kyber775"]}}), {"kyber775"})
+        self.assertEqual(rr.robot_accounts({}), frozenset())
+
+    def test_a_yaml_coerced_login_is_refused_with_the_remedy(self):
+        # An unquoted all-digit login arrives as an int and an unquoted YAML
+        # word as a bool; both are valid logins once quoted, so the message
+        # says to quote rather than calling a valid login malformed.
+        for entry in ("12345", "no", "on", "true", "2024-01-01", "null"):
+            with self.subTest(entry=entry):
+                config = yaml.safe_load(f"options:\n  robot_accounts:\n    - {entry}\n")
+                with self.assertRaises(ValueError) as caught:
+                    rr.validate_config(config)
+                self.assertIn("quote", str(caught.exception))
+                self.assertNotIn("not a bare GitHub login", str(caught.exception))
+                quoted = yaml.safe_load(f'options:\n  robot_accounts:\n    - "{entry}"\n')
+                rr.validate_config(quoted)
+        # `~` and an empty item arrive as None too; quoted `~` is no login, so
+        # only the message is checked for those.
+        for entry in ("~", ""):
+            with self.subTest(entry=entry), self.assertRaises(ValueError) as caught:
+                rr.validate_config(yaml.safe_load(f"options:\n  robot_accounts:\n    - {entry}\n"))
+            self.assertIn("remove an empty entry", str(caught.exception))
+            self.assertNotIn("not a mapping or a list", str(caught.exception))
+        # A mapping or a nested list is a different mistake with a different
+        # remedy: quoting does nothing for it, so the message says the shape.
+        for entry in ([{"login": "kyber775"}], [["kyber775"]]):
+            with self.subTest(entry=entry), self.assertRaises(ValueError) as caught:
+                rr.validate_config({"options": {"robot_accounts": entry}})
+            self.assertIn("not a mapping or a list", str(caught.exception))
+            self.assertNotIn("quote", str(caught.exception))
+        # Quoting keeps what the operator typed: `007` is a login, `7` is not it.
+        self.assertEqual(rr.robot_accounts(yaml.safe_load('options:\n  robot_accounts:\n    - "007"\n')), {"007"})
 
 
 class SelectionTest(unittest.TestCase):
@@ -426,6 +477,20 @@ class OwnersTest(unittest.TestCase):
         self.assertTrue(set(OWNERS) <= root_approvers, root_approvers)
         self.assertEqual(rr.applicable_approvers(["hack/eval/presubmit-cases.txt"], REPO_ROOT), set(EVAL_CREW))
         self.assertNotIn(NON_APPROVER, root_approvers)
+        # OWNERS repeats every root approver under `reviewers`: Prow's reviewer
+        # walk falls through hack/OWNERS (no_parent_owners, no reviewers of its
+        # own) to the root list, which is therefore who may lgtm a roster-only
+        # change besides eval-crew, and the file's own comment says so. Pin
+        # both halves: the repeat, and hack/OWNERS still naming no reviewers.
+        # eval-crew is pinned as well so its members keep lgtm repository-wide
+        # (lapis2002 is not a root approver).
+        root_reviewers = {login.lower() for login in rr._read_yaml(REPO_ROOT / rr.OWNERS_FILENAME).get("reviewers") or []}
+        self.assertTrue({login.lower() for login in root_approvers} <= root_reviewers, root_approvers - root_reviewers)
+        self.assertTrue({login.lower() for login in EVAL_CREW} <= root_reviewers, set(EVAL_CREW) - root_reviewers)
+        hack_owners = rr._read_yaml(REPO_ROOT / "hack" / rr.OWNERS_FILENAME)
+        self.assertNotIn("reviewers", hack_owners)
+        for pattern, rules in (hack_owners.get("filters") or {}).items():
+            self.assertNotIn("reviewers", rules or {}, pattern)
 
 
 class SkipReasonTest(unittest.TestCase):
@@ -447,6 +512,13 @@ class SkipReasonTest(unittest.TestCase):
     def test_an_ignored_keyword_in_the_title_is_skipped(self):
         skipped = rr.skip_reason(pull_request(title="DO NOT REVIEW: wip"), CONFIG)
         self.assertIn("DO NOT REVIEW", skipped)
+
+    def test_a_request_outstanding_to_a_listed_robot_is_nobody_asked(self):
+        # The robot answers the request and GitHub clears it, and nothing
+        # re-fires after that; a person requested alongside still counts.
+        self.assertIsNone(rr.skip_reason(pull_request(requested_reviewers=[{"login": "kyber775"}]), CONFIG))
+        both = pull_request(requested_reviewers=[{"login": "kyber775"}, {"login": "jayantid"}])
+        self.assertIn("jayantid", rr.skip_reason(both, CONFIG))
 
     def test_an_existing_request_is_not_duplicated(self):
         # The workflow fires on every completed AI Review check, so a pull
@@ -480,6 +552,19 @@ class AlreadyReviewedTest(unittest.TestCase):
         # Decided, not inherited: whoever asked for changes is owed a reply,
         # and asking a fresh reviewer over an open objection is noise.
         self.assertIn(NON_APPROVER, self.reason([review(NON_APPROVER, "CHANGES_REQUESTED")]))
+
+    def test_a_robot_under_a_user_account_never_counts(self):
+        # kyber775 reviews under a User account, re-reviews every push and files
+        # its follow-ups as COMMENTED, so the CHANGES_REQUESTED it filed on one
+        # commit stood as its verdict for the life of the pull request and a
+        # green AI Review requested nobody. Listed as a robot, it counts no
+        # more than the App's own review does, whatever state it files.
+        robots = {"kyber775"}
+        stale = [review("kyber775", "CHANGES_REQUESTED", submitted_at="1"), review("kyber775", submitted_at="2")]
+        self.assertIsNone(rr.already_reviewed_reason(pull_request(), stale, APPROVERS, robots))
+        self.assertIsNone(rr.already_reviewed_reason(pull_request(), [review("KYBER775", "APPROVED")], APPROVERS, robots))
+        # Not listed, the same review counts, as it does from any other person.
+        self.assertIn("kyber775", rr.already_reviewed_reason(pull_request(), stale, APPROVERS))
 
     def test_approver_logins_match_case_insensitively(self):
         self.assertIsNotNone(self.reason([review("JayantiD", "APPROVED")]))
@@ -578,6 +663,22 @@ class MainTest(unittest.TestCase):
 
     def test_a_non_approvers_approval_no_longer_blocks_the_check_run_path(self):
         posts = self.run_main(pull_request(), [review(NON_APPROVER, "APPROVED")])
+        self.assertEqual(posts, [self.REQUESTED])
+        self.assertEqual(self.code, 0)
+
+    def test_a_listed_robots_changes_requested_does_not_block_the_check_run_path(self):
+        # Through the live roster, which lists kyber775: the check-run path
+        # reads the robot's standing CHANGES_REQUESTED as no verdict at all
+        # and requests a human.
+        posts = self.run_main(pull_request(), [review("kyber775", "CHANGES_REQUESTED", submitted_at="1"), review("kyber775", submitted_at="2")])
+        self.assertEqual(posts, [self.REQUESTED])
+        self.assertEqual(self.code, 0)
+        # The run log names the list in effect, since shape is all that can be
+        # validated and a well-formed login naming no account sits inert.
+        self.assertIn("Robot accounts, whose reviews never count: kyber775", self.stderr.getvalue())
+
+    def test_a_request_outstanding_to_a_listed_robot_does_not_block_the_check_run_path(self):
+        posts = self.run_main(pull_request(requested_reviewers=[{"login": "kyber775"}]), [])
         self.assertEqual(posts, [self.REQUESTED])
         self.assertEqual(self.code, 0)
 

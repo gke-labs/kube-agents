@@ -1294,6 +1294,424 @@ class RepositoryVerbTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+class HistoryLocalForge(LocalForge):
+    """`LocalForge` with a proposal history per branch, open and closed.
+
+    What `branch-delete` reads to decide a branch is spent: whether any proposal
+    from it is still open, and which revision the closed ones carried.
+    """
+
+    verbs = ("proposal-list",)
+
+    def __init__(self, root, minted=None, history=None):
+        super().__init__(root, minted)
+        self.history: dict[str, list[dict]] = dict(history or {})
+        # Open proposals by the branch they target, which is a separate
+        # question from the ones a branch is the source of.
+        self.targeting: dict[str, list[dict]] = {}
+        self.listed: list[dict] = []
+
+    def proposal_list(self, api, repo, payload):
+        self.listed.append(dict(payload))
+        if payload.get("target") is not None:
+            found = list(self.targeting.get(payload["target"], []))
+        else:
+            found = list(self.history.get(payload.get("source"), []))
+        if payload.get("state") == "open":
+            found = [item for item in found if item.get("state") == "open"]
+        # One page, as the real forge answers: newest first, `limit` long, and
+        # truncated when full.
+        limit = int(payload.get("limit") or 100)
+        return providers.listing(found[:limit], limit, "proposals")
+
+
+class BranchVerbTest(unittest.TestCase):
+    """`branch-view` and `branch-delete`, against a real bare repository."""
+
+    commit_in = RepositoryVerbTest.commit_in
+    remote_tip = RepositoryVerbTest.remote_tip
+
+    SPENT = "platform-agent/remediate-stockout-web"
+
+    def setUp(self):
+        RepositoryVerbTest.setUp(self)
+        self.forge = HistoryLocalForge(self.forges, self.refreshed)
+        self.broker.registry.hosts["local.test"] = self.forge
+
+    def push_branch(self, branch: str, text: str = "fix\n") -> str:
+        git(self.seed, "checkout", "--quiet", "-B", branch, "main")
+        tip = self.commit_in(self.seed, "fix.txt", text, f"on {branch}")
+        git(self.seed, "push", "--quiet", "--force", "origin", branch)
+        git(self.seed, "checkout", "--quiet", "main")
+        return tip
+
+    def closed(
+        self, branch: str, revision: str, state: str = "closed",
+        author: str = "kube-agents", source_repo: str = "acme/infra",
+    ) -> None:
+        self.forge.history.setdefault(branch, []).append(
+            {"number": 7, "state": state, "source": branch, "sourceRevision": revision,
+             "sourceRepo": source_repo, "author": author,
+             "url": "https://local.test/acme/infra/pull/7"}
+        )
+
+    def delete(self, branch: str, revision: str) -> dict:
+        return self.broker.branch_delete(
+            {"repository": "local.test/acme/infra", "branch": branch, "revision": revision}
+        )
+
+    def refused(self, branch: str, revision: str) -> str:
+        with self.assertRaises(WorkspaceError) as caught:
+            self.delete(branch, revision)
+        return caught.exception.fields.get("code")
+
+    def exists(self, branch: str) -> bool:
+        return git(
+            self.origin, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}",
+            check=False,
+        ).returncode == 0
+
+    # -- branch-view -----------------------------------------------------
+
+    def test_view_says_a_branch_the_remote_does_not_hold_is_absent(self):
+        answer = self.broker.branch_view(
+            {"repository": "local.test/acme/infra", "branch": self.SPENT}
+        )
+        self.assertEqual(answer["branch"], {"name": self.SPENT, "exists": False, "revision": None})
+
+    def test_view_names_the_revision_a_held_branch_is_at(self):
+        tip = self.push_branch(self.SPENT)
+        answer = self.broker.branch_view(
+            {"repository": "local.test/acme/infra", "branch": self.SPENT}
+        )
+        self.assertEqual(answer["branch"], {"name": self.SPENT, "exists": True, "revision": tip})
+        self.assertEqual(self.refreshed, ["acme/infra"])
+
+    def test_view_does_not_read_an_unreachable_remote_as_an_absent_branch(self):
+        # "Gone" sends the caller on to reuse the name; an outage must not.
+        self.forge.root = Path(self.tmp.name) / "nowhere"
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.branch_view({"repository": "local.test/acme/infra", "branch": self.SPENT})
+        self.assertEqual(caught.exception.fields.get("code"), "FORGE_CALL_FAILED")
+
+    # -- branch-delete ---------------------------------------------------
+
+    def test_delete_removes_a_branch_whose_closed_proposal_carried_its_tip(self):
+        tip = self.push_branch(self.SPENT)
+        self.closed(self.SPENT, tip)
+        answer = self.delete(self.SPENT, tip)
+        self.assertEqual(answer["branch"], {"name": self.SPENT, "deleted": True, "revision": tip})
+        self.assertFalse(self.exists(self.SPENT))
+
+    def test_delete_removes_a_squash_merged_proposals_branch(self):
+        tip = self.push_branch(self.SPENT)
+        self.closed(self.SPENT, tip, state="merged")
+        self.delete(self.SPENT, tip)
+        self.assertFalse(self.exists(self.SPENT))
+
+    def test_delete_of_a_branch_already_gone_is_an_answer_not_an_error(self):
+        self.closed(self.SPENT, "a" * 40)
+        answer = self.delete(self.SPENT, "a" * 40)
+        self.assertEqual(answer["branch"], {"name": self.SPENT, "deleted": False, "revision": None})
+
+    def test_delete_refuses_a_branch_outside_the_installs_namespace(self):
+        tip = self.push_branch("feature/someones")
+        self.closed("feature/someones", tip)
+        self.assertEqual(self.refused("feature/someones", tip), "BRANCH_NOT_OURS")
+        self.assertTrue(self.exists("feature/someones"))
+        # Refused before the forge is asked anything or a credential is spent.
+        self.assertEqual(self.forge.listed, [])
+        self.assertEqual(self.refreshed, [])
+
+    def test_delete_refuses_a_branch_carrying_an_open_proposal(self):
+        tip = self.push_branch(self.SPENT)
+        self.closed(self.SPENT, tip, state="open")
+        self.assertEqual(self.refused(self.SPENT, tip), "OPEN_PROPOSAL")
+        self.assertTrue(self.exists(self.SPENT))
+
+    def test_delete_refuses_a_branch_an_open_proposal_targets(self):
+        # Somebody stacked a proposal on the spent branch. Deleting a
+        # proposal's target closes it, so the branch is not ours to delete.
+        tip = self.push_branch(self.SPENT)
+        self.closed(self.SPENT, tip)
+        self.forge.targeting[self.SPENT] = [
+            {"number": 9, "state": "open", "source": "feature/follow-up",
+             "target": self.SPENT, "url": "https://local.test/acme/infra/pull/9"}
+        ]
+        self.assertEqual(self.refused(self.SPENT, tip), "BRANCH_NOT_OURS")
+        self.assertTrue(self.exists(self.SPENT))
+        self.assertIn({"state": "open", "target": self.SPENT, "limit": 1}, self.forge.listed)
+
+    def test_delete_asks_for_an_open_proposal_rather_than_reading_the_history(self):
+        tip = self.push_branch(self.SPENT)
+        self.closed(self.SPENT, tip)
+        self.assertEqual(self.delete(self.SPENT, tip)["branch"]["deleted"], True)
+        self.assertIn({"state": "open", "source": self.SPENT, "limit": 1}, self.forge.listed)
+
+    def test_delete_refuses_an_open_proposal_older_than_the_history_page(self):
+        tip = self.push_branch(self.SPENT)
+        self.closed(self.SPENT, tip)
+        full = self.forge.proposal_list
+        # The history page holds only the closed ones; the open one is older.
+
+        def paged(api, repo, payload):
+            found = full(api, repo, payload)
+            if payload.get("state") == "open":
+                return {"proposals": [{"number": 3, "state": "open", "source": self.SPENT,
+                                       "url": "https://local.test/acme/infra/pull/3"}]}
+            return found
+
+        self.forge.proposal_list = paged
+        self.assertEqual(self.refused(self.SPENT, tip), "OPEN_PROPOSAL")
+        self.assertTrue(self.exists(self.SPENT))
+
+    def test_view_does_not_take_a_ref_whose_name_merely_ends_in_the_branch(self):
+        # `ls-remote` matches on the tail; only the exact ref is the branch.
+        git(self.seed, "checkout", "--quiet", "-B", "scratch", "main")
+        self.commit_in(self.seed, "other.txt", "x\n", "decoy")
+        git(self.seed, "push", "--quiet", "origin", f"scratch:refs/heads/foo/refs/heads/{self.SPENT}")
+        git(self.seed, "checkout", "--quiet", "main")
+        answer = self.broker.branch_view(
+            {"repository": "local.test/acme/infra", "branch": self.SPENT}
+        )
+        self.assertEqual(answer["branch"], {"name": self.SPENT, "exists": False, "revision": None})
+
+    def test_delete_refuses_a_branch_that_moved_on_after_its_proposal_closed(self):
+        carried = self.push_branch(self.SPENT, "first\n")
+        self.closed(self.SPENT, carried)
+        tip = self.push_branch(self.SPENT, "second\n")
+        self.assertEqual(self.refused(self.SPENT, tip), "NOT_SPENT")
+        self.assertEqual(self.remote_tip(self.SPENT), tip)
+
+    def test_delete_refuses_a_branch_with_no_proposal_history(self):
+        # Pushed and never proposed: a publish in flight looks exactly like this.
+        tip = self.push_branch(self.SPENT)
+        self.assertEqual(self.refused(self.SPENT, tip), "NOT_SPENT")
+        self.assertTrue(self.exists(self.SPENT))
+
+    def test_delete_refuses_when_the_branch_is_not_where_the_caller_read_it(self):
+        tip = self.push_branch(self.SPENT)
+        self.closed(self.SPENT, tip)
+        self.assertEqual(self.refused(self.SPENT, "b" * 40), "BRANCH_MOVED")
+        self.assertTrue(self.exists(self.SPENT))
+
+    def test_delete_refuses_a_protected_branch_inside_the_namespace(self):
+        tip = self.push_branch("platform-agent/trunk")
+        self.closed("platform-agent/trunk", tip)
+        self.broker.base_branch = "platform-agent/trunk"
+        self.assertEqual(self.refused("platform-agent/trunk", tip), "PROTECTED_BRANCH")
+        self.assertTrue(self.exists("platform-agent/trunk"))
+
+    def test_delete_refuses_on_a_forge_that_cannot_list_proposals(self):
+        self.broker.registry.hosts["local.test"] = LocalForge(self.forges, self.refreshed)
+        tip = self.push_branch(self.SPENT)
+        self.assertEqual(self.refused(self.SPENT, tip), "FORGE_UNSUPPORTED")
+        self.assertTrue(self.exists(self.SPENT))
+
+    def test_delete_loses_to_a_publish_that_lands_between_the_read_and_the_push(self):
+        # The lease is the whole defence here: every check above passed on the
+        # tip read a moment ago, and a sibling moved the branch since.
+        tip = self.push_branch(self.SPENT, "first\n")
+        self.closed(self.SPENT, tip)
+        runner = self.broker._git_runner
+        raced = []
+
+        def racing(argv, cwd, check=True, config=()):
+            if "push" in argv and not raced:
+                raced.append(self.push_branch(self.SPENT, "sibling\n"))
+            return runner(argv, cwd, check, config)
+
+        self.broker._git_runner = racing
+        # Refused as the move it is, not as a git failure a caller would retry.
+        self.assertEqual(self.refused(self.SPENT, tip), "BRANCH_MOVED")
+        self.assertEqual(self.remote_tip(self.SPENT), raced[0])
+
+    def test_delete_that_fails_for_another_reason_is_still_a_git_failure(self):
+        tip = self.push_branch(self.SPENT)
+        self.closed(self.SPENT, tip)
+        runner = self.broker._git_runner
+
+        def refusing(argv, cwd, check=True, config=()):
+            if "push" in argv:
+                argv = [*argv[:-1], ":refs/heads/no/such:thing"]
+            return runner(argv, cwd, check, config)
+
+        self.broker._git_runner = refusing
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.delete(self.SPENT, tip)
+        self.assertTrue(self.exists(self.SPENT))
+
+    def test_delete_the_remote_refuses_is_refused_rather_than_left_to_retry(self):
+        # A hook or branch rule answers every attempt alike; GIT_FAILED would
+        # send the caller round again.
+        tip = self.push_branch(self.SPENT)
+        self.closed(self.SPENT, tip)
+        hook = Path(self.origin) / "hooks" / "pre-receive"
+        hook.write_text(
+            "#!/bin/sh\n"
+            "while read old new ref; do\n"
+            "  case $new in 0000000000000000000000000000000000000000)"
+            " echo 'deletions are restricted' >&2; exit 1;; esac\n"
+            "done\n"
+        )
+        hook.chmod(0o755)
+        with self.assertRaises(WorkspaceError) as caught:
+            self.delete(self.SPENT, tip)
+        self.assertEqual(caught.exception.fields.get("code"), "DELETE_REFUSED")
+        self.assertIn("remote rejected", str(caught.exception))
+        self.assertTrue(self.exists(self.SPENT))
+
+    def test_a_transient_remote_rejection_is_a_git_failure_to_retry(self):
+        # receive-pack answers a lock race or a backend fault with the same
+        # `[remote rejected]` a hook gets. The next attempt clears it, so it
+        # is not a verdict on the name.
+        tip = self.push_branch(self.SPENT)
+        self.closed(self.SPENT, tip)
+        runner = self.broker._git_runner
+        for reason in ("failed to lock", "failed to update ref", "Internal Server Error"):
+            with self.subTest(reason=reason):
+
+                def rejecting(argv, cwd, check=True, config=()):
+                    if "push" in argv:
+                        return subprocess.CompletedProcess(
+                            argv, 1, "",
+                            f" ! [remote rejected] {self.SPENT} ({reason})\n"
+                            "error: failed to push some refs\n",
+                        )
+                    return runner(argv, cwd, check, config)
+
+                self.broker._git_runner = rejecting
+                with self.assertRaises(subprocess.CalledProcessError):
+                    self.delete(self.SPENT, tip)
+                self.assertTrue(self.exists(self.SPENT))
+
+    def test_a_ruleset_or_denied_delete_is_still_refused(self):
+        tip = self.push_branch(self.SPENT)
+        self.closed(self.SPENT, tip)
+        runner = self.broker._git_runner
+        for reason in (
+            "protected branch hook declined",
+            "push declined due to repository rule violations",
+            "deletion prohibited",
+        ):
+            with self.subTest(reason=reason):
+
+                def rejecting(argv, cwd, check=True, config=()):
+                    if "push" in argv:
+                        return subprocess.CompletedProcess(
+                            argv, 1, "", f" ! [remote rejected] {self.SPENT} ({reason})\n"
+                        )
+                    return runner(argv, cwd, check, config)
+
+                self.broker._git_runner = rejecting
+                with self.assertRaises(WorkspaceError) as caught:
+                    self.delete(self.SPENT, tip)
+                self.assertEqual(caught.exception.fields.get("code"), "DELETE_REFUSED")
+
+    def test_delete_whose_push_failed_after_it_landed_answers_gone(self):
+        # Not BRANCH_MOVED: nothing moved it, and "whatever moved it is kept"
+        # would be false about a branch that is not there.
+        tip = self.push_branch(self.SPENT)
+        self.closed(self.SPENT, tip)
+        runner = self.broker._git_runner
+
+        def landed_then_failed(argv, cwd, check=True, config=()):
+            done = runner(argv, cwd, check, config)
+            if "push" in argv:
+                return subprocess.CompletedProcess(argv, 1, done.stdout, "connection reset")
+            return done
+
+        self.broker._git_runner = landed_then_failed
+        answer = self.delete(self.SPENT, tip)
+        self.assertEqual(answer["branch"], {"name": self.SPENT, "deleted": False, "revision": None})
+        self.assertFalse(self.exists(self.SPENT))
+
+    # -- whose branch it is ----------------------------------------------
+
+    def test_delete_refuses_a_branch_whose_spent_proposal_a_person_opened(self):
+        # Under the prefix, closed, tip carried -- and somebody else's.
+        tip = self.push_branch(self.SPENT)
+        self.closed(self.SPENT, tip, author="a-maintainer")
+        self.broker._transport = lambda _forge: SelfAware("kube-agents[bot]")
+        self.assertEqual(self.refused(self.SPENT, tip), "BRANCH_NOT_OURS")
+        self.assertTrue(self.exists(self.SPENT))
+
+    def test_delete_refuses_a_persons_branch_this_install_then_proposed_from(self):
+        # The carrier a caller can mint: a person proposed from the branch and
+        # closed it, then this install opened and closed its own proposal at
+        # the same tip. The tip is carried and the carrier is ours, but the
+        # branch was a person's first.
+        tip = self.push_branch(self.SPENT)
+        self.closed(self.SPENT, tip, author="a-maintainer")
+        self.closed(self.SPENT, tip, author="kube-agents")
+        self.broker._transport = lambda _forge: SelfAware("kube-agents[bot]")
+        self.assertEqual(self.refused(self.SPENT, tip), "BRANCH_NOT_OURS")
+        self.assertTrue(self.exists(self.SPENT))
+
+    def test_delete_refuses_a_history_longer_than_the_page_it_reads(self):
+        # Ten of this install's proposals at the tip, newest first, and a
+        # person's before them: the page shows only ours, and says it is a page.
+        tip = self.push_branch(self.SPENT)
+        for _ in range(vcs_broker.PROPOSAL_HISTORY_ON_A_BRANCH):
+            self.closed(self.SPENT, tip, author="kube-agents")
+        self.closed(self.SPENT, tip, author="a-maintainer")
+        self.broker._transport = lambda _forge: SelfAware("kube-agents[bot]")
+        self.assertEqual(self.refused(self.SPENT, tip), "BRANCH_NOT_OURS")
+        self.assertTrue(self.exists(self.SPENT))
+
+    def test_delete_takes_a_fixed_name_that_has_carried_ten_of_its_own(self):
+        # One name per workload, reused on every alert: ten rounds of this
+        # install's own remediations are a history, not a stranger's branch.
+        tip = self.push_branch(self.SPENT)
+        for _ in range(10):
+            self.closed(self.SPENT, tip, author="kube-agents")
+        self.broker._transport = lambda _forge: SelfAware("kube-agents[bot]")
+        self.delete(self.SPENT, tip)
+        self.assertFalse(self.exists(self.SPENT))
+
+    def test_a_full_page_of_history_is_refused_for_its_length_not_an_owner(self):
+        tip = self.push_branch(self.SPENT)
+        for _ in range(vcs_broker.PROPOSAL_HISTORY_ON_A_BRANCH):
+            self.closed(self.SPENT, tip, author="kube-agents")
+        self.broker._transport = lambda _forge: SelfAware("kube-agents[bot]")
+        with self.assertRaises(WorkspaceError) as caught:
+            self.delete(self.SPENT, tip)
+        self.assertEqual(caught.exception.fields.get("code"), "BRANCH_NOT_OURS")
+        self.assertIn("at least", str(caught.exception))
+        self.assertIn("not a proposal found to be somebody else's", str(caught.exception))
+
+    def test_delete_takes_the_installs_own_proposal_whatever_the_bot_marking(self):
+        tip = self.push_branch(self.SPENT)
+        self.closed(self.SPENT, tip, author="kube-agents")
+        self.broker._transport = lambda _forge: SelfAware("kube-agents[bot]")
+        self.delete(self.SPENT, tip)
+        self.assertFalse(self.exists(self.SPENT))
+
+    def test_delete_refuses_a_branch_whose_spent_proposal_came_from_a_fork(self):
+        tip = self.push_branch(self.SPENT)
+        self.closed(self.SPENT, tip, source_repo="stranger/infra")
+        self.assertEqual(self.refused(self.SPENT, tip), "BRANCH_NOT_OURS")
+        self.assertTrue(self.exists(self.SPENT))
+
+    def test_delete_refuses_when_who_the_credential_is_could_not_be_asked(self):
+        tip = self.push_branch(self.SPENT)
+        self.closed(self.SPENT, tip)
+        self.broker._transport = lambda _forge: LookupFailed()
+        self.assertEqual(self.refused(self.SPENT, tip), "FORGE_CALL_FAILED")
+        self.assertTrue(self.exists(self.SPENT))
+
+    def test_branch_verbs_read_a_full_ref_as_the_branch_it_names(self):
+        tip = self.push_branch(self.SPENT)
+        self.closed(self.SPENT, tip)
+        view = self.broker.branch_view(
+            {"repository": "local.test/acme/infra", "branch": f"refs/heads/{self.SPENT}"}
+        )
+        self.assertEqual(view["branch"]["name"], self.SPENT)
+        answer = self.delete(f"refs/heads/{self.SPENT}", tip)
+        self.assertEqual(answer["branch"]["name"], self.SPENT)
+        self.assertFalse(self.exists(self.SPENT))
+
+
 class CapabilitiesTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1323,6 +1741,14 @@ class CapabilitiesTest(unittest.TestCase):
         self.assertIsNone(answer["forge"])
         self.assertEqual(answer["verbs"], [])
         self.assertIn("not a forge this install serves", answer["missing"][0])
+
+    def test_a_forge_that_cannot_list_proposals_does_not_offer_branch_delete(self):
+        # The broker refuses the delete there, so it is not advertised.
+        verbs = LocalForge(Path(self.tmp.name), []).capabilities("acme/infra")["verbs"]
+        self.assertIn("branch-view", verbs)
+        self.assertNotIn("branch-delete", verbs)
+        listing = HistoryLocalForge(Path(self.tmp.name), []).capabilities("acme/infra")
+        self.assertIn("branch-delete", listing["verbs"])
 
     def test_capabilities_spends_no_credential(self):
         minted = []
@@ -1533,9 +1959,85 @@ class CollaborationTest(unittest.TestCase):
         self.assertIn("labels=bug", recorder.path)
         self.assertIn("state=open", recorder.path)
 
+    def test_issue_list_reads_past_a_page_of_proposals(self):
+        # A label that proposals share -- every remediation pull request carries
+        # its audit's label -- can fill the first page with proposals alone.
+        # Reading that page as "no issues" is how a second ledger gets opened.
+        prs = [{"number": n, "pull_request": {"url": "..."}} for n in range(200, 100, -1)]
+        broker, recorder = self.broker(prs, [{"number": 3, "title": "the ledger"}])
+        answer = broker.issue_list(
+            {"repository": "acme/infra", "state": "open", "labels": ["audit:a1"], "limit": 2}
+        )
+        self.assertEqual([i["number"] for i in answer["issues"]], [3])
+        self.assertFalse(answer["truncated"])
+        self.assertEqual(len(recorder.calls), 2)
+        self.assertIn("page=2", urllib.parse.unquote(recorder.calls[1][4]))
+
+    def test_issue_list_that_runs_out_on_the_limit_is_not_truncated(self):
+        # Review finding: the forge ran out on a short second page with exactly
+        # `limit` issues read, and that was reported as a page with more behind
+        # it, which a verb that takes no page cannot act on.
+        prs = [{"number": n, "pull_request": {"url": "..."}} for n in range(200, 101, -1)]
+        broker, _ = self.broker(prs + [{"number": 8}], [{"number": 3}])
+        answer = broker.issue_list(
+            {"repository": "acme/infra", "state": "open", "labels": ["audit:a1"], "limit": 2}
+        )
+        self.assertEqual([i["number"] for i in answer["issues"]], [8, 3])
+        self.assertFalse(answer["truncated"])
+
+    def test_issue_list_reaches_as_far_for_a_small_limit(self):
+        # Review finding: the scan read pages of `limit`, so a small limit
+        # reached ten times itself past the proposals and no further. Pages are
+        # read full-sized and cut to the limit afterwards.
+        prs = [{"number": n, "pull_request": {"url": "..."}} for n in range(200, 100, -1)]
+        broker, recorder = self.broker(prs, [{"number": 3}, {"number": 2}])
+        answer = broker.issue_list({"repository": "acme/infra", "labels": ["audit:a1"], "limit": 1})
+        self.assertEqual([i["number"] for i in answer["issues"]], [3])
+        self.assertTrue(answer["truncated"])
+        for call in recorder.calls:
+            self.assertIn("per_page=100", urllib.parse.unquote(call[4]))
+
+    def test_a_conversation_is_read_past_one_page(self):
+        # A long-lived ledger passes a hundred comments; the markers that stop
+        # a reply going out twice are on the later pages, so one page is not
+        # the conversation.
+        def note(n):
+            return {"id": n, "body": f"c{n}", "user": {"login": "u"}, "created_at": f"2026-01-01T00:{n // 60:02d}:{n % 60:02d}Z"}
+
+        broker, recorder = self.broker(
+            {"number": 7, "title": "ledger"},
+            [note(n) for n in range(100)],
+            [note(n) for n in range(100, 120)],
+        )
+        answer = broker.issue_view(
+            {"repository": "acme/infra", "number": 7, "comments": True, "limit": 500}
+        )
+        self.assertEqual(answer["commentCount"], 120)
+        self.assertFalse(answer["commentsTruncated"])
+        self.assertIn("page=2", urllib.parse.unquote(recorder.calls[2][4]))
+
+    def test_a_short_last_page_past_the_limit_is_truncation(self):
+        # A limit that is not a multiple of the page size: the second page is
+        # short, so it does not look full, but it carries more than the limit
+        # keeps. What is cut there is as unseen as an unread page.
+        def note(n):
+            return {"id": n, "body": f"c{n}", "user": {"login": "u"}, "created_at": f"2026-01-01T00:{n // 60:02d}:{n % 60:02d}Z"}
+
+        broker, _ = self.broker(
+            {"number": 7, "title": "ledger"},
+            [note(n) for n in range(100)],
+            [note(n) for n in range(100, 160)],
+        )
+        answer = broker.issue_view(
+            {"repository": "acme/infra", "number": 7, "comments": True, "limit": 150}
+        )
+        self.assertEqual(answer["commentCount"], 150)
+        self.assertTrue(answer["commentsTruncated"])
+
     def test_a_listing_says_when_it_is_a_page(self):
-        broker, _ = self.broker([{"number": n} for n in range(3)])
+        broker, _ = self.broker([{"number": n} for n in range(4)])
         answer = broker.issue_list({"repository": "acme/infra", "limit": 3})
+        self.assertEqual(answer["count"], 3)
         self.assertTrue(answer["truncated"])
 
     def test_issue_view_refuses_a_proposal_number(self):
@@ -1783,6 +2285,196 @@ class CollaborationTest(unittest.TestCase):
         # Owner-qualified, so a fork carrying the same branch name cannot
         # answer for this repository's proposal.
         self.assertIn("head=acme%3Aplatform-agent%2Ffix", asked)
+
+    def test_proposal_list_by_label_reads_the_issues_endpoint_not_search(self):
+        # Search lags a write: a sweep that opened a proposal a second ago and
+        # lists again must find it, or it opens a second one.
+        def pull(number, branch, base="main", owner="acme"):
+            return {
+                "number": number,
+                "state": "open",
+                "user": {"login": "u"},
+                "head": {"ref": branch, "sha": "abc", "repo": {"full_name": f"{owner}/infra"}},
+                "base": {"ref": base},
+                "closed_at": None,
+            }
+
+        page = [
+            {"number": 3, "pull_request": {}},
+            {"number": 4},  # an issue carrying the same labels
+            {"number": 5, "pull_request": {}},
+        ]
+        newest = [pull(5, "fix", owner="fork"), pull(3, "fix")]
+        broker, recorder = self.broker(page, newest)
+        answer = broker.proposal_list(
+            {
+                "repository": "acme/infra",
+                "state": "all",
+                "labels": ["audit:a1", "audit:remediation"],
+            }
+        )
+        asked = urllib.parse.unquote(recorder.calls[0][4])
+        self.assertTrue(asked.startswith("repos/acme/infra/issues?"))
+        self.assertIn("labels=audit:a1,audit:remediation", asked)
+        self.assertIn("state=all", asked)
+        self.assertNotIn("head=", asked)
+        # The pull requests are read back for their heads; the issue is not.
+        self.assertEqual(len(recorder.calls), 2)
+        scan = urllib.parse.unquote(recorder.calls[1][4])
+        self.assertTrue(scan.startswith("repos/acme/infra/pulls?"))
+        self.assertIn("state=all", scan)
+        self.assertEqual([p["number"] for p in answer["proposals"]], [3, 5])
+        self.assertEqual(answer["proposals"][0]["closed"], "")
+
+    def test_a_labelled_source_filter_asks_for_the_branch_and_matches_labels_here(self):
+        # Review finding: with labels, the branch was matched against one page
+        # of the label's newest hits, so on a label with more carriers than
+        # the limit an older branch's proposal answered as absent. The branch
+        # is the narrower question: ask `/pulls` for it exactly, as the
+        # unlabelled path does, and match the labels on what comes back.
+        def pull(number, labels):
+            return {
+                "number": number,
+                "state": "open",
+                "user": {"login": "u"},
+                "head": {"ref": "fix", "sha": "abc", "repo": {"full_name": "acme/infra"}},
+                "base": {"ref": "main"},
+                "closed_at": None,
+                "labels": [{"name": name} for name in labels],
+            }
+
+        broker, recorder = self.broker(
+            [pull(9, ["other"]), pull(3, ["Audit:A1", "audit:remediation"])]
+        )
+        answer = broker.proposal_list(
+            {
+                "repository": "Acme/infra",
+                "state": "all",
+                "labels": ["audit:a1", "audit:remediation"],
+                "source": "fix",
+                "limit": 1,
+            }
+        )
+        self.assertEqual(len(recorder.calls), 1)
+        asked = urllib.parse.unquote(recorder.calls[0][4])
+        self.assertTrue(asked.startswith("repos/Acme/infra/pulls?"), asked)
+        self.assertIn("head=Acme:fix", asked)
+        # A full page, cut to the limit after the labels are matched: a limit
+        # of one asked of the forge would return only the unlabelled newer one.
+        self.assertIn("per_page=100", asked)
+        # GitHub matches label names without regard to case, as the issues
+        # filter this stands in for does.
+        self.assertEqual([p["number"] for p in answer["proposals"]], [3])
+
+    def test_a_labelled_source_filter_pages_through_the_matches(self):
+        # Review finding: the caller's page went to the forge with a page size
+        # of a hundred, so page 2 was the branch's proposals 101-200 and the
+        # matches between the limit and a hundred were unreachable.
+        def pull(number):
+            return {
+                "number": number,
+                "state": "closed",
+                "user": {"login": "u"},
+                "head": {"ref": "fix", "sha": "abc", "repo": {"full_name": "acme/infra"}},
+                "base": {"ref": "main"},
+                "closed_at": None,
+                "labels": [{"name": "audit:a1"}],
+            }
+
+        nodes = [pull(n) for n in range(10, 0, -1)]
+        query = {"repository": "acme/infra", "state": "all", "labels": ["audit:a1"], "source": "fix", "limit": 4}
+        first, recorder = self.broker(nodes)
+        answer = first.proposal_list(query)
+        self.assertEqual([p["number"] for p in answer["proposals"]], [10, 9, 8, 7])
+        self.assertTrue(answer["truncated"])
+        second, recorder = self.broker(nodes)
+        answer = second.proposal_list({**query, "page": 2})
+        self.assertNotRegex(urllib.parse.unquote(recorder.calls[0][4]), r"[?&]page=")
+        self.assertEqual([p["number"] for p in answer["proposals"]], [6, 5, 4, 3])
+        self.assertTrue(answer["truncated"])
+        third, _ = self.broker(nodes)
+        answer = third.proposal_list({**query, "page": 3})
+        self.assertEqual([p["number"] for p in answer["proposals"]], [2, 1])
+        self.assertFalse(answer["truncated"])
+
+    def test_a_labelled_source_filter_reads_past_the_branchs_newest_hundred(self):
+        # Review finding: one request of the branch's newest hundred left the
+        # older matches unreachable, and every page answered truncated, so a
+        # caller reading until truncated is false never stopped.
+        def pull(number, labels):
+            return {
+                "number": number,
+                "state": "closed",
+                "user": {"login": "u"},
+                "head": {"ref": "fix", "sha": "abc", "repo": {"full_name": "acme/infra"}},
+                "base": {"ref": "main"},
+                "closed_at": None,
+                "labels": [{"name": name} for name in labels],
+            }
+
+        newest = [pull(n, ["audit:a1"] if n == 150 else []) for n in range(150, 50, -1)]
+        older = [pull(n, ["audit:a1"]) for n in (40, 30)]
+        query = {"repository": "acme/infra", "state": "all", "labels": ["audit:a1"], "source": "fix", "limit": 2}
+        broker, recorder = self.broker(newest, older)
+        answer = broker.proposal_list(query)
+        self.assertEqual([p["number"] for p in answer["proposals"]], [150, 40])
+        self.assertTrue(answer["truncated"])
+        self.assertRegex(urllib.parse.unquote(recorder.calls[1][4]), r"[?&]page=2(&|$)")
+        broker, _ = self.broker(newest, older)
+        answer = broker.proposal_list({**query, "page": 2})
+        self.assertEqual([p["number"] for p in answer["proposals"]], [30])
+        self.assertFalse(answer["truncated"])
+
+    @staticmethod
+    def labelled(numbers):
+        return [{"number": n, "pull_request": {}} for n in numbers]
+
+    @staticmethod
+    def pulls(numbers):
+        return [
+            {"number": n, "state": "closed", "head": {"ref": f"b{n}"}, "base": {"ref": "main"}}
+            for n in numbers
+        ]
+
+    def test_a_label_a_stream_has_used_for_years_costs_pages_not_proposals(self):
+        # A hundred hits on the label, all among the newest hundred and fifty
+        # pull requests: two pages of `/pulls`, not a hundred reads.
+        hits = list(range(250, 150, -1))
+        broker, recorder = self.broker(
+            self.labelled(hits), self.pulls(range(250, 150, -1)), self.pulls(range(150, 100, -1))
+        )
+        answer = broker.proposal_list(
+            {"repository": "acme/infra", "state": "all", "labels": ["audit:a1"], "limit": 100}
+        )
+        self.assertEqual([p["number"] for p in answer["proposals"]], hits)
+        self.assertEqual(len(recorder.calls), 2)
+
+    def test_a_few_old_hits_in_a_busy_repository_are_read_one_at_a_time(self):
+        # Two hits far back: one page of `/pulls` is all the scan is allowed,
+        # and what it did not find is read directly.
+        broker, recorder = self.broker(
+            self.labelled([40, 12]),
+            self.pulls(range(900, 800, -1)),
+            self.pulls([40])[0],
+            self.pulls([12])[0],
+        )
+        answer = broker.proposal_list(
+            {"repository": "acme/infra", "state": "all", "labels": ["audit:a1"]}
+        )
+        self.assertEqual([p["number"] for p in answer["proposals"]], [40, 12])
+        self.assertEqual(
+            [c[4] for c in recorder.calls[2:]],
+            ["repos/acme/infra/pulls/40", "repos/acme/infra/pulls/12"],
+        )
+
+    def test_a_labelled_listing_is_truncated_on_what_the_forge_sent(self):
+        # A full page that filters down to fewer proposals still has a next page.
+        broker, _ = self.broker([{"number": 4}, {"number": 6}])
+        answer = broker.proposal_list(
+            {"repository": "acme/infra", "labels": ["audit:a1"], "limit": 2}
+        )
+        self.assertEqual(answer["proposals"], [])
+        self.assertTrue(answer["truncated"])
 
     def test_issue_list_with_a_query_goes_through_search(self):
         broker, recorder = self.broker({"items": [{"number": 1, "title": "t", "state": "open", "user": {"login": "u"}}]})

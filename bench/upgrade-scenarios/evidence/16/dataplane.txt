@@ -1,0 +1,56 @@
+
+## 2026-09-29T14:33:44Z [dataplane/enforcement-before] G container clusters describe upg-16b --zone us-central1-a --format=value(networkPolicy,addonsConfig.networkPolicyConfig,networkConfig.datapathProvider)
+	disabled=True	
+## exit 0
+
+## 2026-09-29T14:33:45Z [dataplane/connect-before] connect
+<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+## exit 0
+
+## 2026-09-29T14:33:46Z [dataplane/enable-addon] G container clusters update upg-16b --zone us-central1-a --update-addons=NetworkPolicy=ENABLED --quiet
+Updating upg-16b...
+.............................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................done.
+Updated [https://container.googleapis.com/v1/projects/<PROJECT_ID>/zones/us-central1-a/clusters/upg-16b].
+To inspect the contents of your cluster, go to: https://console.cloud.google.com/kubernetes/workload_/gcloud/us-central1-a/upg-16b?project=<PROJECT_ID>
+## exit 0
+
+## 2026-09-29T14:42:32Z [dataplane/enable-enforcement] G container clusters update upg-16b --zone us-central1-a --enable-network-policy --quiet
+Updating upg-16b...
+.........................done.
+Updated [https://container.googleapis.com/v1/projects/<PROJECT_ID>/zones/us-central1-a/clusters/upg-16b].
+To inspect the contents of your cluster, go to: https://console.cloud.google.com/kubernetes/workload_/gcloud/us-central1-a/upg-16b?project=<PROJECT_ID>
+## exit 0
+
+## 2026-09-29T14:44:42Z [dataplane/enforcement-configured] G container clusters describe upg-16b --zone us-central1-a --format=value(networkPolicy,addonsConfig.networkPolicyConfig)
+enabled=True;provider=CALICO	
+## exit 0
+
+## 2026-09-29T14:44:42Z [dataplane/calico-before] calico
+No resources found in kube-system namespace.
+## exit 0
+
+## 2026-09-29T14:44:43Z [dataplane/connect-dormant] connect
+<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+## exit 0
+
+## 2026-09-29T14:59:34Z [dataplane/nodes] K get nodes -o wide
+NAME                                     STATUS   ROLES    AGE     VERSION                INTERNAL-IP    EXTERNAL-IP     OS-IMAGE                             KERNEL-VERSION   CONTAINER-RUNTIME
+gke-upg-16b-default-pool-33088bb0-l342   Ready    <none>   29m     v1.34.11-gke.1056000   10.128.0.131   <EXTERNAL_IP>     Container-Optimized OS from Google   6.12.94+         containerd://2.2.7
+gke-upg-16b-work-pool-3b947e45-p6m9      Ready    <none>   5m51s   v1.35.8-gke.1380000    10.128.0.30    <EXTERNAL_IP>   Container-Optimized OS from Google   6.12.94+         containerd://2.2.7
+## exit 0
+
+## 2026-09-29T14:59:35Z [dataplane/calico-after] calico
+NAME                READY   STATUS    RESTARTS   AGE     IP            NODE                                  NOMINATED NODE   READINESS GATES
+calico-node-vzhzb   1/1     Running   0          5m50s   10.128.0.30   gke-upg-16b-work-pool-3b947e45-p6m9   <none>           <none>
+## exit 0
+
+## 2026-09-29T14:59:35Z [dataplane/connect-after] connect
+wget: download timed out
+command terminated with exit code 1
+## exit 0

@@ -86,9 +86,9 @@
 # out from the forge that it landed.
 #
 # WHAT IT LEAVES BEHIND: one open pull request per run on the GitOps
-# repository, permanently -- the same unbounded accumulation
-# rca-remediation-pr accepts, and for the same reason: nothing closes a pull
-# request opened through submit-suggestion. Every run writes the same path on
+# repository, until the job's reset (hack/ci_reset_agent_pulls.py, #2260)
+# closes it before the next repetition of a case that requests one, or the
+# next lease -- submit-suggestion itself closes nothing. Every run writes the same path on
 # its own branch, which never merges, so the runs do not collide. The case
 # asserts on its own run's output rather than on repository state, so the pile
 # does not make it flake.
@@ -146,12 +146,65 @@ verification_spec:
     mode: assert
     check:
       type: worker_commands
-      # A command word, not a substring: `/opt/vcs/libexec/git` is the
-      # sanctioned local git and must not trip this; a bare `git clone` or any
-      # `gh` at the start of a command or after a shell join must.
+      # A command word, not a substring: `git log` on the working copy is the
+      # sanctioned local git and must not trip this; a `git clone` or any `gh`
+      # at the start of a command or after a shell join must.
       forbidden_patterns:
         - '(^|&&|;|\|)\s*gh\s'
         - '(^|&&|;|\|)\s*git\s+(clone|fetch|pull|push|ls-remote)\b'
+  # The commit step runs `git` and `submit_suggestion.py` as the programs
+  # themselves. A worker runs as `hermes chat -q`, where the command scanner refuses
+  # a command whose program is a shell variable (`$G add`, `"$S" prepare`) and
+  # the refusal is final; a skill that teaches the variable form costs every
+  # pull-request-opening worker its first attempts at the step.
+  - name: the-commit-step-called-its-programs-by-path
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      # The log keeps a one-line summary of each terminal call, its lines
+      # joined with spaces, so `cd "$WS"` followed by a `grep` line reads as
+      # `"$WS" grep`. The first pattern therefore takes a variable as the
+      # program only at the start of the summary or after `;`, `&`, `|` or
+      # `$(`: the `"$S" prepare` a `;` or `&&` chain shows as its first command.
+      # A bare `(` is left out because a quoted message holds one far more often
+      # than a subshell does: `echo "opened PR (${SHA} commit)"`. Shell
+      # keywords, wrappers such as `xargs` and a `!` may come between the two
+      # (`if ! $G diff`, `| xargs $G add`); a `!` takes no flags. The run may
+      # also start after a space with a keyword, since the joined lines have
+      # no `;` between them: an `if` block's `then`, or a second line that
+      # starts with `time`. It may not start there with a wrapper, since
+      # `exec` and `env` are also other tools' subcommands
+      # (`kubectl exec "$POD" -n ns`), or with a `!`, which there is more
+      # often a test's negation, `[ ! "$FORCE" -a -f "$LOCK" ]`.
+      # What follows it is a listed git subcommand, `submit_suggestion.py`'s
+      # `prepare` or `submit`, or a flag (`$G -C dir`): any word would also
+      # match a variable inside a quoted message, `"done; ${SHA} pushed"`.
+      # A test's comparison operator is not a flag, so
+      # `[[ -n "$A" && ! "$N" -gt 0 ]]` is not read as a program.
+      # The second is the assignment, which is how a multi-line call's
+      # `G=...` then `$G add` shows up once its lines are joined; capturing
+      # git's output, `SHA=$(git rev-parse HEAD)`, is not one. The value is
+      # `git` by name or by any path, or `submit_suggestion.py` by any path.
+      # Not seen: a variable command that is neither the chain's first shown
+      # command nor in the same call as its assignment, since the summary
+      # drops a chain's later commands, a loop's body among them, and its
+      # `export` segments. Nor one behind a keyword or wrapper the first
+      # pattern does not list, behind a run that starts after a space with a
+      # wrapper or a `!` (`cd ws nohup $G push`), or behind a listed wrapper
+      # given an option argument or an assignment (`xargs -n 1 $G add`,
+      # `env A=b $G add`). The
+      # patterns show whether this case's worker hit the refusal. What keeps
+      # the skills from teaching the variable form again is the image build's
+      # check_skill_commands.py, which runs the shell blocks of their SKILL.md
+      # files through Tirith, and for inline code
+      # tests/test_skill_inline_commands.py and the stockout plugin's
+      # test_skill_commands.py. Those read the skill's own
+      # text, so they see a chain's later commands, but their patterns miss
+      # the same unlisted wrappers and wrapper arguments.
+      forbidden_patterns:
+        - '((^|[;&|]|\$\()\s*((if|then|else|elif|do|while|until|time|xargs|exec|env|nohup|command)\s+(-\S+\s+)*|!\s+)*|\s(if|then|else|elif|do|while|until|time)\s+(-\S+\s+)*((if|then|else|elif|do|while|until|time|xargs|exec|env|nohup|command)\s+(-\S+\s+)*|!\s+)*)"?\$\{?[A-Za-z_]\w*\}?"?\s+(-{1,2}(?!(eq|ne|gt|ge|lt|le|nt|ot|ef)\b)[A-Za-z]|(add|am|apply|bisect|blame|branch|cat-file|checkout|cherry-pick|clean|clone|commit|config|describe|diff|diff-tree|fetch|for-each-ref|format-patch|gc|grep|init|log|ls-files|ls-remote|ls-tree|merge|merge-base|mv|notes|pull|push|rebase|reflog|remote|reset|restore|rev-list|rev-parse|revert|rm|show|show-ref|stash|status|submodule|switch|symbolic-ref|tag|update-ref|worktree|prepare|submit)\b)'
+        - '(^|[\s;&|(])[A-Za-z_]\w*=(?!"?(\$\(|`))"?(\S*/)?(git|submit_suggestion\.py)(?![\w.-])'
   - name: the-pull-request-is-real-and-this-runs
     role: objective
     mode: assert

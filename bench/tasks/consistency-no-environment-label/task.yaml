@@ -14,10 +14,10 @@
 # (skills/fleet-audit/scripts/fleet_drift.py) turns that permanent coverage
 # gap into a finding naming the label to set.
 #
-# Planted state: none of its own. The seeded fleet labels seeded-a/-b/-c
+# Planted state: none of its own. The seeded fleet labels every seeded cluster
 # `environment = seeded` (bench/tf/fleet/main.tf) so that they cohort alone,
 # and the install's own host cluster carries no environment label. The
-# collector fires §4.14 for the unlabelled host beside the three labelled
+# collector fires §4.14 for the unlabelled host beside the labelled
 # peers -- mode is not part of that key, so what makes the host uncompared is
 # the missing label alone; the fixture role below is the one this fleet
 # carries for the drift stream, and the two sibling objectives bind the run
@@ -37,8 +37,8 @@
 #      §4.14 still fires on the Standard host's own short cohort.
 #   -- The finding recommends `environment=seeded`, the one value that
 #      reaches the floor. Nobody may APPLY it to the host: bench/tf/fleet
-#      reserves that value for the trio, and a fourth voter changes the
-#      authorized-networks arithmetic consistency-drift-outlier depends on.
+#      reserves that value for its own clusters, and a further voter changes
+#      the authorized-networks arithmetic consistency-drift-outlier depends on.
 #      The audit only files the finding; the remediation is prose in the
 #      ledger, never a pull request, because nothing in the eval GitOps
 #      repository declares the host cluster.

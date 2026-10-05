@@ -62,6 +62,50 @@
       "description": "Autonomous diagnostic and remediation skill for GKE compute stockouts."
     },
     {
+      "name": "a2a-gateway",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/a2a-gateway",
+      "tagPolicy": "release",
+      "override": "A2A_GATEWAY_IMAGE",
+      "pulledBy": "The A2A gateway Deployment the operator renders under spec.mode: next, and nothing on a default install. The operator derives it from its own image, else from the agent image it resolves (registry and tag), unless the override is set; the worker and the callout resolve the same way.",
+      "description": "The chat gateway of the A2A next stack: adapters, the bus relay and the session spawner (a2a/Dockerfile.gateway)."
+    },
+    {
+      "name": "a2a-worker",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/a2a-worker",
+      "tagPolicy": "release",
+      "override": "A2A_WORKER_IMAGE",
+      "pulledBy": "The session pods the A2A gateway spawns under spec.mode: next; the operator passes its resolution to the gateway as A2A_WORKER_IMAGE. The image also carries the credential broker's shim as `kubectl` and `gcloud`, used only when the operator's A2A_SESSION_CLUSTER_VIEW flag gives a session pod its read-only cluster view.",
+      "description": "The session worker of the A2A next stack (a2a/Dockerfile.worker): the agent SDK, the worker adapter, and the credential broker's shim as kubectl and gcloud for the flag-gated cluster view."
+    },
+    {
+      "name": "a2a-authcallout",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/a2a-authcallout",
+      "tagPolicy": "release",
+      "override": "A2A_CALLOUT_IMAGE",
+      "pulledBy": "The auth callout Deployment the operator renders under spec.mode: next, and nothing on a default install.",
+      "description": "The NATS auth callout that turns a projected ServiceAccount token into a bus identity (a2a/Dockerfile.authcallout)."
+    },
+    {
+      "name": "a2a-verifier",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/a2a-verifier",
+      "tagPolicy": "release",
+      "override": "A2A_VERIFIER_IMAGE",
+      "pulledBy": "The capability verifier Deployment the operator renders under spec.mode: next, and nothing on a default install. It resolves the same way the gateway, the worker and the callout do.",
+      "description": "The one reader of the capability bucket: it answers every executor's capability check over the bus and holds no RBAC (a2a/Dockerfile.verifier)."
+    },
+    {
+      "name": "hermes-bridge",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/hermes-bridge",
+      "tagPolicy": "release",
+      "pulledBy": "The hermes-bridge sidecar a spec.mode: next install declares on spec.deployment.sidecars beside the agent container. The operator renders no bridge of its own, so there is no operator override; the sidecar's image is the CR's.",
+      "description": "The platform-agent image of the same commit plus the bridge binary that runs the platform persona as the bus executor (a2a/Dockerfile.hermes-bridge)."
+    },
+    {
       "name": "litellm",
       "origin": "third-party",
       "repository": "ghcr.io/berriai/litellm",
@@ -199,7 +243,7 @@
       "repository": "docker.io/library/golang",
       "tag": "1.27-alpine",
       "buildArg": "GOLANG_IMAGE",
-      "pulledBy": "deploy/docker/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway, a2a/Dockerfile.worker and a2a/Dockerfile.hermes-bridge builder stages.",
+      "pulledBy": "deploy/docker/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway, a2a/Dockerfile.hermes-bridge, a2a/Dockerfile.verifier and a2a/Dockerfile.worker builder stages.",
       "description": "Go toolchain for the operator and k8s-event-watcher builds."
     },
     {
@@ -226,7 +270,7 @@
       "repository": "gcr.io/distroless/static",
       "tag": "nonroot",
       "buildArg": "DISTROLESS_IMAGE",
-      "pulledBy": "k8s-operator/Dockerfile, a2a/Dockerfile.authcallout and a2a/Dockerfile.gateway runtime stages.",
+      "pulledBy": "k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway and a2a/Dockerfile.verifier runtime stages.",
       "description": "Runtime base for the operator image."
     },
     {

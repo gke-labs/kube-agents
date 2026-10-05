@@ -17,6 +17,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestValidate_ClusterNameRequired(t *testing.T) {
@@ -62,4 +63,45 @@ func TestValidate_ClusterNameRequired(t *testing.T) {
 			t.Errorf("expected a --cluster-name error, got: %v", err)
 		}
 	})
+}
+
+// TestParseFlags_FailedSchedulingDefaults pins the two knobs the FailedScheduling
+// gate reads, and that they reach the filter as parsed rather than through the
+// shared three-count default.
+func TestParseFlags_FailedSchedulingDefaults(t *testing.T) {
+	f, err := parseFlags(nil)
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if f.failedSchedulingMinCount != 5 {
+		t.Errorf("--failedscheduling-min-count default = %d; want 5", f.failedSchedulingMinCount)
+	}
+	if f.scaleUpHold != 15*time.Minute {
+		t.Errorf("--scaleup-hold default = %s; want 15m", f.scaleUpHold)
+	}
+
+	f, err = parseFlags([]string{"--failedscheduling-min-count=2", "--scaleup-hold=3m"})
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	cfg := newFilterConfig(nil, nil, nil, filterThresholds{
+		failedSchedulingMinCount: f.failedSchedulingMinCount,
+		scaleUpHold:              f.scaleUpHold,
+	})
+	if cfg.failedSchedulingMinCount != 2 {
+		t.Errorf("filterConfig.failedSchedulingMinCount = %d; want 2", cfg.failedSchedulingMinCount)
+	}
+	if cfg.scaleUpHold != 3*time.Minute {
+		t.Errorf("filterConfig.scaleUpHold = %s; want 3m", cfg.scaleUpHold)
+	}
+
+	// Unset in the threshold group means the gate's own default, not the
+	// shared three the other counts fall back to.
+	cfg = newFilterConfig(nil, nil, nil, filterThresholds{})
+	if cfg.failedSchedulingMinCount != 5 {
+		t.Errorf("zero threshold defaulted to %d; want 5", cfg.failedSchedulingMinCount)
+	}
+	if cfg.scaleUpHold != 15*time.Minute {
+		t.Errorf("zero hold defaulted to %s; want 15m", cfg.scaleUpHold)
+	}
 }

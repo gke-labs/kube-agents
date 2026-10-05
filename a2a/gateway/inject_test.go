@@ -10,12 +10,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -25,10 +27,12 @@ import (
 // here drives the executor side through the lib, as the bridge does.
 
 // Compile-time contract. The inject backend is the one adapter that has to
-// answer ABOUT a task, and the chat backends deliberately do not -- a human
-// reads the chat, so the rendered text is their whole interface. The negative
-// assertions are in TestOnlyTheInjectBackendObservesTasks below, which a
-// compile-time var cannot express.
+// answer ABOUT a task. Discord and gchat deliberately do not -- a human reads
+// the chat, so the rendered text is their whole interface -- and Slack
+// implements TaskObserver for TaskStarted and TaskTerminal, to learn which threads a task
+// started in; it answers about nothing. The negative assertions are in
+// TestWhichAdaptersObserveTasks below, which a compile-time var cannot
+// express.
 var (
 	_ Adapter         = (*InjectAdapter)(nil)
 	_ TaskObserver    = (*InjectAdapter)(nil)
@@ -878,11 +882,12 @@ func TestInjectPostsTheWholeOfALongAnswer(t *testing.T) {
 	}
 }
 
-// TestOnlyTheInjectBackendObservesTasks: TaskObserver is an optional
-// extension, and the chat backends must stay outside it. If a chat adapter
-// ever implements it by accident, the gateway starts calling into it on every
-// task with no test covering what it does there.
-func TestOnlyTheInjectBackendObservesTasks(t *testing.T) {
+// TestWhichAdaptersObserveTasks: TaskObserver is an optional
+// extension. Discord and gchat stay outside it, and Slack is inside it for
+// one documented reason (TaskStarted marks session threads). If any other
+// chat adapter picks it up by accident, the gateway starts calling into it on
+// every task with no test covering what it does there.
+func TestWhichAdaptersObserveTasks(t *testing.T) {
 	discord := &DiscordAdapter{}
 	if _, ok := any(discord).(TaskObserver); ok {
 		t.Error("the Discord adapter implements TaskObserver; the gateway now calls into it untested")
@@ -896,6 +901,17 @@ func TestOnlyTheInjectBackendObservesTasks(t *testing.T) {
 	}
 	if _, ok := any(gchat).(InboundObserver); ok {
 		t.Error("the Google Chat adapter implements InboundObserver; the gateway now calls into it untested")
+	}
+	// The Slack adapter is the one chat backend that implements TaskObserver,
+	// for TaskStarted and TaskTerminal: a task starting in a thread is what makes the
+	// thread a session thread (SessionLookup). Pinned so the rule above is
+	// read as "Discord and gchat", not "every chat backend".
+	slackA := &SlackAdapter{}
+	if _, ok := any(slackA).(TaskObserver); !ok {
+		t.Error("the Slack adapter does not implement TaskObserver, so it can no longer learn which threads are session threads")
+	}
+	if _, ok := any(slackA).(InboundObserver); ok {
+		t.Error("the Slack adapter implements InboundObserver; the gateway now calls into it untested")
 	}
 	inject := &InjectAdapter{}
 	if _, ok := any(inject).(TaskObserver); !ok {
@@ -1544,10 +1560,10 @@ func TestInjectReadRouteReportsATerminalOnTheStreamBeforeTheRelay(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	door.SetProbe(func(context.Context, string) (ConversationState, error) {
+	door.SetProbe(func(context.Context, string, string) (ConversationState, error) {
 		return ConversationState{Active: true, TaskID: "task-1", ExecutorState: lib.StateFailed, Final: true, Grace: injectTestGrace}, nil
 	})
-	report := door.runProbe(context.Background(), injectKeyPrefix+"any")
+	report := door.runProbe(context.Background(), injectKeyPrefix+"any", "")
 	if !report.Active || !report.Final || report.ExecutorState != string(lib.StateFailed) {
 		t.Fatalf("report = %+v, want an active task whose stream is final", report)
 	}
@@ -1589,15 +1605,15 @@ func TestInjectReadRouteSaysWhenItCannotLook(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	report := door.runProbe(context.Background(), injectKeyPrefix+"orphan")
+	report := door.runProbe(context.Background(), injectKeyPrefix+"orphan", "")
 	if report.Error == "" || report.Active {
 		t.Fatalf("probe with no gateway = %+v, want an error and nothing asserted", report)
 	}
-	failing := func(context.Context, string) (ConversationState, error) {
+	failing := func(context.Context, string, string) (ConversationState, error) {
 		return ConversationState{Active: true, TaskID: "task-1"}, fmt.Errorf("the stream is unreachable")
 	}
 	door.SetProbe(failing)
-	report = door.runProbe(context.Background(), injectKeyPrefix+"orphan")
+	report = door.runProbe(context.Background(), injectKeyPrefix+"orphan", "")
 	if !strings.Contains(report.Error, "unreachable") || !report.Active || report.TaskID != "task-1" {
 		t.Fatalf("probe that failed to look = %+v, want the error beside what was learned", report)
 	}
@@ -1965,6 +1981,303 @@ func TestInjectReadRouteCarriesTheFoldOfAFinishedTask(t *testing.T) {
 	}
 }
 
+// probeRaw is probe as the wire carries it: the probe object's keys and
+// their raw JSON, for a test whose claim is about presence -- a decoded
+// struct cannot tell an absent key from its zero value.
+func (r *injectRig) probeRaw(t *testing.T, key, taskID string) map[string]json.RawMessage {
+	t.Helper()
+	target := fmt.Sprintf("%s%s%s?after=0&wait=0&%s=1", r.base, conversationsPath, key, probeParam)
+	if taskID != "" {
+		target += "&task=" + taskID
+	}
+	resp, err := r.do(t, http.MethodGet, target, nil, injectTestToken)
+	if err != nil {
+		t.Fatalf("GET %s: %v", target, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s returned %d", target, resp.StatusCode)
+	}
+	var page struct {
+		Probe map[string]json.RawMessage `json:"probe"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
+		t.Fatalf("decoding the read route's reply: %v", err)
+	}
+	if page.Probe == nil {
+		t.Fatalf("GET %s answered without a probe report", target)
+	}
+	return page.Probe
+}
+
+// appendArtifact publishes a second chunk onto an artifact the executor
+// already opened: same artifactId, append: true, which is how an executor
+// extends the tool-call trace one invocation at a time. TaskExecution has no
+// append option, so the envelope is built by hand the way the lib's own
+// chunking test does.
+func (r *injectRig) appendArtifact(t *testing.T, origin *lib.Envelope, addressee string, a lib.Artifact) {
+	t.Helper()
+	payload, err := json.Marshal(lib.ArtifactUpdate{TaskID: origin.TaskID, ContextID: origin.ContextID, Artifact: a, Append: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewArtifactUpdateEnvelope(lib.Party{Session: addressee, AgentType: "test-executor"},
+		origin.TaskID, origin.ContextID, origin.CorrelationID, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.bus.Publish(context.Background(), lib.TaskEventsSubject(addressee, origin.TaskID), env); err != nil {
+		t.Fatalf("publish append chunk: %v", err)
+	}
+}
+
+// TestInjectReadRouteCarriesTheToolCallTraceAndProgressLine: the relay keeps
+// the activity artifact off the chat on purpose, so the read route is the
+// harness's only view of what a run called. The probe carries every data
+// part of it in stream order and the progress artifact's latest line, on a
+// task that is still running -- a caller watching a live run reads what it
+// has called so far, not only what it called by the end -- and the relay's
+// transcript still never shows the trace.
+func TestInjectReadRouteCarriesTheToolCallTraceAndProgressLine(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-trace", injectTestAuthor, "list the clusters")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	calls := []string{
+		`{"tool":"mcp__gke__list_clusters","input":{"project":"p"},"callId":"call_01","status":"completed","durationMs":2130,"at":"2026-09-25T10:00:00Z"}`,
+		`{"tool":"mcp__gke__get_cluster","input":{"name":"c1"},"callId":"call_02","status":"completed","durationMs":410,"at":"2026-09-25T10:00:03Z"}`,
+	}
+	if err := exec.PublishArtifact(ctx, lib.Artifact{ArtifactID: lib.ArtifactActivity, Name: lib.ArtifactActivity,
+		Parts: []lib.Part{{Kind: "data", Data: json.RawMessage(calls[0])}}}); err != nil {
+		t.Fatal(err)
+	}
+	r.appendArtifact(t, origin, "platform", lib.Artifact{ArtifactID: lib.ArtifactActivity, Name: lib.ArtifactActivity,
+		Parts: []lib.Part{{Kind: "data", Data: json.RawMessage(calls[1])}}})
+	if err := exec.PublishArtifact(ctx, lib.Artifact{ArtifactID: lib.ArtifactProgress, Name: lib.ArtifactProgress,
+		Parts: []lib.Part{{Kind: "text", Text: "reading the fleet"}}}); err != nil {
+		t.Fatal(err)
+	}
+	r.appendArtifact(t, origin, "platform", lib.Artifact{ArtifactID: lib.ArtifactProgress, Name: lib.ArtifactProgress,
+		Parts: []lib.Part{{Kind: "text", Text: "checking pods"}}})
+
+	probe := r.probe(t, reply.Conversation, reply.TaskID).Probe
+	if probe.Final || probe.ExecutorState != string(lib.StateWorking) {
+		t.Fatalf("probe = %+v, want a task still working: the trace must not wait on the terminal", probe)
+	}
+	if probe.Activity == nil || len(*probe.Activity) != len(calls) {
+		t.Fatalf("probe.Activity = %v, want %d calls", probe.Activity, len(calls))
+	}
+	for i, want := range calls {
+		var got, exp bytes.Buffer
+		if err := json.Compact(&got, (*probe.Activity)[i]); err != nil {
+			t.Fatalf("call %d is not JSON: %v", i, err)
+		}
+		if err := json.Compact(&exp, []byte(want)); err != nil {
+			t.Fatal(err)
+		}
+		if got.String() != exp.String() {
+			t.Fatalf("activity[%d] = %s, want %s: the trace is the executor's records, in order", i, got.String(), exp.String())
+		}
+	}
+	if probe.Progress != "checking pods" {
+		t.Fatalf("probe.Progress = %q, want the progress artifact's last line", probe.Progress)
+	}
+	// The relay's choice stands: the trace reaches the caller through the
+	// probe and never through the transcript.
+	for _, entry := range r.conversation(t, reply.Conversation, 0, "", 0).Entries {
+		if strings.Contains(entry.Text, "mcp__gke__") || strings.Contains(entry.Text, "call_01") {
+			t.Fatalf("the relay posted the tool-call trace: %+v", entry)
+		}
+	}
+}
+
+// TestInjectReadRouteShowsAnEmptyTraceForATaskThatCalledNothing: the
+// activity key's presence is what tells a harness this door can show tool
+// calls, so a task whose stream was read and holds no trace answers with []
+// rather than nothing -- "called nothing" is a fact about the executor, and
+// an absent key would read as a door that cannot say.
+func TestInjectReadRouteShowsAnEmptyTraceForATaskThatCalledNothing(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-no-trace", injectTestAuthor, "think quietly")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	raw := r.probeRaw(t, reply.Conversation, reply.TaskID)
+	activity, ok := raw["activity"]
+	if !ok {
+		t.Fatalf("probe = %s, want an activity key: the stream was read", raw)
+	}
+	if string(activity) != "[]" {
+		t.Fatalf("activity = %s, want [] for a task that called nothing", activity)
+	}
+	if _, ok := raw["progress"]; ok {
+		t.Fatalf("probe = %s, carries a progress line no executor wrote", raw)
+	}
+}
+
+// TestInjectReadRouteOmitsTheTraceWhenNoStreamWasRead: with no active task
+// there is no stream to read, and a read that failed learned nothing about
+// one, so the activity key is absent in both -- the same shape a door older
+// than the field answers with, which is what lets a harness treat "no key"
+// as "cannot say" without a version check.
+func TestInjectReadRouteOmitsTheTraceWhenNoStreamWasRead(t *testing.T) {
+	r := startInjectRig(t)
+	raw := r.probeRaw(t, injectKeyPrefix+"never-used", "")
+	if activity, ok := raw["activity"]; ok {
+		t.Fatalf("activity = %s on a conversation with no task; want the key absent", activity)
+	}
+
+	door, err := NewInjectAdapter("127.0.0.1:0", injectTestToken, injectTestGrace, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	door.SetProbe(func(context.Context, string, string) (ConversationState, error) {
+		return ConversationState{Active: true, TaskID: "task-1"}, fmt.Errorf("the stream is unreachable")
+	})
+	body, err := json.Marshal(door.runProbe(context.Background(), injectKeyPrefix+"orphan", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report map[string]json.RawMessage
+	if err := json.Unmarshal(body, &report); err != nil {
+		t.Fatal(err)
+	}
+	if activity, ok := report["activity"]; ok {
+		t.Fatalf("activity = %s beside a failed read; want the key absent", activity)
+	}
+	if report["error"] == nil {
+		t.Fatalf("report = %s, want the error that says the read failed", body)
+	}
+}
+
+// TestInjectReadRouteReadsAFinishedTasksTraceByTaskID: the relay clears the
+// record's active task when it posts the terminal, which is exactly when a
+// harness assembles its record, so a probe that read only the active task
+// would answer a finished run with no stream at all. With task= the probe
+// reads the named task's stream off the addressee the record's history
+// kept for it: final, the executor's terminal, the trace and the result,
+// with active false and no age because the record no longer holds it.
+// Without task= the released conversation still reads as no stream (the
+// activity key absent), so "absent = not read" keeps holding.
+func TestInjectReadRouteReadsAFinishedTasksTraceByTaskID(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-trace-after-release", injectTestAuthor, "list the clusters")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	calls := []string{
+		`{"tool":"mcp__gke__list_clusters","input":{"project":"p"},"callId":"call_01","status":"completed","durationMs":2130,"at":"2026-09-25T10:00:00Z"}`,
+		`{"tool":"mcp__gke__get_cluster","input":{"name":"c1"},"callId":"call_02","status":"completed","durationMs":410,"at":"2026-09-25T10:00:03Z"}`,
+	}
+	if err := exec.PublishArtifact(ctx, lib.Artifact{ArtifactID: lib.ArtifactActivity, Name: lib.ArtifactActivity,
+		Parts: []lib.Part{{Kind: "data", Data: json.RawMessage(calls[0])}, {Kind: "data", Data: json.RawMessage(calls[1])}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishArtifact(ctx, lib.Artifact{
+		Name:  lib.ArtifactResult,
+		Parts: []lib.Part{{Kind: "text", Text: "two clusters, both healthy"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	// The instant the finding is about: the relay has posted the terminal
+	// and written the release, so the record holds no active task.
+	r.waitForTerminal(t, reply.Conversation, reply.TaskID)
+	r.awaitRecordRelease(t, reply.Conversation)
+
+	raw := r.probeRaw(t, reply.Conversation, reply.TaskID)
+	if active, ok := raw["active"]; ok && string(active) != "false" {
+		t.Fatalf("active = %s after the relay released the record; want false or absent", active)
+	}
+	if string(raw["final"]) != "true" || string(raw["executorState"]) != `"completed"` {
+		t.Fatalf("probe = %s, want the named task's stream: final, completed", raw)
+	}
+	if string(raw["taskId"]) != `"`+reply.TaskID+`"` {
+		t.Fatalf("taskId = %s, want the task the caller named %q", raw["taskId"], reply.TaskID)
+	}
+	if _, ok := raw["error"]; ok {
+		t.Fatalf("probe = %s, carries an error for a task the stream holds", raw)
+	}
+	if _, ok := raw["ageSeconds"]; ok {
+		t.Fatalf("probe = %s, carries an age for a task the record no longer holds", raw)
+	}
+	var trace []json.RawMessage
+	if err := json.Unmarshal(raw["activity"], &trace); err != nil || len(trace) != len(calls) {
+		t.Fatalf("activity = %s (err %v), want the %d calls the finished run made", raw["activity"], err, len(calls))
+	}
+	for i, want := range calls {
+		var got, exp bytes.Buffer
+		if err := json.Compact(&got, trace[i]); err != nil {
+			t.Fatalf("call %d is not JSON: %v", i, err)
+		}
+		if err := json.Compact(&exp, []byte(want)); err != nil {
+			t.Fatal(err)
+		}
+		if got.String() != exp.String() {
+			t.Fatalf("activity[%d] = %s, want %s", i, got.String(), exp.String())
+		}
+	}
+	if string(raw["result"]) != `"two clusters, both healthy"` {
+		t.Fatalf("result = %s, want the result artifact's text", raw["result"])
+	}
+	if string(raw["terminalSource"]) != `"`+string(TerminalFromExecutor)+`"` {
+		t.Fatalf("terminalSource = %s, want the executor's", raw["terminalSource"])
+	}
+
+	// Unchanged without task=: the record holds no active task, so no
+	// stream is read and the activity key stays absent.
+	raw = r.probeRaw(t, reply.Conversation, "")
+	if activity, ok := raw["activity"]; ok {
+		t.Fatalf("activity = %s with no task named on a released conversation; want the key absent", activity)
+	}
+	if active, ok := raw["active"]; ok && string(active) != "false" {
+		t.Fatalf("active = %s on a released conversation; want false or absent", active)
+	}
+}
+
+// TestInjectReadRouteOmitsTheTraceForAnUnknownTaskID: a task id the record
+// never held is the empty state, not a failure -- no activity key, because
+// no stream was read (an id the conversation does not own is never
+// formatted into a subject), and no error, because the gateway looked at
+// its record and found nothing rather than failing to look. Both on a
+// released conversation, whose history knows no such task, and on one that
+// never had a turn, whose record does not exist.
+func TestInjectReadRouteOmitsTheTraceForAnUnknownTaskID(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-unknown-task", injectTestAuthor, "think quietly")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	r.waitForTerminal(t, reply.Conversation, reply.TaskID)
+	r.awaitRecordRelease(t, reply.Conversation)
+
+	for _, key := range []string{reply.Conversation, injectKeyPrefix + "never-used"} {
+		raw := r.probeRaw(t, key, "task-nobody-published")
+		if activity, ok := raw["activity"]; ok {
+			t.Fatalf("activity = %s for an unknown task on %s; want the key absent", activity, key)
+		}
+		if errField, ok := raw["error"]; ok {
+			t.Fatalf("error = %s for an unknown task on %s; a task with no events is the empty state, not a failed read", errField, key)
+		}
+		if final, ok := raw["final"]; ok && string(final) != "false" {
+			t.Fatalf("final = %s for an unknown task on %s", final, key)
+		}
+	}
+}
+
 // TestInjectReadRouteNamesTheSupervisorsTerminalAsItsOwn: a terminal on the
 // supervisor subject is the supervisor's word about an executor that died or
 // never ran, not an executor's answer. The fold says whose it is, so a caller
@@ -2171,8 +2484,22 @@ func TestInjectCancelNamesTheTaskAfterTheHealReleasedIt(t *testing.T) {
 	if cancelEnv.CorrelationID != origin.CorrelationID {
 		t.Fatalf("the cancel rides correlation %q, want the task's own %q", cancelEnv.CorrelationID, origin.CorrelationID)
 	}
-	if len(cancelEnv.Authority) == 0 {
-		t.Error("the cancel carries no authority block")
+	// Not merely "an authority block": the task's own capability. The
+	// history entry is the only place it survives once the heal released
+	// ActiveTask, and a cancel that lost it would carry `grants: null` --
+	// indistinguishable, to anything that later reads the stream, from a
+	// turn the gateway answered itself.
+	wantRef, wantPresent, err := capability.RefFromAuthority(origin.Authority)
+	if err != nil || !wantPresent {
+		t.Fatalf("the submission carries no capability to compare against: present=%v err=%v", wantPresent, err)
+	}
+	gotRef, gotPresent, err := capability.RefFromAuthority(cancelEnv.Authority)
+	if err != nil || !gotPresent {
+		t.Fatalf("the cancel carries no capability: present=%v err=%v authority=%s",
+			gotPresent, err, cancelEnv.Authority)
+	}
+	if gotRef != wantRef {
+		t.Errorf("the cancel carries capability %+v, want the task's own %+v", gotRef, wantRef)
 	}
 	// The heal ran first and said so; the cancel then went out anyway.
 	r.waitForPost(t, reply.Conversation, "produced nothing on its event stream")
@@ -3240,5 +3567,155 @@ func TestInjectOneBoundCoversTheClaimAndTheWait(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > injectSubmitWait/4 {
 		t.Fatalf("the cancel's wait held for %s past its deadline; it took a bound of its own", elapsed)
+	}
+}
+
+// TestInjectReadRouteCapsTheTraceAndSaysSo: a probe rides every poll, so a
+// long run's trace is bounded to its newest injectMaxActivityEntries entries
+// and activityDropped counts what the cap cut, rather than the body growing
+// with the run.
+func TestInjectReadRouteCapsTheTraceAndSaysSo(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-long-trace", injectTestAuthor, "call many tools")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	const extra = 5
+	parts := make([]lib.Part, 0, injectMaxActivityEntries+extra)
+	for i := 0; i < injectMaxActivityEntries+extra; i++ {
+		parts = append(parts, lib.Part{Kind: "data", Data: json.RawMessage(fmt.Sprintf(`{"tool":"t%d"}`, i))})
+	}
+	if err := exec.PublishArtifact(context.Background(), lib.Artifact{ArtifactID: lib.ArtifactActivity, Name: lib.ArtifactActivity, Parts: parts}); err != nil {
+		t.Fatal(err)
+	}
+	raw := r.probeRaw(t, reply.Conversation, reply.TaskID)
+	var trace []json.RawMessage
+	if err := json.Unmarshal(raw["activity"], &trace); err != nil {
+		t.Fatal(err)
+	}
+	if len(trace) != injectMaxActivityEntries {
+		t.Fatalf("activity carries %d entries, want the cap %d", len(trace), injectMaxActivityEntries)
+	}
+	if got := string(trace[len(trace)-1]); got != fmt.Sprintf(`{"tool":"t%d"}`, injectMaxActivityEntries+extra-1) {
+		t.Fatalf("last entry = %s, want the newest", got)
+	}
+	if got := string(raw["activityDropped"]); got != fmt.Sprint(extra) {
+		t.Fatalf("activityDropped = %s, want %d", got, extra)
+	}
+}
+
+// TestInjectReadRouteRefusesAnotherConversationsTaskID: the door's token
+// admits a caller to conversations under its prefix, not to every task on
+// the addressee. A task id minted for one conversation, read through
+// another, is a miss -- no trace, no result, no error naming it -- and a
+// wildcard is a miss the same way, never a replay of the whole addressee.
+func TestInjectReadRouteRefusesAnotherConversationsTaskID(t *testing.T) {
+	r := startInjectRig(t)
+	theirs := r.inject(t, "case-theirs", injectTestAuthor, "their prompt")
+	theirOrigin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, theirOrigin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishArtifact(context.Background(), lib.Artifact{ArtifactID: lib.ArtifactActivity, Name: lib.ArtifactActivity,
+		Parts: []lib.Part{{Kind: "data", Data: json.RawMessage(`{"tool":"secret-ish"}`)}}}); err != nil {
+		t.Fatal(err)
+	}
+	mine := r.inject(t, "case-mine", injectTestAuthor, "my prompt")
+	for _, foreign := range []string{theirs.TaskID, "*", "task-nobody"} {
+		raw := r.probeRaw(t, mine.Conversation, foreign)
+		if _, ok := raw["activity"]; ok {
+			t.Fatalf("task %q read through another conversation: %s", foreign, raw)
+		}
+		if _, ok := raw["result"]; ok {
+			t.Fatalf("task %q's result read through another conversation: %s", foreign, raw)
+		}
+		if e, ok := raw["error"]; ok {
+			t.Fatalf("task %q produced an error naming something: %s", foreign, e)
+		}
+	}
+	// The owner still reads it.
+	if raw := r.probeRaw(t, theirs.Conversation, theirs.TaskID); string(raw["activity"]) == "" {
+		t.Fatalf("the owning conversation lost its own trace: %s", raw)
+	}
+}
+
+// An activity entry over the probe's per-entry bound is replaced by a
+// stand-in that keeps the tool and a wrapper's nested names, so the trace
+// never rides a poll unbounded and a grader still reads what it reads.
+func TestCapActivityEntryKeepsToolAndNestedNames(t *testing.T) {
+	big := strings.Repeat("x", injectMaxEntryBytes)
+	wrapper := json.RawMessage(`{"tool":"tool_call","input":{"calls":[{"name":"kanban_create","arguments":{"body":"` + big + `"}},{"name":"kanban_list"},{"name":"kanban_get","arguments":{"id":7}},{"name":"kanban_noop","arguments":{}}]},"status":"completed"}`)
+	out := capActivityEntry(wrapper)
+	if len(out) > injectMaxEntryBytes || !strings.Contains(string(out), `"name":"kanban_create"`) || !strings.Contains(string(out), `"name":"kanban_list"`) || strings.Contains(string(out), big[:64]) {
+		t.Fatalf("wrapper cap: %d bytes %s", len(out), out[:min(len(out), 200)])
+	}
+	// The cut is said per call: the large call's arguments is the bridge's
+	// stand-in shape with its size, the argument-less call stays so.
+	if !strings.Contains(string(out), `"arguments":{"bytes":`+strconv.Itoa(len(`{"body":"`+big+`"}`))+`,"head":"","truncated":true}`) || strings.Contains(string(out), `"name":"kanban_list","arguments"`) {
+		t.Fatalf("wrapper cap carries no per-call marker: %s", out[:min(len(out), 300)])
+	}
+	// Small nested arguments, empty or not, stay as they are: no cut, no marker.
+	if !strings.Contains(string(out), `{"arguments":{"id":7},"name":"kanban_get"}`) || !strings.Contains(string(out), `{"arguments":{},"name":"kanban_noop"}`) {
+		t.Fatalf("small nested arguments were marked cut: %s", out[:min(len(out), 400)])
+	}
+	bulky := json.RawMessage(`{"tool":"terminal","input":{"command":"ls"},"callId":"` + big + `","status":"completed"}`)
+	out = capActivityEntry(bulky)
+	if len(out) > injectMaxEntryBytes || !strings.Contains(string(out), `"tool":"terminal"`) || !strings.Contains(string(out), `"input":{"command":"ls"}`) || strings.Contains(string(out), `"truncated"`) {
+		t.Fatalf("bulk outside the input: the input must stay and claim no cut: %d bytes %s", len(out), out[:min(len(out), 200)])
+	}
+	// Inside the wrapper, a key beside calls and an element that is not a
+	// named call are kept when small and said as a stand-in when not, so
+	// nothing leaves the input unaccounted for.
+	beside := json.RawMessage(`{"tool":"tool_call","input":{"mode":"parallel","note":"` + big + `","calls":[{"name":"a","arguments":{"body":"` + big + `"}},"` + big + `",{"id":3}]},"status":"completed"}`)
+	out = capActivityEntry(beside)
+	if len(out) > injectMaxEntryBytes || !strings.Contains(string(out), `"mode":"parallel"`) || !strings.Contains(string(out), `"note":{"bytes":`+strconv.Itoa(len(big)+2)+`,"head":"","truncated":true}`) || !strings.Contains(string(out), `{"id":3}`) || !strings.Contains(string(out), `"name":"a"`) || strings.Count(string(out), `"truncated":true`) != 3 {
+		t.Fatalf("wrapper input beside the calls not accounted for: %d bytes %s", len(out), out[:min(len(out), 400)])
+	}
+	// A calls array under any other tool is not the wrapper: the whole
+	// input is the stand-in, with the input's size.
+	notWrapper := json.RawMessage(`{"tool":"batch","input":{"calls":[{"name":"a","arguments":{"body":"` + big + `"}}]},"status":"completed"}`)
+	out = capActivityEntry(notWrapper)
+	if len(out) > injectMaxEntryBytes || strings.Contains(string(out), `"name":"a"`) || !strings.Contains(string(out), `"input":{"bytes":`) {
+		t.Fatalf("non-wrapper calls array kept: %s", out[:min(len(out), 200)])
+	}
+	// A nested call's bulk under a key other than arguments is cut and said.
+	otherKey := json.RawMessage(`{"tool":"tool_call","input":{"calls":[{"name":"x","input":{"body":"` + big + `"}}]},"status":"completed"}`)
+	out = capActivityEntry(otherKey)
+	if len(out) > injectMaxEntryBytes || !strings.Contains(string(out), `"name":"x"`) || !strings.Contains(string(out), `"arguments":{"bytes":`) {
+		t.Fatalf("nested bulk under another key cut without a marker: %s", out[:min(len(out), 200)])
+	}
+	// Bulk under a key outside the entry's shape: that key goes, named, and
+	// the input is neither replaced nor charged with the cut.
+	extra := json.RawMessage(`{"tool":"x","input":{"a":1},"result":"` + big + `","status":"completed"}`)
+	out = capActivityEntry(extra)
+	if len(out) > injectMaxEntryBytes || !strings.Contains(string(out), `"input":{"a":1}`) || strings.Contains(string(out), `"truncated"`) || !strings.Contains(string(out), `"droppedKeys":["result"]`) {
+		t.Fatalf("bulk under an extra key: %d bytes %s", len(out), out[:min(len(out), 200)])
+	}
+	// Bulk under a number key that does not hold a number: outside the
+	// shape, dropped and named; the input and the string fields stay.
+	notNumber := json.RawMessage(`{"tool":"x","input":{"a":1},"callId":"c","status":"completed","durationMs":["` + big + `"],"dropped":"` + big + `"}`)
+	out = capActivityEntry(notNumber)
+	if len(out) > injectMaxEntryBytes || !strings.Contains(string(out), `"input":{"a":1}`) || !strings.Contains(string(out), `"callId":"c"`) || !strings.Contains(string(out), `"status":"completed"`) || strings.Contains(string(out), `"truncated"`) || !strings.Contains(string(out), `"droppedKeys":["dropped","durationMs"]`) {
+		t.Fatalf("bulk under a non-numeric number key: %d bytes %s", len(out), out[:min(len(out), 300)])
+	}
+	// Bulk made of many small extra keys: the input stays whole and
+	// unclaimed, the first names are kept and the rest are a count.
+	var many strings.Builder
+	many.WriteString(`{"tool":"x","input":{"a":1},"status":"completed"`)
+	for i := 0; i < 4000; i++ {
+		fmt.Fprintf(&many, `,"extra_%04d":"v"`, i)
+	}
+	many.WriteString(`}`)
+	out = capActivityEntry(json.RawMessage(many.String()))
+	if len(out) > injectMaxEntryBytes || !strings.Contains(string(out), `"input":{"a":1}`) || strings.Contains(string(out), `"truncated"`) || !strings.Contains(string(out), `"droppedKeys":["extra_0000",`) || !strings.Contains(string(out), `"+`+strconv.Itoa(4000-injectMaxDroppedKeys)+` more"]`) {
+		t.Fatalf("bulk of many extra keys: %d bytes %s", len(out), out[:min(len(out), 300)])
+	}
+	plain := json.RawMessage(`{"tool":"terminal","input":{"command":"` + big + `"},"status":"completed"}`)
+	out = capActivityEntry(plain)
+	if len(out) > injectMaxEntryBytes || !strings.Contains(string(out), `"tool":"terminal"`) || !strings.Contains(string(out), `"truncated":true`) || !strings.Contains(string(out), `"bytes":`+strconv.Itoa(len(`{"command":"`+big+`"}`))) {
+		t.Fatalf("plain cap: %d bytes %s", len(out), out[:min(len(out), 200)])
 	}
 }

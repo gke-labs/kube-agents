@@ -26,8 +26,8 @@ The **gateway Pod** holds the harness and nothing credentialed:
    internal key. It holds no credential path.
 
 The **shell sandbox Pod**, `<agent>-shell`, runs `sshd`, the agent's own tools, a
-durable `/opt/data`, and the shims that stand in for `gcloud`, `kubectl`, `gh`, and
-`git`. This is the Pod that executes anything the model wrote. Its ServiceAccount
+durable `/opt/data`, the shims that stand in for `gcloud` and `kubectl`, and a
+`git` that holds no credential and reaches no forge. This is the Pod that executes anything the model wrote. Its ServiceAccount
 carries no `iam.gke.io/gcp-service-account` annotation, so the metadata server hands it
 an unbound principal that IAM grants nothing.
 
@@ -111,11 +111,13 @@ checkout the credential holder runs `git` in.
 
 `spec.deployment.env` is applied to the credential runtime because it may
 contain credentials. A short allowlist may also be copied to the sandbox — the
-OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` alert ceilings, and the
-`FEEDBACK_PROMPT_*` switch and delay —
+OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` alert ceilings, the
+`FEEDBACK_PROMPT_*` switch and delay, and the `KAGE_SLACK_UX` flag —
 but only as literal values; all `valueFrom` sources are rejected. A name earns a
 place on that list only if an arbitrary value for it cannot redirect state,
-grant access, or change what code runs; `safeSandboxEnvOverrides` in
+grant access, or change what code runs. `KAGE_SLACK_UX` is the nearest case: it
+switches between code paths the image already ships, which its comment there lists.
+`safeSandboxEnvOverrides` in
 `k8s-operator/internal/controller/platformagent_manifests.go` is the list.
 Reserved proxy, runtime-loader, and shell-startup variables cannot override the
 operator's managed values.
@@ -147,7 +149,9 @@ in any case do nothing on a cluster whose CNI does not enforce NetworkPolicy. Se
 [Denying the sandbox the metadata server](site/src/content/docs/reference/credential-isolation.md#denying-the-sandbox-the-metadata-server).
 
 The ServiceAccount does not tell the gateway from the sandbox. The broker authenticates
-every caller with a `TokenReview` over an audience-bound projected token, and
+every caller of its credentialed listener with a `TokenReview` over an audience-bound
+projected token (the metrics-only listener, [Architecture](#architecture), serves counters
+and authenticates nobody), and
 `CREDENTIAL_PROXY_ALLOWED_CALLERS` names every calling ServiceAccount without varying on
 which one presented it; what does vary the policy is the audience the token was minted for
 and the route table it feeds
@@ -159,7 +163,7 @@ and the route table it feeds
 
 - PlatformAgent only.
 - Credentials managed by the operator.
-- CLI forwarding for `gcloud`, `kubectl`, `gh`, and `git`.
+- CLI forwarding for `gcloud` and `kubectl`.
 - Read-only Google Cloud REST relay for the reads no CLI exposes
   ([`designs/gcp-api-relay.md`](designs/gcp-api-relay.md)).
 - Slack and Google Chat credentialed relays.
@@ -204,13 +208,25 @@ credential-proxy Pod
 
 Envoy is the only listener for credentialed tool and chat requests. The
 credential runtime listens on a Unix socket mounted only in its own Pod, so no
-caller can bypass Envoy by reaching the runtime directly. Envoy authenticates
+caller can bypass Envoy by reaching the runtime directly. The runtime's one TCP
+listener is the metrics-only one on port 8766 (`CREDENTIAL_PROXY_METRICS_PORT`,
+set by the operator): it serves Prometheus counters whose label values are
+static enums and closed vocabularies, holds no route, credential or policy,
+answers at most sixteen connections at a time and cuts each off ten seconds
+after it opened whatever the peer sends (the credentialed handler shares the
+process, so a peer that reaches the port cannot spend its threads), and is
+the one port the broker's NetworkPolicy opens to the `gke-gmp-system`
+namespace, where the managed-Prometheus collector runs, and to no other peer.
+Envoy authenticates
 every caller that is not asking for `/healthz`: the caller presents an
 audience-bound projected ServiceAccount token (one hour; the audience is per
 pod, `kubeagents-credential-proxy` for the sandbox and
 `kubeagents-credential-proxy-chat` for the gateway) as a bearer header, and the
 runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLERS`.
-That list names the gateway's ServiceAccount and the sandbox's and does not vary
+That list names the gateway's ServiceAccount and the sandbox's (and, under the
+operator's `A2A_SESSION_CLUSTER_VIEW` flag, a third, the session pods', bound to
+the audience `kubeagents-credential-proxy-session`; see
+[spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)) and does not vary
 on which one presented the token — the audience and the route table it feeds do —
 so the allowlist itself keeps other workloads out rather than telling those two
 apart. The token crosses the cluster network in cleartext;
@@ -305,9 +321,9 @@ proxy. The credential runtime directly executes the corresponding real CLI and
 returns output and exit status. It never evaluates an agent-supplied shell
 command.
 
-Only `gcloud`, `kubectl`, `gh`, and `git` are accepted. The proxy also rejects
-known credential-disclosure, credential-replacement, and self-modification
-operations, and the GitHub **write** path: merging a pull request
+Only `gcloud` and `kubectl` are forwarded from the sandbox. The proxy also
+rejects known credential-disclosure, credential-replacement, and
+self-modification operations, and the GitHub **write** path: merging a pull request
 (`github.merge`), approving a review (`github.assent`), mutating through the
 REST API (`github.api-mutation`), triggering workflows or releases
 (`github.pipeline-trigger`), and repository administration — secrets,
@@ -844,8 +860,9 @@ Consequences:
   within 60 seconds of admission. Envoy's stream idle timeout in front of the
   runtime is twenty minutes: the broker writes nothing to a stream until the
   request is answered, so the silent worst case is that deadline plus the
-  slot wait, the kill grace and the drain, a little over six minutes at the
-  defaults, and a silent request that reaches its deadline is still answered
+  slot wait, the kill grace and its settle after `SIGKILL`, and the drain, a
+  little over six minutes at the defaults, and a silent request that reaches
+  its deadline is still answered
   with its partial output and the timed-out notice rather than reset by Envoy
   first. An operator raising `CREDENTIAL_PROXY_TIMEOUT_SECONDS` keeps the
   Envoy timeout above it plus the minute.
@@ -926,12 +943,24 @@ file and never a `.git` it can write into.
   crash or restart and are visible to both containers' next boot. The log
   shipper gets no `/tmp`: it buffers in memory
   and keeps its tail database on its own volume. Containers supplied through
-  `spec.deployment.sidecars`/`initContainers` are appended to the Pod as
-  written; the webhook does not require a read-only root of them, so a CR can
-  still add a writable container to this Pod.
+  `spec.deployment.sidecars`/`initContainers` are appended to the Pod
+  substantially as written; the webhook does not require a read-only root of
+  them, so a CR can still add a writable container to this Pod. "As written"
+  is not literal under `spec.mode: next`: the A2A render strips reserved-name
+  volume mounts and bus-credential mounts from a sidecar, and writes two env
+  names onto it because both feed the capability check rather than the
+  container's own configuration - `A2A_CAPABILITY_REQUIRED` as an override
+  that discards a CR value, `POD_NAMESPACE` as a default a CR value beats.
+  Neither edit touches the container's filesystem posture, which is what this
+  bullet is about.
 - A policy ConfigMap hash is placed on the Pod template to trigger rollout when
   command policy changes.
-- The operator reports Ready only when every workload it renders is ready.
+- The operator reports Ready only when every workload it renders is ready, with
+  one deliberate exception: under `mode: next` the capability verifier is not
+  counted. It is a request-path workload, and a rollout of it should not flip a
+  serving install to Provisioning. Because an install whose verifier is down
+  refuses every submission, it reports itself through the `A2AVerifier`
+  condition instead, which an install can be Ready and still carry.
 
 ## Deployment and Migration
 
@@ -999,6 +1028,14 @@ place holding cluster credentials, GCP tokens, and chat secrets, and everything 
 stdout leaves the cluster through Cloud Logging. The same rule covers the event watcher in the
 gateway Pod's `agent-api-auth` sidecar: it logs identifiers — cluster, namespace, pod, event
 reason, profile directory — and never a token, a kubeconfig body, or a request header.
+
+The broker's log is one JSON object per line (`JsonLineFormatter` in `credential_proxy.py`):
+the envelope keys and, on the exec route's records, the `tool_execution_audit` fields the site's
+[observability page](site/src/content/docs/concepts/observability.md#cloud-logging) lists, passed
+as an `audit` mapping in `extra` and merged in at the top level. A new audit site passes the same
+mapping; it never adds argv, a path, stdin or output to it, which is what keeps a `--token` on the
+command line out of the record by construction rather than by scrubbing. The `message` beside the
+mapping is the ordinary log text, and keeps to the identifier-over-value rule above.
 
 The exposure to watch when changing this code is **wrapped errors**, not deliberate logging. A
 failure from parsing a profile's `kubeconfig.yaml`, minting a token, or an API server rejecting a

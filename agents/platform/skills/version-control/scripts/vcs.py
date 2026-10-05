@@ -225,6 +225,7 @@ def verb_proposal_list(arguments) -> dict:
             "page": arguments.page,
             "source": arguments.source,
             "target": arguments.target,
+            "labels": arguments.labels or None,
         },
     )
 
@@ -375,6 +376,16 @@ def verb_identity(arguments) -> dict:
     )
 
 
+def verb_remote_branch_view(arguments) -> dict:
+    return _collaboration(arguments, "branch-view", {"branch": arguments.name})
+
+
+def verb_remote_branch_delete(arguments) -> dict:
+    return _collaboration(
+        arguments, "branch-delete", {"branch": arguments.name, "revision": arguments.revision}
+    )
+
+
 # ---- command line ---------------------------------------------------------
 
 
@@ -497,6 +508,7 @@ def build_parser() -> argparse.ArgumentParser:
     plist.add_argument("--state", default="open", choices=["open", "closed", "all"])
     plist.add_argument("--source", help="only proposals from this branch")
     plist.add_argument("--target", help="only proposals onto this branch")
+    plist.add_argument("--labels", nargs="*", help="only proposals carrying all of these")
     plist.add_argument("-n", "--limit", type=int)
     plist.add_argument("--page", type=int, help="the next page, when the last answer said truncated")
     repo_option(plist).set_defaults(run=verb_proposal_list)
@@ -589,6 +601,22 @@ def build_parser() -> argparse.ArgumentParser:
     lensure.add_argument("--color")
     lensure.add_argument("--description")
     repo_option(lensure).set_defaults(run=verb_label_ensure)
+
+    remote_branch = verbs.add_parser(
+        "remote-branch", help="a branch as the shared repository holds it"
+    )
+    ractions = remote_branch.add_subparsers(dest="action", required=True)
+    rview = ractions.add_parser("view", help="whether the remote holds it, and at which revision")
+    rview.add_argument("name")
+    repo_option(rview).set_defaults(run=verb_remote_branch_view)
+    rdelete = ractions.add_parser(
+        "delete", help="delete a spent branch: its proposal merged or closed, its tip what that proposal carried"
+    )
+    rdelete.add_argument("name")
+    rdelete.add_argument(
+        "--revision", required=True, help="the revision `remote-branch view` reported; the delete is conditional on it"
+    )
+    repo_option(rdelete).set_defaults(run=verb_remote_branch_delete)
 
     identity = verbs.add_parser(
         "identity", aliases=["whoami"], help="who this install is on the forge, and whether a login may write"

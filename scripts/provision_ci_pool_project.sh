@@ -21,6 +21,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# MIN_GCLOUD_VERSION and the two helpers Step 0 compares it with. The file is
+# side-effect free at source time; its require_* wrappers print through the
+# installer's print_* helpers, which this script does not define, so Step 0
+# calls the comparison directly.
+# shellcheck source=scripts/installer/min_versions.sh
+. "${SCRIPT_DIR}/installer/min_versions.sh"
 
 PROJECT_ID=""
 REGION="us-central1"
@@ -49,10 +55,40 @@ ALLOW_UNMAPPED="false"
 readonly GITOPS_SEED_FILE="README.md"
 readonly GITOPS_SEED_MESSAGE="Initial commit"
 readonly GITOPS_SEED_CONTENT="# GitOps Infrastructure Repo"
+# The declared-intent note bench/tasks/obtainability-declared-intent-no-finding
+# reads: the fleet's declared-no-pdb-workload role runs without a budget on
+# purpose, and the case grades that the agent finds this file and says so.
+# The harness reads the frontmatter, not the prose.
+# What `gh api` prints on stderr for a path that is not there; any other failure
+# of the existence read stops the seed rather than writing blind.
+readonly GITOPS_NOTE_ABSENT_PATTERN="HTTP 404"
+readonly GITOPS_INTENT_NOTE_PATH="knowledge/notification-relay-no-pdb.md"
+readonly GITOPS_INTENT_NOTE_MESSAGE="Declare notification-relay's missing PodDisruptionBudget as intended"
+readonly GITOPS_INTENT_NOTE_CONTENT='---
+type: decision
+title: notification-relay runs without a PodDisruptionBudget on purpose
+declares:
+  - check: no-pdb
+    namespace: seeded-intent
+    object: Deployment/notification-relay
+---
+
+`notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
+it is a stateless relay whose clients retry, and a budget would only slow node drains. The
+obtainability audit lists this posture under Declared intent rather than as a finding.'
 
 # The host cluster's name is not a preference: scripts/verify_ci_pool_project.py
 # asserts it, hack/ci-env.sh selects it, and the Boskos lease resolves to it.
 HOST_CLUSTER_NAME="platform-agent-host"
+# The managed OpenTelemetry collection scope Step 2.1 sets on the host cluster
+# after the apply. Neither google provider has a field for it, so full-install
+# cannot; without it the operator finds no managed collector, resolves
+# status.telemetry.otlpEndpointSource to None and wires the agent with
+# OTEL_SDK_DISABLED=true, so an install on the cluster exports no traces and
+# the project's Cloud Trace stays empty. The verifier fails a project whose
+# host cluster lacks this exact value and its tests pin the two copies equal
+# (HOST_OTEL_SCOPE in scripts/verify_ci_pool_project.py).
+readonly HOST_OTEL_SCOPE="COLLECTION_AND_INSTRUMENTATION_COMPONENTS"
 
 usage() {
   cat <<EOF
@@ -66,7 +102,8 @@ Options:
                             bench/tf/fleet is pinned to us-central1-a.
   --app-id=APP_ID           GitHub App ID (default: 4675512)
   --pem-file=PATH           Path to GitHub App private key PEM file for KMS import
-  --skip-host-cluster       Skip terraform/examples/full-install (if host cluster already exists)
+  --skip-host-cluster       Skip terraform/examples/full-install (if host cluster already exists).
+                            The post-apply managed-OTel scope update still runs.
   --skip-fleet              Skip bench/tf/fleet (if seeded fleet clusters already exist)
   --allow-unmapped          Proceed even though the project is not yet mapped in
                             hack/ci-deploy.sh. The run will still end red at the
@@ -115,7 +152,7 @@ fi
 # land it silently -- the verifier matches clusters by name and reports green.
 if [ "${REGION}" != "us-central1" ]; then
   echo "FATAL: --region=${REGION} is not supported. bench/tf/fleet is pinned to" >&2
-  echo "       us-central1-a, so the seeded trio would not follow the host cluster." >&2
+  echo "       us-central1-a, so the seeded fleet would not follow the host cluster." >&2
   echo "       Give bench/tf/fleet a zone in ${REGION} first." >&2
   exit 1
 fi
@@ -158,6 +195,27 @@ if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
   exit 1
 fi
 echo "✓ Toolchain present (gcloud, gh, git, go, jq, python3, terraform, tofu)"
+
+# Step 2.1's post-apply `clusters update --managed-otel-scope` is issued on the
+# GA surface, which gcloud grew in MIN_GCLOUD_VERSION; an older SDK fails the
+# flag's parsing after the apply, the most expensive place in the run to fail,
+# so the version is checked here. An unreadable version is a warning for the
+# reason scripts/installer/min_versions.sh gives: `gcloud version` has changed
+# shape before, and a missed regex should not refuse a usable SDK.
+# `|| true`: under set -e and pipefail a `gcloud version` that exits non-zero
+# would otherwise end the script here, silently, instead of reaching the warning.
+GCLOUD_VERSION="$(gcloud_core_version || true)"
+if [ -z "${GCLOUD_VERSION}" ]; then
+  echo "⚠️ Could not determine the Google Cloud SDK version; skipping the >= ${MIN_GCLOUD_VERSION} check." >&2
+  echo "   Step 2.1 needs --managed-otel-scope on \`gcloud container clusters update\`, which arrived in ${MIN_GCLOUD_VERSION}." >&2
+elif version_lt "${GCLOUD_VERSION}" "${MIN_GCLOUD_VERSION}"; then
+  echo "FATAL: Google Cloud SDK ${GCLOUD_VERSION} is too old; ${MIN_GCLOUD_VERSION} or newer is required." >&2
+  echo "       Step 2.1 sets --managed-otel-scope on the host cluster after the apply, and the flag" >&2
+  echo "       is on the GA surface only from ${MIN_GCLOUD_VERSION}. Upgrade with: gcloud components update" >&2
+  exit 1
+else
+  echo "✓ Google Cloud SDK ${GCLOUD_VERSION} meets the minimum of ${MIN_GCLOUD_VERSION}"
+fi
 
 # The project must exist and bill. `gcloud services enable` against an unbilled
 # project fails with a message that does not obviously say "billing", so the
@@ -406,6 +464,23 @@ if [ -z "${GITOPS_DEFAULT_BRANCH}" ]; then
     -f content="$(printf '%s\n' "${GITOPS_SEED_CONTENT}" | base64 | tr -d '\n')" >/dev/null
 fi
 
+# The declaration the declared-intent eval case reads. A PUT without `sha` on a
+# path that exists fails, so the read comes first, and only a 404 means
+# "absent": any other failure stops the step, as the branch read above does,
+# rather than PUT over a note that may be there. A note someone edited by
+# hand is left as it is.
+if GITOPS_INTENT_NOTE_READ_ERROR="$(gh api "repos/${GITOPS_REPO}/contents/${GITOPS_INTENT_NOTE_PATH}" 2>&1 >/dev/null)"; then
+  :
+elif printf '%s' "${GITOPS_INTENT_NOTE_READ_ERROR}" | grep -q "${GITOPS_NOTE_ABSENT_PATTERN}"; then
+  echo "Seeding ${GITOPS_REPO} with ${GITOPS_INTENT_NOTE_PATH} (the declared-intent note)..."
+  gh api -X PUT "repos/${GITOPS_REPO}/contents/${GITOPS_INTENT_NOTE_PATH}" \
+    -f message="${GITOPS_INTENT_NOTE_MESSAGE}" \
+    -f content="$(printf '%s\n' "${GITOPS_INTENT_NOTE_CONTENT}" | base64 | tr -d '\n')" >/dev/null
+else
+  echo "ERROR: could not read ${GITOPS_INTENT_NOTE_PATH} in ${GITOPS_REPO} (${GITOPS_INTENT_NOTE_READ_ERROR}); not seeding it blind." >&2
+  exit 1
+fi
+
 INST_JSON="$(gh api /orgs/gke-agentic/installations --jq ".installations[] | select(.app_id==${APP_ID})" 2>/dev/null || echo "")"
 if [ -n "${INST_JSON}" ]; then
   INST_ID="$(echo "${INST_JSON}" | jq -r .id)"
@@ -523,6 +598,27 @@ EOF
 else
   echo -e "\n==> [Step 2.1] Skipping Host GKE Cluster (--skip-host-cluster set)..."
 fi
+
+# The one post-apply step Terraform cannot carry (see HOST_OTEL_SCOPE above).
+# Outside the --skip-host-cluster branch on purpose: the flag skips the apply,
+# and the cluster it keeps still needs the scope, so a first run that died
+# after the apply resumes with the flag and still reaches this. That re-run is
+# for a project not yet registered with Boskos (docs/ci-pool-projects.md,
+# section 8): on a registered one this script is the wrong tool whatever its
+# flags, since the rest of it re-applies the fleet and the minter under
+# whatever lease is running, and the repair for a host cluster that predates
+# this step is this one gcloud command by hand, between leases -- the command
+# the verifier's gke/host-otel-scope finding prints. The update is idempotent.
+# install.sh warns and goes on when this fails; here it stops the run, under
+# set -e: a pool project without the scope passes every lease and exports no
+# traces, and the verifier in Step 5 would fail it anyway.
+echo -e "\n==> [Step 2.1] Setting the managed OpenTelemetry scope on ${HOST_CLUSTER_NAME}..."
+gcloud container clusters update "${HOST_CLUSTER_NAME}" \
+  --project="${PROJECT_ID}" \
+  --location="${REGION}" \
+  --managed-otel-scope="${HOST_OTEL_SCOPE}" \
+  --quiet
+echo "✓ Managed OpenTelemetry scope ${HOST_OTEL_SCOPE} set on ${HOST_CLUSTER_NAME}"
 
 if [ "${SKIP_FLEET}" != "true" ]; then
   echo -e "\n==> [Step 2.2] Provisioning Seeded Dirty Fleet (bench/tf/fleet) with remote state..."

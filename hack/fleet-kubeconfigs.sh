@@ -11,11 +11,11 @@
 # seeded clusters into their OWN files and leaves the ambient kubeconfig alone.
 #
 # The files are keyed by fixture ROLE, never by cluster name and never by
-# project. Each eval project carries its own trio of seeded clusters, so a case
+# project. Each eval project carries its own set of seeded clusters, so a case
 # that named `seeded-a` would be a case that only runs in one project. A case
 # names `fixture_role: crashloop-workload`; bench/tf/fleet/fixtures.json says
-# which SLOT of the trio that role lives on; this script finds the leased
-# project's trio and matches each cluster to its slot. The catalog is the only
+# which SLOT of the fleet that role lives on; this script finds the leased
+# project's seeded clusters and matches each cluster to its slot. The catalog is the only
 # place the role->slot mapping exists -- the verifier never re-derives it, it
 # just opens "${BENCH_FLEET_KUBECONFIG_DIR}/<role>.kubeconfig".
 #
@@ -25,7 +25,7 @@
 #   resourceLabels.managed-by=kube-agents-seeded-fleet
 #
 # which is exactly `local.cluster_labels` in bench/tf/fleet/main.tf and is
-# carried by the trio and by nothing else in an eval project (neither
+# carried by the seeded clusters and by nothing else in an eval project (neither
 # platform-agent-host nor the per-run eval-pr-* clusters have either label).
 # Composing "${prefix}-${slot}" from catalog constants instead would silently
 # address the wrong thing the first time someone applies the stack with a
@@ -48,13 +48,13 @@
 # has been SEEN on the slot's cluster, before the agent runs, and the list of
 # what was seen is written beside it as "<role>.confirmed". A labelled cluster
 # is not the same thing as a planted fixture -- an apply that created the
-# clusters and stopped before the Kubernetes provider ran leaves a trio that
+# clusters and stopped before the Kubernetes provider ran leaves a fleet that
 # answers every API call and holds none of the objects -- and the verifier's
 # whole fail/error distinction rests on being able to say an object that is
 # gone AT CHECK TIME went missing DURING the run. Confirming it here is what
 # makes that true, and confirming it PER OBJECT rather than per namespace is
-# what makes it true for the roles that have no namespace: four of the eight
-# are cluster-scoped, so a namespace-only gate waved them through and let a
+# what makes it true for the roles that have no namespace: the cluster-scoped
+# ones, which a namespace-only gate waved through and so let a
 # check on a live-but-empty cluster blame an agent that touched nothing. A
 # fixture that was never planted leaves the role unresolvable, which is an
 # error about the environment, not a failure blamed on the agent.
@@ -64,7 +64,7 @@
 #   hack/fleet-kubeconfigs.sh            # same thing; prints the directory
 #
 # Inputs (all optional except a project):
-#   FLEET_PROJECT_ID          project holding the trio; defaults to PROJECT_ID
+#   FLEET_PROJECT_ID          project holding the fleet; defaults to PROJECT_ID
 #   FLEET_CATALOG             path to fixtures.json
 #   BENCH_FLEET_KUBECONFIG_DIR  where to write; defaults under TMPDIR
 #   FLEET_READONLY_SA         service account to mint a read-only token for
@@ -201,13 +201,13 @@ _fleet_probe_present() {
   esac
 }
 
-# The leased project's seeded trio, as "<slot>\t<name>\t<location>" lines, for
+# The leased project's seeded clusters, as "<slot>\t<name>\t<location>" lines, for
 # each discovered cluster whose name ends in "-<slot>" for a slot the catalog
 # declares. A cluster that matches the labels but no slot is reported and
 # skipped: that is a fleet the catalog does not describe, and guessing at it
 # would put a check on a cluster nobody wrote a fixture for.
 #
-# Two clusters claiming the SAME slot -- a leftover trio under an old
+# Two clusters claiming the SAME slot -- a leftover fleet under an old
 # cluster_prefix, or the same prefix in two zones, both legal -- drops the slot
 # entirely rather than letting gcloud's listing order decide. An ambiguous
 # fixture address must not resolve: silently picking one turns "the wrong
@@ -224,25 +224,31 @@ _fleet_list_seeded_clusters() {
     --format='value(name,location)' 2>/dev/null
 }
 
+# Prints the slot a cluster name resolves to, or nothing when none does.
+_fleet_slot_for_name() {
+  local name="$1" slots="$2" slot matched=""
+  for slot in $slots; do
+    # Longest suffix wins. Slots "a" and "batch-a" both end
+    # "seeded-batch-a", and taking the first match in sorted order would
+    # hand slot 'a' a cluster belonging to 'batch-a'. The longest match is
+    # unique by construction: two different slots cannot both be the
+    # same-length tail of one name.
+    if [ "${name%-"${slot}"}" != "$name" ] &&
+      [ "${#slot}" -gt "${#matched}" ]; then
+      matched="$slot"
+    fi
+  done
+  printf '%s' "$matched"
+}
+
 _fleet_match_slots() {
-  local listing="$1" slots="$2" project="$3" name location slot matched
-  local rows dupes
+  local listing="$1" slots="$2" project="$3" name location matched
+  local slot rows dupes
 
   rows=""
   while IFS=$'\t' read -r name location; do
     [ -n "$name" ] || continue
-    matched=""
-    for slot in $slots; do
-      # Longest suffix wins. Slots "a" and "batch-a" both end
-      # "seeded-batch-a", and taking the first match in sorted order would
-      # hand slot 'a' a cluster belonging to 'batch-a'. The longest match is
-      # unique by construction: two different slots cannot both be the
-      # same-length tail of one name.
-      if [ "${name%-"${slot}"}" != "$name" ] &&
-        [ "${#slot}" -gt "${#matched}" ]; then
-        matched="$slot"
-      fi
-    done
+    matched="$(_fleet_slot_for_name "$name" "$slots")"
     if [ -z "$matched" ]; then
       echo "WARNING: seeded cluster ${name} in ${project} matches no slot the catalog declares; ignoring it" >&2
       continue
@@ -483,7 +489,7 @@ write_fleet_kubeconfigs() {
   printf 'project=%s\n' "$project" >"${dir}/.fleet-context"
   chmod 600 "${dir}/${_FLEET_MARKER}" "${dir}/.fleet-context"
 
-  local slot cluster location slot_config listing discovered errors
+  local slot cluster location slot_config listing discovered errors named
   local role namespace probe probes confirmed missing
   local written=0 unresolved=0 unplanted=0 found=0 labelled=0
   if ! listing="$(_fleet_list_seeded_clusters "$project")"; then
@@ -538,6 +544,29 @@ write_fleet_kubeconfigs() {
     # operator to apply the stack would send them to re-create what already
     # exists. The warnings above name the individual clusters.
     echo "WARNING: project ${project} carries ${labelled} labelled seeded cluster(s) but none resolved to a catalog slot -- see the per-cluster warnings above for whether they were ambiguous or named outside the catalog's slots. Every fleet check in this run reports status=error." >&2
+  else
+    # At least one slot resolved. A slot that did not, with nothing said here,
+    # only adds its roles to `unresolved` below -- the count an unreachable
+    # cluster adds to -- and a caller that tells those apart by warning text
+    # (the pool verifier) would take another cluster's refused credentials as
+    # the reason this slot is empty. A slot some cluster named but that did not
+    # resolve was ambiguous, and _fleet_match_slots has already said so; a
+    # second line here would be the one the fixture-state scan quotes.
+    for slot in $slots; do
+      if printf '%s\n' "$discovered" | awk -F'\t' -v s="$slot" '$1 == s {f = 1} END {exit !f}'; then
+        continue
+      fi
+      named=""
+      while IFS=$'\t' read -r cluster location; do
+        if [ -n "$cluster" ] && [ "$(_fleet_slot_for_name "$cluster" "$slots")" = "$slot" ]; then
+          named=1
+          break
+        fi
+      done <<<"$listing"
+      if [ -z "$named" ]; then
+        echo "WARNING: project ${project} has no labelled seeded cluster for slot '${slot}' (a name ending in '-${slot}'), so every check naming a role on it will report status=error. A project whose fleet was applied before the catalog declared the slot, or whose cluster lost its labels, reads like this." >&2
+      fi
+    done
   fi
 
   while read -r role slot namespace probes; do
@@ -557,7 +586,7 @@ write_fleet_kubeconfigs() {
     # two are still distinguishable is this one, before the run starts.
     #
     # Confirming the NAMESPACE alone is not enough, and was the first version
-    # of this gate: four of the roles have no namespace at all, so it waved
+    # of this gate: the cluster-scoped roles have no namespace at all, so it waved
     # them through and let a check on a live-but-empty cluster report a
     # catastrophic `fail` against an agent that never touched anything.
     confirmed=""

@@ -377,13 +377,18 @@ than a live write, a new domain inherits reviewability and rollback for free.
 The GKE-events path is live end to end:
 
 - **Detection** — `k8s-event-watcher` streams warning events in real time, with namespace deny/allow
-  rules and a flapping guard. The deployed watcher gates on seven reasons, which
+  rules and a flapping guard. The deployed watcher forwards eight reasons, which
   `deploy/shared/start-services.sh` passes as `--reason` and no environment variable overrides:
   `Failed`, `FailedToDrainNode`, `CrashLoopBackOff`, `BackOff`, `ImagePullBackOff`, `ErrImagePull`,
-  `OOMKilled`. The eleven-entry `defaultReasons` in the watcher's `filter.go` — which does include
-  `FailedScheduling` and `Evicted` — applies only when `--reason` is left unset, so it does not
-  describe an install. `Decide` matches the wire reason exactly and before canonicalization, so a
-  reason absent from that list produces nothing at all: no session, no card, no report.
+  `OOMKilled`, `FailedScheduling`. The same list admits two more, cluster-autoscaler's
+  `TriggeredScaleUp` and `NotTriggerScaleUp`, which the watcher records against the pod and never
+  forwards: a `FailedScheduling` is held while a scale-up for its pod is in progress, passed at any
+  count once the autoscaler has declined to help, and otherwise held until its fifth repeat, so a
+  pod waiting for a node the cluster is already adding opens no card and a pod nothing will place
+  opens one. The eleven-entry `defaultReasons` in the watcher's `filter.go` — which does include
+  `Evicted` — applies only when `--reason` is left unset, so it does not describe an install.
+  `Decide` matches the wire reason exactly and before canonicalization, so a reason absent from
+  that list produces nothing at all: no session, no card, no report.
 - **Dedup** — a 24h rolling window collapses repeats and related reasons into one incident.
 - **Session + routing** — one session per incident, SQLite-backed, posted to the right chat thread and
   recorded with the platform that thread lives on, with the triage report stored for follow-up replies.
@@ -437,10 +442,11 @@ credential proxy's entrypoint starts it, so what an install still needs is
 `spec.harness.driftDetector.enabled` set on its `PlatformAgent` and the `drift-pubsub` Terraform
 module applied. Only the first is a start gate: without it the detector ships and does not run,
 while enabling it without the module gives a detector that runs and retries a pull that cannot
-succeed. Either way no drift is detected. The provisioning is a flag:
-`terraform/examples/full-install` instantiates the module when `enable_drift_pubsub` is set. The CR
-field is the half it leaves alone, and reaches the chart through `extra_helm_values`, which the
-installer front doors do not expose — an install.sh install sets it on the `PlatformAgent` itself.
+succeed. Either way no drift is detected. Both are flags:
+`terraform/examples/full-install` instantiates the module when `enable_drift_pubsub` is set and
+writes the CR field when `enable_drift_detector` is, and it refuses an apply that asks for the
+second without the first. Through the installer front doors the pair is one `install.env` key,
+`ENABLE_DRIFT_DETECTOR`, which turns on both.
 
 **Obtainability governance — the same two contracts.** A completely different domain, engineered
 independently, arrived at the same shape. It also closes the quota and capacity gap that previously

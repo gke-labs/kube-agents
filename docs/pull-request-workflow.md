@@ -183,8 +183,9 @@ for — a chart value, a Dockerfile `ARG` default, a compiled constant in the op
 `make images-check` is what holds them in step. It covers every image the chart renders, on a
 default and a mirrored install, and what `githubMinter.enabled=true` adds to each; the build-time
 bases against their Dockerfile `ARG` defaults; the Go builder pin against the `go` directive in
-`k8s-operator/go.mod`; the fluent-bit fallback baked into the operator binary; the example
-manifests; and the kustomize integrations, which it requires to name a variable the file owns
+`k8s-operator/go.mod`; the pins and repositories compiled into the operator binary (the fluent-bit
+fallback, the NATS and nats-box pins, the A2A `next`-stack image names) and the gateway binary's
+worker repository; the example manifests; and the kustomize integrations, which it requires to name a variable the file owns
 rather than a literal. Two copies it does not reach, where a stale pin passes every check:
 Hindsight's images sit behind `hindsight.enabled` — unset by default, and then following
 `platformAgent.harness.memory.provider`, which no render turns on — so their pins in
@@ -220,8 +221,16 @@ the source the flagged line was reached from; the after run reports none. Quote 
 **Testing**. The pack `--download` resolves can differ from the one the hosted analysis ran, so the
 code-scanning tab on the merged head is still the final check.
 
+**Terraform module tests.** If you change a module or composition under `terraform/`, run
+`make terraform-test`. It runs the `terraform test` suite of each directory under
+`terraform/modules/` and `terraform/examples/` that has a `tests/`, against mocked providers, so it
+needs no credentials and makes no cloud call (`terraform init` still fetches the providers on a cold
+plugin cache); it needs Terraform 1.7 or newer for `mock_provider`, above the 1.5 floor the modules
+and the installer declare, and the `validate` job runs it on the version it pins. `make verify`
+below includes it.
+
 **Everything at once.** `make verify` runs what a pull request must pass offline — Go build, vet
-and test, the Python suites, the conformance suite. The per-area targets it wraps, for a faster
+and test, the Python suites, the conformance suite, the Terraform module tests. The per-area targets it wraps, for a faster
 loop while you work:
 
 - `make shellcheck` — the `validate` job in `Validate Repo Structure` runs it after the structure
@@ -255,6 +264,37 @@ could not anchor to a changed line appear in the summary body under **Findings o
 👀 with nothing following it is a bug in the bot, not a verdict — it happened to 3 of the 57 pull
 requests picked up in that range (#647, #649, #679), which is rare enough to be worth waiting through
 and common enough that you must not wait forever.
+
+### What the check means
+
+The `AI Review` check run beside the review is what `.github/workflows/auto_request_review.yml`
+waits on before it assigns a human, and what it says depends on the round. The reason it depends
+on the round: once a first round was answered, further rounds kept about 2.5 findings each without
+decaying, two thirds of them on code the previous round had already read, and most held checks held
+on Medium alone — pull requests stopped converging on green while nearly everything they were shown
+was being fixed (gke-labs/kube-agents-bot#191 has the measurement).
+
+- **First review of a pull request:** `success` only on "No findings" (low-severity items folded
+  into the body do not count); `neutral` under `Found N issues` when anything held.
+- **Any later review of the same pull request**, once the bot has reviewed it at an earlier commit
+  and can read that round back: only 🔴 High holds, and the description finding if the body still
+  owes an answer, whether or not its thread is resolved. 🟠 Medium findings are still posted as threads with their fix and still
+  counted in the title, but the check is `success` under `Found N issues, none holding`, and the
+  review body carries a _Second look_ sentence beside the bar it applied. A Medium here needs no
+  further round: fix it, or answer it in its thread and resolve — the thread still has to be
+  resolved before the merge, per the section below, but the check is not waiting on it.
+- **Back on the first review's bar:** a diff that has more than doubled in lines since the commit
+  the bot last reviewed — the softer bar is earned by a review of roughly this change, not by a
+  commit count — and, silently, a pull request whose earlier round the bot could not read back (a
+  reviews listing past its page cap, or a last-reviewed commit with no manifest in its bucket); the
+  bot's log line `not a second look at …` is the only tell.
+- **`/review` on a commit the bot already reviewed** re-cuts that review at whichever bar it
+  recorded, without reading again: it neither earns nor loses the second look. Of the description
+  it re-checks only that no section is missing or empty; `/review fresh` reads the commit and the
+  body again.
+- **`neutral` on any round** also covers the description finding, a change not fully checked, a
+  review that broke, and a push since the last review (the pushed commit carries the previous title
+  and no verdict).
 
 ### Waiting for it
 
@@ -309,9 +349,11 @@ gh api repos/gke-labs/kube-agents/pulls/<number>/comments/<comment-id>/replies \
 
 ## Resolving conversations
 
-Reply first — `AGENTS.md` says why — naming what changed and the commit that changed it. Then
-resolve. A pull request carrying both `lgtm` and `approved` with a thread still open also carries
-the `do-not-merge` label,
+Reply first — `AGENTS.md` says why — naming what changed and the commit that changed it, or, for a
+`kube-agents-bot` finding you decline with a user in the loop, the reason, which **Self-Review**
+gives too. Then resolve, except the description thread, which waits for the body edit described
+below. A pull request carrying both `lgtm` and `approved` with a thread still open also carries the
+`do-not-merge` label,
 applied by a workflow so that Tide does not spend the queue retrying a merge GitHub will refuse;
 resolving the last thread is what removes it ([how a change merges](#how-a-change-merges)).
 
@@ -337,14 +379,14 @@ query($pr: Int!) {
   reply to \(.comments.nodes[0].databaseId) — \(.comments.nodes[0].author.login): \(.comments.nodes[0].body | split("\n")[0])
   replies so far: \(.comments.nodes | length - 1)"'
 
-# Per thread, once the reply naming the fix is posted:
+# Per thread, once the reply is posted:
 gh api graphql -f query='
 mutation($thread: ID!) {
   resolveReviewThread(input: {threadId: $thread}) { thread { isResolved } }
 }' -f thread='<PRRT_...>'
 ```
 
-Four ways that goes wrong quietly:
+Five ways that goes wrong quietly:
 
 - `first: 100` is a cap, not a promise. A long-lived pull request can carry more threads than that;
   page for the rest, or say you only looked at the first hundred rather than reporting the branch
@@ -357,6 +399,17 @@ Four ways that goes wrong quietly:
   handled.
 - `unresolveReviewThread`, same `threadId`, is the undo. Use it the moment the user disagrees with
   something you resolved.
+- No unresolved threads does not mean the bot is answered. Its finding about the pull request
+  description opens one thread, whose first comment starts `<!-- kube-agents-bot:description -->`,
+  and only editing the body answers it. After that, every review that still finds the body owing an
+  answer — a section missing, empty, contradicted by the tree, or judged not to answer — repeats the
+  finding in its summary body, under **The pull request description is still unanswered.**, and
+  opens a new thread only for a section no earlier thread named. A pull request with every thread
+  resolved can therefore still hold the `AI Review` check. Resolve the description thread only after
+  the body is edited. Editing the body starts no review, and a plain `/review` on an unchanged commit
+  is a re-cut that checks only for missing and empty sections, so comment `/review fresh` and read
+  the body of a review newer than your edit, with the first poll command in
+  [Waiting for it](#waiting-for-it), before reporting the pull request clear.
 
 ## How a change merges
 
@@ -373,9 +426,19 @@ authoritative about it. Read it there when the answer matters, and
 
 The two labels are the two people:
 
-- **`lgtm` is the reviewer's.** A GitHub "Approve" review sets it, and so does `/lgtm` in a comment.
-  This is what the auto-requested human reviewer is being asked for. Prow does not take an `/lgtm`
-  from the pull request's own author, so every change needs one other person however it is approved.
+- **`lgtm` is the reviewer's.** A GitHub "Approve" review sets it, and so does `/lgtm` in a comment
+  — from an account the [`OWNERS`](../OWNERS) files name under `reviewers` or `approvers` for one of
+  the changed paths, and from nobody else. The configuration lists this repository under
+  `owners.skip_collaborators`, so Prow ignores collaborator and organisation-member status for this
+  label: the `triage` the contributor agents hold does not make Prow set it, and anyone outside those
+  lists is answered with "adding LGTM is restricted to approvers and reviewers in OWNERS files",
+  whether they approved, requested changes, or typed the command. The reviewer half of that walk
+  falls through [`hack/OWNERS`](../hack/OWNERS), which sets `no_parent_owners` but names no
+  reviewers, so a change to the two presubmit roster files alone takes its `lgtm` from anyone in the
+  root lists as well as from `eval-crew`, while its `approved` stays `eval-crew`'s alone — the reason
+  the root approvers are repeated under `reviewers`. This is what the auto-requested human reviewer
+  is being asked for. Prow does not take an `/lgtm` from the pull request's own author, so every
+  change needs one other person from those lists however it is approved.
   `trusted_team_for_sticky_lgtm: Googlers` is configured, which means a push after the label lands
   strips it again unless the author is in that team, and the reviewer has to give it a second time.
 - **`approved` is an `OWNERS` approver's.** `/approve`, from someone in the `OWNERS` file governing
@@ -453,6 +516,23 @@ clears it — by job ID, since `--failed` (below) re-runs failed jobs and a canc
 gh api repos/gke-labs/kube-agents/branches/main/protection \
   --jq '.required_status_checks.contexts'
 ```
+
+Every workflow behind one of those contexts also runs for a pull request whose base is a `release/`
+branch, and `tests/test_merge_group_triggers.py` fails if one is filtered back to `main`. A backport
+pull request branches from `upstream/release/<X.Y>` and targets it; the release runbook in
+`scripts/release/README.md` ("Patch releases from a release line") is what happens after it merges.
+A `release/` branch requires the same contexts, but through a ruleset rather than its branch
+protection rule, so the command above prints nothing for a line: its protection rule has no
+`required_status_checks` at all. Read a line's contexts back with the branch substituted,
+URL-encoded:
+
+```bash
+gh api repos/gke-labs/kube-agents/rules/branches/release%2F0.8 \
+  --jq '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context'
+```
+
+The runbook section above says why the two differ, which three settings carry a line's
+protection, and what has to follow when `main`'s set changes.
 
 **A green smoke run stays valid when `main` moves — usually.** Tide credits a Prow presubmit only
 against the base SHA it ran on — crier records it as a `BaseSHA:<sha>` suffix on the commit status
@@ -537,7 +617,8 @@ Four states that look like somebody else's problem and are not:
   review is the explicit hand-back — do that rather than assuming the push spoke for itself.
 - **Nobody is requested at all.** Because a human is only assigned once the `AI Review` check goes
   green, an author with outstanding bot findings has no reviewer and no notification saying so.
-  Clearing the findings and commenting `/review` for a clean pass is what summons one;
+  A green pass after `/review` is what summons one — clean on a first review, or nothing above
+  Medium on a later one (`AGENTS.md`, "Automated Review After Opening a Pull Request");
   `/request-review` is the override. Answering every bot thread does not summon one by itself, so
   an author who has done everything asked of them can still be sitting with nobody assigned.
 - **A red check that is not required.** It still blocks the merge if it is red on the head: Tide
@@ -553,9 +634,15 @@ Four states that look like somebody else's problem and are not:
 one decision this repository automates — it declines to request a reviewer for a draft, for a title
 carrying an ignored keyword, when someone is already requested, when an `OWNERS` approver for one of
 the changed files has submitted `APPROVED`, and when a human other than the author has submitted
-`CHANGES_REQUESTED` — each person's latest verdict, as GitHub counts them. An approval from outside
-`OWNERS` is not a hand-off: it cannot produce the `approved` label, so it counts no more than a
-comment. Of these reasons, `/request-review` skips the verdict check alone (it also bypasses the
+`CHANGES_REQUESTED` — each person's latest verdict, as GitHub counts them. An account
+`.github/auto_request_review.yml` lists under `options.robot_accounts` is no person to either rule: a
+robot that reviews under a user account re-reviews every push and files its follow-ups as
+`COMMENTED`, so a `CHANGES_REQUESTED` it once filed would otherwise stand for the life of the pull
+request and the check-run path would never request a human, and a review request outstanding to it
+is answered by the robot and cleared, so it counts as nobody asked. An approval from outside
+`approvers` is not a hand-off: it cannot produce the `approved` label, so the auto-request counts it
+no more than a comment and still asks someone who can `/approve`. Of these reasons, `/request-review`
+skips the verdict check alone (it also bypasses the
 `AI Review` gate, per `AGENTS.md`) — a person has already read the pull request and asked — and when
 one of the other reasons still declines it, the comment gets 😕 and the run a warning annotation
 naming the reason. A periodic

@@ -28,6 +28,7 @@ their own copies:
 | `DEFAULT_MODEL_PROVIDER`                                                  | Model provider (`gemini`)                                                              |
 | `DEFAULT_MODEL_GEMINI` / `_OPENAI` / `_ANTHROPIC`                         | The model each provider serves by default; the chart's `litellm.yaml` mirrors them     |
 | `DEFAULT_MODEL_MAX_TOKENS`                                                | Output tokens the gateway asks for on a request that names none (`0`: no `max_tokens`) |
+| `DEFAULT_LITELLM_REDACTION_ENABLED` / `_IP_ACTION`                        | Gateway redaction (`false`) and what it does with IP literals (`pseudonym`)            |
 | `DEFAULT_GEMINI_API_KEY_SECRET_NAME`                                      | Secret Manager secret a Gemini key is read from when none is given (`gemini-api-key`)  |
 | `DEFAULT_NAMESPACE`                                                       | Kubernetes namespace of the release (`kubeagents-system`)                              |
 | `DEFAULT_PLATFORM_AGENT_GSA_NAME`                                         | The agent's GCP service account id (`kubeagents-platform-gsa`); one name per project   |
@@ -36,6 +37,7 @@ their own copies:
 | `DEFAULT_GKE_DB_KMS_KEYRING`                                              | Cloud KMS key ring for GKE database encryption (`platform-agent-keyring`)              |
 | `DEFAULT_GKE_DB_KMS_KEY`                                                  | Cloud KMS key for GKE database encryption (`k8s-secret-encryption-key`)                |
 | `DEFAULT_ENABLE_PUBSUB_PLATFORM` / `DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR` | The optional AgentPlugins (`false`)                                                    |
+| `DEFAULT_ENABLE_DRIFT_DETECTOR`                                           | Out-of-band change detection: the audit-log ingress and its consumer (`true`)          |
 | `DEFAULT_KUBE_AGENTS_STATE_BUCKET`                                        | The `KUBE_AGENTS_STATE_BUCKET` sentinel (`auto`) that derives the state bucket         |
 | `DEFAULT_TF_STATE_BUCKET_SUFFIX` / `DEFAULT_TF_STATE_PREFIX_ROOT`         | The derived bucket `<PROJECT_ID><suffix>` and prefix `<root>/<CLUSTER_NAME>`           |
 | `DEFAULT_REGISTRY_PREFIX`                                                 | Container registry prefix                                                              |
@@ -162,17 +164,45 @@ on a Standard cluster (`write_tfvars_from_state` falls back to `false` for that 
 (`--memory=file` or `MEMORY=file` is required to tear it down);
 `ENABLE_GKE_BACKUP_PLAN` absent destroys the backup plan; `ENABLE_STOCKOUT_INVESTIGATOR`
 absent destroys the stockout log sink, its alerts topic and subscription, and their IAM
-grants; `ENABLE_PUBSUB_PLATFORM` absent removes the adapter plugin from the release (the
+grants; `ENABLE_PUBSUB_PLATFORM` absent removes
+the adapter plugin from the release (the
 composition owns no Pub/Sub resource for it alone); `GOOGLE_CHAT_ENABLED` absent removes the
 Chat topic and subscription; `PLATFORM_AGENT_PERMISSION_SET` absent falls back to `read-only`
-and drops the custom roles; `SCOPE_PROJECTS`, `SCOPE_FOLDERS` or `SCOPE_ORGANIZATIONS` absent
+and drops the custom roles; `SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`,
+`SCOPE_SHARED_VPC_HOSTS` or `SCOPE_METRICS_SCOPES` absent
 renders an empty list for it in the scope block, which revokes the read roles in every project,
-folder or organisation it named and retires those projects' Cluster Agent profiles over the
-reconcile's next two clean runs.
+folder, organisation or selector member it named and retires those projects' Cluster Agent profiles over the
+reconcile's next two clean runs; `SCOPE_MAX_PROJECTS` absent writes no cap, so the default of 100
+returns and the projects past it read `over-cap` (or the plan is refused, while a selector is declared).
 The file `install.sh` writes at the end of a first install carries every one of these, so
 the hazard is a hand edit that deletes a line rather than setting it to `false`. Run
 `./upgrade.sh --plan` before a full upgrade and read any `destroy` line as missing
 configuration first and real drift second.
+
+`ENABLE_DRIFT_DETECTOR` has the same sharp edge pointing the other way, because its absence
+provisions rather than destroys. Two things have to hold for that, and most keys fail one of
+them: `write_tfvars_from_state` has to resolve the key against `install.defaults.env` rather
+than against a literal `false`, and the default there has to be `true`. `ENABLE_GVISOR`, in
+the paragraph above, clears the second and fails the first — it defaults to `true` and still
+destroys, because the generator hardcodes `${ENABLE_GVISOR:-false}`. `ENABLE_GKE_BACKUP_PLAN`,
+`ENABLE_PUBSUB_PLATFORM` and `ENABLE_STOCKOUT_INVESTIGATOR` clear the first and fail the
+second. `VERTEX_MANAGE_SERVING_PROJECT` is the only other key where both hold: absent, it
+re-enables `aiplatform.googleapis.com` and re-grants `roles/aiplatform.user` in the serving
+project. A full
+upgrade over an `install.env` written before the key existed adds the Log Router sink,
+Pub/Sub topic and subscription that carry the project's GKE audit records, and starts the
+detector that reads them. That is intended — running an installer is the consent — but it
+means opting out has to be a `ENABLE_DRIFT_DETECTOR=false` line in the file. Only the run
+that creates `install.env` records the flag it was passed; over a file that is already
+there, a `--enable-drift-detector=false` applies to the run it is passed to and is recorded
+nowhere, so the next run resolves the default again, and `upgrade.sh` accepts no such flag
+at all. `install.sh` warns when you pass that flag over a file that does not carry the line;
+an exported `ENABLE_DRIFT_DETECTOR=false` is just as unrecorded and currently warns about
+nothing, so the file is the only opt-out that survives the shell it was typed in.
+Setting it to `false` is still the one boolean `write_tfvars_from_state` omits rather than
+writing, so an install carrying a `TF_VAR_enable_drift_pubsub=true` line keeps its ingress
+and only loses the detector — a written `false` would outrank that line and take the sink,
+topic and subscription with it, up to 31 days of retained messages included.
 
 `MEMORY` is the only one of the keys above that the generator goes and asks the cluster
 about, because it is the only one whose default deletes data rather than infrastructure
@@ -221,22 +251,62 @@ when kubectl's current context is this install's cluster). `API_SERVER_KEY` is g
 once, when the configuration carries none and none can be recovered — not on every run,
 which used to replace the Secret and restart every pod holding it.
 
-### Projects, folders and organisations in scope
+### Projects, folders, organisations and selectors in scope
 
-`SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_EXCLUDE_PROJECTS` and
-`SCOPE_EXCLUDE_CLUSTERS` are the `PlatformAgent`'s `spec.scope`, declared once and reaching both
-halves of the install from the same value: the generator renders them as the composition's `scope`
-object, the IAM module binds the read roles in every project named and the read roles plus
-`roles/cloudasset.viewer` on every folder and organisation named, and the chart renders the same
-object into the CR. The lists are space- or comma-separated like every other list key; a folder or
-organisation is its bare numeric ID, and an entry that is not one stops the run before
-`terraform.tfvars` is written; an excluded project may be a shell-style glob; an excluded cluster
-is `project/location/cluster`, and an entry that does not split into three parts stops the run the
-same way. The patterns, caps and repeats the CRD enforces are checked by the module's variable
-validation, which fails the plan before any binding. A folder or organisation also adds
-`cloudasset.googleapis.com` to the APIs the composition enables in the host project, because the
-reconcile resolves a container's members through it; an install that names explicit projects
-alone never enables it.
+`SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_SHARED_VPC_HOSTS`,
+`SCOPE_METRICS_SCOPES`, `SCOPE_MAX_PROJECTS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS`
+are the `PlatformAgent`'s `spec.scope`, declared once and reaching both halves of the install from
+the same value: the generator renders them as the composition's `scope` object, the IAM module binds
+the read roles in every project named, the read roles plus `roles/cloudasset.viewer` on every
+folder and organisation named, and the read roles in every project a Shared VPC host or Metrics
+Scope resolves to, and the chart renders the same object into the CR. The lists are space- or
+comma-separated like every other list key; a folder or organisation is its bare numeric ID, and an
+entry that is not one stops the run before `terraform.tfvars` is written; a Shared VPC host or
+Metrics Scope is a project ID (the host's, or the scope's scoping project's); an excluded project
+may be a shell-style glob; an excluded cluster is `project/location/cluster`, and an entry that
+does not split into three parts stops the run the same way. The patterns, caps and repeats the CRD
+enforces are checked by the module's variable validation, which fails the plan before any binding.
+A folder or organisation also adds `cloudasset.googleapis.com` to the APIs the composition enables
+in the host project, because the reconcile resolves a container's members through it; an install
+that names explicit projects alone never enables it.
+
+A Shared VPC host or a Metrics Scope inherits nothing, so the composition resolves it to projects
+when Terraform plans (the `kube-agents-scope-resolver` module), with the same reads the reconcile
+makes each run (the Compute API for a host's service projects, the Monitoring API for a scope's
+monitored projects, Resource Manager to name each of those by ID) made with the google provider's
+own token, and the IAM module binds the read roles in each and in the scoping project, and
+`roles/compute.viewer` alone in a host not otherwise in scope, which the reconcile's lookups read. A
+read that identity cannot make fails
+the plan, before anything is applied, naming the selector, the status and the API's message: it
+needs `compute.projects.get` on a host, to read the Metrics Scope in its scoping project with the
+Monitoring API enabled there, and `resourcemanager.projects.get` on every monitored project; a
+monitored project it cannot name is left out by naming its project number in
+`SCOPE_EXCLUDE_PROJECTS`. That is why no shell preflight probes the two selectors' reads as
+`check_scope_container_access` probes a container: a container's failure lands inside the apply,
+after the Asset API is enabled and some containers are bound, while a failed read lands in the plan
+with nothing changed, `upgrade.sh --plan` included. The bindings themselves are the explicit
+projects' case: a resolved project the applying identity cannot set IAM policy in fails inside the
+apply, as a `SCOPE_PROJECTS` entry does, and no preflight probes either. What the selectors do not have is a container's
+zero-touch onboarding: a service project attached, or a project added to the scope, after the last
+full upgrade reads `denied` in the reconcile's snapshot until the next one binds it. An exclude
+entry that names a Shared VPC service project by ID, or a monitored project by its project number,
+keeps it out of the bindings, the one place an exclusion reaches IAM, because the member has no list
+to be dropped from; a monitored project excluded by ID keeps its grant, which the reconcile's naming
+call needs before the exclusion can match. The reads are billed to the management project and use
+its `cloudresourcemanager` and `monitoring` APIs for a Metrics Scope and its `compute` API for a
+Shared VPC host, which the composition enables in the apply that follows the plan, per selector.
+So before an `install.sh` apply that carries a selector, `enable_scope_selector_apis` lists the
+project's enabled APIs and enables whichever of the ones the declared selectors read is off, as
+gcloud's active account, like the KMS enablement beside it: nothing is called when they are on, which is every re-run and Day-2 apply of an existing install, and a failure is a
+warning, since the plan reports a disabled API with the same command as its remedy. The
+generate-only handoff prints the command above the apply, `install.sh --dry-run` skips its plan
+with the command while an API a declared selector reads is off (a dry run enables nothing, and its plan would
+otherwise be refused for a reason the real run does not have), and `upgrade.sh` does none of it,
+because an existing install has them on. The reconcile lists at most `SCOPE_MAX_PROJECTS` projects (100 by default) of the resolved
+set, the management project included, so a declaration whose management project, `SCOPE_PROJECTS`
+and selector members together exceed that (once each, less an exact `SCOPE_EXCLUDE_PROJECTS` entry; a
+project both in `SCOPE_PROJECTS` and excluded by its number stays counted, so drop it from `SCOPE_PROJECTS`)
+is refused at plan rather than bound in full while a selector is declared or the cap is below its default (without a selector and at the default the count is the CRD's own, and such a plan is not refused for it), and a single selector past it is refused at its read.
 
 The block is written on every run, empty lists included: an emptied `projects` list is the
 declaration that drops projects, and a missing block would declare nothing, so removing a
@@ -248,16 +318,21 @@ and the Day-2 menu read the keys from `install.env` alone (`load_install_env` dr
 inherited from the shell, as it does `NAMESPACE`, and `install.sh` does the same once an
 `install.env` exists); `install.sh` also takes the `--scope-*` flags, and on a first install
 the environment, and records them, and an empty `--scope-*=` is refused. A malformed
-`SCOPE_EXCLUDE_CLUSTERS`, `SCOPE_FOLDERS` or `SCOPE_ORGANIZATIONS` entry stops every front door but
-`uninstall.sh`, retags included, until the line is fixed; there is no bypass.
+`SCOPE_EXCLUDE_CLUSTERS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS` or `SCOPE_MAX_PROJECTS` entry stops every front door but
+`uninstall.sh`, retags included, until the line is fixed; there is no bypass. `SCOPE_MAX_PROJECTS` is
+`spec.scope.maxProjects`, the most projects the reconcile lists per run (1 to 5000): empty, the
+default, leaves the CRD's 100 in force and writes no `max_projects` into the scope block; a value
+is rendered into the block, refused at plan time when the explicit projects and selector members
+exceed it (while a selector is declared or the cap is below its default), and read by the live-scope
+check as part of the declaration, so a cap set on the CR by
+hand is reported like any hand edit until the key records it.
 
 Before a full apply the front doors read the live `PlatformAgent` through the install's own
 kubeconfig context and refuse when it carries a scope that neither the release record nor the
 keys account for, printing the `SCOPE_*` lines that reproduce it; a read that cannot decide (no
 context, an unreadable CR or release) refuses too, because the apply itself needs no kubeconfig
 and would go ahead over a scope nobody read (`refuse_apply_over_undeclared_scope` in
-`installer_common.sh`; `upgrade.sh --plan` warns instead). The `sharedVpcHosts` and
-`metricsScopes` selectors have no key yet and are reported, never weighed. An `install.sh` re-run
+`installer_common.sh`; `upgrade.sh --plan` warns instead). An `install.sh` re-run
 and the menu apply the chart's CRDs before their apply, as `upgrade.sh` does, so the block lands on
 every front door rather than being pruned by a served schema that predates the field.
 
@@ -293,19 +368,26 @@ property in the active configuration file, which the provider does not read, mak
 undecided with the property named, unless `GOOGLE_IMPERSONATE_SERVICE_ACCOUNT` overrides the
 first explicitly.
 
-An install that declared a folder or organisation on the `PlatformAgent` by hand before the
-installer had a key for it, and had its roles bound by hand, is refused at its next full upgrade
-like any hand edit, and the lines it prints include `SCOPE_FOLDERS` and `SCOPE_ORGANIZATIONS`.
-Recording them hands the container's bindings to Terraform, which creates them with the applying
-credentials, so those credentials need `setIamPolicy` on the container even where an
-administrator made the hand grant; the alternatives are to obtain it for the identity that
-applies, or to take the container off the `PlatformAgent`, which retires its members over the
-reconcile's next two clean runs, and manage those projects through `SCOPE_PROJECTS` instead.
+An install that declared a folder, organisation, Shared VPC host or Metrics Scope on the
+`PlatformAgent` by hand before the installer had a key for it, and had its roles bound by hand, is
+refused at its next full upgrade like any hand edit, and the lines it prints include
+`SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_SHARED_VPC_HOSTS` and `SCOPE_METRICS_SCOPES`.
+Recording them hands the bindings to Terraform, which creates them with the applying credentials,
+so those credentials need `setIamPolicy` on the container, or in each project a selector resolves
+to, even where an administrator made the hand grant, and for a selector the reads that resolve it;
+the alternatives are to obtain them for the identity that applies, or to take the entry off the
+`PlatformAgent`, which retires its members over the reconcile's next two clean runs, and manage
+those projects through `SCOPE_PROJECTS` instead.
 
 The bindings live in projects, folders and organisations the applying identity has to be able to
 set IAM policy in. A scoped project or container that is deleted, or whose owner revokes that
 permission, fails the refresh or destroy of its bindings on every later plan, full upgrade and
-uninstall. Remove it from `SCOPE_PROJECTS`, `SCOPE_FOLDERS` or `SCOPE_ORGANIZATIONS` and forget
+uninstall (a Shared VPC host or Metrics Scope this identity can no longer read fails the plan the
+same way, since the lookup runs on every plan except `uninstall.sh`'s destroy, which blanks the
+selector keys). Remove it from `SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`,
+`SCOPE_SHARED_VPC_HOSTS` or `SCOPE_METRICS_SCOPES`, or, for a project a selector resolved to, name
+it exactly in `SCOPE_EXCLUDE_PROJECTS` (a monitored project the identity can no longer name only by
+its project number, since the ID is what the plan could not read; a service project by its ID), and forget
 its bindings from state, from the composition directory the last `lifecycle.sh` run initialised
 against the install's backend (the address is `module.kube_agents_iam.google_project_iam_member.scope_roles`,
 `module.kube_agents_iam.google_folder_iam_member.scope_roles` or
@@ -393,10 +475,11 @@ is a hand-authored dotenv and a hand may well write `export`.
   `tf_state_read`) run `trap - ERR` inside their substitution as well. Process
   substitution (`< <(...)`) leaves `BASH_SUBSHELL` at 0 on bash 3.2, so a tolerated read
   through one clears the trap inline wherever it sits.
-- **[common.sh](common.sh)**: utilities the dev tooling and the Prow CI scripts
-  (`hack/ci-deploy.sh`) use — colour output, `init_var`/`load_state`,
-  registry and third-party-image resolution, cluster connection helpers. Sources
-  `installer_common.sh`, so nothing is defined twice.
+- **[common.sh](common.sh)**: utilities the dev tooling (`scripts/dev/`) and the
+  `print_instructions_*` helpers use — colour output, `init_var`/`load_state`,
+  the registry prefixes, cluster connection, the step runner. Sources
+  `installer_common.sh`, so nothing is defined twice. `hack/ci-deploy.sh` sources
+  `scripts/release/common.sh`, not this file.
 - **[gke_dns_endpoint.sh](gke_dns_endpoint.sh)**: `gke_dns_endpoint_flag`, which decides whether a given cluster should be reached with `get-credentials --dns-endpoint`. This is the roster the file's own header defers to: `common.sh`, `installer_common.sh`, `install.sh`, `upgrade.sh`, `hack/ci-env.sh`, `scripts/release/common.sh`, `scripts/release/reconcile_environment.sh`, `terraform/examples/full-install/lifecycle.sh`, and the staging-workload scripts all source it. It is kept out of `common.sh` and free of every helper in this directory so that each of them can take the predicate and nothing else — `hack/ci-env.sh` and `lifecycle.sh` want no part of the state file, and `installer_common.sh` is sourced by front doors that load no other helper. It sets `GKE_DNS_ENDPOINT_FLAG` rather than echoing, so that callers do not run it in a `$(...)` subshell that would discard its memo of whether the local gcloud offers the flag at all. That answer leaves it empty — as do a cluster with no externally reachable DNS endpoint and a describe call that fails — leaving today's IP-endpoint command untouched. `installer_common.sh` and `lifecycle.sh` fall back to a stub setting the same empty value when the file is absent, as `reconcile_environment.sh` does, so a tree without it reaches every cluster with a routable IP endpoint rather than refusing to run.
 - **[min_versions.sh](min_versions.sh)**: minimum tool versions, side-effect-free so
   `install.sh` can source it standalone before any checkout exists.

@@ -137,8 +137,15 @@ __all__ = [
     "utc_now",
 ]
 
-#: Screening evidence must be at least this fraction of passing runs. 19/20.
-DEFAULT_ADMISSION_RATE = 0.95
+#: Screening evidence must be at least this fraction of passing runs. 18/20,
+#: or 19/21 for a window of seven three-repetition nights: the roster page's
+#: own bar (>= 90 % of graded repetitions), which is what the eval crew holds
+#: a case to, set here on 2026-09-29 from the store's night-to-night movement
+#: (#1493; the measurement is the 2026-09-29 comment there,
+#: https://github.com/gke-labs/kube-agents/issues/1493#issuecomment-5892741229).
+#: Advisory under ``EVAL_ADMISSION_MODE=roster``: it changes the record's
+#: sentence beside the roster's answer, never which cases block.
+DEFAULT_ADMISSION_RATE = 0.90
 
 #: ...over at least this many runs. A case that passed 1 of 1 has proved
 #: nothing, and admitting it would let a single lucky run arm the collapse

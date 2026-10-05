@@ -660,6 +660,39 @@ class DeadlineKills(unittest.TestCase):
         out = adjudicate(data(partial, other, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
         self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (0, 2))
 
+    def test_a_not_evaluated_run_with_a_collapsed_case_is_never_the_pull_requests_own_red(self):
+        # The suite certified nothing (SCHEMA.md, `eval_outcome`), and its
+        # roster may be older than the dashboard's: a gate case that failed
+        # every graded repetition on such a run, on no other PR, is still not
+        # the PR's own -- the run page says nothing about the change is
+        # implied, and the Reds tile counts the run among the gate's, so the
+        # digest's split must too.
+        lost = dict(run(1, 1, T0, tasks=[task("agent-kanban-smoke", "fff"), task("security-overgrant-probe", "iii")], result="FAILURE"), eval_verdict="RED", eval_outcome="not_evaluated", not_evaluated=["security-overgrant-probe"])
+        out = adjudicate(data(lost, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
+        self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (0, 1))
+        # And it stays in the population: another PR's red collapsing the
+        # same case is shared, not that PR's own.
+        other = run(3, 3, T0 - timedelta(minutes=10), tasks=[task("agent-kanban-smoke", "fff")], result="FAILURE")
+        out = adjudicate(data(lost, other, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
+        self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (0, 2))
+        # The same record without the suite's word is the PR's own red, as it
+        # always was: the field is what moves it.
+        graded_red = dict(lost)
+        del graded_red["eval_outcome"], graded_red["not_evaluated"]
+        out = adjudicate(data(graded_red, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
+        self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (1, 0))
+
+    def test_the_suites_word_on_an_aborted_build_is_not_the_not_evaluated_shape(self):
+        # The field keys on Prow's FAILURE like lost_pod and deadline_kill:
+        # a build aborted after the suite printed its line is an abort.
+        lost = dict(run(1, 1, T0, tasks=[task("security-overgrant-probe", "iii")], result="FAILURE"), eval_verdict="RED", eval_outcome="not_evaluated", not_evaluated=["security-overgrant-probe"])
+        self.assertTrue(health.Run(lost).not_evaluated)
+        aborted = dict(lost, result="ABORTED")
+        self.assertFalse(health.Run(aborted).not_evaluated)
+        self.assertEqual(health.Run(aborted).not_evaluated_cases, ["security-overgrant-probe"], "the list is still read; the shape is not")
+        out = adjudicate(data(aborted, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
+        self.assertEqual((out["red_runs"], out["pr_caused_reds"], out["infra_reds"], out["aborted_runs"]), (0, 0, 0, 1))
+
     def test_recovering_advice_names_the_bar_the_condition_is_left_on(self):
         self.assertIn("the newest 3 runs with a verdict, green or red, are on distinct PRs and all finished after the last kill", health.advice_for("DEGRADED", "deadline_kill", [], None, {}, recovering=True))
         self.assertIn("3 consecutive green runs on distinct PRs", health.advice_for("DEGRADED", "shared_break", [], None, {}, recovering=True))
@@ -792,6 +825,14 @@ class LostPods(unittest.TestCase):
         trimmed = health.trim(doc, T0 - timedelta(days=1), T0 + timedelta(days=1), "test")["runs"]
         self.assertEqual({k: v for k, v in trimmed[0].items() if k in health.ENDED_FIELDS}, {"has_build_log": False, "pod_phase": "Failed", "pod_node": "node-a", "pod_last_event": "NodeNotReady"})
         self.assertFalse(set(health.ENDED_FIELDS) & set(trimmed[1]))
+
+    def test_trim_carries_the_suites_verdict_so_a_fixture_replays_it(self):
+        # A field trim drops is a field the replay cannot see: without these
+        # two a not-evaluated run returns as the hard red in the fixture.
+        doc = data(dict(run(1, 1, T0, tasks=[task("x", "ppp")], result="FAILURE"), eval_outcome="not_evaluated", not_evaluated=["y"]), run(2, 2, T0, tasks=[task("x", "ppp")]))
+        trimmed = health.trim(doc, T0 - timedelta(days=1), T0 + timedelta(days=1), "test")["runs"]
+        self.assertEqual({k: trimmed[0][k] for k in health.SUITE_FIELDS}, {"eval_outcome": "not_evaluated", "not_evaluated": ["y"]})
+        self.assertFalse(set(health.SUITE_FIELDS) & set(trimmed[1]))
 
     def test_trim_carries_merge_conflict_so_a_fixture_replays_the_same_verdict(self):
         # #1608: a field trim drops is a field the replay cannot see, and the
@@ -1230,6 +1271,105 @@ def pooled(doc=None, now=T0, prev=None, posted=None, wall_clock=None, **artifact
         wall_clock=wall_clock,
         pool_pressure=pressure(**artifact),
     )
+
+
+def periodic_reading(job, when, passed=True, build="100", artifact=None):
+    reading = {"job": job, "build": build, "finished_at": health.iso(when), "passed": passed, "result": "SUCCESS" if passed else "FAILURE"}
+    if artifact is not None:
+        reading["artifact"] = artifact
+    return reading
+
+
+class PeriodicNote(unittest.TestCase):
+    """The watched Prow periodics ride beside the state as notes, never as a
+    state: a failed or overdue run is evidence and a `periodics` entry."""
+
+    WEEKLY = "ci-kube-agents-fleet-reconcile-all"
+    SWEEP = "ci-kube-agents-pull-sweep"
+
+    def judge(self, readings, prev=None, now=T0):
+        return health.adjudicate(data(), now, prev, health.Roster.fixed(ADMITTED), periodics_readings=readings)
+
+    def test_a_failed_reconcile_is_a_note_with_its_projects_and_the_state_stays_green(self):
+        artifact = {"dry_run": True, "outcomes": {"kube-agents-evals-3": {"outcome": "refused", "detail": "delete google_container_cluster.seeded_b"}}}
+        result = self.judge({self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(hours=1), passed=False, artifact=artifact)})
+        self.assertEqual(result["state"], "GREEN", "a failed periodic is a note, not a state")
+        note = result["periodics"][self.WEEKLY]
+        self.assertEqual((note["verdict"], note["build"], note["since"], note["dry_run"]), ("FAILED", "100", health.iso(T0), True))
+        self.assertEqual(note["detail"], ["kube-agents-evals-3: refused (delete google_container_cluster.seeded_b)"])
+        self.assertEqual(result["periodics_read"], [self.WEEKLY])
+        self.assertTrue(any("seeded-fleet reconcile (weekly): build 100 failed" in line for line in result["evidence"]), result["evidence"])
+        # The episode's start carries through the previous health.json.
+        again = self.judge({self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(hours=1), passed=False, build="100")}, prev=result, now=T0 + timedelta(hours=1))
+        self.assertEqual(again["periodics"][self.WEEKLY]["since"], health.iso(T0))
+
+    def test_a_clean_fresh_pool_writes_no_note_and_names_what_it_read(self):
+        result = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(minutes=10)), self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(days=2))})
+        self.assertEqual(result["periodics"], {})
+        self.assertEqual(result["periodics_read"], [self.WEEKLY, self.SWEEP])
+        self.assertFalse(any("reconcile" in line or "sweep" in line for line in result["evidence"]))
+        # What each read job's latest build did, for the recovery message.
+        self.assertEqual(sorted(result["periodics_runs"]), [self.WEEKLY, self.SWEEP])
+        self.assertEqual(result["periodics_streaks"][self.SWEEP], {"build": "100", "projects": {}, "runs": 0})
+
+        self.assertEqual(result["periodics_runs"][self.SWEEP]["passed"], True)
+        self.assertIsNone(result["periodics_runs"][self.SWEEP]["summary"], "no report, no summary")
+
+    def test_the_sweeps_single_failed_build_is_no_note_and_its_streak_carries(self):
+        fail = {"projects": 1, "closed": 0, "failed": 1, "left_for_next_run": 0, "outcomes": {"kube-agents-evals-3": {"error": "HTTP 401 Unauthorized"}}}
+        # A previous health.json without counts yet (the first tick after the
+        # counts ship); a tick with none at all is the test below.
+        first = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(minutes=5), passed=False, build="100", artifact=fail)}, prev={})
+        self.assertEqual(first["periodics"], {}, "one failed ten-minute run is not news")
+        self.assertEqual(first["periodics_streaks"][self.SWEEP], {"build": "100", "projects": {"kube-agents-evals-3": 1}, "runs": 1})
+        second = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 + timedelta(minutes=5), passed=False, build="101", artifact=fail)}, prev=first, now=T0 + timedelta(minutes=15))
+        self.assertIn(self.SWEEP, second["periodics"], "two in a row is")
+        self.assertEqual(second["periodics_streaks"][self.SWEEP]["runs"], 2)
+        third = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 + timedelta(minutes=20), passed=True, build="102")}, prev=second, now=T0 + timedelta(minutes=30))
+        self.assertEqual(third["periodics_streaks"][self.SWEEP], {"build": "102", "projects": {}, "runs": 0}, "a clean build clears every count")
+        self.assertEqual(third["periodics"], {})
+
+    def test_a_tick_without_the_previous_health_json_does_not_hide_a_failing_sweep(self):
+        # The counts live in the previous health.json; without it they start
+        # over, so on that tick the thresholds are off and a failed build is a
+        # note (the poster keys on the verdict and does not re-announce).
+        fail = {"projects": 1, "closed": 0, "failed": 1, "left_for_next_run": 0, "outcomes": {"kube-agents-evals-3": {"error": "HTTP 401 Unauthorized"}}}
+        blind = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(minutes=5), passed=False, build="100", artifact=fail)}, prev=None)
+        self.assertIn(self.SWEEP, blind["periodics"])
+        self.assertEqual(blind["periodics_streaks"][self.SWEEP]["runs"], 1)
+
+    def test_an_overdue_job_is_stale_and_no_readings_is_no_note(self):
+        stale = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(hours=2))})
+        self.assertEqual(stale["periodics"][self.SWEEP]["verdict"], "STALE")
+        blind = self.judge(None)
+        self.assertEqual((blind["periodics"], blind["periodics_read"]), ({}, []))
+
+    def test_an_episodes_start_survives_a_blind_tick_and_ends_on_a_clean_reading(self):
+        failing = {self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(hours=1), passed=False)}
+        first = self.judge(failing)
+        self.assertEqual(first["periodics_since"], {self.WEEKLY: health.iso(T0)})
+        blind = self.judge(None, prev=first, now=T0 + timedelta(hours=1))
+        self.assertEqual((blind["periodics"], blind["periodics_since"]), ({}, {self.WEEKLY: health.iso(T0)}))
+        again = self.judge(failing, prev=blind, now=T0 + timedelta(hours=2))
+        self.assertEqual(again["periodics"][self.WEEKLY]["since"], health.iso(T0), "the start is not the blind tick's end")
+        clean = self.judge({self.WEEKLY: periodic_reading(self.WEEKLY, T0 + timedelta(hours=2))}, prev=again, now=T0 + timedelta(hours=3))
+        self.assertEqual((clean["periodics"], clean["periodics_since"]), ({}, {}))
+        # Blind to one job, not another: the unread job's start survives.
+        partial = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 + timedelta(hours=1))}, prev=first, now=T0 + timedelta(hours=1))
+        self.assertEqual(partial["periodics_since"], {self.WEEKLY: health.iso(T0)})
+        self.assertEqual(partial["periodics_read"], [self.SWEEP])
+        # A job no longer watched leaves the carry.
+        retired = dict(first, periodics_since={**first["periodics_since"], "ci-kube-agents-retired": health.iso(T0)})
+        self.assertEqual(self.judge(None, prev=retired, now=T0 + timedelta(hours=1))["periodics_since"], {self.WEEKLY: health.iso(T0)})
+
+    def test_staleness_is_measured_on_the_wall_clock_not_the_data_horizon(self):
+        # A stalled archive freezes data.json's generated_at with the jobs; the
+        # dead-man's switch has to read the time it is.
+        reading = {self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(days=9))}
+        frozen = health.adjudicate(data(), T0 - timedelta(days=8), None, health.Roster.fixed(ADMITTED), periodics_readings=reading)
+        self.assertEqual(frozen["periodics"], {}, "on the data's own horizon the run is a day old")
+        live = health.adjudicate(data(), T0 - timedelta(days=8), None, health.Roster.fixed(ADMITTED), wall_clock=T0, periodics_readings=reading)
+        self.assertEqual(live["periodics"][self.WEEKLY]["verdict"], "STALE")
 
 
 class PoolNote(unittest.TestCase):
@@ -2228,9 +2368,14 @@ class FixtureDrift(unittest.TestCase):
         self.assertEqual((held["state"], held["condition"], held["since"]), ("DEGRADED", "fixture_drift", health.iso(T0)))
         cleared = self.judge(scan(at=later - timedelta(minutes=5)), prev=held, now=later)
         self.assertEqual((cleared["state"], cleared["condition"], cleared["recovering"]), ("GREEN", None, False), "no three-green-runs bar: the scan is the recovery")
-        # One project still drifted, not repeated: the condition is over.
+        # One of the incident's projects still drifted: not enough to enter,
+        # but the scan still shows the drift, so it is not the recovery either.
         one = self.judge(scan(drifted={project(1): [DRIFT_ROLE]}, at=later - timedelta(minutes=5)), prev=held, now=later)
-        self.assertEqual(one["state"], "GREEN")
+        self.assertEqual((one["state"], one["condition"]), ("DEGRADED", "fixture_drift"))
+        self.assertIn(f"fixture drift held: the fixture-state scan still shows the drift on {project(1)}; a scan that reads those projects clean ends it", one["evidence"])
+        # A project outside the incident drifting once does not hold it.
+        elsewhere = self.judge(scan(drifted={project(9): [DRIFT_ROLE]}, at=later - timedelta(minutes=5)), prev=held, now=later)
+        self.assertEqual(elsewhere["state"], "GREEN")
 
     def test_a_scan_that_could_not_see_the_incident_holds_it(self):
         firing = scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)})
@@ -2262,6 +2407,390 @@ class FixtureDrift(unittest.TestCase):
         self.assertEqual((cited["issue"], cited["tracking_issues"]), (owner, ["#1400"]))
         other = dict(owner, condition="lost_pods")
         self.assertIsNone(self.judge(firing, posted={"issue": other})["issue"])
+
+
+# --------------------------------------------------------------------------- #
+# Rule 3e: pool drift (#1967), the same rule over pool-state.json
+# --------------------------------------------------------------------------- #
+
+POOL_CHECKS = ("project_and_apis", "iam", "artifact_registry", "gke_and_state", "token_minter_kms")
+FINDING = "iam/platform-gsa/missing/roles/serviceusage.serviceUsageConsumer"
+OTHER_FINDING = "apis/cloudkms.googleapis.com"
+FAILED_FINDING = "iam/failed"
+GKE_FAILED_FINDING = "gke_and_state/failed"
+GKE_FINDING = "gke/cluster/seeded-b"
+# The one finding a leased run passes with (the verifier's LEASE_SILENT_FINDINGS).
+SILENT_FINDING = "gke/host-otel-scope"
+FINDING_CHECK = {FINDING: "iam", OTHER_FINDING: "project_and_apis", FAILED_FINDING: "iam", GKE_FAILED_FINDING: "gke_and_state", GKE_FINDING: "gke_and_state", SILENT_FINDING: "gke_and_state"}
+FINDING_DETAIL = "The platform agent GSA is missing roles/serviceusage.serviceUsageConsumer on {project}"
+FINDING_REPAIR = 'gcloud projects add-iam-policy-binding {project} --member="serviceAccount:kubeagents-platform-gsa@{project}.iam.gserviceaccount.com" --role=roles/serviceusage.serviceUsageConsumer'
+POOL_BLIND_REASON = "Could not describe kube-agents-evals-1, so neither it nor anything derived from its project number was checked: PERMISSION_DENIED"
+
+
+def pool_scan(drifted=None, previous=None, at=None, projects=30, checked=None, unread=None, partial=None):
+    """A pool-state.json as scripts/eval_dashboard/pool_state.py writes it:
+    `drifted` {project: [finding ids]} this scan, `previous` the same for the
+    scan before, every check healthy -- or not checked on every project
+    outside `checked`, the checks in `unread` {project: [check ids]} not
+    checked there, and those in `partial` healthy with a warning (read in part)."""
+    drifted = drifted or {}
+    unread = unread or {}
+    partial = partial or {}
+    at = at or T0 - timedelta(minutes=5)
+    entries = {}
+    for i in range(1, projects + 1):
+        name = project(i)
+        readable = checked is None or name in checked
+        findings = {}
+        for finding in drifted.get(name, []):
+            findings[finding] = {"check": FINDING_CHECK[finding], "detail": [FINDING_DETAIL.format(project=name)], "repair": FINDING_REPAIR.format(project=name)}
+        checks = {}
+        for check in POOL_CHECKS:
+            if not readable or check in unread.get(name, []):
+                checks[check] = {"state": "not_checked", "detail": [POOL_BLIND_REASON]}
+            elif check in partial.get(name, []):
+                checks[check] = {"state": "healthy", "detail": ["Could not read the project IAM policy"], "unread": ["Could not read the project IAM policy"]}
+            elif any(FINDING_CHECK[f] == check for f in findings):
+                checks[check] = {"state": "drifted", "detail": [FINDING_DETAIL.format(project=name)]}
+            else:
+                checks[check] = {"state": "healthy", "detail": []}
+        entries[name] = {"checks": checks, "findings": findings if readable else {}}
+    return {
+        "schema_version": 1,
+        "scanned_at": health.iso(at),
+        "scope": "pool",
+        "checks": list(POOL_CHECKS),
+        "projects": entries,
+        "previous": {"scanned_at": health.iso(at - timedelta(hours=1)), "drifted": previous or {}},
+    }
+
+
+class PoolDrift(unittest.TestCase):
+    def judge(self, scan_doc, prev=None, now=T0, doc=None, posted=None, fleet=None):
+        doc = doc or data(*(run(100 + i, 10 + i, T0 - timedelta(minutes=30 * i), tasks=broken_tasks(set())) for i in range(3)))
+        return health.adjudicate(doc, now, prev, health.Roster.fixed(ADMITTED), posted=posted, fixture_state_doc=fleet, pool_state_doc=scan_doc)
+
+    def test_no_scan_means_no_condition_and_no_block(self):
+        result = self.judge(None)
+        self.assertEqual((result["state"], result["pool_state"]), ("GREEN", None))
+        self.assertFalse(any("pool-state" in line for line in result["evidence"]))
+
+    def test_one_project_once_is_evidence_not_a_condition(self):
+        result = self.judge(pool_scan(drifted={project(1): [FINDING]}))
+        self.assertEqual(result["state"], "GREEN")
+        self.assertIn(f"{FINDING} found on 1 pool project(s) ({project(1)}) at the 23:55 UTC scan; not yet repeated or widespread", result["evidence"])
+        block = result["pool_state"]
+        self.assertEqual((block["projects"], block["checked"], block["drifted"], block["unknown"], block["stale"]), (30, 30, {project(1): [FINDING]}, False, False))
+
+    def test_the_same_finding_on_the_same_project_two_scans_running_degrades(self):
+        result = self.judge(pool_scan(drifted={project(1): [FINDING]}, previous={project(1): [FINDING]}))
+        self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "pool_drift"))
+        self.assertEqual(result["cause"], f"pool drift: {FINDING} on 1 pool project(s)")
+        incident = result["incident"]
+        self.assertEqual((incident["prs"], incident["runs"], incident["window_end"]), ([], 0, None))
+        self.assertEqual((incident["roles"], incident["projects"]), ([FINDING], [project(1)]))
+        self.assertEqual(incident["drift"], {project(1): {FINDING: [FINDING_DETAIL.format(project=project(1))]}})
+        self.assertEqual(incident["repairs"], {project(1): {FINDING: FINDING_REPAIR.format(project=project(1))}})
+        self.assertEqual(incident["reads"], {project(1): ["iam"]}, "the exit needs the finding's check read again, not the finding")
+        self.assertEqual(
+            result["advice"],
+            f"A 403 or a missing-resource red from a run that leased {project(1)} is the pool project's shape, not your change"
+            f" ({FINDING}); retest once the pool owner has run the repair, which pool-state.json names per project for every named finding.",
+        )
+
+    def test_three_projects_in_one_scan_degrade_and_two_do_not(self):
+        three = {project(i): [FINDING] for i in (1, 2, 3)}
+        result = self.judge(pool_scan(drifted=three))
+        self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "pool_drift"))
+        self.assertEqual(result["cause"], f"pool drift: {FINDING} on 3 pool project(s)")
+        self.assertEqual(self.judge(pool_scan(drifted={project(i): [FINDING] for i in (1, 2)}))["state"], "GREEN")
+
+    def test_a_finding_a_leased_run_passes_with_gets_the_opposite_advice(self):
+        # A host cluster without the managed OpenTelemetry scope serves its
+        # lease and only its traces are missing, so the 403 sentence would
+        # send a pull request's own red to the pool for as long as the
+        # repair takes (27 of 28 projects when the check landed).
+        three = {project(i): [SILENT_FINDING] for i in (1, 2, 3)}
+        result = self.judge(pool_scan(drifted=three))
+        self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "pool_drift"))
+        self.assertEqual(result["cause"], f"pool drift: {SILENT_FINDING} on 3 pool project(s)")
+        self.assertEqual(result["incident"]["passes_leases"], [SILENT_FINDING])
+        self.assertEqual(result["pool_state"]["passes_leases"], [SILENT_FINDING])
+        self.assertEqual((result["incident"]["reds_runs"], result["incident"]["reds_runs_projects"]), ([], []))
+        self.assertEqual((result["pool_state"]["reds_runs"], result["pool_state"]["reds_runs_projects"]), ([], []))
+        self.assertEqual(
+            result["advice"],
+            f"No run reds from {SILENT_FINDING} on {project(1)}, {project(2)}, {project(3)}: an install there passes its lease with that gap,"
+            " so a 403 or a missing-resource red on one of them is your change's to read, not the pool's."
+            " The pool owner's repair is in pool-state.json per project; nothing on your side waits for it.",
+        )
+        self.assertNotIn("not your change", result["advice"])
+        # The repair still travels with the incident: the pool is drifted.
+        self.assertEqual(result["incident"]["repairs"][project(1)], {SILENT_FINDING: FINDING_REPAIR.format(project=project(1))})
+
+    def test_a_finding_that_reds_runs_beside_one_that_does_not_keeps_the_403_advice_on_its_own_projects(self):
+        drifted = {project(1): [FINDING, SILENT_FINDING], project(2): [FINDING], project(3): [FINDING]}
+        drifted.update({project(i): [SILENT_FINDING] for i in (4, 5, 6)})
+        result = self.judge(pool_scan(drifted=drifted))
+        self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "pool_drift"))
+        self.assertEqual(result["incident"]["roles"], [SILENT_FINDING, FINDING])
+        self.assertEqual(result["incident"]["passes_leases"], [SILENT_FINDING])
+        # The split is carried once, here, for every renderer: the findings
+        # a leased run reds on and the projects one of them is on, in the
+        # incident (the firing ones) and the pool_state block (every drifted
+        # project this scan).
+        self.assertEqual((result["incident"]["reds_runs"], result["incident"]["reds_runs_projects"]), ([FINDING], [project(1), project(2), project(3)]))
+        self.assertEqual((result["pool_state"]["reds_runs"], result["pool_state"]["reds_runs_projects"]), ([FINDING], [project(1), project(2), project(3)]))
+        self.assertEqual(health.pool_drift_split(result["incident"]), ([FINDING], [SILENT_FINDING], [project(1), project(2), project(3)]))
+        advice = result["advice"]
+        self.assertEqual(
+            advice,
+            f"A 403 or a missing-resource red from a run that leased {project(1)}, {project(2)}, {project(3)} is the pool project's shape, not your change"
+            f" ({FINDING}); retest once the pool owner has run the repair, which pool-state.json names per project for every named finding."
+            f" {SILENT_FINDING} reds no run: an install passes its lease with that gap, so a red on a project with only that finding is yours to read.",
+        )
+        # The 403 sentence names the projects the loud finding is on, not the six.
+        self.assertNotIn(project(4), advice)
+
+    def test_a_pool_finding_that_reds_runs_lists_nothing_under_passes_leases(self):
+        result = self.judge(pool_scan(drifted={project(1): [FINDING]}, previous={project(1): [FINDING]}))
+        self.assertEqual((result["incident"]["passes_leases"], result["pool_state"]["passes_leases"]), ([], []))
+        self.assertEqual((result["incident"]["reds_runs"], result["incident"]["reds_runs_projects"]), ([FINDING], [project(1)]))
+
+    def test_an_incident_from_before_the_split_was_carried_reads_every_finding_as_one_a_run_reds_on(self):
+        # A held incident is the previous tick's document; one written before
+        # the split was carried has no classification, and the advice for it
+        # is the one from before the split, on every project.
+        incident = {"roles": [FINDING], "projects": [project(1), project(2)], "drift": {}}
+        self.assertEqual(health.pool_drift_split(incident), ([FINDING], [], [project(1), project(2)]))
+        self.assertEqual(
+            health.advice_for("DEGRADED", "pool_drift", [], None, {}, incident=incident),
+            f"A 403 or a missing-resource red from a run that leased {project(1)}, {project(2)} is the pool project's shape, not your change"
+            f" ({FINDING}); retest once the pool owner has run the repair, which pool-state.json names per project for every named finding.",
+        )
+
+    def test_ranked_below_fixture_drift_and_every_run_based_condition(self):
+        both = self.judge(pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)}), fleet=scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}))
+        self.assertEqual(both["condition"], "fixture_drift")
+        self.assertTrue(any(line.startswith(f"{FINDING} found on 3 pool project(s)") for line in both["evidence"]), "the pool drift stays as context")
+        lost_doc = data(*(lost(100 + i, i, T0 - timedelta(minutes=5 * i)) for i in range(3)))
+        self.assertEqual(self.judge(pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)}), doc=lost_doc)["condition"], "lost_pods")
+
+    def test_a_stale_or_blind_scan_is_never_a_drift(self):
+        stale = self.judge(pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)}, at=T0 - timedelta(hours=4)))
+        self.assertEqual((stale["state"], stale["pool_state"]["stale"]), ("GREEN", True))
+        self.assertIn(f"pool-state scan is 4h old (last {health.iso(T0 - timedelta(hours=4))}); ignored, check the scan job", stale["evidence"])
+        blind = self.judge(pool_scan(checked=set()))
+        self.assertEqual((blind["state"], blind["pool_state"]["unknown"], blind["pool_state"]["reason"]), ("GREEN", True, POOL_BLIND_REASON))
+        self.assertIn(f"pool-state scan at 23:55 UTC could check none of 30 pool projects ({POOL_BLIND_REASON})", blind["evidence"])
+
+    def test_it_ends_when_the_findings_check_reads_clean_and_holds_while_it_is_unread(self):
+        firing = pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)})
+        prev = self.judge(firing)
+        self.assertEqual(prev["condition"], "pool_drift")
+        later = T0 + timedelta(hours=1)
+        at = later - timedelta(minutes=5)
+        cleared = self.judge(pool_scan(at=at), prev=prev, now=later)
+        self.assertEqual((cleared["state"], cleared["condition"], cleared["recovering"]), ("GREEN", None, False), "the scan is the recovery")
+        # The finding's own check unread on one of the projects holds it...
+        held = self.judge(pool_scan(at=at, unread={project(2): ["iam"]}), prev=prev, now=later)
+        self.assertEqual((held["state"], held["condition"], held["since"]), ("DEGRADED", "pool_drift", health.iso(T0)))
+        self.assertIn(f"pool drift held: the pool-state scan could not read {project(2)}; a scan that reads those projects clean ends it", held["evidence"])
+        # ...and another check unread there does not: the grant was read and is back.
+        other = self.judge(pool_scan(at=at, unread={project(2): ["gke_and_state"]}), prev=prev, now=later)
+        self.assertEqual((other["state"], other["condition"]), ("GREEN", None))
+        # A partial read of the finding's check -- healthy with a warning, the
+        # project policy refused -- did not see the grant either, and holds.
+        partial = self.judge(pool_scan(at=at, partial={project(2): ["iam"]}), prev=prev, now=later)
+        self.assertEqual((partial["state"], partial["condition"]), ("DEGRADED", "pool_drift"))
+        self.assertFalse(partial["pool_state"]["unknown"], "a partial read is not a blind scan")
+        for name, (doc, why) in {
+            "absent": (None, "no pool-state scan was read this tick"),
+            "stale": (pool_scan(at=later - timedelta(hours=4)), "the pool-state scan is stale"),
+            "blind": (pool_scan(at=at, checked=set()), "the pool-state scan could check no project"),
+        }.items():
+            with self.subTest(name):
+                still = self.judge(doc, prev=prev, now=later)
+                self.assertEqual((still["state"], still["condition"], still["incident"]), ("DEGRADED", "pool_drift", prev["incident"]))
+                self.assertIn(f"pool drift held: {why}; a scan that reads those projects clean ends it", still["evidence"])
+
+    def test_a_scan_that_still_shows_the_drift_holds_it_even_when_the_repeat_rule_misses(self):
+        # An unread scan or a lost prior in between makes the same drift
+        # arrive as "new" on one project, which does not fire; the exit must
+        # ask the scan whether the finding is still there, not only whether
+        # the check was readable.
+        firing = pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)})
+        prev = self.judge(firing)
+        later = T0 + timedelta(hours=1)
+        persisting = pool_scan(at=later - timedelta(minutes=5), drifted={project(2): [FINDING]}, previous={})
+        held = self.judge(persisting, prev=prev, now=later)
+        self.assertEqual((held["state"], held["condition"], held["since"]), ("DEGRADED", "pool_drift", health.iso(T0)))
+        self.assertIn(f"pool drift held: the pool-state scan still shows the drift on {project(2)}; a scan that reads those projects clean ends it", held["evidence"])
+
+    def test_a_held_fixture_incident_is_not_displaced_by_pool_drift(self):
+        # The fleet scan goes stale while fixture drift is open, and the pool
+        # scan (which the workflow keeps publishing then) fires: the held
+        # incident stands until its own scan reads clean, then pool drift takes
+        # over. Otherwise the state would leave through the pool scan's exit
+        # with the fixture drift never read clean.
+        firing = scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)})
+        prev = self.judge(None, fleet=firing)
+        self.assertEqual(prev["condition"], "fixture_drift")
+        later = T0 + timedelta(hours=1)
+        pool = pool_scan(at=later - timedelta(minutes=5), drifted={project(i): [FINDING] for i in (4, 5, 6)})
+        held = self.judge(pool, fleet=scan(at=later - timedelta(hours=4)), prev=prev, now=later)
+        self.assertEqual((held["state"], held["condition"], held["since"]), ("DEGRADED", "fixture_drift", health.iso(T0)))
+        self.assertTrue(any("fixture-state scan is stale" in line for line in held["evidence"]), held["evidence"])
+        switched = self.judge(pool, fleet=scan(at=later + timedelta(minutes=55)), prev=held, now=later + timedelta(hours=1))
+        self.assertEqual((switched["state"], switched["condition"]), ("DEGRADED", "pool_drift"))
+
+    def test_a_run_based_condition_still_displaces_a_held_scan_condition(self):
+        # Lost pods, a storm, a break: read from the runs, ranked above the
+        # scans, and reported the tick they fire, whatever a scan's hold says.
+        firing = scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)})
+        prev = self.judge(None, fleet=firing)
+        assessed = {"state": "DEGRADED", "condition": health.LOST_PODS, "cause": "the build cluster lost the node under 3 runs", "failing_cases": [], "current": True, "fixture": {"known": False}, "pool_state": {"known": False}}
+        decided = health.transition(prev, assessed, T0 + timedelta(hours=1))
+        self.assertEqual((decided["state"], decided["condition"]), ("DEGRADED", health.LOST_PODS))
+
+    def test_a_held_scan_condition_is_not_replaced_by_its_own_firing_on_other_units(self):
+        # p1..p3 unread this scan while a different finding fires on p4..p6:
+        # the incident stays p1..p3's until they are read clean, then the new
+        # one takes over; otherwise a scan that never read p1..p3 could end it.
+        firing = pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)})
+        prev = self.judge(firing)
+        later = T0 + timedelta(hours=1)
+        unread_old = pool_scan(at=later - timedelta(minutes=5), drifted={project(i): [OTHER_FINDING] for i in (4, 5, 6)}, unread={project(i): ["iam"] for i in (1, 2, 3)})
+        held = self.judge(unread_old, prev=prev, now=later)
+        self.assertEqual((held["condition"], sorted(held["incident"]["projects"]), held["incident"]["roles"]), ("pool_drift", [project(1), project(2), project(3)], [FINDING]))
+        self.assertTrue(any("could not read" in line for line in held["evidence"]), held["evidence"])
+        clean_old = pool_scan(at=later + timedelta(minutes=55), drifted={project(i): [OTHER_FINDING] for i in (4, 5, 6)}, previous={project(i): [OTHER_FINDING] for i in (4, 5, 6)})
+        switched = self.judge(clean_old, prev=held, now=later + timedelta(hours=1))
+        self.assertEqual((switched["condition"], sorted(switched["incident"]["projects"]), switched["incident"]["roles"]), ("pool_drift", [project(4), project(5), project(6)], [OTHER_FINDING]))
+
+    def test_a_drift_that_spreads_is_reported_at_its_new_size(self):
+        # The same finding on the held projects and four more: the new
+        # incident covers the old one, so it is taken (every held project is
+        # still in its reads), and the advice names seven, not three.
+        firing = pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)})
+        prev = self.judge(firing)
+        later = T0 + timedelta(hours=1)
+        spread = pool_scan(at=later - timedelta(minutes=5), drifted={project(i): [FINDING] for i in range(1, 8)}, previous={project(i): [FINDING] for i in (1, 2, 3)})
+        wider = self.judge(spread, prev=prev, now=later)
+        self.assertEqual((wider["condition"], sorted(wider["incident"]["projects"])), ("pool_drift", [project(i) for i in range(1, 8)]))
+        self.assertIn("7 pool project(s)", wider["cause"])
+
+    def test_fixture_drift_takes_over_a_pool_drift_held_by_a_stale_pool_scan(self):
+        # Ranked above it in assess(): a fixture drift that starts firing is
+        # not masked by a pool incident whose scan has gone stale.
+        prev = self.judge(pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)}))
+        later = T0 + timedelta(hours=4)
+        stale_pool = pool_scan(at=T0 - timedelta(minutes=5), drifted={project(i): [FINDING] for i in (1, 2, 3)})
+        fleet = scan(at=later - timedelta(minutes=5), drifted={project(i): [DRIFT_ROLE] for i in (10, 11, 12)})
+        result = self.judge(stale_pool, fleet=fleet, prev=prev, now=later)
+        self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "fixture_drift"))
+        self.assertEqual(sorted(result["incident"]["projects"]), [project(10), project(11), project(12)])
+
+    def test_a_named_finding_joining_a_checks_failed_unit_is_not_its_recovery(self):
+        # `iam/failed` is what the verifier writes for an IAM failure with no
+        # named finding; it stands for the check. A later scan that names a
+        # finding on the same check stops synthesising it, and the check is
+        # still failing, so the incident holds; it ends when the check is clean.
+        firing = pool_scan(drifted={project(i): [FAILED_FINDING] for i in (1, 2, 3)})
+        prev = self.judge(firing)
+        self.assertEqual(prev["condition"], "pool_drift")
+        later = T0 + timedelta(hours=1)
+        at = later - timedelta(minutes=5)
+        joined = pool_scan(at=at, drifted={project(2): [FINDING]}, previous={project(i): [FAILED_FINDING] for i in (1, 2, 3)})
+        held = self.judge(joined, prev=prev, now=later)
+        self.assertEqual((held["state"], held["condition"], held["since"]), ("DEGRADED", "pool_drift", health.iso(T0)))
+        self.assertTrue(any(f"still shows the drift on {project(2)}" in line for line in held["evidence"]), held["evidence"])
+        clean = pool_scan(at=at, previous={project(i): [FAILED_FINDING] for i in (1, 2, 3)})
+        self.assertEqual(self.judge(clean, prev=prev, now=later)["condition"], None)
+        # The same for a check whose findings are not prefixed with its id:
+        # `gke_and_state/failed`, then `gke/cluster/seeded-b`.
+        firing = pool_scan(drifted={project(i): [GKE_FAILED_FINDING] for i in (1, 2, 3)})
+        prev = self.judge(firing)
+        joined = pool_scan(at=at, drifted={project(2): [GKE_FINDING]}, previous={project(i): [GKE_FAILED_FINDING] for i in (1, 2, 3)})
+        held = self.judge(joined, prev=prev, now=later)
+        self.assertEqual((held["state"], held["condition"], held["since"]), ("DEGRADED", "pool_drift", health.iso(T0)))
+        self.assertTrue(any(f"still shows the drift on {project(2)}" in line for line in held["evidence"]), held["evidence"])
+
+    def test_a_project_retired_from_the_mapping_no_longer_holds_the_incident(self):
+        # An incident's project removed from hack/ci-deploy.sh is absent from
+        # every later document; it is not "unread" forever, and the exit
+        # asks only about the projects the scan still lists.
+        firing = pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)})
+        prev = self.judge(firing)
+        later = T0 + timedelta(hours=1)
+        clean = pool_scan(at=later - timedelta(minutes=5), previous={project(i): [FINDING] for i in (1, 2, 3)})
+        del clean["projects"][project(2)]
+        self.assertEqual(self.judge(clean, prev=prev, now=later)["condition"], None)
+        # ...while a project that is listed and unread still holds it.
+        blind = pool_scan(at=later - timedelta(minutes=5), checked={project(i) for i in range(1, 31)} - {project(3)}, previous={project(i): [FINDING] for i in (1, 2, 3)})
+        del blind["projects"][project(2)]
+        held = self.judge(blind, prev=prev, now=later)
+        self.assertEqual((held["state"], held["condition"]), ("DEGRADED", "pool_drift"))
+
+    def test_a_selected_document_missing_the_incidents_projects_holds_it(self):
+        # A hand run's --projects document says `scope: selected`: a project
+        # absent from it was not read, so nothing was observed about the
+        # incident and it holds rather than reading as a recovery nothing saw.
+        firing = pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)})
+        prev = self.judge(firing)
+        later = T0 + timedelta(hours=1)
+        others = pool_scan(at=later - timedelta(minutes=5), previous={project(i): [FINDING] for i in (1, 2, 3)})
+        others["scope"] = "selected"
+        for i in (1, 2, 3):
+            del others["projects"][project(i)]
+        held = self.judge(others, prev=prev, now=later)
+        self.assertEqual((held["state"], held["condition"], held["since"]), ("DEGRADED", "pool_drift", health.iso(T0)))
+        self.assertTrue(any("could not read" in line for line in held["evidence"]), held["evidence"])
+
+    def test_a_check_that_later_fails_without_a_finding_does_not_end_a_named_incident(self):
+        # The IAM policy would not parse, or the read failed outside the
+        # unread grammar: the check is `iam/failed` with nothing named and
+        # nothing unread, which is not a read of the role the incident named.
+        firing = pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)})
+        prev = self.judge(firing)
+        later = T0 + timedelta(hours=1)
+        failed = pool_scan(at=later - timedelta(minutes=5), drifted={project(2): [FAILED_FINDING]}, previous={project(i): [FINDING] for i in (1, 2, 3)})
+        held = self.judge(failed, prev=prev, now=later)
+        self.assertEqual((held["state"], held["condition"], held["since"]), ("DEGRADED", "pool_drift", health.iso(T0)))
+        self.assertTrue(any(f"could not read {project(2)}" in line for line in held["evidence"]), held["evidence"])
+
+    def test_an_incident_whose_every_project_was_retired_ends(self):
+        # The pool's own document (`scope: pool`) no longer listing any of an
+        # incident's projects means they left the mapping: nothing is waited
+        # on, and the incident ends rather than holding forever.
+        firing = pool_scan(drifted={project(2): [FINDING]}, previous={project(2): [FINDING]})
+        prev = self.judge(firing)
+        self.assertEqual(prev["condition"], "pool_drift")
+        later = T0 + timedelta(hours=1)
+        retired = pool_scan(at=later - timedelta(minutes=5), previous={project(2): [FINDING]})
+        del retired["projects"][project(2)]
+        self.assertEqual(retired["scope"], "pool")
+        self.assertEqual(self.judge(retired, prev=prev, now=later)["condition"], None)
+
+    def test_a_fixture_incident_recorded_before_reads_existed_still_exits_on_its_roles(self):
+        # The live health.json at merge time may hold a fixture_drift incident
+        # without `reads`; the exit then asks for the roles themselves.
+        firing = scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)})
+        prev = self.judge(None, fleet=firing)
+        self.assertEqual(prev["condition"], "fixture_drift")
+        del prev["incident"]["reads"]
+        later = T0 + timedelta(hours=1)
+        at = later - timedelta(minutes=5)
+        held = self.judge(None, fleet=scan(at=at, checked={project(i) for i in range(1, 31)} - {project(2)}), prev=prev, now=later)
+        self.assertEqual((held["state"], held["condition"]), ("DEGRADED", "fixture_drift"))
+        cleared = self.judge(None, fleet=scan(at=at), prev=prev, now=later)
+        self.assertEqual((cleared["state"], cleared["condition"]), ("GREEN", None))
+
+    def test_the_posters_issue_is_cited_for_the_condition_it_was_filed_for(self):
+        firing = pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)})
+        owner = {"number": 1500, "url": "https://github.com/gke-labs/kube-agents/issues/1500", "condition": "pool_drift"}
+        self.assertEqual(self.judge(firing, posted={"issue": owner})["tracking_issues"], ["#1500"])
+        self.assertIsNone(self.judge(firing, posted={"issue": dict(owner, condition="fixture_drift")})["issue"])
 
 
 if __name__ == "__main__":

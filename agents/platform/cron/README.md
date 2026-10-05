@@ -369,9 +369,10 @@ repository through the same `resolver.py poll`, so leaving it enabled for a
 release would keep paying the 48 daily model turns the replacement exists to
 stop.
 
-Their SOPs under `../governance/` are deliberately left in place: an SOP is
-inert without a job to run it, and keeping them makes reviving a watchdog a
-roster edit rather than an archaeology exercise.
+The five retired watchdogs' SOPs are gone from `../governance/` as well — git
+history has them. An SOP is inert without a job to run it, and as written none
+of these could produce a finding on a stock install, so reviving one is a new
+SOP and a roster entry, not a restore.
 
 ## Adding a watchdog: the repository steps
 
@@ -464,11 +465,15 @@ rule outlives the memory of why:
 Each governance prompt cites its SOP's total length and the line range of its
 checks section. Those numbers are load-bearing — they are what stops a model
 reading the first screen and reporting a clean fleet it never looked at — and
-they rot the moment an SOP is edited.
+they rot the moment an SOP is edited. They are generated, not measured by hand:
+`make docs-generate` runs `scripts/generate_sop_geography.py`, which reads each
+prompt's SOP, recomputes both numbers and rewrites only those digits in
+`jobs.json`; the section number and the spelled-out check count stay authored.
 `test_cron_prompts_cite_the_real_sop_geography` in
 `../skills/fleet-audit/scripts/test_audit_report.py` re-derives both from the
-SOP itself, so an edit that skips re-measuring fails there rather than at 06:20
-in production. Run it after touching anything in `../governance/`.
+SOP itself, and `make docs-check` runs the generator's `--check`, so an edit
+that skips regenerating fails there rather than at 06:20 in production. Run
+`make docs-generate` after touching anything in `../governance/`.
 
 No prompt is quoted here on purpose. A copy in prose is one more place for the
 same numbers to go stale, and the test above checks the roster against the SOPs

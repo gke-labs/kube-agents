@@ -13,7 +13,41 @@ resource "google_service_account" "agent" {
   lifecycle {
     precondition {
       condition     = !local.scope_declares_anything || local.scope_can_manage
-      error_message = "scope.projects, scope.folders or scope.organizations names something but project_roles (PLATFORM_AGENT_CUSTOM_ROLES on the installer path) carries neither roles/container.clusterViewer nor roles/container.viewer, the two roles that list and get clusters; a custom IAM role is not carried into scoped projects. Add one of the two (it is bound in the host project as well) or empty the scope lists."
+      error_message = "scope.projects, scope.folders, scope.organizations, scope.shared_vpc_hosts or scope.metrics_scopes names something but project_roles (PLATFORM_AGENT_CUSTOM_ROLES on the installer path) carries neither roles/container.clusterViewer nor roles/container.viewer, the two roles that list and get clusters; a custom IAM role is not carried into scoped projects. Add one of the two (it is bound in the host project as well) or empty the scope lists."
+    }
+    # The same shape for a Shared VPC host: the reconcile finds its service
+    # projects with compute.projects.get in the host project, which only
+    # roles/compute.viewer carries among the allowlist, so a host declared
+    # under a role set without it would be resolved here at plan time and read
+    # `denied` in the agent's snapshot on every tick.
+    # No carve-out for a host that is project_id: it is read under
+    # project_roles, but a custom set that carries the permission through a
+    # custom role and one that carries it through nothing look the same from
+    # here, and the second would freeze the selector every tick; adding
+    # roles/compute.viewer costs the first nothing.
+    precondition {
+      condition     = length(local.scope_shared_vpc_hosts) == 0 || contains(local.scope_roles, local.scope_shared_vpc_lookup_role)
+      error_message = "scope.shared_vpc_hosts names a host but project_roles (PLATFORM_AGENT_CUSTOM_ROLES on the installer path) carries no roles/compute.viewer, the role whose compute.projects.get the reconcile needs in the host project to list its service projects; a custom IAM role is not carried into scoped projects. Add it (it is bound in the host project as well) or empty scope.shared_vpc_hosts."
+    }
+    # A selector the resolver did not resolve: the composition hands the
+    # kube-agents-scope-resolver module's members in; a caller that skipped
+    # it would otherwise get the host bound and every member unbound, which
+    # the reconcile reports as denied on each of them.
+    precondition {
+      condition     = local.scope_selectors_resolved
+      error_message = "scope.shared_vpc_hosts or scope.metrics_scopes names a selector that scope_selector_members has no entry for. Resolve the selectors with the kube-agents-scope-resolver module (terraform/modules/kube-agents-scope-resolver) and pass its members output as scope_selector_members, as terraform/examples/full-install does."
+    }
+    # The whole resolved set, as far as a plan can count it (scope.tf,
+    # scope_listed_projects): the reconcile lists at most the cap and reads
+    # the rest over-cap, so the members past it would be bound for nothing.
+    # The resolver's own bound is per selector; this is the sum. Held while a
+    # selector is declared or the cap is declared below its default: without
+    # either the count is the CRD's own list cap plus the management project,
+    # a declaration the plan admitted before the selectors and the declared
+    # cap existed, and such a plan changes nothing about it.
+    precondition {
+      condition     = (length(local.scope_selector_names) == 0 && var.scope.max_projects == local.scope_default_cap) || length(local.scope_listed_projects) <= local.scope_resolved_set_cap
+      error_message = "The management project, scope.projects and the projects scope.shared_vpc_hosts and scope.metrics_scopes resolve to come to ${length(local.scope_listed_projects)} once each, past the resolved-set cap of ${local.scope_resolved_set_cap} (scope.max_projects, spec.scope.maxProjects on the CR): the reconcile lists the first ${local.scope_resolved_set_cap} of them, in that order, and reads the rest over-cap with nothing created under them, so their read roles would be reach the agent never uses. Raise scope.max_projects, declare fewer projects, a narrower selector, or a folder that holds them (a container's members are listed after these and bound on the container, not one by one). An exclude.projects entry lowers this count only when it names a project exactly: by ID for an entry in scope.projects or any selector member, and by number for a monitored project the selector alone reaches, which the resolver leaves out before naming it. A project both in scope.projects and monitored by a declared Metrics Scope that is excluded by its number alone is dropped by the reconcile but counted here, because the plan does not name a number the exclusion keeps it from reading; drop it from scope.projects, which the exclusion makes redundant. A glob is applied by the reconcile alone."
     }
   }
 }

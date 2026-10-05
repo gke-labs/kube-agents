@@ -88,11 +88,20 @@ syft "dir:${TARGET_DIR}" -o spdx-json > "${TMP_SBOM_DIR}/${BUNDLE_PREFIX}.spdx.j
 echo "  • Generating CycloneDX 1.5 JSON SBOM for ${BUNDLE_PREFIX} filesystem..."
 syft "dir:${TARGET_DIR}" -o cyclonedx-json > "${TMP_SBOM_DIR}/${BUNDLE_PREFIX}.cdx.json"
 
-# 2. Staging container image SBOMs with explicit error reporting
+# 2. Staging container image SBOMs with explicit error reporting, one per image
+# the release's own scripts/release/common.sh lists, read at the tag's commit
+# (required_release_images_for_release says why that is the candidate's list,
+# and what happens without the tag).
+release_images=()
+while IFS= read -r img; do release_images+=("${img}"); done < <(required_release_images_for_release "${TAG_NAME}")
+if [ "${#release_images[@]}" -eq 0 ]; then
+  echo "❌ ERROR: no required release images resolved for release ${TAG_NAME}; no image SBOM generated." >&2
+  exit 1
+fi
 export SYFT_PARALLELISM="${SYFT_PARALLELISM:-2}"
 export GOMAXPROCS="${GOMAXPROCS:-2}"
 export GOMEMLIMIT="${GOMEMLIMIT:-4GiB}"
-for img in "${REQUIRED_RELEASE_IMAGES[@]}"; do
+for img in "${release_images[@]}"; do
   img_ref="${REGISTRY_PREFIX}/${img}:${TAG_NAME}"
   if [ "${REGISTRY_PREFIX}" != "${SOURCE_REGISTRY}" ] || [ "${TAG_NAME}" != "${SOURCE_TAG}" ]; then
     if ! docker manifest inspect "${img_ref}" >/dev/null 2>&1; then

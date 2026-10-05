@@ -528,3 +528,22 @@ func TestTheRBACSkewYieldsToAnotherDegradedReason(t *testing.T) {
 		t.Fatalf("the foreign Degraded reason was overwritten: %+v", got)
 	}
 }
+
+// TestTheEventWriteIsProbed: the Recorder's create on events is a permission
+// an older ClusterRole does not hold (it granted events read-only), and the
+// self-check has to name it rather than let the recorder fail quietly in the
+// background.
+func TestTheEventWriteIsProbed(t *testing.T) {
+	authorizer := &fakeAuthorizer{deny: func(attrs *authorizationv1.ResourceAttributes) bool {
+		return attrs.Group == "" && attrs.Resource == "events" && (attrs.Verb == "create" || attrs.Verb == "patch")
+	}}
+	denied, err := probeRBAC(context.Background(), authorizer.reviews())
+	if err != nil {
+		t.Fatalf("probe failed: %v", err)
+	}
+	got := append([]string(nil), denied...)
+	sort.Strings(got)
+	if want := []string{"create events", "patch events"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("denied = %v, want %v", denied, want)
+	}
+}

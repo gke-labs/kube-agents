@@ -44,6 +44,8 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"slices"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -74,8 +76,9 @@ const (
 	shellSandboxRepositoryName = "agent-sandbox"
 
 	// The login the agent ssh's in as, created by deploy/sandbox/Dockerfile as uid
-	// 1000, with an ephemeral home and a durable /opt/data. Not root, and not the
-	// agent pod's own uid 10000 — the two pods share nothing but a public key.
+	// 1000, with a root-owned ephemeral home and a durable /opt/data. Not root, and
+	// not the agent pod's own uid 10000 — the two pods share nothing but a public
+	// key.
 	shellSandboxUser = "agent"
 
 	// shellSandboxUser's uid, from the same useradd. Named here because the
@@ -120,12 +123,12 @@ const (
 	shellSandboxSshdPath = "/var/lib/sandbox-sshd"
 
 	// shellSandboxUser's home, from the useradd in deploy/sandbox/Dockerfile. It
-	// is writable alongside the data volume — see HERMES_WRITE_SAFE_ROOT in
-	// buildPodTemplateSpec — but it is on the container filesystem and does not
-	// survive a restart. That is deliberate: the model owns ~/.bashrc, bash
-	// sources it for a non-interactive `ssh host cmd`, and a hijack planted there
-	// should not outlive the pod. Durable work goes to the data volume, which is
-	// what TERMINAL_CWD points at.
+	// is on the container filesystem, and the image makes it root-owned with no
+	// dotfiles: every session in the pod shares it, and bash and python3 load
+	// code from it unasked, so a file one session planted there would run in
+	// every later one. Durable work goes to the data volume, which is what
+	// TERMINAL_CWD points at. HERMES_WRITE_SAFE_ROOT in buildPodTemplateSpec still
+	// names it; a write there fails on the mode instead.
 	shellSandboxHomePath = "/home/" + shellSandboxUser
 
 	// Hermes' ssh backend keeps a file sync over ~/.hermes: it pushes at connect
@@ -133,19 +136,72 @@ const (
 	// the agent pod's Hermes home. Skills live in that tree, so a file written
 	// here would land in the gateway's skills/ as instructions the next session
 	// loads. deploy/sandbox/Dockerfile makes the directory root-owned and 0555 to
-	// stop that, and on its own that is not enough: /home/agent is owned by uid
-	// 1000 on a writable container filesystem, and removing a directory needs
-	// write on the parent rather than on the directory. `rmdir ~/.hermes && mkdir
-	// ~/.hermes` hands the model a writable one back.
+	// stop that. The mode alone does not bind the name: removing a directory needs
+	// write on the parent rather than on the directory, and in sandbox images
+	// whose /home/agent is still owned by uid 1000, `rmdir ~/.hermes && mkdir
+	// ~/.hermes` hands the model a writable one back. Current images make the
+	// home root-owned, which stops that rmdir; an operator can still run an older
+	// image through shellSandbox.image.
 	//
-	// An empty read-only volume over the path closes it from the other side. The
-	// mount cannot be removed — rmdir on a mount point is EBUSY — and cannot be
-	// written whatever it is replaced by, and undoing it needs CAP_SYS_ADMIN,
-	// which this container does not have. Leaving /home/agent itself
-	// agent-writable keeps ~/.bashrc and the rest of the home working the way the
-	// comment above describes.
+	// An empty read-only volume over the path closes it from the other side,
+	// whatever the image. The mount cannot be removed — rmdir on a mount point is
+	// EBUSY — and cannot be written whatever it is replaced by, and undoing it
+	// needs CAP_SYS_ADMIN, which this container does not have.
 	shellSandboxHermesHomeVolume = "hermes-sync-block"
 	shellSandboxHermesHomePath   = shellSandboxHomePath + "/.hermes"
+
+	// The image trees — the shipped skills, scripts and governance the
+	// entrypoint stages from /opt/defaults into each home root on the data
+	// volume — are read-only mounts in the shell container, for the same
+	// reason as ~/.hermes above. The trusted side runs those scripts and reads
+	// those skills by path, so a tree the model can edit in place, or rename
+	// aside and replace, is a way to plant code or instructions there.
+	//
+	// A read-only mount refuses a write from any uid (EROFS; the model, which
+	// does not own the staged files, is refused earlier with EACCES), and a
+	// mount point cannot be renamed or removed (EBUSY). Neither holds for the
+	// directories above it, though: rename(2) checks only the dentry being
+	// renamed, not its descendants, on Linux and in gVisor alike. So
+	// `mv /opt/data/profiles /opt/data/x && mkdir -p
+	// /opt/data/profiles/platform/scripts` would put a writable tree at the
+	// path while the mount moves away with the old name. Every directory
+	// strictly between the data root and a tree is therefore a read-write
+	// mount of itself (shellSandboxImageTreePins). The cost is that rename(2)
+	// across one of those boundaries now returns EXDEV, and `rm -rf` of a home
+	// fails partway.
+	//
+	// The source of every one of these mounts is a subPath of the data volume
+	// itself, not an emptyDir the init container fills. The pins have to be
+	// subPath binds of the data volume anyway, so this keeps one mechanism, adds
+	// no pod volume, and needs no emptyDir shared from an init container to the
+	// shell, which nobody has shown to work under runsc.
+	//
+	// That makes the order load-bearing. prepare-image-trees restages each tree
+	// root-owned and removes any symlink or non-directory the model planted on
+	// a path that becomes a mount point, and it has to finish before kubelet
+	// resolves the shell's subPaths. Kubelet resolves a container's subPaths
+	// when it creates that container, which is after every init container has
+	// exited, and nothing the model runs executes in between: the model only
+	// runs in the shell container.
+	//
+	// The entrypoint reads both variables. With the mode set it refuses to
+	// start unless every tree is a read-only mount; with it unset (the image
+	// run outside this StatefulSet) it falls back to a root-owned copy.
+	shellSandboxImageTreesInitContainerName = "prepare-image-trees"
+	shellSandboxPrepareImageTreesArg        = "--prepare-image-trees"
+	shellSandboxImageTreesEnvVar            = "SANDBOX_IMAGE_TREES"
+	shellSandboxHomeRootsEnvVar             = "SANDBOX_HOME_ROOTS"
+	shellSandboxImageTreesMode              = "read-only-mounts"
+	// How SANDBOX_HOME_ROOTS spells the data root, which is "" in
+	// shellSandboxImageTreeHomes.
+	shellSandboxDataRootHome = "."
+	// The init container copies a few MB of trees and exits. Its request stays
+	// below the shell's, so the pod's effective request is still the shell's;
+	// generate_chart_footprint.py ignores this container on that basis.
+	shellSandboxImageTreesCPURequest    = "50m"
+	shellSandboxImageTreesMemoryRequest = "64Mi"
+	shellSandboxImageTreesCPULimit      = "500m"
+	shellSandboxImageTreesMemoryLimit   = "256Mi"
 
 	// The agent pod's side of the same keypair. Two volumes rather than one for
 	// a reason spelled out at buildShellSandboxClientKeyInitContainer: the
@@ -161,6 +217,19 @@ const (
 	// for it — it is there so a re-running install surface can recover the pair
 	// from one place, and so the chart can render the sandbox's Secret from it.
 	shellSandboxPrivateKeySecretKey = "SANDBOX_SSH_PRIVATE_KEY" // #nosec G101 -- Secret key name, not a credential
+)
+
+var (
+	// The /opt/defaults trees deploy/sandbox/Dockerfile ships and the
+	// entrypoint stages. See shellSandboxImageTreesMode.
+	shellSandboxImageTrees = []string{"skills", "scripts", "governance"}
+	// The home roots each tree is staged into, relative to
+	// shellSandboxDataPath, "" being the data root itself. Must equal the
+	// entrypoint's SANDBOX_HOME_ROOTS default.
+	shellSandboxImageTreeHomes = []string{"", "profiles/platform"}
+	// All the init container needs to stage a root-owned tree: chown it, and
+	// replace a tree the agent owns without being its owner.
+	shellSandboxImageTreesCapabilities = []corev1.Capability{"CHOWN", "DAC_OVERRIDE", "FOWNER"}
 )
 
 // shellSandboxAuthorizedKeysSecretName is the Secret the sandbox mounts. It holds
@@ -409,8 +478,9 @@ func buildShellSandboxService(agent *agentv1alpha1.PlatformAgent) *corev1.Servic
 //
 // authorizedKeysSecret holds the public half of the keypair the agent pod connects
 // with, under the key "authorized_keys". credentialProxyURL is what the sandbox's
-// kubectl/gcloud/gh/git wrappers post to — always the broker's Service, which is
-// always another pod. Empty is a supported state: the entrypoint logs that the
+// kubectl/gcloud wrappers and the version-control verbs post to — always the
+// broker's Service, which is always another pod. The sandbox's git is local and
+// carries no credential; forge work goes through the verbs. Empty is a supported state: the entrypoint logs that the
 // wrappers are unconfigured and starts anyway, so file and code-execution tools
 // work while the credentialed ones report a clear error instead of a stack trace.
 //
@@ -553,6 +623,7 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 					// no separate field for it: spec.deployment.imagePullSecrets
 					// and IMAGE_PULL_SECRETS cover every pod the operator renders.
 					ImagePullSecrets: resolveImagePullSecrets(agent.Spec.Deployment),
+					InitContainers:   []corev1.Container{buildShellSandboxImageTreesInitContainer(agent)},
 					Containers:       containers,
 					Volumes:          volumes,
 				},
@@ -685,8 +756,115 @@ func buildShellSandboxCredentialProxyTokenVolume() corev1.Volume {
 	}
 }
 
-func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1.EnvVar) corev1.Container {
+// shellSandboxHomeRoots is SANDBOX_HOME_ROOTS: shellSandboxImageTreeHomes,
+// space-separated, with the data root spelled shellSandboxDataRootHome.
+func shellSandboxHomeRoots() string {
+	roots := make([]string, 0, len(shellSandboxImageTreeHomes))
+	for _, home := range shellSandboxImageTreeHomes {
+		if home == "" {
+			home = shellSandboxDataRootHome
+		}
+		roots = append(roots, home)
+	}
+	return strings.Join(roots, " ")
+}
+
+// shellSandboxImageTreePins is every directory strictly between the data root
+// and an image tree, relative to the data root: each home and each of its
+// ancestors, deduplicated and sorted so a parent comes before its children.
+// See shellSandboxImageTreesMode for why each one must be a mount point.
+func shellSandboxImageTreePins() []string {
+	var pins []string
+	for _, home := range shellSandboxImageTreeHomes {
+		for dir := home; dir != "" && dir != shellSandboxDataRootHome; dir = path.Dir(dir) {
+			pins = append(pins, dir)
+		}
+	}
+	slices.Sort(pins)
+	return slices.Compact(pins)
+}
+
+// buildShellSandboxImageTreeMounts is the shell's view of the image trees: a
+// read-write self-mount for each pin, then each home's trees read-only. All of
+// them are subPaths of the data volume, which prepare-image-trees has already
+// staged.
+func buildShellSandboxImageTreeMounts() []corev1.VolumeMount {
+	var mounts []corev1.VolumeMount
+	for _, pin := range shellSandboxImageTreePins() {
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      shellSandboxDataVolume,
+			MountPath: path.Join(shellSandboxDataPath, pin),
+			SubPath:   pin,
+		})
+	}
+	for _, home := range shellSandboxImageTreeHomes {
+		for _, tree := range shellSandboxImageTrees {
+			subPath := path.Join(home, tree)
+			mounts = append(mounts, corev1.VolumeMount{
+				Name:      shellSandboxDataVolume,
+				MountPath: path.Join(shellSandboxDataPath, subPath),
+				SubPath:   subPath,
+				ReadOnly:  true,
+			})
+		}
+	}
+	return mounts
+}
+
+// buildShellSandboxImageTreesInitContainer stages the image trees on the data
+// volume, root-owned, before the shell container's subPaths are resolved. See
+// shellSandboxImageTreesMode.
+//
+// The same image as the shell, so the trees it stages are the ones that image
+// ships, and the image's entrypoint in its prepare mode, which exits before
+// writing anything outside the data volume. That is what lets the root
+// filesystem be read-only here and not in the shell.
+//
+// It runs as the image's own user, root, like the shell container: the
+// entrypoint chowns the data root to the agent and the trees to root. With
+// every other capability dropped, CHOWN does that, DAC_OVERRIDE lets it
+// replace agent-owned directories whatever their mode, and FOWNER lets it
+// chmod files it does not own. It mounts the data volume and nothing else, and
+// holds no credential: the broker token and the keys stay with the shell.
+func buildShellSandboxImageTreesInitContainer(agent *agentv1alpha1.PlatformAgent) corev1.Container {
 	return corev1.Container{
+		Name:  shellSandboxImageTreesInitContainerName,
+		Image: resolveShellSandboxImage(agent),
+		Args:  []string{shellSandboxPrepareImageTreesArg},
+		Env: []corev1.EnvVar{
+			{Name: shellSandboxHomeRootsEnvVar, Value: shellSandboxHomeRoots()},
+		},
+		SecurityContext: &corev1.SecurityContext{
+			SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+			AllowPrivilegeEscalation: ptr.To(false),
+			ReadOnlyRootFilesystem:   ptr.To(true),
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+				Add:  shellSandboxImageTreesCapabilities,
+			},
+		},
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse(shellSandboxImageTreesCPURequest),
+				corev1.ResourceMemory: resource.MustParse(shellSandboxImageTreesMemoryRequest),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse(shellSandboxImageTreesCPULimit),
+				corev1.ResourceMemory: resource.MustParse(shellSandboxImageTreesMemoryLimit),
+			},
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: shellSandboxDataVolume, MountPath: shellSandboxDataPath},
+		},
+	}
+}
+
+func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1.EnvVar) corev1.Container {
+	env = append(slices.Clone(env),
+		corev1.EnvVar{Name: shellSandboxImageTreesEnvVar, Value: shellSandboxImageTreesMode},
+		corev1.EnvVar{Name: shellSandboxHomeRootsEnvVar, Value: shellSandboxHomeRoots()},
+	)
+	container := corev1.Container{
 		Name:  "shell",
 		Image: resolveShellSandboxImage(agent),
 		// No command or args: the image's entrypoint does the
@@ -795,6 +973,8 @@ func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1
 			},
 		},
 	}
+	container.VolumeMounts = append(container.VolumeMounts, buildShellSandboxImageTreeMounts()...)
+	return container
 }
 
 // buildShellSandboxNetworkPolicy is deny-by-default in both directions, with

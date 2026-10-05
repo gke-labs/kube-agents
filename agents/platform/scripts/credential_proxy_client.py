@@ -25,11 +25,24 @@ from pathlib import Path
 # forges an install configured, so a forge CLI appears there and only there:
 # the broker is where that CLI runs. The overlap is not an invariant and these
 # two lists are not to be folded together.
-SUPPORTED_EXECUTABLES = ("kubectl", "gcloud", "gh", "git")
+#
+# `gh` and `git` are not here. The forge is reached through the version-control
+# verbs, and a forwarded git ran in the broker's filesystem rather than the
+# caller's, so a shim on either name answered a command about a tree the agent
+# had never seen. docs/designs/version-control-support.md, "One git in the
+# sandbox".
+SUPPORTED_EXECUTABLES = ("kubectl", "gcloud")
 
 # How long to wait to reach the broker. Bounds the connect only — see
 # BrokerConnection.
 BROKER_CONNECT_TIMEOUT_SECONDS = 10.0
+
+# Exit code returned when the credential proxy blocks a command under its
+# security policy. 77 is EX_NOPERM from sysexits.h ("permission denied").
+# Returning 77 rather than the shell's 126 ("not executable") ensures the
+# runtime does not attach an execution/chmod hint that misleads the agent
+# into seeking local file workarounds for a policy boundary (#2179).
+EXIT_SECURITY_POLICY_BLOCKED = getattr(os, "EX_NOPERM", 77)
 
 # `\Z`, not `$`. `$` also matches immediately before a trailing newline, so
 # `re.match` on "nowhere\n" succeeds -- and that value goes on to build the
@@ -190,22 +203,17 @@ def authorization_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 # Only these read KUBECONFIG: kubectl to pick a context, gcloud to write one in
-# `container clusters get-credentials`. `git` and `gh` ignore the variable, so
-# resolving it for them buys nothing and costs plenty — an unreadable kubeconfig
-# is a hard failure, which would turn a stray KUBECONFIG into a refused `gh pr
-# create`.
+# `container clusters get-credentials`. Today that is every executable this
+# client runs; it stays a separate list because an unreadable kubeconfig is a
+# hard failure, and a later executable that ignores the variable should not be
+# refused over one.
 KUBECONFIG_AWARE = frozenset({"kubectl", "gcloud"})
 
 # Flags whose value may be `-`, meaning "read the document from stdin". This is
 # the whole list the shipped skills use: kubectl's `-f`/`--filename` and
-# `--patch-file`, and gh's `--body-file`.
-#
-# `gh`'s `-F` short form is deliberately absent, and every caller that used to
-# pass it now spells `--body-file` instead. It is not a synonym: `gh api -F
-# key=value` sets a typed field, so matching it here would forward fd 0 for an
-# API call that never asked for it. When a new call site needs a document from
-# stdin, widen it to the long flag rather than adding the short one.
-STDIN_FILE_FLAGS = frozenset({"-f", "--filename", "--patch-file", "--body-file"})
+# `--patch-file`. When a new call site needs a document from stdin, add its long
+# flag; a short one is too easily a different flag on another CLI.
+STDIN_FILE_FLAGS = frozenset({"-f", "--filename", "--patch-file"})
 
 
 def reads_stdin(argv: list[str]) -> bool:
@@ -814,7 +822,7 @@ def execute(
                 file=sys.stderr,
             )
             print(f"policy rule: {payload.get('rule', 'unknown')}", file=sys.stderr)
-            return 126
+            return EXIT_SECURITY_POLICY_BLOCKED
         print(payload.get("error", str(exc)), file=sys.stderr)
         return 1
     except urllib.error.URLError as exc:
@@ -891,13 +899,27 @@ class Listing(list):
     A plain list, so every existing caller keeps working, carrying the two
     fields that say whether it is the whole answer. A listing that stops at the
     broker's ceiling and looks complete is how a caller ends up asking `read`
-    for a path it inferred rather than one it saw.
+    for a path it inferred rather than one it saw. `symlinks` names the files
+    in the page's range that `read` refuses and so are never entries, and
+    `symlinked_directories` the links to directories the listing does not
+    enter, each a `{"path", "target"}` mapping.
     """
 
-    def __init__(self, entries, total: int = 0, truncated: bool = False) -> None:
+    def __init__(
+        self,
+        entries,
+        total: int = 0,
+        truncated: bool = False,
+        symlinks=(),
+        symlinked_directories=(),
+    ) -> None:
         super().__init__(entries)
         self.total = total or len(self)
         self.truncated = truncated
+        # Symlinked files in this page's range, which `read` refuses and so
+        # are never entries; a broker older than the field reports none.
+        self.symlinks = list(symlinks)
+        self.symlinked_directories = list(symlinked_directories)
 
 
 def default_caller_label() -> str:
@@ -1017,7 +1039,10 @@ class Workspace:
         """One page of tracked names. `after` is the last path of the page before.
 
         `total` on the result counts what is still in scope after the cursor, so
-        a caller pages until `truncated` is false.
+        a caller pages until `truncated` is false. `symlinks` on the result
+        names the symlinked files the page's range holds, each once across the
+        pages; a caller rebuilding the tree needs them to know what it lacks,
+        and `symlinked_directories` the links to directories with their targets.
         """
         payload = {"handle": self.handle}
         if prefix:
@@ -1029,6 +1054,8 @@ class Workspace:
             result.get("entries", []),
             total=result.get("total", 0),
             truncated=bool(result.get("truncated")),
+            symlinks=result.get("symlinks") or [],
+            symlinked_directories=result.get("symlinkedDirectories") or [],
         )
 
     def grep(

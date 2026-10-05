@@ -106,8 +106,8 @@ the same layout and is collected from the moment it starts running.
   repetition to infrastructure; the job exits `2` and the line carries
   `NOT EVALUATED` between the anchors) records as `RED` here, because the
   collector reads the `Failed` word and not the words after it; the
-  verdict's own `outcome` is in the run's `eval-verdict.json`, which nothing
-  on the dashboard reads yet. `null` when the log has no such line — the job ended before its
+  verdict's own `outcome` travels as `eval_outcome` below, so a reader of
+  this field alone keeps working. `null` when the log has no such line — the job ended before its
   verdict: Prow's deadline (it delivers SIGTERM and records `FAILURE`, not
   `ABORTED`; build 2092688354838581248 below is one), a death before the
   cases, or step 0's revalidation (a `SUCCESS`). A record written before
@@ -245,6 +245,38 @@ the same layout and is collected from the moment it starts running.
   printed `CONFLICT`. A merge that failed any other way is `false` — a full
   disk fails the merge too, and that is the pool's problem. Absent means
   unknown and reads as a setup crash, as it did before the field existed.
+
+- `eval_outcome`, `not_evaluated` — **optional, additive**: the suite's own
+  verdict for a run it could not evaluate. `bench-gate suite` writes
+  `eval-verdict.json` into the job's artifacts (`hack/ci-eval-pr.sh`; Prow
+  uploads it as `artifacts/eval-verdict.json` beside the log), and its
+  `outcome` is `not_evaluated` when an admitted case, or every case, lost
+  every repetition to infrastructure — the job then exits `2` and its final
+  line carries `NOT EVALUATED` between the anchors above. For a build whose
+  final line carries that marker, and only for one, the collector reads that
+  one artifact; when its `outcome` agrees, the run carries
+  `eval_outcome: "not_evaluated"` and `not_evaluated: [<case id>, ...]`, the
+  case ids the suite named. The same outcome and marker also end an
+  inject-lane run whose every case was set aside as not graded on its
+  transport (`scoring.py`'s `nothing_gradable`; the artifact then names
+  nothing under `not_evaluated` and the cases under `not_graded`, and the
+  script's final line says so). Nothing was lost on such a run, so the
+  collector applies the script's own test (`collect.graded_nothing`) and
+  records it as the plain RED with a note on stderr, never as this field;
+  the field is the infrastructure-loss shape only, until the next-mode view
+  gives the other one a lane. An entry that does not match the case-id
+  grammar the pages use, stated under "URL contract" below, is dropped, and
+  the list is cut at 64 entries, because the artifact is the pull request's
+  own and the ids are posted in the bot's comment. The list is never empty:
+  the suite names every gradable case or the admitted ones it lost on this
+  shape, so an artifact that names no case id after the filter writes
+  neither field and a warning, and so does a line without an agreeing
+  artifact; the run is then the plain `RED` its `Failed` word says — the
+  same double check the script makes before it prints the marker, so a
+  broken invocation cannot dress itself as weather, and a hand-written
+  artifact cannot headline "0 gate cases lost". `eval_verdict` stays `RED` either way. Absent
+  means the suite graded the run, or the record predates the field; both
+  read as they always did.
 
 A truncated log yields a **partial run** (fewer tasks, fallback duration),
 never an error. A task line whose name matches nothing under `bench/tasks/`
@@ -440,6 +472,27 @@ what the renderer does with them.
   and `health.py` excludes it from `setup_deaths` and `infra_reds`.
   `gate_comment.py` does not read it; no comment is left either way.
   Absent reads as a setup crash.
+- `runs[].eval_outcome`, `runs[].not_evaluated` — an `eval_outcome` of
+  `not_evaluated` on a `FAILURE` is a run verdict of its own, read before
+  every other rule and never folded into `red` or `infra` (the suite prints
+  its line minutes before the job ends, so a build Prow aborted in that tail
+  carries the field and reads as `ABORTED`, as every reader keyed on
+  `result` does): `classify.py` verdicts the
+  run `not_evaluated` with a headline naming the lost cases (the suite's
+  list, else the admitted cases that graded nothing) and a retest-when-
+  healthy `do`, and never the "absolute rule tripped" text; `gate_comment.py`
+  answers `is_red` false for it and leaves the one-line ⚪ "run not
+  evaluated" comment naming those cases; `render.py` passes the verdict
+  and the list through to `brief.json`, where the run page and the Brief's
+  run rows label the run and the Reds tile says how many of the gate's reds
+  were not evaluated. A gate case that failed every graded repetition
+  on the same run is named in the lede and the comment (the suite's roster
+  is the branch's; the dashboard's can be newer). `health.py` carries both
+  on `Run`, keeps them through `--trim`, and its `pr_caused_reds` never
+  counts such a run as the pull request's own, collapsed gate case or not,
+  so the daily digest's `infra_reds` holds it where the tile does and the
+  two agree; no health rule reads them. Absent reads as a run the suite
+  graded.
 
 ### `coverage` — from `docs/designs/domains.yaml`
 
@@ -646,17 +699,19 @@ pending[], releases[], nightly{}, trend{}}`. `runs[]` is the **presubmit's** las
 `data.json`, oldest first — a nightly run is nobody's pull request and is
 not listed — each carrying its identity and timing plus
 `classify.classify_run(...)`: `verdict` (`red` = looks like the PR, `green`,
-`infra` = the gate's), `headline`, `lede`, `matches_incident`,
+`infra` = the gate's, `not_evaluated` = the suite graded nothing it could
+certify on), `headline`, `lede`, `matches_incident`,
 `setup_death`, `storm_reps`, `ceiling_reps`, `do`, the run-level `cls`
 (`setup` for a setup death or a lost pod, `deadline-kill`, `only-this-pr`
 for a conflicted merge, else `null` — a run whose classes are per case),
 `eval_verdict` (present only when the `data.json` record carries the key,
 so the Brief's recovery count out of a deadline-kill outage can tell a
-recorded `null` from a pre-field record), `cases[]` (`{case, outcome, cls,
-also_failing_prs, pass_rate_30d, reason, excerpt, rep_n, do, admitted, reps,
-nightly_failed_recent}`, `reps` being `{pass, fail, infra, ceiling}`) and
-`health_at` (the verdict in force when it
-finished, from history; `null` without history). `rep_n` is the 1-based
+recorded `null` from a pre-field record), `not_evaluated[]` (the case ids
+the suite could not evaluate; empty on every other verdict), `cases[]`
+(`{case, outcome, cls, also_failing_prs, pass_rate_30d, reason, excerpt, rep_n,
+do, admitted, reps, nightly_failed_recent}`, `reps` being `{pass, fail, infra,
+ceiling}`) and `health_at` (the verdict in force when it finished, from
+history; `null` without history). `rep_n` is the 1-based
 repetition the row is about — the one whose `reason` is shown, else the
 one whose `excerpt` is (`null` when there is neither); the pages link that
 repetition's transcript, rep 1's when it is `null`. `also_failing_prs` and
@@ -821,7 +876,7 @@ read is final.
 `health.json` is the CI health adjudicator's verdict, published beside
 `data.json` (nothing in this directory writes it); the fields read are
 `state` (`GREEN|DEGRADED|OUTAGE`), `condition`
-(`shared_break|storm|setup_deaths|lost_pods|fixture_drift|delegation_ceiling|deadline_kill`), `since`, `cause`, `advice`,
+(`shared_break|storm|setup_deaths|lost_pods|fixture_drift|pool_drift|delegation_ceiling|deadline_kill`), `since`, `cause`, `advice`,
 `failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
 `slow`, `pool`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
 verdict: the Brief says no verdict is published and shows the last 24
@@ -845,7 +900,13 @@ role out of its designed state; docs/ci-health.md, "The seeded-fleet scan")
 carries `roles`, `projects` and `drift` in its `incident` and a
 `fixture_state` block beside `metrics`; the pages show it as the generic
 degraded headline, and `fixture-state.json` beside `health.json` is the
-scan's own document, which no page reads. `slow` is `null` or, on a `GREEN` tick, the slow-gate note
+scan's own document, which no page reads. `pool_drift` (the hourly pool-state
+scan found a pool project no longer shaped as the verifier requires;
+docs/ci-health.md, "The pool-state scan") is the same shape: `roles` are the
+verifier's finding ids, `incident` also carries `repairs` (`{project: {finding:
+command}}`), and the `pool_state` block beside `fixture_state` summarises the
+scan; `pool-state.json` is its document, which no page reads: `scope` (`pool` for the hourly job's whole mapping, `selected` for a hand run's `--projects`, on both scan documents; the health rule reads a project absent from a `pool` document as retired from the mapping and one absent from a `selected` document as not read), then per project, per check, `state`, `detail`, and for a healthy or drifted check `unread`, the reads the verifier could not make, which is what keeps a check out of the incident's `reads` exit. Both blocks also carry `unread_units`, how many roles or checks were not read in full on projects that were checked (not checked, or read in part with the rest refused), which the pool digest line reports instead of calling the pool clean. Both scan
+incidents carry `reads` (`{project: [what a later scan must read again]}`). `slow` is `null` or, on a `GREEN` tick, the slow-gate note
 (`{since, runs, min_s, median_s, max_s, baseline_days, baseline_runs,
 baseline_p50_s, baseline_p90_s, infra_reps}`, `docs/ci-health.md`, "A slow
 gate"); the pages read `since`, `runs`, `median_s`, `baseline_p50_s` and
@@ -894,6 +955,56 @@ the episode ending. `metrics.pool_since` is the open episode's start, held
 across the ticks that read no artifact and so write no `pool`, and `null` once
 a tick reads one and writes none, which is the episode ending.
 
+A held scan condition (`fixture_drift` or `pool_drift` whose scan is stale,
+blind, or still shows the drift) keeps its `condition` and `incident` while a
+scan condition ranking at or below it (`pool_drift` below `fixture_drift`, or
+its own on other units that do not cover the held ones) is assessed at the same
+severity; `fixture_drift` over a held `pool_drift`, a spread of the same drift,
+and any run-based condition take over as before.
+
+`periodics` is the watched Prow periodics' notes, by job name, one for each job
+whose latest finished build failed (`verdict: FAILED`) or is older than the
+job's stale window, or carries no readable finish time (`STALE`): `{job, label, verdict, since, build,
+finished_at, result, stale_after_h, dry_run, detail[], summary, history_url,
+place, absence, does, effect, runbook}`. `detail` (on `FAILED` only)
+is the report's lines, the projects capped at five (then `and N more`) and the
+run's lines after the cap: for the reconcile the
+projects it refused, failed or was interrupted in, then the run's own `error`
+line; for the sweep the projects whose sweep failed with GitHub's answer, then
+the writes left for the next run under its budget, then the projects held and
+released unswept after the run stopped, then why the run ended early or its
+`error` line; either says when the report was not a JSON object.
+`summary` (on `FAILED` only) is one clause on what the run did ("failed in 11
+of 11 project(s)", "3 applied, 9 unchanged"); `since` is carried from the
+previous `health.json`;
+`place`, `absence`, `does`, `effect` and `runbook` are the words and
+the link the message is built from, from `WATCHED`. The reconcile's report,
+`fleet-reconcile.json` from `hack/fleet_reconcile.py --report`, is
+`{schema_version, mode, dry_run, started_at, finished_at, exit, exit_code,
+error, outcomes{project: {outcome, detail}}, summary}`; the sweep's,
+`pull-sweep.json` from `hack/ci_sweep_agent_pulls.py --report`, is
+`{schema_version, mode, dry_run, started_at, finished_at, exit, exit_code,
+error, ended_early, projects, closed, failed, unmapped[], skipped[],
+left_for_next_run, outcomes{project: {closed, error}}}` (a project carries
+its closes, its error, or both), `skipped` being the
+projects held and released unswept after the run stopped on the burst limit,
+and `left_for_next_run` the writes the budget deferred (a pull request left
+unclosed counts its close and its delete, and its label when it carries
+`audit:remediation`). `periodics_read` names the jobs a
+reading arrived for this tick, whether or not they are noted; the poster clears
+a told job only on a reading that shows it clean. `periodics_runs` is, per read
+job, `{build, finished_at, passed, summary}` of its latest finished build, what
+the recovery message says. `periodics_streaks` is, per watched job, `{build,
+projects{project: n}, runs}`: the last build counted, each project's
+consecutive failed checks (dropped at zero; every count cleared by a clean
+build) and the run's; a failed build is a note only once the run's count
+reaches the job's threshold (two consecutive checks for the sweep, the first
+failure for the reconciles), and the poster treats a told job as recovered only
+on a build that passed (`periodics_runs`), not on a sub-threshold failure. `periodics_since` is each open note's start, kept
+for a job across the ticks with no reading for it (which write no note for it)
+and dropped once a tick with a reading for it writes no note
+(`scripts/eval_dashboard/periodics.py` owns the notes).
+
 `health-history.jsonl` is one JSON object per line, each the full
 `health.json` document as published at that tick plus
 `"tick": "<ISO 8601 UTC>"`, oldest first (the reader sorts anyway and
@@ -939,6 +1050,20 @@ PR 1446's build log keeps the clone header and the failing tail, and its
 | ------------------- | -------------------------------------------------------------------------------------------------------------------------- |
 | 2098383791838990336 | PR 1118 — node went NotReady 2h08m in; no build-log.txt; `has_build_log: false`                                            |
 | 2098418565454499840 | PR 1446 — clone failed (merge conflict) in 0 s; log and `clone-records.json` present, last event `Started`, phase `Failed` |
+
+`testdata_notevaluated/` holds one **derived** build: no
+`pull-kube-agents-smoke-test` run had ended with the not-evaluated verdict
+when the fixture was written (the verdict itself landed on 2026-09-21), so
+this one is shaped from the repetition-era builds above and labelled here
+rather than passed off as real. Its build id, PR number, commit shas and
+project are stand-ins; the `Task ... Result:` lines, the `rep N:` grading
+lines, the final line and `artifacts/eval-verdict.json` are in the shapes
+`bench-gate` and `hack/ci-eval-pr.sh` print for the state. Replace it with a
+real build when one is on record.
+
+| build               | why it is here                                                                                                                   |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| 2101862036789329920 | one admitted case lost every repetition to infrastructure; final line says `NOT EVALUATED`; `artifacts/eval-verdict.json` agrees |
 
 `testdata_rc/` holds one **real** `post-kube-agents-eval-rc` build — the
 release-candidate job, which is a postsubmit, so its `started.json` carries no
@@ -1036,4 +1161,7 @@ derives the trend from them and renders the page.
 for two windows of the week of 2026-09-01 (PR #913's last runs on 09-04/05;
 the crashloop outage of 09-07/08 with PR #608's 15-case red inside it),
 trimmed to the fields `classify.py` reads, for `test_eval_dashboard_classify.py`
-and the page tests.
+and the page tests — plus one **derived** run, build 2097362141184626688,
+the `testdata_notevaluated/` build re-dated into the outage window so the
+not-evaluated verdict is classified and rendered beside the real week; its
+`trimmed.derived` note says so.

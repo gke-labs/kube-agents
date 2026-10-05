@@ -129,6 +129,10 @@ PROJECT_ID_FORMAT = "value(projectId)"
 # A snapshot row of a member the run named by number keeps the number, so the next run can
 # still name the project when the naming call is refused (no outcome is silent, design §4).
 NUMBER_KEY = "number"
+# The snapshot's number -> ID map: every pair the naming pass has returned while a selector
+# still reports the number, so the tie outlives the project's row, which a project an
+# `exclude.projects` number names does not have (`_numbers_memo`).
+NUMBERS_KEY = "numbers"
 ASSET_TYPE_CLUSTER = "container.googleapis.com/Cluster"
 # The two fields the resolver reads, projected so a container of thousands of clusters
 # stays far below the credential proxy's output cap; full-fidelity JSON is ~1 KB a row.
@@ -145,25 +149,51 @@ _denied_this_run: set[str] = set()
 # Same, for a member whose GKE API answered disabled on a per-cluster call (also a 403).
 _api_disabled_this_run: set[str] = set()
 # The listing phase is bounded: the management project lists first and alone, then the
-# containers resolve LIST_WORKERS at a time, then the explicit projects LIST_WORKERS at a
-# time, and a lookup still running when LIST_BUDGET_SECONDS is spent reads unreachable. The
-# bootstrap gate runs this script under its own ceiling (RECONCILE_TIMEOUT_SECONDS there, 240s)
-# and kills it on expiry with nothing written; two hanging projects listed in turn at
-# LIST_TIMEOUT_SECONDS each would already overrun it. Creates still run in the fixed order.
+# containers resolve `workers` at a time, then the explicit projects `workers` at a time,
+# and a lookup still running when the listing budget is spent reads unreachable; both are
+# sized from the declared cap below (LIST_WORKERS and LIST_BUDGET_SECONDS at the default). The
+# bootstrap gate runs this script under its own ceiling (bootstrap_scan_gate.py: the listing
+# and prune budgets for the declared cap and the profiles on the volume, plus its settle
+# time; 240s at the default cap with few profiles) and kills it on expiry
+# with nothing written; two hanging projects listed in turn at LIST_TIMEOUT_SECONDS each
+# would already overrun it. Creates still run in the fixed order.
+# Sized for the default cap: the workers and the budget scale with the declared cap
+# (`_list_workers`, `_list_budget_seconds` below) so a run that may list twice the
+# projects keeps the same margin per project, workers first and the budget only once
+# the workers reach their ceiling; the bootstrap gate's ceiling follows the budget.
 LIST_WORKERS = 8
+# Every lookup is a gcloud process in the sandbox over ssh, and no install has measured
+# the sandbox at more than eight at once (#1913 is to): twice that covers the estate
+# behind #1354 and holds the ceiling until the measurement says otherwise.
+LIST_WORKERS_MAX = 16
 LIST_TIMEOUT_SECONDS = 120
 LIST_BUDGET_SECONDS = 150
 LIST_GRACE_SECONDS = 5
+# PRUNE's per-profile `describe` runs under the same bounded map as the listing, with a
+# budget of its own, instead of a sequential walk at DESCRIBE_TIMEOUT_SECONDS each: at 200
+# profiles the walk was minutes of every hourly tick and a stalled project 30 s per
+# cluster in it. The budget is the larger of a floor scaled like the listing's and an
+# allowance per describe, the cost of one in a sequential walk: the describes run in the
+# sandbox and share its CPU, so the workers shorten a run only as far as that CPU allows
+# (on a two-CPU sandbox a round of eight took as long as eight describes in a row), and a
+# budget sized per describe is one the parallel map can only finish early, never one that
+# cuts a fleet short at the same lexically-last profiles every tick. A describe still
+# pending at the deadline reads inconclusive (kept) and is logged.
+PRUNE_BUDGET_SECONDS = 60
+PRUNE_SECONDS_PER_DESCRIBE = 3
 # How many unlisted projects the chat notification names before it counts the rest: a
 # container can resolve to thousands of projects, a chat message has a size ceiling, and
 # a message the platform drops for its size takes the created/pruned summary with it.
 NOTIFY_UNLISTED_LIMIT = 8
 VIA_MANAGEMENT = "management"
 VIA_EXPLICIT = "explicit"
-# Two caps of 100 (design §3; a declared value replaces this one in a follow-up): the CRD caps each declared list, and this caps the resolved
-# set, the management project included. Explicit projects fill it in sorted order after the
+# Two caps (design §3): the CRD caps each declared list at 100, and the declared
+# `spec.scope.maxProjects` caps the resolved set, the management project included, with this
+# as its default and the value a declaration without the key (a render from an operator
+# that predates it) is read under. Explicit projects fill it in sorted order after the
 # management project; one past the cap reads over-cap, keeps its profiles, and gets no CREATE.
 RESOLVED_SET_CAP = 100
+SCOPE_MAX_PROJECTS_KEY = "maxProjects"
 OUTCOME_OK = "ok"
 OUTCOME_DENIED = "denied"
 OUTCOME_API_DISABLED = "api-disabled"
@@ -192,6 +222,28 @@ _CREATE_DENIED_MARKERS = ("PERMISSION_DENIED", "code=403", "does not have permis
 _API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "API has not been used",
                          "is not enabled", "has not been enabled")
 
+
+
+def _list_workers(cap: int) -> int:
+    """Workers for the bounded lookups: LIST_WORKERS per default cap's worth of projects,
+    up to LIST_WORKERS_MAX, so the per-project margin holds as the cap grows."""
+    return max(LIST_WORKERS, min(LIST_WORKERS_MAX, -(-cap * LIST_WORKERS // RESOLVED_SET_CAP)))
+
+
+def _list_budget_seconds(cap: int) -> float:
+    """The listing budget for a cap: LIST_BUDGET_SECONDS per round of projects-per-worker
+    the default cap needs, so it grows only once the workers have reached their ceiling.
+    The bootstrap gate's ceiling is this plus its settle time (bootstrap_scan_gate.py)."""
+    rounds_at_default = RESOLVED_SET_CAP / LIST_WORKERS
+    rounds = cap / _list_workers(cap)
+    return LIST_BUDGET_SECONDS * max(1, -(-rounds // rounds_at_default))
+
+
+def _prune_budget_seconds(cap: int, profiles: int = 0) -> float:
+    """PRUNE's describe budget: the floor scaled the way the listing budget is, or the
+    profiles times the allowance per describe, whichever is larger."""
+    scaled = PRUNE_BUDGET_SECONDS * (_list_budget_seconds(cap) / LIST_BUDGET_SECONDS)
+    return max(scaled, profiles * PRUNE_SECONDS_PER_DESCRIBE)
 
 def log(msg: str) -> None:
     print(f"[CLUSTER-RECONCILE] {msg}", file=sys.stderr)
@@ -261,8 +313,10 @@ def _classify_list_failure(stderr: str) -> str:
     return OUTCOME_UNREACHABLE
 
 
-def _bounded_map(lookup, keys: list[str], deadline: float, what: str) -> dict:
-    """Run `lookup(key, timeout=...)` for every key, LIST_WORKERS at a time, within the deadline.
+def _bounded_map(lookup, keys: list[str], deadline: float, what: str,
+                 workers: int = LIST_WORKERS, budget_seconds: float = LIST_BUDGET_SECONDS,
+                 consequence: str = "skipping create for it this run") -> dict:
+    """Run `lookup(key, timeout=...)` for every key, `workers` at a time, within the deadline.
 
     Each worker's own timeout is cut to the budget left when it starts, so no thread
     outlives the run by more than LIST_GRACE_SECONDS: the interpreter joins the pool's
@@ -277,7 +331,7 @@ def _bounded_map(lookup, keys: list[str], deadline: float, what: str) -> dict:
     def within_budget(key: str):
         return lookup(key, timeout=max(1.0, min(LIST_TIMEOUT_SECONDS, deadline - time.monotonic())))
 
-    pool = ThreadPoolExecutor(max_workers=min(LIST_WORKERS, len(keys)))
+    pool = ThreadPoolExecutor(max_workers=min(workers, len(keys)))
     futures = {key: pool.submit(within_budget, key) for key in keys}
     done, _ = wait(futures.values(), timeout=max(0.0, deadline + LIST_GRACE_SECONDS - time.monotonic()))
     results: dict = {}
@@ -285,8 +339,8 @@ def _bounded_map(lookup, keys: list[str], deadline: float, what: str) -> dict:
         if future in done:
             results[key] = future.result()
         else:
-            log(f"{what} {key} did not finish within the run's {LIST_BUDGET_SECONDS}s listing budget "
-                f"({OUTCOME_UNREACHABLE}; skipping create for it this run).")
+            log(f"{what} {key} did not finish within the run's {budget_seconds:g}s budget "
+                f"({OUTCOME_UNREACHABLE}; {consequence}).")
             results[key] = (None, OUTCOME_UNREACHABLE)
     pool.shutdown(wait=False, cancel_futures=True)
     return results
@@ -300,23 +354,25 @@ def _lookup_group(group: str, timeout: float = LIST_TIMEOUT_SECONDS):
     return _search_container(group, timeout=timeout)
 
 
-def _resolve_groups(groups: list[str], deadline: float) -> dict[str, tuple]:
+def _resolve_groups(groups: list[str], deadline: float, workers: int = LIST_WORKERS,
+                    budget_seconds: float = LIST_BUDGET_SECONDS) -> dict[str, tuple]:
     """Resolve every container and selector within the run's listing budget, in one pool.
 
     A pending one freezes (design §4). Containers and selectors share the pool so a slow
     folder search does not push the selectors past the budget or the other way round.
     """
-    return _bounded_map(_lookup_group, groups, deadline, "resolving")
+    return _bounded_map(_lookup_group, groups, deadline, "resolving", workers, budget_seconds)
 
 
-def _list_projects(projects: list[str], deadline: float) -> dict[str, tuple[list | None, str]]:
-    """List every explicit project within the run's listing budget, LIST_WORKERS at a time.
+def _list_projects(projects: list[str], deadline: float, workers: int = LIST_WORKERS,
+                   budget_seconds: float = LIST_BUDGET_SECONDS) -> dict[str, tuple[list | None, str]]:
+    """List every explicit project within the run's listing budget, `workers` at a time.
 
     The caller lists the management project first and on its own, at the start of the
     budget, before calling this: its listing decides `create_pass_ran`, and when it
     reaches the sandbox its ssh opens the multiplexed connection the pool then shares.
     """
-    return _bounded_map(_list_project, projects, deadline, "listing clusters in")
+    return _bounded_map(_list_project, projects, deadline, "listing clusters in", workers, budget_seconds)
 
 
 def _list_project(project: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[list | None, str]:
@@ -359,7 +415,14 @@ def _list_project(project: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[
 
 def _empty_scope() -> dict:
     return {"projects": [], "folders": [], "organizations": [], SELECTOR_KIND_SHARED_VPC: [],
-            SELECTOR_KIND_METRICS_SCOPE: [], "exclude": {"projects": [], "clusters": []}}
+            SELECTOR_KIND_METRICS_SCOPE: [], "exclude": {"projects": [], "clusters": []},
+            SCOPE_MAX_PROJECTS_KEY: RESOLVED_SET_CAP}
+
+
+def _cap_of(scope: dict) -> int:
+    """The resolved-set cap a declaration carries, or the default."""
+    cap = scope.get(SCOPE_MAX_PROJECTS_KEY)
+    return cap if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0 else RESOLVED_SET_CAP
 
 
 def _load_scope() -> tuple[dict, bool, bool, bool, bool]:
@@ -432,6 +495,13 @@ def _normalize_scope(parsed: dict) -> dict:
         c for c in (clusters if isinstance(clusters, list) else [])
         if isinstance(c, dict) and all(isinstance(c.get(k), str) for k in ("projectId", "location", "clusterName"))
     ]
+    # The cap in force: the key the operator renders from spec.scope.maxProjects; a render
+    # without it (an operator that predates the field) and a value that is not a positive
+    # integer read as the default, never as no cap.
+    scope[SCOPE_MAX_PROJECTS_KEY] = _cap_of(parsed)
+    if parsed.get(SCOPE_MAX_PROJECTS_KEY) not in (None, scope[SCOPE_MAX_PROJECTS_KEY]):
+        log(f"{SCOPE_MAX_PROJECTS_KEY} {parsed.get(SCOPE_MAX_PROJECTS_KEY)!r} is not a positive integer; "
+            f"using the default cap of {RESOLVED_SET_CAP}.")
     return scope
 
 
@@ -448,7 +518,17 @@ def _previous_declaration(previous: dict | None) -> dict | None:
 
 
 def _excluded_by(project: str, patterns: list[str]) -> str | None:
-    """The first `exclude.projects` entry that matches, an ID or a shell-style glob."""
+    """The first `exclude.projects` entry that matches: an ID or a shell-style glob for a project ID,
+    the entry itself for a project number.
+
+    A glob is written against IDs (design §3) and is never matched against a number, the handle a
+    Metrics Scope names a monitored project by: `*[0-9]*` written to keep numbered sandboxes out
+    would otherwise drop every monitored project once a run had named it, while the install path,
+    which withholds a grant on an exact entry alone, kept its binding. A project ID starts with a
+    letter, so an all-digit value is a number, bare-number key or tied number alike.
+    """
+    if project.isdigit():
+        return project if project in patterns else None
     for pattern in patterns:
         if fnmatch.fnmatchcase(project, pattern):
             return pattern
@@ -644,18 +724,26 @@ def _project_id_of(number: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[
 
 
 def _previous_numbers(previous: dict | None) -> dict[str, str]:
-    """project number -> ID, from every snapshot row a past run named by number.
+    """project number -> ID, from every pair a past run named.
 
-    A row written under the bare number (never named) is not a mapping and is left out, so
-    the log says "reported by number" for it rather than naming an ID that is the number.
+    The snapshot's `numbers` memo keeps the pairs the naming pass returned while a selector
+    still reports the number, a project the declaration excluded and so has no row included;
+    a row that carries a number is a pair too. A row written under the bare number (never
+    named) is not a mapping and is left out, so the log says "reported by number" for it
+    rather than naming an ID that is the number.
     """
-    return {p[NUMBER_KEY]: p["id"] for p in (previous or {}).get("projects", [])
-            if isinstance(p, dict) and isinstance(p.get(NUMBER_KEY), str) and isinstance(p.get("id"), str)
-            and p["id"] != p[NUMBER_KEY]}
+    memo = (previous or {}).get(NUMBERS_KEY)
+    known = ({n: p for n, p in memo.items() if isinstance(n, str) and isinstance(p, str) and n != p}
+             if isinstance(memo, dict) else {})
+    known.update({p[NUMBER_KEY]: p["id"] for p in (previous or {}).get("projects", [])
+                  if isinstance(p, dict) and isinstance(p.get(NUMBER_KEY), str) and isinstance(p.get("id"), str)
+                  and p["id"] != p[NUMBER_KEY]})
+    return known
 
 
 def _selector_members(raw: dict[str, tuple[list[str] | None, str]], previous: dict | None,
-                      deadline: float) -> dict[str, tuple[dict[str, dict] | None, str]]:
+                      deadline: float, patterns: list[str] | None = None, workers: int = LIST_WORKERS,
+                      budget_seconds: float = LIST_BUDGET_SECONDS) -> dict[str, tuple[dict[str, dict] | None, str]]:
     """Name each selector's members: selector -> (members, outcome).
 
     `members` maps a project ID to {"outcome", "number"}: outcome None for a project still to
@@ -668,10 +756,21 @@ def _selector_members(raw: dict[str, tuple[list[str] | None, str]], previous: di
     run, because that number could be any project, including one the same edit dropped from
     `projects`, and a project pruned on that guess is the deletion this script never makes. A
     number named to an ID the scope cannot carry is a known identity and holds nothing. None
-    members means the selector's own lookup failed.
+    members means the selector's own lookup failed. A number an `exclude.projects` entry
+    (`patterns`) names is named like any other, because the ID is what lets
+    `_resolve_projects` drop the project on the routes that reach it by ID (an explicit
+    entry, a folder), and the grant those routes carry is what makes the call succeed. When
+    the call fails, the member is keyed under the ID a past run named it by, which the
+    snapshot's `numbers` memo keeps after the project has left the set, so those routes
+    still drop it; under the bare number when no run has named it, with no unnamed mark and
+    no hold on the prune either way: the number is the declaration speaking. A refusal is
+    the install path having withheld the grant on the entry, and no route lists a project
+    without one; any other failure on a number no run has named is logged, because the entry
+    reaches no route that names the project by ID until a run names it.
     """
+    patterns = patterns or []
     numbers = sorted({m for members, _ in raw.values() if members for m in members if m.isdigit()})
-    named = _bounded_map(_project_id_of, numbers, deadline, "naming project") if numbers else {}
+    named = _bounded_map(_project_id_of, numbers, deadline, "naming project", workers, budget_seconds) if numbers else {}
     known = _previous_numbers(previous)
     out: dict[str, tuple[dict[str, dict] | None, str]] = {}
     for selector, (members, outcome) in raw.items():
@@ -686,6 +785,12 @@ def _selector_members(raw: dict[str, tuple[list[str] | None, str]], previous: di
             project, naming = named.get(member, (None, OUTCOME_UNREACHABLE))
             if project and naming == OUTCOME_OK:
                 resolved.setdefault(project, {"outcome": None, NUMBER_KEY: member})
+            elif _excluded_by(member, patterns):
+                if member not in known and naming != OUTCOME_DENIED:
+                    log(f"{selector}: project {member} is named in exclude.projects and could not be named this run "
+                        f"({naming}); no run has named it, so the entry drops the member by number and reaches no "
+                        "route that names the project by ID until a run names it.")
+                resolved.setdefault(known.get(member, member), {"outcome": None, NUMBER_KEY: member})
             elif project:
                 # Named, to an ID the set cannot carry: a known identity, reported by number.
                 resolved.setdefault(member, {"outcome": naming, NUMBER_KEY: member})
@@ -721,10 +826,18 @@ def _previous_container_members(previous: dict | None, container: str) -> list[s
     })
 
 
+def _numbers_named(selections: dict[str, tuple[dict | None, str]] | None) -> dict[str, str]:
+    """project ID -> the number a Metrics Scope named it by this run (`_selector_members`)."""
+    return {project: info[NUMBER_KEY]
+            for members, _ in (selections or {}).values() if members
+            for project, info in members.items() if info.get(NUMBER_KEY) and project != info[NUMBER_KEY]}
+
+
 def _resolve_projects(management: str | None, scope: dict,
                       searches: dict[str, tuple[dict | None, str]] | None = None,
                       previous: dict | None = None,
-                      selections: dict[str, tuple[dict | None, str]] | None = None) -> tuple[list[dict], list[dict], list[dict]]:
+                      selections: dict[str, tuple[dict | None, str]] | None = None,
+                      cap: int | None = None) -> tuple[list[dict], list[dict], list[dict]]:
     """Turn the declaration into the ordered resolved set (design §3).
 
     Returns (entries, ignored_excludes, containers). Each entry is {id, via, outcome},
@@ -732,7 +845,8 @@ def _resolve_projects(management: str | None, scope: dict,
     whose clusters Asset Inventory already named (kept under `clusters`), a container's or
     selector's own outcome for a member carried forward under the freeze rule, the naming
     call's outcome for a monitored project that could not be named, and `over-cap` for a
-    project past RESOLVED_SET_CAP. The order is fixed so the cap binds the same way every
+    project past the cap (`cap`, the declaration's maxProjects; the module default when
+    not given). The order is fixed so the cap binds the same way every
     run: the management project, then explicit projects sorted by ID, then the selectors'
     projects sorted by ID, then containers sorted by ID (design §3). A glob that matches the
     management project is recorded and not applied. `searches` holds each container's Asset
@@ -741,7 +855,27 @@ def _resolve_projects(management: str | None, scope: dict,
     the id that is also the row's `via` name.
     """
     patterns = scope["exclude"]["projects"]
+    cap = cap if cap is not None else RESOLVED_SET_CAP
     entries: list[dict] = []
+
+    def excluded(project: str, number: str | None) -> bool:
+        # A selector's member matches an entry by the ID it is keyed under or by the number
+        # a Metrics Scope named it by. The number is the only handle an operator has before
+        # the project is named, and the one the install path withholds the grant on, so it
+        # has to keep matching once a past run has named the project and this run's naming
+        # call is refused because that grant is gone: the member is keyed under the ID the
+        # snapshot remembers then, and on the ID alone it would read denied on every tick.
+        return bool(_excluded_by(project, patterns) or (number and _excluded_by(number, patterns)))
+
+    # The number a Metrics Scope named a project by, from this run's naming pass or from the
+    # row or memo the last snapshot kept, so a number entry matches the project on every
+    # route it is reached through -- explicit, container or selector -- as an ID entry does
+    # (design §3: an excluded project is dropped whichever route reached it). A number no run
+    # has tied to an ID matches only its bare-number row, which is all there is to match.
+    numbers_named = _numbers_named(selections)
+
+    def number_of(project: str) -> str | None:
+        return numbers_named.get(project) or _previous_number(previous, project)
 
     def listed_count() -> int:
         # What the cap counts: the projects this run lists, and the ones a frozen container
@@ -755,10 +889,15 @@ def _resolve_projects(management: str | None, scope: dict,
     ignored: list[dict] = []
     seen: set[str] = set()
     if management:
-        pattern = _excluded_by(management, patterns)
+        # By ID, or by the number a Metrics Scope named it by: an entry an operator wrote to
+        # drop a monitored project matches the management project the same way when the
+        # scope monitors it, and is recorded as ignored the same way.
+        by_id = _excluded_by(management, patterns)
+        number = number_of(management)
+        pattern = by_id or (number and _excluded_by(number, patterns))
         if pattern:
-            log(f"exclude.projects entry {pattern!r} matches the management project {management}; "
-                "ignored, the management project is always in scope.")
+            log(f"exclude.projects entry {pattern!r} matches the management project {management}"
+                f"{'' if by_id else f' by its number {number}'}; ignored, the management project is always in scope.")
             ignored.append({"project": management, "pattern": pattern})
         entries.append({"id": management, "via": [VIA_MANAGEMENT], "outcome": None})
         seen.add(management)
@@ -773,11 +912,11 @@ def _resolve_projects(management: str | None, scope: dict,
             add_via(project, VIA_EXPLICIT)
             continue
         seen.add(project)
-        if _excluded_by(project, patterns):
+        if excluded(project, number_of(project)):
             continue
-        outcome = OUTCOME_OVER_CAP if listed_count() >= RESOLVED_SET_CAP else None
+        outcome = OUTCOME_OVER_CAP if listed_count() >= cap else None
         if outcome:
-            log(f"{project} is past the resolved-set cap of {RESOLVED_SET_CAP}; over-cap, no CREATE.")
+            log(f"{project} is past the resolved-set cap of {cap}; over-cap, no CREATE.")
         entries.append({"id": project, "via": [VIA_EXPLICIT], "outcome": outcome})
 
     def frozen_entry(project: str) -> dict | None:
@@ -847,12 +986,12 @@ def _resolve_projects(management: str | None, scope: dict,
             keep_number(project, info[NUMBER_KEY])
             continue
         seen.add(project)
-        if _excluded_by(project, patterns):
+        if excluded(project, info[NUMBER_KEY] or number_of(project)):
             continue
         outcome = info["outcome"]
-        if outcome is None and listed_count() >= RESOLVED_SET_CAP:
+        if outcome is None and listed_count() >= cap:
             outcome = OUTCOME_OVER_CAP
-            log(f"{project} (via {', '.join(sorted(info['via']))}) is past the resolved-set cap of {RESOLVED_SET_CAP}; over-cap, no CREATE.")
+            log(f"{project} (via {', '.join(sorted(info['via']))}) is past the resolved-set cap of {cap}; over-cap, no CREATE.")
         # A member whose naming call failed is carried under that outcome the way a frozen
         # member is, and marked so: a container that places it live below lifts it into the
         # listing, as it lifts a frozen one, rather than losing the folder's clusters to a
@@ -866,7 +1005,7 @@ def _resolve_projects(management: str | None, scope: dict,
             add_via(project, selector)
             keep_number(project, _previous_number(previous, project))
             continue
-        if _excluded_by(project, patterns):
+        if excluded(project, _previous_number(previous, project)):
             continue
         seen.add(project)
         # Frozen (design §4): carried under the selector's outcome, so a failed lookup never
@@ -880,20 +1019,20 @@ def _resolve_projects(management: str | None, scope: dict,
     for container in _container_ids(scope):
         members, outcome = (searches or {}).get(container, (None, OUTCOME_UNREACHABLE))
         if members is not None:
-            fresh = [p for p in sorted(members) if p not in seen and not _excluded_by(p, patterns)]
+            fresh = [p for p in sorted(members) if p not in seen and not excluded(p, number_of(p))]
             # A member an earlier container carried over-cap is in the set but not listed;
             # this container would list it (the live listing wins below), so it counts here
             # like a fresh one, or a second, overlapping container would lift a whole
             # over-cap folder past the cap without a check.
             lifted = [p for p in members if p in seen and (frozen_entry(p) or {}).get("outcome") == OUTCOME_OVER_CAP
                       or (frozen_entry(p) or {}).get("uncounted")]
-            if listed_count() + len(fresh) + len(lifted) > RESOLVED_SET_CAP:
+            if listed_count() + len(fresh) + len(lifted) > cap:
                 # The lookup succeeded and the run holds the full member list, but listing
                 # them would cross the cap: the members the run just resolved are carried
                 # reading over-cap and get no CREATE, and because the run knows they are
                 # under the container, over-cap does not hold back the prune (design §3/§4 as revised).
                 log(f"{container} resolved {len(members)} project(s), which would cross the resolved-set "
-                    f"cap of {RESOLVED_SET_CAP}; over-cap, its members are carried without CREATE.")
+                    f"cap of {cap}; over-cap, its members are carried without CREATE.")
                 outcome, carried, members = OUTCOME_OVER_CAP, sorted(members), None
             else:
                 carried = []
@@ -909,7 +1048,7 @@ def _resolve_projects(management: str | None, scope: dict,
                     if outcome == OUTCOME_OVER_CAP:
                         mark_indexed(project)
                     continue
-                if _excluded_by(project, patterns):
+                if excluded(project, number_of(project)):
                     continue
                 seen.add(project)
                 # `indexed`: an over-cap member was placed by the index this run (the lookup
@@ -934,7 +1073,7 @@ def _resolve_projects(management: str | None, scope: dict,
                     frozen["outcome"] = OUTCOME_OK
                     frozen["clusters"] = sorted(members[project])
                 continue
-            if _excluded_by(project, patterns):
+            if excluded(project, number_of(project)):
                 continue
             seen.add(project)
             entries.append({"id": project, "via": [container], "outcome": OUTCOME_OK, "clusters": sorted(members[project])})
@@ -975,11 +1114,47 @@ def _write_snapshot(snapshot: dict) -> None:
 
 
 def _previous_number(previous: dict | None, project: str) -> str | None:
-    """The project number the last snapshot recorded for the project, if any."""
+    """The project number the last snapshot recorded for the project: on its row, or in the memo."""
     for p in (previous or {}).get("projects", []):
-        if isinstance(p, dict) and p.get("id") == project:
-            return p.get(NUMBER_KEY) if isinstance(p.get(NUMBER_KEY), str) else None
+        if isinstance(p, dict) and p.get("id") == project and isinstance(p.get(NUMBER_KEY), str):
+            return p[NUMBER_KEY]
+    memo = (previous or {}).get(NUMBERS_KEY)
+    if isinstance(memo, dict):
+        for number, pid in memo.items():
+            if pid == project and isinstance(number, str) and number != project:
+                return number
     return None
+
+
+def _numbers_memo(previous: dict | None, selector_reports: dict[str, tuple[list[str] | None, str]],
+                  numbers_named: dict[str, str], selectors_consulted: bool, patterns: list[str]) -> dict[str, str]:
+    """The number -> ID pairs the snapshot keeps for the next run.
+
+    Every pair this run's naming pass returned, and every pair the last snapshot knew (memo
+    or row) whose number a selector still reports or an `exclude.projects` entry names; all
+    of them when a selector's lookup failed or when the run consulted no selector at all
+    (`selectors_consulted` False: the declaration could not be read, the CR carries no scope
+    block, or the render predates the selector keys), since what would be reported is then
+    unknown and such a tick carries the last declaration and every row forward rather than
+    retiring anything, so it must not forget the pairs the rows do not hold either. The
+    entry keeps the pair because the entry is what still needs it: a row keeps its number
+    until the project's last profile is pruned, so an entry whose only tie was the row of a
+    project the scope no longer reports would drop the project, prune it, and then, the row
+    gone with the profiles, find nothing tying the number and admit it again, re-creating
+    the profiles it had just deleted. A pair leaves the memo only on a tick that read the
+    selectors and found its number neither reported nor named by an entry. The memo is
+    what lets a run whose naming call is cut or refused still tie the number to the ID: a
+    project an `exclude.projects` number names has no row to keep the pair on, and without
+    it such a run would find nothing tying the number to the project and admit it again on
+    a route that names it by ID, creating profiles the next run retires. A number and an ID
+    are immutable and unique per project, so a pair never goes stale; a number no selector
+    reports any more is dropped, which bounds the memo by the estate the selectors reach.
+    """
+    reported = {m for members, _ in selector_reports.values() if members for m in members if m.isdigit()}
+    keep_all = not selectors_consulted or any(members is None for members, _ in selector_reports.values())
+    memo = {n: p for n, p in _previous_numbers(previous).items() if keep_all or n in reported or n in patterns}
+    memo.update({n: p for p, n in numbers_named.items()})
+    return dict(sorted(memo.items()))
 
 
 def _previous_via(previous: dict | None, project: str) -> list[str]:
@@ -1071,7 +1246,7 @@ def _previously_resolved(previous: dict | None) -> set[str]:
     }
 
 
-def _cluster_exists(project: str, cluster: str, location: str) -> bool | None:
+def _cluster_exists(project: str, cluster: str, location: str, timeout: float = DESCRIBE_TIMEOUT_SECONDS) -> bool | None:
     """Return True if the GKE cluster exists, False if it definitively does not, None if unknown.
 
     Mirrors platform_mcp_server.verify_gke_cluster's classification: a NotFound/404 is the *only*
@@ -1083,7 +1258,7 @@ def _cluster_exists(project: str, cluster: str, location: str) -> bool | None:
         f"--location={location}", f"--project={project}", "--format=json(status, id)",
     ]
     try:
-        sandbox_exec.run(cmd, check=True, timeout=DESCRIBE_TIMEOUT_SECONDS)
+        sandbox_exec.run(cmd, check=True, timeout=timeout)
         return True
     except subprocess.CalledProcessError as e:
         stderr = e.stderr or ""
@@ -1157,7 +1332,8 @@ def _scaffold_gaps(home: Path) -> list[str]:
     ``create_profile`` stamps ``cluster_identity`` into ``config.yaml`` (step 2b)
     before it fetches the kubeconfig (step 3) and writes ``USER.md`` (step 4). A
     process killed in that window -- the bootstrap gate runs this script under a
-    240s timeout, and Python SIGKILLs on expiry -- leaves a home that reads as fully
+    ceiling (RECONCILE_TIMEOUT_SECONDS at the floor, more with a declared cap and
+    profiles on the volume), and Python SIGKILLs on expiry -- leaves a home that reads as fully
     managed: CREATE finds its identity tuple and skips the cluster, PRUNE keeps it
     because the cluster still exists, and the half-scaffolded profile survives with
     no credentials for the life of the volume. Treating it as absent re-runs the
@@ -1266,20 +1442,36 @@ def reconcile(dry_run: bool = False) -> dict:
     # project that merely changed from one the scope dropped, and nothing is created under
     # a project this tick could not confirm is still the pod's own.
     carried_management = _previous_management(previous) if not management else None
-    # One budget for the whole listing phase (LIST_BUDGET_SECONDS): the management project
+    # One budget for the whole listing phase (_list_budget_seconds for the cap): the management project
     # lists first, at the start of it, so its listing, the one that decides whether the
     # roster is reconciled, is never cut short by a slow container; then the containers and
     # selectors together, one call each, and the naming of the monitored projects a Metrics
     # Scope returned by number; then the explicit and selector projects. Container members
     # arrive with their clusters, so no per-project listing follows for them (design §4).
-    listing_deadline = time.monotonic() + LIST_BUDGET_SECONDS
+    # The cap the declaration carries sizes the run: the workers and the budget scale with it.
+    cap = _cap_of(scope)
+    workers = _list_workers(cap)
+    list_budget = _list_budget_seconds(cap)
+    report["maxProjects"] = cap
+    listing_deadline = time.monotonic() + list_budget
     listings: dict[str, tuple[list | None, str]] = {}
     if management:
         listings[management] = _list_project(management)
-    groups = _resolve_groups(_container_ids(scope) + _selector_ids(scope), listing_deadline)
+    groups = _resolve_groups(_container_ids(scope) + _selector_ids(scope), listing_deadline, workers, list_budget)
     searches = {g: r for g, r in groups.items() if _is_container(g)}
-    selections = _selector_members({g: r for g, r in groups.items() if _is_selector(g)}, previous, listing_deadline)
-    entries, ignored_excludes, containers = _resolve_projects(management or carried_management, scope, searches, previous, selections)
+    selector_reports = {g: r for g, r in groups.items() if _is_selector(g)}
+    selections = _selector_members(selector_reports, previous, listing_deadline, scope["exclude"]["projects"], workers, list_budget)
+    numbers_named = _numbers_named(selections)
+
+    def known_number(project: str) -> str | None:
+        # The number the project was named by: this run's naming pass first, then the row or
+        # memo the last snapshot kept, so the retire hold and every row written below see the
+        # same tie `_resolve_projects` matched an exclude entry on. A row without the number
+        # under a folder, the number tied for the first time this run, would otherwise be held
+        # a day as an index lag rather than retired as the declaration asks.
+        return numbers_named.get(project) or _previous_number(previous, project)
+
+    entries, ignored_excludes, containers = _resolve_projects(management or carried_management, scope, searches, previous, selections, cap)
     report["containers"] = [dict(c) for c in containers]
     if carried_management:
         for entry in entries:
@@ -1301,7 +1493,7 @@ def reconcile(dry_run: bool = False) -> dict:
     #     gate on existed solely to recognise the cluster being skipped.
     cluster_counts: dict[str, int | None] = {}
     to_list = [e["id"] for e in entries if e["outcome"] is None and e["id"] not in listings]
-    listings.update(_list_projects(to_list, listing_deadline))
+    listings.update(_list_projects(to_list, listing_deadline, workers, list_budget))
     for entry in entries:
         # A container member: Asset Inventory named its clusters already.
         if "clusters" in entry and entry["id"] not in listings:
@@ -1501,7 +1693,10 @@ def reconcile(dry_run: bool = False) -> dict:
         container_vias = [v for v in via if _is_container(v)]
         if VIA_MANAGEMENT in via:
             return False
-        if _excluded_by(project, exclude_patterns):
+        # By ID, or by the number this run or the row tied to it: the declaration speaking,
+        # either way.
+        number = known_number(project)
+        if _excluded_by(project, exclude_patterns) or (number and _excluded_by(number, exclude_patterns)):
             return False
         if not container_vias:
             # A selector has no index and no lag: a member it no longer names is the
@@ -1544,6 +1739,32 @@ def reconcile(dry_run: bool = False) -> dict:
     log(f"Reconciling {len(profiles)} managed profile(s){' (dry-run)' if dry_run else ''}.")
     previous_attribution = _previous_attribution(previous)
     unattributed_counts: dict[str, int] = {}
+    # Every profile that will reach the liveness check is described now, `workers` at a
+    # time under PRUNE's budget, and the loop below reads the answers in profile order, so
+    # the log and the report are as they were when the walk was sequential. A policy prune
+    # (an excluded cluster) and a scope prune (a retiring project on a clean run) need no
+    # describe and get none, as the sequential walk gave them none: the latter's project
+    # has usually lost its read roles, so the describe would be a 403 logged as unknown
+    # beside the "left the scope" line for the same profile. A describe still pending at
+    # the deadline reads inconclusive, which keeps the profile. Each describe's timeout is
+    # the budget left, as a listing's is, so no worker outlives the deadline by more than
+    # the grace the bounded map allows; it is not DESCRIBE_TIMEOUT_SECONDS, because under
+    # the pool a describe also waits for the sandbox CPU its pool-mates hold, and at eight
+    # workers a 30 s cut read a third of a live fleet as unknown.
+    to_describe = [
+        name for name in profiles
+        if identities[name] is not None
+        and (identities[name]["project"], identities[name]["cluster"], identities[name]["location"]) not in excluded_triples
+        and identities[name]["cluster"] not in EXTRA_EXCLUDE
+        and not (identities[name]["project"] not in resolved_ids
+                 and lookups_clean and identities[name]["project"] in previously_retiring)
+    ]
+    prune_budget = _prune_budget_seconds(cap, len(to_describe))
+    described = _bounded_map(
+        lambda name, timeout: (_cluster_exists(**identities[name], timeout=timeout), ""),
+        to_describe, time.monotonic() + prune_budget, "describing the cluster of", workers, prune_budget,
+        consequence="inconclusive; the profile is kept",
+    )
     for name in profiles:
         identity = identities[name]
         if identity is None:
@@ -1628,7 +1849,7 @@ def reconcile(dry_run: bool = False) -> dict:
         else:
             unmanaged_reason = None
 
-        exists = _cluster_exists(**identity)
+        exists = described.get(name, (None, ""))[0]
         if exists is not False and unmanaged_reason:
             unmanaged.append({"profile": name, "project": project, "reason": unmanaged_reason})
             report["unmanaged"].append(name)
@@ -1708,8 +1929,8 @@ def reconcile(dry_run: bool = False) -> dict:
          # container, a frozen carry), so a later run that cannot name the number (the grant
          # revoked) still reports the project under its ID rather than retiring it. A number
          # and an ID are immutable and unique per project, so a recorded pair never goes stale.
-         **({NUMBER_KEY: e.get(NUMBER_KEY) or _previous_number(previous, e["id"])}
-            if (e.get(NUMBER_KEY) or _previous_number(previous, e["id"])) else {})}
+         **({NUMBER_KEY: e.get(NUMBER_KEY) or known_number(e["id"])}
+            if (e.get(NUMBER_KEY) or known_number(e["id"])) else {})}
         for e in entries
     ] + [
         # Carried with the via it had, so a container frozen on a later run still finds the
@@ -1722,7 +1943,7 @@ def reconcile(dry_run: bool = False) -> dict:
          "state": STATE_IN_SCOPE, "clusters": remaining(pid),
          **({ABSENT_SINCE_KEY: absent_since.get(pid) or _previous_absent_since(previous, pid)}
             if (pid in absent_since or _previous_absent_since(previous, pid)) else {}),
-         **({NUMBER_KEY: _previous_number(previous, pid)} if _previous_number(previous, pid) else {})}
+         **({NUMBER_KEY: known_number(pid)} if known_number(pid) else {})}
         for pid in sorted(carried_in_scope - resolved_ids)
     ] + [
         # With the number it was named by, so a run that relinks it while the naming call is
@@ -1730,13 +1951,14 @@ def reconcile(dry_run: bool = False) -> dict:
         # retiring project the run did not see.
         {"id": pid, "via": [], "outcome": OUTCOME_OK, "state": STATE_RETIRING,
          "clusters": remaining(pid),
-         **({NUMBER_KEY: _previous_number(previous, pid)} if _previous_number(previous, pid) else {})}
+         **({NUMBER_KEY: known_number(pid)} if known_number(pid) else {})}
         for pid in sorted(still_retiring - carried_in_scope)
     ], key=lambda p: p["id"])
     if not dry_run:
         _write_snapshot({
             "resolvedAt": datetime.now(timezone.utc).strftime(SNAPSHOT_TIME_FORMAT),
             "declared": declared,
+            SCOPE_MAX_PROJECTS_KEY: cap,
             "resolver": RESOLVER_ASSET_INVENTORY if _container_ids(scope) else RESOLVER_EXPLICIT,
             "containers": sorted(containers, key=lambda c: c["id"]),
             # Every profile by project: as read this run, or as last read for one whose
@@ -1752,6 +1974,8 @@ def reconcile(dry_run: bool = False) -> dict:
             "projects": snapshot_projects,
             "unmanaged": sorted(unmanaged, key=lambda u: u["profile"]),
             "ignoredExcludes": ignored_excludes,
+            NUMBERS_KEY: _numbers_memo(previous, selector_reports, numbers_named,
+                                       scope_readable and scope_present and selectors_known, exclude_patterns),
         })
 
     return report
@@ -1793,10 +2017,10 @@ def _format_notification(report: dict) -> str:
         )
     if over_cap_containers:
         lines.append(
-            f"  ⚠️ {len(over_cap_containers)} folder(s)/organisation(s) resolved past the listing cap of {RESOLVED_SET_CAP} "
+            f"  ⚠️ {len(over_cap_containers)} folder(s)/organisation(s) resolved past the listing cap of {report.get('maxProjects', RESOLVED_SET_CAP)} "
             "(members carried over-cap, profiles kept, nothing created): "
             + ", ".join(f"`{c['id']}` ({c.get('projects', 0)} project(s))" for c in over_cap_containers)
-            + ". Narrow it with exclude.projects or declare the sub-folders that hold the clusters."
+            + ". Narrow it with exclude.projects, declare the sub-folders that hold the clusters, or raise spec.scope.maxProjects."
         )
     unlisted = sorted((p, o) for p, o in (report.get("projects") or {}).items() if o != OUTCOME_OK)
     if unlisted:

@@ -138,12 +138,40 @@ variable "scope" {
     the design recommends folders until the scoped service account pool
     grants authority (§9).
 
+    `shared_vpc_hosts` and `metrics_scopes` are project IDs: a Shared VPC host
+    project, whose attached service projects are in scope, and the scoping
+    project of a Cloud Monitoring Metrics Scope, whose monitored projects are.
+    Neither is a Resource Manager container, so nothing is inherited through
+    them: each is resolved to its projects at plan time by the
+    kube-agents-scope-resolver module, handed in through
+    scope_selector_members, and this module binds the same allowlist in every
+    one, the scoping project included and roles/compute.viewer alone in a host
+    not otherwise in scope, because the reconcile's lookups read them. A project attached or linked after the
+    last apply reads `denied` until the next one. An exclude entry that names
+    a Shared VPC service project by ID, or a monitored project by the project
+    number the Monitoring API returns, keeps it out of the bindings; a
+    monitored project excluded by ID keeps its grant, which the reconcile's
+    naming call needs before the exclusion can match; a glob is evaluated by
+    the reconcile alone.
+
+    `max_projects` is the resolved-set cap, spec.scope.maxProjects: the most
+    projects the reconcile lists per run, the management project included,
+    100 by default; a declaration whose explicit projects and selector
+    members alone exceed it is refused at plan time (main.tf) while a
+    selector is declared or the cap is below its default (the CRD's hundred
+    explicit projects with no selector, at the default, was admitted before
+    the cap existed and still is), and the chart renders the same value on
+    the CR.
+
     Empty, the default, binds nothing and the reconcile lists project_id alone.
   EOT
   type = object({
-    projects      = optional(list(string), [])
-    folders       = optional(list(string), [])
-    organizations = optional(list(string), [])
+    projects         = optional(list(string), [])
+    folders          = optional(list(string), [])
+    organizations    = optional(list(string), [])
+    shared_vpc_hosts = optional(list(string), [])
+    metrics_scopes   = optional(list(string), [])
+    max_projects     = optional(number, 100)
     exclude = optional(object({
       projects = optional(list(string), [])
       clusters = optional(list(object({
@@ -156,15 +184,26 @@ variable "scope" {
   nullable = false
   default  = {}
 
+  # The resolved-set cap the reconcile lists per run, the management project included:
+  # spec.scope.maxProjects, with the CRD's bounds. The plan refuses a declaration whose
+  # explicit projects and selector members alone exceed it (main.tf), and the per-selector
+  # cap in kube-agents-scope-resolver is the same number.
+  validation {
+    condition     = var.scope.max_projects >= 1 && var.scope.max_projects <= 5000 && floor(var.scope.max_projects) == var.scope.max_projects
+    error_message = "scope.max_projects is a whole number from 1 to 5000, the bounds the CRD puts on spec.scope.maxProjects."
+  }
+
   validation {
     condition = (
       length(var.scope.projects) <= 100
       && length(var.scope.folders) <= 100
       && length(var.scope.organizations) <= 100
+      && length(var.scope.shared_vpc_hosts) <= 100
+      && length(var.scope.metrics_scopes) <= 100
       && length(var.scope.exclude.projects) <= 100
       && length(var.scope.exclude.clusters) <= 100
     )
-    error_message = "scope.projects, scope.folders, scope.organizations, scope.exclude.projects and scope.exclude.clusters each carry at most 100 entries, the cap the CRD enforces on the same lists."
+    error_message = "scope.projects, scope.folders, scope.organizations, scope.shared_vpc_hosts, scope.metrics_scopes, scope.exclude.projects and scope.exclude.clusters each carry at most 100 entries, the cap the CRD enforces on the same lists."
   }
 
   validation {
@@ -179,6 +218,13 @@ variable "scope" {
       for project in var.scope.projects : can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", project))
     ])
     error_message = "Each scope.projects entry must be a GCP project ID (^[a-z][a-z0-9-]{4,28}[a-z0-9]$), the pattern the CRD accepts for the same field."
+  }
+
+  validation {
+    condition = alltrue([
+      for selector in concat(var.scope.shared_vpc_hosts, var.scope.metrics_scopes) : can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", selector))
+    ])
+    error_message = "Each scope.shared_vpc_hosts and scope.metrics_scopes entry is a GCP project ID (^[a-z][a-z0-9-]{4,28}[a-z0-9]$), the pattern the CRD accepts for the same fields: the Shared VPC host project, or the scoping project of the Metrics Scope."
   }
 
   validation {
@@ -206,9 +252,36 @@ variable "scope" {
       length(distinct(var.scope.projects)) == length(var.scope.projects)
       && length(distinct(var.scope.folders)) == length(var.scope.folders)
       && length(distinct(var.scope.organizations)) == length(var.scope.organizations)
+      && length(distinct(var.scope.shared_vpc_hosts)) == length(var.scope.shared_vpc_hosts)
+      && length(distinct(var.scope.metrics_scopes)) == length(var.scope.metrics_scopes)
       && length(distinct(var.scope.exclude.projects)) == length(var.scope.exclude.projects)
       && length(distinct([for c in var.scope.exclude.clusters : "${c.project_id}/${c.location}/${c.cluster_name}"])) == length(var.scope.exclude.clusters)
     )
-    error_message = "scope.projects, scope.folders, scope.organizations, scope.exclude.projects and scope.exclude.clusters each name an entry once; the CRD rejects a repeat at admission, after IAM has been applied."
+    error_message = "scope.projects, scope.folders, scope.organizations, scope.shared_vpc_hosts, scope.metrics_scopes, scope.exclude.projects and scope.exclude.clusters each name an entry once; the CRD rejects a repeat at admission, after IAM has been applied."
+  }
+}
+
+variable "scope_selector_members" {
+  description = <<-EOT
+    What each of scope.shared_vpc_hosts and scope.metrics_scopes resolved to
+    at plan time: the kube-agents-scope-resolver module's `members` output, a
+    map from the selector's snapshot name (sharedVpcHosts/<host>,
+    metricsScopes/<scope>) to the project IDs it reaches. Every declared
+    selector needs an entry, or the plan is refused (main.tf); a key for a
+    selector the scope does not declare binds nothing. Resolved outside this
+    module because the composition calls it with a module-level depends_on,
+    which would defer a data source here to apply time (scope.tf).
+  EOT
+  type        = map(list(string))
+  nullable    = false
+  default     = {}
+
+  validation {
+    condition = alltrue([
+      for name, members in var.scope_selector_members :
+      can(regex("^(sharedVpcHosts|metricsScopes)/[a-z][a-z0-9-]{4,28}[a-z0-9]$", name))
+      && alltrue([for member in members : can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", member))])
+    ])
+    error_message = "Each scope_selector_members key is sharedVpcHosts/<project id> or metricsScopes/<project id>, and each member a GCP project ID (^[a-z][a-z0-9-]{4,28}[a-z0-9]$): the resolver module's members output as it is."
   }
 }

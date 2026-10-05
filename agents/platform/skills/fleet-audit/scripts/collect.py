@@ -59,20 +59,22 @@ own shell to run.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import hashlib
 import ipaddress
 import json
 import math
 import os
+import posixpath
 import re
 import shlex
 import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
-from typing import Callable, NamedTuple
+from pathlib import Path, PurePosixPath
+from typing import Callable, Iterator, NamedTuple
 
 MANIFEST_VERSION = 1
 
@@ -152,6 +154,58 @@ GITOPS_CLUSTER_TREE_ROOT = "clusters"
 GITOPS_CLUSTER_TREE_DEPTH = 2
 GIT_DIR_NAME = ".git"
 
+# In content mode `audit_report.py start` makes no clone: `--workspace` is an
+# empty scratch directory and the repository lives in the credential broker.
+# `broker_mirror` copies the repository's YAML out of the broker into a private
+# directory so the three indexes below read the same tree a clone would give
+# them. The lease marker above the workspace names the repository; the broker
+# endpoint is the one every other content-mode call uses.
+CREDENTIAL_PROXY_URL_ENV = "CREDENTIAL_PROXY_URL"
+# Where the platform scripts the broker client lives in are found, in the order
+# `audit_report.py` appends them: the image's defaults, the volume's copy, then
+# the repository checkout this file sits in (for tests and local runs).
+PLATFORM_SCRIPT_DIRS = ("/opt/defaults/scripts", "/opt/data/scripts")
+PLATFORM_SCRIPT_DIR_DEPTH = 3
+# How a leased workspace directory names its repository: `owner__name`.
+REPO_DIR_SEPARATOR = "__"
+# What `broker_repo` returns for a content-mode workspace it cannot resolve to a
+# repository: distinct from None, which means "not content mode, walk it".
+UNRESOLVED_REPO = ""
+MIRROR_DIR_PREFIX = "collect-gitops-mirror-"
+# The only names the indexes open. `KUSTOMIZATION_FILE_NAMES` adds the one
+# extension-less spelling Kustomize also accepts.
+MIRROR_SUFFIXES = (".yaml", ".yml")
+# Under the broker's per-request ceilings (256 paths, 8 MiB), the same numbers
+# `api_deprecation_scan.py` and `inspect_repository.py` batch with.
+MIRROR_BATCH_PATHS = 100
+MIRROR_BATCH_BYTES = 6 << 20
+# Bounds on one repository, so a repository nobody sized cannot fill the
+# sandbox's disk. Hitting either abandons the mirror rather than indexing part
+# of the tree: a capped listing cannot say which regions it missed, and
+# `broker_mirror` says why a partial region is worse than none.
+MIRROR_MAX_FILES = 5000
+MIRROR_MAX_BYTES = 64 << 20
+# `Workspace.read_many`'s "ask again for the rest" reason.
+BROKER_SKIP_REQUEST_BUDGET = "requestBudget"
+# The skips that are final for one file: the broker will never send it, but
+# the rest of the tree is whole. A clone's walk reads both, so each withholds
+# the region of the mirror the file could have declared into (`broker_mirror`).
+BROKER_SKIP_TOO_LARGE = "tooLarge"
+BROKER_SKIP_SYMLINK = "symlink"
+BROKER_WITHHOLDING_SKIPS = frozenset({BROKER_SKIP_TOO_LARGE, BROKER_SKIP_SYMLINK})
+# Left in a mirror a file that could hold a release was withheld from.
+# `release_declarations` reads Argo CD Applications from anywhere in the tree,
+# for any destination, so such a file can hide a release for every cluster;
+# the marker makes that index, and `namespace_directories` which leans on it,
+# answer nothing rather than part. Under `.git/`, which git will not track, so
+# no repository can carry one into a clone and switch the indexes off there;
+# not YAML, and the indexes skip `.git/`, so none opens it.
+MIRROR_RELEASES_WITHHELD_MARKER = ".git/collect-releases-withheld"
+# Beside it: the clusters whose `clusters/<name>/` tree a withheld file took out
+# of the mirror, one per line. `namespace_directories` answers nothing for
+# them, because the sibling arm that would have won there reads that tree.
+MIRROR_CLUSTERS_WITHHELD_MARKER = ".git/collect-clusters-withheld"
+
 # `release_declarations` indexes the objects that render a workload a GitOps
 # repo holds no manifest for -- an Argo CD `Application`, from either a chart
 # or a Kustomize overlay, and a Flux `HelmRelease` -- plus the two it needs to
@@ -224,6 +278,63 @@ RENDERER_KUSTOMIZE = "kustomize"
 # build` still accepts, and a repo that uses one is exactly as unresolvable
 # without this as one that uses the first.
 KUSTOMIZATION_FILE_NAMES = ("kustomization.yaml", "kustomization.yml", "Kustomization")
+# What `release_declarations` reads, as a `git grep -E` expression the broker
+# runs over one withheld file: a `tooLarge` file that names none of these
+# cannot hide a release, so it costs only its cluster's tree. A release is a
+# document's own `kind`, so a block-style one sits at column 0, and a CRD
+# bundle's `spec.names.kind: Application` (Argo CD's `install.yaml`, Flux's
+# `gotk-components.yaml`) is indented and does not match. A column-0 `kind`
+# whose value this cannot read on its line (a tag, an anchor, an alias, a
+# block scalar, a comment, the next line), a `? kind` key, and a JSON
+# `"kind":` that ends its line, match whatever the value. Flow and JSON forms
+# with the value on the line can put `kind` anywhere, so they match there.
+# It over-charges a flow or JSON CRD `names:` block (`{kind: Application, …}`)
+# it cannot tell from a flow release. It misses an indented release document
+# beside a column-0 one (a file with no column-0 `kind` at all is caught by
+# COLUMN_ZERO_KIND_PATTERN), and rarer still: a flow `kind` with a tag or
+# anchor, a merge key, an escaped scalar, and line breaks git does not split
+# on (a bare CR, NEL, U+2028). A file the broker sent is parsed instead.
+# Written for both ERE and Python's `re` (with `re.MULTILINE`): no POSIX
+# classes, a literal tab.
+RELEASE_KIND_ALTERNATION = "(" + "|".join(
+    [ARGOCD_APPLICATION_KIND, FLUX_HELM_RELEASE_KIND, FLUX_HELM_REPOSITORY_KIND, ARGOCD_APPPROJECT_KIND]
+) + ")"
+_OPTIONAL_QUOTE = "['\"]?"
+_LINE_START = "^(\ufeff)?"
+_KIND_KEY = _OPTIONAL_QUOTE + "kind" + _OPTIONAL_QUOTE
+_KIND_VALUE = _KIND_KEY + "[ \t]*:[ \t]*" + _OPTIONAL_QUOTE + RELEASE_KIND_ALTERNATION + "([^A-Za-z0-9]|$)"
+# Nothing on the line but a CRLF line's CR, which the broker will not take
+# in a pattern; excluding what starts a value keeps out `kind: {` and the
+# `"kind": {` of every JSON schema.
+_LINE_END = "[^{A-Za-z0-9\"'[]?$"
+_KIND_VALUE_ELSEWHERE = _KIND_KEY + "[ \t]*:[ \t]*([!&*|>#]|" + _LINE_END + ")"
+RELEASE_DECLARING_PATTERN = "|".join(
+    [
+        _LINE_START + _KIND_VALUE,
+        _LINE_START + _KIND_VALUE_ELSEWHERE,
+        _LINE_START + "\\?[ \t]*" + _KIND_KEY + "([^A-Za-z0-9]|$)",
+        "[{,][ \t]*" + _KIND_VALUE,
+        '"kind"[ \t]*:[ \t]*("' + RELEASE_KIND_ALTERNATION + '"|' + _LINE_END + ")",
+        ARGOCD_CLUSTER_SECRET_LABEL.replace(".", r"\."),
+    ]
+)
+# A column-0 `kind` key of any value. A CRD bundle has one on every document
+# (`kind: CustomResourceDefinition`), so a withheld file with none at all is
+# not that case: written indented or as JSON, it counts as declaring. A file
+# git treats as binary (a `binary` or `-diff` attribute) answers "no match"
+# to `git grep -I` too, so a search that never read the file lands here.
+COLUMN_ZERO_KIND_PATTERN = _LINE_START + _KIND_KEY + "[ \t]*:"
+# How many directory links `_application_source_paths` follows in a chain:
+# Linux's own limit before ELOOP.
+LINK_FOLLOW_LIMIT = 40
+# What `release_declarations` reads, as a document's own `kind`; a Secret
+# counts only with the cluster-registration label.
+RELEASE_KINDS = frozenset(
+    {ARGOCD_APPLICATION_KIND, FLUX_HELM_RELEASE_KIND, FLUX_HELM_REPOSITORY_KIND, ARGOCD_APPPROJECT_KIND}
+)
+# The broker's per-file limit, named in the WARNING for a `tooLarge` file so
+# whoever reads it knows which knob returns the file to the mirror.
+BROKER_MAX_FILE_BYTES_ENV = "CREDENTIAL_PROXY_WORKSPACE_MAX_FILE_BYTES"
 # Spelled the same way `audit_report.KCC_API_GROUP_SUFFIX` spells it, and
 # copied rather than imported for the reason `SYSTEM_NAMESPACES` is below.
 KCC_API_GROUP_SUFFIX = "cnrm.cloud.google.com"
@@ -5125,7 +5236,10 @@ AI_PROVIDER_CREDENTIAL_ENV_RE = re.compile(
 )
 
 
-def _is_ai_workload(spec: dict) -> bool:
+def _is_inference_workload(spec: dict) -> bool:
+    """The serving half of `_is_ai_workload`: a serving image or an
+    accelerator request. `fleet_stockout.py` §3.2 reads this half alone,
+    because a provider credential marks a workload that calls a model."""
     containers = spec.get("containers") or []
     if any(AI_MODEL_IMAGE_RE.search(c.get("image") or "") for c in containers):
         return True
@@ -5133,6 +5247,13 @@ def _is_ai_workload(spec: dict) -> bool:
         limits = (c.get("resources") or {}).get("limits") or {}
         if any(AI_ACCELERATOR_KEY_RE.search(key) for key in limits):
             return True
+    return False
+
+
+def _is_ai_workload(spec: dict) -> bool:
+    if _is_inference_workload(spec):
+        return True
+    containers = spec.get("containers") or []
     for c in containers:
         # Named, not valued: a `secretKeyRef` is the correct way to hold one of
         # these and still means the workload holds it. Whether the value is a
@@ -7754,9 +7875,12 @@ def release_declarations(root: Path) -> dict[tuple, dict]:
     `declaration_for` refuses. A fleet installing charts through an
     ApplicationSet keeps the `manual` verdict it has today.
 
-    Returns `{}` when PyYAML is absent or the clone is unreadable, which is the
+    Returns `{}` when PyYAML is absent, the clone is unreadable, or a
+    content-mode mirror carries MIRROR_RELEASES_WITHHELD_MARKER, which is the
     behaviour that shipped before this existed.
     """
+    if (root / MIRROR_RELEASES_WITHHELD_MARKER).exists():
+        return {}
     try:
         import yaml  # noqa: PLC0415 -- optional; absence disables the annotation
     except ImportError:
@@ -7794,7 +7918,7 @@ def release_declarations(root: Path) -> dict[tuple, dict]:
         kind = str(doc.get("kind") or "")
         meta = doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {}
         if kind == "Secret":
-            labels = meta.get("labels") or {}
+            labels = meta.get("labels") if isinstance(meta.get("labels"), dict) else {}
             if labels.get(ARGOCD_CLUSTER_SECRET_LABEL) != ARGOCD_CLUSTER_SECRET_VALUE:
                 continue
             # `stringData` is what a committed registration uses; `data` is
@@ -7808,7 +7932,8 @@ def release_declarations(root: Path) -> dict[tuple, dict]:
             if server and cluster:
                 servers[server] = cluster
         elif kind == FLUX_HELM_REPOSITORY_KIND:
-            url = str((doc.get("spec") or {}).get("url") or "").strip()
+            repo_spec = doc.get("spec") if isinstance(doc.get("spec"), dict) else {}
+            url = str(repo_spec.get("url") or "").strip()
             name = str(meta.get("name") or "")
             namespace = str(meta.get("namespace") or "")
             if url and name:
@@ -7889,7 +8014,15 @@ def release_declarations(root: Path) -> dict[tuple, dict]:
                 continue
             cluster = parts[1]
             namespace = str(meta.get("namespace") or "")
-            chart_spec = ((spec.get("chart") or {}).get("spec") or {}) if isinstance(spec.get("chart"), dict) else {}
+            # A scalar or a list where the chart template goes is a malformed
+            # document, and one malformed file must not crash the whole run
+            # before the manifest prints. Skip it; `sourceRef` is guarded alike.
+            # An absent `chart` is the `chartRef` form, which still indexes, on
+            # an empty chart, for the values field it names.
+            chart = spec.get("chart") if spec.get("chart") is not None else {}
+            chart_spec = chart.get("spec") if isinstance(chart, dict) and chart.get("spec") is not None else {}
+            if not isinstance(chart, dict) or not isinstance(chart_spec, dict):
+                continue
             source_ref = chart_spec.get("sourceRef") if isinstance(chart_spec.get("sourceRef"), dict) else {}
             repo_namespace = str(source_ref.get("namespace") or namespace)
             repo_name = str(source_ref.get("name") or "")
@@ -8107,7 +8240,19 @@ def namespace_directories(
     `declaration_for` refuses, and is refused here for the same reason: naming
     one would name the wrong one about half the time. Absent means unresolved,
     never "nowhere" — the SOP's grep is still the answer then.
+
+    Nothing resolves from a mirror carrying MIRROR_RELEASES_WITHHELD_MARKER.
+    Every arm leans on what that marker withholds: `_kustomize_roots` reads the
+    release index, and without it a directory inside an overlay reads as a
+    plain `sibling`, which is the never-rendering pull request above; and the
+    missing file may be the AppProject that withdraws the `cluster` arm.
+    Nor does anything for a cluster MIRROR_CLUSTERS_WITHHELD_MARKER names: its
+    tree left the mirror, so the sibling arm that would have won there cannot,
+    and an overlay elsewhere would answer in its place.
     """
+    if root is not None and (root / MIRROR_RELEASES_WITHHELD_MARKER).exists():
+        return {}
+    withheld = _withheld_clusters(root)
     resolved: dict[tuple[str, str], dict] = {}
     directories: dict[tuple[str, str], set[str]] = {}
     per_cluster: dict[str, set[str]] = {}
@@ -8146,7 +8291,18 @@ def namespace_directories(
                 "path": next(iter(applied)),
                 "source": NAMESPACE_DIRECTORY_CLUSTER,
             }
-    return resolved
+    return {key: entry for key, entry in resolved.items() if key[0] not in withheld}
+
+
+def _withheld_clusters(root: Path | None) -> set[str]:
+    """The clusters MIRROR_CLUSTERS_WITHHELD_MARKER names under `root`."""
+    if root is None:
+        return set()
+    try:
+        # One name per line: a directory name may hold a space.
+        return set((root / MIRROR_CLUSTERS_WITHHELD_MARKER).read_text(encoding="utf-8").splitlines())
+    except OSError:
+        return set()
 
 
 def collect_cluster(
@@ -8222,8 +8378,9 @@ def collect_cluster(
             emitted["impact_authoritative"] = True
         # Where the GitOps repo declares this object, when it does. Absent
         # means unannotated, never "no declaration exists": the index is empty
-        # without `--workspace`, and the SOP's own grep is still the answer
-        # then. See `workload_declarations`.
+        # without `--workspace` or when content mode could not copy the whole
+        # repository, and the SOP's own grep is still the answer then. See
+        # `workload_declarations` and `indexed_workspace`.
         if declarations:
             declaration = declaration_for(declarations, name, emitted["namespace"], hit["object"])
             if declaration:
@@ -8593,6 +8750,582 @@ def collect_fleet(
     return manifest
 
 
+def _import_platform_script(name: str):
+    """Import one of the platform scripts the broker path needs, or None.
+
+    Lazy, and only on the content-mode path: a directory-mode run needs
+    nothing outside this skill's own scripts, and must not start depending on
+    the platform scripts being importable.
+    """
+    import importlib  # noqa: PLC0415 -- lazy with the rest of the broker path
+
+    checkout = Path(__file__).resolve().parents
+    # A copy run from three or fewer directories below `/` has no checkout.
+    beside = (
+        [str(checkout[PLATFORM_SCRIPT_DIR_DEPTH] / "scripts")]
+        if len(checkout) > PLATFORM_SCRIPT_DIR_DEPTH
+        else []
+    )
+    for directory in (*PLATFORM_SCRIPT_DIRS, *beside):
+        if directory not in sys.path:
+            sys.path.append(directory)
+    try:
+        return importlib.import_module(name)
+    except ImportError:
+        return None
+
+
+def broker_repo(workspace: Path) -> str | None:
+    """The repository a content-mode scratch workspace stands in for, or None.
+
+    None for a clone -- it carries `.git` and the indexes walk it directly --
+    and for a directory no lease holds, which is walked as it is (a local run,
+    an exported tree). `UNRESOLVED_REPO` where it cannot tell which
+    repository, or whether a lease holds the directory at all: the content-mode
+    case gone wrong, which says so and annotates nothing.
+    """
+    if (workspace / GIT_DIR_NAME).exists():
+        return None
+    gitops_workspace = _import_platform_script("gitops_workspace")
+    if gitops_workspace is None:
+        log(
+            f"WARNING: {workspace} is not a clone and the lease helper is not importable, "
+            "so it cannot be read through the broker; no candidate will carry a declaration"
+        )
+        return UNRESOLVED_REPO
+    holder = gitops_workspace.lease_holder(workspace)
+    if holder is None:
+        return None
+    # The `owner__name` directory under the holder first, as
+    # `gitops_workspace.resolve_repo` reads it: one holder can lease more
+    # than one repository, and the marker names whichever was leased last.
+    try:
+        parts = workspace.resolve().relative_to(holder.resolve()).parts
+    except ValueError:
+        parts = ()
+    owner, _, name = parts[0].partition(REPO_DIR_SEPARATOR) if parts else ("", "", "")
+    if owner and name:
+        return f"{owner}/{name}"
+    record = gitops_workspace.read_lease(holder)
+    repo = str((record or {}).get("repo") or "").strip()
+    if not repo:
+        log(
+            f"WARNING: {workspace} is leased but neither its directory nor the lease "
+            "marker names a repository; no candidate will carry a declaration"
+        )
+        return UNRESOLVED_REPO
+    return repo
+
+
+def _mirrored(path: str) -> bool:
+    name = Path(path).name
+    return name.endswith(MIRROR_SUFFIXES) or name in KUSTOMIZATION_FILE_NAMES
+
+
+def _safe_relative(path: str) -> Path | None:
+    """`path` as a relative path inside the mirror, or None if it is not one.
+
+    The broker's names are repository-relative already; this is the check that
+    a name it should never send -- absolute, climbing out, or inside `.git` --
+    is dropped rather than written outside the mirror.
+    """
+    relative = Path(path)
+    if (
+        not path
+        or relative.is_absolute()
+        or ".." in relative.parts
+        or GIT_DIR_NAME in relative.parts
+    ):
+        return None
+    return relative
+
+
+def _mirror_directory_link(dest: Path, path: str, target: str) -> Path | None:
+    """Recreate the repository's directory link `path` -> `target` in `dest`.
+
+    Neither a clone's walk nor the mirror's enters a directory link, but the
+    Kustomize overlay check resolves an Application's path through one, so the
+    mirror holds the same link the clone does. None, and no link, for a target
+    that is absolute or climbs out of the repository, and for a path that runs
+    through another link -- the broker's walk never lists one, and creating
+    its parent there would follow that link. `_links_inside` checks where the
+    links resolve once all of them exist, since a later one can redirect an
+    earlier one.
+    """
+    relative = _safe_relative(path)
+    if relative is None or not target or PurePosixPath(target).is_absolute():
+        return None
+    landing = posixpath.normpath(posixpath.join(relative.parent.as_posix(), target))
+    if landing == ".." or landing.startswith("../"):
+        return None
+    if any((dest / parent).is_symlink() for parent in relative.parents):
+        return None
+    link = dest / relative
+    try:
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        return None
+    return link
+
+
+def _links_inside(dest: Path, links: dict[str, Path]) -> dict[str, str]:
+    """Remove each link in `links` that resolves outside `dest` or into `.git`.
+
+    Repeated until none is removed, because removing one changes where a link
+    through it resolves. Answers each removed path with its target, and
+    drops it from `links`. A loop is left in place: it resolves nowhere, in a clone too.
+    """
+    root = dest.resolve()
+    removed: dict[str, str] = {}
+    changed = True
+    while changed:
+        changed = False
+        for path, link in list(links.items()):
+            try:
+                resolved = link.resolve()
+            except (OSError, RuntimeError):  # a loop, which older Pythons raise as RuntimeError
+                continue
+            if root in (resolved, *resolved.parents) and (root / GIT_DIR_NAME) not in (
+                resolved,
+                *resolved.parents,
+            ):
+                continue
+            removed[path] = os.readlink(link)
+            link.unlink()
+            del links[path]
+            changed = True
+    return removed
+
+
+def _cluster_tree(path: str) -> str | None:
+    """The cluster whose `clusters/<name>/` tree holds `path`, or None.
+
+    The same convention `workload_declarations` reads a cluster off."""
+    parts = PurePosixPath(path).parts
+    if len(parts) > GITOPS_CLUSTER_TREE_DEPTH and parts[0] == GITOPS_CLUSTER_TREE_ROOT:
+        return parts[1]
+    return None
+
+
+def _may_declare_release(workspace, path: str) -> bool:
+    """Whether withheld `path` could hold something the release index reads.
+
+    The broker searches a file it will not send, so a vendored CRD bundle over
+    its size limit need not cost every cluster its `release_declaration`. A
+    withheld Kustomization file still counts, since which Applications name
+    its directory is not looked up for a file the broker would not send, and a
+    search that fails or answers in a shape this does not know could not rule
+    the file out, so each of those still counts as declaring.
+    """
+    if Path(path).name in KUSTOMIZATION_FILE_NAMES:
+        return True
+    try:
+        found = workspace.grep(RELEASE_DECLARING_PATTERN, prefix=path, regex=True)
+    except Exception:  # noqa: BLE001 -- an unanswered search keeps the marker
+        return True
+    if not isinstance(found, dict):
+        return True
+    try:
+        if int(found.get("total", 1)) > 0:
+            return True
+        # A file with no column-0 `kind` could hold an indented release the
+        # search above cannot see, or was never read at all.
+        probe = workspace.grep(COLUMN_ZERO_KIND_PATTERN, prefix=path, regex=True)
+        return not isinstance(probe, dict) or int(probe.get("total", 0)) == 0
+    except Exception:  # noqa: BLE001 -- an unanswered search keeps the marker
+        return True
+
+
+def _application_source_paths(
+    files: dict[str, bytes], directory_links: list[dict]
+) -> set[str] | None:
+    """Every directory an Argo CD Application's source names, through links.
+
+    `_argocd_kustomize_source` resolves an Application's `path` by finding a
+    Kustomization file there on disk, so a Kustomization nothing names is read
+    by nothing. None when the Applications cannot all be read (no PyYAML, a
+    file that names one and does not parse): then any Kustomization counts.
+    """
+    try:
+        import yaml  # noqa: PLC0415 -- optional; absence counts every Kustomization
+    except ImportError:
+        return None
+    named: set[str] = set()
+    for content in files.values():
+        # A backslash may escape the kind (`"\u0041pplication"`), so only a
+        # file with neither is passed over unparsed.
+        if ARGOCD_APPLICATION_KIND.encode() not in content and b"\\" not in content:
+            continue
+        try:
+            docs = list(yaml.safe_load_all(content.decode("utf-8", errors="replace")))
+        except Exception:  # noqa: BLE001 -- an Application this cannot read could name anything
+            return None
+        for doc in docs:
+            if not isinstance(doc, dict) or doc.get("kind") != ARGOCD_APPLICATION_KIND:
+                continue
+            spec = doc.get("spec") if isinstance(doc.get("spec"), dict) else {}
+            sources = [spec.get("source"), *(spec.get("sources") if isinstance(spec.get("sources"), list) else [])]
+            for source in sources:
+                # Coerced as `_argocd_kustomize_source` coerces it: `path: 2024`
+                # names a directory too.
+                path = str(source.get("path") or "").strip() if isinstance(source, dict) else ""
+                if path:
+                    named.add(posixpath.normpath(path))
+    links = [
+        (str(link.get("path") or ""), str(link.get("target") or ""))
+        for link in directory_links
+        if isinstance(link, dict) and link.get("target")
+    ]
+    # A path through a directory link names the link's target too. Each pass
+    # follows one more link from the paths the last pass reached; a chain
+    # longer than the kernel would follow (a link into itself grows forever)
+    # cannot be settled, so it counts every Kustomization.
+    frontier = set(named)
+    for _ in range(LINK_FOLLOW_LIMIT):
+        reached = set()
+        for path in frontier:
+            for link, target in links:
+                if path == link or path.startswith(link + "/"):
+                    rest = path[len(link) + 1 :]
+                    reached.add(posixpath.normpath(posixpath.join(posixpath.dirname(link), target, rest)))
+        frontier = reached - named
+        if not frontier:
+            return named
+        named |= frontier
+    return None
+
+
+def _sent_file_declares_release(path: str, content: bytes, rendered: set[str] | None = None) -> bool:
+    """`_may_declare_release` for a file the broker did send.
+
+    A withheld file under `clusters/<c>/` drops that whole tree from the mirror,
+    and the dropped files the broker sent may hold an Application for another
+    cluster, an AppProject, or a Kustomization an Application renders: one in a
+    directory `rendered` (`_application_source_paths`) names, or any when that
+    is None. Its bytes are here, so it is read the way `release_declarations`
+    reads it; the search stands in only where PyYAML is absent or the file
+    does not parse."""
+    if Path(path).name in KUSTOMIZATION_FILE_NAMES and (
+        rendered is None or posixpath.dirname(path) in rendered
+    ):
+        return True
+    try:
+        import yaml  # noqa: PLC0415 -- optional; absence falls back to the search
+
+        docs = list(yaml.safe_load_all(content.decode("utf-8", errors="replace")))
+    except Exception:  # noqa: BLE001 -- unparseable or no PyYAML: search instead
+        return re.search(RELEASE_DECLARING_PATTERN.encode(), content, re.MULTILINE) is not None
+    for doc in docs:
+        # A `kind` that is not a string names no release, and `str` of an
+        # aliased tree of lists would expand it.
+        kind = doc.get("kind") if isinstance(doc, dict) else None
+        if not isinstance(kind, str):
+            continue
+        meta = doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {}
+        labels = meta.get("labels") if isinstance(meta.get("labels"), dict) else {}
+        if kind in RELEASE_KINDS or (
+            kind == "Secret" and labels.get(ARGOCD_CLUSTER_SECRET_LABEL) == ARGOCD_CLUSTER_SECRET_VALUE
+        ):
+            return True
+    return False
+
+
+def _batches(
+    wanted: list[tuple[str, int]], max_paths: int = MIRROR_BATCH_PATHS
+) -> list[list[str]]:
+    """Split `(path, size)` pairs under both per-request batch limits."""
+    batches: list[list[str]] = []
+    current: list[str] = []
+    current_bytes = 0
+    for path, size in wanted:
+        if current and (
+            len(current) >= max_paths or current_bytes + size > MIRROR_BATCH_BYTES
+        ):
+            batches.append(current)
+            current, current_bytes = [], 0
+        current.append(path)
+        current_bytes += size
+    if current:
+        batches.append(current)
+    return batches
+
+
+def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None) -> bool:
+    """Copy `repo`'s YAML out of the credential broker into `dest`.
+
+    Content mode's counterpart of the clone `workload_declarations`,
+    `release_declarations` and `namespace_directories` walk. Without it, a
+    content-mode run hands them an empty scratch directory and no candidate
+    carries `declaration` or `namespace_directory`, so the model falls back to
+    its own search and a fix the collector could have placed becomes
+    `kind: manual`.
+
+    `dest` is a private temporary directory, never the remediation workspace:
+    `finish` publishes every file in that, and a mirrored manifest written there
+    would be proposed as a fix.
+
+    Every region it indexes is whole. A region missing files would index an
+    object declared twice as declared once, and `declaration_for` would then
+    name one of the two files instead of refusing -- a wrong path, which is
+    worse than the absent one the SOPs already handle. So a capped listing,
+    an unknown skip, any broker failure, or a failed write returns False, the
+    caller does not index `dest`, and the run proceeds as it did before this
+    existed.
+
+    One file the broker will never send -- over its per-file limit
+    (`tooLarge`), or a symlink, which `read` refuses and `list` names apart
+    from its entries -- withholds only what it could have declared into. A
+    file under `clusters/<c>/` drops that cluster's whole tree from the
+    mirror, because `workload_declarations` keys by that path. Any withheld
+    file that could hold a release, wherever it sits, leaves
+    MIRROR_RELEASES_WITHHELD_MARKER, because an Argo CD Application can live
+    anywhere and target any cluster: no candidate then carries
+    `release_declaration` or `namespace_directory`. A symlink and a
+    Kustomization file always could; a `tooLarge` file could unless the
+    broker's search reads it, finds none of the kinds the release index reads,
+    and finds a column-0 `kind` (`_may_declare_release`), and the rest of its
+    cluster's tree (a Kustomization only where an Application names its
+    directory, `_application_source_paths`), which
+    goes with it, holds none either. The other clusters keep their `declaration`, and
+    each withheld file is logged with what it cost.
+
+    A link to a directory, which `list` names with its target, is recreated
+    in the mirror (`_mirror_directory_link`); one whose target the mirror
+    cannot hold leaves the marker instead.
+    """
+    if open_workspace is None:
+        client = _import_platform_script("credential_proxy_client")
+        if client is None:
+            log(f"WARNING: no broker client to read {repo} with; no candidate will carry a declaration")
+            return False
+        open_workspace = client.Workspace.open
+    endpoint = os.environ.get(CREDENTIAL_PROXY_URL_ENV, "").strip()
+    if not endpoint:
+        log(f"WARNING: {CREDENTIAL_PROXY_URL_ENV} is unset, so {repo} cannot be read; no candidate will carry a declaration")
+        return False
+    files: dict[str, bytes] = {}
+    withheld: dict[str, str] = {}
+    directory_links: list[dict] = []
+    total_bytes = 0
+    try:
+        with open_workspace(endpoint, repo, depth=1) as workspace:
+            wanted: list[tuple[str, int]] = []
+            cursor: str | None = None
+            # A truncated page is as long as the broker lets one request be,
+            # and that limit is configurable below MIRROR_BATCH_PATHS; a read
+            # over it fails whole.
+            max_paths = MIRROR_BATCH_PATHS
+            while True:
+                listing = workspace.list(after=cursor)
+                if listing.truncated and listing:
+                    max_paths = min(max_paths, len(listing))
+                withheld.update(
+                    (str(link), BROKER_SKIP_SYMLINK)
+                    for link in getattr(listing, "symlinks", ())
+                    if _mirrored(str(link))
+                )
+                for link in getattr(listing, "symlinked_directories", ()):
+                    path = str(link.get("path") or "") if isinstance(link, dict) else ""
+                    if _safe_relative(path) is None:
+                        log(
+                            f"WARNING: the broker listed the directory link {link!r} in {repo}, "
+                            "which is not a path inside the repository; no candidate will carry a declaration"
+                        )
+                        return False
+                    directory_links.append(link)
+                if len(directory_links) > MIRROR_MAX_FILES:
+                    log(
+                        f"WARNING: {repo} holds more directory links than the collector mirrors "
+                        f"({MIRROR_MAX_FILES}); no candidate will carry a declaration"
+                    )
+                    return False
+                for entry in listing:
+                    path = str(entry.get("path") or "")
+                    if not _mirrored(path):
+                        continue
+                    if _safe_relative(path) is None:
+                        log(
+                            f"WARNING: the broker listed {path!r} in {repo}, which is not a path "
+                            "inside the repository; no candidate will carry a declaration"
+                        )
+                        return False
+                    size = int(entry.get("size", 0) or 0)
+                    total_bytes += size
+                    wanted.append((path, size))
+                    if len(wanted) > MIRROR_MAX_FILES or total_bytes > MIRROR_MAX_BYTES:
+                        log(
+                            f"WARNING: {repo} holds more YAML than the collector mirrors "
+                            f"({MIRROR_MAX_FILES} files, {MIRROR_MAX_BYTES} bytes); "
+                            "no candidate will carry a declaration"
+                        )
+                        return False
+                if not listing or not listing.truncated:
+                    break
+                cursor = str(listing[-1].get("path") or "")
+            for batch in _batches(wanted, max_paths):
+                pending = batch
+                # `requestBudget` means ask again for the rest; stop when a
+                # round returns nothing, so a broker that never relents cannot
+                # spin this.
+                while pending:
+                    got, skipped = workspace.read_many(pending)
+                    files.update(got)
+                    for entry in skipped:
+                        if entry.get("reason") in BROKER_WITHHOLDING_SKIPS:
+                            withheld[str(entry.get("path") or "")] = str(entry.get("reason"))
+                    retry = [e for e in skipped if e.get("reason") == BROKER_SKIP_REQUEST_BUDGET]
+                    refused = [
+                        e
+                        for e in skipped
+                        if e.get("reason") not in BROKER_WITHHOLDING_SKIPS
+                        and e.get("reason") != BROKER_SKIP_REQUEST_BUDGET
+                    ]
+                    if retry and not got and not refused:
+                        # A file larger than one request's budget stalls every
+                        # round that starts with it; a single `read` has only
+                        # the per-file limit, so ask for it alone.
+                        stalled = str(retry[0].get("path") or "")
+                        try:
+                            files[stalled] = workspace.read(stalled)
+                        except Exception as exc:  # noqa: BLE001 -- reported below with its cause
+                            refused = [{"path": stalled, "reason": f"{BROKER_SKIP_REQUEST_BUDGET}, then {exc}"}]
+                        else:
+                            retry = retry[1:]
+                    if refused:
+                        first = refused[0]
+                        log(
+                            f"WARNING: the broker did not send {first.get('path')} from {repo} "
+                            f"({first.get('reason')}); no candidate will carry a declaration"
+                        )
+                        return False
+                    pending = [str(e.get("path") or "") for e in retry]
+            # A symlink's blob is its target's name, so the broker cannot
+            # search what it points at; only a `tooLarge` file is ruled out.
+            releasing = {
+                path
+                for path, reason in withheld.items()
+                if reason != BROKER_SKIP_TOO_LARGE or _may_declare_release(workspace, path)
+            }
+    except Exception as exc:  # noqa: BLE001 -- the annotation is optional; the run is not
+        log(f"WARNING: could not read {repo} through the broker ({exc}); no candidate will carry a declaration")
+        return False
+    # Listed names were checked above; this catches a name `read_many`
+    # returned that the listing did not, before anything is written.
+    unsafe = sorted(path for path in files if _safe_relative(path) is None)
+    if unsafe:
+        log(f"WARNING: the broker sent {unsafe[0]!r} from {repo}; no candidate will carry a declaration")
+        return False
+    clusters = {_cluster_tree(path) for path in withheld} - {None}
+    # A cluster's tree goes with the file withheld from it, so whatever release
+    # the rest of that tree held is lost too, and the file is charged for it.
+    releasing_trees: set[str | None] = set()
+    rendered = _application_source_paths(files, directory_links) if clusters else set()
+    for path, content in files.items():
+        tree = _cluster_tree(path)
+        # Parsed, so a tree already charged is not read again.
+        if (
+            tree in clusters
+            and tree not in releasing_trees
+            and _sent_file_declares_release(path, content, rendered)
+        ):
+            releasing_trees.add(tree)
+    releasing |= {path for path in withheld if _cluster_tree(path) in releasing_trees}
+    for path, reason in sorted(withheld.items()):
+        region = _cluster_tree(path)
+        costs = []
+        if region:
+            # Its tree goes, so its `namespace_directory` too, unless every
+            # cluster's already does.
+            also = "" if path in releasing else " or namespace_directory"
+            costs.append(f"no candidate on cluster {region} will carry a declaration{also}")
+        if path in releasing:
+            costs.append("no candidate will carry a release_declaration or namespace_directory")
+        knob = f"; raise {BROKER_MAX_FILE_BYTES_ENV} on the broker to mirror it" if reason == BROKER_SKIP_TOO_LARGE else ""
+        log(
+            f"WARNING: the broker will not send {path} from {repo} ({reason}); "
+            + (", and ".join(costs) or "it declares nothing the indexes read")
+            + knob
+        )
+    files = {path: content for path, content in files.items() if _cluster_tree(path) not in clusters}
+    try:
+        for path, content in files.items():
+            target = dest / Path(path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+        links: dict[str, Path] = {}
+        unheld: dict[str, str] = {}
+        for link in directory_links:
+            # A link in a dropped tree stays: an Application elsewhere may
+            # name a path through it, and no walk enters it.
+            path, target = str(link["path"]), str(link.get("target") or "")
+            made = _mirror_directory_link(dest, path, target) if path not in links else None
+            if made is None:
+                unheld[path] = target
+            else:
+                links[path] = made
+        unheld.update(_links_inside(dest, links))
+        for path, target in sorted(unheld.items()):
+            # The overlay check resolves a path through the link in a clone,
+            # and here it would find nothing.
+            releasing.add(path)
+            named = repr(target) if target else "an absolute target, or none"
+            log(
+                f"WARNING: the directory link {path} in {repo} names {named}, which "
+                "the mirror cannot hold; no candidate will carry a release_declaration or namespace_directory"
+            )
+        if releasing:
+            (dest / MIRROR_RELEASES_WITHHELD_MARKER).parent.mkdir(parents=True, exist_ok=True)
+            (dest / MIRROR_RELEASES_WITHHELD_MARKER).touch()
+        if clusters:
+            (dest / MIRROR_CLUSTERS_WITHHELD_MARKER).parent.mkdir(parents=True, exist_ok=True)
+            (dest / MIRROR_CLUSTERS_WITHHELD_MARKER).write_text(
+                "".join(f"{c}\n" for c in sorted(clusters)), encoding="utf-8"
+            )
+    except OSError as exc:
+        # `dest` now holds part of the tree; False tells the caller not to index it.
+        log(f"WARNING: could not write {repo}'s mirror ({exc}); no candidate will carry a declaration")
+        return False
+    log(f"mirrored {len(files)} YAML file(s) of {repo} from the broker")
+    return True
+
+
+@contextlib.contextmanager
+def indexed_workspace(workspace: Path | None) -> Iterator[Path | None]:
+    """The directory the declaration indexes walk for `--workspace`.
+
+    A clone, or a directory no lease holds, as it is. A content-mode scratch
+    workspace stands in for a repository the broker holds, so that
+    repository's YAML is mirrored into a private directory for the duration,
+    and None -- nothing indexed -- when the mirror fails: the scratch
+    workspace itself is never walked, because after an `audit_report.py
+    fetch` it holds an arbitrary part of the tree, and `broker_mirror` says
+    why a partial region is worse than none. `fleet_waste.py` uses this too, so the two collectors cannot
+    disagree about which tree they read.
+    """
+    repo = broker_repo(workspace) if workspace is not None else None
+    if repo is None:
+        yield workspace
+        return
+    if repo == UNRESOLVED_REPO:
+        yield None
+        return
+    import tempfile  # noqa: PLC0415 -- only the content-mode path needs it
+
+    try:
+        holder = tempfile.TemporaryDirectory(prefix=MIRROR_DIR_PREFIX)
+    except OSError as exc:
+        # The annotation is optional; the run is not.
+        log(
+            f"WARNING: cannot make a directory to mirror {repo} into ({exc}); "
+            "no candidate will carry a declaration"
+        )
+        yield None
+        return
+    with holder as mirror:
+        yield Path(mirror) if broker_mirror(repo, Path(mirror)) else None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("audit", choices=sorted(CHECK_TABLES))
@@ -8606,9 +9339,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--workspace",
         help=(
-            "the GitOps clone `audit_report.py start` made, so each candidate "
-            "carries where the repository declares its object; omit and no "
-            "candidate is annotated"
+            "the GitOps workspace `audit_report.py start` made -- a clone, or in "
+            "content mode the scratch directory, whose repository is then read "
+            "through the broker -- so each candidate carries where the "
+            "repository declares its object; omit and no candidate is annotated"
         ),
     )
     args = parser.parse_args(argv)
@@ -8623,7 +9357,8 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         workspace = None
-    manifest = collect_fleet(args.audit, args.project, workspace=workspace)
+    with indexed_workspace(workspace) as indexed:
+        manifest = collect_fleet(args.audit, args.project, workspace=indexed)
     print(json.dumps(manifest, indent=2))
     log(summary_line(manifest))
     if manifest.get("error"):

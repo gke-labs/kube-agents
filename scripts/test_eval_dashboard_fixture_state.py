@@ -179,10 +179,12 @@ print(json.dumps(answers[key]))
 '''
 
 
-def _pod(*, restarts, last_reason, phase="Running"):
+def _pod(*, restarts, last_reason, phase="Running", waiting_reason=None):
     status = {"restartCount": restarts, "lastState": {}}
     if last_reason:
         status["lastState"] = {"terminated": {"reason": last_reason, "exitCode": 137}}
+    if waiting_reason:
+        status["state"] = {"waiting": {"reason": waiting_reason}}
     return {"status": {"phase": phase, "containerStatuses": [status]}}
 
 
@@ -198,15 +200,18 @@ def _cluster_b():
     return {
         "currentMasterVersion": "1.33.4-gke.1134000",
         "releaseChannel": {"channel": "REGULAR"},
+        # The no-surge pool as `clusters describe` reports it; the
+        # readiness-surge-blocked role asserts on maxUnavailable here.
+        "nodePools": [{"name": "default-pool", "upgradeSettings": {"maxSurge": 1}}, {"name": "no-surge-pool", "upgradeSettings": {"maxUnavailable": 1}}],
         "maintenancePolicy": {"window": {"maintenanceExclusions": {"hold-the-minor-lag": {"startTime": "2026-09-01T00:00:00Z", "endTime": _future(), "maintenanceExclusionOptions": {"scope": "NO_MINOR_UPGRADES"}}}}},
     }
 
 
 def healthy_world(*projects):
     """Every role planted and in its designed state on each project."""
-    trio = [["seeded-a", "us-central1-a"], ["seeded-b", "us-central1-a"], ["seeded-c", "us-central1-a"]]
+    fleet = [["seeded-a", "us-central1-a"], ["seeded-b", "us-central1-a"], ["seeded-c", "us-central1-a"], ["seeded-d", "us-central1-a"]]
     return {
-        "clusters": {project: trio for project in projects},
+        "clusters": {project: fleet for project in projects},
         "kubectl": {
             "namespace/seeded-debug": {"metadata": {"name": "seeded-debug"}},
             "namespace/seeded-capacity": {"metadata": {"name": "seeded-capacity"}},
@@ -217,14 +222,59 @@ def healthy_world(*projects):
             "deployment/inference-server": {"status": {"readyReplicas": 1, "replicas": 3}},
             "pod?app=inference-server": _pods(_pod(restarts=0, last_reason=None), _pod(restarts=0, last_reason=None, phase="Pending")),
             "deployment/checkout-gateway": {"status": {"readyReplicas": 2, "replicas": 2}},
+            "namespace/seeded-intent": {"metadata": {"name": "seeded-intent"}},
+            "deployment/notification-relay": {"status": {"readyReplicas": 2, "replicas": 2}},
             "poddisruptionbudget?": {"items": []},
             "clusterrolebinding/debug-binding": {"roleRef": {"name": "cluster-admin"}, "subjects": [{"kind": "ServiceAccount", "name": "default", "namespace": "seeded-security"}]},
             "node?cloud.google.com/gke-nodepool=idle-batch-pool": {"items": [{"spec": {"taints": [{"key": "seeded-role", "value": "idle-batch", "effect": "NoSchedule"}]}, "status": {"conditions": [{"type": "Ready", "status": "True"}]}}]},
+            "namespace/seeded-stall": {"metadata": {"name": "seeded-stall"}},
+            "deployment/inventory-api": {
+                "status": {
+                    "conditions": [
+                        {
+                            "type": "Progressing",
+                            "status": "False",
+                            "reason": "ProgressDeadlineExceeded",
+                        }
+                    ]
+                }
+            },
+            "pod?app=inventory-api": _pods(
+                _pod(restarts=0, last_reason=None, phase="Pending", waiting_reason="CreateContainerConfigError")
+            ),
             "namespace/seeded-deprecation": {"metadata": {"name": "seeded-deprecation"}},
             "cronjob/legacy-endpoints-writer": {"spec": {"schedule": "*/10 * * * *", "suspend": False, "jobTemplate": {"spec": {"template": {"spec": {"serviceAccountName": "legacy-endpoints-writer"}}}}}},
             "service/legacy-endpoints-lane": {"spec": {"clusterIP": "None"}},
             "endpoints/legacy-endpoints-lane": {"subsets": [{"addresses": [{"ip": "192.0.2.10"}], "ports": [{"port": 9}]}]},
             "job?app=legacy-endpoints-writer": {"items": [{"status": {"succeeded": 1, "conditions": [{"type": "Complete", "status": "True"}]}}]},
+            # seeded-b's upgrade-readiness fixtures: the pool that cannot
+            # surge, the workload pinned to it, the budget that refuses its
+            # eviction, and the fail-closed webhook. The
+            # first two gate on being up and Running respectively, because
+            # the finding is what a drain WOULD do, which is only meaningful
+            # while they are healthy.
+            "namespace/seeded-upgrade": {"metadata": {"name": "seeded-upgrade"}},
+            "poddisruptionbudget/pinned-batch-runner": {"spec": {"maxUnavailable": 0}, "status": {"disruptionsAllowed": 0, "currentHealthy": 1}},
+            "node?cloud.google.com/gke-nodepool=no-surge-pool": {"items": [{"spec": {}, "status": {"conditions": [{"type": "Ready", "status": "True"}]}}]},
+            "deployment/pinned-batch-runner": {
+                "spec": {"template": {"spec": {"nodeSelector": {"seeded-role": "no-surge"}}}},
+                "status": {"readyReplicas": 1, "replicas": 1},
+            },
+            "pod?app=pinned-batch-runner": _pods(_pod(restarts=0, last_reason=None)),
+            "validatingwebhookconfiguration/seeded-fail-closed-gate": {"webhooks": [{"name": "gate.seeded.invalid", "failurePolicy": "Fail", "timeoutSeconds": 30, "clientConfig": {"service": {"name": "nonexistent-admission-gate"}}}]},
+            # seeded-d's zonal-skew trio. Each is in the state its role's
+            # `state` block asserts: a scheduled pod for the scheduling case,
+            # a Bound claim for the volume case, and a Pending pod for the
+            # capacity case -- the three signals that say the skew's cause is
+            # actually present rather than merely that the objects exist.
+            "namespace/seeded-topology": {"metadata": {"name": "seeded-topology"}},
+            "deployment/zone-pinned-api": {"spec": {"template": {"spec": {"topologySpreadConstraints": [{"whenUnsatisfiable": "ScheduleAnyway"}], "affinity": {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [{"matchExpressions": [{"key": "topology.kubernetes.io/zone", "operator": "In", "values": ["z-a"]}]}]}}}}}}, "status": {"readyReplicas": 2, "replicas": 2}},
+            "pod?app=zone-pinned-api": _pods(_pod(restarts=0, last_reason=None)),
+            "statefulset/zone-bound-store": {"spec": {"volumeClaimTemplates": [{"spec": {"storageClassName": "seeded-zonal-pd"}}]}, "status": {"readyReplicas": 1}},
+            "persistentvolumeclaim?app=zone-bound-store": {"items": [{"status": {"phase": "Bound"}}]},
+            "deployment/capacity-starved-worker": {"status": {"readyReplicas": 1, "replicas": 4}},
+            "deployment/first-zone-sponge": {"spec": {"replicas": 6}},
+            "pod?app=capacity-starved-worker": _pods(_pod(restarts=0, last_reason=None), _pod(restarts=0, last_reason=None, phase="Pending")),
         },
         "describe": {project: {"seeded-b": _cluster_b(), "seeded-c": {"currentMasterVersion": "1.34.1-gke.1"}} for project in projects},
         "server_config": {"channels": [{"channel": "REGULAR", "defaultVersion": "1.34.1-gke.1"}]},
@@ -304,10 +354,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 8, "drifted": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 17, "drifted": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "healthy": 8, "drifted": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "healthy": 17, "drifted": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -361,7 +411,7 @@ class Drift(ScanHarness):
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "healthy": 15, "drifted": 1, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "healthy": 33, "drifted": 1, "not_checked": 0})
 
 
 class NotChecked(ScanHarness):
@@ -454,6 +504,8 @@ class EntryPoint(ScanHarness):
         env = self.environ()
         with unittest.mock.patch.dict(os.environ, env):
             rc, err = self.run_main(["--out", str(out), "--prior", str(prior), "--projects", PROJECT, "--workdir", str(self.workdir), "--now", NOW.isoformat(), "--workers", "1"])
+            # A hand run's document says it covers named projects, not the pool.
+            self.assertEqual(json.loads(out.read_text(encoding="utf-8"))["scope"], fixture_state.SCOPE_SELECTED)
         self.assertEqual(rc, 0, err)
         doc = json.loads(out.read_text())
         self.assertEqual(doc["schema_version"], 1)

@@ -173,17 +173,21 @@ operator who chose the number is not told their stream predates the limit. The
 block is treated the other way - it refuses - because a short consumer budget is not a
 bound the install never had but a shortfall with a load-time failure already attached.
 
-Where that report lands bounds what it is worth, so it is worth saying plainly: the
-provision Job's pod log, and nowhere else. The script exits 0, the reconcile reads the
-Job's `Complete` condition and nothing else, and no Event, no CR condition and no status
-field records that the stream is still unbounded - an install that predates this render
-reads `Ready` with the gap open, exactly as it did before. The 24h TTL removes the
-finished Job and the next reconcile recreates it under the same digested name, so the
-report reappears roughly daily rather than expiring; it is still a pod log, and someone
-has to go and read it. Surfacing it where an operator would see it without being told to
-look is deferred for the same reason the `max_consumers` refusal's own CR surfacing is -
-status plumbing with a blast radius of its own, which is a change about status and not
-about the bus render.
+Where that report lands: the pod log, and an Event on the `PlatformAgent`. The script
+still exits 0, so the Job completes and the CR reads `Ready` - the gap is a report, not a
+failure - but the closing block also writes the finding as one line of JSON to the
+container's termination message (`/dev/termination-log`, the kubelet's default; `{}` when
+it found nothing), and the reconcile that first sees the Job `Complete` reads that off
+the Job's succeeded pod and records a `Warning` Event, reason `TasksSubjectCapMissing`,
+naming the Job, the live and rendered caps, and the `nats stream edit` with its cost. It
+stamps the Job with an annotation so later passes over the same completed Job add
+nothing; the 24h TTL removes the finished Job and the next reconcile recreates it under
+the same digested name, so an unfixed gap is reported once per run, roughly daily, and
+`kubectl describe platformagent` shows it without anyone reading a pod log. It is an
+Event and not a condition because it is a fact about the live stream that a Job
+discovered, not a state the reconcile converges on; the operator's `Recorder` field
+draws that line once. The `max_consumers` refusal in the same block already fails the
+Job, which reaches the CR as `Degraded`/`A2AProvisionFailed`.
 
 W is TBD - see Open questions. It is not just a cost knob; see the audit section.
 
@@ -248,10 +252,10 @@ ServiceAccount token: the bus provisioning Job, every spawned session pod, and t
 platform agent container. **Statically**, from `nats.conf` and listed in `auth_users`:
 the callout itself, which cannot authenticate through the thing it is; the chatops
 gateway, purely as sequencing, since it has a ServiceAccount and its client program
-lands separately from this render; `web`, because a browser never can; `seed`, because
-the hand-applied seed tooling is applied rather than rendered and dropping its user
-would refuse an object already running; `sys`, a human at a port-forward; and `bridge`,
-the Hermes bridge sidecar.
+lands separately from this render; `web` and `console`, because a browser never can;
+`seed`, because the hand-applied seed tooling is applied rather than rendered and
+dropping its user would refuse an object already running; `sys`, a human at a
+port-forward; and `bridge`, the Hermes bridge sidecar.
 
 The shared `worker` user is gone. It was one credential held by two workloads that
 happen to share a pod — the bridge sidecar, which drives the task plane, and the `a2a`
@@ -259,23 +263,23 @@ CLI in the agent container, which reads and writes the topic blackboard — so i
 set was the union of two unrelated jobs, and either workload could do the other's. It
 split into `agent` and `bridge`, and neither holds the other's streams.
 
-Four of those static users are permanent - the callout, which cannot authenticate
-through itself; `web`, because a browser never can; `sys`, which is a human rather than
-a workload; and `bridge`, for a reason worth stating because it looks like an omission.
-The callout keys its map on the ServiceAccount username `TokenReview` returns, and a
-sidecar shares its pod's ServiceAccount. A token presented by the bridge would therefore
-resolve to the `agent` entry rendered for the container beside it, and each would hold
-the union of the two grant sets - `worker` rebuilt under a new name, arrived at by
-moving the bridge onto the mechanism meant to narrow it. `Narrowing` does not help: it
-is pod-scoped, and both workloads are in the same pod. The bridge gets a token when it
-stops sharing a pod with the agent, which is the same event that retires it. The rest
-are waiting on something nameable. The single
-source for all of it - the config's APP and `$SYS` static user blocks, the callout's map,
-and the `NATS_USER` a client is handed so it can set its inbox prefix - is
-`platformagent_a2a_identities.go`; before the callout those three lived in a config
-string, a Secret and a container env block with nothing but review connecting them. The
-one static block not in that file is the callout's own, rendered in the AUTH account
-template in `platformagent_a2a_manifests.go`.
+Five of those static users are permanent - the callout, which cannot authenticate
+through itself; `web` and `console`, because a browser never can; `sys`, which is a
+human rather than a workload; and `bridge`, for a reason worth stating because it looks
+like an omission. The callout keys its map on the ServiceAccount username `TokenReview`
+returns, and a sidecar shares its pod's ServiceAccount. A token presented by the bridge
+would therefore resolve to the `agent` entry rendered for the container beside it, and
+each would hold the union of the two grant sets - `worker` rebuilt under a new name,
+arrived at by moving the bridge onto the mechanism meant to narrow it. `Narrowing` does
+not help: it is pod-scoped, and both workloads are in the same pod. The bridge gets a
+token when it stops sharing a pod with the agent, which is the same event that retires
+it. The rest are waiting on something nameable. The single source for all of it - the
+config's APP and `$SYS` static user blocks, the callout's map, and the `NATS_USER` a
+client is handed so it can set its inbox prefix - is `platformagent_a2a_identities.go`;
+before the callout those three lived in a config string, a Secret and a container env
+block with nothing but review connecting them. The one static block not in that file is
+the callout's own, rendered in the AUTH account template in
+`platformagent_a2a_manifests.go`.
 
 Those credentials belong in Secret data and nowhere else in the render: no rendered
 object name, label, or annotation may carry a password or a digest of one, truncated or
@@ -307,7 +311,20 @@ Layout:
   a pull-only principal may hold no task-subject subscribe at all, which is what the
   session grants do. The addressee token in the task subjects (payload spec
   0.4) is what makes these grants expressible - executor-granularity at connect time,
-  with per-task scoping the parked tightening under the authority work.
+  with per-task scoping the parked tightening under the authority work. **Amended
+  10/1:** "deny by default" holds per side, and only while that side has entries in
+  it. An empty allow list is nats-server's spelling of _unrestricted_, not of
+  _nothing_ (`buildPermissionsFromJwt` builds a side's permission object only when
+  that side's allow or deny list is non-empty, and the two sides are independent), so
+  a rendered entry that lost its publish list would grant the whole subject space on
+  that side while its subscribes stayed narrow. Neither side of a non-narrowed entry
+  may therefore be empty: in the callout identity map the operator refuses such a
+  render and the callout refuses it again at the mint, and in the static `nats.conf`
+  users - which have no validator - a side left empty beside a populated one renders
+  an explicit `deny = [">"]` rather than an absent key. A user with NEITHER side,
+  which is how `sys` ships, still gets no permissions block at all. A principal that
+  must not publish cannot be expressed by omission - there is no deny list in the map
+  - so it has to be left unrendered rather than rendered empty.
 - **Three task-subject classes, and the publish grants split along them** (9/9, payload
   spec 0.4). `…in` is the requester's, `…events` the executor's, and `…supervisor` the
   supervisor's - one writer class each, which is the whole point: a consumer derives the
@@ -371,12 +388,12 @@ Layout:
   agent can subscribe to any inbox and the whole property above leaks through the reply
   path.
 - **The web read surface (amended 8/31; rewritten the same day after review).** One
-  `web` user for the read-only web UI, and the only bus credential that is published to
-  a browser by design. Subscribe on `a2a.>` and its own inbox; publish only the JetStream
-  read API - account-level `INFO`, and `STREAM.INFO`, `CONSUMER.CREATE`, `CONSUMER.INFO`,
-  `CONSUMER.MSG.NEXT` **enumerated per stream** over the four message streams - plus its
-  own inbox. It rides a websocket listener on 9222 rendered plain (`no_tls: true`) with
-  an `allowed_origins` allow-list.
+  `web` user for the read-only web UI, one of the two bus credentials published to a
+  browser by design (the other is `console`, below). Subscribe on `a2a.>` and its own
+  inbox; publish only the JetStream read API - account-level `INFO`, and `STREAM.INFO`,
+  `CONSUMER.CREATE`, `CONSUMER.INFO`, `CONSUMER.MSG.NEXT` **enumerated per stream** over
+  the four message streams - plus its own inbox. It rides a websocket listener on 9222
+  rendered plain (`no_tls: true`) with an `allowed_origins` allow-list.
 
   **"Read-only" is not expressible as a subject list, and the first version of this user
   proved it.** Subject permissions cannot see a request BODY, and JetStream puts the
@@ -405,14 +422,33 @@ Layout:
   on `TASKS` that bound is no longer the flat 64 but a number derived from
   `spec.harness.tuning.maxSessions`, since a session pod creates three consumers there
   and a stream that cannot hold the configured concurrency refuses a legitimate session.
-  The number is `maxSessions` times three plus a fixed reserve for what is nobody's
+  The number is `maxSessions` times three plus a reserve for what is nobody's
   session, itemized term by named term beside `a2aTasksReservedConsumers` in the
   operator: the two standing durables, headroom for the audit durable, one incarnation's
   overlap, the web rail's readers, and - amended 9/25 - the `tasks/get` replay
   ephemerals. A replay's ordered consumer holds a slot for five seconds after the call
   returns, its inactive threshold, so the term counts what the replaying callers can hold
   in flight at once and one tail each; the callers that replay in a loop with nothing
-  between calls are named there as what the term does not size for.
+  between calls are named there as what the term does not size for. Amended 9/28: the
+  replay term scales with the bridge's worker count, which the render reads as
+  `BRIDGE_CONCURRENCY` off `spec.deployment.sidecars` - the sum over every sidecar that
+  sets it, each read as the bridge runs it: the literal, with a `$(NAME)` reference to an
+  earlier literal in the same sidecar expanded as the kubelet expands it, or the bridge's
+  default of 2 for a `valueFrom` or a reference to one, an unparsable value or one below
+  one, and 2 when no sidecar sets it, and at
+  most 1024, the bridge's queue capacity, since the CRD bounds `maxSessions` at 10000 against
+  the same wrap and a sidecar's env is bounded nowhere else - so the reserve moves with the
+  bridge's worker count, and each surface says what it read. The provision script's refusal
+  quotes the count it used, the per-entry rule it read it by, and whether it capped it; the
+  `Ready` condition's message on that refusal says, when an entry it could not read as a
+  count took the default in its place, that the count is what the render read, not what the
+  CR declares, and states the rule; and the script prints a `NOTE:` on every run, refused or
+  not, when an entry took the default or a sidecar carries `envFrom` with no entry in `env`
+  (a `BRIDGE_CONCURRENCY` delivered through `envFrom` is not read), since the budget may then
+  be short for the real count with no refusal to say so. Where the count is above the
+  default, both refusal surfaces offer fewer workers as the third way out beside a lower
+  `maxSessions` and a deleted stream; the message attributes the need to the count wherever
+  it moved the reserve, one worker included.
   The trade is stated where it is made: an install that raises `maxSessions` raises
   `web`'s unreapable-durable ceiling in the same proportion. Deriving downward on a small
   install would silently tighten a working one, so the render takes the larger of 64 and
@@ -485,7 +521,8 @@ Layout:
   fence without the route peer prevents the cluster from ever forming. The topic-grant corollary that two edits
   travel together, applied to the fence. A second policy in the same amendment
   fences the session pods' egress (DNS, 4222 by label, LiteLLM - a spawned worker has no
-  other legitimate destination). **Amended 9/8:** a session pod now carries a
+  other legitimate destination, save the credential broker on its one port when the
+  operator's `A2A_SESSION_CLUSTER_VIEW` flag is on; see `spec-mode-switch.md`). **Amended 9/8:** a session pod now carries a
   ServiceAccount and a projected bus token, so the reason for the fence's shape changed
   while the fence did not. The kubelet delivers that token through a volume, so the
   credential arrives without the pod dialling anything, and this policy is what withholds
@@ -497,6 +534,18 @@ Layout:
   different port) remains the browser-side control: WebSockets are exempt from CORS,
   so for as long as a port-forward runs, any page the operator's browser visits could
   otherwise drive this surface.
+
+- **The console surface (added 9/23).** One `console` user for the web console: the `web`
+  read surface exactly, plus publish on `chat.console.*.in` (the gateway's console adapter's
+  inbound subject, spec-chatops-gateway.md), and subscribe on `chat.console.*.out`. The
+  console holds no verb on any `KV_*` stream, because `STREAM.INFO` accepts a
+  `subjects_filter` in its body and returns every key, which for `session-state` is the
+  conversation and task ids; the capacity tiles that wanted bucket sizes are deferred until
+  a sizes-only route exists. The gateway user gains the matching pair (subscribe `.in`,
+  publish `.out`). The console subjects are core NATS, so
+  the provision Job is untouched and an existing install picks the door up on operator
+  upgrade. Same posture as `web` and stated in the same places: static, published to a
+  browser by design, port-forward only.
 
 - **Bucket access is subject access.** KV and the Object Store ride internal subjects -
   `$KV.{bucket}.>`, `$O.{bucket}.C.>` / `$O.{bucket}.M.>`, plus the `$JS.API` surface for

@@ -11,6 +11,10 @@
 # or pulls them today. This file is declarative intent that parses, not
 # something the operator renders: profiles render nothing until the mode switch
 # says `next` and stage 3's dispatcher exists.
+#
+# Until profiles render, the session pod's tools are the worker image's and the
+# operator's A2A_SESSION_CLUSTER_VIEW flag (a temporary read-only cluster view
+# through the credential broker); this file's identity block stays empty.
 
 description: >-
   The conversation front door.  Holds a chat thread's context, answers directly

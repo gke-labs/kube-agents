@@ -208,11 +208,12 @@ spec:
     (docs/designs/multi-project-scope.md §7). `kindIs "map"` is the test because the
     default is null and a null user value deletes the key, both of which render no
     block, while `{}` is a present map that `with` would skip. The two container lists
-    render only when the value carries the key: Helm patches the CR from the difference
-    between rendered manifests, so a release record written before the chart knew the
-    keys must re-render without them, or the first retag onto this chart would patch
-    `folders: []` over a folder declared on the CR by hand and retire its members. The
-    composition always passes both keys, so on that path they always render.
+    and the two selector lists render only when the value carries the key: Helm patches
+    the CR from the difference between rendered manifests, so a release record written
+    before the chart knew the keys must re-render without them, or the first retag onto
+    this chart would patch `folders: []` (or `sharedVpcHosts: []`) over a list declared
+    on the CR by hand and retire its members. The composition always passes all four
+    keys, so on that path they always render.
   */}}
   {{- $scope := .Values.platformAgent.scope }}
   {{- if kindIs "map" $scope }}
@@ -224,6 +225,20 @@ spec:
     {{- end }}
     {{- if hasKey $scope "organizations" }}
     organizations: {{ $scope.organizations | default list | toJson }}
+    {{- end }}
+    {{- if hasKey $scope "sharedVpcHosts" }}
+    sharedVpcHosts: {{ $scope.sharedVpcHosts | default list | toJson }}
+    {{- end }}
+    {{- if hasKey $scope "metricsScopes" }}
+    metricsScopes: {{ $scope.metricsScopes | default list | toJson }}
+    {{- end }}
+    {{- /*
+      The cap renders only when the value carries it, for the same reason as the lists
+      above: a release record from before the chart knew the key must not patch the
+      CRD's default over a cap set on the CR by hand. The composition always passes it.
+    */}}
+    {{- if hasKey $scope "maxProjects" }}
+    maxProjects: {{ $scope.maxProjects | int }}
     {{- end }}
     exclude:
       projects: {{ $scopeExclude.projects | default list | toJson }}
@@ -243,9 +258,131 @@ spec:
     {{- toYaml . | nindent 4 }}
   {{- end }}
   {{- $integ := .Values.platformAgent.integration }}
-  {{- if or (and $integ.github (or $integ.github.org $integ.github.gitRepo)) $integ.googleChat.enabled $integ.slack.enabled $integ.teams.enabled }}
+  {{- /* Runs the forge checks, and fails, before anything is written. */}}
+  {{- $providers := include "kube-agents.forgeProviders" . }}
+  {{- $forges := $integ.forges | default list }}
+  {{- $repos := $integ.repositories | default list }}
+  {{- /* `gitRepo: None` alone still renders, as it does without forges. */}}
+  {{- $githubSet := and $integ.github (or $integ.github.org $integ.github.gitRepo) }}
+  {{- /*
+  A declaration the deprecated `github` block can express renders as that
+  block, whichever spelling the values file used: one GitHub forge with no
+  credentialsRef, and at most one repository on it, the GitOps one, with no
+  namespace of its own. `helm upgrade` never touches crds/, so an install
+  upgraded that way still serves the CRD it was first installed with, and a
+  schema without `forges` prunes it: the CR loses its repositories and
+  nothing reports it. The alias carries everything such a declaration says
+  except the host, and every host GitHub serves is the same forge, which
+  kube-agents.forgeProviders has already checked.
+
+  Only a repository the operator would accept for GitHub folds: `name`,
+  `owner/name`, or an http(s), ssh or git URL, a schemeless host or an scp
+  remote on github.com, www.github.com or ssh.github.com, with no port, naming
+  `owner/name`, in the grammar the operator applies. Scheme and host fold
+  case, as the operator's do; a URL's userinfo, a token included, is
+  printable ASCII with no `[` or `]` (the operator refuses whitespace, control
+  characters, and a bracket in a URL's userinfo)
+  and ends at its last `@` unless a `#` or `?` comes first (which ends the authority, so the
+  host is not github.com), and a schemeless user is not empty; and a run of `/` around the path, which the
+  operator trims, is allowed, except that an scp remote's colon takes at most
+  one (`github.com://` reads to the operator as a scheme separator). Anything else -- another host, a deeper path,
+  an owner GitHub would not accept, a name that is `.`, `..` or `.git` once
+  its `.git` suffix is dropped, or starts with `-`, a GitHub host followed
+  only by `/` (`github.com/`; `github.com` and `/github.com` are a name), a value over the CRD's
+  2048 characters -- would be refused by the
+  operator against `github.gitRepo`, a key the values file never set, and a forge with neither a namespace nor a repository
+  would fold into no key at all. Those render as the lists, so the refusal
+  names the entry the administrator wrote. A credentialsRef with an empty name
+  is unset, as values.yaml's example writes it.
+  */}}
+  {{- $asAlias := false }}
+  {{- if eq (len $forges) 1 }}
+  {{- $f := first $forges }}
+  {{- $onlyGitOps := true }}
+  {{- range $repos }}
+  {{- if or (ne .role "gitops") .namespace }}
+  {{- $onlyGitOps = false }}
+  {{- end }}
+  {{- end }}
+  {{- $plain := true }}
+  {{- $repo := "" }}
+  {{- with $repos }}
+  {{- $repo = (first .).repository | default "" }}
+  {{- $owner := `[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?/` }}
+  {{- $github := `(?i:(https?|ssh|git)://([!-"$-.0->@-Z\\^-~]*@)?((www|ssh)\.)?github\.com/+|([!-"$-.0-9;->@-~]+@)?((www|ssh)\.)?github\.com(:/?|/+))` }}
+  {{- $plain = and (le (len $repo) 2048) (regexMatch (printf `^(%s%s|/*(%s)?)[A-Za-z0-9_.][A-Za-z0-9_.-]*/*$` $github $owner $owner) $repo) (not (has (trimSuffix ".git" (base $repo)) (list "" "." ".." ".git"))) (not (and (hasSuffix "/" $repo) (has (lower (trimAll "/" $repo)) (list "github.com" "www.github.com" "ssh.github.com")))) }}
+  {{- end }}
+  {{- $asAlias = and (eq ($f.provider | default "github") "github") (not ($f.credentialsRef | default dict).name) (le (len $repos) 1) $onlyGitOps $plain (or $f.namespace $repo) }}
+  {{- end }}
+  {{- $aliasOrg := "" }}
+  {{- $aliasRepo := "" }}
+  {{- if $asAlias }}
+  {{- $aliasOrg = (first $forges).namespace | default "" }}
+  {{- with $repos }}
+  {{- $aliasRepo = (first .).repository | default "" }}
+  {{- end }}
+  {{- end }}
+  {{- $listed := and (or $forges $repos) (not $asAlias) }}
+  {{- /*
+  Anything else needs the list fields, which a CRD from before them would
+  prune the same way. `lookup` sees the installed CRD on a live install and
+  sees nothing under `helm template`, so the guard fires exactly where the
+  pruning would happen.
+  */}}
+  {{- if $listed }}
+  {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+  {{- if $crd }}
+  {{- $props := dict }}
+  {{- range $crd.spec.versions }}
+  {{- if eq .name "v1alpha1" }}
+  {{- $props = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "integration" "properties" (dict) . }}
+  {{- end }}
+  {{- end }}
+  {{- if not (hasKey $props "forges") }}
+  {{- fail "platformAgent.integration.forges needs a PlatformAgent CRD that has the field, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
+  {{- end }}
+  {{- end }}
+  {{- end }}
+  {{- if or (and $asAlias (or $aliasOrg $aliasRepo)) $listed $githubSet $integ.googleChat.enabled $integ.slack.enabled $integ.teams.enabled }}
   integration:
-    {{- if and $integ.github (or $integ.github.org $integ.github.gitRepo) }}
+    {{- if and $asAlias (or $aliasOrg $aliasRepo) }}
+    github:
+      {{- with $aliasOrg }}
+      org: {{ . | quote }}
+      {{- end }}
+      {{- with $aliasRepo }}
+      gitRepo: {{ . | quote }}
+      {{- end }}
+    {{- else if $listed }}
+    {{- with $forges }}
+    forges:
+      {{- range . }}
+      - name: {{ .name | quote }}
+        provider: {{ .provider | default "github" | quote }}
+        {{- with .host }}
+        host: {{ . | quote }}
+        {{- end }}
+        {{- with .namespace }}
+        namespace: {{ . | quote }}
+        {{- end }}
+        {{- with (.credentialsRef | default dict).name }}
+        credentialsRef:
+          name: {{ . | quote }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+    {{- with $repos }}
+    repositories:
+      {{- range . }}
+      - forge: {{ .forge | quote }}
+        repository: {{ .repository | quote }}
+        {{- with .namespace }}
+        namespace: {{ . | quote }}
+        {{- end }}
+        role: {{ .role | quote }}
+      {{- end }}
+    {{- end }}
+    {{- else if $githubSet }}
     github:
       {{- if $integ.github.org }}
       org: {{ $integ.github.org | quote }}

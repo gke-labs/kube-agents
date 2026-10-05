@@ -175,17 +175,16 @@ FIXTURE_NOT_READY = {
         "no CI tier can run it yet; run it locally "
         "with bench/hack/run-gitops-pilot.sh"
     ),
+    "b-0022b-gitops": (
+        "#1307: the second task through the GitOps fix-cycle stack (gitops_task "
+        "b-0022b); parked for the same reason as b-0011-gitops; run it locally "
+        "with TASK=b-0022b bench/hack/run-gitops-pilot.sh"
+    ),
     "scope-second-project-denied": (
         "#1865: needs a second GCP project per pool project, declared in the "
         "harness install's spec.scope.projects, whose listing the agent's service "
         "account is denied, as a fixture role of its own; the evaluation fleet has "
         "one project per install today, so the case cannot be red on main"
-    ),
-    "obtainability-declared-intent-no-finding": (
-        "#1341: needs a second multi-replica workload as a fixture role of its "
-        "own in bench/tf/fleet/fixtures.json (a declaration for checkout-gateway "
-        "would silence the five active cases that grade it) and a knowledge/ "
-        "declaration seeded in each pool project's *-infra repository"
     ),
     "vcs-history-only-fact": (
         "#1253: needs the git-access-ab/r200 branch pushed to every pool "
@@ -194,9 +193,22 @@ FIXTURE_NOT_READY = {
         "than red"
     ),
     "cluster-agent-stalled-controller-diagnosis": (
-        "#1873: needs the stalled-controller role, a Deployment in seeded-stall "
-        "on seeded cluster A waiting on a ConfigMap that does not exist; no "
-        "fixture role plants a stall today"
+        "#1873: needs the stalled-controller role applied to every pool "
+        "project; fixture defined in #1893, waiting on fleet re-apply and pool "
+        "verification sweep"
+    ),
+    "gitops-drift-noise-filtered-triage": (
+        "#911: needs an audit ingress on the eval install -- a drift-audit "
+        "topic, a subscription and a detector enabled to pull from it, none of "
+        "which hack/ci-deploy.sh builds, so no record of any tier reaches the "
+        "classifier and the case files no card at all, which is broken rather "
+        "than red. The umbrella owns it because the gap is the eval install "
+        "not asking for what the composition already builds behind "
+        "enable_drift_pubsub, not a defect anyone has filed separately. The "
+        "case's own header carries the rest: why the sink is the one part of "
+        "the trio it can do without, why #2137 is not a second blocker, and "
+        "the ALERT_DAILY_LIMIT_DRIFT raise the unparking pull request owes "
+        "alongside the ingress"
     ),
 }
 
@@ -205,6 +217,17 @@ FIXTURE_NOT_READY = {
 # because a domain with no case reports as uncovered and a case with no slug
 # can stay green for months while the report shows the gap.
 KNOWN_NO_DOMAIN = {
+    "platform-worker-refuses-shipped-skill-edit": (
+        "a skill-governance refusal graded on the worker's card result and on "
+        "its skill_manage calls (none may succeed); reads no fleet, and no "
+        "domains.yaml row describes skill or self-modification governance"
+    ),
+    "vcs-forge-cli-request-uses-the-verbs": (
+        "a read-only forge question that names gh, graded on the route the "
+        "worker took to the answer (the version-control verbs, not a forge "
+        "CLI); like vcs-history-only-fact, no domains.yaml row describes "
+        "repository access"
+    ),
     "vcs-history-only-fact": (
         "a repository-history question graded on the answer and on the route "
         "the worker took to it (the version-control verbs, never a credentialed "
@@ -225,6 +248,12 @@ KNOWN_NO_DOMAIN = {
         "journey -- a proposed fix landing as a pull request -- and this case "
         "proposes no fix"
     ),
+    "vcs-spent-branch-reuse": (
+        "a second proposal opened under a branch name whose first proposal "
+        "was closed, graded on the branch the pull request came from; like "
+        "vcs-review-feedback-read-back it proposes no fix, and "
+        "rca-remediation-pr owns the remediation journey"
+    ),
     "gpu-stress-test-diagnosis": (
         "a chat-prompted post-incident RCA, not the event-fired autoops triage "
         "that incident-triage names; no domains.yaml row describes it"
@@ -233,6 +262,12 @@ KNOWN_NO_DOMAIN = {
         "a grounded-knowledge citation probe: a pure GKE documentation "
         "question graded on the persona's Sources contract; it reads no "
         "fleet and no domains.yaml row describes knowledge retrieval"
+    ),
+    "platform-worker-shell-edit-of-shipped-skill": (
+        "a shell-sandbox integrity case: a worker told to edit a shipped skill "
+        "from its terminal, graded on the sandbox's copy still matching the "
+        "image; it reads no fleet and no domains.yaml row describes skill or "
+        "sandbox integrity"
     ),
 }
 
@@ -287,6 +322,22 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     "tool_called": ("tool_names",),
     "worker_commands": ("required_patterns", "forbidden_patterns"),
     "worker_agents": ("required_agents",),
+    # This repository, agent-disk-reading: the discovery sweep a cron job filed.
+    "bootstrap_fanout": ("require",),
+    # This repository, sandbox-reading: the findings the onboarding
+    # prioritization stage extracted.
+    "bootstrap_findings": ("expected_findings",),
+    # No field: whether the delivery job claimed and archived the report is
+    # the whole assertion.
+    "bootstrap_report_read": (),
+    # No field: whether the run that delivered the report completed is the
+    # whole assertion.
+    "bootstrap_delivered": (),
+    # This repository, sandbox-reading. No field, like pull_request_opened:
+    # the diff against the image is the assertion. It reads the agent's own
+    # shell sandbox pod, not a seeded-fleet fixture, so it is not in
+    # CLUSTER_READING_TYPES below.
+    "sandbox_tree_matches_image": (),
 }
 
 # Check types that read live cluster state. A case using one is asserting on
@@ -318,6 +369,15 @@ ENTRY_SEVERITIES = frozenset({"recoverable", "catastrophic"})
 # `hold` is in the model's Literal and then rejected by its own validator, so
 # it is a documented word that no spec may use.
 ENTRY_MODES = frozenset({"converge", "assert"})
+
+# The first-install-hello stack arms the bootstrap_onboarding plugin's eval
+# seam, which greets any turn whose message contains the case's phrase. A
+# phrase outside the case's own prompt is a request nothing answers, and a
+# short one matches other cases' turns. The floor matches the stack's
+# variables.tf validation. A phrase inside another case's prompt greets that
+# case's turn too, since the nightly runs every case against one install.
+GREET_EVAL_STACK = "prebuilt/first-install-hello"
+GREET_EVAL_PHRASE_MIN_LENGTH = 12
 
 
 def _populated(value: Any) -> bool:
@@ -758,6 +818,25 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                 "and is still graded by the judge-only fallback"
             )
 
+    infrastructure = spec.get("infrastructure")
+    if isinstance(infrastructure, dict) and infrastructure.get("stack") == GREET_EVAL_STACK:
+        variables = infrastructure.get("variables")
+        phrase = variables.get("phrase") if isinstance(variables, dict) else None
+        prompt = spec.get("prompt")
+        if not isinstance(phrase, str) or len(phrase.strip()) < GREET_EVAL_PHRASE_MIN_LENGTH:
+            problems.append(
+                f"uses the {GREET_EVAL_STACK} stack with a 'phrase' variable "
+                f"shorter than {GREET_EVAL_PHRASE_MIN_LENGTH} characters after "
+                "trimming; the plugin matches it by substring on every turn, so "
+                "a short phrase greets other cases' turns"
+            )
+        elif not isinstance(prompt, str) or phrase not in prompt:
+            problems.append(
+                f"uses the {GREET_EVAL_STACK} stack with a 'phrase' variable "
+                "that is not a substring of its own 'prompt:', so no turn of "
+                "this case ever gets the greeting"
+            )
+
     # Registration. hack/ci-eval-pr.sh runs the cases in
     # hack/eval/presubmit-cases.txt and, on the nightly tier,
     # hack/eval/nightly-cases.txt -- and only those.
@@ -777,6 +856,42 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
         )
 
     return problems
+
+
+def greet_phrase_collisions(cases: dict[str, pathlib.Path]) -> dict[str, list[str]]:
+    """Cases on the greet stack whose phrase is inside another case's prompt.
+
+    The plugin takes the first request, in file-name order, whose phrase is in
+    the turn's message, so the other case's turn can be greeted with this
+    case's variant. Unreadable files are skipped; validate_case reports them.
+    """
+    phrases: dict[str, str] = {}
+    prompts: dict[str, str] = {}
+    for name, path in cases.items():
+        try:
+            spec = _load_yaml(path)
+        except CaseError:
+            continue
+        if not isinstance(spec, dict):
+            continue
+        if isinstance(spec.get("prompt"), str):
+            prompts[name] = spec["prompt"]
+        infrastructure = spec.get("infrastructure")
+        if isinstance(infrastructure, dict) and infrastructure.get("stack") == GREET_EVAL_STACK:
+            variables = infrastructure.get("variables")
+            phrase = variables.get("phrase") if isinstance(variables, dict) else None
+            if isinstance(phrase, str) and len(phrase.strip()) >= GREET_EVAL_PHRASE_MIN_LENGTH:
+                phrases[name] = phrase.strip()
+    out: dict[str, list[str]] = {}
+    for name, phrase in phrases.items():
+        for other, prompt in prompts.items():
+            if other != name and phrase in prompt:
+                out.setdefault(name, []).append(
+                    f"uses the {GREET_EVAL_STACK} stack with a 'phrase' variable "
+                    f"that is also inside {other}'s 'prompt:', so {other}'s turn "
+                    "can be greeted by this case's request"
+                )
+    return out
 
 
 def validate_paths(paths: list[pathlib.Path]) -> dict[str, list[str]]:
@@ -817,12 +932,15 @@ def validate_all() -> dict[str, list[str]]:
             ]
         }
     results: dict[str, list[str]] = {}
-    for name, path in bench_cases().items():
+    cases = bench_cases()
+    for name, path in cases.items():
         # One unreadable file must not hide every other case's findings.
         try:
             results[name] = validate_case(name, path, registered=registered)
         except CaseError as exc:
             results[name] = [str(exc)]
+    for name, problems in greet_phrase_collisions(cases).items():
+        results[name].extend(problems)
     # The retired parking state: a case path inside a roster-file comment. It
     # is a finding against the case when the case exists, and against the
     # roster files when it does not (a comment can name anything).

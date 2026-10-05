@@ -7,8 +7,10 @@
   pre-amendment draft, never implemented; 0.3 added the ratified `authority` rules; 0.4
   moves the addressee into the task subjects, which is what makes connection-time
   authorization expressible on the task plane. Amended 9/9 without a version bump: the
-  supervisor gets its own task subject, and the identity half of the consumer rule flips
-  to subject-derived identity (the Verified identity section).
+  supervisor gets its own task subject, the identity half of the consumer rule flips
+  to subject-derived identity (the Verified identity section), and - once the capability
+  envelope armed later the same day - the authority half flips too, so `authority.grants`
+  becomes decision-grade by resolution (the Authority section).
 
 ## Purpose
 
@@ -143,7 +145,7 @@ lacked.
 | `from`                 | Required; only `from.session` is a presence rule. Never the source of identity or authority - both come from the subject an envelope was delivered on (Verified identity, below). On an identity-bearing subject `from` MUST agree with the writer the subject implies, and a disagreement is a protocol error, never a re-attribution. Refused on `…supervisor`, `…in` and the directory; on `…events` advisory as shipped - counted, and the envelope still published, delivered and folded - and hard only once an operator sets `A2A_STRICT_EVENTS_WRITER=true`. `from.profile` names the AgentProfile a worker runs as; mandatory (9/9) on the directory, where it is the profile binding. On a profile-addressed executor's events either it or `from.session` may carry the addressee token; neither alone is required. Display reads it; nothing decides on it. |
 | `to`                   | Optional, on every class - nothing requires it to be present. Addresses an envelope to a named session, and consumers on a wildcard MUST ignore envelopes addressed elsewhere. Where it IS present on any task subject it MUST agree with that subject's addressee token. Event envelopes carry no `to`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `identity`             | **Reserved and permanently null** (decided 9/9). Verified identity is a property of the delivery, not a field. See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `authority`            | **Reserved**, advisory. Populated by the chatops gateway only. See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `authority`            | Populated by the chatops gateway only. `requester` and `audience` stay advisory forever. `grants` is decision-grade **by resolution, never by reading it** - it carries a capability reference, and a consumer hands that reference to the verifier rather than trusting the block. See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `kind`                 | Required. Enum below; selects the payload type.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `payload`              | The A2A object, per kind.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 
@@ -166,26 +168,74 @@ One of them is now decided the other way.
   definition, which is the property being refused. So the library exposes verified
   identity as a property of the delivery, never as a field it parses. The rules are in
   the Verified identity section below.
-- `authority` will carry a _reference_ to an attenuating capability held in KV - who
+- `authority` carries a _reference_ to an attenuating capability held in KV - who
   originally asked, what scope they hold, what this hop is permitted to do, each further
   hop a strict subset - per the capability envelope design
   (`docs/architecture/09-capability-envelope.md`): no token format, nothing signed in the
   envelope, the message carries a lookup id. The A2A `auth-required` task state is
-  reserved alongside it.
+  reserved alongside it. **Armed 9/9**; the Authority section below states the rule.
 
 Rules (**amended 8/24**, ratified from the gateway design; **the identity half flipped
-9/9**): `identity` MUST NOT be populated by anyone, and an emitter that populates it is
-non-conforming. `authority` is populated by the chatops gateway at ingress and by nothing
-else - the verified requester and the audience snapshot, carried for audit and parity
-testing. It is advisory: nothing yet stops a bus client from inventing an `authority`
-block, so consumers MUST NOT make any authorization decision on it, and libraries MUST
-pass it through untouched. Consumers MAY decide on the **subject-derived identity** of an
-envelope on the task plane, under exactly the conditions the Verified identity section
-states; that is the identity half of the old "neither field" rule, and it is the only
-half that has flipped. The authority half flips when the capability envelope arms
-(`docs/architecture/09-capability-envelope.md`) and not before: a flip that read as
-covering both would license consumers to trust `authority.grants` while it is still
-null.
+9/9**, **the authority half 9/9 as well, once the envelope armed**): `identity` MUST NOT
+be populated by anyone, and an emitter that populates it is non-conforming. `authority`
+is populated by the chatops gateway at ingress and by nothing else. Consumers MAY decide
+on the **subject-derived identity** of an envelope on the task plane, under exactly the
+conditions the Verified identity section states, and MAY decide on `authority.grants`
+under exactly the conditions the Authority section states. Neither `requester` nor
+`audience` is ever decision-grade, and libraries MUST pass the whole block through
+untouched.
+
+### Authority
+
+`authority.requester` and `authority.audience` **stay advisory permanently**, for the
+same reason `identity` stays null: nothing stops a bus client from inventing them, so a
+consumer that authorizes on them is authorizing on attacker-supplied bytes. They are the
+audit trail, and they are pseudonymized. No conformance assertion may be written against
+them, and one written that way is a bug in the test.
+
+`authority.grants` is different, and the difference is the whole design. It carries a
+reference and nothing else:
+
+```json
+"grants": { "capability": { "key": "root.task-9f3c…", "revision": 412 } }
+```
+
+The tier and the scope are **deliberately not on the wire**. Putting them there would let
+a consumer authorize on content it did not verify, in the shape that looks most like
+working code - and that is the one thing 09 forbids.
+
+**The rule.** A consumer MAY treat `authority.grants` as decision-grade, subject to all
+four of:
+
+1. **It resolves the reference; it never reads it.** The decision is the verifier's
+   answer to "does this permit verb V on resource R", obtained over
+   `a2a.cap.verify.<caller>`. A consumer that parses the reference and infers anything
+   from its shape is non-conforming.
+2. **Absent or unresolvable is a refusal, not a pass.** `grants: null` on a task
+   submission means the executor refuses the task. This is the fail-closed direction and
+   it is the direction a relaxed implementation gets wrong; an executor MAY be configured
+   to relax it for a migration window, and MUST default to refusing.
+3. **The refusal is a terminal task event, not a log line.** A refused submission goes to
+   `rejected` on the task's own event subject with a machine-readable reason, before any
+   model spend. A refusal only an operator can see is not a refusal the protocol can be
+   tested against.
+4. **The verifier authenticates the caller from the subject, so the consumer must be the
+   principal it claims to be.** This is the identity half, and it is why the authority
+   half could not flip first: the verifier's answer is "does this capability permit this
+   caller", and without subject-derived identity there is no trustworthy caller to name.
+   A consumer resolving over another principal's verify token is refused by the server,
+   not by the verifier.
+
+**`grants: null` is not deprecated.** A turn with no task behind it - a status ask, a
+refusal the gateway answers itself - carries null and always will. Null means "no
+capability accompanies this", which rule 2 turns into a refusal wherever a capability is
+required. It does not mean "unarmed".
+
+**What this does not give a consumer.** It does not answer "who is the human". The chain
+terminates at a request id, not a person; `authority.requester` names a pseudonymized
+principal and is advisory. It does not expire - 09 §5 is explicit that nothing carries an
+issue time or a use count, so a resolvable reference is resolvable indefinitely, and a
+consumer MUST NOT read a successful resolution as evidence the request is still live.
 
 ### Kinds and payload types
 
@@ -337,7 +387,16 @@ artifact, and four names are reserved so renderers and audit tooling can rely on
 | `progress` | Agent-authored milestones, renderable to chat at zero model cost. Stage 1 derives these from model narration; the subagent framework spec records the deviation |
 
 Artifact names are data, so the set can grow without touching the envelope; only these
-four carry reserved semantics.
+four carry reserved semantics. An `activity` entry is one `data` part whose object carries
+`tool`, `input` when the call had one, and may carry `callId`, `status` (`completed`, `error`,
+`interrupted` for a call still open at the terminal, or `truncated` on the one entry an executor
+publishes in place of the calls missing from the trace: past its budget, failed to publish,
+or unreported at its drain; `dropped` counts them all, and a delivery the executor could not
+read or refused over its body cap is outside it, logged, the call it belonged to in the trace
+as `interrupted` when its opening delivery arrived and whole from the closing one when the
+opening one was unreadable; over the cap the closing delivery is larger still, so that call is absent), `errorType` (the executor's own word for
+an error), `durationMs` and `at`; the library
+validates the part kind (assertion 18), and a reader tolerates the keys it does not know.
 
 ## Verified identity (added 9/9)
 
@@ -505,7 +564,11 @@ Envelope:
    require them, nor one whose `taskId` or addressee fails the dot-free token rule.
 3. The library never populates `identity`. It populates `authority` only on the gateway's
    ingress path; every other producer emits it null. Inbound values are passed through
-   byte-identical and are not consulted for any decision.
+   byte-identical and are not consulted for any decision **by the library**. That is a
+   statement about the library, not about consumers: an executor does decide on
+   `authority.grants`, by resolving the reference against the verifier under the Authority
+   section's four conditions, and it is still the case that nothing decides by reading the
+   block.
 4. A consumer on a wildcard ignores envelopes whose `to` names another session, and an
    envelope whose `to` disagrees with its subject's addressee token is surfaced as a
    protocol error. (Refined 9/9: checking a `to` that is present is every task subject's

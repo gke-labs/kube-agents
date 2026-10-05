@@ -143,18 +143,23 @@ differently at each:
   an install that will never run the detector does not carry the harness triple twice under a
   second set of names.
 
-**It is off unless an install asks for it**, where the watcher is on unless an install switches it
-off. `spec.harness.driftDetector.enabled` defaults to `false`, and the chart's
+**The field is off unless something turns it on, where the watcher is on unless something switches
+it off** — but through `install.sh` both end up on, because the installer sets this field by
+default. `spec.harness.driftDetector.enabled` defaults to `false`, and the chart's
 `platformAgent.harness.driftDetector.enabled` leaves the field out altogether until it is set. The
 reason is the subscription: it exists only where
 [`terraform/modules/drift-pubsub`](../../../terraform/modules/drift-pubsub/) was applied. The
 subscription is not checked at startup, so a detector started without one does not fail loudly: it
 comes up, retries a pull that will never succeed for the life of the pod, and reports nothing. The
 supervisor never sees an exit and the pod stays Ready, which is why the default has to be off rather
-than merely documented. Get the subscription first, then set the field:
+than merely documented. The subscription has to exist before the field is set, and
 [`terraform/examples/full-install`](../../../terraform/examples/full-install/README.md#drift-audit-log-ingress)
-instantiates the module for you behind `enable_drift_pubsub = true`, and an install that does not
-use the composition applies the module itself.
+enforces that ordering rather than leaving it to you: `enable_drift_pubsub = true` instantiates the
+module, `enable_drift_detector = true` writes the field, and a precondition refuses an apply asking
+for the second without the first. Both come from one `ENABLE_DRIFT_DETECTOR` key through the
+installer front doors, which defaults to `true`, so a front-door install gets the pair without
+asking; `ENABLE_DRIFT_DETECTOR=false` in `install.env` is the opt-out. An install that does not use
+the composition applies the module itself and sets the field by hand, in that order.
 
 Enabling it is necessary and not sufficient: the operator also requires `spec.harness.projectId`,
 `.location` and `.clusterName`, because `--cluster-name` is checked at startup against the cluster

@@ -91,6 +91,21 @@ const (
 	// any install whose working directories were larger than the guess.
 	agentDataStorageSize = "10Gi"
 	credentialProxyPort  = 8765
+	// credentialProxyMetricsPort is the broker's metrics-only listener, beside
+	// Envoy's credentialProxyPort. Its own port so that the managed-Prometheus
+	// collector is admitted to a listener that serves counters and nothing
+	// else, and the credentialed port keeps admitting only the sandbox and the
+	// gateway. One constant for the container port, the value of
+	// CREDENTIAL_PROXY_METRICS_PORT the runtime binds, and the collector's
+	// ingress rule; the chart's PodMonitoring scrapes it by number, held to
+	// this one by tests/test_chart_platform_agent_monitoring.py.
+	credentialProxyMetricsPort     int32 = 8766
+	credentialProxyMetricsPortName       = "cred-metrics"                  // #nosec G101 -- Container port name, not a credential
+	credentialProxyMetricsPortEnv        = "CREDENTIAL_PROXY_METRICS_PORT" // #nosec G101 -- Environment variable name, not hardcoded credentials
+	// credentialProxyPortEnv tells the runtime the credentialed port, so its
+	// refusal of a metrics port equal to it compares against the number the
+	// operator renders rather than the runtime's own default.
+	credentialProxyPortEnv = "CREDENTIAL_PROXY_PORT" // #nosec G101 -- Environment variable name, not hardcoded credentials
 	// dashboardPort is the port `hermes dashboard` listens on. It is loopback-only
 	// (see the readiness probe in buildBaseContainers), so the container port, the
 	// Service port, and the NetworkPolicy rule below all describe a listener that
@@ -321,14 +336,23 @@ type scopeDeclaration struct {
 	// and retires nothing, because the ordinary way a block goes missing is a write
 	// through an older operator's webhook, not an operator dropping every project. An
 	// empty `projects` list in a present block is the declaration that drops projects.
-	Present        bool                    `json:"present"`
-	Projects       []string                `json:"projects"`
-	Folders        []string                `json:"folders"`
-	Organizations  []string                `json:"organizations"`
-	SharedVpcHosts []string                `json:"sharedVpcHosts"`
-	MetricsScopes  []string                `json:"metricsScopes"`
-	Exclude        scopeExcludeDeclaration `json:"exclude"`
+	Present        bool     `json:"present"`
+	Projects       []string `json:"projects"`
+	Folders        []string `json:"folders"`
+	Organizations  []string `json:"organizations"`
+	SharedVpcHosts []string `json:"sharedVpcHosts"`
+	MetricsScopes  []string `json:"metricsScopes"`
+	// MaxProjects is the resolved-set cap in force: spec.scope.maxProjects, or its
+	// default when the field is unset, so the reconcile reads the cap it runs under
+	// from the file rather than from a constant of its own.
+	MaxProjects int32                   `json:"maxProjects"`
+	Exclude     scopeExcludeDeclaration `json:"exclude"`
 }
+
+// defaultScopeMaxProjects is the CRD's default for spec.scope.maxProjects, rendered
+// when the field is unset (a CR admitted before the field existed is served without
+// it until the CRD defaults it on the next write).
+const defaultScopeMaxProjects int32 = 100
 
 type scopeExcludeDeclaration struct {
 	Projects []string                        `json:"projects"`
@@ -355,10 +379,14 @@ func renderScopeJSON(agent *agentv1alpha1.PlatformAgent) string {
 		Organizations:  append([]string{}, scope.Organizations...),
 		SharedVpcHosts: append([]string{}, scope.SharedVpcHosts...),
 		MetricsScopes:  append([]string{}, scope.MetricsScopes...),
+		MaxProjects:    defaultScopeMaxProjects,
 		Exclude: scopeExcludeDeclaration{
 			Projects: []string{},
 			Clusters: []agentv1alpha1.ScopeClusterRef{},
 		},
+	}
+	if scope.MaxProjects != nil {
+		decl.MaxProjects = *scope.MaxProjects
 	}
 	if scope.Exclude != nil {
 		decl.Exclude.Projects = append(decl.Exclude.Projects, scope.Exclude.Projects...)
@@ -1250,8 +1278,8 @@ func frontDoorOverlay(agent *agentv1alpha1.PlatformAgent) map[string]any {
 }
 
 // memoryProviderIsHindsightBacked reports whether a provider talks to the in-cluster
-// Hindsight service. Keep in sync with memory_provider_uses_hindsight in
-// scripts/installer/common.sh, which decides whether to deploy it.
+// Hindsight service. Keep in sync with kube-agents.hindsightEnabled in
+// charts/kube-agents/templates/_helpers.tpl, which decides whether to deploy it.
 func memoryProviderIsHindsightBacked(provider string) bool {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case kubeAgentsMemoryProvider, "hindsight":
@@ -1512,26 +1540,65 @@ func filterValidAgentPlugins(agentPlugins []*agentv1alpha1.AgentPlugin) []*agent
 	return valid
 }
 
+// gitopsRefusalWithholdsManaged reports whether a refused gitops repository is
+// keeping accepted managed ones out of managed_repos, as the seed below does.
+func gitopsRefusalWithholdsManaged(resolved *agentv1alpha1.ResolvedIntegration) bool {
+	return resolved != nil && resolved.GitOps() != nil &&
+		len(resolved.Accepted(agentv1alpha1.RepositoryRoleGitOps)) == 0 &&
+		len(resolved.Accepted(agentv1alpha1.RepositoryRoleManaged)) > 0
+}
+
 // buildGitopsStateConfigMap generates the ConfigMap manifest containing runtime state (e.g. repos)
 func buildGitopsStateConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
 	data := map[string]string{}
 
-	// Extract primary repository from CR Spec if provided
-	if agent.Spec.Integration != nil && agent.Spec.Integration.GitHub != nil {
-		gitRepo := strings.TrimSpace(agent.Spec.Integration.GitHub.GitRepo)
-		org := strings.TrimSpace(agent.Spec.Integration.GitHub.Org)
-		if gitRepo != "" && gitRepo != "None" {
-			if err := agentv1alpha1.ValidateGitRepoURLWithOrg(gitRepo, org); err == nil {
-				if cleanedURL, err := agentv1alpha1.CleanRepoURLWithOrg(gitRepo, org); err == nil {
-					entries := []agentv1alpha1.ManagedRepoEntry{
-						{Type: "github", URL: cleanedURL},
+	// Seed the declared repositories from the CR spec: the GitOps repository and
+	// the managed ones into managed_repos, GitOps first, and the context ones
+	// into context_repos. Each entry's `type` is its forge's provider, which is
+	// how the discriminator reaches the agent — written down rather than
+	// inferred from the URL's text. Only entries Problems accepts are seeded:
+	// with the webhook off, nothing else stops a refused one reaching the
+	// agent and the minter. The token refresh mints for the first
+	// managed_repos entry when no repository is named, so while a declared
+	// gitops repository is refused no managed one is seeded either: it would
+	// take that place.
+	if agent.Spec.Integration != nil {
+		resolved, err := agent.Spec.Integration.ResolveGit()
+		if err != nil {
+			manifestsLog.Info("Skipping initial configmap seed due to conflicting git integration", "error", err)
+		} else {
+			seedEntries := func(repos []*agentv1alpha1.ResolvedRepository) []agentv1alpha1.ManagedRepoEntry {
+				var entries []agentv1alpha1.ManagedRepoEntry
+				for _, repo := range repos {
+					entry, err := repo.ManagedRepoEntry()
+					if err != nil {
+						// By field, not value: a clone URL can carry a token.
+						manifestsLog.Info("Skipping initial configmap seed of an unparseable or invalid repository",
+							"index", repo.Index, "forge", repo.ForgeName, "role", repo.Role)
+						continue
 					}
-					if jsonBytes, err := json.Marshal(entries); err == nil {
-						data["managed_repos"] = string(jsonBytes)
-					}
+					entries = append(entries, entry)
+				}
+				return entries
+			}
+			managed := seedEntries(resolved.Accepted(agentv1alpha1.RepositoryRoleGitOps))
+			if len(managed) == 0 && resolved.GitOps() != nil {
+				if gitopsRefusalWithholdsManaged(resolved) {
+					manifestsLog.Info("Skipping initial configmap seed of the managed repositories: the gitops repository is refused")
 				}
 			} else {
-				manifestsLog.Info("Skipping initial configmap seed due to unparseable or invalid GitRepo", "raw", gitRepo, "error", err)
+				managed = append(managed, seedEntries(resolved.Accepted(agentv1alpha1.RepositoryRoleManaged))...)
+			}
+			for key, entries := range map[string][]agentv1alpha1.ManagedRepoEntry{
+				gitopsStateManagedReposKey: managed,
+				gitopsStateContextReposKey: seedEntries(resolved.Accepted(agentv1alpha1.RepositoryRoleContext)),
+			} {
+				if len(entries) == 0 {
+					continue
+				}
+				if jsonBytes, err := json.Marshal(entries); err == nil {
+					data[key] = string(jsonBytes)
+				}
 			}
 		}
 	}
@@ -1547,6 +1614,24 @@ func buildGitopsStateConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.Confi
 		},
 		Data: data,
 	}
+}
+
+// seededGitOpsEntry is the managed_repos entry the CR's GitOps repository
+// seeds, or nil when it declares none or declares an invalid one.
+func seededGitOpsEntry(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.ManagedRepoEntry {
+	if agent.Spec.Integration == nil {
+		return nil
+	}
+	resolved, err := agent.Spec.Integration.ResolveGit()
+	if err != nil {
+		return nil
+	}
+	for _, repo := range resolved.Accepted(agentv1alpha1.RepositoryRoleGitOps) {
+		if entry, err := repo.ManagedRepoEntry(); err == nil {
+			return &entry
+		}
+	}
+	return nil
 }
 
 // renderConfigYAML builds the MANAGED config the pod runs under.
@@ -2144,6 +2229,9 @@ type renderOptions struct {
 	// otlpEndpoint because empty already means the managed collector, and the two
 	// outcomes need opposite manifests.
 	otlpDisabled bool
+	// heldGitHubOrg is the GITHUB_ORG the live gateway carries, set only while
+	// the declaration cannot name the organisation (see heldGitHubOrg).
+	heldGitHubOrg string
 }
 
 // lastWinsEnv drops every entry a later entry of the same name supersedes, keeping the
@@ -2384,6 +2472,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		sidecars = stripContainerMountsNamed(sidecars, droppedSources)
 		sidecarVolumes = a2aStripBusCredentialSources(sidecarVolumes, agent.Name)
 		extraVolumes = a2aStripBusCredentialSources(extraVolumes, agent.Name)
+
+		// Last, after every strip: the executor environment the pod cannot
+		// resolve for itself. Ordering is not incidental -- the strips above
+		// remove what a sidecar must not hold, and this adds what one that
+		// executes tasks cannot run without. See a2aExecutorSidecarEnv.
+		sidecars = a2aExecutorSidecarEnv(sidecars)
 	}
 
 	homeDir := "/opt/data"
@@ -2621,22 +2715,24 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				})
 			}
 		}
-		if github := integration.GitHub; github != nil {
-			org := strings.TrimSpace(github.Org)
-			if org == "" && github.GitRepo != "" {
-				if cleaned, err := agentv1alpha1.CleanRepoSlug(github.GitRepo); err == nil {
-					parts := strings.SplitN(cleaned, "/", 2)
-					if len(parts) == 2 {
-						org = parts[0]
-					}
-				}
-			}
-			if org != "" {
-				envVars = append(envVars, corev1.EnvVar{
-					Name:  "GITHUB_ORG",
-					Value: org,
-				})
-			}
+		// GITHUB_ORG still names GitHub because that is what the agent reads it
+		// as; docs/designs/version-control-support.md §2 renames the vocabulary,
+		// and doing it here would rename a variable the pod's scripts still spell
+		// the old way. Until then it names the primary GitHub forge's namespace,
+		// and is unset when no GitHub forge is declared. While the declaration
+		// cannot name it, the pod keeps the one it has, as the minter does.
+		org := ""
+		if resolved, err := integration.ResolveGit(); err == nil {
+			org = resolved.PrimaryNamespace(agentv1alpha1.GitProviderGitHub)
+		}
+		if org == "" {
+			org = opts.heldGitHubOrg
+		}
+		if org != "" {
+			envVars = append(envVars, corev1.EnvVar{
+				Name:  "GITHUB_ORG",
+				Value: org,
+			})
 		}
 		if teams := integration.Teams; teams != nil && teams.Enabled != nil && *teams.Enabled {
 			allowAll := false
@@ -2797,12 +2893,14 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// The Hermes base image sets HERMES_WRITE_SAFE_ROOT=/opt/data, which is the agent's
 	// own home while the shell is local. agent/file_safety.py checks the path prefix in
 	// the agent process before the write is routed anywhere, so with the shell in the
-	// sandbox this has to name the sandbox's writable directories or write_file and
-	// patch return "Write denied" for everything — which is how the earlier value was
-	// found wrong on a live install. The sandbox's data volume carries the same
-	// /opt/data path deliberately, so the interesting half of this is the ephemeral
-	// home; the value is written out rather than left to the image default so the
-	// policy is visible in the pod spec. It gives up no isolation: with backend: ssh
+	// sandbox this has to name sandbox paths or write_file and patch return "Write
+	// denied" for everything — which is how the earlier value was found wrong on a
+	// live install. The sandbox's data volume carries the same /opt/data path
+	// deliberately. /home/agent is listed too, but current sandbox images make it
+	// root-owned (deploy/sandbox/Dockerfile), so a write there passes this check and
+	// then fails on the directory's mode. The value is written out rather than left
+	// to the image default so the policy is visible in the pod spec. It gives up no
+	// isolation: with backend: ssh
 	// the file tools cannot reach the agent's own filesystem to begin with.
 	//
 	// TERMINAL_CWD is what stops the agent working in a directory that does not
@@ -3140,11 +3238,11 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 // Past the deadline the Deployment reports ProgressDeadlineExceeded and any
 // caller's wait returns early however long it asked for, so a gate raised above
 // this number buys nothing. Kubernetes defaults it to 600s, which is *below*
-// the 605s cold boot agentAPIProbe(10, 60) already sanctions — the kubelet is
-// told to tolerate a boot the Deployment gives up on. 1200s clears the 900s
+// the 905s cold boot agentAPIProbe(10, 90) already sanctions — the kubelet is
+// told to tolerate a boot the Deployment gives up on. 1800s clears the 1500s
 // deploy gate in upgrade.sh. hindsight-api
 // carries an explicit 900 for the same reason; see tests/test_hindsight_probes.py.
-const gatewayProgressDeadlineSeconds int32 = 1200
+const gatewayProgressDeadlineSeconds int32 = 1800
 
 // buildDeployment generates the Deployment manifest for the agent payload
 func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, opts renderOptions) *appsv1.Deployment {
@@ -3880,6 +3978,16 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		{Name: "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS", Value: credentialProxyMaxConcurrentCommands},
 		{Name: "CREDENTIAL_PROXY_STATE_DIR", Value: "/var/lib/credential-proxy"},
 		{Name: "CREDENTIAL_PROXY_UNIX_SOCKET", Value: "/var/run/credential-proxy/backend.sock"},
+		// The credentialed port, the same constant the container port and the
+		// policy are rendered from: the runtime refuses a metrics port equal to
+		// it before binding, so its idea of that port has to be the operator's.
+		// Envoy's listener carries the same number in its config, held to this
+		// constant by the runtime's OperatorContractTest.
+		{Name: credentialProxyPortEnv, Value: strconv.Itoa(credentialProxyPort)},
+		// The metrics-only listener's port (see credentialProxyMetricsPort). In
+		// the managed set, so a spec.deployment.env entry cannot move the
+		// listener off the port the container declares and the policy admits.
+		{Name: credentialProxyMetricsPortEnv, Value: strconv.Itoa(int(credentialProxyMetricsPort))},
 		{Name: "KUBECONFIG", Value: "/var/run/event-watcher/watcher.config"},
 		{Name: "KSA_TOKEN_FILE", Value: "/var/run/secrets/kubeagents/serviceaccount/token"},
 		{Name: "TOKEN_BROKER_URL", Value: fmt.Sprintf("http://github-token-minter.%s.svc.cluster.local:8080/token", agent.Namespace)},
@@ -3934,6 +4042,20 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		// either order without chat answering 403 in between.
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_CHAT_AUDIENCE", Value: credentialProxyChatAudience},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: allowedBrokerCallers(agent)},
+	)
+	if a2aSessionClusterViewEnabled(agent) {
+		// The session pods' audience. Rendered only with the flag, so a
+		// broker on an install without it has no session role to confer
+		// and a stray session token is "another audience", 401.
+		envVars = append(envVars,
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_SESSION_AUDIENCE", Value: credentialProxySessionAudience},
+			// And the ServiceAccount bound to it, both ways: the session
+			// pods may present only the session audience, and nobody else
+			// may present it.
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_SESSION_CALLERS", Value: a2aSessionBrokerCaller(agent)},
+		)
+	}
+	envVars = append(envVars,
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_CONTENT_WORKSPACE", Value: "1"},
@@ -4036,6 +4158,12 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// could set the subscription would arm a second Chat consumer on
 		// whatever the broker's credential can pull.
 		"CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE",
+		// And one that could set CREDENTIAL_PROXY_SESSION_AUDIENCE to the
+		// shell's audience would hand the session the shell's role.
+		"CREDENTIAL_PROXY_SESSION_AUDIENCE",
+		// One that could set the session callers could unbind the session
+		// ServiceAccount from its audience, or bind another to it.
+		"CREDENTIAL_PROXY_SESSION_CALLERS",
 		"A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME",
 		"CREDENTIAL_PROXY_BOOTSTRAP_COMMAND",
 		// The listen address is reserved for the placements as well as for the
@@ -4063,7 +4191,12 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		"CREDENTIAL_PROXY_MAX_OUTPUT_BYTES",
 		"CREDENTIAL_PROXY_MAX_REQUEST_BYTES",
 		"CREDENTIAL_PROXY_POLICY",
-		"CREDENTIAL_PROXY_PORT",
+		// Both port variables are in the broker's `managed` (buildCredentialProxyEnv)
+		// and so reserved there by the loop above; listed for buildAgentAPIAuthEnv,
+		// whose managed set carries neither, and whose credential_proxy.py parses
+		// CREDENTIAL_PROXY_PORT as an integer before the api-proxy role returns.
+		credentialProxyPortEnv,
+		credentialProxyMetricsPortEnv,
 		"CREDENTIAL_PROXY_ROLE",
 		// Same argument as the authentication settings above, one layer over.
 		// A plugin that could set CREDENTIAL_PROXY_SCOPED_SA_POOL would switch
@@ -4162,6 +4295,19 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// on stderr, reported in chat like any other script failure) before the
 	// script arms or prints, so an arbitrary value reaches nothing but that
 	// one message and its own failure report.
+	//
+	// KAGE_SLACK_UX switches between code paths already in the image, all of
+	// them about Slack: which reaction goes on an ask and when it settles, how
+	// much of a delegated card's delivery posts in the thread, whether a
+	// thread's cards show as one plan message, the session status and title
+	// Slack shows on the thread, and whether the harness's own Slack messages
+	// (the scheduled-report wrapper, the heartbeat, restart and shutdown
+	// notices, command and system replies) are reworded or left out. It is
+	// compared against `FLAG_ON_VALUES` in `slack_presenter.py`; any other
+	// value is off, the image default. It names no path, URL, credential or
+	// image, and no value of it adds a destination or a credential: its writes
+	// go only to Slack, in the channels and threads the gateway already
+	// serves.
 	allowed := map[string]struct{}{
 		"ALERT_DAILY_LIMIT_CRITICAL": {},
 		// Not a severity, unlike its three neighbours: the drift detector's
@@ -4176,6 +4322,7 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		"EOD_EXCLUDE_NAMESPACES":      {},
 		"FEEDBACK_PROMPT_DELAY":       {},
 		"FEEDBACK_PROMPT_ENABLED":     {},
+		"KAGE_SLACK_UX":               {},
 		envHermesOtelEnabled:          {},
 		"OTEL_EXPORTER_OTLP_ENDPOINT": {},
 		"OTEL_EXPORTER_OTLP_PROTOCOL": {},
@@ -4183,6 +4330,9 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		"OTEL_SDK_DISABLED":           {},
 		"OTEL_SERVICE_NAME":           {},
 	}
+	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
+	// default suggested prompts (`apply_slack_agent_view.py`), under the same
+	// bound: fixed strings in the image, chosen by the flag and nothing else.
 	var result []corev1.EnvVar
 	for _, env := range custom {
 		// Only literal values are copied. A ValueFrom source can reference a
@@ -4554,7 +4704,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 			// The bearer key is the non-secret loopback sentinel already in this
 			// container's env, and API_SERVER_ENABLED is unconditionally true above,
 			// so the probe is valid in every configuration.
-			StartupProbe:    agentAPIProbe(10, 60),
+			StartupProbe:    agentAPIProbe(10, 90),
 			ReadinessProbe:  agentAPIProbe(15, 3),
 			SecurityContext: hardenedSecurityContext(),
 		},
@@ -5091,7 +5241,27 @@ func getConfigMapHash(configMap *corev1.ConfigMap) (string, error) {
 	return fmt.Sprintf("%x", hash), nil
 }
 
-// buildFluentBitConfigMap generates the ConfigMap manifest containing fluent-bit.conf
+// buildFluentBitConfigMap generates the ConfigMap manifest containing fluent-bit.conf.
+//
+// Three parser passes run over every line the sidecar tails. gchat_event lifts
+// the chat user and session out of the gateway's own lines. The other two are
+// the audit trail's: hermes_audit_line recognises a line the tool_call_audit
+// plugin or the chat_message_audit hook wrote — Hermes' timestamp, level and
+// logger name, then one JSON object — and captures the object as audit_json;
+// audit_json then decodes it into top-level fields and drops the capture. A
+// line neither parser matches passes through untouched, and the raw line stays
+// under `log` either way, so Cloud Logging carries the record's fields as its
+// own jsonPayload keys (event_type, tool, status, ...) beside the text every
+// existing reader still greps. The lift is what makes an audit record
+// filterable without a regex; the record's shape is common/audit_schema.py's.
+//
+// The line prefix the regex reads is Hermes' own log format, which this
+// repository does not own: `%(asctime)s %(levelname)s%(session_tag)s %(name)s:
+// %(message)s` in the pinned image's hermes_logging.py, where session_tag is
+// ` [<session id>]` on a record emitted on a thread that holds a session
+// context and empty otherwise. Both forms have to match, or the records of
+// tools Hermes runs inline on the turn thread would pass through unlifted and
+// silently. TestFluentBitLiftsAuditRecordsIntoFields carries a sample of each.
 func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{
@@ -5130,6 +5300,22 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
     Preserve_Key  On
 
 [FILTER]
+    Name          parser
+    Match         agent.logs
+    Key_Name      log
+    Parser        hermes_audit_line
+    Reserve_Data  On
+    Preserve_Key  On
+
+[FILTER]
+    Name          parser
+    Match         agent.logs
+    Key_Name      audit_json
+    Parser        audit_json
+    Reserve_Data  On
+    Preserve_Key  Off
+
+[FILTER]
     Name              record_modifier
     Match             agent.logs
     Record            app agent
@@ -5144,6 +5330,15 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
     Name    gchat_event
     Format  regex
     Regex   User=(?<gchat_user>[^,\s]+),\s*Session=(?<gchat_session>[^,\s]+)
+
+[PARSER]
+    Name    hermes_audit_line
+    Format  regex
+    Regex   ^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} [A-Z]+(?: \[[^\]]*\])? hermes\.(?:plugin\.tool_call_audit|hook\.chat_message_audit): (?<audit_json>\{.*\})$
+
+[PARSER]
+    Name    audit_json
+    Format  json
 `,
 		},
 	}
@@ -5340,6 +5535,10 @@ func isFQDNNetworkPolicyEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 
 // buildFQDNNetworkPolicy generates the companion FQDNNetworkPolicy (networking.gke.io/v1alpha1)
 // for GKE Dataplane V2 clusters when enable-fqdn-network-policy annotation is set.
+//
+// It selects the gateway pod only. The credential broker, which is the pod that
+// actually calls the forge, is not covered by it; how the broker's egress should
+// be narrowed is an open question in docs/designs/version-control-support.md.
 func buildFQDNNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *unstructured.Unstructured {
 	patterns := []string{
 		// Google APIs & GCP Services (Vertex AI, GKE, Cloud Logging/Monitoring, Workload Identity)
@@ -5367,10 +5566,17 @@ func buildFQDNNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *unstructured.Un
 		"*.gcr.io",
 		"pkg.dev",
 		"*.pkg.dev",
-		// GitOps & Source Control
-		"github.com",
-		"*.github.com",
-		"*.githubusercontent.com",
+	}
+	// GitOps & Source Control: derived from the forge declaration, so a forge
+	// at a customer-chosen hostname is reachable without a literal here. Kept
+	// in its old position in the list, so an upgrade re-renders a GitHub
+	// install's policy byte for byte.
+	var integration *agentv1alpha1.IntegrationSpec
+	if agent != nil && agent.Spec.Integration != nil {
+		integration = &agent.Spec.Integration.IntegrationSpec
+	}
+	patterns = append(patterns, agentv1alpha1.ForgeEgressPatterns(integration)...)
+	patterns = append(patterns,
 		// Chat Integrations
 		"slack.com",
 		"*.slack.com",
@@ -5380,7 +5586,7 @@ func buildFQDNNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *unstructured.Un
 		"*.login.microsoftonline.com",
 		"botframework.com",
 		"*.botframework.com",
-	}
+	)
 
 	matches := make([]interface{}, 0, len(patterns))
 	for _, p := range patterns {

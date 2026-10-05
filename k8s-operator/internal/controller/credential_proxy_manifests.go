@@ -73,9 +73,11 @@ const (
 	//
 	// CPU is sized for a cold pod. After an eviction the replacement passes
 	// its readiness probe five seconds in, and the first mints then arrive
-	// while gcloud and the Minty client are still warming up, each bounded by
-	// GCLOUD_TIMEOUT_SECONDS and MINTY_REQUEST_TIMEOUT_SECONDS in
-	// agents/platform/scripts/github_token_refresh.py. Observed on Autopilot,
+	// while the Minty client is still warming up, bounded by
+	// MINTY_REQUEST_TIMEOUT_SECONDS in agents/platform/scripts/github_token_refresh.py
+	// (gcloud, bounded by GCLOUD_TIMEOUT_SECONDS there, was on this path when
+	// the numbers below were taken; it is now the fallback behind the metadata
+	// server). Observed on Autopilot,
 	// the composition's default, where a pod without bursting has its CPU
 	// limit clamped to its request: at 100m the request was the ceiling, the
 	// calls timed out for minutes after a start and one throttled pod kept
@@ -144,11 +146,13 @@ func credentialProxyName(agent *agentv1alpha1.PlatformAgent) string {
 }
 
 // credentialProxySelector reproduces the labels the pre-#368 standalone proxy
-// carried, down to the component label nothing reads any more. A Deployment's
-// spec.selector is immutable, so an install old enough to still have that
-// Deployment — one that has not reconciled since #368's cleanup removed it —
-// would otherwise fail the apply and wedge the whole reconcile rather than
-// adopting the object.
+// carried, component label included. A Deployment's spec.selector is
+// immutable, so an install old enough to still have that Deployment — one
+// that has not reconciled since #368's cleanup removed it — would otherwise
+// fail the apply and wedge the whole reconcile rather than adopting the
+// object. The chart's PodMonitoring for the broker selects on both labels as
+// well (tests/test_chart_platform_agent_monitoring.py holds it to them), so a
+// change here is a change there.
 func credentialProxySelector(agent *agentv1alpha1.PlatformAgent) map[string]string {
 	return map[string]string{
 		"app":                           credentialProxyName(agent),
@@ -321,7 +325,12 @@ func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent) corev1.Co
 		ImagePullPolicy: pullPolicy,
 		Command:         []string{"/usr/local/bin/start-services"},
 		Env:             envVars,
-		Ports:           []corev1.ContainerPort{{Name: "cred-proxy", ContainerPort: credentialProxyPort}},
+		Ports: []corev1.ContainerPort{
+			{Name: "cred-proxy", ContainerPort: credentialProxyPort},
+			// The runtime's metrics-only listener, for the chart's PodMonitoring
+			// (see credentialProxyMetricsPort).
+			{Name: credentialProxyMetricsPortName, ContainerPort: credentialProxyMetricsPort},
+		},
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
 				Path: "/healthz", Port: intstr.FromString("cred-proxy"),
@@ -460,36 +469,69 @@ func buildCredentialProxyFederationVolume(agent *agentv1alpha1.PlatformAgent) []
 }
 
 // buildCredentialProxyNetworkPolicy narrows who may reach the endpoint down to
-// the two callers that have a reason to: the sandbox, whose wrapped CLIs are the
-// proxy's purpose, and the gateway, which pulls chat events from the relay
-// hosted here. TokenReview already rejects a caller this pod does not serve;
-// this is the layer that keeps such a caller from opening the connection.
+// the callers that have a reason to: the sandbox, whose wrapped CLIs are the
+// proxy's purpose; the gateway, which pulls chat events from the relay hosted
+// here; and, under the cluster-view flag, the session pods. TokenReview already
+// rejects a caller this pod does not serve; this is the layer that keeps such a
+// caller from opening the connection.
+//
+// A second rule admits the managed-Prometheus collector, from its own
+// namespace and to the metrics-only port alone: the runtime serves its counters
+// on credentialProxyMetricsPort rather than behind Envoy so that the collector
+// never has a route to the credentialed listener, and that is the port this
+// rule opens.
 //
 // Ingress only. Egress is left open because this pod is the one that talks to
 // the world — GKE control planes, the Google Chat and Slack APIs, the token
 // broker. buildAgentEgressNetworkPolicy enumerates the agent Pod's egress and
 // deliberately leaves this one alone.
 //
+// The session-pod peer admitted under the cluster-view flag is the bare
+// part-of/component pair, because the spawner stamps no instance label. The
+// webhook admits one PlatformAgent per cluster, so no other agent's session
+// pods share this namespace; were that rule relaxed, this fence would admit
+// them too, and what refuses them is the broker itself: TokenReview against
+// CREDENTIAL_PROXY_ALLOWED_CALLERS and the session-callers binding.
+//
 // Inert on a cluster whose CNI does not implement NetworkPolicy. It is a control
 // where it is enforced and a statement of intent where it is not.
 func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
 	tcp := corev1.ProtocolTCP
+	callers := []networkingv1.NetworkPolicyPeer{
+		{PodSelector: &metav1.LabelSelector{MatchLabels: shellSandboxSelector(agent)}},
+		{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": agent.Name + "-gateway"}}},
+	}
+	if a2aSessionClusterViewEnabled(agent) {
+		// The session pods, under the cluster-view flag: the same selector
+		// the session fence and the bus fence name, on the credentialed port
+		// only. TokenReview, the session audience and the session-callers
+		// binding keep this peer to the session role; this is the layer
+		// that lets it connect.
+		callers = append(callers, networkingv1.NetworkPolicyPeer{PodSelector: &metav1.LabelSelector{MatchLabels: a2aSessionPodSelector()}})
+	}
 	np := &networkingv1.NetworkPolicy{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
 		ObjectMeta: metav1.ObjectMeta{Name: credentialProxyName(agent), Namespace: agent.Namespace},
 		Spec: networkingv1.NetworkPolicySpec{
 			PodSelector: metav1.LabelSelector{MatchLabels: credentialProxySelector(agent)},
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
-			Ingress: []networkingv1.NetworkPolicyIngressRule{{
-				From: []networkingv1.NetworkPolicyPeer{
-					{PodSelector: &metav1.LabelSelector{MatchLabels: shellSandboxSelector(agent)}},
-					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": agent.Name + "-gateway"}}},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{
+				{
+					From: callers,
+					Ports: []networkingv1.NetworkPolicyPort{{
+						Protocol: &tcp,
+						Port:     ptr.To(intstr.FromInt32(credentialProxyPort)),
+					}},
 				},
-				Ports: []networkingv1.NetworkPolicyPort{{
-					Protocol: &tcp,
-					Port:     ptr.To(intstr.FromInt32(credentialProxyPort)),
-				}},
-			}},
+				{
+					From: []networkingv1.NetworkPolicyPeer{{
+						NamespaceSelector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{labelMetadataName: gmpNamespace},
+						},
+					}},
+					Ports: []networkingv1.NetworkPolicyPort{tcpPort(credentialProxyMetricsPort)},
+				},
+			},
 		},
 	}
 	withCommonLabels(np, agent)

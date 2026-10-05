@@ -21,7 +21,7 @@ The shipping install path targets GKE. You'll need one working GCP project plus 
 
 ## GCP project
 
-- A GCP project you can enable APIs on and where you can create GKE clusters, Pub/Sub topics, KMS keyrings, and IAM service accounts.
+- A GCP project you can enable APIs on and where you can create GKE clusters, Pub/Sub topics and subscriptions, Log Router sinks, KMS keyrings, and IAM service accounts.
 - Billing enabled on that project.
 - The `Editor` or `Owner` role for the user running the installer (or a scoped set covering the resources above).
 

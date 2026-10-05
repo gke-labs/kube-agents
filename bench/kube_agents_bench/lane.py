@@ -179,7 +179,9 @@ def load_lane_requesting(path: str | Path) -> dict[str, int]:
     For a case whose prompt the persona answers with a pull request before
     its checks say so: it runs in the second phase and is allowed that many,
     where its own spec would count zero. An entry is a placeholder for the
-    case's own check and goes when that check lands.
+    case's own check and goes when that check lands. Or for a case that opens
+    more pull requests by design than its checks grade: the count is the
+    total, and the entry stays.
     """
     file = Path(path)
     if not file.is_file():
@@ -215,6 +217,12 @@ def requested_pull_requests(spec: Any) -> int:
         for leaf in _leaves(entry.get("check"))
         if leaf.get("type") in REQUESTING_CHECK_TYPES
     )
+
+
+def requested_for(spec: Any, listed_allowance: int = 0) -> int:
+    """How many pull requests a case requests: the larger of what its own
+    checks say and the count the lane file's ``requesting:`` gives it."""
+    return max(requested_pull_requests(spec), listed_allowance)
 
 
 def _load_task(task_yaml: Path) -> dict[str, Any]:
@@ -258,7 +266,7 @@ def copy_task(
     spec = doc.get(SPEC_KEY)
     existing = list(spec) if isinstance(spec, list) else []
     taken = {str(e.get("name")) for e in existing if isinstance(e, dict) and e.get("name")}
-    requested = max(requested_pull_requests(existing), listed_allowance)
+    requested = requested_for(existing, listed_allowance)
     appended = []
     for entry in safeguards:
         if entry["name"] in taken:
@@ -288,11 +296,18 @@ def main(argv: list[str] | None = None) -> int:
     in the fan-out's second phase, then the copy's path, last because it may
     hold spaces; exits
     non-zero, naming the file and the fault, when the lane file or a task
-    refuses the append.
+    refuses the append. ``--list-requesting`` prints ``<requested> <case>``
+    and writes nothing: the api lane runs the same second phase for the
+    repository reset's sake and needs the list without the copies.
     """
     parser = argparse.ArgumentParser(description=main.__doc__.splitlines()[0])
     parser.add_argument("--safeguards", required=True, help="the lane safeguards YAML file")
-    parser.add_argument("--out-dir", required=True, help="where <case>/task.yaml copies go")
+    parser.add_argument("--out-dir", default="", help="where <case>/task.yaml copies go")
+    parser.add_argument(
+        "--list-requesting",
+        action="store_true",
+        help="print `<requested> <case>` per task and write no copies; the api lane orders its fan-out by it",
+    )
     parser.add_argument(
         "--gitops-repo",
         default="",
@@ -300,6 +315,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("tasks", nargs="+", help="task.yaml paths to copy")
     args = parser.parse_args(argv)
+    if not args.out_dir and not args.list_requesting:
+        parser.error("--out-dir is required unless --list-requesting")
     try:
         safeguards = load_lane_safeguards(args.safeguards)
         if args.gitops_repo:
@@ -307,6 +324,9 @@ def main(argv: list[str] | None = None) -> int:
         listed = load_lane_requesting(args.safeguards)
         for task in args.tasks:
             case = Path(task).parent.name
+            if args.list_requesting:
+                print(f"{requested_for(_load_task(Path(task)).get(SPEC_KEY), listed.get(case, 0))} {case}")
+                continue
             written, requested = copy_task(task, safeguards, args.out_dir, listed.get(case, 0))
             # The count first and the path last: the path may hold spaces
             # (a TMPDIR with one), and the consumer splits on whitespace.

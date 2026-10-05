@@ -12,6 +12,7 @@ commands that do touch the network are driven through a single recorded seam
 
 import contextlib
 import copy
+import fnmatch
 import importlib.util
 import io
 import json
@@ -44,7 +45,12 @@ import content_workspace  # noqa: E402
 import credential_proxy  # noqa: E402
 import credential_proxy_client  # noqa: E402
 import gitops_workspace  # noqa: E402
+import vcs_client  # noqa: E402
 import workspace_paths  # noqa: E402
+
+# `BaseTestCase` empties the set so the suite's thousand compliance-audit runs
+# need not each carry a manifest; the guard's own tests put this back.
+REAL_COLLECTOR_AUDITS = audit_report.COLLECTOR_AUDITS
 
 
 @dataclass
@@ -195,19 +201,27 @@ NUMBER_WORDS = {
 
 
 def _outside_fences(lines):
-    """Yield `(1-indexed line number, text)` for lines outside ``` fences.
+    """Yield `(1-indexed line number, text)` for non-blank lines outside fences.
 
     Every heading scan below has to skip fenced blocks. A `### ` inside one is
     a shell comment or a JSON fragment, and counting it as a section heading
     shifts every span derived afterwards — silently, in the direction that
     makes a stale citation look correct.
+
+    The fences are read by `strip_fenced_blocks`, so the grammar is the one
+    the harness uses on issue bodies (CommonMark: a run of three or more
+    backticks or tildes indented at most three spaces, closed by a run of the
+    same character at least as long). A toggle on "```" is not that grammar:
+    it reads the inner fence of a four-backtick block as a closer and a
+    four-space-indented run as a delimiter, and either exposes a `### ` the
+    scan then counts. The function blanks fenced lines in place, so line
+    numbers survive; blank lines are dropped here, which no heading scan
+    notices. `scripts/generate_sop_geography.py` carries the same rule,
+    standard-library only, and its tests hold it to these cases.
     """
-    fenced = False
-    for number, line in enumerate(lines, start=1):
-        if line.lstrip().startswith("```"):
-            fenced = not fenced
-            continue
-        if not fenced:
+    stripped = audit_report.strip_fenced_blocks("\n".join(lines)).split("\n")
+    for number, line in enumerate(stripped, start=1):
+        if line:
             yield number, line
 
 
@@ -416,28 +430,37 @@ THREE_SEVERITIES = [
 
 
 class Recorder:
-    """Stands in for audit_report.run_cmd, recording every command and replying by rule.
+    """Stands in for audit_report.run_cmd and vcs_client.forge, recording both.
 
     `failures` maps a command fragment to the return code that command should
     produce: with `check=True` it raises CalledProcessError exactly as
     subprocess would, and with `check=False` it returns the non-zero result.
     Without it every failure path in the harness is untestable, because a
     recorder that always succeeds can only ever exercise the happy path.
+
+    A forge call is matched against the same two tables by `forge_key_matches`:
+    a key whose first word names the verb. Its reply is the neutral answer,
+    handed back as-is, and a failure raises `vcs_client.VcsError`, which is all
+    the broker ever does. Both kinds of call land in `calls`, a forge call as
+    `["forge", verb]` with its payload in `payloads`, so an assertion about the
+    order of git and forge work still reads one list.
     """
+
+    # The login `identity` names for this install's credential; the one
+    # `harness_comment` writes as.
+    VIEWER = "kube-agents-bot[bot]"
 
     def __init__(self, replies=None, failures=None):
         self.calls: list[list[str]] = []
         self.cwds: list[str | None] = []
-        # Body-file contents, one entry per call, None when the call had no
-        # `--body-file`. The bodies now arrive on stdin rather than in a temp
-        # file, so this list is what `stdin` carried; it stays because
-        # `bodies_for` is the seam that proves something was published, and
-        # what a caller asserts about a body should not change with how the
-        # body reaches `gh`. See `bodies_for` for why the seam exists at all.
-        self.bodies: list[str | None] = []
+        # The payload each forge call carried, None for a command.
+        self.payloads: list[dict | None] = []
         self.envs: list[dict | None] = []
         self.replies = replies or {}
         self.failures = failures or {}
+        # What `identity` answers for each comment author, filled from the
+        # standing the comment fixtures a view handed out were written with.
+        self.standing: dict[str, str] = {}
         # `git diff --cached --quiet` is the harness's commit classifier: rc 0
         # is "nothing staged, the fix is already on main", rc 1 is "there is a
         # commit to make". Defaulting to rc 0 like everything else would make
@@ -448,13 +471,16 @@ class Recorder:
         # branch to describe a repository that is not on `main`, or to None to
         # describe a clone with no origin/HEAD recorded (rc 1).
         self.origin_head = "origin/main"
+        # (audit, repo, issue number) -> the body an `issue-list` entry that
+        # names none should carry. None leaves listings exactly as replied.
+        self.listed_body = None
 
-    def __call__(self, cmd, *, check=True, capture=True, cwd=None, stdin=None, env=None):
+    def __call__(self, cmd, *, check=True, capture=True, cwd=None, env=None):
         self.calls.append(list(cmd))
         self.cwds.append(None if cwd is None else str(cwd))
         # The environment the call named, None when it inherited the process's.
         self.envs.append(env)
-        self.bodies.append(self._read_body(cmd, stdin))
+        self.payloads.append(None)
         joined = " ".join(cmd)
         for key, code in self.failures.items():
             if key in joined:
@@ -469,9 +495,96 @@ class Recorder:
             return CompletedProcess(cmd, 0, self.origin_head + "\n", "")
         self._simulate_clone(cmd)
         for key, payload in self.replies.items():
-            if key in joined:
+            if isinstance(payload, str) and key in joined:
                 return CompletedProcess(cmd, 0, payload, "")
         return CompletedProcess(cmd, 0, "", "")
+
+    def forge(self, verb, payload, repository=None):
+        """`vcs_client.forge`, answered from `replies` and `failures`."""
+        payload = {k: v for k, v in dict(payload).items() if v is not None}
+        if repository is not None:
+            payload["repository"] = repository
+        self.calls.append(["forge", verb])
+        self.cwds.append(None)
+        self.envs.append(None)
+        self.payloads.append(payload)
+        for key, code in self.failures.items():
+            if forge_key_matches(key, verb, payload):
+                raise vcs_client.VcsError(
+                    f"simulated failure (rc {code})", code="FORGE_REJECTED"
+                )
+        if verb == "identity":
+            return self._identity(payload)
+        for key, answer in self.replies.items():
+            if isinstance(answer, dict) and forge_key_matches(key, verb, payload):
+                return self._hand_out(
+                    self._with_listed_bodies(verb, payload, copy.deepcopy(answer))
+                )
+        return self._empty(verb, payload)
+
+    def _with_listed_bodies(self, verb, payload, answer):
+        """Give each issue a ledger listing names the body the store last wrote.
+
+        `finish` checks its stored memory against the body `issue-list`
+        returns (`memory_matches_ledger`). A test that describes a listing
+        without bodies is describing a ledger nobody rewrote behind the store's
+        back, so each entry without one gets the body the store holds for it.
+        A test about a rewritten ledger names the body itself.
+        """
+        if verb != "issue-list" or self.listed_body is None:
+            return answer
+        issues = answer.get("issues")
+        if not isinstance(issues, list):
+            return answer
+        labels = [str(label) for label in payload.get("labels") or []]
+        audit = next(
+            (label.split(":", 1)[1] for label in labels if label.startswith("audit:")), ""
+        )
+        repo = str(payload.get("repository") or "")
+        for issue in issues:
+            if isinstance(issue, dict) and "body" not in issue:
+                issue["body"] = self.listed_body(audit, repo, issue.get("number"))
+        return answer
+
+    @staticmethod
+    def _empty(verb, payload):
+        """What the broker sends when there is nothing to say.
+
+        A list that matched nothing, or an issue or pull request with an empty
+        body and no comments. `{}` for a write, which every reader here takes
+        as "no answer".
+        """
+        if verb in EMPTY_LISTS:
+            return copy.deepcopy(EMPTY_LISTS[verb])
+        noun = {"issue-view": "issue", "proposal-view": "proposal"}.get(verb)
+        if noun is None:
+            return {}
+        answer = {noun: {"number": payload.get("number"), "body": ""}}
+        if payload.get("comments"):
+            answer.update(comments=[], commentCount=0, commentsTruncated=False)
+        return answer
+
+    def _hand_out(self, answer):
+        """The answer, minus the standing its comments were written with."""
+        for item in answer.get("comments") or []:
+            association = item.pop(STANDING, None)
+            if association is None or item.get("bot"):
+                continue
+            login = item["author"]
+            known = self.standing.setdefault(login, association)
+            assert known == association, (
+                f"fixture gives {login} two standings, {known} and {association}; "
+                "the forge answers standing per login, so give each its own"
+            )
+        return answer
+
+    def _identity(self, payload):
+        login = payload.get("login")
+        if login is None:
+            return {"identity": {"login": self.VIEWER, "subject": self.VIEWER, "canWrite": None}}
+        association = self.standing.get(login)
+        can_write = None if association is None else association in WRITE_STANDING
+        return {"identity": {"login": self.VIEWER, "subject": login, "canWrite": can_write}}
 
     @staticmethod
     def _simulate_clone(cmd):
@@ -488,57 +601,37 @@ class Recorder:
         destination = Path(cmd[-1])
         (destination / ".git").mkdir(parents=True, exist_ok=True)
 
-    @staticmethod
-    def _read_body(cmd, stdin):
-        """The body this call published, or None if it has none.
-
-        Both spellings: `gh issue/pr create|edit` takes `--body-file`, while
-        `gh issue/pr comment` takes `-F`. Recognising only one silently returns
-        None for the other, which reads as "nothing was published" — the exact
-        blind spot this seam exists to close.
-
-        The flag's value is `-` and the document arrives on stdin, so the check
-        is that the two agree: an argv naming stdin with nothing on it, or a
-        body handed over with no flag to receive it, is a call that publishes
-        nothing however it reads. A path is still recognised, because a call
-        that names one is a call that needs the two containers to share a
-        filesystem, and the assertion that no such call is left is one this
-        list has to be able to fail.
-        """
-        cmd = list(cmd)
-        flag = next((f for f in ("--body-file", "-F") if f in cmd), None)
-        if flag is None:
-            return None
-        index = cmd.index(flag) + 1
-        if index >= len(cmd):
-            return None
-        if cmd[index] == "-":
-            return stdin
-        try:
-            return Path(cmd[index]).read_text(encoding="utf-8")
-        except OSError:
-            return None
-
-    def bodies_for(self, *path):
-        """What `gh <path...>` actually published, in order.
+    def bodies_for(self, verb):
+        """What forge `verb` actually published, in order.
 
         The one seam the suite was missing. Every other assertion checks either
-        the *arguments* handed to `gh` or the *return value* of a renderer, and
-        nothing checked the wire between them: the body handoff could carry an
-        empty string — blanking every issue, comment and pull request the
+        the *arguments* handed to the forge or the *return value* of a renderer,
+        and nothing checked the wire between them: the body handoff could carry
+        an empty string — blanking every issue, comment and pull request the
         feature exists to produce — and the whole suite stayed green. Anything
         asserting that something was *published* has to come through here.
 
-        Calls with no `--body-file` contribute nothing, so `gh issue edit` for a
-        label and `gh issue edit` for a report do not have to be told apart by
-        the caller; the length of this list is the number of bodies that
-        reached GitHub.
+        Calls with no `body` contribute nothing, so `issue-update` for a label
+        and `issue-update` for a report do not have to be told apart by the
+        caller; the length of this list is the number of bodies that reached
+        the forge.
         """
-        wanted = ["gh", *path]
+        return [p["body"] for p in self.forge_calls(verb) if "body" in p]
+
+    def forge_calls(self, verb, **fields):
+        """The payload of every forge call `verb` names, in order.
+
+        `verb` is a glob, so `issue-*` is every issue write and read. Each of
+        `fields` narrows the list: a value must equal the payload's, or be one
+        of its entries when the payload holds a list, and `...` only asks that
+        the field be there.
+        """
         return [
-            body
-            for call, body in zip(self.calls, self.bodies)
-            if call[: len(wanted)] == wanted and body is not None
+            payload
+            for call, payload in zip(self.calls, self.payloads)
+            if payload is not None
+            and fnmatch.fnmatchcase(call[1], verb)
+            and all(_field_matches(payload, k, v) for k, v in fields.items())
         ]
 
     def matching(self, *fragments):
@@ -548,15 +641,123 @@ class Recorder:
             if all(fragment in " ".join(call) for fragment in fragments)
         ]
 
-    def gh_calls(self, *path):
-        """Every `gh <path...>` call, matched on argv position, not substring.
 
-        `matching` is unsafe for a short fragment like "pr": a temp body file
-        named /tmp/tmpri8dla1x.md makes `gh issue create` look like `gh pr
-        create`. Anything asserting that a *pull request* was never touched
-        has to go through here.
-        """
-        return [c for c in self.calls if c[: len(path) + 1] == ["gh", *path]]
+EMPTY_LISTS = {
+    "issue-list": {"issues": [], "count": 0, "truncated": False},
+    "proposal-list": {"proposals": [], "count": 0, "truncated": False},
+}
+
+# Where a neutral comment fixture keeps the standing it was written with, for
+# the recorder to answer `identity` from. Taken off before the harness sees it.
+STANDING = "_standing"
+WRITE_STANDING = ("OWNER", "MEMBER", "COLLABORATOR")
+
+
+def _field_matches(payload, name, wanted):
+    if name not in payload:
+        return False
+    if wanted is ...:
+        return True
+    have = payload[name]
+    if isinstance(have, list) and not isinstance(wanted, list):
+        return wanted in have
+    return have == wanted
+
+
+def forge_key_matches(key, verb, payload):
+    """Whether a `replies`/`failures` key names this forge call.
+
+    The first word is a glob on the verb; every further word narrows it:
+    `field` asks the field be present and truthy, `!field` that it be absent,
+    and `field=value` that it equal `value`, or hold it when a list. So
+    `issue-view !comments` is the ledger-body read and `*-view comments` is
+    every conversation read, on an issue or a pull request.
+    """
+    verb_glob, *words = key.split()
+    if not fnmatch.fnmatchcase(verb, verb_glob):
+        return False
+    for word in words:
+        if word.startswith("!"):
+            if payload.get(word[1:]):
+                return False
+            continue
+        name, eq, value = word.partition("=")
+        if not eq:
+            if not payload.get(name):
+                return False
+            continue
+        have = payload.get(name)
+        if isinstance(have, list):
+            if value not in [str(v) for v in have]:
+                return False
+        elif str(have) != value:
+            return False
+    return True
+
+
+def neutral_comment(record, kind="issue"):
+    """A gh-shaped comment fixture as the broker answers it.
+
+    The fixtures stay in the shape the pure core reads, because that is where
+    most of them are used; this is the translation the broker does, run
+    backwards. The standing rides along under `STANDING` for the recorder.
+    """
+    login = str((record.get("author") or {}).get("login") or "")
+    bot = login.endswith("[bot]") or bool((record.get("author") or {}).get("is_bot"))
+    neutral = {
+        "id": record.get("id"),
+        "kind": kind,
+        "author": login.removesuffix("[bot]"),
+        "bot": bot,
+        "created": record.get("createdAt", ""),
+        "body": record.get("body", ""),
+    }
+    if "authorAssociation" in record:
+        neutral[STANDING] = record["authorAssociation"]
+    return neutral
+
+
+def comments_view(doc, truncated=False):
+    """A `*-view comments` answer carrying `doc["comments"]`, gh-shaped."""
+    comments = [neutral_comment(c) for c in doc.get("comments") or []]
+    return {"comments": comments, "commentCount": len(comments), "commentsTruncated": truncated}
+
+
+def issue_view(issue):
+    """An `issue-view` answer for an issue whose fields are `issue`."""
+    return {"issue": dict(issue)}
+
+
+def neutral_proposal(record):
+    """A gh-shaped pull request fixture (`pr(...)`) as the broker answers it."""
+    state = str(record.get("state") or "OPEN").lower()
+    return {
+        "number": record.get("number"),
+        "state": state,
+        "source": record.get("headRefName", ""),
+        "url": record.get("url", ""),
+        "body": record.get("body", ""),
+        "labels": [label["name"] for label in record.get("labels") or []],
+        "closed": record.get("closedAt") or record.get("mergedAt"),
+        # The broker strips an App's `[bot]`; a fixture names a person's login.
+        "author": record.get("author", "kube-agents-bot"),
+    }
+
+
+def proposals_view(prs, truncated=False):
+    """A `proposal-list` answer carrying the gh-shaped `prs`."""
+    proposals = [neutral_proposal(p) for p in prs]
+    return {"proposals": proposals, "count": len(proposals), "truncated": truncated}
+
+
+def issues_view(issues):
+    """An `issue-list` answer carrying `issues`."""
+    return {"issues": list(issues), "count": len(issues), "truncated": False}
+
+
+def created(kind, url):
+    """The answer `issue-create` / `proposal-create` gives for `url`."""
+    return {kind: {"number": int(url.rstrip("/").rsplit("/", 1)[1]), "url": url}}
 
 
 class BaseTestCase(unittest.TestCase):
@@ -581,14 +782,24 @@ class BaseTestCase(unittest.TestCase):
         # directory-mode one would look like the fallback failing.
         audit_report.set_content_mode(False)
         self.addCleanup(audit_report.set_content_mode, False)
+        audit_report._VIEWER_LOGINS.clear()
+        self.addCleanup(audit_report._VIEWER_LOGINS.clear)
         gitops_workspace.forget_base_branch()
         self.addCleanup(gitops_workspace.forget_base_branch)
         # CREDENTIAL_PROXY_URL is emptied, not left alone: it is what decides
         # whether the run asks the broker at all, so a developer who exports it
         # would otherwise put the whole suite on a different code path than CI.
         # Directory mode has to be the explicit state, not the ambient one.
+        # The report store is pointed at the temp tree for the same reason as
+        # the scratch directory: off-cluster /opt/data does not exist.
+        self.reports_dir = self.tmp_path / "reports"
         env = patch.dict(
-            os.environ, {"GITOPS_BASE_BRANCH": "", "CREDENTIAL_PROXY_URL": ""}
+            os.environ,
+            {
+                "GITOPS_BASE_BRANCH": "",
+                "CREDENTIAL_PROXY_URL": "",
+                "FLEET_AUDIT_REPORTS_DIR": str(self.reports_dir),
+            },
         )
         env.start()
         self.addCleanup(env.stop)
@@ -597,9 +808,29 @@ class BaseTestCase(unittest.TestCase):
         # tests about the note itself put the real check back.
         self.real_claim_in_flight = audit_report.claim_in_flight
         self.patch_attr("claim_in_flight", lambda *a, **k: None)
+        # The forge goes wherever `run_cmd` goes: a test that swaps in a fresh
+        # Recorder gets its forge calls too, and one that never installed a
+        # Recorder fails loudly instead of reaching for a broker that is not
+        # there.
+        forge = patch.object(vcs_client, "forge", self.forge_through_recorder)
+        forge.start()
+        self.addCleanup(forge.stop)
+
+        # `compliance-audit` is a collector stream, so on the real set every
+        # `finish` here would need a manifest, and passing one is not neutral:
+        # it changes holds, `unpublished_candidates` and the lost-store answer.
+        # `TestCollectorStreamsRequireAManifest` holds the real set.
+        self.patch_attr("COLLECTOR_AUDITS", frozenset())
+
+    @staticmethod
+    def forge_through_recorder(verb, payload, repository=None):
+        recorder = audit_report.run_cmd
+        if not isinstance(recorder, Recorder):
+            raise AssertionError(f"forge {verb} called with no Recorder installed")
+        return recorder.forge(verb, payload, repository=repository)
 
     def issue_list(self, number=42, url="https://github.com/acme/fleet/issues/42"):
-        return json.dumps([{"number": number, "url": url}])
+        return {"issues": [{"number": number, "url": url}], "count": 1, "truncated": False}
 
     def patch_attr(self, name, value):
         """monkeypatch.setattr(audit_report, name, value), undone at teardown."""
@@ -707,6 +938,66 @@ class HarnessTestCase(BaseTestCase):
         # asking git — it would assert `origin/main` on a repository whose
         # default branch the harness was never consulted about.
         audit_report.set_workspace(self.workspace)
+        self._audit_in_flight = None
+        self.harness.listed_body = self.stored_ledger_body
+
+    def stored_ledger_body(self, audit, repo, number):
+        """The ledger body the store last wrote for `number`, or "" without one."""
+        try:
+            envelope = json.loads(
+                (self.store_dir(audit, repo) / "latest.json").read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            return ""
+        if not isinstance(envelope, dict) or envelope.get("issue_number") != number:
+            return ""
+        return str(envelope.get("ledger_body") or "")
+
+    def store_dir(self, audit=AUDIT, repo="acme/fleet"):
+        """The store directory `finish` keeps for `audit` on `repo`."""
+        return self.reports_dir / audit / repo
+
+    def seed_report(self, body, issue=42, repo="acme/fleet", audit=None):
+        """Leave the report store a previous run would have, rendering `body` on `issue`."""
+        audit = audit or self._audit_in_flight or AUDIT
+        directory = self.store_dir(audit, repo)
+        directory.mkdir(parents=True, exist_ok=True)
+        envelope = {
+            "audit_id": audit,
+            "repo": repo,
+            "issue_number": issue,
+            "ledger_body": body,
+            "current_ids": audit_report.parse_delta_block(body),
+            "id_scheme": audit_report.parse_id_scheme(body),
+            "document": {"findings": []},
+        }
+        (directory / "latest.json").write_text(json.dumps(envelope), encoding="utf-8")
+
+    def run_main(self, argv):
+        """Run the CLI, with the store seeded from the recorder's ledger replies.
+
+        A test describes the previous ledger the way it always has — the body
+        `gh issue view --json body` would return, or that call failing — and
+        this turns it into what `finish` and `start` now read instead: the
+        report store's `latest.json` for the issue `gh issue list` names. A
+        failing read is an absent store. With neither, the store is left as the
+        runs before it wrote it, so a test that runs `finish` twice sees the
+        first run's memory — unless there is no store directory at all, where
+        the recorder's default reply, an empty body, is what the test described.
+        A directory without `latest.json` is left alone, as production reads it:
+        a lost memory, never an empty one.
+        """
+        self._audit_in_flight = argv[argv.index("--audit") + 1] if "--audit" in argv else None
+        audit = self._audit_in_flight or AUDIT
+        listed = (self.harness.replies.get("issue-list") or {}).get("issues") or []
+        if "issue-view !comments" in self.harness.failures:
+            shutil.rmtree(self.reports_dir, ignore_errors=True)
+        elif listed and "issue-view !comments" in self.harness.replies:
+            body = self.harness.replies["issue-view !comments"]["issue"].get("body") or ""
+            self.seed_report(body, issue=int(listed[0]["number"]))
+        elif listed and not self.store_dir(audit).exists():
+            self.seed_report("", issue=int(listed[0]["number"]))
+        return super().run_main(argv)
 
     def unclone(self):
         """Put the workspace back to how a freshly started pod finds it."""
@@ -1605,8 +1896,8 @@ class TestSchemeMigration(HarnessTestCase):
         # cannot join against, whose ids nevertheless look entirely ordinary. A
         # naive join calls every one of them fixed.
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps(
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view(
                 {
                     "body": self.previous(
                         [
@@ -1636,14 +1927,14 @@ class TestSchemeMigration(HarnessTestCase):
             "clusterrolebinding-argocd-application-controller"
         )
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": self.previous([stale])}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": self.previous([stale])}),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
 
         self.assertEqual(self.run_finish(make_doc()), 0)
 
-        bodies = self.harness.bodies_for("issue", "comment")
+        bodies = self.harness.bodies_for("issue-comment")
         self.assertTrue(bodies, "the run posted no delta comment at all")
         for body in bodies:
             with self.subTest(body=body):
@@ -1655,8 +1946,8 @@ class TestSchemeMigration(HarnessTestCase):
         # withholding it too would leave the stream silent about a real finding
         # for a run, which is the failure mode the audit exists to prevent.
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": self.previous(["wra-something-old"])}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": self.previous(["wra-something-old"])}),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
 
@@ -1668,8 +1959,8 @@ class TestSchemeMigration(HarnessTestCase):
         # Nothing to join against, so nothing to withhold and nothing to warn
         # about: a first run on a fresh ledger is not a scheme change.
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": self.previous([])}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": self.previous([])}),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
 
@@ -1681,8 +1972,8 @@ class TestSchemeMigration(HarnessTestCase):
         # The run above republished the ledger stamped, so the next one joins
         # normally and a real disappearance reads as resolved.
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps(
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view(
                 {
                     "body": self.previous(
                         [derived_id(), derived_id(fid="gone")],
@@ -1703,8 +1994,8 @@ class TestSchemeMigration(HarnessTestCase):
         # unjoinable, and rolling a deployment back must not turn its findings
         # into a page of fixes.
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps(
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view(
                 {
                     "body": self.previous(
                         [derived_id(), derived_id(fid="gone")],
@@ -2651,11 +2942,13 @@ class TestAuditCatalogue(unittest.TestCase):
                         "for Standard/Autopilot",
                     )
 
-    def test_cost_sop_check_3_8_handles_autopilot_when_3_7_skipped(self):
-        """Check 3.8 must specify evaluation for Autopilot where 3.7 is skipped."""
+    def test_cost_sop_check_3_8_goes_with_3_7_on_autopilot(self):
+        """3.8 examines only 3.7's flagged nodes, so the SOP declares both
+        inapplicable on Autopilot, matching what `fleet_waste.py` writes."""
         sop = self.sop_dir() / audit_report.AUDITS["fleet-wide-cost-analysis"].sop
         text = sop.read_text(encoding="utf-8")
-        self.assertIn("Autopilot clusters where 3.7 is skipped", text)
+        self.assertIn("skip 3.7 and 3.8, and declare both", text)
+        self.assertNotIn("Autopilot clusters where 3.7 is skipped", text)
 
     def test_drift_sop_declares_autopilot_non_configurable_facets_inapplicable(self):
         """Drift SOP must instruct declaring non-configurable facets in checks_not_applicable."""
@@ -2908,8 +3201,8 @@ class TestStaging(unittest.TestCase):
 class TestFinishWithFindings(HarnessTestCase):
     def test_opens_the_ledger_issue_and_touches_no_branch(self):
         self.harness.replies = {
-            "issue list": "[]",
-            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.touch("clusters/stage-eu/psp.yaml")
@@ -2953,22 +3246,21 @@ class TestFinishWithFindings(HarnessTestCase):
         self.assertNotIn("git clean -fdq", joined)
         self.assertNotIn("git reset --hard --quiet", joined)
 
-        create = self.harness.matching("issue", "create")[0]
-        self.assertIn("--label", create)
-        self.assertIn("agent:audit", create)
-        self.assertIn("audit:compliance-audit", create)
-        self.assertIn("--body-file", create)
-        self.assertFalse(self.harness.matching("issue", "edit", "--title"))
+        create = self.harness.forge_calls("issue-create")[0]
+        self.assertIn("agent:audit", create["labels"])
+        self.assertIn("audit:compliance-audit", create["labels"])
+        self.assertTrue(create["body"])
+        self.assertFalse(self.harness.forge_calls("issue-update", title=...))
         # The whole point of the split: reporting never *writes* a pull
         # request. It still reads them — that is how a finding learns whether
         # a fix is already in flight.
-        for verb in ("create", "edit", "close", "comment"):
-            self.assertEqual(self.harness.gh_calls("pr", verb), [], verb)
+        for verb in ("create", "update", "close", "comment"):
+            self.assertEqual(self.harness.forge_calls(f"proposal-{verb}"), [], verb)
 
     def test_opened_status_json(self):
         self.harness.replies = {
-            "issue list": "[]",
-            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.run_finish(make_doc())
@@ -2992,14 +3284,14 @@ class TestFinishWithFindings(HarnessTestCase):
 
     def test_severity_label_is_applied_to_the_new_issue(self):
         self.harness.replies = {
-            "issue list": "[]",
-            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.run_finish(make_doc())
-        label = self.harness.matching("issue", "edit", "severity:critical")
+        label = self.harness.forge_calls("issue-update", labelsAdd="severity:critical")
         self.assertTrue(label)
-        self.assertEqual(label[0][:4], ["gh", "issue", "edit", "7"])
+        self.assertEqual(label[0]["number"], 7)
 
     def test_updates_in_place_and_posts_delta(self):
         previous_body = published_body(
@@ -3012,8 +3304,8 @@ class TestFinishWithFindings(HarnessTestCase):
             generated_at=NOW,
         )
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         doc = make_doc(
@@ -3026,12 +3318,12 @@ class TestFinishWithFindings(HarnessTestCase):
         rc = self.run_finish(doc)
         self.assertEqual(rc, 0)
 
-        self.assertFalse(self.harness.matching("issue", "create"))
-        edit = self.harness.matching("issue", "edit", "--title")[0]
-        self.assertEqual(edit[:4], ["gh", "issue", "edit", "42"])
-        self.assertIn("--body-file", edit)
+        self.assertFalse(self.harness.forge_calls("issue-create"))
+        edit = self.harness.forge_calls("issue-update", title=...)[0]
+        self.assertEqual(edit["number"], 42)
+        self.assertTrue(edit["body"])
 
-        self.assertTrue(self.harness.gh_calls("issue", "comment", "42"))
+        self.assertTrue(self.harness.forge_calls("issue-comment", number=42))
 
         self.assertEqual(
             self.stdout_json(),
@@ -3055,41 +3347,47 @@ class TestFinishWithFindings(HarnessTestCase):
         doc = make_doc()
         previous_body = published_body(doc, generated_at=NOW)
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
 
         self.run_finish(doc)
 
         # Body still refreshed, but silence when nothing changed.
-        self.assertTrue(self.harness.matching("issue", "edit", "--title"))
-        self.assertFalse(self.harness.gh_calls("issue", "comment"))
+        self.assertTrue(self.harness.forge_calls("issue-update", title=...))
+        self.assertFalse(self.harness.forge_calls("issue-comment"))
         result = self.stdout_json()
         self.assertEqual(result["status"], "UPDATED")
         self.assertEqual(result["new"], 0)
         self.assertEqual(result["resolved"], 0)
 
     def test_unreadable_previous_body_suppresses_the_delta(self):
-        # None is not "": an unreadable body makes the delta unknowable, and
+        # None is not "": a lost store makes the delta unknowable, and
         # announcing every live finding as new is worse than announcing none.
-        self.harness.replies = {"issue list": self.issue_list()}
-        self.harness.failures = {"--json body": 1}
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.harness.failures = {"issue-view !comments": 1}
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
 
         self.assertEqual(self.run_finish(make_doc()), 0)
 
-        self.assertFalse(self.harness.gh_calls("issue", "comment"))
+        self.assertFalse(self.harness.forge_calls("issue-comment"))
         result = self.stdout_json()
         self.assertEqual(result["status"], "UPDATED")
         self.assertEqual(result["new"], 0)
         self.assertEqual(result["resolved"], 0)
-        self.assertIn("unreadable", self.err)
+        self.assertIn("unknowable", self.err)
+        # `new: 0` is "not known" here, so the scheduled verdict must not be
+        # `[SILENT]`: the ids published now are the next run's baseline, and
+        # any new among them would never be announced. The audit still looked,
+        # so it is not a coverage gap.
+        self.assertFalse(result["silent_ok"])
+        self.assertFalse(result["partial"])
 
     def test_gcloud_only_run_still_publishes(self):
         self.harness.replies = {
-            "issue list": "[]",
-            "issue create": "https://github.com/acme/fleet/issues/9\n",
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/9"),
         }
         doc = make_doc(
             findings=[
@@ -3098,23 +3396,23 @@ class TestFinishWithFindings(HarnessTestCase):
         )
         self.assertEqual(self.run_finish(doc), 0)
         self.assertEqual(self.git_add_calls(self.harness), [])
-        self.assertTrue(self.harness.matching("issue", "create"))
+        self.assertTrue(self.harness.forge_calls("issue-create"))
 
     def test_a_missing_remediation_file_degrades_one_finding_not_the_report(self):
         # This used to abort the run. One finding whose promised manifest the
         # audit forgot to write would suppress the other nine criticals — the
         # report is the thing with value, and it was the thing thrown away.
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         # Deliberately do NOT create the manifest on disk.
         rc = self.run_finish(make_doc())
         self.assertEqual(rc, 0)
         self.assertIn("remediation file is missing", self.err)
-        self.assertTrue(self.harness.matching("issue", "create"))
+        self.assertTrue(self.harness.forge_calls("issue-create"))
         # Degraded to manual, so it must not become a pull request either.
-        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
 
     def test_a_degraded_finding_says_why_it_has_no_pull_request(self):
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         findings = list(make_doc()["findings"])
         audit_report.degrade_missing_remediations(findings, self.workspace)
         self.assertEqual(findings[0]["remediation"]["kind"], "manual")
@@ -3131,10 +3429,10 @@ class TestFinishWithFindings(HarnessTestCase):
 
 
 class TestPublishedBodies(HarnessTestCase):
-    """What reaches GitHub, read back off the body each `gh` call carried.
+    """What reaches GitHub, read back off the body each forge call carried.
 
-    Every other end-to-end test asserts that `gh` was called with the right
-    flags, and every rendering test asserts that a renderer returns the right
+    Every other end-to-end test asserts that the forge was called with the
+    right verb, and every rendering test asserts that a renderer returns the right
     string. Neither connects the two. Publishing an empty string — blanking the
     ledger, every comment and every pull request — left the whole suite green,
     so the feature's actual output was untested. These tests are the wire, and
@@ -3144,13 +3442,13 @@ class TestPublishedBodies(HarnessTestCase):
 
     def test_the_created_ledger_carries_the_report(self):
         self.harness.replies = {
-            "issue list": "[]",
-            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.assertEqual(self.run_finish(make_doc()), 0)
 
-        bodies = self.harness.bodies_for("issue", "create")
+        bodies = self.harness.bodies_for("issue-create")
         self.assertEqual(len(bodies), 1)
         self.assertIn("## Findings", bodies[0])
         self.assertIn("Namespace has no NetworkPolicy", bodies[0])
@@ -3167,19 +3465,19 @@ class TestPublishedBodies(HarnessTestCase):
             generated_at=NOW,
         )
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
         self.assertEqual(self.run_finish(doc), 0)
 
-        edits = self.harness.bodies_for("issue", "edit")
+        edits = self.harness.bodies_for("issue-update")
         self.assertEqual(len(edits), 1)
         self.assertIn("Bravo finding", edits[0])
         self.assertNotIn("Alpha finding", edits[0])
 
-        comments = self.harness.bodies_for("issue", "comment")
+        comments = self.harness.bodies_for("issue-comment")
         self.assertEqual(len(comments), 1)
         self.assertIn(f"`{derived_id(fid='b')}`", comments[0])
         self.assertIn(f"`{derived_id(fid='a')}`", comments[0])
@@ -3189,26 +3487,26 @@ class TestPublishedBodies(HarnessTestCase):
             make_doc(findings=[make_finding(fid="a")]), generated_at=NOW
         )
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
         doc = make_doc(findings=[])
         doc["resolved_because"] = resolved_for(previous_body)
         self.assertEqual(self.run_finish(doc), 0)
 
-        comments = self.harness.bodies_for("issue", "comment")
+        comments = self.harness.bodies_for("issue-comment")
         self.assertEqual(len(comments), 1)
         self.assertIn("is now clean", comments[0])
 
     def test_the_promoted_pull_request_carries_its_own_body(self):
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.assertEqual(self.run_finish(make_doc()), 0)
 
-        bodies = self.harness.bodies_for("pr", "create")
+        bodies = self.harness.bodies_for("proposal-create")
         self.assertEqual(len(bodies), 1)
         self.assertIn("## Files", bodies[0])
         self.assertIn("clusters/prod-us-east/payments-netpol.yaml", bodies[0])
@@ -3226,44 +3524,45 @@ class TestPublishedBodies(HarnessTestCase):
             make_doc(findings=[make_finding(fid="a")]), generated_at=NOW
         )
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
-            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.assertEqual(self.run_finish(make_doc()), 0)
 
-        published = [b for b in self.harness.bodies if b is not None]
+        published = [p["body"] for p in self.harness.payloads if p and "body" in p]
         self.assertTrue(published, "the run published nothing at all")
         for index, body in enumerate(published):
             with self.subTest(body=index):
                 self.assertTrue(body.strip())
 
-    def test_no_body_reaches_gh_as_a_filesystem_path(self):
-        # A `--body-file /some/path` works only while the container running
-        # this code and the container running the real `gh` can see the same
-        # filesystem, and removing that shared tree is the point of the change
-        # this test guards. `-` is the only value that crosses the boundary,
-        # because a document on stdin needs nowhere to live.
+    def test_no_body_reaches_the_forge_as_a_filesystem_path(self):
+        # A body named by path works only while the container running this
+        # code and the one talking to the forge can see the same filesystem,
+        # and removing that shared tree is the point of the change this test
+        # guards. The document itself is the only thing that crosses.
         previous_body = published_body(
             make_doc(findings=[make_finding(fid="a")]), generated_at=NOW
         )
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
-            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.assertEqual(self.run_finish(make_doc()), 0)
 
         carriers = 0
-        for call in self.harness.calls:
+        for call, payload in zip(self.harness.calls, self.harness.payloads):
             for flag in ("--body-file", "-F"):
-                if flag not in call:
-                    continue
-                carriers += 1
-                with self.subTest(call=" ".join(call)):
-                    self.assertEqual(call[call.index(flag) + 1], "-")
+                self.assertNotIn(flag, call)
+            if payload is None or "body" not in payload:
+                continue
+            carriers += 1
+            with self.subTest(call=" ".join(call)):
+                self.assertFalse(Path(payload["body"]).is_absolute(), payload["body"][:80])
+                self.assertEqual(set(payload) & {"bodyFile", "body_file"}, set())
         self.assertTrue(carriers, "the run published nothing at all")
 
 
@@ -3271,7 +3570,7 @@ class TestFinishClean(HarnessTestCase):
     def test_a_clean_run_with_no_ledger_still_counts_what_was_declared(self):
         # Nothing to open and nothing to close, so the JSON line and the log
         # are the only trace that the run deferred to a declaration.
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         self.record_run()
         doc = searched_doc(findings=[])
         doc["declared"] = [make_declared()]
@@ -3283,11 +3582,11 @@ class TestFinishClean(HarnessTestCase):
         # the channel.
         self.assertTrue(payload["silent_ok"])
         self.assertIn("1 declared posture(s)", self.err)
-        self.assertFalse(self.harness.gh_calls("issue", "create"))
-        self.assertFalse(self.harness.gh_calls("issue", "comment"))
+        self.assertFalse(self.harness.forge_calls("issue-create"))
+        self.assertFalse(self.harness.forge_calls("issue-comment"))
 
     def test_the_findings_branch_reports_the_declared_count_too(self):
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         self.record_run()
         doc = searched_doc(findings=[make_finding(check="no-pdb")])
         doc["declared"] = [make_declared(), make_declared(obj="Deployment/web")]
@@ -3300,8 +3599,8 @@ class TestFinishClean(HarnessTestCase):
             generated_at=NOW,
         )
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
 
         doc = make_doc(findings=[])
@@ -3309,12 +3608,11 @@ class TestFinishClean(HarnessTestCase):
         rc = self.run_finish(doc)
         self.assertEqual(rc, 0)
 
-        self.assertTrue(self.harness.gh_calls("issue", "comment", "42"))
-        close = self.harness.matching("issue", "close", "42")
+        self.assertTrue(self.harness.forge_calls("issue-comment", number=42))
+        close = self.harness.forge_calls("issue-close", number=42)
         self.assertTrue(close)
         # "completed", never "not planned": a clean fleet is done, not rejected.
-        self.assertIn("--reason", close[0])
-        self.assertIn("completed", close[0])
+        self.assertEqual(close[0]["reason"], "completed")
         # Nothing is committed, pushed, or deleted on a clean run.
         self.assertFalse(self.harness.matching("git", "push"))
         self.assertFalse(self.harness.matching("git", "commit"))
@@ -3341,19 +3639,19 @@ class TestFinishClean(HarnessTestCase):
     def test_a_failed_all_clear_comment_still_closes_the_ledger(self):
         # The close used to sit outside the try/finally, so a 422 on the
         # comment left the ledger open forever with no explanation.
-        self.harness.replies = {"issue list": self.issue_list()}
-        self.harness.failures = {"issue comment": 1}
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.harness.failures = {"issue-comment": 1}
 
         self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
 
-        self.assertTrue(self.harness.matching("issue", "close", "42"))
+        self.assertTrue(self.harness.forge_calls("issue-close", number=42))
         self.assertIn("could not post the all-clear comment", self.err)
 
     def test_clean_run_with_no_open_ledger_is_a_no_op(self):
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
-        self.assertFalse(self.harness.matching("issue", "close"))
-        self.assertFalse(self.harness.gh_calls("issue", "comment"))
+        self.assertFalse(self.harness.forge_calls("issue-close"))
+        self.assertFalse(self.harness.forge_calls("issue-comment"))
         self.assertEqual(
             self.stdout_json(),
             {
@@ -3743,8 +4041,8 @@ class TestHeldClose(HarnessTestCase):
             make_doc(findings=list(findings) or [held_finding()]), generated_at=NOW
         )
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": body}),
         }
 
     def test_the_close_is_refused_when_the_check_ran_on_that_cluster_again(self):
@@ -3753,8 +4051,8 @@ class TestHeldClose(HarnessTestCase):
         # which is exactly what rep 2 of 2026-09-16 would have written.
         self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
 
-        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
-        comments = self.harness.bodies_for("issue", "comment")
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+        comments = self.harness.bodies_for("issue-comment")
         self.assertEqual(len(comments), 1)
         comment = comments[0]
         self.assertIn("the ledger stays open", comment)
@@ -3782,7 +4080,7 @@ class TestHeldClose(HarnessTestCase):
 
     def test_a_refused_close_retires_no_remediation_pull_request(self):
         self.previous_ledger(held_finding(), make_finding(fid="a"))
-        self.harness.replies["pr list"] = json.dumps(
+        self.harness.replies["proposal-list"] = proposals_view(
             [
                 pr(
                     8,
@@ -3792,7 +4090,7 @@ class TestHeldClose(HarnessTestCase):
             ]
         )
         self.assertEqual(self.run_finish(naming_doc()), 0)
-        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
         self.assertEqual(self.stdout_json()["prs_closed"], [])
 
     def test_a_resolved_because_entry_lets_the_ledger_close(self):
@@ -3801,8 +4099,8 @@ class TestHeldClose(HarnessTestCase):
         doc["resolved_because"] = [resolved_entry()]
         self.assertEqual(self.run_finish(doc), 0)
 
-        self.assertTrue(self.harness.matching("issue", "close", "42"))
-        comments = self.harness.bodies_for("issue", "comment")
+        self.assertTrue(self.harness.forge_calls("issue-close", number=42))
+        comments = self.harness.bodies_for("issue-comment")
         self.assertEqual(len(comments), 1)
         self.assertIn("closed as completed", comments[0])
         # The reason that retired the finding is published with the close,
@@ -3822,27 +4120,27 @@ class TestHeldClose(HarnessTestCase):
         # excuse is published in the evidence table for a reviewer to weigh.
         self.previous_ledger()
         self.assertEqual(self.run_finish(without_held_check()), 0)
-        self.assertTrue(self.harness.matching("issue", "close", "42"))
+        self.assertTrue(self.harness.forge_calls("issue-close", number=42))
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "CLEAN")
         self.assertEqual(payload["unaccounted"], [])
 
-    def test_an_unreadable_previous_body_holds_nothing_and_closes_nothing(self):
-        # Same rule as the delta: nothing can be joined against a body that
-        # could not be read, so nothing is claimed either way — and, since the
-        # collector contract landed, nothing is closed over it either: the
-        # ledger body is the only memory of what a collector holds, so a run
-        # that cannot read it leaves it as it was and reports partial. (This
-        # test asserted the close before that change; it is the one place the
-        # manifest-less path moved, deliberately — see the collector design.)
-        self.harness.replies = {"issue list": self.issue_list()}
-        self.harness.failures = {"issue view": 1}
+    def test_a_lost_store_without_a_manifest_holds_the_ledger_open(self):
+        # Nothing can be joined against a memory that is gone, and with no
+        # manifest there is no still-flagged set either: an empty document
+        # would close the ledger and its pull requests over findings nothing
+        # says were fixed. It stays open, partial, and says why.
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.harness.failures = {"issue-view !comments": 1}
         self.assertEqual(self.run_finish(naming_doc()), 0)
-        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "CLEAN")
         self.assertTrue(payload["partial"])
-        self.assertIn(audit_report.UNREADABLE_LEDGER_GAP, payload["coverage_gaps"])
+        self.assertIn(audit_report.LOST_MEMORY_UNGUARDED_GAP, payload["coverage_gaps"])
+        self.assertNotIn(audit_report.LOST_MEMORY_GAP, payload["coverage_gaps"])
+        self.assertEqual(payload["resolved"], 0)
+        self.assertEqual(payload["prs_closed"], [])
         self.assertEqual(payload["unaccounted"], [])
 
     def test_a_gap_takes_precedence_over_the_hold(self):
@@ -3855,16 +4153,16 @@ class TestHeldClose(HarnessTestCase):
         self.assertEqual(payload["status"], "CLEAN")
         self.assertTrue(payload["partial"])
         self.assertEqual(payload["unaccounted"], [])
-        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
 
     def test_a_standing_remediate_is_told_the_ledger_stays_open(self):
         self.previous_ledger()
-        self.harness.replies["--json comments"] = json.dumps(
+        self.harness.replies["*-view comments"] = comments_view(
             {"comments": [comment(f"/remediate {held_id()}")]}
         )
         self.assertEqual(self.run_finish(naming_doc()), 0)
         answers = [
-            b for b in self.harness.bodies_for("issue", "comment") if "/remediate" in b
+            b for b in self.harness.bodies_for("issue-comment") if "/remediate" in b
         ]
         self.assertEqual(len(answers), 1)
         self.assertNotIn("closing as completed", answers[0])
@@ -3912,7 +4210,7 @@ class TestStart(HarnessTestCase):
         )
 
     def test_emits_one_json_line(self):
-        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.replies = {"issue-list": self.issue_list()}
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
 
         out = self.out.strip()
@@ -3969,7 +4267,7 @@ class TestStart(HarnessTestCase):
         state and both `finish` calls rewrite one ledger.
         """
         self.patch_attr("claim_in_flight", self.real_claim_in_flight)
-        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.replies = {"issue-list": self.issue_list()}
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
         self.assertIn("is in flight since", self.err)
@@ -4024,7 +4322,7 @@ class TestStart(HarnessTestCase):
         # reader that took "does not parse" for "no note" would let two runs
         # through on it.
         self.patch_attr("claim_in_flight", self.real_claim_in_flight)
-        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.replies = {"issue-list": self.issue_list()}
         note = Path(audit_report.inflight_path_for(AUDIT))
         note.parent.mkdir(parents=True, exist_ok=True)
         note.write_text("")
@@ -4061,11 +4359,11 @@ class TestStart(HarnessTestCase):
 
     def test_a_failed_finish_frees_the_stream_and_a_dry_run_does_not(self):
         # Eight of nine SOPs loop `start --repo A; finish --repo A; start
-        # --repo B` on a multi-repo install. A `finish` that died on a `gh`
+        # --repo B` on a multi-repo install. A `finish` that died on a forge
         # call must not leave B refused for two hours; a `--dry-run` is a
         # preview mid-run and changes nothing.
         self.patch_attr("claim_in_flight", self.real_claim_in_flight)
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
         note = Path(audit_report.inflight_path_for(AUDIT))
         self.assertTrue(note.is_file())
@@ -4077,7 +4375,7 @@ class TestStart(HarnessTestCase):
         self.assertEqual(self.run_finish(make_doc(clusters=[])), 2)
         self.assertIn("scope.clusters", self.err)
         self.assertTrue(note.is_file())
-        self.harness.failures = {"issue create": 1}
+        self.harness.failures = {"issue-create": 1}
         self.assertEqual(self.run_finish(make_doc()), 1, self.err)
         self.assertFalse(note.is_file())
 
@@ -4086,7 +4384,7 @@ class TestStart(HarnessTestCase):
         # cannot open is a `start` that cannot know, so it exits 2 and touches
         # nothing: not the other run's note, and not its state.
         self.patch_attr("claim_in_flight", self.real_claim_in_flight)
-        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.replies = {"issue-list": self.issue_list()}
         note = Path(audit_report.inflight_path_for(AUDIT))
         note.parent.mkdir(parents=True, exist_ok=True)
         theirs = json.dumps({"audit": AUDIT, "started_at": time.time()})
@@ -4116,17 +4414,17 @@ class TestStart(HarnessTestCase):
         # The zero-finding run is the ordinary nightly outcome; it leaves by
         # the close branch, which must free the stream like the publish one.
         self.patch_attr("claim_in_flight", self.real_claim_in_flight)
-        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.replies = {"issue-list": self.issue_list()}
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
         note = Path(audit_report.inflight_path_for(AUDIT))
         self.assertTrue(note.is_file())
         self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
-        self.assertTrue(self.harness.matching("issue", "close", "42"))
+        self.assertTrue(self.harness.forge_calls("issue-close", number=42))
         self.assertFalse(note.is_file())
 
     def test_finish_releases_the_stream_and_a_stale_note_is_forgotten(self):
         self.patch_attr("claim_in_flight", self.real_claim_in_flight)
-        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.replies = {"issue-list": self.issue_list()}
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
         note = Path(audit_report.inflight_path_for(AUDIT))
         self.assertTrue(note.is_file())
@@ -4147,6 +4445,17 @@ class TestStart(HarnessTestCase):
         self.assertEqual(rc, 0, self.err)
         self.assertFalse(note.is_file())
 
+    def test_a_started_at_outside_datetime_s_range_counts_from_the_mtime(self):
+        # Milliseconds, `inf`, NaN: none is a time `report_status` can read,
+        # and an `inf` taken at face value would hold the lease past every
+        # TTL. The note is still a claim, so its mtime dates it.
+        note = Path(tempfile.mkdtemp(prefix="inflight-")) / "note.json"
+        self.addCleanup(shutil.rmtree, note.parent, ignore_errors=True)
+        for started_at in (1759000000000, float("inf"), float("nan")):
+            with self.subTest(started_at=started_at):
+                note.write_text(json.dumps({"audit": AUDIT, "started_at": started_at}))
+                self.assertEqual(audit_report._in_flight_since(note), note.stat().st_mtime)
+
     def test_a_note_write_that_fails_leaves_no_phantom_claim(self):
         # `write_text` opens O_TRUNC and then writes. A write that fails on
         # the shared volume (ENOSPC, EDQUOT, EIO) must not leave an empty
@@ -4155,7 +4464,7 @@ class TestStart(HarnessTestCase):
         # tick's included, for two hours with no run behind it. The note is
         # staged beside and moved into place, so a failure leaves nothing.
         self.patch_attr("claim_in_flight", self.real_claim_in_flight)
-        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.replies = {"issue-list": self.issue_list()}
         note = Path(audit_report.inflight_path_for(AUDIT))
         with patch.object(
             audit_report.os, "replace",
@@ -4181,7 +4490,7 @@ class TestStart(HarnessTestCase):
         # flock needs no writable descriptor, so the lock opens read-only;
         # a lock nobody can write must not refuse anyone.
         self.patch_attr("claim_in_flight", self.real_claim_in_flight)
-        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.replies = {"issue-list": self.issue_list()}
         note = Path(audit_report.inflight_path_for(AUDIT))
         lock = Path(f"{note}.lock")
         lock.parent.mkdir(parents=True, exist_ok=True)
@@ -4214,7 +4523,7 @@ class TestStart(HarnessTestCase):
         # of the stream failed the open for good. The umask is cleared for
         # the create, and put back.
         self.patch_attr("claim_in_flight", self.real_claim_in_flight)
-        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.replies = {"issue-list": self.issue_list()}
         note = Path(audit_report.inflight_path_for(AUDIT))
         lock = Path(f"{note}.lock")
         self.assertFalse(lock.exists())
@@ -4234,11 +4543,11 @@ class TestStart(HarnessTestCase):
         # The note means a run is under way. A `start` that raised left none
         # behind, so the operator's retry must not be refused for it.
         self.patch_attr("claim_in_flight", self.real_claim_in_flight)
-        self.harness.failures = {"issue list": 1}
+        self.harness.failures = {"issue-list": 1}
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 1)
         self.assertFalse(Path(audit_report.inflight_path_for(AUDIT)).is_file())
         self.harness.failures = {}
-        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.replies = {"issue-list": self.issue_list()}
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
 
     def test_start_hands_over_the_findings_the_ledger_carries(self):
@@ -4248,8 +4557,8 @@ class TestStart(HarnessTestCase):
             make_doc(findings=[held_finding(), make_finding(fid="a")]), generated_at=NOW
         )
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": body}),
         }
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
         carried = json.loads(self.out.strip())["carried"]
@@ -4274,12 +4583,12 @@ class TestStart(HarnessTestCase):
         ]
         audit_report.validate_findings(doc, AUDIT)
 
-    def test_an_unreadable_body_hands_over_nothing_and_says_so(self):
-        self.harness.replies = {"issue list": self.issue_list()}
-        self.harness.failures = {"--json body": 1}
+    def test_a_lost_store_hands_over_nothing_and_says_so(self):
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.harness.failures = {"issue-view !comments": 1}
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
         self.assertEqual(json.loads(self.out.strip())["carried"], [])
-        self.assertIn("could not read issue #42", self.err)
+        self.assertIn("unknowable", self.err)
 
     def test_start_hands_over_the_roster(self):
         """Coverage must not depend on how far into the SOP the worker read.
@@ -4298,7 +4607,7 @@ class TestStart(HarnessTestCase):
         for audit_id in audit_report.AUDITS:
             with self.subTest(audit=audit_id):
                 self.out = ""
-                self.harness.replies = {"issue list": "[]"}
+                self.harness.replies = {"issue-list": {"issues": []}}
                 self.assertEqual(self.run_main(["start", "--audit", audit_id]), 0)
                 payload = json.loads(self.out)
                 self.assertEqual(
@@ -4315,7 +4624,7 @@ class TestStart(HarnessTestCase):
         searched is the list the harness read, and so no SOP step needs a
         `kubectl get configmap` of its own.
         """
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         with patch.object(
             gitops_workspace,
             "get_context_github_repo_entries",
@@ -4332,7 +4641,7 @@ class TestStart(HarnessTestCase):
     def test_an_unreadable_context_key_degrades_to_none_and_says_so(self):
         # A filter over an optional list must not stop the audit: the run
         # searches the clone alone and every unmatched posture stays a finding.
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
 
         def unreadable():
             raise RuntimeError("kubectl failed: Forbidden")
@@ -4346,7 +4655,7 @@ class TestStart(HarnessTestCase):
     def test_the_workspace_is_named_so_manifests_can_be_written_into_it(self):
         # The agent does not start in a working tree, so a `remediation.path`
         # is meaningless unless `start` says what it is relative to.
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         self.run_main(["start", "--audit", AUDIT])
         reported = Path(json.loads(self.out)["workspace"])
         self.assertEqual(reported, self.workspace)
@@ -4356,7 +4665,7 @@ class TestStart(HarnessTestCase):
         # Six audits run from one cron file and their schedules collide. They
         # used to share a directory, so whichever one reached `finish` first
         # ran `checkout --force -B` over the other five's untracked manifests.
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         self.run_main(["start", "--audit", AUDIT])
         mine = Path(json.loads(self.out)["workspace"])
         self.out = ""
@@ -4371,7 +4680,7 @@ class TestStart(HarnessTestCase):
     def test_the_clone_is_marked_as_leased(self):
         # The marker the credential proxy looks for. Without it every git verb
         # that writes a tree is refused, including the audit's own.
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         self.run_main(["start", "--audit", AUDIT])
         reported = Path(json.loads(self.out)["workspace"])
         record = gitops_workspace.read_lease(reported.parent)
@@ -4379,7 +4688,7 @@ class TestStart(HarnessTestCase):
         self.assertEqual(record["owner"], f"fleet-audit:{AUDIT}")
 
     def test_null_issue_when_none_open(self):
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         self.run_main(["start", "--audit", "obtainability-audit"])
         self.assertIsNone(json.loads(self.out)["issue"])
 
@@ -4387,7 +4696,7 @@ class TestStart(HarnessTestCase):
         # The report branch is gone. `start` establishes the GitOps clone and
         # leaves it on main; it never cuts a branch of its own and never
         # pushes.
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         self.run_main(["start", "--audit", AUDIT])
         checkouts = self.harness.matching("git", "checkout")
         self.assertEqual(checkouts, [["git", "checkout", "-B", "main", "origin/main"]])
@@ -4400,7 +4709,7 @@ class TestStart(HarnessTestCase):
         # so `git rev-parse --show-toplevel` failed and no remediation pull
         # request could ever have been opened.
         self.unclone()
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         self.run_main(["start", "--audit", AUDIT])
         clones = [c for c in self.harness.calls if c[:2] == ["git", "clone"]]
         self.assertEqual(len(clones), 1)
@@ -4410,7 +4719,7 @@ class TestStart(HarnessTestCase):
 
     def test_a_second_run_fetches_instead_of_cloning_again(self):
         self.unclone()
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         self.run_main(["start", "--audit", AUDIT])
         self.harness.calls.clear()
         self.run_main(["start", "--audit", AUDIT])
@@ -4419,7 +4728,7 @@ class TestStart(HarnessTestCase):
 
     def test_a_stale_findings_file_is_removed(self):
         # A crashed run must not leave a document for the next one to publish.
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         stale = self.tmp_path / f"findings_{AUDIT}.json"
         stale.write_text('{"audit": "stale"}', encoding="utf-8")
         self.run_main(["start", "--audit", AUDIT])
@@ -4427,12 +4736,14 @@ class TestStart(HarnessTestCase):
 
     def test_pending_remediate_requests_are_reported(self):
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json comments": json.dumps(
+            "issue-list": self.issue_list(),
+            "*-view comments": comments_view(
                 {
                     "comments": [
                         comment("/remediate no-network-policy"),
-                        comment("/remediate nope", association="NONE"),
+                        # Its own login: standing is the forge's answer
+                        # about a person, not a field on each comment.
+                        comment("/remediate nope", association="NONE", login="drive-by"),
                     ]
                 }
             ),
@@ -4445,15 +4756,15 @@ class TestStart(HarnessTestCase):
 
     def test_a_gh_outage_fails_loudly_rather_than_reporting_no_ledger(self):
         # Returning "no issue" on a transport failure would open a duplicate.
-        self.harness.failures = {"issue list": 1}
+        self.harness.failures = {"issue-list": 1}
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 1)
         self.assertIn("could not list issues", self.err)
 
     def test_creates_labels(self):
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         self.run_main(["start", "--audit", AUDIT])
 
-        created = {c[3] for c in self.harness.matching("label", "create")}
+        created = {c["name"] for c in self.harness.forge_calls("label-ensure")}
         self.assertEqual(
             created,
             {
@@ -4498,7 +4809,7 @@ class TestDryRun(BaseTestCase):
 
         self.assertIn("## Findings", self.out)
         self.assertIn("<!-- audit-findings:", self.out)
-        self.assertEqual([c for c in recorder.calls if c[0] == "gh"], [])
+        self.assertEqual([c for c in recorder.calls if c[0] == "forge"], [])
         for call in recorder.calls:
             self.assertNotEqual(call[:2], ["git", "add"])
             self.assertNotEqual(call[:2], ["git", "push"])
@@ -4533,7 +4844,7 @@ class TestDryRun(BaseTestCase):
         self.assertIn("clusters/prod-us-east/payments-netpol.yaml", pr)
         self.assertIn("branch: platform-agent/fix-", pr)
         self.assertIn("title: ", pr)
-        # No `gh` call on this path, so the ledger number is genuinely unknown;
+        # No forge call on this path, so the ledger number is genuinely unknown;
         # the run says so rather than letting the gap read as a rendering bug.
         self.assertNotIn("Part of #", pr)
         self.assertIn("the 'Part of #N' link is omitted", self.err)
@@ -5090,9 +5401,9 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         audit_report.set_workspace(self.workspace)
         self.patch_attr("repo_root", lambda: self.workspace)
         self.harness.replies = {
-            "issue list": "[]",
-            "issue create": "https://github.com/acme/fleet/issues/7\n",
-            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
         }
         self.touch("clusters/prod-us-east/payments-db-pdb.yaml")
 
@@ -5111,7 +5422,7 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         return self.stdout_json() if not extra else None
 
     def ledger_body(self):
-        bodies = self.harness.bodies_for("issue", "create")
+        bodies = self.harness.bodies_for("issue-create")
         self.assertEqual(len(bodies), 1, bodies)
         return bodies[0]
 
@@ -5141,10 +5452,10 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         # and neither posture reaches the body as a finding, the delta block,
         # or a pull request.
         self.assertEqual(len(payload["prs_opened"]), 1)
-        self.assertEqual(len(self.harness.gh_calls("pr", "create")), 1)
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1)
         for fid in withheld:
             self.assertNotIn(fid, audit_report.parse_delta_block(body))
-            self.assertNotIn(fid, " ".join(" ".join(c) for c in self.harness.gh_calls("pr")))
+            self.assertNotIn(fid, json.dumps(self.harness.forge_calls("proposal-*")))
         for check in FAULT_CHECKS:
             self.assertIn(f"`{check}`", body)
         self.assertNotIn("### Major (", body.split("### Declared intent not searched")[0])
@@ -5238,7 +5549,7 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         ran, not only when a posture was written. With nothing to withhold
         the run still goes partial, and an open ledger does not close.
         """
-        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.replies = {"issue-list": self.issue_list()}
         self.record_run(context=self.CONTEXT)
         payload = self.finish(self.doc(findings=[]))
         self.assertEqual(payload["status"], "CLEAN")
@@ -5248,8 +5559,8 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         gap = self.declared_gaps(payload)[0]
         self.assertIn("posture checks ran with no declared-intent search on record", gap)
         self.assertIn("acme/terraform-live", gap)
-        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
-        comment = self.harness.bodies_for("issue", "comment")[0]
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+        comment = self.harness.bodies_for("issue-comment")[0]
         self.assertIn("did not see the whole fleet", comment)
         self.assertIn("declared intent:", comment)
 
@@ -5323,28 +5634,28 @@ class TestDeclaredIntentSearch(HarnessTestCase):
             generated_at=NOW,
         )
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous}),
         }
         self.record_run(context=self.CONTEXT)
         payload = self.finish(self.doc())
         self.assertEqual(payload["resolved"], 0)
         self.assertTrue(payload["partial"])
-        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
 
     def test_a_clean_run_over_withheld_postures_names_them_in_the_comment(self):
         # Every finding was a posture, so after the withhold the run is CLEAN
         # over a gap: the open ledger is not closed, and the comment — the one
         # artifact a clean run updates — lists what was held back.
-        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.replies = {"issue-list": self.issue_list()}
         self.record_run(context=self.CONTEXT)
         postures = [f for f in posture_and_fault_findings() if f["check"] in POSTURE_CHECKS]
         payload = self.finish(self.doc(findings=postures))
         self.assertEqual(payload["status"], "CLEAN")
         self.assertTrue(payload["partial"])
         self.assertEqual(len(payload["postures_withheld"]), 3)
-        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
-        comment = self.harness.bodies_for("issue", "comment")[0]
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+        comment = self.harness.bodies_for("issue-comment")[0]
         self.assertIn("3 posture finding(s) are withheld rather than published", comment)
         self.assertIn("- `no-pdb` on `Deployment/checkout-gateway` in `prod-us-east`", comment)
 
@@ -5361,7 +5672,7 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         self.assertIn("`Deployment/checkout-gateway`", self.out)
         self.assertIn("`blocking-pdb`", self.out)
         self.assertNotIn("### Minor (", self.out)
-        self.assertEqual(self.harness.gh_calls("issue"), [])
+        self.assertEqual(self.harness.forge_calls("issue-*"), [])
 
     def test_the_dry_run_renders_a_complete_search(self):
         self.record_run(context=self.CONTEXT)
@@ -5417,7 +5728,7 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         rc = self.run_finish(doc, audit=DECLARING_AUDIT)
         self.assertEqual(rc, 2)
         self.assertIn("declared_intent_searched[0]", self.err)
-        self.assertEqual(self.harness.gh_calls("issue", "create"), [])
+        self.assertEqual(self.harness.forge_calls("issue-create"), [])
 
     # -- start ----------------------------------------------------------------
 
@@ -5504,7 +5815,7 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         self.assertEqual(rc, 2, self.err)
         self.assertIn("withheld", self.err)
         self.assertIn("declared_intent_searched", self.err)
-        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
         # And `--dry-run`, which resolves no repository, holds the same line.
         rc = self.run_main(
             ["remediate", "--audit", DECLARING_AUDIT, "--findings-file", findings_file,
@@ -5544,14 +5855,14 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         """
         request = comment(f"/remediate {self.held_id()}")
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json comments": json.dumps({"comments": [request]}),
-            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "issue-list": self.issue_list(),
+            "*-view comments": comments_view({"comments": [request]}),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
         }
         self.record_run(context=self.CONTEXT)
         payload = self.finish(self.doc())
         self.assertTrue(payload["partial"])
-        posted = self.harness.bodies_for("issue", "comment")
+        posted = self.harness.bodies_for("issue-comment")
         deferrals = [b for b in posted if audit_report.deferred_marker("IC_1") in b]
         self.assertEqual(len(deferrals), 1, posted)
         self.assertIn("on hold, not refused", deferrals[0])
@@ -5562,21 +5873,21 @@ class TestDeclaredIntentSearch(HarnessTestCase):
             self.assertNotIn(audit_report.acked_marker("IC_1"), body)
         # The one pull request is the critical fault's auto-promotion; nothing
         # opened for the deferred posture.
-        self.assertEqual(len(self.harness.gh_calls("pr", "create")), 1)
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1)
         self.assertNotIn(
-            "checkout-gateway", " ".join(" ".join(c) for c in self.harness.gh_calls("pr", "create"))
+            "checkout-gateway", json.dumps(self.harness.forge_calls("proposal-create"))
         )
 
     def test_a_deferred_request_is_answered_once_per_hold(self):
         request = comment(f"/remediate {self.held_id()}")
         earlier = harness_comment(f"on hold\n{audit_report.deferred_marker('IC_1')}\n")
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json comments": json.dumps({"comments": [request, earlier]}),
+            "issue-list": self.issue_list(),
+            "*-view comments": comments_view({"comments": [request, earlier]}),
         }
         self.record_run(context=self.CONTEXT)
         self.finish(self.doc())
-        for body in self.harness.bodies_for("issue", "comment"):
+        for body in self.harness.bodies_for("issue-comment"):
             self.assertNotIn(audit_report.deferred_marker("IC_1"), body)
 
     def test_a_deferred_request_is_honoured_by_the_run_that_records_the_search(self):
@@ -5585,9 +5896,9 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         request = comment(f"/remediate {self.held_id()}")
         earlier = harness_comment(f"on hold\n{audit_report.deferred_marker('IC_1')}\n")
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json comments": json.dumps({"comments": [request, earlier]}),
-            "pr create": "https://github.com/acme/fleet/pull/9\n",
+            "issue-list": self.issue_list(),
+            "*-view comments": comments_view({"comments": [request, earlier]}),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/9"),
         }
         self.record_run(context=self.CONTEXT)
         # The posture carries a manifest this time, so there is something to open.
@@ -5604,9 +5915,9 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         self.assertFalse(payload["partial"])
         # Two pull requests: the critical fault's auto-promotion, and the
         # requested posture's.
-        self.assertEqual(len(self.harness.gh_calls("pr", "create")), 2)
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 2)
         acked = [
-            b for b in self.harness.bodies_for("issue", "comment")
+            b for b in self.harness.bodies_for("issue-comment")
             if audit_report.acked_marker("IC_1") in b
         ]
         self.assertEqual(len(acked), 1)
@@ -5617,14 +5928,14 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         # holding it — so the request is deferred there too, and not acked.
         request = comment(f"/remediate {self.held_id()}")
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json comments": json.dumps({"comments": [request]}),
+            "issue-list": self.issue_list(),
+            "*-view comments": comments_view({"comments": [request]}),
         }
         self.record_run(context=self.CONTEXT)
         postures = [f for f in posture_and_fault_findings() if f["check"] in POSTURE_CHECKS]
         payload = self.finish(self.doc(findings=postures))
         self.assertEqual(payload["status"], "CLEAN")
-        posted = self.harness.bodies_for("issue", "comment")
+        posted = self.harness.bodies_for("issue-comment")
         self.assertTrue(any(audit_report.deferred_marker("IC_1") in b for b in posted), posted)
         for body in posted:
             self.assertNotIn(audit_report.acked_marker("IC_1"), body)
@@ -5644,6 +5955,46 @@ class TestDeclaredIntentSearch(HarnessTestCase):
 
 # --------------------------------------------------------------------------- #
 # Harness-side declaration discovery and matching (the obtainability SOP's §4a)
+
+
+class ExplainEmptyDeclarationsTest(unittest.TestCase):
+    """The reason a note yields no declaration is the parser's own ladder, printed."""
+
+    GOOD = "---\ntype: decision\ndeclares:\n  - check: no-pdb\n    namespace: shop\n    object: Deployment/api\n---\nbody\n"
+
+    def test_each_early_return_names_its_reason_and_items_return_none(self):
+        cases = {
+            "no frontmatter": ("body only\n", "it has no frontmatter"),
+            "unclosed": ("---\ntype: decision\nbody\n", "it has no frontmatter"),
+            "invalid yaml": ("---\ntype: [\n---\n", "not valid YAML ("),
+            "pyyaml value error": ("---\ntype: decision\nreviewed: 2026-02-30\n---\n", "not valid YAML (ValueError)"),
+            "no type": ("---\ndeclares: []\n---\n", "has no `type`"),
+            # A sequence or a scalar parses cleanly and is not a mapping; the
+            # reason names the shape rather than a key the text may contain.
+            "list frontmatter": ("---\n- type: decision\n- declares: []\n---\n", "is a YAML list, not a mapping"),
+            "scalar frontmatter": ("---\njust words\n---\n", "is a YAML str, not a mapping"),
+            "no declares": ("---\ntype: decision\n---\n", "has no `declares` list"),
+            "declares not a list": ("---\ntype: decision\ndeclares: yes\n---\n", "is not a list"),
+            "declares empty": ("---\ntype: decision\ndeclares: []\n---\n", "list is empty"),
+        }
+        for label, (text, expected) in cases.items():
+            with self.subTest(label):
+                reason = audit_report.explain_empty_declarations(text)
+                self.assertIsNotNone(reason, label)
+                self.assertIn(expected, reason)
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(
+                        audit_report.parse_declarations(text, repo="acme/fleet", path="k/n.md", declarable=frozenset({"no-pdb"})),
+                        [],
+                    )
+        self.assertIsNone(audit_report.explain_empty_declarations(self.GOOD))
+
+    def test_the_explanation_logs_nothing(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            audit_report.explain_empty_declarations("---\ntype: [\n---\n")
+            audit_report.explain_empty_declarations("---\ntype: decision\ndeclares: yes\n---\n")
+        self.assertEqual(err.getvalue(), "")
 # --------------------------------------------------------------------------- #
 
 
@@ -6101,7 +6452,7 @@ class DiscoveryTestCase(HarnessTestCase):
         audit_report.set_workspace(self.workspace)
         self.patch_attr("repo_root", lambda: self.workspace)
         self.scratch = Path(audit_report.SCRATCH_DIR)
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
 
     def write(self, root, relative, text):
         target = Path(root) / relative
@@ -6790,9 +7141,9 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
         audit_report.set_workspace(self.workspace)
         self.patch_attr("repo_root", lambda: self.workspace)
         self.harness.replies = {
-            "issue list": "[]",
-            "issue create": "https://github.com/acme/fleet/issues/7\n",
-            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
         }
         self.touch("clusters/prod-us-east/payments-db-pdb.yaml")
         Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
@@ -6828,7 +7179,7 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
         return self.stdout_json() if not extra else None
 
     def ledger_body(self):
-        bodies = self.harness.bodies_for("issue", "create")
+        bodies = self.harness.bodies_for("issue-create")
         self.assertEqual(len(bodies), 1, bodies)
         return bodies[0]
 
@@ -6914,7 +7265,7 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
         self.assertEqual(payload["declared"], 0)
         self.assertEqual(payload["new"], 5)
         self.harness.calls.clear()
-        self.harness.bodies.clear()
+        self.harness.payloads.clear()
         self.file(self.entry(cluster="prod-us-east"))
         payload = self.finish(self.doc())
         self.assertEqual(payload["declared"], 1)
@@ -6963,7 +7314,7 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
         self.assertIn(f"[`{dangling}`]", self.ledger_body())
         # The same declaration moves the posture shape.
         self.harness.calls.clear()
-        self.harness.bodies.clear()
+        self.harness.payloads.clear()
         findings = self.doc()["findings"]
         for finding in findings:
             if finding["check"] == "hpa-cannot-scale":
@@ -7027,7 +7378,7 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
         self.assertIn("DECLARED: 1 posture(s)", self.err)
         self.assertIn("## Declared intent", self.out)
         self.assertIn("`acme/fleet:knowledge/checkout.md`", self.out)
-        self.assertEqual(self.harness.gh_calls("issue"), [])
+        self.assertEqual(self.harness.forge_calls("issue-*"), [])
 
     def test_remediate_refuses_a_declared_id_by_name(self):
         self.record()
@@ -7042,7 +7393,7 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
                 self.assertEqual(rc, 2, self.err)
                 self.assertIn("declared", self.err)
                 self.assertIn("Declared intent", self.err)
-        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
 
     def test_remediate_still_opens_a_fault_beside_a_declared_posture(self):
         self.record()
@@ -7060,8 +7411,8 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
     def ledger_with(self, *comments):
         self.harness.replies.update(
             {
-                "issue list": self.issue_list(),
-                "--json comments": json.dumps({"comments": list(comments)}),
+                "issue-list": self.issue_list(),
+                "*-view comments": comments_view({"comments": list(comments)}),
             }
         )
 
@@ -7080,7 +7431,7 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
         self.ledger_with(comment(f"/remediate {self.PDB_ID()}"))
         payload = self.finish(self.doc())
         self.assertEqual(payload["declared"], 1)
-        posted = self.harness.bodies_for("issue", "comment")
+        posted = self.harness.bodies_for("issue-comment")
         refusals = [b for b in posted if audit_report.refused_marker("IC_1") in b]
         self.assertEqual(len(refusals), 1, posted)
         self.assertIn("`acme/fleet:knowledge/checkout.md`", refusals[0])
@@ -7091,7 +7442,7 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
             self.assertNotIn(audit_report.deferred_marker("IC_1"), body)
             self.assertNotIn(audit_report.acked_marker("IC_1"), body)
         self.assertNotIn(
-            "checkout-gateway", " ".join(" ".join(c) for c in self.harness.gh_calls("pr", "create"))
+            "checkout-gateway", json.dumps(self.harness.forge_calls("proposal-create"))
         )
 
     def test_a_clean_run_refuses_a_request_for_a_declared_posture(self):
@@ -7106,7 +7457,7 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
         payload = self.finish(self.doc(findings=postures))
         self.assertEqual(payload["status"], "CLEAN")
         self.assertEqual(payload["declared"], 1)
-        posted = self.harness.bodies_for("issue", "comment")
+        posted = self.harness.bodies_for("issue-comment")
         refusals = [b for b in posted if audit_report.refused_marker("IC_1") in b]
         self.assertEqual(len(refusals), 1, posted)
         self.assertIn("`acme/fleet:knowledge/checkout.md`", refusals[0])
@@ -7126,7 +7477,7 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
         self.ledger_with(comment(f"/remediate {self.PDB_ID()}"))
         payload = self.finish(self.doc())
         self.assertEqual(payload["declared"], 1)
-        posted = self.harness.bodies_for("issue", "comment")
+        posted = self.harness.bodies_for("issue-comment")
         refusals = [b for b in posted if audit_report.refused_marker("IC_1") in b]
         self.assertEqual(len(refusals), 1, posted)
         self.assertIn("`acme/fleet:knowledge/check'out.md`", refusals[0])
@@ -7416,6 +7767,17 @@ class TestRenderBudget(BaseTestCase):
     def test_truncation_notice_names_the_omitted_count(self):
         body = self.render(make_doc(findings=bulk_findings(250)))
         self.assertRegex(body, r"\d+ further finding\(s\) are omitted")
+        self.assertIn("kept in full in this run's stored report", body)
+
+    def test_an_evidence_table_that_does_not_fit_says_where_it_went(self):
+        clusters = make_doc()["scope"]["clusters"]
+        whole = audit_report._render_check_evidence(clusters, AUDIT, 10**6)
+        self.assertIn("</details>", whole)
+        dropped = audit_report._render_check_evidence(clusters, AUDIT, 400)
+        self.assertNotIn("</details>", "\n".join(dropped))
+        self.assertIn("omitted here", "\n".join(dropped))
+        self.assertIn("stored report", "\n".join(dropped))
+        self.assertEqual(audit_report._render_check_evidence(clusters, AUDIT, 10), [])
 
     def test_title_carries_the_true_total_even_when_truncated(self):
         findings = bulk_findings(250)
@@ -8696,17 +9058,16 @@ class TestOpenRemediationPr(HarnessTestCase):
         self.err = err.getvalue()
         return result
 
-    def flag_values(self, flag):
-        """Every value passed under `flag` across the run's `gh pr edit` calls."""
+    def label_values(self, field):
+        """Every label named under `field` across the run's `proposal-update` calls."""
         return {
-            arg
-            for call in self.harness.gh_calls("pr", "edit")
-            for i, arg in enumerate(call)
-            if i and call[i - 1] == flag
+            label
+            for call in self.harness.forge_calls("proposal-update")
+            for label in call.get(field) or []
         }
 
     def test_branch_commit_push_then_create_in_that_order(self):
-        self.harness.replies = {"pr create": "https://github.com/acme/fleet/pull/8\n"}
+        self.harness.replies = {"proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8")}
         url = self.open_it()
 
         self.assertEqual(url, "https://github.com/acme/fleet/pull/8")
@@ -8717,7 +9078,7 @@ class TestOpenRemediationPr(HarnessTestCase):
         order = [
             c
             for c in self.harness.calls
-            if c[0] in ("git", "gh") and c[1] not in ("symbolic-ref", "remote")
+            if c[0] in ("git", "forge") and c[1] not in ("symbolic-ref", "remote")
         ]
         self.assertEqual(order[0], ["git", "fetch", "origin", "main"])
         self.assertEqual(
@@ -8729,25 +9090,28 @@ class TestOpenRemediationPr(HarnessTestCase):
         self.assertEqual(order[3], ["git", "diff", "--cached", "--quiet"])
         self.assertEqual(order[4][:2], ["git", "commit"])
         self.assertEqual(order[5], ["git", "push", "-f", "origin", branch])
-        self.assertEqual(order[6][:2], ["gh", "pr"])
+        self.assertEqual(order[6], ["forge", "proposal-create"])
 
         # The file the pull request carries comes from the snapshot, not from
         # whatever survived the forced checkout.
         self.assertEqual((self.workspace / self.path).read_bytes(), b"# fix\n")
 
     def test_create_carries_all_four_labels(self):
-        self.harness.replies = {"pr create": "https://github.com/acme/fleet/pull/8\n"}
+        self.harness.replies = {"proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8")}
         self.open_it()
-        create = self.harness.gh_calls("pr", "create")[0]
+        create = self.harness.forge_calls("proposal-create")[0]
+        # A proposal is opened unlabelled and labelled by the next call, the
+        # one verb that takes labels on a pull request.
+        (labelled,) = self.harness.forge_calls("proposal-update", number=8)
         for label in (
             "agent:audit",
             f"audit:{AUDIT}",
             "audit:remediation",
             "severity:critical",
         ):
-            self.assertIn(label, create, label)
-        self.assertIn("--base", create)
-        self.assertIn("main", create)
+            self.assertIn(label, labelled["labelsAdd"], label)
+        self.assertEqual(create["target"], "main")
+        self.assertEqual(create["source"], self.branch)
 
     def test_nothing_to_commit_opens_no_pull_request(self):
         # main already carries the fix. Opening a diff-less PR is the exact
@@ -8756,7 +9120,7 @@ class TestOpenRemediationPr(HarnessTestCase):
         self.assertIsNone(self.open_it())
         self.assertFalse(self.harness.matching("git", "commit"))
         self.assertFalse(self.harness.matching("git", "push"))
-        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
 
     def test_an_unreadable_index_is_never_read_as_already_fixed(self):
         # rc 0 is "nothing staged" and rc 1 is "there is a commit to make".
@@ -8773,10 +9137,10 @@ class TestOpenRemediationPr(HarnessTestCase):
         existing = pr(8, self.branch)
         url = self.open_it(existing=existing)
         self.assertEqual(url, "https://github.com/acme/fleet/pull/8")
-        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
-        edit = self.harness.gh_calls("pr", "edit")[0]
-        self.assertIn("8", edit)
-        self.assertIn("--body-file", edit)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+        edit = self.harness.forge_calls("proposal-update")[0]
+        self.assertEqual(edit["number"], 8)
+        self.assertTrue(edit["body"])
 
     def test_refreshing_an_open_pr_re_applies_its_labels(self):
         # Pull requests 34, 35 and 36 in the reference installation were
@@ -8785,7 +9149,7 @@ class TestOpenRemediationPr(HarnessTestCase):
         # request the audit still owns has to keep saying so.
         self.open_it(existing=pr(8, self.branch))
         self.assertEqual(
-            self.flag_values("--add-label"),
+            self.label_values("labelsAdd"),
             {"agent:audit", f"audit:{AUDIT}", "audit:remediation", "severity:critical"},
         )
 
@@ -8794,40 +9158,77 @@ class TestOpenRemediationPr(HarnessTestCase):
         # on means a finding that escalated still sorts as what it used to be.
         self.open_it(existing=pr(8, self.branch))
         self.assertEqual(
-            self.flag_values("--remove-label"), {"severity:major", "severity:minor"}
+            self.label_values("labelsRemove"), {"severity:major", "severity:minor"}
         )
 
     def test_the_body_edit_survives_a_label_failure(self):
         # A repository whose labels someone deleted by hand must not abort the
         # remediation half of the run. The label sync is a separate,
         # non-checking call for exactly this.
-        self.harness.failures = {"--add-label agent:audit": 1}
+        self.harness.failures = {"proposal-update labelsAdd=agent:audit": 1}
         url = self.open_it(existing=pr(8, self.branch))
         self.assertEqual(url, "https://github.com/acme/fleet/pull/8")
 
     def test_a_label_failure_is_logged_rather_than_swallowed(self):
-        # All six labels move in one `gh` call, so one unresolvable name
+        # All six labels move in one forge call, so one unresolvable name
         # applies none of them. Swallowing that leaves a refresh that did
         # nothing looking exactly like a refresh with nothing to do — which is
         # how the gap this function closes survived unnoticed in the first
         # place.
-        self.harness.failures = {"--add-label agent:audit": 1}
+        self.harness.failures = {"proposal-update labelsAdd=agent:audit": 1}
         self.open_it(existing=pr(8, self.branch))
         self.assertIn("could not re-apply the audit labels", self.err)
         self.assertIn("simulated failure", self.err)
 
-    def test_a_newly_created_pr_is_not_double_labelled(self):
-        # `gh pr create --label` already carries them; a second round-trip per
-        # pull request would buy nothing.
-        self.harness.replies = {"pr create": "https://github.com/acme/fleet/pull/8\n"}
+    def test_a_newly_created_pr_is_labelled_once_and_not_refreshed(self):
+        # `proposal-create` takes no labels, so a new pull request is labelled
+        # by one update carrying them. The title and body it was opened with
+        # are current; editing them again would buy nothing.
+        self.harness.replies = {"proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8")}
         self.open_it()
-        self.assertEqual(self.harness.gh_calls("pr", "edit"), [])
+        (update,) = self.harness.forge_calls("proposal-update")
+        self.assertEqual(update["number"], 8)
+        self.assertNotIn("title", update)
+        self.assertNotIn("body", update)
 
     def test_a_closed_pr_on_the_branch_is_replaced_not_reopened(self):
-        self.harness.replies = {"pr create": "https://github.com/acme/fleet/pull/9\n"}
+        self.harness.replies = {"proposal-create": created("proposal", "https://github.com/acme/fleet/pull/9")}
         self.open_it(existing=pr(8, self.branch, state="CLOSED"))
-        self.assertEqual(self.harness.gh_calls("pr", "edit"), [])
-        self.assertEqual(len(self.harness.gh_calls("pr", "create")), 1)
+        self.assertEqual(self.harness.forge_calls("proposal-update", number=8), [])
+        self.assertEqual(self.harness.forge_calls("proposal-reopen"), [])
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1)
+
+    def test_an_unlabelled_pr_on_the_branch_is_adopted_when_create_is_refused(self):
+        # A run whose label step failed left its pull request open but
+        # unlabelled, so the labelled listing never hands it back as `existing`
+        # and the forge refuses a second one from the same branch. Look it up
+        # by branch and bring it current instead of failing every later run.
+        self.harness.failures = {"proposal-create": 1}
+        self.harness.replies = {
+            f"proposal-list source={self.branch}": proposals_view([pr(8, self.branch)]),
+        }
+        url = self.open_it()
+        self.assertEqual(url, "https://github.com/acme/fleet/pull/8")
+        refresh = self.harness.forge_calls("proposal-update", number=8)
+        self.assertTrue(any(call.get("title") for call in refresh))
+        self.assertIn("agent:audit", self.label_values("labelsAdd"))
+
+    def test_a_pr_a_person_opened_on_the_branch_is_not_adopted(self):
+        # Review finding: adoption rewrote the title and body of whatever was
+        # open on the branch, including a pull request someone opened by hand.
+        self.harness.failures = {"proposal-create": 1}
+        theirs = dict(pr(8, self.branch), author="alice")
+        self.harness.replies = {
+            f"proposal-list source={self.branch}": proposals_view([theirs]),
+        }
+        with self.assertRaises(audit_report.ForgeError):
+            self.open_it()
+        self.assertEqual(self.harness.forge_calls("proposal-update", number=8), [])
+
+    def test_a_refused_create_with_no_pr_on_the_branch_still_fails(self):
+        self.harness.failures = {"proposal-create": 1}
+        with self.assertRaises(audit_report.ForgeError):
+            self.open_it()
 
 
 class TestOpenRefreshIsUnreachable(BaseTestCase):
@@ -8880,8 +9281,8 @@ class TestLabelDescriptions(HarnessTestCase):
     """Every label `ensure_labels` creates has to be creatable.
 
     GitHub caps a label description at 100 characters and answers `422` past
-    it. `gh label create` runs with `check=False`, so the failure is silent and
-    the label simply never exists — which for `audit:stale-closed` means every
+    it. `ensure_labels` creates each label best-effort, so the failure is silent
+    and the label simply never exists — which for `audit:stale-closed` means every
     harness close reads as a human rejection and no finding is re-proposed.
     """
 
@@ -8893,12 +9294,12 @@ class TestLabelDescriptions(HarnessTestCase):
         before = len(self.harness.calls)
         audit_report.ensure_labels("acme/fleet", audit_id)
         calls = [
-            call
-            for call in self.harness.calls[before:]
-            if call[:3] == ["gh", "label", "create"]
+            payload
+            for call, payload in zip(self.harness.calls[before:], self.harness.payloads[before:])
+            if call == ["forge", "label-ensure"]
         ]
         self.assertTrue(calls, "ensure_labels created no labels")
-        return {call[3]: call[call.index("--description") + 1] for call in calls}
+        return {call["name"]: call["description"] for call in calls}
 
     def test_label_descriptions_fit_github_s_limit(self):
         # Every stream, not just one: the per-audit description interpolates
@@ -8938,22 +9339,21 @@ class TestSyncOpenRemediationLabels(HarnessTestCase):
             )
         self.err = err.getvalue()
 
-    def flag_values(self, flag):
+    def label_values(self, field):
         return {
-            arg
-            for call in self.harness.gh_calls("pr", "edit")
-            for i, arg in enumerate(call)
-            if i and call[i - 1] == flag
+            label
+            for call in self.harness.forge_calls("proposal-update")
+            for label in call.get(field) or []
         }
 
     def test_an_open_pr_gets_its_labels_back(self):
         self.sync()
         self.assertEqual(
-            self.flag_values("--add-label"),
+            self.label_values("labelsAdd"),
             {"agent:audit", f"audit:{AUDIT}", "audit:remediation", "severity:critical"},
         )
         self.assertEqual(
-            self.flag_values("--remove-label"), {"severity:major", "severity:minor"}
+            self.label_values("labelsRemove"), {"severity:major", "severity:minor"}
         )
 
     def test_nothing_but_labels_is_touched(self):
@@ -8962,16 +9362,16 @@ class TestSyncOpenRemediationLabels(HarnessTestCase):
         # Anything that pushes or rewrites the body belongs in the promote path.
         self.sync()
         self.assertEqual([c for c in self.harness.calls if c[0] == "git"], [])
-        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
-        edit = self.harness.gh_calls("pr", "edit")[0]
-        self.assertNotIn("--body-file", edit)
-        self.assertNotIn("--title", edit)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+        edit = self.harness.forge_calls("proposal-update")[0]
+        self.assertNotIn("body", edit)
+        self.assertNotIn("title", edit)
 
     def test_a_group_is_labelled_once_not_once_per_finding(self):
-        # Every finding in a group resolves to the same pull request. One `gh`
+        # Every finding in a group resolves to the same pull request. One forge
         # call per finding would be N-1 pointless round trips and N-1 webhooks.
         self.sync(findings=[make_finding(fid="a"), make_finding(fid="b")])
-        self.assertEqual(len(self.harness.gh_calls("pr", "edit")), 1)
+        self.assertEqual(len(self.harness.forge_calls("proposal-update")), 1)
 
     def test_the_severity_is_recomputed_from_the_group(self):
         # The escalation case: the pull request was opened when the group held
@@ -8981,26 +9381,26 @@ class TestSyncOpenRemediationLabels(HarnessTestCase):
             make_finding(fid="b", severity="critical"),
         ]
         self.sync(findings=findings, prs=[pr(9, audit_report.group_branch_for(AUDIT, findings))])
-        self.assertIn("severity:critical", self.flag_values("--add-label"))
+        self.assertIn("severity:critical", self.label_values("labelsAdd"))
         self.assertEqual(
-            self.flag_values("--remove-label"), {"severity:major", "severity:minor"}
+            self.label_values("labelsRemove"), {"severity:major", "severity:minor"}
         )
 
     def test_a_finding_with_no_pull_request_is_left_alone(self):
         self.sync(prs=[])
-        self.assertEqual(self.harness.gh_calls("pr", "edit"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-update"), [])
 
     def test_a_closed_pull_request_is_left_alone(self):
         # A closed pull request is a decision, not a labelling accident.
         self.sync(prs=[pr(9, self.branch, state="CLOSED")])
-        self.assertEqual(self.harness.gh_calls("pr", "edit"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-update"), [])
 
     def test_a_merged_pull_request_is_left_alone(self):
         self.sync(prs=[pr(9, self.branch, state="MERGED", merged_at="2026-01-01T00:00:00Z")])
-        self.assertEqual(self.harness.gh_calls("pr", "edit"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-update"), [])
 
     def test_a_label_failure_is_logged_rather_than_swallowed(self):
-        self.harness.failures = {"--add-label agent:audit": 1}
+        self.harness.failures = {"proposal-update labelsAdd=agent:audit": 1}
         self.sync()
         self.assertIn("could not re-apply the audit labels", self.err)
 
@@ -9011,8 +9411,8 @@ class TestRemediationBaseBranch(HarnessTestCase):
     Hardcoding `main` did not degrade on a repository that uses something else,
     it aborted: `git fetch origin main` fails, and the remediation half of the
     run dies after the findings have already been written and the ledger
-    updated. So these assert the fetch, the checkout *and* the `--base` handed
-    to `gh pr create` — all three have to agree, and a fix that only changed
+    updated. So these assert the fetch, the checkout *and* the `target` handed
+    to `proposal-create` — all three have to agree, and a fix that only changed
     the fetch would open pull requests against a branch they were never cut
     from.
     """
@@ -9023,7 +9423,7 @@ class TestRemediationBaseBranch(HarnessTestCase):
         self.snapshot = {
             "clusters/prod-us-east/payments-netpol.yaml": b"# fix\n",
         }
-        self.harness.replies = {"pr create": "https://github.com/acme/fleet/pull/8\n"}
+        self.harness.replies = {"proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8")}
 
     def open_it(self):
         with contextlib.redirect_stderr(io.StringIO()):
@@ -9039,8 +9439,7 @@ class TestRemediationBaseBranch(HarnessTestCase):
             )
 
     def base_used(self):
-        create = self.harness.gh_calls("pr", "create")[0]
-        return create[create.index("--base") + 1]
+        return self.harness.forge_calls("proposal-create")[0]["target"]
 
     def test_a_master_repository_is_branched_from_master(self):
         self.harness.origin_head = "origin/master"
@@ -9143,33 +9542,33 @@ class TestStaleCloseEligibility(HarnessTestCase):
         closed = self.close([stale], set())
 
         self.assertEqual(closed, ["https://github.com/acme/fleet/pull/8"])
-        comment = self.harness.gh_calls("pr", "comment")[0]
-        self.assertIn("8", comment)
-        close = self.harness.gh_calls("pr", "close")[0]
+        comment = self.harness.forge_calls("proposal-comment")[0]
+        self.assertEqual(comment["number"], 8)
+        close = self.harness.forge_calls("proposal-close")[0]
         # The branch outlives the pull request: a returning finding pushes to it.
-        self.assertNotIn("--delete-branch", close)
+        self.assertEqual(set(close), {"number", "repository"}, close)
         # Comment before close, so the reason is on the PR when it closes.
         self.assertLess(
-            self.harness.calls.index(comment), self.harness.calls.index(close)
+            self.harness.payloads.index(comment), self.harness.payloads.index(close)
         )
 
     def test_a_pr_with_one_live_finding_stays_open(self):
         live = pr(8, "platform-agent/fix-x", body=audit_report.delta_block(["a", "b"]))
         self.assertEqual(self.close([live], {"b"}), [])
-        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
 
     def test_an_already_closed_pr_is_left_alone(self):
         done = pr(
             8, "platform-agent/fix-x", state="MERGED", body=audit_report.delta_block(["a"])
         )
         self.assertEqual(self.close([done], set()), [])
-        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
 
     def test_a_pr_with_no_hidden_block_is_left_alone(self):
         # Hand-opened, or opened by an older harness: it says nothing about
         # which findings it covers, so closing it would be a guess.
         self.assertEqual(self.close([pr(8, "b", body="hello")], set()), [])
-        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
 
     def test_a_pr_stamped_with_another_scheme_is_left_alone(self):
         # It names findings by ids this run cannot join against, so "none of
@@ -9181,7 +9580,7 @@ class TestStaleCloseEligibility(HarnessTestCase):
             body='<!-- audit-findings: ["a"] -->\n<!-- audit-id-scheme: 0 -->',
         )
         self.assertEqual(self.close([old], set()), [])
-        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
 
     def test_an_orphaned_branch_closes_whatever_scheme_stamped_it(self):
         # The orphan rule joins on manifest paths, not ids, so the stamp has no
@@ -9202,7 +9601,7 @@ class TestStaleCloseEligibility(HarnessTestCase):
             branch_by_finding={"a": "platform-agent/fix-current"},
         )
         self.assertEqual(closed, ["https://github.com/acme/fleet/pull/8"])
-        body = "".join(self.harness.bodies_for("pr", "comment"))
+        body = "".join(self.harness.bodies_for("proposal-comment"))
         self.assertIn("Old title", body)
         # The ids do not join under this scheme, so "no longer reproduces" is
         # not something this run established. The branch is.
@@ -9227,26 +9626,26 @@ class TestMergedButPersists(HarnessTestCase):
         )
 
     def test_comments_once_and_never_reopens(self):
-        self.harness.replies = {"--json comments": json.dumps({"comments": []})}
+        self.harness.replies = {"*-view comments": comments_view({"comments": []})}
         self.run_it({"a": self.merged})
-        comment = self.harness.gh_calls("pr", "comment")[0]
-        self.assertIn("8", comment)
-        self.assertEqual(self.harness.gh_calls("pr", "reopen"), [])
+        comment = self.harness.forge_calls("proposal-comment")[0]
+        self.assertEqual(comment["number"], 8)
+        self.assertEqual(self.harness.forge_calls("proposal-reopen"), [])
 
     def test_a_marker_in_the_pr_body_proves_nothing(self):
         # The harness writes this marker into a comment it posts and never into
         # a body, so a body carrying one was put there by whoever can edit the
         # body. Trusting it silenced "your merged fix did not take" for good.
         self.merged["body"] = f"merged\n{audit_report.persists_marker('a')}\n"
-        self.harness.replies = {"--json comments": json.dumps({"comments": []})}
+        self.harness.replies = {"*-view comments": comments_view({"comments": []})}
         self.run_it({"a": self.merged})
-        self.assertEqual(len(self.harness.gh_calls("pr", "comment")), 1)
+        self.assertEqual(len(self.harness.forge_calls("proposal-comment")), 1)
 
     def test_silent_when_the_marker_is_already_in_a_pr_comment(self):
         prior = harness_comment(f"said it\n{audit_report.persists_marker('a')}\n")
-        self.harness.replies = {"--json comments": json.dumps({"comments": [prior]})}
+        self.harness.replies = {"*-view comments": comments_view({"comments": [prior]})}
         self.run_it({"a": self.merged})
-        self.assertEqual(self.harness.gh_calls("pr", "comment"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-comment"), [])
 
     def test_anyone_elses_comment_cannot_forge_the_marker(self):
         # The id is printed on the public ledger, so there is nothing to guess:
@@ -9257,13 +9656,13 @@ class TestMergedButPersists(HarnessTestCase):
             login="drive-by",
             association="NONE",
         )
-        self.harness.replies = {"--json comments": json.dumps({"comments": [forged]})}
+        self.harness.replies = {"*-view comments": comments_view({"comments": [forged]})}
         self.run_it({"a": self.merged})
-        self.assertEqual(len(self.harness.gh_calls("pr", "comment")), 1)
+        self.assertEqual(len(self.harness.forge_calls("proposal-comment")), 1)
 
     def test_an_open_pr_is_not_the_persists_case(self):
         self.run_it({"a": pr(8, "platform-agent/fix-x")})
-        self.assertEqual(self.harness.gh_calls("pr", "comment"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-comment"), [])
 
 
 class TestReplyToRefusals(HarnessTestCase):
@@ -9276,19 +9675,19 @@ class TestReplyToRefusals(HarnessTestCase):
 
     def test_one_reply_carrying_the_requesting_comment_id(self):
         audit_report.reply_to_refusals("acme/fleet", 42, [self.refusal()], [], NOW)
-        self.assertEqual(len(self.harness.gh_calls("issue", "comment")), 1)
+        self.assertEqual(len(self.harness.forge_calls("issue-comment")), 1)
 
     def test_silent_when_that_comment_was_already_answered(self):
         answered = [harness_comment(f"earlier\n{audit_report.refused_marker('IC_1')}\n")]
         audit_report.reply_to_refusals("acme/fleet", 42, [self.refusal()], answered, NOW)
-        self.assertEqual(self.harness.gh_calls("issue", "comment"), [])
+        self.assertEqual(self.harness.forge_calls("issue-comment"), [])
 
     def test_a_different_comment_still_gets_its_own_reply(self):
         answered = [harness_comment(f"earlier\n{audit_report.refused_marker('IC_1')}\n")]
         audit_report.reply_to_refusals(
             "acme/fleet", 42, [self.refusal("IC_2")], answered, NOW
         )
-        self.assertEqual(len(self.harness.gh_calls("issue", "comment")), 1)
+        self.assertEqual(len(self.harness.forge_calls("issue-comment")), 1)
 
     def test_the_refused_requester_cannot_answer_their_own_refusal(self):
         # The refusal names why the command was declined. Quoting the marker
@@ -9302,16 +9701,16 @@ class TestReplyToRefusals(HarnessTestCase):
             )
         ]
         audit_report.reply_to_refusals("acme/fleet", 42, [self.refusal()], answered, NOW)
-        self.assertEqual(len(self.harness.gh_calls("issue", "comment")), 1)
+        self.assertEqual(len(self.harness.forge_calls("issue-comment")), 1)
 
 
 class TestAutoPromotionInFinish(HarnessTestCase):
     def setUp(self):
         super().setUp()
         self.harness.replies = {
-            "issue list": "[]",
-            "issue create": "https://github.com/acme/fleet/issues/7\n",
-            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
             "rev-parse --abbrev-ref": "feature-branch\n",
         }
 
@@ -9320,14 +9719,14 @@ class TestAutoPromotionInFinish(HarnessTestCase):
         self.assertEqual(self.run_finish(make_doc()), 0)
         out = self.stdout_json()
         self.assertEqual(out["prs_opened"], ["https://github.com/acme/fleet/pull/8"])
-        self.assertEqual(len(self.harness.gh_calls("pr", "create")), 1)
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1)
 
     def test_the_ledger_is_rewritten_once_the_pull_request_exists(self):
         # The body was rendered before the PR had a number, so it could not
         # have linked it. One extra edit beats making a reader wait a day.
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.run_finish(make_doc())
-        self.assertTrue(self.harness.gh_calls("issue", "edit", "7"))
+        self.assertTrue(self.harness.forge_calls("issue-update", number=7))
 
     def test_a_gcloud_critical_is_never_auto_promoted(self):
         doc = make_doc(
@@ -9336,7 +9735,7 @@ class TestAutoPromotionInFinish(HarnessTestCase):
             ]
         )
         self.assertEqual(self.run_finish(doc), 0)
-        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
 
     def test_the_cap_holds_and_the_ledger_names_what_it_withheld(self):
         findings = []
@@ -9356,7 +9755,7 @@ class TestAutoPromotionInFinish(HarnessTestCase):
 
         self.assertEqual(self.run_finish(make_doc(findings=findings)), 0)
         self.assertEqual(
-            len(self.harness.gh_calls("pr", "create")), audit_report.AUTO_PROMOTION_CAP
+            len(self.harness.forge_calls("proposal-create")), audit_report.AUTO_PROMOTION_CAP
         )
         body = render_body(
             make_doc(findings=findings),
@@ -9394,15 +9793,25 @@ class TestAutoPromotionInFinish(HarnessTestCase):
         self.assertNotIn("degrades to a manual remediation", self.err)
         self.assertIn(f"platform-agent/fix-{AUDIT}", self.err)
         self.assertIn("## Files", self.out)
-        self.assertEqual(self.harness.gh_calls("issue"), [])
-        self.assertEqual(self.harness.gh_calls("pr"), [])
+        self.assertEqual(self.harness.forge_calls("issue-*"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-*"), [])
 
     def test_a_failed_pr_create_does_not_fail_the_run(self):
         # The ledger is already published; the finding shows as having no PR
         # and the next run retries. Losing the report costs more.
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
-        self.harness.failures = {"pr create": 1}
+        self.harness.failures = {"proposal-create": 1}
         self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assertEqual(self.stdout_json()["prs_opened"], [])
+        self.assertIn("could not publish the fix", self.err)
+
+    def test_a_failed_label_after_create_does_not_fail_the_run(self):
+        # The pull request exists but carries no label to be found by, so it
+        # is not reported as opened; the next run's refused create adopts it.
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.harness.failures = {"proposal-update labelsAdd=agent:audit": 1}
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1)
         self.assertEqual(self.stdout_json()["prs_opened"], [])
         self.assertIn("could not publish the fix", self.err)
 
@@ -9427,25 +9836,75 @@ class TestRemediateOnACleanRun(HarnessTestCase):
 
     def replies(self, comments):
         return {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": "prior"}),
-            "--json comments": json.dumps({"comments": comments}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": "prior"}),
+            "*-view comments": comments_view({"comments": comments}),
         }
 
     def issue_comments(self):
-        return self.harness.gh_calls("issue", "comment")
+        return self.harness.forge_calls("issue-comment")
+
+    def test_a_requesters_standing_is_not_asked_and_an_outage_does_not_hold(self):
+        # Review finding: nothing on a clean run is acted on for anybody, so a
+        # requester's standing is never read; asking it cost a round trip per
+        # requester, and an outage on it held the ledger for nothing.
+        self.harness.replies = self.replies([self.comment()])
+        self.harness.failures = {"identity login=operator": 1}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        self.assertEqual(self.harness.forge_calls("identity", login="operator"), [])
+        bodies = self.harness.bodies_for("issue-comment")
+        self.assertEqual(
+            len([b for b in bodies if audit_report.acked_marker("IC_1") in b]), 1
+        )
+        self.assertTrue(self.harness.forge_calls("issue-close"))
+
+    def test_an_unreadable_conversation_holds_the_ledger_open(self):
+        self.harness.replies = self.replies([self.comment()])
+        self.harness.failures = {"*-view comments": 1}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+        self.assertIn("stays open", self.err)
+
+    def test_a_truncated_conversation_holds_the_ledger_open(self):
+        # Past the read limit a /remediate or a marker can sit where nothing
+        # sees it, so a partial conversation is no more readable than a refused
+        # one, and closing over it would decide those requests by omission.
+        replies = self.replies([self.comment()])
+        replies["*-view comments"] = comments_view(
+            {"comments": [self.comment()]}, truncated=True
+        )
+        self.harness.replies = replies
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+        self.assertEqual(self.harness.forge_calls("issue-comment"), [])
+        self.assertIn("more than", self.err)
+        self.assertIn("stays open", self.err)
+
+    def test_a_held_unread_ledger_keeps_its_memory_and_is_reported(self):
+        # The hold is only as good as what the store says next run: a record
+        # naming no issue is a lost memory, and a lost memory never closes.
+        self.seed_report("prior")
+        self.harness.replies = self.replies([self.comment()])
+        self.harness.failures = {"*-view comments": 1}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        stored = json.loads((self.store_dir() / "latest.json").read_text())
+        self.assertEqual((stored["issue_number"], stored["ledger_body"]), (42, "prior"))
+        self.assertIs(stored["ledger_held_open"], True)
+        self.assertEqual(stored["resolved_ids"], [])
+        # A held close is something the operator hears about.
+        self.assertFalse(self.stdout_json()["silent_ok"])
 
     def test_a_standing_request_is_answered_before_the_ledger_closes(self):
         self.harness.replies = self.replies([self.comment()])
 
         self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
 
-        bodies = self.harness.bodies_for("issue", "comment")
+        bodies = self.harness.bodies_for("issue-comment")
         answer = [b for b in bodies if audit_report.acked_marker("IC_1") in b]
         self.assertEqual(len(answer), 1, bodies)
         self.assertIn("no longer reproduces", answer[0])
         self.assertIn("closing as completed", answer[0])
-        self.assertTrue(self.harness.gh_calls("issue", "close"))
+        self.assertTrue(self.harness.forge_calls("issue-close"))
 
     def test_the_answer_is_said_once_when_the_ledger_stays_open(self):
         # Over a coverage gap the issue survives, so the marker is what stops a
@@ -9459,11 +9918,11 @@ class TestRemediateOnACleanRun(HarnessTestCase):
 
         self.assertEqual(self.run_finish(doc), 0)
 
-        bodies = self.harness.bodies_for("issue", "comment")
+        bodies = self.harness.bodies_for("issue-comment")
         self.assertEqual(
             [b for b in bodies if audit_report.acked_marker("IC_1") in b], []
         )
-        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
 
     def test_someone_else_claiming_to_have_answered_does_not_count(self):
         # The requester's own id is in the command they just posted, so quoting
@@ -9478,7 +9937,7 @@ class TestRemediateOnACleanRun(HarnessTestCase):
 
         self.assertEqual(self.run_finish(doc), 0)
 
-        bodies = self.harness.bodies_for("issue", "comment")
+        bodies = self.harness.bodies_for("issue-comment")
         self.assertEqual(
             len([b for b in bodies if audit_report.acked_marker("IC_1") in b]), 1
         )
@@ -9490,7 +9949,7 @@ class TestRemediateOnACleanRun(HarnessTestCase):
 
         self.assertEqual(self.run_finish(doc), 0)
 
-        bodies = self.harness.bodies_for("issue", "comment")
+        bodies = self.harness.bodies_for("issue-comment")
         answer = [b for b in bodies if audit_report.acked_marker("IC_1") in b][0]
         self.assertIn("stays open", answer)
         self.assertNotIn("closing as completed", answer)
@@ -9500,7 +9959,7 @@ class TestRemediateOnACleanRun(HarnessTestCase):
             [self.comment(body="looks good to me, thanks")]
         )
         self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
-        bodies = self.harness.bodies_for("issue", "comment")
+        bodies = self.harness.bodies_for("issue-comment")
         self.assertEqual(
             [b for b in bodies if audit_report.acked_marker("IC_1") in b], []
         )
@@ -9603,8 +10062,8 @@ class TestRemediateSubcommand(HarnessTestCase):
     def test_it_opens_the_pull_request_and_reports_it(self):
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
         }
         rc = self.run_remediate(make_doc(), [derived_id()])
         self.assertEqual(rc, 0)
@@ -9622,7 +10081,7 @@ class TestRemediateSubcommand(HarnessTestCase):
     def human_closed_pr_reply(self, doc):
         """A pull request on this finding's own branch, closed by a person."""
         branch = audit_report.group_branch_for(AUDIT, doc["findings"])
-        return json.dumps(
+        return proposals_view(
             [
                 {
                     **pr(8, branch, state="CLOSED"),
@@ -9642,15 +10101,15 @@ class TestRemediateSubcommand(HarnessTestCase):
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         doc = make_doc()
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "pr list": self.human_closed_pr_reply(doc),
+            "issue-list": self.issue_list(),
+            "proposal-list": self.human_closed_pr_reply(doc),
         }
         rc = self.run_remediate(doc, [derived_id()])
         self.assertEqual(rc, 0)
         report = self.stdout_json()
         self.assertEqual(report["prs_opened"], [])
         self.assertEqual(report["superseded"], [derived_id()])
-        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
         self.assertIn("close stands", self.err)
         self.assertIn("/remediate", self.err)
 
@@ -9658,9 +10117,9 @@ class TestRemediateSubcommand(HarnessTestCase):
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         doc = make_doc()
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "pr list": self.human_closed_pr_reply(doc),
-            "pr create": "https://github.com/acme/fleet/pull/9\n",
+            "issue-list": self.issue_list(),
+            "proposal-list": self.human_closed_pr_reply(doc),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/9"),
         }
         rc = self.run_remediate(doc, [derived_id()], ["--override-human-close"])
         self.assertEqual(rc, 0)
@@ -9694,8 +10153,8 @@ class TestRemediateSubcommand(HarnessTestCase):
         )
         self.touch("clusters/prod-us-east/written.yaml")
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
         }
         unwritten = derived_id(fid="unwritten")
         rc = self.run_remediate(doc, [derived_id(fid="written"), unwritten])
@@ -9722,14 +10181,14 @@ class TestRemediateSubcommand(HarnessTestCase):
                 )
             ]
         )
-        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.replies = {"issue-list": self.issue_list()}
         self.assertEqual(self.run_remediate(doc, [derived_id(fid="unwritten")]), 2)
         # "not a readable file inside", not "not on disk": a path that exists
         # but resolves outside the clone lands in exactly this refusal, and
         # telling that operator their file is missing sends them to look for a
         # file that is right there.
         self.assertIn("not a readable file inside", self.err)
-        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
 
     def test_an_uncapped_request_beats_the_auto_promotion_cap(self):
         findings = []
@@ -9747,14 +10206,14 @@ class TestRemediateSubcommand(HarnessTestCase):
             )
             self.touch(f"clusters/prod-us-east/f{i}.yaml")
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
         }
         rc = self.run_remediate(
             make_doc(findings=findings), [derived_id(fid=f"crit-{i}") for i in range(7)]
         )
         self.assertEqual(rc, 0)
-        self.assertEqual(len(self.harness.gh_calls("pr", "create")), 7)
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 7)
 
     def test_only_the_named_findings_become_pull_requests(self):
         # `remediate` is a person naming ids. The cron's auto-promotion sweep
@@ -9776,14 +10235,14 @@ class TestRemediateSubcommand(HarnessTestCase):
             )
             self.touch(f"clusters/prod-us-east/f{i}.yaml")
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
         }
 
         rc = self.run_remediate(make_doc(findings=findings), [derived_id(fid="crit-3")])
 
         self.assertEqual(rc, 0)
-        self.assertEqual(len(self.harness.gh_calls("pr", "create")), 1)
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1)
         # Branch names key on the group's paths, not the id, so the staged file
         # is what proves which finding was acted on.
         staged = " ".join(" ".join(c) for c in self.git_add_calls(self.harness))
@@ -9827,26 +10286,26 @@ class TestRemediateSubcommand(HarnessTestCase):
 
 class TestFailurePaths(HarnessTestCase):
     def test_a_failed_issue_create_is_fatal(self):
-        self.harness.replies = {"issue list": "[]"}
-        self.harness.failures = {"issue create": 1}
+        self.harness.replies = {"issue-list": {"issues": []}}
+        self.harness.failures = {"issue-create": 1}
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
 
         rc = self.run_finish(make_doc())
 
         self.assertNotEqual(rc, 0)
         self.assertEqual(self.out, "")
-        self.assertIn("subprocess failed with exit code 1", self.err)
+        self.assertIn("FATAL: issue-create on acme/fleet failed", self.err)
 
     def test_a_failed_issue_edit_is_fatal(self):
-        self.harness.replies = {"issue list": self.issue_list()}
-        self.harness.failures = {"issue edit 42 -R acme/fleet --title": 1}
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.harness.failures = {"issue-update number=42 repository=acme/fleet title": 1}
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
 
         rc = self.run_finish(make_doc())
 
         self.assertNotEqual(rc, 0)
         # No delta comment on a ledger whose body was never rewritten.
-        self.assertFalse(self.harness.gh_calls("issue", "comment"))
+        self.assertFalse(self.harness.forge_calls("issue-comment"))
 
     def test_a_failed_delta_comment_is_survivable(self):
         # Losing the delta comment costs one notification; aborting would
@@ -9855,10 +10314,10 @@ class TestFailurePaths(HarnessTestCase):
             make_doc(findings=[make_finding(fid="a")]), generated_at=NOW
         )
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
-        self.harness.failures = {"issue comment": 1}
+        self.harness.failures = {"issue-comment": 1}
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
 
         rc = self.run_finish(make_doc())
@@ -9869,13 +10328,13 @@ class TestFailurePaths(HarnessTestCase):
 
     def test_a_failed_severity_label_is_survivable(self):
         self.harness.replies = {
-            "issue list": "[]",
-            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
         }
-        # `--add-label` and not the bare `severity:critical`: the remediation
-        # `gh pr create` carries the same severity as a plain `--label`, and a
-        # substring injection would fire on that instead.
-        self.harness.failures = {"--add-label severity:critical": 1}
+        # On `issue-update` and not any call naming `severity:critical`: the
+        # remediation pull request is labelled with the same severity, and a
+        # failure injected there would fire on that instead.
+        self.harness.failures = {"issue-update labelsAdd=severity:critical": 1}
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
 
         self.assertEqual(self.run_finish(make_doc()), 0)
@@ -9884,12 +10343,17 @@ class TestFailurePaths(HarnessTestCase):
     def test_recorder_raises_on_check_true_and_returns_on_check_false(self):
         # The fault-injection seam itself, so a silently-broken Recorder cannot
         # make every failure test above vacuously pass.
-        recorder = Recorder(failures={"gh issue list": 1})
+        recorder = Recorder(failures={"git fetch": 1, "issue-list": 1})
         with self.assertRaises(CalledProcessError):
-            recorder(["gh", "issue", "list"])
-        result = recorder(["gh", "issue", "list"], check=False)
+            recorder(["git", "fetch", "origin"])
+        result = recorder(["git", "fetch", "origin"], check=False)
         self.assertEqual(result.returncode, 1)
         self.assertEqual(recorder(["git", "status"]).returncode, 0)
+        with self.assertRaises(vcs_client.VcsError):
+            recorder.forge("issue-list", {"state": "open"})
+        self.assertEqual(
+            recorder.forge("issue-view", {"number": 1}), {"issue": {"number": 1, "body": ""}}
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -10467,6 +10931,33 @@ class TestFenceScanning(unittest.TestCase):
 
     def test_a_closer_may_carry_trailing_whitespace(self):
         self.assertIn("/remediate real", self.strip("```\nx\n``` \n/remediate real"))
+
+
+class TestOutsideFences(unittest.TestCase):
+    """The heading scans' fence rule is the harness's, not a toggle on ```."""
+
+    def numbers(self, text):
+        return [n for n, _ in _outside_fences(text.split("\n"))]
+
+    def test_a_heading_inside_a_fence_is_not_outside(self):
+        self.assertEqual([5], self.numbers("```bash\n### 2. comment\n```\n\n### 2. Checks"))
+
+    def test_a_shorter_run_inside_a_longer_fence_does_not_close_it(self):
+        # The shape inventory.md uses: a ```` block wrapping a ``` one. A
+        # toggle closes at the inner fence and counts the heading on line 3.
+        self.assertEqual([6], self.numbers("````\n```\n### 9. inner\n```\n````\n### 1. real"))
+
+    def test_a_tilde_fence_is_a_fence(self):
+        self.assertEqual([4], self.numbers("~~~\n### 9. inner\n~~~\n### 1. real"))
+
+    def test_a_four_space_indented_run_does_not_close_a_block(self):
+        self.assertEqual([5], self.numbers("```\n    ```\n### 9. inner\n```\n### 1. real"))
+
+    def test_three_spaces_of_indent_is_still_a_fence(self):
+        self.assertEqual([4], self.numbers("   ```\n### 9. inner\n   ```\n### 1. real"))
+
+    def test_an_unterminated_fence_runs_to_the_end(self):
+        self.assertEqual([1], self.numbers("### 1. real\n```\n### 9. inner\n"))
 
 
 class TestBlockQuoteScanning(unittest.TestCase):
@@ -11146,7 +11637,7 @@ class TestPartialCoverageGating(HarnessTestCase):
     PARTIAL = [{"cluster": "dr-west", "reason": "control plane unreachable"}]
 
     def test_a_clean_but_partial_run_leaves_the_ledger_open(self):
-        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.replies = {"issue-list": self.issue_list()}
         self.assertEqual(
             self.run_finish(make_doc(findings=[], skipped=self.PARTIAL)), 0
         )
@@ -11155,30 +11646,30 @@ class TestPartialCoverageGating(HarnessTestCase):
         self.assertTrue(out["partial"])
         self.assertEqual(len(out["coverage_gaps"]), 1)
         # The all-clear is still said, but the ledger is not retired.
-        self.assertTrue(self.harness.gh_calls("issue", "comment", "42"))
-        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertTrue(self.harness.forge_calls("issue-comment", number=42))
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
 
     def test_a_clean_but_partial_run_reports_nothing_as_resolved(self):
-        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.replies = {"issue-list": self.issue_list()}
         self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
         self.assertEqual(self.stdout_json()["resolved"], 0)
 
     def test_a_clean_and_complete_run_still_closes_the_ledger(self):
-        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.replies = {"issue-list": self.issue_list()}
         self.run_finish(make_doc(findings=[]))
-        self.assertTrue(self.harness.matching("issue", "close", "42"))
+        self.assertTrue(self.harness.forge_calls("issue-close", number=42))
         self.assertFalse(self.stdout_json()["partial"])
 
     def test_a_partial_run_closes_no_remediation_pull_request(self):
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "pr list": json.dumps(
+            "issue-list": self.issue_list(),
+            "proposal-list": proposals_view(
                 [pr(8, "platform-agent/fix-x-gone", body=audit_report.delta_block(["gone"]))]
             ),
         }
         self.run_finish(make_doc(skipped=self.PARTIAL))
-        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
         self.assertIn("no remediation pull request was closed", self.err)
 
     def test_a_gapped_clean_run_opens_a_ledger_when_the_stream_has_none(self):
@@ -11193,18 +11684,17 @@ class TestPartialCoverageGating(HarnessTestCase):
         and it must land somewhere durable.
         """
         self.harness.replies = {
-            "issue list": "[]",
-            "issue create": "https://github.com/acme/fleet/issues/77\n",
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/77"),
         }
         self.assertEqual(
             self.run_finish(make_doc(findings=[], skipped=self.PARTIAL)), 0
         )
-        created = self.harness.gh_calls("issue", "create")
-        self.assertEqual(1, len(created))
-        argv = created[0]
-        self.assertIn("coverage incomplete", " ".join(argv))
-        self.assertIn("agent:audit", argv)
-        self.assertIn(f"audit:{AUDIT}", argv)
+        opened = self.harness.forge_calls("issue-create")
+        self.assertEqual(1, len(opened))
+        self.assertIn("coverage incomplete", opened[0]["title"])
+        self.assertIn("agent:audit", opened[0]["labels"])
+        self.assertIn(f"audit:{AUDIT}", opened[0]["labels"])
 
         out = self.stdout_json()
         self.assertEqual("CLEAN", out["status"])
@@ -11213,9 +11703,9 @@ class TestPartialCoverageGating(HarnessTestCase):
 
     def test_a_truly_clean_run_with_no_ledger_still_opens_nothing(self):
         """Complete coverage, nothing found, no ledger: there is genuinely nothing to say."""
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
-        self.assertEqual([], self.harness.gh_calls("issue", "create"))
+        self.assertEqual([], self.harness.forge_calls("issue-create"))
         self.assertFalse(self.stdout_json()["partial"])
 
     def test_the_coverage_ledger_is_not_titled_like_an_all_clear(self):
@@ -11239,8 +11729,8 @@ class TestPartialCoverageGating(HarnessTestCase):
             generated_at=NOW,
         )
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous}),
         }
         self.run_finish(make_doc(skipped=self.PARTIAL))
         self.assertEqual(self.stdout_json()["resolved"], 0)
@@ -11258,7 +11748,7 @@ class TestPartialCoverageGating(HarnessTestCase):
         # conclude everything a complete run may. It is surfaced in the body
         # and the log, not here.
         many = [make_finding(fid=f"f-{n:04d}", severity="minor") for n in range(400)]
-        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.replies = {"issue-list": self.issue_list()}
         self.assertEqual(self.run_finish(make_doc(findings=many)), 0)
         out = self.stdout_json()
         self.assertFalse(out["partial"])
@@ -11293,7 +11783,7 @@ class TestPartialCoverageGating(HarnessTestCase):
             with self.subTest(label):
                 self.setUp()
                 self.touch("clusters/prod-us-east/payments-netpol.yaml")
-                self.harness.replies = {"issue list": self.issue_list()}
+                self.harness.replies = {"issue-list": self.issue_list()}
                 self.run_finish(doc)
                 out = self.stdout_json()
                 self.assertEqual(out["partial"], expected)
@@ -11519,19 +12009,25 @@ class TestStaleCloseLabelling(HarnessTestCase):
         # is recoverable. The other order leaves an unlabelled closed one,
         # which reads as a human rejection forever.
         self.close_it([self.stale_pr()])
-        order = [c for c in self.harness.calls if c[:2] == ["gh", "pr"]]
-        label = next(i for i, c in enumerate(order) if "--add-label" in c)
-        close = next(i for i, c in enumerate(order) if c[2] == "close")
+        order = [
+            (call[1], payload)
+            for call, payload in zip(self.harness.calls, self.harness.payloads)
+            if call[:1] == ["forge"] and call[1].startswith("proposal-")
+        ]
+        label = next(i for i, (verb, _) in enumerate(order) if verb == "proposal-update")
+        close = next(i for i, (verb, _) in enumerate(order) if verb == "proposal-close")
         self.assertLess(label, close)
-        self.assertIn(audit_report.STALE_CLOSED_LABEL, order[label])
+        self.assertIn(audit_report.STALE_CLOSED_LABEL, order[label][1]["labelsAdd"])
 
     def test_the_branch_is_never_deleted(self):
         self.close_it([self.stale_pr()])
         for call in self.harness.calls:
-            self.assertNotIn("--delete-branch", call)
+            self.assertNotIn("--delete", call)
+        for close in self.harness.forge_calls("proposal-close"):
+            self.assertEqual(set(close), {"number", "repository"}, close)
 
     def test_a_failed_close_is_not_reported_as_closed(self):
-        self.harness.failures = {"pr close": 1}
+        self.harness.failures = {"proposal-close": 1}
         self.assertEqual(self.close_it([self.stale_pr()]), [])
         self.assertIn("could not close PR #8", self.err)
 
@@ -11542,13 +12038,24 @@ class TestStaleCloseLabelling(HarnessTestCase):
         # short-circuiting on it leaves the pull request open forever while the
         # ledger and the run summary both claim it closed.
         prior = harness_comment(audit_report.stale_closed_marker(8))
-        self.harness.replies = {"--json comments": json.dumps({"comments": [prior]})}
+        self.harness.replies = {"*-view comments": comments_view({"comments": [prior]})}
         self.assertEqual(
             self.close_it([self.stale_pr()]), ["https://github.com/acme/fleet/pull/8"]
         )
-        self.assertEqual(len(self.harness.gh_calls("pr", "close")), 1)
-        self.assertEqual(self.harness.gh_calls("pr", "comment"), [])
+        self.assertEqual(len(self.harness.forge_calls("proposal-close")), 1)
+        self.assertEqual(self.harness.forge_calls("proposal-comment"), [])
         self.assertIn("retrying the close", self.err)
+
+    def test_an_identity_outage_does_not_re_announce_an_apps_close(self):
+        # The viewer answer is what marks a comment as this install's; without
+        # it an App's marker is still its own by the bot flag, and reading the
+        # conversation as empty would post the notice again on every run.
+        prior = harness_comment(audit_report.stale_closed_marker(8))
+        self.harness.replies = {"*-view comments": comments_view({"comments": [prior]})}
+        self.harness.failures = {"identity": 1}
+        self.close_it([self.stale_pr()])
+        self.assertEqual(self.harness.forge_calls("proposal-comment"), [])
+        self.assertIn("by the bot flag alone", self.err)
 
     def test_the_marker_is_only_believed_from_this_harness(self):
         # The harness only ever writes this marker into a comment it posts, so
@@ -11565,9 +12072,9 @@ class TestStaleCloseLabelling(HarnessTestCase):
         forged = comment(
             audit_report.stale_closed_marker(8), login="drive-by", association="NONE"
         )
-        self.harness.replies = {"--json comments": json.dumps({"comments": [forged]})}
+        self.harness.replies = {"*-view comments": comments_view({"comments": [forged]})}
         self.close_it([in_body])
-        self.assertEqual(len(self.harness.gh_calls("pr", "comment")), 1)
+        self.assertEqual(len(self.harness.forge_calls("proposal-comment")), 1)
 
     def test_a_live_finding_keeps_its_pull_request_open(self):
         self.assertEqual(self.close_it([self.stale_pr()], current_ids={"gone"}), [])
@@ -11581,8 +12088,8 @@ class TestStaleCloseLabelling(HarnessTestCase):
             branch_by_finding={"gone": "platform-agent/fix-x-new"},
         )
         self.assertEqual(len(closed), 1)
-        comment = self.harness.gh_calls("pr", "comment")[0]
-        self.assertIn("8", comment)
+        comment = self.harness.forge_calls("proposal-comment")[0]
+        self.assertEqual(comment["number"], 8)
 
     def test_a_branch_that_is_still_live_is_left_alone(self):
         self.assertEqual(
@@ -11606,7 +12113,7 @@ class TestStaleCloseLabelling(HarnessTestCase):
             branch_by_finding={"other": "platform-agent/fix-y"},
         )
         self.assertEqual(closed, [])
-        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
         self.assertIn("no remediation branch this run", self.err)
 
     def test_a_resolved_finding_on_an_orphaned_branch_is_told_it_resolved(self):
@@ -11620,7 +12127,7 @@ class TestStaleCloseLabelling(HarnessTestCase):
             current_ids={"someone-else"},
             branch_by_finding={"someone-else": "platform-agent/fix-x-new"},
         )
-        body = self.harness.bodies_for("pr", "comment")[0]
+        body = self.harness.bodies_for("proposal-comment")[0]
         self.assertIn("no longer reproduces", body)
         self.assertNotIn("lives on a different branch", body)
 
@@ -11644,31 +12151,146 @@ class TestFindExistingIssue(HarnessTestCase):
         # pull request it opened. Preferring the lower one abandons that work
         # every run and the audit alternates between two ledgers forever.
         self.harness.replies = {
-            "issue list": json.dumps(
+            "issue-list": issues_view(
                 [
-                    {"number": 7, "url": "https://github.com/acme/fleet/issues/7"},
-                    {"number": 42, "url": "https://github.com/acme/fleet/issues/42"},
+                    {"number": 7, "url": "https://github.com/acme/fleet/issues/7", "body": "seven"},
+                    {"number": 42, "url": "https://github.com/acme/fleet/issues/42", "body": "forty-two"},
                 ]
             )
         }
-        number, url = self.find()
+        number, url, body = self.find()
         self.assertEqual(number, 42)
         self.assertTrue(url.endswith("/42"))
+        self.assertEqual(body, "forty-two")
         self.assertIn("7", self.err)
 
+    def test_a_listing_without_a_body_names_none(self):
+        self.harness.listed_body = None
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.assertEqual(self.find()[2], None)
+
     def test_no_ledger_is_not_an_error(self):
-        self.harness.replies = {"issue list": "[]"}
-        self.assertEqual(self.find(), (None, None))
+        self.harness.replies = {"issue-list": {"issues": []}}
+        self.assertEqual(self.find(), (None, None, None))
 
     def test_an_outage_raises_rather_than_reporting_no_ledger(self):
-        self.harness.failures = {"issue list": 1}
+        self.harness.failures = {"issue-list": 1}
         with self.assertRaises(audit_report.GitHubLookupError):
             self.find()
 
-    def test_unparseable_output_raises(self):
-        self.harness.replies = {"issue list": "not json"}
+    def test_an_answer_without_an_issue_list_raises(self):
+        self.harness.replies = {"issue-list": {"count": 0}}
         with self.assertRaises(audit_report.GitHubLookupError):
             self.find()
+
+    def test_a_truncated_listing_with_no_issue_raises_rather_than_reporting_no_ledger(self):
+        # The broker gave up paging past remediation pull requests on the same
+        # label before reaching an issue. The ledger is the oldest item on the
+        # label, so it may be just past them: reading this as "none" opens a
+        # duplicate ledger.
+        self.harness.replies = {"issue-list": {"issues": [], "count": 0, "truncated": True}}
+        with self.assertRaises(audit_report.GitHubLookupError):
+            self.find()
+
+
+class TestReadCommentsAuthorship(HarnessTestCase):
+    def read(self, comments, *, standing=False, requesters=True):
+        self.harness.replies = {"issue-view comments": comments_view({"comments": comments})}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            records = audit_report.read_comments(
+                "issue-view", "acme/fleet", 42, standing=standing, requesters=requesters
+            )
+        self.err = err.getvalue()
+        return records
+
+    def test_a_user_token_install_recognises_its_own_comments(self):
+        # Under an operator's own token the install's comments are a person's,
+        # not a bot's, so only `identity` can say which ones it wrote.
+        self.harness.VIEWER = "Ops-Person"
+        records = self.read(
+            [comment("mine", login="ops-person"), comment("theirs", login="dev", node_id="IC_2")]
+        )
+        self.assertEqual([r["viewerDidAuthor"] for r in records], [True, False])
+        self.assertFalse(records[0]["author"]["is_bot"])
+
+    def test_a_user_named_like_the_app_is_not_the_install(self):
+        # The broker takes `[bot]` off every author, so the user account
+        # `kube-agents-bot` and the App `kube-agents-bot[bot]` arrive with the
+        # same login. Only the comment's bot flag tells them apart, and reading
+        # the user as this install would make its markers the harness's own.
+        marker = audit_report.acked_marker("IC_1")
+        records = self.read(
+            [
+                comment(f"forged\n{marker}\n", login="kube-agents-bot"),
+                comment(f"mine\n{marker}\n", login="kube-agents-bot[bot]", node_id="IC_2"),
+            ]
+        )
+        self.assertEqual([r["viewerDidAuthor"] for r in records], [False, True])
+        pattern = audit_report.ACKED_MARKER_RE
+        self.assertFalse(audit_report.marker_from_harness(records[:1], pattern, "IC_1"))
+        self.assertTrue(audit_report.marker_from_harness(records[1:], pattern, "IC_1"))
+
+    def test_a_deleted_author_is_not_a_writer_and_the_rest_stays_readable(self):
+        # A deleted account arrives with no login. The broker cannot answer for
+        # nobody, and reading that as an outage would leave the conversation
+        # unreadable, and every /remediate on it ignored, for good.
+        ghost = comment("/remediate a", login="")
+        del ghost["authorAssociation"]
+        records = self.read([ghost, comment("/remediate b", node_id="IC_2")], standing=True)
+        self.assertIsNotNone(records)
+        self.assertEqual(
+            [r["authorAssociation"] for r in records], ["NONE", "COLLABORATOR"]
+        )
+        self.assertEqual(self.harness.forge_calls("identity", login=""), [])
+
+    def test_a_requester_the_forge_cannot_answer_for_leaves_it_unreadable(self):
+        # Not a refusal: a refusal is a public reply and a permanent marker,
+        # and an outage must not write one to a maintainer.
+        self.harness.failures = {"identity login=dev": 1}
+        self.assertIsNone(self.read([comment("/remediate a")], standing=True))
+        self.assertIn("could not tell whether @dev may write", self.err)
+
+    def test_without_requesters_only_this_installs_own_comments_are_asked_about(self):
+        # A reader that acts on nobody's command reads standing only through
+        # `is_machine_author`'s own-comment arm; a requester's outage must not
+        # make it unreadable.
+        self.harness.VIEWER = "Ops-Person"
+        self.harness.failures = {"identity login=dev": 1}
+        records = self.read(
+            [
+                comment("/remediate a", login="dev"),
+                comment("/remediate all", login="ops-person", node_id="IC_2"),
+            ],
+            standing=True,
+            requesters=False,
+        )
+        self.assertIsNotNone(records)
+        self.assertNotIn("authorAssociation", records[0])
+        self.assertEqual(records[1]["authorAssociation"], "COLLABORATOR")
+        self.assertEqual(
+            [call["login"] for call in self.harness.forge_calls("identity", login=...)],
+            ["ops-person"],
+        )
+
+    def test_only_the_authors_of_requests_are_asked_about(self):
+        # Nothing reads a bystander's standing, so their outage must not cost
+        # the request on the same thread its run, and each costs a round trip.
+        self.harness.failures = {"identity login=alice": 1}
+        records = self.read(
+            [
+                comment("looks right to me", login="alice"),
+                comment("/remediate a", login="bob", node_id="IC_2"),
+                comment("thanks", login="carol", node_id="IC_3"),
+            ],
+            standing=True,
+        )
+        self.assertIsNotNone(records)
+        self.assertEqual(records[1]["authorAssociation"], "COLLABORATOR")
+        self.assertEqual(
+            [call["login"] for call in self.harness.forge_calls("identity", login=...)],
+            ["bob"],
+        )
 
 
 class TestRemediationPrPaging(HarnessTestCase):
@@ -11677,7 +12299,7 @@ class TestRemediationPrPaging(HarnessTestCase):
         # re-open fixes that already exist and re-promote findings a human
         # closed. Refusing the run is the only safe answer.
         self.harness.replies = {
-            "pr list": json.dumps(
+            "proposal-list": proposals_view(
                 [
                     pr(i, f"platform-agent/fix-{AUDIT}-{i}")
                     for i in range(audit_report.MAX_PR_PAGE)
@@ -11688,8 +12310,25 @@ class TestRemediationPrPaging(HarnessTestCase):
             audit_report.list_remediation_prs("acme/fleet", AUDIT)
 
     def test_a_short_page_is_returned(self):
-        self.harness.replies = {"pr list": json.dumps([pr(1, "b")])}
+        self.harness.replies = {"proposal-list": proposals_view([pr(1, "b")])}
         self.assertEqual(len(audit_report.list_remediation_prs("acme/fleet", AUDIT)), 1)
+
+    def test_a_truncated_page_is_followed_to_the_next(self):
+        # Past the first page is where a stream with more than a page of
+        # remediation pull requests keeps the rest; dropping it reads them as
+        # "no pull request" and re-opens them.
+        prs = [pr(i, f"platform-agent/fix-{AUDIT}-{i}") for i in range(1, 131)]
+        page = audit_report.MAX_PAGE
+        self.harness.replies = {
+            "proposal-list page=1": proposals_view(prs[:page], truncated=True),
+            "proposal-list page=2": proposals_view(prs[page:]),
+        }
+        listed = audit_report.list_remediation_prs("acme/fleet", AUDIT)
+        self.assertEqual(
+            [c["page"] for c in self.harness.forge_calls("proposal-list")], [1, 2]
+        )
+        self.assertEqual(len(listed), len(prs))
+        self.assertEqual(len({p["number"] for p in listed}), len(prs))
 
 
 # --------------------------------------------------------------------------- #
@@ -11709,7 +12348,7 @@ class TestAcknowledgements(HarnessTestCase):
             [],
             NOW,
         )
-        comments = self.harness.gh_calls("issue", "comment")
+        comments = self.harness.forge_calls("issue-comment")
         self.assertEqual(len(comments), 1)
 
     def test_the_same_request_is_never_answered_twice(self):
@@ -11717,7 +12356,7 @@ class TestAcknowledgements(HarnessTestCase):
         audit_report.ack_remediate_requests(
             "acme/fleet", 42, {"IC_1": ["netpol"]}, {}, answered, NOW
         )
-        self.assertEqual(self.harness.gh_calls("issue", "comment"), [])
+        self.assertEqual(self.harness.forge_calls("issue-comment"), [])
 
     def test_someone_elses_ack_marker_does_not_answer_for_the_harness(self):
         # The requester would otherwise be able to suppress their own
@@ -11728,7 +12367,7 @@ class TestAcknowledgements(HarnessTestCase):
         audit_report.ack_remediate_requests(
             "acme/fleet", 42, {"IC_1": ["netpol"]}, {}, [forged], NOW
         )
-        self.assertEqual(len(self.harness.gh_calls("issue", "comment")), 1)
+        self.assertEqual(len(self.harness.forge_calls("issue-comment")), 1)
 
     def test_the_answer_names_the_outcome_of_each_target(self):
         body = audit_report.render_ack_comment(
@@ -11980,20 +12619,20 @@ class TestCredentialOrdering(HarnessTestCase):
         self.minted.append(repo)
 
     def test_the_repo_is_resolved_before_the_token_is_minted(self):
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         self.run_main(["start", "--audit", AUDIT])
         self.assertEqual(self.order[:2], ["resolve", "refresh"])
 
     def test_the_token_is_minted_for_the_resolved_repository(self):
         # Not for whatever `git config` reports in the current directory —
         # there is no clone there, so the no-argument call raises.
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         self.run_main(["start", "--audit", AUDIT])
         self.assertEqual(self.minted, ["acme/fleet"])
 
     def test_credentials_are_minted_before_the_clone(self):
         self.unclone()
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         self.run_main(["start", "--audit", AUDIT])
         clone = next(
             i for i, c in enumerate(self.harness.calls) if c[:2] == ["git", "clone"]
@@ -12166,8 +12805,8 @@ class TestSilentVerdict(HarnessTestCase):
 
     def finish_json(self, doc, **replies):
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": published_body(doc, generated_at=NOW)}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": published_body(doc, generated_at=NOW)}),
             **replies,
         }
         self.run_finish(doc)
@@ -12197,8 +12836,8 @@ class TestSilentVerdict(HarnessTestCase):
 
     def test_new_findings_are_never_silent(self):
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps(
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view(
                 {"body": published_body(make_doc(findings=[]), generated_at=NOW)}
             ),
         }
@@ -12351,9 +12990,10 @@ class TestDispatchAndHandover(unittest.TestCase):
         self.assertIn("operator's action", section)
         self.assertIn("one `start`-`finish` pair", section)
         self.assertIn("taken between repositories", section)
-        # The exit-code paragraph tells a `START REFUSED` apart from a
-        # rejected document: there is nothing to fix and nothing to re-run.
-        self.assertIn("One exit 2 is not a document to fix", text)
+        # The exit-code paragraph tells a `START REFUSED` and a
+        # `BROKER UNAVAILABLE` apart from a rejected document: neither has a
+        # file to fix.
+        self.assertIn("Two exit 2s are not a document to fix", text)
 
     def test_the_worker_protocol_requires_the_url_in_the_summary(self):
         section = self.read("SOUL.md").split("## 1.")[0]
@@ -12393,6 +13033,9 @@ class TestReadCommandsInDirectoryMode(HarnessTestCase):
         self.assertIn("directory mode", self.err)
 
 
+_REAL_REFRESH_CREDENTIALS = audit_report.refresh_credentials
+
+
 class ContentModeTestCase(BaseTestCase):
     """The same commands with the broker armed, against a real broker-side store.
 
@@ -12404,7 +13047,7 @@ class ContentModeTestCase(BaseTestCase):
     `_workspace_call`, which raises the same exception type the real transport
     raises for the same conditions.
 
-    `run_cmd` is still the Recorder, so every `gh` call is captured and any
+    `run_cmd` is still the Recorder, so every forge call is captured and any
     `git` the run tries to issue is visible. There should not be one.
     """
 
@@ -12562,7 +13205,7 @@ class ContentModeTestCase(BaseTestCase):
         return target
 
     def start(self, audit=AUDIT) -> dict:
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         self.assertEqual(self.run_main(["start", "--audit", audit]), 0)
         return json.loads(self.out.strip())
 
@@ -12595,9 +13238,9 @@ class ContentModeTestCase(BaseTestCase):
             "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
         )
         self.harness.replies = {
-            "issue list": "[]",
-            "issue create": "https://github.com/acme/fleet/issues/7\n",
-            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
         }
         self.assertEqual(self.run_finish(make_doc()), 0)
 
@@ -12610,9 +13253,9 @@ class ContentModeTestCase(BaseTestCase):
             "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
         )
         self.harness.replies = {
-            "issue list": "[]",
-            "issue create": "https://github.com/acme/fleet/issues/7\n",
-            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
         }
         self.assertEqual(self.run_finish(make_doc()), 0)
 
@@ -12643,9 +13286,9 @@ class ContentModeTestCase(BaseTestCase):
             "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
         )
         self.harness.replies = {
-            "issue list": "[]",
-            "issue create": "https://github.com/acme/fleet/issues/7\n",
-            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
         }
         self.assertEqual(self.run_finish(make_doc()), 0)
         self.assertEqual(target.read_text(encoding="utf-8"), "kind: NetworkPolicy\n")
@@ -12654,8 +13297,8 @@ class ContentModeTestCase(BaseTestCase):
         self.start()
         self.write_manifest("README.md", "seed\n")
         self.harness.replies = {
-            "issue list": "[]",
-            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
         }
         doc = make_doc(
             findings=[
@@ -12670,7 +13313,7 @@ class ContentModeTestCase(BaseTestCase):
         )
         self.assertEqual(self.run_finish(doc), 0)
         self.assertEqual(self.stdout_json()["prs_opened"], [])
-        self.assertFalse(self.harness.gh_calls("pr", "create"))
+        self.assertFalse(self.harness.forge_calls("proposal-create"))
 
     def test_a_second_run_adds_to_the_branch_rather_than_replacing_it(self):
         # The clone path recuts the branch from the base every run, which
@@ -12682,9 +13325,9 @@ class ContentModeTestCase(BaseTestCase):
             "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
         )
         self.harness.replies = {
-            "issue list": "[]",
-            "issue create": "https://github.com/acme/fleet/issues/7\n",
-            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
         }
         self.assertEqual(self.run_finish(make_doc()), 0)
 
@@ -12711,13 +13354,13 @@ class ContentModeTestCase(BaseTestCase):
             "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
         )
         self.harness.replies = {
-            "issue list": "[]",
-            "issue create": "https://github.com/acme/fleet/issues/7\n",
-            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
         }
         self.assertEqual(self.run_finish(make_doc()), 0)
         self.assertEqual(self.run_finish(make_doc()), 0)
-        self.assertEqual(len(self.harness.gh_calls("pr", "create")), 2)
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 2)
 
     def test_fetch_brings_a_repository_file_into_the_workspace(self):
         self.start()
@@ -12750,9 +13393,9 @@ class ContentModeTestCase(BaseTestCase):
         path = "clusters/prod-us-east/payments-netpol.yaml"
         self.write_manifest(path, "kind: NetworkPolicy\n")
         self.harness.replies = {
-            "issue list": "[]",
-            "issue create": "https://github.com/acme/fleet/issues/7\n",
-            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
         }
         self.assertEqual(self.run_finish(make_doc()), 0)
         branch = self.branch_for(make_doc())
@@ -12832,9 +13475,9 @@ class ContentModeTestCase(BaseTestCase):
         path = "clusters/prod-us-east/payments-netpol.yaml"
         self.write_manifest(path, "kind: NetworkPolicy\n")
         self.harness.replies = {
-            "issue list": "[]",
-            "issue create": "https://github.com/acme/fleet/issues/7\n",
-            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
         }
         self.assertEqual(self.run_finish(make_doc()), 0)
         branch = self.branch_for(make_doc())
@@ -12878,24 +13521,26 @@ class ContentModeTestCase(BaseTestCase):
         # rather than before it.
         self.assertEqual(set(self.verbs), {"open"})
 
-    def test_the_pull_request_body_still_travels_on_stdin(self):
+    def test_the_pull_request_body_reaches_proposal_create(self):
         self.start()
         self.write_manifest(
             "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
         )
         self.harness.replies = {
-            "issue list": "[]",
-            "issue create": "https://github.com/acme/fleet/issues/7\n",
-            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
         }
         self.assertEqual(self.run_finish(make_doc()), 0)
-        bodies = self.harness.bodies_for("pr", "create")
+        bodies = self.harness.bodies_for("proposal-create")
         self.assertEqual(len(bodies), 1)
         self.assertIn("clusters/prod-us-east/payments-netpol.yaml", bodies[0])
 
-    def test_an_unreachable_broker_falls_back_to_the_leased_clone(self):
-        # The probe is the only question in the run that answers "carry on the
-        # old way" when it cannot be answered. Everything else fails loudly.
+    def test_an_unarmed_broker_refuses_start_instead_of_cloning(self):
+        # The leased clone cannot publish from the sandbox any more: its `git`
+        # has no transport and no credential. A broker that does not answer yes
+        # stops the run here, naming the broker, rather than failing later on
+        # a `git` transport error.
         def unavailable(endpoint, verb, payload):
             raise credential_proxy_client.WorkspaceUnavailable("not enabled")
 
@@ -12905,11 +13550,240 @@ class ContentModeTestCase(BaseTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-        payload = self.start()
-        self.assertEqual(payload["mode"], "directory")
-        self.assertTrue(
-            [c for c in self.harness.calls if c[:2] == ["git", "clone"]]
+        self.harness.replies = {"issue-list": {"issues": []}}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("http://127.0.0.1:8765", self.err)
+        self.assertIn("BROKER UNAVAILABLE:", self.err)
+        self.assertEqual(
+            [c for c in self.harness.calls if c[:2] == ["git", "clone"]], []
         )
+
+    def broker_down_for_refresh(self):
+        # The refresh is the first call a command makes to the broker, ahead
+        # of the content-mode probe, and this is how it fails on a closed port.
+        import github_token_refresh
+
+        import urllib.error
+
+        def refused(repo=None, **_):
+            # Chained as `refresh_git_credentials` chains it: the cause is
+            # what tells a closed port from a broker that answered.
+            try:
+                raise urllib.error.URLError("[Errno 111] Connection refused")
+            except urllib.error.URLError as exc:
+                raise RuntimeError(
+                    "Credential sidecar failed to refresh GitHub auth: "
+                    "<urlopen error [Errno 111] Connection refused>"
+                ) from exc
+
+        self.patch_attr("refresh_credentials", _REAL_REFRESH_CREDENTIALS)
+        patcher = patch.object(github_token_refresh, "refresh_git_credentials", refused)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_broker_that_is_down_refuses_start_naming_it_not_fatal(self):
+        """Review finding: the refresh reaches the broker before the probe, so
+        a broker that is down exited 1 `FATAL` with no `the broker at` line,
+        and the skill read exit 1 as something else having broken."""
+        self.broker_down_for_refresh()
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("BROKER UNAVAILABLE: the broker at http://127.0.0.1:8765", self.err)
+        self.assertIn("Connection refused", self.err)
+        self.assertNotIn("FATAL", self.err)
+        # A refused `start` holds no note: the re-run is not refused for it.
+        self.harness.replies = {"issue-list": {"issues": []}}
+        self.patch_attr("refresh_credentials", lambda repo=None: None)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+
+    def test_a_broker_that_is_down_at_finish_keeps_the_run_in_flight(self):
+        """The skill tells a `finish` refused this way to re-run `finish`, not
+        `start`; that holds only while the note does."""
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue-list": {"issues": []}}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        self.broker_down_for_refresh()
+        self.assertEqual(self.run_finish(make_doc()), 2)
+        self.assertIn("BROKER UNAVAILABLE: the broker at http://127.0.0.1:8765", self.err)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("START REFUSED:", self.err)
+
+    def test_a_broker_lost_after_the_refresh_is_the_same_refusal(self):
+        """Review finding: a broker that went away after the refresh reached
+        `finish` as a forge failure, exited 1 `FATAL` and released the note,
+        the opposite of the same outage caught at the refresh."""
+        import urllib.error
+
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue-list": {"issues": []}}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        answer = self.harness.forge
+
+        def unreachable(verb, payload, repository=None):
+            if verb.startswith("issue-") and verb not in ("issue-list", "issue-view"):
+                try:
+                    raise urllib.error.URLError("[Errno 111] Connection refused")
+                except urllib.error.URLError as exc:
+                    raise vcs_client.VcsError(
+                        "the broker at http://127.0.0.1:8765 could not be reached: "
+                        "[Errno 111] Connection refused. Retry shortly."
+                    ) from exc
+            return answer(verb, payload, repository=repository)
+
+        self.harness.forge = unreachable
+        self.assertEqual(self.run_finish(make_doc()), 2)
+        self.assertIn("BROKER UNAVAILABLE:", self.err)
+        self.assertIn("the broker at http://127.0.0.1:8765", self.err)
+        self.assertNotIn("FATAL", self.err)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("START REFUSED:", self.err)
+
+    @staticmethod
+    def lost_broker_error():
+        import urllib.error
+
+        try:
+            raise urllib.error.URLError("[Errno 111] Connection refused")
+        except urllib.error.URLError as exc:
+            try:
+                raise vcs_client.VcsError(
+                    "the broker at http://127.0.0.1:8765 could not be reached: "
+                    "[Errno 111] Connection refused. Retry shortly."
+                ) from exc
+            except vcs_client.VcsError as wrapped:
+                return wrapped
+
+    def test_a_broker_lost_while_opening_the_pull_request_is_not_a_skipped_group(self):
+        """Review finding: the per-group catch took `BrokerUnavailable` for a
+        group that failed to publish, so the run exited 0 having opened none."""
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.start()
+        self.write_manifest(
+            "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
+        )
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        answer = self.harness.forge
+
+        def unreachable(verb, payload, repository=None):
+            # The create itself, inside the per-group catch; the listings
+            # before it sit outside and would not exercise that catch.
+            if verb == "proposal-create":
+                raise self.lost_broker_error()
+            return answer(verb, payload, repository=repository)
+
+        self.harness.forge = unreachable
+        self.assertEqual(self.run_finish(make_doc()), 2)
+        self.assertIn("BROKER UNAVAILABLE:", self.err)
+        self.assertNotIn("could not publish the fix", self.err)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("START REFUSED:", self.err)
+
+    def test_a_broker_lost_under_the_content_workspace_is_the_same_refusal(self):
+        # The workspace talks to the broker itself, so its transport failure
+        # arrives unwrapped rather than as a forge error.
+        import urllib.error
+
+        self.start()
+        self.write_manifest(
+            "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
+        )
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+
+        def closed(*_args, **_kwargs):
+            raise urllib.error.URLError("[Errno 111] Connection refused")
+
+        with patch.object(credential_proxy_client.Workspace, "open", closed):
+            self.assertEqual(self.run_finish(make_doc()), 2)
+        self.assertIn("BROKER UNAVAILABLE:", self.err)
+        self.assertNotIn("FATAL", self.err)
+
+    def test_a_broker_dropped_mid_answer_under_the_workspace_is_the_same_refusal(self):
+        """Review finding: a broker evicted after taking the request surfaces
+        from the response read, raw and not as a `URLError`, and exited 1."""
+        import http.client
+
+        self.start()
+        self.write_manifest(
+            "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
+        )
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        for raised in (
+            http.client.RemoteDisconnected("Remote end closed connection without response"),
+            http.client.IncompleteRead(b"{", 120),
+            ConnectionResetError(104, "Connection reset by peer"),
+            TimeoutError("timed out"),
+        ):
+            with self.subTest(type(raised).__name__):
+                def dropped(*_args, raised=raised, **_kwargs):
+                    raise raised
+
+                with patch.object(credential_proxy_client.Workspace, "open", dropped):
+                    self.assertEqual(self.run_finish(make_doc()), 2)
+                self.assertIn("BROKER UNAVAILABLE:", self.err)
+                self.assertNotIn("FATAL", self.err)
+
+    def test_a_broker_lost_under_a_read_command_is_the_same_refusal(self):
+        """Review finding: `fetch`, `list` and `grep` open the workspace
+        themselves, so a lost broker there exited 1 `FATAL`."""
+        import http.client
+
+        self.start()
+
+        def dropped(*_args, **_kwargs):
+            raise http.client.RemoteDisconnected("Remote end closed connection without response")
+
+        for argv in (
+            ["fetch", "--audit", AUDIT, "--path", "README.md"],
+            ["list", "--audit", AUDIT],
+            ["grep", "--audit", AUDIT, "--pattern", "seed"],
+        ):
+            with self.subTest(argv[0]):
+                with patch.object(credential_proxy_client.Workspace, "open", dropped):
+                    self.assertEqual(self.run_main(argv), 2)
+                self.assertIn("BROKER UNAVAILABLE: the broker at", self.err)
+                self.assertNotIn("FATAL", self.err)
+
+    def test_a_refresh_the_broker_refused_is_not_called_an_outage(self):
+        """Review finding: a 403 for an unmanaged repository was reported as
+        the broker being down, sending the worker to re-run against a healthy
+        broker."""
+        import urllib.error
+
+        import github_token_refresh
+
+        def forbidden(repo=None, **_):
+            try:
+                raise urllib.error.HTTPError(
+                    "http://127.0.0.1:8765/v1/github/refresh", 403, "Forbidden", {}, None
+                )
+            except urllib.error.HTTPError as exc:
+                raise RuntimeError(
+                    "Credential sidecar failed to refresh GitHub auth: HTTP 403"
+                ) from exc
+
+        self.patch_attr("refresh_credentials", _REAL_REFRESH_CREDENTIALS)
+        patcher = patch.object(github_token_refresh, "refresh_git_credentials", forbidden)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 1)
+        self.assertIn("HTTP 403", self.err)
+        self.assertNotIn("BROKER UNAVAILABLE", self.err)
+
+    def test_a_forge_refusal_from_a_broker_that_answered_stays_a_forge_error(self):
+        # Only a broker that did not answer is the outage; a refusal it sent is
+        # still the forge's, with the code it carried.
+        self.harness.failures = {"issue-create": 1}
+        with self.assertRaises(audit_report.ForgeError):
+            audit_report.forge("issue-create", "acme/fleet", {"title": "t"})
 
 
 # --------------------------------------------------------------------------- #
@@ -13114,6 +13988,117 @@ class TestLoadManifest(BaseTestCase):
             abs((stamped - datetime.now(timezone.utc)).total_seconds()),
             STAMP_TOLERANCE_SECONDS,
         )
+
+
+class TestClustersListedMarker(unittest.TestCase):
+    """`clusters_listed: 0` on a project entry: a fleet with no clusters is not
+    a run that lost them.
+
+    Without it, a cost or stockout run over cluster-free projects reported "no
+    cluster targets were audited" and stayed partial on every run, so it could
+    never close a ledger entry. The marker comes from the collector, is carried
+    verbatim onto `scope.clusters`, and lifts the cluster kind's gap only when
+    every project target carries it.
+    """
+
+    STREAMS = ("fleet-wide-cost-analysis", "stockout-prevention")
+    NETWORKING = "gcp-networking-fabric-audit"
+    KEY = audit_report.CLUSTERS_LISTED_KEY
+
+    def _project(self, audit_id, project, **extra):
+        entry = {
+            "name": f"project/{project}",
+            "location": "-",
+            "project": project,
+            "checks_run": list(audit_report.audit_target_checks(audit_id, f"project/{project}")),
+        }
+        entry.update(extra)
+        return entry
+
+    def _gaps(self, audit_id, clusters):
+        return audit_report.coverage_gaps(make_doc(findings=[], audit=audit_id, clusters=clusters))
+
+    def test_every_project_marked_empty_lifts_the_cluster_gap(self):
+        for audit_id in self.STREAMS:
+            with self.subTest(audit=audit_id):
+                clusters = [
+                    self._project(audit_id, "acme", **{self.KEY: 0}),
+                    self._project(audit_id, "beta", **{self.KEY: 0}),
+                ]
+                self.assertEqual(self._gaps(audit_id, clusters), [])
+
+    def test_one_unmarked_project_keeps_the_cluster_gap(self):
+        # beta's list failed or timed out: its clusters may exist unaudited.
+        for audit_id in self.STREAMS:
+            with self.subTest(audit=audit_id):
+                clusters = [self._project(audit_id, "acme", **{self.KEY: 0}), self._project(audit_id, "beta")]
+                gaps = self._gaps(audit_id, clusters)
+                self.assertEqual(len(gaps), 1)
+                self.assertIn("no cluster targets were audited", gaps[0])
+
+    def test_no_marked_project_keeps_the_cluster_gap(self):
+        for audit_id in self.STREAMS:
+            with self.subTest(audit=audit_id):
+                gaps = self._gaps(audit_id, [self._project(audit_id, "acme")])
+                self.assertEqual(len(gaps), 1)
+                self.assertIn("no cluster targets were audited", gaps[0])
+
+    def test_the_marker_never_lifts_the_project_gap(self):
+        # A run of clusters alone still owes the project checks.
+        cluster = {"name": "acme/us-central1/c1", "location": "us-central1", "project": "acme"}
+        gaps = audit_report._unenumerated_kind_gaps(self.STREAMS[0], [cluster])
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("no project targets were audited", gaps[0])
+
+    def test_a_stream_that_never_emits_it_is_unchanged(self):
+        """Networking is unpartitioned: the key changes nothing it reports."""
+        target = {"name": "project/acme", "location": "-", "project": "acme"}
+        self.assertEqual(
+            audit_report._unenumerated_kind_gaps(self.NETWORKING, [dict(target, **{self.KEY: 0})]),
+            audit_report._unenumerated_kind_gaps(self.NETWORKING, [target]),
+        )
+
+    def test_validation_accepts_the_collectors_zero_on_a_project_entry(self):
+        audit_id = self.STREAMS[0]
+        doc = make_doc(findings=[], audit=audit_id, clusters=[self._project(audit_id, "acme", **{self.KEY: 0})])
+        audit_report.validate_findings(doc, audit_id)
+
+    def test_validation_rejects_anything_the_collector_would_not_write(self):
+        audit_id = self.STREAMS[0]
+        cluster = {"name": "acme/us-central1/c1", "location": "us-central1", "project": "acme", self.KEY: 0}
+        cases = {
+            "a cluster entry": cluster,
+            "a non-zero count": self._project(audit_id, "acme", **{self.KEY: 3}),
+            "a bool": self._project(audit_id, "acme", **{self.KEY: False}),
+            "a string": self._project(audit_id, "acme", **{self.KEY: "0"}),
+        }
+        for label, entry in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(audit_report.ValidationError) as caught:
+                    audit_report.validate_findings(make_doc(findings=[], audit=audit_id, clusters=[entry]), audit_id)
+                self.assertIn(self.KEY, str(caught.exception))
+
+    def _manifest(self, audit_id, **extra):
+        entry = {
+            "name": "project/acme",
+            "outcome": "collected",
+            "commands": [{"check": c, "rc": 0} for c in audit_report.audit_target_checks(audit_id, "project/acme")],
+        }
+        entry.update(extra)
+        return {"clusters": [entry]}
+
+    def test_the_manifest_must_carry_the_marker_the_document_claims(self):
+        # A worker cannot hand-claim an empty fleet to turn a partial run clean.
+        audit_id = self.STREAMS[0]
+        doc = make_doc(findings=[], audit=audit_id, clusters=[self._project(audit_id, "acme", **{self.KEY: 0})])
+        with self.assertRaises(audit_report.ValidationError) as caught:
+            audit_report.cross_check_manifest(doc, self._manifest(audit_id))
+        self.assertIn(self.KEY, str(caught.exception))
+
+    def test_a_marker_copied_from_the_manifest_passes(self):
+        audit_id = self.STREAMS[0]
+        doc = make_doc(findings=[], audit=audit_id, clusters=[self._project(audit_id, "acme", **{self.KEY: 0})])
+        audit_report.cross_check_manifest(doc, self._manifest(audit_id, **{self.KEY: 0}))
 
 
 class TestCrossCheckManifest(unittest.TestCase):
@@ -14123,6 +15108,28 @@ class TestTriageMarkedFindings(BaseTestCase):
         self.assertEqual(plan.needs_triage, ["fronted"])
         self.assertEqual(plan.uncorroborated, [])
 
+    def test_a_new_compute_class_stockout_is_passed_over_and_an_edit_is_not(self):
+        """§3.11's create case is two files under one path; editing an
+        existing class is one, and stays the sweep's to open."""
+        slug = "autoscaler-out-of-resources"
+        obj = "ScaleUpError/scale.up.error.out.of.resources"
+        manifest = {
+            "clusters": [
+                _ran("c1", slug, candidates=[{**_cand(slug, "c1", obj), "needs_triage": "new-computeclass"}]),
+                _ran("c2", slug, candidates=[{**_cand(slug, "c2", obj), "needs_triage": None}]),
+            ]
+        }
+        remediation = {"kind": "manifest", "note": "n"}
+        findings = [
+            _pub("create", slug, "c1", obj) | {"severity": "critical", "remediation": {**remediation, "path": "cc/new.yaml"}},
+            _pub("edit", slug, "c2", obj) | {"severity": "critical", "remediation": {**remediation, "path": "cc/burst.yaml"}},
+        ]
+        plan = audit_report.promotion_candidates(
+            findings, {}, triage_marked=audit_report.triage_marked_findings(findings, manifest)
+        )
+        self.assertEqual(plan.promote, ["edit"])
+        self.assertEqual(plan.needs_triage, ["create"])
+
     def test_an_explicit_remediate_still_opens_it(self):
         plan = audit_report.promotion_candidates(
             [manifest_finding("fronted", "b.yaml")],
@@ -14166,8 +15173,9 @@ class TestTriageMarkedFindings(BaseTestCase):
 class TestScopedCoverage(unittest.TestCase):
     """Coverage is measured against what a target owes, not the whole roster.
 
-    No shipped roster declares `scopes` yet, so these run against a copy of
-    the stockout and networking specs partitioned the way their SOPs read: the
+    The shipped cost and stockout rosters declare `scopes`, but these run
+    against a fixed copy of the stockout and networking specs, partitioned the
+    way their SOPs read, so a roster edit does not move them: the
     project entry owes the quota and reservation checks, every cluster owes
     the rest plus the reservation check's cluster form, and a networking
     subnet owes IP exhaustion alone. Rated against the whole roster, a project
@@ -14229,6 +15237,21 @@ class TestScopedCoverage(unittest.TestCase):
         self.assertEqual(audit_report.target_kind("project/acme-prod"), "project")
         self.assertEqual(audit_report.target_kind("acme-prod/us-east4/gke-nodes"), "subnet")
         self.assertEqual(audit_report.target_kind("prod-us-east"), "cluster")
+
+    def test_a_qualified_cluster_is_a_cluster_where_no_subnet_scope_exists(self):
+        qualified = "acme-stage/europe-west1/stage-eu"
+        self.assertEqual(
+            audit_report.audit_target_checks(self.STOCKOUT, qualified),
+            audit_report.audit_target_checks(self.STOCKOUT, "stage-eu"),
+        )
+        gaps = audit_report.coverage_gaps(self._doc([self._clean_project(), self._clean_cluster(qualified)]))
+        self.assertEqual(gaps, [])
+
+    def test_the_same_shape_stays_a_subnet_where_a_subnet_scope_exists(self):
+        self.assertEqual(
+            audit_report.audit_target_checks(self.NETWORKING, "acme-prod/us-east4/gke-nodes"),
+            ("subnet-ip-exhaustion",),
+        )
 
     def test_a_project_target_owes_only_the_project_scoped_checks(self):
         gaps = audit_report.coverage_gaps(self._doc([self._clean_project(), self._clean_cluster()]))
@@ -14293,8 +15316,9 @@ class TestScopedCoverage(unittest.TestCase):
         """A partitioned stream that meets an unexpected target must not go
         quiet: the safe reading is that the target owes the whole roster and
         shows up as a gap — the alternative, an empty denominator, reports the
-        target as fully audited."""
-        owed = audit_report.audit_target_checks(self.STOCKOUT, "acme/us-east4/net")
+        target as fully audited. Two segments, because three are a qualified
+        cluster in a stream with no subnet scope."""
+        owed = audit_report.audit_target_checks(self.STOCKOUT, "acme/net")
         self.assertEqual(owed, audit_report.audit_checks(self.STOCKOUT))
 
     def test_a_kind_with_no_targets_is_a_gap(self):
@@ -14343,6 +15367,14 @@ class TestScopedCoverage(unittest.TestCase):
         )
         self.assertEqual(gaps, [])
 
+    def test_a_check_a_present_kind_carries_is_not_stranded(self):
+        """Stockout with clusters and no project: `reservation-mismatch-risk`
+        ran on its cluster arm, so only the project-only check is stranded."""
+        self.assertEqual(
+            audit_report._unenumerated_kind_gaps("stockout-prevention", [{"name": "acme/us-east4/prod"}]),
+            ["no project targets were audited — 1 check(s) ran against nothing (quota-exhaustion-risk)"],
+        )
+
     def test_an_unpartitioned_stream_never_reports_a_kind_gap(self):
         self.assertEqual(
             audit_report._unenumerated_kind_gaps("compliance-audit", [{"name": "prod-us-east"}]),
@@ -14374,12 +15406,68 @@ class TestScopedCoverage(unittest.TestCase):
         self.assertNotIn("⚠", out)
 
 
+class TestCollectorStreamsRequireAManifest(HarnessTestCase):
+    """A stream whose SOP runs a collector cannot publish on the model's word
+    alone: `finish` refuses it without `--manifest-file` or a waiver."""
+
+    def setUp(self):
+        super().setUp()
+        self.patch_attr("COLLECTOR_AUDITS", REAL_COLLECTOR_AUDITS)
+
+    def test_every_collector_stream_requires_its_manifest(self):
+        import collect
+        import fleet_drift
+        import fleet_stockout
+        import fleet_waste
+        import patch_readiness
+
+        expected = set(collect.CHECK_TABLES) | {
+            fleet_drift.AUDIT_ID, patch_readiness.AUDIT_ID, fleet_waste.AUDIT_NAME, fleet_stockout.AUDIT_ID,
+        }
+        self.assertEqual(set(REAL_COLLECTOR_AUDITS), expected)
+        self.assertLessEqual(set(REAL_COLLECTOR_AUDITS), set(audit_report.AUDITS))
+
+    def test_streams_with_no_collector_are_not_held_to_it(self):
+        for audit in ("gce-compute-fleet-audit", "gcp-networking-fabric-audit"):
+            with self.subTest(audit=audit):
+                self.assertIn(audit, audit_report.AUDITS)
+                self.assertNotIn(audit, REAL_COLLECTOR_AUDITS)
+
+    def test_no_flag_is_refused_and_nothing_is_published(self):
+        self.harness.replies = {"issue-list": issues_view([])}
+        rc = self.run_finish(make_doc(findings=[]))
+        self.assertEqual(rc, 2)
+        self.assertIn("--manifest-file is required for compliance-audit", self.err)
+        self.assertIn("--no-collector-manifest", self.err)
+        self.assertFalse(self.harness.matching("issue"))
+        self.assertFalse((self.reports_dir / AUDIT).exists())
+
+    def test_a_dry_run_is_refused_too(self):
+        rc = self.run_finish(make_doc(findings=[]), ["--dry-run"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--manifest-file is required", self.err)
+
+    def test_the_waiver_publishes_as_partial(self):
+        self.harness.replies = {"issue-list": issues_view([])}
+        rc = self.run_finish(make_doc(findings=[]), ["--no-collector-manifest", "collector crashed"])
+        self.assertEqual(rc, 0, self.err)
+        self.assertTrue(self.stdout_json()["partial"])
+
+    def test_a_manifest_is_accepted(self):
+        self.harness.replies = {"issue-list": issues_view([])}
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(_full_manifest()), encoding="utf-8")
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", str(path)])
+        self.assertEqual(rc, 0, self.err)
+
+
 class TestFinishManifestFlag(HarnessTestCase):
     """The `--manifest-file` / `--no-collector-manifest` wiring in `handle_finish`.
 
-    Both flags are optional, and `TestFinishWithoutAManifestIsUnchanged` holds
-    the run without either to its recorded transcript; this class is about
-    what each flag adds.
+    The suite's base class lifts the collector-stream requirement, which
+    `TestCollectorStreamsRequireAManifest` holds; with it lifted,
+    `TestFinishWithoutAManifestIsUnchanged` holds the run without either flag
+    to its recorded transcript, and this class is about what each flag adds.
     """
 
     NETPOL_COMMAND = "KUBECONFIG=/opt/data/.kubeconfigs/kc.yaml kubectl get networkpolicy -A -o json"
@@ -14404,19 +15492,19 @@ class TestFinishManifestFlag(HarnessTestCase):
         return cand
 
     def test_a_passing_manifest_lets_the_run_publish(self):
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(_full_manifest())])
         self.assertEqual(rc, 0, self.err)
 
     def test_without_either_flag_the_payload_carries_no_collector_keys(self):
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
         payload = self.stdout_json()
         for key in ("unpublished_candidates", "wholly_unpublished_checks", "uncorroborated_findings"):
             self.assertNotIn(key, payload)
 
     def test_a_manifest_adds_the_collector_keys_to_the_payload(self):
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(_full_manifest())])
         self.assertEqual(rc, 0)
         payload = self.stdout_json()
@@ -14428,7 +15516,7 @@ class TestFinishManifestFlag(HarnessTestCase):
     def test_a_clean_document_over_a_still_flagging_collector_is_disclosed(self):
         """The false clean: nothing published, the collector still emitting.
         Every other field agrees the fleet is healthy; these two do not."""
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         manifest = _full_manifest(candidates=[self.netpol_candidate()])
         rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0)
@@ -14448,14 +15536,14 @@ class TestFinishManifestFlag(HarnessTestCase):
         this is the only thing that fails if the call is dropped from
         `handle_finish` or moved after the body is rendered."""
         self.harness.replies = {
-            "issue list": "[]",
-            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         manifest = _full_manifest(candidates=[self.netpol_candidate()], command=self.NETPOL_COMMAND)
         rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
-        body = self.harness.bodies_for("issue", "create")[0]
+        body = self.harness.bodies_for("issue-create")[0]
         self.assertIn("zero NetworkPolicies in payments", body)
         self.assertIn(self.NETPOL_COMMAND, body)
         # The model's two strings are gone, not merely joined by the truth.
@@ -14466,8 +15554,8 @@ class TestFinishManifestFlag(HarnessTestCase):
     def test_the_real_run_publishes_the_collectors_arm_sentence(self):
         corrected = "Node pool is locked to a single zone: a stockout there halts scale-up."
         self.harness.replies = {
-            "issue list": "[]",
-            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         manifest = _full_manifest(
@@ -14479,7 +15567,7 @@ class TestFinishManifestFlag(HarnessTestCase):
             ["--manifest-file", self.manifest_file(manifest)],
         )
         self.assertEqual(rc, 0, self.err)
-        body = self.harness.bodies_for("issue", "create")[0]
+        body = self.harness.bodies_for("issue-create")[0]
         self.assertIn(corrected, body)
         self.assertNotIn("the model's own guess", body)
 
@@ -14504,8 +15592,26 @@ class TestFinishManifestFlag(HarnessTestCase):
         rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 2)
         self.assertIn("FINDINGS REJECTED", self.err)
-        self.assertFalse(self.harness.matching("issue", "create"))
-        self.assertFalse(self.harness.matching("issue", "edit"))
+        self.assertFalse(self.harness.forge_calls("issue-create"))
+        self.assertFalse(self.harness.forge_calls("issue-update"))
+
+    def test_the_clusters_listed_marker_needs_a_manifest(self):
+        # Hand-written, the marker would lift the no-cluster gap on the worker's word alone.
+        audit_id = "fleet-wide-cost-analysis"
+        project = {
+            "name": "project/acme",
+            "location": "-",
+            "project": "acme",
+            "checks_run": list(audit_report.audit_target_checks(audit_id, "project/acme")),
+            audit_report.CLUSTERS_LISTED_KEY: 0,
+        }
+        doc = make_doc(findings=[], audit=audit_id, clusters=[project])
+        for label, extra in {"no flag": [], "waived": ["--no-collector-manifest", "collector crashed"]}.items():
+            with self.subTest(case=label):
+                self.harness.replies = {"issue list": "[]"}
+                rc = self.run_finish(doc, ["--dry-run", *extra], audit=audit_id)
+                self.assertEqual(rc, 2)
+                self.assertIn("only the collector manifest can back", self.err)
 
     def test_a_missing_manifest_file_is_rejected(self):
         rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", "/nonexistent.json"])
@@ -14519,7 +15625,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(rc, 2)
 
     def test_a_waived_manifest_publishes_but_reports_a_coverage_gap(self):
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         rc = self.run_finish(
             make_doc(findings=[]),
             ["--no-collector-manifest", "collector found no readable project"],
@@ -14538,13 +15644,13 @@ class TestFinishManifestFlag(HarnessTestCase):
     def test_a_waived_clean_run_holds_the_ledger_open_and_says_why(self):
         previous_body = published_body(make_doc(), generated_at=NOW)
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
         rc = self.run_finish(make_doc(findings=[]), ["--no-collector-manifest", "collector crashed"])
         self.assertEqual(rc, 0, self.err)
-        self.assertFalse(self.harness.gh_calls("issue", "close"))
-        comment = self.harness.bodies_for("issue", "comment")[-1]
+        self.assertFalse(self.harness.forge_calls("issue-close"))
+        comment = self.harness.bodies_for("issue-comment")[-1]
         self.assertIn("did not see the whole fleet", comment)
         self.assertIn("the collector manifest was waived — collector crashed", comment)
         self.assertEqual(self.stdout_json()["resolved"], 0)
@@ -14559,20 +15665,20 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertIn("the collector manifest was waived — collector crashed", self.out)
 
     def test_a_blank_waiver_reason_is_rejected(self):
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         rc = self.run_finish(make_doc(findings=[]), ["--no-collector-manifest", "   "])
         self.assertEqual(rc, 2)
         self.assertIn("give the reason", self.err)
-        self.assertFalse(self.harness.matching("issue"))
+        self.assertFalse(self.harness.forge_calls("issue-*"))
 
     def test_an_empty_manifest_path_is_not_the_same_as_no_flag(self):
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         for path in ("", "   "):
             with self.subTest(path=repr(path)):
                 rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", path])
                 self.assertEqual(rc, 2)
                 self.assertIn("--manifest-file: give the path", self.err)
-                self.assertFalse(self.harness.matching("issue"))
+                self.assertFalse(self.harness.forge_calls("issue-*"))
 
     def test_a_pull_request_on_a_finding_the_last_body_never_rendered_is_kept(self):
         """The stale-close pass reads the whole still-flagged set, not only the
@@ -14582,8 +15688,8 @@ class TestFinishManifestFlag(HarnessTestCase):
             make_doc(findings=[make_finding(fid="b", title="Bravo finding")]), generated_at=NOW
         )
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.open_pr_for_a()
@@ -14596,36 +15702,36 @@ class TestFinishManifestFlag(HarnessTestCase):
         doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
         rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
-        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
         self.assertEqual(self.stdout_json()["prs_closed"], [])
 
     def test_a_clean_run_with_no_ledger_keeps_a_still_flagged_pull_request(self):
         """The CLEAN branch's own stale-close call reads the same set."""
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         self.open_pr_for_a()
         manifest = _full_manifest(candidates=[self.netpol_candidate(object="Namespace/a")])
         rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
-        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "CLEAN")
         self.assertEqual(payload["prs_closed"], [])
         # And the control: a collector that no longer flags it lets it retire.
         self.harness = type(self.harness)()
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         self.patch_attr("run_cmd", self.harness)
         self.open_pr_for_a()
         rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(_full_manifest())])
         self.assertEqual(rc, 0, self.err)
-        self.assertTrue(self.harness.gh_calls("pr", "close"))
+        self.assertTrue(self.harness.forge_calls("proposal-close"))
 
     def test_a_dropped_candidate_makes_the_run_speak(self):
         """An unchanged ledger is the usual silent run; a candidate the model
         dropped is the one thing about it an operator needs to hear."""
         previous_body = published_body(make_doc(), generated_at=NOW)
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         corroborated = _full_manifest(candidates=[self.netpol_candidate()])
@@ -14637,8 +15743,8 @@ class TestFinishManifestFlag(HarnessTestCase):
 
         self.harness = type(self.harness)()
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
         self.patch_attr("run_cmd", self.harness)
         dropped = _full_manifest(
@@ -14663,15 +15769,15 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(rc, 0, self.err)
         payload = self.stdout_json()
         self.assertEqual(payload["uncorroborated_findings"], [derived_id()])
-        body = self.harness.bodies_for("issue", "create")[0]
+        body = self.harness.bodies_for("issue-create")[0]
         self.assertIn(f"`{derived_id()}`", body)
         self.assertNotIn(f"`{derived_id(fid='m')}` —", body)
 
     def declaring_replies(self, previous_body=None):
         self.record_run()
-        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.replies = {"issue-list": self.issue_list()}
         if previous_body is not None:
-            self.harness.replies["--json body"] = json.dumps({"body": previous_body})
+            self.harness.replies["issue-view !comments"] = issue_view({"body": previous_body})
 
     def posture_candidate(self):
         return {
@@ -14702,7 +15808,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(payload["status"], "CLEAN")
         self.assertEqual(payload["unaccounted"], [])
         self.assertEqual(payload["declared"], 1)
-        self.assertTrue(self.harness.matching("issue", "close", "42"))
+        self.assertTrue(self.harness.forge_calls("issue-close", number=42))
         self.assertNotIn("STILL FLAGGED", self.err)
 
     def test_a_declared_posture_resolves_and_retires_its_pull_request(self):
@@ -14710,7 +15816,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         fault = make_finding(fid="f", check="no-requests", title="Fault")
         previous_body = published_body(searched_doc(findings=[posture, fault]), generated_at=NOW)
         self.declaring_replies(previous_body)
-        self.harness.replies["pr list"] = json.dumps(
+        self.harness.replies["proposal-list"] = proposals_view(
             [pr(8, "platform-agent/fix-posture", body=audit_report.delta_block([derived_id(check="no-pdb")]))]
         )
         doc = searched_doc(findings=[make_finding(fid="f", check="no-requests", title="Fault")])
@@ -14723,15 +15829,16 @@ class TestFinishManifestFlag(HarnessTestCase):
         payload = self.stdout_json()
         self.assertEqual(payload["resolved"], 1)
         self.assertEqual(payload["prs_closed"], ["https://github.com/acme/fleet/pull/8"])
-        self.assertTrue(self.harness.gh_calls("pr", "close"))
+        self.assertTrue(self.harness.forge_calls("proposal-close"))
         self.assertNotIn("NOT being announced as resolved", self.err)
 
     def replay_ledger(self, body):
         """A fresh recorder whose open ledger carries `body`."""
         self.harness = Recorder()
+        self.harness.listed_body = self.stored_ledger_body
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": body}),
         }
         self.patch_attr("run_cmd", self.harness)
 
@@ -14752,7 +15859,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         # Run N: the document drops a, the collector still flags it.
         rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(both)])
         self.assertEqual(rc, 0, self.err)
-        body_n = self.harness.bodies_for("issue", "edit")[0]
+        body_n = self.harness.bodies_for("issue-update")[0]
         self.assertIn("## Held by the collector", body_n)
         self.assertIn(f"<!-- finding:{a_id} -->", body_n)
         self.assertIn("Alpha finding", body_n)
@@ -14761,7 +15868,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         payload = self.stdout_json()
         self.assertEqual((payload["new"], payload["resolved"]), (0, 0))
         # b, corroborated and critical, is promoted; the held a is not swept.
-        opened = [" ".join(c) for c in self.harness.gh_calls("pr", "create")]
+        opened = [json.dumps(c) for c in self.harness.forge_calls("proposal-create")]
         self.assertEqual(len(opened), 1)
         self.assertNotIn("Alpha finding", opened[0])
         self.assertIn("HELD:", self.err)
@@ -14770,7 +15877,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.replay_ledger(body_n)
         rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(both)])
         self.assertEqual(rc, 0, self.err)
-        body_n1 = self.harness.bodies_for("issue", "edit")[0]
+        body_n1 = self.harness.bodies_for("issue-update")[0]
         self.assertIn(f"<!-- finding:{a_id} -->", body_n1)
         payload = self.stdout_json()
         self.assertEqual((payload["new"], payload["resolved"]), (0, 0))
@@ -14787,8 +15894,8 @@ class TestFinishManifestFlag(HarnessTestCase):
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "HELD")
         self.assertEqual(payload["unaccounted"], [a_id])
-        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
-        self.assertIn("still flagged by the collector", self.harness.bodies_for("issue", "comment")[-1])
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+        self.assertIn("still flagged by the collector", self.harness.bodies_for("issue-comment")[-1])
 
         # Control: the collector drops a, and the same clean run closes.
         self.replay_ledger(body_n1)
@@ -14797,14 +15904,14 @@ class TestFinishManifestFlag(HarnessTestCase):
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "CLEAN")
         self.assertEqual(payload["resolved"], 2)
-        self.assertTrue(self.harness.matching("issue", "close", "42"))
+        self.assertTrue(self.harness.forge_calls("issue-close", number=42))
 
     def test_a_declared_posture_is_not_a_dropped_candidate(self):
         """Exempt from the hold and from the disclosure alike: the collector
         emits a declared posture for as long as the declaration stands, and a
         run that reports it dropped every morning is never silent again."""
         self.record_run()
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         doc = searched_doc(findings=[])
         doc["declared"] = [make_declared(check="no-pdb", obj="Namespace/no-network-policy")]
         manifest = self.manifest_file(
@@ -14839,7 +15946,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         report" — a refusal with a false reason under the permanent marker."""
         self.previous_a_and_b()
         a_id = derived_id(fid="a")
-        self.harness.replies["--json comments"] = json.dumps(
+        self.harness.replies["*-view comments"] = comments_view(
             {"comments": [comment(f"/remediate {a_id}")]}
         )
         both = _full_manifest(
@@ -14851,7 +15958,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         doc_b = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
         rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(both)])
         self.assertEqual(rc, 0, self.err)
-        posted = self.harness.bodies_for("issue", "comment")
+        posted = self.harness.bodies_for("issue-comment")
         deferrals = [b for b in posted if audit_report.deferred_marker("IC_1") in b]
         self.assertEqual(len(deferrals), 1, posted)
         self.assertIn("on hold, not refused", deferrals[0])
@@ -14860,15 +15967,15 @@ class TestFinishManifestFlag(HarnessTestCase):
         for body in posted:
             self.assertNotIn(audit_report.refused_marker("IC_1"), body)
             self.assertNotIn(audit_report.acked_marker("IC_1"), body)
-        opened = " ".join(" ".join(c) for c in self.harness.gh_calls("pr", "create"))
+        opened = json.dumps(self.harness.forge_calls("proposal-create"))
         self.assertNotIn("Alpha finding", opened)
 
     def test_a_remediate_on_a_held_finding_is_deferred_on_a_clean_run_too(self):
         previous_body = published_body(make_doc(), generated_at=NOW)
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
-            "--json comments": json.dumps({"comments": [comment(f"/remediate {derived_id()}")]}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
+            "*-view comments": comments_view({"comments": [comment(f"/remediate {derived_id()}")]}),
         }
         clean = make_doc(findings=[])
         clean["resolved_because"] = resolved_for(previous_body)
@@ -14876,7 +15983,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         rc = self.run_finish(clean, ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
         self.assertEqual(self.stdout_json()["status"], "HELD")
-        posted = self.harness.bodies_for("issue", "comment")
+        posted = self.harness.bodies_for("issue-comment")
         deferrals = [b for b in posted if audit_report.deferred_marker("IC_1") in b]
         self.assertEqual(len(deferrals), 1, posted)
         self.assertIn("collector still emits", deferrals[0])
@@ -14900,7 +16007,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertIn("collector manifest still emits", self.err)
         self.assertNotIn("Held by the collector", self.err)
         self.assertNotIn("known ids are", self.err)
-        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
         rc = self.run_main(
             ["remediate", "--audit", AUDIT, "--findings-file", findings_file, "--finding", a_id]
         )
@@ -14998,13 +16105,13 @@ class TestFinishManifestFlag(HarnessTestCase):
         )
         self.assertGreater(len(reason), audit_report.MAX_CELL_CHARS)
         self.harness.replies = {
-            "issue list": "[]",
-            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         rc = self.run_finish(make_doc(), ["--no-collector-manifest", reason])
         self.assertEqual(rc, 0, self.err)
-        body = self.harness.bodies_for("issue", "create")[0]
+        body = self.harness.bodies_for("issue-create")[0]
         self.assertIn(f"- the collector manifest was waived — {reason}", body)
         self.assertNotIn("\\|", body)
 
@@ -15033,7 +16140,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.replay_ledger(squeezed)
         rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(both)])
         self.assertEqual(rc, 0, self.err)
-        body = self.harness.bodies_for("issue", "edit")[0]
+        body = self.harness.bodies_for("issue-update")[0]
         self.assertIn(f"<!-- finding:{a_id} -->", body)
         self.assertIn("netpol-missing on Namespace/a", body)
         self.assertIn(a_id, audit_report.parse_delta_block(body))
@@ -15051,15 +16158,15 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(payload["status"], "HELD")
         self.assertEqual(payload["unaccounted"], [a_id])
         self.assertEqual(payload["resolved"], 0)
-        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
-        self.assertIn("netpol-missing on Namespace/a", self.harness.bodies_for("issue", "comment")[-1])
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+        self.assertIn("netpol-missing on Namespace/a", self.harness.bodies_for("issue-comment")[-1])
 
         # Control: the collector drops it, and the same clean run closes.
         self.replay_ledger(squeezed)
         rc = self.run_finish(clean, ["--manifest-file", self.manifest_file(_full_manifest())])
         self.assertEqual(rc, 0, self.err)
         self.assertEqual(self.stdout_json()["status"], "CLEAN")
-        self.assertTrue(self.harness.matching("issue", "close", "42"))
+        self.assertTrue(self.harness.forge_calls("issue-close", number=42))
 
     def test_a_remediate_on_a_still_flagged_id_is_deferred_on_a_partial_clean_run(self):
         """The deferral needs neither a previous heading nor complete coverage:
@@ -15067,9 +16174,9 @@ class TestFinishManifestFlag(HarnessTestCase):
         reproduces" under the acked marker."""
         previous_body = published_body(make_doc(), generated_at=NOW)
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
-            "--json comments": json.dumps({"comments": [comment(f"/remediate {derived_id()}")]}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
+            "*-view comments": comments_view({"comments": [comment(f"/remediate {derived_id()}")]}),
         }
         partial = make_doc(
             findings=[], skipped=[{"cluster": "dr-west", "reason": "API server unreachable"}]
@@ -15078,7 +16185,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         rc = self.run_finish(partial, ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
         self.assertTrue(self.stdout_json()["partial"])
-        posted = self.harness.bodies_for("issue", "comment")
+        posted = self.harness.bodies_for("issue-comment")
         deferrals = [b for b in posted if audit_report.deferred_marker("IC_1") in b]
         self.assertEqual(len(deferrals), 1, posted)
         self.assertIn("collector still emits", deferrals[0])
@@ -15150,7 +16257,7 @@ class TestFinishManifestFlag(HarnessTestCase):
 
     def test_unpublished_candidate_ids_are_spelled_as_the_ledger_spells_them(self):
         long_object = "Deployment/" + "very-long-workload-name-segment-" * 4
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         manifest = _full_manifest(candidates=[self.netpol_candidate(object=long_object)])
         rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
@@ -15159,20 +16266,33 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual([r["id"] for r in rows], [expected])
         self.assertLessEqual(len(expected), audit_report.MAX_FINDING_ID)
 
-    def replay_unreadable_ledger(self):
-        """A fresh recorder whose open ledger's body cannot be read."""
+    def replay_lost_store(self):
+        """A fresh recorder over an open ledger with no store directory and
+        nothing to seed from. A replaced volume alone is not this: its run
+        seeds from the body `issue-list` returns. Here the store is removed
+        before that call answers, so `stored_ledger_body` lists "" — a ledger
+        whose body has lost its hidden blocks as well as its store."""
         self.harness = Recorder()
-        self.harness.replies = {"issue list": self.issue_list()}
-        self.harness.failures = {"--json body": 1}
+        self.harness.listed_body = self.stored_ledger_body
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.harness.failures = {"issue-view !comments": 1}
         self.patch_attr("run_cmd", self.harness)
 
-    def test_an_unreadable_ledger_body_is_left_as_it_was(self):
-        """The ledger is the persistence, and a run that cannot read it must not
-        overwrite it: no body edit on the unreadable run, a coverage gap saying
-        so, and the marker's held id survives to the next readable run — while
-        a candidate the ledger never carried is not turned into a hold."""
+    def replay_store(self):
+        """A fresh recorder over the open ledger, reading the store the
+        previous run wrote."""
+        self.harness = Recorder()
+        self.harness.listed_body = self.stored_ledger_body
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.patch_attr("run_cmd", self.harness)
+
+    def test_a_lost_store_rewrites_the_body_and_the_next_run_is_trusted(self):
+        """Freezing the body over a lost store would never recover, since only a
+        run that writes the body writes the store. So the run rewrites it,
+        claims no delta, carries no held id it cannot see — and the run after it
+        reads the store that run wrote and is whole."""
         self.previous_a_and_b()
-        a_id, c_id = derived_id(fid="a"), derived_id(fid="c")
+        a_id = derived_id(fid="a")
         both = _full_manifest(
             candidates=[
                 self.netpol_candidate(object="Namespace/a"),
@@ -15182,79 +16302,144 @@ class TestFinishManifestFlag(HarnessTestCase):
         doc_b = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
         rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(both)])
         self.assertEqual(rc, 0, self.err)
-        body_n = self.harness.bodies_for("issue", "edit")[0]
+        body_n = self.harness.bodies_for("issue-update")[0]
         self.assertIn(a_id, audit_report.parse_delta_block(body_n))
+        # The store holds the block as published, held id included, so a
+        # reader's `current` counts what the issue lists.
+        stored_n = json.loads((self.store_dir() / "latest.json").read_text())
+        self.assertEqual(
+            stored_n["current_ids"], sorted(set(audit_report.parse_delta_block(body_n)))
+        )
+        self.assertIn(a_id, stored_n["current_ids"])
 
-        # Run N+1: `gh issue view` fails; the collector now also flags c, which
-        # the model has been rejecting and no ledger ever carried.
+        # Run N+1: the store is gone; the collector now also flags c.
         with_c = _full_manifest(
             candidates=both["clusters"][0]["candidates"] + [self.netpol_candidate(object="Namespace/c")]
         )
-        self.replay_unreadable_ledger()
+        self.replay_lost_store()
         rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(with_c)])
         self.assertEqual(rc, 0, self.err)
-        self.assertEqual(self.harness.bodies_for("issue", "edit"), [])
+        edits = self.harness.bodies_for("issue-update")
+        self.assertEqual(len(edits), 1)
+        body_n1 = edits[0]
+        self.assertNotIn(a_id, audit_report.parse_delta_block(body_n1))
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "UPDATED")
-        self.assertTrue(payload["partial"])
-        self.assertIn(audit_report.UNREADABLE_LEDGER_GAP, payload["coverage_gaps"])
-        self.assertIn("left as it was", self.err)
+        self.assertNotIn(audit_report.LOST_MEMORY_GAP, payload["coverage_gaps"])
         self.assertNotIn("] HELD:", self.err)
-        self.assertEqual(payload["resolved"], 0)
+        self.assertEqual((payload["new"], payload["resolved"]), (0, 0))
+        self.assertFalse([b for b in self.harness.bodies_for("issue-comment") if "audit delta" in b])
+        stored = json.loads((self.store_dir() / "latest.json").read_text())
+        self.assertEqual(stored["ledger_body"], body_n1)
 
-        # Run N+2 reads the untouched body: a is held, c never became one.
+        # Run N+2 reads the store run N+1 wrote: trusted, and b resolves.
         clean = make_doc(findings=[])
-        clean["resolved_because"] = resolved_for(body_n)
-        a_and_c = _full_manifest(
-            candidates=[
-                self.netpol_candidate(object="Namespace/a"),
-                self.netpol_candidate(object="Namespace/c"),
-            ]
-        )
-        self.replay_ledger(body_n)
-        rc = self.run_finish(clean, ["--manifest-file", self.manifest_file(a_and_c)])
+        clean["resolved_because"] = resolved_for(body_n1)
+        self.replay_store()
+        rc = self.run_finish(clean)
         self.assertEqual(rc, 0, self.err)
         payload = self.stdout_json()
-        self.assertEqual(payload["status"], "HELD")
-        self.assertEqual(payload["unaccounted"], [a_id])
-        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
-        self.assertIn(c_id, [r["id"] for r in payload["unpublished_candidates"]])
+        self.assertEqual(payload["resolved"], 1)
+        self.assertNotIn(audit_report.LOST_MEMORY_GAP, payload["coverage_gaps"])
+        self.assertNotIn("unknowable", self.err)
 
-    def test_a_clean_run_over_an_unreadable_body_does_not_close(self):
-        self.replay_unreadable_ledger()
+    def test_a_clean_run_over_a_lost_store_does_not_close_over_a_flagged_candidate(self):
+        """A candidate the collector still flags may be a finding the lost body
+        carried, so the ledger stays open over it. Once the collector stops
+        flagging it stays open still: the lost body may carry findings from
+        checks no collector covers, and closing would retire their pull
+        requests on an empty document's word."""
+        self.replay_lost_store()
         manifest = _full_manifest(candidates=[self.netpol_candidate()])
         rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
         payload = self.stdout_json()
-        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
         self.assertTrue(payload["partial"])
-        self.assertIn(audit_report.UNREADABLE_LEDGER_GAP, payload["coverage_gaps"])
+        self.assertIn(audit_report.LOST_MEMORY_GAP, payload["coverage_gaps"])
         self.assertEqual(payload["resolved"], 0)
         self.assertEqual(payload["prs_closed"], [])
+        # The collector stops flagging: the other lost-memory gap holds it.
+        self.replay_lost_store()
+        rc = self.run_finish(
+            make_doc(findings=[]), ["--manifest-file", self.manifest_file(_full_manifest())]
+        )
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertNotIn(audit_report.LOST_MEMORY_GAP, payload["coverage_gaps"])
+        self.assertIn(audit_report.LOST_MEMORY_UNGUARDED_GAP, payload["coverage_gaps"])
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+        self.assertEqual(payload["prs_closed"], [])
+
+    def test_a_remediate_over_a_lost_store_is_told_the_record_was_lost(self):
+        """The target is one the collector does not flag, but the lost record
+        may have carried it: neither "no longer reproduces" nor a coverage wait
+        that a clean fleet never ends."""
+        self.replay_lost_store()
+        target = derived_id(fid="a")
+        self.harness.replies["*-view comments"] = comments_view(
+            {"comments": [comment(f"/remediate {target}")]}
+        )
+        rc = self.run_finish(
+            make_doc(findings=[]), ["--manifest-file", self.manifest_file(_full_manifest())]
+        )
+        self.assertEqual(rc, 0, self.err)
+        comments = self.harness.bodies_for("issue-comment")
+        answers = [b for b in comments if "/remediate" in b]
+        self.assertEqual(len(answers), 1)
+        answer = answers[0]
+        self.assertNotIn("no longer reproduces", answer)
+        self.assertNotIn("could not see the whole fleet", answer)
+        self.assertIn("the report store lost its record of this ledger", answer)
+        self.assertIn(f"whether `{target}` was among the findings the ledger carried", answer)
+        self.assertIn("until a run that reports findings rebuilds the record", answer)
+        partial = [b for b in comments if "found nothing" in b]
+        self.assertEqual(len(partial), 1)
+        self.assertIn("found nothing — but the report store lost its record", partial[0])
+        self.assertNotIn("did not see the whole fleet", partial[0])
+        self.assertNotIn("reads the whole fleet", partial[0])
+
+    def test_a_guarded_lost_store_answers_an_unflagged_remediate_with_the_lost_record(self):
+        """The collector still flags b, so the gap is the guarded one; a
+        request for a, which it does not flag, gets the lost-record answer."""
+        self.replay_lost_store()
+        target = derived_id(fid="a")
+        self.harness.replies["*-view comments"] = comments_view(
+            {"comments": [comment(f"/remediate {target}")]}
+        )
+        manifest = _full_manifest(candidates=[self.netpol_candidate(object="Namespace/b")])
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn(audit_report.LOST_MEMORY_GAP, self.stdout_json()["coverage_gaps"])
+        answers = [b for b in self.harness.bodies_for("issue-comment") if "/remediate" in b]
+        self.assertEqual(len(answers), 1)
+        self.assertIn(f"whether `{target}` was among the findings the ledger carried", answers[0])
+        self.assertIn(audit_report.LOST_RECORD_WAY_OUT, answers[0])
+        self.assertNotIn("no longer reproduces", answers[0])
 
     def test_a_scheme_bump_rewrites_the_body_and_the_next_run_is_whole(self):
-        """A marker under another identity scheme is not an unreadable ledger:
-        the stamp is refreshed only by the rewrite, so freezing the body over
-        it would freeze it for good. The bump costs one run's re-spelled holds
+        """A marker under another identity scheme is not a lost memory: the
+        stored body keeps its own stamp and is re-spelled on read, so the
+        scheme is no trust condition. The bump costs one run's re-spelled holds
         and nothing after it."""
         previous_body = published_body(make_doc(), generated_at=NOW).replace(
             f"<!-- audit-id-scheme: {audit_report.ID_SCHEME} -->", "<!-- audit-id-scheme: 1 -->"
         )
         self.assertEqual(audit_report.parse_id_scheme(previous_body), 1)
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         manifest = _full_manifest(candidates=[self.netpol_candidate(object="Namespace/b")])
         doc_b = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
         rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
-        rewritten = self.harness.bodies_for("issue", "edit")[0]
+        rewritten = self.harness.bodies_for("issue-update")[0]
         self.assertEqual(audit_report.parse_id_scheme(rewritten), audit_report.ID_SCHEME)
         payload = self.stdout_json()
         self.assertFalse(payload["partial"])
-        self.assertNotIn(audit_report.UNREADABLE_LEDGER_GAP, payload["coverage_gaps"])
+        self.assertNotIn(audit_report.LOST_MEMORY_GAP, payload["coverage_gaps"])
         # The next run reads a current stamp and is whole.
         self.replay_ledger(rewritten)
         rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(manifest)])
@@ -15264,15 +16449,18 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual((payload["new"], payload["resolved"]), (0, 0))
         self.assertTrue(payload["silent_ok"])
 
-    def test_the_unreadable_ledger_path_touches_only_what_it_may(self):
-        """The inventory: no body or title edit, no label, no promotion, no
-        acknowledgement, no delta comment — refusals and deferrals answered."""
+    def test_a_lost_store_findings_run_writes_and_keeps_flagged_prs(self):
+        """The findings branch over a lost store does everything a run does —
+        body, promotion, `/remediate` — except announce a delta, and a pull
+        request for an id the collector still flags stays open, since the
+        stale-close pass reads the still-flagged set whole."""
         a_id = derived_id(fid="a")
-        self.replay_unreadable_ledger()
-        self.harness.replies["--json comments"] = json.dumps(
+        self.replay_lost_store()
+        self.open_pr_for_a()
+        self.harness.replies["*-view comments"] = comments_view(
             {"comments": [comment(f"/remediate {a_id}")]}
         )
-        self.harness.replies["pr create"] = "https://github.com/acme/fleet/pull/8\n"
+        self.harness.replies["proposal-create"] = created("proposal", "https://github.com/acme/fleet/pull/9")
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         manifest = _full_manifest(
             candidates=[
@@ -15280,32 +16468,33 @@ class TestFinishManifestFlag(HarnessTestCase):
                 self.netpol_candidate(),
             ]
         )
-        # The document's own critical manifest finding would otherwise promote.
         rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
-        self.assertEqual(self.harness.gh_calls("issue", "edit"), [])
-        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
-        posted = self.harness.bodies_for("issue", "comment")
+        # The body, then the relink that names the promoted pull request; the
+        # store keeps the relinked one, since that is what the ledger shows.
+        edits = self.harness.bodies_for("issue-update")
+        self.assertEqual(len(edits), 2)
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1)
+        stored = json.loads((self.store_dir() / "latest.json").read_text())
+        self.assertEqual(stored["ledger_body"], edits[-1])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
+        posted = self.harness.bodies_for("issue-comment")
         self.assertFalse([b for b in posted if "audit delta" in b])
-        self.assertFalse([b for b in posted if audit_report.acked_marker("IC_1") in b])
         deferrals = [b for b in posted if audit_report.deferred_marker("IC_1") in b]
         self.assertEqual(len(deferrals), 1, posted)
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "UPDATED")
-        self.assertTrue(payload["partial"])
-        self.assertIn(audit_report.UNREADABLE_LEDGER_GAP, payload["coverage_gaps"])
-        self.assertEqual(payload["prs_opened"], [])
-        self.assertIn("body, title, label and promotions wait", self.err)
+        self.assertNotIn(audit_report.LOST_MEMORY_GAP, payload["coverage_gaps"])
 
     def test_a_manifest_for_another_audit_is_refused(self):
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         manifest = _full_manifest()
         manifest["audit"] = "obtainability-audit"
         rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 2)
         self.assertIn("'obtainability-audit'", self.err)
         self.assertIn(f"'{AUDIT}'", self.err)
-        self.assertFalse(self.harness.matching("issue"))
+        self.assertFalse(self.harness.forge_calls("issue-*"))
         # Naming this stream, or naming none, both pass.
         for declared in (AUDIT, None):
             with self.subTest(audit=declared):
@@ -15313,7 +16502,8 @@ class TestFinishManifestFlag(HarnessTestCase):
                 if declared:
                     manifest["audit"] = declared
                 self.harness = Recorder()
-                self.harness.replies = {"issue list": "[]"}
+                self.harness.listed_body = self.stored_ledger_body
+                self.harness.replies = {"issue-list": issues_view([])}
                 self.patch_attr("run_cmd", self.harness)
                 rc = self.run_finish(
                     make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)]
@@ -15327,7 +16517,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         manifest["clusters"].append(
             {"name": "alpha-cluster", "outcome": "out-of-scope", "error": "alpha clusters cannot upgrade"}
         )
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
         self.assertIn("INFO: the collector manifest marks 'alpha-cluster' out of scope", self.err)
@@ -15341,7 +16531,8 @@ class TestFinishManifestFlag(HarnessTestCase):
              "checks_run": [ran(c, "alpha-cluster") for c in audit_report.audit_checks(AUDIT)]}
         )
         self.harness = Recorder()
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.listed_body = self.stored_ledger_body
+        self.harness.replies = {"issue-list": issues_view([])}
         self.patch_attr("run_cmd", self.harness)
         rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
@@ -15351,8 +16542,8 @@ class TestFinishManifestFlag(HarnessTestCase):
         still flagged in the comment, and the coverage shortfall under it."""
         previous_body = published_body(make_doc(), generated_at=NOW)
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
         partial = make_doc(
             findings=[], skipped=[{"cluster": "dr-west", "reason": "API server unreachable"}]
@@ -15365,12 +16556,12 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(payload["status"], "HELD")
         self.assertTrue(payload["partial"])
         self.assertEqual(payload["unaccounted"], [derived_id()])
-        comment = self.harness.bodies_for("issue", "comment")[-1]
+        comment = self.harness.bodies_for("issue-comment")[-1]
         self.assertIn("still flagged by the collector", comment)
         self.assertIn("Not covered by this run (1):", comment)
         self.assertIn("dr-west: not audited", comment)
         self.assertNotIn("reads the whole fleet and still finds nothing", comment)
-        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
 
     def test_the_dry_run_previews_the_manifests_hold(self):
         manifest = self.manifest_file(_full_manifest(candidates=[self.netpol_candidate()]))
@@ -15398,8 +16589,8 @@ class TestFinishManifestFlag(HarnessTestCase):
             declaring_doc(findings=[make_finding(check="no-pdb")]), generated_at=NOW
         )
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
         doc = declaring_doc(
             findings=[
@@ -15414,7 +16605,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(rc, 0, self.err)
         payload = self.stdout_json()
         self.assertEqual(payload["postures_withheld"], [posture_id])
-        body = self.harness.bodies_for("issue", "edit")[0]
+        body = self.harness.bodies_for("issue-update")[0]
         self.assertNotIn("## Held by the collector", body)
         self.assertNotIn(posture_id, audit_report.parse_delta_block(body))
         self.assertNotIn("] HELD:", self.err)
@@ -15441,7 +16632,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
-        body = self.harness.bodies_for("issue", "edit")[0]
+        body = self.harness.bodies_for("issue-update")[0]
         self.assertLessEqual(len(body), audit_report.MAX_BODY_CHARS)
         return body, sorted(held_ids)
 
@@ -15468,9 +16659,9 @@ class TestFinishManifestFlag(HarnessTestCase):
             make_doc(findings=[make_finding(fid="b", title="Bravo finding")]), generated_at=NOW
         )
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
-            "--json comments": json.dumps({"comments": [comment(f"/remediate {c_id}")]}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
+            "*-view comments": comments_view({"comments": [comment(f"/remediate {c_id}")]}),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         manifest = _full_manifest(
@@ -15482,12 +16673,12 @@ class TestFinishManifestFlag(HarnessTestCase):
         doc_b = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
         rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
-        posted = self.harness.bodies_for("issue", "comment")
+        posted = self.harness.bodies_for("issue-comment")
         deferrals = [b for b in posted if audit_report.deferred_marker("IC_1") in b]
         self.assertEqual(len(deferrals), 1, posted)
         self.assertIn("`unpublished_candidates`", deferrals[0])
         self.assertNotIn("Held by the collector", deferrals[0])
-        self.assertNotIn("## Held by the collector", self.harness.bodies_for("issue", "edit")[0])
+        self.assertNotIn("## Held by the collector", self.harness.bodies_for("issue-update")[0])
 
     def held_run(self):
         """Run N: the ledger a,b; the document b; the collector flags a,b.
@@ -15502,7 +16693,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         doc_b = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
         rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(both)])
         self.assertEqual(rc, 0, self.err)
-        body = self.harness.bodies_for("issue", "edit")[0]
+        body = self.harness.bodies_for("issue-update")[0]
         self.assertIn(derived_id(fid="a"), audit_report.parse_delta_block(body))
         return body, doc_b
 
@@ -15535,12 +16726,12 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         rc = self.run_finish(doc_b, extra_args)
         self.assertEqual(rc, 0, self.err)
-        body = self.harness.bodies_for("issue", "edit")[0]
+        body = self.harness.bodies_for("issue-update")[0]
         self.assertIn("## Held by the collector", body)
         self.assertIn(f"<!-- finding:{a_id} -->", body)
         self.assertIn("Alpha finding", body)
         self.assertIn(a_id, audit_report.parse_delta_block(body))
-        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
         payload = self.stdout_json()
         self.assertEqual(payload["resolved"], 0)
         self.assertEqual(payload["prs_closed"], [])
@@ -15574,8 +16765,8 @@ class TestFinishManifestFlag(HarnessTestCase):
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "HELD")
         self.assertEqual(payload["unaccounted"], [derived_id(fid="a")])
-        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
-        comment = self.harness.bodies_for("issue", "comment")[-1]
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+        comment = self.harness.bodies_for("issue-comment")[-1]
         self.assertIn("held from a previous manifest run", comment)
         self.assertIn("this run passed no manifest", comment)
         self.assertNotIn("still flagged by the collector", comment)
@@ -15592,7 +16783,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(payload["status"], "CLEAN")
         self.assertEqual(payload["unaccounted"], [])
         self.assertEqual(payload["resolved"], 2)
-        self.assertTrue(self.harness.matching("issue", "close", "42"))
+        self.assertTrue(self.harness.forge_calls("issue-close", number=42))
 
     def with_held_ids(self, body, held_ids, rendered_ids):
         """`body` as the fourth tier leaves it: the held span with only its id
@@ -15623,11 +16814,11 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         rc = self.run_finish(doc_b, extra_args)
         self.assertEqual(rc, 0, self.err)
-        edited = self.harness.bodies_for("issue", "edit")[0]
+        edited = self.harness.bodies_for("issue-update")[0]
         self.assertIn(a_id, audit_report.parse_delta_block(edited))
         self.assertIn(f"<!-- finding:{a_id} -->", edited)
         self.assertIn("not recorded on the previous ledger; carried by id", edited)
-        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
         payload = self.stdout_json()
         self.assertEqual(payload["resolved"], 0)
         self.assertEqual(payload["prs_closed"], [])
@@ -15658,7 +16849,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "HELD")
         self.assertEqual(payload["unaccounted"], [a_id])
-        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
 
     def test_an_undecomposable_marker_id_is_carried_by_id_alone(self):
         row = audit_report.held_row_from_id("odd-id-with-no-segments")
@@ -15667,30 +16858,26 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertIn("<!-- finding:odd-id-with-no-segments -->", lines)
         self.assertIn("not recorded on the previous ledger; carried by id", lines)
 
-    def test_a_flagless_run_over_an_unreadable_body_leaves_it_as_it_was(self):
-        """The one deliberate change to manifest-less behaviour: main rewrote
-        the body over an unreadable one, dropping every held id its marker
-        carried and retiring their pull requests."""
+    def test_a_flagless_run_over_a_lost_store_drops_the_holds(self):
+        """Without a manifest or a memory there is nothing to hold with: the run
+        rewrites the body without the held ids, and nothing protects their
+        pull requests — the manifest-less run's semantics before holds existed."""
         body_n, doc_b = self.held_run()
         a_id = derived_id(fid="a")
-        self.replay_unreadable_ledger()
+        self.replay_lost_store()
         self.open_pr_for_a()
-        self.harness.replies["pr create"] = "https://github.com/acme/fleet/pull/9\n"
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         rc = self.run_finish(doc_b)
         self.assertEqual(rc, 0, self.err)
-        self.assertEqual(self.harness.gh_calls("issue", "edit"), [])
-        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
-        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        edits = self.harness.bodies_for("issue-update")
+        self.assertEqual(len(edits), 1)
+        self.assertNotIn(a_id, audit_report.parse_delta_block(edits[0]))
         payload = self.stdout_json()
-        self.assertTrue(payload["partial"])
-        self.assertIn(audit_report.UNREADABLE_LEDGER_GAP, payload["coverage_gaps"])
         self.assertEqual(payload["status"], "UPDATED")
-        # The next readable run finds the marker intact and carries a on.
-        self.replay_ledger(body_n)
-        rc = self.run_finish(doc_b)
-        self.assertEqual(rc, 0, self.err)
-        self.assertIn(a_id, audit_report.parse_delta_block(self.harness.bodies_for("issue", "edit")[0]))
+        self.assertNotIn(audit_report.LOST_MEMORY_GAP, payload["coverage_gaps"])
+        self.assertIn(a_id, audit_report.parse_delta_block(body_n))
+        self.assertEqual(payload["prs_closed"], ["https://github.com/acme/fleet/pull/8"])
+        self.assertEqual(len(self.harness.forge_calls("proposal-close")), 1)
 
     def test_the_carried_rendering_names_the_last_recorded_command_or_nothing(self):
         recorded = self.held_entry(1)
@@ -15715,14 +16902,14 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(audit_report.parse_held_rows(previous_body), [])
         self.assertNotIn(audit_report.HELD_SECTION_BEGIN, previous_body)
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.assertEqual(self.run_finish(make_doc(findings=[first])), 0, self.err)
         payload = self.stdout_json()
         self.assertEqual(payload["resolved"], 1)
-        edited = self.harness.bodies_for("issue", "edit")[0]
+        edited = self.harness.bodies_for("issue-update")[0]
         self.assertNotIn(audit_report.HELD_SECTION_BEGIN, edited)
         self.assertNotIn(derived_id(fid="second"), audit_report.parse_delta_block(edited))
 
@@ -15758,8 +16945,8 @@ class TestFinishManifestFlag(HarnessTestCase):
         b = make_finding(fid="b", title="Bravo finding")
         previous_body = published_body(make_doc(findings=[long_a, b]), generated_at=NOW)
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         manifest = _full_manifest(
@@ -15771,7 +16958,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         doc_b = make_doc(findings=[b])
         rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
-        body_n = self.harness.bodies_for("issue", "edit")[0]
+        body_n = self.harness.bodies_for("issue-update")[0]
         current = audit_report.published_id(long_a)
         self.assertNotEqual(current, audit_report.derive_finding_id(long_a))
         self.assertIn(current, audit_report.parse_delta_block(body_n))
@@ -15804,7 +16991,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.replay_ledger(forged)
         rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
-        bumped = self.harness.bodies_for("issue", "edit")[0]
+        bumped = self.harness.bodies_for("issue-update")[0]
         self.assertIn(current, audit_report.parse_delta_block(bumped))
         self.assertIn(f"<!-- finding:{current} -->", bumped)
         self.assertEqual(self.stdout_json()["resolved"], 0)
@@ -15813,13 +17000,13 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.replay_ledger(bumped)
         rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
-        self.assertIn(current, audit_report.parse_delta_block(self.harness.bodies_for("issue", "edit")[0]))
+        self.assertIn(current, audit_report.parse_delta_block(self.harness.bodies_for("issue-update")[0]))
         self.assertEqual(self.stdout_json()["resolved"], 0)
         # A manifest-less bump run carries it the same way.
         self.replay_ledger(forged)
         rc = self.run_finish(doc_b)
         self.assertEqual(rc, 0, self.err)
-        self.assertIn(current, audit_report.parse_delta_block(self.harness.bodies_for("issue", "edit")[0]))
+        self.assertIn(current, audit_report.parse_delta_block(self.harness.bodies_for("issue-update")[0]))
 
     def test_a_marker_only_id_is_the_residual_of_a_scheme_bump(self):
         body_n, doc_b, manifest, current, old = self.held_run_with_long_object()
@@ -15845,24 +17032,25 @@ class TestFinishManifestFlag(HarnessTestCase):
         rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
         self.assertIn("WARNING: 1 id(s) in the previous marker had no rendered row", self.err)
-        bumped = self.harness.bodies_for("issue", "edit")[0]
+        bumped = self.harness.bodies_for("issue-update")[0]
         self.assertNotIn("gone.old.spelling", audit_report.parse_delta_block(bumped))
         self.assertIn(current, audit_report.parse_delta_block(bumped))
 
     def test_a_flagless_unreadable_run_answers_no_remediate(self):
-        """Without a manifest and without the body, the held set is unknown,
-        so a standing `/remediate` gets no answer this run — not a refusal,
-        not a deferral, not an acknowledgement — and the next readable run
+        """Without a manifest and with the report store's record of the ledger
+        lost, the held set is unknown, so a standing `/remediate` gets no
+        answer this run — not a refusal, not a deferral, not an
+        acknowledgement — and the next run that can read the held set
         defers it."""
         body_n, doc_b = self.held_run()
         a_id = derived_id(fid="a")
         request = comment(f"/remediate {a_id}")
-        self.replay_unreadable_ledger()
-        self.harness.replies["--json comments"] = json.dumps({"comments": [request]})
+        self.replay_lost_store()
+        self.harness.replies["*-view comments"] = comments_view({"comments": [request]})
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         rc = self.run_finish(doc_b)
         self.assertEqual(rc, 0, self.err)
-        for body in self.harness.bodies_for("issue", "comment"):
+        for body in self.harness.bodies_for("issue-comment"):
             for marker in (
                 audit_report.refused_marker("IC_1"),
                 audit_report.deferred_marker("IC_1"),
@@ -15871,26 +17059,26 @@ class TestFinishManifestFlag(HarnessTestCase):
                 self.assertNotIn(marker, body)
         self.assertIn("no /remediate is answered", self.err)
         # The clean variant answers nothing either.
-        self.replay_unreadable_ledger()
-        self.harness.replies["--json comments"] = json.dumps({"comments": [request]})
+        self.replay_lost_store()
+        self.harness.replies["*-view comments"] = comments_view({"comments": [request]})
         rc = self.run_finish(make_doc(findings=[]))
         self.assertEqual(rc, 0, self.err)
-        for body in self.harness.bodies_for("issue", "comment"):
+        for body in self.harness.bodies_for("issue-comment"):
             self.assertNotIn(audit_report.acked_marker("IC_1"), body)
             self.assertNotIn("no longer reproduces", body)
-        # The next readable run defers it.
+        # The next run with a memory defers it.
         self.replay_ledger(body_n)
-        self.harness.replies["--json comments"] = json.dumps({"comments": [request]})
+        self.harness.replies["*-view comments"] = comments_view({"comments": [request]})
         rc = self.run_finish(doc_b)
         self.assertEqual(rc, 0, self.err)
-        posted = self.harness.bodies_for("issue", "comment")
+        posted = self.harness.bodies_for("issue-comment")
         self.assertEqual(len([b for b in posted if audit_report.deferred_marker("IC_1") in b]), 1, posted)
 
-    def test_a_manifest_still_answers_remediate_over_an_unreadable_body(self):
+    def test_a_manifest_still_answers_remediate_over_a_lost_store(self):
         self.held_run()
         a_id = derived_id(fid="a")
-        self.replay_unreadable_ledger()
-        self.harness.replies["--json comments"] = json.dumps({"comments": [comment(f"/remediate {a_id}")]})
+        self.replay_lost_store()
+        self.harness.replies["*-view comments"] = comments_view({"comments": [comment(f"/remediate {a_id}")]})
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         manifest = _full_manifest(
             candidates=[self.netpol_candidate(object="Namespace/a"), self.netpol_candidate(object="Namespace/b")]
@@ -15898,7 +17086,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         doc_b = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
         rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
-        posted = self.harness.bodies_for("issue", "comment")
+        posted = self.harness.bodies_for("issue-comment")
         self.assertEqual(len([b for b in posted if audit_report.deferred_marker("IC_1") in b]), 1, posted)
 
     def test_an_id_only_row_never_derives_a_location(self):
@@ -15930,7 +17118,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         rc = self.run_finish(doc_b)
         self.assertEqual(rc, 0, self.err)
-        edited = self.harness.bodies_for("issue", "edit")[0]
+        edited = self.harness.bodies_for("issue-update")[0]
         self.assertIn(f"<!-- finding:{clipped} -->", edited)
         self.assertIn("not recorded on the previous ledger; carried by id", edited)
         self.assertNotIn(clipped, audit_report.parse_finding_locations(edited))
@@ -15948,7 +17136,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "HELD")
         self.assertIn(clipped, payload["unaccounted"])
-        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
 
     def test_a_multi_line_title_cannot_manufacture_a_hold(self):
         """The premise the carry must not rest on: a title with a newline puts
@@ -15962,14 +17150,14 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertNotIn(derived_id(fid="first"), audit_report.parse_finding_titles(previous_body))
         self.assertEqual(audit_report.parse_held_ids(previous_body), [])
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.assertEqual(self.run_finish(make_doc(findings=[second])), 0, self.err)
         payload = self.stdout_json()
         self.assertEqual(payload["resolved"], 1)
-        edited = self.harness.bodies_for("issue", "edit")[0]
+        edited = self.harness.bodies_for("issue-update")[0]
         self.assertNotIn(audit_report.HELD_SECTION_BEGIN, edited)
         self.assertNotIn(derived_id(fid="first"), audit_report.parse_delta_block(edited))
 
@@ -16144,7 +17332,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.replay_ledger(body)
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.assertEqual(self.run_finish(doc), 0, self.err)
-        edited = self.harness.bodies_for("issue", "edit")[0]
+        edited = self.harness.bodies_for("issue-update")[0]
         self.assertEqual(
             audit_report.parse_held_ids(edited), [], "a forged hold survived into the next body"
         )
@@ -16269,8 +17457,8 @@ class TestFinishManifestFlag(HarnessTestCase):
             generated_at=NOW,
         )
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         still_there = self.netpol_candidate(object="Namespace/a")
@@ -16283,7 +17471,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(payload["resolved"], 0)
         self.assertIn("NOT being announced as resolved", self.err)
         self.assertIn(derived_id(fid="a"), self.err)
-        for comment in self.harness.bodies_for("issue", "comment"):
+        for comment in self.harness.bodies_for("issue-comment"):
             self.assertNotIn("Alpha finding", comment)
 
     def test_a_dropped_finding_the_collector_also_dropped_still_resolves(self):
@@ -16297,8 +17485,8 @@ class TestFinishManifestFlag(HarnessTestCase):
             generated_at=NOW,
         )
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         manifest = _full_manifest(candidates=[self.netpol_candidate(object="Namespace/b")])
@@ -16309,9 +17497,9 @@ class TestFinishManifestFlag(HarnessTestCase):
 
     def promotion_replies(self):
         self.harness.replies = {
-            "issue list": "[]",
-            "issue create": "https://github.com/acme/fleet/issues/7\n",
-            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
             "rev-parse --abbrev-ref": "feature-branch\n",
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
@@ -16321,7 +17509,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         manifest = _full_manifest(candidates=[self.netpol_candidate()])
         rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
-        self.assertEqual(len(self.harness.gh_calls("pr", "create")), 1)
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1)
         self.assertEqual(self.stdout_json()["uncorroborated_findings"], [])
 
     def test_an_uncorroborated_critical_is_published_but_not_auto_promoted(self):
@@ -16331,12 +17519,12 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.promotion_replies()
         rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(_full_manifest())])
         self.assertEqual(rc, 0, self.err)
-        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "OPENED")
         self.assertEqual(payload["uncorroborated_findings"], [derived_id()])
         self.assertEqual(payload["prs_opened"], [])
-        body = self.harness.bodies_for("issue", "create")[0]
+        body = self.harness.bodies_for("issue-create")[0]
         self.assertIn("Read these before asking", body)
         self.assertIn(f"`{derived_id()}`", body)
         self.assertIn("the sweep will not open a pull request", self.err)
@@ -16346,8 +17534,8 @@ class TestFinishManifestFlag(HarnessTestCase):
         manifest = _full_manifest(candidates=[self.netpol_candidate(needs_triage="service-fronted")])
         rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
-        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
-        body = self.harness.bodies_for("issue", "create")[0]
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+        body = self.harness.bodies_for("issue-create")[0]
         self.assertIn("its fix is what needs a decision", body)
         self.assertNotIn("Read these before asking", body)
         self.assertEqual(self.stdout_json()["uncorroborated_findings"], [])
@@ -16373,14 +17561,14 @@ class TestFinishManifestFlag(HarnessTestCase):
             generated_at=NOW,
         )
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         return previous_body
 
     def open_pr_for_a(self):
-        self.harness.replies["pr list"] = json.dumps(
+        self.harness.replies["proposal-list"] = proposals_view(
             [
                 pr(
                     8,
@@ -16405,7 +17593,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
         rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
-        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
         payload = self.stdout_json()
         self.assertEqual(payload["prs_closed"], [])
         self.assertEqual(payload["resolved"], 0)
@@ -16421,7 +17609,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
         rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
-        self.assertTrue(self.harness.gh_calls("pr", "close"))
+        self.assertTrue(self.harness.forge_calls("proposal-close"))
         payload = self.stdout_json()
         self.assertEqual(payload["prs_closed"], ["https://github.com/acme/fleet/pull/8"])
         self.assertEqual(payload["resolved"], 1)
@@ -16439,8 +17627,8 @@ class TestFinishManifestFlag(HarnessTestCase):
             generated_at=NOW,
         )
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         manifest = _full_manifest(
@@ -16458,8 +17646,8 @@ class TestFinishManifestFlag(HarnessTestCase):
     def clean_over_previous_ledger(self):
         previous_body = published_body(make_doc(), generated_at=NOW)
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
         doc = make_doc(findings=[])
         doc["resolved_because"] = resolved_for(previous_body)
@@ -16475,15 +17663,15 @@ class TestFinishManifestFlag(HarnessTestCase):
         )
         rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
-        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
-        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "HELD")
         self.assertEqual(payload["resolved"], 0)
         self.assertEqual(payload["prs_closed"], [])
         self.assertEqual(payload["unaccounted"], [derived_id()])
         self.assertFalse(payload["silent_ok"])
-        comment = self.harness.bodies_for("issue", "comment")[-1]
+        comment = self.harness.bodies_for("issue-comment")[-1]
         self.assertIn("the ledger stays open", comment)
         self.assertIn("still flagged by the collector", comment)
         self.assertIn("A `resolved_because` entry does not release one of these", comment)
@@ -16516,7 +17704,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         )
         rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
-        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "HELD")
         self.assertEqual(payload["resolved"], 0)
@@ -16525,7 +17713,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.replay_ledger(previous_body)
         rc = self.run_finish(doc)
         self.assertEqual(rc, 0, self.err)
-        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
         self.assertEqual(self.stdout_json()["unaccounted"], [derived_id(cluster=qualified[0])])
 
     def test_a_cluster_past_the_scope_table_is_qualified_from_this_run(self):
@@ -16554,14 +17742,14 @@ class TestFinishManifestFlag(HarnessTestCase):
         )
         rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
-        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "HELD")
         self.assertEqual(payload["unaccounted"], [derived_id(cluster=qualified[0])])
         self.replay_ledger(previous_body)
         rc = self.run_finish(doc)
         self.assertEqual(rc, 0, self.err)
-        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
         self.assertEqual(self.stdout_json()["unaccounted"], [derived_id(cluster=qualified[0])])
 
     def test_the_manifest_path_holds_a_finding_past_the_scope_table(self):
@@ -16631,7 +17819,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         doc = self.clean_over_previous_ledger()
         rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(_full_manifest())])
         self.assertEqual(rc, 0, self.err)
-        self.assertTrue(self.harness.matching("issue", "close", "42"))
+        self.assertTrue(self.harness.forge_calls("issue-close", number=42))
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "CLEAN")
         self.assertEqual(payload["resolved"], 1)
@@ -16641,13 +17829,13 @@ class TestFinishManifestFlag(HarnessTestCase):
         """The Scope table shows full coverage on a waived findings run — the
         document authored no gap — so the waiver gets the section's own list."""
         self.harness.replies = {
-            "issue list": "[]",
-            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         rc = self.run_finish(make_doc(), ["--no-collector-manifest", "collector crashed"])
         self.assertEqual(rc, 0, self.err)
-        body = self.harness.bodies_for("issue", "create")[0]
+        body = self.harness.bodies_for("issue-create")[0]
         self.assertIn("### Coverage", body)
         self.assertIn("the collector manifest was waived — collector crashed", body)
         payload = self.stdout_json()
@@ -16659,8 +17847,8 @@ class TestFinishManifestFlag(HarnessTestCase):
             make_doc(findings=[make_finding(fid="a", title="Alpha finding")]), generated_at=NOW
         )
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         doc = make_doc(
@@ -16671,11 +17859,11 @@ class TestFinishManifestFlag(HarnessTestCase):
         )
         rc = self.run_finish(doc, ["--no-collector-manifest", "collector crashed"])
         self.assertEqual(rc, 0, self.err)
-        comment = self.harness.bodies_for("issue", "comment")[-1]
+        comment = self.harness.bodies_for("issue-comment")[-1]
         self.assertIn("audit delta", comment)
         self.assertIn("Coverage of this run is partial", comment)
         self.assertIn("the collector manifest was waived — collector crashed", comment)
-        body = self.harness.bodies_for("issue", "edit")[0]
+        body = self.harness.bodies_for("issue-update")[0]
         self.assertIn("### Coverage", body)
 
     def test_a_document_gap_does_not_reach_the_delta_comment(self):
@@ -16685,8 +17873,8 @@ class TestFinishManifestFlag(HarnessTestCase):
             make_doc(findings=[make_finding(fid="a", title="Alpha finding")]), generated_at=NOW
         )
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         doc = make_doc(
@@ -16697,12 +17885,12 @@ class TestFinishManifestFlag(HarnessTestCase):
             skipped=[{"cluster": "dr-west", "reason": "API server unreachable"}],
         )
         self.assertEqual(self.run_finish(doc), 0, self.err)
-        comment = self.harness.bodies_for("issue", "comment")[-1]
+        comment = self.harness.bodies_for("issue-comment")[-1]
         self.assertNotIn("Coverage of this run is partial", comment)
-        self.assertNotIn("### Coverage", self.harness.bodies_for("issue", "edit")[0])
+        self.assertNotIn("### Coverage", self.harness.bodies_for("issue-update")[0])
 
     def test_the_waiver_reason_is_redacted(self):
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         rc = self.run_finish(
             make_doc(findings=[]),
             ["--no-collector-manifest", "collector died with password: hunter2correcthorse"],
@@ -16717,7 +17905,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         """The model did publish it; `finish` took it out for want of a
         declared-intent search. Reporting it as a candidate the model dropped
         blames the wrong party for the right absence."""
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         doc = declaring_doc()
         posture = doc["findings"][0]
         manifest = _full_manifest(
@@ -16743,7 +17931,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(payload["wholly_unpublished_checks"], [])
 
     def test_the_drop_warning_only_claims_the_check_ran_where_checks_run_says_so(self):
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         manifest = _full_manifest(candidates=[self.netpol_candidate()])
         attested = make_doc(findings=[])
         rc = self.run_finish(attested, ["--manifest-file", self.manifest_file(manifest)])
@@ -16761,7 +17949,7 @@ class TestFinishManifestFlag(HarnessTestCase):
             c for c in manifest["clusters"][0]["commands"] if c["check"] != "netpol-missing"
         ]
         self.harness = type(self.harness)()
-        self.harness.replies = {"issue list": "[]"}
+        self.harness.replies = {"issue-list": {"issues": []}}
         self.patch_attr("run_cmd", self.harness)
         rc = self.run_finish(silent, ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
@@ -16801,8 +17989,8 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
 
     The contract is meant to be inert until a stream passes a manifest, and
     "inert" is a claim about every byte the run emits rather than about a
-    payload key or two: the `gh` argv sequence, the bodies each call carried,
-    the JSON line on stdout and the log on stderr. Each scenario below records
+    payload key or two: the git argv and forge call sequence, the payload each
+    forge call carried, the JSON line on stdout and the log on stderr. Each scenario below records
     all of that against a frozen clock and compares it with a transcript
     captured from the harness *before* the contract was added. A key added
     unconditionally to the payload, a log line that now prints on every run,
@@ -16811,12 +17999,31 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     One deviation is deliberate and is recorded in the transcripts rather than
     excused: `ID_SCHEME` went from 2 to 3 when the drift collector began
     qualifying cluster names, from 3 to 4 when the patch-readiness
-    collector did the same, and from 4 to 5 when `collect.py` did it for three
-    more streams, and the stamp is global, so every stream's bodies
+    collector did the same, from 4 to 5 when `collect.py` did it for three
+    more streams, and from 5 to 6 when `fleet_waste.py` and `fleet_stockout.py`
+    did it for cost and stockout, and the stamp is global, so every stream's bodies
     carry the current number. That is the whole of the change here -- five
     lines, one per body -- and this class is what proves it. The compliance
     roster growing from eleven checks to sixteen is recorded the same way: the
     Scope table's `n/n` column and the unrun-check prose count the roster.
+    The report store is the other: the previous body is read from the store
+    rather than from a separate body read, so that call is gone from every
+    transcript that had an open ledger, and the `forge issue-list` that finds
+    the ledger carries each issue's body, the body being what the store's
+    record is checked against and, where the store never held the ledger,
+    what seeds it. One line of
+    output moved with it: the clean-over-a-gap run's stderr says the gaps mean
+    it "cannot vouch for the ledger's state", where it said it "cannot speak
+    for the fleet", because a lost store record also makes a clean run
+    partial, and the line now covers both causes. Nothing else moved.
+
+    The move from `gh` to the broker's forge verbs is recorded the same way,
+    and is confined to the call surface: every body, the stdout line and every
+    stderr line but the per-call `forge ...` trace are what `gh` produced. One
+    call is new — the `proposal-update` that labels a pull request
+    `proposal-create` cannot. `identity`, which reads who wrote a comment, is
+    asked only of a conversation that has comments, and none of these
+    transcripts reads one.
 
     Five scenarios, chosen to pass through every branch a manifest could
     touch: the findings path with a delta and an auto-promoted pull request,
@@ -16842,7 +18049,10 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
             "rc": rc,
             "calls": [[self._normalise(a) for a in call] for call in self.harness.calls],
             "cwds": [self._normalise(c) for c in self.harness.cwds],
-            "bodies": [self._normalise(b) for b in self.harness.bodies],
+            "payloads": [
+                None if p is None else json.loads(self._normalise(json.dumps(p, sort_keys=True)))
+                for p in self.harness.payloads
+            ],
             "stdout": self._normalise(self.out),
             "stderr": self._normalise(self.err),
         }
@@ -16885,9 +18095,9 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
             generated_at=NOW,
         )
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
-            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
             "rev-parse --abbrev-ref": "feature-branch\n",
         }
         rc = self.run_finish(make_doc(findings=self.two_findings()))
@@ -16896,8 +18106,8 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     def test_clean_path_closes_the_ledger(self):
         previous_body = published_body(make_doc(), generated_at=NOW)
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
         doc = make_doc(findings=[])
         # Every previous finding explained, so the close is not held (#1691)
@@ -16909,8 +18119,8 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     def test_clean_path_held_over_an_unaccounted_finding(self):
         previous_body = published_body(make_doc(), generated_at=NOW)
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
         rc = self.run_finish(make_doc(findings=[]))
         self.check("clean_held_over_unaccounted", rc)
@@ -16918,8 +18128,8 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     def test_clean_over_a_coverage_gap_leaves_the_ledger_open(self):
         previous_body = published_body(make_doc(), generated_at=NOW)
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
         }
         doc = make_doc(
             findings=[],
@@ -16933,6 +18143,702 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
         rc = self.run_finish(make_doc(findings=self.two_findings()), ["--dry-run"])
         self.check("dry_run", rc)
 
+
+
+class TestReportStore(HarnessTestCase):
+    """The report store: what `finish` writes, what the next run trusts."""
+
+    def envelope(self, **overrides):
+        envelope = audit_report.report_envelope(
+            AUDIT,
+            {"status": "UPDATED", "partial": False, "coverage_gaps": []},
+            make_doc(),
+            NOW,
+            repo="acme/fleet",
+            issue_number=42,
+            ledger_body="body",
+            new_ids=["b", "a"],
+            resolved_ids=[],
+            rendered_ids=["b", "a", "b"],
+        )
+        envelope.update(overrides)
+        return envelope
+
+    def stored(self):
+        return json.loads((self.store_dir() / "latest.json").read_text())
+
+    def test_a_written_report_is_read_back_for_the_same_ledger(self):
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        memory = audit_report.read_report_memory(AUDIT, 42, "acme/fleet")
+        self.assertEqual(memory["ledger_body"], "body")
+        self.assertEqual(memory["current_ids"], ["a", "b"])
+        self.assertEqual(memory["new_ids"], ["a", "b"])
+        self.assertEqual(memory["id_scheme"], audit_report.ID_SCHEME)
+        runs = list((self.store_dir() / "runs").glob("*.json"))
+        self.assertEqual([p.name for p in runs], ["20260801T093000.000000Z.json"])
+
+    def test_a_report_for_another_ledger_is_not_trusted(self):
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        for issue, repo in ((43, "acme/fleet"), (42, "acme/other"), (None, "acme/fleet")):
+            with self.subTest(issue=issue, repo=repo):
+                self.assertIsNone(audit_report.read_report_memory(AUDIT, issue, repo))
+
+    def test_each_repository_keeps_its_own_memory(self):
+        """An SOP walking `managed_repos` finishes one stream once per
+        repository; each run must find its own ledger's memory, not the one
+        the other repository's run wrote a minute before."""
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        audit_report.write_report(
+            AUDIT,
+            self.envelope(repo="acme/other", issue_number=12, ledger_body="other body"),
+            NOW.replace(minute=31),
+        )
+        self.assertEqual(
+            audit_report.read_report_memory(AUDIT, 42, "acme/fleet")["ledger_body"], "body"
+        )
+        self.assertEqual(
+            audit_report.read_report_memory(AUDIT, 12, "acme/other")["ledger_body"],
+            "other body",
+        )
+        for repo in ("acme/fleet", "acme/other"):
+            with self.subTest(repo=repo):
+                runs = list(self.store_dir(repo=repo).joinpath("runs").glob("*.json"))
+                self.assertEqual(len(runs), 1)
+
+    def test_a_repository_that_is_not_owner_name_is_never_a_path(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for repo in ("../../etc", "acme", "acme/fleet/x", "acme/..", ""):
+                with self.subTest(repo=repo):
+                    audit_report.write_report(AUDIT, self.envelope(repo=repo), NOW)
+                    self.assertIsNone(audit_report.read_report_memory(AUDIT, 42, repo))
+        self.assertFalse(self.reports_dir.exists())
+        self.assertIn("is not owner/name", err.getvalue())
+
+    def test_a_store_write_is_readable_whatever_the_umask(self):
+        """A temp file is 0600 and a directory narrows to the umask: under a
+        hardened operator shell's 077 a root hand-run would leave a store no
+        uid-1000 run can read."""
+        mask = os.umask(0o077)
+        try:
+            audit_report.write_report(AUDIT, self.envelope(), NOW)
+        finally:
+            os.umask(mask)
+        directory = self.store_dir()
+        for path in (self.reports_dir, directory, directory / "runs"):
+            with self.subTest(path=path):
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o755)
+        for path in (directory / "latest.json", *(directory / "runs").glob("*.json")):
+            with self.subTest(path=path):
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
+
+    def test_a_root_run_hands_what_it_creates_to_the_stores_owner(self):
+        """Mode cannot let uid 1000 write into a root-owned directory; root
+        hands every directory and file it creates to the nearest existing
+        directory's owner, so the next scheduled run can write."""
+        self.reports_dir.parent.mkdir(parents=True, exist_ok=True)
+        owner = self.reports_dir.parent.stat()
+        chowned = []
+        with (
+            patch.object(audit_report.os, "geteuid", return_value=0),
+            patch.object(
+                audit_report.os, "chown", side_effect=lambda path, uid, gid: chowned.append(
+                    (Path(path), uid, gid)
+                )
+            ),
+        ):
+            audit_report.write_report(AUDIT, self.envelope(), NOW)
+        self.assertEqual({(uid, gid) for _, uid, gid in chowned}, {(owner.st_uid, owner.st_gid)})
+        directory = self.store_dir()
+        paths = {path for path, _, _ in chowned}
+        for created in (self.reports_dir, directory, directory / "runs"):
+            with self.subTest(created=created):
+                self.assertIn(created, paths)
+        # One temp file per write: the ring entry and latest.json.
+        self.assertEqual(len([path for path in paths if path.suffix == ".tmp"]), 2)
+
+    def test_another_uids_store_is_named_when_it_is_denied(self):
+        """What a root hand-run from before the handover left behind: the
+        warning names the path and both uids rather than a bare lost memory."""
+        if os.geteuid() == 0:
+            self.skipTest("root reads a 0000 file")
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        latest = self.store_dir() / "latest.json"
+        latest.chmod(0)
+        self.addCleanup(latest.chmod, 0o644)
+        err = io.StringIO()
+        other = os.geteuid() + 1
+        with (
+            contextlib.redirect_stderr(err),
+            patch.object(audit_report.os, "geteuid", return_value=other),
+        ):
+            self.assertIsNone(audit_report.read_report_memory(AUDIT, 42, "acme/fleet"))
+        self.assertIn(
+            f"{latest} is owned by uid {latest.stat().st_uid} and this run is uid {other}",
+            err.getvalue(),
+        )
+
+    def test_a_malformed_report_is_not_trusted_and_fails_nothing(self):
+        directory = self.store_dir()
+        directory.mkdir(parents=True)
+        for text in ("not json", "[]", json.dumps({"issue_number": 42, "repo": "acme/fleet"})):
+            with self.subTest(text=text):
+                (directory / "latest.json").write_text(text)
+                self.assertIsNone(audit_report.read_report_memory(AUDIT, 42, "acme/fleet"))
+
+    def test_the_ring_keeps_the_newest_runs(self):
+        for minute in range(audit_report.REPORT_HISTORY + 3):
+            audit_report.write_report(AUDIT, self.envelope(), NOW.replace(minute=minute))
+        runs = sorted(p.name for p in (self.store_dir() / "runs").glob("*.json"))
+        self.assertEqual(len(runs), audit_report.REPORT_HISTORY)
+        self.assertTrue(runs[0].startswith("20260801T090300"), runs[0])
+
+    def test_a_failed_write_drops_latest_rather_than_leave_it_stale(self):
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        err = io.StringIO()
+        with patch.object(audit_report, "_atomic_write", side_effect=OSError("disk full")), \
+                contextlib.redirect_stderr(err):
+            audit_report.write_report(AUDIT, self.envelope(), NOW)
+        self.assertFalse((self.store_dir() / "latest.json").exists())
+        self.assertIn("report store write", err.getvalue())
+
+    def test_a_failed_write_over_an_unchanged_ledger_keeps_latest(self):
+        """A run that left the body as it found it has nothing the stored
+        record lacks, so a failed write must not cost the next run its memory."""
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        with patch.object(audit_report, "_atomic_write", side_effect=OSError("disk full")), \
+                contextlib.redirect_stderr(io.StringIO()):
+            audit_report.write_report(AUDIT, self.envelope(), NOW, ledger_unchanged=True)
+        self.assertEqual(
+            audit_report.read_report_memory(AUDIT, 42, "acme/fleet")["ledger_body"], "body"
+        )
+
+    def test_the_document_is_redacted(self):
+        token = "ghp_" + "a" * 36
+        doc = make_doc(findings=[make_finding(fid="a", title=f"leaked {token}")])
+        envelope = audit_report.report_envelope(
+            AUDIT, {}, doc, NOW, repo="acme/fleet", issue_number=42,
+            ledger_body="", new_ids=[], resolved_ids=[], rendered_ids=[],
+        )
+        self.assertNotIn(token, json.dumps(envelope))
+
+    def test_a_finding_id_is_not_redacted_in_the_document(self):
+        """The body's block and `current_ids` publish ids raw; a redacted id in
+        the document would name a finding no other key does."""
+        fid = (
+            "image-not-pinned.prod-us.batch."
+            "deployment-task-runner-controller-manager-with-long-name"
+        )
+        finding = make_finding(fid="a")
+        finding["id"] = fid
+        envelope = audit_report.report_envelope(
+            AUDIT, {}, make_doc(findings=[finding]), NOW, repo="acme/fleet",
+            issue_number=42, ledger_body="", new_ids=[], resolved_ids=[], rendered_ids=[],
+        )
+        self.assertNotEqual(audit_report.redact_secrets(fid), fid)
+        self.assertEqual(envelope["document"]["findings"][0]["id"], fid)
+
+    def test_repository_casing_names_one_store(self):
+        """GitHub's names are not case-sensitive, so `--repo Acme/Fleet` and a
+        ConfigMap's `acme/fleet` are one ledger with one memory."""
+        audit_report.write_report(AUDIT, self.envelope(repo="Acme/Fleet"), NOW)
+        self.assertTrue((self.store_dir() / "latest.json").exists())
+        memory = audit_report.read_report_memory(AUDIT, 42, "acme/fleet")
+        self.assertEqual(memory["ledger_body"], "body")
+
+    def test_a_findings_run_stores_the_body_it_wrote(self):
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        stored = self.stored()
+        body = self.harness.bodies_for("issue-update")[-1]
+        self.assertEqual(stored["ledger_body"], body)
+        self.assertEqual(stored["issue_number"], 42)
+        self.assertEqual(stored["current_ids"], sorted(audit_report.parse_delta_block(body)))
+        self.assertEqual(stored["status"], self.stdout_json()["status"])
+        self.assertIs(stored["ledger_held_open"], False)
+
+    def test_a_clean_run_held_open_carries_the_previous_body_forward(self):
+        previous = published_body(make_doc(), generated_at=NOW)
+        # A store a findings run left: its own document, which the carried
+        # body renders.
+        self.seed_report(previous)
+        latest = self.store_dir() / "latest.json"
+        seeded = json.loads(latest.read_text())
+        seeded["document"] = make_doc()
+        latest.write_text(json.dumps(seeded), encoding="utf-8")
+        self.harness.replies = {"issue-list": self.issue_list()}
+        gap = make_doc(findings=[], skipped=[{"cluster": "dr-west", "reason": "API server unreachable"}])
+        gap["resolved_because"] = resolved_for(previous)
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        self.assertEqual(self.harness.forge_calls("issue-update"), [])
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+        stored = self.stored()
+        self.assertEqual(stored["ledger_body"], previous)
+        self.assertEqual(stored["issue_number"], 42)
+        self.assertEqual(stored["current_ids"], sorted(audit_report.parse_delta_block(previous)))
+        # `document` is this run's; the one the carried body renders rides
+        # beside it for the next run's titles, and no reader is handed both.
+        self.assertEqual(stored["document"]["findings"], [])
+        self.assertEqual(stored["document"]["scope"]["skipped"][0]["cluster"], "dr-west")
+        self.assertEqual(stored["ledger_document"], make_doc())
+        # A reader counting this run's zero must be told the issue is not clear.
+        self.assertIs(stored["ledger_held_open"], True)
+        normal = audit_report.report_envelope(
+            AUDIT, {"status": "UPDATED"}, make_doc(), NOW, repo="acme/fleet", issue_number=42,
+            ledger_body="b", new_ids=[], resolved_ids=[], rendered_ids=[])
+        self.assertNotIn("ledger_document", normal)
+        self.assertIs(normal["ledger_held_open"], False)
+
+    def test_a_held_open_run_whose_store_write_fails_keeps_the_memory(self):
+        """Held open, the run only commented; the record from before still
+        describes the body exactly, so the next run keeps trusting it."""
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"issue-list": self.issue_list(), "issue-view !comments": issue_view({"body": previous})}
+        gap = make_doc(findings=[], skipped=[{"cluster": "dr-west", "reason": "API server unreachable"}])
+        gap["resolved_because"] = resolved_for(previous)
+        with patch.object(audit_report, "_atomic_write", side_effect=OSError("disk full")):
+            self.assertEqual(self.run_finish(gap), 0, self.err)
+        self.assertIn("report store write", self.err)
+        stored = self.stored()
+        self.assertEqual(stored["issue_number"], 42)
+        self.assertEqual(stored["ledger_body"], previous)
+
+    def test_a_findings_run_whose_store_write_fails_drops_the_memory(self):
+        # Seeded first, so the assertion below needs the drop to pass. The
+        # pre-edit invalidation is patched out: it drops the same file before
+        # the body is rewritten, and left in, it would pass this test with
+        # `write_report`'s own drop deleted.
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        self.assertTrue((self.store_dir() / "latest.json").exists())
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        with patch.object(audit_report, "invalidate_report_memory"), patch.object(
+            audit_report, "_atomic_write", side_effect=OSError("disk full")
+        ):
+            self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertFalse((self.store_dir() / "latest.json").exists())
+
+    def run_finish_unseeded(self, doc):
+        """`finish` with no store the harness wrote on the test's behalf: the
+        ledger body the recorder serves is only what GitHub would return."""
+        findings_file = self.write_findings(doc)
+        return BaseTestCase.run_main(
+            self, ["finish", "--audit", AUDIT, "--findings-file", findings_file]
+        )
+
+    def body_reads(self):
+        return [p for p in self.harness.forge_calls("issue-view") if not p.get("comments")]
+
+    def listing(self, body, number=42):
+        return issues_view(
+            [{"number": number, "url": f"https://github.com/acme/fleet/issues/{number}", "body": body}]
+        )
+
+    def test_a_seed_from_the_listing_survives_a_failing_issue_view(self):
+        """The listing already carried the body, so an `issue-view` that
+        would fail has no say: the seed still holds the ledger open."""
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"issue-list": self.listing(previous)}
+        self.harness.failures = {"issue-view !comments": 1}
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        self.assertEqual(self.run_finish_unseeded(make_doc(findings=[])), 0, self.err)
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+        self.assertEqual(self.stdout_json()["status"], "HELD")
+        self.assertNotIn("could not be read to seed one", self.err)
+
+    def test_start_seeds_from_the_listing_without_a_second_read(self):
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"issue-list": self.listing(previous)}
+        self.harness.failures = {"issue-view !comments": 1}
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        self.assertEqual(self.body_reads(), [])
+        self.assertTrue(json.loads(self.out.strip())["carried"])
+
+    def test_a_listing_without_a_body_falls_back_to_issue_view(self):
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"issue-view !comments": issue_view({"body": previous})}
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        memory = audit_report.previous_run_memory(AUDIT, 42, "acme/fleet", None)
+        self.assertEqual(memory["ledger_body"], previous)
+        self.assertEqual(len(self.body_reads()), 1)
+
+    def test_a_failing_issue_view_seeds_nothing(self):
+        """No store and no body in the listing: the fallback read is the only
+        source, and when it fails the memory is lost, not empty."""
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"issue-view !comments": issue_view({"body": previous})}
+        self.harness.failures = {"issue-view !comments": 1}
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            memory = audit_report.previous_run_memory(AUDIT, 42, "acme/fleet", None)
+        self.assertIsNone(memory)
+        self.assertEqual(len(self.body_reads()), 1)
+        self.assertIn("could not be read to seed one", err.getvalue())
+
+    def test_a_failed_close_leaves_the_memory_intact(self):
+        """The close leaves the body as it was, so until it lands the stored
+        memory is still the open ledger; a transient failure must not cost the
+        next run it."""
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.seed_report(previous)
+        self.harness.replies = {"issue-list": self.listing(previous)}
+        self.harness.failures = {"issue-close": 1}
+        clean = make_doc(findings=[])
+        clean["resolved_because"] = resolved_for(previous)
+        self.assertNotEqual(self.run_finish_unseeded(clean), 0)
+        self.assertEqual(len(self.harness.forge_calls("issue-close")), 1)
+        self.assertEqual(
+            (self.stored()["issue_number"], self.stored()["ledger_body"]), (42, previous)
+        )
+        self.assertIsNotNone(audit_report.previous_run_memory(AUDIT, 42, "acme/fleet", previous))
+
+    def test_a_withheld_delta_is_recorded_on_the_envelope(self):
+        """A lost memory stores empty `new_ids`/`resolved_ids` because the
+        delta was withheld; the envelope must say so, or a reader prints +0/−0."""
+        self.rewrite_ledger_behind_the_store()
+        doc = make_doc(findings=[make_finding(fid="a"), make_finding(fid="w", title="Window finding")])
+        self.assertEqual(self.run_finish_unseeded(doc), 0, self.err)
+        stored = self.stored()
+        self.assertIs(stored["delta_known"], False)
+        self.assertEqual((stored["new_ids"], stored["resolved_ids"]), ([], []))
+
+    def test_a_known_delta_is_recorded_on_the_envelope(self):
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertIs(self.stored()["delta_known"], True)
+
+    def test_a_never_stored_ledger_is_seeded_once_from_its_block(self):
+        """The first run after the store lands, or after the volume is replaced,
+        must still refuse to close over findings its empty document does not
+        account for; the ledger's hidden block stands in for the store once."""
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"issue-list": self.listing(previous)}
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        self.assertEqual(self.run_finish_unseeded(make_doc(findings=[])), 0, self.err)
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+        self.assertEqual(self.stdout_json()["status"], "HELD")
+        self.assertIn("seeding this run's memory once", self.err)
+        # The listing brought the body, so the seed is read off it, not re-fetched.
+        self.assertEqual(self.body_reads(), [])
+        stored = self.stored()
+        self.assertEqual((stored["issue_number"], stored["ledger_body"]), (42, previous))
+        self.assertIs(stored["ledger_held_open"], True)
+
+    def test_a_held_open_run_after_a_seed_carries_no_empty_document(self):
+        """Seeded off the block, then held open twice: neither memory wrote
+        the body, so neither run's empty document may ride forward as the
+        document the body renders."""
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"issue-list": self.listing(previous)}
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        for run in (1, 2):
+            with self.subTest(run=run):
+                self.assertEqual(self.run_finish_unseeded(make_doc(findings=[])), 0, self.err)
+                self.assertEqual(self.stdout_json()["status"], "HELD")
+                stored = self.stored()
+                self.assertIs(stored["ledger_held_open"], True)
+                self.assertEqual(stored["ledger_body"], previous)
+                self.assertNotIn("ledger_document", stored)
+
+    def test_a_closed_ledger_is_not_remembered_for_its_issue(self):
+        """Reopened by hand, a closed ledger is not the empty one the close
+        left, so its next run must read a lost memory, not a trusted empty one."""
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"issue-list": self.issue_list(), "issue-view !comments": issue_view({"body": previous})}
+        clean = make_doc(findings=[])
+        clean["resolved_because"] = resolved_for(previous)
+        self.assertEqual(self.run_finish(clean), 0, self.err)
+        self.assertEqual(len(self.harness.forge_calls("issue-close")), 1)
+        self.assertIsNone(self.stored()["issue_number"])
+        self.assertIsNone(audit_report.read_report_memory(AUDIT, 42, "acme/fleet"))
+
+    def test_a_run_that_dies_before_its_write_leaves_no_trusted_memory(self):
+        """Killed between the issue edit and the store write, a run must not
+        leave the envelope of the run before it reading as current."""
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertTrue((self.store_dir() / "latest.json").exists())
+        with patch.object(audit_report, "write_report", side_effect=SystemExit(137)):
+            with self.assertRaises(SystemExit):
+                self.run_finish(make_doc())
+        self.assertFalse((self.store_dir() / "latest.json").exists())
+        self.assertTrue(list((self.store_dir() / "runs").glob("*.json")))
+
+    def test_the_run_after_a_killed_one_reads_a_lost_memory(self):
+        """The directory survives the kill, so the next run finds a store with
+        no `latest.json`: a lost memory, never an empty one to delta against."""
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        with patch.object(audit_report, "write_report", side_effect=SystemExit(137)):
+            with self.assertRaises(SystemExit):
+                self.run_finish(make_doc())
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        payload = self.stdout_json()
+        self.assertNotEqual(payload["status"], "CLOSED")
+        self.assertTrue(
+            {audit_report.LOST_MEMORY_GAP, audit_report.LOST_MEMORY_UNGUARDED_GAP}
+            & set(payload["coverage_gaps"]),
+            payload["coverage_gaps"],
+        )
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+
+    def rewrite_ledger_behind_the_store(self):
+        """Run N publishes a; then something that never touches the store — a
+        `finish` from an older image — rewrites the ledger to list a and w.
+        Returns (run N's body, the rewritten body)."""
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish_unseeded(make_doc(findings=[make_finding(fid="a")])), 0, self.err)
+        body_n = self.stored()["ledger_body"]
+        rewritten = published_body(
+            make_doc(findings=[make_finding(fid="a"), make_finding(fid="w", title="Window finding")]),
+            generated_at=NOW,
+        )
+        self.harness.replies = {
+            "issue-list": issues_view(
+                [{"number": 42, "url": "https://github.com/acme/fleet/issues/42", "body": rewritten}]
+            )
+        }
+        return body_n, rewritten
+
+    def test_a_ledger_rewritten_behind_the_store_is_a_lost_memory(self):
+        """The record still names the open issue and repository, so trusted on
+        those alone it would announce w — which the window already published —
+        as new. The ledger's block no longer matches the record's, so the
+        memory is lost and the run claims no delta."""
+        self.rewrite_ledger_behind_the_store()
+        doc = make_doc(findings=[make_finding(fid="a"), make_finding(fid="w", title="Window finding")])
+        self.assertEqual(self.run_finish_unseeded(doc), 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual((payload["new"], payload["resolved"]), (0, 0))
+        self.assertFalse(payload["silent_ok"])
+        self.assertIn("no longer matches issue #42", self.err)
+        self.assertFalse([b for b in self.harness.bodies_for("issue-comment") if "audit delta" in b])
+
+    def test_a_clean_run_does_not_close_over_what_the_window_reported(self):
+        """The stale record lists only a, which the clean document accounts for;
+        w, which only the window reported, would go unchecked and the ledger
+        would close. A lost memory holds it open instead."""
+        body_n, _ = self.rewrite_ledger_behind_the_store()
+        clean = make_doc(findings=[])
+        clean["resolved_because"] = resolved_for(body_n)
+        self.assertEqual(self.run_finish_unseeded(clean), 0, self.err)
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+        self.assertNotEqual(self.stdout_json()["status"], "CLOSED")
+
+    def test_a_ledger_whose_block_is_unchanged_keeps_its_memory(self):
+        """Prose around the block is not what the delta reads: a hand edit to
+        the body, or GitHub's newline handling, must not lose the memory."""
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish_unseeded(make_doc(findings=[make_finding(fid="a")])), 0, self.err)
+        edited = "A human note.\r\n\r\n" + self.stored()["ledger_body"].replace("\n", "\r\n")
+        memory = audit_report.previous_run_memory(AUDIT, 42, "acme/fleet", edited)
+        self.assertIsNotNone(memory)
+
+    def test_a_listing_that_brought_no_body_cannot_vouch_for_the_store(self):
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertIsNone(audit_report.previous_run_memory(AUDIT, 42, "acme/fleet", None))
+        self.assertIn("did not come back", err.getvalue())
+
+    def test_an_existing_store_is_never_backfilled_from_the_ledger(self):
+        audit_report.write_report(AUDIT, self.envelope(issue_number=43), NOW)
+        self.harness.replies = {"issue-list": self.issue_list(), "issue-view !comments": issue_view({"body": "x"})}
+        self.assertIsNone(audit_report.previous_run_memory(AUDIT, 42, "acme/fleet", "x"))
+        self.assertEqual(self.body_reads(), [])
+
+    def test_a_body_without_a_block_seeds_nothing(self):
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        self.harness.replies = {"issue-list": self.issue_list(), "issue-view !comments": issue_view({"body": "hand-written"})}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertIsNone(audit_report.previous_run_memory(AUDIT, 42, "acme/fleet", None))
+        self.assertEqual(len(self.body_reads()), 1)
+        self.assertIn("unknowable", err.getvalue())
+
+    def test_titles_come_from_the_document_the_ledger_renders(self):
+        own = {"findings": [{"id": "own", "title": "This run"}]}
+        carried = {"findings": [{"id": "held", "title": "Still on the issue"}]}
+        self.assertEqual(audit_report.report_finding_titles({"document": own}), {"own": "This run"})
+        self.assertEqual(
+            audit_report.report_finding_titles({"document": own, "ledger_document": carried}),
+            {"held": "Still on the issue"},
+        )
+
+    def test_a_clean_run_held_open_over_a_lost_store_breaks_the_trust_chain(self):
+        # The body it would carry is not known, so it stores no issue number:
+        # the next run's trust check fails by design rather than trusting ""
+        # as the body GitHub shows.
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.harness.failures = {"issue-view !comments": 1}
+        gap = make_doc(findings=[], skipped=[{"cluster": "dr-west", "reason": "API server unreachable"}])
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+        self.assertIsNone(self.stored()["issue_number"])
+
+    def test_a_clean_run_that_only_comments_keeps_the_memory_when_killed(self):
+        # Held open over a gap, a clean run comments and leaves the body as the
+        # stored envelope describes it, so dying before the write must not turn
+        # the next run into a lost memory that can never close.
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        self.harness.replies = {"issue-list": self.issue_list()}
+        gap = make_doc(findings=[], skipped=[{"cluster": "dr-west", "reason": "API server unreachable"}])
+        with patch.object(audit_report, "write_report", side_effect=SystemExit(137)):
+            with self.assertRaises(SystemExit):
+                self.run_finish(gap)
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+        self.assertEqual(self.harness.forge_calls("issue-update"), [])
+        self.assertTrue((self.store_dir() / "latest.json").exists())
+
+    def test_a_failed_lookup_before_the_ledger_changes_keeps_the_memory(self):
+        # Nothing touched the ledger, so the stored envelope still describes it
+        # exactly; deleting it would cost the next run its memory for nothing.
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.harness.failures = {"proposal-list": 1}
+        self.assertNotEqual(self.run_finish(make_doc()), 0)
+        self.assertEqual(self.harness.forge_calls("issue-update"), [])
+        self.assertEqual(self.stored()["issue_number"], 42)
+
+    def test_a_kill_before_the_findings_rewrite_keeps_the_memory(self):
+        # The comment read and the label sync are round trips that leave the
+        # body alone; a kill in them leaves the stored envelope still true.
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        self.harness.replies = {"issue-list": self.issue_list()}
+        with patch.object(
+            audit_report, "sync_open_remediation_labels", side_effect=SystemExit(137)
+        ):
+            with self.assertRaises(SystemExit):
+                self.run_finish(make_doc())
+        self.assertEqual(self.harness.forge_calls("issue-update"), [])
+        self.assertTrue((self.store_dir() / "latest.json").exists())
+
+    def test_a_dry_run_writes_no_report(self):
+        self.harness.replies = {"issue-list": issues_view([])}
+        self.assertEqual(self.run_finish(make_doc(), ["--dry-run"]), 0, self.err)
+        self.assertFalse((self.reports_dir / AUDIT).exists())
+
+    def test_start_reads_the_carried_locations_from_the_store(self):
+        body = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.seed_report(body)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertFalse([p for p in self.harness.forge_calls("issue-view") if not p.get("comments")])
+        self.assertTrue(json.loads(self.out.strip())["carried"])
+
+
+
+class TestLostRecordWayOut(unittest.TestCase):
+    """Beside a lost record, the comment and the /remediate answer name the
+    same way out, whatever coverage gap stands with it."""
+
+    NOW = datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc)
+    COVERAGE_GAP = "dr-west: control plane unreachable"
+
+    def test_a_mixed_gap_comment_gives_the_lost_record_way_out(self):
+        comment_body = audit_report.render_clean_comment(
+            "compliance-audit",
+            {"scope": {"clusters": [{"name": "prod-us-east"}]}, "findings": []},
+            self.NOW,
+            gaps=[audit_report.LOST_MEMORY_UNGUARDED_GAP, self.COVERAGE_GAP],
+        )
+        self.assertIn("did not see the whole fleet", comment_body)
+        self.assertNotIn("closes on the next run that reads the whole fleet", comment_body)
+        self.assertIn("a run that reads the whole fleet will not close it either", comment_body)
+        self.assertIn(audit_report.LOST_RECORD_WAY_OUT, comment_body)
+
+    def test_a_partial_lost_record_answer_names_both(self):
+        answer = audit_report.render_clean_remediate_answer(
+            "compliance-audit",
+            {"author": "dev", "targets": ["x"], "comment_id": "IC_1"},
+            self.NOW,
+            closing=False,
+            lost_memory=True,
+            partial=True,
+        )
+        self.assertIn(
+            audit_report.LOST_RECORD_WAY_OUT + " This run also did not see the whole fleet.",
+            answer,
+        )
+        self.assertNotIn("could not see the whole fleet", answer)
+
+
+class TestDetectContentMode(BaseTestCase):
+    """With a broker configured, an unclear probe refuses `start`.
+
+    The sandbox's `git` has no transport and no credential, so the leased
+    clone the old fallback chose would fail on its first remote command, later
+    and naming nothing. Only an install with no broker at all reaches it.
+    """
+
+    ENDPOINT = "http://127.0.0.1:8765"
+
+    def probe(self, answer):
+        import credential_proxy_client
+
+        def workspaces_available(endpoint):
+            self.assertEqual(endpoint, self.ENDPOINT)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        patcher = patch.object(credential_proxy_client, "workspaces_available", workspaces_available)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        env = patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": self.ENDPOINT})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_no_broker_configured_is_directory_mode(self):
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}):
+            self.assertFalse(audit_report.detect_content_mode())
+
+    def test_an_armed_broker_is_content_mode(self):
+        self.probe(True)
+        self.assertTrue(audit_report.detect_content_mode())
+
+    def test_a_broker_that_does_not_say_yes_refuses_the_run(self):
+        self.probe(False)
+        with self.assertRaises(audit_report.BrokerUnavailable) as raised:
+            audit_report.detect_content_mode()
+        self.assertIn(self.ENDPOINT, str(raised.exception))
+        self.assertIn("re-run this command", str(raised.exception))
+
+    def test_a_probe_that_raises_refuses_the_run_and_says_why(self):
+        self.probe(OSError("connection reset"))
+        with self.assertRaises(audit_report.BrokerUnavailable) as raised:
+            audit_report.detect_content_mode()
+        self.assertIn("connection reset", str(raised.exception))
+
+    def test_the_skill_tells_this_refusal_from_the_in_flight_guard(self):
+        """Review findings: this refusal printed `START REFUSED` like the
+        in-flight guard, and then the skill said it meant nothing was in
+        flight -- false after `finish`, which keeps its note. It now has its
+        own label, and the skill says which command to re-run."""
+        self.probe(False)
+        with self.assertRaises(audit_report.BrokerUnavailable) as raised:
+            audit_report.detect_content_mode()
+        self.assertNotIsInstance(raised.exception, audit_report.StartRefused)
+        self.assertIn("the broker at", str(raised.exception))
+        skill = Path(__file__).resolve().parents[1] / "SKILL.md"
+        text = skill.read_text(encoding="utf-8")
+        on_demand = text.split("## Running a stream on demand", 1)[1].split("\n## ", 1)[0]
+        exit_codes = " ".join(
+            text.split("Two exit 2s are not a document to fix", 1)[1].split("\n### ", 1)[0].split()
+        )
+        for section in (" ".join(on_demand.split()), exit_codes):
+            self.assertIn("`BROKER UNAVAILABLE`", section)
+            self.assertIn("check the credential-proxy pod and re-run the same command", section)
+        self.assertIn("From `finish`, the run is still in flight", exit_codes)
+        self.assertIn("re-run `finish`, never `start`", exit_codes)
 
 
 if __name__ == "__main__":

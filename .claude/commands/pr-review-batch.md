@@ -510,7 +510,8 @@ an ancestor of pr<N>`. Phase −1 is supposed to withhold the narrowed option in
 
 - **Angle J already has an author to filter by**, which the skill cannot assume:
   `gh pr list --repo "$REPO" --author <login> --state open --json number,title,files`. Read the
-  review comments on any sibling touching adjacent paths.
+  review comments on any sibling touching adjacent paths. A sibling the body names by number may
+  already have merged, and no listing will hold it — fetch that one with `gh pr view`.
 
 - **No green-suite bypass.** Do not skip hunting candidates because CI or unit tests are passing.
   Work every angle explicitly against the diff as defined in `review-adversarial`.
@@ -602,12 +603,12 @@ The rules that decide whether it lands:
 - `event` is `COMMENT`. Never `APPROVE`, never `REQUEST_CHANGES` — that is the human's signature,
   not yours.
 - **`/lgtm` is the same signature by another route, and here it is the merge itself.** Tide merges
-  on labels, and an `APPROVE` review sets `lgtm` — so does the bare command, from any account Prow
-  counts as a collaborator. `/approve` sets the other label. Neither goes out on my behalf unless I
-  asked for it,
-  and nor does `/hold`, which blocks somebody else's change in public. A review that concludes the
-  change is good says so to me; a person signs it. `docs/pull-request-workflow.md`,
-  "How a change merges", is what each label does.
+  on labels, and an `APPROVE` review sets `lgtm` — so does the bare command, from an account the
+  `OWNERS` files name under `reviewers` or `approvers` for one of the changed paths; Prow ignores
+  collaborator status here (`owners.skip_collaborators`). `/approve` sets the other label. Neither
+  goes out on my behalf unless I asked for it, and nor does `/hold`, which blocks somebody else's
+  change in public. A review that concludes the change is good says so to me; a person signs it.
+  `docs/pull-request-workflow.md`, "How a change merges", is what each label does.
 - `line` must be a RIGHT-side line the diff actually shows; use `start_line` with `line` for a
   range. A finding that anchors to no changed line goes in the summary body under a **Findings
   outside this diff** heading — never forced onto a nearby unrelated line, which is how a reviewer
