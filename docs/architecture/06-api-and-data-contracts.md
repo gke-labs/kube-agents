@@ -252,7 +252,8 @@ default) — a closed allowlist must be set explicitly. A session-routed turn ha
 door: it is gated by the gateway's own ingress allowlist (the adapter's allowed-users setting), and
 the target CR's `allowedUsers` is read when the session asks the gateway to mint a child task to it
 (the operator renders those lists to the gateway as `A2A_TARGET_ALLOWED_USERS_GCHAT` / `_SLACK`; the
-gateway compares the turn's backend author id; an absent list is all authenticated users).
+gateway will compare the turn's backend author id against them when it mints that child task, which
+the delegation primitive builds; an absent list is all authenticated users).
 
 ## 3. GitOps repository layout & propose/apply contract
 

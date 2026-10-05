@@ -382,7 +382,7 @@ calls and become properties of the stream:
 ### Reserved artifact names
 
 Added 8/24, ratified with the subagent framework. `artifact-update` payloads name their
-artifact, and four names are reserved so renderers and audit tooling can rely on them:
+artifact, and five names are reserved so renderers and audit tooling can rely on them:
 
 | Name       | Content                                                                                                                                                                                                                                                |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -393,7 +393,7 @@ artifact, and four names are reserved so renderers and audit tooling can rely on
 | `delegate` | The session's request to the gateway to mint a child task: one `data` part `{"addressee", "text"}` on the session's own task events. Consumed by the gateway's relay, never rendered to chat; reserved 10/5, used from the delegation primitive onward |
 
 Artifact names are data, so the set can grow without touching the envelope; only these
-four carry reserved semantics. An `activity` entry is one `data` part whose object carries
+five carry reserved semantics. An `activity` entry is one `data` part whose object carries
 `tool`, `input` when the call had one, and may carry `callId`, `status` (`completed`, `error`,
 `interrupted` for a call still open at the terminal, or `truncated` on the one entry an executor
 publishes in place of the calls missing from the trace: past its budget, failed to publish,
