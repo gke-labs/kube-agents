@@ -84,10 +84,18 @@ verification_spec:
     role: objective
     mode: assert
     check:
-      # The Declared intent table carries the `repo:path` pointer of the note.
-      # The rendered cluster name is a contract with bench/tf/fleet/
+      # The Declared intent table carries the object as `Cluster/seeded-c` and
+      # the `repo:path` pointer of the note. The object spelling, not the bare
+      # cluster name: the Scope table names every audited cluster on every
+      # run, while `Cluster/<name>` appears only in a finding's detail or a
+      # Declared intent row, and the first check rules the finding out. The
+      # rendered cluster name is a contract with bench/tf/fleet/
       # (bench/tasks/DRAFTS.md), not an address the harness resolves.
       type: ledger_issue_contains
       audit: security-patch-orchestrator
       required_phrases:
-        ["## Declared intent", "seeded-c", "notification-relay-no-pdb.md"]
+        [
+          "## Declared intent",
+          "Cluster/seeded-c",
+          "notification-relay-no-pdb.md",
+        ]
