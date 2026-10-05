@@ -739,6 +739,19 @@ async def f():
         call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "hook")
         self.assertEqual(patchlib.unbound(tree, call), ["free", "hook", "inside"])
 
+    def test_multi_item_and_destructuring_with_targets_remain_unbound(self):
+        source = """\
+def f():
+    with cm1, open("path") as later_handle:
+        pass
+    with cm2 as (unpack_a, unpack_b):
+        pass
+    hook(later_handle, unpack_a, unpack_b, free)
+"""
+        tree = ast.parse(source)
+        call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "hook")
+        self.assertEqual(patchlib.unbound(tree, call), ["free", "hook", "later_handle", "unpack_a", "unpack_b"])
+
     def test_module_names_includes_top_level_with_target(self):
         source = """\
 with open("path") as top_handle:
