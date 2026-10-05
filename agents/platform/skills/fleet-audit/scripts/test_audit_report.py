@@ -3388,6 +3388,97 @@ class TestPublishedBodies(HarnessTestCase):
         self.assertTrue(carriers, "the run published nothing at all")
 
 
+class TestNewMarker(HarnessTestCase):
+    """The per-finding `NEW_MARKER` the Slack card reads for its "new" tag.
+
+    Written only where the run can say what the last one carried; a finding
+    wrongly called new is the failure, so an unknown delta marks nothing.
+    """
+
+    @staticmethod
+    def marked(body):
+        return re.findall(
+            r"<!-- finding:(\S+?) -->\n\n" + re.escape(audit_report.NEW_MARKER), body
+        )
+
+    def refresh(self, previous_body, doc):
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        (body,) = self.harness.bodies_for("issue", "edit")
+        return body
+
+    def test_a_first_run_marks_nothing(self):
+        # No ledger to measure against: everything would read as new.
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        (body,) = self.harness.bodies_for("issue", "create")
+        self.assertIn("<!-- finding:", body)
+        self.assertNotIn(audit_report.NEW_MARKER, body)
+
+    def test_a_known_delta_marks_the_new_findings_and_only_them(self):
+        previous = published_body(
+            make_doc(findings=[make_finding(fid="a", title="Alpha finding")]),
+            generated_at=NOW,
+        )
+        doc = make_doc(
+            findings=[
+                make_finding(fid="a", title="Alpha finding"),
+                make_finding(fid="b", title="Bravo finding"),
+            ]
+        )
+        body = self.refresh(previous, doc)
+        self.assertEqual(self.marked(body), [derived_id(fid="b")])
+        self.assertEqual(body.count(audit_report.NEW_MARKER), 1)
+        # The marker sits between the heading and its `Where:` line, and both
+        # readers of that block still read it.
+        self.assertEqual(self.stdout_json()["new"], 1)
+        locations = audit_report.parse_finding_locations(body)
+        self.assertEqual(set(locations), {derived_id(fid="a"), derived_id(fid="b")})
+        self.assertEqual(locations[derived_id(fid="b")]["title"], "Bravo finding")
+
+    def test_an_unknown_delta_marks_nothing(self):
+        # The ledger is open but its body cannot be read, so there is no memory.
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.failures = {"--json body": 1}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        (body,) = self.harness.bodies_for("issue", "edit")
+        self.assertIn("<!-- finding:", body)
+        self.assertNotIn(audit_report.NEW_MARKER, body)
+
+    def test_a_block_under_another_identity_scheme_marks_nothing(self):
+        # Every id looks new across a scheme change, so none is marked.
+        previous = '## Findings\n\n<!-- audit-findings: ["wra-something-old"] -->\n'
+        body = self.refresh(previous, make_doc())
+        self.assertNotIn(audit_report.NEW_MARKER, body)
+
+    def test_the_marker_is_charged_against_the_body_budget(self):
+        finding = make_finding(fid="a", title="Alpha finding")
+        plain = audit_report.render_finding(finding)
+        marked = audit_report.render_finding(finding, new=True)
+        self.assertEqual(marked[:3] + marked[5:], plain)
+        self.assertEqual(marked[3:5], ["", audit_report.NEW_MARKER])
+        both = [finding, make_finding(fid="b", title="Alpha finding")]
+
+        def cost(f):
+            return len("\n".join(audit_report.render_finding(f))) + 2 + len(str(f["id"])) + 3
+
+        # Room for both unmarked; marking the first leaves no room for the second.
+        budget = sum(cost(f) for f in both)
+        _, omitted = audit_report.select_rendered_findings(both, budget)
+        self.assertEqual(omitted, [])
+        _, omitted = audit_report.select_rendered_findings(both, budget, new_ids={str(finding["id"])})
+        self.assertEqual(len(omitted), 1)
+
+
 class TestFinishClean(HarnessTestCase):
     def test_a_clean_run_with_no_ledger_still_counts_what_was_declared(self):
         # Nothing to open and nothing to close, so the JSON line and the log

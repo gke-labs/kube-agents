@@ -27,20 +27,23 @@ The audit SOPs relay one line ending in ``— <issue_url>``. The counts and the
 findings come from the issue itself, whose title is fleet-audit's
 ``issue_title`` (``[audit] <name> — <n> findings (<c> critical)``) and whose
 body has one ``### <Severity> (<n>)`` section per severity, most severe first,
-each finding a ``#### <title> <!-- finding:<id> -->`` heading; the collector's
-held rows under ``## Held by the collector`` are not this run's findings, and
-a ``#`` line inside a finding's fenced evidence ends no section.
+each finding a ``#### <title> <!-- finding:<id> -->`` heading, with a
+``<!-- finding-new -->`` line under it when the run measured it as new since
+the last; the collector's held rows under ``## Held by the collector`` are not
+this run's findings, and a ``#`` line inside a finding's fenced evidence ends
+no section.
 Nothing in the report's own text can set the counts or pick the link, beyond
 its last URL; its line can only withhold them.
 
 The headline carries one number, the count of the most severe findings
 present: "<Name>: 2 critical findings", the name as the title writes it.
 Every critical finding is listed under it, or the top two of a lower
-severity when there is none; the body's summary line ("7 findings: 2
-critical, 1 major, 4 minor.") counts the rest by severity ("5 more (1 major,
-4 minor) are in the thread."), and :func:`thread_rows` lists them in the
-thread. The clusters the body's Scope section skipped get a line of their own
-("Couldn't reach seeded-c, so this run didn't check it."), counted past three
+severity when there is none, a new one tagged "· _new_"; the body's summary
+line ("7 findings: 2 critical, 1 major, 4 minor.") counts the rest by severity
+("5 more (1 major, 4 minor) are in the ledger issue."). The clusters the
+body's Scope section skipped get a line of their own ("Couldn't reach
+seeded-c, so this run didn't check it." when every reason says it was
+unreachable, "Didn't check seeded-c this run." otherwise), counted past three
 names, or the line's own words for what it could not scan when the body has
 no such table. Then a "Look at the first one" button and the ledger link. The
 relayed line itself is not on the card, so it goes in the headline's thread
@@ -121,6 +124,10 @@ ANY_SECTION = re.compile(r"^(?:#{1,3}[ \t]|<!--[ \t]*audit-held:begin)", re.MULT
 FINDING_HEADING = re.compile(
     r"^####[ \t](.{0,1000}?)<!--[ \t]*finding:[ \t]*(\S{1,100}?)[ \t]*-->[ \t]*$", re.MULTILINE
 )
+#: fleet-audit's ``NEW_MARKER``: the first line under a finding's heading, blank
+#: lines aside, when the run measured the finding as new since the last.
+NEW_MARKER = re.compile(r"\n(?:[ \t]*\n)*[ \t]*<!--[ \t]*finding-new[ \t]*-->[ \t]*$", re.MULTILINE)
+NEW_TAG = " · _new_"
 #: A code fence line, opening or closing: a finding's evidence command sits in one.
 FENCE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
 #: A finding heading: a fence with no closer before it is one the model left open.
@@ -143,11 +150,18 @@ FINDINGS_SUMMARY = re.compile(
     re.MULTILINE,
 )
 #: The Scope section, its table of clusters the run could not audit, a row of
-#: it, and the row that counts those past fleet-audit's row cap.
+#: it (the cluster, then the rest of the row, its reason), and the row that
+#: counts those past fleet-audit's row cap.
 SCOPE_SECTION = re.compile(r"^##[ \t]+Scope[ \t]*$", re.MULTILINE)
 SECTION_END = re.compile(r"^##[ \t]", re.MULTILINE)
 SKIPPED_SECTION = re.compile(r"^###[ \t]+Skipped[ \t]*$", re.MULTILINE)
-SKIPPED_ROW = re.compile(r"^\|[ \t]*`([^`\n]{1,253})`[ \t]*\|", re.MULTILINE)
+SKIPPED_ROW = re.compile(r"^\|[ \t]*`([^`\n]{1,253})`[ \t]*\|([^\n]{0,2000})", re.MULTILINE)
+#: A skip reason saying the cluster could not be reached, rather than skipped for any other reason.
+UNREACHABLE_REASON = re.compile(
+    r"\b(?:unreachable|connection\s+refused|dial\s+tcp|no\s+route\s+to\s+host|i/o\s+timeout"
+    r"|could(?:\s+not|n't)\s+(?:reach|connect))\b",
+    re.IGNORECASE,
+)
 SKIPPED_MORE = re.compile(r"^\|[ \t]*_…and[ \t]+(\d{1,9})[ \t]+more_", re.MULTILINE)
 #: fleet-audit's title for a ledger opened over a coverage gap with no findings.
 COVERAGE_TITLE = re.compile(r"\A\[audit\]\s+(?P<name>.+?)\s+[—–-]+\s+coverage incomplete\b")
@@ -198,16 +212,19 @@ FINDINGS_NOUN = ("finding", "findings")
 #: fleet-audit's severities, most severe first, as its sections and summary spell them.
 SEVERITIES = ("critical", "major", "minor")
 CRITICAL = "critical"
-#: The findings the card does not list, by severity, most severe first; the thread lists them.
-MORE_LINE = "{count} more ({breakdown}) {verb} in the thread."
+#: The findings the card does not list, by severity, most severe first; the ledger lists them.
+MORE_LINE = "{count} more ({breakdown}) {verb} in the ledger issue."
 MORE_VERB = ("is", "are")
 BREAKDOWN_PART = "{count} {severity}"
 BREAKDOWN_SEPARATOR = ", "
 #: What this run did not check: the Scope section's skipped clusters, by name up to
-#: ``NAMES_MAX`` and counted past it, else the line's own words.
+#: ``NAMES_MAX`` and counted past it, else the line's own words. "Couldn't reach" only
+#: when every skipped cluster's reason says it was unreachable.
 GAP_MARK = "⚠️ "
 UNREACHED_NAMED = GAP_MARK + "Couldn't reach {names}, so this run didn't check {them}."
 UNREACHED_COUNT = GAP_MARK + "Couldn't reach {count} {noun}, so this run didn't check {them}."
+UNCHECKED_NAMED = GAP_MARK + "Didn't check {names} this run."
+UNCHECKED_COUNT = GAP_MARK + "Didn't check {count} {noun} this run."
 THEM = ("it", "them")
 NAMES_SEPARATOR = ", "
 NAMES_LAST = " and "
@@ -215,8 +232,6 @@ NAMES_MAX = 3
 #: The card for a run that closed its ledger.
 CLEAN_CARD = "{name}: clean. Ledger closed."
 CLOSED_STATE = "closed"
-#: The most rows the thread under the card lists.
-THREAD_ROWS_MAX = 50
 
 #: The Block Kit report: a choice button's click posts its label, the link
 #: button opens the ledger.
@@ -380,8 +395,15 @@ def _without_fences(body: str) -> str:
     return "\n".join(kept)
 
 
-def _severity_findings(body: str) -> list[tuple[str, str]]:
-    """``(severity, title)`` for every finding under a severity section, in body order."""
+class Finding(NamedTuple):
+    severity: str
+    title: str
+    #: fleet-audit measured it as new since the last run.
+    new: bool
+
+
+def _severity_findings(body: str) -> list[Finding]:
+    """Every finding under a severity section, in body order."""
     # fleet-audit's own reader does the same: a body edited in the browser is CRLF.
     body = _without_fences(body.replace("\r\n", "\n"))
     found = []
@@ -390,7 +412,10 @@ def _severity_findings(body: str) -> list[tuple[str, str]]:
         following = ANY_SECTION.search(body, start)
         text = body[start : following.start() if following else len(body)]
         severity = section.group("severity").lower()
-        found += [(severity, title.strip()) for title, _ in FINDING_HEADING.findall(text)]
+        found += [
+            Finding(severity, match.group(1).strip(), bool(NEW_MARKER.match(text, match.end())))
+            for match in FINDING_HEADING.finditer(text)
+        ]
     return found
 
 
@@ -407,11 +432,11 @@ class AuditReport(NamedTuple):
     count: int
     #: The report's whole ledger line, read for gaps.
     line: str
-    findings: list[tuple[str, str]]
+    findings: list[Finding]
     #: Findings by severity: the summary's totals, never fewer than the sections list.
     totals: dict[str, int]
-    #: The Scope section's skipped clusters by name, and how many more its row cap left out.
-    skipped: tuple[list[str], int]
+    #: The Scope section's skipped clusters as ``(name, reason)``, and how many more its row cap left out.
+    skipped: tuple[list[tuple[str, str]], int]
 
 
 class Card(NamedTuple):
@@ -420,8 +445,6 @@ class Card(NamedTuple):
     #: The line under the rows counting the rest, and the line naming what was not checked.
     more: str
     gap: str
-    #: The findings the card does not list, for the thread.
-    rest: list[tuple[str, str]]
 
 
 def _parse_issue(issue: dict, report: str) -> AuditReport | None:
@@ -463,12 +486,12 @@ def _parse_issue(issue: dict, report: str) -> AuditReport | None:
     raw = str(issue.get("body") or "")
     findings = _severity_findings(raw)
     if not findings:
-        return None  # the card would count findings neither it nor its thread can show
+        return None  # the card would count findings neither it nor the ledger shows
     body = _without_fences(raw.replace("\r\n", "\n"))
     return AuditReport(name, count, line, findings, _totals(body, findings, critical), _skipped(body))
 
 
-def _totals(body: str, findings: list[tuple[str, str]], critical: int) -> dict[str, int]:
+def _totals(body: str, findings: list[Finding], critical: int) -> dict[str, int]:
     """Findings by severity: the summary's totals, else the sections'; the title's critical count.
 
     Never fewer than the sections list, the title's count included: a title edited on the
@@ -477,13 +500,13 @@ def _totals(body: str, findings: list[tuple[str, str]], critical: int) -> dict[s
     summary = FINDINGS_SUMMARY.search(body)
     totals = {severity: int(summary.group(severity)) if summary else 0 for severity in SEVERITIES}
     for severity in SEVERITIES:
-        totals[severity] = max(totals[severity], sum(1 for listed, _ in findings if listed == severity))
-    totals[CRITICAL] = max(critical, sum(1 for listed, _ in findings if listed == CRITICAL))
+        totals[severity] = max(totals[severity], sum(1 for finding in findings if finding.severity == severity))
+    totals[CRITICAL] = max(critical, sum(1 for finding in findings if finding.severity == CRITICAL))
     return totals
 
 
-def _skipped(body: str) -> tuple[list[str], int]:
-    """The Scope section's skipped clusters by name, and how many its row cap counted instead.
+def _skipped(body: str) -> tuple[list[tuple[str, str]], int]:
+    """The Scope section's skipped clusters as ``(name, reason)``, and how many its row cap counted instead.
 
     Only the Scope section's: a finding's model-written text may hold a table of its own.
     """
@@ -497,9 +520,9 @@ def _skipped(body: str) -> tuple[list[str], int]:
         return [], 0
     following = ANY_SECTION.search(body, section.end())
     text = body[section.end() : following.start() if following else len(body)]
-    names = [_row_text(name).strip() for name in SKIPPED_ROW.findall(text)]
+    rows = [(_row_text(name).strip(), reason) for name, reason in SKIPPED_ROW.findall(text)]
     more = SKIPPED_MORE.search(text)
-    return [name for name in names if name], int(more.group(1)) if more else 0
+    return [row for row in rows if row[0]], int(more.group(1)) if more else 0
 
 
 def _clean_name(issue: dict, report: str) -> str | None:
@@ -559,18 +582,24 @@ def _names(names: list[str]) -> str:
 
 def _unreached(parsed: AuditReport) -> str:
     """The line naming what this run did not check, or "" when it checked everything it owed."""
-    names, more = parsed.skipped
+    rows, more = parsed.skipped
+    names = [name for name, _ in rows]
+    # Rows past the cap give no reason, so they cannot say they were unreachable.
+    unreachable = not more and all(UNREACHABLE_REASON.search(reason) for _, reason in rows)
     if names and not more and len(names) <= NAMES_MAX:
-        return UNREACHED_NAMED.format(names=_names(names), them=THEM[len(names) != 1])
+        named = UNREACHED_NAMED if unreachable else UNCHECKED_NAMED
+        return named.format(names=_names(names), them=THEM[len(names) != 1])
     count = len(names) + more
     if count:
-        return UNREACHED_COUNT.format(count=count, noun=CLUSTERS_NOUN[count != 1], them=THEM[count != 1])
+        counted = UNREACHED_COUNT if unreachable else UNCHECKED_COUNT
+        return counted.format(count=count, noun=CLUSTERS_NOUN[count != 1], them=THEM[count != 1])
     gap = _gap(parsed.line, COVERAGE.search(parsed.line))
     return GAP_MARK + gap if gap else ""
 
 
-def _row(severity: str, title: str) -> dict:
-    return {"severity": severity, "text": _balanced_clip(_row_text(title), FINDING_ROW_MAX)}
+def _row(finding: Finding) -> dict:
+    tag = NEW_TAG if finding.new else ""
+    return {"severity": finding.severity, "text": _balanced_clip(_row_text(finding.title), FINDING_ROW_MAX - len(tag)) + tag}
 
 
 def _card(parsed: AuditReport) -> Card:
@@ -578,7 +607,7 @@ def _card(parsed: AuditReport) -> Card:
     they are critical and the top two otherwise; a line counts the rest by severity."""
     totals = parsed.totals
     severity = next(level for level in SEVERITIES if totals[level])
-    listed = [index for index, (level, _) in enumerate(parsed.findings) if level == severity]
+    listed = [finding for finding in parsed.findings if finding.severity == severity]
     shown = listed if severity == CRITICAL else listed[:TOP_FINDINGS]
     count = totals[severity]
     headline = CARD_HEADLINE.format(name=parsed.name, count=count, severity=severity, noun=FINDINGS_NOUN[count != 1])
@@ -590,9 +619,7 @@ def _card(parsed: AuditReport) -> Card:
             BREAKDOWN_PART.format(count=number, severity=level) for level, number in left.items() if number
         )
         more = MORE_LINE.format(count=more_count, breakdown=breakdown, verb=MORE_VERB[more_count != 1])
-    rows = [_row(*parsed.findings[index]) for index in shown]
-    rest = [finding for index, finding in enumerate(parsed.findings) if index not in set(shown)]
-    return Card(headline, rows, more, _unreached(parsed), rest)
+    return Card(headline, [_row(finding) for finding in shown], more, _unreached(parsed))
 
 
 def _after_rows(card: Card) -> list[str]:
@@ -641,25 +668,6 @@ def blocks_from_issue(issue: dict, ref: LedgerRef, report: str = "") -> tuple[li
         action_id_prefix=ACTION_ID_PREFIX,
     )
     return blocks, fallback_text(card.headline, rows=card.rows, links=links, after_rows=after)
-
-
-def thread_rows(issue: dict, ref: LedgerRef, report: str = "") -> list[str]:
-    """The findings the card counts but does not list, one row each, for its thread.
-
-    Empty when the card lists them all or does not parse. Ends with the ledger
-    link when the body left some out, or there are more than ``THREAD_ROWS_MAX``.
-    """
-    parsed = _parse_issue(issue, report)
-    if parsed is None:
-        return []
-    card = _card(parsed)
-    if not card.more:
-        return []
-    rows = [severity_row(row["severity"], row["text"]) for row in (_row(*finding) for finding in card.rest)]
-    owed = sum(parsed.totals.values()) - len(card.rows)
-    if len(rows) > THREAD_ROWS_MAX or len(rows) < owed:
-        return [*rows[:THREAD_ROWS_MAX], LEDGER_LINK.format(number=ref.number, url=ref.url)]
-    return rows
 
 
 def _fallback_line(line: str) -> str:

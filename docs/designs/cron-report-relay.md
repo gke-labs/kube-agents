@@ -86,16 +86,17 @@ a skipped cluster or the audit name keeps a link's text but not its target. It
 carries one number, the count of the most severe findings present ("<Name>: 2
 critical findings", the name as the title writes it), and lists every critical
 finding, or the top two of the highest severity present when there is none, each
-row led by its severity. Under the rows, a line counts the rest by severity ("5
-more (1 major, 4 minor) are in the thread."), left off when there are none; a line
-names the clusters the run could not check ("Couldn't reach seeded-c, so this run
-didn't check it.", or a count past three names), or, when the body has no such
-table, gives the relayed line's own words for what was not scanned, since a silent
-gap reads as clean; then the ledger link. The findings the card counts but does
-not list are posted in its thread, one row each, ending with the ledger link when
-the body left some out or there are more than 50. The relayed line itself, which
-alone carries resolved counts and remediation pull requests, is left off the
-headline and goes in its thread, after those rows. The relayed line is the report's last line; when that line is only the ledger link,
+row led by its severity and ending "· _new_" when fleet-audit marked the finding
+new since the last run (a `<!-- finding-new -->` line under its heading, written
+only when the run knows what the last one carried). Under the rows, a line counts
+the rest by severity ("5 more (1 major, 4 minor) are in the ledger issue."), left
+off when there are none; a line names the clusters the run skipped ("Couldn't
+reach seeded-c, so this run didn't check it." when every reason says the cluster
+was unreachable, "Didn't check seeded-c this run." otherwise, or a count past
+three names), or, when the body has no such table, gives the relayed line's own
+words for what was not scanned, since a silent gap reads as clean; then the
+ledger link. The relayed line itself, which alone carries resolved counts and
+remediation pull requests, is left off the headline and goes in its thread. The relayed line is the report's last line; when that line is only the ledger link,
 the last unindented, non-list line above it that reads as the audit line (its coverage, a
 findings total or a change count) stands in for it, else the last such line with any count. A closed issue is a clean run, which closes the ledger without rewriting its
 title, so the headline is "<Name>: clean. Ledger closed." and the link, unless the

@@ -655,6 +655,12 @@ headroom for the trailing marker and for anything a later section appends.
   would have fit; on a body already truncated it costs the findings its length, which grows with the id count up to the cap: about 3 of 37 rendered findings at 60 ids of 70 characters, about 8 at the cap. That is the price of the record. Above `ALL_FINDINGS_BLOCK_CAP` (12,000
   characters) it is left out rather than truncated, since a partial complete list would be the same
   ambiguity with a different name.
+- **A finding new since the last run is marked where the run knows it.** A `<!-- finding-new -->`
+  line under a finding's heading says this run's delta counts it as new, so the Slack card can tag
+  it. It is worked out before rendering, as this run's findings less the previous marker's ids,
+  which on the rendered findings is exactly `new`. A run that cannot say what the last one carried
+  writes none: a first run, a lost report store, and a previous marker under another identity
+  scheme, where every id would look new. An absent marker never means "not new".
 - **The delta comment is capped and ordered by severity.** Both of its lists cap at 50 rows, and the
   `new` list is sorted severity-first before the cap applies — an alphabetical cut decides what a
   reader sees by the first letter of a finding id, which is how a critical ends up under "…and 40
@@ -959,9 +965,9 @@ its keep on the dispatched path, where a person is demonstrably waiting. The sch
 lives on the Chat Agent, which owns ingress: the cron report relay
 ([`cron-report-relay.md`](cron-report-relay.md)) posts the run's one line of counts ending with the
 ledger URL. In Slack with `KAGE_SLACK_UX` on that line becomes a card built from the ledger issue:
-a headline carrying the issue's critical count, every critical finding, a count of the rest (which
-follow in its thread), any clusters the run did not scan, and a link to the issue; the issue stays
-the report, and the card only summarises what it already says.
+a headline carrying the issue's critical count, every critical finding (tagged new where the body
+marks it so), a count of the rest, any clusters the run did not scan, and a link to the issue; the
+issue stays the report, and the card only summarises what it already says.
 
 ## 8. Labels
 

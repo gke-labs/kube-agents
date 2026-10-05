@@ -3359,15 +3359,10 @@ class TestSlackAuditHeadline(unittest.TestCase):
         "labels": ["agent:audit"],
     }
     HEADLINE = "**Security & RBAC Posture Audit: 2 critical findings**"
-    #: The findings the card counts but does not list, which lead its thread.
-    THREAD_ROWS = "`major` m1\n`major` m2\n`major` m3\n`minor` n1\n`minor` n2"
     CLEAN = (
         "**Security & RBAC Posture Audit: clean. Ledger closed.**\n"
         "[Ledger issue #231 ↗](https://github.com/acme/fleet-config/issues/231)"
     )
-
-    def _fold(self, report):
-        return f"{self.THREAD_ROWS}\n\n{report}"
 
     def setUp(self):
         import sqlite3
@@ -3432,7 +3427,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
         headline = session_kv_server.slack_audit_report.headline_from_issue(self.ISSUE, ref, self.COMPOSED)
         self.assertEqual(calls[0].args, ("slack", headline, "", ""))
         self.assertTrue(calls[0].args[1].startswith(self.HEADLINE))
-        self.assertEqual(calls[1].args, ("slack", self._fold(self.COMPOSED), self.HOME, self.SLACK_THREAD))
+        self.assertEqual(calls[1].args, ("slack", self.COMPOSED, self.HOME, self.SLACK_THREAD))
         # A reply in the thread is answered with the whole report, not the headline.
         self.assertEqual(self._stored(), [(self.HOME, self.SLACK_THREAD, self.COMPOSED)])
 
@@ -3443,11 +3438,11 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         headline = calls[0].args[1].splitlines()
         self.assertEqual(headline[0], self.HEADLINE)
-        self.assertEqual(headline[3], "5 more (3 major, 2 minor) are in the thread.")
+        self.assertEqual(headline[3], "5 more (3 major, 2 minor) are in the ledger issue.")
         self.assertIn(f"[Ledger issue #231 ↗]({self.LEDGER})", calls[0].args[1])
-        # The card leaves the line out, so its resolved count is read in the thread, under the rest of the findings.
+        # The card leaves the line out, so its resolved count is read in the thread.
         self.assertNotIn("resolved", calls[0].args[1])
-        self.assertEqual(calls[1].args, ("slack", self._fold(self.ONE_LINE), self.HOME, self.SLACK_THREAD))
+        self.assertEqual(calls[1].args, ("slack", self.ONE_LINE, self.HOME, self.SLACK_THREAD))
         self.assertEqual(self._stored(), [(self.HOME, self.SLACK_THREAD, self.ONE_LINE)])
 
     def test_flag_on_an_unreadable_ledger_falls_back_to_the_line_and_its_link(self):
@@ -3473,14 +3468,13 @@ class TestSlackAuditHeadline(unittest.TestCase):
         with patch.object(session_kv_server, "CRON_REPORT_MAX_CHARS", 3):
             response, calls = self._post(composed=composed)
         self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(len(calls), 1)
         posted = calls[0].args[1]
         self.assertTrue(posted.startswith("[truncated]"), posted[:40])
         self.assertEqual(posted.count("[truncated]"), 1)
         headline = posted.split("\n\n", 1)[1].splitlines()
         self.assertEqual(headline[0], self.HEADLINE)
         self.assertTrue(headline[1].startswith("`critical` "), headline)
-        # Only the findings the card counts follow it; the link-only report is not folded.
-        self.assertEqual([c.args for c in calls[1:]], [("slack", self.THREAD_ROWS, self.HOME, self.SLACK_THREAD)])
 
     def test_flag_on_a_ledger_that_does_not_parse_falls_back(self):
         os.environ["KAGE_SLACK_UX"] = "1"
@@ -3603,7 +3597,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
         _, calls = self._post(job_id="rbac-2")
         second = [c.args for c in calls]
         self.assertEqual(second[0][2:], (self.HOME, self.SLACK_THREAD))
-        self.assertEqual(second[1], ("slack", self._fold(self.COMPOSED), self.HOME, self.SLACK_THREAD))
+        self.assertEqual(second[1], ("slack", self.COMPOSED, self.HOME, self.SLACK_THREAD))
 
 
     BLOCKS_TS = "1712345999.000200"
@@ -3626,8 +3620,8 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self._blocks_on()
         response, calls = self._post(blocks_post=lambda *a, **k: self.BLOCKS_TS)
         self.assertEqual(response.json()["status"], "delivered")
-        # The report is longer than one line, so it follows in the thread, under the findings the card only counts.
-        self.assertEqual([c.args for c in calls], [("slack", self._fold(self.COMPOSED), self.HOME, self.BLOCKS_TS)])
+        # The report is longer than one line, so it follows in the thread.
+        self.assertEqual([c.args for c in calls], [("slack", self.COMPOSED, self.HOME, self.BLOCKS_TS)])
         (post,) = self.posts
         channel, text, blocks, thread_ts = post.args
         self.assertEqual((channel, thread_ts), (self.HOME, ""))
@@ -3649,7 +3643,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self.assertEqual(response.json()["status"], "delivered")
         self.assertEqual(len(self.posts), 1)
         self.assertTrue(calls[0].args[1].startswith(self.HEADLINE))
-        self.assertEqual(calls[1].args, ("slack", self._fold(self.COMPOSED), self.HOME, self.SLACK_THREAD))
+        self.assertEqual(calls[1].args, ("slack", self.COMPOSED, self.HOME, self.SLACK_THREAD))
 
     def test_a_post_that_never_reached_slack_posts_the_text_headline_without_retrying(self):
         self._blocks_on()
@@ -3667,24 +3661,15 @@ class TestSlackAuditHeadline(unittest.TestCase):
     def test_the_one_line_report_goes_in_the_blocks_thread(self):
         self._blocks_on()
         _, calls = self._post(composed=self.ONE_LINE, blocks_post=lambda *a, **k: self.BLOCKS_TS)
-        self.assertEqual([c.args for c in calls], [("slack", self._fold(self.ONE_LINE), self.HOME, self.BLOCKS_TS)])
-        self.assertIn("5 more (3 major, 2 minor) are in the thread.", str(self.posts[0].args[2]))
-
-    def test_a_card_listing_every_finding_folds_only_the_report(self):
-        self._blocks_on()
-        issue = dict(
-            self.ISSUE,
-            title="[audit] Security & RBAC Posture Audit — 2 findings (2 critical)",
-            body="### Critical (2)\n\n#### a <!-- finding:a -->\n#### b <!-- finding:b -->\n",
-        )
-        _, calls = self._post(composed=self.ONE_LINE, issue=issue, blocks_post=lambda *a, **k: self.BLOCKS_TS)
         self.assertEqual([c.args for c in calls], [("slack", self.ONE_LINE, self.HOME, self.BLOCKS_TS)])
+        self.assertIn("5 more (3 major, 2 minor) are in the ledger issue.", str(self.posts[0].args[2]))
 
-    def test_the_rows_post_when_the_report_does_not_fold(self):
+    def test_a_link_only_report_posts_nothing_in_the_blocks_thread(self):
+        # The findings the card only counts are in the ledger issue its line points at.
         self._blocks_on()
         report = f"Ledger: {self.LEDGER}"
         _, calls = self._post(composed=report, blocks_post=lambda *a, **k: self.BLOCKS_TS)
-        self.assertEqual([c.args for c in calls], [("slack", self.THREAD_ROWS, self.HOME, self.BLOCKS_TS)])
+        self.assertEqual(calls, [])
 
     def test_a_closed_ledger_under_the_bare_link_posts_the_clean_card_as_blocks(self):
         self._blocks_on()

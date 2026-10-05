@@ -45,8 +45,9 @@ HERMES_ONLY_LINKS = (
 REPORT = f"Security & RBAC posture audit: 2 new, 1 resolved across 3 clusters — {LEDGER}"
 
 
-def finding(title, fid):
-    return f'<a id="finding-{fid}"></a>\n\n#### {title} <!-- finding:{fid} -->\n\n- **Where:** `seeded-a` — `x`\n'
+def finding(title, fid, new=False):
+    marker = "<!-- finding-new -->\n\n" if new else ""
+    return f'<a id="finding-{fid}"></a>\n\n#### {title} <!-- finding:{fid} -->\n\n{marker}- **Where:** `seeded-a` — `x`\n'
 
 
 BODY = (
@@ -78,9 +79,9 @@ CRITICAL_BODY = (
 )
 
 
-def skipped(*names, more=0):
+def skipped(*names, more=0, reason="unreachable: dial tcp: i/o timeout"):
     """BODY with fleet-audit's Scope table of clusters it could not audit."""
-    rows = "".join(f"| `{name}` | unreachable: dial tcp: i/o timeout |\n" for name in names)
+    rows = "".join(f"| `{name}` | {reason} |\n" for name in names)
     overflow = f"| _…and {more} more_ |  |\n" if more else ""
     return (
         "## Scope\n\n### Skipped\n\n**Coverage is partial.** clusters could not be audited, so this report says nothing about them.\n\n"
@@ -163,7 +164,7 @@ class HeadlineFromIssueTest(unittest.TestCase):
             f"{HEADLINE}\n"
             "`critical` seeded-b, seeded-c: `cluster-admin` bound to the default service account\n"
             "`critical` seeded-c: a ClusterRole grants `*` on secrets\n"
-            "5 more (1 major, 4 minor) are in the thread.\n"
+            "5 more (1 major, 4 minor) are in the ledger issue.\n"
             f"{LINK}",
         )
 
@@ -171,8 +172,33 @@ class HeadlineFromIssueTest(unittest.TestCase):
         body = skipped("seeded-c").replace("7 findings: 2 critical, 1 major, 4 minor.", "7 findings: 2 critical, 3 major, 2 minor.")
         self.assertEqual(
             sar.headline_from_issue(dict(ISSUE, body=body), REF, REPORT).splitlines()[3:],
-            ["5 more (3 major, 2 minor) are in the thread.", "⚠️ Couldn't reach seeded-c, so this run didn't check it.", LINK],
+            ["5 more (3 major, 2 minor) are in the ledger issue.", "⚠️ Couldn't reach seeded-c, so this run didn't check it.", LINK],
         )
+    def test_a_finding_new_since_the_last_run_is_tagged(self):
+        body = BODY.replace(
+            finding("seeded-c: a ClusterRole grants `*` on secrets", "rbac-2"),
+            finding("seeded-c: a ClusterRole grants `*` on secrets", "rbac-2", new=True),
+        )
+        lines = sar.headline_from_issue(dict(ISSUE, body=body), REF, REPORT).splitlines()
+        self.assertEqual(lines[1], "`critical` seeded-b, seeded-c: `cluster-admin` bound to the default service account")
+        self.assertEqual(lines[2], "`critical` seeded-c: a ClusterRole grants `*` on secrets · _new_")
+        self.assertEqual(len(lines), 5)
+
+    def test_no_finding_is_tagged_without_its_marker(self):
+        # A first run, or one whose delta is unknown: fleet-audit writes no marker, so nothing is new.
+        self.assertNotIn("_new_", sar.headline_from_issue(ISSUE, REF, REPORT))
+
+    def test_a_marker_away_from_the_heading_tags_nothing(self):
+        body = BODY.replace("- **Where:** `seeded-a` — `x`\n", "- **Where:** `seeded-a` — `x`\n\n<!-- finding-new -->\n", 1)
+        self.assertNotIn("_new_", sar.headline_from_issue(dict(ISSUE, body=body), REF, REPORT))
+
+    def test_the_tag_survives_a_title_clipped_to_the_row(self):
+        title = "x" * 400
+        body = "### Critical (1)\n\n" + finding(title, "long", new=True)
+        issue = dict(ISSUE, title="[audit] Security & RBAC Posture Audit — 1 finding (1 critical)", body=body)
+        row = sar.headline_from_issue(issue, REF, f"Security audit: 1 new — {LEDGER}").splitlines()[1]
+        self.assertTrue(row.endswith(sar.NEW_TAG), row[-20:])
+
     def test_the_relayed_line_is_not_on_the_card(self):
         # It goes in the thread instead (needs_fold), so "1 resolved" is not said twice here.
         self.assertNotIn("resolved", sar.headline_from_issue(ISSUE, REF, REPORT))
@@ -186,18 +212,18 @@ class HeadlineFromIssueTest(unittest.TestCase):
         issue = dict(ISSUE, title="[audit] Workload Reliability Audit — 5 findings (0 critical)", body=body)
         self.assertEqual(
             sar.headline_from_issue(issue, REF).splitlines(),
-            ["**Workload Reliability Audit: 3 major findings**", "`major` a", "`major` b", "3 more (1 major, 2 minor) are in the thread.", LINK],
+            ["**Workload Reliability Audit: 3 major findings**", "`major` a", "`major` b", "3 more (1 major, 2 minor) are in the ledger issue.", LINK],
         )
 
     def test_without_a_summary_the_sections_are_counted(self):
         body = BODY.replace("7 findings: 2 critical, 1 major, 4 minor.\n\n", "")
         lines = sar.headline_from_issue(dict(ISSUE, body=body), REF, REPORT).splitlines()
-        self.assertEqual(lines[3], "2 more (1 major, 1 minor) are in the thread.")
+        self.assertEqual(lines[3], "2 more (1 major, 1 minor) are in the ledger issue.")
 
     def test_one_more_is_singular(self):
         body = "3 findings: 2 critical, 1 major, 0 minor.\n\n" + CRITICAL_BODY + "### Major (1)\n\n" + finding("idle", "c")
         issue = dict(ISSUE, title="[audit] Security & RBAC Posture Audit — 3 findings (2 critical)", body=body)
-        self.assertEqual(sar.headline_from_issue(issue, REF).splitlines()[3], "1 more (1 major) is in the thread.")
+        self.assertEqual(sar.headline_from_issue(issue, REF).splitlines()[3], "1 more (1 major) is in the ledger issue.")
 
     def test_every_finding_listed_leaves_off_the_more_line(self):
         issue = dict(ISSUE, title="[audit] Security & RBAC Posture Audit — 2 findings (2 critical)", body=CRITICAL_BODY)
@@ -334,7 +360,7 @@ class HeadlineFromIssueTest(unittest.TestCase):
     def test_the_gap_line_follows_the_more_line(self):
         line = "Security audit: 2 new, 1 resolved across 3 clusters (1 unreachable)"
         lines = sar.headline_from_issue(ISSUE, REF, f"{line} — {LEDGER}").splitlines()
-        self.assertEqual(lines[3:], ["5 more (1 major, 4 minor) are in the thread.", "⚠️ 1 cluster unreachable.", LINK])
+        self.assertEqual(lines[3:], ["5 more (1 major, 4 minor) are in the ledger issue.", "⚠️ 1 cluster unreachable.", LINK])
     def test_a_gap_inside_a_parenthetical_of_counts_leaves_the_counts(self):
         # The example line in obtainability_audit_sop.md.
         line = (
@@ -393,7 +419,8 @@ class HeadlineFromIssueTest(unittest.TestCase):
             (["seeded-b", "seeded-c"], 0, "Couldn't reach seeded-b and seeded-c, so this run didn't check them."),
             (["seeded-a", "seeded-b", "seeded-c"], 0, "Couldn't reach seeded-a, seeded-b and seeded-c, so this run didn't check them."),
             (["a", "b", "c", "d"], 0, "Couldn't reach 4 clusters, so this run didn't check them."),
-            (["seeded-c"], 60, "Couldn't reach 61 clusters, so this run didn't check them."),
+            # The rows past the cap give no reason, so nothing says they were unreachable.
+            (["seeded-c"], 60, "Didn't check 61 clusters this run."),
         ):
             with self.subTest(names=names, more=more):
                 text = sar.headline_from_issue(dict(ISSUE, body=skipped(*names, more=more)), REF, REPORT)
@@ -403,6 +430,26 @@ class HeadlineFromIssueTest(unittest.TestCase):
         report = f"Security audit: 7 findings across 3 clusters (1 unreachable) — {LEDGER}"
         text = sar.headline_from_issue(dict(ISSUE, body=skipped("seeded-c")), REF, report)
         self.assertEqual(gap_line(text), "⚠️ Couldn't reach seeded-c, so this run didn't check it.")
+
+    def test_a_cluster_skipped_for_another_reason_was_not_checked_rather_than_not_reached(self):
+        for names, reason, gap in (
+            (["seeded-c"], "no credentials for this cluster", "Didn't check seeded-c this run."),
+            (["seeded-b", "seeded-c"], "excluded by the audit's scope", "Didn't check seeded-b and seeded-c this run."),
+            (["a", "b", "c", "d"], "no credentials", "Didn't check 4 clusters this run."),
+            (["seeded-c"], "control plane unreachable", "Couldn't reach seeded-c, so this run didn't check it."),
+            (["seeded-c"], "dial tcp 10.0.0.1:443: connection refused", "Couldn't reach seeded-c, so this run didn't check it."),
+        ):
+            with self.subTest(reason=reason):
+                text = sar.headline_from_issue(dict(ISSUE, body=skipped(*names, reason=reason)), REF, REPORT)
+                self.assertEqual(gap_line(text), sar.GAP_MARK + gap)
+
+    def test_one_cluster_skipped_for_another_reason_makes_the_whole_line_not_checked(self):
+        body = skipped("seeded-c").replace(
+            "| `seeded-c` | unreachable: dial tcp: i/o timeout |\n",
+            "| `seeded-c` | unreachable: dial tcp: i/o timeout |\n| `seeded-d` | no credentials |\n",
+        )
+        text = sar.headline_from_issue(dict(ISSUE, body=body), REF, REPORT)
+        self.assertEqual(gap_line(text), "⚠️ Didn't check seeded-c and seeded-d this run.")
 
     def test_a_skipped_table_outside_the_scope_section_is_not_read(self):
         # A finding's model-written text may carry a table of its own.
@@ -555,12 +602,12 @@ class HeadlineFromIssueTest(unittest.TestCase):
         )
         self.assertEqual(
             sar._severity_findings(body),
-            [("critical", "crit one"), ("major", "maj one"), ("major", "maj two")],
+            [("critical", "crit one", False), ("major", "maj one", False), ("major", "maj two", False)],
         )
 
     def test_a_padded_title_parses_unchanged(self):
         body = "### Critical (1)\n\n#### \t  seeded-b: privileged pods \t  <!-- finding: p-1 -->\n"
-        self.assertEqual(sar._severity_findings(body), [("critical", "seeded-b: privileged pods")])
+        self.assertEqual(sar._severity_findings(body), [("critical", "seeded-b: privileged pods", False)])
 
     def test_unclosed_mentions_stay_linear(self):
         mentions = "<!" * MENTION_REPEATS
@@ -583,7 +630,7 @@ class HeadlineFromIssueTest(unittest.TestCase):
                 self.assertLess(time.monotonic() - start, FAST_SECONDS)
         title, fid = "t" * 300, "i" * 100
         body = f"### Critical (1)\n\n####   {title}   <!-- finding: {fid} -->\n"
-        self.assertEqual(sar._severity_findings(body), [("critical", title)])
+        self.assertEqual(sar._severity_findings(body), [("critical", title, False)])
 
     def test_a_heading_of_spaces_stays_linear(self):
         for tail in ("", "<!-- finding:", "<!-- finding: x --> y"):
@@ -615,7 +662,7 @@ class HeadlineFromIssueTest(unittest.TestCase):
             "#### Second critical <!-- finding:a.2 -->\n"
         )
         self.assertEqual(
-            sar._severity_findings(body), [("critical", "First critical"), ("critical", "Second critical")]
+            sar._severity_findings(body), [("critical", "First critical", False), ("critical", "Second critical", False)]
         )
 
     def test_a_severity_heading_in_an_open_fence_still_ends_it(self):
@@ -625,7 +672,7 @@ class HeadlineFromIssueTest(unittest.TestCase):
             "```\nlog\n### Minor (1)\n\n"
             "#### A minor <!-- finding:b.1 -->\n\n```\n"
         )
-        self.assertEqual(sar._severity_findings(body), [("major", "Real major"), ("minor", "A minor")])
+        self.assertEqual(sar._severity_findings(body), [("major", "Real major", False), ("minor", "A minor", False)])
 
     def test_zero_in_the_title_with_findings_in_the_body_is_not_clean(self):
         issue = dict(ISSUE, title="[audit] Security & RBAC Posture Audit — 0 findings (0 critical)")
@@ -793,7 +840,7 @@ class BlocksFromIssueTest(unittest.TestCase):
         )
         self.assertEqual(len(blocks[2]["elements"]), 2)
         self.assertEqual(
-            blocks[4]["elements"][0]["elements"], [{"type": "text", "text": "5 more (1 major, 4 minor) are in the thread."}]
+            blocks[4]["elements"][0]["elements"], [{"type": "text", "text": "5 more (1 major, 4 minor) are in the ledger issue."}]
         )
         look, link = blocks[5]["elements"]
         self.assertEqual((look["text"]["text"], look["value"]), (sar.LOOK_FIRST, sar.LOOK_FIRST))
@@ -804,7 +851,7 @@ class BlocksFromIssueTest(unittest.TestCase):
             "*Security &amp; RBAC Posture Audit: 2 critical findings*\n"
             "`critical` seeded-b, seeded-c: `cluster-admin` bound to the default service account\n"
             "`critical` seeded-c: a ClusterRole grants `*` on secrets\n"
-            "5 more (1 major, 4 minor) are in the thread.\n"
+            "5 more (1 major, 4 minor) are in the ledger issue.\n"
             f"<{LEDGER}|Ledger issue #231 ↗>",
         )
 
@@ -812,7 +859,7 @@ class BlocksFromIssueTest(unittest.TestCase):
         blocks, text = sar.blocks_from_issue(dict(ISSUE, body=skipped("seeded-c")), REF, REPORT)
         gap = "⚠️ Couldn't reach seeded-c, so this run didn't check it."
         self.assertEqual([section["elements"][0]["text"] for section in blocks[4]["elements"]][1], gap)
-        self.assertIn(f"in the thread.\n{gap}\n<{LEDGER}|", text)
+        self.assertIn(f"in the ledger issue.\n{gap}\n<{LEDGER}|", text)
 
     def test_the_clean_card_is_one_line_and_the_ledger(self):
         blocks, text = sar.blocks_from_issue(dict(ISSUE, state="closed"), REF, "")
@@ -844,7 +891,7 @@ class BlocksFromIssueTest(unittest.TestCase):
         issue = dict(ISSUE, title="[audit] Security & RBAC Posture Audit — 7 findings (3 critical)")
         lines = sar.headline_from_issue(issue, REF, REPORT).splitlines()
         self.assertEqual(lines[0], "**Security & RBAC Posture Audit: 3 critical findings**")
-        self.assertEqual(lines[3], "6 more (1 critical, 1 major, 4 minor) are in the thread.")
+        self.assertEqual(lines[3], "6 more (1 critical, 1 major, 4 minor) are in the ledger issue.")
     def test_the_relayed_line_is_not_in_the_blocks(self):
         blocks, _ = sar.blocks_from_issue(ISSUE, REF, REPORT)
         self.assertNotIn(LINE, str(blocks))
@@ -884,39 +931,20 @@ class BlocksFromIssueTest(unittest.TestCase):
         self.assertEqual([e["text"]["text"] for e in blocks[-1]["elements"]], [sar.LOOK_FIRST, "Ledger issue #231 ↗"])
         self.assertNotIn("held from an earlier run", str(blocks))
 
+    def test_the_new_tag_is_italic_in_the_blocks(self):
+        body = BODY.replace(
+            finding("seeded-c: a ClusterRole grants `*` on secrets", "rbac-2"),
+            finding("seeded-c: a ClusterRole grants `*` on secrets", "rbac-2", new=True),
+        )
+        blocks, text = sar.blocks_from_issue(dict(ISSUE, body=body), REF, REPORT)
+        second = blocks[2]["elements"][1]["elements"]
+        self.assertEqual(second[-1], {"type": "text", "text": "new", "style": {"italic": True}})
+        self.assertIn("secrets · _new_", text)
+
     def test_clean_and_unparsed_runs_have_no_blocks(self):
         clean = {"title": "[audit] Cost Audit — 0 findings (0 critical)", "body": "Nothing."}
         self.assertIsNone(sar.blocks_from_issue(clean, REF, "Cost audit: clean — " + LEDGER))
         self.assertIsNone(sar.blocks_from_issue({"title": "something else"}, REF, REPORT))
-
-
-class ThreadRowsTest(unittest.TestCase):
-    def test_the_rest_follow_the_card_and_the_ledger_covers_what_the_body_left_out(self):
-        # The summary counts 5 more; the body lists 2 of them.
-        self.assertEqual(
-            sar.thread_rows(ISSUE, REF, REPORT),
-            ["`major` seeded-a: Workload Identity is off on one node pool", "`minor` seeded-a: a namespace has no NetworkPolicy", LINK],
-        )
-
-    def test_every_finding_listed_needs_no_ledger_link(self):
-        body = BODY.replace("7 findings: 2 critical, 1 major, 4 minor.", "4 findings: 2 critical, 1 major, 1 minor.")
-        issue = dict(ISSUE, title="[audit] Security & RBAC Posture Audit — 4 findings (2 critical)", body=body)
-        rows = sar.thread_rows(issue, REF, REPORT)
-        self.assertEqual(len(rows), 2)
-        self.assertNotIn(LINK, rows)
-
-    def test_rows_past_the_cap_end_on_the_ledger(self):
-        body = "60 findings: 0 critical, 0 major, 60 minor.\n\n### Minor (60)\n\n" + "".join(finding(f"m{i}", f"m{i}") for i in range(60))
-        issue = dict(ISSUE, title="[audit] Cost Audit — 60 findings (0 critical)", body=body)
-        rows = sar.thread_rows(issue, REF)
-        self.assertEqual(len(rows), sar.THREAD_ROWS_MAX + 1)
-        self.assertEqual((rows[0], rows[-1]), ("`minor` m2", LINK))
-
-    def test_nothing_for_a_card_that_lists_everything_or_does_not_parse(self):
-        issue = dict(ISSUE, title="[audit] Security & RBAC Posture Audit — 2 findings (2 critical)", body=CRITICAL_BODY)
-        self.assertEqual(sar.thread_rows(issue, REF, REPORT), [])
-        self.assertEqual(sar.thread_rows(dict(ISSUE, state="closed"), REF, ""), [])
-        self.assertEqual(sar.thread_rows(ISSUE, REF, f"Security audit: 9 new — {LEDGER}"), [])
 
 
 if __name__ == "__main__":

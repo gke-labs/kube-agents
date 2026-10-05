@@ -623,6 +623,14 @@ ID_SCHEME_RE = re.compile(
 FINDING_MARKER_RE = re.compile(
     r"^####[ \t]+(.*?)[ \t]*<!--[ \t]*finding:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.M
 )
+# Written on its own line under a finding's heading when this run measured the
+# finding as new since the last one, for the Slack card's "new" tag
+# (`agents/platform/scripts/slack_audit_report.py` reads it). Never written
+# when the delta is unknown, so no finding is ever wrongly called new; and on a
+# line of its own because anything after the heading's marker stops
+# `FINDING_MARKER_RE` matching it. Model text cannot forge it: every free-text
+# field passes through `publishable_text`, which escapes every comment opener.
+NEW_MARKER = "<!-- finding-new -->"
 # The `Where:` line `render_finding` writes under every heading above: the
 # cluster, the namespace (or the cluster-scoped placeholder) and the object.
 # Read back by `parse_finding_locations` so a later run can ask whether it
@@ -7016,7 +7024,11 @@ def index_overhead(
 
 
 def render_finding(
-    finding: dict, *, state: str | None = None, pr_url: str | None = None
+    finding: dict,
+    *,
+    state: str | None = None,
+    pr_url: str | None = None,
+    new: bool = False,
 ) -> list[str]:
     fid = str(finding.get("id", ""))
     # Every free-text field is clipped, not only the evidence. The body budget
@@ -7034,6 +7046,10 @@ def render_finding(
         str(finding.get("namespace", "")),
         str(finding.get("object", "")),
     )
+    if new:
+        # Under the heading, before the `Where:` line: the anchor, a blank line
+        # and the heading come first.
+        lines[3:3] = ["", NEW_MARKER]
     lines.append(f"- **Impact:** {clip_text(finding.get('impact', ''), MAX_TEXT_CHARS)}")
     # The id is repeated here, not left to the index alone: it is the string
     # `/remediate` takes, and the decision to ask for a fix is made at the
@@ -7118,6 +7134,7 @@ def select_rendered_findings(
     *,
     states: dict[str, str] | None = None,
     pr_urls: dict[str, str] | None = None,
+    new_ids: set[str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Split the sorted findings into (rendered, omitted) against a char budget.
 
@@ -7143,6 +7160,7 @@ def select_rendered_findings(
             finding,
             state=(states or {}).get(fid),
             pr_url=(pr_urls or {}).get(fid),
+            new=fid in (new_ids or set()),
         )
         cost = len("\n".join(rendered)) + 2
         cost += len(fid) + 3  # its slot in the hidden delta block
@@ -7390,6 +7408,7 @@ def _render_findings(
     states: dict[str, str] | None = None,
     pr_urls: dict[str, str] | None = None,
     gaps: list[str] | None = None,
+    new_ids: set[str] | None = None,
 ) -> tuple[list[str], list[dict]]:
     """The findings section, plus the findings that did not fit the budget."""
     out = ["", "## Findings", ""]
@@ -7421,8 +7440,9 @@ def _render_findings(
         f"{counts['major']} major, {counts['minor']} minor."
     )
 
+    new_ids = new_ids or set()
     rendered, omitted = select_rendered_findings(
-        findings, budget, states=states, pr_urls=pr_urls
+        findings, budget, states=states, pr_urls=pr_urls, new_ids=new_ids
     )
 
     # A one-row-per-finding index, so the state of the whole stream is legible
@@ -7454,7 +7474,10 @@ def _render_findings(
             fid = str(finding.get("id", ""))
             out.append("")
             out += render_finding(
-                finding, state=states.get(fid), pr_url=pr_urls.get(fid)
+                finding,
+                state=states.get(fid),
+                pr_url=pr_urls.get(fid),
+                new=fid in new_ids,
             )
 
     if omitted:
@@ -7993,8 +8016,13 @@ def render_issue_body(
     held_overflow: int = 0,
     held_preview: bool = False,
     held_carried: bool = False,
+    new_ids: set[str] | None = None,
 ) -> RenderedIssue:
     """Render the complete ledger issue body. The model never hand-writes this.
+
+    `new_ids` is the findings to mark new since the last run (`NEW_MARKER`);
+    None, the default, marks none, which is what a run whose delta is unknown
+    passes.
 
     `held` is the findings the collector still flags that this document did
     not carry, already filtered and capped by the caller
@@ -8075,6 +8103,7 @@ def render_issue_body(
             states=states,
             pr_urls=pr_urls,
             gaps=gaps,
+            new_ids=new_ids,
         )
 
     findings_lines, omitted = select(0)
@@ -12493,6 +12522,17 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         )
 
     title = issue_title(audit_id, findings)
+    # Marked before rendering, because the marker is part of the body: the
+    # findings this run carries that the last run's block did not. Rendered,
+    # these are exactly `compute_delta`'s `new` below. None, marking nothing,
+    # when that is not knowable: a first run (no ledger to measure against,
+    # where everything would read as new), a lost memory, or a block written
+    # under another identity scheme, where every id looks new.
+    new_marked = (
+        set(current_ids) - set(previous_ids)
+        if existing_issue is not None and memory is not None and not stale_scheme
+        else None
+    )
     rendered = render_issue_body(
         data,
         generated_at=now,
@@ -12506,6 +12546,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         held=carried,
         held_overflow=held_overflow,
         held_carried=carried_without_manifest,
+        new_ids=new_marked,
     )
     if rendered.partial:
         log(
