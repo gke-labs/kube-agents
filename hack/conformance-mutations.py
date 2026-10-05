@@ -1225,6 +1225,55 @@ Mutation(
         "exactly the path the worker reads",
     ),
     Mutation(
+        "C1-session-token-for-a-third-audience",
+        "a2a/gateway/spawn.go",
+        ("Audience:          credentialProxySessionAudience,",
+         'Audience:          "kubeagents-credential-proxy",'),
+        "test_C1_a_session_pod_carries_no_kubernetes_identity",
+        "mint the session pod's broker token for the shell's audience instead "
+        "of the session one. The broker's session-callers binding would refuse "
+        "that token at authentication, so this is the fence test's own layer "
+        "being checked, not the broker's. The fence test "
+        "accepts exactly two audiences by constant name, the bus and the "
+        "broker's session audience; a literal third is a destination the "
+        "fence never admitted, and this is the quiet version because the pod "
+        "still holds exactly two tokens at exactly the paths the clients read",
+    ),
+    Mutation(
+        "C1-session-broker-audience-renamed-in-the-spawner",
+        "a2a/gateway/spawn.go",
+        ('credentialProxySessionAudience        = "kubeagents-credential-proxy-session"',
+         'credentialProxySessionAudience        = "kubeagents-credential-proxy-sessions"'),
+        "test_C1_the_session_broker_audience_and_view_env_agree_across_the_module_boundary",
+        "pluralise the audience in the module that projects it. The operator "
+        "keeps telling the broker to accept the singular, the broker's "
+        "TokenReview names the singular, so every session pod's kubectl is "
+        "refused as an unknown audience -- with both Go suites green, because "
+        "each module's test compares its constant to itself",
+    ),
+    Mutation(
+        "C1-shim-token-env-renamed-in-the-spawner",
+        "a2a/gateway/spawn.go",
+        ('Name: "CREDENTIAL_PROXY_TOKEN_FILE"', 'Name: "CREDENTIAL_PROXY_TOKEN_PATH"'),
+        "test_C1_the_session_broker_audience_and_view_env_agree_across_the_module_boundary",
+        "rename the shim's token-file variable in the module that sets it. The "
+        "shim keeps reading CREDENTIAL_PROXY_TOKEN_FILE, finds nothing, sends no "
+        "Authorization header, and every brokered command from every session "
+        "pod is a 401 -- with the Go suite and the Python suite both green, "
+        "because neither names the other's spelling",
+    ),
+    Mutation(
+        "C1-cluster-view-env-renamed-on-the-gateway-side",
+        "a2a/gateway/config.go",
+        ('os.Getenv("A2A_SESSION_CLUSTER_VIEW")', 'os.Getenv("A2A_SESSION_VIEW")'),
+        "test_C1_the_session_broker_audience_and_view_env_agree_across_the_module_boundary",
+        "shorten the flag's name in the module that reads it. The operator "
+        "still renders the long name, so the gateway reads false and spawns "
+        "today's pod on every flag-on install, and nothing says so: the "
+        "quietest drift of the three, which is why it is pinned beside the "
+        "audience",
+    ),
+    Mutation(
         "C1-session-account-gets-rbac",
         "k8s-operator/internal/controller/platformagent_a2a_callout.go",
         ("""\t\tRoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: a2aCalloutName(agent)},
