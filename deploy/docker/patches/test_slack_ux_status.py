@@ -615,13 +615,45 @@ class PlanTest(_RuntimeCase):
 
     def test_a_wait_after_a_refused_plan_post_suspends_and_completing_clears(self):
         # A plan refused on its first post must still clear or suspend the
-        # session when its cards settle (the orphan path).
+        # session when its cards settle.
         adapter = _Adapter(_Client(fail={"post"}))
         self.assertFalse(self._note(adapter, 1, "reading logs"))
         _run(runtime.settle_row(adapter, _sub(), "blocked"))
         self.assertEqual(self._sent(adapter), ["suspended"])
         _run(runtime.settle_row(adapter, _sub(), "completed"))
         self.assertEqual(self._sent(adapter), ["suspended", "closed"])
+
+    def test_two_cards_rolling_after_fallback_one_blocking_suspends_when_running_finishes(self):
+        # When A and B roll after a refused post, B blocking must not suspend
+        # while A still runs; A completing must suspend while B waits, and B
+        # completing closes the session.
+        adapter = _Adapter(_Client(fail={"post"}))
+        self.assertFalse(self._note(adapter, 1, "a", task="t_a"))
+        adapter.client.fail.clear()
+        self.assertFalse(self._note(adapter, 2, "b", task="t_b"))
+        _run(runtime.settle_row(adapter, _sub("t_b"), "blocked"))
+        self.assertEqual(self._sent(adapter), [], "t_a is still rolling")
+        _run(runtime.settle_row(adapter, _sub("t_a"), "completed"))
+        self.assertEqual(self._sent(adapter), ["suspended"], "t_b is waiting on user")
+        _run(runtime.settle_row(adapter, _sub("t_b"), "completed"))
+        self.assertEqual(self._sent(adapter), ["suspended", "closed"])
+
+    def test_a_wait_after_a_refused_plan_post_lapses_and_completing_clears(self):
+        # A card blocking on an unposted plan suspends, sits past PLAN_HOLD_SECONDS
+        # into _lapsed, and completing without unblock still clears the session.
+        async def scenario(adapter):
+            self.assertFalse(await runtime.deliver_row(adapter, _sub(), 1, "check payments", "reading logs"))
+            await runtime.settle_row(adapter, _sub(), "blocked")
+            self.assertEqual(self._sent(adapter), ["suspended"])
+            await asyncio.sleep(0.2)
+            self.assertNotIn((CHANNEL, THREAD), runtime._plans)
+            self.assertIn((CHANNEL, THREAD), runtime._lapsed)
+            await runtime.settle_row(adapter, _sub(), "completed")
+            self.assertEqual(self._sent(adapter), ["suspended", "closed"])
+
+        adapter = _Adapter(_Client(fail={"post"}))
+        with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05):
+            _run(scenario(adapter))
 
     def test_no_thread_or_no_client_is_not_taken(self):
         self.assertFalse(_run(runtime.deliver_row(_Adapter(), _sub(thread=""), 1, "t", "x")))
@@ -863,10 +895,12 @@ class PlanTest(_RuntimeCase):
         _run(runtime.settle_row(adapter, _sub("t_a"), "completed"))
         self.assertIn((CHANNEL, THREAD), runtime._plans)
         self.assertFalse(self._note(adapter, 3, "b2", task="t_b"))
-        self.assertEqual(self._kinds(adapter), ["post", "setStatus"])
-        self.assertEqual(self._sent(adapter), ["closed"])
+        self.assertEqual(self._kinds(adapter), ["post"])
+        self.assertEqual(self._sent(adapter), [])
         _run(runtime.settle_row(adapter, _sub("t_b"), "completed"))
         self.assertNotIn((CHANNEL, THREAD), runtime._plans)
+        self.assertEqual(self._kinds(adapter), ["post", "setStatus"])
+        self.assertEqual(self._sent(adapter), ["closed"])
 
     def test_a_quiet_fallen_back_plan_is_forgotten(self):
         async def scenario(adapter):

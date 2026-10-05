@@ -355,11 +355,11 @@ def _plan_session(chat_id: str, thread_ts: str) -> str:
 
 
 def _running(plan: _Plan) -> bool:
-    return bool(plan.ts and plan.rolling - plan.waiting) or _status.running(plan.rows.values())
+    return bool(plan.rolling - plan.waiting) or _status.running(plan.rows.values())
 
 
 def _waiting(plan: _Plan) -> bool:
-    return bool(plan.ts and plan.waiting) or any(
+    return bool(plan.waiting) or any(
         row.status == _status.TASK_PENDING for row in plan.rows.values()
     )
 
@@ -821,12 +821,38 @@ async def settle_row(adapter: Any, sub: dict, kind: str) -> None:
     status = _status.task_status(kind)
     done = kind == ARCHIVED_KIND or status in (_status.TASK_COMPLETE, _status.TASK_ERROR)
     sender = await _settle_lapsed(adapter, key, card, kind, status, done)
+    if sender is not None and not sender.ts:
+        sender = None
     plan = _plans.get(key)
     if plan is not None and await _settle_current(adapter, key, plan, card, kind, status, done) and plan.ts:
         sender = plan
     if sender is not None:
         await _session(adapter, key, sender)
-    elif (plan is None or not plan.ts) and not _lapsed.get(key):
+    elif (plans := [*_lapsed.get(key, ()), *([plan] if plan is not None else [])]):
+        if any(p.ts for p in plans):
+            posted = next((p for p in reversed(plans) if p.ts), None)
+            if posted is not None:
+                await _session(adapter, key, posted)
+        else:
+            wanted = _plan_session(key[0], key[1])
+            sent = _sessions.get(key)
+            if wanted == _status.SESSION_SUSPENDED:
+                phrase = _status.SESSION_SUSPENDED
+            elif not wanted and (done or kind == ARCHIVED_KIND or not any(_held(p) for p in plans)):
+                phrase = ""
+            elif sent and sent[0] == _status.SESSION_SUSPENDED and wanted == _status.SESSION_PROCESSING:
+                phrase = _status.SESSION_PROCESSING
+            else:
+                return
+            setter = getattr(adapter, "_set_thread_status", None)
+            if not (key[0] and key[1]) or setter is None or (sent and sent[0] == _status.SESSION_PROCESSING and phrase == ""):
+                return
+            team_id = str(sub.get("team_id") or (plans[0].team_id if plans else ""))
+            try:
+                await setter(key[0], team_id, key[1], phrase, PLAN_STATUS_LABEL)
+            except Exception as exc:  # noqa: BLE001 — cosmetic
+                logger.debug("slack_ux_status: setting the unposted plan's session status failed: %s", exc)
+    else:
         # An archive with no row in this process is cleanup of a card that
         # finished long ago, not a settle: the thread may hold another card.
         await _settle_orphan(adapter, sub, key, status, done and kind != ARCHIVED_KIND)
