@@ -87,21 +87,24 @@ Stop therefore acts at both: the broker for commands, and a Hermes tool hook for
    `apply_slack_ux_stop.py`, adds `agent_session_stopped` to the named listeners ahead of the
    catch-all, routed to `slack_ux_stop.on_stopped`.
 4. `!stop` and `/stop` are intercepted before Hermes's own stop command dispatches, in the same
-   applier, so they reach Stop whether or not a turn is running. The `agent_loop_stopped` hook is
-   not used: it fires only when a turn was running, and Stop's own interrupt would fire it again.
+   applier, so they reach Stop whether or not a turn is running. Hermes answers `/stop` in three
+   places, and the applier intercepts all three: `_handle_stop_command`
+   (`gateway/slash_commands.py`) with no turn running, `_busy_stop_command` (`gateway/run_busy.py`)
+   while one runs, and the early answer in `gateway/run_inbound.py` while the agent is still
+   starting. The `agent_loop_stopped` hook is not used: it fires only when a turn was running, and
+   Stop's own interrupt would fire it again.
 5. Both resolve the session the way upstream `/stop` does,
    `async_session_store.get_or_create_session(source)`, and take `chat_id` and `thread_id` from the
    session source. The stop runs as a scheduled task, not inline in the event handler, because it
    waits on kills.
 6. **Who may stop.** The thread's requester only: the event's `user` must be the session source's
-   user, whose message the running turn answers, or a `user_id` on the thread's
-   `kanban_notify_subs` rows, so the requester can stop a turn before it has filed any card. In a
-   shared thread where several people asked for work, any of them may stop it, and the stop takes
-   the whole thread's work, theirs and the others'. This is narrower than upstream, whose sibling
-   stop lets
-   any user `_is_user_authorized_for_source` accepts stop any run in the thread; the reply below
-   promises the narrower rule, so the build enforces it. Anyone else gets the "not yours" reply and
-   nothing stops.
+   user, whose message the running turn answers, or a `user_id` on the thread's `kanban_notify_subs`
+   rows, so the requester can stop a turn before it has filed any card. In a shared thread where
+   several people asked for work, any of them may stop it, and the stop takes the whole thread's
+   work, theirs and the others'. This is narrower than upstream, whose sibling stop lets any user
+   `_is_user_authorized_for_source` accepts stop any run in the thread; the reply below promises the
+   narrower rule, so the build enforces it. Anyone else gets the "not yours" reply and nothing
+   stops.
 
 A Block Kit Stop button of our own is the fallback for the legacy assistant view only; the agent
 view has the native control, so the build does not add one.
@@ -142,14 +145,13 @@ interrupt_reason=STOP_REASON, invalidation_reason=…)`, with a reason of Stop's
    `caller` is the client connection. The build adds the label to every exec, vcs and workspace
    request, in the shims and in the broker's request parsing, and the fence and the ledger key on it.
 4. **Archive the open ones, leaves first.** `kb.archive_task` in reverse topological order over
-   `task_links`.
-   `archive_task` runs `recompute_ready`, which promotes a child once all its parents are archived,
-   so archiving a parent first can hand the dispatcher (5 s tick) a child to start. Every non-final
-   state is archived: `triage`, `todo`, `scheduled`, `ready`, `running`, `blocked`, `review`.
-   `done` and `archived` are final. `block_task` is not used: it clears the claim and leaves the
-   worker running.
-   Read each card's `archive_worker_termination` event; `terminated: false`, or
-   `termination_attempted: false` for a claim on another host, makes that card "would not stop".
+   `task_links`. `archive_task` runs `recompute_ready`, which promotes a child once all its parents
+   are archived, so archiving a parent first can hand the dispatcher (5 s tick) a child to start.
+   Every non-final state is archived: `triage`, `todo`, `scheduled`, `ready`, `running`, `blocked`,
+   `review`. `done` and `archived` are final. `block_task` is not used: it clears the claim and
+   leaves the worker running. For a card that was `running`, read its `archive_worker_termination`
+   event; `terminated: false`, or `termination_attempted: false` for a claim on another host, makes
+   that card "would not stop".
 5. **Rescan** the subscription rows and links, fence and archive anything new, until a scan finds
    nothing new, at most three times. A card still appearing on the third scan is reported as one
    that would not stop.
@@ -163,9 +165,8 @@ interrupt_reason=STOP_REASON, invalidation_reason=…)`, with a reason of Stop's
    does not clear the status after a Stop and otherwise leaves `processing` up for an hour, and
    `closed` means "session terminated; agent won't respond", which contradicts carrying on, so
    `suspended` is the one value left; the live probe confirms how the client draws it. The
-   `archived` events
-   the notifier delivers later find the rows already settled. The status line ends an ordinary turn
-   with `closed` today; that is a separate fix.
+   `archived` events the notifier delivers later find the rows already settled. The status line ends
+   an ordinary turn with `closed` today; that is a separate fix.
 
 The A2A bridge (`a2a/hermes-bridge/bridge.go`) contributes patterns, not code: kill a process group,
 refuse to start work with a cancel already behind it, and record the stop for work nobody is
