@@ -19,6 +19,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -54,7 +55,7 @@ needs_moments = pytest.mark.skipif(
 )
 
 _FAKE_KANBAN_DB = '''
-import contextlib, json, os
+import contextlib, json, os, time
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -76,10 +77,16 @@ def _save(state):
 
 
 class _Conn:
-    # The one query the archive script makes: a key's live cards, newest first.
+    # The archive script's query, a key's live cards newest first, and the
+    # plant's sweep: other runs' live replay cards filed before a cutoff.
     def execute(self, sql, params):
         assert "idempotency_key" in sql, sql
         tasks = _load()["tasks"]
+        if "LIKE" in sql:
+            prefix, key, cutoff = params
+            return [(tid,) for tid, row in sorted(tasks.items())
+                    if (row["key"] or "").startswith(prefix.rstrip("%")) and row["key"] != key
+                    and row["status"] != "archived" and row["created_at"] < cutoff]
         return [(tid,) for tid in sorted(tasks, reverse=True)
                 if tasks[tid]["key"] == params[0] and tasks[tid]["status"] != "archived"]
 
@@ -93,7 +100,7 @@ def create_task(conn, *, title, body=None, created_by=None, idempotency_key=None
     task_id = "t_%08d" % (len(state["tasks"]) + 1)
     state["tasks"][task_id] = {"title": title, "body": body, "created_by": created_by,
                                "status": "ready", "assignee": None, "key": idempotency_key,
-                               "comments": [], "failures": 0}
+                               "comments": [], "failures": 0, "created_at": int(time.time())}
     _save(state)
     return task_id
 
@@ -402,6 +409,34 @@ def test_without_the_module_nothing_posts_and_the_wake_is_plain(
     assert card["key"] == KEY
 
 
+def test_a_plant_archives_only_other_runs_stale_replay_cards(
+    hermes_root: Path, tmp_path: Path
+) -> None:
+    """What an archive whose exec failed left behind; a run going on beside this one keeps its card."""
+    now = int(time.time())
+    stale = now - card_wake.STALE_REPLAY_SECONDS - 60
+
+    def card(key: str, created_at: int) -> dict:
+        return {"title": "t", "body": None, "created_by": card_wake.CARD_CREATOR, "status": "blocked",
+                "assignee": None, "key": key, "comments": [], "failures": 0, "created_at": created_at}
+
+    (tmp_path / "board.json").write_text(json.dumps({"events": [], "tasks": {
+        "t_00000001": card(f"{card_wake.REPLAY_KEY_PREFIX}old", stale),
+        "t_00000002": card(f"{card_wake.REPLAY_KEY_PREFIX}beside", now),
+        "t_00000003": card("someone-elses-card", stale),
+    }}))
+
+    planted = _plant(_shell_for(hermes_root, tmp_path))
+
+    tasks = _board(tmp_path)["tasks"]
+    assert {tid: row["status"] for tid, row in tasks.items() if tid != planted.card} == {
+        "t_00000001": "archived",
+        "t_00000002": "blocked",
+        "t_00000003": "blocked",
+    }
+    assert tasks[planted.card]["status"] == "blocked"
+
+
 def test_a_moments_module_that_posts_nothing_is_a_broken_plant(
     hermes_root: Path, tmp_path: Path
 ) -> None:
@@ -564,7 +599,10 @@ def test_a_failure_prompt_reads_a_worker_outcome(outcome: str) -> None:
 
     assert isinstance(replay, card_wake.Failure)
     assert replay.outcome == outcome
-    assert card_wake.plant_command(replay, KEY).endswith(f" {outcome} {card_wake.WORKER_ASSIGNEE} {KEY}")
+    assert card_wake.plant_command(replay, KEY).endswith(
+        f" {outcome} {card_wake.WORKER_ASSIGNEE} {KEY} {card_wake.REPLAY_KEY_PREFIX}"
+        f" {card_wake.STALE_REPLAY_SECONDS}"
+    )
 
 
 @pytest.mark.parametrize(

@@ -82,7 +82,9 @@ Every replay's card carries a key minted for the run
 (:data:`REPLAY_KEY_PREFIX`, the card's ``idempotency_key``). :func:`archive`
 reads the card's status and comments, then, in a second exec, archives every
 card carrying the key, so a card filed by a plant whose ``kubectl exec`` timed
-out is swept as well, and an archive that fails keeps what was read. What it read rides on the run's trajectory as a harness entry
+out is swept as well, and an archive that fails keeps what was read. A card
+an archive failed to sweep is archived by a later plant on the same install
+once it is older than :data:`STALE_REPLAY_SECONDS`. What it read rides on the run's trajectory as a harness entry
 (:data:`SETTLED_ENTRY`), because devops-bench persists the trajectory and not
 the metadata; the ``replay_card`` verifier grades it.
 
@@ -171,6 +173,10 @@ REPLAY_PRESENT = "__BENCH_CARD_WAKE__"
 
 # A replay card's ``idempotency_key`` is this and a fresh hex suffix per run.
 REPLAY_KEY_PREFIX = "devops-bench-card-wake-"
+# How old another run's replay card must be before a plant archives it: past
+# the longest a run can hold one (a 600 s turn, a 1800 s delegation), so a run
+# going on beside this one on the same install keeps its card.
+STALE_REPLAY_SECONDS = 2 * 60 * 60
 
 # Where the image installs hermes, and the scripts directory slack_ux_moments
 # imports its layout modules from.
@@ -195,21 +201,24 @@ STUB_THREAD = "1700000000.000100"
 # Runs inside the agent container. Positional arguments: the sentinel, the
 # hermes root, the scripts directory, the flag, its on value, the creator,
 # the stub channel, the stub thread, the card title, its body, the block
-# reason or failure error, the outcome, the wake's assignee and the run's key.
+# reason or failure error, the outcome, the wake's assignee, the run's key,
+# the replay key prefix and the stale age. Before filing, it archives other
+# runs' replay cards older than the stale age, which an archive whose exec
+# failed left on the board; that sweep failing does not stop the plant.
 # The card is archived again if anything after filing it fails. The worker
 # pid, elapsed time and runtime limit in a crash or timeout's payload are
 # made up; only the front door reads them.
 _PLANT_SCRIPT = r"""
-import asyncio, dataclasses, json, os, sys
+import asyncio, dataclasses, json, os, sys, time
 
 (SENTINEL, HERMES_ROOT, SCRIPTS, FLAG, ON, CREATOR,
- CHANNEL, THREAD, TITLE, BODY, REASON, OUTCOME, ASSIGNEE, KEY) = sys.argv[1:15]
+ CHANNEL, THREAD, TITLE, BODY, REASON, OUTCOME, ASSIGNEE, KEY, PREFIX, STALE) = sys.argv[1:17]
 STUB_TS = "1700000000.000200"
 STUB_PID = 4242
 STUB_ELAPSED, STUB_LIMIT = 1830, 1800
 # A final attempt's wake: its own crashed or timed_out event, then gave_up.
 FINAL_BATCH = 2
-out = {"card": None, "wake": None, "posted": 0, "error": None, "mismatch": None}
+out = {"card": None, "wake": None, "posted": 0, "error": None, "mismatch": None, "swept": []}
 
 
 class BreakerMismatch(RuntimeError):
@@ -259,6 +268,14 @@ try:
     except ImportError:
         moments = None
     conn = connect()
+    try:
+        stale = [row[0] for row in conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key LIKE ? AND idempotency_key != ? "
+            "AND status != 'archived' AND created_at < ?",
+            (PREFIX + "%", KEY, int(time.time()) - int(STALE)))]
+        out["swept"] = [old for old in stale if kb.archive_task(conn, old)]
+    except Exception as exc:
+        out["sweep_error"] = "%s: %s" % (type(exc).__name__, exc)
     gave_up = OUTCOME == "gave_up"
     card = kb.create_task(conn, title=TITLE, body=BODY, created_by=CREATOR, idempotency_key=KEY)
     out["card"] = card
@@ -543,6 +560,8 @@ def plant_command(replay: Replay | Failure, key: str) -> str:
             outcome,
             assignee,
             key,
+            REPLAY_KEY_PREFIX,
+            str(STALE_REPLAY_SECONDS),
         ],
     )
 
