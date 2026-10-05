@@ -41,11 +41,12 @@ and anywhere blocks cannot render. Other block kinds keep the line.
 
 When the card moves on, any event of it, :func:`settle_question` takes the
 buttons and "waiting on you" off the question, so a typed answer does not
-leave them live, and reads the thread once for that answer: the first reply
-after the question from a person the adapter would answer, not a bot, becomes
+leave them live. An event that means the card resumed (:data:`ANSWERED_KINDS`)
+also reads the thread once for that answer: the first reply after the question
+from a person the adapter would answer, not a bot, and through its channel gate, becomes
 the same "✓ <name>: <words>" line a click leaves (the words as plain text on
-one line, clipped to ``TYPED_ANSWER_MAX``). A card that moved on with nobody
-replying, a read that fails, or a question a click answered whose rewrite
+one line, without the mentions it opens with, clipped to ``TYPED_ANSWER_MAX``).
+A card that moved on any other way, or with nobody replying, a read that fails, or a question a click answered whose rewrite
 failed (the click posted its line in the thread) settles without the line. A question a click already answered
 was rewritten by the click and is left alone; one whose rewrite failed is
 settled here. The
@@ -123,6 +124,10 @@ TYPED_SUBTYPES = frozenset({"thread_broadcast", "file_share", "me_message"})
 
 #: A Slack entity in a reply's text: a link, a mention or a special mention, with an optional label.
 SLACK_ENTITY = re.compile(r"<([^<>|]*)(?:\|([^<>]*))?>")
+
+#: The user mentions a reply opens with, such as the agent's in a channel that requires one.
+#: They address the reply, so they are not part of the answer its line shows.
+LEADING_MENTIONS = re.compile(r"^(?:\s*<@[A-Z0-9]+(?:\|[^<>]*)?>)+\s*")
 
 #: Added to a question's ``text``, so a session the wake never reached reads its card in the thread.
 QUESTION_CARD_NOTE = "(Question from card {card}.)"
@@ -359,7 +364,8 @@ async def _typed_note(adapter: Any, client: Any, sub: dict, channel: str, ts: st
     team_id = str(sub.get("team_id") or "")
     for reply in sorted(replies, key=lambda r: float(r["ts"])):
         if await _by_a_person(adapter, reply, channel, team_id, thread):
-            words = _presenter._clip(" ".join(_plain(str(reply["text"])).split()), TYPED_ANSWER_MAX)
+            text = str(reply["text"])
+            words = _presenter._clip(" ".join(_plain(LEADING_MENTIONS.sub("", text) or text).split()), TYPED_ANSWER_MAX)
             who = await _who(adapter, reply, channel, team_id)
             return ANSWERED.format(who=who, label=_presenter._escape(words))
     return ""
@@ -376,6 +382,9 @@ async def _settled(adapter: Any, sub: dict, entry: tuple, kind: str = UNBLOCKED_
         # So does a card that moved on unanswered.
         answered = kind in ANSWERED_KINDS and not _clicked(channel, ts, rewritten=False)
         note = await _typed_note(adapter, client, sub, channel, ts) if answered else ""
+        if _clicked(channel, ts):
+            # A click during the read rewrote the question with its own line.
+            return True
         settled_text = _without_choices(text)
         await client.chat_update(
             channel=channel,
@@ -389,11 +398,12 @@ async def _settled(adapter: Any, sub: dict, entry: tuple, kind: str = UNBLOCKED_
     return True
 
 
-async def settle_question(adapter: Any, sub: dict, kind: str = UNBLOCKED_KIND) -> None:
+async def settle_question(adapter: Any, sub: dict, kind: str = UNBLOCKED_KIND, event_id: int = 0) -> None:
     """Take the buttons and "waiting on you" off the card's open question, if it has one.
 
     ``kind`` is the card event that moved it on; only one in :data:`ANSWERED_KINDS` puts a
-    typed reply's line on the question.
+    typed reply's line on the question. Given the event's ``event_id``, a question posted
+    for that event or a later one is left alone: the event is older than the question.
 
     The question is forgotten only once the rewrite succeeds (or a click has
     answered it), so a failed rewrite is retried on the card's next event and
@@ -401,11 +411,14 @@ async def settle_question(adapter: Any, sub: dict, kind: str = UNBLOCKED_KIND) -
     whose settle failed are retried too.
     """
     key = _sub_key(sub)
+    def newer(entry: tuple) -> bool:
+        return bool(event_id) and int(entry[0] or 0) >= int(event_id)
+
     for stale_key, stale in [item for item in _unsettled.items() if item[0][0] == key]:
-        if await _settled(adapter, sub, stale, kind) and _unsettled.get(stale_key) is stale:
+        if not newer(stale) and await _settled(adapter, sub, stale, kind) and _unsettled.get(stale_key) is stale:
             _unsettled.pop(stale_key, None)
     entry = _questions.get(key)
-    if entry is None:
+    if entry is None or newer(entry):
         return
     if await _settled(adapter, sub, entry, kind) and _questions.get(key) is entry:
         _questions.pop(key, None)

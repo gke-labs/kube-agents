@@ -474,6 +474,40 @@ class SettleQuestionTest(unittest.TestCase):
                 self.assertEqual(bool(adapter.reads), kind in runtime.ANSWERED_KINDS)
                 self.assertEqual(runtime._questions, {})
 
+    def test_an_event_older_than_the_question_leaves_it_alone(self):
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 8))
+        for event_id in (6, 8):
+            _run(runtime.settle_question(adapter, SUB, "unblocked", event_id))
+        self.assertEqual(adapter.updates, [])
+        _run(runtime.settle_question(adapter, SUB, "unblocked", 9))
+        self.assertEqual(_buttons(adapter.updates[0]["blocks"]), [])
+        self.assertEqual(runtime._questions, {})
+
+    def test_only_the_mentions_a_reply_opens_with_are_dropped_from_its_line(self):
+        for text, words in (
+            ("<@U0BOT> <@U9|sam>  seeded-b", "seeded-b"),
+            ("seeded-b, ask <@U9|sam>", "seeded-b, ask sam"),
+            ("<@U0BOT>", "@U0BOT"),
+        ):
+            with self.subTest(text=text):
+                runtime._questions.clear()
+                adapter = _Adapter()
+                _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+                adapter.replies = [{"ts": "1700000000.000400", "user": "U7", "text": text}]
+                _run(runtime.settle_question(adapter, SUB))
+                self.assertEqual(adapter.updates[0]["blocks"][-1]["elements"][0]["text"], f"✓ Priya: {words}")
+
+    def test_a_click_during_the_read_keeps_its_own_line(self):
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        adapter.replies = [{"ts": "1700000000.000400", "user": "U7", "text": "seeded-b"}]
+        with mock.patch.object(clicks, "answered", lambda channel, ts: bool(adapter.reads)):
+            _run(runtime.settle_question(adapter, SUB))
+        self.assertEqual(len(adapter.reads), 1)
+        self.assertEqual(adapter.updates, [])
+        self.assertEqual(runtime._questions, {})
+
     def test_a_typed_reply_the_channel_gate_drops_is_not_the_answer(self):
         adapter = _Adapter()
         adapter._bot_user_id = "U0BOT"
@@ -483,7 +517,7 @@ class SettleQuestionTest(unittest.TestCase):
             {"ts": "1700000000.000500", "user": "U7", "text": "<@U0BOT> seeded-b"},
         ]
         _run(runtime.settle_question(adapter, SUB))
-        self.assertEqual(adapter.updates[0]["blocks"][-1]["elements"][0]["text"], "✓ Priya: @U0BOT seeded-b")
+        self.assertEqual(adapter.updates[0]["blocks"][-1]["elements"][0]["text"], "✓ Priya: seeded-b")
         self.assertEqual([g["routing_text"] for g in adapter.gated], ["hmm, seeded-a?", "<@U0BOT> seeded-b"])
 
     def test_no_reply_or_a_failed_read_settles_without_the_line(self):
