@@ -149,6 +149,7 @@ ADDED_AFTER_THE_MOVE = [
     "chat-voice-ack-names-target",  # the front door's delegation ack
     "bootstrap-inventory-ranking-delivery",  # the onboarding prioritization stage, #2143
     "platform-worker-shell-edit-of-shipped-skill",  # the sandbox's image trees, #2096
+    "autoops-controller-stall-triage",  # the stall watch on the inject path
 ]
 
 # Admitted after the split, each by a pull request that cited the record
