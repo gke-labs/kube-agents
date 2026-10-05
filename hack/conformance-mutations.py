@@ -287,6 +287,20 @@ MUTATIONS: list[Mutation] = [
         "assert, so it borrows C5's assertion by name; the borrow is what breaks "
         "first, and it has to break loudly or A2 falls off the map",
     ),
+    Mutation(
+        "A3-slack-click-authorization",
+        "deploy/docker/patches/slack_ux_clicks.py",
+        ("    started = await adapter._begin_interaction(ack, body, action, kind)\n",
+         "    started = await adapter._begin_interaction(ack, body, action, kind) or (\n"
+         "        body.get(\"team\", {}).get(\"id\"), action[\"action_id\"], action.get(\"value\"),\n"
+         "        body[\"message\"], body[\"message\"][\"ts\"], body[\"channel\"][\"id\"],\n"
+         "        body[\"user\"][\"id\"], body[\"user\"][\"id\"],\n"
+         "    )\n"),
+        "test_A3_an_unlisted_users_click_changes_nothing",
+        "fall back to the payload's own user when the adapter declines, the "
+        "'make the button work for everyone who can see it' shortcut: an "
+        "unlisted user's click then runs as their turn",
+    ),
     # ---- B. The write path ----------------------------------------------
     Mutation(
         "B1-read-only-verbs",
