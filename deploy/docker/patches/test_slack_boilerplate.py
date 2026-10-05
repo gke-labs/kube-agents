@@ -575,13 +575,15 @@ class _Root:
     def cleanup(self):
         if self._cleaned:
             return
-        self._cleaned = True
-        _live_roots.remove(self)
-        sys.path.remove(str(self.dir))
+        if str(self.dir) in sys.path:
+            sys.path.remove(str(self.dir))
+        if self in _live_roots:
+            _live_roots.remove(self)
         self._forget_gateway()
         if not _live_roots:
             sys.modules.update(self._saved_modules)
         shutil.rmtree(self.dir, ignore_errors=True)
+        self._cleaned = True
 
 
 def _target(platform, live=True):
