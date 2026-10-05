@@ -165,22 +165,15 @@ sandbox cannot read the branch at all; `prepare` then refuses the name with
 
 Generate or edit the files **inside the returned `workspace`**.
 
-The local version control binary is `/opt/vcs/libexec/git`. It holds no
-credential and cannot reach a forge, which is exactly why it is the one to use
-on the working copy. Call it by that full path every time:
+`git` here holds no credential and cannot reach a forge; it works on the
+working copy and nothing else, and `submit` is what sends the result.
 
 ```bash
 cd <workspace>
 # create or edit the declarative files here
-/opt/vcs/libexec/git add <file_path_1> <file_path_2>
-/opt/vcs/libexec/git commit -m "<conventional_commit_message>"
+git add <file_path_1> <file_path_2>
+git commit -m "<conventional_commit_message>"
 ```
-
-Do **not** put it in a shell variable or an alias. The command scanner refuses a
-command whose program is a variable (`$G add`), and in an unattended run that
-refusal is final. Each command you run arrives in a fresh non-interactive shell,
-which never expands aliases, so an aliased `git` followed by `git commit`
-silently runs the credentialed program instead.
 
 **CRITICAL SECURITY RULE:** explicitly stage only the targeted declarative files
 you generated or modified. **Never use `git add .` or `git add -A`** — this is a
@@ -188,7 +181,7 @@ real clone on a filesystem you also scratch in, and a blanket add sweeps
 transient debugging output, logs and anything else that landed there into a
 public pull request.
 
-_(Example: `/opt/vcs/libexec/git add config/manifest.yaml && /opt/vcs/libexec/git commit -m "feat(fleet): provision GKE operator for mercury-09"`)_
+_(Example: `git add config/manifest.yaml && git commit -m "feat(fleet): provision GKE operator for mercury-09"`)_
 
 Committing here is optional. Uncommitted changes **to files the copy already
 tracks** are recorded as a single revision under the `--title` you pass when you
@@ -199,7 +192,7 @@ request's headline.
 The rule above still holds at Step 3: a file the copy has never seen is not
 swept in for you. `submit` refuses and names it, because it cannot tell a
 manifest you generated from a log you left behind. Stage the ones that belong
-(`/opt/vcs/libexec/git add <path>`) and delete the rest.
+(`git add <path>`) and delete the rest.
 
 ### Step 3: Call the Secure Submit Suggestion Script
 

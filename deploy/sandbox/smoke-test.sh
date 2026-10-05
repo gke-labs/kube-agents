@@ -11,6 +11,10 @@
 #
 # Usage: deploy/sandbox/smoke-test.sh [image] [port]
 #
+# Needs Docker 26 or later: the image trees are mounted the way the operator
+# mounts them, as read-only subpaths of the data volume, and `volume-subpath`
+# arrived in 26.0.
+#
 # shellcheck disable=SC2016
 #   Remote commands are single-quoted throughout and that is the point: the
 #   expansion has to happen in the sandbox, not in this shell. A double-quoted
@@ -21,9 +25,33 @@
 # verdict.
 set -uo pipefail
 
+readonly MIN_DOCKER_MAJOR=26
+# The operator's layout, from shellSandboxImageTrees, shellSandboxImageTreeHomes
+# and the ancestor pins it derives in
+# k8s-operator/internal/controller/shell_sandbox_manifests.go. "" is the data
+# root. Each pin is a home's ancestor mounted over itself so it cannot be
+# renamed aside with the read-only trees inside it.
+readonly IMAGE_TREES=(skills scripts governance)
+readonly IMAGE_TREE_HOMES=("" profiles/platform)
+readonly IMAGE_TREE_PINS=(profiles profiles/platform)
+# shellSandboxImageTreesMode: what the operator sets SANDBOX_IMAGE_TREES to.
+readonly IMAGE_TREES_MODE=read-only-mounts
+
 IMAGE="${1:-agent-sandbox:latest}"
 PORT="${2:-12222}"
 NAME="sandbox-smoke-$$"
+
+# Checked before anything is created, so an old daemon costs a message and
+# nothing to clean up. Without volume-subpath the main run fails with a --mount
+# parse error that says nothing about the version.
+docker_version=$(docker version --format '{{.Server.Version}}' 2>/dev/null)
+docker_major=${docker_version%%.*}
+if ! [[ "$docker_major" =~ ^[0-9]+$ ]] || [ "$docker_major" -lt "$MIN_DOCKER_MAJOR" ]; then
+  echo "this smoke test needs Docker $MIN_DOCKER_MAJOR or later (--mount volume-subpath);" >&2
+  echo "the daemon reports '${docker_version:-nothing, is it running?}'" >&2
+  exit 1
+fi
+
 WORK=$(mktemp -d)
 # Named volumes rather than bind mounts, for the ownership. A bind mount arrives
 # owned by whoever ran this script; a named volume is seeded from the image, so
@@ -37,7 +65,8 @@ PASS=0
 FAIL=0
 
 cleanup() {
-  docker rm -f "$NAME" "$NAME-nourl" "$NAME-badsshd" >/dev/null 2>&1
+  docker rm -f "$NAME" "$NAME-nourl" "$NAME-badsshd" "$NAME-prepare" "$NAME-plant" \
+    "$NAME-nomounts" >/dev/null 2>&1
   docker volume rm -f "$DATA_VOL" "$SSHD_VOL" >/dev/null 2>&1
   rm -rf "$WORK"
 }
@@ -83,18 +112,51 @@ SSH_OPTS=(-i "$WORK/id" -p "$PORT" -o IdentitiesOnly=yes
   -o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout=5)
 SSH=(ssh "${SSH_OPTS[@]}" agent@127.0.0.1)
 
+# The shell container's mounts over the data volume, as the operator renders
+# them: each pin read-write over itself, then every <home>/<tree> read-only.
+# Docker mounts shallower destinations first, so the order here does not matter.
+TREE_MOUNTS=()
+for pin in "${IMAGE_TREE_PINS[@]}"; do
+  TREE_MOUNTS+=(--mount "type=volume,src=$DATA_VOL,dst=/opt/data/$pin,volume-subpath=$pin")
+done
+for home in "${IMAGE_TREE_HOMES[@]}"; do
+  for tree in "${IMAGE_TREES[@]}"; do
+    TREE_MOUNTS+=(--mount "type=volume,src=$DATA_VOL,dst=/opt/data/${home:+$home/}$tree,volume-subpath=${home:+$home/}$tree,readonly")
+  done
+done
+
+# Starts the sandbox the way the operator's StatefulSet does: the init
+# container's prepare step first, then the shell with the trees mounted
+# read-only. The prepare run carries the init container's securityContext --
+# read-only root filesystem, every capability dropped but the three it needs,
+# no privilege escalation -- so a prepare step that writes outside the volume or
+# needs more than that fails here rather than on a cluster. Its output is kept in
+# PREPARE_LOG, because the repairs it makes are only ever logged there.
+#
 # Waits for sshd to answer rather than sleeping: the host-key generation on a
 # first start is slow enough on a loaded runner to lose a fixed sleep to, and a
 # flaky smoke test gets deleted rather than debugged.
+PREPARE_LOG=""
 start_sandbox() {
-  docker rm -f "$NAME" >/dev/null 2>&1
+  docker rm -f "$NAME" "$NAME-prepare" >/dev/null 2>&1
+  if ! PREPARE_LOG=$(docker run --rm --name "$NAME-prepare" --read-only \
+    --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
+    --security-opt no-new-privileges \
+    -v "$DATA_VOL:/opt/data" \
+    "$IMAGE" --prepare-image-trees 2>&1); then
+    echo "FAIL  the prepare step exited non-zero; its output follows" >&2
+    echo "$PREPARE_LOG" >&2
+    return 1
+  fi
   docker run -d --name "$NAME" -p "$PORT:2222" \
     -v "$WORK/keys:/etc/ssh-authorized:ro" \
     -v "$DATA_VOL:/opt/data" \
+    "${TREE_MOUNTS[@]}" \
     -v "$SSHD_VOL:/var/lib/sandbox-sshd" \
+    -e "SANDBOX_IMAGE_TREES=$IMAGE_TREES_MODE" \
     -e CREDENTIAL_PROXY_URL=http://127.0.0.1:9999 \
     -e CREDENTIAL_PROXY_TOKEN_FILE=/var/run/secrets/kubeagents/credential-proxy/token \
-    "$IMAGE" >/dev/null
+    "$IMAGE" >/dev/null || return 1
   for _ in $(seq 30); do
     ssh-keyscan -p "$PORT" -t ed25519 127.0.0.1 >/dev/null 2>&1 && return 0
     sleep 1
@@ -102,6 +164,41 @@ start_sandbox() {
   echo "FAIL  sandbox never accepted connections; logs follow" >&2
   docker logs "$NAME" >&2
   return 1
+}
+
+# plant_offline <sh script>: stops the sandbox and runs the script as uid 1000
+# against its data volume, the stand-in for a volume written before the upgrade
+# or a plant the running sandbox's mounts would refuse. The next start_sandbox is
+# what has to repair it.
+plant_offline() {
+  docker rm -f "$NAME" >/dev/null 2>&1
+  docker run --rm --name "$NAME-plant" --user 1000:1000 --entrypoint sh \
+    -v "$DATA_VOL:/opt/data" "$IMAGE" -c "$1"
+}
+
+# mount_state <path>: how the running sandbox sees <path> in its own mount table,
+# which is what the entrypoint's gate reads too. The last matching line wins, as
+# it does for a lookup.
+mount_state() {
+  docker exec "$NAME" awk -v p="$1" '
+    $5 == p { found = 1; ro = 0; n = split($6, o, ","); for (i = 1; i <= n; i++) if (o[i] == "ro") ro = 1 }
+    END { if (!found) print "not a mount point"; else if (ro) print "read-only mount"; else print "writable mount" }
+  ' /proc/self/mountinfo 2>&1
+}
+
+# check_trees_from_image <label>: every tree in every home is a read-only mount
+# holding exactly the image's copy. diff runs over ssh as the agent, which can
+# read both sides and change neither.
+check_trees_from_image() {
+  local home tree path
+  for home in "${IMAGE_TREE_HOMES[@]}"; do
+    for tree in "${IMAGE_TREES[@]}"; do
+      path="/opt/data/${home:+$home/}$tree"
+      check "$1: $path is a read-only mount" "read-only mount" "$(mount_state "$path")"
+      check "$1: $path matches /opt/defaults/$tree" "identical" \
+        "$("${SSH[@]}" "diff -r /opt/defaults/$tree $path && echo identical" 2>&1)"
+    done
+  done
 }
 
 echo "== 1. a sandbox with no key mounted must fail loudly =="
@@ -124,16 +221,40 @@ check "host keys landed on their volume" "ssh_host_ed25519_key" \
   "$(docker exec "$NAME" ls /var/lib/sandbox-sshd 2>&1)"
 check "the data volume is the agent's" "1000" \
   "$(docker exec "$NAME" stat -c '%u' /opt/data 2>&1)"
+# start_sandbox has already failed the run if the prepare step exited non-zero
+# under the init container's restrictions; this is that it did its job.
+check "the prepare step staged the image trees" "image trees prepared" "$PREPARE_LOG"
+check "and the shell's entrypoint found them mounted read-only" "are read-only mounts" "$logs"
+# Every file, not the top directory: a tree chowned to root at the top and left
+# agent-owned below is writable wherever the mount is not.
+check "every file in the staged trees is root's and writable by nobody else" "all root, go-w" \
+  "$(docker exec "$NAME" sh -c 'out=$(find /opt/data/scripts /opt/data/profiles/platform/skills \( ! -user root -o -perm /022 \) 2>&1) &&
+    [ -z "$out" ] && echo "all root, go-w" || echo "$out"' 2>&1)"
 
 echo
 echo "== 3. who may log in =="
 check "the agent's key works" "agent" "$("${SSH[@]}" whoami 2>&1)"
 # sshd's own default, which is the home. It is not where the agent works: Hermes
-# is sent TERMINAL_CWD=/opt/data by the operator, because this home is the
-# container's ephemeral overlay and everything written here is gone on the next
-# pod recycle. The image cannot enforce that — asserted here so the two halves of
-# the arrangement are visible together.
+# is sent TERMINAL_CWD=/opt/data by the operator, because this home is root-owned
+# and on the container's ephemeral overlay. The image cannot enforce that —
+# asserted here so the two halves of the arrangement are visible together.
 check "the session starts in the agent's home" "/home/agent" "$("${SSH[@]}" pwd 2>&1)"
+# Every session shares this home, so anything one could leave in it that bash or
+# python3 loads unasked would run in every later one: a startup file, a ~/bin
+# that Debian's stock .profile puts first on PATH, a usercustomize or .pth file
+# in the user site-packages. deploy/sandbox/Dockerfile has the list. The home is
+# root-owned and empty instead, and these are the routes it closes.
+check "the home is root's and only root may write it" "755 root root" \
+  "$("${SSH[@]}" 'stat -c "%a %U %G" ~' 2>&1)"
+check "and holds nothing but .ssh and .hermes" "nothing else" \
+  "$("${SSH[@]}" 'ls -A ~ | grep -vxE "[.]ssh|[.]hermes" || echo nothing else' 2>&1)"
+for startup in .bashrc .bash_profile .bash_login .profile; do
+  check "the model cannot write ~/$startup" "Permission denied" \
+    "$("${SSH[@]}" "echo 'echo planted' > ~/$startup" 2>&1)"
+done
+check "nor create ~/bin" "Permission denied" "$("${SSH[@]}" 'mkdir ~/bin' 2>&1)"
+check "nor the Python user site-packages" "Permission denied" \
+  "$("${SSH[@]}" 'mkdir -p "$(python3 -m site --user-site)"' 2>&1)"
 check "the data volume is writable" "ok" \
   "$("${SSH[@]}" 'touch /opt/data/probe && echo ok' 2>&1)"
 # One path, two directories: /opt/data is also the agent pod's Hermes home, and
@@ -156,8 +277,8 @@ check "AllowUsers refuses another account holding the same key" "Permission deni
 echo
 echo "== 3b. the hermes principal =="
 # The account trusted agent-pod code connects as. It exists so that a caller
-# reaching in for a cluster command does not run as the login whose home the
-# model owns; see deploy/sandbox/Dockerfile.
+# reaching in for a cluster command does not run as the login the model's own
+# commands run as; see deploy/sandbox/Dockerfile.
 HERMES_SSH=(ssh "${SSH_OPTS[@]}" hermes@127.0.0.1)
 check "the same key opens a hermes session" "hermes" "$("${HERMES_SSH[@]}" whoami 2>&1)"
 check "hermes gets the forwarded proxy URL too" "http://127.0.0.1:9999" \
@@ -165,18 +286,17 @@ check "hermes gets the forwarded proxy URL too" "http://127.0.0.1:9999" \
 check "hermes gets the wrapper PATH too" "/opt/credential-proxy/bin/kubectl" \
   "$("${HERMES_SSH[@]}" 'command -v kubectl' 2>&1)"
 
-# The property the whole account exists for. Bash sources ~/.bashrc for a
-# non-interactive `ssh host cmd`, so a shim planted by the model in its own home
-# would be executed by an agent-pod caller and its output returned as a trusted
-# tool result. Written above Debian's non-interactive guard, because below it
-# the guard hides the problem rather than fixing it.
+# The property the whole account exists for: nothing the model leaves behind
+# changes what an agent-pod caller sees. The first route found was a shim on
+# PATH from ~/.bashrc, which bash sources for a non-interactive `ssh host cmd`,
+# and its output would have come back as a trusted tool result. The home is
+# root-owned now, so the plant itself fails (section 3 checks the refusals), and
+# the shim reaches neither account.
 "${SSH[@]}" 'mkdir -p ~/bin && printf "#!/bin/sh\necho FORGED\n" > ~/bin/kubectl && chmod +x ~/bin/kubectl' >/dev/null 2>&1
-"${SSH[@]}" 'printf "export PATH=$HOME/bin:\$PATH\n%s" "$(cat ~/.bashrc)" > ~/.bashrc.new && mv ~/.bashrc.new ~/.bashrc' >/dev/null 2>&1
-check_absent "a shim planted in the agent's home does not reach a hermes session" "FORGED" \
+"${SSH[@]}" 'printf "export PATH=\$HOME/bin:\$PATH\n" > ~/.bashrc' >/dev/null 2>&1
+check_absent "a shim the model tries to plant in its home does not reach a hermes session" "FORGED" \
   "$("${HERMES_SSH[@]}" 'kubectl version' 2>&1)"
-# Same command as the agent proves the planted shim actually works, so the check
-# above is testing isolation rather than a typo in the setup.
-check "the planted shim does run for the agent itself" "FORGED" \
+check_absent "nor a later agent session" "FORGED" \
   "$("${SSH[@]}" 'kubectl version' 2>&1)"
 
 # The model must not be able to reach hermes' authorized_keys, either by writing
@@ -196,11 +316,12 @@ check "the agent cannot write a kubeconfig for hermes to use" "Permission denied
 # an agent-pod caller runs over it. Two scripts are forwarded in as hermes --
 # `forge.py` for every forge verb (agents/platform/scripts/forge.py, `_forward`)
 # and `resolver.py` for the issues sweep's poll (github-issue-resolver,
-# `_forward_to_sandbox`) -- and the copy of each under /opt/data is the model's
-# own; section 4b plants an edit in one on purpose. So the forwarded path is a
-# root-owned staging directory instead. Both are checked: resolver.py's hop was
-# left under /opt/data when forge.py's was moved, which is what a per-script
-# check would not have let happen.
+# `_forward_to_sandbox`) -- and the copy of each under /opt/data sits in a home
+# the model owns: read-only under the operator, but outside it a root-owned copy
+# the model can rename aside. So the forwarded path is a root-owned staging
+# directory instead; section 4b tries to edit both copies. Both are checked:
+# resolver.py's hop was left under /opt/data when forge.py's was moved, which is
+# what a per-script check would not have let happen.
 for forwarded in forge.py resolver.py; do
   check "the forwarded $forwarded is root-owned and writable by nobody else" "755 root root" \
     "$("${SSH[@]}" "stat -c '%a %U %G' /opt/vcs/libexec/platform/$forwarded" 2>&1)"
@@ -235,8 +356,19 @@ print(\" \".join(bad) or \"clean\")
 # Generated on the host so the private half never has to be copied back out of
 # the container: the model only needs the public half to authorise it.
 ssh-keygen -q -t ed25519 -N '' -f "$WORK/rogue" -C sandbox-smoke-rogue
+check "the agent's authorized_keys is root's" "644 root" \
+  "$("${SSH[@]}" 'stat -c "%a %U" ~/.ssh/authorized_keys' 2>&1)"
+# The directory as well as the file. Replacing a file takes write on the
+# directory rather than on the file, so with an agent-owned .ssh the model could
+# move the root-owned file aside and write its own in its place, and the append
+# below would still be refused. Moved straight back if it ever succeeds, so the
+# rest of the run keeps a working login.
+check "the agent's .ssh is root's" "755 root" \
+  "$("${SSH[@]}" 'stat -c "%a %U" ~/.ssh' 2>&1)"
+check "the model cannot move authorized_keys aside" "Permission denied" \
+  "$("${SSH[@]}" 'mv ~/.ssh/authorized_keys ~/.ssh/aside && mv ~/.ssh/aside ~/.ssh/authorized_keys && echo moved' 2>&1)"
 "${SSH[@]}" "printf '%s\n' '$(cat "$WORK/rogue.pub")' >> ~/.ssh/authorized_keys" >/dev/null 2>&1
-check "the model can authorise a new key for its own account" "agent" \
+check "the model cannot authorise a new key for its own account" "Permission denied" \
   "$(ssh -i "$WORK/rogue" "${SSH_OPTS[@]:2}" agent@127.0.0.1 whoami 2>&1)"
 # Asserted as a refusal rather than as the absence of "hermes" in the output:
 # sshd's own denial names the account it refused ("hermes@127.0.0.1: Permission
@@ -244,10 +376,6 @@ check "the model can authorise a new key for its own account" "agent" \
 # behaves.
 check "the same key does not open a hermes session" "Permission denied" \
   "$(ssh -i "$WORK/rogue" "${SSH_OPTS[@]:2}" hermes@127.0.0.1 whoami 2>&1)"
-
-# Undo the sabotage: later sections use the agent session and would otherwise
-# run against a hijacked PATH.
-"${SSH[@]}" 'rm -rf ~/bin && sed -i "1{/^export PATH=/d}" ~/.bashrc && sed -i "/sandbox-smoke-rogue/d" ~/.ssh/authorized_keys' >/dev/null 2>&1
 
 echo
 echo "== 3c. the host keys are not the model's =="
@@ -291,9 +419,9 @@ check "no sftp subsystem is advertised" "subsystem request failed" \
 echo
 echo "== 4b. what the skills need to find =="
 # The shell moved here, so the files a SKILL.md tells the model to run had to
-# follow it. The image stages them at /opt/defaults and the entrypoint syncs them
-# onto the volume, because a PVC mounting over /opt/data would otherwise hide
-# anything baked there.
+# follow it. The image stages them at /opt/defaults and the prepare step copies
+# them onto the volume, because a PVC mounting over /opt/data would otherwise
+# hide anything baked there; the shell then mounts each copy read-only.
 #
 # fleet-audit rather than any skill: Hermes' own ssh backend separately uploads a
 # skills tree to ~/.hermes/skills, and that tree is the *chat* profile's — it does
@@ -343,24 +471,51 @@ check "PLATFORM_AGENT_HOME too" "/opt/data" \
   "$("${SSH[@]}" 'echo "$PLATFORM_AGENT_HOME"' 2>&1)"
 check "and the reference forms in the skills resolve to the same file" "ok" \
   "$("${SSH[@]}" 'cmp -s "$HERMES_HOME"/scripts/forge.py /opt/data/scripts/forge.py && echo ok' 2>&1)"
-# The delivery is image-owned. An edit the model makes to a skill script is gone
-# at the next start, the same contract the agent pod's force-sync gives; section 6
-# is where the restart happens and this is the marker it looks for.
-"${SSH[@]}" 'echo "# planted" >> /opt/data/scripts/forge.py' >/dev/null 2>&1
-check "the model can edit what it runs" "planted" \
+# The delivery is image-owned, and the model cannot change it: the model runs
+# these files, and so does the agent pod's code over ssh, so an edit that stuck
+# would be code the next caller runs as if it had shipped. Each tree is a
+# root-owned read-only mount. The permission check comes before the mount's, so
+# the model's write to a file gets EACCES; section 12 shows the mount refusing an
+# unlink with EROFS.
+check "the model cannot edit what it runs" "Permission denied" \
+  "$("${SSH[@]}" 'echo "# planted" >> /opt/data/scripts/forge.py' 2>&1)"
+check_absent "and the file is unchanged" "planted" \
   "$("${SSH[@]}" 'tail -1 /opt/data/scripts/forge.py' 2>&1)"
-# The other end of the boundary section 3b set up: this is the copy the *model*
-# runs, and the edit is allowed to stand. What an agent-pod caller runs is the
-# root-owned one, and it is untouched by this.
+# The other end of the boundary section 3b set up. What an agent-pod caller runs
+# is the root-owned staging copy, which is untouched whatever happens above.
 check_absent "the edit does not reach the copy hermes runs" "planted" \
   "$("${SSH[@]}" 'tail -1 /opt/vcs/libexec/platform/forge.py' 2>&1)"
 # And the same for the issues sweep's entry point, which reaches /opt/data on
 # every tick of an install with the sandbox on.
-"${SSH[@]}" 'echo "# planted" >> /opt/data/skills/github-issue-resolver/scripts/resolver.py' >/dev/null 2>&1
-check "the model can edit its own copy of the resolver" "planted" \
+check "nor its own copy of the resolver" "Permission denied" \
+  "$("${SSH[@]}" 'echo "# planted" >> /opt/data/skills/github-issue-resolver/scripts/resolver.py' 2>&1)"
+check_absent "and the resolver is unchanged" "planted" \
   "$("${SSH[@]}" 'tail -1 /opt/data/skills/github-issue-resolver/scripts/resolver.py' 2>&1)"
 check_absent "the edit does not reach the resolver hermes runs" "planted" \
   "$("${SSH[@]}" 'tail -1 /opt/vcs/libexec/platform/resolver.py' 2>&1)"
+# Nor can it replace a tree without editing it. Each tree is a mount point, so
+# renaming it aside is EBUSY; so are profiles/ and profiles/platform, which the
+# operator mounts over themselves for this reason alone. rename(2) checks only
+# the directory it renames, so without those pins moving profiles/ aside and
+# recreating profiles/platform/scripts beneath a new one would work. Every
+# destination is in the source's own directory, so the rename is attempted on
+# one mount and EBUSY, not a cross-device EXDEV, is what answers.
+for moved in /opt/data/scripts /opt/data/profiles/platform/scripts \
+  /opt/data/profiles/platform /opt/data/profiles; do
+  check "$moved cannot be renamed aside" "Device or resource busy" \
+    "$("${SSH[@]}" "mv $moved $moved.aside" 2>&1)"
+done
+# A link resolves to the file on the read-only mount, so a write through it
+# reaches that file and is refused the same way. It is the route a file tool's
+# write takes when it follows a link the model left in its scratch space.
+check "a write through a link the model plants is refused too" "Permission denied" \
+  "$("${SSH[@]}" 'mkdir -p /opt/data/scratch && ln -sf /opt/data/scripts/forge.py /opt/data/scratch/l &&
+    echo "# planted" >> /opt/data/scratch/l' 2>&1)"
+# The staging copy the trees come from, which several scripts also append to
+# sys.path: root-owned, so the model cannot drop in a module for that append to
+# find.
+check "the image's staging copy is not the model's either" "Permission denied" \
+  "$("${SSH[@]}" 'touch /opt/defaults/scripts/x' 2>&1)"
 
 echo
 echo "== 4c. the working directory Hermes cds into =="
@@ -407,13 +562,13 @@ check "and the wrapper says which directory it could not create" \
 
 # _quote_cwd_for_cd emits a bare `~` and rewrites `~/x` through $HOME, so the
 # target is a shell word and has to be expanded on this side. A wrapper that
-# took it for a literal path would create a directory named '$HOME'.
+# took it for a literal path would name '$HOME' in its message below instead.
 check "a bare ~ cwd resolves to this pod's home" "/home/agent" \
   "$(hermes_ssh '~' 'pwd' 2>&1)"
-check "a \$HOME-relative cwd with a space stays one word" "/home/agent/smoke ws" \
+# The home is root-owned, so the wrapper cannot create this one and the command
+# exits 126 as above. The path in its message is what shows the word expanded.
+check "a \$HOME-relative cwd with a space stays one word" "could not create /home/agent/smoke ws" \
   "$(hermes_ssh "\$HOME/'smoke ws'" 'pwd' 2>&1)"
-check_absent "and nothing created a directory named for the variable" '$HOME' \
-  "$("${SSH[@]}" 'ls -a / ~' 2>&1)"
 
 # Everything that is not a Hermes wrapper has to pass through untouched. tar
 # over the connection is how file sync moves whole directories in both
@@ -644,7 +799,7 @@ fi
 
 echo
 echo "== 5. credential-proxy wrappers =="
-for cli in kubectl gcloud gh git; do
+for cli in kubectl gcloud; do
   check "$cli resolves to the wrapper, not 'command not found'" "/opt/credential-proxy/bin/$cli" \
     "$("${SSH[@]}" "command -v $cli" 2>&1)"
 done
@@ -663,7 +818,7 @@ check "CREDENTIAL_PROXY_TOKEN_FILE crosses too" "/var/run/secrets/kubeagents/cre
   "$("${SSH[@]}" 'echo "$CREDENTIAL_PROXY_TOKEN_FILE"' 2>&1)"
 check "the wrapper dispatches rather than refusing to start" "credential proxy" \
   "$("${SSH[@]}" 'kubectl version 2>&1' 2>&1)"
-check "the wrappers are ahead of anything else on PATH" "/opt/credential-proxy/bin:" \
+check "the wrappers are on PATH" "/opt/credential-proxy/bin:" \
   "$("${SSH[@]}" 'echo "$PATH"' 2>&1)"
 # A login shell runs /etc/profile, which overwrites PATH wholesale; profile.d is
 # what puts the wrappers back. Both paths, because only one of them is sshd's.
@@ -672,15 +827,23 @@ check "PATH survives /etc/profile in a login shell" "/opt/credential-proxy/bin/k
 
 echo
 echo "== 5b. the version-control skill's local git =="
-# A second git, off PATH, that the version-control skill reaches by absolute
-# path to read a clone the broker unpacked here. Asserted as absent from PATH
-# first, because that is the property the section is really about: the name
-# `git` still belongs to the shim, and every caller in the tree that types it
-# still means the shim.
-check "the name git still resolves to the shim" "/opt/credential-proxy/bin/git" \
+# The only git in the image, and gh nowhere at all. Asserted by what the name
+# resolves to rather than by which PATH entry wins, in both session shapes:
+# /etc/profile overwrites PATH in a login shell, and profile.d is what puts
+# /opt/vcs/bin back there.
+check "the name git resolves to the local git" "/opt/vcs/bin/git" \
   "$("${SSH[@]}" 'command -v git' 2>&1)"
-check "and in a login session too" "/opt/credential-proxy/bin/git" \
+check "and in a login session too" "/opt/vcs/bin/git" \
   "$("${SSH[@]}" "bash -l -c 'command -v git'" 2>&1)"
+check "gh is not there" "absent" \
+  "$("${SSH[@]}" 'command -v gh >/dev/null 2>&1 && echo present || echo absent' 2>&1)"
+check "nor in a login session" "absent" \
+  "$("${SSH[@]}" "bash -l -c 'command -v gh >/dev/null 2>&1 && echo present || echo absent'" 2>&1)"
+# A working copy that names its own hooks directory still gets the empty one:
+# the wrapper's `-c` outranks the repository's config.
+check "a repository's own hooksPath does not reach the wrapper" "/opt/vcs/share/no-hooks" \
+  "$("${SSH[@]}" 'git init -q /tmp/sh && git -C /tmp/sh config core.hooksPath .githooks && git -C /tmp/sh config core.hooksPath' 2>&1)"
+"${SSH[@]}" 'rm -rf /tmp/sh' >/dev/null 2>&1
 check "the local git is a real git" "git version" \
   "$("${SSH[@]}" '/opt/vcs/libexec/git --version' 2>&1)"
 # The message, not the exit status: example.invalid resolves nowhere, so an
@@ -711,8 +874,9 @@ echo "== 6. a restart must not change the host key or lose the model's work =="
 # has never seen and refuses one that changed. A regenerated host key is not a
 # prompt, it is every later command failing until known_hosts is cleared by hand.
 # Two files, one on each side of the durability line: /opt/data/probe was
-# written in section 3 and this one goes in the home the shell would default to.
-"${SSH[@]}" 'touch ~/ephemeral-probe' >/dev/null 2>&1
+# written in section 3 and this one goes on the container's own disk, where the
+# home the shell would default to also is.
+"${SSH[@]}" 'touch /tmp/ephemeral-probe' >/dev/null 2>&1
 before=$(ssh-keyscan -p "$PORT" -t ed25519 127.0.0.1 2>/dev/null | awk '{print $3}')
 start_sandbox || exit 1
 after=$(ssh-keyscan -p "$PORT" -t ed25519 127.0.0.1 2>/dev/null | awk '{print $3}')
@@ -725,24 +889,36 @@ check_absent "the second start reused the volume's keys" "generating ed25519" \
 # model's work on the wrong side of this line.
 check "the model's files on the data volume survived the recycle" "probe" \
   "$("${SSH[@]}" 'ls /opt/data' 2>&1)"
-check_absent "the ones in the home did not" "ephemeral-probe" \
-  "$("${SSH[@]}" 'ls -a ~' 2>&1)"
-# The other side of that line, and the reason step 1a replaces rather than merges:
-# the skills, SOPs and shared scripts are image-owned, so the edit section 4b made
-# to forge.py has to be gone. Merging would leave a script deleted from the image
-# sitting on the volume looking current for as long as the PVC lives.
-check_absent "the image-owned trees are back to the image's copy" "planted" \
+check_absent "the ones on the container's disk did not" "ephemeral-probe" \
+  "$("${SSH[@]}" 'ls -a /tmp' 2>&1)"
+# The other side of that line, and the reason the prepare step replaces rather
+# than merges: the skills, SOPs and shared scripts are image-owned, so every
+# start has to leave each tree exactly the image's copy. Merging would leave a
+# script deleted from the image sitting on the volume looking current for as
+# long as the PVC lives. Section 4b's edits were refused rather than undone, so
+# the tail is a spot check and the diff against /opt/defaults is the claim.
+check_absent "the image-owned trees are the image's copy" "planted" \
   "$("${SSH[@]}" 'tail -1 /opt/data/scripts/forge.py' 2>&1)"
+check_trees_from_image "after a recycle"
 
 echo
 echo "== 7. an unconfigured proxy warns, it does not crash =="
 # Expected state until #737 Part C makes the credential proxy reachable from
 # outside the agent pod: file and code-execution tools still have to work.
+#
+# Also the image run outside the operator, as sections 1, 3c and 8 are: no
+# prepare step, no mounts, no SANDBOX_IMAGE_TREES. The entrypoint stages the
+# trees itself as root-owned copies, which stops an in-place edit and not a
+# rename, and it has to say so.
 docker rm -f "$NAME-nourl" >/dev/null 2>&1
 docker run -d --name "$NAME-nourl" -v "$WORK/keys:/etc/ssh-authorized:ro" "$IMAGE" >/dev/null
 sleep 3
-check "says so in the log" "CREDENTIAL_PROXY_URL is unset" "$(docker logs "$NAME-nourl" 2>&1)"
+nourl_logs=$(docker logs "$NAME-nourl" 2>&1)
+check "says so in the log" "CREDENTIAL_PROXY_URL is unset" "$nourl_logs"
 check "starts sshd anyway" "sshd" "$(docker exec "$NAME-nourl" ps -o comm= -p 1 2>&1)"
+check "with no mounts the trees are staged as root-owned copies" "root root" \
+  "$(docker exec "$NAME-nourl" stat -c '%U' /opt/data/scripts /opt/data/profiles/platform/scripts 2>&1 | tr '\n' ' ')"
+check "and the log says a rename is still possible there" "can still rename a tree aside" "$nourl_logs"
 docker rm -f "$NAME-nourl" >/dev/null 2>&1
 
 echo
@@ -756,22 +932,59 @@ check "refuses the value" "contains a newline, quote or backslash" "$out"
 check_absent "and does not start sshd with it" "ready; starting" "$out"
 
 echo
-echo "== 9. a symlink the model plants under /opt/data must not survive a recycle =="
-# The volume outlives the pod and uid 1000 owns every name on it, so a link
-# written during one session is input to the *next* start — which runs as root
-# and, before this guard, followed it. Two live paths: the marker file, which
-# root writes with `cat >`, and the profile home root, which root chowns on its
-# way back up to $DATA. Both are planted here as the model and both are aimed
-# somewhere that would matter: /etc/ld.so.preload is loaded into every process
-# sshd forks, and /opt holds the credential-proxy shims that start each
-# session's PATH.
-planted=$("${SSH[@]}" 'rm -rf /opt/data/profiles && ln -s /opt /opt/data/profiles &&
+echo "== 8b. a declared mount mode with no mounts must not start =="
+# SANDBOX_IMAGE_TREES=read-only-mounts is the operator saying the trees are
+# mounted read-only. The entrypoint checks the mount table rather than taking
+# that on trust, and a tree that is not mounted at all has to stop the start as
+# surely as one mounted writable: either way the model could change what it
+# runs. The key is mounted so that the gate is the only thing left to refuse.
+# Detached and polled rather than run in the foreground, because an image
+# without the gate starts sshd and would never return.
+docker rm -f "$NAME-nomounts" >/dev/null 2>&1
+docker run -d --name "$NAME-nomounts" -v "$WORK/keys:/etc/ssh-authorized:ro" \
+  -e "SANDBOX_IMAGE_TREES=$IMAGE_TREES_MODE" "$IMAGE" >/dev/null
+for _ in $(seq 30); do
+  [ "$(docker inspect -f '{{.State.Running}}' "$NAME-nomounts" 2>/dev/null)" = false ] && break
+  sleep 1
+done
+nomounts=$(docker inspect -f 'running=[{{.State.Running}}] exit=[{{.State.ExitCode}}]' "$NAME-nomounts" 2>&1)
+nomounts_logs=$(docker logs "$NAME-nomounts" 2>&1)
+docker rm -f "$NAME-nomounts" >/dev/null 2>&1
+check "the sandbox stops rather than starting" "running=[false]" "$nomounts"
+check_absent "with a non-zero status" "exit=[0]" "$nomounts"
+check "and names the first tree that is not a read-only mount" "/opt/data/governance" "$nomounts_logs"
+check_absent "and never reaches sshd" "ready; starting" "$nomounts_logs"
+
+echo
+echo "== 9. a symlink planted under /opt/data must not survive a recycle =="
+# The volume outlives the pod and uid 1000 owns most names on it, so a link
+# written during one session is input to the *next* start -- which runs as root
+# and, before this guard, followed it. Three paths matter: the marker file,
+# which root writes with `cat >`; the profile home root, which root chowns on
+# its way back up to $DATA; and a tree path, which the prepare step fills and
+# the shell then mounts. Each is aimed somewhere that would matter:
+# /etc/ld.so.preload is loaded into every process sshd forks, /opt holds the
+# credential-proxy shims that start each session's PATH, and a tree pointed into
+# the model's scratch space would mount the model's own files as if they had
+# shipped.
+#
+# The running sandbox refuses every plant that goes through a mount point, and
+# that is checked first. So the plant is then made offline as uid 1000, which is
+# also what a volume from before the upgrade looks like, when the model owned
+# all of it. mv rather than rm -rf: the trees inside are root's now, and uid
+# 1000 can rename one within a directory it owns but cannot empty it.
+PLANT_HOME_LINK='mv /opt/data/profiles /opt/data/profiles.old && ln -s /opt /opt/data/profiles &&
   rm -f /opt/data/.sandbox && ln -s /etc/ld.so.preload /opt/data/.sandbox &&
-  ls -ld /opt/data/profiles /opt/data/.sandbox' 2>&1)
+  ls -ld /opt/data/profiles /opt/data/.sandbox'
+check "the running sandbox refuses the home link" "Device or resource busy" \
+  "$("${SSH[@]}" "$PLANT_HOME_LINK" 2>&1)"
+planted=$(plant_offline "$PLANT_HOME_LINK" 2>&1)
 # Without this the whole section passes when the plant silently failed.
-check "the model can plant the links in the first place" "/opt/data/profiles -> /opt" "$planted"
+check "a volume can carry the links in the first place" "/opt/data/profiles -> /opt" "$planted"
 start_sandbox || exit 1
-check "the start says it removed them" "removed a symlink at /opt/data/profiles" \
+check "the prepare step says it removed the home link" "removed a symlink at /opt/data/profiles" \
+  "$PREPARE_LOG"
+check "the shell's start says it removed the marker link" "removed a symlink at /opt/data/.sandbox" \
   "$(docker logs "$NAME" 2>&1)"
 check "/opt is still root's" "0" "$(docker exec "$NAME" stat -c '%u' /opt 2>&1)"
 check "the marker's target was never created" "absent" \
@@ -780,12 +993,32 @@ check "the marker is a real file again" "regular file" \
   "$(docker exec "$NAME" stat -c '%F' /opt/data/.sandbox 2>&1)"
 check "and holds the marker text" "the shell sandbox's /opt/data" \
   "$(docker exec "$NAME" cat /opt/data/.sandbox 2>&1)"
-check "the profile home is a real directory again" "directory" \
-  "$(docker exec "$NAME" stat -c '%F' /opt/data/profiles 2>&1)"
-check "owned by the agent" "1000" \
-  "$(docker exec "$NAME" stat -c '%u' /opt/data/profiles 2>&1)"
-check "with the image's trees back inside it" "scripts" \
-  "$("${SSH[@]}" 'ls /opt/data/profiles/platform' 2>&1)"
+for home_dir in /opt/data/profiles /opt/data/profiles/platform; do
+  check "$home_dir is a directory the agent owns again" "directory 1000" \
+    "$(docker exec "$NAME" stat -c '%F %u' "$home_dir" 2>&1)"
+done
+
+# The tree path itself, one component further in than the chown walk goes.
+# Docker and kubelet bind whatever sits at a subpath, so the prepare step has to
+# clear a link at the tree path before it stages the tree, not only the links
+# above it.
+PLANT_TREE_LINK='mv /opt/data/profiles/platform/scripts /opt/data/profiles/platform/scripts.old &&
+  mkdir -p /opt/data/scratch/x && echo "# planted" > /opt/data/scratch/x/forge.py &&
+  ln -s /opt/data/scratch/x /opt/data/profiles/platform/scripts &&
+  ls -ld /opt/data/profiles/platform/scripts'
+check "the running sandbox refuses the tree link" "Device or resource busy" \
+  "$("${SSH[@]}" "$PLANT_TREE_LINK" 2>&1)"
+planted=$(plant_offline "$PLANT_TREE_LINK" 2>&1)
+check "a volume can carry a link at a tree path" \
+  "/opt/data/profiles/platform/scripts -> /opt/data/scratch/x" "$planted"
+start_sandbox || exit 1
+check "the prepare step says it removed the tree link" \
+  "removed a symlink at /opt/data/profiles/platform/scripts" "$PREPARE_LOG"
+# Removed, not followed: the link's target is still the model's own directory,
+# with the model's file in it, rather than chowned to root or overwritten.
+check "and left the link's target alone" "1000 # planted" \
+  "$(docker exec "$NAME" sh -c 'stat -c %u /opt/data/scratch/x && cat /opt/data/scratch/x/forge.py' 2>&1 | tr '\n' ' ')"
+check_trees_from_image "after the planted links"
 
 echo
 echo "== 10. a plain file where a home root belongs must not wedge the start =="
@@ -793,20 +1026,23 @@ echo "== 10. a plain file where a home root belongs must not wedge the start =="
 # rather than a link. The symlink pass does not reach it -- `rm` on a symlink is
 # not `rm` on a file, deliberately -- and `install -d` exits 71 on a path that
 # exists and is not a directory, which `set -e` turns into a start that never
-# finishes. Nothing on the volume would have cleared it, so this was a permanent
-# CrashLoopBackOff a session could arrange with one `touch`, and the pod you
-# would exec into to undo it is the pod that is down.
-planted=$("${SSH[@]}" 'rm -rf /opt/data/profiles/platform &&
+# finishes. Nothing on the volume would have cleared it, so on a volume the model
+# owned whole this was a permanent CrashLoopBackOff a session could arrange with
+# one `touch`, and the pod you would exec into to undo it is the pod that is
+# down. The home root is a mount point now, so the running sandbox refuses it;
+# the prepare step still meets whatever an older volume holds.
+PLANT_HOME_FILE='mv /opt/data/profiles/platform /opt/data/profiles/platform.old &&
   echo "the model put a file here" > /opt/data/profiles/platform &&
-  stat -c %F /opt/data/profiles/platform' 2>&1)
-check "the model can plant the file in the first place" "regular file" "$planted"
+  stat -c %F /opt/data/profiles/platform'
+check "the running sandbox refuses the plant" "Device or resource busy" \
+  "$("${SSH[@]}" "$PLANT_HOME_FILE" 2>&1)"
+planted=$(plant_offline "$PLANT_HOME_FILE" 2>&1)
+check "a volume can carry the file in the first place" "regular file" "$planted"
 start_sandbox || exit 1
-check "the start says it moved it aside" "was not a directory" \
-  "$(docker logs "$NAME" 2>&1)"
-check "the home root is a directory again" "directory" \
-  "$(docker exec "$NAME" stat -c '%F' /opt/data/profiles/platform 2>&1)"
-check "with the image's trees back inside it" "scripts" \
-  "$("${SSH[@]}" 'ls /opt/data/profiles/platform' 2>&1)"
+check "the prepare step says it moved it aside" "was not a directory" "$PREPARE_LOG"
+check "the home root is a directory the agent owns again" "directory 1000" \
+  "$(docker exec "$NAME" stat -c '%F %u' /opt/data/profiles/platform 2>&1)"
+check_trees_from_image "after the planted file"
 # Moved, not deleted. Broken state either way, but it is the model's own byte.
 check "and the displaced copy is still readable" "the model put a file here" \
   "$("${SSH[@]}" 'cat /opt/data/profiles/platform.displaced-*' 2>&1)"
@@ -849,11 +1085,21 @@ sqlite3.connect(\"/opt/data/kanban.db\").execute(\"select name from sqlite_maste
 "' 2>&1)"
 check "and says where the board actually is" "kanban_show" \
   "$("${SSH[@]}" 'cat /opt/data/kanban.db/NOT-THE-AGENT-POD-DATABASE.txt' 2>&1)"
-# Sections 9 and 10 plant with `rm -rf /opt/data/profiles`, so a root-owned
-# read-only tripwire inside a profile home breaks them -- and sandbox_mirror.py
-# with them. It is the model's volume; the tripwire is the model's too.
-check "the model can still clear a profile home it stands in" "gone" \
-  "$("${SSH[@]}" 'rm -rf /opt/data/profiles && echo gone' 2>&1)"
+# The tripwire is the model's, like everything in its home but the image trees.
+# Root-owned would buy nothing -- the directory is what makes sqlite3 raise --
+# and a worker that removes one has read the note saying why it is there. The
+# next start puts it back.
+check "the model can still remove a tripwire in a profile home" "gone" \
+  "$("${SSH[@]}" 'rm -rf /opt/data/profiles/platform/kanban.db && echo gone' 2>&1)"
+# What it cannot remove is the home around the trees. rm -rf descends into each
+# read-only tree, fails on the first file there, and leaves every directory above
+# it standing: profiles/ and profiles/platform are pinned so the trees cannot
+# go with them.
+removed=$("${SSH[@]}" 'rm -rf /opt/data/profiles; echo "rc=$?"' 2>&1)
+check "a profile home cannot be removed from under its mounts" "Read-only file system" "$removed"
+check_absent "and rm says it failed" "rc=0" "$removed"
+check "the home and its trees are still there" "intact" \
+  "$("${SSH[@]}" 'test -d /opt/data/profiles/platform && test -f /opt/data/profiles/platform/scripts/forge.py && echo intact' 2>&1)"
 
 echo
 docker image inspect "$IMAGE" --format '{{len .RootFS.Layers}} {{.Size}}' 2>/dev/null |

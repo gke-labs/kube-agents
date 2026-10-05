@@ -51,10 +51,11 @@ sys.path.append(str(Path(__file__).resolve().parent))
 
 import credential_proxy_client  # noqa: E402
 
-# The sandbox's own git, off PATH on purpose. `git` on PATH is the
-# credential-proxy shim and runs in the broker; this one runs here, against a
-# working copy with no remote, and is never given a URL.
-# deploy/sandbox/Dockerfile says why the two are different binaries.
+# The sandbox's own git, by its real path. `git` on PATH is the hardened
+# wrapper around this same binary (/opt/vcs/bin/git); the verbs call it
+# directly and apply their own hardening. Either way it runs here, against a
+# working copy with no remote, and is never given a URL or a credential.
+# deploy/sandbox/Dockerfile says how the two are laid out.
 LOCAL_GIT = os.environ.get("KUBE_AGENTS_LOCAL_GIT", "/opt/vcs/libexec/git")
 
 ROOT = Path(os.environ.get("KUBE_AGENTS_VCS_ROOT", "/opt/data/scratch/vcs"))

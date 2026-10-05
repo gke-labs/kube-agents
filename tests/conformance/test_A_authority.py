@@ -13,6 +13,7 @@ mechanism is different, because these assertions run without a cluster.
 
 from __future__ import annotations
 
+import asyncio
 import re
 import textwrap
 import unittest
@@ -477,42 +478,57 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         to report as absent while the served config still carried it.
         """
         source = h.text("a2a_identities")
+        consts = cls._go_string_consts(source, h.text("a2a_jetstream_grants"))
         grants = {}
         for builder in re.findall(r"^func (\w+Identity)\(", source, re.MULTILINE):
             body = h.go_function_body(source, builder)
-            user = re.search(r'user:\s*"([^"]+)"', body)
-            if user is None:
-                # A5's two halves of the old `worker` name themselves through
-                # constants, because the operator renders one of them into an
-                # env var the `a2a` CLI reads back. Resolve the constant out of
-                # the same file rather than reporting the builder as nameless.
-                ref = re.search(r"user:\s*(a2a\w+),", body)
-                if ref is None:
-                    raise AssertionError(f"{builder} renders no user name")
-                user = re.search(rf'\n\t{ref.group(1)} = "([^"]+)"', source)
-                if user is None:
-                    raise AssertionError(
-                        f"{builder} names its user through {ref.group(1)}, which this file does not declare"
-                    )
+            # A5's two halves of the old `worker` name themselves through
+            # constants, because the operator renders one of them into an env
+            # var the `a2a` CLI reads back, and the verifier does the same so
+            # that the callout contract and the render agree on one spelling.
+            # Resolve the expression rather than reporting either as nameless.
+            expr = re.search(r"\n\t\tuser:\s*(\S+?),", body)
+            if expr is None:
+                raise AssertionError(f"{builder} renders no user name")
+            name = cls._resolve_expr(expr.group(1), consts)
+            if name is None:
+                raise AssertionError(
+                    f"{builder} names its user as `{expr.group(1)}`, which this test cannot resolve"
+                )
             field = re.search(r"\n\t\tpublish:\s*(\[\]string\{.*?\n\t\t\}|\w+),", body, re.DOTALL)
             if field is None:
-                grants[user.group(1)] = ([], True)
+                grants[name] = ([], True)
             elif field.group(1).startswith("[]string{"):
-                grants[user.group(1)] = (re.findall(r'"([^"]+)"', field.group(1)), True)
+                # Entry by entry rather than scraping every quoted run out of
+                # the block, because a concatenated entry scraped that way
+                # yields its fragments -- `_INBOX.` and `.>` as two separate
+                # "grants", neither of which is a subject anything holds.
+                literal = field.group(1)
+                inner = re.sub(r"//[^\n]*", "", literal[literal.index("{") + 1 : literal.rindex("}")])
+                read, complete = [], True
+                for element in inner.split(","):
+                    if not element.strip():
+                        continue
+                    value = cls._resolve_expr(element, consts)
+                    if value is None:
+                        complete = False
+                    else:
+                        read.append(value)
+                grants[name] = (read, complete)
             else:
-                name = field.group(1)
+                var = field.group(1)
                 regions = re.findall(
-                    rf"\n\t{name} :?= (?:append\({name}, )?\[?\]?string?\{{?(.*?)\n\t[}}\)]",
+                    rf"\n\t{var} :?= (?:append\({var}, )?\[?\]?string?\{{?(.*?)\n\t[}}\)]",
                     body,
                     re.DOTALL,
                 )
                 if not regions:
-                    raise AssertionError(f"{builder} builds `{name}` in a shape this test cannot read")
+                    raise AssertionError(f"{builder} builds `{var}` in a shape this test cannot read")
                 # Comments inside these blocks quote the very subjects they
                 # explain the absence of, so they are stripped before reading.
                 bare = [re.sub(r"//[^\n]*", "", r) for r in regions]
                 read = [g for r in bare for g in re.findall(r'"([^"]+)"', r)]
-                resolved, complete = cls._resolve_local_publish(body, name)
+                resolved, complete = cls._resolve_local_publish(body, var)
                 if complete:
                     # Every literal the naive scan saw must survive into the
                     # resolved reading -- as a whole grant, or as a piece of
@@ -524,11 +540,11 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
                     missing = [g for g in read if not any(g in r for r in resolved)]
                     if missing:
                         raise AssertionError(
-                            f"{builder}: resolving `{name}` lost {missing}; the resolver is not reading every append"
+                            f"{builder}: resolving `{var}` lost {missing}; the resolver is not reading every append"
                         )
-                    grants[user.group(1)] = (resolved, True)
+                    grants[name] = (resolved, True)
                 else:
-                    grants[user.group(1)] = (read, False)
+                    grants[name] = (read, False)
         return grants
 
     @staticmethod
@@ -654,8 +670,16 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         """
         conf = h.text("a2a_rendered_nats_conf")
         grants = {}
+        # The allow list alone, terminated on its own `]` rather than on the
+        # close of the `publish` block: a principal with a deny list has a
+        # second bracketed list inside that block, and reading to the block's
+        # end would report every denied subject as a grant. Subjects never
+        # contain `]`, so the character class cannot run past the list it is
+        # reading. Denies narrow what follows, so ignoring them can only
+        # over-report writers, and an over-report of this set fails loudly
+        # rather than passing quietly.
         for block in re.finditer(
-            r"user:\s*(\S+).*?publish\s*\{\s*allow\s*=\s*\[(.*?)\]\s*\}", conf, re.DOTALL
+            r"user:\s*(\S+).*?publish\s*\{\s*allow\s*=\s*\[([^\]]*)\]", conf, re.DOTALL
         ):
             grants[block.group(1)] = re.findall(r'"([^"]+)"', block.group(2))
         return grants
@@ -708,7 +732,7 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         assertion in this class vacuously.
         """
         grants = self._rendered_publish_grants()
-        for user in ("gateway", "agent", "bridge", "web", "seed", "provision"):
+        for user in ("gateway", "agent", "bridge", "web", "seed", "provision", "verifier"):
             self.assertIn(user, grants, f"{user} is no longer a rendered principal")
             self.assertTrue(grants[user], f"{user} renders no publish grants; the tests below go vacuous")
         self.assertEqual([], grants["session"], "the session entry's empty lists are load-bearing")
@@ -834,6 +858,124 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
             if any(self._subject_matches(g, self.EVENTS_PROBE) for g in grants)
         )
         self.assertEqual([], writers, f"rendered principals reaching an executor's events subject: {writers}")
+
+
+class _SlackClickAdapter:
+    """The slice of the Slack adapter a click handler touches, recording each call.
+
+    ``_begin_interaction`` stands in for the adapter's interactive
+    authorization: it acks, and returns the click's fields for a user on
+    ``allowed`` and None for anyone else, which is what the adapter returns for
+    a user its allowlist does not name.
+    """
+
+    def __init__(self, allowed: tuple[str, ...]) -> None:
+        self.allowed = allowed
+        self.listeners: list = []
+        self.asked: list[tuple[str, str]] = []
+        self.slack_calls: list[str] = []
+        self.turns: list[dict] = []
+        adapter = self
+
+        class _App:
+            def action(self, pattern):
+                def add(listener):
+                    adapter.listeners.append((pattern, listener))
+                    return listener
+
+                return add
+
+        class _Client:
+            async def chat_update(self, **kwargs):
+                adapter.slack_calls.append("chat_update")
+
+            async def chat_postMessage(self, **kwargs):
+                adapter.slack_calls.append("chat_postMessage")
+
+        self._app = _App()
+        self._client = _Client()
+
+    async def _begin_interaction(self, ack, body, action, kind):
+        await ack()
+        user = body["user"]["id"]
+        self.asked.append((user, kind))
+        if user not in self.allowed:
+            return None
+        message = body["message"]
+        return ("T1", action["action_id"], action.get("value"), message, message["ts"],
+                body["channel"]["id"], user, user)
+
+    def _is_ignored_channel(self, channel_id):
+        return False
+
+    def _slack_allowed_channels(self):
+        return set()
+
+    def _slack_disable_dms(self):
+        return False
+
+    def _get_client(self, chat_id, team_id=None):
+        return self._client
+
+    async def _handle_slack_message(self, event):
+        self.turns.append(event)
+
+
+class A3ASlackClickIsAuthorizedAsItsClicker(unittest.TestCase):
+    """A3 on a Slack button (``KAGE_SLACK_UX``): a click on one of our choice
+    buttons runs as a turn in the clicker's name, so the clicker is the
+    principal, and only the adapter's own authorization may say who that is.
+
+    A bot token posts every button, and anyone who can see the message can
+    click it. If the handler read the clicker from the payload and ran the
+    turn without asking the adapter, a user the install never allowlisted
+    would drive the agent by clicking where they could not by typing. The
+    adapter's interactive authorization answers None for such a user; the
+    handler must then do nothing at all: no rewrite marking the message
+    answered, no echo, no turn -- and leave the message answerable by someone
+    who is allowed.
+    """
+
+    CHANNEL = "C0KAGE"
+    MESSAGE_TS = "1700000000.000200"
+
+    def _click(self, adapter: _SlackClickAdapter, user: str) -> None:
+        action_id = "kage_needs.choice.0"
+        listeners = [fn for pattern, fn in adapter.listeners if pattern.search(action_id)]
+        self.assertEqual(len(listeners), 1, "no single listener answers a choice click")
+        acks = []
+
+        async def ack():
+            acks.append(True)
+
+        body = {
+            "user": {"id": user},
+            "channel": {"id": self.CHANNEL},
+            "message": {"ts": self.MESSAGE_TS, "text": "Which cluster?", "blocks": []},
+        }
+        action = {
+            "action_id": action_id,
+            "value": "seeded-a",
+            "text": {"type": "plain_text", "text": "seeded-a"},
+            "action_ts": f"{len(adapter.asked)}.1",
+        }
+        asyncio.run(listeners[0](ack, body, action))
+        self.assertEqual(len(acks), 1, "the click was not acked exactly once")
+
+    def test_A3_an_unlisted_users_click_changes_nothing(self) -> None:
+        clicks = h.slack_ux_clicks_module()
+        adapter = _SlackClickAdapter(allowed=("U_ALLOWED",))
+        clicks.register(adapter)
+
+        self._click(adapter, "U_UNLISTED")
+        self.assertEqual(adapter.asked, [("U_UNLISTED", clicks.CHOICE_KIND)],
+                         "the click never reached the adapter's authorization")
+        self.assertEqual(adapter.slack_calls, [], "a refused click rewrote or echoed in the thread")
+        self.assertEqual(adapter.turns, [], "a refused click ran a turn")
+
+        # Still answerable: the refused click did not spend the message.
+        self._click(adapter, "U_ALLOWED")
+        self.assertEqual([turn["user"] for turn in adapter.turns], ["U_ALLOWED"])
 
 
 class A4DelegationAttenuates(unittest.TestCase):

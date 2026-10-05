@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The eight validators every forge's verbs run on their arguments.
+"""The validators every forge's verbs run on their arguments.
 
 Shared rather than per-forge because the thing being validated is the caller's
 request, not the forge's API. `limit` bounds a page because a listing nobody
@@ -34,6 +34,10 @@ SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 # no caller reads to the end. A truncated listing says that it is truncated.
 DEFAULT_PAGE_SIZE = 30
 MAX_PAGE_SIZE = 100
+# A conversation is the exception: it is one thread, not a tracker, and the
+# caller reading it is deciding which requests it has already answered, so its
+# markers on a later page have to be seen. Read page by page up to this.
+MAX_CONVERSATION_SIZE = 1000
 
 
 def validate_branch(value: Any, field: str = "branch") -> str:
@@ -85,6 +89,15 @@ def validate_limit(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise WorkspaceError("limit must be a positive number of items")
     return min(value, MAX_PAGE_SIZE)
+
+
+def validate_comment_limit(value: Any) -> int:
+    """`validate_limit` for a conversation read, bounded by the thread size."""
+    if value is None:
+        return DEFAULT_PAGE_SIZE
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise WorkspaceError("limit must be a positive number of items")
+    return min(value, MAX_CONVERSATION_SIZE)
 
 
 def validate_page(value: Any) -> int:

@@ -133,6 +133,8 @@ ADDED_AFTER_THE_MOVED_BLOCK = [
     "vcs-review-feedback-read-back",
     # #1918: a second proposal under a branch name its first proposal spent.
     "vcs-spent-branch-reuse",
+    # #2201: a request for gh answered through the verbs.
+    "vcs-forge-cli-request-uses-the-verbs",
 ]
 # Registered after the moved block, in file order, by the pull request that
 # authored each case.
@@ -146,6 +148,10 @@ ADDED_AFTER_THE_MOVE = [
     "platform-worker-refuses-shipped-skill-edit",  # skill governance, #1848
     "chat-voice-ack-names-target",  # the front door's delegation ack
     "bootstrap-inventory-ranking-delivery",  # the onboarding prioritization stage, #2143
+    "chat-question-wake-stays-silent",  # SOUL §2 step 5's already-posted rule
+    "chat-question-typed-answer-fresh-session",  # a typed answer from a new thread session
+    "platform-worker-shell-edit-of-shipped-skill",  # the sandbox's image trees, #2096
+    "autoops-controller-stall-triage",  # the stall watch on the inject path
 ]
 
 # Admitted after the split, each by a pull request that cited the record

@@ -56,6 +56,8 @@ from kube_agents_bench.verifiers import (
     WorkerCommandsVerifier,
     LedgerIssueContainsVerifier,
     PullRequestOpenedVerifier,
+    ReplayCardVerifier,
+    ReplyIsSilentVerifier,
     ReportContainsVerifier,
     ToolCalledVerifier,
 )
@@ -221,6 +223,100 @@ def test_worker_commands_rejects_a_pattern_that_does_not_compile():
 
 def test_worker_commands_is_registered_under_its_type():
     assert "worker_commands" in VERIFIERS
+
+
+# ------------------------------------------------------------ replay_card
+
+
+def _stash_settled(result) -> None:
+    entry = {"name": "card_wake_settled", "args": {"card": "t_1"}, "result": result, "status": "harness"}
+    transcript.set("[SILENT]", _TRAJECTORY + [entry])
+
+
+def _replay_card(**fields) -> ReplayCardVerifier:
+    return ReplayCardVerifier(type="replay_card", **fields)
+
+
+def test_replay_card_passes_on_an_unblocked_card_carrying_the_answer():
+    _stash_settled({"status": "ready", "comments": [{"author": "default", "body": "Answer: Seeded-B"}]})
+    res = _replay_card(status_not_in=["blocked"], comment_phrases=["seeded-b"]).verify(5.0)
+    assert res.success, res.reason
+
+
+def test_replay_card_fails_on_a_card_left_blocked():
+    _stash_settled({"status": "blocked", "comments": [{"author": "default", "body": "seeded-b"}]})
+    res = _replay_card(status_not_in=["blocked"]).verify(5.0)
+    assert not res.success and res.status != "error"
+    assert "'blocked'" in res.reason
+
+
+def test_replay_card_fails_when_no_comment_carries_the_phrase():
+    _stash_settled({"status": "ready", "comments": []})
+    res = _replay_card(comment_phrases=["seeded-b"]).verify(5.0)
+    assert not res.success and res.status != "error"
+
+
+def test_replay_card_status_in_is_an_allow_list():
+    _stash_settled({"status": "todo", "comments": []})
+    assert not _replay_card(status_in=["ready", "running"]).verify(5.0).success
+
+
+@pytest.mark.parametrize("trajectory", [_TRAJECTORY, None])
+def test_replay_card_errors_without_a_replay_entry(trajectory):
+    if trajectory is None:
+        transcript.clear()
+    else:
+        transcript.set("ok", trajectory)
+    assert _replay_card(status_not_in=["blocked"]).verify(5.0).status == "error"
+
+
+def test_replay_card_errors_when_the_card_was_not_read():
+    _stash_settled(None)
+    res = _replay_card(status_not_in=["blocked"]).verify(5.0)
+    assert res.status == "error"
+    assert "unknown" in res.reason
+
+
+@pytest.mark.parametrize("status", [None, 3])
+def test_replay_card_errors_when_the_cards_status_was_not_read(status):
+    _stash_settled({"status": status, "comments": [{"author": "default", "body": "seeded-b"}]})
+    res = _replay_card(status_not_in=["blocked"], comment_phrases=["seeded-b"]).verify(5.0)
+    assert res.status == "error"
+    assert "unknown" in res.reason
+
+
+
+def test_replay_card_passes_on_a_decoy_left_blocked():
+    _stash_settled({"status": "ready", "comments": [{"author": "default", "body": "seeded-b"}], "decoy_status": "blocked"})
+    res = _replay_card(status_not_in=["blocked"], decoy_status_in=["blocked"]).verify(5.0)
+    assert res.success, res.reason
+
+
+def test_replay_card_fails_on_an_unblocked_decoy():
+    """The front door answered the wrong card: ``tool_called`` alone would pass this."""
+    _stash_settled({"status": "blocked", "comments": [], "decoy_status": "ready"})
+    res = _replay_card(decoy_status_in=["blocked"]).verify(5.0)
+    assert not res.success and res.status != "error"
+    assert "decoy" in res.reason and "'ready'" in res.reason
+
+
+def test_replay_card_errors_when_the_decoy_was_not_read():
+    _stash_settled({"status": "ready", "comments": []})
+    res = _replay_card(status_not_in=["blocked"], decoy_status_in=["blocked"]).verify(5.0)
+    assert res.status == "error"
+    assert "decoy" in res.reason
+
+def test_replay_card_must_assert_something():
+    with pytest.raises(ValidationError):
+        _replay_card()
+
+
+def test_replay_card_is_published_and_registered():
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject.open("rb") as fh:
+        eps = tomllib.load(fh)["project"]["entry-points"]["devops_bench.verifiers"]
+    assert eps["replay_card"] == "kube_agents_bench.verifiers:ReplayCardVerifier"
+    assert isinstance(parse_node({"type": "replay_card", "status_not_in": ["blocked"]}), ReplayCardVerifier)
 
 
 # ------------------------------------------------------------ worker_agents
@@ -1267,6 +1363,50 @@ def test_tool_called_sees_through_the_tool_call_wrapper():
     assert ToolCalledVerifier(type="tool_called", tool_names=["tool_call"], scope="workers").verify(5.0).status == "pass"
 
 
+def test_tool_called_sees_through_tool_call_wrapper_direct_name_shape():
+    # The recorded trajectory shape from worker session store: args has a top-level name
+    trajectory = [
+        {"name": "kanban_create", "args": {}, "status": "completed"},
+        {
+            "name": "tool_call",
+            "args": {
+                "name": "mcp__gke__get_k8s_resource",
+                "arguments": {
+                    "namespace": "checkout",
+                    "resourceType": "pod",
+                },
+            },
+            "status": "completed",
+            "agent": "platform",
+        },
+        {
+            "name": "tool_call",
+            "args": {"name": "mcp__platform_control__list_cluster_profiles", "arguments": {}},
+            "status": "completed",
+            "agent": "platform",
+        },
+        {"name": "kanban_complete", "args": {}, "status": "completed", "agent": "platform"},
+    ]
+    transcript.set("done", trajectory)
+    v1 = ToolCalledVerifier(
+        type="tool_called", tool_names=["mcp__gke__get_k8s_resource"], scope="workers"
+    )
+    assert v1.verify(5.0).status == "pass"
+
+    v2 = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["mcp__platform_control__list_cluster_profiles"],
+        scope="workers",
+    )
+    assert v2.verify(5.0).status == "pass"
+
+    # Uncalled tool returns fail
+    v3 = ToolCalledVerifier(
+        type="tool_called", tool_names=["mcp__gke__delete_k8s_resource"], scope="workers"
+    )
+    assert v3.verify(5.0).status == "fail"
+
+
 def test_tool_call_wrapper_with_malformed_args_matches_nothing():
     transcript.set(
         "done",
@@ -1299,6 +1439,99 @@ def test_tool_called_workers_scope_counts_only_the_tagged_entries():
     assert router_only.verify(5.0).status == "fail"
 
 
+def test_tool_called_workers_scope_filters_by_agent():
+    multi_agent_trajectory = [
+        {"name": "kanban_create", "args": {}, "status": "completed"},
+        {
+            "name": "mcp__gke__get_k8s_resource",
+            "args": {"name": "payments-api"},
+            "status": "completed",
+            "agent": "platform",
+        },
+        {
+            "name": "mcp__gke__get_k8s_resource",
+            "args": {"name": "payments-api"},
+            "status": "completed",
+            "agent": "cluster-seeded-a-east",
+        },
+    ]
+    transcript.set("done", multi_agent_trajectory)
+    # Filtered by agent: platform sees exactly 1 call
+    platform_only = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["mcp__gke__get_k8s_resource"],
+        scope="workers",
+        agent="platform",
+    ).verify(5.0)
+    assert platform_only.status == "pass" and platform_only.raw == {"matching_calls": 1}
+    assert "for agent 'platform'" in platform_only.reason
+
+    # Filtered by agent: cluster sees 1 call with regex
+    cluster_only = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["mcp__gke__get_k8s_resource"],
+        scope="workers",
+        agent=r"cluster-.+",
+    ).verify(5.0)
+    assert cluster_only.status == "pass" and cluster_only.raw == {"matching_calls": 1}
+
+    # If platform did not call the tool, minimum_calls=1 fails
+    no_cluster = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["nonexistent_tool"],
+        scope="workers",
+        agent="platform",
+    ).verify(5.0)
+    assert no_cluster.status == "fail" and no_cluster.raw == {"matching_calls": 0}
+
+
+def test_tool_called_agent_selector_matching_no_worker_is_fail():
+    multi_agent_trajectory = [
+        {"name": "kanban_create", "args": {}, "status": "completed"},
+        {
+            "name": "mcp__gke__get_k8s_resource",
+            "args": {"name": "payments-api"},
+            "status": "completed",
+            "agent": "cluster-seeded-a-east",
+        },
+    ]
+    transcript.set("done", multi_agent_trajectory)
+    res = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["mcp__gke__get_k8s_resource"],
+        scope="workers",
+        agent="platform",
+    ).verify(5.0)
+    assert res.status == "fail"
+    assert res.raw == {"matching_calls": 0}
+    assert "no worker trajectory entries matched agent selector" in res.reason
+    assert "seen agents: ['cluster-seeded-a-east']" in res.reason
+
+
+def test_tool_called_agent_selector_matching_no_worker_with_capture_gaps_is_error():
+    multi_agent_trajectory = [
+        {"name": "kanban_create", "args": {}, "status": "completed"},
+        {
+            "name": "mcp__gke__get_k8s_resource",
+            "args": {"name": "payments-api"},
+            "status": "completed",
+            "agent": "cluster-seeded-a-east",
+        },
+    ]
+    gap = "no session store for profile platform"
+    transcript.set("done", multi_agent_trajectory, worker_capture_gaps=[gap])
+    res = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["mcp__gke__get_k8s_resource"],
+        scope="workers",
+        agent="platform",
+    ).verify(5.0)
+    assert res.status == "error"
+    assert not res.success
+    assert gap in res.reason
+    assert "no worker trajectory entries matched agent selector 'platform'" in res.reason
+
+
 def test_tool_called_all_scope_counts_both():
     transcript.set("done", _WORKER_TAGGED)
     v = ToolCalledVerifier(
@@ -1322,6 +1555,40 @@ def test_tool_called_workers_scope_without_a_capture_is_error_not_pass():
 def test_tool_called_rejects_an_unknown_scope():
     with pytest.raises(ValidationError):
         ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"], scope="fleet")
+
+
+def test_tool_called_rejects_empty_agent_pattern():
+    with pytest.raises(ValidationError):
+        ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"], agent="", scope="workers")
+
+
+@pytest.mark.parametrize("pattern", [".*", "platform|", "(cluster-.+)?", "^$"])
+def test_tool_called_rejects_empty_matching_agent_pattern(pattern):
+    with pytest.raises(ValidationError, match="matches empty string"):
+        ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"], agent=pattern, scope="workers")
+
+
+def test_tool_called_all_scope_agent_filter_ignores_untagged_router_entries():
+    transcript.set("done", _WORKER_TAGGED)
+    # kanban_create was called by the router (untagged), but NOT by agent 'platform'.
+    # Under scope: all with agent: platform, it must not count the router turn.
+    res = ToolCalledVerifier(
+        type="tool_called", tool_names=["kanban_create"], scope="all", agent="platform"
+    ).verify(5.0)
+    assert res.status == "fail" and res.raw == {"matching_calls": 0}
+
+    # kanban_complete was called by agent 'platform'. It passes.
+    res_platform = ToolCalledVerifier(
+        type="tool_called", tool_names=["kanban_complete"], scope="all", agent="platform"
+    ).verify(5.0)
+    assert res_platform.status == "pass" and res_platform.raw == {"matching_calls": 1}
+
+
+def test_tool_called_rejects_agent_filter_under_router_scope():
+    with pytest.raises(ValidationError):
+        ToolCalledVerifier(
+            type="tool_called", tool_names=["kanban_create"], scope="router", agent="platform"
+        )
 
 
 def test_a_workers_scope_none_safeguard_trips_on_the_workers_attempt():
@@ -3831,3 +4098,53 @@ def test_the_ack_voice_objectives_read_the_whole_closing_message(final_message):
 )
 def test_the_ack_voice_objectives_stop_at_the_delivered_sections(final_message):
     assert not _ack_voice_hits(final_message), final_message
+
+
+
+# Hermes v2026.9.14 is_intentional_silence_response's verdicts on each reply,
+# taken from the real function (gateway/response_filters.py).
+_GATEWAY_SUPPRESSES = [
+    "[SILENT]", "SILENT", "NO_REPLY", "NO REPLY", "no_reply", "NO_REPLY\n", "**SILENT**", "*NO_REPLY*",
+    '"SILENT"', "'NO_REPLY'", "(SILENT)", "\u201cSILENT\u201d", "\u2014SILENT\u2014", "\u2013 SILENT",
+    "SILENT\u2026", "...SILENT...", ". SILENT .", "#SILENT", "/SILENT", "@SILENT", "&SILENT", "SILENT%",
+    "NO\nREPLY", "NO  REPLY!", "silent.", "[SILENT].", ".[SILENT]", "- SILENT", "Silent", " SILENT",
+    "\uff0aSILENT\uff0a", "\u00a1SILENT!", "\u00bfSILENT?", "_SILENT_", "\u00a0SILENT", "SILENT\r\n",
+    "SILENT" + " " * 70,
+]
+_GATEWAY_POSTS = [
+    "", "  \n", "`[SILENT]`", "`SILENT`", "`NO_REPLY`", "```\nSILENT\n```", "[ SILENT ]", "[silent ]",
+    "[SILENT", "\U0001f515 SILENT", "SILENT \U0001f92b", "NOREPLY", "noreply", "SI_LENT", "NO*REPLY",
+    "N_O REPLY", ". . SILENT", "> SILENT", "SILENT\n\nok", "[SILENT] ok", "SILENT\u200b", "~SILENT~",
+    "+SILENT+", "<SILENT>", "x" * 70 + " SILENT", "Which should I look at: seeded-a or seeded-b?",
+]
+
+
+def _silent(reply: str):
+    transcript.set(reply, [], final_message=reply)
+    return ReplyIsSilentVerifier(type="reply_is_silent").verify(5)
+
+
+@pytest.mark.parametrize("reply", _GATEWAY_SUPPRESSES)
+def test_reply_is_silent_passes_what_the_gateway_suppresses(reply):
+    assert _silent(reply).success, repr(reply)
+
+
+@pytest.mark.parametrize("reply", _GATEWAY_POSTS)
+def test_reply_is_silent_fails_what_the_gateway_posts(reply):
+    res = _silent(reply)
+    assert not res.success and res.status != "error", repr(reply)
+
+
+def test_reply_is_silent_reads_the_final_message_not_the_output():
+    transcript.set("Which cluster?", [], final_message="[SILENT]")
+    assert ReplyIsSilentVerifier(type="reply_is_silent").verify(5).success
+
+
+def test_reply_is_silent_without_a_transcript_is_an_error():
+    assert ReplyIsSilentVerifier(type="reply_is_silent").verify(5).status == "error"
+
+
+def test_the_question_wake_case_grades_silence_with_the_gateway_predicate():
+    spec = yaml.safe_load((TASKS / "chat-question-wake-stays-silent" / "task.yaml").read_text())
+    entries = [e for e in spec["verification_spec"] if e["name"] == "the-wake-reply-is-silent"]
+    assert [e["check"] for e in entries] == [{"type": "reply_is_silent"}]

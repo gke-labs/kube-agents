@@ -153,9 +153,10 @@ class ExclusionRules(unittest.TestCase):
             self.assertIsNotNone(sm.is_excluded(name), name)
 
     def test_image_owned_trees_never_cross(self):
-        # The sandbox entrypoint replaces these from /opt/defaults on every
-        # start, so a copy from the agent pod is undone at the next restart at
-        # best and shadows a newer image at worst.
+        # The sandbox stages these from /opt/defaults on every pod start and,
+        # under the operator, mounts them read-only in the shell, so a copy from
+        # the agent pod fails against the mount there, is undone at the next
+        # restart elsewhere, and shadows a newer image at worst.
         for name in ("skills", "governance", "scripts"):
             self.assertEqual(sm.is_excluded(name), "delivered by the sandbox image", name)
 
@@ -586,13 +587,14 @@ class MigrationMarker(unittest.TestCase):
 class Skeleton(unittest.TestCase):
     """The layout push, against a real filesystem with `sh -c` as the SSH hop.
 
-    Everything below the sandbox's /opt/data is owned by uid 1000, so the model
-    decides what is sitting on a skeleton path when this runs. A plain
-    `mkdir -p` returned 1 for any of it, the entrypoint turned that into
-    `exit 1` for the whole gateway container, and nothing on either side ever
-    cleared it -- the sandbox entrypoint only unlinks symlinks and only rewrites
-    the trees it ships in /opt/defaults. `touch /opt/data/scratch` from a sandbox
-    shell was a permanent CrashLoopBackOff the agent could not repair.
+    Everything below the sandbox's /opt/data except the image's read-only trees
+    is owned by uid 1000, so the model decides what is sitting on a skeleton
+    path when this runs. A plain `mkdir -p` returned 1 for any of it, the
+    entrypoint turned that into `exit 1` for the whole gateway container, and
+    nothing on either side ever cleared it -- the sandbox entrypoint only
+    unlinks symlinks and only rewrites the trees it ships in /opt/defaults.
+    `touch /opt/data/scratch` from a sandbox shell was a permanent
+    CrashLoopBackOff the agent could not repair.
     """
 
     def setUp(self):

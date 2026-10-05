@@ -6830,6 +6830,7 @@ class DomainScopedFlagsTest(unittest.TestCase):
         "--scope-organizations": ("PARAM_SCOPE_ORGANIZATIONS", "987654321098"),
         "--scope-shared-vpc-hosts": ("PARAM_SCOPE_SHARED_VPC_HOSTS", "shared-net-host"),
         "--scope-metrics-scopes": ("PARAM_SCOPE_METRICS_SCOPES", "observability-hub"),
+        "--scope-max-projects": ("PARAM_SCOPE_MAX_PROJECTS", "250"),
         "--scope-exclude-projects": ("PARAM_SCOPE_EXCLUDE_PROJECTS", "*-sandbox"),
         "--scope-exclude-clusters": ("PARAM_SCOPE_EXCLUDE_CLUSTERS", "payments-staging/us-central1/scratch"),
     }
@@ -7137,17 +7138,23 @@ class DomainScopedFlagsTest(unittest.TestCase):
             self.assertIn("whatever the calling shell still exports", combined)
             self.assertNotIn("from the file alone", combined)
 
-    def test_the_drift_detector_warning_reaches_an_exported_value(self):
-        """The environment is a supported route, and it bypassed the guard.
+    def test_an_exported_on_over_a_silent_file_is_what_the_install_does_anyway(self):
+        """The warning this used to produce was the old default's, and the
+        hazard behind it is the one flipping the default removed.
 
-        installer_common.sh documents precedence as install.defaults.env → an
-        exported environment variable → install.env → a flag, and install.env
-        only outranks the export for a key it actually assigns. So
         `ENABLE_DRIFT_DETECTOR=true ./install.sh` over a file predating the key
-        provisions the sink, topic and subscription, and the next upgrade.sh --
-        run from a shell without that export, reading the file alone --
-        destroys them under -auto-approve. A guard keyed on "was the flag
-        typed" cannot see this run at all.
+        provisions the sink, topic and subscription and records nothing. While
+        DEFAULT_ENABLE_DRIFT_DETECTOR was false, the next upgrade.sh from a
+        shell without that export read the file alone, wrote neither tfvars key
+        and destroyed the trio under -auto-approve -- so this run was a
+        reversal waiting to happen and the guard said so.
+
+        With the default true that run falls to the default, writes both keys
+        and keeps the trio. The export now agrees with what every later run
+        does from any shell, so there is no reversal left to announce and the
+        guard says nothing. Warning here anyway would hand the operator a
+        destructive consequence for a run that takes nothing from them, which
+        is how the next warning gets discounted.
         """
         with tempfile.TemporaryDirectory() as tmp:
             destination = pathlib.Path(tmp) / "existing.env"
@@ -7160,10 +7167,161 @@ class DomainScopedFlagsTest(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
             combined = proc.stdout + proc.stderr
+            self.assertNotIn("ENABLE_DRIFT_DETECTOR", combined)
+            self.assertNotIn("applies to this run only", combined)
+
+    def test_the_drift_detector_warning_still_reaches_an_exported_value(self):
+        """The environment is a supported route and must stay visible to the
+        guard, which the test above no longer proves on its own.
+
+        installer_common.sh documents precedence as install.defaults.env → an
+        exported environment variable → install.env → a flag, and install.env
+        only outranks the export for a key it actually assigns. A guard keyed
+        on "was the flag typed" cannot see the export at all; the one above is
+        silent for a reason that would also hold if the guard were blind, so
+        the export needs a case where it still produces a warning.
+
+        This is that case, and it only works because the cascade reads the
+        export by emptiness rather than truthiness. The shell exports `false`
+        and the flag says true, so a later run from this shell re-reads the
+        export and destroys the trio -- but an exported `false` read as
+        "nobody said anything" would fall through to the default, conclude
+        that a later run turns the detector on, and stay silent about exactly
+        the reversal this guard exists for.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\n")
+            proc = self._parse(
+                "--enable-drift-detector",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+                env={"ENABLE_DRIFT_DETECTOR": "false"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
             self.assertIn("applies to this run only", combined)
             self.assertIn("records no ENABLE_DRIFT_DETECTOR", combined)
-            self.assertIn("a later run without it writes neither", combined)
             self.assertIn("the apply destroys", combined)
+            # The export named as the source, not the file and not the
+            # default: it is what a later run from this shell reads back, and
+            # it is not a line the operator can edit in install.env.
+            self.assertIn("the ENABLE_DRIFT_DETECTOR=false this shell exports", combined)
+
+    def test_turning_it_off_over_a_silent_file_warns_that_the_default_undoes_it(self):
+        """The reversal the flipped default created, and the one case here
+        that is silent in the wrong direction if nobody thinks about it.
+
+        `--enable-drift-detector=false` over an install.env that records no
+        ENABLE_DRIFT_DETECTOR used to be the harmless arm: this run wrote
+        neither tfvars key and so would every later run, so there was nothing
+        to announce and the call site deliberately blanked the chosen value to
+        keep the guard quiet.
+
+        With the default true that is exactly backwards. This function never
+        rewrites an existing file, so the =false is recorded nowhere; the next
+        install.sh or upgrade.sh finds the file still silent, falls to
+        DEFAULT_ENABLE_DRIFT_DETECTOR and provisions the Log Router sink, the
+        drift-audit topic and its subscription. The operator's opt-out expires
+        without a word, on the front door that takes no flag to repeat it.
+        Leaving the old blanking in place is a change nobody can see until
+        their audit records start being exported again.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\n")
+            proc = self._parse(
+                "--enable-drift-detector=false",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("applies to this run only", combined)
+            self.assertIn("records no ENABLE_DRIFT_DETECTOR", combined)
+            # The default named as what brings it back, because the operator
+            # cannot act on "a later run": there is no line in their file to
+            # edit and no export to drop, so the remedy is to write one.
+            self.assertIn("the shipped ENABLE_DRIFT_DETECTOR default (true)", combined)
+            self.assertIn("provisions them again, empty", combined)
+            self.assertIn("Set ENABLE_DRIFT_DETECTOR=false in", combined)
+            self.assertIn("upgrade.sh takes no such flag", combined)
+            # Hedged, not asserted. The other two turning-off strings are
+            # about a trio something asked for; here nothing ever did, so on
+            # the first run after the default flipped there is none to destroy
+            # and promising its loss is a claim the apply does not support.
+            self.assertIn("if a run since the detector became the default", combined)
+
+    def test_turning_it_off_over_a_blank_line_warns_the_same_way(self):
+        """A file line with no value is the silent file's other spelling, and
+        the two readers of it have to agree.
+
+        write_tfvars_from_state takes the key as ${ENABLE_DRIFT_DETECTOR:-...},
+        so `ENABLE_DRIFT_DETECTOR=` resolves to the default and the next run
+        provisions the sink, topic and subscription -- the same reversal the
+        test above pins for a file that omits the key. install_env_records_key
+        answers yes for a key assigned empty, though, so without
+        empty_is_unrecorded the guard read that "" as a recorded `false`,
+        agreed with the flag and printed nothing: the one shape of the
+        turning-off case it could not see.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\nENABLE_DRIFT_DETECTOR=\n")
+            proc = self._parse(
+                "--enable-drift-detector=false",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("applies to this run only", combined)
+            # Not "records ENABLE_DRIFT_DETECTOR=", which is what the recorded
+            # branch would print and would name an empty value as the reason.
+            self.assertIn("records no ENABLE_DRIFT_DETECTOR", combined)
+            self.assertIn("the shipped ENABLE_DRIFT_DETECTOR default (true)", combined)
+            self.assertIn("Set ENABLE_DRIFT_DETECTOR=false in", combined)
+
+    def test_a_blank_line_for_a_default_false_key_is_still_read_as_off(self):
+        """empty_is_unrecorded is opt-in, and this is what it must not change.
+
+        ENABLE_GKE_BACKUP_PLAN defaults to false, so a blank line really does
+        resolve to off and a --enable-gke-backup-plan=false agrees with it.
+        Warning there would report a reversal that cannot happen.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\nENABLE_GKE_BACKUP_PLAN=\n")
+            proc = self._parse(
+                "--enable-gke-backup-plan=false",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertNotIn("ENABLE_GKE_BACKUP_PLAN", combined)
+
+    def test_turning_it_on_over_a_silent_file_says_nothing_now(self):
+        """The other half of the swap: the arm that used to warn and must not.
+
+        While the default was false, `--enable-drift-detector` over a file
+        recording nothing was a reversal -- this run provisioned the trio and
+        the next run without the flag destroyed it -- and the guard's whole
+        reason for existing was to say so. The default now does what the flag
+        does, so the flag changes nothing about any later run and there is no
+        consequence to report.
+
+        Pinned because the failure is invisible: a warning left here tells
+        every operator who passes the flag that their audit records are about
+        to be destroyed by a run that will in fact keep them.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\n")
+            proc = self._parse(
+                "--enable-drift-detector",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertNotIn("ENABLE_DRIFT_DETECTOR", combined)
+            self.assertNotIn("applies to this run only", combined)
 
     def test_turning_the_drift_detector_off_says_this_apply_destroys_them(self):
         """The consequence is not symmetrical, and the timing inverts with it.
@@ -7286,7 +7444,12 @@ class DomainScopedFlagsTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
             combined = proc.stdout + proc.stderr
             self.assertIn("applies to this run only", combined)
-            self.assertIn("a later run without it writes neither", combined)
+            # The source is named between the two halves of this clause now:
+            # a later run reads the key back from the file here, but from the
+            # shell or the shipped default when the file is silent, and the
+            # operator cannot act on the warning without being told which.
+            self.assertIn("a later run without it re-reads", combined)
+            self.assertIn("writes neither and stops the detector", combined)
             self.assertIn("keeps the Log Router sink", combined)
             self.assertNotIn("destroys", combined)
 
@@ -7740,23 +7903,13 @@ class DomainScopedFlagsTest(unittest.TestCase):
             self.assertIn("the apply destroys", combined)
             self.assertNotIn("keeps the Log Router sink", combined)
 
-    def test_turning_it_off_over_a_file_that_never_asked_says_nothing(self):
-        """Nothing diverges, so the destroyed-ingress line would be a lie.
-
-        A file with no ENABLE_DRIFT_DETECTOR line and a typed `=false` agree:
-        this run writes neither tfvars key and so would every later run. The
-        helper's unrecorded branch fires on any non-empty value, so the call
-        site has to withhold the value rather than let it print.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            destination = pathlib.Path(tmp) / "existing.env"
-            destination.write_text("PROJECT_ID=p\n")
-            proc = self._parse(
-                "--enable-drift-detector=false",
-                f'bootstrap_install_env_file "{destination}" v1.2.3',
-            )
-            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
-            self.assertNotIn("ENABLE_DRIFT_DETECTOR", proc.stdout + proc.stderr)
+    # The case that was here -- `=false` over a file with no
+    # ENABLE_DRIFT_DETECTOR line -- asserted silence, on the reasoning that
+    # this run writes neither tfvars key and so would every later run. The
+    # second half stopped being true when DEFAULT_ENABLE_DRIFT_DETECTOR
+    # flipped. It is now
+    # test_turning_it_off_over_a_silent_file_warns_that_the_default_undoes_it,
+    # in this class, asserting the warning.
 
     def test_turning_it_off_over_an_exported_value_is_still_a_reversal(self):
         """A silent file is not the same as nobody asking for the detector.
@@ -7812,12 +7965,14 @@ class DomainScopedFlagsTest(unittest.TestCase):
         the file line counts.
 
         No caveat here, and that is the assertion. The file records the
-        detector on, so the run from a clean shell the caveat warns about
+        detector on, so the run from a clean shell the caveat warned about
         re-reads that line, writes both drift tfvars keys and provisions the
         ingress -- which is what the rest of this same sentence promises when
-        it says a later run starts the detector again. The caveat holds only
-        where the shell is the last thing holding the trio up, which is the
-        test below.
+        it says a later run starts the detector again. There is no longer any
+        arrangement in which the caveat holds, because a clean-shell run that
+        finds the file silent now falls to DEFAULT_ENABLE_DRIFT_DETECTOR and
+        provisions the trio too; the test below is the arrangement it used to
+        hold for, asserting its absence.
         """
         with tempfile.TemporaryDirectory() as tmp:
             destination = pathlib.Path(tmp) / "existing.env"
@@ -7836,27 +7991,30 @@ class DomainScopedFlagsTest(unittest.TestCase):
             self.assertNotIn("records neither key as on", combined)
             self.assertNotIn("destroys them", combined)
 
-    def test_the_caveat_lands_when_the_shell_is_holding_up_both_halves(self):
-        """The one arrangement where the next clean shell really does take it.
+    def test_the_shell_holding_up_both_halves_no_longer_gets_a_caveat(self):
+        """The arrangement the caveat was written for, and why it has none now.
 
         Nothing in install.env: the detector is on because this shell exports
         ENABLE_DRIFT_DETECTOR, and the ingress stands because the same shell
-        exports TF_VAR_enable_drift_pubsub. A later run from a shell with
-        neither reads neither, writes neither tfvars key, and
-        enable_drift_pubsub falls to its false default -- so the caveat is the
-        whole warning, and the sentence it joins names the export rather than
-        the file as what brings the detector back.
+        exports TF_VAR_enable_drift_pubsub. While DEFAULT_ENABLE_DRIFT_DETECTOR
+        was false this was the one arrangement where the next clean shell
+        really did take the trio -- it read neither key, wrote neither tfvars
+        key, and enable_drift_pubsub fell to its false default -- so the
+        warning carried a caveat saying exactly that.
 
-        Both exports, which is the assertion this test exists for. A later run
-        that drops only TF_VAR_enable_drift_pubsub and keeps
-        ENABLE_DRIFT_DETECTOR=true seeds PARAM_ENABLE_DRIFT_DETECTOR, and
-        write_tfvars_from_state writes `enable_drift_pubsub = true` from it
-        (test_tfvars_writes_both_drift_keys_when_the_detector_is_on in
-        tests/test_installer_common.py) -- the trio is provisioned, not
-        destroyed. A caveat naming the TF_VAR_ export alone would promise that
-        operator a loss they do not take, and contradict its own next clause,
-        which tells them a later run re-reads the export and starts the
-        detector again.
+        The default is true now, so that clean-shell run falls to it, writes
+        both drift tfvars keys and provisions the trio. "The first run from a
+        shell exporting neither destroys them" is therefore false on the only
+        path that could still reach it, and it was spliced in front of a clause
+        promising that a later run starts the detector again -- the warning
+        would have contradicted itself in consecutive sentences. The caveat is
+        gone rather than reworded: with the default on, no arrangement is left
+        in which dropping the exports loses the trio.
+
+        What survives is the rest of the sentence, which was always true and
+        still is: this run stops the detector, the TF_VAR_ export keeps the
+        trio standing through this apply, and a later run re-reads the export
+        and starts the detector again.
         """
         with tempfile.TemporaryDirectory() as tmp:
             destination = pathlib.Path(tmp) / "existing.env"
@@ -7874,19 +8032,15 @@ class DomainScopedFlagsTest(unittest.TestCase):
             combined = proc.stdout + proc.stderr
             self.assertIn("it stops the detector now", combined)
             self.assertIn("this shell's environment", combined)
-            self.assertIn("records neither key as on", combined)
-            self.assertIn(
-                "keeping either ENABLE_DRIFT_DETECTOR or "
-                "TF_VAR_enable_drift_pubsub keeps them",
-                combined,
-            )
-            self.assertIn("from a shell exporting neither destroys them", combined)
-            # The wording this replaced, pinned as absent: it named the TF_VAR_
-            # export alone and so told an operator whose later shell keeps
-            # ENABLE_DRIFT_DETECTOR that their audit records go, which is the
-            # opposite of what that run does.
-            self.assertNotIn("from a shell without that export", combined)
             self.assertIn("this shell exports", combined)
+            # Every fragment the caveat was made of, pinned as absent. Asserted
+            # piecewise rather than as one string so that reinstating any part
+            # of it -- including the earlier wording that named the TF_VAR_
+            # export alone -- fails here rather than passing on a reword.
+            self.assertNotIn("records neither key as on", combined)
+            self.assertNotIn("keeping either ENABLE_DRIFT_DETECTOR", combined)
+            self.assertNotIn("exporting neither destroys them", combined)
+            self.assertNotIn("from a shell without that export", combined)
 
     def test_an_unchosen_drift_detector_key_stays_empty_and_says_nothing(self):
         """Empty through resolve_shared_defaults is what keeps this quiet.
@@ -8929,7 +9083,7 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
             cwd=str(_REPO_ROOT),
         )
 
-    def test_a_first_install_records_the_seven_keys_even_when_empty(self):
+    def test_a_first_install_records_the_eight_keys_even_when_empty(self):
         with tempfile.TemporaryDirectory() as tmp:
             dest = pathlib.Path(tmp) / "new.install.env"
             loaded = pathlib.Path(tmp) / "loaded.install.env"
@@ -8948,6 +9102,7 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_ORGANIZATIONS=''$", re.MULTILINE))
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_SHARED_VPC_HOSTS=shared-net-host$", re.MULTILINE))
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_METRICS_SCOPES=''$", re.MULTILINE))
+            self.assertRegex(proc.stdout, re.compile(r"^SCOPE_MAX_PROJECTS=''$", re.MULTILINE))
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_EXCLUDE_PROJECTS=''$", re.MULTILINE))
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_EXCLUDE_CLUSTERS=''$", re.MULTILINE))
 
@@ -9070,6 +9225,7 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
                           ("--scope-organizations", "SCOPE_ORGANIZATIONS"),
                           ("--scope-shared-vpc-hosts", "SCOPE_SHARED_VPC_HOSTS"),
                           ("--scope-metrics-scopes", "SCOPE_METRICS_SCOPES"),
+                          ("--scope-max-projects", "SCOPE_MAX_PROJECTS"),
                           ("--scope-exclude-projects", "SCOPE_EXCLUDE_PROJECTS"),
                           ("--scope-exclude-clusters", "SCOPE_EXCLUDE_CLUSTERS")):
             for value in ("", ",", " ", " , "):
@@ -9092,7 +9248,7 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
         )
         help_text = proc.stdout + proc.stderr
         for flag in ("--scope-projects=IDS", "--scope-folders=IDS", "--scope-organizations=IDS",
-                     "--scope-shared-vpc-hosts=IDS", "--scope-metrics-scopes=IDS",
+                     "--scope-shared-vpc-hosts=IDS", "--scope-metrics-scopes=IDS", "--scope-max-projects=N",
                      "--scope-exclude-projects=IDS", "--scope-exclude-clusters=TRIPLES"):
             with self.subTest(flag=flag):
                 self.assertIn(flag, help_text)
@@ -9256,7 +9412,7 @@ print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-cent
         self.assertIn("The live-scope check does not run here", self.text)
         handoff = self.text[self.text.index("The live-scope check does not run here"):]
         handoff = handoff[:handoff.index("3. Out-of-Terraform post-apply steps")]
-        for phrase in ("SCOPE_PROJECTS, SCOPE_FOLDERS,", "SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES and the two exclusions",
+        for phrase in ("SCOPE_PROJECTS, SCOPE_FOLDERS,", "SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_MAX_PROJECTS and the two exclusions",
                        "the reconcile", "retires what it drops", "record it first", "preflight above does not refuse on this route"):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, handoff)

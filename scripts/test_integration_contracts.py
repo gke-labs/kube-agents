@@ -101,6 +101,8 @@ class SpecToolRegistryTest(unittest.TestCase):
             "kanban_complete",
             "kanban_block",
             "kanban_heartbeat",
+            "kanban_comment",
+            "kanban_unblock",
         },
         "*skill_manage_image_owned*": {"skill_manage"},
     }
@@ -118,6 +120,9 @@ class SpecToolRegistryTest(unittest.TestCase):
         # #1765: the 50-a-day Developer Knowledge method the personas forbid
         # and knowledge-grounding-sources-probe's safeguard names.
         ("developer_knowledge", "answer_query"),
+        # #953: read-only workload existence inspection across clusters
+        ("gke", "get_k8s_resource"),
+        ("gke", "describe_k8s_resource"),
     }
     REMOTE_TOOL_EVIDENCE = (
         "agents/platform/SOUL.md",

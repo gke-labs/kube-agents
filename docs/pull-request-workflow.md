@@ -349,9 +349,11 @@ gh api repos/gke-labs/kube-agents/pulls/<number>/comments/<comment-id>/replies \
 
 ## Resolving conversations
 
-Reply first — `AGENTS.md` says why — naming what changed and the commit that changed it. Then
-resolve. A pull request carrying both `lgtm` and `approved` with a thread still open also carries
-the `do-not-merge` label,
+Reply first — `AGENTS.md` says why — naming what changed and the commit that changed it, or, for a
+`kube-agents-bot` finding you decline with a user in the loop, the reason, which **Self-Review**
+gives too. Then resolve, except the description thread, which waits for the body edit described
+below. A pull request carrying both `lgtm` and `approved` with a thread still open also carries the
+`do-not-merge` label,
 applied by a workflow so that Tide does not spend the queue retrying a merge GitHub will refuse;
 resolving the last thread is what removes it ([how a change merges](#how-a-change-merges)).
 
@@ -377,7 +379,7 @@ query($pr: Int!) {
   reply to \(.comments.nodes[0].databaseId) — \(.comments.nodes[0].author.login): \(.comments.nodes[0].body | split("\n")[0])
   replies so far: \(.comments.nodes | length - 1)"'
 
-# Per thread, once the reply naming the fix is posted:
+# Per thread, once the reply is posted:
 gh api graphql -f query='
 mutation($thread: ID!) {
   resolveReviewThread(input: {threadId: $thread}) { thread { isResolved } }
@@ -424,9 +426,19 @@ authoritative about it. Read it there when the answer matters, and
 
 The two labels are the two people:
 
-- **`lgtm` is the reviewer's.** A GitHub "Approve" review sets it, and so does `/lgtm` in a comment.
-  This is what the auto-requested human reviewer is being asked for. Prow does not take an `/lgtm`
-  from the pull request's own author, so every change needs one other person however it is approved.
+- **`lgtm` is the reviewer's.** A GitHub "Approve" review sets it, and so does `/lgtm` in a comment
+  — from an account the [`OWNERS`](../OWNERS) files name under `reviewers` or `approvers` for one of
+  the changed paths, and from nobody else. The configuration lists this repository under
+  `owners.skip_collaborators`, so Prow ignores collaborator and organisation-member status for this
+  label: the `triage` the contributor agents hold does not make Prow set it, and anyone outside those
+  lists is answered with "adding LGTM is restricted to approvers and reviewers in OWNERS files",
+  whether they approved, requested changes, or typed the command. The reviewer half of that walk
+  falls through [`hack/OWNERS`](../hack/OWNERS), which sets `no_parent_owners` but names no
+  reviewers, so a change to the two presubmit roster files alone takes its `lgtm` from anyone in the
+  root lists as well as from `eval-crew`, while its `approved` stays `eval-crew`'s alone — the reason
+  the root approvers are repeated under `reviewers`. This is what the auto-requested human reviewer
+  is being asked for. Prow does not take an `/lgtm` from the pull request's own author, so every
+  change needs one other person from those lists however it is approved.
   `trusted_team_for_sticky_lgtm: Googlers` is configured, which means a push after the label lands
   strips it again unless the author is in that team, and the reviewer has to give it a second time.
 - **`approved` is an `OWNERS` approver's.** `/approve`, from someone in the `OWNERS` file governing
@@ -509,9 +521,18 @@ Every workflow behind one of those contexts also runs for a pull request whose b
 branch, and `tests/test_merge_group_triggers.py` fails if one is filtered back to `main`. A backport
 pull request branches from `upstream/release/<X.Y>` and targets it; the release runbook in
 `scripts/release/README.md` ("Patch releases from a release line") is what happens after it merges.
-Which contexts a `release/` branch _requires_ is a repository setting like `main`'s, read back with
-the same command and the branch substituted, URL-encoded (`release%2F0.8`); no `release/` branch
-carries one today, and a line needs it before its first backport merges.
+A `release/` branch requires the same contexts, but through a ruleset rather than its branch
+protection rule, so the command above prints nothing for a line: its protection rule has no
+`required_status_checks` at all. Read a line's contexts back with the branch substituted,
+URL-encoded:
+
+```bash
+gh api repos/gke-labs/kube-agents/rules/branches/release%2F0.8 \
+  --jq '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context'
+```
+
+The runbook section above says why the two differ, which three settings carry a line's
+protection, and what has to follow when `main`'s set changes.
 
 **A green smoke run stays valid when `main` moves — usually.** Tide credits a Prow presubmit only
 against the base SHA it ran on — crier records it as a `BaseSHA:<sha>` suffix on the commit status
@@ -619,8 +640,9 @@ robot that reviews under a user account re-reviews every push and files its foll
 `COMMENTED`, so a `CHANGES_REQUESTED` it once filed would otherwise stand for the life of the pull
 request and the check-run path would never request a human, and a review request outstanding to it
 is answered by the robot and cleared, so it counts as nobody asked. An approval from outside
-`OWNERS` is not a hand-off: it cannot produce the `approved` label, so it counts no more than a
-comment. Of these reasons, `/request-review` skips the verdict check alone (it also bypasses the
+`approvers` is not a hand-off: it cannot produce the `approved` label, so the auto-request counts it
+no more than a comment and still asks someone who can `/approve`. Of these reasons, `/request-review`
+skips the verdict check alone (it also bypasses the
 `AI Review` gate, per `AGENTS.md`) — a person has already read the pull request and asked — and when
 one of the other reasons still declines it, the comment gets 😕 and the run a warning annotation
 naming the reason. A periodic

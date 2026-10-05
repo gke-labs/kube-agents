@@ -107,26 +107,19 @@ RUN pip install --no-cache-dir pyyaml requests
 # `.git/config` that came with it -- out of the container holding the token.
 # See docs/designs/version-control-support.md.
 #
-# The binary lives at /opt/vcs/libexec/git and is on no PATH at all. It is
-# reached by absolute path from vcs_client.py -- see LOCAL_GIT there, and the
-# KUBE_AGENTS_LOCAL_GIT it reads -- and
-# by /usr/lib/git-core, which is git's compiled-in exec path rather than a PATH
-# directory. A bare `git` typed by the model still resolves to the credential
-# shim, exactly as it did before this layer existed.
+# The binary lives at /opt/vcs/libexec/git. vcs_client.py reaches it by that
+# absolute path -- see LOCAL_GIT there, and the KUBE_AGENTS_LOCAL_GIT it reads --
+# and git's own re-exec reaches it through /usr/lib/git-core, its compiled-in
+# exec path. The name `git` on PATH is /opt/vcs/bin/git, a wrapper that runs it
+# with hooks disarmed (deploy/sandbox/vcs-git.sh says what it covers and what it
+# does not). There is no credential shim named `git` or `gh` beside it: a shim
+# owning the name is how the agent leaves the abstraction, and the measurement
+# says so -- with the version-control skill loaded and a shim still on `git`,
+# agents still reached for the shim over the verbs.
+# docs/designs/version-control-support.md carries the reasoning.
 #
-# Giving the local binary the name `git` instead is the better arrangement and
-# it is still not done here. The rename has to travel with the last caller of
-# bare `git` moving onto the verbs, because until then the name has to keep
-# meaning the shim. submit_suggestion.py is off it as of this change;
-# gitops_workspace.py and fleet-audit's audit_report.py are not, so the rename
-# waits on them. docs/designs/version-control-support.md carries the reasoning, including
-# the measurement that motivates it: given the version-control skill and a shim
-# still owning the name, an agent answered 8 of 60 read probes through the shim
-# alone and issued 4 credentialed clones through it.
-#
-# What will make putting this git on a PATH safe is that it cannot present a
-# request to a forge, and that property is established now so the later change
-# is a PATH edit and nothing more. Git reaches a network three ways and each
+# What makes putting this git on a PATH safe is that it cannot present a
+# request to a forge. Git reaches a network three ways and each
 # gets its own answer; docs/designs/version-control-support.md §3 is the
 # argument, this is the mechanism.
 #
@@ -231,6 +224,14 @@ RUN apt-get update && \
     /opt/vcs/libexec/git clone -q /tmp/vcs-guard.bundle /tmp/vcs-guard-clone && \
     rm -rf /tmp/vcs-guard /tmp/vcs-guard.bundle /tmp/vcs-guard-clone
 
+# Root-owned and empty: the wrapper points `core.hooksPath` here, and a
+# directory the agent could write to would be a hooks directory it controls.
+COPY --chmod=0755 deploy/sandbox/vcs-git.sh /opt/vcs/bin/git
+COPY --chmod=0644 deploy/sandbox/vcs-path.sh /etc/profile.d/vcs-path.sh
+RUN mkdir -p /opt/vcs/share/no-hooks && \
+    chmod 0555 /opt/vcs/share/no-hooks && \
+    /opt/vcs/bin/git --version
+
 # The login the agent connects as. `usermod -p '*'` matters: useradd leaves a
 # '!' in /etc/shadow, which sshd reads as a locked account and refuses even for
 # public-key auth. '*' means "no password login is possible", which is what is
@@ -264,15 +265,18 @@ RUN apt-get update && \
 # authoritative skills come from /opt/defaults/skills (see the note further
 # down), and what Hermes pushes here is the wrong profile's tree anyway.
 #
-# The other half is a mount, and it is the half that makes this hold. The mode
-# here binds the directory; it does not bind the NAME. /home/agent is owned by
-# uid 1000, and removing a directory takes write on the parent rather than on
-# the directory, so `rmdir ~/.hermes && mkdir ~/.hermes` returns a writable one
-# to the model and the sync resumes on the next command. The operator mounts an
+# The mode binds the directory; it does not bind the NAME. Removing a directory
+# takes write on the parent rather than on the directory, so while /home/agent
+# was owned by uid 1000, `rmdir ~/.hermes && mkdir ~/.hermes` returned a writable
+# one to the model and the sync resumed on the next command. The home is
+# root-owned now (below), which stops that rmdir, and a mount is the second
+# layer, the one that also holds against root. The operator mounts an
 # empty read-only volume over this path (shellSandboxHermesHomePath in
 # k8s-operator/internal/controller/shell_sandbox_manifests.go), which makes the
 # rmdir EBUSY. A build of this image run outside that StatefulSet keeps the mode
-# and loses the guarantee.
+# and loses the guarantee. The image trees under /opt/data use the same pattern
+# for the same reason: root-owned files, and a read-only mount over each tree so
+# the model cannot swap the directory (deploy/sandbox/entrypoint.sh, step 1a).
 #
 # The far end degrades quietly, which is why this works from one side.
 # _ensure_remote_dirs runs `mkdir -p` and ignores the exit status; the push then
@@ -280,22 +284,43 @@ RUN apt-get update && \
 # logs a warning; and sync_back returns early on `not self._pushed_hashes and
 # not self._synced_files` without opening a connection at all. The cost is that
 # warning, once per sync cycle.
-RUN useradd --create-home --home-dir /home/agent --shell /bin/bash --uid 1000 agent && \
+#
+# /home/agent is root-owned and holds no dotfiles: --no-create-home skips
+# /etc/skel, and uid 1000 can create nothing in it. Every session in this pod
+# runs as `agent` and shares the home for as long as the container lives, and
+# several programs load code from it unasked. bash reads ~/.bashrc for the
+# `bash -c` that sshd starts ForceCommand with, before session-command.sh runs.
+# A login shell reads ~/.bash_profile, ~/.bash_login or ~/.profile, and
+# Debian's stock .profile puts ~/bin first on PATH. python3 imports
+# usercustomize and runs .pth files from the user site-packages under ~/.local.
+# With an agent-owned home, one session could plant any of these, and every
+# later session ran it. An environment variable can switch off some of these,
+# but not the first, and no list of them is complete. A home the model cannot
+# write covers all of them.
+#
+# .ssh is root-owned for the same reason, and so is the authorized_keys the
+# entrypoint installs there: an agent-owned file let the model authorise a key
+# of its own. sshd's StrictModes accepts root ownership at every level.
+# Nothing that runs here needs to write the home. Hermes works in
+# TERMINAL_CWD=/opt/data and /tmp, the credential-proxy client writes under
+# $HERMES_HOME, and vcs_client.py points HOME at a scratch directory of its own.
+RUN useradd --no-create-home --home-dir /home/agent --shell /bin/bash --uid 1000 agent && \
     usermod -p '*' agent && \
-    install -d -m 0700 -o agent -g agent /home/agent/.ssh && \
+    install -d -m 0755 -o root -g root /home/agent && \
+    install -d -m 0755 -o root -g root /home/agent/.ssh && \
     install -d -m 0555 -o root -g root /home/agent/.hermes && \
     install -d -m 0755 /run/sshd && \
     install -d -m 0755 -o agent -g agent /opt/data && \
     install -d -m 0700 -o root -g root /var/lib/sandbox-sshd
 
 # The second principal, for trusted code in the agent pod reaching in to run a
-# cluster command. It exists because `agent` cannot be used for that: `agent`
-# owns its own home directory, bash sources ~/.bashrc for a non-interactive
-# `ssh host cmd`, and the model can therefore choose what an agent-pod caller
-# sees — shadow a binary on PATH, and the forged output comes back as a trusted
-# tool result. Debian's stock guard at the top of .bashrc returns early for
-# non-interactive shells and hides this; the model owns the file and can delete
-# the guard.
+# cluster command. It exists because `agent` cannot be used for that. A caller
+# logged in as `agent` is the same uid as every process the model starts, and
+# works in directories the model owns (/opt/data, /tmp), so the model can choose
+# what that caller sees, and the forged output comes back as a trusted tool
+# result. The first such route was ~/.bashrc, which bash sources for a
+# non-interactive `ssh host cmd`. The home is root-owned now (above), but the
+# account split does not depend on every such route being found.
 #
 # Both principals are authorised by the same key. A second keypair would buy
 # nothing: the private half lives only in the agent pod, which the model has no
@@ -357,11 +382,12 @@ COPY --chmod=0755 deploy/sandbox/entrypoint.sh /usr/local/bin/sandbox-entrypoint
 COPY --chmod=0755 deploy/sandbox/session-command.sh /usr/local/bin/sandbox-session-command
 
 # What the agent's shell actually reads and runs, staged at /opt/defaults for the
-# entrypoint to force-sync onto the volume. Same two-part arrangement as the agent
-# image (deploy/shared/docker-entrypoint.sh steps 2a/2b): a PVC mounts over
+# entrypoint to copy onto the volume (step 1a). Same two-part arrangement as the
+# agent image (deploy/shared/docker-entrypoint.sh steps 2a/2b): a PVC mounts over
 # /opt/data and would otherwise shadow anything baked there, so the image keeps its
 # copy somewhere the mount cannot reach and the entrypoint puts it in place on
-# every start.
+# every start -- under the operator, from the init container, before the shell
+# mounts each tree read-only.
 #
 # It has to be here at all because the shell moved. A SKILL.md tells the model to
 # run `"$HERMES_HOME"/scripts/github_token_refresh.py`; before #737 that resolved
@@ -406,10 +432,7 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          a forge module answers it, so it imports vcs_client
 #                          rather than anything that speaks HTTP
 #   pr_triggers.py         imported by pr_conversation, imports forge
-#   github_token_refresh.py  named by SOUL.md as the token refresher the agent
-#                          runs by hand (`python3 ./scripts/github_token_refresh.py
-#                          <owner>/<repo>`), and imported for its `log` by
-#                          submit_suggestion
+#   github_token_refresh.py  imported for its `log` by submit_suggestion
 #   wif_credentials.py     imported by github_token_refresh, and reached only by
 #                          the branch the proxy container takes; here so that the
 #                          import at the top of that script resolves
@@ -421,16 +444,16 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          that read a whole tree — inspect-repository and
 #                          fleet-upgrade-verification's api_deprecation_scan, both
 #                          `ensure_workspace(..., lease=...)` — and by fleet-audit's
-#                          audit_report, which also proposes from it. That last one
-#                          is the consumer this migration does not move; every
-#                          other working copy that *proposes* a change is
-#                          `vcs_client`'s now
+#                          audit_report, whose directory-mode fallback still
+#                          reaches for it; the content mode it runs in does not.
+#                          Every working copy that *proposes* a change goes
+#                          through `vcs_client`
 #   credential_proxy_client.py  how anything here reaches the broker at all, and
 #                          the only way out of this container that carries a
 #                          credential. Imported by vcs_client, and through it by
 #                          every verb. The same file is also COPYed to
 #                          /usr/local/bin/credential-proxy-exec above, as the
-#                          kubectl/git/gh shim; that copy is not importable by
+#                          kubectl/gcloud shim; that copy is not importable by
 #                          module name, so it is staged here as well
 #   vcs_client.py          the client half of the verb surface: it composes a
 #                          request, sends it over the line above, and raises on a
@@ -521,12 +544,20 @@ COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/eo
 # design has these executed directly, so the mode has to say so. The agent image
 # does exactly this to the same tree.
 #
-# Then ownership. /opt/data is agent-owned and the entrypoint copies these into it,
-# so the model can edit what it runs and lose the edit at the next restart — the
-# same contract the agent pod's force-sync gives. That is not a trust boundary: the
-# `hermes` principal must never execute anything under /opt/data, because uid 1000
-# owns that mount point and can rename any directory in it aside. What `hermes`
-# runs comes off PATH, out of root-owned /opt/credential-proxy/bin.
+# Then ownership, which is root's, and a guard that fails the build if any of it
+# is not. The model runs these files and so does the agent pod's code over ssh,
+# so neither this staging copy nor the copies the entrypoint makes of it may be
+# something uid 1000 can change. Most skill scripts and several shared ones
+# append /opt/defaults/scripts to `sys.path` to find their siblings (audit_report,
+# vcs and vcs_client among them); an agent-owned directory there would let the
+# model supply any module the earlier entries miss. The copies under /opt/data are
+# root-owned too, and under the operator each tree is also a read-only mount;
+# deploy/sandbox/entrypoint.sh, step 1a, has why the mount is needed as well.
+#
+# Still not a trust boundary for the `hermes` principal, which must never
+# execute anything under /opt/data: the model owns the rest of that volume. What
+# `hermes` runs comes off PATH, out of root-owned /opt/credential-proxy/bin, and
+# the scripts it forwards to are the separate copy under /opt/vcs/libexec below.
 RUN find /opt/defaults -name '__pycache__' -type d -prune -exec rm -rf {} + && \
     find /opt/defaults -name 'test_*.py' -type f -delete && \
     find /opt/defaults -type d -name tests -prune -exec rm -rf {} + && \
@@ -534,10 +565,14 @@ RUN find /opt/defaults -name '__pycache__' -type d -prune -exec rm -rf {} + && \
         echo "the files above name the agent image's venv interpreter, which does not exist here" >&2; \
         exit 1; \
     fi && \
-    chown -R agent:agent /opt/defaults && \
+    chown -R root:root /opt/defaults && \
     chmod -R u=rwX,go=rX /opt/defaults && \
     find /opt/defaults/scripts -type f -exec chmod 755 {} + && \
-    find /opt/defaults/skills -path '*/scripts/*' -type f -exec chmod 755 {} +
+    find /opt/defaults/skills -path '*/scripts/*' -type f -exec chmod 755 {} + && \
+    if find /opt/defaults \( ! -user root -o -perm /022 \) -print | grep .; then \
+        echo "the paths above under /opt/defaults are not root-owned, or are group- or other-writable" >&2; \
+        exit 1; \
+    fi
 
 # The trusted principal's own copy of the forwarded scripts. Root-owned.
 #
@@ -546,14 +581,15 @@ RUN find /opt/defaults -name '__pycache__' -type d -prune -exec rm -rf {} + && \
 # script here. Two of them cross: forge.py for every forge verb
 # (agents/platform/scripts/forge.py, `_forward`) and resolver.py for the issues
 # sweep's `poll` (github-issue-resolver, `_forward_to_sandbox`). The copy under
-# /opt/data is the model's: uid 1000 owns that mount, can rewrite any file in
-# it, and the edit lives until the next restart -- section 4b of
-# deploy/sandbox/smoke-test.sh plants one on purpose. Forwarding to that copy
-# would run the model's code with the cron's credential, which is exactly the
-# rule the block above states one caller short of keeping. So the forwarded
-# path is this one instead, outside every directory the agent can write. The
-# model's own copy stays where its instructions say it is; nothing about what
-# an agent runs changes here.
+# /opt/data is root-owned and, under the operator, a read-only mount, but it
+# sits on the model's volume: uid 1000 owns that volume's mount point and the
+# homes around each tree, and a run outside the operator's StatefulSet has no
+# mount to stop it renaming a tree aside and putting its own in its place.
+# Forwarding to that copy would stake the cron's credential on all of that
+# holding, which is exactly the rule the block above states one caller short of
+# keeping. So the forwarded path is this one instead, outside every volume the
+# agent can write, as defence in depth. The model's own copy stays where its
+# instructions say it is; nothing about what an agent runs changes here.
 #
 # The whole import closure is staged, not just the two entry points:
 # `sys.path[0]` is the script's own directory, so a module missing here would be
@@ -604,16 +640,14 @@ RUN set -e; \
 # the build PATH — profile.d puts it there at login — so `command -v` here can
 # only be finding a native binary.
 #
-# `gh` keeps its shim here. Taking it away is the right end state -- a forge CLI
-# on PATH is the route out of a forge-neutral abstraction and the model takes
-# it, answering through `gh api` on a quarter of the write probes with the
-# version-control skill loaded -- but callers in the tree still mean this shim.
-# The consumer migration moved the pull-request and issue paths onto the
-# version-control verbs and deliberately left `fleet-audit`'s `audit_report.py`
-# on the CLI, on size grounds. The removal travels with that port, not with
-# this line.
+# `gh` and `git` are in the guard and have no shim. Neither spends a
+# credential from here any more: the forge is reached through the
+# version-control verbs, and a forwarded git would run in the broker's
+# filesystem, not this one. The `git` the agent does get is /opt/vcs/bin's,
+# which is not on the build PATH either, so a hit below still means a native
+# binary arrived by some other route.
 RUN mkdir -p /opt/credential-proxy/bin && \
-    for binary in gcloud kubectl gh git; do \
+    for binary in gcloud kubectl; do \
         ln -s /usr/local/bin/credential-proxy-exec "/opt/credential-proxy/bin/${binary}"; \
     done && \
     for binary in gcloud kubectl gh git; do \

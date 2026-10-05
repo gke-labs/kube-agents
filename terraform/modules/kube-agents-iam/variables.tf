@@ -154,6 +154,15 @@ variable "scope" {
     naming call needs before the exclusion can match; a glob is evaluated by
     the reconcile alone.
 
+    `max_projects` is the resolved-set cap, spec.scope.maxProjects: the most
+    projects the reconcile lists per run, the management project included,
+    100 by default; a declaration whose explicit projects and selector
+    members alone exceed it is refused at plan time (main.tf) while a
+    selector is declared or the cap is below its default (the CRD's hundred
+    explicit projects with no selector, at the default, was admitted before
+    the cap existed and still is), and the chart renders the same value on
+    the CR.
+
     Empty, the default, binds nothing and the reconcile lists project_id alone.
   EOT
   type = object({
@@ -162,6 +171,7 @@ variable "scope" {
     organizations    = optional(list(string), [])
     shared_vpc_hosts = optional(list(string), [])
     metrics_scopes   = optional(list(string), [])
+    max_projects     = optional(number, 100)
     exclude = optional(object({
       projects = optional(list(string), [])
       clusters = optional(list(object({
@@ -173,6 +183,15 @@ variable "scope" {
   })
   nullable = false
   default  = {}
+
+  # The resolved-set cap the reconcile lists per run, the management project included:
+  # spec.scope.maxProjects, with the CRD's bounds. The plan refuses a declaration whose
+  # explicit projects and selector members alone exceed it (main.tf), and the per-selector
+  # cap in kube-agents-scope-resolver is the same number.
+  validation {
+    condition     = var.scope.max_projects >= 1 && var.scope.max_projects <= 5000 && floor(var.scope.max_projects) == var.scope.max_projects
+    error_message = "scope.max_projects is a whole number from 1 to 5000, the bounds the CRD puts on spec.scope.maxProjects."
+  }
 
   validation {
     condition = (

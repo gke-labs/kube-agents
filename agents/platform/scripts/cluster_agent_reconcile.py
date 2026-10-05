@@ -149,25 +149,51 @@ _denied_this_run: set[str] = set()
 # Same, for a member whose GKE API answered disabled on a per-cluster call (also a 403).
 _api_disabled_this_run: set[str] = set()
 # The listing phase is bounded: the management project lists first and alone, then the
-# containers resolve LIST_WORKERS at a time, then the explicit projects LIST_WORKERS at a
-# time, and a lookup still running when LIST_BUDGET_SECONDS is spent reads unreachable. The
-# bootstrap gate runs this script under its own ceiling (RECONCILE_TIMEOUT_SECONDS there, 240s)
-# and kills it on expiry with nothing written; two hanging projects listed in turn at
-# LIST_TIMEOUT_SECONDS each would already overrun it. Creates still run in the fixed order.
+# containers resolve `workers` at a time, then the explicit projects `workers` at a time,
+# and a lookup still running when the listing budget is spent reads unreachable; both are
+# sized from the declared cap below (LIST_WORKERS and LIST_BUDGET_SECONDS at the default). The
+# bootstrap gate runs this script under its own ceiling (bootstrap_scan_gate.py: the listing
+# and prune budgets for the declared cap and the profiles on the volume, plus its settle
+# time; 240s at the default cap with few profiles) and kills it on expiry
+# with nothing written; two hanging projects listed in turn at LIST_TIMEOUT_SECONDS each
+# would already overrun it. Creates still run in the fixed order.
+# Sized for the default cap: the workers and the budget scale with the declared cap
+# (`_list_workers`, `_list_budget_seconds` below) so a run that may list twice the
+# projects keeps the same margin per project, workers first and the budget only once
+# the workers reach their ceiling; the bootstrap gate's ceiling follows the budget.
 LIST_WORKERS = 8
+# Every lookup is a gcloud process in the sandbox over ssh, and no install has measured
+# the sandbox at more than eight at once (#1913 is to): twice that covers the estate
+# behind #1354 and holds the ceiling until the measurement says otherwise.
+LIST_WORKERS_MAX = 16
 LIST_TIMEOUT_SECONDS = 120
 LIST_BUDGET_SECONDS = 150
 LIST_GRACE_SECONDS = 5
+# PRUNE's per-profile `describe` runs under the same bounded map as the listing, with a
+# budget of its own, instead of a sequential walk at DESCRIBE_TIMEOUT_SECONDS each: at 200
+# profiles the walk was minutes of every hourly tick and a stalled project 30 s per
+# cluster in it. The budget is the larger of a floor scaled like the listing's and an
+# allowance per describe, the cost of one in a sequential walk: the describes run in the
+# sandbox and share its CPU, so the workers shorten a run only as far as that CPU allows
+# (on a two-CPU sandbox a round of eight took as long as eight describes in a row), and a
+# budget sized per describe is one the parallel map can only finish early, never one that
+# cuts a fleet short at the same lexically-last profiles every tick. A describe still
+# pending at the deadline reads inconclusive (kept) and is logged.
+PRUNE_BUDGET_SECONDS = 60
+PRUNE_SECONDS_PER_DESCRIBE = 3
 # How many unlisted projects the chat notification names before it counts the rest: a
 # container can resolve to thousands of projects, a chat message has a size ceiling, and
 # a message the platform drops for its size takes the created/pruned summary with it.
 NOTIFY_UNLISTED_LIMIT = 8
 VIA_MANAGEMENT = "management"
 VIA_EXPLICIT = "explicit"
-# Two caps of 100 (design §3; a declared value replaces this one in a follow-up): the CRD caps each declared list, and this caps the resolved
-# set, the management project included. Explicit projects fill it in sorted order after the
+# Two caps (design §3): the CRD caps each declared list at 100, and the declared
+# `spec.scope.maxProjects` caps the resolved set, the management project included, with this
+# as its default and the value a declaration without the key (a render from an operator
+# that predates it) is read under. Explicit projects fill it in sorted order after the
 # management project; one past the cap reads over-cap, keeps its profiles, and gets no CREATE.
 RESOLVED_SET_CAP = 100
+SCOPE_MAX_PROJECTS_KEY = "maxProjects"
 OUTCOME_OK = "ok"
 OUTCOME_DENIED = "denied"
 OUTCOME_API_DISABLED = "api-disabled"
@@ -196,6 +222,28 @@ _CREATE_DENIED_MARKERS = ("PERMISSION_DENIED", "code=403", "does not have permis
 _API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "API has not been used",
                          "is not enabled", "has not been enabled")
 
+
+
+def _list_workers(cap: int) -> int:
+    """Workers for the bounded lookups: LIST_WORKERS per default cap's worth of projects,
+    up to LIST_WORKERS_MAX, so the per-project margin holds as the cap grows."""
+    return max(LIST_WORKERS, min(LIST_WORKERS_MAX, -(-cap * LIST_WORKERS // RESOLVED_SET_CAP)))
+
+
+def _list_budget_seconds(cap: int) -> float:
+    """The listing budget for a cap: LIST_BUDGET_SECONDS per round of projects-per-worker
+    the default cap needs, so it grows only once the workers have reached their ceiling.
+    The bootstrap gate's ceiling is this plus its settle time (bootstrap_scan_gate.py)."""
+    rounds_at_default = RESOLVED_SET_CAP / LIST_WORKERS
+    rounds = cap / _list_workers(cap)
+    return LIST_BUDGET_SECONDS * max(1, -(-rounds // rounds_at_default))
+
+
+def _prune_budget_seconds(cap: int, profiles: int = 0) -> float:
+    """PRUNE's describe budget: the floor scaled the way the listing budget is, or the
+    profiles times the allowance per describe, whichever is larger."""
+    scaled = PRUNE_BUDGET_SECONDS * (_list_budget_seconds(cap) / LIST_BUDGET_SECONDS)
+    return max(scaled, profiles * PRUNE_SECONDS_PER_DESCRIBE)
 
 def log(msg: str) -> None:
     print(f"[CLUSTER-RECONCILE] {msg}", file=sys.stderr)
@@ -265,8 +313,10 @@ def _classify_list_failure(stderr: str) -> str:
     return OUTCOME_UNREACHABLE
 
 
-def _bounded_map(lookup, keys: list[str], deadline: float, what: str) -> dict:
-    """Run `lookup(key, timeout=...)` for every key, LIST_WORKERS at a time, within the deadline.
+def _bounded_map(lookup, keys: list[str], deadline: float, what: str,
+                 workers: int = LIST_WORKERS, budget_seconds: float = LIST_BUDGET_SECONDS,
+                 consequence: str = "skipping create for it this run") -> dict:
+    """Run `lookup(key, timeout=...)` for every key, `workers` at a time, within the deadline.
 
     Each worker's own timeout is cut to the budget left when it starts, so no thread
     outlives the run by more than LIST_GRACE_SECONDS: the interpreter joins the pool's
@@ -281,7 +331,7 @@ def _bounded_map(lookup, keys: list[str], deadline: float, what: str) -> dict:
     def within_budget(key: str):
         return lookup(key, timeout=max(1.0, min(LIST_TIMEOUT_SECONDS, deadline - time.monotonic())))
 
-    pool = ThreadPoolExecutor(max_workers=min(LIST_WORKERS, len(keys)))
+    pool = ThreadPoolExecutor(max_workers=min(workers, len(keys)))
     futures = {key: pool.submit(within_budget, key) for key in keys}
     done, _ = wait(futures.values(), timeout=max(0.0, deadline + LIST_GRACE_SECONDS - time.monotonic()))
     results: dict = {}
@@ -289,8 +339,8 @@ def _bounded_map(lookup, keys: list[str], deadline: float, what: str) -> dict:
         if future in done:
             results[key] = future.result()
         else:
-            log(f"{what} {key} did not finish within the run's {LIST_BUDGET_SECONDS}s listing budget "
-                f"({OUTCOME_UNREACHABLE}; skipping create for it this run).")
+            log(f"{what} {key} did not finish within the run's {budget_seconds:g}s budget "
+                f"({OUTCOME_UNREACHABLE}; {consequence}).")
             results[key] = (None, OUTCOME_UNREACHABLE)
     pool.shutdown(wait=False, cancel_futures=True)
     return results
@@ -304,23 +354,25 @@ def _lookup_group(group: str, timeout: float = LIST_TIMEOUT_SECONDS):
     return _search_container(group, timeout=timeout)
 
 
-def _resolve_groups(groups: list[str], deadline: float) -> dict[str, tuple]:
+def _resolve_groups(groups: list[str], deadline: float, workers: int = LIST_WORKERS,
+                    budget_seconds: float = LIST_BUDGET_SECONDS) -> dict[str, tuple]:
     """Resolve every container and selector within the run's listing budget, in one pool.
 
     A pending one freezes (design §4). Containers and selectors share the pool so a slow
     folder search does not push the selectors past the budget or the other way round.
     """
-    return _bounded_map(_lookup_group, groups, deadline, "resolving")
+    return _bounded_map(_lookup_group, groups, deadline, "resolving", workers, budget_seconds)
 
 
-def _list_projects(projects: list[str], deadline: float) -> dict[str, tuple[list | None, str]]:
-    """List every explicit project within the run's listing budget, LIST_WORKERS at a time.
+def _list_projects(projects: list[str], deadline: float, workers: int = LIST_WORKERS,
+                   budget_seconds: float = LIST_BUDGET_SECONDS) -> dict[str, tuple[list | None, str]]:
+    """List every explicit project within the run's listing budget, `workers` at a time.
 
     The caller lists the management project first and on its own, at the start of the
     budget, before calling this: its listing decides `create_pass_ran`, and when it
     reaches the sandbox its ssh opens the multiplexed connection the pool then shares.
     """
-    return _bounded_map(_list_project, projects, deadline, "listing clusters in")
+    return _bounded_map(_list_project, projects, deadline, "listing clusters in", workers, budget_seconds)
 
 
 def _list_project(project: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[list | None, str]:
@@ -363,7 +415,14 @@ def _list_project(project: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[
 
 def _empty_scope() -> dict:
     return {"projects": [], "folders": [], "organizations": [], SELECTOR_KIND_SHARED_VPC: [],
-            SELECTOR_KIND_METRICS_SCOPE: [], "exclude": {"projects": [], "clusters": []}}
+            SELECTOR_KIND_METRICS_SCOPE: [], "exclude": {"projects": [], "clusters": []},
+            SCOPE_MAX_PROJECTS_KEY: RESOLVED_SET_CAP}
+
+
+def _cap_of(scope: dict) -> int:
+    """The resolved-set cap a declaration carries, or the default."""
+    cap = scope.get(SCOPE_MAX_PROJECTS_KEY)
+    return cap if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0 else RESOLVED_SET_CAP
 
 
 def _load_scope() -> tuple[dict, bool, bool, bool, bool]:
@@ -436,6 +495,13 @@ def _normalize_scope(parsed: dict) -> dict:
         c for c in (clusters if isinstance(clusters, list) else [])
         if isinstance(c, dict) and all(isinstance(c.get(k), str) for k in ("projectId", "location", "clusterName"))
     ]
+    # The cap in force: the key the operator renders from spec.scope.maxProjects; a render
+    # without it (an operator that predates the field) and a value that is not a positive
+    # integer read as the default, never as no cap.
+    scope[SCOPE_MAX_PROJECTS_KEY] = _cap_of(parsed)
+    if parsed.get(SCOPE_MAX_PROJECTS_KEY) not in (None, scope[SCOPE_MAX_PROJECTS_KEY]):
+        log(f"{SCOPE_MAX_PROJECTS_KEY} {parsed.get(SCOPE_MAX_PROJECTS_KEY)!r} is not a positive integer; "
+            f"using the default cap of {RESOLVED_SET_CAP}.")
     return scope
 
 
@@ -676,7 +742,8 @@ def _previous_numbers(previous: dict | None) -> dict[str, str]:
 
 
 def _selector_members(raw: dict[str, tuple[list[str] | None, str]], previous: dict | None,
-                      deadline: float, patterns: list[str] | None = None) -> dict[str, tuple[dict[str, dict] | None, str]]:
+                      deadline: float, patterns: list[str] | None = None, workers: int = LIST_WORKERS,
+                      budget_seconds: float = LIST_BUDGET_SECONDS) -> dict[str, tuple[dict[str, dict] | None, str]]:
     """Name each selector's members: selector -> (members, outcome).
 
     `members` maps a project ID to {"outcome", "number"}: outcome None for a project still to
@@ -703,7 +770,7 @@ def _selector_members(raw: dict[str, tuple[list[str] | None, str]], previous: di
     """
     patterns = patterns or []
     numbers = sorted({m for members, _ in raw.values() if members for m in members if m.isdigit()})
-    named = _bounded_map(_project_id_of, numbers, deadline, "naming project") if numbers else {}
+    named = _bounded_map(_project_id_of, numbers, deadline, "naming project", workers, budget_seconds) if numbers else {}
     known = _previous_numbers(previous)
     out: dict[str, tuple[dict[str, dict] | None, str]] = {}
     for selector, (members, outcome) in raw.items():
@@ -769,7 +836,8 @@ def _numbers_named(selections: dict[str, tuple[dict | None, str]] | None) -> dic
 def _resolve_projects(management: str | None, scope: dict,
                       searches: dict[str, tuple[dict | None, str]] | None = None,
                       previous: dict | None = None,
-                      selections: dict[str, tuple[dict | None, str]] | None = None) -> tuple[list[dict], list[dict], list[dict]]:
+                      selections: dict[str, tuple[dict | None, str]] | None = None,
+                      cap: int | None = None) -> tuple[list[dict], list[dict], list[dict]]:
     """Turn the declaration into the ordered resolved set (design §3).
 
     Returns (entries, ignored_excludes, containers). Each entry is {id, via, outcome},
@@ -777,7 +845,8 @@ def _resolve_projects(management: str | None, scope: dict,
     whose clusters Asset Inventory already named (kept under `clusters`), a container's or
     selector's own outcome for a member carried forward under the freeze rule, the naming
     call's outcome for a monitored project that could not be named, and `over-cap` for a
-    project past RESOLVED_SET_CAP. The order is fixed so the cap binds the same way every
+    project past the cap (`cap`, the declaration's maxProjects; the module default when
+    not given). The order is fixed so the cap binds the same way every
     run: the management project, then explicit projects sorted by ID, then the selectors'
     projects sorted by ID, then containers sorted by ID (design §3). A glob that matches the
     management project is recorded and not applied. `searches` holds each container's Asset
@@ -786,6 +855,7 @@ def _resolve_projects(management: str | None, scope: dict,
     the id that is also the row's `via` name.
     """
     patterns = scope["exclude"]["projects"]
+    cap = cap if cap is not None else RESOLVED_SET_CAP
     entries: list[dict] = []
 
     def excluded(project: str, number: str | None) -> bool:
@@ -844,9 +914,9 @@ def _resolve_projects(management: str | None, scope: dict,
         seen.add(project)
         if excluded(project, number_of(project)):
             continue
-        outcome = OUTCOME_OVER_CAP if listed_count() >= RESOLVED_SET_CAP else None
+        outcome = OUTCOME_OVER_CAP if listed_count() >= cap else None
         if outcome:
-            log(f"{project} is past the resolved-set cap of {RESOLVED_SET_CAP}; over-cap, no CREATE.")
+            log(f"{project} is past the resolved-set cap of {cap}; over-cap, no CREATE.")
         entries.append({"id": project, "via": [VIA_EXPLICIT], "outcome": outcome})
 
     def frozen_entry(project: str) -> dict | None:
@@ -919,9 +989,9 @@ def _resolve_projects(management: str | None, scope: dict,
         if excluded(project, info[NUMBER_KEY] or number_of(project)):
             continue
         outcome = info["outcome"]
-        if outcome is None and listed_count() >= RESOLVED_SET_CAP:
+        if outcome is None and listed_count() >= cap:
             outcome = OUTCOME_OVER_CAP
-            log(f"{project} (via {', '.join(sorted(info['via']))}) is past the resolved-set cap of {RESOLVED_SET_CAP}; over-cap, no CREATE.")
+            log(f"{project} (via {', '.join(sorted(info['via']))}) is past the resolved-set cap of {cap}; over-cap, no CREATE.")
         # A member whose naming call failed is carried under that outcome the way a frozen
         # member is, and marked so: a container that places it live below lifts it into the
         # listing, as it lifts a frozen one, rather than losing the folder's clusters to a
@@ -956,13 +1026,13 @@ def _resolve_projects(management: str | None, scope: dict,
             # over-cap folder past the cap without a check.
             lifted = [p for p in members if p in seen and (frozen_entry(p) or {}).get("outcome") == OUTCOME_OVER_CAP
                       or (frozen_entry(p) or {}).get("uncounted")]
-            if listed_count() + len(fresh) + len(lifted) > RESOLVED_SET_CAP:
+            if listed_count() + len(fresh) + len(lifted) > cap:
                 # The lookup succeeded and the run holds the full member list, but listing
                 # them would cross the cap: the members the run just resolved are carried
                 # reading over-cap and get no CREATE, and because the run knows they are
                 # under the container, over-cap does not hold back the prune (design §3/§4 as revised).
                 log(f"{container} resolved {len(members)} project(s), which would cross the resolved-set "
-                    f"cap of {RESOLVED_SET_CAP}; over-cap, its members are carried without CREATE.")
+                    f"cap of {cap}; over-cap, its members are carried without CREATE.")
                 outcome, carried, members = OUTCOME_OVER_CAP, sorted(members), None
             else:
                 carried = []
@@ -1176,7 +1246,7 @@ def _previously_resolved(previous: dict | None) -> set[str]:
     }
 
 
-def _cluster_exists(project: str, cluster: str, location: str) -> bool | None:
+def _cluster_exists(project: str, cluster: str, location: str, timeout: float = DESCRIBE_TIMEOUT_SECONDS) -> bool | None:
     """Return True if the GKE cluster exists, False if it definitively does not, None if unknown.
 
     Mirrors platform_mcp_server.verify_gke_cluster's classification: a NotFound/404 is the *only*
@@ -1188,7 +1258,7 @@ def _cluster_exists(project: str, cluster: str, location: str) -> bool | None:
         f"--location={location}", f"--project={project}", "--format=json(status, id)",
     ]
     try:
-        sandbox_exec.run(cmd, check=True, timeout=DESCRIBE_TIMEOUT_SECONDS)
+        sandbox_exec.run(cmd, check=True, timeout=timeout)
         return True
     except subprocess.CalledProcessError as e:
         stderr = e.stderr or ""
@@ -1262,7 +1332,8 @@ def _scaffold_gaps(home: Path) -> list[str]:
     ``create_profile`` stamps ``cluster_identity`` into ``config.yaml`` (step 2b)
     before it fetches the kubeconfig (step 3) and writes ``USER.md`` (step 4). A
     process killed in that window -- the bootstrap gate runs this script under a
-    240s timeout, and Python SIGKILLs on expiry -- leaves a home that reads as fully
+    ceiling (RECONCILE_TIMEOUT_SECONDS at the floor, more with a declared cap and
+    profiles on the volume), and Python SIGKILLs on expiry -- leaves a home that reads as fully
     managed: CREATE finds its identity tuple and skips the cluster, PRUNE keeps it
     because the cluster still exists, and the half-scaffolded profile survives with
     no credentials for the life of the volume. Treating it as absent re-runs the
@@ -1371,20 +1442,25 @@ def reconcile(dry_run: bool = False) -> dict:
     # project that merely changed from one the scope dropped, and nothing is created under
     # a project this tick could not confirm is still the pod's own.
     carried_management = _previous_management(previous) if not management else None
-    # One budget for the whole listing phase (LIST_BUDGET_SECONDS): the management project
+    # One budget for the whole listing phase (_list_budget_seconds for the cap): the management project
     # lists first, at the start of it, so its listing, the one that decides whether the
     # roster is reconciled, is never cut short by a slow container; then the containers and
     # selectors together, one call each, and the naming of the monitored projects a Metrics
     # Scope returned by number; then the explicit and selector projects. Container members
     # arrive with their clusters, so no per-project listing follows for them (design §4).
-    listing_deadline = time.monotonic() + LIST_BUDGET_SECONDS
+    # The cap the declaration carries sizes the run: the workers and the budget scale with it.
+    cap = _cap_of(scope)
+    workers = _list_workers(cap)
+    list_budget = _list_budget_seconds(cap)
+    report["maxProjects"] = cap
+    listing_deadline = time.monotonic() + list_budget
     listings: dict[str, tuple[list | None, str]] = {}
     if management:
         listings[management] = _list_project(management)
-    groups = _resolve_groups(_container_ids(scope) + _selector_ids(scope), listing_deadline)
+    groups = _resolve_groups(_container_ids(scope) + _selector_ids(scope), listing_deadline, workers, list_budget)
     searches = {g: r for g, r in groups.items() if _is_container(g)}
     selector_reports = {g: r for g, r in groups.items() if _is_selector(g)}
-    selections = _selector_members(selector_reports, previous, listing_deadline, scope["exclude"]["projects"])
+    selections = _selector_members(selector_reports, previous, listing_deadline, scope["exclude"]["projects"], workers, list_budget)
     numbers_named = _numbers_named(selections)
 
     def known_number(project: str) -> str | None:
@@ -1395,7 +1471,7 @@ def reconcile(dry_run: bool = False) -> dict:
         # a day as an index lag rather than retired as the declaration asks.
         return numbers_named.get(project) or _previous_number(previous, project)
 
-    entries, ignored_excludes, containers = _resolve_projects(management or carried_management, scope, searches, previous, selections)
+    entries, ignored_excludes, containers = _resolve_projects(management or carried_management, scope, searches, previous, selections, cap)
     report["containers"] = [dict(c) for c in containers]
     if carried_management:
         for entry in entries:
@@ -1417,7 +1493,7 @@ def reconcile(dry_run: bool = False) -> dict:
     #     gate on existed solely to recognise the cluster being skipped.
     cluster_counts: dict[str, int | None] = {}
     to_list = [e["id"] for e in entries if e["outcome"] is None and e["id"] not in listings]
-    listings.update(_list_projects(to_list, listing_deadline))
+    listings.update(_list_projects(to_list, listing_deadline, workers, list_budget))
     for entry in entries:
         # A container member: Asset Inventory named its clusters already.
         if "clusters" in entry and entry["id"] not in listings:
@@ -1663,6 +1739,32 @@ def reconcile(dry_run: bool = False) -> dict:
     log(f"Reconciling {len(profiles)} managed profile(s){' (dry-run)' if dry_run else ''}.")
     previous_attribution = _previous_attribution(previous)
     unattributed_counts: dict[str, int] = {}
+    # Every profile that will reach the liveness check is described now, `workers` at a
+    # time under PRUNE's budget, and the loop below reads the answers in profile order, so
+    # the log and the report are as they were when the walk was sequential. A policy prune
+    # (an excluded cluster) and a scope prune (a retiring project on a clean run) need no
+    # describe and get none, as the sequential walk gave them none: the latter's project
+    # has usually lost its read roles, so the describe would be a 403 logged as unknown
+    # beside the "left the scope" line for the same profile. A describe still pending at
+    # the deadline reads inconclusive, which keeps the profile. Each describe's timeout is
+    # the budget left, as a listing's is, so no worker outlives the deadline by more than
+    # the grace the bounded map allows; it is not DESCRIBE_TIMEOUT_SECONDS, because under
+    # the pool a describe also waits for the sandbox CPU its pool-mates hold, and at eight
+    # workers a 30 s cut read a third of a live fleet as unknown.
+    to_describe = [
+        name for name in profiles
+        if identities[name] is not None
+        and (identities[name]["project"], identities[name]["cluster"], identities[name]["location"]) not in excluded_triples
+        and identities[name]["cluster"] not in EXTRA_EXCLUDE
+        and not (identities[name]["project"] not in resolved_ids
+                 and lookups_clean and identities[name]["project"] in previously_retiring)
+    ]
+    prune_budget = _prune_budget_seconds(cap, len(to_describe))
+    described = _bounded_map(
+        lambda name, timeout: (_cluster_exists(**identities[name], timeout=timeout), ""),
+        to_describe, time.monotonic() + prune_budget, "describing the cluster of", workers, prune_budget,
+        consequence="inconclusive; the profile is kept",
+    )
     for name in profiles:
         identity = identities[name]
         if identity is None:
@@ -1747,7 +1849,7 @@ def reconcile(dry_run: bool = False) -> dict:
         else:
             unmanaged_reason = None
 
-        exists = _cluster_exists(**identity)
+        exists = described.get(name, (None, ""))[0]
         if exists is not False and unmanaged_reason:
             unmanaged.append({"profile": name, "project": project, "reason": unmanaged_reason})
             report["unmanaged"].append(name)
@@ -1856,6 +1958,7 @@ def reconcile(dry_run: bool = False) -> dict:
         _write_snapshot({
             "resolvedAt": datetime.now(timezone.utc).strftime(SNAPSHOT_TIME_FORMAT),
             "declared": declared,
+            SCOPE_MAX_PROJECTS_KEY: cap,
             "resolver": RESOLVER_ASSET_INVENTORY if _container_ids(scope) else RESOLVER_EXPLICIT,
             "containers": sorted(containers, key=lambda c: c["id"]),
             # Every profile by project: as read this run, or as last read for one whose
@@ -1914,10 +2017,10 @@ def _format_notification(report: dict) -> str:
         )
     if over_cap_containers:
         lines.append(
-            f"  ⚠️ {len(over_cap_containers)} folder(s)/organisation(s) resolved past the listing cap of {RESOLVED_SET_CAP} "
+            f"  ⚠️ {len(over_cap_containers)} folder(s)/organisation(s) resolved past the listing cap of {report.get('maxProjects', RESOLVED_SET_CAP)} "
             "(members carried over-cap, profiles kept, nothing created): "
             + ", ".join(f"`{c['id']}` ({c.get('projects', 0)} project(s))" for c in over_cap_containers)
-            + ". Narrow it with exclude.projects or declare the sub-folders that hold the clusters."
+            + ". Narrow it with exclude.projects, declare the sub-folders that hold the clusters, or raise spec.scope.maxProjects."
         )
     unlisted = sorted((p, o) for p, o in (report.get("projects") or {}).items() if o != OUTCOME_OK)
     if unlisted:

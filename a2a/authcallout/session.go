@@ -3,6 +3,7 @@ package authcallout
 import (
 	"fmt"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -78,7 +79,7 @@ const (
 // incarnation per task, which makes those the same thing today; the gateway
 // pins that when it routes a session (gateway.go, the SessionRouted branch,
 // which retires the previous incarnation and re-mints rec.BusSession).
-func sessionGrants(pod string) Grants {
+func sessionGrants(pod string) (Grants, error) {
 	inbox := "_INBOX." + pod + ".>"
 	g := Grants{
 		Publish: []string{
@@ -102,8 +103,53 @@ func sessionGrants(pod string) Grants {
 			consumerAPI("DELETE", name),
 		)
 	}
+	// The capability path: ask, and be answered. Two subjects, and the shape
+	// of both is the mechanism rather than a convention.
+	//
+	// The ask carries the caller's own name as the subject's LAST token, and
+	// the verifier reads its caller off that token rather than off anything
+	// in the payload. That is only sound because this grant is exactly one
+	// subject: the server refuses this session on any other session's verify
+	// token, so a pod cannot ask a question in somebody else's name. A
+	// wildcard here would silently convert the verifier's identity check
+	// into a self-assertion.
+	//
+	// The answer namespace is `a2a.cap.reply.<pod>.>` rather than the
+	// session's own _INBOX for the verifier's sake, not this session's: the
+	// verifier answers wherever a caller says, and every broker is a caller,
+	// so its publish grant cannot be narrower than the whole reply space. If
+	// that space were _INBOX, the verifier would hold `_INBOX.>` and could
+	// publish into the gateway's inbox, where the gateway reads JetStream
+	// replies. See capability.ReplyPrefix.
+	//
+	// Deliberately NOT granted: `$KV.cap.hop.<pod>.*`, the write a broker
+	// would use to attenuate a capability before forwarding it. The rules
+	// for that write exist and are tested (capability.Minter.Attenuate), but
+	// nothing in the product calls them — there is no second hop, because
+	// the gateway's delegate flow mints the successor's root itself. A grant
+	// for a client that does not exist is a standing authorization, not
+	// documentation of a plan; it lands with the hop that needs it.
+	//
+	// Both of these are unreachable today: validSessionName has already
+	// accepted the pod name as a dot-free DNS-1123 label, and every such
+	// string also satisfies capability's checkToken. They return an error
+	// rather than an empty grant set anyway, because an empty grant set is
+	// not the fail-closed value it reads as — the server mints it as an
+	// UNRESTRICTED client (see Service.authorize). There is no value of this
+	// type that means "refuse", so refusing has to be said out of band.
+	verify, err := capability.VerifySubject(pod)
+	if err != nil {
+		return Grants{}, fmt.Errorf("the attested pod name is not a usable capability caller: %w", err)
+	}
+	reply, err := capability.ReplySubscribe(pod)
+	if err != nil {
+		return Grants{}, fmt.Errorf("the attested pod name is not a usable capability caller: %w", err)
+	}
+	g.Publish = append(g.Publish, verify)
+	g.Subscribe = append(g.Subscribe, reply)
+
 	g.Publish = append(g.Publish, inbox)
-	return g
+	return g, nil
 }
 
 // validSessionName is the check the whole derivation stands on: the pod name

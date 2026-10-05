@@ -54,6 +54,15 @@ fi
 # point of #1081's precedence chain — an empty assignment would beat it and
 # mean "explicitly nothing", which for MEMORY or PERMISSION_SET is a different
 # install from the default one.
+#
+# What that costs: a key absent from this table has no way to be refused at
+# all. The renderer regenerates install.env on every reconcile, so a line
+# written into it by hand is gone by the next run, and the shipped default is
+# the only answer the environment can give. For every key whose default is
+# false that is the quiet outcome; for ENABLE_DRIFT_DETECTOR, whose default is
+# true, it is a Log Router sink over every cluster in the project. A key being
+# in this table is therefore not only how an environment states a non-default
+# choice -- it is the only way it can state one.
 MAPPING="
 PROJECT_ID:GCP_PROJECT_ID
 REGION:GCP_REGION
@@ -91,6 +100,7 @@ HERMES_DASHBOARD_ENABLED:HERMES_DASHBOARD_ENABLED
 ENABLE_GKE_BACKUP_PLAN:ENABLE_GKE_BACKUP_PLAN
 ENABLE_PUBSUB_PLATFORM:ENABLE_PUBSUB_PLATFORM
 ENABLE_STOCKOUT_INVESTIGATOR:ENABLE_STOCKOUT_INVESTIGATOR
+ENABLE_DRIFT_DETECTOR:ENABLE_DRIFT_DETECTOR
 REGISTRY_PREFIX:REGISTRY_PREFIX
 THIRD_PARTY_REGISTRY_PREFIX:THIRD_PARTY_REGISTRY_PREFIX
 NAMESPACE:NAMESPACE

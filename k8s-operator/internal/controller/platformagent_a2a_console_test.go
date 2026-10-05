@@ -272,7 +272,10 @@ func TestReconcileA2ARendersAndRemovesTheConsole(t *testing.T) {
 
 // The console fence outlives every other front-door object in the teardown:
 // its Deployment's Delete returns before the pod has exited, and an unfenced
-// console pod hands its password to any in-cluster caller.
+// console pod hands its password to any in-cluster caller. It goes directly
+// before the session fence, which is as late as it can go:
+// TestTheSessionFenceIsTheLastFenceTheTeardownDeletes holds the session fence
+// last.
 func TestTheConsoleFenceIsDeletedAfterTheConsoleAndBeforeTheBus(t *testing.T) {
 	agent := a2aTestAgent()
 	r := &PlatformAgentReconciler{}
@@ -291,8 +294,8 @@ func TestTheConsoleFenceIsDeletedAfterTheConsoleAndBeforeTheBus(t *testing.T) {
 	if dep := idx("*v1.Deployment/" + a2aConsoleName(agent)); fence < dep {
 		t.Errorf("console fence at %d, before its Deployment at %d", fence, dep)
 	}
-	if session := idx("*v1.NetworkPolicy/" + a2aSessionNetpolName(agent)); fence < session {
-		t.Errorf("console fence at %d, before the session fence at %d", fence, session)
+	if session := idx("*v1.NetworkPolicy/" + a2aSessionNetpolName(agent)); fence != session-1 {
+		t.Errorf("console fence at %d, want directly before the session fence at %d", fence, session)
 	}
 	// cleanupA2A deletes the StatefulSet sentinel after this whole walk, so
 	// being in the walk is being before it. Should the StatefulSet move back

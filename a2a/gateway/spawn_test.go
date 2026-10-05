@@ -292,6 +292,92 @@ func TestSpawnedSessionsCarryNoBusPasswordAndAPodBoundTokenInstead(t *testing.T)
 	}
 }
 
+// TestClusterViewProjectsOnlyTheSessionAudience: with the view on, the pod
+// gains exactly one more projected token (the broker's session audience) and
+// the broker env; automount stays false and no default-audience token exists.
+func TestClusterViewProjectsOnlyTheSessionAudience(t *testing.T) {
+	cs := k8sfake.NewSimpleClientset()
+	cfg := &Config{Namespace: "test-ns", WorkerImage: "img", SessionServiceAccount: "agent-a2a-session",
+		TaskDeadline: 15 * time.Minute, NATSURL: "nats://bus:4222",
+		SessionClusterView: true, CredentialProxyURL: "http://agent-credential-proxy.test-ns.svc.cluster.local:8765"}
+	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-9", BusSession: "chat-otter-1a2b", Addressee: "chat-otter-1a2b"}
+	if _, err := s.Spawn(context.Background(), rec, "task-9", "", 1); err != nil {
+		t.Fatal(err)
+	}
+	pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-1a2b", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
+		t.Fatal("automount is not false with the view on")
+	}
+	audiences := map[string]*corev1.ProjectedVolumeSource{}
+	for _, v := range pod.Spec.Volumes {
+		if v.Projected == nil {
+			continue
+		}
+		for _, src := range v.Projected.Sources {
+			if src.ServiceAccountToken != nil {
+				audiences[src.ServiceAccountToken.Audience] = v.Projected
+			}
+		}
+	}
+	if len(audiences) != 2 || audiences[lib.BusTokenAudience] == nil || audiences[credentialProxySessionAudience] == nil {
+		t.Fatalf("projected audiences = %v, want exactly the bus and the session audience", audiences)
+	}
+	if mode := audiences[credentialProxySessionAudience].DefaultMode; mode == nil || *mode != credentialProxyTokenMode {
+		t.Errorf("session token mode = %v, want %o (uid 1000 reads a root-written file)", mode, credentialProxyTokenMode)
+	}
+	c := pod.Spec.Containers[0]
+	env := map[string]string{}
+	for _, e := range c.Env {
+		env[e.Name] = e.Value
+	}
+	if env["CREDENTIAL_PROXY_URL"] != cfg.CredentialProxyURL ||
+		env["CREDENTIAL_PROXY_TOKEN_FILE"] != credentialProxyTokenMountPath+"/"+credentialProxyTokenFile ||
+		env["HERMES_HOME"] != sessionHermesHome || env[lib.EnvClusterView] != "true" {
+		t.Fatalf("cluster-view env = %v", env)
+	}
+	var mounted bool
+	for _, m := range c.VolumeMounts {
+		if m.MountPath == credentialProxyTokenMountPath && m.ReadOnly {
+			mounted = true
+		}
+	}
+	if !mounted {
+		t.Fatal("the session token is not mounted read-only at the path the shim reads")
+	}
+}
+
+// TestNoClusterViewSpawnsTodaysPod: the flag off renders the pod exactly as
+// before - no broker env, one projected audience.
+func TestNoClusterViewSpawnsTodaysPod(t *testing.T) {
+	cs := k8sfake.NewSimpleClientset()
+	cfg := &Config{Namespace: "test-ns", WorkerImage: "img", SessionServiceAccount: "agent-a2a-session",
+		TaskDeadline: 15 * time.Minute, NATSURL: "nats://bus:4222"}
+	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-9", BusSession: "chat-otter-1a2b", Addressee: "chat-otter-1a2b"}
+	if _, err := s.Spawn(context.Background(), rec, "task-9", "", 1); err != nil {
+		t.Fatal(err)
+	}
+	pod, _ := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-1a2b", metav1.GetOptions{})
+	for _, e := range pod.Spec.Containers[0].Env {
+		if strings.HasPrefix(e.Name, "CREDENTIAL_PROXY_") || e.Name == lib.EnvClusterView || e.Name == "HERMES_HOME" {
+			t.Errorf("%s rendered with the view off", e.Name)
+		}
+	}
+	n := 0
+	for _, v := range pod.Spec.Volumes {
+		if v.Projected != nil {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("%d projected volumes with the view off, want 1", n)
+	}
+}
+
 // mintSessionName is load-bearing for the callout in a way it was not before,
 // and it had no test.
 //
@@ -323,5 +409,74 @@ func TestMintedSessionNamesAreOneSubjectTokenAndALegalPodName(t *testing.T) {
 	// AlreadyExists against a terminating predecessor.
 	if len(seen) < 100 {
 		t.Errorf("only %d distinct names from 800 mints; the suffix is not varying", len(seen))
+	}
+}
+
+// The capability contract's two halves reach the session pod, and they carry
+// the gateway's OWN resolved values rather than defaults the pod would pick.
+//
+// This is the pairing test for the mint. The gateway mints under
+// cfg.AuthorityScope and the executor checks against A2A_AUTHORITY_SCOPE, and
+// the verifier compares them — so an unrendered scope is not a missing nicety,
+// it is every task refused. It would also be refused *quietly*: the executor's
+// fallback is capability.NamespaceScope(""), which is `namespace/-`, and that
+// placeholder mismatches any real namespace the gateway minted under — the
+// refusal comes from the two scopes differing, not from the placeholder being
+// empty of everything, so the failure arrives as a scope refusal and reads
+// like a capability bug.
+func TestSpawnRendersTheCapabilityContractFromTheGatewaysOwnConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		optional     bool
+		wantRequired string
+	}{
+		{"armed", false, "true"},
+		{"relaxed for a mixed-version install", true, "false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := k8sfake.NewSimpleClientset()
+			cfg := &Config{
+				Namespace: "test-ns", WorkerImage: "img",
+				SessionServiceAccount: "agent-a2a-session",
+				TaskDeadline:          15 * time.Minute,
+				CapabilityOptional:    tc.optional,
+			}
+			// The same call the gateway makes at construction, before it
+			// builds a spawner: the scope the pod is told has to be the
+			// one the minter will actually use.
+			cfg.defaultCapabilityCeiling()
+			s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+
+			rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-1",
+				BusSession: "chat-otter-abcd", Addressee: "chat-otter-abcd"}
+			if _, err := s.Spawn(context.Background(), rec, "task-1", "", 1); err != nil {
+				t.Fatal(err)
+			}
+			pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-abcd", metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			env := map[string]string{}
+			for _, e := range pod.Spec.Containers[0].Env {
+				env[e.Name] = e.Value
+			}
+			if got, want := env["A2A_AUTHORITY_SCOPE"], string(cfg.AuthorityScope); got != want {
+				t.Errorf("A2A_AUTHORITY_SCOPE = %q, want %q — the scope the gateway mints under.\n"+
+					"An executor checking against a different scope refuses every task it is given.", got, want)
+			}
+			if env["A2A_AUTHORITY_SCOPE"] == "namespace/-" {
+				t.Error("the session pod is told the empty scope; the gateway's own namespace never reached its config")
+			}
+			if got := env["A2A_CAPABILITY_REQUIRED"]; got != tc.wantRequired {
+				t.Errorf("A2A_CAPABILITY_REQUIRED = %q, want %q — one switch arms or relaxes both halves", got, tc.wantRequired)
+			}
+			// The pod is told nothing it could derive a DIFFERENT scope
+			// from. A POD_NAMESPACE here would give the adapter a second
+			// source that agrees today and drifts the first time the
+			// gateway is given an explicit ceiling.
+			if _, ok := env["POD_NAMESPACE"]; ok {
+				t.Error("the session pod carries POD_NAMESPACE; that is a second source for a value the gateway already resolved")
+			}
+		})
 	}
 }

@@ -180,6 +180,15 @@ readonly A2A_NATS_URL_FORMAT='nats://%s.%s.svc:%d'
 readonly A2A_CREDS_SECRET_NAME="${A2A_NATS_SERVICE_NAME}-creds"
 readonly A2A_BRIDGE_USER="bridge"
 readonly A2A_BRIDGE_PASSWORD_KEY="bridge-password"
+# The key that signs the agent's pod-wide tool-call hook, and the env both the
+# agent and the bridge read it from (a2aBridgeActivityKey and
+# a2aActivitySecretEnvVar). The operator adds it to the agent container only
+# for a sidecar that runs the api executor, so under the cli pin below the
+# agent never carries it and the bridge's per-task keys sign instead; the
+# sidecar names it itself so that lifting the pin needs no edit here.
+# Optional, as the operator renders it.
+readonly A2A_BRIDGE_ACTIVITY_KEY="bridge-activity-key"
+readonly BRIDGE_ACTIVITY_SECRET_ENV_VAR="A2A_ACTIVITY_SECRET"
 # The bridge's own env (a2a/cmd/hermes-bridge/main.go), the entrypoint switch
 # that keeps a second container of the agent image out of the shared tree
 # (deploy/shared/docker-entrypoint.sh, step 1.5; buildBaseContainers sets it
@@ -191,6 +200,14 @@ readonly BRIDGE_NATS_URL_ENV_VAR="NATS_URL"
 readonly BRIDGE_NATS_USER_ENV_VAR="NATS_USER"
 readonly BRIDGE_NATS_PASSWORD_ENV_VAR="NATS_PASSWORD"
 readonly BRIDGE_CONCURRENCY_ENV_VAR="BRIDGE_CONCURRENCY"
+# The lane pins the bridge's subprocess executor. The sidecar copies the agent
+# container's API_SERVER_KEY, so left unset the bridge would pick its api
+# executor, whose turns the pod's API server answers with its own profile
+# rather than the platform persona the lane's cases were graded against. The
+# pin holds until cases have been graded on api
+# (docs/designs/eval-next-transport.md).
+readonly BRIDGE_EXECUTOR_ENV_VAR="BRIDGE_EXECUTOR"
+readonly BRIDGE_EXECUTOR_PINNED="cli"
 readonly AGENT_SHARED_STATE_SETUP_ENV_VAR="AGENT_SHARED_STATE_SETUP"
 readonly AGENT_SHARED_STATE_SETUP_SKIP="skip"
 readonly A2A_BUS_TOKEN_VOLUME="a2a-bus-token"
@@ -232,6 +249,7 @@ readonly A2A_RESERVE_PER_WORKER=6
 # inject transport ends as infrastructure.
 readonly BRIDGE_CONSUMING_LOG_MSG='"msg":"hermes bridge consuming"'
 readonly BRIDGE_CONSUMING_LOG_PROFILE='"profile":"platform"'
+readonly BRIDGE_CONSUMING_LOG_EXECUTOR='"executor":"cli"'
 readonly MODE_NEXT_BRIDGE_LOG_ATTEMPTS=60
 # The provisioning Job depends on NATS and on the callout. The operator now
 # creates it only once a callout replica serves (#1702); before that its
@@ -271,15 +289,18 @@ readonly MODE_NEXT_ENTRYPOINT_SCAN_LINES=400
 readonly MODE_NEXT_ENTRYPOINT_MATCH_LINES=40
 # The operator's override variables (a2aGatewayImage and a2aWorkerImage in
 # platformagent_a2a_manifests.go, a2aCalloutImage in platformagent_a2a_callout.go,
-# a2aConsoleImage in platformagent_a2a_console.go) and the repository names
+# a2aVerifierImage in platformagent_a2a_verifier.go, a2aConsoleImage in
+# platformagent_a2a_console.go) and the repository names
 # step 4 pushes the builds under.
 readonly A2A_GATEWAY_IMAGE_ENV_VAR="A2A_GATEWAY_IMAGE"
 readonly A2A_CALLOUT_IMAGE_ENV_VAR="A2A_CALLOUT_IMAGE"
 readonly A2A_WORKER_IMAGE_ENV_VAR="A2A_WORKER_IMAGE"
+readonly A2A_VERIFIER_IMAGE_ENV_VAR="A2A_VERIFIER_IMAGE"
 readonly A2A_CONSOLE_IMAGE_ENV_VAR="A2A_CONSOLE_IMAGE"
 readonly A2A_GATEWAY_IMAGE_NAME="a2a-gateway"
 readonly A2A_CALLOUT_IMAGE_NAME="a2a-authcallout"
 readonly A2A_WORKER_IMAGE_NAME="a2a-worker"
+readonly A2A_VERIFIER_IMAGE_NAME="a2a-verifier"
 readonly A2A_CONSOLE_IMAGE_NAME="a2a-console"
 # The bridge image goes to the CR as the sidecar's image, not to the operator:
 # the operator renders no bridge, so its images.json entry has no override.
@@ -802,7 +823,7 @@ else
   # one above. Empty otherwise, so the command below is byte-for-byte what it
   # was. The four references go to the operator through operator.extraEnv
   # in step 5: the operator reads its A2A image overrides from its own
-  # environment; without them it would derive the same four references
+  # environment; without them it would derive the same five references
   # from its own image (the operator image is this build's, under the same
   # repository and tag), so the overrides are belt and braces that keep the
   # deploy's inputs explicit and byte-pinned by the tests. The same
@@ -815,9 +836,10 @@ else
     A2A_GATEWAY_URI="${AR_REPO}/${A2A_GATEWAY_IMAGE_NAME}:${TAG}"
     A2A_CALLOUT_URI="${AR_REPO}/${A2A_CALLOUT_IMAGE_NAME}:${TAG}"
     A2A_WORKER_URI="${AR_REPO}/${A2A_WORKER_IMAGE_NAME}:${TAG}"
+    A2A_VERIFIER_URI="${AR_REPO}/${A2A_VERIFIER_IMAGE_NAME}:${TAG}"
     A2A_CONSOLE_URI="${AR_REPO}/${A2A_CONSOLE_IMAGE_NAME}:${TAG}"
     A2A_BRIDGE_URI="${AR_REPO}/${A2A_BRIDGE_IMAGE_NAME}:${TAG}"
-    A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI}"
+    A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI}"
     A2A_OPERATOR_ENV_ARGS=(
       --set-string "operator.extraEnv[0].name=${A2A_GATEWAY_IMAGE_ENV_VAR}"
       --set-string "operator.extraEnv[0].value=${A2A_GATEWAY_URI}"
@@ -825,12 +847,18 @@ else
       --set-string "operator.extraEnv[1].value=${A2A_CALLOUT_URI}"
       --set-string "operator.extraEnv[2].name=${A2A_WORKER_IMAGE_ENV_VAR}"
       --set-string "operator.extraEnv[2].value=${A2A_WORKER_URI}"
-      --set-string "operator.extraEnv[3].name=${A2A_CONSOLE_IMAGE_ENV_VAR}"
-      --set-string "operator.extraEnv[3].value=${A2A_CONSOLE_URI}"
-      --set-string "operator.extraEnv[4].name=${A2A_INJECT_BACKEND_ENV_VAR}"
-      --set-string "operator.extraEnv[4].value=${A2A_INJECT_BACKEND_ON}"
+      # The verifier is on the request path: unoverridden it stays on a
+      # private dev registry a leased eval project cannot pull, the Deployment
+      # never comes up, and every executor refuses every task -- an eval that
+      # reads as a broken product rather than a missing override.
+      --set-string "operator.extraEnv[3].name=${A2A_VERIFIER_IMAGE_ENV_VAR}"
+      --set-string "operator.extraEnv[3].value=${A2A_VERIFIER_URI}"
+      --set-string "operator.extraEnv[4].name=${A2A_CONSOLE_IMAGE_ENV_VAR}"
+      --set-string "operator.extraEnv[4].value=${A2A_CONSOLE_URI}"
+      --set-string "operator.extraEnv[5].name=${A2A_INJECT_BACKEND_ENV_VAR}"
+      --set-string "operator.extraEnv[5].value=${A2A_INJECT_BACKEND_ON}"
     )
-    echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout, worker and console images and the Hermes bridge sidecar"
+    echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout, worker, verifier and console images and the Hermes bridge sidecar"
   fi
   gcloud builds submit --config="deploy/docker/cloudbuild-ci.yaml" \
     --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}" \
@@ -1024,6 +1052,22 @@ echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
 # removes the CR whole, so the flip-back-with-sidecar failure the bridge doc
 # names never arises here.
 #
+# The verifier is gated too, and gated LAST of everything here, which is not
+# where its dependency would put it. Its precondition is the provisioning Job
+# -- it binds the capability bucket at boot and exits when it cannot, so until
+# the Job has created the bucket it crash-loops -- but its deadline is the
+# first submission, which is hack/ci-eval-pr.sh, after this step. Waiting on
+# it right after the Job would put a kubelet restart backoff of up to five
+# minutes AHEAD of the sidecar patch this script has yet to issue, and so add
+# that backoff to the deploy; waiting on it at the end spends the same backoff
+# alongside the two agent rollouts and the bridge coming up, and still answers
+# the only question that matters, which is whether the verifier is answering
+# before anything asks it. Gated rather than reported because every executor
+# turns an unanswered Check into a terminal rejection: a verifier still in
+# backoff when the eval starts does not slow a case down, it refuses it, and
+# the whole eval reads as a broken product (the same reason the slice pins
+# A2A_VERIFIER_IMAGE through operator.extraEnv at all).
+#
 # Reported, not gated: the A2A gateway Deployment. It used to exit on start
 # without a chat backend (#1660); the inject door is one, so it now starts,
 # but no pool-project run has shown it coming up yet and a gateway that is
@@ -1040,6 +1084,15 @@ dump_mode_next_state() {
   kubectl get pods,jobs,networkpolicies,pvc -n "${NAMESPACE}" -l "${A2A_PART_OF_SELECTOR}" || true
   kubectl get events -n "${NAMESPACE}" --sort-by=.lastTimestamp | tail -"${MODE_NEXT_DIAG_EVENT_LINES}" || true
   kubectl logs -n "${NAMESPACE}" "deployment/${OPERATOR_DEPLOYMENT_NAME}" --tail="${MODE_NEXT_DIAG_LOG_LINES}" || true
+  # The verifier's own log, on every failure path and not only its gate's.
+  # Its one durable failure -- it could not bind the capability bucket, so it
+  # exited -- is a line in this log and nowhere else: `describe` shows a
+  # CrashLoopBackOff without the reason, and the CR's A2AVerifier condition
+  # says zero replicas are ready without saying why. Previous as well as
+  # current, because by the time anything reads this the container that
+  # printed it has usually already been restarted.
+  kubectl logs -n "${NAMESPACE}" "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier" --tail="${MODE_NEXT_DIAG_LOG_LINES}" 2>/dev/null || true
+  kubectl logs -n "${NAMESPACE}" "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier" --previous --tail="${MODE_NEXT_DIAG_LOG_LINES}" 2>/dev/null || true
 }
 
 # Waits for the operator to create the workload, then for its rollout; on
@@ -1212,27 +1265,33 @@ gate_cr_not_degraded() {
 # Renders the merge patch that declares the bridge sidecar on the CR, from the
 # agent container the operator rendered (the agent Deployment's JSON on stdin).
 #
-# The bridge's subprocess stands in for the `hermes chat -q` a kanban worker
-# spawns inside the agent container, so the sidecar gets that container's
+# The bridge's cli subprocess stands in for the `hermes chat -q` a kanban
+# worker spawns inside the agent container, and its default api executor needs
+# that container's API_SERVER_KEY, so the sidecar gets that container's
 # environment, envFrom, mounts, security context and resources rather than a
 # list written here that would drift from the operator's render the next time
-# it changes. Two subtractions and one addition. The projected bus token mount
+# it changes. Two subtractions and two additions. The projected bus token mount
 # is dropped: the webhook reserves that volume for the agent container and
 # refuses a sidecar naming it (and the callout could not tell the two apart
 # anyway; the bridge doc's "Bus user and grants" says why it stays a
 # password). Ports and probes are not copied: port names are unique per pod
 # and the bridge serves nothing. Added: the bridge's own env -- the bus URL,
 # the `bridge` user and its password from the operator's creds Secret,
-# BRIDGE_CONCURRENCY -- and AGENT_SHARED_STATE_SETUP=skip, so the image's
+# BRIDGE_CONCURRENCY, the pinned BRIDGE_EXECUTOR -- and AGENT_SHARED_STATE_SETUP=skip, so the image's
 # entrypoint runs its container-local init, waits for the owner's
 # config.yaml, enters $HERMES_HOME and execs the bridge, as it does for the
-# dashboard container. The pull policy is the agent container's too, so the
-# same tag is fetched the same way.
+# dashboard container. The second addition is A2A_ACTIVITY_SECRET from the
+# creds Secret's bridge-activity-key, the key the tool-call hook signs with:
+# the operator adds it to the agent container only once a bridge sidecar is
+# declared, so the copy above cannot carry it. The pull policy is the agent
+# container's too, so the same tag is fetched the same way.
 #
 # Arguments, in order: the agent container's name, the sidecar's name, its
 # image, then the bus URL, user and the creds Secret's name and key, the
-# concurrency, the reserved volume name, and the entrypoint switch's name and
-# value. Positional so the test can call it the way the step does.
+# concurrency, the reserved volume name, the entrypoint switch's name and
+# value, the activity key's variable and Secret key, and the executor's
+# variable and value. Positional so the
+# test can call it the way the step does.
 render_mode_next_sidecar_patch() {
   python3 -c '
 import json
@@ -1240,17 +1299,20 @@ import sys
 
 (agent_container, sidecar, image, url_env, url, user_env, user, password_env,
  creds_secret, password_key, concurrency_env, concurrency, reserved_volume,
- shared_state_env, shared_state_value) = sys.argv[1:16]
+ shared_state_env, shared_state_value, activity_env, activity_key,
+ executor_env, executor) = sys.argv[1:20]
 pod = json.load(sys.stdin)["spec"]["template"]["spec"]
 agent = next(c for c in pod["containers"] if c["name"] == agent_container)
-own = {url_env, user_env, password_env, concurrency_env, shared_state_env}
+own = {url_env, user_env, password_env, executor_env, concurrency_env, shared_state_env, activity_env}
 env = [e for e in agent.get("env", []) if e["name"] not in own]
 env += [
     {"name": shared_state_env, "value": shared_state_value},
     {"name": url_env, "value": url},
     {"name": user_env, "value": user},
     {"name": password_env, "valueFrom": {"secretKeyRef": {"name": creds_secret, "key": password_key}}},
+    {"name": executor_env, "value": executor},
     {"name": concurrency_env, "value": concurrency},
+    {"name": activity_env, "valueFrom": {"secretKeyRef": {"name": creds_secret, "key": activity_key, "optional": True}}},
 ]
 container = {
     "name": sidecar,
@@ -1328,10 +1390,12 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
       "${BRIDGE_NATS_PASSWORD_ENV_VAR}" "${A2A_CREDS_SECRET_NAME}" "${A2A_BRIDGE_PASSWORD_KEY}" \
       "${BRIDGE_CONCURRENCY_ENV_VAR}" "${MODE_NEXT_BRIDGE_CONCURRENCY}" \
       "${A2A_BUS_TOKEN_VOLUME}" \
-      "${AGENT_SHARED_STATE_SETUP_ENV_VAR}" "${AGENT_SHARED_STATE_SETUP_SKIP}")"
+      "${AGENT_SHARED_STATE_SETUP_ENV_VAR}" "${AGENT_SHARED_STATE_SETUP_SKIP}" \
+      "${BRIDGE_ACTIVITY_SECRET_ENV_VAR}" "${A2A_BRIDGE_ACTIVITY_KEY}" \
+      "${BRIDGE_EXECUTOR_ENV_VAR}" "${BRIDGE_EXECUTOR_PINNED}")"
   # Names only, for the artifact: the copied env carries the agent's own
   # values, and a rendered Secret reference is a name either way.
-  echo "Declaring the ${BRIDGE_SIDECAR_NAME} sidecar (${A2A_BRIDGE_URI}, ${BRIDGE_CONCURRENCY_ENV_VAR}=${MODE_NEXT_BRIDGE_CONCURRENCY}) with env:"
+  echo "Declaring the ${BRIDGE_SIDECAR_NAME} sidecar (${A2A_BRIDGE_URI}, ${BRIDGE_CONCURRENCY_ENV_VAR}=${MODE_NEXT_BRIDGE_CONCURRENCY}, ${BRIDGE_EXECUTOR_ENV_VAR}=${BRIDGE_EXECUTOR_PINNED}) with env:"
   printf '%s' "${SIDECAR_PATCH}" | python3 -c 'import json,sys; c=json.load(sys.stdin)["spec"]["deployment"]["sidecars"][0]; print("  " + " ".join(e["name"] for e in c["env"])); print("  mounts: " + " ".join(m["name"] for m in c["volumeMounts"]))'
   SIDECAR_GEN_BEFORE="$(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.metadata.generation}')"
   kubectl patch platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" --type merge -p "${SIDECAR_PATCH}"
@@ -1355,12 +1419,12 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   BRIDGE_LOG_START=$SECONDS
   BRIDGE_CONSUMING=""
   for _ in $(seq 1 "${MODE_NEXT_BRIDGE_LOG_ATTEMPTS}"); do
-    BRIDGE_CONSUMING="$(kubectl logs -n "${NAMESPACE}" "deployment/${AGENT_DEPLOYMENT_NAME}" -c "${BRIDGE_SIDECAR_NAME}" --tail="${MODE_NEXT_DIAG_LOG_LINES}" 2>/dev/null | grep -F "${BRIDGE_CONSUMING_LOG_MSG}" | grep -F "${BRIDGE_CONSUMING_LOG_PROFILE}" | tail -1 || true)"
+    BRIDGE_CONSUMING="$(kubectl logs -n "${NAMESPACE}" "deployment/${AGENT_DEPLOYMENT_NAME}" -c "${BRIDGE_SIDECAR_NAME}" --tail="${MODE_NEXT_DIAG_LOG_LINES}" 2>/dev/null | grep -F "${BRIDGE_CONSUMING_LOG_MSG}" | grep -F "${BRIDGE_CONSUMING_LOG_PROFILE}" | grep -F "${BRIDGE_CONSUMING_LOG_EXECUTOR}" | tail -1 || true)"
     [ -n "${BRIDGE_CONSUMING}" ] && break
     sleep "${MODE_NEXT_POLL_SECONDS}"
   done
   if [ -z "${BRIDGE_CONSUMING}" ]; then
-    echo "ERROR: the ${BRIDGE_SIDECAR_NAME} sidecar never logged ${BRIDGE_CONSUMING_LOG_MSG} with ${BRIDGE_CONSUMING_LOG_PROFILE}"
+    echo "ERROR: the ${BRIDGE_SIDECAR_NAME} sidecar never logged ${BRIDGE_CONSUMING_LOG_MSG} with ${BRIDGE_CONSUMING_LOG_PROFILE} and ${BRIDGE_CONSUMING_LOG_EXECUTOR}"
     echo "--- ${BRIDGE_SIDECAR_NAME} log ---"
     kubectl logs -n "${NAMESPACE}" "deployment/${AGENT_DEPLOYMENT_NAME}" -c "${BRIDGE_SIDECAR_NAME}" --tail="${MODE_NEXT_DIAG_LOG_LINES}" || true
     kubectl logs -n "${NAMESPACE}" "deployment/${AGENT_DEPLOYMENT_NAME}" -c "${BRIDGE_SIDECAR_NAME}" --previous --tail="${MODE_NEXT_DIAG_LOG_LINES}" 2>/dev/null || true
@@ -1369,6 +1433,11 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     exit 1
   fi
   echo "✓ bridge consuming $((BRIDGE_LOG_START - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the patch: ${BRIDGE_CONSUMING}"
+
+  # Last, for the reason in this step's header: the bucket it needs exists by
+  # now, and the backoff it may still be in has been running against the two
+  # rollouts above rather than in front of them.
+  gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier"
 
   # What the run has to show for itself, for the artifact log: the CR status,
   # the stack the mode rendered, the ungated gateway, and the entrypoint's

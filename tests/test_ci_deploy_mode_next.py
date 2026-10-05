@@ -7,10 +7,10 @@ negative one: with the flag unset, the build submits exactly the substitutions
 it submitted before the flag existed, the Helm install gets no extra value, and
 step 6b makes no kubectl call at all. The positive half is pinned by the same
 lifting technique tests/test_ci_deploy_rc_images.py uses: section 4 run with
-the flag set names the five next-stack images and fills the operator.extraEnv
-values the release expands (the four image overrides and the inject door's
+the flag set names the six next-stack images and fills the operator.extraEnv
+values the release expands (the five image overrides and the inject door's
 flag), the Cloud Build's `a2a` and `a2a-bridge` steps run with `docker` stubbed
-build and push those five in order with the bridge FROM this build's platform
+build and push those six in order with the bridge FROM this build's platform
 image, the three guards (release-candidate path, Prow run with no pull request
 that is not a next-lane job, the concurrency's grammar) run against the values
 they refuse and admit, the
@@ -65,19 +65,28 @@ _INVENTORY_CHECK = _REPO_ROOT / "hack" / "check-image-inventory.sh"
 _CONTROLLER = _REPO_ROOT / "k8s-operator" / "internal" / "controller"
 _A2A_MANIFESTS = _CONTROLLER / "platformagent_a2a_manifests.go"
 _A2A_CALLOUT = _CONTROLLER / "platformagent_a2a_callout.go"
+_A2A_VERIFIER = _CONTROLLER / "platformagent_a2a_verifier.go"
 _A2A_CONSOLE = _CONTROLLER / "platformagent_a2a_console.go"
 _A2A_IDENTITIES = _CONTROLLER / "platformagent_a2a_identities.go"
 _AGENT_MANIFESTS = _CONTROLLER / "platformagent_manifests.go"
 _API_TYPES = _REPO_ROOT / "k8s-operator" / "api" / "v1alpha1" / "common_types.go"
 _BRIDGE_MAIN = _REPO_ROOT / "a2a" / "cmd" / "hermes-bridge" / "main.go"
 _BRIDGE_GO = _REPO_ROOT / "a2a" / "hermes-bridge" / "bridge.go"
+_BRIDGE_API_GO = _REPO_ROOT / "a2a" / "hermes-bridge" / "api.go"
 _OPERATOR_TEMPLATE = _REPO_ROOT / "charts" / "kube-agents" / "templates" / "operator-deployment.yaml"
 
 _AR_REPO = "us-central1-docker.pkg.dev/kube-agents-evals/kube-agents"
 _TAG = "pr-1686-abc1234"
-_A2A_SUBSTITUTIONS = ("_A2A_GATEWAY_URI", "_A2A_CALLOUT_URI", "_A2A_WORKER_URI", "_A2A_CONSOLE_URI", "_A2A_BRIDGE_URI")
-_A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "a2a-console", "hermes-bridge")
-_A2A_DOCKERFILE_SUFFIXES = ("gateway", "authcallout", "worker", "console")
+_A2A_SUBSTITUTIONS = (
+    "_A2A_GATEWAY_URI",
+    "_A2A_CALLOUT_URI",
+    "_A2A_WORKER_URI",
+    "_A2A_VERIFIER_URI",
+    "_A2A_CONSOLE_URI",
+    "_A2A_BRIDGE_URI",
+)
+_A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "a2a-verifier", "a2a-console", "hermes-bridge")
+_A2A_DOCKERFILE_SUFFIXES = ("gateway", "authcallout", "worker", "verifier", "console")
 _PLATFORM_URI = f"{_AR_REPO}/platform-agent:{_TAG}"
 _FLAG_UNSET_SPELLINGS = (None, "", "0", "true", "yes")
 # The next lane's two Prow jobs (oss-test-infra), the only runs section 2b
@@ -318,6 +327,10 @@ def render_sidecar(deployment: dict, concurrency: str = "4") -> dict:
         consts["A2A_BUS_TOKEN_VOLUME"],
         consts["AGENT_SHARED_STATE_SETUP_ENV_VAR"],
         consts["AGENT_SHARED_STATE_SETUP_SKIP"],
+        consts["BRIDGE_ACTIVITY_SECRET_ENV_VAR"],
+        consts["A2A_BRIDGE_ACTIVITY_KEY"],
+        consts["BRIDGE_EXECUTOR_ENV_VAR"],
+        consts["BRIDGE_EXECUTOR_PINNED"],
     ]
     quoted = " ".join(f"'{a}'" for a in args)
     result = subprocess.run(
@@ -418,7 +431,7 @@ class FlagSetIsNextTest(unittest.TestCase):
         for name, image in zip(_A2A_SUBSTITUTIONS, _A2A_IMAGES, strict=True):
             self.assertIn(f"{name}={_AR_REPO}/{image}:{_TAG}", subs)
 
-    def test_the_release_gets_the_four_overrides_and_the_inject_flag_as_operator_extra_env(self) -> None:
+    def test_the_release_gets_the_five_overrides_and_the_inject_flag_as_operator_extra_env(self) -> None:
         result = run_build_section("1")
         self.assertEqual(result.returncode, 0, result.stderr)
         args = helm_args(result)
@@ -426,10 +439,14 @@ class FlagSetIsNextTest(unittest.TestCase):
             go_constant(_A2A_MANIFESTS, "a2aGatewayImageEnvVar"),
             go_constant(_A2A_CALLOUT, "a2aCalloutImageEnvVar"),
             go_constant(_A2A_MANIFESTS, "a2aWorkerImageEnvVar"),
+            # The verifier sits on the request path: an eval install that does
+            # not override it leaves the Deployment on a private dev registry
+            # it cannot pull, and every executor refuses every task.
+            go_constant(_A2A_VERIFIER, "a2aVerifierImageEnvVar"),
             go_constant(_A2A_CONSOLE, "a2aConsoleImageEnvVar"),
         )
         expected = []
-        for index, (env_var, image) in enumerate(zip(env_vars, _A2A_IMAGES[:4], strict=True)):
+        for index, (env_var, image) in enumerate(zip(env_vars, _A2A_IMAGES[:5], strict=True)):
             expected += [
                 "--set-string",
                 f"operator.extraEnv[{index}].name={env_var}",
@@ -441,9 +458,9 @@ class FlagSetIsNextTest(unittest.TestCase):
         inject_env_var = go_constant(_A2A_MANIFESTS, "a2aInjectBackendEnvVar")
         expected += [
             "--set-string",
-            f"operator.extraEnv[4].name={inject_env_var}",
+            f"operator.extraEnv[5].name={inject_env_var}",
             "--set-string",
-            "operator.extraEnv[4].value=true",
+            "operator.extraEnv[5].value=true",
         ]
         self.assertEqual(args, expected)
         # The bridge image goes to the CR, not to the operator.
@@ -486,6 +503,8 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertEqual(consts["A2A_INJECT_TOKEN_KEY"], go_constant(_A2A_MANIFESTS, "a2aInjectTokenKey"))
         self.assertEqual(consts["A2A_BRIDGE_USER"], go_constant(_A2A_IDENTITIES, "a2aBridgeUser"))
         self.assertEqual(consts["A2A_BRIDGE_PASSWORD_KEY"], go_constant(_A2A_MANIFESTS, "a2aBridgePasswordKey"))
+        self.assertEqual(consts["A2A_BRIDGE_ACTIVITY_KEY"], go_constant(_A2A_MANIFESTS, "a2aBridgeActivityKey"))
+        self.assertEqual(consts["BRIDGE_ACTIVITY_SECRET_ENV_VAR"], go_constant(_A2A_MANIFESTS, "a2aActivitySecretEnvVar"))
         self.assertEqual(consts["A2A_BUS_TOKEN_VOLUME"], go_constant(_A2A_CALLOUT, "a2aBusTokenVolume"))
         self.assertIn(f'"{consts["A2A_BUS_TOKEN_VOLUME"]}": {{}}', text(_API_TYPES))
         self.assertEqual(consts["AGENT_SHARED_STATE_SETUP_ENV_VAR"], go_constant(_AGENT_MANIFESTS, "sharedStateSetupEnvVar"))
@@ -511,13 +530,25 @@ class FlagSetIsNextTest(unittest.TestCase):
                 self.assertIn(f'os.Getenv("{consts[const]}")', main_go)
         self.assertIn(f'"{consts["BRIDGE_CONCURRENCY_ENV_VAR"]}"', main_go)
         self.assertEqual(int(consts["BRIDGE_QUEUE_CAPACITY"]), go_int_constant(_BRIDGE_GO, "taskQueueCapacity"))
-        self.assertIn('Info("hermes bridge consuming", "profile", b.cfg.Profile)', text(_BRIDGE_GO))
+        self.assertIn('Info("hermes bridge consuming", "profile", b.cfg.Profile, ', text(_BRIDGE_GO))
         # The shape the deploy greps is the JSON handler's: `"msg":"..."` and
         # `"profile":"..."`. A text handler would print the same words in a
         # shape neither grep matches.
         self.assertIn("slog.New(slog.NewJSONHandler(os.Stderr, nil))", main_go)
         self.assertEqual(consts["BRIDGE_CONSUMING_LOG_MSG"], '"msg":"hermes bridge consuming"')
         self.assertEqual(consts["BRIDGE_CONSUMING_LOG_PROFILE"], f'"profile":"{go_constant(_BRIDGE_MAIN, "defaultProfile")}"')
+        # The lane pins the subprocess executor, and the start line is where the
+        # deploy proves the pin took: the variable the bridge reads, the value it
+        # accepts, and the field it logs the choice under.
+        self.assertEqual(consts["BRIDGE_EXECUTOR_ENV_VAR"], go_constant(_BRIDGE_MAIN, "executorEnv"))
+        self.assertEqual(consts["BRIDGE_EXECUTOR_PINNED"], go_constant(_BRIDGE_API_GO, "ExecutorCLI"))
+        self.assertIn('"executor", b.cfg.Executor)', text(_BRIDGE_GO))
+        self.assertEqual(consts["BRIDGE_CONSUMING_LOG_EXECUTOR"], f'"executor":"{consts["BRIDGE_EXECUTOR_PINNED"]}"')
+        self.assertIn(
+            '| grep -F "${BRIDGE_CONSUMING_LOG_MSG}" | grep -F "${BRIDGE_CONSUMING_LOG_PROFILE}" | grep -F "${BRIDGE_CONSUMING_LOG_EXECUTOR}" |',
+            text(_CI_DEPLOY),
+            "the start-line wait requires all three fields, or a bridge on the wrong executor passes it",
+        )
 
     def test_the_concurrency_default_is_the_eval_scripts_and_fits_the_queue(self) -> None:
         consts = constants()
@@ -634,6 +665,12 @@ class FlagSetIsNextTest(unittest.TestCase):
                 "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout",
                 "deployment/${AGENT_DEPLOYMENT_NAME}",
                 "deployment/${AGENT_DEPLOYMENT_NAME}",
+                # Last, not after the Job its bucket comes from: see the
+                # step header. A verifier still in its crash-loop backoff
+                # when the eval starts submitting refuses every case
+                # terminally, so this one is a gate and not a report, but
+                # the backoff is spent alongside the rollouts above.
+                "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier",
             ],
         )
         markers = [
@@ -650,6 +687,7 @@ class FlagSetIsNextTest(unittest.TestCase):
             'gate_cr_not_degraded "the sidecar patch"',
             'gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"',
             'grep -F "${BRIDGE_CONSUMING_LOG_MSG}" | grep -F "${BRIDGE_CONSUMING_LOG_PROFILE}"',
+            'gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier"',
         ]
         position = 0
         for marker in markers:
@@ -990,11 +1028,17 @@ class SidecarPatchTest(unittest.TestCase):
                 {"name": "NATS_URL", "value": "nats://platform-agent-a2a-nats.kubeagents-system.svc:4222"},
                 {"name": "NATS_USER", "value": "bridge"},
                 {"name": "NATS_PASSWORD", "valueFrom": {"secretKeyRef": {"name": "platform-agent-a2a-nats-creds", "key": "bridge-password"}}},
+                {"name": "BRIDGE_EXECUTOR", "value": "cli"},
                 {"name": "BRIDGE_CONCURRENCY", "value": "4"},
+                {
+                    "name": "A2A_ACTIVITY_SECRET",
+                    "valueFrom": {"secretKeyRef": {"name": "platform-agent-a2a-nats-creds", "key": "bridge-activity-key", "optional": True}},
+                },
             ],
         )
         self.assertEqual(names.count("NATS_URL"), 1, "the agent's NATS_URL is replaced, not shadowed")
         self.assertEqual(names.count("AGENT_SHARED_STATE_SETUP"), 1)
+        self.assertEqual(names.count("BRIDGE_EXECUTOR"), 1)
         self.assertEqual(self.sidecar["envFrom"], [{"secretRef": {"name": "extra"}}])
 
     def test_it_mounts_what_the_agent_mounts_except_the_reserved_bus_token(self) -> None:
@@ -1026,8 +1070,8 @@ class SidecarPatchTest(unittest.TestCase):
         sidecar = render_sidecar(bare, concurrency="6")["spec"]["deployment"]["sidecars"][0]
         self.assertEqual(set(sidecar), {"name", "image", "env", "volumeMounts"})
         self.assertEqual(sidecar["volumeMounts"], [])
-        self.assertEqual([e["name"] for e in sidecar["env"]], ["AGENT_SHARED_STATE_SETUP", "NATS_URL", "NATS_USER", "NATS_PASSWORD", "BRIDGE_CONCURRENCY"])
-        self.assertEqual(sidecar["env"][-1]["value"], "6")
+        self.assertEqual([e["name"] for e in sidecar["env"]], ["AGENT_SHARED_STATE_SETUP", "NATS_URL", "NATS_USER", "NATS_PASSWORD", "BRIDGE_EXECUTOR", "BRIDGE_CONCURRENCY", "A2A_ACTIVITY_SECRET"])
+        self.assertEqual(sidecar["env"][-2]["value"], "6")
 
     def test_the_context_the_operator_renders_is_one_the_webhook_admits(self) -> None:
         """The renderer copies the agent container's securityContext verbatim,
@@ -1082,21 +1126,26 @@ class BridgeImageBuildTest(unittest.TestCase):
             ("a2a-gateway", "A2A_GATEWAY_IMAGE"),
             ("a2a-worker", "A2A_WORKER_IMAGE"),
             ("a2a-authcallout", "A2A_CALLOUT_IMAGE"),
+            ("a2a-verifier", "A2A_VERIFIER_IMAGE"),
             ("a2a-console", "A2A_CONSOLE_IMAGE"),
         ):
             self.assertEqual(by_name[name]["override"], override)
             self.assertEqual(by_name[name]["tagPolicy"], "release")
 
-    def test_the_a2a_step_starts_at_once_and_builds_the_four_in_order(self) -> None:
-        """The four A2A images do not depend on the platform image, so their
+    def test_the_a2a_step_starts_at_once_and_builds_the_five_in_order(self) -> None:
+        """The five A2A images do not depend on the platform image, so their
         step must not queue behind it; only the bridge does."""
         self.assertEqual(build_step("a2a")["waitFor"], ["-"])
         result = run_build_step("a2a", next_stack_substitutions(), 'docker() { echo "docker $*"; }')
         self.assertEqual(result.returncode, 0, result.stderr)
         expected = []
-        for suffix, image in zip(_A2A_DOCKERFILE_SUFFIXES, _A2A_IMAGES[:4], strict=True):
+        for suffix, image in zip(_A2A_DOCKERFILE_SUFFIXES, _A2A_IMAGES[:5], strict=True):
             uri = f"{_AR_REPO}/{image}:{_TAG}"
-            expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.{suffix} a2a")
+            # The worker's Dockerfile copies the credential broker's shim client
+            # from agents/platform/scripts, so it builds from the repository
+            # root; the gateway and the callout stay on the a2a/ module root.
+            context = "." if suffix == "worker" else "a2a"
+            expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.{suffix} {context}")
             expected.append(f"docker push {uri}")
         self.assertEqual(result.stdout.splitlines(), expected)
 

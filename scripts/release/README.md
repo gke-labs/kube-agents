@@ -447,13 +447,20 @@ line; a patch is validated by the RC pipeline and released by hand.
 1. **Land the fix on the line.** Cherry-pick the merged `main` commit onto a branch cut from
    `upstream/release/<X.Y>`, open a pull request whose base is `release/<X.Y>` with a `fix:`
    title, and let Tide merge it (a `feat:` or a breaking change is refused at release time). The
-   merge builds the commit's SHA-tagged images. Tide reads the target branch's protection, and
-   the lines carry `main`'s: a `release/*` branch protection rule with the same required
-   contexts and conversation resolution, and a ruleset that lets only Tide and the release bot
-   create, push or delete a line — the bot because the tagger pushes a freshly stamped commit,
-   which has had no checks run. Both are repository settings, not files in this tree; if a
-   backport pull request shows no required checks or merges without them, that is where to
-   look. A checkout of a line between stamps carries the previous release's
+   merge builds the commit's SHA-tagged images. The lines carry `main`'s protection in three
+   repository settings, none of them files in this tree. A `release/*` branch protection rule
+   requires conversation resolution and restricts pushes to Tide and the release bot. The
+   `kube-agents-release-lines` ruleset lets only those two create, push or delete a line. The
+   `kube-agents-release-lines-checks` ruleset requires `main`'s status contexts, copied in by
+   hand (the list is in `docs/pull-request-workflow.md`, "Branch protection is not the gate", and a
+   context added to `main`'s set has to be added to the ruleset too), with the release bot as its only
+   bypass actor. The contexts live in a ruleset rather than on the branch
+   protection rule because a branch protection rule cannot exempt an app from required checks,
+   and the tagger's push of a freshly stamped commit, which has had no checks run, was rejected
+   by exactly that when it created the first line. Tide is deliberately not a bypass actor of the
+   checks ruleset, so a backport merge still needs every context. If a backport pull request
+   shows no required checks or merges without them, those three settings are where to look. A
+   checkout of a line between stamps carries the previous release's
    `BAKED_RELEASE_VERSION`; run from it, with the release's tag and full history fetched,
    `install.sh` recognises the shape and defaults to the checkout's own commit, as on `main`,
    and `upgrade.sh` asks for `--image-tag`. `--image-tag <sha>` of the backport's images works

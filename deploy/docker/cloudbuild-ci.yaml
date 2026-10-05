@@ -166,20 +166,28 @@ steps:
       - "k8s-operator/Dockerfile"
       - "k8s-operator"
 
-  # The next stack's four first-party images (a2a/Dockerfile.gateway,
-  # .authcallout, .worker, .console), built only when hack/ci-deploy.sh runs under
-  # EVAL_MODE_NEXT=1 and passes their URIs. With the substitutions at their
+  # The next stack's five first-party images (a2a/Dockerfile.gateway,
+  # .authcallout, .worker, .verifier, .console), built only when hack/ci-deploy.sh
+  # runs under EVAL_MODE_NEXT=1 and passes their URIs. With the substitutions at their
   # empty defaults the step prints one line and exits, and the `images:` list
   # below stays the four it was: that list cannot be conditional and an empty
   # entry fails the build, which is why this step pushes from inside itself.
   # The deploy script points the operator at these builds through its
   # overrides; without them the operator would derive the same references
   # from its own image, which is this build's, so the overrides keep the
-  # deploy's inputs explicit rather than change them. Context is the a2a/ module root, as each
-  # Dockerfile's header says. One step rather than four: they share the Go
+  # deploy's inputs explicit rather than change them. Context is the a2a/ module root for the
+  # gateway, the callout, the verifier and the console, and the repository root for the worker,
+  # which copies the credential broker's shim client from agents/platform/scripts - each
+  # Dockerfile's header says which. One step rather than five: they share the Go
   # module download layer, which the daemon serves to the ones after the first.
   # Nothing here depends on the platform image, so the step starts at once,
   # like sandbox and operator; the bridge, which does, is the step after.
+  #
+  # The verifier belongs in this set and not in the "override it later" pile:
+  # it sits on the request path, and an executor that cannot reach it refuses
+  # rather than proceeds. Left on its private default an eval cluster cannot
+  # pull it, so every task in the run is refused and the eval reads as a
+  # product failure.
   - id: a2a
     name: "gcr.io/cloud-builders/docker"
     entrypoint: "bash"
@@ -194,14 +202,15 @@ steps:
           exit 0
         fi
         set -e
-        build_and_push() { # <Dockerfile suffix> <image URI>
-          docker build --platform linux/amd64 -t "$$2" -f "a2a/Dockerfile.$$1" a2a
+        build_and_push() { # <Dockerfile suffix> <image URI> <build context>
+          docker build --platform linux/amd64 -t "$$2" -f "a2a/Dockerfile.$$1" "$$3"
           docker push "$$2"
         }
-        build_and_push gateway "$_A2A_GATEWAY_URI"
-        build_and_push authcallout "$_A2A_CALLOUT_URI"
-        build_and_push worker "$_A2A_WORKER_URI"
-        build_and_push console "$_A2A_CONSOLE_URI"
+        build_and_push gateway "$_A2A_GATEWAY_URI" a2a
+        build_and_push authcallout "$_A2A_CALLOUT_URI" a2a
+        build_and_push worker "$_A2A_WORKER_URI" .
+        build_and_push verifier "$_A2A_VERIFIER_URI" a2a
+        build_and_push console "$_A2A_CONSOLE_URI" a2a
 
   # The Hermes bridge sidecar (a2a/Dockerfile.hermes-bridge), under the same
   # flag and the same no-op rule. It is FROM the platform-agent image of THIS
@@ -271,9 +280,11 @@ substitutions:
   _KUBE_AGENTS_VERSION: "dev"
   _REQUIRE_CACHE: "false"
   # Empty means the a2a and a2a-bridge steps are no-ops; hack/ci-deploy.sh
-  # sets all five together under EVAL_MODE_NEXT=1.
+  # sets all six together under EVAL_MODE_NEXT=1. The a2a step gates on
+  # _A2A_GATEWAY_URI alone, so they are set as a set or not at all.
   _A2A_GATEWAY_URI: ""
   _A2A_CALLOUT_URI: ""
   _A2A_WORKER_URI: ""
+  _A2A_VERIFIER_URI: ""
   _A2A_CONSOLE_URI: ""
   _A2A_BRIDGE_URI: ""

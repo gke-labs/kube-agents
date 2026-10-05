@@ -63,6 +63,9 @@ import credential_proxy  # noqa: E402
 # the two copies never shadow each other inside one interpreter.
 GATEWAY_REDACTOR_MODULE_NAME = "kube_agents_gateway_redactor"
 
+# The same, for the Slack click handler imported by path.
+SLACK_UX_CLICKS_MODULE_NAME = "kube_agents_slack_ux_clicks"
+
 # The published site's content tree. A directory rather than a file, so it is
 # not a Source: D2's assertion is about every page, and a registry would need
 # editing for each page added. site_pages() below answers for the empty set
@@ -268,7 +271,20 @@ SOURCES: dict[str, Source] = {
     ),
     "a2a_spawner": Source(
         "a2a/gateway/spawn.go",
-        ("partOfValue", "sessionRole", "AutomountServiceAccountToken"),
+        ("partOfValue", "sessionRole", "AutomountServiceAccountToken", "credentialProxySessionAudience"),
+    ),
+    # The broker's shim, which the worker image carries as kubectl/gcloud and
+    # the spawner configures through three env names it spells itself.
+    "credential_proxy_client": Source(
+        "agents/platform/scripts/credential_proxy_client.py",
+        ("CREDENTIAL_PROXY_URL", "CREDENTIAL_PROXY_TOKEN_FILE", "HERMES_HOME"),
+    ),
+    # The gateway's env contract with the operator (module a2a reading what
+    # module k8s-operator renders). C1 pins the cluster-view names across the
+    # boundary; the anchors are the two names and a long-standing neighbour.
+    "a2a_gateway_config": Source(
+        "a2a/gateway/config.go",
+        ("A2A_DEFAULT_ADDRESSEE", "A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL"),
     ),
     # --- model egress -----------------------------------------------------
     # The redactor the chart mounts into the LiteLLM gateway. It is a copy of
@@ -296,6 +312,18 @@ SOURCES: dict[str, Source] = {
     "a2a_callout_rbac": Source(
         "k8s-operator/internal/controller/platformagent_a2a_callout.go",
         ("func buildA2ASessionServiceAccount", "Subjects: []rbacv1.Subject{"),
+    ),
+    # A3 on a Slack button click (KAGE_SLACK_UX): the handler that turns a
+    # click on our choice buttons into the clicker's turn. The anchors are the
+    # call into the adapter's own interactive authorization and the return on
+    # its refusal, which is everything the A3 click test depends on.
+    "slack_ux_clicks": Source(
+        "deploy/docker/patches/slack_ux_clicks.py",
+        (
+            "def register(adapter",
+            "started = await adapter._begin_interaction(",
+            "if started is None:",
+        ),
     ),
     # A3's task-plane writer sets, and A5's split of the shared `worker`
     # credential into a callout principal for the agent container and a static
@@ -597,6 +625,21 @@ def gateway_redactor_module():
     # declares a dataclass, and dataclasses resolve the defining module through
     # sys.modules while the class body is being processed.
     sys.modules[GATEWAY_REDACTOR_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def slack_ux_clicks_module():
+    """The Slack click handler the gateway runs, imported from the patch by path.
+
+    The image installs it as ``gateway/slack_ux_clicks.py``; the file it is
+    copied from is the one a test of who may click has to read.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(SLACK_UX_CLICKS_MODULE_NAME, path_of("slack_ux_clicks"))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[SLACK_UX_CLICKS_MODULE_NAME] = module
     spec.loader.exec_module(module)
     return module
 

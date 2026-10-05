@@ -323,6 +323,7 @@ data:
       "organizations": [],
       "sharedVpcHosts": [],
       "metricsScopes": [],
+      "maxProjects": 100,
       "exclude": {
         "projects": [],
         "clusters": []
@@ -617,6 +618,10 @@ spec:
               value: us-central1-a
             - name: KUBE_CONTEXT_NAME
               value: gke_example-project_us-central1-a_cluster-a
+            - name: SANDBOX_IMAGE_TREES
+              value: read-only-mounts
+            - name: SANDBOX_HOME_ROOTS
+              value: . profiles/platform
           image: ghcr.io/gke-labs/kube-agents/agent-sandbox:latest
           name: shell
           ports:
@@ -661,7 +666,67 @@ spec:
             - mountPath: /etc/gitops
               name: gitops-state-volume
               readOnly: true
+            - mountPath: /opt/data/profiles
+              name: data
+              subPath: profiles
+            - mountPath: /opt/data/profiles/platform
+              name: data
+              subPath: profiles/platform
+            - mountPath: /opt/data/skills
+              name: data
+              readOnly: true
+              subPath: skills
+            - mountPath: /opt/data/scripts
+              name: data
+              readOnly: true
+              subPath: scripts
+            - mountPath: /opt/data/governance
+              name: data
+              readOnly: true
+              subPath: governance
+            - mountPath: /opt/data/profiles/platform/skills
+              name: data
+              readOnly: true
+              subPath: profiles/platform/skills
+            - mountPath: /opt/data/profiles/platform/scripts
+              name: data
+              readOnly: true
+              subPath: profiles/platform/scripts
+            - mountPath: /opt/data/profiles/platform/governance
+              name: data
+              readOnly: true
+              subPath: profiles/platform/governance
       enableServiceLinks: false
+      initContainers:
+        - args:
+            - --prepare-image-trees
+          env:
+            - name: SANDBOX_HOME_ROOTS
+              value: . profiles/platform
+          image: ghcr.io/gke-labs/kube-agents/agent-sandbox:latest
+          name: prepare-image-trees
+          resources:
+            limits:
+              cpu: 500m
+              memory: 256Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              add:
+                - CHOWN
+                - DAC_OVERRIDE
+                - FOWNER
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - mountPath: /opt/data
+              name: data
       serviceAccountName: platformagent-shell
       shareProcessNamespace: false
       volumes:
@@ -1127,7 +1192,7 @@ metadata:
       name: platformagent
       uid: ""
 spec:
-  progressDeadlineSeconds: 1200
+  progressDeadlineSeconds: 1800
   replicas: 1
   selector:
     matchLabels:
@@ -1270,7 +1335,7 @@ spec:
                   $API_SERVER_KEY" http://127.0.0.1:8642/api/sessions?limit=1; rc=$?;
                   [ "$rc" -eq 0 ] && exit 0; [ "$rc" -eq 7 ] && [ "$ENABLE_LEADER_ELECTION"
                   = "true" ] && exit 0; exit "$rc"'
-            failureThreshold: 60
+            failureThreshold: 90
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 5

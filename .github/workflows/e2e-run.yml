@@ -47,7 +47,7 @@ on:
       timeout_minutes:
         description: "Job timeout"
         required: false
-        default: 60
+        default: 95
         type: number
 
 jobs:
@@ -60,13 +60,13 @@ jobs:
     concurrency:
       group: ${{ inputs.github_environment }}-environment
       cancel-in-progress: false
-    # Roughly 40 of the default 60 minutes can go before the first test runs: a
-    # fresh Autopilot cluster scaling from zero and pulling every image, then
-    # wait_for_gke_readiness.sh's litellm (420s) and gateway (900s) gates paid
-    # twice each, plus a 300s image-tag verification loop and the adapter build
-    # ahead of it. Lower this and the job timeout fires before the tests do,
-    # reporting a broken deploy rather than a slow one. Re-derive the sum from
-    # wait_for_gke_readiness.sh before changing it.
+    # Up to 74 of the default 95 minutes can go before the first test runs: ~5m
+    # of runner setup and adapter build, then wait_for_gke_readiness.sh's
+    # litellm (420s) and gateway (1500s) gates paid twice each (64m) plus
+    # confirm_agent_image.sh's 300s verification loop (5m), leaving ~21m for the
+    # RC suites. Lower this and the job timeout fires before the suites finish,
+    # reporting a broken deploy rather than a slow one. Held by
+    # SiblingGatewayRolloutGatesTest in tests/test_gateway_rollout_budgets.py.
     timeout-minutes: ${{ inputs.timeout_minutes }}
     permissions:
       contents: read

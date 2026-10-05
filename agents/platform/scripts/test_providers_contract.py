@@ -61,6 +61,7 @@ SHAPES: dict[str, frozenset[str]] = {
             "url",
             "created",
             "updated",
+            "closed",
             "body",
         }
     ),

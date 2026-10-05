@@ -446,6 +446,15 @@ class TestTheValidatorItself(unittest.TestCase):
         )
         self.assertEqual(problems, [])
 
+    def test_a_replay_card_check_on_the_decoy_alone_is_not_rejected(self):
+        # replay_card's verifier asserts on decoy_status_in by itself, so the
+        # validator must count it as a field that can fail.
+        problems = []
+        validator._check_assertions(
+            {"type": "replay_card", "decoy_status_in": ["blocked"]}, "check 'x'", problems
+        )
+        self.assertEqual(problems, [])
+
     def test_main_exits_non_zero_when_a_case_is_rejected(self):
         # Every other test here reads the problem list that validate_case
         # returns. None of them runs main(), so none of them would notice if

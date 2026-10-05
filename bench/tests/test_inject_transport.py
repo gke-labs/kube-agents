@@ -1928,7 +1928,7 @@ def test_each_reason_class_is_named(state: str, reason: str, infrastructure: boo
 
 
 def test_the_infrastructure_reasons_are_the_executors_own() -> None:
-    """The set is the bridge's five plus the worker adapter's two, named
+    """The set is the bridge's and the worker adapter's own reasons, named
     against their definitions; the persona's are not in it."""
     assert inject.INFRASTRUCTURE_REASONS == {
         "bridge-shutdown",
@@ -1939,6 +1939,9 @@ def test_the_infrastructure_reasons_are_the_executors_own() -> None:
         "worker-evicted",
         "bus-subscribe-failed",
         "hermes-rate-limited",
+        "hermes-api-unreachable",
+        "hermes-api-refused",
+        "session-busy",
     }
     assert not inject.INFRASTRUCTURE_REASONS & inject.PERSONA_REASONS
 

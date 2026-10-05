@@ -86,8 +86,10 @@ one planted defect, one name, however the case refers to it. Cases address fixtu
 role and never by cluster name or project id; `docs/designs/bench-fleet-catalog.md` is
 the contract for why.
 
-A case whose spec reads live cluster state must declare it. `fixtures: []` is the
-declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up
+A case whose spec reads live cluster state must declare it. A check that reads the
+agent's own install rather than the seeded fleet (the `bootstrap_*` checks,
+`sandbox_tree_matches_image`) is not a fixture read, and a case carrying only those needs
+no `fixtures:`. `fixtures: []` is the declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up
 its own Terraform stack and depends on no fixture — and an absent key on such a case is a
 finding, because a grep that returns one case for a role has to mean one case uses it.
 
@@ -168,7 +170,7 @@ deployment's ready replicas land in a range). A fourth, `fleet_resource_property
 this repository's `resource_property` against the seeded-fleet cluster that carries a
 fixture role, named by `fixture_role:` rather than by cluster.
 
-Seven read what the run produced, from this repository
+Nine read what the run produced, from this repository
 (`bench/kube_agents_bench/verifiers.py`, registered through the
 `devops_bench.verifiers` entry-point group in `bench/pyproject.toml`):
 `report_contains` (phrases in the agent's answer; its `forbidden_patterns` are
@@ -181,13 +183,15 @@ repetition's, unless the case sets `accepts_stream_pull_request` and runs on an 
 prefix written to the case's GitOps repository since the repetition started; it
 passes on a write, so a case wraps it in `none` to say the agent wrote nothing
 it was not asked for, and the inject lane appends exactly that entry to every
-case it runs), and `worker_commands` (regular expressions over the terminal commands
+case it runs), `worker_commands` (regular expressions over the terminal commands
 the delegated workers ran, read from each card's worker log before the harness
-purges it), and `worker_agents` (regular expressions every one of which must match the
+purges it), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
-workers' trajectory entries).
+workers' trajectory entries), `replay_card` (the status and comments of the card a
+card-wake replay planted, read before the harness archives it), and `reply_is_silent`
+(whether the gateway would post the closing message at all, by its own silence rule).
 
-Four read the install under test, all from the same file. `bootstrap_fanout` compares the
+Five read the install under test, all from the same file. `bootstrap_fanout` compares the
 cards the onboarding discovery sweep filed, read from the agent pod's board, against the
 Cluster Agent profiles on its disk. Its `require` is `one_card_per_cluster_agent` (exactly
 one card per ready profile with a cluster identity, keyed and assigned to it, and no cluster
@@ -203,6 +207,9 @@ sandbox too, and passes when onboarding's delivery job has claimed the ranked re
 `INVENTORY.delivered.md`, which it does after reading it. `bootstrap_delivered` reads the
 agent pod's `cron/executions.db` instead and passes when the delivery job's run that claimed
 the report completed, which is the condition for the scheduler to post what it printed.
+`sandbox_tree_matches_image` execs into the agent's shell sandbox Pod and diffs the image's
+staged skills, scripts and governance against the copies the sandbox runs, so a case can
+grade an edit to them by its effect.
 
 Two limits are worth knowing before choosing one. `tool_called` defaults to
 `scope: router`, the delegating turn's calls only — the harness appends the delegated

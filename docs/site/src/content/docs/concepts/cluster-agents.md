@@ -27,7 +27,7 @@ A managed cluster and its Cluster Agent profile are created together and deleted
 
 Delegation runs on the shared kanban board — agents never pass context to each other directly:
 
-1. The Platform Agent resolves the cluster's profile name with its `get_cluster_profile_name` tool, which also says whether that profile exists, and files a card: `kanban_create(assignee="<profile>", body="<namespace/workload, symptom, time window>")`.
+1. The Platform Agent resolves the cluster's profile name with its `get_cluster_profile_name` tool, which also says whether that profile exists, and files a card: `kanban_create(assignee="<profile>", body="<namespace/workload, symptom, time window>")`. If the request omits the cluster name, `list_cluster_profiles()` returns every profile with the project, cluster and location it is pinned to, so the Platform Agent can find the cluster first.
 2. The gateway's dispatcher auto-spawns the Cluster Agent as a worker on that card. The card inherits the chat subscription of the card that created it, so the user sees the cluster's progress in the thread.
 3. The worker completes the card with the grounded root-cause analysis in `result` — the field the gateway posts into the requesting chat thread verbatim — and the machine-readable form of it, including the proposed manifest patch, in `metadata`.
 4. The Platform Agent reads the result and, if you asked for the fix, submits it through the [declarative workflow](/kube-agents/concepts/declarative-workflow/) (`submit-suggestion`); if you asked for a diagnosis, the root cause and the proposed patch come back in the reply. The write path never moves to the cluster side.

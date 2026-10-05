@@ -447,9 +447,8 @@ def _post_body(provider, repo: str, pr, body: str) -> None:
     None of it survives the split into separate pods. There is no volume both
     sides mount, so `post_comment` takes the text and hands it to the verb as a
     field, which travels as JSON on fd 0 through the one channel that crosses a
-    pod boundary. `audit_report.BODY_STDIN` still takes the older exit from the
-    other side: the same fd, carrying the document itself rather than a request
-    containing it.
+    pod boundary. The fleet audit's issue and pull-request bodies take the same
+    route.
     """
     provider.post_comment(repo, pr, body)
 
