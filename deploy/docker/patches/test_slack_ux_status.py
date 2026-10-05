@@ -684,6 +684,33 @@ class PlanTest(_RuntimeCase):
         _run(runtime.settle_row(adapter, _sub(), "completed"))
         self.assertEqual(self._sent(adapter), ["suspended", "processing", "closed"])
 
+    def test_a_blocked_card_on_unposted_plan_resuming_by_note_sends_processing_and_completing_clears(self):
+        # A card blocking on an unposted plan suspends. Resuming via progress note
+        # moves the session back to processing, and completing clears it to closed.
+        adapter = _Adapter(_Client(fail={"post"}))
+        self.assertFalse(self._note(adapter, 1, "reading logs"))
+        _run(runtime.settle_row(adapter, _sub(), "blocked"))
+        self.assertEqual(self._sent(adapter), ["suspended"])
+        self.assertFalse(self._note(adapter, 2, "resumed working"))
+        self.assertEqual(self._sent(adapter), ["suspended", "processing"])
+        _run(runtime.settle_row(adapter, _sub(), "completed"))
+        self.assertEqual(self._sent(adapter), ["suspended", "processing", "closed"])
+
+    def test_two_cards_on_unposted_plan_one_blocked_sibling_starting_by_note_sends_processing(self):
+        # Card A blocks on an unposted plan, sending suspended. Sibling card B
+        # starting with a progress note transitions session to processing while A waits.
+        adapter = _Adapter(_Client(fail={"post"}))
+        self.assertFalse(self._note(adapter, 1, "a", task="t_a"))
+        _run(runtime.settle_row(adapter, _sub("t_a"), "blocked"))
+        self.assertEqual(self._sent(adapter), ["suspended"])
+        adapter.client.fail.clear()
+        self.assertFalse(self._note(adapter, 2, "b", task="t_b"))
+        self.assertEqual(self._sent(adapter), ["suspended", "processing"], "t_b is rolling while t_a waits")
+        _run(runtime.settle_row(adapter, _sub("t_b"), "completed"))
+        self.assertEqual(self._sent(adapter), ["suspended", "processing", "suspended"], "t_a is still waiting")
+        _run(runtime.settle_row(adapter, _sub("t_a"), "completed"))
+        self.assertEqual(self._sent(adapter), ["suspended", "processing", "suspended", "closed"])
+
     def test_an_unblocked_card_on_unposted_plan_sends_default_text_to_legacy_setter(self):
         # On a client without Agent Sessions, an unblocked card on an unposted plan
         # passes adapter._default_status_text(None) to _set_thread_status, not literal "processing".

@@ -433,13 +433,13 @@ async def _session(adapter: Any, key: tuple, plan: _Plan, *, force: bool = False
 
     :func:`_plan_session` reads the current plan and any set aside: a card
     running opens the session, one waiting on the user suspends it, nothing
-    clears it. Sent on every note and settle that moves a posted plan:
+    clears it. Sent on every note and settle that moves a plan:
     :func:`set_thread_status` skips an unchanged status against what
     Slack last accepted, so a refused one is retried and one a Planning Agent
     turn changed is restored. The legacy setter has no such check and costs a
-    call per note, beside the note's own edit. A plan that never posted sends
-    no status during note delivery; its cards' settlements update the session
-    when settling.
+    call per note, beside the note's own edit. An unposted plan sends status
+    during note delivery and card settlement, keeping the thread's session in
+    sync with its rolling and waiting cards.
     """
     chat_id, thread_ts = key
     wanted = _plan_session(chat_id, thread_ts)
@@ -801,7 +801,7 @@ async def deliver_row(
         _plans.move_to_end(key)  # eviction at PLANS_MAX takes the least active thread
     if plan.fallback:
         _roll(adapter, key, plan, card)
-        if plan.ts:
+        if plan.ts or (_status is not None and _sessions.get(key, ("", 0))[0] == _status.SESSION_SUSPENDED):
             await _session(adapter, key, plan)
         return False
     row = plan.rows.get(card)
@@ -826,7 +826,7 @@ async def deliver_row(
         else:
             row.lines, row.steps, row.note, row.status, row.last_event_id = previous
         _roll(adapter, key, plan, card)
-        if plan.ts:
+        if plan.ts or (_status is not None and _sessions.get(key, ("", 0))[0] == _status.SESSION_SUSPENDED):
             await _session(adapter, key, plan)
         return False
     _arm(adapter, key, plan)
