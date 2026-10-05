@@ -170,6 +170,9 @@ type Gateway struct {
 	// resolution (Config.GchatAllowedUsers, lowercased at build).
 	gchatAllowed  map[string]bool
 	gchatAllowAll bool
+	// targetAllowed is Config.TargetAllowedUsers compiled for lookup: the
+	// platform agent's own lists, checked when a session asks to delegate.
+	targetAllowed targetAllowed
 	// droppedNotices records which unverifiable senders have been told so —
 	// the drop is visible once per sender, not once per message. Per
 	// sender, NOT per conversation: a channel mention mints a fresh
@@ -275,6 +278,12 @@ func New(o Options) (*Gateway, error) {
 	if backend == gchatBackend && len(gchatAllowed) == 0 && !o.Config.GchatAllowAllUsers {
 		log.Warn("gchat allowlist is empty and allow-all is off; every inbound message will be dropped at verification")
 	}
+	targetAllowed := buildTargetAllowed(o.Config)
+	for target, byBackend := range targetAllowed {
+		for b, set := range byBackend {
+			log.Info("target allowlist loaded", "target", target, "backend", b, "entries", len(set))
+		}
+	}
 	if o.RelayDurable == "" {
 		o.RelayDurable = relayDurable
 	}
@@ -317,6 +326,7 @@ func New(o Options) (*Gateway, error) {
 		injectAudience: injectAudience,
 		gchatAllowed:   gchatAllowed,
 		gchatAllowAll:  o.Config.GchatAllowAllUsers,
+		targetAllowed:  targetAllowed,
 		droppedNotices: map[string]bool{},
 		relayDurable:   o.RelayDurable,
 	}
