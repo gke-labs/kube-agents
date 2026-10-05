@@ -634,8 +634,8 @@ stopped publishing, or an egress allowlist admits only the old hostname, only th
 
 ## How each failure is tested
 
-Every failure on this list is tested the same way, and this section is written for a reader who
-has never seen the code. A small test fleet of four clusters runs all the time for this purpose.
+Every failure on this list that can be set up is tested the same way, and this section is written
+for a reader who has never seen the code. Six cannot be set up, and the end of this section says why. A small test fleet of four clusters runs all the time for this purpose.
 On it we set up a harmless example of each failure: not a live outage, but the condition that
 would cause one, such as a rule that forbids taking an application down, so the fleet stays
 healthy and the test can run every night. Then, every night, a scripted test asks the assistant
@@ -647,11 +647,12 @@ batch-runner". Only those lines are checked automatically, word for word, so a r
 be mistaken for a wrong one because of how it was phrased, and a hedged or wrong line fails. The
 rest of the answer, the explanation and the advice, is read by a second model that scores its
 quality. Two guards sit around every test: if the example was quietly repaired during the run,
-the test fails rather than passes, and if a test cluster was missing when the test ran, the result
-is recorded as a broken environment rather than a wrong answer.
+the test fails rather than passes, and if a test cluster was missing when the test ran, the test is
+designed to record a broken environment rather than a wrong answer.
 
-Two failures get a second test. The assistant also produces a scheduled weekly report on upgrade
-readiness without being asked, and for those two the report itself must flag the problem.
+One failure, the protection rule, gets a second test. The assistant also produces a scheduled
+weekly report on upgrade readiness without being asked, and for that one the report itself must
+flag the problem.
 
 Six of the twenty cannot be set up as a standing example, because the failure only exists during
 a specific version change, is a live fault, needs hardware the fleet does not have, or lives in a
@@ -664,7 +665,7 @@ reproduction, and the table says so.
 | 2   | [No spare capacity for the displaced pods](#2-no-spare-capacity-for-the-displaced-pods)                                                | A machine pool on the second cluster set to replace its only machine without adding a spare first, with one application pinned to it                                                | Asked which pools would take their application down during an upgrade; must name the pool and the application                                                                                                |
 | 3   | [Every replica in one zone or on one node](#3-every-replica-in-one-zone-or-on-one-node)                                                | On the fourth cluster, three applications whose copies all sit in one zone, each for a different reason: a placement rule, a disk tied to that zone, no room in the other zone      | Asked which applications lose every copy when one zone is drained; must name all three and the reason for each                                                                                               |
 | 4   | [Data on the node is gone](#4-data-on-the-node-is-gone)                                                                                | An application on the first cluster that keeps its work queue in a scratch directory on the machine itself, which an upgrade wipes                                                  | Asked which applications keep state on the machine; must name it                                                                                                                                             |
-| 5   | [Maintenance window too short, or an exclusion ends mid-roll](#5-maintenance-window-too-short-or-an-exclusion-ends-mid-roll)           | The second cluster is held back from upgrading by a calendar hold with an end date                                                                                                  | Asked when each cluster's hold ends; must give the date. The weekly report already flags a hold that blocks a due upgrade                                                                                    |
+| 5   | [Maintenance window too short, or an exclusion ends mid-roll](#5-maintenance-window-too-short-or-an-exclusion-ends-mid-roll)           | The second cluster is held back from upgrading by a calendar hold with an end date                                                                                                  | Asked when each cluster's hold ends; must give the date. The weekly report flags only a hold that blocks every upgrade, which is not the kind set up here, so the chat test is the only check of it          |
 | 6   | [A served API version is removed](#6-a-served-api-version-is-removed)                                                                  | A scheduled job on the first cluster that still calls an old interface: one that is deprecated but still works, because a cluster would refuse an interface that is already removed | Asked which callers use removed interfaces and which merely deprecated ones; must put this job under deprecated and say nothing calls a removed one                                                          |
 | 7   | [A fail-closed webhook whose backend is not up](#7-a-fail-closed-webhook-whose-backend-is-not-up)                                      | A gatekeeper on the second cluster configured to reject every new pod whenever it cannot be reached, pointing at a service that does not exist                                      | Asked which gatekeepers would block pods from restarting during an upgrade; must name it                                                                                                                     |
 | 8   | [A default changes in the new minor](#8-a-default-changes-in-the-new-minor)                                                            | Nothing: the failure exists only between two specific versions                                                                                                                      | Not tested on the standing fleet; the one-off reproduction is the record                                                                                                                                     |
@@ -684,7 +685,7 @@ reproduction, and the table says so.
 This table is the plan the tests follow, not a status board. Engineers find what exists today
 in four places: the fleet's fixture catalogue
 ([`bench/tf/fleet/fixtures.json`](../../bench/tf/fleet/fixtures.json)) for what is set up, the
-nightly roster (`hack/eval/nightly-cases.txt`) for which tests run, the case format
+two rosters under `hack/eval/` for which tests run, the case format
 ([`bench-case-format.md`](bench-case-format.md)) for how a test is written, and the governance
 SOPs for what the weekly report checks. The one-off reproductions behind every row are in
 [`upgrade-failure-reproductions.md`](upgrade-failure-reproductions.md).
