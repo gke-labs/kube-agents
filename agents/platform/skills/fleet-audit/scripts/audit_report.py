@@ -2397,7 +2397,8 @@ def report_filed(envelope: dict | None) -> tuple[set[str], set[tuple[str, str]]]
     search, and one in a carried ledger document were all filed. A finding
     whose check that run did not run on its cluster -- the cluster skipped,
     the check timed out or inapplicable -- was not looked for, so is unknown
-    rather than new. None without a stored document, as for a memory seeded
+    rather than new; what ran comes from that run's own document alone, since
+    a carried ledger document's scope is an older run's. None without a stored document, as for a memory seeded
     from the issue body, which cannot say what the body left out.
     """
     envelope = envelope or {}
@@ -2414,6 +2415,8 @@ def report_filed(envelope: dict | None) -> tuple[set[str], set[tuple[str, str]]]
         findings = document.get("findings")
         filed = (findings if isinstance(findings, list) else []) + postures_withheld(document)
         ids.update(str(f["id"]) for f in filed if isinstance(f, dict) and f.get("id"))
+        if document is not envelope.get("document"):
+            continue
         scope = document.get("scope")
         clusters = scope.get("clusters") if isinstance(scope, dict) else None
         for cluster in clusters if isinstance(clusters, list) else []:

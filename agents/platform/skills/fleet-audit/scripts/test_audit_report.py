@@ -3677,6 +3677,29 @@ class TestNewMarker(HarnessTestCase):
         )
         self.assertEqual(self.marked(self.finish(doc)), [derived_id(fid="c")])
 
+    def test_a_carried_ledger_documents_scope_does_not_count_as_looked_at(self):
+        # A held-open run skipped stage-eu and carried the older run's ledger
+        # document, which reached it; the last run still never looked there.
+        alpha = make_finding(fid="a", title="Alpha finding")
+        skipped = make_doc(
+            clusters=[{"name": "prod-us-east"}],
+            skipped=[{"cluster": "stage-eu", "reason": "unreachable"}],
+        )["scope"]
+        self.remember([alpha], scope=skipped)
+        latest = self.store_dir() / "latest.json"
+        envelope = json.loads(latest.read_text(encoding="utf-8"))
+        reached = make_doc(clusters=[{"name": "prod-us-east"}, {"name": "stage-eu"}])["scope"]
+        envelope["ledger_document"] = {"findings": [], "scope": reached}
+        latest.write_text(json.dumps(envelope), encoding="utf-8")
+        doc = make_doc(
+            findings=[
+                alpha,
+                make_finding(fid="b", title="Bravo finding", cluster="stage-eu"),
+                make_finding(fid="c", title="Charlie finding"),
+            ]
+        )
+        self.assertEqual(self.marked(self.finish(doc)), [derived_id(fid="c")])
+
     def test_a_finding_whose_check_the_last_run_did_not_run_is_not_new(self):
         # The last run reached prod-us-east but its netpol check did not run
         # there (timed out, say), so nothing it found there is known new.
