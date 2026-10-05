@@ -1276,6 +1276,18 @@ class RuntimeTest(unittest.TestCase):
                     self._options_incident(adapter, *labels)
                     check(adapter)
 
+    def test_the_recommended_buttons_text_typed_with_its_suffix_counts(self):
+        labels = ("apply Option A: Raise the limit", "apply Option B: Restore the secret")
+        for text in (
+            f"apply B: Restore the secret{incident.RECOMMENDED_SUFFIX}",
+            f"apply Option B: Restore the secret{incident.RECOMMENDED_SUFFIX}",
+        ):
+            with self.subTest(text=text):
+                importlib.reload(runtime)
+                adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": text, "ts": "223.000"}])
+                self._options_incident(adapter, *labels, recommended=1)
+                self._drops(adapter)
+
     def test_a_clipped_buttons_shown_text_counts_as_its_whole_text(self):
         title = (
             "Roll back checkout-gateway to the last revision that served without OOMKills in prod "
@@ -1291,7 +1303,7 @@ class RuntimeTest(unittest.TestCase):
                 (self._drops, f"apply B: {shown.lower()}"),
                 (self._runs, f"apply B: {shown.rsplit(' ', 1)[0]}"),
                 (self._runs, f"apply A: {shown}"),
-            )
+            ) + ((self._drops, f"apply B: {shown}…{incident.RECOMMENDED_SUFFIX}"),) * bool(recommended)
             for check, text in cases:
                 with self.subTest(recommended=recommended, text=text):
                     importlib.reload(runtime)

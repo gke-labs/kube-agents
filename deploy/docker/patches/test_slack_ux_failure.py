@@ -208,6 +208,29 @@ class PresentTest(unittest.TestCase):
             with self.subTest(reply=reply):
                 self.assertEqual(runtime.present(reply)[1], "check it there")
 
+    def test_a_question_after_a_blank_line_is_offered_whatever_it_opens_on(self):
+        for reply, want in {
+            "It failed.\n\nOK to retry?": "OK to retry",
+            "It failed.\n\nI'll retry at 14:00, want that?": "I'll retry at 14:00, want that",
+            "It failed.\n\n2 retries left, use one?": "2 retries left, use one",
+            "It failed.\n\nretry it on seeded-a?": "retry it on seeded-a",
+        }.items():
+            with self.subTest(reply=reply):
+                self.assertEqual(runtime.present(reply)[1], want)
+
+    def test_a_question_cut_at_an_abbreviation_offers_nothing(self):
+        for reply in (
+            "It failed. Scale down vs. roll back?",
+            "It failed. Restart it on seeded-a, i.e. the canary?",
+            "It failed. Try another cluster, e.g. seeded-a?",
+            "It failed. Reopen ticket No. 3?",
+        ):
+            with self.subTest(reply=reply):
+                self.assertEqual(runtime.present(reply)[1], "")
+        for reply in ("It failed. The answer is no. Retry?", "I checked pods, services, etc.\n\nRetry?"):
+            with self.subTest(reply=reply):
+                self.assertEqual(runtime.present(reply)[1], "retry")
+
     def test_a_question_that_carries_on_the_line_above_offers_nothing(self):
         for reply in ("It stopped. Should I check it\nthere?", "It stopped.\n- seeded-a\n  Should I retry?"):
             with self.subTest(reply=reply):
@@ -505,7 +528,7 @@ class ApplyTest(unittest.TestCase):
             + applier.START_ANCHOR
             + "        finally:\n"
             + "            pass\n",
-            applier.SLACK_ADAPTER: "from typing import Optional\n\n\nclass S:\n"
+            applier.SLACK_ADAPTER: "from typing import Optional\n\n\nclass SlackAdapter:\n"
             + applier.BLOCKS_ANCHOR
             + "        return None\n",
             applier.RUN_TURN: "class R:\n    async def _run_agent_queued_followup(self, turn_ctx, pending_event):\n"
@@ -554,6 +577,54 @@ class ApplyTest(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             verifier.check_callers(self.root)
         self.assertIn("defines no _process_message_background", str(ctx.exception))
+
+    def test_the_verifier_refuses_a_call_out_of_its_place(self):
+        start = "            _kage_slack_failure.start(event)\n"
+        end = "            _kage_slack_failure.end(_kage_failure_token)\n"
+        begin = "        _kage_failure_token = _kage_slack_failure.begin(event)\n"
+        moved = {
+            "start above its hook": (
+                applier.BASE,
+                lambda text: text.replace(start, "").replace(applier.START_ANCHOR, start + applier.START_ANCHOR),
+            ),
+            "start under an if": (applier.BASE, lambda text: text.replace(start, "            if False:\n    " + start)),
+            "end outside the finally": (
+                applier.BASE,
+                lambda text: text.replace(end, "            pass\n" + end.replace("    ", "", 1)),
+            ),
+            "begin below the send": (
+                applier.BASE,
+                lambda text: text.replace(begin, "").replace("        finally:\n" + end, "    " + begin + "        finally:\n" + end),
+            ),
+            "note_wake apart from the moments line": (
+                applier.NOTIFIER,
+                lambda text: text.replace(applier.WAKE_ANCHOR, applier.WAKE_ANCHOR + "        pass\n"),
+            ),
+        }
+        for name, (rel, misplace) in moved.items():
+            with self.subTest(name=name):
+                self.setUp()
+                applier.apply(self.root)
+                path = self.root / rel
+                text = path.read_text()
+                self.assertNotEqual(misplace(text), text)
+                path.write_text(misplace(text))
+                with self.assertRaises(SystemExit) as ctx:
+                    verifier.check_callers(self.root)
+                self.assertIn("does not make", str(ctx.exception))
+
+    def test_the_verifier_reads_maybe_blocks_on_the_slack_adapter_only(self):
+        applier.apply(self.root)
+        path = self.root / applier.SLACK_ADAPTER
+        patched = path.read_text()
+        upstream = patched.replace("class SlackAdapter:", "class Other:") + (
+            "\n\nclass SlackAdapter:\n" + applier.BLOCKS_ANCHOR + "        return None\n"
+            "\n    def _kage_upstream_maybe_blocks(self, content):\n        return None\n"
+        )
+        path.write_text(upstream)
+        with self.assertRaises(SystemExit) as ctx:
+            verifier.check_callers(self.root)
+        self.assertIn("SlackAdapter._maybe_blocks does not make", str(ctx.exception))
 
     def test_the_verifier_refuses_a_call_reading_a_name_nothing_binds(self):
         path = self.root / applier.RUN_TURN

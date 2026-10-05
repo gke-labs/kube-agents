@@ -31,8 +31,9 @@ sends as the clicker's message in the thread. Typing ``apply`` still works:
 the ``incidents`` row the notifier stores after the send is keyed to the same
 thread, and the report text is untouched, only laid out.
 
-The event watcher's alert also records the thread's session title on its
-routing row, read back by :func:`alert_title`.
+The event watcher's crashloop alert, posted to a Slack thread with the flag
+on, also records the thread's session title on its routing row, read back by
+:func:`alert_title`; any other alert records none.
 
 Only the first report in a thread takes the alert. ``POST /v1/incidents``
 keeps the first report per thread, and a second one edited over it would

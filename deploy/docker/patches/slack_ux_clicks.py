@@ -593,7 +593,7 @@ def _option_texts(message: dict) -> frozenset[tuple[str, str]]:
             value_form = BUTTON_FORM.fullmatch(str(element.get("value") or ""))
             if value_form and not BUTTON_FORM.match(shown):
                 title = shown.removesuffix(INCIDENT_RECOMMENDED_SUFFIX)
-                for text in (title, title.removesuffix(CLIPPED_END)):
+                for text in (shown, title, title.removesuffix(CLIPPED_END)):
                     found.add((value_form.group(1) or "", _option_text(text)))
     return frozenset(found)
 

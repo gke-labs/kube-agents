@@ -6,14 +6,16 @@ has run, with ``slack_presenter.py`` staged beside this script.
 
 Two things are checked:
 
-1. The five calls are in place, read from the parsed tree inside the function
-   that must make each: ``build_wake_text`` calls ``note_wake`` after the
-   moments wake-text line, ``_process_message_background`` calls ``start``
-   after its processing-start hook, ``send_final_ledgered`` brackets its send
-   with ``begin`` and ``end``, ``SlackAdapter._maybe_blocks`` hands upstream's
-   renamed body to ``maybe_blocks``, and ``_run_agent_queued_followup`` calls
-   ``drop``, each importing the module and reading only names bound where
-   it runs (``patchlib.unbound``).
+1. The five calls are in place, read from the parsed tree as the statement
+   right after its upstream anchor, in the same block of the function that
+   must make it: ``build_wake_text`` calls ``note_wake`` after the moments
+   wake-text line, ``_process_message_background`` calls ``start`` after its
+   processing-start hook, ``send_final_ledgered`` calls ``begin`` and then
+   sends inside a ``try`` whose ``finally`` calls ``end``,
+   ``SlackAdapter._maybe_blocks`` opens by handing upstream's renamed body to
+   ``maybe_blocks``, and ``_run_agent_queued_followup`` calls ``drop`` after
+   its processing-start hook, each importing the module and reading only
+   names bound where it runs (``patchlib.unbound``).
 2. The module, loaded by path: flag off a failure wake marks nothing; flag on,
    mock 06's reply to a ``gave_up`` wake's turn is drawn with its first
    sentence in bold and one choice button reading "check it there", a second
@@ -27,6 +29,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import itertools
 import os
 import re
 import sys
@@ -42,25 +45,50 @@ IMPORT_MODULE = "gateway"
 IMPORT_NAME = "slack_ux_failure"
 ALIAS = "_kage_slack_failure"
 
-NOTIFIER = "gateway/kanban_watchers_notifier.py"
-NOTE_WAKE = "_kage_slack_failure.note_wake(self.sub, self.wake_kinds, self.synth)"
-#: Each file's inserted statements, by the function that must make them.
-CALLS = {
-    NOTIFIER: {"build_wake_text": (NOTE_WAKE,)},
-    "gateway/platforms/base.py": {
-        "_process_message_background": ("_kage_slack_failure.start(event)",),
-        "send_final_ledgered": (
-            "_kage_failure_token = _kage_slack_failure.begin(event)",
-            "_kage_slack_failure.end(_kage_failure_token)",
+ADAPTER_CLASS = "SlackAdapter"
+#: The send ``begin`` must sit right above, with ``end`` in its ``finally``.
+BRACKETED_SEND = (
+    "try:\n"
+    "    result = await delivery_adapter._send_with_retry(chat_id=event.source.chat_id, "
+    "content=text_content, reply_to=reply_to, metadata=metadata)\n"
+    "finally:\n"
+    "    _kage_slack_failure.end(_kage_failure_token)"
+)
+#: Each file's inserted statements, by the function that must make them (``Class.name`` for a
+#: method looked up on that class only), as ``(anchor, statement)`` source pairs: the statement
+#: comes right after the anchor in the same block, or first in the body when the anchor is None.
+PLACED = {
+    "gateway/kanban_watchers_notifier.py": {
+        "build_wake_text": (
+            (
+                "self.synth = _kage_moments_wake_text(self.sub, self.d['events'], self.wake_kinds, self.synth)",
+                "_kage_slack_failure.note_wake(self.sub, self.wake_kinds, self.synth)",
+            ),
         ),
     },
-    "plugins/platforms/slack/adapter.py": {
-        "_maybe_blocks": ("return _kage_slack_failure.maybe_blocks(content, self._kage_upstream_maybe_blocks)",),
-        "_kage_upstream_maybe_blocks": (),
+    "gateway/platforms/base.py": {
+        "_process_message_background": (
+            ("await self._run_processing_hook('on_processing_start', event)", "_kage_slack_failure.start(event)"),
+        ),
+        "send_final_ledgered": (("_kage_failure_token = _kage_slack_failure.begin(event)", BRACKETED_SEND),),
     },
-    "gateway/run_turn.py": {"_run_agent_queued_followup": ("_kage_slack_failure.drop(turn_ctx.source, pending_event)",)},
+    "plugins/platforms/slack/adapter.py": {
+        f"{ADAPTER_CLASS}._maybe_blocks": (
+            (None, "return _kage_slack_failure.maybe_blocks(content, self._kage_upstream_maybe_blocks)"),
+        ),
+        f"{ADAPTER_CLASS}._kage_upstream_maybe_blocks": (),
+    },
+    "gateway/run_turn.py": {
+        "_run_agent_queued_followup": (
+            (
+                "await _run_followup_processing_hook(_hook_adapter, pending_event, 'on_processing_start')",
+                "_kage_slack_failure.drop(turn_ctx.source, pending_event)",
+            ),
+        ),
+    },
 }
-MOMENTS_LINE = "self.synth = _kage_moments_wake_text("
+FUNCTION_DEFS = (ast.FunctionDef, ast.AsyncFunctionDef)
+BLOCK_FIELDS = ("body", "orelse", "finalbody")
 
 REPLY = (
     "I couldn't find seeded-z. The fleet has seeded-a, -b and -c. checkout-gateway runs on seeded-a. Check it there?"
@@ -78,17 +106,19 @@ def _fail(detail: str) -> SystemExit:
 
 
 def check_callers(root: Path) -> None:
-    for rel, functions in CALLS.items():
+    for rel, functions in PLACED.items():
         path = root / rel
         tree = ast.parse(path.read_text() if path.is_file() else "")
         # Read from the tree, so a call left only in a comment or a string does not count.
-        for function, calls in functions.items():
-            made = _statements_in(tree, function)
-            if made is None:
+        for function, pairs in functions.items():
+            defs = _defs(tree, function)
+            if not defs:
                 raise _fail(f"{rel} defines no {function}")
-            for call in calls:
-                if call not in made:
-                    raise _fail(f"{rel}'s {function} does not make {call!r}")
+            for anchor, call in pairs:
+                anchor, call = anchor and _code(anchor), _code(call)
+                if not any(_placed(node, anchor, call) for node in defs):
+                    where = f"right after {anchor!r}" if anchor else "first"
+                    raise _fail(f"{rel}'s {function} does not make {call!r} {where}")
         # A call compiles without its import and raises NameError only when it runs.
         if not any(
             isinstance(stmt, ast.ImportFrom)
@@ -102,32 +132,45 @@ def check_callers(root: Path) -> None:
             unbound = patchlib.unbound(tree, stmt)
             if unbound:
                 raise _fail(f"{rel} calls {ALIAS} with {', '.join(unbound)}, which nothing binds there")
-    lines = {
-        ast.unparse(stmt): stmt.lineno
-        for stmt in ast.walk(ast.parse((root / NOTIFIER).read_text()))
-        if isinstance(stmt, (ast.Expr, ast.Assign))
-    }
-    moments = [line for code, line in lines.items() if code.startswith(MOMENTS_LINE)]
-    if not moments or min(moments) > lines[NOTE_WAKE]:
-        raise _fail("note_wake does not follow the moments note on the wake")
 
 
-def _statements_in(tree: ast.Module, function: str) -> "set[str] | None":
-    """The simple statements the functions named ``function`` make, as ``ast.unparse``
-    writes them, or None when ``tree`` defines no such function."""
-    found = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function
-    ]
-    if not found:
-        return None
-    return {
-        ast.unparse(stmt)
-        for node in found
-        for stmt in ast.walk(node)
-        if isinstance(stmt, (ast.Expr, ast.Assign, ast.Return))
-    }
+def _code(source: str) -> str:
+    """``source``'s one statement as ``ast.unparse`` writes it."""
+    return ast.unparse(ast.parse(source).body[0])
+
+
+def _defs(tree: ast.Module, function: str) -> list:
+    """The defs named ``function`` anywhere in ``tree``, or, for ``Class.name``, on that class only."""
+    owner, _, name = function.rpartition(".")
+    if owner:
+        nodes = [n for c in tree.body if isinstance(c, ast.ClassDef) and c.name == owner for n in c.body]
+    else:
+        nodes = list(ast.walk(tree))
+    return [n for n in nodes if isinstance(n, FUNCTION_DEFS) and n.name == name]
+
+
+def _blocks(node: ast.AST):
+    """Each statement list ``node`` runs, nested blocks included and nested defs not."""
+    for field in BLOCK_FIELDS:
+        block = getattr(node, field, None)
+        if isinstance(block, list) and block and isinstance(block[0], ast.stmt):
+            yield block
+            for stmt in block:
+                if not isinstance(stmt, (*FUNCTION_DEFS, ast.ClassDef)):
+                    yield from _blocks(stmt)
+    for inner in (*getattr(node, "handlers", ()), *getattr(node, "cases", ())):
+        yield from _blocks(inner)
+
+
+def _placed(node: ast.AST, anchor: str | None, call: str) -> bool:
+    """Whether ``call`` is ``node``'s first statement (no anchor) or right after ``anchor`` in one block."""
+    if anchor is None:
+        return ast.unparse(node.body[0]) == call
+    for block in _blocks(node):
+        code = [ast.unparse(stmt) for stmt in block]
+        if (anchor, call) in itertools.pairwise(code):
+            return True
+    return False
 
 
 def _calling_statements(tree: ast.Module) -> list[ast.stmt]:

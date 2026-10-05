@@ -300,7 +300,8 @@ def present(content: str) -> tuple[str, str]:
     marker, or the first sentence holds markup outside its code spans, since a
     ``*`` inside would unpair. The offer is the last sentence when it is one
     yes/no question with no markup, not on a list item or heading line nor
-    indented or carrying on the line above, that fits a button, with the ``?`` dropped and
+    indented or carrying on the line above, nor cut short on its line at an
+    abbreviation's period ("vs.", "e.g."), that fits a button, with the ``?`` dropped and
     its first letter lowered unless that would change a word that is
     capitalised anyway ("I", "OK", "API").
     """
@@ -329,6 +330,10 @@ def present(content: str) -> tuple[str, str]:
     question = match.group(1).strip() if match else ""
     if not question or MARKUP.search(question) or len(question) > _presenter.BUTTON_TEXT_MAX:
         return bolded, ""
+    # A line break ends the sentence, whatever the line above ends on.
+    before = text[: match.start(1)]
+    if before.rstrip(" \t") == before.rstrip() and _after_abbreviation(before.rstrip(), question):
+        return bolded, ""
     *above, last = text.rstrip().rsplit("\n", 2)[-2:]
     if _presenter.LIST_MARKER.match(last) or _presenter.HEADING.match(last):
         return bolded, ""
@@ -346,6 +351,14 @@ def present(content: str) -> tuple[str, str]:
     if LOWERABLE.match(word):
         question = question[0].lower() + question[1:]
     return bolded, question
+
+
+def _after_abbreviation(before: str, question: str) -> bool:
+    """Whether ``before`` ends on a period ``slack_presenter`` does not read as a sentence end
+    ("vs.", "e.g.", "No." before a number), so ``question`` is only the tail of its sentence."""
+    tail = max(0, len(before) - _presenter.ABBREVIATION_TAIL)
+    numbered = _presenter.NUMBER_ABBREVIATION_END.search(before, tail) and _presenter.NUMBER_NEXT.match(question)
+    return bool(numbered or _presenter.ABBREVIATION_END.search(before, tail))
 
 
 def _opener(question: str) -> str:
@@ -381,9 +394,10 @@ def _bold(sentence: str) -> Optional[str]:
 
 def _wraps(above: str, line: str) -> bool:
     """Whether ``line`` carries on a sentence ``above`` left open at its end, rather
-    than starting one of its own or a block."""
+    than starting one of its own or a block; a blank line leaves nothing open."""
     return (
-        not above.rstrip().endswith(SENTENCE_ENDS)
+        bool(above.strip())
+        and not above.rstrip().endswith(SENTENCE_ENDS)
         and _continues(line)
         and not LOWERABLE.match(line.lstrip())
     )
