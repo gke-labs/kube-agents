@@ -19,6 +19,7 @@ import os
 import shutil
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -545,12 +546,17 @@ class _Root:
         # On the path for the root's lifetime: the delivery fixture imports
         # gateway.platforms.base when it is called, not when it is loaded.
         sys.path.insert(0, str(self.dir))
+        self._saved_modules = {
+            m: sys.modules[m]
+            for m in list(sys.modules)
+            if m.partition(".")[0] in ("gateway", "agent")
+        }
         self._forget_gateway()
 
     @staticmethod
     def _forget_gateway():
-        for module in [m for m in sys.modules if m.partition(".")[0] in ("gateway", "agent")]:
-            sys.modules.pop(module)
+        for module in [m for m in list(sys.modules) if m.partition(".")[0] in ("gateway", "agent")]:
+            sys.modules.pop(module, None)
 
     def load(self, relative, name):
         """Exec one (possibly patched) fixture with ``gateway`` importable."""
@@ -561,6 +567,7 @@ class _Root:
     def cleanup(self):
         sys.path.remove(str(self.dir))
         self._forget_gateway()
+        sys.modules.update(self._saved_modules)
         shutil.rmtree(self.dir, ignore_errors=True)
 
 
@@ -1238,6 +1245,51 @@ class MissingPresenterTest(unittest.TestCase):
             ), mock.patch.object(runtime.logger, "warning") as warning:
                 runtime.enabled()
                 self.assertEqual(warning.called, warns)
+
+
+class RootTest(unittest.TestCase):
+    def test_root_preserves_external_modules(self):
+        fake_gateway = types.ModuleType("gateway.preexisting")
+        fake_agent = types.ModuleType("agent.preexisting")
+        sys.modules["gateway.preexisting"] = fake_gateway
+        sys.modules["agent.preexisting"] = fake_agent
+        self.addCleanup(sys.modules.pop, "gateway.preexisting", None)
+        self.addCleanup(sys.modules.pop, "agent.preexisting", None)
+
+        root = _Root()
+        # During the root's lifetime, pre-existing modules are cleared so the
+        # fixture tree imports cleanly.
+        self.assertNotIn("gateway.preexisting", sys.modules)
+        self.assertNotIn("agent.preexisting", sys.modules)
+
+        # Exercising delivery fixture imports gateway modules from root.dir.
+        delivery = root.load(applier.DELIVERY, "cron.scheduler_delivery")
+        delivery["_deliver_result"]({"id": "j1"}, "hello", [_target("slack")])
+        self.assertIn("gateway.platforms.base", sys.modules)
+
+        root.cleanup()
+        # After cleanup, what the root added is removed, and the pre-existing
+        # stubs are restored.
+        self.assertNotIn("gateway.platforms.base", sys.modules)
+        self.assertIs(sys.modules.get("gateway.preexisting"), fake_gateway)
+        self.assertIs(sys.modules.get("agent.preexisting"), fake_agent)
+
+    def test_root_preserves_top_level_package_stubs(self):
+        fake_gateway = types.ModuleType("gateway")
+        sys.modules["gateway"] = fake_gateway
+        self.addCleanup(sys.modules.pop, "gateway", None)
+
+        root = _Root()
+        self.assertNotIn("gateway", sys.modules)
+
+        delivery = root.load(applier.DELIVERY, "cron.scheduler_delivery")
+        delivery["_deliver_result"]({"id": "j1"}, "hello", [_target("slack")])
+        self.assertIn("gateway", sys.modules)
+        self.assertIsNot(sys.modules.get("gateway"), fake_gateway)
+
+        root.cleanup()
+        self.assertNotIn("gateway.platforms.base", sys.modules)
+        self.assertIs(sys.modules.get("gateway"), fake_gateway)
 
 
 if __name__ == "__main__":
