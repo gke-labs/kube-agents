@@ -78,13 +78,13 @@ Planning Agent's turn, and the cards would run on.
 Fallback: when posting or editing the plan fails (Slack refuses the blocks, the
 message was deleted), the thread drops to the rolling line until every card
 that rolled a note since has settled or been archived, which is what the
-thread showed before this module. A posted plan holds ``processing`` while
-those cards roll and ``suspended`` while they wait on the user; a plan refused
-on its first post holds session status through its rolling and waiting cards,
-clearing the session when its cards settle. A settle still edits a posted plan, best
-effort, so an edit refused once, for a rate limit say, does not leave its rows
-showing as running. Everything here is in process, like the progress-line map:
-a gateway restart forgets the plan, and the next note starts a new one. A
+thread showed before this module. A plan holds ``processing`` while
+those cards roll and ``suspended`` while they wait on the user, clearing the
+session when its cards settle, even if its initial post was refused by Slack.
+A settle still edits a posted plan, best effort, so an edit refused once,
+for a rate limit say, does not leave its rows showing as running. Everything
+here is in process, like the progress-line map: a gateway restart forgets
+the plan, and the next note starts a new one. A
 card that settles with no plan left closes the thread's session, or suspends
 it while the card waits on the user, so the Working… the old process set
 does not stick; it can also clear Working… for another card from before the
@@ -351,10 +351,10 @@ def _plan_session(chat_id: str, thread_ts: str) -> str:
     """The session status the thread's plans hold, or ``""`` when no card runs or waits.
 
     A card runs on a plan touched within :data:`PLAN_HOLD_SECONDS`: a row
-    running, or a card rolling after its posted plan fell back. A set-aside
-    plan is untouched that long unless a card on it was answered since. A
-    card waiting on the user, on any of the thread's plans, holds
-    ``suspended``.
+    running, or a card rolling after its plan fell back (including when its
+    initial post was refused). A set-aside plan is untouched that long
+    unless a card on it was answered since. A card waiting on the user, on
+    any of the thread's plans, holds ``suspended``.
     """
     key = (chat_id, thread_ts)
     plan = _plans.get(key)
@@ -799,8 +799,7 @@ async def deliver_row(
         _plans.move_to_end(key)  # eviction at PLANS_MAX takes the least active thread
     if plan.fallback:
         _roll(adapter, key, plan, card)
-        if plan.ts or key in _sessions:
-            await _session(adapter, key, plan)
+        await _session(adapter, key, plan)
         return False
     row = plan.rows.get(card)
     created = row is None
@@ -824,8 +823,7 @@ async def deliver_row(
         else:
             row.lines, row.steps, row.note, row.status, row.last_event_id = previous
         _roll(adapter, key, plan, card)
-        if plan.ts or key in _sessions:
-            await _session(adapter, key, plan)
+        await _session(adapter, key, plan)
         return False
     _arm(adapter, key, plan)
     await _session(adapter, key, plan)
