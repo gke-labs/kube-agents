@@ -1105,7 +1105,11 @@ class BridgeImageBuildTest(unittest.TestCase):
         expected = []
         for suffix, image in zip(_A2A_DOCKERFILE_SUFFIXES, _A2A_IMAGES[:4], strict=True):
             uri = f"{_AR_REPO}/{image}:{_TAG}"
-            expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.{suffix} a2a")
+            # The worker's Dockerfile copies the credential broker's shim client
+            # from agents/platform/scripts, so it builds from the repository
+            # root; the gateway and the callout stay on the a2a/ module root.
+            context = "." if suffix == "worker" else "a2a"
+            expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.{suffix} {context}")
             expected.append(f"docker push {uri}")
         self.assertEqual(result.stdout.splitlines(), expected)
 

@@ -175,8 +175,10 @@ steps:
   # The deploy script points the operator at these builds through its
   # overrides; without them the operator would derive the same references
   # from its own image, which is this build's, so the overrides keep the
-  # deploy's inputs explicit rather than change them. Context is the a2a/ module root, as each
-  # Dockerfile's header says. One step rather than three: they share the Go
+  # deploy's inputs explicit rather than change them. Context is the a2a/ module root for the
+  # gateway and the callout, and the repository root for the worker, which copies the
+  # credential broker's shim client from agents/platform/scripts - each Dockerfile's header
+  # says which. One step rather than three: they share the Go
   # module download layer, which the daemon serves to the second and third.
   # Nothing here depends on the platform image, so the step starts at once,
   # like sandbox and operator; the bridge, which does, is the step after.
@@ -200,14 +202,14 @@ steps:
           exit 0
         fi
         set -e
-        build_and_push() { # <Dockerfile suffix> <image URI>
-          docker build --platform linux/amd64 -t "$$2" -f "a2a/Dockerfile.$$1" a2a
+        build_and_push() { # <Dockerfile suffix> <image URI> <build context>
+          docker build --platform linux/amd64 -t "$$2" -f "a2a/Dockerfile.$$1" "$$3"
           docker push "$$2"
         }
-        build_and_push gateway "$_A2A_GATEWAY_URI"
-        build_and_push authcallout "$_A2A_CALLOUT_URI"
-        build_and_push worker "$_A2A_WORKER_URI"
-        build_and_push verifier "$_A2A_VERIFIER_URI"
+        build_and_push gateway "$_A2A_GATEWAY_URI" a2a
+        build_and_push authcallout "$_A2A_CALLOUT_URI" a2a
+        build_and_push worker "$_A2A_WORKER_URI" .
+        build_and_push verifier "$_A2A_VERIFIER_URI" a2a
 
   # The Hermes bridge sidecar (a2a/Dockerfile.hermes-bridge), under the same
   # flag and the same no-op rule. It is FROM the platform-agent image of THIS

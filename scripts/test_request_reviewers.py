@@ -477,6 +477,20 @@ class OwnersTest(unittest.TestCase):
         self.assertTrue(set(OWNERS) <= root_approvers, root_approvers)
         self.assertEqual(rr.applicable_approvers(["hack/eval/presubmit-cases.txt"], REPO_ROOT), set(EVAL_CREW))
         self.assertNotIn(NON_APPROVER, root_approvers)
+        # OWNERS repeats every root approver under `reviewers`: Prow's reviewer
+        # walk falls through hack/OWNERS (no_parent_owners, no reviewers of its
+        # own) to the root list, which is therefore who may lgtm a roster-only
+        # change besides eval-crew, and the file's own comment says so. Pin
+        # both halves: the repeat, and hack/OWNERS still naming no reviewers.
+        # eval-crew is pinned as well so its members keep lgtm repository-wide
+        # (lapis2002 is not a root approver).
+        root_reviewers = {login.lower() for login in rr._read_yaml(REPO_ROOT / rr.OWNERS_FILENAME).get("reviewers") or []}
+        self.assertTrue({login.lower() for login in root_approvers} <= root_reviewers, root_approvers - root_reviewers)
+        self.assertTrue({login.lower() for login in EVAL_CREW} <= root_reviewers, set(EVAL_CREW) - root_reviewers)
+        hack_owners = rr._read_yaml(REPO_ROOT / "hack" / rr.OWNERS_FILENAME)
+        self.assertNotIn("reviewers", hack_owners)
+        for pattern, rules in (hack_owners.get("filters") or {}).items():
+            self.assertNotIn("reviewers", rules or {}, pattern)
 
 
 class SkipReasonTest(unittest.TestCase):

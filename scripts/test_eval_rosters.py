@@ -151,6 +151,7 @@ ADDED_AFTER_THE_MOVE = [
     "chat-question-wake-stays-silent",  # SOUL §2 step 5's already-posted rule
     "chat-question-typed-answer-fresh-session",  # a typed answer from a new thread session
     "platform-worker-shell-edit-of-shipped-skill",  # the sandbox's image trees, #2096
+    "autoops-controller-stall-triage",  # the stall watch on the inject path
     "chat-voice-answer-first",  # a delegated answer opens on its verdict
 ]
 
