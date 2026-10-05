@@ -822,6 +822,12 @@ def _settled_entry(planted: Planted, settled: Settled | None, answer_reply: str 
     }
 
 
+def _no_reply(turn: AgentResult) -> bool:
+    """Whether ``turn`` errored with nothing parsed, as ``AgentResult.errored`` builds one:
+    its ``output`` is the error, not a reply. A parsed turn's warnings leave its reply."""
+    return bool(turn.errors) and not turn.trajectory
+
+
 def merge(
     planted: Planted, wake: AgentResult, answer: AgentResult, settled: Settled | None = None
 ) -> AgentResult:
@@ -830,7 +836,8 @@ def merge(
     ``output`` and ``final_message`` are the reply to the wake; the answer
     turn's text, and the card as the run left it (``settled``), are kept in
     metadata and as the trajectory's :data:`SETTLED_ENTRY`, the answer turn's
-    reply as its ``args.answer_reply`` unless that turn errored. The trajectory,
+    reply as its ``args.answer_reply`` unless that turn errored before any reply
+    was parsed. The trajectory,
     errors and worker captures are both turns'. The
     answer turn's tokens supersede the wake turn's when both read the same
     session, whose row is cumulative over the conversation, except for the
@@ -863,7 +870,7 @@ def merge(
         trajectory=[
             *wake.trajectory,
             *answer.trajectory,
-            _settled_entry(planted, settled, None if answer.errors else answer_reply),
+            _settled_entry(planted, settled, None if _no_reply(answer) else answer_reply),
         ],
         tokens=tokens,
         errors=[*wake.errors, *answer.errors],

@@ -526,6 +526,15 @@ def test_merge_records_no_answer_reply_for_an_errored_answer_turn() -> None:
     assert "answer_reply" not in merged.trajectory[-1]["args"]
 
 
+def test_merge_keeps_the_reply_of_an_answer_turn_that_parsed_with_warnings() -> None:
+    call = {"type": "tool_call", "name": "kanban_unblock"}
+    answer = AgentResult(output="[SILENT]", trajectory=[call], errors=["tool output without a matching call"])
+
+    merged = card_wake.merge(_PLANTED, _result("[SILENT]", [], {}), answer)
+
+    assert merged.trajectory[-1]["args"]["answer_reply"] == "[SILENT]"
+
+
 # --- A typed answer in a fresh session (session: fresh) -----------------------
 
 FRESH_PROMPT = PROMPT + "session: fresh\n"

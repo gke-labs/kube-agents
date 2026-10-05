@@ -102,8 +102,8 @@ WAKE_NOTE = (
     "else: the question already shows who answered and what. If it failed, say so."
 )
 
-#: The answered line a typed answer gets, as ``slack_ux_clicks.CLICKED``, and its
-#: name when looking the answerer's up raises.
+#: The answered line a typed answer gets, as ``slack_ux_clicks.CLICKED``, and the
+#: name it shows when the answerer's name lookup raises.
 ANSWERED = "✓ {who}: {label}"
 NAMELESS = "Someone"
 

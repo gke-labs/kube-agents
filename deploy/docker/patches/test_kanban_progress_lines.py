@@ -1314,6 +1314,7 @@ class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.questions_settled, ["t_e0c1"], "a block settles any earlier question first")
         await self._notes_then_report(_Adapter())
         self.assertEqual(self.questions_settled, ["t_e0c1"] * 4)
+        self.assertEqual(self.question_events, [3, 1, 2, 3], "each settle is told its event's id, for the replay guard")
 
     async def test_a_block_with_no_question_settles_the_earlier_one(self):
         self.posts_question = False
