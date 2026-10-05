@@ -162,6 +162,7 @@ ADDED_AFTER_THE_MOVE = [
     "chat-voice-final-attempt-is-not-retried",  # the front door's reply to a card's last attempt
     "chat-voice-failure-leads-with-fact",  # the front door's reply to a blocked card
     "upgrades-zonal-control-plane-outage-warned",  # upgrade-failure catalogue entry 11, the first scenario case
+    "capability-criteria-confirmed-change",  # the criteria store's confirmed-change path, with capability_store.py
 ]
 
 # Admitted after the split, each by a pull request that cited the record

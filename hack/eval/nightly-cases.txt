@@ -687,3 +687,11 @@
 # mutate. Nightly from its first merge; a presubmit seat is a later pull
 # request that cites its record.
 ./tasks/upgrades-zonal-control-plane-outage-warned/task.yaml
+
+# The upgrade audit's criteria store: a confirmed threshold change written
+# through capability_criteria under the operator's name, read back, and
+# reverted, graded on the declared line per change and on the worker having
+# used the tool. Reads no cluster; writes two changelog entries on the
+# platform profile's volume. `deployer: noop`, `validated: false` until its
+# first observed runs; the 200s default hint.
+./tasks/capability-criteria-confirmed-change/task.yaml
