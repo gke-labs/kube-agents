@@ -235,6 +235,17 @@ class NeedsYouTest(unittest.TestCase):
         self.assertEqual(len(adapter.updates), 1)
         self.assertEqual(runtime._questions[runtime._sub_key(SUB)][0], 9)
 
+    def test_a_failed_re_ask_leaves_the_earlier_question_to_settle_once(self):
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        adapter.fail = True
+        self.assertFalse(_run(runtime.needs_you(adapter, SUB, QUESTION, 9)))
+        self.assertEqual(runtime._unsettled, {})
+        self.assertEqual(runtime._questions[runtime._sub_key(SUB)][0], 3)
+        adapter.fail = False
+        _run(runtime.settle_question(adapter, SUB))
+        self.assertEqual(len(adapter.updates), 1)
+
     def test_a_replayed_block_neither_settles_nor_reposts(self):
         adapter = _Adapter()
         self.assertTrue(_run(runtime.needs_you(adapter, SUB, QUESTION, 3)))

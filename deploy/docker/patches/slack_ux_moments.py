@@ -193,14 +193,15 @@ async def needs_you(adapter: Any, sub: dict, payload: Any, event_id: int = 0) ->
     # The caller settled any earlier question first (kanban_progress_lines.deliver).
     key = _sub_key(sub)
     earlier = _questions.get(key)
-    if earlier is not None:
-        # Still open: its settle failed or never ran. The new question takes the slot, so keep this one for a retry.
-        _remember(_unsettled, (key, earlier[2]), earlier)
     blocks, text = moment
     text = _with_card(text, key[0], any(b.get("type") == "actions" for b in blocks))
     ts = await _post(adapter, sub, blocks, text)
     if ts is None:
+        # The earlier question keeps its slot, so it is settled once, from there.
         return False
+    if earlier is not None:
+        # Still open: its settle failed or never ran. The new question takes the slot, so keep this one for a retry.
+        _remember(_unsettled, (key, earlier[2]), earlier)
     entry = (int(event_id or 0), str(sub.get("chat_id") or ""), ts, blocks, text)
     _remember(_questions, key, entry)
     return True
