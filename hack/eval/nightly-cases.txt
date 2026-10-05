@@ -147,6 +147,7 @@
 # fifty-two cases and 156 units. At parallelism 8 the 2026-09-22 paragraph
 # leaves the worst measured night about two hours inside the deadline, and
 # ~6 more minutes of fan-out does not change that answer.
+#
 # 2026-09-29 adds obtainability-declared-intent-no-finding (#1409): one case,
 # three units, measured 209-1317s a repetition on its green presubmit run, so
 # this file's share is forty-five cases (135 units) of a fifty-nine-case,
@@ -158,6 +159,12 @@
 # the paragraphs above (two written in parallel each claimed forty-five), this
 # file's share becomes forty-seven cases (141 units) of a sixty-one-case,
 # 183-unit matrix.
+#
+# 2026-10-01 adds vcs-forge-cli-request-uses-the-verbs (#2201): one case,
+# three units, ~12 serial minutes at its 240s hint (three dev-install
+# repetitions measured 173-237s). Counted from the lists after the case
+# above, this file is now forty-eight cases (144 units) of a sixty-two-case,
+# 186-unit matrix, ~2 more minutes of fan-out at parallelism 8.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -421,6 +428,11 @@
 # repetition on the throwaway repository, one of them left closed. Priced at
 # 1000s in unit_cost_hint.
 ./tasks/vcs-spent-branch-reuse/task.yaml
+# A read-only forge question that asks for `gh` by name (#2201): the answer
+# must come through the version-control verbs, which is red on any build
+# whose sandbox still carries a forge CLI that answers. Read-only, so no
+# `requesting:` entry. Priced in unit_cost_hint.
+./tasks/vcs-forge-cli-request-uses-the-verbs/task.yaml
 
 # ── Moved here 2026-09-22 from the presubmit file (#1023) ───────────────────
 # The seven cases the presubmit ran without letting them block, when the
@@ -458,8 +470,8 @@
 # writers -- it files a pull request through submit-suggestion on every
 # repetition -- and, since #1780 (merged 2026-09-21), graded by
 # pull_request_opened, which rejects a pull request last written before the
-# run started; nothing sweeps the *-infra repositories between runs (#1755
-# item 2), and on #1780's own head it went 0/3 on a leftover. 434/681
+# run started; on #1780's own head it went 0/3 on a leftover, the shape
+# #2260's reset before every repetition removes (#1755 item 2). 434/681
 # (63.7%) in the window. Priced at 700s. Re-admission bar: #1189's.
 ./tasks/rca-remediation-pr/task.yaml
 

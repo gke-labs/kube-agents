@@ -1062,7 +1062,7 @@ Five details decide whether you will see it happen.
 
 **The roll is a stop-start.** At the default single replica the gateway's update strategy is
 `Recreate`, so the old pod is terminated before the new one starts and the agent is unreachable
-across the gap — up to the startup budget of roughly ten minutes on a cold image pull. Expect one
+across the gap — up to the startup budget of roughly fifteen minutes on a cold image pull. Expect one
 such restart per agent the first time an operator carrying this change reconciles: the annotation is
 new, so the first pass adds it and the template changes once, whether or not anything was rotated.
 An operator upgrade that changes how the digest is computed restarts each stamped pod once in the

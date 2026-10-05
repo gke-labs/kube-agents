@@ -11,14 +11,14 @@ what it still costs is a repository that fills up, and a repetition reproducing
 the same fix refused "nothing to commit" by the leftover branch.
 
 Runs from a Prow periodic that executes only `main`, never a pull request's
-code. That placement is the point: closing a pull request and deleting its
-branch need `pull_requests: write` and `contents: write` on every pool
-repository, and a presubmit runs the pull request's own scripts, so a write
-credential mounted there is reachable by any change under test. Here the
-credential is the agent's own GitHub App, signed through each project's KMS
-key (the same key minty signs with in-cluster), by a service account only this
-job runs as. The token is narrowed at mint to one repository and those two
-writes; the key never leaves KMS.
+code, as the backstop behind the in-job reset (hack/ci_reset_agent_pulls.py,
+which the eval job runs at lease time and before every unit that may write):
+a run killed hard leaves its last unit's pull request, and this closes it once
+the project is free again. The credential is the agent's own GitHub App,
+signed through each project's KMS key (the same key minty signs with
+in-cluster), by a service account only this job runs as. The token is narrowed
+at mint to one repository and the three writes made here (label, close, delete
+the branch); the key never leaves KMS.
 
 Which projects: the ones Boskos hands out as `free`. Each is acquired into a
 `cleaning` state for as long as its sweep takes -- seconds, or minutes after a
@@ -35,15 +35,18 @@ read it refuses under its limit ends the run at once, since the cooldown covers
 the next project's mint and listing too. Every run writes a
 report beside the job's artifacts (write_report), which the CI health bot reads.
 
-Three conditions, all required, matching is_agent_pull_request in
-agents/platform/scripts/forge.py: authored by the agent's bot, head branch
-carrying the agent's prefix, and that branch in the repository itself rather
-than a fork. The head branch goes with the pull request: submit_suggestion.py
-starts from the remote branch when it exists and refuses "nothing to commit"
-when the new tree matches it, so a closed pull request whose branch stayed
-would still cost the next lease a repetition (#1755 item 2). Branches under
-the prefix with no open pull request are deleted too, so a delete that failed
-or a run killed between a close and its delete is caught up by the next run.
+Two conditions, both required: authored by the agent's bot, and the head
+branch in the repository itself rather than a fork. Not the branch name: the
+agent names its own branches when it pushes with git from its sandbox, and
+42 of the 60 pull requests open across the pool on 2026-10-01 carried no
+`platform-agent/` prefix (#2260). A pull request carrying `audit:remediation`
+is labelled `audit:stale-closed` before it is closed, which is how the fleet
+audit tells a harness close from a human's refusal (#2228). The head branch
+goes with the pull request: submit_suggestion.py starts from the remote
+branch when it exists and refuses "nothing to commit" when the new tree
+matches it (#1755 item 2). Every other branch but the default goes too: a
+pool repository is a fixture nothing else keeps branches in, so a branch with
+no open pull request is a leftover whatever its name.
 """
 
 import argparse
@@ -80,7 +83,8 @@ REQUEST_TIMEOUT_SECONDS = 30
 # is logged and reported.
 WRITE_PAUSE_SECONDS = 1.0
 WRITE_BUDGET_PER_RUN = 40
-# A pull request left unclosed will cost its close and its branch delete.
+# A pull request left unclosed will cost its close and its branch delete, and
+# one more for the label when it is the audit's.
 WRITES_PER_PULL_REQUEST = 2
 # GitHub answers a limit with a 429, or with a 403 it marks: a Retry-After, a
 # spent rate-limit budget in the headers, or a body naming a limit. Any other
@@ -111,9 +115,13 @@ MODE_PROJECT = "project"
 # The pause between writes, a module attribute so a test can stand in for it.
 pause = time.sleep
 
-# Must equal AGENT_BRANCH_PREFIX in agents/platform/scripts/forge.py, which is
-# what names the branches these pull requests come from. A test pins the two.
-AGENT_BRANCH_PREFIX = "platform-agent/"
+# The label the fleet audit puts on a remediation pull request it opened, and
+# the one it reads back on a closed one to tell a harness close from a human's
+# refusal (pr_closed_by_harness in agents/platform/skills/fleet-audit/scripts/
+# audit_report.py). An unlabelled close retires that fix path in that
+# repository for good (#2228 item 3). A test pins both literals to the audit's.
+AUDIT_REMEDIATION_LABEL = "audit:remediation"
+STALE_CLOSED_LABEL = "audit:stale-closed"
 
 # GitHub rejects an App JWT whose exp is more than ten minutes out; nine leaves
 # room for clock skew, and the backdated iat covers a slow runner.
@@ -129,10 +137,9 @@ BOT_LOGIN_SUFFIX = "[bot]"
 DEFAULT_APP_ID = "4675512"
 
 # What this asks for: pull_requests to close, contents to delete the head
-# branch (a ref delete is a contents write). The installation carries issues
-# write as well, for the agent; a token that inherited it whole would hold
-# that here for nothing.
-TOKEN_PERMISSIONS = {"pull_requests": "write", "contents": "write"}
+# branch (a ref delete is a contents write), issues to label an audit pull
+# request before its close (labels ride the issues endpoint).
+TOKEN_PERMISSIONS = {"pull_requests": "write", "contents": "write", "issues": "write"}
 # GitHub's answers for a ref that is already gone: 422 "Reference does not
 # exist", or 404. Neither is a failure -- the branch is what was wanted absent.
 REF_GONE_CODES = (404, 422)
@@ -204,9 +211,11 @@ class RateLimited(Exception):
 
 
 class WriteBudget:
-    """The run's remaining writes. A close or a delete takes one; when none is
-    left the rest waits for the next run, counted in `left` as the writes it
-    will need (a pull request left unclosed is two: its close and its delete)."""
+    """The run's remaining writes. A close or a delete takes one, an audit's
+    label and close take two together or not at all; when a take cannot be
+    paid for, what it was for waits for the next run, counted in `left` as the
+    writes it will need (a pull request left unclosed is its close and its
+    delete, and its label when it is the audit's)."""
 
     def __init__(self, writes=None):
         self.budget = WRITE_BUDGET_PER_RUN if writes is None else writes
@@ -214,14 +223,21 @@ class WriteBudget:
         self.left = 0
         self.exhausted_at = None
 
-    def take(self, repo, writes_left_if_not=1):
-        if self.remaining <= 0:
-            if self.exhausted_at is None:
+    def take(self, repo, writes_left_if_not=1, count=1):
+        """Take `count` writes together, or none: a label whose close the
+        budget could not then pay for would leave a pull request open and
+        labelled, so the two are one take."""
+        if self.remaining < count:
+            if self.remaining <= 0 and self.exhausted_at is None:
                 self.exhausted_at = repo
                 print("  write budget for this run (%d) used up at %s; the rest waits for the next run" % (self.budget, repo), file=sys.stderr)
+            elif self.remaining > 0:
+                # One write left and a pair asked for: the pair waits, the
+                # write stays for a single close or delete behind it.
+                print("  %d write(s) left in this run's budget, %d asked for at %s; that one waits for the next run" % (self.remaining, count, repo), file=sys.stderr)
             self.left += writes_left_if_not
             return False
-        self.remaining -= 1
+        self.remaining -= count
         return True
 
 
@@ -360,19 +376,21 @@ def open_pulls(repo, authorization):
 
 
 def is_agent_pull_request(pull, repo, bot_login):
-    """The ownership test from forge.py, over a REST pull-request object.
+    """Authored by the agent's bot, from a branch in the repository itself.
 
-    The branch prefix alone is not ownership -- anyone who can fork can name a
-    branch with it -- so the author and the head repository are checked too.
+    Not the branch name: forge.py's prefix is a convention two skills follow
+    and the agent's own `git push` does not, so it is a read filter there and
+    no test of ownership here. A fork's branch is never the agent's.
     """
     head = pull.get("head") or {}
     head_repo = (head.get("repo") or {}).get("full_name") or ""
     author = (pull.get("user") or {}).get("login") or ""
-    return (
-        author.lower() == bot_login.lower()
-        and str(head.get("ref") or "").startswith(AGENT_BRANCH_PREFIX)
-        and head_repo.lower() == repo.lower()
-    )
+    return author.lower() == bot_login.lower() and head_repo.lower() == repo.lower()
+
+
+def is_audit_pull_request(pull):
+    """Carries the fleet audit's remediation label, so a close must be labelled."""
+    return any((label or {}).get("name") == AUDIT_REMEDIATION_LABEL for label in pull.get("labels") or [] if isinstance(label, dict))
 
 
 def scoped_token(app_id, project, repo, runner=subprocess.run):
@@ -430,7 +448,7 @@ def _field(payload, key, what, repo):
 CALL_FAULTS = (urllib.error.HTTPError, OSError, http.client.HTTPException, SweepError)
 
 
-def _retry_after(exc):
+def retry_after(exc):
     """Seconds GitHub asked for, bounded; the default when it named none."""
     raw = (getattr(exc, "headers", None) or {}).get(RETRY_AFTER_HEADER)
     try:
@@ -438,6 +456,9 @@ def _retry_after(exc):
     except (TypeError, ValueError):
         return RETRY_AFTER_DEFAULT_SECONDS
     return max(0, min(seconds, RETRY_AFTER_MAX_SECONDS))
+
+
+_retry_after = retry_after
 
 
 def is_rate_limited(exc):
@@ -464,7 +485,7 @@ def write(method, path, authorization, body=None):
         except urllib.error.HTTPError as exc:
             if not is_rate_limited(exc):
                 raise
-            wait = _retry_after(exc)
+            wait = retry_after(exc)
             print("  %s %s refused (%s); waiting %ds before one retry" % (method, path, boskos_pool.describe(exc), wait), file=sys.stderr)
             pause(wait)
             try:
@@ -488,18 +509,23 @@ def delete_branch(repo, ref, authorization):
             raise
 
 
-def agent_branches(repo, authorization):
-    """Every branch under AGENT_BRANCH_PREFIX in the repository itself."""
-    refs = api("GET", "/repos/%s/git/matching-refs/heads/%s" % (repo, AGENT_BRANCH_PREFIX), authorization)
-    if not isinstance(refs, list) or not all(isinstance(ref, dict) for ref in refs):
-        raise SweepError("GitHub answered the branch listing for %s with a body that is not a list of refs" % repo)
-    names = [str(ref.get("ref") or "") for ref in refs]
-    return [name[len("refs/heads/"):] for name in names if name.startswith("refs/heads/" + AGENT_BRANCH_PREFIX)]
+def leftover_branches(repo, authorization):
+    """Every branch in the repository but its default one."""
+    default = _field(api("GET", "/repos/%s" % repo, authorization), "default_branch", "the repository lookup", repo)
+    names = []
+    for page in range(1, MAX_PAGES + 1):
+        batch = api("GET", "/repos/%s/branches?per_page=%d&page=%d" % (repo, PER_PAGE, page), authorization)
+        if not isinstance(batch, list) or not all(isinstance(branch, dict) for branch in batch):
+            raise SweepError("GitHub answered the branch listing for %s with a body that is not a list of branches" % repo)
+        names.extend(str(branch.get("name") or "") for branch in batch)
+        if len(batch) < PER_PAGE:
+            break
+    return [name for name in names if name and name != default]
 
 
 def close_agent_pulls(repo, authorization, bot_login, dry_run=False, budget=None):
     """Close every open pull request `bot_login` owns, and delete its branch --
-    and any branch under the agent's prefix an earlier run left behind.
+    and every other branch but the default, whatever an earlier run named it.
 
     Returns (closed, deleted, unclosed, undeleted): the counts, the numbers
     that would not close, and the branches that would not delete. With a
@@ -519,23 +545,41 @@ def close_agent_pulls(repo, authorization, bot_login, dry_run=False, budget=None
         deferred = set()
         for pull in pulls:
             if not is_agent_pull_request(pull, repo, bot_login):
-                still_open.add(str((pull.get("head") or {}).get("ref") or ""))
+                # Only a head in this repository keeps a branch here (a fork's
+                # head shares a name with nothing the branch pass could reach),
+                # and the base always: GitHub closes a pull request whose base
+                # branch is deleted.
+                head = pull.get("head") or {}
+                if str((head.get("repo") or {}).get("full_name") or "").lower() == repo.lower():
+                    still_open.add(str(head.get("ref") or ""))
+                still_open.add(str((pull.get("base") or {}).get("ref") or ""))
                 continue
             number = pull["number"]
             ref = pull["head"]["ref"]
-            print("  #%s (%s)" % (number, ref))
+            audit = is_audit_pull_request(pull)
+            print("  #%s (%s)%s" % (number, ref, " audit, labelled first" if audit else ""))
             if dry_run:
                 closed += 1
                 gone.add(ref)
                 continue
-            if budget is not None and not budget.take(repo, writes_left_if_not=WRITES_PER_PULL_REQUEST):
+            # The label's write and the close's are one take from the budget,
+            # before either is made: a label spent on a pull request the close
+            # cannot then pay for would leave it open and labelled, and
+            # "labelled" and "closed" go together or not at all.
+            needed = WRITES_PER_PULL_REQUEST + int(audit)
+            if budget is not None and not budget.take(repo, writes_left_if_not=needed, count=1 + int(audit)):
                 still_open.add(ref)
                 continue
             # Each close stands alone. One that fails is reported and the sweep
             # carries on: giving up here would leave every later pull request open,
             # which is the thing being fixed. HTTPException covers a response cut
             # short mid-read, which urllib does not raise as OSError.
+            # The audit's label goes on before the close, never after: a close
+            # the audit reads back unlabelled is a human's refusal to it, so a
+            # label that will not stick leaves the pull request open instead.
             try:
+                if audit:
+                    write("POST", "/repos/%s/issues/%s/labels" % (repo, number), authorization, {"labels": [STALE_CLOSED_LABEL]})
                 write(
                     "PATCH",
                     "/repos/%s/pulls/%s" % (repo, number),
@@ -569,14 +613,12 @@ def close_agent_pulls(repo, authorization, bot_login, dry_run=False, budget=None
                 print("  #%s closed but %s was not deleted (%s)" % (number, ref, boskos_pool.describe(exc)), file=sys.stderr)
                 undeleted.append(ref)
         # Branches an earlier run left behind -- a delete that failed, a job killed
-        # between a close and its delete -- belong to closed pull requests, which
-        # no later listing of open ones finds. So the branches are listed too:
-        # every one under the agent's prefix in the repository itself goes, unless
-        # an open pull request (anyone's) still has it as head. In the repository
-        # itself only the agent pushes under its prefix; the prefix-alone caveat
-        # is about forks, which this listing never reaches.
+        # between a close and its delete, a push whose pull request never opened
+        # -- belong to no open pull request, which no listing of those finds. So
+        # the branches are listed too: every one but the default goes, whatever
+        # its name, unless an open pull request (anyone's) still has it as head.
         try:
-            leftover_refs = agent_branches(repo, authorization)
+            leftover_refs = leftover_branches(repo, authorization)
         except RateLimited as exc:
             # The first call after a burst of writes is where a refusal lands.
             exc.closed = closed

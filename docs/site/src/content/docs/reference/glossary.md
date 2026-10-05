@@ -85,7 +85,7 @@ In-cluster broker that mints short-lived GitHub App installation tokens via GCP 
 
 ### Credential proxy
 
-A Deployment of its own (`<name>-credential-proxy`, Envoy plus `credential_proxy.py`) that mediates credentialed CLI execution and holds every credential in the install. The agent's shell runs `gcloud`, `kubectl`, `gh`, and `git` through shims that forward each command to it over a ClusterIP Service, against an executable allowlist, so the pod running model-authored code never holds the raw credentials. Started by `deploy/shared/start-services.sh` with `CREDENTIAL_PROXY_ROLE` unset, which is what distinguishes it from the gateway pod's `agent-api-auth` sidecar built from the same image.
+A Deployment of its own (`<name>-credential-proxy`, Envoy plus `credential_proxy.py`) that mediates credentialed CLI execution and holds every credential in the install. The agent's shell runs `gcloud` and `kubectl` through shims that forward each command to it over a ClusterIP Service, against an executable allowlist, and reaches a forge through the version-control verbs it serves, so the pod running model-authored code never holds the raw credentials. Started by `deploy/shared/start-services.sh` with `CREDENTIAL_PROXY_ROLE` unset, which is what distinguishes it from the gateway pod's `agent-api-auth` sidecar built from the same image.
 
 ### Inference Replay Proxy
 

@@ -1539,9 +1539,12 @@ class PullRequestOpenedVerifier(BaseVerifier):
     fix touches, so every
     later run of the audit on the stream -- this case's later repetitions, or
     another case auditing the same fleet -- finds the pull request open on it,
-    leaves it, and pushes nothing. The presubmit holds no credential to close
-    it between units (docs/ci-pool-projects.md 5.3), so without the option
-    only the first unit on the stream could pass. A leftover from before the
+    leaves it, and pushes nothing. Since #2260 the job's repository reset
+    closes that pull request, labelled ``audit:stale-closed``, before each
+    unit of a case that requests one, so each unit re-proposes and opens its
+    own; the option is for runs the reset skips (no App key,
+    docs/ci-pool-projects.md 5.5), where without it only the first unit on
+    the stream could pass. A leftover from before the
     stream's first unit -- an earlier job on the pool project -- predates the
     stamp and is still rejected. The branch ties the pull request to the
     audit, not to this case's defect: another case on the same stream opens
@@ -2183,10 +2186,13 @@ class GitHubWritesVerifier(BaseVerifier):
     WHAT IT READS. :func:`kube_agents_bench.github_writes.find_writes` over
     the repository ``BENCH_GITOPS_REPO`` names, from
     ``TranscriptSnapshot.started_at`` less ``max_clock_skew_sec``: every pull
-    request under ``branch_prefix`` whose head is in the repository itself and
-    that was opened or updated in the window, and every such branch heading no
-    pull request whose tip was committed in it (the refs API carries no push
-    time, so that is what is measured). The repository comes from the
+    request a ``[bot]`` login (or ``author``) opened from a branch in the
+    repository itself and that was opened or updated in the window, and every
+    branch under ``platform-agent/`` heading no pull request whose tip was
+    committed in it (the refs API carries no push time, so that is what is
+    measured). Not the branch name for a pull request: the agent names its own
+    branches when it pushes with git (#2260); a branch carries no author, so
+    the prefix is the one mark the branch half has. The repository comes from the
     environment and not from the reply, since the reply of a run that wrote
     where it should not have may say nothing about it.
 
@@ -2229,9 +2235,8 @@ class GitHubWritesVerifier(BaseVerifier):
     # project that breaks loudly if the organisation moves -- here as an
     # error, since the repository is the run's configuration, not the reply.
     owner: str = ""
-    branch_prefix: str = github_writes.AGENT_BRANCH_PREFIX
-    # The bot login the writes must carry, "" for any. Left empty by the lane
-    # for the reason github_writes.AGENT_BRANCH_PREFIX gives.
+    # The bot login the writes must carry, "" for any `[bot]` login. Left
+    # empty by the lane for the reason github_writes.BOT_LOGIN_SUFFIX gives.
     author: str = ""
     requested_pull_requests: int = Field(default=0, ge=0)
     # Tolerance between GitHub's stamps and the harness's run-start clock,
@@ -2282,9 +2287,7 @@ class GitHubWritesVerifier(BaseVerifier):
         since = started - timedelta(seconds=self.max_clock_skew_sec)
         client = github_writes.GitHubClient(token, _http_get_json, single_call_timeout(timeout_sec))
         try:
-            report = github_writes.find_writes(
-                client, repo, since, branch_prefix=self.branch_prefix, author=self.author
-            )
+            report = github_writes.find_writes(client, repo, since, author=self.author)
         except github_writes.GitHubUnreadable as exc:
             return done(False, str(exc), status="error")
         except OSError as exc:
@@ -2333,7 +2336,7 @@ class GitHubWritesVerifier(BaseVerifier):
             )
         return done(
             False,
-            f"no pull request or branch under {self.branch_prefix} was written to {repo} "
+            f"no agent pull request or branch was written to {repo} "
             f"since {since.isoformat()} that this repetition has to answer for" + tail,
             raw=raw,
         )

@@ -26,8 +26,8 @@ The **gateway Pod** holds the harness and nothing credentialed:
    internal key. It holds no credential path.
 
 The **shell sandbox Pod**, `<agent>-shell`, runs `sshd`, the agent's own tools, a
-durable `/opt/data`, and the shims that stand in for `gcloud`, `kubectl`, `gh`, and
-`git`. This is the Pod that executes anything the model wrote. Its ServiceAccount
+durable `/opt/data`, the shims that stand in for `gcloud` and `kubectl`, and a
+`git` that holds no credential and reaches no forge. This is the Pod that executes anything the model wrote. Its ServiceAccount
 carries no `iam.gke.io/gcp-service-account` annotation, so the metadata server hands it
 an unbound principal that IAM grants nothing.
 
@@ -163,7 +163,7 @@ and the route table it feeds
 
 - PlatformAgent only.
 - Credentials managed by the operator.
-- CLI forwarding for `gcloud`, `kubectl`, `gh`, and `git`.
+- CLI forwarding for `gcloud` and `kubectl`.
 - Read-only Google Cloud REST relay for the reads no CLI exposes
   ([`designs/gcp-api-relay.md`](designs/gcp-api-relay.md)).
 - Slack and Google Chat credentialed relays.
@@ -318,9 +318,9 @@ proxy. The credential runtime directly executes the corresponding real CLI and
 returns output and exit status. It never evaluates an agent-supplied shell
 command.
 
-Only `gcloud`, `kubectl`, `gh`, and `git` are accepted. The proxy also rejects
-known credential-disclosure, credential-replacement, and self-modification
-operations, and the GitHub **write** path: merging a pull request
+Only `gcloud` and `kubectl` are forwarded from the sandbox. The proxy also
+rejects known credential-disclosure, credential-replacement, and
+self-modification operations, and the GitHub **write** path: merging a pull request
 (`github.merge`), approving a review (`github.assent`), mutating through the
 REST API (`github.api-mutation`), triggering workflows or releases
 (`github.pipeline-trigger`), and repository administration — secrets,

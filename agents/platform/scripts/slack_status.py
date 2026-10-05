@@ -19,13 +19,18 @@ is the same plan as plain text, for the message's ``text`` field, with ``&``,
 The session (:func:`session_status`, :func:`session_title`):
 ``agents.sessions.setStatus`` accepts ``processing``, ``suspended`` or
 ``closed`` and refuses free text with ``invalid_arguments``, which is what
-Hermes's thread status sends it. A title is at most 80 characters and
-``agents.sessions.rename`` refuses ``:``, ``/`` and ``·``.
+Hermes's thread status sends it. ``agents.sessions.rename`` refuses a whole
+title with ``invalid_name`` when it runs over 80 characters or holds a single
+character outside a narrow set: letters, digits, combining marks, spaces, a
+little ASCII punctuation and the common emoji blocks. ``:``, ``/``, ``#``,
+``%``, the ellipsis, every dash but ``-`` and compatibility forms such as
+``²`` or ``ﬁ`` are refused.
 """
 
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -38,11 +43,54 @@ SESSION_SUSPENDED = "suspended"
 SESSION_CLOSED = "closed"
 SESSION_STATUSES = frozenset({SESSION_PROCESSING, SESSION_SUSPENDED, SESSION_CLOSED})
 
-#: ``agents.sessions.rename`` limits, and what each refused character becomes.
-#: A slash becomes the division slash (U+2215), which reads the same, so
-#: ``kube-system/coredns`` stays one name rather than two alternatives.
+#: ``agents.sessions.rename`` limits, measured against Slack: a letter, a
+#: decimal digit or a combining mark in any script passes, as does a symbol in
+#: :data:`TITLE_EMOJI`, and of everything else only :data:`TITLE_KEPT`. The
+#: limit counts code points. A letter with a compatibility decomposition (``ª``,
+#: ``ﬁ``, ``𝐀``, Thai ``ำ``) is refused, so the title is NFKC-normalized first,
+#: which also turns ``…`` into ``...`` and ``²`` into ``2``. A refused character
+#: an ask is likely to hold becomes an ASCII stand-in from
+#: :data:`TITLE_REPLACEMENTS`; a format character such as a zero-width joiner
+#: is dropped, and any other becomes a space.
+#: A slash between two word characters (:func:`_word_char`) becomes a hyphen, so
+#: ``kube-system/coredns`` stays one name rather than two alternatives; one that
+#: leads a path like ``/metrics`` becomes a space. A combining mark goes with
+#: its base, so one on a refused character is dropped. A clipped title ends on
+#: :data:`TITLE_ELLIPSIS`, since "…" is refused.
 TITLE_MAX = 80
-TITLE_REPLACEMENTS = ((":", ","), ("·", ","), ("/", "\u2215"))
+TITLE_KEPT = frozenset(" -'\"&|_!?.,()=“”")
+TITLE_REPLACEMENTS = {
+    ":": ",",
+    ";": ",",
+    "·": ",",
+    "•": ",",
+    "‒": " - ",
+    "–": " - ",
+    "—": " - ",
+    "―": " - ",
+    "−": "-",
+    "‐": "-",
+    "‘": "'",
+    "’": "'",
+    "[": "(",
+    "]": ")",
+    "{": "(",
+    "}": ")",
+    "%": " percent",
+    "×": "x",
+    "、": ",",
+    "。": ".",
+    "«": '"',
+    "»": '"',
+}
+#: The symbol blocks Slack accepts, as inclusive code point ranges: Miscellaneous
+#: Symbols and Dingbats (``⚠``, ``✅``), and the emoji planes from Miscellaneous
+#: Symbols and Pictographs to Symbols and Pictographs Extended-A (``😀``, skin
+#: tones). Regional indicators (flags) sit below them and are refused, as are
+#: ``⭐``, ``⏰`` and ``🀄``.
+TITLE_EMOJI = ((0x2600, 0x27BF), (0x1F300, 0x1FAFF))
+TITLE_EMOJI_CATEGORIES = frozenset({"So", "Sk"})
+TITLE_ELLIPSIS = "..."
 ELLIPSIS = "…"
 #: A word-aligned clip shorter than this share of the limit drops too much; it cuts hard instead.
 CLIP_MIN_SHARE = 2
@@ -125,33 +173,69 @@ def session_status(text: Any) -> str:
     return SESSION_PROCESSING if status else SESSION_CLOSED
 
 
-def _clip(text: str, limit: int) -> str:
-    """``text`` cut on a word to ``limit`` characters, ellipsis included."""
+def _clip(text: str, limit: int, ellipsis: str = ELLIPSIS) -> str:
+    """``text`` cut on a word to ``limit`` characters, ``ellipsis`` included."""
     if len(text) <= limit:
         return text
-    hard = text[: limit - len(ELLIPSIS)]
+    hard = text[: limit - len(ellipsis)]
     cut = hard.rsplit(" ", 1)[0]
     # A long unbroken word would otherwise take everything after the last space with it.
     if len(cut) * CLIP_MIN_SHARE < len(hard):
         cut = hard
-    return cut.rstrip(" ,") + ELLIPSIS
+    return cut.rstrip(" ,") + ellipsis
+
+
+def _word_char(char: str) -> bool:
+    """Whether ``char`` is part of a word: a letter, a decimal digit, ``_`` or a combining mark."""
+    return char.isalpha() or char.isdecimal() or char == "_" or unicodedata.category(char).startswith("M")
+
+
+def _title_char(char: str) -> str:
+    """``char`` if ``agents.sessions.rename`` accepts it, else its stand-in, nothing or a space."""
+    category = unicodedata.category(char)
+    if _word_char(char) or char in TITLE_KEPT:
+        return char
+    if category in TITLE_EMOJI_CATEGORIES and any(low <= ord(char) <= high for low, high in TITLE_EMOJI):
+        return char
+    return TITLE_REPLACEMENTS.get(char, "" if category == "Cf" else " ")
+
+
+def _title_chars(title: str) -> str:
+    """``title`` with each character through :func:`_title_char`, a slash between words joined.
+
+    A combining mark is kept only on a letter, digit or emoji kept as itself, the bases Slack was
+    measured to accept one on; on any other it is dropped with its base.
+    """
+    out: list[str] = []
+    marks_kept = after_word = False
+    for i, char in enumerate(title):
+        if unicodedata.category(char).startswith("M"):
+            out.append(char if marks_kept else "")
+            continue
+        joins = char == "/" and after_word and i + 1 < len(title) and _word_char(title[i + 1])
+        stand_in = "-" if joins else _title_char(char)
+        after_word = stand_in == char and _word_char(char)
+        marks_kept = stand_in == char and char not in TITLE_KEPT
+        out.append(stand_in)
+    return "".join(out)
 
 
 def session_title(text: Any) -> str:
     """A title ``agents.sessions.rename`` accepts, from the ask's words, or ``""``.
 
-    Mentions and bare links are dropped, a channel keeps its name and a link its label, the
-    refused characters are replaced, and the result is clipped on a word to
-    :data:`TITLE_MAX`.
+    Mentions and bare links are dropped, a channel keeps its name and a link its label, each
+    refused character is replaced, and the result is clipped on a word to :data:`TITLE_MAX`,
+    ending on :data:`TITLE_ELLIPSIS`. NFKC first, so a compatibility form becomes the plain
+    character Slack accepts and an accent typed as a combining mark joins its letter.
     """
     title = MENTION.sub(" ", str(text or ""))
-    title = CHANNEL.sub(r"#\1", title)
+    title = CHANNEL.sub(r"\1", title)
     title = LINK.sub(lambda m: m.group(2) or " ", title)
-    for refused, replacement in TITLE_REPLACEMENTS:
-        title = title.replace(refused, replacement)
+    title = unicodedata.normalize("NFKC", title)
+    title = _title_chars(title)
     title = WHITESPACE.sub(" ", title)
     title = REPEATED_COMMA.sub(", ", title).strip(" ,")
-    return _clip(title, TITLE_MAX)
+    return _clip(title, TITLE_MAX, TITLE_ELLIPSIS)
 
 
 def task_status(kind: str) -> str | None:
