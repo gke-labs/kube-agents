@@ -53,6 +53,7 @@ EXPECTED_TOOLS = {
     "mark_finding_surfaced",
     "record_finding_verification",
     "findings_publication",
+    "capability_criteria",
 }
 
 

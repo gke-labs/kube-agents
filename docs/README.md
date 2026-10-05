@@ -44,6 +44,8 @@ kube-agents/
 │   ├── contributor/                               Contributor-agent protocol (claim/PR/review loop)
 │   └── platform/                                  Platform Agent profile
 │       ├── AGENTS.md, SOUL.md, CAPABILITIES.md    persona and workspace docs
+│       ├── capabilities/                          per-capability criteria defaults
+│       │                                          the agent tunes at runtime
 │       ├── docs/                                  runtime references (glossary,
 │       │                                          console links) + design docs
 │       ├── governance/                            cron-run SOP playbooks + the
