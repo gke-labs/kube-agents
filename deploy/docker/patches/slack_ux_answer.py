@@ -23,11 +23,11 @@ blocks, never a fold's.
 
 The first sentence is ``slack_presenter.split_lead``'s, the sentence
 ``slack_presenter.split_answer`` takes its headline from. A bold headline is
-plain text, so an answer it cannot carry whole keeps the upstream post: one
-whose first line is a heading, a list item or a code fence, or whose first
-sentence is longer than ``HEADLINE_MAX``, runs onto a second line, or holds a
-link, a mention or code. So does
-one with nothing after that sentence, one longer than :data:`FOLD_TEXT_MAX`, a
+plain text with its code spans kept as code, so an answer it cannot carry whole
+keeps the upstream post: one whose first line is a heading, a list item or a
+code fence, or whose first sentence is longer than ``HEADLINE_MAX``, runs onto
+a second line, or holds a link or a mention. So does one with nothing after
+that sentence, one longer than :data:`FOLD_TEXT_MAX`, a
 fold ``block_kit`` cannot render or that would hold a block outside
 :data:`FOLD_CHILD_TYPES` (a table or a divider), and an adapter not rendering
 ``rich_blocks``, since upstream would then post text alone. A refused fold
@@ -77,8 +77,10 @@ FOLD_TEXT_MAX = 12000
 FOLD_CHILD_TYPES = frozenset({"header", "section", "rich_text"})
 #: A first line that is not prose: a heading, a list item or a fence.
 NOT_PROSE = re.compile(r"^\s*(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|`{3,}|~{3,})")
-#: What a plain-text headline would lose: a markdown link, a url, a Slack mention or link, a code span.
-LOSES_CONTENT = re.compile(r"\]\(|https?://|<[@#!]|`", re.IGNORECASE)
+#: What a plain-text headline would lose: a markdown link, a url, a Slack mention or link.
+LOSES_CONTENT = re.compile(r"\]\(|https?://|<[@#!]", re.IGNORECASE)
+#: Holds a code span's place while the rest of the headline is made plain.
+CODE_MARK = "\x01"
 #: Upstream's per-post ``config.extra`` switches the folded post carries as well.
 REPLY_BROADCAST = "reply_broadcast"
 #: The Slack adapter module's link-preview helper, read from the adapter's own module.
@@ -107,8 +109,24 @@ def _load_block_kit() -> Any:
     return _block_kit
 
 
-def split(answer: str) -> tuple[str, str] | None:
-    """``(headline, rest)``: the first sentence as plain text, everything after it as markdown.
+def _headline_runs(lead: str) -> list[tuple[str, bool]]:
+    """``lead`` as ``(text, is_code)`` runs: each code span kept as code, the rest made plain."""
+    held, codes, last = [], [], 0
+    for start, end, opener in _presenter._code_spans(lead):
+        held += [lead[last:start], f"{CODE_MARK}{len(codes)}{CODE_MARK}"]
+        codes.append(lead[start + opener:end - opener].strip())
+        last = end
+    held.append(lead[last:])
+    runs = []
+    for index, part in enumerate(_presenter._plain("".join(held)).split(CODE_MARK)):
+        text = codes[int(part)] if index % 2 else part
+        if text:
+            runs.append((text, bool(index % 2)))
+    return runs
+
+
+def split(answer: str) -> tuple[list[tuple[str, bool]], str] | None:
+    """``(headline, rest)``: the first sentence as plain and code runs, everything after it as markdown.
 
     None, with the reason logged, when the headline cannot carry that sentence whole or
     nothing follows it.
@@ -119,11 +137,11 @@ def split(answer: str) -> tuple[str, str] | None:
         return _refuse("it opens with a heading, a list item or a code fence")
     lead, _body = _presenter.split_lead(answer)
     if LOSES_CONTENT.search(lead):
-        return _refuse("the first sentence holds a link, a mention or code")
-    headline = _presenter._plain(lead)
+        return _refuse("the first sentence holds a link or a mention")
+    headline = _headline_runs(lead)
     if not headline:
         return _refuse("it does not open with a sentence")
-    if len(headline) > _presenter.HEADLINE_MAX:
+    if sum(len(text) for text, _code in headline) > _presenter.HEADLINE_MAX:
         return _refuse("the first sentence is longer than HEADLINE_MAX")
     # The rest is cut from the answer as written, so its line breaks reach block_kit as they
     # would upstream; split_lead's body joins a first paragraph's lines into one.
@@ -148,11 +166,14 @@ def render_fold(rest: str, mrkdwn_fn: Any = None) -> list[dict] | None:
     return blocks
 
 
-def blocks_answer(headline: str, fold_blocks: list[dict]) -> list[dict]:
-    """``headline`` in bold, then ``fold_blocks`` folded under :data:`FOLD_TITLE`, as Block Kit."""
-    bold = {"type": "text", "text": headline, "style": {"bold": True}}
+def blocks_answer(headline: list[tuple[str, bool]], fold_blocks: list[dict]) -> list[dict]:
+    """``headline`` in bold, its code runs as code too, then ``fold_blocks`` folded under :data:`FOLD_TITLE`."""
+    bold = [
+        {"type": "text", "text": text, "style": {"bold": True, "code": True} if code else {"bold": True}}
+        for text, code in headline
+    ]
     return [
-        {"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": [bold]}]},
+        {"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": bold}]},
         {
             "type": "container",
             "title": {"type": "plain_text", "text": FOLD_TITLE},

@@ -120,11 +120,28 @@ BLOCK_KIT = SimpleNamespace(render_blocks=_render_blocks, sanitize_blocks=lambda
 
 class SplitTest(unittest.TestCase):
     def test_the_first_sentence_leads_and_the_rest_follows(self):
-        self.assertEqual(runtime.split(ANSWER), (HEADLINE, REST))
+        self.assertEqual(runtime.split(ANSWER), ([(HEADLINE, False)], REST))
 
     def test_the_headline_is_split_answers(self):
         headline, _rest = runtime.split(ANSWER)
-        self.assertEqual(headline, presenter.split_answer(ANSWER)[0])
+        self.assertEqual("".join(text for text, _code in headline), presenter.split_answer(ANSWER)[0])
+
+    def test_a_bold_lead_folds_without_its_markers(self):
+        # The shape the worker report stanza asks for (kanban_report_format.py).
+        for answer in ("**No pods are failing.** All 12 are Running.", "**No pods are failing.**\nAll 12 are Running."):
+            with self.subTest(answer):
+                self.assertEqual(runtime.split(answer), ([("No pods are failing.", False)], "All 12 are Running."))
+
+    def test_a_code_span_in_the_lead_stays_code(self):
+        headline, rest = runtime.split("**One pod is failing: `web-1` is CrashLoopBackOff.** It exits 137.")
+        self.assertEqual(
+            headline, [("One pod is failing: ", False), ("web-1", True), (" is CrashLoopBackOff.", False)]
+        )
+        self.assertEqual(rest, "It exits 137.")
+        self.assertEqual(
+            runtime.blocks_answer(headline, [])[0]["elements"][0]["elements"][1],
+            {"type": "text", "text": "web-1", "style": {"bold": True, "code": True}},
+        )
 
     def test_the_rest_keeps_its_line_breaks(self):
         answers = {
@@ -134,7 +151,7 @@ class SplitTest(unittest.TestCase):
         }
         for what, (lead, rest) in answers.items():
             with self.subTest(what):
-                self.assertEqual(runtime.split(lead + rest), (lead.strip(), rest))
+                self.assertEqual(runtime.split(lead + rest), ([(lead.strip(), False)], rest))
 
     def test_answers_the_headline_cannot_carry_whole_are_refused(self):
         refused = {
@@ -145,8 +162,8 @@ class SplitTest(unittest.TestCase):
             "a link": "See [the runbook](https://example.com/runbook). It covers this.",
             "a bare url": "The dashboard is https://example.com/d. It shows the spike.",
             "a mention": "<@U123> owns this pool. Ask them first.",
-            "code": "The `payments-api` pod restarts. It reads a missing secret.",
             "a wrapped sentence": "Checkout is slow because the\npayments pool is full. Scale it.",
+            "a bold lead with no full stop": "**No pods are failing**: all 12 are Running.",
             "an overlong sentence": ("word " * 40).strip() + ". Then more.",
             "a single sentence": "Checkout is healthy.",
             "nothing": "",
