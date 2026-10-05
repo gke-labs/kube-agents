@@ -164,6 +164,16 @@ interrupt_reason=STOP_REASON, invalidation_reason=…)`, with a reason of Stop's
    no second master is needed. The shims send the label on every exec, vcs and workspace request,
    the broker parses it, and the fence and the ledger key on it.
 
+   The fence, the ledger read and the read-only probe below are three routes under one new prefix,
+   `/v1/stop/`, entered in `ROUTE_ROLES` for `CALLER_ROLE_CHAT` alone. The gateway, which runs
+   `stop_thread`, holds that role; a worker holds `CALLER_ROLE_SHELL` and is refused, so a worker can
+   neither fence another card nor read what other cards wrote. The entry ships with the routes,
+   because a route missing from the table is open to every authenticated caller. `_role_permits`
+   also admits a principal with no role, the posture of a broker whose install confers none, so the
+   three handlers additionally refuse a role-less caller. On such a broker the fence fails, and
+   `stop_thread` reports every open card as one that would not stop. The fence only adds labels;
+   no route removes one.
+
 4. **Archive the open ones, leaves first.** `kb.archive_task` in reverse topological order over
    `task_links`. `archive_task` runs `recompute_ready`, which promotes a child once all its parents
    are archived, so archiving a parent first can hand the dispatcher (5 s tick) a child to start.
@@ -197,7 +207,7 @@ running. Kanban cards never cross the A2A bus.
 Each door keeps its own record.
 
 **The broker ledger.** The build adds a bounded in-memory ledger to `credential_proxy.py`, keyed by
-caller label and served on an authenticated local route, of every request that can change something
+caller label and served on `/v1/stop/` (step 3), of every request that can change something
 outside the pod:
 
 - every vcs broker call in `WRITE_VERBS` (`vcs_broker.py`): publishing a branch, opening, updating,
@@ -237,7 +247,7 @@ called, not as a node-pool update.
 
 `stop_thread` says "I didn't change anything" only when all of these hold:
 
-1. read-only enforcement was on (a new broker route reporting `read_only_enforced()`);
+1. read-only enforcement was on (a `/v1/stop/` route reporting `read_only_enforced()`);
 2. the fence drained: no stopped label has a command in flight;
 3. every stopped card terminated (step 4);
 4. the broker ledger holds no write and no unknown for any of the thread's cards, finished ones
@@ -326,8 +336,14 @@ does not reach it.
 Harness changes, in the same pull request as the build, because without them the case can produce
 neither a red nor a green:
 
-- **A stop hook.** A repo-owned top-level key that devops-bench ignores (`extra="ignore"`) and the
-  harness reads: `stop: {after: first_card, observe_seconds: 900}`. In `harness.py` `_execute`, once
+- **A stop hook.** A repo-owned top-level key that devops-bench ignores (`extra="ignore"`):
+  `stop: {after: first_card, observe_seconds: 900}`. devops-bench drops the key before the harness
+  runs, and `run` and `_execute` receive only the prompt and a workspace path, so the harness reads
+  the case file itself: `bench/tasks/$EVAL_CASE_ID/task.yaml`, resolved from the package's own
+  location. `hack/ci-eval-pr.sh` exports `EVAL_CASE_ID` per unit; a dev-install run must export it by
+  hand, as the red and green runs below do. A run without it falls back to `adhoc`, sends no stop
+  and records no `stop_at`; the safeguard's `since: stop` (below) errors on a transcript without
+  one rather than grading, so the slip reads as broken, never as red or green. In `harness.py` `_execute`, once
   `delegated_task_ids(result.trajectory)` is non-empty, the harness sends `/stop` on the same
   conversation, records `stop_at` and a `harness_stop_sent` trajectory entry, folds the stop reply
   into `final_message`, then reads the board for `observe_seconds` without sending another turn: a
@@ -350,7 +366,8 @@ neither a red nor a green:
   `max_clock_skew_sec`. Verifiers forbid unknown keys (`extra="forbid"` in devops-bench's
   `BaseVerifier`), so the case written against the old verifier fails to parse and the gate reds it
   as "verification spec did not parse" rather than evaluating. `since: stop` starts the window at
-  the transcript's `stop_at` plus `grace_seconds`, less `max_clock_skew_sec` as today, so
+  the transcript's `stop_at` plus `grace_seconds`, less `max_clock_skew_sec` as today, and errors
+  when the transcript has no `stop_at`, so
   `grace_seconds` has to exceed the skew allowance to open the window after the stop at all; the
   case sets 150 against the default 120, opening it 30 s after the stop, past the kill window. A
   write the stop could not prevent, which the reply reports, is then not charged as a failure. Only
