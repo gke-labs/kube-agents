@@ -37,6 +37,13 @@ SUPPORTED_EXECUTABLES = ("kubectl", "gcloud")
 # BrokerConnection.
 BROKER_CONNECT_TIMEOUT_SECONDS = 10.0
 
+# Exit code returned when the credential proxy blocks a command under its
+# security policy. 77 is EX_NOPERM from sysexits.h ("permission denied").
+# Returning 77 rather than the shell's 126 ("not executable") ensures the
+# runtime does not attach an execution/chmod hint that misleads the agent
+# into seeking local file workarounds for a policy boundary (#2179).
+EXIT_SECURITY_POLICY_BLOCKED = getattr(os, "EX_NOPERM", 77)
+
 # `\Z`, not `$`. `$` also matches immediately before a trailing newline, so
 # `re.match` on "nowhere\n" succeeds -- and that value goes on to build the
 # scope key in a log line and a filename in the broker's state dir. `fullmatch`
@@ -815,7 +822,7 @@ def execute(
                 file=sys.stderr,
             )
             print(f"policy rule: {payload.get('rule', 'unknown')}", file=sys.stderr)
-            return 126
+            return EXIT_SECURITY_POLICY_BLOCKED
         print(payload.get("error", str(exc)), file=sys.stderr)
         return 1
     except urllib.error.URLError as exc:

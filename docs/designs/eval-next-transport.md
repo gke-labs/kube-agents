@@ -290,13 +290,19 @@ faults as well as the persona's. The reason rides as the terminal's status messa
 takes the token up to the next space, so `bus-publish-failed at working` reads as
 `bus-publish-failed`, and a message without the prefix is an unknown reason. The executors' own
 reasons, the bridge's `bridge-shutdown`, `bridge-queue-overflow`, `bus-publish-failed`,
-`spawn-failed`, `bridge-died-without-terminal-event` and `hermes-rate-limited` (a turn that gave
-up on the provider's rate limit or billing, Hermes's exit 75) and the worker adapter's `worker-evicted`
+`spawn-failed`, `bridge-died-without-terminal-event`, `hermes-rate-limited` (a turn that gave
+up on the provider's rate limit or billing, Hermes's exit 75 or the API server's
+`X-Hermes-Failure-Reason` header, or the API server's concurrent-run cap answering 429) and
+`hermes-api-unreachable` (the bridge never got a response from the pod's API server),
+`hermes-api-refused` (the API server answered a 4xx other than 429, before any turn ran) and
+`session-busy` (the task's deadline passed while it waited for its session's previous turn, so
+no request was sent), and the worker adapter's `worker-evicted`
 and `bus-subscribe-failed` (`spawn-failed` is both), are infrastructure, the class the api
 transport gives an exhausted transport retry, because they say the executor lost the task rather
 than the persona failing it, the same line the profiles spec draws with `worker-evicted`; the
-persona's reasons, `hermes-exited-nonzero` and `deadline-exceeded`, and any reason the harness
-does not know, are graded failures. A `rejected` terminal, which both executors publish for a
+persona's reasons, `hermes-exited-nonzero` and `deadline-exceeded`, the API server's 5xx or failed turn,
+unparseable or broken-off answers (`hermes-api-failed`, `hermes-api-unreadable`,
+`hermes-api-read-failed`), and any reason the harness does not know, are graded failures. A `rejected` terminal, which both executors publish for a
 submission with no text parts, is infrastructure and never graded, because it is the harness's
 own defect. A `canceled` terminal after the harness's own cancel is the graded timeout above, and
 `canceled-before-start` the infrastructure outcome above. The rule is the same on both
@@ -348,9 +354,14 @@ the worker checks
 ([`eval-scorer.md`](eval-scorer.md), "The inject lane sets aside what its transport
 cannot show"). A case whose premise
 needs the front door — `agent-kanban-smoke`, which grades
-the chat profile's `kanban_create` — is a different matter: the door addresses `platform`
-directly, so `hack/eval/inject-lane-exclusions.txt` keeps it off this lane's matrix with the
-reason, and the api lane's roster is untouched.
+the chat profile's `kanban_create` — is a different matter: the door addresses `platform`,
+and the bridge's `cli` executor answers it with the platform profile, so
+`hack/eval/inject-lane-exclusions.txt` keeps it off this lane's matrix with the reason, and the
+api lane's roster is untouched. The lane pins that executor: `hack/ci-deploy.sh` sets
+`BRIDGE_EXECUTOR=cli` on the sidecar and its start-line wait requires `"executor":"cli"`. The
+bridge's default `api` executor runs the turn under the pod's API server, whose profile is the
+chat path's own (`default` on a stock install), so it changes which agent answers every case on
+the lane; the pin, and the exclusion, stay until cases have been graded on that executor.
 `ledger_issue_contains` finds the ledger by scanning the final message for a GitHub issue URL, so
 it works on any transport that maps a result into the final message, which both new transports
 do, and its grade depends on that mapping: the fleet-audit cases get the URL from the delegated
@@ -408,8 +419,13 @@ the CR's phase, so a refusal reds the lane rather than parking the CR `Degraded`
 working bus. The
 sidecar also carries the agent container's own environment, mounts, security context and
 resources, derived from the rendered Deployment at deploy time rather than copied into the
-script: the bridge's subprocess stands in for the `hermes chat -q` a kanban worker spawns inside
-the agent container, and that is the environment such a worker inherits. The one mount not
+script: the bridge's `cli` subprocess stands in for the `hermes chat -q` a kanban worker spawns
+inside the agent container, and that is the environment such a worker inherits; under the
+default `api` executor the same copy is what carries `API_SERVER_KEY` into the sidecar, which is
+why the patch pins `BRIDGE_EXECUTOR=cli` rather than leaving the choice to the key. The
+patch adds one more variable of its own, `A2A_ACTIVITY_SECRET` from the creds Secret's
+`bridge-activity-key`, because the agent container gains that entry only when the operator
+renders the sidecar the patch is declaring. The one mount not
 carried is the projected bus token, which the webhook reserves for the agent container. The
 third piece was decided the same day and is built: a look-ahead in the bridge's worker that
 before it spawns replays the task's `in` subject for a trailing `cancel` and finalizes
@@ -535,8 +551,10 @@ artifact, one terminal event with `final: true`, and `cancel` as a real envelope
 dropped connection. The harness returns when the terminal lands, at whatever second it lands,
 and `tasks/get` by replay answers status without a live executor.
 
-The caveat that decides how much of the time cost stage 1 removes: the bridge runs one
-`hermes -p platform chat -Q -q <prompt>` per task and publishes its terminal when that turn ends.
+The caveat that decides how much of the time cost stage 1 removes: the bridge runs one turn
+per task, by default a turn in the conversation's session through the pod's API server and as
+the fallback a `hermes -p platform chat -Q -q <prompt>` subprocess, and publishes its terminal
+when that turn ends.
 Kanban stays the delegation mechanism inside the persona under `next` (decided 2026-09-17).
 Agent-initiated delegation as a child task on the bus is designed and not built:
 [`spec-subagent-profiles.md`](spec-subagent-profiles.md) has an orchestrator delegate by

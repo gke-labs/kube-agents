@@ -152,6 +152,7 @@ ADDED_AFTER_THE_MOVE = [
     "chat-question-typed-answer-fresh-session",  # a typed answer from a new thread session
     "chat-question-click-answer-stays-silent",  # SOUL §1.5 Unblock: silent after a button answer
     "platform-worker-shell-edit-of-shipped-skill",  # the sandbox's image trees, #2096
+    "autoops-controller-stall-triage",  # the stall watch on the inject path
 ]
 
 # Admitted after the split, each by a pull request that cited the record
