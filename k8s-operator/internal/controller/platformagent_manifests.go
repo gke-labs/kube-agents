@@ -4275,7 +4275,8 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	//   - Reactions: which reaction goes on an ask and when it settles.
 	//   - Reports: a fleet-audit cron report and the first inventory report
 	//     post as Block Kit, laid out again as a headline and the top findings
-	//     with the rest behind a "See all" button, through the credential
+	//     (the audit's rest in its thread, the inventory's behind a "See all"
+	//     button), through the credential
 	//     proxy's Slack relay to the channel or thread the report was already
 	//     bound for; the audit's counts come from its ledger issue, read
 	//     through the forge broker.

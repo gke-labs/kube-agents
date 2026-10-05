@@ -2475,8 +2475,9 @@ def _slack_audit_headline(
     ends with an issue URL in a managed repository, which is where fleet-audit
     keeps its ledger, and at least `AUDIT_HEADLINE_MIN_LEFT_S` is left before
     `deadline` (a ``time.monotonic()`` value) to fetch it. The headline is built
-    from that issue; when it cannot be read, is closed or does not parse, it is
-    the report's own line in bold with the ledger link. The issue rides along
+    from that issue, or is the clean card when it is closed; when it cannot be
+    read or does not parse, it is the report's own line in bold with the ledger
+    link. The issue rides along
     for :func:`_post_audit_blocks`.
     """
     if platform != "slack" or unrelayed or not slack_presenter.enabled():
@@ -2584,11 +2585,11 @@ def _post_audit_blocks(
     thread_id: str,
     deadline: float,
 ) -> AuditPost | None:
-    """Post the audit report as Block Kit (headline, top findings, choice and
-    link buttons); where it landed, or None to post text instead.
+    """Post the audit report as Block Kit (headline, findings, choice and link
+    buttons, or the clean card); where it landed, or None to post text instead.
 
     None, before anything is posted, when there are no blocks to build (no
-    issue, a clean run, an issue that does not parse), no Slack relay in the
+    issue, an issue that does not parse), no Slack relay in the
     environment, or less than `AUDIT_BLOCKS_MIN_POST_S` left before `deadline`
     (a ``time.monotonic()`` value); after Slack refused the blocks; and after a
     relay failure. The post is bounded by what is left before `deadline`. Nothing

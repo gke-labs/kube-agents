@@ -959,9 +959,9 @@ its keep on the dispatched path, where a person is demonstrably waiting. The sch
 lives on the Chat Agent, which owns ingress: the cron report relay
 ([`cron-report-relay.md`](cron-report-relay.md)) posts the run's one line of counts ending with the
 ledger URL. In Slack with `KAGE_SLACK_UX` on that line becomes a card built from the ledger issue:
-a headline carrying the issue's one total, any clusters the run did not scan, its top two findings
-and a link to the issue; the issue stays the report, and the card only summarises what it already
-says.
+a headline carrying the issue's critical count, every critical finding, a count of the rest (which
+follow in its thread), any clusters the run did not scan, and a link to the issue; the issue stays
+the report, and the card only summarises what it already says.
 
 ## 8. Labels
 

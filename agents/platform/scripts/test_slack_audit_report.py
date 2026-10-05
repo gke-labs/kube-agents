@@ -82,11 +82,10 @@ def skipped(*names, more=0):
     """BODY with fleet-audit's Scope table of clusters it could not audit."""
     rows = "".join(f"| `{name}` | unreachable: dial tcp: i/o timeout |\n" for name in names)
     overflow = f"| _…and {more} more_ |  |\n" if more else ""
-    table = (
-        "\n### Skipped\n\n**Coverage is partial.** clusters could not be audited, so this report says nothing about them.\n\n"
-        "| Cluster | Reason |\n| ------- | ------ |\n" + rows + overflow + "\n"
+    return (
+        "## Scope\n\n### Skipped\n\n**Coverage is partial.** clusters could not be audited, so this report says nothing about them.\n\n"
+        "| Cluster | Reason |\n| ------- | ------ |\n" + rows + overflow + "\n## Findings\n\n" + BODY
     )
-    return BODY.replace("\n### Skipped\n\n", table)
 
 
 def gap_line(text):
@@ -404,6 +403,19 @@ class HeadlineFromIssueTest(unittest.TestCase):
         report = f"Security audit: 7 findings across 3 clusters (1 unreachable) — {LEDGER}"
         text = sar.headline_from_issue(dict(ISSUE, body=skipped("seeded-c")), REF, report)
         self.assertEqual(gap_line(text), "⚠️ Couldn't reach seeded-c, so this run didn't check it.")
+
+    def test_a_skipped_table_outside_the_scope_section_is_not_read(self):
+        # A finding's model-written text may carry a table of its own.
+        body = BODY.replace("\n### Skipped\n\n", "\n### Skipped\n\n| `seeded-z` | unreachable |\n\n")
+        text = sar.headline_from_issue(dict(ISSUE, body=body), REF, REPORT)
+        self.assertIsNone(gap_line(text))
+        self.assertNotIn("seeded-z", text)
+
+    def test_a_title_counting_fewer_criticals_than_listed_counts_the_listed(self):
+        issue = dict(ISSUE, title="[audit] Security & RBAC Posture Audit — 7 findings (1 critical)")
+        text = sar.headline_from_issue(issue, REF, REPORT)
+        self.assertIn("2 critical findings", text)
+        self.assertNotIn("-", text.splitlines()[0])
 
     def test_a_skipped_name_cannot_post_a_link_or_a_mention(self):
         text = sar.headline_from_issue(dict(ISSUE, body=skipped("<!channel>")), REF, REPORT)

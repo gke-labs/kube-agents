@@ -142,8 +142,10 @@ FINDINGS_SUMMARY = re.compile(
     r"[ \t]+(?P<minor>\d{1,9})[ \t]+minor\.[ \t]*$",
     re.MULTILINE,
 )
-#: The Scope section's table of clusters the run could not audit, a row of it,
-#: and the row that counts those past fleet-audit's row cap.
+#: The Scope section, its table of clusters the run could not audit, a row of
+#: it, and the row that counts those past fleet-audit's row cap.
+SCOPE_SECTION = re.compile(r"^##[ \t]+Scope[ \t]*$", re.MULTILINE)
+SECTION_END = re.compile(r"^##[ \t]", re.MULTILINE)
 SKIPPED_SECTION = re.compile(r"^###[ \t]+Skipped[ \t]*$", re.MULTILINE)
 SKIPPED_ROW = re.compile(r"^\|[ \t]*`([^`\n]{1,253})`[ \t]*\|", re.MULTILINE)
 SKIPPED_MORE = re.compile(r"^\|[ \t]*_…and[ \t]+(\d{1,9})[ \t]+more_", re.MULTILINE)
@@ -467,18 +469,30 @@ def _parse_issue(issue: dict, report: str) -> AuditReport | None:
 
 
 def _totals(body: str, findings: list[tuple[str, str]], critical: int) -> dict[str, int]:
-    """Findings by severity: the summary's totals, else the sections', and the title's critical count."""
+    """Findings by severity: the summary's totals, else the sections'; the title's critical count.
+
+    Never fewer than the sections list, the title's count included: a title edited on the
+    forge must not leave the card counting fewer critical findings than it lists.
+    """
     summary = FINDINGS_SUMMARY.search(body)
     totals = {severity: int(summary.group(severity)) if summary else 0 for severity in SEVERITIES}
     for severity in SEVERITIES:
         totals[severity] = max(totals[severity], sum(1 for listed, _ in findings if listed == severity))
-    totals[CRITICAL] = critical
+    totals[CRITICAL] = max(critical, sum(1 for listed, _ in findings if listed == CRITICAL))
     return totals
 
 
 def _skipped(body: str) -> tuple[list[str], int]:
-    """The Scope section's skipped clusters by name, and how many its row cap counted instead."""
-    section = SKIPPED_SECTION.search(body)
+    """The Scope section's skipped clusters by name, and how many its row cap counted instead.
+
+    Only the Scope section's: a finding's model-written text may hold a table of its own.
+    """
+    scope = SCOPE_SECTION.search(body)
+    if not scope:
+        return [], 0
+    scope_end = SECTION_END.search(body, scope.end())
+    body = body[: scope_end.start() if scope_end else len(body)]
+    section = SKIPPED_SECTION.search(body, scope.end())
     if not section:
         return [], 0
     following = ANY_SECTION.search(body, section.end())
