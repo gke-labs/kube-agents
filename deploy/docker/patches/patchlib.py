@@ -572,7 +572,9 @@ def module_names(tree: ast.Module) -> set[str]:
             names.add(stmt.name)
         elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
             names.update((a.asname or a.name).split(".")[0] for a in stmt.names)
-        elif isinstance(stmt, (ast.If, ast.Try, ast.With)):
+        elif isinstance(stmt, (ast.If, ast.Try, ast.With, ast.AsyncWith)):
+            if isinstance(stmt, (ast.With, ast.AsyncWith)):
+                names.update(name for item in stmt.items if item.optional_vars for name in _stored(item.optional_vars))
             for child in ast.iter_child_nodes(stmt):
                 if isinstance(child, ast.stmt):
                     stack.append(child)
@@ -604,6 +606,11 @@ def _binds(stmt: ast.stmt) -> set[str]:
         return {(a.asname or a.name).split(".")[0] for a in stmt.names}
     if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         return {stmt.name}
+    if isinstance(stmt, (ast.With, ast.AsyncWith)):
+        names = {name for item in stmt.items if item.optional_vars for name in _stored(item.optional_vars)}
+        for child in stmt.body:
+            names |= _binds(child)
+        return names
     return set()
 
 

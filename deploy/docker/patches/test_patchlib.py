@@ -717,5 +717,31 @@ def f(a, *rest, key=None, **extra):
         self.assertEqual(patchlib.unbound(tree, assigns[0]), ["value"])
         self.assertEqual(patchlib.unbound(tree, assigns[1]), [])
 
+    def test_with_statement_binds_target_and_body_after_block(self):
+        source = """\
+def f():
+    with open("path") as handle:
+        inside = 1
+        if False:
+            branched = 2
+    hook(handle, inside, branched, free)
+"""
+        tree = ast.parse(source)
+        call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "hook")
+        self.assertEqual(patchlib.unbound(tree, call), ["branched", "free", "hook"])
+
+    def test_module_names_includes_top_level_with_target(self):
+        source = """\
+with open("path") as top_handle:
+    top_inside = 1
+
+hook(top_handle, top_inside, free)
+"""
+        tree = ast.parse(source)
+        self.assertIn("top_handle", patchlib.module_names(tree))
+        self.assertIn("top_inside", patchlib.module_names(tree))
+        call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "hook")
+        self.assertEqual(patchlib.unbound(tree, call), ["free", "hook"])
+
 if __name__ == "__main__":
     unittest.main()
