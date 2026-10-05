@@ -23,7 +23,13 @@ from datetime import datetime, timedelta, timezone
 # never the relay, and importing the relay module would say otherwise.
 GCLOUD = "gcloud"
 LOG_FILTER = 'resource.type="k8s_container" "Logging incoming GChat event"'
+# The most entries one read asks for, newest first, and the ceiling of the
+# `--limit` flag. The flag is the knob that always shrinks a body the broker's
+# stdout cap cut: the body is the newest entries whatever the window, so
+# `--hours` shrinks it only once the narrower window holds fewer than the
+# limit.
 LOG_LIMIT = 1000
+LIMIT_FLOOR = 1
 LOG_FORMAT = "json"
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 DEFAULT_HOURS = 24
@@ -58,10 +64,22 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--hours", type=int, default=DEFAULT_HOURS, help=f"Time window in hours (default: {DEFAULT_HOURS})"
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=LOG_LIMIT,
+        help=(
+            f"Most entries to read, newest first, {LIMIT_FLOOR} to {LOG_LIMIT} (default: {LOG_LIMIT}); "
+            f"lower it when the read is cut by the credential broker's output cap"
+        ),
+    )
+    args = parser.parse_args(argv)
+    if not LIMIT_FLOOR <= args.limit <= LOG_LIMIT:
+        parser.error(f"--limit must be between {LIMIT_FLOOR} and {LOG_LIMIT}, got {args.limit}")
+    return args
 
 
-def logging_read_argv(project_id: str, hours: int) -> list[str]:
+def logging_read_argv(project_id: str, hours: int, limit: int = LOG_LIMIT) -> list[str]:
     """The brokered read: every flag here is on the shim's allowlist."""
     return [
         GCLOUD,
@@ -69,14 +87,14 @@ def logging_read_argv(project_id: str, hours: int) -> list[str]:
         "read",
         LOG_FILTER,
         f"--project={project_id}",
-        f"--limit={LOG_LIMIT}",
+        f"--limit={limit}",
         f"--format={LOG_FORMAT}",
         f"--freshness={hours}h",
     ]
 
 
-def read_entries(project_id: str, hours: int) -> list:
-    argv = logging_read_argv(project_id, hours)
+def read_entries(project_id: str, hours: int, limit: int = LOG_LIMIT) -> list:
+    argv = logging_read_argv(project_id, hours, limit)
     try:
         completed = subprocess.run(
             argv, capture_output=True, text=True, timeout=GCLOUD_TIMEOUT_SECONDS, check=False
@@ -97,8 +115,9 @@ def read_entries(project_id: str, hours: int) -> list:
     if SHIM_TRUNCATION_NOTE in completed.stderr:
         raise RuntimeError(
             f"gcloud logging read returned more than the credential broker relays for one "
-            f"command ({SHIM_TRUNCATION_NOTE}); the {LOG_LIMIT} newest entries do not fit, "
-            f"so narrow the window with --hours"
+            f"command ({SHIM_TRUNCATION_NOTE}); the {limit} newest entries do not fit, so "
+            f"lower --limit (the body is the newest entries whatever the window, so --hours "
+            f"shrinks it only once the narrower window holds fewer than {limit})"
         )
     # `--format=json` answers an empty window with the literal `[]`, so an
     # empty body is one that went missing between gcloud and here, and it
@@ -148,7 +167,7 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     start_str = (datetime.now(timezone.utc) - timedelta(hours=args.hours)).strftime(TIMESTAMP_FORMAT)
     try:
-        entries = read_entries(args.project_id, args.hours)
+        entries = read_entries(args.project_id, args.hours, args.limit)
     except RuntimeError as exc:
         print(f"Error querying Cloud Logging: {exc}", file=sys.stderr)
         return EXIT_READ_FAILED

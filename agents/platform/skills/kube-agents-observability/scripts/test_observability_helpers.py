@@ -719,8 +719,36 @@ class GetChatUsersTest(unittest.TestCase):
         self.assertEqual(get_chat_users.EXIT_READ_FAILED, code)
         self.assertEqual("", out)
         self.assertIn("credential proxy output truncated", err)
-        self.assertIn("--hours", err)
+        # The knob the message names is the one that always shrinks the body:
+        # the limit, since the body is the newest entries whatever the window.
+        self.assertIn("lower --limit", err)
+        self.assertIn(f"the {get_chat_users.LOG_LIMIT} newest entries", err)
         self.assertNotIn("did not return JSON", err)
+
+    def test_a_truncated_read_names_the_limit_the_caller_asked_for(self):
+        truncated = self.completed(returncode=0, stdout="[{", stderr="credential proxy output truncated\n")
+        with patch.object(get_chat_users.subprocess, "run", return_value=truncated):
+            code, out, err = run(get_chat_users.main, ["--project-id", PROJECT, "--limit", "250"])
+        self.assertEqual(get_chat_users.EXIT_READ_FAILED, code)
+        self.assertIn("the 250 newest entries", err)
+
+    def test_the_limit_flag_bounds_the_brokered_read(self):
+        with patch.object(get_chat_users.subprocess, "run", return_value=self.completed(stdout="[]")) as run_mock:
+            code, out, err = run(get_chat_users.main, ["--project-id", PROJECT, "--limit", "50"])
+        self.assertEqual(0, code, err)
+        argv = run_mock.call_args.args[0]
+        self.assertIn("--limit=50", argv)
+        decision = command_policy.evaluate(argv)
+        self.assertTrue(decision.allowed, decision.message)
+
+    def test_a_limit_outside_the_cap_is_refused_before_any_read(self):
+        for limit in ("0", "-1", str(get_chat_users.LOG_LIMIT + 1)):
+            with self.subTest(limit=limit), patch.object(get_chat_users.subprocess, "run") as run_mock:
+                with self.assertRaises(SystemExit) as raised:
+                    get_chat_users.parse_args(["--project-id", PROJECT, "--limit", limit])
+                self.assertNotEqual(0, raised.exception.code)
+                run_mock.assert_not_called()
+        self.assertEqual(get_chat_users.LOG_LIMIT, get_chat_users.parse_args(["--project-id", PROJECT]).limit)
 
     def test_the_truncation_note_is_the_line_the_shim_prints(self):
         shim = Path(credential_proxy_client.__file__).read_text(encoding="utf-8")

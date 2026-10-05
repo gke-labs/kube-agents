@@ -47,7 +47,7 @@ To determine which users have interacted with the system via Google Chat in the 
 - Run the packaged Python helper script to automatically query and parse the GKE container logs from Google Cloud Logging:
 
   ```bash
-  python3 ./scripts/get_chat_users.py --project-id <PROJECT_ID> [--hours <HOURS>]
+  python3 ./scripts/get_chat_users.py --project-id <PROJECT_ID> [--hours <HOURS>] [--limit <N>]
 
   ```
 
