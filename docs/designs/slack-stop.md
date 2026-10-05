@@ -169,6 +169,21 @@ interrupt_reason=STOP_REASON, invalidation_reason=…)`, with a reason of Stop's
    kill, therefore cannot reach a door at all, and anything that does write carries a label the
    fence can stop.
 
+   The agent pod's own callers need a label of their own, because none of the above reaches them.
+   `sandbox_exec.py` connects as `hermes` with `-F /dev/null` and a client environment of `PATH`,
+   `HOME`, `LANG` and `TMPDIR`, so neither the wrapper nor the drop-in is in its path, and
+   `sshd_config` runs `session-command.sh` and accepts client variables only for `agent`. Yet its
+   `kubectl` and `gcloud` resolve to the shims and present the shell token, so the Platform MCP
+   cluster tools, Cluster Agent scaffolding and reconcile, the stall-watch sweep, `gke_endpoint.py`
+   and the forwarded `forge.py` and `resolver.py` would all be refused. `ssh_argv` therefore adds
+   `HERMES_CALLER_LABEL=pod:<caller>` to the `remote_env` of every command it renders, the caller
+   naming itself (`pod:mcp`, `pod:stall-watch`, …) and defaulting to the script's name. A worker
+   session whose wrapper finds neither `HERMES_KANBAN_TASK` nor `HERMES_SESSION_ID` (the pinned
+   Hermes does not always set the latter, as `bench/kube_agents_bench/worker_trajectory.py` notes)
+   sends `pod:session`. The grammar admits `pod:` names beside card and session ids. A `pod:` label
+   is not a card, so no Stop fences one, and the check counts a `pod:session` write in its window
+   as an unknown for every thread, because it cannot say whose it was.
+
    The fence, the ledger read and the read-only probe below are three routes under one new prefix,
    `/v1/stop/`, entered in `ROUTE_ROLES` for `CALLER_ROLE_CHAT` alone. The gateway, which runs
    `stop_thread`, holds that role; a worker holds `CALLER_ROLE_SHELL` and is refused, so a worker can
@@ -335,7 +350,16 @@ the reply says "I didn't change anything" only when nothing was written.
 
 The case runs on the api lane only. The inject door addresses `platform` directly, so no card is
 filed, the hook never fires, and `since: stop` would error on every repetition; the build adds the
-case to `hack/eval/inject-lane-exclusions.txt`, with that reason, in the same pull request. The api
+case to `hack/eval/inject-lane-exclusions.txt` in the same pull request, with that reason and the
+issue `agent-kanban-smoke`'s entry names, #2039, since the premise and the condition for returning
+to the lane are the same. `scripts/test_eval_rosters.py` refuses that entry beside the case's
+nightly-only registration and its `requesting:` entry below: `test_an_exclusion_is_not_a_demotion`
+requires every exclusion on the presubmit file and the blocking roster, and
+`test_the_requesting_cases_are_the_pinned_set` requires every `requesting:` case on the inject
+lane. The build relaxes both: an exclusion is checked against the file the case is registered in,
+and a `requesting:` entry for an excluded case is checked against the registered cases and pinned
+in a list of its own, since the api lane reads `requesting:` over the unfiltered matrix. The
+exclusions file's header, which says presubmit cases, says registered cases. The api
 lane never touches Slack, so it grades `stop_thread` (the
 fence, the archive and the check) through the door it was called from, which is why card lookup
 keys on the session's own platform and source and `stop_thread` returns its reply. The Slack event
@@ -485,7 +509,11 @@ The third branch passes the unknown replies: a write in flight at the fence land
 could-not-check, would-not-stop or read-only-off rows, whether or not GitHub received the write. It
 carries no `github_writes` leaf for that reason. A build that always answered "couldn't check" would
 pass this objective; the unit tests of the check, not the eval, hold the strong reply to its six
-conditions, and the safeguard still charges any write after the kill window.
+conditions. The safeguard still charges a pull request opened after the kill window, by its
+`created_at`, but not every branch pushed after it: the refs API carries no push time, so
+`github_writes` dates a branch with no pull request by its tip's committer date, and a commit made
+before the stop and pushed after the window is not charged. That is the table's "A branch was
+pushed, no pull request" row, which the unit tests of the ledger cover and the eval does not.
 
 `github_writes` sees bot pull requests and `platform-agent/` branches only, so the case backs the "I
 didn't change anything" claim for those writes and not for the table's issue, comment and label
