@@ -26,6 +26,7 @@ from kube_agents_bench import card_wake
 
 REPO = Path(__file__).resolve().parents[2]
 MOMENTS = REPO / "deploy" / "docker" / "patches" / "slack_ux_moments.py"
+CLICKS = REPO / "deploy" / "docker" / "patches" / "slack_ux_clicks.py"
 SCRIPTS = REPO / "agents" / "platform" / "scripts"
 
 PROMPT = """[bench:slack-question-wake]
@@ -456,6 +457,67 @@ def test_archive_is_best_effort() -> None:
 
 
 
+# --- An answer by button (answer_by: click) ----------------------------------
+
+CLICK_PROMPT = PROMPT + "answer_by: click\n"
+
+
+def _with_clicks(root: Path) -> Path:
+    shutil.copy(CLICKS, root / "gateway" / "slack_ux_clicks.py")
+    return _with_moments(root)
+
+
+def test_parse_reads_an_answer_by_click() -> None:
+    assert card_wake.parse(CLICK_PROMPT).clicked
+    assert not card_wake.parse(PROMPT).clicked
+
+
+def test_an_answer_by_anything_but_click_is_an_authoring_error() -> None:
+    with pytest.raises(ValueError, match="answer_by"):
+        card_wake.parse(PROMPT + "answer_by: typing\n")
+
+
+def test_a_click_answer_that_is_not_an_option_is_an_authoring_error() -> None:
+    with pytest.raises(ValueError, match="options a click can press"):
+        card_wake.parse(CLICK_PROMPT.replace("answer: seeded-b", "answer: seeded-c"))
+
+
+@needs_moments
+@pytest.mark.skipif(not CLICKS.exists(), reason="main has no deploy/docker/patches/slack_ux_clicks.py")
+def test_a_click_plant_builds_the_turn_the_images_button_sends(hermes_root: Path, tmp_path: Path) -> None:
+    planted = _plant(_shell_for(_with_clicks(hermes_root), tmp_path, CLICK_PROMPT), CLICK_PROMPT)
+
+    assert planted.click is not None and planted.click.startswith("seeded-b")
+    assert planted.card in planted.click
+    assert planted.answer(card_wake.parse(CLICK_PROMPT)) == planted.click
+    assert planted.answer(card_wake.parse(PROMPT)) == "seeded-b"
+
+
+@needs_moments
+def test_a_click_plant_on_an_image_without_the_clicks_module_is_broken(hermes_root: Path, tmp_path: Path) -> None:
+    with pytest.raises(card_wake.ReplayBroken, match="slack_ux_clicks"):
+        _plant(_shell_for(_with_moments(hermes_root), tmp_path, CLICK_PROMPT), CLICK_PROMPT)
+    assert [card["status"] for card in _board(tmp_path)["tasks"].values()] == ["archived"]
+
+
+def test_a_click_plant_on_an_image_without_moments_is_broken(hermes_root: Path, tmp_path: Path) -> None:
+    with pytest.raises(card_wake.ReplayBroken, match="slack_ux_moments"):
+        _plant(_shell_for(hermes_root, tmp_path, CLICK_PROMPT), CLICK_PROMPT)
+
+
+def test_a_click_plant_that_built_no_turn_is_broken() -> None:
+    reply = f'{card_wake.REPLAY_PRESENT}\n{{"card": "t_1", "wake": "[kanban] Task t_1 blocked.", "click": null}}'
+    with pytest.raises(card_wake.ReplayBroken, match="no click turn"):
+        card_wake.plant(lambda command, timeout: reply, card_wake.parse(CLICK_PROMPT), 30)
+
+
+def test_merge_carries_the_answer_reply_for_the_verifier() -> None:
+    merged = card_wake.merge(_PLANTED, _result("[SILENT]", [], {}), _result("Unblocked it.", [], {}))
+
+    assert merged.trajectory[-1]["args"]["answer_reply"] == "Unblocked it."
+    assert merged.metadata["final_message"] == "[SILENT]"
+
+
 # --- A typed answer in a fresh session (session: fresh) -----------------------
 
 FRESH_PROMPT = PROMPT + "session: fresh\n"
@@ -844,7 +906,7 @@ def test_the_settled_card_rides_on_the_trajectory_for_the_verifier() -> None:
 
     assert merged.trajectory[-1] == {
         "name": card_wake.SETTLED_ENTRY,
-        "args": {"card": "t_1"},
+        "args": {"card": "t_1", "answer_reply": ""},
         "result": {"status": "ready", "comments": [{"author": "default", "body": "seeded-b"}]},
         "status": "harness",
     }

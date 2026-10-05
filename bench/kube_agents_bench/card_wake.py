@@ -61,6 +61,16 @@ two apart, and the read records the decoy's status beside the planted
 card's, archived included, so ``replay_card`` can require that it is still
 blocked.
 
+**An answer by button.** A question prompt with ``answer_by: click`` sends
+the answer as the turn a click on the question's button for ``answer`` sends
+instead of as typed text. The plant finds that button on the question the
+image posted and builds the turn with the image's own
+``gateway/slack_ux_clicks.py``: the label, the line its value names, and the
+card the question came from. An image without that module, or a question
+without that button, is broken, not red. The answer turn's reply rides on the
+trajectory's :data:`SETTLED_ENTRY` (``args.answer_reply``), so
+``reply_is_silent`` can grade it as well as the wake's.
+
 What neither replay reproduces: the turns arrive on the run's own
 ``/v1/responses`` conversation rather than the session that filed the card, so
 the front door has not seen the ask that led to it; for a question, the flag is
@@ -129,6 +139,10 @@ _QUESTION_FIELDS = ("title", "question", "options", "answer")
 # conversation that starts from the thread's context.
 SESSION_FIELD = "session"
 SESSION_FRESH = "fresh"
+# Optional for a question replay: ``answer_by: click`` sends the answer as a
+# click on its button rather than as typed text.
+ANSWER_BY_FIELD = "answer_by"
+ANSWER_BY_CLICK = "click"
 _FAILURE_FIELDS = ("title", "body", "outcome", "reason")
 OPTION_SEPARATOR = "|"
 
@@ -181,21 +195,22 @@ ASK_MESSAGE_ID = "bench-ask"
 # Runs inside the agent container. Positional arguments: the sentinel, the
 # hermes root, the scripts directory, the flag, its on value, the creator,
 # the stub channel, the stub thread, the card title, its body, the block
-# reason or failure error, the outcome, the wake's assignee, the run's key and
-# the decoy's key, empty for no decoy. The cards are archived again if
+# reason or failure error, the outcome, the wake's assignee, the run's key,
+# the decoy's key, empty for no decoy, and the label of the button an answer
+# by click presses, empty for a typed answer. The cards are archived again if
 # anything after filing them fails.
 _PLANT_SCRIPT = r"""
 import asyncio, dataclasses, json, os, sys
 
 (SENTINEL, HERMES_ROOT, SCRIPTS, FLAG, ON, CREATOR,
- CHANNEL, THREAD, TITLE, BODY, REASON, OUTCOME, ASSIGNEE, KEY, DECOY_KEY) = sys.argv[1:16]
+ CHANNEL, THREAD, TITLE, BODY, REASON, OUTCOME, ASSIGNEE, KEY, DECOY_KEY, CLICK) = sys.argv[1:17]
 STUB_TS = "1700000000.000200"
 # The decoy lists first (kanban_list sorts by priority, then created_at) and
 # the planted card is backdated so the decoy is the newer: created_at is
 # whole seconds, and two cards filed together would otherwise tie.
 DECOY_PRIORITY = 1
 CARD_BACKDATE_SECONDS = 60
-out = {"card": None, "decoy": None, "wake": None, "posted": 0, "post": None, "error": None}
+out = {"card": None, "decoy": None, "wake": None, "posted": 0, "post": None, "click": None, "error": None}
 
 
 class _Client:
@@ -266,6 +281,19 @@ try:
             asyncio.run(moments.needs_you(adapter, sub, events[0].payload or {}, events[0].id))
             if not adapter.posts:
                 raise RuntimeError("the image has slack_ux_moments but it posted nothing for card %s" % card)
+        if CLICK:
+            if moments is None:
+                raise RuntimeError("an answer by click needs gateway/slack_ux_moments.py in the image")
+            from gateway import slack_ux_clicks as clicks
+            post = adapter.posts[0]
+            blocks = post.get("blocks") or []
+            buttons = [e for b in blocks if b.get("type") == "actions" for e in b.get("elements") or []
+                       if clicks._shown_text(e) == CLICK]
+            if not buttons:
+                raise RuntimeError("the question for card %s has no %r button" % (card, CLICK))
+            message = {"ts": STUB_TS, "text": post.get("text") or "", "blocks": blocks}
+            turn = clicks._turn(CLICK, buttons[0].get("value"), message)
+            out["click"] = clicks._turn_text(turn, moments.question_card(CHANNEL, STUB_TS) or "")
     else:
         sub = {"task_id": card, "platform": "api_server", "chat_id": CHANNEL, "thread_id": "",
                "delivery_mode": "notify+wake"}
@@ -424,6 +452,7 @@ class Replay:
     options: tuple[str, ...]
     answer: str
     fresh: bool = False
+    clicked: bool = False
 
     @property
     def reason(self) -> str:
@@ -446,7 +475,8 @@ class Planted:
     """What the plant left on the board: the card, its wake, how many posts the stub took, and the run's key.
 
     ``post`` is the first post's ``text`` and ``blocks``, ``None`` when the
-    stub took none; ``decoy`` is the fresh-session replay's decoy card.
+    stub took none; ``decoy`` is the fresh-session replay's decoy card;
+    ``click`` is the turn an answer by click sends.
     """
 
     card: str
@@ -455,6 +485,11 @@ class Planted:
     key: str = ""
     post: dict | None = None
     decoy: str | None = None
+    click: str | None = None
+
+    def answer(self, replay: Replay) -> str:
+        """The answer turn's text: the click's turn for an answer by click, else the typed answer."""
+        return self.click if replay.clicked and self.click else replay.answer
 
 
 @dataclass(frozen=True)
@@ -507,17 +542,24 @@ def parse(prompt: str) -> Replay | Failure | None:
         return Failure(fields["title"], fields["body"], fields["outcome"], fields["reason"])
     if directive != QUESTION_DIRECTIVE:
         return None
-    fields = _fields(lines[1:], (*_QUESTION_FIELDS, SESSION_FIELD))
+    fields = _fields(lines[1:], (*_QUESTION_FIELDS, SESSION_FIELD, ANSWER_BY_FIELD))
     session = fields.get(SESSION_FIELD, "")
     if session and session != SESSION_FRESH:
         raise ValueError(f"{directive} session {session!r} is not {SESSION_FRESH!r}")
+    answer_by = fields.get(ANSWER_BY_FIELD, "")
+    if answer_by and answer_by != ANSWER_BY_CLICK:
+        raise ValueError(f"{directive} answer_by {answer_by!r} is not {ANSWER_BY_CLICK!r}")
     options = tuple(
         o.strip() for o in fields.get("options", "").split(OPTION_SEPARATOR) if o.strip()
     )
     missing = [f for f in _QUESTION_FIELDS if not fields.get(f)] + ([] if options else ["options"])
     if missing:
         raise ValueError(f"{directive} prompt is missing {', '.join(dict.fromkeys(missing))}")
-    return Replay(fields["title"], fields["question"], options, fields["answer"], session == SESSION_FRESH)
+    if answer_by and fields.get("answer") and fields["answer"] not in options:
+        raise ValueError(f"{directive} answer {fields['answer']!r} is not one of the options a click can press")
+    return Replay(
+        fields["title"], fields["question"], options, fields["answer"], session == SESSION_FRESH, bool(answer_by)
+    )
 
 
 def _command(script: str, args: list[str]) -> str:
@@ -562,6 +604,7 @@ def plant_command(replay: Replay | Failure, key: str) -> str:
             WAKE_ASSIGNEE,
             key,
             decoy_key(key) if isinstance(replay, Replay) and replay.fresh else "",
+            replay.answer if isinstance(replay, Replay) and replay.clicked else "",
         ],
     )
 
@@ -668,6 +711,10 @@ def plant(
     if isinstance(replay, Replay) and replay.fresh and not (isinstance(decoy, str) and decoy):
         _sweep(shell, key, timeout)
         raise ReplayBroken(f"{what}: no decoy card in {payload!r}")
+    click = payload.get("click")
+    if isinstance(replay, Replay) and replay.clicked and not (isinstance(click, str) and click.strip()):
+        _sweep(shell, key, timeout)
+        raise ReplayBroken(f"{what}: no click turn in {payload!r}")
     return Planted(
         card,
         wake,
@@ -675,6 +722,7 @@ def plant(
         key,
         post if isinstance(post, dict) else None,
         decoy if isinstance(decoy, str) and decoy else None,
+        click if isinstance(click, str) and click.strip() else None,
     )
 
 
@@ -760,10 +808,13 @@ def _card_metadata(planted: Planted, settled: Settled | None) -> dict:
     return metadata
 
 
-def _settled_entry(planted: Planted, settled: Settled | None) -> dict:
+def _settled_entry(planted: Planted, settled: Settled | None, answer_reply: str | None = None) -> dict:
+    args = {"card": planted.card}
+    if answer_reply is not None:
+        args["answer_reply"] = answer_reply
     return {
         "name": SETTLED_ENTRY,
-        "args": {"card": planted.card},
+        "args": args,
         "result": settled.as_metadata() if settled is not None else None,
         "status": "harness",
     }
@@ -776,7 +827,8 @@ def merge(
 
     ``output`` and ``final_message`` are the reply to the wake; the answer
     turn's text, and the card as the run left it (``settled``), are kept in
-    metadata and as the trajectory's :data:`SETTLED_ENTRY`. The trajectory,
+    metadata and as the trajectory's :data:`SETTLED_ENTRY`, the answer turn's
+    reply as its ``args.answer_reply``. The trajectory,
     errors and worker captures are both turns'. The
     answer turn's tokens supersede the wake turn's when both read the same
     session, whose row is cumulative over the conversation, except for the
@@ -798,14 +850,15 @@ def merge(
         if key in wake.metadata or key in answer.metadata:
             metadata[key] = _combine(wake.metadata.get(key), answer.metadata.get(key))
     metadata["final_message"] = str(wake.metadata.get("final_message") or wake.output)
+    answer_reply = str(answer.metadata.get("final_message") or answer.output)
     metadata["question_wake"] = {
         **_card_metadata(planted, settled),
         "answer_output": answer.output,
-        "answer_final_message": str(answer.metadata.get("final_message") or answer.output),
+        "answer_final_message": answer_reply,
     }
     return AgentResult(
         output=wake.output,
-        trajectory=[*wake.trajectory, *answer.trajectory, _settled_entry(planted, settled)],
+        trajectory=[*wake.trajectory, *answer.trajectory, _settled_entry(planted, settled, answer_reply)],
         tokens=tokens,
         errors=[*wake.errors, *answer.errors],
         metadata=metadata,
