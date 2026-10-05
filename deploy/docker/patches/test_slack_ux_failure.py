@@ -31,11 +31,20 @@ REPLY = (
 SUB = {"task_id": "t_f1", "platform": "slack", "chat_id": "C0KAGE", "thread_id": "1700000000.000100"}
 WAKE = "Task t_f1 gave up."
 FLAG_ENV = "KAGE_SLACK_UX"
+USER_MESSAGE_ID = "1700000001.000200"
 
 
 def _event(internal=True, platform="slack", chat_id="C0KAGE", thread_id="1700000000.000100"):
     source = SimpleNamespace(platform=SimpleNamespace(value=platform), chat_id=chat_id, thread_id=thread_id)
-    return SimpleNamespace(internal=internal, source=source, timestamp=datetime.now())
+    message_id = None if internal else USER_MESSAGE_ID
+    return SimpleNamespace(internal=internal, source=source, message_id=message_id, timestamp=datetime.now())
+
+
+def _lane_event(ledger_message_id=None):
+    """The fresh event Hermes sends a finished turn's reply under when a follow-up is queued."""
+    lane = _event(internal=False)
+    lane.message_id, lane.ledger_message_id = None, ledger_message_id
+    return lane
 
 
 def _render(content):
@@ -211,6 +220,34 @@ class MarkTest(FlagOn):
         runtime.drop(_event().source, _event(internal=False))
         self.assertEqual(self.draw(_event(internal=False)), _render(REPLY))
         self.assertEqual(self.draw(_event()), _render(REPLY))
+
+    def test_a_wake_with_a_message_queued_behind_it_keeps_its_look(self):
+        # U1 runs; the wake and then U2 queue behind it.
+        outer = _event(internal=False)
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        self.assertEqual(self.draw(_lane_event(USER_MESSAGE_ID)), _render(REPLY))
+        runtime.drop(_event().source, _event())
+        self.assertEqual(len(_buttons(self.draw(_lane_event()))), 1)
+        later = _event(internal=False)
+        later.timestamp += timedelta(seconds=1)
+        runtime.drop(_event().source, later)
+        self.assertEqual(self.draw(outer), _render(REPLY))
+
+    def test_a_wake_turn_with_a_user_message_queued_behind_it_keeps_its_look(self):
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        self.assertEqual(len(_buttons(self.draw(_lane_event()))), 1)
+        runtime.drop(_event().source, _event(internal=False))
+        self.assertEqual(self.draw(_event()), _render(REPLY))
+
+    def test_a_user_message_queued_before_the_wake_leaves_its_mark(self):
+        outer = _event(internal=False)
+        queued = _event(internal=False)
+        queued.timestamp -= timedelta(seconds=1)
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        runtime.drop(_event().source, queued)
+        self.assertEqual(self.draw(_lane_event(USER_MESSAGE_ID)), _render(REPLY))
+        runtime.drop(_event().source, _event())
+        self.assertEqual(len(_buttons(self.draw(outer))), 1)
 
     def test_a_sibling_wake_leaves_the_mark(self):
         runtime.note_wake(SUB, {"gave_up"}, WAKE)

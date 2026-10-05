@@ -55,6 +55,7 @@ REPLY = (
 )
 LEAD = "**I couldn't find seeded-z.**"
 LABEL = "check it there"
+USER_MESSAGE_ID = "1700000001.000200"
 SUB = {"platform": "slack", "chat_id": "C0KAGE", "thread_id": "1700000000.000100", "task_id": "t_verify"}
 
 
@@ -98,7 +99,8 @@ def _event(internal: bool = True):
     source = SimpleNamespace(
         platform=SimpleNamespace(value="slack"), chat_id=SUB["chat_id"], thread_id=SUB["thread_id"]
     )
-    return SimpleNamespace(internal=internal, source=source, timestamp=datetime.now())
+    message_id = None if internal else USER_MESSAGE_ID
+    return SimpleNamespace(internal=internal, source=source, message_id=message_id, timestamp=datetime.now())
 
 
 def _render(content: str) -> list:
@@ -143,6 +145,12 @@ def drive(module) -> None:
         carried = _draw(module, outer)
         if not carried[0]["text"]["text"].startswith(LEAD):
             raise _fail("a wake queued behind the user's turn lost the failure's look")
+        lane = _event(internal=False)
+        lane.message_id, lane.ledger_message_id = None, None
+        module.note_wake(SUB, {"gave_up"}, "wake")
+        queued = _draw(module, lane)
+        if not queued[0]["text"]["text"].startswith(LEAD):
+            raise _fail("a wake turn with a follow-up queued behind it lost the failure's look")
     finally:
         os.environ.pop(FLAG_ENV, None)
 

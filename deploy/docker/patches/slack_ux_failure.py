@@ -32,13 +32,15 @@ Which reply is the wake's: :func:`note_wake` marks the subscription's thread
 when a Slack wake carries ``blocked``, ``crashed``, ``timed_out`` or
 ``gave_up``, unless ``gateway/slack_ux_moments.py`` noted the question already
 posted (that wake is answered with ``[SILENT]``, so it clears the thread's mark
-instead). The next final reply sent for an internal event in that thread takes
+instead). The next final reply sent for the wake's turn in that thread takes
 the mark, within :data:`MARK_TTL_SECONDS`; a reply the user's own message
-prompted never does. A message queued behind a running turn runs as a follow-up
+prompted never does. A wake's turn is an internal event or, when a follow-up is
+queued behind it, the fresh event Hermes sends its reply under, which carries no
+inbound message id. A message queued behind a running turn runs as a follow-up
 whose reply is sent under that turn's event, which may be the user's: a queued
 wake carries the mark to that reply (:func:`drop`), taken by the wake's own turn
 or an event that arrived before the wake was drained, while a queued user's
-message drops it, so the wake's reply is drawn as the failure's and the user's
+message drops a mark noted before it arrived, so the wake's reply is drawn as the failure's and the user's
 is not. A carried mark the follow-up never sent (a ``[SILENT]`` or streamed
 reply) is dropped by the thread's next final rather than drawing a later message
 of the user's. Outside a thread the reply keeps its question as text, since a click answers in the thread it was clicked in. Kanban pings and moments are
@@ -111,8 +113,8 @@ LOWERABLE = re.compile(r"^(?!I(?:'|$))[A-Z](?:[a-z]|$)")
 #: Slack's cap on a message's blocks; a reply already at it keeps its question as text.
 MESSAGE_BLOCKS_MAX = 50
 
-#: Marked threads, ``(chat_id, thread_id) -> monotonic time``.
-_marks: "OrderedDict[tuple[str, str], float]" = OrderedDict()
+#: Marked threads, ``(chat_id, thread_id) -> (monotonic time, wall time)``.
+_marks: "OrderedDict[tuple[str, str], tuple[float, datetime]]" = OrderedDict()
 #: Marks a queued wake carried to its follow-up's reply, ``(chat_id, thread_id) ->
 #: (mark time, when carried)``: taken under any event that arrived before the carry.
 _carried: "OrderedDict[tuple[str, str], tuple[float, datetime]]" = OrderedDict()
@@ -150,7 +152,7 @@ def note_wake(sub: dict, wake_kinds: Iterable[str], text: str) -> None:
         _marks.pop(key, None)
         if _wake_note() in (text or ""):
             return
-        _marks[key] = time.monotonic()
+        _marks[key] = (time.monotonic(), datetime.now())
         while len(_marks) > MARKS_MAX:
             _marks.popitem(last=False)
     except Exception:
@@ -158,7 +160,7 @@ def note_wake(sub: dict, wake_kinds: Iterable[str], text: str) -> None:
 
 
 def begin(event: Any) -> Optional[contextvars.Token]:
-    """Mark this send when ``event`` is an internal turn in a marked thread, or the
+    """Mark this send when ``event`` is a wake's turn in a marked thread, or the
     turn a queued wake's mark was carried to (:func:`drop`); see :func:`end`."""
     try:
         source = getattr(event, "source", None)
@@ -169,10 +171,13 @@ def begin(event: Any) -> Optional[contextvars.Token]:
             return None
         key = _key(source.chat_id, getattr(source, "thread_id", None))
         carried = _carried.pop(key, None)
-        internal = getattr(event, "internal", False)
-        noted = _marks.pop(key, None) if internal else None
-        if carried is not None and (internal or _arrived_by(event, carried[1])):
+        wake = getattr(event, "internal", False) or _queued_wake_reply(event)
+        noted = None
+        if carried is not None and (wake or _arrived_by(event, carried[1])):
             noted = carried[0]
+        elif wake:
+            mark = _marks.pop(key, None)
+            noted = mark[0] if mark else None
         if noted is None or time.monotonic() - noted > MARK_TTL_SECONDS:
             return None
         return _marked.set(key[1])
@@ -183,24 +188,40 @@ def begin(event: Any) -> Optional[contextvars.Token]:
 
 def drop(source: Any, pending_event: Any) -> None:
     """Carry the mark on ``source``'s thread to the queued follow-up's reply when the
-    follow-up is internal, or clear it when it is a user's message.
+    follow-up is internal, or clear it when it is a user's message that arrived
+    after the mark was noted.
 
     The follow-up's reply goes out under the outer turn's event, which a wake
-    queued behind a user's turn would otherwise never be marked under.
+    queued behind a user's turn would otherwise never be marked under. A mark
+    noted after the user's message is a wake still to come, and stays.
     """
     try:
         if not (_marks or _carried) or source is None:
             return
         key = _key(source.chat_id, getattr(source, "thread_id", None))
-        noted = _marks.pop(key, None)
         if not getattr(pending_event, "internal", False):
             _carried.pop(key, None)
-        elif noted is not None:
-            _carried[key] = (noted, datetime.now())
+            mark = _marks.get(key)
+            if mark is not None and not _arrived_by(pending_event, mark[1]):
+                del _marks[key]
+            return
+        mark = _marks.pop(key, None)
+        if mark is not None:
+            _carried[key] = (mark[0], datetime.now())
             while len(_carried) > MARKS_MAX:
                 _carried.popitem(last=False)
     except Exception:
         logger.warning("slack_ux_failure: carrying or clearing the follow-up's mark failed", exc_info=True)
+
+
+def _queued_wake_reply(event: Any) -> bool:
+    """Whether ``event`` is the fresh one Hermes sends a finished turn's reply under
+    when a follow-up is queued, for a turn with no inbound message: a wake's."""
+    return not (
+        getattr(event, "internal", False)
+        or getattr(event, "message_id", None)
+        or getattr(event, "ledger_message_id", None)
+    )
 
 
 def _arrived_by(event: Any, moment: datetime) -> bool:
