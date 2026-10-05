@@ -135,6 +135,9 @@ SLACK_ENTITY = re.compile(r"<([^<>|]*)(?:\|([^<>]*))?>")
 
 #: An unlabeled user mention inside a reply's words, shown as ``@`` and the person's name.
 USER_MENTION = re.compile(r"<@([A-Z0-9]+)>")
+#: The most distinct mentions a reply's names are looked up for. Each shows as at least ``@``
+#: and one character, so a later one starts past ``TYPED_ANSWER_MAX`` and is clipped off.
+MENTIONS_NAMED_MAX = TYPED_ANSWER_MAX // 2
 #: The characters that would end an entity's label early, read as spaces in a name put in one.
 MENTION_LABEL_UNSAFE = str.maketrans("|<>", "   ")
 
@@ -380,10 +383,11 @@ def _plain(text: str) -> str:
 async def _named_mentions(adapter: Any, text: str, channel: str, team_id: str) -> str:
     """``text`` with each unlabeled user mention labeled with the person's name, so it reads as ``@name``.
 
-    The adapter's cached ``users.info`` lookup, as for the line's name; a lookup that fails leaves the id.
+    The adapter's cached ``users.info`` lookup, as for the line's name; a lookup that fails leaves the id,
+    as does a mention past the first :data:`MENTIONS_NAMED_MAX`, which the clip drops anyway.
     """
     names = {}
-    for user_id in dict.fromkeys(USER_MENTION.findall(text)):
+    for user_id in list(dict.fromkeys(USER_MENTION.findall(text)))[:MENTIONS_NAMED_MAX]:
         try:
             names[user_id] = str(await adapter._resolve_user_name(user_id, chat_id=channel, team_id=team_id) or "")
         except Exception:  # noqa: BLE001 — the mention keeps its id

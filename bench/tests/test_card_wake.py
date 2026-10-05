@@ -494,6 +494,16 @@ def test_a_click_plant_builds_the_turn_the_images_button_sends(hermes_root: Path
 
 
 @needs_moments
+@pytest.mark.skipif(not CLICKS.exists(), reason="main has no deploy/docker/patches/slack_ux_clicks.py")
+def test_a_click_plant_on_a_question_shown_without_buttons_names_the_case(hermes_root: Path, tmp_path: Path) -> None:
+    # No question mark before the options, so slack_moments leaves them as text.
+    prompt = CLICK_PROMPT.replace("Which should I look at?", "Pick one to look at.")
+
+    with pytest.raises(card_wake.ReplayBroken, match="shows no buttons"):
+        _plant(_shell_for(_with_clicks(hermes_root), tmp_path, prompt), prompt)
+
+
+@needs_moments
 def test_a_click_plant_on_an_image_without_the_clicks_module_is_broken(hermes_root: Path, tmp_path: Path) -> None:
     with pytest.raises(card_wake.ReplayBroken, match="slack_ux_clicks"):
         _plant(_shell_for(_with_moments(hermes_root), tmp_path, CLICK_PROMPT), CLICK_PROMPT)

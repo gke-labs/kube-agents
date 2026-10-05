@@ -670,6 +670,24 @@ class SettleQuestionTest(unittest.TestCase):
         note = adapter.updates[0]["blocks"][-1]["elements"][0]["text"]
         self.assertEqual(note, "✓ Priya: seeded-b, ask @Sam ops or @Priya or @U8")
 
+    def test_names_are_looked_up_only_for_the_mentions_the_line_can_show(self):
+        adapter = _Adapter()
+        resolve = adapter._resolve_user_name
+        looked_up = []
+
+        async def counting(user_id, chat_id="", team_id=""):
+            looked_up.append(user_id)
+            return await resolve(user_id, chat_id, team_id)
+
+        adapter._resolve_user_name = counting
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        roster = "".join(f"<@U{n:03d}>" for n in range(runtime.MENTIONS_NAMED_MAX + 5))
+        adapter.replies = [{"ts": "1700000000.000400", "user": "U7", "text": roster}]
+        _run(runtime.settle_question(adapter, SUB))
+        mentioned = [user_id for user_id in looked_up if user_id != "U7"]
+        self.assertEqual(mentioned, [f"U{n:03d}" for n in range(runtime.MENTIONS_NAMED_MAX)])
+        self.assertTrue(adapter.updates[0]["blocks"][-1]["elements"][0]["text"].startswith("✓ Priya: @U000@U001"))
+
     def test_a_mention_whose_name_lookup_fails_keeps_its_id(self):
         adapter = _Adapter()
         resolve = adapter._resolve_user_name

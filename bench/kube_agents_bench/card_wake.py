@@ -289,8 +289,13 @@ try:
             from gateway import slack_ux_clicks as clicks
             post = adapter.posts[0]
             blocks = post.get("blocks") or []
-            buttons = [e for b in blocks if b.get("type") == "actions" for e in b.get("elements") or []
-                       if clicks._shown_text(e) == CLICK]
+            shown = [e for b in blocks if b.get("type") == "actions" for e in b.get("elements") or []]
+            if not shown:
+                # Usually the case's fault: slack_moments shows 2 to 5 short options after a
+                # question as buttons, unless it only asks whether to go on.
+                raise RuntimeError("the question for card %s shows no buttons; its options are not ones "
+                                   "slack_moments renders as buttons, so the case cannot click" % card)
+            buttons = [e for e in shown if clicks._shown_text(e) == CLICK]
             if not buttons:
                 raise RuntimeError("the question for card %s has no %r button" % (card, CLICK))
             message = {"ts": STUB_TS, "text": post.get("text") or "", "blocks": blocks}
@@ -442,7 +447,7 @@ class ReplayUnavailable(RuntimeError):
 
 
 class ReplayBroken(RuntimeError):
-    """The plant script ran in the image and failed there: the image's fault, not the cluster's."""
+    """The plant script ran in the image and failed there: the image's fault or the case's, not the cluster's."""
 
 
 @dataclass(frozen=True)
