@@ -14,6 +14,7 @@ flag off, or for any platform but Slack, the two must be identical.
 """
 
 import asyncio
+import contextlib
 import importlib
 import os
 import shutil
@@ -530,12 +531,17 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+_live_roots = []
+_known_root_dirs = set()
+
+
 class _Root:
     """A throwaway Hermes root holding the fixtures and the runtime module."""
 
     def __init__(self):
         self._cleaned = False
         self.dir = Path(tempfile.mkdtemp())
+        _known_root_dirs.add(self.dir.resolve())
         for relative, text in FIXTURES.items():
             path = self.dir / relative
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -547,12 +553,36 @@ class _Root:
         # On the path for the root's lifetime: the delivery fixture imports
         # gateway.platforms.base when it is called, not when it is loaded.
         sys.path.insert(0, str(self.dir))
-        self._saved_modules = {
-            m: sys.modules[m]
-            for m in list(sys.modules)
-            if m.partition(".")[0] in ("gateway", "agent")
-        }
+        if _live_roots:
+            self._saved_modules = dict(_live_roots[0]._saved_modules)
+        else:
+            self._saved_modules = {
+                m: sys.modules[m]
+                for m in list(sys.modules)
+                if m.partition(".")[0] in ("gateway", "agent")
+                and not self._is_root_module(sys.modules[m])
+            }
+        _live_roots.append(self)
         self._forget_gateway()
+
+    @staticmethod
+    def _is_root_module(mod):
+        f = getattr(mod, "__file__", None)
+        if f:
+            with contextlib.suppress(OSError, ValueError, TypeError):
+                mod_path = Path(f).resolve()
+                for root_dir in _known_root_dirs:
+                    if root_dir == mod_path or root_dir in mod_path.parents:
+                        return True
+        paths = getattr(mod, "__path__", None)
+        if paths:
+            with contextlib.suppress(OSError, ValueError, TypeError):
+                for p in paths:
+                    pkg_path = Path(p).resolve()
+                    for root_dir in _known_root_dirs:
+                        if root_dir == pkg_path or root_dir in pkg_path.parents:
+                            return True
+        return False
 
     @staticmethod
     def _forget_gateway():
@@ -569,12 +599,17 @@ class _Root:
         if self._cleaned:
             return
         self._cleaned = True
+        if self in _live_roots:
+            _live_roots.remove(self)
         try:
             sys.path.remove(str(self.dir))
         except ValueError:
             pass
         self._forget_gateway()
-        sys.modules.update(self._saved_modules)
+        if not _live_roots:
+            for m, mod in self._saved_modules.items():
+                if not self._is_root_module(mod):
+                    sys.modules[m] = mod
         shutil.rmtree(self.dir, ignore_errors=True)
 
 
@@ -1321,6 +1356,31 @@ class RootTest(unittest.TestCase):
         added = sys.modules["gateway.platforms.base"]
         root.cleanup()
         self.assertIs(sys.modules.get("gateway.platforms.base"), added)
+
+    def test_overlapping_roots_fifo_cleanup_does_not_leak_stale_modules(self):
+        # When two roots overlap and clean up out-of-order (FIFO), the inner root
+        # must not snapshot the outer root's imports as pre-existing stubs, and
+        # tearing down the outer root first must not leave stale deleted paths in sys.modules.
+        outer = _Root()
+        self.addCleanup(outer.cleanup)
+        outer_delivery = outer.load(applier.DELIVERY, "cron.scheduler_delivery")
+        outer_delivery["_deliver_result"]({"id": "j1"}, "hello", [_target("slack")])
+        outer_mod = sys.modules.get("gateway.platforms.base")
+        self.assertIsNotNone(outer_mod)
+
+        inner = _Root()
+        self.addCleanup(inner.cleanup)
+        inner_delivery = inner.load(applier.DELIVERY, "cron.scheduler_delivery")
+        inner_delivery["_deliver_result"]({"id": "j1"}, "hello", [_target("slack")])
+        inner_mod = sys.modules.get("gateway.platforms.base")
+        self.assertIsNot(inner_mod, outer_mod)
+
+        # FIFO teardown: clean outer first, then inner
+        outer.cleanup()
+        self.assertNotIn("gateway.platforms.base", inner._saved_modules)
+
+        inner.cleanup()
+        self.assertNotIn("gateway.platforms.base", sys.modules)
 
 
 if __name__ == "__main__":
