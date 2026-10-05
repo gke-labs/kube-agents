@@ -386,6 +386,15 @@ def _link_url(url: str) -> str:
     return url.replace("&", "&amp;").translate(MRKDWN_URL_ESCAPES)
 
 
+def _closes_own_run(stem: str, closer: str) -> bool:
+    """Whether ``closer``, the emphasis markers after ``stem``'s stop, closes a run ``stem`` opened."""
+    if closer in BOLD_EDGES:
+        return stem.count(closer) % 2 == 1
+    if closer in ITALIC_EDGES:
+        return stem.replace(closer * 2, "").count(closer) % 2 == 1
+    return False
+
+
 def _first_sentence(line: str) -> tuple[str, str]:
     """``(first sentence, the rest)`` of ``line``, not cut after an abbreviation."""
     for match in SENTENCE_END.finditer(line):
@@ -393,9 +402,9 @@ def _first_sentence(line: str) -> tuple[str, str]:
         stem = sentence.rstrip("*_")
         tail = max(0, len(stem) - ABBREVIATION_TAIL)
         numbered = NUMBER_ABBREVIATION_END.search(stem, tail) and NUMBER_NEXT.match(line, match.end())
-        # A bold run closing right after the stop ends the sentence, whatever word it ends on.
-        bold_closed = any(sentence.endswith(m) and line.lstrip().startswith(m) for m in BOLD_EDGES)
-        if bold_closed or not (numbered or ABBREVIATION_END.search(stem, tail)):
+        # An emphasis run this sentence opened and closes right after the stop ends it, whatever
+        # word it ends on.
+        if _closes_own_run(stem, sentence[len(stem) :]) or not (numbered or ABBREVIATION_END.search(stem, tail)):
             rest = line[match.end() :].strip()
             # "**One. Two.**" splits inside the bold, which would leave both halves unpaired.
             for marker, (opener, closer) in BOLD_EDGES.items():

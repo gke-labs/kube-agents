@@ -311,6 +311,14 @@ class SplitAnswerTest(unittest.TestCase):
         for line, headline, body in (
             ("**Replicas are at max.** 3 pods run.", "Replicas are at max.", ["3 pods run."]),
             ("__Etc.__ Done.", "Etc.", ["Done."]),
+            (
+                "Yes — **replicas are at max.** 3 of 3 are ready. Nothing to do.",
+                "Yes — replicas are at max.",
+                ["3 of 3 are ready. Nothing to do."],
+            ),
+            ("Replicas are **at max.** 3 of 4 are ready.", "Replicas are at max.", ["3 of 4 are ready."]),
+            ("*Replicas are at max.* 3 pods run.", "Replicas are at max.", ["3 pods run."]),
+            ("The answer is _no._ 3 pods are down.", "The answer is no.", ["3 pods are down."]),
         ):
             self.assertEqual(sp.split_answer(line), (headline, body))
         self.assertEqual(sp.split_answer("Scale to max. 3 pods run."), ("Scale to max. 3 pods run.", []))
