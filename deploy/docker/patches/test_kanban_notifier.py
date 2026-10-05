@@ -2124,6 +2124,17 @@ class ApplyTest(unittest.TestCase):
             ("an early return", UPSTREAM_NOTIFIER.replace(
                 header, header + "        if not d:\n            return\n")),
             ("an early raise", UPSTREAM_NOTIFIER.replace(header, header + "        raise TypeError(d)\n")),
+            ("a second __init__ under an if", UPSTREAM_NOTIFIER.replace(binding, binding + (
+                "\n    if _LEGACY:\n        def __init__(self, runner, d):\n            self.runner = runner\n"))),
+            ("__init__ rebound through a tuple", UPSTREAM_NOTIFIER.replace(
+                binding, binding + "\n    _, __init__ = 1, object.__init__\n")),
+            ("__init__ imported", UPSTREAM_NOTIFIER.replace(
+                binding, binding + "\n    from os import getcwd as __init__\n")),
+            ("the class imported after it", UPSTREAM_NOTIFIER + "\nfrom gateway.legacy import _KanbanNotification\n"),
+            ("the class rebound under a try", UPSTREAM_NOTIFIER + (
+                "\ntry:\n    import legacy\nexcept ImportError:\n    _KanbanNotification = None\n")),
+            ("the class renamed behind an alias", UPSTREAM_NOTIFIER.replace(
+                "class _KanbanNotification:", "class _Notification:") + "\n_KanbanNotification = _Notification\n"),
         ):
             with self.subTest(why):
                 self.assertEqual(shape.count(binding), 1)
@@ -2137,6 +2148,8 @@ class ApplyTest(unittest.TestCase):
         for shape in (
             UPSTREAM_NOTIFIER.replace(binding, binding + "        if not d:\n            return\n"),
             UPSTREAM_NOTIFIER.replace(header, header + "        def _check():\n            return d\n"),
+            # A bare annotation binds nothing.
+            UPSTREAM_NOTIFIER.replace(binding, binding + "\n    __init__: object\n"),
         ):
             patch_tree(shape)
 

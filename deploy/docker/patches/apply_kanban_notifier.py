@@ -380,12 +380,30 @@ SENTINELS = (
 )
 
 
-def _defines(node: ast.stmt, name: str) -> bool:
-    """Whether a statement binds ``name`` in the scope it sits in."""
-    if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-        return node.name == name
-    targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
-    return any(isinstance(target, ast.Name) and target.id == name for target in targets)
+def _bindings(body: list[ast.stmt], name: str) -> list[ast.AST]:
+    """Every statement or target in ``body`` that may bind ``name`` in its scope.
+
+    Branches count, since any of them may run, and so do a tuple target, an
+    import, a loop, ``with`` or ``except`` name and a walrus; a nested scope's
+    body does not, and neither does a bare annotation, which binds nothing.
+    """
+    found, pending = [], list(body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name == name:
+                found.append(node)
+            continue
+        if isinstance(node, ast.Lambda) or (isinstance(node, ast.AnnAssign) and node.value is None):
+            continue
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == name:
+            found.append(node)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            found.extend(a for a in node.names if (a.asname or a.name).split(".")[0] == name)
+        elif isinstance(node, ast.ExceptHandler) and node.name == name:
+            found.append(node)
+        pending.extend(ast.iter_child_nodes(node))
+    return found
 
 
 def _exits(fn: ast.FunctionDef) -> list[ast.stmt]:
@@ -410,15 +428,15 @@ def expect_platform_binding(patch: patchlib.Patch) -> None:
     constructor's body, at the pinned indentation, runs on every construction.
     The statement found must also be the binding itself, so the text sitting in
     a comment or a string on another assignment's line does not pass. Python
-    keeps the last definition, so the class and the constructor must each be
-    the only one of their name, and no ``return`` or ``raise`` may come before
-    the binding.
+    keeps the last binding, so the class and the constructor must each be the
+    only binding of their name in their scope, in any branch or form
+    (``_bindings``), and no ``return`` or ``raise`` may come before the binding.
     """
     offset = patch.source.index(PLATFORM_BINDING)
     lineno = patch.source.count("\n", 0, offset) + 1
     col = len(PLATFORM_BINDING) - len(PLATFORM_BINDING.lstrip(" "))
-    classes = [node for node in patch._tree().body if _defines(node, PLATFORM_CLASS)]
-    methods = [node for node in classes[0].body if _defines(node, PLATFORM_METHOD)] if len(classes) == 1 else []
+    classes = _bindings(patch._tree().body, PLATFORM_CLASS)
+    methods = _bindings(classes[0].body, PLATFORM_METHOD) if len(classes) == 1 and isinstance(classes[0], ast.ClassDef) else []
     if len(methods) == 1 and isinstance(methods[0], ast.FunctionDef) and any(
         isinstance(stmt, ast.Assign) and stmt.lineno == lineno and stmt.col_offset == col
         and ast.get_source_segment(patch.source, stmt) == PLATFORM_BINDING.strip()
