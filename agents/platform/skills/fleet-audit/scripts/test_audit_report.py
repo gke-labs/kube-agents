@@ -5560,6 +5560,8 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
             audit_report.shield_declared_account_siblings(both, [declaration])
         (left,) = both["findings"]
         self.assertEqual(left["remediation"]["note"].count("declared at acme/fleet:knowledge/api-token.md"), 1)
+        # And it is the owner's spelling that is printed, not the worker's.
+        self.assertIn("`Deployment/api` declared at", left["remediation"]["note"])
         # Two notes declaring the same workload name it once, under the first.
         twice = audit_report.validate_findings(make_doc(findings=[self._sa_finding("worker", "Deployment/worker")], audit=AUDIT), AUDIT)
         second = dict(declaration, path="knowledge/also-api.md")
@@ -16187,21 +16189,26 @@ class TestFinishManifestFlag(HarnessTestCase):
         path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
         api = make_finding(fid="api", check="default-sa-automount", obj="Deployment/api", title="api", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
         worker = make_finding(fid="worker", check="default-sa-automount", obj="Deployment/worker", title="worker", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
-        previous_body = published_body(make_doc(findings=[api, worker], audit=AUDIT), generated_at=NOW)
+        # cron is undeclared and also omitted this run: still flagged by the
+        # collector, in the shielded namespace, on the same pull request.
+        cron = make_finding(fid="cron", check="default-sa-automount", obj="CronJob/cron", title="cron", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        previous_body = published_body(make_doc(findings=[api, worker, cron], audit=AUDIT), generated_at=NOW)
         self.declaring_replies(previous_body)
         api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
         worker_id = derived_id(check="default-sa-automount", obj="Deployment/worker")
+        cron_id = derived_id(check="default-sa-automount", obj="CronJob/cron")
         self.harness.replies["proposal-list"] = proposals_view(
-            [pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([api_id, worker_id]))]
+            [pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([api_id, worker_id, cron_id]))]
         )
         self.touch(path)
         audit_report.write_declarations(AUDIT, "acme/fleet", [{"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}])
         doc = make_doc(findings=[worker], audit=AUDIT)
-        manifest = _full_manifest(audit=AUDIT, candidates=[self.account_candidate("Deployment/api"), self.account_candidate("Deployment/worker")])
+        manifest = _full_manifest(audit=AUDIT, candidates=[self.account_candidate("Deployment/api"), self.account_candidate("Deployment/worker"), self.account_candidate("CronJob/cron")])
         rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
         self.assertEqual(rc, 0, self.err)
         self.assertIn(f"DECLARED: {api_id}", self.err)
         self.assertIn("collector candidate the document did not report", self.err)
+        self.assertIn(f"SHIELDED: {cron_id}", self.err)
         payload = self.stdout_json()
         self.assertEqual(payload["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
         comment = " ".join(self.harness.bodies_for("proposal-*"))

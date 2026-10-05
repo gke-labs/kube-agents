@@ -5370,6 +5370,19 @@ def _shield_sources(data: dict, declarations: list[dict]) -> dict[tuple[str, str
         seen.add(folded)
         sources.setdefault(key, []).append((obj, repo, path))
 
+    # `start`'s declarations first: their `object` is the owner's `Kind/name`,
+    # which the note should print; a `declared[]` entry carries the worker's
+    # spelling of the same workload and only adds what no note declared.
+    for entry in declarations:
+        if _id_segment(str(entry.get("check", ""))) != _id_segment(SHARED_ACCOUNT_CHECK):
+            continue
+        add(
+            str(entry.get(DECLARATION_CLUSTER_FIELD, "") or ""),
+            str(entry.get("namespace") or ""),
+            str(entry.get("object", "")),
+            str(entry.get("repo", "")),
+            str(entry.get("path", "")),
+        )
     for entry in data.get("declared") or []:
         if str(entry.get("check", "")) != SHARED_ACCOUNT_CHECK:
             continue
@@ -5381,20 +5394,12 @@ def _shield_sources(data: dict, declarations: list[dict]) -> dict[tuple[str, str
             str(declaration.get("repo", "")),
             str(declaration.get("path", "")),
         )
-    for entry in declarations:
-        if _id_segment(str(entry.get("check", ""))) != _id_segment(SHARED_ACCOUNT_CHECK):
-            continue
-        add(
-            str(entry.get(DECLARATION_CLUSTER_FIELD, "") or ""),
-            str(entry.get("namespace") or ""),
-            str(entry.get("object", "")),
-            str(entry.get("repo", "")),
-            str(entry.get("path", "")),
-        )
     return sources
 
 
-def shield_declared_account_siblings(data: dict, declarations: list[dict] | None = None) -> list[str]:
+def shield_declared_account_siblings(
+    data: dict, declarations: list[dict] | None = None, manifest: dict | None = None
+) -> list[str]:
     """Keep a declared 2.7 workload's token by making its siblings' fixes manual.
 
     `default-sa-automount` is declared per workload and remediated per
@@ -5407,22 +5412,35 @@ def shield_declared_account_siblings(data: dict, declarations: list[dict] | None
     ways to fix the rest. The declared workloads come from `declared[]` and
     from `start`'s declarations (`_shield_sources`), so a declared workload
     the worker left out of the document still protects its namespace.
-    Returns the ids changed, each logged; the caller carries them to the
-    stale-close pass, and nothing in the document records them.
+    Returns the ids shielded, each logged, and nothing in the document
+    records them: the findings changed, plus every 2.7 candidate the
+    collector still emits in a shielded namespace that the document neither
+    reports nor declares. A 2.7 pull request is one namespace's one file, so
+    a sibling the worker left out is on the same branch as the ones it
+    reported; counted as held rather than shielded, it would keep that
+    pull request open past the close the shield exists to make.
     """
     shielded_by = _shield_sources(data, list(declarations or []))
     if not shielded_by:
         return []
+
+    def declared_for(cluster: str, namespace: str) -> list[tuple[str, str, str]]:
+        # Fleet-wide entries first: a note without `cluster` is the owner's
+        # spelling, and a cluster-scoped `declared[]` copy of the same
+        # workload adds nothing a reader needs.
+        ns = _id_segment(namespace)
+        found = list(shielded_by.get((_id_segment(""), ns), []))
+        named = {_id_segment(obj) for obj, _repo, _path in found}
+        for entry in shielded_by.get((_id_segment(cluster), ns), []):
+            if _id_segment(entry[0]) not in named:
+                found.append(entry)
+        return found
+
     changed: list[str] = []
     for finding in data.get("findings") or []:
         if str(finding.get("check", "")) != SHARED_ACCOUNT_CHECK:
             continue
-        namespace = _id_segment(str(finding.get("namespace") or ""))
-        declared = list(shielded_by.get((_id_segment(str(finding.get("cluster", ""))), namespace), []))
-        named = {_id_segment(obj) for obj, _repo, _path in declared}
-        for entry in shielded_by.get((_id_segment(""), namespace), []):
-            if _id_segment(entry[0]) not in named:
-                declared.append(entry)
+        declared = declared_for(str(finding.get("cluster", "")), str(finding.get("namespace") or ""))
         if not declared:
             continue
         fid = str(finding.get("id", ""))
@@ -5447,6 +5465,24 @@ def shield_declared_account_siblings(data: dict, declarations: list[dict] | None
             f"ServiceAccount with a declared workload ({names}); the shared-account fix would "
             "remove that workload's token, so this finding is manual."
         )
+    if manifest is not None:
+        known = {derive_finding_id(f) for f in data.get("findings") or []} | {
+            derive_finding_id(e) for e in data.get("declared") or []
+        }
+        for entry, candidate in _candidates(manifest):
+            if str(candidate.get("check", "")) != SHARED_ACCOUNT_CHECK:
+                continue
+            keyed = {**candidate, "cluster": str(candidate.get("cluster") or entry.get("name") or "")}
+            identity = derive_finding_id(keyed)
+            if identity in known or not declared_for(keyed["cluster"], str(keyed.get("namespace") or "")):
+                continue
+            known.add(identity)
+            changed.append(_shorten_id(identity))
+            log(
+                f"SHIELDED: {_shorten_id(identity)} — a {SHARED_ACCOUNT_CHECK} candidate the document "
+                "did not report, in a namespace with a declared workload; its shared-account pull "
+                "request is closed with the others rather than held open for it."
+            )
     return changed
 
 
@@ -10767,7 +10803,7 @@ def join_harness_declarations(
     declarations = read_declarations(audit_id, repo=repo)
     moved = apply_declarations(data, declarations)
     from_manifest = declare_collector_candidates(data, declarations, manifest)
-    shielded = shield_declared_account_siblings(data, declarations)
+    shielded = shield_declared_account_siblings(data, declarations, manifest)
     return [str(finding.get("id", "")) for finding in moved] + from_manifest, shielded
 
 
