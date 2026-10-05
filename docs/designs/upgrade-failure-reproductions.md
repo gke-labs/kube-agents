@@ -130,7 +130,7 @@ Harness: `scenarios/04.sh` (`upg-04b`); `bash run.sh 04`. Reproduced: an emptyDi
 control-plane upgrade and was replaced after the node rebuild, and nothing reported the loss; only
 emptyDir was tested, not hostPath or Local SSD.
 
-Fleet: no role on `main`. An `emptyDir` stamp would not hold, since the fleet's own node rebuilds erase it, but the volume source itself (a workload whose queue is an `emptyDir`) does, and that is the shape the catalogue's coverage section designs.
+Fleet: no role on `main`. An `emptyDir` stamp would not hold, since the fleet's own node rebuilds erase it, a standing shape that holds is designed in the catalogue's "How each failure is tested" section.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/04.sh`, evidence
 `bench/upgrade-scenarios/evidence/04/node-data.txt`, and item 4 of the harness README. Detection,
@@ -187,9 +187,7 @@ Harness: `scenarios/08.sh` and the hold `08h`; `bash run.sh 08`. Reproduced: the
 refused the gitRepo volume with FailedMount on the new node.
 
 Fleet: no role on `main`. The `gitRepo` shape the harness planted is version-bound (it needs a kubelet
-below 1.33, which only the EXTENDED channel offers), but a namespace whose Pod Security Admission
-is pinned to version `latest` holds with no version bound, since the rule set changes under it at
-every minor, and that is the designed shape.
+below 1.33, which only the EXTENDED channel offers), a standing shape that holds is designed in the catalogue's "How each failure is tested" section.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/08.sh`, evidence
 `bench/upgrade-scenarios/evidence/08/default-change.txt`, and item 8 of the harness README.
@@ -243,7 +241,7 @@ Harness: `scenarios/12.sh` (`upg-12b`); `bash run.sh 12`. Reproduced in GKE's fo
 a label set by hand stayed Pending after the rebuilt node came back without it, and GKE reported
 DONE; whether a minor still drops a standard label was not checked.
 
-Fleet: no role on `main`. A hand-set node label would not hold through the node rebuild GKE's own patch upgrades perform, but a selector on a built-in deprecated label the kubelet still sets (`beta.kubernetes.io/arch`) does, and that is the designed shape.
+Fleet: no role on `main`. A hand-set node label would not hold through the node rebuild GKE's own patch upgrades perform, a standing shape that holds is designed in the catalogue's "How each failure is tested" section.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/12.sh`, evidence
 `bench/upgrade-scenarios/evidence/12/label.txt`, and item 12 of the harness README. Detection, where
@@ -257,8 +255,7 @@ inside 1.31 moved containerd from 1.7.34 to 2.0.10 and a v1alpha2 CRI client bro
 newest 1.31 patch already on containerd 2.0, so the runtime moves with a patch, not a minor.
 
 Fleet: no role on `main`. The REGULAR clusters already run containerd 2, so a runtime-version fixture
-could hold only the wreckage, but an agent mounting the containerd socket holds on any runtime, and
-that is the designed shape.
+could hold only the wreckage, a standing shape that holds is designed in the catalogue's "How each failure is tested" section.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/13b.sh`, evidence
 `bench/upgrade-scenarios/evidence/13b/runtime.txt`, and item 13 of the harness README. Detection,
@@ -273,7 +270,7 @@ pool can still be created on a 1.34 cluster, GKE refused its 1.35 upgrade with a
 the migration to v2 first, and after the migration the old JVM was OOMKilled five times while a
 fixed JVM stayed up.
 
-Fleet: no role on `main`. A cgroup v1 pool would not hold for long (GKE migrates one to v2 at 1.33 and refuses v1 at 1.35), but a JDK 8 from before cgroup v2 support, under a memory limit, holds on any pool, and that is the designed shape.
+Fleet: no role on `main`. A cgroup v1 pool would not hold for long (GKE migrates one to v2 at 1.33 and refuses v1 at 1.35), a standing shape that holds is designed in the catalogue's "How each failure is tested" section.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/14c.sh` (`14.sh` is the symptom alone), evidence
 `bench/upgrade-scenarios/evidence/14c/cgroup.txt`, and item 14 of the harness README. Detection,
@@ -288,8 +285,7 @@ with singleProcessOomKill true kept running; no upgrade crossed the 1.28 boundar
 symptom is shown.
 
 Fleet: no role on `main`. The symptom needs a multi-process container over its limit, which no
-standing fixture should run, but the shape itself (several processes under one limit, none of them
-allocating) holds, and that is the designed shape.
+standing fixture should run, a standing shape that holds is designed in the catalogue's "How each failure is tested" section.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/15.sh`, evidence
 `bench/upgrade-scenarios/evidence/15/group-oom.txt`, and item 15 of the harness README. Detection,
@@ -317,7 +313,7 @@ only where a hand-set label was, the rebuilt node lacked the label, the DaemonSe
 the client on the new node got Connection refused, with the operation DONE; GKE's own node agents
 cannot be broken from outside.
 
-Fleet: no role on `main`. A hand-set label the DaemonSet selects on is what a node rebuild drops, so that shape would turn into the after-state, but a host-network agent mounting the CNI configuration directory holds, and that is the designed shape.
+Fleet: no role on `main`. A hand-set label the DaemonSet selects on is what a node rebuild drops, so that shape would turn into the after-state, a standing shape that holds is designed in the catalogue's "How each failure is tested" section.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/17.sh`, evidence
 `bench/upgrade-scenarios/evidence/17/node-agent.txt`, and item 17 of the harness README. Detection,
@@ -335,7 +331,7 @@ forward-compatibility libraries a planted pod forced (Error 803). The upgrade re
 catalogue's condition rather than creating it, and two runs lost their only GPU node to a stockout
 mid-upgrade while the operation read DONE.
 
-Fleet: no role on `main`, and the fleet carries no accelerator, so nothing GPU-bound can run; a suspended job that requests a GPU and pins a CUDA version holds as a manifest, and that is the designed shape.
+Fleet: no role on `main`, and the fleet carries no accelerator, so nothing GPU-bound can run; a standing shape that holds is designed in the catalogue's "How each failure is tested" section.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/18k.sh` (`18m.sh` repeats it in another zone; both
 source `18.sh`; the forward-compatibility round is `bench/upgrade-scenarios/compat-probe.sh`),
