@@ -1319,6 +1319,19 @@ def comment_pending(episode: dict, namespace: str, card: str) -> None:
         episode["pending"] = []
 
 
+def card_wait_over(episode: dict, now: str) -> bool:
+    """Whether a card-less episode has waited as long as a card is given to
+    appear. Every step that finds no card asks this, so none gives up on a
+    card the others are still waiting for."""
+    if not episode.get(SESSION_KEY):
+        return True  # nothing can file a card for it
+    try:
+        waited = (datetime.fromisoformat(now) - datetime.fromisoformat(str(episode.get("opened_at")))).total_seconds()
+    except (ValueError, TypeError):  # TypeError: a hand-edited time with no timezone
+        return True
+    return waited >= UNFILED_ALERT_RETRY_SECONDS
+
+
 def adopt_cards(state: dict, now: str) -> set[str]:
     """Look up the card each open alert's session filed, and return the scopes
     whose session has filed none UNFILED_ALERT_RETRY_SECONDS after the alert.
@@ -1335,11 +1348,7 @@ def adopt_cards(state: dict, now: str) -> set[str]:
                 continue
         except BoardUnreadable:
             continue
-        try:
-            waited = (datetime.fromisoformat(now) - datetime.fromisoformat(str(episode.get("opened_at")))).total_seconds()
-        except (ValueError, TypeError):  # TypeError: a hand-edited time with no timezone
-            waited = UNFILED_ALERT_RETRY_SECONDS
-        if waited >= UNFILED_ALERT_RETRY_SECONDS:
+        if card_wait_over(episode, now):
             expired.add(scope)
     return expired
 
@@ -1501,7 +1510,10 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             # Whether a card is open is unknown; ask again next tick.
             continue
         if card is None:
-            # No card came of the alert, so there is nothing to close.
+            if not card_wait_over(episode, now):
+                # The card may still come; it is closed with the cleared line
+                # when it does, or the line is said bare once the wait is over.
+                continue
             end_episode(state, scope)
             lines.append(f"{CLEARED_PREFIX} in {scope_label_text(scope)}: {cleared}")
             continue

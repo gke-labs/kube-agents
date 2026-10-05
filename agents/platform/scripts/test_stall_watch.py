@@ -441,12 +441,25 @@ class Alerts(Base):
         self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW, other]}})
         self.assertEqual(len(self.kv.alerts), 2)
 
-    def test_an_alert_whose_card_never_came_clears_with_a_line_and_no_card(self):
+    def test_an_alert_whose_card_never_came_clears_with_a_line_and_no_card_after_the_wait(self):
         self.kv.file_cards = False
-        self.run_tick({"c": {"checkout": [DEADLINE_ROW]}})
-        lines, _ = self.run_tick({"c": {"checkout": []}})
+        self.run_tick({"c": {"checkout": [DEADLINE_ROW]}}, now="2026-10-02T12:00:00+00:00")
+        lines, _ = self.run_tick({"c": {"checkout": []}}, now="2026-10-02T12:30:00+00:00")
+        self.assertEqual(lines, [], "the card may still come")
+        self.assertIn(f"{cid('c')}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
+        lines, _ = self.run_tick({"c": {"checkout": []}}, now="2026-10-03T12:00:00+00:00")
         self.assertEqual(lines, [f"{stall_watch.CLEARED_PREFIX} in {label('c')} / `checkout`: Deployment/checkout-api"])
         self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY], {})
+
+    def test_a_card_filed_after_the_stall_cleared_is_still_closed(self):
+        self.kv.file_cards = False
+        self.run_tick({"c": {"checkout": [DEADLINE_ROW]}}, now="2026-10-02T12:00:00+00:00")
+        self.run_tick({"c": {"checkout": []}}, now="2026-10-02T12:30:00+00:00")
+        tid = self.board.file(self.kv.alerts[0]["session"], self.kv.alerts[0])
+        lines, _ = self.run_tick({"c": {"checkout": []}}, now="2026-10-02T13:00:00+00:00")
+        self.assertEqual(len(self.cleared(lines)), 1)
+        self.assertIn(f"card `{tid}` closed", lines[0])
+        self.assertEqual(self.board.cards[tid]["status"], "done")
 
     def test_an_episode_from_before_the_inject_path_keeps_its_card(self):
         # The ledger the card-filing watch wrote: `card`, no `session`.

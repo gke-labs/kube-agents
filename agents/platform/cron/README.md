@@ -94,7 +94,9 @@ close and reopen an episode.
 
 `deliver: chat` carries the watch's own one-liners: "stall cleared in
 `<project>/<cluster>` (`<location>`) / `<namespace>`: `<objects>`; card `<id>`
-closed" (without the card clause when the alert produced no card), "stall
+closed" (without the card clause when the alert produced no card within a
+day; until then a cleared namespace waits for its card, so a late card is still
+closed), "stall
 noticed in `<n>` more namespaces; alerts follow on later ticks, 3 a tick", the
 cleared line naming at most eight objects, and an "alerts not raised" line when the Session
 KV server refuses an alert, said once until the reason changes, with a line
