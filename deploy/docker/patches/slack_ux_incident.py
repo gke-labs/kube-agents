@@ -190,7 +190,12 @@ def _unfenced(text: str) -> list[str]:
 
 
 def _option_choice(letter: str, title: str, recommended: bool) -> tuple[str, str, bool]:
-    """A lettered option's ``(label, reply, recommended)``; the title is clipped before the suffix, so it shows."""
+    """A lettered option's ``(label, reply, recommended)``; the title is clipped before the suffix, so it shows.
+
+    A title's own trailing suffix is dropped: a click strips the suffix from any
+    incident label, and could not tell that one from the one added here.
+    """
+    title = title.removesuffix(RECOMMENDED_SUFFIX)
     label = OPTION_LABEL.format(title=title)
     if recommended:
         label = _presenter._clip(label, _presenter.BUTTON_TEXT_MAX - len(RECOMMENDED_SUFFIX)) + RECOMMENDED_SUFFIX
