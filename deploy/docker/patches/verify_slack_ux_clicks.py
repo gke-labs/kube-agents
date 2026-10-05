@@ -15,7 +15,7 @@ Two things are checked:
    ``_get_client``, ``_handle_slack_message``, ``_is_interactive_user_authorized``,
    ``_channel_gate_allows``, ``_slack_message_matches_mention_patterns``,
    ``_event_declares_bot_sender`` and ``_resolve_user_name``, sets
-   ``_bot_user_id``, ``_team_bot_user_ids`` and ``_user_name_cache`` in ``__init__``, plus ``_client_for`` for ``slack_ux_incident``;
+   ``_bot_user_id`` and ``_team_bot_user_ids`` in ``__init__``, plus ``_client_for`` for ``slack_ux_incident``;
    the adapter file still defines ``_slack_mention_detection_text(event)`` at module level and still reads the
    ``_hermes_force_process`` marker the click's message carries.
    ``_register_bolt_handlers`` still wires the plugin
@@ -65,8 +65,7 @@ RUNTIME_MEMBERS = (
 #: The adapter file's module-level functions the runtime calls, and how: positional arguments, keywords.
 RUNTIME_FUNCTIONS = {"_slack_mention_detection_text": (1, ())}
 #: The instance attributes the runtime reads, set in ``__init__``.
-#: ``_user_name_cache`` is what keeps a click from costing a ``users.info`` call each time.
-RUNTIME_ATTRIBUTES = ("_bot_user_id", "_team_bot_user_ids", "_user_name_cache")
+RUNTIME_ATTRIBUTES = ("_bot_user_id", "_team_bot_user_ids")
 #: The members the runtime awaits; every other one it calls plainly.
 ASYNC_MEMBERS = ("_begin_interaction", "_handle_slack_message", "_channel_gate_allows", "_resolve_user_name")
 #: The event key whose ``.get()`` makes the message handler skip the mention

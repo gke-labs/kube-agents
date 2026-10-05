@@ -74,7 +74,6 @@ class SlackAdapter:
         self._app = App()
         self._bot_user_id: str = ""
         self._team_bot_user_ids, self._other = {}, {}
-        self._user_name_cache = {}
 
     def _handle_clarify_action(self, ack, body, action):
         return None
@@ -258,7 +257,6 @@ class ApplierTest(unittest.TestCase):
             ("        self._bot_user_id: str = \"\"\n", "", "no longer sets _bot_user_id"),
             ("self._team_bot_user_ids, self._other = {}, {}", "self._bot_ids, self._other = {}, {}",
              "no longer sets _team_bot_user_ids"),
-            ("        self._user_name_cache = {}\n", "", "no longer sets _user_name_cache"),
             ("def _resolve_user_name(", "def _user_name(", "_resolve_user_name"),
             ("    async def _resolve_user_name(", "    def _resolve_user_name(",
              "_resolve_user_name is no longer async"),
