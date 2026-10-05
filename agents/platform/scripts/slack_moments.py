@@ -411,9 +411,9 @@ def _question(reason: str, buttons: bool) -> tuple[str, list[str], list[str]]:
     if not usable:
         start, options = len(lines), []
     first = lines[0].strip()
-    # A clipped headline keeps its whole line below it too.
-    # Measured as shown: a link's url is not on screen.
-    below = 0 if len(_headline_text(first)) > _presenter.HEADLINE_MAX else 1
+    # A clipped headline keeps its whole line below it too, measured as shown, and so
+    # does one with a link: the headline shows only the label, the line below the url.
+    below = 0 if len(_headline_text(first)) > _presenter.HEADLINE_MAX or _presenter.MD_LINK.search(first) else 1
     return first, [*before, *lines[below:start]], options
 
 

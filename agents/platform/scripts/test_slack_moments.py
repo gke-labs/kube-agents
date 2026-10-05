@@ -444,10 +444,21 @@ class NeedsYouTest(unittest.TestCase):
         self.assertEqual(_buttons(blocks), [])
         self.assertIn(long, _contexts(blocks)[0])
 
-    def test_a_headline_short_once_plain_is_not_repeated_below(self):
-        link = "[runbook](https://example.com/" + "a" * 150 + ")"
-        blocks, text = m.needs_you(f"Check the {link} first. Which?\n- seeded-a\n- seeded-b")
+    def test_a_headline_with_a_link_keeps_the_url_on_the_line_below(self):
+        url = "https://example.com/" + "a" * 150
+        blocks, _ = m.needs_you(f"Check the [runbook]({url}) first. Which?\n- seeded-a\n- seeded-b")
         self.assertIn("Check the runbook first. Which?", blocks[0]["text"]["text"])
+        self.assertEqual(_contexts(blocks)[0], f"Check the <{url}|runbook> first. Which?")
+        self.assertEqual([b["value"] for b in _buttons(blocks)], ["seeded-a", "seeded-b"])
+
+    def test_a_short_headline_with_a_link_keeps_the_url_on_the_line_below(self):
+        url = "https://github.com/acme/x/pull/412"
+        blocks, _ = m.needs_you(f"Should I merge [PR #412]({url})?\n- Yes\n- No")
+        self.assertEqual(_contexts(blocks)[0], f"Should I merge <{url}|PR #412>?")
+        self.assertEqual([b["value"] for b in _buttons(blocks)], ["Yes", "No"])
+
+    def test_a_short_headline_without_a_link_is_not_repeated_below(self):
+        blocks, _ = m.needs_you("Which cluster?\n- seeded-a\n- seeded-b")
         self.assertEqual([b for b in blocks if b["type"] == "context" and b.get("block_id") != p.WAITING_BLOCK_ID], [])
 
     def test_a_long_first_line_is_repeated_whole_below_the_clipped_headline(self):
