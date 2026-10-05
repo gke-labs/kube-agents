@@ -77,25 +77,31 @@ headline in place of the composed message (`slack_audit_report.py`, called from
 home channel is known, the job's `skills` (a list or one string, or the legacy `skill`) include
 `fleet-audit`, the message ends
 with a link to an issue in a managed repository, and enough of the posts' budget is
-left to read that issue. The headline reads the finding and critical counts and
-the top two findings from that issue if it is open and labelled `agent:audit`;
-held rows are not findings, a `#` line inside a finding's fenced evidence ends no
-section, and a finding title or the audit name keeps a link's text but not its
-target. It carries one number, the title's finding count ("<Name> found 7 things
-to look at across 3 clusters.", the coverage taken from the relayed line's "across
-<n> clusters" when it has one, or "across 3 of 5 clusters" when it says so, and left
-out when the line names something it could not scan without an "of <m>", since "across
-3 clusters" would vouch for all three); then, on the line under the headline, the
-parts of the relayed line naming what was not scanned ("1 cluster
-skipped, 2 clusters unreachable."), since a silent gap reads as clean, followed by
-the relayed line's "<n> new" count ("2 are new since the last run.") and a lead into
-the rows; then the top two findings; then the ledger link. The relayed line itself, which alone carries
-resolved counts and remediation pull requests, is left off the headline and goes
-in its thread. The relayed line is the report's last line; when that line is only the ledger link,
+left to read that issue. The headline reads that issue if it is open and labelled
+`agent:audit`: the title's critical count, the body's summary line for the other
+severities (the findings its sections list when it has none), the findings
+themselves, and the Scope section's skipped clusters. Held rows are not findings,
+a `#` line inside a finding's fenced evidence ends no section, and a finding title,
+a skipped cluster or the audit name keeps a link's text but not its target. It
+carries one number, the count of the most severe findings present ("<Name>: 2
+critical findings", the name as the title writes it), and lists every critical
+finding, or the top two of the highest severity present when there is none, each
+row led by its severity. Under the rows, a line counts the rest by severity ("5
+more (1 major, 4 minor) are in the thread."), left off when there are none; a line
+names the clusters the run could not check ("Couldn't reach seeded-c, so this run
+didn't check it.", or a count past three names), or, when the body has no such
+table, gives the relayed line's own words for what was not scanned, since a silent
+gap reads as clean; then the ledger link. The findings the card counts but does
+not list are posted in its thread, one row each, ending with the ledger link when
+the body left some out or there are more than 50. The relayed line itself, which
+alone carries resolved counts and remediation pull requests, is left off the
+headline and goes in its thread, after those rows. The relayed line is the report's last line; when that line is only the ledger link,
 the last unindented, non-list line above it that reads as the audit line (its coverage, a
-findings total or a change count) stands in for it, else the last such line with any count. When the issue cannot be read, is closed (a clean run closes it without
-rewriting its title), or does not parse, the leg posts the relayed line in bold
-with the link. Not parsing includes a title of 0 findings, a "<n> new" above the
+findings total or a change count) stands in for it, else the last such line with any count. A closed issue is a clean run, which closes the ledger without rewriting its
+title, so the headline is "<Name>: clean. Ledger closed." and the link, unless the
+relayed line counts a finding. When the issue cannot be read or does not parse,
+the leg posts the relayed line in bold with the link. Not parsing includes a title
+of 0 findings, a body listing no finding, a "<n> new" above the
 title's count, a title whose count disagrees with the finding total the relayed
 line states, and a relayed line with no total that counts no non-zero new,
 resolved or severity count or calls the run clean, held, carried or nothing
@@ -115,16 +121,15 @@ headline beside the scheduler's raw copy.
 
 When the credential proxy's Slack relay is also in the environment and the issue
 parses, the headline goes out as Block Kit instead of text. `_post_audit_blocks`
-builds it with `slack_audit_report.blocks_from_issue` (the same headline, new
-count and top two findings, a "Fix the first one" button, "Fix it" when one finding
-is listed, a "See all N" button when the issue counts more than it shows, and a link
-button to the ledger; nothing folds) and posts it once through `slack_blocks_post`
+builds it with `slack_audit_report.blocks_from_issue` (the same headline, rows and
+lines, a "Look at the first one" button when a finding is listed, and a link button
+to the ledger; nothing folds) and posts it once through `slack_blocks_post`
 to the relay's `chat.postMessage`, because `hermes send` takes text only. A click on
 a choice button runs as the clicker's turn in the thread, carrying the button's
 label, which is also its value. The leg posts the text headline
 through `hermes send` instead when there is no relay, when the report carries a
-truncation notice (the blocks have no place for it), when the issue was not read, is
-closed or does not parse, when Slack refuses the message for any reason, since
+truncation notice (the blocks have no place for it), when the issue was not read or
+does not parse, when Slack refuses the message for any reason, since
 nothing smaller is left to retry with, when too little of the posts' budget is left, and
 when the relay call fails. That last case includes a failure that may have posted,
 such as a timeout after the request was sent: nothing posts the report again, since

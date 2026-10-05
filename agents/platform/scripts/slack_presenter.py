@@ -762,7 +762,11 @@ def blocks_answer(
 
 
 def fallback_text(
-    headline: str, links: Iterable[Any] = (), choices: Iterable[str] = (), rows: Sequence[Any] = ()
+    headline: str,
+    links: Iterable[Any] = (),
+    choices: Iterable[str] = (),
+    rows: Sequence[Any] = (),
+    after_rows: str = "",
 ) -> str:
     """The same layout as plain mrkdwn, with no buttons.
 
@@ -771,7 +775,8 @@ def fallback_text(
     plain pass would strip markup a code span had kept. ``rows`` follow the
     headline, one line each, led by their severity as inline code or, with
     none, a bullet, and any ``detail`` on the line under its row, each clipped
-    as the rich view clips it; links become inline ``<url|label>``; choices
+    as the rich view clips it, then each line of ``after_rows``, clipped and
+    escaped the same; links become inline ``<url|label>``; choices
     become one "Reply with one of:" line. Every label and row is escaped and every url,
     in a row or a link, is a ``SAFE_URL``, so none can mention anyone.
     """
@@ -780,6 +785,7 @@ def fallback_text(
     if title:
         parts.append(f"*{_escape(title)}*")
     parts.extend(_row_line(row) for row in _shown(rows))
+    parts.extend(to_mrkdwn(_escape(_clip(line, ROW_TEXT_MAX))) for line in _after_lines(after_rows))
     pairs = _link_pairs(links)
     if pairs:
         parts.append(CHOICE_SEPARATOR.join(f"<{url}|{_escape(label)}>" for label, url in pairs))
@@ -840,8 +846,8 @@ def blocks_report(
 
     ``headline`` is bold and ``note`` follows it plain, both one line;
     ``detail``, when given, is one more plain line under them, clipped like a
-    row, and ``after_rows`` one plain line below the rows' group, clipped the
-    same. ``rows``
+    row, and each line of ``after_rows`` a plain line below the rows' group,
+    clipped the same. ``rows``
     are ``{"text": <markdown>, "severity"?: str, "detail"?:
     <markdown>}`` mappings or plain strings, a ``detail`` being a second line
     under its row, clipped like it; ``rows`` sit between two dividers, with no
@@ -869,10 +875,10 @@ def blocks_report(
         blocks.append({"type": "divider"})
         blocks.append({"type": "rich_text", "elements": [_rich_row(row) for row in rows]})
         blocks.append({"type": "divider"})
-    after_line = _clip(_plain(after_rows or "").strip(), ROW_TEXT_MAX)
-    if after_line:
+    after_lines = [_clip(_plain(line), ROW_TEXT_MAX) for line in _after_lines(after_rows)]
+    if after_lines:
         blocks.append({"type": "rich_text", "elements": [
-            {"type": "rich_text_section", "elements": [{"type": "text", "text": after_line}]}]})
+            {"type": "rich_text_section", "elements": [{"type": "text", "text": line}]} for line in after_lines]})
     choice_buttons = [
         _button(label, f"{action_id_prefix}.{CHOICE_ACTION}.{i}", value=label)
         for i, label in enumerate(_choice_labels(choices))
@@ -885,6 +891,11 @@ def blocks_report(
     ]
     blocks.extend(_actions(choice_buttons + link_buttons))
     return blocks
+
+
+def _after_lines(after_rows: str) -> list[str]:
+    """The non-blank lines of ``after_rows``, stripped."""
+    return [line.strip() for line in (after_rows or "").splitlines() if line.strip()]
 
 
 def _choice_labels(choices: Iterable[Any]) -> list[str]:

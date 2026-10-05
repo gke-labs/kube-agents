@@ -2834,10 +2834,14 @@ def relay_cron_report(
         else:
             leg_message = truncation_notice + headline.text if headline else message
             new_thread_id = _send_to_chat(platform, leg_message, leg_chat_id, leg_thread_id)
-        # The blocks leave out the report's line as the text headline does, so they lose what it loses.
-        if headline and slack_audit_report.needs_fold(composed, headline.text):
+        # The blocks leave out the report's line as the text headline does, so they lose what it loses;
+        # the findings the card counts but does not list go above it, since the card says they are there.
+        rows = slack_audit_report.thread_rows(headline.issue, headline.ref, composed) if headline and headline.issue else []
+        folds = bool(headline) and slack_audit_report.needs_fold(composed, headline.text)
+        if rows or folds:
+            fold = "\n\n".join(part for part in ("\n".join(rows), message if folds else "") if part)
             if new_thread_id:
-                _post_audit_fold(profile, job_id, message, leg_chat_id, new_thread_id, posts_deadline)
+                _post_audit_fold(profile, job_id, fold, leg_chat_id, new_thread_id, posts_deadline)
             else:
                 logger.warning(
                     f"Relay for {profile}/{job_id}: no thread to post the full report in, "

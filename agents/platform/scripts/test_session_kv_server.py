@@ -3348,10 +3348,26 @@ class TestSlackAuditHeadline(unittest.TestCase):
     ONE_LINE = f"Security & RBAC posture audit: 2 new, 1 resolved across 3 clusters — {LEDGER}"
     ISSUE = {
         "title": "[audit] Security & RBAC Posture Audit — 7 findings (2 critical)",
-        "body": "### Critical (2)\n\n#### cluster-admin bound to default <!-- finding:rbac-1 -->\n",
+        "body": (
+            "7 findings: 2 critical, 3 major, 2 minor.\n\n### Critical (2)\n\n"
+            "#### cluster-admin bound to default <!-- finding:rbac-1 -->\n"
+            "#### privileged pods admitted <!-- finding:rbac-2 -->\n"
+            "### Major (3)\n\n#### m1 <!-- finding:m1 -->\n#### m2 <!-- finding:m2 -->\n#### m3 <!-- finding:m3 -->\n"
+            "### Minor (2)\n\n#### n1 <!-- finding:n1 -->\n#### n2 <!-- finding:n2 -->\n"
+        ),
         "state": "open",
         "labels": ["agent:audit"],
     }
+    HEADLINE = "**Security & RBAC Posture Audit: 2 critical findings**"
+    #: The findings the card counts but does not list, which lead its thread.
+    THREAD_ROWS = "`major` m1\n`major` m2\n`major` m3\n`minor` n1\n`minor` n2"
+    CLEAN = (
+        "**Security & RBAC Posture Audit: clean. Ledger closed.**\n"
+        "[Ledger issue #231 ↗](https://github.com/acme/fleet-config/issues/231)"
+    )
+
+    def _fold(self, report):
+        return f"{self.THREAD_ROWS}\n\n{report}"
 
     def setUp(self):
         import sqlite3
@@ -3415,8 +3431,8 @@ class TestSlackAuditHeadline(unittest.TestCase):
         ref = session_kv_server.slack_audit_report.ledger_ref(self.COMPOSED)
         headline = session_kv_server.slack_audit_report.headline_from_issue(self.ISSUE, ref, self.COMPOSED)
         self.assertEqual(calls[0].args, ("slack", headline, "", ""))
-        self.assertTrue(calls[0].args[1].startswith("**Security & RBAC Posture audit found 7 things to look at"))
-        self.assertEqual(calls[1].args, ("slack", self.COMPOSED, self.HOME, self.SLACK_THREAD))
+        self.assertTrue(calls[0].args[1].startswith(self.HEADLINE))
+        self.assertEqual(calls[1].args, ("slack", self._fold(self.COMPOSED), self.HOME, self.SLACK_THREAD))
         # A reply in the thread is answered with the whole report, not the headline.
         self.assertEqual(self._stored(), [(self.HOME, self.SLACK_THREAD, self.COMPOSED)])
 
@@ -3426,12 +3442,12 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self.assertEqual(response.json()["status"], "delivered")
         self.assertEqual(len(calls), 2)
         headline = calls[0].args[1].splitlines()
-        self.assertEqual(headline[0], "**Security & RBAC Posture audit found 7 things to look at across 3 clusters.**")
-        self.assertTrue(headline[1].startswith("2 are new since the last run."), headline[1])
+        self.assertEqual(headline[0], self.HEADLINE)
+        self.assertEqual(headline[3], "5 more (3 major, 2 minor) are in the thread.")
         self.assertIn(f"[Ledger issue #231 ↗]({self.LEDGER})", calls[0].args[1])
-        # The card leaves the line out, so its resolved count is read in the thread.
+        # The card leaves the line out, so its resolved count is read in the thread, under the rest of the findings.
         self.assertNotIn("resolved", calls[0].args[1])
-        self.assertEqual(calls[1].args, ("slack", self.ONE_LINE, self.HOME, self.SLACK_THREAD))
+        self.assertEqual(calls[1].args, ("slack", self._fold(self.ONE_LINE), self.HOME, self.SLACK_THREAD))
         self.assertEqual(self._stored(), [(self.HOME, self.SLACK_THREAD, self.ONE_LINE)])
 
     def test_flag_on_an_unreadable_ledger_falls_back_to_the_line_and_its_link(self):
@@ -3457,13 +3473,14 @@ class TestSlackAuditHeadline(unittest.TestCase):
         with patch.object(session_kv_server, "CRON_REPORT_MAX_CHARS", 3):
             response, calls = self._post(composed=composed)
         self.assertEqual(response.json()["status"], "delivered")
-        self.assertEqual(len(calls), 1)
         posted = calls[0].args[1]
         self.assertTrue(posted.startswith("[truncated]"), posted[:40])
         self.assertEqual(posted.count("[truncated]"), 1)
         headline = posted.split("\n\n", 1)[1].splitlines()
-        self.assertTrue(headline[0].startswith("**Security & RBAC Posture audit found 7 things to look at"), headline)
+        self.assertEqual(headline[0], self.HEADLINE)
         self.assertTrue(headline[1].startswith("`critical` "), headline)
+        # Only the findings the card counts follow it; the link-only report is not folded.
+        self.assertEqual([c.args for c in calls[1:]], [("slack", self.THREAD_ROWS, self.HOME, self.SLACK_THREAD)])
 
     def test_flag_on_a_ledger_that_does_not_parse_falls_back(self):
         os.environ["KAGE_SLACK_UX"] = "1"
@@ -3475,18 +3492,23 @@ class TestSlackAuditHeadline(unittest.TestCase):
         os.environ["KAGE_SLACK_UX"] = "1"
         _, calls = self._post(composed=self.ONE_LINE, issue=dict(self.ISSUE, state="closed"))
         self.assertTrue(calls[0].args[1].startswith("**Security & RBAC posture audit: 2 new"))
-        self.assertNotIn("found 7", calls[0].args[1])
+        self.assertNotIn("critical findings", calls[0].args[1])
 
     def test_flag_on_a_report_with_no_headline_line_is_posted_unchanged(self):
-        # Only the link, so neither the ledger nor the report yields a headline.
+        # Only the link, so neither the unread ledger nor the report yields a headline.
         os.environ["KAGE_SLACK_UX"] = "1"
         report = f"Ledger: {self.LEDGER}"
-        for job_id, issue in (("rbac-unread", None), ("rbac-closed", dict(self.ISSUE, state="closed"))):
-            with self.subTest(issue=issue):
-                response, calls = self._post(composed=report, issue=issue, job_id=job_id)
-                self.assertEqual(response.status_code, 200)
-                self.assertEqual(response.json()["status"], "delivered")
-                self.assertEqual([c.args for c in calls], [("slack", report, "", "")])
+        response, calls = self._post(composed=report, issue=None, job_id="rbac-unread")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual([c.args for c in calls], [("slack", report, "", "")])
+
+    def test_flag_on_a_closed_ledger_under_the_bare_link_is_the_clean_card(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        report = f"Ledger: {self.LEDGER}"
+        response, calls = self._post(composed=report, issue=dict(self.ISSUE, state="closed"), job_id="rbac-closed")
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual([c.args for c in calls], [("slack", self.CLEAN, "", "")])
 
     def test_flag_on_an_unmanaged_repository_is_unchanged(self):
         os.environ["KAGE_SLACK_UX"] = "1"
@@ -3559,7 +3581,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
         _, calls = self._post(turn_ok=False)
         self.assertEqual(len(calls), 1)
         self.assertIn("raw audit", calls[0].args[1])
-        self.assertNotIn("found 7 things to look at", calls[0].args[1])
+        self.assertNotIn(self.HEADLINE, calls[0].args[1])
 
     def test_flag_on_with_no_home_channel_is_unchanged(self):
         os.environ["KAGE_SLACK_UX"] = "1"
@@ -3581,7 +3603,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
         _, calls = self._post(job_id="rbac-2")
         second = [c.args for c in calls]
         self.assertEqual(second[0][2:], (self.HOME, self.SLACK_THREAD))
-        self.assertEqual(second[1], ("slack", self.COMPOSED, self.HOME, self.SLACK_THREAD))
+        self.assertEqual(second[1], ("slack", self._fold(self.COMPOSED), self.HOME, self.SLACK_THREAD))
 
 
     BLOCKS_TS = "1712345999.000200"
@@ -3604,18 +3626,18 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self._blocks_on()
         response, calls = self._post(blocks_post=lambda *a, **k: self.BLOCKS_TS)
         self.assertEqual(response.json()["status"], "delivered")
-        # The report is longer than one line, so it follows in the thread.
-        self.assertEqual([c.args for c in calls], [("slack", self.COMPOSED, self.HOME, self.BLOCKS_TS)])
+        # The report is longer than one line, so it follows in the thread, under the findings the card only counts.
+        self.assertEqual([c.args for c in calls], [("slack", self._fold(self.COMPOSED), self.HOME, self.BLOCKS_TS)])
         (post,) = self.posts
         channel, text, blocks, thread_ts = post.args
         self.assertEqual((channel, thread_ts), (self.HOME, ""))
-        self.assertTrue(text.startswith("*Security &amp; RBAC Posture audit found 7 things to look at"), text)
-        self.assertEqual(self._types(blocks), ["rich_text", "divider", "rich_text", "divider", "actions"])
-        actions = blocks[4]["elements"]
+        self.assertTrue(text.startswith("*Security &amp; RBAC Posture Audit: 2 critical findings*"), text)
+        self.assertEqual(self._types(blocks), ["rich_text", "divider", "rich_text", "divider", "rich_text", "actions"])
+        actions = blocks[-1]["elements"]
+        self.assertEqual(len(actions), 2)
         self.assertEqual(actions[0]["action_id"], "kage_audit.choice.0")
         self.assertEqual(actions[0]["style"], "primary")
-        self.assertEqual(actions[0]["value"], "Fix it")
-        self.assertEqual(actions[1]["value"], "See all 7")
+        self.assertEqual(actions[0]["value"], "Look at the first one")
         self.assertEqual(actions[-1]["url"], self.LEDGER)
         self.assertEqual(self._stored(), [(self.HOME, self.BLOCKS_TS, self.COMPOSED)])
 
@@ -3626,28 +3648,53 @@ class TestSlackAuditHeadline(unittest.TestCase):
         response, calls = self._post(blocks_post=refused)
         self.assertEqual(response.json()["status"], "delivered")
         self.assertEqual(len(self.posts), 1)
-        self.assertTrue(calls[0].args[1].startswith("**Security & RBAC Posture audit found 7 things to look at"))
-        self.assertEqual(calls[1].args, ("slack", self.COMPOSED, self.HOME, self.SLACK_THREAD))
+        self.assertTrue(calls[0].args[1].startswith(self.HEADLINE))
+        self.assertEqual(calls[1].args, ("slack", self._fold(self.COMPOSED), self.HOME, self.SLACK_THREAD))
 
     def test_a_post_that_never_reached_slack_posts_the_text_headline_without_retrying(self):
         self._blocks_on()
         _, calls = self._post(blocks_post=session_kv_server.slack_blocks_post.NotSent("connection refused"))
         self.assertEqual(len(self.posts), 1)
-        self.assertTrue(calls[0].args[1].startswith("**Security & RBAC Posture audit found 7 things to look at"))
+        self.assertTrue(calls[0].args[1].startswith(self.HEADLINE))
 
     def test_a_post_that_may_have_landed_still_posts_the_text_headline(self):
         # A Slack leg that posts nothing is undelivered; as the only leg it fails the route.
         self._blocks_on()
         _, calls = self._post(blocks_post=TimeoutError("timed out"))
         self.assertEqual(len(self.posts), 1)
-        self.assertTrue(calls[0].args[1].startswith("**Security & RBAC Posture audit found 7 things to look at"))
+        self.assertTrue(calls[0].args[1].startswith(self.HEADLINE))
 
     def test_the_one_line_report_goes_in_the_blocks_thread(self):
         self._blocks_on()
         _, calls = self._post(composed=self.ONE_LINE, blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        self.assertEqual([c.args for c in calls], [("slack", self._fold(self.ONE_LINE), self.HOME, self.BLOCKS_TS)])
+        self.assertIn("5 more (3 major, 2 minor) are in the thread.", str(self.posts[0].args[2]))
+
+    def test_a_card_listing_every_finding_folds_only_the_report(self):
+        self._blocks_on()
+        issue = dict(
+            self.ISSUE,
+            title="[audit] Security & RBAC Posture Audit — 2 findings (2 critical)",
+            body="### Critical (2)\n\n#### a <!-- finding:a -->\n#### b <!-- finding:b -->\n",
+        )
+        _, calls = self._post(composed=self.ONE_LINE, issue=issue, blocks_post=lambda *a, **k: self.BLOCKS_TS)
         self.assertEqual([c.args for c in calls], [("slack", self.ONE_LINE, self.HOME, self.BLOCKS_TS)])
-        detail = self.posts[0].args[2][0]["elements"][1]["elements"][0]["text"]
-        self.assertTrue(detail.startswith("2 are new since the last run."), detail)
+
+    def test_the_rows_post_when_the_report_does_not_fold(self):
+        self._blocks_on()
+        report = f"Ledger: {self.LEDGER}"
+        _, calls = self._post(composed=report, blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        self.assertEqual([c.args for c in calls], [("slack", self.THREAD_ROWS, self.HOME, self.BLOCKS_TS)])
+
+    def test_a_closed_ledger_under_the_bare_link_posts_the_clean_card_as_blocks(self):
+        self._blocks_on()
+        _, calls = self._post(
+            composed=f"Ledger: {self.LEDGER}", issue=dict(self.ISSUE, state="closed"), blocks_post=lambda *a, **k: self.BLOCKS_TS
+        )
+        (post,) = self.posts
+        self.assertEqual(post.args[1], f"*Security &amp; RBAC Posture Audit: clean. Ledger closed.*\n<{self.LEDGER}|Ledger issue #231 ↗>")
+        self.assertEqual(self._types(post.args[2]), ["rich_text", "actions"])
+        self.assertEqual(calls, [])
 
     def test_a_closed_ledger_posts_no_blocks(self):
         self._blocks_on()
@@ -3699,13 +3746,13 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self.assertEqual(response.json()["status"], "delivered")
         self.assertEqual(self.posts, [])
         self.assertTrue(calls[0].args[1].startswith("[truncated]"), calls[0].args[1][:40])
-        self.assertIn("**Security & RBAC Posture audit found 7 things to look at", calls[0].args[1])
+        self.assertIn(self.HEADLINE, calls[0].args[1])
 
     def test_a_refusal_that_is_not_about_blocks_posts_text_without_a_retry(self):
         self._blocks_on()
         _, calls = self._post(blocks_post=session_kv_server.slack_blocks_post.Refused("channel_not_found"))
         self.assertEqual(len(self.posts), 1)
-        self.assertTrue(calls[0].args[1].startswith("**Security & RBAC Posture audit found 7 things to look at"))
+        self.assertTrue(calls[0].args[1].startswith(self.HEADLINE))
 
     def test_too_little_time_for_the_ledger_posts_the_composed_message(self):
         self._blocks_on()
@@ -3766,7 +3813,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
         response, calls = self._post_at(budget - 1, lambda *a, **k: self.BLOCKS_TS)
         self.assertEqual(response.json()["status"], "delivered")
         self.assertEqual(self.posts, [])
-        self.assertTrue(calls[0].args[1].startswith("**Security & RBAC Posture audit found 7 things to look at"))
+        self.assertTrue(calls[0].args[1].startswith(self.HEADLINE))
 
     def test_an_unreadable_ledger_posts_text_and_no_blocks(self):
         self._blocks_on()
