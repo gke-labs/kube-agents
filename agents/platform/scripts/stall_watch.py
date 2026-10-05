@@ -100,6 +100,7 @@ happened.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import re
@@ -1010,9 +1011,13 @@ def session_kv(path: str, body: dict | None = None, method: str = "") -> dict:
     request = urllib.request.Request(
         f"{SESSION_KV_URL}{path}", data=data, headers=headers, method=method or ("POST" if data is not None else "GET")
     )
-    with urllib.request.urlopen(request, timeout=SESSION_KV_TIMEOUT_SECONDS) as response:
-        answer = json.loads(response.read().decode("utf-8") or "{}")
-    # A ValueError is what every caller already turns into a refused alert.
+    # Callers handle HTTPError, OSError and ValueError, so every other way the
+    # answer can fail to arrive whole is a ValueError here.
+    try:
+        with urllib.request.urlopen(request, timeout=SESSION_KV_TIMEOUT_SECONDS) as response:
+            answer = json.loads(response.read().decode("utf-8") or "{}")
+    except http.client.HTTPException as exc:  # a body cut short, a status line that is not HTTP
+        raise ValueError(f"the Session KV server's answer was malformed: {exc!r}") from exc
     if not isinstance(answer, dict):
         raise ValueError(f"the Session KV server answered {type(answer).__name__}, not a JSON object")
     return answer
@@ -1351,6 +1356,12 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
         scope = scope_key(entry["cluster"], entry["namespace"])
         if scope not in candidates and (scope not in episodes or scope in expired) and would_raise(state, sweep, scope):
             candidates[scope] = []
+    # Objects held for a card go through the same card check as new ones, so a
+    # card finished before they reach it gets a new alert, not a comment.
+    # A cleared scope is left to the clearing step.
+    for scope, episode in episodes.items():
+        if not dry_run and episode.get("pending") and scope not in candidates and scope_rows(state, scope):
+            candidates[scope] = []
     raised = held = 0
     refusal: str | None = None
     for scope in sorted(candidates, key=lambda sc: (scope_first_seen(state, sc), sc)):
@@ -1398,7 +1409,13 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
                 comment_pending(episode, namespace)
                 continue
             if status is not None:
+                if not would_raise(state, sweep, scope):
+                    # The finished card's episode stays until a read tick can
+                    # raise the new alert, or the clearing step closes it.
+                    continue
                 end_episode(state, scope)
+        if not would_raise(state, sweep, scope):
+            continue
         if refusal is not None:
             # The server refused this tick's first alert; the rest wait for the
             # next tick rather than each spending a timeout on the same answer.
@@ -1449,10 +1466,6 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
         if state.get(INJECT_ERROR_KEY):
             lines.append(INJECT_RECOVERED_LINE)
         state[INJECT_ERROR_KEY] = None
-    if not dry_run:
-        for scope, episode in episodes.items():
-            if episode.get("pending") and scope not in new_by_scope:
-                comment_pending(episode, namespace_of(scope))
     open_scopes = {scope_key(e["cluster"], e["namespace"]) for e in state["stalls"].values()}
     for scope in sorted(set(episodes) - open_scopes):
         episode = episodes[scope]

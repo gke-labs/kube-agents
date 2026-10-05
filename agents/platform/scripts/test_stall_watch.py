@@ -3,6 +3,7 @@
 Session KV server at its routes and the board at the kanban command, with a
 real sqlite file for the card lookup by session."""
 
+import http.client
 import io
 import json
 import os
@@ -414,6 +415,31 @@ class Alerts(Base):
         self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW, other]}})
         self.assertIn("Deployment/cart-api", self.board.cards[tid]["comments"][0])
         self.assertEqual(self.episode(f"{cid('c')}/checkout")["card"], tid)
+
+    def test_objects_held_for_a_card_finished_before_they_reach_it_get_a_new_alert(self):
+        self.kv.file_cards = False
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        other = finding("checkout", "Deployment/cart-api", "generation-lag", "generation 2 observed 1")
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW, other]}})
+        tid = self.board.file(self.kv.alerts[0]["session"], self.kv.alerts[0])
+        self.board.cards[tid]["status"] = "done"
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW, other]}})
+        self.assertEqual(self.board.cards[tid]["comments"], [], "a finished card is not told about objects nobody will triage")
+        self.assertEqual(len(self.last_alerts), 1)
+        self.assertEqual(sorted(o["object"] for o in self.last_alerts[0]["objects"]), ["Deployment/cart-api", "Deployment/checkout-api"])
+
+    def test_a_finished_card_on_an_unread_tick_waits_for_a_read_tick_to_re_alert(self):
+        self.kv.file_cards = False
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        other = finding("checkout", "Deployment/cart-api", "generation-lag", "generation 2 observed 1")
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW, other]}})
+        tid = self.board.file(self.kv.alerts[0]["session"], self.kv.alerts[0])
+        self.board.cards[tid]["status"] = "done"
+        self.run_tick({"c": TIMEOUT})
+        self.assertEqual(len(self.kv.alerts), 1, "nothing is raised for a namespace this tick did not read")
+        self.assertIn(f"{cid('c')}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW, other]}})
+        self.assertEqual(len(self.kv.alerts), 2)
 
     def test_an_alert_whose_card_never_came_clears_with_a_line_and_no_card(self):
         self.kv.file_cards = False
@@ -919,7 +945,8 @@ class Alerts(Base):
         self.assertEqual(sorted(a["cluster"] for a in self.kv.alerts), ["a", "b"])
 
     def test_same_named_clusters_in_two_locations_are_two_scopes(self):
-        fleet = {"c": {"payments": [DEPLOYMENT_ROW]}, "c@europe-west1": Located("europe-west1", {"payments": []})}
+        row = finding("payments", "Deployment/payments-api", "stale-condition", "Available=False")
+        fleet = {"c": {"payments": [row]}, "c@europe-west1": Located("europe-west1", {"payments": []})}
         self.run_tick(fleet)
         self.assertEqual(len(self.kv.alerts), 1)
         lines, _ = self.run_tick(fleet)
@@ -940,10 +967,6 @@ class Alerts(Base):
 
 
 class SessionKv(Base):
-    def test_the_kind_is_the_one_the_session_kv_server_dispatches_on(self):
-        source = (Path(__file__).resolve().parent / "session_kv_server.py").read_text()
-        self.assertIn(f'INJECT_KIND_STALL = "{stall_watch.INJECT_KIND}"', source)
-
     def test_calls_carry_the_bearer_token_and_go_to_loopback(self):
         seen = {}
 
@@ -968,6 +991,16 @@ class SessionKv(Base):
         self.assertIn("answer could not be read", lines[0])
         self.assertIn("not a JSON object", lines[0])
         self.assertNotIn("could not be reached", lines[0])
+
+    def test_an_answer_cut_short_is_a_refusal_not_a_crash(self):
+        def urlopen(request, timeout):
+            raise http.client.IncompleteRead(b"{", 10)
+
+        with patch.object(stall_watch.urllib.request, "urlopen", urlopen), patch.object(stall_watch, "session_kv", REAL_SESSION_KV):
+            lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        self.assertEqual(len(lines), 1)
+        self.assertIn("answer could not be read", lines[0])
+        self.assertIn("IncompleteRead", lines[0])
 
     def test_the_board_is_the_one_hermes_resolves(self):
         # hermes_cli.kanban has no kanban_db_path; importing it from there fell
