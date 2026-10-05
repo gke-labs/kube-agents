@@ -678,6 +678,17 @@ class RuntimeTest(unittest.TestCase):
         self.assertFalse(runtime.answered(CHANNEL, MESSAGE_TS), "a question the click did not rewrite reads settled")
         self.assertTrue(runtime.clicked(CHANNEL, MESSAGE_TS), "a click whose rewrite failed still answered it")
         self.assertFalse(runtime.clicked("C0OTHER", MESSAGE_TS))
+        self.assertFalse(runtime.rewriting(CHANNEL, MESSAGE_TS), "a failed rewrite is not still rewriting")
+
+    def test_rewriting_reports_a_click_between_its_record_and_its_rewrite(self):
+        self.assertFalse(runtime.rewriting(CHANNEL, MESSAGE_TS))
+        runtime._answered[(CHANNEL, MESSAGE_TS, runtime.CHOICE_KIND)] = None
+        self.assertTrue(runtime.rewriting(CHANNEL, MESSAGE_TS))
+        self.assertFalse(runtime.rewriting("C0OTHER", MESSAGE_TS))
+        runtime._answered.clear()
+        self._answer(_Adapter(), *_choice())
+        self.assertTrue(runtime.answered(CHANNEL, MESSAGE_TS))
+        self.assertFalse(runtime.rewriting(CHANNEL, MESSAGE_TS), "a landed rewrite is not still rewriting")
 
     def test_two_clicks_at_once_run_one_turn(self):
         adapter = _Adapter()

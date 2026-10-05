@@ -509,15 +509,31 @@ class SettleQuestionTest(unittest.TestCase):
         self.assertEqual(adapter.updates, [])
         self.assertEqual(runtime._questions, {})
 
-    def test_a_click_recorded_during_the_read_drops_the_typed_line(self):
+    def test_a_click_whose_rewrite_failed_during_the_read_drops_the_typed_line(self):
         adapter = _Adapter()
         _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
         adapter.replies = [{"ts": "1700000000.000400", "user": "U7", "text": "seeded-a"}]
-        with mock.patch.object(clicks, "clicked", lambda channel, ts: bool(adapter.reads)):
+        with mock.patch.object(clicks, "clicked", lambda channel, ts: bool(adapter.reads)), \
+                mock.patch.object(clicks, "rewriting", lambda channel, ts: False):
             _run(runtime.settle_question(adapter, SUB))
         self.assertEqual(len(adapter.reads), 1)
         self.assertEqual(_buttons(adapter.updates[0]["blocks"]), [])
         self.assertNotIn("✓", adapter.updates[0]["text"])
+
+    def test_a_click_still_rewriting_is_left_to_its_rewrite(self):
+        # Before the read, or landing during it: the settle sends nothing and keeps the question.
+        for before in (True, False):
+            with self.subTest(before=before):
+                runtime._questions.clear()
+                adapter = _Adapter()
+                _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+                adapter.replies = [{"ts": "1700000000.000400", "user": "U7", "text": "seeded-a"}]
+                with mock.patch.object(clicks, "clicked", lambda channel, ts: before or bool(adapter.reads)), \
+                        mock.patch.object(clicks, "rewriting", lambda channel, ts: before or bool(adapter.reads)):
+                    _run(runtime.settle_question(adapter, SUB))
+                self.assertEqual(adapter.updates, [])
+                self.assertEqual(len(adapter.reads), 0 if before else 1)
+                self.assertEqual(len(runtime._questions), 1, "the next event settles it if the rewrite fails")
 
     def test_an_event_older_than_a_retried_question_leaves_it_alone(self):
         adapter = _Adapter()
@@ -576,6 +592,15 @@ class SettleQuestionTest(unittest.TestCase):
         _run(runtime.settle_question(adapter, SUB))
         note = adapter.updates[0]["blocks"][-1]["elements"][0]["text"]
         self.assertEqual(note, "✓ Priya: !channel seeded-b &amp; @U8 &lt;b&gt;")
+
+    def test_a_mention_inside_a_typed_answer_reads_as_the_name(self):
+        adapter = _Adapter()
+        adapter.names["U9"] = "Sam | <ops>"
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        adapter.replies = [{"ts": "1700000000.000400", "user": "U7", "text": "seeded-b, ask <@U9> or <@U7> or <@U8>"}]
+        _run(runtime.settle_question(adapter, SUB))
+        note = adapter.updates[0]["blocks"][-1]["elements"][0]["text"]
+        self.assertEqual(note, "✓ Priya: seeded-b, ask @Sam ops or @Priya or @U8")
 
     def test_a_click_whose_rewrite_failed_settles_without_a_typed_line(self):
         adapter = _Adapter()

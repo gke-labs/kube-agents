@@ -233,6 +233,8 @@ MESSAGE_BLOCKS_MAX = 50
 _answered: OrderedDict[tuple, None] = OrderedDict()
 #: The keys of ``_answered`` whose rewrite landed.
 _rewritten: OrderedDict[tuple, None] = OrderedDict()
+#: The keys of ``_answered`` whose rewrite failed; one in neither is still rewriting.
+_unrewritten: OrderedDict[tuple, None] = OrderedDict()
 _warned_missing = False
 
 
@@ -281,6 +283,12 @@ def answered(channel_id: str, msg_ts: str) -> bool:
 def clicked(channel_id: str, msg_ts: str) -> bool:
     """Whether a choice click in this process answered the message, whether or not its rewrite landed."""
     return (str(channel_id), str(msg_ts), CHOICE_KIND) in _answered
+
+
+def rewriting(channel_id: str, msg_ts: str) -> bool:
+    """Whether a choice click answered the message and its rewrite has neither landed nor failed yet."""
+    key = (str(channel_id), str(msg_ts), CHOICE_KIND)
+    return key in _answered and key not in _rewritten and key not in _unrewritten
 
 
 def _answered_by(other: str) -> bool:
@@ -721,6 +729,10 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
             "slack_ux_clicks: could not mark %s answered; its buttons stay but further clicks are dropped: %s",
             msg_ts, exc,
         )
+        if key in _answered:
+            _unrewritten[key] = None
+            while len(_unrewritten) > ANSWERED_MAX:
+                _unrewritten.popitem(last=False)
     if not rewritten:
         try:
             await client.chat_postMessage(

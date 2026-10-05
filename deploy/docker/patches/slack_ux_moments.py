@@ -45,11 +45,12 @@ leave them live. An event that means the card resumed (:data:`ANSWERED_KINDS`)
 also reads the thread once for that answer: the first reply after the question
 from a person the adapter would answer, not a bot, and through its channel gate, becomes
 the same "✓ <name>: <words>" line a click leaves (the words as plain text on
-one line, without the user mentions it opens with, clipped to ``TYPED_ANSWER_MAX``).
+one line, without the user mentions it opens with and with any other as ``@`` and the
+person's name, clipped to ``TYPED_ANSWER_MAX``).
 A card that moved on any other way, or with nobody replying, a read that fails, or a question a click answered whose rewrite
 failed (the click posted its line in the thread) settles without the line. A question a click already answered
-was rewritten by the click and is left alone; one whose rewrite failed is
-settled here. The
+was rewritten by the click and is left alone, as is one whose rewrite is still
+in flight, until the card's next event; one whose rewrite failed is settled here. The
 notifier delivers at least once, so a ``blocked`` event replayed after its
 question posted (:func:`asked`) neither settles nor reposts it. A question
 whose settle failed when the card asked again is kept and retried with the
@@ -127,6 +128,10 @@ SLACK_ENTITY = re.compile(r"<([^<>|]*)(?:\|([^<>]*))?>")
 
 #: The user mentions a reply opens with, such as the agent's in a channel that requires one.
 #: They address the reply, so they are not part of the answer its line shows.
+#: An unlabeled user mention inside a reply's words, shown as ``@`` and the person's name.
+USER_MENTION = re.compile(r"<@([A-Z0-9]+)>")
+#: The characters that would end an entity's label early, read as spaces in a name put in one.
+MENTION_LABEL_UNSAFE = str.maketrans("|<>", "   ")
 LEADING_MENTIONS = re.compile(r"^(?:[\s,:]*<@[A-Z0-9]+(?:\|[^<>]*)?>)+[\s,:]*")
 
 #: Added to a question's ``text``, so a session the wake never reached reads its card in the thread.
@@ -289,6 +294,16 @@ def _clicked(channel: str, ts: str, rewritten: bool = True) -> bool:
         return False
 
 
+def _rewriting(channel: str, ts: str) -> bool:
+    """Whether a click in this process answered the message and is still rewriting it."""
+    try:
+        from gateway import slack_ux_clicks
+
+        return bool(slack_ux_clicks.rewriting(channel, ts))
+    except Exception:  # noqa: BLE001 — read as not rewriting, as before the click tracked it
+        return False
+
+
 def _without_choices(text: str) -> str:
     """The question's ``text`` without its last "Reply with one of:" line, which
     asks for an answer that has arrived, as ``slack_ux_clicks._answered_text`` drops it."""
@@ -350,6 +365,26 @@ def _plain(text: str) -> str:
     return text
 
 
+async def _named_mentions(adapter: Any, text: str, channel: str, team_id: str) -> str:
+    """``text`` with each unlabeled user mention labeled with the person's name, so it reads as ``@name``.
+
+    The adapter's cached ``users.info`` lookup, as for the line's name; a lookup that fails leaves the id.
+    """
+    names = {}
+    for user_id in dict.fromkeys(USER_MENTION.findall(text)):
+        try:
+            names[user_id] = str(await adapter._resolve_user_name(user_id, chat_id=channel, team_id=team_id) or "")
+        except Exception:  # noqa: BLE001 — the mention keeps its id
+            names[user_id] = ""
+
+    def label(match: re.Match) -> str:
+        user_id = match.group(1)
+        name = " ".join(names.get(user_id, "").translate(MENTION_LABEL_UNSAFE).split())
+        return f"<@{user_id}|@{name}>" if name and name != user_id else match.group(0)
+
+    return USER_MENTION.sub(label, text)
+
+
 async def _typed_note(adapter: Any, client: Any, sub: dict, channel: str, ts: str) -> str:
     """The answered line for the first reply a person typed after the question, or "" for none."""
     thread = str(sub.get("thread_id") or "")
@@ -365,7 +400,8 @@ async def _typed_note(adapter: Any, client: Any, sub: dict, channel: str, ts: st
     for reply in sorted(replies, key=lambda r: float(r["ts"])):
         if await _by_a_person(adapter, reply, channel, team_id, thread):
             text = str(reply["text"])
-            words = _presenter._clip(" ".join(_plain(LEADING_MENTIONS.sub("", text) or text).split()), TYPED_ANSWER_MAX)
+            text = await _named_mentions(adapter, LEADING_MENTIONS.sub("", text) or text, channel, team_id)
+            words = _presenter._clip(" ".join(_plain(text).split()), TYPED_ANSWER_MAX)
             who = await _who(adapter, reply, channel, team_id)
             return ANSWERED.format(who=who, label=_presenter._escape(words))
     return ""
@@ -385,8 +421,11 @@ async def _settled(adapter: Any, sub: dict, entry: tuple, kind: str = UNBLOCKED_
         if _clicked(channel, ts):
             # A click during the read rewrote the question with its own line.
             return True
+        if _rewriting(channel, ts):
+            # Its rewrite takes the buttons off; one that fails is settled on the card's next event.
+            return False
         if _clicked(channel, ts, rewritten=False):
-            # One still rewriting, or whose rewrite failed and posted its line, is the answer.
+            # One whose rewrite failed posted its line in the thread, and is the answer.
             note = ""
         settled_text = _without_choices(text)
         await client.chat_update(
