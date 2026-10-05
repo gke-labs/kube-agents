@@ -56,8 +56,10 @@ locals {
   poll      = 15
   inventory = "${local.home}/INVENTORY.raw.md ${local.home}/INVENTORY.md"
   # The gate as the cron job launches it, and the longest one run of it can
-  # take: bootstrap_scan_gate.py's RECONCILE_TIMEOUT_SECONDS (240) plus one
-  # cron tick.
+  # take at the default scope cap, which is what this stack installs:
+  # bootstrap_scan_gate.py's RECONCILE_TIMEOUT_SECONDS (240) plus one cron
+  # tick. A declared spec.scope.maxProjects raises the gate's ceiling with
+  # the reconcile's budget.
   gate_script = "bootstrap_scan_gate.py"
   gate_wait   = 300
   scan_job    = "bootstrap-inventory-scan"

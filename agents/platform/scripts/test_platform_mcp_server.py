@@ -495,7 +495,8 @@ class TestSandboxRouting(unittest.TestCase):
         self.assertEqual(captured["argv"][0], "ssh")
         target = [a for a in captured["argv"] if "@" in a]
         self.assertEqual(len(target), 1)
-        # Not terminal.ssh_user: that account's ~/.bashrc is the model's, and
+        # Not terminal.ssh_user: on older sandbox images that account's
+        # ~/.bashrc is the model's, and
         # bash sources it for a non-interactive `ssh host cmd`.
         self.assertTrue(target[0].startswith("hermes@"))
         self.assertNotIn("agent@", " ".join(captured["argv"]))
@@ -1437,6 +1438,25 @@ class TestClusterAgentRoster(unittest.TestCase):
             ["cluster-proj-seeded-a-us-central1", "cluster-proj-seeded-b-us-central1"],
             [p["name"] for p in got],
         )
+
+    def test_corrupt_config_yaml_logs_warning_and_preserves_roster(self):
+        p_scalar = self._profile("cluster-proj-scalar-us-central1")
+        (p_scalar / "config.yaml").write_text("scalar_string\n", encoding="utf-8")
+
+        p_non_utf8 = self._profile("cluster-proj-nonutf8-us-central1")
+        (p_non_utf8 / "config.yaml").write_bytes(b"\x80\xff\xfe")
+
+        with patch.object(platform_mcp_server, "log") as mock_log:
+            got = json.loads(platform_mcp_server.list_cluster_profiles())
+
+        self.assertEqual(
+            [{"name": "cluster-proj-nonutf8-us-central1"}, {"name": "cluster-proj-scalar-us-central1"}],
+            got,
+        )
+        self.assertEqual(2, mock_log.call_count)
+        logged_msgs = [c[0][0] for c in mock_log.call_args_list]
+        self.assertTrue(any("Warning: could not read the cluster identity of cluster-proj-scalar-us-central1" in m for m in logged_msgs))
+        self.assertTrue(any("Warning: could not read the cluster identity of cluster-proj-nonutf8-us-central1" in m for m in logged_msgs))
 
     def test_list_is_empty_without_a_profiles_tree(self):
         self.assertEqual([], json.loads(platform_mcp_server.list_cluster_profiles()))

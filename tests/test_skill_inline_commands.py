@@ -37,9 +37,12 @@ NOT_A_TEST_OPERAND = r"(?![=!]?=|\]|-(eq|ne|gt|ge|lt|le|nt|ot|ef)\b)\S"
 VARIABLE_PROGRAM_RE = re.compile(
     PREFIX + r"\"?\$\{?[A-Za-z_]\w*\}?\"?\s+" + NOT_A_TEST_OPERAND, re.MULTILINE
 )
+# An assignment whose value is git, by name or by any path, or the suggestion
+# script by any path: the setup line of the variable form. A command
+# substitution (`SHA=$(git rev-parse HEAD)`) runs git rather than naming it.
+# bench/tasks/vcs-review-feedback-read-back/task.yaml carries the same pattern.
 PROGRAM_ASSIGNMENT_RE = re.compile(
-    r"\b[A-Za-z_]\w*=(?!\"?(\$\(|`)/opt/vcs/libexec/git[\s)`])\S*"
-    r"(/opt/vcs/libexec/git|submit_suggestion\.py)\b"
+    r"(^|[\s;&|(`])[A-Za-z_]\w*=(?!\"?(\$\(|`))\"?(\S*/)?(git|submit_suggestion\.py)(?![\w.-])"
 )
 # A script run by a path that starts with a variable, which the skills taught
 # for their helper scripts (`"$HERMES_HOME"/skills/.../resolver.py poll`). The
@@ -98,6 +101,10 @@ class SkillInlineCommandsTest(unittest.TestCase):
             "$G add <path>",
             '$G add config/manifest.yaml && $G commit -m "feat: x"',
             "export G=/opt/vcs/libexec/git",
+            "G=git",
+            "export G=git",
+            'G="git"',
+            "G=/opt/vcs/bin/git",
             '"$S" prepare --repo <owner>/<repo>',
             '"$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition',
             'cd "$WS" && "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py poll',
@@ -125,6 +132,11 @@ class SkillInlineCommandsTest(unittest.TestCase):
             '"$HERMES_HOME"/skills/pr-conversation/scripts/pr_conversation.py',
             'python3 "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition',
             "SHA=$(/opt/vcs/libexec/git rev-parse HEAD)",
+            "SHA=$(git rev-parse HEAD)",
+            "SHA=`git rev-parse HEAD`",
+            "GIT_DIR=.git git status",
+            "TOOL=git-lfs",
+            "REPO=acme/infra.git",
             'for f in $FILES; do echo "$f"; done',
         ):
             with self.subTest(span):

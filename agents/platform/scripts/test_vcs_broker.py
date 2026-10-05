@@ -1959,9 +1959,85 @@ class CollaborationTest(unittest.TestCase):
         self.assertIn("labels=bug", recorder.path)
         self.assertIn("state=open", recorder.path)
 
+    def test_issue_list_reads_past_a_page_of_proposals(self):
+        # A label that proposals share -- every remediation pull request carries
+        # its audit's label -- can fill the first page with proposals alone.
+        # Reading that page as "no issues" is how a second ledger gets opened.
+        prs = [{"number": n, "pull_request": {"url": "..."}} for n in range(200, 100, -1)]
+        broker, recorder = self.broker(prs, [{"number": 3, "title": "the ledger"}])
+        answer = broker.issue_list(
+            {"repository": "acme/infra", "state": "open", "labels": ["audit:a1"], "limit": 2}
+        )
+        self.assertEqual([i["number"] for i in answer["issues"]], [3])
+        self.assertFalse(answer["truncated"])
+        self.assertEqual(len(recorder.calls), 2)
+        self.assertIn("page=2", urllib.parse.unquote(recorder.calls[1][4]))
+
+    def test_issue_list_that_runs_out_on_the_limit_is_not_truncated(self):
+        # Review finding: the forge ran out on a short second page with exactly
+        # `limit` issues read, and that was reported as a page with more behind
+        # it, which a verb that takes no page cannot act on.
+        prs = [{"number": n, "pull_request": {"url": "..."}} for n in range(200, 101, -1)]
+        broker, _ = self.broker(prs + [{"number": 8}], [{"number": 3}])
+        answer = broker.issue_list(
+            {"repository": "acme/infra", "state": "open", "labels": ["audit:a1"], "limit": 2}
+        )
+        self.assertEqual([i["number"] for i in answer["issues"]], [8, 3])
+        self.assertFalse(answer["truncated"])
+
+    def test_issue_list_reaches_as_far_for_a_small_limit(self):
+        # Review finding: the scan read pages of `limit`, so a small limit
+        # reached ten times itself past the proposals and no further. Pages are
+        # read full-sized and cut to the limit afterwards.
+        prs = [{"number": n, "pull_request": {"url": "..."}} for n in range(200, 100, -1)]
+        broker, recorder = self.broker(prs, [{"number": 3}, {"number": 2}])
+        answer = broker.issue_list({"repository": "acme/infra", "labels": ["audit:a1"], "limit": 1})
+        self.assertEqual([i["number"] for i in answer["issues"]], [3])
+        self.assertTrue(answer["truncated"])
+        for call in recorder.calls:
+            self.assertIn("per_page=100", urllib.parse.unquote(call[4]))
+
+    def test_a_conversation_is_read_past_one_page(self):
+        # A long-lived ledger passes a hundred comments; the markers that stop
+        # a reply going out twice are on the later pages, so one page is not
+        # the conversation.
+        def note(n):
+            return {"id": n, "body": f"c{n}", "user": {"login": "u"}, "created_at": f"2026-01-01T00:{n // 60:02d}:{n % 60:02d}Z"}
+
+        broker, recorder = self.broker(
+            {"number": 7, "title": "ledger"},
+            [note(n) for n in range(100)],
+            [note(n) for n in range(100, 120)],
+        )
+        answer = broker.issue_view(
+            {"repository": "acme/infra", "number": 7, "comments": True, "limit": 500}
+        )
+        self.assertEqual(answer["commentCount"], 120)
+        self.assertFalse(answer["commentsTruncated"])
+        self.assertIn("page=2", urllib.parse.unquote(recorder.calls[2][4]))
+
+    def test_a_short_last_page_past_the_limit_is_truncation(self):
+        # A limit that is not a multiple of the page size: the second page is
+        # short, so it does not look full, but it carries more than the limit
+        # keeps. What is cut there is as unseen as an unread page.
+        def note(n):
+            return {"id": n, "body": f"c{n}", "user": {"login": "u"}, "created_at": f"2026-01-01T00:{n // 60:02d}:{n % 60:02d}Z"}
+
+        broker, _ = self.broker(
+            {"number": 7, "title": "ledger"},
+            [note(n) for n in range(100)],
+            [note(n) for n in range(100, 160)],
+        )
+        answer = broker.issue_view(
+            {"repository": "acme/infra", "number": 7, "comments": True, "limit": 150}
+        )
+        self.assertEqual(answer["commentCount"], 150)
+        self.assertTrue(answer["commentsTruncated"])
+
     def test_a_listing_says_when_it_is_a_page(self):
-        broker, _ = self.broker([{"number": n} for n in range(3)])
+        broker, _ = self.broker([{"number": n} for n in range(4)])
         answer = broker.issue_list({"repository": "acme/infra", "limit": 3})
+        self.assertEqual(answer["count"], 3)
         self.assertTrue(answer["truncated"])
 
     def test_issue_view_refuses_a_proposal_number(self):
@@ -2209,6 +2285,196 @@ class CollaborationTest(unittest.TestCase):
         # Owner-qualified, so a fork carrying the same branch name cannot
         # answer for this repository's proposal.
         self.assertIn("head=acme%3Aplatform-agent%2Ffix", asked)
+
+    def test_proposal_list_by_label_reads_the_issues_endpoint_not_search(self):
+        # Search lags a write: a sweep that opened a proposal a second ago and
+        # lists again must find it, or it opens a second one.
+        def pull(number, branch, base="main", owner="acme"):
+            return {
+                "number": number,
+                "state": "open",
+                "user": {"login": "u"},
+                "head": {"ref": branch, "sha": "abc", "repo": {"full_name": f"{owner}/infra"}},
+                "base": {"ref": base},
+                "closed_at": None,
+            }
+
+        page = [
+            {"number": 3, "pull_request": {}},
+            {"number": 4},  # an issue carrying the same labels
+            {"number": 5, "pull_request": {}},
+        ]
+        newest = [pull(5, "fix", owner="fork"), pull(3, "fix")]
+        broker, recorder = self.broker(page, newest)
+        answer = broker.proposal_list(
+            {
+                "repository": "acme/infra",
+                "state": "all",
+                "labels": ["audit:a1", "audit:remediation"],
+            }
+        )
+        asked = urllib.parse.unquote(recorder.calls[0][4])
+        self.assertTrue(asked.startswith("repos/acme/infra/issues?"))
+        self.assertIn("labels=audit:a1,audit:remediation", asked)
+        self.assertIn("state=all", asked)
+        self.assertNotIn("head=", asked)
+        # The pull requests are read back for their heads; the issue is not.
+        self.assertEqual(len(recorder.calls), 2)
+        scan = urllib.parse.unquote(recorder.calls[1][4])
+        self.assertTrue(scan.startswith("repos/acme/infra/pulls?"))
+        self.assertIn("state=all", scan)
+        self.assertEqual([p["number"] for p in answer["proposals"]], [3, 5])
+        self.assertEqual(answer["proposals"][0]["closed"], "")
+
+    def test_a_labelled_source_filter_asks_for_the_branch_and_matches_labels_here(self):
+        # Review finding: with labels, the branch was matched against one page
+        # of the label's newest hits, so on a label with more carriers than
+        # the limit an older branch's proposal answered as absent. The branch
+        # is the narrower question: ask `/pulls` for it exactly, as the
+        # unlabelled path does, and match the labels on what comes back.
+        def pull(number, labels):
+            return {
+                "number": number,
+                "state": "open",
+                "user": {"login": "u"},
+                "head": {"ref": "fix", "sha": "abc", "repo": {"full_name": "acme/infra"}},
+                "base": {"ref": "main"},
+                "closed_at": None,
+                "labels": [{"name": name} for name in labels],
+            }
+
+        broker, recorder = self.broker(
+            [pull(9, ["other"]), pull(3, ["Audit:A1", "audit:remediation"])]
+        )
+        answer = broker.proposal_list(
+            {
+                "repository": "Acme/infra",
+                "state": "all",
+                "labels": ["audit:a1", "audit:remediation"],
+                "source": "fix",
+                "limit": 1,
+            }
+        )
+        self.assertEqual(len(recorder.calls), 1)
+        asked = urllib.parse.unquote(recorder.calls[0][4])
+        self.assertTrue(asked.startswith("repos/Acme/infra/pulls?"), asked)
+        self.assertIn("head=Acme:fix", asked)
+        # A full page, cut to the limit after the labels are matched: a limit
+        # of one asked of the forge would return only the unlabelled newer one.
+        self.assertIn("per_page=100", asked)
+        # GitHub matches label names without regard to case, as the issues
+        # filter this stands in for does.
+        self.assertEqual([p["number"] for p in answer["proposals"]], [3])
+
+    def test_a_labelled_source_filter_pages_through_the_matches(self):
+        # Review finding: the caller's page went to the forge with a page size
+        # of a hundred, so page 2 was the branch's proposals 101-200 and the
+        # matches between the limit and a hundred were unreachable.
+        def pull(number):
+            return {
+                "number": number,
+                "state": "closed",
+                "user": {"login": "u"},
+                "head": {"ref": "fix", "sha": "abc", "repo": {"full_name": "acme/infra"}},
+                "base": {"ref": "main"},
+                "closed_at": None,
+                "labels": [{"name": "audit:a1"}],
+            }
+
+        nodes = [pull(n) for n in range(10, 0, -1)]
+        query = {"repository": "acme/infra", "state": "all", "labels": ["audit:a1"], "source": "fix", "limit": 4}
+        first, recorder = self.broker(nodes)
+        answer = first.proposal_list(query)
+        self.assertEqual([p["number"] for p in answer["proposals"]], [10, 9, 8, 7])
+        self.assertTrue(answer["truncated"])
+        second, recorder = self.broker(nodes)
+        answer = second.proposal_list({**query, "page": 2})
+        self.assertNotRegex(urllib.parse.unquote(recorder.calls[0][4]), r"[?&]page=")
+        self.assertEqual([p["number"] for p in answer["proposals"]], [6, 5, 4, 3])
+        self.assertTrue(answer["truncated"])
+        third, _ = self.broker(nodes)
+        answer = third.proposal_list({**query, "page": 3})
+        self.assertEqual([p["number"] for p in answer["proposals"]], [2, 1])
+        self.assertFalse(answer["truncated"])
+
+    def test_a_labelled_source_filter_reads_past_the_branchs_newest_hundred(self):
+        # Review finding: one request of the branch's newest hundred left the
+        # older matches unreachable, and every page answered truncated, so a
+        # caller reading until truncated is false never stopped.
+        def pull(number, labels):
+            return {
+                "number": number,
+                "state": "closed",
+                "user": {"login": "u"},
+                "head": {"ref": "fix", "sha": "abc", "repo": {"full_name": "acme/infra"}},
+                "base": {"ref": "main"},
+                "closed_at": None,
+                "labels": [{"name": name} for name in labels],
+            }
+
+        newest = [pull(n, ["audit:a1"] if n == 150 else []) for n in range(150, 50, -1)]
+        older = [pull(n, ["audit:a1"]) for n in (40, 30)]
+        query = {"repository": "acme/infra", "state": "all", "labels": ["audit:a1"], "source": "fix", "limit": 2}
+        broker, recorder = self.broker(newest, older)
+        answer = broker.proposal_list(query)
+        self.assertEqual([p["number"] for p in answer["proposals"]], [150, 40])
+        self.assertTrue(answer["truncated"])
+        self.assertRegex(urllib.parse.unquote(recorder.calls[1][4]), r"[?&]page=2(&|$)")
+        broker, _ = self.broker(newest, older)
+        answer = broker.proposal_list({**query, "page": 2})
+        self.assertEqual([p["number"] for p in answer["proposals"]], [30])
+        self.assertFalse(answer["truncated"])
+
+    @staticmethod
+    def labelled(numbers):
+        return [{"number": n, "pull_request": {}} for n in numbers]
+
+    @staticmethod
+    def pulls(numbers):
+        return [
+            {"number": n, "state": "closed", "head": {"ref": f"b{n}"}, "base": {"ref": "main"}}
+            for n in numbers
+        ]
+
+    def test_a_label_a_stream_has_used_for_years_costs_pages_not_proposals(self):
+        # A hundred hits on the label, all among the newest hundred and fifty
+        # pull requests: two pages of `/pulls`, not a hundred reads.
+        hits = list(range(250, 150, -1))
+        broker, recorder = self.broker(
+            self.labelled(hits), self.pulls(range(250, 150, -1)), self.pulls(range(150, 100, -1))
+        )
+        answer = broker.proposal_list(
+            {"repository": "acme/infra", "state": "all", "labels": ["audit:a1"], "limit": 100}
+        )
+        self.assertEqual([p["number"] for p in answer["proposals"]], hits)
+        self.assertEqual(len(recorder.calls), 2)
+
+    def test_a_few_old_hits_in_a_busy_repository_are_read_one_at_a_time(self):
+        # Two hits far back: one page of `/pulls` is all the scan is allowed,
+        # and what it did not find is read directly.
+        broker, recorder = self.broker(
+            self.labelled([40, 12]),
+            self.pulls(range(900, 800, -1)),
+            self.pulls([40])[0],
+            self.pulls([12])[0],
+        )
+        answer = broker.proposal_list(
+            {"repository": "acme/infra", "state": "all", "labels": ["audit:a1"]}
+        )
+        self.assertEqual([p["number"] for p in answer["proposals"]], [40, 12])
+        self.assertEqual(
+            [c[4] for c in recorder.calls[2:]],
+            ["repos/acme/infra/pulls/40", "repos/acme/infra/pulls/12"],
+        )
+
+    def test_a_labelled_listing_is_truncated_on_what_the_forge_sent(self):
+        # A full page that filters down to fewer proposals still has a next page.
+        broker, _ = self.broker([{"number": 4}, {"number": 6}])
+        answer = broker.proposal_list(
+            {"repository": "acme/infra", "labels": ["audit:a1"], "limit": 2}
+        )
+        self.assertEqual(answer["proposals"], [])
+        self.assertTrue(answer["truncated"])
 
     def test_issue_list_with_a_query_goes_through_search(self):
         broker, recorder = self.broker({"items": [{"number": 1, "title": "t", "state": "open", "user": {"login": "u"}}]})

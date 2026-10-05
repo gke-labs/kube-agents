@@ -23,15 +23,13 @@
 # ~40 runs a day.
 # WHAT IT NEEDS. #2016 step 3: three clean days at >= 90 % of graded
 # repetitions under pull_request_opened, no all-reps collapse, infra classes
-# the harness excludes not counted. One graded miss shape is this case's
-# own and counts: the job's three repetitions share the leased repository
-# and the pool sweep (#1832) runs between leases, not between them, so
-# repetitions 2 and 3 meet repetition 1's open pull request; a repetition
-# that pushes its own commit onto it passes (#1832 grades the head
-# commit), one that only links its sibling's pull request fails. Read a
-# 50-67% day as that before reading it as regression; step 3 decides
-# whether to count it, grade repetition 1 only, or sweep between
-# repetitions. Then step 4 adds the roster line and takes remediation off
+# the harness excludes not counted. Before #2260 one graded miss shape was
+# this case's own and counted: the job's three repetitions shared the
+# leased repository and the pool sweep (#1832) ran between leases, not
+# between them, so repetitions 2 and 3 met repetition 1's open pull
+# request; since #2260 the job empties the repository before every
+# repetition of this case, so a 50-67% day reads as regression.
+# Then step 4 adds the roster line and takes remediation off
 # the allowlist (docs/eval-gate-roster.md has the entry). Measured before
 # the 2026-09-15 move: 7/9 across three presubmit
 # builds; misses are #1097 and #1590, 980-1929s a repetition on 2026-09-14;
@@ -71,8 +69,9 @@
 #
 # Isolation class: read-only on the cluster; write to the eval GitOps repo.
 # Every run leaves a pull request behind and submit-suggestion has no dedupe;
-# a Prow periodic (hack/ci_sweep_agent_pulls.py --pool) closes them, branches
-# too, between leases (the accounting is in rca-remediation-pr's header). This case doubles
+# the job's reset (hack/ci_reset_agent_pulls.py, #2260) closes them, branches
+# too, before every repetition, and a Prow periodic (hack/ci_sweep_agent_pulls.py
+# --pool) catches what a run killed hard left (the accounting is in rca-remediation-pr's header). This case doubles
 # the within-job accumulation,
 # accepted on the same terms: the *-infra repos are throwaway fixtures nobody
 # reads. Eligible tier: presubmit; nightly 2026-09-15 until the seat,

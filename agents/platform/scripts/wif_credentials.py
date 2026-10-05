@@ -186,8 +186,10 @@ def fetch_identity_token(audience: str, path: str = "") -> str | None:
     # load_document reads GOOGLE_APPLICATION_CREDENTIALS precisely so a
     # hand-placed one is honoured -- so reaching either is a configuration this
     # path cannot drive, not a bug. Decline the way an unfederated identity is
-    # declined and let the caller fall through to gcloud, rather than raising
-    # KeyError out of a function whose contract is to return None. `audience`,
+    # declined and let the caller fall through (to gcloud, since a credential
+    # file is configured here; to the metadata server first when none is),
+    # rather than raising KeyError out of a function whose contract is to
+    # return None. `audience`,
     # `token_url` and `subject_token_type` below are indexed directly because
     # the schema requires them of every external_account.
     impersonation = document.get("service_account_impersonation_url")
