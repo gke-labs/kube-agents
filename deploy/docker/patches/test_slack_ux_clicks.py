@@ -12,6 +12,7 @@ runtime module is driven with a stub adapter.
 import ast
 import asyncio
 import importlib
+import json
 import os
 import re
 import shutil
@@ -74,6 +75,7 @@ class SlackAdapter:
         self._app = App()
         self._bot_user_id: str = ""
         self._team_bot_user_ids, self._other = {}, {}
+        self._user_name_cache = {}
 
     def _handle_clarify_action(self, ack, body, action):
         return None
@@ -105,6 +107,9 @@ class SlackAdapter:
 
     def _event_declares_bot_sender(self, event: dict) -> bool:
         return False
+
+    async def _resolve_user_name(self, user_id: str, chat_id: str = "", team_id: str = "") -> str:
+        return user_id
 
     def _slack_message_matches_mention_patterns(self, text: str) -> bool:
         return False
@@ -254,6 +259,12 @@ class ApplierTest(unittest.TestCase):
             ("        self._bot_user_id: str = \"\"\n", "", "no longer sets _bot_user_id"),
             ("self._team_bot_user_ids, self._other = {}, {}", "self._bot_ids, self._other = {}, {}",
              "no longer sets _team_bot_user_ids"),
+            ("        self._user_name_cache = {}\n", "", "no longer sets _user_name_cache"),
+            ("def _resolve_user_name(", "def _user_name(", "_resolve_user_name"),
+            ("    async def _resolve_user_name(", "    def _resolve_user_name(",
+             "_resolve_user_name is no longer async"),
+            ('chat_id: str = "", team_id: str = "") -> str:', 'chat_id: str = "") -> str:',
+             "_resolve_user_name no longer accepts"),
             ("def _is_ignored_channel(self, channel_id)", "def _is_ignored_channel(self)",
              "_is_ignored_channel no longer accepts"),
             ("    def _is_ignored_channel(", "    async def _is_ignored_channel(",
@@ -383,9 +394,12 @@ def _slack_mention_detection_text(event):
 class _Adapter:
     def __init__(
         self, authorized=True, fail=(), allowed_channels=(), disable_dms=False, ignored=(), replies=(), unlisted=(),
-        unheard=(), ignore_other_user_mentions=False, broken=(), api_human_users=(),
+        unheard=(), ignore_other_user_mentions=False, broken=(), api_human_users=(), names=None,
     ):
         self.broken = set(broken)
+        # Upstream answers with the id itself when users.info fails or names nobody.
+        self.names = {USER: "Jayanti"} if names is None else names
+        self.named = []
         self.api_human_users = frozenset(api_human_users)
         self.ignore_other_user_mentions = ignore_other_user_mentions
         self.authorized = authorized
@@ -443,6 +457,12 @@ class _Adapter:
         if event.get("app_id") and not event.get("client_msg_id"):
             return event.get("user") not in self.api_human_users
         return False
+
+    async def _resolve_user_name(self, user_id, chat_id="", team_id=""):
+        self.named.append((user_id, chat_id, team_id))
+        if "names" in self.broken:
+            raise RuntimeError("users.info failed")
+        return self.names.get(user_id, user_id)
 
     def _slack_message_matches_mention_patterns(self, text):
         if "patterns" in self.broken:
@@ -1157,8 +1177,8 @@ class RuntimeTest(unittest.TestCase):
                 self._incident(adapter)
                 check(adapter)
 
-    def _options_incident(self, adapter, *replies, recommended=None):
-        """An alert whose option buttons send ``replies``, each showing its title, the last one clicked."""
+    def _options_incident(self, adapter, *replies, recommended=None, user=None):
+        """An alert whose option buttons send ``replies``, each showing its title, the last one clicked by ``user``."""
         forms = [runtime.BUTTON_FORM.fullmatch(reply) for reply in replies]
         choices = [
             incident._option_choice(form.group(1), form.group(2), i == recommended)
@@ -1167,6 +1187,8 @@ class RuntimeTest(unittest.TestCase):
         ]
         triage = {"headline": "Pod OOMKilled", "links": [], "fold_title": "Options", "choices": choices}
         body, action = _alert_choice(len(replies) - 1, replies[-1])
+        if user is not None:
+            body["user"] = user
         body["message"]["blocks"] = incident.blocks_triage(triage, [])
         clicked = body["message"]["blocks"][1]["elements"][len(replies) - 1]
         action["text"] = clicked["text"]
@@ -1250,8 +1272,32 @@ class RuntimeTest(unittest.TestCase):
                 )
                 update = next(entry[1] for entry in adapter.log if entry[0] == "chat_update")
                 turn = next(entry[1] for entry in adapter.log if entry[0] == "message")
-                self.assertEqual(update["blocks"][-1]["elements"][0]["text"], "<@U1> picked: Restore the secret")
+                self.assertEqual(update["blocks"][-1]["elements"][0]["text"], "✓ Jayanti: Restore the secret")
                 self.assertEqual(turn["text"], "apply Option B: Restore the secret")
+
+    def test_an_incident_click_names_the_clicker_in_plain_text_and_never_by_id(self):
+        handle = {"id": USER, "username": "jpatil", "name": "jpatil"}
+        cases = (
+            ("the display name", {}, (), None, "Jayanti"),
+            ("users.info named nobody", {"names": {}}, (), handle, "jpatil"),
+            ("users.info failed", {}, ("names",), handle, "jpatil"),
+            ("no name anywhere", {"names": {}}, (), {"id": USER}, runtime.NAMELESS_CLICKER),
+            ("a failed lookup and no handle", {}, ("names",), None, runtime.NAMELESS_CLICKER),
+            ("a handle that is the id", {"names": {}}, (), {"id": USER, "name": USER}, runtime.NAMELESS_CLICKER),
+            ("a name that is mrkdwn", {"names": {USER: "<!here> & *co*"}}, (), None, "&lt;!here&gt; &amp; *co*"),
+        )
+        for why, kwargs, broken, user, name in cases:
+            with self.subTest(why):
+                importlib.reload(runtime)
+                adapter = _Adapter(broken=broken, **kwargs)
+                self._options_incident(
+                    adapter, "apply Option A: Roll back to 14:02", "apply Option B: Restore the secret", user=user,
+                )
+                update = next(entry[1] for entry in adapter.log if entry[0] == "chat_update")
+                line = update["blocks"][-1]["elements"][0]["text"]
+                self.assertEqual(line, f"✓ {name}: Restore the secret")
+                self.assertNotIn(USER, json.dumps(update))
+                self.assertEqual(adapter.named, [(USER, CHANNEL, TEAM)])
 
     def test_an_incident_click_on_a_clipped_title_sends_the_whole_reply(self):
         title = "Restore the secret payments-db-creds from the GitOps repository and restart the rollout"
@@ -1454,7 +1500,7 @@ class RuntimeTest(unittest.TestCase):
         body, action = _alert_choice(1, "Apply Option B")
         body["message"]["text"] = report
         self._answer(adapter, body, action)
-        self.assertEqual(seen, [[f"<@U1> picked: Apply Option B\n\n{report}"]])
+        self.assertEqual(seen, [[f"✓ Jayanti: Apply Option B\n\n{report}"]])
 
     def test_the_answered_alert_drops_its_reply_with_line_and_keeps_the_rest(self):
         triage = {
@@ -1467,7 +1513,7 @@ class RuntimeTest(unittest.TestCase):
         alert = incident.message_text(triage, report)
         self.assertEqual(alert.count(presenter.CHOICES_LEAD), 2)
         head = incident.fallback_text(triage).rsplit("\n", 1)[0]
-        for note, check in (("<@U1> picked: Apply Option B", ()), (runtime.ANSWERED_IN_THREAD, ("typed",))):
+        for note, check in (("✓ Jayanti: Apply Option B", ()), (runtime.ANSWERED_IN_THREAD, ("typed",))):
             with self.subTest(note=note):
                 importlib.reload(runtime)
                 replies = [{"type": "message", "user": "U2", "text": "apply B", "ts": "223.000"}] if check else []
@@ -1484,7 +1530,7 @@ class RuntimeTest(unittest.TestCase):
         adapter = _Adapter()
         self._answer(adapter, body, action)
         update = next(entry[1] for entry in adapter.log if entry[0] == "chat_update")
-        self.assertEqual(update["text"], "<@U1> picked: Apply Option B\n\nthe report")
+        self.assertEqual(update["text"], "✓ Jayanti: Apply Option B\n\nthe report")
 
     def test_a_headline_quoting_the_reply_with_words_stays(self):
         headline = f"*{presenter.CHOICES_LEAD}nobody answered*"
@@ -1493,7 +1539,7 @@ class RuntimeTest(unittest.TestCase):
         adapter = _Adapter()
         self._answer(adapter, body, action)
         update = next(entry[1] for entry in adapter.log if entry[0] == "chat_update")
-        self.assertEqual(update["text"], f"<@U1> picked: Apply Option B\n\n{headline}\n\nthe report")
+        self.assertEqual(update["text"], f"✓ Jayanti: Apply Option B\n\n{headline}\n\nthe report")
 
     def test_a_card_questions_reply_with_line_goes_after_a_detail_with_a_blank_line(self):
         body, action = _choice(1, "seeded-b", prefix="kage_needs")
