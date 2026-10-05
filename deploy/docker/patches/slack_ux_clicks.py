@@ -28,7 +28,8 @@ With the flag on, :func:`register` adds two listeners:
   reply the report's call to action asks for, ``apply Option B: <that
   title>``, which is the turn when its title is the one shown, whole or as
   the clip shows it. The shown title, without the suffix, is what the
-  answered line says ("@user picked: <title>"), the echo carries and the
+  answered line says ("✓ <name>: <title>", by the clicker's display name, then
+  real name, then handle, never a mention or an id), the echo carries and the
   thread is offered as its ask. A
   label that starts like a command (``/`` or ``!``) is sent as text, since a
   choice is an answer. The click goes through the adapter's own interactive
@@ -134,8 +135,10 @@ CHOICE_KIND = "kage choice"
 #: thread instead when that rewrite fails, so a click always shows once.
 ECHO = "↳ <@{user}>: {label}"
 ANSWERED = "✓ <@{user}>: {label}"
-#: The answered line for an incident option.
-PICKED = "<@{user}> picked: {label}"
+#: The answered line for an incident option, naming the clicker as plain text.
+CLICKED = "✓ {name}: {label}"
+#: The clicker when Slack names them nowhere: never their raw id.
+NAMELESS_CLICKER = "Someone"
 
 #: Joins a label to the shown line its value names.
 TURN_JOIN = ": "
@@ -290,6 +293,25 @@ def _unescape(text: str) -> str:
 def answered(channel_id: str, msg_ts: str) -> bool:
     """Whether a choice click in this process answered the message and rewrote it."""
     return (str(channel_id), str(msg_ts), CHOICE_KIND) in _rewritten
+
+
+async def clicker_name(adapter: Any, body: dict, user_id: str, channel_id: str, team_id: str) -> str:
+    """The clicker's name as an answered line shows it, escaped: never a mention or their id.
+
+    The adapter's ``_resolve_user_name`` reads ``users.info`` once per user and
+    caches the answer, preferring the display name, then the real name, then the
+    handle. It answers with the id when the call fails, so the click's own
+    handle stands in then.
+    """
+    try:
+        name = str(await adapter._resolve_user_name(user_id, chat_id=channel_id, team_id=team_id) or "").strip()
+    except Exception as exc:  # noqa: BLE001 — the click still answers
+        logger.debug("slack_ux_clicks: could not name %s: %s", user_id, exc)
+        name = ""
+    if not name or name == user_id:
+        user = body.get("user") or {}
+        name = str(user.get("username") or user.get("name") or "").strip()
+    return _presenter._escape(name) if name and name != user_id else NAMELESS_CLICKER
 
 
 def _answered_by(other: str) -> bool:
@@ -716,7 +738,10 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
     if incident:
         label = label.removesuffix(INCIDENT_RECOMMENDED_SUFFIX)
     shown = _presenter._escape(label)
-    note = (PICKED if incident else ANSWERED).format(user=user_id, label=shown)
+    note = (
+        CLICKED.format(name=await clicker_name(adapter, body, user_id, channel_id, team_id), label=shown)
+        if incident else ANSWERED.format(user=user_id, label=shown)
+    )
     # Before the awaits: a card that moves on in between settles its question and forgets it.
     card = _question_card(channel_id, msg_ts)
     rewritten = False
