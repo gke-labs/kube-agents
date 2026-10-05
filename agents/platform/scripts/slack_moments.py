@@ -357,7 +357,8 @@ def _trailing_options(lines: Sequence[str]) -> tuple[int, list[str]]:
     while start > 1 and (not lines[start - 1].strip() or OPTION_LINE.match(lines[start - 1])):
         start -= 1
     # A button is plain text: `code` and **bold** would show their markup.
-    options = [_unmarked(m.group(1)) for m in (OPTION_LINE.match(line) for line in lines[start:]) if m]
+    # A linked option shows, and answers with, its label, as the headline does.
+    options = [_unmarked(_presenter.MD_LINK.sub(r"\1", m.group(1))) for m in (OPTION_LINE.match(line) for line in lines[start:]) if m]
     # Read as the headline shows it: "**Which cluster?**" still ends in "?".
     question = _headline_text(lines[start - 1])
     if not options or not question.endswith(QUESTION_END):
@@ -414,7 +415,9 @@ def _question(reason: str, buttons: bool) -> tuple[str, list[str], list[str]]:
     # A clipped headline keeps its whole line below it too, measured as shown, and so
     # does one with a link: the headline shows only the label, the line below the url.
     below = 0 if len(_headline_text(first)) > _presenter.HEADLINE_MAX or _presenter.MD_LINK.search(first) else 1
-    return first, [*before, *lines[below:start]], options
+    # Linked options likewise stay in the detail: their buttons show only the label.
+    end = len(lines) if any(_presenter.MD_LINK.search(line) for line in lines[start:]) else start
+    return first, [*before, *lines[below:end]], options
 
 
 def _detail(lines: Sequence[str]) -> str:
