@@ -2483,7 +2483,7 @@ def _note_declaration_problem(body: str, repo_slug: str, audit=None) -> Optional
     """Why an audit would not join one of `body`'s declarations to its fixture finding, or None when every one joins.
 
     Not a copy of the parser: the note goes through the audit's own
-    `parse_declarations` once per stream in GITOPS_INTENT_NOTE_DECLARATIONS
+    `parse_declarations` once, over the union of the declarable sets of the streams in GITOPS_INTENT_NOTE_DECLARATIONS
     (frontmatter delimiters, YAML and its error classes, `type`, `declares`,
     the item shape, the `cluster` rule, that stream's `declarable` set) and
     the surviving items are compared on the audit's own join key, which folds
@@ -2655,7 +2655,7 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
         return CheckResult(
             name,
             False,
-            f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} but the audit reads no declaration from it: "
+            f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} but the audits do not read every declaration the fixture needs from it: "
             f"{problem}. Replace it: {gitops_note_seed_command(repo_slug, sha)}",
         )
     # The audit reads notes only under the paths `.kube-agents/intent.yaml`

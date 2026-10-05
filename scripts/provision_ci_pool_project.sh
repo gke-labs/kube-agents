@@ -49,10 +49,11 @@ ALLOW_UNMAPPED="false"
 readonly GITOPS_SEED_FILE="README.md"
 readonly GITOPS_SEED_MESSAGE="Initial commit"
 readonly GITOPS_SEED_CONTENT="# GitOps Infrastructure Repo"
-# The declared-intent note bench/tasks/obtainability-declared-intent-no-finding
-# reads: the fleet's declared-no-pdb-workload role runs without a budget on
-# purpose, and the case grades that the agent finds this file and says so.
-# The harness reads the frontmatter, not the prose.
+# The declared-intent note the declared-intent cases read (GITOPS_INTENT_NOTE_CASES
+# in scripts/verify_ci_pool_project.py): the fleet's declared-no-pdb-workload role
+# runs without a budget or a NetworkPolicy and declared-token-workload's
+# token-reader keeps its mounted token, all on purpose. The harness reads the
+# frontmatter, not the prose.
 # What `gh api` prints on stderr for a path that is not there; any other failure
 # of the existence read stops the seed rather than writing blind.
 readonly GITOPS_NOTE_ABSENT_PATTERN="HTTP 404"

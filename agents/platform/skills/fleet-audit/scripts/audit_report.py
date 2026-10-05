@@ -868,6 +868,12 @@ SHARED_ACCOUNT_SHIELD_NOTE = (
 )
 # How many declared workloads the note names before counting the rest.
 SHARED_ACCOUNT_SHIELD_NAMES = 3
+# The kinds a 2.7 declaration may name, folded as `_object_kind_segment`
+# folds them: 2.7 is declared per workload, and an item naming the namespace
+# or the account covers no workload's token, so it shields nothing.
+SHARED_ACCOUNT_WORKLOAD_KINDS = frozenset(
+    {"deployment", "statefulset", "daemonset", "cronjob", "job", "pod", "replicaset"}
+)
 SHARED_ACCOUNT_STALE_REASON = (
     "Closing unmerged: a workload in this namespace is now declared to need the `default` "
     "ServiceAccount's token, so the shared-account fix this pull request proposes would remove "
@@ -5113,9 +5119,19 @@ def fold_searched_record(data: dict, record: dict | None) -> None:
     data[DECLARED_INTENT_SEARCHED_KEY] = current
 
 
+def _object_kind_segment(obj: str) -> str:
+    """The kind of `Kind/name`, folded as the join folds the whole object.
+
+    `_id_segment` squeezes every run outside `[a-z0-9]` to one `-`, so
+    `Namespace/x`, `Namespace x` and `namespace-x` are all `namespace-x` to
+    the join; the kind is what stands before the first `-` of that.
+    """
+    return _id_segment(obj).partition("-")[0]
+
+
 def _is_namespace_object(obj: str) -> bool:
-    """Whether `obj` names a Namespace, with the kind folded as the join folds it (`namespace/x`, `Namespace / x`)."""
-    return _id_segment(obj.partition("/")[0]) == _id_segment(NAMESPACE_SHAPE_KIND)
+    """Whether `obj` names a Namespace, on the same folding the join uses."""
+    return _object_kind_segment(obj) == _id_segment(NAMESPACE_SHAPE_KIND)
 
 
 def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
@@ -5223,16 +5239,28 @@ def _shield_sources(data: dict, declarations: list[dict]) -> dict[tuple[str, str
     `start`'s declarations hold what the owner declared whether or not the
     worker reported that workload at all. A fleet-wide declaration (no
     `cluster`) is keyed under the empty cluster and reaches every cluster.
-    Each value is `(object, repo, path)`, de-duplicated.
+    Each value is `(object, repo, path)`, de-duplicated on the folded object
+    (the first spelling is kept for display), and an item whose object is not
+    a workload kind is logged and left out: it covers no workload's token.
     """
     sources: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
+    seen: set[tuple[str, str, str, str]] = set()
 
     def add(cluster: str, namespace: str, obj: str, repo: str, path: str) -> None:
+        if _object_kind_segment(obj) not in SHARED_ACCOUNT_WORKLOAD_KINDS:
+            log(
+                f"DECLARATION NOT APPLIED: {SHARED_ACCOUNT_CHECK} on {obj!r} ({repo}:{path}) — "
+                f"{SHARED_ACCOUNT_CHECK} is declared per workload (`Kind/name` of a "
+                f"{', '.join(sorted(SHARED_ACCOUNT_WORKLOAD_KINDS))}); this item names no "
+                "workload, so it shields nothing in its namespace."
+            )
+            return
         key = (_id_segment(cluster), _id_segment(namespace))
-        entry = (obj, repo, path)
-        bucket = sources.setdefault(key, [])
-        if entry not in bucket:
-            bucket.append(entry)
+        folded = key + (_id_segment(obj), repo + ":" + path)
+        if folded in seen:
+            return
+        seen.add(folded)
+        sources.setdefault(key, []).append((obj, repo, path))
 
     for entry in data.get("declared") or []:
         if str(entry.get("check", "")) != SHARED_ACCOUNT_CHECK:
@@ -5283,8 +5311,9 @@ def shield_declared_account_siblings(data: dict, declarations: list[dict] | None
             continue
         namespace = _id_segment(str(finding.get("namespace") or ""))
         declared = list(shielded_by.get((_id_segment(str(finding.get("cluster", ""))), namespace), []))
+        named = {(_id_segment(obj), repo, path) for obj, repo, path in declared}
         for entry in shielded_by.get((_id_segment(""), namespace), []):
-            if entry not in declared:
+            if (_id_segment(entry[0]), entry[1], entry[2]) not in named:
                 declared.append(entry)
         if not declared:
             continue

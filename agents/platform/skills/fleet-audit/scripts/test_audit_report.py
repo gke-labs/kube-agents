@@ -5432,7 +5432,7 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
         self.assertIn("allow-all", str(cm.exception))
         # The kind is folded as the join folds it: kubectl's spelling and a
         # space around the slash are the namespace posture too.
-        for obj in ("Namespace/payments", "namespace/payments", "Namespace / payments"):
+        for obj in ("Namespace/payments", "namespace/payments", "Namespace / payments", "Namespace payments", "Namespace-payments"):
             with self.subTest(obj):
                 doc["declared"][0]["object"] = obj
                 audit_report.validate_findings(doc, AUDIT)
@@ -5443,11 +5443,16 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
         self.assertNotIn("allow-all", str(cm.exception))
 
     def test_the_apply_guard_folds_the_kind_as_the_join_does(self):
-        posture = make_finding(fid="ns", severity="major", obj="namespace/payments", check="netpol-missing")
-        doc = audit_report.validate_findings(make_doc(findings=[posture], audit=AUDIT), AUDIT)
-        with contextlib.redirect_stderr(io.StringIO()):
-            moved = audit_report.apply_declarations(doc, [self._netpol_declaration("Namespace/payments")])
-        self.assertEqual([f["object"] for f in moved], ["namespace/payments"])
+        # Every spelling the join reads as `namespace-payments` is the posture
+        # to the guard too: the join folds every separator, not only `/`.
+        for spelling in ("namespace/payments", "Namespace payments", "Namespace-payments"):
+            with self.subTest(spelling):
+                posture = make_finding(fid="ns", severity="major", obj=spelling, check="netpol-missing")
+                doc = audit_report.validate_findings(make_doc(findings=[posture], audit=AUDIT), AUDIT)
+                with contextlib.redirect_stderr(io.StringIO()):
+                    moved = audit_report.apply_declarations(doc, [self._netpol_declaration("Namespace/payments")])
+                self.assertEqual([f["object"] for f in moved], [spelling])
+        self.assertFalse(audit_report._is_namespace_object("NetworkPolicy/namespace-wide"))
 
     def _sa_finding(self, fid, obj, namespace="payments", cluster="prod-us-east"):
         return make_finding(fid=fid, severity="major", obj=obj, check="default-sa-automount", namespace=namespace, cluster=cluster, command="kubectl get sa default -n " + namespace, remediation={"kind": "manifest", "path": f"clusters/{cluster}/{namespace}/default-sa-automount.yaml", "note": "shared file"})
@@ -5534,13 +5539,30 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
         scoped = dict(declaration, **{audit_report.DECLARATION_CLUSTER_FIELD: "prod-eu-west"})
         fresh = audit_report.validate_findings(make_doc(findings=[self._sa_finding("worker", "Deployment/worker")], audit=AUDIT), AUDIT)
         self.assertEqual(audit_report.shield_declared_account_siblings(fresh, [scoped]), [])
-        # One declared workload named once, whichever source it came from.
+        # One declared workload named once, whichever source it came from and
+        # however each spelled it: the worker's `deployment/api` and the
+        # owner's `Deployment/api` are one workload to the join.
         with contextlib.redirect_stderr(io.StringIO()):
-            both = audit_report.validate_findings(make_doc(findings=[self._sa_finding("api", "Deployment/api"), self._sa_finding("worker", "Deployment/worker")], audit=AUDIT), AUDIT)
+            both = audit_report.validate_findings(make_doc(findings=[self._sa_finding("api", "deployment/api"), self._sa_finding("worker", "Deployment/worker")], audit=AUDIT), AUDIT)
             audit_report.apply_declarations(both, [declaration])
             audit_report.shield_declared_account_siblings(both, [declaration])
         (left,) = both["findings"]
-        self.assertEqual(left["remediation"]["note"].count("`Deployment/api` declared at"), 1)
+        self.assertEqual(left["remediation"]["note"].count("declared at acme/fleet:knowledge/api-token.md"), 1)
+
+    def test_a_declaration_naming_no_workload_shields_nothing(self):
+        # 2.7 is declared per workload. An item that copies the 2.6 shape, or
+        # names the account, covers no workload's token: logged, not applied.
+        worker = self._sa_finding("worker", "Deployment/worker")
+        for obj in ("Namespace/payments", "ServiceAccount/default"):
+            with self.subTest(obj):
+                doc = audit_report.validate_findings(make_doc(findings=[worker], audit=AUDIT), AUDIT)
+                declaration = {"check": "default-sa-automount", "namespace": "payments", "object": obj, "repo": "acme/fleet", "path": "knowledge/payments.md", "excerpt": "x"}
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(audit_report.shield_declared_account_siblings(doc, [declaration]), [])
+                self.assertEqual(doc["findings"][0]["remediation"]["kind"], "manifest")
+                self.assertIn("DECLARATION NOT APPLIED", err.getvalue())
+                self.assertIn("names no workload", err.getvalue())
 
     def test_the_shield_folds_cluster_and_namespace_as_the_id_does(self):
         api = self._sa_finding("api", "Deployment/api")

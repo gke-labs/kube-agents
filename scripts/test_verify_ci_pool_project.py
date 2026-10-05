@@ -1817,7 +1817,7 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
                 run.side_effect = [_ok(self._contents(body, sha="deadbeef"))]
                 result = checker.check_gitops_declaration("kube-agents-evals-3")
                 self.assertFalse(result.passed, label)
-                self.assertIn("the audit reads no declaration from it", result.message)
+                self.assertIn("the audits do not read every declaration the fixture needs from it", result.message)
                 self.assertIn(reasons[label], result.message, label)
                 if label == "empty cluster":
                     # One item skipped, the other parsed: the diagnosis names
@@ -1935,7 +1935,7 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
             with self.subTest(stream):
                 self.assertIn(item["check"], audit.audit_declarable_checks(stream))
 
-    def test_a_note_missing_one_of_the_two_declarations_fails(self):
+    def test_a_note_missing_one_of_its_declarations_fails(self):
         # The fixture rests on three postures in one note; a note that declares
         # only the budget leaves the compliance case failing on that project.
         good = checker.GITOPS_INTENT_NOTE_CONTENT
