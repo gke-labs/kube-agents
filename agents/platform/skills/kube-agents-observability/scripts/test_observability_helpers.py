@@ -709,6 +709,43 @@ class GetChatUsersTest(unittest.TestCase):
         self.assertIn("security policy", err)
         self.assertEqual("", out)
 
+    def test_a_read_the_broker_stopped_at_its_deadline_names_the_deadline_not_a_bare_exit_code(self):
+        # The broker answers its own deadline with exit 124 and, for gcloud,
+        # nothing on stderr: the "timed out after" line it appends is for
+        # kubectl only, so the generic branch would print `exited 124: `.
+        stopped = self.completed(returncode=get_chat_users.BROKER_DEADLINE_EXIT_CODE, stderr="")
+        with patch.object(get_chat_users.subprocess, "run", return_value=stopped):
+            code, out, err = run(get_chat_users.main, ["--project-id", PROJECT])
+        self.assertEqual(get_chat_users.EXIT_READ_FAILED, code)
+        self.assertEqual("", out)
+        self.assertIn(f"exited {get_chat_users.BROKER_DEADLINE_EXIT_CODE}: the credential broker", err)
+        self.assertIn("command deadline", err)
+        self.assertIn(f"{get_chat_users.BROKER_DEFAULT_DEADLINE_SECONDS} s by default", err)
+        self.assertIn("--limit", err)
+        self.assertNotIn("stderr:", err)
+
+    def test_a_read_the_broker_stopped_keeps_what_gcloud_wrote_before_it_was_killed(self):
+        stopped = self.completed(returncode=get_chat_users.BROKER_DEADLINE_EXIT_CODE, stderr="Listing entries...\n")
+        with patch.object(get_chat_users.subprocess, "run", return_value=stopped):
+            code, out, err = run(get_chat_users.main, ["--project-id", PROJECT])
+        self.assertEqual(get_chat_users.EXIT_READ_FAILED, code)
+        self.assertIn("command deadline", err)
+        self.assertIn("stderr: Listing entries...", err)
+
+    def test_the_deadline_exit_code_and_default_are_the_brokers_and_its_notice_is_kubectl_only(self):
+        # Read from the broker's source, as the ordering test below does: the
+        # helper names the code and the default in its message, and the
+        # message's claim that no notice arrives for gcloud rests on the
+        # broker appending one for kubectl alone.
+        broker = (Path(credential_proxy_client.__file__).with_name("credential_proxy.py")).read_text(encoding="utf-8")
+        exit_code = re.search(r"exit_code=(\d+) if captured\.timed_out else process\.returncode", broker)
+        self.assertIsNotNone(exit_code, "the broker's timed-out exit code was not found")
+        self.assertEqual(get_chat_users.BROKER_DEADLINE_EXIT_CODE, int(exit_code.group(1)))
+        deadline = re.search(r'os\.getenv\("CREDENTIAL_PROXY_TIMEOUT_SECONDS", "(\d+)"\)', broker)
+        self.assertIsNotNone(deadline, "the broker's CREDENTIAL_PROXY_TIMEOUT_SECONDS default was not found")
+        self.assertEqual(get_chat_users.BROKER_DEFAULT_DEADLINE_SECONDS, int(deadline.group(1)))
+        self.assertIn('if captured.timed_out and argv and Path(argv[0]).name == "kubectl":', broker)
+
     def test_a_truncated_read_is_a_failure_that_names_the_cap_not_a_json_error(self):
         # The shim writes the cut body, notes the truncation on stderr and exits
         # as gcloud did (0); the cut JSON must not be reported as malformed.
@@ -791,7 +828,8 @@ class GetChatUsersTest(unittest.TestCase):
         # runs from when the command starts, after up to the slot wait in its
         # queue, while the helper's clock starts before the shim connects, so
         # a timeout at or below the sum fires first and the broker's answer,
-        # its output or its own timeout notice, never reaches the helper.
+        # its output or the exit code it sets at its own deadline, never
+        # reaches the helper.
         broker = (Path(credential_proxy_client.__file__).with_name("credential_proxy.py")).read_text(encoding="utf-8")
         deadline = re.search(r'os\.getenv\("CREDENTIAL_PROXY_TIMEOUT_SECONDS", "(\d+)"\)', broker)
         self.assertIsNotNone(deadline, "the broker's CREDENTIAL_PROXY_TIMEOUT_SECONDS default was not found")
