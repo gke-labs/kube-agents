@@ -357,7 +357,8 @@ def _trailing_options(lines: Sequence[str]) -> tuple[int, list[str]]:
     while start > 1 and (not lines[start - 1].strip() or OPTION_LINE.match(lines[start - 1])):
         start -= 1
     # A button is plain text: `code` and **bold** would show their markup.
-    options = [_unmarked(m.group(1)) for m in (OPTION_LINE.match(line) for line in lines[start:]) if m]
+    # A linked option shows, and answers with, its label, as the headline does.
+    options = [_unmarked(_presenter.MD_LINK.sub(r"\1", m.group(1))) for m in (OPTION_LINE.match(line) for line in lines[start:]) if m]
     # Read as the headline shows it: "**Which cluster?**" still ends in "?".
     question = _headline_text(lines[start - 1])
     if not options or not question.endswith(QUESTION_END):

@@ -263,6 +263,11 @@ class NeedsYouTest(unittest.TestCase):
         blocks, _ = m.needs_you("Which cluster?\n- `seeded-reliability`\n- **seeded-debug**")
         self.assertEqual([b["text"]["text"] for b in _buttons(blocks)], ["seeded-reliability", "seeded-debug"])
 
+    def test_a_linked_option_is_its_label_on_the_button(self):
+        long = "https://github.com/kubernetes-sigs/cluster-api-provider-gcp/pull/1234"
+        blocks, _ = m.needs_you(f"Which PR should I merge first?\n- [#412](https://github.com/acme/x/pull/412)\n- [#1234]({long})")
+        self.assertEqual([(b["text"]["text"], b["value"]) for b in _buttons(blocks)], [("#412", "#412"), ("#1234", "#1234")])
+
     def test_a_glob_or_dunder_option_keeps_its_characters(self):
         blocks, _ = m.needs_you("Which pods?\n- Delete app=web-*\n- Keep `__pycache__`\n- Scale to 2*3")
         self.assertEqual([b["text"]["text"] for b in _buttons(blocks)], ["Delete app=web-*", "Keep __pycache__", "Scale to 2*3"])
