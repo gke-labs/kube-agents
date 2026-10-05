@@ -291,8 +291,8 @@ MAX_ALERTS_PER_TICK = 3
 MAX_OBJECTS_IN_LINE = 8
 #: The longest name the Session KV server takes (`DRIFT_MAX_FIELD_CHARS` there).
 #: It refuses a record with a longer namespace or cluster, and drops a longer
-#: object name, so such objects are left out of the record here rather than
-#: costing the namespace a refused inject on every tick.
+#: object name, so object names are cut to it here: a namespace whose stalled
+#: objects all have longer names would otherwise never be alerted.
 MAX_NAME_CHARS = 200
 #: The HTTP status the server answers a record it refuses with: a fault in that
 #: one record, not in the server.
@@ -306,6 +306,10 @@ MAX_ROWS_IN_RECORD = 500
 SESSION_KV_URL = "http://127.0.0.1:8699"
 SESSION_KV_AUTH_ENV = "SESSION_KV_API_KEY"
 SESSION_KV_TIMEOUT_SECONDS = 30
+CONTENT_TYPE_HEADER = "Content-Type"
+JSON_CONTENT_TYPE = "application/json"
+AUTH_HEADER = "Authorization"
+BEARER_PREFIX = "Bearer "
 HEALTHZ_PATH = "/healthz"
 SESSIONS_PATH = "/sessions"
 INJECT_SUFFIX = "/inject"
@@ -999,10 +1003,10 @@ def session_kv(path: str, body: dict | None = None, method: str = "") -> dict:
     the way findings_nudge.py authenticates; SESSION_KV_API_KEY survives into a
     no_agent child."""
     data = json.dumps(body).encode("utf-8") if body is not None else None
-    headers = {"Content-Type": "application/json"} if data is not None else {}
+    headers = {CONTENT_TYPE_HEADER: JSON_CONTENT_TYPE} if data is not None else {}
     token = (os.environ.get(SESSION_KV_AUTH_ENV) or "").strip()
     if token:
-        headers["Authorization"] = f"Bearer {token}"
+        headers[AUTH_HEADER] = f"{BEARER_PREFIX}{token}"
     request = urllib.request.Request(
         f"{SESSION_KV_URL}{path}", data=data, headers=headers, method=method or ("POST" if data is not None else "GET")
     )
@@ -1016,9 +1020,8 @@ def stall_payload(project: str, cluster: str, location: str, namespace: str, ass
     are text a tenant writes, and the Cluster Agent reads them again when it
     runs the skill."""
     objects = [
-        {"object": r["object"], "heuristic": r["heuristic"], "stalled_for": r.get("stalled_for") or ""}
+        {"object": r["object"][:MAX_NAME_CHARS], "heuristic": r["heuristic"], "stalled_for": r.get("stalled_for") or ""}
         for r in sorted(rows, key=lambda r: (r["object"], r["heuristic"]))
-        if len(r["object"]) <= MAX_NAME_CHARS
     ]
     return {
         "kind": INJECT_KIND,
@@ -1389,9 +1392,6 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             sys.stderr.write(f"stall_watch: {cid} has no Cluster Agent profile; no alert for {scope}\n")
             continue
         payload = stall_payload(project, name, location, namespace, assignee, rows, scope_first_seen(state, scope) or now)
-        if not payload["objects"]:
-            sys.stderr.write(f"stall_watch: every stalled object in {scope} has a name over {MAX_NAME_CHARS} characters; no alert\n")
-            continue
         attempted = True
         try:
             if board_records_sessions() is False:
@@ -1401,10 +1401,8 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             # unguarded: a rollback then ends the episode instead of crashing.
             episodes[scope] = {SESSION_KEY: session, "card": None, "assignee": assignee, "opened_at": now, "objects": object_names(rows)}
             if persist is not None:
-                try:
-                    persist()
-                except OSError as exc:
-                    raise AlertRefused(f"the ledger could not be saved before the alert: {exc}") from exc
+                # An OSError stops the tick; the scheduler reports the failure.
+                persist()
             inject(session, payload)
         except RecordRefused as exc:
             # This record's fault, not the server's: the next namespace in line

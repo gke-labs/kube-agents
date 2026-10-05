@@ -92,8 +92,8 @@ server unreachable, not advertising the kind, or answering anything but `injecte
 attempts and is said once in chat, with a line when alerts are raised again. The refusal text names
 no session, since every attempt opens a new one and the ledger compares the text to decide whether
 the refusal is new. A record the server refuses with 400 is that record's fault, not the server's:
-it skips only that namespace. Objects whose names exceed the server's 200-character limit are left
-out of the record before it is sent.
+it skips only that namespace. Object names longer than the server's 200-character limit are cut to
+it before the record is sent.
 
 ### 3.4 No alert limit
 

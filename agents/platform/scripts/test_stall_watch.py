@@ -816,15 +816,10 @@ class Alerts(Base):
         self.assertEqual(sorted(a["namespace"] for a in self.kv.alerts), ["bbb", "ccc"])
         self.assertNotIn(f"{cid('c')}/aaa-refused", self.ledger()[stall_watch.EPISODES_KEY])
 
-    def test_objects_with_names_the_server_would_refuse_are_left_out(self):
+    def test_objects_with_names_over_the_server_limit_are_sent_cut(self):
         long_name = "Job/" + "j" * stall_watch.MAX_NAME_CHARS
-        rows = [finding("ns", long_name, "stale-condition", "Complete=False"), finding("ns", "Deployment/short", "stale-condition", "Available=False")]
-        self.run_tick({"c": {"ns": rows}})
-        self.assertEqual([o["object"] for o in self.kv.alerts[0]["objects"]], ["Deployment/short"])
-        self.setUp()
         self.run_tick({"c": {"ns": [finding("ns", long_name, "stale-condition", "Complete=False")]}})
-        self.assertEqual(self.kv.alerts, [])
-        self.assertEqual(self.kv.calls, [], "no session is opened for a record with nothing to send")
+        self.assertEqual([o["object"] for o in self.kv.alerts[0]["objects"]], [long_name[: stall_watch.MAX_NAME_CHARS]])
 
     def test_a_ledger_time_without_a_timezone_does_not_stop_the_watch(self):
         self.kv.file_cards = False
@@ -915,7 +910,11 @@ class SessionKv(Base):
         # The daemon's real route against the watch's real builder: a field
         # renamed on one side alone would otherwise be a refused alert on every
         # tick with every test green.
-        import session_kv_server
+        own_db = str(self.home / "session_kv.db")
+        # The import runs init_db() on the path it resolves; in the agent image
+        # the inherited variable names the live database.
+        with patch.dict(os.environ, {"SESSION_KV_DB_PATH": own_db}):
+            import session_kv_server
         from fastapi.testclient import TestClient
 
         rows = [
@@ -923,9 +922,7 @@ class SessionKv(Base):
             finding("checkout", "Gateway/edge", "stale-condition", "Programmed=False", stalled_for="6h11m"),
         ]
         payload = stall_watch.stall_payload(PROJECT, "c", LOCATION, "checkout", "cluster-proj-c-us-central1", rows, "2026-10-02T12:30:00+00:00")
-        # Its own database, whatever path the import resolved: the ledger row
-        # the route writes must not land in an inherited live one.
-        own_db = str(self.home / "session_kv.db")
+        # Its own database, whatever path an earlier import resolved.
         with patch.dict(os.environ, {"SESSION_KV_API_KEY": "tok"}), patch.object(session_kv_server, "SESSION_KV_DB_PATH", own_db), \
                 patch.object(session_kv_server, "trigger_agent_troubleshooter") as trigger:
             session_kv_server.init_db()

@@ -83,9 +83,9 @@ does not advertise the kind on `/healthz`, leaves the namespace with its rows
 for the next tick, and the tick stops trying the rest rather than spend a
 timeout on each; the "alerts not raised" line below reports them rather than
 the held count. A record the server refuses on its own merits (HTTP 400) skips
-only that namespace, and the next one in line still gets its alert. Objects
-whose names exceed the server's 200-character limit are left out of the
-record, and a namespace with nothing else stalled gets no alert. A new object in a namespace whose card is still open is a comment on that
+only that namespace, and the next one in line still gets its alert. Object
+names longer than the server's 200-character limit are cut to it in the
+record. A new object in a namespace whose card is still open is a comment on that
 card; when every object in the namespace has cleared, the card gets a closing
 comment and is completed. A `repeating-warnings` or
 `dangling-reference` row clears only after two consecutive scans without it, so
@@ -105,8 +105,8 @@ posts. A namespace whose alert has produced no card a day after it was raised
 again in that tick; a shorter retry would post a fresh alert every hour or so
 for as long as the turns kept failing. Alerts are not raised at all on a board
 whose tasks table has no `session_id` column, since the card an alert produces
-could not be found. The watch saves its ledger before each inject and raises
-nothing on a tick whose ledger cannot be saved, so a ledger that keeps failing
+could not be found. The watch saves its ledger before each inject and fails
+the tick, with no alert, when the ledger cannot be saved, so a ledger that keeps failing
 to save cannot raise the same alerts every tick. A clean tick prints nothing. Anything a tick
 could not read (a
 cluster that timed out, a namespace whose scan failed, the rows of a kind a scan skipped or the repeating-warnings rows of one that could not read the events, a project whose listing failed or that gcloud called incomplete, a cluster whose profile's `cluster_identity` could not be read and whose project nothing else lists, a sweep that hit its
