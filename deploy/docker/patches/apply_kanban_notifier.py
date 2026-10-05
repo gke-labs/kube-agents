@@ -360,8 +360,8 @@ TRAILER = (
 )
 
 #: Text that only exists after a successful run. All five edited anchors
-#: are destroyed by their own replacement (the platform_str pin is not, which is
-#: why these run first), so a re-run would already fail on
+#: are destroyed by their own replacement (the platform_str pin is not, and
+#: passes a re-run), so a re-run would already fail on
 #: "found 0" — but that message blames upstream drift for what is actually a
 #: duplicated build step, and before the old delivery applier grew this guard a
 #: second pass exited 0 and left a second hook call and a second trailer import

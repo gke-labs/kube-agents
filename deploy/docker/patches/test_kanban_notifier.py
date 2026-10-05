@@ -2186,7 +2186,8 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual(target.read_text(), drifted)
 
     def test_applying_twice_fails_rather_than_silently_no_opping(self):
-        # Every anchor is destroyed by its own replacement, so a re-run
+        # Every edited anchor is destroyed by its own replacement (the
+        # platform_str pin is not, and passes a re-run), so a re-run
         # would fail on "found 0" anyway — but that message blames upstream
         # drift for what is really a duplicated build step, and the old delivery
         # applier had an anchor that survived patching and did silently stack.
