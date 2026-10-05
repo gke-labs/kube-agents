@@ -487,6 +487,7 @@ class SettleQuestionTest(unittest.TestCase):
     def test_only_the_mentions_a_reply_opens_with_are_dropped_from_its_line(self):
         for text, words in (
             ("<@U0BOT> <@U9|sam>  seeded-b", "seeded-b"),
+            ("<@U0BOT>: seeded-b", "seeded-b"),
             ("seeded-b, ask <@U9|sam>", "seeded-b, ask sam"),
             ("<@U0BOT>", "@U0BOT"),
         ):
@@ -507,6 +508,27 @@ class SettleQuestionTest(unittest.TestCase):
         self.assertEqual(len(adapter.reads), 1)
         self.assertEqual(adapter.updates, [])
         self.assertEqual(runtime._questions, {})
+
+    def test_a_click_recorded_during_the_read_drops_the_typed_line(self):
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        adapter.replies = [{"ts": "1700000000.000400", "user": "U7", "text": "seeded-a"}]
+        with mock.patch.object(clicks, "clicked", lambda channel, ts: bool(adapter.reads)):
+            _run(runtime.settle_question(adapter, SUB))
+        self.assertEqual(len(adapter.reads), 1)
+        self.assertEqual(_buttons(adapter.updates[0]["blocks"]), [])
+        self.assertNotIn("✓", adapter.updates[0]["text"])
+
+    def test_an_event_older_than_a_retried_question_leaves_it_alone(self):
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 8))
+        adapter.fail_update = True
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 9))
+        adapter.fail_update = False
+        self.assertEqual(len(runtime._unsettled), 1, "the first question waits for a retry")
+        _run(runtime.settle_question(adapter, SUB, "unblocked", 8))
+        self.assertEqual(adapter.updates, [])
+        self.assertEqual(len(runtime._unsettled), 1)
 
     def test_a_typed_reply_the_channel_gate_drops_is_not_the_answer(self):
         adapter = _Adapter()

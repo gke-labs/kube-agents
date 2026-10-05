@@ -45,7 +45,7 @@ leave them live. An event that means the card resumed (:data:`ANSWERED_KINDS`)
 also reads the thread once for that answer: the first reply after the question
 from a person the adapter would answer, not a bot, and through its channel gate, becomes
 the same "✓ <name>: <words>" line a click leaves (the words as plain text on
-one line, without the mentions it opens with, clipped to ``TYPED_ANSWER_MAX``).
+one line, without the user mentions it opens with, clipped to ``TYPED_ANSWER_MAX``).
 A card that moved on any other way, or with nobody replying, a read that fails, or a question a click answered whose rewrite
 failed (the click posted its line in the thread) settles without the line. A question a click already answered
 was rewritten by the click and is left alone; one whose rewrite failed is
@@ -127,7 +127,7 @@ SLACK_ENTITY = re.compile(r"<([^<>|]*)(?:\|([^<>]*))?>")
 
 #: The user mentions a reply opens with, such as the agent's in a channel that requires one.
 #: They address the reply, so they are not part of the answer its line shows.
-LEADING_MENTIONS = re.compile(r"^(?:\s*<@[A-Z0-9]+(?:\|[^<>]*)?>)+\s*")
+LEADING_MENTIONS = re.compile(r"^(?:[\s,:]*<@[A-Z0-9]+(?:\|[^<>]*)?>)+[\s,:]*")
 
 #: Added to a question's ``text``, so a session the wake never reached reads its card in the thread.
 QUESTION_CARD_NOTE = "(Question from card {card}.)"
@@ -385,6 +385,9 @@ async def _settled(adapter: Any, sub: dict, entry: tuple, kind: str = UNBLOCKED_
         if _clicked(channel, ts):
             # A click during the read rewrote the question with its own line.
             return True
+        if _clicked(channel, ts, rewritten=False):
+            # One still rewriting, or whose rewrite failed and posted its line, is the answer.
+            note = ""
         settled_text = _without_choices(text)
         await client.chat_update(
             channel=channel,
