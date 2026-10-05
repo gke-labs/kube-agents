@@ -18,15 +18,6 @@ from contextlib import closing, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-# Before anything imports session_kv_server, which resolves its database at
-# import. setdefault rather than assignment: discovery imports several test
-# modules into one process, and the module that imported the server first owns
-# the path. The round-trip test pins its own temp database regardless, because
-# this file ships in the agent image, where the variable names the live one.
-_db_fd, _TEMP_DB_PATH = tempfile.mkstemp()
-os.close(_db_fd)
-os.environ.setdefault("SESSION_KV_DB_PATH", _TEMP_DB_PATH)
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import stall_watch  # noqa: E402
 from test_mcp_package_contract import requires_mcp  # noqa: E402
@@ -835,6 +826,17 @@ class Alerts(Base):
         self.kv.file_cards = False
         self.run_tick({"c": {"checkout": [DEADLINE_ROW]}}, now="2026-10-02T12:00:00+00:00")
         lines, _ = self.run_tick({"c": {"checkout": []}}, now="2026-10-03T12:00:00+00:00")
+        self.assertEqual(lines, [f"{stall_watch.CLEARED_PREFIX} in {label('c')} / `checkout`: Deployment/checkout-api"])
+        self.assertEqual(len(self.kv.alerts), 1)
+
+    def test_a_day_long_wait_whose_rows_are_on_their_way_out_still_says_cleared(self):
+        # A dangling reference is kept for one missed scan, which raises no
+        # alert; ending the episode on that tick would leave the clear unsaid.
+        self.kv.file_cards = False
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}}, now="2026-10-02T12:00:00+00:00")
+        lines, _ = self.run_tick({"c": {"checkout": []}}, now="2026-10-03T12:00:00+00:00")
+        self.assertEqual(lines, [])
+        lines, _ = self.run_tick({"c": {"checkout": []}}, now="2026-10-03T12:30:00+00:00")
         self.assertEqual(lines, [f"{stall_watch.CLEARED_PREFIX} in {label('c')} / `checkout`: Deployment/checkout-api"])
         self.assertEqual(len(self.kv.alerts), 1)
 

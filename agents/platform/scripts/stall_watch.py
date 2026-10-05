@@ -1223,6 +1223,12 @@ def scope_rows(state: dict, scope: str) -> list[dict]:
     return [e for e in state["stalls"].values() if scope_key(e["cluster"], e["namespace"]) == scope]
 
 
+def would_raise(state: dict, sweep: Sweep, scope: str) -> bool:
+    """Whether a scope with no episode is a candidate for an alert this tick:
+    read this tick, with a row not on its way out."""
+    return scope in sweep.read_scopes and any(not e.get("missed") for e in scope_rows(state, scope))
+
+
 def scope_first_seen(state: dict, scope: str) -> str:
     """When the scope's oldest ledgered row was first seen: the queue order."""
     return min((str(e.get("first_seen") or "") for e in scope_rows(state, scope)), default="")
@@ -1282,7 +1288,7 @@ def comment_pending(episode: dict, namespace: str) -> None:
         episode["pending"] = []
 
 
-def adopt_cards(state: dict, now: str) -> None:
+def adopt_cards(state: dict, sweep: Sweep, now: str) -> None:
     """Look up the card each open alert's session filed. An alert whose session
     has filed none UNFILED_ALERT_RETRY_SECONDS after it was raised ends its
     episode, so the scope is a candidate again and its alert is raised again in
@@ -1301,9 +1307,9 @@ def adopt_cards(state: dict, now: str) -> None:
             waited = (datetime.fromisoformat(now) - datetime.fromisoformat(str(episode.get("opened_at")))).total_seconds()
         except (ValueError, TypeError):  # TypeError: a hand-edited time with no timezone
             waited = UNFILED_ALERT_RETRY_SECONDS
-        # A namespace that has also cleared is left to the clearing step, which
-        # posts its line; ending the episode here would drop it unannounced.
-        if waited >= UNFILED_ALERT_RETRY_SECONDS and scope_rows(state, scope):
+        # Ended only when the stall is raised again this tick; otherwise the
+        # clearing step, or a later tick, owns the episode.
+        if waited >= UNFILED_ALERT_RETRY_SECONDS and would_raise(state, sweep, scope):
             sys.stderr.write(f"stall_watch: session {episode[SESSION_KEY]} filed no card for {scope} since {episode.get('opened_at')}; its episode ends and the alert is raised again\n")
             end_episode(state, scope)
 
@@ -1322,15 +1328,14 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
     episodes = state.setdefault(EPISODES_KEY, {})
     lines: list[str] = []
     if not dry_run:
-        adopt_cards(state, now)
+        adopt_cards(state, sweep, now)
     # Every scope read this tick that has rows and no episode is a candidate,
     # whether its objects appeared now or it has waited: past the cap, after a
     # refused alert, or with no profile. Oldest first sighting first.
     candidates = dict(new_by_scope)
     for entry in state["stalls"].values():
         scope = scope_key(entry["cluster"], entry["namespace"])
-        # A row missed this tick is on its way out and raises no alert.
-        if scope not in candidates and scope not in episodes and scope in sweep.read_scopes and not entry.get("missed"):
+        if scope not in candidates and scope not in episodes and would_raise(state, sweep, scope):
             candidates[scope] = []
     raised = held = 0
     refusal: str | None = None

@@ -177,7 +177,7 @@ posted; no alert limit is claimed. The producer: a new episode creates a session
 the cap holds; the card is adopted by session id; comment, clear and complete work through it; an
 old-shape episode keeps working; a daemon that refuses or does not advertise the kind leaves the
 namespace waiting and is said once, at either step; a ledger that cannot be saved raises nothing; a
-session that files no card is raised again a day later; the record `stall_payload` builds is the one
+session that files no card is raised again a day later, unless its stall is clearing; the record `stall_payload` builds is the one
 the daemon's route accepts. `test_triage_reply_roundtrip.py` drives a report cut from `_stall_task_body`
 through the real notifier, server and plugin, and shows the pre-inject stall report shape earns no row.
 
@@ -216,6 +216,11 @@ cases do; the apply step is covered by the unit test above.
   platform. On a dual-platform install the other platform sees the watch's own "stall cleared" and
   "held" lines, which cron delivery fans out, and not the alert or the report. When the alert post
   fails outright the report has no route at all, the same failure the event path has.
+- **A lost ledger re-alerts every open stall.** The card path asked the board through its
+  idempotency key; the inject path asks only the ledger. A ledger that comes back empty (the volume
+  recreated, the file deleted, a `STATE_SCHEMA_VERSION` change) makes every stall still open new,
+  three alerts a tick, and leaves the earlier cards open. Matching open cards by title would be the
+  only guard, and a ledger loss is rare.
 - **A kill between saving the ledger and sending the inject delays the alert a day.** The episode is
   saved with a session that never got the record, and the watch waits the day it gives any session
   that files no card. The window is the inject call itself, at most its 30-second timeout.
