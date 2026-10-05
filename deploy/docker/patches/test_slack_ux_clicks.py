@@ -303,6 +303,14 @@ class ApplierTest(unittest.TestCase):
             verifier.main(self.root.dir)
         self.assertIn("self._app", str(caught.exception))
 
+    def test_verifier_refuses_an_adapter_that_only_mentions_its_bolt_app(self):
+        applier.apply(self.root.dir)
+        path = self.root.dir / applier.RELATIVE
+        path.write_text(path.read_text().replace("self._app.action(", "self._bolt_app.action("))
+        with self.assertRaises(SystemExit) as caught:
+            verifier.main(self.root.dir)
+        self.assertIn("self._app", str(caught.exception))
+
 
 class FlagOffIdentityTest(unittest.TestCase):
     """With KAGE_SLACK_UX off the patched adapter wires exactly upstream's listeners."""

@@ -308,11 +308,14 @@ def check_adapter(root: Path) -> None:
     methods = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == METHOD]
     if len(methods) != 1:
         raise _fail(f"{ADAPTER} has {len(methods)} def {METHOD}(), expected 1")
+    # A call on it, not a mention: `if self._app is None: return` wires nothing.
     on_app = any(
-        isinstance(node, ast.Attribute)
-        and node.attr == APP_ATTRIBUTE
-        and isinstance(node.value, ast.Name)
-        and node.value.id == "self"
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == APP_ATTRIBUTE
+        and isinstance(node.func.value.value, ast.Name)
+        and node.func.value.value.id == "self"
         for node in ast.walk(methods[0])
     )
     if not on_app:
