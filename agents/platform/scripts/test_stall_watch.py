@@ -1002,6 +1002,28 @@ class SessionKv(Base):
         self.assertIn("answer could not be read", lines[0])
         self.assertIn("IncompleteRead", lines[0])
 
+    def test_a_reply_field_of_the_wrong_shape_is_a_refusal_not_a_crash(self):
+        healthy = {stall_watch.INJECT_KINDS_KEY: [stall_watch.INJECT_KIND]}
+        cases = {
+            "kinds a number": ({stall_watch.INJECT_KINDS_KEY: 5}, {"sessionID": "s1"}, {"status": "injected"}),
+            "kinds a joined string": ({stall_watch.INJECT_KINDS_KEY: f"k8s-event,{stall_watch.INJECT_KIND}"}, {"sessionID": "s1"}, {"status": "injected"}),
+            "session id a number": (healthy, {"sessionID": 7}, {"status": "injected"}),
+            "no inject status": (healthy, {"sessionID": "s1"}, {}),
+        }
+        for name, (healthz, session, injected) in cases.items():
+            with self.subTest(name):
+                self.setUp()
+
+                def urlopen(request, timeout, healthz=healthz, session=session, injected=injected):
+                    path = request.full_url[len(stall_watch.SESSION_KV_URL):]
+                    body = healthz if path == stall_watch.HEALTHZ_PATH else session if path == stall_watch.SESSIONS_PATH else injected
+                    return io.BytesIO(json.dumps(body).encode())
+
+                with patch.object(stall_watch.urllib.request, "urlopen", urlopen), patch.object(stall_watch, "session_kv", REAL_SESSION_KV):
+                    lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+                self.assertEqual(len(lines), 1, lines)
+                self.assertTrue(lines[0].startswith(stall_watch.INJECT_FAILED_PREFIX), lines[0])
+
     def test_the_board_is_the_one_hermes_resolves(self):
         # hermes_cli.kanban has no kanban_db_path; importing it from there fell
         # through to the default board every time.

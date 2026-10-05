@@ -1053,32 +1053,57 @@ class RecordRefused(AlertRefused):
     are still worth sending this tick."""
 
 
+# One reader per route: each returns the field the watch uses, typed, or raises
+# the ValueError its caller reports as an answer that could not be read. No
+# caller reads an answer's fields itself.
+
+
+def healthz_kinds() -> list[str]:
+    kinds = session_kv(HEALTHZ_PATH).get(INJECT_KINDS_KEY)
+    if kinds is None:
+        return []
+    if not isinstance(kinds, list) or not all(isinstance(k, str) for k in kinds):
+        raise ValueError(f"the Session KV server's {INJECT_KINDS_KEY} is not a list of names: {kinds!r}")
+    return kinds
+
+
+def new_session() -> str:
+    session_id = session_kv(SESSIONS_PATH, method="POST").get(SESSION_ID_KEY)
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise ValueError(f"the Session KV server returned no session id: {session_id!r}")
+    return session_id
+
+
+def inject_status(session_id: str, payload: dict) -> str:
+    status = session_kv(
+        f"{SESSIONS_PATH}/{urllib.parse.quote(session_id, safe='')}{INJECT_SUFFIX}",
+        {MESSAGE_KEY: json.dumps(payload)},
+    ).get(STATUS_KEY)
+    if not isinstance(status, str):
+        raise ValueError(f"the Session KV server's inject answer has no status: {status!r}")
+    return status
+
+
 def open_session() -> str:
     """A session for one alert. A server that does not advertise the kind is
     refused before any session is opened: its dispatch would take the record
     for a Kubernetes event and post a Pod alert naming nothing."""
     try:
-        if INJECT_KIND not in (session_kv(HEALTHZ_PATH).get(INJECT_KINDS_KEY) or []):
+        if INJECT_KIND not in healthz_kinds():
             raise AlertRefused(f"the Session KV server does not advertise the {INJECT_KIND} inject kind")
-        session_id = session_kv(SESSIONS_PATH, method="POST").get(SESSION_ID_KEY)
+        return new_session()
     except urllib.error.HTTPError as exc:
         raise AlertRefused(f"the Session KV server answered with an error: {exc}") from exc
     except ValueError as exc:  # JSONDecodeError and UnicodeDecodeError are ValueErrors
         raise AlertRefused(f"the Session KV server's answer could not be read: {exc}") from exc
     except OSError as exc:  # URLError is an OSError
         raise AlertRefused(f"the Session KV server could not be reached: {exc}") from exc
-    if not session_id:
-        raise AlertRefused("the Session KV server returned no session id")
-    return str(session_id)
 
 
 def inject(session_id: str, payload: dict) -> None:
     """Hand the record to the session; raises AlertRefused unless it was taken."""
     try:
-        status = session_kv(
-            f"{SESSIONS_PATH}/{urllib.parse.quote(session_id, safe='')}{INJECT_SUFFIX}",
-            {MESSAGE_KEY: json.dumps(payload)},
-        ).get(STATUS_KEY)
+        status = inject_status(session_id, payload)
     except urllib.error.HTTPError as exc:
         if exc.code == HTTP_BAD_REQUEST:
             raise RecordRefused(f"the Session KV server refused the record: {exc}") from exc
@@ -1283,18 +1308,11 @@ def episode_gone(state: dict, scope: str, task_id: str) -> bool:
     return False
 
 
-def comment_pending(episode: dict, namespace: str) -> None:
-    """Tell the card about objects that joined while it was open; what the
-    board refused, or what joined before the card was filed, stays pending and
-    is tried again next tick."""
+def comment_pending(episode: dict, namespace: str, card: str) -> None:
+    """Tell the open card about objects that joined since it was filed; what
+    the board refused stays pending and is tried again next tick."""
     pending = sorted(set(episode.get("pending", [])))
     if not pending:
-        return
-    try:
-        card = episode_card(episode)
-    except BoardUnreadable:
-        return
-    if not card:
         return
     if comment_card(card, f"The watch now also sees these objects stalled in `{namespace}`: {names_text(pending)}"):
         episode["objects"] = sorted(set(episode.get("objects", [])) | set(pending))
@@ -1333,7 +1351,7 @@ def restore_episode(episodes: dict, scope: str, previous: dict | None) -> None:
         episodes[scope] = previous
 
 
-def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scope: dict, now: str, *, dry_run: bool = False, persist=None) -> list[str]:
+def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scope: dict, now: str, *, dry_run: bool = False, persist) -> list[str]:
     """Raise alerts for the tick's new episodes, and comment on and close the
     cards earlier alerts produced; return the chat lines. A new episode gets no
     line of its own, because the alert is its notice; a closed card gets one,
@@ -1406,7 +1424,7 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             if status is not None and status not in TERMINAL_CARD_STATUSES:
                 episode["unknown"] = 0
                 episode["pending"] = sorted(set(episode.get("pending", [])) | set(object_names(new_rows)))
-                comment_pending(episode, namespace)
+                comment_pending(episode, namespace, card)
                 continue
             if status is not None:
                 if not would_raise(state, sweep, scope):
@@ -1437,9 +1455,8 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             # `card` is present as None because the card-filing watch read it
             # unguarded: a rollback then ends the episode instead of crashing.
             episodes[scope] = {SESSION_KEY: session, "card": None, "assignee": assignee, "opened_at": now, "objects": object_names(rows)}
-            if persist is not None:
-                # An OSError stops the tick; the scheduler reports the failure.
-                persist()
+            # An OSError stops the tick; the scheduler reports the failure.
+            persist()
             inject(session, payload)
         except RecordRefused as exc:
             # This record's fault, not the server's: the next namespace in line
@@ -1538,7 +1555,7 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
         state["sweep_error"] = None
         state[CURSOR_KEY] = sweep.cursor
         new_by_scope, cleared_by_scope = diff_and_update(state, sweep, now)
-        lines += episode_lines(state, sweep, new_by_scope, cleared_by_scope, now, dry_run=dry_run, persist=None if dry_run else lambda: save_state(state_path, state))
+        lines += episode_lines(state, sweep, new_by_scope, cleared_by_scope, now, dry_run=dry_run, persist=lambda: save_state(state_path, state))
     if not dry_run:
         save_state(state_path, state)
     return lines
