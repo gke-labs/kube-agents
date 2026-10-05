@@ -3296,10 +3296,18 @@ class TestIsFleetAuditJob(unittest.TestCase):
             {"id": "legacy", "skill": "fleet-audit"},
             {"id": "stall-watch", "skills": []},
         ]
-        for base in (self.home, os.path.join(self.home, "profiles", "platform")):
+        # The home roster's audit job is its own, and every path a profile that is not one
+        # segment would reach holds a roster that answers True, so only the guards answer False.
+        rosters = {
+            self.home: [{"id": "home-audit", "skills": ["fleet-audit"]}, *jobs[3:]],
+            os.path.join(self.home, "profiles", "platform"): jobs,
+            os.path.join(self.home, "profiles"): jobs,
+            os.path.join(self.home, "platform"): jobs,
+        }
+        for base, roster in rosters.items():
             os.makedirs(os.path.join(base, "cron"))
             with open(os.path.join(base, "cron", "jobs.json"), "w", encoding="utf-8") as handle:
-                json.dump({"jobs": jobs if base != self.home else jobs[3:]}, handle)
+                json.dump({"jobs": roster}, handle)
         home = patch("gitops_workspace.agent_home", return_value=self.home)
         home.start()
         self.addCleanup(home.stop)
@@ -3314,7 +3322,9 @@ class TestIsFleetAuditJob(unittest.TestCase):
         self.assertFalse(session_kv_server._is_fleet_audit_job("platform", "user-made"))
 
     def test_the_default_profile_reads_the_home_roster(self):
+        self.assertTrue(session_kv_server._is_fleet_audit_job("default", "home-audit"))
         self.assertFalse(session_kv_server._is_fleet_audit_job("default", "compliance-audit"))
+        self.assertFalse(session_kv_server._is_fleet_audit_job("platform", "home-audit"))
 
     def test_an_unreadable_roster_is_not(self):
         with self.assertLogs(session_kv_server.logger, "WARNING"):
@@ -3322,8 +3332,9 @@ class TestIsFleetAuditJob(unittest.TestCase):
 
     def test_a_profile_that_is_not_one_path_segment_is_not(self):
         for profile in ("..", ".", "../platform", "profiles/platform", ""):
-            with self.subTest(profile=profile):
-                self.assertFalse(session_kv_server._is_fleet_audit_job(profile, "compliance-audit"))
+            for job_id in ("compliance-audit", "home-audit"):
+                with self.subTest(profile=profile, job_id=job_id):
+                    self.assertFalse(session_kv_server._is_fleet_audit_job(profile, job_id))
 
 
 class TestSlackAuditHeadline(unittest.TestCase):
