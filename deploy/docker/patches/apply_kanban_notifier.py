@@ -388,6 +388,8 @@ def expect_platform_binding(patch: patchlib.Patch) -> None:
     under an ``if``, a ``try`` or a closure, would pass it and leave some
     instances without ``platform_str``. Only a statement directly in the
     constructor's body, at the pinned indentation, runs on every construction.
+    The statement found must also be the binding itself, so the text sitting in
+    a comment or a string on another assignment's line does not pass.
     """
     offset = patch.source.index(PLATFORM_BINDING)
     lineno = patch.source.count("\n", 0, offset) + 1
@@ -397,6 +399,7 @@ def expect_platform_binding(patch: patchlib.Patch) -> None:
             for method in node.body:
                 if isinstance(method, ast.FunctionDef) and method.name == PLATFORM_METHOD and any(
                     isinstance(stmt, ast.Assign) and stmt.lineno == lineno and stmt.col_offset == col
+                    and ast.get_source_segment(patch.source, stmt) == PLATFORM_BINDING.strip()
                     for stmt in method.body
                 ):
                     return

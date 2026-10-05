@@ -2096,6 +2096,21 @@ class ApplyTest(unittest.TestCase):
                     patch_tree(nested)
                 self.assertIn("_KanbanNotification.__init__", str(ctx.exception))
 
+    def test_a_platform_str_binding_carried_by_another_line_fails_loudly(self):
+        # The pinned text in a comment or a string on another assignment's line
+        # still counts once and still lands on an Assign at the pinned column.
+        binding = '        self.platform_str = (sub["platform"] or "").lower()\n'
+        for carrier in (
+            "        self.platform = _norm(sub)  # was:" + binding,
+            '        self.platform = """' + binding + '        """\n',
+        ):
+            with self.subTest(carrier=carrier.strip()):
+                moved = UPSTREAM_NOTIFIER.replace(binding, carrier)
+                self.assertEqual(moved.count(binding), 1)
+                with self.assertRaises(SystemExit) as ctx:
+                    patch_tree(moved)
+                self.assertIn("_KanbanNotification.__init__", str(ctx.exception))
+
     def test_a_drifted_wake_step_anchor_fails_loudly(self):
         with self.assertRaises(SystemExit) as ctx:
             patch_tree(UPSTREAM_NOTIFIER.replace(*TELL_DRIFT))

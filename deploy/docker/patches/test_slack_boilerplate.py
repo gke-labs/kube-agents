@@ -832,6 +832,9 @@ class ApplierTest(unittest.TestCase):
             ('-> "Optional[_TargetDelivery]"', '-> "Optional[_TargetDeliveryV2]"', "no longer annotated"),
             (bind, "t = _prepare_slack_target(target)", "no longer binds t"),
             (bind, f"{bind}\n{indent}t = target", "no longer binds t"),
+            (bind, f"{bind}\n{indent}def _one(t):\n{indent}    pass", "no longer binds t"),
+            (bind, f"{bind}\n{indent}try:\n{indent}    pass\n{indent}except Exception as t:\n{indent}    pass",
+             "no longer binds t"),
         ):
             with self.subTest(detail=detail):
                 self.assertEqual(patched.count(old), 1)
@@ -841,6 +844,19 @@ class ApplierTest(unittest.TestCase):
                 self.assertIn(detail, str(caught.exception))
         path.write_text(patched)
         verifier.check_target_fields(self.root.dir)
+
+    def test_verifier_accepts_every_spelling_of_optional(self):
+        applier.apply(self.root.dir)
+        path = self.root.dir / applier.DELIVERY
+        patched = path.read_text()
+        for spelling in (
+            '-> "Union[_TargetDelivery, None]"',
+            '-> "typing.Optional[_TargetDelivery]"',
+            '-> "_TargetDelivery | None"',
+        ):
+            with self.subTest(spelling=spelling):
+                path.write_text(patched.replace('-> "Optional[_TargetDelivery]"', spelling))
+                verifier.check_target_fields(self.root.dir)
 
     def test_verifier_refuses_a_dropped_wrapper(self):
         applier.apply(self.root.dir)

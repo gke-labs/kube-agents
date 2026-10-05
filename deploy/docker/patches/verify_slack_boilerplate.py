@@ -77,8 +77,9 @@ TARGET_CLASS = "_TargetDelivery"
 TARGET_FACTORY = "_prepare_target_delivery"
 TARGET_LOCAL = "t"
 #: Names a return annotation may carry besides ``TARGET_CLASS``: the forms of
-#: "or None". Anything else names a second class whose fields go unchecked.
-OPTIONAL_NAMES = {"Optional", "typing", "None"}
+#: "or None" (``None`` itself parses as a constant, not a name). Anything else
+#: names a second class whose fields go unchecked.
+OPTIONAL_NAMES = {"Optional", "Union", "typing"}
 #: What ``cron_delivery_text`` reads off a target. ``drive`` below passes a
 #: SimpleNamespace, so only this check ties the names to upstream's class. Only
 #: ``platform_name`` changes what is sent; the other two feed a log line, and are
@@ -312,17 +313,30 @@ def check_delivery(root: Path) -> None:
         raise _fail(f"{DELIVER_FN}() no longer builds the cron wrapper; the Chat relay routes on it")
 
 
+def _binds(node: ast.AST, name: str) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id == name and isinstance(node.ctx, ast.Store)
+    if isinstance(node, ast.arg):
+        return node.arg == name
+    if isinstance(node, ast.alias):
+        return (node.asname or node.name.split(".")[0]) == name
+    if isinstance(node, ast.MatchMapping):
+        return node.rest == name
+    if isinstance(node, (ast.ExceptHandler, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                         ast.MatchAs, ast.MatchStar)):
+        return node.name == name
+    return False
+
+
 def check_target_fields(root: Path) -> None:
     # Fields declared on the class itself only: a field moved to a base class or
     # turned into a property refuses the build, loudly, until this is re-derived.
     tree = _tree(root, DELIVERY)
     deliver = _function(tree, DELIVER_FN, DELIVERY)
-    # Every store of t, whatever its form, so a second binding from anything
-    # but the factory refuses the build.
-    stores = [
-        node for node in ast.walk(deliver)
-        if isinstance(node, ast.Name) and node.id == TARGET_LOCAL and isinstance(node.ctx, ast.Store)
-    ]
+    # Every binding of t, whatever its form (a nested def's parameter, an
+    # except or import alias, a def, a match capture), so a second binding from
+    # anything but the factory refuses the build.
+    stores = [node for node in ast.walk(deliver) if _binds(node, TARGET_LOCAL)]
     binds = [
         node for node in ast.walk(deliver)
         if isinstance(node, ast.Assign) and [ast.unparse(t) for t in node.targets] == [TARGET_LOCAL]
