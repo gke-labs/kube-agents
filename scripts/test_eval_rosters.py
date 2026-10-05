@@ -171,6 +171,7 @@ ADDED_AFTER_THE_MOVE = [
     "upgrades-freeze-runbook-probe",  # the gke-upgrades skill sync
     "session-crashloop-question-loads-a-skill",  # the session persona's skills, #2858
     "fleet-audit-unchanged-finding-keeps-wording",  # finish keeps the wording of an unchanged finding
+    "capability-criteria-confirmed-change",  # the criteria store's confirmed-change path, with capability_store.py
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
