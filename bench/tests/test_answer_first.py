@@ -110,8 +110,17 @@ def test_a_bold_label_before_a_colon_is_not_a_lead():
     for result in (
         "**Memory check**: no node is under pressure. **Pod check**: all pods run. Want me to watch it?",
         "**No node is under memory pressure**: all three report False.",
+        "**Memory check:** no node is under pressure. All 3 checked.",
     ):
         assert "not a whole sentence" in _run(result).reason, result
+
+
+def test_an_unpunctuated_lead_before_more_bold_labels_is_a_section_label():
+    for result in (
+        "**Memory pressure**\nNone of the three nodes reports MemoryPressure=True.\n\n**Pods outside kube-system**\nAll are Running.",
+        "**Memory**: no node is under pressure. **Pods**: all Running.",
+    ):
+        assert "one of several bold labels" in _run(result, lead_terms=["memory"]).reason, result
 
 
 def test_a_link_target_is_not_part_of_the_lead():

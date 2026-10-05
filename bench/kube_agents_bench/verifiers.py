@@ -317,6 +317,9 @@ _TERMINAL = ".!?"
 # "**No**: ...", "**Yes** \u2014 ...". A longer span before a colon is a label ("**Memory check**:").
 _LEAD_CLAUSE = (":", "\u2014", "\u2013")
 _WHITESPACE = re.compile(r"\s")
+# A later bold span closed without a stop and followed by a colon, a dash or the line's end:
+# a section label. After an unpunctuated lead, it makes the lead one label of several.
+_BOLD_SECTION = re.compile(r"\*\*[^*\n]+?(?<![.!?])\*\*[ \t]*(?:[:\u2014\u2013]|$)", re.MULTILINE)
 # A markdown link; chat shows its text, not its target.
 _MARKDOWN_LINK = re.compile(r"\[([^\]]*)\]\([^)\s]*\)")
 # Bold and code markers, which chat renders rather than shows.
@@ -403,13 +406,14 @@ class AnswerFirstVerifier(BaseVerifier):
             after = result[lead.end() :]
             if _INNER_SENTENCE_BREAK.search(_unabbreviate(inner)):
                 defects.append(f"the bold lead is more than one sentence: {inner!r}")
-            elif not (
-                inner.endswith(tuple(_TERMINAL))
-                or after[:1] in tuple(_TERMINAL)
-                or (after.lstrip(" ").startswith(_LEAD_CLAUSE) and not _WHITESPACE.search(inner))
-                or not after.split("\n", 1)[0].strip()
-            ):
-                defects.append(f"the bold span is not a whole sentence: {inner!r}")
+            elif not (inner.endswith(tuple(_TERMINAL)) or after[:1] in tuple(_TERMINAL)):
+                if not (
+                    (after.lstrip(" ").startswith(_LEAD_CLAUSE) and not _WHITESPACE.search(inner))
+                    or not after.split("\n", 1)[0].strip()
+                ):
+                    defects.append(f"the bold span is not a whole sentence: {inner!r}")
+                elif _BOLD_SECTION.search(after):
+                    defects.append(f"the bold lead is one of several bold labels: {inner!r}")
             lead_text = _normalize(_MARKDOWN_LINK.sub(r"\1", inner))
             rest = after.lstrip(_LEAD_TRAIL)
         if _ATX_HEADING.search(_FENCE.sub("", result)):

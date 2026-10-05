@@ -213,6 +213,8 @@ class SplitTest(unittest.TestCase):
             "a bold label alone": "**No pods are failing**: all 12 are Running.",
             "a bold label and more": "**No pods are failing**: all 12 are Running. Two restarted today.",
             "a bold label and a dash": "**Memory check** \u2014 no node is under pressure. All 3 checked.",
+            "a colon inside the bold": "**Memory check:** no node is under pressure. All 3 checked.",
+            "a one-word label, colon inside": "**No:** no node is under pressure. All 3 checked.",
             "an overlong sentence": ("word " * 40).strip() + ". Then more.",
             "a single sentence": "Checkout is healthy.",
             "nothing": "",
@@ -262,6 +264,19 @@ class TrailingQuestionTest(unittest.TestCase):
                 ("Node: a\nCause: OOM", "Want me to restart it?"),
             ),
             "under a count": ("Replicas: `3/3`\nWant me to watch it?", ("Replicas: `3/3`", "Want me to watch it?")),
+            "wrapped before a number": (
+                "The pool is full.\n\nWant me to scale it to\n6 nodes?",
+                ("The pool is full.", "Want me to scale it to 6 nodes?"),
+            ),
+            "wrapped before a code span": (
+                "It restarted. Want me to roll back to\n`v1.2`?",
+                ("It restarted.", "Want me to roll back to `v1.2`?"),
+            ),
+            "wrapped before a capital": ("It is cordoned. Want me to drain\nSeeded-B?", ("It is cordoned.", "Want me to drain Seeded-B?")),
+            "wrapped after approx.": (
+                "The pool is full. Want me to scale to approx.\n6 nodes?",
+                ("The pool is full.", "Want me to scale to approx. 6 nodes?"),
+            ),
             "wrapped after e.g.": (
                 f"{REST}\n\nWant me to scale it, e.g.\nadd two nodes?",
                 (REST, "Want me to scale it, e.g. add two nodes?"),

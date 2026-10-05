@@ -83,11 +83,18 @@ LOSES_CONTENT = re.compile(r"\]\(|https?://|<[@#!]", re.IGNORECASE)
 CODE_MARK = "\x01"
 #: Emphasis markers split_lead may close at the cut, longest first.
 MARKERS = ("**", "__", "*", "_")
-#: A bold label opening the answer ("**Memory check**: ..."): a phrase of more than one word,
-#: closed without a stop and followed by a colon or a dash. It is not a sentence, and the eval's
-#: ``answer_first`` fails it too; a one-word answer ("**No**: ...") is one.
-#: The phrase stops at its own closer, so a later "**cpu**: 40%" on the line is not read as the label.
-BOLD_LABEL = re.compile(r"^(\*\*|__)(?=\S)((?:(?!\1)[^\n])*?\s(?:(?!\1)[^\n])*?)(?<=[^\s.!?])\1[ \t]*[:\u2014\u2013]")
+#: A bold label opening the answer: a phrase of more than one word closed without a stop and
+#: followed by a colon or a dash ("**Memory check**: ..."), or any phrase whose colon or dash sits
+#: inside the bold ("**Memory check:** ..."). It is not a sentence, and the eval's ``answer_first``
+#: fails it too; a one-word answer ("**No**: ...") is one. The phrase stops at its own closer, so
+#: a later "**cpu**: 40%" on the line is not read as the label.
+BOLD_LABEL = re.compile(
+    r"^(\*\*|__)(?=\S)(?:(?:(?!\1)[^\n])*?\s(?:(?!\1)[^\n])*?(?<=[^\s.!?])\1[ \t]*[:\u2014\u2013]"
+    r"|(?:(?!\1)[^\n])*?[:\u2014\u2013][ \t]*\1)"
+)
+#: A ``Label: value`` line of up to three words before the colon: evidence, not a sentence a
+#: question below it continues.
+LABEL_LINE = re.compile(r"^\S+(?: \S+){0,2}:\s+\S")
 #: A quote or a table row: lines the presenter reads as text that are not a prose sentence either.
 NOT_PROSE_LINE = re.compile(r"^\s*[>|]")
 #: Upstream's per-post ``config.extra`` switches the folded post carries as well.
@@ -192,9 +199,17 @@ def trailing_question(rest: str) -> tuple[str, str]:
     """
     lines = rest.rstrip().split("\n")
     first = len(lines) - 1
-    # A soft-wrapped question's next line starts mid-sentence, in lower case: the presenter's
-    # SENTENCE_END rule. Walk back over such lines; an evidence line above the question stays.
-    while first and lines[first - 1].strip() and lines[first].lstrip()[:1].islower():
+    # Walk back over a soft-wrapped question's earlier lines. A line starting in lower case
+    # continues the one above (the presenter's SENTENCE_END rule); any other continues it unless
+    # the line above ends a sentence by the presenter's rules, is a label, or is not prose.
+    while first and lines[first - 1].strip():
+        above, line = lines[first - 1].strip(), lines[first].strip()
+        if not line[:1].islower() and (
+            LABEL_LINE.match(above)
+            or _not_prose(lines[first - 1])
+            or len(above) + 1 in _presenter.sentence_starts(f"{above} {line}")
+        ):
+            break
         first -= 1
     question_lines = lines[first:]
     if not question_lines[-1].endswith("?") or any(_not_prose(line) for line in question_lines):
