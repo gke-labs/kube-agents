@@ -94,9 +94,11 @@ with open("gateway/kanban_watchers_notifier.py", encoding="utf-8") as _notifier_
 GOOGLE_CHAT_ADAPTER = "plugins/platforms/google_chat/adapter.py"
 
 # The `_progress_deliver` arguments, before or after apply_slack_ux_incident.py
-# wraps `adapter`; the Dockerfile re-runs this verifier on the final tree.
+# wraps `adapter` (and apply_slack_ux_answer.py the adapter inside that); the
+# Dockerfile re-runs this verifier on the final tree.
 RUNNER_ARGS = re.compile(
-    r"self\.runner,\s*(?:adapter|_kage_slack_incident\.adapter_for\(adapter\b[^\n]*\)),"
+    r"self\.runner,\s*(?:adapter|_kage_slack_incident\.adapter_for\("
+    r"(?:_kage_slack_answer\.adapter_for\()?adapter\b[^\n]*\)),"
     r"\s*sub, ev\.kind, ev, msg, metadata,"
 )
 

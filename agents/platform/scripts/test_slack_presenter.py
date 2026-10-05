@@ -198,6 +198,13 @@ class SplitAnswerTest(unittest.TestCase):
         self.assertEqual(headline, "Yes, seeded-a is healthy")
         self.assertEqual(body, ["- one\n- two"])
 
+    def test_split_lead_keeps_the_sentence_as_written(self):
+        sentence = "The [pool](https://x) is at `4/4` nodes" + " and busy" * 20 + "."
+        md = sentence + " It needs more.\n\nScale it."
+        lead, body = sp.split_lead(md)
+        self.assertEqual((lead, body), (sentence, ["It needs more.", "Scale it."]))
+        self.assertEqual((sp._clip(sp._plain(lead), sp.HEADLINE_MAX), body), sp.split_answer(md))
+
     def test_empty(self):
         self.assertEqual(sp.split_answer(""), ("", []))
         self.assertEqual(sp.split_answer("   \n\n "), ("", []))

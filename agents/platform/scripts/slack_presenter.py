@@ -9,7 +9,8 @@ gateway. Its callers include the gateway patches for reactions
 (``slack_ux_reactions``, which the kanban notifier also reaches), plan and
 session status (``slack_ux_status``, which reads only :func:`enabled`), moments
 (``slack_ux_moments``, which reads :func:`enabled` and lays out through
-``slack_moments``), incident triage (``slack_ux_incident``), button clicks
+``slack_moments``), incident triage (``slack_ux_incident``), a finished card's
+answer (``slack_ux_answer``, through :func:`split_lead`), button clicks
 (``slack_ux_clicks``) and the harness-message patch (``slack_boilerplate``,
 which reads only :func:`enabled`).
 Every caller reaches it through ``PYTHONPATH=/opt/defaults/scripts``, which the
@@ -20,7 +21,7 @@ Everything a caller changes on screen is gated on :func:`enabled`, the
 take their upstream path unchanged; this module only answers questions.
 
 Layout: :func:`split_answer` takes the headline off an agent's markdown
-answer; link buttons, none for a url :func:`_safe_link_url` refuses, and choice
+answer, and :func:`split_lead` the same first sentence as written; link buttons, none for a url :func:`_safe_link_url` refuses, and choice
 buttons, whose value the caller sets, are built by ``_button`` and wrapped into
 rows by ``_actions``; :func:`fallback_text`
 is the headline, links and choices as plain mrkdwn, for the message's ``text``
@@ -415,6 +416,12 @@ def split_answer(markdown: str) -> tuple[str, list[str]]:
     gives ``("", [])``, and an answer that opens with a code fence has no
     headline: ``("", paragraphs)``.
     """
+    lead, body = split_lead(markdown)
+    return (_clip(_plain(lead), HEADLINE_MAX) if lead else ""), body
+
+
+def split_lead(markdown: str) -> tuple[str, list[str]]:
+    """:func:`split_answer` with the first sentence as it was written: markdown, unclipped."""
     paragraphs = _paragraphs((markdown or "").replace("\x00", ""))
     if not paragraphs:
         return "", []
@@ -435,10 +442,9 @@ def split_answer(markdown: str) -> tuple[str, list[str]]:
     # A period inside a code span does not end the sentence.
     held, spans = _hold_code(LIST_MARKER.sub("", joined))
     sentence, remainder = (_restore_code(part, spans) for part in _first_sentence(held))
-    headline = _clip(_plain(sentence), HEADLINE_MAX)
     tail = "\n".join(part for part in (remainder, more_lines.strip("\n")) if part)
     body = ([tail] if tail.strip() else []) + rest
-    return headline, body
+    return sentence, body
 
 
 # --- blocks ----------------------------------------------------------------
