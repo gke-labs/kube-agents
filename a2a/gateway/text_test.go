@@ -222,6 +222,57 @@ func TestChatChunksAvoidSplittingCodeSpans(t *testing.T) {
 			t.Errorf("case 3: chunk %d exceeds %d bytes: %d", i, discordChunk, len(c))
 		}
 	}
+
+	// Case 4: Recut wiring when a fence is open. A fence opener starting at
+	// byte 949 has 949 < budget/2 (1900/2 = 950), so the initial cut at 1900
+	// does not move back. The open fence triggers a recut with budget 1896
+	// (budget - len(fenceClose)). Since 949 >= 1896/2 (948), the recut
+	// adjustment moves the cut back to 949, preventing the chunk from ending
+	// with a closing fence. Sabotaging the recut adjustment leaves chunk 1 at
+	// length 1900 (1896 + len(fenceClose)) instead of 949.
+	in4 := strings.Repeat("a", 949) + "```" + strings.Repeat("b", 1000)
+	chunks4 := chatChunks(in4, discordChunk)
+	if len(chunks4) < 2 {
+		t.Fatalf("case 4: got %d chunks, want >= 2", len(chunks4))
+	}
+	if len(chunks4[0]) != 949 {
+		t.Errorf("case 4: chunk 1 len = %d, want 949", len(chunks4[0]))
+	}
+}
+
+// TestChatChunksContinuationAfterFencedBlock verifies that when a fenced code
+// block is cut across chunks, the continuation chunk scans candidate code spans
+// with the reopen prefix in place so that the block's closing fence is not
+// inverted into a phantom opener that drags subsequent prose cuts back or emits
+// empty code blocks in later chunks (#2288).
+func TestChatChunksContinuationAfterFencedBlock(t *testing.T) {
+	// A 400-line fenced block whose remaining lines in chunk 2 close at offset
+	// 1711 (in the second half of budget 1897), followed by 150 lines of prose.
+	in := "```\n" + strings.Repeat("log line\n", 400) + "```\n" + strings.Repeat("prose line with **bold** and <https://a.example|link>\n", 150)
+	chunks := chatChunks(in, discordChunk)
+	if len(chunks) < 3 {
+		t.Fatalf("got %d chunks, want >= 3", len(chunks))
+	}
+	for i, c := range chunks {
+		if len(c) > discordChunk {
+			t.Errorf("chunk %d exceeds %d bytes: %d", i, discordChunk, len(c))
+		}
+		if strings.HasPrefix(c, "```\n```\n") {
+			t.Errorf("chunk %d opens with empty fence block: %q", i, c[:min(len(c), 30)])
+		}
+	}
+	// Verify that prose after the block converts markdown properly
+	gchat := toGchatText(chunks[len(chunks)-1])
+	if !strings.Contains(gchat, "*bold*") || strings.Contains(gchat, "**bold**") {
+		t.Errorf("toGchatText left bold unconverted in prose: %q", gchat)
+	}
+	if strings.Contains(gchat, "<https://a.example|") {
+		t.Errorf("toGchatText left link undefanged in prose: %q", gchat)
+	}
+	// Verify round trip unchunking
+	if got := unchunk(t, "continuation after fence", chunks, in); got != in {
+		t.Errorf("unchunked text does not match original")
+	}
 }
 
 // TestChatChunksUnchangedOutsideFences: text with no fence open at the cut

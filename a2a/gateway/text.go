@@ -268,11 +268,11 @@ func chatChunks(text string, size int) []string {
 			return append(chunks, reopen+text)
 		}
 		cut := chunkCut(text, budget)
-		cut = adjustCutToCodeSpanStart(text, cut, budget)
+		cut = adjustCutToCodeSpanStart(reopen, text, cut, budget)
 		open := fenceOpenAtEnd(reopen + text[:cut])
 		if open {
 			cut = chunkCut(text, budget-len(fenceClose))
-			cut = adjustCutToCodeSpanStart(text, cut, budget-len(fenceClose))
+			cut = adjustCutToCodeSpanStart(reopen, text, cut, budget-len(fenceClose))
 			open = fenceOpenAtEnd(reopen + text[:cut])
 		}
 		chunk := reopen + text[:cut]
@@ -324,14 +324,31 @@ func chunkCut(text string, size int) int {
 }
 
 // adjustCutToCodeSpanStart moves cut back to the start of any code span
-// found by mdCodeSpanRE in text that contains cut, provided that start lies
-// in the second half of the budget (the same rule chunkCut applies to line
-// breaks); otherwise cut is returned unchanged.
-func adjustCutToCodeSpanStart(text string, cut, budget int) int {
-	for _, span := range mdCodeSpanRE.FindAllStringIndex(text, -1) {
-		if span[0] < cut && cut < span[1] {
-			if span[0] >= budget/2 {
-				return span[0]
+// found by mdCodeSpanRE in (reopen+text) that contains cut (relative to text),
+// provided that start lies in the second half of the budget (the same rule
+// chunkCut applies to line breaks); otherwise cut is returned unchanged.
+// The scan is bounded to the prefix of text that can affect this cut, keeping
+// chunking linear in message size.
+func adjustCutToCodeSpanStart(reopen, text string, cut, budget int) int {
+	textLimit := cut + budget
+	if textLimit > len(text) {
+		textLimit = len(text)
+	} else {
+		for textLimit < len(text) && !utf8.RuneStart(text[textLimit]) {
+			textLimit++
+		}
+	}
+	candidate := reopen + text[:textLimit]
+	cutInCand := len(reopen) + cut
+
+	for _, span := range mdCodeSpanRE.FindAllStringIndex(candidate, -1) {
+		if span[0] >= cutInCand {
+			break
+		}
+		if span[0] < cutInCand && cutInCand < span[1] {
+			spanStartInText := span[0] - len(reopen)
+			if spanStartInText >= budget/2 {
+				return spanStartInText
 			}
 			break
 		}
