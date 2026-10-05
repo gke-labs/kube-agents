@@ -1625,7 +1625,9 @@ class KubeAgentsHarness(AgentHarness):
 
         The answer goes on the wake's conversation, or on a new one for a
         ``session: fresh`` replay (:meth:`_execute_fresh_answer`); for an
-        ``answer_by: click`` replay it is the click's turn the plant built.
+        ``answer_by: click`` replay it is the click's turn the plant built. A
+        wake turn that replied with parse warnings still gets its answer; only
+        one that errored with no reply (:func:`card_wake.no_reply`) ends the run.
 
         See :mod:`kube_agents_bench.card_wake`. No agent sees anything when the
         plant fails: a script that never ran to completion is infrastructure,
@@ -1650,9 +1652,9 @@ class KubeAgentsHarness(AgentHarness):
         answer_turn = None
         try:
             wake_turn = self._execute(planted.wake, workspace_path)
-            if not wake_turn.errors and not failure and replay.fresh:
+            if not card_wake.no_reply(wake_turn) and not failure and replay.fresh:
                 answer_turn = self._execute_fresh_answer(replay, planted, wake_turn, workspace_path)
-            elif not wake_turn.errors and not failure:
+            elif not card_wake.no_reply(wake_turn) and not failure:
                 answer_turn = self._execute(planted.answer(replay), workspace_path)
         finally:
             _PINNED_RUN_ID.reset(pinned)

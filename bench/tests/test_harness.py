@@ -3284,6 +3284,20 @@ def test_a_question_wake_archives_its_card_when_the_wake_turn_errors(
     assert "question_wake" in result.metadata and "failure_wake" not in result.metadata
 
 
+def test_a_wake_turn_that_replied_with_a_parse_warning_still_gets_its_answer(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    stub_agent.turns = [_turn("junk", _text("[SILENT]")), _answer_turn()]  # type: ignore[arg-type]
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert [r["input"] for r in stub_agent.requests] == [_REPLAY_WAKE, "seeded-b"]
+    assert result.output == "[SILENT]"
+    assert result.trajectory[-1]["args"]["answer_reply"] == "Passed seeded-b to the card."
+
+
 def test_a_question_wake_missing_its_answer_errors_without_planting(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
 ) -> None:

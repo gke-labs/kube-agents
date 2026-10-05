@@ -822,7 +822,7 @@ def _settled_entry(planted: Planted, settled: Settled | None, answer_reply: str 
     }
 
 
-def _no_reply(turn: AgentResult) -> bool:
+def no_reply(turn: AgentResult) -> bool:
     """Whether ``turn`` errored with nothing parsed, as ``AgentResult.errored`` builds one:
     its ``output`` is the error, not a reply. A parsed turn always carries ``final_message``,
     so its warnings leave its reply."""
@@ -871,7 +871,7 @@ def merge(
         trajectory=[
             *wake.trajectory,
             *answer.trajectory,
-            _settled_entry(planted, settled, None if _no_reply(answer) else answer_reply),
+            _settled_entry(planted, settled, None if no_reply(answer) else answer_reply),
         ],
         tokens=tokens,
         errors=[*wake.errors, *answer.errors],
