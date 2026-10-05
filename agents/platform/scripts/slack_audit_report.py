@@ -626,7 +626,7 @@ def _row(finding: Finding) -> dict:
 
 
 def _card(parsed: AuditReport) -> Card:
-    """The card: its headline counts the most severe findings present, listing up to
+    """The card: its headline counts the most severe level the body lists, listing up to
     :data:`CRITICAL_ROWS_MAX` when they are critical and the top two otherwise; a line counts
     the rest by severity."""
     totals = parsed.totals

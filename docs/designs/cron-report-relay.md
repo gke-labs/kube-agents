@@ -83,9 +83,9 @@ summary line for the other severities (the findings its sections list when it ha
 themselves, and the Scope section's skipped clusters. Held rows are not findings,
 a `#` line inside a finding's fenced evidence ends no section, and a finding title,
 a skipped cluster or the audit name keeps a link's text but not its target. It
-carries one number, the count of the most severe findings present ("<Name>: 2
+carries one number, the count of the most severe findings a section lists ("<Name>: 2
 critical findings", the name as the title writes it), and lists the critical
-findings (up to ten), or the top two of the highest severity present when there is none, each
+findings (up to ten), or the top two of the highest severity listed when there is none, each
 row led by its severity and ending "· _new_" when fleet-audit marked the finding
 new since the last run (a `<!-- finding-new -->` line under its heading, written
 only when the run knows what the last one carried). Under the rows, a line counts
