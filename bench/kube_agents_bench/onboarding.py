@@ -159,11 +159,16 @@ RAW_READ = "__ONBOARDING_RAW_BLOCK__"
 MAX_PARSER_ERRORS = 5
 
 # bootstrap_scan_gate.py: PRIORITIZE_IDEMPOTENCY_KEY and SCAN_ASSIGNEE, and the
-# word every ranking card title the SOP prescribes carries.
+# word the ranking card title bootstrap_handoff.py files carries.
 PRIORITIZE_KEY = "bootstrap-inventory-prioritize"
 PRIORITIZE_ASSIGNEE = "platform"
 PRIORITIZE_TITLE_WORD = "Prioritize"
 HANDOFF_READ = "__ONBOARDING_HANDOFF_BOARD__"
+# Where the agent pod keeps bootstrap_handoff.py. The board read asks the
+# writer's own finding_lines which clusters it lists, so the check cannot
+# disagree with the writer about which findings belong in the block.
+HANDOFF_MODULE_DIR = f"{DATA_ROOT}/scripts"
+HANDOFF_MODULE = "bootstrap_handoff"
 
 # Runs in the sandbox. Parses the raw report with the sandbox's own parser and
 # prints the items' (cluster, check, object), or the parser's Failure code and
@@ -207,7 +212,7 @@ print(json.dumps(out))
 # the key, so a fail can say the card was filed unkeyed.
 _HANDOFF_SCRIPT = """
 import json, os, sqlite3, sys
-root, board, sentinel, marker, prefix, key, assignee, word = sys.argv[1:9]
+root, board, sentinel, marker, prefix, key, assignee, word, module_dir, module = sys.argv[1:11]
 SQLITE_BUSY_TIMEOUT = 10
 out = {"sweep": None, "clusters": [], "keyed": [], "unkeyed": [], "error": None}
 
@@ -219,6 +224,11 @@ def done(error=None):
     sys.exit(0)
 
 
+try:
+    sys.path.insert(0, module_dir)
+    writer = __import__(module)
+except Exception as exc:
+    done("the hand-off module %s cannot be imported from %s: %s" % (module, module_dir, exc))
 try:
     with open(os.path.join(root, marker)) as fh:
         ids = [line.strip()[len("task_id="):] for line in fh if line.startswith("task_id=")]
@@ -237,7 +247,7 @@ try:
         "SELECT id, status FROM tasks WHERE substr(idempotency_key, 1, ?) = ? AND created_at >= ? ORDER BY created_at, id",
         (len(prefix), prefix, since)).fetchall()
     for tid, status in cards:
-        card = {"id": tid, "status": status, "cluster": None, "findings": None, "metadata": "none"}
+        card = {"id": tid, "status": status, "listed": [], "metadata": "none"}
         if status == "done":
             run = conn.execute(
                 "SELECT metadata FROM task_runs WHERE task_id = ? AND outcome = 'completed' ORDER BY id DESC LIMIT 1",
@@ -249,12 +259,7 @@ try:
                 card["metadata"] = "invalid"
             if isinstance(meta, dict):
                 card["metadata"] = "present"
-                cluster = meta.get("cluster")
-                card["cluster"] = cluster if isinstance(cluster, str) and cluster else None
-                project = meta.get("project")
-                card["project"] = project if isinstance(project, str) and project else None
-                findings = meta.get("findings")
-                card["findings"] = len(findings) if isinstance(findings, list) else None
+                card["listed"] = sorted({line["cluster"] for line in writer.finding_lines(meta)})
         out["clusters"].append(card)
     out["keyed"] = [
         {"id": tid, "status": status}
@@ -459,6 +464,8 @@ def handoff_command() -> str:
             PRIORITIZE_KEY,
             PRIORITIZE_ASSIGNEE,
             PRIORITIZE_TITLE_WORD,
+            HANDOFF_MODULE_DIR,
+            HANDOFF_MODULE,
         ]
     )
     return (

@@ -44,7 +44,6 @@ PRIORITIZE_INSTRUCTIONS_PATHS = (
 PRIORITIZE_TITLE = "Prioritize the onboarding inventory report"
 
 HANDOFF_MARKER = ".bootstrap_handoff_filed"
-ABSENT, OURS, FOREIGN = "absent", "ours", "foreign"
 BOARD_FILE = "kanban.db"
 SQLITE_BUSY_TIMEOUT_SECONDS = 10
 
@@ -54,7 +53,11 @@ BLOCKED = "blocked"
 # Hermes routes a card blocked twice for one cause to triage, which waits for a
 # person; for the hand-off it has given what it will.
 TRIAGE = "triage"
-SETTLED = (DONE, BLOCKED, TRIAGE)
+# Hermes's other terminal statuses (kanban_workspace_gc.py): a card a person
+# cancelled or one that failed outright will not report either.
+FAILED = "failed"
+CANCELLED = "cancelled"
+SETTLED = (DONE, BLOCKED, TRIAGE, FAILED, CANCELLED)
 ARCHIVED = "archived"
 # How long after the sweep was filed the hand-off stops waiting for unsettled
 # cards and writes what it has, naming the rest as gaps. Seven clusters on two
@@ -72,9 +75,6 @@ SANDBOX_TIMEOUT_SECONDS = 30
 REMOTE_SH = "/bin/sh"
 REMOTE_WRITE = 'umask 022 && /bin/cat > "$1.tmp" && /bin/mv -f -- "$1.tmp" "$1"'
 TMP_SUFFIX = ".tmp"
-# A raw file at most this large is read back to tell whose it is; only its
-# header line is needed.
-RAW_HEADER_BYTES = 4096
 
 # What the findings block's provider_managed means: an object the platform
 # provider runs, which the ranking stage scores apart from the user's own.
@@ -215,10 +215,8 @@ def _list(value) -> list:
 
 def _slug(text: str) -> str:
     words = re.findall(r"[a-z0-9]+", text.lower())
-    if not words:
-        return DEFAULT_CHECK
-    digest = hashlib.sha1(" ".join(words).encode()).hexdigest()[:CHECK_DIGEST_CHARS]
-    return "-".join(words[:CHECK_SLUG_WORDS] + [digest])
+    digest = hashlib.sha1(" ".join(text.lower().split()).encode()).hexdigest()[:CHECK_DIGEST_CHARS]
+    return "-".join((words[:CHECK_SLUG_WORDS] or [DEFAULT_CHECK]) + [digest])
 
 
 def _provider_managed(namespace: str) -> bool:
@@ -340,6 +338,12 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
     for meta, card_id in audits:
         for gap in _gap_list(meta):
             gaps.append(f"{_cell(meta.get('cluster'))} ({card_id}): {_cell(gap)}")
+        dropped = len(_list(meta.get("findings"))) - len(finding_lines(meta))
+        if dropped:
+            gaps.append(
+                f"{_cell(meta.get('cluster'))} ({card_id}): {dropped} reported finding(s) had no `issue` "
+                "or `title` to list, so they are not in the plan or the findings block"
+            )
     for gap in _gap_list(sweep["metadata"]):
         gaps.append(f"sweep {sweep['id']}: {_cell(gap)}")
     if sweep["status"] == BLOCKED:
@@ -373,7 +377,7 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
         "",
         (
             f"First-time environment scan, compiled at {stamp} from the per-cluster audit cards of "
-            f"{_sweep_tag(sweep['id'])}. This is the complete findings set; the delivered report is ranked from it."
+            f"sweep `{sweep['id']}`. This is the complete findings set; the delivered report is ranked from it."
         ),
         "",
         "## Coverage",
@@ -533,29 +537,6 @@ def _record(marker: Path, sweep_id: str, task_id: str, now: float) -> None:
     marker.write_text(f"sweep={sweep_id}\ntask_id={task_id}\nfiled_at={int(now)}\n", encoding="utf-8")
 
 
-def raw_owner(data_dir: Path, sweep_id: str) -> str | None:
-    """Whose raw file is in place: ABSENT, OURS (this sweep's hand-off wrote it
-    on an earlier tick that did not finish), FOREIGN, or None when it cannot be
-    read, which retries on the next tick."""
-    try:
-        sx = _sandbox()
-        if sx.sandbox_enabled():
-            data = sx.read_bytes(RAW_PATH, max_bytes=RAW_HEADER_BYTES, timeout=SANDBOX_TIMEOUT_SECONDS)
-        else:
-            path = data_dir / Path(RAW_PATH).name
-            data = path.read_bytes()[:RAW_HEADER_BYTES] if path.exists() else None
-    except Exception as e:  # noqa: BLE001 - retry next tick
-        _log(f"cannot read {RAW_PATH}: {e}")
-        return None
-    if data is None:
-        return ABSENT
-    return OURS if _sweep_tag(sweep_id).encode() in data else FOREIGN
-
-
-def _sweep_tag(sweep_id: str) -> str:
-    return f"sweep `{sweep_id}`"
-
-
 def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, now: float | None = None) -> str | None:
     """Advance the hand-off one tick. Returns the ranking card id once filed."""
     now = time.time() if now is None else now
@@ -587,15 +568,7 @@ def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, now: float | None
     timed_out = not settled(state) and now - filed_at >= deadline(state)
     if not settled(state) and not timed_out:
         return None
-    owner = raw_owner(data_dir, sweep_id)
-    if owner is None:
-        return None
-    if owner == FOREIGN:
-        # An earlier shape of the sweep wrote the raw file itself; an install
-        # upgraded mid-onboarding keeps that file rather than one rebuilt from
-        # metadata the old sweep never wrote, and still gets it ranked.
-        _log(f"{RAW_PATH} was written before this hand-off; keeping it for sweep {sweep_id}")
-    elif not write_raw(data_dir, compose(state, timed_out, now)):
+    if not write_raw(data_dir, compose(state, timed_out, now)):
         return None
     task_id = file_prioritize(parse_task_id)
     if not task_id:

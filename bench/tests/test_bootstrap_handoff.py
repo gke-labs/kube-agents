@@ -121,6 +121,7 @@ def install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(onboarding, "FALLBACK_PYTHON", sys.executable)
     monkeypatch.setattr(onboarding, "RAW_FILE", str(raw))
     monkeypatch.setattr(onboarding, "PARSER_DIR", str(PARSER_DIR))
+    monkeypatch.setattr(onboarding, "HANDOFF_MODULE_DIR", str(REPO / "agents" / "chat" / "scripts"))
     monkeypatch.setattr(onboarding, "SANDBOX_PYTHON", sys.executable)
     monkeypatch.setattr(onboarding, "agent_shell", _local_shell)
     monkeypatch.setattr(onboarding, "sandbox_shell", _local_shell)
@@ -264,6 +265,24 @@ def test_a_previous_sweeps_cluster_card_is_not_required(install) -> None:
     seeded_c = next(c for c in cards if "seeded-c" in c["assignee"])
     seeded_c["created_at"] = SWEEP_AT - 1
     install(RAW_WITHOUT_BLOCK + _block(METADATA, skip=("seeded-c",)), cards=cards)
+    assert _verify("raw_report_has_findings_block").status == "pass"
+
+
+def test_a_writer_the_agent_pod_cannot_import_is_an_error(install, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(onboarding, "HANDOFF_MODULE_DIR", str(tmp_path / "no-scripts"))
+    install(RAW_WITHOUT_BLOCK + _block(METADATA))
+    result = _verify("raw_report_has_findings_block")
+    assert result.status == "error", result.reason
+    assert "bootstrap_handoff cannot be imported" in result.reason
+
+
+def test_a_finding_the_writer_does_not_list_needs_no_line(install) -> None:
+    # A finding with no issue or title is a gap line in the raw file, not a block line.
+    runs = [
+        (tid, "completed", dict(meta, findings=[{"namespace": "ns", "description": "no title"}]) if meta["cluster"] == "seeded-c" else meta)
+        for tid, meta in METADATA.items()
+    ]
+    install(RAW_WITHOUT_BLOCK + _block(METADATA, skip=("seeded-c",)), runs=runs)
     assert _verify("raw_report_has_findings_block").status == "pass"
 
 

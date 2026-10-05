@@ -2,8 +2,9 @@
 
 Run: python3 -m unittest agents/chat/scripts/test_bootstrap_handoff.py
 
-The cluster metadata in testdata/bootstrap_handoff/ is what seven Cluster
-Agents returned on a live install, trimmed and with the project id replaced, so
+The cluster metadata in testdata/bootstrap_handoff/ is what four of the
+Cluster Agents on a live install returned, trimmed and with the project id
+replaced, so
 the findings carry the shapes the agents really produce: no `workload` field,
 `namespace: multiple`, several workloads named in one `issue`. The raw file is
 checked with the ranking stage's own parser, inventory_findings.parse_block,
@@ -213,6 +214,25 @@ class ComposeTest(unittest.TestCase):
         text = h.compose(self._state(_all_done(), {"fleet": fleet}), timed_out=False, now=NOW)
         self.assertIn("seeded-a (example-project): cluster status ERROR", text)
 
+    def test_a_finding_without_text_is_a_named_gap(self):
+        meta = {"project": "p", "cluster": "c", "findings": [
+            {"namespace": "ns", "workload": "api", "issue": "no probes"},
+            {"namespace": "buildkit", "workload": "gke0", "description": "runs privileged"}]}
+        text = h.compose(self._state([("t_txt", "done", meta, "")]), timed_out=False, now=NOW)
+        self.assertIn("c (t_txt): 1 reported finding(s) had no `issue` or `title`", text)
+        self.assertEqual(len(inventory_findings.parse_block(text)), 1)
+
+    def test_titles_with_no_ascii_words_keep_separate_checks(self):
+        meta = {"project": "p", "cluster": "c", "findings": [
+            {"namespace": "ns", "workload": "api", "area": "security", "issue": "\u0431\u0435\u0437 \u043f\u0440\u043e\u0431"},
+            {"namespace": "ns", "workload": "api", "area": "security", "issue": "\u0440\u0430\u0431\u043e\u0442\u0430\u0435\u0442 \u043e\u0442 root"}]}
+        checks = [line["check"] for line in h.finding_lines(meta)]
+        self.assertEqual(len(set(checks)), 2)
+
+    def test_a_cancelled_or_failed_card_counts_as_settled(self):
+        clusters = _all_done() + [("t_c", "cancelled", None, ""), ("t_f", "failed", None, "")]
+        self.assertTrue(h.settled(self._state(clusters)))
+
     def test_no_findings_still_writes_an_empty_block(self):
         clusters = [("t_5ca49c4e", "done", _metadata()["t_5ca49c4e"], "")]
         text = h.compose(self._state(clusters), timed_out=False, now=NOW)
@@ -230,8 +250,7 @@ class HandOffTest(unittest.TestCase):
         self.scan_marker.write_text(f"task_id={SWEEP}\nfiled_at={NOW - 60}\n")
         self.filed = []
         self.sandbox = types.SimpleNamespace(
-            sandbox_enabled=lambda: False, TERMINAL_PRINCIPAL="agent", run=None,
-            read_bytes=lambda path, **kw: None)
+            sandbox_enabled=lambda: False, TERMINAL_PRINCIPAL="agent", run=None)
         patches = [
             mock.patch.object(h, "_board_path", lambda _d: self.board),
             mock.patch.object(h, "_sandbox", lambda: self.sandbox),
@@ -305,11 +324,11 @@ class HandOffTest(unittest.TestCase):
         self.assertIsNone(self._run(now=NOW + 10 * h.DEADLINE_SECONDS))
         self.assertEqual(self.filed, [])
 
-    def test_a_raw_file_from_an_older_sweep_shape_is_kept_and_ranked(self):
+    def test_a_raw_file_already_in_place_is_rebuilt_from_the_cards(self):
         _board(self.board, clusters=_all_done())
-        (self.d / "INVENTORY.raw.md").write_text("# report the old sweep typed\n")
+        (self.d / "INVENTORY.raw.md").write_text("# report a model typed, no findings block\n")
         self.assertEqual(self._run(), "t_rank1")
-        self.assertEqual((self.d / "INVENTORY.raw.md").read_text(), "# report the old sweep typed\n")
+        inventory_findings.parse_block((self.d / "INVENTORY.raw.md").read_text())
 
     def test_a_marker_without_filed_at_times_out_from_its_own_timestamp(self):
         _board(self.board, clusters=_all_done() + [("t_stuck", "ready", None, "")])
@@ -338,11 +357,6 @@ class HandOffTest(unittest.TestCase):
         argv = shlex.split(sent[0])
         self.assertEqual(argv[argv.index("--idempotency-key") + 1], h.PRIORITIZE_KEY)
         self.assertEqual(argv[argv.index("--assignee") + 1], h.ASSIGNEE)
-
-    def test_its_own_half_written_hand_off_is_finished(self):
-        _board(self.board, clusters=_all_done())
-        (self.d / "INVENTORY.raw.md").write_text(f"compiled from {h._sweep_tag(SWEEP)}\n")
-        self.assertEqual(self._run(), "t_rank1")
 
     def test_an_archived_sweep_is_left_alone_even_past_the_deadline(self):
         _board(self.board, sweep_status="archived", clusters=_all_done())

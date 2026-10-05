@@ -23,13 +23,14 @@ reach the report is deferred rather than discarded.
 
 1. If `/opt/data/INVENTORY.md` already exists, the report has already been written. Return strictly
    `[SILENT]` immediately and do nothing.
-2. If `/opt/data/INVENTORY.raw.md` is absent **or empty**, the sweep has not finished or has failed.
+2. If `/opt/data/INVENTORY.raw.md` is absent **or empty**, the hand-off that writes it has not run or
+   has failed.
    Do **not** run discovery yourself, do **not** go looking for the findings elsewhere, do **not**
    register anything, and do **not** write a report. Block the card with `kanban_block` saying
    whether the file was missing or empty, and stop.
 
-   An empty findings file is not the same as a clean cluster. A clean cluster still produces a
-   header and a `scanned=…` summary; zero bytes means the sweep did not write anything, and a report
+   An empty findings file is not the same as a clean cluster. A clean fleet still produces the
+   hand-off's tables and an empty findings block; zero bytes means nothing wrote the file, and a report
    generated from it would be invented. This has been observed: given a zero-byte file, this stage
    made 51 tool calls hunting for the findings and then wrote a 554-byte report describing a cluster
    it had never read.

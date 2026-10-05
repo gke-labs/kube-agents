@@ -385,7 +385,7 @@ resource "null_resource" "ranking" {
           echo "ERROR: onboarding already delivered on ${var.host_cluster_name} (${local.home}/.bootstrap_completed). Clearing the INVENTORY files would delete the report that was delivered." >&2
           exit 1 ;;
         unfiled)
-          echo "ERROR: the onboarding gate on ${var.host_cluster_name} has not filed its discovery sweep (no ${local.home}/.bootstrap_scan_filed). A sweep filed during this case writes its own INVENTORY.raw.md over the planted one; wait for the gate to file, or run the case elsewhere." >&2
+          echo "ERROR: the onboarding gate on ${var.host_cluster_name} has not filed its discovery sweep (no ${local.home}/.bootstrap_scan_filed). A sweep filed during this case writes its own INVENTORY.raw.md over the planted one once its cards settle, and files a ranking card of its own; wait for the gate to file, or run the case elsewhere." >&2
           exit 1 ;;
         nojobs)
           echo "ERROR: ${local.scan_job} or ${local.delivery_job} is not in the cron store on ${var.host_cluster_name}, so nothing would deliver the report this case grades." >&2

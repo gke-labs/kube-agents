@@ -372,8 +372,9 @@ resource "null_resource" "sweep" {
 
       # ---- 4 (wait_for = "handoff"). Wait for the hand-off to ranking ------
       # Settled is the sweep and every Cluster Agent card filed at or after it
-      # done, blocked or archived, with at least one such card or a sweep
-      # that completed (a blocked sweep with no card can still file them).
+      # in a status nothing more comes from (done, blocked, triage, failed,
+      # cancelled, archived), with at least one such card or a sweep that
+      # completed (a blocked sweep with no card can still file them).
       # The ranking card is not settled-gated: once it exists the hand-off has
       # happened. A failed read leaves the last state standing, as in the
       # fan-out wait below.
@@ -390,7 +391,7 @@ resource "null_resource" "sweep" {
           (key, since)).fetchone()[0]
       cards = [s for (s,) in c.execute(
           "SELECT status FROM tasks WHERE idempotency_key LIKE ? AND created_at >= ?", (cluster_like, since))]
-      ended = ("done", "blocked", "triage", "archived")
+      ended = ("done", "blocked", "triage", "failed", "cancelled", "archived")
       settled = status in ended and all(s in ended for s in cards) and (bool(cards) or status != "blocked")
       print(started, int(keyed > 0), int(settled))
       PY

@@ -3160,13 +3160,12 @@ class BootstrapHandoffVerifier(_OnboardingPollVerifier):
             )
         items = read["items"]
         covered = {i.get("cluster") for i in items}
-        # The hand-off lists findings only for a card that named its project and
-        # cluster; one that did not is a gap line there, not a missing block line.
-        with_findings = [
-            c for c in board.get("clusters") or []
-            if c.get("cluster") and c.get("project") and (c.get("findings") or 0) > 0
-        ]
-        missing = sorted({c["cluster"] for c in with_findings} - covered)
+        # Which clusters the writer lists comes from the writer itself
+        # (bootstrap_handoff.finding_lines, run on the agent pod by the board
+        # read), so a card it deliberately leaves to the Gaps section is not
+        # demanded here.
+        expected = {cluster for c in board.get("clusters") or [] for cluster in c.get("listed") or []}
+        missing = sorted(expected - covered)
         if missing:
             return (
                 "fail",
@@ -3180,7 +3179,7 @@ class BootstrapHandoffVerifier(_OnboardingPollVerifier):
             "pass",
             (
                 f"{where}: {raw_file} has {len(items)} block line(s) covering all "
-                f"{len({c['cluster'] for c in with_findings})} cluster(s) whose cards completed with findings"
+                f"{len(expected)} cluster(s) whose cards completed with findings"
             ),
             raw,
         )
