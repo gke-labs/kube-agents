@@ -427,11 +427,13 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual([rec for _label, _reply, rec in triage["choices"]], [False, True])
 
     def test_a_title_ending_in_the_suffix_clicks_through_to_its_apply_reply(self):
-        report = REPORT.replace("(Roll back to 14:02)", "(Roll back (recommended))")
-        label, reply, recommended = runtime.parse_triage(report)["choices"][0]
-        self.assertEqual((label, reply, recommended), ("Roll back", "apply Option A: Roll back", False))
-        picked = label.removesuffix(clicks.INCIDENT_RECOMMENDED_SUFFIX)
-        self.assertEqual(clicks._incident_turn(picked, reply), reply)
+        for title in ("Roll back (recommended)", "Roll back (recommended) (recommended)"):
+            with self.subTest(title=title):
+                report = REPORT.replace("(Roll back to 14:02)", f"({title})")
+                label, reply, recommended = runtime.parse_triage(report)["choices"][0]
+                self.assertEqual((label, reply, recommended), ("Roll back", "apply Option A: Roll back", False))
+                picked = label.removesuffix(clicks.INCIDENT_RECOMMENDED_SUFFIX)
+                self.assertEqual(clicks._incident_turn(picked, reply), reply)
 
     def test_a_stray_heading_between_options_still_shows_every_option(self):
         for cut in ("# undo it with kubectl rollout undo\n", "````\n```\n# undo\n```\n````\n"):

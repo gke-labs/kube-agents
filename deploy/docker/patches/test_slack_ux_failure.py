@@ -209,7 +209,23 @@ class PresentTest(unittest.TestCase):
                 self.assertEqual(runtime.present(reply)[1], "check it there")
 
     def test_a_question_that_carries_on_the_line_above_offers_nothing(self):
-        self.assertEqual(runtime.present("It stopped. Should I check it\nthere?")[1], "")
+        for reply in ("It stopped. Should I check it\nthere?", "It stopped.\n- seeded-a\n  Should I retry?"):
+            with self.subTest(reply=reply):
+                self.assertEqual(runtime.present(reply)[1], "")
+
+    def test_a_lead_wrapped_onto_an_acronym_or_i_is_bolded_whole(self):
+        for reply, want in {
+            "I couldn't reach the\nAPI server. Should I retry?": "**I couldn't reach the**\n**API server.** Should I retry?",
+            "The pod is gone, so\nI stopped. Retry?": "**The pod is gone, so**\n**I stopped.** Retry?",
+        }.items():
+            with self.subTest(reply=reply):
+                self.assertEqual(runtime.present(reply)[0], want)
+
+    def test_a_nul_in_the_reply_is_not_read_as_a_code_span(self):
+        self.assertEqual(
+            runtime.present("I couldn't find `a.b` or \x000\x00 it. Retry?"),
+            ("**I couldn't find** `a.b` **or 0 it.** Retry?", "retry"),
+        )
 
     def test_a_code_span_is_read_as_the_presenter_reads_it(self):
         for reply, want in {

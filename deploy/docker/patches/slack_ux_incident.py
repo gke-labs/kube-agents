@@ -195,7 +195,8 @@ def _option_choice(letter: str, title: str, recommended: bool) -> tuple[str, str
     A title's own trailing suffix is dropped: a click strips the suffix from any
     incident label, and could not tell that one from the one added here.
     """
-    title = title.removesuffix(RECOMMENDED_SUFFIX)
+    while title.endswith(RECOMMENDED_SUFFIX):
+        title = title.removesuffix(RECOMMENDED_SUFFIX)
     label = OPTION_LABEL.format(title=title)
     if recommended:
         label = _presenter._clip(label, _presenter.BUTTON_TEXT_MAX - len(RECOMMENDED_SUFFIX)) + RECOMMENDED_SUFFIX

@@ -115,8 +115,9 @@ CURLY_APOSTROPHE = "\u2019"
 EITHER_OR = re.compile(r"\bor\b", re.IGNORECASE)
 #: How a sentence ends, so a soft-wrapped lead is not joined past its end.
 SENTENCE_ENDS = (".", "!", "?")
-#: A first word the button may lower: capitalised only for starting the
-#: sentence, so not "I", "I'll", or an acronym.
+#: A first word capitalised only for starting the sentence, so not "I", "I'll",
+#: or an acronym: the button may lower it, and a line opening on one is not a
+#: wrapped lead's continuation.
 LOWERABLE = re.compile(r"^(?!I(?:'|$))[A-Z](?:[a-z]|$)")
 
 #: Slack's cap on a message's blocks; a reply already at it keeps its question as text.
@@ -290,19 +291,21 @@ def present(content: str) -> tuple[str, str]:
     """``(content with its first sentence in bold, offer label or "")``.
 
     A first sentence soft-wrapped onto the next lines is bolded line by line,
-    since Slack shows each line as written; a line that opens on a capital, a
-    list item, heading or fence does not continue it. A code span in it, found
+    since Slack shows each line as written; a line opening on a word that is
+    capitalised only to start a sentence ("Pod:", not "API"), a list item,
+    heading or fence does not continue it. A code span in it, found
     as ``slack_presenter`` finds one, stays code, with the words on either side
     bolded and the span not (``**Couldn't find** `seeded-z`.``). The bold is
     left off when the first line opens with other markup, a heading or a list
     marker, or the first sentence holds markup outside its code spans, since a
     ``*`` inside would unpair. The offer is the last sentence when it is one
     yes/no question with no markup, not on a list item or heading line nor
-    carrying on the line above, that fits a button, with the ``?`` dropped and
+    indented or carrying on the line above, that fits a button, with the ``?`` dropped and
     its first letter lowered unless that would change a word that is
     capitalised anyway ("I", "OK", "API").
     """
-    text = content or ""
+    # The presenter's code-span placeholders are NULs; a NUL of the reply's own would be read as one.
+    text = (content or "").replace("\x00", "")
     lead = text.lstrip()
     indent = text[: len(text) - len(lead)]
     lines = lead.split("\n")
@@ -329,7 +332,8 @@ def present(content: str) -> tuple[str, str]:
     *above, last = text.rstrip().rsplit("\n", 2)[-2:]
     if _presenter.LIST_MARKER.match(last) or _presenter.HEADING.match(last):
         return bolded, ""
-    if above and text[: match.start(1)].rstrip(" \t").endswith("\n") and _wraps(above[0], last):
+    own_line = text[: match.start(1)].rstrip(" \t").endswith("\n")
+    if own_line and (last[:1].isspace() or _wraps(above[0], last)):
         return bolded, ""
     word = question.split()[0]
     if (
@@ -381,7 +385,7 @@ def _wraps(above: str, line: str) -> bool:
     return (
         not above.rstrip().endswith(SENTENCE_ENDS)
         and _continues(line)
-        and not line.lstrip()[:1].isupper()
+        and not LOWERABLE.match(line.lstrip())
     )
 
 
