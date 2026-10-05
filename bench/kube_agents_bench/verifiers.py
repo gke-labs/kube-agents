@@ -284,17 +284,32 @@ _RESULT_HEADER_PREFIX = "Result of delegated task "
 # A bold span opening the text, closed on its own line.
 _BOLD_LEAD = re.compile(r"\A\*\*([^\n]+?)\*\*")
 _ATX_HEADING = re.compile(r"^ {0,3}#{1,6} ", re.MULTILINE)
+# A fenced block, dropped before the heading check: a "# comment" in a snippet is no heading
+# (kanban_report_format.py's ``_FENCE``).
+_FENCE = re.compile(r"```.*?```", re.DOTALL)
 # A sentence ends at terminal punctuation followed by whitespace; a line break
 # ends one too, so each bullet counts.
 _SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+|\n+")
 _INNER_SENTENCE_BREAK = re.compile(r"[.!?]\s+\S")
-# Abbreviations whose dots end no sentence; their dots are dropped before counting.
-_ABBREVIATION = re.compile(r"\b(?:e\.g|i\.e|vs|etc|a\.m|p\.m)\.", re.IGNORECASE)
+# A line break inside a soft-wrapped sentence: after a line that has not ended, before a line
+# that is not blank, a list item or a heading. It joins, as slack_presenter.split_lead does.
+_SOFT_WRAP = re.compile(r"(?<=[^.!?:\s])[ \t]*\n(?=[ \t]*\S)(?![ \t]*(?:[-*+]|\d+[.)]|#{1,6})\s)")
+# Abbreviations whose dots end no sentence; their dots are dropped before counting. The
+# fold's own tables, copied from slack_presenter.py's ``ABBREVIATION_END`` and
+# ``NUMBER_ABBREVIATION_END`` (no/max/min abbreviate only before a number), plus a.m./p.m.
+_ABBREVIATION = re.compile(
+    r"(?:(?<=^)|(?<=[\s(\[]))(?:e\.g|i\.e|a\.m|p\.m|vs|approx|incl|cf|etc|esp|ex|fig|rev|ver|cont|"
+    r"jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\.",
+    re.IGNORECASE | re.MULTILINE,
+)
+_NUMBER_ABBREVIATION = re.compile(r"(?:(?<=^)|(?<=[\s(\[#]))(?:no|max|min)\.(?=\s+\d)", re.IGNORECASE | re.MULTILINE)
 # What trails a bold lead whose terminal punctuation sits outside the bold.
 _LEAD_TRAIL = ".!? \t"
 _TERMINAL = ".!?"
-# What may follow a bold answer that leaves its punctuation to the detail: "**No.**", "**No**: ...".
+# What may follow a one-word bold answer that leaves its punctuation to the detail:
+# "**No**: ...", "**Yes** \u2014 ...". A longer span before a colon is a label ("**Memory check**:").
 _LEAD_CLAUSE = (":", "\u2014", "\u2013")
+_WHITESPACE = re.compile(r"\s")
 # A markdown link; chat shows its text, not its target.
 _MARKDOWN_LINK = re.compile(r"\[([^\]]*)\]\([^)\s]*\)")
 
@@ -312,11 +327,15 @@ def _delivered_results(final_message: str) -> list[str]:
 
 
 def _unabbreviate(text: str) -> str:
-    return _ABBREVIATION.sub(lambda m: m.group(0).replace(".", ""), text)
+    def undot(match: re.Match) -> str:
+        return match.group(0).replace(".", "")
+
+    return _NUMBER_ABBREVIATION.sub(undot, _ABBREVIATION.sub(undot, text))
 
 
 def _sentences(text: str) -> list[str]:
-    return [s.strip() for s in _SENTENCE_BREAK.split(_unabbreviate(text)) if s.strip()]
+    joined = _SOFT_WRAP.sub(" ", text)
+    return [s.strip() for s in _SENTENCE_BREAK.split(_unabbreviate(joined)) if s.strip()]
 
 
 @VERIFIERS.register("answer_first")
@@ -332,7 +351,8 @@ class AnswerFirstVerifier(BaseVerifier):
     Every delivered result must pass: the lead is a bold span opening the
     result and holding one whole sentence; no ATX heading anywhere; at most
     ``max_chars`` characters as chat shows them, a markdown link counting as
-    its text, and ``max_sentences`` sentences, a bullet counting as one; and no sentence
+    its text, and ``max_sentences`` sentences, a bullet counting as one and a
+    soft-wrapped sentence as one; and no sentence
     after the lead matching any of ``recap_patterns``, regexes searched in each
     later sentence's normalized text, which name the ways a restated verdict
     reads ("the cluster is healthy", "in summary"). Restatement in other words
@@ -377,13 +397,13 @@ class AnswerFirstVerifier(BaseVerifier):
             elif not (
                 inner.endswith(tuple(_TERMINAL))
                 or after[:1] in tuple(_TERMINAL)
-                or after.lstrip(" ").startswith(_LEAD_CLAUSE)
+                or (after.lstrip(" ").startswith(_LEAD_CLAUSE) and not _WHITESPACE.search(inner))
                 or not after.split("\n", 1)[0].strip()
             ):
                 defects.append(f"the bold span is not a whole sentence: {inner!r}")
             lead_text = _normalize(_MARKDOWN_LINK.sub(r"\1", inner))
             rest = after.lstrip(_LEAD_TRAIL)
-        if _ATX_HEADING.search(result):
+        if _ATX_HEADING.search(_FENCE.sub("", result)):
             defects.append("carries a section heading")
         shown = len(_MARKDOWN_LINK.sub(r"\1", result))
         if shown > self.max_chars:

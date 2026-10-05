@@ -98,12 +98,20 @@ def test_a_bold_fragment_is_not_a_lead():
         assert "not a whole sentence" in _run(result).reason, result
 
 
-def test_a_lead_may_hand_its_punctuation_to_the_detail():
+def test_a_one_word_lead_may_hand_its_punctuation_to_the_detail():
     for result in (
-        "**No node is under memory pressure**: all three report False.",
-        "**No node is under memory pressure** \u2014 all three report False.",
+        "**No**: no node is under memory pressure; all three report False.",
+        "**Yes** \u2014 every node reports MemoryPressure=False.",
     ):
         assert _run(result).success, result
+
+
+def test_a_bold_label_before_a_colon_is_not_a_lead():
+    for result in (
+        "**Memory check**: no node is under pressure. **Pod check**: all pods run. Want me to watch it?",
+        "**No node is under memory pressure**: all three report False.",
+    ):
+        assert "not a whole sentence" in _run(result).reason, result
 
 
 def test_a_link_target_is_not_part_of_the_lead():
@@ -118,6 +126,30 @@ def test_a_lead_on_its_own_line_needs_no_full_stop():
 def test_abbreviations_end_no_sentence():
     outcome = _run("**Every node reports pressure False, e.g. node-a.** Checked at 10 a.m. vs. yesterday.")
     assert outcome.success, outcome.reason
+
+
+def test_the_fold_s_abbreviations_end_no_sentence():
+    for result in (
+        "**Memory sits at approx. 60% on every node.** All three report MemoryPressure=False.",
+        "**Every node is fine.** They run ver. 1.31, incl. kube-system. The max. 4 pods run. Watch it?",
+    ):
+        outcome = _run(result)
+        assert outcome.success, (result, outcome.reason)
+
+
+def test_a_soft_wrapped_sentence_counts_once():
+    result = (
+        "**Every node is fine.** All three nodes report\nMemoryPressure=False and\n"
+        "the only pods not Running\nare two completed jobs. Want me to watch it?"
+    )
+    outcome = _run(result, max_sentences=3)
+    assert outcome.success, outcome.reason
+
+
+def test_a_hash_line_in_a_fence_is_not_a_heading():
+    outcome = _run("**Every node is fine.** Run this:\n\n```\n# list nodes\nkubectl get nodes\n```")
+    assert outcome.success, outcome.reason
+    assert "section heading" in _run("**Every node is fine.**\n\n# Nodes\nAll fine.").reason
 
 
 def test_a_link_counts_as_its_text():
