@@ -380,6 +380,26 @@ SENTINELS = (
 )
 
 
+def _defines(node: ast.stmt, name: str) -> bool:
+    """Whether a statement binds ``name`` in the scope it sits in."""
+    if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+        return node.name == name
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
+    return any(isinstance(target, ast.Name) and target.id == name for target in targets)
+
+
+def _exits(fn: ast.FunctionDef) -> list[ast.stmt]:
+    """The ``return`` and ``raise`` statements of ``fn`` itself, not of a def nested in it."""
+    found, pending = [], list(fn.body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.Return, ast.Raise)):
+            found.append(node)
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            pending.extend(ast.iter_child_nodes(node))
+    return found
+
+
 def expect_platform_binding(patch: patchlib.Patch) -> None:
     """Assert the one ``PLATFORM_BINDING`` line is a statement of ``_KanbanNotification.__init__``.
 
@@ -389,20 +409,22 @@ def expect_platform_binding(patch: patchlib.Patch) -> None:
     instances without ``platform_str``. Only a statement directly in the
     constructor's body, at the pinned indentation, runs on every construction.
     The statement found must also be the binding itself, so the text sitting in
-    a comment or a string on another assignment's line does not pass.
+    a comment or a string on another assignment's line does not pass. Python
+    keeps the last definition, so the class and the constructor must each be
+    the only one of their name, and no ``return`` or ``raise`` may come before
+    the binding.
     """
     offset = patch.source.index(PLATFORM_BINDING)
     lineno = patch.source.count("\n", 0, offset) + 1
     col = len(PLATFORM_BINDING) - len(PLATFORM_BINDING.lstrip(" "))
-    for node in patch._tree().body:
-        if isinstance(node, ast.ClassDef) and node.name == PLATFORM_CLASS:
-            for method in node.body:
-                if isinstance(method, ast.FunctionDef) and method.name == PLATFORM_METHOD and any(
-                    isinstance(stmt, ast.Assign) and stmt.lineno == lineno and stmt.col_offset == col
-                    and ast.get_source_segment(patch.source, stmt) == PLATFORM_BINDING.strip()
-                    for stmt in method.body
-                ):
-                    return
+    classes = [node for node in patch._tree().body if _defines(node, PLATFORM_CLASS)]
+    methods = [node for node in classes[0].body if _defines(node, PLATFORM_METHOD)] if len(classes) == 1 else []
+    if len(methods) == 1 and isinstance(methods[0], ast.FunctionDef) and any(
+        isinstance(stmt, ast.Assign) and stmt.lineno == lineno and stmt.col_offset == col
+        and ast.get_source_segment(patch.source, stmt) == PLATFORM_BINDING.strip()
+        for stmt in methods[0].body
+    ) and not any(node.lineno < lineno for node in _exits(methods[0])):
+        return
     raise patch._fail(
         f"the platform_str binding at line {lineno} is no longer a statement of "
         f"{PLATFORM_CLASS}.{PLATFORM_METHOD}'s own body, so the completion call's "

@@ -2111,6 +2111,35 @@ class ApplyTest(unittest.TestCase):
                     patch_tree(moved)
                 self.assertIn("_KanbanNotification.__init__", str(ctx.exception))
 
+    def test_a_platform_str_binding_python_would_not_keep_or_reach_fails_loudly(self):
+        # The pin matches once, but Python keeps the last class and the last
+        # __init__, and an early exit skips the binding.
+        binding = '        self.platform_str = (sub["platform"] or "").lower()\n'
+        header = "class _KanbanNotification:\n    def __init__(self, runner, d):\n"
+        for why, shape in (
+            ("a second __init__", UPSTREAM_NOTIFIER.replace(
+                binding, binding + "\n    def __init__(self, runner, d):\n        self.runner = runner\n")),
+            ("__init__ rebound", UPSTREAM_NOTIFIER.replace(binding, binding + "\n    __init__ = object.__init__\n")),
+            ("a second class", UPSTREAM_NOTIFIER + "\n\nclass _KanbanNotification:\n    pass\n"),
+            ("an early return", UPSTREAM_NOTIFIER.replace(
+                header, header + "        if not d:\n            return\n")),
+            ("an early raise", UPSTREAM_NOTIFIER.replace(header, header + "        raise TypeError(d)\n")),
+        ):
+            with self.subTest(why):
+                self.assertEqual(shape.count(binding), 1)
+                with self.assertRaises(SystemExit) as ctx:
+                    patch_tree(shape)
+                self.assertIn("_KanbanNotification.__init__", str(ctx.exception))
+
+    def test_an_exit_after_the_platform_str_binding_or_in_a_nested_def_passes(self):
+        binding = '        self.platform_str = (sub["platform"] or "").lower()\n'
+        header = "class _KanbanNotification:\n    def __init__(self, runner, d):\n"
+        for shape in (
+            UPSTREAM_NOTIFIER.replace(binding, binding + "        if not d:\n            return\n"),
+            UPSTREAM_NOTIFIER.replace(header, header + "        def _check():\n            return d\n"),
+        ):
+            patch_tree(shape)
+
     def test_a_drifted_wake_step_anchor_fails_loudly(self):
         with self.assertRaises(SystemExit) as ctx:
             patch_tree(UPSTREAM_NOTIFIER.replace(*TELL_DRIFT))

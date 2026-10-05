@@ -328,6 +328,23 @@ def _binds(node: ast.AST, name: str) -> bool:
     return False
 
 
+def _annotation_names(annotation: ast.expr) -> set[str]:
+    """Every name an annotation reads, inside forward-reference strings at any depth."""
+    names, pending = set(), [annotation]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            try:
+                pending.append(ast.parse(node.value, mode="eval").body)
+            except SyntaxError:
+                raise _fail(f"{TARGET_FACTORY}()'s return annotation {node.value!r} does not parse") from None
+            continue
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            names.add(node.id if isinstance(node, ast.Name) else node.attr)
+        pending.extend(ast.iter_child_nodes(node))
+    return names
+
+
 def check_target_fields(root: Path) -> None:
     # Fields declared on the class itself only: a field moved to a base class or
     # turned into a property refuses the build, loudly, until this is re-derived.
@@ -337,21 +354,19 @@ def check_target_fields(root: Path) -> None:
     # except or import alias, a def, a match capture), so a second binding from
     # anything but the factory refuses the build.
     stores = [node for node in ast.walk(deliver) if _binds(node, TARGET_LOCAL)]
+    # An annotated binding (``t: _TargetDelivery = ...``) is the same binding.
     binds = [
         node for node in ast.walk(deliver)
-        if isinstance(node, ast.Assign) and [ast.unparse(t) for t in node.targets] == [TARGET_LOCAL]
+        if (
+            isinstance(node, ast.Assign) and [ast.unparse(t) for t in node.targets] == [TARGET_LOCAL]
+            or isinstance(node, ast.AnnAssign) and ast.unparse(node.target) == TARGET_LOCAL
+        )
         and isinstance(node.value, ast.Call) and ast.unparse(node.value.func) == TARGET_FACTORY
     ]
     if len(stores) != 1 or len(binds) != 1:
         raise _fail(f"{DELIVER_FN}() no longer binds {TARGET_LOCAL} once, from {TARGET_FACTORY}()")
     factory = _function(tree, TARGET_FACTORY, DELIVERY)
-    returns = factory.returns
-    if isinstance(returns, ast.Constant) and isinstance(returns.value, str):
-        returns = ast.parse(returns.value, mode="eval").body
-    named = set() if returns is None else {
-        node.id if isinstance(node, ast.Name) else node.attr
-        for node in ast.walk(returns) if isinstance(node, (ast.Name, ast.Attribute))
-    }
+    named = set() if factory.returns is None else _annotation_names(factory.returns)
     if named - OPTIONAL_NAMES != {TARGET_CLASS}:
         raise _fail(f"{TARGET_FACTORY}() is no longer annotated to return {TARGET_CLASS}")
     classes = [

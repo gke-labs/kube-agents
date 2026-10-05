@@ -858,6 +858,27 @@ class ApplierTest(unittest.TestCase):
                 path.write_text(patched.replace('-> "Optional[_TargetDelivery]"', spelling))
                 verifier.check_target_fields(self.root.dir)
 
+    def test_verifier_accepts_an_annotated_binding_and_a_nested_forward_reference(self):
+        applier.apply(self.root.dir)
+        path = self.root.dir / applier.DELIVERY
+        patched = path.read_text()
+        for old, new in (
+            ("t = _prepare_target_delivery(target)", "t: _TargetDelivery = _prepare_target_delivery(target)"),
+            ('-> "Optional[_TargetDelivery]"', '-> Optional["_TargetDelivery"]'),
+        ):
+            with self.subTest(new=new):
+                self.assertEqual(patched.count(old), 1)
+                path.write_text(patched.replace(old, new))
+                verifier.check_target_fields(self.root.dir)
+
+    def test_verifier_names_an_unparseable_return_annotation(self):
+        applier.apply(self.root.dir)
+        path = self.root.dir / applier.DELIVERY
+        path.write_text(path.read_text().replace('-> "Optional[_TargetDelivery]"', '-> "Optional[_TargetDelivery"'))
+        with self.assertRaises(SystemExit) as ctx:
+            verifier.check_target_fields(self.root.dir)
+        self.assertIn("does not parse", str(ctx.exception))
+
     def test_verifier_refuses_a_dropped_wrapper(self):
         applier.apply(self.root.dir)
         path = self.root.dir / applier.DELIVERY
