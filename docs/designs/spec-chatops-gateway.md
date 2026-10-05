@@ -1135,11 +1135,11 @@ fenced block it cuts and reopens it with a bare fence at the start of the next c
 reading the cut with the same code-span parse the adapters use: every chunk is balanced on
 its fences, so a cut block never leaks its closer into the next chunk, the fences added stay
 within the chunk cap, and the text between them is the original, byte for byte. When a cut
-falls inside any code span (including a multi-line double-backtick span or a mid-line fence
-opener) whose start lies in the second half of the budget, the cut moves back to the span's
-start, preserving the span intact in the next chunk. The opener's language tag is not carried onto the
-reopened fence (it is the rest of the opener's line, unbounded), so a continuation chunk
-loses the tag on Discord.
+falls inside a code span opening delimiter, or inside a span that fits in a chunk whose start
+lies in the second half of the budget, the cut moves back to the span's start, preserving the
+span intact in the next chunk; a longer span is split with balanced fences as before. The opener's
+language tag is not carried onto the reopened fence (it is the rest of the opener's line, unbounded),
+so a continuation chunk loses the tag on Discord.
 
 ## The console adapter (added 9/23)
 

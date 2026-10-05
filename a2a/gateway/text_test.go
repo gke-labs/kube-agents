@@ -90,11 +90,11 @@ func TestIsDelegate(t *testing.T) {
 // chunk is then balanced on its fences, so a fenced block never leaks its
 // closer into the next chunk; no chunk exceeds the cap even with the fences
 // added; and the text between the inserted fences is the original, byte for
-// byte. When a cut falls inside any code span (including multi-line double-backtick
-// spans and mid-line fence openers) whose start lies in the second half of the
+// byte. When a cut falls inside a code span opening delimiter, or inside a
+// span that fits in a chunk whose start lies in the second half of the
 // budget, the cut moves back to the span start, keeping the span intact in the
-// next chunk. The opener's info string is not carried: a continuation of a
-// yaml block reopens with ``` alone.
+// next chunk; longer spans are split with balanced fences as before. The opener's
+// info string is not carried: a continuation of a yaml block reopens with ``` alone.
 func TestChatChunksKeepFencesBalanced(t *testing.T) {
 	logs := strings.Repeat("log line\n", 300)
 	cases := map[string]struct {
@@ -237,6 +237,34 @@ func TestChatChunksAvoidSplittingCodeSpans(t *testing.T) {
 	}
 	if len(chunks4[0]) != 949 {
 		t.Errorf("case 4: chunk 1 len = %d, want 949", len(chunks4[0]))
+	}
+}
+
+// TestChatChunksLongSpanNotMovedWhenExceedingBudget: a fenced block or code span
+// longer than the chunk budget is split across chunks rather than moving the cut
+// back to the start and wasting chunk capacity (#2288).
+func TestChatChunksLongSpanNotMovedWhenExceedingBudget(t *testing.T) {
+	// A 1000-byte prose intro followed by a 2500-byte fenced block (3508 bytes total).
+	// Under budget 1900, moving the cut back to 1000 would produce 3 chunks because
+	// the 2500-byte block would still be split on iteration 2. By not moving the cut
+	// for spans that exceed the budget, chunk 1 packs up to the line break inside the block
+	// (1893 bytes + "\n```" = 1897 bytes) and chunk 2 carries the remainder (1615 bytes),
+	// requiring only 2 chunks total.
+	intro := strings.Repeat("intro line\n", 90) + strings.Repeat("x", 10) // 1000 bytes
+	block := "```\n" + strings.Repeat("xxxxxxxxx\n", 250) + "```\n"        // 2505 bytes
+	text := intro + block
+	chunks := chatChunks(text, discordChunk)
+	if len(chunks) != 2 {
+		t.Fatalf("got %d chunks, want 2", len(chunks))
+	}
+	if len(chunks[0]) > discordChunk {
+		t.Errorf("chunk 1 len = %d, exceeds discord cap %d", len(chunks[0]), discordChunk)
+	}
+	if !strings.HasSuffix(chunks[0], "\n```") {
+		t.Errorf("chunk 1 should be closed with balanced fence, got %q", chunks[0][len(chunks[0])-10:])
+	}
+	if !strings.HasPrefix(chunks[1], "```\n") {
+		t.Errorf("chunk 2 should reopen with fence, got %q", chunks[1][:10])
 	}
 }
 
