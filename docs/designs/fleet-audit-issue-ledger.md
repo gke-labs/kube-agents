@@ -660,8 +660,8 @@ headroom for the trailing marker and for anything a later section appends.
   check on its cluster, so the Slack card can tag it. It is worked out before rendering, against
   everything the last run filed in its stored report rather than the hidden block alone: a finding
   the last body cut for space, or a posture it withheld, is not new, and nor is one whose check that
-  run did not run on its cluster (skipped, timed out, or inapplicable). That makes it narrower than
-  the delta's `new`. A run that cannot say what the last one filed writes none: a first run, a lost
+  run did not run on its cluster (skipped, timed out, or inapplicable). A finding whose check no
+  `checks_run` entry names is therefore never marked. That makes it narrower than the delta's `new`. A run that cannot say what the last one filed writes none: a first run, a lost
   or seeded report store, and a previous marker under another identity scheme, where every id would
   look new. An absent marker never means "not new".
 - **The delta comment is capped and ordered by severity.** Both of its lists cap at 50 rows, and the
