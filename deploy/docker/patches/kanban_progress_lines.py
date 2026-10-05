@@ -140,6 +140,8 @@ ROLLING_KINDS = ("heartbeat", "status")
 #: the terminal kind whose report may announce a PR (see ``slack_ux_moments``).
 NEEDS_YOU_KIND = "blocked"
 PR_REPORT_KIND = "completed"
+#: The completed event's payload key holding the worker's one-line status.
+SUMMARY_KEY = "summary"
 
 #: Leading marker on the rolling message. ``IN_PROGRESS`` while the card runs;
 #: on a terminal event the message is re-rendered with one of the other two so
@@ -731,7 +733,12 @@ async def deliver(
         if getattr(result, "success", True) is not False:
             await _settle_reaction(adapter, sub, kind, board)
         if kind == PR_REPORT_KIND:
-            await _pr_opened(moments, adapter, sub, message, result)
+            # The message can be the result alone, the worker's summary dropped from it; a PR
+            # the summary names is still one this card opened.
+            payload = getattr(ev, "payload", None)
+            summary = str(payload.get(SUMMARY_KEY) or "").strip() if isinstance(payload, dict) else ""
+            scanned = message if not summary or summary in message else f"{message}\n{summary}"
+            await _pr_opened(moments, adapter, sub, scanned, result)
         return result
 
     payload = getattr(ev, "payload", None)

@@ -1345,6 +1345,17 @@ class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
             [("Checking seeded-a.", 1), (self.PR_NOTE, 1), (f"Done. {self.PR_NOTE}", 2)],
         )
 
+    async def test_an_opened_pr_in_the_summary_alone_is_announced(self):
+        adapter, report = _Adapter(), "Both overlays reconcile."
+        ev = SimpleNamespace(id=3, kind="completed", payload={"summary": self.PR_NOTE})
+        await deliver(SimpleNamespace(), adapter, SLACK_SUB, "completed", ev, report, None, HEADER)
+        self.assertEqual([text for _task, text, _sent in self.announced], [f"{report}\n{self.PR_NOTE}"])
+
+    async def test_a_summary_already_in_the_message_is_scanned_once(self):
+        ev = SimpleNamespace(id=3, kind="completed", payload={"summary": self.PR_NOTE})
+        await deliver(SimpleNamespace(), _Adapter(), SLACK_SUB, "completed", ev, f"Done. {self.PR_NOTE}", None, HEADER)
+        self.assertEqual([text for _task, text, _sent in self.announced], [f"Done. {self.PR_NOTE}"])
+
     async def test_a_long_note_is_scanned_whole(self):
         # The rolling line clips at 300 characters, cutting a url past it whole.
         note = "Reconciled the overlays. " * 13 + self.PR_NOTE
