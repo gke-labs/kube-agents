@@ -786,6 +786,12 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # off). slack_moments.py is staged for the verifier as slack_presenter.py is.
 # Also rides this COPY and RUN. See deploy/docker/patches/slack_ux_moments.py.
 #
+# Slack: with KAGE_SLACK_UX on, an incident's triage report edits its alert in
+# place into the headline, one button per option and the report folded, instead
+# of replying under it. The kanban notifier's deliver call gets the adapter
+# gateway/slack_ux_incident.py returns, which is the notifier's own with the
+# flag off. Anchors on apply_kanban_progress_lines' call above. Also rides this
+# COPY and RUN. See deploy/docker/patches/slack_ux_incident.py.
 # Same flag, same block: gateway/slack_boilerplate.py keeps Hermes' own
 # boilerplate off Slack -- the cron wrapper (other targets, and the Chat relay
 # that routes on it, keep it), the opt-in heartbeat's tool trace (generic
@@ -813,6 +819,10 @@ COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/apply_slack_ux_moments.py \
      deploy/docker/patches/verify_slack_ux_moments.py \
      deploy/docker/patches/slack_ux_moments.py \
+     deploy/docker/patches/apply_slack_ux_incident.py \
+     deploy/docker/patches/verify_slack_ux_incident.py \
+     deploy/docker/patches/slack_ux_incident.py \
+     deploy/docker/patches/verify_kanban_progress_lines.py \
      deploy/docker/patches/apply_slack_boilerplate.py \
      deploy/docker/patches/verify_slack_boilerplate.py \
      deploy/docker/patches/slack_boilerplate.py \
@@ -844,6 +854,9 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
     install -m 0644 /tmp/message-surface/slack_ux_moments.py /opt/hermes/gateway/slack_ux_moments.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_ux_moments.py /opt/hermes && \
     grep -qF "_kage_moments_wake_text(" /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    install -m 0644 /tmp/message-surface/slack_ux_incident.py /opt/hermes/gateway/slack_ux_incident.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_ux_incident.py /opt/hermes && \
+    grep -qF "_kage_slack_incident.adapter_for(" /opt/hermes/gateway/kanban_watchers_notifier.py && \
     install -m 0644 /tmp/message-surface/slack_boilerplate.py /opt/hermes/gateway/slack_boilerplate.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_boilerplate.py /opt/hermes && \
     grep -qF "_kage_slack_boilerplate.cron_delivery_text" /opt/hermes/cron/scheduler_delivery.py && \
@@ -859,6 +872,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_status.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_clicks.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_moments.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_incident.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_kanban_progress_lines.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_boilerplate.py && \
     rm -rf /tmp/message-surface
 
@@ -1224,6 +1239,14 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling
 # bridge names exit 75 `hermes-rate-limited`. Applied after kanban_guardrail_exit
 # because that patch inserts above this block and leaves the anchor alone. See
 # the module docstring in deploy/docker/patches/apply_quiet_rate_limit_exit.py.
+#
+# api_failure_reason_header is that patch's twin for the bridge's API executor:
+# a failed API-server turn answers with failed/partial and the error text but
+# not the failure_reason Hermes classified, so the bridge could not tell a turn
+# that gave up on a rate limit from the persona failing. One insertion after the
+# chat-completions handler builds its response headers adds
+# X-Hermes-Failure-Reason. See the module docstring in
+# deploy/docker/patches/apply_api_failure_reason_header.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_guardrail_exit.py \
      deploy/docker/patches/rate_limit_retry_delay.py \
      /opt/hermes/hermes_cli/
@@ -1237,6 +1260,8 @@ COPY deploy/docker/patches/apply_kanban_guardrail_exit.py \
      deploy/docker/patches/verify_mcp_toolset_names.py \
      deploy/docker/patches/apply_quiet_rate_limit_exit.py \
      deploy/docker/patches/verify_quiet_rate_limit_exit.py \
+     deploy/docker/patches/apply_api_failure_reason_header.py \
+     deploy/docker/patches/verify_api_failure_reason_header.py \
      deploy/docker/patches/verify_policy_refusal_hint.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-guardrail-exit/
@@ -1245,6 +1270,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_rate_limit_retry_delay.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_mcp_toolset_names.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_quiet_rate_limit_exit.py /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_api_failure_reason_header.py /opt/hermes && \
     grep -q 'if sys.platform == "linux":  # kube-agents patch: state-db-synchronous-full' /opt/hermes/hermes_state_wal.py && \
     grep -q "if _kanban_halt_nudge:" /opt/hermes/agent/turn_tool_round.py && \
     grep -q "_kanban_should_record_missing(" /opt/hermes/agent/turn_finalizer.py && \
@@ -1254,11 +1280,13 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     grep -q "_kube_retry_delay_from_error(api_error)" /opt/hermes/agent/turn_recovery.py && \
     grep -q 'mcp_names |= {f"mcp-{_kube_mcp_name}" for _kube_mcp_name in mcp_names}' /opt/hermes/cli.py && \
     grep -q 'kube-agents patch: quiet_rate_limit_exit' /opt/hermes/cli.py && \
+    grep -q 'kube-agents patch: api_failure_reason_header' /opt/hermes/gateway/platforms/api_server_openai_routes.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_state_db_synchronous_full.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_kanban_guardrail_exit.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_rate_limit_retry_delay.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_mcp_toolset_names.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_quiet_rate_limit_exit.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_api_failure_reason_header.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_policy_refusal_hint.py && \
     rm -rf /tmp/kanban-guardrail-exit
 

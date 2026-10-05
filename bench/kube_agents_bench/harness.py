@@ -41,7 +41,10 @@ Environment:
         ``API_SERVER_MODEL_NAME`` and the one LiteLLM actually serves).
     AGENT_CONVERSATION_ID: Pins the ``conversation`` field. Unset (the default)
         generates a fresh id per invocation so each task's trajectory is
-        isolated on this stateful endpoint.
+        isolated on this stateful endpoint. A card-wake replay (a prompt
+        opening with one of :mod:`card_wake`'s directives) pins its own id
+        for its turns, plants its card with a ``kubectl exec`` first, and is
+        refused under ``AGENT_TRANSPORT=inject``.
     AGENT_HTTP_TIMEOUT: Per-request timeout in seconds (default ``600``).
     AGENT_DELEGATION_TIMEOUT: Total seconds to wait for delegated work across
         all status turns (default ``1800``). ``0`` disables waiting, restoring
@@ -140,6 +143,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Callable, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -148,7 +152,8 @@ from devops_bench.agents import AgentHarness, AgentResult
 from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
-from kube_agents_bench import board, gitops, transcript, worker_trajectory
+from kube_agents_bench import board, card_wake, gitops, transcript, worker_trajectory
+from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     STATUS_TOOL,
     delegated_task_ids,
@@ -230,6 +235,9 @@ _DEFAULT_AGENT_NAMESPACE = "kubeagents-system"
 # message id.
 _RUN_ID_PREFIX = "devops-bench-"
 _RUN_ID_HEX_WIDTH = 12
+# Set while a card-wake replay sends its turns, so they land on one
+# conversation: see KubeAgentsHarness._execute_card_wake.
+_PINNED_RUN_ID: ContextVar[str | None] = ContextVar("pinned_run_id", default=None)
 # How long one injected task may run before the harness reads the record and
 # classifies it. The api path's AGENT_HTTP_TIMEOUT is a PER-REQUEST bound
 # there, with AGENT_DELEGATION_TIMEOUT covering the work across status turns;
@@ -1296,10 +1304,11 @@ def _run_id() -> str:
     """The api path's run id: pinned by ``AGENT_CONVERSATION_ID`` or minted.
 
     It is the stateful ``conversation`` field, fresh per invocation so no task
-    inherits the previous task's trajectory. The inject path does not use it:
-    see :func:`_inject_identity`.
+    inherits the previous task's trajectory. A card-wake replay pins it
+    for its turns (:data:`_PINNED_RUN_ID`). The inject path does not use
+    it: see :func:`_inject_identity`.
     """
-    return os.environ.get("AGENT_CONVERSATION_ID") or _mint_run_id()
+    return _PINNED_RUN_ID.get() or os.environ.get("AGENT_CONVERSATION_ID") or _mint_run_id()
 
 
 def _inject_identity() -> tuple[str, str, str]:
@@ -1432,6 +1441,12 @@ class KubeAgentsHarness(AgentHarness):
         return result
 
     def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
+        try:
+            replay = card_wake.parse(prompt)
+        except ValueError as exc:
+            return AgentResult.errored(str(exc))
+        if replay is not None:
+            return self._execute_card_wake(replay, workspace_path)
         transport = os.environ.get("AGENT_TRANSPORT", TRANSPORT_API)
         if transport not in _TRANSPORTS:
             return AgentResult.errored(
@@ -1602,6 +1617,81 @@ class KubeAgentsHarness(AgentHarness):
         # And only then the workers', which the row must not overwrite.
         _fold_worker_tokens(result.tokens)
         return result
+
+    def _execute_card_wake(
+        self, replay: card_wake.Replay | card_wake.Failure, workspace_path: Path | None
+    ) -> AgentResult:
+        """Send a planted card's wake and, for a question, the user's answer.
+
+        The answer goes on the wake's conversation, or on a new one for a
+        ``session: fresh`` replay (:meth:`_execute_fresh_answer`).
+
+        See :mod:`kube_agents_bench.card_wake`. No agent sees anything when the
+        plant fails: a script that never ran to completion is infrastructure,
+        and one that ran and failed in the image is an error. The card is read
+        and archived whatever the turns did, so a parked card does not outlive
+        the run.
+        """
+        failure = isinstance(replay, card_wake.Failure)
+        transport = os.environ.get("AGENT_TRANSPORT", TRANSPORT_API)
+        if transport != TRANSPORT_API:
+            directive = card_wake.FAILURE_DIRECTIVE if failure else card_wake.QUESTION_DIRECTIVE
+            return AgentResult.errored(
+                f"{directive} needs AGENT_TRANSPORT={TRANSPORT_API}, got {transport!r}"
+            )
+        try:
+            planted = card_wake.plant(_agent_shell, replay, _EXEC_TIMEOUT)
+        except card_wake.ReplayUnavailable as exc:
+            return _infra_failure(str(exc))
+        except card_wake.ReplayBroken as exc:
+            return AgentResult.errored(str(exc))
+        pinned = _PINNED_RUN_ID.set(_run_id())
+        answer_turn = None
+        try:
+            wake_turn = self._execute(planted.wake, workspace_path)
+            if not wake_turn.errors and not failure and replay.fresh:
+                answer_turn = self._execute_fresh_answer(replay, planted, wake_turn, workspace_path)
+            elif not wake_turn.errors and not failure:
+                answer_turn = self._execute(replay.answer, workspace_path)
+        finally:
+            _PINNED_RUN_ID.reset(pinned)
+            settled = card_wake.archive(_agent_shell, planted.key, _EXEC_TIMEOUT)
+            if settled is None:
+                _log.warning("card wake: card %s could not be read", planted.card)
+            elif not settled.archived:
+                _log.warning("card wake: card %s was not archived", planted.card)
+        if answer_turn is None:
+            return card_wake.tag(planted, wake_turn, settled, "failure_wake" if failure else "question_wake")
+        return card_wake.merge(planted, wake_turn, answer_turn, settled)
+
+    def _execute_fresh_answer(
+        self,
+        replay: card_wake.Replay,
+        planted: card_wake.Planted,
+        wake_turn: AgentResult,
+        workspace_path: Path | None,
+    ) -> AgentResult:
+        """Send the typed answer on a new conversation that starts from the thread's context.
+
+        The wake reply joins the thread only when the gateway would post it.
+        A context the image cannot format is infrastructure or an error, as
+        a failed plant is, and no answer is sent.
+        """
+        reply = str(wake_turn.metadata.get("final_message") or wake_turn.output or "")
+        if is_intentional_silence_response(reply):
+            reply = ""
+        messages = card_wake.thread_messages(replay, planted, reply)
+        try:
+            prompt = card_wake.fresh_answer(_agent_shell, messages, replay.answer, _EXEC_TIMEOUT)
+        except card_wake.ReplayUnavailable as exc:
+            return _infra_failure(str(exc))
+        except card_wake.ReplayBroken as exc:
+            return AgentResult.errored(str(exc))
+        fresh = _PINNED_RUN_ID.set(_mint_run_id())
+        try:
+            return self._execute(prompt, workspace_path)
+        finally:
+            _PINNED_RUN_ID.reset(fresh)
 
     def _execute_inject(self, prompt: str) -> AgentResult:
         """The inject transport: send the prompt through the gateway's front door.

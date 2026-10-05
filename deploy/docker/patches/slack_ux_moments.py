@@ -2,9 +2,10 @@
 
 Installed into the image at ``/opt/hermes/gateway/slack_ux_moments.py``.
 ``gateway/kanban_progress_lines.py`` calls it for a Slack card when
-``KAGE_SLACK_UX`` is on, and ``apply_slack_ux_moments.py`` has the notifier's
-wake text pass through :func:`wake_text`; with the flag off nothing reaches it
-and the wake text comes back unchanged. What the messages look like is
+``KAGE_SLACK_UX`` is on, and ``apply_slack_ux_moments.py`` has every notifier
+wake's text pass through :func:`wake_text`, flag on or off. That function does
+not read the flag: with it off no question was posted, so the wake text comes
+back unchanged. What the messages look like is
 ``agents/platform/scripts/slack_moments.py``.
 
 Upstream, and why it changes
@@ -21,24 +22,31 @@ reaches the thread as "⏸ <head> blocked: <reason>", clipped to 160
 characters, and the ``blocked`` wake has the Planning Agent explain it, so
 the thread gets the question twice, once as a paraphrase. With the flag on,
 :func:`needs_you` instead posts the reason as a question: the first line in
-bold (plain if bold would drop a ``*``), the rest below (clipped at 2,000 characters), a choice button per option
-the question ends with, and "waiting on you". Buttons need the card's thread, since a click answers in the
-thread it was clicked in; a card with no thread keeps its options as text.
+bold (plain if bold would drop a ``*``), the rest below (clipped at 2,000
+characters), a choice button per option the question ends with, and "waiting
+on you". Buttons need the card's thread, since a click answers in the thread
+it was clicked in; a card with no thread keeps its options as text.
 The wake still runs, since it is how the Planning Agent learns which card an
 answer belongs to, but :func:`wake_text` adds a note that the question is
 already posted, so it says nothing now and only takes the answer, typed or
 clicked (``gateway/slack_ux_clicks.py``), to the card with ``kanban_comment``
 and ``kanban_unblock``. A click's turn names the card, which
-:func:`question_card` looks up. Other block kinds keep the line.
+:func:`question_card` looks up. A typed answer can open a session the wake
+never reached, which knows the thread only by reading it back, so the
+question's ``text`` names the card too, above its buttons' "Reply with one
+of:" line: the adapter reads a thread back through ``text``, and Slack does
+not render ``text`` beside the blocks; it is the fallback for notifications
+and anywhere blocks cannot render. Other block kinds keep the line.
 
 When the card moves on, any event of it, :func:`settle_question` takes the
 buttons and "waiting on you" off the question, so a typed answer does not
 leave them live. A question a click already answered was rewritten by the
 click and is left alone; one whose rewrite failed is settled here. The
 notifier delivers at least once, so a ``blocked`` event replayed after its
-question posted (:func:`asked`) neither settles nor reposts it. The open
-questions are held in process, so a restart leaves the buttons of any it
-forgot.
+question posted (:func:`asked`) neither settles nor reposts it. A question
+whose settle failed when the card asked again is kept and retried with the
+card's next settle. The open questions are held in process, so a restart
+leaves the buttons of any it forgot.
 
 Fail-soft: a moment that cannot be posted is logged, and the caller falls back
 to what it did before.
@@ -74,13 +82,16 @@ NEEDS_INPUT = "needs_input"
 #: The event kind a posted question arrives as, and the one its wake is for.
 BLOCKED_KIND = "blocked"
 
-#: Added to the ``blocked`` wake when the question is already in the thread.
+#: Added to the ``blocked`` wake when the question is already posted.
 WAKE_NOTE = (
-    "The specialist's question is already posted in this thread, in the specialist's words, as "
-    "its own message with its choices. Do not restate, paraphrase or acknowledge it. If nothing else "
+    "The specialist's question is already posted to the user as its own message, in the "
+    "specialist's words. Do not restate, paraphrase or acknowledge it. If nothing else "
     "in this notification needs saying, reply with exactly [SILENT]. When the user answers, "
     "typed or clicked, carry the answer to the card with kanban_comment, then kanban_unblock."
 )
+
+#: Added to a question's ``text``, so a session the wake never reached reads its card in the thread.
+QUESTION_CARD_NOTE = "(Question from card {card}.)"
 
 #: Bound on each in-process map, oldest evicted first.
 ANNOUNCED_MAX = 512
@@ -89,6 +100,8 @@ ANNOUNCED_MAX = 512
 _announced: OrderedDict[tuple, None] = OrderedDict()
 #: Subscription -> ``(event id, channel, ts, blocks, text)`` of its open question.
 _questions: OrderedDict[tuple, tuple] = OrderedDict()
+#: ``(subscription, ts)`` -> the entry of a question asked again before its settle succeeded.
+_unsettled: OrderedDict[tuple, tuple] = OrderedDict()
 _warned_missing = False
 
 
@@ -147,19 +160,18 @@ async def _post(adapter: Any, sub: dict, blocks: list[dict], text: str) -> str |
 
 
 async def pr_opened(adapter: Any, sub: dict, text: str) -> bool:
-    """Post the PR ``text`` says was opened, once per thread; True when posted."""
-    found = _moments.opened_pr(text)
-    if found is None:
-        return False
-    url, repo, number, line = found
-    key = (str(sub.get("chat_id") or ""), str(sub.get("thread_id") or ""), url)
-    if key in _announced:
-        return False
-    blocks, fallback = _moments.pr_opened(url, repo, number, line)
-    if await _post(adapter, sub, blocks, fallback) is None:
-        return False
-    _remember(_announced, key, None)
-    return True
+    """Post each PR ``text`` says was opened, once per thread; True when any posted."""
+    posted = False
+    for url, repo, number, line in _moments.opened_prs(text):
+        key = (str(sub.get("chat_id") or ""), str(sub.get("thread_id") or ""), url)
+        if key in _announced:
+            continue
+        blocks, fallback = _moments.pr_opened(url, repo, number, line)
+        if await _post(adapter, sub, blocks, fallback) is None:
+            continue
+        _remember(_announced, key, None)
+        posted = True
+    return posted
 
 
 async def needs_you(adapter: Any, sub: dict, payload: Any, event_id: int = 0) -> bool:
@@ -178,15 +190,33 @@ async def needs_you(adapter: Any, sub: dict, payload: Any, event_id: int = 0) ->
         return False
     if asked(sub, event_id):
         return True
-    # A card blocks again only after it was unblocked, so an earlier question is answered.
-    await settle_question(adapter, sub)
+    # The caller settled any earlier question first (kanban_progress_lines.deliver).
+    key = _sub_key(sub)
+    earlier = _questions.get(key)
     blocks, text = moment
+    text = _with_card(text, key[0], any(b.get("type") == "actions" for b in blocks))
     ts = await _post(adapter, sub, blocks, text)
     if ts is None:
+        # The earlier question keeps its slot, so it is settled once, from there.
         return False
+    if earlier is not None:
+        # Still open: its settle failed or never ran. The new question takes the slot, so keep this one for a retry.
+        _remember(_unsettled, (key, earlier[2]), earlier)
     entry = (int(event_id or 0), str(sub.get("chat_id") or ""), ts, blocks, text)
-    _remember(_questions, _sub_key(sub), entry)
+    _remember(_questions, key, entry)
     return True
+
+
+def _with_card(text: str, card: str, buttons: bool) -> str:
+    """``text`` naming ``card`` on the line above its buttons' "Reply with one of:" line,
+    or last without buttons: a click's rewrite drops that line only while it is the last."""
+    if not card:
+        return text
+    note = QUESTION_CARD_NOTE.format(card=card)
+    body, _nl, last = text.rpartition("\n")
+    if buttons and body and last.startswith(_presenter.CHOICES_LEAD):
+        return f"{body}\n{note}\n{last}"
+    return f"{text}\n{note}"
 
 
 def asked(sub: dict, event_id: int) -> bool:
@@ -197,8 +227,12 @@ def asked(sub: dict, event_id: int) -> bool:
 
 
 def question_card(channel: str, ts: str) -> str | None:
-    """The card whose open question this process posted as ``ts`` in ``channel``, else None."""
-    for key, (_event_id, posted_channel, posted_ts, _blocks, _text) in list(_questions.items()):
+    """The card whose open question this process posted as ``ts`` in ``channel``, else None.
+
+    A question kept in ``_unsettled`` for a retry still has live buttons, so it counts too.
+    """
+    entries = [*_questions.items(), *((key[0], entry) for key, entry in _unsettled.items())]
+    for key, (_event_id, posted_channel, posted_ts, _blocks, _text) in entries:
         if ts and posted_ts == str(ts) and posted_channel == str(channel):
             return key[0] or None
     return None
@@ -216,30 +250,45 @@ def _clicked(channel: str, ts: str) -> bool:
         return False
 
 
+def _without_choices(text: str) -> str:
+    """The question's ``text`` without its last "Reply with one of:" line, which
+    asks for an answer that has arrived, as ``slack_ux_clicks._answered_text`` drops it."""
+    body, _nl, last = text.rpartition("\n")
+    return body.rstrip("\n") if body and last.startswith(_presenter.CHOICES_LEAD) else text
+
+
+async def _settled(adapter: Any, sub: dict, entry: tuple) -> bool:
+    """Rewrite one question without its buttons; True once it needs nothing more."""
+    _event_id, channel, ts, blocks, text = entry
+    if not ts or _clicked(channel, ts):
+        return True
+    try:
+        client = adapter._get_client(channel, team_id=sub.get("team_id") or None)
+        await client.chat_update(
+            channel=channel, ts=ts, text=_without_choices(text), blocks=_moments.needs_you_settled(blocks)
+        )
+    except Exception as exc:  # noqa: BLE001 — cosmetic; the next event retries
+        logger.warning("slack_ux_moments: settling the question %s failed: %s", ts, exc)
+        return False
+    return True
+
+
 async def settle_question(adapter: Any, sub: dict) -> None:
     """Take the buttons and "waiting on you" off the card's open question, if it has one.
 
     The question is forgotten only once the rewrite succeeds (or a click has
     answered it), so a failed rewrite is retried on the card's next event and
-    a click in between still names the card.
+    a click in between still names the card. Earlier questions of the card
+    whose settle failed are retried too.
     """
     key = _sub_key(sub)
+    for stale_key, stale in [item for item in _unsettled.items() if item[0][0] == key]:
+        if await _settled(adapter, sub, stale) and _unsettled.get(stale_key) is stale:
+            _unsettled.pop(stale_key, None)
     entry = _questions.get(key)
     if entry is None:
         return
-    _event_id, channel, ts, blocks, text = entry
-    if not ts or _clicked(channel, ts):
-        _questions.pop(key, None)
-        return
-    try:
-        client = adapter._get_client(channel, team_id=sub.get("team_id") or None)
-        await client.chat_update(
-            channel=channel, ts=ts, text=text, blocks=_moments.needs_you_settled(blocks)
-        )
-    except Exception as exc:  # noqa: BLE001 — cosmetic; the next event retries
-        logger.warning("slack_ux_moments: settling the question %s failed: %s", ts, exc)
-        return
-    if _questions.get(key) is entry:
+    if await _settled(adapter, sub, entry) and _questions.get(key) is entry:
         _questions.pop(key, None)
 
 

@@ -32,6 +32,7 @@ SUB = {
 }
 QUESTION = {"kind": "needs_input", "reason": "Which cluster?\n- seeded-a\n- seeded-b"}
 POSTED_TS = "1700000000.000300"
+EARLIER_TS = "1700000000.000200"
 WAKE = "Task t_e0c1 is blocked.\n\ngateway.kanban.wake.guidance"
 
 #: build_wake_text's shape upstream, trimmed to what the patch touches.
@@ -63,7 +64,7 @@ class _Client:
         return {"ts": POSTED_TS}
 
     async def chat_update(self, **kwargs):
-        if self.adapter.fail:
+        if self.adapter.fail or self.adapter.fail_update:
             raise RuntimeError("message_not_found")
         self.adapter.updates.append(kwargs)
 
@@ -74,6 +75,7 @@ class _Adapter:
         self.updates = []
         self.teams = []
         self.fail = fail
+        self.fail_update = False
 
 
     def _get_client(self, chat_id, team_id=None):
@@ -151,6 +153,14 @@ class PrOpenedTest(unittest.TestCase):
         self.assertFalse(_run(runtime.pr_opened(_Adapter(), {**SUB, "chat_id": ""}, f"Opened {PR}")))
         self.assertFalse(_run(runtime.pr_opened(object(), SUB, f"Opened {PR}")))
 
+    def test_each_pr_a_text_opened_posts_once(self):
+        adapter = _Adapter()
+        other = "https://github.com/acme/other/pull/7"
+        self.assertTrue(_run(runtime.pr_opened(adapter, SUB, f"Opened {PR}")))
+        self.assertTrue(_run(runtime.pr_opened(adapter, SUB, f"- Opened {PR}\n- Opened {other}")))
+        self.assertFalse(_run(runtime.pr_opened(adapter, SUB, f"- Opened {PR}\n- Opened {other}")))
+        self.assertEqual([("PR #412" in p["text"], "PR #7" in p["text"]) for p in adapter.posts], [(True, False), (False, True)])
+
     def test_the_announced_map_is_bounded(self):
         adapter = _Adapter()
         with mock.patch.object(runtime, "ANNOUNCED_MAX", 2):
@@ -162,6 +172,7 @@ class PrOpenedTest(unittest.TestCase):
 class NeedsYouTest(unittest.TestCase):
     def setUp(self):
         runtime._questions.clear()
+        runtime._unsettled.clear()
 
     def test_posts_a_needs_input_question_with_its_choices(self):
         adapter = _Adapter()
@@ -170,6 +181,26 @@ class NeedsYouTest(unittest.TestCase):
         labels = [e["text"]["text"] for b in blocks if b["type"] == "actions" for e in b["elements"]]
         self.assertEqual(labels, ["seeded-a", "seeded-b"])
         self.assertEqual(adapter.posts[0]["thread_ts"], SUB["thread_id"])
+
+    def test_the_question_text_names_its_card_above_the_choices(self):
+        # A typed answer can open a session the wake never reached; it reads the card here.
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, SUB, QUESTION))
+        lines = adapter.posts[0]["text"].split("\n")
+        self.assertEqual(lines[-2], "(Question from card t_e0c1.)")
+        self.assertTrue(lines[-1].startswith("Reply with one of: "), lines)
+        self.assertNotIn("t_e0c1", str(adapter.posts[0]["blocks"]))
+
+    def test_a_question_with_no_thread_names_its_card_last(self):
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, {**SUB, "thread_id": ""}, QUESTION))
+        self.assertTrue(adapter.posts[0]["text"].endswith("- seeded-b\n(Question from card t_e0c1.)"))
+
+    def test_a_detail_line_reading_like_the_choices_line_keeps_the_card_last(self):
+        adapter = _Adapter()
+        payload = {"kind": "needs_input", "reason": "Blocked.\nDetails.\n\nReply with one of: yes or no"}
+        _run(runtime.needs_you(adapter, {**SUB, "thread_id": ""}, payload))
+        self.assertTrue(adapter.posts[0]["text"].endswith("yes or no\n(Question from card t_e0c1.)"))
 
     def test_other_kinds_and_empty_reasons_post_nothing(self):
         adapter = _Adapter()
@@ -189,13 +220,31 @@ class NeedsYouTest(unittest.TestCase):
         self.assertEqual(_buttons(post["blocks"]), [])
         self.assertIn("- seeded-a\n- seeded-b", post["text"])
 
-    def test_blocking_again_settles_the_earlier_question(self):
+    def test_blocking_again_does_not_settle_the_earlier_question_itself(self):
         adapter = _Adapter()
         _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 9))
+        self.assertEqual((len(adapter.posts), adapter.updates), (2, []))
+
+    def test_blocking_again_after_the_callers_settle_replaces_the_question(self):
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        _run(runtime.settle_question(adapter, SUB))
         _run(runtime.needs_you(adapter, SUB, QUESTION, 9))
         self.assertEqual(len(adapter.posts), 2)
         self.assertEqual(len(adapter.updates), 1)
         self.assertEqual(runtime._questions[runtime._sub_key(SUB)][0], 9)
+
+    def test_a_failed_re_ask_leaves_the_earlier_question_to_settle_once(self):
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        adapter.fail = True
+        self.assertFalse(_run(runtime.needs_you(adapter, SUB, QUESTION, 9)))
+        self.assertEqual(runtime._unsettled, {})
+        self.assertEqual(runtime._questions[runtime._sub_key(SUB)][0], 3)
+        adapter.fail = False
+        _run(runtime.settle_question(adapter, SUB))
+        self.assertEqual(len(adapter.updates), 1)
 
     def test_a_replayed_block_neither_settles_nor_reposts(self):
         adapter = _Adapter()
@@ -271,6 +320,7 @@ class SettleQuestionTest(unittest.TestCase):
 
     def setUp(self):
         runtime._questions.clear()
+        runtime._unsettled.clear()
 
     def test_rewrites_the_question_without_buttons_or_the_waiting_line(self):
         adapter = _Adapter()
@@ -282,6 +332,16 @@ class SettleQuestionTest(unittest.TestCase):
         self.assertNotIn(runtime._moments.WAITING, str(update["blocks"]))
         self.assertIn("Which cluster?", str(update["blocks"]))
         self.assertEqual(runtime._questions, {})
+
+    def test_the_settled_text_drops_the_reply_with_line(self):
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        self.assertIn(runtime._presenter.CHOICES_LEAD, adapter.posts[0]["text"])
+        _run(runtime.settle_question(adapter, SUB))
+        text = adapter.updates[0]["text"]
+        self.assertNotIn(runtime._presenter.CHOICES_LEAD, text)
+        self.assertIn("Which cluster?", text)
+        self.assertIn("t_e0c1", text.splitlines()[-1])
 
     def test_once(self):
         adapter = _Adapter()
@@ -332,6 +392,36 @@ class SettleQuestionTest(unittest.TestCase):
         self.assertEqual(_buttons(adapter.updates[-1]["blocks"]), [])
         self.assertEqual(runtime._questions, {})
         self.assertIsNone(runtime.question_card("C0KAGE", POSTED_TS))
+
+    def test_a_question_asked_again_after_a_failed_settle_is_retried_with_the_next(self):
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        key = runtime._sub_key(SUB)
+        first = runtime._questions[key]
+        runtime._questions[key] = (first[0], first[1], EARLIER_TS, *first[3:])
+        adapter.fail_update = True
+        with self.assertLogs(runtime.logger, "WARNING"):
+            _run(runtime.settle_question(adapter, SUB))
+        self.assertTrue(_run(runtime.needs_you(adapter, SUB, QUESTION, 9)))
+        self.assertEqual(runtime._questions[key][0], 9)
+        adapter.fail_update = False
+        _run(runtime.settle_question(adapter, SUB))
+        self.assertEqual([u["ts"] for u in adapter.updates], [EARLIER_TS, POSTED_TS])
+        self.assertEqual((runtime._questions, runtime._unsettled), ({}, {}))
+
+    def test_a_click_on_a_question_kept_for_retry_still_names_its_card(self):
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        key = runtime._sub_key(SUB)
+        first = runtime._questions[key]
+        runtime._questions[key] = (first[0], first[1], EARLIER_TS, *first[3:])
+        adapter.fail_update = True
+        with self.assertLogs(runtime.logger, "WARNING"):
+            _run(runtime.settle_question(adapter, SUB))
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 9))
+        self.assertEqual(runtime.question_card("C0KAGE", EARLIER_TS), SUB["task_id"])
+        self.assertEqual(runtime.question_card("C0KAGE", POSTED_TS), SUB["task_id"])
+        self.assertIsNone(runtime.question_card("C0OTHER", EARLIER_TS))
 
     def test_a_clicked_question_is_forgotten_without_a_rewrite(self):
         adapter = _Adapter()

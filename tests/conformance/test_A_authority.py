@@ -905,6 +905,9 @@ class _SlackClickAdapter:
         return ("T1", action["action_id"], action.get("value"), message, message["ts"],
                 body["channel"]["id"], user, user)
 
+    def _is_ignored_channel(self, channel_id):
+        return False
+
     def _slack_allowed_channels(self):
         return set()
 

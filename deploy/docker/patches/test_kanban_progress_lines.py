@@ -1556,5 +1556,69 @@ def _choices(blocks):
     ]
 
 
+class ReplayedUnblockTest(TypedAnswerSettlesTheQuestionTest):
+    """A rewound claim replays its batch: a replayed ``unblocked`` must not undo the ``blocked`` after it.
+
+    Upstream skips a ping already sent by ``last_ping_event_id``; a silent kind
+    is never recorded there. ``record`` False is a send whose ping record
+    failed, so ``last_ping_event_id`` lags the ``blocked`` that was sent.
+    """
+
+    SECOND = {"kind": "needs_input", "reason": "Which namespace?\n- default\n- prod"}
+
+    def _replaying(self, adapter, record):
+        notification = self._notification(adapter)
+        notification.sub = dict(SLACK_SUB)
+        sent = notification._send_event
+
+        async def send(ev, msg):
+            if ev.id <= notification.sub.get("last_ping_event_id", 0):
+                return  # upstream's dedup, ahead of the send
+            await sent(ev, msg)
+            if record:
+                notification.sub["last_ping_event_id"] = ev.id
+
+        notification._send_event = send
+        return notification
+
+    async def _deliver(self, notification, events):
+        notification.events = events
+        notification.d = {"events": events}
+        await notification._send_pings()
+
+    async def _ask_again_then_replay(self, record):
+        adapter = _SlackAdapter()
+        notification = self._replaying(adapter, record)
+        batch = [
+            SimpleNamespace(id=4, kind="unblocked", payload=None),
+            SimpleNamespace(id=5, kind="blocked", payload=self.SECOND),
+        ]
+        with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "1"}):
+            await self._deliver(notification, [SimpleNamespace(id=3, kind="blocked", payload=self.QUESTION)])
+            await self._deliver(notification, batch)
+            # The wake was not accepted: the claim rewinds and the same batch is delivered again.
+            await self._deliver(notification, batch)
+        return adapter, notification, batch
+
+    async def test_a_replayed_unblock_leaves_the_later_question_open(self):
+        adapter, _notification, _batch = await self._ask_again_then_replay(record=True)
+        self.assertEqual([entry[0] for entry in slack_ux_moments._questions.values()], [5])
+        self.assertEqual(len(adapter.updates), 1, "the replay settled the question the later block posted")
+
+    async def test_the_retried_wake_keeps_its_no_re_ask_note(self):
+        _adapter, notification, batch = await self._ask_again_then_replay(record=True)
+        text = slack_ux_moments.wake_text(notification.sub, batch, ["blocked"], "W")
+        self.assertIn(slack_ux_moments.WAKE_NOTE, text)
+
+    async def test_a_replayed_unblock_leaves_the_question_open_when_the_ping_record_lags(self):
+        # The lagging record re-sends blocked 5; unguarded, the replayed unblock
+        # first settles its question, so the user is asked it a second time.
+        adapter, notification, batch = await self._ask_again_then_replay(record=False)
+        self.assertEqual((len(adapter.posts), len(adapter.updates)), (2, 1))
+        self.assertEqual([entry[0] for entry in slack_ux_moments._questions.values()], [5])
+        text = slack_ux_moments.wake_text(notification.sub, batch, ["blocked"], "W")
+        self.assertIn(slack_ux_moments.WAKE_NOTE, text)
+
+
 if __name__ == "__main__":
     unittest.main()
