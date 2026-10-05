@@ -155,6 +155,12 @@ INSPECTION_COMMANDS = [
     "python3 -m pip show google-api-python-client",
     "pip3 list | grep -i google-auth",
     "pip freeze | grep -i oauth2client 2>/dev/null",
+    # A path through a shell variable and a `$`-anchored regex: a bare `$`
+    # is a parameter expansion, which runs nothing, so each is still one
+    # plain grep or pip query.
+    'grep -rn print-access-token "$SKILL_DIR"/scripts/',
+    "grep -rn 'print-access-token$' /opt/defaults/skills/kube-agents-observability/scripts/",
+    'pip show "$PKG" | grep -i google-auth',
 ]
 
 # The same words with grep no longer alone on the line, as typed: a second
