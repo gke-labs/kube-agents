@@ -1002,9 +1002,10 @@ class BlocksFromIssueTest(unittest.TestCase):
         self.assertEqual(second[-1], {"type": "text", "text": "new", "style": {"italic": True}})
         self.assertIn("secrets · _new_", text)
 
-    def test_clean_and_unparsed_runs_have_no_blocks(self):
-        clean = {"title": "[audit] Cost Audit — 0 findings (0 critical)", "body": "Nothing."}
-        self.assertIsNone(sar.blocks_from_issue(clean, REF, "Cost audit: clean — " + LEDGER))
+    def test_a_held_run_over_an_open_ledger_and_an_unparsed_issue_have_no_blocks(self):
+        # The open ledger still carries the last run's title; a line saying this run held it is not that run.
+        held = "Security & RBAC posture audit: held, 2 critical carried — " + LEDGER
+        self.assertIsNone(sar.blocks_from_issue(ISSUE, REF, held))
         self.assertIsNone(sar.blocks_from_issue({"title": "something else"}, REF, REPORT))
 
 
