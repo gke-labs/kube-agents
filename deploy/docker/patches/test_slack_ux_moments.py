@@ -323,10 +323,16 @@ class WakeTextTest(unittest.TestCase):
     def test_notes_the_question_posted_for_this_event(self):
         _run(runtime.needs_you(_Adapter(), SUB, QUESTION, 3))
         noted = runtime.wake_text(SUB, [_event(2, "heartbeat"), _event(3)], {"blocked"}, WAKE)
-        self.assertEqual(noted, f"{WAKE}\n\n{runtime.WAKE_NOTE}")
+        self.assertEqual(noted, f"{WAKE}\n\n{runtime.WAKE_NOTE} {runtime.WAKE_NOTE_ANSWERED}")
         self.assertIn("[SILENT]", noted)
         self.assertIn("kanban_comment", noted)
         self.assertIn("kanban_unblock", noted)
+
+    def test_a_question_outside_a_thread_is_not_followed_by_silence(self):
+        sub = {**SUB, "thread_id": ""}
+        _run(runtime.needs_you(_Adapter(), sub, QUESTION, 3))
+        noted = runtime.wake_text(sub, [_event(3)], {"blocked"}, WAKE)
+        self.assertEqual(noted, f"{WAKE}\n\n{runtime.WAKE_NOTE}")
 
     def test_a_retried_wake_is_noted_again(self):
         _run(runtime.needs_you(_Adapter(), SUB, QUESTION, 3))
@@ -491,17 +497,19 @@ class SettleQuestionTest(unittest.TestCase):
         self.assertEqual(_buttons(adapter.updates[0]["blocks"]), [])
         self.assertEqual(runtime._questions, {})
 
-    def test_only_the_mentions_a_reply_opens_with_are_dropped_from_its_line(self):
+    def test_only_the_agents_mentions_a_reply_opens_with_are_dropped_from_its_line(self):
         for text, words in (
-            ("<@U0BOT> <@U9|sam>  seeded-b", "seeded-b"),
-            ("<@U0BOT>: seeded-b", "seeded-b"),
-            ("seeded-b, ask <@U9|sam>", "seeded-b, ask sam"),
+            ("<@U0BOT> <@U9|sam>  seeded-b", "sam seeded-b"),
+            ("<@U0BOT>: <@U0BOT> seeded-b", "seeded-b"),
+            ("<@U9|sam> <@U0BOT> seeded-b", "sam @U0BOT seeded-b"),
+            ("<@U0BOT> seeded-b, ask <@U9|sam>", "seeded-b, ask sam"),
             ("<@U0BOT>", "@U0BOT"),
         ):
             with self.subTest(text=text):
                 runtime._questions.clear()
                 runtime._credited.clear()
                 adapter = _Adapter()
+                adapter._bot_user_id = "U0BOT"
                 _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
                 adapter.replies = [{"ts": "1700000000.000400", "user": "U7", "text": text}]
                 _run(runtime.settle_question(adapter, SUB))
@@ -672,11 +680,21 @@ class SettleQuestionTest(unittest.TestCase):
             return await resolve(user_id, chat_id, team_id)
 
         adapter._resolve_user_name = flaky
+        adapter._bot_user_id = "U0BOT"
         _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
         adapter.replies = [{"ts": "1700000000.000400", "user": "U7", "text": ", <@U0BOT> seeded-b, ask <@U9>"}]
         _run(runtime.settle_question(adapter, SUB))
         note = adapter.updates[0]["blocks"][-1]["elements"][0]["text"]
         self.assertEqual(note, "✓ Priya: seeded-b, ask @U9")
+
+    def test_the_workspaces_own_bot_mention_is_the_one_dropped(self):
+        adapter = _Adapter()
+        adapter._bot_user_id = "U0OTHER"
+        adapter._team_bot_user_ids = {SUB["team_id"]: "U0TEAM"}
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        adapter.replies = [{"ts": "1700000000.000400", "user": "U7", "text": "<@U0TEAM> seeded-b"}]
+        _run(runtime.settle_question(adapter, SUB))
+        self.assertEqual(adapter.updates[0]["blocks"][-1]["elements"][0]["text"], "✓ Priya: seeded-b")
 
     def test_a_click_whose_rewrite_failed_settles_without_a_typed_line(self):
         adapter = _Adapter()
@@ -851,7 +869,7 @@ class ApplierTest(unittest.TestCase):
         loaded = namespace["_kage_moments_wake_text"].__globals__
         with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "1"}):
             _run(loaded["needs_you"](_Adapter(), SUB, QUESTION, 3))
-        self.assertEqual(_wake(namespace, events=[_event(3)]), f"{WAKE}\n\n{runtime.WAKE_NOTE}")
+        self.assertEqual(_wake(namespace, events=[_event(3)]), f"{WAKE}\n\n{runtime.WAKE_NOTE} {runtime.WAKE_NOTE_ANSWERED}")
         self.assertEqual(_wake(namespace, events=[_event(3)], wake_kinds=("crashed",)), WAKE)
 
 

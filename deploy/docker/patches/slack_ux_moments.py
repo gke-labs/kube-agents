@@ -47,7 +47,7 @@ from a person the adapter would answer, not a bot, and through its channel gate,
 that no other question in the thread was shown with, and for a question retried
 after the card asked again, before the card's next question it still holds, becomes
 the same "✓ <name>: <words>" line a click leaves (the words as plain text on
-one line, without the user mentions it opens with, an unlabeled one elsewhere as ``@`` and
+one line, without the agent's own mentions it opens with, any other unlabeled one as ``@`` and
 the person's name, clipped to ``TYPED_ANSWER_MAX``).
 A card that moved on any other way, or with nobody replying, a read that fails, or a question a click answered whose rewrite
 failed (the click posted its line in the thread) settles without the line. A question a click already answered
@@ -100,7 +100,10 @@ WAKE_NOTE = (
     "The specialist's question is already posted to the user as its own message, in the "
     "specialist's words. Do not restate, paraphrase or acknowledge it. If nothing else "
     "in this notification needs saying, reply with exactly [SILENT]. When the user answers, "
-    "typed or clicked, carry the answer to the card with kanban_comment, then kanban_unblock. "
+    "typed or clicked, carry the answer to the card with kanban_comment, then kanban_unblock."
+)
+#: Added after :data:`WAKE_NOTE` for a question in a thread, the only place its answered line shows.
+WAKE_NOTE_ANSWERED = (
     "Once kanban_unblock succeeds, reply with exactly [SILENT] unless they also asked something "
     "else: the question already shows who answered and what. If it failed, say so."
 )
@@ -135,9 +138,9 @@ USER_MENTION = re.compile(r"<@([A-Z0-9]+)>")
 #: The characters that would end an entity's label early, read as spaces in a name put in one.
 MENTION_LABEL_UNSAFE = str.maketrans("|<>", "   ")
 
-#: The user mentions a reply opens with, such as the agent's in a channel that requires one.
-#: They address the reply, so they are not part of the answer its line shows.
-LEADING_MENTIONS = re.compile(r"^(?:[\s,:]*<@[A-Z0-9]+(?:\|[^<>]*)?>)+[\s,:]*")
+#: A user mention a reply opens with, and the separators around it. The agent's, which a
+#: channel may require, addresses the reply and is not part of the answer its line shows.
+LEADING_MENTION = re.compile(r"^[\s,:]*<@([A-Z0-9]+)(?:\|[^<>]*)?>[\s,:]*")
 
 #: Added to a question's ``text``, so a session the wake never reached reads its card in the thread.
 QUESTION_CARD_NOTE = "(Question from card {card}.)"
@@ -394,6 +397,15 @@ async def _named_mentions(adapter: Any, text: str, channel: str, team_id: str) -
     return USER_MENTION.sub(label, text)
 
 
+def _unaddressed(adapter: Any, text: str, team_id: str) -> str:
+    """``text`` less the agent's own mentions it opens with; a reply that is nothing else stays whole."""
+    bot = adapter._team_bot_user_ids.get(team_id, adapter._bot_user_id)
+    rest = text
+    while bot and (match := LEADING_MENTION.match(rest)) and match.group(1) == bot:
+        rest = rest[match.end():]
+    return rest or text
+
+
 async def _typed_note(
     adapter: Any, client: Any, sub: dict, channel: str, ts: str, until: str = ""
 ) -> tuple[str, tuple | None]:
@@ -423,7 +435,7 @@ async def _typed_note(
         _remember(_credited, credit, None)
         try:
             text = str(reply["text"])
-            text = await _named_mentions(adapter, LEADING_MENTIONS.sub("", text) or text, channel, team_id)
+            text = await _named_mentions(adapter, _unaddressed(adapter, text, team_id), channel, team_id)
             words = _presenter._clip(" ".join(_plain(text).split()), TYPED_ANSWER_MAX)
             who = await _who(adapter, reply, channel, team_id)
         except BaseException:
@@ -514,7 +526,8 @@ async def settle_question(adapter: Any, sub: dict, kind: str = UNBLOCKED_KIND, e
 
 
 def wake_text(sub: dict, events: Iterable[Any], wake_kinds: Any, text: str) -> str:
-    """``text`` with :data:`WAKE_NOTE` added when the wake is for a question this posted.
+    """``text`` with :data:`WAKE_NOTE` added when the wake is for a question this posted,
+    and :data:`WAKE_NOTE_ANSWERED` after it when that question is in a thread.
 
     Matched on the ``blocked`` event's id, so a notifier retry of the same
     delivery gets the note again and a later block that posted no question
@@ -531,7 +544,9 @@ def wake_text(sub: dict, events: Iterable[Any], wake_kinds: Any, text: str) -> s
             for ev in events or ()
             if getattr(ev, "kind", None) == BLOCKED_KIND
         }
-        return f"{text}\n\n{WAKE_NOTE}" if entry[0] in blocked else text
+        if entry[0] not in blocked:
+            return text
+        return f"{text}\n\n{WAKE_NOTE} {WAKE_NOTE_ANSWERED}" if sub.get("thread_id") else f"{text}\n\n{WAKE_NOTE}"
     except Exception:
         logger.debug("slack_ux_moments: reading the posted question failed", exc_info=True)
         return text

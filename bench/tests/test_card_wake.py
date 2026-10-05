@@ -284,7 +284,7 @@ def _moments_note() -> str:
         spec.loader.exec_module(module)
     finally:
         sys.path.remove(str(SCRIPTS))
-    return module.WAKE_NOTE
+    return f"{module.WAKE_NOTE} {module.WAKE_NOTE_ANSWERED}"
 
 
 def test_parse_reads_the_replay_fields() -> None:
