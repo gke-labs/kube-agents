@@ -826,7 +826,7 @@ async def settle_row(adapter: Any, sub: dict, kind: str) -> None:
         sender = plan
     if sender is not None:
         await _session(adapter, key, sender)
-    elif plan is None and not _lapsed.get(key):
+    elif (plan is None or not plan.ts) and not _lapsed.get(key):
         # An archive with no row in this process is cleanup of a card that
         # finished long ago, not a settle: the thread may hold another card.
         await _settle_orphan(adapter, sub, key, status, done and kind != ARCHIVED_KIND)

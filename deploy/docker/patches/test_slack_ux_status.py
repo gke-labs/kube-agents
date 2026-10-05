@@ -610,7 +610,18 @@ class PlanTest(_RuntimeCase):
         self.assertNotIn((CHANNEL, THREAD), runtime._plans)
         adapter.client.fail.clear()
         self.assertTrue(self._note(adapter, 2, "next card", task="t_b"))
-        self.assertEqual(self._kinds(adapter), ["post", "post", "setStatus"])
+        self.assertEqual(self._kinds(adapter), ["post", "setStatus", "post", "setStatus"])
+        self.assertEqual(self._sent(adapter), ["closed", "processing"])
+
+    def test_a_wait_after_a_refused_plan_post_suspends_and_completing_clears(self):
+        # A plan refused on its first post must still clear or suspend the
+        # session when its cards settle (the orphan path).
+        adapter = _Adapter(_Client(fail={"post"}))
+        self.assertFalse(self._note(adapter, 1, "reading logs"))
+        _run(runtime.settle_row(adapter, _sub(), "blocked"))
+        self.assertEqual(self._sent(adapter), ["suspended"])
+        _run(runtime.settle_row(adapter, _sub(), "completed"))
+        self.assertEqual(self._sent(adapter), ["suspended", "closed"])
 
     def test_no_thread_or_no_client_is_not_taken(self):
         self.assertFalse(_run(runtime.deliver_row(_Adapter(), _sub(thread=""), 1, "t", "x")))
@@ -852,7 +863,8 @@ class PlanTest(_RuntimeCase):
         _run(runtime.settle_row(adapter, _sub("t_a"), "completed"))
         self.assertIn((CHANNEL, THREAD), runtime._plans)
         self.assertFalse(self._note(adapter, 3, "b2", task="t_b"))
-        self.assertEqual(self._kinds(adapter), ["post"])
+        self.assertEqual(self._kinds(adapter), ["post", "setStatus"])
+        self.assertEqual(self._sent(adapter), ["closed"])
         _run(runtime.settle_row(adapter, _sub("t_b"), "completed"))
         self.assertNotIn((CHANNEL, THREAD), runtime._plans)
 
