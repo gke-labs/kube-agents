@@ -25,7 +25,7 @@ Pure functions only, like ``slack_presenter``, whose layout this reuses.
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 
 import slack_presenter as _presenter
 
@@ -174,6 +174,11 @@ WAITING = "⏸ waiting on you"
 
 def opened_pr(text: str) -> tuple[str, str, str, str] | None:
     """``(url, repo, number, line)`` for the first PR ``text`` says was opened, else None."""
+    return next(opened_prs(text), None)
+
+
+def opened_prs(text: str) -> Iterator[tuple[str, str, str, str]]:
+    """``(url, repo, number, line)`` for each PR ``text`` says was opened, in order."""
     for line in str(text or "").splitlines():
         for match in PR_URL.finditer(line):
             verb = OPENED_BEFORE_URL.search(line[: match.start()]) or _opened_pr_then(
@@ -184,8 +189,7 @@ def opened_pr(text: str) -> tuple[str, str, str, str] | None:
             before = line[: verb.start()]
             if NEGATED_VERB.search(before) or not _ours(before):
                 continue
-            return match.group(0), match.group(2), match.group(3), line.strip()
-    return None
+            yield match.group(0), match.group(2), match.group(3), line.strip()
 
 
 def _opened_pr_then(before: str, number: str) -> re.Match | None:
@@ -276,14 +280,20 @@ def _link(match: re.Match) -> str:
     return f"<{_presenter._link_url(url)}|{_escape(label)}>"
 
 
-def _subline_mrkdwn(subline: str) -> str:
-    """``subline`` escaped, with each Markdown link outside a code span as a mrkdwn link."""
+def _bolded(text: str) -> str:
+    """``text`` escaped, its Markdown bold as mrkdwn's single-star bold."""
+    return _presenter.MD_BOLD.sub(lambda m: f"*{next(g for g in m.groups() if g is not None)}*", _escape(text))
+
+
+def _subline_mrkdwn(subline: str, links: bool = True) -> str:
+    """``subline`` escaped with its bold as mrkdwn bold outside code spans; with
+    ``links``, each Markdown link there as a mrkdwn link."""
     held, spans = _presenter._hold_code(subline.replace("\x00", ""))
     parts, last = [], 0
-    for match in _presenter.MD_LINK.finditer(held):
-        parts += [_escape(held[last : match.start()]), _link(match)]
+    for match in _presenter.MD_LINK.finditer(held) if links else ():
+        parts += [_bolded(held[last : match.start()]), _link(match)]
         last = match.end()
-    text = "".join(parts) + _escape(held[last:])
+    text = "".join(parts) + _bolded(held[last:])
     return _presenter.CODE_PLACEHOLDER.sub(lambda m: _escape(spans[int(m.group(1))][0]), text)
 
 
@@ -293,7 +303,7 @@ def _with_subline(blocks: list[dict], subline: str, links: bool = False) -> list
     a link. An opened PR's line keeps its links as text, for :data:`PR_URL`'s reason."""
     if not subline:
         return blocks
-    text = _subline_mrkdwn(subline) if links else _escape(subline)
+    text = _subline_mrkdwn(subline, links)
     context = {"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}
     return [*blocks[:1], context, *blocks[1:]]
 

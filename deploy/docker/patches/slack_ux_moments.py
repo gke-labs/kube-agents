@@ -160,19 +160,18 @@ async def _post(adapter: Any, sub: dict, blocks: list[dict], text: str) -> str |
 
 
 async def pr_opened(adapter: Any, sub: dict, text: str) -> bool:
-    """Post the PR ``text`` says was opened, once per thread; True when posted."""
-    found = _moments.opened_pr(text)
-    if found is None:
-        return False
-    url, repo, number, line = found
-    key = (str(sub.get("chat_id") or ""), str(sub.get("thread_id") or ""), url)
-    if key in _announced:
-        return False
-    blocks, fallback = _moments.pr_opened(url, repo, number, line)
-    if await _post(adapter, sub, blocks, fallback) is None:
-        return False
-    _remember(_announced, key, None)
-    return True
+    """Post each PR ``text`` says was opened, once per thread; True when any posted."""
+    posted = False
+    for url, repo, number, line in _moments.opened_prs(text):
+        key = (str(sub.get("chat_id") or ""), str(sub.get("thread_id") or ""), url)
+        if key in _announced:
+            continue
+        blocks, fallback = _moments.pr_opened(url, repo, number, line)
+        if await _post(adapter, sub, blocks, fallback) is None:
+            continue
+        _remember(_announced, key, None)
+        posted = True
+    return posted
 
 
 async def needs_you(adapter: Any, sub: dict, payload: Any, event_id: int = 0) -> bool:
@@ -250,6 +249,13 @@ def _clicked(channel: str, ts: str) -> bool:
         return False
 
 
+def _without_choices(text: str) -> str:
+    """The question's ``text`` without its last "Reply with one of:" line, which
+    asks for an answer that has arrived; ``slack_ux_clicks`` drops it the same way."""
+    body, _nl, last = text.rpartition("\n")
+    return body.rstrip("\n") if body and last.startswith(_presenter.CHOICES_LEAD) else text
+
+
 async def _settled(adapter: Any, sub: dict, entry: tuple) -> bool:
     """Rewrite one question without its buttons; True once it needs nothing more."""
     _event_id, channel, ts, blocks, text = entry
@@ -258,7 +264,7 @@ async def _settled(adapter: Any, sub: dict, entry: tuple) -> bool:
     try:
         client = adapter._get_client(channel, team_id=sub.get("team_id") or None)
         await client.chat_update(
-            channel=channel, ts=ts, text=text, blocks=_moments.needs_you_settled(blocks)
+            channel=channel, ts=ts, text=_without_choices(text), blocks=_moments.needs_you_settled(blocks)
         )
     except Exception as exc:  # noqa: BLE001 — cosmetic; the next event retries
         logger.warning("slack_ux_moments: settling the question %s failed: %s", ts, exc)

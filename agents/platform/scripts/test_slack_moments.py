@@ -110,14 +110,20 @@ class OpenedPrTest(unittest.TestCase):
 
     def test_a_labels_evidence_keeps_its_markup_and_drops_the_url(self):
         blocks, _ = m.pr_opened(*m.opened_pr(f"**Opened PR:** <{PR}>"))
-        self.assertEqual(_contexts(blocks)[0], "**Opened PR #412**")
+        self.assertEqual(_contexts(blocks)[0], "*Opened PR #412*")
 
     def test_markup_wrapped_round_the_url_goes_with_it(self):
         for line in (f"Opened PR **{PR}**", f"Opened PR **<{PR}>**", f"Opened PR `{PR}`", f"Opened `{PR}`"):
             blocks, _ = m.pr_opened(*m.opened_pr(line))
             self.assertEqual(_contexts(blocks)[0], "Opened PR #412", line)
         blocks, _ = m.pr_opened(*m.opened_pr(f"**Done, opened PR {PR}**"))
-        self.assertEqual(_contexts(blocks)[0], "**Done, opened PR #412**")
+        self.assertEqual(_contexts(blocks)[0], "*Done, opened PR #412*")
+
+    def test_every_opened_pr_in_a_text_is_found(self):
+        other = "https://github.com/acme/other/pull/7"
+        found = list(m.opened_prs(f"- Opened {PR}\n- Opened {other}, and opened {PR}/files"))
+        self.assertEqual([f[0] for f in found], [PR, other, PR])
+        self.assertEqual(list(m.opened_prs(f"{PR} already covers it")), [])
 
     def test_another_link_on_the_pr_line_stays_text(self):
         blocks, _ = m.pr_opened(*m.opened_pr(f"Opened PR {PR}, see [docs](https://other.example/x)"))
@@ -362,6 +368,12 @@ class NeedsYouTest(unittest.TestCase):
         self.assertEqual(
             blocks[1]["elements"][0]["text"],
             "See <https://x.example/a?b=1&amp;c=2|runbook> or `[no](https://y.example)`.",
+        )
+
+    def test_bold_in_the_detail_is_slack_bold_outside_code(self):
+        blocks, _ = m.needs_you("Which pod should I restart?\n**web-1** is __OOMKilled__, not `**x**`.\n- web-1\n- web-2")
+        self.assertEqual(
+            blocks[1]["elements"][0]["text"], "*web-1* is *OOMKilled*, not `**x**`.\n- web-1\n- web-2"
         )
 
     def test_a_link_that_is_not_safe_stays_escaped_text(self):

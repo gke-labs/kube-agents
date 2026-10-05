@@ -817,8 +817,8 @@ _NO_REPLAY_CARD_REASON = (
 )
 _REPLAY_CARD_UNREAD_REASON = (
     "the replay's card could not be read before it was archived (the read "
-    "failed, or no card carried the run's key), so its status and comments "
-    "are unknown"
+    "failed, no card carried the run's key, or the agent under test archived "
+    "the planted card itself), so its status and comments are unknown"
 )
 _REPLAY_DECOY_UNREAD_REASON = (
     "the replay's decoy card could not be read (the prompt was not a "
