@@ -1,13 +1,13 @@
 # Slack Stop: cancel the turn and the cards, and say what changed
 
-Status: proposed; the reply wording is pending maintainer approval. Builds on the Slack status
-line (`deploy/docker/patches/slack_ux_status.py`), which owns the agent session's status and the
-thread's plan rows.
+Status: proposed; the checked-and-unchanged reply is approved, the other replies are pending
+maintainer approval. Builds on the Slack status line (`deploy/docker/patches/slack_ux_status.py`),
+which owns the agent session's status and the thread's plan rows.
 
 Slack's agent view puts a Stop button beside "working…". Pressing it stops everything the thread
 started: the Planning Agent's turn **and** every kanban card it filed that has not finished. The
-reply says "Nothing changed in <target>." only when that has been checked and found true; otherwise
-it says what did change, or that it could not check.
+reply says "I didn't change anything in <target>." only when that has been checked and found true;
+otherwise it says what did change, or that it could not check.
 
 ## Today
 
@@ -172,7 +172,7 @@ The A2A bridge (`a2a/hermes-bridge/bridge.go`) contributes patterns, not code: k
 refuse to start work with a cancel already behind it, and record the stop for work nobody is
 running. Kanban cards never cross the A2A bus.
 
-## How "nothing changed" is checked
+## How "I didn't change anything" is checked
 
 Each door keeps its own record.
 
@@ -216,7 +216,7 @@ RBAC refusal is not, and `started` with no outcome, as when the worker was kille
 unknown. The tool list is Google's and can grow, which is why it reads by prefix rather than
 enumerating writes.
 
-`stop_thread` says "Nothing changed" only when all of these hold:
+`stop_thread` says "I didn't change anything" only when all of these hold:
 
 1. read-only enforcement was on (a new broker route reporting `read_only_enforced()`);
 2. the fence drained: no stopped label has a command in flight;
@@ -252,17 +252,18 @@ Limits the reply carries rather than hides:
 
 Every reply after a stop starts "Stopped". `<target>` is the cluster a stopped card was assigned to,
 read from the Cluster Agent profile it ran under (one per cluster); a card on the Platform Agent
-names no cluster. Several targets are joined "seeded-a or seeded-b" up to three, then
-"3 clusters". With no target, the clause is dropped ("Nothing changed."). Several writes are one
-line each under a single "Stopped." The reply is one message in the thread.
+names no cluster. Several targets are joined "seeded-a or seeded-b" up to three, then "3 clusters".
+With no target, the clause is dropped ("I didn't change anything."). Several writes are one line
+each under a single "Stopped." The reply is one message in the thread.
 
-The replies below are pending maintainer approval; none is final until signed off.
+The three checked-and-unchanged rows are approved; the rest are pending maintainer approval and
+none of them is final until signed off.
 
 | Case                                                             | Reply                                                                                                                           |
 | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| Checked, nothing changed                                         | Stopped. Nothing changed in seeded-a.                                                                                           |
-| Checked, nothing changed, several targets                        | Stopped. Nothing changed in seeded-a or seeded-b.                                                                               |
-| Checked, nothing changed, no target known                        | Stopped. Nothing changed.                                                                                                       |
+| Checked, nothing changed                                         | Stopped. I didn't change anything in seeded-a.                                                                                  |
+| Checked, nothing changed, several targets                        | Stopped. I didn't change anything in seeded-a or seeded-b.                                                                      |
+| Checked, nothing changed, no target known                        | Stopped. I didn't change anything.                                                                                              |
 | A pull request was opened and is still open                      | Stopped. Before stopping, I opened a pull request for seeded-a: #412. It's still open; close it if you don't want it.           |
 | A pull request was opened and has merged                         | Stopped. Before stopping, I opened a pull request for seeded-a and it has merged: #412. Revert it if you don't want the change. |
 | A pull request was updated                                       | Stopped. Before stopping, I updated my pull request for seeded-a: #412.                                                         |
@@ -281,17 +282,15 @@ Slack. The existing `STOPPED` reword in `slack_boilerplate.py` ("Stopped. Send m
 you want to carry on.") is replaced by these on Slack, because it says nothing about the cards. A
 stopped card's plan row reads "Stopped" in its detail, with the ✗ icon.
 
-**Pending maintainer approval:** "Nothing changed in seeded-a" is the mock's wording, and it reads as a claim about
-the cluster, while the check covers only this thread's writes. "Stopped. I didn't change anything in
-seeded-a." says exactly what was checked. The eval accepts whichever is chosen; the table above uses
-the mock's until decided.
+The maintainer chose "Stopped. I didn't change anything in seeded-a." over the mock's "Nothing
+changed in seeded-a", because the check covers this thread's writes, not the whole cluster.
 
 ## Eval case
 
 `bench/tasks/chat-stop-halts-delegated-remediation/task.yaml`: the user asks for a remediation the
 Planning Agent delegates as a card ending in a pull request; the harness sends Stop once the first
 card is filed; the case asserts that no write lands after the stop beyond the kill window, and that
-the reply says "Nothing changed in" only when nothing was written.
+the reply says "I didn't change anything in" only when nothing was written.
 
 The case runs on the api lane, which never touches Slack, so it grades `stop_thread` (the
 fence, the archive and the check) through the door it was called from, which is why card lookup
@@ -346,8 +345,8 @@ prompt: >-
   submit-suggestion skill. Do not apply anything to the cluster.
 expected_output: >-
   The Planning Agent files the work as a card and acknowledges it. When the user stops it, every
-  card stops before writing anything, and the reply says "Stopped." and "Nothing changed in
-  <cluster>." No pull request or branch is written.
+  card stops before writing anything, and the reply says "Stopped." and "I didn't change
+  anything in <cluster>." No pull request or branch is written.
 infrastructure:
   deployer: noop
 validated: false
@@ -375,7 +374,7 @@ verification_spec:
         - type: all
           checks:
             - type: report_contains
-              required_phrases: ["Stopped", "Nothing changed in"]
+              required_phrases: ["Stopped", "didn't change anything in"]
             - type: none
               checks:
                 - type: github_writes
@@ -384,7 +383,7 @@ verification_spec:
           checks:
             - type: report_contains
               required_phrases: ["Stopped", "Before stopping"]
-              forbidden_phrases: ["Nothing changed in"]
+              forbidden_phrases: ["didn't change anything in"]
             - type: github_writes
               owner: gke-agentic
   - name: no-write-after-the-kill-window
@@ -407,11 +406,13 @@ child errors. `tool_called` accepts `require_success`; `report_contains` accepts
 `required_phrases`, `forbidden_phrases` and `any_of_phrases`.
 
 `report_contains` lowercases both sides, so no reply other than the verified one may contain
-"nothing changed in"; the read-only-off row is worded around it for that reason.
+"didn't change anything in"; the could-not-check, read-only-off and would-not-stop rows are worded
+around it for that reason. `stop_thread` builds the reply from fixed strings with a straight
+apostrophe, so the phrase never meets a typographic one.
 
-`github_writes` sees bot pull requests and `platform-agent/` branches only, so the case backs the
-"Nothing changed" claim for those writes and not for the table's issue, comment and label rows,
-which unit tests of the ledger cover.
+`github_writes` sees bot pull requests and `platform-agent/` branches only, so the case backs the "I
+didn't change anything" claim for those writes and not for the table's issue, comment and label
+rows, which unit tests of the ledger cover.
 
 The case asserts no MCP write: on the pool projects the agent's IAM refuses one, and existing cases
 do not enumerate the `gke` server's tool names, which are Google's to change.
@@ -430,7 +431,8 @@ case cannot land marked ahead of the fix. It lands with the build: red shown on 
 
 ## Open before the build
 
-- **Live probe, not run.** Nobody has pressed Stop on an app subscribed to `agent_session_stopped`.
+- **Live probe, deliberately parked.** It is held until the build, not merely unrun: nobody has
+  pressed Stop on an app subscribed to `agent_session_stopped`.
   The probe: subscribe the event on a test app's manifest, start a session that holds `processing`,
   press Stop once, and log the event's keys at the relay; then restore the manifest. It posts to
   Slack and edits the app, so it needs the owner's go-ahead. The event shape here is from Slack's
