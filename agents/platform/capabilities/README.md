@@ -18,7 +18,11 @@ Each directory holds:
 `criteria.json` here is the shipped default and must validate against the schema beside it —
 `test_capability_store.py` checks every directory. Keep the defaults quiet: a capability's first
 weeks on a fleet are for tuning, and the procedure that reads these values (the governance SOP or
-`SKILL.md`) names each key beside the check it drives. A key a release stops shipping stays on the
+`SKILL.md`) names each key beside the check it drives. An audit whose checks run in a collector script gets
+the values as that script's flags, one per key, on the command the SOP shows: the collector runs in
+the shell sandbox, which never receives this tree, so the agent's `get` is how a tuned value reaches
+a candidate's severity, and the manifest the collector writes records the values it used. A key a
+release stops shipping stays on the
 volume until the next `set`, which prunes it and says so in the changelog; the schema is what
 declares it gone.
 
