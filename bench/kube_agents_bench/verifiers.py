@@ -163,7 +163,9 @@ class ReportContainsVerifier(BaseVerifier):
     so a Markdown bullet or heading with no terminal punctuation is its own
     segment and a pattern may anchor on ``\\n``; the flat collapse would
     otherwise fuse a negated bullet into its unnegated neighbour before the
-    regex runs.
+    regex runs. ``any_of_patterns`` are alternatives to ``any_of_phrases``
+    for the phrase a substring cannot bound: "it stopped" also matches
+    "limit stopped". Each is ``re.search``ed against the flat normalization.
 
     Both sides are normalized first, by ``_normalize`` above: lowercased,
     Markdown emphasis dropped, whitespace runs collapsed. These are the
@@ -191,10 +193,11 @@ class ReportContainsVerifier(BaseVerifier):
     # spellings ("HPA" / "HorizontalPodAutoscaler"), all-of required_phrases
     # would punish a correct report for choosing the other name.
     any_of_phrases: list[str] = Field(default_factory=list)
+    any_of_patterns: list[str] = Field(default_factory=list)
     forbidden_patterns: list[str] = Field(default_factory=list)
     scope: Literal["final", "full"] = "final"
 
-    @field_validator("forbidden_patterns")
+    @field_validator("forbidden_patterns", "any_of_patterns")
     @classmethod
     def _forbidden_patterns_compile(cls, patterns: list[str]) -> list[str]:
         for pattern in patterns:
@@ -218,8 +221,9 @@ class ReportContainsVerifier(BaseVerifier):
         pattern_hits = [
             p for p in self.forbidden_patterns if re.search(p, _normalize_lines(raw))
         ]
-        any_of_miss = bool(self.any_of_phrases) and not any(
-            _normalize(p) in text for p in self.any_of_phrases
+        any_of_miss = bool(self.any_of_phrases or self.any_of_patterns) and not (
+            any(_normalize(p) in text for p in self.any_of_phrases)
+            or any(re.search(p, text) for p in self.any_of_patterns)
         )
         if missing or present or pattern_hits or any_of_miss:
             parts = []
@@ -233,7 +237,8 @@ class ReportContainsVerifier(BaseVerifier):
                 )
             if any_of_miss:
                 parts.append(
-                    f"none of the alternative phrasings present: {self.any_of_phrases}"
+                    "none of the alternative phrasings present: "
+                    f"{self.any_of_phrases + self.any_of_patterns}"
                 )
             return VerificationResult(
                 success=False,

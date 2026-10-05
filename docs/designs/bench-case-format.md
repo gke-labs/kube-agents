@@ -178,7 +178,8 @@ Nine read what the run produced, from this repository
 `devops_bench.verifiers` entry-point group in `bench/pyproject.toml`):
 `report_contains` (phrases in the agent's answer; its `forbidden_patterns` are
 regular expressions, for a banned word whose negated uses are legitimate and
-which no substring can express), `tool_called` (calls in the
+which no substring can express, and its `any_of_patterns` are regular-expression
+alternatives to `any_of_phrases`, for a phrase that must start at a word boundary), `tool_called` (calls in the
 trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
 published), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier

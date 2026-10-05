@@ -103,6 +103,9 @@ verification_spec:
   # ("twice", "both attempts") does not, so none is here. Nor is a bare
   # "stopped" or "exhausted": "the pods stopped responding" and "exhausted its
   # 30-minute limit" describe the failure, not the end of the run.
+  # "It stopped" and "won't retry" are patterns, not phrases: a substring
+  # matches "limit stopped it" and "won't retry forever", which say the
+  # opposite.
   - name: the-reply-says-it-stopped
     role: objective
     mode: assert
@@ -112,9 +115,6 @@ verification_spec:
         - "gave up"
         - "given up"
         - "giving up"
-        - "it stopped"
-        - "it's stopped"
-        - "it has stopped"
         - "has now stopped"
         - "stopped for good"
         - "stopped running"
@@ -123,8 +123,6 @@ verification_spec:
         - "will not be retried"
         - "isn't being retried"
         - "not being retried"
-        - "won't retry"
-        - "will not retry"
         - "no more retries"
         - "out of retries"
         - "retries exhausted"
@@ -152,6 +150,9 @@ verification_spec:
         - "won't rerun"
         - "won't re-run"
         - "not retrying it"
+      any_of_patterns:
+        - '\bit(?:''s| has)? stopped'
+        - '\b(?:won''t|will not) retry\b(?! (?:forever|indefinitely|endlessly))'
   # SOUL step 5: the reply answers for the whole team, so a reply to
   # any failure wake, crashed and timed_out included, names no agent,
   # specialist or card, and never says "unblock" or "re-route".

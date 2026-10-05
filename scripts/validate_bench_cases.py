@@ -296,6 +296,7 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "required_phrases",
         "forbidden_phrases",
         "any_of_phrases",
+        "any_of_patterns",
         "forbidden_patterns",
     ),
     "ledger_issue_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),

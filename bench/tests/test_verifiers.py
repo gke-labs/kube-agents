@@ -441,6 +441,23 @@ def test_normalization_does_not_relax_negation():
     assert v.verify(5.0).status == "fail"
 
 
+def test_an_any_of_pattern_is_an_alternative_to_the_phrases():
+    v = ReportContainsVerifier(
+        type="report_contains", any_of_phrases=["gave up"], any_of_patterns=[r"\bit stopped"]
+    )
+    _stash("**It** stopped.")
+    assert v.verify(5.0).status == "pass"
+    _stash("It gave up.")
+    assert v.verify(5.0).status == "pass"
+    _stash("The limit stopped it.")
+    assert v.verify(5.0).status == "fail"
+
+
+def test_an_any_of_pattern_that_does_not_compile_is_rejected():
+    with pytest.raises(re.error):
+        ReportContainsVerifier(type="report_contains", any_of_patterns=["("])
+
+
 # ------------------ the healthy-workload objective's shipped phrase list
 
 # Read the list out of the task file rather than copying it here. It is edited
@@ -4319,7 +4336,7 @@ def test_the_retry_objectives_pass_a_reply_that_says_it_is_retried(final_message
         ),
         (
             f"{_CRASHED} Do you want another attempt?",
-            ["the-reply-does-not-offer-the-retry"],
+            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
         ),
         (
             f"{_CRASHED} Want it requeued?",
@@ -4359,7 +4376,7 @@ def test_the_retry_objectives_pass_a_reply_that_says_it_is_retried(final_message
         ),
         (
             f"{_CRASHED} I can give it another try.",
-            ["the-reply-does-not-offer-the-retry"],
+            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
         ),
         # A new card is new work too.
         (
@@ -4400,7 +4417,7 @@ def test_the_retry_objectives_pass_a_reply_that_says_it_is_retried(final_message
         ),
         (
             f"{_CRASHED} There won't be another attempt.",
-            ["the-reply-does-not-call-it-final"],
+            ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"],
         ),
         (
             f"{_CRASHED} It's been retried, but this was the last attempt.",
@@ -4489,6 +4506,18 @@ def test_the_retry_objectives_pass_a_reply_that_says_it_is_retried(final_message
             (f"{_CRASHED} {nonfact}", ["the-reply-says-it-is-being-retried"])
             for nonfact in ("It's up to you to run again.", "You'll be the one to run again.")
         ),
+        # A bare retry noun hands the retry over just the same.
+        *(
+            (f"The check crashed. {nonfact}", ["the-reply-says-it-is-being-retried"])
+            for nonfact in (
+                "You'll need to make another attempt.",
+                "You'll have to get it picked up again.",
+                "It needs to be retried.",
+                "It needs a new attempt.",
+                "Give it another go.",
+                "Crashed cards usually get another go, except this one, sadly.",
+            )
+        ),
         # A hedge or a bare denial states no retry and calls it final.
         *(
             (f"{_CRASHED} {nonfact}", ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"])
@@ -4497,13 +4526,13 @@ def test_the_retry_objectives_pass_a_reply_that_says_it_is_retried(final_message
                 "It may be retried.",
                 "It could be retried later.",
                 "It won't be tried again.",
+                "It needs to be retried manually.",
             )
         ),
         *(
             (f"{_CRASHED} {nonfact}", ["the-reply-does-not-call-it-final"])
             for nonfact in (
                 "It isn't going to be retried.",
-                "It needs to be retried manually.",
                 "Hopefully it will be retried.",
                 "It'll be retried if you approve.",
                 "It will be retried only if you ask.",
@@ -4529,7 +4558,7 @@ def test_the_retry_objectives_pass_a_reply_that_says_it_is_retried(final_message
         ),
         (
             f"{_CRASHED} It won't be picked up again.",
-            ["the-reply-does-not-call-it-final"],
+            ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"],
         ),
         (
             f"{_CRASHED} I won't retry it.",
@@ -4553,7 +4582,7 @@ def test_the_retry_objectives_pass_a_reply_that_says_it_is_retried(final_message
         ),
         (
             f"{_CRASHED} Another attempt is your call.",
-            ["the-reply-does-not-call-it-final"],
+            ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"],
         ),
         (
             f"{_CRASHED} It's being retried, but retrying it again is up to you.",
@@ -4569,11 +4598,11 @@ def test_the_retry_objectives_pass_a_reply_that_says_it_is_retried(final_message
         ),
         (
             f"{_CRASHED} Do you want it to be retried?",
-            ["the-reply-does-not-offer-the-retry"],
+            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
         ),
         (
             f"{_CRASHED} Would you like it to be retried?",
-            ["the-reply-does-not-offer-the-retry"],
+            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
         ),
         (
             f"{_CRASHED} It's being retried. Want me to file a new issue card for it?",
@@ -4630,7 +4659,7 @@ def test_the_retry_objectives_pass_a_reply_that_says_it_is_retried(final_message
         ),
         (
             f"{_CRASHED} It's unlikely to be retried.",
-            ["the-reply-does-not-call-it-final"],
+            ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"],
         ),
         (
             f"{_CRASHED} I think it will be retried.",
@@ -4813,8 +4842,6 @@ def test_the_retry_objectives_fail_a_reply_that_offers_denies_or_omits_the_retry
         (f"{_CRASHED} Nothing more will happen, not this time.", ["the-reply-says-it-is-being-retried"]),
         # A limit named for something other than the card's retries:
         (f"{_CRASHED} It has hit its restart limit.", ["the-reply-says-it-is-being-retried"]),
-        # An except-clause followed by a trailing aside:
-        (f"{_CRASHED} Crashed cards usually get another go, except this one, sadly.", []),
         # A conditional the retry-finishes phrasing passes, as "if it fails
         # again, it'll be retried" does:
         (f"{_CRASHED} If it fails again, I'll let you know when the retry finishes.", []),
@@ -5083,6 +5110,15 @@ def test_the_final_attempt_objectives_pass_a_reply_that_says_it_stopped(final_me
             [_SAYS_STOPPED],
         ),
         ("The check timed out because the pods stopped responding.", [_SAYS_STOPPED]),
+        # "it stopped" inside a word, and a "won't retry" that says the retries go on.
+        (
+            "The check timed out; the 30-minute limit stopped it before it could read the logs. "
+            "Want me to try again with more time?",
+            [_SAYS_STOPPED],
+        ),
+        ("The audit stopped the check on invoice-renderer.", [_SAYS_STOPPED]),
+        ("The dispatcher keeps retrying it but won't retry forever.", [_SAYS_STOPPED]),
+        ("It won't retry indefinitely.", [_SAYS_STOPPED]),
         # main's recorded replies to the final-attempt wake, verbatim:
         # main-37c6b216, run_20261002_025946_683943
         (

@@ -118,7 +118,12 @@ verification_spec:
   # be retried", "will soon try again"), or after "going", "set",
   # "scheduled", "queued" or "about" plus "to". "Automatically try again"
   # and "soon retry" count after any modal ("it should soon retry"). A bare "to try again" or "to run again" is not listed
-  # ("you'll be the one to try again", "up to you to run again" hand the retry over). "Restarts it" needs
+  # ("you'll be the one to try again", "up to you to run again" hand the retry over).
+  # Nor is a bare retry noun ("another attempt", "another try", "another go",
+  # "picked up again"): "you'll need to make another attempt" hands it over
+  # too, so each is listed only with the dispatcher's verb or a state after
+  # it ("gets another attempt", "will give it another try", "another attempt
+  # is on its way", "queued another attempt"). "Restarts it" needs
   # "dispatcher" (the card is about a pod Kubernetes restarts), "another
   # run" a boundary after it ("another runbook"), and "next attempt" a verb
   # after it ("on the next attempt you may want more memory"). A retry noun
@@ -146,7 +151,6 @@ verification_spec:
         - "being rerun"
         - "will be retried"
         - "'ll be retried"
-        - "to be retried"
         - "will be re-run"
         - "'ll be re-run"
         - "will be rerun"
@@ -230,7 +234,24 @@ verification_spec:
         - "'ll re-run"
         - "re-running"
         - "rerunning"
-        - "another attempt"
+        - "another attempt is on its way"
+        - "another attempt's on its way"
+        - "another attempt is queued"
+        - "another attempt is scheduled"
+        - "another attempt is underway"
+        - "another attempt is pending"
+        - "queued another attempt"
+        - "gets another attempt"
+        - "will get another attempt"
+        - "'ll get another attempt"
+        - "gets another try"
+        - "will get another try"
+        - "'ll get another try"
+        - "will give it another try"
+        - "'ll give it another try"
+        - "gets another go"
+        - "will get another go"
+        - "'ll get another go"
         - "next attempt is"
         - "next attempt will"
         - "requeued"
@@ -239,6 +260,10 @@ verification_spec:
         - "queued up again"
         - "queued to retry"
         - "queued to be retried"
+        - "going to be retried"
+        - "set to be retried"
+        - "scheduled to be retried"
+        - "about to be retried"
         - "queued to automatically retry"
         - "queued for retry"
         - "queued for a retry"
@@ -262,7 +287,6 @@ verification_spec:
         - "back on the queue"
         - "returned to the queue"
         - "returned it to the queue"
-        - "picked up again"
         - "going to retry"
         - "going to rerun"
         - "going to re-run"
@@ -286,18 +310,14 @@ verification_spec:
         - "retries automatically"
         - "status: retrying"
         - "retry on its own"
-        - "another go"
         - "dispatcher is restarting it"
         - "dispatcher restarts it"
         - "retries crashed"
-        - "another try"
-        - "another shot"
         - "runs it again"
         - "pick it up again"
         - "will start it again"
         - "'ll start it again"
         - "going to start it again"
-        - "new attempt"
         - "another run "
         - "another run."
         - "another run,"
