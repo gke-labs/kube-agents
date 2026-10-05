@@ -143,7 +143,7 @@ default posture). Until then, flipping it is a `kubectl patch` on the PlatformAg
 Helm 3's three-way merge leaves fields the chart never sets alone, so a patched mode
 should survive chart upgrades.
 
-## One thing inside `next` has its own switch
+## Switches inside `next`
 
 The A2A gateway's inject door (`spec-chatops-gateway.md`, "The test backend") renders only
 when the OPERATOR carries `A2A_INJECT_BACKEND=true`, on top of `spec.mode: next`. That is not a
@@ -154,6 +154,32 @@ install is an eval install is a property of who deployed the operator, which is 
 image overrides are already decided. The operator's render tests check that the flag unset
 renders no part of the door, and the conformance suite that every render site consults the flag
 and that the flag is not a CRD field.
+
+A second switch of the same kind: `A2A_SESSION_CLUSTER_VIEW=true` on the operator, on top of
+`spec.mode: next`, gives the session pods the gateway spawns a temporary read-only view of the
+clusters. The operator names the session ServiceAccount on the credential broker's allowed
+callers, renders a session audience the broker maps to a role that reaches the exec route for
+`kubectl` and `gcloud` only, binds the two so that ServiceAccount may present only that audience
+and no other caller may present it, opens the broker's ingress and the session pod's egress to each
+other, and tells the gateway, whose spawner projects the audience-bound token and enables the
+worker's shell. The session ServiceAccount gains no RBAC in either state; `kubectl` runs in the
+broker, read-only in verbs, and with the broker's permissions: under a `custom` permission set
+with an admin role the broker's allowlist is the only control and `kubectl get secret` returns
+data, as
+[credential isolation](../site/src/content/docs/reference/credential-isolation.md#pod-anatomy)
+says of the platform agent. A session holds at most `CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_COMMANDS` broker commands at once (default 2; the operator's `spec.deployment.env` reaches it), so a conversation cannot take the whole command pool from the platform agent's shell. Operator-level for the reason above: the pod executes model output, and
+widening its fence is a property of who deployed the operator. Under the flag a session reads clusters with the platform agent's broker scope, and the only gate
+between a person and that read is the gateway's ingress allowlist. That differs from the design of
+record ([architecture 02](../architecture/02-agent-personas.md) §2.4,
+[03](../architecture/03-security-model.md) §4a, and "Sessions by default" in
+`spec-chatops-gateway.md`), where a session reaches cluster data only through a gateway-minted
+child task and the gateway checks the target agent's `AllowedUsers` against the requester first.
+Today the two gates admit the same people, because the ingress allowlist is the only human-to-agent
+check the gateway enforces. It is a demo aid with two retirement triggers, whichever lands first:
+declarative profiles carrying a session's identity and tools, and gateway-side `AllowedUsers`
+enforcement ([architecture 07](../architecture/07-implementation-roadmap.md)); once the gateway
+refuses a person for the platform agent, a session with this view would read its clusters anyway,
+so the flag goes before that enforcement ships.
 
 ## Per-feature overrides - sketched, not built
 

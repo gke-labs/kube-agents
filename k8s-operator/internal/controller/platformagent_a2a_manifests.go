@@ -247,6 +247,16 @@ const (
 	// explicit "true" is off, so a typo leaves the door shut.
 	a2aInjectBackendEnvVar = "A2A_INJECT_BACKEND"
 
+	// a2aSessionClusterViewEnvVar arms the session pods' temporary read-only
+	// cluster view: the pod becomes a caller of the credential broker with
+	// the broker's `session` role (kubectl and gcloud, read-only, nothing
+	// else). A demo aid until declarative profiles (spec-subagent-profiles)
+	// carry a session's identity and tools; the flag and everything it
+	// renders go when they do. Operator-level and off by default for the
+	// reason a2aInjectBackendEnvVar is: the pod executes model output, and
+	// what widens its fence is a property of who deployed the operator.
+	a2aSessionClusterViewEnvVar = "A2A_SESSION_CLUSTER_VIEW"
+
 	// a2aInjectListenEnvVar is what the operator renders onto the gateway to
 	// select the backend; a2aInjectListenHost and a2aInjectPort are the
 	// address it listens on. The host is the pod's loopback, not every
@@ -1057,6 +1067,14 @@ func a2aChatDisplayMode(mode string) string {
 		return a2aChatDisplayModeDefault
 	}
 	return strings.ToLower(mode)
+}
+
+// a2aSessionClusterViewEnabled reports whether this install's session pods
+// get the temporary cluster view: the literal "true" on the operator, and a
+// mode-next CR (nothing else spawns a session pod). Anything but "true" is
+// off, so a typo leaves the fence as it is.
+func a2aSessionClusterViewEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	return renderMode(agent, "a2a-session") == ModeNext && os.Getenv(a2aSessionClusterViewEnvVar) == "true"
 }
 
 // a2aCapabilityRequired renders "false" only for an explicit "false", so a
@@ -2037,10 +2055,23 @@ func buildA2ANATSService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 // session pod it creates, paired with part-of: a2aPartOf under the STANDARD
 // app.kubernetes.io/component key (the spawner is a client of the cluster, not
 // the operator, so it uses the standard key; operator-rendered pieces carry
-// a2aComponentLabel). Three things select on this pair and must agree: the
-// bus fence's session peer, the session fence's own podSelector, and the
-// gateway's session cap and sweeper, which count and list pods by it.
+// a2aComponentLabel). Everything that selects session pods must agree on this
+// pair: the bus fence's session peer, the session fence's own podSelector,
+// the broker fence's session peer under the cluster-view flag, and the
+// gateway's session cap and sweeper, which count and list pods by it. The
+// operator's selectors all come from a2aSessionPodSelector so they cannot
+// drift apart.
 const a2aSessionComponent = "a2a-session"
+
+// a2aSessionPodSelector is the one spelling of "a session pod" the operator's
+// NetworkPolicies select on. A fresh map per call: callers hand it to a
+// LabelSelector that the API machinery may mutate.
+func a2aSessionPodSelector() map[string]string {
+	return map[string]string{
+		labelPartOf:                   a2aPartOf,
+		"app.kubernetes.io/component": a2aSessionComponent,
+	}
+}
 
 func a2aNATSNetpolName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Name + "-a2a-nats-netpol"
@@ -2056,7 +2087,8 @@ func a2aSessionNetpolName(agent *agentv1alpha1.PlatformAgent) string {
 // the delegation path was the way around the agent's own allowlist.
 //
 // Deny-by-default with three destinations, which is the whole of a worker's
-// job description:
+// job description (plus a fourth, the credential broker on its one port, only
+// under the operator's cluster-view flag; see the rule at the end):
 //
 //	DNS       — name resolution for the two peers below, same peer set the
 //	            agent's egress policy uses so the two cannot drift on what DNS
@@ -2083,7 +2115,9 @@ func a2aSessionNetpolName(agent *agentv1alpha1.PlatformAgent) string {
 // even if a route existed. Three independent reasons, which is deliberate:
 // this is the pod that executes model output.
 //
-// A worker that needs the internet is a design change, not a policy widening.
+// A worker that needs the internet is a design change, not a policy widening:
+// the broker rule below is the one admitted widening, flag-gated, and it
+// reaches a pod that authenticates the caller rather than the internet.
 //
 // PolicyTypes carries Ingress with no rules on purpose: nothing dials a
 // session pod, so a listener in a worker is an accident and an accident should
@@ -2100,6 +2134,43 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 	// a Pod selector that no link-local address matches.
 	dnsPeers := clusterDNSPeers(dnsClusterIPs)
 
+	egress := []networkingv1.NetworkPolicyEgressRule{
+		{
+			Ports: []networkingv1.NetworkPolicyPort{udpPort(a2aDNSPort), tcpPort(a2aDNSPort)},
+			To:    dnsPeers,
+		},
+		{
+			Ports: []networkingv1.NetworkPolicyPort{tcpPort(a2aNATSClientPort)},
+			To: []networkingv1.NetworkPolicyPeer{
+				namespacedPodPeer(agent.Namespace, map[string]string{
+					labelPartOf:       a2aPartOf,
+					a2aComponentLabel: "nats",
+				}),
+			},
+		},
+		{
+			Ports: []networkingv1.NetworkPolicyPort{
+				tcpPort(a2aLiteLLMServicePort),
+				tcpPort(a2aLiteLLMUpstreamPort),
+				tcpPort(a2aLiteLLMContainerPort),
+			},
+			To: []networkingv1.NetworkPolicyPeer{
+				namespacedPodPeer(agent.Namespace, map[string]string{"app": "litellm"}),
+			},
+		},
+	}
+	if a2aSessionClusterViewEnabled(agent) {
+		// The credential broker, under the cluster-view flag: the one
+		// widening of this fence, to one pod on one port, and the pod on
+		// the other end authenticates the token and confers the session
+		// role. The API server stays unreachable from here; kubectl runs
+		// in the broker. Header comment: this IS the design change.
+		egress = append(egress, networkingv1.NetworkPolicyEgressRule{
+			Ports: []networkingv1.NetworkPolicyPort{tcpPort(credentialProxyPort)},
+			To:    []networkingv1.NetworkPolicyPeer{namespacedPodPeer(agent.Namespace, credentialProxySelector(agent))},
+		})
+	}
+
 	return &networkingv1.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -2110,45 +2181,21 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 		Spec: networkingv1.NetworkPolicySpec{
 			// No instance label, unlike the rest of what the operator
 			// renders, because the spawner stamps none — the selector can
-			// only name what the pods carry. Two PlatformAgents in one
-			// namespace would each fence the other's session pods with an
-			// identical rule set, so the effect is a duplicate fence rather
-			// than a gap; the bus grants still separate them at auth.
+			// only name what the pods carry. The webhook admits one
+			// PlatformAgent per cluster, so two agents' session pods never
+			// share a namespace; were that rule ever relaxed, each agent's
+			// fence would select the other's pods too, and what would then
+			// separate them is the bus grants at auth and, under the
+			// cluster-view flag, the broker's CREDENTIAL_PROXY_ALLOWED_CALLERS
+			// and session-callers binding — not this selector.
 			PodSelector: metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					labelPartOf:                   a2aPartOf,
-					"app.kubernetes.io/component": a2aSessionComponent,
-				},
+				MatchLabels: a2aSessionPodSelector(),
 			},
 			PolicyTypes: []networkingv1.PolicyType{
 				networkingv1.PolicyTypeIngress,
 				networkingv1.PolicyTypeEgress,
 			},
-			Egress: []networkingv1.NetworkPolicyEgressRule{
-				{
-					Ports: []networkingv1.NetworkPolicyPort{udpPort(a2aDNSPort), tcpPort(a2aDNSPort)},
-					To:    dnsPeers,
-				},
-				{
-					Ports: []networkingv1.NetworkPolicyPort{tcpPort(a2aNATSClientPort)},
-					To: []networkingv1.NetworkPolicyPeer{
-						namespacedPodPeer(agent.Namespace, map[string]string{
-							labelPartOf:       a2aPartOf,
-							a2aComponentLabel: "nats",
-						}),
-					},
-				},
-				{
-					Ports: []networkingv1.NetworkPolicyPort{
-						tcpPort(a2aLiteLLMServicePort),
-						tcpPort(a2aLiteLLMUpstreamPort),
-						tcpPort(a2aLiteLLMContainerPort),
-					},
-					To: []networkingv1.NetworkPolicyPeer{
-						namespacedPodPeer(agent.Namespace, map[string]string{"app": "litellm"}),
-					},
-				},
-			},
+			Egress: egress,
 		},
 	}
 }
@@ -2234,10 +2281,7 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 					}}},
 					// Session pods, by the spawner's labels (see
 					// a2aSessionComponent above).
-					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
-						labelPartOf:                   a2aPartOf,
-						"app.kubernetes.io/component": a2aSessionComponent,
-					}}},
+					{PodSelector: &metav1.LabelSelector{MatchLabels: a2aSessionPodSelector()}},
 					// The provision Job's pods.
 					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
 						labelPartOf:       a2aPartOf,
@@ -3697,6 +3741,17 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		}}
 	}
 
+	var clusterViewEnv []corev1.EnvVar
+	if a2aSessionClusterViewEnabled(agent) {
+		// The spawner's half of the cluster view: told, and told where the
+		// broker is. Both or neither - the gateway refuses the first
+		// without the second (a2a/gateway/config.go).
+		clusterViewEnv = []corev1.EnvVar{
+			{Name: "A2A_SESSION_CLUSTER_VIEW", Value: "true"},
+			{Name: "A2A_CREDENTIAL_PROXY_URL", Value: credentialProxyBaseURL(agent)},
+		}
+	}
+
 	// The Google Chat backend, applied the same way: three slices, empty
 	// when the install does not arm it, so every other render is
 	// byte-identical to what it was. What arms it is a2aChatArmed; what it
@@ -3841,6 +3896,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	}...)
 	env = append(env, chatEnv...)
 	env = append(env, injectEnv...)
+	env = append(env, clusterViewEnv...)
 
 	return &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},

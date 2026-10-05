@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, and the console adapter); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence; and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env, its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); not yet the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, or the default flip
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, and the console adapter); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence; and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env, its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); not yet the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, or the default flip; the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default, retired by declarative profiles or by gateway-side `AllowedUsers` enforcement, whichever lands first) is built
 
 ## Purpose
 
@@ -271,6 +271,15 @@ holds for a delegation too. The audit record for a session-routed turn names the
 session at the gateway; the child task's envelope names the target, the session that asked,
 and the same requester.
 
+One exception stands while its flag is on: the session pod's temporary read-only cluster view
+(`spec-mode-switch.md`, "Switches inside `next`") lets a session read clusters through the
+credential broker directly, with the platform agent's scope and no child task, so the only gate
+between the requester and that read is the gateway's ingress allowlist, not the target's
+`AllowedUsers`. Today both admit the same people. The view retires when declarative profiles
+carry a session's identity and tools or when the gateway enforces the target agent's
+`AllowedUsers` ([architecture 07](../architecture/07-implementation-roadmap.md)), whichever lands
+first; after the second, a session holding the view would be a way around that check.
+
 Delegation ends the turn. A session's turn is a conversation turn, bounded at thirty minutes
 by the `chat` profile's own deadline, and the executors it delegates to run to two hours; the
 two do not nest. When the session delegates, its turn completes with a reply that says so
@@ -318,7 +327,9 @@ long-lived sessions. Four operations:
 
 **Spawn.** First message in a conversation creates the pod: the demo's reference worker
 shape (no ambient k8s credentials, scratch on emptyDir, 250m/512Mi requests; egress
-fenced (8/31) to DNS, the bus, and LiteLLM - the deployment spec owns the policy),
+fenced (8/31) to DNS, the bus, and LiteLLM, except, under the operator's
+`A2A_SESSION_CLUSTER_VIEW` flag, the credential broker (`spec-mode-switch.md`) - the
+deployment spec owns the policy),
 running the headless harness behind a thin shim that bridges bus envelopes to the CLI's
 stream-json stdin/stdout. Model auth, as shipped (amended 8/31): the worker talks to
 the install's own LiteLLM, in-namespace, with no _cloud_ credential at all - the spawned

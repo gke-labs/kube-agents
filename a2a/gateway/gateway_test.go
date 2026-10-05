@@ -2197,6 +2197,32 @@ func TestSessionOnAckTellsSlackChannelsToMention(t *testing.T) {
 	}
 }
 
+// TestNewRefusesTheClusterViewWithoutABrokerURL: told the view is on but not
+// where the broker is, the gateway refuses to start rather than spawn pods
+// whose shim dials nothing.
+func TestNewRefusesTheClusterViewWithoutABrokerURL(t *testing.T) {
+	s := startServer(t)
+	url := s.ClientURL()
+	provision(t, url)
+	mapFile := filepath.Join(t.TempDir(), "principal-map")
+	if err := os.WriteFile(mapFile, []byte("1001 test:bnaylor\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test"), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.Close)
+	cfg := &Config{NATSURL: url, PrincipalMapPath: mapFile, DefaultAddressee: "platform", IdleTTL: 30 * time.Minute,
+		AttributionSalt: []byte("test-salt"), SessionClusterView: true}
+	if _, err := New(Options{Client: client, Adapter: newFakeAdapter(), Config: cfg, Backend: "discord", Spawner: &fakeSpawner{}}); err == nil ||
+		!strings.Contains(err.Error(), "A2A_CREDENTIAL_PROXY_URL") {
+		t.Fatalf("New() = %v, want a refusal naming A2A_CREDENTIAL_PROXY_URL", err)
+	}
+}
+
 // assertRootCapability is the DoD's first clause in unit form: grants is not
 // null, it names the key the gateway minted for this task, and the entry is
 // really there at the pinned revision with the addressee as its delegate.

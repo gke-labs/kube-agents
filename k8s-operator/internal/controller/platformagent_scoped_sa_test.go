@@ -404,12 +404,16 @@ func TestTheReservedListNamesTheA2AChatVariables(t *testing.T) {
 		// that set it would arm a second relay instance on whatever the
 		// broker's credential can pull, or refuse the broker's start.
 		{Name: "GOOGLE_CHAT_SUBSCRIPTION_NAME", Value: "projects/p/subscriptions/theirs"},
+		{Name: "CREDENTIAL_PROXY_SESSION_AUDIENCE", Value: "kubeagents-credential-proxy"},
+		{Name: "CREDENTIAL_PROXY_SESSION_CALLERS", Value: "system:serviceaccount:ns:theirs"},
 		{Name: "HARMLESS_PLUGIN_SETTING", Value: "kept"},
 	})
 	for _, name := range []string{
 		"CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE",
 		"A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME",
 		"GOOGLE_CHAT_SUBSCRIPTION_NAME",
+		"CREDENTIAL_PROXY_SESSION_AUDIENCE",
+		"CREDENTIAL_PROXY_SESSION_CALLERS",
 	} {
 		if _, count := envValueCount(merged, name); count != 0 {
 			t.Errorf("%s survived the merge from spec.deployment.env", name)

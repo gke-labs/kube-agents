@@ -165,6 +165,20 @@
 # repetitions measured 173-237s). Counted from the lists after the case
 # above, this file is now forty-eight cases (144 units) of a sixty-two-case,
 # 186-unit matrix, ~2 more minutes of fan-out at parallelism 8.
+#
+# 2026-10-02 adds autoops-controller-stall-triage: one case, three units,
+# ~55 serial minutes at its 1100s hint (dev-install repetitions measured
+# 1040-1080s), all of it on the infra lock with the other tofu cases, most of
+# it the stack waiting out stall_report.py's ten-minute Deployment threshold.
+# Counted from the lists with it, the last entry below: forty-nine cases
+# (147 units) here, of a sixty-three-case, 189-unit matrix with the presubmit
+# file's fourteen. The parallelism arithmetic above does not price
+# this case: every case with a `stack:` holds the infra lock for its whole run,
+# so those cases run one at a time whatever EVAL_TASK_PARALLELISM is. With this
+# case the nightly carries eleven of them, ~433 serial minutes at their
+# unit_cost_hint figures and three repetitions (~378 without it), against the
+# 480m deadline. Whether that fits is the eval crew's call, on the first nights'
+# record.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -540,3 +554,12 @@
 # names the read-only or refused write. `deployer: noop`, no fixture,
 # `validated: false` until its first observed runs; the 200s default hint.
 ./tasks/platform-worker-shell-edit-of-shipped-skill/task.yaml
+
+# The stall watch's half of incident-triage: a Deployment gated on a readiness
+# condition nothing sets, handed to the Session KV daemon as a
+# `controller-stall` inject and graded on the triage card the Planning Agent
+# files from it (docs/designs/stall-watch-inject.md). Tofu, so it serializes on
+# the infra lock; the plant waits out stall_report.py's ten-minute Deployment
+# threshold before it posts the record. Nightly rather than presubmit for that
+# wait.
+./tasks/autoops-controller-stall-triage/task.yaml

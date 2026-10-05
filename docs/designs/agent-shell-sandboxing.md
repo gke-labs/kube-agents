@@ -2547,7 +2547,8 @@ API server. Every path on the credentialed listener except `/healthz` requires i
 unidentified caller gets an undifferentiated `401` rather than a reason. `CREDENTIAL_PROXY_ALLOWED_CALLERS` names the
 TokenReview usernames the broker will serve — the sandbox's ServiceAccount, which is where
 every credentialed command originates, the gateway's, because the chat relays go through
-the same listener, and, when the next stack takes Google Chat, the A2A gateway's. The operator grants
+the same listener, when the next stack takes Google Chat, the A2A gateway's, and, under the
+operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session pods'. The operator grants
 the broker exactly one verb, `create` on `tokenreviews`, to do it.
 
 **The audience is per Pod, and it is what separates the callers.** The sandbox's token is
@@ -2566,7 +2567,14 @@ had and nothing checked. The same table carries a third role, `a2a-chat`, for th
 gateway: `/v1/chat/a2a/**` is that role's alone, `/v1/chat/api` it shares with the chat
 role, and the legacy event routes it cannot reach; [the chatops gateway
 design](spec-chatops-gateway.md) ("The Google Chat adapter") owns why that caller is kept
-apart from the legacy chat one. A `NetworkPolicy` would have expressed the same thing and is not the mechanism
+apart from the legacy chat one. Under the operator's `A2A_SESSION_CLUSTER_VIEW` flag there is
+a fourth, `session`, for the pods the A2A gateway spawns per conversation: their token is
+minted for `kubeagents-credential-proxy-session`, `/v1/exec` admits `(shell, session)`, and
+within that route `ROLE_EXECUTABLES` holds the session to `kubectl` and `gcloud`. Because a
+Pod picks the audience it projects, the role is also bound to the caller:
+`CREDENTIAL_PROXY_SESSION_CALLERS` names the session ServiceAccount, which may present only
+the session audience, and no other caller may present that audience
+([spec-mode-switch.md](spec-mode-switch.md#switches-inside-next) owns the flag). A `NetworkPolicy` would have expressed the same thing and is not the mechanism
 chosen, because it does nothing at all on a CNI that does not implement `NetworkPolicy` and
 `TokenReview` is answered by the API server on every cluster.
 
