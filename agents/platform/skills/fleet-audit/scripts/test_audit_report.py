@@ -16096,6 +16096,37 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertIn("The finding has not gone", comment)
         self.assertNotIn("If the finding comes back", comment)
 
+    def test_a_shielded_sibling_closes_the_pull_request_whose_branch_no_group_owns(self):
+        # The ordinary shape on a real run: another namespace still has a
+        # manifest fix this run, so a live group exists and the pre-declaration
+        # shared-account branch is no group's. Without the shield's exemption
+        # from the stranded rule, that pull request would stay open as "the
+        # only fix there is"; with it, the shielded close still fires.
+        path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
+        other = "clusters/prod-us-east/billing/default-sa-automount.yaml"
+        api = make_finding(fid="api", check="default-sa-automount", obj="Deployment/api", title="api", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        worker = make_finding(fid="worker", check="default-sa-automount", obj="Deployment/worker", title="worker", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        batch = make_finding(fid="batch", check="default-sa-automount", obj="Deployment/batch", title="batch", severity="major", namespace="billing", remediation={"kind": "manifest", "path": other, "note": "shared file"})
+        previous_body = published_body(make_doc(findings=[api, worker, batch], audit=AUDIT), generated_at=NOW)
+        self.declaring_replies(previous_body)
+        api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
+        worker_id = derived_id(check="default-sa-automount", obj="Deployment/worker")
+        self.harness.replies["proposal-list"] = proposals_view(
+            [pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([api_id, worker_id]))]
+        )
+        self.touch(path)
+        self.touch(other)
+        doc = make_doc(findings=[worker, batch], audit=AUDIT)
+        doc["declared"] = [{"check": "default-sa-automount", "cluster": "prod-us-east", "namespace": "payments", "object": "Deployment/api", "title": "api", "declaration": {"repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}}]
+        billing = dict(self.account_candidate("Deployment/batch"), namespace="billing")
+        manifest = _full_manifest(audit=AUDIT, candidates=[self.account_candidate("Deployment/api"), self.account_candidate("Deployment/worker"), billing])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
+        comment = " ".join(self.harness.bodies_for("proposal-*"))
+        self.assertIn("declared to need the `default` ServiceAccount's token", comment)
+        self.assertNotIn("PR #9 covers", self.err)
+
     def test_a_worker_cannot_mark_a_sibling_shielded_from_the_document(self):
         # Same pull request, no declaration anywhere: a document that carries
         # the ids under a key of the worker's choosing closes nothing, because
