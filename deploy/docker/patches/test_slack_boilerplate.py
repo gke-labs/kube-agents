@@ -601,6 +601,37 @@ class _Adapter:
         return SimpleNamespace(success=True)
 
 
+def target_reads(source):
+    """The attributes ``cron_delivery_text`` reads off ``target``.
+
+    Every appearance of ``target`` must be ``target.<attr>`` or
+    ``getattr(target, "<attr>", ...)``; any other (a keyword or positional
+    hand-off, a container, an alias) carries it where this cannot follow, and
+    fails rather than leaving a read unpinned.
+    """
+    fn = next(
+        node for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef) and node.name == "cron_delivery_text"
+    )
+    parents = {child: node for node in ast.walk(fn) for child in ast.iter_child_nodes(node)}
+    read = set()
+    for node in ast.walk(fn):
+        if not (isinstance(node, ast.Name) and node.id == "target"):
+            continue
+        parent = parents[node]
+        if isinstance(parent, ast.Attribute):
+            read.add(parent.attr)
+        elif (
+            isinstance(parent, ast.Call) and ast.unparse(parent.func) == "getattr"
+            and len(parent.args) >= 2 and parent.args[0] is node
+            and isinstance(parent.args[1], ast.Constant)
+        ):
+            read.add(parent.args[1].value)
+        else:
+            raise AssertionError(f"target escapes at line {node.lineno}: {ast.unparse(parent)}")
+    return read
+
+
 class ApplierTest(unittest.TestCase):
     def setUp(self):
         self.root = _Root()
@@ -775,31 +806,32 @@ class ApplierTest(unittest.TestCase):
 
     def test_target_fields_are_what_cron_delivery_text_reads(self):
         # A new getattr in the helper would otherwise go unpinned.
-        tree = ast.parse(Path(runtime.__file__).read_text())
-        fn = next(
-            node for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef) and node.name == "cron_delivery_text"
-        )
-        read = set()
-        for node in ast.walk(fn):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr":
-                if isinstance(node.args[0], ast.Name) and node.args[0].id == "target":
-                    read.add(ast.literal_eval(node.args[1]))
-            elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "target":
-                read.add(node.attr)
-            elif isinstance(node, ast.Call) and any(
-                isinstance(arg, ast.Name) and arg.id == "target" for arg in node.args
-            ):
-                self.assertEqual(ast.unparse(node.func), "getattr", "target is handed to a helper this test cannot see into")
-        self.assertEqual(read, set(verifier.TARGET_FIELDS))
+        self.assertEqual(target_reads(Path(runtime.__file__).read_text()), set(verifier.TARGET_FIELDS))
+
+    def test_target_reads_refuses_target_escaping_the_helper(self):
+        for escape in (
+            "_log(job, target=target)",
+            "_log(*[target])",
+            "_log([target])",
+            "t = target",
+        ):
+            with self.subTest(escape=escape):
+                source = f"def cron_delivery_text(target):\n    getattr(target, 'chat_id', '')\n    {escape}\n"
+                with self.assertRaises(AssertionError):
+                    target_reads(source)
 
     def test_verifier_refuses_a_target_from_elsewhere(self):
         applier.apply(self.root.dir)
         path = self.root.dir / applier.DELIVERY
         patched = path.read_text()
+        bind = "t = _prepare_target_delivery(target)"
+        indent = patched.split(bind)[0].rsplit("\n", 1)[1]
         for old, new, detail in (
             ('-> "Optional[_TargetDelivery]"', '-> "Optional[_SlackTarget]"', "no longer annotated"),
-            ("t = _prepare_target_delivery(target)", "t = _prepare_slack_target(target)", "no longer binds t"),
+            ('-> "Optional[_TargetDelivery]"', '-> "Union[_TargetDelivery, _SlackTarget]"', "no longer annotated"),
+            ('-> "Optional[_TargetDelivery]"', '-> "Optional[_TargetDeliveryV2]"', "no longer annotated"),
+            (bind, "t = _prepare_slack_target(target)", "no longer binds t"),
+            (bind, f"{bind}\n{indent}t = target", "no longer binds t"),
         ):
             with self.subTest(detail=detail):
                 self.assertEqual(patched.count(old), 1)

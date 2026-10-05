@@ -2065,6 +2065,19 @@ class ApplyTest(unittest.TestCase):
             patch_tree(renamed)
         self.assertIn("platform_str", str(ctx.exception))
 
+    def test_a_platform_str_binding_moved_out_of_init_fails_loudly(self):
+        # The line still occurs once, so only the scope check sees the move.
+        binding = '        self.platform_str = (sub["platform"] or "").lower()\n'
+        moved = UPSTREAM_NOTIFIER.replace(binding, "").replace(
+            "    def build_wake_text(self) -> None:\n        task, sub = self.task, self.sub\n",
+            "    def build_wake_text(self) -> None:\n        task, sub = self.task, self.sub\n" + binding,
+        )
+        self.assertEqual(moved.count(binding), 1)
+        self.assertNotIn(binding, method_source(moved, "__init__"))
+        with self.assertRaises(SystemExit) as ctx:
+            patch_tree(moved)
+        self.assertIn("_KanbanNotification.__init__", str(ctx.exception))
+
     def test_a_drifted_wake_step_anchor_fails_loudly(self):
         with self.assertRaises(SystemExit) as ctx:
             patch_tree(UPSTREAM_NOTIFIER.replace(*TELL_DRIFT))

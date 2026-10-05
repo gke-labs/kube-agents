@@ -75,6 +75,10 @@ TARGET_TEXT = "target_text"
 WRAPPER_HEADER = "Cronjob Response: "
 TARGET_CLASS = "_TargetDelivery"
 TARGET_FACTORY = "_prepare_target_delivery"
+TARGET_LOCAL = "t"
+#: Names a return annotation may carry besides ``TARGET_CLASS``: the forms of
+#: "or None". Anything else names a second class whose fields go unchecked.
+OPTIONAL_NAMES = {"Optional", "typing", "None"}
 #: What ``cron_delivery_text`` reads off a target. ``drive`` below passes a
 #: SimpleNamespace, so only this check ties the names to upstream's class. Only
 #: ``platform_name`` changes what is sent; the other two feed a log line, and are
@@ -312,14 +316,29 @@ def check_target_fields(root: Path) -> None:
     # Fields declared on the class itself only: a field moved to a base class or
     # turned into a property refuses the build, loudly, until this is re-derived.
     tree = _tree(root, DELIVERY)
-    sources = [
-        node for node in ast.walk(_function(tree, DELIVER_FN, DELIVERY))
-        if isinstance(node, ast.Assign) and [ast.unparse(t) for t in node.targets] == ["t"]
+    deliver = _function(tree, DELIVER_FN, DELIVERY)
+    # Every store of t, whatever its form, so a second binding from anything
+    # but the factory refuses the build.
+    stores = [
+        node for node in ast.walk(deliver)
+        if isinstance(node, ast.Name) and node.id == TARGET_LOCAL and isinstance(node.ctx, ast.Store)
     ]
-    if [ast.unparse(node.value.func) for node in sources if isinstance(node.value, ast.Call)] != [TARGET_FACTORY]:
-        raise _fail(f"{DELIVER_FN}() no longer binds t once, from {TARGET_FACTORY}()")
+    binds = [
+        node for node in ast.walk(deliver)
+        if isinstance(node, ast.Assign) and [ast.unparse(t) for t in node.targets] == [TARGET_LOCAL]
+        and isinstance(node.value, ast.Call) and ast.unparse(node.value.func) == TARGET_FACTORY
+    ]
+    if len(stores) != 1 or len(binds) != 1:
+        raise _fail(f"{DELIVER_FN}() no longer binds {TARGET_LOCAL} once, from {TARGET_FACTORY}()")
     factory = _function(tree, TARGET_FACTORY, DELIVERY)
-    if factory.returns is None or TARGET_CLASS not in ast.unparse(factory.returns):
+    returns = factory.returns
+    if isinstance(returns, ast.Constant) and isinstance(returns.value, str):
+        returns = ast.parse(returns.value, mode="eval").body
+    named = set() if returns is None else {
+        node.id if isinstance(node, ast.Name) else node.attr
+        for node in ast.walk(returns) if isinstance(node, (ast.Name, ast.Attribute))
+    }
+    if named - OPTIONAL_NAMES != {TARGET_CLASS}:
         raise _fail(f"{TARGET_FACTORY}() is no longer annotated to return {TARGET_CLASS}")
     classes = [
         node for node in tree.body

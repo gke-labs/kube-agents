@@ -78,6 +78,7 @@ Why the changes are needed is documented in the module docstrings of
 
 from __future__ import annotations
 
+import ast
 import sys
 from pathlib import Path
 
@@ -259,10 +260,13 @@ COMPLETION_CALL = (
 )
 
 #: The completion call reads ``n.platform_str`` ahead of the flag, and no
-#: other anchor holds it. Pinned unchanged, so an upstream that stops binding
-#: platform_str here fails the build instead of raising AttributeError on every
-#: completion.
+#: other anchor holds it. Pinned unchanged and inside
+#: ``_KanbanNotification.__init__``, so an upstream that renames, rewrites,
+#: duplicates or moves the binding fails the build instead of raising
+#: AttributeError on every completion.
 PLATFORM_BINDING = '        self.platform_str = (sub["platform"] or "").lower()\n'
+PLATFORM_CLASS = "_KanbanNotification"
+PLATFORM_METHOD = "__init__"
 
 COMPLETION_PATCHED = (
     f"{HANDOFF_INDENT}# kube-agents patch: see gateway/kanban_notifier.py\n"
@@ -376,11 +380,36 @@ SENTINELS = (
 )
 
 
+def expect_platform_binding(patch: patchlib.Patch) -> None:
+    """Assert the one ``PLATFORM_BINDING`` line sits in ``_KanbanNotification.__init__``.
+
+    ``substitute`` counts the line anywhere, so a binding moved verbatim into
+    another scope with a local ``sub`` would pass it and leave the instance
+    without ``platform_str``.
+    """
+    lineno = patch.source.count("\n", 0, patch.source.index(PLATFORM_BINDING)) + 1
+    for node in patch._tree().body:
+        if isinstance(node, ast.ClassDef) and node.name == PLATFORM_CLASS:
+            for method in node.body:
+                if (
+                    isinstance(method, ast.FunctionDef)
+                    and method.name == PLATFORM_METHOD
+                    and method.lineno <= lineno <= method.end_lineno
+                ):
+                    return
+    raise patch._fail(
+        f"the platform_str binding at line {lineno} is no longer inside "
+        f"{PLATFORM_CLASS}.{PLATFORM_METHOD}, where the completion call expects "
+        f"n.platform_str to be set. {patch.note}"
+    )
+
+
 def apply(root: Path) -> None:
     """Apply the patch under ``root``, or raise SystemExit with the reason."""
     patch = patchlib.Patch(root, RELATIVE, prefix="kanban_notifier")
     patch.refuse_if_patched(*SENTINELS)
     patch.substitute(PLATFORM_BINDING, PLATFORM_BINDING, label="platform_str binding")
+    expect_platform_binding(patch)
     for label, anchor, patched in EDITS:
         patch.substitute(anchor, patched, label=label)
     patch.append(TRAILER)
