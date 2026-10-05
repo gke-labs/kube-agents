@@ -65,6 +65,8 @@ class _Adapter:
         self.fail_post = fail_post
         self.blocked = blocked
         self._bot_message_ts = set()
+        self.config = SimpleNamespace(extra=self.extra)
+        self.trimmed = 0
 
     def _extra_flag(self, key):
         return bool(self.extra.get(key))
@@ -89,6 +91,15 @@ class _Adapter:
 
     def format_message(self, content):
         return f"mrkdwn({content})"
+
+    def _append_feedback_block(self, blocks):
+        return [*blocks, {"type": "actions"}] if self._extra_flag("feedback_buttons") else blocks
+
+    async def stop_typing(self, chat_id, metadata=None):
+        self.log.append(("stop_typing", chat_id))
+
+    def _trim_bot_message_timestamps(self):
+        self.trimmed += 1
 
     async def send(self, chat_id, content, metadata=None):
         self.log.append(("send", chat_id, content, metadata))
@@ -115,9 +126,15 @@ class SplitTest(unittest.TestCase):
         headline, _rest = runtime.split(ANSWER)
         self.assertEqual(headline, presenter.split_answer(ANSWER)[0])
 
-    def test_code_in_the_first_sentence_keeps_its_text(self):
-        headline, _rest = runtime.split("The `payments-api` pod restarts. It reads a missing secret.")
-        self.assertEqual(headline, "The payments-api pod restarts.")
+    def test_the_rest_keeps_its_line_breaks(self):
+        answers = {
+            "a table": ("Three nodes are hot.\n", "| node | cpu |\n|---|---|\n| a | 95% |"),
+            "a quote": ("The pool is full. ", "Two lines say so.\n> quoted line\n> another"),
+            "labels": ("Pod restarted.\n", "Node: a\nCause: OOM"),
+        }
+        for what, (lead, rest) in answers.items():
+            with self.subTest(what):
+                self.assertEqual(runtime.split(lead + rest), (lead.strip(), rest))
 
     def test_answers_the_headline_cannot_carry_whole_are_refused(self):
         refused = {
@@ -128,6 +145,8 @@ class SplitTest(unittest.TestCase):
             "a link": "See [the runbook](https://example.com/runbook). It covers this.",
             "a bare url": "The dashboard is https://example.com/d. It shows the spike.",
             "a mention": "<@U123> owns this pool. Ask them first.",
+            "code": "The `payments-api` pod restarts. It reads a missing secret.",
+            "a wrapped sentence": "Checkout is slow because the\npayments pool is full. Scale it.",
             "an overlong sentence": ("word " * 40).strip() + ". Then more.",
             "a single sentence": "Checkout is healthy.",
             "nothing": "",
@@ -201,10 +220,12 @@ class SendTest(unittest.TestCase):
     def test_the_answer_posts_once_bold_then_folded(self):
         adapter = _Adapter()
         result = self.send(adapter)
-        self.assertEqual([entry[0] for entry in adapter.log], ["chat_postMessage"])
+        self.assertEqual([entry[0] for entry in adapter.log], ["chat_postMessage", "stop_typing"])
         post = adapter.log[0][1]
         self.assertEqual(post["channel"], CHANNEL)
         self.assertEqual(post["thread_ts"], THREAD_TS)
+        self.assertTrue(post["mrkdwn"])
+        self.assertNotIn("reply_broadcast", post)
         self.assertEqual(post["text"], f"mrkdwn({ANSWER})")
         headline, fold = post["blocks"]
         self.assertEqual(
@@ -216,7 +237,15 @@ class SendTest(unittest.TestCase):
         self.assertEqual(fold["child_blocks"], _render_blocks(REST, adapter.format_message))
         self.assertTrue(result.success)
         self.assertEqual(result.message_id, POSTED_TS)
-        self.assertEqual(adapter._bot_message_ts, {f"T0KAGE:{POSTED_TS}"})
+        self.assertEqual(adapter._bot_message_ts, {f"T0KAGE:{POSTED_TS}", f"T0KAGE:{THREAD_TS}"})
+        self.assertEqual(adapter.trimmed, 1)
+
+    def test_the_post_carries_upstreams_broadcast_and_feedback_settings(self):
+        adapter = _Adapter(extra={"rich_blocks": True, "reply_broadcast": True, "feedback_buttons": True})
+        self.send(adapter)
+        post = adapter.log[0][1]
+        self.assertTrue(post["reply_broadcast"])
+        self.assertEqual([block["type"] for block in post["blocks"]], ["rich_text", "container", "actions"])
 
     def test_a_top_level_chat_posts_without_a_thread(self):
         adapter = _Adapter()
@@ -225,6 +254,7 @@ class SendTest(unittest.TestCase):
         )
         asyncio.run(wrapped.send(CHANNEL, ANSWER, metadata={}))
         self.assertNotIn("thread_ts", adapter.log[0][1])
+        self.assertEqual([entry[0] for entry in adapter.log], ["chat_postMessage"])
 
     def test_a_refused_answer_takes_the_upstream_send(self):
         adapter = _Adapter()

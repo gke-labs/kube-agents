@@ -17,7 +17,8 @@ Three things are checked:
    bold and the rest folded as the Slack plugin's own ``block_kit`` renders
    it, and a report that opens with a heading takes the upstream send.
 3. The adapter. ``SlackAdapter`` still has the members the runtime calls, the
-   one it awaits still async, and still sets ``_bot_message_ts``. The stub
+   ones it awaits still async, and still sets ``_bot_message_ts``; its module
+   still defines ``_slack_unfurl_kwargs``. The stub
    below supplies them, so only this check ties them to upstream; a missing
    one would fall back to the upstream send at runtime, folding nothing.
 
@@ -43,10 +44,13 @@ ADAPTER_CLASS = "SlackAdapter"
 #: The adapter members the runtime calls, the ones it awaits, and the attribute it adds to.
 RUNTIME_MEMBERS = (
     "_extra_flag", "_outbound_blocked", "_dm_target", "_metadata_team_id", "_resolve_thread_ts",
-    "_client_for", "_workspace_message_marker", "format_message",
+    "_client_for", "_workspace_message_marker", "format_message", "_append_feedback_block",
+    "stop_typing", "_trim_bot_message_timestamps",
 )
-ASYNC_MEMBERS = ("_dm_target",)
+ASYNC_MEMBERS = ("_dm_target", "stop_typing")
 RUNTIME_ATTRIBUTE = "_bot_message_ts"
+#: The adapter module's link-preview helper, which the runtime reads from the adapter's module.
+MODULE_FUNCTION = "_slack_unfurl_kwargs"
 FLAG_ENV = "KAGE_SLACK_UX"
 
 METHOD = "_send_event"
@@ -63,6 +67,8 @@ HEADLINE = "Checkout is slow because the payments pool is at its limit."
 REST = "The pool has 4 nodes and all of them are above 90% CPU.\n\n- Scale the pool to 6 nodes.\n- Then watch p99 latency."
 ANSWER = f"{HEADLINE} {REST}"
 REPORT = "## What's wrong\n\nCheckout is slow.\n\n## Why\n\nThe pool is full."
+#: What the stub's format_message prefixes, so the post shows it ran.
+MRKDWN_MARK = "mrkdwn:"
 
 
 def _fail(detail: str) -> SystemExit:
@@ -135,6 +141,8 @@ def check_adapter(root: Path) -> None:
     )
     if not sets:
         raise _fail(f"{ADAPTER_CLASS} no longer sets self.{RUNTIME_ATTRIBUTE}")
+    if not any(isinstance(n, ast.FunctionDef) and n.name == MODULE_FUNCTION for n in tree.body):
+        raise _fail(f"{ADAPTER} no longer defines {MODULE_FUNCTION}()")
 
 
 def _load_runtime(root: Path):
@@ -155,6 +163,7 @@ class _StubAdapter:
     def __init__(self) -> None:
         self.log: list[tuple] = []
         self._bot_message_ts: set = set()
+        self.config = SimpleNamespace(extra={"rich_blocks": True})
 
     def _extra_flag(self, key):
         return key == "rich_blocks"
@@ -174,6 +183,18 @@ class _StubAdapter:
     def _workspace_message_marker(self, team_id, ts):
         return ts
 
+    def format_message(self, content):
+        return MRKDWN_MARK + content
+
+    def _append_feedback_block(self, blocks):
+        return blocks
+
+    async def stop_typing(self, chat_id, metadata=None):
+        self.log.append(("stop_typing", chat_id))
+
+    def _trim_bot_message_timestamps(self):
+        pass
+
     def _client_for(self, chat_id, metadata):
         adapter = self
 
@@ -190,11 +211,11 @@ class _StubAdapter:
 
 
 def _plugin_fold(root: Path) -> list[dict]:
-    """``REST`` as the Slack plugin's block_kit renders it, loaded apart from the runtime's copy."""
+    """``REST`` as the Slack plugin's block_kit renders it through the stub's format_message."""
     spec = importlib.util.spec_from_file_location("slack_ux_answer_verify_block_kit", root / BLOCK_KIT)
     block_kit = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(block_kit)
-    return block_kit.sanitize_blocks(block_kit.render_blocks(REST, mrkdwn_fn=None))
+    return block_kit.sanitize_blocks(block_kit.render_blocks(REST, mrkdwn_fn=_StubAdapter().format_message))
 
 
 async def _drive(module, expected_fold: list[dict]) -> None:
@@ -212,13 +233,15 @@ async def _drive(module, expected_fold: list[dict]) -> None:
         if wrapped is adapter:
             raise _fail("adapter_for() did not take a completed card on Slack")
         result = await wrapped.send(CHANNEL, ANSWER, metadata=metadata)
-        if [entry[0] for entry in adapter.log] != ["chat_postMessage"] or result.message_id != POSTED_TS:
+        if [entry[0] for entry in adapter.log] != ["chat_postMessage", "stop_typing"] or result.message_id != POSTED_TS:
             raise _fail(f"the answer delivery made {adapter.log!r}")
         post = adapter.log[0][1]
         headline, fold = post["blocks"]
         bold = headline["elements"][0]["elements"]
         if post.get("thread_ts") != THREAD_TS or bold != [{"type": "text", "text": HEADLINE, "style": {"bold": True}}]:
             raise _fail(f"the answer post was {post!r}")
+        if post.get("text") != MRKDWN_MARK + ANSWER or adapter._bot_message_ts != {POSTED_TS, THREAD_TS}:
+            raise _fail(f"the post's text or reply tracking was {post.get('text')!r}, {adapter._bot_message_ts!r}")
         if fold.get("type") != "container" or not expected_fold or fold.get("child_blocks") != expected_fold:
             raise _fail("the rest was not folded through the Slack plugin's block_kit")
         adapter = _StubAdapter()

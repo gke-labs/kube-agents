@@ -4,7 +4,9 @@ Installed into the image at ``/opt/hermes/gateway/slack_ux_incident.py``.
 ``apply_slack_ux_incident.py`` makes the kanban notifier hand the terminal
 send the adapter :func:`adapter_for` returns. With ``KAGE_SLACK_UX`` off, or
 for anything but an incident report bound for its own alert's thread on
-Slack, that is the notifier's own adapter, so the delivery is upstream's.
+Slack, that is the adapter it was handed: the notifier's own, so the delivery
+is upstream's, or with the flag on ``slack_ux_answer``'s, which folds a
+finished card's answer.
 
 Upstream, and why it changes
 ----------------------------

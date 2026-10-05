@@ -21,9 +21,10 @@ Everything a caller changes on screen is gated on :func:`enabled`, the
 take their upstream path unchanged; this module only answers questions.
 
 Layout: :func:`split_answer` takes the headline off an agent's markdown
-answer, and :func:`split_lead` the same first sentence as written; link buttons, none for a url :func:`_safe_link_url` refuses, and choice
-buttons, whose value the caller sets, are built by ``_button`` and wrapped into
-rows by ``_actions``; :func:`fallback_text`
+answer, and :func:`split_lead` the same first sentence as written; link
+buttons, none for a url :func:`_safe_link_url` refuses, and choice buttons,
+whose value the caller sets, are built by ``_button`` and wrapped into rows by
+``_actions``; :func:`fallback_text`
 is the headline, links and choices as plain mrkdwn, for the message's ``text``
 field.
 :func:`blocks_answer` lays a headline, links and choices out as blocks; its

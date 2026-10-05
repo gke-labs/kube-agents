@@ -795,7 +795,8 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # Same flag: a finished card's answer posts as its first sentence in bold and
 # the rest in a collapsed "why" fold. gateway/slack_ux_answer.py's adapter sits
 # inside the incident one, so it anchors on that patch's line and applies
-# after it. See deploy/docker/patches/slack_ux_answer.py.
+# after it. Also rides this COPY and RUN. See
+# deploy/docker/patches/slack_ux_answer.py.
 # Same flag, same block: gateway/slack_boilerplate.py keeps Hermes' own
 # boilerplate off Slack -- the cron wrapper (other targets, and the Chat relay
 # that routes on it, keep it), the opt-in heartbeat's tool trace (generic

@@ -10,8 +10,9 @@ adapter, so the delivery is upstream's.
 Upstream, and why it changes
 ----------------------------
 With the flag on, the completion message on Slack is the worker's answer alone
-(``kanban_notifier.completion_text``), and the Chat agent's SOUL has it lead
-with the answer. Upstream still posts it as one run of prose, so the answer
+(``kanban_notifier.completion_text``), and the specialists' SOULs have it lead
+with the answer (``agents/platform/SOUL.md`` §7, ``agents/cluster/SOUL.md``
+step 4). Upstream still posts it as one run of prose, so the answer
 sits at the same weight as the reasoning under it. With the flag on, the
 message is instead the answer's first sentence in bold, then everything after
 it in a collapsed fold titled :data:`FOLD_TITLE`, rendered by the Slack
@@ -24,12 +25,15 @@ The first sentence is ``slack_presenter.split_lead``'s, the sentence
 ``slack_presenter.split_answer`` takes its headline from. A bold headline is
 plain text, so an answer it cannot carry whole keeps the upstream post: one
 whose first line is a heading, a list item or a code fence, or whose first
-sentence is longer than ``HEADLINE_MAX`` or holds a link or a mention. So does
+sentence is longer than ``HEADLINE_MAX``, runs onto a second line, or holds a
+link, a mention or code. So does
 one with nothing after that sentence, one longer than :data:`FOLD_TEXT_MAX`, a
 fold ``block_kit`` cannot render or that would hold a block outside
 :data:`FOLD_CHILD_TYPES` (a table or a divider), and an adapter not rendering
 ``rich_blocks``, since upstream would then post text alone. A refused fold
-logs why; a failed post falls back to the upstream send. An incident report
+logs why; a failed post falls back to the upstream send. The folded post
+carries what upstream's adds: link-preview settings, ``reply_broadcast``, the
+feedback buttons, the status clear and the reply tracking for the thread. An incident report
 that edits its alert never reaches this send, and one whose edit fails opens
 with a heading, so it keeps the upstream post here too.
 """
@@ -38,6 +42,7 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
 from importlib import util as importlib_util
 from pathlib import Path
 from types import SimpleNamespace
@@ -72,8 +77,12 @@ FOLD_TEXT_MAX = 12000
 FOLD_CHILD_TYPES = frozenset({"header", "section", "rich_text"})
 #: A first line that is not prose: a heading, a list item or a fence.
 NOT_PROSE = re.compile(r"^\s*(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|`{3,}|~{3,})")
-#: What a plain-text headline would lose: a markdown link, a url, a Slack mention or link.
-LOSES_CONTENT = re.compile(r"\]\(|https?://|<[@#!]", re.IGNORECASE)
+#: What a plain-text headline would lose: a markdown link, a url, a Slack mention or link, a code span.
+LOSES_CONTENT = re.compile(r"\]\(|https?://|<[@#!]|`", re.IGNORECASE)
+#: Upstream's per-post ``config.extra`` switches the folded post carries as well.
+REPLY_BROADCAST = "reply_broadcast"
+#: The Slack adapter module's link-preview helper, read from the adapter's own module.
+UNFURL_KWARGS = "_slack_unfurl_kwargs"
 
 
 def enabled() -> bool:
@@ -108,15 +117,20 @@ def split(answer: str) -> tuple[str, str] | None:
         return _refuse(f"longer than {FOLD_TEXT_MAX} characters")
     if NOT_PROSE.match(answer.lstrip("\n")):
         return _refuse("it opens with a heading, a list item or a code fence")
-    lead, body = _presenter.split_lead(answer)
+    lead, _body = _presenter.split_lead(answer)
     if LOSES_CONTENT.search(lead):
-        return _refuse("the first sentence holds a link or a mention")
+        return _refuse("the first sentence holds a link, a mention or code")
     headline = _presenter._plain(lead)
     if not headline:
         return _refuse("it does not open with a sentence")
     if len(headline) > _presenter.HEADLINE_MAX:
         return _refuse("the first sentence is longer than HEADLINE_MAX")
-    rest = "\n\n".join(section for section in body if section.strip())
+    # The rest is cut from the answer as written, so its line breaks reach block_kit as they
+    # would upstream; split_lead's body joins a first paragraph's lines into one.
+    first_line, _, after = answer.strip().partition("\n")
+    if not first_line.startswith(lead):
+        return _refuse("the first sentence runs onto a second line")
+    rest = "\n".join(part for part in (first_line[len(lead):].strip(), after) if part).strip()
     if not rest:
         return _refuse("nothing follows the first sentence")
     return headline, rest
@@ -192,19 +206,33 @@ class _AnswerFolder:
         channel = await adapter._dm_target(self._chat_id, metadata)
         team_id = adapter._metadata_team_id(metadata)
         thread_ts = adapter._resolve_thread_ts(None, metadata)
+        extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
+        unfurl = getattr(sys.modules.get(type(adapter).__module__), UNFURL_KWARGS, None)
+        # What upstream's _post_chunks and _maybe_blocks add to the post: mrkdwn, link previews,
+        # the feedback buttons, and the channel copy of a threaded reply.
+        kwargs = {"mrkdwn": True, **(unfurl(extra) if callable(unfurl) else {})}
+        if thread_ts:
+            kwargs["thread_ts"] = thread_ts
+            if extra.get(REPLY_BROADCAST):
+                kwargs[REPLY_BROADCAST] = True
         response = await adapter._client_for(channel, metadata).chat_postMessage(
             channel=channel,
             text=mrkdwn_fn(content) if callable(mrkdwn_fn) else content,
-            blocks=blocks_answer(headline, fold_blocks),
-            **({"thread_ts": thread_ts} if thread_ts else {}),
+            blocks=adapter._append_feedback_block(blocks_answer(headline, fold_blocks)),
+            **kwargs,
         )
         ts = str(response.get("ts") or "")
         try:
+            if thread_ts:
+                await adapter.stop_typing(self._chat_id, metadata=metadata)
             if ts:
-                # As upstream's send does, so a reply to it is answered without an @mention.
+                # As upstream's send does, so a reply in the thread is answered without an @mention.
                 adapter._bot_message_ts.add(adapter._workspace_message_marker(team_id, ts))
-        except Exception as exc:  # noqa: BLE001 — posted; only reply tracking is lost
-            logger.debug("slack_ux_answer: could not track %s: %s", ts, exc)
+                if thread_ts:
+                    adapter._bot_message_ts.add(adapter._workspace_message_marker(team_id, thread_ts))
+                adapter._trim_bot_message_timestamps()
+        except Exception as exc:  # noqa: BLE001 — posted; only the status clear or reply tracking is lost
+            logger.debug("slack_ux_answer: could not finish after posting %s: %s", ts, exc)
         logger.info("slack_ux_answer: posted the answer folded in %s", channel)
         return SimpleNamespace(success=True, message_id=ts, error=None)
 
