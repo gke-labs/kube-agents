@@ -120,8 +120,6 @@
 # fifty-eight (174), +3 more: one front-door turn plus the card round trip.
 # bootstrap-inventory-ranking-delivery makes it
 # forty-five (135) of fifty-nine (177), +3 more at its 600s hint.
-# platform-worker-shell-edit-of-shipped-skill (listed below) makes it
-# forty-six (138) of sixty (180), +3 more at the 200s default.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
 # answer it plainly: 1734-2693 serial minutes of work at a realised
