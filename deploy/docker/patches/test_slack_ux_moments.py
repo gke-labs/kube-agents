@@ -358,6 +358,8 @@ class SettleQuestionTest(unittest.TestCase):
     def setUp(self):
         runtime._questions.clear()
         runtime._unsettled.clear()
+        runtime._resumed.clear()
+        runtime._credited.clear()
         # The image installs the clicks module as gateway.slack_ux_clicks; the answered line comes from it.
         gateway = mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_clicks=clicks),
                                                 "gateway.slack_ux_clicks": clicks})
@@ -444,6 +446,7 @@ class SettleQuestionTest(unittest.TestCase):
         ):
             with self.subTest(case=case):
                 runtime._questions.clear()
+                runtime._credited.clear()
                 adapter = _Adapter()
                 adapter.names = {}
                 _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
@@ -461,9 +464,12 @@ class SettleQuestionTest(unittest.TestCase):
                 self.assertNotIn("<@", update["text"])
 
     def test_only_a_card_that_resumed_credits_a_typed_reply(self):
+        # Upstream sends no "claimed" event to a subscriber, so it is not one of them.
+        self.assertEqual(runtime.ANSWERED_KINDS, {"unblocked", "heartbeat"})
         for kind in ("archived", "status", "completed", "gave_up", "unblocked", "claimed", "heartbeat"):
             with self.subTest(kind=kind):
                 runtime._questions.clear()
+                runtime._credited.clear()
                 adapter = _Adapter()
                 _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
                 adapter.replies = [{"ts": "1700000000.000400", "user": "U7", "text": "hold on, checking"}]
@@ -493,6 +499,7 @@ class SettleQuestionTest(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 runtime._questions.clear()
+                runtime._credited.clear()
                 adapter = _Adapter()
                 _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
                 adapter.replies = [{"ts": "1700000000.000400", "user": "U7", "text": text}]
@@ -525,6 +532,7 @@ class SettleQuestionTest(unittest.TestCase):
         for before in (True, False):
             with self.subTest(before=before):
                 runtime._questions.clear()
+                runtime._credited.clear()
                 adapter = _Adapter()
                 _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
                 adapter.replies = [{"ts": "1700000000.000400", "user": "U7", "text": "seeded-a"}]
@@ -538,13 +546,34 @@ class SettleQuestionTest(unittest.TestCase):
     def test_an_event_older_than_a_retried_question_leaves_it_alone(self):
         adapter = _Adapter()
         _run(runtime.needs_you(adapter, SUB, QUESTION, 8))
-        adapter.fail_update = True
         _run(runtime.needs_you(adapter, SUB, QUESTION, 9))
-        adapter.fail_update = False
         self.assertEqual(len(runtime._unsettled), 1, "the first question waits for a retry")
         _run(runtime.settle_question(adapter, SUB, "unblocked", 8))
         self.assertEqual(adapter.updates, [])
         self.assertEqual(len(runtime._unsettled), 1)
+
+    def test_a_retried_settle_still_reads_the_answer_once_the_card_resumed(self):
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        adapter.replies = [{"ts": "1700000000.000400", "user": "U7", "text": "seeded-b"}]
+        adapter.fail_update = True
+        _run(runtime.settle_question(adapter, SUB, "unblocked", 4))
+        adapter.fail_update = False
+        self.assertEqual(adapter.updates, [])
+        _run(runtime.settle_question(adapter, SUB, "completed", 5))
+        self.assertEqual(adapter.updates[0]["blocks"][-1]["elements"][0]["text"], "✓ Priya: seeded-b")
+        self.assertEqual(runtime._resumed, {})
+
+    def test_one_reply_answers_one_question_of_a_thread(self):
+        # Two cards ask in one thread; the reply is shown on the first to resume, never on both.
+        adapter = _Adapter()
+        other = {**SUB, "task_id": "t_f1d2"}
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        _run(runtime.needs_you(adapter, other, QUESTION, 4))
+        adapter.replies = [{"ts": "1700000000.000400", "user": "U7", "text": "seeded-b"}]
+        _run(runtime.settle_question(adapter, other, "unblocked", 5))
+        _run(runtime.settle_question(adapter, SUB, "unblocked", 6))
+        self.assertEqual(["✓" in u["text"] for u in adapter.updates], [True, False])
 
     def test_a_typed_reply_the_channel_gate_drops_is_not_the_answer(self):
         adapter = _Adapter()
@@ -563,6 +592,7 @@ class SettleQuestionTest(unittest.TestCase):
                         RuntimeError("missing_scope")):
             with self.subTest(replies=replies):
                 runtime._questions.clear()
+                runtime._credited.clear()
                 adapter = _Adapter()
                 _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
                 adapter.replies = replies

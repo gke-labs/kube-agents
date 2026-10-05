@@ -4169,3 +4169,10 @@ def test_the_question_wake_case_grades_silence_with_the_gateway_predicate():
     spec = yaml.safe_load((TASKS / "chat-question-wake-stays-silent" / "task.yaml").read_text())
     entries = [e for e in spec["verification_spec"] if e["name"] == "the-wake-reply-is-silent"]
     assert [e["check"] for e in entries] == [{"type": "reply_is_silent"}]
+
+
+def test_the_click_case_grades_the_answer_turns_reply_and_the_wakes():
+    spec = yaml.safe_load((TASKS / "chat-question-click-answer-stays-silent" / "task.yaml").read_text())
+    checks = {e["name"]: e["check"] for e in spec["verification_spec"]}
+    assert checks["the-click-reply-is-silent"] == {"type": "reply_is_silent", "reply": "answer"}
+    assert checks["the-wake-reply-is-silent"] == {"type": "reply_is_silent"}

@@ -1347,7 +1347,10 @@ class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.question_kinds, [], "an overtaken archive settles nothing")
 
     async def test_a_failed_settle_still_delivers(self):
-        async def settle_question(adapter, sub, kind):
+        raised = []
+
+        async def settle_question(adapter, sub, kind, event_id=0):
+            raised.append(kind)
             raise RuntimeError("boom")
 
         self.modules["gateway.slack_ux_moments"].settle_question = settle_question
@@ -1355,6 +1358,7 @@ class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
         result = await self._notes_then_report(adapter)
         self.assertTrue(result.success)
         self.assertEqual(len(adapter.sent), 2)
+        self.assertTrue(raised, "the settle ran and raised its own error")
 
     async def test_other_terminal_kinds_never_ask(self):
         await self._notes_then_report(_Adapter())
