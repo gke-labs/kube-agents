@@ -306,6 +306,13 @@ class MarkTest(FlagOn):
         self.assertEqual(self.draw(_lane_event()), _render(REPLY))
         self.assertEqual(len(_buttons(self.draw(_turn()))), 1)
 
+    def test_a_follow_up_with_no_queued_event_drops_an_unsent_claim(self):
+        # The wake's reply was [SILENT]; the /steer reply goes out under the wake's event.
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        wake = _turn()
+        runtime.drop(_event().source, None)
+        self.assertEqual(self.draw(wake), _render(REPLY))
+
     def test_an_event_with_text_and_no_message_id_does_not_take_a_claim(self):
         # A Slack slash command carries no message id.
         runtime.note_wake(SUB, {"gave_up"}, WAKE)

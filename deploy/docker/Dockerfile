@@ -795,10 +795,11 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # COPY and RUN. See deploy/docker/patches/slack_ux_incident.py.
 # Slack: with KAGE_SLACK_UX on, the Planning Agent's reply to a blocked or failed
 # card's wake is drawn with its first sentence in bold and its closing question,
-# when it has one, as a choice button. The wake marks the thread, the final send
-# carries the mark, _maybe_blocks draws it, and a queued user message clears
-# it (apply_slack_ux_failure.py; runs after apply_slack_ux_moments.py, whose
-# wake line it follows). Also rides this COPY and RUN. See deploy/docker/patches/slack_ux_failure.py.
+# when it has one, as a choice button. The wake marks the thread, the wake's turn
+# claims the mark when it starts (_process_message_background, or the queued
+# follow-up), its final send carries the claim, _maybe_blocks draws it, and a
+# user's turn starting after the mark clears it (apply_slack_ux_failure.py; runs
+# after apply_slack_ux_moments.py, whose wake line it follows). Also rides this COPY and RUN. See deploy/docker/patches/slack_ux_failure.py.
 # Same flag, same block: gateway/slack_boilerplate.py keeps Hermes' own
 # boilerplate off Slack -- the cron wrapper (other targets, and the Chat relay
 # that routes on it, keep it), the opt-in heartbeat's tool trace (generic

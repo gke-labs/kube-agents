@@ -222,8 +222,20 @@ def start(event: Any) -> None:
 
 
 def drop(source: Any, pending_event: Any) -> None:
-    """:func:`start` for a follow-up drained from behind the turn on ``source``."""
-    start(pending_event)
+    """:func:`start` for a follow-up drained from behind the turn on ``source``.
+
+    A follow-up with no queued event (a ``/steer``) still ends the turn before it,
+    so it drops that turn's claim.
+    """
+    if pending_event is not None:
+        start(pending_event)
+        return
+    try:
+        key = _slack_key(source) if _carried and source is not None else None
+        if key is not None:
+            _carried.pop(key, None)
+    except Exception:
+        logger.warning("slack_ux_failure: dropping the turn's claim failed", exc_info=True)
 
 
 def _slack_key(source: Any) -> Optional[tuple[str, str]]:

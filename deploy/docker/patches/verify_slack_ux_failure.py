@@ -6,16 +6,19 @@ has run, with ``slack_presenter.py`` staged beside this script.
 
 Two things are checked:
 
-1. The four calls are in place: ``build_wake_text`` calls ``note_wake`` after
-   the moments wake-text line, ``send_final_ledgered`` brackets its send with
-   ``begin`` and ``end``, ``SlackAdapter._maybe_blocks`` hands upstream's
+1. The five calls are in place: ``build_wake_text`` calls ``note_wake`` after
+   the moments wake-text line, ``_process_message_background`` calls ``start``
+   after its processing-start hook, ``send_final_ledgered`` brackets its send
+   with ``begin`` and ``end``, ``SlackAdapter._maybe_blocks`` hands upstream's
    renamed body to ``maybe_blocks``, and ``_run_agent_queued_followup`` calls
    ``drop``.
 2. The module, loaded by path: flag off a failure wake marks nothing; flag on,
-   mock 06's reply to a ``gave_up`` wake is drawn with its first sentence in
-   bold and one choice button reading "check it there", a second reply in the
-   thread is drawn as upstream draws it, a reply the user's own message
-   prompted is never marked, and a queued user message clears the mark.
+   mock 06's reply to a ``gave_up`` wake's turn is drawn with its first
+   sentence in bold and one choice button reading "check it there", a second
+   reply in the thread is drawn as upstream draws it, a user's turn starting
+   after a wake's claim is never marked, a user message that arrived after the
+   mark clears it, and the reply a wake's turn sends under a queued follow-up's
+   event or the outer user turn's event keeps the look.
 """
 
 from __future__ import annotations
@@ -144,7 +147,10 @@ def drive(module) -> None:
         if _draw(module, _started(module)) != _render(REPLY):
             raise _fail("a second reply in the thread was drawn as the failure's")
         module.note_wake(SUB, {"gave_up"}, "wake")
-        if _draw(module, _event(internal=False)) != _render(REPLY):
+        _started(module)
+        user = _event(internal=False, later=True)
+        module.start(user)
+        if _draw(module, user) != _render(REPLY):
             raise _fail("a reply to the user's own message was drawn as the failure's")
         module.note_wake(SUB, {"gave_up"}, "wake")
         module.drop(_event().source, _event(internal=False, later=True))
