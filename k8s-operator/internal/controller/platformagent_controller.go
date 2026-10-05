@@ -272,11 +272,15 @@ const (
 	reasonForbiddenVolumeMount = "ForbiddenVolumeMount"
 )
 
-var missingShellMessageMarkers = []string{
-	"/bin/sh",
-	"no such file or directory",
-	"executable file not found",
-}
+var (
+	missingShellMessageMarkers = []string{
+		"/bin/sh",
+		"no such file or directory",
+		"executable file not found",
+	}
+
+	platformAgentGroupResource = agentv1alpha1.GroupVersion.WithResource("platformagents").GroupResource()
+)
 
 // PlatformAgentReconciler reconciles a PlatformAgent object
 type PlatformAgentReconciler struct {
@@ -436,8 +440,46 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 
-func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, retErr error) {
+// isPlatformAgentConflict reports whether err is an optimistic concurrency conflict
+// (409 Conflict) specifically on a PlatformAgent custom resource (Group: kubeagents.x-k8s.io,
+// Resource/Kind: platformagents). Conflicts on owned objects (ConfigMaps, Secrets, Deployments,
+// NetworkPolicies) return false so they propagate as reconciler errors and surface in
+// controller_runtime_reconcile_errors_total (#2281).
+func isPlatformAgentConflict(err error) bool {
+	if !errors.IsConflict(err) {
+		return false
+	}
+	var statusErr *errors.StatusError
+	if goerrors.As(err, &statusErr) && statusErr.ErrStatus.Details != nil {
+		d := statusErr.ErrStatus.Details
+		return d.Group == platformAgentGroupResource.Group && d.Kind == platformAgentGroupResource.Resource
+	}
+	return false
+}
+
+func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, retErr error) {
 	log := logf.FromContext(ctx)
+
+	// Optimistic concurrency conflicts (409 Conflict) on PlatformAgent updates
+	// (spec, finalizer, or status updates) occur when owned-object watch events
+	// race ahead of the status watch stream or when concurrent reconcile passes
+	// update the CR. Instead of letting controller-runtime log an unhandled
+	// Reconciler error and increment reconcile_errors_total, requeue cleanly
+	// via the workqueue rate limiter so the informer cache catches up and the
+	// next pass reconciles against the fresh ResourceVersion (#2281).
+	// Owned-object conflicts (e.g. ConfigMaps, Secrets, Deployments) are not
+	// caught here and propagate as errors to preserve telemetry and diagnostics.
+	defer func() {
+		if isPlatformAgentConflict(retErr) {
+			log.Info("PlatformAgent update conflict; requeuing cleanly",
+				"name", req.Name,
+				"namespace", req.Namespace,
+				"error", retErr,
+			)
+			result = ctrl.Result{Requeue: true}
+			retErr = nil
+		}
+	}()
 
 	instance := &agentv1alpha1.PlatformAgent{}
 	if err := r.Get(ctx, req.NamespacedName, instance); err != nil {
@@ -544,10 +586,15 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 					retErr = err
 					return
 				}
-				// The reconcile is already failing and will requeue. Losing
-				// this write is not what to report about that pass, but it is
-				// not nothing either: the condition is a pass behind.
-				log.Error(err, "could not write BusCredentialsReady")
+				// The reconcile is already failing and will requeue. If the
+				// failure is already a PlatformAgent conflict being requeued cleanly,
+				// a subsequent conflict writing BusCredentialsReady is the same race
+				// and should not log an Error with a stack trace.
+				if isPlatformAgentConflict(retErr) && errors.IsConflict(err) {
+					log.Info("Conflict writing BusCredentialsReady; pass already requeuing on conflict", "error", err)
+				} else {
+					log.Error(err, "could not write BusCredentialsReady")
+				}
 			}
 		}()
 	}
