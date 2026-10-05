@@ -3628,10 +3628,13 @@ class TestNewMarker(HarnessTestCase):
 
     def test_an_unknown_delta_marks_nothing(self):
         # The ledger is open but its body cannot be read, so there is no memory.
+        alpha = make_finding(fid="a", title="Alpha finding")
+        self.remember([alpha])
         self.harness.replies = {"issue-list": self.issue_list()}
         self.harness.failures = {"issue-view !comments": 1}
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
-        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        doc = make_doc(findings=[alpha, make_finding(fid="b", title="Bravo finding")])
+        self.assertEqual(self.run_finish(doc), 0, self.err)
         (body,) = self.harness.bodies_for("issue-update")
         self.assertIn("<!-- finding:", body)
         self.assertNotIn(audit_report.NEW_MARKER, body)

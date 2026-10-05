@@ -33,6 +33,12 @@ LABEL_SPACES = 40_000
 #: A posture of this many "skipped: " parts (1.4 MB) took 11 seconds while each
 #: gap was cut out of the clause by rereading it.
 GAP_PARTS_REPEATS = 160_000
+#: The many-gaps posture is timed against one this many times shorter on the same
+#: machine: a linear read takes about this many times longer, a reread about its square.
+GAP_PARTS_SCALE = 8
+#: Twice GAP_PARTS_SCALE, so a slow or noisy runner passes a linear read and a
+#: reread (about 40 times longer) still fails.
+GAP_PARTS_RATIO_MAX = 16
 #: A roll-up of this many "these 4 high, those 14 low, " terms (400 KB) took 7
 #: seconds while each term was looked up in a list of the restated ones.
 RESTATED_REPEATS = 15_000
@@ -192,10 +198,16 @@ class PresentTest(unittest.TestCase):
                 self.assertLess(time.monotonic() - start, FAST_SECONDS)
 
     def test_a_posture_of_many_gaps_stays_fast(self):
-        report = "# Scan\n\nI scanned 3 clusters; " + "skipped: " * GAP_PARTS_REPEATS + "\n\n1. **A.** b\n2. **B.** c\n"
-        start = time.monotonic()
-        inventory_presenter.present(report)
-        self.assertLess(time.monotonic() - start, FAST_SECONDS)
+        # An absolute budget failed a linear read on a shared runner (5.2 s against
+        # 5), so the time is compared with a shorter posture's on the same machine.
+        def seconds(repeats):
+            report = "# Scan\n\nI scanned 3 clusters; " + "skipped: " * repeats + "\n\n1. **A.** b\n2. **B.** c\n"
+            start = time.monotonic()
+            inventory_presenter.present(report)
+            return time.monotonic() - start
+
+        short = seconds(GAP_PARTS_REPEATS // GAP_PARTS_SCALE)
+        self.assertLess(seconds(GAP_PARTS_REPEATS), short * GAP_PARTS_RATIO_MAX)
 
     def test_a_roll_up_of_many_restated_terms_stays_fast(self):
         report = TWO_ITEMS + "Other findings: " + "these 4 high, those 14 low, " * RESTATED_REPEATS + "\n"

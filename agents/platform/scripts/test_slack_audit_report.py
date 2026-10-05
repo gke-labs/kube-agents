@@ -916,6 +916,7 @@ class BlocksFromIssueTest(unittest.TestCase):
         self.assertEqual(blocks[0]["elements"][0]["elements"][0]["text"], "Security & RBAC Posture Audit: clean. Ledger closed.")
         self.assertEqual([e["text"]["text"] for e in blocks[1]["elements"]], ["Ledger issue #231 ↗"])
         self.assertEqual(text, f"*Security &amp; RBAC Posture Audit: clean. Ledger closed.*\n<{LEDGER}|Ledger issue #231 ↗>")
+
     def test_nothing_folds(self):
         for report in (REPORT, ""):
             with self.subTest(report=report):
