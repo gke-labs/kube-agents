@@ -342,9 +342,15 @@ class TerraformRoleBundlesTest(unittest.TestCase):
     def test_every_read_role_has_its_api_enabled(self):
         self.assertIn("base_apis", self.lists, "the composition's API list moved or was renamed")
         for role, api in ROLE_APIS.items():
-            if role not in self.lists["read_only_roles"]:
-                continue
             with self.subTest(role=role):
+                # A key the bundle does not carry would otherwise skip the
+                # assertion, and the API behind it could leave base_apis
+                # with the suite green.
+                self.assertIn(
+                    role,
+                    self.lists["read_only_roles"],
+                    f"ROLE_APIS names {role}, which local.read_only_roles does not grant",
+                )
                 self.assertIn(
                     api,
                     self.lists["base_apis"],
