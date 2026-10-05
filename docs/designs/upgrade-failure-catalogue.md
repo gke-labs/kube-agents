@@ -235,7 +235,8 @@ nodes it can empty, then drains the rest, respecting the budget for up to one ho
   soak, at most seven days in total, on standard blue-green; the wait of up to seven days and then
   an hour's drain on autoscaled blue-green) and the removal that ends it are in GKE's
   [node upgrade strategies](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/node-pool-upgrade-strategies).
-  The seeded fleet plants no drain-blocking budget.
+  The seeded fleet plants one: the `readiness-drain-blocked` role, a `maxUnavailable: 0` budget on
+  the one-replica `pinned-batch-runner` Deployment.
 
 ### 2. No spare capacity for the displaced pods
 
@@ -265,7 +266,8 @@ strategy's limitations.
   unavailability, not from an incident, and it does not arise on GKE's default settings. Measured
   on a test cluster whose GPU pool had `maxSurge` 0 and `maxUnavailable` 1: the only L4 node was
   destroyed, the zone had no L4 to replace it for eight minutes, and GKE reported the operation
-  done while the pool was in error. No public story verified and no fixture. Accelerator pools
+  done while the pool was in error. No public story verified; the seeded fleet plants the shape as
+  the `readiness-surge-blocked` role, a `maxSurge` 0 pool with one workload pinned to it. Accelerator pools
   are the common case because their quota is small.
 
 ### 3. Every replica in one zone or on one node
@@ -281,8 +283,9 @@ node, or a zone whose nodes roll together, the upgrade takes every replica at on
 - Mitigate after: the next rollout re-spreads the pods once the constraints are in place.
 - Read today: the obtainability audit's spread and pinning checks.
 - GKE recommender: none.
-- Why it is on the list: a consequence of scheduling, not an incident; no fixture on the seeded
-  fleet and no public story verified.
+- Why it is on the list: a consequence of scheduling, not an incident; no public story verified.
+  The seeded fleet plants three shapes of it on its multi-zonal cluster (`zonal-skew-scheduling`,
+  `zonal-skew-volume`, `zonal-skew-capacity`).
 
 ### 4. Data on the node is gone
 
@@ -371,8 +374,9 @@ case `kube-system`.
 - Mitigate after: set `failurePolicy: Ignore` or remove the webhook configuration to unwedge the cluster, then restore it once the backend is up.
 - Read today: nothing.
 - GKE recommender: `K8S_ADMISSION_WEBHOOK_UNAVAILABLE` flags a webhook whose Service has no endpoints and `K8S_ADMISSION_WEBHOOK_UNSAFE` one that intercepts `kube-system` or cluster-scoped system resources ([webhook insights](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/optimize-webhooks)); the certificate subtypes (`DEPRECATION_K8S_1_23_CERTIFICATE`, `DEPRECATION_K8S_SHA_1_CERTIFICATE`) covered backend certificates the 1.23 and 1.29 removals rejected; `K8S_CRD_WITH_INVALID_CA_BUNDLE` flags CRDs with an invalid CA bundle.
-- Why it is on the list: Jetstack's Open Policy Agent webhook outage in the incidents; no fixture
-  on the seeded fleet.
+- Why it is on the list: Jetstack's Open Policy Agent webhook outage in the incidents. The seeded
+  fleet plants the shape as the `readiness-failclosed-webhook` role, a fail-closed webhook whose
+  Service does not exist.
 
 ### 8. A default changes in the new minor
 
@@ -627,6 +631,63 @@ stopped publishing, or an egress allowlist admits only the old hostname, only th
   [`k8s.gcr.io` freeze](https://kubernetes.io/blog/2023/02/06/k8s-gcr-io-freeze-announcement/) and
   its [redirect](https://kubernetes.io/blog/2023/03/10/image-registry-redirect/): tags published
   after the freeze exist only on the new host, and allowlists naming only the old one broke.
+
+## How each failure is tested
+
+Every failure on this list is tested the same way, and this section is written for a reader who
+has never seen the code. A small test fleet of four clusters runs all the time for this purpose.
+On it we set up a harmless example of each failure: not a live outage, but the condition that
+would cause one, such as a rule that forbids taking an application down, so the fleet stays
+healthy and the test can run every night. Then, every night, a scripted test asks the assistant
+about it in chat, exactly as an operator would, and checks the answer.
+
+The check is strict in one place and lenient everywhere else. The question ends by asking for one
+short line per cluster in a fixed form, for example "cluster B: protected application: yes; which:
+batch-runner". Only those lines are checked automatically, word for word, so a right answer cannot
+be mistaken for a wrong one because of how it was phrased, and a hedged or wrong line fails. The
+rest of the answer, the explanation and the advice, is read by a second model that scores its
+quality. Two guards sit around every test: if the example was quietly repaired during the run,
+the test fails rather than passes, and if a test cluster was missing when the test ran, the result
+is recorded as a broken environment rather than a wrong answer.
+
+Two failures get a second test. The assistant also produces a scheduled weekly report on upgrade
+readiness without being asked, and for those two the report itself must flag the problem.
+
+Six of the twenty cannot be set up as a standing example, because the failure only exists during
+a specific version change, is a live fault, needs hardware the fleet does not have, or lives in a
+compatibility table rather than in a cluster. Each of those keeps the record of its one-off
+reproduction, and the table says so.
+
+| #   | The failure                                                                                                                            | What we set up on the test fleet                                                                                                                                                    | How the assistant is tested                                                                                                                                                                                  |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1   | [A protection rule forbids taking a pod down](#1-a-poddisruptionbudget-forbids-the-eviction)                                           | One small application on the second cluster whose protection rule says no copy may ever be unavailable, so the machine it runs on can never be emptied for an upgrade               | Asked which clusters carry such a rule and which application; must name the cluster, the application and the rule. The weekly report must also warn, unasked, that this cluster's upgrade would not complete |
+| 2   | [No spare capacity for the displaced pods](#2-no-spare-capacity-for-the-displaced-pods)                                                | A machine pool on the second cluster set to replace its only machine without adding a spare first, with one application pinned to it                                                | Asked which pools would take their application down during an upgrade; must name the pool and the application                                                                                                |
+| 3   | [Every replica in one zone or on one node](#3-every-replica-in-one-zone-or-on-one-node)                                                | On the fourth cluster, three applications whose copies all sit in one zone, each for a different reason: a placement rule, a disk tied to that zone, no room in the other zone      | Asked which applications lose every copy when one zone is drained; must name all three and the reason for each                                                                                               |
+| 4   | [Data on the node is gone](#4-data-on-the-node-is-gone)                                                                                | An application on the first cluster that keeps its work queue in a scratch directory on the machine itself, which an upgrade wipes                                                  | Asked which applications keep state on the machine; must name it                                                                                                                                             |
+| 5   | [Maintenance window too short, or an exclusion ends mid-roll](#5-maintenance-window-too-short-or-an-exclusion-ends-mid-roll)           | The second cluster is held back from upgrading by a calendar hold with an end date                                                                                                  | Asked when each cluster's hold ends; must give the date. The weekly report already flags a hold that blocks a due upgrade                                                                                    |
+| 6   | [A served API version is removed](#6-a-served-api-version-is-removed)                                                                  | A scheduled job on the first cluster that still calls an old interface: one that is deprecated but still works, because a cluster would refuse an interface that is already removed | Asked which callers use removed interfaces and which merely deprecated ones; must put this job under deprecated and say nothing calls a removed one                                                          |
+| 7   | [A fail-closed webhook whose backend is not up](#7-a-fail-closed-webhook-whose-backend-is-not-up)                                      | A gatekeeper on the second cluster configured to reject every new pod whenever it cannot be reached, pointing at a service that does not exist                                      | Asked which gatekeepers would block pods from restarting during an upgrade; must name it                                                                                                                     |
+| 8   | [A default changes in the new minor](#8-a-default-changes-in-the-new-minor)                                                            | Nothing: the failure exists only between two specific versions                                                                                                                      | Not tested on the standing fleet; the one-off reproduction is the record                                                                                                                                     |
+| 9   | [A feature is deprecated but still served](#9-a-feature-is-deprecated-but-still-served)                                                | The same scheduled job as entry 6                                                                                                                                                   | Asked which workload on each cluster still calls deprecated interfaces, using the cluster's audit log; must name the job and the interface                                                                   |
+| 10  | [Add-on and client skew](#10-add-on-and-client-skew)                                                                                   | Nothing: the failure lives in a compatibility table, not in a cluster                                                                                                               | Not tested on the standing fleet                                                                                                                                                                             |
+| 11  | [The control plane is unreachable for minutes on a zonal cluster](#11-the-control-plane-is-unreachable-for-minutes-on-a-zonal-cluster) | Nothing extra: all four test clusters have a single-zone control plane, which is the condition                                                                                      | Asked whether each cluster's control plane stays reachable while it upgrades; must say no for every cluster and that running applications are unaffected                                                     |
+| 12  | [A node label is removed](#12-a-node-label-is-removed)                                                                                 | An application on the first cluster that insists on running only on machines carrying a label that has been deprecated for years but is still set today                             | Asked which applications depend on deprecated machine labels; must name it                                                                                                                                   |
+| 13  | [The container runtime changes](#13-the-container-runtime-changes)                                                                     | A per-machine agent on the first cluster that talks to the container engine directly through its socket                                                                             | Asked which agents talk to the container engine directly; must name it                                                                                                                                       |
+| 14  | [cgroup v2 under a runtime that cannot read it](#14-cgroup-v2-under-a-runtime-that-cannot-read-it)                                     | Nothing: the failure exists only on a specific machine image                                                                                                                        | Not tested on the standing fleet                                                                                                                                                                             |
+| 15  | [The OOM killer starts killing the whole container](#15-the-oom-killer-starts-killing-the-whole-container)                             | Nothing: this is a live fault, not a condition                                                                                                                                      | Not tested on the standing fleet                                                                                                                                                                             |
+| 16  | [The network dataplane changes](#16-the-network-dataplane-changes)                                                                     | Nothing extra: every test namespace already carries a deny-all network rule, and no test cluster enforces network rules today                                                       | Asked whether each cluster enforces its network rules and what turning enforcement on would block; must say none enforces them and name what would start being blocked                                       |
+| 17  | [A node networking agent fails on the new image](#17-a-node-networking-agent-fails-on-the-new-image)                                   | Nothing: the condition is a machine label that a rebuild drops                                                                                                                      | Not tested on the standing fleet                                                                                                                                                                             |
+| 18  | [GPU driver mismatch](#18-gpu-driver-mismatch)                                                                                         | Nothing: the fleet has no GPUs                                                                                                                                                      | Not tested on the standing fleet                                                                                                                                                                             |
+| 19  | [In-tree volumes lose their CSI path](#19-in-tree-volumes-lose-their-csi-path)                                                         | A disk on the first cluster attached the old way, with an application reading from it                                                                                               | Asked which volumes still use the old attachment path; must name it                                                                                                                                          |
+| 20  | [Images on a retired registry](#20-images-on-a-retired-registry)                                                                       | An application on the first cluster whose image comes from a download site that was retired and now only forwards requests                                                          | Asked which images come from retired download sites; must name it                                                                                                                                            |
+
+This table is the plan the tests follow, not a status board. Engineers find what exists today
+in four places: the fleet's fixture catalogue
+([`bench/tf/fleet/fixtures.json`](../../bench/tf/fleet/fixtures.json)) for what is set up, the
+nightly roster (`hack/eval/nightly-cases.txt`) for which tests run, the case format
+([`bench-case-format.md`](bench-case-format.md)) for how a test is written, and the governance
+SOPs for what the weekly report checks. The one-off reproductions behind every row are in
+[`upgrade-failure-reproductions.md`](upgrade-failure-reproductions.md).
 
 ## The order to add checks
 
