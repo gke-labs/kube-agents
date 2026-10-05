@@ -64,7 +64,7 @@ RUNTIME_MEMBERS = (
 )
 #: The adapter file's module-level functions the runtime calls, and how: positional arguments, keywords.
 RUNTIME_FUNCTIONS = {"_slack_mention_detection_text": (1, ())}
-#: The instance attributes the runtime reads, set in ``__init__``.
+#: The instance attributes the runtime reads or relies on, set in ``__init__``.
 #: ``_user_name_cache`` is what keeps a click from costing a ``users.info`` call each time.
 RUNTIME_ATTRIBUTES = ("_bot_user_id", "_team_bot_user_ids", "_user_name_cache")
 #: The members the runtime awaits; every other one it calls plainly.
@@ -237,7 +237,7 @@ def check_members(tree: ast.Module) -> None:
         raise _fail(f"{ADAPTER_CLASS} no longer has {', '.join(missing)}, which the runtime calls")
     unset = [name for name in RUNTIME_ATTRIBUTES if name not in _init_attributes(classes[0])]
     if unset:
-        raise _fail(f"{ADAPTER_CLASS}.__init__ no longer sets {', '.join(unset)}, which the runtime reads")
+        raise _fail(f"{ADAPTER_CLASS}.__init__ no longer sets {', '.join(unset)}, which the runtime reads or relies on")
     functions = {n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
     for name, (positional, keywords) in RUNTIME_FUNCTIONS.items():
         function = functions.get(name)

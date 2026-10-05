@@ -20,6 +20,7 @@ Two things are checked:
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import os
 import re
@@ -29,6 +30,9 @@ from types import SimpleNamespace
 
 RUNTIME = "gateway/slack_ux_failure.py"
 FLAG_ENV = "KAGE_SLACK_UX"
+IMPORT_MODULE = "gateway"
+IMPORT_NAME = "slack_ux_failure"
+ALIAS = "_kage_slack_failure"
 
 NOTIFIER = "gateway/kanban_watchers_notifier.py"
 CALLS = {
@@ -64,6 +68,14 @@ def check_callers(root: Path) -> None:
         for call in calls:
             if call not in text:
                 raise _fail(f"{rel} does not carry {call!r}")
+        # A call compiles without its import and raises NameError only when it runs.
+        if not any(
+            isinstance(stmt, ast.ImportFrom)
+            and stmt.module == IMPORT_MODULE
+            and any(a.name == IMPORT_NAME and a.asname == ALIAS for a in stmt.names)
+            for stmt in ast.parse(text).body
+        ):
+            raise _fail(f"{rel} does not import {IMPORT_MODULE}.{IMPORT_NAME} as {ALIAS}")
     notifier = (root / NOTIFIER).read_text()
     if MOMENTS_LINE not in notifier or notifier.index(MOMENTS_LINE) > notifier.index(CALLS[NOTIFIER][0]):
         raise _fail("note_wake does not follow the moments note on the wake")

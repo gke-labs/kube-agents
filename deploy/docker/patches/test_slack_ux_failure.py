@@ -74,7 +74,13 @@ class PresentTest(unittest.TestCase):
         self.assertEqual(label, "")
 
     def test_a_lead_holding_markup_is_left_plain(self):
-        for reply in ("*Already bold.* Retry?", "`seeded-z` is gone. Retry?", "- a list item. Retry?"):
+        for reply in (
+            "*Already bold.* Retry?",
+            "`seeded-z` is gone. Retry?",
+            "- a list item. Retry?",
+            "1. Restart the pod.\n2. Check the logs.\nRetry?",
+            "2) Check the logs. Retry?",
+        ):
             with self.subTest(reply=reply):
                 bolded, _ = runtime.present(reply)
                 self.assertEqual(bolded, reply)
@@ -235,6 +241,19 @@ class ApplyTest(unittest.TestCase):
         verifier.check_callers(self.root)
         with self.assertRaises(SystemExit):
             applier.apply(self.root)
+
+    def test_the_verifier_refuses_a_call_whose_import_is_gone(self):
+        applier.apply(self.root)
+        imported = applier.GATEWAY_IMPORT.strip().splitlines()[-1]
+        for rel in (applier.NOTIFIER, applier.BASE, applier.SLACK_ADAPTER, applier.RUN_TURN):
+            with self.subTest(rel=rel):
+                path = self.root / rel
+                patched = path.read_text()
+                path.write_text(patched.replace(imported, ""))
+                with self.assertRaises(SystemExit) as ctx:
+                    verifier.check_callers(self.root)
+                self.assertIn("does not import gateway.slack_ux_failure", str(ctx.exception))
+                path.write_text(patched)
 
 
 if __name__ == "__main__":

@@ -181,7 +181,7 @@ def present(content: str) -> tuple[str, str]:
     indent = text[: len(text) - len(lead)]
     first, newline, after = lead.partition("\n")
     sentence, rest = _presenter._first_sentence(first)
-    if sentence and sentence[0].isalnum() and not MARKUP.search(sentence):
+    if sentence and sentence[0].isalnum() and not MARKUP.search(sentence) and not _presenter.LIST_MARKER.match(first):
         first = f"**{sentence}**" + (f" {rest}" if rest else "")
     bolded = indent + first + newline + after
     match = TRAILING_QUESTION.search(text.rstrip())
