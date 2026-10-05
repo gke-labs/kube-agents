@@ -132,6 +132,12 @@ class SplitTest(unittest.TestCase):
             with self.subTest(answer):
                 self.assertEqual(runtime.split(answer), ([("No pods are failing.", False)], "All 12 are Running."))
 
+    def test_a_bold_run_cut_at_the_lead_reopens_in_the_rest(self):
+        self.assertEqual(
+            runtime.split("**Two pods fail. Both exit 137.** Raise the limit."),
+            ([("Two pods fail.", False)], "**Both exit 137.** Raise the limit."),
+        )
+
     def test_a_code_span_in_the_lead_stays_code(self):
         headline, rest = runtime.split("**One pod is failing: `web-1` is CrashLoopBackOff.** It exits 137.")
         self.assertEqual(
@@ -423,6 +429,67 @@ class ApplierTest(unittest.TestCase):
         applier.apply(self.root)
         with self.assertRaises(SystemExit):
             applier.apply(self.root)
+
+
+#: The SlackAdapter surface slack_ux_answer calls, with upstream's signatures.
+ADAPTER_SOURCE = """
+def _slack_unfurl_kwargs(extra):
+    return {}
+
+
+class SlackAdapter:
+    def __init__(self):
+        self._bot_message_ts = set()
+
+    def _extra_flag(self, key, default=False): ...
+    def _outbound_blocked(self, chat_id, what): ...
+    async def _dm_target(self, chat_id, metadata): ...
+    @staticmethod
+    def _metadata_team_id(metadata): ...
+    def _resolve_thread_ts(self, reply_to=None, metadata=None): ...
+    def _client_for(self, chat_id, metadata): ...
+    @staticmethod
+    def _workspace_message_marker(team_id, message_id): ...
+    def format_message(self, content): ...
+    def _append_feedback_block(self, blocks): ...
+    async def stop_typing(self, chat_id, metadata=None): ...
+    def _trim_bot_message_timestamps(self): ...
+"""
+
+
+class AdapterCheckTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / verify_slack_ux_answer.ADAPTER).parent.mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def check(self, source):
+        (self.root / verify_slack_ux_answer.ADAPTER).write_text(source)
+        verify_slack_ux_answer.check_adapter(self.root)
+
+    def test_upstream_signatures_pass(self):
+        self.check(ADAPTER_SOURCE)
+
+    def test_a_signature_that_cannot_take_the_call_fails(self):
+        drifts = {
+            "stop_typing": ("stop_typing(self, chat_id, metadata=None)", "stop_typing(self, chat_id, meta=None)"),
+            "_client_for": ("_client_for(self, chat_id, metadata)", "_client_for(self, chat_id, metadata, team)"),
+            "_workspace_message_marker": ("@staticmethod\n    def _workspace_message_marker(team_id",
+                                          "def _workspace_message_marker(team_id"),
+            "_slack_unfurl_kwargs": ("_slack_unfurl_kwargs(extra)", "_slack_unfurl_kwargs()"),
+        }
+        for name, (old, new) in drifts.items():
+            with self.subTest(name), self.assertRaisesRegex(SystemExit, f"{name}.* no longer accepts"):
+                self.assertIn(old, ADAPTER_SOURCE)
+                self.check(ADAPTER_SOURCE.replace(old, new))
+
+    def test_a_member_turned_property_fails(self):
+        source = ADAPTER_SOURCE.replace("    def format_message", "    @property\n    def format_message")
+        with self.assertRaisesRegex(SystemExit, "format_message is now decorated"):
+            self.check(source)
 
 
 if __name__ == "__main__":

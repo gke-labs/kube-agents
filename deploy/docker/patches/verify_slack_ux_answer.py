@@ -16,11 +16,13 @@ Three things are checked:
    card's answer posts once, in the card's thread, as its first sentence in
    bold and the rest folded as the Slack plugin's own ``block_kit`` renders
    it, and a report that opens with a heading takes the upstream send.
-3. The adapter. ``SlackAdapter`` still has the members the runtime calls, the
-   ones it awaits still async, and still sets ``_bot_message_ts``; its module
-   still defines ``_slack_unfurl_kwargs``. The stub
-   below supplies them, so only this check ties them to upstream; a missing
-   one would fall back to the upstream send at runtime, folding nothing.
+3. The adapter. ``SlackAdapter`` still has the members the runtime calls, each
+   still accepting the call ``_post`` makes (:data:`CALL_SHAPES`), the ones it
+   awaits still async, and still sets ``_bot_message_ts``; its module still
+   defines ``_slack_unfurl_kwargs(extra)``. The stub below supplies them, so
+   only this check ties them to upstream; a missing one, or one whose
+   signature drifted, raises inside the folder's ``send``, which falls back
+   to the upstream send at runtime, folding nothing.
 
 A wrong adapter here raises nothing at runtime: the answer is posted whole as
 before. The build is where it is caught.
@@ -30,7 +32,9 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import copy
 import importlib.util
+import inspect
 import os
 import sys
 from pathlib import Path
@@ -41,16 +45,29 @@ RUNTIME = "gateway/slack_ux_answer.py"
 BLOCK_KIT = "plugins/platforms/slack/block_kit.py"
 ADAPTER = "plugins/platforms/slack/adapter.py"
 ADAPTER_CLASS = "SlackAdapter"
-#: The adapter members the runtime calls, the ones it awaits, and the attribute it adds to.
-RUNTIME_MEMBERS = (
-    "_extra_flag", "_outbound_blocked", "_dm_target", "_metadata_team_id", "_resolve_thread_ts",
-    "_client_for", "_workspace_message_marker", "format_message", "_append_feedback_block",
-    "stop_typing", "_trim_bot_message_timestamps",
-)
+#: The adapter members the runtime calls, each as (positional count after self, keyword names)
+#: the way slack_ux_answer calls it; the ones it awaits; and the attribute it adds to.
+CALL_SHAPES = {
+    "_extra_flag": (1, ()),
+    "_outbound_blocked": (2, ()),
+    "_dm_target": (2, ()),
+    "_metadata_team_id": (1, ()),
+    "_resolve_thread_ts": (2, ()),
+    "_client_for": (2, ()),
+    "_workspace_message_marker": (2, ()),
+    "format_message": (1, ()),
+    "_append_feedback_block": (1, ()),
+    "stop_typing": (1, ("metadata",)),
+    "_trim_bot_message_timestamps": (0, ()),
+}
+RUNTIME_MEMBERS = tuple(CALL_SHAPES)
 ASYNC_MEMBERS = ("_dm_target", "stop_typing")
 RUNTIME_ATTRIBUTE = "_bot_message_ts"
 #: The adapter module's link-preview helper, which the runtime reads from the adapter's module.
 MODULE_FUNCTION = "_slack_unfurl_kwargs"
+MODULE_FUNCTION_SHAPE = (1, ())
+#: The one decorator a member may carry: it binds the call without ``self``.
+STATIC = "staticmethod"
 FLAG_ENV = "KAGE_SLACK_UX"
 
 METHOD = "_send_event"
@@ -117,6 +134,43 @@ def check_notifier(root: Path) -> None:
         raise _fail(f"{NOTIFIER} does not import gateway.slack_ux_answer as {ALIAS}")
 
 
+def _signature(args: ast.arguments) -> inspect.Signature:
+    """The signature ``args`` declares, with annotations dropped and every default ``None``."""
+    bare = copy.deepcopy(args)
+    for arg in [*bare.posonlyargs, *bare.args, *bare.kwonlyargs, bare.vararg, bare.kwarg]:
+        if arg is not None:
+            arg.annotation = None
+    bare.defaults = [ast.Constant(None) for _ in bare.defaults]
+    bare.kw_defaults = [None if d is None else ast.Constant(None) for d in bare.kw_defaults]
+    scope: dict = {}
+    exec(f"def member({ast.unparse(bare)}): pass", scope)  # noqa: S102 — a signature, no body
+    return inspect.signature(scope["member"])
+
+
+def _accepts(
+    function: ast.FunctionDef | ast.AsyncFunctionDef, positional: int, keywords: tuple[str, ...], bound_self: bool
+) -> bool:
+    """Whether ``function`` binds the call as Python would, ``self`` first when ``bound_self``.
+
+    A keyword that binds only into ``**kwargs`` counts as refused: the call runs, but the
+    parameter it meant to set does not get it.
+    """
+    signature = _signature(function.args)
+    leading = [None] if bound_self else []
+    try:
+        bound = signature.bind(*leading, *[None] * positional, **dict.fromkeys(keywords))
+    except TypeError:
+        return False
+    extra = next(
+        (bound.arguments.get(p.name, {}) for p in signature.parameters.values() if p.kind is p.VAR_KEYWORD), {}
+    )
+    return not set(keywords) & set(extra)
+
+
+def _shape(positional: int, keywords: tuple[str, ...]) -> str:
+    return f"{positional} positional argument(s)" + (f" and {', '.join(keywords)}=" if keywords else "")
+
+
 def check_adapter(root: Path) -> None:
     path = root / ADAPTER
     if not path.is_file():
@@ -125,24 +179,37 @@ def check_adapter(root: Path) -> None:
     classes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == ADAPTER_CLASS]
     if len(classes) != 1:
         raise _fail(f"{ADAPTER} has {len(classes)} class {ADAPTER_CLASS}, expected 1")
-    defs = {
-        n.name: isinstance(n, ast.AsyncFunctionDef)
-        for n in classes[0].body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
+    defs = {n.name: n for n in classes[0].body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
     missing = [name for name in RUNTIME_MEMBERS if name not in defs]
     if missing:
         raise _fail(f"{ADAPTER_CLASS} no longer defines {', '.join(missing)}")
-    wrong = [name for name in RUNTIME_MEMBERS if defs[name] != (name in ASYNC_MEMBERS)]
+    wrong = [
+        name for name in RUNTIME_MEMBERS if isinstance(defs[name], ast.AsyncFunctionDef) != (name in ASYNC_MEMBERS)
+    ]
     if wrong:
         raise _fail(f"{ADAPTER_CLASS}.{', '.join(wrong)} changed between sync and async")
+    for name, (positional, keywords) in CALL_SHAPES.items():
+        decorators = [ast.unparse(d) for d in defs[name].decorator_list]
+        # Any other decorator (``@property``, a wrapper) changes how the call binds.
+        if decorators not in ([], [STATIC]):
+            raise _fail(f"{ADAPTER_CLASS}.{name} is now decorated {decorators!r}; the runtime calls it as a method")
+        if not _accepts(defs[name], positional, keywords, bound_self=not decorators):
+            raise _fail(
+                f"{ADAPTER_CLASS}.{name} no longer accepts {_shape(positional, keywords)}, as slack_ux_answer calls it"
+            )
     sets = any(
         isinstance(n, ast.Attribute) and n.attr == RUNTIME_ATTRIBUTE and isinstance(n.ctx, ast.Store)
         for n in ast.walk(classes[0])
     )
     if not sets:
         raise _fail(f"{ADAPTER_CLASS} no longer sets self.{RUNTIME_ATTRIBUTE}")
-    if not any(isinstance(n, ast.FunctionDef) and n.name == MODULE_FUNCTION for n in tree.body):
+    helper = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == MODULE_FUNCTION), None)
+    if helper is None:
         raise _fail(f"{ADAPTER} no longer defines {MODULE_FUNCTION}()")
+    if helper.decorator_list or not _accepts(helper, *MODULE_FUNCTION_SHAPE, bound_self=False):
+        raise _fail(
+            f"{MODULE_FUNCTION}() no longer accepts {_shape(*MODULE_FUNCTION_SHAPE)}, as slack_ux_answer calls it"
+        )
 
 
 def _load_runtime(root: Path):

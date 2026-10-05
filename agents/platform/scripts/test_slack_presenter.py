@@ -307,6 +307,14 @@ class SplitAnswerTest(unittest.TestCase):
         for line in ("Node pool np-1 at rev. 7 is cordoned.", "Certs expired Sept. 30 on seeded-a."):
             self.assertEqual(sp.split_answer(line), (line, []))
 
+    def test_a_bold_lead_ends_at_its_closer_whatever_word_it_ends_on(self):
+        for line, headline, body in (
+            ("**Replicas are at max.** 3 pods run.", "Replicas are at max.", ["3 pods run."]),
+            ("__Etc.__ Done.", "Etc.", ["Done."]),
+        ):
+            self.assertEqual(sp.split_answer(line), (headline, body))
+        self.assertEqual(sp.split_answer("Scale to max. 3 pods run."), ("Scale to max. 3 pods run.", []))
+
     def test_an_abbreviation_in_parentheses_does_not_end_the_headline(self):
         for line, headline in (
             ("Several pods fail (e.g. Checkout) in prod. Raise it.", "Several pods fail (e.g. Checkout) in prod."),

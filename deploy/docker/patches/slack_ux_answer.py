@@ -82,6 +82,8 @@ NOT_PROSE = re.compile(r"^\s*(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|`{3,}|~{3,})")
 LOSES_CONTENT = re.compile(r"\]\(|https?://|<[@#!]", re.IGNORECASE)
 #: Holds a code span's place while the rest of the headline is made plain.
 CODE_MARK = "\x01"
+#: Emphasis markers split_lead may close at the cut, longest first.
+MARKERS = ("**", "__", "*", "_")
 #: Where a sentence in the answer's last line starts: after a sentence end and its space.
 SENTENCE_START = re.compile(r"(?<=[.!?])\s+(?=\S)")
 #: A last line that is not a prose sentence: a quote or a table row, besides :data:`NOT_PROSE`.
@@ -151,9 +153,17 @@ def split(answer: str) -> tuple[list[tuple[str, bool]], str] | None:
     # The rest is cut from the answer as written, so its line breaks reach block_kit as they
     # would upstream; split_lead's body joins a first paragraph's lines into one.
     first_line, _, after = answer.strip().partition("\n")
-    if not first_line.startswith(lead):
+    written, reopen = lead, ""
+    # "**One. Two.** Three." comes back as "**One.**": split_lead closed the run it cut, so the
+    # rest reopens it.
+    for marker in MARKERS:
+        if lead.endswith(marker) and not first_line.startswith(lead) and first_line.startswith(lead[: -len(marker)]):
+            written, reopen = lead[: -len(marker)], marker
+            break
+    if not first_line.startswith(written):
         return _refuse("the first sentence runs onto a second line")
-    rest = "\n".join(part for part in (first_line[len(lead):].strip(), after) if part).strip()
+    tail = first_line[len(written):].strip()
+    rest = "\n".join(part for part in (reopen + tail if tail else "", after) if part).strip()
     if not rest:
         return _refuse("nothing follows the first sentence")
     return headline, rest

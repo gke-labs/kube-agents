@@ -393,7 +393,9 @@ def _first_sentence(line: str) -> tuple[str, str]:
         stem = sentence.rstrip("*_")
         tail = max(0, len(stem) - ABBREVIATION_TAIL)
         numbered = NUMBER_ABBREVIATION_END.search(stem, tail) and NUMBER_NEXT.match(line, match.end())
-        if not (numbered or ABBREVIATION_END.search(stem, tail)):
+        # A bold run closing right after the stop ends the sentence, whatever word it ends on.
+        bold_closed = any(sentence.endswith(m) and line.lstrip().startswith(m) for m in BOLD_EDGES)
+        if bold_closed or not (numbered or ABBREVIATION_END.search(stem, tail)):
             rest = line[match.end() :].strip()
             # "**One. Two.**" splits inside the bold, which would leave both halves unpaired.
             for marker, (opener, closer) in BOLD_EDGES.items():
