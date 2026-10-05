@@ -268,9 +268,11 @@ func chatChunks(text string, size int) []string {
 			return append(chunks, reopen+text)
 		}
 		cut := chunkCut(text, budget)
+		cut = adjustCutToCodeSpanStart(text, cut, budget)
 		open := fenceOpenAtEnd(reopen + text[:cut])
 		if open {
 			cut = chunkCut(text, budget-len(fenceClose))
+			cut = adjustCutToCodeSpanStart(text, cut, budget-len(fenceClose))
 			open = fenceOpenAtEnd(reopen + text[:cut])
 		}
 		chunk := reopen + text[:cut]
@@ -316,6 +318,22 @@ func chunkCut(text string, size int) int {
 		cut = size
 		for cut > 0 && !utf8.RuneStart(text[cut]) {
 			cut--
+		}
+	}
+	return cut
+}
+
+// adjustCutToCodeSpanStart moves cut back to the start of any code span
+// found by mdCodeSpanRE in text that contains cut, provided that start lies
+// in the second half of the budget (the same rule chunkCut applies to line
+// breaks); otherwise cut is returned unchanged.
+func adjustCutToCodeSpanStart(text string, cut, budget int) int {
+	for _, span := range mdCodeSpanRE.FindAllStringIndex(text, -1) {
+		if span[0] < cut && cut < span[1] {
+			if span[0] >= budget/2 {
+				return span[0]
+			}
+			break
 		}
 	}
 	return cut

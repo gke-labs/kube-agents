@@ -90,10 +90,10 @@ func TestIsDelegate(t *testing.T) {
 // chunk is then balanced on its fences, so a fenced block never leaks its
 // closer into the next chunk; no chunk exceeds the cap even with the fences
 // added; and the text between the inserted fences is the original, byte for
-// byte. The guarantee is about fences only: a cut inside a multi-line
-// double-backtick span, or a hard cut inside a mid-line fence opener, still
-// makes the next chunk parse differently from the whole (tracked as a
-// follow-up). The opener's info string is not carried: a continuation of a
+// byte. When a cut falls inside any code span (including multi-line double-backtick
+// spans and mid-line fence openers) whose start lies in the second half of the
+// budget, the cut moves back to the span start, keeping the span intact in the
+// next chunk. The opener's info string is not carried: a continuation of a
 // yaml block reopens with ``` alone.
 func TestChatChunksKeepFencesBalanced(t *testing.T) {
 	logs := strings.Repeat("log line\n", 300)
@@ -155,6 +155,71 @@ func TestChatChunksKeepFencesBalanced(t *testing.T) {
 		}
 		if joined.String() != tc.text {
 			t.Errorf("%s: the chunks, with the inserted fences removed, are not the original text:\n got %q\nwant %q", name, joined.String(), tc.text)
+		}
+	}
+}
+
+// TestChatChunksAvoidSplittingCodeSpans: when a cut falls inside any code
+// span (multi-line double-backtick spans or mid-line fence openers) starting in
+// the second half of the budget, the chunker moves the cut back to the span's
+// start so that each chunk parses independently without orphaned delimiters
+// breaking downstream markdown conversion (#2288).
+func TestChatChunksAvoidSplittingCodeSpans(t *testing.T) {
+	// Case 1: A multi-line double-backtick span starting in the second half
+	// of the budget. Without adjusting the cut, an ordinary line break inside
+	// the double-backtick span is chosen, splitting the span and leaving an
+	// orphaned closer in chunk 2 that swallows subsequent prose as code.
+	in1 := strings.Repeat("filler line\n", 150) + "``" + strings.Repeat("filler line\n", 20) + "end``\nsee **bold** and <https://a.example|https://b.example>\n``x``\n"
+	chunks1 := chatChunks(in1, discordChunk)
+	if len(chunks1) != 2 {
+		t.Fatalf("case 1: got %d chunks, want 2", len(chunks1))
+	}
+	for i, c := range chunks1 {
+		if len(c) > discordChunk {
+			t.Errorf("case 1: chunk %d exceeds %d bytes: %d", i, discordChunk, len(c))
+		}
+	}
+	wantCut1 := len(strings.Repeat("filler line\n", 150))
+	if len(chunks1[0]) != wantCut1 {
+		t.Errorf("case 1: chunk 1 len = %d, want %d", len(chunks1[0]), wantCut1)
+	}
+	gotGchat1 := toGchatText(chunks1[1])
+	if !strings.Contains(gotGchat1, "*bold*") || strings.Contains(gotGchat1, "**bold**") {
+		t.Errorf("case 1: toGchatText(chunk 2) left bold unconverted: %q", gotGchat1)
+	}
+	if strings.Contains(gotGchat1, "<https://a.example|") {
+		t.Errorf("case 1: toGchatText(chunk 2) left link undefanged: %q", gotGchat1)
+	}
+
+	// Case 2: A hard cut inside a mid-line fence opener at byte 1898.
+	// Without adjusting the cut, chunk 1 ends with two backticks and chunk 2
+	// starts with the third, corrupting fence pairing in chunk 2.
+	in2 := strings.Repeat("a", 1898) + "```\ncodeA\n```\nsee **bold** and <https://a.example|https://b.example>\n```\ncodeB\n```\n"
+	chunks2 := chatChunks(in2, discordChunk)
+	if len(chunks2) != 2 {
+		t.Fatalf("case 2: got %d chunks, want 2", len(chunks2))
+	}
+	if len(chunks2[0]) != 1898 {
+		t.Errorf("case 2: chunk 1 len = %d, want 1898", len(chunks2[0]))
+	}
+	gotGchat2 := toGchatText(chunks2[1])
+	if !strings.Contains(gotGchat2, "*bold*") || strings.Contains(gotGchat2, "**bold**") {
+		t.Errorf("case 2: toGchatText(chunk 2) left bold unconverted: %q", gotGchat2)
+	}
+	if strings.Contains(gotGchat2, "<https://a.example|") {
+		t.Errorf("case 2: toGchatText(chunk 2) left link undefanged: %q", gotGchat2)
+	}
+
+	// Fallback case: a span starting in the first half of the budget (< budget/2)
+	// falls through to existing behavior and makes progress without looping.
+	in3 := "``" + strings.Repeat("filler line\n", 170) + "end``\n"
+	chunks3 := chatChunks(in3, discordChunk)
+	if len(chunks3) < 2 {
+		t.Fatalf("case 3: got %d chunks, want >= 2", len(chunks3))
+	}
+	for i, c := range chunks3 {
+		if len(c) > discordChunk {
+			t.Errorf("case 3: chunk %d exceeds %d bytes: %d", i, discordChunk, len(c))
 		}
 	}
 }
