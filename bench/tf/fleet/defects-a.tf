@@ -1587,7 +1587,9 @@ resource "kubernetes_cron_job_v1" "stale_kubectl_client" {
         labels = { app = "stale-kubectl-client" }
       }
       spec {
-        backoff_limit = 0
+        backoff_limit              = 0
+        active_deadline_seconds    = 300
+        ttl_seconds_after_finished = "900"
         template {
           metadata {
             labels = { app = "stale-kubectl-client" }

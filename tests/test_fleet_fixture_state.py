@@ -730,6 +730,11 @@ class PassTest(_Harness):
                 {"spec": {"template": {"spec": {"containers": [{"name": "jvm", "image": "docker.io/library/eclipse-temurin:8u442-b06-jre", "resources": {"limits": {"memory": "192Mi"}}}]}}}, "status": {"readyReplicas": 1, "replicas": 1}},
                 'image any_eq "docker.io/library/eclipse-temurin:8u302-b08-jre": observed "docker.io/library/eclipse-temurin:8u442-b06-jre"',
             ),
+            "multi-process-container": (
+                "deployment/multi-process-worker",
+                {"spec": {"template": {"spec": {"containers": [{"name": "supervisor", "command": ["sh", "-c", "exec sleep infinity"], "resources": {"limits": {"memory": "32Mi"}}}]}}}, "status": {"readyReplicas": 1, "replicas": 1}},
+                'spec.template.spec.containers[*].command[2] any_eq "sleep infinity & sleep infinity & wait": observed "exec sleep infinity"',
+            ),
             "node-image-coupled-agent": (
                 "daemonset/cni-shaped-agent",
                 {"spec": {"template": {"spec": {"hostNetwork": False, "volumes": [{"name": "cni-conf", "hostPath": {"path": "/etc/cni/net.d", "type": "Directory"}}]}}}, "status": {"desiredNumberScheduled": 2, "numberReady": 2}},

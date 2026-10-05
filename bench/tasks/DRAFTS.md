@@ -238,7 +238,7 @@ Not domains; failures every domain has to survive (strategy §4.2, last two tabl
 
 ## Seeded-fleet shopping list (what the defects above imply)
 
-Three clusters, not two — the consistency scenario has no majority and no outlier with two. Cluster A carries `seeded-reliability`, `seeded-security`, `seeded-debug`, `seeded-capacity`, `seeded-deprecation`, `seeded-intent`, `seeded-stall`, `seeded-shapes` and the idle/orphan cost defects; cluster B is pinned one version behind; cluster C is the consistency outlier. A fourth, multi-zonal cluster D now carries the zonal-skew fixtures, and B the upgrade-readiness drain defects. The scheduled reconcile must re-pin B's version (GKE auto-upgrade heals that defect otherwise) and must not "fix" any planted defect.
+Three clusters, not two — the consistency scenario has no majority and no outlier with two. Cluster A carries `seeded-reliability`, `seeded-security`, `seeded-debug`, `seeded-capacity`, `seeded-deprecation`, `seeded-intent`, `seeded-stall`, `seeded-shapes`, `seeded-defaults` and the idle/orphan cost defects; cluster B is pinned one version behind; cluster C is the consistency outlier. A fourth, multi-zonal cluster D now carries the zonal-skew fixtures, and B the upgrade-readiness drain defects. The scheduled reconcile must re-pin B's version (GKE auto-upgrade heals that defect otherwise) and must not "fix" any planted defect.
 
 That allocation is written down in `bench/tf/fleet/fixtures.json` as a role-to-slot catalog, which is what lets a case address a fixture without naming a cluster (A5). Planting a new defect means adding a role there in the same change.
 

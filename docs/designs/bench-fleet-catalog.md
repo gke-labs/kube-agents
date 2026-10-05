@@ -263,7 +263,7 @@ correctly reports no finding and a case asserting one correctly fails.
 Twenty-eight of the thirty are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`,
 `declared-no-pdb-workload`, `declared-token-workload`, `declared-overrequest-workload`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the four
 `readiness-*` roles on slot `b`, the three `zonal-skew-*` roles on slot `d` and the eleven
-upgrade-failure shapes in `seeded-shapes` (`node-local-state`, `deprecated-label-selector`,
+upgrade-failure shapes, ten in `seeded-shapes` and one in `seeded-defaults` (`node-local-state`, `deprecated-label-selector`,
 `containerd-socket-agent`, `intree-pd-volume`, `retired-registry-image`, `moving-admission-default`,
 `stale-client-skew`, `cgroup-blind-runtime`, `multi-process-container`, `node-image-coupled-agent`,
 `cuda-pinned-gpu-job`), covering
