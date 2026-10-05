@@ -20,9 +20,10 @@ marked thread's next internal final runs marked.
 both draw a marked reply.
 
 ``gateway/run_turn.py``: ``_run_agent_queued_followup`` calls
-``drop(turn_ctx.source, pending_event)`` just before it runs the follow-up, so a
-user message queued behind a wake turn, whose reply is sent under the wake's
-event, does not take the wake's mark.
+``drop(turn_ctx.source, pending_event)`` just before it runs the follow-up. The
+follow-up's reply is sent under the outer turn's event, so a user message
+queued behind a wake turn drops the wake's mark, and a wake queued behind a
+user's turn carries its mark to that reply.
 
 With the flag off nothing is marked and every call returns upstream's result.
 What the flag changes, and why, is in the module docstring of
@@ -94,7 +95,8 @@ RUN_TURN = "gateway/run_turn.py"
 FOLLOWUP_ANCHOR = '        await _run_followup_processing_hook(_hook_adapter, pending_event, "on_processing_start")\n'
 FOLLOWUP_PATCHED = FOLLOWUP_ANCHOR + (
     "        # kube-agents patch: this follow-up's reply goes out under the outer turn's\n"
-    "        # event, so a user's message must not take a failure wake's mark; see\n"
+    "        # event, so a user's message drops a failure wake's mark and a queued\n"
+    "        # wake carries it to that reply; see\n"
     "        # gateway/slack_ux_failure.py.\n"
     "        _kage_slack_failure.drop(turn_ctx.source, pending_event)\n"
 )

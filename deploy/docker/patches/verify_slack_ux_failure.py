@@ -136,6 +136,11 @@ def drive(module) -> None:
         module.drop(_event().source, _event(internal=False))
         if _draw(module, _event()) != _render(REPLY):
             raise _fail("a queued follow-up's reply was drawn as the failure's")
+        module.note_wake(SUB, {"gave_up"}, "wake")
+        module.drop(_event().source, _event())
+        carried = _draw(module, _event(internal=False))
+        if not carried[0]["text"]["text"].startswith(LEAD):
+            raise _fail("a wake queued behind the user's turn lost the failure's look")
     finally:
         os.environ.pop(FLAG_ENV, None)
 
@@ -145,7 +150,7 @@ def main(root: Path = Path("/opt/hermes")) -> None:
     drive(_load_runtime(root))
     print(
         "slack_ux_failure verify: marked from the wake, bracketed in the final send, "
-        "drawn in _maybe_blocks, dropped by a queued user message; a failure reply leads in bold and offers its question once"
+        "drawn in _maybe_blocks, dropped by a queued user message and carried by a queued wake; a failure reply leads in bold and offers its question once"
     )
 
 

@@ -447,8 +447,8 @@ async def _drive(module) -> None:
         update, turn = (entry[1] for entry in adapter.log)
         if any(b.get("type") == "actions" for b in update["blocks"]):
             raise _fail("the answered choice buttons are still on the message")
-        if f"<@{USER}>" not in update["text"]:
-            raise _fail(f"the answered message does not name the clicker: {update!r}")
+        if not update["text"].startswith(f"✓ {module.NAMELESS_CLICKER}: {LABEL}") or "@" in update["text"]:
+            raise _fail(f"the answered message does not name the clicker as plain text: {update!r}")
         expected = {"user": USER, "text": LABEL, "channel": CHANNEL, "thread_ts": THREAD, "ts": ACTION_TS}
         if {k: turn.get(k) for k in expected} != expected:
             raise _fail(f"the turn was {turn!r}")

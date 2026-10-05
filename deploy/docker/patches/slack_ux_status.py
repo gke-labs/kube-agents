@@ -25,7 +25,7 @@ costs a call or two rather than 30 a minute. Each open and close is logged at in
 free text and is left to upstream.
 
 **The session title.** Upstream titles only DM threads. With the flag on, a
-channel thread's first ask (or a clicked choice's label, offered by
+channel thread's first ask (or the question a clicked choice answers, offered by
 ``slack_ux_clicks`` before its turn runs) becomes its session title, set right after a
 ``processing`` lands: ``agents.sessions.rename`` refuses a thread with no
 session yet. A failed rename keeps the ask for the next ``processing`` sent;

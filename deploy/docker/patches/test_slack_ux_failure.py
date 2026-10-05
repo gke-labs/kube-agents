@@ -48,10 +48,12 @@ def _buttons(blocks):
 class FlagOn(unittest.TestCase):
     def setUp(self):
         runtime._marks.clear()
+        runtime._carried.clear()
         patcher = mock.patch.dict(os.environ, {FLAG_ENV: "1"})
         patcher.start()
         self.addCleanup(patcher.stop)
         self.addCleanup(runtime._marks.clear)
+        self.addCleanup(runtime._carried.clear)
 
     def draw(self, event, content=REPLY, render=_render):
         token = runtime.begin(event)
@@ -76,7 +78,9 @@ class PresentTest(unittest.TestCase):
     def test_a_lead_holding_markup_is_left_plain(self):
         for reply in (
             "*Already bold.* Retry?",
-            "`seeded-z` is gone. Retry?",
+            "`seeded-z`. Retry?",
+            "`seeded-z` is *gone*. Retry?",
+            "An unpaired ` tick. Retry?",
             "- a list item. Retry?",
             "1. Restart the pod.\n2. Check the logs.\nRetry?",
             "2) Check the logs. Retry?",
@@ -84,6 +88,20 @@ class PresentTest(unittest.TestCase):
             with self.subTest(reply=reply):
                 bolded, _ = runtime.present(reply)
                 self.assertEqual(bolded, reply)
+
+    def test_a_code_span_in_the_lead_stays_code_and_the_words_around_it_are_bold(self):
+        cases = {
+            "I couldn't find `seeded-z` in the fleet. Check it there?": (
+                "**I couldn't find** `seeded-z` **in the fleet.** Check it there?"
+            ),
+            "`seeded-z` is gone. Retry?": "`seeded-z` **is gone.** Retry?",
+            "The pod `api-7f` crashed with `OOMKilled`. More.": (
+                "**The pod** `api-7f` **crashed with** `OOMKilled`. More."
+            ),
+        }
+        for reply, want in cases.items():
+            with self.subTest(reply=reply):
+                self.assertEqual(runtime.present(reply)[0], want)
 
     def test_a_question_that_does_not_fit_a_button_or_holds_markup_offers_nothing(self):
         long_question = "Want me to " + "really " * 12 + "try again?"
@@ -152,6 +170,22 @@ class MarkTest(FlagOn):
         runtime.note_wake(SUB, {"gave_up"}, WAKE)
         runtime.drop(_event().source, _event())
         self.assertEqual(len(_buttons(self.draw(_event()))), 1)
+
+    def test_a_wake_queued_behind_a_user_turn_carries_the_mark_to_its_reply(self):
+        # The follow-up's final goes out under the outer turn's event, the user's.
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        runtime.drop(_event().source, _event())
+        blocks = self.draw(_event(internal=False))
+        self.assertTrue(blocks[0]["text"]["text"].startswith("**I couldn't find seeded-z.**"))
+        self.assertEqual(len(_buttons(blocks)), 1)
+        self.assertEqual(self.draw(_event()), _render(REPLY))
+
+    def test_a_user_message_queued_after_a_carried_wake_drops_the_mark(self):
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        runtime.drop(_event().source, _event())
+        runtime.drop(_event().source, _event(internal=False))
+        self.assertEqual(self.draw(_event(internal=False)), _render(REPLY))
+        self.assertEqual(self.draw(_event()), _render(REPLY))
 
     def test_a_sibling_wake_leaves_the_mark(self):
         runtime.note_wake(SUB, {"gave_up"}, WAKE)

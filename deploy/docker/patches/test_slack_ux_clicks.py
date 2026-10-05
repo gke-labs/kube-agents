@@ -546,9 +546,9 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(
             [[e["action_id"] for e in b["elements"]] for b in actions], [["kage.link.0"]]
         )
-        self.assertEqual(update["blocks"][-1]["elements"][0]["text"], "✓ <@U1>: Leave it")
+        self.assertEqual(update["blocks"][-1]["elements"][0]["text"], "✓ Jayanti: Leave it")
         # The note leads the text; the message's own text stays under it for a later thread read.
-        self.assertEqual(update["text"], "✓ <@U1>: Leave it\n\nfallback")
+        self.assertEqual(update["text"], "✓ Jayanti: Leave it\n\nfallback")
         self.assertEqual(
             turn,
             {
@@ -572,7 +572,7 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(attachment["fallback"], update["text"])
         actions = [b for b in attachment["blocks"] if b["type"] == "actions"]
         self.assertEqual([[e["action_id"] for e in b["elements"]] for b in actions], [["kage.link.0"]])
-        self.assertEqual(attachment["blocks"][-1]["elements"][0]["text"], "✓ <@U1>: Leave it")
+        self.assertEqual(attachment["blocks"][-1]["elements"][0]["text"], "✓ Jayanti: Leave it")
 
     def test_a_message_without_a_side_bar_is_sent_no_attachments(self):
         adapter = _Adapter()
@@ -589,14 +589,26 @@ class RuntimeTest(unittest.TestCase):
         turn = adapter.log[-1][1]
         self.assertEqual(turn["text"], "Leave it\n\n" + runtime.CARD_NOTE.format(card="t_e0c1"))
 
-    def test_a_clicked_session_is_titled_from_the_label_not_the_card_note(self):
+    def test_a_clicked_session_is_titled_from_the_question_not_the_label(self):
+        adapter = _Adapter()
+        asks = []
+        status = SimpleNamespace(note_ask=lambda *args: asks.append(args))
+        body, action = _choice(value="Post it now")
+        body["message"]["text"] = "Post the release notes now?\n\nReply with one of: Post it now, Wait"
+        with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_status=status), "gateway.slack_ux_status": status}):
+            self._answer(adapter, body, action)
+        self.assertEqual(asks, [(CHANNEL, THREAD, "Post the release notes now?")])
+
+    def test_a_clicked_session_with_no_question_text_is_titled_from_the_label_not_the_card_note(self):
         adapter = _Adapter()
         status = SimpleNamespace(note_ask=lambda chat, thread, text: adapter.log.append(("note_ask", (chat, thread, text))))
         moments = SimpleNamespace(question_card=lambda channel, ts: "t_e0c1")
         gateway = SimpleNamespace(slack_ux_moments=moments, slack_ux_status=status)
         modules = {"gateway": gateway, "gateway.slack_ux_moments": moments, "gateway.slack_ux_status": status}
         with mock.patch.dict(sys.modules, modules):
-            self._answer(adapter, *_choice())
+            body, action = _choice()
+            body["message"]["text"] = ""
+            self._answer(adapter, body, action)
         self.assertEqual([entry[0] for entry in adapter.log], ["chat_update", "note_ask", "message"])
         self.assertEqual(adapter.log[1][1], (CHANNEL, THREAD, "Leave it"))
 
@@ -611,8 +623,8 @@ class RuntimeTest(unittest.TestCase):
         asks = []
         status = SimpleNamespace(note_ask=lambda *args: asks.append(args))
         with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_status=status), "gateway.slack_ux_status": status}):
-            _run(runtime._title_from_label(adapter, "D1", TEAM, THREAD, "Leave it"))
-            _run(runtime._title_from_label(adapter, CHANNEL, TEAM, THREAD, "Leave it"))
+            _run(runtime._offer_title(adapter, "D1", TEAM, THREAD, "Leave it"))
+            _run(runtime._offer_title(adapter, CHANNEL, TEAM, THREAD, "Leave it"))
         self.assertEqual(titles, [("D1", THREAD, "Leave it", TEAM)])
         # A DM's title is upstream's, set once; offering the label as its ask would rename it.
         self.assertEqual(asks, [(CHANNEL, THREAD, "Leave it")])
@@ -728,7 +740,7 @@ class RuntimeTest(unittest.TestCase):
         self._answer(adapter, *_choice(value="Logs & metrics", shown="Logs &amp; metrics &amp;lt;b&amp;gt;"))
         update, turn = (entry[1] for entry in adapter.log)
         self.assertEqual(turn["text"], "Logs & metrics &lt;b&gt;")
-        self.assertEqual(update["blocks"][-1]["elements"][0]["text"], "✓ <@U1>: Logs &amp; metrics &amp;lt;b&amp;gt;")
+        self.assertEqual(update["blocks"][-1]["elements"][0]["text"], "✓ Jayanti: Logs &amp; metrics &amp;lt;b&amp;gt;")
 
     def test_turn_and_answer_carry_the_shown_text_never_the_longer_value(self):
         label = "Yes, roll back checkout-gateway to the previous revision in namespace prod " * 3
@@ -739,7 +751,7 @@ class RuntimeTest(unittest.TestCase):
         self._answer(adapter, *_choice(0, button["value"], shown=shown))
         update, turn = (entry[1] for entry in adapter.log)
         self.assertEqual(turn["text"], shown)
-        self.assertEqual(update["blocks"][-1]["elements"][0]["text"], f"✓ <@U1>: {shown}")
+        self.assertEqual(update["blocks"][-1]["elements"][0]["text"], f"✓ Jayanti: {shown}")
 
     def _card_click(self, value, label="Fix the first one", row="seeded-b and seeded-c admit privileged pods", elements=None):
         if elements is None:
@@ -762,7 +774,7 @@ class RuntimeTest(unittest.TestCase):
         # An existing session in the thread is not re-hydrated with it, so the turn itself names the row the card shows.
         update, turn = self._card_click("Fix the first one: seeded-b and seeded-c admit privileged pods")
         self.assertEqual(turn["text"], "Fix the first one: seeded-b and seeded-c admit privileged pods")
-        self.assertEqual(update["blocks"][-1]["elements"][0]["text"], "✓ <@U1>: Fix the first one")
+        self.assertEqual(update["blocks"][-1]["elements"][0]["text"], "✓ Jayanti: Fix the first one")
 
     def test_a_value_naming_a_line_the_card_does_not_show_sends_the_label(self):
         for value in (
@@ -887,7 +899,7 @@ class RuntimeTest(unittest.TestCase):
                 turn = adapter.log[-1][1]
                 self.assertEqual(turn["text"], runtime.COMMAND_GUARD + label)
                 self.assertFalse(turn["text"].lstrip().startswith(runtime.COMMAND_PREFIXES))
-                self.assertEqual(adapter.log[0][1]["blocks"][-1]["elements"][0]["text"], f"✓ <@U1>: {label}")
+                self.assertEqual(adapter.log[0][1]["blocks"][-1]["elements"][0]["text"], f"✓ Jayanti: {label}")
 
     def test_click_where_a_typed_message_is_ignored_changes_nothing(self):
         cases = {
@@ -953,7 +965,7 @@ class RuntimeTest(unittest.TestCase):
         with self.assertLogs(runtime.logger, level="WARNING"):
             self._answer(adapter, *_choice())
         self.assertEqual([entry[0] for entry in adapter.log], ["chat_postMessage", "message"])
-        self.assertEqual(adapter.log[0][1], {"channel": CHANNEL, "thread_ts": THREAD, "text": "↳ <@U1>: Leave it"})
+        self.assertEqual(adapter.log[0][1], {"channel": CHANNEL, "thread_ts": THREAD, "text": "✓ Jayanti: Leave it"})
 
     def test_failed_rewrite_and_echo_still_run_the_turn(self):
         adapter = _Adapter(fail=("chat_update", "chat_postMessage"))
@@ -1328,7 +1340,7 @@ class RuntimeTest(unittest.TestCase):
 
     def test_an_incident_click_offers_the_title_as_the_threads_ask(self):
         adapter = _Adapter()
-        with mock.patch.object(runtime, "_title_from_label", wraps=runtime._title_from_label) as title:
+        with mock.patch.object(runtime, "_offer_title", wraps=runtime._offer_title) as title:
             self._options_incident(
                 adapter, "apply Option A: Roll back to 14:02", "apply Option B: Restore the secret", recommended=1,
             )
@@ -1340,7 +1352,7 @@ class RuntimeTest(unittest.TestCase):
             adapter, "apply Option A: Roll back to 14:02", "apply Option B: Restore the secret", recommended=1,
         )
         echo = next(entry[1] for entry in adapter.log if entry[0] == "chat_postMessage")
-        self.assertEqual(echo["text"], "↳ <@U1>: Restore the secret")
+        self.assertEqual(echo["text"], "✓ Jayanti: Restore the secret")
 
     def test_a_colon_form_with_a_hostname_slack_linked_still_counts(self):
         # Slack sends a typed hostname as <http://host|host>, and a typed url as <url>.
@@ -1548,7 +1560,7 @@ class RuntimeTest(unittest.TestCase):
         adapter = _Adapter()
         self._answer(adapter, body, action)
         update = next(entry[1] for entry in adapter.log if entry[0] == "chat_update")
-        self.assertEqual(update["text"], f"✓ <@U1>: seeded-b\n\n{question}")
+        self.assertEqual(update["text"], f"✓ Jayanti: seeded-b\n\n{question}")
 
     def test_a_card_questions_rewrite_keeps_the_line_naming_its_card(self):
         body, action = _choice(1, "seeded-b", prefix="kage_needs")
@@ -1557,7 +1569,7 @@ class RuntimeTest(unittest.TestCase):
         adapter = _Adapter()
         self._answer(adapter, body, action)
         update = next(entry[1] for entry in adapter.log if entry[0] == "chat_update")
-        self.assertEqual(update["text"], f"✓ <@U1>: seeded-b\n\n{question}")
+        self.assertEqual(update["text"], f"✓ Jayanti: seeded-b\n\n{question}")
 
     def test_typed_apply_keeps_the_report_too(self):
         adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": "apply Option B", "ts": "223.000"}])
@@ -1573,7 +1585,7 @@ class RuntimeTest(unittest.TestCase):
         self._answer(adapter, body, action)
         text = adapter.log[0][1]["text"]
         self.assertLessEqual(len(text), runtime.SLACK_TEXT_MAX)
-        self.assertTrue(text.startswith("✓ <@U1>: Leave it\n\nword word"))
+        self.assertTrue(text.startswith("✓ Jayanti: Leave it\n\nword word"))
         self.assertTrue(text.endswith(presenter.ELLIPSIS))
 
     def test_a_message_with_no_text_is_answered_with_the_note_alone(self):
@@ -1581,7 +1593,7 @@ class RuntimeTest(unittest.TestCase):
         body, action = _choice()
         del body["message"]["text"]
         self._answer(adapter, body, action)
-        self.assertEqual(adapter.log[0][1]["text"], "✓ <@U1>: Leave it")
+        self.assertEqual(adapter.log[0][1]["text"], "✓ Jayanti: Leave it")
 
     def test_two_clicks_during_the_thread_read_run_one_turn(self):
         adapter = _Adapter()
