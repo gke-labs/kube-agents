@@ -2576,7 +2576,7 @@ def _note_declaration_problem(body: str, repo_slug: str, audit=None) -> Optional
                 f"its only matching {wanted_item['check']} declaration(s) name cluster {', '.join(clusters)}, so the "
                 "audit joins them to that cluster's finding alone; the fixture's note is fleet-wide (an item without `cluster`)"
             )
-        return f"no declares item is check {wanted_item['check']} for {wanted_item['object']} in {wanted_item['namespace']}"
+        return f"no declares item is check {wanted_item['check']} for {wanted_item['object']} in {wanted_item['namespace'] or '(cluster)'}"
     return None
 
 
