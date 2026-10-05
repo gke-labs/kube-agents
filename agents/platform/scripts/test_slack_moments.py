@@ -110,14 +110,20 @@ class OpenedPrTest(unittest.TestCase):
 
     def test_a_labels_evidence_keeps_its_markup_and_drops_the_url(self):
         blocks, _ = m.pr_opened(*m.opened_pr(f"**Opened PR:** <{PR}>"))
-        self.assertEqual(_contexts(blocks)[0], "**Opened PR #412**")
+        self.assertEqual(_contexts(blocks)[0], "*Opened PR #412*")
 
     def test_markup_wrapped_round_the_url_goes_with_it(self):
         for line in (f"Opened PR **{PR}**", f"Opened PR **<{PR}>**", f"Opened PR `{PR}`", f"Opened `{PR}`"):
             blocks, _ = m.pr_opened(*m.opened_pr(line))
             self.assertEqual(_contexts(blocks)[0], "Opened PR #412", line)
         blocks, _ = m.pr_opened(*m.opened_pr(f"**Done, opened PR {PR}**"))
-        self.assertEqual(_contexts(blocks)[0], "**Done, opened PR #412**")
+        self.assertEqual(_contexts(blocks)[0], "*Done, opened PR #412*")
+
+    def test_every_opened_pr_in_a_text_is_found(self):
+        other = "https://github.com/acme/other/pull/7"
+        found = list(m.opened_prs(f"- Opened {PR}\n- Opened {other}, and opened {PR}/files"))
+        self.assertEqual([f[0] for f in found], [PR, other, PR])
+        self.assertEqual(list(m.opened_prs(f"{PR} already covers it")), [])
 
     def test_another_link_on_the_pr_line_stays_text(self):
         blocks, _ = m.pr_opened(*m.opened_pr(f"Opened PR {PR}, see [docs](https://other.example/x)"))
@@ -364,6 +370,20 @@ class NeedsYouTest(unittest.TestCase):
             "See <https://x.example/a?b=1&amp;c=2|runbook> or `[no](https://y.example)`.",
         )
 
+    def test_bold_in_the_detail_is_slack_bold_outside_code(self):
+        blocks, _ = m.needs_you("Which pod should I restart?\n**web-1** is OOMKilled, not `**x**`.\n- web-1\n- web-2")
+        self.assertEqual(blocks[1]["elements"][0]["text"], "*web-1* is OOMKilled, not `**x**`.\n- web-1\n- web-2")
+
+    def test_a_dunder_or_a_star_inside_bold_keeps_its_characters(self):
+        for detail in (
+            "See https://github.com/a/b/blob/main/pkg/__init__.py now",
+            "__DB_HOST__ unset",
+            "**/tmp/*.log** filled",
+            "re**start**ed",
+        ):
+            blocks, _ = m.needs_you(f"Which?\n{detail}")
+            self.assertEqual(blocks[1]["elements"][0]["text"], detail)
+
     def test_a_link_that_is_not_safe_stays_escaped_text(self):
         blocks, _ = m.needs_you("Which?\nSee [<@U1>](javascript:alert) now.")
         self.assertEqual(blocks[1]["elements"][0]["text"], "See [&lt;@U1&gt;](javascript:alert) now.")
@@ -424,10 +444,21 @@ class NeedsYouTest(unittest.TestCase):
         self.assertEqual(_buttons(blocks), [])
         self.assertIn(long, _contexts(blocks)[0])
 
-    def test_a_headline_short_once_plain_is_not_repeated_below(self):
-        link = "[runbook](https://example.com/" + "a" * 150 + ")"
-        blocks, text = m.needs_you(f"Check the {link} first. Which?\n- seeded-a\n- seeded-b")
+    def test_a_headline_with_a_link_keeps_the_url_on_the_line_below(self):
+        url = "https://example.com/" + "a" * 150
+        blocks, _ = m.needs_you(f"Check the [runbook]({url}) first. Which?\n- seeded-a\n- seeded-b")
         self.assertIn("Check the runbook first. Which?", blocks[0]["text"]["text"])
+        self.assertEqual(_contexts(blocks)[0], f"Check the <{url}|runbook> first. Which?")
+        self.assertEqual([b["value"] for b in _buttons(blocks)], ["seeded-a", "seeded-b"])
+
+    def test_a_short_headline_with_a_link_keeps_the_url_on_the_line_below(self):
+        url = "https://github.com/acme/x/pull/412"
+        blocks, _ = m.needs_you(f"Should I merge [PR #412]({url})?\n- Yes\n- No")
+        self.assertEqual(_contexts(blocks)[0], f"Should I merge <{url}|PR #412>?")
+        self.assertEqual([b["value"] for b in _buttons(blocks)], ["Yes", "No"])
+
+    def test_a_short_headline_without_a_link_is_not_repeated_below(self):
+        blocks, _ = m.needs_you("Which cluster?\n- seeded-a\n- seeded-b")
         self.assertEqual([b for b in blocks if b["type"] == "context" and b.get("block_id") != p.WAITING_BLOCK_ID], [])
 
     def test_a_long_first_line_is_repeated_whole_below_the_clipped_headline(self):

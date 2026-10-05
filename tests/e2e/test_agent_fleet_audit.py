@@ -30,8 +30,15 @@ _REFRESH_SCRIPT_CANDIDATES = (
     f"/opt/defaults/scripts/{_REFRESH_SCRIPT_NAME}",
 )
 _REFRESH_CONFIRMATION = "Refreshed GitHub credentials via"
+# The version-control CLI the agent reaches the forge through. There is no `gh`
+# in the sandbox; the audit helper takes the same broker route, through the
+# client library this CLI wraps.
+_VCS_CANDIDATES = (
+    "/opt/data/skills/version-control/scripts/vcs.py",
+    "/opt/defaults/skills/version-control/scripts/vcs.py",
+)
 # The exec budget covers the refresh (its client waits up to 60s on the proxy)
-# plus the gh call, with room for a slow broker.
+# plus the two forge calls, with room for a slow broker.
 _PROBE_TIMEOUT_SECONDS = 180
 
 # All Registered Audit Streams and their human titles
@@ -58,14 +65,15 @@ def test_github_token_minting_and_connectivity(
     Executes a genuinely 100% read-only probe inside the agent's shell sandbox pod, or the
     legacy gateway pod on an install that has no sandbox:
     1. Triggers token refresh through the credential proxy and GitHub Token Minter (Cloud KMS).
-    2. Executes `gh api repos/<target_repo>` from the shared workspace root.
-    3. Verifies repository access and permissions over the network.
+    2. Asks the broker who this install is (`vcs.py identity`).
+    3. Reads the target repository's issues through the broker (`vcs.py issue list`), which
+       fails unless the broker can actually read that repository.
     Does NOT invoke `audit_report.py start`, preventing workspace reset, lease scrubbing, or label writes.
 
     Step 1 is the only thing that mints on a fresh install: nothing at startup writes the
     proxy's gh credentials, so a probe that skips it passes or fails on whether some earlier
     task happened to mint. The probe therefore fails when the refresh client cannot be found
-    or the refresh fails, instead of falling through to `gh`.
+    or the refresh fails, instead of carrying on to steps 2 and 3 on whatever is cached.
     """
     if not gke_cluster_name or not github_repo:
         pytest.fail("GKE cluster name and GITHUB_REPO are required for live GitHub connectivity probe.")
@@ -155,22 +163,37 @@ if res_ref.returncode != 0:
     sys.exit(res_ref.returncode)
 print(f"{_REFRESH_CONFIRMATION} {{refresh_script}}")
 
-# 2. Execute read-only GitHub API verification via Envoy proxy from workspace root
-env = os.environ.copy()
-env['PWD'] = '/opt/data'
-env['PATH'] = '/opt/credential-proxy/bin:' + env.get('PATH', '')
-cmd_gh = ['gh', 'api', f'repos/{github_repo}', '--jq', '.full_name']
-res_gh = subprocess.run(cmd_gh, cwd='/opt/data', env=env, capture_output=True, text=True)
-if res_gh.returncode != 0:
-    print(f"GitHub API query failed: {{res_gh.stderr}}", file=sys.stderr)
-    sys.exit(res_gh.returncode)
-
-full_name = res_gh.stdout.strip()
-if full_name.lower() != '{github_repo}'.lower():
-    print(f"Expected repository '{github_repo}', got '{{full_name}}'", file=sys.stderr)
+# 2. A read-only forge call through the broker: who this install is on the
+# repository, which the broker answers with the token step 1 minted.
+import json
+vcs = [p for p in {_VCS_CANDIDATES!r} if os.path.isfile(p)]
+if not vcs:
+    print(f"vcs.py not found at any of {_VCS_CANDIDATES!r}", file=sys.stderr)
+    sys.exit(1)
+res_vcs = subprocess.run(
+    ['python3', vcs[0], 'identity', '--repo', '{github_repo}'],
+    cwd='/opt/data', capture_output=True, text=True,
+)
+if res_vcs.returncode != 0:
+    print(f"Forge query failed: {{res_vcs.stdout}}{{res_vcs.stderr}}", file=sys.stderr)
+    sys.exit(res_vcs.returncode)
+login = (json.loads(res_vcs.stdout).get("identity") or {{}}).get("login")
+if not login:
+    print(f"No identity for '{github_repo}': {{res_vcs.stdout}}", file=sys.stderr)
     sys.exit(1)
 
-print(f"Successfully authenticated and queried repository: {{full_name}}")
+# 3. A read of the repository itself. `identity` names no repository, so it
+# passes on any token the broker holds; this one fails unless that token can
+# read this repository.
+res_read = subprocess.run(
+    ['python3', vcs[0], 'issue', 'list', '--repo', '{github_repo}', '-n', '1'],
+    cwd='/opt/data', capture_output=True, text=True,
+)
+if res_read.returncode != 0 or "issues" not in json.loads(res_read.stdout or "{{}}"):
+    print(f"Repository read failed: {{res_read.stdout}}{{res_read.stderr}}", file=sys.stderr)
+    sys.exit(res_read.returncode or 1)
+
+print(f"Successfully authenticated and queried repository: {github_repo} as {{login}}")
 """
 
     base_exec = [
@@ -195,7 +218,7 @@ print(f"Successfully authenticated and queried repository: {{full_name}}")
             f"STDOUT:\n{proc_start.stdout}\nSTDERR:\n{proc_start.stderr}"
         )
         assert _REFRESH_CONFIRMATION in proc_start.stdout, (
-            f"The probe reached `gh` without running the token refresh; stdout was:\n{proc_start.stdout}"
+            f"The probe reached the forge without running the token refresh; stdout was:\n{proc_start.stdout}"
         )
         assert f"Successfully authenticated and queried repository: {github_repo}" in proc_start.stdout, (
             f"Expected successful repository query confirmation in stdout, got:\n{proc_start.stdout}"
@@ -480,9 +503,9 @@ def test_audit_report_github_api_lifecycle_mocked(
 ) -> None:
     """Verifies that each audit watchdog executes the exact expected GitHub API lifecycle.
 
-    Uses an in-memory execution seam to simulate the GitHub CLI/API and assert:
+    Uses an in-memory seam in place of the broker's forge verbs and asserts:
     1. It ensures the standard audit and severity labels exist on the repo.
-    2. It searches GitHub for existing ledger issues (gh issue list --label audit:<audit_id>).
+    2. It searches for existing ledger issues (issue-list labelled audit:<audit_id>).
     3. It fetches previous issue body and comments to check for active findings and /remediate commands.
     4. It updates the ledger issue title and body with the rendered capacity audit tables.
     5. It strictly does NOT create unexpected pull requests without explicit authorization.
@@ -520,35 +543,36 @@ def test_audit_report_github_api_lifecycle_mocked(
     # left alone it is the agent's volume on whatever host runs this.
     original_reports_dir = os.environ.get("FLEET_AUDIT_REPORTS_DIR")
 
+    import vcs_client
+
+    original_forge = vcs_client.forge
     calls: list[list[str]] = []
+    forge_calls: list[tuple[str, dict]] = []
+    ledger_body = "<!-- audit-findings: [] -->"
 
     def mock_run_cmd(cmd, **kwargs):
         cmd_list = list(cmd)
         calls.append(cmd_list)
-        joined = " ".join(cmd_list)
         if cmd_list[:2] == ["git", "clone"]:
             dest = pathlib.Path(cmd_list[-1])
             (dest / ".git").mkdir(parents=True, exist_ok=True)
-            return type("CompletedProcess", (), {"returncode": 0, "stdout": "", "stderr": ""})()
-        if "gh issue list" in joined:
-            return type("CompletedProcess", (), {
-                "returncode": 0,
-                "stdout": json.dumps([{"number": 42, "url": f"https://github.com/test-org-kube-agent/agents-repo/issues/42"}]),
-                "stderr": "",
-            })()
-        if "gh issue view" in joined and "--json body" in joined:
-            return type("CompletedProcess", (), {
-                "returncode": 0,
-                "stdout": json.dumps({"body": "<!-- audit-findings: [] -->"}),
-                "stderr": "",
-            })()
-        if "gh issue view" in joined and "--json comments" in joined:
-            return type("CompletedProcess", (), {
-                "returncode": 0,
-                "stdout": json.dumps({"comments": []}),
-                "stderr": "",
-            })()
         return type("CompletedProcess", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    def mock_forge(verb, payload, repository=None):
+        forge_calls.append((verb, dict(payload)))
+        if verb == "issue-list":
+            url = "https://github.com/test-org-kube-agent/agents-repo/issues/42"
+            return {"issues": [{"number": 42, "url": url, "body": ledger_body}], "count": 1, "truncated": False}
+        if verb == "issue-view":
+            answer = {"issue": {"number": 42, "body": ledger_body}}
+            if payload.get("comments"):
+                answer.update(comments=[], commentCount=0, commentsTruncated=False)
+            return answer
+        if verb == "proposal-list":
+            return {"proposals": [], "count": 0, "truncated": False}
+        if verb == "identity":
+            return {"identity": {"login": "audit-bot", "subject": "audit-bot", "canWrite": None}}
+        return {}
 
     try:
         audit_report.GITOPS_WORKSPACE = str(tmp_path)
@@ -556,6 +580,7 @@ def test_audit_report_github_api_lifecycle_mocked(
         os.environ["FLEET_AUDIT_REPORTS_DIR"] = str(tmp_path / "reports")
         audit_report.set_workspace(workspace)
         audit_report.run_cmd = mock_run_cmd
+        vcs_client.forge = mock_forge
         audit_report.refresh_credentials = lambda *args, **kwargs: None
         audit_report.resolve_repo = lambda *args, **kwargs: "test-org-kube-agent/agents-repo"
         audit_report.repo_root = lambda: workspace
@@ -607,30 +632,35 @@ def test_audit_report_github_api_lifecycle_mocked(
         )
         assert exit_code == 0, f"Expected finish exit code 0 for '{audit_id}', got {exit_code}"
 
-        all_commands = [" ".join(c) for c in calls]
+        def called(verb, **fields):
+            return [p for v, p in forge_calls if v == verb and all(
+                (want in p.get(k, ())) if isinstance(p.get(k), list) else str(want) in str(p.get(k, ""))
+                for k, want in fields.items()
+            )]
 
         # 1. Assert label verification calls
-        assert any("gh label create" in c and f"audit:{audit_id}" in c for c in all_commands), (
+        assert called("label-ensure", name=f"audit:{audit_id}"), (
             f"Expected GitHub call to ensure 'audit:{audit_id}' label exists."
         )
 
         # 2. Assert ledger lookup
-        assert any("gh issue list" in c and f"audit:{audit_id}" in c for c in all_commands), (
+        assert called("issue-list", labels=f"audit:{audit_id}"), (
             f"Expected GitHub call to list existing ledger issue for '{audit_id}'."
         )
 
         # 3. Assert ledger issue update
-        assert any("gh issue edit 42" in c and f"[audit] {human_name}" in c for c in all_commands), (
+        assert called("issue-update", number=42, title=f"[audit] {human_name}"), (
             f"Expected GitHub call to edit issue #42 with updated '{human_name}' title."
         )
 
         # 4. Assert NO unauthorized PR creation
-        assert not any("gh pr create" in c for c in all_commands), (
+        assert not called("proposal-create"), (
             "SECURITY/SAFETY VIOLATION: Audit unexpectedly attempted to create a pull request!"
         )
 
     finally:
         audit_report.run_cmd = original_run_cmd
+        vcs_client.forge = original_forge
         audit_report.refresh_credentials = original_refresh
         audit_report.resolve_repo = original_resolve
         audit_report.repo_root = original_repo_root

@@ -166,19 +166,18 @@ async def _post(adapter: Any, sub: dict, blocks: list[dict], text: str, color: s
 
 
 async def pr_opened(adapter: Any, sub: dict, text: str) -> bool:
-    """Post the PR ``text`` says was opened, once per thread; True when posted."""
-    found = _moments.opened_pr(text)
-    if found is None:
-        return False
-    url, repo, number, line = found
-    key = (str(sub.get("chat_id") or ""), str(sub.get("thread_id") or ""), url)
-    if key in _announced:
-        return False
-    blocks, fallback = _moments.pr_opened(url, repo, number, line)
-    if await _post(adapter, sub, blocks, fallback, _moments.PR_SIDE_BAR) is None:
-        return False
-    _remember(_announced, key, None)
-    return True
+    """Post each PR ``text`` says was opened, once per thread; True when any posted."""
+    posted = False
+    for url, repo, number, line in _moments.opened_prs(text):
+        key = (str(sub.get("chat_id") or ""), str(sub.get("thread_id") or ""), url)
+        if key in _announced:
+            continue
+        blocks, fallback = _moments.pr_opened(url, repo, number, line)
+        if await _post(adapter, sub, blocks, fallback, _moments.PR_SIDE_BAR) is None:
+            continue
+        _remember(_announced, key, None)
+        posted = True
+    return posted
 
 
 async def needs_you(adapter: Any, sub: dict, payload: Any, event_id: int = 0) -> bool:
@@ -200,14 +199,15 @@ async def needs_you(adapter: Any, sub: dict, payload: Any, event_id: int = 0) ->
     # The caller settled any earlier question first (kanban_progress_lines.deliver).
     key = _sub_key(sub)
     earlier = _questions.get(key)
-    if earlier is not None:
-        # Still open: its settle failed or never ran. The new question takes the slot, so keep this one for a retry.
-        _remember(_unsettled, (key, earlier[2]), earlier)
     blocks, text = moment
     text = _with_card(text, key[0], any(b.get("type") == "actions" for b in blocks))
     ts = await _post(adapter, sub, blocks, text, _moments.NEEDS_YOU_SIDE_BAR)
     if ts is None:
+        # The earlier question keeps its slot, so it is settled once, from there.
         return False
+    if earlier is not None:
+        # Still open: its settle failed or never ran. The new question takes the slot, so keep this one for a retry.
+        _remember(_unsettled, (key, earlier[2]), earlier)
     entry = (int(event_id or 0), str(sub.get("chat_id") or ""), ts, blocks, text)
     _remember(_questions, key, entry)
     return True
@@ -256,6 +256,13 @@ def _clicked(channel: str, ts: str) -> bool:
         return False
 
 
+def _without_choices(text: str) -> str:
+    """The question's ``text`` without its last "Reply with one of:" line, which
+    asks for an answer that has arrived, as ``slack_ux_clicks._answered_text`` drops it."""
+    body, _nl, last = text.rpartition("\n")
+    return body.rstrip("\n") if body and last.startswith(_presenter.CHOICES_LEAD) else text
+
+
 async def _settled(adapter: Any, sub: dict, entry: tuple) -> bool:
     """Rewrite one question without its buttons; True once it needs nothing more."""
     _event_id, channel, ts, blocks, text = entry
@@ -263,9 +270,10 @@ async def _settled(adapter: Any, sub: dict, entry: tuple) -> bool:
         return True
     try:
         client = adapter._get_client(channel, team_id=sub.get("team_id") or None)
+        settled = _without_choices(text)
         await client.chat_update(
-            channel=channel, ts=ts, text=text,
-            **_presenter.with_side_bar(_moments.needs_you_settled(blocks), _moments.NEEDS_YOU_SIDE_BAR, text),
+            channel=channel, ts=ts, text=settled,
+            **_presenter.with_side_bar(_moments.needs_you_settled(blocks), _moments.NEEDS_YOU_SIDE_BAR, settled),
         )
     except Exception as exc:  # noqa: BLE001 — cosmetic; the next event retries
         logger.warning("slack_ux_moments: settling the question %s failed: %s", ts, exc)

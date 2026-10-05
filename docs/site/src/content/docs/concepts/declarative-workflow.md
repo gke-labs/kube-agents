@@ -122,13 +122,7 @@ Minty is a small in-cluster service that brokers GitHub App installation tokens 
 
 ### Recovery
 
-If a git operation fails with an auth error (e.g. `fatal: Authentication failed`, `could not read Username`), `SOUL.md §3` requires the agent to run the packaged token refresher:
-
-```bash
-./scripts/github_token_refresh.py <owner>/<repo>
-```
-
-which triggers a fresh mint from Minty and caches it, then retries the command. The recovery ladder (`§4`) caps retries at **5 iterations or ~10 minutes per distinct blocker** before escalating.
+The agent does not refresh GitHub credentials itself. The `git` in its sandbox holds no credential and has no transport to a forge, so a remote `git` command fails by design rather than with an auth error, and `SOUL.md §3` tells the agent to reach the repository through the `version-control` skill's verbs instead. The credential broker refreshes its token from Minty before every credentialed call those verbs make. For other blockers, the recovery ladder (`§4`) caps retries at **5 iterations or ~10 minutes per distinct blocker** before escalating.
 
 ## Complementary integrations
 

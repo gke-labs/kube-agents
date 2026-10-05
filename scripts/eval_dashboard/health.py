@@ -354,7 +354,9 @@ FIXTURE_STATE_MAX_AGE = timedelta(hours=3)
 # consecutive scans, or on three projects in one (#1927's shape was all 30).
 # A run that leases a drifted project fails on the missing grant with a 403
 # in the agent's transcript, not on the change; the run-based rules see that
-# red, this one names the cause and carries the repair.
+# red, this one names the cause and carries the repair. A finding the verifier
+# lists in LEASE_SILENT_FINDINGS (pool_state.passes_leases) reds no run, and
+# the advice for it says the opposite: a red on such a project is the change's.
 POOL_STATE_LABEL = "pool-state"
 # The verifier's synthesised finding for a check that failed with nothing more
 # specific to say: `<check>/failed` (REPORT_FINDING_FAILED in
@@ -518,6 +520,19 @@ ADVICE_FIXTURE_DRIFT = (
 ADVICE_POOL_DRIFT = (
     "A 403 or a missing-resource red from a run that leased {projects} is the pool project's shape, not your change"
     " ({findings}); retest once the pool owner has run the repair, which pool-state.json names per project for every named finding."
+)
+# The same condition when every firing finding is one a leased run passes
+# with (pool_state.passes_leases): the pool is drifted and the repair is the
+# pool owner's as before, but no red on a pull request is the pool's.
+ADVICE_POOL_DRIFT_SILENT = (
+    "No run reds from {findings} on {projects}: an install there passes its lease with that gap,"
+    " so a 403 or a missing-resource red on one of them is your change's to read, not the pool's."
+    " The pool owner's repair is in pool-state.json per project; nothing on your side waits for it."
+)
+# Appended when loud and silent findings fire together: ADVICE_POOL_DRIFT then
+# names only the loud ones and the projects they are on.
+ADVICE_POOL_DRIFT_SILENT_TAIL = (
+    " {findings} reds no run: an install passes its lease with that gap, so a red on a project with only that finding is yours to read."
 )
 ADVICE_CEILING = (
     "Retest once workers are finishing again; those runs read NOT EVALUATED, not red."
@@ -1108,7 +1123,10 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
     {project: {unit: [what the scan observed]}} for those and `repairs`
     {project: {unit: repair}}; `read` is {project: [what the scan could read
     there]} and `reads` the subset of it the firing units need, which is
-    what rule 6's exit checks against a later scan.
+    what rule 6's exit checks against a later scan. `passes_leases` is the
+    drifted units, firing or not, a leased run passes with (the pool scan's
+    LEASE_SILENT_FINDINGS; a fleet scan has none), `reds_runs` the rest, and
+    `reds_runs_projects` the drifted projects one of those is on.
     """
     out = {
         "fires": False,
@@ -1124,6 +1142,9 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
         "reads": {},
         "current": {},
         "read": {},
+        "passes_leases": [],
+        "reds_runs": [],
+        "reds_runs_projects": [],
         "checked": 0,
         "total": 0,
         "scanned": [],
@@ -1163,6 +1184,15 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
     current = module.drift_map(state_doc)
     previous = module.previous_drift_map(state_doc)
     out["current"] = current
+    passes_leases = getattr(module, "passes_leases", None)
+    out["passes_leases"] = sorted(
+        {unit for units in current.values() for unit in units if passes_leases is not None and passes_leases(unit)}
+    )
+    # The split is made here, once, and carried in the documents: the
+    # advice, the Chat sentence, the digest line and the issue body read it
+    # rather than each deciding which projects the 403 sentence covers.
+    out["reds_runs"] = sorted({unit for units in current.values() for unit in units if unit not in out["passes_leases"]})
+    out["reds_runs_projects"] = sorted(project for project, units in current.items() if any(unit in out["reds_runs"] for unit in units))
     # The checks failing per project, for the exit of a `<check>/failed`
     # unit; a fleet scan's units are its roles, so its failing set is current.
     out["failing"] = module.failing_map(state_doc) if hasattr(module, "failing_map") else current
@@ -1743,12 +1773,41 @@ def advice_for(
             projects=_project_list(list(incident.get("projects") or [])) or "the drifted projects",
         )
     if condition == POOL_DRIFT:
-        incident = incident or {}
-        return ADVICE_POOL_DRIFT.format(
-            findings=", ".join(incident.get("roles") or []) or "the findings",
+        return _pool_drift_advice(incident or {})
+    return ADVICE_SETUP
+
+
+def pool_drift_split(incident: dict) -> tuple[list[str], list[str], list[str]]:
+    """(findings a leased run reds on, findings it passes with, projects one
+    of the former is on), as assess() carried them in the incident. An
+    incident written before the split was carried (a held one from an
+    earlier tick) has no classification, so every finding is one a run reds
+    on and every project is named: the wording from before the split."""
+    findings = list(incident.get("roles") or [])
+    projects = list(incident.get("projects") or [])
+    loud = list(incident["reds_runs"]) if "reds_runs" in incident else findings
+    silent = list(incident.get("passes_leases") or [])
+    loud_projects = list(incident["reds_runs_projects"]) if "reds_runs_projects" in incident else projects
+    return loud, silent, loud_projects
+
+
+def _pool_drift_advice(incident: dict) -> str:
+    """ADVICE_POOL_DRIFT names the findings a leased run reds on and the
+    projects they are on; a finding a leased run passes with gets the
+    opposite advice, on its own or as a tail after the others."""
+    loud, silent, loud_projects = pool_drift_split(incident)
+    if silent and not loud:
+        return ADVICE_POOL_DRIFT_SILENT.format(
+            findings=", ".join(silent),
             projects=_project_list(list(incident.get("projects") or [])) or "the drifted projects",
         )
-    return ADVICE_SETUP
+    text = ADVICE_POOL_DRIFT.format(
+        findings=", ".join(loud) or "the findings",
+        projects=_project_list(loud_projects) or "the drifted projects",
+    )
+    if silent:
+        text += ADVICE_POOL_DRIFT_SILENT_TAIL.format(findings=", ".join(silent))
+    return text
 
 
 # --------------------------------------------------------------------------- #
@@ -1794,7 +1853,8 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
     elif r3e["fires"]:
         # Below fixture drift: a drifted fixture reds the cases that read it,
         # a drifted grant reds whatever the agent asks of it; both are the
-        # pool's and neither is a run-based signal.
+        # pool's and neither is a run-based signal. A finding a leased run
+        # passes with (`passes_leases`) reds nothing, and the advice says so.
         state, condition = DEGRADED, POOL_DRIFT
         cause = CAUSE_POOL_DRIFT.format(findings=", ".join(r3e["roles"]), projects=len(r3e["projects"]))
     else:
@@ -1872,6 +1932,15 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
             "drift": r3e["drift"],
             "repairs": r3e["repairs"],
             "reads": r3e["reads"],
+            # The firing findings a leased run passes with, the ones it reds
+            # on, and the firing projects one of the latter is on: the
+            # advice, the Chat sentence and the issue body word the
+            # consequence from these three and classify nothing themselves.
+            "passes_leases": [unit for unit in r3e["roles"] if unit in r3e["passes_leases"]],
+            "reds_runs": [unit for unit in r3e["roles"] if unit not in r3e["passes_leases"]],
+            "reds_runs_projects": [
+                project for project in r3e["projects"] if any(unit not in r3e["passes_leases"] for unit in r3e["drift"].get(project) or {})
+            ],
         }
     else:
         incident = None
@@ -2331,6 +2400,9 @@ def scan_block(scan_result: dict) -> dict | None:
         "checked": scan_result["checked"],
         "unread_units": scan_result.get("unread_units", 0),
         "drifted": scan_result["current"],
+        "passes_leases": scan_result.get("passes_leases", []),
+        "reds_runs": scan_result.get("reds_runs", []),
+        "reds_runs_projects": scan_result.get("reds_runs_projects", []),
         "unknown": scan_result["unknown"],
         "stale": scan_result["stale"],
         "reason": scan_result["reason"],

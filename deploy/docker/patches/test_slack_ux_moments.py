@@ -168,6 +168,14 @@ class PrOpenedTest(unittest.TestCase):
         self.assertFalse(_run(runtime.pr_opened(_Adapter(), {**SUB, "chat_id": ""}, f"Opened {PR}")))
         self.assertFalse(_run(runtime.pr_opened(object(), SUB, f"Opened {PR}")))
 
+    def test_each_pr_a_text_opened_posts_once(self):
+        adapter = _Adapter()
+        other = "https://github.com/acme/other/pull/7"
+        self.assertTrue(_run(runtime.pr_opened(adapter, SUB, f"Opened {PR}")))
+        self.assertTrue(_run(runtime.pr_opened(adapter, SUB, f"- Opened {PR}\n- Opened {other}")))
+        self.assertFalse(_run(runtime.pr_opened(adapter, SUB, f"- Opened {PR}\n- Opened {other}")))
+        self.assertEqual([("PR #412" in p["text"], "PR #7" in p["text"]) for p in adapter.posts], [(True, False), (False, True)])
+
     def test_the_announced_map_is_bounded(self):
         adapter = _Adapter()
         with mock.patch.object(runtime, "ANNOUNCED_MAX", 2):
@@ -241,6 +249,17 @@ class NeedsYouTest(unittest.TestCase):
         self.assertEqual(len(adapter.posts), 2)
         self.assertEqual(len(adapter.updates), 1)
         self.assertEqual(runtime._questions[runtime._sub_key(SUB)][0], 9)
+
+    def test_a_failed_re_ask_leaves_the_earlier_question_to_settle_once(self):
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        adapter.fail = True
+        self.assertFalse(_run(runtime.needs_you(adapter, SUB, QUESTION, 9)))
+        self.assertEqual(runtime._unsettled, {})
+        self.assertEqual(runtime._questions[runtime._sub_key(SUB)][0], 3)
+        adapter.fail = False
+        _run(runtime.settle_question(adapter, SUB))
+        self.assertEqual(len(adapter.updates), 1)
 
     def test_a_replayed_block_neither_settles_nor_reposts(self):
         adapter = _Adapter()
@@ -348,6 +367,16 @@ class SettleQuestionTest(unittest.TestCase):
         _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
         _run(runtime.settle_question(adapter, SUB))
         self.assertEqual(adapter.updates[0]["attachments"], [])
+
+    def test_the_settled_text_drops_the_reply_with_line(self):
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        self.assertIn(runtime._presenter.CHOICES_LEAD, adapter.posts[0]["text"])
+        _run(runtime.settle_question(adapter, SUB))
+        text = adapter.updates[0]["text"]
+        self.assertNotIn(runtime._presenter.CHOICES_LEAD, text)
+        self.assertIn("Which cluster?", text)
+        self.assertIn("t_e0c1", text.splitlines()[-1])
 
     def test_once(self):
         adapter = _Adapter()

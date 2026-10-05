@@ -10,8 +10,8 @@ on every run and closed as completed when the fleet comes back clean. Fixes
 travel separately, as narrow remediation pull requests carrying only the files
 that fix a specific group of findings, so a report is never a pull request with
 no diff. The LLM's role is strictly constrained to **inspecting the fleet
-read-only and emitting a findings.json**; every git/gh operation, every rendered
-body, the commit subjects, the timestamps, and the run-over-run delta are
+read-only and emitting a findings.json**; every git or forge operation, every
+rendered body, the commit subjects, the timestamps, and the run-over-run delta are
 produced here, deterministically.
 
 Two-command lifecycle, plus three on-demand commands:
@@ -36,9 +36,12 @@ an alias, a hook path. `list` and `fetch` are the read half — the names of the
 files in the broker's checkout, and the bytes of the ones a fix has to start
 from.
 
-**Directory mode**, which is what ran before and still runs when the broker has
-not been armed: a leased clone on the shared volume, and `checkout`, `add`,
-`commit`, `push` run in it through the shim.
+**Directory mode** is what ran before: a leased clone on the shared volume, and
+`checkout`, `add`, `commit`, `push` run in it. The sandbox's `git` has no network
+transport and no credential, so it cannot run there any more. It is taken only
+when no broker is configured at all (`CREDENTIAL_PROXY_URL` unset), and with a
+broker configured a probe that does not answer yes refuses `start` rather than
+fall back to it.
 
 `start` reports which one it took as the `mode` field of its JSON line, and the
 mode is resolved once per process so a single run cannot take both forks.
@@ -142,7 +145,7 @@ class AuditSpec(NamedTuple):
 
 
 # The audit streams allowed to own a ledger. An id not listed here is rejected
-# before any git/gh call: a typo must not silently open a ledger stream of its
+# before any git or forge call: a typo must not silently open a ledger stream of its
 # own.
 # The human names mirror the `name` of the matching watchdog in
 # agents/platform/cron/jobs.json — this profile's own roster, which holds every
@@ -432,12 +435,11 @@ RECOMMENDATION_FIELDS: tuple[tuple[str, str], ...] = (
 PROTECTED_BRANCHES = {"main", "master", "production"}
 PROTECTED_BRANCH_PREFIXES = ("run/",)
 
-# Both directories must live on the PVC. `gh` and `git` are not binaries in the
-# agent container: /opt/credential-proxy/bin/{gh,git} POST argv and cwd to a
-# sidecar that runs the real tool in *its* filesystem. Only /opt/data is shared
-# between the two containers — /tmp is a per-container emptyDir — so a body file
-# written to the default temp dir names a path the sidecar cannot open, and a
-# checkout outside the workspace root is rejected by the sidecar outright.
+# Both directories live on the PVC, because that is where the leased clone of
+# directory mode has always been and where a run's `start` and `finish` — two
+# processes — find the same tree. Nothing here reaches the credential container
+# through a path any more: forge calls carry their documents in the request,
+# and content mode hands the broker bytes.
 #
 # Overridable so the suite can point them at a temp directory. Off-cluster
 # /opt/data does not exist and is not creatable, and a harness that can only be
@@ -480,7 +482,7 @@ REPORT_REPO_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+\Z")
 # Applied to a pull request the harness itself closed as stale. It is the
 # discriminator that keeps a *human's* close final while letting the audit
 # re-propose a fix it withdrew on its own: strip the label and the close becomes
-# a veto. Requested in the `gh pr list` projection, so it costs no extra call.
+# a veto. Every proposal listing carries its labels, so it costs no extra call.
 STALE_CLOSED_LABEL = "audit:stale-closed"
 
 # Wildcard stagers that must never reach `git add` — an audit stages named
@@ -948,10 +950,18 @@ CLONE_MODE_DIRECTORY = "directory"
 # branch per repository and never reads the agent container's environment.
 BASE_BRANCH_OVERRIDE_VARS = ("CREDENTIAL_PROXY_BASE_BRANCH", "GITOPS_BASE_BRANCH")
 
-# `gh pr list` takes a limit, not a cursor. A full page means the oldest
-# remediation branches fell off the end, and a branch that reads as "no pull
-# request exists" is one the harness will force-push over. Detect it and stop.
+# The most remediation pull requests one stream may have. Past it the listing
+# stops reading, and a branch that reads as "no pull request exists" is one the
+# harness will force-push over. Detect it and stop.
 MAX_PR_PAGE = 1000
+# One page of a forge listing: the most the broker returns per request.
+MAX_PAGE = 100
+# Enough for any conversation this harness keeps up with, and the most one read
+# of it returns (the broker pages to it). A ledger or pull request whose
+# conversation fills it is read as unreadable rather than whole: the markers
+# that stop a reply going out twice may be past the ceiling, and a reply posted
+# again every morning is worse than one run that answers nothing.
+MAX_COMMENTS_READ = 1000
 
 # Auto-promotion ceiling per `finish` run (design §3.1). An explicit
 # `/remediate` bypasses it: a human asked for that one by name.
@@ -1081,6 +1091,17 @@ class StartRefused(ValidationError):
     A subclass so `main` can label it apart from a rejected document. Both
     exit 2, but every SOP reads `FINDINGS REJECTED` as "fix the file and
     re-run", and a refused `start` has no file to fix.
+    """
+
+
+class BrokerUnavailable(ValidationError):
+    """The credential proxy did not answer, so this command could not publish.
+
+    Apart from `StartRefused` because it is not about the stream: any command
+    that reaches the broker can raise it, and what it leaves in flight is
+    whatever the command found. A refused `start` holds no note; a refused
+    `finish` keeps its run open for the next `finish`. Exit 2 again, since the
+    answer is the same command once the broker is back, not a fix to the file.
     """
 
 
@@ -2242,23 +2263,17 @@ def seed_memory_from_ledger(
 
     `listed_body` is the body `find_existing_issue`'s listing already carried.
     Where it arrived it is the seed, so the seed has no failure point of its
-    own; `gh issue view` is only the fallback for a listing that brought none.
+    own; an `issue-view` is only the fallback for a listing that brought none.
     """
     body = listed_body
     if not isinstance(body, str):
-        res = gh(
-            ["issue", "view", str(issue_number), "-R", repo, "--json", "body"], check=False
-        )
-        if res.returncode != 0:
+        body = fetch_issue_body(repo, issue_number)
+        if body is None:
             log(
                 f"WARNING: no report store for {audit_id} in {repo} and issue #{issue_number} "
                 f"could not be read to seed one; {MEMORY_UNKNOWABLE}"
             )
             return None
-        try:
-            body = json.loads(res.stdout or "{}").get("body")
-        except (json.JSONDecodeError, AttributeError):
-            body = None
     if not isinstance(body, str) or not DELTA_RE.search(normalise_newlines(body)):
         log(
             f"No report store for {audit_id} in {repo} and issue #{issue_number} carries no "
@@ -2296,7 +2311,7 @@ def memory_matches_ledger(
     The comparison is the finding-id block, not the whole body: the block is
     what the delta and the unaccounted guard read, and it survives the newline
     and whitespace changes GitHub or a hand edit can make to the prose around
-    it. The body is the one `gh issue list` returned alongside the issue's
+    it. The body is the one the `issue-list` returned alongside the issue's
     number, so it costs no read of its own, and it is a check on the store,
     never a memory in its place. A body that did not arrive cannot vouch for
     the record, so it fails the check.
@@ -5793,7 +5808,7 @@ def group_branch_for(audit_id: str, group: list[dict]) -> str:
     """Name a remediation branch after the *files* the group stages.
 
     The branch name is the only durable link between a finding and its pull
-    request — one `gh pr list --json headRefName` reconstructs the whole mapping
+    request — one listing of its proposals by branch reconstructs the whole mapping
     with no state kept anywhere else. That makes its stability load-bearing.
 
     Keying it on the lowest finding id looked reasonable and was not: finding
@@ -5937,13 +5952,13 @@ def strip_block_quotes(text: str) -> str:
 
 
 def parse_gh_timestamp(value: str | None) -> datetime | None:
-    """A `gh --json` RFC 3339 timestamp as an aware `datetime`, or None.
+    """A forge's RFC 3339 timestamp as an aware `datetime`, or None.
 
-    `gh` emits `2026-07-30T09:14:22Z`; `fromisoformat` did not accept the `Z`
+    The forge emits `2026-07-30T09:14:22Z`; `fromisoformat` did not accept the `Z`
     suffix before 3.11 and the container's interpreter is not guaranteed to be
     newer, so the suffix is normalised by hand. Anything unparseable returns
     None and every caller must treat that as "unknown", never as "old" — a
-    missing timestamp is a `gh` schema change, not evidence about the past.
+    missing timestamp is a schema change, not evidence about the past.
     """
     text = str(value or "").strip()
     if not text:
@@ -5978,7 +5993,7 @@ def timestamp_strictly_after(candidate: str | None, reference: str | None) -> bo
 
     Unknown on either side is False, and the asymmetry with `newer_timestamp`
     is the point. This decides whether a request may overrule a human's close,
-    so a missing `closedAt` — a `gh` schema change, not evidence the close
+    so a missing `closedAt` — a schema change, not evidence the close
     never happened — must not read as "nothing to overrule". Equal instants
     lose too: they cannot distinguish cause from effect, and the cheaper
     mistake is the one a second `/remediate` fixes.
@@ -6032,9 +6047,9 @@ def _promotable_hint(promotable: set[str]) -> str:
     return f". Promotable ids here: {shown}."
 
 
-# The suffix GitHub appends to the login of an App installation. REST-shaped
-# comment data carries it; the GraphQL struct `fetch_issue_comments` returns
-# strips it, which is why `is_machine_author` does not rest on this alone.
+# The suffix GitHub appends to the login of an App installation. The broker's
+# comment logins may or may not carry it depending on the forge and endpoint,
+# which is why `is_machine_author` does not rest on this alone.
 BOT_LOGIN_SUFFIX = "[bot]"
 
 
@@ -6556,7 +6571,7 @@ def derive_finding_state(reproduces: bool, pr: dict | None) -> str:
 
 
 def pr_labels(pr: dict | None) -> set[str]:
-    """The label names on a `gh pr list --json labels` record."""
+    """The label names on a `pr_record`."""
     labels = (pr or {}).get("labels") or []
     names: set[str] = set()
     for label in labels:
@@ -6793,11 +6808,12 @@ def marker_from_harness(
     could only ever have come from someone editing it — the arm was forgery
     surface and nothing else, and it is gone.
 
-    `viewerDidAuthor` is GitHub answering "did the caller write this", which is
-    exactly the question, and it holds whether the audit runs as an App or
-    under an operator's own token. `is_machine_author` is the fallback for a
-    comment struct that arrived without it: an App's login carries the `[bot]`
-    suffix on the REST path.
+    `viewerDidAuthor` answers "did the caller write this", which is exactly the
+    question: `read_comments` sets it by comparing each author with the login
+    the broker's `identity` verb reports for the install's own credential, so
+    it holds whether the audit runs as an App or under an operator's own token.
+    `is_machine_author` is the fallback for when that answer is missing: an
+    App's comment carries the `bot` flag, and its login the `[bot]` suffix.
     """
     return any(
         (bool(c.get("viewerDidAuthor")) or is_machine_author(c))
@@ -8882,7 +8898,7 @@ def render_clean_remediate_answer(
 # --------------------------------------------------------------------------- #
 
 
-# The clone every `git` and `gh` call runs inside, once `ensure_workspace` has
+# The clone every `git` call runs inside, once `ensure_workspace` has
 # established it. Module-level rather than threaded through forty call sites,
 # but *never* implicit at the boundary: `run_cmd` still takes an explicit `cwd`
 # and only falls back to this.
@@ -8904,23 +8920,16 @@ def run_cmd(
     check: bool = True,
     capture: bool = True,
     cwd: str | Path | None = None,
-    stdin: str | None = None,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Run one subprocess, always from a known directory.
 
-    `cwd` is not a convenience. `gh` and `git` are not binaries in this
-    container: `/opt/credential-proxy/bin/{gh,git}` are shims that POST their
-    argv **and `os.getcwd()`** to a sidecar, which runs the real tool in its own
-    filesystem at that path and rejects anything outside the workspace root. A
-    call made from whatever directory the agent happened to be in is not merely
-    untidy — it is a call the sidecar refuses, or worse, one that lands in the
-    wrong clone.
-
-    `stdin` is how a document reaches the tool without a file. The shim forwards
-    fd 0 for an argv that named `-` as an input file, so `--body-file -` carries
-    a pull-request body across the container boundary that a
-    `--body-file /some/path` could only cross while the two shared a volume.
+    `cwd` is not a convenience: a `git` call made from whatever directory the
+    agent happened to be in runs against whichever repository encloses it, or
+    none, rather than the leased clone. The directory is this process's own and
+    nothing else's. It never crossed to the credential container — the shim
+    that used to stand in for `git` here sent argv alone — and forge calls do
+    not come through here at all; see `forge`.
 
     `env` replaces the child's environment when given; None inherits this
     process's, as `subprocess.run` does.
@@ -8935,7 +8944,6 @@ def run_cmd(
             text=True,
             capture_output=capture,
             cwd=str(target) if target is not None else None,
-            input=stdin,
             env=env,
         )
     except subprocess.CalledProcessError as exc:
@@ -8944,8 +8952,8 @@ def run_cmd(
             log(exc.stderr.strip())
         raise
     # `check=False` callers used to fail in silence: the logging lived in the
-    # except arm, which a non-raising call never reaches, so a `gh` outage on
-    # the comment path left no trace anywhere in the run's output.
+    # except arm, which a non-raising call never reaches, so an outage on the
+    # comment path left no trace anywhere in the run's output.
     if result.returncode != 0:
         log(f"FAILED ({result.returncode}): {' '.join(cmd)}")
         if capture and result.stderr:
@@ -8959,14 +8967,250 @@ def git(
     return run_cmd(["git"] + args, check=check, cwd=cwd)
 
 
-def gh(
-    args: list[str],
-    *,
-    check: bool = True,
-    cwd: str | Path | None = None,
-    stdin: str | None = None,
-) -> subprocess.CompletedProcess:
-    return run_cmd(["gh"] + args, check=check, cwd=cwd, stdin=stdin)
+class ForgeError(RuntimeError):
+    """The broker refused a forge verb, or could not be reached to ask."""
+
+
+def broker_lost(exc: BaseException) -> bool:
+    """Did the broker not answer at all, rather than answer with a refusal?
+
+    True for a connection refused, timed out or broken mid-answer anywhere in
+    `exc`'s cause chain; False for an HTTP status, which is the broker (or
+    something in front of it) answering. `urlopen` turns only a failed send
+    into `URLError`: a broker that dies after taking the request surfaces from
+    the response read as `RemoteDisconnected`, `IncompleteRead`, a reset or a
+    read timeout, raw, wherever no client translated it to `BrokerDisconnected`. Only the first is the outage
+    `BrokerUnavailable` names: a 403 for an unmanaged repository sent back to
+    "check the pod and re-run" would loop against a healthy broker.
+    """
+    import http.client
+    import urllib.error
+
+    import credential_proxy_client
+
+    seen: BaseException | None = exc
+    while seen is not None:
+        if isinstance(seen, urllib.error.HTTPError):
+            return False
+        if isinstance(
+            seen,
+            (
+                urllib.error.URLError,
+                credential_proxy_client.BrokerDisconnected,
+                ConnectionError,
+                TimeoutError,
+                http.client.HTTPException,
+            ),
+        ):
+            return True
+        seen = seen.__cause__
+    return False
+
+
+def forge(verb: str, repo: str, payload: dict) -> dict:
+    """One forge verb against `repo`, through the broker. Raises ForgeError.
+
+    Issues, pull requests, comments and labels all go this way. There is no
+    `gh` in the sandbox to run: the broker holds the credential and answers in
+    the neutral shapes of the version-control protocol, and `ForgeError` keeps
+    this module's callers free of the client's exception type, which is only
+    importable where the scripts directory is (the module comment on
+    `sys.path`).
+
+    A broker that did not answer at all -- the connection refused, or broken
+    mid-answer -- raises `BrokerUnavailable` instead, wherever in the command it
+    happens: the same outage met at the refresh step, and owed the same exit
+    and the same note, not a `FATAL` because it landed five seconds later.
+    """
+    import vcs_client
+
+    number = payload.get("number")
+    log(f"forge {verb} {repo}" + (f" #{number}" if number is not None else ""))
+    try:
+        return vcs_client.forge(verb, dict(payload), repository=repo)
+    except vcs_client.VcsError as exc:
+        code = f" [{exc.code}]" if exc.code else ""
+        detail = f": {exc.detail}" if exc.detail else ""
+        log(f"FAILED: forge {verb} {repo}{code}: {exc}{detail}")
+        if not exc.code and broker_lost(exc):
+            raise BrokerUnavailable(
+                f"{verb} on {repo}: {exc} This sandbox has no other way to publish; "
+                "check the credential-proxy pod and re-run this command."
+            ) from exc
+        raise ForgeError(f"{verb} on {repo} failed{code}: {exc}{detail}") from exc
+
+
+def try_forge(verb: str, repo: str, payload: dict) -> dict | None:
+    """`forge`, with None for a refusal. The failure is already logged."""
+    try:
+        return forge(verb, repo, payload)
+    except ForgeError:
+        return None
+
+
+def _login_key(login: str) -> str:
+    """Logins compared case-insensitively and without an App's `[bot]` suffix.
+
+    The broker strips that suffix off every comment author and may not strip it
+    off its own login, so the same account can arrive spelled both ways.
+    """
+    login = (login or "").strip().lower()
+    return login[: -len(BOT_LOGIN_SUFFIX)] if login.endswith(BOT_LOGIN_SUFFIX) else login
+
+
+# The login `identity` names for this install's credential, per repository.
+# It cannot change within a run, and every conversation read needs it.
+_VIEWER_LOGINS: dict[str, str] = {}
+
+
+def viewer_login(repo: str) -> str | None:
+    """This install's own login on `repo`, lowercased; None when unanswerable.
+
+    The App's `[bot]` suffix is kept: it is the one thing that tells the App
+    from a user account registered under the same name, and `read_comments`
+    needs it for exactly that. Only an answer is remembered, so an outage is
+    asked about again.
+    """
+    if repo not in _VIEWER_LOGINS:
+        who = try_forge("identity", repo, {})
+        if who is None:
+            return None
+        _VIEWER_LOGINS[repo] = str((who.get("identity") or {}).get("login") or "").strip().lower()
+    return _VIEWER_LOGINS[repo]
+
+
+def read_comments(
+    verb: str, repo: str, number: int, *, standing: bool, requesters: bool = True
+) -> list[dict] | None:
+    """A conversation, as the comment records the rest of this module reads.
+
+    None when it could not be read whole. The records keep the field names the
+    pure core has always read — `author.login`, `createdAt`, `viewerDidAuthor`,
+    `authorAssociation` — so the rules written against them did not move. Two
+    of those are not in the neutral comment and are answered here:
+
+    - `viewerDidAuthor` compares the author with the login the broker's
+      `identity` names for this install's credential, and requires the
+      comment's `bot` flag to agree with whether that login is an App's. The
+      broker strips `[bot]` off every author, so without the flag a user
+      account registered under the App's slug would read as this install, and
+      its markers as the harness's own.
+    - `authorAssociation`, which only `standing` reads ask for, is the answer
+      to `identity`'s `canWrite` for that author: `COLLABORATOR` when it may
+      write, `NONE` when it may not. An author the forge could not answer for
+      makes the whole read unreadable, not a refusal: that answer is a public
+      reply and a permanent marker, and a five-second outage must not write one
+      to a maintainer. An automation's comment is never asked about, because
+      `is_machine_author` sets it aside whatever its standing. Nor is a comment
+      that names no `/remediate` and was not written by this install: nothing
+      reads its standing, so it carries none, and a bystander the forge could
+      not answer for does not cost every request on the thread its run.
+      With `requesters` false, a request this install did not write is not
+      asked about either: a reader that acts on nobody's command reads only
+      `is_machine_author`'s own-comment arm, and a requester the forge could
+      not answer for would otherwise hold that run for an answer it ignores.
+
+    A read without `standing` survives an `identity` outage for the viewer:
+    every comment is then not this install's, and the `bot` flag is left to
+    recognise an App's own.
+
+    Only the conversation tab: on a pull request that is where every marker
+    this harness writes is, and where `gh pr view --json comments` read.
+    """
+    answer = try_forge(
+        verb, repo, {"number": number, "comments": True, "limit": MAX_COMMENTS_READ}
+    )
+    if answer is None:
+        return None
+    if answer.get("commentsTruncated"):
+        log(
+            f"WARNING: #{number} has more than {MAX_COMMENTS_READ} comments; the "
+            "markers past that point cannot be seen, so none is trusted."
+        )
+        return None
+    items = [
+        item
+        for item in answer.get("comments") or []
+        if isinstance(item, dict) and item.get("kind", "issue") == "issue"
+    ]
+    if not items:
+        return []
+    viewer_raw = viewer_login(repo)
+    viewer = None if viewer_raw is None else _login_key(viewer_raw)
+    viewer_is_app = bool(viewer_raw) and viewer_raw.endswith(BOT_LOGIN_SUFFIX)
+    if viewer is None:
+        if standing:
+            return None
+        # A marker read: authorship is the only thing the viewer answers, and
+        # `marker_from_harness` falls back to the `bot` flag without it. An
+        # App install still sees its own markers through an `identity` outage,
+        # rather than reading none and posting every once-only comment again.
+        log(
+            f"WARNING: could not ask the forge who this install is on {repo}; "
+            f"reading #{number}'s markers by the bot flag alone."
+        )
+        viewer = ""
+    standing_of: dict[str, bool | None] = {}
+    records: list[dict] = []
+    for item in items:
+        login = str(item.get("author") or "")
+        bot = bool(item.get("bot"))
+        record = {
+            "id": str(item.get("id") or ""),
+            "body": str(item.get("body") or ""),
+            "createdAt": str(item.get("created") or ""),
+            "author": {"login": login, "is_bot": bot},
+            "viewerDidAuthor": bool(viewer)
+            and _login_key(login) == viewer
+            and bot == viewer_is_app,
+        }
+        needs_standing = record["viewerDidAuthor"] or (
+            requesters and "/remediate" in record["body"]
+        )
+        if standing and not bot and needs_standing:
+            key = _login_key(login)
+            if not key:
+                # A deleted account: nobody, so not a writer. A settled answer,
+                # unlike an outage, and reading it as one would leave this
+                # conversation unreadable for as long as the comment exists.
+                standing_of[key] = False
+            elif key not in standing_of:
+                asked = try_forge("identity", repo, {"login": login})
+                standing_of[key] = (
+                    None if asked is None else (asked.get("identity") or {}).get("canWrite")
+                )
+            if standing_of[key] is None:
+                log(
+                    f"WARNING: could not tell whether @{login} may write to {repo}; "
+                    f"reading #{number}'s comments again next run rather than "
+                    "answering a request on a guess."
+                )
+                return None
+            record["authorAssociation"] = "COLLABORATOR" if standing_of[key] else "NONE"
+        records.append(record)
+    return records
+
+
+def pr_record(proposal: dict) -> dict:
+    """A neutral proposal, in the field names the pull-request rules read.
+
+    `gh pr list --json` named them, and every rule from `pr_is_merged` to the
+    close-semantics gate is written against them; translating once here keeps
+    those rules as they were. `closed` is when the proposal closed *or*
+    merged, so it answers both `closedAt` and, on a merge, `mergedAt`.
+    """
+    state = str(proposal.get("state") or "").upper()
+    closed = str(proposal.get("closed") or "")
+    return {
+        "number": proposal.get("number"),
+        "headRefName": str(proposal.get("source") or ""),
+        "state": state,
+        "mergedAt": closed if state == "MERGED" else "",
+        "closedAt": closed,
+        "url": str(proposal.get("url") or ""),
+        "body": str(proposal.get("body") or ""),
+        "labels": [{"name": name} for name in proposal.get("labels") or []],
+    }
 
 
 # Which mechanism publishes a fix, and where the answer comes from.
@@ -8976,11 +9220,11 @@ def gh(
 # is what ran before: a leased clone on a volume both containers mount, with the
 # agent running `checkout`, `add`, `commit` and `push` in it through the shim.
 #
-# The two are live at once while the fleet migrates, and the switch is not a
-# flag in this container. The broker either has the routes armed or it does not,
-# so the answer is asked of the broker once per process and remembered — every
-# later branch in the run has to take the same fork, and a second probe could
-# answer differently if the sidecar restarted mid-run.
+# The switch is not a flag in this container. The answer is asked of the broker
+# once per process and remembered — every later branch in the run has to take
+# the same fork, and a second probe could answer differently if the sidecar
+# restarted mid-run. Directory mode is reached only with no broker configured;
+# see `detect_content_mode`.
 _CONTENT_MODE: bool = False
 
 
@@ -8998,13 +9242,15 @@ def set_content_mode(enabled: bool) -> None:
 
 
 def detect_content_mode() -> bool:
-    """Ask the broker whether it takes content. False on anything unclear.
+    """Ask the broker whether it takes content; refuse `start` if it will not say yes.
 
-    Falling back to the directory path on an unreachable broker is right for
-    this one question and wrong as a general habit: the fallback publishes the
-    audit through the mechanism that has been shipping for months, whereas
-    refusing would drop the whole run over a probe. Every *other* call in the
-    run still goes through the proxy and still fails loudly if it is down.
+    False only when no broker is configured at all. With one configured,
+    directory mode is no fallback: the sandbox's `git` has no network transport
+    and no credential, so the leased clone would fail on its first remote
+    command, later and with a `git` error that names nothing. A broker that is
+    down, unreachable, token-less, or not yet rolled to a build serving the
+    workspace routes (`workspaces_available` answers False for all of those)
+    refuses the command here instead, with a message naming the broker.
     """
     endpoint = proxy_endpoint()
     if not endpoint:
@@ -9012,25 +9258,53 @@ def detect_content_mode() -> bool:
     import credential_proxy_client
 
     try:
-        return credential_proxy_client.workspaces_available(endpoint)
-    except Exception as exc:  # noqa: BLE001 — a probe must not end the run
-        log(f"could not ask the broker about content workspaces ({exc}); "
-            "publishing through the leased clone instead")
-        return False
+        armed = credential_proxy_client.workspaces_available(endpoint)
+    except Exception as exc:  # noqa: BLE001 — named in the refusal below
+        armed, why = False, f": {exc}"
+    else:
+        why = ""
+    if armed:
+        return True
+    raise BrokerUnavailable(
+        f"the broker at {endpoint} did not confirm its content-workspace routes{why}. "
+        "It may be down, unreachable, refusing this sandbox's token, or on a build "
+        "older than this skill. This sandbox has no other way to publish; check the "
+        "credential-proxy pod and re-run this command."
+    )
 
 
 def refresh_credentials(repo: str | None = None) -> None:
-    """Mint the short-lived repo-scoped GitHub App token into gh + the git credential store.
+    """Mint the short-lived repo-scoped GitHub App token into the git credential store.
 
     `repo` is passed explicitly because the fallback is not usable here:
     `refresh_git_credentials()` with no argument re-derives the repository by
     running `git config --get remote.origin.url` in the *current* directory, and
     on this path there is no clone in the current directory yet — establishing
     one is what the token is for.
+
+    With a broker configured the refresh is a call to it, made before the
+    content-mode probe, so a broker that is down fails here first. That is the
+    same condition the probe names, and it gets the same refusal rather than a
+    `FATAL` the skill reads as something else having broken. A refresh the
+    broker answered and refused -- a repository not on its managed list is a
+    403 -- is not that condition, and stays the error it is.
     """
     from github_token_refresh import refresh_git_credentials
 
-    refresh_git_credentials(repo)
+    endpoint = proxy_endpoint()
+    if not endpoint:
+        refresh_git_credentials(repo)
+        return
+    try:
+        refresh_git_credentials(repo)
+    except Exception as exc:  # noqa: BLE001 — named in the refusal below
+        if not broker_lost(exc):
+            raise
+        raise BrokerUnavailable(
+            f"the broker at {endpoint} could not refresh repository credentials: {exc}. "
+            "This sandbox has no other way to publish; check the credential-proxy pod "
+            "and re-run this command."
+        ) from exc
 
 
 def resolve_repo(
@@ -9146,18 +9420,18 @@ def ensure_labels(repo: str, audit_id: str) -> None:
             # Load-bearing, not decorative: `pr_closed_by_harness` reads this
             # label to tell a close the harness made from a close a human made,
             # and that is the whole of the close-semantics decision. It has to
-            # be *created* here because `gh pr edit --add-label` does not create
-            # a missing label — it resolves the name to an id and errors — and
-            # the call site closes with `check=False`. Leave it out and every
+            # be *created* here because adding a missing label to a pull request
+            # is refused rather than creating it, and the call site closes on a
+            # best-effort basis. Leave it out and every
             # harness close lands unlabelled, every close then reads as a human
             # rejection, and no finding is ever re-proposed after its first
             # quiet day.
             STALE_CLOSED_LABEL,
             "C5DEF5",
             # Keep this under GitHub's 100-character description limit. It was
-            # 108 for as long as this label existed, so `gh label create`
-            # returned HTTP 422 on every run, the label never came into being,
-            # and — because the close path runs `check=False` — every harness
+            # 108 for as long as this label existed, so creating it returned
+            # HTTP 422 on every run, the label never came into being, and —
+            # because the close path is best-effort — every harness
             # close landed unlabelled. That is the exact failure the comment
             # above warns about, live the whole time. `test_label_descriptions
             # _fit_github_s_limit` now fails before a reviewer has to notice.
@@ -9168,20 +9442,10 @@ def ensure_labels(repo: str, audit_id: str) -> None:
         ("severity:minor", "FBCA04", "Highest audit finding severity: minor"),
     ]
     for name, color, description in labels:
-        gh(
-            [
-                "label",
-                "create",
-                name,
-                "-R",
-                repo,
-                "--color",
-                color,
-                "--description",
-                description,
-                "--force",
-            ],
-            check=False,
+        try_forge(
+            "label-ensure",
+            repo,
+            {"name": name, "color": color, "description": description},
         )
 
 
@@ -9199,7 +9463,7 @@ def find_existing_issue(
     None when the listing carried none.
 
     Raises rather than reporting "none" when the lookup itself fails. The old
-    code returned (None, None) on a non-zero exit, which made a `gh` outage
+    code returned (None, None) on a non-zero exit, which made a forge outage
     indistinguishable from an empty result: the run would open a duplicate
     ledger, or on a clean run report CLEAN having closed nothing.
 
@@ -9211,35 +9475,34 @@ def find_existing_issue(
     audit alternates between two ledgers indefinitely. Preferring the higher one
     settles on the ledger everything already points at.
     """
-    res = gh(
-        [
-            "issue",
-            "list",
-            "-R",
-            repo,
-            "--label",
-            f"audit:{audit_id}",
-            "--state",
-            "open",
-            "--json",
-            "number,url,body",
-            "--limit",
-            "20",
-        ],
-        check=False,
-    )
-    if res.returncode != 0:
-        raise GitHubLookupError(
-            f"could not list issues for audit:{audit_id} in {repo} "
-            f"(gh exited {res.returncode}): {(res.stderr or '').strip()[:200]}"
-        )
     try:
-        issues = json.loads(res.stdout or "[]")
-    except json.JSONDecodeError as exc:
+        answer = forge(
+            "issue-list",
+            repo,
+            # A full page, so the broker's paging past the remediation pull
+            # requests on the same label reaches as far as `MAX_PR_PAGE`.
+            {"labels": [f"audit:{audit_id}"], "state": "open", "limit": MAX_PAGE},
+        )
+    except ForgeError as exc:
         raise GitHubLookupError(
-            f"gh issue list returned output that is not JSON: {exc}"
+            f"could not list issues for audit:{audit_id} in {repo}: {str(exc)[:200]}"
         ) from exc
-    if not isinstance(issues, list) or not issues:
+    if not isinstance(answer.get("issues"), list):
+        # Not "no ledger": an answer this cannot read says nothing about
+        # whether one exists, and reading it as none opens a duplicate.
+        raise GitHubLookupError(
+            f"issue list for audit:{audit_id} in {repo} carried no issues field"
+        )
+    issues = [i for i in answer["issues"] if isinstance(i, dict)]
+    if not issues and answer.get("truncated"):
+        # The broker stopped paging before it found an issue: every page it read
+        # was remediation pull requests on the same label. The ledger, the
+        # oldest item on the label, may be past them, so this is not "none".
+        raise GitHubLookupError(
+            f"issue list for audit:{audit_id} in {repo} was truncated before any "
+            "issue was found; merge or close the remediation backlog on this label"
+        )
+    if not issues:
         return None, None, None
     issues.sort(key=lambda p: int(p.get("number", 0)))
     chosen = issues[-1]
@@ -9255,52 +9518,36 @@ def find_existing_issue(
     return int(chosen["number"]), chosen.get("url"), body if isinstance(body, str) else None
 
 
+def fetch_issue_body(repo: str, number: int) -> str | None:
+    """The ledger's current body, or None when it could not be read.
+
+    None and "" are different answers. An unreadable body means the delta is
+    unknowable; treating it as empty would announce every live finding as new.
+    The caller logs what it does instead.
+    """
+    answer = try_forge("issue-view", repo, {"number": number})
+    if answer is None or not isinstance(answer.get("issue"), dict):
+        return None
+    return str(answer["issue"].get("body") or "")
+
+
 def fetch_issue_url(repo: str, number: int) -> str | None:
-    res = gh(["issue", "view", str(number), "-R", repo, "--json", "url"], check=False)
-    if res.returncode != 0:
-        return None
-    try:
-        return json.loads(res.stdout or "{}").get("url")
-    except json.JSONDecodeError:
-        return None
+    answer = try_forge("issue-view", repo, {"number": number})
+    issue = (answer or {}).get("issue")
+    return (issue.get("url") or None) if isinstance(issue, dict) else None
 
 
 def fetch_issue_comments(repo: str, number: int) -> list[dict]:
     """Comments on the ledger, for `/remediate` parsing. Empty on failure.
 
-    No sub-projection is possible or needed: `gh issue view --json comments`
-    returns a fixed comment struct that already carries `id`, `author`,
-    `authorAssociation`, and the `createdAt` the close-vs-request comparison
-    reads.
+    With each author's standing, which `/remediate` authorization reads — see
+    `read_comments`.
     """
-    res = gh(
-        ["issue", "view", str(number), "-R", repo, "--json", "comments"], check=False
-    )
-    if res.returncode != 0:
+    comments = read_comments("issue-view", repo, number, standing=True)
+    if comments is None:
         log(f"WARNING: could not read comments on issue #{number}; treating as none.")
         return []
-    try:
-        comments = json.loads(res.stdout or "{}").get("comments") or []
-    except json.JSONDecodeError:
-        log(f"WARNING: comments on issue #{number} came back as non-JSON.")
-        return []
-    return [c for c in comments if isinstance(c, dict)]
-
-
-# Every `gh` flag below that used to name a file now names `-`, and the document
-# travels on stdin.
-#
-# It used to be a real file, and the comment that stood here explained at length
-# why it could not be in `/tmp`: `gh` is not a binary in this container, the shim
-# POSTs argv to another container which runs the real `gh` in *its* filesystem,
-# and a `/tmp` path names a file that exists on one side and not the other. The
-# answer then was the shared PersistentVolumeClaim, the only filesystem both
-# could see. That shared volume is what this change exists to remove — an
-# agent-writable tree the credential container also reads is the arrangement
-# behind every code-execution finding in this area — so the body stops being a
-# file. Nothing needs one: a pull-request body is a document, and `-` is how
-# every one of these subcommands takes a document.
-BODY_STDIN = "-"
+    return comments
 
 
 def apply_severity_label(repo: str, number: int, findings: list[dict]) -> None:
@@ -9309,19 +9556,15 @@ def apply_severity_label(repo: str, number: int, findings: list[dict]) -> None:
     highest = next((s for s in SEVERITIES if counts[s]), None)
     if highest is None:
         return
-    args = [
-        "issue",
-        "edit",
-        str(number),
-        "-R",
+    try_forge(
+        "issue-update",
         repo,
-        "--add-label",
-        f"severity:{highest}",
-    ]
-    for severity in SEVERITIES:
-        if severity != highest:
-            args += ["--remove-label", f"severity:{severity}"]
-    gh(args, check=False)
+        {
+            "number": number,
+            "labelsAdd": [f"severity:{highest}"],
+            "labelsRemove": [f"severity:{s}" for s in SEVERITIES if s != highest],
+        },
+    )
 
 
 def post_comment(repo: str, number: int, text: str, *, what: str) -> None:
@@ -9331,34 +9574,14 @@ def post_comment(repo: str, number: int, text: str, *, what: str) -> None:
     close sat outside the try/finally. A comment is a courtesy; the state
     change is the point.
     """
-    res = gh(
-        # `--body-file` rather than the `-F` short form it replaces: the shim
-        # decides whether to forward fd 0 by matching the flag, and its list is
-        # deliberately short. A one-letter flag is the kind that means something
-        # else to another tool, so the long spelling is the one to widen it to.
-        ["issue", "comment", str(number), "-R", repo, "--body-file", BODY_STDIN],
-        check=False,
-        stdin=text,
-    )
-    if res.returncode != 0:
-        log(
-            f"WARNING: could not post the {what} on #{number} "
-            f"(gh exited {res.returncode}); continuing."
-        )
+    if try_forge("issue-comment", repo, {"number": number, "body": text}) is None:
+        log(f"WARNING: could not post the {what} on #{number}; continuing.")
 
 
 def post_pr_comment(repo: str, number: int, text: str, *, what: str) -> None:
-    """`gh pr comment`, with the same log-and-continue posture as post_comment."""
-    res = gh(
-        ["pr", "comment", str(number), "-R", repo, "--body-file", BODY_STDIN],
-        check=False,
-        stdin=text,
-    )
-    if res.returncode != 0:
-        log(
-            f"WARNING: could not post the {what} on PR #{number} "
-            f"(gh exited {res.returncode}); continuing."
-        )
+    """A pull-request comment, with the same log-and-continue posture as post_comment."""
+    if try_forge("proposal-comment", repo, {"number": number, "body": text}) is None:
+        log(f"WARNING: could not post the {what} on PR #{number}; continuing.")
 
 
 # --------------------------------------------------------------------------- #
@@ -9373,44 +9596,40 @@ def list_remediation_prs(repo: str, audit_id: str) -> list[dict]:
     reproduces is a state the report has to be able to show, and a closed one
     is what stops the harness re-opening a fix a human rejected.
 
-    `labels` is in the projection because the close-semantics rule needs it —
+    The close-semantics rule reads two things off each one. Its labels, because
     `audit:stale-closed` is what tells a close the harness made from a close a
-    human made, and asking for it here costs nothing over the request already
-    being sent. `closedAt` is there for the other half of the same rule: a
+    human made. And when it closed, for the other half of the same rule: a
     `/remediate` only overrules a human close if it was written after it, and
-    that comparison needs a time on both sides.
+    that comparison needs a time on both sides. Both come back as `pr_record`
+    names them.
+
+    Read to the last page. A page that is missing reads as "no pull request"
+    for every finding it would have covered, so a lookup that fails partway
+    raises rather than returning what it had.
     """
-    res = gh(
-        [
-            "pr",
-            "list",
-            "-R",
-            repo,
-            "--label",
-            f"audit:{audit_id}",
-            "--label",
-            "audit:remediation",
-            "--state",
-            "all",
-            "--json",
-            "number,headRefName,state,mergedAt,closedAt,url,body,labels",
-            "--limit",
-            str(MAX_PR_PAGE),
-        ],
-        check=False,
-    )
-    if res.returncode != 0:
-        raise GitHubLookupError(
-            f"could not list remediation pull requests for audit:{audit_id} in "
-            f"{repo} (gh exited {res.returncode}): {(res.stderr or '').strip()[:200]}"
-        )
-    try:
-        prs = json.loads(res.stdout or "[]")
-    except json.JSONDecodeError as exc:
-        raise GitHubLookupError(
-            f"gh pr list returned output that is not JSON: {exc}"
-        ) from exc
-    prs = [p for p in prs if isinstance(p, dict)]
+    prs: list[dict] = []
+    page = 1
+    while True:
+        try:
+            answer = forge(
+                "proposal-list",
+                repo,
+                {
+                    "labels": [f"audit:{audit_id}", "audit:remediation"],
+                    "state": "all",
+                    "limit": MAX_PAGE,
+                    "page": page,
+                },
+            )
+        except ForgeError as exc:
+            raise GitHubLookupError(
+                f"could not list remediation pull requests for audit:{audit_id} "
+                f"in {repo}: {str(exc)[:200]}"
+            ) from exc
+        prs += [pr_record(p) for p in answer.get("proposals") or [] if isinstance(p, dict)]
+        if not answer.get("truncated") or len(prs) >= MAX_PR_PAGE:
+            break
+        page += 1
     if len(prs) >= MAX_PR_PAGE:
         # A silently truncated page is the worst possible answer here: the
         # missing pull requests read as "no pull request", so the harness
@@ -9466,7 +9685,7 @@ def sync_remediation_labels(
 ) -> None:
     """Re-assert the four labels on a remediation pull request that already exists.
 
-    `gh pr create` carries the labels for a *new* pull request, and until this
+    `open_remediation_pr` labels a *new* pull request, and until this
     function nothing carried them for an existing one — a later run reads that
     pull request, decides it is already open, and moves on without looking at
     what its labels have become. They drift two ways.
@@ -9479,46 +9698,36 @@ def sync_remediation_labels(
     minor to critical otherwise keeps the label it was opened with — the one
     field triage sorts on, silently stale.
 
-    A second call rather than more flags on `open_remediation_pr`'s own
-    `gh pr edit`, and `check=False`, because a label is worth less than the body
-    it would otherwise take down with it: on a repository whose labels someone
+    A second call rather than more fields on `open_remediation_pr`'s own
+    update, and best-effort, because a label is worth less than the body it
+    would otherwise take down with it: on a repository whose labels someone
     deleted by hand, folding these into the first call would abort the entire
-    remediation half of the run. The `--remove-label` for the two severities
-    that do not apply resolves even when the pull request never carried them —
-    `ensure_labels` creates all three at the top of every path that reaches
-    here, and `gh` only objects to a label the *repository* does not have.
+    remediation half of the run. Removing the two severities that do not apply
+    succeeds even when the pull request never carried them.
 
-    One `gh` call sets all six, so a single unresolvable name applies *none* of
+    One call sets all six, so a single unresolvable name applies *none* of
     them. That is the right trade against a partly-labelled pull request, but it
     is only safe if it is audible: a silent no-op here looks exactly like a
     refresh that had nothing to change, and the labelling gap this function
     exists to close went unnoticed for months for want of a line in the log.
     """
-    args = [
-        "pr",
-        "edit",
-        number,
-        "-R",
-        repo,
-        "--add-label",
-        "agent:audit",
-        "--add-label",
-        f"audit:{audit_id}",
-        "--add-label",
-        "audit:remediation",
-        "--add-label",
-        f"severity:{highest}",
-    ]
-    for severity in SEVERITIES:
-        if severity != highest:
-            args += ["--remove-label", f"severity:{severity}"]
-    res = gh(args, check=False)
-    if res.returncode != 0:
-        log(
-            f"#{number}: could not re-apply the audit labels "
-            f"(gh exited {res.returncode}): "
-            f"{(res.stderr or res.stdout or '').strip() or 'no output'}"
+    try:
+        forge(
+            "proposal-update",
+            repo,
+            {
+                "number": int(number),
+                "labelsAdd": remediation_labels(audit_id, highest),
+                "labelsRemove": [f"severity:{s}" for s in SEVERITIES if s != highest],
+            },
         )
+    except ForgeError as exc:
+        log(f"#{number}: could not re-apply the audit labels: {exc}")
+
+
+def remediation_labels(audit_id: str, highest: str) -> list[str]:
+    """The four labels every remediation pull request carries."""
+    return ["agent:audit", f"audit:{audit_id}", "audit:remediation", f"severity:{highest}"]
 
 
 def sync_open_remediation_labels(
@@ -9552,7 +9761,7 @@ def sync_open_remediation_labels(
     deliberate promise — a reviewer's commits stay where they are — and
     re-labelling keeps it while still repairing the field triage sorts on. When
     the labels are already right the call is a no-op, so a steady fleet pays one
-    `gh` call per open remediation pull request per run and changes nothing.
+    forge call per open remediation pull request per run and changes nothing.
 
     One call per pull request rather than per finding, since a group's findings
     all resolve to the same one.
@@ -9735,52 +9944,65 @@ def open_remediation_pr(
     highest = next(
         (s for s in SEVERITIES if severity_counts(group)[s]), SEVERITIES[-1]
     )
+    if not (existing and str(existing.get("state", "")).upper() == "OPEN"):
+        try:
+            created = forge(
+                "proposal-create",
+                repo,
+                {"source": branch, "target": base, "title": title, "body": body},
+            ).get("proposal") or {}
+        except ForgeError:
+            # The forge refuses a second pull request from one branch. One is
+            # already open there when an earlier run created it and then failed
+            # to label it: unlabelled, the listing above never finds it, and
+            # without this every later run is refused the same way. Adopt it --
+            # but only one this install opened: a person who opened their own
+            # pull request from the branch wrote its title and description.
+            existing = open_proposal_on(repo, branch)
+            if existing is None:
+                raise
     if existing and str(existing.get("state", "")).upper() == "OPEN":
         number = str(existing["number"])
-        gh(
-            [
-                "pr",
-                "edit",
-                number,
-                "-R",
-                repo,
-                "--title",
-                title,
-                "--body-file",
-                BODY_STDIN,
-            ],
-            stdin=body,
+        forge(
+            "proposal-update",
+            repo,
+            {"number": int(number), "title": title, "body": body},
         )
         sync_remediation_labels(repo, number, audit_id, highest)
         return str(existing.get("url") or "")
-    res = gh(
-        [
-            "pr",
-            "create",
-            "-R",
+    # Labelled in a second call because creating a proposal takes none; `gh pr
+    # create --label` made the same two requests. Not best-effort: an unlabelled
+    # remediation pull request is invisible to `list_remediation_prs`, so the
+    # next run opens it again. The raise lands in the caller's per-group catch.
+    number = created.get("number")
+    if number is not None:
+        forge(
+            "proposal-update",
             repo,
-            "--base",
-            base,
-            "--head",
-            branch,
-            "--title",
-            title,
-            "--body-file",
-            BODY_STDIN,
-            "--label",
-            "agent:audit",
-            "--label",
-            f"audit:{audit_id}",
-            "--label",
-            "audit:remediation",
-            "--label",
-            f"severity:{highest}",
-        ],
-        stdin=body,
-    )
+            {"number": int(number), "labelsAdd": remediation_labels(audit_id, highest)},
+        )
+    return str(created.get("url") or "") or None
 
-    lines = [ln for ln in (res.stdout or "").strip().splitlines() if ln.strip()]
-    return lines[-1] if lines else None
+
+def open_proposal_on(repo: str, branch: str) -> dict | None:
+    """The open pull request this install opened from `branch`; None if none.
+
+    Labelled or not. One a person opened is not returned, and neither is any
+    when the forge cannot say who this install is: adopting rewrites the title
+    and body, and those are not this harness's to overwrite on a guess.
+    """
+    viewer = viewer_login(repo)
+    if not viewer:
+        return None
+    answer = try_forge(
+        "proposal-list", repo, {"source": branch, "state": "open", "limit": 1}
+    )
+    found = [
+        pr_record(p)
+        for p in (answer or {}).get("proposals") or []
+        if isinstance(p, dict) and _login_key(str(p.get("author") or "")) == _login_key(viewer)
+    ]
+    return found[0] if found else None
 
 
 def close_stale_remediation_prs(
@@ -9903,11 +10125,12 @@ def close_stale_remediation_prs(
         # A labelled pull request that is still open, by contrast, costs one
         # line of noise and is fixed on the next run.
         if STALE_CLOSED_LABEL not in pr_labels(pr):
-            res = gh(
-                ["pr", "edit", str(number), "-R", repo, "--add-label", STALE_CLOSED_LABEL],
-                check=False,
+            labelled = try_forge(
+                "proposal-update",
+                repo,
+                {"number": number, "labelsAdd": [STALE_CLOSED_LABEL]},
             )
-            if res.returncode != 0:
+            if labelled is None:
                 log(
                     f"WARNING: could not label PR #{number} as `{STALE_CLOSED_LABEL}`; "
                     "leaving it open. Closing it unlabelled would read as a human "
@@ -9930,8 +10153,7 @@ def close_stale_remediation_prs(
                 what="stale-close comment",
             )
         # Never --delete-branch: a returning finding pushes to this branch again.
-        res = gh(["pr", "close", str(number), "-R", repo], check=False)
-        if res.returncode != 0:
+        if try_forge("proposal-close", repo, {"number": number}) is None:
             # Reporting a close that did not happen is how a run's own summary
             # stops describing the repository.
             log(f"WARNING: could not close PR #{number}; it stays open.")
@@ -9978,15 +10200,12 @@ def comment_on_merged_but_persisting(
 
 
 def fetch_pr_comments(repo: str, number: int) -> list[dict]:
-    res = gh(["pr", "view", str(number), "-R", repo, "--json", "comments"], check=False)
-    if res.returncode != 0:
+    """A pull request's conversation, read for the harness's own markers."""
+    comments = read_comments("proposal-view", repo, number, standing=False)
+    if comments is None:
         log(f"WARNING: could not read comments on PR #{number}; treating as none.")
         return []
-    try:
-        comments = json.loads(res.stdout or "{}").get("comments") or []
-    except json.JSONDecodeError:
-        return []
-    return [c for c in comments if isinstance(c, dict)]
+    return comments
 
 
 def reply_to_refusals(
@@ -10301,7 +10520,7 @@ def degrade_missing_remediations(findings: list[dict], root: Path) -> list[str]:
 
 
 def ensure_workspace(repo: str, audit_id: str, *, reset: bool = False) -> Path:
-    """Establish (and enter) the clone every git and gh call runs inside.
+    """Establish (and enter) the clone every git call runs inside.
 
     Lazy and idempotent: the first run of a stream clones, later ones fetch.
     Nothing in the pod does this at startup, and nothing should — a clone baked
@@ -10340,10 +10559,10 @@ def ensure_workspace(repo: str, audit_id: str, *, reset: bool = False) -> Path:
             reset=reset,
             owner=f"fleet-audit:{audit_id}",
         )
-        # No identity to configure: nothing commits here. The `gh` calls the run
-        # still makes are addressed with `-R owner/name` and do not need a
-        # working tree, but they do need a directory that exists, which is what
-        # this hands the runner.
+        # No identity to configure: nothing commits here, and the forge calls
+        # the run makes name their repository and need no working tree. The
+        # runner still wants a directory that exists, which is what this hands
+        # it.
         set_workspace(scratch)
         return scratch
 
@@ -11270,7 +11489,7 @@ def _handle_finish_dry_run(
     # left the only *reviewable* artifact — the thing a person is asked to merge
     # — visible nowhere but in production, which is the opposite of what a dry
     # run is for. The issue number is not available here: looking it up is a
-    # `gh` call, and this path makes none.
+    # forge call, and this path makes none.
     if groups:
         log(
             "DRY RUN: no --issue is looked up on this path, so the 'Part of #N' "
@@ -11320,7 +11539,7 @@ def _open_promoted_prs(
     the run. The ledger is already written by this point, and it records the
     finding as having no pull request — so the next run simply tries again.
     Failing the whole audit would throw away a correct report over a transient
-    `gh` error, and lose the groups that came after the broken one.
+    forge error, and lose the groups that came after the broken one.
     """
     if not promote:
         return []
@@ -11351,9 +11570,25 @@ def _open_promoted_prs(
                     existing=pr_by_finding.get(fid),
                     generated_at=generated_at,
                 )
-            except (subprocess.CalledProcessError, ValidationError) as exc:
+            except BrokerUnavailable:
+                # The broker is gone, not this group: the next group would fail
+                # the same way, and `main` labels it and `finish` keeps its note,
+                # as for the same outage anywhere else in the command.
+                raise
+            except (subprocess.CalledProcessError, ForgeError, ValidationError) as exc:
                 log(f"WARNING: could not publish the fix for {fid}: {exc}")
                 continue
+            except Exception as exc:
+                # The content workspace talks to the broker directly, so its
+                # transport failures arrive unwrapped.
+                if broker_lost(exc):
+                    raise BrokerUnavailable(
+                        f"publishing the fix for {fid} on {repo}: the broker at "
+                        f"{proxy_endpoint()} did not answer: {exc}. This sandbox has "
+                        "no other way to publish; check the credential-proxy pod "
+                        "and re-run this command."
+                    ) from exc
+                raise
             if url:
                 opened.append(url)
     finally:
@@ -11527,7 +11762,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
         ]
         if args.issue is None:
             # The real run looks the ledger up; a dry run may not, because
-            # that is a gh call. Say so rather than let the missing "Part of
+            # that is a forge call. Say so rather than let the missing "Part of
             # #N" read as a defect in the rendering.
             log("DRY RUN: no --issue given, so the 'Part of #N' link is omitted.")
         for group in groups:
@@ -11663,8 +11898,18 @@ def handle_finish(args: argparse.Namespace) -> None:
         # to hold: a tick landing in that window would otherwise pass `start`
         # and unlink the very document about to be resubmitted.
         raise
+    except Exception as exc:
+        # A lost broker that reached here raw is the same outage `forge`
+        # names, and keeps the note for the re-run the skill prescribes.
+        if broker_lost(exc):
+            raise BrokerUnavailable(
+                f"the broker at {proxy_endpoint()} did not answer: {exc}. "
+                "Check the credential-proxy pod and re-run `finish`."
+            ) from exc
+        release_in_flight(audit_id)
+        raise
     except BaseException:
-        # A `finish` that died on a `gh` call or anything else is over; the
+        # A `finish` that died on a forge call or anything else is over; the
         # retry loads the document afresh, and the SOP's next `start --repo B`
         # is not refused for two hours by an attempt that already died. The
         # cost, accepted: a rival `start` landing before the retry scrubs the
@@ -12028,7 +12273,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # ledger says -- the findings rewrite, the coverage issue a clean run
     # opens -- and just after the clean close, not here. A close leaves the
     # body untouched, so the stored memory stays exactly true until it lands,
-    # and a failure on that path (a transient `gh issue close`, a terminal
+    # and a failure on that path (a transient `issue-close`, a terminal
     # timeout) must not cost the next run it.
 
     # --- Clean run: retire the stream's ledger and every fix it was waiting on. ---
@@ -12091,6 +12336,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 repo, audit_id, remediation_prs, still_flagged, previous_titles, {}, now
             )
         )
+        conversation_unread = False
         if existing_issue and answers_remediate:
             # A command standing on the ledger is answered *before* anything
             # closes. "Every /remediate gets exactly one answer" cannot have a
@@ -12110,7 +12356,19 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             # be one the lost record carried, so it is not "no longer
             # reproduces" and not a coverage wait either.
             lost_gaps = [gap for gap in gaps if gap in LOST_MEMORY_GAPS]
-            clean_comments = fetch_issue_comments(repo, existing_issue)
+            # Read rather than fetched: an unreadable conversation is not an
+            # empty one here. Closing over it would take an unanswered request
+            # with it, so the ledger is held open below and the next run reads
+            # it again.
+            # Standing is asked only of this install's own comments: nothing
+            # here is acted on for anybody, so a requester's standing is never
+            # read (see `unanswered_remediate_comments`).
+            clean_comments = read_comments(
+                "issue-view", repo, existing_issue, standing=True, requesters=False
+            )
+            if clean_comments is None:
+                conversation_unread = True
+                clean_comments = []
             for request in unanswered_remediate_comments(clean_comments):
                 targets = request.get("targets") or []
                 held = [t for t in targets if t in withheld_ids]
@@ -12178,7 +12436,18 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
 
         opened_issue: int | None = None
         opened_body = ""
-        if existing_issue and gaps:
+        held_unread = bool(existing_issue and conversation_unread)
+        if held_unread and not gaps and not unaccounted:
+            # A clean run that could not read the ledger's conversation cannot
+            # tell whether a `/remediate` stands on it, and closing would leave
+            # that request no thread to be answered on. Nothing is posted: the
+            # all-clear goes out with the close, on the run that can read it.
+            log(
+                f"Audit {audit_id} is clean, but issue #{existing_issue}'s comments "
+                "could not be read; it stays open so a standing /remediate is "
+                "answered on the next run rather than closed over."
+            )
+        elif existing_issue and gaps:
             # Zero findings over incomplete coverage is not an all-clear. The
             # ledger stays open and says why, so the stream self-heals the day
             # the unreadable clusters come back. Over a held finding the held
@@ -12245,16 +12514,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             )
             # Completed, not "not planned": a closed ledger means the fleet is
             # clean, never that the report was rejected.
-            gh(
-                [
-                    "issue",
-                    "close",
-                    str(existing_issue),
-                    "-R",
-                    repo,
-                    "--reason",
-                    "completed",
-                ]
+            forge(
+                "issue-close",
+                repo,
+                {"number": existing_issue, "reason": "completed"},
             )
             # Dropped only once the close has landed: the close leaves the body
             # as it was, so until it succeeds the stored memory is still exactly
@@ -12275,28 +12538,19 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 data, generated_at=now, audit_id=audit_id, gaps=gaps
             )
             invalidate_report_memory(audit_id, repo)
-            res = gh(
-                [
-                    "issue",
-                    "create",
-                    "-R",
-                    repo,
-                    "--title",
-                    coverage_issue_title(audit_id, gaps),
-                    "--body-file",
-                    BODY_STDIN,
-                    "--label",
-                    "agent:audit",
-                    "--label",
-                    f"audit:{audit_id}",
-                ],
-                stdin=rendered.body,
-            )
-            lines = [ln for ln in (res.stdout or "").strip().splitlines() if ln.strip()]
-            existing_url = lines[-1] if lines else None
+            opened = forge(
+                "issue-create",
+                repo,
+                {
+                    "title": coverage_issue_title(audit_id, gaps),
+                    "body": rendered.body,
+                    "labels": ["agent:audit", f"audit:{audit_id}"],
+                },
+            ).get("issue") or {}
+            existing_url = str(opened.get("url") or "") or None
             opened_body = rendered.body
-            tail = (existing_url or "").rstrip("/").rsplit("/", 1)[-1]
-            opened_issue = int(tail) if tail.isdigit() else None
+            number = opened.get("number")
+            opened_issue = number if isinstance(number, int) else None
             log(
                 f"Audit {audit_id} found nothing and had no ledger, but "
                 f"{len(gaps)} coverage gap(s) mean it cannot speak for the "
@@ -12319,13 +12573,13 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # about is gone whatever it was called. The coverage guard still
         # applies, because "nothing found" over an unchecked fleet is not the
         # same as "nothing there".
-        clean_resolved = 0 if (gaps or unaccounted) else len(previous_ids)
+        clean_resolved = 0 if (gaps or unaccounted or held_unread) else len(previous_ids)
         payload = {
             # HELD is CLEAN refused its close: the same zero findings,
             # with the ledger left open over findings the run did not
             # account for. A distinct word because the worker relays
             # this line, and "clean" is the one thing it is not.
-            "status": "HELD" if unaccounted else "CLEAN",
+            "status": "HELD" if unaccounted or held_unread else "CLEAN",
             "issue_url": existing_url,
             "new": 0,
             "resolved": clean_resolved,
@@ -12337,7 +12591,12 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             # better and is the best news this audit ever delivers, and
             # a gap means it could not look rather than found nothing.
             "silent_ok": not (
-                clean_resolved or gaps or prs_closed or unaccounted or collector_speaks
+                clean_resolved
+                or gaps
+                or prs_closed
+                or unaccounted
+                or held_unread
+                or collector_speaks
             ),
             "partial": bool(gaps),
             "coverage_gaps": gaps,
@@ -12365,7 +12624,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # carries would be announced as new. The previous body carries forward
         # instead; with no memory of it, the envelope names no issue, so the
         # next run's trust check fails as a lost memory should.
-        body_untouched = bool(existing_issue) and bool(gaps or unaccounted)
+        body_untouched = bool(existing_issue) and bool(gaps or unaccounted or held_unread)
         # `document` stays this run's: it is what a reader asking "what did the
         # last run check, which clusters did it skip" is answered from. The
         # document the untouched body renders rides alongside as
@@ -12402,7 +12661,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 issue_number=stored_issue,
                 ledger_body=stored_body,
                 new_ids=[],
-                resolved_ids=[] if (gaps or unaccounted) else previous_ids,
+                resolved_ids=[] if body_untouched or gaps or unaccounted else previous_ids,
                 rendered_ids=stored_ids,
                 ledger_document=ledger_document,
                 ledger_held_open=body_untouched,
@@ -12551,44 +12810,23 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # them must not cost the next run a memory that is still true.
     invalidate_report_memory(audit_id, repo)
     if existing_issue is None:
-        res = gh(
-            [
-                "issue",
-                "create",
-                "-R",
-                repo,
-                "--title",
-                title,
-                "--body-file",
-                BODY_STDIN,
-                "--label",
-                "agent:audit",
-                "--label",
-                f"audit:{audit_id}",
-            ],
-            stdin=rendered.body,
-        )
+        opened = forge(
+            "issue-create",
+            repo,
+            {
+                "title": title,
+                "body": rendered.body,
+                "labels": ["agent:audit", f"audit:{audit_id}"],
+            },
+        ).get("issue") or {}
         status = "OPENED"
-        lines = [ln for ln in (res.stdout or "").strip().splitlines() if ln.strip()]
-        issue_url = lines[-1] if lines else None
-        number = None
-        if issue_url:
-            tail = issue_url.rstrip("/").rsplit("/", 1)[-1]
-            number = int(tail) if tail.isdigit() else None
+        issue_url = str(opened.get("url") or "") or None
+        number = opened.get("number") if isinstance(opened.get("number"), int) else None
     else:
-        gh(
-            [
-                "issue",
-                "edit",
-                str(existing_issue),
-                "-R",
-                repo,
-                "--title",
-                title,
-                "--body-file",
-                BODY_STDIN,
-            ],
-            stdin=rendered.body,
+        forge(
+            "issue-update",
+            repo,
+            {"number": existing_issue, "title": title, "body": rendered.body},
         )
         status = "UPDATED"
         number = existing_issue
@@ -12674,12 +12912,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 held_overflow=held_overflow,
                 held_carried=carried_without_manifest,
             ).body
-            relinked = gh(
-                ["issue", "edit", str(number), "-R", repo, "--body-file", BODY_STDIN],
-                stdin=relink,
-                check=False,
-            )
-            if relinked.returncode == 0:
+            relinked = try_forge("issue-update", repo, {"number": number, "body": relink})
+            if relinked is not None:
                 ledger_body = relink
 
     # A command that succeeds silently is indistinguishable from one that was
@@ -12879,7 +13113,7 @@ def build_parser() -> argparse.ArgumentParser:
     finish_parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Validate and render to stdout; perform zero git/gh side effects.",
+        help="Validate and render to stdout; perform zero git or forge side effects.",
     )
     # One or the other, never both: a waiver says the collector produced no
     # manifest, and a manifest beside it would make that sentence false.
@@ -13006,7 +13240,7 @@ def build_parser() -> argparse.ArgumentParser:
     remediate_parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Render the pull-request bodies to stdout; zero git/gh side effects.",
+        help="Render the pull-request bodies to stdout; zero git or forge side effects.",
     )
     remediate_parser.add_argument(
         "--manifest-file",
@@ -13036,6 +13270,9 @@ def main(argv: list[str] | None = None) -> int:
             handle_remediate(args)
         else:
             handle_finish(args)
+    except BrokerUnavailable as exc:
+        log(f"BROKER UNAVAILABLE: {exc}")
+        return 2
     except StartRefused as exc:
         # Exit 2 like a rejected document, labelled apart from one: there
         # is no document here to fix and re-run.
@@ -13048,6 +13285,16 @@ def main(argv: list[str] | None = None) -> int:
         log(f"FATAL: subprocess failed with exit code {exc.returncode}")
         return 1
     except Exception as exc:  # noqa: BLE001 — one actionable line beats a traceback in cron logs
+        if broker_lost(exc):
+            # Any command's own broker calls -- `fetch`, `list` and `grep` open
+            # the content workspace directly -- surface a lost broker raw. The
+            # skill promises this line from any command, not from the ones
+            # that happen to wrap their calls.
+            log(
+                f"BROKER UNAVAILABLE: the broker at {proxy_endpoint()} did not answer: "
+                f"{exc}. Check the credential-proxy pod and re-run this command."
+            )
+            return 2
         log(f"FATAL: {exc}")
         return 1
     return 0

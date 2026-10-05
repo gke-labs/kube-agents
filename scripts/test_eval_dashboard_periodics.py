@@ -451,7 +451,7 @@ class WorkflowWiring(unittest.TestCase):
         self.assertEqual(note["summary"], "failed in 2 of 3 project(s) after closing 1 pull request(s)")
         self.assertEqual(note["detail"], ["kube-agents-evals-2: HTTP 403 Forbidden: x", "kube-agents-evals-4: HTTP 502 Bad Gateway"])
         self.assertEqual((note["place"], note["absence"]), ("Eval GitOps repos", "leftover pull requests from eval runs are not being cleaned up"))
-        self.assertTrue(note["runbook"].endswith("#55-the-pull-request-sweep"))
+        self.assertTrue(note["runbook"].endswith("#55-the-repository-reset-and-the-sweep-behind-it"))
         passed = {"job": SWEEP.job, "build": "100", "finished_at": NOW.isoformat(timespec="seconds"), "passed": True, "result": "SUCCESS", "artifact": {"projects": 12, "closed": 241, "failed": 0, "left_for_next_run": 0, "outcomes": {}}}
         runs = periodics.runs({SWEEP.job: passed})
         self.assertEqual(runs[SWEEP.job], {"build": "100", "finished_at": NOW.isoformat(timespec="seconds"), "passed": True, "summary": "closed 241 pull request(s) across 12 project(s)"})

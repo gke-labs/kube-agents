@@ -906,7 +906,7 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
     def test_upgrade_confirms_agent_image_before_rollout_status(self):
         text = (_REPO_ROOT / "upgrade.sh").read_text()
         confirm_idx = text.index('confirm_agent_image.sh" "$target_namespace" "$PLATFORM_AGENT_DEPLOYMENT"')
-        rollout_idx = text.index('rollout status "deployment/${PLATFORM_AGENT_DEPLOYMENT}" -n "$target_namespace" --timeout=900s')
+        rollout_idx = text.index('rollout status "deployment/${PLATFORM_AGENT_DEPLOYMENT}" -n "$target_namespace" --timeout=1500s')
         self.assertLess(confirm_idx, rollout_idx)
 
     def test_the_harness_retag_uses_the_assembled_key_list(self):

@@ -31,7 +31,7 @@ into the headline and the attachment that carries the bar when it is posted.
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 
 import slack_presenter as _presenter
 
@@ -175,6 +175,10 @@ OPTIONS_MIN = 2
 OPTIONS_MAX = _presenter.BUTTONS_PER_ROW
 #: The reason below the question, clipped; ``kanban_block`` puts no bound on it.
 DETAIL_MAX = 2000
+#: Bold in a context line: ``**text**`` between word boundaries with no ``*`` inside,
+#: which mrkdwn would read as a marker. ``__x__`` stays text, so a ``__init__.py`` in a
+#: path or url keeps its characters.
+DETAIL_BOLD = re.compile(r"(?<![\w*])\*\*(?=\S)([^*\n]+?)(?<=\S)\*\*(?![\w*])")
 NEEDS_YOU_ACTION_PREFIX = "kage_needs"
 WAITING = "⏸ waiting on you"
 NEEDS_YOU_SIDE_BAR = _presenter.SIDE_BAR_YELLOW
@@ -182,6 +186,11 @@ NEEDS_YOU_SIDE_BAR = _presenter.SIDE_BAR_YELLOW
 
 def opened_pr(text: str) -> tuple[str, str, str, str] | None:
     """``(url, repo, number, line)`` for the first PR ``text`` says was opened, else None."""
+    return next(opened_prs(text), None)
+
+
+def opened_prs(text: str) -> Iterator[tuple[str, str, str, str]]:
+    """``(url, repo, number, line)`` for each PR ``text`` says was opened, in order."""
     for line in str(text or "").splitlines():
         for match in PR_URL.finditer(line):
             verb = OPENED_BEFORE_URL.search(line[: match.start()]) or _opened_pr_then(
@@ -192,8 +201,7 @@ def opened_pr(text: str) -> tuple[str, str, str, str] | None:
             before = line[: verb.start()]
             if NEGATED_VERB.search(before) or not _ours(before):
                 continue
-            return match.group(0), match.group(2), match.group(3), line.strip()
-    return None
+            yield match.group(0), match.group(2), match.group(3), line.strip()
 
 
 def _opened_pr_then(before: str, number: str) -> re.Match | None:
@@ -284,14 +292,20 @@ def _link(match: re.Match) -> str:
     return f"<{_presenter._link_url(url)}|{_escape(label)}>"
 
 
-def _subline_mrkdwn(subline: str) -> str:
-    """``subline`` escaped, with each Markdown link outside a code span as a mrkdwn link."""
+def _bolded(text: str) -> str:
+    """``text`` escaped, each :data:`DETAIL_BOLD` run as mrkdwn's single-star bold."""
+    return DETAIL_BOLD.sub(r"*\1*", _escape(text))
+
+
+def _subline_mrkdwn(subline: str, links: bool = True) -> str:
+    """``subline`` escaped with its bold as mrkdwn bold outside code spans; with
+    ``links``, each Markdown link there as a mrkdwn link."""
     held, spans = _presenter._hold_code(subline.replace("\x00", ""))
     parts, last = [], 0
-    for match in _presenter.MD_LINK.finditer(held):
-        parts += [_escape(held[last : match.start()]), _link(match)]
+    for match in _presenter.MD_LINK.finditer(held) if links else ():
+        parts += [_bolded(held[last : match.start()]), _link(match)]
         last = match.end()
-    text = "".join(parts) + _escape(held[last:])
+    text = "".join(parts) + _bolded(held[last:])
     return _presenter.CODE_PLACEHOLDER.sub(lambda m: _escape(spans[int(m.group(1))][0]), text)
 
 
@@ -301,7 +315,7 @@ def _with_subline(blocks: list[dict], subline: str, links: bool = False) -> list
     a link. An opened PR's line keeps its links as text, for :data:`PR_URL`'s reason."""
     if not subline:
         return blocks
-    text = _subline_mrkdwn(subline) if links else _escape(subline)
+    text = _subline_mrkdwn(subline, links)
     context = {"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}
     return [*blocks[:1], context, *blocks[1:]]
 
@@ -405,9 +419,9 @@ def _question(reason: str, buttons: bool) -> tuple[str, list[str], list[str]]:
     if not usable:
         start, options = len(lines), []
     first = lines[0].strip()
-    # A clipped headline keeps its whole line below it too.
-    # Measured as shown: a link's url is not on screen.
-    below = 0 if len(_headline_text(first)) > _presenter.HEADLINE_MAX else 1
+    # A clipped headline keeps its whole line below it too, measured as shown, and so
+    # does one with a link: the headline shows only the label, the line below the url.
+    below = 0 if len(_headline_text(first)) > _presenter.HEADLINE_MAX or _presenter.MD_LINK.search(first) else 1
     return first, [*before, *lines[below:start]], options
 
 

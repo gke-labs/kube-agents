@@ -85,9 +85,9 @@ verification_spec:
     mode: assert
     check:
       type: worker_commands
-      # A command word, not a substring: `/opt/vcs/libexec/git log` is the
-      # sanctioned local git and must not trip this; a bare `git clone` or
-      # any `gh` at the start of a command or after a shell join must. The
+      # A command word, not a substring: `git log` on the working copy is the
+      # sanctioned local git and must not trip this; a `git clone` or any
+      # `gh` at the start of a command or after a shell join must. The
       # last two forbid writes: the first green attempt answered a history
       # question by "restoring" the file and opening a pull request, which is
       # the wrong deliverable and a mutation of the corpus the case reads.
