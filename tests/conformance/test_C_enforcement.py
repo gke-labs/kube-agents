@@ -1087,6 +1087,53 @@ class C1IsolationIsStructural(unittest.TestCase):
                     "the shim no longer reads %s by that name" % name,
                 )
 
+    def test_C1_the_target_allowlist_env_names_agree_across_the_module_boundary(self) -> None:
+        """The platform agent's allowlists cross the same boundary, fail-open.
+
+        The operator renders the CR's integration.{googleChat,slack}.allowedUsers
+        onto the gateway as A2A_TARGET_ALLOWED_USERS_{GCHAT,SLACK}; the gateway
+        reads the same two names and checks a session's request to delegate to
+        the platform agent against them. The gateway reads an absent variable
+        as "all authenticated users", by design (an absent CR list means the
+        same), so a rename on either side is not a refusal anyone sees: every
+        requester is allowed and both Go suites are green. The two spellings
+        are pinned equal here, and the absent-list branch is pinned as allow so
+        a future "fix" that flips it to deny is a visible change.
+        """
+        a2a_manifests = h.text("a2a_session_fence")
+        allowlist = h.text("a2a_gateway_allowlist")
+
+        def one(pattern: str, text: str, what: str) -> str:
+            found = re.findall(pattern, text)
+            self.assertEqual(
+                len(found),
+                1,
+                "%s is not a single match (%d); this test compared nothing" % (what, len(found)),
+            )
+            return found[0]
+
+        for const, env in (
+            ("a2aTargetAllowedUsersGchatEnvVar", "EnvTargetAllowedUsersGchat"),
+            ("a2aTargetAllowedUsersSlackEnvVar", "EnvTargetAllowedUsersSlack"),
+        ):
+            with self.subTest(pair=const):
+                rendered = one(r'%s\s*=\s*"([^"]+)"' % const, a2a_manifests, "the operator's %s" % const)
+                read = one(r'%s\s*=\s*"([^"]+)"' % env, allowlist, "the gateway's %s" % env)
+                self.assertEqual(
+                    rendered,
+                    read,
+                    "the operator renders %r and the gateway reads %r: every delegation "
+                    "is allowed on an install whose Go suites are green" % (rendered, read),
+                )
+                one(r"Name:\s*%s," % const, a2a_manifests, "the operator's render of %s" % const)
+                one(r"os\.Getenv\(%s\)" % env, allowlist + h.text("a2a_gateway_config"), "the gateway's read of %s" % env)
+
+        # The absent-list branch is allow, stated in the function that answers.
+        body = allowlist.split("func (g *Gateway) targetAllows")[1].split("\n}\n")[0]
+        self.assertIn("if set == nil {", body, "targetAllows lost its absent-list branch")
+        self.assertIn("return true", body.split("if set == nil {")[1].split("}")[0],
+                      "targetAllows answers an absent list with something other than allow")
+
     def test_C1_the_reserved_bus_token_file_env_is_spelled_the_same_in_both_modules(
         self,
     ) -> None:

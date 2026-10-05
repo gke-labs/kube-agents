@@ -1263,6 +1263,24 @@ Mutation(
         "because neither names the other's spelling",
     ),
     Mutation(
+        "C1-target-allowlist-env-renamed-on-the-gateway-side",
+        "a2a/gateway/allowlist.go",
+        ('EnvTargetAllowedUsersGchat = "A2A_TARGET_ALLOWED_USERS_GCHAT"', 'EnvTargetAllowedUsersGchat = "A2A_TARGET_ALLOWEDUSERS_GCHAT"'),
+        "test_C1_the_target_allowlist_env_names_agree_across_the_module_boundary",
+        "rename the Chat allowlist variable in the module that reads it. The "
+        "operator still renders the long name, so the gateway reads no list and "
+        "allows every delegation to the platform agent, which is the fail-open "
+        "direction and the quietest drift here",
+    ),
+    Mutation(
+        "C1-target-allowlist-env-renamed-on-the-operator-side",
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ('a2aTargetAllowedUsersSlackEnvVar = "A2A_TARGET_ALLOWED_USERS_SLACK"', 'a2aTargetAllowedUsersSlackEnvVar = "A2A_TARGET_ALLOWED_USERS_SLACK_IDS"'),
+        "test_C1_the_target_allowlist_env_names_agree_across_the_module_boundary",
+        "rename the Slack allowlist variable in the module that renders it; the "
+        "gateway keeps reading the old name and sees no list",
+    ),
+    Mutation(
         "C1-cluster-view-env-renamed-on-the-gateway-side",
         "a2a/gateway/config.go",
         ('os.Getenv("A2A_SESSION_CLUSTER_VIEW")', 'os.Getenv("A2A_SESSION_VIEW")'),

@@ -286,6 +286,13 @@ SOURCES: dict[str, Source] = {
         "a2a/gateway/config.go",
         ("A2A_DEFAULT_ADDRESSEE", "A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL"),
     ),
+    # The platform agent's allowlists as the gateway reads them: the per-target
+    # check a session's delegation is held to. The names cross the module
+    # boundary from the operator's render; C1 pins the pair.
+    "a2a_gateway_allowlist": Source(
+        "a2a/gateway/allowlist.go",
+        ("EnvTargetAllowedUsersGchat", "EnvTargetAllowedUsersSlack", "func (g *Gateway) targetAllows"),
+    ),
     # --- model egress -----------------------------------------------------
     # The redactor the chart mounts into the LiteLLM gateway. It is a copy of
     # the chat plugin's module, and tests/test_litellm_redaction.py keeps the
