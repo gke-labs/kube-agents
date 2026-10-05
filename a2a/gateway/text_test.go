@@ -193,23 +193,30 @@ func TestChatChunksAvoidSplittingCodeSpans(t *testing.T) {
 		t.Errorf("case 1: toGchatText(chunk 2) left link undefanged: %q", gotGchat1)
 	}
 
-	// Case 2: A hard cut inside a mid-line fence opener at byte 1898.
-	// Without adjusting the cut, chunk 1 ends with two backticks and chunk 2
-	// starts with the third, corrupting fence pairing in chunk 2.
-	in2 := strings.Repeat("a", 1898) + "```\ncodeA\n```\nsee **bold** and <https://a.example|https://b.example>\n```\ncodeB\n```\n"
+	// Case 2: A hard cut inside a mid-line fence opener at byte 1898 where the
+	// fenced block exceeds the chunk budget. Because the block is longer than
+	// the budget, fitsIntact is false; insideOpener alone moves the cut back
+	// to the opener's start at 1898. Without insideOpener, chunk 1 ends with
+	// two backticks and chunk 2 starts with the third without a fence opener,
+	// corrupting fence pairing across subsequent chunks.
+	in2 := strings.Repeat("a", 1898) + "```\n" + strings.Repeat("log line\n", 300) + "```\nsee **bold** and <https://a.example|https://b.example>\n"
 	chunks2 := chatChunks(in2, discordChunk)
-	if len(chunks2) != 2 {
-		t.Fatalf("case 2: got %d chunks, want 2", len(chunks2))
+	if len(chunks2) < 2 {
+		t.Fatalf("case 2: got %d chunks, want >= 2", len(chunks2))
 	}
 	if len(chunks2[0]) != 1898 {
 		t.Errorf("case 2: chunk 1 len = %d, want 1898", len(chunks2[0]))
 	}
-	gotGchat2 := toGchatText(chunks2[1])
+	if !strings.HasPrefix(chunks2[1], "```\n") {
+		t.Errorf("case 2: chunk 2 does not begin with fence opener: %q", chunks2[1][:min(len(chunks2[1]), 20)])
+	}
+	lastChunk := chunks2[len(chunks2)-1]
+	gotGchat2 := toGchatText(lastChunk)
 	if !strings.Contains(gotGchat2, "*bold*") || strings.Contains(gotGchat2, "**bold**") {
-		t.Errorf("case 2: toGchatText(chunk 2) left bold unconverted: %q", gotGchat2)
+		t.Errorf("case 2: toGchatText(last chunk) left bold unconverted: %q", gotGchat2)
 	}
 	if strings.Contains(gotGchat2, "<https://a.example|") {
-		t.Errorf("case 2: toGchatText(chunk 2) left link undefanged: %q", gotGchat2)
+		t.Errorf("case 2: toGchatText(last chunk) left link undefanged: %q", gotGchat2)
 	}
 
 	// Fallback case: a span starting in the first half of the budget (< budget/2)
