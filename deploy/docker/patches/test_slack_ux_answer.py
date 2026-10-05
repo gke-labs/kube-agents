@@ -57,6 +57,11 @@ class _Client:
         return {"ts": POSTED_TS}
 
 
+def _slack_unfurl_kwargs(extra):
+    """Found through ``_Adapter``'s module, the way the runtime finds the Slack adapter module's."""
+    return {"unfurl_links": False}
+
+
 class _Adapter:
     """The SlackAdapter surface the folder reaches."""
 
@@ -151,6 +156,27 @@ class SplitTest(unittest.TestCase):
             ([("No: all 12 are Running.", False)], "Two restarted today."),
         )
 
+    def test_a_later_bold_label_on_the_line_does_not_refuse_the_lead(self):
+        answers = {
+            "after a bold sentence": (
+                "**All 3 nodes are Ready.** Load \u2014 **cpu**: 40%, **mem**: 60%.",
+                ([("All 3 nodes are Ready.", False)], "Load \u2014 **cpu**: 40%, **mem**: 60%."),
+            ),
+            "after a one-word answer": (
+                "**No**: all 12 are Running. **Two** \u2014 restarted.",
+                ([("No: all 12 are Running.", False)], "**Two** \u2014 restarted."),
+            ),
+        }
+        for what, (answer, expected) in answers.items():
+            with self.subTest(what):
+                self.assertEqual(runtime.split(answer), expected)
+
+    def test_a_lead_opening_on_a_triple_backtick_span_folds(self):
+        self.assertEqual(
+            runtime.split("```kubectl``` is deprecated. Use the plugin."),
+            ([("kubectl", True), (" is deprecated.", False)], "Use the plugin."),
+        )
+
     def test_a_code_span_in_the_lead_stays_code(self):
         headline, rest = runtime.split("**One pod is failing: `web-1` is CrashLoopBackOff.** It exits 137.")
         self.assertEqual(
@@ -231,6 +257,15 @@ class TrailingQuestionTest(unittest.TestCase):
                 ("It restarted.", "Want me to roll back to `v1.2`?"),
             ),
             "after a bold sentence": ("**Done.** Open a PR?", ("**Done.**", "Open a PR?")),
+            "under label lines": (
+                "Node: a\nCause: OOM\nWant me to restart it?",
+                ("Node: a\nCause: OOM", "Want me to restart it?"),
+            ),
+            "under a count": ("Replicas: `3/3`\nWant me to watch it?", ("Replicas: `3/3`", "Want me to watch it?")),
+            "wrapped after e.g.": (
+                f"{REST}\n\nWant me to scale it, e.g.\nadd two nodes?",
+                (REST, "Want me to scale it, e.g. add two nodes?"),
+            ),
         }
         for what, (rest, expected) in cases.items():
             with self.subTest(what):
@@ -337,6 +372,7 @@ class SendTest(unittest.TestCase):
         self.send(adapter)
         post = adapter.log[0][1]
         self.assertTrue(post["reply_broadcast"])
+        self.assertIs(post["unfurl_links"], False)
         self.assertEqual([block["type"] for block in post["blocks"]], ["rich_text", "container", "actions"])
 
     def test_a_closing_question_posts_after_the_fold(self):

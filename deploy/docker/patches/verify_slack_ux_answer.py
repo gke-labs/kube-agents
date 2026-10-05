@@ -19,8 +19,9 @@ Three things are checked:
 3. The adapter. ``SlackAdapter`` still has the members the runtime calls, each
    still accepting the call ``_post`` makes (:data:`CALL_SHAPES`), the ones it
    awaits still async, and still sets ``_bot_message_ts``; its module still
-   defines ``_slack_unfurl_kwargs(extra)``. The stub below supplies them, so
-   only this check ties them to upstream; a missing one, or one whose
+   defines ``_slack_unfurl_kwargs(extra)``. The stub below and this module's
+   own ``_slack_unfurl_kwargs`` supply them, the drive checking the post
+   carries what that helper returns, so only this check ties them to upstream; a missing one, or one whose
    signature drifted, raises inside the folder's ``send``, which falls back
    to the upstream send at runtime, folding nothing.
 
@@ -66,6 +67,8 @@ RUNTIME_ATTRIBUTE = "_bot_message_ts"
 #: The adapter module's link-preview helper, which the runtime reads from the adapter's module.
 MODULE_FUNCTION = "_slack_unfurl_kwargs"
 MODULE_FUNCTION_SHAPE = (1, ())
+#: What this module's own helper adds, so the drive sees the post carry it.
+UNFURL_MARK = {"unfurl_links": False}
 #: The one decorator a member may carry: it binds the call without ``self``.
 STATIC = "staticmethod"
 FLAG_ENV = "KAGE_SLACK_UX"
@@ -231,6 +234,11 @@ def _load_runtime(root: Path):
     return module
 
 
+def _slack_unfurl_kwargs(extra):
+    """The stub module's link-preview helper, found the way the runtime finds upstream's."""
+    return dict(UNFURL_MARK)
+
+
 class _StubAdapter:
     """The SlackAdapter surface the folder reaches, recording what it is asked to do."""
 
@@ -312,6 +320,8 @@ async def _drive(module, expected_fold: list[dict], expected_question: list[dict
         post = adapter.log[0][1]
         headline, fold = post["blocks"]
         bold = headline["elements"][0]["elements"]
+        if any(post.get(key) != value for key, value in UNFURL_MARK.items()):
+            raise _fail(f"the answer post did not carry {MODULE_FUNCTION}()'s settings: {post!r}")
         if post.get("thread_ts") != THREAD_TS or bold != [{"type": "text", "text": HEADLINE, "style": {"bold": True}}]:
             raise _fail(f"the answer post was {post!r}")
         if post.get("text") != MRKDWN_MARK + ANSWER or adapter._bot_message_ts != {POSTED_TS, THREAD_TS}:

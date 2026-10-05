@@ -77,8 +77,6 @@ FOLD_TEXT_MAX = 12000
 #: As ``slack_ux_incident``'s: the block types Slack has been seen to keep
 #: inside a collapsible ``container``.
 FOLD_CHILD_TYPES = frozenset({"header", "section", "rich_text"})
-#: A first line that is not prose: a heading, a list item or a fence.
-NOT_PROSE = re.compile(r"^\s*(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|`{3,}|~{3,})")
 #: What a plain-text headline would lose: a markdown link, a url, a Slack mention or link.
 LOSES_CONTENT = re.compile(r"\]\(|https?://|<[@#!]", re.IGNORECASE)
 #: Holds a code span's place while the rest of the headline is made plain.
@@ -88,11 +86,10 @@ MARKERS = ("**", "__", "*", "_")
 #: A bold label opening the answer ("**Memory check**: ..."): a phrase of more than one word,
 #: closed without a stop and followed by a colon or a dash. It is not a sentence, and the eval's
 #: ``answer_first`` fails it too; a one-word answer ("**No**: ...") is one.
-BOLD_LABEL = re.compile(r"^(\*\*|__)(?=\S)([^\n]*?\s[^\n]*?)(?<=[^\s.!?])\1[ \t]*[:\u2014\u2013]")
-#: A line that is not a prose sentence: a quote or a table row, besides :data:`NOT_PROSE`.
+#: The phrase stops at its own closer, so a later "**cpu**: 40%" on the line is not read as the label.
+BOLD_LABEL = re.compile(r"^(\*\*|__)(?=\S)((?:(?!\1)[^\n])*?\s(?:(?!\1)[^\n])*?)(?<=[^\s.!?])\1[ \t]*[:\u2014\u2013]")
+#: A quote or a table row: lines the presenter reads as text that are not a prose sentence either.
 NOT_PROSE_LINE = re.compile(r"^\s*[>|]")
-#: A line that ends its sentence, so the next line starts a new one.
-LINE_ENDS_SENTENCE = re.compile(r"[.!?:][*_`)\]\"']*\s*$")
 #: Upstream's per-post ``config.extra`` switches the folded post carries as well.
 REPLY_BROADCAST = "reply_broadcast"
 #: The Slack adapter module's link-preview helper, read from the adapter's own module.
@@ -102,6 +99,16 @@ UNFURL_KWARGS = "_slack_unfurl_kwargs"
 def enabled() -> bool:
     """Whether ``KAGE_SLACK_UX`` is on and the presenter is importable."""
     return _presenter is not None and _presenter.enabled()
+
+
+def _not_prose(line: str) -> bool:
+    """Whether ``line`` is a heading, a list item or a fence, as the presenter reads them, or a quote or a table row."""
+    return bool(
+        _presenter.HEADING.match(line)
+        or _presenter.LIST_MARKER.match(line)
+        or _presenter._opens_fence(line)
+        or NOT_PROSE_LINE.match(line)
+    )
 
 
 def _refuse(reason: str) -> None:
@@ -146,7 +153,7 @@ def split(answer: str) -> tuple[list[tuple[str, bool]], str] | None:
     if len(answer) > FOLD_TEXT_MAX:
         return _refuse(f"longer than {FOLD_TEXT_MAX} characters")
     opener = answer.lstrip("\n")
-    if NOT_PROSE.match(opener) or NOT_PROSE_LINE.match(opener):
+    if _not_prose(opener.partition("\n")[0]):
         return _refuse("it opens with a heading, a list item, a code fence, a quote or a table row")
     if BOLD_LABEL.match(opener):
         return _refuse("it opens with a bold label, not a sentence")
@@ -185,14 +192,12 @@ def trailing_question(rest: str) -> tuple[str, str]:
     """
     lines = rest.rstrip().split("\n")
     first = len(lines) - 1
-    # A soft-wrapped question starts on an earlier line of its paragraph: walk back to a line
-    # that ends a sentence, a blank line, or the start.
-    while first and lines[first - 1].strip() and not LINE_ENDS_SENTENCE.search(lines[first - 1]):
+    # A soft-wrapped question's next line starts mid-sentence, in lower case: the presenter's
+    # SENTENCE_END rule. Walk back over such lines; an evidence line above the question stays.
+    while first and lines[first - 1].strip() and lines[first].lstrip()[:1].islower():
         first -= 1
     question_lines = lines[first:]
-    if not question_lines[-1].endswith("?") or any(
-        NOT_PROSE.match(line) or NOT_PROSE_LINE.match(line) for line in question_lines
-    ):
+    if not question_lines[-1].endswith("?") or any(_not_prose(line) for line in question_lines):
         return rest, ""
     joined = " ".join(line.strip() for line in question_lines)
     starts = _presenter.sentence_starts(joined)
