@@ -11,7 +11,8 @@ Two things are checked:
    after its processing-start hook, ``send_final_ledgered`` brackets its send
    with ``begin`` and ``end``, ``SlackAdapter._maybe_blocks`` hands upstream's
    renamed body to ``maybe_blocks``, and ``_run_agent_queued_followup`` calls
-   ``drop``.
+   ``drop``, each importing the module and reading only names bound where
+   it runs (``patchlib.unbound``).
 2. The module, loaded by path: flag off a failure wake marks nothing; flag on,
    mock 06's reply to a ``gave_up`` wake's turn is drawn with its first
    sentence in bold and one choice button reading "check it there", a second
@@ -31,6 +32,8 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+
+import patchlib
 
 RUNTIME = "gateway/slack_ux_failure.py"
 FLAG_ENV = "KAGE_SLACK_UX"
@@ -84,9 +87,25 @@ def check_callers(root: Path) -> None:
             for stmt in ast.parse(text).body
         ):
             raise _fail(f"{rel} does not import {IMPORT_MODULE}.{IMPORT_NAME} as {ALIAS}")
+        # An anchor pins the text it replaces, not the names the inserted call reads.
+        tree = ast.parse(text)
+        for stmt in _calling_statements(tree):
+            unbound = patchlib.unbound(tree, stmt)
+            if unbound:
+                raise _fail(f"{rel} calls {ALIAS} with {', '.join(unbound)}, which nothing binds there")
     notifier = (root / NOTIFIER).read_text()
     if MOMENTS_LINE not in notifier or notifier.index(MOMENTS_LINE) > notifier.index(CALLS[NOTIFIER][0]):
         raise _fail("note_wake does not follow the moments note on the wake")
+
+
+def _calling_statements(tree: ast.Module) -> list[ast.stmt]:
+    """The simple statements in ``tree`` that call into :data:`ALIAS`."""
+    return [
+        stmt
+        for stmt in ast.walk(tree)
+        if isinstance(stmt, (ast.Expr, ast.Assign, ast.Return))
+        and any(isinstance(n, ast.Name) and n.id == ALIAS for n in ast.walk(stmt))
+    ]
 
 
 def _load_runtime(root: Path):

@@ -32,8 +32,8 @@ unchanged, question included.
 Which reply is the wake's: :func:`note_wake` marks the subscription's thread
 when a Slack wake carries ``blocked``, ``crashed``, ``timed_out`` or
 ``gave_up``, unless ``gateway/slack_ux_moments.py`` noted the question already
-posted (that wake is answered with ``[SILENT]``, so it clears the thread's mark
-instead). The wake's turn claims the mark when it starts (:func:`start`, or
+posted (that wake is answered with ``[SILENT]``, so it clears the mark its own
+card left instead). The wake's turn claims the mark when it starts (:func:`start`, or
 :func:`drop` for a follow-up drained from behind a running turn), and the next
 final reply sent for that turn takes the claim within :data:`MARK_TTL_SECONDS`.
 Hermes sends that reply under the wake's internal event, under the empty event
@@ -124,8 +124,8 @@ LOWERABLE = re.compile(r"^(?!I(?:'|$))[A-Z](?:[a-z]|$)")
 #: Slack's cap on a message's blocks; a reply already at it keeps its question as text.
 MESSAGE_BLOCKS_MAX = 50
 
-#: Marked threads, ``(chat_id, thread_id) -> (monotonic time, wall time)``.
-_marks: "OrderedDict[tuple[str, str], tuple[float, datetime]]" = OrderedDict()
+#: Marked threads, ``(chat_id, thread_id) -> (monotonic time, wall time, card id)``.
+_marks: "OrderedDict[tuple[str, str], tuple[float, datetime, str]]" = OrderedDict()
 #: Marks a queued wake carried to its follow-up's reply, ``(chat_id, thread_id) ->
 #: (mark time, when carried)``: taken under any event that arrived before the carry.
 _carried: "OrderedDict[tuple[str, str], tuple[float, datetime]]" = OrderedDict()
@@ -160,10 +160,14 @@ def note_wake(sub: dict, wake_kinds: Iterable[str], text: str) -> None:
         if not FAILURE_KINDS & set(wake_kinds or ()) or not enabled():
             return
         key = _key(sub.get("chat_id"), sub.get("thread_id"))
-        _marks.pop(key, None)
+        card = str(sub.get("task_id") or "")
         if _wake_note() in (text or ""):
+            # Only this card's own mark: a sibling's failure wake may still be queued.
+            if key in _marks and _marks[key][2] == card:
+                del _marks[key]
             return
-        _marks[key] = (time.monotonic(), datetime.now())
+        _marks.pop(key, None)
+        _marks[key] = (time.monotonic(), datetime.now(), card)
         while len(_marks) > MARKS_MAX:
             _marks.popitem(last=False)
     except Exception:
@@ -292,7 +296,7 @@ def present(content: str) -> tuple[str, str]:
     heading or fence does not continue it. A code span in it stays code, with
     the words on either side bolded and the span not (``**Couldn't find**
     `seeded-z`.``). The bold is left off when the first line opens with other
-    markup or a list marker, or the first sentence holds markup outside its code
+    markup, a heading or a list marker, or the first sentence holds markup outside its code
     spans, since a ``*`` inside would unpair. The offer is the last sentence when it is
     one yes/no question with no markup that fits a button, with the ``?``
     dropped and its first letter lowered unless that would change a word that
@@ -312,8 +316,8 @@ def present(content: str) -> tuple[str, str]:
         first = f"{first.rstrip()} {lines[taken].strip()}"
         taken += 1
     sentence, rest = _presenter._first_sentence(first)
-    strong = _bold(sentence) if sentence[:1].isalnum() or sentence[:1] == "`" else None
-    if strong and not _presenter.LIST_MARKER.match(lines[0]):
+    strong = _bold(sentence) if sentence else None
+    if strong and not (_presenter.LIST_MARKER.match(lines[0]) or _presenter.HEADING.match(lines[0])):
         bolded = indent + "\n".join([strong + (f" {rest}" if rest else "")] + lines[taken:])
     else:
         bolded = text

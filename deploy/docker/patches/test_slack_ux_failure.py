@@ -116,10 +116,18 @@ class PresentTest(unittest.TestCase):
             "2) Check the logs. Retry?",
             "Can't reach `api`'s pods. Retry?",
             "Lost `api`, then retried. Retry?",
+            "# A heading. Retry?",
         ):
             with self.subTest(reply=reply):
                 bolded, _ = runtime.present(reply)
                 self.assertEqual(bolded, reply)
+
+    def test_a_lead_opening_on_an_emoji_a_quote_or_a_bracket_is_bold(self):
+        for lead in ("\u26a0\ufe0f The check crashed.", '"seeded-z" is not a cluster.', "(Retrying) The pod is gone."):
+            with self.subTest(lead=lead):
+                self.assertEqual(
+                    runtime.present(f"{lead} Check it there?"), (f"**{lead}** Check it there?", "check it there")
+                )
 
     def test_a_code_span_in_the_lead_stays_code_and_the_words_around_it_are_bold(self):
         cases = {
@@ -341,6 +349,11 @@ class MarkTest(FlagOn):
         runtime.note_wake(SUB, {"blocked"}, WAKE + " " + slack_ux_moments.WAKE_NOTE)
         self.assertEqual(runtime._marks, {})
 
+    def test_a_sibling_wake_whose_question_is_posted_leaves_the_mark(self):
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        runtime.note_wake({**SUB, "task_id": "t_f2"}, {"blocked"}, WAKE + " " + slack_ux_moments.WAKE_NOTE)
+        self.assertEqual(len(_buttons(self.draw(_turn()))), 1)
+
     def test_the_mark_is_taken_once(self):
         runtime.note_wake(SUB, {"blocked"}, WAKE)
         self.draw(_turn())
@@ -458,6 +471,14 @@ class ApplyTest(unittest.TestCase):
                     verifier.check_callers(self.root)
                 self.assertIn("does not import gateway.slack_ux_failure", str(ctx.exception))
                 path.write_text(patched)
+
+    def test_the_verifier_refuses_a_call_reading_a_name_nothing_binds(self):
+        path = self.root / applier.RUN_TURN
+        path.write_text(path.read_text().replace("(self, turn_ctx, pending_event)", "(self, ctx, pending_event)"))
+        applier.apply(self.root)
+        with self.assertRaises(SystemExit) as ctx:
+            verifier.check_callers(self.root)
+        self.assertIn("turn_ctx", str(ctx.exception))
 
 
 if __name__ == "__main__":
