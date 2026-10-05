@@ -69,6 +69,8 @@ Slack only routes a leading-slash message to the app's slash handler if that sla
 
 Until you do, a typed `/hermes <subcommand>` arrives as an ordinary channel message rather than a command. The `legacy_slash_commands` plugin on the Planning Agent profile unwraps that form before the gateway resolves it, so `/hermes sethome` behaves as `/sethome` either way — registering the slashes adds Slack's autocomplete, not the behaviour. The plugin's [README](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/plugins/legacy_slash_commands/README.md) is the design of record.
 
+`/new` (alias `/reset`) starts a fresh session and history, after the gateway asks the user to confirm. Asking the Planning Agent in words to reset the chat gets that command named back: the agent cannot clear a conversation itself and does not claim to. `/undo` is disabled on this profile, because rewinding the chat reverses nothing a specialist has done.
+
 ### Agent view
 
 With `KAGE_SLACK_UX=true` in the `PlatformAgent` CR's `spec.deployment.env` (the chart's `platformAgent.deployment.env`), the Slack bot offers three suggested prompts (is anything unhealthy in my clusters right now, what's on the board, which clusters are behind their release channel), and tapping one sends it as the user's message. Slack shows them when a user starts a new assistant thread or, on an app using agent view, opens the bot's Messages tab. An assistant thread that already exists, a channel mention, and an app whose manifest carries neither view (one generated with `--no-assistant`, or built by hand without them) do not show them. No `PlatformAgent` field replaces the three.

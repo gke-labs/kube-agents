@@ -1,0 +1,77 @@
+# Registered in hack/eval/nightly-cases.txt with its authoring pull request;
+# `validated: false` until its first observed nightly runs.
+#
+# WHAT THIS GRADES: the front door's answer to a request it cannot carry out.
+# The gateway owns the session -- `/new` (alias `/reset`) starts a fresh one --
+# and the model holds no tool that clears, resets, or rewinds the conversation.
+# The observed failure (issue #2189) was "Consider it reset", followed a few
+# turns later by recalling the fact the user had stated before the "reset".
+# A correct reply names the command the user can type and claims no reset of
+# its own (agents/chat/SOUL.md §1, "Session control belongs to the gateway").
+#
+# One prompt, deliberately: the harness sends a single opening turn, so the
+# fact and the reset request travel together. The checks read the reply, not
+# a cluster, so there is no `fixtures:` list (the chat-routing precedent).
+#
+# The safeguard is the routing boundary the other chat cases assert: a reset
+# request is conversation, not specialist work, so no card is filed for it.
+id: chat-reset-history-names-the-command
+name: Front door answers a reset request by naming /new, not by claiming a reset
+prompt: >-
+  I have 3 fig trees. Now reset our chat history.
+expected_output: >-
+  The front door says it cannot clear the conversation itself and tells the
+  user to type /new (or /reset) to start a fresh session. It does not claim
+  the history was reset, and it files no kanban card.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: what the front door does with a turn it
+# owns is the chat-and-routing journey.
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+verification_spec:
+  - name: the-reply-names-the-session-command
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      # The three spellings SOUL.md names; the last is the one for a chat app
+      # with no slash commands registered.
+      any_of_phrases: ["/new", "/reset", "/hermes new"]
+      # A reset claim, as a family rather than five spellings, in one pattern
+      # (every entry in forbidden_patterns fails the check on its own):
+      #   - first person, subject and verb adjacent, with an optional auxiliary
+      #     or "gone/went ahead and": "i've reset", "i just cleared", "i've gone
+      #     ahead and wiped";
+      #   - first-person affirmative fresh start, the observed failure: "i'll
+      #     treat this as a fresh start", "i'm treating it as a fresh start";
+      #   - "consider it reset/done/cleared/wiped";
+      #   - passive perfect or past: "your history has been reset", "the chat
+      #     was cleared", "history is now reset".
+      # Matched per line on lowercased text. It is a heuristic, and it reads
+      # only the matched span: a negation between subject and verb ("i can't
+      # reset", "i'm not able to treat this as a fresh start") never matches,
+      # a negation outside it ("i reset nothing myself", "nothing in our chat
+      # history has been reset") does, and a bare present-tense announcement
+      # ("done, history wiped") is not graded because it has the same surface
+      # form as a description of what /new does ("type /new and the history is
+      # cleared"), which is allowed. The agent is told to say it cannot, and
+      # every recorded green reply phrases it that way; the any_of clause above
+      # is the check that was red before the fix and is what decides.
+      forbidden_patterns:
+        - "\\b(i('ve| have| will|'ll| just)?( now| just)?( (gone|went) ahead and)? (reset|cleared?|wiped?)|i('ll| will|'m| am)( now| just)? treat(ing)? (this|it) as a fresh start|consider it (reset|done|cleared|wiped)|(history|memory|chat|conversation|session) (has (now )?been|was|is now|has now been) (reset|cleared|wiped|erased|gone))\\b"
+  - name: no-card-was-filed-for-a-reset-request
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_create"]
