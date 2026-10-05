@@ -14,7 +14,6 @@ flag off, or for any platform but Slack, the two must be identical.
 """
 
 import asyncio
-import contextlib
 import importlib
 import os
 import shutil
@@ -532,7 +531,6 @@ def _run(coro):
 
 
 _live_roots = []
-_known_root_dirs = set()
 
 
 class _Root:
@@ -541,7 +539,6 @@ class _Root:
     def __init__(self):
         self._cleaned = False
         self.dir = Path(tempfile.mkdtemp())
-        _known_root_dirs.add(self.dir.resolve())
         for relative, text in FIXTURES.items():
             path = self.dir / relative
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -558,36 +555,16 @@ class _Root:
         else:
             self._saved_modules = {
                 m: sys.modules[m]
-                for m in list(sys.modules)
+                for m in sys.modules
                 if m.partition(".")[0] in ("gateway", "agent")
-                and not self._is_root_module(sys.modules[m])
             }
         _live_roots.append(self)
         self._forget_gateway()
 
     @staticmethod
-    def _is_root_module(mod):
-        f = getattr(mod, "__file__", None)
-        if f:
-            with contextlib.suppress(OSError, ValueError, TypeError):
-                mod_path = Path(f).resolve()
-                for root_dir in _known_root_dirs:
-                    if root_dir == mod_path or root_dir in mod_path.parents:
-                        return True
-        paths = getattr(mod, "__path__", None)
-        if paths:
-            with contextlib.suppress(OSError, ValueError, TypeError):
-                for p in paths:
-                    pkg_path = Path(p).resolve()
-                    for root_dir in _known_root_dirs:
-                        if root_dir == pkg_path or root_dir in pkg_path.parents:
-                            return True
-        return False
-
-    @staticmethod
     def _forget_gateway():
-        for module in [m for m in list(sys.modules) if m.partition(".")[0] in ("gateway", "agent")]:
-            sys.modules.pop(module, None)
+        for module in [m for m in sys.modules if m.partition(".")[0] in ("gateway", "agent")]:
+            sys.modules.pop(module)
 
     def load(self, relative, name):
         """Exec one (possibly patched) fixture with ``gateway`` importable."""
@@ -599,17 +576,11 @@ class _Root:
         if self._cleaned:
             return
         self._cleaned = True
-        if self in _live_roots:
-            _live_roots.remove(self)
-        try:
-            sys.path.remove(str(self.dir))
-        except ValueError:
-            pass
+        _live_roots.remove(self)
+        sys.path.remove(str(self.dir))
         self._forget_gateway()
         if not _live_roots:
-            for m, mod in self._saved_modules.items():
-                if not self._is_root_module(mod):
-                    sys.modules[m] = mod
+            sys.modules.update(self._saved_modules)
         shutil.rmtree(self.dir, ignore_errors=True)
 
 
@@ -1359,8 +1330,14 @@ class RootTest(unittest.TestCase):
 
     def test_overlapping_roots_fifo_cleanup_does_not_leak_stale_modules(self):
         # When two roots overlap and clean up out-of-order (FIFO), the inner root
-        # must not snapshot the outer root's imports as pre-existing stubs, and
-        # tearing down the outer root first must not leave stale deleted paths in sys.modules.
+        # must inherit the outer root's baseline rather than snapshot the outer
+        # root's imports, and tearing down the outer root first must not leave
+        # stale deleted paths in sys.modules or lose the baseline on the way out.
+        stub = types.ModuleType("gateway.preexisting")
+        patcher = mock.patch.dict(sys.modules, {"gateway.preexisting": stub})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
         outer = _Root()
         self.addCleanup(outer.cleanup)
         outer_delivery = outer.load(applier.DELIVERY, "cron.scheduler_delivery")
@@ -1377,10 +1354,13 @@ class RootTest(unittest.TestCase):
 
         # FIFO teardown: clean outer first, then inner
         outer.cleanup()
-        self.assertNotIn("gateway.platforms.base", inner._saved_modules)
+        self.assertIsNot(inner._saved_modules.get("gateway.platforms.base"), outer_mod)
+        self.assertIs(inner._saved_modules.get("gateway.preexisting"), stub)
 
         inner.cleanup()
-        self.assertNotIn("gateway.platforms.base", sys.modules)
+        self.assertIsNot(sys.modules.get("gateway.platforms.base"), outer_mod)
+        self.assertIsNot(sys.modules.get("gateway.platforms.base"), inner_mod)
+        self.assertIs(sys.modules.get("gateway.preexisting"), stub)
 
 
 if __name__ == "__main__":
