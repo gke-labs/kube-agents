@@ -11,10 +11,15 @@ The plan (:func:`plan_blocks`): one message per thread holding a Block Kit
 ``details`` are the card's progress notes as steps, the last one open while
 the card runs. Slack's task statuses are ``pending``, ``in_progress``,
 ``complete`` and ``error`` and nothing else, so a card waiting on the user is
-``pending``. The plan carries no Stop button yet: ``/stop`` interrupts only
-the Planning Agent's turn and would leave the cards running. :func:`plan_text`
-is the same plan as plain text, for the message's ``text`` field, with ``&``,
-``<`` and ``>`` escaped since Slack parses that field.
+``pending``. A row's title says where the card is (:func:`row_title`): its
+latest note while it runs (with a step count past one) or after it failed,
+its one-line result once complete, "waiting on you" while pending, and the
+card's title when there is none of those; in a plan of several rows it leads
+with the card's title, so the rows stay told apart. The plan carries no Stop
+button yet: ``/stop`` interrupts only the Planning Agent's turn and would leave
+the cards running. :func:`plan_text` is the same plan as plain text, for the
+message's ``text`` field, with ``&``, ``<`` and ``>`` escaped since Slack
+parses that field.
 
 The session (:func:`session_status`, :func:`session_title`):
 ``agents.sessions.setStatus`` accepts ``processing``, ``suspended`` or
@@ -142,6 +147,10 @@ ROW_MARKERS = {
     TASK_ERROR: "✗",
 }
 NOTE_SEPARATOR = " · "
+#: A running row's step count, after its latest note, once it has more than one.
+STEP_COUNT = "step {count} ▸"
+#: A pending row's title: the card asked the user something, or its review waits on them.
+WAITING_ON_YOU = "waiting on you"
 #: What the text fallback escapes, ``&`` first, as Hermes's ``format_message``
 #: does: Slack parses a message's ``text``, so a card title or note holding
 #: ``<!here>`` would broadcast and ``<url|label>`` would post a link under any label.
@@ -152,6 +161,9 @@ TEXT_ESCAPES = (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
 #: bound on rows so a runaway fan-out cannot outgrow the message.
 PLAN_TITLE_MAX = 256
 ROW_TITLE_MAX = 256
+#: A card's title ahead of its state in a plan of several, so a long one
+#: cannot crowd the state out of the row.
+ROW_NAME_MAX = 80
 STEPS_MAX = 6
 ROWS_MAX = 20
 STEP_TEXT_MAX = 300
@@ -257,7 +269,7 @@ def _steps(lines: Sequence[str], status: str) -> list[str]:
 
 
 def task_card(task_id: str, title: str, lines: Sequence[str], status: str) -> dict:
-    """One plan row: the card's title and status, its notes as steps in ``details``."""
+    """One plan row: its title and status, the card's notes as steps in ``details``."""
     card: dict = {
         "type": "task_card",
         "task_id": str(task_id),
@@ -282,6 +294,42 @@ def task_card(task_id: str, title: str, lines: Sequence[str], status: str) -> di
     return card
 
 
+def _lead(row: Any) -> tuple[str, str]:
+    """Where the card is and its step count, for its row's title; ``""`` for either it lacks.
+
+    The row's ``note`` says which line is where the card is, so a line that
+    only moved the card is never taken for it, whatever its wording.
+    """
+    if row.status == TASK_PENDING:
+        return WAITING_ON_YOU, ""
+    if row.status == TASK_COMPLETE:
+        return str(getattr(row, "result", "") or "").strip(), ""
+    note = _clip(str(getattr(row, "note", "") or "").strip(), STEP_TEXT_MAX)
+    count = int(getattr(row, "steps", 0) or 0)
+    if note and row.status == TASK_RUNNING and count > 1:
+        return note, STEP_COUNT.format(count=count)
+    return note, ""
+
+
+def row_title(row: Any, several: bool = False) -> str:
+    """A row's title: where its card is, after the card's title in a plan of ``several`` rows.
+
+    A step count is kept whole when the note is clipped, and the card's title
+    is clipped to :data:`ROW_NAME_MAX` ahead of it. With nothing to say the row
+    shows the card's title, or its id when that is blank.
+    """
+    name = str(row.title or "").strip() or str(row.task_id)
+    lead, count = _lead(row)
+    if not lead:
+        return _clip(name, ROW_TITLE_MAX)
+    if several:
+        lead = _clip(name, ROW_NAME_MAX) + NOTE_SEPARATOR + lead
+    if not count:
+        return _clip(lead, ROW_TITLE_MAX)
+    tail = NOTE_SEPARATOR + count
+    return _clip(lead, ROW_TITLE_MAX - len(tail)) + tail
+
+
 def plan_title(title: str | None, rows: Sequence[Any]) -> str:
     """The plan's title: the one given, else the one card's title, else a count."""
     given = str(title or "").strip()
@@ -301,29 +349,30 @@ def plan_blocks(title: str | None, rows: Sequence[Any]) -> list[dict]:
     """The status message's blocks: one ``plan``.
 
     ``rows`` are objects with ``task_id``, ``title``, ``lines`` and ``status``,
-    in the order the cards first reported; past :data:`ROWS_MAX` the oldest
-    are dropped.
+    and optionally ``result`` (a completed card's one line), ``steps`` (how
+    many notes the card has given, past the :data:`STEPS_MAX` kept, moves not
+    counted) and ``note`` (the line a running or failed row's title shows;
+    without it the row shows the card's title), in the
+    order the cards first reported; past :data:`ROWS_MAX` the oldest are dropped.
     """
     rows = list(rows)[-ROWS_MAX:]
+    several = len(rows) > 1
     return [
         {
             "type": "plan",
             "title": plan_title(title, rows),
-            "tasks": [task_card(r.task_id, r.title, r.lines, r.status) for r in rows],
+            "tasks": [task_card(r.task_id, row_title(r, several), r.lines, r.status) for r in rows],
         }
     ]
 
 
 def plan_text(title: str | None, rows: Sequence[Any]) -> str:
-    """The plan as plain lines: the title, then a marker, title and latest note per row, escaped."""
+    """The plan as plain lines: the title, then a marker and :func:`row_title` per row, escaped."""
     rows = list(rows)[-ROWS_MAX:]
+    several = len(rows) > 1
     out = [plan_title(title, rows)]
     for row in rows:
-        line = f"{ROW_MARKERS.get(row.status, STEP_OPEN)} {str(row.title or '').strip() or row.task_id}"
-        notes = _notes(row.lines)
-        if notes:
-            line += NOTE_SEPARATOR + notes[-1]
-        out.append(line)
+        out.append(f"{ROW_MARKERS.get(row.status, STEP_OPEN)} {row_title(row, several)}")
     text = "\n".join(out)
     for raw, escaped in TEXT_ESCAPES:
         text = text.replace(raw, escaped)

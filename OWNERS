@@ -1,3 +1,10 @@
+# Prow reads this file for both merge labels. `approvers` can set `approved`;
+# `approvers` and `reviewers` can set `lgtm`, and Prow sets it for nobody else:
+# the Prow configuration for this repository (prow/oss/plugins.yaml in
+# GoogleCloudPlatform/oss-test-infra) lists it under skip_collaborators, so
+# being a collaborator or an organisation member is not enough. Machine
+# accounts are never listed here. Every change needs one person other than its
+# author (docs/pull-request-workflow.md, "How a change merges").
 approvers:
 - AntonTyb
 - bnaylor
@@ -9,3 +16,30 @@ approvers:
 - mplakhtiy
 - toshiowang
 - mrusmanabdullah
+# Everyone who may set `lgtm`. The approvers are repeated on purpose: for a
+# change to the two presubmit roster files, Prow's approver walk stops at
+# hack/OWNERS (no_parent_owners) while its reviewer walk falls through to this
+# list, because that file names no reviewers. Without the repeat a root
+# approver could not lgtm a roster-only change. The other names are people
+# who review here and may give `lgtm` on their own; a root approver adds or
+# removes one by pull request, and scripts/test_request_reviewers.py pins the
+# repeat.
+reviewers:
+- AntonTyb
+- bnaylor
+- bradhoekstra
+- dshnayder
+- eLeontev
+- fatoshoti
+- fkc1e100
+- Fuxiao-Gao
+- haoxuw
+- jayantid
+- justinsb
+- kirill-kosov
+- lapis2002
+- mastersingh24
+- mplakhtiy
+- mrusmanabdullah
+- stalhaali
+- toshiowang
