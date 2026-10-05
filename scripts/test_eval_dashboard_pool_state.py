@@ -201,6 +201,14 @@ class OneProject(ScanHarness):
         self.assertEqual(pool_state.unread_units(doc), 0, "a GCP-blind project is blind, not partial")
         self.assertIn("PERMISSION_DENIED", pool_state.not_checked_reason(doc) or "")
 
+    def test_passes_leases_is_the_verifiers_classification(self):
+        # health.py words the pool-drift advice from this: a finding here
+        # reds no leased run, so a 403 on the project is the change's.
+        self.assertTrue(pool_state.passes_leases("gke/host-otel-scope"))
+        self.assertFalse(pool_state.passes_leases(FINDING))
+        self.assertFalse(pool_state.passes_leases("gke/cluster/seeded-b"))
+        self.assertEqual(frozenset(f for f in (FINDING, "gke/host-otel-scope", "gke/cluster/seeded-b") if pool_state.passes_leases(f)), verifier.LEASE_SILENT_FINDINGS)
+
     def test_the_stub_exits_the_way_the_verifier_does(self):
         # The fixtures' exit codes sit on the check records; the stub must
         # exit with them or the tests below never see a non-zero verifier.

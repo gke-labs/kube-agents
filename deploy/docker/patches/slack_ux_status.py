@@ -65,8 +65,8 @@ answered there runs on it again: it becomes the thread's plan once more, or,
 beside a newer plan, holds ``processing`` for another hold. Past
 :data:`LAPSED_PER_THREAD` a thread drops a set-aside plan that is quiet and
 has no card waiting first. A set-aside plan with no card waiting on the user
-or given up is dropped once :data:`SET_ASIDE_MAX_SECONDS` pass after its last
-touch before it was set aside, or after a card on it resumed, its session sent, so a rolling card or running row whose
+or given up is dropped :data:`SET_ASIDE_MAX_SECONDS` after it was set aside,
+or after a card on it resumed, its session sent, so a rolling card or running row whose
 terminal event was lost does not keep it for good. A plan evicted at
 :data:`PLANS_MAX`, current or set
 aside, has its session sent again on the way out, since nothing else would;
@@ -130,8 +130,8 @@ SESSION_REFRESH_SECONDS = 60.0
 #: reach no one.
 PLAN_HOLD_SECONDS = 1800.0
 
-#: How long a set-aside plan is kept after its last touch before it was set
-#: aside, or after a card on it resumed, when nothing on it waits on a person:
+#: How long a set-aside plan is kept after it was set aside, or after a card
+#: on it resumed, when nothing on it waits on a person:
 #: no card waiting on the user and none that gave up. Its running rows and rolling cards lost their terminal events, or
 #: their cards have been quiet this long; well past a card's silent stretches,
 #: so a late event almost always still finds its row.
@@ -670,9 +670,12 @@ async def _settle_lapsed(
             old.rolling.discard(card)
         row = old.rows.get(card)
         if row is not None and _move(row, kind):
-            await _render(adapter, key, old)
             if row.status == _status.TASK_RUNNING:
+                # Before the render's await, as in deliver_row: an expiry due
+                # during it must not drop the plan the card resumes on.
+                old.touched = time.monotonic()
                 resumed = old
+            await _render(adapter, key, old)
         elif not (parked or unrolled):
             continue
         elif card in old.rolling and card not in old.waiting:
@@ -794,6 +797,9 @@ async def deliver_row(
     row.lines = [*row.lines, line][-_status.STEPS_MAX:]
     row.status = _status.TASK_RUNNING
     row.last_event_id = max(row.last_event_id, event_id)
+    # Before the render's await, so a lapse due during it sees the note and
+    # does not set the plan aside under it.
+    plan.touched = time.monotonic()
     if not await _render(adapter, key, plan):
         if created:
             # Never shown, so no event could settle it: the card is rolling now.
@@ -804,7 +810,6 @@ async def deliver_row(
         if plan.ts:
             await _session(adapter, key, plan)
         return False
-    plan.touched = time.monotonic()
     _arm(adapter, key, plan)
     await _session(adapter, key, plan)
     return True

@@ -2419,7 +2419,9 @@ OTHER_FINDING = "apis/cloudkms.googleapis.com"
 FAILED_FINDING = "iam/failed"
 GKE_FAILED_FINDING = "gke_and_state/failed"
 GKE_FINDING = "gke/cluster/seeded-b"
-FINDING_CHECK = {FINDING: "iam", OTHER_FINDING: "project_and_apis", FAILED_FINDING: "iam", GKE_FAILED_FINDING: "gke_and_state", GKE_FINDING: "gke_and_state"}
+# The one finding a leased run passes with (the verifier's LEASE_SILENT_FINDINGS).
+SILENT_FINDING = "gke/host-otel-scope"
+FINDING_CHECK = {FINDING: "iam", OTHER_FINDING: "project_and_apis", FAILED_FINDING: "iam", GKE_FAILED_FINDING: "gke_and_state", GKE_FINDING: "gke_and_state", SILENT_FINDING: "gke_and_state"}
 FINDING_DETAIL = "The platform agent GSA is missing roles/serviceusage.serviceUsageConsumer on {project}"
 FINDING_REPAIR = 'gcloud projects add-iam-policy-binding {project} --member="serviceAccount:kubeagents-platform-gsa@{project}.iam.gserviceaccount.com" --role=roles/serviceusage.serviceUsageConsumer'
 POOL_BLIND_REASON = "Could not describe kube-agents-evals-1, so neither it nor anything derived from its project number was checked: PERMISSION_DENIED"
@@ -2502,6 +2504,70 @@ class PoolDrift(unittest.TestCase):
         self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "pool_drift"))
         self.assertEqual(result["cause"], f"pool drift: {FINDING} on 3 pool project(s)")
         self.assertEqual(self.judge(pool_scan(drifted={project(i): [FINDING] for i in (1, 2)}))["state"], "GREEN")
+
+    def test_a_finding_a_leased_run_passes_with_gets_the_opposite_advice(self):
+        # A host cluster without the managed OpenTelemetry scope serves its
+        # lease and only its traces are missing, so the 403 sentence would
+        # send a pull request's own red to the pool for as long as the
+        # repair takes (27 of 28 projects when the check landed).
+        three = {project(i): [SILENT_FINDING] for i in (1, 2, 3)}
+        result = self.judge(pool_scan(drifted=three))
+        self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "pool_drift"))
+        self.assertEqual(result["cause"], f"pool drift: {SILENT_FINDING} on 3 pool project(s)")
+        self.assertEqual(result["incident"]["passes_leases"], [SILENT_FINDING])
+        self.assertEqual(result["pool_state"]["passes_leases"], [SILENT_FINDING])
+        self.assertEqual((result["incident"]["reds_runs"], result["incident"]["reds_runs_projects"]), ([], []))
+        self.assertEqual((result["pool_state"]["reds_runs"], result["pool_state"]["reds_runs_projects"]), ([], []))
+        self.assertEqual(
+            result["advice"],
+            f"No run reds from {SILENT_FINDING} on {project(1)}, {project(2)}, {project(3)}: an install there passes its lease with that gap,"
+            " so a 403 or a missing-resource red on one of them is your change's to read, not the pool's."
+            " The pool owner's repair is in pool-state.json per project; nothing on your side waits for it.",
+        )
+        self.assertNotIn("not your change", result["advice"])
+        # The repair still travels with the incident: the pool is drifted.
+        self.assertEqual(result["incident"]["repairs"][project(1)], {SILENT_FINDING: FINDING_REPAIR.format(project=project(1))})
+
+    def test_a_finding_that_reds_runs_beside_one_that_does_not_keeps_the_403_advice_on_its_own_projects(self):
+        drifted = {project(1): [FINDING, SILENT_FINDING], project(2): [FINDING], project(3): [FINDING]}
+        drifted.update({project(i): [SILENT_FINDING] for i in (4, 5, 6)})
+        result = self.judge(pool_scan(drifted=drifted))
+        self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "pool_drift"))
+        self.assertEqual(result["incident"]["roles"], [SILENT_FINDING, FINDING])
+        self.assertEqual(result["incident"]["passes_leases"], [SILENT_FINDING])
+        # The split is carried once, here, for every renderer: the findings
+        # a leased run reds on and the projects one of them is on, in the
+        # incident (the firing ones) and the pool_state block (every drifted
+        # project this scan).
+        self.assertEqual((result["incident"]["reds_runs"], result["incident"]["reds_runs_projects"]), ([FINDING], [project(1), project(2), project(3)]))
+        self.assertEqual((result["pool_state"]["reds_runs"], result["pool_state"]["reds_runs_projects"]), ([FINDING], [project(1), project(2), project(3)]))
+        self.assertEqual(health.pool_drift_split(result["incident"]), ([FINDING], [SILENT_FINDING], [project(1), project(2), project(3)]))
+        advice = result["advice"]
+        self.assertEqual(
+            advice,
+            f"A 403 or a missing-resource red from a run that leased {project(1)}, {project(2)}, {project(3)} is the pool project's shape, not your change"
+            f" ({FINDING}); retest once the pool owner has run the repair, which pool-state.json names per project for every named finding."
+            f" {SILENT_FINDING} reds no run: an install passes its lease with that gap, so a red on a project with only that finding is yours to read.",
+        )
+        # The 403 sentence names the projects the loud finding is on, not the six.
+        self.assertNotIn(project(4), advice)
+
+    def test_a_pool_finding_that_reds_runs_lists_nothing_under_passes_leases(self):
+        result = self.judge(pool_scan(drifted={project(1): [FINDING]}, previous={project(1): [FINDING]}))
+        self.assertEqual((result["incident"]["passes_leases"], result["pool_state"]["passes_leases"]), ([], []))
+        self.assertEqual((result["incident"]["reds_runs"], result["incident"]["reds_runs_projects"]), ([FINDING], [project(1)]))
+
+    def test_an_incident_from_before_the_split_was_carried_reads_every_finding_as_one_a_run_reds_on(self):
+        # A held incident is the previous tick's document; one written before
+        # the split was carried has no classification, and the advice for it
+        # is the one from before the split, on every project.
+        incident = {"roles": [FINDING], "projects": [project(1), project(2)], "drift": {}}
+        self.assertEqual(health.pool_drift_split(incident), ([FINDING], [], [project(1), project(2)]))
+        self.assertEqual(
+            health.advice_for("DEGRADED", "pool_drift", [], None, {}, incident=incident),
+            f"A 403 or a missing-resource red from a run that leased {project(1)}, {project(2)} is the pool project's shape, not your change"
+            f" ({FINDING}); retest once the pool owner has run the repair, which pool-state.json names per project for every named finding.",
+        )
 
     def test_ranked_below_fixture_drift_and_every_run_based_condition(self):
         both = self.judge(pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)}), fleet=scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}))
