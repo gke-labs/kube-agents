@@ -947,16 +947,9 @@ class SessionKv(Base):
     def test_calls_carry_the_bearer_token_and_go_to_loopback(self):
         seen = {}
 
-        class Response(io.BytesIO):
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_):
-                return False
-
         def urlopen(request, timeout):
             seen.update(url=request.full_url, method=request.get_method(), auth=request.get_header("Authorization"), body=request.data, timeout=timeout)
-            return Response(b'{"status": "injected"}')
+            return io.BytesIO(b'{"status": "injected"}')
 
         with patch.dict(os.environ, {stall_watch.SESSION_KV_AUTH_ENV: "tok"}), patch.object(stall_watch.urllib.request, "urlopen", urlopen):
             self.assertEqual(REAL_SESSION_KV("/sessions/s/inject", {"message": "{}"}), {"status": "injected"})
@@ -965,21 +958,16 @@ class SessionKv(Base):
         self.assertEqual(seen["timeout"], stall_watch.SESSION_KV_TIMEOUT_SECONDS)
 
     def test_an_answer_that_is_not_a_json_object_is_a_refusal_not_a_crash(self):
-        class Response(io.BytesIO):
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_):
-                return False
-
-        with patch.object(stall_watch.urllib.request, "urlopen", lambda request, timeout: Response(b"null")):
+        with patch.object(stall_watch.urllib.request, "urlopen", lambda request, timeout: io.BytesIO(b"null")):
             with self.assertRaises(ValueError):
                 REAL_SESSION_KV(stall_watch.HEALTHZ_PATH)
             with patch.object(stall_watch, "session_kv", REAL_SESSION_KV):
                 lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
         self.assertEqual(len(lines), 1)
         self.assertTrue(lines[0].startswith(stall_watch.INJECT_FAILED_PREFIX), lines[0])
+        self.assertIn("answer could not be read", lines[0])
         self.assertIn("not a JSON object", lines[0])
+        self.assertNotIn("could not be reached", lines[0])
 
     def test_the_board_is_the_one_hermes_resolves(self):
         # hermes_cli.kanban has no kanban_db_path; importing it from there fell

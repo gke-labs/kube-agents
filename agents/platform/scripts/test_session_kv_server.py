@@ -4221,9 +4221,13 @@ class TestStallInject(unittest.TestCase):
         def row(obj, heuristic, detail, stalled_for):
             return {"object": obj, "namespace": "checkout", "heuristic": heuristic, "detail": detail, "stalled_for": stalled_for}
 
+        # Longer than either side's limit: the watch must cut it to a length
+        # the route keeps rather than drops.
+        long_name = "Job/" + "j" * session_kv_server.DRIFT_MAX_FIELD_CHARS
         rows = [
             row("Deployment/checkout-api", "dangling-reference", "envFrom -> ConfigMap/x not found", "26m"),
             row("Gateway/edge", "stale-condition", "Programmed=False", "6h11m"),
+            row(long_name, "stale-condition", "Complete=False", "26m"),
         ]
         payload = stall_watch.stall_payload("proj", "c", "us-central1", "checkout", "cluster-proj-c-us-central1", rows, "2026-10-02T12:30:00+00:00")
         response = self.client.post(
@@ -4234,6 +4238,8 @@ class TestStallInject(unittest.TestCase):
         card = session_kv_server._stall_task_body(delivered)
         self.assertIn("- Deployment/checkout-api: dangling-reference (26m)", card)
         self.assertIn("- Gateway/edge: stale-condition (6h11m)", card)
+        self.assertIn(f"- {long_name[: session_kv_server.DRIFT_MAX_FIELD_CHARS]}: stale-condition (26m)", card)
+        self.assertEqual(stall_watch.MAX_NAME_CHARS, session_kv_server.DRIFT_MAX_FIELD_CHARS)
         self.assertIn("`assignee`: `cluster-proj-c-us-central1`", session_kv_server._build_agent_query(delivered))
         with sqlite3.connect(temp_db_path) as conn:
             count = conn.execute("SELECT COUNT(*) FROM intercepted_events WHERE reason = ?", (session_kv_server.STALL_LEDGER_REASON,)).fetchone()[0]

@@ -1058,7 +1058,9 @@ def open_session() -> str:
         session_id = session_kv(SESSIONS_PATH, method="POST").get(SESSION_ID_KEY)
     except urllib.error.HTTPError as exc:
         raise AlertRefused(f"the Session KV server answered with an error: {exc}") from exc
-    except (OSError, ValueError) as exc:  # URLError is an OSError
+    except ValueError as exc:  # JSONDecodeError and UnicodeDecodeError are ValueErrors
+        raise AlertRefused(f"the Session KV server's answer could not be read: {exc}") from exc
+    except OSError as exc:  # URLError is an OSError
         raise AlertRefused(f"the Session KV server could not be reached: {exc}") from exc
     if not session_id:
         raise AlertRefused("the Session KV server returned no session id")
