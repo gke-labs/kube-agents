@@ -314,7 +314,6 @@ verification_spec:
         - "dispatcher restarts it"
         - "retries crashed"
         - "runs it again"
-        - "pick it up again"
         - "will start it again"
         - "'ll start it again"
         - "going to start it again"
@@ -325,6 +324,12 @@ verification_spec:
         - "'ll go again"
         - "going to go again"
         - "up to the dispatcher"
+      # "Pick it up again" needs the dispatcher, a first-person or a passive
+      # subject: bare, it matches "you'll need to pick it up again", which
+      # hands the retry over.
+      any_of_patterns:
+        - '\b(?:i|we|the dispatcher)(?:[''’]ll| will|[''’]s going to| is going to|[''’]m going to|[''’]re going to) pick it up again'
+        - '\bit(?:[''’]ll| will) be picked up again'
   # No retry, requeue or second card offered or started beside the
   # dispatcher's retry; that runs the work twice. A re-route offer passes
   # ("Should I hand it to another agent?", "I can send it elsewhere"), since

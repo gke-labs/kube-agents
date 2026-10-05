@@ -4278,6 +4278,8 @@ def _report_misses(case: Path, final_message: str) -> list[str]:
                 "Status: retrying.",
                 "The dispatcher retries automatically, so there's nothing to do.",
                 "The dispatcher retries failed workers automatically.",
+                "The dispatcher will pick it up again.",
+                "It'll be picked up again shortly.",
             )
         ),
         # SOUL step 5 forbids a retry offer, not a re-route one, so this passes.
@@ -4516,6 +4518,8 @@ def test_the_retry_objectives_pass_a_reply_that_says_it_is_retried(final_message
                 "It needs a new attempt.",
                 "Give it another go.",
                 "Crashed cards usually get another go, except this one, sadly.",
+                "You'll need to pick it up again.",
+                "Someone will have to pick it up again.",
             )
         ),
         # A hedge or a bare denial states no retry and calls it final.
@@ -5053,6 +5057,7 @@ _SAYS_STOPPED = "the-reply-says-it-stopped"
         "It timed out again and nothing is retrying it. Want me to run it again?",
         "It timed out on every attempt, so it won't rerun. Run it again with more time?",
         "It timed out and won't be tried again. Retry it with a narrower scope?",
+        "It timed out on its final try and won't be retried. Run it again with more time?",
         "Nothing is retrying it automatically. Run it again with a longer limit?",
         "Nothing retries it automatically now. Re-run it?",
         # A negation that reaches the verb through "be" or "going to":
@@ -5119,6 +5124,8 @@ def test_the_final_attempt_objectives_pass_a_reply_that_says_it_stopped(final_me
         ("The audit stopped the check on invoice-renderer.", [_SAYS_STOPPED]),
         ("The dispatcher keeps retrying it but won't retry forever.", [_SAYS_STOPPED]),
         ("It won't retry indefinitely.", [_SAYS_STOPPED]),
+        ("It won't be retried indefinitely.", [_SAYS_STOPPED]),
+        ("The dispatcher keeps at it; it won't be retried forever.", [_SAYS_STOPPED]),
         # main's recorded replies to the final-attempt wake, verbatim:
         # main-37c6b216, run_20261002_025946_683943
         (
