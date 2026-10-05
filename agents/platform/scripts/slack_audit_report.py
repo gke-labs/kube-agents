@@ -597,9 +597,19 @@ def _unreached(parsed: AuditReport) -> str:
     return GAP_MARK + gap if gap else ""
 
 
+def _untagged(title: str) -> str:
+    """`title` without a trailing "new" tag of its own, which only the marker may add."""
+    tag = NEW_TAG.strip()
+    title = title.rstrip()
+    while title.endswith(tag):
+        title = title[: -len(tag)].rstrip()
+    return title
+
+
 def _row(finding: Finding) -> dict:
     tag = NEW_TAG if finding.new else ""
-    return {"severity": finding.severity, "text": _balanced_clip(_row_text(finding.title), FINDING_ROW_MAX - len(tag)) + tag}
+    text = _untagged(_row_text(finding.title))
+    return {"severity": finding.severity, "text": _balanced_clip(text, FINDING_ROW_MAX - len(tag)) + tag}
 
 
 def _card(parsed: AuditReport) -> Card:

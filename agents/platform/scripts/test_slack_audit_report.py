@@ -192,6 +192,14 @@ class HeadlineFromIssueTest(unittest.TestCase):
         body = BODY.replace("- **Where:** `seeded-a` — `x`\n", "- **Where:** `seeded-a` — `x`\n\n<!-- finding-new -->\n", 1)
         self.assertNotIn("_new_", sar.headline_from_issue(dict(ISSUE, body=body), REF, REPORT))
 
+    def test_a_title_cannot_carry_the_tag_itself(self):
+        body = BODY.replace(
+            "seeded-c: a ClusterRole grants `*` on secrets",
+            "seeded-c: a ClusterRole grants `*` on secrets · _new_ · _new_ ",
+        )
+        lines = sar.headline_from_issue(dict(ISSUE, body=body), REF, REPORT).splitlines()
+        self.assertEqual(lines[2], "`critical` seeded-c: a ClusterRole grants `*` on secrets")
+
     def test_the_tag_survives_a_title_clipped_to_the_row(self):
         title = "x" * 400
         body = "### Critical (1)\n\n" + finding(title, "long", new=True)

@@ -2371,6 +2371,40 @@ def report_finding_titles(envelope: dict | None) -> dict[str, str]:
     }
 
 
+def report_filed(envelope: dict | None) -> tuple[set[str], set[str]] | None:
+    """(every finding id, every skipped cluster) the stored run filed, or None.
+
+    Wider than the body's hidden block, which names only what the body
+    rendered: a finding the budget cut, a posture withheld for want of a
+    search, and one in a carried ledger document were all filed. A finding on
+    a cluster that run skipped was not looked for, so is unknown rather than
+    new. None without a stored document, as for a memory seeded from the
+    issue body, which cannot say what the body left out.
+    """
+    envelope = envelope or {}
+    documents = [
+        envelope.get(key)
+        for key in ("document", "ledger_document")
+        if isinstance(envelope.get(key), dict)
+    ]
+    if not documents:
+        return None
+    ids: set[str] = set()
+    skipped: set[str] = set()
+    for document in documents:
+        findings = document.get("findings")
+        filed = (findings if isinstance(findings, list) else []) + postures_withheld(document)
+        ids.update(str(f["id"]) for f in filed if isinstance(f, dict) and f.get("id"))
+        scope = document.get("scope")
+        entries = scope.get("skipped") if isinstance(scope, dict) else None
+        skipped.update(
+            str(entry["cluster"]).strip()
+            for entry in (entries if isinstance(entries, list) else [])
+            if isinstance(entry, dict) and entry.get("cluster")
+        )
+    return ids, skipped
+
+
 def base_branch() -> str:
     """The branch remediation pull requests target: this repository's own default.
 
@@ -12523,14 +12557,22 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
 
     title = issue_title(audit_id, findings)
     # Marked before rendering, because the marker is part of the body: the
-    # findings this run carries that the last run's block did not. Rendered,
-    # these are exactly `compute_delta`'s `new` below. None, marking nothing,
-    # when that is not knowable: a first run (no ledger to measure against,
-    # where everything would read as new), a lost memory, or a block written
-    # under another identity scheme, where every id looks new.
+    # findings the last run filed nowhere (`report_filed`), on a cluster it
+    # looked at. Narrower than `compute_delta`'s `new`, which joins against the
+    # rendered block alone and so counts a finding the last body cut for space.
+    # None, marking nothing, when that is not knowable: a first run (no ledger
+    # to measure against, where everything would read as new), a lost or
+    # seeded memory, or a block written under another identity scheme, where
+    # every id looks new.
+    filed = report_filed(memory) if existing_issue is not None and not stale_scheme else None
     new_marked = (
-        set(current_ids) - set(previous_ids)
-        if existing_issue is not None and memory is not None and not stale_scheme
+        {
+            str(f.get("id", ""))
+            for f in findings
+            if str(f.get("id", "")) not in filed[0] | set(previous_ids)
+            and str(f.get("cluster", "")).strip() not in filed[1]
+        }
+        if filed is not None
         else None
     )
     rendered = render_issue_body(
