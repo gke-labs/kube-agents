@@ -32,6 +32,7 @@ import os
 import shutil
 import subprocess
 import unittest
+from collections import Counter
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
@@ -238,17 +239,21 @@ STRAY_OPENER_MDX_LINES = (
     "",
     "{/* a comment closed on its own line, later in the file */}",
 )
-# A backtick left unpaired in a list item, a table row or a heading. A renderer
-# parses each of those inline on its own, so the backtick is text and the next
-# block's links are live; read as one paragraph, it paired with the next
-# backtick in the document and hid every link between them, the broken one
-# included. The last item keeps the case the paragraph read exists for: a span
-# that wraps onto a plain continuation line is still one span.
+# A backtick left unpaired in a list item, a table row or a heading, or in the
+# paragraph before a blockquote or a thematic break. A renderer parses each of
+# those inline on its own, so the backtick is text and the next block's links
+# are live; read as one paragraph, it paired with the next backtick in the
+# document and hid every link between them, the broken one included. The
+# wrapped item keeps the case the paragraph read exists for: a span that wraps
+# onto a plain continuation line is still one span. The rule is underscores:
+# dashes under a paragraph would be a setext heading, and stars a list item.
 BLOCK_BOUNDARIES = "block-boundaries.md"  # a root file, reached by shape
 LIVE_IN_NEXT_ITEM = "docs/live-in-next-item.md"
 LIVE_IN_NEXT_ROW = "docs/live-in-next-row.md"
 LIVE_UNDER_HEADING = "docs/live-under-heading.md"
 LIVE_AFTER_ITEM_WRAP = "docs/live-after-item-wrap.md"
+LIVE_IN_QUOTE = "docs/live-in-quote.md"
+LIVE_UNDER_RULE = "docs/live-under-rule.md"
 BLOCK_BOUNDARIES_GONE_LINE = f"| [live]({LIVE_IN_NEXT_ROW}) and [gone](nowhere.md) | `y` |"
 BLOCK_BOUNDARIES_LINES = (
     "# block boundaries",
@@ -264,6 +269,33 @@ BLOCK_BOUNDARIES_LINES = (
     "",
     "- an item whose span wraps `[specimen](specimen.md)",
     f"  onto its continuation line` and then [live]({LIVE_AFTER_ITEM_WRAP}) reaches",
+    "",
+    "a paragraph with a lone ` marker",
+    f"> a quote after it links [live]({LIVE_IN_QUOTE}) and `code`",
+    "",
+    "a lone ` before a rule",
+    "___",
+    f"[live]({LIVE_UNDER_RULE}) and `code` under the rule",
+)
+# A span and an inline comment that wrap from one blockquote line to the next.
+# A renderer strips the markers and reads the quote's lines as one paragraph,
+# so the specimen inside the span is no link, the link after the span's closer
+# is live, the link inside the comment renders nowhere and the link after the
+# comment's closer is live. Read a `>` line at a time, each backtick was
+# unpaired and the opener was text: the specimen was reported as a broken
+# link and the hidden document was reached.
+QUOTE_WRAP = "quote-wrap.md"  # a root file, reached by shape
+LIVE_AFTER_QUOTED_SPAN = "docs/live-after-quoted-span.md"
+HIDDEN_IN_QUOTED_COMMENT = "docs/hidden-in-quoted-comment.md"
+LIVE_AFTER_QUOTED_COMMENT = "docs/live-after-quoted-comment.md"
+QUOTE_WRAP_LINES = (
+    "# quote wrap",
+    "",
+    "> a span that wraps `[specimen](specimen.md)",
+    f"> onto the next quoted line` and then [live]({LIVE_AFTER_QUOTED_SPAN}) reaches",
+    ">",
+    f"> prose before a comment <!-- [hidden]({HIDDEN_IN_QUOTED_COMMENT})",
+    f"> --> and [live]({LIVE_AFTER_QUOTED_COMMENT}) after its closer",
 )
 # A comment opener alone on its line under a numbered item's continuation,
 # four spaces in. CommonMark measures the block indent from the item, so the
@@ -575,7 +607,10 @@ class SyntheticRepoTest(unittest.TestCase):
         self.assertEqual(cdl.check_file(self.root / STRAY_OPENER_MDX, tracked), [])
 
     def test_a_backtick_does_not_pair_across_a_block_boundary(self) -> None:
-        self._track(BLOCK_BOUNDARIES, LIVE_IN_NEXT_ITEM, LIVE_IN_NEXT_ROW, LIVE_UNDER_HEADING, LIVE_AFTER_ITEM_WRAP)
+        self._track(
+            BLOCK_BOUNDARIES, LIVE_IN_NEXT_ITEM, LIVE_IN_NEXT_ROW, LIVE_UNDER_HEADING, LIVE_AFTER_ITEM_WRAP,
+            LIVE_IN_QUOTE, LIVE_UNDER_RULE,
+        )
         _write(self.root, BLOCK_BOUNDARIES, "\n".join(BLOCK_BOUNDARIES_LINES) + "\n")
         self.assertEqual(self._unlinked(), [])
         gone_line = BLOCK_BOUNDARIES_LINES.index(BLOCK_BOUNDARIES_GONE_LINE) + 1
@@ -583,6 +618,12 @@ class SyntheticRepoTest(unittest.TestCase):
             cdl.check_file(self.root / BLOCK_BOUNDARIES, cdl.tracked_paths()),
             [f"{BLOCK_BOUNDARIES}:{gone_line}: broken link -> nowhere.md"],
         )
+
+    def test_a_span_or_a_comment_wraps_across_the_lines_of_one_blockquote(self) -> None:
+        self._track(QUOTE_WRAP, LIVE_AFTER_QUOTED_SPAN, HIDDEN_IN_QUOTED_COMMENT, LIVE_AFTER_QUOTED_COMMENT)
+        _write(self.root, QUOTE_WRAP, "\n".join(QUOTE_WRAP_LINES) + "\n")
+        self.assertEqual(self._unlinked(), [f"{HIDDEN_IN_QUOTED_COMMENT}: {cdl.UNLINKED_MESSAGE}"])
+        self.assertEqual(cdl.check_file(self.root / QUOTE_WRAP, cdl.tracked_paths()), [])
 
     def test_an_indented_opener_alone_on_its_line_is_a_block_comment(self) -> None:
         self._track(INDENTED_OPENER, HIDDEN_UNDER_ITEM, LIVE_AFTER_INDENTED_COMMENT)
@@ -663,6 +704,32 @@ class SyntheticRepoTest(unittest.TestCase):
         self.assertEqual(err.getvalue().count("broken link ->"), 1)
         self.assertEqual(err.getvalue().count("broken citation ->"), 2)
         self.assertEqual(err.getvalue().count(cdl.UNLINKED_MESSAGE), 1)
+
+    def test_main_reads_each_document_code_file_and_the_site_config_once(self) -> None:
+        """The broken-link checks and the reachability walk share one parse of every input."""
+        _write(self.root, cdl.SITE_CONFIG, "\n".join(SITE_CONFIG_LINES) + "\n")
+        self._track(UNLINKED)
+        reads: Counter[str] = Counter()
+
+        def counted(name: str, real):  # a wrapper for three signatures
+            def wrapper(*args):
+                reads[f"{name} {args[0]}" if args else name] += 1
+                return real(*args)
+
+            return wrapper
+
+        with (
+            mock.patch.object(cdl, "markdown_links", counted("links", cdl.markdown_links)),
+            mock.patch.object(cdl, "code_citations", counted("citations", cdl.code_citations)),
+            mock.patch.object(cdl, "site_sidebar", counted("sidebar", cdl.site_sidebar)),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            cdl.main()
+        self.assertEqual({key: n for key, n in reads.items() if n != 1}, {}, reads)
+        self.assertEqual(sum(key.startswith("links ") for key in reads), len(cdl.tracked_markdown()))
+        self.assertEqual(sum(key.startswith("citations ") for key in reads), len(cdl.tracked_code()))
+        self.assertIn("sidebar", reads)
 
     def test_main_is_clean_once_every_citation_is_tracked(self) -> None:
         _write(self.root, MISSING, "# now present\n")

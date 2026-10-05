@@ -66,7 +66,7 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from itertools import islice
 from pathlib import Path
 from urllib.parse import unquote
@@ -149,14 +149,18 @@ FENCE_RE = re.compile(r"^\s*(```|~~~)")
 # renderer parses each of those inline on its own, so a lone backtick in one
 # list item never pairs with one in the next and hides the link between
 # them, while a span that wraps onto a plain continuation line is still one
-# span. Reading a span one line at a time was wrong in the unsafe direction
-# once comments were stripped too: a `<!--` quoted in a span that wraps
+# span. A blockquote's lines are read with their markers removed, as a
+# renderer reads them, so a span or a comment may wrap from one `>` line to
+# the next, and a quoted heading, list item or marker-only line still ends the
+# paragraph inside the quote. Reading a span one line at a time was wrong in
+# the unsafe direction once comments were stripped too: a `<!--` quoted in a span that wraps
 # stayed visible and opened a comment that swallowed the rest of the
 # document, links included.
 BACKTICK_RUN_RE = re.compile(r"`+")
 ONE_LINE_BLOCK = r"#{1,6}(?:\s|$)|\||(?P<rule>[-*_])(?:\s*(?P=rule)){2,}\s*$"
 ONE_LINE_BLOCK_RE = re.compile(rf"^ {{0,3}}(?:{ONE_LINE_BLOCK})")
 BLOCK_OPENER_RE = re.compile(rf"^ {{0,3}}(?:[-*+](?:\s|$)|\d{{1,9}}[.)](?:\s|$)|>|{ONE_LINE_BLOCK})")
+QUOTE_MARKER_RE = re.compile(r"^ {0,3}>[ \t]?")
 
 # HTML and MDX comments, for the same reason again: a link an author commented
 # out instead of deleting renders nowhere, so it reaches no document -- the
@@ -369,6 +373,15 @@ def strip_code_fences(text: str) -> list[tuple[int, str]]:
     return kept
 
 
+def unquoted(line: str) -> tuple[int, str]:
+    """A line's blockquote depth and its content with the quote markers removed."""
+    depth = 0
+    while m := QUOTE_MARKER_RE.match(line):
+        line = line[m.end() :]
+        depth += 1
+    return depth, line
+
+
 def paragraphs(lines: list[tuple[int, str]]) -> Iterator[tuple[list[int], str]]:
     """Group the lines into paragraphs: runs of adjacent non-blank lines, joined by newlines.
 
@@ -376,17 +389,25 @@ def paragraphs(lines: list[tuple[int, str]]) -> Iterator[tuple[list[int], str]]:
     heading, a list item, a table row, a blockquote, a thematic break) or the
     line after a one-line block (a heading, a table row, a thematic break)
     ends one; a blank line is a paragraph of its own so that a comment still
-    runs across it.
+    runs across it. Two lines of one blockquote are read with their markers
+    removed, as a renderer reads a quote's content, so the next `>` line
+    continues the paragraph unless what follows its marker would end one.
     """
     numbers: list[int] = []
     body: list[str] = []
     for lineno, line in lines:
+        depth, content = unquoted(line)
+        previous_depth, previous = unquoted(body[-1]) if body else (0, "")
+        if depth and depth == previous_depth:
+            this_text, previous_text = content, previous  # inside one quote: the markers are not content
+        else:
+            this_text, previous_text = line, body[-1] if body else ""
         ends = numbers and (
-            line.strip() == ""
-            or body[-1].strip() == ""
+            this_text.strip() == ""
+            or previous_text.strip() == ""
             or lineno != numbers[-1] + 1
-            or BLOCK_OPENER_RE.match(line)
-            or ONE_LINE_BLOCK_RE.match(body[-1])
+            or BLOCK_OPENER_RE.match(this_text)
+            or ONE_LINE_BLOCK_RE.match(previous)
         )
         if ends:
             yield numbers, "\n".join(body)
@@ -566,9 +587,15 @@ def code_citations(path: Path) -> Iterator[tuple[int, str]]:
             yield lineno, m.group(0)
 
 
-def check_file(path: Path, tracked: set[Path]) -> list[str]:
+def check_file(path: Path, tracked: set[Path], links: Iterable[tuple[int, str]] | None = None) -> list[str]:
+    """Report every relative link in a document whose target is not tracked.
+
+    ``links`` is the document's links when the caller has read them already;
+    ``main()`` reads each document once and hands the same links here and to
+    ``reached_files()``.
+    """
     problems: list[str] = []
-    for lineno, target in markdown_links(path):
+    for lineno, target in markdown_links(path) if links is None else links:
         if target.startswith(REPO_BLOB_URL_PREFIXES) or target.startswith(SKIP_PREFIXES):
             continue  # a remote resource or a Starlight route; existence is not checked here
         resolved = link_target(path, target)
@@ -580,10 +607,13 @@ def check_file(path: Path, tracked: set[Path]) -> list[str]:
     return problems
 
 
-def check_code_file(path: Path, tracked: set[Path]) -> list[str]:
-    """Report every design-document path cited in a code file that is not tracked."""
+def check_code_file(path: Path, tracked: set[Path], citations: Iterable[tuple[int, str]] | None = None) -> list[str]:
+    """Report every design-document path cited in a code file that is not tracked.
+
+    ``citations`` is the file's citations when the caller has read them already.
+    """
     problems: list[str] = []
-    for lineno, cited in code_citations(path):
+    for lineno, cited in code_citations(path) if citations is None else citations:
         if (REPO / cited).resolve() not in tracked:
             rel = path.relative_to(REPO)
             problems.append(f"{rel}:{lineno}: broken citation -> {cited}")
@@ -700,16 +730,24 @@ def reached_by_shape(rel: str, site_directories: frozenset[str]) -> bool:
     return any(pattern.match(rel) for pattern in FAMILY_PATTERNS)
 
 
-def reached_files(markdown: list[Path], code: list[Path]) -> set[Path]:
+def reached_files(
+    markdown: list[Path],
+    code: list[Path],
+    links: Mapping[Path, Sequence[tuple[int, str]]] | None = None,
+    citations: Mapping[Path, Sequence[tuple[int, str]]] | None = None,
+    sidebar: tuple[frozenset[str], frozenset[Path]] | None = None,
+) -> set[Path]:
     """Every document a reader reaches, resolved.
 
     Reach starts at the documents a reader arrives at without a link -- the
     shapes above, the sidebar's pages, and every design document a code file
     cites -- and follows links from there. An allowlisted document is a dead
     end: nothing is reached through it, so a document linked only from one is
-    reported rather than hidden behind the entry.
+    reported rather than hidden behind the entry. ``links`` (by resolved
+    document), ``citations`` (by code file) and ``sidebar`` are what the
+    caller has read already; each is read here when it is not given.
     """
-    site_directories, sidebar_pages = site_sidebar()
+    site_directories, sidebar_pages = site_sidebar() if sidebar is None else sidebar
     tracked = {path.resolve(): path.relative_to(REPO).as_posix() for path in markdown}
     reached: set[Path] = set(sidebar_pages)
     for resolved, rel in tracked.items():
@@ -718,12 +756,12 @@ def reached_files(markdown: list[Path], code: list[Path]) -> set[Path]:
     for path in code:
         if path.resolve() == SELF:
             continue
-        for _, cited in code_citations(path):
+        for _, cited in code_citations(path) if citations is None else citations[path]:
             reached.add((REPO / cited).resolve())
     queue = [p for p in reached if p in tracked and tracked[p] not in UNLINKED_ALLOWLIST]
     while queue:
         source = queue.pop()
-        for _, target in markdown_links(source):
+        for _, target in markdown_links(source) if links is None else links[source]:
             resolved = link_target(source, target)
             if resolved is None:
                 continue
@@ -736,9 +774,14 @@ def reached_files(markdown: list[Path], code: list[Path]) -> set[Path]:
     return reached
 
 
-def check_unlinked(markdown: list[Path], reached: set[Path]) -> list[str]:
-    """Report every document no reader reaches, and every allowlist entry that is stale."""
-    site_directories, _ = site_sidebar()
+def check_unlinked(markdown: list[Path], reached: set[Path], site_directories: frozenset[str] | None = None) -> list[str]:
+    """Report every document no reader reaches, and every allowlist entry that is stale.
+
+    ``site_directories`` is the sidebar's autogenerated set when the caller has
+    read the site config already.
+    """
+    if site_directories is None:
+        site_directories, _ = site_sidebar()
     problems: list[str] = []
     tracked_rel = {path.relative_to(REPO).as_posix() for path in markdown}
     for rel in sorted(UNLINKED_ALLOWLIST - tracked_rel):
@@ -763,16 +806,21 @@ def main() -> int:
         print("ERROR: no Markdown files found.", file=sys.stderr)
         return 1
 
+    # Each document, code file and the site config is read once; the broken-link
+    # checks and the reachability walk read the same links and citations.
     tracked = tracked_paths()
     problems: list[str] = []
+    links = {f.resolve(): tuple(markdown_links(f)) for f in files}
     for f in files:
-        problems.extend(check_file(f, tracked))
+        problems.extend(check_file(f, tracked, links[f.resolve()]))
 
     code = tracked_code()
+    citations = {f: tuple(code_citations(f)) for f in code}
     for f in code:
-        problems.extend(check_code_file(f, tracked))
+        problems.extend(check_code_file(f, tracked, citations[f]))
 
-    problems.extend(check_unlinked(files, reached_files(files, code)))
+    sidebar = site_sidebar()
+    problems.extend(check_unlinked(files, reached_files(files, code, links, citations, sidebar), sidebar[0]))
 
     print(
         f"Checked relative links in {len(files)} Markdown files "
