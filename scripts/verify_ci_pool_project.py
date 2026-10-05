@@ -413,9 +413,11 @@ under Declared intent rather than as findings."""
 # nothing, and the declared-intent cases fail on that project with a
 # presence-only check green -- which is why presence alone is not the check.
 # The nightly cases that fail on a project whose note is missing or unread,
-# one per declaring stream, named in this check's messages.
+# named in this check's messages: the declared-intent case of each declaring
+# stream, and the exposure sweep, whose report must name the note's path.
 GITOPS_INTENT_NOTE_CASES = (
     "obtainability-declared-intent-no-finding",
+    "obtainability-fleet-exposure-sweep",
     "compliance-declared-intent-no-finding",
     "compliance-declared-token-shields-siblings",
     "patch-declared-intent-no-finding",
