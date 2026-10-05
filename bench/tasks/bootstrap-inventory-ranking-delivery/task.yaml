@@ -3,8 +3,9 @@
 # ranked report onboarding delivers to the user, and the delivery job picks
 # that report up.
 #
-# That stage is not started by a conversation. The sweep's worker files the
-# `bootstrap-inventory-prioritize` card once INVENTORY.raw.md is written, and
+# That stage is not started by a conversation. The onboarding gate's hand-off
+# files the `bootstrap-inventory-prioritize` card once INVENTORY.raw.md is
+# written, and
 # that card's worker follows agents/platform/governance/inventory_prioritize_sop.md,
 # whose Step 2 runs `inventory_findings.py extract` through its terminal.
 # With the shell sandbox on, that terminal is the sandbox pod, so the script
@@ -18,7 +19,7 @@
 # reads the report through the sandbox rather than off its own disk.
 #
 # bench/tf/prebuilt/bootstrap-ranking plants a fixed raw report on the
-# sandbox, files the prioritization card the way the sweep's worker does,
+# sandbox, files the prioritization card the way the hand-off does,
 # waits until that card's worker has ended its run itself or the stack's
 # `run_wait` (900s) has passed, and then arms delivery by touching
 # `.user_aligned`, as the onboarding plugin does when a person first chats.

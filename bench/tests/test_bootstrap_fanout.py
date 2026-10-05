@@ -284,7 +284,7 @@ def test_a_board_where_no_worker_has_filed_yet_fails_rather_than_errors(pod) -> 
     result = _verify("one_card_per_cluster_agent")
     assert result.status == "fail", result.reason
     assert "filed 0 cluster card(s) for 4 Cluster Agent(s)" in result.reason
-    assert _verify("no_card_waits_on_the_sweep").status == "pass"
+    assert _verify("every_card_waits_on_the_sweep").status == "pass"
 
 
 def test_a_missing_card_is_named(pod) -> None:
@@ -381,26 +381,37 @@ def test_a_fail_outranks_a_final_read_that_errors(pod, monkeypatch: pytest.Monke
 def test_an_unreadable_pod_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(verifiers, "_agent_shell", lambda s, t: "")
     assert _verify("one_card_per_cluster_agent").status == "error"
-    assert _verify("no_card_waits_on_the_sweep").status == "error"
+    assert _verify("every_card_waits_on_the_sweep").status == "error"
 
 
 # --- the safeguard --------------------------------------------------------
 
 
-def test_the_prioritize_card_may_wait_on_the_sweep(pod) -> None:
-    pod(_board("branch"))
-    result = _verify("no_card_waits_on_the_sweep")
+def _cluster_cards(board: dict) -> list[dict]:
+    children = {w[0] for w in board["kanban_worker_children"]}
+    return [t for t in board["tasks"] if t["id"] in children and str(t.get("idempotency_key") or "").startswith(discovery.CLUSTER_KEY_PREFIX)]
+
+
+def test_cluster_cards_that_all_wait_on_the_sweep_pass(pod) -> None:
+    board = _board("branch")
+    for card in _cluster_cards(board):
+        board["task_links"].append([board["sweep"], card["id"]])
+    pod(board)
+    result = _verify("every_card_waits_on_the_sweep")
     assert result.status == "pass", result.reason
 
 
-def test_a_cluster_card_waiting_on_the_sweep_fails(pod) -> None:
+def test_a_cluster_card_free_of_the_sweep_fails(pod) -> None:
     board = _board("branch")
-    waiting = _card(board, "cluster-example-project-agent-harness")
-    board["task_links"].append([board["sweep"], waiting["id"]])
+    cards = _cluster_cards(board)
+    free = _card(board, "cluster-example-project-agent-harness")
+    for card in cards:
+        if card["id"] != free["id"]:
+            board["task_links"].append([board["sweep"], card["id"]])
     pod(board)
-    result = _verify("no_card_waits_on_the_sweep")
+    result = _verify("every_card_waits_on_the_sweep")
     assert result.status == "fail"
-    assert waiting["id"] in result.reason
+    assert free["id"] in result.reason
 
 
 # --- registration ---------------------------------------------------------
@@ -414,7 +425,7 @@ def test_the_verifier_is_published_as_an_entry_point() -> None:
 
 
 def test_parse_node_builds_it_like_a_task_yaml_would() -> None:
-    node = parse_node({"type": "bootstrap_fanout", "require": "no_card_waits_on_the_sweep"})
+    node = parse_node({"type": "bootstrap_fanout", "require": "every_card_waits_on_the_sweep"})
     assert isinstance(node, BootstrapFanoutVerifier)
     assert VERIFIERS.get("bootstrap_fanout") is BootstrapFanoutVerifier
 

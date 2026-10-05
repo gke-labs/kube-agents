@@ -1,22 +1,32 @@
 # Domain: fleet audits. Journey: a fresh install runs its onboarding discovery
-# sweep, and the sweep hands one survey card to each Cluster Agent instead of
-# auditing every cluster from the Platform Agent's own seat.
+# sweep, the sweep hands one survey card to each Cluster Agent instead of
+# auditing every cluster from the Platform Agent's own seat, and once those
+# cards settle the gate's hand-off writes the raw report and files the ranking
+# card. One stack run grades both halves: stack cases run one at a time in the
+# nightly, so a second case for the hand-off would cost a second re-armed sweep.
 #
 # The sweep is not started by a conversation. The `bootstrap-inventory-scan`
 # cron job on the Planning Agent's profile files it once per install, and the
 # Platform Agent's worker fans it out. Nothing a chat prompt says reaches that
 # path, so the prompt below only reads the board; the grade comes from the
-# stack and the verifier.
+# stack and the verifiers.
 #
-# bench/tf/prebuilt/bootstrap-discovery re-arms the gate, waits for the cron
-# job to file a new sweep card, and returns once that card's worker has filed
-# its Cluster Agent cards and then ended its run itself (or completed without
-# filing one), or at the stack's `run_wait` (900s) with whatever it has filed
-# by then; the apply fails if no worker has picked the card up by then or no
-# read of the board has succeeded. The objective then compares the cards it
-# filed against the Cluster Agent roster, read straight from the profiles on
-# the agent's disk rather than through the gate, so a build whose gate hands
-# the worker no roster fails here instead of erroring. The re-arm runbook in
+# bench/tf/prebuilt/bootstrap-discovery, with wait_for = "handoff", re-arms the
+# gate, waits for the cron job to file a new sweep card, and returns once a
+# card keyed `bootstrap-inventory-prioritize` is on the board, or once the
+# sweep and every Cluster Agent card it filed have stayed done, blocked or
+# archived for the stack's `settle_hold` (120s) without one, or at its
+# `handoff_wait` (1800s). That settle rule is looser than the hand-off's own
+# on purpose: a blocked sweep or an archived card, which the hand-off waits on
+# or treats as cancelled, ends the wait here and fails `ranking-card-keyed`.
+# The apply fails if no worker has picked the sweep up by `run_wait` (900s) or
+# no read of the board has succeeded. The fan-out objective compares the cards
+# the sweep filed against the Cluster Agent roster, read straight from the
+# profiles on the agent's disk rather than through the gate, so a build whose
+# gate hands the worker no roster fails here instead of erroring. The hand-off
+# objectives parse the sandbox's raw report with the sandbox's own
+# agents/platform/scripts/inventory_findings.py, and read the board for the
+# keyed ranking card. The re-arm runbook in
 # agents/chat/defaults/plugins/bootstrap_onboarding/README.md §5 says why
 # re-arming archives the previous sweep's cards first.
 #
@@ -31,7 +41,7 @@
 # that other cases' cards running at the same time would use.
 ---
 id: bootstrap-discovery-fanout
-name: The onboarding discovery sweep files one survey card per Cluster Agent
+name: The onboarding sweep files one survey card per Cluster Agent and its hand-off reaches ranking
 
 # No seeded-fleet dependency: the roster is whatever Cluster Agents the install
 # under test has, and the verifier reads it from there.
@@ -46,6 +56,8 @@ infrastructure:
   # TF_VAR_host_cluster_location, exported by hack/ci-eval-pr.sh), because they
   # name the install the runner deployed and no task may choose a different
   # one. The stack defaults everything else.
+  variables:
+    wait_for: "handoff"
 
 validated: false
 
@@ -72,19 +84,22 @@ prompt: |
      returns the oldest tasks first and stops at a page.
   2. Report its id and status, and for each card it filed, that card's id,
      assignee and status.
+  3. Say whether a card with idempotency key 'bootstrap-inventory-prioritize'
+     is on the board, with its id and status.
 
   Only read the board. Do not start, retry, unblock, archive, complete or
-  create any card, and make no changes to the cluster.
+  create any card, write no files, and make no changes to the cluster.
 expected_output: |
   critical requirements:
-  - The reply names the discovery sweep card and lists the cards it filed with
-    their assignees and statuses, read off the kanban board.
-  - No card is created, moved or archived, and nothing is changed on the
-    cluster.
+  - The reply names the discovery sweep card, lists the cards it filed with
+    their assignees and statuses, and says whether the prioritization card is
+    on the board, read off the kanban board.
+  - No card is created, moved or archived, no file is written, and nothing is
+    changed on the cluster.
 
 verification_spec:
-  # Both entries read the board and the profiles on the agent's disk
-  # (kube_agents_bench/discovery.py), not the transcript.
+  # The bootstrap_fanout entries read the board and the profiles on the agent's
+  # disk (kube_agents_bench/discovery.py), not the transcript.
 
   - name: one-card-per-cluster-agent
     role: objective
@@ -92,11 +107,28 @@ verification_spec:
       type: bootstrap_fanout
       require: one_card_per_cluster_agent
 
-  # A cluster card that waits on the sweep cannot start until the sweep is
-  # done, and the sweep's report is built from the cluster cards' results.
-  - name: no-cluster-card-waits-on-the-sweep
+  # The sweep completes at fan-out and the gate's hand-off collects the
+  # cluster cards, so each card waits on the sweep: the board refuses the
+  # sweep's completion over a card it filed without being its parent.
+  - name: every-cluster-card-waits-on-the-sweep
     role: safeguard
     severity: recoverable
     check:
       type: bootstrap_fanout
-      require: no_card_waits_on_the_sweep
+      require: every_card_waits_on_the_sweep
+
+  # Reads INVENTORY.raw.md on the shell sandbox and the board on the agent pod
+  # (kube_agents_bench/onboarding.py), not the transcript.
+  - name: raw-report-has-findings-block
+    role: objective
+    check:
+      type: bootstrap_handoff
+      require: raw_report_has_findings_block
+
+  # The prioritization stage's card is found by this key; one filed without
+  # it is a second card the next sweep's hand-off would not deduplicate.
+  - name: ranking-card-keyed
+    role: objective
+    check:
+      type: bootstrap_handoff
+      require: ranking_card_filed

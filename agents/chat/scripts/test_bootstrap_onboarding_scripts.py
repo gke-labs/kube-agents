@@ -549,20 +549,19 @@ class ScanGateTest(unittest.TestCase):
         self.assertEqual(self.filed, [])
         self.assertEqual(out, "")
 
-    def test_body_hands_ranking_to_a_separate_card(self):
-        """Ranking must not happen inside the sweep.
+    def test_body_leaves_the_raw_file_and_ranking_to_the_hand_off(self):
+        """The worker fans out and completes; bootstrap_handoff.py does the rest.
 
-        The delivered report has to be produced from the raw findings alone. A
-        worker that ranks inline ranks against its own sweep transcript too, so
-        the same findings yield a different report depending on how the sweep
-        went — which is exactly what a fresh card prevents.
+        Asked to wait, compile and hand off, the worker had no tool that waits,
+        typed the raw file without its findings block, and filed the ranking card
+        without its key.
         """
         body = bootstrap_scan_gate._task_body()
-        self.assertIn(bootstrap_scan_gate.RAW_INVENTORY_PATH, body)
-        self.assertIn(bootstrap_scan_gate.PRIORITIZE_IDEMPOTENCY_KEY, body)
-        for path in bootstrap_scan_gate.PRIORITIZE_INSTRUCTIONS_PATHS:
-            self.assertIn(path, body)
-        self.assertIn("Do not rank the findings yourself", body)
+        self.assertIn(f"do not write `{bootstrap_scan_gate.RAW_INVENTORY_PATH}`", body)
+        self.assertIn("do not file a ranking card", body)
+        self.assertIn("Do not wait for the per-cluster cards", body)
+        self.assertNotIn("sleep 60", body)
+        self.assertNotIn(bootstrap_scan_gate.PRIORITIZE_IDEMPOTENCY_KEY, body)
 
     def test_child_cards_are_pointed_at_the_per_cluster_audit_sop(self):
         """Without the SOP path the child body is written freehand.
@@ -601,13 +600,10 @@ class ScanGateTest(unittest.TestCase):
         """
         body = bootstrap_scan_gate._task_body()
         self.assertIn(bootstrap_scan_gate.RECONCILE_SCRIPT_NAME, body)  # roster first
-        self.assertIn("did not cover yourself", body)  # no silent hole
-        self.assertIn("kanban_create", body)  # one child per cluster
-        # The sweep card waits for its children and synthesizes their results
-        # itself; completing on a dispatch receipt is the #1010 defect, and the
-        # retired aggregation-card handoff must not creep back into the body.
-        self.assertIn("wait for the children", body)
-        self.assertIn("kanban_show", body)
+        self.assertIn("audit the clusters no call covers", body)  # no silent hole
+        self.assertIn("Step 2 — fan out", body)  # one child per cluster
+        # The fleet list is how the hand-off names a cluster nobody reported on.
+        self.assertIn("`fleet`", body)
         self.assertNotIn("aggregation card", body)
         self.assertIn("metadata", body)  # structured child results
 
@@ -678,16 +674,15 @@ class ScanGateTest(unittest.TestCase):
         self.assertIn("    (none)", step2)
         self.assertIn("If no calls are listed above", step2)
 
-    def test_the_fan_out_calls_carry_no_parents(self):
-        # A card whose parent is the sweep card cannot start until the sweep card
-        # completes, so the #1174 guard lets the sweep card complete over it: the
-        # sweep closed on a dispatch receipt and nothing read the audits (#1872).
+    def test_the_fan_out_calls_wait_on_the_sweep(self):
+        # The sweep completes at fan-out, and the #1174 guard refuses that
+        # completion over a card it filed unless the card names it as a parent.
+        # Nothing reads the audits from the sweep any more; the hand-off does.
         self._cluster_agent("proj", "prod", "us-east4")
         step2 = self._step_2(bootstrap_scan_gate._task_body())
         calls = [line for line in step2.splitlines() if "kanban_create(" in line]
         self.assertEqual(len(calls), 1)
-        self.assertNotIn("parents", calls[0])
-        self.assertIn("Pass no `parents`", step2)
+        self.assertIn("parents=[<this card's id>]", calls[0])
 
     def test_step_2_leaves_out_a_profile_whose_scaffold_did_not_finish(self):
         # Hermes never registered the first, so a card assigned to it is never
@@ -1019,7 +1014,7 @@ class ScanGateTest(unittest.TestCase):
         self.assertIn("may be empty or incomplete", body)
         # The degradation has to reach the user: the report is delivered verbatim.
         self.assertIn("names each one as lacking an agent", body)
-        self.assertIn("file it anyway", body)
+        self.assertIn("complete the card anyway", body)
 
     def test_body_degrades_when_no_cluster_agents_exist(self):
         # A single-cluster install reconciles to an empty roster, and that is the
@@ -1027,7 +1022,7 @@ class ScanGateTest(unittest.TestCase):
         # than fanning out to an empty roster and writing nothing.
         body = bootstrap_scan_gate._task_body()
         self.assertIn("there are no Cluster Agents", body)
-        self.assertIn("do the whole sweep yourself", body)
+        self.assertIn("audit every cluster yourself in Step 3", body)
         # The workload checks live only in the single-cluster SOP now, so the solo
         # walk has to be sent there or it produces a topology table with empty
         # workload columns — the empty report this card exists to prevent.
@@ -1040,13 +1035,23 @@ class ScanGateTest(unittest.TestCase):
     def test_body_propagates_idempotency_keys_to_the_fan_out(self):
         # The root card is guarded by a marker and a key; the cards it spawns
         # are guarded only by what these instructions tell the worker to set.
-        # (The aggregation card's key went with the fan-in shape, #1010: the
-        # sweep card now waits for its children and writes the findings itself,
-        # so the only spawned cards left are per-cluster and prioritize.)
         name = self._cluster_agent("proj", "prod", "us-east4")
         body = bootstrap_scan_gate._task_body()
         self.assertIn(f"{bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX}{name}", body)
-        self.assertIn(bootstrap_scan_gate.PRIORITIZE_IDEMPOTENCY_KEY, body)
+
+    def test_a_filed_sweep_runs_the_hand_off_instead_of_filing(self):
+        (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n")
+        with mock.patch.object(bootstrap_scan_gate.bootstrap_handoff, "hand_off") as hand_off:
+            rc, out = self._run()
+        self.assertEqual((rc, out, self.filed), (0, "", []))
+        hand_off.assert_called_once_with(self.d, self.d / SCAN_FILED, bootstrap_scan_gate._parse_task_id)
+
+    def test_no_hand_off_once_the_report_is_delivered(self):
+        (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n")
+        (self.d / COMPLETED).write_text("")
+        with mock.patch.object(bootstrap_scan_gate.bootstrap_handoff, "hand_off") as hand_off:
+            self._run()
+        hand_off.assert_not_called()
 
     def test_parses_task_id_from_either_response_shape(self):
         # --json is what we ask for, but run_slash hands back stdout and stderr

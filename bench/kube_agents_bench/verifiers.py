@@ -86,6 +86,7 @@ __all__ = [
     "BootstrapDeliveredVerifier",
     "BootstrapFanoutVerifier",
     "BootstrapFindingsVerifier",
+    "BootstrapHandoffVerifier",
     "BootstrapReportReadVerifier",
     "FleetResourcePropertyVerifier",
     "GitHubWritesVerifier",
@@ -978,20 +979,22 @@ class BootstrapFanoutVerifier(BaseVerifier):
       finished scaffolding and has a cluster identity got exactly one
       ``bootstrap-inventory-cluster-*`` card, assigned to it and keyed by its
       profile name, and no such card went anywhere else.
-    - ``no_card_waits_on_the_sweep``: no ``bootstrap-inventory-cluster-*``
-      card names the sweep as a parent. A child waiting on the card that waits
-      on it never runs until the sweep has given up on it.
+    - ``every_card_waits_on_the_sweep``: every ``bootstrap-inventory-cluster-*``
+      card names the sweep as a parent. The sweep completes right after the
+      fan-out and the gate's hand-off collects the cards, and the board refuses
+      that completion over a card the sweep filed without being its parent; a
+      refused worker that cannot wait blocks its card instead.
 
     Fails closed: an unreadable pod, no sweep marker, a board that cannot be
     queried, or a sweep card the board does not know is ``status="error"``,
     and so is an empty roster for ``one_card_per_cluster_agent``.
-    ``no_card_waits_on_the_sweep`` does not read the roster, so an empty one
+    ``every_card_waits_on_the_sweep`` does not read the roster, so an empty one
     is not an error for it. A ``fail`` from an earlier poll outranks a final
     read that errors.
     """
 
     type: Literal["bootstrap_fanout"]
-    require: Literal["one_card_per_cluster_agent", "no_card_waits_on_the_sweep"]
+    require: Literal["one_card_per_cluster_agent", "every_card_waits_on_the_sweep"]
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         read_timeout = min(single_call_timeout(timeout_sec), _FANOUT_READ_TIMEOUT_SEC)
@@ -1030,11 +1033,11 @@ class BootstrapFanoutVerifier(BaseVerifier):
             if str(c.get("key") or "").startswith(discovery.CLUSTER_KEY_PREFIX)
         ]
         where = f"sweep {sweep.get('id')} ({sweep.get('status')})"
-        if self.require == "no_card_waits_on_the_sweep":
-            waiting = [c["id"] for c in cards if sweep.get("id") in (c.get("parents") or [])]
-            if waiting:
-                return "fail", f"{where}: cluster card(s) {waiting} name the sweep as a parent", payload
-            return "pass", f"{where}: none of {len(cards)} cluster card(s) waits on the sweep", payload
+        if self.require == "every_card_waits_on_the_sweep":
+            free = [c["id"] for c in cards if sweep.get("id") not in (c.get("parents") or [])]
+            if free:
+                return "fail", f"{where}: cluster card(s) {free} do not name the sweep as a parent", payload
+            return "pass", f"{where}: all {len(cards)} cluster card(s) wait on the sweep", payload
 
         roster = payload.get("roster") or []
         if not roster:
@@ -3069,6 +3072,113 @@ class BootstrapDeliveredVerifier(_OnboardingPollVerifier):
         if status in ("claimed", "running"):
             return "fail", f"the {job} run that claimed the report at {claimed} is still {status}", read
         return "fail", f"the {job} run that claimed the report at {claimed} ended {status}: {run.get('error') or 'no error recorded'}", read
+
+
+@VERIFIERS.register("bootstrap_handoff")
+class BootstrapHandoffVerifier(_OnboardingPollVerifier):
+    """Checks the discovery sweep's hand-off to the prioritization stage.
+
+    The onboarding gate's hand-off (``bootstrap_handoff.py``) compiles the
+    sweep's Cluster Agent cards' results into ``INVENTORY.raw.md`` on the
+    shell sandbox and files the
+    ``bootstrap-inventory-prioritize`` card, whose worker extracts the raw
+    file's ```findings block. This reads both ends of that hand-off
+    (:mod:`kube_agents_bench.onboarding`): the board on the agent pod and the
+    raw file on the sandbox.
+
+    ``require``:
+
+    - ``raw_report_has_findings_block``: the sandbox's own
+      ``inventory_findings.parse_block`` accepts the raw file, and every
+      cluster card created at or after the sweep that is ``done`` with
+      findings in its latest completed run's metadata has at least one block
+      line for its cluster. The sandbox's parser is the oracle, so the
+      verdict is what the next stage would make of the file.
+    - ``ranking_card_filed``: a card keyed ``bootstrap-inventory-prioritize``
+      created at or after the sweep exists and is not archived.
+
+    Fails closed: either pod unreadable, no sweep marker, a sweep the board
+    does not know, a board that cannot be queried, or a parser the sandbox
+    cannot import is ``status="error"``.
+    """
+
+    type: Literal["bootstrap_handoff"]
+    require: Literal["raw_report_has_findings_block", "ranking_card_filed"]
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        board = onboarding.read_handoff_board(onboarding.agent_shell, read_timeout)
+        if board is None:
+            return "error", "the agent pod's board could not be read (kubectl exec failed or the command did not run)", None
+        if board.get("error"):
+            return "error", str(board["error"]), board
+        sweep = board.get("sweep") or {}
+        where = f"sweep {sweep.get('id')} ({sweep.get('status')})"
+        if self.require == "ranking_card_filed":
+            return self._ranking(board, where)
+        return self._raw(board, where, read_timeout)
+
+    @staticmethod
+    def _ranking(board: dict[str, Any], where: str) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        key = onboarding.PRIORITIZE_KEY
+        live = [c for c in board.get("keyed") or [] if c.get("status") != "archived"]
+        if live:
+            card = live[-1]
+            return "pass", f"{where}: ranking card {card['id']} ({card['status']}) is keyed {key}", board
+        parts = [f"{where}: no unarchived card keyed {key} was filed at or after the sweep"]
+        archived = [c["id"] for c in board.get("keyed") or []]
+        if archived:
+            parts.append(f"keyed card(s) {archived} are archived")
+        unkeyed = board.get("unkeyed") or []
+        if unkeyed:
+            described = [f"{c['id']} ({c['status']}, key {c.get('key')!r}): {c.get('title')!r}" for c in unkeyed]
+            parts.append(f"a ranking card was filed without the key: {described}")
+        return "fail", "; ".join(parts), board
+
+    @staticmethod
+    def _raw(
+        board: dict[str, Any], where: str, read_timeout: float
+    ) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        read = onboarding.read_raw_block(onboarding.sandbox_shell, read_timeout)
+        pod, raw_file = onboarding.sandbox_pod(), onboarding.RAW_FILE
+        if read is None:
+            return "error", f"{pod} could not be read (kubectl exec failed or the command did not run)", None
+        if read.get("error"):
+            return "error", f"{pod}: {read['error']}", read
+        raw = {"board": board, "raw": read}
+        if read.get("raw") == "absent":
+            return "fail", f"{where}: there is no {raw_file} on {pod}", raw
+        if read.get("raw") == "unreadable":
+            return "fail", f"{where}: {raw_file} on {pod} cannot be read as UTF-8 text: {read.get('errors')}", raw
+        if read.get("items") is None:
+            errors = read.get("errors") or []
+            more = int(read.get("error_count") or 0) - len(errors)
+            tail = f" (and {more} more)" if more > 0 else ""
+            return (
+                "fail",
+                f"{where}: the sandbox's parser rejects {raw_file} with exit code {read.get('code')}: {errors}{tail}",
+                raw,
+            )
+        items = read["items"]
+        covered = {i.get("cluster") for i in items}
+        with_findings = [c for c in board.get("clusters") or [] if c.get("cluster") and (c.get("findings") or 0) > 0]
+        missing = sorted({c["cluster"] for c in with_findings} - covered)
+        if missing:
+            return (
+                "fail",
+                (
+                    f"{where}: {raw_file} has {len(items)} block line(s) and none for cluster(s) {missing}, "
+                    "whose Cluster Agent cards completed with findings"
+                ),
+                raw,
+            )
+        return (
+            "pass",
+            (
+                f"{where}: {raw_file} has {len(items)} block line(s) covering all "
+                f"{len({c['cluster'] for c in with_findings})} cluster(s) whose cards completed with findings"
+            ),
+            raw,
+        )
 
 
 # ------------------------------------------------------------ shell sandbox

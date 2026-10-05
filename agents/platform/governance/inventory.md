@@ -1,25 +1,25 @@
 # First-Time Environment Discovery & Inventory Scan (`bootstrap-inventory-scan`)
 
-**Purpose:** Executes the background GKE environment discovery, topology inspection, and SRE workload audit on initial agent boot, generating the unified `/opt/data/INVENTORY.raw.md` file.
+**Purpose:** Starts the first-time GKE environment discovery on initial agent boot: enumerate the
+fleet, hand one audit card to each cluster's Cluster Agent, audit any cluster that has none, and
+complete.
 
-That file is the **complete** findings set, and it is not what the user receives. A separate
-prioritization stage (`inventory_prioritize_sop.md`) ranks it down to the short report delivered to
-chat as `/opt/data/INVENTORY.md`. Your job is to be thorough; being brief is the next stage's job.
+You do not write the report. Once the per-cluster cards settle, the onboarding gate
+(`bootstrap_handoff.py`, a script) writes their structured `metadata` into
+`/opt/data/INVENTORY.raw.md` and files the card that ranks it into the report delivered to chat as
+`/opt/data/INVENTORY.md`. Your job is to make sure every cluster is either handed to a Cluster Agent,
+audited by you, or named as a gap.
 
 ---
 
 ## Pre-Execution Check
 
-0. **Which card are you?** If your card body told you to resume this SOP at Step 4, you are an
-   aggregation card a run of the older fan-in shape filed before it was retired (#1010): go
-   straight there and skip the status check below. It describes the state
-   you are in — no `INVENTORY.raw.md`, no `INVENTORY.md` — and would send you back through
-   discovery and the fan-out you were created to collect, re-filing your own card as its own
-   parent and finishing onboarding with no report written.
-1. **Verify Status:** Check directly via terminal command (`test -e /opt/data/INVENTORY.raw.md`) or directly inspect exact absolute file paths using `read_file` on `/opt/data/INVENTORY.raw.md`. **Do not run relative directory search patterns (`search_files`) since your active working directory (`cwd`) resides inside a subfolder where `/opt/data/` markers won't be listed.**
-   - If `/opt/data/INVENTORY.md` is already built on disk, the whole flow has run: return strictly `[SILENT]` immediately and do nothing.
-   - If `/opt/data/INVENTORY.raw.md` exists but `/opt/data/INVENTORY.md` does not, the sweep already finished and the handoff is what did not: **skip discovery entirely and go straight to Step 5** to file the prioritization card. Do not re-scan the fleet, and do not write the report yourself.
-   - If both are confirmed absent, proceed through the systematic technical discovery process below.
+1. **Verify Status:** Check `test -e /opt/data/INVENTORY.raw.md` with an absolute path. **Do not run
+   relative directory search patterns (`search_files`): your working directory is a subfolder where
+   `/opt/data/` files are not listed.**
+   - If it exists, discovery already ran and was handed off: complete this card with a one-line
+     `result` saying so, and do nothing else.
+   - Otherwise proceed.
 
 ---
 
@@ -43,15 +43,15 @@ you (`SOUL.md` §6). **Your card lists one `kanban_create` call per Cluster Agen
 those calls and no others.** The gate read them from the Cluster Agent profiles when it filed this
 card and kept only the ones ready to take a card, so a roster you look up yourself does not match
 it. If the card lists none, there are no
-Cluster Agents: skip to Step 4 and audit every cluster from Step 1 yourself. Make the calls **all up
-front, in one burst and with no `parents`**, so the dispatcher runs them concurrently. Each has this
-shape:
+Cluster Agents: skip to Step 3 and audit every cluster from Step 1 yourself. Make the calls **all up
+front, in one burst, each with this card's id in `parents`**. Each has this shape:
 
 ```
 kanban_create(
   assignee='<the Cluster Agent profile>',
   idempotency_key='bootstrap-inventory-cluster-<the Cluster Agent profile>',
   title='Report cluster inventory: `<cluster>` (`<project>`, `<location>`)',
+  parents=[<this card's id>],
   body=<the instructions below>,
 )
 ```
@@ -63,10 +63,14 @@ The body must send that agent to the single-cluster SOP, reading whichever of th
 
 and tell it to complete its card with the structured `metadata` that SOP specifies.
 
+`parents` holds the per-cluster cards until this card completes. That is what lets you complete it
+in Step 4 straight away: the board refuses a completion while cards this card filed are unfinished,
+unless this card is their parent. They start as soon as you complete.
+
 **Point at the SOP; do not summarise it in the card body.** The checks are specific — probes,
 requests and limits and the resulting QoS class, HPA coverage, `privileged` / `hostPID` /
 `hostNetwork`, ResourceQuotas, LimitRanges, NetworkPolicies, Workload Identity — and so is the
-`metadata` shape the aggregation stage reads. A body written freehand loses both, and what comes
+`metadata` shape the hand-off reads. A body written freehand loses both, and what comes
 back is a topology listing with no findings in it. That has been observed: four cards completed in
 under two minutes each, every one of them with no `metadata` at all, and the fleet report that
 followed named zero problems on a fleet that had them.
@@ -74,60 +78,21 @@ followed named zero problems on a fleet that had them.
 **Do not create, repair, or delete a Cluster Agent profile.** Profile lifecycle belongs to
 `cluster_agent_reconcile.py`, which holds the scope and its exclusions and the create/prune
 rules; a profile you create by hand is one the next reconcile run may immediately prune, and you
-will loop. A cluster no call on your card covers is yours to audit in Step 4 — or, if you cannot
-reach it, a row in the report saying so.
+will loop. A cluster no call on your card covers is yours to audit in Step 3 — or, if you cannot
+reach it, an entry in `gaps` saying so.
 
 ---
 
-## Step 3: Wait for the per-cluster cards on this card
+## Step 3: Audit the clusters no call covers
 
-Keep this card open and poll every per-cluster card from Step 2: `kanban_show(<id>)` for each,
-`sleep 60` between polling rounds (double it once the wait passes five minutes), until all of them are settled (`done` or `archived`). Then read
-each one's `metadata` and carry on to Step 4 **in this same run**.
-
-**Do not complete this card yet, and do not `kanban_block` on the per-cluster cards.** Completing
-now hands back a dispatch receipt as this card's final result and loses the fleet report — the
-per-cluster results become metadata on cards nobody reads (`kanban_complete` refuses this shape
-while the per-cluster cards are unfinished; see `SOUL.md` §0/§6 and issue #1010). Blocking with
-`kind="dependency"` deadlocks the board instead of waiting (`SOUL.md` §0). Poll.
-
-If a per-cluster card blocks or keeps failing, note the gap and proceed with the rest of the fleet
-— Step 4 already requires a row for every cluster the enumeration returned, reporting ones the
-children never covered.
-
----
-
-## Step 4: Compile Raw Inventory (`/opt/data/INVENTORY.raw.md`)
-
-**This step and the two after it run on the same card, after the Step 3 wait.** Your input is the
-`metadata` of every per-cluster card — read during the Step 3 wait, or already in your worker
-context if you are a pre-#1010 aggregation card — their `topology`, `workloads`,
-`namespace_governance`, `findings` and `gaps`.
-
-**Get the fleet list before you write anything.** If you did not run Step 1 in this run — a
-different card did, and none of its output reaches you — run it now:
-
-```
-gcloud config get-value project
-gcloud container clusters list --project=<that project>
-```
-
-If instead you are the Step 2 worker continuing here because no cluster had an agent, you already
-have that list and must not re-run the enumeration. Either way the list, not the child cards, is
-what makes the report whole: the children tell you only about clusters that had an agent to report,
-the `Status` column has no other source, and any listed cluster that returned no `metadata` is one
-nobody has audited.
-
-**A cluster with no Cluster Agent has no `metadata`, and you audit it here yourself.** Those are
-the clusters in the list that no `kanban_create` call on your card names: all of them when the card
+**A cluster with no Cluster Agent has no card, and you audit it here yourself.** Those are the
+clusters Step 1 listed that no `kanban_create` call on your card names: all of them when the card
 lists none, and usually none otherwise, because the reconcile gives every listed cluster a profile.
-Take the set from the card's calls, not from a roster you look up. A pre-#1010 aggregation card
-carries no calls: its set is the listed clusters none of its child cards reported on. Follow Steps 2 to 4 of `cluster_inventory_audit_sop.md`
-for each, and record what you find in that SOP's Step 5 `metadata` shape: Step 2 is the
-control-plane topology the fleet table's columns need, and Steps 3 and 4 are the probes,
-requests/limits and QoS, HPA, security context, namespace governance, addons, observability and
-hardening checks the Cluster Agents ran. Do not re-audit a cluster that did report; a cluster that
-returned a `gaps` entry is a cluster whose gap you record.
+Take the set from the card's calls, not from a roster you look up. Follow Steps 2 to 4 of
+`cluster_inventory_audit_sop.md` for each, and record what you find in that SOP's Step 5 `metadata`
+shape: Step 2 is the control-plane topology, and Steps 3 and 4 are the probes, requests/limits and
+QoS, HPA, security context, namespace governance, addons, observability and hardening checks the
+Cluster Agents run.
 
 **Pin `kubectl` to each cluster before you run a single command against it.** That SOP is written
 for a Cluster Agent whose `KUBECONFIG` already points at one cluster; yours does not. Bare
@@ -140,152 +105,38 @@ Cluster Agent's own cluster and not one you are auditing on its behalf. A cluste
 uncovered precisely because credentials for it could not be minted; if that happens to you too,
 record it as unaudited and why, and audit nothing on it.
 
-One check is yours rather than theirs, because it reads a resource only this cluster has: before
-you record an observability gap, read `.status.telemetry` on the PlatformAgent to see which
-collector the agents are actually exporting to. A Cluster Agent pinned to a workload cluster cannot
-see it, so it reports what it found on its own cluster and you reconcile.
-
-Write the unified file `/opt/data/INVENTORY.raw.md`. **This is the complete findings set, and it is the only record of what the sweep saw — the prioritization stage reads this file and nothing else, so anything you omit here is invisible for the rest of onboarding.** Write in clean Markdown. Do not leave placeholders, "TODO", or truncated tables; fill in every value you discovered (use `n/a` only when a value genuinely does not apply).
-
-Length is not a concern here and completeness is. This file is not delivered to chat directly; it is ranked down first, and it stays on disk so the user can ask for the full inventory later.
-
-Structure the file in this order:
-
-1. **Greeting Header:** A short, friendly heading and one or two sentences framing the report — e.g. a title like `# GKE Environment Discovery Report`, and a line noting this is the first-time environment scan for the project.
-
-2. **GKE Fleet Discovery Table:** One row per discovered cluster.
-
-   | Cluster Name | GCP Region / Zone | Status | K8s Version | Node Pools / Machine Types | Workload Identity | Observability Stack | Deployment Toolchain |
-   | :----------- | :---------------- | :----- | :---------- | :------------------------- | :---------------- | :------------------ | :------------------- |
-
-3. **Workloads Inventory Table:** One row per workload discovered across clusters.
-
-   | Cluster | Namespace | Workload Name | Kind | Replicas (`Ready/Total`) | Probes (`Live/Ready`) | Resource QoS (`Req/Lim`) | OTel / Telemetry | Security Context (`NonRoot`) |
-   | :------ | :-------- | :------------ | :--- | :----------------------- | :-------------------- | :----------------------- | :--------------- | :--------------------------- |
-
-4. **Prioritized SRE Remediation Plan:** The full set of high-impact recommendations, grouped by priority — not just headings, but a concrete, actionable list under each:
-   - **Priority 1 — Security & Identity Hardening** (Workload Identity, Shielded Nodes, Dataplane V2, Pod Security Admission, non-root/read-only filesystems).
-   - **Priority 2 — Workload Reliability & Probes** (missing liveness/readiness/startup probes, resource requests/limits and QoS, HPA coverage).
-   - **Priority 3 — Observability & Telemetry** (OpenTelemetry collection, Managed Service for Prometheus, SLO/error-budget alerting, missing standard SRE alerts).
-
-   For each item, name the affected cluster/namespace/workload where applicable and state the recommended action concisely, so the reader can act on it directly.
-
-   **Every `findings[]` entry from every per-cluster card belongs in one of these three groups.**
-   This section is the only part of the file the prioritization stage can rank, so a finding a
-   Cluster Agent reported and this list omits is a finding the user never sees. Carry its
-   `severity` through — the next stage classifies against its own anchors, but it reads yours as
-   the evidence for doing so.
-
-5. **Machine-Readable Findings Block:** the same findings again, one JSON object per line, inside a
-   fence whose info string is exactly `findings`:
-
-   ````
-   ```findings
-   {"check": "probes-readiness", "project": "acme-prod", "cluster": "prod-eu", "namespace": "payments", "object": "checkout", "title": "checkout Deployment has no readinessProbe", "detail": "3 replicas, no readinessProbe on any container", "severity_hint": "high"}
-   {"check": "workload-identity-off", "project": "acme-prod", "cluster": "prod-eu", "object": "prod-eu", "title": "Workload Identity is not enabled on the cluster", "severity_hint": "high"}
-   ```
-   ````
-
-   This block is what the prioritization stage registers, so **every problem in the prose plan above
-   needs a line here, and every line here needs to be a real finding.** The two are the same set said
-   twice: the prose for a person, the block for the next stage.
-
-   - `check`, `project`, `cluster`, `object` and `title` are required. `project` is the GCP
-     project id the cluster lives in — the queue keys on it because a cluster name alone is
-     ambiguous across projects. `namespace` is omitted for a cluster-scoped finding; `object` is
-     then the cluster's own name.
-   - **One line per affected object, not per condition.** A missing `readinessProbe` on three
-     Deployments is three lines. Each has its own manifest to change and gets fixed on its own
-     schedule, and `check` + `project` + `cluster` + `namespace` + `object` is the finding's
-     identity in the queue — collapsing them here loses two of the three permanently. The report
-     gathers them back into one line.
-   - `check` is a lowercase hyphenated slug naming the condition, stable across sweeps. Use the
-     vocabulary below where one fits.
-   - Optional: `detail` (what was observed, including how you know — a command's output, an absent
-     field), `severity_hint` (`high`/`medium`/`low`, your judgement with the whole fleet in view),
-     `provider_managed` (`true` for an object in `kube-system`, `kube-public`, `kube-node-lease`,
-     `gke-*` or `gmp-*`). `provider_managed` is a JSON boolean, not the string `"true"`.
-   - Do not score anything. The rubric lives in the next stage and needs the whole fleet's findings
-     side by side.
-   - A clean fleet writes the fence with nothing between the lines. An absent block is not the same
-     thing, and the next stage treats it as a broken sweep.
-
-   Nothing else goes in the block: no rank, no severity word, no recommendation prose. A line the
-   next stage cannot parse stops registration for the whole file, so keep each one to a single line
-   of valid JSON.
-
-   **The check vocabulary.** These are the audit streams' own slugs. Using them means the same
-   problem carries one identity whichever source found it, and a finding promoted out of the queue
-   routes to the stream that owns the check.
-
-   | what you found                   | check slug                            |
-   | -------------------------------- | ------------------------------------- |
-   | liveness / readiness probes      | `probes-liveness`, `probes-readiness` |
-   | missing `startupProbe`           | `probes-startup`                      |
-   | requests, limits, QoS class      | `no-requests`, `no-memory-limit`      |
-   | HPA coverage                     | `no-hpa`, `hpa-cannot-scale`          |
-   | NetworkPolicy                    | `netpol-missing`                      |
-   | ResourceQuota and LimitRange     | `no-resourcequota`                    |
-   | Workload Identity                | `workload-identity-off`               |
-   | `runAsNonRoot` security context  | `podsecurity-gaps`                    |
-   | missing `readOnlyRootFilesystem` | `readonly-root-fs`                    |
-   | Shielded Nodes                   | `shielded-nodes`                      |
-   | Dataplane V2                     | `datapath-provider`                   |
-   | Managed Service for Prometheus   | `managed-prometheus`                  |
-   | node auto-upgrade                | `no-autoupgrade`                      |
-
-   For anything else, write a lowercase hyphenated slug naming the condition, and keep it stable: it
-   is the row's identity across every later sweep.
+For the clusters you audit here, one check reads a resource only this cluster has: before you
+record an observability gap, read `.status.telemetry` on the PlatformAgent to see which collector
+the agents are actually exporting to. Report it as `telemetry` in Step 4 as well: the hand-off puts
+it in the raw report beside the Cluster Agents' observability findings, which could not see it.
 
 ---
 
-## Step 5: Hand Off to Prioritization
+## Step 4: Complete the Card
 
-Once `/opt/data/INVENTORY.raw.md` is fully written and confirmed on disk, file exactly one card to
-rank it into the delivered report:
+**Complete this card now. Do not wait for the per-cluster cards, do not write
+`/opt/data/INVENTORY.raw.md` or `/opt/data/INVENTORY.md`, and do not file a ranking card** — the
+onboarding gate does all three once the per-cluster cards settle. Waiting is what this card used to
+do, and it has no tool that waits reliably.
 
+Call `kanban_complete` with a short factual `result` (clusters listed, cards filed, clusters you
+audited) and this `metadata`:
+
+```json
+{
+  "fleet": [{ "project": "…", "cluster": "…", "location": "…", "status": "RUNNING" }],
+  "clusters": [<one Step 3 audit per cluster, in the single-cluster SOP's metadata shape>],
+  "telemetry": "<the PlatformAgent's .status.telemetry, one line>",
+  "gaps": ["<anything you could not do, and why>"]
+}
 ```
-kanban_create(
-  assignee='platform',
-  idempotency_key='bootstrap-inventory-prioritize',
-  title='Prioritize the onboarding inventory report',
-  parents=[<this card's id>],
-  body=<the instructions below>,
-)
-```
 
-`parents` matters: it queues the ranking to run after this card completes, which is what lets your
-own `kanban_complete` in Step 6 close this card while the ranking is still pending — a
-free-running child would be refused as unfinished fan-out work (#1010).
+`fleet` is every cluster Step 1 listed: the hand-off names any of them that no audit reported on, so
+a silent gap does not read as a clean cluster. `clusters` is an empty list when every cluster had an
+agent. `telemetry` is the collector the agents export to: read `.status.telemetry` on the PlatformAgent
+once and summarise it. A Cluster Agent cannot see that resource, so the report shows it beside their
+observability findings. A cluster you could not reach goes in `gaps`, not silently out of `fleet`. If you could not
+list the clusters at all, say so in `gaps` and complete anyway — onboarding runs once.
 
-The body must tell that worker to follow the prioritization SOP, reading whichever of these exists:
-
-- `/opt/data/profiles/platform/governance/inventory_prioritize_sop.md`
-- `/opt/platform-template/governance/inventory_prioritize_sop.md`
-
-and to read `/opt/data/INVENTORY.raw.md` as its only input, writing the ranked report to
-`/opt/data/INVENTORY.md`.
-
-**Use that exact idempotency key.** Onboarding must happen once; the key is what makes a retry or a
-duplicate of this card re-attach to the prioritization already in flight instead of writing the
-report twice. One caveat: the board answers a repeated key with the id of the existing card, even a
-completed one. If the create returns a card that has already completed and `/opt/data/INVENTORY.md`
-is still absent, that earlier card failed without producing a report — file one more card with a
-suffixed key (`bootstrap-inventory-prioritize-retry-1`) instead of reusing a key the board has
-already answered.
-
-**Do not prioritize the findings yourself.** Ranking runs as its own card on purpose: it must see the
-raw findings and nothing else. Doing it here would rank them against the whole transcript of your
-sweep instead, which produces a different report depending on how the sweep happened to go.
-
----
-
-## Step 6: Complete the Card, Then Exit Silently
-
-Once the prioritization card is filed, call `kanban_complete`: `result` is a short factual account
-of the sweep — clusters audited, findings count, that the full findings are at
-`/opt/data/INVENTORY.raw.md` and ranking is queued. Completing is what releases the prioritization
-card (it lists this card in `parents`). Then return strictly `[SILENT]` without running any
-further terminal commands. Delivery to chat is handled separately by the
-`bootstrap-inventory-delivery` job, after prioritization writes `/opt/data/INVENTORY.md` — do not
-attempt to send the report yourself.
+Then return strictly `[SILENT]`. Delivery to chat is handled separately; do not send anything to the
+user.

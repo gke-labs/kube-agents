@@ -2427,11 +2427,12 @@ unit_cost_hint() {
     # record and then waits for the card. 1040-1080s a repetition on a dev
     # install on 2026-10-02.
     autoops-controller-stall-triage) echo 1100 ;;
-    # Tofu too: the plant waits for the cron job to file the sweep and for the
-    # sweep's worker to file its cards and end its run (up to the stack's
-    # run_wait, 900s), and the agent turn is a board read. 340-520s a
-    # repetition on 2026-09-28.
-    bootstrap-discovery-fanout) echo 600 ;;
+    # Tofu too: the plant waits for the cron job to file the sweep, then for
+    # the gate's hand-off to file the ranking card or for the sweep's Cluster
+    # Agent cards to settle (up to the stack's handoff_wait, 1800s), and the
+    # agent turn is a board read. About 960s a repetition on a dev install on
+    # 2026-10-05; 340-520s when it waited only for the fan-out (2026-09-28).
+    bootstrap-discovery-fanout) echo 1000 ;;
     # Tofu too: the plant files one card and waits for its worker to run the
     # prioritization SOP and end its run (up to the stack's run_wait, 900s),
     # and the agent turn is a board read. Unmeasured; priced below the band

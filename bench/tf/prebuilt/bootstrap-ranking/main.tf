@@ -33,8 +33,9 @@
 # job is paused, or it sends anywhere but `local`:
 # the ranked report this produces is the one onboarding delivers, and arming
 # delivery with a chat bound would post it there. It also refuses one whose
-# gate has not filed its sweep (no `.bootstrap_scan_filed`), because a sweep
-# filed during the run writes its own INVENTORY.raw.md over the planted one.
+# gate has not filed its sweep (no `.bootstrap_scan_filed`), because the hand-off
+# of a sweep filed during the run writes its own INVENTORY.raw.md over the
+# planted one.
 # Open `bootstrap-inventory-*` cards are archived before the plant, so an
 # earlier sweep still running cannot do that either; the sweep marker stays,
 # so the gate files no other.
@@ -84,8 +85,8 @@ locals {
   # untouched.
   raw_b64 = base64encode(file("${path.module}/inventory-raw.txt"))
   # bootstrap_scan_gate.py's PRIORITIZE_IDEMPOTENCY_KEY and SCAN_ASSIGNEE, and
-  # the card agents/platform/governance/inventory.md Step 5 tells the sweep's
-  # worker to file, without the parent: this plant stands in for that worker.
+  # the card agents/chat/scripts/bootstrap_handoff.py files: this plant stands
+  # in for the hand-off.
   card_key      = "bootstrap-inventory-prioritize"
   card_assignee = "platform"
   card_title    = "Prioritize the onboarding inventory report"

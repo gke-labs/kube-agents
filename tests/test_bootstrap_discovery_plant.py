@@ -63,6 +63,7 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _MODULE = _REPO_ROOT / "bench" / "tf" / "prebuilt" / "bootstrap-discovery" / "main.tf"
 _HEREDOC_RE = re.compile(r"command\s*=\s*<<-EOT\n(.*?)\n\s*EOT\n", re.S)
 _RUN_STATE_RE = re.compile(r"^run_state\(\) \{\n  agent_py [^\n]*<<'PY'\n(.*?)\nPY\n", re.S | re.M)
+_HANDOFF_STATE_RE = re.compile(r"^  handoff_state\(\) \{\n    agent_py [^\n]*<<'PY'\n(.*?)\nPY\n", re.DOTALL | re.MULTILINE)
 _STEP_1_RE = re.compile(r"^state=\"\$\(agent_py [^\n]*<<'PY' \|\| true\n(.*?)\nPY\n", re.S | re.M)
 _STEP_2_RE = re.compile(r"^old_id=\"\$\(agent_py <<'PY'\n(.*?)\nPY\n", re.S | re.M)
 _PLANT_BLOCK = 0
@@ -87,6 +88,10 @@ _INTERPOLATIONS = {
     "local.pod_wait": "5",
     "local.scan_job": "bootstrap-inventory-scan",
     "local.rate_limit_block": "provider rate limit: API retries exhausted",
+    "local.prioritize_key": "bootstrap-inventory-prioritize",
+    "local.handoff_wait": "1800",
+    "local.settle_hold": "120",
+    "var.wait_for": "fanout",
     "var.project_id": "kube-agents-evals",
     "var.host_cluster_name": "platform-agent-host",
     "var.host_cluster_location": "us-central1",
@@ -202,6 +207,14 @@ elif "/proc" in stdin:
         if target == "pod/gw-leader":
             (state / "gate_done").touch()
         print("idle")
+elif "bootstrap-inventory-prioritize" in cmd:
+    record("handoff_state")
+    states = os.environ.get("HANDOFF_STATES", "1 0 0").split(";")
+    answer = states[min(bump("handoff_state"), len(states) - 1)]
+    if answer == "fail":
+        sys.stderr.write("error: unable to upgrade connection: container not found\n")
+        sys.exit(1)
+    print(answer)
 elif "task_runs" in stdin:
     record("run_state")
     states = os.environ.get("RUN_STATES", "1 1 1 1").split(";")
@@ -336,6 +349,67 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("no worker picked up sweep card t_new within 900s", completed.stderr)
         self.assertNotIn("Board reads after", completed.stderr)
+
+    def test_the_fanout_default_never_reads_the_hand_off(self):
+        completed, calls = self._run(GATE_FILES=1, RUN_STATES="2 2 3 1")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(self._indices(calls, "[handoff_state]"), [])
+
+    def _run_handoff(self, **scenario):
+        script = pathlib.Path(self._dir.name) / "handoff.sh"
+        script.write_text(_render_plant(**{"var.wait_for": "handoff"}))
+        return self._run(script, GATE_FILES=1, **scenario)
+
+    def test_handoff_returns_once_the_ranking_card_is_keyed(self):
+        completed, calls = self._run_handoff(HANDOFF_STATES="1 0 0;1 0 0;1 1 0")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(len(self._indices(calls, "[handoff_state]")), 3)
+        self.assertEqual(self._indices(calls, "[run_state]"), [])
+        self.assertIn("a card keyed bootstrap-inventory-prioritize is on the board after 30s", completed.stdout)
+        self.assertEqual(self._indices(calls, "[archive]"), [])
+
+    def test_handoff_returns_after_the_cards_stay_settled_for_the_hold(self):
+        completed, calls = self._run_handoff(HANDOFF_STATES="1 0 0;1 0 1")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        # Settled from the read at 15s; 120s later is the read at 135s.
+        self.assertEqual(len(self._indices(calls, "[handoff_state]")), 135 // 15 + 1)
+        self.assertIn("settled for 120s with no card keyed bootstrap-inventory-prioritize", completed.stdout)
+
+    def test_handoff_restarts_the_hold_when_a_card_unsettles(self):
+        completed, calls = self._run_handoff(HANDOFF_STATES="1 0 1;1 0 1;1 0 0;1 0 1")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        # Settled again from the read at 45s, so the hold ends at 165s.
+        self.assertEqual(len(self._indices(calls, "[handoff_state]")), 165 // 15 + 1)
+
+    def test_handoff_keeps_the_hold_across_a_failed_read(self):
+        completed, calls = self._run_handoff(HANDOFF_STATES="1 0 1;fail;1 0 1")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(len(self._indices(calls, "[handoff_state]")), 120 // 15 + 1)
+
+    def test_handoff_hands_over_at_its_ceiling(self):
+        completed, calls = self._run_handoff(HANDOFF_STATES="1 0 0")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(len(self._indices(calls, "[handoff_state]")), 1800 // 15 + 1)
+        self.assertIn("No card keyed bootstrap-inventory-prioritize", completed.stdout)
+        self.assertEqual(self._indices(calls, "[archive]"), [])
+
+    def test_handoff_reports_a_sweep_no_worker_picked_up(self):
+        completed, calls = self._run_handoff(HANDOFF_STATES="0 0 0")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("no worker picked up sweep card t_new within 900s", completed.stderr)
+        self.assertEqual(len(self._indices(calls, "[handoff_state]")), 900 // 15 + 1)
+
+    def test_handoff_reports_a_board_it_never_read_as_unread(self):
+        completed, calls = self._run_handoff(HANDOFF_STATES="fail")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("no read of sweep card t_new's hand-off from the board succeeded", completed.stderr)
+        self.assertEqual(len(self._indices(calls, "[open_cards]")), 3)
+
+    def test_handoff_bash_syntax_is_valid(self):
+        script = pathlib.Path(self._dir.name) / "handoff.sh"
+        script.write_text(_render_plant(**{"var.wait_for": "handoff"}))
+        completed = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_step_1_refuses_every_state_but_clear_before_re_arming(self):
         # "" is a step-1 read that failed: only the catch-all arm stops it.
@@ -757,6 +831,75 @@ class RunStateQueryTest(unittest.TestCase):
         old = [("t_old_child", _CLUSTER_KEY + "old", "t_old_sweep", 50)]
         self.assertEqual(self._query([(100, 210, "blocked", "Waiting for the roster")], [], other_children=old), "1 1 0 0")
         self.assertEqual(self._query([(100, 210, "completed", "done")], [120, 200], other_children=old), "1 1 2 1")
+
+
+class HandoffStateQueryTest(unittest.TestCase):
+    """Step 4's hand-off query, run under the test interpreter against a board."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._dir = tempfile.TemporaryDirectory()
+        cls._home = cls._dir.name
+        cls._script = _HANDOFF_STATE_RE.search(_render_plant(**{"local.home": cls._home})).group(1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._dir.cleanup()
+
+    def _query(self, sweep_status, cards=(), runs=1, sweep_at=100):
+        board = pathlib.Path(self._home) / "kanban.db"
+        board.unlink(missing_ok=True)
+        with sqlite3.connect(board) as conn:
+            conn.execute(
+                "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT NOT NULL, "
+                "created_at INTEGER NOT NULL, idempotency_key TEXT)"
+            )
+            conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT NOT NULL)")
+            conn.execute("INSERT INTO tasks VALUES (?, ?, ?, 'bootstrap-inventory-scan')", (_SWEEP, sweep_status, sweep_at))
+            conn.executemany(
+                "INSERT INTO tasks VALUES (?, ?, ?, ?)",
+                [(f"t_{i}", status, at, key) for i, (key, status, at) in enumerate(cards)],
+            )
+            conn.executemany("INSERT INTO task_runs (task_id) VALUES (?)", [(_SWEEP,)] * runs)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-",
+                _SWEEP,
+                _INTERPOLATIONS["local.cluster_key_like"],
+                _INTERPOLATIONS["local.prioritize_key"],
+            ],
+            input=self._script,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return completed.stdout.strip()
+
+    def test_a_keyed_ranking_card_after_the_sweep_counts(self):
+        cards = [(_INTERPOLATIONS["local.prioritize_key"], "todo", 200)]
+        self.assertEqual(self._query("running", cards), "1 1 0")
+
+    def test_an_archived_or_older_ranking_card_does_not_count(self):
+        key = _INTERPOLATIONS["local.prioritize_key"]
+        self.assertEqual(self._query("running", [(key, "archived", 200)]), "1 0 0")
+        self.assertEqual(self._query("running", [(key, "todo", 50)]), "1 0 0")
+
+    def test_settled_needs_the_sweep_and_every_cluster_card_ended(self):
+        self.assertEqual(self._query("done", [(_CLUSTER_KEY + "a", "done", 150), (_CLUSTER_KEY + "b", "blocked", 150)]), "1 0 1")
+        self.assertEqual(self._query("done", [(_CLUSTER_KEY + "a", "done", 150), (_CLUSTER_KEY + "b", "running", 150)]), "1 0 0")
+        self.assertEqual(self._query("running", [(_CLUSTER_KEY + "a", "done", 150)]), "1 0 0")
+        self.assertEqual(self._query("blocked", [(_CLUSTER_KEY + "a", "archived", 150)]), "1 0 1")
+
+    def test_a_blocked_sweep_with_no_cluster_card_is_not_settled(self):
+        self.assertEqual(self._query("blocked"), "1 0 0")
+        self.assertEqual(self._query("done"), "1 0 1")
+
+    def test_a_previous_sweeps_cluster_card_is_ignored(self):
+        self.assertEqual(self._query("done", [(_CLUSTER_KEY + "old", "running", 50)]), "1 0 1")
+
+    def test_no_run_reads_as_not_started(self):
+        self.assertEqual(self._query("todo", runs=0), "0 0 0")
 
 
 if __name__ == "__main__":

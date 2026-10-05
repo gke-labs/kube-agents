@@ -2,24 +2,22 @@
 
 **Purpose:** The per-cluster half of first-time environment discovery, performed by a Cluster Agent
 on the one cluster it is pinned to. The Platform Agent fans this out during
-`bootstrap-inventory-scan` (`inventory.md`) and aggregates the results; this SOP covers only what
-one Cluster Agent does with its own cluster.
+`bootstrap-inventory-scan` (`inventory.md`), and the onboarding gate's hand-off script collects the
+results from every card; this SOP covers only what one Cluster Agent does with its own cluster.
 
 You are one of several agents auditing in parallel. **Report your findings on your card and write
 nothing to shared state.** Specifically: do not write `/opt/data/INVENTORY.raw.md` or
 `/opt/data/INVENTORY.md`, do not create kanban cards, and do not check whether either file already
-exists. Those steps belong to the Platform Agent, and running them here means several agents
-writing one path at once.
+exists. Those steps belong to the hand-off, and running them here means several writers on one
+path at once.
 
 **Never block this card, whatever fails** — not for a failed `cluster_preflight.sh`, denied
 permissions, a cluster in `ERROR`, credentials that will not mint, or an MCP tool that errors. This
 overrides `SOUL.md` §6 step 2, your own `AGENTS.md` ("Fail loud, never silent"), and `SOUL.md` §2.
-The platform card that fanned this one out waits for it to reach `done` or `archived` before it
-compiles the fleet report (and a pre-#1010 aggregation card, where one is still in flight, lists
-this card in its `parents`, which `claim_task` enforces the same way). A block is not `done`, nothing re-arms
-`.bootstrap_scan_filed`, and the notifier reaches nobody on a card the cron gate filed — so one
-blocked card costs the fleet report permanently and silently. Record what failed in `gaps`, and
-complete.
+The hand-off waits for this card to be `done` or `blocked` and then reads its `metadata`. A blocked
+card has none, so the report names its cluster as a gap carrying only the block reason, and nothing
+re-arms `.bootstrap_scan_filed` to try again — onboarding runs once. Record what failed in `gaps`,
+and complete: the report then shows what you did find and what you could not do.
 
 **A preflight failure other than check 5 means you audit nothing.** Complete with the failure in
 `gaps` and every other field empty. The script stops at the first failure, so a failure in checks
@@ -132,8 +130,8 @@ Google Cloud and GKE best practices where it helps.
 ## Step 5: Report on your card
 
 Complete the card with `kanban_complete`, supplying **both** a human-readable `result` and a
-structured `metadata` object. The Platform Agent's waiting sweep card reads `metadata` verbatim off
-this card and builds the fleet tables from it, so a finding that appears only in `result` prose is a
+structured `metadata` object. The onboarding hand-off reads `metadata` verbatim off this card and
+builds the fleet tables and the findings block from it, so a finding that appears only in `result` prose is a
 finding the report loses.
 
 `metadata` must have this shape:
@@ -183,6 +181,7 @@ finding the report loses.
   ],
   "findings": [
     {
+      "check": "probes-readiness",
       "severity": "high|medium|low",
       "area": "security|reliability|observability",
       "namespace": "…",
@@ -195,13 +194,38 @@ finding the report loses.
 }
 ```
 
+`check` is a lowercase hyphenated slug naming the condition, stable across sweeps: with the project,
+cluster, namespace and workload it is the finding's identity in the findings queue. These are the
+audit streams' own slugs; use one where it fits. Using them means the same
+problem carries one identity whichever source found it, and a finding promoted out of the queue
+routes to the stream that owns the check.
+
+| what you found                   | check slug                            |
+| -------------------------------- | ------------------------------------- |
+| liveness / readiness probes      | `probes-liveness`, `probes-readiness` |
+| missing `startupProbe`           | `probes-startup`                      |
+| requests, limits, QoS class      | `no-requests`, `no-memory-limit`      |
+| HPA coverage                     | `no-hpa`, `hpa-cannot-scale`          |
+| NetworkPolicy                    | `netpol-missing`                      |
+| ResourceQuota and LimitRange     | `no-resourcequota`                    |
+| Workload Identity                | `workload-identity-off`               |
+| `runAsNonRoot` security context  | `podsecurity-gaps`                    |
+| missing `readOnlyRootFilesystem` | `readonly-root-fs`                    |
+| Shielded Nodes                   | `shielded-nodes`                      |
+| Dataplane V2                     | `datapath-provider`                   |
+| Managed Service for Prometheus   | `managed-prometheus`                  |
+| node auto-upgrade                | `no-autoupgrade`                      |
+
+For anything else, write a lowercase hyphenated slug naming the condition, and keep it stable: it
+is the row's identity across every later sweep.
+
 One `findings` entry names one workload. `"workload": "multiple workloads"`, a comma-separated list,
 or `"e.g. networking-dra-driver"` all collapse on the way through aggregation into a line the user
 cannot act on; file one entry per affected workload instead, even when the issue and the
 recommendation repeat verbatim.
 
 `workloads` must hold one entry per workload Step 3 listed — every Deployment, StatefulSet,
-DaemonSet, and Job, including the ones with no findings. The aggregation stage has no way to go back
+DaemonSet, and Job, including the ones with no findings. The hand-off has no way to go back
 for the rest, and a summary row (`"workload": "multiple"`) is not one of them: the report cannot name
 what to fix from it. Before you complete the card, compare `len(workloads)` against the count Step 3
 produced; if it is short, either finish the enumeration or record the difference and the reason in
