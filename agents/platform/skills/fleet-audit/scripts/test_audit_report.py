@@ -69,8 +69,9 @@ AUDIT = "compliance-audit"
 # list; compliance-audit is the second stream with one.
 DECLARING_AUDIT = "obtainability-audit"
 # A stream whose SOP has no declared-intent step, for the tests about what such a
-# stream rejects and owes; the generic AUDIT is a declaring stream now.
-NON_DECLARING_AUDIT = "security-patch-orchestrator"
+# stream rejects and owes; the generic AUDIT is a declaring stream now, and so
+# is the patch stream.
+NON_DECLARING_AUDIT = "ai-security-audit"
 NOW = datetime(2026, 8, 1, 9, 30, tzinfo=timezone.utc)
 # How far the run-record stamp may sit from wall-clock and still be this run's.
 # Wide enough for a loaded CI worker, narrow enough that a hardcoded date fails.
@@ -5060,7 +5061,7 @@ class TestDeclaredIntent(BaseTestCase):
                 self.validate(doc)
 
     def test_a_stream_without_a_declared_intent_step_rejects_the_list(self):
-        # Seven streams have no declared-intent step. A worker on one of them that writes a
+        # Six streams have no declared-intent step. A worker on one of them that writes a
         # `declared` list has misread a step that does not exist for it, and a
         # hostile document has found a stream with no rule to break; both are
         # rejected whole rather than admitted because the check is on the
@@ -5072,7 +5073,7 @@ class TestDeclaredIntent(BaseTestCase):
             if not spec.declarable
         ]
         self.assertIn(NON_DECLARING_AUDIT, silent)
-        self.assertEqual(len(silent), len(audit_report.AUDITS) - 2)
+        self.assertEqual(len(silent), len(audit_report.AUDITS) - 3)
         for audit_id in silent:
             with self.subTest(audit=audit_id):
                 doc = make_doc(audit=audit_id, findings=[])
@@ -5422,6 +5423,57 @@ def posture_and_fault_findings():
 
 POSTURE_CHECKS = ("no-pdb", "no-hpa", "hpa-cannot-scale")
 FAULT_CHECKS = ("blocking-pdb", "no-requests")
+
+
+class TestPatchDeclaredShapes(HarnessTestCase):
+    """The patch stream's six postures: the knobs an owner sets, and nothing the fleet drifted into."""
+
+    PATCH_AUDIT = "security-patch-orchestrator"
+
+    def test_the_declarable_set_is_the_six_policy_knobs(self):
+        # Pinned as a literal: the catalogue test only checks the set is a
+        # subset of the roster, and a fault slipping in would pass it.
+        self.assertEqual(
+            audit_report.audit_declarable_checks(self.PATCH_AUDIT),
+            frozenset({"no-channel", "no-autoupgrade", "no-autorepair", "no-maintenance-window", "blocking-exclusion", "no-notifications"}),
+        )
+        for fault in ("master-behind", "pool-skew", "fleet-spread", "stale-image-type"):
+            self.assertNotIn(fault, audit_report.audit_declarable_checks(self.PATCH_AUDIT))
+
+    def _patch_finding(self, fid, check, obj, severity="minor"):
+        return make_finding(fid=fid, check=check, obj=obj, severity=severity, namespace="", cluster="acme-prod/us-east1/prod-us-east", command="gcloud container clusters describe prod-us-east --location=us-east1 --project=acme-prod --format=json", remediation={"kind": "manual", "note": "a human decides"})
+
+    def _patch_doc(self, findings):
+        clusters = [{"name": "acme-prod/us-east1/prod-us-east", "location": "us-east1", "project": "acme-prod"}]
+        return audit_report.validate_findings(make_doc(findings=findings, audit=self.PATCH_AUDIT, clusters=clusters), self.PATCH_AUDIT)
+
+    def test_a_declaration_moves_the_posture_and_not_the_version_lag_on_the_same_cluster(self):
+        # One note names the cluster for both: the knob moves, the lag stays,
+        # because `master-behind` is not in the set and is never looked up.
+        posture = self._patch_finding("notif", "no-notifications", "Cluster/prod-us-east")
+        pool = self._patch_finding("pool", "no-autoupgrade", "NodePool/batch-a", severity="major")
+        lag = self._patch_finding("lag", "master-behind", "Cluster/prod-us-east", severity="major")
+        doc = self._patch_doc([posture, pool, lag])
+        declarations = [
+            {"check": check, "namespace": "", "object": obj, "repo": "acme/fleet", "path": "knowledge/prod-us-east.md", "excerpt": "x"}
+            for check, obj in (("no-notifications", "Cluster/prod-us-east"), ("no-autoupgrade", "NodePool/batch-a"), ("master-behind", "Cluster/prod-us-east"))
+        ]
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, declarations)
+        self.assertEqual(sorted(f["check"] for f in moved), ["no-autoupgrade", "no-notifications"])
+        self.assertEqual([f["check"] for f in doc["findings"]], ["master-behind"])
+        self.assertEqual(sorted(e["check"] for e in doc["declared"]), ["no-autoupgrade", "no-notifications"])
+
+    def test_the_validator_rejects_a_declared_version_lag(self):
+        doc = make_doc(findings=[], audit=self.PATCH_AUDIT)
+        doc["declared"] = [make_declared(check="no-channel", cluster="prod-us-east", namespace="", obj="Cluster/prod-us-east")]
+        audit_report.validate_findings(copy.deepcopy(doc), self.PATCH_AUDIT)
+        for fault in ("master-behind", "pool-skew", "fleet-spread", "stale-image-type"):
+            with self.subTest(fault):
+                doc["declared"][0]["check"] = fault
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(copy.deepcopy(doc), self.PATCH_AUDIT)
+                self.assertIn("declared[0].check", str(cm.exception))
 
 
 class TestComplianceDeclaredShapes(HarnessTestCase):

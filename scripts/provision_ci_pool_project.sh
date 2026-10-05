@@ -64,10 +64,10 @@ readonly GITOPS_SEED_CONTENT="# GitOps Infrastructure Repo"
 # of the existence read stops the seed rather than writing blind.
 readonly GITOPS_NOTE_ABSENT_PATTERN="HTTP 404"
 readonly GITOPS_INTENT_NOTE_PATH="knowledge/notification-relay-no-pdb.md"
-readonly GITOPS_INTENT_NOTE_MESSAGE="Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, and token-reader's mounted token, as intended"
+readonly GITOPS_INTENT_NOTE_MESSAGE="Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, and seeded-c's missing upgrade notifications, as intended"
 readonly GITOPS_INTENT_NOTE_CONTENT='---
 type: decision
-title: seeded-intent and seeded-token carry three postures on purpose
+title: seeded-intent, seeded-token and seeded-c carry four postures on purpose
 declares:
   - check: no-pdb
     namespace: seeded-intent
@@ -78,6 +78,9 @@ declares:
   - check: default-sa-automount
     namespace: seeded-token
     object: Deployment/token-reader
+  - check: no-notifications
+    namespace: ""
+    object: Cluster/seeded-c
 ---
 
 `notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
@@ -85,8 +88,9 @@ it is a stateless relay whose clients retry, and a budget would only slow node d
 namespace carries no NetworkPolicy by design either: nothing in it accepts traffic. `token-reader`
 in `seeded-token` runs on the default ServiceAccount of its namespace with the token mounted by
 design: it reads the API server with that identity. Its neighbour `token-sidecar` is not declared.
-The obtainability and compliance audits list the three postures under Declared intent rather than
-as findings.'
+`seeded-c` publishes no GKE upgrade notifications by design: this fleet learns about upgrades from
+the weekly audit. The obtainability, compliance and upgrade readiness audits list the four postures
+under Declared intent rather than as findings.'
 
 # The host cluster's name is not a preference: scripts/verify_ci_pool_project.py
 # asserts it, hack/ci-env.sh selects it, and the Boskos lease resolves to it.

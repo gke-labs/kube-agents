@@ -196,6 +196,22 @@ AUDITS: dict[str, AuditSpec] = {
             "stale-image-type",
             "no-notifications",
         ),
+        # §4a of the SOP: the six checks that read a knob the owner sets —
+        # channel enrolment, a pool's auto-upgrade and auto-repair, the
+        # maintenance window, an exclusion, upgrade notifications — and so
+        # the only six a repository declaration may keep off the ledger. The
+        # other four report where the fleet ended up, not what anyone chose:
+        # a master behind its channel is the effect of an exclusion or a
+        # rollout, a skewed pool and a withdrawn image can take no patches,
+        # and the spread is a fleet-wide signal no one object owns.
+        declarable=(
+            "no-channel",
+            "no-autoupgrade",
+            "no-autorepair",
+            "no-maintenance-window",
+            "blocking-exclusion",
+            "no-notifications",
+        ),
     ),
     "obtainability-audit": AuditSpec(
         "Workload Reliability Audit",

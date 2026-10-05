@@ -376,14 +376,14 @@ GITOPS_SEED_CONTENT = "# GitOps Infrastructure Repo"
 # declared-intent cases (GITOPS_INTENT_NOTE_CASES) fail on a project whose
 # repository lacks it.
 GITOPS_INTENT_NOTE_PATH = "knowledge/notification-relay-no-pdb.md"
-GITOPS_INTENT_NOTE_MESSAGE = "Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, and token-reader's mounted token, as intended"
+GITOPS_INTENT_NOTE_MESSAGE = "Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, and seeded-c's missing upgrade notifications, as intended"
 # The script's GITOPS_INTENT_NOTE_CONTENT, byte for byte, so the repair this
 # verifier prints is the note provisioning seeds; a test pins the two copies
 # to each other. The body read back is judged by the audit's parser, not
 # compared to this text.
 GITOPS_INTENT_NOTE_CONTENT = """---
 type: decision
-title: seeded-intent and seeded-token carry three postures on purpose
+title: seeded-intent, seeded-token and seeded-c carry four postures on purpose
 declares:
   - check: no-pdb
     namespace: seeded-intent
@@ -394,6 +394,9 @@ declares:
   - check: default-sa-automount
     namespace: seeded-token
     object: Deployment/token-reader
+  - check: no-notifications
+    namespace: ""
+    object: Cluster/seeded-c
 ---
 
 `notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
@@ -401,8 +404,9 @@ it is a stateless relay whose clients retry, and a budget would only slow node d
 namespace carries no NetworkPolicy by design either: nothing in it accepts traffic. `token-reader`
 in `seeded-token` runs on the default ServiceAccount of its namespace with the token mounted by
 design: it reads the API server with that identity. Its neighbour `token-sidecar` is not declared.
-The obtainability and compliance audits list the three postures under Declared intent rather than
-as findings."""
+`seeded-c` publishes no GKE upgrade notifications by design: this fleet learns about upgrades from
+the weekly audit. The obtainability, compliance and upgrade readiness audits list the four postures
+under Declared intent rather than as findings."""
 # The declarations the audits' parser (audit_report.py parse_declarations) must
 # find in the note's `declares` list, each with the stream whose `declarable`
 # set is the policy for it. A file that has the path but not these declares
@@ -414,11 +418,13 @@ GITOPS_INTENT_NOTE_CASES = (
     "obtainability-declared-intent-no-finding",
     "compliance-declared-intent-no-finding",
     "compliance-declared-token-shields-siblings",
+    "patch-declared-intent-no-finding",
 )
 GITOPS_INTENT_NOTE_DECLARATIONS = (
     ("obtainability-audit", {"check": "no-pdb", "namespace": "seeded-intent", "object": "Deployment/notification-relay"}),
     ("compliance-audit", {"check": "netpol-missing", "namespace": "seeded-intent", "object": "Namespace/seeded-intent"}),
     ("compliance-audit", {"check": "default-sa-automount", "namespace": "seeded-token", "object": "Deployment/token-reader"}),
+    ("security-patch-orchestrator", {"check": "no-notifications", "namespace": "", "object": "Cluster/seeded-c"}),
 )
 
 # Mirrors terraform/modules/github-minter/main.tf: the key is ASYMMETRIC_SIGN /

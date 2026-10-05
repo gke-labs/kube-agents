@@ -48,10 +48,11 @@ zone and its nodes span a second, `var.second_zone`. The clusters also carry
 
 The rule is about where a check points, not about every string in the file. A case may
 require a rendered cluster name in a phrase list (`seeded-b` in the upgrade cases,
-`seeded-c` in `consistency-drift-outlier`) when the claim being graded is that the audit
-named the right cluster; `bench/tasks/DRAFTS.md` records those names as a contract with
-`bench/tf/fleet/`, and the cases that rely on it say so in a comment beside the phrase
-(`grep -l 'required_phrases:.*"seeded-' bench/tasks/*/task.yaml` lists them). That is a
+`seeded-c` in `consistency-drift-outlier` and `patch-declared-intent-no-finding`) when the
+claim being graded is that the audit named the right cluster; `bench/tasks/DRAFTS.md`
+records those names as a contract with `bench/tf/fleet/`, and the cases that rely on it say
+so in a comment beside the phrase (`grep -l '"seeded-[bc]"' bench/tasks/*/task.yaml` lists
+them). That is a
 different thing
 from addressing a fixture: the phrase survives the prefix being the default it has always
 been, and it breaks loudly and correctly if the prefix ever changes. What must never

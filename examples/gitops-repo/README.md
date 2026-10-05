@@ -35,11 +35,16 @@ gitops-repo/
   and `knowledge/` before they report a posture an owner may have chosen: a fixed replica count,
   a pinned HPA or a missing PodDisruptionBudget (`agents/platform/governance/obtainability_audit_sop.md` §4a),
   a namespace with no NetworkPolicy or a workload on the default ServiceAccount's token
-  (`compliance_audit_sop.md` §3a, object `Namespace/<ns>` or the workload's `Kind/name`).
+  (`compliance_audit_sop.md` §3a, object `Namespace/<ns>` or the workload's `Kind/name`),
+  a cluster off its release channel, without a maintenance window or upgrade notifications, under a
+  change freeze, or a node pool with auto-upgrade or auto-repair off
+  (`security_patch_orchestrator_sop.md` §4a, object `Cluster/<name>` or `NodePool/<pool>`, namespace empty).
   A choice HCL cannot express — a workload meant to run one replica — goes in an OKF document
   (`type` frontmatter, 06 §5) under `knowledge/` as a `declares:` list in the frontmatter, one item
   per posture with `check` (the slug, `single-replica`), `namespace`, `object` as `Kind/name`, and
-  `cluster` when the choice is one cluster's rather than fleet-wide; the audit reads the
+  `cluster` when the choice is one cluster's rather than fleet-wide (the bare cluster name for the
+  workload streams, the qualified `<project>/<location>/<name>` for the patch stream, whose findings
+  carry that form); the audit reads the
   frontmatter, never the prose, and lists a match under _Declared intent_ with the file's path
   instead of reporting it. `.kube-agents/intent.yaml` names the paths the audit reads for such
   notes (`knowledge/` here); without it, or when a named path has nothing behind it, the whole

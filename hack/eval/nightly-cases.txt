@@ -383,6 +383,18 @@
 # fourteen). deployer: noop, read-only over the seeded fleet.
 ./tasks/compliance-declared-token-shields-siblings/task.yaml
 
+# The patch stream's declared-intent case (#1408): seeded-c publishes no GKE
+# upgrade notifications, the 3.10 posture every fleet cluster carries and no
+# other case grades, and the same knowledge/ note declares it for seeded-c
+# alone. It runs the upgrade readiness audit and grades its ledger: no finding
+# id for seeded-c's notifications, the other clusters' still findings, and a
+# Declared intent row naming the note. Red on main's tree (the finding
+# published), three greens on the branch's, on a dev install. One case, three
+# units: this file's share is fifty-one cases (153 units) of a sixty-five-case,
+# 195-unit matrix (with the presubmit file's fourteen). deployer: noop,
+# read-only over the seeded fleet.
+./tasks/patch-declared-intent-no-finding/task.yaml
+
 # ── Moved here 2026-09-15 from the commented-out state (#1546, #1564) ───────
 # Nine cases; each carries the blocker that kept it parked. None was
 # activatable as a presubmit seat then and none is now; what changed is
