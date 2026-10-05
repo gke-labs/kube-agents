@@ -183,7 +183,8 @@ session that files no card is raised again a day later, and keeps its episode wh
 the daemon's route accepts. `test_triage_reply_roundtrip.py` drives a report cut from `_stall_task_body`
 through the real notifier, server and plugin, and shows the pre-inject stall report shape earns no row.
 
-**Eval.** `autoops-controller-stall-triage`, modelled on `gitops-drift-out-of-band-triage`. Its
+**Eval.** `autoops-controller-stall-triage`, modelled on `gitops-drift-out-of-band-triage`, covers the
+daemon end of the chain and everything after it, not the stall watch, which its unit tests cover. Its
 stack plants a Deployment gated on a pod readiness condition nothing sets, waits until the image's
 own `stall_report.py` reports it (its Deployment threshold is ten minutes, and the Cluster Agent
 runs the same scan when it works the card), posts the `controller-stall` inject built from that
