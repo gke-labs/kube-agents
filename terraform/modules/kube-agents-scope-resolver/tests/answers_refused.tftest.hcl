@@ -91,6 +91,25 @@ run "a_second_page_is_refused" {
   expect_failures = [data.http.scope_shared_vpc_host]
 }
 
+# The page bound holds whatever cap is declared: the plan cannot follow a
+# second page, so a cap past one page does not admit a host that needs one.
+run "a_second_page_is_refused_whatever_the_cap" {
+  command = plan
+
+  variables {
+    quota_project    = "mgmt-project-1"
+    shared_vpc_hosts = ["host-proj-1"]
+    member_cap       = 1000
+  }
+
+  override_data {
+    target = data.http.scope_shared_vpc_host["host-proj-1"]
+    values = { status_code = 200, response_body = jsonencode({ resources = [{ id = "svc-proj-1", type = "PROJECT" }], nextPageToken = "CgVwYWdlMg" }) }
+  }
+
+  expect_failures = [data.http.scope_shared_vpc_host]
+}
+
 run "a_metrics_scope_the_identity_cannot_read_is_refused" {
   command = plan
 

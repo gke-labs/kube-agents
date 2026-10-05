@@ -66,6 +66,14 @@ const (
 	// had and nothing checked. credential_proxy.py's ROUTE_ROLES is the table.
 	credentialProxyChatAudience = "kubeagents-credential-proxy-chat" // #nosec G101 -- Token audience name, not a credential
 
+	// credentialProxySessionAudience is the session pod's, under
+	// a2aSessionClusterViewEnvVar. A third audience for the same reason as
+	// the second: the session ServiceAccount is on the callers list, so only
+	// the audience can tell a session token from the shell's, and the
+	// broker's `session` role (exec only, kubectl and gcloud only) hangs off
+	// it. Spelled identically in credential_proxy.py and a2a/gateway/spawn.go.
+	credentialProxySessionAudience = "kubeagents-credential-proxy-session" // #nosec G101 -- Token audience name, not a credential
+
 	// credentialProxyTokenMountPath is where the agent container finds the
 	// token it presents to the broker.
 	credentialProxyTokenMountPath = "/var/run/secrets/kubeagents/credential-proxy" // #nosec G101 -- Mount path, not a credential
@@ -119,10 +127,11 @@ func credentialProxyBaseURL(agent *agentv1alpha1.PlatformAgent) string {
 // allowedBrokerCallers is the value of CREDENTIAL_PROXY_ALLOWED_CALLERS: the
 // TokenReview usernames the broker will serve.
 //
-// Two of them. The sandbox's is the caller that matters — the shell is where
-// every credentialed command runs, so a broker that served only the agent's
-// identity would answer 401 to all of them. The agent's is there because the
-// gateway's chat relays go through the same listener from the agent Pod.
+// Two of them, three under the cluster-view flag. The sandbox's is the caller
+// that matters — the shell is where every credentialed command runs, so a
+// broker that served only the agent's identity would answer 401 to all of
+// them. The agent's is there because the gateway's chat relays go through the
+// same listener from the agent Pod.
 //
 // Two identities rather than one is not a widening of who may call: both Pods
 // belong to this agent, and neither could reach the broker without a token this
@@ -131,10 +140,25 @@ func credentialProxyBaseURL(agent *agentv1alpha1.PlatformAgent) string {
 // with the broker, so a username alone cannot say which Pod called. That is
 // what credentialProxyChatAudience is for.
 func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent) string {
-	return strings.Join([]string{
+	callers := []string{
 		fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, agentServiceAccountName(agent)),
 		fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, shellSandboxServiceAccountName(agent)),
-	}, ",")
+	}
+	// The third caller exists only under the cluster-view flag. It is
+	// held to the session role by CREDENTIAL_PROXY_SESSION_CALLERS, which
+	// buildCredentialProxyEnv renders beside it: the broker refuses this
+	// ServiceAccount every audience but the session one, and the session
+	// audience to every other caller.
+	if a2aSessionClusterViewEnabled(agent) {
+		callers = append(callers, a2aSessionBrokerCaller(agent))
+	}
+	return strings.Join(callers, ",")
+}
+
+// a2aSessionBrokerCaller is the TokenReview username of the session pods'
+// ServiceAccount, as the broker sees it.
+func a2aSessionBrokerCaller(agent *agentv1alpha1.PlatformAgent) string {
+	return fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, a2aSessionServiceAccountName(agent))
 }
 
 // buildAgentCredentialProxyTokenVolume projects the token the agent presents to

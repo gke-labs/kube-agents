@@ -167,7 +167,7 @@ class Periodic:
 
 
 SWEEP_DOES = "closes the pull requests the agent opened during eval runs in the pool projects' `kube-agents-evals[-<n>]-infra` repos"
-SWEEP_EFFECT = "pull requests pile up in those repos, and eval cases that open one can link an old one and fail."
+SWEEP_EFFECT = "pull requests a run left behind stay open until the project's next lease, whose reset closes them."
 RECONCILE_EFFECT = "drifted fixtures stay drifted, and the eval cases that assert on them fail."
 WATCHED = (
     Periodic(
@@ -175,7 +175,7 @@ WATCHED = (
         "Eval GitOps repos", "leftover pull requests from eval runs are not being cleaned up",
         "leftover pull requests from eval runs are being cleaned up again",
         f"runs every ten minutes and {SWEEP_DOES}", SWEEP_EFFECT,
-        f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#55-the-pull-request-sweep",
+        f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#55-the-repository-reset-and-the-sweep-behind-it",
         SWEEP_RUN_ALERT_AFTER,
     ),
     Periodic(

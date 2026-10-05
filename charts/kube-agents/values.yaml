@@ -864,10 +864,10 @@ platformAgent:
   # needs them granted by hand.
   #
   # A map renders the block as it is, empty lists included (folders,
-  # organizations, sharedVpcHosts and metricsScopes only when the map carries
-  # the key, so a release record from before the chart knew them re-renders
-  # without them and a retag's patch leaves the CR's lists alone; the
-  # composition always passes all four): an
+  # organizations, sharedVpcHosts, metricsScopes and maxProjects only when the
+  # map carries the key, so a release record from before the chart knew them
+  # re-renders without them and a retag's patch leaves the CR's lists and cap
+  # alone; the composition always passes all five): an
   # empty scope is a present block with empty lists, which the reconcile reads as the
   # declaration that drops projects (their Cluster Agent profiles retire over
   # its next two clean runs), so the composition always passes a map and a
@@ -892,6 +892,9 @@ platformAgent:
   #     organizations: []           # numeric IDs; wide, prefer folders
   #     sharedVpcHosts: [shared-vpc-host]  # host project IDs; every attached service project
   #     metricsScopes: []           # scoping project IDs; every project the scope monitors
+  #     maxProjects: 100            # the most projects the reconcile lists per run, the
+  #                                 # management project included; a project past it reads
+  #                                 # over-cap. Renders only when set here (CRD default 100)
   #     exclude:
   #       projects: ["*-sandbox"]     # project IDs or shell-style globs
   #       clusters:                   # one cluster, by the full triple

@@ -13,8 +13,11 @@ Two things are checked:
    body still follows it, so with the flag off the setter is upstream's. The
    message-event builder calls ``note_ask``, and the import the guard names is
    bound at module level. Every name the guard and the ``note_ask`` call pass
-   is bound where they run, so an upstream rename fails here rather than
-   raising ``NameError`` on every flag-on call.
+   is bound where they run (``patchlib.unbound``), so an upstream rename
+   fails here rather than raising ``NameError`` on every flag-on call. The
+   other members the runtime calls on the adapter have the shape it calls
+   them in: ``_get_client`` takes a ``team_id`` keyword, and
+   ``_default_status_text`` one argument.
 2. The runtime module, loaded by path from ``gateway/`` and driven with a stub
    adapter: flag off it is inert; flag on, Hermes's phrase reaches Slack as
    ``processing`` once, the clear as ``closed``, the ask becomes the session
@@ -28,11 +31,12 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import builtins
 import importlib.util
 import os
 import sys
 from pathlib import Path
+
+import patchlib
 
 ADAPTER = "plugins/platforms/slack/adapter.py"
 ADAPTER_CLASS = "SlackAdapter"
@@ -50,6 +54,11 @@ NOTE_TARGET = "note_ask"
 IMPORT_MODULE = "gateway"
 IMPORT_NAME = "slack_ux_status"
 UPSTREAM_RESOLVER = "_session_status_method"
+#: Called as ``adapter._get_client(chat_id, team_id=...)``.
+CLIENT_GETTER = "_get_client"
+CLIENT_KEYWORD = "team_id"
+#: Called as ``adapter._default_status_text(None)``, the turn's start time.
+PHRASE_GETTER = "_default_status_text"
 
 CHANNEL = "C0KAGE"
 THREAD = "1700000000.000100"
@@ -58,7 +67,7 @@ CARD = "t_verify"
 PLAN_TS = "1700000000.000200"
 PHRASE = "is thinking..."
 ASK = "why is <#C1|payments> slow: check /metrics"
-TITLE = "why is #payments slow, check \u2215metrics"
+TITLE = "why is payments slow, check metrics"
 
 
 def _fail(detail: str) -> SystemExit:
@@ -104,7 +113,7 @@ def _is_guard(stmt: ast.stmt) -> bool:
     )
 
 
-def _method(tree: ast.Module, name: str) -> ast.AsyncFunctionDef:
+def _member(tree: ast.Module, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
     """``name`` as defined on the adapter class, not a same-named def elsewhere in the module."""
     adapter = next(
         (node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == ADAPTER_CLASS), None,
@@ -112,51 +121,30 @@ def _method(tree: ast.Module, name: str) -> ast.AsyncFunctionDef:
     if adapter is None:
         raise _fail(f"{ADAPTER} has no class {ADAPTER_CLASS}")
     for node in adapter.body:
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == name:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
             return node
-    raise _fail(f"{ADAPTER_CLASS} has no async def {name}()")
+    raise _fail(f"{ADAPTER_CLASS} has no def {name}()")
 
 
-def _module_names(tree: ast.Module) -> set[str]:
-    """Names bound at module level, including under a top-level ``if``, ``try`` or ``with``."""
-    names = set(dir(builtins))
-    stack = list(tree.body)
-    while stack:
-        stmt = stack.pop()
-        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names.add(stmt.name)
-        elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
-            names.update((a.asname or a.name).split(".")[0] for a in stmt.names)
-        elif isinstance(stmt, (ast.If, ast.Try, ast.With)):
-            for child in ast.iter_child_nodes(stmt):
-                if isinstance(child, ast.stmt):
-                    stack.append(child)
-                elif isinstance(child, ast.excepthandler):
-                    stack.extend(child.body)
-        else:
-            names.update(n.id for n in ast.walk(stmt) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store))
-    return names
+def _method(tree: ast.Module, name: str) -> ast.AsyncFunctionDef:
+    node = _member(tree, name)
+    if not isinstance(node, ast.AsyncFunctionDef):
+        raise _fail(f"{ADAPTER_CLASS}.{name}() is no longer async")
+    return node
 
 
-def _unbound(func: ast.AsyncFunctionDef, module: set[str], stmt: ast.stmt) -> list[str]:
-    """Names ``stmt``, a statement of ``func``'s body, reads that nothing binds before it runs.
-
-    Bound means a parameter, a module-level name, or a plain assignment in
-    ``func``'s body ahead of ``stmt``; one under a branch may not have run.
-    """
-    signature = func.args
-    bound = {a.arg for a in signature.posonlyargs + signature.args + signature.kwonlyargs}
-    bound.update(a.arg for a in (signature.vararg, signature.kwarg) if a is not None)
-    for earlier in func.body[: func.body.index(stmt)]:
-        if isinstance(earlier, (ast.Assign, ast.AnnAssign)):
-            targets = earlier.targets if isinstance(earlier, ast.Assign) else [earlier.target]
-            bound.update(
-                n.id for t in targets for n in ast.walk(t) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
-            )
-    return sorted({
-        n.id for n in ast.walk(stmt)
-        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id not in bound | module
-    })
+def _check_members(tree: ast.Module) -> None:
+    """The adapter members ``slack_ux_status`` calls besides the setter, in the shape it calls them."""
+    getter = _member(tree, CLIENT_GETTER)
+    names = [a.arg for a in getter.args.posonlyargs + getter.args.args + getter.args.kwonlyargs]
+    if isinstance(getter, ast.AsyncFunctionDef) or CLIENT_KEYWORD not in names[2:]:
+        raise _fail(f"{CLIENT_GETTER}() is not a plain method taking a {CLIENT_KEYWORD} keyword: {names}")
+    phrase = _member(tree, PHRASE_GETTER)
+    static = any(isinstance(d, ast.Name) and d.id == "staticmethod" for d in phrase.decorator_list)
+    positional = phrase.args.posonlyargs + phrase.args.args
+    required_keywords = [a for a, default in zip(phrase.args.kwonlyargs, phrase.args.kw_defaults) if default is None]
+    if isinstance(phrase, ast.AsyncFunctionDef) or len(positional) != (1 if static else 2) or required_keywords:
+        raise _fail(f"{PHRASE_GETTER}() no longer takes the one argument the runtime passes")
 
 
 def check_adapter(root: Path) -> None:
@@ -164,7 +152,7 @@ def check_adapter(root: Path) -> None:
     if not path.is_file():
         raise _fail(f"{path} does not exist")
     tree = ast.parse(path.read_text())
-    module = _module_names(tree)
+    _check_members(tree)
     setter = _method(tree, SETTER)
     positional = tuple(a.arg for a in setter.args.posonlyargs + setter.args.args)
     if positional != SETTER_POSITIONAL:
@@ -172,7 +160,7 @@ def check_adapter(root: Path) -> None:
     body = setter.body
     if len(body) < 3 or not _is_guard(body[1]):
         raise _fail(f"{SETTER}() does not open with the {FLAG_ENV} guard after its docstring")
-    unbound = _unbound(setter, module, body[1])
+    unbound = patchlib.unbound(tree, body[1])
     if unbound:
         raise _fail(f"{SETTER}() guard reads {', '.join(unbound)}, which {ADAPTER} no longer binds")
     upstream = ast.Module(body=body[2:], type_ignores=[])
@@ -185,7 +173,7 @@ def check_adapter(root: Path) -> None:
     notes = [stmt for stmt in builder.body if _calls(stmt, GUARD_ALIAS, NOTE_TARGET)]
     if not notes:
         raise _fail(f"{BUILDER}() does not keep the ask for the session title")
-    unbound = _unbound(builder, module, notes[0])
+    unbound = patchlib.unbound(tree, notes[0])
     if unbound:
         raise _fail(f"{BUILDER}() passes {', '.join(unbound)} to {NOTE_TARGET}(), which it no longer binds")
     bound = any(
@@ -290,7 +278,8 @@ def main(root: Path = Path("/opt/hermes")) -> None:
     check_adapter(root)
     asyncio.run(_drive(_load_runtime(root)))
     print(
-        "slack_ux_status verify: status setter guarded ahead of upstream's body; "
+        "slack_ux_status verify: status setter guarded ahead of upstream's body; adapter members in the "
+        "shape the runtime calls; "
         "runtime sends enum statuses on change, titles the session, posts, edits and settles one plan"
     )
 

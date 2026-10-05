@@ -17,6 +17,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -44,8 +45,8 @@ func startServer(t *testing.T) *natsserver.Server {
 	return s
 }
 
-// provision creates the TASKS stream and session-state bucket the way the W6
-// operator's provision Job does.
+// provision creates the TASKS stream and the session-state and cap buckets
+// the way the W6 operator's provision Job does.
 func provision(t *testing.T, url string) {
 	t.Helper()
 	nc, err := nats.Connect(url)
@@ -69,6 +70,11 @@ func provision(t *testing.T, url string) {
 	}
 	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: lib.SessionStateBucket}); err != nil {
 		t.Fatalf("create session-state: %v", err)
+	}
+	// `nats kv add cap`, history 1: one live revision per key, which is what
+	// the chain walk's revision pinning is written against.
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: capability.Bucket, History: 1}); err != nil {
+		t.Fatalf("create cap: %v", err)
 	}
 }
 
@@ -206,6 +212,14 @@ type rig struct {
 // to a test principal, and runs it.
 func startRig(t *testing.T) *rig {
 	t.Helper()
+	return startRigWith(t, nil)
+}
+
+// startRigWith is startRig with one hook into the Config the gateway is built
+// from, for the cases that have to arm a switch before Run starts rather than
+// reach into a running gateway.
+func startRigWith(t *testing.T, tweak func(*Config)) *rig {
+	t.Helper()
 	s := startServer(t)
 	url := s.ClientURL()
 	provision(t, url)
@@ -236,6 +250,9 @@ func startRig(t *testing.T) *rig {
 		DefaultAddressee: "platform",
 		IdleTTL:          30 * time.Minute,
 		AttributionSalt:  []byte("test-salt"),
+	}
+	if tweak != nil {
+		tweak(cfg)
 	}
 	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord"})
 	if err != nil {
@@ -375,9 +392,7 @@ func TestNewTaskRoutesToPlatformWithMintedIdsAndAuthority(t *testing.T) {
 	if auth.Audience.Conversation != "discord:g1/thread1" || !auth.Audience.RosterComplete {
 		t.Fatalf("audience = %+v", auth.Audience)
 	}
-	if string(auth.Grants) != "null" {
-		t.Fatalf("grants must stay null, got %s", auth.Grants)
-	}
+	assertRootCapability(t, r, auth, origin.TaskID, "platform")
 
 	var m lib.Message
 	if err := json.Unmarshal(origin.Payload, &m); err != nil {
@@ -532,6 +547,23 @@ func TestMessageDuringWorkingIsSteeringOnSameTask(t *testing.T) {
 	if auth.Requester.Principal == originAuth.Requester.Principal {
 		t.Fatal("steer must be attributed to its own sender")
 	}
+	// ...and to the same capability. One task is one capability, and the
+	// reason is the reference rather than the ceiling: Ref pins a key AND a
+	// revision, the executor resolved THAT pair when the task opened, and a
+	// second mint per turn would hand it a root it never resolved. The
+	// verifier walks what the envelope names, so the steer would be checked
+	// against an entry whose arrival nothing ordered against the work already
+	// in flight.
+	//
+	// Not a ceiling difference. A steerer has no ceiling of their own here --
+	// mintCapability fills Tier and Scope from install-wide config and varies
+	// only Delegate, so a re-mint on this turn would produce the same bound
+	// with a different revision. An earlier version of this comment said the
+	// re-mint would substitute "the steerer's ceiling for the submitter's",
+	// which reads as a per-requester bound that this tree does not have.
+	if string(auth.Grants) != string(originAuth.Grants) {
+		t.Fatalf("the steer carries a different capability:\n  steer  %s\n  origin %s", auth.Grants, originAuth.Grants)
+	}
 	// The steer is acknowledged in-channel - silent absorption looked like
 	// a dropped message live.
 	waitFor(t, "steer acknowledgement", func() bool {
@@ -655,12 +687,8 @@ func TestRosterCapAndPseudonyms(t *testing.T) {
 	for i := range big {
 		big[i] = fmt.Sprintf("u%d", i)
 	}
-	raw := BuildAuthority(ps, pm, "test:bnaylor", "discord", "1001", "principal-map",
+	auth := BuildAuthority(ps, pm.Resolve, "test:bnaylor", "discord", "1001", "principal-map",
 		"discord:g/x", "group", big, true)
-	var auth Authority
-	if err := json.Unmarshal(raw, &auth); err != nil {
-		t.Fatal(err)
-	}
 	if len(auth.Audience.Roster) != rosterCap {
 		t.Fatalf("roster len = %d, want %d", len(auth.Audience.Roster), rosterCap)
 	}
@@ -869,6 +897,54 @@ func TestTasklessHealPersistsAcrossCapRefusal(t *testing.T) {
 	if rec.ActiveTask != nil {
 		t.Fatalf("release announced but not written: %+v", rec.ActiveTask)
 	}
+}
+
+// A refusal reaches chat with the cause the executor named. gke-labs#1884
+// put a capability check in front of every task, so an unreachable verifier
+// now lands as `rejected` where only an empty submission used to -- and a
+// bare "the executor rejected the task" sends the user to re-read their own
+// prompt for a fault that is in the install. Asserted on the reason the
+// verifier outage produces, not on any refusal, because that is the one the
+// bare line was actively misleading about.
+func TestARejectedTaskPostsTheReasonTheExecutorGave(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-rejected"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-1", Text: "start"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateSubmitted, false); err != nil {
+		t.Fatal(err)
+	}
+
+	const reason = "reason: capability-refused - the verifier could not be reached"
+	payload, err := json.Marshal(lib.StatusUpdate{
+		TaskID: origin.TaskID, ContextID: origin.ContextID,
+		Status: lib.TaskStatus{State: lib.StateRejected, Message: &lib.Message{
+			Role: "agent", MessageID: "msg-reject",
+			Parts: []lib.Part{{Kind: "text", Text: reason}},
+		}},
+		Final: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewStatusUpdateEnvelope(lib.Party{Session: "platform"}, origin.TaskID, origin.ContextID, origin.CorrelationID, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.bus.Publish(ctx, lib.TaskEventsSubject("platform", origin.TaskID), env); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "the refusal posts with its reason", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if strings.Contains(p, reason) {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 func TestLongFailureReasonIsChunkedUnderTheCap(t *testing.T) {
@@ -2118,5 +2194,167 @@ func TestSessionOnAckTellsSlackChannelsToMention(t *testing.T) {
 	}
 	if !strings.Contains(sessionOnAck("discord", "group", "platform"), "`platform`") {
 		t.Fatal("the ack does not name the default addressee")
+	}
+}
+
+// TestNewRefusesTheClusterViewWithoutABrokerURL: told the view is on but not
+// where the broker is, the gateway refuses to start rather than spawn pods
+// whose shim dials nothing.
+func TestNewRefusesTheClusterViewWithoutABrokerURL(t *testing.T) {
+	s := startServer(t)
+	url := s.ClientURL()
+	provision(t, url)
+	mapFile := filepath.Join(t.TempDir(), "principal-map")
+	if err := os.WriteFile(mapFile, []byte("1001 test:bnaylor\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test"), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.Close)
+	cfg := &Config{NATSURL: url, PrincipalMapPath: mapFile, DefaultAddressee: "platform", IdleTTL: 30 * time.Minute,
+		AttributionSalt: []byte("test-salt"), SessionClusterView: true}
+	if _, err := New(Options{Client: client, Adapter: newFakeAdapter(), Config: cfg, Backend: "discord", Spawner: &fakeSpawner{}}); err == nil ||
+		!strings.Contains(err.Error(), "A2A_CREDENTIAL_PROXY_URL") {
+		t.Fatalf("New() = %v, want a refusal naming A2A_CREDENTIAL_PROXY_URL", err)
+	}
+}
+
+// assertRootCapability is the DoD's first clause in unit form: grants is not
+// null, it names the key the gateway minted for this task, and the entry is
+// really there at the pinned revision with the addressee as its delegate.
+//
+// It resolves through the same Resolver the verifier runs, against the same
+// real bucket, so what is under test is the write the gateway performed and
+// not the struct it marshalled.
+func assertRootCapability(t *testing.T, r *rig, auth Authority, taskID, delegate string) {
+	t.Helper()
+	if string(auth.Grants) == "null" || len(auth.Grants) == 0 {
+		t.Fatalf("grants is null; the task carries no capability")
+	}
+	var grants AuthorityGrants
+	if err := json.Unmarshal(auth.Grants, &grants); err != nil {
+		t.Fatalf("grants: %v", err)
+	}
+	ref := grants.Capability
+	if want := "root." + taskID; ref.Key != want {
+		t.Fatalf("capability key = %q, want %q", ref.Key, want)
+	}
+	if ref.Revision == 0 {
+		t.Fatalf("capability reference is not pinned to a revision: %+v", ref)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	store, err := capability.NewStore(ctx, r.client.JetStream())
+	if err != nil {
+		t.Fatalf("cap store: %v", err)
+	}
+	res := &capability.Resolver{Store: store}
+
+	entry, err := res.Resolve(ctx, delegate, ref)
+	if err != nil {
+		t.Fatalf("the delegate could not resolve its own capability: %v", err)
+	}
+	if entry.Delegate != delegate {
+		t.Fatalf("delegate = %q, want %q", entry.Delegate, delegate)
+	}
+	if entry.Tier != capability.TierDeveloperTeam {
+		t.Fatalf("tier = %q, want the narrow default", entry.Tier)
+	}
+	if entry.Scope == "" {
+		t.Fatal("scope is empty; the ceiling was never applied")
+	}
+
+	// Same reference, wrong holder. The block travels on a bus other
+	// principals read, so possession of the reference must not be the test.
+	if _, err := res.Resolve(ctx, "somebody-else", ref); err == nil {
+		t.Fatal("a principal the root does not name resolved it anyway")
+	} else if !errors.Is(err, capability.ErrRefused) {
+		t.Fatalf("wrong holder refused for the wrong reason: %v", err)
+	}
+}
+
+// deleteCapBucket takes the capability bucket away, the way deleteTasksStream
+// takes the task stream away: it is how an install that never provisioned the
+// bucket, or a gateway whose $KV.cap.root.* grant is missing, looks from here.
+func deleteCapBucket(t *testing.T, url string) {
+	t.Helper()
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := js.DeleteKeyValue(ctx, capability.Bucket); err != nil {
+		t.Fatalf("delete cap bucket: %v", err)
+	}
+}
+
+// TestAMintFailureRefusesTheTurn covers the armed half of the mint-failure
+// branch, which had no test: every other gateway test provisions the cap
+// bucket in provision(), so Mint never fails and neither arm was reachable.
+//
+// Enforcement on is the default, and the contract is that a gateway which
+// cannot mint refuses rather than passes. The alternative -- send it anyway --
+// is not a smaller failure: the executor refuses the capability-less
+// submission regardless, one round trip and (on the session route) one pod
+// later, with the reason surfacing in a different component's log than the
+// one the operator is reading.
+func TestAMintFailureRefusesTheTurn(t *testing.T) {
+	r := startRig(t)
+	deleteCapBucket(t, r.url)
+	conv := "discord:g1/thread-mint-refuses"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "do a thing"}
+
+	waitFor(t, "the refusal to be posted", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if strings.Contains(p, "could not mint") {
+				return true
+			}
+		}
+		return false
+	})
+	// And nothing went to an executor: the refusal is the whole outcome.
+	if envs := inSubjectEnvelopes(t, r.url, "platform"); len(envs) != 0 {
+		t.Fatalf("a submission was published despite the mint failing: %d envelope(s) on the in subject", len(envs))
+	}
+}
+
+// TestAMintFailureUnderCapabilityOptionalSendsGrantsNull covers the relaxed
+// twin -- the mixed-version window, and the only path in the tree that reaches
+// an executor with grants null. It is asserted because it is the one way a
+// capability-less submission is legitimate, so a regression that reached it by
+// accident (the return dropped, the condition inverted) would otherwise look
+// exactly like correct behaviour.
+func TestAMintFailureUnderCapabilityOptionalSendsGrantsNull(t *testing.T) {
+	r := startRigWith(t, func(c *Config) { c.CapabilityOptional = true })
+	deleteCapBucket(t, r.url)
+	conv := "discord:g1/thread-mint-relaxed"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "do a thing"}
+
+	var env *lib.Envelope
+	waitFor(t, "the submission to reach the executor anyway", func() bool {
+		envs := inSubjectEnvelopes(t, r.url, "platform")
+		if len(envs) == 0 {
+			return false
+		}
+		env = envs[0]
+		return true
+	})
+	var auth Authority
+	if err := json.Unmarshal(env.Authority, &auth); err != nil {
+		t.Fatalf("authority: %v", err)
+	}
+	if string(auth.Grants) != "null" {
+		t.Fatalf("grants = %s, want null -- this is the one path that may carry no capability", auth.Grants)
 	}
 }

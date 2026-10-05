@@ -95,11 +95,11 @@ try:
 
     # By name, not as a module: `health` is the parameter every render_*
     # function here takes, and importing the module would shadow it.
-    from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, PROW_JOB_TIMEOUT, minutes_text, pool_span, wait_text
+    from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, PROW_JOB_TIMEOUT, minutes_text, pool_drift_split, pool_span, wait_text
 except ImportError:  # run as a script: scripts/eval_dashboard/post_health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
     from eval_dashboard import gate_issue, ghcli, nightly, periodics
-    from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, PROW_JOB_TIMEOUT, minutes_text, pool_span, wait_text
+    from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, PROW_JOB_TIMEOUT, minutes_text, pool_drift_split, pool_span, wait_text
 
 STATE_SCHEMA_VERSION = 1
 
@@ -235,6 +235,36 @@ FIXTURE_RECONCILE_HINT = "Fleet owner: re-apply bench/tf/fleet in the projects n
 # (an adopted human issue, or a failed filing, does not). The space is told
 # where to look rather than what to type.
 POOL_REPAIR_HINT = "Pool owner: the repair command per project (or, for a check that failed without naming one, what was observed) is in pool-state.json (docs/ci-health.md, The pool-state scan) and in the bot's tracking issue when it filed one."
+# The consequence of a pool drift for a pull request, by whether a leased run
+# reds on the findings; health.py's incident and `pool_state` block carry the
+# split (pool_drift_split: `reds_runs`, `passes_leases` from the verifier's
+# LEASE_SILENT_FINDINGS, and `reds_runs_projects`). The default reading sends
+# a real 403 to the pool, so a finding a run passes with is said the other
+# way round; beside findings that do red a run, the 403 sentence counts only
+# the projects one of those is on, and the exception follows it.
+POOL_REDS_RUNS = " a 403 or a missing-resource red from a run that leased one of those projects is the pool's, not the code."
+POOL_REDS_RUNS_BESIDE = (
+    " a 403 or a missing-resource red from a run that leased a project with {findings} ({count} of the {total}) is the pool's, not the code;"
+    " {silent} reds no run, so a red on one of the others is the code's to read."
+)
+POOL_PASSES_LEASES = (
+    " no run reds from {findings}: an install there passes its lease with that gap,"
+    " so a 403 or a missing-resource red on one of those projects is the code's to read, not the pool's."
+)
+POOL_RETEST = "Retest once the pool owner has run the repair."
+POOL_NO_RETEST = "Nothing on a pull request waits for the repair."
+# The change post's header for the condition. DEGRADED's is "flaky" because
+# every other condition's remedy is a retest, and render_change's other
+# branches inline it; a drift made only of findings a leased run passes with
+# asks for no retest, so its header says so before the sentence does.
+POOL_DRIFT_HEADER = "🟡 *Smoke gate: flaky*"
+POOL_DRIFT_SILENT_HEADER = "🟡 *Smoke gate: pool drifted, runs unaffected*"
+POOL_DIGEST_REDS_RUNS = " a 403 from a run that leased one of them is the pool's, not the code."
+POOL_DIGEST_REDS_RUNS_BESIDE = (
+    " a 403 from a run that leased a project with {findings} ({count} of the {total}) is the pool's, not the code;"
+    " {silent} reds no run, so a 403 on one of the others is the code's to read."
+)
+POOL_DIGEST_PASSES_LEASES = " no run reds from that; a 403 on one of them is the code's to read."
 
 # Rule 8 sends the reader somewhere. The build cluster is named by its real
 # identifiers because `build-kube-agents` is Prow's context alias for it
@@ -642,11 +672,28 @@ def pool_drift_sentence(health: dict, since: str) -> str:
     incident = health.get("incident") or {}
     findings = list(incident.get("roles") or [])
     projects = list(incident.get("projects") or [])
-    return (
+    loud, silent, loud_projects = pool_drift_split(incident)
+    head = (
         f"pool {plural(len(findings), 'finding')} {', '.join(findings) or '(unnamed)'}"
         f" on {len(projects)} pool {plural(len(projects), 'project')} since {since};"
-        " a 403 or a missing-resource red from a run that leased one of those projects is the pool's, not the code."
     )
+    if silent and not loud:
+        return head + POOL_PASSES_LEASES.format(findings=", ".join(silent))
+    if silent:
+        return head + POOL_REDS_RUNS_BESIDE.format(findings=", ".join(loud), count=len(loud_projects), total=len(projects), silent=", ".join(silent))
+    return head + POOL_REDS_RUNS
+
+
+def pool_drift_passes_leases(health: dict) -> bool:
+    """Whether every firing pool finding is one a leased run passes with:
+    the one split the header and the retest line both turn on."""
+    loud, silent, _ = pool_drift_split(health.get("incident") or {})
+    return bool(silent) and not loud
+
+
+def pool_drift_retest(health: dict) -> str:
+    """Whether a pull request has anything to wait for."""
+    return POOL_NO_RETEST if pool_drift_passes_leases(health) else POOL_RETEST
 
 
 def cause_sentence(health: dict) -> str:
@@ -720,7 +767,8 @@ def render_change(health: dict, prev: dict | None, issue: dict | None = None) ->
     elif condition == CONDITION_POOL_DRIFT:
         tag = issue_tag(issue)
         tracking = f" Tracking {tag}." if tag else ""
-        lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)} Retest once the pool owner has run the repair. {POOL_REPAIR_HINT}{tracking}"]
+        header = POOL_DRIFT_SILENT_HEADER if pool_drift_passes_leases(health) else POOL_DRIFT_HEADER
+        lines = [f"{header} — {cause_sentence(health)} {pool_drift_retest(health)} {POOL_REPAIR_HINT}{tracking}"]
     else:
         lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)}  Passing runs still count; if yours died before any test ran, retest."]
     lines.append(incident_link(health))
@@ -1066,9 +1114,18 @@ def pool_state_digest_line(health: dict) -> str | None:
     drifted = block.get("drifted") or {}
     if drifted:
         findings = sorted({finding for findings in drifted.values() for finding in findings})
+        # The block carries the same split as the incident, over every
+        # drifted project rather than the firing ones.
+        loud, silent, loud_projects = pool_drift_split(dict(block, roles=findings, projects=sorted(drifted)))
+        if silent and not loud:
+            consequence = POOL_DIGEST_PASSES_LEASES
+        elif silent:
+            consequence = POOL_DIGEST_REDS_RUNS_BESIDE.format(findings=", ".join(loud), count=len(loud_projects), total=len(drifted), silent=", ".join(silent))
+        else:
+            consequence = POOL_DIGEST_REDS_RUNS
         return (
             f"🧭 *Pool projects:* {len(drifted)} of {checked} checked pool projects drifted at {when}"
-            f" ({', '.join(findings)}); a 403 from a run that leased one of them is the pool's, not the code."
+            f" ({', '.join(findings)});{consequence}"
         )
     unchecked = f", {total - checked} not checked" if total > checked else ""
     unread = int(block.get("unread_units") or 0)

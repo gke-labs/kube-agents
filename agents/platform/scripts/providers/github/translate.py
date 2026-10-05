@@ -69,6 +69,10 @@ def proposal(node: dict[str, Any]) -> dict[str, Any]:
     the branch and the field is the revision it closed at, however the branch
     moves afterwards -- which is what `branch-delete` relies on to tell a spent
     branch from one that moved on.
+
+    `closed` is when it closed or merged, `""` while it is open: a caller
+    weighing a person's later instruction against a close needs a time on both
+    sides.
     """
     if node.get("merged_at"):
         state = "merged"
@@ -93,6 +97,7 @@ def proposal(node: dict[str, Any]) -> dict[str, Any]:
         "url": node.get("html_url") or "",
         "created": node.get("created_at") or "",
         "updated": node.get("updated_at") or "",
+        "closed": node.get("closed_at") or "",
         "body": node.get("body") or "",
     }
 
