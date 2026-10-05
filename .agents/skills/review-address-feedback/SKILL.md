@@ -5,7 +5,7 @@ description: "Address review feedback on an open pull request: triage and fix fi
 
 # Task
 
-Work a review round until every thread has a reply and a re-read comes back clean. `AGENTS.md` and the rules it links win if this file disagrees, and unattended agents follow [`agents/contributor/AGENTS.md`](../../../agents/contributor/AGENTS.md) where it differs; [`docs/pull-request-workflow.md`](../../../docs/pull-request-workflow.md) holds the commands.
+Work a review round until every thread has a reply and the last re-read settles: clean on a first review, nothing holding the check on a later one. `AGENTS.md` and the rules it links win if this file disagrees, and unattended agents follow [`agents/contributor/AGENTS.md`](../../../agents/contributor/AGENTS.md) where it differs; [`docs/pull-request-workflow.md`](../../../docs/pull-request-workflow.md) holds the commands.
 
 # Workflow
 
@@ -18,5 +18,5 @@ Work a review round until every thread has a reply and a re-read comes back clea
 7. **Re-review non-trivial fixes** with [`review-preflight`](../review-preflight/SKILL.md) before pushing.
 8. **Push once:** a push restarts CI.
 9. **Convince with proof.** Reply in every thread with the fixing commit, the refutation, or the filed issue or case; answer review-body findings in one pull request comment. Ground every statement in something the reviewer can verify (a test, command output, a `file:line`, a design doc, or a design choice the user made for this pull request) and reason from it; make no unsourced claim.
-10. **Request one re-read** of the new commits, unless the push already triggered one; never twice for one commit unless the first never arrived, and a draft gets none until it is marked ready. Re-request any human who asked for changes. When the round produced no commits, request a human reviewer instead. On new findings, return to step 1.
+10. **Request one re-read** of the new commits under step 4's standing instruction, and without one ask the user which width; skip it when the push already triggered one, never twice for one commit unless the first never arrived, and none for a draft until it is marked ready. Re-request any human who asked for changes. When the round produced no commits, request a human reviewer instead. On a finding that holds the check, return to step 1; a Medium on a later round is fixed or answered in its thread, and resolved, without another re-read.
 11. **Once the last re-read settles,** resolve each thread fixed by a commit or shown factually wrong, and, with a user in the loop, each `kube-agents-bot` finding you declined once your reply and **Self-Review** give the reason; the description thread waits for the body edit. A disagreement with a human reviewer stays open for them, including one your reply settles by a design choice. Fold the round into **Self-Review** and **Live validation** in place.
