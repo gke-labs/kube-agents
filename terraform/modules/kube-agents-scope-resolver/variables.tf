@@ -76,3 +76,23 @@ variable "exclude_projects" {
   nullable    = false
   default     = []
 }
+
+variable "member_cap" {
+  description = <<-EOT
+    The most projects one selector may resolve to: the resolved-set cap the
+    reconcile lists per run (spec.scope.maxProjects; kube-agents-iam's
+    scope.max_projects), since a single selector past it cannot fit whatever
+    else the scope declares, and refusing it at the read spares the naming
+    reads the whole-set check would otherwise wait for. The reconcile's
+    default, 100, when not given. A Shared VPC host is also bounded by one
+    page of the Compute API's answer, 500 service projects, whatever this is.
+  EOT
+  type        = number
+  nullable    = false
+  default     = 100
+
+  validation {
+    condition     = var.member_cap >= 1 && var.member_cap <= 5000 && floor(var.member_cap) == var.member_cap
+    error_message = "member_cap is a whole number from 1 to 5000, the bounds the CRD puts on spec.scope.maxProjects."
+  }
+}

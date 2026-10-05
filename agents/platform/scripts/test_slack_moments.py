@@ -110,14 +110,24 @@ class OpenedPrTest(unittest.TestCase):
 
     def test_a_labels_evidence_keeps_its_markup_and_drops_the_url(self):
         blocks, _ = m.pr_opened(*m.opened_pr(f"**Opened PR:** <{PR}>"))
-        self.assertEqual(_contexts(blocks)[0], "**Opened PR #412**")
+        self.assertEqual(_contexts(blocks)[0], "*Opened PR #412*")
 
     def test_markup_wrapped_round_the_url_goes_with_it(self):
         for line in (f"Opened PR **{PR}**", f"Opened PR **<{PR}>**", f"Opened PR `{PR}`", f"Opened `{PR}`"):
             blocks, _ = m.pr_opened(*m.opened_pr(line))
             self.assertEqual(_contexts(blocks)[0], "Opened PR #412", line)
         blocks, _ = m.pr_opened(*m.opened_pr(f"**Done, opened PR {PR}**"))
-        self.assertEqual(_contexts(blocks)[0], "**Done, opened PR #412**")
+        self.assertEqual(_contexts(blocks)[0], "*Done, opened PR #412*")
+
+    def test_every_opened_pr_in_a_text_is_found(self):
+        other = "https://github.com/acme/other/pull/7"
+        found = list(m.opened_prs(f"- Opened {PR}\n- Opened {other}, and opened {PR}/files"))
+        self.assertEqual([f[0] for f in found], [PR, other, PR])
+        self.assertEqual(list(m.opened_prs(f"{PR} already covers it")), [])
+
+    def test_another_link_on_the_pr_line_stays_text(self):
+        blocks, _ = m.pr_opened(*m.opened_pr(f"Opened PR {PR}, see [docs](https://other.example/x)"))
+        self.assertEqual(_contexts(blocks)[0], "Opened PR #412, see [docs](https://other.example/x)")
 
     def test_a_draft_pr_is_an_opened_pr(self):
         for line in (f"Opened a draft PR {PR}", f"Opened a new draft PR: {PR}"):
@@ -162,6 +172,22 @@ class OpenedPrTest(unittest.TestCase):
         blocks, _ = m.pr_opened(*m.opened_pr(line))
         self.assertLessEqual(len(_contexts(blocks)[0]), m.EVIDENCE_MAX)
         self.assertTrue(_contexts(blocks)[0].endswith(p.ELLIPSIS))
+
+    def test_a_name_ending_in_ed_is_someone_else(self):
+        for line in (
+            f"Fred: opened {PR}", f"Mohammed, as usual, opened {PR}", f"Triggered by Renovate, opened {PR}",
+            f"Triggered by Renovate and opened {PR}", f"Rotated by cert-manager: opened {PR}",
+        ):
+            self.assertIsNone(m.opened_pr(line), line)
+
+    def test_our_own_outcome_and_step_labels_still_open_a_pr(self):
+        for line in (
+            f"Resolved: opened {PR}", f"Tests passed, opened {PR}", f"Working on it, opened {PR}",
+            f"Addressed the review, opened {PR}", f"Drained node-a and opened {PR}", f"Rotated the cert, opened {PR}",
+            f"Cordoned node-b: opened {PR}", f"Fixed by bumping the chart, opened {PR}",
+            f"Fixed by hand, opened {PR}", f"Scaled by 2x and opened {PR}",
+        ):
+            self.assertEqual(m.opened_pr(line)[0], PR, line)
 
     def test_the_opened_pr_is_found_after_a_cited_one(self):
         other = "https://github.com/acme/x/pull/300"
@@ -237,6 +263,16 @@ class NeedsYouTest(unittest.TestCase):
         blocks, _ = m.needs_you("Which cluster?\n- `seeded-reliability`\n- **seeded-debug**")
         self.assertEqual([b["text"]["text"] for b in _buttons(blocks)], ["seeded-reliability", "seeded-debug"])
 
+    def test_a_linked_option_is_its_label_on_the_button(self):
+        long = "https://github.com/kubernetes-sigs/cluster-api-provider-gcp/pull/1234"
+        blocks, _ = m.needs_you(f"Which PR should I merge first?\n- [#412](https://github.com/acme/x/pull/412)\n- [#1234]({long})")
+        self.assertEqual([(b["text"]["text"], b["value"]) for b in _buttons(blocks)], [("#412", "#412"), ("#1234", "#1234")])
+        self.assertEqual(_contexts(blocks)[0], f"- <https://github.com/acme/x/pull/412|#412>\n- <{long}|#1234>")
+
+    def test_options_without_a_link_are_not_repeated_in_the_detail(self):
+        blocks, _ = m.needs_you("Which cluster?\n- seeded-a\n- seeded-b")
+        self.assertEqual(_contexts(blocks), [m.WAITING])
+
     def test_a_glob_or_dunder_option_keeps_its_characters(self):
         blocks, _ = m.needs_you("Which pods?\n- Delete app=web-*\n- Keep `__pycache__`\n- Scale to 2*3")
         self.assertEqual([b["text"]["text"] for b in _buttons(blocks)], ["Delete app=web-*", "Keep __pycache__", "Scale to 2*3"])
@@ -271,11 +307,17 @@ class NeedsYouTest(unittest.TestCase):
         self.assertEqual(_contexts(blocks)[0], "I found:\n- pod a is OOMKilled\n- pod b is Pending")
 
     def test_a_plan_after_a_proceed_question_is_not_choices(self):
-        for question in ("Shall I proceed?", "OK to go ahead?", "Should I continue?", "Do you approve?"):
+        for question in (
+            "Shall I proceed?", "OK to go ahead?", "Should I continue?", "Do you approve?", "Sound good?",
+            "Does this plan look right?", "Does the fix look good to you?", "Does the new plan look right?", "Do these look right?", "Looks OK?", "OK?", "Any objections?",
+        ):
             reason = f"Here is the fix. {question}\n1. Drain node-pool-a\n2. Upgrade to 1.31\n3. Uncordon"
             blocks, text = m.needs_you(reason)
             self.assertEqual(_buttons(blocks), [], question)
             self.assertIn("1. Drain node-pool-a", text, question)
+        for question in ("Looks good, what next?", "Looks OK, but where should I start?", "Thoughts?"):
+            blocks, _ = m.needs_you(f"{question}\n- Drain\n- Upgrade")
+            self.assertEqual(len(_buttons(blocks)), 2, question)
         blocks, _ = m.needs_you("Which step should I proceed with?\n- Drain\n- Upgrade")
         self.assertEqual([b["text"]["text"] for b in _buttons(blocks)], ["Drain", "Upgrade"])
 
@@ -331,6 +373,45 @@ class NeedsYouTest(unittest.TestCase):
         self.assertEqual(blocks[0]["text"]["text"], "*Which namespace?*")
         self.assertEqual([b["value"] for b in _buttons(blocks)], ["default", "prod"])
 
+    def test_a_markdown_link_in_the_detail_is_a_slack_link(self):
+        blocks, _ = m.needs_you("Which?\nSee [runbook](https://x.example/a?b=1&c=2) or `[no](https://y.example)`.")
+        self.assertEqual(
+            blocks[1]["elements"][0]["text"],
+            "See <https://x.example/a?b=1&amp;c=2|runbook> or `[no](https://y.example)`.",
+        )
+
+    def test_bold_in_the_detail_is_slack_bold_outside_code(self):
+        blocks, _ = m.needs_you("Which pod should I restart?\n**web-1** is OOMKilled, not `**x**`.\n- web-1\n- web-2")
+        self.assertEqual(blocks[1]["elements"][0]["text"], "*web-1* is OOMKilled, not `**x**`.\n- web-1\n- web-2")
+
+    def test_a_dunder_or_a_star_inside_bold_keeps_its_characters(self):
+        for detail in (
+            "See https://github.com/a/b/blob/main/pkg/__init__.py now",
+            "__DB_HOST__ unset",
+            "**/tmp/*.log** filled",
+            "re**start**ed",
+        ):
+            blocks, _ = m.needs_you(f"Which?\n{detail}")
+            self.assertEqual(blocks[1]["elements"][0]["text"], detail)
+
+    def test_a_link_that_is_not_safe_stays_escaped_text(self):
+        blocks, _ = m.needs_you("Which?\nSee [<@U1>](javascript:alert) now.")
+        self.assertEqual(blocks[1]["elements"][0]["text"], "See [&lt;@U1&gt;](javascript:alert) now.")
+
+    def test_a_link_label_cannot_mention_anyone(self):
+        blocks, _ = m.needs_you("Which?\nSee [<!channel>](https://x.example).")
+        self.assertEqual(blocks[1]["elements"][0]["text"], "See <https://x.example|&lt;!channel&gt;>.")
+
+    def test_a_nul_in_the_detail_is_dropped_rather_than_read_as_a_code_span(self):
+        blocks, _ = m.needs_you("Which?\nA \x000\x00 b")
+        self.assertEqual(blocks[1]["elements"][0]["text"], "A 0 b")
+
+    def test_a_question_opening_with_a_code_span_heads_itself(self):
+        blocks, text = m.needs_you("```checkout-gateway``` is in two clusters. Which?\n- seeded-a\n- seeded-b")
+        self.assertIn("is in two clusters. Which?", blocks[0]["text"]["text"])
+        self.assertEqual([b["value"] for b in _buttons(blocks)], ["seeded-a", "seeded-b"])
+        self.assertIn("two clusters", text)
+
     def test_an_italic_question_keeps_its_buttons_and_loses_its_underscores(self):
         blocks, text = m.needs_you("_Which cluster should I drain?_\n- seeded-a\n- seeded-b")
         self.assertEqual(blocks[0]["text"]["text"], "*Which cluster should I drain?*")
@@ -372,6 +453,23 @@ class NeedsYouTest(unittest.TestCase):
         blocks, _ = m.needs_you(f"Pick one?\n- short\n- {long}")
         self.assertEqual(_buttons(blocks), [])
         self.assertIn(long, _contexts(blocks)[0])
+
+    def test_a_headline_with_a_link_keeps_the_url_on_the_line_below(self):
+        url = "https://example.com/" + "a" * 150
+        blocks, _ = m.needs_you(f"Check the [runbook]({url}) first. Which?\n- seeded-a\n- seeded-b")
+        self.assertIn("Check the runbook first. Which?", blocks[0]["text"]["text"])
+        self.assertEqual(_contexts(blocks)[0], f"Check the <{url}|runbook> first. Which?")
+        self.assertEqual([b["value"] for b in _buttons(blocks)], ["seeded-a", "seeded-b"])
+
+    def test_a_short_headline_with_a_link_keeps_the_url_on_the_line_below(self):
+        url = "https://github.com/acme/x/pull/412"
+        blocks, _ = m.needs_you(f"Should I merge [PR #412]({url})?\n- Yes\n- No")
+        self.assertEqual(_contexts(blocks)[0], f"Should I merge <{url}|PR #412>?")
+        self.assertEqual([b["value"] for b in _buttons(blocks)], ["Yes", "No"])
+
+    def test_a_short_headline_without_a_link_is_not_repeated_below(self):
+        blocks, _ = m.needs_you("Which cluster?\n- seeded-a\n- seeded-b")
+        self.assertEqual([b for b in blocks if b["type"] == "context" and b.get("block_id") != p.WAITING_BLOCK_ID], [])
 
     def test_a_long_first_line_is_repeated_whole_below_the_clipped_headline(self):
         first = "why " * 60

@@ -25,7 +25,7 @@ Pure functions only, like ``slack_presenter``, whose layout this reuses.
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 
 import slack_presenter as _presenter
 
@@ -82,7 +82,7 @@ JOIN = frozenset({"and", "then"})
 OUR_LEAD = frozenset({"i", "we", "i've", "we've", "i’ve", "we’ve"})
 #: An outcome a label may name before "opened": "Done: opened", "Tests passed, opened".
 OUTCOME_WORD = frozenset({
-    "done", "update", "next", "result", "ready", "green", "complete", "completed", "finished",
+    "done", "update", "next", "result", "ready", "green", "complete", "completed", "finished", "passed",
 })
 #: A label naming the PR with no subject: "PR opened: <url>".
 PR_LABEL = (["pr"], ["pull", "request"])
@@ -93,17 +93,24 @@ OTHER_SUBJECT = frozenset({"he", "she", "they", "who", "which"})
 #: The worker's own earlier steps. A list rather than "-ed", which would take
 #: "Ahmed then opened" and "Fred reviewed and opened" as ours.
 OUR_VERB = frozenset({
-    "added", "adjusted", "analysed", "analyzed", "applied", "audited", "began", "bumped", "built",
+    "added", "addressed", "adjusted", "analysed", "analyzed", "applied", "audited", "began", "bumped", "built", "cherry-picked", "cordoned",
     "changed", "checked", "cleaned", "closed", "committed", "compared", "confirmed", "corrected",
-    "created", "debugged", "decreased", "deployed", "diagnosed", "did", "disabled", "documented",
-    "drafted", "edited", "enabled", "fetched", "filed", "fixed", "found", "generated", "got",
-    "identified", "implemented", "increased", "inspected", "installed", "investigated", "kept",
+    "created", "debugged", "decreased", "deleted", "deployed", "diagnosed", "did", "disabled", "documented",
+    "drafted", "drained", "dropped", "edited", "enabled", "fetched", "filed", "fixed", "following", "found", "generated", "got",
+    "identified", "implemented", "increased", "inspected", "installed", "investigated", "investigating", "kept",
     "looked", "lowered", "made", "merged", "migrated", "modified", "moved", "opened", "patched",
-    "pinned", "prepared", "pulled", "pushed", "put", "raised", "ran", "re-ran", "read", "rebased",
-    "rebuilt", "reduced", "refactored", "regenerated", "removed", "renamed", "replaced",
-    "reproduced", "reran", "restarted", "restored", "reverted", "reviewed", "rewrote", "rolled",
-    "scaled", "sent", "set", "split", "submitted", "superseded", "tested", "took", "traced",
-    "tuned", "updated", "upgraded", "validated", "verified", "wrote",
+    "pinned", "prepared", "proposed", "provisioned", "pulled", "pushed", "put", "raised", "ran", "re-ran", "read", "rebased",
+    "rebuilt", "reconciled", "recreated", "redeployed", "reduced", "refactored", "refreshed", "regenerated", "released", "removed", "renamed", "replaced",
+    "reproduced", "reran", "resized", "resolved", "restarted", "restored", "retried", "reverted", "reviewed", "rewrote", "rolled", "rotated",
+    "scaled", "sent", "set", "shipped", "split", "submitted", "superseded", "synced", "tagged", "tested", "took", "traced", "triggered",
+    "tuned", "uncordoned", "updated", "updating", "upgraded", "validated", "verified", "working", "wrote",
+})
+#: Steps a bot or a person gets credit for with "by": "Triggered by Renovate" is
+#: Renovate's, while "Fixed by hand" and "Scaled by 2x" are ours.
+PASSIVE_BY = "by"
+CREDITED_VERB = frozenset({
+    "created", "dropped", "filed", "generated", "merged", "raised", "retried", "reviewed", "rotated",
+    "submitted", "synced", "tagged", "triggered",
 })
 #: The worker's line under the headline, clipped: a note can be one long
 #: paragraph, and a Slack context element holds at most 3,000 characters.
@@ -138,13 +145,17 @@ OPTION_LINE = re.compile(r"^\s*(?:[-*•]|\d+[.)]|[A-Za-z][.)])\s+(.+?)\s*$")
 #: How the line right before the options must end for them to be choices; a
 #: list after "I found:" is evidence, not answers.
 QUESTION_END = "?"
-#: A yes/no question asking leave to go on ("Shall I proceed?", "OK to continue?"):
-#: a list after it is the plan, not answers, unless the question also offers a
-#: choice ("Shall I proceed with A or B?"). "How would you like to proceed?" asks
-#: for one of the options, so it is not one.
+#: A yes/no question asking leave to go on ("Shall I proceed?", "OK to continue?",
+#: "Sound good?", "Does the fix look right?"): a list after it is the plan, not
+#: answers, unless the question also offers a choice ("Shall I proceed with A or
+#: B?"). "How would you like to proceed?" asks for one of the options, so it is not one.
 PROCEED_QUESTION = re.compile(
     r"^(?:(?:shall|should|can|may)\s+(?:i|we)|(?:is\s+it\s+)?ok(?:ay)?\s+to)\b.*?\b(?:proceed|continue|go\s+ahead)\b"
-    r"|^do\s+you\s+approve\b",
+    r"|^do\s+you\s+approve\b"
+    # The informal asks only as the whole sentence: "Looks good, what next?" asks something else.
+    r"|^(?:(?:does\s+(?:this|that|it|the)|do\s+(?:these|they|those|the))(?:\s+[\w-]+){0,2}\s+)?(?:sounds?|looks?)\s+(?:good|ok(?:ay)?|right|fine)"
+    r"(?:\s+to\s+you)?\s*\?$"
+    r"|^(?:ok(?:ay)?|agreed|any\s+objections)\s*\?$",
     re.IGNORECASE,
 )
 #: Where the question's last sentence starts: "Here is the fix. Shall I proceed?"
@@ -157,12 +168,21 @@ OPTIONS_MIN = 2
 OPTIONS_MAX = _presenter.BUTTONS_PER_ROW
 #: The reason below the question, clipped; ``kanban_block`` puts no bound on it.
 DETAIL_MAX = 2000
+#: Bold in a context line: ``**text**`` between word boundaries with no ``*`` inside,
+#: which mrkdwn would read as a marker. ``__x__`` stays text, so a ``__init__.py`` in a
+#: path or url keeps its characters.
+DETAIL_BOLD = re.compile(r"(?<![\w*])\*\*(?=\S)([^*\n]+?)(?<=\S)\*\*(?![\w*])")
 NEEDS_YOU_ACTION_PREFIX = "kage_needs"
 WAITING = "⏸ waiting on you"
 
 
 def opened_pr(text: str) -> tuple[str, str, str, str] | None:
     """``(url, repo, number, line)`` for the first PR ``text`` says was opened, else None."""
+    return next(opened_prs(text), None)
+
+
+def opened_prs(text: str) -> Iterator[tuple[str, str, str, str]]:
+    """``(url, repo, number, line)`` for each PR ``text`` says was opened, in order."""
     for line in str(text or "").splitlines():
         for match in PR_URL.finditer(line):
             verb = OPENED_BEFORE_URL.search(line[: match.start()]) or _opened_pr_then(
@@ -173,8 +193,7 @@ def opened_pr(text: str) -> tuple[str, str, str, str] | None:
             before = line[: verb.start()]
             if NEGATED_VERB.search(before) or not _ours(before):
                 continue
-            return match.group(0), match.group(2), match.group(3), line.strip()
-    return None
+            yield match.group(0), match.group(2), match.group(3), line.strip()
 
 
 def _opened_pr_then(before: str, number: str) -> re.Match | None:
@@ -193,9 +212,14 @@ def _a_name(clause: str) -> bool:
     """Whether ``clause`` only names someone ("Dependabot", "Renovate (bot)"): no
     step or outcome of ours ("Done", "Checked it", "Tests passed", "Following up")."""
     words = _trimmed([w.lower() for w in CLAUSE_WORD.findall(clause)])
-    return bool(words) and not any(
-        w in OUR_LEAD or w in OUR_VERB or w in OUTCOME_WORD or w.endswith(("ed", "ing")) for w in words
-    )
+    return bool(words) and (_passive(words) or not any(
+        w in OUR_LEAD or w in OUR_VERB or w in OUTCOME_WORD for w in words
+    ))
+
+
+def _passive(words: list[str]) -> bool:
+    """Whether ``words`` credit a step to someone: "Triggered by Renovate", not "Fixed by hand"."""
+    return any(word in CREDITED_VERB and nxt == PASSIVE_BY for word, nxt in zip(words, words[1:]))
 
 
 def _trimmed(words: list[str]) -> list[str]:
@@ -243,6 +267,7 @@ def _ours(before: str) -> bool:
         bool(words)
         and (words[0] in OUR_LEAD or words[0] in OUR_VERB)
         and not OTHER_SUBJECT.intersection(words[1:])
+        and not _passive(words)
     )
 
 
@@ -252,12 +277,38 @@ def _escape(text: str) -> str:
     return text
 
 
-def _with_subline(blocks: list[dict], subline: str) -> list[dict]:
+def _link(match: re.Match) -> str:
+    label, url = match.group(1), match.group(2)
+    if not _presenter._safe_link_url(url):
+        return _escape(match.group(0))
+    return f"<{_presenter._link_url(url)}|{_escape(label)}>"
+
+
+def _bolded(text: str) -> str:
+    """``text`` escaped, each :data:`DETAIL_BOLD` run as mrkdwn's single-star bold."""
+    return DETAIL_BOLD.sub(r"*\1*", _escape(text))
+
+
+def _subline_mrkdwn(subline: str, links: bool = True) -> str:
+    """``subline`` escaped with its bold as mrkdwn bold outside code spans; with
+    ``links``, each Markdown link there as a mrkdwn link."""
+    held, spans = _presenter._hold_code(subline.replace("\x00", ""))
+    parts, last = [], 0
+    for match in _presenter.MD_LINK.finditer(held) if links else ():
+        parts += [_bolded(held[last : match.start()]), _link(match)]
+        last = match.end()
+    text = "".join(parts) + _bolded(held[last:])
+    return _presenter.CODE_PLACEHOLDER.sub(lambda m: _escape(spans[int(m.group(1))][0]), text)
+
+
+def _with_subline(blocks: list[dict], subline: str, links: bool = False) -> list[dict]:
     """``blocks`` with ``subline`` as a context line under the headline, escaped so
-    the worker's words cannot mention anyone."""
+    the worker's words cannot mention anyone; with ``links``, a Markdown link stays
+    a link. An opened PR's line keeps its links as text, for :data:`PR_URL`'s reason."""
     if not subline:
         return blocks
-    context = {"type": "context", "elements": [{"type": "mrkdwn", "text": _escape(subline)}]}
+    text = _subline_mrkdwn(subline, links)
+    context = {"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}
     return [*blocks[:1], context, *blocks[1:]]
 
 
@@ -306,7 +357,8 @@ def _trailing_options(lines: Sequence[str]) -> tuple[int, list[str]]:
     while start > 1 and (not lines[start - 1].strip() or OPTION_LINE.match(lines[start - 1])):
         start -= 1
     # A button is plain text: `code` and **bold** would show their markup.
-    options = [_unmarked(m.group(1)) for m in (OPTION_LINE.match(line) for line in lines[start:]) if m]
+    # A linked option shows, and answers with, its label, as the headline does.
+    options = [_unmarked(_presenter.MD_LINK.sub(r"\1", m.group(1))) for m in (OPTION_LINE.match(line) for line in lines[start:]) if m]
     # Read as the headline shows it: "**Which cluster?**" still ends in "?".
     question = _headline_text(lines[start - 1])
     if not options or not question.endswith(QUESTION_END):
@@ -329,7 +381,10 @@ def _first_text_line(lines: Sequence[str], fences: bool) -> int | None:
     fence = None
     for index, line in enumerate(lines):
         opened = _presenter.next_fence(line, fence) if fences else None
-        if opened is None and not _presenter.FENCE.match(line) and any(
+        # A line inside a fence, an opener or a closer is no headline; a line
+        # that opens with a code span ("```x``` is down. Which?") is text.
+        stray = not fences and _presenter._opens_fence(line)
+        if fence is None and opened is None and not stray and any(
             ch.isalnum() for ch in _presenter._plain(line)
         ):
             return index
@@ -357,9 +412,12 @@ def _question(reason: str, buttons: bool) -> tuple[str, list[str], list[str]]:
     if not usable:
         start, options = len(lines), []
     first = lines[0].strip()
-    # A clipped headline keeps its whole line below it too.
-    below = 0 if len(first) > _presenter.HEADLINE_MAX else 1
-    return first, [*before, *lines[below:start]], options
+    # A clipped headline keeps its whole line below it too, measured as shown, and so
+    # does one with a link: the headline shows only the label, the line below the url.
+    below = 0 if len(_headline_text(first)) > _presenter.HEADLINE_MAX or _presenter.MD_LINK.search(first) else 1
+    # Linked options likewise stay in the detail: their buttons show only the label.
+    end = len(lines) if any(_presenter.MD_LINK.search(line) for line in lines[start:]) else start
+    return first, [*before, *lines[below:end]], options
 
 
 def _detail(lines: Sequence[str]) -> str:
@@ -389,6 +447,7 @@ def needs_you(reason: str, buttons: bool = True) -> tuple[list[dict], str] | Non
     blocks = _with_subline(
         _presenter.blocks_answer(headline, choices=options, action_id_prefix=NEEDS_YOU_ACTION_PREFIX),
         detail,
+        links=True,
     )
     blocks.append({
         "type": "context",

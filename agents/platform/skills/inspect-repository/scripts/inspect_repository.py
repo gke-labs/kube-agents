@@ -338,9 +338,11 @@ def clone_directory(args) -> int:
                 "lease": lease,
                 "complete": True,
                 # Said rather than silently done. `--depth` is a broker-side
-                # clone option; this path is `git clone` through the shim and
+                # clone option; this path is a plain local `git clone`, which
                 # takes the full history, so a caller that asked for a shallow
-                # read got something else and should know which.
+                # read got something else and should know which. In the sandbox
+                # that `git` has no transport, so this fallback cannot clone
+                # there at all.
                 "depthIgnored": bool(args.depth),
             }
         )
@@ -396,7 +398,7 @@ def build_parser() -> argparse.ArgumentParser:
     searcher = commands.add_parser("grep", help="search the tracked files")
     searcher.add_argument("--handle", required=True)
     searcher.add_argument("--pattern", required=True)
-    searcher.add_argument("--prefix")
+    searcher.add_argument("--prefix", help="a directory or file, a path rather than a glob")
     searcher.add_argument("--regex", action="store_true", help="POSIX extended regex")
     searcher.add_argument("--ignore-case", action="store_true")
     searcher.set_defaults(func=handle_grep)

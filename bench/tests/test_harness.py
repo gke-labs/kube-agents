@@ -3258,6 +3258,7 @@ def test_a_question_wake_archives_its_card_when_the_wake_turn_errors(
     assert len(stub_agent.requests) == 1
     assert _archived(scripts)
     assert [s["name"] for s in result.trajectory][-1] == card_wake.SETTLED_ENTRY
+    assert "question_wake" in result.metadata and "failure_wake" not in result.metadata
 
 
 def test_a_question_wake_missing_its_answer_errors_without_planting(
@@ -3366,3 +3367,96 @@ def test_a_failure_wake_needs_the_api_transport(
 
     assert result.errors == [f"{card_wake.FAILURE_DIRECTIVE} needs AGENT_TRANSPORT=api, got 'inject'"]
     assert scripts == []
+
+
+# --- The fresh-session question replay (session: fresh) ----------------------
+
+_FRESH_PROMPT = _REPLAY_PROMPT + "session: fresh\n"
+_FRESH_DECOY = "t_dec0y000"
+_FRESH_POST = {"text": "Two clusters run checkout-gateway. Which should I look at?", "blocks": []}
+_FRESH_CONTEXT = "[Thread context — prior messages in this thread (not yet in conversation history):]\n...\n[End of thread context]\n"
+_FRESH_SETTLED = {**_REPLAY_SETTLED, "decoy_status": "blocked"}
+
+
+def _fresh_shell(scripts: list[str], context_reply: str | None = None):
+    """``_replay_shell`` for a fresh-session replay: a decoy, a post, and the context script."""
+    planted = json.dumps(
+        {"card": _REPLAY_CARD, "decoy": _FRESH_DECOY, "wake": _REPLAY_WAKE, "posted": 1, "post": _FRESH_POST, "error": None}
+    )
+    read = json.dumps({"card": _REPLAY_CARD, **_FRESH_SETTLED, "error": None})
+    archived = json.dumps({"archived": True, "cards": [_REPLAY_CARD, _FRESH_DECOY], "error": None})
+    context = json.dumps({"context": _FRESH_CONTEXT, "error": None})
+
+    def shell(script: str, timeout: float) -> str:
+        scripts.append(script)
+        if "create_task" in script:
+            return f"{card_wake.REPLAY_PRESENT}\n{planted}"
+        if shlex.quote(card_wake._CONTEXT_SCRIPT) in script:
+            return context_reply if context_reply is not None else f"{card_wake.REPLAY_PRESENT}\n{context}"
+        if shlex.quote(card_wake._READ_SCRIPT) in script:
+            return f"{card_wake.REPLAY_PRESENT}\n{read}"
+        return f"{card_wake.REPLAY_PRESENT}\n{archived}"
+
+    return shell
+
+
+def _context_messages(scripts: list[str]) -> list[dict]:
+    command = next(s for s in scripts if shlex.quote(card_wake._CONTEXT_SCRIPT) in s)
+    return json.loads(shlex.split(command)[-1])
+
+
+def test_a_fresh_session_replay_sends_the_answer_on_a_new_conversation_after_the_thread(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _fresh_shell(scripts))
+    stub_agent.turns = [_turn(_text("[SILENT]")), _answer_turn()]
+
+    result = KubeAgentsHarness().run(_FRESH_PROMPT)
+
+    assert not result.has_errors()
+    wake, answer = stub_agent.requests
+    assert wake["input"] == _REPLAY_WAKE
+    assert answer["input"] == (
+        f"{_FRESH_CONTEXT}\n\n[New message]\n[bench-user | Slack user <@UBENCHASKER>] seeded-b"
+    )
+    assert wake["conversation"] != answer["conversation"]
+    # The silent wake reply is not in the thread: the gateway posts nothing for it.
+    messages = _context_messages(scripts)
+    assert [m.get("text") for m in messages] == ["Check checkout-gateway's restarts", _FRESH_POST["text"]]
+    assert result.trajectory[-1]["result"] == _FRESH_SETTLED
+    assert result.metadata["question_wake"]["decoy"] == _FRESH_DECOY
+    check = ReplayCardVerifier(type="replay_card", status_not_in=["blocked"], decoy_status_in=["blocked"])
+    assert check.verify(5.0).success
+    assert _archived(scripts)
+
+
+def test_a_fresh_session_replay_puts_a_posted_wake_reply_in_the_thread(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _fresh_shell(scripts))
+    stub_agent.turns = [_turn(_text("Which cluster: seeded-a or seeded-b?")), _answer_turn()]
+
+    KubeAgentsHarness().run(_FRESH_PROMPT)
+
+    messages = _context_messages(scripts)
+    assert messages[-1]["text"] == "Which cluster: seeded-a or seeded-b?"
+    assert messages[-1]["user"] == card_wake.STUB_BOT
+
+
+def test_a_fresh_session_replay_whose_context_failed_in_the_image_sends_no_answer(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    broken = f'{card_wake.REPLAY_PRESENT}\n{{"error": "ImportError: no adapter"}}'
+    monkeypatch.setattr(harness, "_agent_shell", _fresh_shell(scripts, context_reply=broken))
+    stub_agent.turns = [_turn(_text("[SILENT]"))]
+
+    result = KubeAgentsHarness().run(_FRESH_PROMPT)
+
+    assert result.has_errors()
+    assert "no adapter" in result.errors[0]
+    assert not result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert len(stub_agent.requests) == 1
+    assert _archived(scripts)

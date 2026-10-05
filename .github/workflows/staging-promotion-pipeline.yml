@@ -192,9 +192,11 @@ jobs:
       # agentplugins_e2e_test.py, and the stockout file across every scenario
       # rather than the one the gate pins.
       optional_suites: "gchat,agent-plugin,stockout-full"
-      # Double the RC gate's 60: the same fixed provisioning cost, but all five
-      # test files rather than one suite's worth.
-      timeout_minutes: 120
+      # Up to 74m before the first test runs (see e2e-run.yml: ~5m setup, 64m of
+      # wait_for_gke_readiness.sh gates paid twice, and 5m confirm_agent_image.sh),
+      # plus ~60m across all five test files rather than the RC gate's single suite.
+      # Held by SiblingGatewayRolloutGatesTest in tests/test_gateway_rollout_budgets.py.
+      timeout_minutes: 135
     secrets: inherit
 
   step-3b-rollback-leg:
@@ -230,8 +232,18 @@ jobs:
     concurrency:
       group: nightly-environment
       cancel-in-progress: false
-    # Four Helm moves, each with a rollout wait of up to fifteen minutes.
-    timeout-minutes: 90
+    # Four upgrade.sh moves (two operator, two harness), each a 10m helm_retag
+    # wait plus every gate upgrade.sh's step-5 block pays in that mode — the
+    # two 3m sandbox waits in every mode, the 25m gateway gate (harness, and
+    # operator when it restarted the agent for new Secret keys), the 2m
+    # controller gate (operator) and 5m image confirmation (harness) — plus two
+    # 120s operator-scale handoff gates and two assert_running checks (two 120s
+    # image confirmations + 600s rollout + 600s Ready condition each): 230m of
+    # worst-case serial waits, plus 15m for the fetch-depth 0 checkout, two
+    # checkout_at, two registry sweeps, the dry run and the snapshots between
+    # the moves. Read off the scripts by SiblingGatewayRolloutGatesTest rather
+    # than kept here.
+    timeout-minutes: 250
     permissions:
       contents: read
       id-token: write
@@ -349,7 +361,7 @@ jobs:
         id: release-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          client-id: ${{ vars.RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.RELEASE_BOT_APP_PRIVATE_KEY }}
           permission-contents: write
           permission-workflows: write
@@ -522,7 +534,7 @@ jobs:
         id: release-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          client-id: ${{ vars.RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.RELEASE_BOT_APP_PRIVATE_KEY }}
           permission-contents: write
           permission-workflows: write
@@ -576,7 +588,7 @@ jobs:
         id: release-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          client-id: ${{ vars.RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.RELEASE_BOT_APP_PRIVATE_KEY }}
           permission-contents: write
           permission-workflows: write

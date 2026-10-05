@@ -26,8 +26,8 @@ The **gateway Pod** holds the harness and nothing credentialed:
    internal key. It holds no credential path.
 
 The **shell sandbox Pod**, `<agent>-shell`, runs `sshd`, the agent's own tools, a
-durable `/opt/data`, and the shims that stand in for `gcloud`, `kubectl`, `gh`, and
-`git`. This is the Pod that executes anything the model wrote. Its ServiceAccount
+durable `/opt/data`, the shims that stand in for `gcloud` and `kubectl`, and a
+`git` that holds no credential and reaches no forge. This is the Pod that executes anything the model wrote. Its ServiceAccount
 carries no `iam.gke.io/gcp-service-account` annotation, so the metadata server hands it
 an unbound principal that IAM grants nothing.
 
@@ -119,8 +119,9 @@ grant access, or run code the image does not already ship. The list is
 `safeSandboxEnvOverrides` in
 `k8s-operator/internal/controller/platformagent_manifests.go`. `KAGE_SLACK_UX`
 is the nearest case: it switches between Slack code paths the image already
-ships, adds no destination or credential, and writes only to Slack in the thread
-it answers; its comment in `safeSandboxEnvOverrides` lists each path.
+ships, adds no destination or credential, and writes only to Slack, in the
+channels and threads the gateway already serves; its comment in
+`safeSandboxEnvOverrides` lists each path.
 Reserved proxy, runtime-loader, and shell-startup variables cannot override the
 operator's managed values.
 
@@ -165,7 +166,7 @@ and the route table it feeds
 
 - PlatformAgent only.
 - Credentials managed by the operator.
-- CLI forwarding for `gcloud`, `kubectl`, `gh`, and `git`.
+- CLI forwarding for `gcloud` and `kubectl`.
 - Read-only Google Cloud REST relay for the reads no CLI exposes
   ([`designs/gcp-api-relay.md`](designs/gcp-api-relay.md)).
 - Slack and Google Chat credentialed relays.
@@ -225,7 +226,10 @@ audience-bound projected ServiceAccount token (one hour; the audience is per
 pod, `kubeagents-credential-proxy` for the sandbox and
 `kubeagents-credential-proxy-chat` for the gateway) as a bearer header, and the
 runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLERS`.
-That list names the gateway's ServiceAccount and the sandbox's and does not vary
+That list names the gateway's ServiceAccount and the sandbox's (and, under the
+operator's `A2A_SESSION_CLUSTER_VIEW` flag, a third, the session pods', bound to
+the audience `kubeagents-credential-proxy-session`; see
+[spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)) and does not vary
 on which one presented the token — the audience and the route table it feeds do —
 so the allowlist itself keeps other workloads out rather than telling those two
 apart. The token crosses the cluster network in cleartext;
@@ -320,9 +324,9 @@ proxy. The credential runtime directly executes the corresponding real CLI and
 returns output and exit status. It never evaluates an agent-supplied shell
 command.
 
-Only `gcloud`, `kubectl`, `gh`, and `git` are accepted. The proxy also rejects
-known credential-disclosure, credential-replacement, and self-modification
-operations, and the GitHub **write** path: merging a pull request
+Only `gcloud` and `kubectl` are forwarded from the sandbox. The proxy also
+rejects known credential-disclosure, credential-replacement, and
+self-modification operations, and the GitHub **write** path: merging a pull request
 (`github.merge`), approving a review (`github.assent`), mutating through the
 REST API (`github.api-mutation`), triggering workflows or releases
 (`github.pipeline-trigger`), and repository administration — secrets,
@@ -942,12 +946,24 @@ file and never a `.git` it can write into.
   crash or restart and are visible to both containers' next boot. The log
   shipper gets no `/tmp`: it buffers in memory
   and keeps its tail database on its own volume. Containers supplied through
-  `spec.deployment.sidecars`/`initContainers` are appended to the Pod as
-  written; the webhook does not require a read-only root of them, so a CR can
-  still add a writable container to this Pod.
+  `spec.deployment.sidecars`/`initContainers` are appended to the Pod
+  substantially as written; the webhook does not require a read-only root of
+  them, so a CR can still add a writable container to this Pod. "As written"
+  is not literal under `spec.mode: next`: the A2A render strips reserved-name
+  volume mounts and bus-credential mounts from a sidecar, and writes two env
+  names onto it because both feed the capability check rather than the
+  container's own configuration - `A2A_CAPABILITY_REQUIRED` as an override
+  that discards a CR value, `POD_NAMESPACE` as a default a CR value beats.
+  Neither edit touches the container's filesystem posture, which is what this
+  bullet is about.
 - A policy ConfigMap hash is placed on the Pod template to trigger rollout when
   command policy changes.
-- The operator reports Ready only when every workload it renders is ready.
+- The operator reports Ready only when every workload it renders is ready, with
+  one deliberate exception: under `mode: next` the capability verifier is not
+  counted. It is a request-path workload, and a rollout of it should not flip a
+  serving install to Provisioning. Because an install whose verifier is down
+  refuses every submission, it reports itself through the `A2AVerifier`
+  condition instead, which an install can be Ready and still carry.
 
 ## Deployment and Migration
 

@@ -61,3 +61,6 @@ chat-voice-failure-leads-with-fact
 # `platform` directly, so no front door answers the wake. Returns to the
 # lane when the door routes through the chat profile.
 chat-question-wake-stays-silent
+# #2039: the same for a typed answer to that question in a session the wake
+# never reached (session: fresh).
+chat-question-typed-answer-fresh-session

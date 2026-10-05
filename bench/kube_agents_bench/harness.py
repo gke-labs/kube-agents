@@ -153,6 +153,7 @@ from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
 from kube_agents_bench import board, card_wake, gitops, transcript, worker_trajectory
+from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     STATUS_TOOL,
     delegated_task_ids,
@@ -1620,7 +1621,10 @@ class KubeAgentsHarness(AgentHarness):
     def _execute_card_wake(
         self, replay: card_wake.Replay | card_wake.Failure, workspace_path: Path | None
     ) -> AgentResult:
-        """Send a planted card's wake and, for a question, the user's answer, on one conversation.
+        """Send a planted card's wake and, for a question, the user's answer.
+
+        The answer goes on the wake's conversation, or on a new one for a
+        ``session: fresh`` replay (:meth:`_execute_fresh_answer`).
 
         See :mod:`kube_agents_bench.card_wake`. No agent sees anything when the
         plant fails: a script that never ran to completion is infrastructure,
@@ -1651,7 +1655,9 @@ class KubeAgentsHarness(AgentHarness):
         answer_turn = None
         try:
             wake_turn = self._execute(planted.wake, workspace_path)
-            if not wake_turn.errors and not failure:
+            if not wake_turn.errors and not failure and replay.fresh:
+                answer_turn = self._execute_fresh_answer(replay, planted, wake_turn, workspace_path)
+            elif not wake_turn.errors and not failure:
                 answer_turn = self._execute(replay.answer, workspace_path)
         finally:
             _PINNED_RUN_ID.reset(pinned)
@@ -1664,8 +1670,37 @@ class KubeAgentsHarness(AgentHarness):
         # both are tagged, since an errored run is the one whose card and wake
         # are wanted.
         if answer_turn is None:
-            return card_wake.tag(planted, wake_turn, settled)
+            return card_wake.tag(planted, wake_turn, settled, "failure_wake" if failure else "question_wake")
         return card_wake.merge(planted, wake_turn, answer_turn, settled)
+
+    def _execute_fresh_answer(
+        self,
+        replay: card_wake.Replay,
+        planted: card_wake.Planted,
+        wake_turn: AgentResult,
+        workspace_path: Path | None,
+    ) -> AgentResult:
+        """Send the typed answer on a new conversation that starts from the thread's context.
+
+        The wake reply joins the thread only when the gateway would post it.
+        A context the image cannot format is infrastructure or an error, as
+        a failed plant is, and no answer is sent.
+        """
+        reply = str(wake_turn.metadata.get("final_message") or wake_turn.output or "")
+        if is_intentional_silence_response(reply):
+            reply = ""
+        messages = card_wake.thread_messages(replay, planted, reply)
+        try:
+            prompt = card_wake.fresh_answer(_agent_shell, messages, replay.answer, _EXEC_TIMEOUT)
+        except card_wake.ReplayUnavailable as exc:
+            return _infra_failure(str(exc))
+        except card_wake.ReplayBroken as exc:
+            return AgentResult.errored(str(exc))
+        fresh = _PINNED_RUN_ID.set(_mint_run_id())
+        try:
+            return self._execute(prompt, workspace_path)
+        finally:
+            _PINNED_RUN_ID.reset(fresh)
 
     def _execute_inject(self, prompt: str) -> AgentResult:
         """The inject transport: send the prompt through the gateway's front door.

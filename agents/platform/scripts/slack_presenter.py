@@ -9,8 +9,9 @@ gateway. Its callers include the gateway patches for reactions
 (``slack_ux_reactions``, which the kanban notifier also reaches), plan and
 session status (``slack_ux_status``, which reads only :func:`enabled`), moments
 (``slack_ux_moments``, which reads :func:`enabled` and lays out through
-``slack_moments``), incident triage (``slack_ux_incident``) and button clicks
-(``slack_ux_clicks``).
+``slack_moments``), incident triage (``slack_ux_incident``), button clicks
+(``slack_ux_clicks``) and the harness-message patch (``slack_boilerplate``,
+which reads only :func:`enabled`).
 Every caller reaches it through ``PYTHONPATH=/opt/defaults/scripts``, which the
 operator sets on the agent container.
 

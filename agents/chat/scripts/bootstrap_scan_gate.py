@@ -137,7 +137,15 @@ SCOPE_GAP_NAMED_LIMIT = 20
 # sweep degrades to the Platform Agent walking the whole fleet alone. So the gate runs
 # the reconcile itself and waits for it, rather than racing it.
 RECONCILE_ATTEMPTS_MARKER = ".bootstrap_reconcile_attempts"
-RECONCILE_TIMEOUT_SECONDS = 240  # the reconcile bounds its listing phase to LIST_BUDGET_SECONDS (150) and writes its snapshot after
+# At the default cap with few profiles: the reconcile bounds its listing phase to its
+# listing budget (150 s at a cap of 100) and its prune's describes to theirs (60 s), writes
+# its snapshot after, and the settle time covers the creates. A declared
+# `spec.scope.maxProjects` scales the listing budget and the profiles on the volume the
+# prune's, so `_reconcile_timeout_seconds` reads both the way the reconcile does and adds
+# the settle time; this constant is the floor, and the ceiling when there is no declaration
+# to read (the scope file's variable unset) or the reconcile cannot be imported.
+RECONCILE_TIMEOUT_SECONDS = 240
+RECONCILE_SETTLE_SECONDS = 30
 # `cluster_agent_reconcile.EXIT_ALREADY_RUNNING`. Mutual exclusion lives in that
 # script, because the hourly `cluster-agent-reconcile` job runs it too and the
 # gateway's cron lock is per job id — a lock held here would not keep the two apart.
@@ -383,6 +391,28 @@ def _record_reconcile_attempt(data_dir: Path, attempts: int, since: float | None
         sys.stderr.write(f"bootstrap_scan_gate: could not record reconcile attempt: {e}\n")
 
 
+def _reconcile_timeout_seconds() -> int:
+    """The ceiling for this install: the reconcile's own listing budget for the declared
+    `spec.scope.maxProjects`, its prune budget for that cap and the profiles on the volume,
+    and RECONCILE_SETTLE_SECONDS, read through the reconcile's functions so the two cannot
+    drift; RECONCILE_TIMEOUT_SECONDS when there is no declaration to read or the module
+    cannot be imported (the value at the default cap with few profiles)."""
+    try:
+        import cluster_agent_profile as profiles  # beside this script in the pod, as for the roster
+        import cluster_agent_reconcile as rec
+        if not os.environ.get(rec.SCOPE_FILE_ENV):
+            return RECONCILE_TIMEOUT_SECONDS
+        cap = rec._cap_of(rec._load_scope()[0])
+        try:
+            count = len(profiles.list_profiles())
+        except Exception:  # noqa: BLE001 - no roster yet is the bootstrap case; the floor's prune budget then
+            count = 0
+        ceiling = rec._list_budget_seconds(cap) + rec._prune_budget_seconds(cap, count) + RECONCILE_SETTLE_SECONDS
+        return max(RECONCILE_TIMEOUT_SECONDS, int(ceiling))
+    except Exception:  # noqa: BLE001 - the floor is the safe answer; never fail the tick over it
+        return RECONCILE_TIMEOUT_SECONDS
+
+
 def ensure_cluster_agents(data_dir: Path) -> bool:
     """Create the Cluster Agents, blocking until that finishes.
 
@@ -402,6 +432,7 @@ def ensure_cluster_agents(data_dir: Path) -> bool:
     script = _reconcile_script(data_dir)
     if not script.exists():
         return True  # deployment without Cluster Agents; the solo sweep is correct here
+    timeout = _reconcile_timeout_seconds()
 
     attempts = _reconcile_attempts(data_dir)
     since = _reconcile_since(data_dir)
@@ -428,7 +459,7 @@ def ensure_cluster_agents(data_dir: Path) -> bool:
             [sys.executable, str(script), "--require-create-pass"],
             capture_output=True,
             text=True,
-            timeout=RECONCILE_TIMEOUT_SECONDS,
+            timeout=timeout,
             env={**os.environ, "HERMES_HOME": str(data_dir)},
         )
     except Exception as e:  # noqa: BLE001 - timeout or spawn failure; retry next tick

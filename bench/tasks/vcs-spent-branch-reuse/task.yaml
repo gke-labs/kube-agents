@@ -49,8 +49,10 @@
 # cleared some other way than the verbs.
 #
 # WHAT IT LEAVES BEHIND: two pull requests per run on the GitOps repository,
-# one closed and one open, under a branch name no other run uses -- the
-# accumulation rca-remediation-pr and vcs-review-feedback-read-back accept.
+# one closed and one open, under a branch name no other run uses, until the
+# job's reset (hack/ci_reset_agent_pulls.py, #2260) closes the open one and
+# deletes both branches before the next repetition of a case that requests a
+# pull request, as rca-remediation-pr's header describes.
 #
 # No `domain:`, for the reason vcs-review-feedback-read-back gives: it grades
 # the version-control path of the remediation journey, not a fix.
@@ -113,9 +115,9 @@ verification_spec:
         # `bash -c "..."` or `$(...)`, or on the second line of a multi-line
         # command. Not after any quote, though: a commit message or a title
         # is free prose on the command line, and "git push was refused" in
-        # one is not a route. It is also reachable by path --
-        # `/opt/credential-proxy/bin/gh` is the shim a bare `gh` resolves to
-        # -- so any path to it trips. `/opt/vcs/libexec/git` itself does not:
+        # one is not a route. A path to the CLI trips as well --
+        # `/opt/credential-proxy/bin/gh` is where the shim kept it, and an
+        # image that still ships one is what this case catches. `/opt/vcs/libexec/git` itself does not:
         # it is the sanctioned local git, and it cannot reach a forge (see
         # vcs-review-feedback-read-back); a path that only starts there, such
         # as `/opt/vcs/libexec/../../credential-proxy/bin/git`, still trips.

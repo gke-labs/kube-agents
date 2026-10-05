@@ -42,6 +42,25 @@ the API server's is. The harness sends that wake as the run's only turn. The
 wake names the card but not the reason, so the front door reads the card
 (``kanban_show``) as it would in a real thread.
 
+**A typed answer in a session the wake never reached.** A question prompt
+with ``session: fresh`` sends the answer on a new conversation instead, as
+Slack does when the thread has no live session for the answer to land in
+(it expired, the gateway restarted, or sessions are per user): the new
+session starts from the thread as Hermes' cold start reads it, the ask that
+opened the thread, the question posted in it and the front door's reply to
+the wake when it was not silent, then the typed answer with the sender
+prefix a shared thread session carries. The in-pod context script
+(:func:`context_command`) formats those messages with the image's own
+``SlackAdapter._format_thread_context``, so the new session reads the
+thread's text the way the gateway would hand it over, card id included or
+not. The plant also files a decoy: a second card blocked on the same
+question, as a question in another thread would be, made to list first and
+read as the newer of the two so that neither "the first" nor "the latest"
+is a guess that lands on the planted card. Only the thread's text tells the
+two apart, and the read records the decoy's status beside the planted
+card's, archived included, so ``replay_card`` can require that it is still
+blocked.
+
 **A worker that crashed or timed out.** The dispatcher retries a ``crashed``
 or ``timed_out`` card until its failure breaker trips
 (``hermes_cli/kanban_db_dispatch.py``, ``_record_task_failure``:
@@ -128,10 +147,12 @@ __all__ = [
     "ReplayUnavailable",
     "Settled",
     "archive",
+    "fresh_answer",
     "merge",
     "parse",
     "plant",
     "tag",
+    "thread_messages",
 ]
 
 # First lines of the two replay prompts. The ``key: value`` lines under each
@@ -140,6 +161,10 @@ __all__ = [
 QUESTION_DIRECTIVE = "[bench:slack-question-wake]"
 FAILURE_DIRECTIVE = "[bench:card-failure-wake]"
 _QUESTION_FIELDS = ("title", "question", "options", "answer")
+# Optional for a question replay: ``session: fresh`` sends the answer on a new
+# conversation that starts from the thread's context.
+SESSION_FIELD = "session"
+SESSION_FRESH = "fresh"
 _FAILURE_FIELDS = ("title", "body", "outcome", "reason")
 OPTION_SEPARATOR = "|"
 
@@ -173,6 +198,8 @@ REPLAY_PRESENT = "__BENCH_CARD_WAKE__"
 
 # A replay card's ``idempotency_key`` is this and a fresh hex suffix per run.
 REPLAY_KEY_PREFIX = "devops-bench-card-wake-"
+# Appended to the run's key for a fresh-session replay's decoy card.
+DECOY_KEY_SUFFIX = "-decoy"
 # How old another run's replay card must be before a plant archives it: past
 # the longest a run can hold one (a 600 s turn, a 1800 s delegation), so a run
 # going on beside this one on the same install keeps its card.
@@ -197,28 +224,43 @@ WAKE_ASSIGNEE = "platform"
 WORKER_ASSIGNEE = "cluster-bench-project-bench-sandbox-us-central1"
 STUB_CHANNEL = "C0BENCHWAKE"
 STUB_THREAD = "1700000000.000100"
+# The fresh-session thread: the user who asked and answers, and the bot that
+# posted the question and the wake reply. Ids, not secrets.
+STUB_USER = "UBENCHASKER"
+STUB_USER_NAME = "bench-user"
+STUB_BOT = "UBENCHBOT"
+# The question's ts is the plant script's stub post's; the wake reply follows it.
+STUB_QUESTION_TS = "1700000000.000200"
+STUB_REPLY_TS = "1700000000.000300"
+ASK_MESSAGE_ID = "bench-ask"
 
 # Runs inside the agent container. Positional arguments: the sentinel, the
 # hermes root, the scripts directory, the flag, its on value, the creator,
 # the stub channel, the stub thread, the card title, its body, the block
 # reason or failure error, the outcome, the wake's assignee, the run's key,
-# the replay key prefix and the stale age. Before filing, it archives other
-# runs' replay cards older than the stale age, which an archive whose exec
-# failed left on the board; that sweep failing does not stop the plant.
-# The card is archived again if anything after filing it fails. The worker
-# pid, elapsed time and runtime limit in a crash or timeout's payload are
-# made up; only the front door reads them.
+# the decoy's key (empty for no decoy), the replay key prefix and the stale
+# age. Before filing, it archives other runs' replay cards older than the
+# stale age, which an archive whose exec failed left on the board; that sweep
+# failing does not stop the plant. The cards are archived again if anything
+# after filing them fails. The worker pid, elapsed time and runtime limit in
+# a crash or timeout's payload are made up; only the front door reads them.
 _PLANT_SCRIPT = r"""
 import asyncio, dataclasses, json, os, sys, time
 
 (SENTINEL, HERMES_ROOT, SCRIPTS, FLAG, ON, CREATOR,
- CHANNEL, THREAD, TITLE, BODY, REASON, OUTCOME, ASSIGNEE, KEY, PREFIX, STALE) = sys.argv[1:17]
+ CHANNEL, THREAD, TITLE, BODY, REASON, OUTCOME, ASSIGNEE, KEY, DECOY_KEY, PREFIX, STALE) = sys.argv[1:18]
 STUB_TS = "1700000000.000200"
 STUB_PID = 4242
 STUB_ELAPSED, STUB_LIMIT = 1830, 1800
 # A final attempt's wake: its own crashed or timed_out event, then gave_up.
 FINAL_BATCH = 2
-out = {"card": None, "wake": None, "posted": 0, "error": None, "mismatch": None, "swept": []}
+# The decoy lists first (kanban_list sorts by priority, then created_at) and
+# the planted card is backdated so the decoy is the newer: created_at is
+# whole seconds, and two cards filed together would otherwise tie.
+DECOY_PRIORITY = 1
+CARD_BACKDATE_SECONDS = 60
+out = {"card": None, "decoy": None, "wake": None, "posted": 0, "post": None,
+       "error": None, "mismatch": None, "swept": []}
 
 
 class BreakerMismatch(RuntimeError):
@@ -353,26 +395,40 @@ try:
     if not wake.synth:
         raise RuntimeError("the notifier built no wake for card %s" % card)
     out.update(wake=wake.synth, posted=len(adapter.posts))
+    if adapter.posts:
+        out["post"] = {"text": adapter.posts[0].get("text") or "", "blocks": adapter.posts[0].get("blocks") or []}
+    if DECOY_KEY:
+        # Filed after the planted card, so it is the newer of two cards blocked on one question.
+        decoy = kb.create_task(conn, title=TITLE, body=BODY, created_by=CREATOR,
+                               priority=DECOY_PRIORITY, idempotency_key=DECOY_KEY)
+        out["decoy"] = decoy
+        if not kb.block_task(conn, decoy, reason=REASON, kind="needs_input"):
+            raise RuntimeError("decoy card %s would not block" % decoy)
+        conn.execute("UPDATE tasks SET created_at = created_at - ? WHERE id = ?",
+                     (CARD_BACKDATE_SECONDS, card))
 except Exception as exc:
     out["mismatch" if isinstance(exc, BreakerMismatch) else "error"] = "%s: %s" % (type(exc).__name__, exc)
-    if conn is not None and out["card"]:
-        try:
-            kb.archive_task(conn, out["card"])
-        except Exception:
-            pass
+    for filed in (out["card"], out["decoy"]):
+        if conn is not None and filed:
+            try:
+                kb.archive_task(conn, filed)
+            except Exception:
+                pass
 print(SENTINEL)
 print(json.dumps(out))
 """
 
-# Reads the run's newest card as the run left it. Positional arguments: the
-# sentinel, the hermes root and the run's key. ``card`` is ``None`` when no
-# card that is not yet archived carries the key.
+# Reads the run's newest card as the run left it, and its decoy's status.
+# Positional arguments: the sentinel, the hermes root, the run's key and the
+# decoy's key. ``card`` is ``None`` when no card that is not yet archived
+# carries the key; ``decoy_status`` is ``None`` when no card, archived or
+# not, carries the decoy's: an agent that archived the decoy reads as that.
 _READ_SCRIPT = r"""
 import json, sys
 
-SENTINEL, HERMES_ROOT, KEY = sys.argv[1:4]
+SENTINEL, HERMES_ROOT, KEY, DECOY_KEY = sys.argv[1:5]
 sys.path.insert(0, HERMES_ROOT)
-out = {"card": None, "status": None, "comments": [], "error": None}
+out = {"card": None, "status": None, "comments": [], "decoy_status": None, "error": None}
 try:
     from hermes_cli import kanban_db as kb
     try:
@@ -388,18 +444,23 @@ try:
         out["card"] = cards[0]
         out["status"] = task.status if task else None
         out["comments"] = [{"author": c.author, "body": c.body} for c in kb.list_comments(conn, cards[0])]
+    decoys = [row[0] for row in conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key = ? ORDER BY created_at DESC", (DECOY_KEY,))]
+    if decoys:
+        decoy = kb.get_task(conn, decoys[0])
+        out["decoy_status"] = decoy.status if decoy else None
 except Exception as exc:
     out["error"] = "%s: %s" % (type(exc).__name__, exc)
 print(SENTINEL)
 print(json.dumps(out))
 """
 
-# Archives every card carrying the run's key. Positional arguments: the
-# sentinel, the hermes root and the run's key.
+# Archives every card carrying the run's key or its decoy's. Positional
+# arguments: the sentinel, the hermes root, the run's key and the decoy's key.
 _ARCHIVE_SCRIPT = r"""
 import json, sys
 
-SENTINEL, HERMES_ROOT, KEY = sys.argv[1:4]
+SENTINEL, HERMES_ROOT, KEY, DECOY_KEY = sys.argv[1:5]
 sys.path.insert(0, HERMES_ROOT)
 out = {"archived": False, "cards": [], "error": None}
 try:
@@ -409,10 +470,47 @@ try:
     except ImportError:
         connect = kb.connect
     conn = connect()
-    cards = [row[0] for row in conn.execute(
-        "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived'", (KEY,))]
+    cards = [row[0] for key in (KEY, DECOY_KEY) for row in conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived'", (key,))]
     out["cards"] = cards
     out["archived"] = all([bool(kb.archive_task(conn, card)) for card in cards])
+except Exception as exc:
+    out["error"] = "%s: %s" % (type(exc).__name__, exc)
+print(SENTINEL)
+print(json.dumps(out))
+"""
+
+
+# Formats the fresh session's thread context with the image's Slack adapter.
+# Positional arguments: the sentinel, the hermes root, the scripts directory,
+# the channel, the thread, the asker's user id and name, the bot's user id,
+# and a JSON list of the thread's messages before the answer. The adapter is
+# never constructed or connected: only the formatter's own state is set, and
+# name lookup and the allowlist answer from the arguments.
+_CONTEXT_SCRIPT = r"""
+import asyncio, json, sys
+
+SENTINEL, HERMES_ROOT, SCRIPTS, CHANNEL, THREAD, USER, USER_NAME, BOT, MESSAGES = sys.argv[1:10]
+out = {"context": None, "error": None}
+try:
+    sys.path[:0] = [HERMES_ROOT, SCRIPTS]
+    from plugins.platforms.slack.adapter import SlackAdapter
+
+    adapter = SlackAdapter.__new__(SlackAdapter)
+    adapter._team_bot_user_ids = {}
+    adapter._bot_user_id = BOT
+
+    async def _resolve_user_name(user_id, chat_id=None, team_id=None):
+        return USER_NAME if user_id == USER else user_id
+
+    adapter._resolve_user_name = _resolve_user_name
+    adapter._is_sender_authorized = lambda *args, **kwargs: True
+    messages = json.loads(MESSAGES)
+    content, _parent = asyncio.run(adapter._format_thread_context(
+        messages, thread_ts=THREAD, current_ts="", team_id="", channel_id=CHANNEL))
+    if not content:
+        raise RuntimeError("the adapter formatted no thread context from %d message(s)" % len(messages))
+    out["context"] = content
 except Exception as exc:
     out["error"] = "%s: %s" % (type(exc).__name__, exc)
 print(SENTINEL)
@@ -440,6 +538,7 @@ class Replay:
     question: str
     options: tuple[str, ...]
     answer: str
+    fresh: bool = False
 
     @property
     def reason(self) -> str:
@@ -459,12 +558,18 @@ class Failure:
 
 @dataclass(frozen=True)
 class Planted:
-    """What the plant left on the board: the card, its wake, how many posts the stub took, and the run's key."""
+    """What the plant left on the board: the card, its wake, how many posts the stub took, and the run's key.
+
+    ``post`` is the first post's ``text`` and ``blocks``, ``None`` when the
+    stub took none; ``decoy`` is the fresh-session replay's decoy card.
+    """
 
     card: str
     wake: str
     posted: int
     key: str = ""
+    post: dict | None = None
+    decoy: str | None = None
 
 
 @dataclass(frozen=True)
@@ -479,9 +584,13 @@ class Settled:
     status: str | None
     comments: tuple[dict, ...] = ()
     archived: bool = field(default=False, compare=False)
+    decoy_status: str | None = None
 
     def as_metadata(self) -> dict:
-        return {"status": self.status, "comments": [dict(c) for c in self.comments]}
+        metadata = {"status": self.status, "comments": [dict(c) for c in self.comments]}
+        if self.decoy_status is not None:
+            metadata["decoy_status"] = self.decoy_status
+        return metadata
 
 
 def _fields(lines: list[str], names: tuple[str, ...]) -> dict[str, str]:
@@ -513,14 +622,17 @@ def parse(prompt: str) -> Replay | Failure | None:
         return Failure(fields["title"], fields["body"], fields["outcome"], fields["reason"])
     if directive != QUESTION_DIRECTIVE:
         return None
-    fields = _fields(lines[1:], _QUESTION_FIELDS)
+    fields = _fields(lines[1:], (*_QUESTION_FIELDS, SESSION_FIELD))
+    session = fields.get(SESSION_FIELD, "")
+    if session and session != SESSION_FRESH:
+        raise ValueError(f"{directive} session {session!r} is not {SESSION_FRESH!r}")
     options = tuple(
         o.strip() for o in fields.get("options", "").split(OPTION_SEPARATOR) if o.strip()
     )
     missing = [f for f in _QUESTION_FIELDS if not fields.get(f)] + ([] if options else ["options"])
     if missing:
         raise ValueError(f"{directive} prompt is missing {', '.join(dict.fromkeys(missing))}")
-    return Replay(fields["title"], fields["question"], options, fields["answer"])
+    return Replay(fields["title"], fields["question"], options, fields["answer"], session == SESSION_FRESH)
 
 
 def _command(script: str, args: list[str]) -> str:
@@ -534,6 +646,11 @@ def _command(script: str, args: list[str]) -> str:
 def new_key() -> str:
     """A fresh run key for a replay card's ``idempotency_key``."""
     return REPLAY_KEY_PREFIX + uuid.uuid4().hex
+
+
+def decoy_key(key: str) -> str:
+    """The idempotency key of the decoy card a fresh-session replay files beside ``key``'s."""
+    return key + DECOY_KEY_SUFFIX
 
 
 def plant_command(replay: Replay | Failure, key: str) -> str:
@@ -560,6 +677,7 @@ def plant_command(replay: Replay | Failure, key: str) -> str:
             outcome,
             assignee,
             key,
+            decoy_key(key) if isinstance(replay, Replay) and replay.fresh else "",
             REPLAY_KEY_PREFIX,
             str(STALE_REPLAY_SECONDS),
         ],
@@ -567,13 +685,61 @@ def plant_command(replay: Replay | Failure, key: str) -> str:
 
 
 def read_command(key: str) -> str:
-    """The ``sh -c`` line that reads the newest card carrying ``key`` in the pod."""
-    return _command(_READ_SCRIPT, [REPLAY_PRESENT, HERMES_ROOT, key])
+    """The ``sh -c`` line that reads the newest card carrying ``key``, and its decoy's status, in the pod."""
+    return _command(_READ_SCRIPT, [REPLAY_PRESENT, HERMES_ROOT, key, decoy_key(key)])
 
 
 def archive_command(key: str) -> str:
-    """The ``sh -c`` line that archives the cards carrying ``key`` in the pod."""
-    return _command(_ARCHIVE_SCRIPT, [REPLAY_PRESENT, HERMES_ROOT, key])
+    """The ``sh -c`` line that archives the cards carrying ``key`` or its decoy's in the pod."""
+    return _command(_ARCHIVE_SCRIPT, [REPLAY_PRESENT, HERMES_ROOT, key, decoy_key(key)])
+
+
+def thread_messages(replay: Replay, planted: Planted, wake_reply: str) -> list[dict]:
+    """The thread as Slack would hold it before the typed answer, oldest first.
+
+    The ask that opened it, the question the stub took (when the image posts
+    one) and the front door's reply to the wake, left out when it is ``""``:
+    the gateway posts nothing for a silent reply.
+    """
+    bot = {"user": STUB_BOT, "bot_id": STUB_BOT}
+    messages = [{"ts": STUB_THREAD, "user": STUB_USER, "client_msg_id": ASK_MESSAGE_ID, "text": replay.title}]
+    if planted.post is not None:
+        messages.append({"ts": STUB_QUESTION_TS, **bot, **planted.post})
+    if wake_reply.strip():
+        messages.append({"ts": STUB_REPLY_TS, **bot, "text": wake_reply})
+    return messages
+
+
+def context_command(messages: list[dict]) -> str:
+    """The ``sh -c`` line that formats ``messages`` as the image's Slack adapter would."""
+    return _command(
+        _CONTEXT_SCRIPT,
+        [
+            REPLAY_PRESENT,
+            HERMES_ROOT,
+            SCRIPTS_DIR,
+            STUB_CHANNEL,
+            STUB_THREAD,
+            STUB_USER,
+            STUB_USER_NAME,
+            STUB_BOT,
+            json.dumps(messages),
+        ],
+    )
+
+
+def fresh_answer(shell: Callable[[str, float], str], messages: list[dict], answer: str, timeout: float) -> str:
+    """The first message a new thread session gets for ``answer``: the thread's context, then the answer.
+
+    Joined as ``run_inbound._prefix_inbound_sender_context`` joins them, with
+    the sender prefix a shared thread session carries. Raises
+    :class:`ReplayUnavailable` or :class:`ReplayBroken` as :func:`plant` does.
+    """
+    reply = _reply(shell(context_command(messages), timeout), "thread context")
+    content = reply.get("context")
+    if not isinstance(content, str) or not content.strip():
+        raise ReplayBroken(f"thread context: none in {reply!r}")
+    return f"{content}\n\n[New message]\n[{STUB_USER_NAME} | Slack user <@{STUB_USER}>] {answer}"
 
 
 def _reply(text: str, what: str) -> dict:
@@ -619,8 +785,18 @@ def plant(
     if not isinstance(card, str) or not card or not isinstance(wake, str) or not wake.strip():
         _sweep(shell, key, timeout)
         raise ReplayBroken(f"{what}: no card or no wake in {payload!r}")
-    posted = payload.get("posted")
-    return Planted(card, wake, posted if isinstance(posted, int) else 0, key)
+    posted, post, decoy = payload.get("posted"), payload.get("post"), payload.get("decoy")
+    if isinstance(replay, Replay) and replay.fresh and not (isinstance(decoy, str) and decoy):
+        _sweep(shell, key, timeout)
+        raise ReplayBroken(f"{what}: no decoy card in {payload!r}")
+    return Planted(
+        card,
+        wake,
+        posted if isinstance(posted, int) else 0,
+        key,
+        post if isinstance(post, dict) else None,
+        decoy if isinstance(decoy, str) and decoy else None,
+    )
 
 
 def _sweep(shell: Callable[[str, float], str], key: str, timeout: float) -> bool:
@@ -648,11 +824,12 @@ def archive(shell: Callable[[str, float], str], key: str, timeout: float) -> Set
     archived = _sweep(shell, key, timeout)
     if reply is None or not isinstance(reply.get("card"), str):
         return None
-    status, comments = reply.get("status"), reply.get("comments")
+    status, comments, decoy = reply.get("status"), reply.get("comments"), reply.get("decoy_status")
     return Settled(
         status if isinstance(status, str) else None,
         tuple(c for c in comments if isinstance(c, dict)) if isinstance(comments, list) else (),
         archived,
+        decoy if isinstance(decoy, str) else None,
     )
 
 
@@ -693,12 +870,15 @@ def _combine(first, second):
 def _card_metadata(planted: Planted, settled: Settled | None) -> dict:
     # ``settled`` is ``None`` when the card could not be read; its status and
     # comments are then unknown rather than empty.
-    return {
+    metadata = {
         "card": planted.card,
         "wake": planted.wake,
         "posted": planted.posted,
         "settled": settled.as_metadata() if settled is not None else None,
     }
+    if planted.decoy is not None:
+        metadata["decoy"] = planted.decoy
+    return metadata
 
 
 def _settled_entry(planted: Planted, settled: Settled | None) -> dict:
@@ -753,13 +933,17 @@ def merge(
     )
 
 
-def tag(planted: Planted, wake: AgentResult, settled: Settled | None = None) -> AgentResult:
-    """The failure replay's one turn, with the card, its wake and ``settled`` kept in metadata.
+def tag(
+    planted: Planted, wake: AgentResult, settled: Settled | None = None, key: str = "failure_wake"
+) -> AgentResult:
+    """A replay's one turn, with the card, its wake and ``settled`` kept in metadata under ``key``.
 
-    The reply to the wake is already the run's ``final_message``; the
-    trajectory gains :data:`SETTLED_ENTRY` and nothing else changes.
+    The failure replay's turn, or a question replay's whose wake errored
+    (``key="question_wake"``). The reply to the wake is already the run's
+    ``final_message``; the trajectory gains :data:`SETTLED_ENTRY` and nothing
+    else changes.
     """
-    metadata = {**wake.metadata, "failure_wake": _card_metadata(planted, settled)}
+    metadata = {**wake.metadata, key: _card_metadata(planted, settled)}
     return AgentResult(
         output=wake.output,
         trajectory=[*wake.trajectory, _settled_entry(planted, settled)],

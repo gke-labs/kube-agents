@@ -133,6 +133,8 @@ ADDED_AFTER_THE_MOVED_BLOCK = [
     "vcs-review-feedback-read-back",
     # #1918: a second proposal under a branch name its first proposal spent.
     "vcs-spent-branch-reuse",
+    # #2201: a request for gh answered through the verbs.
+    "vcs-forge-cli-request-uses-the-verbs",
 ]
 # Registered after the moved block, in file order, by the pull request that
 # authored each case.
@@ -147,6 +149,9 @@ ADDED_AFTER_THE_MOVE = [
     "chat-voice-ack-names-target",  # the front door's delegation ack
     "bootstrap-inventory-ranking-delivery",  # the onboarding prioritization stage, #2143
     "chat-question-wake-stays-silent",  # SOUL §2 step 5's already-posted rule
+    "chat-question-typed-answer-fresh-session",  # a typed answer from a new thread session
+    "platform-worker-shell-edit-of-shipped-skill",  # the sandbox's image trees, #2096
+    "autoops-controller-stall-triage",  # the stall watch on the inject path
     "chat-voice-retry-says-it-is-retried",  # the front door's reply to a crashed card
     "chat-voice-final-attempt-is-not-retried",  # the front door's reply to a card's last attempt
     "chat-voice-failure-leads-with-fact",  # the front door's reply to a blocked card
@@ -338,6 +343,7 @@ INJECT_LANE_EXCLUDED = [
     "chat-voice-final-attempt-is-not-retried",  # the same for a card's last-attempt wake
     "chat-voice-failure-leads-with-fact",  # #2039: grades the front door's reply to a blocked card's wake; same door
     "chat-question-wake-stays-silent",  # #2039: grades the front door's silence on a posted question's wake; same door
+    "chat-question-typed-answer-fresh-session",  # the same for a typed answer in a session the wake never reached
 ]
 # The directives a case's prompt opens with to replay a wake into the chat
 # front door (bench/kube_agents_bench/card_wake.py); the harness errors such
@@ -351,6 +357,7 @@ INJECT_LANE_EXCLUDED_TIER = {
     "chat-voice-final-attempt-is-not-retried": "nightly",
     "chat-voice-failure-leads-with-fact": "nightly",
     "chat-question-wake-stays-silent": "nightly",
+    "chat-question-typed-answer-fresh-session": "nightly",
 }
 
 

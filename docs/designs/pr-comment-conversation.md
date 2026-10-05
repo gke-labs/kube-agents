@@ -379,8 +379,7 @@ key -->` renders as `/agent fix the typo`, so the request acted on and the reque
   path work failed — `/tmp` is a per-container `emptyDir`, so every refusal died on "no such file"
   live, and the shared volume that replaced it then needed the file made group-readable across the
   uid split of #955. The text is now handed to `proposal-comment` as its `body`, which crosses on
-  fd 0 as part of the request and needs neither. `audit_report.BODY_STDIN` still takes the older
-  exit on the same fd, carrying the document itself rather than a request containing it.
+  fd 0 as part of the request and needs neither. The fleet audit's bodies take the same route.
 - **Cap.** At most `PR_AGENT_MAX_PER_TICK` (default 3) worker cards per tick, oldest first, with
   `deferred: <n>` logged. No silent truncation. The same cap bounds **refusals**, which the design
   above missed: an account posting a hundred untrusted comments would otherwise draw a hundred

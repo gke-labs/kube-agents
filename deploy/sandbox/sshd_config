@@ -24,16 +24,18 @@ HostKey /var/lib/sandbox-sshd/ssh_host_rsa_key
 # and nothing else is meant to be able to open a session here.
 #
 # `agent` is the model's shell. `hermes` is what trusted agent-pod code connects
-# as to run a cluster command, and it exists because the model owns `agent`'s
-# home and can make a non-interactive session there return whatever it likes
-# (deploy/sandbox/Dockerfile says more).
+# as to run a cluster command, and it exists because the model runs as `agent`
+# and can shape what a non-interactive session there returns (deploy/sandbox/
+# Dockerfile says more).
 #
-# %h, not an absolute path, and that is the whole of what keeps the two apart.
-# An absolute AuthorizedKeysFile is read for every account, so with
-# /home/agent/.ssh/authorized_keys named here — a 0600 file the model owns and
-# can append to — the model could authorise its own key and then open a session
-# as `hermes`. Per-user resolution sends it to /home/hermes/.ssh/authorized_keys
-# instead, inside a 0700 home that uid 1000 cannot enter.
+# %h, not an absolute path. An absolute AuthorizedKeysFile is read for every
+# account, so with /home/agent/.ssh/authorized_keys named here, that one file
+# would decide who may log in as `hermes` too. The entrypoint makes it
+# root-owned, but in an image where the model could append to it (older
+# builds made it a 0600 file the model owned) the model could authorise its
+# own key and then open a session as `hermes`. Per-user resolution sends it to
+# /home/hermes/.ssh/authorized_keys instead, inside a 0700 home that uid 1000
+# cannot enter.
 PermitRootLogin no
 PasswordAuthentication no
 KbdInteractiveAuthentication no

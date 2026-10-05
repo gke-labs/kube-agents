@@ -792,6 +792,15 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # gateway/slack_ux_incident.py returns, which is the notifier's own with the
 # flag off. Anchors on apply_kanban_progress_lines' call above. Also rides this
 # COPY and RUN. See deploy/docker/patches/slack_ux_incident.py.
+# Same flag, same block: gateway/slack_boilerplate.py keeps Hermes' own
+# boilerplate off Slack -- the cron wrapper (other targets, and the Chat relay
+# that routes on it, keep it), the opt-in heartbeat's tool trace (generic
+# phrase instead), the back-online notices, session-database warnings and
+# busy-input hint (not sent), and the restart/shutdown notices, slash-command
+# replies and other system replies (reworded in SlackAdapter.send and
+# edit_message; the steer and auth failure replies are replaced where they
+# are built, so no exception text reaches Slack). See
+# deploy/docker/patches/slack_boilerplate.py.
 COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/verify_slack_code_emphasis.py \
      deploy/docker/patches/apply_google_chat_attachment_notice.py \
@@ -814,6 +823,9 @@ COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/verify_slack_ux_incident.py \
      deploy/docker/patches/slack_ux_incident.py \
      deploy/docker/patches/verify_kanban_progress_lines.py \
+     deploy/docker/patches/apply_slack_boilerplate.py \
+     deploy/docker/patches/verify_slack_boilerplate.py \
+     deploy/docker/patches/slack_boilerplate.py \
      agents/platform/scripts/slack_presenter.py \
      agents/platform/scripts/slack_status.py \
      agents/platform/scripts/slack_moments.py \
@@ -845,6 +857,9 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
     install -m 0644 /tmp/message-surface/slack_ux_incident.py /opt/hermes/gateway/slack_ux_incident.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_ux_incident.py /opt/hermes && \
     grep -qF "_kage_slack_incident.adapter_for(" /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    install -m 0644 /tmp/message-surface/slack_boilerplate.py /opt/hermes/gateway/slack_boilerplate.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_boilerplate.py /opt/hermes && \
+    grep -qF "_kage_slack_boilerplate.cron_delivery_text" /opt/hermes/cron/scheduler_delivery.py && \
     cd /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_agent_view.py /opt/hermes && \
     grep -qF "def _kage_slack_ux_on(" /opt/hermes/hermes_cli/slack_cli.py && \
@@ -859,6 +874,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_moments.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_incident.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_kanban_progress_lines.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_boilerplate.py && \
     rm -rf /tmp/message-surface
 
 # Perf: hide worker-only kanban tools from orchestrator profiles. Upstream gates
@@ -1236,6 +1252,7 @@ COPY deploy/docker/patches/apply_kanban_guardrail_exit.py \
      deploy/docker/patches/verify_mcp_toolset_names.py \
      deploy/docker/patches/apply_quiet_rate_limit_exit.py \
      deploy/docker/patches/verify_quiet_rate_limit_exit.py \
+     deploy/docker/patches/verify_policy_refusal_hint.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-guardrail-exit/
 RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_synchronous_full.py /opt/hermes && \
@@ -1257,6 +1274,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_rate_limit_retry_delay.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_mcp_toolset_names.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_quiet_rate_limit_exit.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_policy_refusal_hint.py && \
     rm -rf /tmp/kanban-guardrail-exit
 
 # Perf: let a board mutation wake the kanban watchers instead of waiting out a

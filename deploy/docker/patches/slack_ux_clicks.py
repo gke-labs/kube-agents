@@ -22,7 +22,7 @@ With the flag on, :func:`register` adds two listeners:
   whole line the message itself shows ("Fix the first one: <the first row>",
   markup and a row's severity aside) is the turn, so a session that never
   read the message is told what the click is about. Part of a line is not
-  enough: it can say the opposite of the line it came from. The echo and the answered line still show the label. A
+  enough: it can say the opposite of the line it came from. The answered line (or its echo) still shows the label. A
   label that starts like a command (``/`` or ``!``) is sent as text, since a
   choice is an answer. The click goes through the adapter's own interactive
   authorization; an unlisted user's click is logged and changes nothing, and
@@ -32,8 +32,10 @@ With the flag on, :func:`register` adds two listeners:
   Then the message is rewritten with the choice buttons replaced by
   a line naming who chose what (the same line goes above the message's text,
   which is kept: an incident report is in that text and nowhere a later read
-  of the thread looks), a short echo ("↳ @user: label") is posted in
-  the thread, since a bot token cannot post as the user, and the label is fed
+  of the thread looks); only when Slack refuses that rewrite is a short echo
+  ("↳ @user: label") posted in the thread instead, since a bot token cannot
+  post as the user. The label is then offered as the thread's first ask, so
+  a session titled from the click reads as the label. The label is fed
   to the adapter's message handler as that user's message in that thread, the
   path a reaction trigger already takes. That path applies the channel and user checks a typed message gets, so a click
   can do nothing its clicker could not do by typing the label.
@@ -69,7 +71,7 @@ the thread is read once, plus the cached thread-root lookup the adapter's
 channel gate makes, and if a person the adapter would answer (not a bot by
 its own test, its interactive authorization, the check the clicker passed, and
 its channel gate with the mention rule the click skips) has replied with one of the call to
-action's forms (``apply``, ``apply Option B``, ``apply B``, any of them ending
+action's forms (``apply``, ``apply Option B``, ``apply B`` (a letter the alert offers, when its options are lettered), any of them ending
 in a please or a thanks, or a button's whole text, ``apply Option B: <that
 option's text>``; a colon before anything else is not one) since the buttons appeared, the buttons are replaced with
 "answered in the thread" and the click is dropped. Any option typed counts, not only the one
@@ -88,7 +90,7 @@ test is the exception: the adapter makes it before any other, so one that
 raises took no turn and that reply does not count. Other choice buttons are
 not checked.
 
-A click that runs is fail-soft: a rewrite or echo that fails is logged and the
+A click that runs is fail-soft: a rewrite, or the echo standing in for it, that fails is logged and the
 turn still runs, because the click was the user's answer. A click dropped for a
 typed apply runs no turn, whether or not its rewrite lands.
 """
@@ -118,7 +120,8 @@ FLAG_ON_VALUES = frozenset({"1", "true", "yes", "on"})
 #: What the adapter's authorization log calls each kind of click.
 CHOICE_KIND = "kage choice"
 
-#: The echo posted in the thread, and the line that replaces the answered buttons.
+#: The line that replaces the answered buttons, and the echo posted in the
+#: thread instead when that rewrite fails, so a click always shows once.
 ECHO = "↳ <@{user}>: {label}"
 ANSWERED = "✓ <@{user}>: {label}"
 
@@ -451,6 +454,26 @@ def _question_card(channel_id: str, msg_ts: str) -> str:
         return ""
 
 
+async def _title_from_label(adapter: Any, channel_id: str, team_id: str, thread_ts: str, label: str) -> None:
+    """Offer ``label`` as the thread's first ask before the turn runs, so a session
+    titled from the click shows the label and never the card note in the turn.
+
+    A channel thread is titled through ``slack_ux_status``; a DM thread only by
+    upstream, once, so a DM already titled from its first message keeps it."""
+    if not channel_id.startswith(DM_CHANNEL_PREFIX):
+        try:
+            from gateway import slack_ux_status
+
+            slack_ux_status.note_ask(channel_id, thread_ts, label)
+        except Exception:  # noqa: BLE001 — the title is cosmetic; the click still answers
+            pass
+    elif hasattr(adapter, "_set_assistant_thread_title"):
+        try:
+            await adapter._set_assistant_thread_title(channel_id, thread_ts, label, team_id=team_id)
+        except Exception:  # noqa: BLE001 — as above
+            pass
+
+
 def _turn_text(label: str, card: str) -> str:
     text = _as_answer(label)
     return f"{text}\n\n{CARD_NOTE.format(card=card)}" if card else text
@@ -509,8 +532,13 @@ def _typed_apply(text: str, options: frozenset[tuple[str, str]]) -> bool:
     after the colon is that option's own in ``options``. A guess at what the agent applies."""
     text = TYPED_STRUCK.sub("", text).translate(TYPED_MARKUP)
     typed = TYPED_APPLY.match(text, TYPED_LEAD.match(text).end())
-    if not typed or not typed.group(0).endswith(":"):
-        return bool(typed)
+    if not typed:
+        return False
+    if not typed.group(0).endswith(":"):
+        # A letter the alert does not offer applies nothing. A single fix (no letters) or no
+        # option read: any letter counts, since the agent may apply the one fix anyway.
+        letters = {letter for letter, _ in options if letter}
+        return not (typed.group(1) and letters) or typed.group(1).upper() in letters
     tail = SLACK_LINK.sub(lambda link: link.group(2) or link.group(1), text[typed.end():])
     return ((typed.group(1) or "").upper(), _option_text(tail)) in options
 
@@ -597,7 +625,7 @@ async def _applied_by_typing(
 
 
 async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) -> None:
-    """Authorize a choice click, mark it answered, echo it, and run it as the clicker's turn."""
+    """Authorize a choice click, mark it answered, title its thread from the label, and run it as the clicker's turn."""
     started = await adapter._begin_interaction(ack, body, action, kind)
     if started is None:
         return
@@ -650,12 +678,14 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
     note = ANSWERED.format(user=user_id, label=shown)
     # Before the awaits: a card that moves on in between settles its question and forgets it.
     card = _question_card(channel_id, msg_ts)
+    rewritten = False
     try:
         await client.chat_update(
             channel=channel_id, ts=msg_ts,
             text=_answered_text(note, message, not action_id.startswith(INCIDENT_CHOICE_PREFIX)),
             blocks=answered_blocks(message.get("blocks"), _answered_by, note),
         )
+        rewritten = True
         if key in _answered:
             _rewritten[key] = None
             while len(_rewritten) > ANSWERED_MAX:
@@ -665,12 +695,14 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
             "slack_ux_clicks: could not mark %s answered; its buttons stay but further clicks are dropped: %s",
             msg_ts, exc,
         )
-    try:
-        await client.chat_postMessage(
-            channel=channel_id, thread_ts=thread_ts, text=ECHO.format(user=user_id, label=shown),
-        )
-    except Exception as exc:  # noqa: BLE001 — the click still answers
-        logger.warning("slack_ux_clicks: could not echo the click on %s: %s", msg_ts, exc)
+    if not rewritten:
+        try:
+            await client.chat_postMessage(
+                channel=channel_id, thread_ts=thread_ts, text=ECHO.format(user=user_id, label=shown),
+            )
+        except Exception as exc:  # noqa: BLE001 — the click still answers
+            logger.warning("slack_ux_clicks: could not echo the click on %s: %s", msg_ts, exc)
+    await _title_from_label(adapter, channel_id, team_id, thread_ts, label)
 
     synthetic = {
         "type": "message",

@@ -153,7 +153,7 @@ class StageTest(unittest.TestCase):
 
     def test_every_read_carries_a_timeout(self):
         # `sandbox_exec.run` waits forever when handed no timeout, and the far
-        # side sources a `~/.bashrc` the model owns.
+        # side sources a `~/.bashrc` the model owns on older sandbox images.
         self.fake_read({"/opt/data/report.md": b"body"})
         staged, directory = sandbox_artifact_patch._stage(["/opt/data/report.md"])
         self.addCleanup(sandbox_artifact_patch._cleanup, staged, directory)
