@@ -80,7 +80,8 @@ message was deleted), the thread drops to the rolling line until every card
 that rolled a note since has settled or been archived, which is what the
 thread showed before this module. A posted plan holds ``processing`` while
 those cards roll and ``suspended`` while they wait on the user; a plan refused
-on its first post holds no status. A settle still edits a posted plan, best
+on its first post holds session status through its rolling and waiting cards,
+clearing the session when its cards settle. A settle still edits a posted plan, best
 effort, so an edit refused once, for a rate limit say, does not leave its rows
 showing as running. Everything here is in process, like the progress-line map:
 a gateway restart forgets the plan, and the next note starts a new one. A
@@ -424,8 +425,9 @@ async def _session(adapter: Any, key: tuple, plan: _Plan) -> None:
     :func:`set_thread_status` skips an unchanged status against what
     Slack last accepted, so a refused one is retried and one a Planning Agent
     turn changed is restored. The legacy setter has no such check and costs a
-    call per note, beside the note's own edit. A plan that never posted set no
-    status, so it sends none.
+    call per note, beside the note's own edit. A plan that never posted sends
+    no status during note delivery; its cards' settlements update the session
+    when settling.
     """
     if not plan.ts:
         return
