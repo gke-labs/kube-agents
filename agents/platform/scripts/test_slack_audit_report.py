@@ -311,8 +311,8 @@ class HeadlineFromIssueTest(unittest.TestCase):
         self.assertIsNotNone(sar.headline_from_issue(dict(ISSUE, state="OPEN"), REF, REPORT))
 
     def test_a_zero_finding_title_does_not_parse(self):
-        issue = dict(ISSUE, title="[audit] Security & RBAC Posture Audit — 0 findings (0 critical)", body="All clear.")
-        self.assertIsNone(sar.headline_from_issue(issue, REF, REPORT))
+        issue = dict(ISSUE, title="[audit] Security & RBAC Posture Audit — 0 findings (0 critical)")
+        self.assertIsNone(sar.headline_from_issue(issue, REF, LEDGER))
 
     def test_the_card_does_not_restate_the_lines_counts(self):
         line = (
@@ -933,7 +933,7 @@ class BlocksFromIssueTest(unittest.TestCase):
             ("unlabelled", dict(ISSUE, labels=["bug"]), REPORT),
             ("stale", ISSUE, f"Security audit: 9 new — {LEDGER}"),
             ("old total", ISSUE, f"Security audit: 0 findings across 2 of 3 clusters — {LEDGER}"),
-            ("zero", dict(ISSUE, title="[audit] Cost Audit — 0 findings (0 critical)"), REPORT),
+            ("zero", dict(ISSUE, title="[audit] Cost Audit — 0 findings (0 critical)"), LEDGER),
             ("none listed", dict(ISSUE, body="Summary."), REPORT),
         ):
             with self.subTest(label):

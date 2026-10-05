@@ -1437,6 +1437,7 @@ class DeliveryFlagTest(unittest.TestCase):
         with (
             mock.patch.dict(os.environ, env, clear=True),
             mock.patch.object(bootstrap_delivery, "_origin", lambda: dict(origin)),
+            mock.patch.object(bootstrap_delivery.sandbox_exec, "sandbox_enabled", return_value=False),
             contextlib.redirect_stdout(buf),
         ):
             rc = bootstrap_delivery.main(self.d)
@@ -1503,6 +1504,7 @@ class BlocksDeliveryTest(unittest.TestCase):
         with (
             mock.patch.dict(os.environ, env, clear=True),
             mock.patch.object(bootstrap_delivery, "_origin", lambda: dict(origin)),
+            mock.patch.object(bootstrap_delivery.sandbox_exec, "sandbox_enabled", return_value=False),
             mock.patch.object(self.sbp, "post", side_effect=post) as poster,
             contextlib.redirect_stdout(out),
             contextlib.redirect_stderr(err),
