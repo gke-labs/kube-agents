@@ -1,7 +1,8 @@
 # Slack Stop: cancel the turn and the cards, and say what changed
 
 Status: proposed; the reply wording is pending maintainer approval. Builds on the Slack status
-line (`deploy/docker/patches/slack_ux_status.py`), which owns the agent session's status and the thread's plan rows.
+line (`deploy/docker/patches/slack_ux_status.py`), which owns the agent session's status and the
+thread's plan rows.
 
 Slack's agent view puts a Stop button beside "working…". Pressing it stops everything the thread
 started: the Planning Agent's turn **and** every kanban card it filed that has not finished. The
@@ -92,8 +93,12 @@ Stop therefore acts at both: the broker for commands, and a Hermes tool hook for
    `async_session_store.get_or_create_session(source)`, and take `chat_id` and `thread_id` from the
    session source. The stop runs as a scheduled task, not inline in the event handler, because it
    waits on kills.
-6. **Who may stop.** The thread's requester only: the event's `user` must match the `user_id` on
-   the thread's `kanban_notify_subs` rows. This is narrower than upstream, whose sibling stop lets
+6. **Who may stop.** The thread's requester only: the event's `user` must be the session source's
+   user, whose message the running turn answers, or a `user_id` on the thread's
+   `kanban_notify_subs` rows, so the requester can stop a turn before it has filed any card. In a
+   shared thread where several people asked for work, any of them may stop it, and the stop takes
+   the whole thread's work, theirs and the others'. This is narrower than upstream, whose sibling
+   stop lets
    any user `_is_user_authorized_for_source` accepts stop any run in the thread; the reply below
    promises the narrower rule, so the build enforces it. Anyone else gets the "not yours" reply and
    nothing stops.
@@ -136,11 +141,13 @@ interrupt_reason=STOP_REASON, invalidation_reason=…)`, with a reason of Stop's
    (`HERMES_KANBAN_TASK`, else `HERMES_SESSION_ID`) only on a workspace `open`, and the exec path's
    `caller` is the client connection. The build adds the label to every exec, vcs and workspace
    request, in the shims and in the broker's request parsing, and the fence and the ledger key on it.
-4. **Archive the open ones, leaves first.** `kb.archive_task` in reverse topological order over `task_links`.
+4. **Archive the open ones, leaves first.** `kb.archive_task` in reverse topological order over
+   `task_links`.
    `archive_task` runs `recompute_ready`, which promotes a child once all its parents are archived,
    so archiving a parent first can hand the dispatcher (5 s tick) a child to start. Every non-final
    state is archived: `triage`, `todo`, `scheduled`, `ready`, `running`, `blocked`, `review`.
-   `done` and `archived` are final. `block_task` is not used: it clears the claim and leaves the worker running.
+   `done` and `archived` are final. `block_task` is not used: it clears the claim and leaves the
+   worker running.
    Read each card's `archive_worker_termination` event; `terminated: false`, or
    `termination_attempted: false` for a claim on another host, makes that card "would not stop".
 5. **Rescan** the subscription rows and links, fence and archive anything new, until a scan finds
@@ -155,7 +162,8 @@ interrupt_reason=STOP_REASON, invalidation_reason=…)`, with a reason of Stop's
    `agents.sessions.setStatus` takes `processing`, `suspended` or `closed` and nothing else. Slack
    does not clear the status after a Stop and otherwise leaves `processing` up for an hour, and
    `closed` means "session terminated; agent won't respond", which contradicts carrying on, so
-   `suspended` is the one value left; the live probe confirms how the client draws it. The `archived` events
+   `suspended` is the one value left; the live probe confirms how the client draws it. The
+   `archived` events
    the notifier delivers later find the rows already settled. The status line ends an ordinary turn
    with `closed` today; that is a separate fix.
 
