@@ -4712,6 +4712,8 @@ def test_the_retry_objectives_pass_a_reply_that_says_it_is_retried(final_message
                 "Crashed cards usually get another go, except this one, sadly.",
                 "You'll need to pick it up again.",
                 "Someone will have to pick it up again.",
+                "I'll pick it up again.",
+                "We will pick it up again.",
             )
         ),
         # A hedge or a bare denial states no retry and calls it final.
@@ -5513,6 +5515,9 @@ def test_the_failure_case_requires_a_successful_card_read():
         # The dots in a permission name do not end the first sentence.
         "Without container.deployments.update, invoice-renderer on bench-sandbox wasn't restarted. "
         + _FAILURE_ASK,
+        # The name with a space in place of the hyphen.
+        "I couldn't restart invoice renderer on bench-sandbox. My service account lacks the "
+        "`container.deployments.update` permission there. " + _FAILURE_ASK,
         # Nor do they end the closing question.
         "I couldn't restart invoice-renderer on bench-sandbox. My service account lacks the "
         "`container.deployments.update` permission there. Want me to try again once my service "

@@ -324,11 +324,11 @@ verification_spec:
         - "'ll go again"
         - "going to go again"
         - "up to the dispatcher"
-      # "Pick it up again" needs the dispatcher, a first-person or a passive
-      # subject: bare, it matches "you'll need to pick it up again", which
-      # hands the retry over.
+      # "Pick it up again" needs the dispatcher or a passive subject: bare,
+      # it matches "you'll need to pick it up again", which hands the retry
+      # over, and "I'll pick it up again" is the front door's own retry.
       any_of_patterns:
-        - '\b(?:i|we|the dispatcher)(?:[''’]ll| will|[''’]s going to| is going to|[''’]m going to|[''’]re going to) pick it up again'
+        - '\bthe dispatcher(?:[''’]ll| will|[''’]s going to| is going to) pick it up again'
         - '\bit(?:[''’]ll| will) be picked up again'
   # No retry, requeue or second card offered or started beside the
   # dispatcher's retry; that runs the work twice. A re-route offer passes
