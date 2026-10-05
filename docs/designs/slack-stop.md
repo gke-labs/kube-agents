@@ -6,7 +6,7 @@ which owns the agent session's status and the thread's plan rows.
 
 Slack's agent view puts a Stop button beside "working…". Pressing it stops everything the thread
 started: the Planning Agent's turn **and** every kanban card it filed that has not finished. The
-reply says "I didn't change anything in <target>." only when that has been checked and found true;
+reply says "I didn't change anything in `<target>`." only when that has been checked and found true;
 otherwise it says what did change, or that it could not check.
 
 ## Today
@@ -30,9 +30,10 @@ otherwise it says what did change, or that it could not check.
   `GatewayRunner._interrupt_and_clear_session` (Hermes `gateway/run_agent_cache.py`), which
   hard-interrupts the turn and its synchronous `delegate_task` children, bumps the run generation so
   a late reply is dropped, reaps the turn's processes, and fires `agent_loop_stopped`. With no turn
-  running, which is the usual state once cards are filed, it replies that nothing is active and does
-  nothing else. Kanban cards are separate worker processes and run on either way; the status-line
-  docstring says so.
+  running, which is the usual state once cards are filed, it clears any stuck Slack status
+  (`_stop_typing_with_metadata`, `gateway/slash_commands.py`) and replies that nothing is active.
+  Kanban cards are separate worker processes and run on either way; the status-line docstring says
+  so.
 
 ## Where a card's work actually runs
 
@@ -142,10 +143,27 @@ interrupt_reason=STOP_REASON, invalidation_reason=…)`, with a reason of Stop's
    `pre_tool_call` hook reads (below), so an MCP call a worker starts between the fence and its kill
    is refused. An MCP call already sent cannot be recalled: Google runs it, and a cluster or node-pool
    update continues as a long-running operation after the worker dies.
-   No such label reaches the broker today: `credential_proxy_client` sends `default_caller_label`
+
+   No such label reaches the broker today. `credential_proxy_client` sends `default_caller_label`
    (`HERMES_KANBAN_TASK`, else `HERMES_SESSION_ID`) only on a workspace `open`, and the exec path's
-   `caller` is the client connection. The build adds the label to every exec, vcs and workspace
-   request, in the shims and in the broker's request parsing, and the fence and the ledger key on it.
+   `caller` is the client connection. Nor can the shims read the label from their own environment:
+   the SSH crossing forwards only `HERMES_PROFILE_HOME`
+   (`deploy/docker/ssh_config.d/10-sandbox-profile-home.conf`, `deploy/sandbox/sshd_config`).
+   `HERMES_SESSION_ID` never exists in the sandbox, and `session-command.sh` rebuilds
+   `HERMES_KANBAN_TASK` from the cwd only when it lies under `kanban/workspaces/t_…`. Hermes tracks
+   the cwd across commands (`_update_cwd`, `tools/environments/base.py`), so a worker that `cd`s out
+   of its workspace would make writes with no label: no fence, no ledger key.
+
+   The build therefore forwards the label explicitly, the way `HERMES_PROFILE_HOME` crosses. The
+   `ssh` wrapper (`deploy/docker/ssh-wrapper.sh`) copies the worker's `HERMES_KANBAN_TASK`, else
+   `HERMES_SESSION_ID`, to `HERMES_CALLER_LABEL` when it spawns the client; the drop-in's `Match`
+   block adds the name to its `SendEnv`; the sandbox's `Match User agent` block adds it to its
+   `AcceptEnv`; and `session-command.sh` exports it whatever the cwd. The shared ControlMaster
+   forwards a multiplexed client's variable only when its own `SendEnv` permits the name, and every
+   `ssh` in the pod reads the same image-shipped drop-in, so the one master already permits it and
+   no second master is needed. The shims send the label on every exec, vcs and workspace request,
+   the broker parses it, and the fence and the ledger key on it.
+
 4. **Archive the open ones, leaves first.** `kb.archive_task` in reverse topological order over
    `task_links`. `archive_task` runs `recompute_ready`, which promotes a child once all its parents
    are archived, so archiving a parent first can hand the dispatcher (5 s tick) a child to start.
@@ -202,7 +220,8 @@ against ingestion lag would return "empty" for "not yet ingested".
 `mcp-gke` (platform, cluster), handles each `gke` MCP call. Workers run in the agent pod, so
 the gateway and the hook share a filesystem. The hook:
 
-- refuses the call (`{"action": "block"}`) when the card (`HERMES_KANBAN_TASK`) or session is on the
+- refuses the call (`{"action": "block", "message": "Stopped: this task was stopped from Slack."}`;
+  Hermes ignores a block with no message) when the card (`HERMES_KANBAN_TASK`) or session is on the
   stopped list;
 - otherwise appends `started` to a per-card record under the profile's home before the call, and
   the outcome after it.
@@ -222,7 +241,9 @@ called, not as a node-pool update.
 2. the fence drained: no stopped label has a command in flight;
 3. every stopped card terminated (step 4);
 4. the broker ledger holds no write and no unknown for any of the thread's cards, finished ones
-   included;
+   included, and no unlabeled write from the earliest card's creation to the end of the fence wait.
+   An unlabeled write, or one whose label names no card or session on the board, cannot be ruled
+   out as this thread's, so it counts as an unknown;
 5. the ledger covers those cards' whole lives: the broker started before the earliest of them was
    created and has evicted no entry since. The ledger is in memory, so a broker restart empties
    it, and an empty ledger is not evidence of no write;
@@ -238,15 +259,16 @@ Limits the reply carries rather than hides:
 
 - **The scope is this thread's cards.** Another thread's card, a scheduled job, or a person may have
   changed the same cluster; the check does not see them.
-- **The caller label is self-reported.** The shim the build changes reads it from the worker's
-  environment (`HERMES_KANBAN_TASK`, else `HERMES_SESSION_ID`), and the worker's shell could change
-  it. A worker
-  that did so would escape both the fence and the check.
+- **The caller label is the command's own word.** The worker's label crosses into the sandbox
+  intact, but the command runs in a shell the model drives, which can unset or overwrite
+  `HERMES_CALLER_LABEL` before it calls a shim. An unset label, or one naming no known card or
+  session, is an unknown, so the reply never says "I didn't change anything". A label forged to name
+  another live card or session escapes both the fence and this thread's check.
 - **A token minted outside both doors is invisible.** The metadata server is reachable from the agent
   container, so code there can mint the Workload Identity token and call Google directly. Hermes's
   own tools do not; the IAM grant is the limit on anything that does.
-- **What already landed stays landed:** a pull request a person or Tide merged, or a GitOps sync
-  that applied one, is reported, not undone.
+- **What already landed stays landed:** a pull request a person or the repository's auto-merge
+  merged, or a GitOps sync that applied one, is reported, not undone.
 
 ## Wording
 
@@ -281,9 +303,9 @@ none of them is final until signed off.
 URL on every door. "Nothing was running." replaces Hermes's own no-active-turn reply on Slack, and
 only when no turn is running and the thread has no card on the board at all. A thread with cards,
 finished or not, gets the checked reply, so a Stop after every card reached `done` still says what
-those cards wrote. The existing `STOPPED` reword in `slack_boilerplate.py` ("Stopped. Send me a message whenever
-you want to carry on.") is replaced by these on Slack, because it says nothing about the cards. A
-stopped card's plan row reads "Stopped" in its detail, with the ✗ icon.
+those cards wrote. The existing `STOPPED` reword in `slack_boilerplate.py` ("Stopped. Send me a
+message whenever you want to carry on.") is replaced by these on Slack, because it says nothing
+about the cards. A stopped card's plan row reads "Stopped" in its detail, with the ✗ icon.
 
 The maintainer chose "Stopped. I didn't change anything in seeded-a." over the mock's "Nothing
 changed in seeded-a", because the check covers this thread's writes, not the whole cluster.
@@ -322,17 +344,18 @@ neither a red nor a green:
   a subscription row. The harness sends the stop after the opening turn has returned, so there is
   no concurrent turn.
 - **`github_writes` grows `since` and `grace_seconds`.** The verifier is the repo's
-  (`bench/kube_agents_bench/verifiers.py`); today it accepts `owner`, `author`, `requested_pull_requests`
-  and `max_clock_skew_sec`, reads only `[bot]` pull requests and `platform-agent/` branches, and its
-  window always starts at the run's `started_at` less `max_clock_skew_sec`. Verifiers forbid unknown keys (`extra="forbid"` in devops-bench's `BaseVerifier`),
-  so the case written against the old verifier fails to parse and the gate reds it as "verification
-  spec did not parse" rather than evaluating. `since: stop` starts the window at the transcript's
-  `stop_at` plus `grace_seconds`, less `max_clock_skew_sec` as today, so `grace_seconds` has to
-  exceed the skew allowance to open the window after the stop at all; the case sets 150 against the
-  default 120, opening it 30 s after the stop, past the kill window. A write the stop could not
-  prevent, which the reply reports, is then not charged as a failure. Only the safeguard uses
-  `since`: the truthfulness objective reads the whole run, because a pull request opened before the
-  stop is exactly what "Before stopping" must report.
+  (`bench/kube_agents_bench/verifiers.py`); today it accepts `owner`, `author`,
+  `requested_pull_requests` and `max_clock_skew_sec`, reads only `[bot]` pull requests and
+  `platform-agent/` branches, and its window always starts at the run's `started_at` less
+  `max_clock_skew_sec`. Verifiers forbid unknown keys (`extra="forbid"` in devops-bench's
+  `BaseVerifier`), so the case written against the old verifier fails to parse and the gate reds it
+  as "verification spec did not parse" rather than evaluating. `since: stop` starts the window at
+  the transcript's `stop_at` plus `grace_seconds`, less `max_clock_skew_sec` as today, so
+  `grace_seconds` has to exceed the skew allowance to open the window after the stop at all; the
+  case sets 150 against the default 120, opening it 30 s after the stop, past the kill window. A
+  write the stop could not prevent, which the reply reports, is then not charged as a failure. Only
+  the safeguard uses `since`: the truthfulness objective reads the whole run, because a pull request
+  opened before the stop is exactly what "Before stopping" must report.
 - **`BENCH_GITOPS_REPO` on the api lane.** `github_writes` errors without it, and
   `hack/ci-eval-pr.sh` exports it only under `AGENT_TRANSPORT=inject`. The script exports it on the
   api lane too, from the same repository mapping, or all three `github_writes` leaves error and
@@ -448,11 +471,10 @@ case cannot land marked ahead of the fix. It lands with the build: red shown on 
 ## Open before the build
 
 - **Live probe, deliberately parked.** It is held until the build, not merely unrun: nobody has
-  pressed Stop on an app subscribed to `agent_session_stopped`.
-  The probe: subscribe the event on a test app's manifest, start a session that holds `processing`,
-  press Stop once, and log the event's keys at the relay; then restore the manifest. It posts to
-  Slack and edits the app, so it needs the owner's go-ahead. The event shape here is from Slack's
-  reference.
+  pressed Stop on an app subscribed to `agent_session_stopped`. The probe: subscribe the event on a
+  test app's manifest, start a session that holds `processing`, press Stop once, and log the event's
+  keys at the relay; then restore the manifest. It posts to Slack and edits the app, so it needs the
+  owner's go-ahead. The event shape here is from Slack's reference.
 - That sshd sends no signal to a no-pty command when its channel closes, and that Envoy closes the
   broker's upstream connection when the shim's closes. Both are standard behaviour, unverified in
   these images; the broker fence does not depend on either.
