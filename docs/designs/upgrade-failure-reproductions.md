@@ -43,7 +43,7 @@ the seeded fleet on `main` holds for it. The fleet can carry a before-state only
 7. [A fail-closed webhook whose backend is not
    up](#7-a-fail-closed-webhook-whose-backend-is-not-up): reproduced; `scenarios/07.sh`; `readiness-failclosed-webhook` on seeded-b.
 8. [A default changes in the new minor](#8-a-default-changes-in-the-new-minor): reproduced;
-   `scenarios/08.sh`; version-bound, not for the fleet.
+   `scenarios/08.sh`; no role on `main`.
 9. [A feature is deprecated but still served](#9-a-feature-is-deprecated-but-still-served): no break
    (as expected); `scenarios/09.sh`; `deprecated-api-caller` on `main`.
 10. [Add-on and client skew](#10-add-on-and-client-skew): partial; `scenarios/10b.sh`; no role on
@@ -66,7 +66,7 @@ the seeded fleet on `main` holds for it. The fleet can carry a before-state only
 17. [A node networking agent fails on the new
     image](#17-a-node-networking-agent-fails-on-the-new-image): partial; `scenarios/17.sh`; no role
     on `main`.
-18. [GPU driver mismatch](#18-gpu-driver-mismatch): partial; `scenarios/18k.sh`; never the fleet.
+18. [GPU driver mismatch](#18-gpu-driver-mismatch): partial; `scenarios/18k.sh`; no role on `main`.
 19. [In-tree volumes lose their CSI path](#19-in-tree-volumes-lose-their-csi-path): reproduced (GKE
     form); `scenarios/19c.sh`; no role on `main`.
 20. [Images on a retired registry](#20-images-on-a-retired-registry): reproduced;
@@ -186,8 +186,10 @@ where to look, mitigation and what reads it today: [catalogue entry
 Harness: `scenarios/08.sh` and the hold `08h`; `bash run.sh 08`. Reproduced: the 1.33 kubelet
 refused the gitRepo volume with FailedMount on the new node.
 
-Fleet: version-bound and not for the fleet: the before-state needs a kubelet below 1.33, which only
-the EXTENDED channel offers.
+Fleet: no role on `main`. The `gitRepo` shape the harness planted is version-bound (it needs a kubelet
+below 1.33, which only the EXTENDED channel offers), but a namespace whose Pod Security Admission
+is pinned to version `latest` holds with no version bound, since the rule set changes under it at
+every minor, and that is the designed shape.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/08.sh`, evidence
 `bench/upgrade-scenarios/evidence/08/default-change.txt`, and item 8 of the harness README.
@@ -271,7 +273,7 @@ pool can still be created on a 1.34 cluster, GKE refused its 1.35 upgrade with a
 the migration to v2 first, and after the migration the old JVM was OOMKilled five times while a
 fixed JVM stayed up.
 
-Fleet: no role on `main`, and none would hold for long: GKE migrates a cgroup v1 pool to v2 at 1.33 and refuses v1 at 1.35, so the before-state has a shelf life the fleet's auto-upgrade sets.
+Fleet: no role on `main`. A cgroup v1 pool would not hold for long (GKE migrates one to v2 at 1.33 and refuses v1 at 1.35), but a JDK 8 from before cgroup v2 support, under a memory limit, holds on any pool, and that is the designed shape.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/14c.sh` (`14.sh` is the symptom alone), evidence
 `bench/upgrade-scenarios/evidence/14c/cgroup.txt`, and item 14 of the harness README. Detection,
@@ -285,8 +287,9 @@ three-process container over its limit was killed whole and crash-looped, and th
 with singleProcessOomKill true kept running; no upgrade crossed the 1.28 boundary, so only the
 symptom is shown.
 
-Fleet: no role on `main`; the symptom needs a multi-process container over its limit, which no
-standing fixture should run.
+Fleet: no role on `main`. The symptom needs a multi-process container over its limit, which no
+standing fixture should run, but the shape itself (several processes under one limit, none of them
+allocating) holds, and that is the designed shape.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/15.sh`, evidence
 `bench/upgrade-scenarios/evidence/15/group-oom.txt`, and item 15 of the harness README. Detection,
@@ -300,7 +303,7 @@ default-deny NetworkPolicy sat unenforced, switching enforcement on changed noth
 pool upgrade rebuilt the node with calico and cut traffic; the trigger is the enforcement switch
 applied at the rebuild, not a version change.
 
-Fleet: no named role, but seeded-a holds the before-state: default-deny NetworkPolicies in three of its five seeded namespaces (`seeded-reliability`, `seeded-debug`, `seeded-capacity`; `seeded-security` has none on purpose and `seeded-deprecation` an egress-only policy) with neither the network-policy add-on nor Dataplane V2 enforcing them, which the first Recommender read counted as the catch for this entry.
+Fleet: no named role, but seeded-a holds the before-state: default-deny NetworkPolicies in five of its seven seeded namespaces (`seeded-reliability`, `seeded-debug`, `seeded-capacity`, `seeded-intent`, `seeded-stall`; `seeded-security` has none on purpose and `seeded-deprecation` an egress-only policy) with neither the network-policy add-on nor Dataplane V2 enforcing them, which the first Recommender read counted as the catch for this entry.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/16.sh`, evidence
 `bench/upgrade-scenarios/evidence/16/dataplane.txt`, and item 16 of the harness README. Detection,
