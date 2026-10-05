@@ -119,8 +119,9 @@ UNBLOCKED_KIND = "unblocked"
 #: A typed answer's words on its answered line are clipped to this.
 TYPED_ANSWER_MAX = 80
 
-#: Replies the settle reads after a question, looking for its typed answer.
-REPLIES_READ_MAX = 50
+#: Slack's most replies one ``conversations.replies`` page returns; the settle reads one
+#: page after a question, looking for its typed answer.
+REPLIES_READ_MAX = 1000
 
 #: The reply subtypes a person typing leaves, besides none: "also send to channel", a file
 #: with a comment, a ``/me``. A join or any other event in the thread is not an answer.
