@@ -428,7 +428,7 @@ async def _render(adapter: Any, key: tuple, plan: _Plan) -> bool:
     return True
 
 
-async def _session(adapter: Any, key: tuple, plan: _Plan) -> None:
+async def _session(adapter: Any, key: tuple, plan: _Plan, *, force: bool = False) -> None:
     """Send the session status the thread's plans now hold, with this plan's team.
 
     :func:`_plan_session` reads the current plan and any set aside: a card
@@ -441,10 +441,10 @@ async def _session(adapter: Any, key: tuple, plan: _Plan) -> None:
     no status during note delivery; its cards' settlements update the session
     when settling.
     """
-    if not plan.ts:
-        return
     chat_id, thread_ts = key
     wanted = _plan_session(chat_id, thread_ts)
+    if not plan.ts and not wanted and key not in _sessions and not force:
+        return
     setter = getattr(adapter, "_set_thread_status", None)
     if setter is None:
         return
@@ -598,20 +598,9 @@ async def _set_aside(adapter: Any, key: tuple, plan: _Plan) -> None:
             "slack_ux_status: evicting the set-aside plans in %s/%s; resending its session", *old_key,
         )
         posted = next((old for old in reversed(evicted) if old.ts), None)
-        if posted is not None:
-            await _session(adapter, old_key, posted)
-        elif _status is not None and _sessions.get(old_key, ("", 0))[0] == _status.SESSION_SUSPENDED:
-            await _close_unposted(adapter, old_key, evicted[-1].team_id)
-
-
-async def _close_unposted(adapter: Any, key: tuple, team_id: str) -> None:
-    setter = getattr(adapter, "_set_thread_status", None)
-    if not (key[0] and key[1]) or setter is None:
-        return
-    try:
-        await setter(key[0], team_id, key[1], "", PLAN_STATUS_LABEL)
-    except Exception as exc:  # noqa: BLE001 — cosmetic
-        logger.debug("slack_ux_status: closing evicted unposted plan's session failed: %s", exc)
+        sender = posted or (evicted[-1] if evicted else None)
+        if sender is not None:
+            await _session(adapter, old_key, sender)
 
 
 async def _keep(adapter: Any, key: tuple, plan: _Plan) -> None:
@@ -625,12 +614,8 @@ async def _keep(adapter: Any, key: tuple, plan: _Plan) -> None:
     while len(_plans) > PLANS_MAX:
         old_key, old = _plans.popitem(last=False)
         _disarm(old)
-        if old.ts:
-            logger.info("slack_ux_status: evicting the plan in %s/%s; closing its session", *old_key)
-            await _session(adapter, old_key, old)
-        elif _status is not None and _sessions.get(old_key, ("", 0))[0] == _status.SESSION_SUSPENDED:
-            logger.info("slack_ux_status: evicting the unposted plan in %s/%s; closing its session", *old_key)
-            await _close_unposted(adapter, old_key, old.team_id)
+        logger.info("slack_ux_status: evicting the plan in %s/%s; closing its session", *old_key)
+        await _session(adapter, old_key, old)
 
 
 def _roll(adapter: Any, key: tuple, plan: _Plan, card: str) -> None:
@@ -859,38 +844,12 @@ async def settle_row(adapter: Any, sub: dict, kind: str, result: str = "") -> No
     status = _status.task_status(kind)
     done = kind == ARCHIVED_KIND or status in (_status.TASK_COMPLETE, _status.TASK_ERROR)
     sender = await _settle_lapsed(adapter, key, card, kind, status, done, result)
-    if sender is not None and not sender.ts:
-        sender = None
     plan = _plans.get(key)
-    if plan is not None and await _settle_current(adapter, key, plan, card, kind, status, done, result) and plan.ts:
+    if plan is not None and await _settle_current(adapter, key, plan, card, kind, status, done, result):
         sender = plan
     if sender is not None:
-        await _session(adapter, key, sender)
-    elif (plans := [*_lapsed.get(key, ()), *([plan] if plan is not None else [])]):
-        if any(p.ts for p in plans):
-            posted = next((p for p in reversed(plans) if p.ts), None)
-            if posted is not None:
-                await _session(adapter, key, posted)
-        else:
-            wanted = _plan_session(key[0], key[1])
-            sent = _sessions.get(key)
-            if wanted == _status.SESSION_SUSPENDED:
-                phrase = _status.SESSION_SUSPENDED
-            elif not wanted and (done or kind == ARCHIVED_KIND or not any(_held(p) for p in plans)):
-                phrase = ""
-            elif sent and sent[0] == _status.SESSION_SUSPENDED and wanted == _status.SESSION_PROCESSING:
-                phrase = _status.SESSION_PROCESSING
-            else:
-                return
-            setter = getattr(adapter, "_set_thread_status", None)
-            if not (key[0] and key[1]) or setter is None:
-                return
-            team_id = str(sub.get("team_id") or (plans[0].team_id if plans else ""))
-            try:
-                await setter(key[0], team_id, key[1], phrase, PLAN_STATUS_LABEL)
-            except Exception as exc:  # noqa: BLE001 — cosmetic
-                logger.debug("slack_ux_status: setting the unposted plan's session status failed: %s", exc)
-    else:
+        await _session(adapter, key, sender, force=True)
+    elif plan is None and not _lapsed.get(key):
         # An archive with no row in this process is cleanup of a card that
         # finished long ago, not a settle: the thread may hold another card.
         await _settle_orphan(adapter, sub, key, status, done and kind != ARCHIVED_KIND)
