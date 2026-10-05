@@ -1258,10 +1258,15 @@ class RootTest(unittest.TestCase):
     def test_root_preserves_external_modules(self):
         fake_gateway = types.ModuleType("gateway.preexisting")
         fake_agent = types.ModuleType("agent.preexisting")
-        sys.modules["gateway.preexisting"] = fake_gateway
-        sys.modules["agent.preexisting"] = fake_agent
-        self.addCleanup(sys.modules.pop, "gateway.preexisting", None)
-        self.addCleanup(sys.modules.pop, "agent.preexisting", None)
+        patcher = mock.patch.dict(
+            sys.modules,
+            {
+                "gateway.preexisting": fake_gateway,
+                "agent.preexisting": fake_agent,
+            },
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
         root = _Root()
         self.addCleanup(root.cleanup)
@@ -1284,8 +1289,9 @@ class RootTest(unittest.TestCase):
 
     def test_root_preserves_top_level_package_stubs(self):
         fake_gateway = types.ModuleType("gateway")
-        sys.modules["gateway"] = fake_gateway
-        self.addCleanup(sys.modules.pop, "gateway", None)
+        patcher = mock.patch.dict(sys.modules, {"gateway": fake_gateway})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
         root = _Root()
         self.addCleanup(root.cleanup)
