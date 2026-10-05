@@ -153,6 +153,10 @@ class PresentTest(unittest.TestCase):
             "How's that?",
             "So, which one should I use?",
             "Anything else?",
+            "Could you share the namespace?",
+            "Can you tell me which cluster it runs on?",
+            "Do you know the correct image tag?",
+            "Want me to check where it runs?",
         ):
             with self.subTest(question):
                 self.assertEqual(runtime.present("It failed. " + question)[1], "")

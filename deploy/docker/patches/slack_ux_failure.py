@@ -22,8 +22,8 @@ only when it ends on a yes/no question.
 With the flag on, the Slack reply to such a wake is drawn with its first
 sentence in bold and, when it ends on one short yes/no question, a choice button
 carrying that question ("check it there"). An open question ("Which namespace
-should it use?") or an either/or stays text, since it needs a word, not a
-click. A click is the clicker answering in the thread with the button's text
+should it use?"), a request ("Could you share the namespace?") or an either/or
+stays text, since it needs a word, not a click. A click is the clicker answering in the thread with the button's text
 (``gateway/slack_ux_clicks.py``), so the Planning Agent reads it as the user
 saying yes. The words are the agent's; only how they are drawn changes. The
 ``text`` Slack keeps for notifications and for a later read of the thread is
@@ -97,9 +97,17 @@ MARKUP = re.compile(r"[*_~`<>\[\]|]")
 #: inside a bold lead, with the words around it bolded and the span itself not.
 CODE_SPAN = re.compile(r"`[^`\n]+`")
 #: A question that asks for a word rather than a yes: an open one, by its first
-#: word, or an either/or. Its click would post the question back as the answer.
+#: word or a question word anywhere in it ("Can you tell me which cluster?"), a
+#: request for something ("Could you share the namespace?"), or an either/or. Its
+#: click would post the question back as the answer.
 OPEN_OPENERS = frozenset(
     {"what", "whats", "which", "who", "whom", "whose", "when", "where", "why", "how", "anything"}
+)
+OPEN_WORD = re.compile(r"\b(?:what|which|who|whom|whose|when|where|why|how)\b", re.IGNORECASE)
+REQUEST = re.compile(
+    r"^(?:(?:could|can|would|will) you (?:please )?(?:share|tell|give|send|provide|paste|"
+    r"point|list|name|let me know)|do you (?:know|have))\b",
+    re.IGNORECASE,
 )
 #: Words skipped before the opener ("So, which one?"), and what is stripped off it.
 OPENER_FILLERS = frozenset({"so", "and", "then", "ok", "okay"})
@@ -314,7 +322,12 @@ def present(content: str) -> tuple[str, str]:
     if not question or MARKUP.search(question) or len(question) > _presenter.BUTTON_TEXT_MAX:
         return bolded, ""
     word = question.split()[0]
-    if _opener(question) in OPEN_OPENERS or EITHER_OR.search(question):
+    if (
+        _opener(question) in OPEN_OPENERS
+        or OPEN_WORD.search(question)
+        or REQUEST.match(question)
+        or EITHER_OR.search(question)
+    ):
         return bolded, ""
     if LOWERABLE.match(word):
         question = question[0].lower() + question[1:]
