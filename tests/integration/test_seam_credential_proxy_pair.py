@@ -1,6 +1,6 @@
 """Seam: credential proxy client ↔ server, over a real socket.
 
-Every kubectl/gcloud/gh/git an agent runs goes shim → client → HTTP → proxy.
+Every kubectl/gcloud an agent runs goes shim → client → HTTP → proxy.
 The server has real-socket tests and the client has mocked-urlopen tests, but
 until this file the pair had never met: nothing proved the bytes the client
 sends are the bytes the server's parser accepts, or that the server's refusals
@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from _seams import REPO_ROOT, SCRIPTS_DIR
 
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+import credential_proxy  # noqa: E402
 import credential_proxy_client  # noqa: E402
 from credential_proxy import (  # noqa: E402
     CommandExecutor,
@@ -78,9 +80,13 @@ class CredentialProxyPairTest(unittest.TestCase):
         return code, stdout.getvalue(), stderr.getvalue()
 
     def test_stdout_stderr_and_exit_code_round_trip_exactly(self):
-        # `git version` is allowed, runs in the sidecar, and its stdout must
-        # arrive byte-for-byte through the JSON envelope and the shim.
-        code, out, err = self._execute(["git", "version"])
+        # `git version` runs in the sidecar with no credential, and its stdout
+        # must arrive byte-for-byte through the JSON envelope and the shim.
+        # The route refuses git (the next-but-one test), so this re-admits it:
+        # the bytes are what is under test here, not the allowlist.
+        routed = (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "git")
+        with mock.patch.object(credential_proxy, "EXEC_ROUTE_EXECUTABLES", routed):
+            code, out, err = self._execute(["git", "version"])
         self.assertEqual(0, code)
         self.assertIn("git version", out)
         self.assertEqual("", err)
@@ -93,10 +99,11 @@ class CredentialProxyPairTest(unittest.TestCase):
         self.assertIn("cluster deletion is not available here", err)
         self.assertIn("policy rule: gcloud.destroy", err)
 
-    def test_an_unleased_git_write_comes_back_as_a_readable_refusal(self):
+    def test_a_refused_executable_comes_back_as_a_readable_refusal(self):
+        # git is reached through the verbs, never this route.
         code, _, err = self._execute(["git", "commit", "-m", "x"])
         self.assertEqual(126, code)
-        self.assertIn("policy rule: git.workspace.lease", err)
+        self.assertIn("policy rule: executable.allowlist", err)
 
     def test_a_non_json_error_body_is_a_message_not_a_traceback(self):
         # Envoy restarting mid-request: 503, text/html, written by neither

@@ -2893,12 +2893,14 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// The Hermes base image sets HERMES_WRITE_SAFE_ROOT=/opt/data, which is the agent's
 	// own home while the shell is local. agent/file_safety.py checks the path prefix in
 	// the agent process before the write is routed anywhere, so with the shell in the
-	// sandbox this has to name the sandbox's writable directories or write_file and
-	// patch return "Write denied" for everything — which is how the earlier value was
-	// found wrong on a live install. The sandbox's data volume carries the same
-	// /opt/data path deliberately, so the interesting half of this is the ephemeral
-	// home; the value is written out rather than left to the image default so the
-	// policy is visible in the pod spec. It gives up no isolation: with backend: ssh
+	// sandbox this has to name sandbox paths or write_file and patch return "Write
+	// denied" for everything — which is how the earlier value was found wrong on a
+	// live install. The sandbox's data volume carries the same /opt/data path
+	// deliberately. /home/agent is listed too, but current sandbox images make it
+	// root-owned (deploy/sandbox/Dockerfile), so a write there passes this check and
+	// then fails on the directory's mode. The value is written out rather than left
+	// to the image default so the policy is visible in the pod spec. It gives up no
+	// isolation: with backend: ssh
 	// the file tools cannot reach the agent's own filesystem to begin with.
 	//
 	// TERMINAL_CWD is what stops the agent working in a directory that does not
@@ -3236,11 +3238,11 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 // Past the deadline the Deployment reports ProgressDeadlineExceeded and any
 // caller's wait returns early however long it asked for, so a gate raised above
 // this number buys nothing. Kubernetes defaults it to 600s, which is *below*
-// the 605s cold boot agentAPIProbe(10, 60) already sanctions — the kubelet is
-// told to tolerate a boot the Deployment gives up on. 1200s clears the 900s
+// the 905s cold boot agentAPIProbe(10, 90) already sanctions — the kubelet is
+// told to tolerate a boot the Deployment gives up on. 1800s clears the 1500s
 // deploy gate in upgrade.sh. hindsight-api
 // carries an explicit 900 for the same reason; see tests/test_hindsight_probes.py.
-const gatewayProgressDeadlineSeconds int32 = 1200
+const gatewayProgressDeadlineSeconds int32 = 1800
 
 // buildDeployment generates the Deployment manifest for the agent payload
 func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, opts renderOptions) *appsv1.Deployment {
@@ -4682,7 +4684,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 			// The bearer key is the non-secret loopback sentinel already in this
 			// container's env, and API_SERVER_ENABLED is unconditionally true above,
 			// so the probe is valid in every configuration.
-			StartupProbe:    agentAPIProbe(10, 60),
+			StartupProbe:    agentAPIProbe(10, 90),
 			ReadinessProbe:  agentAPIProbe(15, 3),
 			SecurityContext: hardenedSecurityContext(),
 		},

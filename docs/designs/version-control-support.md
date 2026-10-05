@@ -7,16 +7,13 @@
 > over `/v1/vcs/*` from a forge-neutral `providers/` layer whose one implementation
 > is `providers/github/`; the `version-control` skill drives those verbs from a
 > sandbox that holds a credential-free git; and the consumers reach the forge
-> through those verbs rather than by naming GitHub. Two things are deliberately
-> left behind by that migration and are not scheduling slips: `audit_report.py`
-> and the `fleet-audit` prose around it still shell `gh`, and
-> `inspect_repository.py` stays on the broker's content-workspace route rather
-> than moving to the verbs, because it reads repositories this install does not
-> manage and does it with a shallow clone — neither of which the verbs offer,
-> the second on purpose ([The seam](#3-the-seam)). Its fallback, `git clone`
-> through the sandbox's credential shim, is taken only against a broker that
-> does not serve that route, which no shipped install is; it goes when the shim
-> does. The CRD declares forges and repositories in `spec.integration.forges`
+> through those verbs rather than by naming GitHub. The sandbox carries no `gh`
+> and no credential shim named `git`. One thing is deliberately left behind and
+> is not a scheduling slip: `inspect_repository.py` stays on the broker's
+> content-workspace route rather than moving to the verbs, because it reads
+> repositories this install does not manage and does it with a shallow clone —
+> neither of which the verbs offer, the second on purpose
+> ([The seam](#3-the-seam)). The CRD declares forges and repositories in `spec.integration.forges`
 > and `spec.integration.repositories` with only `github` registered, and no
 > second forge exists.
 > This is the design for driving any forge, and the order the rest has to
@@ -76,7 +73,7 @@ Writing costs it more turns than today's design does. Method and results in
 | Each provider                | `providers/github/`, `providers/gitlab/` — one directory each        |
 | Registration                 | `providers/registry.py` — the one shared file a new provider edits   |
 | The declarative surface      | `spec.integration.forges` and `.repositories` on the CR              |
-| The local git                | `/opt/vcs/libexec/git` in the sandbox image                          |
+| The local git                | `/opt/vcs/bin/git`, a hardened wrapper, in the sandbox image         |
 
 ## How to read this document
 
@@ -135,9 +132,9 @@ The coupling runs through five layers, each with a different owner and a differe
    broker's content-workspace route, which clones on the credential side and honours `--depth`.
    (`github_token_refresh.py` and
    `credential_proxy.py` also run `gh`, but for credentials rather than for forge work; they are
-   layer 3.) Five of the six are now on the verbs, and `forge.py` with them — it holds typed
-   values and three policy rules and no forge implementation. `audit_report.py` is the sixth and
-   has not moved. `inspect_repository.py` will not move: see the status banner.
+   layer 3.) All six go through the verbs, and `forge.py` with them — it holds typed values and
+   three policy rules and no forge implementation. `inspect_repository.py` does not move: see the
+   status banner.
 2. **Repository identity.** `owner/repo` — exactly two path segments — was asserted in seven places
    across Python and Go, one regex expressing it copy-pasted into six modules. The widest assumption
    and the one least visible from any single file. Each language now runs its assertions through
@@ -457,15 +454,15 @@ Four `SKILL.md` files instructed the model in `gh` spellings and called the arte
 `fleet-audit`, `pr-conversation` and `submit-suggestion` under `agents/platform/skills/`, and
 `gke-stockout-investigator` under `agentplugins/`, which reaches an install through the
 `AgentPlugin` CRD rather than through the agent image and so is easy to miss. These want the command
-behind a wrapper and the noun taken from configuration. Three are done; `fleet-audit` is the one
-still written in `gh`, and it travels with `audit_report.py` for the reason the banner gives.
+behind a wrapper and the noun taken from configuration. `fleet-audit` travels with
+`audit_report.py`, because the helper is what writes the ledger its prose describes.
 
-The seven governance SOPs name `gh` only to forbid it — "never run `gh issue create`", "the helper
-owns every `git`/`gh` operation" — because `audit_report.py` owns their write path. A prohibition has
-no command to wrap, so the SOP work is smaller and different: the nouns ("pull request", "PR body")
-come from configuration, and the prohibitions get reworded once the helper they defer to is a
-provider rather than `gh`. [The consumer migration](#the-protocol-past-its-first-feature) moves that
-helper; this step only follows it.
+The seven governance SOPs named `gh` only to forbid it, because `audit_report.py` owns their write
+path. A prohibition has no command to wrap, so the SOP work is smaller and different: the nouns
+("pull request", "PR body") come from configuration, and the prohibitions say to publish through the
+helper and the version-control verbs rather than naming a forge CLI.
+[The consumer migration](#the-protocol-past-its-first-feature) moves that helper; this step only
+follows it.
 
 `github-issue-resolver`, the skill a reader would expect on the first list, is not on it: its prompt
 names no forge command — only its own `resolver.py` subcommands — and its coupling is entirely in
@@ -621,7 +618,8 @@ directions) — say so in their refusals.
 ### One git in the sandbox
 
 The sandbox has exactly one git: the real binary at `/opt/vcs/libexec/git`,
-reached through a symlink in `/opt/vcs/bin`. There is no credential shim named
+reached through a wrapper at `/opt/vcs/bin/git` that runs it with a
+repository's hooks disarmed. There is no credential shim named
 `git` beside it, and that is worth stating explicitly because the sandbox does
 carry shims for `gcloud` and `kubectl`.
 
@@ -648,17 +646,31 @@ So `git` and `gh` come off the sandbox's shim set, leaving `gcloud` and
 `kubectl`, which keep theirs because neither has a credential-free equivalent
 and neither has anything local to read. `SUPPORTED_EXECUTABLES` in
 `credential_proxy_client.py` and the shim symlinks in `deploy/sandbox/Dockerfile`
-are the two places that say so, and the image's smoke test asserts the two
-missing names by absence rather than by which path wins.
+are the two places that say so. The image's smoke test asserts `gh` by absence
+and `git` by what the name resolves to, rather than by which PATH entry wins.
 
-The real git then needs to be reachable, and `/opt/vcs/bin` goes on PATH in one
-place: the `SANDBOX_PATH` line in `deploy/sandbox/entrypoint.sh`, which becomes
-the `SetEnv` directive in the generated `/etc/ssh/sshd_config.d` drop-in. One
-place is not an accident of this design — sshd keeps the first `SetEnv` it reads
-and discards every later one whole, so the environment a sandbox session gets
-cannot be assembled from more than one directive. A missed prepend is therefore
-a `git: not found` on the first call rather than a silent forward, which is the
+The real git then needs to be reachable, and `/opt/vcs/bin` goes on PATH in the
+two places a sandbox session's PATH comes from. The `SANDBOX_PATH` line in
+`deploy/sandbox/entrypoint.sh` becomes the `SetEnv` directive in the generated
+`/etc/ssh/sshd_config.d` drop-in, and it has to be that one line — sshd keeps
+the first `SetEnv` it reads and discards every later one whole. That covers a
+non-login command. A login shell runs `/etc/profile` first, which overwrites
+PATH wholesale, and Hermes takes its environment snapshot with `bash -l -c`; so
+`/etc/profile.d/vcs-path.sh` puts the directory back, the same way the shim
+directory's own profile.d entry always has. A missed prepend is a
+`git: not found` on the first call rather than a silent forward, which is the
 other thing deleting the shim buys.
+
+The wrapper gives the agent's own `git` `core.hooksPath` pointed at an empty,
+root-owned directory, `core.fsmonitor` off, `protocol.ext.allow=never`, and no
+system config — the hooks, `ext` and system-config settings `vcs.py` gives its
+own calls, plus `fsmonitor`. `-c` outranks every
+config file, so a working copy that sets its own `core.hooksPath` — the step an
+injected `CONTRIBUTING.md` asked for — still gets the empty one. It is not a
+boundary, and does not claim to be. A repository-local `filter.<name>.clean`
+still runs, because no `-c` can unset a name it does not know, and the binary is
+one absolute path away. What contains that is the sandbox: an unprivileged user
+with no credential and no transport to a forge.
 
 The image's existing build guard needs no change to cover this. It already fails
 the build if a bare `command -v` finds any of `gcloud`, `kubectl`, `gh` or `git`,
@@ -1508,10 +1520,10 @@ and no issue resolution, no audit ledger, and no way to open a change.
 Migrating those three onto the provider is the step that makes a forge a class rather than four
 rewrites. It was anticipated rather than planned:
 [`pr-comment-conversation.md`](pr-comment-conversation.md) §7 names `resolver.py` as the module's
-obvious next consumer while holding the migration itself out of scope. Two of the three have since
-made the move, onto the verbs rather than onto `forge.py` — which is the same destination, since
-`forge.py`'s operations are verbs now. `audit_report.py` is the one left, and until it moves the
-ledger is the one forge surface a second forge would not serve.
+obvious next consumer while holding the migration itself out of scope. All three move onto the
+verbs rather than onto `forge.py` — which is the same destination, since `forge.py`'s operations are
+verbs now — and with `audit_report.py` among them the ledger is a forge surface a second forge
+serves like any other.
 
 The protocol grows to the union of what the four need. Beyond the existing seven, that is opening a
 change (branch plus pull request), editing and reading one back, listing and commenting on issues,
@@ -2141,6 +2153,7 @@ side of each.
 | `ref` (comment)     | `"note-{id}"`                     | one notes endpoint, so the kind is constant                    |
 | `url`               | `web_url`                         |                                                                |
 | `created`/`updated` | `created_at` / `updated_at`       | both ISO-8601, same as GitHub                                  |
+| `closed` (proposal) | `merged_at`, else `closed_at`     | GitLab leaves `closed_at` empty on a merge; `""` while open    |
 | `body`              | `description`                     | GitLab's name for it                                           |
 | `labels`            | `labels`                          | plain strings, not GitHub's `{name: …}` dicts                  |
 

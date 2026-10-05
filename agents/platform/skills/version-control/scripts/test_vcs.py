@@ -764,6 +764,16 @@ class CollaborationTest(VcsTestCase):
         self.assertNotIn("source", payload)
         self.assertNotIn("target", payload)
 
+    def test_proposal_list_filters_by_labels_at_the_forge(self):
+        code, _ = self.run_vcs("proposal", "list", "--labels", "audit:a1", "audit:remediation")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            self.broker.payload("proposal-list")["labels"], ["audit:a1", "audit:remediation"]
+        )
+        code, _ = self.run_vcs("proposal", "list")
+        self.assertEqual(code, 0)
+        self.assertNotIn("labels", self.broker.payload("proposal-list"))
+
     def test_identity_says_when_the_login_is_an_automations(self):
         code, _ = self.run_vcs("identity", "--login", "renovate", "--bot")
         self.assertEqual(code, 0)
@@ -1004,10 +1014,9 @@ class SkillTextTest(unittest.TestCase):
         # Review finding: every command reaches the sandbox as a fresh
         # non-interactive `bash -c`, which does not expand aliases, so an
         # aliased `git` followed by `git log` ran the credentialed shim. The
-        # skill points at the path.
+        # name is the local git's now, so nothing needs aliasing.
         text = (Path(__file__).resolve().parents[1] / "SKILL.md").read_text()
         self.assertNotIn("alias git", text)
-        self.assertIn("/opt/vcs/libexec/git", text)
 
 class LocalGitTest(VcsTestCase):
     def test_a_missing_local_git_names_the_fallback(self):

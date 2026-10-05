@@ -10,7 +10,7 @@
 
 ### 0. Open the audit run
 
-The lifecycle is the `fleet-audit` skill's (`skills/fleet-audit/SKILL.md`, "The two-command lifecycle" and "Step 1 — `start`"): what `start` prints; what `workspace`, `findings_path`, `pending_remediation_requests` and `carried` oblige you to do; that there is no report branch; and that no issue body, PR body, commit or `gh` call is ever yours to write. This stream's invocation:
+The lifecycle is the `fleet-audit` skill's (`skills/fleet-audit/SKILL.md`, "The two-command lifecycle" and "Step 1 — `start`"): what `start` prints; what `workspace`, `findings_path`, `pending_remediation_requests` and `carried` oblige you to do; that there is no report branch; and that no issue body, PR body, commit or forge call is ever yours to write. This stream's invocation:
 
 ```bash
 ./skills/fleet-audit/scripts/audit_report.py start --audit compliance-audit [--repo "<owner>/<repo>"]
@@ -419,7 +419,7 @@ What `finish` validates, publishes and prints, its exit codes, partial coverage,
 The skill's "Red lines" hold in full — read-only against clusters, no `git add`, no path outside the workspace, no second ledger, no hand-written body, no padded `checks_run`, no restored `findings.json`. This stream adds:
 
 - **Read-only.** No `kubectl apply|patch|create|delete|edit|scale|exec|run|port-forward|cp`, no `gcloud container clusters|node-pools update`, no write of any kind against any cluster. `gcloud container clusters get-credentials` is the sole exception and touches only a local kubeconfig.
-- **No `gh` call and no `submit-suggestion` from this SOP.** `audit_report.py` owns the entire git/GitHub path: one stream has one ledger and `finish` owns it, and every remediation PR is its to open.
+- **No forge call (`vcs.py` or otherwise) and no `submit-suggestion` from this SOP.** `audit_report.py` owns the entire git and forge path: one stream has one ledger and `finish` owns it, and every remediation PR is its to open.
 - **Never comment on the ledger yourself.** `/remediate` is a human reviewer's instruction to this harness, not a step in the audit: an agent that posts it — including when someone asks for a fix in chat — is authorizing its own pull request. `finish` ignores a `/remediate` from a machine account, so posting one achieves nothing but noise on the issue.
 - **No unstable identity.** The id is derived, so the way to destabilise it is to write an unstable `object` — a pod name with its ReplicaSet suffix, a generated resource name, the binding one run and the role the next. Name the durable object the check judged and audit the owning controller, never the pod. A finding whose identity moves is reported as fixed and re-reported as new, on a ledger people trust to tell them what is still broken.
 - **No inference from an unaudited cluster.** A cluster you could not read goes in `scope.skipped` and never appears in a finding. A cluster you read where some checks did not run stays in `scope.clusters`, with Autopilot's 2.1–2.3 in `checks_not_applicable` and anything a later run could still clear — a command that errored, an absent API group — in `limitations`. Never demote a partially-checked cluster to `scope.skipped`: that silently discards every real finding from the checks that did run on a cluster you were told to audit.

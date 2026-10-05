@@ -259,8 +259,10 @@ bounded **Worker Recovery Ladder** (`SOUL.md §4`) before escalating:
 1. Re-run / re-query to capture the exact failure.
 2. Inspect identity context (SA annotations, Workload Identity, IAM bindings).
 3. Inspect platform recovery mechanisms (the CI/CD pipeline run, cloud APIs, GKE Hub).
-4. Apply an allowed self-repair (e.g. token refresh via `scripts/github_token_refresh.py`) — never
-   a direct cluster mutation; repairs still route through the declarative workflow.
+4. Apply an allowed self-repair (e.g. updating CR metadata or restarting a stuck management-cluster
+   controller) — never a direct cluster mutation; repairs still route through the declarative
+   workflow. GitHub credentials are not the agent's to refresh: the version-control verbs refresh
+   the broker's credential before every call.
 5. Re-run and resume the original task.
 6. Escalate to a human only as last resort.
 

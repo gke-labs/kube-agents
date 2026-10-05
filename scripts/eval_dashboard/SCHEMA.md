@@ -989,7 +989,8 @@ left_for_next_run, outcomes{project: {closed, error}}}` (a project carries
 its closes, its error, or both), `skipped` being the
 projects held and released unswept after the run stopped on the burst limit,
 and `left_for_next_run` the writes the budget deferred (a pull request left
-unclosed counts its close and its delete). `periodics_read` names the jobs a
+unclosed counts its close and its delete, and its label when it carries
+`audit:remediation`). `periodics_read` names the jobs a
 reading arrived for this tick, whether or not they are noted; the poster clears
 a told job only on a reading that shows it clean. `periodics_runs` is, per read
 job, `{build, finished_at, passed, summary}` of its latest finished build, what

@@ -5,8 +5,8 @@
 A worker runs as `hermes chat -q`, where the command scanner refuses a command
 whose program is a shell variable (`$G add`) and the refusal is final. The
 platform image's skill check does not read this skill, which ships in the
-plugin's own image, and its `/opt/vcs/libexec/git` steps sit in inline code,
-which that check skips.
+plugin's own image, and its `git` steps sit in inline code, which that check
+skips.
 """
 
 import re
@@ -34,9 +34,12 @@ VARIABLE_PROGRAM_RE = re.compile(
 )
 # The path put in a variable for later use, which is the variable form's setup.
 # Capturing git's output, `SHA=$(/opt/vcs/libexec/git ...)`, is not that.
+# An assignment whose value is git, by name or by any path, or the suggestion
+# script by any path: the setup line of the variable form. A command
+# substitution (`SHA=$(git rev-parse HEAD)`) runs git rather than naming it.
+# bench/tasks/vcs-review-feedback-read-back/task.yaml carries the same pattern.
 PROGRAM_ASSIGNMENT_RE = re.compile(
-    r"\b[A-Za-z_]\w*=(?!\"?(\$\(|`)/opt/vcs/libexec/git[\s)`])\S*"
-    r"(/opt/vcs/libexec/git|submit_suggestion\.py)\b"
+    r"(^|[\s;&|(`])[A-Za-z_]\w*=(?!\"?(\$\(|`))\"?(\S*/)?(git|submit_suggestion\.py)(?![\w.-])"
 )
 # A script run by a path that starts with a variable, which the scanner refuses
 # the same way (`"$HERMES_HOME"/skills/.../submit_suggestion.py prepare`).
@@ -72,6 +75,10 @@ class SkillCommandsTest(unittest.TestCase):
             "${G} add <path>",
             '"$S" prepare --repo <owner>/<repo>',
             "export G=/opt/vcs/libexec/git",
+            "G=git",
+            "export G=git",
+            'G="git"',
+            "G=/opt/vcs/bin/git",
             'S="$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py',
             '"$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py prepare \\',
         ):
@@ -85,6 +92,11 @@ class SkillCommandsTest(unittest.TestCase):
             'V="$HERMES_HOME"/skills/version-control/scripts/vcs.py',
             'python3 "$V" proposal list --repo <owner>/<repo>',
             "SHA=$(/opt/vcs/libexec/git rev-parse HEAD)",
+            "SHA=$(git rev-parse HEAD)",
+            "SHA=`git rev-parse HEAD`",
+            "GIT_DIR=.git git status",
+            "TOOL=git-lfs",
+            "REPO=acme/infra.git",
         ):
             with self.subTest(command):
                 self.assertFalse(any(pattern.search(command) for pattern in PATTERNS))

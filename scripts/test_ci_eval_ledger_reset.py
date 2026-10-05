@@ -598,9 +598,9 @@ class CallSiteTest(unittest.TestCase):
         self.assertLess(launch, stream_release)
         self.assertLess(stream_release, task_release)
         self.assertIn('if [ -n "${audit_id}" ] && ! lock_acquire "${STATE_DIR}/lock-stream-${audit_id}"', unit)
-        # Released on the infra-lock and mint-failure paths as well as after
-        # the run.
-        self.assertEqual(unit.count('[ -n "${audit_id}" ] && lock_release "${STATE_DIR}/lock-stream-${audit_id}"'), 3)
+        # Released on the infra-lock, mint-failure and repository-reset paths
+        # as well as after the run.
+        self.assertEqual(unit.count('[ -n "${audit_id}" ] && lock_release "${STATE_DIR}/lock-stream-${audit_id}"'), 4)
         # Before the infra lock: a stack-bearing unit waiting on its stream
         # must not hold the one tofu lane while it waits.
         infra_lock = unit.index('lock_acquire "${STATE_DIR}/lock-infra"')
