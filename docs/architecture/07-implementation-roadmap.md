@@ -236,8 +236,10 @@ Built end-to-end means all of these pass — the concrete form of [01](01-vision
   IAM**. Sequence the tool removal and the IAM tightening together so there is no period where agents can
   both mutate directly _and_ via PR.
 - **ChatOps router is net-new behavior** — the multi-tier gateway (slash / `@handle` / NL resolution,
-  cross-pod dispatch, gateway-side `allowedUsers` enforcement) has **no implementation today** — only a
-  single-agent Hermes fan-in exists. Build it incrementally (Phase 2 deterministic modes, Phase 3 the
+  cross-pod dispatch) has **no implementation today** — only a single-agent Hermes fan-in exists;
+  gateway-side `allowedUsers` enforcement has its ground (the lists reach the gateway and the per-target
+  check exists, `a2a/gateway/allowlist.go`) and is enforced at the mint of a session's child task, which
+  the delegation primitive builds. Build it incrementally (Phase 2 deterministic modes, Phase 3 the
   session-agent fallback) and keep routing **out of the trust path**: a mis-route must never bypass an allowlist, and
   the per-pod gateway stays as an enforcement backstop ([03](03-security-model.md) §4a,
   [06](06-api-and-data-contracts.md) §2b).

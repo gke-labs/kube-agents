@@ -204,6 +204,11 @@ The tier and the scope are **deliberately not on the wire**. Putting them there 
 a consumer authorize on content it did not verify, in the shape that looks most like
 working code - and that is the one thing 09 forbids.
 
+`authority.via` (added 10/5) is attribution of a third kind: on a task the gateway minted on a
+session's request, and on the wake-up turn after it, `via` names the task and session that asked
+(`{"taskId": "...", "session": "..."}`). Like `requester` and `audience` it is populated by the
+gateway only and advisory; absent on a task a human turn started.
+
 **The rule.** A consumer MAY treat `authority.grants` as decision-grade, subject to all
 four of:
 
@@ -379,12 +384,13 @@ calls and become properties of the stream:
 Added 8/24, ratified with the subagent framework. `artifact-update` payloads name their
 artifact, and four names are reserved so renderers and audit tooling can rely on them:
 
-| Name       | Content                                                                                                                                                         |
-| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `result`   | The deliverable, chunked per A2A chunking rules                                                                                                                 |
-| `thinking` | Reasoning deltas. Debug views only                                                                                                                              |
-| `activity` | Tool-call trace, one entry per invocation. Always in the audit replay                                                                                           |
-| `progress` | Agent-authored milestones, renderable to chat at zero model cost. Stage 1 derives these from model narration; the subagent framework spec records the deviation |
+| Name       | Content                                                                                                                                                                                                                                                |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `result`   | The deliverable, chunked per A2A chunking rules                                                                                                                                                                                                        |
+| `thinking` | Reasoning deltas. Debug views only                                                                                                                                                                                                                     |
+| `activity` | Tool-call trace, one entry per invocation. Always in the audit replay                                                                                                                                                                                  |
+| `progress` | Agent-authored milestones, renderable to chat at zero model cost. Stage 1 derives these from model narration; the subagent framework spec records the deviation                                                                                        |
+| `delegate` | The session's request to the gateway to mint a child task: one `data` part `{"addressee", "text"}` on the session's own task events. Consumed by the gateway's relay, never rendered to chat; reserved 10/5, used from the delegation primitive onward |
 
 Artifact names are data, so the set can grow without touching the envelope; only these
 four carry reserved semantics. An `activity` entry is one `data` part whose object carries
