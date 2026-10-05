@@ -1626,7 +1626,7 @@ class KubeAgentsHarness(AgentHarness):
         The answer goes on the wake's conversation, or on a new one for a
         ``session: fresh`` replay (:meth:`_execute_fresh_answer`); for an
         ``answer_by: click`` replay it is the click's turn the plant built. A
-        wake turn that replied with parse warnings still gets its answer; only
+        wake turn that replied still gets its answer, whatever errors it carried; only
         one that errored with no reply (:func:`card_wake.no_reply`) ends the run.
 
         See :mod:`kube_agents_bench.card_wake`. No agent sees anything when the

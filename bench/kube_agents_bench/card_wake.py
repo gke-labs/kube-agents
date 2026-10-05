@@ -839,7 +839,8 @@ def merge(
     metadata and as the trajectory's :data:`SETTLED_ENTRY`, the answer turn's
     reply as its ``args.answer_reply`` unless that turn errored before any reply
     was parsed. The trajectory,
-    errors and worker captures are both turns'. The
+    errors and worker captures are both turns'; an answer turn that errored with
+    no reply puts its errors first, since scoring reads only the first. The
     answer turn's tokens supersede the wake turn's when both read the same
     session, whose row is cumulative over the conversation, except for the
     wake turn's ``workers``, which are that turn's alone and are added back;
@@ -866,6 +867,7 @@ def merge(
         "answer_output": answer.output,
         "answer_final_message": answer_reply,
     }
+    errors = [*answer.errors, *wake.errors] if no_reply(answer) else [*wake.errors, *answer.errors]
     return AgentResult(
         output=wake.output,
         trajectory=[
@@ -874,7 +876,7 @@ def merge(
             _settled_entry(planted, settled, None if no_reply(answer) else answer_reply),
         ],
         tokens=tokens,
-        errors=[*wake.errors, *answer.errors],
+        errors=errors,
         metadata=metadata,
     )
 

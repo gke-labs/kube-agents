@@ -832,10 +832,27 @@ def test_merge_sums_tokens_across_sessions_and_keeps_an_empty_reply_empty() -> N
 
 
 def test_merge_keeps_both_turns_errors() -> None:
-    wake = AgentResult(output="a", trajectory=[], errors=["first"])
-    answer = AgentResult(output="b", trajectory=[], errors=["second"])
+    wake = AgentResult(output="a", trajectory=[], errors=["first"], metadata={"final_message": "a"})
+    answer = AgentResult(
+        output="b", trajectory=[], errors=["second"], metadata={"final_message": "b"}
+    )
 
     assert card_wake.merge(_PLANTED, wake, answer).errors == ["first", "second"]
+
+
+def test_merge_leads_with_an_answer_turn_that_failed_after_a_wake_that_warned() -> None:
+    # Scoring reads only errors[0], so the wake's warning would hide the answer's infra marker.
+    wake = AgentResult(
+        output="[SILENT]",
+        trajectory=[],
+        errors=["skipped an item"],
+        metadata={"final_message": "[SILENT]"},
+    )
+    answer = AgentResult.errored("KUBE_AGENTS_INFRA_FAILURE: 429")
+
+    errors = card_wake.merge(_PLANTED, wake, answer).errors
+
+    assert errors == ["KUBE_AGENTS_INFRA_FAILURE: 429", "skipped an item"]
 
 
 def test_merge_records_the_card_as_the_run_left_it() -> None:
