@@ -5464,6 +5464,21 @@ class TestPatchDeclaredShapes(HarnessTestCase):
         self.assertEqual([f["check"] for f in doc["findings"]], ["master-behind"])
         self.assertEqual(sorted(e["check"] for e in doc["declared"]), ["no-autoupgrade", "no-notifications"])
 
+    def test_an_incomplete_search_withholds_the_six_knobs_and_publishes_the_faults(self):
+        # No search record at all: every posture of the six is held, the four
+        # faults publish, and the run reads partial from the caller's side.
+        knobs = [self._patch_finding(f"k{i}", check, obj) for i, (check, obj) in enumerate((
+            ("no-channel", "Cluster/prod-us-east"), ("no-autoupgrade", "NodePool/batch-a"), ("no-autorepair", "NodePool/batch-a"),
+            ("no-maintenance-window", "Cluster/prod-us-east"), ("blocking-exclusion", "Cluster/prod-us-east"), ("no-notifications", "Cluster/prod-us-east")))]
+        faults = [self._patch_finding(f"f{i}", check, obj, severity="major") for i, (check, obj) in enumerate((
+            ("master-behind", "Cluster/prod-us-east"), ("pool-skew", "NodePool/batch-a"), ("fleet-spread", "Cluster/prod-us-east"), ("stale-image-type", "NodePool/batch-a")))]
+        doc = self._patch_doc(knobs + faults)
+        doc.pop(audit_report.DECLARED_INTENT_SEARCHED_KEY, None)
+        with contextlib.redirect_stderr(io.StringIO()):
+            withheld = audit_report.withhold_unsearched_postures(doc, None)
+        self.assertEqual(sorted(f["check"] for f in withheld), sorted(audit_report.audit_declarable_checks(self.PATCH_AUDIT)))
+        self.assertEqual(sorted(f["check"] for f in doc["findings"]), ["fleet-spread", "master-behind", "pool-skew", "stale-image-type"])
+
     def test_the_validator_rejects_a_declared_version_lag(self):
         doc = make_doc(findings=[], audit=self.PATCH_AUDIT)
         doc["declared"] = [make_declared(check="no-channel", cluster="prod-us-east", namespace="", obj="Cluster/prod-us-east")]

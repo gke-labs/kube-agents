@@ -42,9 +42,8 @@ gitops-repo/
   A choice HCL cannot express — a workload meant to run one replica — goes in an OKF document
   (`type` frontmatter, 06 §5) under `knowledge/` as a `declares:` list in the frontmatter, one item
   per posture with `check` (the slug, `single-replica`), `namespace`, `object` as `Kind/name`, and
-  `cluster` when the choice is one cluster's rather than fleet-wide (the bare cluster name for the
-  workload streams, the qualified `<project>/<location>/<name>` for the patch stream, whose findings
-  carry that form); the audit reads the
+  `cluster` when the choice is one cluster's rather than fleet-wide, spelled as the qualified
+  `<project>/<location>/<name>` every stream's findings carry, never the bare name; the audit reads the
   frontmatter, never the prose, and lists a match under _Declared intent_ with the file's path
   instead of reporting it. `.kube-agents/intent.yaml` names the paths the audit reads for such
   notes (`knowledge/` here); without it, or when a named path has nothing behind it, the whole
