@@ -1011,7 +1011,11 @@ def session_kv(path: str, body: dict | None = None, method: str = "") -> dict:
         f"{SESSION_KV_URL}{path}", data=data, headers=headers, method=method or ("POST" if data is not None else "GET")
     )
     with urllib.request.urlopen(request, timeout=SESSION_KV_TIMEOUT_SECONDS) as response:
-        return json.loads(response.read().decode("utf-8") or "{}")
+        answer = json.loads(response.read().decode("utf-8") or "{}")
+    # A ValueError is what every caller already turns into a refused alert.
+    if not isinstance(answer, dict):
+        raise ValueError(f"the Session KV server answered {type(answer).__name__}, not a JSON object")
+    return answer
 
 
 def stall_payload(project: str, cluster: str, location: str, namespace: str, assignee: str, rows: list[dict], first_seen: str) -> dict:
@@ -1347,14 +1351,14 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             candidates[scope] = []
     raised = held = 0
     refusal: str | None = None
-    attempted = False
     for scope in sorted(candidates, key=lambda sc: (scope_first_seen(state, sc), sc)):
         new_rows = candidates[scope]
         cid, namespace = split_scope(scope)
         project, name, location = split_cluster_id(cid)
-        # An expired episode is replaced only by an alert that is sent.
-        previous = episodes.get(scope)
-        episode = None if scope in expired else previous
+        # An expired episode is replaced only by an alert that is sent; an
+        # episode this iteration ends below is not put back on a refusal.
+        previous = episodes.get(scope) if scope in expired else None
+        episode = None if scope in expired else episodes.get(scope)
         # An alert carries every object the scope holds, not only the ones that
         # appeared this tick.
         seen = {(r["object"], r["heuristic"], r["detail"]) for r in new_rows}
@@ -1407,7 +1411,6 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             sys.stderr.write(f"stall_watch: {cid} has no Cluster Agent profile; no alert for {scope}\n")
             continue
         payload = stall_payload(project, name, location, namespace, assignee, rows, scope_first_seen(state, scope) or now)
-        attempted = True
         try:
             if board_records_sessions() is False:
                 raise AlertRefused("the kanban board records no tasks.session_id, so the card an alert produces could not be found")
@@ -1434,12 +1437,16 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
     if held:
         text = f"{NOTICED_PREFIX} in {held} more namespace{'s' if held > 1 else ''}; alerts follow on later ticks, {MAX_ALERTS_PER_TICK} a tick"
         lines.append(f"{DRY_RUN_PREFIX} {text}" if dry_run else text)
-    if attempted:
-        if refusal is not None and state.get(INJECT_ERROR_KEY) != refusal:
+    if refusal is not None:
+        if state.get(INJECT_ERROR_KEY) != refusal:
             lines.append(f"{INJECT_FAILED_PREFIX} {refusal}")
-        elif refusal is None and state.get(INJECT_ERROR_KEY):
-            lines.append(INJECT_RECOVERED_LINE)
         state[INJECT_ERROR_KEY] = refusal
+    elif raised and not dry_run:
+        # Only a sent alert shows the server is taking them again; a tick whose
+        # one attempt was a refused record proves nothing either way.
+        if state.get(INJECT_ERROR_KEY):
+            lines.append(INJECT_RECOVERED_LINE)
+        state[INJECT_ERROR_KEY] = None
     if not dry_run:
         for scope, episode in episodes.items():
             if episode.get("pending") and scope not in new_by_scope:

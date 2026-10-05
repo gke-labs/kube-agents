@@ -559,6 +559,16 @@ class Alerts(Base):
         self.assertEqual(len(self.kv.alerts), 2)
         self.assertEqual(sorted(o["object"] for o in self.last_alerts[0]["objects"]), ["Deployment/cart-api", "Deployment/checkout-api"], "the new alert carries every object the scope holds")
 
+    def test_a_refused_alert_after_a_completed_card_is_raised_once_the_server_answers(self):
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        self.board.cards[self.card_of("checkout")]["status"] = "done"
+        fleet = {"c": {"checkout": [DEPLOYMENT_ROW, finding("checkout", "Deployment/cart-api", "generation-lag", "generation 2 observed 1")]}}
+        self.kv.fail_next = stall_watch.urllib.error.URLError("connection refused")
+        self.run_tick(fleet)
+        self.assertEqual(len(self.kv.alerts), 1)
+        self.run_tick(fleet)
+        self.assertEqual(len(self.kv.alerts), 2, "the ended episode was not restored, so the scope is a candidate again")
+
     def test_a_cleared_namespace_comments_completes_and_prints_once(self):
         self.run_tick({"c": {"checkout": [DEADLINE_ROW]}})
         tid = self.card_of("checkout")
@@ -818,6 +828,20 @@ class Alerts(Base):
         self.assertIn("answered with an error: HTTP Error 401", lines[0])
         self.assertNotIn("could not be reached", lines[0])
 
+    def test_a_tick_whose_only_attempt_was_a_refused_record_does_not_say_recovered(self):
+        def wedged(ns):
+            return [finding(ns, "Deployment/api", "stale-condition", "Progressing=False ProgressDeadlineExceeded")]
+
+        self.kv.advertise = False
+        lines, _ = self.run_tick({"c": {"aaa": wedged("aaa")}})
+        self.assertTrue(lines[0].startswith(stall_watch.INJECT_FAILED_PREFIX), lines)
+        self.kv.advertise = True
+        self.kv.refuse_namespaces = {"aaa"}
+        lines, _ = self.run_tick({"c": {"aaa": wedged("aaa")}})
+        self.assertEqual(lines, [], "nothing was raised, so nothing says alerts are raised again")
+        lines, _ = self.run_tick({"c": {"aaa": wedged("aaa"), "bbb": wedged("bbb")}})
+        self.assertEqual(lines, [stall_watch.INJECT_RECOVERED_LINE])
+
     def test_a_refusal_at_the_inject_is_said_once_too(self):
         # Every attempt opens a new session; a refusal naming it would be new
         # text, and so a new chat line, on every tick.
@@ -939,6 +963,23 @@ class SessionKv(Base):
         self.assertEqual(seen["url"], "http://127.0.0.1:8699/sessions/s/inject")
         self.assertEqual((seen["method"], seen["auth"], json.loads(seen["body"])), ("POST", "Bearer tok", {"message": "{}"}))
         self.assertEqual(seen["timeout"], stall_watch.SESSION_KV_TIMEOUT_SECONDS)
+
+    def test_an_answer_that_is_not_a_json_object_is_a_refusal_not_a_crash(self):
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        with patch.object(stall_watch.urllib.request, "urlopen", lambda request, timeout: Response(b"null")):
+            with self.assertRaises(ValueError):
+                REAL_SESSION_KV(stall_watch.HEALTHZ_PATH)
+            with patch.object(stall_watch, "session_kv", REAL_SESSION_KV):
+                lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith(stall_watch.INJECT_FAILED_PREFIX), lines[0])
+        self.assertIn("not a JSON object", lines[0])
 
     def test_the_board_is_the_one_hermes_resolves(self):
         # hermes_cli.kanban has no kanban_db_path; importing it from there fell
