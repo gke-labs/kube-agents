@@ -497,13 +497,17 @@ def _totals(body: str, findings: list[Finding], critical: int) -> dict[str, int]
     """Findings by severity: the summary's totals, else the sections'; the title's critical count.
 
     Never fewer than the sections list, the title's count included: a title edited on the
-    forge must not leave the card counting fewer critical findings than it lists.
+    forge must not leave the card counting fewer critical findings than it lists. The title
+    counts only over a body that lists a critical, which fleet-audit renders first: otherwise
+    the card would lead on criticals it has no row for.
     """
     summary = FINDINGS_SUMMARY.search(body)
     totals = {severity: int(summary.group(severity)) if summary else 0 for severity in SEVERITIES}
     for severity in SEVERITIES:
         totals[severity] = max(totals[severity], sum(1 for finding in findings if finding.severity == severity))
-    totals[CRITICAL] = max(critical, sum(1 for finding in findings if finding.severity == CRITICAL))
+    listed_critical = sum(1 for finding in findings if finding.severity == CRITICAL)
+    if listed_critical:
+        totals[CRITICAL] = max(critical, listed_critical)
     return totals
 
 

@@ -78,8 +78,8 @@ home channel is known, the job's `skills` (a list or one string, or the legacy `
 `fleet-audit`, the message ends
 with a link to an issue in a managed repository, and enough of the posts' budget is
 left to read that issue. The headline reads that issue if it is open and labelled
-`agent:audit`: the title's critical count, the body's summary line for the other
-severities (the findings its sections list when it has none), the findings
+`agent:audit`: the title's critical count when the body lists a critical, the body's
+summary line for the other severities (the findings its sections list when it has none), the findings
 themselves, and the Scope section's skipped clusters. Held rows are not findings,
 a `#` line inside a finding's fenced evidence ends no section, and a finding title,
 a skipped cluster or the audit name keeps a link's text but not its target. It

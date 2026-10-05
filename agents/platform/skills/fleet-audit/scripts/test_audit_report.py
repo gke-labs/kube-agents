@@ -3637,17 +3637,18 @@ class TestNewMarker(HarnessTestCase):
         self.assertNotIn(audit_report.NEW_MARKER, body)
 
     def test_a_block_under_another_identity_scheme_marks_nothing(self):
-        # Every id looks new across a scheme change, so none is marked.
-        self.harness.replies = {
-            "issue-list": self.issue_list(),
-            "issue-view !comments": issue_view(
-                {"body": '## Findings\n\n<!-- audit-findings: ["wra-something-old"] -->\n'}
-            ),
-        }
-        self.touch("clusters/prod-us-east/payments-netpol.yaml")
-        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
-        (body,) = self.harness.bodies_for("issue-update")
-        self.assertNotIn(audit_report.NEW_MARKER, body)
+        # Every id looks new across a scheme change, so none is marked, even
+        # where the last run's scope says it ran the finding's check.
+        alpha = make_finding(fid="a", title="Alpha finding")
+        self.remember([alpha])
+        latest = self.store_dir() / "latest.json"
+        envelope = json.loads(latest.read_text(encoding="utf-8"))
+        envelope["ledger_body"] = '## Findings\n\n<!-- audit-findings: ["a"] -->\n'
+        envelope["current_ids"] = ["a"]
+        envelope["id_scheme"] = None
+        envelope["document"]["findings"] = [{"id": "a"}]
+        latest.write_text(json.dumps(envelope), encoding="utf-8")
+        self.assertNotIn(audit_report.NEW_MARKER, self.finish(make_doc(findings=[alpha])))
 
     def test_a_finding_the_last_body_cut_for_space_is_not_new(self):
         # The hidden block names only what the body rendered; the stored

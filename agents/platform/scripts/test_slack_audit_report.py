@@ -909,6 +909,18 @@ class BlocksFromIssueTest(unittest.TestCase):
         lines = sar.headline_from_issue(issue, REF, REPORT).splitlines()
         self.assertEqual(lines[0], "**Security & RBAC Posture Audit: 3 critical findings**")
         self.assertEqual(lines[3], "6 more (1 critical, 1 major, 4 minor) are in the ledger issue.")
+    def test_a_title_counting_criticals_the_body_does_not_list_leads_on_what_it_lists(self):
+        body = (
+            "5 findings: 0 critical, 1 major, 4 minor.\n\n### Major (1)\n\n"
+            + finding("seeded-a: Workload Identity is off on one node pool", "wi-1")
+            + "\n### Minor (4)\n\n"
+            + finding("seeded-a: a namespace has no NetworkPolicy", "np-1")
+        )
+        issue = dict(ISSUE, title="[audit] Security & RBAC Posture Audit — 5 findings (2 critical)", body=body)
+        blocks, text = sar.blocks_from_issue(issue, REF, "")
+        self.assertIn("Audit: 1 major finding*", text)
+        self.assertNotIn("critical", text)
+        self.assertIn(sar.LOOK_FIRST, str(blocks))
     def test_the_relayed_line_is_not_in_the_blocks(self):
         blocks, _ = sar.blocks_from_issue(ISSUE, REF, REPORT)
         self.assertNotIn(LINE, str(blocks))
