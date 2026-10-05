@@ -170,10 +170,9 @@
 # ~55 serial minutes at its 1100s hint (dev-install repetitions measured
 # 1040-1080s), all of it on the infra lock with the other tofu cases, most of
 # it the stack waiting out stall_report.py's ten-minute Deployment threshold.
-# Counted from the lists with it, the last entry below: forty-seven cases
-# (141 units) here, of a sixty-one-case, 183-unit matrix with the presubmit
-# file's fourteen. That is two more than the 2026-09-29 tally above, which was
-# already one behind the lists. The parallelism arithmetic above does not price
+# Counted from the lists with it, the last entry below: forty-nine cases
+# (147 units) here, of a sixty-three-case, 189-unit matrix with the presubmit
+# file's fourteen. The parallelism arithmetic above does not price
 # this case: every case with a `stack:` holds the infra lock for its whole run,
 # so those cases run one at a time whatever EVAL_TASK_PARALLELISM is. With this
 # case the nightly carries eleven of them, ~433 serial minutes at their
