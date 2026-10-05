@@ -1593,6 +1593,20 @@ class ReplayedUnblockTest(TypedAnswerSettlesTheQuestionTest):
         text = slack_ux_moments.wake_text(notification.sub, batch, ["blocked"], "W")
         self.assertIn(slack_ux_moments.WAKE_NOTE, text)
 
+    async def test_a_replayed_note_leaves_the_later_question_open_when_the_ping_record_lags(self):
+        # A noted heartbeat is a sent kind, so it reaches deliver(): replayed, it must
+        # not settle the question blocked 5 posted, or blocked 5 asks it again.
+        adapter = _SlackAdapter()
+        notification = self._replaying(adapter, record=False)
+        batch = [SimpleNamespace(id=4, kind="unblocked", payload=None), _beat(5, "retrying"),
+                 SimpleNamespace(id=6, kind="blocked", payload=self.SECOND)]
+        with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "1"}):
+            await self._deliver(notification, [SimpleNamespace(id=3, kind="blocked", payload=self.QUESTION)])
+            await self._deliver(notification, batch)
+            await self._deliver(notification, batch)
+        self.assertEqual([entry[0] for entry in slack_ux_moments._questions.values()], [6])
+        self.assertEqual((len(adapter.posts), len(adapter.updates)), (2, 1), "the replayed note settled the later question")
+
 
 if __name__ == "__main__":
     unittest.main()

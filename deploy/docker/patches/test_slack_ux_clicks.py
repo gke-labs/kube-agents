@@ -711,8 +711,10 @@ class RuntimeTest(unittest.TestCase):
             for _ in range(5):
                 await asyncio.sleep(0)
             self.assertEqual(adapter.log, [], "the first click's rewrite was not held")
+            self.assertTrue(runtime.rewriting(CHANNEL, MESSAGE_TS), "a held rewrite reads as in flight")
             release.set()
             await asyncio.gather(*clicks)
+            self.assertFalse(runtime.rewriting(CHANNEL, MESSAGE_TS))
 
         _run(both())
         turns = [entry[1]["text"] for entry in adapter.log if entry[0] == "message"]

@@ -518,6 +518,14 @@ def test_merge_carries_the_answer_reply_for_the_verifier() -> None:
     assert merged.metadata["final_message"] == "[SILENT]"
 
 
+def test_merge_records_no_answer_reply_for_an_errored_answer_turn() -> None:
+    answer = AgentResult.errored("HTTP 500 from agent endpoint: upstream")
+
+    merged = card_wake.merge(_PLANTED, _result("[SILENT]", [], {}), answer)
+
+    assert "answer_reply" not in merged.trajectory[-1]["args"]
+
+
 # --- A typed answer in a fresh session (session: fresh) -----------------------
 
 FRESH_PROMPT = PROMPT + "session: fresh\n"

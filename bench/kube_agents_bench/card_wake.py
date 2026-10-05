@@ -11,8 +11,8 @@ the conversation that filed it, and the front door's reply follows
 question is already posted, unless something else in the notification needs
 saying, otherwise the question in its own words. The user's answer then goes
 to the card
-with ``kanban_comment`` and ``kanban_unblock``, and the reply to it is exactly
-``[SILENT]`` (§1.5, **Unblock**). On an image
+with ``kanban_comment`` and ``kanban_unblock``, and once the unblock succeeds the
+reply to it is exactly ``[SILENT]`` (§1.5, **Unblock**). On an image
 whose gateway carries a Slack moments module (``gateway/slack_ux_moments.py``)
 with ``KAGE_SLACK_UX`` on, that module's ``needs_you`` posts the question in
 the Slack thread itself before the wake is built. None of that is reachable
@@ -830,7 +830,7 @@ def merge(
     ``output`` and ``final_message`` are the reply to the wake; the answer
     turn's text, and the card as the run left it (``settled``), are kept in
     metadata and as the trajectory's :data:`SETTLED_ENTRY`, the answer turn's
-    reply as its ``args.answer_reply``. The trajectory,
+    reply as its ``args.answer_reply`` unless that turn errored. The trajectory,
     errors and worker captures are both turns'. The
     answer turn's tokens supersede the wake turn's when both read the same
     session, whose row is cumulative over the conversation, except for the
@@ -860,7 +860,11 @@ def merge(
     }
     return AgentResult(
         output=wake.output,
-        trajectory=[*wake.trajectory, *answer.trajectory, _settled_entry(planted, settled, answer_reply)],
+        trajectory=[
+            *wake.trajectory,
+            *answer.trajectory,
+            _settled_entry(planted, settled, None if answer.errors else answer_reply),
+        ],
         tokens=tokens,
         errors=[*wake.errors, *answer.errors],
         metadata=metadata,

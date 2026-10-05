@@ -4301,9 +4301,10 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	//     buttons; the wake for a question already posted carries a note
 	//     telling the Planning Agent not to ask it again, nor to reply after
 	//     carrying the answer to the card, the one effect that reaches a
-	//     model; once the card moves on, the question's thread is read once
+	//     model; once the card resumes, the question's thread is read once
 	//     (conversations.replies, the existing token and scopes) for the first
-	//     reply a person typed, so the settled question shows who answered.
+	//     reply a person typed, and the names it shows are looked up with
+	//     users.info, cached per user, so the settled question shows who answered.
 	//   - Reactions: which reaction goes on an ask and when it settles.
 	//   - Thread status: less of a delegated card's delivery posts in the
 	//     thread, the thread's cards show as one plan message, and Slack shows

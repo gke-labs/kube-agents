@@ -828,7 +828,7 @@ _REPLAY_DECOY_UNREAD_REASON = (
 
 _NO_ANSWER_REPLY_REASON = (
     f"no answer reply on a {card_wake.SETTLED_ENTRY} entry in the trajectory: the prompt "
-    "was not a question replay, or its wake turn errored, so no answer turn ran to grade"
+    "was not a question replay, or its wake or answer turn errored, so no answer reply was recorded to grade"
 )
 
 

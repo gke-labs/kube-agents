@@ -730,7 +730,7 @@ async def deliver(
             # An at-least-once replay of the block whose question is up: settling
             # it would take its buttons off and posting would repeat it.
             return None
-        await _settle_question(moments, adapter, sub, kind)
+        await _settle_question(moments, adapter, sub, kind, event_id)
         if kind == NEEDS_YOU_KIND and moments is not None and await _needs_you(moments, adapter, sub, ev):
             await _settle_reaction(adapter, sub, kind, board)
             return None
@@ -753,7 +753,7 @@ async def deliver(
     payload = getattr(ev, "payload", None)
     line = rolling_line(kind, payload) or message
     moments = _slack_moments(quiet)
-    await _settle_question(moments, adapter, sub, kind)
+    await _settle_question(moments, adapter, sub, kind, event_id)
     result = await _roll(
         adapter, sub, metadata, header, title, line, _moved_to(kind, payload),
         _slack_plan(quiet), event_id, tracked,

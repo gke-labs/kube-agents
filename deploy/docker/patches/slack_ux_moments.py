@@ -103,7 +103,7 @@ WAKE_NOTE = (
 )
 
 #: The answered line a typed answer gets, as ``slack_ux_clicks.CLICKED``, and its
-#: name when the clicks module is missing.
+#: name when looking the answerer's up raises.
 ANSWERED = "✓ {who}: {label}"
 NAMELESS = "Someone"
 
