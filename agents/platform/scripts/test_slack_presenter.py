@@ -597,6 +597,8 @@ class FallbackTextTest(unittest.TestCase):
                 {"type": "text", "text": "start", "style": {"bold": True}},
                 {"type": "text", "text": "ed"},
             ],
+            "__enforce__ PSA": [{"type": "text", "text": "enforce", "style": {"bold": True}}, {"type": "text", "text": " PSA"}],
+            "snake__case__name": [{"type": "text", "text": "snake__case__name"}],
         }
         for row, elements in cases.items():
             with self.subTest(row=row):
@@ -630,7 +632,7 @@ class FallbackTextTest(unittest.TestCase):
         self.assertEqual(sp.fallback_text("h", links=links), "*h*\n<https://a?b=%3Ec%7Cd|z> · <https://p|ok>")
 
     def test_a_url_slack_would_refuse_is_dropped(self):
-        too_long = "https://x/" + "a" * sp.URL_MAX
+        too_long = "https://x/" + "a" * sp.BUTTON_URL_MAX
         links = [("a", too_long), ("b", "https://p\n"), ("c", "https://"), ("d", "HTTPS://P")]
         self.assertEqual(sp.fallback_text("h", links=links), "*h*\n<HTTPS://P|d>")
 
@@ -774,6 +776,10 @@ class BlocksReportTest(unittest.TestCase):
         self.assertFalse(sp.names_gap("with no unreachable nodes"))
         self.assertFalse(sp.names_gap("Clusters skipped: none"))
         self.assertFalse(sp.names_gap("unreachable", ": 0."))
+        self.assertFalse(sp.names_gap("Skipped", ": 0 clusters"))
+        self.assertFalse(sp.names_gap("unreachable", ": 0/3."))
+        self.assertFalse(sp.names_gap("Clusters skipped", ": 0 of 3 clusters."))
+        self.assertEqual(sp.gap_parts("Skipped: 0 clusters"), [])
         self.assertTrue(sp.names_gap("seeded-b unreachable", ": 2 nodes."))
         self.assertTrue(sp.names_gap("seeded-b skipped: no credentials"))
         self.assertTrue(sp.names_gap("unreachable", ": 0 of 3 control planes answered."))
@@ -878,11 +884,26 @@ class BlocksReportTest(unittest.TestCase):
         self.assertEqual(sp.as_line("Done!"), "Done!")
 
     def test_row_links_keep_only_urls_slack_accepts(self):
-        too_long = "https://x/" + "a" * sp.URL_MAX
+        too_long = "https://x/" + "a" * sp.BUTTON_URL_MAX
         for url, linked in ((too_long, False), ("HTTPS://P/q", True), ("https://", False)):
             elements = sp._rich_elements(f"[d]({url})")
             self.assertEqual(elements[0]["type"] == "link", linked, url)
             self.assertEqual(f"<{url}|d>" in sp.to_mrkdwn(f"[d]({url})"), linked, url)
+
+    def test_a_row_link_and_a_button_take_the_same_longest_url(self):
+        for scheme in ("https://", "http://"):
+            longest = scheme + "x/" + "a" * (sp.BUTTON_URL_MAX - len(scheme) - len("x/"))
+            with self.subTest(scheme=scheme):
+                self.assertTrue(sp.SAFE_URL.fullmatch(longest))
+                self.assertFalse(sp.SAFE_URL.fullmatch(longest + "a"))
+                self.assertTrue(sp._safe_link_url(longest))
+                self.assertFalse(sp._safe_link_url(longest + "a"))
+
+    def test_mrkdwn_reads_fences_as_the_paragraph_splitter_does(self):
+        # A tilde fence's lines pass through; a leading triple-backtick span is a code span.
+        self.assertEqual(sp.to_mrkdwn("~~~\n**raw**\n~~~\n**bold**"), "~~~\n**raw**\n~~~\n*bold*")
+        self.assertEqual(sp.to_mrkdwn("```kubectl``` output **exposed**"), "```kubectl``` output *exposed*")
+        self.assertEqual(sp.to_mrkdwn("```\n**raw**\n```\n**bold**"), "```\n**raw**\n```\n*bold*")
 
     def test_a_row_link_with_parentheses_in_its_url_is_whole_in_both_views(self):
         url = "https://console.cloud.google.com/logs/query;query=resource.type%3D(k8s_container)"

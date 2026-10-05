@@ -171,8 +171,6 @@ BACKTICK = "`"
 ROW_TEXT_MAX = 300
 PRIMARY_STYLE = "primary"
 
-CODE_FENCE = "```"
-
 #: A code fence line; nothing between an opener and its closer is a heading, a bullet or markup.
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 HEADING = re.compile(r"^\s{0,3}#{1,6}\s+")
@@ -237,25 +235,24 @@ NUMBER_ABBREVIATION_END = re.compile(r"(?:^|[\s(\[#])(?:no|max|min)\.$", re.IGNO
 NUMBER_NEXT = re.compile(r"\d")
 #: How far back from a candidate end an abbreviation can start; bounds the check to the tail.
 ABBREVIATION_TAIL = 16
-#: Slack refuses a button whose url is longer than this.
-URL_MAX = 3000
 #: A url a link button or ``<url|label>`` may carry: http(s) in any case, no userinfo (an ``@``
 #: before the path, query or fragment, which would show one host and open another), nothing that
-#: ends or splits the link, and short enough for a button. Use ``fullmatch``: ``$`` would admit a
+#: ends or splits the link, and no longer than :data:`BUTTON_URL_MAX`. Use ``fullmatch``: ``$`` would admit a
 #: trailing newline.
 SAFE_URL = re.compile(
-    rf"https?://(?=[^\s<>|]{{1,{URL_MAX - len('https://')}}}\Z)[^\s<>|/?#@]*(?:[/?#][^\s<>|]*)?", re.IGNORECASE
+    rf"(?=[^\s<>|]{{1,{BUTTON_URL_MAX}}}\Z)https?://(?=[^\s<>|])[^\s<>|/?#@]*(?:[/?#][^\s<>|]*)?", re.IGNORECASE
 )
 #: A space-aligned clip shorter than this share of the limit drops too much; it cuts hard instead.
 CLIP_MIN_SHARE = 2
 INLINE_CODE = re.compile(r"`[^`]*`")
 #: :func:`to_mrkdwn` holds a code span's place with this; :data:`CODE_PLACEHOLDER` finds it again.
 CODE_HOLD = "\x00{}\x00"
-#: A bold takes :data:`STAR_BOLD`'s and :data:`STAR_BOLD_IN_WORD`'s edges, so a card row and its text
-#: fallback agree on ``2**20 and 2**30``.
+#: A bold takes :data:`STAR_BOLD`'s, :data:`STAR_BOLD_IN_WORD`'s and :data:`UNDERSCORE_BOLD`'s edges, so a
+#: card row and its text fallback agree on ``2**20 and 2**30`` and on ``__x__``.
 RICH_SPAN = re.compile(
     rf"`(?P<code>[^`]+)`|{BOLD_OPEN.format(re.escape('**'))}(?P<bold>(?:(?!\*\*).)+?)(?<=\S)\*\*"
     r"|(?<=\w)\*\*(?P<inbold>[^\s*]+)\*\*"
+    rf"|{UNDERSCORE_BOLD.replace('((?:', '(?P<ubold>(?:', 1)}"
     rf"|\[(?P<label>[^\[\]]+)\]\((?P<url>{MD_LINK_URL})\)"
     r"|(?<![\w*])\*(?=[^\s.])(?P<star>[^*\n]+?)(?<=\S)\*(?![\w*])|(?<![\w_])_(?=[^\s.])(?P<under>[^_\n]+?)(?<=\S)_(?![\w_])"
     r"|(?<![\w~])~(?=\S)(?P<strike>[^~\n]+?)(?<=\S)~(?![\w~])"
@@ -284,9 +281,14 @@ NEGATED = re.compile(r"\b(?:no|zero)\s+$", re.IGNORECASE)
 #: How far back from a gap word NEGATED reads: "zero" and a run of spaces. Farther
 #: than that, the clause errs toward naming a gap rather than hiding one.
 NEGATION_REACH = 100
-#: "Clusters skipped: none", "unreachable: 0": the gap word negated right after
-#: it, by a word ending the clause; "skipped: no credentials" is a reason.
-NONE_AFTER = re.compile(r"\s*[:=—–]\s*(?:none|nothing|zero|no|0)\s*(?:[.;,!?)]|$)", re.IGNORECASE)
+#: "Clusters skipped: none", "unreachable: 0", "Skipped: 0 of 3 clusters": the gap word negated
+#: right after it, by a word ending the clause, perhaps with a total and a scan noun;
+#: "skipped: no credentials" is a reason.
+NONE_AFTER = re.compile(
+    r"\s*[:=—–]\s*(?:none|nothing|zero|no|0)(?:\s*(?:/|of)\s*\d+)?"
+    r"(?:\s+(?:clusters?|namespaces?|projects?|nodes?|workloads?))?\s*(?:[.;,!?)]|$)",
+    re.IGNORECASE,
+)
 #: Where a clause's parts divide, so "No drift, but 2 clusters were
 #: unreachable" keeps its gap.
 CLAUSE_PART = re.compile(r"[,:]|\b(?:but|and|while|although|though)\b", re.IGNORECASE)
@@ -742,13 +744,11 @@ def to_mrkdwn(markdown: str) -> str:
         return CODE_PLACEHOLDER.sub(lambda m: restore(spans[int(m.group(1))]), text)
 
     lines = []
-    in_fence = False
+    fence = None
     for line in markdown.replace("\x00", "").split("\n"):
-        if line.strip().startswith(CODE_FENCE):
-            in_fence = not in_fence
-            lines.append(line)
-            continue
-        if in_fence:
+        # A fence's lines, the opener and closer included, pass through as written.
+        fence, was_open = next_fence(line, fence), fence
+        if fence is not None or was_open is not None:
             lines.append(line)
             continue
         held = INLINE_CODE.sub(hold, line)
@@ -877,8 +877,8 @@ def _rich_elements(markdown: str) -> list[dict]:
             elements.append({"type": "text", "text": markdown[at : span.start()]})
         if span.group("code") is not None:
             elements.append({"type": "text", "text": span.group("code"), "style": {"code": True}})
-        elif span.group("bold") is not None or span.group("inbold") is not None:
-            elements.append({"type": "text", "text": span.group("bold") or span.group("inbold"), "style": {"bold": True}})
+        elif (bold := next((span.group(g) for g in ("bold", "inbold", "ubold") if span.group(g) is not None), None)) is not None:
+            elements.append({"type": "text", "text": bold, "style": {"bold": True}})
         elif span.group("star") is not None or span.group("under") is not None:
             elements.append({"type": "text", "text": span.group("star") or span.group("under"), "style": {"italic": True}})
         elif span.group("strike") is not None:
