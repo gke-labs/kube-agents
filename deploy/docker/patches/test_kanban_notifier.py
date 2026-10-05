@@ -2078,6 +2078,24 @@ class ApplyTest(unittest.TestCase):
             patch_tree(moved)
         self.assertIn("_KanbanNotification.__init__", str(ctx.exception))
 
+    def test_a_platform_str_binding_nested_inside_init_fails_loudly(self):
+        # Indented deeper, the pinned line is still a substring and still inside
+        # __init__'s span, but some constructions would skip it.
+        binding = '        self.platform_str = (sub["platform"] or "").lower()\n'
+        nested_line = "    " + binding
+        for wrapper in (
+            '        if sub.get("platform"):\n',
+            "        try:\n",
+            "        def _bind():\n",
+        ):
+            with self.subTest(wrapper=wrapper.strip()):
+                tail = "        except KeyError:\n            pass\n" if "try" in wrapper else ""
+                nested = UPSTREAM_NOTIFIER.replace(binding, wrapper + nested_line + tail)
+                self.assertEqual(nested.count(binding), 1)
+                with self.assertRaises(SystemExit) as ctx:
+                    patch_tree(nested)
+                self.assertIn("_KanbanNotification.__init__", str(ctx.exception))
+
     def test_a_drifted_wake_step_anchor_fails_loudly(self):
         with self.assertRaises(SystemExit) as ctx:
             patch_tree(UPSTREAM_NOTIFIER.replace(*TELL_DRIFT))

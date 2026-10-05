@@ -381,26 +381,29 @@ SENTINELS = (
 
 
 def expect_platform_binding(patch: patchlib.Patch) -> None:
-    """Assert the one ``PLATFORM_BINDING`` line sits in ``_KanbanNotification.__init__``.
+    """Assert the one ``PLATFORM_BINDING`` line is a statement of ``_KanbanNotification.__init__``.
 
-    ``substitute`` counts the line anywhere, so a binding moved verbatim into
-    another scope with a local ``sub`` would pass it and leave the instance
-    without ``platform_str``.
+    ``substitute`` counts the line anywhere, and as a substring, so a binding
+    moved verbatim into another scope, or nested deeper inside ``__init__``
+    under an ``if``, a ``try`` or a closure, would pass it and leave some
+    instances without ``platform_str``. Only a statement directly in the
+    constructor's body, at the pinned indentation, runs on every construction.
     """
-    lineno = patch.source.count("\n", 0, patch.source.index(PLATFORM_BINDING)) + 1
+    offset = patch.source.index(PLATFORM_BINDING)
+    lineno = patch.source.count("\n", 0, offset) + 1
+    col = len(PLATFORM_BINDING) - len(PLATFORM_BINDING.lstrip(" "))
     for node in patch._tree().body:
         if isinstance(node, ast.ClassDef) and node.name == PLATFORM_CLASS:
             for method in node.body:
-                if (
-                    isinstance(method, ast.FunctionDef)
-                    and method.name == PLATFORM_METHOD
-                    and method.lineno <= lineno <= method.end_lineno
+                if isinstance(method, ast.FunctionDef) and method.name == PLATFORM_METHOD and any(
+                    isinstance(stmt, ast.Assign) and stmt.lineno == lineno and stmt.col_offset == col
+                    for stmt in method.body
                 ):
                     return
     raise patch._fail(
-        f"the platform_str binding at line {lineno} is no longer inside "
-        f"{PLATFORM_CLASS}.{PLATFORM_METHOD}, where the completion call expects "
-        f"n.platform_str to be set. {patch.note}"
+        f"the platform_str binding at line {lineno} is no longer a statement of "
+        f"{PLATFORM_CLASS}.{PLATFORM_METHOD}'s own body, so the completion call's "
+        f"n.platform_str is not set on every construction. {patch.note}"
     )
 
 
