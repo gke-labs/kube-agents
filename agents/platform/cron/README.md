@@ -82,7 +82,10 @@ one line saying how many wait. An alert the server refused, or a server that
 does not advertise the kind on `/healthz`, leaves the namespace with its rows
 for the next tick, and the tick stops trying the rest rather than spend a
 timeout on each; the "alerts not raised" line below reports them rather than
-the held count. A new object in a namespace whose card is still open is a comment on that
+the held count. A record the server refuses on its own merits (HTTP 400) skips
+only that namespace, and the next one in line still gets its alert. Objects
+whose names exceed the server's 200-character limit are left out of the
+record, and a namespace with nothing else stalled gets no alert. A new object in a namespace whose card is still open is a comment on that
 card; when every object in the namespace has cleared, the card gets a closing
 comment and is completed. A `repeating-warnings` or
 `dangling-reference` row clears only after two consecutive scans without it, so

@@ -91,7 +91,9 @@ cannot be written means no alert, rather than the same alert on every tick. A re
 server unreachable, not advertising the kind, or answering anything but `injected`) ends the tick's
 attempts and is said once in chat, with a line when alerts are raised again. The refusal text names
 no session, since every attempt opens a new one and the ledger compares the text to decide whether
-the refusal is new.
+the refusal is new. A record the server refuses with 400 is that record's fault, not the server's:
+it skips only that namespace. Objects whose names exceed the server's 200-character limit are left
+out of the record before it is sent.
 
 ### 3.4 No alert limit
 

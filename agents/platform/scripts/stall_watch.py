@@ -108,6 +108,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Iterable
@@ -288,6 +289,14 @@ PROFILE_SCOPE = "profile"
 MAX_ALERTS_PER_TICK = 3
 #: Object names a chat line or card comment spells out before counting the rest.
 MAX_OBJECTS_IN_LINE = 8
+#: The longest name the Session KV server takes (`DRIFT_MAX_FIELD_CHARS` there).
+#: It refuses a record with a longer namespace or cluster, and drops a longer
+#: object name, so such objects are left out of the record here rather than
+#: costing the namespace a refused inject on every tick.
+MAX_NAME_CHARS = 200
+#: The HTTP status the server answers a record it refuses with: a fault in that
+#: one record, not in the server.
+HTTP_BAD_REQUEST = 400
 #: Rows one record carries. The card lists sixty of them and counts the rest;
 #: this keeps one namespace with thousands of stalled objects from becoming a
 #: request of the same size.
@@ -1009,6 +1018,7 @@ def stall_payload(project: str, cluster: str, location: str, namespace: str, ass
     objects = [
         {"object": r["object"], "heuristic": r["heuristic"], "stalled_for": r.get("stalled_for") or ""}
         for r in sorted(rows, key=lambda r: (r["object"], r["heuristic"]))
+        if len(r["object"]) <= MAX_NAME_CHARS
     ]
     return {
         "kind": INJECT_KIND,
@@ -1024,6 +1034,11 @@ def stall_payload(project: str, cluster: str, location: str, namespace: str, ass
 
 class AlertRefused(Exception):
     """The Session KV server did not take the alert; the message says why."""
+
+
+class RecordRefused(AlertRefused):
+    """The server refused this one record (HTTP 400). Other namespaces' alerts
+    are still worth sending this tick."""
 
 
 def open_session() -> str:
@@ -1048,6 +1063,10 @@ def inject(session_id: str, payload: dict) -> None:
             f"{SESSIONS_PATH}/{urllib.parse.quote(session_id, safe='')}{INJECT_SUFFIX}",
             {MESSAGE_KEY: json.dumps(payload)},
         ).get(STATUS_KEY)
+    except urllib.error.HTTPError as exc:
+        if exc.code == HTTP_BAD_REQUEST:
+            raise RecordRefused(f"the Session KV server refused the record: {exc}") from exc
+        raise AlertRefused(f"the inject failed: {exc}") from exc
     except (OSError, ValueError) as exc:
         raise AlertRefused(f"the inject failed: {exc}") from exc
     if status != INJECTED_STATUS:
@@ -1277,9 +1296,11 @@ def adopt_cards(state: dict, now: str) -> None:
             continue
         try:
             waited = (datetime.fromisoformat(now) - datetime.fromisoformat(str(episode.get("opened_at")))).total_seconds()
-        except ValueError:
+        except (ValueError, TypeError):  # TypeError: a hand-edited time with no timezone
             waited = UNFILED_ALERT_RETRY_SECONDS
-        if waited >= UNFILED_ALERT_RETRY_SECONDS:
+        # A namespace that has also cleared is left to the clearing step, which
+        # posts its line; ending the episode here would drop it unannounced.
+        if waited >= UNFILED_ALERT_RETRY_SECONDS and scope_rows(state, scope):
             sys.stderr.write(f"stall_watch: session {episode[SESSION_KEY]} filed no card for {scope} since {episode.get('opened_at')}; its episode ends and the alert is raised again\n")
             end_episode(state, scope)
 
@@ -1367,6 +1388,10 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             # leaves the cluster out and its rows clear.
             sys.stderr.write(f"stall_watch: {cid} has no Cluster Agent profile; no alert for {scope}\n")
             continue
+        payload = stall_payload(project, name, location, namespace, assignee, rows, scope_first_seen(state, scope) or now)
+        if not payload["objects"]:
+            sys.stderr.write(f"stall_watch: every stalled object in {scope} has a name over {MAX_NAME_CHARS} characters; no alert\n")
+            continue
         attempted = True
         try:
             if board_records_sessions() is False:
@@ -1380,7 +1405,13 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
                     persist()
                 except OSError as exc:
                     raise AlertRefused(f"the ledger could not be saved before the alert: {exc}") from exc
-            inject(session, stall_payload(project, name, location, namespace, assignee, rows, scope_first_seen(state, scope) or now))
+            inject(session, payload)
+        except RecordRefused as exc:
+            # This record's fault, not the server's: the next namespace in line
+            # still gets its alert.
+            episodes.pop(scope, None)
+            sys.stderr.write(f"stall_watch: no alert for {scope}: {exc}\n")
+            continue
         except AlertRefused as exc:
             episodes.pop(scope, None)
             refusal = str(exc)
