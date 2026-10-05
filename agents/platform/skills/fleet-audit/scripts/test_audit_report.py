@@ -16079,7 +16079,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.declaring_replies(previous_body)
         api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
         worker_id = derived_id(check="default-sa-automount", obj="Deployment/worker")
-        self.harness.replies["pr list"] = json.dumps(
+        self.harness.replies["proposal-list"] = proposals_view(
             [pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([api_id, worker_id]))]
         )
         self.touch(path)
@@ -16090,8 +16090,8 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(rc, 0, self.err)
         payload = self.stdout_json()
         self.assertEqual(payload["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
-        self.assertTrue(self.harness.gh_calls("pr", "close"))
-        comment = " ".join(b for b in self.harness.bodies if b)
+        self.assertTrue(self.harness.forge_calls("proposal-close"))
+        comment = " ".join(self.harness.bodies_for("proposal-*"))
         self.assertIn("declared to need the `default` ServiceAccount's token", comment)
         self.assertIn("The finding has not gone", comment)
         self.assertNotIn("If the finding comes back", comment)
@@ -16107,7 +16107,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.declaring_replies(previous_body)
         api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
         worker_id = derived_id(check="default-sa-automount", obj="Deployment/worker")
-        self.harness.replies["pr list"] = json.dumps(
+        self.harness.replies["proposal-list"] = proposals_view(
             [pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([api_id, worker_id]))]
         )
         self.touch(path)
@@ -16118,7 +16118,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(rc, 0, self.err)
         # Whatever else this run says about the pull request (its branch is
         # not the group's), the shield reason is not among it.
-        comment = " ".join(b for b in self.harness.bodies if b)
+        comment = " ".join(self.harness.bodies_for("proposal-*"))
         self.assertNotIn("declared to need the `default` ServiceAccount's token", comment)
         self.assertNotIn("The finding has not gone", comment)
         self.assertNotIn("MANUAL:", self.err)
