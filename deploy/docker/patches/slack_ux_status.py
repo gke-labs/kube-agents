@@ -428,7 +428,7 @@ async def _render(adapter: Any, key: tuple, plan: _Plan) -> bool:
     return True
 
 
-async def _session(adapter: Any, key: tuple, plan: _Plan, *, force: bool = False) -> None:
+async def _session(adapter: Any, key: tuple, plan: _Plan) -> None:
     """Send the session status the thread's plans now hold, with this plan's team.
 
     :func:`_plan_session` reads the current plan and any set aside: a card
@@ -443,8 +443,6 @@ async def _session(adapter: Any, key: tuple, plan: _Plan, *, force: bool = False
     """
     chat_id, thread_ts = key
     wanted = _plan_session(chat_id, thread_ts)
-    if not plan.ts and not wanted and key not in _sessions and not force:
-        return
     setter = getattr(adapter, "_set_thread_status", None)
     if setter is None:
         return
@@ -801,7 +799,7 @@ async def deliver_row(
         _plans.move_to_end(key)  # eviction at PLANS_MAX takes the least active thread
     if plan.fallback:
         _roll(adapter, key, plan, card)
-        if plan.ts or (_status is not None and _sessions.get(key, ("", 0))[0] == _status.SESSION_SUSPENDED):
+        if plan.ts or key in _sessions:
             await _session(adapter, key, plan)
         return False
     row = plan.rows.get(card)
@@ -826,7 +824,7 @@ async def deliver_row(
         else:
             row.lines, row.steps, row.note, row.status, row.last_event_id = previous
         _roll(adapter, key, plan, card)
-        if plan.ts or (_status is not None and _sessions.get(key, ("", 0))[0] == _status.SESSION_SUSPENDED):
+        if plan.ts or key in _sessions:
             await _session(adapter, key, plan)
         return False
     _arm(adapter, key, plan)
@@ -848,7 +846,7 @@ async def settle_row(adapter: Any, sub: dict, kind: str, result: str = "") -> No
     if plan is not None and await _settle_current(adapter, key, plan, card, kind, status, done, result):
         sender = plan
     if sender is not None:
-        await _session(adapter, key, sender, force=True)
+        await _session(adapter, key, sender)
     elif plan is None and not _lapsed.get(key):
         # An archive with no row in this process is cleanup of a card that
         # finished long ago, not a settle: the thread may hold another card.

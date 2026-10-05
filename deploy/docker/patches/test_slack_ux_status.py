@@ -711,6 +711,32 @@ class PlanTest(_RuntimeCase):
         _run(runtime.settle_row(adapter, _sub("t_a"), "completed"))
         self.assertEqual(self._sent(adapter), ["suspended", "processing", "suspended", "closed"])
 
+    def test_a_blocked_card_resuming_by_first_refused_note_sends_processing_and_completing_clears(self):
+        # A card blocking after restart sets orphan suspended status. Its first note
+        # creates a plan whose post is refused; the refused-first-post arm in deliver_row
+        # transitions session status to processing, and completing clears it to closed.
+        adapter = _Adapter(_Client(fail={"post"}))
+        _run(runtime.settle_row(adapter, _sub(), "blocked"))
+        self.assertEqual(self._sent(adapter), ["suspended"])
+        self.assertFalse(self._note(adapter, 1, "resumed"))
+        self.assertEqual(self._sent(adapter), ["suspended", "processing"])
+        _run(runtime.settle_row(adapter, _sub(), "completed"))
+        self.assertEqual(self._sent(adapter), ["suspended", "processing", "closed"])
+
+    def test_a_closed_thread_starting_a_rolling_card_after_refused_post_sends_processing(self):
+        # When a turn ends and clears the session to closed, a subsequent card whose
+        # plan post is refused transitions from closed to processing upon delivering its note.
+        adapter = _Adapter(_Client(fail={"post"}))
+        _run(runtime.set_thread_status(
+            adapter, CHANNEL, "T1", THREAD, "", runtime.PLAN_STATUS_LABEL,
+            lambda c: c.agents_sessions_setStatus, lambda c: c.agents_sessions_rename,
+        ))
+        self.assertEqual(self._sent(adapter), ["closed"])
+        self.assertFalse(self._note(adapter, 1, "reading logs"))
+        self.assertEqual(self._sent(adapter), ["closed", "processing"])
+        _run(runtime.settle_row(adapter, _sub(), "completed"))
+        self.assertEqual(self._sent(adapter), ["closed", "processing", "closed"])
+
     def test_an_unblocked_card_on_unposted_plan_sends_default_text_to_legacy_setter(self):
         # On a client without Agent Sessions, an unblocked card on an unposted plan
         # passes adapter._default_status_text(None) to _set_thread_status, not literal "processing".
@@ -771,7 +797,7 @@ class PlanTest(_RuntimeCase):
             self.assertFalse(await runtime.deliver_row(adapter, _sub("t_b", thread="2.0"), 2, "b", "logs"))
             await asyncio.sleep(0.1)
             self.assertNotIn((CHANNEL, "1.0"), runtime._lapsed)
-            self.assertEqual(self._sent(adapter), ["suspended", "closed"])
+            self.assertEqual(self._sent(adapter), ["suspended", "closed", "closed"])
 
         adapter = _Adapter(_Client(fail={"post"}))
         with mock.patch.object(runtime, "PLANS_MAX", 1), mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05):
@@ -779,7 +805,7 @@ class PlanTest(_RuntimeCase):
 
     def test_posted_plan_lapsed_and_subsequent_unposted_plan_blocking_suspends_and_completing_clears(self):
         # A posted plan lapses, and a subsequent unposted plan on the same thread
-        # blocks: the session transitions from closed to suspended, and completing clears.
+        # blocks: the session transitions from closed to processing, suspended, and completing clears.
         async def scenario(adapter):
             self.assertTrue(await runtime.deliver_row(adapter, _sub("t_a"), 1, "check payments", "reading logs"))
             self.assertEqual(self._sent(adapter), ["processing"])
@@ -791,9 +817,9 @@ class PlanTest(_RuntimeCase):
             adapter.client.fail.add("post")
             self.assertFalse(await runtime.deliver_row(adapter, _sub("t_b"), 2, "check payments", "checking pods"))
             await runtime.settle_row(adapter, _sub("t_b"), "blocked")
-            self.assertEqual(self._sent(adapter), ["processing", "closed", "suspended"])
+            self.assertEqual(self._sent(adapter), ["processing", "closed", "processing", "suspended"])
             await runtime.settle_row(adapter, _sub("t_b"), "completed")
-            self.assertEqual(self._sent(adapter), ["processing", "closed", "suspended", "closed"])
+            self.assertEqual(self._sent(adapter), ["processing", "closed", "processing", "suspended", "closed"])
 
         adapter = _Adapter()
         with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05):
@@ -1089,7 +1115,7 @@ class PlanTest(_RuntimeCase):
         adapter = _Adapter(_Client(fail={"post"}))
         with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05):
             _run(scenario(adapter))
-        self.assertEqual(self._kinds(adapter), ["post"], "a plan that never posted sends no status")
+        self.assertEqual(self._kinds(adapter), ["post", "setStatus"], "lapsed unposted plan clears session")
 
     def test_eviction_takes_the_least_active_thread(self):
         adapter = _Adapter()
