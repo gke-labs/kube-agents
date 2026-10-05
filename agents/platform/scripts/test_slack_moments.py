@@ -267,6 +267,11 @@ class NeedsYouTest(unittest.TestCase):
         long = "https://github.com/kubernetes-sigs/cluster-api-provider-gcp/pull/1234"
         blocks, _ = m.needs_you(f"Which PR should I merge first?\n- [#412](https://github.com/acme/x/pull/412)\n- [#1234]({long})")
         self.assertEqual([(b["text"]["text"], b["value"]) for b in _buttons(blocks)], [("#412", "#412"), ("#1234", "#1234")])
+        self.assertEqual(_contexts(blocks)[0], f"- <https://github.com/acme/x/pull/412|#412>\n- <{long}|#1234>")
+
+    def test_options_without_a_link_are_not_repeated_in_the_detail(self):
+        blocks, _ = m.needs_you("Which cluster?\n- seeded-a\n- seeded-b")
+        self.assertEqual(_contexts(blocks), [m.WAITING])
 
     def test_a_glob_or_dunder_option_keeps_its_characters(self):
         blocks, _ = m.needs_you("Which pods?\n- Delete app=web-*\n- Keep `__pycache__`\n- Scale to 2*3")
