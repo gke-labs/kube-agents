@@ -326,10 +326,10 @@ func chunkCut(text string, size int) int {
 // adjustCutToCodeSpanStart moves cut back to the start of any code span
 // found by mdCodeSpanRE in (reopen+text) that contains cut (relative to text),
 // provided that the cut falls inside the span's opening delimiter, or the
-// span fits within budget and its start lies in the second half of the budget
-// (the same rule chunkCut applies to line breaks); otherwise cut is returned
-// unchanged so that spans longer than a chunk are split with balanced fences
-// as before without dragging the cut back unnecessarily.
+// span can be carried intact into the next chunk and its start lies in the second
+// half of the budget (the same rule chunkCut applies to line breaks); otherwise
+// cut is returned unchanged so that spans longer than a chunk, or spans whose closer
+// is followed by an unbroken line exceeding remaining budget, are not moved unnecessarily.
 // The scan is bounded to the prefix of text that can affect this cut, keeping
 // chunking linear in message size.
 func adjustCutToCodeSpanStart(reopen, text string, cut, budget int) int {
@@ -355,9 +355,15 @@ func adjustCutToCodeSpanStart(reopen, text string, cut, budget int) int {
 				openTicks++
 			}
 			insideOpener := cutInCand <= span[0]+openTicks
-			fitsIntact := (span[1]-span[0] <= budget) && (!mdFenceUnclosed(spanText) || textLimit == len(text))
+			spanStartInText := span[0] - len(reopen)
+			spanLen := span[1] - span[0]
+			closedOrComplete := !mdFenceUnclosed(spanText) || textLimit == len(text)
+			fitsIntact := false
+			if closedOrComplete && spanStartInText >= 0 && spanLen <= budget {
+				rest := text[spanStartInText:]
+				fitsIntact = len(rest) <= budget || chunkCut(rest, budget) >= spanLen
+			}
 			if insideOpener || fitsIntact {
-				spanStartInText := span[0] - len(reopen)
 				if spanStartInText >= budget/2 {
 					return spanStartInText
 				}

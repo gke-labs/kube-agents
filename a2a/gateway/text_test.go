@@ -91,9 +91,11 @@ func TestIsDelegate(t *testing.T) {
 // closer into the next chunk; no chunk exceeds the cap even with the fences
 // added; and the text between the inserted fences is the original, byte for
 // byte. When a cut falls inside a code span opening delimiter, or inside a
-// span that fits in a chunk whose start lies in the second half of the
-// budget, the cut moves back to the span start, keeping the span intact in the
-// next chunk; longer spans are split with balanced fences as before. The opener's
+// span that can be carried intact into the next chunk whose start lies in the second
+// half of the budget, the cut moves back to the span start, keeping the span intact in the
+// next chunk. A fenced block longer than a chunk is split with balanced fences
+// as before; a multi-line double-backtick span that cannot be moved is split with
+// its closer in the next chunk, tracked as a follow-up. The opener's
 // info string is not carried: a continuation of a yaml block reopens with ``` alone.
 func TestChatChunksKeepFencesBalanced(t *testing.T) {
 	logs := strings.Repeat("log line\n", 300)
@@ -275,8 +277,12 @@ func TestChatChunksLongSpanNotMovedWhenExceedingBudget(t *testing.T) {
 // empty code blocks in later chunks (#2288).
 func TestChatChunksContinuationAfterFencedBlock(t *testing.T) {
 	// A 400-line fenced block whose remaining lines in chunk 2 close at offset
-	// 1711 (in the second half of budget 1897), followed by 150 lines of prose.
-	in := "```\n" + strings.Repeat("log line\n", 400) + "```\n" + strings.Repeat("prose line with **bold** and <https://a.example|link>\n", 150)
+	// 1711 (in the second half of budget 1897), followed by 20 lines of prose:
+	// enough that the remainder needs a further cut, short enough that the text
+	// after the closer fits in one chunk, so the scan window reaches the end of
+	// the text and only the reopen prefix keeps the closer from reading as an
+	// opener (a longer tail is rejected by the span length bound alone).
+	in := "```\n" + strings.Repeat("log line\n", 400) + "```\n" + strings.Repeat("prose line with **bold** and <https://a.example|link>\n", 20)
 	chunks := chatChunks(in, discordChunk)
 	if len(chunks) < 3 {
 		t.Fatalf("got %d chunks, want >= 3", len(chunks))
@@ -300,6 +306,28 @@ func TestChatChunksContinuationAfterFencedBlock(t *testing.T) {
 	// Verify round trip unchunking
 	if got := unchunk(t, "continuation after fence", chunks, in); got != in {
 		t.Errorf("unchunked text does not match original")
+	}
+}
+
+// TestChatChunksSpanFollowedByLongUnbrokenLineNotMoved verifies that a span
+// whose closer is followed by unbroken text exceeding the remaining budget
+// is not moved back when the next iteration would split it anyway.
+func TestChatChunksSpanFollowedByLongUnbrokenLineNotMoved(t *testing.T) {
+	// 1000 bytes of 10-byte prose lines, then "``" + 132 filler lines + "end``" (1591 bytes),
+	// followed on that same line by 400 bytes of prose before a newline.
+	// Moving the cut back to 1000 would produce 3 chunks because the next iteration's
+	// cut would land inside the 1591-byte span at byte 1585. Not moving the cut keeps
+	// it at 2 chunks.
+	intro := strings.Repeat("012345678\n", 100)                    // 1000 bytes
+	span := "``" + strings.Repeat("filler line\n", 132) + "end``" // 1591 bytes
+	trailing := strings.Repeat("a", 400) + "\n"                   // 401 bytes
+	text := intro + span + trailing
+	chunks := chatChunks(text, discordChunk)
+	if len(chunks) != 2 {
+		t.Fatalf("got %d chunks, want 2", len(chunks))
+	}
+	if len(chunks[0]) > discordChunk {
+		t.Errorf("chunk 1 len = %d, exceeds discord cap %d", len(chunks[0]), discordChunk)
 	}
 }
 
