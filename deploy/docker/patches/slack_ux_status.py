@@ -881,6 +881,8 @@ async def _settle_orphan(adapter: Any, sub: dict, key: tuple, status: str | None
     elif status == _status.TASK_PENDING:
         wanted = _status.SESSION_SUSPENDED
     else:
+        # The card runs again, so a wait whose send failed is over too.
+        _orphan_waits.pop(key, None)
         return
     sent = _sessions.get(key)
     setter = getattr(adapter, "_set_thread_status", None)

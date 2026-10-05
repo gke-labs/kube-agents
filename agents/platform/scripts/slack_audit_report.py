@@ -313,13 +313,10 @@ def needs_fold(report: str, headline: str) -> bool:
     return _plain(line).rstrip(LEDGER_SEPARATORS).strip() not in headline
 
 
-def _new_count(line: str) -> int | None:
-    """The one "<n> new" count in the report's ledger line: 0 when there is none,
-    None when there are several (a count by severity), which no single number states."""
-    counts = NEW_COUNT.findall(line)
-    if len(counts) > 1:
-        return None
-    return int(counts[0]) if counts else 0
+def _new_count(line: str) -> int:
+    """How many findings the report's ledger line calls new: its "<n> new" counts
+    summed, since a count by severity ("1 new critical, 2 new major") states several."""
+    return sum(int(count) for count in NEW_COUNT.findall(line))
 
 
 def _states_a_change(line: str) -> bool:
@@ -483,7 +480,7 @@ def _parse_issue(issue: dict, report: str) -> AuditReport | None:
     name = _row_text(title.group("name")).strip()
     count, critical = int(title.group("count")), int(title.group("critical"))
     line = _ledger_line(report)
-    if (_new_count(line) or 0) > count:
+    if _new_count(line) > count:
         return None  # a stale or wrong ledger: the report has more new findings than it lists
     total = _findings_total(line)
     if total is not None and total != count:
@@ -553,7 +550,7 @@ def _clean_name(issue: dict, report: str) -> str | None:
     if not title:
         return None
     line = _ledger_line(report)
-    if (_findings_total(line) or 0) or (_new_count(line) or 0) or any(int(n) for n in SEVERITY_COUNT.findall(line)):
+    if (_findings_total(line) or 0) or _new_count(line) or any(int(n) for n in SEVERITY_COUNT.findall(line)):
         return None
     return _row_text(title.group("name")).strip()
 
@@ -621,8 +618,11 @@ def _untagged(title: str) -> str:
 
 def _row(finding: Finding) -> dict:
     tag = NEW_TAG if finding.new else ""
-    text = _untagged(_row_text(finding.title))
-    return {"severity": finding.severity, "text": _balanced_clip(text, FINDING_ROW_MAX - len(tag)) + tag}
+    text = _balanced_clip(_untagged(_row_text(finding.title)), FINDING_ROW_MAX - len(tag))
+    if text.endswith(ELLIPSIS):
+        # A clip can end on a tag the title carried mid-way.
+        text = _untagged(text[: -len(ELLIPSIS)]) + ELLIPSIS
+    return {"severity": finding.severity, "text": text + tag}
 
 
 def _card(parsed: AuditReport) -> Card:

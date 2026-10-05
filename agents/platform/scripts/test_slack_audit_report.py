@@ -221,6 +221,13 @@ class HeadlineFromIssueTest(unittest.TestCase):
                 lines = sar.headline_from_issue(dict(ISSUE, body=body), REF, REPORT).splitlines()
                 self.assertEqual(lines[2], f"`critical` {kept}")
 
+    def test_a_clip_cannot_end_a_title_on_a_tag_it_carried(self):
+        title = "A" * (sar.FINDING_ROW_MAX - 11) + " · _new_ " + "B" * 10
+        body = "### Critical (1)\n\n" + finding(title, "long")
+        issue = dict(ISSUE, title="[audit] Security & RBAC Posture Audit — 1 finding (1 critical)", body=body)
+        row = sar.headline_from_issue(issue, REF, f"Security audit: 1 resolved — {LEDGER}").splitlines()[1]
+        self.assertNotIn("new", row)
+
     def test_the_tag_survives_a_title_clipped_to_the_row(self):
         title = "x" * 400
         body = "### Critical (1)\n\n" + finding(title, "long", new=True)
@@ -295,6 +302,10 @@ class HeadlineFromIssueTest(unittest.TestCase):
         )
         self.assertIsNone(sar.headline_from_issue(dict(ISSUE, state=""), REF, ""))
         self.assertIsNone(sar.headline_from_issue(dict(ISSUE, state="closed", labels=["bug"]), REF, ""))
+        self.assertIsNone(
+            sar.headline_from_issue(dict(ISSUE, state="closed"), REF, f"Audit: 1 new critical, 2 new major — {LEDGER}")
+        )
+
     def test_an_issue_without_the_ledger_label_does_not_parse(self):
         self.assertIsNone(sar.headline_from_issue(dict(ISSUE, labels=["bug"]), REF, REPORT))
         self.assertIsNone(sar.headline_from_issue(dict(ISSUE, labels=None), REF, REPORT))
@@ -495,9 +506,12 @@ class HeadlineFromIssueTest(unittest.TestCase):
     def test_a_skipped_table_outside_the_scope_section_is_not_read(self):
         # A finding's model-written text may carry a table of its own.
         body = BODY.replace("\n### Skipped\n\n", "\n### Skipped\n\n| `seeded-z` | unreachable |\n\n")
-        text = sar.headline_from_issue(dict(ISSUE, body=body), REF, REPORT)
-        self.assertIsNone(gap_line(text))
-        self.assertNotIn("seeded-z", text)
+        # The second is a Scope with nothing skipped, so the finding's table is the first one after it.
+        for body in (body, "## Scope\n\nEvery cluster was audited.\n\n## Findings\n\n" + body):
+            with self.subTest(body=body[:20]):
+                text = sar.headline_from_issue(dict(ISSUE, body=body), REF, REPORT)
+                self.assertIsNone(gap_line(text))
+                self.assertNotIn("seeded-z", text)
 
     def test_a_title_counting_fewer_criticals_than_listed_counts_the_listed(self):
         issue = dict(ISSUE, title="[audit] Security & RBAC Posture Audit — 7 findings (1 critical)")
@@ -965,6 +979,7 @@ class BlocksFromIssueTest(unittest.TestCase):
             ("closed", dict(ISSUE, state="closed"), REPORT),
             ("unlabelled", dict(ISSUE, labels=["bug"]), REPORT),
             ("stale", ISSUE, f"Security audit: 9 new — {LEDGER}"),
+            ("stale by severity", ISSUE, f"Security audit: 5 new critical, 4 new major — {LEDGER}"),
             ("old total", ISSUE, f"Security audit: 0 findings across 2 of 3 clusters — {LEDGER}"),
             ("zero", dict(ISSUE, title="[audit] Cost Audit — 0 findings (0 critical)"), LEDGER),
             ("none listed", dict(ISSUE, body="Summary."), REPORT),
