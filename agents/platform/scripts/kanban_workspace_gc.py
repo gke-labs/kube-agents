@@ -65,7 +65,8 @@ TERMINAL = ("done", "archived", "failed", "cancelled")
 TASK_DIR = re.compile(r"^t_[0-9a-f]+$")
 
 # `ls` and `rm` by absolute path, so the sandbox command cannot be redirected by
-# the model's ~/.bashrc. Bash sources it even for `ssh host cmd`, and this is
+# a ~/.bashrc the model wrote, which older sandbox images allow. Bash sources it
+# even for `ssh host cmd`, and this is
 # the one call in the repository that authenticates as the model's own account
 # (see `_sandbox_names`), but a bash function name cannot contain a slash and a
 # non-interactive shell does not expand aliases, so neither of these two can be

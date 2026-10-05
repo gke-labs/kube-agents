@@ -69,15 +69,13 @@ volume), which is exactly where a worker refused by ``skill_manage`` went
 next when this change was first run against the bench case.
 
 What this does not close: writers that run in the sandbox. A shell command,
-or ``execute_code``, can still ``sed -i`` the sandbox's copy for as long as
-that sandbox pod runs, and a symlink made in the sandbox is invisible to the
-file guard's ``realpath``, which runs on the gateway. That edit never reaches
-the gateway (the writeback channel is closed at the sandbox end, see
-``docs/designs/agent-shell-sandboxing.md``) and is replaced from the image
-when the sandbox restarts. The bench case's safeguard counts only a
-successful ``skill_manage`` write, so it does not observe these routes;
-closing them needs the sandbox's copy to be read-only, a change to the
-sandbox (gke-labs/kube-agents#2096).
+``execute_code``, or a file tool writing through a symlink made in the
+sandbox (invisible to the file guard's ``realpath``, which runs on the
+gateway) never reaches this module. The sandbox closes those itself: its copy
+of the trees is root-owned and mounted read-only (see "The delivered trees
+are read-only mounts" in ``docs/designs/agent-shell-sandboxing.md``). The
+bench case's safeguard counts only a successful ``skill_manage`` write;
+``platform-worker-shell-edit-of-shipped-skill`` grades the sandbox's copy.
 """
 
 from __future__ import annotations

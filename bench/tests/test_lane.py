@@ -197,6 +197,17 @@ def test_the_cli_prints_case_and_path_per_task_and_fails_loudly(tmp_path, capsys
     assert capsys.readouterr().out.splitlines() == [f"{LISTED_COUNT} {READ_ONLY_CASE} {tmp_path / 'listed' / READ_ONLY_CASE / 'task.yaml'}"]
 
 
+def test_list_requesting_prints_the_counts_and_writes_nothing(tmp_path, capsys):
+    """The api lane orders its second phase by this, with no copies made."""
+    listed_file = scratch_lane_file(tmp_path, {READ_ONLY_CASE: LISTED_COUNT})
+    rc = lane.main(["--safeguards", str(listed_file), "--list-requesting", str(TASKS / READ_ONLY_CASE / "task.yaml"), str(TASKS / REQUESTING_CASE / "task.yaml")])
+    assert rc == 0
+    assert capsys.readouterr().out.splitlines() == [f"{LISTED_COUNT} {READ_ONLY_CASE}", f"1 {REQUESTING_CASE}"]
+    assert not any(tmp_path.rglob("task.yaml"))
+    with pytest.raises(SystemExit):
+        lane.main(["--safeguards", str(LANE_FILE), str(TASKS / READ_ONLY_CASE / "task.yaml")])
+
+
 def scratch_lane_file(tmp_path: Path, requesting: dict[str, int]) -> Path:
     """The real lane file's safeguards under a `requesting:` mapping of our own."""
     path = tmp_path / "lane-with-requesting.yaml"

@@ -36,7 +36,7 @@ _PROGRESS_DEADLINE_EXCEEDED = 'error: deployment "platform-agent-gateway" exceed
 # scope, so a developer's shell holding a non-integer would error every test in the class
 # rather than fail one; the rest are pinned so the import does not vary by machine.
 _IMPORT_ENV = {
-    "GATEWAY_ROLLOUT_TIMEOUT_SEC": "900",
+    "GATEWAY_ROLLOUT_TIMEOUT_SEC": "1500",
     "TEST_TIMEOUT_SEC": "120",
     "POLL_INTERVAL_SEC": "5",
     "AGENT_NAMESPACE": _NAMESPACE,

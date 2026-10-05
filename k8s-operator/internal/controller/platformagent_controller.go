@@ -153,6 +153,13 @@ const (
 	reasonContainerCreating = "ContainerCreating"
 	reasonPodInitializing   = "PodInitializing"
 	reasonContainerError    = "Error"
+	reasonCrashLoopBackOff  = "CrashLoopBackOff"
+
+	// a2aVerifierContainerName is the verifier Deployment's only container
+	// (buildA2AVerifierDeployment). The pod scan names it to tell the one
+	// crash loop that is the a2a stack still coming up from a real fault;
+	// see getDeploymentStatusDetails.
+	a2aVerifierContainerName = "verifier"
 
 	// The condition reporting that cluster event ingestion has been switched off
 	// on the spec. It is written only in that state — see updateStatusReady.
@@ -745,7 +752,8 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// The mode gate: `next` additionally renders the A2A stack -- NATS, the
-	// auth callout, the gateway, the provisioning Job; `today` keeps the
+	// auth callout, the gateway, the capability verifier, the provisioning
+	// Job; `today` keeps the
 	// dark stack dark — including tearing it
 	// back down after a flip, so `mode` absent renders exactly today's stack
 	// rather than today's stack plus leftovers. Version skew touches NEITHER
@@ -3132,6 +3140,81 @@ func setA2AGatewayCondition(agent *agentv1alpha1.PlatformAgent, dark string, now
 	})
 }
 
+// a2aVerifierNotReady reports whether the CR should carry the A2AVerifier
+// condition: the stack is rendered, the verifier Deployment exists, and no
+// replica of it is ready.
+//
+// Existence is part of the test on purpose. An absent Deployment is the
+// ordinary shape of a pass that has not rendered it yet, and reconcileA2A
+// creates it every pass, so "absent" is not a state an install sits in --
+// whereas reporting it would put the condition on every install for the
+// first seconds of its life. What this is for is the durable case: the
+// Deployment is there and its pods cannot run.
+//
+// The second result is whether this pass has an answer at all, and it is the
+// reason "not ready" is not a plain bool. A read error leaves the condition
+// alone rather than asserting either way: the API server being unreachable is
+// not a fact about the verifier, it is already the reconcile's problem, and
+// the next pass re-reads. Returning false for it would not be neutral --
+// setA2AVerifierCondition REMOVES the condition on false -- so a single
+// transient Get error on a settled install would clear a correct "the verifier
+// has no ready replica" off the CR and report the stack healthy until the next
+// pass put it back.
+//
+// An absent Deployment is a real answer (not ready is false; see above) and a
+// read error is not, so NotFound is not folded in with the rest.
+func (r *PlatformAgentReconciler) a2aVerifierNotReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (notReady, known bool) {
+	if !a2aStackRendering(agent) {
+		return false, true
+	}
+	verifier := &appsv1.Deployment{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aVerifierName(agent)}, verifier); err != nil {
+		if errors.IsNotFound(err) {
+			return false, true
+		}
+		return false, false
+	}
+	return verifier.Status.ReadyReplicas == 0, true
+}
+
+// a2aVerifierConditionCurrent reports whether the CR's A2AVerifier condition
+// already says what this pass would write.
+func a2aVerifierConditionCurrent(agent *agentv1alpha1.PlatformAgent, notReady, known bool) bool {
+	// Unknown contributes no change: this pass would not touch the
+	// condition, so it cannot be the reason to write status.
+	if !known {
+		return true
+	}
+	existing := meta.FindStatusCondition(agent.Status.Conditions, a2aVerifierConditionType)
+	if !notReady {
+		return existing == nil
+	}
+	return existing != nil && existing.Status == metav1.ConditionFalse &&
+		existing.Reason == a2aVerifierNotReadyReason
+}
+
+// setA2AVerifierCondition writes the verifier condition on the same
+// present-while-it-holds pattern as A2AGateway. Not Degraded, and not a Ready
+// row: see a2aVerifierConditionType for why the CR stays Ready through this.
+func setA2AVerifierCondition(agent *agentv1alpha1.PlatformAgent, notReady, known bool, now metav1.Time) {
+	// No answer this pass, so whatever the CR already says stands.
+	if !known {
+		return
+	}
+	if !notReady {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aVerifierConditionType)
+		return
+	}
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type:               a2aVerifierConditionType,
+		Status:             metav1.ConditionFalse,
+		Reason:             a2aVerifierNotReadyReason,
+		Message:            a2aVerifierNotReadyMessage,
+		ObservedGeneration: agent.Generation,
+		LastTransitionTime: now,
+	})
+}
+
 // wantBusProvisioned is the provisioned-once record's desired presence:
 // sticky under next once this pass or an earlier one saw the Job complete,
 // absent under today, where the flip's teardown took the bus with it.
@@ -3184,12 +3267,15 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 		dark = a2a.gatewayDarkReason
 	}
 	want := wantBusProvisioned(agent, a2a)
-	if a2aGatewayConditionCurrent(agent, dark) && busProvisionedConditionCurrent(agent, want) {
+	verifierNotReady, verifierKnown := r.a2aVerifierNotReady(ctx, agent)
+	if a2aGatewayConditionCurrent(agent, dark) && busProvisionedConditionCurrent(agent, want) &&
+		a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown) {
 		return nil
 	}
 	now := metav1.Now()
 	setA2AGatewayCondition(agent, dark, now)
 	setBusProvisionedCondition(agent, want, a2a.jobName, now)
+	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	return r.Status().Update(ctx, agent)
 }
 
@@ -3309,7 +3395,16 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 			}
 		}
 	case errWorkload == nil:
-		if phaseOverride, reasonOverride, msgOverride := r.getDeploymentStatusDetails(ctx, agent); reasonOverride != "Provisioning" {
+		// The bucket question the scan asks is "has this install ever
+		// provisioned the bus", not "did this pass watch the Job finish".
+		// a2a.done is only the latter: the Job carries a 24h
+		// TTLSecondsAfterFinished and a spec-digested name, so it is reaped
+		// daily and re-rendered on any operator upgrade that changes the
+		// digest, and done is false for the whole re-run while the bucket
+		// has existed the entire time. busProvisioned is the sticky record
+		// of the first completion, and the disjunction is the same one
+		// readSplitWorkloads and wantBusProvisioned already use.
+		if phaseOverride, reasonOverride, msgOverride := r.getDeploymentStatusDetails(ctx, agent, a2a.done || busProvisioned(agent)); reasonOverride != "Provisioning" {
 			newPhase = phaseOverride
 			condReason = reasonOverride
 			condMsg = msgOverride
@@ -3432,6 +3527,17 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// The provisioned-once record, same shape (wantBusProvisioned).
 	busProvisionedWanted := wantBusProvisioned(agent, a2a)
 	busProvisionedUnchanged := busProvisionedConditionCurrent(agent, busProvisionedWanted)
+	// The verifier term has to be computed here, with the others, rather than
+	// read at the write below: the early return a few lines down is what
+	// decides whether there is a write at all. Left out of the check, the
+	// condition is only ever written on a pass that some *other* status change
+	// already dirtied -- so on a settled Ready install, the one state it exists
+	// to report (verifier loses its last replica, nothing else moves) never
+	// reaches status, and the recovery never clears it. That is the shape the
+	// A2AGateway and BusProvisioned terms above are in, and for the same
+	// reason.
+	verifierNotReady, verifierKnown := r.a2aVerifierNotReady(ctx, agent)
+	a2aVerifierUnchanged := a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown)
 
 	existingCond := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
 	existingDegradedCond := meta.FindStatusCondition(agent.Status.Conditions, "Degraded")
@@ -3473,6 +3579,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		hostPathDroppedUnchanged &&
 		a2aGatewayUnchanged &&
 		busProvisionedUnchanged &&
+		a2aVerifierUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&
 		existingCond.ObservedGeneration == agent.Generation {
 		return newPhase, nil
@@ -3546,6 +3653,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 
 	setA2AGatewayCondition(agent, a2aGatewayDark, now)
 	setBusProvisionedCondition(agent, busProvisionedWanted, a2a.jobName, now)
+	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 
 	if err := r.Status().Update(ctx, agent); err != nil {
 		return newPhase, err
@@ -3823,7 +3931,14 @@ func networkPolicyStatusUnchanged(status agentv1alpha1.NetworkPolicyStatus, prof
 	return true
 }
 
-func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (phase string, reason string, message string) {
+// capBucketProvisioned is "this install has provisioned the bus at least
+// once", which is this operator's only cheap proxy for "the capability bucket
+// exists". It qualifies exactly one container's crash loop; see the verifier
+// paragraph below. Callers pass the sticky reading -- a2a.done for the pass
+// that watched the Job finish, OR the provisioned-once record for every pass
+// after it -- because the Job is reaped and re-rendered while the bucket it
+// made stays put.
+func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context, agent *agentv1alpha1.PlatformAgent, capBucketProvisioned bool) (phase string, reason string, message string) {
 	phase = "Provisioning"
 	reason = "Provisioning"
 	message = "Waiting for deployment replicas to be ready"
@@ -3858,6 +3973,35 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	// the skew itself -- a second reason there would report the freeze as a fault.
 	if a2aStackRendering(agent) {
 		selectors = append(selectors, map[string]string{"app": a2aGatewayName(agent)})
+	}
+
+	// The verifier, for the opposite reason to the gateway's and so worth its own
+	// paragraph: it is scanned precisely because it does NOT gate Ready.
+	//
+	// readSplitWorkloads leaves it out on purpose -- a verifier rollout should not
+	// flip a serving install to Provisioning, and the CRD page says so. But every
+	// executor turns a Check that gets no answer into a terminal rejected, so a
+	// verifier stuck in ImagePullBackOff refuses every submission while the CR
+	// reports Ready=True. Not gating is the decision; reporting nothing is not.
+	// Scanned, the operator at least reads the container fault instead of a green
+	// CR and a bus that rejects everything.
+	//
+	// The reference is a2aReleaseImage's: A2A_VERIFIER_IMAGE if set, else derived
+	// from the operator's tag, else from the agent image (b1ee482e graduated it off
+	// the private dev-registry default it had when this paragraph was first
+	// written). All three rungs can name something unpullable -- an override typo,
+	// a release whose verifier image was never pushed, an unreachable registry --
+	// so the fault stays worth scanning for; it is just no longer the default.
+	//
+	// This is the one selector here whose pod is not counted toward Ready, so it
+	// cannot by itself move a CR off Ready, and the ordering note above still
+	// holds. It CAN move the phase, though, which is the thing to keep in mind
+	// when reading the paragraph above as a safety argument: the reason it adds
+	// turns a Provisioning into a Degraded an operator will act on. That is
+	// wanted for an unoverridden image and wrong for the bucket wait, and the
+	// pod loop below draws the line.
+	if a2aStackRendering(agent) {
+		selectors = append(selectors, map[string]string{"app": a2aVerifierName(agent)})
 	}
 
 	pods := make([]corev1.Pod, 0)
@@ -3896,7 +4040,46 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 		initThenApp := make([]corev1.ContainerStatus, 0, len(pod.Status.InitContainerStatuses)+len(pod.Status.ContainerStatuses))
 		initThenApp = append(initThenApp, pod.Status.InitContainerStatuses...)
 		initThenApp = append(initThenApp, pod.Status.ContainerStatuses...)
+		// A verifier crash loop in the window before the provision Job completes
+		// is the a2a stack still coming up, not a fault, and it is the one crash
+		// loop here the scan has to not report.
+		//
+		// The two dependencies the verifier can outrun no longer restart it at
+		// all: a bus that is not answering yet and a bucket the Job has not
+		// created yet are both waited out in-process (a2a/cmd/verifier's
+		// bindStore). What can still end the process in this same window is
+		// authentication. reconcileA2A applies the callout one step before the
+		// verifier, and applying it is not the same as it serving; a bus that
+		// refuses the same identity twice running aborts nats.go's reconnect
+		// loop for good (processAuthError), which the verifier answers by
+		// exiting so the pod restarts. That is right of the verifier and
+		// transient on a fresh install. Meanwhile `notReady` holds "bus
+		// provisioning" until the Job completes, which keeps updateStatusReady
+		// in the `case errWorkload == nil:` arm -- the arm that calls this scan.
+		// So without this, a fresh `next` install can spend that window
+		// reporting Degraded/CrashLoopBackOff for a stack that is merely not up
+		// yet. Before the verifier joined the selectors that window read
+		// Provisioning, and it has to go on reading Provisioning.
+		//
+		// Narrow on purpose, three ways: this container, this reason, and only
+		// while the bucket is unprovisioned. ImagePullBackOff on the verifier is
+		// a real fault at any time -- it is the fault this selector was added
+		// for, and unreachable at any of a2aReleaseImage's three rungs -- and a
+		// crash loop that outlives the install's first provisioning is the
+		// verifier failing at something other than coming up -- which is why
+		// capBucketProvisioned has to be the sticky reading and not this
+		// pass's Job status, or a TTL re-run would file a real fault here.
+		//
+		// Suppressing rather than skipping the pod: a verifier pod can carry a
+		// genuine fault on another container in the same window, and the loop
+		// below still has to find it.
+		crashIsTheBucketWait := !capBucketProvisioned && pod.Labels["app"] == a2aVerifierName(agent)
+
 		for _, cs := range initThenApp {
+			if crashIsTheBucketWait && cs.Name == a2aVerifierContainerName &&
+				cs.State.Waiting != nil && cs.State.Waiting.Reason == reasonCrashLoopBackOff {
+				continue
+			}
 			if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" &&
 				cs.State.Waiting.Reason != reasonContainerCreating && cs.State.Waiting.Reason != reasonPodInitializing {
 				phase = "Degraded"

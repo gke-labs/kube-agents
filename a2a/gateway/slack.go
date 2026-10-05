@@ -181,15 +181,18 @@ type SlackAdapter struct {
 	seenOrder []string
 }
 
-// slackLinkRE rewrites the markdown links the relay emits into mrkdwn's
-// <url|text> form; anything fancier is presentation polish, not this card.
-// The URL class excludes `|`: Slack splits the generated <url|text> at its
-// first pipe, so a crafted link whose URL carried one would render as a link
-// to a truncated target under display text of the URL's own choosing. `<`
-// and `>` are already escaped before this runs (toMrkdwn), so the pipe is
-// the one character left to refuse; it is not legal in a URL unencoded, so
-// refusing it costs nothing real.
-var slackLinkRE = regexp.MustCompile(`\[([^\]\n]+)\]\((https?://[^)\s|]+)\)`)
+// slackLinkRE matches the markdown links the relay emits, for rewriteLinks
+// to turn into mrkdwn's <url|text> form; anything fancier is presentation
+// polish, not this card. The URL class excludes `|`: Slack splits the
+// generated <url|text> at its first pipe, so a crafted link whose URL carried
+// one would render as a link to a truncated target under display text of the
+// URL's own choosing. `<` and `>` are already escaped before this runs
+// (toMrkdwn), so the pipe is the one character left to refuse; it is not
+// legal in a URL unencoded, so refusing it costs nothing real. The class
+// admits one level of balanced parentheses, which CommonMark admits in a
+// destination and documentation URLs carry (`.../wiki/Foo_(bar)`); ending at
+// the first `)` made those a link to a 404 with a stray `)` after it.
+var slackLinkRE = regexp.MustCompile(`\[([^\]\n]+)\]\((https?://(?:[^()\s|]|\([^()\s|]*\))+)\)`)
 
 // slackConversationID is the backend-qualified session key. A channel is
 // not a session; a thread in it is — and Slack threads are implicit
@@ -222,14 +225,17 @@ func slackChannelThread(conversation string) (channel, threadTS string, ok bool)
 
 // toMrkdwn escapes Slack's control characters, then translates the two
 // markdown forms the relay emits (bold pairs, links) into mrkdwn. Escaping
-// first, so the only < and > on the wire are the ones our own deterministic
-// link translation writes. Narrow on purpose: full markdown fidelity is
+// first, over the whole text, so the only < and > on the wire are the ones
+// our own deterministic link translation writes, and so a prompt-injected
+// <!channel> inside a code span is as inert as one in prose; the two
+// translations then leave code spans as written, since the task's result is
+// executor output of arbitrary shape and a `**kwargs` or a `**/*.yaml` in
+// it is the answer, not bold. The rules are the ones markdown.go holds for
+// both chat surfaces. Narrow on purpose: full markdown fidelity is
 // presentation polish, and the legacy Hermes path's converter is not this
 // code path's to reuse.
 func toMrkdwn(text string) string {
-	text = slackEscaper.Replace(text)
-	text = strings.ReplaceAll(text, "**", "*")
-	return slackLinkRE.ReplaceAllString(text, "<$2|$1>")
+	return rewriteMarkdown(slackEscaper.Replace(text), slackLinkRE)
 }
 
 var (

@@ -30,7 +30,24 @@ DEFAULTS="${SANDBOX_DEFAULTS:-/opt/defaults}"
 # /opt/data/scripts, which the machine home already carries. What the agent pod
 # does push in is the *empty* layout for every profile it has, including those —
 # deploy/shared/sandbox_mirror.py, which does know the list.
+#
+# The operator sets this on both containers from shellSandboxImageTreeHomes in
+# k8s-operator/internal/controller/shell_sandbox_manifests.go, the same constant
+# that generates the read-only mounts step 1a checks for. The default here has to
+# match it for a run outside that StatefulSet;
+# agents/platform/scripts/test_sandbox_delivery.py holds the two together.
 SANDBOX_HOME_ROOTS="${SANDBOX_HOME_ROOTS:-. profiles/platform}"
+
+# How the image trees reach the shell. `read-only-mounts` is what the operator's
+# StatefulSet sets: an init container running this script with
+# --prepare-image-trees has staged them root-owned on the volume, and the shell
+# container mounts each <home>/<tree> read-only over itself. Unset means nobody
+# made those mounts (a plain `docker run`, an older operator), and step 1a stages
+# the trees itself. Step 1a reads the mount table to check the first case.
+SANDBOX_IMAGE_TREES="${SANDBOX_IMAGE_TREES:-}"
+SANDBOX_MOUNTINFO="${SANDBOX_MOUNTINFO:-/proc/self/mountinfo}"
+IMAGE_TREES_READ_ONLY_MOUNTS="read-only-mounts"
+PREPARE_IMAGE_TREES_ARG="--prepare-image-trees"
 
 # The SQLite databases the agent pod keeps in each of those homes, which this
 # container has no copy of. Step 1b puts a directory at every one of them so a
@@ -41,9 +58,11 @@ AGENT_POD_DATABASES="${AGENT_POD_DATABASES:-kanban.db state.db}"
 AGENT_POD_DATABASE_NOTE="NOT-THE-AGENT-POD-DATABASE.txt"
 SANDBOX_FORWARDED_ENV_NAMES="CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_TOKEN_FILE KUBE_CONTEXT_NAME GKE_PROJECT_ID GKE_CLUSTER_NAME GKE_LOCATION"
 
-# Every name under $DATA is owned by uid 1000 and survives a pod recycle, so any
-# path below it that this script hands to root may be a symlink the model planted
-# on a previous boot. None of the three operations used below resolves anything
+# Nearly every name under $DATA is owned by uid 1000 -- the image trees step 1a
+# stages are root's, everything else is the model's -- and all of it survives a
+# pod recycle, so any path below it that this script hands to root may be a
+# symlink the model planted on a previous boot, or on a volume from before the
+# image trees were root-owned. None of the three operations used below resolves anything
 # but the path text: `cat >` opens with O_CREAT|O_TRUNC and follows the link,
 # `install -d` creates the target's parent chain, and `chown` follows it and
 # hands the target to the model. Pointed at /etc/ld.so.preload that is a
@@ -68,10 +87,13 @@ unlink_if_symlink() {
 # A plain file where a home root belongs is the same shape of permanent failure
 # as a planted link, and the symlink pass above does not reach it. `install -d`
 # below exits 71 on one — "exists but is not a directory" — and `set -e` takes
-# the container with it. Everything under $DATA is uid 1000's, so
+# the container with it. The home roots are uid 1000's, so on a volume from
+# before the operator mounted them, or in a run outside its StatefulSet,
 # `rm -rf /opt/data/profiles/platform && touch /opt/data/profiles/platform` from
 # a shell would stop this pod starting for good, and unlike the agent pod there
-# would then be nothing left to exec into and repair it with.
+# would then be nothing left to exec into and repair it with. Under the operator
+# the home roots are mount points and the rm stops at them, but the init
+# container still meets whatever an older volume holds.
 #
 # Moved aside rather than deleted, matching push_skeleton in
 # deploy/shared/sandbox_mirror.py: broken state either way, but it is the model's
@@ -133,6 +155,85 @@ clear_symlinks_under_data() {
   done
 }
 
+# One entry of $SANDBOX_HOME_ROOTS as a directory: `.` is $DATA itself.
+home_for_root() {
+  if [ "$1" = "." ]; then
+    echo "$DATA"
+  else
+    echo "$DATA/$1"
+  fi
+}
+
+# A home root, created if missing and handed to the model with every directory
+# between it and $DATA. Idempotent, so both modes below run it: the init
+# container because it is about to stage trees inside, the shell because the
+# model writes everything else in its home.
+prepare_home_root() {
+  local home="$1" dir
+  clear_symlinks_under_data "$home" 1
+  install -d -o agent -g agent "$home"
+  # -o/-g reach the last component only. `profiles/platform` therefore leaves
+  # $DATA/profiles owned by root, and 0755 root:root is readable and traversable
+  # enough that nothing looks wrong: the platform profile is agent-owned, the
+  # shell works, every skill works. What fails is creating anything *beside*
+  # platform, which is exactly what sandbox_mirror.py does — it extracts one
+  # home per profile the agent pod has, and each cluster profile is a mkdir in
+  # this directory. tar exits 2, the mirror raises before writing its marker,
+  # and the model's pre-upgrade files stay on the agent's volume where the
+  # shell can no longer see them. The only trace is a line in
+  # logs/sandbox_mirror.log. Walk back up to $DATA so the parents match the leaf.
+  #
+  # The walk starts at $home and not at its parent, so that the `.` root --
+  # where $home IS $DATA -- runs zero iterations. Starting one level up instead
+  # sends that case climbing out of the volume: /opt next, which owns
+  # /opt/credential-proxy, and an agent-owned /opt is uid 1000 able to rename
+  # the shims aside and put its own there.
+  dir="$home"
+  while [ "$dir" != "$DATA" ] && [ "$dir" != "/" ] && [ "$dir" != "." ]; do
+    chown agent:agent "$dir"
+    dir="$(dirname "$dir")"
+  done
+}
+
+# One image tree, replaced wholesale from $DEFAULTS and left root-owned with
+# nothing group- or other-writable. Never chowned to agent: the model runs these
+# files and must not be able to change them.
+#
+# The symlink pass reaches the tree path itself, not only its parents. Under the
+# operator this path becomes a mount point, and kubelet would follow a planted
+# link when it binds it. `rm -rf` then takes whatever else is there, a plain file
+# included, so the path that gets mounted is always the directory `cp` creates.
+stage_image_tree() {
+  local home="$1" name="$2"
+  clear_symlinks_under_data "$home/$name"
+  rm -rf "${home:?}/$name"
+  cp -a "$DEFAULTS/$name" "$home/$name"
+  chown -R root:root "$home/$name"
+  chmod -R go-w "$home/$name"
+}
+
+# Whether $1 is a mount point whose own options include `ro`, by the mount
+# table rather than by trying a write: a probe write that succeeded would be the
+# very edit this exists to rule out. Field 5 is the mount point and field 6 its
+# per-mount options. The last matching line wins, because a later mount over
+# the same path is the one a lookup reaches.
+mount_is_read_only() {
+  awk -v path="$1" '
+    $5 == path {
+      found = 1
+      ro = 0
+      n = split($6, opts, ",")
+      for (i = 1; i <= n; i++) if (opts[i] == "ro") ro = 1
+    }
+    END { exit !(found && ro) }
+  ' "$SANDBOX_MOUNTINFO"
+}
+
+# Whether anything is mounted at the path, whatever its options.
+mount_point_exists() {
+  awk -v path="$1" '$5 == path { found = 1 } END { exit !found }' "$SANDBOX_MOUNTINFO"
+}
+
 # 1. The model's durable directory. A PVC mounts over the image's /opt/data and
 #    arrives owned by root, so the agent could not write to it. Not recursive:
 #    only the mount point needs fixing, and a recursive chown over a volume that
@@ -142,6 +243,34 @@ if [ ! -d "$DATA" ]; then
   exit 1
 fi
 chown agent:agent "$DATA"
+
+# The init container's whole job, and nothing past it. The operator runs this
+# script with --prepare-image-trees in an init container that mounts only the
+# data volume, whole, and has a read-only root filesystem. It stages every tree
+# into every home root, root-owned, and exits. Kubelet resolves the shell
+# container's subPath mounts after that, when no model code has run yet, so the
+# read-only mounts land on exactly what was staged here.
+#
+# It exits before the marker below and before steps 2 to 4, so it writes
+# nothing outside $DATA: no authorized_keys, no host keys, no sshd drop-in.
+if [ "${1:-}" = "$PREPARE_IMAGE_TREES_ARG" ]; then
+  if [ ! -d "$DEFAULTS" ]; then
+    log "no $DEFAULTS in this image: there are no image trees to stage, and the"
+    log "shell container's read-only mounts over them would be empty."
+    exit 1
+  fi
+  for root in $SANDBOX_HOME_ROOTS; do
+    home="$(home_for_root "$root")"
+    prepare_home_root "$home"
+    for entry in "$DEFAULTS"/*; do
+      [ -e "$entry" ] || continue
+      stage_image_tree "$home" "$(basename "$entry")"
+    done
+    log "staged $(cd "$DEFAULTS" && echo *) from $DEFAULTS into $home, root-owned"
+  done
+  log "image trees prepared; the shell container mounts them read-only"
+  exit 0
+fi
 
 # Which /opt/data this is. The path is deliberately the same as the agent pod's
 # Hermes home so that a script naming it resolves wherever it runs, and the cost
@@ -170,54 +299,83 @@ chown agent:agent "$DATA/.sandbox"
 #     looking current for as long as the PVC lives — the same failure the agent
 #     pod's step 2.6a exists to prevent, arriving here by the same route. The
 #     model's own files belong in $DATA/scratch and $DATA/gitops, which this does
-#     not touch; a helper it writes into $DATA/scripts is gone at the next start,
-#     and that is the contract rather than an accident.
+#     not touch.
+#
+#     The trees are the image's, not the model's. The model runs these files,
+#     and so does the agent pod's code when it reaches in over ssh, so an edit
+#     that stuck -- a changed forge.py, a planted helper in $DATA/scripts -- is
+#     code the next caller runs as if it had shipped. Under the operator they
+#     are root-owned read-only mounts: the model's write to a file gets EACCES,
+#     creating or removing one gets EROFS (as does any write by a uid that
+#     passes the permission check, root included), and renaming a tree aside
+#     gets EBUSY because it is a mount point. The operator also mounts profiles/ and profiles/platform over
+#     themselves, because rename(2) checks only the directory it renames: without
+#     those, `mv /opt/data/profiles x && mkdir -p profiles/platform/scripts`
+#     would replace a tree without touching it.
+#
+#     This step does not stage them in that case. The init container did, and
+#     this checks the result: every tree in every home must be a read-only
+#     mount, or the sandbox does not start. A missing mount fails as loudly as
+#     a writable one, because either way the model could change what it runs.
+#
+#     With SANDBOX_IMAGE_TREES unset nobody made those mounts, so this stages
+#     root-owned copies itself. That stops an in-place edit and not a rename:
+#     the model owns the home around each tree.
 #
 #     Not swallowed. A half-synced tree fails later and somewhere else — as a
 #     skill whose script is missing, or a stale one that no longer matches the
 #     SKILL.md the agent pod put in the prompt.
 #     Once per home root in $SANDBOX_HOME_ROOTS, so the same tree is reachable
 #     by the machine-home path and by the profile-home path the SOPs use. They
-#     are copies rather than symlinks: a symlinked profile tree makes an `rm -rf`
-#     inside one home delete the other's, and the model owns both.
+#     are copies rather than symlinks so that each is a real directory the
+#     operator can mount read-only on its own.
 if [ -d "$DEFAULTS" ]; then
   for root in $SANDBOX_HOME_ROOTS; do
-    if [ "$root" = "." ]; then
-      home="$DATA"
-    else
-      home="$DATA/$root"
-    fi
-    clear_symlinks_under_data "$home" 1
-    install -d -o agent -g agent "$home"
-    # -o/-g reach the last component only. `profiles/platform` therefore leaves
-    # $DATA/profiles owned by root, and 0755 root:root is readable and traversable
-    # enough that nothing looks wrong: the platform profile is agent-owned, the
-    # shell works, every skill works. What fails is creating anything *beside*
-    # platform, which is exactly what sandbox_mirror.py does — it extracts one
-    # home per profile the agent pod has, and each cluster profile is a mkdir in
-    # this directory. tar exits 2, the mirror raises before writing its marker,
-    # and the model's pre-upgrade files stay on the agent's volume where the
-    # shell can no longer see them. The only trace is a line in
-    # logs/sandbox_mirror.log. Walk back up to $DATA so the parents match the leaf.
-    #
-    # The walk starts at $home and not at its parent, so that the `.` root --
-    # where $home IS $DATA -- runs zero iterations. Starting one level up instead
-    # sends that case climbing out of the volume: /opt next, which owns
-    # /opt/credential-proxy, and an agent-owned /opt is uid 1000 able to rename
-    # the shims aside and put its own there.
-    dir="$home"
-    while [ "$dir" != "$DATA" ] && [ "$dir" != "/" ] && [ "$dir" != "." ]; do
-      chown agent:agent "$dir"
-      dir="$(dirname "$dir")"
-    done
-    for entry in "$DEFAULTS"/*; do
-      [ -e "$entry" ] || continue
-      name="$(basename "$entry")"
-      rm -rf "${home:?}/$name"
-      cp -a "$entry" "$home/$name"
-      chown -R agent:agent "$home/$name"
-    done
-    log "synced $(cd "$DEFAULTS" && echo *) from $DEFAULTS into $home"
+    home="$(home_for_root "$root")"
+    prepare_home_root "$home"
+    case $SANDBOX_IMAGE_TREES in
+    "$IMAGE_TREES_READ_ONLY_MOUNTS")
+      # The other half of the rename guarantee: every directory between $DATA
+      # and the home is mounted over itself, so it cannot be moved aside and
+      # the tree path recreated beneath a new one.
+      pin="$DATA"
+      for part in $(printf '%s\n' "$root" | tr '/' ' '); do
+        [ "$part" = . ] && continue
+        pin="$pin/$part"
+        if ! mount_point_exists "$pin"; then
+          log "$pin is not a mount point, and SANDBOX_IMAGE_TREES=$IMAGE_TREES_READ_ONLY_MOUNTS"
+          log "says it must be: without it the trees below it can be renamed away with"
+          log "it. Refusing to start; check the shell container's volumeMounts."
+          exit 1
+        fi
+      done
+      for entry in "$DEFAULTS"/*; do
+        [ -e "$entry" ] || continue
+        tree="$home/$(basename "$entry")"
+        if ! mount_is_read_only "$tree"; then
+          log "$tree is not a read-only mount, and SANDBOX_IMAGE_TREES=$IMAGE_TREES_READ_ONLY_MOUNTS"
+          log "says it must be. Refusing to start a shell that could change the"
+          log "code it runs; check the shell container's volumeMounts."
+          exit 1
+        fi
+      done
+      log "$(cd "$DEFAULTS" && echo *) in $home are read-only mounts"
+      ;;
+    "")
+      for entry in "$DEFAULTS"/*; do
+        [ -e "$entry" ] || continue
+        stage_image_tree "$home" "$(basename "$entry")"
+      done
+      log "synced $(cd "$DEFAULTS" && echo *) from $DEFAULTS into $home as root-owned"
+      log "copies. Nothing mounts them read-only outside the operator's StatefulSet,"
+      log "so the model can still rename a tree aside and put its own in its place."
+      ;;
+    *)
+      log "SANDBOX_IMAGE_TREES=$SANDBOX_IMAGE_TREES is not a mode this image knows;"
+      log "refusing to start rather than guess how the image trees were delivered."
+      exit 1
+      ;;
+    esac
   done
 else
   log "no $DEFAULTS in this image — the agent's skills, SOPs and shared scripts"
@@ -247,12 +405,11 @@ fi
 #     "unable to open database file", `cat` says "Is a directory", and neither can
 #     be mistaken for data. The explanation goes inside it, where an `ls` finds it.
 #
-#     The tripwire is the model's, like every other name on this volume: agent-
-#     owned and writable, so `rm -rf` over a profile home still works. Root-owned
-#     and read-only is the tempting version and it is wrong — it makes an
-#     undeletable directory inside the model's own home, which breaks the plain
-#     `rm -rf /opt/data/profiles` that sections 9 and 10 of smoke-test.sh pin, and
-#     with it sandbox_mirror.py's ability to replace a profile home.
+#     The tripwire is the model's, like everything in its home except the image
+#     trees: agent-owned and writable, so `rm -rf /opt/data/profiles/platform/kanban.db`
+#     works. Root-owned and read-only would make sqlite3 raise too, and it would
+#     buy nothing. The trees are locked because the model and the agent pod's
+#     code run them; nobody runs this directory, and the next start puts it back.
 #
 #     Being removable costs little. The directory is what makes sqlite3 raise;
 #     the mode never was. A worker that deletes it has to `rm -rf` a directory
@@ -297,7 +454,10 @@ if [ ! -r "$AUTHORIZED_KEYS_SRC" ]; then
   log "Mount the sandbox key secret there, or set SANDBOX_AUTHORIZED_KEYS."
   exit 1
 fi
-install -m 0600 -o agent -g agent "$AUTHORIZED_KEYS_SRC" /home/agent/.ssh/authorized_keys
+# Root-owned, like the home and the .ssh above it (deploy/sandbox/Dockerfile):
+# a file the agent owns is one the model can add a key of its own to. 0644
+# because sshd reads it as the user it is authenticating.
+install -m 0644 -o root -g root "$AUTHORIZED_KEYS_SRC" /home/agent/.ssh/authorized_keys
 # The same key also authorises `hermes`, the principal trusted agent-pod code
 # connects as instead of `agent`. The Dockerfile comment on that account says
 # why the two cannot be the same login. Nothing else here needs changing: the
@@ -389,12 +549,12 @@ done
 #    gitops_workspace.agent_home() reads PLATFORM_AGENT_HOME to decide where a
 #    leased clone goes. sshd starts sessions with neither.
 SANDBOX_SSHD_DROPIN=/etc/ssh/sshd_config.d/10-sandbox-env.conf
-SANDBOX_PATH=/opt/credential-proxy/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
-# /opt/vcs/libexec is deliberately not on this list. The image carries a second,
-# credential-free git there for the version-control skill, and the skill reaches
-# it by absolute path; putting its directory ahead of the shim would take the
-# name `git` from every caller that means the shim, so that PATH edit travels
-# with those callers. deploy/sandbox/Dockerfile has the argument.
+SANDBOX_PATH=/opt/vcs/bin:/opt/credential-proxy/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+# /opt/vcs/bin holds the only `git` in the sandbox, the credential-free wrapper
+# (deploy/sandbox/vcs-git.sh); /opt/credential-proxy/bin holds gcloud and
+# kubectl and nothing named git or gh, so the order between the two decides
+# nothing. Login shells get the same prepend from /etc/profile.d/vcs-path.sh,
+# because /etc/profile overwrites this PATH before profile.d runs.
 setenv_args="PATH=\"$SANDBOX_PATH\" HERMES_HOME=\"$DATA\" PLATFORM_AGENT_HOME=\"$DATA\""
 # CREDENTIAL_PROXY_TOKEN_FILE is a path, not a token: the file it names is a
 # projected volume, and forwarding the name is what lets the client read it. It
@@ -434,9 +594,9 @@ if ! sshd -t; then
   exit 1
 fi
 if [ -z "${CREDENTIAL_PROXY_URL:-}" ]; then
-  log "CREDENTIAL_PROXY_URL is unset — kubectl, gcloud, gh and git will report"
-  log "that they are not configured. Expected until #737 Part C makes the"
-  log "credential proxy reachable from outside the agent pod."
+  log "CREDENTIAL_PROXY_URL is unset — kubectl and gcloud will report that"
+  log "they are not configured, and the version-control verbs cannot reach the"
+  log "broker."
 fi
 
 log "ready; starting $*"

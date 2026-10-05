@@ -914,7 +914,7 @@ main() {
   # Blanking the two selectors also means the destroy makes none of the
   # plan-time lookups, so a host or scope this identity can no longer read
   # cannot refuse the teardown either.
-  export SCOPE_PROJECTS="" SCOPE_FOLDERS="" SCOPE_ORGANIZATIONS="" SCOPE_SHARED_VPC_HOSTS="" SCOPE_METRICS_SCOPES="" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""
+  export SCOPE_PROJECTS="" SCOPE_FOLDERS="" SCOPE_ORGANIZATIONS="" SCOPE_SHARED_VPC_HOSTS="" SCOPE_METRICS_SCOPES="" SCOPE_MAX_PROJECTS="" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""
   # Gateway redaction, for the same reason: the generator refuses a misspelt
   # toggle or a malformed rule, and the gateway goes with the release.
   export LITELLM_REDACTION_ENABLED="false" LITELLM_REDACTION_IP_ACTION="" LITELLM_REDACTION_IP_ALLOW_CIDRS="" LITELLM_REDACTION_RULES=""

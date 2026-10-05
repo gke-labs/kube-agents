@@ -1993,7 +1993,7 @@ main() {
     fi
   fi
   if [ "$PARAM_UPGRADE_MODE" = "harness" ] || [ "$PARAM_UPGRADE_MODE" = "full" ] || [ "$restarted_agent" = "true" ]; then
-    kubectl rollout status "deployment/${PLATFORM_AGENT_DEPLOYMENT}" -n "$target_namespace" --timeout=900s
+    kubectl rollout status "deployment/${PLATFORM_AGENT_DEPLOYMENT}" -n "$target_namespace" --timeout=1500s
   fi
   # A healthy gateway is not a working install. The agent runs no command in its
   # own pod: every shell command goes over ssh to the sandbox StatefulSet, and

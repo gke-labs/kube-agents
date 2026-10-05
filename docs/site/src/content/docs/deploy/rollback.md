@@ -107,7 +107,7 @@ does not un-stick on its own: the current script un-sticks a `pending-*` release
 release images back against the tag and fails the step on any still on `N` (from `0.5.0`; the
 current script reads plugin image volumes too), then waits with `kubectl rollout status`
 for the rollouts the chart does not cover, the agent Deployment first, and those waits are
-`N-1`'s: the current script gives the agent fifteen minutes in the namespace `install.env` names,
+`N-1`'s: the current script gives the agent twenty-five minutes in the namespace `install.env` names,
 while `0.4.0`'s gives it two minutes in `kubeagents-system` whatever `NAMESPACE` says. So on a
 slow image pull, or on an install in another namespace, `0.4.0`'s harness step can report a
 failure after both Helm moves have succeeded. A timeout is not a signal to run the step again.

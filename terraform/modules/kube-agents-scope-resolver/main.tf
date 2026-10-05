@@ -44,13 +44,14 @@ locals {
   scope_compute_api_url          = "https://compute.googleapis.com/compute/v1"
   scope_monitoring_api_url       = "https://monitoring.googleapis.com/v1"
   scope_resource_manager_api_url = "https://cloudresourcemanager.googleapis.com/v3"
-  # getXpnResources is paged; one page of the API's maximum holds five times
-  # the cap the CRD puts on any scope list, so a second page is refused rather
-  # than followed, which HCL cannot do.
+  # getXpnResources is paged at the API's maximum of 500, and HCL cannot
+  # follow a second page, so a host with more service projects than one page
+  # holds is refused whatever cap is declared: the bound on a host at plan
+  # time is the smaller of member_cap and this page.
   scope_xpn_page_size = 500
   # The most projects one selector may resolve to. The reconcile lists at
-  # most RESOLVED_SET_CAP (cluster_agent_reconcile.py; 100) projects of the
-  # whole resolved set, the management project included, and a project past
+  # most the declared cap (spec.scope.maxProjects; RESOLVED_SET_CAP, 100, in
+  # cluster_agent_reconcile.py as its default) projects of the whole resolved set, the management project included, and a project past
   # that reads `over-cap` with nothing created under it; the cap on the whole
   # set is kube-agents-iam's precondition, which counts the management
   # project, the explicit projects and every selector's members together, as
@@ -61,8 +62,9 @@ locals {
   # 375) the whole-set check would otherwise wait for. Counted as the
   # reconcile counts: less the members an exclude_projects entry names
   # exactly, by number for a monitored project and by ID for a service
-  # project, since an excluded member is neither listed nor bound.
-  scope_selector_member_cap       = 100
+  # project, since an excluded member is neither listed nor bound. The number
+  # is the declared cap, handed in as member_cap.
+  scope_selector_member_cap       = var.member_cap
   scope_xpn_resource_type_project = "PROJECT"
   # What the Compute API answers, with HTTP 400, for a project that is not a
   # Shared VPC host. It has no service projects, which is a fact about the
@@ -155,11 +157,11 @@ data "http" "scope_shared_vpc_host" {
       # Counted less an exact exclude entry, as the reconcile counts and as
       # kube-agents-iam binds: an excluded service project is neither.
       condition     = self.status_code != 200 || length(distinct([for resource in try(jsondecode(self.response_body).resources, []) : try(resource.id, "") if try(resource.type, "") == local.scope_xpn_resource_type_project && !contains(var.exclude_projects, try(resource.id, ""))])) <= local.scope_selector_member_cap
-      error_message = "shared_vpc_hosts: ${each.key} has more than ${local.scope_selector_member_cap} attached service projects not named in exclude_projects, more than the reconcile lists of the whole resolved set (RESOLVED_SET_CAP, the management project included), so the host cannot fit whatever else the scope declares; the members past the cap would read over-cap with nothing created under them, and their read roles would be reach the agent never uses. Name the service projects not wanted in exclude_projects (the scope's exclude.projects) by ID, or declare the ones wanted in the scope's projects, or a folder that holds them, instead. Nothing was applied."
+      error_message = "shared_vpc_hosts: ${each.key} has more than ${local.scope_selector_member_cap} attached service projects not named in exclude_projects, more than the reconcile lists of the whole resolved set (spec.scope.maxProjects, the management project included), so the host cannot fit whatever else the scope declares; the members past the cap would read over-cap with nothing created under them, and their read roles would be reach the agent never uses. Raise spec.scope.maxProjects, name the service projects not wanted in exclude_projects (the scope's exclude.projects) by ID, or declare the ones wanted in the scope's projects, or a folder that holds them, instead. Nothing was applied."
     }
     postcondition {
       condition     = !can(jsondecode(self.response_body).nextPageToken)
-      error_message = "shared_vpc_hosts: ${each.key} has more than ${local.scope_xpn_page_size} attached service projects, more than one page of the Compute API's answer holds and far past the scope cap; declare the service projects wanted in the scope's projects, or a folder that holds them, instead. Nothing was applied."
+      error_message = "shared_vpc_hosts: ${each.key} has more than ${local.scope_xpn_page_size} attached service projects, more than one page of the Compute API's answer holds, and the plan cannot follow a second page whatever spec.scope.maxProjects declares; declare the service projects wanted in the scope's projects, or a folder that holds them, instead. Nothing was applied."
     }
   }
 }
@@ -192,7 +194,7 @@ data "http" "scope_metrics_scope" {
       # the filter scope_monitored_numbers applies below, so the remedy the
       # message offers lowers the count it is tested against.
       condition     = self.status_code != 200 || length(distinct([for row in try(jsondecode(self.response_body).monitoredProjects, []) : try(regex(local.scope_monitored_project_name_pattern, row.name)["project"], "") if !contains(var.exclude_projects, try(regex(local.scope_monitored_project_name_pattern, row.name)["project"], ""))])) <= local.scope_selector_member_cap
-      error_message = "metrics_scopes: the Metrics Scope of ${each.key} monitors more than ${local.scope_selector_member_cap} projects not named by number in exclude_projects, more than the reconcile lists of the whole resolved set (RESOLVED_SET_CAP, the management project included), so the scope cannot fit whatever else the declaration holds; the members past the cap would read over-cap with nothing created under them, and their read roles would be reach the agent never uses. Declare a narrower scope, name the numbers not wanted in exclude_projects (the scope's exclude.projects), or declare the projects wanted in the scope's projects instead. Nothing was applied."
+      error_message = "metrics_scopes: the Metrics Scope of ${each.key} monitors more than ${local.scope_selector_member_cap} projects not named by number in exclude_projects, more than the reconcile lists of the whole resolved set (spec.scope.maxProjects, the management project included), so the scope cannot fit whatever else the declaration holds; the members past the cap would read over-cap with nothing created under them, and their read roles would be reach the agent never uses. Raise spec.scope.maxProjects, declare a narrower scope, name the numbers not wanted in exclude_projects (the scope's exclude.projects), or declare the projects wanted in the scope's projects instead. Nothing was applied."
     }
   }
 }

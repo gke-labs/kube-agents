@@ -1,10 +1,11 @@
 # Coverage configuration for `make coverage`.
 #
-# The suite is run per-directory (mirroring PYTHON_TEST_DIRS in the Makefile),
-# so the Makefile exports two variables this file leans on:
+# The suite is run per test file, each from its own directory (mirroring
+# PYTHON_TEST_FILES in the Makefile), so the Makefile exports two variables
+# this file leans on:
 #
 #   COVERAGE_ROOT  the repository root. `source` must resolve to the same tree
-#                  from every test directory the loop cd's into, so it cannot
+#                  from every test directory the sweep cd's into, so it cannot
 #                  be a relative path. Defaults to "." for a bare
 #                  `coverage run` at the repository root.
 #   COVERAGE_FILE  the shared data file under .coverage-data/ (a coverage.py

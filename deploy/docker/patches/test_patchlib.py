@@ -10,6 +10,7 @@ disk exactly as upstream shipped it.
 Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t deploy/docker/patches
 """
 
+import ast
 import contextlib
 import io
 import tempfile
@@ -681,6 +682,40 @@ class ByteColumnTest(unittest.TestCase):
         self.assertEqual(p.source[site.start : site.end], body)
         self.assertEqual(site.after, len(source))
 
+
+
+class UnboundTest(unittest.TestCase):
+    SOURCE = """\
+import os
+
+LIMIT = 3
+
+
+def f(a, *rest, key=None, **extra):
+    early = a
+    if key:
+        maybe = 1
+    for item in rest:
+        with open(item) as handle:
+            try:
+                pass
+            except OSError as exc:
+                hook(a, rest, key, extra, early, item, handle, exc, os, LIMIT, len, maybe, gone)
+    value = value + 1
+    total = [x for x in rest]
+"""
+
+    def test_reports_only_what_nothing_binds_ahead(self):
+        tree = ast.parse(self.SOURCE)
+        call = next(n for n in ast.walk(tree) if isinstance(n, ast.Expr))
+        # ``maybe`` is bound only inside a branch, ``gone`` nowhere, ``hook`` is a free name.
+        self.assertEqual(patchlib.unbound(tree, call), ["gone", "hook", "maybe"])
+
+    def test_an_assignment_does_not_bind_its_own_value(self):
+        tree = ast.parse(self.SOURCE)
+        assigns = [n for n in ast.walk(tree) if isinstance(n, ast.Assign) and n.lineno > 10]
+        self.assertEqual(patchlib.unbound(tree, assigns[0]), ["value"])
+        self.assertEqual(patchlib.unbound(tree, assigns[1]), [])
 
 if __name__ == "__main__":
     unittest.main()

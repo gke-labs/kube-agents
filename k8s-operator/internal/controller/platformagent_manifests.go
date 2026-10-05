@@ -336,14 +336,23 @@ type scopeDeclaration struct {
 	// and retires nothing, because the ordinary way a block goes missing is a write
 	// through an older operator's webhook, not an operator dropping every project. An
 	// empty `projects` list in a present block is the declaration that drops projects.
-	Present        bool                    `json:"present"`
-	Projects       []string                `json:"projects"`
-	Folders        []string                `json:"folders"`
-	Organizations  []string                `json:"organizations"`
-	SharedVpcHosts []string                `json:"sharedVpcHosts"`
-	MetricsScopes  []string                `json:"metricsScopes"`
-	Exclude        scopeExcludeDeclaration `json:"exclude"`
+	Present        bool     `json:"present"`
+	Projects       []string `json:"projects"`
+	Folders        []string `json:"folders"`
+	Organizations  []string `json:"organizations"`
+	SharedVpcHosts []string `json:"sharedVpcHosts"`
+	MetricsScopes  []string `json:"metricsScopes"`
+	// MaxProjects is the resolved-set cap in force: spec.scope.maxProjects, or its
+	// default when the field is unset, so the reconcile reads the cap it runs under
+	// from the file rather than from a constant of its own.
+	MaxProjects int32                   `json:"maxProjects"`
+	Exclude     scopeExcludeDeclaration `json:"exclude"`
 }
+
+// defaultScopeMaxProjects is the CRD's default for spec.scope.maxProjects, rendered
+// when the field is unset (a CR admitted before the field existed is served without
+// it until the CRD defaults it on the next write).
+const defaultScopeMaxProjects int32 = 100
 
 type scopeExcludeDeclaration struct {
 	Projects []string                        `json:"projects"`
@@ -370,10 +379,14 @@ func renderScopeJSON(agent *agentv1alpha1.PlatformAgent) string {
 		Organizations:  append([]string{}, scope.Organizations...),
 		SharedVpcHosts: append([]string{}, scope.SharedVpcHosts...),
 		MetricsScopes:  append([]string{}, scope.MetricsScopes...),
+		MaxProjects:    defaultScopeMaxProjects,
 		Exclude: scopeExcludeDeclaration{
 			Projects: []string{},
 			Clusters: []agentv1alpha1.ScopeClusterRef{},
 		},
+	}
+	if scope.MaxProjects != nil {
+		decl.MaxProjects = *scope.MaxProjects
 	}
 	if scope.Exclude != nil {
 		decl.Exclude.Projects = append(decl.Exclude.Projects, scope.Exclude.Projects...)
@@ -2459,6 +2472,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		sidecars = stripContainerMountsNamed(sidecars, droppedSources)
 		sidecarVolumes = a2aStripBusCredentialSources(sidecarVolumes, agent.Name)
 		extraVolumes = a2aStripBusCredentialSources(extraVolumes, agent.Name)
+
+		// Last, after every strip: the executor environment the pod cannot
+		// resolve for itself. Ordering is not incidental -- the strips above
+		// remove what a sidecar must not hold, and this adds what one that
+		// executes tasks cannot run without. See a2aExecutorSidecarEnv.
+		sidecars = a2aExecutorSidecarEnv(sidecars)
 	}
 
 	homeDir := "/opt/data"
@@ -2874,12 +2893,14 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// The Hermes base image sets HERMES_WRITE_SAFE_ROOT=/opt/data, which is the agent's
 	// own home while the shell is local. agent/file_safety.py checks the path prefix in
 	// the agent process before the write is routed anywhere, so with the shell in the
-	// sandbox this has to name the sandbox's writable directories or write_file and
-	// patch return "Write denied" for everything — which is how the earlier value was
-	// found wrong on a live install. The sandbox's data volume carries the same
-	// /opt/data path deliberately, so the interesting half of this is the ephemeral
-	// home; the value is written out rather than left to the image default so the
-	// policy is visible in the pod spec. It gives up no isolation: with backend: ssh
+	// sandbox this has to name sandbox paths or write_file and patch return "Write
+	// denied" for everything — which is how the earlier value was found wrong on a
+	// live install. The sandbox's data volume carries the same /opt/data path
+	// deliberately. /home/agent is listed too, but current sandbox images make it
+	// root-owned (deploy/sandbox/Dockerfile), so a write there passes this check and
+	// then fails on the directory's mode. The value is written out rather than left
+	// to the image default so the policy is visible in the pod spec. It gives up no
+	// isolation: with backend: ssh
 	// the file tools cannot reach the agent's own filesystem to begin with.
 	//
 	// TERMINAL_CWD is what stops the agent working in a directory that does not
@@ -3217,11 +3238,11 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 // Past the deadline the Deployment reports ProgressDeadlineExceeded and any
 // caller's wait returns early however long it asked for, so a gate raised above
 // this number buys nothing. Kubernetes defaults it to 600s, which is *below*
-// the 605s cold boot agentAPIProbe(10, 60) already sanctions — the kubelet is
-// told to tolerate a boot the Deployment gives up on. 1200s clears the 900s
+// the 905s cold boot agentAPIProbe(10, 90) already sanctions — the kubelet is
+// told to tolerate a boot the Deployment gives up on. 1800s clears the 1500s
 // deploy gate in upgrade.sh. hindsight-api
 // carries an explicit 900 for the same reason; see tests/test_hindsight_probes.py.
-const gatewayProgressDeadlineSeconds int32 = 1200
+const gatewayProgressDeadlineSeconds int32 = 1800
 
 // buildDeployment generates the Deployment manifest for the agent payload
 func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, opts renderOptions) *appsv1.Deployment {
@@ -4255,12 +4276,18 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// script arms or prints, so an arbitrary value reaches nothing but that
 	// one message and its own failure report.
 	//
-	// KAGE_SLACK_UX switches the Slack adapter between two code paths already
-	// in the image: which reaction goes on an ask and when it settles. It is
+	// KAGE_SLACK_UX switches between code paths already in the image, all of
+	// them about Slack: which reaction goes on an ask and when it settles, how
+	// much of a delegated card's delivery posts in the thread, whether a
+	// thread's cards show as one plan message, the session status and title
+	// Slack shows on the thread, and whether the harness's own Slack messages
+	// (the scheduled-report wrapper, the heartbeat, restart and shutdown
+	// notices, command and system replies) are reworded or left out. It is
 	// compared against `FLAG_ON_VALUES` in `slack_presenter.py`; any other
 	// value is off, the image default. It names no path, URL, credential or
-	// image, and no value of it reaches anything but the reactions the gateway
-	// adds to messages it already receives.
+	// image, and no value of it adds a destination or a credential: its writes
+	// go only to Slack, in the channels and threads the gateway already
+	// serves.
 	allowed := map[string]struct{}{
 		"ALERT_DAILY_LIMIT_CRITICAL": {},
 		// Not a severity, unlike its three neighbours: the drift detector's
@@ -4657,7 +4684,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 			// The bearer key is the non-secret loopback sentinel already in this
 			// container's env, and API_SERVER_ENABLED is unconditionally true above,
 			// so the probe is valid in every configuration.
-			StartupProbe:    agentAPIProbe(10, 60),
+			StartupProbe:    agentAPIProbe(10, 90),
 			ReadinessProbe:  agentAPIProbe(15, 3),
 			SecurityContext: hardenedSecurityContext(),
 		},

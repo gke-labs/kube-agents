@@ -231,8 +231,21 @@ class ToolInvocationCountingTest(_BrokerFixture):
         self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="blocked"))
         self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
 
+    def routed_git(self):
+        # `/v1/exec` refuses `git` before either git gate, so admit it to count
+        # what those gates refuse.
+        routed = (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "git")
+        return mock.patch.object(credential_proxy, "EXEC_ROUTE_EXECUTABLES", routed)
+
+    def test_git_counts_as_blocked_on_the_exec_route(self):
+        status, body = self.post(["git", "status"])
+        self.assertEqual(403, status)
+        self.assertEqual("executable.allowlist", body.get("rule"))
+        self.assertEqual(1, _series(self.families(), "kubeagents_tool_invocations_total", tool="git", subcommand="status", status="blocked"))
+
     def test_a_refused_git_argument_counts_as_blocked(self):
-        status, body = self.post(["git", "-c", "x=y", "status"])
+        with self.routed_git():
+            status, body = self.post(["git", "-c", "x=y", "status"])
         self.assertEqual(403, status)
         self.assertEqual("git.argument.refused", body.get("rule"))
         self.assertEqual(1, _series(self.families(), "kubeagents_tool_invocations_total", tool="git", subcommand="status", status="blocked"))
@@ -240,7 +253,8 @@ class ToolInvocationCountingTest(_BrokerFixture):
     def test_a_git_write_outside_a_lease_counts_as_blocked(self):
         # No cwd, so the command would run at the shared workspace root, which
         # the lease floor refuses for a write.
-        status, body = self.post(["git", "commit", "-m", "x"])
+        with self.routed_git():
+            status, body = self.post(["git", "commit", "-m", "x"])
         self.assertEqual(403, status)
         self.assertEqual("git.workspace.lease", body.get("rule"))
         self.assertEqual(1, _series(self.families(), "kubeagents_tool_invocations_total", tool="git", subcommand="commit", status="blocked"))

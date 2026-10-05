@@ -14,6 +14,7 @@ and that an unset setting is left OUT of the file rather than written empty.
 
 import os
 import pathlib
+import re
 import subprocess
 import tempfile
 import unittest
@@ -269,6 +270,78 @@ class MemoryMappingAgreementTest(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertIn(token, provision)
                 self.assertIn(token, renderer)
+
+
+class DefaultOnKeysAreRefusableTest(unittest.TestCase):
+    """A shipped default of `true` inverts what an omission costs.
+
+    The module docstring above states the hazard the renderer was built for: an
+    omitted setting becomes a default and the apply destroys what the default
+    does not mention. A key whose default is `true` runs the other way — the
+    omission *provisions*, unattended, on a schedule. Either way the environment
+    needs a way to say no, and MAPPING is the only one it has: the reconcile
+    rewrites `install.env` from these variables every run, so a line added to
+    that file by hand is gone before the next apply reads it.
+
+    So this is the question nobody asked when ENABLE_DRIFT_DETECTOR's default
+    was flipped: of the booleans `install.defaults.env` ships as `true`, which
+    can a long-lived environment actually refuse? The answer was "not that one",
+    and nothing failed.
+    """
+
+    # Keyed by the install.env name, valued by why MAPPING does not carry it.
+    # Both are pre-existing and neither is this file's to fix; they are listed
+    # so that the next `true` default has to be argued about rather than added.
+    _NOT_MAPPED = {
+        # Chooses where secrets go -- terraform.tfvars, or TF_VAR_* in the
+        # process environment. Provisions nothing either way, so an environment
+        # that cannot override it loses no cloud resource by the omission.
+        "PERSIST_SECRETS_ON_DISK",
+        # The same shape as the drift key and genuinely unaddressed: the default
+        # enables the Vertex API on the serving project and grants the gateway's
+        # role there, so an omission acts on a project rather than skipping it,
+        # and a long-lived environment has no variable that declines. Narrower
+        # in that nothing happens unless model_provider is vertex_ai. Left as it
+        # was found -- flipping one default is not licence to widen the audit --
+        # and tracked as issue #2269, which is what removes this entry.
+        "VERTEX_MANAGE_SERVING_PROJECT",
+    }
+
+    def test_every_default_true_boolean_can_be_refused_by_an_environment(self):
+        defaults = (_REPO_ROOT / "install.defaults.env").read_text()
+        default_true = {
+            m.group(1)
+            for m in re.finditer(r'^DEFAULT_([A-Z0-9_]+)="?true"?\s*$',
+                                 defaults, re.MULTILINE)
+        }
+        self.assertTrue(default_true, "no DEFAULT_*=true parsed; the regex is stale")
+
+        block = _SCRIPT.read_text().split('MAPPING="', 1)[1].split('"', 1)[0]
+        mapped = {line.split(":", 1)[0].strip()
+                  for line in block.splitlines() if ":" in line}
+        self.assertTrue(mapped, "MAPPING did not parse; the split is stale")
+
+        unrefusable = sorted(default_true - mapped - self._NOT_MAPPED)
+        self.assertEqual(
+            unrefusable,
+            [],
+            "install.defaults.env ships these as true, so a long-lived "
+            "environment that says nothing gets them -- and they are not in "
+            "render_install_env.sh's MAPPING, so there is no GitHub variable "
+            "that can decline them and no install.env line that survives the "
+            f"next reconcile: {unrefusable}",
+        )
+
+    def test_the_exemptions_are_still_default_true(self):
+        """An exemption for a key that no longer defaults to true is dead
+        weight that would hide the next real one if the default came back."""
+        defaults = (_REPO_ROOT / "install.defaults.env").read_text()
+        for key in sorted(self._NOT_MAPPED):
+            with self.subTest(key=key):
+                self.assertRegex(
+                    defaults,
+                    re.compile(rf'^DEFAULT_{key}="?true"?\s*$', re.MULTILINE),
+                )
 
 
 class RenderingTest(unittest.TestCase):

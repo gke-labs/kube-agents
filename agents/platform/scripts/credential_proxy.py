@@ -2439,9 +2439,12 @@ FORGE_REFRESH_HELPER_DIR = "/opt/defaults/scripts"
 # import its CLI side into the broker.
 FORGE_READ_ONLY_FLAG = "--read-only"
 
-# How much of a failed helper's stderr reaches the broker log. The full text is
+# How much of a helper's stderr reaches the broker log. The full text is
 # bounded only by the executor's output ceiling, which is not a log line; this
-# runs on every failed cron tick.
+# runs on every failed cron tick and on every refresh. The tail, not the head:
+# the helper logs each step as it goes and names the outcome on its last line,
+# so a long run-up (a wide managed-repository list, a Minty retry) would
+# otherwise push the one line that says what happened out of the log.
 FORGE_HELPER_LOG_DETAIL_CHARS = 1000
 
 # What may be spliced into that filename. Closed, anchored and lowercase: a
@@ -3437,6 +3440,15 @@ def forge_registry() -> providers.Registry:
         return _forge_registry
 
 
+# What `/v1/exec` runs for the sandbox, enforced here because the client is
+# only a convenience: anything holding the sandbox's token can post its own
+# argv. Neither `git` nor any forge CLI is on it: a repository and a forge are
+# reached through the verbs, which run them on the broker's own behalf. `git`
+# here would run under the broker's credential helper, and a read such as
+# `ls-remote` is no write for a lease to fence.
+EXEC_ROUTE_EXECUTABLES = ("gcloud", "kubectl")
+
+
 def broker_executables() -> tuple[str, ...]:
     """What the credentialed process may run at all.
 
@@ -3447,13 +3459,14 @@ def broker_executables() -> tuple[str, ...]:
     read as one decision and was two.
 
     `gcloud` and `kubectl` are on both: the agent names them and this process
-    runs them. `git` is on both for now -- the broker issues it on its own
-    behalf for the verbs, and the sandbox shim still forwards it for the
-    shipped callers, whose move onto the verbs is what retires the forwarding
-    (see deploy/sandbox/Dockerfile). What this list decides on its own is the
-    forge CLI: one is here only if some forge this install built declares one,
-    so an install whose forges all speak HTTP grants no forge binary rather
-    than inheriting the union of every binary any forge could want.
+    runs them. `git` and any forge CLI are here for the broker's own use -- it
+    issues them on its own behalf for the verbs. `/v1/exec` refuses both
+    (`EXEC_ROUTE_EXECUTABLES`), so a sandbox caller that composes its own
+    request reaches neither. What this list
+    decides on its own is the forge CLI: one is here only if some forge this
+    install built declares one, so an install whose forges all speak HTTP
+    grants no forge binary rather than inheriting the union of every binary
+    any forge could want.
     """
     return ("gcloud", "kubectl", "git", *providers.Registry().executables)
 
@@ -4435,7 +4448,9 @@ class CommandExecutor:
         helper = self._forge_helper(provider)
         if not repository_is_managed(repository):
             raise PermissionError(f"{repository} is not a repository this install manages")
-        self._run_forge_helper(provider, helper, [repository], "credential refresh")
+        self._run_forge_helper(
+            provider, helper, [repository], "credential refresh", log_success=True
+        )
 
     @staticmethod
     def _forge_helper(provider: str) -> Path:
@@ -4450,7 +4465,12 @@ class CommandExecutor:
         return Path(FORGE_REFRESH_HELPER_DIR) / f"{provider}_token_refresh.py"
 
     def _run_forge_helper(
-        self, provider: str, helper: Path, arguments: list[str], action: str
+        self,
+        provider: str,
+        helper: Path,
+        arguments: list[str],
+        action: str,
+        log_success: bool = False,
     ) -> ExecutionResult:
         """Run a forge helper after its caller has settled admission, or raise.
 
@@ -4458,26 +4478,31 @@ class CommandExecutor:
         strategy that asked to be made current and silently was not is a 401
         later, from inside a clone, that reads like the repository is gone.
 
-        A failure's detail is logged here and not returned: it crosses back
+        The helper's stderr is logged here and not returned: it crosses back
         into the sandbox otherwise, and this is the one place a broker outage is
-        diagnosable. Redacted before it is bounded, so a token cut in half by
-        the slice is not what survives. `action` names the operation in the log
-        line and the exception, and nothing else about the two operations
-        differs on this path.
+        diagnosable. A failure at WARNING; with `log_success`, a success at INFO
+        too, because the refresh helper says there which branch minted the
+        identity token and how long it took, and a refresh that fell through to
+        gcloud and still succeeded is only visible from that line. The read-only
+        mint, one per clone, asks for no such line. Redacted before it is
+        bounded, so a token cut in half by the slice is not what survives.
+        `action` names the operation in the log line and the exception.
         """
         if not helper.is_file():
             raise RuntimeError(f"no credential refresh helper for {provider}")
         result = self.execute_internal([str(helper), *arguments])
+        detail = redact_credentials(result.stderr.strip())[-FORGE_HELPER_LOG_DETAIL_CHARS:]
         if result.exit_code != 0:
-            detail = redact_credentials(result.stderr.strip())
             LOGGER.warning(
                 "%s %s exited %d%s",
                 provider,
                 action,
                 result.exit_code,
-                f": {detail[:FORGE_HELPER_LOG_DETAIL_CHARS]}" if detail else "",
+                f": {detail}" if detail else "",
             )
             raise RuntimeError(f"{action} failed")
+        if log_success and detail:
+            LOGGER.info("%s %s: %s", provider, action, detail)
         return result
 
     def mint_read_credential(self, provider: str, repository: str) -> str:
@@ -4498,7 +4523,7 @@ class CommandExecutor:
 
         The token comes back on stdout and is returned, never logged: what the
         helper wrote to stderr is logged redacted on failure, as the refresh
-        path does, and stdout is not.
+        path does (and, unlike it, not on success), and stdout is not.
         """
         helper = self._forge_helper(provider)
         if repository_role(repository) != ROLE_CONTEXT:
@@ -5991,7 +6016,15 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             _sanitize_for_logging(argv[0]),
             extra=audit(AUDIT_STATUS_STARTED),
         )
-        if argv[0] not in CommandExecutor.ALLOWED_EXECUTABLES:
+        # Decided once, before any gate: every outcome below is counted under
+        # the same two labels. An executable outside the image's allowlist is
+        # counted as `other`; one the image has but this route refuses (git)
+        # is counted under its own name.
+        tool_label, subcommand_label = _tool_labels(argv)
+        if (
+            argv[0] not in CommandExecutor.ALLOWED_EXECUTABLES
+            or argv[0] not in EXEC_ROUTE_EXECUTABLES
+        ):
             LOGGER.warning(
                 "executable blocked request_id=%s executable=%s",
                 request_id,

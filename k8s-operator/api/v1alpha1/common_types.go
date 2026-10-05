@@ -1158,8 +1158,9 @@ type SecuritySpec struct {
 	// NetworkPolicy matches addresses, never DNS names, so restoring a hosted
 	// service means naming its address ranges.
 	//
-	// Credentialed gcloud, kubectl, gh and git are unaffected: they are shims
-	// that call the broker, and the broker is on the allowlist.
+	// Credentialed gcloud and kubectl, and the version-control verbs, are
+	// unaffected: all of them call the broker, and the broker is on the
+	// allowlist.
 	//
 	// TURNING THIS OFF DOES NOT DELETE THE POLICY. An egress policy is a
 	// guardrail, and the operator will not remove a guardrail it may not have

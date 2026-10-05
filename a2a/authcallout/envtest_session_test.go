@@ -156,7 +156,11 @@ func TestLiveAPodBoundTokenCarriesThePodClaim(t *testing.T) {
 	// The grants that name is turned into, so this test also pins that the
 	// real attested name survives into a real subject rather than into an
 	// escaped or truncated one.
-	if got := sessionGrants(att.PodName); !containsString(got.Publish, "a2a.tasks.chat-otter-1a2b.*.events") {
+	got, err := sessionGrants(att.PodName)
+	if err != nil {
+		t.Fatalf("sessionGrants(%q): %v", att.PodName, err)
+	}
+	if !containsString(got.Publish, "a2a.tasks.chat-otter-1a2b.*.events") {
 		t.Errorf("grants derived from the attested pod = %+v, want the pod's own events subject", got)
 	}
 }
