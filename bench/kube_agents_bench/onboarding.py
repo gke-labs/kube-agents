@@ -251,6 +251,8 @@ try:
                 card["metadata"] = "present"
                 cluster = meta.get("cluster")
                 card["cluster"] = cluster if isinstance(cluster, str) and cluster else None
+                project = meta.get("project")
+                card["project"] = project if isinstance(project, str) and project else None
                 findings = meta.get("findings")
                 card["findings"] = len(findings) if isinstance(findings, list) else None
         out["clusters"].append(card)
@@ -419,11 +421,15 @@ def raw_command() -> str:
 
 
 def _payload(reply: str, sentinel: str) -> dict[str, Any] | None:
-    marker = reply.rfind(sentinel)
-    if marker < 0:
+    # The sentinel's own line, not its last occurrence: the JSON after it is
+    # one line that can carry model-written titles, and json.dumps escapes any
+    # newline in them, so no title can forge a line of its own.
+    lines = reply.splitlines()
+    start = next((i for i, line in enumerate(lines) if line.strip() == sentinel), None)
+    if start is None:
         return None
     try:
-        parsed = json.loads(reply[marker + len(sentinel) :])
+        parsed = json.loads("\n".join(lines[start + 1 :]))
     except json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else None

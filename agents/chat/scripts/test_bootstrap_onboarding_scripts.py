@@ -1046,6 +1046,12 @@ class ScanGateTest(unittest.TestCase):
         self.assertEqual((rc, out, self.filed), (0, "", []))
         hand_off.assert_called_once_with(self.d, self.d / SCAN_FILED, bootstrap_scan_gate._parse_task_id)
 
+    def test_a_failing_hand_off_does_not_fail_the_cron_run(self):
+        (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n")
+        with mock.patch.object(bootstrap_scan_gate.bootstrap_handoff, "hand_off", side_effect=TypeError("bad metadata")):
+            rc, out = self._run()
+        self.assertEqual((rc, out), (0, ""))
+
     def test_no_hand_off_once_the_report_is_delivered(self):
         (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n")
         (self.d / COMPLETED).write_text("")

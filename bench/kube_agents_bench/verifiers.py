@@ -2926,7 +2926,7 @@ class _OnboardingPollVerifier(BaseVerifier):
 class BootstrapFindingsVerifier(_OnboardingPollVerifier):
     """Checks the findings the onboarding prioritization stage extracted.
 
-    The prioritization card is filed by the discovery sweep's worker, not by
+    The prioritization card is filed by the onboarding gate's hand-off, not by
     the conversation, and its worker runs ``inventory_findings.py extract``
     through its terminal. This reads the file that writes,
     ``INVENTORY.items.json``, off the shell sandbox's data volume
@@ -3160,7 +3160,12 @@ class BootstrapHandoffVerifier(_OnboardingPollVerifier):
             )
         items = read["items"]
         covered = {i.get("cluster") for i in items}
-        with_findings = [c for c in board.get("clusters") or [] if c.get("cluster") and (c.get("findings") or 0) > 0]
+        # The hand-off lists findings only for a card that named its project and
+        # cluster; one that did not is a gap line there, not a missing block line.
+        with_findings = [
+            c for c in board.get("clusters") or []
+            if c.get("cluster") and c.get("project") and (c.get("findings") or 0) > 0
+        ]
         missing = sorted({c["cluster"] for c in with_findings} - covered)
         if missing:
             return (

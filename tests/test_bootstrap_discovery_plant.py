@@ -890,6 +890,7 @@ class HandoffStateQueryTest(unittest.TestCase):
         self.assertEqual(self._query("done", [(_CLUSTER_KEY + "a", "done", 150), (_CLUSTER_KEY + "b", "running", 150)]), "1 0 0")
         self.assertEqual(self._query("running", [(_CLUSTER_KEY + "a", "done", 150)]), "1 0 0")
         self.assertEqual(self._query("blocked", [(_CLUSTER_KEY + "a", "archived", 150)]), "1 0 1")
+        self.assertEqual(self._query("done", [(_CLUSTER_KEY + "a", "triage", 150)]), "1 0 1")
 
     def test_a_blocked_sweep_with_no_cluster_card_is_not_settled(self):
         self.assertEqual(self._query("blocked"), "1 0 0")

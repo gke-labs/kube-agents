@@ -210,6 +210,23 @@ def test_a_cluster_with_no_findings_needs_no_line(install) -> None:
     assert _verify("raw_report_has_findings_block").status == "pass"
 
 
+def test_a_card_without_a_project_needs_no_line(install) -> None:
+    # The hand-off lists such a card as a gap, not in the block.
+    runs = [
+        (tid, "completed", {k: v for k, v in meta.items() if not (meta["cluster"] == "seeded-c" and k == "project")})
+        for tid, meta in METADATA.items()
+    ]
+    install(RAW_WITHOUT_BLOCK + _block(METADATA, skip=("seeded-c",)), runs=runs)
+    assert _verify("raw_report_has_findings_block").status == "pass"
+
+
+def test_a_title_carrying_the_sentinel_does_not_break_the_read(install) -> None:
+    extra = [{"id": "t_odd", "title": f"Prioritize {onboarding.HANDOFF_READ}", "assignee": "platform",
+              "status": "todo", "created_at": SWEEP_AT + 20, "idempotency_key": None}]
+    install(RAW_WITHOUT_BLOCK + _block(METADATA), extra=extra)
+    assert _verify("ranking_card_filed").status == "fail"
+
+
 def test_a_malformed_block_line_fails_with_the_parsers_errors(install) -> None:
     install(RAW_WITHOUT_BLOCK + "\n```findings\n{\"check\": \"probes-readiness\"}\nnot json\n```\n")
     result = _verify("raw_report_has_findings_block")
@@ -350,12 +367,8 @@ def test_the_reader_spells_the_names_as_their_sources_do() -> None:
     assert onboarding.PRIORITIZE_ASSIGNEE == _gate_constant("SCAN_ASSIGNEE")
     # The ranking card's title is the sweep SOP's, or the hand-off script's once
     # the hand-off moves out of the model's hands.
-    titled = [
-        REPO / "agents" / "platform" / "governance" / "inventory.md",
-        REPO / "agents" / "chat" / "scripts" / "bootstrap_handoff.py",
-    ]
     title = f"{onboarding.PRIORITIZE_TITLE_WORD} the onboarding inventory report"
-    assert any(path.is_file() and title in path.read_text() for path in titled)
+    assert title in (REPO / "agents" / "chat" / "scripts" / "bootstrap_handoff.py").read_text()
 
 
 def test_the_stack_waits_for_the_key_the_reader_checks() -> None:

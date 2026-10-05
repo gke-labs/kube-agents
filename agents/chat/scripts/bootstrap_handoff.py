@@ -21,6 +21,7 @@ discovery, which deletes ``.bootstrap_scan_filed`` but may not know this marker,
 still gets its own hand-off.
 """
 
+import hashlib
 import json
 import re
 import shlex
@@ -43,8 +44,6 @@ PRIORITIZE_INSTRUCTIONS_PATHS = (
 PRIORITIZE_TITLE = "Prioritize the onboarding inventory report"
 
 HANDOFF_MARKER = ".bootstrap_handoff_filed"
-# What the marker records instead of a card id when it kept a raw file it found.
-KEPT = "kept-existing-raw"
 ABSENT, OURS, FOREIGN = "absent", "ours", "foreign"
 BOARD_FILE = "kanban.db"
 SQLITE_BUSY_TIMEOUT_SECONDS = 10
@@ -99,6 +98,9 @@ DEFAULT_CHECK = "finding"
 STAMP_FORMAT = "%Y-%m-%d %H:%M UTC"
 # A check slug derived from the issue text when the Cluster Agent gave none.
 CHECK_SLUG_WORDS = 6
+# A short digest of the whole title, so two findings whose titles share their
+# first words keep separate identities in the findings queue.
+CHECK_DIGEST_CHARS = 6
 # Placeholders a Cluster Agent writes where a field names more than one object.
 NOT_AN_OBJECT = ("", "multiple", "multiple workloads", "various", "n/a", "none")
 
@@ -206,9 +208,17 @@ def _text(value) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def _list(value) -> list:
+    """A list from model-written metadata, or empty when it is anything else."""
+    return value if isinstance(value, list) else []
+
+
 def _slug(text: str) -> str:
     words = re.findall(r"[a-z0-9]+", text.lower())
-    return "-".join(words[:CHECK_SLUG_WORDS]) or DEFAULT_CHECK
+    if not words:
+        return DEFAULT_CHECK
+    digest = hashlib.sha1(" ".join(words).encode()).hexdigest()[:CHECK_DIGEST_CHARS]
+    return "-".join(words[:CHECK_SLUG_WORDS] + [digest])
 
 
 def _provider_managed(namespace: str) -> bool:
@@ -227,7 +237,7 @@ def finding_lines(meta: dict) -> list[dict]:
     if not project or not cluster:
         return []
     lines = []
-    for finding in meta.get("findings") or []:
+    for finding in _list(meta.get("findings")):
         if not isinstance(finding, dict):
             continue
         title = _text(finding.get("issue")) or _text(finding.get("title"))
@@ -280,7 +290,7 @@ def _gap_list(meta: dict) -> list:
 
 
 def _node_pools(topology: dict) -> str:
-    pools = topology.get("node_pools") or []
+    pools = _list(topology.get("node_pools"))
     return ", ".join(
         f"{_text(p.get('name'))} ({_text(p.get('machine_type')) or NOT_APPLICABLE})" for p in pools if isinstance(p, dict)
     ) or NOT_APPLICABLE
@@ -318,7 +328,7 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
             )
         else:
             gaps.append(f"{_cell(card['title'] or card['key'])} ({card['id']}): still {_cell(card['status'])} when the hand-off ran")
-    for meta in sweep["metadata"].get("clusters") or []:
+    for meta in _list(sweep["metadata"].get("clusters")):
         if isinstance(meta, dict) and _text(meta.get("cluster")) and _text(meta.get("project")):
             audits.append((meta, sweep["id"]))
             gaps.append(
@@ -329,7 +339,7 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
             gaps.append(f"sweep {sweep['id']}: an audit it reported has no `project` and `cluster`, so it is not listed")
     for meta, card_id in audits:
         for gap in _gap_list(meta):
-            gaps.append(f"{_text(meta.get('cluster'))} ({card_id}): {_cell(gap)}")
+            gaps.append(f"{_cell(meta.get('cluster'))} ({card_id}): {_cell(gap)}")
     for gap in _gap_list(sweep["metadata"]):
         gaps.append(f"sweep {sweep['id']}: {_cell(gap)}")
     if sweep["status"] == BLOCKED:
@@ -340,14 +350,14 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
             "it would have listed or audited may be missing"
         )
     reported = {(_text(m.get("project")), _text(m.get("cluster"))) for m, _ in audits}
-    fleet = [f for f in sweep["metadata"].get("fleet") or [] if isinstance(f, dict)]
+    fleet = [f for f in _list(sweep["metadata"].get("fleet")) if isinstance(f, dict)]
     for entry in fleet:
         status = _text(entry.get("status"))
         if status and status.upper() not in HEALTHY_CLUSTER_STATUSES:
             gaps.append(f"{_cell(entry.get('cluster'))} ({_cell(entry.get('project'))}): cluster status {_cell(status)}")
         if (_text(entry.get("project")), _text(entry.get("cluster"))) not in reported:
             gaps.append(
-                f"{_text(entry.get('cluster'))} ({_text(entry.get('project'))}, {_text(entry.get('location'))}): "
+                f"{_cell(entry.get('cluster'))} ({_cell(entry.get('project'))}, {_cell(entry.get('location'))}): "
                 "listed in the fleet but no audit reported on it"
             )
     if not fleet:
@@ -372,10 +382,10 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
         "| :------ | :------ | :------- | :--- | ----------------: | :-------------- |",
     ]
     for meta, card_id in audits:
-        complete = not (meta.get("gaps") or [])
+        complete = not _gap_list(meta)
         out.append(
             f"| {_cell(meta.get('cluster'))} | {_cell(meta.get('project'))} | {_cell(meta.get('location'))} "
-            f"| {card_id} | {len(meta.get('workloads') or [])} | {'yes' if complete else 'no — see Gaps'} |"
+            f"| {card_id} | {len(_list(meta.get('workloads')))} | {'yes' if complete else 'no — see Gaps'} |"
         )
     out += [
         "",
@@ -412,7 +422,7 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
         "| :------------------ | :-------- | :---------------------------- |"),
     ]
     for meta, _ in audits:
-        for w in meta.get("workloads") or []:
+        for w in _list(meta.get("workloads")):
             if not isinstance(w, dict):
                 continue
             out.append(
@@ -427,7 +437,7 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
     by_area: dict[str, list[str]] = {}
     for meta, _ in audits:
         for finding, line in zip(
-            [f for f in meta.get("findings") or [] if isinstance(f, dict) and (_text(f.get("issue")) or _text(f.get("title")))],
+            [f for f in _list(meta.get("findings")) if isinstance(f, dict) and (_text(f.get("issue")) or _text(f.get("title")))],
             finding_lines(meta),
         ):
             lines.append(line)
@@ -569,9 +579,11 @@ def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, now: float | None
         _log(f"sweep {sweep_id} or all of its cluster cards are archived; not handing off")
         return None
     try:
-        filed_at = float(filed.get("filed_at", now))
-    except ValueError:
-        filed_at = now
+        filed_at = float(filed["filed_at"])
+    except (KeyError, ValueError):
+        # A marker written by hand may carry only the card id; its own
+        # timestamp is when the sweep was filed, near enough.
+        filed_at = scan_marker.stat().st_mtime
     timed_out = not settled(state) and now - filed_at >= deadline(state)
     if not settled(state) and not timed_out:
         return None
@@ -579,13 +591,11 @@ def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, now: float | None
     if owner is None:
         return None
     if owner == FOREIGN:
-        # An earlier shape of the sweep wrote the raw file itself and ranked it;
-        # an install upgraded mid-onboarding keeps that file rather than one
-        # rebuilt from metadata the old sweep never wrote.
-        _record(marker, sweep_id, KEPT, now)
+        # An earlier shape of the sweep wrote the raw file itself; an install
+        # upgraded mid-onboarding keeps that file rather than one rebuilt from
+        # metadata the old sweep never wrote, and still gets it ranked.
         _log(f"{RAW_PATH} was written before this hand-off; keeping it for sweep {sweep_id}")
-        return None
-    if not write_raw(data_dir, compose(state, timed_out, now)):
+    elif not write_raw(data_dir, compose(state, timed_out, now)):
         return None
     task_id = file_prioritize(parse_task_id)
     if not task_id:

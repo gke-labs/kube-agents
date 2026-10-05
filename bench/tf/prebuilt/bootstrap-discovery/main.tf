@@ -390,7 +390,7 @@ resource "null_resource" "sweep" {
           (key, since)).fetchone()[0]
       cards = [s for (s,) in c.execute(
           "SELECT status FROM tasks WHERE idempotency_key LIKE ? AND created_at >= ?", (cluster_like, since))]
-      ended = ("done", "blocked", "archived")
+      ended = ("done", "blocked", "triage", "archived")
       settled = status in ended and all(s in ended for s in cards) and (bool(cards) or status != "blocked")
       print(started, int(keyed > 0), int(settled))
       PY

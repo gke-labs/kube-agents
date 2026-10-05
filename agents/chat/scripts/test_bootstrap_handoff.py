@@ -11,6 +11,8 @@ rather than with a copy of its rules.
 """
 
 import json
+import os
+import shlex
 import sqlite3
 import sys
 import tempfile
@@ -218,6 +220,8 @@ class ComposeTest(unittest.TestCase):
 
 
 class HandOffTest(unittest.TestCase):
+    _real_file_prioritize = staticmethod(h.file_prioritize)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.d = Path(self.tmp.name)
@@ -246,6 +250,11 @@ class HandOffTest(unittest.TestCase):
 
     def _run(self, now=NOW):
         return h.hand_off(self.d, self.scan_marker, None, now=now)
+
+    def _run_with_parser(self):
+        import bootstrap_scan_gate
+
+        return h.hand_off(self.d, self.scan_marker, bootstrap_scan_gate._parse_task_id, now=NOW)
 
     def test_waits_while_a_cluster_card_is_running(self):
         _board(self.board, clusters=_all_done() + [("t_running", "running", None, "")])
@@ -296,13 +305,39 @@ class HandOffTest(unittest.TestCase):
         self.assertIsNone(self._run(now=NOW + 10 * h.DEADLINE_SECONDS))
         self.assertEqual(self.filed, [])
 
-    def test_a_raw_file_from_an_older_sweep_shape_is_kept(self):
+    def test_a_raw_file_from_an_older_sweep_shape_is_kept_and_ranked(self):
         _board(self.board, clusters=_all_done())
         (self.d / "INVENTORY.raw.md").write_text("# report the old sweep typed\n")
-        self.assertIsNone(self._run())
+        self.assertEqual(self._run(), "t_rank1")
         self.assertEqual((self.d / "INVENTORY.raw.md").read_text(), "# report the old sweep typed\n")
-        self.assertEqual(self.filed, [])
-        self.assertIn(f"task_id={h.KEPT}", (self.d / h.HANDOFF_MARKER).read_text())
+
+    def test_a_marker_without_filed_at_times_out_from_its_own_timestamp(self):
+        _board(self.board, clusters=_all_done() + [("t_stuck", "ready", None, "")])
+        self.scan_marker.write_text(f"task_id={SWEEP}\n")
+        old = NOW - 10 * h.DEADLINE_SECONDS
+        os.utime(self.scan_marker, (old, old))
+        self.assertEqual(self._run(), "t_rank1")
+
+    def test_metadata_of_the_wrong_type_does_not_raise(self):
+        meta = {"project": "p", "cluster": "c", "workloads": 12, "findings": "none", "gaps": 3,
+                "topology": {"node_pools": "default"}}
+        _board(self.board, sweep_meta={"clusters": 5, "fleet": "x"}, clusters=[("t_odd", "done", meta, "")])
+        self.assertEqual(self._run(), "t_rank1")
+        inventory_findings.parse_block((self.d / "INVENTORY.raw.md").read_text())
+
+    def test_the_ranking_card_is_filed_with_its_key(self):
+        _board(self.board, clusters=_all_done())
+        sent = []
+        kanban = types.ModuleType("hermes_cli.kanban")
+        kanban.run_slash = lambda cmd: sent.append(cmd) or '{"id": "t_real"}'
+        pkg = types.ModuleType("hermes_cli")
+        pkg.kanban = kanban
+        with mock.patch.dict(sys.modules, {"hermes_cli": pkg, "hermes_cli.kanban": kanban}), \
+                mock.patch.object(h, "file_prioritize", HandOffTest._real_file_prioritize):
+            self.assertEqual(self._run_with_parser(), "t_real")
+        argv = shlex.split(sent[0])
+        self.assertEqual(argv[argv.index("--idempotency-key") + 1], h.PRIORITIZE_KEY)
+        self.assertEqual(argv[argv.index("--assignee") + 1], h.ASSIGNEE)
 
     def test_its_own_half_written_hand_off_is_finished(self):
         _board(self.board, clusters=_all_done())

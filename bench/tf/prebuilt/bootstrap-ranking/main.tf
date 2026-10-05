@@ -33,9 +33,9 @@
 # job is paused, or it sends anywhere but `local`:
 # the ranked report this produces is the one onboarding delivers, and arming
 # delivery with a chat bound would post it there. It also refuses one whose
-# gate has not filed its sweep (no `.bootstrap_scan_filed`), because the hand-off
-# of a sweep filed during the run writes its own INVENTORY.raw.md over the
-# planted one.
+# gate has not filed its sweep (no `.bootstrap_scan_filed`), because a sweep
+# filed during the run fans out audits beside the planted card and its
+# hand-off files a ranking card of its own.
 # Open `bootstrap-inventory-*` cards are archived before the plant, so an
 # earlier sweep still running cannot do that either; the sweep marker stays,
 # so the gate files no other.
