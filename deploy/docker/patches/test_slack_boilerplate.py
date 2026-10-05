@@ -1356,6 +1356,9 @@ class RootTest(unittest.TestCase):
 
         # FIFO teardown: clean outer first, then inner
         outer.cleanup()
+        # Baseline must stay out until the last live root exits: restoring it
+        # here would shadow inner's gateway package while inner is still live.
+        self.assertNotIn("gateway.preexisting", sys.modules)
         self.assertIsNot(inner._saved_modules.get("gateway.platforms.base"), outer_mod)
         self.assertIs(inner._saved_modules.get("gateway.preexisting"), stub)
 
