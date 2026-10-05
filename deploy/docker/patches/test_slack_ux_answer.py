@@ -179,6 +179,23 @@ class SplitTest(unittest.TestCase):
             self.assertIsNone(runtime.split(long))
 
 
+class TrailingQuestionTest(unittest.TestCase):
+    def test_a_closing_question_is_split_off_as_written(self):
+        cases = {
+            "after a sentence": ("The pool is full. Want me to scale it?", ("The pool is full.", "Want me to scale it?")),
+            "on its own line": (f"{REST}\n\nShould I open a PR?", (REST, "Should I open a PR?")),
+            "alone": ("Want me to watch it?", ("", "Want me to watch it?")),
+        }
+        for what, (rest, expected) in cases.items():
+            with self.subTest(what):
+                self.assertEqual(runtime.trailing_question(rest), expected)
+
+    def test_anything_else_stays_in_the_fold(self):
+        for rest in (REST, "- Is it the pool?", "> Why did it fail?", "Did it fail? It did."):
+            with self.subTest(rest):
+                self.assertEqual(runtime.trailing_question(rest), (rest, ""))
+
+
 class AdapterForTest(unittest.TestCase):
     def setUp(self):
         self.env = mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "1"})
@@ -263,6 +280,21 @@ class SendTest(unittest.TestCase):
         post = adapter.log[0][1]
         self.assertTrue(post["reply_broadcast"])
         self.assertEqual([block["type"] for block in post["blocks"]], ["rich_text", "container", "actions"])
+
+    def test_a_closing_question_posts_after_the_fold(self):
+        question = "Want me to scale the pool to 6 nodes?"
+        adapter = _Adapter()
+        self.send(adapter, f"{ANSWER}\n\n{question}")
+        post = adapter.log[0][1]
+        self.assertEqual(post["text"], f"mrkdwn({ANSWER}\n\n{question})")
+        _headline, fold, after = post["blocks"]
+        self.assertEqual(fold["child_blocks"], _render_blocks(REST, adapter.format_message))
+        self.assertEqual(after, _render_blocks(question, adapter.format_message)[0])
+
+    def test_an_answer_that_is_only_a_lead_and_a_question_has_no_fold(self):
+        adapter = _Adapter()
+        self.send(adapter, f"{HEADLINE} Want me to watch it?")
+        self.assertEqual([block["type"] for block in adapter.log[0][1]["blocks"]], ["rich_text", "section"])
 
     def test_a_top_level_chat_posts_without_a_thread(self):
         adapter = _Adapter()

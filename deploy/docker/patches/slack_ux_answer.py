@@ -31,7 +31,8 @@ that sentence, one longer than :data:`FOLD_TEXT_MAX`, a
 fold ``block_kit`` cannot render or that would hold a block outside
 :data:`FOLD_CHILD_TYPES` (a table or a divider), and an adapter not rendering
 ``rich_blocks``, since upstream would then post text alone. A refused fold
-logs why; a failed post falls back to the upstream send. The folded post
+logs why; a failed post falls back to the upstream send. A closing question posts after
+the fold, unfolded, so an offer is never hidden. The folded post
 carries what upstream's adds: link-preview settings, ``reply_broadcast``, the
 feedback buttons, the status clear and the reply tracking for the thread. An incident report
 that edits its alert never reaches this send, and one whose edit fails opens
@@ -81,6 +82,10 @@ NOT_PROSE = re.compile(r"^\s*(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|`{3,}|~{3,})")
 LOSES_CONTENT = re.compile(r"\]\(|https?://|<[@#!]", re.IGNORECASE)
 #: Holds a code span's place while the rest of the headline is made plain.
 CODE_MARK = "\x01"
+#: Where a sentence in the answer's last line starts: after a sentence end and its space.
+SENTENCE_START = re.compile(r"(?<=[.!?])\s+(?=\S)")
+#: A last line that is not a prose sentence: a quote or a table row, besides :data:`NOT_PROSE`.
+NOT_PROSE_LINE = re.compile(r"^\s*[>|]")
 #: Upstream's per-post ``config.extra`` switches the folded post carries as well.
 REPLY_BROADCAST = "reply_broadcast"
 #: The Slack adapter module's link-preview helper, read from the adapter's own module.
@@ -154,6 +159,20 @@ def split(answer: str) -> tuple[list[tuple[str, bool]], str] | None:
     return headline, rest
 
 
+def trailing_question(rest: str) -> tuple[str, str]:
+    """``(rest, question)``: the rest's last sentence split off when it asks a question, else ``(rest, "")``.
+
+    A question folded away under :data:`FOLD_TITLE` is one nobody sees, so it posts after the fold.
+    """
+    before, _, last_line = rest.rstrip().rpartition("\n")
+    if not last_line.endswith("?") or NOT_PROSE.match(last_line) or NOT_PROSE_LINE.match(last_line):
+        return rest, ""
+    starts = [match.end() for match in SENTENCE_START.finditer(last_line)]
+    cut = starts[-1] if starts else 0
+    kept = "\n".join(part for part in (before, last_line[:cut].rstrip()) if part).strip()
+    return kept, last_line[cut:].strip()
+
+
 def render_fold(rest: str, mrkdwn_fn: Any = None) -> list[dict] | None:
     """``rest`` as the blocks the adapter's own send would render; None, with the reason logged, if it cannot fold."""
     block_kit = _load_block_kit()
@@ -166,21 +185,26 @@ def render_fold(rest: str, mrkdwn_fn: Any = None) -> list[dict] | None:
     return blocks
 
 
-def blocks_answer(headline: list[tuple[str, bool]], fold_blocks: list[dict]) -> list[dict]:
-    """``headline`` in bold, its code runs as code too, then ``fold_blocks`` folded under :data:`FOLD_TITLE`."""
+def blocks_answer(
+    headline: list[tuple[str, bool]], fold_blocks: list[dict], question_blocks: list[dict] = ()
+) -> list[dict]:
+    """``headline`` in bold, its code runs as code too, ``fold_blocks`` folded under :data:`FOLD_TITLE`,
+    then ``question_blocks`` unfolded. No fold when ``fold_blocks`` is empty."""
     bold = [
         {"type": "text", "text": text, "style": {"bold": True, "code": True} if code else {"bold": True}}
         for text, code in headline
     ]
+    fold = {
+        "type": "container",
+        "title": {"type": "plain_text", "text": FOLD_TITLE},
+        "is_collapsible": True,
+        "default_collapsed": True,
+        "child_blocks": fold_blocks,
+    }
     return [
         {"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": bold}]},
-        {
-            "type": "container",
-            "title": {"type": "plain_text", "text": FOLD_TITLE},
-            "is_collapsible": True,
-            "default_collapsed": True,
-            "child_blocks": fold_blocks,
-        },
+        *([fold] if fold_blocks else []),
+        *question_blocks,
     ]
 
 
@@ -218,8 +242,10 @@ class _AnswerFolder:
         headline, rest = parts
         adapter = self._adapter
         mrkdwn_fn = getattr(adapter, "format_message", None)
-        fold_blocks = render_fold(rest, mrkdwn_fn)
-        if not fold_blocks:
+        rest, question = trailing_question(rest)
+        fold_blocks = render_fold(rest, mrkdwn_fn) if rest else []
+        question_blocks = render_fold(question, mrkdwn_fn) if question else []
+        if fold_blocks is None or question_blocks is None:
             return None
         if adapter._outbound_blocked(self._chat_id, OUTBOUND_LABEL):
             # Upstream's send refuses it as well, and says so in its result.
@@ -239,7 +265,7 @@ class _AnswerFolder:
         response = await adapter._client_for(channel, metadata).chat_postMessage(
             channel=channel,
             text=mrkdwn_fn(content) if callable(mrkdwn_fn) else content,
-            blocks=adapter._append_feedback_block(blocks_answer(headline, fold_blocks)),
+            blocks=adapter._append_feedback_block(blocks_answer(headline, fold_blocks, question_blocks)),
             **kwargs,
         )
         ts = str(response.get("ts") or "")
