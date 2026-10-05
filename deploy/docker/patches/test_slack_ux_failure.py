@@ -91,6 +91,31 @@ class PresentTest(unittest.TestCase):
             with self.subTest(reply=reply):
                 self.assertEqual(runtime.present(reply)[1], "")
 
+    def test_a_question_that_needs_a_word_offers_nothing(self):
+        for question in (
+            "What would you like me to do?",
+            "Which namespace should it use?",
+            "Where should I look next?",
+            "How should I proceed?",
+            "Retry on seeded-a, or check seeded-b first?",
+            "Should I retry or stop?",
+        ):
+            with self.subTest(question):
+                self.assertEqual(runtime.present("It failed. " + question)[1], "")
+
+    def test_a_soft_wrapped_first_sentence_is_bolded_whole(self):
+        for reply, bolded in {
+            "I couldn't find\nseeded-z. The fleet has seeded-a.\nCheck it there?":
+                "**I couldn't find seeded-z.** The fleet has seeded-a.\nCheck it there?",
+            "I couldn't find\nseeded-z.\nThe fleet has seeded-a.":
+                "**I couldn't find seeded-z.**\nThe fleet has seeded-a.",
+            "The check stopped on\n- seeded-a\n- seeded-b":
+                "**The check stopped on**\n- seeded-a\n- seeded-b",
+            "The check stopped\n\nIt will retry.": "**The check stopped**\n\nIt will retry.",
+        }.items():
+            with self.subTest(reply=reply):
+                self.assertEqual(runtime.present(reply)[0], bolded)
+
     def test_the_offer_keeps_words_capitalised_anyway(self):
         for question, label in {
             "Retry it?": "retry it",

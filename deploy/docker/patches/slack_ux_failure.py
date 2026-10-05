@@ -17,11 +17,12 @@ couldn't find seeded-z.") and ends on the retry as a question ("Check it
 there?"). Upstream renders that reply like any other, so the failure reads as a
 paragraph and answering it means typing. Nothing here depends on the reply
 taking that shape: any reply to such a wake gets the bold lead, and the button
-only when it ends on a question.
+only when it ends on a yes/no question.
 
 With the flag on, the Slack reply to such a wake is drawn with its first
-sentence in bold and, when it ends on one short question, a choice button
-carrying that question ("check it there"). A click is the clicker answering in
+sentence in bold and, when it ends on one short yes/no question, a choice button
+carrying that question ("check it there"). An open question ("Which namespace
+should it use?") or an either/or stays text, since it needs a word, not a click. A click is the clicker answering in
 the thread with the button's text (``gateway/slack_ux_clicks.py``), so the
 Planning Agent reads it as the user saying yes. The words are the agent's; only
 how they are drawn changes. The ``text`` Slack keeps for notifications and for
@@ -83,6 +84,12 @@ ACTION_ID_PREFIX = "kage_failure"
 #: question with no markup. ``[^.!?]`` keeps it one sentence.
 TRAILING_QUESTION = re.compile(r"(?:^|(?<=[.!?])\s+)([^.!?\n]+)\?\s*$")
 MARKUP = re.compile(r"[*_~`<>\[\]|]")
+#: A question that asks for a word rather than a yes: an open one, by its first
+#: word, or an either/or. Its click would post the question back as the answer.
+OPEN_OPENERS = frozenset({"what", "what's", "whats", "which", "who", "whom", "whose", "when", "where", "why", "how"})
+EITHER_OR = re.compile(r"\bor\b", re.IGNORECASE)
+#: How a sentence ends, so a soft-wrapped lead is not joined past its end.
+SENTENCE_ENDS = (".", "!", "?")
 #: A first word the button may lower: capitalised only for starting the
 #: sentence, so not "I", "I'll", or an acronym.
 LOWERABLE = re.compile(r"^(?!I(?:'|$))[A-Z](?:[a-z]|$)")
@@ -170,28 +177,50 @@ def end(token: Optional[contextvars.Token]) -> None:
 def present(content: str) -> tuple[str, str]:
     """``(content with its first sentence in bold, offer label or "")``.
 
-    The bold is left off when the first line opens with markup or its first
-    sentence holds any, since a ``*`` inside would unpair. The offer is the last
-    sentence when it is one question with no markup that fits a button, with the
-    ``?`` dropped and its first letter lowered unless that would change a word
-    that is capitalised anyway ("I", "OK", "API").
+    A first sentence soft-wrapped onto the next lines is joined onto one line
+    and bolded whole, as ``slack_presenter.split_answer`` reads it; a list item,
+    heading or fence does not continue it. The bold is left off when the first
+    line opens with markup or a list marker, or the first sentence holds markup,
+    since a ``*`` inside would unpair. The offer is the last sentence when it is
+    one yes/no question with no markup that fits a button, with the ``?``
+    dropped and its first letter lowered unless that would change a word that
+    is capitalised anyway ("I", "OK", "API").
     """
     text = content or ""
     lead = text.lstrip()
     indent = text[: len(text) - len(lead)]
-    first, newline, after = lead.partition("\n")
+    lines = lead.split("\n")
+    first, taken = lines[0], 1
+    while (
+        taken < len(lines)
+        and not first.rstrip().endswith(SENTENCE_ENDS)
+        and not _presenter._first_sentence(first)[1]
+        and _continues(lines[taken])
+    ):
+        first = f"{first.rstrip()} {lines[taken].strip()}"
+        taken += 1
     sentence, rest = _presenter._first_sentence(first)
-    if sentence and sentence[0].isalnum() and not MARKUP.search(sentence) and not _presenter.LIST_MARKER.match(first):
-        first = f"**{sentence}**" + (f" {rest}" if rest else "")
-    bolded = indent + first + newline + after
+    if sentence and sentence[0].isalnum() and not MARKUP.search(sentence) and not _presenter.LIST_MARKER.match(lines[0]):
+        bolded = indent + "\n".join([f"**{sentence}**" + (f" {rest}" if rest else "")] + lines[taken:])
+    else:
+        bolded = text
     match = TRAILING_QUESTION.search(text.rstrip())
     question = match.group(1).strip() if match else ""
     if not question or MARKUP.search(question) or len(question) > _presenter.BUTTON_TEXT_MAX:
         return bolded, ""
     word = question.split()[0]
+    if word.lower() in OPEN_OPENERS or EITHER_OR.search(question):
+        return bolded, ""
     if LOWERABLE.match(word):
         question = question[0].lower() + question[1:]
     return bolded, question
+
+
+def _continues(line: str) -> bool:
+    """Whether ``line`` carries on the sentence above it rather than starting a block."""
+    return bool(line.strip()) and not (
+        _presenter.LIST_MARKER.match(line) or _presenter.HEADING.match(line) or _presenter._opens_fence(line)
+    )
 
 
 def maybe_blocks(content: str, render: Callable[[str], Optional[list]]) -> Optional[list]:
