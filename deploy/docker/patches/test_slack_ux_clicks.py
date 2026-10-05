@@ -1338,6 +1338,29 @@ class RuntimeTest(unittest.TestCase):
                 turn = next(entry[1] for entry in adapter.log if entry[0] == "message")
                 self.assertEqual(turn["text"], sent)
 
+    def test_a_typed_apply_as_a_button_from_before_titles_showed_it_drops_the_click(self):
+        # An alert posted before buttons showed titles: its button shows the reply, clipped.
+        title = "Restore the secret payments-db-creds from the GitOps repository"
+        reply = f"apply Option B: {title}"
+        shown = presenter._clip(reply, presenter.BUTTON_TEXT_MAX)
+        typed_title = shown.removeprefix("apply Option B: ")
+        for typed, check in (
+            (f"apply B: {typed_title}", self._drops),
+            (f"apply B: {typed_title.removesuffix('…')}", self._drops),
+            ("apply B: Restore the secret", self._runs),
+        ):
+            with self.subTest(typed=typed):
+                importlib.reload(runtime)
+                adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": typed, "ts": "223.000"}])
+                body, action = _alert_choice(1, reply)
+                button = body["message"]["blocks"][1]["elements"][2]
+                button.update(
+                    action_id=action["action_id"], value=reply, text={"type": "plain_text", "text": shown, "emoji": True},
+                )
+                action["text"]["text"] = shown
+                self._answer(adapter, body, action)
+                check(adapter)
+
     def test_an_incident_click_offers_the_title_as_the_threads_ask(self):
         adapter = _Adapter()
         with mock.patch.object(runtime, "_offer_title", wraps=runtime._offer_title) as title:
