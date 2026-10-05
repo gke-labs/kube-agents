@@ -464,7 +464,9 @@ def test_normalization_does_not_relax_negation():
 
 def test_an_any_of_pattern_is_an_alternative_to_the_phrases():
     v = ReportContainsVerifier(
-        type="report_contains", any_of_phrases=["gave up"], any_of_patterns=[r"\bit stopped"]
+        type="report_contains",
+        any_of_phrases=["gave up"],
+        any_of_patterns=[r"\bit stopped"],
     )
     _stash("**It** stopped.")
     assert v.verify(5.0).status == "pass"
@@ -1650,6 +1652,18 @@ def test_an_any_of_only_pass_says_so_instead_of_all_0_required():
         type="report_contains", any_of_phrases=["HPA", "HorizontalPodAutoscaler"]
     )
     transcript.set("the HPA hit max replicas", [])
+    res = v.verify(5.0)
+    assert res.status == "pass"
+    assert "at least one of 2 alternative phrasing(s)" in res.reason
+
+
+def test_an_any_of_patterns_pass_counts_the_patterns():
+    v = ReportContainsVerifier(
+        type="report_contains",
+        any_of_phrases=["gave up"],
+        any_of_patterns=[r"\bit stopped"],
+    )
+    transcript.set("it stopped after the last attempt", [])
     res = v.verify(5.0)
     assert res.status == "pass"
     assert "at least one of 2 alternative phrasing(s)" in res.reason
@@ -5263,6 +5277,8 @@ _SAYS_STOPPED = "the-reply-says-it-stopped"
         "It timed out and won't be tried again. Retry it with a narrower scope?",
         "It timed out on its final try and won't be retried. Run it again with more time?",
         "Nothing is retrying it automatically. Run it again with a longer limit?",
+        # Kubernetes restarting the pod is the defect, not a retry of the check:
+        "It timed out and won't be retried; the kubelet will restart it as before. Run it again with more time?",
         "Nothing retries it automatically now. Re-run it?",
         # A negation that reaches the verb through "be" or "going to":
         "It stopped and won't be rerun automatically.",
@@ -5325,6 +5341,14 @@ def test_the_final_attempt_objectives_pass_a_reply_that_says_it_stopped(final_me
         ("It stopped. It is going to requeue it.", [_SAYS_RETRIED]),
         ("It stopped. It'll requeue it.", [_SAYS_RETRIED]),
         ("It stopped. The dispatcher will queue it up again.", [_SAYS_RETRIED]),
+        # A restart or another try from the dispatcher is a retry to come:
+        (
+            "The check on invoice-renderer timed out and it stopped. The dispatcher will restart it.",
+            [_SAYS_RETRIED],
+        ),
+        ("It stopped. The dispatcher is restarting it.", [_SAYS_RETRIED]),
+        ("It stopped. The dispatcher will give it another try.", [_SAYS_RETRIED]),
+        ("It stopped, but it'll give it another go.", [_SAYS_RETRIED]),
         ("It timed out twice.", [_SAYS_STOPPED]),
         # "Stopped" or "exhausted" about the failure itself, not the run:
         (

@@ -164,7 +164,7 @@ class ReportContainsVerifier(BaseVerifier):
     Substring matching, deliberately: the task author chose the phrase (a
     planted defect's name, a required noun), so an exact match is fair.
     Anything fuzzier belongs to the judge, not to a blocking check.
-    ``forbidden_patterns`` is the one regex exception, for the shape a
+    ``forbidden_patterns`` is the first regex exception, for the shape a
     substring cannot express: a banned word whose negated uses are
     legitimate ("no guarantee"). Each is ``re.search``ed against a
     line-preserving variant of the same normalization — newlines survive,
@@ -254,10 +254,11 @@ class ReportContainsVerifier(BaseVerifier):
                 reason="; ".join(parts),
             )
         # The success reason has to name every clause that ran, including
-        # any_of_phrases. Counting only required and forbidden made a check
-        # built from any_of alone report "all 0 required phrase(s)", which
-        # reads exactly like a check that asserted nothing -- and the failure
-        # branch above is the only thing that would have said otherwise.
+        # any_of_phrases and any_of_patterns. Counting only required and
+        # forbidden made a check built from any_of alone report "all 0
+        # required phrase(s)", which reads exactly like a check that asserted
+        # nothing -- and the failure branch above is the only thing that would
+        # have said otherwise.
         satisfied = [
             f"all {len(self.required_phrases)} required phrase(s)",
             f"none of {len(self.forbidden_phrases)} forbidden",
@@ -266,9 +267,10 @@ class ReportContainsVerifier(BaseVerifier):
             satisfied.append(
                 f"none of {len(self.forbidden_patterns)} forbidden pattern(s)"
             )
-        if self.any_of_phrases:
+        if self.any_of_phrases or self.any_of_patterns:
             satisfied.append(
-                f"at least one of {len(self.any_of_phrases)} alternative phrasing(s)"
+                "at least one of "
+                f"{len(self.any_of_phrases) + len(self.any_of_patterns)} alternative phrasing(s)"
             )
         return VerificationResult(
             success=True,
