@@ -38,7 +38,8 @@ gitops-repo/
   (`compliance_audit_sop.md` §3a, object `Namespace/<ns>` or the workload's `Kind/name`),
   a cluster off its release channel, without a maintenance window or upgrade notifications, under a
   change freeze, or a node pool with auto-upgrade or auto-repair off
-  (`security_patch_orchestrator_sop.md` §4a, object `Cluster/<name>` or `NodePool/<pool>`, namespace empty).
+  (`security_patch_orchestrator_sop.md` §4a, object `Cluster/<name>` or `NodePool/<pool>`, and `namespace: ""` written out: an omitted key or a
+  YAML null is skipped, not read as empty).
   A choice HCL cannot express — a workload meant to run one replica — goes in an OKF document
   (`type` frontmatter, 06 §5) under `knowledge/` as a `declares:` list in the frontmatter, one item
   per posture with `check` (the slug, `single-replica`), `namespace`, `object` as `Kind/name`, and
