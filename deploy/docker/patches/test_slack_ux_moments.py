@@ -62,7 +62,7 @@ class _Client:
         if self.adapter.fail:
             raise RuntimeError("channel_not_found")
         self.adapter.posts.append(kwargs)
-        return {"ts": POSTED_TS}
+        return {"ts": self.adapter.post_ts}
 
     async def chat_update(self, **kwargs):
         if self.adapter.fail or self.adapter.fail_update:
@@ -83,6 +83,7 @@ class _Adapter:
         self.teams = []
         self.fail = fail
         self.fail_update = False
+        self.post_ts = POSTED_TS
         self.replies = []
         self.reads = []
         self.unauthorized = set()
@@ -569,11 +570,40 @@ class SettleQuestionTest(unittest.TestCase):
         adapter = _Adapter()
         other = {**SUB, "task_id": "t_f1d2"}
         _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        adapter.post_ts = "1700000000.000350"
         _run(runtime.needs_you(adapter, other, QUESTION, 4))
         adapter.replies = [{"ts": "1700000000.000400", "user": "U7", "text": "seeded-b"}]
         _run(runtime.settle_question(adapter, other, "unblocked", 5))
         _run(runtime.settle_question(adapter, SUB, "unblocked", 6))
-        self.assertEqual(["✓" in u["text"] for u in adapter.updates], [True, False])
+        self.assertEqual([(u["ts"], "✓" in u["text"]) for u in adapter.updates],
+                         [("1700000000.000350", True), (POSTED_TS, False)])
+
+    def test_a_reply_not_shown_is_free_for_another_question(self):
+        adapter = _Adapter()
+        other = {**SUB, "task_id": "t_f1d2"}
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        adapter.post_ts = "1700000000.000350"
+        _run(runtime.needs_you(adapter, other, QUESTION, 4))
+        adapter.replies = [{"ts": "1700000000.000400", "user": "U7", "text": "seeded-b"}]
+        adapter.fail_update = True
+        _run(runtime.settle_question(adapter, other, "unblocked", 5))
+        adapter.fail_update = False
+        _run(runtime.settle_question(adapter, SUB, "unblocked", 6))
+        self.assertEqual([(u["ts"], "✓" in u["text"]) for u in adapter.updates], [(POSTED_TS, True)])
+
+    def test_a_retried_question_reads_only_the_replies_before_the_card_asked_again(self):
+        # The reply after the card's next question answers that one, not the question whose settle failed.
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        adapter.fail_update = True
+        _run(runtime.settle_question(adapter, SUB, "unblocked", 4))
+        adapter.fail_update = False
+        adapter.post_ts = "1700000000.000350"
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 5))
+        adapter.replies = [{"ts": "1700000000.000400", "user": "U7", "text": "seeded-b"}]
+        _run(runtime.settle_question(adapter, SUB, "unblocked", 6))
+        self.assertEqual([(u["ts"], "✓" in u["text"]) for u in adapter.updates],
+                         [(POSTED_TS, False), ("1700000000.000350", True)])
 
     def test_a_typed_reply_the_channel_gate_drops_is_not_the_answer(self):
         adapter = _Adapter()
