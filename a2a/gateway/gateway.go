@@ -793,7 +793,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 				rec.Addressee = rec.BusSession
 			}
 		}
-		g.startTask(ctx, rec, msg, principal, authority)
+		g.startTask(ctx, rec, msg, backend, principal, authority)
 	}
 
 	if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
@@ -1184,7 +1184,7 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 	if !g.freshIncarnation(ctx, rec) {
 		return false
 	}
-	g.startTask(ctx, rec, msg, principal, authority)
+	g.startTask(ctx, rec, msg, backend, principal, authority)
 	return true
 }
 
@@ -1421,7 +1421,7 @@ func isMaxBytes(err error) bool {
 
 // startTask mints the identifiers, publishes the submission, and posts the
 // placeholder the relay will edit.
-func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, principal string, authority Authority) {
+func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, backend, principal string, authority Authority) {
 	taskID := "task-" + randHex(taskIDHexWidth)
 	// correlationId is minted here and nowhere else — the originating user
 	// interaction (payload spec field rule).
@@ -1496,8 +1496,12 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	// relay acks what it cannot route and the durable won't redeliver it.
 	rec.ActiveTask = &ActiveTask{TaskID: taskID, CorrelationID: correlationID, StatusMsgID: statusMsgID,
 		Ask: truncateRunes(msg.Text, askCap), SubmittedAt: time.Now(), Capability: capRef}
-	rec.Tasks = append(rec.Tasks, TaskRef{ID: taskID, Addressee: rec.Addressee,
-		CorrelationID: correlationID, Capability: capRef})
+	rec.Tasks = append(rec.Tasks, TaskRef{
+		ID: taskID, Addressee: rec.Addressee, CorrelationID: correlationID, Capability: capRef,
+		Requester:   &TaskRequester{Backend: backend, AuthorID: msg.AuthorID},
+		Attribution: authority.Attribution(),
+		StartedAt:   time.Now().UTC(),
+	})
 	rec.LastTaskActivity = time.Now().UTC()
 	if len(rec.Tasks) > taskHistoryCap {
 		rec.Tasks = rec.Tasks[len(rec.Tasks)-taskHistoryCap:]

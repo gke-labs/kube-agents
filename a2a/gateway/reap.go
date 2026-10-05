@@ -170,29 +170,64 @@ func (g *Gateway) reapSession(ctx context.Context, rec *SessionRecord) {
 // untouched, because this bound is about the copy's horizon, not the
 // task's lifecycle.
 func (g *Gateway) boundAskCopy(ctx context.Context, rec *SessionRecord) {
+	now := time.Now()
 	active := rec.ActiveTask
-	if active == nil || active.Ask == "" || active.SubmittedAt.IsZero() ||
-		time.Since(active.SubmittedAt) < g.cfg.AskTTL {
+	askExpired := active != nil && active.Ask != "" && !active.SubmittedAt.IsZero() &&
+		now.Sub(active.SubmittedAt) >= g.cfg.AskTTL
+	if !askExpired && !g.requesterExpired(rec, now) {
 		return
 	}
 	l := g.lockSession(rec.Key)
 	l.Lock()
 	defer l.Unlock()
 	// Same discipline as the reap: re-check on the fresh record under the
-	// lock, and clear only the copy the scan saw expire.
+	// lock, and clear only the copies the scan saw expire.
 	fresh, err := g.reg.Get(ctx, rec.Key)
-	if err != nil || fresh == nil || fresh.ActiveTask == nil ||
-		fresh.ActiveTask.TaskID != active.TaskID || fresh.ActiveTask.Ask == "" ||
-		fresh.ActiveTask.SubmittedAt.IsZero() ||
-		time.Since(fresh.ActiveTask.SubmittedAt) < g.cfg.AskTTL {
+	if err != nil || fresh == nil {
 		return
 	}
-	fresh.ActiveTask.Ask = ""
+	changed := false
+	if askExpired && fresh.ActiveTask != nil && fresh.ActiveTask.TaskID == active.TaskID &&
+		fresh.ActiveTask.Ask != "" && !fresh.ActiveTask.SubmittedAt.IsZero() &&
+		now.Sub(fresh.ActiveTask.SubmittedAt) >= g.cfg.AskTTL {
+		fresh.ActiveTask.Ask = ""
+		changed = true
+	}
+	// The requester copy on the task history is bounded the same way: the
+	// backend-native id a later child task would be checked against, and the
+	// attribution it would inherit, outlive nothing past the TTL. The entry
+	// itself stays; a delegation from it is refused rather than guessed.
+	for i := range fresh.Tasks {
+		ref := &fresh.Tasks[i]
+		if ref.Requester == nil && ref.Attribution == nil {
+			continue
+		}
+		if ref.StartedAt.IsZero() || now.Sub(ref.StartedAt) < g.cfg.AskTTL {
+			continue
+		}
+		ref.Requester, ref.Attribution = nil, nil
+		changed = true
+	}
+	if !changed {
+		return
+	}
 	if err := g.reg.Put(ctx, fresh); err != nil {
 		g.log.Error("ask bound: record write failed", "session", fresh.Key, "err", err)
 		return
 	}
-	g.log.Info("ask bound: cleared an ask copy past its TTL", "session", fresh.Key, "taskId", fresh.ActiveTask.TaskID)
+	g.log.Info("ask bound: cleared copies past their TTL", "session", fresh.Key)
+}
+
+// requesterExpired reports whether any history entry's requester copy is
+// past AskTTL, from the scan's own view of the record.
+func (g *Gateway) requesterExpired(rec *SessionRecord, now time.Time) bool {
+	for _, ref := range rec.Tasks {
+		if (ref.Requester != nil || ref.Attribution != nil) && !ref.StartedAt.IsZero() &&
+			now.Sub(ref.StartedAt) >= g.cfg.AskTTL {
+			return true
+		}
+	}
+	return false
 }
 
 // buildRehydrationPrimer folds the context's tasks from JetStream into a

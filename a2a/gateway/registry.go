@@ -87,6 +87,16 @@ type SessionRecord struct {
 	Tasks []TaskRef `json:"tasks,omitempty"`
 }
 
+// TaskRequester is the turn's requester in the backend's own vocabulary:
+// what the target's allowlist is keyed on when this turn asks the gateway to
+// mint a child task. It lives in the session-state KV beside the conversation
+// key, which is backend-native already, and never reaches the bus; the bus
+// carries Attribution, which is pseudonymized. Cleared by the reap past AskTTL.
+type TaskRequester struct {
+	Backend  string `json:"backend"`
+	AuthorID string `json:"authorId"`
+}
+
 // TaskRef names one historical task and the authority it ran under: the
 // addressee, the correlation id that threads its envelopes, and the
 // capability it was minted with. A cancel is rebuilt from these.
@@ -110,6 +120,14 @@ type TaskRef struct {
 	// the requester asked for" (terminal `canceled`) from "the executor
 	// died mid-work" (terminal `failed`) — assertion 13's distinction.
 	Canceled bool `json:"canceled,omitempty"`
+	// Requester, Attribution and StartedAt are what a child task minted on
+	// this turn's behalf, or the wake-up turn after it, inherits: the
+	// allowlist is checked against Requester, the child's authority block is
+	// Attribution with fresh grants, and StartedAt is what the AskTTL pass
+	// ages them by. Nil/zero on entries written before the fields existed.
+	Requester   *TaskRequester  `json:"requester,omitempty"`
+	Attribution json.RawMessage `json:"attribution,omitempty"`
+	StartedAt   time.Time       `json:"startedAt,omitempty"`
 }
 
 // MarkCanceled records a published cancel against the task's history entry.

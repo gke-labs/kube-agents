@@ -2358,3 +2358,68 @@ func TestAMintFailureUnderCapabilityOptionalSendsGrantsNull(t *testing.T) {
 		t.Fatalf("grants = %s, want null -- this is the one path that may carry no capability", auth.Grants)
 	}
 }
+
+// TestStartTaskRecordsTheRequester: the history entry carries the backend and
+// the backend-native author id (what the allowlist check compares when this
+// turn asks the gateway to mint a child task) and the pseudonymized
+// attribution, never the plaintext principal.
+func TestStartTaskRecordsTheRequester(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-req"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "how is the fleet?"}
+	r.awaitTask(t, "platform")
+	var rec *SessionRecord
+	waitFor(t, "record with a task", func() bool {
+		rec, _ = r.g.reg.Get(context.Background(), conv)
+		return rec != nil && len(rec.Tasks) == 1
+	})
+	ref := rec.Tasks[0]
+	if ref.Requester == nil || ref.Requester.Backend != "discord" || ref.Requester.AuthorID != "1001" {
+		t.Fatalf("requester = %+v", ref.Requester)
+	}
+	if ref.StartedAt.IsZero() {
+		t.Fatal("startedAt not recorded")
+	}
+	if strings.Contains(string(ref.Attribution), "test:bnaylor") {
+		t.Fatalf("attribution carries the plaintext principal: %s", ref.Attribution)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(ref.Attribution, &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m["requester"]; !ok {
+		t.Fatalf("attribution lacks requester: %s", ref.Attribution)
+	}
+	if _, ok := m["grants"]; ok {
+		t.Fatalf("attribution carries grants: %s", ref.Attribution)
+	}
+}
+
+// TestAskTTLClearsTheRequesterToo: past AskTTL the history entry drops its
+// requester and attribution the way ActiveTask drops its Ask; the entry itself
+// stays, as do entries written before the fields existed.
+func TestAskTTLClearsTheRequesterToo(t *testing.T) {
+	r := startRigWith(t, func(c *Config) { c.AskTTL = time.Minute })
+	conv := "discord:g1/thread-ttl"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "x"}
+	r.awaitTask(t, "platform")
+	ctx := context.Background()
+	var rec *SessionRecord
+	waitFor(t, "record", func() bool { rec, _ = r.g.reg.Get(ctx, conv); return rec != nil && len(rec.Tasks) == 1 })
+	rec.Tasks[0].StartedAt = time.Now().Add(-2 * time.Minute)
+	rec.Tasks = append(rec.Tasks, TaskRef{ID: "task-legacy", Addressee: "platform"}) // pre-field entry
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	r.g.boundAskCopy(ctx, rec)
+	fresh, _ := r.g.reg.Get(ctx, conv)
+	if fresh.Tasks[0].Requester != nil || fresh.Tasks[0].Attribution != nil {
+		t.Fatalf("requester survived the TTL: %+v", fresh.Tasks[0])
+	}
+	if fresh.Tasks[1].ID != "task-legacy" {
+		t.Fatalf("legacy entry disturbed: %+v", fresh.Tasks[1])
+	}
+	if fresh.ActiveTask == nil || fresh.ActiveTask.Ask == "" {
+		t.Fatalf("the active task's fresh ask was cleared: %+v", fresh.ActiveTask)
+	}
+}
