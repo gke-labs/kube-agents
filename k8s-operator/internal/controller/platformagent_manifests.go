@@ -1808,6 +1808,10 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		// opt back into the mode that corrupts the file every other profile shares
 		// the volume with.
 		Database *managedDatabaseConfig `json:"database,omitempty"`
+		// Hooks carries the bridge activity door's pod-wide entry under
+		// mode next with a bridge declared (a2aActivityHook); absent
+		// otherwise, so a default install's config is unchanged.
+		Hooks *managedHooks `json:"hooks,omitempty"`
 	}{}
 
 	// Model. The endpoint every profile in the pod reasons through, and the setting
@@ -1857,6 +1861,8 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		*agent.Spec.Deployment.Availability.RuntimeClassName != "" {
 		cfg.Database = &managedDatabaseConfig{JournalMode: sqliteJournalModeDelete}
 	}
+
+	cfg.Hooks = a2aActivityHook(agent)
 
 	cfg.Display.Platforms = map[string]map[string]any{}
 
@@ -2995,6 +3001,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				Value: a2aAgentBusUser,
 			},
 		)
+	}
+	if a2aActivityHookWanted(agent) {
+		envVars = append(envVars, a2aActivitySecretEnv(agent))
 	}
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "PATH",
