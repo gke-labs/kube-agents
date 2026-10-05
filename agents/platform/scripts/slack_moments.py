@@ -415,7 +415,9 @@ def _question(reason: str, buttons: bool) -> tuple[str, list[str], list[str]]:
     # A clipped headline keeps its whole line below it too, measured as shown, and so
     # does one with a link: the headline shows only the label, the line below the url.
     below = 0 if len(_headline_text(first)) > _presenter.HEADLINE_MAX or _presenter.MD_LINK.search(first) else 1
-    return first, [*before, *lines[below:start]], options
+    # Linked options likewise stay in the detail: their buttons show only the label.
+    end = len(lines) if any(_presenter.MD_LINK.search(line) for line in lines[start:]) else start
+    return first, [*before, *lines[below:end]], options
 
 
 def _detail(lines: Sequence[str]) -> str:
