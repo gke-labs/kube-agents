@@ -3961,13 +3961,15 @@ def test_the_question_wake_case_grades_silence_with_the_gateway_predicate():
 _RETRY_CASE = TASKS / "chat-voice-retry-says-it-is-retried" / "task.yaml"
 _CRASHED = "The worker checking invoice-renderer on bench-sandbox crashed."
 _NO_INTERNALS = "the-reply-names-no-internals"
+_NAMES_WORKLOAD = "the-reply-names-the-workload"
 
 
 def _report_misses(case: Path, final_message: str) -> list[str]:
     """``case``'s report_contains objectives that fail on ``final_message``.
 
-    The no-internals check has its own test, so the retry wording rows
-    can keep their worker, card and agent names.
+    The no-internals and workload checks have their own tests, so the
+    wording rows can keep their worker, card and agent names and need not
+    name invoice-renderer.
     """
     spec = yaml.safe_load(case.read_text())
     transcript.set(final_message, [], final_message=final_message)
@@ -3975,7 +3977,7 @@ def _report_misses(case: Path, final_message: str) -> list[str]:
         entry["name"]
         for entry in spec["verification_spec"]
         if entry["check"]["type"] == "report_contains"
-        and entry["name"] != _NO_INTERNALS
+        and entry["name"] not in (_NO_INTERNALS, _NAMES_WORKLOAD)
         and not ReportContainsVerifier(**entry["check"]).verify(timeout_sec=1).success
     ]
 
@@ -5201,6 +5203,27 @@ def test_every_failure_voice_case_names_no_internals(case, final_message, named)
     (check,) = [e["check"] for e in spec if e["name"] == _NO_INTERNALS]
     transcript.set(final_message, [], final_message=final_message)
     assert ReportContainsVerifier(**check).verify(timeout_sec=1).success is not named
+
+
+@pytest.mark.parametrize("case", [_RETRY_CASE, _FINAL_CASE])
+@pytest.mark.parametrize(
+    ("final_message", "named"),
+    [
+        ("The look into invoice-renderer's restarts on bench-sandbox stopped.", True),
+        ("The **invoice-renderer** check crashed.", True),
+        ("The `invoice-renderer` check crashed.", True),
+        ("The Invoice Renderer check timed out.", True),
+        # The pinned wording rows' bare replies: nothing says which work it was.
+        ("It stopped. Nothing will be retried.", False),
+        ("It crashed and is being retried.", False),
+        ("The restart check on bench-sandbox crashed.", False),
+    ],
+)
+def test_every_worker_voice_case_needs_the_planted_workload(case, final_message, named):
+    spec = yaml.safe_load(case.read_text())["verification_spec"]
+    (check,) = [e["check"] for e in spec if e["name"] == _NAMES_WORKLOAD]
+    transcript.set(final_message, [], final_message=final_message)
+    assert ReportContainsVerifier(**check).verify(timeout_sec=1).success is named
 
 
 _FAILURE_WHY = "The service account lacks container.deployments.update there."

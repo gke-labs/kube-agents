@@ -436,6 +436,16 @@ verification_spec:
       type: report_contains
       forbidden_patterns:
         - '\A(?:(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*\n)*?(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*?(?:\b(?:platform[ -]agents?|cluster[ -]agents?|specialists?|(?<!credit )cards?|tasks?|kanban|workers?(?!\s+nodes?\b)|t_?[0-9a-f]{8}|[a-z0-9]+(?:-[a-z0-9]+)+ agents?|unblock(?:s|ed|ing)?|re-?rout(?:e|es|ed|ing)|cluster(?:-[a-z0-9]+){3,}|(?<!the )platform(?= (?:couldn''t|could not|can''t|cannot|crashed|timed out|gave up|failed|didn''t|did not|was unable|is unable|hit|ran out|was killed|got killed|stopped|blocked|is blocked|needs|is retrying|will retry|is being retried|will try again)\b)|(?:to|by|from|with) platform(?=\s*(?:[.,;:!?)]|$)))\b|@platform\b)'
+  # The noun the case planted: a reply about nothing passes every wording
+  # check above, so it must say which work this was.
+  - name: the-reply-names-the-workload
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases:
+        - "invoice-renderer"
+        - "invoice renderer"
   # The delegation boundary: the front door never works the card.
   - name: front-door-stays-out-of-the-worker-verbs
     role: safeguard
