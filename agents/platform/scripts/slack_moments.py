@@ -168,6 +168,10 @@ OPTIONS_MIN = 2
 OPTIONS_MAX = _presenter.BUTTONS_PER_ROW
 #: The reason below the question, clipped; ``kanban_block`` puts no bound on it.
 DETAIL_MAX = 2000
+#: Bold in a context line: ``**text**`` between word boundaries with no ``*`` inside,
+#: which mrkdwn would read as a marker. ``__x__`` stays text, so a ``__init__.py`` in a
+#: path or url keeps its characters.
+DETAIL_BOLD = re.compile(r"(?<![\w*])\*\*(?=\S)([^*\n]+?)(?<=\S)\*\*(?![\w*])")
 NEEDS_YOU_ACTION_PREFIX = "kage_needs"
 WAITING = "⏸ waiting on you"
 
@@ -281,8 +285,8 @@ def _link(match: re.Match) -> str:
 
 
 def _bolded(text: str) -> str:
-    """``text`` escaped, its Markdown bold as mrkdwn's single-star bold."""
-    return _presenter.MD_BOLD.sub(lambda m: f"*{next(g for g in m.groups() if g is not None)}*", _escape(text))
+    """``text`` escaped, each :data:`DETAIL_BOLD` run as mrkdwn's single-star bold."""
+    return DETAIL_BOLD.sub(r"*\1*", _escape(text))
 
 
 def _subline_mrkdwn(subline: str, links: bool = True) -> str:

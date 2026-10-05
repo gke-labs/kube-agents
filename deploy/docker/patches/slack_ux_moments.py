@@ -251,7 +251,7 @@ def _clicked(channel: str, ts: str) -> bool:
 
 def _without_choices(text: str) -> str:
     """The question's ``text`` without its last "Reply with one of:" line, which
-    asks for an answer that has arrived; ``slack_ux_clicks`` drops it the same way."""
+    asks for an answer that has arrived, as ``slack_ux_clicks._answered_text`` drops it."""
     body, _nl, last = text.rpartition("\n")
     return body.rstrip("\n") if body and last.startswith(_presenter.CHOICES_LEAD) else text
 

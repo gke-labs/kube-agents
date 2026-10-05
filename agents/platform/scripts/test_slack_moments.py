@@ -371,10 +371,18 @@ class NeedsYouTest(unittest.TestCase):
         )
 
     def test_bold_in_the_detail_is_slack_bold_outside_code(self):
-        blocks, _ = m.needs_you("Which pod should I restart?\n**web-1** is __OOMKilled__, not `**x**`.\n- web-1\n- web-2")
-        self.assertEqual(
-            blocks[1]["elements"][0]["text"], "*web-1* is *OOMKilled*, not `**x**`.\n- web-1\n- web-2"
-        )
+        blocks, _ = m.needs_you("Which pod should I restart?\n**web-1** is OOMKilled, not `**x**`.\n- web-1\n- web-2")
+        self.assertEqual(blocks[1]["elements"][0]["text"], "*web-1* is OOMKilled, not `**x**`.\n- web-1\n- web-2")
+
+    def test_a_dunder_or_a_star_inside_bold_keeps_its_characters(self):
+        for detail in (
+            "See https://github.com/a/b/blob/main/pkg/__init__.py now",
+            "__DB_HOST__ unset",
+            "**/tmp/*.log** filled",
+            "re**start**ed",
+        ):
+            blocks, _ = m.needs_you(f"Which?\n{detail}")
+            self.assertEqual(blocks[1]["elements"][0]["text"], detail)
 
     def test_a_link_that_is_not_safe_stays_escaped_text(self):
         blocks, _ = m.needs_you("Which?\nSee [<@U1>](javascript:alert) now.")
