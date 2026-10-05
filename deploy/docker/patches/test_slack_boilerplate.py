@@ -1310,8 +1310,14 @@ class RootTest(unittest.TestCase):
         root = _Root()
         self.addCleanup(root.cleanup)
         root.cleanup()
-        # Repeated calls should not raise ValueError (e.g. sys.path.remove)
+        # A second call must be a no-op, not a repeat: re-running forget and
+        # restore would evict whatever a newer root has imported since.
+        later = _Root()
+        self.addCleanup(later.cleanup)
+        delivery = later.load(applier.DELIVERY, "cron.scheduler_delivery")
+        delivery["_deliver_result"]({"id": "j1"}, "hello", [_target("slack")])
         root.cleanup()
+        self.assertIn("gateway.platforms.base", sys.modules)
 
 
 if __name__ == "__main__":
