@@ -133,6 +133,8 @@ ADDED_AFTER_THE_MOVED_BLOCK = [
     "vcs-review-feedback-read-back",
     # #1918: a second proposal under a branch name its first proposal spent.
     "vcs-spent-branch-reuse",
+    # #2201: a request for gh answered through the verbs.
+    "vcs-forge-cli-request-uses-the-verbs",
 ]
 # Registered after the moved block, in file order, by the pull request that
 # authored each case.

@@ -7,8 +7,8 @@
 # roster on 2026-09-02 (#1189) and, when the presubmit became the blocking
 # roster only (#1023), moved to the nightly with the other held-out cases
 # (434/681 graded presubmit repetitions 2026-09-15 to 09-22; since #1780 it
-# is graded by pull_request_opened, and nothing sweeps the *-infra
-# repositories between runs, #1755 item 2). Re-admission bar: #1189's.
+# is graded by pull_request_opened; since #2260 the job empties the *-infra
+# repository before every repetition, #1755 item 2). Re-admission bar: #1189's.
 # Parked 2026-08-26→27 because its cost and signal were unmeasured (the
 # 2026-08-26 run's 85-minute deadline expired before it ever started); the
 # activating pull request's own smoke run is the clean measured run it was
@@ -55,18 +55,19 @@
 # Every run leaves a pull request behind. Nothing in the skill closes it --
 # submit-suggestion gets no dedupe, unlike fleet-audit's `remediate`, which
 # keys the branch on the touched files and closes the PR when the finding
-# stops reproducing. What bounds the accumulation is the pool sweep
-# (hack/ci_sweep_agent_pulls.py --pool, a Prow periodic), which closes the
-# agent bot's open PRs on each free project's *-infra repo between leases and
-# deletes their branches (a leftover branch refuses an identical fix). A
-# job usually inherits none, its own reps accumulate within it, and the
-# head-commit check keeps an inherited one out of grading -- which is why this
+# stops reproducing. What bounds the accumulation is the job's own reset
+# (hack/ci_reset_agent_pulls.py, #2260), which closes the agent bot's open
+# PRs and deletes every branch but the default at lease time and before
+# every repetition of this case, with the pool sweep
+# (hack/ci_sweep_agent_pulls.py --pool, a Prow periodic) behind it for what
+# a run killed hard left (a leftover branch refuses an identical fix). The
+# head-commit check keeps anything inherited out of grading -- which is why this
 # scenario asserts on the PR URL its own run produced rather than on repo state.
 #
 # Isolation class: read-only on the cluster; unbounded write to the eval
 # GitOps repo. Presubmit-eligible on the same terms as the audit scenarios
-# (throwaway repo, token scoped to it), with the within-job accumulation above
-# accepted; the pool sweep bounds it across leases. Eligible tier: presubmit
+# (throwaway repo, token scoped to it); the reset above empties the repository
+# between repetitions and the pool sweep bounds it across leases. Eligible tier: presubmit
 # once re-admitted; active there 2026-08-27 to 2026-09-22, nightly since.
 id: rca-remediation-pr
 name: RCA lands its fix as a pull request, never on the cluster

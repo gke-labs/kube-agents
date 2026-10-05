@@ -172,7 +172,8 @@ and drops the custom roles; `SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATI
 `SCOPE_SHARED_VPC_HOSTS` or `SCOPE_METRICS_SCOPES` absent
 renders an empty list for it in the scope block, which revokes the read roles in every project,
 folder, organisation or selector member it named and retires those projects' Cluster Agent profiles over the
-reconcile's next two clean runs.
+reconcile's next two clean runs; `SCOPE_MAX_PROJECTS` absent writes no cap, so the default of 100
+returns and the projects past it read `over-cap` (or the plan is refused, while a selector is declared).
 The file `install.sh` writes at the end of a first install carries every one of these, so
 the hazard is a hand edit that deletes a line rather than setting it to `false`. Run
 `./upgrade.sh --plan` before a full upgrade and read any `destroy` line as missing
@@ -253,9 +254,9 @@ which used to replace the Secret and restart every pod holding it.
 ### Projects, folders, organisations and selectors in scope
 
 `SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_SHARED_VPC_HOSTS`,
-`SCOPE_METRICS_SCOPES`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` are the
-`PlatformAgent`'s `spec.scope`, declared once and reaching both halves of the install from the
-same value: the generator renders them as the composition's `scope` object, the IAM module binds
+`SCOPE_METRICS_SCOPES`, `SCOPE_MAX_PROJECTS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS`
+are the `PlatformAgent`'s `spec.scope`, declared once and reaching both halves of the install from
+the same value: the generator renders them as the composition's `scope` object, the IAM module binds
 the read roles in every project named, the read roles plus `roles/cloudasset.viewer` on every
 folder and organisation named, and the read roles in every project a Shared VPC host or Metrics
 Scope resolves to, and the chart renders the same object into the CR. The lists are space- or
@@ -301,13 +302,11 @@ warning, since the plan reports a disabled API with the same command as its reme
 generate-only handoff prints the command above the apply, `install.sh --dry-run` skips its plan
 with the command while an API a declared selector reads is off (a dry run enables nothing, and its plan would
 otherwise be refused for a reason the real run does not have), and `upgrade.sh` does none of it,
-because an existing install has them on. The reconcile lists at most 100 projects of the resolved
+because an existing install has them on. The reconcile lists at most `SCOPE_MAX_PROJECTS` projects (100 by default) of the resolved
 set, the management project included, so a declaration whose management project, `SCOPE_PROJECTS`
 and selector members together exceed that (once each, less an exact `SCOPE_EXCLUDE_PROJECTS` entry; a
 project both in `SCOPE_PROJECTS` and excluded by its number stays counted, so drop it from `SCOPE_PROJECTS`)
-is refused at plan rather than bound in full while a selector is declared (without one the count is
-the CRD's own, and a plan that declares none is not refused for it), and a single selector past it is
-refused at its read.
+is refused at plan rather than bound in full while a selector is declared or the cap is below its default (without a selector and at the default the count is the CRD's own, and such a plan is not refused for it), and a single selector past it is refused at its read.
 
 The block is written on every run, empty lists included: an emptied `projects` list is the
 declaration that drops projects, and a missing block would declare nothing, so removing a
@@ -319,8 +318,14 @@ and the Day-2 menu read the keys from `install.env` alone (`load_install_env` dr
 inherited from the shell, as it does `NAMESPACE`, and `install.sh` does the same once an
 `install.env` exists); `install.sh` also takes the `--scope-*` flags, and on a first install
 the environment, and records them, and an empty `--scope-*=` is refused. A malformed
-`SCOPE_EXCLUDE_CLUSTERS`, `SCOPE_FOLDERS` or `SCOPE_ORGANIZATIONS` entry stops every front door but
-`uninstall.sh`, retags included, until the line is fixed; there is no bypass.
+`SCOPE_EXCLUDE_CLUSTERS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS` or `SCOPE_MAX_PROJECTS` entry stops every front door but
+`uninstall.sh`, retags included, until the line is fixed; there is no bypass. `SCOPE_MAX_PROJECTS` is
+`spec.scope.maxProjects`, the most projects the reconcile lists per run (1 to 5000): empty, the
+default, leaves the CRD's 100 in force and writes no `max_projects` into the scope block; a value
+is rendered into the block, refused at plan time when the explicit projects and selector members
+exceed it (while a selector is declared or the cap is below its default), and read by the live-scope
+check as part of the declaration, so a cap set on the CR by
+hand is reported like any hand edit until the key records it.
 
 Before a full apply the front doors read the live `PlatformAgent` through the install's own
 kubeconfig context and refuse when it carries a scope that neither the release record nor the

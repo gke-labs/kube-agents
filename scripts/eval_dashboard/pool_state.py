@@ -420,6 +420,14 @@ def check_of(document: dict | None, project: str, finding_id: str) -> str:
     return str(finding(document, project, finding_id).get(KEY_CHECK) or "")
 
 
+def passes_leases(finding_id: str) -> bool:
+    """Whether a run that leases the project passes with this finding on it.
+    The verifier classifies the finding (LEASE_SILENT_FINDINGS, beside the
+    finding itself); health.py words the pool-drift advice from the answer,
+    since the default advice tells a pull request its 403 is the pool's."""
+    return finding_id in verifier.LEASE_SILENT_FINDINGS
+
+
 def checked_projects(document: dict | None) -> int:
     """Projects where at least one GCP check read anything; a partial read
     is not a blind scan, and the GitHub read alone is not a read of the

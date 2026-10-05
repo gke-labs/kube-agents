@@ -292,7 +292,7 @@ bootstrap_install_env() {
   # next run from a clean shell. A first install, which has no file yet, keeps
   # the environment and records it; a typed --scope-* flag still overrides
   # for one run and is warned about.
-  unset SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_SHARED_VPC_HOSTS SCOPE_METRICS_SCOPES SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
+  unset SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_SHARED_VPC_HOSTS SCOPE_METRICS_SCOPES SCOPE_MAX_PROJECTS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
   # Checked before sourcing: a stray quote would otherwise abort the run through
   # the ERR trap with a bash parse error and no indication of which file.
   if ! bash -n "$file" 2>/dev/null; then
@@ -402,6 +402,8 @@ PARAM_SCOPE_FOLDERS="${SCOPE_FOLDERS:-}"
 PARAM_SCOPE_ORGANIZATIONS="${SCOPE_ORGANIZATIONS:-}"
 PARAM_SCOPE_SHARED_VPC_HOSTS="${SCOPE_SHARED_VPC_HOSTS:-}"
 PARAM_SCOPE_METRICS_SCOPES="${SCOPE_METRICS_SCOPES:-}"
+# Empty means the CRD's default cap (100); a value is spec.scope.maxProjects.
+PARAM_SCOPE_MAX_PROJECTS="${SCOPE_MAX_PROJECTS:-}"
 PARAM_SCOPE_EXCLUDE_PROJECTS="${SCOPE_EXCLUDE_PROJECTS:-}"
 PARAM_SCOPE_EXCLUDE_CLUSTERS="${SCOPE_EXCLUDE_CLUSTERS:-}"
 # Whether a --scope-* flag was typed: the Day-2 menu reads the keys from
@@ -612,6 +614,9 @@ Flags for AI Agents & Automation:
                                 read roles (and roles/compute.viewer in the host, for the lookup)
   --scope-metrics-scopes=IDS    Metrics Scope scoping-project IDs; every project the scope
                                 monitors is in scope, resolved and granted the same way
+  --scope-max-projects=N        The most projects the reconcile lists per run, the management
+                                project included (spec.scope.maxProjects; 1 to 5000, 100 when
+                                unset); a project past it reads over-cap
   --scope-exclude-projects=IDS  Project IDs or shell-style globs (*-sandbox) to leave
                                 unmanaged
   --scope-exclude-clusters=TRIPLES
@@ -789,6 +794,7 @@ require_scope_flag_value() {
     --scope-organizations) key="SCOPE_ORGANIZATIONS" ;;
     --scope-shared-vpc-hosts) key="SCOPE_SHARED_VPC_HOSTS" ;;
     --scope-metrics-scopes) key="SCOPE_METRICS_SCOPES" ;;
+    --scope-max-projects) key="SCOPE_MAX_PROJECTS" ;;
     --scope-exclude-projects) key="SCOPE_EXCLUDE_PROJECTS" ;;
     --litellm-redaction-ip-action) key="LITELLM_REDACTION_IP_ACTION" ;;
     --litellm-redaction-ip-allow-cidrs) key="LITELLM_REDACTION_IP_ALLOW_CIDRS" ;;
@@ -852,6 +858,9 @@ parse_args() {
       --scope-metrics-scopes=*)
         PARAM_SCOPE_METRICS_SCOPES="${1#*=}"; SCOPE_FLAG_PASSED="true"
         require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_METRICS_SCOPES"; shift ;;
+      --scope-max-projects=*)
+        PARAM_SCOPE_MAX_PROJECTS="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_MAX_PROJECTS"; shift ;;
       --scope-exclude-projects=*)
         PARAM_SCOPE_EXCLUDE_PROJECTS="${1#*=}"; SCOPE_FLAG_PASSED="true"
         require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_EXCLUDE_PROJECTS"; shift ;;
@@ -1984,13 +1993,14 @@ bootstrap_install_env_file() {
     # next full upgrade regenerates from the file, so a project the file does
     # not name is dropped again, its bindings revoked and its profiles retired.
     local scope_key scope_flag scope_value
-    for scope_key in SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_SHARED_VPC_HOSTS SCOPE_METRICS_SCOPES SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS; do
+    for scope_key in SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_SHARED_VPC_HOSTS SCOPE_METRICS_SCOPES SCOPE_MAX_PROJECTS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS; do
       case "$scope_key" in
         SCOPE_PROJECTS) scope_flag="--scope-projects"; scope_value="${PARAM_SCOPE_PROJECTS:-}" ;;
         SCOPE_FOLDERS) scope_flag="--scope-folders"; scope_value="${PARAM_SCOPE_FOLDERS:-}" ;;
         SCOPE_ORGANIZATIONS) scope_flag="--scope-organizations"; scope_value="${PARAM_SCOPE_ORGANIZATIONS:-}" ;;
         SCOPE_SHARED_VPC_HOSTS) scope_flag="--scope-shared-vpc-hosts"; scope_value="${PARAM_SCOPE_SHARED_VPC_HOSTS:-}" ;;
         SCOPE_METRICS_SCOPES) scope_flag="--scope-metrics-scopes"; scope_value="${PARAM_SCOPE_METRICS_SCOPES:-}" ;;
+        SCOPE_MAX_PROJECTS) scope_flag="--scope-max-projects"; scope_value="${PARAM_SCOPE_MAX_PROJECTS:-}" ;;
         SCOPE_EXCLUDE_PROJECTS) scope_flag="--scope-exclude-projects"; scope_value="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}" ;;
         *) scope_flag="--scope-exclude-clusters"; scope_value="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}" ;;
       esac
@@ -2064,6 +2074,7 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" SCOPE_ORGANIZATIONS "${SCOPE_ORGANIZATIONS:-}"
   write_env_var "$tmp" SCOPE_SHARED_VPC_HOSTS "${SCOPE_SHARED_VPC_HOSTS:-}"
   write_env_var "$tmp" SCOPE_METRICS_SCOPES "${SCOPE_METRICS_SCOPES:-}"
+  write_env_var "$tmp" SCOPE_MAX_PROJECTS "${SCOPE_MAX_PROJECTS:-}"
   write_env_var "$tmp" SCOPE_EXCLUDE_PROJECTS "${SCOPE_EXCLUDE_PROJECTS:-}"
   write_env_var "$tmp" SCOPE_EXCLUDE_CLUSTERS "${SCOPE_EXCLUDE_CLUSTERS:-}"
   write_env_var "$tmp" GITOPS_ORG "${GITOPS_ORG:-}"
@@ -3055,7 +3066,7 @@ print_generate_only_handoff() {
   echo -e "  KUBE_AGENTS_STATE_BUCKET=\"${state_bkt}\" KUBE_AGENTS_STATE_PREFIX=\"${state_pfx}\" ./lifecycle.sh apply"
   echo -e "  # The live-scope check does not run here. On an existing install, a scope the PlatformAgent"
   echo -e "  # carries that the SCOPE_* keys in install.env do not declare (SCOPE_PROJECTS, SCOPE_FOLDERS,"
-  echo -e "  # SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES and the two exclusions)"
+  echo -e "  # SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_MAX_PROJECTS and the two exclusions)"
   echo -e "  # is replaced by this apply, and the reconcile"
   echo -e "  # retires what it drops; read spec.scope off the PlatformAgent and record it first."
   if [[ "${SCOPE_FOLDERS:-}${SCOPE_ORGANIZATIONS:-}" == *[![:space:],]* ]]; then
@@ -4491,7 +4502,7 @@ main() {
     # flag here would be validated and then dropped without a word.
     if [ "$SCOPE_FLAG_PASSED" = "true" ]; then
       print_error "--menu takes no --scope-* flag: it edits install.env in place and reads the scope keys from there."
-      print_info "Set SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_EXCLUDE_PROJECTS or SCOPE_EXCLUDE_CLUSTERS in install.env, or pass the flag to a plain install.sh run."
+      print_info "Set SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_MAX_PROJECTS, SCOPE_EXCLUDE_PROJECTS or SCOPE_EXCLUDE_CLUSTERS in install.env, or pass the flag to a plain install.sh run."
       exit 1
     fi
     run_menu_system
@@ -5356,6 +5367,7 @@ main() {
   local scope_organizations="${PARAM_SCOPE_ORGANIZATIONS:-}"
   local scope_shared_vpc_hosts="${PARAM_SCOPE_SHARED_VPC_HOSTS:-}"
   local scope_metrics_scopes="${PARAM_SCOPE_METRICS_SCOPES:-}"
+  local scope_max_projects="${PARAM_SCOPE_MAX_PROJECTS:-}"
   local scope_exclude_projects="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}"
   local scope_exclude_clusters="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}"
   # This is the only place this rule runs: the installer library's copy went
@@ -5376,6 +5388,10 @@ main() {
     print_error "--enable-gvisor must be either true or false."
     exit 1
   fi
+  # The cap's bounds are the CRD's; checked here, once installer_common.sh is
+  # sourced (parse_args refuses only an empty value), and again by the tfvars
+  # writer for a value install.env carries on the other front doors.
+  require_scope_max_projects "$scope_max_projects" || exit 1
   if [[ ! "$PARAM_ENABLE_WEBUI" =~ ^(true|false)$ ]]; then
     print_error "--enable-hermes-dashboard must be either true or false."
     exit 1
@@ -5691,6 +5707,7 @@ main() {
   export SCOPE_ORGANIZATIONS="$scope_organizations"
   export SCOPE_SHARED_VPC_HOSTS="$scope_shared_vpc_hosts"
   export SCOPE_METRICS_SCOPES="$scope_metrics_scopes"
+  export SCOPE_MAX_PROJECTS="$scope_max_projects"
   export SCOPE_EXCLUDE_PROJECTS="$scope_exclude_projects"
   export SCOPE_EXCLUDE_CLUSTERS="$scope_exclude_clusters"
   export GITOPS_ORG="$github_org"

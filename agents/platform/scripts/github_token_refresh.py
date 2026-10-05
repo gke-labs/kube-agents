@@ -9,14 +9,17 @@ deployments continue to use the direct path.
 
 import argparse
 import email.message
+import http.client
 import io
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Sequence
@@ -84,6 +87,58 @@ READ_ONLY_FLAG = "--read-only"
 MINTY_REQUEST_TIMEOUT_SECONDS = 5
 CLI_SETUP_TIMEOUT_SECONDS = 15
 GCLOUD_TIMEOUT_SECONDS = 5
+
+#: Under a metadata-server identity the token gcloud prints comes from this
+#: endpoint, so it is asked directly: one GET answered in tens of milliseconds,
+#: where a cold gcloud process on a busy pod has taken longer than its five
+#: seconds and failed the refresh (#2175). `format=full` is what google-auth
+#: sends for gcloud, so the token is the same one. The address rather than
+#: `metadata.google.internal`, so the timeout covers the whole attempt: a name
+#: lookup has no bound of its own and walks the pod's search list when cluster
+#: DNS is down. A slow answer is retried once; a refused connection, an error
+#: status or an empty body falls through at once.
+METADATA_IDENTITY_URL = (
+    "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/identity"
+)
+METADATA_FLAVOR_HEADER = {"Metadata-Flavor": "Google"}
+METADATA_TOKEN_FORMAT = "full"
+METADATA_TIMEOUT_SECONDS = 3
+METADATA_MAX_ATTEMPTS = 2
+METADATA_RETRY_DELAY_SECONDS = 0.5
+#: An identity token is a JWT of about a kilobyte; anything else at the
+#: address (an error page, a proxy's answer) is not a token and falls through.
+#: Each attempt runs under a wall-clock bound in a worker thread, because the
+#: socket timeout bounds each connect and receive and not the whole answer.
+METADATA_TOKEN_MAX_BYTES = 8192
+METADATA_READ_CHUNK_BYTES = 1024
+#: The shape the proxy's redactor uses for the same token: a JWT header is a
+#: JSON object, so its base64url begins `eyJ`, and no segment is short.
+JWT_SHAPE = re.compile(r"^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$")
+#: A credential file named by either of these is the identity gcloud presents,
+#: and it need not be the instance's: the metadata server is asked only when
+#: neither names one, so a host that pointed gcloud at a key keeps minting as
+#: that account. (The federated placement names its external_account file
+#: here and is served by fetch_identity_token before this is consulted.)
+CREDENTIAL_FILE_VARIABLES = ("CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE", "GOOGLE_APPLICATION_CREDENTIALS")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A 3xx from the metadata address is an error, not a hop to follow."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+#: Opened without a proxy and without following redirects: the broker forwards
+#: HTTP_PROXY into this helper for its GitHub and Minty traffic, and a
+#: link-local metadata address must never be sent through it or lead anywhere
+#: else. Module-level so a test can stand in for it.
+metadata_open = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect()).open
+
+#: How the broker identity token was minted on this run, for the one line the
+#: refresh writes last: the sidecar logs the tail of this helper's output, so
+#: the branch and its duration have to be on the last line to be read.
+identity_note = {"minted": "", "fell_through": ""}
 
 #: The retry policy for one Minty request, shared by the write and the read-only
 #: mint: three attempts, half a second before the second, doubling after.
@@ -254,53 +309,185 @@ def get_current_git_repo(cwd: str | None = None) -> str | None:
     return None
 
 
-def broker_oidc_token() -> str:
-    """The Google OIDC identity token Minty authenticates the caller by.
+def describe_failure(exc: BaseException) -> str:
+    """A subprocess failure with what the command printed, not only its exit code.
 
-    Federation first, and only when the container is actually running on a
-    federated credential -- fetch_identity_token returns None otherwise and
-    this falls through to the metadata server via gcloud, which is what every
-    placement other than the co-located sandbox proxy uses. The federated
-    branch exists because gcloud refuses to mint an ID token from an
-    external_account credential at all, so without it the co-located proxy can
-    reach GCP but not GitHub.
+    `str(CalledProcessError)` is the exit status alone and `str(TimeoutExpired)`
+    the timeout alone; the stderr both carry is what says why, and it was being
+    dropped from every refresh failure the sidecar logged.
     """
-    oidc_token = wif_credentials.fetch_identity_token(TOKEN_BROKER_URL)
-    if oidc_token:
-        log("Minted the broker OIDC token through Workload Identity Federation.")
-        return oidc_token
-    try:
-        res = subprocess.run(
-            [
-                "gcloud",
-                "auth",
-                "print-identity-token",
-                f"--audiences={TOKEN_BROKER_URL}",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=GCLOUD_TIMEOUT_SECONDS,
-        )
-        oidc_token = res.stdout.strip()
-    except Exception:
+    stderr = getattr(exc, "stderr", None)
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", "replace")
+    detail = (stderr or "").strip()
+    return f"{exc}: {detail}" if detail else str(exc)
+
+
+def metadata_identity_token(audience: str) -> str | None:
+    """The identity token for `audience` from the metadata server, or None.
+
+    None when the metadata server is not the identity here (refused, an error
+    status, a body that is not a JWT), and after `METADATA_MAX_ATTEMPTS` slow
+    answers; the caller falls through to gcloud either way, and the reason is
+    logged. Only a slow answer is retried: the others are a definite no.
+    """
+    query = urllib.parse.urlencode({"audience": audience, "format": METADATA_TOKEN_FORMAT})
+    request = urllib.request.Request(
+        f"{METADATA_IDENTITY_URL}?{query}", headers=METADATA_FLAVOR_HEADER
+    )
+    reason = ""
+    # Timed as one step, retry included, so the line says what the refresh
+    # spent here and not only what the last attempt did.
+    started = time.monotonic()
+    for attempt in range(1, METADATA_MAX_ATTEMPTS + 1):
+        try:
+            token = _bounded_attempt(request)
+            if not token:
+                reason = f"empty token after {time.monotonic() - started:.2f}s"
+                break
+            if not JWT_SHAPE.fullmatch(token):
+                reason = f"body is not a JWT ({len(token)} chars) after {time.monotonic() - started:.2f}s"
+                break
+            how = f"from the metadata server in {time.monotonic() - started:.2f}s" + (
+                f" (attempt {attempt})" if attempt > 1 else ""
+            )
+            identity_note["minted"] = how
+            log(f"Minted the broker OIDC token {how}.")
+            return token
+        # URLError covers a refused connection, an error status and a 3xx,
+        # OSError a socket timeout, HTTPException a body cut short, ValueError
+        # a body that is not UTF-8 or too large. urlopen wraps a timeout raised
+        # while connecting in URLError's `reason`; an attempt that outlives
+        # its bound is a TimeoutError from _bounded_attempt.
+        except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as exc:
+            reason = f"{exc} after {time.monotonic() - started:.2f}s"
+            slow = isinstance(exc, TimeoutError) or isinstance(
+                getattr(exc, "reason", None), TimeoutError
+            )
+            if not slow:
+                break
+            if attempt < METADATA_MAX_ATTEMPTS:
+                log(f"WARNING: metadata server identity token attempt {attempt} timed out; retrying.")
+        if attempt < METADATA_MAX_ATTEMPTS:
+            time.sleep(METADATA_RETRY_DELAY_SECONDS)
+    identity_note["fell_through"] = f"the metadata server gave none: {reason}"
+    log(f"WARNING: no identity token from the metadata server ({reason}); asking gcloud.")
+    return None
+
+
+def _bounded_attempt(request) -> str:
+    """One GET and its body under `METADATA_TIMEOUT_SECONDS` of wall clock.
+
+    The socket timeout bounds each connect and each receive, so a peer that is
+    slow between them (a header byte at a time) is never timed out by it; the
+    attempt runs in a worker thread and is given up on, as a slow answer, when
+    it outlives the bound. The thread then ends on its own next socket timeout,
+    which is well inside this short-lived helper's life.
+    """
+    outcome = {}
+
+    def work():
+        try:
+            with metadata_open(request, timeout=METADATA_TIMEOUT_SECONDS) as response:
+                outcome["body"] = _read_token_body(response)
+        except BaseException as exc:  # noqa: BLE001 -- re-raised on the caller's thread
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=work, name="metadata-identity-token", daemon=True)
+    worker.start()
+    worker.join(METADATA_TIMEOUT_SECONDS)
+    if worker.is_alive():
+        raise TimeoutError(f"attempt still running after {METADATA_TIMEOUT_SECONDS}s")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["body"]
+
+
+def _read_token_body(response) -> str:
+    """The response body as text, bounded in size and complete.
+
+    Read one receive at a time so a body that grows past a token's size is cut
+    off there, and refused when a Content-Length answer closed before it was
+    complete: read1 returns b"" at EOF without raising, and a token cut inside
+    its signature would otherwise pass the shape check and be sent to Minty.
+    """
+    chunks = []
+    size = 0
+    while True:
+        chunk = response.read1(METADATA_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+        if size > METADATA_TOKEN_MAX_BYTES:
+            raise ValueError(f"body larger than a token (over {METADATA_TOKEN_MAX_BYTES} bytes)")
+    if response.length:
+        raise http.client.IncompleteRead(b"".join(chunks), response.length)
+    return b"".join(chunks).decode("utf-8").strip()
+
+
+def gcloud_identity_token(audience: str) -> str:
+    """The identity token from `gcloud auth print-identity-token`, or raise.
+
+    With `--audiences` first, then without it for a credential that refuses
+    the flag. Each failure is kept with its stderr, so a timeout reads as a
+    timeout and a refusal as what gcloud said.
+    """
+    started = time.monotonic()
+    failures = []
+    for argv in (
+        ["gcloud", "auth", "print-identity-token", f"--audiences={audience}"],
+        ["gcloud", "auth", "print-identity-token"],
+    ):
         try:
             res = subprocess.run(
-                ["gcloud", "auth", "print-identity-token"],
+                argv,
                 capture_output=True,
                 text=True,
                 check=True,
                 timeout=GCLOUD_TIMEOUT_SECONDS,
             )
-            oidc_token = res.stdout.strip()
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to retrieve Google OIDC token via gcloud: {e}"
-            ) from e
+        except Exception as exc:  # noqa: BLE001 -- every failure is reported, with its stderr
+            failures.append(describe_failure(exc))
+            continue
+        oidc_token = res.stdout.strip()
+        if not oidc_token:
+            raise RuntimeError("Retrieved Google OIDC token via gcloud is empty.")
+        how = f"through gcloud in {time.monotonic() - started:.2f}s"
+        if identity_note["fell_through"]:
+            how += f" ({identity_note['fell_through']})"
+        identity_note["minted"] = how
+        log(f"Minted the broker OIDC token {how}.")
+        return oidc_token
+    raise RuntimeError(
+        "Failed to retrieve Google OIDC token via gcloud "
+        f"after {time.monotonic() - started:.2f}s: " + "; ".join(failures)
+    )
 
-    if not oidc_token:
-        raise RuntimeError("Retrieved Google OIDC token via gcloud is empty.")
-    return oidc_token
+
+def broker_oidc_token() -> str:
+    """The Google OIDC identity token Minty authenticates the caller by.
+
+    Federation first, and only when the container is actually running on a
+    federated credential -- fetch_identity_token returns None otherwise. The
+    federated branch exists because gcloud refuses to mint an ID token from an
+    external_account credential at all, so without it the co-located proxy can
+    reach GCP but not GitHub. Then the metadata server directly, which is what
+    every other placement runs on; gcloud last, for a host with neither.
+    """
+    oidc_token = wif_credentials.fetch_identity_token(TOKEN_BROKER_URL)
+    if oidc_token:
+        identity_note["minted"] = "through Workload Identity Federation"
+        log("Minted the broker OIDC token through Workload Identity Federation.")
+        return oidc_token
+    configured = next((name for name in CREDENTIAL_FILE_VARIABLES if os.environ.get(name)), "")
+    if configured:
+        # Whatever that file names is the identity, not the instance's; only
+        # gcloud reads it.
+        identity_note["fell_through"] = f"{configured} names a credential file"
+        log(f"{configured} names a credential file; asking gcloud for the identity token.")
+        return gcloud_identity_token(TOKEN_BROKER_URL)
+    return metadata_identity_token(TOKEN_BROKER_URL) or gcloud_identity_token(TOKEN_BROKER_URL)
 
 
 def request_minty_token(
@@ -494,12 +681,12 @@ def refresh_git_credentials(
     # The `no_agent` cron jobs are what need this. They run as a plain Python
     # subprocess on the gateway rather than as a model turn, so they never touch
     # the terminal backend and never reach the sandbox the way a skill does —
-    # and once the gateway holds no credential, both branches around this one
-    # are dead there: CREDENTIAL_PROXY_URL is unset, and the direct mint below
-    # ends at `No such file or directory: 'gcloud'`. Putting the variable back
-    # on the gateway would fix it by restoring a credential path to the pod the
-    # split exists to empty. Taking the route the model's shell already takes
-    # does not.
+    # and once the gateway holds no credential, CREDENTIAL_PROXY_URL is unset
+    # there and the only route is this one. Putting the variable back on the
+    # gateway would restore a credential path to the pod the split exists to
+    # empty. Taking the route the model's shell already takes does not. The
+    # direct mint below is the broker container's own path and the standalone
+    # placement's; on the gateway, this forward runs before it is reached.
     #
     # The forwarded process re-enters this function in the sandbox, where
     # CREDENTIAL_PROXY_URL is set, so it takes the branch above and stops.
@@ -576,11 +763,19 @@ def refresh_git_credentials(
             timeout=CLI_SETUP_TIMEOUT_SECONDS,
             env=env,
         )
+        # The identity note again on the last line: the sidecar keeps the tail
+        # of this output, and a long managed-repository list in the Minty line
+        # above would otherwise push the branch that minted out of its log.
         log(
             f"GitHub authentication successfully configured for repository: {repository}"
+            + (f" (identity token {identity_note['minted']})" if identity_note["minted"] else "")
         )
     except Exception as e:
-        raise RuntimeError(f"Failed to configure GitHub auth in gh CLI: {e}") from e
+        # With gh's stderr: the exit status alone cannot tell a token GitHub
+        # rejected from a config file gh could not write.
+        raise RuntimeError(
+            f"Failed to configure GitHub auth in gh CLI: {describe_failure(e)}"
+        ) from e
 
     return token
 

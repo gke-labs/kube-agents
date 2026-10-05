@@ -566,7 +566,8 @@ takes project IDs or shell-style globs, `exclude.clusters` the full `project_id`
 `cluster_name` triple; neither changes IAM, except that an entry naming a Shared VPC service project
 by ID, or a monitored project by number, withholds its grant (below). Through the installer the value comes from
 `SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_SHARED_VPC_HOSTS`,
-`SCOPE_METRICS_SCOPES`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` in `install.env`
+`SCOPE_METRICS_SCOPES`, `SCOPE_MAX_PROJECTS`,
+`SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` in `install.env`
 ([`scripts/installer/README.md`](../../../scripts/installer/README.md), which also says how to
 forget the bindings of a project that became unreachable). If the running `PlatformAgent` already
 declares `spec.scope` by hand, copy it into `scope` before the first apply of a composition that
@@ -619,12 +620,10 @@ composition enables them in the apply, per selector, so `install.sh` enables whi
 selectors read is off before an apply that carries one; a 403 that names a disabled
 API is reported with that remedy, and one that refuses the identity the consumer project
 (`USER_PROJECT_DENIED`) with the `serviceusage.services.use` it needs there. The reconcile lists at
-most 100 projects of the resolved set, the management project included, so a declaration whose
+most `scope.max_projects` projects of the resolved set (100 by default; `spec.scope.maxProjects` on the CR), the management project included, so a declaration whose
 management project, `projects` and selector members together exceed that (once each, less an exact
 `exclude.projects` entry; a project both in `projects` and excluded by its number stays counted, so drop
-it from `projects`) is refused at plan rather than bound in full while a selector is declared
-(without one the count is the CRD's own, and a plan that declares none is not refused for it), and a
-single selector past it is refused at its read. A project that is not a Shared VPC host resolves to no members, as it does
+it from `projects`) is refused at plan rather than bound in full while a selector is declared or the cap is below its default (without a selector and at the default the count is the CRD's own, and such a plan is not refused for it), and a single selector past it is refused at its read. A project that is not a Shared VPC host resolves to no members, as it does
 at runtime. An exclude entry that names a Shared VPC service project by ID, or a monitored project
 by number, keeps it out of the bindings, the one place `exclude` reaches IAM, because a selector's
 member has no list to be dropped from; a monitored project excluded by ID keeps its grant, which the

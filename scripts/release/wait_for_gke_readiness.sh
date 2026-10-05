@@ -18,11 +18,11 @@ source "${SCRIPT_DIR}/common.sh"
 # deadline" however long it was given, so a gate at or above it buys nothing.
 #
 # litellm sets no progressDeadlineSeconds and so runs on Kubernetes' 600s
-# default; the gateway's is pinned at 1200s by the operator
-# (gatewayProgressDeadlineSeconds) against a 605s startupProbe budget from
-# agentAPIProbe(10, 60). Both values below are sized for these Deployments:
-# litellm is gated at 420s and the gateway at 900s (matching upgrade.sh),
-# the latter after 180s reported red on deploys that had succeeded.
+# default; the gateway's is pinned at 1800s by the operator
+# (gatewayProgressDeadlineSeconds) against a 905s startupProbe budget from
+# agentAPIProbe(10, 90). Both values below are sized for these Deployments:
+# litellm is gated at 420s and the gateway at 1500s (matching upgrade.sh),
+# the latter after 180s and 900s reported red on deploys that had succeeded.
 #
 # The single 300s that used to cover both was under the gateway's cold-start
 # cost. It went unnoticed while the RC provisioned Standard clusters; a fresh
@@ -30,7 +30,7 @@ source "${SCRIPT_DIR}/common.sh"
 # container starts at all (measured 215s in autopush, 259s in staging, and
 # those were warm).
 readonly LITELLM_READINESS_TIMEOUT="420s"
-readonly GATEWAY_READINESS_TIMEOUT="900s"
+readonly GATEWAY_READINESS_TIMEOUT="1500s"
 
 release_resolve_target
 

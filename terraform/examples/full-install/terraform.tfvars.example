@@ -193,6 +193,7 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 #   organizations    = []
 #   shared_vpc_hosts = ["shared-vpc-host"]
 #   metrics_scopes   = []
+#   max_projects     = 100 # the most projects the reconcile lists per run (spec.scope.maxProjects)
 #   exclude = {
 #     projects = ["*-sandbox"]
 #     clusters = [

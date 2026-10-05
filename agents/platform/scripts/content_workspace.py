@@ -1252,19 +1252,45 @@ class ContentWorkspaceStore:
         a listing that stopped at the ceiling says so instead of looking
         complete — a caller that cannot tell the difference goes on to `read`
         paths it invented.
+
+        A symlinked file is never an entry, because `read` refuses it, but it
+        is named in `symlinks` -- each once across the pages, on the page whose
+        range it sorts into. A clone's walk follows it, so a caller rebuilding
+        the tree from entries alone would hold less than the clone and could
+        not tell. A link to a directory is named in `symlinkedDirectories` the
+        same way, with the relative target it names ("" for an absolute one):
+        the walk here does not enter it, and neither does a clone's, but a
+        clone resolves a path through it.
         """
         with self._use(handle) as workspace:
             under = repo_relative(prefix).parts if prefix else ()
             cursor = str(repo_relative(after)) if after else ""
             names: list[str] = []
+            links: list[str] = []
+            directory_links: dict[str, str] = {}
             for path in workspace.tree.rglob("*"):
-                if not path.is_file() or path.is_symlink():
+                linked = path.is_symlink()
+                if not linked and not path.is_file():
                     continue
                 relative = path.relative_to(workspace.tree)
                 parts = relative.parts
                 if any(_looks_like_dot_git(part) for part in parts):
                     continue
                 if under and parts[: len(under)] != under:
+                    continue
+                if linked:
+                    # Only a link that resolves to a file is one a clone's walk
+                    # reads; a dangling one is nothing a clone could read.
+                    if path.is_file():
+                        links.append(str(PurePosixPath(*parts)))
+                    elif path.is_dir():
+                        # An absolute target names this host's filesystem,
+                        # which no response carries; "" says only that it is
+                        # one, and no mirror can hold it either way.
+                        target = os.readlink(path)
+                        directory_links[str(PurePosixPath(*parts))] = (
+                            "" if os.path.isabs(target) else target
+                        )
                     continue
                 names.append(str(PurePosixPath(*parts)))
             # Sorted on the name this answers with rather than on the `Path`,
@@ -1284,10 +1310,25 @@ class ContentWorkspaceStore:
                 for name in page
             ]
             total = len(names) - start
+            truncated = total > len(entries)
+            last = page[-1] if truncated and page else None
+
+            def in_range(names: list[str]) -> list[str]:
+                return sorted(
+                    name
+                    for name in names
+                    if (not cursor or name > cursor) and (last is None or name <= last)
+                )
+
             return {
                 "entries": entries,
+                "symlinks": in_range(links),
+                "symlinkedDirectories": [
+                    {"path": name, "target": directory_links[name]}
+                    for name in in_range(list(directory_links))
+                ],
                 "total": total,
-                "truncated": total > len(entries),
+                "truncated": truncated,
             }
 
     def grep(
@@ -1322,7 +1363,9 @@ class ContentWorkspaceStore:
         with self._use(handle) as workspace:
             # -I skips binary files, -n numbers the lines, -z puts a NUL after
             # the name so a file whose name carries a colon cannot be misread.
-            argv = ["grep", "--no-color", "-I", "-n", "-z"]
+            # `--literal-pathspecs`, as for `commit`, so a prefix whose name
+            # holds a glob character is that path rather than a pattern.
+            argv = ["--literal-pathspecs", "grep", "--no-color", "-I", "-n", "-z"]
             argv.append("-E" if regex else "-F")
             if ignore_case:
                 argv.append("-i")

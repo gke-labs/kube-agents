@@ -77,6 +77,7 @@ from gateway.kanban_progress_lines import (  # noqa: E402
     ROLLING_KINDS,
     STOPPED,
     deliver,
+    silent_event,
     progress_note,
     render,
     rolling_line,
@@ -94,10 +95,10 @@ GOOGLE_CHAT_ADAPTER = "plugins/platforms/google_chat/adapter.py"
 HEADER = "[default] @platform "
 
 # --- 1. The wiring resolved ---------------------------------------------------
-# Both names arrive in one appended trailer, but they are checked separately:
-# the render branch calls `_progress_note` and the send site calls
-# `_progress_deliver`, so a rename breaks one path while the other keeps working
-# and the build stays green.
+# The names arrive in one appended trailer, but they are checked separately:
+# the render branch calls `_progress_note`, the send site `_progress_deliver`
+# and the skip loop `_progress_silent_event`, so a rename breaks one path while
+# the others keep working and the build stays green.
 print("import wiring:")
 check(
     "the notifier resolved the progress-note import",
@@ -115,9 +116,19 @@ check(
     "something else is bound to the name the notifier calls",
 )
 check(
+    "the notifier resolved the silent-kind import",
+    getattr(notifier, "_progress_silent_event", None) is silent_event,
+    "the skip hook would raise NameError inside the send loop's try",
+)
+check(
     "heartbeat is claimed",
     "heartbeat" in notifier.TERMINAL_KINDS,
     "an unclaimed kind never reaches the formatter",
+)
+check(
+    "the silent kinds are claimed",
+    {"archived", "unblocked"} <= set(notifier.TERMINAL_KINDS),
+    "an unclaimed archived or unblocked never reaches the _send_pings hook",
 )
 check(
     "heartbeat never wakes the creator",
@@ -131,13 +142,13 @@ check(
 )
 check(
     "the trailer is applied exactly once",
-    NOTIFIER_SOURCE.count("from gateway.kanban_progress_lines import") == 2
+    NOTIFIER_SOURCE.count("from gateway.kanban_progress_lines import") == 3
     and NOTIFIER_SOURCE.count("import deliver as _progress_deliver") == 1,
     "a duplicated trailer means the applier ran twice over one tree",
 )
 
 # --- 2. The send site ---------------------------------------------------------
-# One call site is the whole reason this patch is three anchors and not thirty.
+# One call site is the whole reason this patch is four anchors and not thirty.
 # If upstream grows a second `adapter.send` inside the notifier's delivery, the
 # events leaving through it bypass the rolling message entirely.
 print("send site:")
@@ -156,6 +167,11 @@ check(
     "without it the rolling message loses the board slug and the @-mention",
 )
 check(
+    "the helper is given the card's title",
+    "title=self.title," in NOTIFIER_SOURCE,
+    "without it a KAGE_SLACK_UX plan row shows the card id instead of its title",
+)
+check(
     "the map is hung off the runner, not the per-delivery notification",
     "self.runner, adapter, sub, ev.kind, ev, msg, metadata," in NOTIFIER_SOURCE,
     "_KanbanNotification is rebuilt for every delivery; a map on it forgets "
@@ -167,6 +183,21 @@ check(
     "the failure check still reads the helper's return value",
     0 <= _deliver_at < _check_at,
     "the send-failure accounting is what makes delivery at-least-once",
+)
+_silent_at = NOTIFIER_SOURCE.find("await _progress_silent_event(self, ev)")
+check(
+    "a skipped event reaches the silent-kind hook once, before the skip",
+    NOTIFIER_SOURCE.count("await _progress_silent_event(self, ev)") == 1
+    and NOTIFIER_SOURCE[_silent_at:].split("\n", 2)[1].strip() == "continue",
+    "an archived or unblocked card would never move its plan row",
+)
+_loop_at = NOTIFIER_SOURCE.rfind('for ev in self.d["events"]:', 0, _silent_at)
+check(
+    "the hook sits in the loop over the delivery's batch, ahead of the ping dedup",
+    0 <= _loop_at < _silent_at
+    and _silent_at < NOTIFIER_SOURCE.find('if ev.id <= self.sub.get("last_ping_event_id", 0):', _silent_at),
+    "silent_event reads notification.d['events'] and last_ping_event_id to skip a replayed unblocked; "
+    "renamed, a rewound claim's replay would revive a row waiting on the user",
 )
 check(
     "the heartbeat formatter still builds the first rendering",

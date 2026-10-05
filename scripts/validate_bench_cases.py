@@ -222,6 +222,12 @@ KNOWN_NO_DOMAIN = {
         "its skill_manage calls (none may succeed); reads no fleet, and no "
         "domains.yaml row describes skill or self-modification governance"
     ),
+    "vcs-forge-cli-request-uses-the-verbs": (
+        "a read-only forge question that names gh, graded on the route the "
+        "worker took to the answer (the version-control verbs, not a forge "
+        "CLI); like vcs-history-only-fact, no domains.yaml row describes "
+        "repository access"
+    ),
     "vcs-history-only-fact": (
         "a repository-history question graded on the answer and on the route "
         "the worker took to it (the version-control verbs, never a credentialed "

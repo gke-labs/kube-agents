@@ -84,7 +84,8 @@ class ArgvTestCase(unittest.TestCase):
     def test_connects_as_hermes_not_as_the_shell_user(self):
         """The whole point of the second principal.
 
-        terminal.ssh_user is `agent`, whose ~/.bashrc the model owns and which
+        terminal.ssh_user is `agent`, whose ~/.bashrc the model owns on older
+        sandbox images and which
         bash sources for a non-interactive `ssh host cmd`. Authenticating as it
         would let the model choose what this caller sees.
         """

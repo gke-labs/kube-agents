@@ -232,6 +232,14 @@ spec:
     {{- if hasKey $scope "metricsScopes" }}
     metricsScopes: {{ $scope.metricsScopes | default list | toJson }}
     {{- end }}
+    {{- /*
+      The cap renders only when the value carries it, for the same reason as the lists
+      above: a release record from before the chart knew the key must not patch the
+      CRD's default over a cap set on the CR by hand. The composition always passes it.
+    */}}
+    {{- if hasKey $scope "maxProjects" }}
+    maxProjects: {{ $scope.maxProjects | int }}
+    {{- end }}
     exclude:
       projects: {{ $scopeExclude.projects | default list | toJson }}
       clusters: {{ $scopeExclude.clusters | default list | toJson }}

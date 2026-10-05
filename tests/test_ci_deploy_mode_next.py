@@ -7,10 +7,10 @@ negative one: with the flag unset, the build submits exactly the substitutions
 it submitted before the flag existed, the Helm install gets no extra value, and
 step 6b makes no kubectl call at all. The positive half is pinned by the same
 lifting technique tests/test_ci_deploy_rc_images.py uses: section 4 run with
-the flag set names the four next-stack images and fills the operator.extraEnv
-values the release expands (the three image overrides and the inject door's
+the flag set names the five next-stack images and fills the operator.extraEnv
+values the release expands (the four image overrides and the inject door's
 flag), the Cloud Build's `a2a` and `a2a-bridge` steps run with `docker` stubbed
-build and push those four in order with the bridge FROM this build's platform
+build and push those five in order with the bridge FROM this build's platform
 image, the three guards (release-candidate path, Prow run with no pull request
 that is not a next-lane job, the concurrency's grammar) run against the values
 they refuse and admit, the
@@ -65,6 +65,7 @@ _INVENTORY_CHECK = _REPO_ROOT / "hack" / "check-image-inventory.sh"
 _CONTROLLER = _REPO_ROOT / "k8s-operator" / "internal" / "controller"
 _A2A_MANIFESTS = _CONTROLLER / "platformagent_a2a_manifests.go"
 _A2A_CALLOUT = _CONTROLLER / "platformagent_a2a_callout.go"
+_A2A_VERIFIER = _CONTROLLER / "platformagent_a2a_verifier.go"
 _A2A_IDENTITIES = _CONTROLLER / "platformagent_a2a_identities.go"
 _AGENT_MANIFESTS = _CONTROLLER / "platformagent_manifests.go"
 _API_TYPES = _REPO_ROOT / "k8s-operator" / "api" / "v1alpha1" / "common_types.go"
@@ -74,9 +75,9 @@ _OPERATOR_TEMPLATE = _REPO_ROOT / "charts" / "kube-agents" / "templates" / "oper
 
 _AR_REPO = "us-central1-docker.pkg.dev/kube-agents-evals/kube-agents"
 _TAG = "pr-1686-abc1234"
-_A2A_SUBSTITUTIONS = ("_A2A_GATEWAY_URI", "_A2A_CALLOUT_URI", "_A2A_WORKER_URI", "_A2A_BRIDGE_URI")
-_A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "hermes-bridge")
-_A2A_DOCKERFILE_SUFFIXES = ("gateway", "authcallout", "worker")
+_A2A_SUBSTITUTIONS = ("_A2A_GATEWAY_URI", "_A2A_CALLOUT_URI", "_A2A_WORKER_URI", "_A2A_VERIFIER_URI", "_A2A_BRIDGE_URI")
+_A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "a2a-verifier", "hermes-bridge")
+_A2A_DOCKERFILE_SUFFIXES = ("gateway", "authcallout", "worker", "verifier")
 _PLATFORM_URI = f"{_AR_REPO}/platform-agent:{_TAG}"
 _FLAG_UNSET_SPELLINGS = (None, "", "0", "true", "yes")
 # The next lane's two Prow jobs (oss-test-infra), the only runs section 2b
@@ -410,14 +411,14 @@ class FlagUnsetIsTodayTest(unittest.TestCase):
 
 
 class FlagSetIsNextTest(unittest.TestCase):
-    def test_the_build_names_the_four_next_stack_images(self) -> None:
+    def test_the_build_names_the_five_next_stack_images(self) -> None:
         result = run_build_section("1")
         self.assertEqual(result.returncode, 0, result.stderr)
         subs = substitutions(result)
         for name, image in zip(_A2A_SUBSTITUTIONS, _A2A_IMAGES, strict=True):
             self.assertIn(f"{name}={_AR_REPO}/{image}:{_TAG}", subs)
 
-    def test_the_release_gets_the_three_overrides_and_the_inject_flag_as_operator_extra_env(self) -> None:
+    def test_the_release_gets_the_four_overrides_and_the_inject_flag_as_operator_extra_env(self) -> None:
         result = run_build_section("1")
         self.assertEqual(result.returncode, 0, result.stderr)
         args = helm_args(result)
@@ -425,9 +426,13 @@ class FlagSetIsNextTest(unittest.TestCase):
             go_constant(_A2A_MANIFESTS, "a2aGatewayImageEnvVar"),
             go_constant(_A2A_CALLOUT, "a2aCalloutImageEnvVar"),
             go_constant(_A2A_MANIFESTS, "a2aWorkerImageEnvVar"),
+            # The verifier sits on the request path: an eval install that does
+            # not override it leaves the Deployment on a private dev registry
+            # it cannot pull, and every executor refuses every task.
+            go_constant(_A2A_VERIFIER, "a2aVerifierImageEnvVar"),
         )
         expected = []
-        for index, (env_var, image) in enumerate(zip(env_vars, _A2A_IMAGES[:3], strict=True)):
+        for index, (env_var, image) in enumerate(zip(env_vars, _A2A_IMAGES[:4], strict=True)):
             expected += [
                 "--set-string",
                 f"operator.extraEnv[{index}].name={env_var}",
@@ -439,9 +444,9 @@ class FlagSetIsNextTest(unittest.TestCase):
         inject_env_var = go_constant(_A2A_MANIFESTS, "a2aInjectBackendEnvVar")
         expected += [
             "--set-string",
-            f"operator.extraEnv[3].name={inject_env_var}",
+            f"operator.extraEnv[4].name={inject_env_var}",
             "--set-string",
-            "operator.extraEnv[3].value=true",
+            "operator.extraEnv[4].value=true",
         ]
         self.assertEqual(args, expected)
         # The bridge image goes to the CR, not to the operator.
@@ -632,6 +637,12 @@ class FlagSetIsNextTest(unittest.TestCase):
                 "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout",
                 "deployment/${AGENT_DEPLOYMENT_NAME}",
                 "deployment/${AGENT_DEPLOYMENT_NAME}",
+                # Last, not after the Job its bucket comes from: see the
+                # step header. A verifier still in its crash-loop backoff
+                # when the eval starts submitting refuses every case
+                # terminally, so this one is a gate and not a report, but
+                # the backoff is spent alongside the rollouts above.
+                "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier",
             ],
         )
         markers = [
@@ -648,6 +659,7 @@ class FlagSetIsNextTest(unittest.TestCase):
             'gate_cr_not_degraded "the sidecar patch"',
             'gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"',
             'grep -F "${BRIDGE_CONSUMING_LOG_MSG}" | grep -F "${BRIDGE_CONSUMING_LOG_PROFILE}"',
+            'gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier"',
         ]
         position = 0
         for marker in markers:
@@ -1084,14 +1096,14 @@ class BridgeImageBuildTest(unittest.TestCase):
             self.assertEqual(by_name[name]["override"], override)
             self.assertEqual(by_name[name]["tagPolicy"], "release")
 
-    def test_the_a2a_step_starts_at_once_and_builds_the_three_in_order(self) -> None:
-        """The three A2A images do not depend on the platform image, so their
+    def test_the_a2a_step_starts_at_once_and_builds_the_four_in_order(self) -> None:
+        """The four A2A images do not depend on the platform image, so their
         step must not queue behind it; only the bridge does."""
         self.assertEqual(build_step("a2a")["waitFor"], ["-"])
         result = run_build_step("a2a", next_stack_substitutions(), 'docker() { echo "docker $*"; }')
         self.assertEqual(result.returncode, 0, result.stderr)
         expected = []
-        for suffix, image in zip(_A2A_DOCKERFILE_SUFFIXES, _A2A_IMAGES[:3], strict=True):
+        for suffix, image in zip(_A2A_DOCKERFILE_SUFFIXES, _A2A_IMAGES[:4], strict=True):
             uri = f"{_AR_REPO}/{image}:{_TAG}"
             # The worker's Dockerfile copies the credential broker's shim client
             # from agents/platform/scripts, so it builds from the repository
