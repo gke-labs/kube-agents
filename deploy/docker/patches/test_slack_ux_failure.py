@@ -85,6 +85,17 @@ class PresentTest(unittest.TestCase):
             with self.subTest(reply=reply):
                 self.assertEqual(runtime.present(reply)[1], "")
 
+    def test_the_offer_keeps_words_capitalised_anyway(self):
+        for question, label in {
+            "Retry it?": "retry it",
+            "I can retry it?": "I can retry it",
+            "I'll retry it?": "I'll retry it",
+            "OK to retry?": "OK to retry",
+            "A retry?": "a retry",
+        }.items():
+            with self.subTest(question):
+                self.assertEqual(runtime.present("It failed. " + question)[1], label)
+
     def test_a_lone_question_is_both_lead_and_offer(self):
         self.assertEqual(
             runtime.present("Try again on seeded-a?"), ("**Try again on seeded-a?**", "try again on seeded-a")
@@ -100,6 +111,21 @@ class MarkTest(FlagOn):
         self.assertEqual(button["text"]["text"], "check it there")
         self.assertEqual(button["value"], "check it there")
         self.assertRegex(button["action_id"], slack_presenter.CHOICE_ACTION_ID_PATTERN)
+
+    def test_a_queued_follow_up_drops_the_mark(self):
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        runtime.drop(_event().source)
+        self.assertEqual(self.draw(_event()), _render(REPLY))
+
+    def test_a_later_wake_clears_the_mark(self):
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        runtime.note_wake(SUB, {"completed"}, "Task t_f2 completed.")
+        self.assertEqual(self.draw(_event()), _render(REPLY))
+
+    def test_a_wake_whose_question_is_posted_clears_the_mark(self):
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        runtime.note_wake(SUB, {"blocked"}, WAKE + " " + slack_ux_moments.WAKE_NOTE)
+        self.assertEqual(runtime._marks, {})
 
     def test_the_mark_is_taken_once(self):
         runtime.note_wake(SUB, {"blocked"}, WAKE)
@@ -182,6 +208,9 @@ class ApplyTest(unittest.TestCase):
             applier.SLACK_ADAPTER: "from typing import Optional\n\n\nclass S:\n"
             + applier.BLOCKS_ANCHOR
             + "        return None\n",
+            applier.RUN_TURN: "class R:\n    async def _run_agent_queued_followup(self, turn_ctx):\n"
+            + applier.FOLLOWUP_ANCHOR
+            + "        return None\n",
         }
         for rel, text in files.items():
             (self.root / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -189,7 +218,7 @@ class ApplyTest(unittest.TestCase):
 
     def test_each_file_gets_its_call_and_a_second_run_is_refused(self):
         applier.apply(self.root)
-        for rel in (applier.NOTIFIER, applier.BASE, applier.SLACK_ADAPTER):
+        for rel in (applier.NOTIFIER, applier.BASE, applier.SLACK_ADAPTER, applier.RUN_TURN):
             self.assertIn(applier.BUILD_MARKER, (self.root / rel).read_text())
         self.assertIn("def _kage_upstream_maybe_blocks(", (self.root / applier.SLACK_ADAPTER).read_text())
         verifier.check_callers(self.root)

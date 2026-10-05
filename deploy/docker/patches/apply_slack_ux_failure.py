@@ -4,7 +4,7 @@
 Run by ``deploy/docker/Dockerfile`` against the Hermes tree, after
 ``slack_ux_failure.py`` has been copied to ``gateway/`` and after
 ``apply_slack_ux_moments.py``, whose wake-text line the first anchor follows.
-Three files:
+Four files:
 
 ``gateway/kanban_watchers_notifier.py``: ``build_wake_text`` ends with
 ``note_wake(self.sub, self.wake_kinds, self.synth)``, so a Slack failure wake
@@ -18,6 +18,10 @@ marked thread's next internal final runs marked.
 ``_kage_upstream_maybe_blocks`` and a ``_maybe_blocks`` that hands it to
 ``maybe_blocks`` takes its place, so the normal post and the stream finalize
 both draw a marked reply.
+
+``gateway/run_turn.py``: ``_run_agent_queued_followup`` opens with
+``drop(turn_ctx.source)``, so a user message queued behind a wake turn, whose
+reply is sent under the wake's event, does not take the wake's mark.
 
 With the flag off nothing is marked and every call returns upstream's result.
 What the flag changes, and why, is in the module docstring of
@@ -84,6 +88,17 @@ BLOCKS_PATCHED = (
     "    def _kage_upstream_maybe_blocks(self, content: str) -> Optional[list]:\n"
 )
 
+RUN_TURN = "gateway/run_turn.py"
+
+FOLLOWUP_ANCHOR = (
+    '        """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""\n'
+)
+FOLLOWUP_PATCHED = FOLLOWUP_ANCHOR + (
+    "        # kube-agents patch: this follow-up's reply goes out under the outer turn's\n"
+    "        # event, so a failure wake's mark must not reach it; see gateway/slack_ux_failure.py.\n"
+    "        _kage_slack_failure.drop(turn_ctx.source)\n"
+)
+
 
 def apply(root: Path) -> None:
     """Apply the patch under ``root``, or raise SystemExit with the reason."""
@@ -102,9 +117,15 @@ def apply(root: Path) -> None:
     slack_adapter.substitute(BLOCKS_ANCHOR, BLOCKS_PATCHED, label="SlackAdapter._maybe_blocks")
     slack_adapter.append(GATEWAY_IMPORT)
 
+    run_turn = patchlib.Patch(root, RUN_TURN, prefix=PREFIX)
+    run_turn.refuse_if_patched(BUILD_MARKER)
+    run_turn.substitute(FOLLOWUP_ANCHOR, FOLLOWUP_PATCHED, label="_run_agent_queued_followup docstring")
+    run_turn.append(GATEWAY_IMPORT)
+
     notifier.commit("1 anchor, 1 import")
     base.commit("1 anchor, 1 import")
     slack_adapter.commit("1 anchor, 1 import")
+    run_turn.commit("1 anchor, 1 import")
 
 
 if __name__ == "__main__":

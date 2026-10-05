@@ -1,21 +1,23 @@
 """Lead a failure reply with its fact in bold, and offer its closing question as a button.
 
 Installed into the image at ``/opt/hermes/gateway/slack_ux_failure.py``.
-``apply_slack_ux_failure.py`` wires three calls: the kanban notifier's
+``apply_slack_ux_failure.py`` wires four calls: the kanban notifier's
 ``build_wake_text`` calls :func:`note_wake`, ``send_final_ledgered`` brackets
-its send with :func:`begin` and :func:`end`, and ``SlackAdapter._maybe_blocks``
-hands its rendering to :func:`maybe_blocks`. With ``KAGE_SLACK_UX`` off
+its send with :func:`begin` and :func:`end`, ``SlackAdapter._maybe_blocks``
+hands its rendering to :func:`maybe_blocks`, and ``_run_agent_queued_followup``
+calls :func:`drop`. With ``KAGE_SLACK_UX`` off
 :func:`note_wake` records nothing, so no reply is marked and every call returns
 what upstream would have.
 
 Upstream, and why it changes
 ----------------------------
 A card that blocked or failed wakes the Planning Agent, whose reply is the
-thread's only word on it (``agents/chat/SOUL.md`` §2 step 5): it opens on what
-did not happen ("I couldn't find seeded-z.") and, for a card nothing will run
-again, ends on the retry as a question ("Check it there?"). Upstream renders
-that reply like any other, so the failure reads as a paragraph and answering
-it means typing.
+thread's only word on it. Mock 06's reply opens on what did not happen ("I
+couldn't find seeded-z.") and ends on the retry as a question ("Check it
+there?"). Upstream renders that reply like any other, so the failure reads as a
+paragraph and answering it means typing. Nothing here depends on the reply
+taking that shape: any reply to such a wake gets the bold lead, and the button
+only when it ends on a question.
 
 With the flag on, the Slack reply to such a wake is drawn with its first
 sentence in bold and, when it ends on one short question, a choice button
@@ -28,14 +30,19 @@ a later read of the thread is unchanged, question included.
 Which reply is the wake's: :func:`note_wake` marks the subscription's thread
 when a Slack wake carries ``blocked``, ``crashed``, ``timed_out`` or
 ``gave_up``, unless ``gateway/slack_ux_moments.py`` noted the question already
-posted (that wake is answered with ``[SILENT]``). The next final reply sent for
-an internal event in that thread takes the mark, within :data:`MARK_TTL_SECONDS`;
-a reply the user's own message prompted never does. Kanban pings and moments are
+posted (that wake is answered with ``[SILENT]``). Any later wake in the thread
+clears the mark first, so it lives until the next wake at most. The next final
+reply sent for an internal event in that thread takes the mark, within
+:data:`MARK_TTL_SECONDS`; a reply the user's own message prompted never does.
+A user message queued behind the wake turn runs as a follow-up whose reply is
+sent under the wake's event, so the follow-up drops the mark (:func:`drop`) and
+neither reply is drawn as the failure's. Kanban pings and moments are
 not finals and never look. The marks are this process's, so a restart between a
 wake and its reply drops the look, not the reply.
 
 A reply that arrives as edits to a streamed message, rather than through
-``send_final_ledgered``, is drawn as upstream draws it.
+``send_final_ledgered``, is drawn as upstream draws it, and its mark waits for
+the next wake or the TTL.
 
 Fail-soft: anything that raises is logged and the reply goes out as upstream
 renders it.
@@ -75,6 +82,9 @@ ACTION_ID_PREFIX = "kage_failure"
 #: question with no markup. ``[^.!?]`` keeps it one sentence.
 TRAILING_QUESTION = re.compile(r"(?:^|(?<=[.!?])\s+)([^.!?\n]+)\?\s*$")
 MARKUP = re.compile(r"[*_~`<>\[\]|]")
+#: A first word the button may lower: capitalised only for starting the
+#: sentence, so not "I", "I'll", or an acronym.
+LOWERABLE = re.compile(r"^(?!I(?:'|$))[A-Z](?:[a-z]|$)")
 
 #: Slack's cap on a message's blocks; a reply already at it keeps its question as text.
 MESSAGE_BLOCKS_MAX = 50
@@ -109,12 +119,12 @@ def note_wake(sub: dict, wake_kinds: Iterable[str], text: str) -> None:
     try:
         if str(sub.get("platform") or "").strip().lower() != SLACK_PLATFORM:
             return
+        key = _key(sub.get("chat_id"), sub.get("thread_id"))
+        _marks.pop(key, None)
         if not FAILURE_KINDS & set(wake_kinds or ()) or not enabled():
             return
         if _wake_note() in (text or ""):
             return
-        key = _key(sub.get("chat_id"), sub.get("thread_id"))
-        _marks.pop(key, None)
         _marks[key] = time.monotonic()
         while len(_marks) > MARKS_MAX:
             _marks.popitem(last=False)
@@ -140,6 +150,15 @@ def begin(event: Any) -> Optional[contextvars.Token]:
         return None
 
 
+def drop(source: Any) -> None:
+    """Clear the mark on ``source``'s thread, for a queued follow-up sent under the wake's event."""
+    try:
+        if _marks and source is not None:
+            _marks.pop(_key(source.chat_id, getattr(source, "thread_id", None)), None)
+    except Exception:
+        logger.warning("slack_ux_failure: clearing the follow-up's thread failed", exc_info=True)
+
+
 def end(token: Optional[contextvars.Token]) -> None:
     """Undo :func:`begin`."""
     if token is not None:
@@ -151,8 +170,9 @@ def present(content: str) -> tuple[str, str]:
 
     The bold is left off when the first line opens with markup or its first
     sentence holds any, since a ``*`` inside would unpair. The offer is the last
-    sentence when it is one question with no markup that fits a button, with its
-    first letter lowered and the ``?`` dropped.
+    sentence when it is one question with no markup that fits a button, with the
+    ``?`` dropped and its first letter lowered unless that would change a word
+    that is capitalised anyway ("I", "OK", "API").
     """
     text = content or ""
     lead = text.lstrip()
@@ -166,7 +186,10 @@ def present(content: str) -> tuple[str, str]:
     question = match.group(1).strip() if match else ""
     if not question or MARKUP.search(question) or len(question) > _presenter.BUTTON_TEXT_MAX:
         return bolded, ""
-    return bolded, question[0].lower() + question[1:]
+    word = question.split()[0]
+    if LOWERABLE.match(word):
+        question = question[0].lower() + question[1:]
+    return bolded, question
 
 
 def maybe_blocks(content: str, render: Callable[[str], Optional[list]]) -> Optional[list]:

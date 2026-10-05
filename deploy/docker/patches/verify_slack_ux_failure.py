@@ -6,15 +6,16 @@ has run, with ``slack_presenter.py`` staged beside this script.
 
 Two things are checked:
 
-1. The three calls are in place: ``build_wake_text`` calls ``note_wake`` after
+1. The four calls are in place: ``build_wake_text`` calls ``note_wake`` after
    the moments wake-text line, ``send_final_ledgered`` brackets its send with
-   ``begin`` and ``end``, and ``SlackAdapter._maybe_blocks`` hands upstream's
-   renamed body to ``maybe_blocks``.
+   ``begin`` and ``end``, ``SlackAdapter._maybe_blocks`` hands upstream's
+   renamed body to ``maybe_blocks``, and ``_run_agent_queued_followup`` calls
+   ``drop``.
 2. The module, loaded by path: flag off a failure wake marks nothing; flag on,
    mock 06's reply to a ``gave_up`` wake is drawn with its first sentence in
    bold and one choice button reading "check it there", a second reply in the
-   thread is drawn as upstream draws it, and a reply the user's own message
-   prompted is never marked.
+   thread is drawn as upstream draws it, a reply the user's own message
+   prompted is never marked, and a queued follow-up clears the mark.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ CALLS = {
         "return _kage_slack_failure.maybe_blocks(content, self._kage_upstream_maybe_blocks)",
         "def _kage_upstream_maybe_blocks(self, content: str) -> Optional[list]:",
     ),
+    "gateway/run_turn.py": ("_kage_slack_failure.drop(turn_ctx.source)",),
 }
 MOMENTS_LINE = "self.synth = _kage_moments_wake_text("
 
@@ -118,6 +120,10 @@ def drive(module) -> None:
         module.note_wake(SUB, {"gave_up"}, "wake")
         if _draw(module, _event(internal=False)) != _render(REPLY):
             raise _fail("a reply to the user's own message was drawn as the failure's")
+        module.note_wake(SUB, {"gave_up"}, "wake")
+        module.drop(_event().source)
+        if _draw(module, _event()) != _render(REPLY):
+            raise _fail("a queued follow-up's reply was drawn as the failure's")
     finally:
         os.environ.pop(FLAG_ENV, None)
 
@@ -127,7 +133,7 @@ def main(root: Path = Path("/opt/hermes")) -> None:
     drive(_load_runtime(root))
     print(
         "slack_ux_failure verify: marked from the wake, bracketed in the final send, "
-        "drawn in _maybe_blocks; a failure reply leads in bold and offers its question once"
+        "drawn in _maybe_blocks, dropped by a queued follow-up; a failure reply leads in bold and offers its question once"
     )
 
 
