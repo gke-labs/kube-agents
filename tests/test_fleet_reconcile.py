@@ -13,6 +13,7 @@ The shared walk in `hack/boskos_pool.py` is covered here for what the sweep's
 tests do not reach: acquiring one project by name.
 """
 
+import argparse
 import importlib.util
 import io
 import json
@@ -92,16 +93,24 @@ class _Tofu:
         return [call[1] for call in self.calls]
 
 
+def _gcloud_ok(argv, **_):
+    return subprocess.CompletedProcess(argv, 0, "", "")
+
+
 def setUpModule():
     # boskos_pool holds every lease a second before releasing it (its cache
     # lag); the reconcile's holds last minutes, so nothing here depends on it.
-    global _real_pool_pause
+    # The applied.json marker goes through gcloud, which the suite never runs.
+    global _real_pool_pause, _real_gcloud
     _real_pool_pause = boskos_pool.pause
     boskos_pool.pause = lambda seconds: None
+    _real_gcloud = reconcile.gcloud_runner
+    reconcile.gcloud_runner = _gcloud_ok
 
 
 def tearDownModule():
     boskos_pool.pause = _real_pool_pause
+    reconcile.gcloud_runner = _real_gcloud
 
 
 class _Boskos:
@@ -114,6 +123,7 @@ class _Boskos:
         self.released = []
         self.resets = []
         self.beats = []
+        self.walked = 0
 
     def __call__(self, request, timeout=None):
         url = request.full_url
@@ -128,6 +138,7 @@ class _Boskos:
             return io.BytesIO(b"{}")
         if action == "acquire":
             assert query["dest"] == reconcile.HOLD_STATE and query["state"] == "free", query
+            self.walked += 1
             if not self.free:
                 raise _http_error(404, url)
             name = self.free.pop(0)
@@ -156,7 +167,7 @@ class PlanInspectionTest(unittest.TestCase):
         tofu = _Tofu({P7: UPDATE_ONLY})
         outcome, detail = reconcile.reconcile_project(P7, runner=tofu)
         self.assertEqual(outcome, reconcile.OUTCOME_APPLIED)
-        self.assertEqual(detail, "0 to add, 1 to change, 0 to replace, 0 refused")
+        self.assertEqual(detail, "0 to add, 1 to change, 0 to replace, 0 to destroy, 0 refused")
         self.assertEqual(tofu.verbs(), ["init", "plan", "show", "apply"])
         self.assertEqual(tofu.calls[3][-1], tofu.calls[2][-1], "apply takes the plan file show inspected")
         self.assertIn("-var=project_id=%s" % P7, tofu.calls[1])
@@ -182,7 +193,7 @@ class PlanInspectionTest(unittest.TestCase):
         # The orphan disk a cleanup deleted comes back; that is the point.
         tofu = _Tofu({P7: CREATE_AND_UPDATE})
         outcome, detail = reconcile.reconcile_project(P7, runner=tofu)
-        self.assertEqual((outcome, detail), (reconcile.OUTCOME_APPLIED, "1 to add, 1 to change, 0 to replace, 0 refused"))
+        self.assertEqual((outcome, detail), (reconcile.OUTCOME_APPLIED, "1 to add, 1 to change, 0 to replace, 0 to destroy, 0 refused"))
 
     def test_a_replace_is_refused_and_named_before_anything_is_applied(self):
         tofu = _Tofu({P7: REPLACE})
@@ -393,7 +404,7 @@ class LeaseTest(unittest.TestCase):
         outcomes = {}
         with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
             with self.assertRaises(boskos_pool.Terminated):
-                reconcile.reconcile_pool(BOSKOS, OWNER, len(KNOWN), runner=tofu, known=KNOWN, outcomes=outcomes)
+                reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, outcomes=outcomes)
         self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_FAILED)
         self.assertIn("release failed", outcomes[P7][1])
 
@@ -413,7 +424,7 @@ class LeaseTest(unittest.TestCase):
         outcomes = {}
         with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
             with self.assertRaises(boskos_pool.Terminated):
-                reconcile.reconcile_pool(BOSKOS, OWNER, len(KNOWN), runner=tofu, known=KNOWN, outcomes=outcomes)
+                reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, outcomes=outcomes)
         self.assertEqual(outcomes[P8][0], reconcile.OUTCOME_INTERRUPTED)
         self.assertIn("force-unlock", outcomes[P8][1])
         self.assertIn("release failed", outcomes[P8][1])
@@ -457,23 +468,10 @@ class LeaseTest(unittest.TestCase):
         boskos = _Boskos(free=[P7, P8])
         tofu = _Tofu({P7: UPDATE_ONLY, P8: CREATE_AND_UPDATE})
         with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
-            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, 2, runner=tofu, known=KNOWN)
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN)
         self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_APPLIED, P8: reconcile.OUTCOME_APPLIED})
         self.assertEqual(sorted(boskos.released), [P7, P8])
         self.assertEqual(tofu.verbs().count("apply"), 2)
-
-    def test_the_pool_walk_leaves_a_hand_out_outside_the_mapping_untouched(self):
-        # Registered in Boskos but not mapped: released, reported, no tofu.
-        stray = "kube-agents-evals-99"
-        boskos = _Boskos(free=[stray, P7])
-        tofu = _Tofu({P7: UPDATE_ONLY})
-        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
-            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, 2, runner=tofu, known=KNOWN)
-        self.assertEqual(outcomes[stray], (reconcile.OUTCOME_FAILED, reconcile.REASON_UNMAPPED))
-        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
-        self.assertEqual(sorted(boskos.released), [P7, stray])
-        self.assertNotIn(stray, " ".join(" ".join(c) for c in tofu.calls))
-
 
 class MainTest(unittest.TestCase):
     def _main(self, argv, boskos, tofu, scan=None):
@@ -524,7 +522,7 @@ class MainTest(unittest.TestCase):
         # operator's force-unlock is against that project's state.
         self.assertIn(f"{P8}: interrupted (terminated (signal 2) while tofu ran", stdout.getvalue())
         self.assertIn("force-unlock", stdout.getvalue())
-        self.assertIn("reconciled 2 project(s): 1 applied, 0 unchanged, 0 planned, 0 busy, 0 refused or failed, 1 interrupted", stdout.getvalue())
+        self.assertIn("reconciled 2 project(s): 1 applied, 0 converged, 0 unchanged, 0 planned, 0 busy, 0 refused or failed, 1 interrupted, 0 not reached", stdout.getvalue())
         self.assertIn(f"terminated (signal 2) after 2 project(s); interrupted in {P8}", stderr.getvalue())
 
     def test_drifted_reads_the_scan_resets_strands_and_applies_the_projects_listed(self):
@@ -539,26 +537,18 @@ class MainTest(unittest.TestCase):
         self.assertEqual(boskos.resets[0]["state"], reconcile.HOLD_STATE)
         self.assertEqual(boskos.resets[0]["expire"], reconcile.STRANDED_AFTER)
 
-    def test_all_walks_the_free_pool_after_resetting_strands_and_applies_each(self):
-        # The weekly arm: the pool size from the mapping bounds the walk, each
-        # free project is held and applied once, and the exit is the outcomes'.
+    def test_all_asks_for_every_mapped_project_after_resetting_strands_and_applies_each(self):
+        # The full-pass arm: every mapped project is asked for by name, held
+        # and applied once, and the exit is the outcomes'.
         boskos = _Boskos(free=[P7, P8])
         tofu = _Tofu({P7: UPDATE_ONLY, P8: UPDATE_ONLY})
-        rc, _ = self._main(["--all"], boskos, tofu)
+        with mock.patch.object(reconcile, "pool_projects", lambda *a, **k: set(KNOWN)):
+            rc, _ = self._main(["--all"], boskos, tofu)
         self.assertEqual(rc, reconcile.EXIT_OK)
         self.assertEqual(boskos.resets[0]["state"], reconcile.HOLD_STATE)
         self.assertEqual(boskos.acquired, [P7, P8])
         self.assertEqual(boskos.released, [P7, P8])
         self.assertEqual(tofu.verbs().count("apply"), 2)
-
-    def test_all_fails_on_a_hand_out_outside_the_mapping_and_releases_it(self):
-        boskos = _Boskos(free=["kube-agents-evals-99", P7])
-        tofu = _Tofu({P7: UPDATE_ONLY})
-        rc, stderr = self._main(["--all"], boskos, tofu)
-        self.assertEqual(rc, reconcile.EXIT_FAILED)
-        self.assertIn("kube-agents-evals-99", stderr)
-        self.assertEqual(boskos.released, ["kube-agents-evals-99", P7])
-        self.assertEqual(tofu.verbs().count("apply"), 1, "the mapped project is still applied")
 
     def test_the_report_is_written_for_a_pass_a_failure_and_a_termination(self):
         # The CI health bot reads it from the job's artifacts; ARTIFACTS is
@@ -659,7 +649,7 @@ class HoldTest(unittest.TestCase):
                 if run == "named":
                     reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=slow_tofu, known=KNOWN)
                 else:
-                    reconcile.reconcile_pool(BOSKOS, OWNER, 1, runner=slow_tofu, known=KNOWN)
+                    reconcile.reconcile_pool(BOSKOS, OWNER, runner=slow_tofu, known=KNOWN)
             self.assertGreaterEqual(len(boskos.beats), 2, run)
             self.assertEqual(boskos.released, [P7], run)
 
@@ -1060,6 +1050,538 @@ class TofuRunnerTest(unittest.TestCase):
         # its own session sees only the one interrupt this process forwards.
         result = reconcile.tofu_runner([sys.executable, "-c", "import os; print(os.getsid(0))"], timeout=10)
         self.assertNotEqual(int(result.stdout.strip()), os.getsid(0))
+
+
+# ---------------------------------------------------------------------------
+# Apply-on-merge: the run budget, the by-name pass over the pool, the stop
+# when main moves, the re-stamp outcome, the allowlist, the traceable report
+# and the workers. Each guard below was seen red before its code was written.
+
+SEEDED_B = "google_container_cluster.seeded_b"
+EXCLUSION = {"maintenance_policy": [{"maintenance_exclusion": [{"exclusion_name": "hold-the-minor-lag", "start_time": "2026-10-01T00:00:00Z", "end_time": "2026-12-30T00:00:00Z"}]}], "min_master_version": "1.34.11", "name": "fleet-seeded-b"}
+
+
+def _restamped(before=EXCLUSION, **after_changes):
+    after = json.loads(json.dumps(before))
+    after["maintenance_policy"][0]["maintenance_exclusion"][0]["start_time"] = "2026-10-05T00:00:00Z"
+    after["maintenance_policy"][0]["maintenance_exclusion"][0]["end_time"] = "2027-01-03T00:00:00Z"
+    after.update(after_changes)
+    return after
+
+
+def _plan_with_diff(address, before, after, actions=("update",), after_unknown=None, extra=()):
+    changes = [{"address": address, "change": {"actions": list(actions), "before": before, "after": after, "after_unknown": after_unknown or {}}}]
+    changes += [{"address": a, "change": {"actions": list(acts)}} for acts, a in extra]
+    return json.dumps({"resource_changes": changes})
+
+
+RESTAMP_ONLY = _plan_with_diff(SEEDED_B, EXCLUSION, _restamped())
+RESTAMP_AND_UPGRADE = _plan_with_diff(SEEDED_B, EXCLUSION, _restamped(min_master_version="1.34.12"))
+RESTAMP_ELSEWHERE = _plan_with_diff("google_container_cluster.seeded_a", EXCLUSION, _restamped())
+RESTAMP_UNKNOWN_FIELD = _plan_with_diff(SEEDED_B, EXCLUSION, _restamped(), after_unknown={"node_version": True})
+RESTAMP_PLUS_CREATE = _plan_with_diff(SEEDED_B, EXCLUSION, _restamped(), extra=((["create"], "google_compute_disk.orphan"),))
+
+
+def _allow(triples):
+    return [reconcile.AllowEntry(address, why, bool(standing)) for address, why, standing in triples]
+
+
+class _Clock:
+    """A monotonic clock the tests move by hand."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+def _tofu_taking(seconds, clock, plans):
+    """A _Tofu whose apply advances the fake clock by `seconds`."""
+    inner = _Tofu(plans)
+
+    def runner(argv, **kw):
+        if argv[1] == "apply":
+            clock.now += seconds
+        return inner(argv, **kw)
+
+    runner.inner = inner
+    return runner
+
+
+class BudgetTest(unittest.TestCase):
+    """A run never starts a project it cannot finish inside its budget."""
+
+    def test_a_project_is_not_started_with_less_than_a_ceiling_left(self):
+        clock = _Clock()
+        tofu = _tofu_taking(50, clock, {P7: UPDATE_ONLY, P8: UPDATE_ONLY})
+        boskos = _Boskos(free=[P7, P8])
+        with mock.patch.object(reconcile, "clock", clock), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
+            run = reconcile.Run(budget_seconds=100, ceiling_seconds=60)
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=run)
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
+        self.assertEqual(outcomes[P8][0], reconcile.OUTCOME_NOT_REACHED)
+        self.assertIn("budget", outcomes[P8][1])
+        self.assertEqual(boskos.acquired, [P7], "the project that was not started was never leased")
+
+    def test_without_a_budget_every_project_is_started(self):
+        clock = _Clock()
+        tofu = _tofu_taking(5000, clock, {P7: UPDATE_ONLY, P8: UPDATE_ONLY})
+        boskos = _Boskos(free=[P7, P8])
+        with mock.patch.object(reconcile, "clock", clock), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=reconcile.Run())
+        self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_APPLIED, P8: reconcile.OUTCOME_APPLIED})
+
+    def test_the_per_project_deadline_is_the_ceiling(self):
+        timeouts = []
+
+        def runner(argv, timeout=None, **_):
+            timeouts.append(timeout)
+            if argv[1] == "plan":
+                return subprocess.CompletedProcess(argv, reconcile.PLAN_HAS_CHANGES, "", "")
+            if argv[1] == "show":
+                return subprocess.CompletedProcess(argv, 0, UPDATE_ONLY, "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        boskos = _Boskos(free=[P7])
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
+            reconcile.reconcile_pool(BOSKOS, OWNER, runner=runner, known={P7}, run=reconcile.Run(budget_seconds=7200, ceiling_seconds=300))
+        self.assertTrue(timeouts and all(t <= 300 for t in timeouts), timeouts)
+
+    def test_not_reached_is_counted_and_is_not_a_failure(self):
+        clock = _Clock()
+        tofu = _tofu_taking(50, clock, {P7: UPDATE_ONLY, P8: UPDATE_ONLY})
+        boskos = _Boskos(free=[P7, P8])
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            report = pathlib.Path(tmp) / "r.json"
+            with mock.patch.object(reconcile, "clock", clock), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(
+                reconcile, "tofu_runner", tofu
+            ), mock.patch.object(reconcile.signal, "signal"), mock.patch.object(reconcile, "pool_projects", lambda *a, **k: set(KNOWN)), mock.patch(
+                "sys.stdout", stdout
+            ), mock.patch("sys.stderr", io.StringIO()):
+                rc = reconcile.main(["--all", "--budget-seconds", "100", "--project-ceiling-seconds", "60", "--report", str(report), "--boskos-server", BOSKOS, "--boskos-owner", OWNER])
+            doc = json.loads(report.read_text())
+        self.assertEqual(rc, reconcile.EXIT_OK)
+        self.assertEqual(doc["summary"][reconcile.OUTCOME_NOT_REACHED], 1)
+        self.assertEqual((doc["budget_seconds"], doc["ceiling_seconds"]), (100, 60))
+        self.assertIn("1 not reached", stdout.getvalue())
+
+
+class PassTest(unittest.TestCase):
+    """`--all` asks for every mapped project by name and keeps asking for the busy ones."""
+
+    def test_every_mapped_project_is_asked_for_by_name_and_the_pool_is_never_walked(self):
+        boskos = _Boskos(free=[P8, P7])
+        tofu = _Tofu({P7: UPDATE_ONLY, P8: UPDATE_ONLY})
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=reconcile.Run())
+        self.assertEqual(boskos.acquired, [P7, P8], "sorted, by name")
+        self.assertEqual(boskos.walked, 0, "no /acquire of whatever is free")
+        self.assertEqual(sorted(boskos.released), [P7, P8])
+        self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_APPLIED, P8: reconcile.OUTCOME_APPLIED})
+
+    def test_a_busy_project_is_asked_for_again_until_it_is_free(self):
+        boskos = _Boskos(free=[P7])
+        pauses = []
+
+        def pause(seconds):
+            pauses.append(seconds)
+            boskos.free.append(P8)
+
+        tofu = _Tofu({P7: UPDATE_ONLY, P8: UPDATE_ONLY})
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(reconcile, "pause", pause):
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=reconcile.Run(budget_seconds=7200))
+        self.assertEqual(outcomes[P8][0], reconcile.OUTCOME_APPLIED)
+        self.assertEqual(pauses, [reconcile.POLL_INTERVAL_SECONDS])
+
+    def test_a_project_still_busy_when_the_budget_ends_is_not_reached(self):
+        clock = _Clock()
+        boskos = _Boskos(free=[P7])
+
+        def pause(seconds):
+            clock.now += seconds
+
+        tofu = _Tofu({P7: UPDATE_ONLY})
+        with mock.patch.object(reconcile, "clock", clock), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(reconcile, "pause", pause):
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=reconcile.Run(budget_seconds=400, ceiling_seconds=60))
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
+        self.assertEqual(outcomes[P8][0], reconcile.OUTCOME_NOT_REACHED)
+        self.assertIn("not free", outcomes[P8][1])
+        self.assertLessEqual(clock.now, 400)
+
+    def test_a_registration_outside_the_mapping_is_never_asked_for(self):
+        boskos = _Boskos(free=["kube-agents-evals-99", P7])
+        tofu = _Tofu({P7: UPDATE_ONLY})
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known={P7}, run=reconcile.Run())
+        self.assertEqual(list(outcomes), [P7])
+        self.assertEqual(boskos.acquired, [P7])
+
+
+class MainMovedTest(unittest.TestCase):
+    """A run applies the tree it started with, and stops when main's fleet tree is no longer that one."""
+
+    def _git(self, trees):
+        calls = []
+
+        def git(args):
+            calls.append(list(args))
+            if args[:1] == ["fetch"]:
+                return ""
+            if args[:1] == ["rev-parse"] and args[1].startswith("FETCH_HEAD:"):
+                return trees.pop(0) if len(trees) > 1 else trees[0]
+            if args[:1] == ["rev-parse"] and args[1] == "HEAD:bench/tf/fleet":
+                return "tree-aaa"
+            if args[:1] == ["rev-parse"] and args[1] == "HEAD":
+                return "commit-111"
+            raise AssertionError(args)
+
+        git.calls = calls
+        return git
+
+    def test_the_run_stops_when_the_fleet_tree_on_main_moves(self):
+        git = self._git(["tree-aaa", "tree-bbb"])
+        boskos = _Boskos(free=[P7, P8])
+        tofu = _Tofu({P7: UPDATE_ONLY, P8: UPDATE_ONLY})
+        with mock.patch.object(reconcile, "git_output", git), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(reconcile, "MAIN_CHECK_INTERVAL_SECONDS", 0):
+            run = reconcile.Run(main_ref="origin/main")
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=run)
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
+        self.assertEqual(outcomes[P8][0], reconcile.OUTCOME_NOT_REACHED)
+        self.assertIn("tree-bbb", outcomes[P8][1])
+        self.assertIn(["fetch", "--quiet", "--depth=1", "origin", "main"], git.calls)
+        self.assertEqual(boskos.acquired, [P7])
+
+    def test_a_fetch_that_fails_is_a_warning_not_a_stop(self):
+        def git(args):
+            if args[:1] == ["fetch"]:
+                raise reconcile.ReconcileError("fetch: could not resolve host")
+            if args[:1] == ["rev-parse"] and args[1] == "HEAD:bench/tf/fleet":
+                return "tree-aaa"
+            return "commit-111"
+
+        boskos = _Boskos(free=[P7, P8])
+        tofu = _Tofu({P7: UPDATE_ONLY, P8: UPDATE_ONLY})
+        stderr = io.StringIO()
+        with mock.patch.object(reconcile, "git_output", git), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(reconcile, "MAIN_CHECK_INTERVAL_SECONDS", 0), mock.patch("sys.stderr", stderr):
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=reconcile.Run(main_ref="origin/main"))
+        self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_APPLIED, P8: reconcile.OUTCOME_APPLIED})
+        self.assertIn("could not resolve host", stderr.getvalue())
+
+    def test_without_a_main_ref_git_is_never_fetched(self):
+        git = self._git(["tree-aaa"])
+        boskos = _Boskos(free=[P7])
+        with mock.patch.object(reconcile, "git_output", git), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
+            reconcile.reconcile_pool(BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known={P7}, run=reconcile.Run())
+        self.assertFalse(any(c[:1] == ["fetch"] for c in git.calls))
+
+
+class ConvergedTest(unittest.TestCase):
+    """A plan whose only change is seeded-b's exclusion re-stamp is `converged`, decided on the changed fields, not the address."""
+
+    def test_a_restamp_only_plan_is_applied_and_reported_converged(self):
+        tofu = _Tofu({P7: RESTAMP_ONLY})
+        outcome, detail = reconcile.reconcile_project(P7, runner=tofu)
+        self.assertEqual(outcome, reconcile.OUTCOME_CONVERGED)
+        self.assertIn("re-stamp", detail)
+        self.assertEqual(tofu.verbs(), ["init", "plan", "show", "apply"], "the re-stamp is still applied")
+
+    def test_a_restamp_with_a_version_change_on_the_same_address_is_applied_not_converged(self):
+        outcome, _ = reconcile.reconcile_project(P7, runner=_Tofu({P7: RESTAMP_AND_UPGRADE}))
+        self.assertEqual(outcome, reconcile.OUTCOME_APPLIED)
+
+    def test_a_restamp_shaped_change_on_another_address_is_applied(self):
+        outcome, _ = reconcile.reconcile_project(P7, runner=_Tofu({P7: RESTAMP_ELSEWHERE}))
+        self.assertEqual(outcome, reconcile.OUTCOME_APPLIED)
+
+    def test_an_unknown_after_value_counts_as_a_changed_field(self):
+        outcome, _ = reconcile.reconcile_project(P7, runner=_Tofu({P7: RESTAMP_UNKNOWN_FIELD}))
+        self.assertEqual(outcome, reconcile.OUTCOME_APPLIED)
+
+    def test_a_restamp_beside_any_other_change_is_applied(self):
+        outcome, _ = reconcile.reconcile_project(P7, runner=_Tofu({P7: RESTAMP_PLUS_CREATE}))
+        self.assertEqual(outcome, reconcile.OUTCOME_APPLIED)
+
+    def test_an_update_without_before_and_after_is_applied(self):
+        outcome, _ = reconcile.reconcile_project(P7, runner=_Tofu({P7: UPDATE_ONLY}))
+        self.assertEqual(outcome, reconcile.OUTCOME_APPLIED)
+
+    def test_a_dry_run_of_a_restamp_says_so_and_applies_nothing(self):
+        tofu = _Tofu({P7: RESTAMP_ONLY})
+        outcome, detail = reconcile.reconcile_project(P7, runner=tofu, dry_run=True)
+        self.assertEqual(outcome, reconcile.OUTCOME_PLANNED)
+        self.assertIn("re-stamp", detail)
+        self.assertNotIn("apply", tofu.verbs())
+
+    def test_converged_is_not_a_failure_and_is_counted(self):
+        self.assertNotIn(reconcile.OUTCOME_CONVERGED, reconcile.FAILING_OUTCOMES)
+        self.assertNotIn(reconcile.OUTCOME_NOT_REACHED, reconcile.FAILING_OUTCOMES)
+        boskos = _Boskos(free=[P7])
+        stdout = io.StringIO()
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", stdout):
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=_Tofu({P7: RESTAMP_ONLY}), known={P7}, run=reconcile.Run())
+            failing = reconcile.report(outcomes)
+        self.assertEqual(failing, [])
+        self.assertIn("1 converged", stdout.getvalue())
+
+
+class AllowlistTest(unittest.TestCase):
+    """What a re-apply may delete or replace is declared in the fleet directory, not in this script."""
+
+    def test_the_committed_allowlist_carries_the_no_surge_pool_as_a_standing_entry(self):
+        entries = reconcile.load_allowlist(reconcile.ALLOWLIST_FILE)
+        standing = [e for e in entries if e.standing]
+        self.assertEqual([e.address for e in standing], ["google_container_node_pool.no_surge_pool"])
+        self.assertTrue(all(e.why for e in entries), "every entry says why")
+        self.assertFalse(hasattr(reconcile, "REPLACE_ALLOWED_ADDRESSES"), "one list, in the file")
+
+    def test_a_delete_on_a_listed_address_is_applied_and_counted(self):
+        allow = _allow([("google_compute_disk.orphan", "revert of the cost fixture", False)])
+        tofu = _Tofu({P7: DELETE})
+        outcome, detail = reconcile.reconcile_project(P7, runner=tofu, allow=allow)
+        self.assertEqual(outcome, reconcile.OUTCOME_APPLIED)
+        self.assertEqual(detail, "0 to add, 0 to change, 0 to replace, 1 to destroy, 0 refused")
+        self.assertIn("apply", tofu.verbs())
+
+    def test_a_delete_on_an_unlisted_address_is_still_refused(self):
+        allow = _allow([("google_compute_disk.other", "something else", False)])
+        outcome, detail = reconcile.reconcile_project(P7, runner=_Tofu({P7: DELETE}), allow=allow)
+        self.assertEqual(outcome, reconcile.OUTCOME_REFUSED)
+        self.assertIn("delete google_compute_disk.orphan", detail)
+
+    def test_a_replace_on_a_listed_address_is_applied(self):
+        allow = _allow([("google_container_node_pool.seeded_a_idle", "one-time rebuild", False)])
+        outcome, _ = reconcile.reconcile_project(P7, runner=_Tofu({P7: REPLACE}), allow=allow)
+        self.assertEqual(outcome, reconcile.OUTCOME_APPLIED)
+
+    def test_a_forget_is_refused_even_when_listed(self):
+        allow = _allow([("google_compute_disk.orphan", "x", False)])
+        outcome, _ = reconcile.reconcile_project(P7, runner=_Tofu({P7: FORGET}), allow=allow)
+        self.assertEqual(outcome, reconcile.OUTCOME_REFUSED)
+
+    def test_an_entry_the_plan_did_not_need_is_reported_unused_and_a_standing_one_is_not(self):
+        allow = _allow([("google_compute_disk.gone", "an old revert", False), ("google_container_node_pool.no_surge_pool", "minor roll", True)])
+        boskos = _Boskos(free=[P7])
+        run = reconcile.Run(allow=allow)
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
+            reconcile.reconcile_pool(BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known={P7}, run=run)
+        self.assertEqual(run.extras[P7]["allowlist_unused"], ["google_compute_disk.gone"])
+
+    def test_an_entry_the_plan_used_is_not_reported(self):
+        allow = _allow([("google_compute_disk.orphan", "revert", False)])
+        boskos = _Boskos(free=[P7])
+        run = reconcile.Run(allow=allow)
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
+            reconcile.reconcile_pool(BOSKOS, OWNER, runner=_Tofu({P7: DELETE}), known={P7}, run=run)
+        self.assertEqual(run.extras[P7]["allowlist_unused"], [])
+
+    def test_a_malformed_allowlist_is_refused_before_anything_is_leased(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "allow.json"
+            for bad in ('{"address": "x"}', '[{"address": "x"}]', '[{"why": "no address"}]', "not json"):
+                path.write_text(bad)
+                with self.assertRaises(reconcile.ReconcileError, msg=bad):
+                    reconcile.load_allowlist(path)
+            path.write_text('[{"address": "google_compute_disk.orphan", "why": "revert"}]')
+            entries = reconcile.load_allowlist(path)
+            self.assertEqual((entries[0].address, entries[0].why, entries[0].standing), ("google_compute_disk.orphan", "revert", False))
+
+    def test_a_missing_allowlist_file_means_nothing_may_be_destroyed(self):
+        self.assertEqual(reconcile.load_allowlist(pathlib.Path("/nonexistent/allow.json")), [])
+
+
+class ReportFieldsTest(unittest.TestCase):
+    """The report says what was applied, where, when, from which commit; each project keeps a marker in its state bucket."""
+
+    def _git(self, args):
+        if args == ["rev-parse", "HEAD"]:
+            return "commit-111"
+        if args == ["rev-parse", "HEAD:bench/tf/fleet"]:
+            return "tree-aaa"
+        raise AssertionError(args)
+
+    def test_the_report_carries_the_commit_the_tree_the_times_and_the_visited_count(self):
+        boskos = _Boskos(free=[P7])
+        published = []
+        with tempfile.TemporaryDirectory() as tmp:
+            report = pathlib.Path(tmp) / "r.json"
+            with mock.patch.object(reconcile, "git_output", self._git), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(
+                reconcile, "tofu_runner", _Tofu({P7: UPDATE_ONLY})
+            ), mock.patch.object(reconcile, "publish_applied", lambda *a, **k: published.append(a) or None), mock.patch.object(reconcile.signal, "signal"), mock.patch.object(
+                reconcile, "pool_projects", lambda *a, **k: set(KNOWN)
+            ), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()), mock.patch.dict(os.environ, {"BUILD_ID": "123", "JOB_NAME": "post-x"}):
+                rc = reconcile.main(["--all", "--workers", "1", "--report", str(report), "--boskos-server", BOSKOS, "--boskos-owner", OWNER])
+            doc = json.loads(report.read_text())
+        self.assertEqual(rc, reconcile.EXIT_OK)
+        self.assertEqual((doc["commit"], doc["fleet_tree"], doc["workers"], doc["build"], doc["job"]), ("commit-111", "tree-aaa", 1, "123", "post-x"))
+        self.assertEqual(doc["visited"], 1)
+        # No budget was given, so the busy project is busy, as a hand run reports it.
+        self.assertEqual(doc["outcomes"][P8]["outcome"], reconcile.OUTCOME_BUSY)
+        entry = doc["outcomes"][P7]
+        self.assertTrue(entry["started_at"].endswith("Z") and entry["finished_at"] >= entry["started_at"])
+        self.assertEqual(entry["allowlist_unused"], [])
+        self.assertEqual(doc["summary"][reconcile.OUTCOME_BUSY], 1)
+        self.assertEqual(len(published), 1)
+
+    def test_an_applied_project_gets_a_marker_in_its_state_bucket(self):
+        copies = []
+
+        def gcloud(argv, **kw):
+            copies.append((list(argv), kw.get("input")))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        run = reconcile.Run(commit="commit-111", fleet_tree="tree-aaa", build="123", job="post-x")
+        with mock.patch.object(reconcile, "gcloud_runner", gcloud):
+            warning = reconcile.publish_applied(P7, reconcile.OUTCOME_APPLIED, run)
+        self.assertIsNone(warning)
+        self.assertEqual(len(copies), 1)
+        argv, stdin = copies[0]
+        self.assertEqual(argv, ["gcloud", "storage", "cp", "-", f"gs://{P7}-tf-state/seeded-fleet/applied.json"])
+        body = json.loads(stdin)
+        self.assertEqual((body["commit"], body["fleet_tree"], body["build"], body["job"], body["outcome"]), ("commit-111", "tree-aaa", "123", "post-x", "applied"))
+        self.assertTrue(body["finished_at"].endswith("Z"))
+
+    def test_a_failed_marker_write_is_a_warning_on_the_outcome_not_a_failure(self):
+        def gcloud(argv, **kw):
+            return subprocess.CompletedProcess(argv, 1, "", "AccessDeniedException: 403")
+
+        boskos = _Boskos(free=[P7])
+        run = reconcile.Run(commit="c", fleet_tree="t", publish=True)
+        with mock.patch.object(reconcile, "gcloud_runner", gcloud), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known={P7}, run=run)
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
+        self.assertIn("applied.json", outcomes[P7][1])
+        self.assertIn("403", outcomes[P7][1])
+
+    def test_no_marker_is_written_on_a_dry_run_or_a_refusal(self):
+        copies = []
+
+        def gcloud(argv, **kw):
+            copies.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        for plan, dry in ((UPDATE_ONLY, True), (REPLACE, False)):
+            boskos = _Boskos(free=[P7])
+            with mock.patch.object(reconcile, "gcloud_runner", gcloud), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
+                reconcile.reconcile_pool(BOSKOS, OWNER, runner=_Tofu({P7: plan}), known={P7}, dry_run=dry, run=reconcile.Run(commit="c", fleet_tree="t", publish=True))
+        self.assertEqual(copies, [])
+
+
+class WorkersTest(unittest.TestCase):
+    """N projects at once, each under its own lease; a termination still releases every one."""
+
+    def test_two_workers_hold_two_projects_at_once(self):
+        live, peak, lock = [0], [0], threading.Lock()
+
+        def tofu(argv, **_):
+            if argv[1] == "apply":
+                with lock:
+                    live[0] += 1
+                    peak[0] = max(peak[0], live[0])
+                time.sleep(0.3)
+                with lock:
+                    live[0] -= 1
+            if argv[1] == "plan":
+                return subprocess.CompletedProcess(argv, reconcile.PLAN_HAS_CHANGES, "", "")
+            if argv[1] == "show":
+                return subprocess.CompletedProcess(argv, 0, UPDATE_ONLY, "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        boskos = _Boskos(free=[P7, P8])
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=reconcile.Run(workers=2))
+        self.assertEqual(peak[0], 2, "both applies ran at the same time")
+        self.assertEqual(sorted(boskos.released), [P7, P8])
+        self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_APPLIED, P8: reconcile.OUTCOME_APPLIED})
+
+    def test_hold_signals_is_a_no_op_off_the_main_thread(self):
+        before = signal.getsignal(signal.SIGINT)
+        errors = []
+
+        def body():
+            try:
+                boskos_pool._hold_signals(True)
+                boskos_pool._hold_signals(False)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t = threading.Thread(target=body)
+        t.start()
+        t.join()
+        self.assertEqual(errors, [])
+        self.assertIs(signal.getsignal(signal.SIGINT), before)
+        self.assertEqual(boskos_pool._HOLD_DEPTH, 0)
+
+    def test_a_termination_with_workers_interrupts_every_apply_and_releases_every_project(self):
+        started = threading.Barrier(3)
+
+        def tofu(argv, **_):
+            if argv[1] == "apply":
+                started.wait(timeout=5)
+                # The fake stands in for a tofu that exits on the interrupt.
+                for _ in range(100):
+                    if reconcile.terminating():
+                        return subprocess.CompletedProcess(argv, 130, "", "interrupted")
+                    time.sleep(0.02)
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            if argv[1] == "plan":
+                return subprocess.CompletedProcess(argv, reconcile.PLAN_HAS_CHANGES, "", "")
+            if argv[1] == "show":
+                return subprocess.CompletedProcess(argv, 0, UPDATE_ONLY, "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        # Three mapped projects for two workers: the third must never start
+        # once the termination has landed, and the report must say so.
+        p9 = "kube-agents-evals-9"
+        boskos = _Boskos(free=[P7, P8, p9])
+        previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+        outcomes = {}
+
+        def fire():
+            started.wait(timeout=5)
+            os.kill(os.getpid(), signal.SIGINT)
+
+        try:
+            threading.Thread(target=fire, daemon=True).start()
+            with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()):
+                with self.assertRaises(boskos_pool.Terminated):
+                    reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN | {p9}, run=reconcile.Run(workers=2), outcomes=outcomes)
+        finally:
+            signal.signal(signal.SIGINT, previous)
+            reconcile._TERMINATING.clear()
+        self.assertEqual(sorted(boskos.released), [P7, P8])
+        self.assertEqual(sorted(boskos.acquired), [P7, P8], "no project is leased after the termination")
+        self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_INTERRUPTED, P8: reconcile.OUTCOME_INTERRUPTED, p9: reconcile.OUTCOME_NOT_REACHED})
+        self.assertTrue(all("force-unlock" in d for p, (_, d) in outcomes.items() if p != p9))
+        self.assertIn("terminated", outcomes[p9][1])
+
+    def test_a_project_that_failed_before_its_plan_was_read_reports_no_allowlist_verdict(self):
+        allow = _allow([("google_compute_disk.gone", "old revert", False)])
+        boskos = _Boskos(free=[P7])
+        run = reconcile.Run(allow=allow)
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=_Tofu({}, fail={"init": "backend: bucket not found"}), known={P7}, run=run)
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_FAILED)
+        self.assertNotIn("allowlist_unused", run.extras[P7], "a plan that was not read says nothing about the allowlist")
+
+    def test_the_report_says_when_the_main_moved_check_could_not_run(self):
+        def git(args):
+            if args[:1] == ["fetch"]:
+                raise reconcile.ReconcileError("fetch: could not resolve host")
+            return "tree-aaa" if args[1].startswith("HEAD:") else "commit-111"
+
+        boskos = _Boskos(free=[P7])
+        with mock.patch.object(reconcile, "git_output", git), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(reconcile, "MAIN_CHECK_INTERVAL_SECONDS", 0), mock.patch("sys.stderr", io.StringIO()):
+            run = reconcile.Run(main_ref="origin/main")
+            reconcile.reconcile_pool(BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known={P7}, run=run)
+        self.assertIn("could not resolve host", run.main_check_error)
+        with tempfile.TemporaryDirectory() as tmp:
+            report = pathlib.Path(tmp) / "r.json"
+            reconcile.write_report(str(report), argparse.Namespace(project=None, drifted=False, dry_run=False), {}, 0, None, 0, run)
+            doc = json.loads(report.read_text())
+        self.assertEqual(doc["main_ref"], "origin/main")
+        self.assertIn("could not resolve host", doc["main_check_error"])
 
 
 if __name__ == "__main__":

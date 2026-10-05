@@ -95,6 +95,13 @@ REQUIRED_BINARIES = ("gcloud", "kubectl")
 ROLE_HEALTHY = "healthy"
 ROLE_DRIFTED = "drifted"
 ROLE_NOT_CHECKED = "not_checked"
+# The stack has not planted the fixture there (a new role, a project applied
+# before the catalog grew it, or something destroyed it): the runner found no
+# object or no cluster for its slot. A rollout state the next reconcile
+# finishes, told apart from a read that failed, which says nothing about the
+# fixture.
+ROLE_ABSENT = "absent"
+ROLE_STATES = (ROLE_HEALTHY, ROLE_DRIFTED, ROLE_ABSENT, ROLE_NOT_CHECKED)
 REPORT_VERDICT_TO_STATE = {
     "converged": ROLE_HEALTHY,
     "drifted": ROLE_DRIFTED,
@@ -150,6 +157,10 @@ RUNNER_WARNING_PREFIX = "WARNING: "
 RUNNER_LIST_WARNING = "could not list clusters"
 RUNNER_ROLE_WARNING = "fixture role '{role}'"
 RUNNER_SLOT_WARNING = "slot '{slot}'"
+# The runner's words for an absent fixture (hack/fleet-kubeconfigs.sh): the
+# role's objects missing, no cluster for its slot, or no seeded cluster at
+# all. Any other explanation (no credentials, could not list) is a failed read.
+RUNNER_ABSENT_PHRASES = ("was never planted", "has no labelled seeded cluster for slot", "carries no clusters labelled")
 
 DEFAULT_WORKERS = 6
 DEFAULT_PROJECT_TIMEOUT_S = 600
@@ -261,6 +272,22 @@ def unpublished_reason(role: str, slot: str, warnings: list[str]) -> str:
     return warnings[0] if warnings else REASON_UNPUBLISHED
 
 
+def unpublished_state(role: str, slot: str, warnings: list[str]) -> tuple[str, str]:
+    """(state, reason) for a role the runner published nothing for: absent
+    when a warning about this role, its slot, or the whole project says the
+    fixture is not there; not checked when the warning is about reading, is
+    about another role, or there is none."""
+    reason = unpublished_reason(role, slot, warnings)
+    role_needle, slot_needle = RUNNER_ROLE_WARNING.format(role=role), RUNNER_SLOT_WARNING.format(slot=slot)
+    for warning in warnings:
+        if RUNNER_LIST_WARNING in warning:
+            break
+        names_this = role_needle in warning or slot_needle in warning or RUNNER_ABSENT_PHRASES[2] in warning
+        if names_this and any(phrase in warning for phrase in RUNNER_ABSENT_PHRASES):
+            return ROLE_ABSENT, warning
+    return ROLE_NOT_CHECKED, reason
+
+
 def _all_roles(roles: dict[str, str], state: str, detail: list[str]) -> dict[str, dict]:
     return {role: {KEY_STATE: state, KEY_DETAIL: list(detail)} for role in roles}
 
@@ -269,7 +296,7 @@ def _project_entry(roles_out: dict[str, dict], reader: str | None, started: floa
     counts = collections.Counter(entry[KEY_STATE] for entry in roles_out.values())
     entry = {
         KEY_ROLES: roles_out,
-        KEY_SUMMARY: {state: counts.get(state, 0) for state in (ROLE_HEALTHY, ROLE_DRIFTED, ROLE_NOT_CHECKED)},
+        KEY_SUMMARY: {state: counts.get(state, 0) for state in ROLE_STATES},
         KEY_DURATION: int(time.monotonic() - started),
         KEY_READER: reader,
     }
@@ -347,11 +374,13 @@ def scan_project(
         verdict = verdicts.get(role) if isinstance(verdicts.get(role), dict) else {}
         kind = str(verdict.get(KEY_STATE) or REPORT_VERDICT_UNPUBLISHED)
         detail = [str(line) for line in verdict.get(KEY_DETAIL) or []]
+        state = REPORT_VERDICT_TO_STATE.get(kind, ROLE_NOT_CHECKED)
         if kind == REPORT_VERDICT_UNPUBLISHED:
-            detail = [unpublished_reason(role, slot, warnings)]
+            state, reason = unpublished_state(role, slot, warnings)
+            detail = [reason]
         elif kind == REPORT_VERDICT_NO_STATE:
             detail = [REASON_NO_STATE]
-        roles_out[role] = {KEY_STATE: REPORT_VERDICT_TO_STATE.get(kind, ROLE_NOT_CHECKED), KEY_DETAIL: detail}
+        roles_out[role] = {KEY_STATE: state, KEY_DETAIL: detail}
     return _project_entry(roles_out, reader, started)
 
 
@@ -384,6 +413,28 @@ def unread_units(document: dict | None) -> int:
         if any(s in (ROLE_HEALTHY, ROLE_DRIFTED) for s in states):
             count += sum(1 for s in states if s == ROLE_NOT_CHECKED)
     return count
+
+
+def absent_units(document: dict | None) -> int:
+    """How many roles the stack has not planted, across every project."""
+    return sum(len(roles) for roles in absent_map(document).values())
+
+
+def absent_projects(document: dict | None) -> int:
+    """How many projects have at least one absent role."""
+    return len(absent_map(document))
+
+
+def absent_map(document: dict | None) -> dict[str, list[str]]:
+    """{project: [absent roles]} for the projects with any, sorted."""
+    out: dict[str, list[str]] = {}
+    projects = (document or {}).get(KEY_PROJECTS) if isinstance(document, dict) else None
+    for project, entry in sorted((projects or {}).items()) if isinstance(projects, dict) else []:
+        roles = (entry or {}).get(KEY_ROLES) if isinstance(entry, dict) else None
+        absent = sorted(role for role, verdict in (roles or {}).items() if isinstance(verdict, dict) and verdict.get(KEY_STATE) == ROLE_ABSENT)
+        if absent:
+            out[project] = absent
+    return out
 
 
 def read_map(document: dict | None) -> dict[str, list[str]]:
@@ -448,8 +499,10 @@ def summarize(projects: dict[str, dict]) -> dict:
         KEY_PROJECTS: len(projects),
         "checked": checked_projects({KEY_PROJECTS: projects}),
         "drifted_projects": len(drift_map({KEY_PROJECTS: projects})),
+        "absent_projects": len(absent_map({KEY_PROJECTS: projects})),
         ROLE_HEALTHY: counts.get(ROLE_HEALTHY, 0),
         ROLE_DRIFTED: counts.get(ROLE_DRIFTED, 0),
+        ROLE_ABSENT: counts.get(ROLE_ABSENT, 0),
         ROLE_NOT_CHECKED: counts.get(ROLE_NOT_CHECKED, 0),
     }
 
@@ -568,7 +621,7 @@ def main(argv=None) -> int:
     log(
         f"fixture-state: {summary['checked']} of {summary[KEY_PROJECTS]} pool projects checked, "
         f"{summary['drifted_projects']} with drift ({summary[ROLE_HEALTHY]} roles healthy, "
-        f"{summary[ROLE_DRIFTED]} drifted, {summary[ROLE_NOT_CHECKED]} not checked) in {document[KEY_DURATION]}s; wrote {args.out}"
+        f"{summary[ROLE_DRIFTED]} drifted, {summary[ROLE_ABSENT]} absent, {summary[ROLE_NOT_CHECKED]} not checked) in {document[KEY_DURATION]}s; wrote {args.out}"
     )
     return EXIT_OK
 

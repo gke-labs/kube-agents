@@ -905,7 +905,7 @@ scan found a pool project no longer shaped as the verifier requires;
 docs/ci-health.md, "The pool-state scan") is the same shape: `roles` are the
 verifier's finding ids, `incident` also carries `repairs` (`{project: {finding:
 command}}`), and the `pool_state` block beside `fixture_state` summarises the
-scan; `pool-state.json` is its document, which no page reads: `scope` (`pool` for the hourly job's whole mapping, `selected` for a hand run's `--projects`, on both scan documents; the health rule reads a project absent from a `pool` document as retired from the mapping and one absent from a `selected` document as not read), then per project, per check, `state`, `detail`, and for a healthy or drifted check `unread`, the reads the verifier could not make, which is what keeps a check out of the incident's `reads` exit. Both blocks also carry `unread_units`, how many roles or checks were not read in full on projects that were checked (not checked, or read in part with the rest refused), which the pool digest line reports instead of calling the pool clean. Both scan
+scan; `pool-state.json` is its document, which no page reads: `scope` (`pool` for the hourly job's whole mapping, `selected` for a hand run's `--projects`, on both scan documents; the health rule reads a project absent from a `pool` document as retired from the mapping and one absent from a `selected` document as not read), then per project, per check, `state`, `detail`, and for a healthy or drifted check `unread`, the reads the verifier could not make, which is what keeps a check out of the incident's `reads` exit. Both blocks also carry `unread_units`, how many roles or checks were not read in full on projects that were checked (not checked, or read in part with the rest refused), which the pool digest line reports instead of calling the pool clean; both also carry `absent_units` and `absent_projects`, meaningful on the fleet block only: the fixtures the stack has not planted (a rollout the next reconcile finishes), which the fleet digest line says apart from the reads that failed. Both scan
 incidents carry `reads` (`{project: [what a later scan must read again]}`). `slow` is `null` or, on a `GREEN` tick, the slow-gate note
 (`{since, runs, min_s, median_s, max_s, baseline_days, baseline_runs,
 baseline_p50_s, baseline_p90_s, infra_reps}`, `docs/ci-health.md`, "A slow
@@ -969,8 +969,9 @@ finished_at, result, stale_after_h, dry_run, detail[], summary, history_url,
 place, absence, does, effect, runbook}`. `detail` (on `FAILED` only)
 is the report's lines, the projects capped at five (then `and N more`) and the
 run's lines after the cap: for the reconcile the
-projects it refused, failed or was interrupted in, then the run's own `error`
-line; for the sweep the projects whose sweep failed with GitHub's answer, then
+projects it refused, failed or was interrupted in, each with its one next
+step, then how many it did not reach and why, then the allowlist entries no
+plan needed, then the run's own `error` line; for the sweep the projects whose sweep failed with GitHub's answer, then
 the writes left for the next run under its budget, then the projects held and
 released unswept after the run stopped, then why the run ended early or its
 `error` line; either says when the report was not a JSON object.
@@ -980,8 +981,14 @@ previous `health.json`;
 `place`, `absence`, `does`, `effect` and `runbook` are the words and
 the link the message is built from, from `WATCHED`. The reconcile's report,
 `fleet-reconcile.json` from `hack/fleet_reconcile.py --report`, is
-`{schema_version, mode, dry_run, started_at, finished_at, exit, exit_code,
-error, outcomes{project: {outcome, detail}}, summary}`; the sweep's,
+`{schema_version, mode, dry_run, commit, fleet_tree, build, job, workers,
+budget_seconds, ceiling_seconds, main_ref, main_check_error, started_at,
+finished_at, exit, exit_code, error, visited, outcomes{project: {outcome,
+detail, started_at, finished_at, allowlist_unused[]?}}, summary}` (`visited`
+counts the projects the run held; `allowlist_unused` is present only when the
+plan was read; `main_check_error` is set when the moved-check could not read
+main; outcomes are applied, converged, unchanged, planned, busy, refused,
+failed, interrupted, not_reached); the sweep's,
 `pull-sweep.json` from `hack/ci_sweep_agent_pulls.py --report`, is
 `{schema_version, mode, dry_run, started_at, finished_at, exit, exit_code,
 error, ended_early, projects, closed, failed, unmapped[], skipped[],
@@ -993,8 +1000,8 @@ unclosed counts its close and its delete, and its label when it carries
 `audit:remediation`). `periodics_read` names the jobs a
 reading arrived for this tick, whether or not they are noted; the poster clears
 a told job only on a reading that shows it clean. `periodics_runs` is, per read
-job, `{build, finished_at, passed, summary}` of its latest finished build, what
-the recovery message says. `periodics_streaks` is, per watched job, `{build,
+job, `{build, finished_at, passed, summary, dry_run}` of its latest finished build, what
+the recovery message and the digest's reconcile run line say. `periodics_streaks` is, per watched job, `{build,
 projects{project: n}, runs}`: the last build counted, each project's
 consecutive failed checks (dropped at zero; every count cleared by a clean
 build) and the run's; a failed build is a note only once the run's count

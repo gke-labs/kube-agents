@@ -152,7 +152,7 @@ above decides which one the message carries; the others stay in the evidence.
 For a storm, retest after the time the message gives; for lost pods, once new
 jobs are progressing; for a delegation-ceiling wave, once workers are
 finishing again (the gateway log in a run's artifacts says whether the
-dispatcher stalled); for fixture drift, once the fleet owner has re-applied
+dispatcher stalled); for fixture drift, once the daily reconcile has re-applied
 the stack — a red on a case that depends on the drifted fixture, from a run
 that leased one of those projects, is the fixture's, not the change's; for pool
 drift, once the pool owner has run the repair the issue carries.
@@ -364,11 +364,11 @@ wait is a fixed 24-hour figure that is not in the run data.
 
 ## The watched periodics
 
-Three Prow periodics keep the pool in shape from outside any run, and until this
+Three Prow jobs keep the pool in shape from outside any run, and until this
 rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
 (the GitOps stale-pull-request sweep, every ten minutes) and the seeded-fleet
-reconcile, hourly against the drifted projects and weekly against every free
-one. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
+reconcile, as a postsubmit on every merge that changes the stack and as a
+daily pass over every project. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
 per job with its label, its stale window, the report it writes, and the words
 its messages are built from, so adding the next periodic is one entry. The 15-minute tick's `Fetch the watched periodics'
 latest builds` step reads each job's `latest-build.txt` from
@@ -395,8 +395,8 @@ that could not fetch the previous `health.json` has no counts to carry, so it
 notes any failed build rather than hide one already told. A
 recovery needs a build that passed: a failed check under the threshold writes
 no note and is not one. One whose latest finished
-build is older than its stale window (an hour for the sweep, three for the
-hourly reconcile, eight days for the weekly) is `STALE`, whatever that build's
+build is older than its stale window (an hour for the sweep, 36 hours for the
+daily reconcile; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
 verdict, measured on the wall clock rather than data.json's horizon, as the
 pool note is. The note carries the build, when it finished, `since` (kept for
 the job across ticks through the previous `health.json`, ticks with no reading
@@ -405,7 +405,8 @@ message is built from (where the job acts, what stops happening when it fails
 and resumes when it recovers, what it does and how often, what a failure costs),
 a one-line summary of what the run did from its report, and the report's detail
 lines, up to five: for the reconcile the projects it refused, failed or was
-interrupted in with each one's reason; for the sweep the projects whose sweep
+interrupted in, each with its reason and its one next step, then how many it
+did not reach and why, and the allowlist entries no plan needed; for the sweep the projects whose sweep
 failed with GitHub's answer, what the run left for the next one under its write
 budget, the projects it did not reach after stopping, and why it stopped if it
 did. `periodics_runs` carries every read
@@ -425,7 +426,9 @@ leftover pull requests from eval runs are not being cleaned up"); the job, what
 it does and how often, which run and how it failed; the effect and the scope
 ("CI eval infrastructure only"); the runbook link and the build link. The
 recovery is one line naming the run and what it did ("closed 241 pull request(s)
-across 12 project(s)"). The digest carries one line per open note. Nothing here
+across 12 project(s)"). The digest carries one line per open note, and one per
+reconcile job's latest run: when, which build, passed or failed, dry run or
+not, and what it did. Nothing here
 files an issue: the recovery is a person's, and the failed and stopped messages
 link the runbook section (`docs/ci-pool-projects.md`, 5.5 and 6.2).
 
@@ -630,13 +633,15 @@ provisioned or not visible scans as "not checked".
 **The document.** `fixture-state.json` is `{schema_version, scanned_at,
 duration_s, projects{}, summary, previous}`. `projects` has one entry per
 pool project, `{roles{}, summary, duration_s, reader, error?}`, and `roles`
-one entry per catalog role: `{"state": "healthy" | "drifted" | "not_checked",
+one entry per catalog role: `{"state": "healthy" | "drifted" | "absent" | "not_checked",
 "detail": [...]}` — for a drifted role, the assertion and what the scan
 observed, as `hack/fleet-fixture-state.py` writes it (`deployment/checkout-gateway
-status.readyReplicas eq 2: observed 0`); for one not checked, why (the reader
-could not be impersonated, the runner published no kubeconfig for it, its
+status.readyReplicas eq 2: observed 0`); for an absent one, the runner's
+warning that the fixture is not there (never planted, or no cluster for its
+slot), a rollout the next reconcile finishes; for one not checked, why (the reader
+could not be impersonated, the runner could not list or reach the cluster, its
 read failed). `summary` counts projects, projects checked (at least one role
-read), projects with drift, and roles by state. `previous` is the prior
+read), projects with drift, projects with an absent role, and roles by state. `previous` is the prior
 document's `scanned_at` and its `{project: [drifted roles]}` map, carried so
 the adjudicator can ask "drifted last scan too?" from one file.
 
@@ -698,27 +703,28 @@ the code, that a retest waits for the re-apply, and `Tracking
 #NNN`; the gate comment's health box carries the same sentence on a red run
 while the condition lasts; the 9 AM digest always carries one line on the
 latest scan (`🧭 Seeded fleet: 30 of 30 pool projects checked at 8:00 AM ET,
-every fixture in its designed state`, or how many roles it could not read on
-the projects it checked, or the drifted projects and roles, or
+every fixture in its designed state`, or how many fixtures are absent on how
+many projects and how many roles it could not read, or the drifted projects and roles, or
 that the scan is stale or could see nothing). The tracking issue is filed for
 the fleet owner, labelled `presubmit-gate`: `Seeded fleet drift:
 crashloop-workload out of designed state on 3 pool projects since Mon 9:00 AM
 ET`, with the roles, per project the assertion and what was observed, the
-window, the evidence, and the reconcile — re-apply `bench/tf/fleet` in each
-project named (`bench/tf/fleet/README.md`, "State and reconcile"; for `stalled-controller`
+window, the evidence, and the reconcile — the daily run re-applies
+`bench/tf/fleet` in each project named, or a hand run of
+`hack/fleet_reconcile.py --project` from `main` does it sooner
+(`bench/tf/fleet/README.md`, "State and reconcile"; for `stalled-controller`
 drift where an in-cluster heal started the container, hand-delete the pod in `seeded-stall`
 and replace the Deployment if the condition persists) — and the
-line "Filed automatically by the smoke health bot; the fleet owner should
-re-apply the stack in the projects named; the bot will not close it." An open
+line "Filed automatically by the smoke health bot; the daily reconcile re-applies
+the stack in the projects named, and the bot comments here when a scan reads
+them healthy; the bot will not close it." An open
 `presubmit-gate` issue that already names every drifted role is adopted
 instead. The recovery comments on it as on any other.
-The hourly `ci-kube-agents-fleet-reconcile`
-periodic re-applies the stack in the projects the scan names
-(`docs/ci-pool-projects.md` §6.2), and the
-recovery comment follows the first scan after that apply, one to two hours
-after the report. No recovery by then is the periodic still in `--dry-run`
-(its first week), a drift the re-apply did not fix, a plan it refused, an apply that failed, or a project leased each time the
-hourly ran; the periodic's own log says which.
+The daily `ci-kube-agents-fleet-reconcile-daily` run re-applies the stack in
+the projects the scan names (`docs/ci-pool-projects.md` §6.2) at 08:30 UTC, and the
+recovery comment follows the first scan after that apply. No recovery by then
+is a drift the re-apply did not fix, a plan it refused, an apply that failed,
+or a project leased for the whole run; the run's report says which.
 
 **What never fails the bot.** A missing `kubectl` or `gcloud`, a project the
 publisher cannot read, a missing grant, a runner or a state check that hangs

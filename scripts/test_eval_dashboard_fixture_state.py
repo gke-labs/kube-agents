@@ -361,10 +361,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 19, "drifted": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 19, "drifted": 0, "absent": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "healthy": 19, "drifted": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 19, "drifted": 0, "absent": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -418,7 +418,7 @@ class Drift(ScanHarness):
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "healthy": 37, "drifted": 1, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 37, "drifted": 1, "absent": 0, "not_checked": 0})
 
 
 class NotChecked(ScanHarness):
@@ -446,16 +446,37 @@ class NotChecked(ScanHarness):
         self.assertIn("could not list clusters", detail[0])
         self.assertNotIn("error", doc["projects"][PROJECT], "the runner ran and said why; that is not a scan error")
 
-    def test_an_unplanted_role_carries_the_runners_warning_naming_it(self):
+    def test_an_unplanted_role_is_absent_with_the_runners_warning_naming_it(self):
+        # Absent is a rollout state, not a failed read: the stack has not put
+        # the fixture there yet (or something destroyed it), and the next
+        # reconcile plants it. It is never counted as "not read".
         world = healthy_world(PROJECT)
         world["kubectl_overrides"] = {PROJECT: {"clusterrolebinding/debug-binding": None}}
         doc, _ = self.scan(world)
         states = self.states(doc)
-        self.assertEqual(states["rbac-overgrant"], "not_checked")
+        self.assertEqual(states["rbac-overgrant"], "absent")
         self.assertEqual({s for r, s in states.items() if r != "rbac-overgrant"}, {"healthy"})
         detail = doc["projects"][PROJECT]["roles"]["rbac-overgrant"]["detail"][0]
         self.assertIn("fixture role 'rbac-overgrant'", detail)
         self.assertIn("never planted", detail)
+        self.assertEqual(doc["projects"][PROJECT]["summary"]["absent"], 1)
+        self.assertEqual((fixture_state.absent_units(doc), fixture_state.absent_projects(doc), fixture_state.unread_units(doc)), (1, 1, 0))
+        self.assertEqual(doc["summary"]["absent_projects"], 1)
+
+    def test_a_slot_with_no_cluster_is_absent_and_a_credential_failure_is_not_checked(self):
+        warnings = ["project p has no labelled seeded cluster for slot 'd' (a name ending in '-d'), so every check naming a role on it will report status=error."]
+        self.assertEqual(fixture_state.unpublished_state("zonal-skew-volume", "d", warnings), ("absent", warnings[0]))
+        warnings = ["project p carries no clusters labelled environment=seeded,managed-by=kube-agents-seeded-fleet. Apply bench/tf/fleet/ there"]
+        self.assertEqual(fixture_state.unpublished_state("crashloop-workload", "a", warnings)[0], "absent")
+        warnings = ["no credentials for seeded cluster fleet-seeded-a in p: 403. Every check naming a role on slot 'a' will report status=error."]
+        self.assertEqual(fixture_state.unpublished_state("crashloop-workload", "a", warnings)[0], "not_checked")
+        warnings = ["could not list clusters in p; every fleet check will report status=error"]
+        self.assertEqual(fixture_state.unpublished_state("crashloop-workload", "a", warnings)[0], "not_checked")
+        self.assertEqual(fixture_state.unpublished_state("crashloop-workload", "a", [])[0], "not_checked")
+        # Another role's "never planted" warning says nothing about this one.
+        other = ["x absent from a.kubeconfig in p, so fixture role 'idle-nodepool' was never planted (or has already been destroyed)."]
+        self.assertEqual(fixture_state.unpublished_state("crashloop-workload", "a", other)[0], "not_checked")
+        self.assertEqual(fixture_state.unpublished_state("idle-nodepool", "a", other)[0], "absent")
 
     def test_a_read_that_fails_is_not_checked_not_drift(self):
         world = healthy_world(PROJECT)
@@ -591,7 +612,7 @@ class Workflow(unittest.TestCase):
             work = pathlib.Path(tmp) / "work"
             work.mkdir()
             document = {
-                "summary": {"checked": 1, "projects": 2, "drifted_projects": 1, "healthy": 6, "drifted": 1, "not_checked": 7},
+                "summary": {"checked": 1, "projects": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 6, "drifted": 1, "absent": 0, "not_checked": 7},
                 "projects": {
                     "p1": {"roles": {"r1": {"state": "drifted"}, "r2": {"state": "healthy"}}},
                     "p2": {"roles": {"r1": {"state": "not_checked"}}, "error": "cannot mint a token"},

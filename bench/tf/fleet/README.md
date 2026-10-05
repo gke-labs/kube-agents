@@ -41,12 +41,16 @@ re-initializing against that project's bucket and naming the project on the appl
 
 Local validation without credentials: `tofu init -backend=false && tofu validate`.
 
-Drift is corrected by re-applying this stack with `hack/fleet_reconcile.py`, which holds each
-project through Boskos for its one apply, applies only creates and in-place updates, plus the one replacement of the no-surge pool its
-minor trigger plans (below), and refuses anything else; that apply is a person's. Its schedule is two Prow periodic entries in
-`oss-test-infra`, `main` only: hourly for the projects the CI health bot's scan reports
-drifted, weekly for all of them (`docs/ci-pool-projects.md` §6.2). Until those entries exist,
-a hand run of the script is the reconcile. Its `init` runs with `-lockfile=readonly`, so the
+Drift is corrected by re-applying this stack with `hack/fleet_reconcile.py`, the fleet's only
+writer: from `main`, under a Boskos lease per project, creates and in-place updates only, plus
+the deletes and replaces `reconcile-allow.json` beside this file declares (one entry per
+address with its reason, reviewed in the pull request that needs it and removed by its
+follow-up; the no-surge pool's replace on a minor roll is the standing one). Its two Prow
+entries in `oss-test-infra` run `main` only: a postsubmit on every merge touching this
+directory, and a daily pass at 08:30 UTC (`docs/ci-pool-projects.md` §6.2, which also states
+the rule for a fixture pull request and for proving a branch on one leased project). A hand
+run goes through the script too (`--project <id>`), never `tofu apply` from a branch, and
+never from a laptop while a run holds the project. Its `init` runs with `-lockfile=readonly`, so the
 providers are the ones `.terraform.lock.hcl` pins; to move them, change `versions.tf` if the major
 changes and run `tofu providers lock -platform=linux_amd64 -platform=darwin_arm64 -platform=darwin_amd64`
 here, and commit the result. Detecting the drift is a separate job, and
@@ -82,13 +86,13 @@ finding this fleet never declared.
 (`replace_triggered_by` on a `terraform_data` that holds the minor). An in-place version
 change drains its only node, `pinned-batch-runner`'s budget holds that drain for up to an
 hour, and the provider's node-pool update timeout is thirty minutes, so tracking the pin
-would run the weekly reconcile into that timeout in every project on every patch roll.
+would run the reconcile into that timeout in every project on every patch roll.
 Deleting a pool is different: GKE does not respect PodDisruptionBudgets on deletion unless
 the pool opts in, so the replace takes minutes, the pool stays level with the control plane's
 minor, and upgrade SOP 3.2 `pool-skew` stays clean. GKE applies patches within the held minor
 on its own, and the readiness roles assert the pool's surge settings, not its version.
-`hack/fleet_reconcile.py` applies that one replacement by address and refuses every other,
-so a failed weekly apply against `seeded-b` is a real error to read.
+`hack/fleet_reconcile.py` applies that replacement because `reconcile-allow.json` lists the address, and refuses every undeclared one,
+so a failed apply against `seeded-b` is a real error to read.
 
 Second, it rolls the exclusion. The lag is held between reconciles by a
 `NO_MINOR_UPGRADES` maintenance exclusion whose window (90 days by default,
@@ -453,9 +457,9 @@ rest. The no-surge pool on `seeded-b` adds a seventh node, a fifth e2-small, and
 seeded-d adds a fourth management fee, an e2-small and an e2-standard-2, so a project carrying
 the whole stack costs roughly $435 per month — the fee, not the nodes, is the larger
 part of the increase. No separate rollout stands between a merge and that cost: a new
-cluster or pool plans as a create, which `hack/fleet_reconcile.py` applies, so its weekly
-run creates both in every free pool project it applies to once the periodic is past its
-first-week `--dry-run` ([`docs/ci-health.md`](../../../docs/ci-health.md)). Four of the first six nodes are e2-small; `seeded-a`'s default pool is two e2-mediums
+cluster or pool plans as a create, which `hack/fleet_reconcile.py` applies, so the
+postsubmit on that merge creates both in every pool project within hours
+([`docs/ci-pool-projects.md`](../../../docs/ci-pool-projects.md) §6.2). Four of the first six nodes are e2-small; `seeded-a`'s default pool is two e2-mediums
 since #1278 (roughly $25 per month more than the one it ran on), because a single
 e2-medium's 940m allocatable CPU is fully claimed by GKE system pods and the planted
 `payments-api` / `checkout-gateway` fixtures went Pending — the comment on

@@ -77,8 +77,8 @@ SCOPE_LINE = "CI eval infrastructure only."
 # reads its latest finished build every fifteen, so the unit is the check, not
 # the build (one sweep build in three is never read), and one failed check
 # followed by a clean one is a flap: the sweep is said once it has failed this
-# many consecutive checks. The reconciles run hourly and weekly: their first
-# failed build is the news. Any project's failure fails a run, so a per-project
+# many consecutive checks. The reconciles run daily and on every merge: their
+# first failed build is the news. Any project's failure fails a run, so a per-project
 # threshold could never fire before the run's; the per-project counts name the
 # projects that have failed in every one of those checks.
 SWEEP_RUN_ALERT_AFTER = 2
@@ -92,6 +92,27 @@ KEY_STREAK_BUILD = "build"
 KEY_STREAK_PROJECTS = "projects"
 KEY_STREAK_RUNS = "runs"
 RECONCILE_NAMED_OUTCOMES = ("refused", "failed", "interrupted")
+# The one next step per named outcome, said in the message so nobody
+# re-applies by hand what the next run will do, or force-unlocks a state
+# that is not locked.
+RECONCILE_NEXT_STEP = {
+    "refused": "a code change, or an entry in bench/tf/fleet/reconcile-allow.json",
+    "failed": "nothing by hand, the next run retries it",
+    "interrupted": "the next run retries it, and force-unlocks only if it fails on the lock",
+}
+# A `failed` whose detail names the lock (the ceiling cut the apply, or the
+# next run already failed on the lock) owes a hand step before any retry.
+RECONCILE_LOCK_MARKER = "force-unlock"
+RECONCILE_NEXT_STEP_LOCKED = "tofu force-unlock against that project's state, then the next run retries it"
+RECONCILE_OUTCOME_NOT_REACHED = "not_reached"
+# The report's outcome names as the message says them.
+RECONCILE_OUTCOME_WORDS = {RECONCILE_OUTCOME_NOT_REACHED: "not reached"}
+REPORT_KEY_VISITED = "visited"
+REPORT_KEY_ALLOWLIST_UNUSED = "allowlist_unused"
+# The Prow job names (oss-test-infra, kube-agents-periodics.yaml and
+# kube-agents-postsubmits.yaml); a rename there is a rename here.
+RECONCILE_DAILY_JOB = "ci-kube-agents-fleet-reconcile-daily"
+RECONCILE_POSTSUBMIT_JOB = "post-kube-agents-fleet-reconcile"
 # gsutil's absent-object wording, the set scripts/release/poll_rc_eval_verdict.py
 # settled on for the Prow archive; the same wording here. Never a bare 404,
 # because gsutil echoes the failing URL and a 19-digit build id can contain
@@ -150,10 +171,10 @@ class Periodic:
     job: str
     label: str
     # A finished build older than this is a job that stopped running. It is a
-    # window, not the cadence: the sweep runs every ten minutes and the hourly
-    # reconcile hourly. The sweep's and the hourly's windows are what their
-    # TestGrid stale-results settings were; the weekly's is a week and a day.
-    stale_after: timedelta
+    # window, not the cadence: the sweep runs every ten minutes and the daily
+    # reconcile once a day. None for a job with no cadence (the postsubmit
+    # runs on merges), which no age makes stale.
+    stale_after: timedelta | None
     artifact: str | None
     place: str
     absence: str
@@ -179,19 +200,21 @@ WATCHED = (
         SWEEP_RUN_ALERT_AFTER,
     ),
     Periodic(
-        "ci-kube-agents-fleet-reconcile", "seeded-fleet reconcile (hourly)", timedelta(hours=3), RECONCILE_ARTIFACT,
+        RECONCILE_DAILY_JOB, "seeded-fleet reconcile (daily)", timedelta(hours=36), RECONCILE_ARTIFACT,
         "Eval seeded fleet", "planted defects are not being re-applied", "planted defects are being re-applied again",
-        "runs hourly and re-applies the seeded-fleet stack in the pool projects the scan reports drifted", RECONCILE_EFFECT,
+        "runs daily at 08:30 UTC and re-applies the seeded-fleet stack in every pool project, waiting for the leased ones", RECONCILE_EFFECT,
         f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#62-the-scheduled-reconcile",
     ),
     Periodic(
-        "ci-kube-agents-fleet-reconcile-all", "seeded-fleet reconcile (weekly)", timedelta(hours=192), RECONCILE_ARTIFACT,
+        RECONCILE_POSTSUBMIT_JOB, "seeded-fleet reconcile (on merge)", None, RECONCILE_ARTIFACT,
         "Eval seeded fleet", "planted defects are not being re-applied", "planted defects are being re-applied again",
-        "runs weekly and re-applies the seeded-fleet stack in every free pool project", RECONCILE_EFFECT,
+        "runs on every merge to main that changes bench/tf/fleet and applies it to every pool project", RECONCILE_EFFECT,
         f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#62-the-scheduled-reconcile",
     ),
 )
 WATCHED_BY_JOB = {p.job: p for p in WATCHED}
+# The reconcile jobs, for the digest's run line; the words name the trigger.
+RECONCILE_RUN_WORDS = {RECONCILE_DAILY_JOB: "daily run", RECONCILE_POSTSUBMIT_JOB: "on-merge run"}
 
 
 def history_url(job: str) -> str:
@@ -372,18 +395,37 @@ def reconcile_detail(artifact: dict | None) -> list[str]:
         return []
     lines = []
     outcomes = artifact.get(REPORT_KEY_OUTCOMES)
-    if isinstance(outcomes, dict):
-        for project in sorted(outcomes):
-            entry = outcomes[project]
-            if not isinstance(entry, dict) or entry.get(REPORT_KEY_OUTCOME) not in RECONCILE_NAMED_OUTCOMES:
-                continue
-            lines.append(f"{project}: {entry.get(REPORT_KEY_OUTCOME)} ({entry.get(REPORT_KEY_DETAIL) or 'no detail'})")
-    # The cap counts projects; the run's own error line comes after it.
+    entries = {p: e for p, e in outcomes.items() if isinstance(e, dict)} if isinstance(outcomes, dict) else {}
+    for project in sorted(entries):
+        entry = entries[project]
+        outcome = entry.get(REPORT_KEY_OUTCOME)
+        if outcome not in RECONCILE_NAMED_OUTCOMES:
+            continue
+        detail = entry.get(REPORT_KEY_DETAIL) or "no detail"
+        step = RECONCILE_NEXT_STEP_LOCKED if outcome == "failed" and RECONCILE_LOCK_MARKER in detail else RECONCILE_NEXT_STEP[outcome]
+        lines.append(f"{project}: {outcome} ({detail}); next: {step}")
+    # The cap counts projects; the lines after it are one each.
     if len(lines) > DETAIL_LIMIT:
         lines = lines[:DETAIL_LIMIT] + [f"and {len(lines) - DETAIL_LIMIT} more"]
+    not_reached = [e for e in entries.values() if e.get(REPORT_KEY_OUTCOME) == RECONCILE_OUTCOME_NOT_REACHED]
+    if not_reached:
+        lines.append(f"{len(not_reached)} not reached ({not_reached[0].get(REPORT_KEY_DETAIL) or 'no detail'})")
+    unused = allowlist_unused(entries)
+    if unused:
+        lines.append(f"allowlist: {len(unused)} {'entry' if len(unused) == 1 else 'entries'} no plan needed, remove {'it' if len(unused) == 1 else 'them'}: {', '.join(unused)}")
     if artifact.get(REPORT_KEY_ERROR):
         lines.append(f"run: {artifact[REPORT_KEY_ERROR]}")
     return lines
+
+
+def allowlist_unused(entries: dict) -> list[str]:
+    """The allowlist addresses no visited project's plan needed: unused on
+    every project that reported the key. One project still needing an entry
+    keeps it off the list."""
+    reported = [set(e[REPORT_KEY_ALLOWLIST_UNUSED]) for e in entries.values() if isinstance(e.get(REPORT_KEY_ALLOWLIST_UNUSED), list)]
+    if not reported:
+        return []
+    return sorted(set.intersection(*reported))
 
 
 def sweep_detail(artifact: dict | None) -> list[str]:
@@ -455,15 +497,17 @@ def run_summary(periodic: Periodic, artifact: dict | None, passed: bool) -> str 
     summary = artifact.get(RECONCILE_KEY_SUMMARY)
     if not isinstance(summary, dict):
         return None
-    parts = [f"{count} {outcome}" for outcome, count in summary.items() if isinstance(count, int) and count > 0]
+    parts = [f"{count} {RECONCILE_OUTCOME_WORDS.get(outcome, outcome)}" for outcome, count in summary.items() if isinstance(count, int) and count > 0]
+    visited = artifact.get(REPORT_KEY_VISITED)
+    lead = f"{visited} visited: " if isinstance(visited, int) and not isinstance(visited, bool) else ""
     if passed:
-        return ", ".join(parts) if parts else "nothing to do"
+        return lead + (", ".join(parts) if parts else "nothing to do")
     # A failed build: the named failures first; none means the run failed
     # above the projects (Boskos, the mapping, a crash), which the detail's
     # run line names.
     named = [p for p in parts if p.split(" ", 1)[1] in RECONCILE_NAMED_OUTCOMES]
     if named:
-        return ", ".join(named + [p for p in parts if p not in named])
+        return lead + ", ".join(named + [p for p in parts if p not in named])
     return f"the run failed after {', '.join(parts)}" if parts else "the run failed before reaching a project"
 
 
@@ -481,6 +525,7 @@ def runs(readings: dict[str, dict], watched=WATCHED) -> dict[str, dict]:
             KEY_FINISHED_AT: reading.get(KEY_FINISHED_AT),
             KEY_PASSED: bool(reading.get(KEY_PASSED)),
             KEY_SUMMARY: run_summary(periodic, artifact, bool(reading.get(KEY_PASSED))),
+            KEY_DRY_RUN: bool(artifact.get(KEY_DRY_RUN)) if artifact else None,
         }
     return out
 
@@ -573,7 +618,7 @@ def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, wa
         if not isinstance(reading, dict):
             continue
         finished_at = parse_iso(reading.get(KEY_FINISHED_AT))
-        if finished_at is None or now - finished_at > periodic.stale_after:
+        if finished_at is None or (periodic.stale_after is not None and now - finished_at > periodic.stale_after):
             verdict = VERDICT_STALE
         elif not reading.get(KEY_PASSED):
             verdict = VERDICT_FAILED
@@ -595,7 +640,7 @@ def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, wa
             KEY_BUILD: reading.get(KEY_BUILD),
             KEY_FINISHED_AT: reading.get(KEY_FINISHED_AT),
             KEY_RESULT: reading.get(KEY_RESULT),
-            KEY_STALE_AFTER_H: int(periodic.stale_after.total_seconds() // SECONDS_PER_HOUR),
+            KEY_STALE_AFTER_H: int(periodic.stale_after.total_seconds() // SECONDS_PER_HOUR) if periodic.stale_after is not None else None,
             KEY_DRY_RUN: bool(artifact.get(KEY_DRY_RUN)) if artifact else None,
             # A job whose first failure is news keeps the report's own lines; a
             # thresholded job leads with the projects that keep failing.
@@ -614,7 +659,8 @@ def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, wa
 def evidence(note: dict) -> str:
     if note[KEY_VERDICT] == VERDICT_STALE:
         if not note[KEY_FINISHED_AT]:
-            return f"{note[KEY_LABEL]}: build {note[KEY_BUILD]} finished at a time its finished.json does not give, so the {note[KEY_STALE_AFTER_H]}h window cannot be measured"
+            window = f"the {note[KEY_STALE_AFTER_H]}h window cannot be measured" if note.get(KEY_STALE_AFTER_H) is not None else "it cannot be placed in time"
+            return f"{note[KEY_LABEL]}: build {note[KEY_BUILD]} finished at a time its finished.json does not give, so {window}"
         return f"{note[KEY_LABEL]}: no finished run since {note[KEY_FINISHED_AT]} ({note[KEY_JOB]} has finished nothing in {note[KEY_STALE_AFTER_H]}h)"
     detail = f": {'; '.join(note[KEY_DETAIL])}" if note.get(KEY_DETAIL) else ""
     return f"{note[KEY_LABEL]}: build {note[KEY_BUILD]} failed at {note[KEY_FINISHED_AT]}{detail}"

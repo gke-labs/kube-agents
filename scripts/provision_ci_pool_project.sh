@@ -40,8 +40,8 @@ LEDGER_INSTALLATION_ID="157029058"
 # a Prow periodic on main). Step 4 grants it signer on this project's copy of
 # the App key, which is the whole reach it has here.
 PULL_SWEEP_SA="serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserviceaccount.com"
-# The identity the seeded-fleet reconcile runs as (hack/fleet_reconcile.py, two
-# Prow periodics on main). The IAM step before 1.3 grants it what re-applying
+# The identity the seeded-fleet reconcile runs as (hack/fleet_reconcile.py, a
+# postsubmit and a daily on main). The IAM step before 1.3 grants it what re-applying
 # bench/tf/fleet needs on the project; step 2 grants it the state bucket.
 FLEET_RECONCILER_SA="serviceAccount:seeded-fleet-reconciler@kube-agents-prow.iam.gserviceaccount.com"
 PEM_FILE=""

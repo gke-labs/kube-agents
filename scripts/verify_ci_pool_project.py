@@ -317,8 +317,8 @@ HOST_CLUSTER = "platform-agent-host"
 # seeded-d is deliberately absent. Pool projects applied before bench/tf/fleet
 # grew slot d do not have it, so listing it would make the hourly pool-state
 # scan report every one of them drifted and hold the presubmit gate DEGRADED
-# until the fleet is re-applied across the pool. The weekly reconcile
-# (hack/fleet_reconcile.py --all) creates it in each project it applies to,
+# until the fleet is re-applied across the pool. The reconcile
+# (hack/fleet_reconcile.py --all, on merge and daily) creates it in each project it applies to,
 # since a new cluster plans as a create; add it here once that has reached
 # every project.
 EXPECTED_CLUSTERS = {HOST_CLUSTER, "seeded-a", "seeded-b", "seeded-c"}

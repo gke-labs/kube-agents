@@ -1028,7 +1028,8 @@ def render_periodic(health: dict, prev: dict | None) -> str:
             if note.get("finished_at"):
                 middle = f"Its last finished run was {when} (build {note['build']}); nothing has finished in {note['stale_after_h']}h. If the next one doesn't land, it needs checking."
             else:
-                middle = f"Build {note['build']} finished, but its finished.json gives no time for it, so the {note['stale_after_h']}h window cannot be measured. Someone check the job."
+                window = f"the {note['stale_after_h']}h window cannot be measured" if note.get("stale_after_h") is not None else "it cannot be placed in time"
+                middle = f"Build {note['build']} finished, but its finished.json gives no time for it, so {window}. Someone check the job."
             blocks.append("\n".join([f"⚪ *{words['place']}: {words['label']} has stopped running.*", f"{does} {middle}", effect, footer]))
             continue
         dry = " (a dry run: nothing was applied)" if note.get("dry_run") else ""
@@ -1059,8 +1060,25 @@ def render_periodic_clear(health: dict, prev: dict | None) -> str:
     return "\n".join(lines)
 
 
-def periodic_digest_lines(health: dict) -> list[str]:
+def reconcile_run_lines(health: dict) -> list[str]:
+    """One line per reconcile job's latest finished run: when, which build,
+    passed or failed, dry run or not, and what it did. The team's answer to
+    "did the fleet get applied", whether or not anything is wrong."""
     lines = []
+    for job, run in sorted((health.get("periodics_runs") or {}).items()):
+        words = periodics.RECONCILE_RUN_WORDS.get(job)
+        if not words or not isinstance(run, dict):
+            continue
+        when = clock(parse_iso(run.get("finished_at")))
+        verdict = "passed" if run.get("passed") else "failed"
+        dry = " (a dry run: nothing was applied)" if run.get("dry_run") else ""
+        did = f": {run['summary']}" if run.get("summary") else ""
+        lines.append(f"🔁 *Seeded-fleet reconcile:* {words} at {when} (build {run.get('build')}) {verdict}{dry}{did}.")
+    return lines
+
+
+def periodic_digest_lines(health: dict) -> list[str]:
+    lines = reconcile_run_lines(health)
     for job, note in sorted((health.get("periodics") or {}).items()):
         words = _job_words(job, note)
         if note.get("verdict") == periodics.VERDICT_STALE:
@@ -1160,11 +1178,19 @@ def fixture_digest_line(health: dict) -> str | None:
         )
     unchecked = f", {total - checked} not checked" if total > checked else ""
     unread = int(block.get("unread_units") or 0)
+    absent = int(block.get("absent_units") or 0)
+    # A project counts as checked when one role was read. A fixture the stack
+    # has not planted there (or something destroyed) is absent: a rollout the
+    # next reconcile finishes, said apart from a read that failed, which is
+    # not a fixture in its designed state either way.
+    clauses = []
+    if absent:
+        absent_projects = int(block.get("absent_projects") or 0)
+        clauses.append(f"{absent} {plural(absent, 'fixture')} absent on {absent_projects} {plural(absent_projects, 'project')} (not applied there yet, or destroyed), the next reconcile plants them")
     if unread:
-        # A project counts as checked when one role was read; a role the scan
-        # could not read (never planted, or its probe failed) is not a fixture
-        # in its designed state.
-        return f"🧭 *Seeded fleet:* {checked} of {total} pool projects checked at {when}, no drift in what was read; {unread} {plural(unread, 'role')} not read{unchecked}."
+        clauses.append(f"{unread} {plural(unread, 'role')} not read")
+    if clauses:
+        return f"🧭 *Seeded fleet:* {checked} of {total} pool projects checked at {when}, no drift in what was read; {'; '.join(clauses)}{unchecked}."
     return f"🧭 *Seeded fleet:* {checked} of {total} pool projects checked at {when}, every fixture in its designed state{unchecked}."
 
 

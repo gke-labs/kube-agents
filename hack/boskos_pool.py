@@ -229,6 +229,12 @@ def _defer_terminations():
 
 def _hold_signals(block):
     global _HOLD_DEPTH
+    # Signal handlers are the main thread's: Python delivers signals there
+    # alone and refuses signal.signal() elsewhere. A worker thread's hold has
+    # nothing to defer, and the main thread forwards a termination to its
+    # children itself (hack/fleet_reconcile.py, _run_workers).
+    if threading.current_thread() is not threading.main_thread():
+        return
     if block:
         if _HOLD_DEPTH == 0:
             # Swapped before counted: a termination raised out of the swap
