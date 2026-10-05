@@ -740,7 +740,7 @@ five minutes at a time, and lands it once this release's CRD is applied: within 
 quiet install, at once when the Ready status update next writes for any other reason. The other
 status writers carry the field through as they read it, so a pass that ends `Degraded` lands
 nothing new. The counters and `usage.lastActiveTime` are declared in the schema and absent from
-every status until something writes them; the operator poller that will is designed in
+every status until something writes them; the operator poller that will write the first of them is designed in
 [`docs/designs/usage-counters-producer.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/usage-counters-producer.md).
 
 These condition types appear in `conditions`; only `Ready` is always present:
