@@ -6635,6 +6635,18 @@ def test_any_with_no_recorded_slot_says_so_rather_than_naming_a_slot():
             res = v.verify(5.0)
     assert res.status == "error"
     assert "recorded none" in res.reason and "no slot at all" not in res.reason
+    # The pattern names no slot, so the reason does not say one was named.
+    assert not res.reason.startswith(verifiers._UNRECORDED_SLOT_REASON)
+
+
+def test_any_with_no_runner_directory_names_the_runner_not_a_slot():
+    v = parse_node({"type": "report_contains", "any_of_patterns": ["(?m)^{cluster:any}: ok$"]})
+    _stash("seeded-a: ok")
+    with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: ""}):
+        res = v.verify(5.0)
+    assert res.status == "error"
+    assert "hack/fleet-kubeconfigs.sh did not run" in res.reason
+    assert not res.reason.startswith(verifiers._UNRECORDED_SLOT_REASON)
 
 
 def test_a_miss_is_reported_in_the_cases_spelling_with_the_names_the_slots_resolved_to():

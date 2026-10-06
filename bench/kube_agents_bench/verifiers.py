@@ -566,8 +566,11 @@ class ReportContainsVerifier(BaseVerifier):
                 reason=f"{_UNRECORDED_SLOT_REASON}: slot {exc.args[0]!r} has no cluster record in the runner's context file",
             )
         except (LookupError, FleetRoleUnresolved) as exc:
+            # `{cluster:any}` with nothing recorded, or no runner directory at
+            # all: neither names a slot, and each message already says what
+            # happened, so no slot-shaped prefix is put in front of it.
             return VerificationResult(
-                success=False, status="error", elapsed_time=time.monotonic() - start, reason=f"{_UNRECORDED_SLOT_REASON}: {exc}"
+                success=False, status="error", elapsed_time=time.monotonic() - start, reason=str(exc)
             )
         snap = transcript.get()
         if snap is None:
