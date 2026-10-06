@@ -6612,6 +6612,15 @@ def test_a_pattern_the_expansion_breaks_or_a_mistyped_placeholder_fails_at_spec_
     assert needle in str(excinfo.value)
 
 
+@pytest.mark.parametrize("field", ["required_phrases", "forbidden_phrases", "any_of_phrases"])
+def test_a_cluster_placeholder_in_a_phrase_list_fails_at_spec_load(field):
+    # A phrase is a substring matched as written, so a placeholder in one is
+    # never expanded: an inert forbid, or a requirement that fails every run.
+    with pytest.raises(Exception) as excinfo:
+        parse_node({"type": "report_contains", field: ["{cluster:a}: control plane is regional"]})
+    assert "cluster placeholder" in str(excinfo.value) and field in str(excinfo.value)
+
+
 def test_any_with_no_recorded_slot_says_so_rather_than_naming_a_slot():
     v = parse_node({"type": "report_contains", "any_of_patterns": ["(?m)^{cluster:any}: ok$"]})
     _stash("seeded-a: ok")

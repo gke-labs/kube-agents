@@ -714,6 +714,34 @@ class TestTheRulesReject(unittest.TestCase):
         )
         self.assertIn("worker_commands", problem)
 
+    def test_a_cluster_placeholder_in_a_phrase_list_is_rejected(self):
+        # report_contains expands the placeholder in its two pattern lists
+        # only; in a phrase list it is a literal substring no report carries,
+        # so a forbid never fires and a requirement fails every run.
+        for key in ("required_phrases", "forbidden_phrases", "any_of_phrases"):
+            with self.subTest(key=key):
+                problem = self._only(
+                    "which only report_contains expands",
+                    verification_spec=self._entry(check={"type": "report_contains", key: ["{cluster:a}: control plane is regional"]}),
+                )
+                self.assertIn(repr(key), problem)
+                self.assertIn("'forbidden_patterns' and 'any_of_patterns'", problem)
+
+    def test_a_cluster_placeholder_in_another_checks_phrase_list_is_rejected(self):
+        # ledger_issue_contains and replay_card carry phrase lists too, and
+        # neither expands anything; the guard reads every string list on a
+        # node rather than a fixed set of keys.
+        for check in (
+            {"type": "ledger_issue_contains", "required_phrases": ["{cluster:a} is zonal"]},
+            {"type": "replay_card", "status_not_in": ["blocked"], "comment_phrases": ["{cluster:any}"]},
+        ):
+            with self.subTest(check=check["type"]):
+                problem = self._only(
+                    "which only report_contains expands",
+                    verification_spec=self._entry(check=check),
+                )
+                self.assertIn(check["type"], problem)
+
     def test_a_malformed_cluster_placeholder_is_rejected(self):
         self._only(
             "malformed cluster placeholder",

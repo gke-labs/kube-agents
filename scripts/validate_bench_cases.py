@@ -447,7 +447,9 @@ CLUSTER_PLACEHOLDER = re.compile(r"\{cluster:([a-z0-9-]+)\}")
 CLUSTER_PLACEHOLDER_LOOSE = re.compile(r"\{\s*cluster\s*:", re.IGNORECASE)
 CLUSTER_PLACEHOLDER_OPENER = "{cluster:"
 CLUSTER_PLACEHOLDER_ANY = "any"
-PATTERN_LIST_KEYS = ("forbidden_patterns", "any_of_patterns", "required_patterns")
+# The two lists report_contains expands a placeholder in; every other list on
+# every check (its phrase lists included) is searched or matched as written.
+EXPANDING_PATTERN_KEYS = ("forbidden_patterns", "any_of_patterns")
 REPORT_CHECK_TYPE = "report_contains"
 
 
@@ -467,20 +469,28 @@ def _catalog_slots() -> set[str]:
 
 def _cluster_placeholders(node: Any, where: str, problems: list[str], slots: set[str], parked: bool) -> None:
     """Every `{cluster:...}` in a check subtree names a catalogue slot or
-    `any`, is well-formed, and sits in a report_contains pattern list: the
-    verifier expands it from the runner's record, so anything else errors on
-    every run or compiles as literal text that never matches."""
+    `any`, is well-formed, and sits in one of the two report_contains pattern
+    lists: the verifier expands it from the runner's record there and nowhere
+    else, so in a phrase list, another check's pattern list or any other
+    string list it is literal text that never matches (an inert forbid) or
+    fails every run (a requirement). Every list of strings on the node is
+    read, not a fixed set of keys, so a new field is covered when it lands."""
     if not isinstance(node, dict):
         return
-    for key in PATTERN_LIST_KEYS:
-        for pattern in node.get(key) or []:
+    for key, values in node.items():
+        if not isinstance(values, list):
+            continue
+        expands = node.get("type") == REPORT_CHECK_TYPE and key in EXPANDING_PATTERN_KEYS
+        for pattern in values:
             if not isinstance(pattern, str):
                 continue
-            if node.get("type") != REPORT_CHECK_TYPE:
+            if not expands:
                 if CLUSTER_PLACEHOLDER_LOOSE.search(pattern):
                     problems.append(
                         f"{where}: {key!r} on a {node.get('type')!r} check carries {CLUSTER_PLACEHOLDER_OPENER}...}}, "
-                        f"which only {REPORT_CHECK_TYPE} expands; elsewhere it is literal text that never matches"
+                        f"which only {REPORT_CHECK_TYPE} expands, and only in its "
+                        f"{' and '.join(repr(k) for k in EXPANDING_PATTERN_KEYS)}; elsewhere it is literal text "
+                        "that never matches"
                     )
                 continue
             if CLUSTER_PLACEHOLDER_LOOSE.search(CLUSTER_PLACEHOLDER.sub("", pattern)):

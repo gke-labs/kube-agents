@@ -63,7 +63,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from devops_bench.k8s import get_resource
 from devops_bench.verification.base import (
@@ -442,6 +442,21 @@ class ReportContainsVerifier(BaseVerifier):
                     "(it names a catalogue role and a slot's file); see bench/tf/fleet/fixtures.json"
                 )
         return roles
+
+    @field_validator("required_phrases", "forbidden_phrases", "any_of_phrases")
+    @classmethod
+    def _phrases_carry_no_placeholder(cls, phrases: list[str], info: ValidationInfo) -> list[str]:
+        # A phrase is matched as a substring, as written: a placeholder here
+        # is never expanded, so a forbid built on one never fires and a
+        # requirement fails every run. Refused at spec load, like a pattern
+        # that does not compile.
+        for phrase in phrases:
+            if _CLUSTER_PLACEHOLDER_LOOSE.search(phrase):
+                raise ValueError(
+                    f"{info.field_name} entry {phrase!r} carries a cluster placeholder, which only "
+                    "forbidden_patterns and any_of_patterns expand; as a phrase it is literal text that never matches"
+                )
+        return phrases
 
     @field_validator("forbidden_patterns", "any_of_patterns")
     @classmethod
