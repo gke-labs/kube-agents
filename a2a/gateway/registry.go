@@ -129,7 +129,7 @@ type TaskRef struct {
 	// ages them by. Nil/zero on entries written before the fields existed.
 	Requester   *TaskRequester  `json:"requester,omitempty"`
 	Attribution json.RawMessage `json:"attribution,omitempty"`
-	StartedAt   time.Time       `json:"startedAt,omitempty"`
+	StartedAt   time.Time       `json:"startedAt,omitzero"`
 }
 
 // MarkCanceled records a published cancel against the task's history entry.

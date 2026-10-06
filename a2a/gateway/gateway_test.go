@@ -2453,6 +2453,16 @@ func rawSessionRecord(t *testing.T, reg *Registry, sessionKey string) string {
 	return string(entry.Value())
 }
 
+func TestTaskRefOmitsAZeroStartedAt(t *testing.T) {
+	raw, err := json.Marshal(TaskRef{ID: "task-legacy", Addressee: "platform"}) // pre-field shape
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "startedAt") {
+		t.Fatalf("a legacy-shaped entry marshals a zero startedAt: %s", raw)
+	}
+}
+
 // TestAskTTLClearsTheRequesterToo: past AskTTL the history entry drops its
 // requester and attribution the way ActiveTask drops its Ask; the entry itself
 // stays, as do entries written before the fields existed.
