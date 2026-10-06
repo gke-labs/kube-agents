@@ -327,9 +327,11 @@ verification_spec:
       # "Pick it up again" needs the dispatcher or a passive subject: bare,
       # it matches "you'll need to pick it up again", which hands the retry
       # over, and "I'll pick it up again" is the front door's own retry.
+      # Patterns run per line, where a space does not cross a line break;
+      # \s+ does, so a phrase that wraps still matches.
       any_of_patterns:
-        - '\bthe dispatcher(?:[''’]ll| will|[''’]s going to| is going to) pick it up again'
-        - '\bit(?:[''’]ll| will) be picked up again'
+        - '\bthe\s+dispatcher(?:[''’]ll|\s+will|[''’]s\s+going\s+to|\s+is\s+going\s+to)\s+pick\s+it\s+up\s+again'
+        - '\bit(?:[''’]ll|\s+will)\s+be\s+picked\s+up\s+again'
   # No retry, requeue or second card offered or started beside the
   # dispatcher's retry; that runs the work twice. A re-route offer passes
   # ("Should I hand it to another agent?", "I can send it elsewhere"), since

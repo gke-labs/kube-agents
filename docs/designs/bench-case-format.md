@@ -187,7 +187,8 @@ Nine read what the run produced, from this repository
 line's decoration folded when the check sets `fold_decoration: true` (indentation, bullets,
 numbers, headings, quotes, links, a trailing stop or an affirming mark; a mark that hedges or
 negates the last word stays, so it reads as a wrong value), so a pattern anchored at both ends
-spells a declared line once and should keep `\n` out of its gaps, for what no substring can
+spells a declared line once and should keep `\n` out of its gaps (a literal space does not cross a
+line break; a phrase that may wrap says `\s+`), for what no substring can
 express: a banned word whose negated uses are legitimate, a phrase that must start at a word
 boundary (`any_of_patterns` are the regex alternatives to `any_of_phrases`, one pool: at least one
 of either must match), and a required claim whose subject and verb an adverb or a tense can

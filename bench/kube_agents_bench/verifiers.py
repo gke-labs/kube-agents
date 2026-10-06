@@ -381,7 +381,9 @@ class ReportContainsVerifier(BaseVerifier):
     so a Markdown bullet or heading with no terminal punctuation is its own
     segment and a pattern may anchor on ``\\n``; the flat collapse would
     otherwise fuse a negated bullet into its unnegated neighbour before the
-    regex runs. ``any_of_patterns`` and ``any_of_phrases`` are one pool of
+    regex runs. A literal space in a pattern therefore does not cross a
+    line break; a phrase that may wrap says ``\\s+`` where it may.
+    ``any_of_patterns`` and ``any_of_phrases`` are one pool of
     alternatives: at least one of either has to match.
 
     Both sides are normalized first, by ``_normalize`` above: lowercased,
@@ -417,8 +419,10 @@ class ReportContainsVerifier(BaseVerifier):
     # boundary, or a subject bound to its verb across an adverb. One pool
     # with any_of_phrases (at least one of either must match), searched
     # against the same line-preserving text as forbidden_patterns, so a
-    # pattern may anchor on a newline and should keep it out of its gaps. `{cluster:<slot>}` in either list stands for the
-    # cluster the runner recorded for that slot (see _CLUSTER_PLACEHOLDER).
+    # pattern may anchor on a newline and should keep it out of its gaps,
+    # and a phrase that may wrap says `\s+` where a space would not cross
+    # the break. `{cluster:<slot>}` in either list stands for the cluster
+    # the runner recorded for that slot (see _CLUSTER_PLACEHOLDER).
     any_of_patterns: list[str] = Field(default_factory=list)
     # Fold each line's decoration (bullets, numbers, quotes, links, a trailing
     # stop or an affirming mark; a mark that hedges or negates the last word

@@ -6677,3 +6677,36 @@ def test_cluster_placeholders_expand_to_escaped_recorded_names():
     assert re.search(dotted, "a.b") and not re.search(dotted, "axb")
     # a placeholder still compiles at spec load, before any record exists
     parse_node({"type": "report_contains", "forbidden_patterns": ["{cluster:any}: no$"]})
+
+
+# ------------------------- any_of_patterns written for the flat text still cross a break
+
+
+def _any_of_patterns_of(case_name: str) -> list[str]:
+    spec = yaml.safe_load((TASKS / case_name / "task.yaml").read_text(encoding="utf-8"))
+    lists = [e["check"]["any_of_patterns"] for e in spec["verification_spec"] if e["check"].get("any_of_patterns")]
+    assert len(lists) == 1, case_name
+    return lists[0]
+
+
+@pytest.mark.parametrize(
+    "case_name, final_message, matches",
+    [
+        # A right phrase that wraps over a line still matches.
+        ("chat-voice-final-attempt-is-not-retried", "The last attempt failed. It has\nstopped.", True),
+        ("chat-voice-retry-says-it-is-retried", "The worker crashed. The dispatcher will\npick it up again.", True),
+        # A hedge that wraps is still refused: the lookahead reads past the break.
+        ("chat-voice-final-attempt-is-not-retried", "The worker crashed; it won't retry\nfor now, but ask and I'll queue it.", False),
+        ("chat-voice-final-attempt-is-not-retried", "It won't be retried\nuntil tomorrow.", False),
+        # ... and the one `until` the lookahead lets through (the user has to act) still is.
+        ("chat-voice-final-attempt-is-not-retried", "It won't be retried\nuntil you say so.", True),
+    ],
+)
+def test_the_chat_voice_patterns_cross_a_line_break_as_they_did_on_the_flat_text(case_name, final_message, matches):
+    """`any_of_patterns` run against the line-preserving text, where a literal
+    space does not span a line break; the two cases that wrote their patterns
+    for the flat text say `\\s+` where a phrase may wrap, so they grade a
+    wrapped reply as they did before."""
+    v = ReportContainsVerifier(type="report_contains", any_of_patterns=_any_of_patterns_of(case_name))
+    transcript.set(final_message, [], final_message=final_message)
+    assert v.verify(1.0).success is matches, final_message
