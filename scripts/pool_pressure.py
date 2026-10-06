@@ -108,6 +108,10 @@ FIXTURE_LOG_SUFFIX = ".txt"
 # cat -r` transfers only the range, so the head costs a round trip rather than a
 # download. Ten times that offset, for whatever the job prints before it leases.
 BUILD_LOG_HEAD_BYTES = 65536
+# The range ends on a byte count, so the cut can land inside a multi-byte
+# character (#2477). The banner lookup only needs the text before the cut.
+BUILD_LOG_ENCODING = "utf-8"
+BUILD_LOG_DECODE_ERRORS = "replace"
 
 # Every phase boundary in the presubmit's script prints a banner:
 #
@@ -788,16 +792,20 @@ def _read_log_head(path: str) -> str:
     The return code is ignored here too, for a different reason: a log shorter
     than the range makes gcloud exit 1 with "Download not completed" after
     writing the whole object anyway. A build still running has no log at all.
+
+    Not run_cmd: its text mode decodes strictly, and a range cut inside a
+    character raised UnicodeDecodeError out of the sweep (#2477).
     """
-    _, out, _ = run_cmd(
-        [
-            "gcloud", "storage", "cat",
-            "-r", f"0-{BUILD_LOG_HEAD_BYTES - 1}",
-            f"{path}/{BUILD_LOG_ARTIFACT}",
-        ],
-        timeout=GCLOUD_TIMEOUT_SECONDS,
-    )
-    return out
+    cmd = [
+        "gcloud", "storage", "cat",
+        "-r", f"0-{BUILD_LOG_HEAD_BYTES - 1}",
+        f"{path}/{BUILD_LOG_ARTIFACT}",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=GCLOUD_TIMEOUT_SECONDS)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+    return proc.stdout.decode(BUILD_LOG_ENCODING, errors=BUILD_LOG_DECODE_ERRORS)
 
 
 def _wait_from_gcs(path: str) -> Optional[Wait]:
@@ -807,6 +815,18 @@ def _wait_from_gcs(path: str) -> Optional[Wait]:
     # The second round trip is only worth spending once the build is known to
     # have produced a usable prowjob.json.
     return wait_from_prowjob(prowjob, started, _read_log_head(path))
+
+
+def _read_wait(path: str) -> Tuple[Optional[Wait], Optional[str]]:
+    """_wait_from_gcs with a failing build reported rather than raised.
+
+    pool.map re-raises a worker's exception at the caller, so without this one
+    unreadable log ended the sweep with no output at all (#2477).
+    """
+    try:
+        return _wait_from_gcs(path), None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
 
 
 class Sweep:
@@ -824,12 +844,16 @@ class Sweep:
         elapsed_seconds: float,
         window_start: datetime,
         truncated: bool = False,
+        unreadable: Optional[List[Dict[str, str]]] = None,
     ):
         self.waits = waits
         self.builds_read = builds_read
         self.elapsed_seconds = elapsed_seconds
         self.window_start = window_start
         self.truncated = truncated
+        # Builds whose read raised, each as {"build_id", "error"}; counted in
+        # builds_read, left out of waits.
+        self.unreadable = unreadable or []
 
 
 def collect_waits(
@@ -882,6 +906,7 @@ def collect_waits(
             )
 
         collected: List[Wait] = []
+        unreadable: List[Dict[str, str]] = []
         read = 0
         done: List[str] = []
         truncated = False
@@ -890,9 +915,14 @@ def collect_waits(
                 if time.monotonic() - began > deadline_seconds:
                     truncated = True
                     break
-                for wait in pool.map(_wait_from_gcs, sorted(candidates[day])):
+                paths = sorted(candidates[day])
+                for path, (wait, error) in zip(paths, pool.map(_read_wait, paths)):
                     read += 1
-                    if wait is not None:
+                    if error is not None:
+                        unreadable.append(
+                            {"build_id": path.rsplit("/", 1)[-1], "error": error}
+                        )
+                    elif wait is not None:
                         collected.append(wait)
                 done.append(day)
 
@@ -908,9 +938,20 @@ def collect_waits(
             datetime.strptime(oldest, DATE_FORMAT).replace(tzinfo=timezone.utc),
         )
 
+    if unreadable and not collected:
+        # Every build raised. Reported as unmeasured, not as a window with no
+        # runs: before the per-build catch this input crashed the job red.
+        first = unreadable[0]
+        return Source(
+            error=f"none of the {read} builds could be read; first failure, build "
+            f"{first['build_id']}: {first['error']}"
+        )
+
     waits = [w for w in collected if measured_start <= w.created <= window_end]
     return Source(
-        value=Sweep(waits, read, time.monotonic() - began, measured_start, truncated)
+        value=Sweep(
+            waits, read, time.monotonic() - began, measured_start, truncated, unreadable
+        )
     )
 
 
@@ -923,7 +964,8 @@ def _read_optional_json(path: Path) -> Optional[dict]:
 
 def _read_optional_text(path: Path) -> str:
     try:
-        return path.read_text(encoding="utf-8")
+        # The same tolerance as _read_log_head: a fixture is cut at the same range.
+        return path.read_text(encoding=BUILD_LOG_ENCODING, errors=BUILD_LOG_DECODE_ERRORS)
     except OSError:
         return ""
 
@@ -1335,6 +1377,7 @@ def summarise(
             ).strftime(TIMESTAMP_FORMAT),
             "truncated": bool(sweep and sweep.truncated),
             "builds_read": sweep.builds_read if sweep else 0,
+            "unreadable": sweep.unreadable if sweep else [],
             "elapsed_seconds": round(sweep.elapsed_seconds, 1) if sweep else 0.0,
             "segments": segment_breakdown(waits),
             "days": [
@@ -1416,6 +1459,13 @@ def render(summary: dict) -> str:
             f"\n[!] The sweep ran out of time and covers {trend['window_start']}"
             " onward,\n    not the whole window above. Older days are missing"
             " from the table, not empty."
+        )
+
+    if trend["unreadable"]:
+        names = ", ".join(u["build_id"] for u in trend["unreadable"])
+        out.append(
+            f"\n[!] {len(trend['unreadable'])} build(s) could not be read and are"
+            f" left out of the numbers: {names}"
         )
 
     if trend["days"]:

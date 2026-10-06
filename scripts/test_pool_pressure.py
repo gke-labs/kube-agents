@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -689,6 +690,115 @@ class SweepDeadline(unittest.TestCase):
         self.assertTrue(summary["trend"]["truncated"])
         self.assertEqual("2026-08-27", summary["trend"]["window_start"][:10])
         self.assertIn("ran out of time", pp.render(summary))
+
+
+class LogHead(unittest.TestCase):
+    """The ranged read stops at a byte count, which can fall inside a character.
+
+    Build 2107550359353298944 (#2477) put byte 65535 in the middle of an arrow,
+    and the text-mode decode took the whole sweep down with it.
+    """
+
+    LEASE_BANNER = "=== [2026-10-06T19:46:00Z] Leasing GCP Project from Boskos ===\n"
+
+    def _read(self, body: bytes) -> str:
+        """_read_log_head through a gcloud stub that serves `body` by range."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "build-log.txt")
+            with open(log, "wb") as fh:
+                fh.write(body)
+            stub = os.path.join(tmp, "gcloud")
+            with open(stub, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "#!/usr/bin/env python3\n"
+                    "import sys\n"
+                    "first, last = map(int, sys.argv[sys.argv.index('-r') + 1].split('-'))\n"
+                    f"sys.stdout.buffer.write(open({log!r}, 'rb').read()[first:last + 1])\n"
+                )
+            os.chmod(stub, 0o755)
+            path = tmp + os.pathsep + os.environ["PATH"]
+            with unittest.mock.patch.dict(os.environ, {"PATH": path}):
+                return pp._read_log_head("gs://bucket/build")
+
+    def test_a_head_cut_inside_a_character_still_yields_the_text_before_it(self):
+        banner = self.LEASE_BANNER.encode("utf-8")
+        arrow = "→".encode("utf-8")
+        self.assertEqual(3, len(arrow))
+        # Bytes 65534 and 65535 are the arrow's first two; its third is past the range.
+        filler = b"x" * (pp.BUILD_LOG_HEAD_BYTES - 2 - len(banner))
+        head = self._read(banner + filler + arrow + b" past the cut\n")
+        self.assertTrue(head.startswith(self.LEASE_BANNER))
+        self.assertGreaterEqual(len(head), pp.BUILD_LOG_HEAD_BYTES - 2)
+        self.assertIsNotNone(pp.lease_window(head)[0])
+
+
+class SweepUnreadable(unittest.TestCase):
+    """A build whose read raises is named and skipped; the sweep goes on.
+
+    The periodic writes nothing when the sweep raises, so one bad log blanked
+    the TestGrid tab for a week (#2477).
+    """
+
+    # Three builds from the breach fixture day, 2026-08-26.
+    BUILDS = (2092660728946233344, 2092616949556056064, 2092526388937494528)
+    BAD = BUILDS[1]
+    AS_OF = datetime(2026, 8, 27, tzinfo=timezone.utc)
+
+    def _sweep(self, bad=(BAD,)):
+        entries = {build: f"gs://bucket/{build}" for build in self.BUILDS}
+
+        def wait_for(path):
+            build = int(path.rsplit("/", 1)[1])
+            if build in bad:
+                raise UnicodeDecodeError("utf-8", b"\xe2\x86", 0, 2, "unexpected end of data")
+            moment = pp.snowflake_time(build)
+            return pp.Wait(build, "1", moment, moment, 15)
+
+        with unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/gcloud"), \
+                unittest.mock.patch.object(pp, "_index_entries_from_gcs",
+                                           return_value=(entries, None)), \
+                unittest.mock.patch.object(pp, "_wait_from_gcs", side_effect=wait_for):
+            return pp.collect_waits(self.AS_OF - timedelta(days=1), self.AS_OF)
+
+    def test_the_other_builds_are_still_measured(self):
+        sweep = self._sweep().value
+        self.assertEqual(3, sweep.builds_read)
+        self.assertEqual(sorted(b for b in self.BUILDS if b != self.BAD),
+                         sorted(w.build_id for w in sweep.waits))
+
+    def test_the_unreadable_build_is_named_in_the_output(self):
+        source = self._sweep()
+        self.assertEqual([str(self.BAD)], [u["build_id"] for u in source.value.unreadable])
+        self.assertIn("UnicodeDecodeError", source.value.unreadable[0]["error"])
+        summary = pp.summarise(
+            self.AS_OF - timedelta(days=1), self.AS_OF, 15, 45, 45,
+            source, pp.Source(error="not read"), pp.Source(error="not read"),
+        )
+        self.assertEqual([str(self.BAD)], [u["build_id"] for u in summary["trend"]["unreadable"]])
+        self.assertIn(str(self.BAD), pp.render(summary))
+
+    def test_every_build_unreadable_is_not_measured_rather_than_quiet(self):
+        """Before the per-build catch this input crashed the job red; the
+        catch must not turn it into a green window with no runs."""
+        source = self._sweep(bad=self.BUILDS)
+        self.assertFalse(source.ok)
+        self.assertIn("3", source.error)
+        self.assertIn("UnicodeDecodeError", source.error)
+
+
+class FromDirLogHead(unittest.TestCase):
+    def test_a_fixture_log_cut_inside_a_character_still_replays(self):
+        """The re-capture recipe takes the same 64 KiB range the live path
+        reads, so a fixture can carry the same cut (#2477)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            shutil.copytree(BREACH_DIR, tmp, dirs_exist_ok=True)
+            with open(os.path.join(tmp, "logs", "worst-queue-stall.txt"), "ab") as fh:
+                fh.write("→".encode("utf-8")[:2])
+            source = pp._collect_waits_from_dir(
+                tmp, BREACH_AS_OF - timedelta(days=1), BREACH_AS_OF
+            )
+        self.assertTrue(source.ok)
+        self.assertEqual(5, len(source.value.waits))
 
 
 class EndToEnd(unittest.TestCase):
