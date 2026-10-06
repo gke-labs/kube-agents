@@ -396,10 +396,9 @@ type Config struct {
 	// this bounds its length: a harness that delegates in a loop stops at
 	// the bound instead of walking the session cap.
 	//
-	// Zero means 3. FromEnv refuses a value under
-	// 1 rather than clamping it: 0 would be "delegation off", which is a
-	// different switch (A2A_DELEGATE_TOOL on the worker side), not a typo to
-	// paper over.
+	// Zero means 3. FromEnv refuses a value under 1 rather than clamping
+	// it: 0 would be "delegation off", which is a different switch
+	// (A2A_DELEGATE_TOOL on the worker side), not a typo to paper over.
 	DelegationDepthMax int
 }
 
