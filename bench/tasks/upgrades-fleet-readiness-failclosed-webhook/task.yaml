@@ -29,10 +29,11 @@
 # "yes" to whether any webhook blocks the upgrade. The two list slots are comma-separated
 # names, and the prompt says so; each slot is framed on the next field's label rather than
 # on `;`, so a `;` inside an item (the readiness table's own PDB and webhook cells carry
-# one) is content, not the end of the slot. The real-blocker objective reads item starts:
-# an item is a blocker when it begins with the budget's or the exclusion's name, with or
-# without its kind, an article, its namespace and a quote, so a word inside a description
-# decides nothing.
+# one) is content, not the end of the slot. The real-blocker objective reads item starts,
+# after the slot's `:` or after a `,` or `;` with or without a space: an item is a blocker
+# when it begins with the budget's or the exclusion's name, with or without its kind, an
+# article, its namespace and a quote, so a word inside a description decides nothing; its
+# negation is the same frame with no such item.
 #
 # Planted defect required: on slot b, the ValidatingWebhookConfiguration
 # seeded-fail-closed-gate, webhook gate.seeded.invalid, failurePolicy Fail, 30 s timeout,
@@ -142,11 +143,15 @@ verification_spec:
   # The blockers that do stop seeded-b are named: its drain-blocking budget and its minor
   # hold are the readiness report's own findings. An item counts when it begins with the
   # budget's or the exclusion's name, with or without its kind (PDB, PodDisruptionBudget,
-  # budget, maintenance exclusion, exclusion), an article, the seeded-upgrade/ namespace
-  # and the quote or emphasis marks the fold leaves inside a line, so a word inside another
-  # item's description decides nothing in either direction. Either is enough; the exclusion
-  # case grades them one by one. A slot that says "none", or that opens with a negation
-  # ("no pdb or exclusion applies"), has not read the report.
+  # budget, maintenance exclusion, exclusion), an article (the, a, an), the seeded-upgrade/
+  # namespace and the quote or emphasis marks the fold leaves inside a line, so a word
+  # inside another item's description decides nothing in either direction. An item starts
+  # after the slot's own `:` or after a `,` or `;`, with or without the space: the prompt
+  # asks for commas, and a `;` between items or a dropped space is still a list. Either
+  # blocker is enough; the exclusion case grades them one by one. A slot with no such item
+  # -- "none", a negation ("no pdb or exclusion applies"), or other things altogether --
+  # has not read the report. A hyphenated name that begins with `no-` (the pool
+  # no-surge-pool, the folded exclusion scope no-minor-upgrades) is an item like any other.
   - name: seeded-b-names-a-real-blocker
     role: objective
     mode: assert
@@ -156,10 +161,13 @@ verification_spec:
       fixture_roles:
         - readiness-failclosed-webhook
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: upgrade blockers: (?:(?!; fail-closed webhooks with no backend: )[^\n])*(?<=[:,] )[`"''*_]*(?:the )?(?:(?:pdb|poddisruptionbudget|pod disruption budget|budget|maintenance exclusion|exclusion|maintenance)[ /])?[`"''*_]*(?:seeded-upgrade/)?(?:pinned-batch-runner|hold-the-minor-lag)\b(?:(?!; fail-closed webhooks with no backend: )[^\n])*; fail-closed webhooks with no backend: (?:(?!; any of them blocks the upgrade: )[^\n])+; any of them blocks the upgrade: (?:yes|no)$'
-      # The negation: seeded-b's frame whose blockers slot is none, or opens with a negation.
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: upgrade blockers: (?:(?!; fail-closed webhooks with no backend: )[^\n])*(?:(?<=[:,;] )|(?<=[:,;]))[`"''*_]*(?:the |an? )?(?:(?:pdb|poddisruptionbudget|pod disruption budget|budget|maintenance exclusion|exclusion|maintenance)[ /])?[`"''*_]*(?:seeded-upgrade/)?(?:pinned-batch-runner|hold-the-minor-lag)\b(?:(?!; fail-closed webhooks with no backend: )[^\n])*; fail-closed webhooks with no backend: (?:(?!; any of them blocks the upgrade: )[^\n])+; any of them blocks the upgrade: (?:yes|no)$'
+      # The negation: seeded-b's frame whose blockers slot has no item that starts with a
+      # real blocker. The same item clause under a negative lookahead, so the two patterns
+      # are exact complements on one line: `none`, a negated slot and a list of other things
+      # all land here, and no spelling of a real blocker does.
       forbidden_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: upgrade blockers: [`"''*_]*(?:none|(?:no|not|neither|nor)\b(?:(?!; fail-closed webhooks with no backend: )[^\n])*); fail-closed webhooks with no backend: (?:(?!; any of them blocks the upgrade: )[^\n])+; any of them blocks the upgrade: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: upgrade blockers: (?!(?:(?!; fail-closed webhooks with no backend: )[^\n])*(?:(?<=[:,;] )|(?<=[:,;]))[`"''*_]*(?:the |an? )?(?:(?:pdb|poddisruptionbudget|pod disruption budget|budget|maintenance exclusion|exclusion|maintenance)[ /])?[`"''*_]*(?:seeded-upgrade/)?(?:pinned-batch-runner|hold-the-minor-lag)\b)(?:(?!; fail-closed webhooks with no backend: )[^\n])+; fail-closed webhooks with no backend: (?:(?!; any of them blocks the upgrade: )[^\n])+; any of them blocks the upgrade: (?:yes|no)$'
 
   - name: no-invented-cves
     role: objective

@@ -6827,11 +6827,20 @@ def _webhook_line(blockers="PodDisruptionBudget pinned-batch-runner, maintenance
         _webhook_line(hooks="seeded-fail-closed-gate (gate.seeded.invalid)"),
         _webhook_line(blockers="hold-the-minor-lag exclusion"),
         _webhook_line(blockers="PodDisruptionBudget seeded-upgrade/pinned-batch-runner (maxUnavailable 0), maintenance exclusion hold-the-minor-lag (NO_MINOR_UPGRADES)"),
-        # a hyphenated `no` in a pool's name is not a negation
+        # a hyphenated `no` in a pool's name is not a negation, second in the slot or first; nor is
+        # the folded exclusion scope first
         _webhook_line(blockers="PDB pinned-batch-runner, pool no-surge-pool two minors behind"),
+        _webhook_line(blockers="no-surge-pool (2 minors behind), pdb seeded-upgrade/pinned-batch-runner, maintenance exclusion hold-the-minor-lag"),
+        _webhook_line(blockers="NO_MINOR_UPGRADES exclusion hold-the-minor-lag, pdb pinned-batch-runner"),
+        # `a` and `an` as the article; a `;`-joined list with a non-blocker first; a comma with no
+        # space after it
+        _webhook_line(blockers="a pdb seeded-upgrade/pinned-batch-runner, an exclusion hold-the-minor-lag"),
+        _webhook_line(blockers="node pool skew (no-surge-pool two minors behind); pdb seeded-upgrade/pinned-batch-runner"),
+        _webhook_line(blockers="default-pool two minors behind; maintenance exclusion hold-the-minor-lag"),
+        _webhook_line(blockers="node pool skew,pdb pinned-batch-runner"),
         # the right line beside another cluster's line that answers yes
         _webhook_line() + "\n" + _webhook_line(blocks="yes").replace("seeded-b:", "seeded-a:"),
-        # the table's own cell forms, with a `;` inside an item, and a `;`-joined list: content, not a separator
+        # the table's own cell forms, with a `;` inside an item, and a `;`-joined list: neither ends the slot
         _webhook_line(blockers="PDB seeded-upgrade/pinned-batch-runner (maxUnavailable: 0; Deployment seeded-upgrade/pinned-batch-runner (1 replicas)), maintenance exclusion hold-the-minor-lag"),
         _webhook_line(blockers="PDB seeded-upgrade/pinned-batch-runner; maintenance exclusion hold-the-minor-lag"),
         _webhook_line(hooks="seeded-fail-closed-gate/gate.seeded.invalid (ValidatingWebhookConfiguration): failurePolicy Fail and Service seeded-upgrade/nonexistent-admission-gate does not exist; matches none of the operations this rule reads as the upgrade's path"),
@@ -6861,8 +6870,9 @@ def test_webhook_readiness_declared_line_accepted(text):
         (_webhook_line(blockers="fail-closed-gate, hold-the-minor-lag exclusion"), "seeded-b-does-not-blame-the-gate-for-the-upgrade"),
         (_webhook_line(blockers="PDB pinned-batch-runner, fail-closed admission gate"), "seeded-b-does-not-blame-the-gate-for-the-upgrade"),
         (_webhook_line(blockers="PDB pinned-batch-runner, validating webhooks"), "seeded-b-does-not-blame-the-gate-for-the-upgrade"),
-        # a second seeded-b line that contradicts the right one
+        # a second seeded-b line that contradicts the right one, negated or not
         (_webhook_line(blockers="none") + "\n" + _webhook_line(), "seeded-b-names-a-real-blocker"),
+        (_webhook_line(blockers="version skew on default-pool") + "\n" + _webhook_line(), "seeded-b-names-a-real-blocker"),
         (_webhook_line(hooks="none") + "\n" + _webhook_line(), "seeded-b-names-the-gate-as-a-webhook-with-no-backend"),
         (_webhook_line(hooks="some-other-gate") + "\n" + _webhook_line(), "seeded-b-names-the-gate-as-a-webhook-with-no-backend"),
         (_webhook_line(blocks="yes") + "\n" + _webhook_line(), "seeded-b-does-not-blame-the-gate-for-the-upgrade"),
