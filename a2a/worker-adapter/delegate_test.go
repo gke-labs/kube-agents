@@ -157,3 +157,71 @@ func TestNoSocketConfiguredMeansNoListener(t *testing.T) {
 	}
 	stop()
 }
+
+// TestADelegateCallAfterCancelIsRefused: once cancel has reached supervise,
+// the turn is over even though the harness is still dying. A delegate call in
+// that window must not publish a child request, nor turn the canceled task
+// into a completed one. The stub traps TERM and records it, so the test knows
+// cancel has been acted on, and lives until the SIGKILL KillGrace later.
+func TestADelegateCallAfterCancelIsRefused(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	const session, taskID = "chat-test-del3", "task-del-3"
+	origin := submit(t, c, session, taskID, "find out how the fleet is")
+	sock := delegateSock(t)
+	marker := filepath.Join(filepath.Dir(sock), "termed")
+	harness := stub(t, `
+trap 'touch `+marker+`' TERM
+echo '{"type":"system","subtype":"init","session_id":"stub-1"}'
+read first || exit 1
+while true; do sleep 1; done
+`)
+	cfg := adapterConfig(url, taskID, session, harness)
+	cfg.DelegateSocket = sock
+	cfg.TaskDeadline = 2 * time.Minute
+	cfg.KillGrace = 10 * time.Second
+	done := runAdapter(context.Background(), cfg)
+	waitState(t, c, session, taskID, lib.StateWorking)
+
+	env, err := lib.NewCancelEnvelope(gatewayParty, taskID, origin.ContextID, origin.CorrelationID,
+		lib.WithTo(lib.Party{Session: session}))
+	if err != nil {
+		t.Fatalf("cancel envelope: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.Publish(ctx, lib.TaskInSubject(session, taskID), env); err != nil {
+		t.Fatalf("publish cancel: %v", err)
+	}
+	deadline := time.Now().Add(waitDeadline)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("harness never received SIGTERM")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	reply := askDelegate(t, sock, lib.DelegateRequest{Addressee: "platform", Text: "how is the fleet?"})
+	if reply.OK || !strings.Contains(reply.Message, "already ended") {
+		t.Fatalf("delegate after cancel: %+v", reply)
+	}
+	out := waitOutcome(t, done, 45*time.Second)
+	if out.err != nil || out.res.State != lib.StateCanceled {
+		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
+	}
+	for _, ev := range replayEvents(t, url, session, taskID) {
+		if ev.Kind != lib.KindArtifactUpdate {
+			continue
+		}
+		var u lib.ArtifactUpdate
+		if err := json.Unmarshal(ev.Payload, &u); err != nil {
+			t.Fatalf("artifact payload: %v", err)
+		}
+		if u.Artifact.Name == lib.ArtifactDelegate {
+			t.Fatalf("a delegate artifact was published after cancel: %s", ev.Payload)
+		}
+	}
+}

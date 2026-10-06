@@ -585,14 +585,17 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 
 		case ask := <-delegateCh:
 			// One child at a time, and the turn ends on the first one. A
-			// request after the deliverable is decided (the harness's own
-			// result, or an earlier delegation) is refused rather than
+			// request after the turn is decided (the harness's own result, an
+			// earlier delegation, cancel or the deadline) is refused rather than
 			// published: there is no turn left for it to belong to.
 			if delegated {
 				ask.reply <- delegateReply{Message: "a task is already delegated this turn"}
 				continue
 			}
-			if sawResult || exited {
+			// Cancel and the deadline end the turn when they fire, not when
+			// the harness finally dies: a call in that window would publish
+			// a child and turn the canceled task into a completed one.
+			if sawResult || exited || canceled || deadlineHit {
 				ask.reply <- delegateReply{Message: "this turn has already ended"}
 				continue
 			}
