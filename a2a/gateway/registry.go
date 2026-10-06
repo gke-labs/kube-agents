@@ -92,7 +92,10 @@ type SessionRecord struct {
 // backend it came in on and its Subject, the author id normalized for that
 // backend and HMAC'd under the install salt (requesterSubject). No plaintext
 // id is stored; the allowlist entries are hashed the same way, so the check
-// compares pseudonyms. It lives in the session-state KV and never reaches the
+// compares pseudonyms. On Google Chat it is the lowercased email's hash, so it
+// can differ from Attribution's requester.subject (the raw id's hash, which
+// the cross-surface audit join keys on); the two are not meant to join.
+// It lives in the session-state KV and never reaches the
 // bus; the bus carries Attribution. Cleared by the ask bound past AskTTL.
 type TaskRequester struct {
 	Backend string `json:"backend"`
