@@ -667,21 +667,25 @@ or a setting of the cluster, never data on a machine or a condition a version ch
 operator would. The automatic check today is a search for exact phrases anywhere in the reply, with
 a list of accepted spellings where a right answer can be worded two ways and a list of forbidden
 phrases for a wrong verdict; the rest of the answer, the explanation and the advice, is scored by a
-second model. That is how the series' one registered test, row 5's, is graded, and a correct reply
-has failed it on phrasing. The form the rest of the series is designed to use, which some tests
+second model. That is how the series' one registered test is graded, and a correct reply has failed it on
+phrasing; that test asks rows 5's and 1's questions together, grades the calendar hold by name and
+leaves row 1's rule to the second model. The form the rest of the series is designed to use, which some tests
 elsewhere in the harness already ask for, narrows the automatic check: the question ends by asking
 for one short line per cluster in a fixed vocabulary, for example "cluster B: protected
 application: yes; which: batch-runner", the automatic check is a pattern anchored on the cluster's
 name that accepts a right line and refuses the wrong value, and the test names the hedges it
 refuses, such as "probably" or "could not check"; prose stays with the second model. Two guards
-are part of the design. A test about a planted object carries a check on that object, so a run that
+are the designed form for the tests still to be written; no registered test carries either today. A
+test about a planted object carries a check on that object, so a run that
 quietly repairs it fails rather than passes; the check reaches only objects in the cluster that the
 example's entry in the fleet's fixture catalogue lists, so where the condition is a setting of the
 cluster itself (rows 5, 11 and 16), the test carries no such check, and what keeps the condition in
 place is the fleet's own reconcile, with a scheduled scan of the fixture catalogue's recorded state
-that reports a drift without acting on it, as row 5's registered test documents. And a test that
-carries such a check records a broken environment rather than a wrong answer when the object's
-cluster is missing; one that carries none, row 5's today, fails as a wrong answer. For the
+that reports a drift without acting on it. The registered test carries no check on row 1's rule
+either, although the rule's catalogue entry lists it and could ground one, as the test's own header
+records. And a test that carries such a check records a broken environment rather than a wrong
+answer when the object's cluster is missing; one that carries none, the registered test today, fails
+as a wrong answer. For the
 protection rule a second audit is to be tested as well: the morning reliability audit is the one that
 files the rule today, and the Monday upgrade audit, which has no budget check yet, is to gain one; once
 it exists, the issue it files must name the cluster whose upgrade would not complete.
@@ -708,10 +712,10 @@ the failure happens to share. Two do; the entry's "Read today" line names the au
 procedure document: the morning reliability audit of this section is the obtainability audit there,
 and the Monday upgrade audit is the security-patch orchestrator.
 
-| #   | The failure                                                                                  | What we set up on the test fleet                                                                                                                                                                                          | How the nightly test checks it                                                                                    |
-| --- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| 1   | [A protection rule forbids taking a pod down](#1-a-poddisruptionbudget-forbids-the-eviction) | _Exists._ One small application on the second cluster whose rule says no copy may ever be unavailable, so the machine it runs on cannot be emptied cleanly for an upgrade; GKE waits, then removes the application anyway | Asked which clusters carry such a rule and which application; must name the cluster, the application and the rule |
-| 3   | [Every replica in one zone or on one node](#3-every-replica-in-one-zone-or-on-one-node)      | _Exists._ On the fourth cluster, three applications whose copies all sit in one zone, each for a different reason: a placement rule, a disk tied to that zone, no room in the other zone                                  | Asked which applications lose every copy when one zone is drained; must name all three and the reason for each    |
+| #   | The failure                                                                                  | What we set up on the test fleet                                                                                                                                                                                          | How the nightly test checks it                                                                                                                                                                     |
+| --- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | [A protection rule forbids taking a pod down](#1-a-poddisruptionbudget-forbids-the-eviction) | _Exists._ One small application on the second cluster whose rule says no copy may ever be unavailable, so the machine it runs on cannot be emptied cleanly for an upgrade; GKE waits, then removes the application anyway | Asked which clusters carry such a rule and which application; must name the cluster, the application and the rule. The registered test asks this today and grades the rule in the judged part only |
+| 3   | [Every replica in one zone or on one node](#3-every-replica-in-one-zone-or-on-one-node)      | _Exists._ On the fourth cluster, three applications whose copies all sit in one zone, each for a different reason: a placement rule, a disk tied to that zone, no room in the other zone                                  | Asked which applications lose every copy when one zone is drained; must name all three and the reason for each                                                                                     |
 
 ### Caught only in conversation today
 
