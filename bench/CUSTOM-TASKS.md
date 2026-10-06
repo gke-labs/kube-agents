@@ -401,7 +401,7 @@ tool output the agent never reported on. `ledger_issue_contains` grades the arti
 **Finding the issue.** From the run's own final message, because that is the only channel that
 exists: `start` prints `"issue": null` until a ledger exists, the audit's on-disk `.lease` marker
 records the repo and the stream but no issue number, and the audit runs in a delegated worker whose
-tool calls reach the trajectory only as clipped, tagged entries that `tool_called` counts by name (`scope: workers`) and no verifier reads for content.
+tool calls reach the trajectory only as clipped, tagged entries that `tool_called` counts by name (`scope: workers`) and, with `arguments`, matches a string argument against a regex; nothing extracts a value such as the issue URL.
 What does cross back is `finish`'s `issue_url`, which the
 SOP requires every non-silent report to carry in full — and an on-demand run, which is what an eval
 task is, is never silent. The URL is a **pointer only**: every phrase assertion is made against
