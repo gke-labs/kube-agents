@@ -2865,11 +2865,12 @@ profile_begin "record + final gate"
 # against a window it had just moved.
 #
 # EVAL_MODE_NEXT=1 is the fourth, for the same reason as the third. The next
-# lane's periodic on main (ci-kube-agents-eval-next) is also a periodic with
-# no PULL_NUMBER, and the key has no mode field either, so its samples would
-# be today's the moment they landed. The deploy admits the flag on that job
-# by name (EVAL_MODE_NEXT_JOB_NAMES in hack/ci-deploy.sh); this is what keeps
-# the admission from moving the window. Whatever the job's identity may hold
+# lane's periodic and nightly on main (ci-kube-agents-eval-next,
+# ci-kube-agents-eval-nightly-next-claude) are also periodics with no
+# PULL_NUMBER, and the key has no mode field either, so their samples would
+# be today's the moment they landed. The deploy admits the flag on those
+# jobs by name (EVAL_MODE_NEXT_JOB_NAMES in hack/ci-deploy.sh); this is what
+# keeps the admission from moving the window. Whatever the job's identity may hold
 # on the store is a grant in oss-test-infra this script cannot see, not a
 # property of it. A next record of its own is the mode field on the key;
 # until it exists a flagged run reads the store, when one is armed, and

@@ -187,8 +187,8 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 
 # EVAL_MODE_NEXT=1 flips the eval install to `spec.mode: next` once the
 # today-mode install has passed step 6, so the matrix can be run against the
-# next stack: the presubmit's on demand, or the next lane's periodic on main
-# (#1686, measuring #1661). Unset, or set to
+# next stack: the presubmit's on demand, or the next lane's periodic and
+# nightly on main (#1686, measuring #1661). Unset, or set to
 # anything but "1", is today: every line the flag guards is skipped and the
 # script behaves exactly as it did before the flag existed.
 #
@@ -233,18 +233,20 @@ readonly PLATFORM_AGENT_CR_NAME="platform-agent"
 # operator to clear its finalizer before uninstallation. Matches
 # charts/kube-agents/values.yaml cleanupHook.timeout (120s).
 readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
-# The next lane's Prow jobs: its on-demand presubmit and its periodic on
-# main. Section 2b admits the flag on a run whose JOB_NAME is one of these
-# (space-separated, matched whole) or that carries a PULL_NUMBER -- the
-# presubmit is admitted by the second on a pull request and by the first on a
-# Tide batch, the periodic only by the first -- and refuses it on any other
-# Prow run, so the flag
-# leaking into the nightly's or a postsubmit's environment still stops the
-# deploy at second zero. The names are the jobs' own in oss-test-infra
-# (prow/prowjobs/gke-labs/kube-agents/); a rename there is a one-line edit here.
-# hack/ci-eval-pr.sh keeps such a run out of the baseline recorder on the flag
-# alone, so admitting a job here never lets it write main's window.
-readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test-next ci-kube-agents-eval-next"
+# The next lane's Prow jobs: its on-demand presubmit, its six-hourly periodic
+# on main, and its daily full-catalog nightly on main (the agent on Claude,
+# compared with a today-mode nightly on the same model). Section 2b admits
+# the flag on a run whose JOB_NAME is one of these (space-separated, matched
+# whole) or that carries a PULL_NUMBER -- the presubmit is admitted by the
+# second on a pull request and by the first on a Tide batch, the periodic and
+# the nightly only by the first -- and refuses it on any other Prow run, so
+# the flag leaking into the today nightly's or a postsubmit's environment
+# still stops the deploy at second zero. The names are the jobs' own in
+# oss-test-infra (prow/prowjobs/gke-labs/kube-agents/); a rename there is a
+# one-line edit here. hack/ci-eval-pr.sh keeps such a run out of the baseline
+# recorder on the flag alone, so admitting a job here never lets it write
+# main's window.
+readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test-next ci-kube-agents-eval-next ci-kube-agents-eval-nightly-next-claude"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly AGENT_CONTAINER_NAME="platform-agent"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
@@ -698,16 +700,16 @@ else
 fi
 
 # The mode flip exists for the next lane's runs: a pull request's, or one of
-# the jobs EVAL_MODE_NEXT_JOB_NAMES lists (its periodic on main). A flagged
-# run appends nothing to main's baseline and publishes no dashboard
+# the jobs EVAL_MODE_NEXT_JOB_NAMES lists (its periodic and nightly on main).
+# A flagged run appends nothing to main's baseline and publishes no dashboard
 # (hack/ci-eval-pr.sh keeps it out of both on the flag alone; bench-gate
 # separately refuses a pull request's sample, bench/baselines/README.md), so
-# what the flag mis-set on a job that is not the lane's -- the nightly, a
-# postsubmit -- would do is run that job in next mode and leave main's window
-# and dashboard silently missing it, its verdict measuring the wrong stack.
-# Keyed on the job's name rather than on PULL_NUMBER, so the periodic is
-# admitted by being named and every other Prow run without a pull request is
-# still refused.
+# what the flag mis-set on a job that is not the lane's -- the today nightly,
+# a postsubmit -- would do is run that job in next mode and leave main's
+# window and dashboard silently missing it, its verdict measuring the wrong
+# stack. Keyed on the job's name rather than on PULL_NUMBER, so the lane's
+# scheduled jobs are admitted by being named and every other Prow run without
+# a pull request is still refused.
 if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${IS_PROW_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then
   # One whole-string comparison per listed name, not a pattern over the
   # joined list: a substring match on the space-padded list would also admit
