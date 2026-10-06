@@ -477,6 +477,12 @@ def test_an_answer_by_anything_but_click_is_an_authoring_error() -> None:
         card_wake.parse(PROMPT + "answer_by: typing\n")
 
 
+@pytest.mark.parametrize("line", ["Answer_by: click", "answer-by: click", "answer by click"])
+def test_a_line_that_is_not_a_field_is_an_authoring_error(line: str) -> None:
+    with pytest.raises(ValueError, match="is not one of"):
+        card_wake.parse(PROMPT + line + "\n")
+
+
 def test_an_empty_answer_by_is_an_authoring_error() -> None:
     with pytest.raises(ValueError, match="answer_by"):
         card_wake.parse(PROMPT + "answer_by:\n")
@@ -501,6 +507,19 @@ def test_a_click_plant_builds_the_turn_the_images_button_sends(hermes_root: Path
     assert planted.card in planted.click
     assert planted.answer(card_wake.parse(CLICK_PROMPT)) == planted.click
     assert planted.answer(card_wake.parse(PROMPT)) == "seeded-b"
+
+
+@needs_moments
+@pytest.mark.skipif(not CLICKS.exists(), reason="main has no deploy/docker/patches/slack_ux_clicks.py")
+@pytest.mark.parametrize("option", ["[seeded-b](https://example.com/b)", "`seeded-b`", "**seeded-b**"])
+def test_a_click_plant_presses_a_marked_up_option_by_the_label_its_button_shows(
+    hermes_root: Path, tmp_path: Path, option: str
+) -> None:
+    prompt = CLICK_PROMPT.replace("| seeded-b", f"| {option}").replace("answer: seeded-b", f"answer: {option}")
+
+    planted = _plant(_shell_for(_with_clicks(hermes_root), tmp_path, prompt), prompt)
+
+    assert planted.click is not None and planted.click.startswith("seeded-b")
 
 
 @needs_moments

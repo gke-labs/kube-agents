@@ -133,7 +133,7 @@ __all__ = [
 # First lines of the two replay prompts. The ``key: value`` lines under each
 # are its fields (:data:`_QUESTION_FIELDS` with the optional
 # :data:`SESSION_FIELD` and :data:`ANSWER_BY_FIELD`, :data:`_FAILURE_FIELDS`);
-# anything else is ignored.
+# blank lines are skipped, and any other line is an authoring error.
 QUESTION_DIRECTIVE = "[bench:slack-question-wake]"
 FAILURE_DIRECTIVE = "[bench:card-failure-wake]"
 _QUESTION_FIELDS = ("title", "question", "options", "answer")
@@ -295,11 +295,14 @@ try:
                 # question as buttons, unless it only asks whether to go on.
                 raise RuntimeError("the question for card %s shows no buttons; its options are not ones "
                                    "slack_moments renders as buttons, so the case cannot click" % card)
-            buttons = [e for e in shown if clicks._shown_text(e) == CLICK]
+            # The option as its button shows it: a link's label, without code or bold markup.
+            render = moments._moments
+            label = render._unmarked(render._presenter.MD_LINK.sub(r"\1", CLICK)) if render else CLICK
+            buttons = [e for e in shown if clicks._shown_text(e) == label]
             if not buttons:
-                raise RuntimeError("the question for card %s has no %r button" % (card, CLICK))
+                raise RuntimeError("the question for card %s has no %r button" % (card, label))
             message = {"ts": STUB_TS, "text": post.get("text") or "", "blocks": blocks}
-            turn = clicks._turn(CLICK, buttons[0].get("value"), message)
+            turn = clicks._turn(label, buttons[0].get("value"), message)
             out["click"] = clicks._turn_text(turn, moments.question_card(CHANNEL, STUB_TS) or "")
     else:
         sub = {"task_id": card, "platform": "api_server", "chat_id": CHANNEL, "thread_id": "",
@@ -524,17 +527,22 @@ def _fields(lines: list[str], names: tuple[str, ...]) -> dict[str, str]:
     fields: dict[str, str] = {}
     for line in lines:
         key, sep, value = line.partition(":")
-        if sep and key.strip() in names:
-            fields[key.strip()] = value.strip()
+        if not line.strip():
+            continue
+        if not sep or key.strip() not in names:
+            # A misspelt ``answer_by`` dropped here would run the typed path and grade green.
+            raise ValueError(f"replay prompt line {line.strip()!r} is not one of {', '.join(names)}")
+        fields[key.strip()] = value.strip()
     return fields
 
 
 def parse(prompt: str) -> Replay | Failure | None:
     """The replay ``prompt`` asks for, or ``None`` when it is an ordinary ask.
 
-    Raises :class:`ValueError` for a replay prompt missing a field, naming
-    an unknown outcome, or giving ``session`` or ``answer_by`` any value but
-    its one: that is a case authoring error, not a run.
+    Raises :class:`ValueError` for a replay prompt missing a field, carrying
+    a line that is not one, naming an unknown outcome, or giving ``session``
+    or ``answer_by`` any value but its one: that is a case authoring error,
+    not a run.
     """
     lines = prompt.strip().splitlines()
     directive = lines[0].strip() if lines else ""
