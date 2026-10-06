@@ -427,6 +427,74 @@ class A3TheA2ADoorIsDarkUnlessTheOperatorOpensIt(unittest.TestCase):
         )
 
 
+
+class A3TheA2ADoorsGoogleClassAssertsOnlyAVerifiedEmail(unittest.TestCase):
+    """A3 on the A2A door's developer class: the one door path that asserts a
+    principal outside the eval namespace, so the one that has to show where
+    the principal came from.
+
+    A bearer that is not the door's static token is checked with Google as an
+    access token issued for the install's client; the verified email is the
+    principal, and only if it is on the door's own allowlist. Three things
+    make that hold: the token is bound to the install's client and to a
+    verified email; the gateway admits only an id carrying the class's prefix
+    and on the allowlist; and the prefix is one no eval caller can spell, so
+    the static token's holder, who names their caller freely, cannot reach a
+    developer's tasks or conversations. A fourth keeps the roster honest: the
+    class has no map, and the gateway's default map is the chat one.
+    """
+
+    def test_A3_a_google_token_is_bound_to_the_install_client_and_a_verified_email(self) -> None:
+        body = h.go_function_body(h.text("a2a_door_google"), "verify")
+        self.assertRegex(
+            body,
+            r"string\(info\.Aud\) != v\.clientID && string\(info\.Azp\) != v\.clientID \{[^}]*return \"\"",
+            "a token issued for another OAuth client is no longer refused",
+        )
+        self.assertRegex(
+            body,
+            r'string\(info\.EmailVerified\) != "true" \{[^}]*return ""',
+            "a token without a verified email is no longer refused",
+        )
+
+    def test_A3_the_google_class_admits_only_a_prefixed_allowlisted_email(self) -> None:
+        body = h.go_function_body(h.text("a2a_door_google_identity"), "resolveA2AGooglePrincipal")
+        self.assertIn("strings.CutPrefix(authorID, a2aGoogleCallerPrefix)", body)
+        self.assertRegex(
+            body,
+            r'if !ok \|\| email == "" \{\s*return ""',
+            "an id without the class's prefix is no longer refused",
+        )
+        self.assertRegex(
+            body,
+            r'if !g\.a2aGoogleAllowed\[strings\.ToLower\(email\)\] \{\s*return ""',
+            "a verified email off the door's allowlist is no longer refused",
+        )
+
+    def test_A3_no_eval_caller_can_spell_a_google_caller(self) -> None:
+        found = re.search(r'\ba2aGoogleCallerPrefix\s*=\s*"([^"]*)"', h.text("a2a_door_google"))
+        self.assertIsNotNone(found, "a2aGoogleCallerPrefix is no longer a string constant in a2adoor_google.go")
+        prefix = found.group(1)
+        self.assertTrue(
+            prefix.startswith(":"),
+            f"a2aGoogleCallerPrefix is {prefix!r}: without the leading colon an eval caller "
+            "naming a context that carries the email spells a Google caller's conversation key",
+        )
+        caller_of = h.go_function_body(h.text("a2a_door_callers"), "callerOf")
+        self.assertRegex(
+            caller_of,
+            r'if strings\.Contains\(caller, ":"\) \{\s*return "",',
+            "an eval caller may now contain a colon, so it can spell a Google caller",
+        )
+
+    def test_A3_the_google_class_roster_does_not_resolve_through_the_chat_map(self) -> None:
+        body = h.go_function_body(h.text("a2a_door_roster"), "rosterResolver")
+        self.assertRegex(
+            body,
+            r"if backend == consoleBackend \|\| backend == a2aGoogleBackend \{\s*return func",
+            "the Google class's roster falls through to principalMapFor, whose default is the chat map",
+        )
+
 RBAC_GROUP = "rbac.authorization.k8s.io"
 
 # The ClusterRoles the operator is allowed to hold `bind` over, and why each is

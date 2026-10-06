@@ -1238,6 +1238,66 @@ Mutation(
         "naming a cloud identity is still honoured",
     ),
     Mutation(
+        "A3-a2a-google-token-any-client",
+        "a2a/gateway/a2adoor_google.go",
+        ("\tif string(info.Aud) != v.clientID && string(info.Azp) != v.clientID {",
+         "\tif false {"),
+        "test_A3_a_google_token_is_bound_to_the_install_client_and_a_verified_email",
+        "accept a Google access token issued for any OAuth client, so a token "
+        "a developer granted some other app signs them in here",
+    ),
+    Mutation(
+        "A3-a2a-google-email-unverified",
+        "a2a/gateway/a2adoor_google.go",
+        ('\tif string(info.EmailVerified) != "true" {', "\tif false {"),
+        "test_A3_a_google_token_is_bound_to_the_install_client_and_a_verified_email",
+        "accept a token whose email Google has not verified, so the principal "
+        "is an address its holder never proved they own",
+    ),
+    Mutation(
+        "A3-a2a-google-prefix-unchecked",
+        "a2a/gateway/gchat.go",
+        ('\tif !ok || email == "" {', '\tif email == "" {'),
+        "test_A3_the_google_class_admits_only_a_prefixed_allowlisted_email",
+        "resolve an id that did not come through the door's Google check, so "
+        "any author stamped with the class's backend is admitted on the "
+        "allowlist alone",
+    ),
+    Mutation(
+        "A3-a2a-google-allowlist-bypassed",
+        "a2a/gateway/gchat.go",
+        ("\tif !g.a2aGoogleAllowed[strings.ToLower(email)] {", "\tif false {"),
+        "test_A3_the_google_class_admits_only_a_prefixed_allowlisted_email",
+        "admit every Google-verified email, so anyone with a Google account "
+        "and the install's public client id signs in",
+    ),
+    Mutation(
+        "A3-a2a-google-prefix-spellable",
+        "a2a/gateway/a2adoor_google.go",
+        ('\ta2aGoogleCallerPrefix = ":google:"', '\ta2aGoogleCallerPrefix = "google:"'),
+        "test_A3_no_eval_caller_can_spell_a_google_caller",
+        "drop the leading colon, so an eval caller \"google\" naming the context "
+        "\"<email>:<ctx>\" spells a developer's conversation key with the "
+        "static token",
+    ),
+    Mutation(
+        "A3-a2a-eval-caller-colon-allowed",
+        "a2a/gateway/a2adoor.go",
+        ('\tif strings.Contains(caller, ":") {', "\tif false {"),
+        "test_A3_no_eval_caller_can_spell_a_google_caller",
+        "let an eval caller contain a colon, so the static token's holder can "
+        "name themselves \":google:<email>\" and read that developer's tasks",
+    ),
+    Mutation(
+        "A3-a2a-google-roster-chat-map",
+        "a2a/gateway/gateway.go",
+        ("\tif backend == consoleBackend || backend == a2aGoogleBackend {",
+         "\tif backend == consoleBackend {"),
+        "test_A3_the_google_class_roster_does_not_resolve_through_the_chat_map",
+        "send the Google class's roster through principalMapFor, whose default "
+        "is the chat map, so a door caller's id resolves as a chat identity",
+    ),
+    Mutation(
         "C1-session-fence-selector-drift",
         "a2a/gateway/spawn.go",
         ('\tsessionRole = "a2a-session"', '\tsessionRole = "a2a-worker"'),
