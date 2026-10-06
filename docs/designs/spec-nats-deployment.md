@@ -577,8 +577,13 @@ keyed on the agent's own ServiceAccount and carries the blackboard grants and no
 else. The bridge sidecar is **not** among them and cannot be, for the ServiceAccount
 reason in the status section above: it would key to the agent's entry. Nor is the
 gateway - also a static `nats.conf` user for now - and there is no audit exporter or
-janitor yet. The designed shape is one entry per
-`AgentProfile` rendered from the CR's bus grants, which arrives with the CRD.
+janitor yet. **Amended 10/6:** the `AgentProfile` CRD adds two kinds of entry. The
+operator has one for itself, keyed on the manager's own ServiceAccount: publish on
+`a2a.agents.*` and direct-get on the directory, for the agent cards, and nothing else. Each
+profile gets one narrowed entry, `narrowing: "profile"`, carrying the profile's name and topic
+grants and no subjects. The callout derives that profile pod's task subjects from the
+profile, and its consumer names and inbox from the attested pod name (see the subagent
+profiles spec for why a static entry cannot work there).
 
 The session entry is a different kind of entry and the difference is load-bearing. Every
 session pod runs as one shared ServiceAccount, so the ServiceAccount alone cannot tell two

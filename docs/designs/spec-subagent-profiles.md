@@ -2,7 +2,10 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** draft, for review
+- **Status:** stage 3 in progress. Built: the `AgentProfile` CRD and what the operator renders
+  from one (the ServiceAccount, the callout identity, the agent card). Not built: the
+  dispatcher and janitor, the cluster-agent profile, and the gateway reading the `chat`
+  profile.
 - **Companions:** the A2A payload spec (`spec-a2a-payloads.md`) - envelope, subjects, task
   lifecycle; the NATS deployment spec (`spec-nats-deployment.md`) - streams, accounts,
   connection-time authz
@@ -90,6 +93,12 @@ One deliberate non-decision: there is no separate template/instance split, no
 per-cluster case is the reconciler stamping out one CR per cluster, exactly as it stamps
 out profile directories today. The scaffolder is the template engine. We don't need a
 second one.
+
+"Profile" means two things in this tree, so to be plain about it: the CRD is the A2A side's
+profile. The Hermes side's profile model (the platform and cluster templates the platform
+agent scaffolds, the config overlay, `AgentPlugin.spec.targetProfile`) is a different thing
+with the same name. The CRD does not absorb it. Both stay as they are until the Hermes-side
+model is retired.
 
 Relationship to the architecture set: `docs/architecture/06-api-and-data-contracts.md`
 defines `kind: Agent` and 08 reconciles it into one isolated pod per agent.
@@ -236,7 +245,10 @@ posture: non-root, scratch on an emptyDir, no secrets. Two deltas from the demo:
   still nil for the default profile (a KSA with no RoleBindings has a name and nothing
   else). Automount stays off; the projected volume is explicit.
 
-Env is minimal: `TASK_ID`, `PROFILE`, `NATS_URL`, and `A2A_ORIGIN_SEQ`. Everything else -
+Env is minimal: `TASK_ID`, `PROFILE`, `NATS_URL`, and `A2A_ORIGIN_SEQ`, plus the two the
+adapter needs under a pod-bound token: `A2A_POD_NAME` from the downward API, and
+`A2A_PROFILE_EXECUTOR=true`, which tells the adapter it is a profile pod rather than a
+session pod that lost its session name. Everything else -
 prompt, correlation, context - is in the task message, which the adapter fetches by the
 stream sequence `A2A_ORIGIN_SEQ` names rather than by scanning the subject. The spawner
 knows that sequence because it publishes the submission before it spawns the pod, and the
@@ -265,6 +277,30 @@ stale card routing traffic to a profile that no longer exists. The chat
 front door's roster becomes a read of the directory stream instead of a listing of
 profile directories. Same information, but it exists whether or not any worker is
 running.
+
+What the operator renders per profile, as built (amended 10/6):
+
+- The ServiceAccount: `agentprofile-<profile>`, owned by the CR, token automount off, no
+  RoleBinding anywhere. A profile that names its own in `identity.serviceAccountName` gets
+  none created. A profile may not name a ServiceAccount the operator already uses for
+  something else (the agent's, the session pods', the callout's, and so on) or `default`.
+  Those are refused with a condition, and the profile renders nothing.
+- The callout identity: one entry per profile in the PlatformAgent's identity map. A static
+  entry cannot work here. Every pod of a profile publishes as the profile, but two of them
+  running at once need their own consumers and inboxes, and a shared consumer name or a
+  wildcard one is worse than either. So the entry narrows on `profile`. It carries the
+  profile name and its topic grants, never subjects, and the callout derives the task subjects
+  from the profile and the consumer names and inbox from the attested pod name, the same way
+  it already does for session pods. A refused profile is left out of the map rather than
+  failing it for everyone.
+- The card: the operator is a bus principal for this and nothing else. Its entry publishes on
+  `a2a.agents.*` and direct-gets the directory, so reconcile can tell a missing or stale card
+  from a current one. The grant is a wildcard over the profile token because callout grants are
+  fixed for the life of a connection, and a profile created later still has to be publishable.
+
+The CR binds to the PlatformAgent in its namespace. The field table has no agentRef, and with
+two agents in one namespace (only possible with the singleton webhook off) a profile renders
+nothing. The name `platform` is reserved: it is the Hermes bridge's addressee.
 
 Spawn latency is the demo's: roughly 5-10 seconds to first streamed output with a warm
 node and pre-pulled image. Fine for delegated tasks, which today sit in a 5-second

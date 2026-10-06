@@ -28,6 +28,7 @@ Custom resources in the `kubeagents.x-k8s.io/v1alpha1` API group:
 
 - **`PlatformAgent`** — declares a Platform Agent instance, container image, service account, chat integrations, and harness toggles.
 - **`AgentPlugin`** — declares OCI plugin extensions, secret environment variables, and allowed configuration overrides targeted to a `PlatformAgent`.
+- **`AgentProfile`** — under `spec.mode: next` only, declares one kind of A2A agent pod; the operator renders its ServiceAccount, bus identity and agent card. See [AgentProfile CRD](/kube-agents/operator/agentprofile-crd/).
 
 The controller reconciles a `PlatformAgent` into:
 
