@@ -5837,7 +5837,12 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
         # fleet-wide one reaches every cluster.
         scoped = dict(declaration, **{audit_report.DECLARATION_CLUSTER_FIELD: "prod-eu-west"})
         fresh = audit_report.validate_findings(make_doc(findings=[self._sa_finding("worker", "Deployment/worker")], audit=AUDIT), AUDIT)
-        self.assertEqual(audit_report.shield_declared_account_siblings(fresh, [scoped]), [])
+        with contextlib.redirect_stderr(io.StringIO()):
+            elsewhere = audit_report.shield_declared_account_siblings(fresh, [scoped])
+        # Nothing here is demoted; the declaration's own id on its own cluster
+        # is still reported as shielded, for a pull request that covers it.
+        self.assertEqual(fresh["findings"][0]["remediation"]["kind"], "manifest")
+        self.assertEqual(elsewhere, [audit_report.published_id({"check": "default-sa-automount", "cluster": "prod-eu-west", "namespace": "payments", "object": "Deployment/api"})])
         # One declared workload named once, whichever source it came from and
         # however each spelled it: the worker's `deployment/api` and the
         # owner's `Deployment/api` are one workload to the join.
@@ -16613,6 +16618,31 @@ class TestFinishManifestFlag(HarnessTestCase):
         ledger = " ".join(self.harness.bodies_for("issue-*"))
         self.assertIn("except the one the compliance shield forbids", ledger)
         self.assertIn("except the compliance shield's (1)", self.err)
+
+    def test_a_partial_run_closes_the_pull_request_when_the_declared_workloads_cluster_is_the_gap(self):
+        # The run skipped the very cluster the declared workload lives on, so
+        # nothing about it can be in the document or the manifest. The scoped
+        # declaration start filed names the cluster itself, and that is enough.
+        path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
+        api = make_finding(fid="api", check="default-sa-automount", obj="Deployment/api", title="api", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        previous_body = published_body(make_doc(findings=[api], audit=AUDIT), generated_at=NOW)
+        self.declaring_replies(previous_body)
+        api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
+        self.harness.replies["proposal-list"] = proposals_view(
+            [pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([api_id]))]
+        )
+        self.touch(path)
+        pathlib.Path(audit_report.declarations_path_for(AUDIT)).parent.mkdir(parents=True, exist_ok=True)
+        audit_report.write_declarations(AUDIT, "acme/fleet", [{"check": "default-sa-automount", audit_report.DECLARATION_CLUSTER_FIELD: "prod-us-east", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}])
+        doc = make_doc(findings=[], audit=AUDIT, clusters=[{"name": "stage-eu", "location": "europe-west1", "project": "acme-stage"}], skipped=[{"cluster": "prod-us-east", "reason": "control plane unreachable"}])
+        manifest = _full_manifest(names=("stage-eu",), audit=AUDIT)
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertTrue(payload["partial"])
+        self.assertEqual(payload["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
+        comment = " ".join(self.harness.bodies_for("proposal-*"))
+        self.assertIn("declared to need the `default` ServiceAccount's token", comment)
 
     def test_a_worker_cannot_mark_a_sibling_shielded_from_the_document(self):
         # Same pull request, no declaration anywhere: a document that carries

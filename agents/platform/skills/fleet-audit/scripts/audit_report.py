@@ -905,7 +905,7 @@ SHARED_ACCOUNT_WORKLOAD_KINDS = frozenset({"deployment", "statefulset", "daemons
 SHARED_ACCOUNT_STALE_REASON = (
     "Closing unmerged: a workload in this namespace is now declared to need the `default` "
     "ServiceAccount's token, so the shared-account fix this pull request proposes would remove "
-    "it; the remaining findings are manual, per pod spec."
+    "it; the remaining findings are fixed per pod spec, not on the account."
 )
 SHARED_ACCOUNT_STALE_RESOLUTION = (
     "The finding has not gone: it stays on the ledger, and while the declaration stands the "
@@ -5549,12 +5549,25 @@ def shield_declared_account_siblings(
             )
     # Every declared 2.7 workload counts as shielded too: a pull request that
     # covers only declared workloads proposes the fix the declaration forbids,
-    # and on a partial run nothing else would close it.
+    # and on a partial run nothing else would close it. `declared[]` carries
+    # what this run could read; a scoped declaration `start` filed names its
+    # cluster itself, so it counts even when that cluster is the run's gap.
     for entry in data.get("declared") or []:
         if str(entry.get("check", "")) == SHARED_ACCOUNT_CHECK:
             fid = published_id(entry)
             if fid not in changed:
                 changed.append(fid)
+    for entry in declarations or []:
+        if _id_segment(str(entry.get("check", ""))) != _id_segment(SHARED_ACCOUNT_CHECK):
+            continue
+        cluster = str(entry.get(DECLARATION_CLUSTER_FIELD, "") or "")
+        if not cluster or _object_kind_segment(str(entry.get("object", ""))) not in SHARED_ACCOUNT_WORKLOAD_KINDS:
+            continue
+        fid = published_id(
+            {"check": SHARED_ACCOUNT_CHECK, "cluster": cluster, "namespace": str(entry.get("namespace") or ""), "object": str(entry.get("object", ""))}
+        )
+        if fid not in changed:
+            changed.append(fid)
     return changed
 
 
