@@ -778,7 +778,9 @@ class Run:
         try:
             if self.fleet_tree is None:
                 self.fleet_tree = git_output(["rev-parse", "HEAD:%s" % FLEET_SUBDIR])
-            git_output(["fetch", "--quiet", "--depth=1", remote, branch])
+            # No --depth: a depth-limited fetch marks a full clone shallow,
+            # and a hand run with this flag uses the operator's own checkout.
+            git_output(["fetch", "--quiet", remote, branch])
             current = git_output(["rev-parse", "FETCH_HEAD:%s" % FLEET_SUBDIR])
         except ReconcileError as exc:
             # Not knowing is not the same as having moved: the run goes on

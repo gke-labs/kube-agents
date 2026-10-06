@@ -1402,7 +1402,8 @@ class MainMovedTest(unittest.TestCase):
         self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
         self.assertEqual(outcomes[P8][0], reconcile.OUTCOME_NOT_REACHED)
         self.assertIn("tree-bbb", outcomes[P8][1])
-        self.assertIn(["fetch", "--quiet", "--depth=1", "origin", "main"], git.calls)
+        self.assertIn(["fetch", "--quiet", "origin", "main"], git.calls)
+        self.assertFalse(any("--depth" in arg for call in git.calls for arg in call), "a depth-limited fetch would mark a full clone shallow")
         self.assertEqual(boskos.acquired, [P7])
 
     def test_a_fetch_that_fails_is_a_warning_not_a_stop(self):
