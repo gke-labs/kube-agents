@@ -9,7 +9,7 @@ Cloud Console — with a tier of **read-only AI agents** that operate infrastruc
 changes through GitOps**, never by mutating it directly. Three personas map onto the Kubernetes
 containment hierarchy:
 
-- **Platform Agent** — one per project.
+- **Platform Agent** — one per install, over a scope of one or more projects.
 - **Cluster Admin Agent** — one per cluster.
 - **Developer Team Agent** — one per namespace.
 

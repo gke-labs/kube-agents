@@ -2823,6 +2823,62 @@ def test_pr_pass_reads_the_pull_request_this_run_opened(token, github):
     ]
 
 
+_DECLARATION = "clusters/fa2-seeded-a/seeded-reliability/checkout-gateway.yaml"
+_KEPT = ["clusters/*seeded-a/seeded-reliability/checkout-gateway.yaml"]
+
+
+def _pr_files_route(github, *entries) -> None:
+    github.routes[f"{_pr_api('pulls')}/files?per_page=100&page=1"] = (200, list(entries))
+
+
+def test_a_pull_request_that_rewrites_a_kept_path_is_a_fail(token, github):
+    """A budget written over the Deployment's own file changes one file and
+    passes every other clause; `unchanged_paths` is what catches it."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    _pr_files_route(github, {"filename": _DECLARATION, "status": "modified"})
+    res = _pr_check(unchanged_paths=_KEPT).verify(5.0)
+    assert res.status == "fail"
+    assert _DECLARATION in res.reason and "unchanged_paths" in res.reason
+    # Without the option the same pull request passes, which is the gap.
+    assert _pr_check().verify(5.0).status == "pass"
+
+
+def test_a_pull_request_beside_the_kept_path_passes(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    _pr_files_route(
+        github,
+        {"filename": "clusters/fa2-seeded-a/seeded-reliability/checkout-gateway-pdb.yaml", "status": "added"},
+    )
+    res = _pr_check(unchanged_paths=_KEPT).verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_a_rename_away_from_a_kept_path_is_a_change_to_it(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    _pr_files_route(
+        github,
+        {"filename": "clusters/seeded-a/seeded-reliability/moved.yaml", "previous_filename":
+         "clusters/seeded-a/seeded-reliability/checkout-gateway.yaml", "status": "renamed"},
+    )
+    assert _pr_check(unchanged_paths=_KEPT).verify(5.0).status == "fail"
+
+
+def test_files_the_credential_cannot_read_are_unevaluable_not_a_pass(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    github.routes[f"{_pr_api('pulls')}/files?per_page=100&page=1"] = (403, {"message": "denied"})
+    res = _pr_check(unchanged_paths=_KEPT).verify(5.0)
+    assert res.status == "error"
+    assert "pull_requests: read" in res.reason
+
+
 def test_a_previous_reps_pull_request_is_a_fail(token, github):
     """The defect this check exists for (#1755). The pool sweep runs between
     leases, not between reps, so rep 1's pull request is still there for rep 2
@@ -4175,10 +4231,38 @@ def test_reply_is_silent_without_a_transcript_is_an_error():
     assert ReplyIsSilentVerifier(type="reply_is_silent").verify(5).status == "error"
 
 
+def _settled_with(answer_reply=None):
+    args = {"card": "t_1"} if answer_reply is None else {"card": "t_1", "answer_reply": answer_reply}
+    return [{"name": "card_wake_settled", "args": args, "result": None, "status": "harness"}]
+
+
+def test_reply_is_silent_on_the_answer_grades_the_answer_turns_reply():
+    check = ReplyIsSilentVerifier(type="reply_is_silent", reply="answer")
+    transcript.set("[SILENT]", _settled_with("Unblocked it."), final_message="[SILENT]")
+    res = check.verify(5)
+    assert not res.success and res.status != "error" and "Unblocked it." in res.reason
+    transcript.set("Unblocked it.", _settled_with("[SILENT]"), final_message="Unblocked it.")
+    assert check.verify(5).success
+
+
+def test_reply_is_silent_on_the_answer_without_one_is_an_error():
+    check = ReplyIsSilentVerifier(type="reply_is_silent", reply="answer")
+    for trajectory in ([], _settled_with()):
+        transcript.set("[SILENT]", trajectory, final_message="[SILENT]")
+        assert check.verify(5).status == "error"
+
+
 def test_the_question_wake_case_grades_silence_with_the_gateway_predicate():
     spec = yaml.safe_load((TASKS / "chat-question-wake-stays-silent" / "task.yaml").read_text())
     entries = [e for e in spec["verification_spec"] if e["name"] == "the-wake-reply-is-silent"]
     assert [e["check"] for e in entries] == [{"type": "reply_is_silent"}]
+
+
+def test_the_click_case_grades_the_answer_turns_reply_and_the_wakes():
+    spec = yaml.safe_load((TASKS / "chat-question-click-answer-stays-silent" / "task.yaml").read_text())
+    checks = {e["name"]: e["check"] for e in spec["verification_spec"]}
+    assert checks["the-click-reply-is-silent"] == {"type": "reply_is_silent", "reply": "answer"}
+    assert checks["the-wake-reply-is-silent"] == {"type": "reply_is_silent"}
 
 
 _RETRY_CASE = TASKS / "chat-voice-retry-says-it-is-retried" / "task.yaml"

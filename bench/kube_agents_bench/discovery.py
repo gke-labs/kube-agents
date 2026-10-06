@@ -17,8 +17,9 @@
 The sweep card is filed by the ``bootstrap-inventory-scan`` cron job, not by
 the conversation a case drives, so nothing in the transcript names it. What
 it did is on the agent's data volume: the card id in
-``.bootstrap_scan_filed``, the cards its worker filed in the board's
-``kanban_worker_children``, and the Cluster Agent roster under ``profiles/``.
+``.bootstrap_scan_filed``, the cluster cards the gate filed for it (keyed
+``bootstrap-inventory-cluster-*`` and created at or after it), and the
+Cluster Agent roster under ``profiles/``.
 This module reads all three in one ``kubectl exec``, the way
 :mod:`kube_agents_bench.board` reads card statuses.
 
@@ -61,7 +62,7 @@ READY_FILES = ("profile.yaml", "USER.md")
 # file, sentinel, scan marker, key prefix, the comma-joined ready files, then
 # the reserved profile names.
 _IN_POD_SCRIPT = r"""
-import json, os, sqlite3, sys
+import json, os, re, sqlite3, sys
 
 ROOT, BOARD, SENTINEL, MARKER, PREFIX, READY = sys.argv[1:7]
 RESERVED = set(sys.argv[7:])
@@ -78,10 +79,10 @@ def fail(message):
 
 try:
     with open(os.path.join(ROOT, MARKER)) as fh:
-        marker = dict(line.strip().split("=", 1) for line in fh if "=" in line)
+        ids = [m.group(1) for m in (re.search(r"(?:^|\s)task_id\s*=\s*(\S+)", line) for line in fh) if m]
 except OSError as exc:
     fail("no discovery sweep has been filed: %s" % exc)
-sweep_id = marker.get("task_id", "")
+sweep_id = ids[0] if ids else ""
 if not sweep_id:
     fail("%s names no task_id" % MARKER)
 
@@ -111,18 +112,17 @@ for name in names:
 
 try:
     conn = sqlite3.connect("file:%s/%s?mode=ro" % (ROOT, BOARD), uri=True, timeout=SQLITE_BUSY_TIMEOUT)
-    row = conn.execute("SELECT id, status FROM tasks WHERE id = ?", (sweep_id,)).fetchone()
+    row = conn.execute("SELECT id, status, created_at FROM tasks WHERE id = ?", (sweep_id,)).fetchone()
     if row is None:
         fail("the sweep card %s named by %s is not on the board" % (sweep_id, MARKER))
     out["sweep"] = {"id": row[0], "status": row[1]}
-    # The board creates kanban_worker_children when a worker first files a card.
-    rows = []
-    if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'kanban_worker_children'").fetchone():
-        rows = conn.execute(
-            "SELECT t.id, t.assignee, t.idempotency_key, t.status FROM kanban_worker_children w "
-            "JOIN tasks t ON t.id = w.child_id WHERE w.creator_id = ? ORDER BY w.created_at, t.id",
-            (sweep_id,),
-        ).fetchall()
+    # The gate files the cluster cards, so they are found by key and time, not
+    # by which worker created them.
+    rows = conn.execute(
+        "SELECT id, assignee, idempotency_key, status FROM tasks WHERE substr(idempotency_key, 1, ?) = ? "
+        "AND created_at >= ? ORDER BY created_at, id",
+        (len(PREFIX), PREFIX, row[2]),
+    ).fetchall()
     for tid, assignee, key, status in rows:
         parents = [p for (p,) in conn.execute("SELECT parent_id FROM task_links WHERE child_id = ?", (tid,))]
         out["children"].append(
@@ -158,7 +158,7 @@ def command() -> str:
 
 
 def read_fanout(shell: Callable[[str, float], str], timeout: float) -> tuple[dict[str, Any] | None, str]:
-    """The sweep, its worker's children and the roster, or ``None`` and why not.
+    """The sweep, the cluster cards filed for it and the roster, or ``None`` and why not.
 
     ``shell`` is ``harness._agent_shell``, a parameter so the tests can run the
     script locally.

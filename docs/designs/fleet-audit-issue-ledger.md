@@ -117,11 +117,13 @@ collide), based on `main`, linked to the ledger issue with `Part of #<issue>`.
 
 Recorded with rationale so a later reader does not re-litigate them.
 
-### 3.1 Gating — hybrid: auto for critical manifests, pull-based for everything else
+### 3.1 Gating — hybrid: auto above a severity floor, pull-based for everything else
 
 A remediation PR opens automatically **iff** the finding satisfies all of:
 
-1. `severity == "critical"`, and
+1. `severity` ranks at or above `UNVOUCHED_PROMOTION_FLOOR` (`critical`), or at or above
+   `AUTO_PROMOTION_FLOOR` (`major`) on a check in `MAJOR_SWEEP_CHECKS` whose collector candidate is
+   graded that high too, and
 2. `remediation.kind == "manifest"`, and
 3. there is no **live** pull request on its branch, and
 4. on a run that passed `--manifest-file`, the collector neither declined to flag it nor marked its
@@ -131,7 +133,33 @@ Every other finding stays prose in the ledger until a human asks for it. Rationa
 findings that have a mergeable diff should arrive ready to merge; the long tail must not turn six
 streams into a notification firehose. At most five auto-promotions per run (§13 Q4); the surplus is
 named in the ledger, in the same section that names what a collector manifest withholds from the
-sweep ([collector design §3.4](fleet-audit-collector-manifest.md)).
+sweep ([collector design §3.4](fleet-audit-collector-manifest.md)). A finding the floor
+passes over is named there too, as below the floor, up to twenty a block and a count of the rest
+(`MAX_WITHHELD_ROWS`); `/remediate` reaches it, because an explicit request is not held to the
+floor.
+
+**Condition 1 is a rank comparison, not an equality**, and the distinction only shows up once the
+floor moves off the top severity: an `==` test would file every `critical` under "below the floor"
+the moment the floor became `major`, silently switching off the promotions that matter most. A
+severity the harness does not recognise ranks below every real one.
+
+The floor was `critical`, which selected almost nothing on a real fleet — the `critical` findings
+were exposure problems closed with `gcloud`, and the ones attracting a declarative fix were graded
+`major` and `minor`, so the two conditions were nearly disjoint and the sweep opened nothing while
+the ledger showed twenty-six manifest remediations waiting. Lowering it to `major` across the
+board was tried and does not hold: a SOP grades how bad a finding is, not whether its fix is safe to
+open unasked, and the `major` manifests include a memory limit, a rollout strategy, a CronJob
+concurrency policy, Binary Authorization enforcement and release-channel enrolment — each a change
+its owner has to choose. Marking those one at a time with `needs_triage` is a denylist that every
+new check has to remember to join.
+
+So `major` is an allowlist. `MAJOR_SWEEP_CHECKS` names the checks whose fix is additive and reads
+whole in one screen — a PodDisruptionBudget, turning off a token for a ServiceAccount nothing has
+granted, an On-Demand fallback at the bottom of a ComputeClass — and only those open at `major`.
+The collector has to stand behind the grade: its candidate must exist, so a `needs_triage` marker
+could have been set on it, and must itself be at least `major`, so the model's re-grade of a `minor`
+candidate does not decide that a pull request opens. Everything else is held to `critical`. `minor`
+stays below both floors — defence-in-depth work a reader may reasonably never ask for.
 
 "Live" rather than "in any state" is condition 3's whole point, and the distinction is between two
 kinds of closed PR. One the harness closed itself as stale carries the `audit:stale-closed` label,
@@ -254,8 +282,8 @@ supplies the finding — and says nothing rather than print an empty code fence.
 Accepted risk: this can close a PR a human was mid-review on. Mitigations, all three required:
 
 - The closing comment states plainly that the PR may be reopened, and says **exactly** what happens
-  if the finding returns: a `critical` manifest finding is re-proposed automatically on this same
-  branch, at most five per run, and anything else is listed on the ledger as awaiting
+  if the finding returns: a manifest finding graded at or above the auto-promotion floor is normally
+  re-proposed automatically on this same branch, at most five per run, and anything else is listed on the ledger as awaiting
   `/remediate <finding-id>`. The comment is not allowed to promise a fresh pull request to every
   reader, because auto-promotion does not open one for every reader — and the findings it silently
   would not re-propose are precisely the low-severity ones nobody is watching for.
@@ -302,7 +330,7 @@ The ledger renders each finding in exactly one state. Transitions are computed p
 | -------------------- | ----------------------------------------------------- | ------------------------------------- | ------------------------------------------------------- |
 | `open`               | reproduces; no PR on its branch                       | `open`                                | none, unless it qualifies for auto-promotion            |
 | `pr-open`            | reproduces; branch has an open PR                     | `fix proposed` + link                 | **labels re-asserted** — the PR itself is untouched     |
-| `pr-merged-persists` | reproduces; branch PR is merged                       | `⚠ fix merged, still reproduces`      | comment once on the merged PR; never reopen it          |
+| `pr-merged-persists` | reproduces; branch PR is merged                       | `⚠ fix merged, still reproduces`     | comment once on the merged PR; never reopen it          |
 | `refused`            | reproduces; branch PR closed unmerged by a **person** | `fix refused` + link                  | none — the close stands until someone says `/remediate` |
 | `withdrawn`          | reproduces; branch PR closed unmerged by the harness  | `fix withdrawn, awaiting re-proposal` | eligible for promotion again, exactly as if it had none |
 | `resolved`           | no longer reproduces; PR open or absent               | not rendered — see below              | close any open PR (§3.3), keep the branch               |
@@ -338,8 +366,8 @@ Three of the rendered rows are easy to misread, and two of them were wrong in an
   the reader who believes it leaves alone the one case the harness is waiting to re-propose — a
   flapping finding would be fixable exactly once, and never again after its first quiet day. So a
   `withdrawn` finding is treated as having no pull request at all: auto-promotion picks it up on the
-  usual terms (`critical`, `manifest`, under the cap), and `/remediate` reaches it without the
-  after-the-close age test a `refused` finding imposes.
+  usual terms (at or above the floor, `manifest`, under the cap), and `/remediate` reaches it
+  without the after-the-close age test a `refused` finding imposes.
   A `refused` one is reachable only by `/remediate <id>` from someone with write access, and only by
   a command written _after_ the close — an older one is reported as `superseded` rather than
   honoured, because a comment nobody can edit away would otherwise re-open a human's close every
@@ -487,9 +515,9 @@ whose SOP runs a collector must pass one; on any other stream the steps below ar
 
 6. Otherwise → render and create-or-edit the ledger issue, apply the severity label, post the delta
    comment when the delta is non-empty.
-7. Auto-promote every eligible critical manifest finding (§3.1) — at most five per run, the surplus
-   named in the ledger as awaiting `/remediate` (§13 Q4) — and every authorised `/remediate` target,
-   which is uncapped, by invoking the same code path as `remediate`.
+7. Auto-promote every eligible manifest finding at or above the severity floor (§3.1) — at most
+   five per run, the surplus named in the ledger as awaiting `/remediate` (§13 Q4) — and every
+   authorised `/remediate` target, which is uncapped, by invoking the same code path as `remediate`.
 8. Close stale PRs (§3.3), unless partial, when only the shield's close is made; comment once on `pr-merged-persists` PRs; answer every
    `/remediate` exactly once, with an acknowledgement or a refusal. Each "once" guard reads the
    hidden markers of §3.1.
@@ -515,12 +543,12 @@ runs — otherwise the ledger reads its own replies back on the next run and ans
 
 Exit contract — the keys below on every line:
 
-- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
-- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
-- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
-- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":true,"coverage_gaps":["prod-eu-1: API server unreachable"],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
-- `{"status":"HELD","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":["cluster-admin-binding.prod-us-east._.clusterrolebinding-debug-binding"]}`
-- `{"status":"UPDATED","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":true,"declared":0,"postures_withheld":[],"unaccounted":[]}`
+- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_still_open":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
+- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_still_open":["…"],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_still_open":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_still_open":[],"prs_closed":[],"partial":true,"coverage_gaps":["prod-eu-1: API server unreachable"],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
+- `{"status":"HELD","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_still_open":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":["cluster-admin-binding.prod-us-east._.clusterrolebinding-debug-binding"]}`
+- `{"status":"UPDATED","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_still_open":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":true,"declared":0,"postures_withheld":[],"unaccounted":[]}`
 
 `postures_withheld` is the ids of the posture findings `finish` took out of the document because it
 recorded no complete declared-intent search (§7.4); empty on every other run.
@@ -562,6 +590,21 @@ error**. That finding degrades to `kind: manual`, keeps its evidence and recomme
 ledger that a fix was named but not written, and the report publishes. Killing a nine-critical
 security report because one of the nine manifests was not written is the wrong shape of failure: it
 throws away eight findings to punish one.
+
+The refusal below does not contradict that: it publishes nothing _yet_, and the worker that wrote
+the document is still there to answer it by writing the file or declining it with a reason, so no
+finding is thrown away. Outside a run `start` opened, nothing answers it, and the degrade stands.
+
+On a run `start` opened, `finish` refuses before that degrade can publish when a finding the sweep
+would open has no fix written: a promised file that is missing, or a `manual` remediation on a
+finding the collector clears for the `major` sweep whose candidate carries a `declaration`. It exits
+2 naming each, and keeps refusing until each is written or declined by name with a reason
+(`--decline-fix <id> <why>`); a declined fix publishes as `manual` with the reason on its row.
+Refusing once was not enough: a worker re-ran `finish` unchanged and the fix reached the ledger as
+`manual`, and refused for good it declined the fix with boilerplate. So a fix `finish` can derive
+it writes instead: a declared `no-pdb` finding gets the SOP's PodDisruptionBudget from the
+collector's `pod_selector`, in a new file beside the declaration; a decline of that budget stands
+only when its reason carries the URL of the pull request already carrying it. The SKILL's "Write every `manifest` remediation file" rule is the worker-facing statement.
 
 `remediate` degrades the same way, for the same reason at a smaller scale. A named target whose fix
 is not a readable file inside the clone is refused **by name** — logged, and returned in the
@@ -1133,9 +1176,12 @@ unchanged. As shipped it is **346**. New cases:
   labelled `agent:audit` + `audit:<id>`; zero findings with complete coverage and no ledger opens
   nothing.
 - Grouping: disjoint paths, two findings one path, transitive union across three findings.
-- Promotion eligibility: critical+manifest auto; critical+gcloud not; major+manifest only on request;
-  already-has-PR is a no-op in every state; the sixth eligible critical in a run is withheld and
-  named in the ledger, while six explicit `/remediate` targets all open.
+- Promotion eligibility: critical+manifest auto, and major+manifest auto only on a
+  `MAJOR_SWEEP_CHECKS` check an at-least-`major` candidate backs; critical+gcloud not;
+  minor+manifest only on request and named in the ledger as below the floor; the floor is compared
+  by rank, so lowering it never stops a `critical` promoting; already-has-PR is a no-op in every
+  state; the sixth eligible finding in a run is withheld and named in the ledger, while six explicit
+  `/remediate` targets all open.
 - Command parsing: `/remediate <id>`, `/remediate all`, unknown id, non-manifest id, the command
   appearing inside a fenced code block (must not match), and a command from an `authorAssociation`
   of `NONE` or `CONTRIBUTOR` (refused, replied to once).
@@ -1315,8 +1361,8 @@ and `agent:audit` is added to that skill's inviolable red line so the exclusion 
 rewrite of the query. It lands in Phase 1 (§10), so the exclusion is never absent while ledger issues
 exist.
 
-**Q4. Volume ceiling.** Hybrid gating bounds auto-opened PRs to critical manifest findings, but a
-genuinely bad fleet day could still open many at once. Consider a per-run cap with the withheld set
+**Q4. Volume ceiling.** Hybrid gating bounds auto-opened PRs to manifest findings at or above the
+severity floor, but a genuinely bad fleet day could still open many at once. Consider a per-run cap with the withheld set
 named in the ledger.
 
 _Resolved: auto-promotion is capped at five PRs per `finish` run._ Withheld findings are named in the

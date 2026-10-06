@@ -120,6 +120,9 @@ DEFAULT_CONTAINER = STORE_CONTAINERS[0]
 # the longest observed audit run is ~20 minutes, so an hour of slack flags
 # real silence without paging on a slow morning.
 STALE_SLACK = timedelta(hours=1)
+# How this CLI asks for more room, for the note under a table that dropped
+# columns to fit.
+WIDER_HINT = "--width for a wider table"
 # The zone the cron fields are read in when `--timezone` is not given: the
 # pod's own default, since the chart does not set TZ.
 DEFAULT_SCHEDULE_TIMEZONE = "UTC"
@@ -1003,7 +1006,7 @@ def render(
     out += ["", palette("STREAMS", "head")]
     out += render_table(
         COLUMNS, [entry["row"] for entry in shown], palette,
-        width if width else UNBOUNDED, box,
+        width if width else UNBOUNDED, box, wider_hint=WIDER_HINT,
     )
     # Rows, not streams: the note fires on hidden rows, and a stream on two
     # repositories can lose one of them to --stream or --flagged.
@@ -1041,6 +1044,7 @@ def render(
                     for label, _, (scope, text) in gaps
                 ],
                 palette, width if width else UNBOUNDED, box, separator="blank",
+                wider_hint=WIDER_HINT,
             )
         else:
             out.append(palette("  " + count + "; --gaps for the text", "yellow"))

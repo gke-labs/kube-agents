@@ -1152,7 +1152,7 @@ class RepositoryVerbTest(unittest.TestCase):
         forge = ProposingLocalForge(
             self.forges, self.refreshed, open_sources={"release-1.2"}, author="a-colleague"
         )
-        self.broker._transport = lambda _forge: SelfAware("kube-agents[bot]")
+        self.broker._transport = lambda _forge, _repo: SelfAware("kube-agents[bot]")
         with self.assertRaises(WorkspaceError) as caught:
             self._advance_onto(forge)
         self.assertEqual(caught.exception.fields.get("code"), "CLONED_BRANCH")
@@ -1170,7 +1170,7 @@ class RepositoryVerbTest(unittest.TestCase):
         forge = ProposingLocalForge(
             self.forges, self.refreshed, open_sources={"release-1.2"}, author="Kube-Agents"
         )
-        self.broker._transport = lambda _forge: SelfAware("kube-agents[bot]")
+        self.broker._transport = lambda _forge, _repo: SelfAware("kube-agents[bot]")
         made = self._advance_onto(forge)
         self.assertEqual(self.remote_tip("release-1.2"), made)
 
@@ -1200,7 +1200,7 @@ class RepositoryVerbTest(unittest.TestCase):
         forge = ProposingLocalForge(
             self.forges, self.refreshed, open_sources={"release-1.2"}, author="a-colleague"
         )
-        self.broker._transport = lambda _forge: Nameless()
+        self.broker._transport = lambda _forge, _repo: Nameless()
         made = self._advance_onto(forge)
         self.assertEqual(self.remote_tip("release-1.2"), made)
 
@@ -1217,7 +1217,7 @@ class RepositoryVerbTest(unittest.TestCase):
         forge = ProposingLocalForge(
             self.forges, self.refreshed, open_sources={"release-1.2"}, author="a-colleague"
         )
-        self.broker._transport = lambda _forge: LookupFailed()
+        self.broker._transport = lambda _forge, _repo: LookupFailed()
         with self.assertRaises(WorkspaceError) as caught:
             self._advance_onto(forge)
         self.assertEqual(caught.exception.fields.get("code"), "FORGE_CALL_FAILED")
@@ -1632,7 +1632,7 @@ class BranchVerbTest(unittest.TestCase):
         # Under the prefix, closed, tip carried -- and somebody else's.
         tip = self.push_branch(self.SPENT)
         self.closed(self.SPENT, tip, author="a-maintainer")
-        self.broker._transport = lambda _forge: SelfAware("kube-agents[bot]")
+        self.broker._transport = lambda _forge, _repo: SelfAware("kube-agents[bot]")
         self.assertEqual(self.refused(self.SPENT, tip), "BRANCH_NOT_OURS")
         self.assertTrue(self.exists(self.SPENT))
 
@@ -1644,7 +1644,7 @@ class BranchVerbTest(unittest.TestCase):
         tip = self.push_branch(self.SPENT)
         self.closed(self.SPENT, tip, author="a-maintainer")
         self.closed(self.SPENT, tip, author="kube-agents")
-        self.broker._transport = lambda _forge: SelfAware("kube-agents[bot]")
+        self.broker._transport = lambda _forge, _repo: SelfAware("kube-agents[bot]")
         self.assertEqual(self.refused(self.SPENT, tip), "BRANCH_NOT_OURS")
         self.assertTrue(self.exists(self.SPENT))
 
@@ -1655,7 +1655,7 @@ class BranchVerbTest(unittest.TestCase):
         for _ in range(vcs_broker.PROPOSAL_HISTORY_ON_A_BRANCH):
             self.closed(self.SPENT, tip, author="kube-agents")
         self.closed(self.SPENT, tip, author="a-maintainer")
-        self.broker._transport = lambda _forge: SelfAware("kube-agents[bot]")
+        self.broker._transport = lambda _forge, _repo: SelfAware("kube-agents[bot]")
         self.assertEqual(self.refused(self.SPENT, tip), "BRANCH_NOT_OURS")
         self.assertTrue(self.exists(self.SPENT))
 
@@ -1665,7 +1665,7 @@ class BranchVerbTest(unittest.TestCase):
         tip = self.push_branch(self.SPENT)
         for _ in range(10):
             self.closed(self.SPENT, tip, author="kube-agents")
-        self.broker._transport = lambda _forge: SelfAware("kube-agents[bot]")
+        self.broker._transport = lambda _forge, _repo: SelfAware("kube-agents[bot]")
         self.delete(self.SPENT, tip)
         self.assertFalse(self.exists(self.SPENT))
 
@@ -1673,7 +1673,7 @@ class BranchVerbTest(unittest.TestCase):
         tip = self.push_branch(self.SPENT)
         for _ in range(vcs_broker.PROPOSAL_HISTORY_ON_A_BRANCH):
             self.closed(self.SPENT, tip, author="kube-agents")
-        self.broker._transport = lambda _forge: SelfAware("kube-agents[bot]")
+        self.broker._transport = lambda _forge, _repo: SelfAware("kube-agents[bot]")
         with self.assertRaises(WorkspaceError) as caught:
             self.delete(self.SPENT, tip)
         self.assertEqual(caught.exception.fields.get("code"), "BRANCH_NOT_OURS")
@@ -1683,7 +1683,7 @@ class BranchVerbTest(unittest.TestCase):
     def test_delete_takes_the_installs_own_proposal_whatever_the_bot_marking(self):
         tip = self.push_branch(self.SPENT)
         self.closed(self.SPENT, tip, author="kube-agents")
-        self.broker._transport = lambda _forge: SelfAware("kube-agents[bot]")
+        self.broker._transport = lambda _forge, _repo: SelfAware("kube-agents[bot]")
         self.delete(self.SPENT, tip)
         self.assertFalse(self.exists(self.SPENT))
 
@@ -1696,7 +1696,7 @@ class BranchVerbTest(unittest.TestCase):
     def test_delete_refuses_when_who_the_credential_is_could_not_be_asked(self):
         tip = self.push_branch(self.SPENT)
         self.closed(self.SPENT, tip)
-        self.broker._transport = lambda _forge: LookupFailed()
+        self.broker._transport = lambda _forge, _repo: LookupFailed()
         self.assertEqual(self.refused(self.SPENT, tip), "FORGE_CALL_FAILED")
         self.assertTrue(self.exists(self.SPENT))
 

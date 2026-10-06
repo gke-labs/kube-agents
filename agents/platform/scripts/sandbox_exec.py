@@ -72,11 +72,11 @@ SANDBOX_PRINCIPAL = "hermes"
 # line rather than a second credential, and the separation the module docstring
 # describes is the only thing keeping them apart.
 #
-# Three writers pass it, all for the same reason: they have to write inside a
+# Four writers pass it, all for the same reason: they have to write inside a
 # tree that is `agent:agent` to the leaves, which uid 1001 cannot do.
 # `kanban_workspace_gc.py` unlinks scratch workspaces; `cluster_agent_profile.py`
 # writes one profile's kubeconfig; `bootstrap_delivery.py` renames the delivered
-# onboarding report. The alternative in any case — loosening the modes so a
+# onboarding report; `bootstrap_handoff.py` writes the raw onboarding report. The alternative in any case — loosening the modes so a
 # shared group could reach in — buys a wider grant than the narrower login does,
 # and leaves uid 1001 writing into a tree uid 1000 owns, which is a
 # symlink-follow waiting to happen.

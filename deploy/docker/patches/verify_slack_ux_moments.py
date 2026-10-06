@@ -137,7 +137,7 @@ async def _drive(module) -> None:
     if f"\n{module.QUESTION_CARD_NOTE.format(card=sub['task_id'])}\n" not in adapter.posts[0]["text"]:
         raise _fail("the question's text does not name its card")
     noted = module.wake_text(sub, [_Event(BLOCKED_ID, BLOCKED)], {BLOCKED}, WAKE)
-    if noted != f"{WAKE}\n\n{module.WAKE_NOTE}":
+    if noted != f"{WAKE}\n\n{module.WAKE_NOTE} {module.WAKE_NOTE_ANSWERED}":
         raise _fail("the wake for the posted question does not carry the note")
     if module.wake_text(sub, [_Event(BLOCKED_ID + 1, BLOCKED)], {BLOCKED}, WAKE) != WAKE:
         raise _fail("the wake for another blocked event carries the note")

@@ -277,8 +277,8 @@ the server. `session_kv_server.py` runs in the sandbox and binds
 `127.0.0.1:8699`; its callers are the event watcher and the drift detector in
 `agent-api-auth`, the Platform MCP server, the `incident_context` plugin, the
 gateway's kanban notifier, which keys a delivered triage report to the thread it
-went into, the chat adapter's scheduled-report relay, and the two findings
-scripts. Deliberately not stated as a total: the list has grown twice and a
+went into, the chat adapter's scheduled-report relay, the two findings
+scripts, and the `stall-watch` cron script. Deliberately not stated as a total: the list keeps growing and a
 count is the part that goes stale first. The key exists so
 that the server can reject a request that did not come from one of them, which
 means the server has to hold it. The salt is read by the Chat Agent plugins,

@@ -3,8 +3,10 @@
 # project id, and only while scoped_pool_enabled arms it. These cases pin the
 # key, the account id a project produces, the declared bound on the pool
 # (scoped_pool_max_accounts, which the plan holds the derived set to; it is
-# not a reading of the host project's quota), and that a selector's members
-# are pool members like an explicit project. The provider is mocked, so a plan here creates nothing.
+# not a reading of the host project's quota), that a selector's members are
+# pool members like an explicit project, and that a container's listed members
+# are pool members and nothing else. The provider is mocked, so a plan here
+# creates nothing.
 
 mock_provider "google" {}
 
@@ -142,12 +144,14 @@ run "a_selector_member_gets_an_account" {
   }
 }
 
-# A folder's or an organisation's members are not listed at plan time, so an
-# armed pool with a folder in scope creates members for the host project and
-# the explicit projects only: no member for the folder or anything under it.
-# This is the omission the design records as a follow-up and the broker
-# refuses on at runtime, when a project under the folder has no pool entry.
-run "a_folder_in_scope_adds_no_pool_member" {
+# A folder's or an organisation's members are listed at plan time while the
+# pool is armed (the composition hands the resolver's container_members in),
+# and each gets a pool account on that apply -- and nothing else: no
+# per-project binding, because the container-level grant is inherited, and no
+# place in the resolved-set count, because containers come last in the
+# reconcile's order and are not counted at plan. A project created under the
+# container since the last apply joins the pool on the next one.
+run "a_folders_listed_members_are_pool_members_and_nothing_else" {
   command = plan
 
   variables {
@@ -155,16 +159,197 @@ run "a_folder_in_scope_adds_no_pool_member" {
     scope = {
       projects      = ["team-alpha"]
       folders       = ["123456789012"]
-      organizations = []
+      organizations = ["987654321098"]
+    }
+    scope_container_members = {
+      "folders/123456789012"       = ["folder-proj1", "folder-proj2", "mgmt-project-1"]
+      "organizations/987654321098" = ["org-proj1", "folder-proj1"]
     }
   }
 
   assert {
-    condition     = toset(keys(google_service_account.scoped)) == toset(["mgmt-project-1", "team-alpha"])
+    condition     = toset(keys(google_service_account.scoped)) == toset(["mgmt-project-1", "team-alpha", "folder-proj1", "folder-proj2", "org-proj1"])
     error_message = "pool keys: ${jsonencode(keys(google_service_account.scoped))}"
   }
   assert {
-    condition     = toset(keys(output.scoped_service_accounts)) == toset(["mgmt-project-1", "team-alpha"])
+    condition     = toset(keys(output.scoped_service_accounts)) == toset(keys(google_service_account.scoped))
     error_message = "output keys: ${jsonencode(keys(output.scoped_service_accounts))}"
   }
+  assert {
+    condition     = toset([for binding in values(google_project_iam_member.scope_roles) : binding.project]) == toset(["team-alpha"])
+    error_message = "a container's member is bound per project; the container grant is inherited: ${jsonencode(distinct([for binding in values(google_project_iam_member.scope_roles) : binding.project]))}"
+  }
+  assert {
+    condition     = toset(output.scope_bound_projects) == toset(["team-alpha"])
+    error_message = "scope_bound_projects carries a container's member: ${jsonencode(output.scope_bound_projects)}"
+  }
+  assert {
+    condition     = length(google_folder_iam_member.scope_roles) == length(output.scope_container_roles) && length(google_organization_iam_member.scope_roles) == length(output.scope_container_roles)
+    error_message = "the container bindings changed: ${length(google_folder_iam_member.scope_roles)} folder, ${length(google_organization_iam_member.scope_roles)} organisation"
+  }
+}
+
+# The members' place in the pool is bounded by the pool cap alone, not the
+# resolved-set cap: the same declaration under scope.max_projects = 2 (the
+# management project and team-alpha) plans, because the container's three
+# members are not counted toward the resolved set.
+run "a_containers_members_are_not_counted_toward_the_resolved_set_cap" {
+  command = plan
+
+  variables {
+    scoped_pool_enabled = true
+    scope = {
+      projects     = ["team-alpha"]
+      folders      = ["123456789012"]
+      max_projects = 2
+    }
+    scope_container_members = {
+      "folders/123456789012" = ["folder-proj1", "folder-proj2", "folder-proj3"]
+    }
+  }
+
+  assert {
+    condition     = length(google_service_account.scoped) == 5
+    error_message = "${length(google_service_account.scoped)} members planned for two listed projects and three container members"
+  }
+}
+
+# The pool cap counts a container's member like any other: three members
+# under a folder beside the management project, against a bound of three.
+run "a_containers_members_count_toward_the_pool_cap" {
+  command = plan
+
+  variables {
+    scoped_pool_enabled      = true
+    scoped_pool_max_accounts = 3
+    scope                    = { folders = ["123456789012"] }
+    scope_container_members = {
+      "folders/123456789012" = ["folder-proj1", "folder-proj2", "folder-proj3"]
+    }
+  }
+
+  expect_failures = [google_service_account.agent]
+}
+
+# An exact exclude.projects entry drops a container's member from the pool,
+# the operator's one lever over a member the plan listed; a glob is the
+# reconcile's alone and drops nothing here.
+run "an_exact_exclude_drops_a_containers_member_from_the_pool" {
+  command = plan
+
+  variables {
+    scoped_pool_enabled = true
+    scope = {
+      folders = ["123456789012"]
+      exclude = { projects = ["folder-proj2", "folder-*"] }
+    }
+    scope_container_members = {
+      "folders/123456789012" = ["folder-proj1", "folder-proj2", "folder-proj3"]
+    }
+  }
+
+  assert {
+    condition     = toset(keys(google_service_account.scoped)) == toset(["mgmt-project-1", "folder-proj1", "folder-proj3"])
+    error_message = "pool keys: ${jsonencode(keys(google_service_account.scoped))}"
+  }
+}
+
+# Armed beside a container whose key the input lacks: refused on the agent
+# account, naming the container, so a module caller that skipped the resolver
+# is told rather than getting the container's clusters refused by the broker.
+run "an_armed_pool_beside_an_unlisted_container_is_refused" {
+  command = plan
+
+  variables {
+    scoped_pool_enabled = true
+    scope = {
+      folders       = ["123456789012"]
+      organizations = ["987654321098"]
+    }
+    scope_container_members = {
+      "folders/123456789012" = ["folder-proj1"]
+    }
+  }
+
+  expect_failures = [google_service_account.agent]
+}
+
+# Disarmed, no container is read and the input stays empty: a folder in scope
+# plans with nothing in scope_container_members, and no member is created.
+run "a_disarmed_pool_beside_a_container_needs_no_listing" {
+  command = plan
+
+  variables {
+    scope = {
+      projects = ["team-alpha"]
+      folders  = ["123456789012"]
+    }
+  }
+
+  assert {
+    condition     = length(google_service_account.scoped) == 0
+    error_message = "accounts planned while disarmed: ${jsonencode(keys(google_service_account.scoped))}"
+  }
+  assert {
+    condition     = length(google_folder_iam_member.scope_roles) == length(output.scope_container_roles)
+    error_message = "the folder binding changed: ${length(google_folder_iam_member.scope_roles)}"
+  }
+}
+
+# A container with no clusters lists to an empty entry: the key is present,
+# so the plan is not refused, and it adds no member.
+run "a_container_with_no_members_adds_nothing_and_is_not_refused" {
+  command = plan
+
+  variables {
+    scoped_pool_enabled     = true
+    scope                   = { folders = ["123456789012"] }
+    scope_container_members = { "folders/123456789012" = [] }
+  }
+
+  assert {
+    condition     = toset(keys(google_service_account.scoped)) == toset(["mgmt-project-1"])
+    error_message = "pool keys: ${jsonencode(keys(google_service_account.scoped))}"
+  }
+}
+
+# The input has the shape the resolver's output has, and nothing else: a key
+# that is not folders/<id> or organizations/<id>, or a member that is not a
+# project ID the CRD accepts (a number, an uppercase name), is refused at the
+# variable, before the pool would file an account under a key the broker
+# never looks up.
+run "a_malformed_container_listing_is_refused_at_the_variable" {
+  command = plan
+
+  variables {
+    scoped_pool_enabled = true
+    scope = {
+      projects      = []
+      folders       = ["123456789012"]
+      organizations = []
+    }
+    scope_container_members = {
+      "folders/123456789012" = ["200000000002"]
+    }
+  }
+
+  expect_failures = [var.scope_container_members]
+}
+
+run "a_container_key_of_the_wrong_shape_is_refused_at_the_variable" {
+  command = plan
+
+  variables {
+    scoped_pool_enabled = true
+    scope = {
+      projects      = []
+      folders       = ["123456789012"]
+      organizations = []
+    }
+    scope_container_members = {
+      "folder/123456789012" = ["team-alpha"]
+    }
+  }
+
+  expect_failures = [var.scope_container_members]
 }

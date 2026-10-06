@@ -362,9 +362,10 @@ func sweepA2ALabelled(ctx context.Context, t *testing.T, cl client.Client, visit
 		visit("StatefulSet", sts.Items[i].Name)
 	}
 
-	// The verifier's budget. A PDB left behind on a today install is inert
-	// until something matching its selector is scheduled again, which is
-	// exactly why a sweep by name would never notice it.
+	// The next stack's budgets, the verifier's and the callout's. A PDB left
+	// behind on a today install is inert until something matching its
+	// selector is scheduled again, which is exactly why a sweep by name would
+	// never notice it.
 	var pdbs policyv1.PodDisruptionBudgetList
 	if err := cl.List(ctx, &pdbs, inNS, hasLabel); err != nil {
 		t.Fatalf("list poddisruptionbudgets: %v", err)

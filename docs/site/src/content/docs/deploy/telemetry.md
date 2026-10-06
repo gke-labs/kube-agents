@@ -11,13 +11,13 @@ For what's exported and how the agent surfaces it in Chat replies, see [Concepts
 
 ## What runs where
 
-| Signal          | Producer                                                   | Collector                                                             | Destination      |
-| --------------- | ---------------------------------------------------------- | --------------------------------------------------------------------- | ---------------- |
-| Metrics         | LiteLLM, vLLM, Hindsight, event watcher, credential broker | GKE Managed Prometheus                                                | Cloud Monitoring |
-| Traces          | LiteLLM, vLLM, Hermes                                      | GKE OTel collector (`gke-managed-otel`)                               | Cloud Trace      |
-| Container logs  | All containers                                             | GKE built-in log agent                                                | Cloud Logging    |
-| Tool-call audit | Hermes `tool_call_audit` plugin, `chat_message_audit` hook | fluent-bit sidecar (lifts the JSON to fields), then the GKE log agent | Cloud Logging    |
-| Broker audit    | Credential broker (JSON lines on its stdout)               | GKE built-in log agent                                                | Cloud Logging    |
+| Signal          | Producer                                                   | Collector                                                                 | Destination      |
+| --------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------- | ---------------- |
+| Metrics         | LiteLLM, vLLM, Hindsight, event watcher, credential broker | GKE Managed Prometheus                                                    | Cloud Monitoring |
+| Traces          | LiteLLM, vLLM, Hermes                                      | GKE OTel collector (`gke-managed-otel`)                                   | Cloud Trace      |
+| Container logs  | All containers                                             | GKE built-in log agent                                                    | Cloud Logging    |
+| Tool-call audit | Hermes `tool_call_audit` plugin, `chat_message_audit` hook | fluent-bit sidecar (tails the audit file as JSON), then the GKE log agent | Cloud Logging    |
+| Broker audit    | Credential broker (JSON lines on its stdout)               | GKE built-in log agent                                                    | Cloud Logging    |
 
 ## GKE Managed Prometheus
 
