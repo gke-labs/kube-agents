@@ -9,11 +9,11 @@ import plotly.graph_objects as go
 
 from admin_console.causal_flow import CausalSource
 from admin_console.domain import ActivityEvent
-from admin_console.ui import ATTRIBUTION_COLORS, STATUS_COLORS, TRIGGER_COLORS
+from admin_console.ui import ATTRIBUTION_COLORS, PALETTE, STATUS_COLORS, TRIGGER_COLORS
 
 PLOT_BG = "rgba(0,0,0,0)"
-GRID = "#26344c"
-TEXT = "#b7c4d9"
+GRID = PALETTE.border
+TEXT = PALETTE.chart_text
 
 
 def _base_layout(figure: go.Figure, *, height: int) -> go.Figure:
@@ -23,7 +23,11 @@ def _base_layout(figure: go.Figure, *, height: int) -> go.Figure:
         paper_bgcolor=PLOT_BG,
         plot_bgcolor=PLOT_BG,
         font={"color": TEXT, "family": "Inter, ui-sans-serif, system-ui"},
-        hoverlabel={"bgcolor": "#151f32", "bordercolor": GRID, "font_color": "#edf3ff"},
+        hoverlabel={
+            "bgcolor": PALETTE.chart_hover_background,
+            "bordercolor": GRID,
+            "font_color": PALETTE.text,
+        },
         legend={
             "orientation": "h",
             "yanchor": "bottom",
@@ -98,7 +102,7 @@ def attribution_donut(events: list[ActivityEvent]) -> go.Figure:
     figure.add_annotation(
         text=f"<b>{coverage}%</b><br><span style='font-size:11px'>linked</span>",
         showarrow=False,
-        font={"color": "#edf3ff", "size": 20},
+        font={"color": PALETTE.text, "size": 20},
     )
     return _base_layout(figure, height=300)
 
@@ -189,10 +193,10 @@ def causality_sankey(events: list[ActivityEvent]) -> go.Figure:
             "<br>".join(source_detail_parts),
             source.key,
         )
-        agent = node("agent", event.agent_name, "#7C9CFF")
-        action = node("action", action_label, "#B58CFF")
+        agent = node("agent", event.agent_name, PALETTE.accent)
+        action = node("action", action_label, PALETTE.violet)
         outcome = node(
-            "outcome", outcome_label, STATUS_COLORS.get(event.status, "#8FA1BD")
+            "outcome", outcome_label, STATUS_COLORS.get(event.status, PALETTE.neutral)
         )
         edge_counts[(trigger, agent)] += 1
         edge_counts[(agent, action)] += 1
@@ -213,14 +217,14 @@ def causality_sankey(events: list[ActivityEvent]) -> go.Figure:
                 "customdata": node_details,
                 "pad": 20,
                 "thickness": 14,
-                "line": {"color": "#26344c", "width": 1},
+                "line": {"color": GRID, "width": 1},
                 "hovertemplate": "%{customdata}<extra></extra>",
             },
             link={
                 "source": sources,
                 "target": targets,
                 "value": values,
-                "color": "rgba(124,156,255,.18)",
+                "color": PALETTE.flow_link,
                 "hovertemplate": "%{source.label} → %{target.label}<br>%{value} events<extra></extra>",
             },
         )
@@ -239,8 +243,8 @@ def interaction_timeline(events: list[ActivityEvent]) -> go.Figure:
                 mode="markers",
                 marker={
                     "size": max(11, min(24, 10 + event.duration_ms / 800)),
-                    "color": STATUS_COLORS.get(event.status, "#8FA1BD"),
-                    "line": {"color": "#edf3ff", "width": 1},
+                    "color": STATUS_COLORS.get(event.status, PALETTE.neutral),
+                    "line": {"color": PALETTE.marker_outline, "width": 1},
                 },
                 name=event.status.title(),
                 legendgroup=event.status,

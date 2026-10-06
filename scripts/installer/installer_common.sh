@@ -181,12 +181,15 @@ readonly SCOPE_CLUSTER_TRIPLE_PATTERN='^[^/]+/[^/]+/[^/]+$'
 readonly SCOPE_CONTAINER_ID_PATTERN='^[0-9]{1,20}$'
 # What check_scope_container_access verifies before an apply that binds a
 # container: the API the reconcile's container search calls, the permission
-# the applying identity needs on each container kind, the constraints an
-# organisation policy forbids an API through, and where the permission probe
-# is asked.
+# the applying identity needs on each container kind, the permission and the
+# role the same identity needs on every container while the pool lists its
+# members at plan time, the constraints an organisation policy forbids an API
+# through, and where the permission probe is asked.
 readonly SCOPE_ASSET_API="cloudasset.googleapis.com"
 readonly SCOPE_FOLDER_SET_IAM_PERMISSION="resourcemanager.folders.setIamPolicy"
 readonly SCOPE_ORGANIZATION_SET_IAM_PERMISSION="resourcemanager.organizations.setIamPolicy"
+readonly SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION="cloudasset.assets.searchAllResources"
+readonly SCOPE_CONTAINER_ASSET_SEARCH_ROLE="roles/cloudasset.viewer"
 readonly SCOPE_SERVICE_USAGE_CONSTRAINTS="gcp.restrictServiceUsage serviceuser.services"
 readonly RESOURCE_MANAGER_API_URL="https://cloudresourcemanager.googleapis.com/v3"
 readonly SCOPE_PREFLIGHT_HTTP_TIMEOUT_SECONDS=20
@@ -221,6 +224,14 @@ readonly SCOPE_PROBE_TOKEN_SCOPE_PATTERN="insufficient authentication scopes|ACC
 # apply, and the dry-run skips its plan while one is off.
 readonly SCOPE_METRICS_SCOPE_APIS="cloudresourcemanager.googleapis.com monitoring.googleapis.com"
 readonly SCOPE_SHARED_VPC_HOST_APIS="compute.googleapis.com"
+# The scoped service account pool, armed beside a folder or organisation,
+# lists the container's members in the same plan through the Asset API
+# (SCOPE_ASSET_API), which the composition otherwise enables for the
+# reconcile in the apply; so enable_scope_selector_apis treats the pair as a
+# third selector kind. The two clauses the enabling message names its reason
+# with, one per kind of plan-time read.
+readonly SCOPE_SELECTOR_READ_REASON="resolves the declared Shared VPC host or Metrics Scope"
+readonly SCOPE_POOL_CONTAINER_READ_REASON="lists the declared folder's or organisation's members for the scoped service account pool"
 # The three answers a container permission probe gives.
 readonly SCOPE_PROBE_GRANTED=0
 readonly SCOPE_PROBE_DENIED=1
@@ -1343,9 +1354,13 @@ print("SCOPED_SA_POOL_ENABLED=" + json.dumps("true" if live["scopedPoolEnabled"]
 # account, whose answer does not depend on who asks: (1) the Cloud Asset API
 # the reconcile's container search calls can be enabled in the host project,
 # meaning it is enabled already or no effective organisation policy forbids
-# it, and (2) this identity can set IAM policy on every container named, so
+# it, (2) this identity can set IAM policy on every container named, so
 # the apply does not stop partway with the API enabled and some containers
-# bound. Every container is probed and every failure named before the run
+# bound, and (3) while the scoped service account pool is armed
+# (scope_pool_lists_containers), this identity can search every container's
+# members through that API, which the plan does for the pool after
+# enable_scope_selector_apis has enabled it and refuses without. Every
+# container is probed and every failure named before the run
 # stops (docs/designs/multi-project-scope.md §6); a probe that cannot decide
 # (no curl, no token, a transport error) warns and lets the apply speak,
 # because an apply that fails to bind fails loudly, unlike the scope replace
@@ -1359,8 +1374,9 @@ check_scope_container_access() {
   local mode="${1:-$SCOPE_CHECK_MODE_REFUSE}"
   local folders="${SCOPE_FOLDERS:-}" organizations="${SCOPE_ORGANIZATIONS:-}"
   [[ "${folders}${organizations}" == *[![:space:],]* ]] || return 0
-  local project="${PROJECT_ID:-}" entry token="" constraint failures=() undecided=() rc had_noglob=false identity properties reason
+  local project="${PROJECT_ID:-}" entry token="" constraint failures=() undecided=() rc had_noglob=false identity properties reason pool_lists=false
   identity="$(_scope_terraform_identity_label)"
+  ! scope_pool_lists_containers || pool_lists=true
   if [[ "$organizations" == *[![:space:],]* ]]; then
     print_warning "SCOPE_ORGANIZATIONS binds the agent's read roles on the whole organisation, every project in it included. The design recommends folders until the scoped service account pool grants authority (docs/designs/multi-project-scope.md §9)."
   fi
@@ -1398,6 +1414,14 @@ check_scope_container_access() {
         # granted answer passes silently.
         undecided+=("whether ${identity} can set IAM policy on folders/${entry}${reason:+ ($reason)}")
       fi
+      $pool_lists || continue
+      rc=0
+      reason="$(_scope_container_can_set_iam "folders/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
+      if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
+        failures+=("${identity} cannot list the members of folders/${entry} (${SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION}); the plan ${SCOPE_POOL_CONTAINER_READ_REASON} and would refuse. Ask for ${SCOPE_CONTAINER_ASSET_SEARCH_ROLE} on the folder for that identity, set SCOPED_SA_POOL_ENABLED=false, or drop it from SCOPE_FOLDERS.")
+      elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
+        undecided+=("whether ${identity} can list the members of folders/${entry}${reason:+ ($reason)}")
+      fi
     done
     for entry in $organizations; do
       [ -n "$entry" ] || continue
@@ -1409,6 +1433,14 @@ check_scope_container_access() {
         # Undecided, and any status the probe does not define: nothing but a
         # granted answer passes silently.
         undecided+=("whether ${identity} can set IAM policy on organizations/${entry}${reason:+ ($reason)}")
+      fi
+      $pool_lists || continue
+      rc=0
+      reason="$(_scope_container_can_set_iam "organizations/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
+      if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
+        failures+=("${identity} cannot list the members of organizations/${entry} (${SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION}); the plan ${SCOPE_POOL_CONTAINER_READ_REASON} and would refuse. Ask for ${SCOPE_CONTAINER_ASSET_SEARCH_ROLE} on the organisation for that identity, set SCOPED_SA_POOL_ENABLED=false, or drop it from SCOPE_ORGANIZATIONS.")
+      elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
+        undecided+=("whether ${identity} can list the members of organizations/${entry}${reason:+ ($reason)}")
       fi
     done
     $had_noglob || set +f
@@ -1429,10 +1461,19 @@ check_scope_container_access() {
   return 1
 }
 
+# True when the plan lists a container's members for the scoped service
+# account pool: SCOPED_SA_POOL_ENABLED is a true spelling and a folder or
+# organisation is declared. With the pool off no container is read at plan.
+scope_pool_lists_containers() {
+  is_truthy "${SCOPED_SA_POOL_ENABLED:-$SCOPED_SA_POOL_ENABLED_DEFAULT}" || return 1
+  [[ "${SCOPE_FOLDERS:-}${SCOPE_ORGANIZATIONS:-}" == *[![:space:],]* ]]
+}
+
 # Prints, space-separated, the APIs the plan reads for the selectors the
 # environment declares (SCOPE_METRICS_SCOPE_APIS for SCOPE_METRICS_SCOPES,
-# SCOPE_SHARED_VPC_HOST_APIS for SCOPE_SHARED_VPC_HOSTS); nothing when neither
-# is declared.
+# SCOPE_SHARED_VPC_HOST_APIS for SCOPE_SHARED_VPC_HOSTS, SCOPE_ASSET_API for
+# the pool's listing of a declared folder's or organisation's members);
+# nothing when none is declared.
 scope_selector_apis() {
   local apis=""
   if [[ "${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]]; then
@@ -1441,7 +1482,24 @@ scope_selector_apis() {
   if [[ "${SCOPE_SHARED_VPC_HOSTS:-}" == *[![:space:],]* ]]; then
     apis+="${apis:+ }$SCOPE_SHARED_VPC_HOST_APIS"
   fi
+  if scope_pool_lists_containers; then
+    apis+="${apis:+ }$SCOPE_ASSET_API"
+  fi
   printf '%s' "$apis"
+}
+
+# Prints what the plan does through the APIs scope_selector_apis names, as
+# the clause(s) after "the plan": the selector read, the pool's container
+# listing, or both joined; nothing when scope_selector_apis prints nothing.
+scope_selector_apis_reason() {
+  local reason=""
+  if [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]]; then
+    reason="$SCOPE_SELECTOR_READ_REASON"
+  fi
+  if scope_pool_lists_containers; then
+    reason+="${reason:+ and }$SCOPE_POOL_CONTAINER_READ_REASON"
+  fi
+  printf '%s' "$reason"
 }
 
 # Prints the APIs of scope_selector_apis not enabled in project $1,
@@ -1458,13 +1516,16 @@ scope_selector_apis_missing() {
 }
 
 # Enables, in the management project, whichever of the APIs the plan-time
-# resolution of the declared Shared VPC hosts or Metrics Scopes reads
-# (scope_selector_apis) is not enabled yet. The reads run in the plan and are
-# billed to that project, and the composition enables the APIs only in the
-# apply that follows, so a first install that declared a selector would
-# otherwise be refused at plan with the API reported disabled. Nothing is
-# called when every API is on already, which is every re-run and every Day-2
-# apply of an existing install, and nothing when no selector is declared. The
+# resolution of the declared Shared VPC hosts or Metrics Scopes reads, or the
+# scoped service account pool's listing of a declared folder's or
+# organisation's members (scope_selector_apis), is not enabled yet. The reads
+# run in the plan and are billed to that project, and the composition enables
+# the APIs only in the apply that follows, so a first install that declared a
+# selector, or armed the pool beside a container, would otherwise be refused
+# at plan with the API reported disabled. Nothing is called when every API is
+# on already, which is every re-run and every Day-2 apply of an existing
+# install, and nothing when no selector is declared and no container is
+# listed. The
 # enable runs as gcloud's active account, like the KMS enablement beside it;
 # a failure is a warning and the run goes on, because the plan reports a
 # disabled API with the same command as the remedy, and an account that
@@ -1473,16 +1534,17 @@ scope_selector_apis_missing() {
 # run, whose handoff names the command instead. $1 the project (PROJECT_ID by
 # default). Caller defines print_info / print_warning.
 enable_scope_selector_apis() {
-  [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]] || return 0
-  local project="${1:-${PROJECT_ID:-}}" missing rc=0
+  [ -n "$(scope_selector_apis)" ] || return 0
+  local project="${1:-${PROJECT_ID:-}}" missing rc=0 reason
+  reason="$(scope_selector_apis_reason)"
   missing="$(scope_selector_apis_missing "$project")" || rc=$?
   if [ "$rc" -ne 0 ]; then
     missing="$(scope_selector_apis)"
-    print_info "The enabled APIs of project '${project}' could not be listed; enabling ${missing// /, }, which the plan's lookup of the declared Shared VPC host or Metrics Scope reads and which is idempotent..."
+    print_info "The enabled APIs of project '${project}' could not be listed; enabling ${missing// /, }, which the plan reads when it ${reason}, and which is idempotent..."
   elif [ -z "$missing" ]; then
     return 0
   else
-    print_info "Enabling ${missing// /, } in project '${project}': the plan resolves the declared Shared VPC host or Metrics Scope through it, before the apply that would otherwise enable it..."
+    print_info "Enabling ${missing// /, } in project '${project}': the plan ${reason} through it, before the apply that would otherwise enable it..."
   fi
   # shellcheck disable=SC2086
   if ! (trap - ERR; gcloud services enable $missing --project="$project"); then

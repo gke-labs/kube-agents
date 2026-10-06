@@ -204,7 +204,8 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 
 # The scoped service account pool: one reader service account per project the
 # plan can list in scope above (project_id, projects less an exact exclude,
-# selector members; not a folder's or organisation's members yet), created in
+# selector members, and, while the pool is armed, each folder's and
+# organisation's members as the scope resolver lists them), created in
 # project_id and handed to the credential broker as its mapping. Off by
 # default and independent of scope: the members hold no IAM grant yet, so an
 # armed pool turns every cluster read into a Forbidden. max_accounts is the

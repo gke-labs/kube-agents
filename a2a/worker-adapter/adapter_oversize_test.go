@@ -41,6 +41,7 @@ func TestLifecycle_OversizeResultLineFailsWithTheCeilingNamed(t *testing.T) {
 	// the harness at all.
 	harness := stub(t, `
 echo '{"type":"system","subtype":"init","session_id":"stub-oversize"}'
+read first || exit 1
 printf '{"type":"result","subtype":"success","result":"'
 head -c 9000000 /dev/zero | tr '\0' 'x'
 printf '"}\n'
@@ -98,6 +99,7 @@ func TestLifecycle_OversizeLineWithAHarnessThatWaitsOnStdin(t *testing.T) {
 
 	harness := stub(t, `
 echo '{"type":"system","subtype":"init","session_id":"stub-oversize2"}'
+read first || exit 1
 printf '{"type":"result","subtype":"success","result":"'
 head -c 9000000 /dev/zero | tr '\0' 'x'
 printf '"}\n'

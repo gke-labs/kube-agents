@@ -29,12 +29,31 @@
 # below are the whole of that reporting, so a lookup this identity cannot make
 # is a refused plan and never a silently smaller set, which would retire the
 # members it missed on the reconcile's next two clean runs.
+#
+# The same module lists a declared folder's or organisation's members while
+# the scoped service account pool is armed (list_container_members), with the
+# Cloud Asset Inventory search the reconcile runs for a container (design §6):
+# the pool's accounts are Terraform's too, one per project, so a member the
+# reconcile would discover under the container has to be known at plan time
+# to get one. The members get a pool account and nothing else -- the
+# container-level grant is inherited, and the resolved-set cap counts
+# containers at runtime, after the explicit projects and the selectors -- and
+# a project created under the container between applies waits for the next
+# one. With the pool off no container is read.
 
 
 locals {
   scope_shared_vpc_hosts   = toset(var.shared_vpc_hosts)
   scope_metrics_scopes     = toset(var.metrics_scopes)
   scope_resolves_selectors = length(local.scope_shared_vpc_hosts) + length(local.scope_metrics_scopes) > 0
+  # The containers whose members are listed, under the key the snapshot's
+  # `containers` array and kube-agents-iam's scope_container_members use;
+  # none unless the pool is armed.
+  scope_listed_containers = var.list_container_members ? toset(concat(
+    [for folder in var.folders : "folders/${folder}"],
+    [for organization in var.organizations : "organizations/${organization}"],
+  )) : toset([])
+  scope_reads_apis = local.scope_resolves_selectors || length(local.scope_listed_containers) > 0
 
   # The three reads, as the reconcile makes them (agents/platform/scripts/
   # cluster_agent_reconcile.py): the Compute API names a host's service
@@ -49,6 +68,18 @@ locals {
   # holds is refused whatever cap is declared: the bound on a host at plan
   # time is the smaller of member_cap and this page.
   scope_xpn_page_size = 500
+  # A container's members, as the reconcile lists them (_search_container):
+  # one searchAllResources call scoped to the folder or organisation,
+  # filtered to GKE clusters, and the project read out of each asset name,
+  # the segment after `projects/` (the `project` field carries the number).
+  # Paged at the API's maximum of 500 clusters, a second page refused as a
+  # host's is.
+  scope_asset_api_url              = "https://cloudasset.googleapis.com/v1"
+  scope_asset_type_cluster         = "container.googleapis.com/Cluster"
+  scope_asset_page_size            = 500
+  scope_cluster_asset_name_pattern = "^//container\\.googleapis\\.com/projects/(?P<project>[^/]+)/(?:locations|zones)/[^/]+/clusters/[^/]+$"
+  scope_asset_viewer_role          = "roles/cloudasset.viewer"
+  scope_asset_search_permission    = "cloudasset.assets.searchAllResources"
   # The most projects one selector may resolve to. The reconcile lists at
   # most the declared cap (spec.scope.maxProjects; RESOLVED_SET_CAP, 100, in
   # cluster_agent_reconcile.py as its default) projects of the whole resolved set, the management project included, and a project past
@@ -98,19 +129,20 @@ locals {
   scope_compute_api_service          = "compute.googleapis.com"
   scope_monitoring_api_service       = "monitoring.googleapis.com"
   scope_resource_manager_api_service = "cloudresourcemanager.googleapis.com"
+  scope_asset_api_service            = "cloudasset.googleapis.com"
 }
 
 # The identity the google provider plans and applies with, so every read
 # below is answered for it: a lookup that passes here passes for the apply,
 # and one that fails names the principal an administrator has to grant.
 data "google_client_config" "scope_resolver" {
-  count = local.scope_resolves_selectors ? 1 : 0
+  count = local.scope_reads_apis ? 1 : 0
 }
 
 locals {
   # The bearer, and the consumer project every read is billed to, so the
   # answer is the same whichever credential type the provider holds.
-  scope_resolver_headers = local.scope_resolves_selectors ? {
+  scope_resolver_headers = local.scope_reads_apis ? {
     Authorization         = "Bearer ${data.google_client_config.scope_resolver[0].access_token}"
     "x-goog-user-project" = var.quota_project
   } : {}
@@ -121,7 +153,7 @@ locals {
   # above, by API, so each postcondition picks by marker and the text lives
   # once.
   scope_api_off_clause = {
-    for api in [local.scope_compute_api_service, local.scope_monitoring_api_service, local.scope_resource_manager_api_service] :
+    for api in [local.scope_compute_api_service, local.scope_monitoring_api_service, local.scope_resource_manager_api_service, local.scope_asset_api_service] :
     api => " That answer names a disabled API rather than a grant: ${api} is off in ${var.quota_project}, the project these reads are billed to (install.sh enables it before a first install; by hand: gcloud services enable ${api} --project=${var.quota_project})."
   }
   scope_consumer_denied_clause = " That answer refuses the consumer project rather than a grant on the project read: ${local.scope_resolver_identity} may not bill reads to ${var.quota_project}, the project these reads name in x-goog-user-project. It needs serviceusage.services.use there (${local.scope_consumer_role} carries it, as does any role that applies the composition); the API is on, and enabling it changes nothing."
@@ -306,13 +338,112 @@ locals {
   )
 }
 
+locals {
+  scope_container_url = {
+    for container in local.scope_listed_containers :
+    container => "${local.scope_asset_api_url}/${container}:searchAllResources?assetTypes=${local.scope_asset_type_cluster}&pageSize=${local.scope_asset_page_size}"
+  }
+}
+
+data "http" "scope_container" {
+  for_each = local.scope_listed_containers
+
+  url                = local.scope_container_url[each.key]
+  request_headers    = local.scope_resolver_headers
+  request_timeout_ms = local.scope_lookup_timeout_ms
+
+  retry {
+    attempts = local.scope_lookup_retry_attempts
+  }
+
+  lifecycle {
+    postcondition {
+      condition     = self.status_code == 200
+      error_message = "folders / organizations: the members of ${each.key} could not be listed for the scoped service account pool by ${local.scope_resolver_identity}; the Cloud Asset API answered HTTP ${self.status_code}: ${substr(try(jsondecode(self.response_body).error.message, self.response_body), 0, local.scope_lookup_error_excerpt_chars)}. That identity needs ${local.scope_asset_search_permission} on ${each.key} (${local.scope_asset_viewer_role} carries it, the role the apply binds for the agent there), and ${local.scope_asset_api_service} enabled in ${var.quota_project} (install.sh enables it before a first plan while the pool is armed beside a container); or turn the pool off, or drop the container.${anytrue([for marker in local.scope_consumer_denied_markers : strcontains(self.response_body, marker)]) ? local.scope_consumer_denied_clause : anytrue([for marker in local.scope_api_off_markers : strcontains(self.response_body, marker)]) ? local.scope_api_off_clause[local.scope_asset_api_service] : ""} Nothing was applied."
+    }
+    postcondition {
+      # A 200 that does not decode to an object, or whose results carry a
+      # name that is not a GKE cluster's (the search is filtered to that one
+      # asset type, so such a row is a shape this module does not read, not a
+      # foreign asset to skip), is refused rather than read as a container
+      # with no clusters, which the apply would turn into retired pool
+      # accounts. An absent `results` key stays legal: a container with no
+      # cluster answers so.
+      condition     = self.status_code != 200 || (can(keys(jsondecode(self.response_body))) && can([for result in try(jsondecode(self.response_body).results, []) : regex(local.scope_cluster_asset_name_pattern, result.name)]))
+      error_message = "folders / organizations: the Cloud Asset API's answer for ${each.key} is not the searchAllResources document this module reads (a JSON object whose results each name a GKE cluster, //container.googleapis.com/projects/<project>/locations/<location>/clusters/<name>); refusing to list the container's members for the scoped service account pool from it rather than derive a set that may be short. Nothing was applied."
+    }
+    postcondition {
+      # Counted less an exact exclude entry, which drops the member from the
+      # pool below.
+      condition     = self.status_code != 200 || length(distinct([for result in try(jsondecode(self.response_body).results, []) : try(regex(local.scope_cluster_asset_name_pattern, result.name)["project"], "") if !contains(var.exclude_projects, try(regex(local.scope_cluster_asset_name_pattern, result.name)["project"], ""))])) <= local.scope_selector_member_cap
+      error_message = "folders / organizations: ${each.key} holds GKE clusters in more than ${local.scope_selector_member_cap} projects not named in exclude_projects, more than the reconcile lists of the whole resolved set (spec.scope.maxProjects, the management project included), so the container cannot fit whatever else the scope declares; the members past the cap would read over-cap with nothing created under them, and a pool account each the broker never serves. Raise spec.scope.maxProjects, name the projects not wanted in exclude_projects (the scope's exclude.projects) by ID, or declare the projects wanted, or a sub-folder that holds them, instead. Nothing was applied."
+    }
+    postcondition {
+      condition     = !can(jsondecode(self.response_body).nextPageToken)
+      error_message = "folders / organizations: ${each.key} holds more than ${local.scope_asset_page_size} GKE clusters, more than one page of the Cloud Asset API's answer holds, and the plan cannot follow a second page whatever spec.scope.maxProjects declares; declare the projects wanted in the scope's projects, or a sub-folder that holds them, instead. Nothing was applied."
+    }
+  }
+}
+
+locals {
+  # Every project the search named under each container, by ID, distinct and
+  # sorted, as the index answered it: what the empty-answer check below reads.
+  scope_container_listed = {
+    for container, response in data.http.scope_container :
+    container => response.status_code == 200 && can(keys(jsondecode(response.response_body))) ? sort(distinct(compact([
+      for result in try(jsondecode(response.response_body).results, []) :
+      try(regex(local.scope_cluster_asset_name_pattern, result.name)["project"], "")
+    ]))) : []
+  }
+  # The same less the management project, which kube-agents-iam seeds the
+  # pool with unconditionally and drops from a container's members itself, so
+  # it is neither a member here nor, when its ID is a legacy domain-scoped one
+  # (quota_project admits that form), uncarriable: it gets its pool account
+  # regardless. Then less an exact exclude entry; a legacy domain-scoped ID
+  # takes the host path -- left out of `container_members`, reported in
+  # `uncarriable_members` and by the check below -- since no pool account can
+  # be keyed on an ID the CRD's patterns refuse.
+  scope_container_named = {
+    for container, listed in local.scope_container_listed :
+    container => [for member in listed : member if member != var.quota_project]
+  }
+  scope_container_members = {
+    for container, named in local.scope_container_named :
+    container => [for member in named : member if can(regex(local.scope_project_id_pattern, member)) && !contains(var.exclude_projects, member)]
+  }
+  scope_container_uncarriable = {
+    for container, named in local.scope_container_named :
+    container => [for member in named : member if !can(regex(local.scope_project_id_pattern, member))]
+    if length([for member in named : member if !can(regex(local.scope_project_id_pattern, member))]) > 0
+  }
+  scope_uncarriable = merge(local.scope_selector_uncarriable, local.scope_container_uncarriable)
+  # The listed containers the index answered with no cluster at all, before
+  # the management project and the excludes are taken out: what the
+  # empty-answer check below names.
+  scope_containers_answered_empty = sort([for container, listed in local.scope_container_listed : container if length(listed) == 0])
+}
+
+# A warning, not a refusal: Cloud Asset Inventory search is eventually
+# consistent, and where the reconcile keeps a member the index omits for a day
+# (design §7, INDEX_LAG_GRACE_SECONDS) the plan carries no state to grace one
+# with, so it applies the answer as read. The shape an index gap most often
+# takes, and the one that empties a whole container's pool in one apply, is a
+# container answered with no member at all; that is what this names. A
+# shorter but non-empty answer is not told apart from a project that left.
+check "listed_containers_name_a_member" {
+  assert {
+    condition     = length(local.scope_containers_answered_empty) == 0
+    error_message = "folders / organizations: the Cloud Asset API named no GKE cluster under ${join(", ", local.scope_containers_answered_empty)}, so the scoped service account pool would list no member there. The search is eventually consistent and the plan carries no state to grace an index gap with: for a container known to hold clusters an empty answer is more likely index lag than an empty container, and applying it would destroy every member's pool account, each re-created under a new unique ID on the plan the index answers again. Re-plan later, or pin the projects wanted in scope.projects, which does not depend on the index."
+  }
+}
+
 # A warning, not a refusal: the member is not in the set, and the plan says so
-# here and in `uncarriable_members`, while the rest of the selector's members
-# are bound as usual.
+# here and in `uncarriable_members`, while the rest of the selector's or
+# container's members are bound, or given a pool account, as usual.
 check "selector_members_the_scope_can_carry" {
   assert {
-    condition     = length(local.scope_selector_uncarriable) == 0
-    error_message = "shared_vpc_hosts / metrics_scopes: ${join("; ", [for selector, members in local.scope_selector_uncarriable : "${selector} names project(s) ${join(", ", members)}"])} with an ID the scope cannot carry (the CRD accepts ${local.scope_project_id_pattern}; a legacy domain-scoped ID does not match). Left out of the bindings; the reconcile reports such a project on its own."
+    condition     = length(local.scope_uncarriable) == 0
+    error_message = "shared_vpc_hosts / metrics_scopes / folders / organizations: ${join("; ", [for selector, members in local.scope_uncarriable : "${selector} names project(s) ${join(", ", members)}"])} with an ID the scope cannot carry (the CRD accepts ${local.scope_project_id_pattern}; a legacy domain-scoped ID does not match). Left out of the bindings and the scoped service account pool; the reconcile reports such a project on its own."
   }
 }
 

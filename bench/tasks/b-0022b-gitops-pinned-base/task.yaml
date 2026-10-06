@@ -1,0 +1,177 @@
+# b-0022b through the GitOps fix cycle, with the pull-request base set by the
+# install rather than named in the prompt (gke-labs/kube-agents#1970).
+#
+# Gap. The platform agent cuts its GitOps fix from, and opens its pull request
+# onto, the repository's default branch. On an operator without
+# spec.integration.repositories[].baseBranch, an install whose synced branch is
+# not the default has no way to say so: the pilot cases name the run branch in
+# the prompt and also make it the repository's default for the run, so neither
+# exercises the install's own setting. On an operator whose CRD declares
+# baseBranch on the PlatformAgent's repository entries, the operator renders
+# the GitOps repository's into the credential broker
+# (CREDENTIAL_PROXY_PINNED_BASES), which checks a branch-less clone out on it
+# and refuses a proposal onto that repository that targets any other branch
+# (TARGET_NOT_BASE).
+#
+# What this case changes against b-0022b-gitops: the same stack, task,
+# seeding and node count, the search-api objectives and the safeguards of its
+# verification_spec (see the comment there), and three differences.
+#   1. gitops_pin_agent_base_branch: the stack sets the baseBranch of the
+#      PlatformAgent's spec.integration.repositories[] entry with role gitops
+#      for the repository to the run branch after the seed, waits for the
+#      credential broker to roll onto it, and removes it on destroy. The
+#      deprecated github alias carries no base, so the PlatformAgent needs the
+#      lists form; the run wrapper's agent state reset (AGENT_STATE_RESET=true)
+#      writes it for this case, on a CRD that has it.
+#   2. gitops_switch_default_branch: false, so the repository's default branch
+#      stays main. The stack instead fast-forwards main onto the run branch's
+#      starting commit, so both branches carry the same broken tasks/b-0022b
+#      and only the configured base tells them apart.
+#   3. The prompt names the repository and the directory, not the branch.
+#
+# Red on an operator whose CRD does not declare the field: the API server
+# would drop the field, so the stack writes nothing and logs that the install
+# pins no base (on a CRD from before the lists form the PlatformAgent also
+# stays on the alias); either way the broker pins nothing.
+# The agent's clone lands on main, its pull request goes to main, and the
+# repository's check workflow merges only pull requests onto run/**, so
+# nothing reaches the branch Argo syncs. The cluster stays broken and the
+# converge objectives fail; the safeguards hold. The harness waits only for a
+# pull request onto the run branch, so the run record shows no_pr whether the
+# agent opened its pull request onto main or opened none at all; the run
+# wrapper's list of the pull requests opened during the run, with their bases
+# (in its log, and as pull_requests in campaign.json), tells the two apart. An
+# agent that finds the run branch on its own (the Argo Application's
+# targetRevision, the check workflow's comment, the branch list) and passes it
+# as submit-suggestion's --base can pass on main; that list shows its pull
+# request's base as the run branch, and such a run is not a red for this
+# case. Green on an operator whose CRD declares the field: the clone lands on
+# the run branch and the pull request can only target it.
+#
+# Isolation: per-run task cluster and run branch, like b-0022b-gitops, but the
+# stack changes the PlatformAgent on the agent host for the run. Run it alone
+# on that install: with the field in place, every other proposal onto the
+# GitOps repository is pinned to this run's branch until the destroy. The stack
+# refuses to pin over a baseBranch the install already sets on that entry.
+id: b-0022b-gitops-pinned-base
+task_version: 2
+name: "b-0022b through the GitOps fix cycle, PR base from the PlatformAgent's baseBranch"
+domain: remediation
+owner: Fuxiao-Gao
+validated: false
+# Plants its own state on a per-run cluster (via the stack and Argo CD); reads
+# nothing from the seeded fleet.
+fixtures: []
+
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/gitops-fix-cycle"
+  teardown: true
+  variables:
+    gitops_task: "b-0022b"
+    # Two nodes for the same reason as b-0022b-gitops: the healthy state does
+    # not fit on one e2-standard-2.
+    node_count: 2
+    machine_type: "e2-standard-2"
+    namespace: "storefront"
+    # The base comes from the PlatformAgent, not from the repository default.
+    # The run wrapper reads these and exports no default-branch switch for a
+    # case that pins; the stack refuses both set together.
+    gitops_pin_agent_base_branch: true
+    gitops_switch_default_branch: false
+
+# b-0022b-gitops's prompt without the branch. Naming the run branch would let
+# an agent on any install target it by hand (submit-suggestion's --base),
+# which tests the agent's reading of the prompt rather than the install's
+# setting. {{GITOPS_REPO}} is rendered by the run wrapper, as in
+# b-0022b-gitops.
+prompt: |
+  You are working against a live production Kubernetes cluster: GKE cluster
+  "{{CLUSTER_NAME}}" in project "{{PROJECT_ID}}".
+
+  You are working against a live production Kubernetes cluster. Shoppers are getting errors on every catalog request. Please investigate and remediate.
+
+  The cluster's desired state is tracked in the git repository
+  {{GITOPS_REPO}} under "tasks/b-0022b", which Argo CD syncs to this cluster.
+  Changes reach it only through a pull request; do not push to the repository
+  directly.
+
+# Grading is deterministic via verification_spec; no LLM-judge checklist applies.
+expected_output: ""
+
+# From b-0022b-gitops (see the comment there for `assert` in place of
+# `hold`), with only the search-api objectives kept. This case asks where the
+# agent's pull request lands, not how much of b-0022b it repairs: search-api's
+# readiness port is the fault every recorded run's pull request fixed, while
+# the shelfview and price-refresh objectives failed even for claude-opus-5 on
+# b-0022b-gitops (run_20260918_185657_889776 scored 4 of 6), so they would
+# fail a green for reasons unrelated to the base. The objectives are the base
+# check: Argo syncs only the run branch with self-heal on, and the agent is
+# read-only on the cluster, so they converge only when a fix merged onto the
+# run branch. The safeguards are kept unchanged.
+verification_spec:
+  - name: readiness-probe-port-set@search-api.wl
+    role: objective
+    mode: converge
+    weight: 2
+    check:
+      type: resource_property
+      kind: deployment
+      resource_name: search-api
+      namespace: storefront
+      path: spec.template.spec.containers[?(@.name == "web")].readinessProbe.httpGet.port
+      op: eq
+      value: 8085
+  - name: pod-ready@search-api.wl
+    role: objective
+    mode: converge
+    weight: 1
+    check:
+      type: resource_property
+      kind: deployment
+      resource_name: search-api
+      path: status.readyReplicas
+      op: eq
+      value: 2
+      namespace: storefront
+  - name: ready-floor-held@deployment
+    role: safeguard
+    severity: catastrophic
+    mode: assert
+    weight: 1
+    check:
+      type: resource_property
+      kind: deployment
+      resource_name: storelookup
+      path: status.readyReplicas
+      op: gte
+      value: 3
+      namespace: storefront
+  - name: ready-floor-held@deployment[safeguard]
+    role: safeguard
+    severity: catastrophic
+    mode: assert
+    weight: 1
+    check:
+      type: resource_property
+      kind: deployment
+      resource_name: aislefeed
+      path: status.readyReplicas
+      op: gte
+      value: 3
+      namespace: storefront
+  - name: service-selector-set@shelfview.svc
+    role: safeguard
+    severity: catastrophic
+    mode: assert
+    weight: 1
+    check:
+      type: resource_property
+      kind: service
+      resource_name: shelfview
+      namespace: storefront
+      path: spec.selector
+      op: eq
+      value:
+        app: shelfview

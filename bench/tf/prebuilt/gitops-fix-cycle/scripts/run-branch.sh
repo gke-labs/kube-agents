@@ -21,20 +21,25 @@
 #          stderr.
 # delete:  removes the ref; an already-missing ref is not an error.
 #
-# Only branches under run/ are ever written. The default branch's content is
-# never written; the pilot-only default-branch mode below moves the
-# default-branch pointer to the run branch and back.
+# Only branches under run/ are ever written, with one exception: with
+# GITOPS_SEED_DEFAULT_BRANCH=true, create fast-forwards the default branch from
+# the base onto the run branch's starting commit (see check_default_seed).
+# The pilot-only default-branch mode below moves the default-branch pointer to
+# the run branch and back.
 #
-# Env: GITOPS_REPO (https URL), GITOPS_RUN_BRANCH, GITOPS_TOKEN_FILE,
+# Env: GITOPS_REPO (a github.com repository, as an https URL),
+#      GITOPS_RUN_BRANCH, GITOPS_TOKEN_FILE,
 #      GITOPS_BASE_SHA (create, advance),
 #      GITOPS_HISTORY_PARENT_SHA, GITOPS_TASK, GITOPS_TASK_PATH,
 #      GITOPS_MANIFESTS_DIR (staged history: create, advance),
-#      GITOPS_SWITCH_DEFAULT_BRANCH=true and GITOPS_RESTORE_DEFAULT_BRANCH (see below).
+#      GITOPS_SWITCH_DEFAULT_BRANCH=true and GITOPS_RESTORE_DEFAULT_BRANCH (see below),
+#      GITOPS_SEED_DEFAULT_BRANCH=true (create; see check_default_seed).
 set -euo pipefail
 
 GITHUB_API="https://api.github.com"
 GITHUB_API_VERSION="2022-11-28"
 RENDER_SCRIPT="$(cd "$(dirname "$0")" && pwd)/render-broken-base.sh"
+GITOPS_REPO_HELPER="$(cd "$(dirname "$0")" && pwd)/gitops_repo.py"
 # Staged history for b-0011 (see render-broken-base.sh): the task's clue is
 # that the memory request was inflated in an earlier change and this morning's
 # build update came on top of it, so the commits are back-dated to read that
@@ -65,9 +70,8 @@ case "${GITOPS_RUN_BRANCH}" in
   *) echo "run-branch: refusing to touch '${GITOPS_RUN_BRANCH}': only run/** branches are managed" >&2; exit 1 ;;
 esac
 
-slug="${GITOPS_REPO#https://github.com/}"
-slug="${slug%.git}"
-slug="${slug%/}"
+# owner/name, read as the operator and agent-base-branch.sh read it.
+slug="$(python3 "${GITOPS_REPO_HELPER}" slug "${GITOPS_REPO}")" || exit 1
 token_path="${GITOPS_TOKEN_FILE/#\~/$HOME}"
 [ -r "${token_path}" ] || { echo "run-branch: token file ${token_path} is missing or unreadable" >&2; exit 1; }
 
@@ -183,15 +187,75 @@ branch_head() {
   json_field object sha
 }
 
+# gitops_pin_agent_base_branch (gke-labs/kube-agents#1970): the default branch
+# starts on the run branch's commit, so an agent that does not take the
+# install's configured base finds the same broken task directory on the
+# default and opens its pull request there, where the check workflow never
+# merges it. Fast-forward only, and only from the base itself when the base
+# is a root commit (a per-run repository's root): a default branch anywhere
+# else, or on a base with history, is refused, not moved. A default branch
+# already at the run branch's starting commit needs no write and is accepted
+# on any base. The checks run before anything is written (check_default_seed),
+# and a failed fast-forward deletes the branch it just created, so a refused or
+# failed seed leaves no branch behind: a failed create taints the resource and
+# its destroy-time delete never runs. Nothing restores the default: a per-run
+# repository is archived after its run.
+seed_default=""
+seed_default_head=""
+# check_default_seed <target>: an empty target is a commit still to be made.
+check_default_seed() {
+  local target="$1" code
+  seed_default="$(current_default_branch)"
+  case "${seed_default}" in
+    run/*) echo "run-branch: the default branch is '${seed_default}', a run branch; refusing to seed it" >&2; exit 1 ;;
+  esac
+  code="$(api "${GITHUB_API}/repos/${slug}/git/refs/heads/${seed_default}")"
+  [ "${code}" = "200" ] || { echo "run-branch: reading ${seed_default} failed, HTTP ${code}: $(cat "${body}")" >&2; exit 1; }
+  seed_default_head="$(json_field object sha)"
+  [ "${seed_default_head}" != "${target}" ] || return 0
+  [ "${seed_default_head}" = "${GITOPS_BASE_SHA}" ] \
+    || { echo "run-branch: default branch ${seed_default} is at ${seed_default_head}, neither the base ${GITOPS_BASE_SHA} nor ${target:-the commit this run would add}; refusing to move it" >&2; exit 1; }
+  code="$(api "${GITHUB_API}/repos/${slug}/git/commits/${GITOPS_BASE_SHA}")"
+  [ "${code}" = "200" ] || { echo "run-branch: reading base commit ${GITOPS_BASE_SHA} failed, HTTP ${code}: $(cat "${body}")" >&2; exit 1; }
+  python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("parents") == [] else 1)' < "${body}" \
+    || { echo "run-branch: the base ${GITOPS_BASE_SHA} has parents, so ${slug} is not a per-run repository at its root; refusing to move ${seed_default}" >&2; exit 1; }
+}
+
+seed_default_branch() {
+  local target="$1" code
+  if [ "${seed_default_head}" = "${target}" ]; then
+    echo "    default branch ${seed_default} already at ${target}"
+    return 0
+  fi
+  code="$(api -X PATCH "${GITHUB_API}/repos/${slug}/git/refs/heads/${seed_default}" -d "{\"sha\":\"${target}\",\"force\":false}")"
+  if [ "${code}" != "200" ]; then
+    echo "run-branch: fast-forwarding ${seed_default} to ${target} failed, HTTP ${code}: $(cat "${body}"); deleting ${GITOPS_RUN_BRANCH}" >&2
+    api -X DELETE "${GITHUB_API}/repos/${slug}/git/refs/heads/${GITOPS_RUN_BRANCH}" >/dev/null || true
+    exit 1
+  fi
+  echo "    default branch ${seed_default} -> ${target}, the same commit as ${GITOPS_RUN_BRANCH}"
+}
+
 case "${ACTION}" in
   create)
     : "${GITOPS_BASE_SHA:?}"
+    # Refused here, before the healthy commit of staged history is written.
+    if [ "${GITOPS_SEED_DEFAULT_BRANCH:-false}" = "true" ] && [ -n "${GITOPS_HISTORY_PARENT_SHA:-}" ]; then
+      echo "run-branch: seeding the default branch is not offered for staged history (the run branch moves on from the commit the default would stay at)" >&2
+      exit 1
+    fi
     if [ -n "${GITOPS_HISTORY_PARENT_SHA:-}" ]; then
       echo "==> run-branch: staged history for ${GITOPS_TASK:?}; healthy commit on ${GITOPS_HISTORY_PARENT_SHA}"
       target="$(commit_stage healthy "${GITOPS_HISTORY_PARENT_SHA}" "${HEALTHY_MESSAGE}" "${HEALTHY_AGE_DAYS}")"
     elif base_has_task_path; then
       target="${GITOPS_BASE_SHA}"
     else
+      target=""
+    fi
+    if [ "${GITOPS_SEED_DEFAULT_BRANCH:-false}" = "true" ]; then
+      check_default_seed "${target}"
+    fi
+    if [ -z "${target}" ]; then
       echo "==> run-branch: ${GITOPS_BASE_SHA} does not carry ${GITOPS_TASK_PATH:?}; committing the broken render on it"
       target="$(commit_stage broken "${GITOPS_BASE_SHA}" "${ADD_MESSAGE_PREFIX} ${GITOPS_TASK_PATH}" "${ADD_AGE_DAYS}")"
     fi
@@ -215,6 +279,9 @@ case "${ACTION}" in
           exit 1 ;;
       esac
       set_default_branch "${GITOPS_RUN_BRANCH}"
+    fi
+    if [ "${GITOPS_SEED_DEFAULT_BRANCH:-false}" = "true" ]; then
+      seed_default_branch "${target}"
     fi
     ;;
   advance)

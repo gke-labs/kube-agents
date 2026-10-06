@@ -36,9 +36,10 @@
 # provisioner, so it lives exactly as long as the task cluster: devops-bench's
 # teardown (`tofu destroy`) removes both. Reruns are safe because create
 # force-resets an existing run branch to the broken base. The default branch's
-# content is never written; the pilot-only default-branch mode
-# (gitops_switch_default_branch) moves the default-branch pointer to the run
-# branch for the run and back on destroy.
+# content is never written, except that gitops_pin_agent_base_branch
+# fast-forwards it onto the run branch's starting commit; the pilot-only
+# default-branch mode (gitops_switch_default_branch) moves the default-branch
+# pointer to the run branch for the run and back on destroy.
 
 terraform {
   required_version = ">= 1.5.0"
@@ -76,12 +77,13 @@ locals {
   # stages): their seed asserts the state that history produces and their
   # task_version names it, so the parent is required, not optional.
   staged_history_tasks = ["b-0011"]
-  task_path      = var.gitops_task_path != "" ? var.gitops_task_path : "tasks/${var.gitops_task}"
-  base_sha       = var.gitops_broken_base_sha
-  history_parent = var.gitops_history_parent_sha
-  manifests_dir  = "${path.module}/manifests/${var.gitops_task}"
-  # The task prompt names this branch via {{CLUSTER_NAME}}, so the default
-  # must stay in step with bench/tasks/<task>-gitops/task.yaml.
+  task_path            = var.gitops_task_path != "" ? var.gitops_task_path : "tasks/${var.gitops_task}"
+  base_sha             = var.gitops_broken_base_sha
+  history_parent       = var.gitops_history_parent_sha
+  manifests_dir        = "${path.module}/manifests/${var.gitops_task}"
+  # A GitOps case's prompt can name this branch via {{CLUSTER_NAME}}, so the
+  # default must stay in step with each GitOps case whose prompt names the run
+  # branch.
   run_branch = var.gitops_run_branch != "" ? var.gitops_run_branch : "run/${var.cluster_name}/${var.gitops_task}"
 }
 
@@ -112,6 +114,18 @@ resource "null_resource" "run_branch" {
       condition     = !contains(local.staged_history_tasks, var.gitops_task) || var.gitops_history_parent_sha != ""
       error_message = "gitops_history_parent_sha is required for ${var.gitops_task}: its seeding is the staged history, and a branch cut at the broken base alone fails the seed."
     }
+    precondition {
+      condition     = !(var.gitops_pin_agent_base_branch && var.gitops_switch_default_branch)
+      error_message = "gitops_pin_agent_base_branch and gitops_switch_default_branch are two ways to give the agent its base; with both set the default-branch switch hides whether the pinned base works."
+    }
+    precondition {
+      condition     = !var.gitops_pin_agent_base_branch || var.agent_host_context != ""
+      error_message = "gitops_pin_agent_base_branch needs agent_host_context: the base is set on the PlatformAgent there."
+    }
+    precondition {
+      condition     = !var.gitops_pin_agent_base_branch || (var.gitops_history_parent_sha == "" && !contains(local.staged_history_tasks, var.gitops_task))
+      error_message = "gitops_pin_agent_base_branch cannot run ${var.gitops_task} on staged history (a task main.tf lists as staged, or gitops_history_parent_sha set): run-branch.sh does not seed the default branch for staged history, whose run branch moves on from the commit the default would stay at."
+    }
   }
   triggers = {
     repo            = var.gitops_repo
@@ -124,6 +138,7 @@ resource "null_resource" "run_branch" {
     token_file      = var.gitops_token_file
     switch_default  = tostring(var.gitops_switch_default_branch)
     restore_default = var.gitops_restore_default_branch
+    seed_default    = tostring(var.gitops_pin_agent_base_branch)
     script          = "${path.module}/scripts/run-branch.sh"
   }
 
@@ -141,6 +156,7 @@ resource "null_resource" "run_branch" {
       GITOPS_TOKEN_FILE             = self.triggers.token_file
       GITOPS_SWITCH_DEFAULT_BRANCH  = self.triggers.switch_default
       GITOPS_RESTORE_DEFAULT_BRANCH = self.triggers.restore_default
+      GITOPS_SEED_DEFAULT_BRANCH    = self.triggers.seed_default
     }
   }
 
@@ -189,6 +205,46 @@ resource "null_resource" "setup" {
       ARGOCD_VERSION            = var.argocd_version
       AGENT_HOST_CONTEXT        = var.agent_host_context
       AGENT_NAMESPACE           = var.agent_namespace
+    }
+  }
+}
+
+# The PlatformAgent's PR base, pinned to the run branch for the run
+# (var.gitops_pin_agent_base_branch). After the seed, so the broker rolls
+# onto the base once everything else is in place; destroyed first, so the base
+# is cleared before the run branch it names is deleted.
+resource "null_resource" "agent_base_branch" {
+  count      = var.gitops_pin_agent_base_branch ? 1 : 0
+  depends_on = [null_resource.setup]
+
+  triggers = {
+    context   = var.agent_host_context
+    namespace = var.agent_namespace
+    repo      = var.gitops_repo
+    branch    = local.run_branch
+    script    = "${path.module}/scripts/agent-base-branch.sh"
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = "${self.triggers.script} pin"
+    environment = {
+      AGENT_HOST_CONTEXT = self.triggers.context
+      AGENT_NAMESPACE    = self.triggers.namespace
+      GITOPS_REPO        = self.triggers.repo
+      GITOPS_RUN_BRANCH  = self.triggers.branch
+    }
+  }
+
+  provisioner "local-exec" {
+    when        = destroy
+    interpreter = ["/bin/bash", "-c"]
+    command     = "${self.triggers.script} unpin"
+    environment = {
+      AGENT_HOST_CONTEXT = self.triggers.context
+      AGENT_NAMESPACE    = self.triggers.namespace
+      GITOPS_REPO        = self.triggers.repo
+      GITOPS_RUN_BRANCH  = self.triggers.branch
     }
   }
 }

@@ -901,6 +901,58 @@ class TestResolveRepo(WorkspaceTestCase):
 # --------------------------------------------------------------------------- #
 
 
+class TestRepositoryKeys(unittest.TestCase):
+    """The forge-neutral reading the broker's managed-repository gate keys on."""
+
+    def keys(self, entries):
+        return gitops_workspace._repository_keys(entries, "managed_repos")
+
+    def test_a_github_entry_is_keyed_under_its_canonical_host_however_written(self):
+        self.assertEqual(
+            ["github:github.com/acme/fleet", "github:github.com/acme/other"],
+            self.keys(
+                [
+                    {"type": "github", "url": "https://github.com/Acme/Fleet"},
+                    {"type": "github", "url": "acme/fleet"},
+                    {"type": "github", "url": "git@github.com:acme/other.git"},
+                ]
+            ),
+        )
+
+    def test_another_forges_entry_keeps_its_host_and_its_nested_path(self):
+        self.assertEqual(
+            ["gitlab:gitlab.example.com/acme/platform/infra"],
+            self.keys(
+                [{"type": "gitlab", "url": "https://gitlab.example.com/acme/platform/infra.git"}]
+            ),
+        )
+
+    def test_the_type_leads_the_key_as_written(self):
+        # The gate matches it against a forge's provider, so `GitHub` is not
+        # `github`, and a github.com URL under another type keys under that type.
+        self.assertEqual(
+            ["GitHub:github.com/acme/secret", "gitlab:github.com/acme/other"],
+            self.keys(
+                [
+                    {"type": "GitHub", "url": "https://github.com/acme/secret"},
+                    {"type": "gitlab", "url": "https://github.com/Acme/Other"},
+                ]
+            ),
+        )
+
+    def test_an_entry_with_no_host_to_key_by_or_no_type_is_skipped(self):
+        with self.assertLogs(gitops_workspace.LOGGER, level="WARNING"):
+            self.assertEqual(
+                [],
+                self.keys(
+                    [
+                        {"type": "gitlab", "url": "acme/infra"},
+                        {"url": "https://github.com/acme/fleet"},
+                    ]
+                ),
+            )
+
+
 class TestContextRepos(WorkspaceTestCase):
     """`context_repos` is a second key in the same ConfigMap, and a different list.
 

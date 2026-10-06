@@ -73,13 +73,27 @@ class GitHubForge(Forge):
 
     @classmethod
     def for_config(cls, config: Mapping[str, Any]) -> Iterable[Forge]:
-        """Exactly one, always.
+        """One, or none when the install's forge configuration leaves GitHub out.
 
-        An install has one GitHub or it has none, and "none" is not a state
-        this repository has ever been in -- github.com is where it lives. The
-        argument is read only for the two privileged operations to hand the
-        credentials: `refresh` for the write token, `mint` for a read-only one.
+        With no forge configuration at all (`forges` absent or None) the
+        install predates it and is GitHub, as every install has been. With one,
+        GitHub is built only if an entry names it -- a GitLab-only install has
+        no GitHub to resolve a bare name to. The only host served is
+        github.com: an enterprise host is a declared host this forge does not
+        mint for yet, and is refused rather than quietly treated as
+        github.com. `refresh` and `mint` are the two privileged operations the
+        credentials are handed.
         """
+        entries = config.get("forges")
+        if entries is not None:
+            mine = [entry for entry in entries if entry.get("provider") == cls.name]
+            if not mine:
+                return ()
+            for entry in mine:
+                if entry.get("host") not in cls.hosts:
+                    raise ValueError(
+                        f"{entry.get('host')} is not a {cls.name} host this broker serves"
+                    )
         return (cls(refresh=config.get("refresh"), mint=config.get("mint")),)
 
     def read_credential(self, repo: str) -> Credential:

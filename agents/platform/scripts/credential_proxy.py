@@ -881,11 +881,13 @@ _managed_repository_lock = threading.Lock()
 
 
 def managed_repositories() -> frozenset[str]:
-    """The `owner/name` slugs this install is configured to act on, lowercased.
+    """The repositories this install is configured to act on, as `host/path` keys.
 
     Read from the same mounted ConfigMap `github_token_refresh` already reads to
-    widen token scoping, through the same helper, so there is one parser and one
-    notion of what counts as a managed GitHub repository.
+    widen token scoping, through `gitops_workspace.get_managed_repo_keys`, so
+    there is one parser. Keyed by host as well as path because two forges can
+    each have an `acme/infra`, and a gate that compared paths alone would let
+    a registration on one forge admit the other forge's repository.
 
     Raises rather than returning empty when the list cannot be read. The two
     outcomes are not the same: an empty list is an install with nothing
@@ -894,11 +896,11 @@ def managed_repositories() -> frozenset[str]:
     Returning empty for both would make them indistinguishable in the log at the
     moment an operator most needs to tell them apart.
     """
-    return _cached_repository_slugs("_managed_repository_cache", "get_managed_github_repos")
+    return _cached_repository_slugs("_managed_repository_cache", "get_managed_repo_keys")
 
 
 def _cached_repository_slugs(cache_name: str, reader_name: str) -> frozenset[str]:
-    """One ConfigMap list, lowercased and cached for MANAGED_REPOSITORY_CACHE_SECONDS.
+    """One ConfigMap list's keys, cached for MANAGED_REPOSITORY_CACHE_SECONDS.
 
     The cache is a named module global rather than a dict entry because tests
     (and anyone invalidating by hand) reset it by assigning `None` to that
@@ -912,28 +914,54 @@ def _cached_repository_slugs(cache_name: str, reader_name: str) -> frozenset[str
             return cached[1]
     import gitops_workspace
 
-    slugs = frozenset(slug.lower() for slug in getattr(gitops_workspace, reader_name)())
+    # Not lowercased here: the reader already lowercased each key's host and
+    # path, and its leading provider must keep the case the entry was written
+    # with, or an entry typed `GitHub` would count as `github`.
+    slugs = frozenset(getattr(gitops_workspace, reader_name)())
     with _managed_repository_lock:
         globals()[cache_name] = (now + MANAGED_REPOSITORY_CACHE_SECONDS, slugs)
     return slugs
 
 
-def repository_is_managed(repository: str) -> bool:
-    """Is ``repository`` one this install registered?
+def _repository_key(repository: str, forge: providers.Forge | None) -> str:
+    """`provider:host/path` for ``repository`` on ``forge``, or on the install's one forge.
 
-    Compared case-insensitively because GitHub treats owner and repository names
-    that way, and the two sides of this comparison are written by different
-    people: the slug in the request comes from a git remote or a model, and the
-    one in the ConfigMap from whoever registered it.
+    The provider is part of the key, not only the host: an entry counts for the
+    forge it was registered as and no other, so an entry typed for one provider
+    that happens to name another provider's host admits nothing. A caller that
+    resolved the repository passes the forge it resolved to. One that holds a
+    bare path -- the content workspace, which serves one forge -- gets the
+    install's only forge; with more than one there is no such thing, and asking
+    is a bug the caller has to fix, so it raises, which every gate below treats
+    as an unreadable list and refuses.
     """
-    return repository.lower() in managed_repositories()
+    if forge is None:
+        forge = forge_registry().default
+        if forge is None:
+            raise LookupError(f"{repository} names no forge and this install has no one forge")
+    if not forge.hosts:
+        raise LookupError(f"{forge.name} serves no host to key {repository} under")
+    # The path and host compare case-insensitively; the provider does not,
+    # because `gitops_workspace` keeps an entry's `type` exactly as written.
+    return f"{forge.name}:" + f"{forge.hosts[0]}/{repository}".lower()
+
+
+def repository_is_managed(repository: str, forge: providers.Forge | None = None) -> bool:
+    """Is ``repository`` on ``forge`` one this install registered?
+
+    Compared case-insensitively because both forges this is written for treat
+    names that way, and the two sides of this comparison are written by
+    different people: the repository in the request comes from a git remote or
+    a model, and the one in the ConfigMap from whoever registered it.
+    """
+    return _repository_key(repository, forge) in managed_repositories()
 
 
 _context_repository_cache: tuple[float, frozenset[str]] | None = None
 
 
 def context_repositories() -> frozenset[str]:
-    """The `owner/name` slugs registered under `context_repos`, lowercased.
+    """The repositories registered under `context_repos`, as `provider:host/path` keys.
 
     The list the agent may only *read*: the second key of the same ConfigMap,
     through the same module and with the same cache window as the managed list,
@@ -941,10 +969,10 @@ def context_repositories() -> frozenset[str]:
     that separation is the safety property. Raises when unreadable, for the
     reason `managed_repositories` gives.
     """
-    return _cached_repository_slugs("_context_repository_cache", "get_context_github_repos")
+    return _cached_repository_slugs("_context_repository_cache", "get_context_repo_keys")
 
 
-def repository_role(repository: str) -> str:
+def repository_role(repository: str, forge: providers.Forge | None = None) -> str:
     """Which list ``repository`` is registered in: managed, context, or neither.
 
     Managed wins. A repository in both lists is one the install writes to, and
@@ -954,11 +982,26 @@ def repository_role(repository: str) -> str:
     question `commit`, `push`, the API routes and the refresh route ask, and
     `ROLE_CONTEXT` is not an answer any of them accepts.
     """
-    if repository_is_managed(repository):
+    if repository_is_managed(repository, forge):
         return ROLE_MANAGED
-    if repository.lower() in context_repositories():
+    if _repository_key(repository, forge) in context_repositories():
         return ROLE_CONTEXT
     return ROLE_UNREGISTERED
+
+
+def _provider_forge(provider: str) -> providers.Forge:
+    """The configured forge called ``provider``, or a refusal.
+
+    For the privileged operations, which are handed a provider name and a path
+    by a caller that has already resolved them. A provider this install did not
+    build is refused rather than read as the install's one forge: answering for
+    it from another forge's list is how a registration on one forge would
+    admit a name on another.
+    """
+    for forge in forge_registry().forges:
+        if forge.name == provider:
+            return forge
+    raise PermissionError(f"{provider} is not a forge this install serves")
 
 
 def read_credential_for(registry: providers.Registry, repository: str) -> providers.Credential:
@@ -977,7 +1020,19 @@ def read_credential_for(registry: providers.Registry, repository: str) -> provid
     anyway.
     """
     try:
-        role = repository_role(repository)
+        forge, repo = registry.resolve(repository)
+    except providers.WorkspaceError as exc:
+        # Not the lists: the name does not resolve to a forge this install
+        # serves (a bare name with more than one forge, or none built).
+        LOGGER.warning(
+            "content workspace open repo=%s role=unknown: the repository does not "
+            "resolve to a forge this install serves code=%s; cloning without a credential",
+            repository,
+            exc.fields.get("code"),
+        )
+        return providers.NoCredential()
+    try:
+        role = repository_role(repo, forge)
     except Exception as exc:  # noqa: BLE001 - the clone proceeds without it
         LOGGER.warning(
             "content workspace open repo=%s role=unknown: the repository lists "
@@ -987,9 +1042,9 @@ def read_credential_for(registry: providers.Registry, repository: str) -> provid
         )
         return providers.NoCredential()
     LOGGER.info("content workspace open repo=%s role=%s", repository, role)
-    if role != ROLE_CONTEXT or registry.default is None:
+    if role != ROLE_CONTEXT:
         return providers.NoCredential()
-    return registry.default.read_credential(repository)
+    return forge.read_credential(repo)
 
 
 def require_managed_workspace(store, handle: object) -> None:
@@ -4832,7 +4887,7 @@ class CommandExecutor:
         spends the token, so it is the call that has to ask.
         """
         helper = self._forge_helper(provider)
-        if not repository_is_managed(repository):
+        if not repository_is_managed(repository, _provider_forge(provider)):
             raise PermissionError(f"{repository} is not a repository this install manages")
         clean_repo = repository.strip().lower()
         org = clean_repo.split("/", 1)[0] if "/" in clean_repo else clean_repo
@@ -4948,7 +5003,7 @@ class CommandExecutor:
         path does (and, unlike it, not on success), and stdout is not.
         """
         helper = self._forge_helper(provider)
-        if repository_role(repository) != ROLE_CONTEXT:
+        if repository_role(repository, _provider_forge(provider)) != ROLE_CONTEXT:
             raise PermissionError(
                 f"{repository} is not a context repository of this install"
             )
@@ -5567,6 +5622,8 @@ def build_vcs_broker(executor: CommandExecutor, base_branch: str = ""):
         cli_runner=executor.execute_forge_cli,
         refresh=executor.refresh_forge_credential,
         base_branch=base_branch,
+        http_timeout=executor.timeout_seconds,
+        http_max_bytes=executor.max_output_bytes,
     )
     LOGGER.info(
         "version control enabled root=%s forges=%s",
@@ -6236,7 +6293,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         )
         return False
 
-    def _repository_is_permitted(self, repository: str) -> bool:
+    def _repository_is_permitted(
+        self, repository: str, forge: providers.Forge | None = None
+    ) -> bool:
         """Answer 403 and return False unless this install registered ``repository``.
 
         The broker is where this belongs and where it has not been until now.
@@ -6251,7 +6310,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         it was in the log: an authorization check that fails open is not one.
         """
         try:
-            permitted = repository_is_managed(repository)
+            permitted = repository_is_managed(repository, forge)
         except Exception as exc:
             LOGGER.warning(
                 "refusing a repository request: the managed-repository list "
@@ -7199,7 +7258,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
 
-        if not self._repository_is_permitted(repository):
+        if not self._repository_is_permitted(repository, forge):
             return
 
         try:
@@ -7293,23 +7352,24 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     return
                 # The managed-repository control, on the same footing as
                 # `require_managed_workspace` on the content routes: the broker
-                # holds the forge credential, so "is this a repository we write
-                # to" can only be answered here. Nothing downstream answers it
+                # holds the forge credential, so "is this a repository we act
+                # on" can only be answered here. Nothing downstream answers it
                 # -- a forge is handed a repository and spends the token on it
-                # -- so this is the whole of the check for these routes.
+                # -- so this is the whole of the check for these routes, reads
+                # included (see `vcs_broker.UNGATED_VERBS`).
                 #
                 # Resolved rather than compared as given, because the managed
-                # list holds slugs and a caller may name a repository by URL.
-                # Resolving here also rejects a host this install serves no
-                # credential for before the write verb is entered, which is the
-                # same order `/v1/forge/refresh` uses.
-                if verb in vcs_broker.WRITE_VERBS:
+                # list holds `provider:host/path` keys and a caller may name a
+                # repository by URL. Resolving here also rejects a host this
+                # install serves no credential for before the verb is entered,
+                # which is the same order `/v1/forge/refresh` uses.
+                if verb not in vcs_broker.UNGATED_VERBS:
                     try:
-                        _, repository = self.vcs.registry.resolve(payload.get("repository"))
+                        forge, repository = self.vcs.registry.resolve(payload.get("repository"))
                     except providers.WorkspaceError as exc:
                         self._json(HTTPStatus(exc.status), _redacted_fields(exc))
                         return
-                    if not self._repository_is_permitted(repository):
+                    if not self._repository_is_permitted(repository, forge):
                         return
                 result = route(payload)
                 self._json(HTTPStatus.OK, result)
