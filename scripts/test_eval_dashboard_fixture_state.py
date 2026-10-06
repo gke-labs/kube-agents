@@ -470,7 +470,10 @@ class NotChecked(ScanHarness):
         doc = {"projects": {"p1": {"roles": {r: {"state": "absent", "detail": ["project p1 carries no clusters labelled environment=seeded,managed-by=kube-agents-seeded-fleet. Apply bench/tf/fleet/ there"]} for r in ("a", "b")}}}}
         self.assertEqual(fixture_state.checked_projects(doc), 1)
         self.assertEqual((fixture_state.absent_units(doc), fixture_state.absent_projects(doc), fixture_state.unread_units(doc)), (2, 1, 0))
-        self.assertIn("carries no clusters labelled", fixture_state.not_checked_reason(doc) or "")
+        # The same predicate on both counts: a project reached only through
+        # its absent roles still reports the reads that failed there.
+        doc["projects"]["p1"]["roles"]["c"] = {"state": "not_checked", "detail": ["no credentials for seeded cluster fleet-seeded-a in p1"]}
+        self.assertEqual((fixture_state.checked_projects(doc), fixture_state.unread_units(doc)), (1, 1))
 
     def test_a_slot_with_no_cluster_is_absent_and_a_credential_failure_is_not_checked(self):
         warnings = ["project p has no labelled seeded cluster for slot 'd' (a name ending in '-d'), so every check naming a role on it will report status=error."]

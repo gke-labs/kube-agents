@@ -1189,7 +1189,7 @@ def fixture_digest_line(health: dict) -> str | None:
     unchecked = f", {total - checked} not checked" if total > checked else ""
     unread = int(block.get("unread_units") or 0)
     absent = int(block.get("absent_units") or 0)
-    # A project counts as checked when one role was read. A fixture the stack
+    # A project counts as checked when one role was read or seen absent. A fixture the stack
     # has not planted there (or something destroyed) is absent: a rollout the
     # next reconcile finishes, said apart from a read that failed, which is
     # not a fixture in its designed state either way.

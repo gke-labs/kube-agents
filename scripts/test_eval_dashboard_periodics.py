@@ -294,12 +294,19 @@ class AssessTest(unittest.TestCase):
         lines = periodics.reconcile_detail(artifact)
         self.assertEqual(lines[0], "kube-agents-evals-3: refused (1 refused: delete x); next: a code change, or an entry in bench/tf/fleet/reconcile-allow.json")
         self.assertEqual(lines[1], "kube-agents-evals-4: failed (tofu apply exited 1: boom); next: nothing by hand, the next run retries it")
+        # tofu's own lock error counts as locked too, and a non-string detail does not crash the tick.
+        locked = {"outcomes": {"p": {"outcome": "failed", "detail": "tofu plan exited 1: Error acquiring the state lock: ConditionNotMet ... Lock Info: ID 1234"}}}
+        self.assertTrue(periodics.reconcile_detail(locked)[0].endswith(periodics.RECONCILE_NEXT_STEP_LOCKED))
+        odd = {"outcomes": {"p": {"outcome": "failed", "detail": 1}, "q": {"outcome": "refused", "detail": True}}}
+        self.assertEqual(len(periodics.reconcile_detail(odd)), 2)
         ceiling = {"outcomes": {"p": {"outcome": "failed", "detail": "did not finish within 3600s; tofu was interrupted, and killed if it did not stop within 120s, which leaves the state locked: tofu force-unlock"}}}
         self.assertEqual(periodics.reconcile_detail(ceiling), ["p: failed (did not finish within 3600s; tofu was interrupted, and killed if it did not stop within 120s, which leaves the state locked: tofu force-unlock); next: tofu force-unlock against that project's state, then the next run retries it"])
         self.assertEqual(lines[2], "kube-agents-evals-5: interrupted (terminated (signal 15) while tofu ran; ...: tofu force-unlock); next: the next run retries it, and force-unlocks only if it fails on the lock")
         self.assertEqual(lines[3], "2 not reached (not started: 100s left in the run's budget, under the 3600s per-project ceiling; the next run takes it)")
-        self.assertEqual(lines[4], "allowlist: 1 entry no plan needed, remove it: google_compute_disk.gone")
-        self.assertEqual(lines[5], "run: 2 project(s) not reconciled: kube-agents-evals-3, kube-agents-evals-4")
+        # The interrupted project carries no allowlist verdict, so this run
+        # says nothing about the entry the others did not need.
+        self.assertEqual(lines[4], "run: 2 project(s) not reconciled: kube-agents-evals-3, kube-agents-evals-4")
+        self.assertEqual(len(lines), 5)
 
     def test_an_allowlist_entry_some_project_still_needed_is_not_called_unused(self):
         artifact = {"outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}, "p2": {"outcome": "applied", "detail": "", "allowlist_unused": []}}}
@@ -310,8 +317,12 @@ class AssessTest(unittest.TestCase):
         # the entry.
         artifact = {"visited": 1, "mapped": 2, "outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}, "p2": {"outcome": "busy", "detail": ""}}}
         self.assertEqual(periodics.reconcile_detail(artifact), [])
+        # A visited project whose plan was never read (failed at init) carries
+        # no verdict, and that is the project that may still need the entry.
         artifact = {"visited": 2, "mapped": 2, "outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}, "p2": {"outcome": "failed", "detail": "init"}}}
-        self.assertEqual(periodics.reconcile_detail(artifact)[-1], "allowlist: 1 entry no plan needed, remove it: a")
+        self.assertFalse(any(line.startswith("allowlist:") for line in periodics.reconcile_detail(artifact)))
+        artifact = {"visited": 2, "mapped": 2, "outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}, "p2": {"outcome": "converged", "detail": "", "allowlist_unused": ["a"]}}}
+        self.assertEqual(periodics.reconcile_detail(artifact), ["allowlist: 1 entry no plan needed, remove it: a"])
         self.assertEqual(periodics.reconcile_detail({"outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}}}), [], "no visited/mapped counts, no claim")
 
     def test_runs_carry_whether_the_build_was_a_dry_run(self):
@@ -534,7 +545,12 @@ class WorkflowWiring(unittest.TestCase):
     def test_the_watched_jobs_are_the_two_periodics_and_the_postsubmit(self):
         # The names are the Prow job names in oss-test-infra, which nothing here
         # can check; a rename there is a rename here.
-        self.assertEqual([p.job for p in periodics.WATCHED], ["ci-kube-agents-pull-sweep", "ci-kube-agents-fleet-reconcile-daily", "post-kube-agents-fleet-reconcile"])
+        # The hourly and the weekly stay watched until the oss-test-infra
+        # change retires them: the watch must not go dark between the merges.
+        self.assertEqual(
+            [p.job for p in periodics.WATCHED],
+            ["ci-kube-agents-pull-sweep", "ci-kube-agents-fleet-reconcile", "ci-kube-agents-fleet-reconcile-all", "ci-kube-agents-fleet-reconcile-daily", "post-kube-agents-fleet-reconcile"],
+        )
         for periodic in periodics.WATCHED:
             self.assertTrue(periodic.stale_after is None or periodic.stale_after >= timedelta(hours=1))
         self.assertIsNone(POST.stale_after, "a job that runs on merges has no cadence to be late against")

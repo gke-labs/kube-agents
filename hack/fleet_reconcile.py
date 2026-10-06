@@ -472,7 +472,7 @@ def load_allowlist(path):
         unknown = set(item) - ALLOW_KEYS
         if unknown:
             raise ReconcileError("%s: entry %r has keys this script does not read: %s" % (path, item[ALLOW_KEY_ADDRESS], ", ".join(sorted(unknown))))
-        if not ALLOW_ADDRESS_RE.match(item[ALLOW_KEY_ADDRESS]):
+        if not ALLOW_ADDRESS_RE.fullmatch(item[ALLOW_KEY_ADDRESS]):
             raise ReconcileError("%s: %r is not a resource address (type.name, optionally module-prefixed or indexed)" % (path, item[ALLOW_KEY_ADDRESS]))
         standing = item.get(ALLOW_KEY_STANDING, False)
         # A JSON boolean only: a string "false" is true, and a standing entry
@@ -683,11 +683,23 @@ class Run:
             self._stop = moved
         return self._stop
 
-    def _main_moved(self):
+    def require_main_readable(self):
+        """The first read of `main_ref`, before anything is leased: a ref git
+        cannot fetch is a configuration error, not "main has not moved"; a
+        failure later in the run is a warning the report carries."""
+        if not self.main_ref:
+            return
+        moved = self._main_moved(force=True)
+        if self.main_check_error:
+            raise ReconcileError("--stop-when-moved %s: %s" % (self.main_ref, self.main_check_error))
+        if moved:
+            self._stop = moved
+
+    def _main_moved(self, force=False):
         if not self.main_ref:
             return None
         now = clock()
-        if self._last_main_check is not None and now - self._last_main_check < MAIN_CHECK_INTERVAL_SECONDS:
+        if not force and self._last_main_check is not None and now - self._last_main_check < MAIN_CHECK_INTERVAL_SECONDS:
             return None
         self._last_main_check = now
         remote, _, branch = self.main_ref.partition("/")
@@ -759,15 +771,22 @@ def _record(project, outcomes, runner, dry_run, run=None):
     if terminating() and outcome[0] == OUTCOME_FAILED:
         # A worker's tofu exited on the interrupt the main thread forwarded.
         outcome = (OUTCOME_INTERRUPTED, REASON_INTERRUPTED % "signal")
-    if outcome[0] in AT_TREE_OUTCOMES and not dry_run and run.publish:
-        warning = publish_applied(project, outcome[0], run)
-        if warning:
-            outcome = (outcome[0], "%s; %s" % (outcome[1], warning))
+    # On the record before the marker is written: a termination during the
+    # write must not drop a project whose apply just happened. No allowlist
+    # verdict for a plan that was not read: an empty list would read as "this
+    # project needed every entry" when the entries are counted.
     outcomes[project] = outcome
-    # No allowlist verdict for a plan that was not read: an empty list would
-    # read as "this project needed every entry" when the entries are counted.
     run.mark(project, finished_at=_iso(time.time()), **({"allowlist_unused": extras["allowlist_unused"]} if "allowlist_unused" in extras else {}))
-    _line(project, outcome)
+    if outcome[0] in AT_TREE_OUTCOMES and not dry_run and run.publish:
+        try:
+            warning = publish_applied(project, outcome[0], run)
+        except boskos_pool.Terminated:
+            outcomes[project] = (outcome[0], "%s; %s" % (outcome[1], WARNING_MARKER % "terminated during the write"))
+            _line(project, outcomes[project])
+            raise
+        if warning:
+            outcomes[project] = (outcome[0], "%s; %s" % (outcome[1], warning))
+    _line(project, outcomes[project])
 
 def report(outcomes):
     failing = sorted(p for p, (outcome, _) in outcomes.items() if outcome in FAILING_OUTCOMES)
@@ -1013,7 +1032,6 @@ def main(argv=None):
     parser.add_argument("--project-ceiling-seconds", type=int, default=PROJECT_TIMEOUT_SECONDS, help="the most one project may take, init through apply (default: %(default)s)")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="projects reconciled at once, each under its own lease (default: %(default)s)")
     parser.add_argument("--stop-when-moved", metavar="REMOTE/BRANCH", help="stop, with the rest not reached, once this ref's bench/tf/fleet tree differs from the checkout's (the jobs pass origin/main)")
-    parser.add_argument("--allowlist", default=str(ALLOWLIST_FILE), help="the deletes and replaces a re-apply may make (default: %(default)s)")
     parser.add_argument("--no-publish", action="store_true", help="do not write applied.json to the project's state bucket")
     parser.add_argument(
         "--report",
@@ -1039,6 +1057,12 @@ def main(argv=None):
         remote, _, branch = args.stop_when_moved.partition("/")
         if not remote or not branch:
             parser.error("--stop-when-moved takes REMOTE/BRANCH, for example origin/main")
+    if args.project_ceiling_seconds < 1:
+        parser.error("--project-ceiling-seconds must be at least 1")
+    if args.budget_seconds is not None and args.budget_seconds < args.project_ceiling_seconds:
+        # A budget under one ceiling would drain every project as not reached
+        # and exit green, applying nothing.
+        parser.error("--budget-seconds must be at least the per-project ceiling (%d)" % args.project_ceiling_seconds)
     for sig in TERMINATION_SIGNALS:
         signal.signal(sig, boskos_pool.terminate)
     outcomes = {}
@@ -1047,7 +1071,13 @@ def main(argv=None):
     code = None
     run = None
     try:
-        run = _start(args, error)
+        try:
+            run = _start(args, error)
+        except SystemExit as exc:
+            # A refused allowlist or an unreadable main ref: reported above,
+            # nothing leased, the report still written below.
+            code = exc.code if isinstance(exc.code, int) else EXIT_FAILED
+            return code
         code = _run(args, outcomes, error, run)
     except BaseException as exc:
         # Unhandled: the report still names what killed the run.
@@ -1076,14 +1106,16 @@ def _provenance():
 def _start(args, error):
     """The Run for these arguments; the allowlist is read whole first, so a
     malformed one stops the run before anything is leased."""
+    # The committed, reviewed list and no other: there is no flag to point a
+    # run at a different file.
     try:
-        allow = load_allowlist(args.allowlist)
+        allow = load_allowlist(ALLOWLIST_FILE)
     except ReconcileError as exc:
         error.append(str(exc))
         print("ERROR: %s" % exc, file=sys.stderr)
         raise SystemExit(EXIT_FAILED)
     commit, fleet_tree = _provenance()
-    return Run(
+    run = Run(
         budget_seconds=args.budget_seconds,
         ceiling_seconds=args.project_ceiling_seconds,
         main_ref=args.stop_when_moved,
@@ -1095,6 +1127,13 @@ def _start(args, error):
         job=os.environ.get(JOB_NAME_ENV),
         publish=not args.no_publish,
     )
+    try:
+        run.require_main_readable()
+    except ReconcileError as exc:
+        error.append(str(exc))
+        print("ERROR: %s" % exc, file=sys.stderr)
+        raise SystemExit(EXIT_FAILED)
+    return run
 
 
 def write_report(path, args, outcomes, code, error, started, run=None):

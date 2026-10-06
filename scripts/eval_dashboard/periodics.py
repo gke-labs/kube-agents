@@ -100,9 +100,10 @@ RECONCILE_NEXT_STEP = {
     "failed": "nothing by hand, the next run retries it",
     "interrupted": "the next run retries it, and force-unlocks only if it fails on the lock",
 }
-# A `failed` whose detail names the lock (the ceiling cut the apply, or the
-# next run already failed on the lock) owes a hand step before any retry.
-RECONCILE_LOCK_MARKER = "force-unlock"
+# A `failed` whose detail names the lock owes a hand step before any retry:
+# this script's own words when the ceiling cut the apply, and tofu's when the
+# next run failed on the lock it left.
+RECONCILE_LOCK_MARKERS = ("force-unlock", "Error acquiring the state lock")
 RECONCILE_NEXT_STEP_LOCKED = "tofu force-unlock against that project's state, then the next run retries it"
 RECONCILE_OUTCOME_NOT_REACHED = "not_reached"
 # The report's outcome names as the message says them.
@@ -200,6 +201,21 @@ WATCHED = (
         f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#55-the-repository-reset-and-the-sweep-behind-it",
         SWEEP_RUN_ALERT_AFTER,
     ),
+    # The hourly and the weekly stay watched until the oss-test-infra change
+    # retires them for the daily and the postsubmit below; a follow-up removes
+    # these two entries then, so the watch never goes dark between the merges.
+    Periodic(
+        "ci-kube-agents-fleet-reconcile", "seeded-fleet reconcile (hourly, retiring)", timedelta(hours=3), RECONCILE_ARTIFACT,
+        "Eval seeded fleet", "planted defects are not being re-applied", "planted defects are being re-applied again",
+        "runs hourly and re-applies the seeded-fleet stack in the pool projects the scan reports drifted", RECONCILE_EFFECT,
+        f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#62-the-scheduled-reconcile",
+    ),
+    Periodic(
+        "ci-kube-agents-fleet-reconcile-all", "seeded-fleet reconcile (weekly, retiring)", timedelta(hours=192), RECONCILE_ARTIFACT,
+        "Eval seeded fleet", "planted defects are not being re-applied", "planted defects are being re-applied again",
+        "runs weekly and re-applies the seeded-fleet stack in every free pool project", RECONCILE_EFFECT,
+        f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#62-the-scheduled-reconcile",
+    ),
     Periodic(
         RECONCILE_DAILY_JOB, "seeded-fleet reconcile (daily)", timedelta(hours=36), RECONCILE_ARTIFACT,
         "Eval seeded fleet", "planted defects are not being re-applied", "planted defects are being re-applied again",
@@ -215,7 +231,7 @@ WATCHED = (
 )
 WATCHED_BY_JOB = {p.job: p for p in WATCHED}
 # The reconcile jobs, for the digest's run line; the words name the trigger.
-RECONCILE_RUN_WORDS = {RECONCILE_DAILY_JOB: "daily run", RECONCILE_POSTSUBMIT_JOB: "on-merge run"}
+RECONCILE_RUN_WORDS = {"ci-kube-agents-fleet-reconcile": "hourly run", "ci-kube-agents-fleet-reconcile-all": "weekly run", RECONCILE_DAILY_JOB: "daily run", RECONCILE_POSTSUBMIT_JOB: "on-merge run"}
 
 
 def history_url(job: str) -> str:
@@ -402,8 +418,8 @@ def reconcile_detail(artifact: dict | None) -> list[str]:
         outcome = entry.get(REPORT_KEY_OUTCOME)
         if outcome not in RECONCILE_NAMED_OUTCOMES:
             continue
-        detail = entry.get(REPORT_KEY_DETAIL) or "no detail"
-        step = RECONCILE_NEXT_STEP_LOCKED if outcome == "failed" and RECONCILE_LOCK_MARKER in detail else RECONCILE_NEXT_STEP[outcome]
+        detail = str(entry.get(REPORT_KEY_DETAIL) or "no detail")
+        step = RECONCILE_NEXT_STEP_LOCKED if outcome == "failed" and any(marker in detail for marker in RECONCILE_LOCK_MARKERS) else RECONCILE_NEXT_STEP[outcome]
         lines.append(f"{project}: {outcome} ({detail}); next: {step}")
     # The cap counts projects; the lines after it are one each.
     if len(lines) > DETAIL_LIMIT:
@@ -411,10 +427,12 @@ def reconcile_detail(artifact: dict | None) -> list[str]:
     not_reached = [e for e in entries.values() if e.get(REPORT_KEY_OUTCOME) == RECONCILE_OUTCOME_NOT_REACHED]
     if not_reached:
         lines.append(f"{len(not_reached)} not reached ({not_reached[0].get(REPORT_KEY_DETAIL) or 'no detail'})")
-    # Said only about a run that reached every mapped project: the projects
-    # a partial run missed are the ones that may still need the entry.
+    # Said only about a run that reached every mapped project and read every
+    # plan: a project missed, or one that failed before its plan, is the one
+    # that may still need the entry.
     visited, mapped = artifact.get(REPORT_KEY_VISITED), artifact.get(REPORT_KEY_MAPPED)
-    unused = allowlist_unused(entries) if isinstance(visited, int) and isinstance(mapped, int) and visited == mapped else []
+    with_verdict = sum(1 for e in entries.values() if isinstance(e.get(REPORT_KEY_ALLOWLIST_UNUSED), list))
+    unused = allowlist_unused(entries) if isinstance(visited, int) and isinstance(mapped, int) and visited == mapped and with_verdict == visited else []
     if unused:
         lines.append(f"allowlist: {len(unused)} {'entry' if len(unused) == 1 else 'entries'} no plan needed, remove {'it' if len(unused) == 1 else 'them'}: {', '.join(unused)}")
     if artifact.get(REPORT_KEY_ERROR):

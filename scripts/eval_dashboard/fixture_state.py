@@ -410,7 +410,9 @@ def unread_units(document: dict | None) -> int:
         if not isinstance(roles, dict):
             continue
         states = [v.get(KEY_STATE) for v in roles.values() if isinstance(v, dict)]
-        if any(s in (ROLE_HEALTHY, ROLE_DRIFTED) for s in states):
+        # The same "reached" test as checked_projects: a project seen only
+        # through absent roles still reports the reads that failed there.
+        if any(s in (ROLE_HEALTHY, ROLE_DRIFTED, ROLE_ABSENT) for s in states):
             count += sum(1 for s in states if s == ROLE_NOT_CHECKED)
     return count
 
@@ -488,13 +490,6 @@ def not_checked_reason(document: dict | None) -> str | None:
         for verdict in (roles or {}).values():
             if isinstance(verdict, dict) and verdict.get(KEY_STATE) == ROLE_NOT_CHECKED and verdict.get(KEY_DETAIL):
                 reasons[str(verdict[KEY_DETAIL][0])] += 1
-    if not reasons:
-        # Nothing failed to read: the commonest absence explains the scan instead.
-        for entry in (projects or {}).values() if isinstance(projects, dict) else []:
-            roles = (entry or {}).get(KEY_ROLES) if isinstance(entry, dict) else None
-            for verdict in (roles or {}).values():
-                if isinstance(verdict, dict) and verdict.get(KEY_STATE) == ROLE_ABSENT and verdict.get(KEY_DETAIL):
-                    reasons[str(verdict[KEY_DETAIL][0])] += 1
     return reasons.most_common(1)[0][0] if reasons else None
 
 

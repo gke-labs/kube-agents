@@ -615,11 +615,31 @@ class MainTest(unittest.TestCase):
         with self.assertRaises(SystemExit), mock.patch("sys.stderr", io.StringIO()):
             reconcile.main(["--all", "--no-lease"])
 
+    def test_a_budget_under_one_ceiling_or_a_ceiling_under_a_second_is_refused_by_the_parser(self):
+        # A budget the first project cannot fit would drain every project as
+        # not reached and exit green, applying nothing.
+        for argv in (["--budget-seconds", "0"], ["--budget-seconds", "1800"], ["--budget-seconds", "-5"], ["--project-ceiling-seconds", "0"], ["--budget-seconds", "100", "--project-ceiling-seconds", "200"]):
+            with self.assertRaises(SystemExit, msg=argv), mock.patch("sys.stderr", io.StringIO()), mock.patch.object(reconcile.signal, "signal"):
+                reconcile.main(["--all"] + argv)
+
+    def test_a_main_ref_git_cannot_read_fails_the_run_before_anything_is_leased(self):
+        # The first check is configuration: a ref that cannot be fetched is
+        # not "main has not moved", it is a guard that would be off all run.
+        boskos = _Boskos(free=[P7])
+        stderr = io.StringIO()
+        with mock.patch.object(reconcile, "git_output", _git_whose_fetch_fails), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(
+            reconcile, "tofu_runner", _Tofu({P7: UPDATE_ONLY})
+        ), mock.patch.object(reconcile.signal, "signal"), mock.patch.object(reconcile, "pool_projects", lambda *a, **k: {P7}), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", stderr):
+            rc = reconcile.main(["--all", "--stop-when-moved", "upstream/main", "--boskos-server", BOSKOS, "--boskos-owner", OWNER])
+        self.assertEqual(rc, reconcile.EXIT_FAILED)
+        self.assertEqual(boskos.acquired, [])
+        self.assertIn("could not resolve host", stderr.getvalue())
+
     def test_a_main_ref_without_a_remote_is_refused_by_the_parser(self):
         # `--stop-when-moved main` would fetch remote "main", branch "", fail
         # every check and leave the guard off with a warning.
         for bad in ("main", "origin/", "/main"):
-            with self.assertRaises(SystemExit, msg=bad), mock.patch("sys.stderr", io.StringIO()):
+            with self.assertRaises(SystemExit, msg=bad), mock.patch("sys.stderr", io.StringIO()), mock.patch.object(reconcile.signal, "signal"):
                 reconcile.main(["--all", "--stop-when-moved", bad])
 
 
@@ -1403,8 +1423,19 @@ class AllowlistTest(unittest.TestCase):
             self.assertEqual((entries[0].address, entries[0].why, entries[0].standing), ("google_compute_disk.orphan", "revert", False))
             self.assertEqual(entries[1].address, 'module.fleet.kubernetes_network_policy_v1.default_deny["token"]')
 
-    def test_a_missing_allowlist_file_means_nothing_may_be_destroyed(self):
+    def test_a_missing_committed_allowlist_means_nothing_may_be_destroyed(self):
+        # The default path only: there is no flag to point the run at another
+        # file, so the committed, reviewed list is the one every run reads.
         self.assertEqual(reconcile.load_allowlist(pathlib.Path("/nonexistent/allow.json")), [])
+        with self.assertRaises(SystemExit), mock.patch("sys.stderr", io.StringIO()), mock.patch.object(reconcile.signal, "signal"):
+            reconcile.main(["--all", "--allowlist", "/tmp/x.json"])
+
+    def test_an_address_with_a_trailing_newline_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "allow.json"
+            path.write_text(json.dumps([{"address": "google_container_node_pool.no_surge_pool\n", "why": "x", "standing": True}]))
+            with self.assertRaises(reconcile.ReconcileError):
+                reconcile.load_allowlist(path)
 
 
 class ReportFieldsTest(unittest.TestCase):
@@ -1457,6 +1488,21 @@ class ReportFieldsTest(unittest.TestCase):
         body = json.loads(stdin)
         self.assertEqual((body["commit"], body["fleet_tree"], body["build"], body["job"], body["outcome"]), ("commit-111", "tree-aaa", "123", "post-x", "applied"))
         self.assertTrue(body["finished_at"].endswith("Z"))
+
+    def test_a_termination_during_the_marker_write_keeps_the_applied_project_on_the_record(self):
+        def gcloud(argv, **kw):
+            raise boskos_pool.Terminated("signal 15")
+
+        boskos = _Boskos(free=[P7, P8])
+        run = reconcile.Run(commit="c", fleet_tree="t", publish=True)
+        outcomes = {}
+        with mock.patch.object(reconcile, "gcloud_runner", gcloud), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()):
+            with self.assertRaises(boskos_pool.Terminated):
+                reconcile.reconcile_pool(BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY, P8: UPDATE_ONLY}), known=KNOWN, run=run, outcomes=outcomes)
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED, "the apply happened; the marker did not")
+        self.assertIn("applied.json not written", outcomes[P7][1])
+        self.assertEqual(outcomes[P8][0], reconcile.OUTCOME_NOT_REACHED)
+        self.assertEqual(boskos.released, [P7])
 
     def test_a_failed_marker_write_is_a_warning_on_the_outcome_not_a_failure(self):
         def gcloud(argv, **kw):
