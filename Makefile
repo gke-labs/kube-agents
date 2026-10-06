@@ -568,8 +568,43 @@ coverage-check: ## Fail if total Python coverage is below COVERAGE_FLOOR. Run `m
 # specs directly -- the roster-collision sweep in tests/test_verifiers.py,
 # which has to see every task's phrases at once -- so the parser belongs with
 # the test runner. Keep in step with bench/pyproject.toml's `dev` group.
-test-bench-deps: ## Install what `make test-bench` needs: bench/ editable plus pytest and pyyaml. Resolves devops-bench from the git SHA pinned in bench/pyproject.toml, so the first run needs network.
-	@python3 -m pip install -e bench/ pytest pyyaml
+#
+# The install is retried because the devops-bench pin is a git clone from
+# github.com, and pip retries its HTTP downloads but not that clone: one
+# GitHub-side 504 on it failed a pull request's bench job outright, and a
+# re-run of the same tree passed. Three attempts a fixed few seconds apart
+# absorb a single bad transfer and little more; each failed attempt is
+# announced on stderr, and the last still exits non-zero so a genuine error --
+# a broken pin, a missing build backend -- stays an error. The tunables are
+# checked before the loop reads them: `?=` does not stop an exported empty
+# variable or `make ... BENCH_DEPS_INSTALL_ATTEMPTS=` reaching the recipe, and
+# `[ "$$attempt" -ge "" ]` then errors, which `if` reads as false, so the
+# ceiling would never fire and the loop would retry forever. BENCH_PIP exists
+# so a test can point the recipe at a stub and count invocations offline.
+BENCH_DEPS_INSTALL_ATTEMPTS ?= 3
+BENCH_DEPS_RETRY_DELAY_SECONDS ?= 5
+BENCH_PIP ?= python3 -m pip
+
+test-bench-deps: ## Install what `make test-bench` needs: bench/ editable plus pytest and pyyaml. Resolves devops-bench from the git SHA pinned in bench/pyproject.toml, so the first run needs network; the install is retried up to BENCH_DEPS_INSTALL_ATTEMPTS times.
+	@attempts="$(BENCH_DEPS_INSTALL_ATTEMPTS)"; \
+	delay="$(BENCH_DEPS_RETRY_DELAY_SECONDS)"; \
+	if ! [ "$$attempts" -ge 1 ] 2>/dev/null || ! [ "$$delay" -ge 0 ] 2>/dev/null; then \
+		echo "Error: BENCH_DEPS_INSTALL_ATTEMPTS must be a whole number of at least 1 and BENCH_DEPS_RETRY_DELAY_SECONDS one of at least 0; got '$$attempts' and '$$delay'." >&2; \
+		exit 1; \
+	fi; \
+	attempt=1; \
+	while :; do \
+		if $(BENCH_PIP) install -e bench/ pytest pyyaml; then \
+			exit 0; \
+		fi; \
+		if [ "$$attempt" -ge "$$attempts" ]; then \
+			echo "Error: bench deps install failed after $$attempts attempts." >&2; \
+			exit 1; \
+		fi; \
+		echo "bench deps install attempt $$attempt of $$attempts failed; retrying in $${delay}s" >&2; \
+		sleep "$$delay"; \
+		attempt=$$((attempt + 1)); \
+	done
 
 test-bench: ## Run the bench harness tests under pytest.
 	@python3 -m pytest bench/tests/
