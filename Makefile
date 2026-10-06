@@ -575,12 +575,12 @@ coverage-check: ## Fail if total Python coverage is below COVERAGE_FLOOR. Run `m
 # re-run of the same tree passed. Three attempts a fixed few seconds apart
 # absorb a single bad transfer and little more; each failed attempt is
 # announced on stderr, and the last still exits non-zero so a genuine error --
-# a broken pin, a missing build backend -- stays an error. The tunables are
-# checked before the loop reads them: `?=` does not stop an exported empty
-# variable or `make ... BENCH_DEPS_INSTALL_ATTEMPTS=` reaching the recipe, and
-# `[ "$$attempt" -ge "" ]` then errors, which `if` reads as false, so the
-# ceiling would never fire and the loop would retry forever. BENCH_PIP exists
-# so a test can point the recipe at a stub and count invocations offline.
+# a broken pin, a missing build backend -- stays an error. The loop has the
+# shape of k8s-operator/Makefile's envtest-use macro, with a fixed delay in
+# place of its doubling one, and checks its tunables before reading them for
+# the reason given there: an empty override would otherwise defeat the
+# ceiling and the loop would retry forever. BENCH_PIP exists so a test can
+# point the recipe at a stub and count invocations offline.
 BENCH_DEPS_INSTALL_ATTEMPTS ?= 3
 BENCH_DEPS_RETRY_DELAY_SECONDS ?= 5
 BENCH_PIP ?= python3 -m pip

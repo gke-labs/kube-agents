@@ -164,6 +164,9 @@ That module gates more than the flags. It also runs the envtest retry loop in `k
 against a stub, and reads the envtest cache steps in `k8s-operator-test.yml` and `a2a-test.yml` —
 one shared key, restored everywhere and saved only on main — so editing the macro or dropping a
 cache step fails it too. Run it with `python3 -m unittest tests.test_third_party_download_retry`.
+`make test-bench-deps` retries its pip install the same way, because the devops-bench pin is a git
+clone that pip does not retry, and `tests/test_bench_deps_install_retry.py` runs that loop against a
+stub pip.
 
 **Operator code.** If you modify `k8s-operator/`, run `make` or `go build` inside that directory to
 ensure compilation succeeds.

@@ -16,9 +16,13 @@ always succeeds, and a mutant with the `sleep` or the ceiling deleted reports
 green until the next bad minute. So the loop is *run*, not read: these tests
 point the recipe at a stub `pip` through `BENCH_PIP` and count invocations,
 the pattern `test_third_party_download_retry.py` uses for the envtest fetch.
+The two defaults the loop runs with are read back from make's own variable
+database, because the behaviour tests override the delay to keep the suite
+fast and so cannot see a default pause that went to zero.
 """
 
 import pathlib
+import re
 import shutil
 import stat
 import sys
@@ -31,11 +35,28 @@ sys.path.insert(0, str(_HERE))
 
 from _run_make import run_make  # noqa: E402
 
+#: The tunables the recipe reads. Dropped from the environment of every make
+#: these tests run: `?=` yields to an exported variable, so a developer who
+#: exported `BENCH_DEPS_INSTALL_ATTEMPTS=1` to make a broken local install
+#: fail fast would otherwise fail the two tests below that rely on the
+#: Makefile's default rather than an override.
+BENCH_TUNABLES = ("BENCH_DEPS_INSTALL_ATTEMPTS", "BENCH_DEPS_RETRY_DELAY_SECONDS", "BENCH_PIP")
+
 #: The ceiling the Makefile declares, and the one the issue asked for: three
 #: attempts. The default is asserted on rather than overridden, because the
 #: count is the contract -- a retry that silently became one attempt is the
 #: regression, and a test that passed its own ceiling could not see it.
 DEFAULT_ATTEMPTS = 3
+
+#: The least a default pause may be. The behaviour tests pass a delay of
+#: their own, so a default of zero -- three attempts inside the same bad
+#: second at GitHub -- would pass every one of them; this floor is what
+#: catches it. The exact number is not the contract; "a few seconds" is.
+MIN_DEFAULT_DELAY_SECONDS = 1
+
+#: How make prints a variable in its database (`make -p`): `NAME = value`,
+#: one per line, under a comment naming where it was set.
+VARIABLE_LINE = r"^%s = (.*)$"
 
 #: What the recipe hands pip after the substituted command; asserted on so a
 #: stub that was reached with the wrong arguments cannot read as a pass.
@@ -105,7 +126,7 @@ class BenchDepsInstallRetryTest(unittest.TestCase):
         ]
         if attempts is not None:
             args.append("BENCH_DEPS_INSTALL_ATTEMPTS=%s" % attempts)
-        return run_make(args, timeout=MAKE_TIMEOUT_SECONDS)
+        return run_make(args, timeout=MAKE_TIMEOUT_SECONDS, drop_env=BENCH_TUNABLES)
 
     def _calls(self):
         return self.calls.read_text().splitlines()
@@ -176,6 +197,44 @@ class BenchDepsInstallRetryTest(unittest.TestCase):
         self.assertIn(INVALID_TUNABLE_ERROR, result.stderr)
         self.assertEqual(
             len(self._calls()), 0, "it must refuse before installing, not after an attempt"
+        )
+
+
+class MakefileDefaultsTest(unittest.TestCase):
+    """The two defaults, read from make rather than from the Makefile's text.
+
+    `make -p` prints every variable with its value after `?=` has been
+    resolved, with the tunables dropped from the environment so what is read
+    is the Makefile's own default and not the developer's shell. `-n` keeps
+    the recipe from running.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        result = run_make(
+            ["-s", "-p", "-n", "test-bench-deps"],
+            timeout=MAKE_TIMEOUT_SECONDS,
+            drop_env=BENCH_TUNABLES,
+        )
+        if result.returncode != 0:
+            raise AssertionError("make -p failed (%d):\n%s" % (result.returncode, result.stderr))
+        cls.database = result.stdout
+
+    def _default(self, name):
+        match = re.search(VARIABLE_LINE % re.escape(name), self.database, re.MULTILINE)
+        self.assertIsNotNone(match, "%s is not declared in the Makefile" % name)
+        return match.group(1).strip()
+
+    def test_the_default_ceiling_is_three_attempts(self):
+        self.assertEqual(self._default("BENCH_DEPS_INSTALL_ATTEMPTS"), str(DEFAULT_ATTEMPTS))
+
+    def test_the_default_pause_is_a_few_seconds_not_none(self):
+        delay = self._default("BENCH_DEPS_RETRY_DELAY_SECONDS")
+        self.assertTrue(delay.isdigit(), "the default delay must be a whole number; got %r" % delay)
+        self.assertGreaterEqual(
+            int(delay),
+            MIN_DEFAULT_DELAY_SECONDS,
+            "a default pause of %s would retry inside the same bad second" % delay,
         )
 
 
