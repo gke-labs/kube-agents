@@ -250,9 +250,9 @@ resource "null_resource" "sweep" {
         agent sh -c 'sed -n -E "s/(^|.*[[:space:]])task_id[[:space:]]*=[[:space:]]*([^[:space:]]+).*/\\2/p" ${local.home}/.bootstrap_scan_filed 2>/dev/null | head -n 1; true' || true
       }
       # A failed listing or rm fails step 2, where the destroy's copy only
-      # reports it: the sandbox's /opt/data outlives its pod, and a report left
-      # there makes the sweep skip discovery
-      # (agents/platform/governance/inventory.md). Every step runs and the
+      # reports it: the sandbox's /opt/data outlives its pod, and a raw file
+      # left there would be graded by raw-report-has-findings-block before this
+      # run's hand-off writes its own. Every step runs and the
       # status covers them all, so step 2 still stops and the trap can name
       # what it left. The listing is checked on its own because a failure
       # inside a `for` word list fails nothing.
@@ -363,8 +363,10 @@ resource "null_resource" "sweep" {
       # in a status nothing more comes from (done, blocked, triage, failed,
       # cancelled, archived), with at least one such card or a sweep that
       # completed (a blocked sweep can still list the fleet once unblocked).
-      # The ranking card is not settled-gated: once it exists the hand-off has
-      # happened. A failed read leaves the last state standing.
+      # The ranking card is not settled-gated: once one exists that can run,
+      # the hand-off has happened. One that is blocked, triage, failed or
+      # cancelled may be a card the sweep's worker filed early, which the
+      # hand-off replaces. A failed read leaves the last state standing.
       handoff_state() {
         agent_py "$sweep" "${local.cluster_key_like}" "${local.prioritize_key}" <<'PY'
       import sqlite3, sys
@@ -373,7 +375,8 @@ resource "null_resource" "sweep" {
       status, since = c.execute("SELECT status, created_at FROM tasks WHERE id = ?", (sweep,)).fetchone()
       started = c.execute("SELECT count(*) FROM task_runs WHERE task_id = ?", (sweep,)).fetchone()[0]
       keyed = c.execute(
-          "SELECT count(*) FROM tasks WHERE idempotency_key = ? AND created_at >= ? AND status != 'archived'",
+          "SELECT count(*) FROM tasks WHERE idempotency_key = ? AND created_at >= ? "
+          "AND status NOT IN ('archived', 'blocked', 'triage', 'failed', 'cancelled')",
           (key, since)).fetchone()[0]
       cards = [s for (s,) in c.execute(
           "SELECT status FROM tasks WHERE idempotency_key LIKE ? AND created_at >= ?", (cluster_like, since))]

@@ -65,6 +65,9 @@ TRIAGE = "triage"
 FAILED = "failed"
 CANCELLED = "cancelled"
 SETTLED = (DONE, BLOCKED, TRIAGE, FAILED, CANCELLED)
+# A ranking card in one of these will not rank anything without a person, so
+# the hand-off never takes it for its own, whenever it was filed.
+WONT_RUN = (BLOCKED, TRIAGE, FAILED, CANCELLED)
 # A blocked sweep is not finished: unblocked, it may still list the fleet.
 SWEEP_FINISHED = (DONE, FAILED, CANCELLED)
 ARCHIVED = "archived"
@@ -183,7 +186,7 @@ def read_board(board: Path, sweep_id: str) -> dict | None:
             return None
         status, created_at = row
         sweep = {"id": sweep_id, "status": status, "created_at": created_at, "metadata": _metadata(conn, sweep_id),
-                 "block_reason": _block_reason(conn, sweep_id) if status == BLOCKED else ""}
+                 "block_reason": _block_reason(conn, sweep_id) if status in (BLOCKED, TRIAGE) else ""}
         clusters = []
         archived = 0
         archived_keys = set()
@@ -201,13 +204,16 @@ def read_board(board: Path, sweep_id: str) -> dict | None:
                 "metadata": _metadata(conn, tid) if cstatus == DONE else {},
                 "block_reason": _block_reason(conn, tid) if cstatus in (BLOCKED, TRIAGE) else "",
             })
-        # Earlier runs' open onboarding cards: the board answers a create under
-        # one of these keys with that old card instead of filing a new one.
+        # Open onboarding cards the board would answer a create with instead of
+        # filing a new one: an earlier run's, and a ranking card that will not
+        # run, such as one a sweep worker filed before the raw file existed.
+        wont_run = ", ".join("?" * len(WONT_RUN))
         stale = {
             key: tid for tid, key in conn.execute(
-                "SELECT id, idempotency_key FROM tasks WHERE (idempotency_key LIKE ? OR idempotency_key = ?) "
-                "AND created_at < ? AND status != ?",
-                (CLUSTER_KEY_PREFIX + "%", PRIORITIZE_KEY, created_at, ARCHIVED),
+                "SELECT id, idempotency_key FROM tasks WHERE status != ? AND ("
+                "((idempotency_key LIKE ? OR idempotency_key = ?) AND created_at < ?) "
+                f"OR (idempotency_key = ? AND status IN ({wont_run})))",
+                (ARCHIVED, CLUSTER_KEY_PREFIX + "%", PRIORITIZE_KEY, created_at, PRIORITIZE_KEY, *WONT_RUN),
             ).fetchall()
         }
         return {"sweep": sweep, "clusters": clusters, "archived_clusters": archived, "archived_keys": archived_keys,
@@ -379,8 +385,8 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
             )
     for gap in _gap_list(sweep["metadata"]):
         gaps.append(f"sweep {sweep['id']}: {_cell(gap)}")
-    if sweep["status"] == BLOCKED:
-        gaps.append(f"sweep {sweep['id']} blocked — {_cell(sweep['block_reason'] or NO_REASON)}")
+    if sweep["status"] in (BLOCKED, TRIAGE):
+        gaps.append(f"sweep {sweep['id']} {sweep['status']} — {_cell(sweep['block_reason'] or NO_REASON)}")
     elif sweep["status"] in (FAILED, CANCELLED):
         gaps.append(f"sweep {sweep['id']} {sweep['status']}: the fleet list and any agent-less audits are missing")
     elif sweep["status"] != DONE:
@@ -591,11 +597,11 @@ def _archive(task_id: str) -> bool:
     try:
         from hermes_cli.kanban import run_slash
 
-        run_slash(f"archive {shlex.quote(task_id)}")
+        out = str(run_slash(f"archive {shlex.quote(task_id)}")).strip()
     except Exception as e:  # noqa: BLE001 - retry next tick
         _log(f"could not archive {task_id}: {e}")
         return False
-    _log(f"archived {task_id}, an earlier run's card holding an onboarding key")
+    _log(f"asked the board to archive {task_id}, a card holding an onboarding key: {out}")
     return True
 
 

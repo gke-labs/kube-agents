@@ -163,6 +163,9 @@ MAX_PARSER_ERRORS = 5
 PRIORITIZE_KEY = "bootstrap-inventory-prioritize"
 PRIORITIZE_ASSIGNEE = "platform"
 PRIORITIZE_TITLE_WORD = "Prioritize"
+# bootstrap_handoff.py: WONT_RUN, the statuses in which a ranking card ranks
+# nothing without a person, so the hand-off replaces it.
+RANKING_WONT_RUN = ("blocked", "triage", "failed", "cancelled")
 HANDOFF_READ = "__ONBOARDING_HANDOFF_BOARD__"
 # Where the agent pod keeps bootstrap_handoff.py. The board read asks the
 # writer's own finding_lines which clusters it lists, so the check cannot

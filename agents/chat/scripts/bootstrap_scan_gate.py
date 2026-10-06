@@ -502,7 +502,8 @@ def should_skip(data_dir: Path) -> bool:
 
     - ``.bootstrap_scan_filed`` — a card exists. Covers the long middle of the
       sweep, when there is no report yet and nothing else says work is in
-      flight. This is the one that stops the every-60-seconds re-file.
+      flight. ``main`` checks it before calling this, to run the hand-off
+      instead, so here it only keeps this function's answer complete.
     - ``INVENTORY.raw.md`` — the hand-off ran; prioritization may still be
       running. Checked separately from the report because the gap between the
       two is now a distinct stage, not an instant.

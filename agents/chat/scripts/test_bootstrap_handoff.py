@@ -490,6 +490,49 @@ class HandOffTest(unittest.TestCase):
             self.board.unlink()
             (self.d / h.HANDOFF_MARKER).unlink()
 
+    def _ranking_card(self, tid, status, created_at):
+        conn = sqlite3.connect(self.board)
+        conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?)",
+                     (tid, status, h.PRIORITIZE_KEY, "early ranking", created_at))
+        conn.commit()
+        conn.close()
+
+    def test_a_ranking_card_that_will_not_run_is_replaced_whenever_it_was_filed(self):
+        # A sweep worker that filed the key before the raw file existed: the
+        # card is newer than the sweep and blocked.
+        for status in h.WONT_RUN:
+            _board(self.board, clusters=_all_done())
+            self._ranking_card("t_early", status, SWEEP_CREATED + 50)
+            sent = []
+            with self._stub_kanban(sent, reply='{"id": "t_newrank"}'), \
+                    mock.patch.object(h, "file_prioritize", HandOffTest._real_file_prioritize):
+                self.assertEqual(self._run_with_parser(), "t_newrank", status)
+            self.assertEqual(sent[0], "archive t_early", status)
+            self.board.unlink()
+            (self.d / h.HANDOFF_MARKER).unlink()
+
+    def test_a_ranking_card_still_running_for_this_sweep_is_kept(self):
+        # A tick that filed the card but failed to record it finds it again.
+        _board(self.board, clusters=_all_done())
+        self._ranking_card("t_mine", "running", SWEEP_CREATED + 50)
+        sent = []
+        with self._stub_kanban(sent, reply='{"id": "t_mine"}'), \
+                mock.patch.object(h, "file_prioritize", HandOffTest._real_file_prioritize):
+            self.assertEqual(self._run_with_parser(), "t_mine")
+        self.assertFalse(any(cmd.startswith("archive") for cmd in sent))
+
+    def test_a_sweep_in_triage_reports_its_reason(self):
+        _board(self.board, sweep_status="triage", clusters=_all_done())
+        conn = sqlite3.connect(self.board)
+        conn.execute("INSERT INTO task_events (task_id, kind, payload) VALUES (?, 'blocked', ?)",
+                     (SWEEP, json.dumps({"reason": "cannot list clusters"})))
+        conn.commit()
+        conn.close()
+        state = h.read_board(self.board, SWEEP)
+        text = h.compose(state, timed_out=True, now=NOW)
+        self.assertIn(f"sweep {SWEEP} triage — cannot list clusters", text)
+        self.assertNotIn("was still", text)
+
     def test_a_failed_or_cancelled_sweep_settles(self):
         for status in ("failed", "cancelled"):
             _board(self.board, sweep_status=status, clusters=_all_done())

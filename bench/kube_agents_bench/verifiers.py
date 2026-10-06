@@ -3078,12 +3078,14 @@ class BootstrapHandoffVerifier(_OnboardingPollVerifier):
 
     - ``raw_report_has_findings_block``: the sandbox's own
       ``inventory_findings.parse_block`` accepts the raw file, and every
-      cluster card created at or after the sweep that is ``done`` with
-      findings in its latest completed run's metadata has at least one block
-      line for its cluster. The sandbox's parser is the oracle, so the
+      cluster the hand-off's own ``finding_lines`` lists from the done cluster
+      cards created at or after the sweep has at least one block line. The sandbox's parser is the oracle, so the
       verdict is what the next stage would make of the file.
-    - ``ranking_card_filed``: a card keyed ``bootstrap-inventory-prioritize``
-      created at or after the sweep exists and is not archived.
+    - ``ranking_card_filed``: the newest card keyed
+      ``bootstrap-inventory-prioritize`` created at or after the sweep is
+      neither archived nor in a status where it will not run (``blocked``,
+      ``triage``, ``failed``, ``cancelled``), such as a card the sweep's worker
+      filed before the raw file existed.
 
     Fails closed: either pod unreadable, no sweep marker, a sweep the board
     does not know, a board that cannot be queried, or a parser the sandbox
@@ -3111,6 +3113,12 @@ class BootstrapHandoffVerifier(_OnboardingPollVerifier):
         live = [c for c in board.get("keyed") or [] if c.get("status") != "archived"]
         if live:
             card = live[-1]
+            if card["status"] in onboarding.RANKING_WONT_RUN:
+                return (
+                    "fail",
+                    f"{where}: ranking card {card['id']} keyed {key} is {card['status']}, so it will not rank the report",
+                    board,
+                )
             return "pass", f"{where}: ranking card {card['id']} ({card['status']}) is keyed {key}", board
         parts = [f"{where}: no unarchived card keyed {key} was filed at or after the sweep"]
         archived = [c["id"] for c in board.get("keyed") or []]

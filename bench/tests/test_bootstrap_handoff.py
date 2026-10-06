@@ -382,6 +382,24 @@ def test_an_archived_or_earlier_keyed_card_fails(install, overrides: dict[str, A
     assert _verify("ranking_card_filed").status == "fail"
 
 
+@pytest.mark.parametrize("status", onboarding.RANKING_WONT_RUN)
+def test_a_ranking_card_that_will_not_run_fails(install, status: str) -> None:
+    # A sweep worker's early card blocks on the pre-check: keyed, after the sweep, and ranks nothing.
+    install(RAW_WITHOUT_BLOCK, extra=[_ranking_card(status=status)])
+    result = _verify("ranking_card_filed")
+    assert result.status == "fail", result.reason
+    assert f"is {status}, so it will not rank the report" in result.reason
+
+
+def test_the_wont_run_statuses_match_the_hand_off() -> None:
+    sys.path.insert(0, str(GATE.parent))
+    try:
+        import bootstrap_handoff
+    finally:
+        sys.path.remove(str(GATE.parent))
+    assert onboarding.RANKING_WONT_RUN == bootstrap_handoff.WONT_RUN
+
+
 # --- the mirrored names and the case --------------------------------------
 
 

@@ -18,12 +18,10 @@
 waits for the sweep it files. Three behaviours pinned here fail quietly on a
 real install:
 
-  1. Step 4 must not hand over on a run that ended before the sweep filed its
-     cards, or one the worker did not end itself -- a rate-limit block, or a
-     run that filed some and was reclaimed. Handing over early grades a
-     fan-out that is still being written. With no Cluster Agent card filed,
-     only a completed run hands over: a worker that blocked can still file
-     them once the block is lifted.
+  1. Step 4 must not hand over before the hand-off has: it waits for a ranking
+     card that can still run, or for the sweep and its Cluster Agent cards to
+     stay settled for the hold, and a failed board read keeps the last state
+     rather than ending the wait.
   2. On failure, the exit trap must wait for every gateway pod's gate run to
      exit before it lists the cards to archive. A gate run that read the marker
      as absent files its sweep after the trap puts the marker back, and above
@@ -722,6 +720,8 @@ class HandoffStateQueryTest(unittest.TestCase):
     def test_an_archived_or_older_ranking_card_does_not_count(self):
         key = _INTERPOLATIONS["local.prioritize_key"]
         self.assertEqual(self._query("running", [(key, "archived", 200)]), "1 0 0")
+        for status in ("blocked", "triage", "failed", "cancelled"):
+            self.assertEqual(self._query("running", [(key, status, 200)]), "1 0 0", status)
         self.assertEqual(self._query("running", [(key, "todo", 50)]), "1 0 0")
 
     def test_settled_needs_the_sweep_and_every_cluster_card_ended(self):

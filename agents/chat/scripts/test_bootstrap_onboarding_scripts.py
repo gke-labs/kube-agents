@@ -4,9 +4,9 @@ Run: python3 -m unittest agents/chat/scripts/test_bootstrap_onboarding_scripts.p
 
 Covers the deterministic decision + I/O logic of:
   - bootstrap_delivery.py  (no_agent delivery of INVENTORY.md, exactly once)
-  - bootstrap_scan_gate.py (files the sweep as a kanban task listing a
-                            kanban_create call for each ready Cluster Agent;
-                            stops re-filing)
+  - bootstrap_scan_gate.py (files the sweep as a kanban task listing the
+                            ready Cluster Agents, whose cards the hand-off
+                            files; stops re-filing)
 
 The in-process job removal in bootstrap_delivery._retire_jobs imports
 cron.jobs, which is unavailable here; its import is guarded, so it is a no-op
@@ -744,7 +744,7 @@ class ScanGateTest(unittest.TestCase):
         """The roster is read after the gate's own reconcile, not before it.
 
         On a fresh install no profile exists until that reconcile creates it, so
-        a list taken any earlier is empty and the sweep fans out to nobody.
+        a list taken any earlier is empty and no Cluster Agent card is filed.
         """
         bootstrap_scan_gate.file_scan_task = self._orig
         script = self.d / "scripts" / bootstrap_scan_gate.RECONCILE_SCRIPT_NAME
@@ -782,7 +782,7 @@ class ScanGateTest(unittest.TestCase):
         self.assertIn("Discovery steps run ONCE", body)
 
     def test_reconcile_runs_before_the_sweep_is_filed(self):
-        """A sweep filed against a not-yet-reconciled roster fans out to nobody.
+        """A sweep filed against a not-yet-reconciled roster gets no Cluster Agent cards.
 
         `cluster-agent-reconcile` is on `11 * * * *` and this gate is on
         `* * * * *`, so on a fresh install the gate reaches an empty roster up to
@@ -1169,7 +1169,7 @@ class ScopeGapParagraphTest(unittest.TestCase):
         with mock.patch.object(bootstrap_scan_gate, "_data_dir", return_value=data_dir):
             body = bootstrap_scan_gate._task_body()
         self.assertIn("`locked` (denied)", body)
-        # It sits between the roster caveat and Step 2, where the fan-out reads it.
+        # It sits between the roster caveat and Step 2, which lists the roster.
         self.assertLess(body.index("`locked` (denied)"), body.index("**Step 2"))
 
 
