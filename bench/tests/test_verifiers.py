@@ -6829,8 +6829,19 @@ def _webhook_line(blockers="PodDisruptionBudget pinned-batch-runner, maintenance
         _webhook_line(blockers="PodDisruptionBudget seeded-upgrade/pinned-batch-runner (maxUnavailable 0), maintenance exclusion hold-the-minor-lag (NO_MINOR_UPGRADES)"),
         # a hyphenated `no` in a pool's name is not a negation
         _webhook_line(blockers="PDB pinned-batch-runner, pool no-surge-pool two minors behind"),
-        # the right line beside another cluster's line
-        _webhook_line() + "\n" + _webhook_line().replace("seeded-b:", "seeded-a:").replace("no", "yes"),
+        # the right line beside another cluster's line that answers yes
+        _webhook_line() + "\n" + _webhook_line(blocks="yes").replace("seeded-b:", "seeded-a:"),
+        # the table's own cell forms, with a `;` inside an item, and a `;`-joined list: content, not a separator
+        _webhook_line(blockers="PDB seeded-upgrade/pinned-batch-runner (maxUnavailable: 0; Deployment seeded-upgrade/pinned-batch-runner (1 replicas)), maintenance exclusion hold-the-minor-lag"),
+        _webhook_line(blockers="PDB seeded-upgrade/pinned-batch-runner; maintenance exclusion hold-the-minor-lag"),
+        _webhook_line(hooks="seeded-fail-closed-gate/gate.seeded.invalid (ValidatingWebhookConfiguration): failurePolicy Fail and Service seeded-upgrade/nonexistent-admission-gate does not exist; matches none of the operations this rule reads as the upgrade's path"),
+        # a word inside a blocker's description decides nothing
+        _webhook_line(blockers="PDB pinned-batch-runner (allowed disruptions: none), maintenance exclusion hold-the-minor-lag"),
+        # an article, a quote or emphasis inside the line (the fold strips only the line's edges), a
+        # spelled-out kind, a kind joined by `/`
+        _webhook_line(blockers="the PDB `pinned-batch-runner`, the maintenance exclusion `hold-the-minor-lag`"),
+        _webhook_line(blockers="**Pod Disruption Budget seeded-upgrade/pinned-batch-runner**, \"hold-the-minor-lag\""),
+        _webhook_line(blockers="PodDisruptionBudget/pinned-batch-runner"),
     ],
 )
 def test_webhook_readiness_declared_line_accepted(text):
@@ -6864,6 +6875,10 @@ def test_webhook_readiness_declared_line_accepted(text):
         (_webhook_line(blockers="none"), "seeded-b-names-a-real-blocker"),
         (_webhook_line(blockers="no pdb or exclusion applies"), "seeded-b-names-a-real-blocker"),
         (_webhook_line(blockers="not the pdb, nor the exclusion"), "seeded-b-names-a-real-blocker"),
+        # a blocker keyword inside an item that is not a blocker
+        (_webhook_line(blockers="outside the maintenance window"), "seeded-b-names-a-real-blocker"),
+        (_webhook_line(blockers="budget pressure on the node pool"), "seeded-b-names-a-real-blocker"),
+        (_webhook_line(blockers="**none**"), "seeded-b-names-a-real-blocker"),
         # a hedged value
         (_webhook_line(blocks="probably no"), "seeded-b-has-a-declared-line"),
         # prose with the same words, no declared line
