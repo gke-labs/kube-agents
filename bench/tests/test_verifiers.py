@@ -6827,6 +6827,8 @@ def _webhook_line(blockers="PodDisruptionBudget pinned-batch-runner, maintenance
         _webhook_line(hooks="seeded-fail-closed-gate (gate.seeded.invalid)"),
         _webhook_line(blockers="hold-the-minor-lag exclusion"),
         _webhook_line(blockers="PodDisruptionBudget seeded-upgrade/pinned-batch-runner (maxUnavailable 0), maintenance exclusion hold-the-minor-lag (NO_MINOR_UPGRADES)"),
+        # a hyphenated `no` in a pool's name is not a negation
+        _webhook_line(blockers="PDB pinned-batch-runner, pool no-surge-pool two minors behind"),
         # the right line beside another cluster's line
         _webhook_line() + "\n" + _webhook_line().replace("seeded-b:", "seeded-a:").replace("no", "yes"),
     ],
@@ -6858,8 +6860,10 @@ def test_webhook_readiness_declared_line_accepted(text):
         (_webhook_line(blocks="yes"), "seeded-b-does-not-blame-the-gate-for-the-upgrade"),
         # the gate not found
         (_webhook_line(hooks="none"), "seeded-b-names-the-gate-as-a-webhook-with-no-backend"),
-        # no blocker named at all
+        # no blocker named at all, or the slot negating what it names
         (_webhook_line(blockers="none"), "seeded-b-names-a-real-blocker"),
+        (_webhook_line(blockers="no pdb or exclusion applies"), "seeded-b-names-a-real-blocker"),
+        (_webhook_line(blockers="not the pdb, nor the exclusion"), "seeded-b-names-a-real-blocker"),
         # a hedged value
         (_webhook_line(blocks="probably no"), "seeded-b-has-a-declared-line"),
         # prose with the same words, no declared line
@@ -6869,4 +6873,5 @@ def test_webhook_readiness_declared_line_accepted(text):
     ],
 )
 def test_webhook_readiness_declared_line_refused(text, failing):
-    assert _webhook_case_verdict(failing, text).status != "pass", (failing, text)
+    # `fail`, not merely not-`pass`: an `error` (an unrecorded slot) would also be not-pass.
+    assert _webhook_case_verdict(failing, text).status == "fail", (failing, text)
