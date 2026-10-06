@@ -664,19 +664,24 @@ version upgrades, so it is always a standing condition, the shape of a workload 
 or a setting of the cluster, never data on a machine or a condition a version change ends.
 
 **How a nightly test checks the answer.** The test asks the assistant a question in chat, as an
-operator would, and the question ends by asking for one short line per cluster in a fixed form,
-for example "cluster B: protected application: yes; which: batch-runner". Only those lines are
-checked automatically, word for word, so a right answer cannot fail on phrasing and a wrong line
-cannot pass; each test also lists the hedges it refuses, such as "probably" or "could not check".
-The rest of the answer, the explanation and the advice, is scored by a second model. Two guards
+operator would. The automatic check today is a search for exact phrases anywhere in the reply, with
+a list of accepted spellings where a right answer can be worded two ways and a list of forbidden
+phrases for a wrong verdict; the rest of the answer, the explanation and the advice, is scored by a
+second model. That is how the series' one registered test, row 5's, is graded, and a correct reply
+has failed it on phrasing. The form the rest of the series is designed to use, which some tests
+elsewhere in the harness already ask for, narrows the automatic check: the question ends by asking
+for one short line per cluster in a fixed vocabulary, for example "cluster B: protected
+application: yes; which: batch-runner", the automatic check is a pattern anchored on the cluster's
+name that accepts a right line and refuses the wrong value, and the test names the hedges it
+refuses, such as "probably" or "could not check"; prose stays with the second model. Two guards
 are part of the design. A test about a planted object carries a check on that object, so a run that
 quietly repairs it fails rather than passes; the check reaches only objects in the cluster that the
 example's entry in the fleet's fixture catalogue lists, so where the condition is a setting of the
 cluster itself (rows 5, 11 and 16), the test carries no such check, and what keeps the condition in
 place is the fleet's own reconcile, with a scheduled scan of the fixture catalogue's recorded state
 that reports a drift without acting on it, as row 5's registered test documents. And a test that
-depends on a particular cluster records a broken environment rather than a wrong answer when that
-cluster is missing. For the
+carries such a check records a broken environment rather than a wrong answer when the object's
+cluster is missing; one that carries none, row 5's today, fails as a wrong answer. For the
 protection rule a second audit is to be tested as well: the morning reliability audit is the one that
 files the rule today, and the Monday upgrade audit, which has no budget check yet, is to gain one; once
 it exists, the issue it files must name the cluster whose upgrade would not complete.
