@@ -78,6 +78,19 @@ def _head_constants(text):
     )
 
 
+def _shell_function(text, name):
+    """A function of the script, from its `name() {` line to the `}` that
+    closes it in column 0."""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line == f"{name}() {{":
+            for end in range(index, len(lines)):
+                if lines[end] == "}":
+                    return "\n".join(lines[index : end + 1])
+            break
+    raise AssertionError(f"{name}() not found in hack/ci-deploy.sh in the shape this test lifts")
+
+
 def _guard_block(text):
     start = text.find(_GUARD_START)
     assert start != -1, f"{_GUARD_START!r} not found in hack/ci-deploy.sh"
@@ -135,6 +148,8 @@ class CiDeployReleaseGuardTest(unittest.TestCase):
                     "-c",
                     "set -euo pipefail\n"
                     + _head_constants(text)
+                    + "\n"
+                    + _shell_function(text, "heal_poisoned_release_record")
                     + "\n"
                     + _guard_block(text),
                 ],

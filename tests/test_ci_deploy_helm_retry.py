@@ -42,6 +42,15 @@ def _head_constants(text):
     )
 
 
+def _heal_function(text):
+    """The heal_poisoned_release_record helper defined in hack/ci-deploy.sh."""
+    start = text.find("heal_poisoned_release_record() {")
+    assert start != -1, "heal_poisoned_release_record() not found in hack/ci-deploy.sh"
+    end = text.find("\n}\n", start)
+    assert end != -1, "closing brace of heal_poisoned_release_record() not found"
+    return text[start : end + 3]
+
+
 def _deploy_block(text):
     start = text.find(_DEPLOY_START)
     assert start != -1, f"{_DEPLOY_START!r} not found in hack/ci-deploy.sh"
@@ -53,12 +62,17 @@ def _deploy_block(text):
 class CiDeployHelmRetryTest(unittest.TestCase):
     maxDiff = None
 
-    def _run_deploy_block(self, helm_responses, history_json=""):
+    def _run_deploy_block(self, helm_responses, history_json="", history_exit=None):
         """Run the lifted deploy block with recording stubs.
 
         helm_responses: list of (exit_code, stdout, stderr) tuples returned
                         sequentially on each `helm upgrade --install` call.
+        history_exit: exit code for `helm history`. Defaults to 0 when history_json
+                      is provided, or 1 (absent release) when empty.
         """
+        if history_exit is None:
+            history_exit = 0 if history_json else 1
+
         text = _deploy_text()
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = pathlib.Path(tmp)
@@ -83,7 +97,7 @@ echo "helm $*" >> "{log}"
 case "$1" in
   history)
     cat "{history_file}"
-    exit 0
+    exit {history_exit}
     ;;
   uninstall)
     exit 0
@@ -168,6 +182,8 @@ A2A_OPERATOR_ENV_ARGS=()
                     "set -euo pipefail\n"
                     + _head_constants(text)
                     + "\n"
+                    + _heal_function(text)
+                    + "\n"
                     + preamble
                     + "\n"
                     + _deploy_block(text),
@@ -191,8 +207,7 @@ A2A_OPERATOR_ENV_ARGS=()
     def test_a_transient_api_server_500_retries_and_succeeds(self):
         err_msg = (
             'could not get information about the resource Service "github-token-minter" '
-            '... Internal Server Error: "/api/v1/namespaces/kubeagents-system/services/github-token-minter": '
-            'the server is currently unable to handle the request'
+            '... Internal Server Error: failed to call webhook'
         )
         responses = [
             (1, "", err_msg),
@@ -206,12 +221,48 @@ A2A_OPERATOR_ENV_ARGS=()
         self.assertIn("attempt 1 of 3", out)
 
     def test_a_transient_unable_to_handle_request_retries_and_succeeds(self):
-        err_msg = (
-            'an error on the server ("Internal Server Error: '
-            '"/api/v1/namespaces/kubeagents-system/configmaps?fieldManager=helm": '
-            'the server is currently unable to handle the request") '
-            'has prevented the request from succeeding (post configmaps)'
-        )
+        # Exercises 'the server is currently unable to handle the request' without
+        # 'Internal Server Error' (#2382 bot review).
+        err_msg = 'the server is currently unable to handle the request (post configmaps)'
+        responses = [
+            (1, "", err_msg),
+            (0, "Release kube-agents installed", ""),
+        ]
+        rc, calls, out, err = self._run_deploy_block(responses)
+        self.assertEqual(rc, 0, err)
+        helm_upgrades = [c for c in calls if c.startswith("helm upgrade")]
+        self.assertEqual(len(helm_upgrades), 2, f"expected 2 helm calls: {calls}")
+        self.assertIn("hit a transient API-server 5xx, retrying", out)
+
+    def test_a_transient_service_unavailable_retries_and_succeeds(self):
+        # Exercises '503 Service Unavailable' without 'Internal Server Error'.
+        err_msg = "Error: 503 Service Unavailable: back-end server is at capacity"
+        responses = [
+            (1, "", err_msg),
+            (0, "Release kube-agents installed", ""),
+        ]
+        rc, calls, out, err = self._run_deploy_block(responses)
+        self.assertEqual(rc, 0, err)
+        helm_upgrades = [c for c in calls if c.startswith("helm upgrade")]
+        self.assertEqual(len(helm_upgrades), 2, f"expected 2 helm calls: {calls}")
+        self.assertIn("hit a transient API-server 5xx, retrying", out)
+
+    def test_a_transient_bad_gateway_retries_and_succeeds(self):
+        # Exercises 'Bad Gateway' without 'Internal Server Error'.
+        err_msg = "Error: Bad Gateway: connection dropped by upstream"
+        responses = [
+            (1, "", err_msg),
+            (0, "Release kube-agents installed", ""),
+        ]
+        rc, calls, out, err = self._run_deploy_block(responses)
+        self.assertEqual(rc, 0, err)
+        helm_upgrades = [c for c in calls if c.startswith("helm upgrade")]
+        self.assertEqual(len(helm_upgrades), 2, f"expected 2 helm calls: {calls}")
+        self.assertIn("hit a transient API-server 5xx, retrying", out)
+
+    def test_a_transient_gateway_timeout_retries_and_succeeds(self):
+        # Exercises 'Gateway Timeout' without 'Internal Server Error'.
+        err_msg = "Error: Gateway Timeout: upstream request timed out"
         responses = [
             (1, "", err_msg),
             (0, "Release kube-agents installed", ""),
@@ -223,7 +274,7 @@ A2A_OPERATOR_ENV_ARGS=()
         self.assertIn("hit a transient API-server 5xx, retrying", out)
 
     def test_persistent_5xx_exhausts_retries_and_fails(self):
-        err_msg = "Error: 500 Internal Server Error: the server is currently unable to handle the request"
+        err_msg = "Error: 504 Gateway Timeout: unable to reach control plane"
         responses = [
             (1, "", err_msg),
             (1, "", err_msg),
@@ -237,17 +288,45 @@ A2A_OPERATOR_ENV_ARGS=()
         self.assertIn("attempt 2 of 3 hit a transient API-server 5xx, retrying", out)
 
     def test_transient_5xx_heals_poisoned_release_record_before_retry(self):
-        err_msg = "Error: 500 Internal Server Error: the server is currently unable to handle the request"
+        err_msg = "the server is currently unable to handle the request"
         responses = [
             (1, "", err_msg),
             (0, "Release kube-agents installed", ""),
         ]
         history_poisoned = json.dumps([{"revision": 1, "status": "failed"}])
-        rc, calls, out, err = self._run_deploy_block(responses, history_json=history_poisoned)
+        rc, calls, out, err = self._run_deploy_block(responses, history_json=history_poisoned, history_exit=0)
         self.assertEqual(rc, 0, err)
         uninstalls = [c for c in calls if c.startswith("helm uninstall")]
         self.assertEqual(len(uninstalls), 1, f"expected poisoned record to be healed before retry: {calls}")
-        self.assertIn("clearing the record before retrying", out)
+        self.assertIn("record before retrying", out.lower())
+        self.assertIn("cleared the poisoned", out.lower())
+
+    def test_transient_5xx_with_deployed_revision_does_not_heal_release_record(self):
+        # A release with a deployed revision is healthy and must not be uninstalled (#2382 bot review).
+        err_msg = "the server is currently unable to handle the request"
+        responses = [
+            (1, "", err_msg),
+            (0, "Release kube-agents installed", ""),
+        ]
+        history_healthy = json.dumps([{"revision": 1, "status": "deployed"}, {"revision": 2, "status": "failed"}])
+        rc, calls, out, err = self._run_deploy_block(responses, history_json=history_healthy, history_exit=0)
+        self.assertEqual(rc, 0, err)
+        uninstalls = [c for c in calls if c.startswith("helm uninstall")]
+        self.assertEqual(len(uninstalls), 0, f"release with deployed revision must not be uninstalled: {calls}")
+        self.assertNotIn("clearing the record", out.lower())
+
+    def test_transient_5xx_absent_release_does_not_heal_release_record(self):
+        # When helm history exits 1 (fresh project or no release yet), heal must not fire.
+        err_msg = "the server is currently unable to handle the request"
+        responses = [
+            (1, "", err_msg),
+            (0, "Release kube-agents installed", ""),
+        ]
+        rc, calls, out, err = self._run_deploy_block(responses, history_json="", history_exit=1)
+        self.assertEqual(rc, 0, err)
+        uninstalls = [c for c in calls if c.startswith("helm uninstall")]
+        self.assertEqual(len(uninstalls), 0, f"absent release must not issue uninstall: {calls}")
+        self.assertNotIn("clearing the record", out.lower())
 
     def test_non_5xx_error_fails_immediately_without_retry(self):
         err_msg = "Error: execution error at (kube-agents/templates/deployment.yaml:10:14): invalid value"

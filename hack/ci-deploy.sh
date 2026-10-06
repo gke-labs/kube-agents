@@ -88,7 +88,7 @@ readonly HELM_DEPLOYED_STATUS_RE='"status"[[:space:]]*:[[:space:]]*"deployed"'
 # startup can fail the first attempt; retrying proceeds to evaluation (#2382).
 readonly HELM_DEPLOY_ATTEMPTS=3
 readonly HELM_DEPLOY_RETRY_DELAY_SECONDS=5
-readonly HELM_API_SERVER_5XX_RE='(Internal Server Error|the server is currently unable to handle the request|an error on the server|50[0234] |Service Unavailable|Gateway Timeout|Bad Gateway)'
+readonly HELM_API_SERVER_5XX_RE="Internal Server Error|the server is currently unable to handle the request|an error on the server|50[0234] |Service Unavailable|Gateway Timeout|Bad Gateway"
 
 # The keypair the agent uses to reach its shell sandbox over SSH. Generated per
 # run and thrown away with the lease: nothing outside this cluster ever sees it,
@@ -784,6 +784,32 @@ else
   BUILD_WORKER_ARGS=(--machine-type=e2-highcpu-8)
 fi
 
+# Heal a poisoned release record with no deployed revision (#1172, #2382).
+# Called before initial deployment (step 5a) and before retrying on transient
+# 5xx errors (step 5c).
+heal_poisoned_release_record() {
+  local reason="${1:-a previous run left this pool project poisoned (#1172)}"
+  local action="${2:-installing}"
+  local history_json
+  if history_json="$(helm history "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" -o json 2>/dev/null)" \
+    && ! grep -Eq "${HELM_DEPLOYED_STATUS_RE}" <<<"${history_json}"; then
+    echo "WARNING: the ${HELM_RELEASE_NAME} release record exists with no deployed revision —"
+    echo "         ${reason}. Clearing the"
+    echo "         record before ${action}."
+    # --no-hooks: the pre-delete hook waits on an operator a failed install
+    # never started. If even the uninstall cannot clear it, drop the
+    # release-record Secrets directly — with no deployed revision there is
+    # nothing real for Helm to unwind, and the record is all that blocks the
+    # install. Both failing leaves the record in place, so let set -e stop
+    # the run here, before the upgrade fails less legibly. No --wait and no
+    # hooks means Helm's uninstall timeout would bound nothing, so none is
+    # passed.
+    helm uninstall "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" --no-hooks \
+      || kubectl delete secret -n "${NAMESPACE}" -l "${HELM_RELEASE_SECRET_SELECTOR}" --ignore-not-found
+    echo "✓ Cleared the poisoned ${HELM_RELEASE_NAME} release record"
+  fi
+}
+
 START_TIME=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Deploying ${DEPLOY_SOURCE} to Namespace: ${NAMESPACE} ==="
 
@@ -897,15 +923,15 @@ fi
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Deploying the kube-agents chart ==="
 
-# ─── 5a. Heal a poisoned release record (#1172) ───────────────────────────────
+# ─── 5a. Heal a poisoned release record (#1172, #2382) ─────────────────────────
 # A failed or killed prior run can leave the release record behind with no
 # deployed revision: its teardown's `helm uninstall` failed, or the teardown
 # was killed mid-uninstall — the cause no teardown-side fallback can cover.
 # `helm upgrade --install` below then takes the upgrade path and dies with
 # `UPGRADE FAILED: "kube-agents" has no deployed releases`, instantly
-# failing whichever PR drew this pool project. Heal it here, at lease time,
-# where every cause of the no-deployed-revision state converges. (A release
-# stuck `pending-upgrade` *above* a deployed revision is a different state —
+# failing whichever PR drew this pool project. Heal it here, at lease time
+# or in the 5c retry loop, where causes of the no-deployed-revision state converge.
+# (A release stuck `pending-upgrade` *above* a deployed revision is a different state —
 # upgrade then fails on Helm's in-progress lock, but that run's own teardown
 # uninstall clears it, so it burns one run rather than poisoning the pool.)
 #
@@ -918,23 +944,7 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Deploying the kube-agents chart ===
 # release with an older deployed revision, which upgrades fine and is left
 # alone. One call; a healthy or absent release costs the probe and nothing
 # more.
-if RELEASE_HISTORY_JSON="$(helm history "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" -o json 2>/dev/null)" \
-  && ! grep -Eq "${HELM_DEPLOYED_STATUS_RE}" <<<"${RELEASE_HISTORY_JSON}"; then
-  echo "WARNING: the ${HELM_RELEASE_NAME} release record exists with no deployed revision —"
-  echo "         a previous run left this pool project poisoned (#1172). Clearing the"
-  echo "         record before installing."
-  # --no-hooks: the pre-delete hook waits on an operator a failed install
-  # never started. If even the uninstall cannot clear it, drop the
-  # release-record Secrets directly — with no deployed revision there is
-  # nothing real for Helm to unwind, and the record is all that blocks the
-  # install. Both failing leaves the record in place, so let set -e stop
-  # the run here, before the upgrade fails less legibly. No --wait and no
-  # hooks means Helm's uninstall timeout would bound nothing, so none is
-  # passed.
-  helm uninstall "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" --no-hooks \
-    || kubectl delete secret -n "${NAMESPACE}" -l "${HELM_RELEASE_SECRET_SELECTOR}" --ignore-not-found
-  echo "✓ Cleared the poisoned ${HELM_RELEASE_NAME} release record"
-fi
+heal_poisoned_release_record
 
 API_SERVER_KEY="${API_SERVER_KEY:-$(openssl rand -hex 16)}"
 
@@ -998,15 +1008,9 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     sleep "${HELM_DEPLOY_RETRY_DELAY_SECONDS}"
     # If the failed attempt left behind a release record with no deployed revision,
     # clear it so the next attempt can install cleanly (#1172, #2382).
-    if RELEASE_HISTORY_JSON="$(helm history "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" -o json 2>/dev/null)" \
-      && ! grep -Eq "${HELM_DEPLOYED_STATUS_RE}" <<<"${RELEASE_HISTORY_JSON}"; then
-      echo "WARNING: the ${HELM_RELEASE_NAME} release record exists with no deployed revision after attempt ${attempt} — clearing the record before retrying."
-      helm uninstall "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" --no-hooks 2>/dev/null \
-        || kubectl delete secret -n "${NAMESPACE}" -l "${HELM_RELEASE_SECRET_SELECTOR}" --ignore-not-found
-    fi
+    heal_poisoned_release_record "attempt ${attempt} failed before reaching a deployed revision (#1172, #2382)" "retrying"
   else
     rm -f "${HELM_INSTALL_OUT}"
-    rm -rf "${SANDBOX_KEY_DIR}"
     exit "${HELM_EXIT}"
   fi
 done
