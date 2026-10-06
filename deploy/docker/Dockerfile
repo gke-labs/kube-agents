@@ -756,11 +756,12 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # See the module docstring in
 # deploy/docker/patches/apply_slack_reactions_scope.py.
 #
-# Slack: with KAGE_SLACK_UX on, react to each ask by its kind (eyes, hammer and
-# wrench, clipboard, rotating light) and add a settle reaction beside it when
-# the work ends, never removing one -- the credential proxy refuses reactions.remove,
-# so upstream's eyes-for-a-tick swap leaves both. The two hooks gain a guard
-# that hands over to gateway/slack_ux_reactions.py; with the flag off they run
+# Slack: with KAGE_SLACK_UX on, track how the work each ask started settles,
+# reacting only with an x on one whose work failed (SHOW_ARRIVAL and
+# SHOWN_SETTLES hold the rest back), never removing one -- the credential
+# proxy refuses reactions.remove, so upstream's eyes-for-a-tick swap leaves
+# both. The two hooks gain a guard that hands over to
+# gateway/slack_ux_reactions.py; with the flag off they run
 # upstream's body untouched. slack_presenter.py is staged here only so the
 # verifier can import it; the image ships it under /opt/defaults/scripts. Also
 # rides this COPY and RUN. See deploy/docker/patches/slack_ux_reactions.py.
@@ -795,6 +796,13 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # gateway/slack_ux_incident.py returns, which is the notifier's own with the
 # flag off. Anchors on apply_kanban_progress_lines' call above. Also rides this
 # COPY and RUN. See deploy/docker/patches/slack_ux_incident.py.
+# Slack: with KAGE_SLACK_UX on, the Planning Agent's reply to a blocked or failed
+# card's wake is drawn with its first sentence in bold and its closing question,
+# when it has one, as a choice button. The wake marks the thread, the wake's turn
+# claims the mark when it starts (_process_message_background, or the queued
+# follow-up), its final send carries the claim, _maybe_blocks draws it, and a
+# user's turn starting after the mark clears it (apply_slack_ux_failure.py; runs
+# after apply_slack_ux_moments.py, whose wake line it follows). Also rides this COPY and RUN. See deploy/docker/patches/slack_ux_failure.py.
 # Same flag, same block: gateway/slack_boilerplate.py keeps Hermes' own
 # boilerplate off Slack -- the cron wrapper (other targets, and the Chat relay
 # that routes on it, keep it), the opt-in heartbeat's tool trace (generic
@@ -825,6 +833,9 @@ COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/apply_slack_ux_incident.py \
      deploy/docker/patches/verify_slack_ux_incident.py \
      deploy/docker/patches/slack_ux_incident.py \
+     deploy/docker/patches/apply_slack_ux_failure.py \
+     deploy/docker/patches/verify_slack_ux_failure.py \
+     deploy/docker/patches/slack_ux_failure.py \
      deploy/docker/patches/verify_kanban_progress_lines.py \
      deploy/docker/patches/apply_slack_boilerplate.py \
      deploy/docker/patches/verify_slack_boilerplate.py \
@@ -860,6 +871,9 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
     install -m 0644 /tmp/message-surface/slack_ux_incident.py /opt/hermes/gateway/slack_ux_incident.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_ux_incident.py /opt/hermes && \
     grep -qF "_kage_slack_incident.adapter_for(" /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    install -m 0644 /tmp/message-surface/slack_ux_failure.py /opt/hermes/gateway/slack_ux_failure.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_ux_failure.py /opt/hermes && \
+    grep -qF "_kage_slack_failure.maybe_blocks(" /opt/hermes/plugins/platforms/slack/adapter.py && \
     install -m 0644 /tmp/message-surface/slack_boilerplate.py /opt/hermes/gateway/slack_boilerplate.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_boilerplate.py /opt/hermes && \
     grep -qF "_kage_slack_boilerplate.cron_delivery_text" /opt/hermes/cron/scheduler_delivery.py && \
@@ -876,6 +890,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_clicks.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_moments.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_incident.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_failure.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_kanban_progress_lines.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_boilerplate.py && \
     rm -rf /tmp/message-surface

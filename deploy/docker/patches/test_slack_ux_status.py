@@ -357,6 +357,17 @@ class _Adapter:
         return self.client.calls
 
 
+class _LegacyAdapter(_Adapter):
+    """An adapter whose SDK predates Agent Sessions: upstream's free-text setter."""
+
+    def __init__(self):
+        super().__init__()
+        self.texts = []
+
+    async def _set_thread_status(self, chat_id, team_id, thread_ts, status, fail_label):
+        self.texts.append(status)
+
+
 class _RuntimeCase(unittest.TestCase):
     def setUp(self):
         importlib.reload(runtime)
@@ -494,6 +505,59 @@ class SessionTest(_RuntimeCase):
         )
         self.assertEqual(runtime._titles[(CHANNEL, THREAD)], "why is payments slow?")
         self.assertNotIn((CHANNEL, THREAD), runtime._asks)
+
+    def _alerts(self, titles):
+        """``gateway.slack_ux_incident`` with ``alert_title`` answering from ``titles``, counting its reads."""
+        reads = []
+
+        def alert_title(chat_id, thread_id):
+            reads.append((chat_id, thread_id))
+            return titles.get((chat_id, thread_id), "")
+
+        gateway = SimpleNamespace()
+        gateway.slack_ux_incident = SimpleNamespace(alert_title=alert_title)
+        patcher = mock.patch.dict(sys.modules, {"gateway": gateway, "gateway.slack_ux_incident": gateway.slack_ux_incident})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return reads
+
+    def test_an_alert_thread_takes_the_title_the_watcher_recorded(self):
+        self._alerts({(CHANNEL, THREAD): "payments-api crashloop in seeded-debug"})
+        adapter = _Adapter()
+        self._status(adapter, PHRASE)
+        self.assertEqual(
+            adapter.calls, [("setStatus", "processing"), ("rename", "payments-api crashloop in seeded-debug")],
+        )
+        self.assertEqual(runtime._titles[(CHANNEL, THREAD)], "payments-api crashloop in seeded-debug")
+
+    def test_an_alert_title_comes_before_the_threads_ask(self):
+        self._alerts({(CHANNEL, THREAD): "payments-api crashloop in seeded-debug"})
+        adapter = _Adapter()
+        runtime.note_ask(CHANNEL, THREAD, "Restore the secret")
+        self._status(adapter, PHRASE)
+        self.assertEqual([v for n, v in adapter.calls if n == "rename"], ["payments-api crashloop in seeded-debug"])
+        self.assertNotIn((CHANNEL, THREAD), runtime._asks)
+
+    def test_a_thread_with_no_alert_title_takes_its_ask_and_is_read_once(self):
+        reads = self._alerts({})
+        adapter = _Adapter()
+        self._status(adapter, PHRASE)
+        self._status(adapter, "")
+        runtime.note_ask(CHANNEL, THREAD, "why is payments slow?")
+        self._status(adapter, PHRASE)
+        self.assertEqual([v for n, v in adapter.calls if n == "rename"], ["why is payments slow?"])
+        self.assertEqual(reads, [(CHANNEL, THREAD)])
+
+    def test_an_alert_title_that_cannot_be_read_falls_back_to_the_ask(self):
+        gateway = SimpleNamespace()
+        gateway.slack_ux_incident = SimpleNamespace(alert_title=mock.Mock(side_effect=OSError("locked")))
+        patcher = mock.patch.dict(sys.modules, {"gateway": gateway, "gateway.slack_ux_incident": gateway.slack_ux_incident})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        adapter = _Adapter()
+        runtime.note_ask(CHANNEL, THREAD, "why is payments slow?")
+        self._status(adapter, PHRASE)
+        self.assertEqual([v for n, v in adapter.calls if n == "rename"], ["why is payments slow?"])
 
     def test_flag_off_keeps_no_ask(self):
         env = _flag("")
@@ -1138,6 +1202,28 @@ class PlanTest(_RuntimeCase):
         _run(runtime.settle_row(adapter, _sub(), "blocked"))
         _run(runtime.settle_row(adapter, _sub(), "completed"))
         self.assertEqual(self._sent(adapter), ["suspended", "closed"])
+
+    def test_a_wait_whose_send_fails_is_still_a_wait_on_the_next_clear(self):
+        adapter = _Adapter(_Client(fail={"setStatus"}))
+        _run(runtime.settle_row(adapter, _sub(), "blocked"))
+        adapter.client.fail.clear()
+        _run(adapter._set_thread_status(CHANNEL, TEAM, THREAD, "", "turn"))
+        self.assertEqual(self._sent(adapter), ["suspended", "suspended"])
+
+    def test_a_wait_whose_send_failed_ends_when_the_card_runs_again(self):
+        adapter = _Adapter(_Client(fail={"setStatus"}))
+        _run(runtime.settle_row(adapter, _sub(), "blocked"))
+        adapter.client.fail.clear()
+        _run(runtime.settle_row(adapter, _sub(), "unblocked"))
+        _run(adapter._set_thread_status(CHANNEL, TEAM, THREAD, "", "turn"))
+        self.assertEqual(self._sent(adapter)[-1], "closed")
+
+    def test_a_wait_after_a_restart_sends_the_legacy_setter_only_a_clear(self):
+        # Without Agent Sessions upstream's setter shows its text as is.
+        adapter = _LegacyAdapter()
+        _run(runtime.settle_row(adapter, _sub(), "blocked"))
+        _run(runtime.settle_row(adapter, _sub(), "completed"))
+        self.assertEqual(adapter.texts, ["", ""])
 
     def test_a_restart_leaves_running_and_retried_cards_alone(self):
         adapter = _Adapter()

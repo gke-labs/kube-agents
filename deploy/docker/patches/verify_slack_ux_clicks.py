@@ -13,9 +13,9 @@ Two things are checked:
    :func:`slack_ux_clicks.answer` unpacks, in that order, plus
    ``_is_ignored_channel``, ``_slack_allowed_channels``, ``_slack_disable_dms``,
    ``_get_client``, ``_handle_slack_message``, ``_is_interactive_user_authorized``,
-   ``_channel_gate_allows``, ``_slack_message_matches_mention_patterns`` and
-   ``_event_declares_bot_sender``, sets
-   ``_bot_user_id`` and ``_team_bot_user_ids`` in ``__init__``, plus ``_client_for`` for ``slack_ux_incident``;
+   ``_channel_gate_allows``, ``_slack_message_matches_mention_patterns``,
+   ``_event_declares_bot_sender`` and ``_resolve_user_name``, sets
+   ``_bot_user_id``, ``_team_bot_user_ids`` and ``_user_name_cache`` in ``__init__``, plus ``_client_for`` for ``slack_ux_incident``;
    the adapter file still defines ``_slack_mention_detection_text(event)`` at module level and still reads the
    ``_hermes_force_process`` marker the click's message carries.
    ``_register_bolt_handlers`` still wires the plugin
@@ -48,6 +48,10 @@ FLAG_ENV = "KAGE_SLACK_UX"
 
 METHOD = "_register_bolt_handlers"
 PLUGIN_WIRING = "_register_plugin_action_handlers"
+#: The Bolt app ``slack_ux_clicks.register()`` adds its listeners to. It is set
+#: outside ``__init__`` and the stub supplies it, so only this check ties it to
+#: upstream: ``METHOD`` must still wire listeners onto it.
+APP_ATTRIBUTE = "_app"
 GUARD_ALIAS = "_kage_slack_clicks"
 IMPORT_MODULE = "gateway"
 IMPORT_NAME = "slack_ux_clicks"
@@ -60,13 +64,15 @@ RUNTIME_MEMBERS = (
     "_begin_interaction", "_is_ignored_channel", "_slack_allowed_channels", "_slack_disable_dms",
     "_get_client", "_handle_slack_message", "_client_for", "_is_interactive_user_authorized",
     "_channel_gate_allows", "_slack_message_matches_mention_patterns", "_event_declares_bot_sender",
+    "_resolve_user_name",
 )
 #: The adapter file's module-level functions the runtime calls, and how: positional arguments, keywords.
 RUNTIME_FUNCTIONS = {"_slack_mention_detection_text": (1, ())}
-#: The instance attributes the runtime reads, set in ``__init__``.
-RUNTIME_ATTRIBUTES = ("_bot_user_id", "_team_bot_user_ids")
+#: The instance attributes the runtime reads or relies on, set in ``__init__``.
+#: ``_user_name_cache`` is what keeps a click from costing a ``users.info`` call each time.
+RUNTIME_ATTRIBUTES = ("_bot_user_id", "_team_bot_user_ids", "_user_name_cache")
 #: The members the runtime awaits; every other one it calls plainly.
-ASYNC_MEMBERS = ("_begin_interaction", "_handle_slack_message", "_channel_gate_allows")
+ASYNC_MEMBERS = ("_begin_interaction", "_handle_slack_message", "_channel_gate_allows", "_resolve_user_name")
 #: The event key whose ``.get()`` makes the message handler skip the mention
 #: requirement for a click's turn. Matched in the AST, so quoting does not matter.
 FORCE_MARKER = "_hermes_force_process"
@@ -85,6 +91,7 @@ CALL_SHAPES = {
     "_is_interactive_user_authorized": ((1, ("channel_id", "team_id")),),
     "_slack_message_matches_mention_patterns": ((1, ()),),
     "_event_declares_bot_sender": ((1, ()),),
+    "_resolve_user_name": ((1, ("chat_id", "team_id")),),
     "_channel_gate_allows": ((0, (
         "channel_id", "routing_text", "bot_uid", "is_mentioned", "is_thread_reply", "event_thread_ts", "user_id",
         "team_id", "is_dm", "force_process",
@@ -234,7 +241,7 @@ def check_members(tree: ast.Module) -> None:
         raise _fail(f"{ADAPTER_CLASS} no longer has {', '.join(missing)}, which the runtime calls")
     unset = [name for name in RUNTIME_ATTRIBUTES if name not in _init_attributes(classes[0])]
     if unset:
-        raise _fail(f"{ADAPTER_CLASS}.__init__ no longer sets {', '.join(unset)}, which the runtime reads")
+        raise _fail(f"{ADAPTER_CLASS}.__init__ no longer sets {', '.join(unset)}, which the runtime reads or relies on")
     functions = {n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
     for name, (positional, keywords) in RUNTIME_FUNCTIONS.items():
         function = functions.get(name)
@@ -304,6 +311,18 @@ def check_adapter(root: Path) -> None:
     methods = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == METHOD]
     if len(methods) != 1:
         raise _fail(f"{ADAPTER} has {len(methods)} def {METHOD}(), expected 1")
+    # A call on it, not a mention: `if self._app is None: return` wires nothing.
+    on_app = any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == APP_ATTRIBUTE
+        and isinstance(node.func.value.value, ast.Name)
+        and node.func.value.value.id == "self"
+        for node in ast.walk(methods[0])
+    )
+    if not on_app:
+        raise _fail(f"{METHOD}() no longer wires listeners onto self.{APP_ATTRIBUTE}, which the runtime adds its listeners to")
     body = methods[0].body
     wired = [i for i, stmt in enumerate(body) if _is_self_call(stmt, PLUGIN_WIRING)]
     if len(wired) != 1:
@@ -380,6 +399,9 @@ class _StubAdapter:
     def _event_declares_bot_sender(self, event):
         return bool(event.get("bot_id"))
 
+    async def _resolve_user_name(self, user_id, chat_id="", team_id=""):
+        return user_id
+
     async def _channel_gate_allows(
         self, *, channel_id, routing_text, bot_uid, is_mentioned, is_thread_reply, event_thread_ts, user_id,
         team_id, is_dm, force_process,
@@ -441,8 +463,8 @@ async def _drive(module) -> None:
         update, turn = (entry[1] for entry in adapter.log)
         if any(b.get("type") == "actions" for b in update["blocks"]):
             raise _fail("the answered choice buttons are still on the message")
-        if f"<@{USER}>" not in update["text"]:
-            raise _fail(f"the answered message does not name the clicker: {update!r}")
+        if not update["text"].startswith(f"✓ {module.NAMELESS_CLICKER}: {LABEL}") or "@" in update["text"]:
+            raise _fail(f"the answered message does not name the clicker as plain text: {update!r}")
         expected = {"user": USER, "text": LABEL, "channel": CHANNEL, "thread_ts": THREAD, "ts": ACTION_TS}
         if {k: turn.get(k) for k in expected} != expected:
             raise _fail(f"the turn was {turn!r}")

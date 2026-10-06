@@ -1,4 +1,4 @@
-"""Slack presentation for kube-agents: answer layout, buttons and reactions.
+"""Slack presentation for kube-agents: answer layout, buttons, reports and reactions.
 
 Nothing here imports the Hermes gateway, the Slack SDK or the network, and
 every function is pure but :func:`enabled`, which reads the environment, and
@@ -10,8 +10,13 @@ gateway. Its callers include the gateway patches for reactions
 session status (``slack_ux_status``, which reads only :func:`enabled`), moments
 (``slack_ux_moments``, which reads :func:`enabled` and lays out through
 ``slack_moments``), incident triage (``slack_ux_incident``), button clicks
-(``slack_ux_clicks``) and the harness-message patch (``slack_boilerplate``,
-which reads only :func:`enabled`).
+(``slack_ux_clicks``), failure replies (``slack_ux_failure``, which bolds
+with ``_first_sentence`` and adds its offer with :func:`blocks_answer`) and
+the harness-message patch (``slack_boilerplate``, which reads only :func:`enabled`);
+the Chat Agent's ``bootstrap_delivery``, which lays out the first inventory
+report through ``inventory_presenter``; and ``session_kv_server``'s cron relay,
+which gates the fleet-audit report on :func:`enabled` and lays it out through
+``slack_audit_report``.
 Every caller reaches it through ``PYTHONPATH=/opt/defaults/scripts``, which the
 operator sets on the agent container.
 
@@ -24,10 +29,20 @@ answer; link buttons, none for a url :func:`_safe_link_url` refuses, and choice
 buttons, whose value the caller sets, are built by ``_button`` and wrapped into
 rows by ``_actions``; :func:`fallback_text`
 is the headline, links and choices as plain mrkdwn, for the message's ``text``
-field.
+field, with any report rows led by their severity as inline code (a bullet when
+they have none).
 :func:`blocks_answer` lays a headline, links and choices out as blocks; its
-caller is ``slack_moments``, which lays out the messages ``slack_ux_moments``
-posts.
+callers are ``slack_moments``, which lays out the messages ``slack_ux_moments``
+posts, and ``slack_ux_failure``, which adds a failure reply's offer button.
+:func:`with_side_bar` puts every block below the headline in one legacy
+attachment whose ``color`` is the side bar, for ``slack_ux_moments`` posting and
+settling a moment and ``slack_ux_clicks`` rewriting one; :func:`message_blocks`
+and :func:`side_bar_color` read a click's echoed message back.
+
+Reports (:func:`blocks_report`): a headline, the top findings as one group
+between dividers, then the choice buttons and the link buttons. Block Kit has no bordered box a message
+can draw, so the dividers stand in for a border. :func:`names_gap` and
+:func:`as_line` find and set out a report's line saying what was not scanned.
 
 Reactions (:func:`arrival_reaction`, :func:`settle_reaction`): the first
 reaction says what kind of ask arrived, chosen by keyword before any model
@@ -37,6 +52,7 @@ credential proxy refuses every Slack method ending in ``remove``.
 
 from __future__ import annotations
 
+import itertools
 import os
 import re
 from bisect import bisect_right
@@ -148,9 +164,30 @@ LINK_ACTION_ID_PATTERN = re.compile(r"\.link\.\d+$")
 CHOICE_ACTION_ID_PATTERN = re.compile(r"\.choice\.\d+$")
 #: The block that says a message waits on an answer; a choice click drops it.
 WAITING_BLOCK_ID = "kage_waiting"
+#: A button Slack draws filled in its accent colour, for the one action a message is for.
+PRIMARY_STYLE = "primary"
+#: Side-bar colours, Slack's own green and yellow: something done that is the
+#: user's to act on, and something waiting on them. Block Kit has no colour; a
+#: side bar is a legacy attachment's ``color``.
+SIDE_BAR_GREEN = "#2EB67D"
+SIDE_BAR_YELLOW = "#ECB22E"
+#: How many leading blocks stay above the side bar. Slack shows a message's
+#: ``text`` as its body when it has no top-level blocks, so the headline stays
+#: out of the bar to keep ``text`` the notification and read-back copy only.
+SIDE_BAR_FROM = 1
+HEX_MARK = "#"
 
 CHOICES_LEAD = "Reply with one of: "
 CHOICE_SEPARATOR = " · "
+BULLET = "• "
+
+#: A row's severity, as inline code ahead of its text: "`critical` text".
+SEVERITY_TAG = "`{severity}` {text}"
+BACKTICK = "`"
+
+#: Characters per report row.
+ROW_TEXT_MAX = 300
+PRIMARY_STYLE = "primary"
 
 #: A code fence line; nothing between an opener and its closer is a heading, a bullet or markup.
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
@@ -216,8 +253,101 @@ NUMBER_ABBREVIATION_END = re.compile(r"(?:^|[\s(\[#])(?:no|max|min)\.$", re.IGNO
 NUMBER_NEXT = re.compile(r"\d")
 #: How far back from a candidate end an abbreviation can start; bounds the check to the tail.
 ABBREVIATION_TAIL = 16
+#: A url a link button or ``<url|label>`` may carry: http(s) in any case, no userinfo (an ``@``
+#: before the path, query or fragment, which would show one host and open another), nothing that
+#: ends or splits the link, and no longer than :data:`BUTTON_URL_MAX`. Use ``fullmatch``: ``$`` would admit a
+#: trailing newline.
+SAFE_URL = re.compile(
+    rf"(?=[^\s<>|]{{1,{BUTTON_URL_MAX}}}\Z)https?://(?=[^\s<>|])[^\s<>|/?#@]*(?:[/?#][^\s<>|]*)?", re.IGNORECASE
+)
 #: A space-aligned clip shorter than this share of the limit drops too much; it cuts hard instead.
 CLIP_MIN_SHARE = 2
+INLINE_CODE = re.compile(r"`[^`]*`")
+#: :func:`to_mrkdwn` holds a code span's place with this; :data:`CODE_PLACEHOLDER` finds it again.
+CODE_HOLD = "\x00{}\x00"
+#: A bold takes :data:`STAR_BOLD`'s, :data:`STAR_BOLD_IN_WORD`'s and :data:`UNDERSCORE_BOLD`'s edges, so a
+#: card row and its text fallback agree on ``2**20 and 2**30`` and on ``__x__``.
+RICH_SPAN = re.compile(
+    rf"`(?P<code>[^`]+)`|{BOLD_OPEN.format(re.escape('**'))}(?P<bold>(?:(?!\*\*).)+?)(?<=\S)\*\*"
+    r"|(?<=\w)\*\*(?P<inbold>[^\s*]+)\*\*"
+    rf"|{UNDERSCORE_BOLD.replace('((?:', '(?P<ubold>(?:', 1)}"
+    rf"|\[(?P<label>[^\[\]]+)\]\((?P<url>{MD_LINK_URL})\)"
+    r"|(?<![\w*])\*(?=[^\s.])(?P<star>[^*\n]+?)(?<=\S)\*(?![\w*])|(?<![\w_])_(?=[^\s.])(?P<under>[^_\n]+?)(?<=\S)_(?![\w_])"
+    r"|(?<![\w~])~(?=\S)(?P<strike>[^~\n]+?)(?<=\S)~(?![\w~])"
+)
+#: A bare url in :func:`to_mrkdwn`'s input, held out of the bold pass like a code span. Its last
+#: character is not markup or punctuation, so ``**https://x.io**`` still bolds the url.
+BARE_URL = re.compile(r"https?://[^\s<>|\x00]*[^\s<>|\x00*_.,;:!?'\"]", re.IGNORECASE)
+
+#: A report naming something that was not scanned (the prioritization SOP's Step 1).
+GAP = re.compile(
+    r"\b(?:could\s+not|couldn't|cannot|can't|unable\s+to|was\s+not|were\s+not|wasn't|weren't|not)"
+    r"\s+(?:be\s+)?(?:scanned|reached|checked|accessed|read)\b"
+    r"|\b(?:unreachable|unavailable|inaccessible|skipped|did\s+not\s+run)\b"
+    r"|\b(?:permission|access)\s+denied\b(?!\s+(?:events?|requests?)\b)"
+    r"|\b(?:clusters?|namespaces?|projects?|nodes?)\s+(?:(?:were|was)\s+)?(?:denied|forbidden)\b(?!\s+(?:by|from)\b)",
+    re.IGNORECASE,
+)
+#: "No clusters were unreachable.", "0 clusters unreachable", "There were 0
+#: clusters that were unreachable", "Not a single cluster was unreachable": a
+#: part of a clause whose subject is one of these names no gap.
+NO_GAP = re.compile(
+    r"^\s*(?:there\s+(?:were|was|are|is)\s+)?(?:no|none|nothing|zero|0|not\s+(?:a\s+single|one|any))\b", re.IGNORECASE
+)
+#: "with no unreachable nodes": the gap word negated right before it.
+NEGATED = re.compile(r"\b(?:no|zero)\s+$", re.IGNORECASE)
+#: How far back from a gap word NEGATED reads: "zero" and a run of spaces. Farther
+#: than that, the clause errs toward naming a gap rather than hiding one.
+NEGATION_REACH = 100
+#: "Clusters skipped: none", "unreachable: 0", "Skipped: 0 of 3 clusters": the gap word negated
+#: right after it, by a word ending the clause, perhaps with a total and a scan noun;
+#: "skipped: no credentials" is a reason.
+NONE_AFTER = re.compile(
+    r"\s*[:=—–]\s*(?:none|nothing|zero|no|0)(?:\s*(?:/|of)\s*\d+)?"
+    r"(?:\s+(?:clusters?|namespaces?|projects?|nodes?|workloads?))?\s*(?:[.;,!?)]|$)",
+    re.IGNORECASE,
+)
+#: Where a clause's parts divide, so "No drift, but 2 clusters were
+#: unreachable" keeps its gap.
+CLAUSE_PART = re.compile(r"[,:]|\b(?:but|and|while|although|though)\b", re.IGNORECASE)
+#: Where a line's parts divide, for the one that names a gap; kept, so a
+#: part's "skipped" can still be read against the ": none" after it.
+#: ``(?<!\s)`` here and below starts a whitespace run's match only at the run's
+#: first character: the same matches, but a long run is not retried from every
+#: position inside it, which made a 96 KB run of spaces take minutes.
+LINE_PART = re.compile(r"([;:,]\s+|[.!?]\s+|(?<!\s)\s+[—–]\s+)")
+#: Taken out with the space before it, so no double space is left behind.
+PARENTHETICAL = re.compile(r"(?<!\s)\s*\(([^()]*)\)")
+#: A parenthetical held out of a line while it is split, so its commas do not divide it.
+HELD = "\0{}\0"
+HELD_REF = re.compile(r"\0(\d+)\0")
+#: Fills a parenthetical's span so a join inside it is not found.
+HELD_MASK = "\0"
+#: A conjunction that starts a second count inside a gap part: "2 new and 1 skipped".
+COUNT_JOIN = re.compile(r"(?<!\s)\s+(?:and|but|while|although|though)\s+(?=\d)", re.IGNORECASE)
+#: A conjunction that can start a gap after the counts: "7 findings across 3 clusters but seeded-c was not reached".
+GAP_JOIN = re.compile(r"(?<!\s)\s+(?:and|but|while|although|though)\s+", re.IGNORECASE)
+#: The most joins a gap part is searched at; each reads the whole text before it,
+#: so a part of thousands of "and"s would otherwise take seconds. Past it the part stays whole.
+GAP_JOINS_MAX = 20
+#: A count, not a digit inside a name such as seeded-3.
+COUNT = re.compile(r"(?<![\w.-])\d")
+#: A name and a plural verb after "and": "2 clusters and seeded-c were unreachable" is one subject.
+SHARED_SUBJECT = re.compile(
+    r"^(?!(?:they|others|some|both|all|these|those|rest)\s)(?=[\w.-]*[a-z])[\w.-]+\s+(?:were|are|have)(?:n['’]t)?\b",
+    re.IGNORECASE,
+)
+#: One name in the list a gap's colon opens ("skipped: seeded-d (no credentials), seeded-e"),
+#: as against a reason ("unreachable: no response from the control plane") or a count.
+LISTED_NAME = re.compile(r"\s*(?!\d)[\w.-]+(?:\s*\([^()]*\))?\s*[.!?]?\s*")
+#: The word joining a gap part to the clean part before it: "..., but 2 clusters were skipped".
+JOINING_WORD = re.compile(r"^(?:but|and|while|although|though|yet)\s+", re.IGNORECASE)
+COLON = ":"
+COMMA = ","
+CLAUSE_ENDS = ".!?"
+CLAUSE_STOP = "."
+#: A first word :func:`as_line` capitalizes; "seeded-c" or "kube-system" is a name and keeps its case.
+LOWER_WORD = re.compile(r"[a-z]+(?![\w-])")
 
 
 def enabled() -> bool:
@@ -369,6 +499,109 @@ def _clip(text: str, limit: int) -> str:
     return cut.rstrip() + ELLIPSIS
 
 
+def names_gap(clause: str, after: str = "") -> bool:
+    """True when ``clause`` says something was not scanned, and no part of it says nothing was.
+
+    ``after`` is the text that followed ``clause`` in its line, read only for a
+    negation of a gap word that ends the clause; a URL's path is not a clause.
+    """
+    clause = BARE_URL.sub(" ", clause)
+    # Each gap word starts at a word boundary, so no part divider spans it.
+    starts = [0] + [m.end() for m in CLAUSE_PART.finditer(clause)]
+    for match in GAP.finditer(clause):
+        part = clause[starts[bisect_right(starts, match.start()) - 1] : match.start()]
+        if NO_GAP.match(part) or NEGATED.search(clause, max(0, match.start() - NEGATION_REACH), match.start()):
+            continue
+        if not NONE_AFTER.match(clause[match.end() :] + after):
+            return True
+    return False
+
+
+def _held_split(pattern: re.Pattern, text: str) -> list[str]:
+    """``pattern.split(text)`` with no split inside a parenthetical.
+
+    A NUL in ``text`` is dropped first: a literal ``\\0N\\0`` would otherwise read
+    as a held reference and be swapped for a parenthetical, or index past them.
+    """
+    text = text.replace("\0", "")
+    held: list[str] = []
+
+    def hold(match: re.Match) -> str:
+        held.append(match.group(0))
+        return HELD.format(len(held) - 1)
+
+    pieces = pattern.split(PARENTHETICAL.sub(hold, text))
+    return [HELD_REF.sub(lambda m: held[int(m.group(1))], piece) for piece in pieces]
+
+
+def _gap_counts(piece: str) -> list[str]:
+    """``piece`` as the counts in it that name a gap: "2 new and 1 skipped" is ["1 skipped"]."""
+    counts = _held_split(COUNT_JOIN, piece)
+    kept = [count for count in counts if names_gap(PARENTHETICAL.sub("", count))]
+    if not kept or len(kept) == len(counts):
+        return _after_counts(piece)
+    return [part for count in kept for part in _after_counts(count)]
+
+
+def _after_counts(piece: str) -> list[str]:
+    """``piece`` from the gap joined to a count before it: "2 new and seeded-c skipped" is ["seeded-c skipped"].
+
+    "seeded-d and seeded-e were skipped" has no count before its join and stays whole, and
+    "2 clusters and seeded-c were unreachable" shares one subject and stays whole.
+    """
+    masked = PARENTHETICAL.sub(lambda match: HELD_MASK * len(match.group(0)), piece)
+    for join in itertools.islice(GAP_JOIN.finditer(masked), GAP_JOINS_MAX):
+        before = PARENTHETICAL.sub("", piece[: join.start()])
+        after = piece[join.end() :]
+        if join.group(0).strip().lower() == "and" and SHARED_SUBJECT.match(after):
+            continue
+        if COUNT.search(before) and not names_gap(before) and names_gap(PARENTHETICAL.sub("", after)):
+            return _gap_counts(after)
+    return [piece]
+
+
+def gap_parts(text: str) -> list[str]:
+    """Every part of ``text`` that names what was not scanned, as written, in order.
+
+    ``text`` is split at :data:`LINE_PART` outside parentheses. A part naming a
+    gap keeps its parentheticals and, after a colon, the names the colon lists
+    ("skipped: seeded-d, seeded-e") but not a reason; a count beside it joined
+    by "and" is left behind. A part that names none is searched inside its parentheticals.
+    """
+    pieces = _held_split(LINE_PART, text)
+    parts, separators = pieces[::2], pieces[1::2]
+    found: list[str] = []
+    i = 0
+    while i < len(parts):
+        part = parts[i]
+        after = PARENTHETICAL.sub("", separators[i] + parts[i + 1]) if i < len(separators) else ""
+        if not names_gap(PARENTHETICAL.sub("", part), after):
+            for inner in PARENTHETICAL.findall(part):
+                found += gap_parts(inner)
+            i += 1
+            continue
+        piece, named = part, False
+        while i < len(separators):
+            separator, following = separators[i], parts[i + 1]
+            opens = separator.strip() == COLON and not named
+            if not (opens or named and separator.strip() == COMMA) or not LISTED_NAME.fullmatch(following):
+                break
+            named = True
+            piece += separator + following
+            i += 1
+        found += [JOINING_WORD.sub("", count.strip()) for count in _gap_counts(piece)]
+        i += 1
+    return found
+
+
+def as_line(clause: str) -> str:
+    """``clause`` as a sentence of its own: ending in a full stop, capitalized unless it opens on a name."""
+    clause = clause.strip()
+    if clause[-1:] not in CLAUSE_ENDS:
+        clause += CLAUSE_STOP
+    return clause[:1].upper() + clause[1:] if LOWER_WORD.match(clause) else clause
+
+
 def _escape(text: str) -> str:
     for raw, escaped in MRKDWN_ESCAPES:
         text = text.replace(raw, escaped)
@@ -479,7 +712,9 @@ def _safe_link_url(url: str) -> bool:
         return False
 
 
-def _button(label: str, action_id: str, *, url: str | None = None, value: str | None = None) -> dict | None:
+def _button(
+    label: str, action_id: str, *, url: str | None = None, value: str | None = None, style: str | None = None,
+) -> dict | None:
     """A button, or ``None`` for a ``url`` :func:`_safe_link_url` refuses. Callers drop an unsafe url
     first and this is the backstop: a button with no url would still read as a link button, and a click
     on it would open nothing. ``_actions`` skips ``None``."""
@@ -494,6 +729,8 @@ def _button(label: str, action_id: str, *, url: str | None = None, value: str | 
         button["url"] = url
     if value is not None:
         button["value"] = value[:BUTTON_VALUE_MAX]
+    if style is not None:
+        button["style"] = style
     return button
 
 
@@ -505,15 +742,96 @@ def _actions(buttons: Sequence[dict | None]) -> list[dict]:
     ]
 
 
+def to_mrkdwn(markdown: str) -> str:
+    """Standard markdown to Slack mrkdwn: bold, links and headings; code and urls left alone.
+
+    The input must already be escaped (``&``, ``<``, ``>``), as :func:`_row_line`
+    does: this adds brackets but escapes nothing. Only a link to a ``SAFE_URL``
+    is then written as ``<url|label>``; any other target, ``@U…``, ``!channel``,
+    ``#C…`` or a url Slack would refuse, keeps its label alone.
+    """
+    spans: list[str] = []
+
+    def keep(text: str) -> str:
+        spans.append(text)
+        return CODE_HOLD.format(len(spans) - 1)
+
+    def hold(m: re.Match) -> str:
+        return keep(m.group(0))
+
+    def link(m: re.Match) -> str:
+        return f"<{keep(m.group(2))}|{m.group(1)}>" if SAFE_URL.fullmatch(m.group(2)) else m.group(1)
+
+    def restore(text: str) -> str:
+        return CODE_PLACEHOLDER.sub(lambda m: restore(spans[int(m.group(1))]), text)
+
+    lines = []
+    fence = None
+    for line in markdown.replace("\x00", "").split("\n"):
+        # A fence's lines, the opener and closer included, pass through as written.
+        fence, was_open = next_fence(line, fence), fence
+        if fence is not None or was_open is not None:
+            lines.append(line)
+            continue
+        held = INLINE_CODE.sub(hold, line)
+        heading = HEADING.match(held)
+        if heading:
+            held = "**" + held[heading.end():].strip() + "**"
+        held = MD_LINK.sub(link, held)
+        held = BARE_URL.sub(hold, held)
+        held = MD_BOLD.sub(lambda m: "*" + next(g for g in m.groups() if g is not None) + "*", held)
+        lines.append(restore(held))
+    return "\n".join(lines)
+
+
+def _row_parts(row: Any) -> tuple[str, str]:
+    """``(severity, text)`` from a ``{"text", "severity"?}`` mapping or a plain string."""
+    if isinstance(row, Mapping):
+        text, severity = str(row.get("text") or ""), row.get("severity")
+    else:
+        text, severity = str(row), None
+    return str(severity or "").replace(BACKTICK, "").strip().lower(), text
+
+
+def _row_detail(row: Any) -> str:
+    """A row's optional second line, from a mapping's ``detail``; empty for a plain string."""
+    return str(row.get("detail") or "").strip() if isinstance(row, Mapping) else ""
+
+
+def _shown(rows: Iterable[Any]) -> list[Any]:
+    """``rows`` without those that have neither text nor a severity, which would render empty."""
+    return [row for row in rows or () if any(part.strip() for part in _row_parts(row))]
+
+
+def severity_row(severity: str, text: str) -> str:
+    """``text`` led by ``severity`` as inline code; the same in markdown and mrkdwn."""
+    return SEVERITY_TAG.format(severity=severity, text=text)
+
+
+def _row_line(row: Any) -> str:
+    """A row as one mrkdwn line, so a row can no more mention anyone than a label can.
+
+    Escaping neutralises the brackets already there; ``to_mrkdwn`` then writes
+    new ones only for a link to a ``SAFE_URL``.
+    """
+    severity, text = _row_parts(row)
+    line = to_mrkdwn(_escape(_clip(text.strip(), ROW_TEXT_MAX)))
+    line = severity_row(_escape(severity), line) if severity else f"{BULLET}{line}"
+    detail = _row_detail(row)
+    return f"{line}\n{to_mrkdwn(_escape(_clip(detail, ROW_TEXT_MAX)))}" if detail else line
+
+
 def blocks_answer(
     headline: str,
     links: Iterable[Any] = (),
     choices: Iterable[str] = (),
     action_id_prefix: str = "kage",
+    primary_link: bool = False,
 ) -> list[dict]:
     """Block Kit for a message: headline, link buttons, choice buttons.
 
-    ``links`` are ``(label, url)`` pairs or ``{"text", "url"}`` mappings.
+    ``links`` are ``(label, url)`` pairs or ``{"text", "url"}`` mappings; with
+    ``primary_link`` the first is drawn as the message's primary action.
     ``choices`` are labels; each button's ``value`` is its label. Blocks are
     emitted in that order and any part left empty is omitted.
     """
@@ -522,7 +840,10 @@ def blocks_answer(
     if title:
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*{_escape(title)}*"}})
     link_buttons = [
-        _button(label, f"{action_id_prefix}.{LINK_ACTION}.{i}", url=url)
+        _button(
+            label, f"{action_id_prefix}.{LINK_ACTION}.{i}", url=url,
+            style=PRIMARY_STYLE if primary_link and not i else None,
+        )
         for i, (label, url) in enumerate(_link_pairs(links))
     ]
     blocks.extend(_actions(link_buttons))
@@ -534,18 +855,80 @@ def blocks_answer(
     return blocks
 
 
-def fallback_text(headline: str, links: Iterable[Any] = (), choices: Iterable[str] = ()) -> str:
+def with_side_bar(blocks: Sequence[dict], color: str, text: str) -> dict:
+    """``blocks`` as the ``blocks`` and ``attachments`` of a ``chat.postMessage`` or
+    ``chat.update``: all but the first :data:`SIDE_BAR_FROM` go in one attachment
+    with ``color`` as its side bar.
+
+    ``text`` is the message's own, given as the attachment's ``fallback``:
+    without one Slack stores "[no preview available]", which a thread read back
+    shows. The Slack adapter reads a fallback only from an attachment with no
+    text it can extract (``_extract_text_from_slack_attachments``), and drops
+    one the message's text already holds.
+    ``attachments`` is always present, empty when nothing is left for the bar,
+    since ``chat.update`` keeps a message's attachments unless it is sent some.
+    """
+    blocks = list(blocks or ())
+    above, barred = blocks[:SIDE_BAR_FROM], blocks[SIDE_BAR_FROM:]
+    if not above or not barred:
+        return {"blocks": blocks, "attachments": []}
+    return {"blocks": above, "attachments": [{"color": color, "fallback": text, "blocks": barred}]}
+
+
+def _side_bar(message: Any) -> dict | None:
+    """The first attachment of ``message`` with a colour and blocks: a side bar, not an unfurl."""
+    attachments = message.get("attachments") or () if isinstance(message, dict) else ()
+    for attachment in attachments:
+        if isinstance(attachment, dict) and attachment.get("blocks") and attachment.get("color"):
+            return attachment
+    return None
+
+
+def message_blocks(message: Any) -> list[dict]:
+    """The blocks ``message`` shows itself: its own, then its side bar's.
+
+    A click's payload echoes a message :func:`with_side_bar` laid out with its
+    blocks split between the two. Any other attachment, such as a link's
+    unfurl, is not the message's own.
+    """
+    if not isinstance(message, dict):
+        return []
+    bar = _side_bar(message) or {}
+    return [b for b in (*(message.get("blocks") or ()), *(bar.get("blocks") or ())) if isinstance(b, dict)]
+
+
+def side_bar_color(message: Any) -> str | None:
+    """The colour of the side bar of ``message``, else None."""
+    bar = _side_bar(message)
+    if bar is None:
+        return None
+    color = str(bar["color"])
+    # Slack echoes a hex colour without its "#".
+    return color if color.startswith(HEX_MARK) else HEX_MARK + color
+
+
+def fallback_text(
+    headline: str,
+    links: Iterable[Any] = (),
+    choices: Iterable[str] = (),
+    rows: Sequence[Any] = (),
+    after_rows: str = "",
+) -> str:
     """The same layout as plain mrkdwn, with no buttons.
 
     Used as the ``text`` of a blocks message (notifications, screen readers).
     ``headline`` is already plain, as :func:`split_answer` gives it; a second
-    plain pass would strip markup a code span had kept. Links become inline
-    ``<url|label>``, the url escaped by :func:`_link_url` so the link opens what
-    its button opens; choices become one "Reply with one of:" line. Every label
-    is escaped, so none can mention anyone. The headline loses no character but
-    to the ``HEADLINE_MAX`` clip, since one a code span kept can be part of a
-    command; one holding a ``*``, ``_`` or ``~`` that Slack would read as markup
-    goes out without the bold.
+    plain pass would strip markup a code span had kept. ``rows`` follow the
+    headline, one line each, led by their severity as inline code or, with
+    none, a bullet, and any ``detail`` on the line under its row, each clipped
+    as the rich view clips it, then each line of ``after_rows``, clipped and
+    escaped the same; links become inline ``<url|label>``, the url escaped by
+    :func:`_link_url` so the link opens what its button opens; choices become one
+    "Reply with one of:" line. Every label and row is escaped, a row's url is a
+    ``SAFE_URL`` and a link's passes :func:`_safe_link_url`, so none can mention
+    anyone. The headline loses no character but to the ``HEADLINE_MAX`` clip,
+    since one a code span kept can be part of a command; one holding a ``*``,
+    ``_`` or ``~`` that Slack would read as markup goes out without the bold.
     """
     parts: list[str] = []
     title = _clip((headline or "").strip(), HEADLINE_MAX)
@@ -553,6 +936,8 @@ def fallback_text(headline: str, links: Iterable[Any] = (), choices: Iterable[st
         # A marker in the headline would end or nest inside the bold it is wrapped in.
         live = FALLBACK_LIVE_MARKER.search(title) or MD_ITALIC.search(title)
         parts.append(_escape(title) if live else f"*{_escape(title)}*")
+    parts.extend(_row_line(row) for row in _shown(rows))
+    parts.extend(to_mrkdwn(_escape(_clip(line, ROW_TEXT_MAX))) for line in _after_lines(after_rows))
     pairs = _link_pairs(links)
     if pairs:
         parts.append(CHOICE_SEPARATOR.join(f"<{_link_url(url)}|{_escape(label)}>" for label, url in pairs))
@@ -560,6 +945,114 @@ def fallback_text(headline: str, links: Iterable[Any] = (), choices: Iterable[st
     if labels:
         parts.append(CHOICES_LEAD + CHOICE_SEPARATOR.join(labels))
     return "\n".join(parts)
+
+
+def _rich_elements(markdown: str) -> list[dict]:
+    """One line of markdown as rich_text elements: code spans, bold, italic, strike and links kept, the rest text."""
+    elements: list[dict] = []
+    at = 0
+    for span in RICH_SPAN.finditer(markdown):
+        if span.start() > at:
+            elements.append({"type": "text", "text": markdown[at : span.start()]})
+        if span.group("code") is not None:
+            elements.append({"type": "text", "text": span.group("code"), "style": {"code": True}})
+        elif (bold := next((span.group(g) for g in ("bold", "inbold", "ubold") if span.group(g) is not None), None)) is not None:
+            elements.append({"type": "text", "text": bold, "style": {"bold": True}})
+        elif span.group("star") is not None or span.group("under") is not None:
+            elements.append({"type": "text", "text": span.group("star") or span.group("under"), "style": {"italic": True}})
+        elif span.group("strike") is not None:
+            elements.append({"type": "text", "text": span.group("strike"), "style": {"strike": True}})
+        elif SAFE_URL.fullmatch(span.group("url")):
+            elements.append({"type": "link", "url": span.group("url"), "text": span.group("label")})
+        else:
+            elements.append({"type": "text", "text": span.group("label")})
+        at = span.end()
+    if at < len(markdown):
+        elements.append({"type": "text", "text": markdown[at:]})
+    return elements
+
+
+def _rich_row(row: Any) -> dict:
+    """A report row: its severity as inline code, then its text, with no bullet; any detail below it."""
+    severity, text = _row_parts(row)
+    elements = _rich_elements(_clip(text.strip(), ROW_TEXT_MAX))
+    if severity:
+        elements = [{"type": "text", "text": severity, "style": {"code": True}}, {"type": "text", "text": " "}, *elements]
+    detail = _row_detail(row)
+    if detail:
+        elements += [{"type": "text", "text": "\n"}, *_rich_elements(_clip(detail, ROW_TEXT_MAX))]
+    return {"type": "rich_text_section", "elements": elements}
+
+
+def blocks_report(
+    headline: str,
+    note: str = "",
+    rows: Sequence[Any] = (),
+    choices: Iterable[Any] = (),
+    links: Iterable[Any] = (),
+    action_id_prefix: str = "kage",
+    detail: str = "",
+    after_rows: str = "",
+) -> list[dict]:
+    """Block Kit for a report: headline, the top rows between dividers, buttons.
+
+    ``headline`` is bold and ``note`` follows it plain, both one line;
+    ``detail``, when given, is one more plain line under them, clipped like a
+    row, and each line of ``after_rows`` a plain line below the rows' group,
+    clipped the same. ``rows``
+    are ``{"text": <markdown>, "severity"?: str, "detail"?:
+    <markdown>}`` mappings or plain strings, a ``detail`` being a second line
+    under its row, clipped like it; ``rows`` sit between two dividers, with no
+    header above them. The first choice is the primary button and the links
+    follow the choices. A choice is clipped to the button label before it
+    becomes the value too, so a click posts only what the button showed.
+    Any part left empty, a row with no text and no severity included, is
+    omitted.
+    """
+    rows = _shown(rows)
+    blocks: list[dict] = []
+    head: list[dict] = []
+    title = _clip(_plain(headline or ""), HEADLINE_MAX)
+    if title:
+        head.append({"type": "text", "text": title, "style": {"bold": True}})
+    if note and note.strip():
+        head.append({"type": "text", "text": " " + _plain(note)})
+    sections = [{"type": "rich_text_section", "elements": head}] if head else []
+    detail_line = _clip(_plain(detail or "").strip(), ROW_TEXT_MAX)
+    if detail_line:
+        sections.append({"type": "rich_text_section", "elements": [{"type": "text", "text": detail_line}]})
+    if sections:
+        blocks.append({"type": "rich_text", "elements": sections})
+    if rows:
+        blocks.append({"type": "divider"})
+        blocks.append({"type": "rich_text", "elements": [_rich_row(row) for row in rows]})
+        blocks.append({"type": "divider"})
+    after_lines = [_clip(_plain(line), ROW_TEXT_MAX) for line in _after_lines(after_rows)]
+    if after_lines:
+        blocks.append({"type": "rich_text", "elements": [
+            {"type": "rich_text_section", "elements": [{"type": "text", "text": line}]} for line in after_lines]})
+    choice_buttons = [
+        _button(label, f"{action_id_prefix}.{CHOICE_ACTION}.{i}", value=label)
+        for i, label in enumerate(_choice_labels(choices))
+    ]
+    if choice_buttons:
+        choice_buttons[0]["style"] = PRIMARY_STYLE
+    link_buttons = [
+        _button(label, f"{action_id_prefix}.{LINK_ACTION}.{i}", url=url)
+        for i, (label, url) in enumerate(_link_pairs(links))
+    ]
+    blocks.extend(_actions(choice_buttons + link_buttons))
+    return blocks
+
+
+def _after_lines(after_rows: str) -> list[str]:
+    """The non-blank lines of ``after_rows``, stripped."""
+    return [line.strip() for line in (after_rows or "").splitlines() if line.strip()]
+
+
+def _choice_labels(choices: Iterable[Any]) -> list[str]:
+    """Each non-empty choice clipped to a button label."""
+    return [_clip(str(choice), BUTTON_TEXT_MAX) for choice in choices or () if str(choice).strip()]
 
 
 # --- link-button ack -------------------------------------------------------

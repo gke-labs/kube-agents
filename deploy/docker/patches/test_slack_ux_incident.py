@@ -231,7 +231,9 @@ class RuntimeTest(unittest.TestCase):
 
     def test_an_option_title_keeps_its_in_word_double_markers(self):
         triage = runtime.parse_triage(REPORT.replace("Roll back to 14:02", "Set DB__HOST and DB__PORT"))
-        self.assertEqual(triage["choices"][0][0], "apply Option A: Set DB__HOST and DB__PORT")
+        self.assertEqual(
+            triage["choices"][0][:2], ("Set DB__HOST and DB__PORT", "apply Option A: Set DB__HOST and DB__PORT")
+        )
 
     def test_link_labels_are_plain_and_reach_the_fallback_text(self):
         report = REPORT.replace("[GKE Workloads]", "[**GKE Workloads**]")
@@ -283,8 +285,12 @@ class RuntimeTest(unittest.TestCase):
         buttons = actions["elements"]
         self.assertEqual(
             [b["text"]["text"] for b in buttons],
-            ["apply Option A: Roll back to 14:02", "apply Option B: Restore the secret",
-             "GKE Workloads ↗", "Cloud Logs ↗"],
+            ["Roll back to 14:02", "Restore the secret (recommended)", "GKE Workloads ↗", "Cloud Logs ↗"],
+        )
+        # The value is the reply a click sends: the call to action's own words.
+        self.assertEqual(
+            [b.get("value") for b in buttons[:2]],
+            ["apply Option A: Roll back to 14:02", "apply Option B: Restore the secret"],
         )
         self.assertEqual([b.get("style") for b in buttons], [None, "primary", None, None])
         self.assertEqual([b.get("url") for b in buttons[2:]], [WORKLOADS_URL, LOGS_URL])
@@ -392,7 +398,8 @@ class RuntimeTest(unittest.TestCase):
         blocks = adapter.log[0][1]["blocks"]
         button = blocks[1]["elements"][1]
         action = {"action_id": button["action_id"], "text": button["text"], "value": button["value"]}
-        self.assertTrue(clicks._shown_text(action).startswith("apply Option B"))
+        self.assertEqual(clicks._shown_text(action), "Restore the secret (recommended)")
+        self.assertEqual(action["value"], "apply Option B: Restore the secret")
         answered = clicks.answered_blocks(
             blocks, lambda a: bool(presenter.CHOICE_ACTION_ID_PATTERN.search(a)), "✓ picked"
         )
@@ -417,13 +424,22 @@ class RuntimeTest(unittest.TestCase):
             "- ❌ **Not Recommended: Option A** — it hides the cause.\n- ✅ **Recommended: Option B**",
         )
         triage = runtime.parse_triage(report)
-        self.assertEqual([rec for _label, rec in triage["choices"]], [False, True])
+        self.assertEqual([rec for _label, _reply, rec in triage["choices"]], [False, True])
+
+    def test_a_title_ending_in_the_suffix_clicks_through_to_its_apply_reply(self):
+        for title in ("Roll back (recommended)", "Roll back (recommended) (recommended)"):
+            with self.subTest(title=title):
+                report = REPORT.replace("(Roll back to 14:02)", f"({title})")
+                label, reply, recommended = runtime.parse_triage(report)["choices"][0]
+                self.assertEqual((label, reply, recommended), ("Roll back", "apply Option A: Roll back", False))
+                picked = label.removesuffix(clicks.INCIDENT_RECOMMENDED_SUFFIX)
+                self.assertEqual(clicks._incident_turn(picked, reply), reply)
 
     def test_a_stray_heading_between_options_still_shows_every_option(self):
         for cut in ("# undo it with kubectl rollout undo\n", "````\n```\n# undo\n```\n````\n"):
             with self.subTest(cut=cut):
                 report = REPORT.replace("- **Option B", cut + "- **Option B")
-                self.assertEqual([rec for _label, rec in runtime.parse_triage(report)["choices"]], [False, True])
+                self.assertEqual([rec for _label, _reply, rec in runtime.parse_triage(report)["choices"]], [False, True])
 
     def test_a_whats_wrong_opening_with_a_code_span_still_gives_the_headline(self):
         lines = REPORT.split("\n")
@@ -435,7 +451,7 @@ class RuntimeTest(unittest.TestCase):
     def test_a_line_opening_with_a_code_span_is_not_a_fence(self):
         report = REPORT.replace("- ✅ **Recommended", "```kubectl rollout undo``` is the command.\n- ✅ **Recommended")
         triage = runtime.parse_triage(report)
-        self.assertEqual([rec for _label, rec in triage["choices"]], [False, True])
+        self.assertEqual([rec for _label, _reply, rec in triage["choices"]], [False, True])
         self.assertEqual([label for label, _url in triage["links"]], ["GKE Workloads", "Cloud Logs"])
 
     def test_an_option_named_only_in_a_heading_keeps_the_threaded_reply(self):
@@ -444,7 +460,7 @@ class RuntimeTest(unittest.TestCase):
 
     def test_a_stray_heading_after_the_options_keeps_links_and_the_recommendation(self):
         triage = runtime.parse_triage(REPORT.replace("- ✅ **Recommended", "# see the runbook\n- ✅ **Recommended"))
-        self.assertEqual([rec for _label, rec in triage["choices"]], [False, True])
+        self.assertEqual([rec for _label, _reply, rec in triage["choices"]], [False, True])
         self.assertEqual([label for label, _url in triage["links"]], ["GKE Workloads", "Cloud Logs"])
 
     def test_a_link_emoji_inside_prose_is_not_the_links_line(self):
@@ -456,7 +472,7 @@ class RuntimeTest(unittest.TestCase):
 
     def test_emphasis_closed_before_the_colon_is_still_the_recommendation(self):
         report = REPORT.replace("**Recommended: Option B**", "**Recommended**: Option B")
-        self.assertEqual([rec for _label, rec in runtime.parse_triage(report)["choices"]], [False, True])
+        self.assertEqual([rec for _label, _reply, rec in runtime.parse_triage(report)["choices"]], [False, True])
 
     def test_an_unclosed_fence_between_options_keeps_the_reply(self):
         report = REPORT.replace("- **Option B", "```\nkubectl rollout undo deploy/payments-api\n- **Option B")
@@ -465,7 +481,7 @@ class RuntimeTest(unittest.TestCase):
     def test_a_longer_fence_is_closed_only_by_one_as_long(self):
         report = REPORT.replace("- **Option B", "````\n```\n````\n- **Option B")
         triage = runtime.parse_triage(report)
-        self.assertEqual([rec for _label, rec in triage["choices"]], [False, True])
+        self.assertEqual([rec for _label, _reply, rec in triage["choices"]], [False, True])
         self.assertEqual(len(triage["links"]), 2)
 
     def test_a_url_slack_would_refuse_is_dropped_not_sent(self):
@@ -487,7 +503,8 @@ class RuntimeTest(unittest.TestCase):
         adapter = _Adapter()
         self.deliver(adapter, result=SINGLE)
         _headline, actions, fold = adapter.log[0][1]["blocks"]
-        self.assertEqual([b["text"]["text"] for b in actions["elements"]], ["apply: Lower the node pool max"])
+        self.assertEqual([b["text"]["text"] for b in actions["elements"]], ["Lower the node pool max"])
+        self.assertEqual(actions["elements"][0]["value"], "apply: Lower the node pool max")
         self.assertEqual(actions["elements"][0]["style"], "primary")
         self.assertEqual(fold["title"]["text"], "why · what the fix does")
 
@@ -499,9 +516,11 @@ class RuntimeTest(unittest.TestCase):
 
     def test_a_title_with_parentheses_is_kept_whole(self):
         triage = runtime.parse_triage(REPORT.replace("Restore the secret", "Scale to 4 (from 2)"))
-        self.assertEqual(triage["choices"][1][0], "apply Option B: Scale to 4 (from 2)")
+        self.assertEqual(
+            triage["choices"][1], ("Scale to 4 (from 2) (recommended)", "apply Option B: Scale to 4 (from 2)", True)
+        )
         single = runtime.parse_triage(SINGLE.replace("Lower the node pool max", "Cap at 4 (was 8)"))
-        self.assertEqual(single["choices"], [("apply: Cap at 4 (was 8)", True)])
+        self.assertEqual(single["choices"], [("Cap at 4 (was 8)", "apply: Cap at 4 (was 8)", True)])
 
     def test_only_the_links_line_becomes_buttons(self):
         prose = REPORT.replace(
@@ -523,7 +542,7 @@ class RuntimeTest(unittest.TestCase):
             "Revert the Deployment to revision 7.\n```\n# in seeded-debug\nkubectl rollout undo deploy/payments-api\n```\n",
         )
         triage = runtime.parse_triage(fenced)
-        self.assertEqual([c for c, _ in triage["choices"]],
+        self.assertEqual([reply for _label, reply, _rec in triage["choices"]],
                          ["apply Option A: Roll back to 14:02", "apply Option B: Restore the secret"])
         self.assertEqual(len(triage["links"]), 2)
 
@@ -533,7 +552,7 @@ class RuntimeTest(unittest.TestCase):
             "## What to do\n\n```\n- **Option A (<Action Title>):** <what it does>\n```\n",
         )
         triage = runtime.parse_triage(quoted)
-        self.assertEqual(triage["choices"][0][0], "apply Option A: Roll back to 14:02")
+        self.assertEqual(triage["choices"][0][1], "apply Option A: Roll back to 14:02")
 
     def test_a_link_with_userinfo_gets_no_button(self):
         spoofed = "https://console.cloud.google.com@evil.example/"
@@ -614,6 +633,37 @@ class RuntimeTest(unittest.TestCase):
         blocks = runtime.blocks_triage(triage, [])
         for button in blocks[1]["elements"]:
             self.assertLessEqual(len(button["text"]["text"]), presenter.BUTTON_TEXT_MAX)
+        # The recommended title is clipped, not its suffix.
+        self.assertTrue(blocks[1]["elements"][1]["text"]["text"].endswith("… (recommended)"))
+        self.assertEqual(blocks[1]["elements"][1]["value"], "apply Option B: " + long_title)
+
+    def test_the_fallback_text_offers_the_replies(self):
+        text = runtime.fallback_text(runtime.parse_triage(REPORT))
+        self.assertIn("apply Option A: Roll back to 14:02", text)
+        self.assertIn("apply Option B: Restore the secret", text)
+        self.assertNotIn("(recommended)", text)
+
+    def test_the_alert_title_is_read_from_the_alerts_routing_row(self):
+        self.assertEqual(runtime.alert_title(CHANNEL, ALERT_TS, self.db), "")
+        meta = {"platform": "slack", "chat_id": CHANNEL, "thread_id": ALERT_TS,
+                "title": "payments-api crashloop in seeded-debug"}
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO session_metadata VALUES (?, ?)", ("k8s-evt-0000abcd", json.dumps(meta))
+            )
+            conn.execute("INSERT INTO incidents VALUES (?, ?, ?)", (CHANNEL, ALERT_TS, "first"))
+            conn.commit()
+        # A stored report does not hide it: the click comes after the report.
+        self.assertEqual(runtime.alert_title(CHANNEL, ALERT_TS, self.db), "payments-api crashloop in seeded-debug")
+        self.assertEqual(runtime.alert_title("C0OTHER", ALERT_TS, self.db), "")
+        self.assertEqual(runtime.alert_title(CHANNEL, ALERT_TS, os.path.join(self.tmp.name, "missing.db")), "")
+
+    def test_a_cron_rows_title_is_not_an_alert_title(self):
+        meta = {"platform": "slack", "chat_id": CHANNEL, "thread_id": "1700000000.000777", "title": "cron"}
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("INSERT INTO session_metadata VALUES (?, ?)", ("cron-daily-audit", json.dumps(meta)))
+            conn.commit()
+        self.assertEqual(runtime.alert_title(CHANNEL, "1700000000.000777", self.db), "")
 
 
 class ApplierTest(unittest.TestCase):

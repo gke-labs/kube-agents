@@ -395,6 +395,12 @@ def test_with_the_module_the_question_posts_once_and_the_wake_carries_the_note(
         f"[kanban] Task {planted.card} blocked; needs attention.\n"
         f"Assignee: @{card_wake.WAKE_ASSIGNEE}\n\n{_moments_note()}"
     )
+    # The question's choices sit inside the side bar's attachment, so the
+    # replay's capture of it is what lets a fresh session read them.
+    (side_bar,) = planted.post["attachments"]
+    assert side_bar["color"] == "#ECB22E"
+    assert "seeded-a" in json.dumps(side_bar["blocks"])
+    assert "seeded-a" not in json.dumps(planted.post["blocks"])
     card = _board(tmp_path)["tasks"][planted.card]
     assert card["status"] == "blocked"
     assert card["created_by"] == card_wake.CARD_CREATOR
@@ -668,7 +674,14 @@ def test_a_fresh_plant_that_filed_no_decoy_is_broken() -> None:
 
 def test_the_thread_holds_the_ask_the_question_and_a_posted_wake_reply() -> None:
     replay = card_wake.parse(FRESH_PROMPT)
-    post = {"text": "Which should I look at? (Question from card t_1.)", "blocks": []}
+    # The shape the plant captures: the question's detail and choices sit in
+    # the side bar's attachment, not in the top-level blocks.
+    choices = [{"type": "actions", "elements": [{"type": "button", "text": {"type": "plain_text", "text": "seeded-a"}}]}]
+    post = {
+        "text": "Which should I look at? (Question from card t_1.)",
+        "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "*Which should I look at?*"}}],
+        "attachments": [{"color": "#ECB22E", "blocks": choices}],
+    }
     planted = card_wake.Planted("t_1", "wake", 1, KEY, post, "t_2")
 
     messages = card_wake.thread_messages(replay, planted, "seeded-a or seeded-b?")
@@ -678,6 +691,7 @@ def test_the_thread_holds_the_ask_the_question_and_a_posted_wake_reply() -> None
         (card_wake.STUB_BOT, post["text"]),
         (card_wake.STUB_BOT, "seeded-a or seeded-b?"),
     ]
+    assert (messages[1]["blocks"], messages[1]["attachments"]) == (post["blocks"], post["attachments"])
     assert [m["ts"] for m in messages] == sorted(m["ts"] for m in messages)
 
 

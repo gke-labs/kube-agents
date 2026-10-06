@@ -4357,14 +4357,19 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// or a credential. Its writes go only to Slack, in the channels and threads
 	// the gateway already serves, among them a reaction on an ask, a click's
 	// rewrite of the clicked message and its echo, and an incident alert's edit
-	// into its options. Each effect it switches, one per change that ships it:
+	// into its options, apart from one: the title of an event alert's thread,
+	// recorded on that alert's own routing row in the local Session KV
+	// database. Each effect it switches, one per change that ships it:
 	//
 	//   - Clicks: a click on a choice runs as the clicker's turn under the
 	//     adapter's own authorization, echoed in the same thread.
-	//   - Incident alerts: an incident alert's triage options post as an edit
-	//     of the alert, with a button per option and the report folded; the
-	//     Session KV database is read, read-only, to tell an alert's thread
-	//     from any other; and before an option click counts, the alert's
+	//   - Incident alerts: a crashloop alert posts to Slack as a one-line
+	//     headline, and the event watcher records a title for the alert's
+	//     thread on its routing row, which the thread status reads; an
+	//     incident alert's triage options post as an edit of the alert, with a
+	//     button per option and the report folded; the Session KV database is
+	//     otherwise read, read-only, to tell an alert's thread from any other
+	//     and to read that title; and before an option click counts, the alert's
 	//     thread is read once (conversations.replies, the existing token and
 	//     scopes) to see whether someone the agent answers typed apply since
 	//     the options appeared, which drops the click.
@@ -4374,6 +4379,13 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	//     telling the Planning Agent not to ask it again, the one effect that
 	//     reaches a model.
 	//   - Reactions: which reaction goes on an ask and when it settles.
+	//   - Reports: a fleet-audit cron report and the first inventory report
+	//     post as Block Kit, laid out again as a headline and the top findings
+	//     (the audit's rest counted and left to its ledger, the inventory's
+	//     behind a "See all" button), through the credential
+	//     proxy's Slack relay to the channel or thread the report was already
+	//     bound for; the audit's counts come from its ledger issue, read
+	//     through the forge broker.
 	//   - Thread status: less of a delegated card's delivery posts in the
 	//     thread, the thread's cards show as one plan message, and Slack shows
 	//     a session status and title on the thread.

@@ -1,4 +1,4 @@
-"""React to each Slack ask by kind, and again when the work settles.
+"""Mark a Slack ask ❌ when the work it started fails, and nothing otherwise.
 
 Installed into the image at ``/opt/hermes/gateway/slack_ux_reactions.py``.
 ``apply_slack_ux_reactions.py`` makes the Slack adapter's two reaction hooks
@@ -20,11 +20,14 @@ turn ends. Two things go wrong in a kube-agents install:
   runs on the kanban board for minutes after. Upstream's ✅ says "done" at the
   moment the work starts.
 
-With the flag on:
+With the flag on, only a failure shows: ``SHOW_ARRIVAL`` and
+``SHOWN_SETTLES`` hold the routine reactions (the arrival reaction, ✅ and ⏸️)
+back, a display choice made for now. Everything below still decides each ask's
+settle, so a delegated ask's ❌ still waits on the cards it opened.
 
-* The arrival reaction says what kind of ask this is, chosen from its words
-  before any model call (``slack_presenter.arrival_reaction``): 👀 a question
-  or check, 🛠️ a change, 📋 the board, 🚨 an incident.
+* The arrival reaction would say what kind of ask this is, chosen from its
+  words before any model call (``slack_presenter.arrival_reaction``): 👀 a
+  question or check, 🛠️ a change, 📋 the board, 🚨 an incident.
 * Nothing is ever removed.
 * A turn that answered directly settles at once: ✅, or ❌ on failure. A
   cancelled turn adds nothing.
@@ -49,8 +52,8 @@ With the flag on:
 
 The deferred asks live in this process only (the notifier runs in the gateway
 process too). A gateway restart between the turn and the settle loses the
-settle, and the ask keeps its arrival reaction alone; nothing is ever put on a
-message this process did not see arrive.
+settle, and the ask shows nothing; nothing is ever put on a message this
+process did not see arrive.
 
 Fail-soft throughout: an open-card read that fails, on any board, settles the
 ask at once as a direct answer; a lineage read that fails leaves the turn to the
@@ -138,6 +141,12 @@ DEFERRED_PER_THREAD = 32
 #: The notifier's dedup key for a board whose database path does not resolve.
 UNRESOLVED_PREFIX = "slug:"
 
+#: Whether an ask gets its arrival reaction, and which settles show as a
+#: reaction on it (``slack_presenter.SETTLE_*`` values, copied as the flag
+#: values are). Only a failure is marked for now: no routine 👀, ✅ or ⏸️.
+SHOW_ARRIVAL = False
+SHOWN_SETTLES = frozenset({"failed"})
+
 #: Statuses a card runs from, or waits to be picked up in. A card that paused
 #: during a turn but sits in one of these at its end was resumed within it.
 RESUMED_STATUSES = frozenset({"todo", "ready", "scheduled", "running"})
@@ -203,6 +212,12 @@ def enabled() -> bool:
             "treating the flag as off", FLAG_ENV,
         )
     return False
+
+
+async def _show(adapter: Any, chat_id: str, ts: str, settle: str, team_id: Any) -> None:
+    """Put ``settle``'s reaction on the ask, if it is one that shows."""
+    if settle in SHOWN_SETTLES:
+        await adapter._react(chat_id, ts, _presenter.settle_reaction(settle), team_id, remove=False)
 
 
 def _remember(store: OrderedDict, key: Any, value: Any, cap: int) -> None:
@@ -351,7 +366,7 @@ def _creator_unseen(before: dict, after: dict, finished: dict) -> bool:
 
 
 async def on_processing_start(adapter: Any, event: Any) -> None:
-    """Add the arrival reaction for this ask's kind, and note the thread's open cards."""
+    """Note the thread's open cards, after the arrival reaction for this ask's kind if that shows."""
     target = adapter._reacting_target(event)
     if target is None:
         return
@@ -359,8 +374,9 @@ async def on_processing_start(adapter: Any, event: Any) -> None:
     chat_id, thread_id = _where(event)
     if not chat_id:
         return
-    emoji = _presenter.arrival_reaction(getattr(event, "text", ""))
-    await adapter._react(chat_id, ts, emoji, team_id, remove=False)
+    if SHOW_ARRIVAL:
+        emoji = _presenter.arrival_reaction(getattr(event, "text", ""))
+        await adapter._react(chat_id, ts, emoji, team_id, remove=False)
     # After the reaction, so the read never delays it; the model has not
     # created a card yet, since the turn has not reached its first tool call.
     # Events are recorded from here on. One can lag the change it reports, so
@@ -411,12 +427,11 @@ async def on_processing_complete(adapter: Any, event: Any, outcome: Any) -> None
             # A pause the turn also saw resumed would put ⏸️ on nothing that waits.
             paused = {card for card in waiting & turn.paused if card in after}
             if any(after[card].status not in RESUMED_STATUSES for card in paused):
-                blocked = _presenter.settle_reaction(_presenter.SETTLE_BLOCKED)
-                await adapter._react(chat_id, ts, blocked, team_id, remove=False)
+                await _show(adapter, chat_id, ts, _presenter.SETTLE_BLOCKED, team_id)
             return
         if failed:
             settle = _presenter.SETTLE_FAILED
-    await adapter._react(chat_id, ts, _presenter.settle_reaction(settle), team_id, remove=False)
+    await _show(adapter, chat_id, ts, settle, team_id)
 
 
 async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None = None) -> None:
@@ -466,7 +481,7 @@ async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None
         return
     if provisional:
         for ask in asks:
-            await adapter._react(key[0], ask.ts, _presenter.settle_reaction(settle), ask.team_id, remove=False)
+            await _show(adapter, key[0], ask.ts, settle, ask.team_id)
         return
     follow_ups = {}
     if settle == _presenter.SETTLE_DONE:
@@ -492,9 +507,8 @@ async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None
         else:
             _deferred.pop(key, None)
     if waits_on_user:
-        blocked = _presenter.settle_reaction(_presenter.SETTLE_BLOCKED)
         for ask in asks:
-            await adapter._react(key[0], ask.ts, blocked, ask.team_id, remove=False)
+            await _show(adapter, key[0], ask.ts, _presenter.SETTLE_BLOCKED, ask.team_id)
     for ask in settled:
         outcome = _presenter.SETTLE_FAILED if ask.failed else _presenter.SETTLE_DONE
-        await adapter._react(key[0], ask.ts, _presenter.settle_reaction(outcome), ask.team_id, remove=False)
+        await _show(adapter, key[0], ask.ts, outcome, ask.team_id)

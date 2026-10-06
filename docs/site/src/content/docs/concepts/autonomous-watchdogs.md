@@ -5,7 +5,7 @@ sidebar:
   order: 6
 ---
 
-`agents/platform/cron/jobs.json` defines the governance watchdogs. Each one carries a pre-authored prompt that runs on the Platform Agent on a cron schedule. The prompts typically point at a [governance SOP](/kube-agents/concepts/governance-sops/); the agent reads the SOP, executes the procedure, and publishes what it found to your GitOps repo — an audit ledger issue via `fleet-audit`, plus a proposed PR via `submit-suggestion` where the fix is mergeable. The findings land in the repo rather than in a chat channel: the ledger issue is the report, and it is where a scheduled run is meant to be read.
+`agents/platform/cron/jobs.json` defines the governance watchdogs. Each one carries a pre-authored prompt that runs on the Platform Agent on a cron schedule. The prompts typically point at a [governance SOP](/kube-agents/concepts/governance-sops/); the agent reads the SOP, executes the procedure, and publishes what it found to your GitOps repo — an audit ledger issue via `fleet-audit`, plus a proposed PR via `submit-suggestion` where the fix is mergeable. The ledger issue is the record, and it is where a scheduled run is meant to be read; chat usually gets a one-line report linking to it, which in Slack with `KAGE_SLACK_UX` on arrives as a headline ([ChatOps → Proactive alerts](/kube-agents/concepts/chatops/#proactive-alerts-both-channels)).
 
 Watchdog runs execute autonomously: the agent config sets `approvals.cron_mode: approve` (see `deploy/shared/defaults/config.yaml`), so commands that would otherwise require human approval run without prompting when triggered by a scheduled job.
 

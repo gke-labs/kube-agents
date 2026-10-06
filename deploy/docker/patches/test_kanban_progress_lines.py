@@ -1652,13 +1652,13 @@ class TypedAnswerSettlesTheQuestionTest(unittest.IsolatedAsyncioTestCase):
         adapter = _SlackAdapter()
         posted = await self._ask_then_unblock(adapter)
         self.assertEqual(len(posted), 1)
-        self.assertTrue(_choices(posted[0]["blocks"]))
+        self.assertTrue(_choices(slack_presenter.message_blocks(posted[0])))
         self.assertEqual(len(adapter.updates), 1, "the unblock left the question's buttons live")
         settled = adapter.updates[0]
         self.assertEqual(settled["ts"], "1790717880.000300")
-        self.assertEqual(_choices(settled["blocks"]), [])
+        self.assertEqual(_choices(slack_presenter.message_blocks(settled)), [])
         self.assertNotIn(
-            slack_presenter.WAITING_BLOCK_ID, [block.get("block_id") for block in settled["blocks"]],
+            slack_presenter.WAITING_BLOCK_ID, [block.get("block_id") for block in slack_presenter.message_blocks(settled)],
         )
         self.assertEqual(adapter.sent, [])
 

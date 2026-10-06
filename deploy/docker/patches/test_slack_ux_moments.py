@@ -91,6 +91,10 @@ def _buttons(blocks):
     return [e for b in blocks if b["type"] == "actions" for e in b["elements"]]
 
 
+def _shown(message):
+    return [*message.get("blocks", []), *(b for a in message.get("attachments", []) for b in a["blocks"])]
+
+
 def _run(coro):
     return asyncio.run(coro)
 
@@ -120,6 +124,17 @@ class PrOpenedTest(unittest.TestCase):
         self.assertEqual((post["channel"], post["thread_ts"]), ("C0KAGE", "1700000000.000100"))
         self.assertEqual(adapter.teams, ["T1"])
         self.assertIn("PR #412", post["text"])
+
+    def test_the_pr_sits_beside_a_green_bar_under_its_headline(self):
+        adapter = _Adapter()
+        _run(runtime.pr_opened(adapter, SUB, f"Opened {PR}"))
+        post = adapter.posts[0]
+        self.assertEqual([b["type"] for b in post["blocks"]], ["section"])
+        [attachment] = post["attachments"]
+        self.assertEqual(attachment["color"], "#2EB67D")
+        self.assertEqual(attachment["fallback"], post["text"])
+        self.assertEqual([b["type"] for b in attachment["blocks"]], ["context", "actions"])
+        self.assertEqual([e.get("style") for e in _buttons(attachment["blocks"])], ["primary", None])
 
     def test_another_channel_gets_its_own(self):
         adapter = _Adapter()
@@ -177,7 +192,7 @@ class NeedsYouTest(unittest.TestCase):
     def test_posts_a_needs_input_question_with_its_choices(self):
         adapter = _Adapter()
         self.assertTrue(_run(runtime.needs_you(adapter, SUB, QUESTION)))
-        blocks = adapter.posts[0]["blocks"]
+        blocks = _shown(adapter.posts[0])
         labels = [e["text"]["text"] for b in blocks if b["type"] == "actions" for e in b["elements"]]
         self.assertEqual(labels, ["seeded-a", "seeded-b"])
         self.assertEqual(adapter.posts[0]["thread_ts"], SUB["thread_id"])
@@ -189,7 +204,7 @@ class NeedsYouTest(unittest.TestCase):
         lines = adapter.posts[0]["text"].split("\n")
         self.assertEqual(lines[-2], "(Question from card t_e0c1.)")
         self.assertTrue(lines[-1].startswith("Reply with one of: "), lines)
-        self.assertNotIn("t_e0c1", str(adapter.posts[0]["blocks"]))
+        self.assertNotIn("t_e0c1", str(_shown(adapter.posts[0])))
 
     def test_a_question_with_no_thread_names_its_card_last(self):
         adapter = _Adapter()
@@ -217,7 +232,7 @@ class NeedsYouTest(unittest.TestCase):
         self.assertTrue(_run(runtime.needs_you(adapter, {**SUB, "thread_id": ""}, QUESTION)))
         post = adapter.posts[0]
         self.assertIsNone(post["thread_ts"])
-        self.assertEqual(_buttons(post["blocks"]), [])
+        self.assertEqual(_buttons(_shown(post)), [])
         self.assertIn("- seeded-a\n- seeded-b", post["text"])
 
     def test_blocking_again_does_not_settle_the_earlier_question_itself(self):
@@ -328,10 +343,30 @@ class SettleQuestionTest(unittest.TestCase):
         _run(runtime.settle_question(adapter, SUB))
         update = adapter.updates[0]
         self.assertEqual((update["channel"], update["ts"]), ("C0KAGE", POSTED_TS))
-        self.assertEqual(_buttons(update["blocks"]), [])
-        self.assertNotIn(runtime._moments.WAITING, str(update["blocks"]))
-        self.assertIn("Which cluster?", str(update["blocks"]))
+        self.assertEqual(_buttons(_shown(update)), [])
+        self.assertNotIn(runtime._moments.WAITING, str(_shown(update)))
+        self.assertIn("Which cluster?", str(_shown(update)))
         self.assertEqual(runtime._questions, {})
+
+    def test_the_question_sits_beside_a_yellow_bar_that_its_settle_keeps(self):
+        adapter = _Adapter()
+        reason = "Which cluster?\nBoth run checkout. Which one?\n- seeded-a\n- seeded-b"
+        _run(runtime.needs_you(adapter, SUB, {**QUESTION, "reason": reason}, 3))
+        post = adapter.posts[0]
+        self.assertEqual([b["type"] for b in post["blocks"]], ["section"])
+        self.assertEqual(post["attachments"][0]["color"], "#ECB22E")
+        self.assertEqual([b["type"] for b in post["attachments"][0]["blocks"]], ["context", "actions", "context"])
+        _run(runtime.settle_question(adapter, SUB))
+        update = adapter.updates[0]
+        self.assertEqual(update["blocks"], post["blocks"])
+        self.assertEqual(update["attachments"], [{"color": "#ECB22E", "fallback": update["text"], "blocks": post["attachments"][0]["blocks"][:1]}])
+
+    def test_a_settle_that_leaves_only_the_headline_clears_the_attachment(self):
+        # chat.update keeps an attachment it is not sent, buttons and all.
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        _run(runtime.settle_question(adapter, SUB))
+        self.assertEqual(adapter.updates[0]["attachments"], [])
 
     def test_the_settled_text_drops_the_reply_with_line(self):
         adapter = _Adapter()
@@ -389,7 +424,7 @@ class SettleQuestionTest(unittest.TestCase):
         self.assertEqual(runtime.question_card("C0KAGE", POSTED_TS), card)
         adapter.fail = False
         _run(runtime.settle_question(adapter, SUB))
-        self.assertEqual(_buttons(adapter.updates[-1]["blocks"]), [])
+        self.assertEqual(_buttons(_shown(adapter.updates[-1])), [])
         self.assertEqual(runtime._questions, {})
         self.assertIsNone(runtime.question_card("C0KAGE", POSTED_TS))
 
