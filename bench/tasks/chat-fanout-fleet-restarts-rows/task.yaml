@@ -33,8 +33,9 @@ prompt: >-
 expected_output: >-
   The front door files one card for the platform specialist and acks with one
   line, "checking all 3 clusters." with the count it holds. The platform
-  worker files one card per cluster, each titled with the bare cluster name
-  (seeded-a, seeded-b, seeded-c), and each card's result opens with a
+  worker files one card per cluster, each assigned to that cluster's Cluster
+  Agent and titled with the bare cluster name (seeded-a, seeded-b, seeded-c),
+  and each card's result opens with a
   one-line finding such as "payments-api restarting, OOMKilled". The answer
   leads with what differs: seeded-a has payments-api in seeded-debug
   restarting, and names the quiet clusters in a clause. Nothing is changed or
@@ -72,6 +73,7 @@ verification_spec:
   # the bare name the plan row renders; "Check seeded-a" or a card per
   # namespace does not count, and neither does a card assigned to platform,
   # which nests a second Platform Agent per cluster instead of delegating.
+  # An install with no Cluster Agent profiles for the fleet cannot pass.
   - name: a-card-titled-seeded-a
     role: objective
     mode: assert

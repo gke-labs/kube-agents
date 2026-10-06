@@ -164,6 +164,9 @@ FOLD_ANCESTOR_DEPTH = 8
 #: ``created`` event (``hermes_cli/kanban_db.py``), walked up from the card,
 #: and the open statuses ``kanban_children_settled`` waits on. Parameters: the
 #: card, the depth bound, then the subscription's platform, chat and thread.
+#: The cards between are not required open: ``kanban_children_settled`` closes
+#: each only after the card beneath it, and usually before its report is
+#: delivered, so requiring them open would post the report again.
 FANNED_OUT_ANCESTOR_SQL = (
     "WITH RECURSIVE up(id, depth) AS ("
     "SELECT json_extract(payload, '$.creator_task_id'), 1 FROM task_events "
@@ -554,7 +557,7 @@ def _fan_out_open(sub: dict, board: Optional[str]) -> bool:
 
 
 async def _folds(sub: dict, board: Optional[str]) -> bool:
-    """Whether a fanned-out card's report folds into its plan row: see :data:`FOLDED_KIND`.
+    """Whether the report of a card beneath a fan-out folds into its plan row: see :data:`FOLDED_KIND`.
 
     A read that fails posts the report, as it did before the plan.
     """

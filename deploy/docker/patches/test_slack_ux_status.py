@@ -997,7 +997,7 @@ class PlanTest(_RuntimeCase):
         self.assertEqual(self._kinds(adapter).count("post"), posts)
 
     def test_a_settle_says_whether_the_plan_shows_the_card_complete(self):
-        # True lets a fanned-out card's report fold into its row (kanban_progress_lines).
+        # True lets the report of a card beneath a fan-out fold into its row (kanban_progress_lines).
         adapter = _Adapter()
         self._note(adapter, 1, "reading version", title="seeded-c")
         self.assertTrue(_run(runtime.settle_row(adapter, _sub("t_b"), "completed", "1.33.4 = default", "seeded-a")))

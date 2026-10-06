@@ -739,9 +739,9 @@ check(
 )
 
 # --- The fold reads a real board ----------------------------------------------
-# With KAGE_SLACK_UX on, a fanned-out card's completion folds into its plan row
-# when its creator is still open on the same thread and created another card
-# too. A schema drift under
+# With KAGE_SLACK_UX on, a card's completion folds into its plan row when its
+# nearest ancestor that created more than one card is still open on the same
+# thread. A schema drift under
 # FANNED_OUT_ANCESTOR_SQL raises inside _folds, which posts the report instead, so the
 # fold would quietly stop and every fanned-out card post its own line again.
 # The read itself runs here, against boards built with hermes_cli.

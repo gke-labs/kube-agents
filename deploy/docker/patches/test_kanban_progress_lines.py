@@ -1264,7 +1264,7 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.rows, self.settled), ([], []))
 
 
-class CreatorOpenTest(unittest.IsolatedAsyncioTestCase):
+class FanOutOpenTest(unittest.IsolatedAsyncioTestCase):
     """The read that decides whether a card beneath a fan-out folds its report, against a sqlite board."""
 
     def setUp(self):
@@ -1299,7 +1299,7 @@ class CreatorOpenTest(unittest.IsolatedAsyncioTestCase):
         conn.commit()
         conn.close()
 
-    async def test_an_open_creator_on_the_same_thread_folds(self):
+    async def test_an_open_fan_out_on_the_same_thread_folds(self):
         self.assertTrue(await kanban_progress_lines._folds(SLACK_SUB, None))
 
     async def test_a_creator_that_is_done_or_archived_does_not(self):
@@ -1446,7 +1446,7 @@ class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.settled, [("t_e0c1", "completed")], "the arrival reaction was left on")
         self.assertEqual(self.announced, [("t_e0c1", f"seeded-a: {self.PR_NOTE}", 0)], "a PR it opened lost its message")
 
-    async def test_a_completion_the_plan_does_not_show_or_with_no_open_creator_posts(self):
+    async def test_a_completion_the_plan_does_not_show_or_with_no_open_fan_out_posts(self):
         for shows, folds in ((False, True), (True, False)):
             with self.subTest(shows=shows, folds=folds):
                 reader = self._plan(shows=shows, folds=folds)
