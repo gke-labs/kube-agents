@@ -532,8 +532,9 @@ def _fields(lines: list[str], names: tuple[str, ...]) -> dict[str, str]:
 def parse(prompt: str) -> Replay | Failure | None:
     """The replay ``prompt`` asks for, or ``None`` when it is an ordinary ask.
 
-    Raises :class:`ValueError` for a replay prompt missing a field or naming
-    an unknown outcome: that is a case authoring error, not a run.
+    Raises :class:`ValueError` for a replay prompt missing a field, naming
+    an unknown outcome, or giving ``session`` or ``answer_by`` any value but
+    its one: that is a case authoring error, not a run.
     """
     lines = prompt.strip().splitlines()
     directive = lines[0].strip() if lines else ""
@@ -551,10 +552,10 @@ def parse(prompt: str) -> Replay | Failure | None:
         return None
     fields = _fields(lines[1:], (*_QUESTION_FIELDS, SESSION_FIELD, ANSWER_BY_FIELD))
     session = fields.get(SESSION_FIELD, "")
-    if session and session != SESSION_FRESH:
+    if SESSION_FIELD in fields and session != SESSION_FRESH:
         raise ValueError(f"{directive} session {session!r} is not {SESSION_FRESH!r}")
     answer_by = fields.get(ANSWER_BY_FIELD, "")
-    if answer_by and answer_by != ANSWER_BY_CLICK:
+    if ANSWER_BY_FIELD in fields and answer_by != ANSWER_BY_CLICK:
         raise ValueError(f"{directive} answer_by {answer_by!r} is not {ANSWER_BY_CLICK!r}")
     options = tuple(
         o.strip() for o in fields.get("options", "").split(OPTION_SEPARATOR) if o.strip()

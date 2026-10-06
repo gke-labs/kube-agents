@@ -477,6 +477,16 @@ def test_an_answer_by_anything_but_click_is_an_authoring_error() -> None:
         card_wake.parse(PROMPT + "answer_by: typing\n")
 
 
+def test_an_empty_answer_by_is_an_authoring_error() -> None:
+    with pytest.raises(ValueError, match="answer_by"):
+        card_wake.parse(PROMPT + "answer_by:\n")
+
+
+def test_an_empty_session_is_an_authoring_error() -> None:
+    with pytest.raises(ValueError, match="session"):
+        card_wake.parse(PROMPT + "session:\n")
+
+
 def test_a_click_answer_that_is_not_an_option_is_an_authoring_error() -> None:
     with pytest.raises(ValueError, match="options a click can press"):
         card_wake.parse(CLICK_PROMPT.replace("answer: seeded-b", "answer: seeded-c"))
