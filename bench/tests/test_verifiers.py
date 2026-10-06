@@ -445,6 +445,11 @@ _RIGHT_REPORT = "\n".join(_zonal_line(c) for c in _SLOTS)
         "\n".join(_zonal_line(c).replace("zonal;", "zonal\u200b;") for c in _SLOTS),
         "\n".join("\ufeff" + _zonal_line(c) for c in _SLOTS),
         "\n".join(_zonal_line(c).replace("unaffected", "unaffected\u2060") for c in _SLOTS),
+        # Flanked by spaces: the character is its own token to the whitespace
+        # collapse, so it has to go before the collapse, not after it.
+        "\n".join(_zonal_line(c).replace("is zonal", "is \u200b zonal") for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace("upgrade: unavailable", "upgrade: \u00ad unavailable") for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace("pods: unaffected", "pods: \ufeff unaffected") for c in _SLOTS),
         # The recorded location after the name, as a profile id spells it; any
         # other location is another cluster (see the recorded-cluster tests).
         "\n".join(_zonal_line(f"{c}-us-central1-a") for c in _SLOTS),

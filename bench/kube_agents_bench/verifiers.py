@@ -295,7 +295,11 @@ _SEPARATOR_NO_SPACE = re.compile(r"([:;])(?=[a-z\"'\u201c\u2018<])")
 # selector, a soft hyphen), and the five skin-tone modifiers an emoji is
 # rendered with (U+1F3FB to U+1F3FF, which only change how a listed closer
 # looks): not whitespace to Python, not a word character, and not a value.
-# Removed before anything else reads the line.
+# Removed from the raw line in `_normalize_lines`, before `_normalize`
+# collapses whitespace: one flanked by spaces (`is \u200b zonal`) would
+# otherwise leave a double space behind that no later fold closes, and the
+# frames read it as a wrong value. `_fold_line_decoration` strips the class
+# again for a caller that hands it a line directly.
 _INVISIBLE = re.compile("[\u200b-\u200f\u2060-\u2064\ufeff\ufe0e\ufe0f\u00ad\U0001f3fb-\U0001f3ff]")
 
 
@@ -352,7 +356,10 @@ def _normalize_lines(text: str, *, fold_decoration: bool = False) -> str:
     # a kubeconfig context (`gke_<project>_<location>_<name>`) keeps the
     # boundary before its cluster name, while `_word_` emphasis, whose
     # underscores sit at a token's edges, is still deleted.
-    lines = (_normalize(_INNER_UNDERSCORE.sub("-", line) if fold_decoration else line) for line in text.splitlines())
+    lines = (
+        _normalize(_INNER_UNDERSCORE.sub("-", _INVISIBLE.sub("", line)) if fold_decoration else line)
+        for line in text.splitlines()
+    )
     if fold_decoration:
         lines = (_fold_line_decoration(line) for line in lines)
     return "\n".join(lines)
