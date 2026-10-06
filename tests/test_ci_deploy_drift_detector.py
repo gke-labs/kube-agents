@@ -37,10 +37,14 @@ and onboards a project with the ingress and no publisher grant.
 import pathlib
 import re
 import shutil
+import stat
 import subprocess
+import tempfile
 import unittest
 
 import yaml
+
+from tests.testing.common import get_isolated_test_env
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CI_DEPLOY = _REPO_ROOT / "hack" / "ci-deploy.sh"
@@ -66,12 +70,51 @@ _PUBLISHERS_LINE = (
 
 _LOG_DROPPED_ENV = "DRIFT_DETECTOR_LOG_DROPPED"
 
+_READY_GATE_START = "drift_detector_started=false"
+_READY_GATE_END = 'echo "✓ Rollout verification finished'
+_GATE_NAMESPACE = "kubeagents-system"
+_GATE_RESULT = "GATE_RESULT"
+# Comfortably past the 64 KiB pipe buffer, which is what decides whether the
+# writer is still writing when the reader stops.
+_FILLER_LINE = "2026-10-06T00:00:00Z drift-detector: parsed=0 skipped=0 failed=0\n"
+_FILLER_LINES = 40000
+
 
 def _shell_constant(path: pathlib.Path, name: str) -> str:
     match = re.search(rf'^readonly {name}="([^"]*)"$', path.read_text(), re.MULTILINE)
     if match is None:
         raise AssertionError(f"{path.name} declares no readonly {name}")
     return match.group(1)
+
+
+def _logical_lines(path: pathlib.Path) -> list:
+    """`path`'s shell lines, comment-only lines dropped and continuations joined.
+
+    Scanning physical lines is what a backslash-continued command walks past:
+    `gcloud --project X \\` on one line and `pubsub subscriptions create` on
+    the next matches neither half of a pattern that wants both words, and the
+    scans below are the only thing standing between this script and a second
+    engine provisioning Pub/Sub.
+
+    Comment-only lines are dropped first and continuations joined second,
+    which is the order that matters -- joining first would let a comment
+    ending in a backslash swallow the code line under it and hide exactly what
+    is being looked for.
+
+    Trailing comments are then cut at the first `#`. That also cuts a `#`
+    inside a quoted string or a `${VAR#prefix}` expansion, which nothing short
+    of a shell parser fixes. It drops the rest of such a line, so that half
+    can only miss an offender, never invent one.
+    """
+    uncommented = "\n".join(
+        line for line in path.read_text().splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    # Only the continuation's own trailing indent, not `\s*`: that would eat
+    # the blank line after a continuation too and splice two separate commands
+    # into one, which is the way this could report something that is not there.
+    joined = re.sub(r"\\\n[ \t]*", " ", uncommented)
+    return [line.split("#", 1)[0] for line in joined.splitlines()]
 
 
 def _terraform_declares(path: pathlib.Path, variable: str) -> bool:
@@ -91,6 +134,19 @@ def _terraform_default(path: pathlib.Path, variable: str) -> str:
     if match is None:
         raise AssertionError(f"variable {variable} in {path.name} has no string default")
     return match.group(1)
+
+
+def _head_constants(text: str) -> str:
+    """The file-head `readonly` declarations a lifted block reads."""
+    return "\n".join(line for line in text.splitlines() if line.startswith("readonly "))
+
+
+def _ready_gate(text: str) -> str:
+    start = text.find(_READY_GATE_START)
+    assert start != -1, f"{_READY_GATE_START!r} not found in hack/ci-deploy.sh"
+    end = text.find(_READY_GATE_END, start)
+    assert end != -1, f"{_READY_GATE_END!r} not found after {_READY_GATE_START!r}"
+    return text[start:end]
 
 
 class PoolProjectProvisionsTheIngressTest(unittest.TestCase):
@@ -162,13 +218,12 @@ class PoolProjectProvisionsTheIngressTest(unittest.TestCase):
         #
         # Matched on word boundaries rather than as the literal "gcloud pubsub",
         # which `gcloud beta pubsub`, `gcloud --project X pubsub` and a
-        # `$GCLOUD pubsub` all walk straight past.
-        code = [
-            line.split("#", 1)[0] for line in _CI_DEPLOY.read_text().splitlines()
-            if not line.lstrip().startswith("#")
-        ]
+        # `$GCLOUD pubsub` all walk straight past -- and over logical lines, so
+        # that a backslash before the subcommand does not do the same.
         invocation = re.compile(r"\bgcloud\b.*\bpubsub\b")
-        offenders = [line.strip() for line in code if invocation.search(line)]
+        offenders = [
+            line.strip() for line in _logical_lines(_CI_DEPLOY) if invocation.search(line)
+        ]
         self.assertEqual(
             offenders,
             [],
@@ -204,6 +259,102 @@ class DetectorIsTurnedOnForEachLeaseTest(unittest.TestCase):
         )
 
 
+class TheReadinessGateReadsTheWholeLogTest(unittest.TestCase):
+    """The startup gate survives a log longer than the pipe buffer.
+
+    The gate greps `kubectl logs` for the detector's pull-loop marker, and the
+    script runs under `set -o pipefail`. That combination is a trap: a `grep`
+    that stops at the first match closes the pipe, the `kubectl` still writing
+    into it dies of SIGPIPE, and `pipefail` reports the pipeline failed. A
+    found marker then reads as not found.
+
+    It is not a rare shape here. The marker prints once when the detector
+    starts and the detector keeps logging after that, so by the time the gate
+    runs the log is past the buffer and the match is an early line. The gate
+    inverts, exhausts its retries, and reds every case in the lease on an
+    install that is working -- with the gate's own error message saying the
+    detector never started, which is the opposite of where to look.
+
+    So these run the real block out of the script against a stub `kubectl`,
+    rather than asserting on its text: the defect is in how two exit codes
+    combine, and only a shell can tell you that.
+    """
+
+    def _run_gate(self, log_body: str):
+        text = _CI_DEPLOY.read_text()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            bin_dir = tmp_path / "bin"
+            bin_dir.mkdir()
+            pod_log = tmp_path / "pod.log"
+            pod_log.write_text(log_body, encoding="utf-8")
+
+            # `exec cat` so the stub is a real writer into the pipe: a stub
+            # that buffered the log in the shell and echoed it would never be
+            # mid-write when grep left, and would pass either way.
+            kubectl_stub = bin_dir / "kubectl"
+            kubectl_stub.write_text(
+                f"""#!/usr/bin/env bash
+if [ "$1" = "logs" ]; then
+  case "$*" in
+    *--tail=*) echo "(tail elided)"; exit 0 ;;
+  esac
+  exec cat "{pod_log}"
+fi
+exit 0
+""",
+                encoding="utf-8",
+            )
+            sleep_stub = bin_dir / "sleep"
+            sleep_stub.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            for stub in (kubectl_stub, sleep_stub):
+                stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+
+            script = "\n".join(
+                (
+                    "set -euo pipefail",
+                    _head_constants(text),
+                    f"NAMESPACE={_GATE_NAMESPACE}",
+                    _ready_gate(text),
+                    f'echo "{_GATE_RESULT}=${{drift_detector_started}}"',
+                )
+            )
+            return subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True,
+                text=True,
+                cwd=_REPO_ROOT,
+                env=get_isolated_test_env(bin_dir=bin_dir),
+            )
+
+    def test_an_early_marker_in_a_long_log_is_found(self) -> None:
+        marker = _shell_constant(_CI_DEPLOY, "EVAL_DRIFT_READY_MARKER")
+        proc = self._run_gate(
+            f"starting\n{marker} drift-audit-eval\n" + _FILLER_LINE * _FILLER_LINES
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            "the drift-detector readiness gate failed on a log that contains its "
+            "marker. Under `set -o pipefail` a grep that stops at the first match "
+            "SIGPIPEs the kubectl feeding it, and the pipeline reports failure; "
+            f"the gate must drain the log instead.\nstdout: {proc.stdout}\n"
+            f"stderr: {proc.stderr}",
+        )
+        self.assertIn(f"{_GATE_RESULT}=true", proc.stdout)
+
+    def test_a_log_without_the_marker_still_fails_the_gate(self) -> None:
+        # The other direction, so a fix for the above cannot be "stop checking".
+        proc = self._run_gate(_FILLER_LINE * _FILLER_LINES)
+        self.assertEqual(
+            proc.returncode,
+            1,
+            "the gate passed a log with no pull-loop marker in it, so it would "
+            f"admit an install whose detector never started.\nstdout: {proc.stdout}",
+        )
+        self.assertIn("never reached its pull loop", proc.stdout + proc.stderr)
+
+
 class DroppedRecordsCanBeLoggedOnDemandTest(unittest.TestCase):
     """`DRIFT_DETECTOR_LOG_DROPPED` reaches the detector on an install that asks.
 
@@ -222,11 +373,9 @@ class DroppedRecordsCanBeLoggedOnDemandTest(unittest.TestCase):
     """
 
     def test_the_eval_deploy_does_not_ask_for_dropped_records(self) -> None:
-        code = [
-            line for line in _CI_DEPLOY.read_text().splitlines()
-            if not line.lstrip().startswith("#")
+        offenders = [
+            line.strip() for line in _logical_lines(_CI_DEPLOY) if _LOG_DROPPED_ENV in line
         ]
-        offenders = [line.strip() for line in code if _LOG_DROPPED_ENV in line]
         self.assertEqual(
             offenders,
             [],

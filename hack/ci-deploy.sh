@@ -1235,10 +1235,19 @@ fi
 # drift case cares about (docs/ci-pool-projects.md).
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Verifying drift-detector startup ==="
 drift_detector_started=false
+# `grep -F ... >/dev/null` rather than `grep -qF`, and the difference is the
+# whole gate. `-q` exits on the first match, which closes the pipe under a
+# kubectl still writing; kubectl takes SIGPIPE, and the `set -o pipefail` at
+# the top of this script turns that into a failed pipeline. The marker prints
+# once when the detector starts and it keeps logging after that, so the log is
+# past the 64 KiB pipe buffer by the time this runs and the match is an early
+# line -- the shape that fails. Found reads as not found, the loop exhausts,
+# and a healthy install reds every case in the lease, with the message below
+# saying the detector never started. Draining a bounded log costs one read.
 for _ in $(seq "${EVAL_DRIFT_READY_ATTEMPTS}"); do
   if kubectl logs -n "${NAMESPACE}" deployment/platform-agent-gateway \
     -c "${EVAL_DRIFT_READY_CONTAINER}" 2>/dev/null |
-    grep -qF "${EVAL_DRIFT_READY_MARKER}"; then
+    grep -F "${EVAL_DRIFT_READY_MARKER}" >/dev/null; then
     drift_detector_started=true
     break
   fi
