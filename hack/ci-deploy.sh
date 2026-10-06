@@ -634,8 +634,9 @@ export SLACK_ENABLED="false"
 #
 # One GitOps repo per leasable project, so two concurrent leases can never
 # share a ledger issue or race on a remediation branch. Onboarding a further
-# project (issue #637, Boskos leasing) is one line here plus the same pair in
-# _EXPECTED_MAPPING in tests/test_ci_gitops_repo.py — no other edit in this file.
+# project (issue #637, Boskos leasing) is one line here, its row in
+# gitlab_project_for_project() below, and the same pair in _EXPECTED_MAPPING in
+# tests/test_ci_gitops_repo.py — no other edit in this file.
 #
 # A mapping here is a claim that the repo exists and that App 4675512 is
 # installed on it. It is not self-verifying: with the line present and either
@@ -646,6 +647,52 @@ export SLACK_ENABLED="false"
 # are separate events, and kube-agents-evals-3 is what happens when they are
 # assumed to be one.
 gitops_repo_for_project() {
+  case "$1" in
+    kube-agents-evals) echo "gke-agentic/kube-agents-evals-infra" ;;
+    kube-agents-evals-2) echo "gke-agentic/kube-agents-evals-2-infra" ;;
+    kube-agents-evals-3) echo "gke-agentic/kube-agents-evals-3-infra" ;;
+    kube-agents-evals-4) echo "gke-agentic/kube-agents-evals-4-infra" ;;
+    kube-agents-evals-5) echo "gke-agentic/kube-agents-evals-5-infra" ;;
+    kube-agents-evals-6) echo "gke-agentic/kube-agents-evals-6-infra" ;;
+    kube-agents-evals-7) echo "gke-agentic/kube-agents-evals-7-infra" ;;
+    kube-agents-evals-8) echo "gke-agentic/kube-agents-evals-8-infra" ;;
+    kube-agents-evals-9) echo "gke-agentic/kube-agents-evals-9-infra" ;;
+    kube-agents-evals-10) echo "gke-agentic/kube-agents-evals-10-infra" ;;
+    kube-agents-evals-11) echo "gke-agentic/kube-agents-evals-11-infra" ;;
+    kube-agents-evals-12) echo "gke-agentic/kube-agents-evals-12-infra" ;;
+    kube-agents-evals-13) echo "gke-agentic/kube-agents-evals-13-infra" ;;
+    kube-agents-evals-14) echo "gke-agentic/kube-agents-evals-14-infra" ;;
+    kube-agents-evals-15) echo "gke-agentic/kube-agents-evals-15-infra" ;;
+    kube-agents-evals-16) echo "gke-agentic/kube-agents-evals-16-infra" ;;
+    kube-agents-evals-17) echo "gke-agentic/kube-agents-evals-17-infra" ;;
+    kube-agents-evals-18) echo "gke-agentic/kube-agents-evals-18-infra" ;;
+    kube-agents-evals-19) echo "gke-agentic/kube-agents-evals-19-infra" ;;
+    kube-agents-evals-20) echo "gke-agentic/kube-agents-evals-20-infra" ;;
+    kube-agents-evals-21) echo "gke-agentic/kube-agents-evals-21-infra" ;;
+    kube-agents-evals-22) echo "gke-agentic/kube-agents-evals-22-infra" ;;
+    kube-agents-evals-23) echo "gke-agentic/kube-agents-evals-23-infra" ;;
+    kube-agents-evals-24) echo "gke-agentic/kube-agents-evals-24-infra" ;;
+    kube-agents-evals-25) echo "gke-agentic/kube-agents-evals-25-infra" ;;
+    kube-agents-evals-26) echo "gke-agentic/kube-agents-evals-26-infra" ;;
+    kube-agents-evals-27) echo "gke-agentic/kube-agents-evals-27-infra" ;;
+    kube-agents-evals-28) echo "gke-agentic/kube-agents-evals-28-infra" ;;
+    kube-agents-evals-29) echo "gke-agentic/kube-agents-evals-29-infra" ;;
+    kube-agents-evals-30) echo "gke-agentic/kube-agents-evals-30-infra" ;;
+    kube-agents-evals-31) echo "gke-agentic/kube-agents-evals-31-infra" ;;
+    kube-agents-evals-32) echo "gke-agentic/kube-agents-evals-32-infra" ;;
+    kube-agents-evals-33) echo "gke-agentic/kube-agents-evals-33-infra" ;;
+    kube-agents-evals-34) echo "gke-agentic/kube-agents-evals-34-infra" ;;
+    kube-agents-evals-35) echo "gke-agentic/kube-agents-evals-35-infra" ;;
+    *) return 1 ;;
+  esac
+}
+
+# The same table for the GitLab forge (EVAL_FORGE=gitlab, issue #2394): one
+# private gitlab.com project per pool project, same name under the group
+# gke-agentic. A row here claims the project exists and the bot account
+# kube-agents-eval-bot is a Developer on it (docs/ci-pool-projects.md 5.6),
+# and _EXPECTED_GITLAB_MAPPING in tests/test_ci_gitops_repo.py pins the pair.
+gitlab_project_for_project() {
   case "$1" in
     kube-agents-evals) echo "gke-agentic/kube-agents-evals-infra" ;;
     kube-agents-evals-2) echo "gke-agentic/kube-agents-evals-2-infra" ;;
@@ -767,6 +814,58 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   fi
 fi
 
+# --- Which forge this run deploys against (EVAL_FORGE) ----------------------
+# EVAL_FORGE picks the forge the eval run drives: github (default; the
+# resolution below) or gitlab (issue #2394). Under gitlab the GitHub
+# integration and its minter stay off, the PlatformAgent declares one GitLab
+# forge whose credential is a Kubernetes Secret (step 5 fills it from the
+# pool's Secret Manager secret gitlab-agent-token in GITLAB_SECRETS_PROJECT),
+# and the pool project's GitLab project is its gitops repository. Mapped and gated here, ahead of the
+# GitHub resolution, so an unmapped project is refused naming this table.
+EVAL_FORGE="${EVAL_FORGE:-github}"
+# The Secret the forge's credentialsRef names, and the key the token sits
+# under. The key is this deploy's choice: the operator reads only the Secret's
+# name today, and the GitLab provider, when it lands, fixes the key it reads.
+# This is the one place to change it.
+GITLAB_FORGE_SECRET_NAME="gitlab-forge-token"
+GITLAB_FORGE_SECRET_KEY="token"
+GITLAB_AGENT_SM_SECRET="gitlab-agent-token"
+# One token pair serves the whole pool, kept where the runner identities
+# live rather than copied into every leased project: GitLab has no minting,
+# so the pair is rotated by a human with overlap, and one home keeps that
+# the same size however many projects the pool has (docs/ci-pool-projects.md 5.6).
+GITLAB_SECRETS_PROJECT="kube-agents-prow"
+GITLAB_FORGE_HOST="gitlab.com"
+case "${EVAL_FORGE}" in
+  github) ;;
+  gitlab)
+    if ! GITLAB_PROJECT="$(gitlab_project_for_project "${PROJECT_ID}")"; then
+      echo "ERROR: EVAL_FORGE=gitlab but no GitLab project is mapped for PROJECT_ID=${PROJECT_ID}." >&2
+      echo "       Add it to gitlab_project_for_project() in hack/ci-deploy.sh once the project" >&2
+      echo "       exists and the bot is a Developer on it (docs/ci-pool-projects.md 5.6)." >&2
+      exit 1
+    fi
+    # The gate: the chart refuses a provider it does not register, but only at
+    # helm time, after the image build. Two hand-mirrored lists say which
+    # providers it registers, the CRD's enum and $registered in _helpers.tpl;
+    # read both now and fail in seconds unless both name gitlab.
+    PLATFORM_AGENT_CRD="${SCRIPT_DIR}/../charts/kube-agents/crds/kubeagents.x-k8s.io_platformagents.yaml"
+    CHART_HELPERS="${SCRIPT_DIR}/../charts/kube-agents/templates/_helpers.tpl"
+    if ! grep -Eq '^[[:space:]]+- gitlab$' "${PLATFORM_AGENT_CRD}" \
+      || ! grep -Eq 'registered := list .*"gitlab"' "${CHART_HELPERS}"; then
+      echo "ERROR: EVAL_FORGE=gitlab, but the chart in this checkout does not register provider" >&2
+      echo "       gitlab (${PLATFORM_AGENT_CRD#"${SCRIPT_DIR}/../"} and ${CHART_HELPERS#"${SCRIPT_DIR}/../"}" >&2
+      echo "       both have to list it). The GitLab provider is the operator half of" >&2
+      echo "       gke-labs/kube-agents#1154; this deploy waits for it (#2394)." >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "ERROR: EVAL_FORGE='${EVAL_FORGE}' is not a forge this deploy knows; use github (default) or gitlab." >&2
+    exit 1
+    ;;
+esac
+
 # The override exists for developers, and only for them. Under Boskos the
 # project is leased per run, so a value pinned in the job environment would
 # eventually point one project's run at another project's GitOps repo — the
@@ -842,7 +941,10 @@ fi
 # kubeagents-platform-gsa@<harness.projectId> — exactly the GSA_NAME/PROJECT_ID
 # pair this deploy annotates the agent KSA with, so the rule is keyed on this
 # project's platform GSA and no other's.
-if [ -n "${GITOPS_REPO}" ] && [ -n "${EVAL_GITHUB_APP_ID:-}" ]; then
+if [ "${EVAL_FORGE}" = "gitlab" ]; then
+  GITHUB_MINTER_ARGS=(--set "githubMinter.enabled=false")
+  echo "GitHub token minter: off (EVAL_FORGE=gitlab)"
+elif [ -n "${GITOPS_REPO}" ] && [ -n "${EVAL_GITHUB_APP_ID:-}" ]; then
   GITHUB_MINTER_ARGS=(
     --set "githubMinter.enabled=true"
     --set-string "githubMinter.org=${GITOPS_REPO%%/*}"
@@ -855,6 +957,31 @@ else
   echo "GitHub token minter: disabled (EVAL_GITHUB_APP_ID unset) — the agent can read" \
     "managed_repos but cannot mint a token, so GitHub-writing scenarios will fail."
 fi
+
+# The values the chart receives for the forge: forges[] + repositories[] for
+# gitlab, the deprecated github.gitRepo alias otherwise (the chart refuses both
+# at once, so the alias is set empty beside the lists).
+case "${EVAL_FORGE}" in
+  gitlab)
+    GITOPS_REPO=""
+    GITHUB_MINTER_ARGS=(--set "githubMinter.enabled=false")
+    FORGE_ARGS=(
+      --set-string "platformAgent.integration.github.gitRepo="
+      --set-string "platformAgent.integration.forges[0].name=gitlab"
+      --set-string "platformAgent.integration.forges[0].provider=gitlab"
+      --set-string "platformAgent.integration.forges[0].host=${GITLAB_FORGE_HOST}"
+      --set-string "platformAgent.integration.forges[0].namespace=${GITLAB_PROJECT%%/*}"
+      --set-string "platformAgent.integration.forges[0].credentialsRef.name=${GITLAB_FORGE_SECRET_NAME}"
+      --set-string "platformAgent.integration.repositories[0].forge=gitlab"
+      --set-string "platformAgent.integration.repositories[0].repository=https://${GITLAB_FORGE_HOST}/${GITLAB_PROJECT}"
+      --set-string "platformAgent.integration.repositories[0].role=gitops"
+    )
+    echo "Forge: gitlab — ${GITLAB_FORGE_HOST}/${GITLAB_PROJECT} (mapped from PROJECT_ID=${PROJECT_ID}); GitHub integration and minter off"
+    ;;
+  *)
+    FORGE_ARGS=(--set-string "platformAgent.integration.github.gitRepo=${GITOPS_REPO}")
+    ;;
+esac
 
 # ─── 2d. The seeded fleet's read-only credential ──────────────────────────────
 # The gate hack/ci-eval-pr.sh applies before it writes the fleet kubeconfigs,
@@ -884,6 +1011,22 @@ preflight_fleet_reader() {
   }
 }
 preflight_fleet_reader
+
+# The GitLab forge's credential, read once now for the same reason: the
+# token is hand-provisioned (docs/ci-pool-projects.md 5.6), and a runner
+# without the accessor grant, or a secret that is gone, should fail here,
+# not after the image build. The value is discarded; step 5 reads it again
+# into the Kubernetes Secret.
+preflight_gitlab_forge_secret() {
+  if ! gcloud secrets versions access latest --secret="${GITLAB_AGENT_SM_SECRET}" --project="${GITLAB_SECRETS_PROJECT}" >/dev/null; then
+    echo "FATAL: stopping before the build: Secret Manager ${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET} cannot be read as this runner (docs/ci-pool-projects.md 5.6: the secret and the runner's secretAccessor grant are hand steps)." >&2
+    exit 1
+  fi
+  echo "GitLab forge credential: ${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET} readable"
+}
+if [ "${EVAL_FORGE}" = "gitlab" ]; then
+  preflight_gitlab_forge_secret
+fi
 
 # ─── 2c. Image Build Worker ───────────────────────────────────────────────────
 # Where the image builds run. Either a private worker pool or a sized machine
@@ -1159,6 +1302,40 @@ SANDBOX_KEY_DIR="$(umask 077 && mktemp -d)"
 ssh-keygen -q -t "${SANDBOX_SSH_KEY_TYPE}" -N '' -C "${SANDBOX_SSH_KEY_COMMENT}" \
   -f "${SANDBOX_KEY_DIR}/id_sandbox"
 
+# ─── 5b-ii. The GitLab forge credential ──────────────────────────────────────
+# EVAL_FORGE=gitlab only. The agent token is a personal access token of the
+# bot account, one for the pool, kept in GITLAB_SECRETS_PROJECT's Secret
+# Manager (docs/ci-pool-projects.md 5.6). It goes Secret Manager -> kubectl over a
+# pipe: never a file and never an argument, so it is in no artifact and no
+# `ps`. The Secret is applied, not created, so a re-deploy on the same
+# cluster picks up a rotated token, and it carries the label hack/ci-teardown.sh
+# sweeps by (its SWEEP_SELECTOR; the pair is pinned equal by the tests), so the
+# token leaves the host cluster with the lease instead of outliving it.
+GITLAB_FORGE_SECRET_LABEL="app.kubernetes.io/part-of=kube-agents"
+materialize_gitlab_forge_secret() {
+  local manifest
+  # Rendered first, applied second: in one pipe the apply would run on the
+  # empty stream a failed read leaves, and only then would pipefail report it.
+  # tr: a value stored with a trailing newline (echo into --data-file=-) would
+  # otherwise reach GitLab as part of the token.
+  manifest="$(gcloud secrets versions access latest --secret="${GITLAB_AGENT_SM_SECRET}" --project="${GITLAB_SECRETS_PROJECT}" \
+    | tr -d '\r\n' \
+    | kubectl create secret generic "${GITLAB_FORGE_SECRET_NAME}" -n "${NAMESPACE}" \
+        --from-file="${GITLAB_FORGE_SECRET_KEY}=/dev/stdin" --dry-run=client -o yaml \
+    | kubectl label --local -f - "${GITLAB_FORGE_SECRET_LABEL}" -o yaml)" || {
+    # The read itself passed the preflight in 2d, so the stage that failed is
+    # as likely a kubectl one; each stage's own stderr is just above this line.
+    echo "ERROR: could not render the GitLab forge Secret from Secret Manager ${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET}; the failing stage (gcloud, tr, kubectl create, kubectl label) reported just above (docs/ci-pool-projects.md 5.6)." >&2
+    return 1
+  }
+  kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  printf '%s\n' "${manifest}" | kubectl apply -f - >/dev/null
+  echo "GitLab forge credential: Secret ${NAMESPACE}/${GITLAB_FORGE_SECRET_NAME} (key ${GITLAB_FORGE_SECRET_KEY}) from Secret Manager ${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET}"
+}
+if [ "${EVAL_FORGE}" = "gitlab" ]; then
+  materialize_gitlab_forge_secret
+fi
+
 # ─── 5c. Deploy the chart ─────────────────────────────────────────────────────
 # Named in the build log so a run's dispatcher behaviour can be read against
 # the cap it was given without opening the rendered CR.
@@ -1175,7 +1352,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-string "platformAgent.harness.location=${REGION}" \
     --set-string "platformAgent.harness.projectId=${PROJECT_ID}" \
     --set-string "platformAgent.security.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
-    --set-string "platformAgent.integration.github.gitRepo=${GITOPS_REPO}" \
+    "${FORGE_ARGS[@]}" \
     "${GITHUB_MINTER_ARGS[@]}" \
     --set "platformAgent.credentials.create=true" \
     --set-string "platformAgent.credentials.data.API_SERVER_KEY=${API_SERVER_KEY}" \
