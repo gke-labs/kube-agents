@@ -338,7 +338,7 @@ class FinderMustNotImportTest(unittest.TestCase):
         (self.root / "gateway_helper.py").write_text("VALUE = 1\n")
         script = textwrap.dedent(
             f"""
-            import faulthandler, importlib, importlib.util, sys, threading, time, types
+            import faulthandler, importlib, importlib.util, sys, threading, time, traceback, types
             DEADLINE = {RACE_DEADLINE_SECONDS}
             sys.path.insert(0, {str(self.root)!r})
             spec = importlib.util.spec_from_file_location(
@@ -372,13 +372,21 @@ class FinderMustNotImportTest(unittest.TestCase):
             patch.install = lambda: None
             sys.modules["fake_patch"] = patch
             sys.meta_path.insert(0, Signalling(["fake_patch"]))
-            a = threading.Thread(
-                name="A", target=lambda: importlib.import_module("gateway"), daemon=True
-            )
+            # A thread that dies with an exception is as "not alive" as one
+            # that returned, so liveness alone would read a regression that
+            # raises in the hook as a pass. Each thread keeps its traceback
+            # for the verdict below.
+            errors = {{}}
+
+            def run(name, module):
+                try:
+                    importlib.import_module(module)
+                except BaseException:
+                    errors[name] = traceback.format_exc()
+
+            a = threading.Thread(name="A", target=run, args=("A", "gateway"), daemon=True)
             b = threading.Thread(
-                name="B",
-                target=lambda: importlib.import_module("gateway.platform_registry"),
-                daemon=True,
+                name="B", target=run, args=("B", sc.TRIGGER_MODULE), daemon=True
             )
             a.start()
             if not ctl.started.wait(DEADLINE):
@@ -398,6 +406,14 @@ class FinderMustNotImportTest(unittest.TestCase):
                     "deadlock: thread %s still alive %ds after release"
                     % (" and ".join(alive), DEADLINE)
                 )
+            for name, tb in errors.items():
+                sys.stderr.write("thread %s raised:\\n%s" % (name, tb))
+            if errors:
+                fail("thread %s raised instead of finishing" % " and ".join(sorted(errors)))
+            # Both returned cleanly: the trigger module must also have run,
+            # or the hook handed back a spec that loaded nothing.
+            if not getattr(sys.modules.get(sc.TRIGGER_MODULE), "EXECUTED", False):
+                fail("the trigger module did not execute")
             print("OK", flush=True)
             """
         )
