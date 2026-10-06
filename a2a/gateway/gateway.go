@@ -278,7 +278,8 @@ func New(o Options) (*Gateway, error) {
 	if backend == gchatBackend && len(gchatAllowed) == 0 && !o.Config.GchatAllowAllUsers {
 		log.Warn("gchat allowlist is empty and allow-all is off; every inbound message will be dropped at verification")
 	}
-	targetAllowed := buildTargetAllowed(o.Config)
+	ps := NewPseudonymizer(o.Config.AttributionSalt)
+	targetAllowed := buildTargetAllowed(o.Config, ps)
 	for target, byBackend := range targetAllowed {
 		for b, set := range byBackend {
 			log.Info("target allowlist loaded", "target", target, "backend", b, "entries", len(set))
@@ -315,7 +316,7 @@ func New(o Options) (*Gateway, error) {
 		reg:            NewRegistry(o.Client),
 		adapter:        o.Adapter,
 		pm:             pm,
-		ps:             NewPseudonymizer(o.Config.AttributionSalt),
+		ps:             ps,
 		log:            log,
 		runCtx:         context.Background(),
 		sessionLocks:   map[string]*sessionLockEntry{},
@@ -1508,7 +1509,7 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		Ask: truncateRunes(msg.Text, askCap), SubmittedAt: time.Now(), Capability: capRef}
 	rec.Tasks = append(rec.Tasks, TaskRef{
 		ID: taskID, Addressee: rec.Addressee, CorrelationID: correlationID, Capability: capRef,
-		Requester:   &TaskRequester{Backend: backend, AuthorID: msg.AuthorID},
+		Requester:   &TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)},
 		Attribution: authority.Attribution(),
 		StartedAt:   time.Now().UTC(),
 	})

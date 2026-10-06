@@ -257,10 +257,11 @@ ingress as before (advisory today; see "Requester identity on the bus").
 Delegation on a human's behalf keeps the human's bound, and the gateway is where it is kept.
 A session does not mint a child task itself: it asks the gateway to, over the same local
 channel its turns arrive on, naming the addressee and the task text. The gateway is the only
-party that holds what the check needs - the plaintext requester the turn came in with (the bus
-carries a pseudonym), the target agent's `AllowedUsers`, and the `.in` credential - so it
-enforces the target's allowlist against that requester, mints the child with the `authority`
-block stamped as at ingress, and relays the child's events into the conversation as it does
+party that holds what the check needs - the requester the turn came in with and the install
+salt that pseudonymizes it (the bus and the session KV carry only the pseudonym, and the
+gateway hashes the allowlist the same way to compare), the target agent's `AllowedUsers`, and
+the `.in` credential - so it enforces the target's allowlist against that requester, mints the
+child with the `authority` block stamped as at ingress, and relays the child's events into the conversation as it does
 for any task. This is the Delegate flow above with the session, rather than a "delegate:"
 prefix, as the one asking; the machinery is the same. The session's routing judgment never
 becomes an authorization decision, because the session never writes an `authority` block and
@@ -313,9 +314,9 @@ child's terminal. The session's bus grants do not change for it (its only subscr
 its inbox, and it publishes only on its own task); what is new is the request shape between
 session and gateway and the gateway's record of which conversation a child belongs to. The
 request is the reserved `delegate` artifact on the session's own task; the gateway's record is the
-task history entry, which carries the turn's requester (backend and author id, in the KV only) and
-its pseudonymized attribution, so a child minted later and the wake-up after it run under the turn
-that asked. Working
+task history entry, which carries the turn's requester (backend and pseudonymized author id,
+in the KV only) and its pseudonymized attribution, so a child minted later and the wake-up after
+it run under the turn that asked. Working
 state richer than the transcript primer rehydrate builds today - what the session has
 discovered and decided, keyed by `contextId` - is part of the same work, so a resumed
 conversation is a resumed agent. A warm pool of ready pods is deferred; the cold start is

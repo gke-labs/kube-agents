@@ -17,22 +17,37 @@ const (
 const targetPlatform = "platform"
 
 // targetAllowed is Config.TargetAllowedUsers compiled for lookup: target ->
-// backend -> set, with Google Chat emails lowercased and Slack ids kept exact.
+// backend -> set of requester subjects (requesterSubject of each entry), so
+// the set compares against the pseudonym the session KV stores and never
+// against plaintext.
 type targetAllowed map[string]map[string]map[string]bool
 
-func buildTargetAllowed(cfg *Config) targetAllowed {
+// requesterSubject is the requester as the gateway stores and compares it:
+// the author id normalized in its backend's vocabulary (trimmed; Google Chat
+// ids are emails and lowercased, Slack member ids and every other backend's
+// kept exact), then pseudonymized under the install salt the way the
+// authority block's identifiers are. The session-state KV holds this and not
+// the id (spec-chatops-gateway.md, "Identifiers in `authority` are
+// pseudonymous"), and the target allowlists are hashed through the same
+// function, so the two sides cannot normalize differently. An id that is
+// blank after trimming has no subject: "".
+func requesterSubject(ps *Pseudonymizer, backend, authorID string) string {
+	id := strings.TrimSpace(authorID)
+	if backend == gchatBackend {
+		id = strings.ToLower(id)
+	}
+	return ps.Hash(id)
+}
+
+func buildTargetAllowed(cfg *Config, ps *Pseudonymizer) targetAllowed {
 	out := targetAllowed{}
 	for target, byBackend := range cfg.TargetAllowedUsers {
 		for backend, ids := range byBackend {
 			set := map[string]bool{}
 			for _, id := range ids {
-				if id = strings.TrimSpace(id); id == "" {
-					continue
+				if subject := requesterSubject(ps, backend, id); subject != "" {
+					set[subject] = true
 				}
-				if backend == gchatBackend {
-					id = strings.ToLower(id)
-				}
-				set[id] = true
 			}
 			if len(set) == 0 {
 				continue // an empty list is no list: all authenticated users
@@ -46,20 +61,17 @@ func buildTargetAllowed(cfg *Config) targetAllowed {
 	return out
 }
 
-// targetAllows answers whether authorID, in backend's vocabulary, may reach
+// targetAllows answers whether the requester whose subject (requesterSubject,
+// as a history entry's TaskRequester stores it) came in on backend may reach
 // target. No list for the (target, backend) pair means the ingress allowlist
-// is the only gate, which is today's bound, so the answer is true. Google
-// Chat ids are emails and compare case-insensitively; Slack member ids
-// compare exactly.
-func (g *Gateway) targetAllows(target, backend, authorID string) bool {
+// is the only gate, which is today's bound, so the answer is true. Under a
+// list, a blank subject is never a member.
+func (g *Gateway) targetAllows(target, backend, subject string) bool {
 	set := g.targetAllowed[target][backend]
 	if set == nil {
 		return true
 	}
-	if backend == gchatBackend {
-		authorID = strings.ToLower(authorID)
-	}
-	return set[authorID]
+	return subject != "" && set[subject]
 }
 
 // splitList parses a comma-separated env value, dropping blanks.

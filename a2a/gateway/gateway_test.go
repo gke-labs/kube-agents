@@ -2374,8 +2374,12 @@ func TestStartTaskRecordsTheRequester(t *testing.T) {
 		return rec != nil && len(rec.Tasks) == 1
 	})
 	ref := rec.Tasks[0]
-	if ref.Requester == nil || ref.Requester.Backend != "discord" || ref.Requester.AuthorID != "1001" {
-		t.Fatalf("requester = %+v", ref.Requester)
+	if want := requesterSubject(r.g.ps, "discord", "1001"); ref.Requester == nil ||
+		ref.Requester.Backend != "discord" || ref.Requester.Subject != want || !strings.HasPrefix(want, "hmac:") {
+		t.Fatalf("requester = %+v, want backend discord and subject %q", ref.Requester, want)
+	}
+	if raw := rawSessionRecord(t, r.g.reg, conv); strings.Contains(raw, `"1001"`) {
+		t.Fatalf("the session KV holds the plaintext author id: %s", raw)
 	}
 	if ref.StartedAt.IsZero() {
 		t.Fatal("startedAt not recorded")
@@ -2393,6 +2397,60 @@ func TestStartTaskRecordsTheRequester(t *testing.T) {
 	if _, ok := m["grants"]; ok {
 		t.Fatalf("attribution carries grants: %s", ref.Attribution)
 	}
+}
+
+// TestStartTaskHashesAGchatRequester: on Google Chat the author id is the
+// sender's email, and the history entry lands in the session-state KV, which
+// the content posture holds to pseudonyms. The stored requester is the
+// backend plus the normalized id hashed under the install salt; the email
+// appears nowhere in the record, in any case.
+func TestStartTaskHashesAGchatRequester(t *testing.T) {
+	r := startGchatRig(t, []string{"alice@example.com"}, false)
+	conv := "gchat:spaces/S1/threads/T-req"
+	r.adapter.inbox <- InboundMessage{
+		Conversation: conv, Kind: "group",
+		AuthorID: "Alice@Example.com", MessageID: "spaces/S1/messages/M1", Text: "how is the fleet?",
+	}
+	r.awaitTask(t, "platform")
+	waitFor(t, "record with a task", func() bool {
+		rec, _ := r.g.reg.Get(context.Background(), conv)
+		return rec != nil && len(rec.Tasks) == 1
+	})
+	raw := rawSessionRecord(t, r.g.reg, conv)
+	if strings.Contains(strings.ToLower(raw), "alice@example.com") {
+		t.Fatalf("the session KV holds the requester's email: %s", raw)
+	}
+	var stored struct {
+		Tasks []struct {
+			Requester map[string]string `json:"requester"`
+		} `json:"tasks"`
+	}
+	if err := json.Unmarshal([]byte(raw), &stored); err != nil {
+		t.Fatal(err)
+	}
+	if len(stored.Tasks) != 1 {
+		t.Fatalf("tasks = %+v", stored.Tasks)
+	}
+	want := NewPseudonymizer([]byte("test-salt")).Hash("alice@example.com") // trimmed, lowercased, hashed
+	got := stored.Tasks[0].Requester
+	if got["backend"] != gchatBackend || got["subject"] != want || len(got) != 2 {
+		t.Fatalf("requester = %v, want backend %q and subject %q only", got, gchatBackend, want)
+	}
+}
+
+// rawSessionRecord reads a record's bytes as the KV holds them, so a test can
+// assert on what is at rest rather than on the decoded struct.
+func rawSessionRecord(t *testing.T, reg *Registry, sessionKey string) string {
+	t.Helper()
+	kv, err := reg.kv(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := kv.Get(context.Background(), kvKey(sessionKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(entry.Value())
 }
 
 // TestAskTTLClearsTheRequesterToo: past AskTTL the history entry drops its

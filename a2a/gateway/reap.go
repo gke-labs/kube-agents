@@ -194,8 +194,8 @@ func (g *Gateway) boundAskCopy(ctx context.Context, rec *SessionRecord) {
 		changed = true
 	}
 	// The requester copy on the task history is bounded the same way: the
-	// backend-native id a later child task would be checked against, and the
-	// attribution it would inherit, outlive nothing past the TTL. The entry
+	// pseudonymized requester a later child task would be checked against,
+	// and the attribution it would inherit, outlive nothing past the TTL. The entry
 	// itself stays; a delegation from it is refused rather than guessed.
 	for i := range fresh.Tasks {
 		ref := &fresh.Tasks[i]

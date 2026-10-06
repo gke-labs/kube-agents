@@ -87,14 +87,16 @@ type SessionRecord struct {
 	Tasks []TaskRef `json:"tasks,omitempty"`
 }
 
-// TaskRequester is the turn's requester in the backend's own vocabulary:
-// what the target's allowlist is keyed on when this turn asks the gateway to
-// mint a child task. It lives in the session-state KV beside the conversation
-// key, which is backend-native already, and never reaches the bus; the bus
-// carries Attribution, which is pseudonymized. Cleared by the reap past AskTTL.
+// TaskRequester is the turn's requester as the target's allowlist is checked
+// against it when this turn asks the gateway to mint a child task: the
+// backend it came in on and its Subject, the author id normalized for that
+// backend and HMAC'd under the install salt (requesterSubject). No plaintext
+// id is stored; the allowlist entries are hashed the same way, so the check
+// compares pseudonyms. It lives in the session-state KV and never reaches the
+// bus; the bus carries Attribution. Cleared by the ask bound past AskTTL.
 type TaskRequester struct {
-	Backend  string `json:"backend"`
-	AuthorID string `json:"authorId"`
+	Backend string `json:"backend"`
+	Subject string `json:"subject"`
 }
 
 // TaskRef names one historical task and the authority it ran under: the
