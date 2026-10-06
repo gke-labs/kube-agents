@@ -110,6 +110,11 @@ CHECK_SLUG_WORDS = 6
 # A short digest of the whole title, so two findings whose titles share their
 # first words keep separate identities in the findings queue.
 CHECK_DIGEST_CHARS = 6
+# cluster_inventory_audit_sop.md: the metadata fields that hold one entry each.
+LIST_FIELDS = ("findings", "workloads")
+# Recorded as the ranking card when no cluster was audited and none was filed.
+NO_RANKING = "none"
+GAPS_HEADING = "## Gaps"
 # Placeholders a Cluster Agent writes where a field names more than one object.
 NOT_AN_OBJECT = ("", "multiple", "multiple workloads", "various", "n/a", "none")
 
@@ -315,6 +320,15 @@ def _cell(value) -> str:
     return str(value).replace("|", "/").replace("\n", " ")
 
 
+def _malformed(meta: dict) -> list[tuple[str, str]]:
+    """The list fields the audit SOP prescribes that a card set to something else."""
+    bad = [(f, type(meta[f]).__name__) for f in LIST_FIELDS if meta.get(f) is not None and not isinstance(meta[f], list)]
+    gaps = meta.get("gaps")
+    if gaps is not None and not isinstance(gaps, (list, str)):
+        bad.append(("gaps", type(gaps).__name__))
+    return bad
+
+
 def _gap_list(meta: dict) -> list:
     gaps = meta.get("gaps")
     if isinstance(gaps, str):
@@ -375,6 +389,11 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
     for meta, card_id in audits:
         for gap in _gap_list(meta):
             gaps.append(f"{_cell(meta.get('cluster'))} ({card_id}): {_cell(gap)}")
+        for field, kind in _malformed(meta):
+            gaps.append(
+                f"{_cell(meta.get('cluster'))} ({card_id}): `{field}` was a {kind}, not a list, so nothing "
+                "from it is listed"
+            )
         dropped = len(_list(meta.get("findings"))) - len(finding_lines(meta))
         if dropped:
             gaps.append(
@@ -433,7 +452,7 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
         "| :------ | :------ | :------- | :--- | ----------------: | :-------------- |",
     ]
     for meta, card_id in audits:
-        complete = not _gap_list(meta)
+        complete = not _gap_list(meta) and not _malformed(meta)
         out.append(
             f"| {_cell(meta.get('cluster'))} | {_cell(meta.get('project'))} | {_cell(meta.get('location'))} "
             f"| {card_id} | {len(_list(meta.get('workloads')))} | {'yes' if complete else 'no — see Gaps'} |"
@@ -514,16 +533,38 @@ def _sandbox():
     return sandbox_exec
 
 
-def write_raw(data_dir: Path, text: str) -> bool:
-    """Write the raw file where the ranking card's terminal reads it."""
+def covered(state: dict) -> bool:
+    """True when at least one cluster's audit reached the report."""
+    def named(meta) -> bool:
+        return isinstance(meta, dict) and bool(_text(meta.get("cluster")) and _text(meta.get("project")))
+
+    return any(c["status"] == DONE and named(c["metadata"]) for c in state["clusters"]) or any(
+        named(m) for m in _list(state["sweep"]["metadata"].get("clusters"))
+    )
+
+
+def no_coverage_report(raw: str) -> str:
+    """The delivered report when no cluster was audited: what went wrong, never a clean result."""
+    start = raw.find(GAPS_HEADING)
+    end = raw.find("\n## ", start + len(GAPS_HEADING)) if start >= 0 else -1
+    gaps = raw[start + len(GAPS_HEADING):end if end >= 0 else None].strip() if start >= 0 else ""
+    return (
+        "## Onboarding scan: no cluster was audited\n\n"
+        "The first-time scan finished without an audit of any cluster, so this is not a clean result. "
+        f"What it recorded:\n\n{gaps}\n\nThe full record is `{RAW_PATH}`.\n"
+    )
+
+
+def write_raw(data_dir: Path, text: str, path: str = RAW_PATH) -> bool:
+    """Write the raw file (or ``path``) where the ranking card's terminal reads it."""
     try:
         sx = _sandbox()
         in_sandbox = sx.sandbox_enabled()
     except Exception as e:  # noqa: BLE001 - retry next tick
-        _log(f"cannot tell where {RAW_PATH} goes: {e}")
+        _log(f"cannot tell where {path} goes: {e}")
         return False
     if not in_sandbox:
-        target = data_dir / Path(RAW_PATH).name
+        target = data_dir / Path(path).name
         tmp = target.with_suffix(TMP_SUFFIX)
         try:
             tmp.write_text(text, encoding="utf-8")
@@ -536,14 +577,14 @@ def write_raw(data_dir: Path, text: str) -> bool:
     # card's worker writes its own files beside this one.
     try:
         done = sx.run(
-            [REMOTE_SH, "-c", REMOTE_WRITE, "sh", RAW_PATH],
+            [REMOTE_SH, "-c", REMOTE_WRITE, "sh", path],
             stdin=text, principal=sx.TERMINAL_PRINCIPAL, timeout=SANDBOX_TIMEOUT_SECONDS,
         )
     except Exception as e:  # noqa: BLE001 - retry next tick
-        _log(f"could not write {RAW_PATH} in the sandbox: {e}")
+        _log(f"could not write {path} in the sandbox: {e}")
         return False
     if done.returncode != 0:
-        _log(f"could not write {RAW_PATH} in the sandbox: {(done.stderr or '').strip()}")
+        _log(f"could not write {path} in the sandbox: {(done.stderr or '').strip()}")
         return False
     return True
 
@@ -695,7 +736,19 @@ def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, roster=None, now:
     timed_out = not ready and now - filed_at >= deadline(state)
     if not ready and not timed_out:
         return None
-    if not write_raw(data_dir, compose(state, timed_out, now)):
+    raw = compose(state, timed_out, now)
+    if not write_raw(data_dir, raw):
+        return None
+    if not covered(state):
+        # Ranked, an empty raw file reads as a clean environment; the user gets
+        # what went wrong instead, through the same delivery job.
+        if not write_raw(data_dir, no_coverage_report(raw), REPORT_PATH):
+            return None
+        try:
+            _record(marker, sweep_id, NO_RANKING, now)
+        except OSError as e:
+            _log(f"wrote {REPORT_PATH} but could not write {marker}: {e}")
+        _log(f"no cluster was audited for sweep {sweep_id}; wrote {REPORT_PATH} without ranking")
         return None
     task_id = file_prioritize(parse_task_id, state.get("stale_keys"))
     if not task_id:

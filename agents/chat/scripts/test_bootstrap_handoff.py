@@ -310,7 +310,7 @@ class HandOffTest(unittest.TestCase):
         self.assertFalse((self.d / "INVENTORY.raw.md").exists())
         self.assertEqual(self.filed, [])
 
-    def test_waits_while_the_sweep_is_still_fanning_out(self):
+    def test_waits_while_the_sweep_is_still_running(self):
         _board(self.board, sweep_status="running", clusters=_all_done())
         self.assertIsNone(self._run())
 
@@ -337,11 +337,36 @@ class HandOffTest(unittest.TestCase):
         self.assertIn("stopped waiting", text)
 
     def test_a_blocked_sweep_waits_for_the_deadline(self):
-        _board(self.board, sweep_status="blocked")
+        _board(self.board, sweep_status="blocked", clusters=_all_done())
         self.assertIsNone(self._run())
         self.assertEqual(self.filed, [])
-        self.assertEqual(self._run(now=NOW - 60 + h.DEADLINE_SECONDS), "t_rank1")
+        limit = h.DEADLINE_SECONDS + h.DEADLINE_PER_CARD_SECONDS * len(_all_done())
+        self.assertEqual(self._run(now=NOW - 60 + limit), "t_rank1")
         self.assertIn("blocked —", (self.d / "INVENTORY.raw.md").read_text())
+
+    def test_no_cluster_audited_is_reported_not_ranked(self):
+        # No Cluster Agents and a sweep that completed with nothing: ranked, the
+        # empty raw file would read as a clean environment.
+        _board(self.board, clusters=[])
+        self.assertIsNone(self._run_roster([]))
+        self.assertEqual(self.filed, [])
+        report = (self.d / "INVENTORY.md").read_text()
+        self.assertIn("no cluster was audited", report)
+        self.assertIn("the sweep reported no fleet list", report)
+        self.assertIn("task_id=none", (self.d / h.HANDOFF_MARKER).read_text())
+        (self.d / "INVENTORY.md").unlink()
+        self.assertIsNone(self._run_roster([]))
+        self.assertFalse((self.d / "INVENTORY.md").exists())
+
+    def test_a_list_field_of_the_wrong_type_is_a_gap_not_a_clean_cluster(self):
+        meta = {"project": "p", "cluster": "c", "workloads": [{"name": "w"}], "findings": "buildkit runs privileged",
+                "gaps": {"reason": "ssh exit 255"}}
+        _board(self.board, clusters=[("t_odd", "done", meta, "")])
+        self.assertEqual(self._run(), "t_rank1")
+        raw = (self.d / "INVENTORY.raw.md").read_text()
+        self.assertIn("c (t_odd): `findings` was a str, not a list, so nothing from it is listed", raw)
+        self.assertIn("c (t_odd): `gaps` was a dict, not a list", raw)
+        self.assertIn("| t_odd | 1 | no — see Gaps |", raw)
 
     def test_one_archived_cluster_card_only_skips_that_cluster(self):
         _board(self.board, clusters=_all_done() + [("t_gone", "archived", None, "")])

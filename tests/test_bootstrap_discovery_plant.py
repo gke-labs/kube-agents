@@ -730,6 +730,7 @@ class HandoffStateQueryTest(unittest.TestCase):
     def test_an_archived_or_older_ranking_card_does_not_count(self):
         key = _INTERPOLATIONS["local.prioritize_key"]
         self.assertEqual(self._query("running", [(key, "archived", 200)]), "1 0 0")
+        self.assertEqual(self._query("running", [(key, "todo", 50)]), "1 0 0")
 
     def test_only_the_hand_offs_own_ranking_card_counts_where_its_module_is(self):
         key = _INTERPOLATIONS["local.prioritize_key"]

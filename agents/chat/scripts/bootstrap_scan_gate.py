@@ -50,7 +50,7 @@ file time covers every case.
 
 Archiving the previous run's ``bootstrap-inventory-*`` cards and then deleting
 ``.bootstrap_scan_filed`` — together with ``INVENTORY.raw.md``, which nothing
-else ever removes and whose presence makes the sweep skip discovery
+else ever removes and which a reader would take for this run's findings
 (``should_skip`` checks it too, but sees it only with the shell sandbox off) —
 is the supported way
 to re-arm discovery after a sweep has genuinely failed (the runbook is

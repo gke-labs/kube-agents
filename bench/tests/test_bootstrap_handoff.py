@@ -394,7 +394,7 @@ def test_an_archived_or_earlier_keyed_card_fails(install, overrides: dict[str, A
 
 @pytest.mark.parametrize("status", onboarding.RANKING_WONT_RUN)
 def test_a_ranking_card_that_will_not_run_fails(install, status: str) -> None:
-    # A sweep worker's early card blocks on the pre-check: keyed, after the sweep, and ranks nothing.
+    # The hand-off's own card, keyed and after the sweep, that ranks nothing in this status.
     install(RAW_WITHOUT_BLOCK, extra=[_ranking_card(status=status)])
     result = _verify("ranking_card_filed")
     assert result.status == "fail", result.reason

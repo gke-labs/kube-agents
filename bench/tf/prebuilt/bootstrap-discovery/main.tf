@@ -15,7 +15,7 @@
 # The scenario driver for bench/tasks/bootstrap-discovery-fanout: re-arm the
 # onboarding discovery gate on the install under test, wait for the
 # `bootstrap-inventory-scan` cron job to file a fresh sweep card, then wait for
-# the hand-off to the ranking stage: return once a card keyed
+# the hand-off to the ranking stage: return once the hand-off's own card keyed
 # `bootstrap-inventory-prioritize` is on the board, or once the sweep and its
 # Cluster Agent cards have all settled without one for `settle_hold`, or at
 # `handoff_wait`. Fail the apply if no worker has picked the sweep up by

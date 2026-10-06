@@ -221,7 +221,7 @@ For anything else, write a lowercase hyphenated slug naming the condition, and k
 is the row's identity across every later sweep.
 
 One `findings` entry names one workload. `"workload": "multiple workloads"`, a comma-separated list,
-or `"e.g. networking-dra-driver"` all collapse on the way through aggregation into a line the user
+or `"e.g. networking-dra-driver"` all collapse on the way into the report into a line the user
 cannot act on; file one entry per affected workload instead, even when the issue and the
 recommendation repeat verbatim.
 
