@@ -56,22 +56,25 @@ func TestTheAgentProfileCRDRefusesWhatTheLoaderRefused(t *testing.T) {
 	}
 
 	cases := map[string]func(*agentv1alpha1.AgentProfile){
-		"blank description":        func(p *agentv1alpha1.AgentProfile) { p.Spec.Description = "   " },
-		"no persona image":         func(p *agentv1alpha1.AgentProfile) { p.Spec.Persona.Image = "" },
-		"no harness image":         func(p *agentv1alpha1.AgentProfile) { p.Spec.Harness.Image = "" },
-		"negative maxTurns":        func(p *agentv1alpha1.AgentProfile) { p.Spec.Harness.MaxTurns = -1 },
-		"no deadline":              func(p *agentv1alpha1.AgentProfile) { p.Spec.Lifecycle.ActiveDeadlineSeconds = 0 },
-		"negative ttl":             func(p *agentv1alpha1.AgentProfile) { p.Spec.Lifecycle.TTLSecondsAfterFinished = -1 },
-		"negative queue timeout":   func(p *agentv1alpha1.AgentProfile) { p.Spec.QueueTimeoutSeconds = -1 },
-		"no concurrency":           func(p *agentv1alpha1.AgentProfile) { p.Spec.Concurrency = 0 },
-		"dotted name":              func(p *agentv1alpha1.AgentProfile) { p.Name = "my.profile" },
-		"reserved name platform":   func(p *agentv1alpha1.AgentProfile) { p.Name = "platform" },
-		"dotted topic token":       func(p *agentv1alpha1.AgentProfile) { p.Spec.Bus.PublishTopics = []string{"shared.up.grade"} },
-		"unscoped topic":           func(p *agentv1alpha1.AgentProfile) { p.Spec.Bus.SubscribeTopics = []string{"blueprint"} },
-		"prefixed topic":           func(p *agentv1alpha1.AgentProfile) { p.Spec.Bus.PublishTopics = []string{"a2a.topics.shared.annotations"} },
+		"blank description":      func(p *agentv1alpha1.AgentProfile) { p.Spec.Description = "   " },
+		"no persona image":       func(p *agentv1alpha1.AgentProfile) { p.Spec.Persona.Image = "" },
+		"no harness image":       func(p *agentv1alpha1.AgentProfile) { p.Spec.Harness.Image = "" },
+		"negative maxTurns":      func(p *agentv1alpha1.AgentProfile) { p.Spec.Harness.MaxTurns = -1 },
+		"no deadline":            func(p *agentv1alpha1.AgentProfile) { p.Spec.Lifecycle.ActiveDeadlineSeconds = 0 },
+		"negative ttl":           func(p *agentv1alpha1.AgentProfile) { p.Spec.Lifecycle.TTLSecondsAfterFinished = -1 },
+		"negative queue timeout": func(p *agentv1alpha1.AgentProfile) { p.Spec.QueueTimeoutSeconds = -1 },
+		"no concurrency":         func(p *agentv1alpha1.AgentProfile) { p.Spec.Concurrency = 0 },
+		"dotted name":            func(p *agentv1alpha1.AgentProfile) { p.Name = "my.profile" },
+		"reserved name platform": func(p *agentv1alpha1.AgentProfile) { p.Name = "platform" },
+		"dotted topic token":     func(p *agentv1alpha1.AgentProfile) { p.Spec.Bus.PublishTopics = []string{"shared.up.grade"} },
+		"unscoped topic":         func(p *agentv1alpha1.AgentProfile) { p.Spec.Bus.SubscribeTopics = []string{"blueprint"} },
+		"prefixed topic": func(p *agentv1alpha1.AgentProfile) {
+			p.Spec.Bus.PublishTopics = []string{"a2a.topics.shared.annotations"}
+		},
 		"wildcard topic":           func(p *agentv1alpha1.AgentProfile) { p.Spec.Bus.SubscribeTopics = []string{"shared.*"} },
 		"clusterRef missing field": func(p *agentv1alpha1.AgentProfile) { p.Spec.ClusterRef.Location = "" },
 		"bad serviceAccountName":   func(p *agentv1alpha1.AgentProfile) { p.Spec.Identity.ServiceAccountName = "Not_A_Name" },
+		"another profile's SA":     func(p *agentv1alpha1.AgentProfile) { p.Spec.Identity.ServiceAccountName = "agentprofile-other" },
 	}
 	for name, mutate := range cases {
 		p := valid.DeepCopy()

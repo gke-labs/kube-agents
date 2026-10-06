@@ -54,8 +54,8 @@ Topic grants are written without the `a2a.topics.` prefix, as `shared.{topic}` o
 A profile binds to the PlatformAgent in its own namespace. With that agent on `mode: next`, the operator renders three things per profile:
 
 - A ServiceAccount, `agentprofile-<name>`, owned by the profile, with token automount off and no RoleBinding. If `spec.identity.serviceAccountName` names an existing ServiceAccount, that one is used and none is created. Naming a ServiceAccount does hand the profile's pods whatever RBAC it holds.
-- A bus identity for that ServiceAccount in the auth callout's identity map. Its pods may publish their own task events, read their own task input, and use the topics the profile names. Nothing else.
-- An agent card on `a2a.agents.<name>`, rendered from `spec.description`. Deleting the profile publishes a tombstone in its place before the profile is removed.
+- A bus identity for that ServiceAccount in the auth callout's identity map. Its pods may publish task events and read task input for this profile's tasks, and use the topics the profile names. Nothing else. The scope is the profile, not one task: two pods of the same profile can reach each other's task subjects.
+- An agent card on `a2a.agents.<name>`, rendered from `spec.description`. Deleting the profile on a `mode: next` install publishes a tombstone in its place before the profile is removed. A profile deleted while its PlatformAgent is on `today`, or while the operator has no bus identity, is removed without one.
 
 A profile may not run as `default`, as a ServiceAccount the operator already uses (for the PlatformAgent or for itself), or as one another `AgentProfile` already holds. Such a profile renders nothing, and its `IdentityReady` condition says why.
 

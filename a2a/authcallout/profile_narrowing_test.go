@@ -383,3 +383,17 @@ func TestAnAdapterRefusesAProfileExecutorWithASession(t *testing.T) {
 		t.Fatalf("want a startup refusal naming %s, got %v", lib.EnvProfileExecutor, err)
 	}
 }
+
+// A narrowed pod named after a mapped principal would be granted that
+// principal's inbox, since the user and the inbox prefix are the pod name. The
+// callout refuses it at connect.
+func TestANarrowedPodNamedAfterAMappedPrincipalIsRefused(t *testing.T) {
+	const tokenPodNamedLikeAnEntry = "token-for-an-auditor-pod-named-like-a-mapped-user-padded-ok"
+	tokens := profileTokens()
+	tokens[tokenPodNamedLikeAnEntry] = Attested{ServiceAccount: auditorSA, PodName: "profile-cluster-a", PodUID: "uid-x"}
+	h := startHarness(t, profileMap, tokens)
+	if nc, err := nats.Connect(h.url, nats.Token(tokenPodNamedLikeAnEntry), nats.CustomInboxPrefix("_INBOX.profile-cluster-a")); err == nil {
+		nc.Close()
+		t.Fatal("a pod named after a mapped principal connected; it would hold that principal's inbox")
+	}
+}

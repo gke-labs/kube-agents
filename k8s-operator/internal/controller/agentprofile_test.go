@@ -360,6 +360,68 @@ func TestAProfileOnTheOperatorsServiceAccountIsRefused(t *testing.T) {
 	}
 }
 
+// A profile that sorts first cannot take over another profile's
+// operator-created ServiceAccount by naming it: the incumbent keeps its entry.
+func TestAProfileCannotTakeOverAnotherProfilesServiceAccount(t *testing.T) {
+	withoutOperatorBusPrincipal(t)
+	agent := a2aTestAgent()
+	yak := testAgentProfile(agent.Namespace, "yak")
+	aardvark := testAgentProfile(agent.Namespace, "aardvark", func(p *agentv1alpha1.AgentProfile) {
+		p.Spec.Identity.ServiceAccountName = "agentprofile-yak"
+	})
+	resolved := resolveAgentProfileIdentities(agent, []agentv1alpha1.AgentProfile{yak, aardvark})
+	if resolved["aardvark"].refused == nil {
+		t.Error("aardvark took yak's operator-created ServiceAccount")
+	}
+	if resolved["yak"].refused != nil {
+		t.Errorf("yak lost its own ServiceAccount: %v", resolved["yak"].refused)
+	}
+}
+
+// A profile that got past admission with a bad name or topic (an older or
+// edited CRD) drops out of the map alone; the render still succeeds.
+func TestAMalformedProfileDropsOutWithoutFailingTheMap(t *testing.T) {
+	withoutOperatorBusPrincipal(t)
+	agent := a2aTestAgent()
+	profiles := []agentv1alpha1.AgentProfile{
+		testAgentProfile(agent.Namespace, "a.b"),
+		testAgentProfile(agent.Namespace, "badtopic", func(p *agentv1alpha1.AgentProfile) { p.Spec.Bus.SubscribeTopics = []string{"tasks.>"} }),
+		testAgentProfile(agent.Namespace, "fine"),
+	}
+	entries := renderedMapEntries(t, agent, profiles)
+	if _, ok := entries["profile-fine"]; !ok {
+		t.Error("the good profile is missing")
+	}
+	for _, bad := range []string{"profile-a.b", "profile-badtopic"} {
+		if _, ok := entries[bad]; ok {
+			t.Errorf("%s rendered", bad)
+		}
+	}
+}
+
+// An existing ServiceAccount under the operator-created name that the profile
+// does not control is neither adopted nor given a bus identity.
+func TestAForeignServiceAccountIsNotAdopted(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	agent := a2aTestAgent()
+	p := testAgentProfile(agent.Namespace, "auditor")
+	foreign := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "agentprofile-auditor", Namespace: agent.Namespace}}
+	h := newProfileHarness(t, agent, &p, foreign)
+	h.reconcile(agent.Namespace, "auditor")
+
+	if c := condition(h.profile(agent.Namespace, "auditor"), agentv1alpha1.AgentProfileConditionIdentityReady); c.Reason != reasonAgentProfileRefused {
+		t.Errorf("IdentityReady reason = %q, want %q", c.Reason, reasonAgentProfileRefused)
+	}
+	sa, _ := h.serviceAccount(agent.Namespace, "agentprofile-auditor")
+	if len(sa.OwnerReferences) != 0 {
+		t.Errorf("the foreign ServiceAccount was adopted: %v", sa.OwnerReferences)
+	}
+	bound, err := boundAgentProfiles(context.Background(), h.c, agent)
+	if err != nil || len(bound) != 0 {
+		t.Errorf("boundAgentProfiles = %v, %v; want the profile left out of the map", bound, err)
+	}
+}
+
 // The order of the profile entries does not depend on list order, so an
 // unchanged set of profiles never churns the map's version.
 func TestProfileEntriesRenderInNameOrder(t *testing.T) {

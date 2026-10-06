@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"slices"
 	"time"
 
 	"github.com/nats-io/jwt/v2"
@@ -351,6 +352,15 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 			grants, user = g, att.PodName
 		default:
 			return "", nil, "", fmt.Errorf("%s names narrowing %q, which this callout does not implement", att.ServiceAccount, id.Narrowing)
+		}
+		// A narrowed user is named for its pod, and that name is also its
+		// inbox prefix. A pod named after a user the map serves (the
+		// operator, the verifier) would be granted that principal's
+		// inbox, and could read or forge its JetStream replies. Pod names
+		// the gateway and the dispatcher mint never collide; a pod someone
+		// named by hand might.
+		if slices.Contains(m.Users(), user) {
+			return "", nil, "", fmt.Errorf("%s narrows on pod %q, which is the name of a mapped principal; its inbox is that principal's", att.ServiceAccount, user)
 		}
 	}
 

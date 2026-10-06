@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -216,6 +217,19 @@ func (n *natsCardPublisher) conn(agent *agentv1alpha1.PlatformAgent) (*nats.Conn
 	}
 	n.conns[key] = nc
 	return nc, nil
+}
+
+// forget closes and drops every connection held for an agent in namespace.
+func (n *natsCardPublisher) forget(namespace string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	prefix := namespace + "/"
+	for key, nc := range n.conns {
+		if strings.HasPrefix(key, prefix) {
+			nc.Close()
+			delete(n.conns, key)
+		}
+	}
 }
 
 // Read fetches the profile's last directory message with a direct get by

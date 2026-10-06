@@ -19,6 +19,11 @@ package controller
 import (
 	"context"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -55,5 +60,35 @@ func boundAgentProfiles(ctx context.Context, c client.Reader, agent *agentv1alph
 		}
 		return nil, err
 	}
-	return profiles.Items, nil
+	var bound []agentv1alpha1.AgentProfile
+	for i := range profiles.Items {
+		foreign, err := agentProfileServiceAccountIsForeign(ctx, c, &profiles.Items[i])
+		if err != nil {
+			return nil, err
+		}
+		if !foreign {
+			bound = append(bound, profiles.Items[i])
+		}
+	}
+	return bound, nil
+}
+
+// agentProfileServiceAccountIsForeign reports whether a profile with no
+// spec.identity would land on a ServiceAccount that already exists and is not
+// the profile's: one someone created by hand, with whatever RoleBindings they
+// gave it. The operator neither adopts it nor renders a bus identity for it.
+// A ServiceAccount spec.identity names is foreign on purpose and not checked.
+func agentProfileServiceAccountIsForeign(ctx context.Context, c client.Reader, p *agentv1alpha1.AgentProfile) (bool, error) {
+	if p.Spec.Identity.ServiceAccountName != "" {
+		return false, nil
+	}
+	var sa corev1.ServiceAccount
+	err := c.Get(ctx, types.NamespacedName{Namespace: p.Namespace, Name: agentProfileServiceAccountPrefix + p.Name}, &sa)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return !metav1.IsControlledBy(&sa, p), nil
 }

@@ -302,6 +302,14 @@ What the operator renders per profile, as built (amended 10/6):
   from a current one. The grant is a wildcard over the profile token because callout grants are
   fixed for the life of a connection, and a profile created later still has to be publishable.
 
+Two limits of what is built. Credentials are per profile, as decided 8/24, so two pods of one
+profile can reach each other's task subjects; per-task credentials stay with the authority
+work. And a profile deleted while its agent is on `today` releases its finalizer with no
+tombstone, because there is no bus to publish one on. The directory survives a flip to
+`today` on the bus's PVC, so that card is still there when the agent goes back to `next`.
+Nothing sweeps directory entries that have no profile. Fixing that means either holding
+deletion on a `today` install or giving the operator a read of the whole directory.
+
 The CR binds to the PlatformAgent in its namespace. The field table has no agentRef, and with
 two agents in one namespace (only possible with the singleton webhook off) a profile renders
 nothing. The name `platform` is reserved: it is the Hermes bridge's addressee.

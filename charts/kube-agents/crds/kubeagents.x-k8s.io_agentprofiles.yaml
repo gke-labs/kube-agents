@@ -64,7 +64,7 @@ spec:
                         PublishTopics are the topics the profile's pods may
                         write.
                       items:
-                        maxLength: 134
+                        maxLength: 133
                         pattern: ^(shared\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?|agent\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)$
                         type: string
                       maxItems: 32
@@ -75,7 +75,7 @@ spec:
                         SubscribeTopics are the topics the profile's pods
                         may read.
                       items:
-                        maxLength: 134
+                        maxLength: 133
                         pattern: ^(shared\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?|agent\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)$
                         type: string
                       maxItems: 32
@@ -151,6 +151,12 @@ spec:
                       maxLength: 253
                       pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                       type: string
+                      x-kubernetes-validations:
+                        - message:
+                            "serviceAccountName may not name an operator-created
+                            AgentProfile ServiceAccount (agentprofile-*): that ServiceAccount
+                            belongs to another profile"
+                          rule: "!self.startsWith('agentprofile-')"
                   type: object
                 lifecycle:
                   description: |-

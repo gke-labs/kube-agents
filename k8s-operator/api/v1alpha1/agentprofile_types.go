@@ -129,7 +129,7 @@ type AgentProfileBus struct {
 	// PublishTopics are the topics the profile's pods may write.
 	// +kubebuilder:validation:MaxItems=32
 	// +kubebuilder:validation:items:Pattern=`^(shared\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?|agent\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)$`
-	// +kubebuilder:validation:items:MaxLength=134
+	// +kubebuilder:validation:items:MaxLength=133
 	// +listType=set
 	// +optional
 	PublishTopics []string `json:"publishTopics,omitempty"`
@@ -137,7 +137,7 @@ type AgentProfileBus struct {
 	// SubscribeTopics are the topics the profile's pods may read.
 	// +kubebuilder:validation:MaxItems=32
 	// +kubebuilder:validation:items:Pattern=`^(shared\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?|agent\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)$`
-	// +kubebuilder:validation:items:MaxLength=134
+	// +kubebuilder:validation:items:MaxLength=133
 	// +listType=set
 	// +optional
 	SubscribeTopics []string `json:"subscribeTopics,omitempty"`
@@ -150,6 +150,7 @@ type AgentProfileIdentity struct {
 	// absent, the operator creates a ServiceAccount with none.
 	// +kubebuilder:validation:MaxLength=253
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +kubebuilder:validation:XValidation:rule="!self.startsWith('agentprofile-')",message="serviceAccountName may not name an operator-created AgentProfile ServiceAccount (agentprofile-*): that ServiceAccount belongs to another profile"
 	// +optional
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 }

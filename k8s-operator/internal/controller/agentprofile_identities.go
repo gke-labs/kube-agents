@@ -21,6 +21,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/util/validation"
 
@@ -209,6 +210,18 @@ func resolveAgentProfileIdentities(agent *agentv1alpha1.PlatformAgent, profiles 
 		p := &sorted[i]
 		sa := agentProfileServiceAccountName(p)
 		switch {
+		case !isDNS1123LabelToken(p.Name):
+			// The CRD refuses these too. Refused here as well so that a
+			// profile admitted by an older or edited CRD drops out of the
+			// map instead of failing the whole render.
+			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("profile name %q is not a dot-free DNS-1123 label", p.Name)}
+		case badTopicGrant(p) != "":
+			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("topic grant %q is not shared.{topic} or agent.{agent}.{topic}", badTopicGrant(p))}
+		case p.Spec.Identity.ServiceAccountName != "" && strings.HasPrefix(p.Spec.Identity.ServiceAccountName, agentProfileServiceAccountPrefix):
+			// The operator-created ServiceAccounts belong to the profile
+			// they are named for. Without this a profile that sorts first
+			// could name another's and take its map entry over.
+			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("serviceAccountName %q is an operator-created AgentProfile ServiceAccount", p.Spec.Identity.ServiceAccountName)}
 		case p.Name == a2aBridgeAddressee:
 			// The CRD refuses this name too; the operator does not rely
 			// on admission alone, because CRD validation can be
@@ -226,6 +239,16 @@ func resolveAgentProfileIdentities(agent *agentv1alpha1.PlatformAgent, profiles 
 		}
 	}
 	return out
+}
+
+// badTopicGrant returns the first topic grant the CRD's pattern refuses, or "".
+func badTopicGrant(p *agentv1alpha1.AgentProfile) string {
+	for _, t := range append(append([]string(nil), p.Spec.Bus.PublishTopics...), p.Spec.Bus.SubscribeTopics...) {
+		if !agentProfileTopicRE.MatchString(t) {
+			return t
+		}
+	}
+	return ""
 }
 
 // agentProfileMapEntries renders one narrowed map entry per profile that

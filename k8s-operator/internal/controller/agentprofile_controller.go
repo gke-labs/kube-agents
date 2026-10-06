@@ -115,6 +115,11 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 	if agent == nil || !a2aStackRendering(agent) {
+		// No bus to talk to: drop any connection held for this namespace's
+		// agent rather than let it reconnect to a dead Service forever.
+		if f, ok := r.Cards.(interface{ forget(namespace string) }); ok {
+			f.forget(profile.Namespace)
+		}
 		if agent != nil {
 			reason, msg = reasonAgentProfileNotNext, "the PlatformAgent "+agent.Name+" does not run spec.mode: next; an AgentProfile renders nothing until it does"
 			if _, modeErr := resolveMode(agent); modeErr != nil {
@@ -141,6 +146,15 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 	resolution := resolveAgentProfileIdentities(agent, all.Items)[profile.Name]
+	if resolution.refused == nil {
+		foreign, err := agentProfileServiceAccountIsForeign(ctx, r.Client, &profile)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if foreign {
+			resolution = agentProfileResolution{refused: fmt.Errorf("ServiceAccount %s already exists and is not this profile's; the operator does not adopt it", agentProfileServiceAccountPrefix+profile.Name)}
+		}
+	}
 
 	if resolution.refused != nil {
 		if err := r.deleteOwnServiceAccount(ctx, &profile); err != nil {
@@ -312,7 +326,10 @@ func (r *AgentProfileReconciler) applyServiceAccount(ctx context.Context, p *age
 	if err := ctrl.SetControllerReference(p, sa, r.Scheme); err != nil {
 		return err
 	}
-	return r.Patch(ctx, sa, client.Apply, client.FieldOwner(agentProfileComponent), client.ForceOwnership)
+	// No ForceOwnership: a foreign ServiceAccount under this name has
+	// already been refused (agentProfileServiceAccountIsForeign), so a field
+	// conflict here is a surprise worth an error, not something to take over.
+	return r.Patch(ctx, sa, client.Apply, client.FieldOwner(agentProfileComponent))
 }
 
 // deleteOwnServiceAccount removes the ServiceAccount the operator created for
