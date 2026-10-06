@@ -83,6 +83,13 @@ readonly HELM_RELEASE_SECRET_SELECTOR="owner=helm,name=${HELM_RELEASE_NAME}"
 # so a Helm formatting change cannot silently blind the guard.
 readonly HELM_DEPLOYED_STATUS_RE='"status"[[:space:]]*:[[:space:]]*"deployed"'
 
+# Bounded retry attempts for the Helm chart install. Transient API-server 5xx
+# errors (500, 502, 503, 504) during Autopilot control-plane scaling or cluster
+# startup can fail the first attempt; retrying proceeds to evaluation (#2382).
+readonly HELM_DEPLOY_ATTEMPTS=3
+readonly HELM_DEPLOY_RETRY_DELAY_SECONDS=5
+readonly HELM_API_SERVER_5XX_RE='(Internal Server Error|the server is currently unable to handle the request|an error on the server|50[0234] |Service Unavailable|Gateway Timeout|Bad Gateway)'
+
 # The keypair the agent uses to reach its shell sandbox over SSH. Generated per
 # run and thrown away with the lease: nothing outside this cluster ever sees it,
 # and the next run's install gets a pair of its own.
@@ -947,32 +954,63 @@ SANDBOX_KEY_DIR="$(umask 077 && mktemp -d)"
 ssh-keygen -q -t "${SANDBOX_SSH_KEY_TYPE}" -N '' -C "${SANDBOX_SSH_KEY_COMMENT}" \
   -f "${SANDBOX_KEY_DIR}/id_sandbox"
 
+# ─── 5c. Deploy the chart ─────────────────────────────────────────────────────
 # Named in the build log so a run's dispatcher behaviour can be read against
 # the cap it was given without opening the rendered CR.
 echo "Kanban board cap for this install: max_in_progress=${EVAL_KANBAN_MAX_IN_PROGRESS} (spec.harness.tuning.maxInProgress)"
-helm upgrade --install "${HELM_RELEASE_NAME}" ./charts/kube-agents \
-  --namespace "${NAMESPACE}" --create-namespace \
-  "${IMAGE_ARGS[@]}" \
-  --set-string "platformAgent.harness.clusterName=${CLUSTER_NAME}" \
-  --set-string "platformAgent.harness.location=${REGION}" \
-  --set-string "platformAgent.harness.projectId=${PROJECT_ID}" \
-  --set-string "platformAgent.security.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
-  --set-string "platformAgent.integration.github.gitRepo=${GITOPS_REPO}" \
-  "${GITHUB_MINTER_ARGS[@]}" \
-  --set "platformAgent.credentials.create=true" \
-  --set-string "platformAgent.credentials.data.API_SERVER_KEY=${API_SERVER_KEY}" \
-  --set-string "platformAgent.credentials.data.GEMINI_API_KEY=${GEMINI_API_KEY}" \
-  --set-file "platformAgent.credentials.data.SANDBOX_SSH_PRIVATE_KEY=${SANDBOX_KEY_DIR}/id_sandbox" \
-  --set-file "platformAgent.credentials.data.SANDBOX_SSH_PUBLIC_KEY=${SANDBOX_KEY_DIR}/id_sandbox.pub" \
-  --set-string "litellm.modelProvider=${MODEL_PROVIDER}" \
-  --set-string "litellm.modelDefaultName=${MODEL_DEFAULT_NAME}" \
-  --set-string "litellm.vertex.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
-  --set "platformAgent.deployment.availability.runtimeClassName=" \
-  --set "platformAgent.harness.tuning.maxInProgress=${EVAL_KANBAN_MAX_IN_PROGRESS}" \
-  --set-string "platformAgent.deployment.env[0].name=ALERT_DAILY_LIMIT_WARNING" \
-  --set-string "platformAgent.deployment.env[0].value=${EVAL_ALERT_DAILY_LIMIT_WARNING}" \
-  ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"} \
-  --wait --timeout 15m
+
+HELM_INSTALL_OUT="$(mktemp)"
+HELM_EXIT=0
+for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
+  set +e
+  helm upgrade --install "${HELM_RELEASE_NAME}" ./charts/kube-agents \
+    --namespace "${NAMESPACE}" --create-namespace \
+    "${IMAGE_ARGS[@]}" \
+    --set-string "platformAgent.harness.clusterName=${CLUSTER_NAME}" \
+    --set-string "platformAgent.harness.location=${REGION}" \
+    --set-string "platformAgent.harness.projectId=${PROJECT_ID}" \
+    --set-string "platformAgent.security.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --set-string "platformAgent.integration.github.gitRepo=${GITOPS_REPO}" \
+    "${GITHUB_MINTER_ARGS[@]}" \
+    --set "platformAgent.credentials.create=true" \
+    --set-string "platformAgent.credentials.data.API_SERVER_KEY=${API_SERVER_KEY}" \
+    --set-string "platformAgent.credentials.data.GEMINI_API_KEY=${GEMINI_API_KEY}" \
+    --set-file "platformAgent.credentials.data.SANDBOX_SSH_PRIVATE_KEY=${SANDBOX_KEY_DIR}/id_sandbox" \
+    --set-file "platformAgent.credentials.data.SANDBOX_SSH_PUBLIC_KEY=${SANDBOX_KEY_DIR}/id_sandbox.pub" \
+    --set-string "litellm.modelProvider=${MODEL_PROVIDER}" \
+    --set-string "litellm.modelDefaultName=${MODEL_DEFAULT_NAME}" \
+    --set-string "litellm.vertex.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --set "platformAgent.deployment.availability.runtimeClassName=" \
+    --set "platformAgent.harness.tuning.maxInProgress=${EVAL_KANBAN_MAX_IN_PROGRESS}" \
+    --set-string "platformAgent.deployment.env[0].name=ALERT_DAILY_LIMIT_WARNING" \
+    --set-string "platformAgent.deployment.env[0].value=${EVAL_ALERT_DAILY_LIMIT_WARNING}" \
+    ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"} \
+    --wait --timeout 15m 2>&1 | tee "${HELM_INSTALL_OUT}"
+  HELM_EXIT="${PIPESTATUS[0]}"
+  set -e
+
+  if [ "${HELM_EXIT}" -eq 0 ]; then
+    break
+  fi
+
+  if grep -Eq "${HELM_API_SERVER_5XX_RE}" "${HELM_INSTALL_OUT}" && [ "${attempt}" -lt "${HELM_DEPLOY_ATTEMPTS}" ]; then
+    echo "WARNING: Helm chart deployment attempt ${attempt} of ${HELM_DEPLOY_ATTEMPTS} hit a transient API-server 5xx, retrying in ${HELM_DEPLOY_RETRY_DELAY_SECONDS}s..."
+    sleep "${HELM_DEPLOY_RETRY_DELAY_SECONDS}"
+    # If the failed attempt left behind a release record with no deployed revision,
+    # clear it so the next attempt can install cleanly (#1172, #2382).
+    if RELEASE_HISTORY_JSON="$(helm history "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" -o json 2>/dev/null)" \
+      && ! grep -Eq "${HELM_DEPLOYED_STATUS_RE}" <<<"${RELEASE_HISTORY_JSON}"; then
+      echo "WARNING: the ${HELM_RELEASE_NAME} release record exists with no deployed revision after attempt ${attempt} — clearing the record before retrying."
+      helm uninstall "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" --no-hooks 2>/dev/null \
+        || kubectl delete secret -n "${NAMESPACE}" -l "${HELM_RELEASE_SECRET_SELECTOR}" --ignore-not-found
+    fi
+  else
+    rm -f "${HELM_INSTALL_OUT}"
+    rm -rf "${SANDBOX_KEY_DIR}"
+    exit "${HELM_EXIT}"
+  fi
+done
+rm -f "${HELM_INSTALL_OUT}"
 # Deleted here rather than from the EXIT trap, which two later steps replace.
 # A failed install leaves the directory behind in a pod prow destroys with the
 # lease, and nothing uploads it — /logs/artifacts is the only path off this box.
