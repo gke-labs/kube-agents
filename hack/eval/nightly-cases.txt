@@ -390,8 +390,8 @@
 # id for seeded-c's notifications, the other clusters' still findings, and a
 # Declared intent row naming the note. Red on main's tree (the finding
 # published), three greens on the branch's, on a dev install. One case, three
-# units: this file's share is fifty-one cases (153 units) of a sixty-five-case,
-# 195-unit matrix (with the presubmit file's fourteen). deployer: noop,
+# units: this file's share is fifty-seven cases (171 units) of a seventy-one-case,
+# 213-unit matrix (with the presubmit file's fourteen). deployer: noop,
 # read-only over the seeded fleet.
 ./tasks/patch-declared-intent-no-finding/task.yaml
 
