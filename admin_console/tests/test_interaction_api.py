@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import stat
 import time
 import tempfile
 import unittest
@@ -774,6 +775,33 @@ class InteractionApiTest(unittest.TestCase):
 
         self.assertEqual(transport.url, "interactions/ix_cancel/cancel")
         self.assertEqual(result.status, "cancelled")
+
+    def test_sqlite_store_file_is_owner_only_before_sqlite_opens_it(self):
+        # A file SQLite creates takes the umask's mode until the store
+        # tightens it; a second process checking it in that window refused it.
+        modes = []
+        real_connect = sqlite3.connect
+
+        def connect(path, *args, **kwargs):
+            modes.append(stat.S_IMODE(os.stat(path).st_mode))
+            return real_connect(path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "interactions.db"
+            with patch("admin_console.chat.store.sqlite3.connect", connect):
+                SQLiteInteractionStore(path)
+        self.assertEqual(modes[0], 0o600)
+
+    def test_sqlite_store_is_writable_under_a_umask_without_owner_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            os.chmod(directory, 0o700)
+            path = Path(directory) / "interactions.db"
+            previous = os.umask(0o277)
+            try:
+                SQLiteInteractionStore(path)
+            finally:
+                os.umask(previous)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
     def test_sqlite_store_preserves_terminal_interaction_and_events(self):
         with tempfile.TemporaryDirectory() as directory:
