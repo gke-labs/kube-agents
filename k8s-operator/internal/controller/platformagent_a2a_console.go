@@ -99,9 +99,12 @@ const (
 	a2aConsoleReadinessFailure = 3
 	a2aConsoleLivenessPeriod   = 10
 	a2aConsoleLivenessFailure  = 6
-	a2aConsoleCPURequest       = "10m"
-	a2aConsoleMemoryRequest    = "32Mi"
-	a2aConsoleMemoryLimit      = "128Mi"
+	// GKE Autopilot raises any CPU request under 50m on admission, so a
+	// smaller one is rewritten on every apply and the stored Deployment
+	// never matches the render. Sized like the gateway and the verifier.
+	a2aConsoleCPURequest    = "50m"
+	a2aConsoleMemoryRequest = "64Mi"
+	a2aConsoleMemoryLimit   = "128Mi"
 )
 
 func a2aConsoleImage() string {

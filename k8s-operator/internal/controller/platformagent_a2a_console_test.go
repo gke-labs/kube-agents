@@ -27,6 +27,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -89,6 +90,12 @@ func TestBuildA2AConsoleDeployment(t *testing.T) {
 	}
 	if got := consoleEnv(t, c); !reflect.DeepEqual(got, want) {
 		t.Errorf("env = %v\nwant  %v", got, want)
+	}
+
+	// Autopilot's floor: a CPU request under 50m is raised on admission, so
+	// the stored Deployment would never match the render.
+	if cpu := c.Resources.Requests.Cpu(); cpu.Cmp(resource.MustParse("50m")) < 0 {
+		t.Errorf("cpu request = %s, want at least 50m (GKE Autopilot raises anything lower on every apply)", cpu)
 	}
 
 	if len(c.Ports) != 1 || c.Ports[0].ContainerPort != 8080 || c.Ports[0].Name != "http" {
