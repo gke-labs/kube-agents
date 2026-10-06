@@ -5402,7 +5402,9 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
     return moved
 
 
-def _shield_sources(data: dict, declarations: list[dict]) -> dict[tuple[str, str], list[tuple[str, str, str]]]:
+def _shield_sources(
+    data: dict, declarations: list[dict], candidates: dict[tuple[str, str], set[str]] | None = None
+) -> dict[tuple[str, str], list[tuple[str, str, str]]]:
     """Declared 2.7 workloads by `(cluster, namespace)`, folded as the finding id folds them.
 
     Two sources, because each misses what the other has: the document's
@@ -5413,12 +5415,27 @@ def _shield_sources(data: dict, declarations: list[dict]) -> dict[tuple[str, str
     Each value is `(object, repo, path)`, one per folded object (the first
     spelling and the first note that declared it are kept for display), and an
     item whose object is not a workload kind is logged and left out: it covers
-    no workload's token.
+    no workload's token. With `candidates` — the collector's 2.7 workloads,
+    `(namespace, object)` folded to the clusters that carry each — an item
+    naming a workload the collector did not report on the `default` account
+    (a misspelling, a workload on a named account) is left out the same way:
+    it covers no token, so it shields none.
     """
     sources: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
     seen: set[tuple[str, str, str]] = set()
 
     def add(cluster: str, namespace: str, obj: str, repo: str, path: str) -> None:
+        if candidates is not None:
+            on_account = candidates.get((_id_segment(namespace), _id_segment(obj))) or set()
+            if not on_account or (cluster and _id_segment(cluster) not in on_account):
+                log(
+                    f"DECLARATION NOT APPLIED: {SHARED_ACCOUNT_CHECK} on {obj!r} ({repo}:{path}) — "
+                    f"the collector reports no such workload on the `default` ServiceAccount in "
+                    f"{namespace!r}"
+                    + (f" on {cluster}" if cluster else "")
+                    + "; this item covers no token, so it shields nothing."
+                )
+                return
         if _object_kind_segment(obj) not in SHARED_ACCOUNT_WORKLOAD_KINDS:
             log(
                 f"DECLARATION NOT APPLIED: {SHARED_ACCOUNT_CHECK} on {obj!r} ({repo}:{path}) — "
@@ -5484,7 +5501,16 @@ def shield_declared_account_siblings(
     reported; counted as held rather than shielded, it would keep that
     pull request open past the close the shield exists to make.
     """
-    shielded_by = _shield_sources(data, list(declarations or []))
+    candidates: dict[tuple[str, str], set[str]] | None = None
+    if manifest is not None:
+        candidates = {}
+        for entry, candidate in _candidates(manifest):
+            if str(candidate.get("check", "")) != SHARED_ACCOUNT_CHECK:
+                continue
+            cluster = str(candidate.get("cluster") or entry.get("name") or "")
+            key = (_id_segment(str(candidate.get("namespace") or "")), _id_segment(str(candidate.get("object", ""))))
+            candidates.setdefault(key, set()).add(_id_segment(cluster))
+    shielded_by = _shield_sources(data, list(declarations or []), candidates)
     if not shielded_by:
         return []
 
@@ -10457,6 +10483,7 @@ def close_stale_remediation_prs(
     *,
     branch_by_finding: dict[str, str] | None = None,
     shielded_ids: set[str] | None = None,
+    shielded_only: bool = False,
 ) -> list[str]:
     """Close every open remediation PR the current findings no longer justify.
 
@@ -10464,7 +10491,10 @@ def close_stale_remediation_prs(
     findings `shield_declared_account_siblings` demoted this run proposes the
     shared-account fix for a namespace that now holds a declared workload, so
     it is closed with that reason rather than left open as the only fix there
-    is — merging it would be the harm the shield exists to prevent.
+    is — merging it would be the harm the shield exists to prevent. With
+    `shielded_only`, that is the only close made: a run over partial coverage
+    cannot say a finding stopped reproducing, but the shield's close rests on
+    the declaration, not on what the run could read, so it still stands.
 
     Two reasons a pull request is stale, and the second one is why this cannot
     just read the hidden block. A pull request is stale when every finding it
@@ -10512,6 +10542,8 @@ def close_stale_remediation_prs(
         # branch rule below is the only one allowed to act on it.
         persisting = [fid for fid in covered if fid in current_ids] if joinable else []
         only_shielded = bool(persisting) and all(fid in shielded_ids for fid in persisting)
+        if shielded_only and not only_shielded:
+            continue
         if not orphaned:
             if not covered or not joinable or (persisting and not only_shielded):
                 continue
@@ -12787,7 +12819,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             )
         prs_closed = (
             []
-            if gaps or unaccounted
+            if (gaps or unaccounted) and not shielded_ids
             else close_stale_remediation_prs(
                 # No finding is current, but one the collector still flags is
                 # not stale either: a pull request whose finding never reached
@@ -12795,6 +12827,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 # body budget dropped — is still a fix for a live condition.
                 repo, audit_id, remediation_prs, still_flagged, previous_titles, {}, now,
                 shielded_ids=shielded_ids,
+                # Over a gap or an unaccounted finding only the shield's close
+                # is made; it rests on the declaration, not on this run's read.
+                shielded_only=bool(gaps or unaccounted),
             )
         )
         conversation_unread = False
@@ -13325,13 +13360,20 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # Retiring a pull request means asserting its finding no longer reproduces.
     # Over incomplete coverage that assertion is unfounded, so nothing is
     # closed and every open fix survives to the next complete run.
-    if gaps:
+    if gaps and not shielded_ids:
         prs_closed = []
         log(
             "Coverage is partial, so no remediation pull request was closed as "
             "stale; a fix cannot be retired on evidence the audit never gathered."
         )
     else:
+        if gaps:
+            log(
+                "Coverage is partial, so only the shield's closes are made: a pull "
+                "request whose remaining findings share a namespace with a declared "
+                "workload is closed on the declaration, not on this run's reading; "
+                "every other open fix survives to the next complete run."
+            )
         prs_closed = close_stale_remediation_prs(
             repo,
             audit_id,
@@ -13351,6 +13393,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 for finding in group
             },
             shielded_ids=shielded_ids,
+            shielded_only=bool(gaps),
         )
 
     prs_opened = _open_promoted_prs(

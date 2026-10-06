@@ -5884,6 +5884,41 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
         elsewhere = {"clusters": [{"name": "rogue-cluster", "candidates": [dict(posture, cluster="rogue-cluster")]}]}
         self.assertEqual(audit_report.declare_collector_candidates(doc, declarations, elsewhere), [])
 
+    def test_with_a_manifest_a_declaration_naming_no_candidate_shields_nothing(self):
+        # The owner misspelled the workload, or named one on a named account:
+        # the collector reports no such workload on the default account, so the
+        # item covers no token. Without a manifest the kind filter is all there is.
+        worker = self._sa_finding("worker", "Deployment/worker")
+        manifest = {"clusters": [{"name": "prod-us-east", "candidates": [
+            {"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "severity": "major", "excerpt": "x"},
+            {"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/worker", "severity": "major", "excerpt": "x"},
+        ]}]}
+        typo = {"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/apii", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "x"}
+        doc = audit_report.validate_findings(make_doc(findings=[worker], audit=AUDIT), AUDIT)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(audit_report.shield_declared_account_siblings(doc, [typo], manifest), [])
+        self.assertEqual(doc["findings"][0]["remediation"]["kind"], "manifest")
+        self.assertIn("reports no such workload", err.getvalue())
+        # The real workload still shields; a fleet-wide item is matched on any
+        # cluster. The result names the demoted sibling and the held candidate
+        # (api, declared but unreported), both shielded for the stale-close pass.
+        real = dict(typo, object="Deployment/api")
+        doc = audit_report.validate_findings(make_doc(findings=[worker], audit=AUDIT), AUDIT)
+        with contextlib.redirect_stderr(io.StringIO()):
+            shielded = audit_report.shield_declared_account_siblings(doc, [real], manifest)
+        self.assertIn(doc["findings"][0]["id"], shielded)
+        self.assertEqual(doc["findings"][0]["remediation"]["kind"], "manual")
+        # A cluster-scoped item for a cluster where the collector saw no such workload is refused too.
+        elsewhere = dict(real, **{audit_report.DECLARATION_CLUSTER_FIELD: "stage-eu"})
+        doc = audit_report.validate_findings(make_doc(findings=[worker], audit=AUDIT), AUDIT)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(audit_report.shield_declared_account_siblings(doc, [elsewhere], manifest), [])
+        # No manifest: today's fallback, the kind filter alone.
+        doc = audit_report.validate_findings(make_doc(findings=[worker], audit=AUDIT), AUDIT)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(len(audit_report.shield_declared_account_siblings(doc, [typo])), 1)
+
     def test_a_declaration_naming_no_workload_shields_nothing(self):
         # 2.7 is declared per workload. An item that copies the 2.6 shape, or
         # names the account, covers no workload's token: logged, not applied.
@@ -16523,6 +16558,34 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(rc, 2, self.err)
         self.assertIn("declared", self.err)
         self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+
+    def test_a_partial_run_still_closes_the_shielded_pull_request_and_nothing_else(self):
+        # Over partial coverage no ordinary close is made: a retired fix
+        # asserts its finding stopped reproducing, which this run cannot say.
+        # The shield's close rests on the declaration instead, so it stands.
+        path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
+        api = make_finding(fid="api", check="default-sa-automount", obj="Deployment/api", title="api", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        worker = make_finding(fid="worker", check="default-sa-automount", obj="Deployment/worker", title="worker", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        previous_body = published_body(make_doc(findings=[api, worker], audit=AUDIT), generated_at=NOW)
+        self.declaring_replies(previous_body)
+        api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
+        worker_id = derived_id(check="default-sa-automount", obj="Deployment/worker")
+        self.harness.replies["proposal-list"] = proposals_view([
+            pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([api_id, worker_id])),
+            pr(8, "platform-agent/fix-x-gone", body=audit_report.delta_block(["gone"])),
+        ])
+        self.touch(path)
+        doc = make_doc(findings=[worker], audit=AUDIT, skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}])
+        doc["declared"] = [{"check": "default-sa-automount", "cluster": "prod-us-east", "namespace": "payments", "object": "Deployment/api", "title": "api", "declaration": {"repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}}]
+        manifest = _full_manifest(audit=AUDIT, candidates=[self.account_candidate("Deployment/api"), self.account_candidate("Deployment/worker")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertTrue(payload["partial"])
+        self.assertEqual(payload["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
+        self.assertIn("only the shield's closes are made", self.err)
+        comment = " ".join(self.harness.bodies_for("proposal-*"))
+        self.assertIn("declared to need the `default` ServiceAccount's token", comment)
 
     def test_a_worker_cannot_mark_a_sibling_shielded_from_the_document(self):
         # Same pull request, no declaration anywhere: a document that carries
