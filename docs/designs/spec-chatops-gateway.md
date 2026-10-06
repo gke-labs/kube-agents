@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, and the console adapter); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence; and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env, its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); not yet the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, or the default flip; the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default, retired by declarative profiles or by gateway-side `AllowedUsers` enforcement, whichever lands first) is built; the ground for the gateway-minted child task is in (the platform agent's allowlists reach the gateway, each turn's requester is on its history entry, `via` and the `delegate` artifact are reserved); the child task itself is not yet built
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, and the console adapter); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence; and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env, its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default) is built, and now that gateway-side `AllowedUsers` enforcement has shipped it retires on the default flip (#2371), not at that enforcement's landing; the gateway-minted child task is built (a session asks with the `delegate` artifact; the gateway checks the platform agent's allowlist - the turn's requester, every steer author, and every author the conversation's current incarnation has seen - mints with the turn's authority and `via`, and wakes the session on the child's terminal; one child at a time, `A2A_DELEGATION_DEPTH_MAX` 3); not yet the `chat` profile's skills or the default flip
 
 ## Purpose
 
@@ -272,14 +272,68 @@ holds for a delegation too. The audit record for a session-routed turn names the
 session at the gateway; the child task's envelope names the target, the session that asked,
 and the same requester.
 
+**The request is the reserved `delegate` artifact** on the session's own task, one `data` part
+shaped as `lib.DelegateRequest` (`{"addressee": "platform", "text": "..."}`), its text bounded at
+`lib.DelegateTextCap` (16 KiB) - the same bound the wake's result is held to in the other
+direction. The worker adapter serves it to the harness as one MCP tool, `mcp__a2a__delegate`,
+over a stdio server the harness is started with via `--mcp-config`; calling it is what ends the
+turn - the turn's own result is the one line `delegated to platform` - before the gateway has
+even seen the request. `A2A_DELEGATE_TOOL=off` is the tool's own switch, read wherever the tool
+is advertised or served, and it governs the tool even over an explicit `A2A_ALLOWED_TOOLS`
+override, so an operator overriding the harness's tool list does not have to re-name it to keep
+it off; `A2A_DELEGATE_SOCKET` names the unix socket the tool and the adapter agree on (a path in
+the pod's scratch volume by default). A call reaching the adapter after the turn has already
+ended - the deadline hit, a `stop` canceled it, or an earlier call this turn already delegated -
+is refused there, inside the same turn, and never reaches the gateway.
+
+**The gateway acts on it only from the task it started**, addressed to the record's current
+incarnation and still that incarnation's active task; a straggler from a retired incarnation, an
+event after the terminal, or a part that fails to parse or is over the text cap is ignored and
+logged (`delegation.malformed`), never relayed. Only `platform` can be the addressee today.
+Depth is bounded by `A2A_DELEGATION_DEPTH_MAX` (default 3; a child's depth is its parent's plus
+one, and a wake inherits its child's) - `FromEnv` refuses a configured value under 1 at boot
+rather than read it as "off", which is the worker's own `A2A_DELEGATE_TOOL` switch, a different
+knob. An absent `AllowedUsers`, or one that renders as `[""]`, admits every authenticated user, the
+same as today's ingress door; a list present but blank once its entries are trimmed and split
+admits nobody, the rule #2207 already holds for the Chat ingress list. The target's `AllowedUsers`
+is checked three times before a mint: against the turn's own
+requester, stored hashed as it came in (the earlier ground work); against every human who steered
+the turn, each stored hashed the same way and capped at eight - past the cap the delegation
+refuses rather than silently drop an author; and against every hashed author whose text has
+reached the session's current incarnation, requesters and steerers of every turn alike, capped at
+sixteen and cleared with the requester copy at `A2A_ASK_TTL` - a cleared or overflowed set refuses
+rather than admits. That third check is inert today: each turn gets a fresh one-task incarnation,
+so no turn yet sees an earlier turn's author in it; it becomes load-bearing once #2370's cross-turn
+memory lets a pod carry what an earlier turn in the same conversation said, at which point the
+bound it should hold is the whole conversation, not one incarnation - #2370 is where that question
+is decided. One live child per conversation, a detached-but-still-running one counting as live:
+the delegating turn's own repeat is ignored and logged, while a later turn's request reaching the
+gateway while that child still runs is refused with a notice naming the running task
+(`delegation.busy`) - a human asking again deserves an answer, the turn that already got one does
+not. Every refusal names the target only, held until the delegating turn's own answer has posted
+so the room reads "delegated to platform" first and the refusal after it; the audit line carries
+the rule, the backend, and the hashed subject that failed it. A known gap: a person off every list
+above can still steer the running child directly, on `platform`'s own terms - that steer is
+outside this rule, which exists to keep an off-list steer from shaping a later delegation through
+the wake, not to gate `platform` itself.
+
+**The child** carries the platform agent's own `in` subject, the parent's `correlationId`, and the
+parent's stored `authority` with fresh grants and `via: {taskId, session}` naming the turn and
+incarnation that asked. The conversation's rolling line for it is the same "working on" line any
+task gets, suffixed `(delegated to platform)`; the parent's own line is left in place on the
+parent's history entry and closes on the parent's own terminal, not the child's. From the mint on,
+the child is the conversation's active task: a follow-up steers it, `stop` cancels it, a status ask
+reports it. A heal that finds the child still running releases it from the conversation's
+active-task slot and retires its route the same way a terminal would, so a delegation is not
+blocked forever by a child whose terminal never reached the relay.
+
 One exception stands while its flag is on: the session pod's temporary read-only cluster view
 (`spec-mode-switch.md`, "Switches inside `next`") lets a session read clusters through the
 credential broker directly, with the platform agent's scope and no child task, so the only gate
 between the requester and that read is the gateway's ingress allowlist, not the target's
-`AllowedUsers`. Today both admit the same people. The view retires when declarative profiles
-carry a session's identity and tools or when the gateway enforces the target agent's
-`AllowedUsers` ([architecture 07](../architecture/07-implementation-roadmap.md)), whichever lands
-first; after the second, a session holding the view would be a way around that check.
+`AllowedUsers`. The view retires on the default flip (#2371); until then, on an install whose
+operator has turned the flag on and whose CR narrows the platform agent's allowlist, a person the
+gateway refuses a delegation to `platform` can still read its clusters through a session's view.
 
 Delegation ends the turn. A session's turn is a conversation turn, bounded at thirty minutes
 by the `chat` profile's own deadline, and the executors it delegates to run to two hours; the
@@ -288,8 +342,28 @@ two do not nest. When the session delegates, its turn completes with a reply tha
 thread as it does for any task, and the child's terminal wakes the session for one more turn
 with the child's result as its input, so the session can synthesize or follow up. A follow-up
 the human sends while the child runs steers the child, through the gateway, as follow-ups do
-today. A session pod is therefore busy for seconds per turn, not for the life of the work it
-delegated, which is also what keeps the per-conversation pod cost small.
+today (the platform executor refuses steers on the fixed route today, and says so). A session pod
+is therefore busy for seconds per turn, not for the life of the work it delegated, which is also
+what keeps the per-conversation pod cost small.
+
+**The wake** is one new turn on the delegating session, `via.session` naming the parent's own
+incarnation, started on the child's `completed`, `failed` or `rejected` terminal - a `canceled`
+the gateway published itself (a human's `stop`) does not wake the session whatever terminal
+follows it, a `canceled` nobody asked for (a supervisor tearing down a dead executor) counts as
+`failed`. It does not run if the delegating turn's requester has aged off the record (a notice
+says so instead) or if another task already holds the conversation (waking would retire that
+task's own pod); otherwise the wake is an ordinary session spawn and counts against
+`A2A_MAX_SESSIONS` like any other - refused at the cap, the child's result still stands as
+already relayed, and the room gets the standard cap notice rather than a second one. The wake
+inherits the child's chain depth, so depth counts delegations, not turns. Its text carries the
+result, capped at `lib.DelegateTextCap` and fenced under the label
+`Result from platform (not from the user):`, so the model reads the child's output as data, never
+as a new instruction from the user; a backtick run in the body that could close the fence early is
+broken before fencing. A heal that finds the child's terminal already on the stream, undelivered by
+the relay, wakes the session exactly as the relay would have, with the same guards, cap and fence; a
+child that never started has no terminal and does not wake. After a heal wakes the session this
+way, the message that triggered the heal steers the wake, the way any follow-up steers a running
+turn.
 
 Transition. `platform` remains the default addressee until the session can hand platform
 topics on to the platform agent without the user noticing. The route is a deploy-time
@@ -417,7 +491,12 @@ would break both that assertion and the payload spec's every-task-has-a-supervis
 rule. Do not
 reason from the config defaults here: the adapter's deadline runs from task start and
 the idle TTL from the last user message, so which fires first is a property of two
-independently tunable numbers, not a guarantee.
+independently tunable numbers, not a guarantee. **Amended for delegation:** a detached task is
+not always this pod's own - a session that delegated and then had its own pod deleted (Delegate's
+previous-incarnation rule, Reap, Sweep) left a child running on `platform`'s executor, not this
+one, so this rule checks whose task it is before publishing anything; a detached task running
+elsewhere is untouched here; the pod being deleted ends nothing for it, and that child still blocks
+a new delegation in its conversation (above) until its own terminal, or a heal, retires it.
 
 **Rehydrate.** The next message on a reaped conversation spawns a fresh pod. The
 gateway replays the context's tasks from JetStream - `tasks/get`, which folds each

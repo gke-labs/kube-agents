@@ -173,13 +173,13 @@ between a person and that read is the gateway's ingress allowlist. That differs 
 record ([architecture 02](../architecture/02-agent-personas.md) §2.4,
 [03](../architecture/03-security-model.md) §4a, and "Sessions by default" in
 `spec-chatops-gateway.md`), where a session reaches cluster data only through a gateway-minted
-child task and the gateway checks the target agent's `AllowedUsers` against the requester first.
-Today the two gates admit the same people, because the ingress allowlist is the only human-to-agent
-check the gateway enforces. It is a demo aid with two retirement triggers, whichever lands first:
-declarative profiles carrying a session's identity and tools, and gateway-side `AllowedUsers`
-enforcement ([architecture 07](../architecture/07-implementation-roadmap.md)); once the gateway
-refuses a person for the platform agent, a session with this view would read its clusters anyway,
-so the flag goes before that enforcement ships.
+child task and the gateway checks the target agent's `AllowedUsers` against the requester first -
+built now: a delegation to `platform` is checked against its `AllowedUsers`, but the view bypasses
+that check entirely, so on an install whose CR narrows the platform agent's allowlist the two gates
+no longer admit the same people. The view retires on the default flip (#2371); until then, on an
+install whose operator has turned the flag on and whose CR narrows the platform agent's allowlist,
+a person the gateway refuses a delegation to `platform` can still read its clusters through a
+session's view.
 
 ## Per-feature overrides - sketched, not built
 

@@ -252,10 +252,12 @@ default) — a closed allowlist must be set explicitly. A session-routed turn ha
 door: it is gated by the gateway's own ingress allowlist (the adapter's allowed-users setting), and
 the target CR's `allowedUsers` is read when the session asks the gateway to mint a child task to it
 (the operator renders those lists to the gateway as `A2A_TARGET_ALLOWED_USERS_GCHAT` / `_SLACK`; the
-gateway will compare the turn's pseudonymized backend author id, as the session KV stores it, against
-the list's entries pseudonymized the same way when it mints that child task, which the delegation
-primitive builds; an absent list is all authenticated users, and a list that is blank after trimming
-admits nobody).
+gateway compares the turn's pseudonymized backend author id, as the session KV stores it, against
+the list's entries pseudonymized the same way, at the mint of that child task (`a2a/gateway/delegation.go`;
+the delegation primitive, built) — along with every steered author of the turn and every author the
+conversation's current incarnation has seen, same comparison, each capped and refused past its cap;
+an absent list is all authenticated users, and a list that is blank after trimming admits nobody).
+Detail: [spec-chatops-gateway.md](../designs/spec-chatops-gateway.md), "Sessions by default".
 
 ## 3. GitOps repository layout & propose/apply contract
 
