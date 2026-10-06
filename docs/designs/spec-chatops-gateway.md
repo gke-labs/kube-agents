@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects; and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env, its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); not yet the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, or the default flip; the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default, retired by declarative profiles or by gateway-side `AllowedUsers` enforcement, whichever lands first) is built
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door with its eval and Google sign-in identity classes); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects (but not yet the door's Google sign-in env); and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env, its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); not yet the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, or the default flip; the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default, retired by declarative profiles or by gateway-side `AllowedUsers` enforcement, whichever lands first) is built
 
 ## Purpose
 
@@ -1311,7 +1311,11 @@ events through as they come.
 **Conversation.** `a2a:<caller>:<contextId>`, kind `dm`. The caller is part of the key so two
 callers naming the same `contextId` do not share a conversation; a caller that sends none is
 minted one and reads it back on the `Task`. `Roster` is the caller alone, complete;
-`openDirect` returns the caller's last conversation, as on the inject door.
+`openDirect` returns the caller's last conversation, as on the inject door. A Google-verified
+caller (below) is `:google:<email>` inside the door, so its conversation is
+`a2a::google:<email>:<contextId>`: an eval caller may not contain a colon, so no eval key starts
+`a2a::` and no eval caller equals a Google one, which keeps the two classes' conversations and
+task scopes apart even though the static token's holder names their caller freely.
 
 **Identity, first version: the eval class.** The caller names itself - the `X-A2A-Caller` header,
 or `message.metadata.caller` for a client that cannot set headers - and is resolved through the
@@ -1323,20 +1327,37 @@ nothing is defaulted. `verifiedBy` is `a2a-bearer`, its own value, so an externa
 submission and an eval harness's are distinguishable downstream even though both resolve into
 the eval namespace today.
 
-That is the demo answer and not the product answer. The developer class (an ID token for the
-person whose harness is calling, audience this install's door, principal the same email the
-Google Chat adapter carries) and the unattended class (an organisation's service identity,
-read-only against protected targets) arrive as verifiers beside this map, never as entries in
-it, and each gets its own `verifiedBy`. Validating a token at the door is not the per-user
-token brokerage the permission model declined: the door holds an audience and an allowlist,
-never a refresh token.
+**Identity, second class: a developer signed in with Google.** A bearer that is not the door's
+static token is checked, when `A2A_DOOR_GOOGLE_CLIENT_ID` is set, as a Google OAuth access token:
+Google's tokeninfo endpoint must answer for it with the install's one pre-registered client as
+its audience or authorized party, a verified email, and an expiry still ahead. The email,
+lower-cased, is the principal - the same string the Google Chat adapter carries for the same
+person - admitted only if it is on the door's own allowlist (`A2A_DOOR_ALLOWED_USERS`; empty
+admits nobody, and there is no allow-all). The authority block records backend `a2a-google` and
+`verifiedBy` `a2a-google-token`. A request carrying the token may not also name a caller: the
+header or `message.metadata.caller` beside a token is refused, so a token never travels with a
+name that disagrees with it. A token Google refuses is a 401 a client answers by signing in
+again; a check that could not be made (Google unreachable, more checks in flight than the door
+allows) is a 503. An admission is remembered for at most five minutes or until the token
+expires, under a byte bound; a refusal is not remembered. This is a verifier beside the eval
+map, never an entry in it: the static token and its map work as before. The roster resolves the
+class's own way, never through the chat principal map that is the gateway's default.
+
+Validating a token at the door is not the per-user token brokerage the permission model
+declined: the door holds a client id and the gateway an allowlist, never a refresh token or a
+client secret. The principal this class asserts is attribution: the task's capability is the
+install's, as it is for every ingress. Still to come as verifiers of their own, each with its
+own `verifiedBy`: JWT access tokens from an OpenID Connect provider (Entra, Okta), and the
+unattended class (an organisation's service identity, read-only against protected targets).
 
 **The card is the catalog.** One skill per destination this door routes to, which today is the
 gateway's default addressee. When profiles land the list is rendered from `DIRECTORY` and the
 caller's entitlements, per caller, and it is the same list the router's capability catalog is
 built from. The card is the one unauthenticated route, because discovery reads it to learn which
 security scheme to present; it discloses the endpoint URL, the scheme and the default
-destination's name, none of which a 401 hides.
+destination's name, none of which a 401 hides. With the Google class armed the card lists a
+second scheme beside the bearer, `openIdConnect` at Google's OpenID configuration, as an
+alternative.
 
 **Posture.** Every RPC request carries a bearer token (`A2A_DOOR_TOKEN`, required whenever
 `A2A_DOOR_LISTEN` is set, no unauthenticated mode); the caller map is its own file
@@ -1351,8 +1372,8 @@ under the door's own name, so each door comes and goes with its own flag. The re
 the door as a backend the way it counts the inject door (`a2aGatewayBackend`): a `mode: next`
 install with no `discord-bot` Secret and this door armed gets its gateway rather than the
 `NoChatBackend` condition, which is what the gateway's own start-up check already accepts. The
-identity classes above are what will let it be rendered on an install a customer reaches; until
-then it is a dev and eval door like the other.
+operator does not yet render the Google class's env; until it does, and until the door has
+ingress a customer reaches, it is a dev and eval door like the other.
 
 ## What stage 2 builds from this doc
 
