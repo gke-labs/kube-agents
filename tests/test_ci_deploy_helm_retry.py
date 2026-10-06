@@ -273,6 +273,60 @@ A2A_OPERATOR_ENV_ARGS=()
         self.assertEqual(len(helm_upgrades), 2, f"expected 2 helm calls: {calls}")
         self.assertIn("hit a transient API-server 5xx, retrying", out)
 
+    def test_a_transient_an_error_on_the_server_retries_and_succeeds(self):
+        # Exercises 'an error on the server' without 'Internal Server Error' or other signatures.
+        err_msg = "an error on the server has prevented the request from succeeding (post configmaps)"
+        responses = [
+            (1, "", err_msg),
+            (0, "Release kube-agents installed", ""),
+        ]
+        rc, calls, out, err = self._run_deploy_block(responses)
+        self.assertEqual(rc, 0, err)
+        helm_upgrades = [c for c in calls if c.startswith("helm upgrade")]
+        self.assertEqual(len(helm_upgrades), 2, f"expected 2 helm calls: {calls}")
+        self.assertIn("hit a transient API-server 5xx, retrying", out)
+
+    def test_helm_api_server_5xx_regex_matches_all_alternations(self):
+        # Pin that HELM_API_SERVER_5XX_RE matches every alternation and rejects non-5xx errors.
+        import re
+
+        text = _deploy_text()
+        m = re.search(r'^readonly HELM_API_SERVER_5XX_RE=["\']([^"\']+)["\']', text, re.MULTILINE)
+        self.assertIsNotNone(m, "HELM_API_SERVER_5XX_RE not found in hack/ci-deploy.sh")
+        assert m is not None
+        pattern = re.compile(m.group(1))
+
+        # Each distinct alternation required by the regex:
+        signatures = [
+            "Internal Server Error",
+            "the server is currently unable to handle the request",
+            "an error on the server",
+            "500 Internal Server Error",
+            "502 Bad Gateway",
+            "503 Service Unavailable",
+            "504 Gateway Timeout",
+            "Service Unavailable",
+            "Gateway Timeout",
+            "Bad Gateway",
+        ]
+        for sig in signatures:
+            with self.subTest(signature=sig):
+                self.assertTrue(pattern.search(sig), f"pattern must match signature: {sig!r}")
+
+        # Non-matching client errors and operational failures:
+        non_5xx = [
+            "release: already exists",
+            "cannot re-use a name that is still in use",
+            "timed out waiting for the condition",
+            "404 Not Found",
+            "401 Unauthorized",
+            "403 Forbidden",
+            "invalid chart values",
+        ]
+        for non in non_5xx:
+            with self.subTest(non_5xx=non):
+                self.assertFalse(pattern.search(non), f"pattern must NOT match non-5xx: {non!r}")
+
     def test_persistent_5xx_exhausts_retries_and_fails(self):
         err_msg = "Error: 504 Gateway Timeout: unable to reach control plane"
         responses = [
