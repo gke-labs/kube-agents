@@ -95,7 +95,7 @@ def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Store:
     monkeypatch.setattr(oobe, "STATE_FILE", str(s.state))
     monkeypatch.setattr(oobe, "PLATFORM_EXECUTIONS_DB", str(s.db))
     monkeypatch.setattr(oobe, "HERMES_PYTHON", sys.executable)
-    monkeypatch.setattr(oobe.onboarding, "agent_shell", _local_shell)
+    monkeypatch.setattr(oobe, "agent_shell", _local_shell)
     return s
 
 
@@ -175,5 +175,5 @@ def test_an_unreadable_store_is_an_error(store: Store) -> None:
 
 
 def test_a_pod_that_does_not_answer_is_an_error(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(oobe.onboarding, "agent_shell", lambda _script, _timeout: "")
+    monkeypatch.setattr(oobe, "agent_shell", lambda _script, _timeout: "")
     assert _verify().status == "error"

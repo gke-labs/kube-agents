@@ -25,6 +25,7 @@ Its own module rather than a section of ``verifiers.py``, registered through the
 """
 
 import json
+import os
 import shlex
 from datetime import datetime
 from typing import Any, Callable, Literal
@@ -41,6 +42,10 @@ FIRST_RUN_AUDITS = ("compliance-audit", "obtainability-audit", "fleet-wide-cost-
 STATE_FILE = f"{DATA_ROOT}/.bench-oobe.json"
 PLATFORM_EXECUTIONS_DB = f"{DATA_ROOT}/profiles/platform/cron/executions.db"
 STARTS_READ = "__OOBE_STARTS_READ__"
+# The gateway Deployment, as the stack names it (variables.tf: agent_deployment). Exec goes
+# there rather than through AGENT_SERVICE_NAME, which can name a tunnel in front of the
+# gateway that has none of its containers.
+DEFAULT_AGENT_DEPLOYMENT = "platform-agent-gateway"
 
 # Prints the arm time and each audit's newest run claimed at or after it. A missing
 # state file, a sqlite failure or a timestamp that does not parse is printed as an
@@ -73,6 +78,13 @@ if out["applied_at"] and not out["error"]:
         out["error"] = "%s: %s" % (db, exc)
 print(sentinel + json.dumps(out))
 """
+
+
+def agent_shell(script: str, timeout: float) -> str:
+    """Run ``script`` in the gateway's agent container. Best effort: any failure returns ``""``."""
+    deployment = os.environ.get("AGENT_DEPLOYMENT", DEFAULT_AGENT_DEPLOYMENT)
+    container = os.environ.get("AGENT_CONTAINER", onboarding.DEFAULT_AGENT_CONTAINER)
+    return onboarding._kubectl_exec(f"deployment/{deployment}", container, script, timeout)
 
 
 def starts_command() -> str:
@@ -111,7 +123,7 @@ class OobeAuditsStartedVerifier(_OnboardingPollVerifier):
     type: Literal["oobe_audits_started"]
 
     def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
-        read = read_starts(onboarding.agent_shell, read_timeout)
+        read = read_starts(agent_shell, read_timeout)
         if read is None:
             return "error", "the agent pod's cron store could not be read (kubectl exec failed or the command did not run)", None
         if read.get("error"):
