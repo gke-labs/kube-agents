@@ -579,8 +579,12 @@ coverage-check: ## Fail if total Python coverage is below COVERAGE_FLOOR. Run `m
 # shape of k8s-operator/Makefile's envtest-use macro, with a fixed delay in
 # place of its doubling one, and checks its tunables before reading them for
 # the reason given there: an empty override would otherwise defeat the
-# ceiling and the loop would retry forever. BENCH_PIP exists so a test can
-# point the recipe at a stub and count invocations offline.
+# ceiling and the loop would retry forever. The check is for a run of digits
+# rather than `test`'s integer grammar, which admits a sign or trailing
+# whitespace ("5 ", "-0") that `sleep` rejects; the rejected sleep would then
+# be a message on stderr and no pause, and every attempt would land in the
+# same bad second. BENCH_PIP exists so a test can point the recipe at a stub
+# and count invocations offline.
 BENCH_DEPS_INSTALL_ATTEMPTS ?= 3
 BENCH_DEPS_RETRY_DELAY_SECONDS ?= 5
 BENCH_PIP ?= python3 -m pip
@@ -588,8 +592,11 @@ BENCH_PIP ?= python3 -m pip
 test-bench-deps: ## Install what `make test-bench` needs: bench/ editable plus pytest and pyyaml. Resolves devops-bench from the git SHA pinned in bench/pyproject.toml, so the first run needs network; the install is retried up to BENCH_DEPS_INSTALL_ATTEMPTS times.
 	@attempts="$(BENCH_DEPS_INSTALL_ATTEMPTS)"; \
 	delay="$(BENCH_DEPS_RETRY_DELAY_SECONDS)"; \
-	if ! [ "$$attempts" -ge 1 ] 2>/dev/null || ! [ "$$delay" -ge 0 ] 2>/dev/null; then \
-		echo "Error: BENCH_DEPS_INSTALL_ATTEMPTS must be a whole number of at least 1 and BENCH_DEPS_RETRY_DELAY_SECONDS one of at least 0; got '$$attempts' and '$$delay'." >&2; \
+	bad=0; \
+	case "$$attempts" in ''|*[!0-9]*) bad=1;; *) [ "$$attempts" -ge 1 ] || bad=1;; esac; \
+	case "$$delay" in ''|*[!0-9]*) bad=1;; esac; \
+	if [ "$$bad" -ne 0 ]; then \
+		echo "Error: BENCH_DEPS_INSTALL_ATTEMPTS must be a whole number of at least 1 and BENCH_DEPS_RETRY_DELAY_SECONDS one of at least 0, digits only; got '$$attempts' and '$$delay'." >&2; \
 		exit 1; \
 	fi; \
 	attempt=1; \

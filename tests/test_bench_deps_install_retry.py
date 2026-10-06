@@ -68,6 +68,16 @@ RETRY_NOTICE = "bench deps install attempt %d of %d failed; retrying"
 EXHAUSTED_ERROR = "failed after %d attempts"
 INVALID_TUNABLE_ERROR = "BENCH_DEPS_INSTALL_ATTEMPTS must be a whole number"
 
+#: Overrides that are not a run of digits: a trailing space, a sign, a unit
+#: suffix. `test`'s integer grammar accepts the first three (`[ "5 " -ge 0 ]`
+#: is true in dash and bash), so a guard written that way lets them through,
+#: announces the retry, and `sleep "5 "` or `sleep -0` then fails with a
+#: message and no pause: every attempt lands in the same bad second. The
+#: recipe has to refuse them before the first attempt, like the empty string.
+#: A leading space is not in the list because make strips it from a
+#: command-line assignment before the recipe sees it.
+MALFORMED_TUNABLES = ("5 ", "-0", "+5", "5s")
+
 #: Comfortably above the slowest case: two attempts with a one-second pause.
 MAKE_TIMEOUT_SECONDS = 60
 
@@ -198,6 +208,40 @@ class BenchDepsInstallRetryTest(unittest.TestCase):
         self.assertEqual(
             len(self._calls()), 0, "it must refuse before installing, not after an attempt"
         )
+
+    def test_a_delay_sleep_would_reject_is_refused_before_installing(self):
+        """A padded or signed delay is refused, not announced and then not slept.
+
+        `[ "5 " -ge 0 ]` is true in dash and bash, `sleep "5 "` is an error,
+        and a `sleep` followed by `;` fails without stopping the loop: the
+        next attempt starts at once. The guard checks the shape `sleep`
+        accepts, so the override is refused before the first attempt.
+        """
+        for delay in MALFORMED_TUNABLES:
+            with self.subTest(delay=delay):
+                self.calls.write_text("")
+                self._write_stub(ALWAYS_FAILING_STUB % self.calls)
+                result = self._run(attempts=2, delay=delay)
+                self.assertNotEqual(result.returncode, 0, "delay %r must fail the target" % delay)
+                self.assertIn(INVALID_TUNABLE_ERROR, result.stderr)
+                self.assertEqual(
+                    len(self._calls()), 0, "delay %r must be refused before any install" % delay
+                )
+
+    def test_a_padded_or_signed_ceiling_is_refused_before_installing(self):
+        """The same shape check applies to the attempt count."""
+        for attempts in MALFORMED_TUNABLES:
+            with self.subTest(attempts=attempts):
+                self.calls.write_text("")
+                self._write_stub(ALWAYS_FAILING_STUB % self.calls)
+                result = self._run(attempts=attempts)
+                self.assertNotEqual(
+                    result.returncode, 0, "attempts %r must fail the target" % attempts
+                )
+                self.assertIn(INVALID_TUNABLE_ERROR, result.stderr)
+                self.assertEqual(
+                    len(self._calls()), 0, "attempts %r must be refused before any install" % attempts
+                )
 
 
 class MakefileDefaultsTest(unittest.TestCase):
