@@ -130,7 +130,7 @@
 # it fifty-four (162) of sixty-eight (204), +3 more: the same shape on a
 # blocked card. Counted from the lists again (fifty-seven here, fourteen in
 # the presubmit file, seventy-one cases and 213 units),
-# chat-fanout-fleet-version-rows makes it fifty-eight (174) of seventy-two
+# chat-fanout-fleet-restarts-rows makes it fifty-eight (174) of seventy-two
 # (216), +3 more: one front-door turn and a four-card fan-out.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
@@ -647,5 +647,5 @@
 
 # A fleet question fanned out one card per cluster, each titled with the bare
 # cluster name the Slack plan row renders (agents/platform/SOUL.md, fan-out).
-# deployer: noop; reads the seeded fleet's version-laggard role.
-./tasks/chat-fanout-fleet-version-rows/task.yaml
+# deployer: noop; reads the seeded fleet's crashloop-workload role.
+./tasks/chat-fanout-fleet-restarts-rows/task.yaml

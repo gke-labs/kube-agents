@@ -158,7 +158,7 @@ ADDED_AFTER_THE_MOVE = [
     "chat-voice-retry-says-it-is-retried",  # the front door's reply to a crashed card
     "chat-voice-final-attempt-is-not-retried",  # the front door's reply to a card's last attempt
     "chat-voice-failure-leads-with-fact",  # the front door's reply to a blocked card
-    "chat-fanout-fleet-version-rows",  # a fleet question fanned out one titled card per cluster
+    "chat-fanout-fleet-restarts-rows",  # a fleet question fanned out one titled card per cluster
 ]
 
 # Admitted after the split, each by a pull request that cited the record

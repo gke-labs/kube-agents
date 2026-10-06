@@ -1,0 +1,103 @@
+# Registered in hack/eval/nightly-cases.txt. Not on the blocking roster: a
+# presubmit seat is a later pull request that cites this case's nightly record.
+#
+# Domain: chat and routing. A question about every cluster reaches the front
+# door, which acks it with the cluster count and files one card for platform;
+# platform fans it out one card per cluster (agents/chat/SOUL.md, the ack;
+# agents/platform/SOUL.md, "Multi-cluster work (fan-out)"). With the Slack
+# board view on, each per-cluster card shows as one row of the thread's plan,
+# its title then the first line of its result, and its completion posts
+# nothing else (deploy/docker/patches/kanban_progress_lines.py, the fold). So
+# the title is what the user reads as the row's name: a card titled
+# "Check restarts on seeded-a" renders a row that says so, where the plan
+# wants "seeded-a · payments-api restarting, OOMKilled".
+#
+# The objectives therefore grade the shape of the fan-out, not only that it
+# happened: the ack, then three kanban_create calls by the platform worker,
+# each titled with a bare seeded cluster name. An install may carry cluster
+# profiles beyond the seeded three, so the ack's count is not asserted and
+# more than three cards still pass. The answer is graded on what the fleet
+# plants (payments-api crashlooping on slot a), so a fan-out that reads
+# nothing still fails.
+#
+# The Slack rendering itself is not graded here: the harness talks to the API
+# server, not Slack. The patch tests cover the rows' wiring; this case holds
+# the agent to the inputs those rows are built from.
+#
+# Planted defect required: crashloop-workload, the payments-api Deployment in
+# seeded-debug on slot a, OOMKilled on every start. Isolation class: read-only.
+id: chat-fanout-fleet-restarts-rows
+name: A fleet question fans out one card per cluster, titled with its name
+prompt: >-
+  which clusters have pods restarting right now?
+expected_output: >-
+  The front door files one card for the platform specialist and acks with one
+  line, "checking all 3 clusters." with the count it holds. The platform
+  worker files one card per cluster, each titled with the bare cluster name
+  (seeded-a, seeded-b, seeded-c), and each card's result opens with a
+  one-line finding such as "payments-api restarting, OOMKilled". The answer
+  leads with what differs: seeded-a has payments-api in seeded-debug
+  restarting, and names the quiet clusters in a clause. Nothing is changed or
+  restarted.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: a fleet question routed and answered
+# from observed evidence.
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: jayantid
+
+# Named by ROLE, not cluster: bench/tf/fleet/fixtures.json;
+# docs/designs/bench-fleet-catalog.md is the rule.
+fixtures:
+  - crashloop-workload
+
+verification_spec:
+  # The final scope holds the delegating turn's closing message, which for a
+  # delegated ask is the ack. Any count: see the header.
+  - name: the-ack-names-the-fleet-check
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      any_of_patterns: ["checking all \\d+ clusters"]
+  # scope: workers with agent: platform reads the platform worker's own calls,
+  # not the front door's one card. The title pattern is the bare name the
+  # plan row renders; "Check seeded-a" or a card per namespace does not count.
+  - name: one-card-per-cluster-titled-with-its-name
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      scope: workers
+      agent: platform
+      arguments:
+        title: "seeded-[abc]"
+      minimum_calls: 3
+      require_success: true
+  # "seeded-a" is slot a under the fleet prefix's default, the contract the
+  # crashloop cases carry.
+  - name: the-answer-names-the-restarting-workload
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["seeded-a", "payments-api"]
+      any_of_phrases: ["restart", "crashloop", "oomkilled"]
+  # The front door holds no infrastructure tools and never works a card
+  # itself. No require_success: an attempted worker-verb call is the
+  # violation, successful or not.
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]
