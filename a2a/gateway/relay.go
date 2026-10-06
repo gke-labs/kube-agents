@@ -165,7 +165,7 @@ func (g *Gateway) applyEvent(ctx context.Context, rec *SessionRecord, item relay
 			g.log.Error("relay: malformed artifact-update", "taskId", env.TaskID, "err", err)
 			return
 		}
-		g.applyArtifact(rec, rs, env.TaskID, a, render)
+		g.applyArtifact(ctx, rec, rs, item.subject, env.TaskID, a, render)
 	}
 }
 
@@ -198,7 +198,7 @@ func (g *Gateway) applyStatus(ctx context.Context, rec *SessionRecord, rs *relay
 	}
 }
 
-func (g *Gateway) applyArtifact(rec *SessionRecord, rs *relayState, taskID string, a lib.ArtifactUpdate, render bool) {
+func (g *Gateway) applyArtifact(ctx context.Context, rec *SessionRecord, rs *relayState, subject, taskID string, a lib.ArtifactUpdate, render bool) {
 	switch a.Artifact.Name {
 	case lib.ArtifactProgress:
 		// The rolling progress line: one edited chat message as progress
@@ -215,6 +215,9 @@ func (g *Gateway) applyArtifact(rec *SessionRecord, rs *relayState, taskID strin
 		} else {
 			rs.result = append([]lib.Part(nil), a.Artifact.Parts...)
 		}
+	case lib.ArtifactDelegate:
+		// A request to the gateway, never rendered to chat.
+		g.handleDelegateRequest(ctx, rec, subject, taskID, a.Artifact.Parts)
 	case lib.ArtifactThinking, lib.ArtifactActivity:
 		// Debug/audit views only; never rendered to chat.
 	}
@@ -298,7 +301,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			if g.cfg.DisplayMode == displayModeDefault {
 				progress = ""
 			}
-			g.editLine(rec.Key, active.StatusMsgID, terminalLine(s.Status.State, progress))
+			g.editLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(s.Status.State, progress), active.LineNote))
 		}
 		rec.ActiveTask = nil
 		// An executor's end of a live task is activity. The idle TTL that
@@ -316,6 +319,14 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			now := time.Now().UTC()
 			rec.LastActivity = now
 			rec.LastTaskActivity = now
+		}
+	} else if active != nil && source == TerminalFromExecutor {
+		// A session turn that delegated ends after its child became the
+		// active task. Its answer ("delegated to platform") is task activity
+		// for the session-thread rule all the same; LastActivity stays the
+		// active task's business.
+		if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.ParentTaskID == taskID {
+			rec.LastTaskActivity = time.Now().UTC()
 		}
 	}
 	// Retire the routing state. A post-final straggler then finds no route
@@ -368,7 +379,7 @@ func (g *Gateway) updateRollingLine(rec *SessionRecord, taskID string, rs *relay
 	if g.cfg.DisplayMode == displayModeDefault {
 		progress = ""
 	}
-	line := statusLine(rs.state, progress)
+	line := withLineNote(statusLine(rs.state, progress), active.LineNote)
 	if line == rs.lastLine {
 		return
 	}
@@ -388,6 +399,14 @@ func (g *Gateway) editLine(conversation, messageID, line string) bool {
 		return false
 	}
 	return true
+}
+
+// withLineNote suffixes a rolling line with the task's note, if it has one.
+func withLineNote(line, note string) string {
+	if note == "" {
+		return line
+	}
+	return line + " " + note
 }
 
 func statusLine(state lib.TaskState, progress string) string {

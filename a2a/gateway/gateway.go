@@ -1459,6 +1459,9 @@ type taskStart struct {
 	Role         string
 	ParentTaskID string
 	Depth        int
+	// LineNote suffixes the turn's rolling line for as long as it renders;
+	// a child says it was delegated. Empty for a human turn.
+	LineNote string
 }
 
 // startTask opens a turn for a human message.
@@ -1545,7 +1548,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 
 	// Placeholder first, so the rolling line exists before the first event
 	// can arrive (the demo posts one while the pod cold-starts; same idea).
-	statusMsgID, err := g.adapter.Post(rec.Key, "⏳ submitted…")
+	statusMsgID, err := g.adapter.Post(rec.Key, withLineNote("⏳ submitted…", ts.LineNote))
 	if err != nil {
 		g.log.Error("placeholder post failed", "conversation", rec.Key, "err", err)
 	}
@@ -1554,7 +1557,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// executor's submitted event must never race the mapping, because the
 	// relay acks what it cannot route and the durable won't redeliver it.
 	rec.ActiveTask = &ActiveTask{TaskID: taskID, CorrelationID: correlationID, StatusMsgID: statusMsgID,
-		Ask: truncateRunes(ts.Text, askCap), SubmittedAt: time.Now(), Capability: capRef}
+		Ask: truncateRunes(ts.Text, askCap), SubmittedAt: time.Now(), Capability: capRef, LineNote: ts.LineNote}
 	requester := ts.Requester
 	rec.Tasks = append(rec.Tasks, TaskRef{
 		ID: taskID, Addressee: rec.Addressee, CorrelationID: correlationID, Capability: capRef,

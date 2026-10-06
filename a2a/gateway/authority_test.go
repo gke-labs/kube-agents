@@ -38,6 +38,7 @@ func TestAttributionRoundTripsWithoutGrants(t *testing.T) {
 	a := Authority{
 		Requester: AuthorityRequester{Principal: "h1", Backend: "slack", Subject: "h2", VerifiedBy: "principal-map"},
 		Audience:  AuthorityAudience{Conversation: "h3", Kind: "group", Roster: []string{"h1"}, RosterComplete: true},
+		Via:       &AuthorityVia{TaskID: "task-parent", Session: "chat-otter-0001"},
 	}
 	raw := a.Attribution()
 	var m map[string]json.RawMessage
@@ -51,7 +52,16 @@ func TestAttributionRoundTripsWithoutGrants(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if back.Requester != a.Requester || back.Audience.Conversation != "h3" || len(back.Audience.Roster) != 1 {
+	if back.Requester != a.Requester || back.Audience.Conversation != "h3" || back.Audience.Kind != "group" {
 		t.Fatalf("round trip lost fields: %+v", back)
+	}
+	if len(back.Audience.Roster) != 1 || back.Audience.Roster[0] != "h1" || !back.Audience.RosterComplete {
+		t.Fatalf("round trip lost the roster: %+v", back.Audience)
+	}
+	if back.Via == nil || *back.Via != *a.Via {
+		t.Fatalf("round trip lost via: %+v", back.Via)
+	}
+	if back.Grants != nil {
+		t.Fatalf("round trip carries grants: %s", back.Grants)
 	}
 }

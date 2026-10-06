@@ -51,6 +51,9 @@ type ActiveTask struct {
 	// retarget). A detached task no longer serializes the session; its events,
 	// if they ever arrive, still relay.
 	Detached bool `json:"detached,omitempty"`
+	// LineNote suffixes every render of the rolling line (taskStart.LineNote);
+	// on the record so a gateway restart keeps rendering it.
+	LineNote string `json:"lineNote,omitempty"`
 }
 
 // SessionRecord is one conversation's durable state in the session-state KV
