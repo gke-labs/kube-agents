@@ -5,8 +5,8 @@ findings queue that later publishers read, and the short ranked report the user 
 `/opt/data/INVENTORY.raw.md`, registers every finding through
 `/opt/data/scripts/inventory_findings.py`, writes `/opt/data/INVENTORY.md`.
 
-**You do not decide what the findings are, and you do not make the registration call.** The sweep
-wrote a machine-readable block into the raw file; `inventory_findings.py extract` turns it into a
+**You do not decide what the findings are, and you do not make the registration call.** The
+onboarding hand-off wrote a machine-readable block into the raw file; `inventory_findings.py extract` turns it into a
 numbered list, `register` refuses to send anything until every number on that list carries a score,
 and `ranked` reads the order back. Your job between those commands is judgement — scoring, and
 choosing what the report shows — and nothing else.
@@ -23,13 +23,14 @@ reach the report is deferred rather than discarded.
 
 1. If `/opt/data/INVENTORY.md` already exists, the report has already been written. Return strictly
    `[SILENT]` immediately and do nothing.
-2. If `/opt/data/INVENTORY.raw.md` is absent **or empty**, the sweep has not finished or has failed.
+2. If `/opt/data/INVENTORY.raw.md` is absent **or empty**, the hand-off that writes it has not run or
+   has failed.
    Do **not** run discovery yourself, do **not** go looking for the findings elsewhere, do **not**
    register anything, and do **not** write a report. Block the card with `kanban_block` saying
    whether the file was missing or empty, and stop.
 
-   An empty findings file is not the same as a clean cluster. A clean cluster still produces a
-   header and a `scanned=…` summary; zero bytes means the sweep did not write anything, and a report
+   An empty findings file is not the same as a clean cluster. A clean fleet still produces the
+   hand-off's tables and an empty findings block; zero bytes means nothing wrote the file, and a report
    generated from it would be invented. This has been observed: given a zero-byte file, this stage
    made 51 tool calls hunting for the findings and then wrote a 554-byte report describing a cluster
    it had never read.
@@ -66,10 +67,13 @@ The raw file's format varies by deployment — it may be prose and Markdown tabl
 line-oriented `key=value` findings with a `severity=` field and a trailing
 `scanned=… findings=… elapsed=…` summary. Treat either as a list of findings.
 
-**The severity the file states is evidence, not the answer.** A block line's `severity_hint` counts,
-and so does the prose plan's own grouping: `Priority 1 / 2 / 3` headings, or sections named Critical
-/ High / Medium / Low. That is the sweep's judgement made while it had the whole cluster in view, and
-it is the best evidence you have for the likelihood and blast-radius measures in Step 3. Read it,
+**The severity the file states is evidence, not the answer.** A block line's `severity_hint` counts:
+it is the Cluster Agent's judgement made while it had the whole cluster in view, and the best
+evidence you have for the likelihood and blast-radius measures in Step 3. The onboarding raw file's
+`Priority 1 / 2 / 3` headings group findings by area (security, reliability, observability), not by
+severity; a file from another source may use sections named Critical / High / Medium / Low, which
+do carry its judgement. An observability finding that the raw file's agent-telemetry line contradicts
+is weaker evidence than it reads: the Cluster Agent could not see the PlatformAgent's collector. Read it,
 then classify against the anchors. Do not carry the word through unchanged — the queue orders
 findings from several sources on one scale, and a sweep's `Priority 1`, an audit stream's `critical`
 and a watcher event carrying no severity at all are three bars set by three authors.
@@ -335,8 +339,9 @@ Three of the checks the sweep emits have no audit stream behind them yet: `probe
 `readonly-root-fs`, and `no-resourcequota`. Set `remediation.kind` to `manual` for those even though
 each is a YAML edit — there is no stream to route a pull request through until they get one.
 
-The vocabulary the slugs come from is the sweep's to choose from; it lives in
-[`inventory.md`](inventory.md) Step 4 beside the block that carries them.
+The vocabulary the slugs come from is the Cluster Agents' to choose from; it lives in
+[`cluster_inventory_audit_sop.md`](cluster_inventory_audit_sop.md) Step 5 beside the `findings`
+shape that carries them.
 
 ### If the script fails
 

@@ -147,6 +147,33 @@ variable "gitops_restore_default_branch" {
   default     = "main"
 }
 
+# The other way to give the agent its PR base (gke-labs/kube-agents#1970):
+# set it on the install. When true, run-branch.sh fast-forwards the
+# repository's default branch onto the run branch's starting commit (so the
+# default carries the same task directory and differs only in being the
+# default), and scripts/agent-base-branch.sh sets the baseBranch of the
+# PlatformAgent's spec.integration.repositories[] entry with role gitops for
+# gitops_repo to the run branch after the seed, waits for the credential broker
+# to roll onto it, and removes it on destroy (and on a failed pin) when it
+# still names the run branch; a baseBranch the install already sets there is
+# refused, never overwritten, and on a CRD that declares the field a
+# PlatformAgent without that entry (one on the deprecated github alias) is
+# refused. Needs agent_host_context, a task without staged history (so not
+# b-0011; main.tf refuses one at plan time), a per-run repository whose
+# default branch head is gitops_broken_base_sha and that commit its root (run-branch.sh
+# refuses to move the default from a base with parents), and an install whose
+# accepted GitOps repository is gitops_repo; excludes
+# gitops_switch_default_branch. On an install whose CRD has no
+# spec.integration.repositories[].baseBranch (one from before the lists form
+# included, whose PlatformAgent stays on the alias) the API server would drop
+# the field, so the script writes nothing and says so, which is the case's
+# red, not a setup failure. One run at a time per install.
+variable "gitops_pin_agent_base_branch" {
+  type        = bool
+  description = "Set the baseBranch of the PlatformAgent's GitOps repository entry (spec.integration.repositories[]) to the run branch for the run, and seed the default branch with the same starting commit."
+  default     = false
+}
+
 # Onboard the per-run cluster with the platform agent before the agent's turn.
 # The platform agent delegates single-cluster work to a Cluster Agent profile
 # that must already be scaffolded (kubeconfig pin + USER.md identity). The

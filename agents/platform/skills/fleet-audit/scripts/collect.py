@@ -11,10 +11,13 @@ twenty-three-check roster (§3.1–§3.23 of `governance/obtainability_audit_sop
 `compliance-audit`'s sixteen-check roster (§2.1–§2.16 of
 `governance/compliance_audit_sop.md`), and `ai-security-audit`'s six-check
 roster (§3.1–§3.6 of `governance/ai_security_audit_sop.md`). Every check the
-three SOPs define is mechanical — none needed a `needs_triage` judgment call,
-including ai-security's §3.4, whose severity forks on whether the same
-container also trips §3.2, a fact both checks compute from the same dump — so
-nothing was left on the SOP side to skip. Other streams have their own
+three SOPs define is mechanical — none needed a `needs_triage` judgment call
+to *find*, including ai-security's §3.4, whose severity forks on whether the
+same container also trips §3.2, a fact both checks compute from the same dump —
+so nothing was left on the SOP side to skip. Four checks' *fixes* do need a
+reader -- `netpol-missing`'s remedy is a default-deny NetworkPolicy, for one --
+so their candidates carry a marker that keeps the automatic sweep from
+opening them (`TRIAGE_BY_SLUG`). Other streams have their own
 collectors (`fleet_drift.py`, `patch_readiness.py`) or none. The three streams
 collect in different shapes: obtainability answers every check from one
 workload dump plus the reads its declaration fields need; compliance issues
@@ -48,8 +51,8 @@ What this file does for the checks it covers:
      and every candidate finding.
 
 The agent's job on a covered check shrinks to: run this script, read the
-manifest, and — because every check converted so far is fully mechanical,
-needing no `needs_triage` judgment — copy each candidate into `findings.json`
+manifest, and — because every check converted so far is fully mechanical —
+copy each candidate into `findings.json`
 with the recommendation prose the validator requires. Nothing here writes to
 a cluster; every subprocess this module runs is `gcloud`/`kubectl` read
 verbs, in the same register `command_policy.py` already allows an agent's
@@ -71,6 +74,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path, PurePosixPath
@@ -104,6 +108,34 @@ MAX_WORKERS = 8
 # "Config Connector is not installed on this cluster" about the one cluster in
 # the fleet that runs Config Connector, on the strength of its own timeout.
 TIMEOUT_RC = 124
+
+# A judgement this collector hands the sweep (`audit_report.py`'s
+# `NO_SWEEP_TRIAGE`, which carries the same string). A `netpol-missing` fix
+# writes a default-deny NetworkPolicy, and a namespace that has been serving
+# traffic with no policy at all can lose callers nobody listed the moment it
+# lands. The finding is still mechanical; whether to cut that traffic off is
+# not, so the sweep withholds it and `/remediate <id>` opens it by name.
+NETPOL_MISSING_SLUG = "netpol-missing"
+NETPOL_DEFAULT_DENY_TRIAGE = "default-deny"
+# The other checks whose fix a reader has to judge, for the same reason: the
+# finding is mechanical and the remedy can break what the check never read.
+# `default-sa-automount`'s fix turns the token off for every pod on the
+# namespace's default ServiceAccount, and the check cannot see which of them
+# call the API server. `service-selects-nothing`'s fix rewrites the selector
+# or deletes the Service, a choice the SOP calls a judgement. And
+# `spread-not-achieved`'s fix is a `DoNotSchedule` spread, which leaves a
+# replica Pending when the pool shrinks. None is on `MAJOR_SWEEP_CHECKS`, so a
+# `major` one waits regardless; the marker is what holds a `critical` one (a
+# §3.16 Service behind a load balancer) and what names the reason in the ledger.
+SA_TOKEN_TRIAGE = "namespace-token"
+SERVICE_SELECTOR_TRIAGE = "service-selector"
+HARD_SPREAD_TRIAGE = "hard-spread"
+TRIAGE_BY_SLUG = {
+    NETPOL_MISSING_SLUG: NETPOL_DEFAULT_DENY_TRIAGE,
+    "default-sa-automount": SA_TOKEN_TRIAGE,
+    "service-selects-nothing": SERVICE_SELECTOR_TRIAGE,
+    "spread-not-achieved": HARD_SPREAD_TRIAGE,
+}
 
 # The manifest contract's outcomes, and the target names a sweep of more than
 # one project needs (§2 of `docs/designs/fleet-audit-collector-manifest.md`).
@@ -995,6 +1027,37 @@ def limitranges_by_namespace(dump: dict) -> dict[str, list[dict]]:
     return _by_namespace(dump, "LimitRange")
 
 
+# The controllers a disruption budget can count, through their scale subresource.
+SCALABLE_WORKLOAD_KINDS = ("Deployment", "StatefulSet")
+
+
+def pod_templates_by_namespace(dump: dict) -> dict[str, list[dict]]:
+    """Every pod template the dump holds, by namespace: `{kind, name, labels}`.
+
+    Unfiltered, unlike `normalize_workloads`: the question it answers is which
+    pods a selector would reach, and a system or opted-out workload's pods are
+    reached all the same. A CronJob's template is its Job template's, and a Job
+    a CronJob owns is left to that CronJob. Bare pods are not in this dump.
+    """
+    out: dict[str, list[dict]] = {}
+    for item in dump.get("items", []) or []:
+        kind = item.get("kind")
+        meta = item.get("metadata") or {}
+        spec = item.get("spec") or {}
+        if kind == "CronJob":
+            spec = (spec.get("jobTemplate") or {}).get("spec") or {}
+        elif kind == "Job":
+            if any(ref.get("kind") == "CronJob" for ref in meta.get("ownerReferences") or []):
+                continue
+        elif kind not in WORKLOAD_KINDS:
+            continue
+        labels = ((spec.get("template") or {}).get("metadata") or {}).get("labels") or {}
+        out.setdefault(meta.get("namespace", ""), []).append(
+            {"kind": kind, "name": meta.get("name", ""), "labels": labels}
+        )
+    return out
+
+
 def pdbs_by_namespace(dump: dict) -> dict[str, list[dict]]:
     return _by_namespace(dump, "PodDisruptionBudget")
 
@@ -1359,6 +1422,7 @@ def build_context(dump: dict, workloads: list[dict]) -> dict:
         "claims": claims_by_key(dump),
         "limitranges": limitranges_by_namespace(dump),
         "pdbs": pdbs_by_namespace(dump),
+        "pod_templates": pod_templates_by_namespace(dump),
         "hpas": hpas_by_namespace(dump),
         "services": services_by_namespace(dump),
         "cronjobs": cronjobs_with_jobs(dump),
@@ -1681,10 +1745,39 @@ def check_no_pdb(workload: dict, context: dict) -> dict | None:
         selector = (pdb.get("spec") or {}).get("selector")
         if selector is not None and selector_matches(selector, workload["pod_labels"]):
             return None
-    return {
+    hit = {
         "object": f"{workload['kind']}/{workload['name']}",
         "excerpt": f"replicas={replicas}, no PodDisruptionBudget matches this workload's pod labels",
+        # The names a new budget must not take in this namespace.
+        "namespace_pdbs": sorted(
+            str((pdb.get("metadata") or {}).get("name") or "") for pdb in context["pdbs"].get(workload["ns"], [])
+        ),
     }
+    # The fix's selector is this one verbatim (SOP §3.3), so `finish` can write
+    # the PodDisruptionBudget when the worker did not -- but only where it
+    # reaches no other controller's pods: a `maxUnavailable` budget over pods
+    # with no scale subresource behind them permits no evictions at all.
+    selector = workload["spec"].get("selector")
+    if isinstance(selector, dict):
+        shared = sorted(
+            f"{template['kind']}/{template['name']}"
+            for template in context.get("pod_templates", {}).get(workload["ns"], [])
+            if (template["kind"], template["name"]) != (workload["kind"], workload["name"])
+            and selector_matches(selector, template["labels"])
+        )
+        unscalable = [name for name in shared if name.partition("/")[0] not in SCALABLE_WORKLOAD_KINDS]
+        if unscalable:
+            # Said on the candidate, so `finish` does not then ask the worker
+            # for a budget SOP §3.4 says must not exist.
+            hit["pod_selector_withheld"] = (
+                f"the workload's selector also reaches {', '.join(unscalable)}'s pods, which no "
+                "scale subresource counts, so a budget over them permits no evictions"
+            )
+        elif not shared:
+            # Shared only with another scalable workload, the budget is valid
+            # but spans both: the worker decides, so nothing is attached.
+            hit["pod_selector"] = selector
+    return hit
 
 
 def _hpa_targeting(workload: dict, context: dict) -> dict | None:
@@ -8372,10 +8465,16 @@ def collect_cluster(
             "severity": severity,
             "excerpt": excerpt,
             "impact": impact,
-            "needs_triage": None,
+            "needs_triage": TRIAGE_BY_SLUG.get(spec.slug),
         }
         if arm_specific:
             emitted["impact_authoritative"] = True
+        if isinstance(hit.get("pod_selector"), dict):
+            emitted["pod_selector"] = hit["pod_selector"]
+        if isinstance(hit.get("namespace_pdbs"), list):
+            emitted["namespace_pdbs"] = hit["namespace_pdbs"]
+        if hit.get("pod_selector_withheld"):
+            emitted["pod_selector_withheld"] = hit["pod_selector_withheld"]
         # Where the GitOps repo declares this object, when it does. Absent
         # means unannotated, never "no declaration exists": the index is empty
         # without `--workspace` or when content mode could not copy the whole
@@ -9326,6 +9425,40 @@ def indexed_workspace(workspace: Path | None) -> Iterator[Path | None]:
         yield Path(mirror) if broker_mirror(repo, Path(mirror)) else None
 
 
+# The suffix of the temporary file `--out` writes beside its target before the
+# rename, so a reader of the directory can tell a half-written manifest apart.
+MANIFEST_TEMP_SUFFIX = ".partial"
+# What `open(..., "w")` would create before the umask.
+MANIFEST_FILE_MODE = 0o666
+
+
+def write_manifest_atomically(path: Path, text: str) -> None:
+    """Write `text` to `path` so a reader sees the whole manifest or none of it.
+
+    A temporary file in the same directory, flushed to disk, then renamed over
+    `path`: a collector killed part-way -- a terminal timeout, a second run
+    started beside the first -- leaves the previous file or no file, never two
+    documents spliced into one.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=MANIFEST_TEMP_SUFFIX)
+    # `mkstemp` makes the file 0600; the manifest is read by whoever runs
+    # `finish`, so it gets the mode a plain write would have.
+    umask = os.umask(0)
+    os.umask(umask)
+    os.chmod(temporary, MANIFEST_FILE_MODE & ~umask)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as out:
+            out.write(text)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("audit", choices=sorted(CHECK_TABLES))
@@ -9345,6 +9478,13 @@ def main(argv: list[str] | None = None) -> int:
             "repository declares its object; omit and no candidate is annotated"
         ),
     )
+    parser.add_argument(
+        "--out",
+        help=(
+            "write the manifest to this path, atomically, rather than to stdout; "
+            "stdout then carries only the one-line summary"
+        ),
+    )
     args = parser.parse_args(argv)
     workspace = Path(args.workspace) if args.workspace else None
     if workspace is not None and not workspace.is_dir():
@@ -9359,11 +9499,16 @@ def main(argv: list[str] | None = None) -> int:
         workspace = None
     with indexed_workspace(workspace) as indexed:
         manifest = collect_fleet(args.audit, args.project, workspace=indexed)
-    print(json.dumps(manifest, indent=2))
+    if args.out:
+        write_manifest_atomically(Path(args.out), json.dumps(manifest, indent=2) + "\n")
+        print(summary_line(manifest))
+    else:
+        print(json.dumps(manifest, indent=2))
     log(summary_line(manifest))
     if manifest.get("error"):
-        # The manifest is still written -- the shell has already redirected
-        # stdout -- but a run that found nothing to audit is a failed run.
+        # The manifest is still written -- to `--out`, or to a stdout the shell
+        # has already redirected -- but a run that found nothing to audit is a
+        # failed run.
         log(f"WARNING: {manifest['error']}")
         return 1
     return 0
