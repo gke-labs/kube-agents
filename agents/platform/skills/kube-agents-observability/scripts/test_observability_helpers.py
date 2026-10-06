@@ -177,7 +177,8 @@ class AnalyzeTraceLatencyTest(BrokerSessionCase):
             analyze_trace_latency.main, ["--project-id", PROJECT, "--hours", "2", "--limit", "2"], session=session
         )
         self.assertEqual(0, code, err)
-        self.assertEqual("", err)
+        # The span-less trace is skipped and named, and nothing else is on stderr.
+        self.assertEqual([f"Trace {TRACE_B} was read but carries no spans; nothing to rank."], err.splitlines())
         self.assert_every_call_is_a_relayed_read_the_policy_admits()
         listing = self.http.calls[0]
         self.assertEqual(RELAYED_TRACES, listing["url"])
@@ -295,7 +296,25 @@ class AnalyzeTraceLatencyTest(BrokerSessionCase):
         self.assertEqual(google_api.EXIT_READ_FAILED, code)
         self.assertIn(f"Error reading trace {TRACE_A}", err)
         self.assertIn(f"Error reading trace {TRACE_B}", err)
-        self.assertIn("none of the 2 traces listed could be read", err)
+        self.assertIn("none of the 2 traces listed could be read with spans", err)
+        self.assertNotIn("Trace ID:", out)
+        self.assertNotIn("No traces found", out)
+
+    def test_every_trace_read_without_spans_is_a_failed_read_not_a_silent_success(self):
+        # Every get answers 2xx with no spans (ingestion lag, half-indexed
+        # traces on a small --limit): nothing is printed, so counting the
+        # reads rather than the breakdowns would exit 0 with only the
+        # "Retrieving" line on stdout, the shape the guard exists to prevent.
+        session = self.session({
+            RELAYED_TRACES: TRACE_LIST,
+            f"{RELAYED_TRACES}/{TRACE_A}": {},
+            f"{RELAYED_TRACES}/{TRACE_B}": TRACE_B_DETAIL,
+        })
+        code, out, err = run(analyze_trace_latency.main, ["--project-id", PROJECT], session=session)
+        self.assertEqual(google_api.EXIT_READ_FAILED, code)
+        self.assertIn(f"Trace {TRACE_A} was read but carries no spans", err)
+        self.assertIn(f"Trace {TRACE_B} was read but carries no spans", err)
+        self.assertIn("none of the 2 traces listed could be read with spans", err)
         self.assertNotIn("Trace ID:", out)
         self.assertNotIn("No traces found", out)
 
