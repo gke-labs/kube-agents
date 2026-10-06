@@ -362,12 +362,38 @@ class SettleQuestionTest(unittest.TestCase):
         adapter = _Adapter()
         _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
         clicks = SimpleNamespace(
+            rewriting=lambda channel, ts: (channel, ts) == ("C0KAGE", POSTED_TS),
             answering=lambda channel, ts: (channel, ts) == ("C0KAGE", POSTED_TS),
             answered=lambda channel, ts: False,
         )
         with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_clicks=clicks), "gateway.slack_ux_clicks": clicks}):
             _run(runtime.settle_question(adapter, SUB))
+        # The in-flight click must not trigger a settle chat_update
         self.assertEqual(adapter.updates, [])
+        # The question is kept for retry rather than forgotten prematurely
+        self.assertIn(runtime._sub_key(SUB), runtime._questions)
+
+        # Once the click rewrite lands, a subsequent settle sees answered() and pops the question
+        clicks.rewriting = lambda channel, ts: False
+        clicks.answering = lambda channel, ts: (channel, ts) == ("C0KAGE", POSTED_TS)
+        clicks.answered = lambda channel, ts: (channel, ts) == ("C0KAGE", POSTED_TS)
+        with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_clicks=clicks), "gateway.slack_ux_clicks": clicks}):
+            _run(runtime.settle_question(adapter, SUB))
+        self.assertEqual(adapter.updates, [])
+        self.assertEqual(runtime._questions, {})
+
+    def test_a_failed_click_rewrite_is_settled_when_its_card_moves_on(self):
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        clicks = SimpleNamespace(
+            rewriting=lambda channel, ts: False,
+            answering=lambda channel, ts: False,
+            answered=lambda channel, ts: False,
+        )
+        with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_clicks=clicks), "gateway.slack_ux_clicks": clicks}):
+            _run(runtime.settle_question(adapter, SUB))
+        # The settle chat_update must run to strip buttons
+        self.assertEqual(len(adapter.updates), 1)
         self.assertEqual(runtime._questions, {})
 
     def test_the_click_record_is_read_from_the_clicks_module(self):

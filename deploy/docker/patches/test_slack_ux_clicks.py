@@ -646,22 +646,30 @@ class RuntimeTest(unittest.TestCase):
             self._answer(adapter, *_choice(1, "Leave it"))
         self.assertFalse(runtime.answered(CHANNEL, MESSAGE_TS), "a question the click did not rewrite reads settled")
 
-    def test_answering_reports_an_in_flight_click(self):
+    def test_answering_and_rewriting_report_an_in_flight_click(self):
         adapter = _Adapter()
         client = _Client(adapter.log)
         update = client.chat_update
         seen_in_flight = []
 
         async def held_update(**kwargs):
-            seen_in_flight.append(runtime.answering(CHANNEL, MESSAGE_TS))
+            seen_in_flight.append((
+                runtime.answering(CHANNEL, MESSAGE_TS),
+                runtime.rewriting(CHANNEL, MESSAGE_TS),
+                runtime.answered(CHANNEL, MESSAGE_TS),
+            ))
             await update(**kwargs)
 
         client.chat_update = held_update
         adapter._get_client = lambda chat_id, team_id=None: client
         self.assertFalse(runtime.answering(CHANNEL, MESSAGE_TS))
+        self.assertFalse(runtime.rewriting(CHANNEL, MESSAGE_TS))
+        self.assertFalse(runtime.answered(CHANNEL, MESSAGE_TS))
         self._answer(adapter, *_choice())
-        self.assertEqual(seen_in_flight, [True])
+        self.assertEqual(seen_in_flight, [(True, True, False)])
         self.assertTrue(runtime.answering(CHANNEL, MESSAGE_TS))
+        self.assertFalse(runtime.rewriting(CHANNEL, MESSAGE_TS))
+        self.assertTrue(runtime.answered(CHANNEL, MESSAGE_TS))
 
     def test_a_settle_arriving_inside_the_clicks_chat_update_leaves_the_message_alone(self):
         adapter = _Adapter()
@@ -675,9 +683,12 @@ class RuntimeTest(unittest.TestCase):
             3, CHANNEL, MESSAGE_TS, [{"type": "section", "text": {"type": "mrkdwn", "text": "Q"}}], "Q",
         )
 
+        in_flight_settle_ran = []
+
         async def held_update(**kwargs):
             # A card event reaches settle_question during chat_update round-trip
             await slack_ux_moments.settle_question(adapter, sub)
+            in_flight_settle_ran.append(len([c for c in adapter.log if c[0] == "chat_update"]))
             await update(**kwargs)
 
         client.chat_update = held_update
@@ -688,10 +699,55 @@ class RuntimeTest(unittest.TestCase):
         with mock.patch.dict(sys.modules, modules):
             self._answer(adapter, *_choice())
 
+        # During held_update, settle_question did not issue any chat_update
+        self.assertEqual(in_flight_settle_ran, [0])
         # Only the click's rewrite should have updated the message
         chat_updates = [call for call in adapter.log if call[0] == "chat_update"]
         self.assertEqual(len(chat_updates), 1)
         self.assertIn("Leave it", str(chat_updates[0][1]))
+
+        # A subsequent settle after the click landed sees answered() and pops the question
+        with mock.patch.dict(sys.modules, modules):
+            asyncio.run(slack_ux_moments.settle_question(adapter, sub))
+        self.assertEqual(slack_ux_moments._questions, {})
+
+    def test_a_failed_rewrite_is_still_settled_when_its_card_moves_on(self):
+        adapter = _Adapter()
+        # The click's chat_update will fail
+        fail_client = _Client(adapter.log, fail=("chat_update",))
+        ok_client = _Client(adapter.log)
+
+        client_holder = [fail_client]
+        adapter._get_client = lambda chat_id, team_id=None: client_holder[0]
+
+        import slack_ux_moments
+        sub = {"task_id": "t_e0c1", "platform": "slack", "chat_id": CHANNEL, "thread_id": THREAD}
+        slack_ux_moments._questions.clear()
+        slack_ux_moments._questions[slack_ux_moments._sub_key(sub)] = (
+            3, CHANNEL, MESSAGE_TS, [{"type": "section", "text": {"type": "mrkdwn", "text": "Q"}}], "Q",
+        )
+
+        gateway = SimpleNamespace(slack_ux_clicks=runtime, slack_ux_moments=slack_ux_moments)
+        modules = {"gateway": gateway, "gateway.slack_ux_clicks": runtime, "gateway.slack_ux_moments": slack_ux_moments}
+        with mock.patch.dict(sys.modules, modules):
+            with self.assertLogs(runtime.logger, level="WARNING"):
+                self._answer(adapter, *_choice())
+
+        # The click's chat_update failed, so answering and answered are False
+        self.assertFalse(runtime.answered(CHANNEL, MESSAGE_TS))
+        self.assertFalse(runtime.answering(CHANNEL, MESSAGE_TS))
+        self.assertFalse(runtime.rewriting(CHANNEL, MESSAGE_TS))
+        # But _answered has the key to deduplicate clicks
+        self.assertIn((CHANNEL, MESSAGE_TS, runtime.CHOICE_KIND), runtime._answered)
+
+        # Now the card moves on and settle_question runs with a functional client
+        client_holder[0] = ok_client
+        with mock.patch.dict(sys.modules, modules):
+            asyncio.run(slack_ux_moments.settle_question(adapter, sub))
+
+        # Settle must have issued chat_update to take the buttons off
+        settle_updates = [call for call in adapter.log if call[0] == "chat_update"]
+        self.assertEqual(len(settle_updates), 1)
         self.assertEqual(slack_ux_moments._questions, {})
 
     def test_two_clicks_at_once_run_one_turn(self):

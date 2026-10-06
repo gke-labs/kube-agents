@@ -229,6 +229,8 @@ MESSAGE_BLOCKS_MAX = 50
 
 #: ``(channel, ts, kind)`` a click answered.
 _answered: OrderedDict[tuple, None] = OrderedDict()
+#: The keys of ``_answered`` currently awaiting a ``chat.update`` rewrite.
+_rewriting: set[tuple] = set()
 #: The keys of ``_answered`` whose rewrite landed.
 _rewritten: OrderedDict[tuple, None] = OrderedDict()
 _warned_missing = False
@@ -277,8 +279,14 @@ def answered(channel_id: str, msg_ts: str) -> bool:
 
 
 def answering(channel_id: str, msg_ts: str) -> bool:
-    """Whether a choice click on the message is in flight or already answered."""
-    return (str(channel_id), str(msg_ts), CHOICE_KIND) in _answered
+    """Whether a choice click rewrite on the message is in flight or already completed."""
+    key = (str(channel_id), str(msg_ts), CHOICE_KIND)
+    return key in _rewriting or key in _rewritten
+
+
+def rewriting(channel_id: str, msg_ts: str) -> bool:
+    """Whether a choice click rewrite on the message is currently in flight."""
+    return (str(channel_id), str(msg_ts), CHOICE_KIND) in _rewriting
 
 
 def _answered_by(other: str) -> bool:
@@ -684,6 +692,7 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
     # Before the awaits: a card that moves on in between settles its question and forgets it.
     card = _question_card(channel_id, msg_ts)
     rewritten = False
+    _rewriting.add(key)
     try:
         await client.chat_update(
             channel=channel_id, ts=msg_ts,
@@ -700,6 +709,8 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
             "slack_ux_clicks: could not mark %s answered; its buttons stay but further clicks are dropped: %s",
             msg_ts, exc,
         )
+    finally:
+        _rewriting.discard(key)
     if not rewritten:
         try:
             await client.chat_postMessage(

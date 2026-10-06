@@ -239,17 +239,32 @@ def question_card(channel: str, ts: str) -> str | None:
 
 
 def _clicked(channel: str, ts: str) -> bool:
-    """Whether a click in this process already answered the message or is rewriting it."""
+    """Whether a click in this process already answered the message and landed its rewrite."""
     try:
         from gateway import slack_ux_clicks
     except ImportError:
         return False
     try:
-        answering = getattr(slack_ux_clicks, "answering", None)
-        if callable(answering):
-            return bool(answering(channel, ts))
         return bool(slack_ux_clicks.answered(channel, ts))
     except Exception:  # noqa: BLE001 — read as unanswered; the settle is cosmetic
+        return False
+
+
+def _rewriting(channel: str, ts: str) -> bool:
+    """Whether a choice click rewrite on the message is currently in flight in this process."""
+    try:
+        from gateway import slack_ux_clicks
+    except ImportError:
+        return False
+    try:
+        rewriting = getattr(slack_ux_clicks, "rewriting", None)
+        if callable(rewriting):
+            return bool(rewriting(channel, ts))
+        answering = getattr(slack_ux_clicks, "answering", None)
+        if callable(answering):
+            return bool(answering(channel, ts)) and not bool(slack_ux_clicks.answered(channel, ts))
+        return False
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -265,6 +280,8 @@ async def _settled(adapter: Any, sub: dict, entry: tuple) -> bool:
     _event_id, channel, ts, blocks, text = entry
     if not ts or _clicked(channel, ts):
         return True
+    if _rewriting(channel, ts):
+        return False
     try:
         client = adapter._get_client(channel, team_id=sub.get("team_id") or None)
         await client.chat_update(
