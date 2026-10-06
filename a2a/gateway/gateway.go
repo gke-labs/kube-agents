@@ -1135,6 +1135,23 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		state.ExecutorState = task.State
 		state.Final = task.Final
 		state.ReachedWorking = slices.Contains(task.StatusHistory, lib.StateWorking)
+		// A chain task's terminal is never the root's end, and the stored
+		// record can be a step behind the stream: the relay writes it once
+		// per batch, after the batch's events. So a read in between can find
+		// a child whose terminal is on the stream still active (its wake is
+		// being started), or the delegating turn still active with its
+		// delegate artifact and its own terminal on the stream before the
+		// record names the child it minted. Either is reported as the chain
+		// running, with nothing to adopt; the root's end reaches the caller
+		// from the relay. The second shape also holds open a turn whose
+		// delegation was refused, only until the relay writes the record
+		// that releases it.
+		_, ends := rec.observedAs(read)
+		chainTask := (read != taskID && !ends) ||
+			(state.Active && task.Artifact(lib.ArtifactDelegate) != nil)
+		if chainTask && task.Final {
+			state.ExecutorState, state.Final, state.ReachedWorking = lib.StateWorking, false, true
+		}
 		// The trace and the progress line as they stand, final or not: a
 		// caller watching a running task reads what it has called so far.
 		// Non-nil from here on even when empty, because "read and found
@@ -1146,7 +1163,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 			}
 		}
 		state.Progress = lastTextPart(artifactParts(task, lib.ArtifactProgress))
-		if task.Final {
+		if state.Final {
 			// The fold's terminal, with whose word it is: the events
 			// subject is the executor's, the supervisor subject the
 			// supervisor's. A caller grading an answer off this read takes

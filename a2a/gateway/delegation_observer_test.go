@@ -425,3 +425,76 @@ func TestTheA2ADoorShowsADelegatingTurnAsOneTask(t *testing.T) {
 		}
 	}
 }
+
+// TestTheProbeNeverReportsTheRootFinalFromAChainTask: the relay writes the
+// record once per batch, after the batch's events, so a read between a
+// chain event and that write sees a stored record one step behind the
+// stream. Two such windows, and in neither is the stream's terminal the
+// root's end: a child whose terminal is on the stream while the record still
+// shows it active (its wake is being started), and the delegating turn
+// itself, active with its delegate artifact and its "delegated to platform"
+// terminal on the stream before the record names the child it minted. The
+// probe reports the root running, with no result to adopt.
+func TestTheProbeNeverReportsTheRootFinalFromAChainTask(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		stale func(rec *SessionRecord, root, child string, parentActive, childActive ActiveTask)
+	}{
+		{"a completed child the record still holds", func(rec *SessionRecord, _, _ string, _, childActive ActiveTask) {
+			rec.ActiveTask = &childActive
+		}},
+		{"the delegating turn before the record names its child", func(rec *SessionRecord, root, child string, parentActive, _ ActiveTask) {
+			rec.ActiveTask = &parentActive
+			kept := rec.Tasks[:0]
+			for _, ref := range rec.Tasks {
+				if ref.ID == root {
+					ref.Children = nil
+				}
+				if ref.RootTaskID == root && ref.ID != root {
+					continue
+				}
+				kept = append(kept, ref)
+			}
+			rec.Tasks = kept
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, spawn, _ := startObservedRig(t, doorDelegation(t))
+			ctx := context.Background()
+			conv := "a2a:agent-1001/ctx-probe-stale"
+			exec, origin, _ := sessionTurnVia(t, r, spawn, conv, a2aBackend, "how is the fleet?")
+			before, _ := r.g.reg.Get(ctx, conv)
+			parentActive := *before.ActiveTask
+			if err := exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "report fleet health")); err != nil {
+				t.Fatal(err)
+			}
+			child := awaitSubmission(t, r, targetPlatform, 0)
+			var childActive ActiveTask
+			waitFor(t, "the child active on the record", func() bool {
+				rec, _ := r.g.reg.Get(ctx, conv)
+				if rec.ActiveTask == nil || rec.ActiveTask.TaskID != child.TaskID {
+					return false
+				}
+				childActive = *rec.ActiveTask
+				return true
+			})
+			completeTask(t, exec, "delegated to platform")
+			completeTask(t, r.execFor(t, child, targetPlatform), "fleet is green")
+			waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
+			waitFor(t, "the wake active on the record", func() bool {
+				rec, _ := r.g.reg.Get(ctx, conv)
+				return rec.ActiveTask != nil && rec.ActiveTask.TaskID != child.TaskID
+			})
+			putRecord(t, r, conv, func(rec *SessionRecord) {
+				tc.stale(rec, origin.TaskID, child.TaskID, parentActive, childActive)
+			})
+			st, err := r.g.probeConversation(ctx, conv, origin.TaskID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !st.Active || st.Final || st.Result != "" || st.Reason != "" || st.TerminalSource != "" || st.TaskID != origin.TaskID {
+				t.Fatalf("probe of the root = %+v, want it active and running with no result", st)
+			}
+		})
+	}
+}
