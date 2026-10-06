@@ -15,7 +15,8 @@ Three things are checked:
    ``adapter_for`` returns the notifier's own adapter; flag on, a finished
    card's answer posts once, in the card's thread, as its first sentence in
    bold and the rest folded as the Slack plugin's own ``block_kit`` renders
-   it, and a report that opens with a heading takes the upstream send.
+   it, a table included, and a report that opens with a heading takes the
+   upstream send.
 3. The adapter. ``SlackAdapter`` still has the members the runtime calls, each
    still accepting the call ``_post`` makes (:data:`CALL_SHAPES`), the ones it
    awaits still async, and still sets ``_bot_message_ts``; its module still
@@ -89,6 +90,8 @@ ANSWER = f"{HEADLINE} {REST}"
 REPORT = "## What's wrong\n\nCheckout is slow.\n\n## Why\n\nThe pool is full."
 #: A closing offer, which posts after the fold, unfolded.
 QUESTION = "Should I scale the pool to 6 nodes?"
+#: A fleet answer's table, which folds as ``block_kit`` renders it.
+TABLE = "| cluster | version |\n| --- | --- |\n| seeded-a | 1.33.4 |\n| seeded-b | 1.32.9 |"
 #: A report a reply can act on that opens on a bold sentence: it keeps the upstream post.
 OPTIONS_REPORT = (
     "**Checkout is down because the pool is exhausted.** It has 4 nodes.\n\n"
@@ -300,7 +303,9 @@ def _plugin_blocks(root: Path, markdown: str) -> list[dict]:
     return block_kit.sanitize_blocks(block_kit.render_blocks(markdown, mrkdwn_fn=_StubAdapter().format_message))
 
 
-async def _drive(module, expected_fold: list[dict], expected_question: list[dict]) -> None:
+async def _drive(
+    module, expected_fold: list[dict], expected_question: list[dict], expected_table: list[dict]
+) -> None:
     event = SimpleNamespace(kind="completed")
     task = SimpleNamespace(result=ANSWER)
     sub = {"chat_id": CHANNEL, "thread_id": THREAD_TS}
@@ -337,6 +342,13 @@ async def _drive(module, expected_fold: list[dict], expected_question: list[dict
             raise _fail(f"a closing question did not post after the fold as block_kit renders it: {adapter.log!r}")
         if blocks[1].get("child_blocks") != expected_fold:
             raise _fail("a closing question changed what was folded")
+        adapter = _StubAdapter()
+        await module.adapter_for(adapter, "slack", event, task, sub).send(
+            CHANNEL, f"{HEADLINE}\n\n{TABLE}", metadata=metadata
+        )
+        blocks = adapter.log[0][1]["blocks"] if adapter.log and adapter.log[0][0] == "chat_postMessage" else []
+        if len(blocks) != 2 or blocks[1].get("child_blocks") != expected_table:
+            raise _fail(f"a table did not fold as block_kit renders it: {adapter.log!r}")
         for what, report in (("opening with a heading", REPORT), ("with options to act on", OPTIONS_REPORT)):
             adapter = _StubAdapter()
             await module.adapter_for(adapter, "slack", event, task, sub).send(CHANNEL, report, metadata=metadata)
@@ -352,11 +364,13 @@ def main(root: Path = Path("/opt/hermes")) -> None:
     module = _load_runtime(root)
     # The runtime imports gateway.kanban_notifier when it decides.
     sys.path.insert(0, str(root))
-    asyncio.run(_drive(module, _plugin_blocks(root, REST), _plugin_blocks(root, QUESTION)))
+    asyncio.run(
+        _drive(module, _plugin_blocks(root, REST), _plugin_blocks(root, QUESTION), _plugin_blocks(root, TABLE))
+    )
     print(
         "slack_ux_answer verify: the notifier's deliver takes adapter_for()'s adapter inside the incident one; "
-        "off it is the notifier's own, on a finished answer posts its first sentence bold, the rest folded and a "
-        "closing question after the fold, and a report with options posts whole"
+        "off it is the notifier's own, on a finished answer posts its first sentence bold, the rest folded, a table "
+        "included, and a closing question after the fold, and a report with options posts whole"
     )
 
 

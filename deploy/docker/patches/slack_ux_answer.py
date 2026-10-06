@@ -30,7 +30,7 @@ a second line, or holds a link or a mention. So does one with nothing after
 that sentence, one whose first line ends in a colon (what it introduces is the
 answer), one longer than :data:`FOLD_TEXT_MAX`, a
 fold ``block_kit`` cannot render or that would hold a block outside
-:data:`FOLD_CHILD_TYPES` (a table or a divider), and an adapter not rendering
+:data:`FOLD_CHILD_TYPES` (a divider), and an adapter not rendering
 ``rich_blocks``, since upstream would then post text alone. A refused fold
 logs why; a failed post falls back to the upstream send. A closing question posts after
 the fold, unfolded, so an offer is never hidden. The folded post
@@ -75,9 +75,10 @@ OUTBOUND_LABEL = "outbound generic send to"
 #: As ``slack_ux_incident``'s: an answer longer than this keeps the upstream
 #: post, and the message ``text`` stays far inside Slack's 40,000 characters.
 FOLD_TEXT_MAX = 12000
-#: As ``slack_ux_incident``'s: the block types Slack has been seen to keep
-#: inside a collapsible ``container``.
-FOLD_CHILD_TYPES = frozenset({"header", "section", "rich_text"})
+#: The block types Slack has been seen to keep inside a collapsible
+#: ``container``: ``slack_ux_incident``'s, and ``table``, read back from
+#: ``conversations.history`` after a post, so a fleet answer's table folds.
+FOLD_CHILD_TYPES = frozenset({"header", "section", "rich_text", "table"})
 #: What a plain-text headline would lose: a markdown link, a url, a Slack mention or link.
 LOSES_CONTENT = re.compile(r"\]\(|https?://|<[@#!]", re.IGNORECASE)
 #: Holds a code span's place while the rest of the headline is made plain.

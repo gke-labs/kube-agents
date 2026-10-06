@@ -113,10 +113,13 @@ class _Adapter:
 
 
 def _render_blocks(markdown, mrkdwn_fn=None):
-    """Stands in for block_kit.render_blocks: one section per paragraph, a ``|`` paragraph a table."""
+    """Stands in for block_kit.render_blocks: one section per paragraph, a ``|`` paragraph a table,
+    a ``---`` one a divider."""
     fmt = mrkdwn_fn or (lambda s: s)
     return [
-        {"type": "table"} if p.startswith("|") else {"type": "section", "text": {"type": "mrkdwn", "text": fmt(p)}}
+        {"type": "table"} if p.startswith("|")
+        else {"type": "divider"} if p == "---"
+        else {"type": "section", "text": {"type": "mrkdwn", "text": fmt(p)}}
         for p in markdown.split("\n\n") if p
     ]
 
@@ -442,13 +445,25 @@ class SendTest(unittest.TestCase):
         self.assertEqual(adapter.log, [("send", CHANNEL, answer, METADATA)])
         self.assertIn("colon", logs.output[0])
 
-    def test_a_table_in_the_rest_takes_the_upstream_send(self):
+    def test_a_table_in_the_rest_folds_under_the_first_sentence(self):
         adapter = _Adapter()
-        answer = f"{HEADLINE}\n\n| node | cpu |\n| --- | --- |"
+        table = "| cluster | version |\n| --- | --- |\n| seeded-b | 1.32.9 |"
+        question = "Want me to open a PR for seeded-b?"
+        self.send(adapter, content=f"{HEADLINE}\n\n{table}\n\n{question}")
+        self.assertEqual([entry[0] for entry in adapter.log], ["chat_postMessage", "stop_typing"])
+        headline, fold, after = adapter.log[0][1]["blocks"]
+        self.assertEqual(headline["elements"][0]["elements"], [{"type": "text", "text": HEADLINE, "style": {"bold": True}}])
+        self.assertEqual(fold["type"], "container")
+        self.assertEqual(fold["child_blocks"], [{"type": "table"}])
+        self.assertEqual(after, _render_blocks(question, adapter.format_message)[0])
+
+    def test_a_divider_in_the_rest_takes_the_upstream_send(self):
+        adapter = _Adapter()
+        answer = f"{HEADLINE}\n\n{WHY}\n\n---\n\n{STEPS}"
         with self.assertLogs(runtime.logger) as logs:
             self.send(adapter, content=answer)
         self.assertEqual([entry[0] for entry in adapter.log], ["send"])
-        self.assertIn("table", logs.output[0])
+        self.assertIn("divider", logs.output[0])
 
     def test_a_report_with_options_takes_the_upstream_send_whatever_it_opens_on(self):
         adapter = _Adapter()
