@@ -193,7 +193,9 @@ express: a banned word whose negated uses are legitimate, a phrase that must sta
 boundary (`any_of_patterns` are the regex alternatives to `any_of_phrases`, one pool: at least one
 of either must match), and a required claim whose subject and verb an adverb or a tense can
 separate; `{cluster:<slot>}` in either list stands for the
-cluster the runner recorded for that slot, bare or as the last joined component of a longer id and
+cluster the runner recorded for that slot, bare or as the last `-` or `/`-joined component of a longer id (a
+kubeconfig context's `_` joins only under `fold_decoration: true`, which makes it a `-`; without the fold the
+underscore is deleted as emphasis and the id has no boundary before the name) and
 optionally followed by its recorded location, bounded on both sides by the expansion itself (so
 `unseeded-a` and `seeded-a-canary` are never slot a, whatever surrounds the placeholder), and
 `{cluster:any}` for every recorded slot, so a case names which cluster rather than what a cluster's

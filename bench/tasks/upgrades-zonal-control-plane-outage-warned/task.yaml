@@ -113,7 +113,8 @@ verification_spec:
   # or a parenthetical after it. Which name is not the case's to guess:
   # `{cluster:a}` in a pattern expands, at verify time, to the cluster the
   # runner recorded for slot a in its context file (`cluster.a=`), bare or
-  # as the last `-`, `_` or `/`-joined component of a longer id, followed by
+  # as the last `-` or `/`-joined component of a longer id (a kubeconfig
+  # context's `_` counts because the fold has made it a `-`), followed by
   # nothing or by `-<location>` as the runner recorded it; `{cluster:any}` is
   # every recorded slot. So `seeded-b-us-central1-a` is slot b where that is
   # the recorded location, `seeded-a-us-west1` is not slot a (the runner's

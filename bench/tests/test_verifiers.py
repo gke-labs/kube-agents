@@ -6621,6 +6621,20 @@ def test_a_cluster_placeholder_in_a_phrase_list_fails_at_spec_load(field):
     assert "cluster placeholder" in str(excinfo.value) and field in str(excinfo.value)
 
 
+@pytest.mark.parametrize("fold, status", [(True, "pass"), (False, "fail")])
+def test_a_kubeconfig_context_names_the_slot_only_under_the_fold(fold, status):
+    # Through verify(), on the text the verifier produces: `_normalize`
+    # deletes an underscore, so `gke_p_us-central1-a_seeded-a` has no
+    # boundary before the name unless the fold has made the `_` a `-` first.
+    v = parse_node({"type": "report_contains", "fold_decoration": fold, "any_of_patterns": ["(?m)^{cluster:a}: ok$"]})
+    _stash("gke_kube-agents-evals_us-central1-a_seeded-a: ok")
+    with tempfile.TemporaryDirectory(prefix="zonal-fleet-") as root:
+        _write_fleet_dir(Path(root), _zonal_case_fixtures())
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            res = v.verify(5.0)
+    assert res.status == status, res.reason
+
+
 def test_a_cluster_placeholder_in_tool_calleds_agent_selector_fails_at_spec_load():
     # The selector is a scalar regex matched as written against agent tags;
     # the placeholder is not expanded there, so it is refused up front.

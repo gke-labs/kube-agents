@@ -138,8 +138,9 @@ _REPORT_READ_ATTEMPTS = 3
 
 # `{cluster:<slot>}` in a `forbidden_patterns` or `any_of_patterns` entry
 # stands for the cluster the runner recorded for that slot, as a frame that
-# matches the name bare or as the last `-`, `_` or `/`-joined component of a
-# longer id (a project, a kubeconfig context, a resource path), followed by
+# matches the name bare or as the last `-` or `/`-joined component of a
+# longer id (a project, a resource path; a kubeconfig context's `_` joins
+# only under `fold_decoration: true`, see _NAME_JOINERS), followed by
 # nothing or by `-<location>` as recorded. `{cluster:any}` is every recorded
 # slot. The case then says WHICH cluster, not what a cluster's name looks
 # like, so `seeded-a-us-west1` is slot a only where the runner recorded it.
@@ -148,8 +149,12 @@ _CLUSTER_PLACEHOLDER = re.compile(r"\{cluster:([a-z0-9-]+)\}")
 # the author meant, so a near miss is refused rather than compiled literally.
 _CLUSTER_PLACEHOLDER_LOOSE = re.compile(r"\{\s*cluster\s*:", re.IGNORECASE)
 _CLUSTER_ANY = "any"
-_NAME_CHARS = "[a-z0-9/._-]"
-_NAME_JOINERS = "[-_/]"
+# No `_` in either: `_normalize` deletes every underscore as Markdown emphasis,
+# and under the fold `_INNER_UNDERSCORE` has already made an inner one a `-`,
+# so none reaches the frame. A kubeconfig context (`gke_<project>_<location>_
+# <name>`) therefore matches only with `fold_decoration: true`.
+_NAME_CHARS = "[a-z0-9/.-]"
+_NAME_JOINERS = "[-/]"
 # The frame bounds the name itself, so a pattern need not: nothing word-like
 # before it (`unseeded-a` is not `seeded-a`), and after it nothing word-like
 # and no `-` that would make it a longer name (`seeded-a-canary`,
@@ -503,7 +508,8 @@ class ReportContainsVerifier(BaseVerifier):
     @staticmethod
     def _cluster_frame(name: str, location: str) -> str:
         """The regex for one recorded cluster, as one group: its name, bare or
-        as the last `-`, `_` or `/`-joined component of a longer id, then
+        as the last `-` or `/`-joined component of a longer id (a `_` join
+        only under the fold, which has made it a `-` by now), then
         nothing or its recorded location, bounded on both sides by the frame
         itself (nothing word-like before, nothing word-like and no `-` after),
         so `unseeded-a`, `seeded-a-canary` and `seeded-a-us-west1` are not
