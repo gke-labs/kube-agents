@@ -633,7 +633,8 @@ async def silent_event(notification: Any, ev: Any) -> None:
     ``None``, before it skips the event. :func:`deliver` never sees these, so
     without this a card archived by hand would hold its row running, and the
     thread's Working…, and an unblocked card would stay waiting on you, with
-    its question's buttons still live, until its next note. Only
+    its question's buttons still live, until its next note, and its ask would
+    keep its ⏸️ (``gateway/slack_ux_reactions.py``). Only
     :data:`SILENT_PLAN_KINDS`, never one replayed or overtaken
     (:func:`_overtaken`), only with ``KAGE_SLACK_UX`` on for a Slack card,
     and never raises: it runs inside the send loop.
@@ -655,6 +656,8 @@ async def silent_event(notification: Any, ev: Any) -> None:
     if plan is not None:
         await _settle_plan_row(plan, adapter, sub, kind)
     await _settle_question(moments, adapter, sub, kind)
+    # An unblocked card no longer waits on the user, so its ask loses its pause.
+    await _settle_reaction(adapter, sub, kind, getattr(notification, "board_slug", None))
 
 
 def _explained_by_wake(quiet: Any, sub: dict, kind: str) -> bool:
