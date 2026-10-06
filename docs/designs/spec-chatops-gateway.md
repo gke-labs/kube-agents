@@ -287,9 +287,11 @@ ended - the deadline hit, a `stop` canceled it, or an earlier call this turn alr
 is refused there, inside the same turn, and never reaches the gateway.
 
 **The gateway acts on it only from the task it started**, addressed to the record's current
-incarnation and still that incarnation's active task; a straggler from a retired incarnation, an
-event after the terminal, or a part that fails to parse or is over the text cap is ignored and
-logged (`delegation.malformed`), never relayed. Only `platform` can be the addressee today.
+incarnation and still that incarnation's active task; a straggler from a retired incarnation, or an
+event after the active task has moved on, is ignored and logged under one rule (`delegation.stale`),
+never relayed - a different rule from a part that fails to parse, is blank, or is over the text cap,
+which is ignored and logged separately (`delegation.malformed`). Only `platform` can be the
+addressee today.
 Depth is bounded by `A2A_DELEGATION_DEPTH_MAX` (default 3; a child's depth is its parent's plus
 one, and a wake inherits its child's) - `FromEnv` refuses a configured value under 1 at boot
 rather than read it as "off", which is the worker's own `A2A_DELEGATE_TOOL` switch, a different
