@@ -792,16 +792,29 @@ class InteractionApiTest(unittest.TestCase):
                 SQLiteInteractionStore(path)
         self.assertEqual(modes[0], 0o600)
 
-    def test_sqlite_store_is_writable_under_a_umask_without_owner_write(self):
+    def test_sqlite_store_file_is_owner_writable_under_a_restrictive_umask(self):
+        # The umask filters os.open's mode, so a 0o277 umask would leave a
+        # 0o400 file that SQLite opens read-only. Read at connect time, so the
+        # constructor's later chmod cannot hide it, whatever the uid.
+        modes = []
+        real_connect = sqlite3.connect
+
+        def connect(path, *args, **kwargs):
+            modes.append(stat.S_IMODE(os.stat(path).st_mode))
+            return real_connect(path, *args, **kwargs)
+
         with tempfile.TemporaryDirectory() as directory:
             os.chmod(directory, 0o700)
             path = Path(directory) / "interactions.db"
             previous = os.umask(0o277)
             try:
-                SQLiteInteractionStore(path)
+                with patch("admin_console.chat.store.sqlite3.connect", connect):
+                    SQLiteInteractionStore(path)
+            except sqlite3.OperationalError:
+                pass  # the read-only open; the mode below says why
             finally:
                 os.umask(previous)
-            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(modes[0], 0o600)
 
     def test_sqlite_store_preserves_terminal_interaction_and_events(self):
         with tempfile.TemporaryDirectory() as directory:
