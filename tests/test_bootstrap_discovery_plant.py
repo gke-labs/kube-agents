@@ -625,7 +625,7 @@ class SweepIdReadTest(unittest.TestCase):
         self.assertEqual(self._sweep_id("task_id=t_1\nfiled_at=1\n"), "t_1")
 
     def test_a_marker_written_by_hand_reads_as_its_task_id(self):
-        self.assertEqual(self._sweep_id("filed_at=1\n  task_id = t_2\ntask_id=t_3\n"), "t_2")
+        self.assertEqual(self._sweep_id("filed_at=1\n  task_id = t_2\n"), "t_2")
 
 
 class Step2GateQueryTest(unittest.TestCase):

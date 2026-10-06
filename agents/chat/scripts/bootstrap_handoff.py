@@ -616,10 +616,16 @@ def file_cluster_cards(state: dict, roster: list, parse_task_id) -> tuple[int, l
     for agent in roster:
         if agent["key"] in have:
             continue
-        if agent["key"] in stale and not _archive(stale[agent["key"]]):
-            unfiled.append(dict(agent, stale_card=stale[agent["key"]]))
+        old = stale.get(agent["key"])
+        if old and not _archive(old):
+            unfiled.append(dict(agent, stale_card=old))
             continue
-        if _create(parse_task_id, agent["name"], agent["key"], agent["title"], _cluster_body(agent)):
+        task_id = _create(parse_task_id, agent["name"], agent["key"], agent["title"], _cluster_body(agent))
+        if old and task_id == old:
+            # run_slash reports a failed archive as text rather than raising;
+            # the board handing back the old card is the sign it failed.
+            unfiled.append(dict(agent, stale_card=old))
+        elif task_id:
             filed += 1
         else:
             unfiled.append(agent)
@@ -630,7 +636,11 @@ def file_prioritize(parse_task_id, stale: dict | None = None) -> str | None:
     old = (stale or {}).get(PRIORITIZE_KEY)
     if old and not _archive(old):
         return None
-    return _create(parse_task_id, ASSIGNEE, PRIORITIZE_KEY, PRIORITIZE_TITLE, _prioritize_body())
+    task_id = _create(parse_task_id, ASSIGNEE, PRIORITIZE_KEY, PRIORITIZE_TITLE, _prioritize_body())
+    if old and task_id == old:
+        _log(f"the board handed back {old}, an earlier run's ranking card the archive did not remove")
+        return None
+    return task_id
 
 
 def _record(marker: Path, sweep_id: str, task_id: str, now: float) -> None:
@@ -660,8 +670,8 @@ def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, roster=None, now:
     # Archiving the sweep, or every one of its cards, is how a person, the
     # re-arm runbook or a bench stack cancels it, often to plant a raw file of
     # their own; writing over that file once the deadline passed would undo
-    # them. The runbook archives newest first, so the cards go before the sweep.
-    # One archived card among live ones only skips that cluster.
+    # them. The runbook archives the sweep first for this reason: one archived
+    # card among live ones only skips that cluster.
     if state["sweep"]["status"] == ARCHIVED or (state["archived_clusters"] and not state["clusters"]):
         _log(f"sweep {sweep_id} or all of its cluster cards are archived; not handing off")
         return None

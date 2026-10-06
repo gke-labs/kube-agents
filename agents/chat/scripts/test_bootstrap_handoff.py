@@ -453,6 +453,43 @@ class HandOffTest(unittest.TestCase):
             self.assertEqual(self._run_with_parser(), "t_newrank")
         self.assertEqual(sent[0], "archive t_oldrank")
 
+    def test_an_archive_the_board_ignored_is_a_gap_not_a_filed_card(self):
+        _board(self.board, clusters=_all_done())
+        conn = sqlite3.connect(self.board)
+        conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?)",
+                     ("t_old", "running", f"{h.CLUSTER_KEY_PREFIX}t_old", "old", SWEEP_CREATED - 100))
+        conn.commit()
+        conn.close()
+        roster = [self._agent(tid) for tid, _, _, _ in _all_done()] + [self._agent("t_old")]
+        # The archive's error comes back as text; the create returns the old card.
+        with self._stub_kanban([], reply='{"id": "t_old"}'):
+            limit = h.DEADLINE_SECONDS + h.DEADLINE_PER_CARD_SECONDS * len(_all_done())
+            self.assertIsNone(self._run_roster(roster))
+            self.assertEqual(self._run_roster(roster, now=NOW - 60 + limit), "t_rank1")
+        self.assertIn("card t_old holds this Cluster Agent's key and could not be archived",
+                      (self.d / "INVENTORY.raw.md").read_text())
+
+    def test_a_ranking_card_the_archive_left_is_not_recorded(self):
+        _board(self.board, clusters=_all_done())
+        conn = sqlite3.connect(self.board)
+        conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?)",
+                     ("t_oldrank", "blocked", h.PRIORITIZE_KEY, "old ranking", SWEEP_CREATED - 100))
+        conn.commit()
+        conn.close()
+        with self._stub_kanban([], reply='{"id": "t_oldrank"}'), \
+                mock.patch.object(h, "file_prioritize", HandOffTest._real_file_prioritize):
+            self.assertIsNone(self._run_with_parser())
+        self.assertFalse((self.d / h.HANDOFF_MARKER).exists())
+
+    def test_a_failed_or_cancelled_sweep_is_a_gap(self):
+        for status in ("failed", "cancelled"):
+            _board(self.board, sweep_status=status, clusters=_all_done())
+            self.assertEqual(self._run(), f"t_rank{len(self.filed)}")
+            raw = (self.d / "INVENTORY.raw.md").read_text()
+            self.assertIn(f"sweep {SWEEP} {status}: the fleet list and any agent-less audits are missing", raw)
+            self.board.unlink()
+            (self.d / h.HANDOFF_MARKER).unlink()
+
     def test_a_failed_or_cancelled_sweep_settles(self):
         for status in ("failed", "cancelled"):
             _board(self.board, sweep_status=status, clusters=_all_done())
