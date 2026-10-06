@@ -64,3 +64,10 @@ chat-question-wake-stays-silent
 # #2039: the same for a typed answer to that question in a session the wake
 # never reached (session: fresh).
 chat-question-typed-answer-fresh-session
+
+# #2039: grades the specialist's answer as the chat front door's card round
+# trip delivers it into the thread (answer_first reads each delivered card
+# result). The inject door addresses `platform` directly, so no card is
+# filed and no result is delivered, and the check fails every repetition.
+# Returns to the lane when the door routes through the chat profile.
+chat-voice-answer-first
