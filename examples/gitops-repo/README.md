@@ -31,8 +31,9 @@ gitops-repo/
   (next bullet); a declaration is a reviewed change, not a comment. `.kube-agents/` is in it
   because `intent.yaml` decides which paths' notes can do that, and removing the file opens the
   whole repository to them, so the bound carries the same review as the notes it bounds.
-- **Declared intent:** the declaring audit streams read `clusters/<cluster>/provisioning/`
-  and `knowledge/` before they report a posture an owner may have chosen: a fixed replica count,
+- **Declared intent:** the declaring audit streams read `knowledge/` — and the obtainability
+  stream `clusters/<cluster>/provisioning/` as well — before they report a posture an owner may
+  have chosen: a fixed replica count,
   a pinned HPA or a missing PodDisruptionBudget (`agents/platform/governance/obtainability_audit_sop.md` §4a),
   a namespace with no NetworkPolicy or a workload on the default ServiceAccount's token
   (`compliance_audit_sop.md` §3a, object `Namespace/<ns>` or the workload's `Kind/name`),
