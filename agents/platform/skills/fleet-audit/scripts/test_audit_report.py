@@ -5766,9 +5766,7 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
             changed = audit_report.shield_declared_account_siblings(doc)
         by_obj = {f["object"]: f for f in doc["findings"]}
         self.assertEqual(sorted(by_obj), ["Deployment/batch", "Deployment/worker"])
-        # The sibling is demoted; the declared workload counts as shielded too,
-        # so a pull request covering only declared workloads still closes.
-        self.assertEqual(sorted(changed), sorted([by_obj["Deployment/worker"]["id"], derived_id(check="default-sa-automount", obj="Deployment/api")]))
+        self.assertEqual(changed, [by_obj["Deployment/worker"]["id"]])
         self.assertEqual(by_obj["Deployment/worker"]["remediation"]["kind"], "manual")
         self.assertEqual(by_obj["Deployment/worker"]["remediation"]["path"], "")
         self.assertIn("`Deployment/api` declared at acme/fleet:knowledge/api-token.md", by_obj["Deployment/worker"]["remediation"]["note"])
@@ -5837,12 +5835,7 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
         # fleet-wide one reaches every cluster.
         scoped = dict(declaration, **{audit_report.DECLARATION_CLUSTER_FIELD: "prod-eu-west"})
         fresh = audit_report.validate_findings(make_doc(findings=[self._sa_finding("worker", "Deployment/worker")], audit=AUDIT), AUDIT)
-        with contextlib.redirect_stderr(io.StringIO()):
-            elsewhere = audit_report.shield_declared_account_siblings(fresh, [scoped])
-        # Nothing here is demoted; the declaration's own id on its own cluster
-        # is still reported as shielded, for a pull request that covers it.
-        self.assertEqual(fresh["findings"][0]["remediation"]["kind"], "manifest")
-        self.assertEqual(elsewhere, [audit_report.published_id({"check": "default-sa-automount", "cluster": "prod-eu-west", "namespace": "payments", "object": "Deployment/api"})])
+        self.assertEqual(audit_report.shield_declared_account_siblings(fresh, [scoped]), [])
         # One declared workload named once, whichever source it came from and
         # however each spelled it: the worker's `deployment/api` and the
         # owner's `Deployment/api` are one workload to the join.
@@ -16629,6 +16622,11 @@ class TestFinishManifestFlag(HarnessTestCase):
         )
         self.touch(path)
         declaration = {"repo": "acme/fleet", "path": "knowledge/tokens.md", "excerpt": "both need the token"}
+        pathlib.Path(audit_report.declarations_path_for(AUDIT)).parent.mkdir(parents=True, exist_ok=True)
+        audit_report.write_declarations(AUDIT, "acme/fleet", [
+            {"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", **declaration},
+            {"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/worker", **declaration},
+        ])
         doc = make_doc(findings=[], audit=AUDIT, skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}])
         doc["declared"] = [
             {"check": "default-sa-automount", "cluster": "prod-us-east", "namespace": "payments", "object": "Deployment/api", "title": "api", "declaration": declaration},
@@ -16670,6 +16668,28 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(payload["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
         comment = " ".join(self.harness.bodies_for("proposal-*"))
         self.assertIn("declared to need the `default` ServiceAccount's token", comment)
+
+    def test_a_worker_written_declared_entry_alone_closes_nothing_on_a_partial_run(self):
+        # No declaration filed by start, a partial run, and a declared[] entry
+        # the worker composed: the shield demotes nothing (no 2.7 finding) and
+        # the close that can happen over partial coverage is not made on the
+        # worker's word, so the pull request stays open.
+        path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
+        api = make_finding(fid="api", check="default-sa-automount", obj="Deployment/api", title="api", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        previous_body = published_body(make_doc(findings=[api], audit=AUDIT), generated_at=NOW)
+        self.declaring_replies(previous_body)
+        api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
+        self.harness.replies["proposal-list"] = proposals_view(
+            [pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([api_id]))]
+        )
+        self.touch(path)
+        doc = make_doc(findings=[], audit=AUDIT, skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}])
+        doc["declared"] = [{"check": "default-sa-automount", "cluster": "prod-us-east", "namespace": "payments", "object": "Deployment/api", "title": "api", "declaration": {"repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}}]
+        manifest = _full_manifest(audit=AUDIT, candidates=[self.account_candidate("Deployment/api")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["prs_closed"], [])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
 
     def test_a_worker_cannot_mark_a_sibling_shielded_from_the_document(self):
         # Same pull request, no declaration anywhere: a document that carries
