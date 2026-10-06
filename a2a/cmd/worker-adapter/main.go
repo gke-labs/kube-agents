@@ -190,8 +190,10 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 		TaskID:       taskID,
 		Profile:      profile,
 		Session:      os.Getenv("A2A_SESSION"),
-		Namespace:    namespace,
-		Scope:        scope,
+		// Literal "true" only, like EnvClusterView.
+		ProfileExecutor: os.Getenv(lib.EnvProfileExecutor) == "true",
+		Namespace:       namespace,
+		Scope:           scope,
 		// Unset means required: a submission with no capability is
 		// refused. "false" is the mixed-version window only — a gateway
 		// that predates the mint. It does not switch enforcement off; a

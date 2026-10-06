@@ -83,12 +83,22 @@ type Identity struct {
 
 	// Narrowing, when set, means this entry's grants are not in the map at
 	// all: they are derived at mint time from a claim the API server
-	// attested about the particular workload connecting. NarrowingPod is
-	// the only value this callout implements. Such an entry MUST carry no
+	// attested about the particular workload connecting: NarrowingPod or
+	// NarrowingProfile. Such an entry MUST carry no
 	// grants, and the map is refused if it does — see session.go for why an
 	// entry that could hold real grants AND be narrowed is one skipped code
 	// path away from handing every session everything.
 	Narrowing string `json:"narrowing,omitempty"`
+
+	// Profile is the AgentProfile a NarrowingProfile entry executes for: the
+	// addressee token on the task subjects its pods publish. Set only with
+	// that narrowing.
+	Profile string `json:"profile,omitempty"`
+
+	// Topics are a NarrowingProfile entry's blackboard grants in the
+	// profile's own spelling; the callout composes the subjects (see
+	// profile_narrowing.go). Set only with that narrowing.
+	Topics *TopicGrants `json:"topics,omitempty"`
 }
 
 // IdentityMap is what the operator renders and the callout serves. Version is
@@ -177,6 +187,12 @@ func (id Identity) validate() error {
 			id.User, id.Account, mintableAccounts)
 	}
 	hasGrants := len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0
+	// The profile fields mean something only under NarrowingProfile. On any
+	// other entry they would be read by nothing, and a field the callout
+	// silently ignores is a grant someone believes exists.
+	if id.Narrowing != NarrowingProfile && (id.Profile != "" || id.Topics != nil) {
+		return fmt.Errorf("user %q carries profile or topics but narrows on %q; only %q reads them", id.User, id.Narrowing, NarrowingProfile)
+	}
 	switch id.Narrowing {
 	case "":
 		// An entry with an empty side is almost certainly a render bug,
@@ -208,6 +224,16 @@ func (id Identity) validate() error {
 		if hasGrants {
 			return fmt.Errorf("user %q narrows on %q, so its grants are derived from the attested claim and the map must carry none; it carries %d publish and %d subscribe",
 				id.User, id.Narrowing, len(id.Grants.Publish), len(id.Grants.Subscribe))
+		}
+	case NarrowingProfile:
+		// The same fail-closed shape as NarrowingPod: the map carries the
+		// profile and its topics, never subjects.
+		if hasGrants {
+			return fmt.Errorf("user %q narrows on %q, so its grants are derived from the profile and the attested pod and the map must carry none; it carries %d publish and %d subscribe",
+				id.User, id.Narrowing, len(id.Grants.Publish), len(id.Grants.Subscribe))
+		}
+		if err := validateProfileEntry(id); err != nil {
+			return err
 		}
 	default:
 		return fmt.Errorf("user %q names narrowing %q, which this callout does not implement", id.User, id.Narrowing)
