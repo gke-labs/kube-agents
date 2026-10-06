@@ -358,6 +358,18 @@ class SettleQuestionTest(unittest.TestCase):
         clicked.assert_called_once_with("C0KAGE", POSTED_TS)
         self.assertEqual(adapter.updates, [])
 
+    def test_a_click_in_flight_leaves_the_message_alone(self):
+        adapter = _Adapter()
+        _run(runtime.needs_you(adapter, SUB, QUESTION, 3))
+        clicks = SimpleNamespace(
+            answering=lambda channel, ts: (channel, ts) == ("C0KAGE", POSTED_TS),
+            answered=lambda channel, ts: False,
+        )
+        with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_clicks=clicks), "gateway.slack_ux_clicks": clicks}):
+            _run(runtime.settle_question(adapter, SUB))
+        self.assertEqual(adapter.updates, [])
+        self.assertEqual(runtime._questions, {})
+
     def test_the_click_record_is_read_from_the_clicks_module(self):
         clicks = SimpleNamespace(answered=lambda channel, ts: (channel, ts) == ("C0KAGE", POSTED_TS))
         with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_clicks=clicks), "gateway.slack_ux_clicks": clicks}):

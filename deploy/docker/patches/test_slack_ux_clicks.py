@@ -646,6 +646,54 @@ class RuntimeTest(unittest.TestCase):
             self._answer(adapter, *_choice(1, "Leave it"))
         self.assertFalse(runtime.answered(CHANNEL, MESSAGE_TS), "a question the click did not rewrite reads settled")
 
+    def test_answering_reports_an_in_flight_click(self):
+        adapter = _Adapter()
+        client = _Client(adapter.log)
+        update = client.chat_update
+        seen_in_flight = []
+
+        async def held_update(**kwargs):
+            seen_in_flight.append(runtime.answering(CHANNEL, MESSAGE_TS))
+            await update(**kwargs)
+
+        client.chat_update = held_update
+        adapter._get_client = lambda chat_id, team_id=None: client
+        self.assertFalse(runtime.answering(CHANNEL, MESSAGE_TS))
+        self._answer(adapter, *_choice())
+        self.assertEqual(seen_in_flight, [True])
+        self.assertTrue(runtime.answering(CHANNEL, MESSAGE_TS))
+
+    def test_a_settle_arriving_inside_the_clicks_chat_update_leaves_the_message_alone(self):
+        adapter = _Adapter()
+        client = _Client(adapter.log)
+        update = client.chat_update
+
+        import slack_ux_moments
+        sub = {"task_id": "t_e0c1", "platform": "slack", "chat_id": CHANNEL, "thread_id": THREAD}
+        slack_ux_moments._questions.clear()
+        slack_ux_moments._questions[slack_ux_moments._sub_key(sub)] = (
+            3, CHANNEL, MESSAGE_TS, [{"type": "section", "text": {"type": "mrkdwn", "text": "Q"}}], "Q",
+        )
+
+        async def held_update(**kwargs):
+            # A card event reaches settle_question during chat_update round-trip
+            await slack_ux_moments.settle_question(adapter, sub)
+            await update(**kwargs)
+
+        client.chat_update = held_update
+        adapter._get_client = lambda chat_id, team_id=None: client
+
+        gateway = SimpleNamespace(slack_ux_clicks=runtime, slack_ux_moments=slack_ux_moments)
+        modules = {"gateway": gateway, "gateway.slack_ux_clicks": runtime, "gateway.slack_ux_moments": slack_ux_moments}
+        with mock.patch.dict(sys.modules, modules):
+            self._answer(adapter, *_choice())
+
+        # Only the click's rewrite should have updated the message
+        chat_updates = [call for call in adapter.log if call[0] == "chat_update"]
+        self.assertEqual(len(chat_updates), 1)
+        self.assertIn("Leave it", str(chat_updates[0][1]))
+        self.assertEqual(slack_ux_moments._questions, {})
+
     def test_two_clicks_at_once_run_one_turn(self):
         adapter = _Adapter()
 

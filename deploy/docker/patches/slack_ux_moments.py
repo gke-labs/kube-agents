@@ -239,12 +239,15 @@ def question_card(channel: str, ts: str) -> str | None:
 
 
 def _clicked(channel: str, ts: str) -> bool:
-    """Whether a click in this process already answered the message."""
+    """Whether a click in this process already answered the message or is rewriting it."""
     try:
         from gateway import slack_ux_clicks
     except ImportError:
         return False
     try:
+        answering = getattr(slack_ux_clicks, "answering", None)
+        if callable(answering):
+            return bool(answering(channel, ts))
         return bool(slack_ux_clicks.answered(channel, ts))
     except Exception:  # noqa: BLE001 — read as unanswered; the settle is cosmetic
         return False
