@@ -801,14 +801,17 @@ heal_poisoned_release_record() {
     # wait for the operator to clear its finalizer before uninstalling (#2382).
     # Without this, Helm deletes the operator and RBAC first, leaving the CR
     # stranded on its finalizer and breaking subsequent install attempts.
+    # Timeout matches charts/kube-agents/values.yaml cleanupHook.timeout (120s).
+    # If the deletion times out or fails, stop under set -e so we do not issue
+    # a --no-hooks uninstall that strands the CR in Terminating.
     if [ "${action}" = "retrying" ]; then
       kubectl delete platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" \
-        --ignore-not-found --wait --timeout=60s || true
+        --ignore-not-found --wait --timeout=120s
     fi
 
     # --no-hooks: at lease time (§5a), a leftover release from a failed prior
     # run never started the operator, so running pre-delete hooks would hang.
-    # On retry (§5c), the CR was already deleted above, so the hook is redundant.
+    # On retry (§5c), the CR was verified deleted above, so the hook is redundant.
     # If even the uninstall cannot clear it, drop the release-record Secrets
     # directly — with no deployed revision the record is all that blocks the
     # install. Both failing leaves the record in place, so let set -e stop

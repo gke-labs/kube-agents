@@ -64,13 +64,20 @@ def _deploy_block(text):
 class CiDeployHelmRetryTest(unittest.TestCase):
     maxDiff = None
 
-    def _run_deploy_block(self, helm_responses, history_json="", history_exit=None):
+    def _run_deploy_block(
+        self,
+        helm_responses,
+        history_json="",
+        history_exit=None,
+        kubectl_delete_exit=0,
+    ):
         """Run the lifted deploy block with recording stubs.
 
         helm_responses: list of (exit_code, stdout, stderr) tuples returned
                         sequentially on each `helm upgrade --install` call.
         history_exit: exit code for `helm history`. Defaults to 0 when history_json
                       is provided, or 1 (absent release) when empty.
+        kubectl_delete_exit: exit code for `kubectl delete platformagent`.
         """
         if history_exit is None:
             history_exit = 0 if history_json else 1
@@ -134,7 +141,17 @@ esac
             kubectl_stub.write_text(
                 f"""#!/usr/bin/env bash
 echo "kubectl $*" >> "{log}"
-exit 0
+case "$1" in
+  delete)
+    if [ "$2" = "platformagent" ]; then
+      exit {kubectl_delete_exit}
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
 """,
                 encoding="utf-8",
             )
@@ -399,6 +416,7 @@ A2A_OPERATOR_ENV_ARGS=()
         self.assertEqual(len(cr_deletes), 1, f"expected CR delete before uninstall: {calls}")
         self.assertIn("--wait", cr_deletes[0])
         self.assertIn("--ignore-not-found", cr_deletes[0])
+        self.assertIn("--timeout=120s", cr_deletes[0])
         uninstalls = [c for c in calls if c.startswith("helm uninstall")]
         self.assertEqual(len(uninstalls), 1, f"expected poisoned record to be healed before retry: {calls}")
         # Verify CR delete precedes helm uninstall
@@ -407,6 +425,28 @@ A2A_OPERATOR_ENV_ARGS=()
         self.assertLess(cr_idx, uninstall_idx, "CR delete must precede helm uninstall")
         self.assertIn("record before retrying", out.lower())
         self.assertIn("cleared the poisoned", out.lower())
+
+    def test_transient_5xx_cr_delete_failure_aborts_without_uninstall(self):
+        # When CR deletion fails or times out, set -e must stop the run immediately
+        # without running helm uninstall --no-hooks (which would strand the CR) (#2382 bot review).
+        err_msg = "the server is currently unable to handle the request"
+        responses = [
+            (1, "", err_msg),
+            (0, "Release kube-agents installed", ""),
+        ]
+        history_poisoned = json.dumps([{"revision": 1, "status": "failed"}])
+        rc, calls, out, err = self._run_deploy_block(
+            responses,
+            history_json=history_poisoned,
+            history_exit=0,
+            kubectl_delete_exit=1,
+        )
+        self.assertNotEqual(rc, 0, f"failed CR delete must stop under set -e: {rc}")
+        cr_deletes = [c for c in calls if c.startswith("kubectl delete platformagent")]
+        self.assertEqual(len(cr_deletes), 1, f"expected CR delete attempt: {calls}")
+        self.assertIn("--timeout=120s", cr_deletes[0])
+        uninstalls = [c for c in calls if c.startswith("helm uninstall")]
+        self.assertEqual(len(uninstalls), 0, f"no uninstall must occur if CR delete fails: {calls}")
 
     def test_transient_5xx_with_deployed_revision_does_not_heal_release_record(self):
         # A release with a deployed revision is healthy and must not be uninstalled (#2382 bot review).
