@@ -215,6 +215,12 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 // principal map admits programs, so the door delegates only under a list of
 // its own (spec-chatops-gateway.md, "Sessions by default"; the CR field that
 // would render one is gke-labs#2478).
+//
+// The inject door (backend "inject") is deliberately not included, and is
+// not an oversight to fix: it exists only where an operator arms it on a dev
+// or eval install, its principal map already names who may use it, and the
+// live runs and evals exercise delegation through it. Its absent list stays
+// everyone its map admits, as a chat backend's does.
 func (g *Gateway) doorUnlisted(target, backend string) bool {
 	return backend == a2aBackend && g.targetAllowed[target][backend] == nil
 }

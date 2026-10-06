@@ -1888,3 +1888,15 @@ func TestADoorAuthorWithNoListRefusesAChatTurnsDelegation(t *testing.T) {
 		})
 	}
 }
+
+// TestTheInjectDoorWithNoListMayDelegate: the inject door is deliberately not
+// held to the A2A door's rule (doorUnlisted says why): with no list for it,
+// its turns delegate as a chat backend's do.
+func TestTheInjectDoorWithNoListMayDelegate(t *testing.T) {
+	r, spawn := startRigWithSpawnerCap(t, "platform", 0, func(c *Config) { armInjectMap(t, c) })
+	exec, _, _ := sessionTurnVia(t, r, spawn, injectKeyPrefix+"case-nolist", injectBackend, "do a thing")
+	if err := exec.PublishArtifact(context.Background(), delegateArtifact(t, "platform", "x")); err != nil {
+		t.Fatal(err)
+	}
+	r.awaitTask(t, targetPlatform)
+}
