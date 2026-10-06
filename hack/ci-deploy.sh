@@ -89,6 +89,8 @@ readonly HELM_DEPLOYED_STATUS_RE='"status"[[:space:]]*:[[:space:]]*"deployed"'
 readonly HELM_DEPLOY_ATTEMPTS=3
 readonly HELM_DEPLOY_RETRY_DELAY_SECONDS=5
 readonly APISERVER_READYZ_TIMEOUT_SECONDS=30
+readonly HELM_HISTORY_PROBE_ATTEMPTS=3
+readonly HELM_HISTORY_PROBE_RETRY_DELAY_SECONDS=2
 readonly HELM_API_SERVER_5XX_RE="an error on the server|the server is currently unable to handle the request|the server was unable to return a response in the time allotted|the server responded with the status code 50[0234]|Internal error occurred:|etcdserver:|request did not complete within|(HTTP( response status)?|status:)[: ]+50[0234]([^0-9]|$)"
 
 # The keypair the agent uses to reach its shell sandbox over SSH. Generated per
@@ -796,12 +798,8 @@ heal_poisoned_release_record() {
   local reason="${1:-a previous run left this pool project poisoned (#1172)}"
   local action="${2:-installing}"
   local history_json="" history_err="" history_rc=0
-  local history_probe_attempts=1
-  if [ "${action}" = "retrying" ]; then
-    history_probe_attempts=3
-  fi
 
-  for ((probe_try=1; probe_try<=history_probe_attempts; probe_try++)); do
+  for ((probe_try=1; probe_try<=HELM_HISTORY_PROBE_ATTEMPTS; probe_try++)); do
     local probe_tmp
     probe_tmp="$(mktemp)"
     if history_json="$(helm history "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" -o json 2>"${probe_tmp}")"; then
@@ -817,11 +815,11 @@ heal_poisoned_release_record() {
       if ! grep -Eq "${HELM_API_SERVER_5XX_RE}" <<<"${history_err}"; then
         break
       fi
-      # If retrying and the probe hit an API-server 5xx, wait and re-probe
+      # If the probe hit an API-server 5xx, wait and re-probe
       # rather than prematurely treating it as "absent release" (#2382).
-      if [ "${action}" = "retrying" ] && [ "${probe_try}" -lt "${history_probe_attempts}" ]; then
-        echo "WARNING: helm history probe attempt ${probe_try} hit a transient API-server 5xx (${history_err}), re-probing in 2s..."
-        sleep 2
+      if [ "${probe_try}" -lt "${HELM_HISTORY_PROBE_ATTEMPTS}" ]; then
+        echo "WARNING: helm history probe attempt ${probe_try} hit a transient API-server 5xx (${history_err}), re-probing in ${HELM_HISTORY_PROBE_RETRY_DELAY_SECONDS}s..."
+        sleep "${HELM_HISTORY_PROBE_RETRY_DELAY_SECONDS}"
       fi
     fi
   done
@@ -832,11 +830,18 @@ heal_poisoned_release_record() {
     if ! grep -Eq "${HELM_API_SERVER_5XX_RE}" <<<"${history_err}"; then
       return 0
     fi
-    # If probe failed with an API-server 5xx and re-probes were exhausted,
-    # fail loudly under set -e so the run does not silently skip healing
-    # and fail attempt 2 on "has no deployed releases" (#2382).
-    echo "ERROR: helm history probe failed with API-server 5xx: ${history_err}" >&2
-    return "${history_rc}"
+    # If probe failed with an API-server 5xx and re-probes were exhausted:
+    # On in-loop retry (§5c), fail loudly under set -e so the run does not
+    # silently skip healing and fail attempt 2 on "has no deployed releases" (#2382).
+    # At lease time (§5a), degrade to the pre-fix behaviour: warn and skip
+    # the heal so a transient control-plane blip seconds after creation does not
+    # abort the run before chart deployment and its retry loop can run.
+    if [ "${action}" = "retrying" ]; then
+      echo "ERROR: helm history probe failed with API-server 5xx: ${history_err}" >&2
+      return "${history_rc}"
+    fi
+    echo "WARNING: helm history probe failed with API-server 5xx after ${HELM_HISTORY_PROBE_ATTEMPTS} attempts (${history_err}); skipping lease-time release record heal and proceeding to deploy."
+    return 0
   fi
 
   if ! grep -Eq "${HELM_DEPLOYED_STATUS_RE}" <<<"${history_json}"; then
@@ -1003,8 +1008,8 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Deploying the kube-agents chart ===
 # their statuses. "History succeeds but no revision is deployed" is
 # therefore precisely the state upgrade rejects — including a latest-failed
 # release with an older deployed revision, which upgrades fine and is left
-# alone. One call; a healthy or absent release costs the probe and nothing
-# more.
+# alone. One call (or bounded re-probes if the probe hits a transient control-plane 5xx);
+# a healthy or absent release costs the probe and nothing more.
 heal_poisoned_release_record
 
 API_SERVER_KEY="${API_SERVER_KEY:-$(openssl rand -hex 16)}"
