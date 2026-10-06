@@ -2026,7 +2026,15 @@ class WatchedPeriodics(RunHarness):
         doc = health("GREEN")
         doc["periodics"], doc["periodics_read"] = {}, ["post-kube-agents-fleet-reconcile", self.DAILY]
         doc["periodics_runs"] = {"post-kube-agents-fleet-reconcile": {"build": "7", "finished_at": "2026-09-13T13:10:00+00:00", "passed": False, "summary": "1 refused"}, self.DAILY: {"build": "9", "finished_at": "2026-09-14T08:40:00+00:00", "passed": True, "summary": "35 visited: 35 converged"}}
+        # The tick decided the supersession from both artifacts; the poster
+        # reads that decision rather than re-deriving it from the summaries.
+        self.assertEqual(post_health.periodic_clears(doc, prev), [])
+        doc["periodics_superseded"] = ["post-kube-agents-fleet-reconcile"]
         self.assertEqual(post_health.periodic_clears(doc, prev), ["post-kube-agents-fleet-reconcile"])
+        # And the clear cites the daily's run, not the postsubmit's failed one.
+        text = post_health.render_periodic_clear(doc, prev)
+        self.assertIn("`post-kube-agents-fleet-reconcile`'s build 7 failure is cleared by `ci-kube-agents-fleet-reconcile-daily`'s 4:40 AM ET run (build 9): 35 visited: 35 converged.", text)
+        self.assertNotIn("1 refused", text)
 
     def test_the_digest_line_for_an_unreadable_finish_time_says_so(self):
         doc = health("GREEN")

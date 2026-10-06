@@ -264,13 +264,22 @@ class AssessTest(unittest.TestCase):
         fresh = {DAILY.job: self.reading(DAILY, NOW - timedelta(hours=35))}
         self.assertEqual(periodics.assess(fresh, NOW, {}), {})
 
-    def test_a_failed_postsubmit_is_retired_once_the_daily_passes_after_it(self):
-        # The postsubmit has no window to retire it; the daily that followed
-        # and converged is the recovery for the same fleet.
-        failed = self.reading(POST, NOW - timedelta(days=2), passed=False, artifact={"summary": {"refused": 1}})
-        later_daily = self.reading(DAILY, NOW - timedelta(hours=1))
-        self.assertEqual(periodics.assess({POST.job: failed, DAILY.job: later_daily}, NOW, {}), {})
-        earlier_daily = self.reading(DAILY, NOW - timedelta(days=3))
+    def test_a_failed_postsubmit_is_retired_once_a_later_daily_has_dealt_with_its_projects(self):
+        # The postsubmit has no window to retire it. A later daily that
+        # reached the projects it failed on is the recovery; one that passed
+        # without reaching them is not; one that failed is the current story
+        # about the fleet, so the older failure is not news beside it.
+        failed = self.reading(POST, NOW - timedelta(days=2), passed=False, artifact={"summary": {"refused": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "lock"}}})
+        reached = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"summary": {"converged": 35}, "outcomes": {"kube-agents-evals-9": {"outcome": "converged", "detail": ""}}})
+        self.assertEqual(periodics.assess({POST.job: failed, DAILY.job: reached}, NOW, {}), {})
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: reached}), [POST.job])
+        missed = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"summary": {"converged": 34, "not_reached": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "not_reached", "detail": "busy"}}})
+        self.assertIn(POST.job, periodics.assess({POST.job: failed, DAILY.job: missed}, NOW, {}))
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: missed}), [])
+        daily_failed = self.reading(DAILY, NOW - timedelta(hours=1), passed=False, artifact={"summary": {"failed": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "lock"}}})
+        notes = periodics.assess({POST.job: failed, DAILY.job: daily_failed}, NOW, {})
+        self.assertEqual(sorted(notes), [DAILY.job], "the daily's own note is the current story")
+        earlier_daily = self.reading(DAILY, NOW - timedelta(days=3), artifact={"outcomes": {"kube-agents-evals-9": {"outcome": "converged", "detail": ""}}})
         self.assertIn(POST.job, periodics.assess({POST.job: failed, DAILY.job: earlier_daily}, NOW, {}))
         self.assertIn(POST.job, periodics.assess({POST.job: failed}, NOW, {}))
 
@@ -305,6 +314,11 @@ class AssessTest(unittest.TestCase):
         lines = periodics.reconcile_detail(artifact)
         self.assertEqual(lines[0], "kube-agents-evals-3: refused (1 refused: delete x); next: a code change, or an entry in bench/tf/fleet/reconcile-allow.json")
         self.assertEqual(lines[1], "kube-agents-evals-4: failed (tofu apply exited 1: boom); next: nothing by hand, the next run retries it")
+        # A failure the next run cannot clear names its hand step.
+        stray = {"outcomes": {"kube-agents-evals-99": {"outcome": "failed", "detail": "not a mapped pool project (gitops_repo_for_project in hack/ci-deploy.sh)"}}}
+        self.assertTrue(periodics.reconcile_detail(stray)[0].endswith(periodics.RECONCILE_NEXT_STEP_UNMAPPED))
+        no_tofu = {"outcomes": {"p": {"outcome": "failed", "detail": "could not run tofu (FileNotFoundError: [Errno 2] No such file or directory: 'tofu')"}}}
+        self.assertTrue(periodics.reconcile_detail(no_tofu)[0].endswith(periodics.RECONCILE_NEXT_STEP_RUNNER))
         # tofu's own lock error counts as locked too, and a non-string detail does not crash the tick.
         locked = {"outcomes": {"p": {"outcome": "failed", "detail": "tofu plan exited 1: Error acquiring the state lock: ConditionNotMet ... Lock Info: ID 1234"}}}
         self.assertTrue(periodics.reconcile_detail(locked)[0].endswith(periodics.RECONCILE_NEXT_STEP_LOCKED))

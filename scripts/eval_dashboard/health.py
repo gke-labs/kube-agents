@@ -2369,6 +2369,7 @@ def adjudicate(
         "periodics": watched,
         "periodics_read": sorted(readings),
         "periodics_runs": periodics.runs(readings),
+        "periodics_superseded": periodics.superseded_jobs(readings),
         "periodics_streaks": streaks,
         "periodics_since": periodics_since,
         "metrics": metrics([run for run in runs if run.finished <= now], now, fixtures, roster),

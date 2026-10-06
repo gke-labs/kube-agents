@@ -989,14 +989,12 @@ def periodic_clears(health: dict, prev: dict | None) -> list[str]:
     read = set(health.get("periodics_read") or [])
     runs = health.get("periodics_runs") or {}
 
+    superseded = set(health.get("periodics_superseded") or [])
+
     def recovered(job):
-        own = runs.get(job) or {}
-        if own.get("passed"):
-            return True
-        # A superseding job's later pass is the recovery for one with no window.
-        other = runs.get(periodics.SUPERSEDED_BY.get(job, "")) or {}
-        when, later = parse_iso(own.get("finished_at")), parse_iso(other.get("finished_at"))
-        return bool(other.get("passed")) and when is not None and later is not None and later > when
+        # Its own passed build, or the tick's decision that a later build of
+        # the job that supersedes it dealt with its projects.
+        return bool((runs.get(job) or {}).get("passed")) or job in superseded
 
     return sorted(job for job in told if job in read and job not in current and recovered(job))
 
@@ -1059,14 +1057,24 @@ def render_periodic_clear(health: dict, prev: dict | None) -> str:
     run did when its report says."""
     lines = []
     runs = health.get("periodics_runs") or {}
+    superseded = set(health.get("periodics_superseded") or [])
     for job in periodic_clears(health, prev):
         words = _job_words(job)
         run = runs.get(job) or {}
+        if job in superseded and not run.get("passed"):
+            # Cleared by the superseding job's later run: that run is the
+            # evidence, not the failed build being cleared.
+            other = periodics.SUPERSEDED_BY.get(job, "")
+            theirs = runs.get(other) or {}
+            when = clock(parse_iso(theirs.get("finished_at"))) if theirs.get("finished_at") else "?"
+            did = f": {theirs['summary']}" if theirs.get("summary") else " finished clean"
+            lines.append(f"✅ *{words['place']}: {words['presence']}.* `{job}`'s build {run.get('build')} failure is cleared by `{other}`'s {when} run (build {theirs.get('build')}){did}.")
+            continue
         when = clock(parse_iso(run.get("finished_at"))) if run.get("finished_at") else None
         did = run.get("summary")
-        # A clear needs a passed build on record, and a passed build has a
-        # finish time (none is STALE and noted), so `when` is always there.
-        # The job by name: the two reconciles share a place and a presence.
+        # A passed build has a finish time (none is STALE and noted), so
+        # `when` is there. The job by name: the two reconciles share a place
+        # and a presence.
         tail = f" `{job}`'s {when} run (build {run.get('build')}): {did}." if did else f" `{job}`'s {when} run (build {run.get('build')}) finished clean."
         lines.append(f"✅ *{words['place']}: {words['presence']}.*{tail}")
     return "\n".join(lines)

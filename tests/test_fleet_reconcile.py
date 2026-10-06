@@ -1175,6 +1175,15 @@ def _allow(triples):
     return [reconcile.AllowEntry(address, why, bool(standing)) for address, why, standing in triples]
 
 
+class _Boskos_failing_one(_Boskos):
+    """A Boskos whose acquire of P8 answers 500."""
+
+    def __call__(self, request, timeout=None):
+        if "/acquirebystate?" in request.full_url and "names=%s" % P8 in request.full_url:
+            raise _http_error(500, request.full_url)
+        return super().__call__(request, timeout)
+
+
 class _Clock:
     """A monotonic clock the tests move by hand."""
 
@@ -1259,7 +1268,7 @@ class BudgetTest(unittest.TestCase):
 class PassTest(unittest.TestCase):
     """`--all` asks for every mapped project by name and keeps asking for the busy ones."""
 
-    def test_every_mapped_project_is_asked_for_by_name_and_the_pool_is_never_walked(self):
+    def test_every_mapped_project_is_asked_for_by_name_then_one_anonymous_acquire(self):
         boskos = _Boskos(free=[P8, P7])
         tofu = _Tofu({P7: UPDATE_ONLY, P8: UPDATE_ONLY})
         with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
@@ -1288,7 +1297,9 @@ class PassTest(unittest.TestCase):
         boskos = _Boskos(free=[P7])
 
         def pause(seconds):
-            clock.now += seconds
+            # A real sleep returns late: the drain must still say "not free",
+            # not blame the budget for a project that was busy all along.
+            clock.now += seconds + 1
 
         tofu = _Tofu({P7: UPDATE_ONLY})
         with mock.patch.object(reconcile, "clock", clock), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(reconcile, "pause", pause):
@@ -1296,7 +1307,7 @@ class PassTest(unittest.TestCase):
         self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
         self.assertEqual(outcomes[P8][0], reconcile.OUTCOME_NOT_REACHED)
         self.assertIn("not free", outcomes[P8][1])
-        self.assertLessEqual(clock.now, 400)
+        self.assertLessEqual(clock.now, 405)
 
     def test_a_registration_outside_the_mapping_is_never_asked_for_by_name(self):
         boskos = _Boskos(free=["kube-agents-evals-99", P7])
@@ -1877,12 +1888,6 @@ class WorkersTest(unittest.TestCase):
         self.assertEqual(sorted(boskos.released), [P7, P8])
 
     def test_a_worker_that_hits_a_boskos_fault_records_its_project_and_stops_the_run(self):
-        class _Boskos_failing_one(_Boskos):
-            def __call__(self, request, timeout=None):
-                if "/acquirebystate?" in request.full_url and "names=%s" % P8 in request.full_url:
-                    raise _http_error(500, request.full_url)
-                return super().__call__(request, timeout)
-
         p9 = "kube-agents-evals-9"
         boskos = _Boskos_failing_one(free=[P7, P8, p9])
         slow = _Tofu({P7: UPDATE_ONLY, P8: UPDATE_ONLY, p9: UPDATE_ONLY})
@@ -1980,13 +1985,16 @@ class WorkersTest(unittest.TestCase):
         self.assertEqual(boskos.walked, 1)
         self.assertNotIn(stray, " ".join(" ".join(c) for c in tofu.calls))
 
-    def test_a_named_run_that_loses_boskos_records_the_project_and_the_rest(self):
-        class _Boskos_failing_one(_Boskos):
-            def __call__(self, request, timeout=None):
-                if "/acquirebystate?" in request.full_url and "names=%s" % P8 in request.full_url:
-                    raise _http_error(500, request.full_url)
-                return super().__call__(request, timeout)
+    def test_a_project_outside_the_mapping_is_failed_but_not_counted_visited(self):
+        boskos = _Boskos(free=[P7])
+        run = reconcile.Run()
+        outcomes = {}
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()):
+            reconcile.reconcile_named([P7, "kube-agents-evals-99"], BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known=KNOWN, outcomes=outcomes, run=run)
+        self.assertEqual(outcomes["kube-agents-evals-99"][0], reconcile.OUTCOME_FAILED)
+        self.assertEqual(reconcile.visited_count(outcomes, run), 1, "held one project, not two")
 
+    def test_a_named_run_that_loses_boskos_records_the_project_and_the_rest(self):
         p9 = "kube-agents-evals-9"
         boskos = _Boskos_failing_one(free=[P7, P8, p9])
         outcomes = {}

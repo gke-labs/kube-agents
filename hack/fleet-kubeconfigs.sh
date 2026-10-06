@@ -182,10 +182,20 @@ _fleet_probe_present() {
       # says nothing about whether the fixture is there. The error text is
       # kept in a variable, not a file: this file is sourced by the eval job
       # under its own EXIT trap, so nothing here may install one.
+      # Presence is decided on stdout alone: a successful empty list can
+      # carry discovery noise or a deprecation warning on stderr, which must
+      # not read as an object. The error text is fetched by a second call
+      # only when the first failed.
       if [ "$namespace" != "-" ] && [ -n "$namespace" ]; then
-        if ! _FLEET_PROBE_OUT="$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -n "$namespace" -l "$rest" -o name 2>&1)"; then _FLEET_PROBE_ERR="$_FLEET_PROBE_OUT"; return 2; fi
+        if ! _FLEET_PROBE_OUT="$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -n "$namespace" -l "$rest" -o name 2>/dev/null)"; then
+          _FLEET_PROBE_ERR="$({ KUBECONFIG="$kubeconfig" kubectl get "$kind" -n "$namespace" -l "$rest" -o name >/dev/null; } 2>&1)"
+          return 2
+        fi
       else
-        if ! _FLEET_PROBE_OUT="$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -l "$rest" -o name 2>&1)"; then _FLEET_PROBE_ERR="$_FLEET_PROBE_OUT"; return 2; fi
+        if ! _FLEET_PROBE_OUT="$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -l "$rest" -o name 2>/dev/null)"; then
+          _FLEET_PROBE_ERR="$({ KUBECONFIG="$kubeconfig" kubectl get "$kind" -l "$rest" -o name >/dev/null; } 2>&1)"
+          return 2
+        fi
       fi
       [ -n "$_FLEET_PROBE_OUT" ]
       ;;

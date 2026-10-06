@@ -172,11 +172,20 @@ answers.update(world.get("kubectl_overrides", {}).get(project, {}))
 if isinstance(answers.get(key), dict) and "__error__" in answers[key]:
     print(f'Error from server ({answers[key]["__error__"]}): {kind} "{name}" is forbidden', file=sys.stderr)
     sys.exit(1)
+wants_names = "-o" in args and args[args.index("-o") + 1] == "name"
+if isinstance(answers.get(key), dict) and "__warn__" in answers[key]:
+    # A successful, empty answer with discovery noise on stderr; `-o name`
+    # prints nothing for an empty list, as kubectl does.
+    print(answers[key]["__warn__"], file=sys.stderr)
+    if not wants_names:
+        print(json.dumps({"items": []}))
+    sys.exit(0)
 if key not in answers or answers[key] is None:
     if name:
         print(f'Error from server (NotFound): {kind} "{name}" not found', file=sys.stderr)
         sys.exit(1)
-    print(json.dumps({"items": []}))
+    if not wants_names:
+        print(json.dumps({"items": []}))
     sys.exit(0)
 print(json.dumps(answers[key]))
 '''
@@ -479,6 +488,16 @@ class NotChecked(ScanHarness):
         self.assertIn("Forbidden", detail)
         self.assertNotIn("never planted", detail)
         self.assertEqual((fixture_state.absent_units(doc), fixture_state.unread_units(doc)), (0, 1))
+
+    def test_discovery_noise_on_a_successful_empty_list_is_not_a_present_fixture(self):
+        # kubectl writes aggregated-API discovery errors to stderr and still
+        # exits 0 with an empty list; the probe must read stdout alone.
+        world = healthy_world(PROJECT)
+        world["kubectl_overrides"] = {PROJECT: {"node?cloud.google.com/gke-nodepool=idle-batch-pool": {"__warn__": "E1006 memcache.go:287] couldn't get resource list for metrics.k8s.io/v1beta1: the server is currently unable to handle the request"}}}
+        doc, _ = self.scan(world)
+        states = self.states(doc)
+        self.assertEqual(states["idle-nodepool"], "absent")
+        self.assertIn("never planted", doc["projects"][PROJECT]["roles"]["idle-nodepool"]["detail"][0])
 
     def test_a_project_whose_fleet_is_wholly_absent_was_still_checked(self):
         # The runner ran and found no seeded cluster: that is an observation

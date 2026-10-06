@@ -109,7 +109,14 @@ RECONCILE_NEXT_STEP = {
 RECONCILE_LOCK_MARKERS = ("Error acquiring the state lock", "Lock Info", "acquires a state lock")
 RECONCILE_CEILING_MARKER = "force-unlock"
 RECONCILE_NEXT_STEP_LOCKED = "tofu force-unlock against that project's state, then the next run retries it"
+# Two `failed`s the next run cannot clear: a Boskos registration the mapping
+# lacks, and a runner that could not start tofu at all.
+RECONCILE_UNMAPPED_MARKER = "not a mapped pool project"
+RECONCILE_NEXT_STEP_UNMAPPED = "add its gitops_repo_for_project row in hack/ci-deploy.sh, or remove the Boskos registration"
+RECONCILE_RUNNER_MARKER = "could not run tofu ("
+RECONCILE_NEXT_STEP_RUNNER = "a runner fault (tofu missing or unrunnable), not the project's: fix the job image or the machine"
 RECONCILE_OUTCOME_NOT_REACHED = "not_reached"
+RECONCILE_OUTCOME_BUSY = "busy"
 # The report's outcome names as the message says them.
 RECONCILE_OUTCOME_WORDS = {RECONCILE_OUTCOME_NOT_REACHED: "not reached"}
 REPORT_KEY_VISITED = "visited"
@@ -434,6 +441,10 @@ def reconcile_detail(artifact: dict | None) -> list[str]:
                 step = RECONCILE_NEXT_STEP_LOCKED
             elif RECONCILE_CEILING_MARKER in detail:
                 step = RECONCILE_NEXT_STEP["interrupted"]
+            elif RECONCILE_UNMAPPED_MARKER in detail:
+                step = RECONCILE_NEXT_STEP_UNMAPPED
+            elif RECONCILE_RUNNER_MARKER in detail:
+                step = RECONCILE_NEXT_STEP_RUNNER
         lines.append(f"{project}: {outcome} ({detail}); next: {step}")
     # The cap counts projects; the lines after it are one each.
     if len(lines) > DETAIL_LIMIT:
@@ -708,17 +719,47 @@ def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, wa
     return notes
 
 
+def _named_failures(artifact) -> list[str]:
+    """The projects a reconcile report names as refused, failed or interrupted."""
+    outcomes = artifact.get(REPORT_KEY_OUTCOMES) if isinstance(artifact, dict) else None
+    if not isinstance(outcomes, dict):
+        return []
+    return sorted(p for p, e in outcomes.items() if isinstance(e, dict) and e.get(REPORT_KEY_OUTCOME) in RECONCILE_NAMED_OUTCOMES)
+
+
+def _reached(artifact, projects: list[str]) -> bool:
+    """True when the report holds every named project with an outcome that
+    means it was held and planned (not busy, not not_reached)."""
+    outcomes = artifact.get(REPORT_KEY_OUTCOMES) if isinstance(artifact, dict) else None
+    if not isinstance(outcomes, dict):
+        return False
+    return all(isinstance(outcomes.get(p), dict) and outcomes[p].get(REPORT_KEY_OUTCOME) not in (RECONCILE_OUTCOME_NOT_REACHED, RECONCILE_OUTCOME_BUSY) for p in projects)
+
+
 def superseded(job: str, readings: dict[str, dict]) -> bool:
-    """True when the job's failed build was followed by a passed build of
-    the job that supersedes it (the daily after a failed postsubmit)."""
+    """True when the job's failed build is no longer the story about the
+    fleet: the job that supersedes it (the daily, for the postsubmit) has a
+    later build that either failed itself, so its own note is current, or
+    passed having reached every project the failed build named. A later
+    pass that never reached them (busy, not reached) retires nothing."""
     other = SUPERSEDED_BY.get(job)
     if not other:
         return False
     mine, theirs = readings.get(job), readings.get(other)
-    if not isinstance(mine, dict) or not isinstance(theirs, dict) or not theirs.get(KEY_PASSED):
+    if not isinstance(mine, dict) or not isinstance(theirs, dict):
         return False
     when, later = parse_iso(mine.get(KEY_FINISHED_AT)), parse_iso(theirs.get(KEY_FINISHED_AT))
-    return when is not None and later is not None and later > when
+    if when is None or later is None or later <= when:
+        return False
+    if not theirs.get(KEY_PASSED):
+        return True
+    return _reached(theirs.get(KEY_ARTIFACT), _named_failures(mine.get(KEY_ARTIFACT)))
+
+
+def superseded_jobs(readings: dict[str, dict]) -> list[str]:
+    """The watched jobs whose latest failed build a later build of their
+    superseding job has retired; carried in health.json for the poster."""
+    return sorted(job for job, reading in readings.items() if isinstance(reading, dict) and not reading.get(KEY_PASSED) and superseded(job, readings))
 
 
 def evidence(note: dict) -> str:

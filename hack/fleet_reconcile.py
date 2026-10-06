@@ -181,13 +181,6 @@ FAILING_OUTCOMES = frozenset({OUTCOME_REFUSED, OUTCOME_FAILED})
 AT_TREE_OUTCOMES = frozenset({OUTCOME_APPLIED, OUTCOME_CONVERGED, OUTCOME_UNCHANGED})
 # A project the run held and planned: everything but the two it never leased.
 VISITED_OUTCOMES = frozenset(OUTCOMES) - {OUTCOME_BUSY, OUTCOME_NOT_REACHED}
-
-
-def visited_count(outcomes, run=None):
-    """How many of the projects the run set out to visit it held: a stray
-    registration recorded failed is outside that set and does not count."""
-    names = run.mapped_names if run is not None and run.mapped_names is not None else None
-    return sum(1 for p, (o, _) in outcomes.items() if o in VISITED_OUTCOMES and (names is None or p in names))
 OUTPUT_TAIL_CHARS = 600
 REASON_UNMAPPED = "not a mapped pool project (gitops_repo_for_project in hack/ci-deploy.sh)"
 # Boskos's 404 does not say which; a mapped project lands here between its
@@ -196,6 +189,7 @@ REASON_BUSY = "not free in Boskos, or not registered there yet"
 REASON_INTERRUPTED = "terminated (%s) while tofu ran; an apply cut past its grace leaves the state locked: tofu force-unlock"
 REASON_CEILING = "did not finish within %ds; tofu was interrupted, and killed if it did not stop within %ds, which leaves the state locked: tofu force-unlock"
 REASON_NOT_REACHED_BUDGET = "not started: %ds left in the run's budget, under the %ds per-project ceiling; the next run takes it"
+REASON_NOT_REACHED_BUDGET_MARK = "left in the run's budget"
 REASON_NOT_REACHED_MOVED = "not started: bench/tf/fleet on %s is now %s and this run applies %s; the next run takes it"
 REASON_NOT_REACHED_BUSY = "not free in Boskos before the run's budget ran out; the next run takes it"
 REASON_NOT_REACHED_TERMINATED = "not started: the run was terminated; the next run takes it"
@@ -218,6 +212,22 @@ ISO_UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 class ReconcileError(Exception):
     """A fault that stops one project's reconcile. The caller reports it."""
+
+
+def _is_budget_reason(reason):
+    return REASON_NOT_REACHED_BUDGET_MARK in (reason or "")
+
+
+def visited_count(outcomes, run=None):
+    """How many of the projects the run set out to visit it held. A stray
+    registration recorded failed is outside that set, and so is a named
+    project failed as unmapped before Boskos was asked: neither was held."""
+    names = run.mapped_names if run is not None and run.mapped_names is not None else None
+    return sum(
+        1
+        for p, (o, d) in outcomes.items()
+        if o in VISITED_OUTCOMES and not (o == OUTCOME_FAILED and d == REASON_UNMAPPED) and (names is None or p in names)
+    )
 
 
 def tofu_runner(argv, cwd=None, timeout=None, **_):
@@ -943,6 +953,7 @@ def reconcile_pool(server, owner, runner=tofu_runner, dry_run=False, known=None,
 
     def worker():
         busy = set()
+        polled = False
         while True:
             # The stop check may fetch main; it runs outside the lock so the
             # other workers do not hold their leases waiting on it.
@@ -951,7 +962,10 @@ def reconcile_pool(server, owner, runner=tofu_runner, dry_run=False, known=None,
                 if not pending:
                     return
                 if stop:
-                    drain(stop)
+                    # A budget that ran out while this worker was polling busy
+                    # projects: the projects were busy, the budget only timed
+                    # the wait, and the report says the former.
+                    drain(REASON_NOT_REACHED_BUSY if polled and _is_budget_reason(stop) else stop)
                     return
                 project = pending.pop(0)
             try:
@@ -989,6 +1003,7 @@ def reconcile_pool(server, owner, runner=tofu_runner, dry_run=False, known=None,
                     drain(REASON_NOT_REACHED_BUSY if run.budget is not None else REASON_BUSY, OUTCOME_NOT_REACHED if run.budget is not None else OUTCOME_BUSY)
                 return
             pause(wait)
+            polled = True
             busy.clear()
 
     try:
@@ -1016,18 +1031,13 @@ def _check_for_stray_registration(server, owner, runner, dry_run, run, outcomes)
     """One anonymous acquire after the by-name pass. A project Boskos hands
     out that the mapping lacks is released untouched and failed, as the old
     walk did: a registration with no mapping row takes a share of every
-    pull request's leases and nothing else watched reports it. A mapped
-    project freed since its turn is simply reconciled."""
+    pull request's leases and nothing else watched reports it. Every mapped
+    project is already on the record by now (visited, busy or not reached),
+    so one handed back here is released untouched as well."""
     release_failures = {}
 
     def visit(project):
         if project in outcomes:
-            # Real Boskos frees a released project at once, so this is
-            # usually one the pass just reconciled: released untouched.
-            return
-        if project in (run.mapped_names or ()):
-            # Mapped, busy at its turn, free now: reconciled.
-            _record(project, outcomes, runner, dry_run, run)
             return
         outcomes[project] = (OUTCOME_FAILED, REASON_UNMAPPED)
         _line(project, outcomes[project])
@@ -1285,11 +1295,8 @@ def _run(args, outcomes, error, run):
         visited = visited_count(outcomes, run)
         if args.all and outcomes and visited == 0 and not run.main_moved:
             # Busy for the whole budget, unregistered under the mapped name,
-            # or a budget the poll ate: whichever, nothing applied today.
-            # Every project busy or never registered under its mapped name
-            # for the whole budget: a green build that applied nothing would
-            # hide a pool held all day or a Boskos registration that no longer
-            # matches the mapping.
+            # or a budget the poll ate: whichever, nothing applied today, and
+            # a green build would hide it.
             error.append(REASON_VISITED_NONE % len(outcomes))
             print("ERROR: %s" % error[-1], file=sys.stderr)
             return EXIT_FAILED
