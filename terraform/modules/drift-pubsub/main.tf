@@ -75,6 +75,49 @@ locals {
     local.lease_filter,
     local.cluster_filter,
   ]))
+
+  # The identity the sink below will publish as, named before the sink exists
+  # so the grant can precede it. unique_writer_identity makes this the
+  # project's Logging service agent, one per project rather than one per sink,
+  # so it is derivable from the project number alone.
+  #
+  # The sink's postcondition checks this against what Logging actually returns,
+  # because a wrong guess here is the silently-inert pipeline the grant's own
+  # comment describes.
+  derived_sink_writer_identity = "serviceAccount:service-${data.google_project.this.number}@gcp-sa-logging.iam.gserviceaccount.com"
+
+  # A project where Logging reports some other identity would fail that
+  # postcondition on every plan from then on, taking the whole composition with
+  # it and leaving no way out but editing this module. The override is that way
+  # out: it moves the grant and the postcondition together, so setting it to
+  # what Logging reported makes the apply correct rather than merely quiet.
+  expected_sink_writer_identity = coalesce(var.sink_writer_identity_override, local.derived_sink_writer_identity)
+}
+
+data "google_project" "this" {
+  project_id = var.project_id
+}
+
+# Creating the first sink in a project materialises the Logging service agent
+# as a side effect, which is too late: the grant below has to name the agent
+# before the sink is created, and IAM will not bind a service account that does
+# not exist. This asks Service Usage for it up front. A project that has ever
+# held a sink already has one and this is a no-op there.
+#
+# Do not delete this as dead weight. generateServiceIdentity returns an *empty*
+# identity for logging.googleapis.com -- no email, which is why the provider had
+# to be taught not to error on it -- so it looks like it achieves nothing. The
+# minting is a server-side side effect of the call, not something the response
+# reports. Measured on a project with the API enabled and no sink ever created:
+# granting roles/pubsub.publisher to service-<number>@gcp-sa-logging fails with
+# "Service account ... does not exist", the same grant succeeds immediately
+# after this call, and the call still returns empty. Enabling the API is not
+# what creates the agent.
+resource "google_project_service_identity" "logging" {
+  provider = google-beta
+
+  project = var.project_id
+  service = "logging.googleapis.com"
 }
 
 resource "google_pubsub_topic" "drift_audit" {
@@ -117,6 +160,57 @@ resource "google_pubsub_subscription" "drift_audit" {
   }
 }
 
+# IMPORTANT: without this grant the sink is silently inert. Log Router surfaces
+# no error, the topic receives nothing, and the only trace is an export-error
+# metric nobody is watching. It is the most likely reason a freshly applied
+# drift pipeline delivers zero messages, and it looks identical to "no drift
+# happened" from the consumer's side.
+#
+# This grant used to read google_logging_project_sink.drift_audit.writer_identity,
+# which ordered it *after* the sink: Logging starts routing the moment the sink
+# exists, so every apply had a window -- measured at 0.7s in the audit log on
+# #2426 -- where the sink published to a topic it could not write, and Logging
+# mailed every project owner an "[ACTION REQUIRED] Cloud Logging sink
+# configuration error" with topic_permission_denied. Naming the identity from
+# the project number instead inverts the order to grant-then-sink and closes
+# the window. local.expected_sink_writer_identity carries the "serviceAccount:" prefix,
+# as writer_identity did.
+#
+# `.id`, never `.name`. A replaced topic or subscription loses its whole IAM
+# policy in GCP, and a binding keyed on the plan-time-known `.name` is left out
+# of the plan that replaced it — green apply, empty policy. chat-pubsub's
+# main.tf carries the full account of that failure.
+resource "google_pubsub_topic_iam_member" "sink_writer" {
+  project = var.project_id
+  topic   = google_pubsub_topic.drift_audit.id
+  role    = "roles/pubsub.publisher"
+  member  = local.expected_sink_writer_identity
+
+  depends_on = [google_project_service_identity.logging]
+}
+
+# Deleting a sink does not stop the export at the same instant. The Log Router
+# holds the sink's configuration on a fleet that converges over minutes, and
+# the audit log on #2426 has Terraform deleting the sink and the topic 0.6s
+# apart -- so the router kept exporting to a topic that was already gone and
+# Logging mailed every project owner a topic_not_found error, on every destroy.
+#
+# Terraform has no way to wait for that convergence, and Logging exposes no
+# signal to wait on, so this is a timer. It sits between the sink and both the
+# grant and the topic: created after the grant and before the sink, it is
+# destroyed after the sink and before them, which is the order the Log Router
+# needs. Create costs nothing (no create_duration), and the whole delay is
+# paid once per destroy.
+#
+# Keeping the grant on the far side of the wait matters as much as the topic
+# does. Revoking publish while the router is still exporting trades
+# topic_not_found for topic_permission_denied -- the same email.
+resource "time_sleep" "sink_drain" {
+  destroy_duration = var.sink_drain_duration
+
+  depends_on = [google_pubsub_topic_iam_member.sink_writer]
+}
+
 resource "google_logging_project_sink" "drift_audit" {
   project     = var.project_id
   name        = var.sink_name
@@ -127,30 +221,25 @@ resource "google_logging_project_sink" "drift_audit" {
   # an identity shared across every Google Cloud customer. With it the sink
   # publishes as this project's own logging service agent,
   # service-<project-number>@gcp-sa-logging.iam.gserviceaccount.com, so the
-  # grant below admits only sinks belonging to this project.
+  # grant above admits only sinks belonging to this project.
   #
   # "Unique" means unique per project, not per sink: every sink here with this
   # flag set shares the identity, so the grant is not narrower than the project.
   unique_writer_identity = true
-}
 
-# IMPORTANT: without this grant the sink is silently inert. Log Router surfaces
-# no error, the topic receives nothing, and the only trace is an export-error
-# metric nobody is watching. It is the most likely reason a freshly applied
-# drift pipeline delivers zero messages, and it looks identical to "no drift
-# happened" from the consumer's side.
-#
-# writer_identity already carries the "serviceAccount:" prefix.
-#
-# `.id`, never `.name`. A replaced topic or subscription loses its whole IAM
-# policy in GCP, and a binding keyed on the plan-time-known `.name` is left out
-# of the plan that replaced it — green apply, empty policy. chat-pubsub's
-# main.tf carries the full account of that failure.
-resource "google_pubsub_topic_iam_member" "sink_writer" {
-  project = var.project_id
-  topic   = google_pubsub_topic.drift_audit.id
-  role    = "roles/pubsub.publisher"
-  member  = google_logging_project_sink.drift_audit.writer_identity
+  # The grant above names this identity rather than reading it from here, so
+  # nothing else would notice a project where the guess is wrong -- the apply
+  # would go green over a sink that cannot publish, which is the failure the
+  # grant's comment calls the hardest one to see. Checking it here turns that
+  # into a failed apply naming both identities.
+  lifecycle {
+    postcondition {
+      condition     = self.writer_identity == local.expected_sink_writer_identity
+      error_message = "sink ${var.sink_name} publishes as ${self.writer_identity}, not the ${local.expected_sink_writer_identity} that roles/pubsub.publisher was granted to, so it cannot write to topic ${var.topic_name}. Set sink_writer_identity_override = \"${self.writer_identity}\" to move the grant and this check onto the identity Logging reported; granting the role by hand will not clear this, because the check compares identities rather than grants. Then open an issue: the module derives the identity from the project number and this project does not follow that form."
+    }
+  }
+
+  depends_on = [time_sleep.sink_drain]
 }
 
 // Nobody, on an install: the sink above is the only publisher, which is what

@@ -781,6 +781,14 @@ passed, so its defaults decide the 31-day retention and the cluster scope,
 which is every GKE cluster in the project; a caller that needs the module's
 other knobs instantiates it directly.
 
+The module creates the sink after its publish grant and holds a two-minute
+wait between deleting the sink and deleting the topic, so that Cloud Logging
+never routes to a topic it cannot reach and mails every project owner about
+it. That wait is why a destroy of this configuration pauses once the sink is
+gone;
+[the module's README](../../modules/drift-pubsub/README.md#why-the-sink-is-created-last-and-destroyed-first)
+is canonical for both orderings.
+
 Three outputs, each `null` while the flag is off: `drift_pubsub_topic`,
 `drift_pubsub_subscription`, and `drift_pubsub_subscription_id`, the
 fully-qualified path the drift detector's `--subscription` flag takes.
