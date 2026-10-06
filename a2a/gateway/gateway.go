@@ -166,6 +166,10 @@ type Gateway struct {
 	// door is armed and never consulted for a message from a real backend.
 	// Separate from pm on purpose: see Config.InjectPrincipalMapPath.
 	injectPM *PrincipalMap
+	// a2aPM and a2aAudience are the A2A door's, built the same way from its
+	// own file (Config.A2ADoorPrincipalMapPath).
+	a2aPM       *PrincipalMap
+	a2aAudience *PrincipalMap
 	// gchatAllowed and gchatAllowAll gate the gchat backend's identity
 	// resolution (Config.GchatAllowedUsers, lowercased at build).
 	gchatAllowed  map[string]bool
@@ -229,6 +233,11 @@ func New(o Options) (*Gateway, error) {
 		// Backend would mean, and "" in an authority block is worse than
 		// the truth.
 		backend = injectBackend
+	} else if backend == "" && o.Config.A2ADoorArmed() {
+		// The A2A door alone, likewise. With both doors and no real
+		// backend the inject door wins the default, and every message
+		// through either stamps its own.
+		backend = a2aBackend
 	}
 	if backend == injectBackend {
 		// Said out loud, and repeated on the door's read route
@@ -236,8 +245,16 @@ func New(o Options) (*Gateway, error) {
 		// like this, but a `mode: next` install whose relay URL failed to
 		// render looks exactly the same, and the difference between the
 		// two must not be silence.
-		log.Warn("the gateway is running on the inject door alone: no Discord token, Slack pair or Chat relay is armed, " +
-			"so nothing but the eval door can reach this install (inject-only)")
+		if o.Config.A2ADoorArmed() {
+			log.Warn("the gateway is running on the inject and A2A doors alone: no Discord token, Slack pair or Chat relay is armed, " +
+				"so nothing but the two doors and the console can reach this install (the read route still reports inject-only)")
+		} else {
+			log.Warn("the gateway is running on the inject door alone: no Discord token, Slack pair or Chat relay is armed, " +
+				"so nothing but the eval door can reach this install (inject-only)")
+		}
+	} else if backend == a2aBackend {
+		log.Warn("the gateway is running on the A2A door alone: no Discord token, Slack pair or Chat relay is armed, " +
+			"so nothing but the A2A door and the console can reach this install")
 	}
 	// gchat resolves identity from the Google-asserted email, not from the
 	// map — an empty map is only a lockout on the backends that use one
@@ -267,6 +284,21 @@ func New(o Options) (*Gateway, error) {
 		if injectPM.Len() == 0 {
 			log.Warn("the inject door's principal map is empty; every injected message will be dropped at verification",
 				"path", o.Config.InjectPrincipalMapPath)
+		}
+	}
+	var a2aPM, a2aAudience *PrincipalMap
+	if o.Config.A2ADoorArmed() {
+		a2aPM, err = LoadPrincipalMap(o.Config.A2ADoorPrincipalMapPath)
+		if err != nil {
+			return nil, err
+		}
+		a2aAudience = a2aPM.Section(a2aPrincipalPrefix, injectEvalPrincipalPrefix)
+		// Counted on the section the door honours, not the raw file: a map
+		// whose lines forgot the a2a: prefix or point outside eval: has
+		// entries and admits nobody.
+		if a2aAudience.Len() == 0 {
+			log.Warn("the A2A door's principal map carries no a2a: entry mapped to an eval: identity; every message through it will be dropped at verification",
+				"path", o.Config.A2ADoorPrincipalMapPath, "entries", a2aPM.Len())
 		}
 	}
 	gchatAllowed := map[string]bool{}
@@ -328,6 +360,8 @@ func New(o Options) (*Gateway, error) {
 		backend:        backend,
 		injectPM:       injectPM,
 		injectAudience: injectAudience,
+		a2aPM:          a2aPM,
+		a2aAudience:    a2aAudience,
 		gchatAllowed:   gchatAllowed,
 		gchatAllowAll:  o.Config.GchatAllowAllUsers,
 		targetAllowed:  targetAllowed,
@@ -510,7 +544,7 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	//
 	// A chat turn's caller is a person, for whom a late answer beats none:
 	// the lock first, then a whole turn, as before the door existed.
-	if backend == injectBackend {
+	if backend == injectBackend || backend == a2aBackend {
 		ctx, cancel := context.WithTimeout(g.runCtx, g.turnBudget)
 		defer cancel()
 		g.runTurn(ctx, msg, backend, principal)
@@ -841,6 +875,9 @@ func (g *Gateway) principalMapFor(backend string) *PrincipalMap {
 	if backend == injectBackend && g.injectAudience != nil {
 		return g.injectAudience
 	}
+	if backend == a2aBackend && g.a2aAudience != nil {
+		return g.a2aAudience
+	}
 	return g.pm
 }
 
@@ -890,6 +927,17 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		source := TerminalFromExecutor
 		if terminalSubject == lib.TaskSupervisorSubject(addressee, active.TaskID) {
 			source = TerminalFromSupervisor
+		}
+		// The deliverable too, from the stream, for the same program: the
+		// status card posted above never carries the result's text, and
+		// a door that inferred its artifact from the last post would hand
+		// the card over as the answer.
+		if task.State == lib.StateCompleted {
+			if art := task.Artifact(lib.ArtifactResult); art != nil {
+				if result := joinTextParts(art.Parts); result != "" {
+					g.observeTaskDelivered(rec.Key, active.TaskID, result)
+				}
+			}
 		}
 		g.observeTaskTerminal(rec.Key, active.TaskID, task.State, source, finalMessageText(task))
 		healed, healedSource, healedTask = true, source, task
@@ -1360,6 +1408,14 @@ func (g *Gateway) observeTaskStarted(conversation, taskID string) {
 func (g *Gateway) observeTaskTerminal(conversation, taskID string, state lib.TaskState, source TerminalSource, reason string) {
 	if observer, ok := g.adapter.(TaskObserver); ok {
 		observer.TaskTerminal(conversation, taskID, state, source, reason)
+	}
+}
+
+// observeTaskDelivered hands a DeliverableObserver the completed task's
+// result whole, before the relay posts it in chunks. See the interface.
+func (g *Gateway) observeTaskDelivered(conversation, taskID, result string) {
+	if observer, ok := g.adapter.(DeliverableObserver); ok {
+		observer.TaskDelivered(conversation, taskID, result)
 	}
 }
 

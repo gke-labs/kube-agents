@@ -118,8 +118,17 @@
 # it forty-three (129) of fifty-seven (171), +6: two front-door turns, no
 # fixture. chat-voice-ack-names-target makes it forty-four (132) of
 # fifty-eight (174), +3 more: one front-door turn plus the card round trip.
-# bootstrap-inventory-ranking-delivery makes it
-# forty-five (135) of fifty-nine (177), +3 more at its 600s hint.
+# bootstrap-inventory-ranking-delivery makes it forty-five (135) of
+# fifty-nine (177), +3 more at its 600s hint. Counted from the lists again
+# (fifty-one here, chat-question-wake-stays-silent among them, and fourteen
+# in the presubmit file before them, sixty-five cases and 195 units),
+# chat-voice-retry-says-it-is-retried makes it fifty-two (156) of
+# sixty-six (198), +3 more: one front-door turn on a planted card, no worker.
+# chat-voice-final-attempt-is-not-retried (after it) makes it fifty-three
+# (159) of sixty-seven (201), +3 more: the same shape on the card's last
+# attempt. chat-voice-failure-leads-with-fact (the last entry below) makes
+# it fifty-four (162) of sixty-eight (204), +3 more: the same shape on a
+# blocked card.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
 # answer it plainly: 1734-2693 serial minutes of work at a realised
@@ -353,6 +362,39 @@
 # pull request. deployer: noop, read-only over the seeded fleet.
 ./tasks/obtainability-declared-intent-no-finding/task.yaml
 
+# The compliance stream's declared-intent case (#1408): the same seeded-intent
+# namespace, whose missing NetworkPolicy is the 2.6 posture the same
+# knowledge/ note declares. It runs the compliance audit and grades the
+# security ledger: no finding id for the namespace, and a Declared intent row
+# naming the note. Red on main's images (the finding published), three greens
+# on the branch's, on a dev install. One case, three units: this file's share
+# is forty-nine cases (147 units) of a sixty-three-case, 189-unit matrix (with
+# the presubmit file's fourteen). deployer: noop, read-only over the seeded fleet.
+./tasks/compliance-declared-intent-no-finding/task.yaml
+
+# The compliance stream's other posture (#1408): 2.7 default-sa-automount,
+# declared per workload and fixed per namespace. seeded-token holds a declared
+# workload and an undeclared sibling; the case runs the compliance audit and
+# grades the ledger: the declared workload under Declared intent, the sibling
+# still a finding with a manual fix naming the declared one. Red on main's
+# images (both published as findings), three greens on the branch's, on a dev
+# install. One case, three units: this file's share is fifty cases
+# (150 units) of a sixty-four-case, 192-unit matrix (with the presubmit file's
+# fourteen). deployer: noop, read-only over the seeded fleet.
+./tasks/compliance-declared-token-shields-siblings/task.yaml
+
+# The patch stream's declared-intent case (#1408): seeded-c publishes no GKE
+# upgrade notifications, the 3.10 posture every fleet cluster carries and no
+# other case grades, and the same knowledge/ note declares it for seeded-c
+# alone. It runs the upgrade readiness audit and grades its ledger: no finding
+# id for seeded-c's notifications, the other clusters' still findings, and a
+# Declared intent row naming the note. Red on main's tree (the finding
+# published), three greens on the branch's, on a dev install. One case, three
+# units: this file's share is fifty-seven cases (171 units) of a seventy-one-case,
+# 213-unit matrix (with the presubmit file's fourteen). deployer: noop,
+# read-only over the seeded fleet.
+./tasks/patch-declared-intent-no-finding/task.yaml
+
 # ── Moved here 2026-09-15 from the commented-out state (#1546, #1564) ───────
 # Nine cases; each carries the blocker that kept it parked. None was
 # activatable as a presubmit seat then and none is now; what changed is
@@ -574,3 +616,28 @@
 # threshold before it posts the record. Nightly rather than presubmit for that
 # wait.
 ./tasks/autoops-controller-stall-triage/task.yaml
+
+# The front door's reply when a card's worker crashes (agents/chat/SOUL.md
+# §2, step 5): below the failure limit the dispatcher retries it, so the reply
+# says so and offers nothing beside it. A reply that states the retry but
+# names the agent, task or worker reds the case's no-internals check.
+# deployer: noop; the card and its crash are planted per run
+# (bench/kube_agents_bench/card_wake.py), so one front-door turn and no
+# worker: filing or unblocking a card fails its catastrophic fence.
+./tasks/chat-voice-retry-says-it-is-retried/task.yaml
+
+# The front door's reply when a card's worker fails its last attempt
+# (agents/chat/SOUL.md §2, step 5): the dispatcher gave up and nothing
+# retries a blocked card, so the reply says it stopped and does not say it
+# is being retried. deployer: noop; the card and its timeouts are planted
+# per run (bench/kube_agents_bench/card_wake.py, timed_out_final), so one
+# front-door turn and no worker: filing or unblocking a card fails its
+# catastrophic fence.
+./tasks/chat-voice-final-attempt-is-not-retried/task.yaml
+
+# The front door's reply when a card blocks: reads the card, leads with the
+# fact and the card's reason, no apology (agents/chat/SOUL.md §2, step 5).
+# deployer: noop; the blocked card is planted per run
+# (bench/kube_agents_bench/card_wake.py), so one front-door turn and no
+# worker: filing or unblocking a card fails the case's catastrophic fence.
+./tasks/chat-voice-failure-leads-with-fact/task.yaml

@@ -164,14 +164,16 @@ class ReportContainsVerifier(BaseVerifier):
     Substring matching, deliberately: the task author chose the phrase (a
     planted defect's name, a required noun), so an exact match is fair.
     Anything fuzzier belongs to the judge, not to a blocking check.
-    ``forbidden_patterns`` is the one regex exception, for the shape a
+    ``forbidden_patterns`` is the first regex exception, for the shape a
     substring cannot express: a banned word whose negated uses are
     legitimate ("no guarantee"). Each is ``re.search``ed against a
     line-preserving variant of the same normalization — newlines survive,
     so a Markdown bullet or heading with no terminal punctuation is its own
     segment and a pattern may anchor on ``\\n``; the flat collapse would
     otherwise fuse a negated bullet into its unnegated neighbour before the
-    regex runs.
+    regex runs. ``any_of_patterns`` are alternatives to ``any_of_phrases``
+    for the phrase a substring cannot bound: "it stopped" also matches
+    "limit stopped". Each is ``re.search``ed against the flat normalization.
 
     Both sides are normalized first, by ``_normalize`` above: lowercased,
     Markdown emphasis dropped, whitespace runs collapsed. These are the
@@ -199,10 +201,11 @@ class ReportContainsVerifier(BaseVerifier):
     # spellings ("HPA" / "HorizontalPodAutoscaler"), all-of required_phrases
     # would punish a correct report for choosing the other name.
     any_of_phrases: list[str] = Field(default_factory=list)
+    any_of_patterns: list[str] = Field(default_factory=list)
     forbidden_patterns: list[str] = Field(default_factory=list)
     scope: Literal["final", "full"] = "final"
 
-    @field_validator("forbidden_patterns")
+    @field_validator("forbidden_patterns", "any_of_patterns")
     @classmethod
     def _forbidden_patterns_compile(cls, patterns: list[str]) -> list[str]:
         for pattern in patterns:
@@ -226,8 +229,9 @@ class ReportContainsVerifier(BaseVerifier):
         pattern_hits = [
             p for p in self.forbidden_patterns if re.search(p, _normalize_lines(raw))
         ]
-        any_of_miss = bool(self.any_of_phrases) and not any(
-            _normalize(p) in text for p in self.any_of_phrases
+        any_of_miss = bool(self.any_of_phrases or self.any_of_patterns) and not (
+            any(_normalize(p) in text for p in self.any_of_phrases)
+            or any(re.search(p, text) for p in self.any_of_patterns)
         )
         if missing or present or pattern_hits or any_of_miss:
             parts = []
@@ -241,7 +245,8 @@ class ReportContainsVerifier(BaseVerifier):
                 )
             if any_of_miss:
                 parts.append(
-                    f"none of the alternative phrasings present: {self.any_of_phrases}"
+                    "none of the alternative phrasings present: "
+                    f"{self.any_of_phrases + self.any_of_patterns}"
                 )
             return VerificationResult(
                 success=False,
@@ -249,10 +254,11 @@ class ReportContainsVerifier(BaseVerifier):
                 reason="; ".join(parts),
             )
         # The success reason has to name every clause that ran, including
-        # any_of_phrases. Counting only required and forbidden made a check
-        # built from any_of alone report "all 0 required phrase(s)", which
-        # reads exactly like a check that asserted nothing -- and the failure
-        # branch above is the only thing that would have said otherwise.
+        # any_of_phrases and any_of_patterns. Counting only required and
+        # forbidden made a check built from any_of alone report "all 0
+        # required phrase(s)", which reads exactly like a check that asserted
+        # nothing -- and the failure branch above is the only thing that would
+        # have said otherwise.
         satisfied = [
             f"all {len(self.required_phrases)} required phrase(s)",
             f"none of {len(self.forbidden_phrases)} forbidden",
@@ -261,9 +267,10 @@ class ReportContainsVerifier(BaseVerifier):
             satisfied.append(
                 f"none of {len(self.forbidden_patterns)} forbidden pattern(s)"
             )
-        if self.any_of_phrases:
+        if self.any_of_phrases or self.any_of_patterns:
             satisfied.append(
-                f"at least one of {len(self.any_of_phrases)} alternative phrasing(s)"
+                "at least one of "
+                f"{len(self.any_of_phrases) + len(self.any_of_patterns)} alternative phrasing(s)"
             )
         return VerificationResult(
             success=True,

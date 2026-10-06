@@ -573,6 +573,12 @@ def module_names(tree: ast.Module) -> set[str]:
         elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
             names.update((a.asname or a.name).split(".")[0] for a in stmt.names)
         elif isinstance(stmt, (ast.If, ast.Try, ast.With)):
+            if (
+                isinstance(stmt, ast.With)
+                and stmt.items
+                and isinstance(target := stmt.items[0].optional_vars, ast.Name)
+            ):
+                names.add(target.id)
             for child in ast.iter_child_nodes(stmt):
                 if isinstance(child, ast.stmt):
                     stack.append(child)
@@ -595,7 +601,13 @@ def _own(node: ast.AST) -> set[str]:
 
 
 def _binds(stmt: ast.stmt) -> set[str]:
-    """Names ``stmt`` binds on every path through it: none for a branch, which may not have run."""
+    """Names ``stmt`` binds on every path through it: none for a branch, which may not have run.
+
+    For a ``with`` or ``async with``, counts only the first item's bare Name target: a
+    destructuring target can fail to unpack and a subsequent item in a multi-item statement
+    can raise during evaluation or entry, both of which a suppressing ``__exit__`` would
+    swallow to leave the target unbound after the block.
+    """
     if isinstance(stmt, ast.Assign):
         return {name for target in stmt.targets for name in _stored(target)}
     if isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
@@ -604,6 +616,10 @@ def _binds(stmt: ast.stmt) -> set[str]:
         return {(a.asname or a.name).split(".")[0] for a in stmt.names}
     if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         return {stmt.name}
+    if isinstance(stmt, (ast.With, ast.AsyncWith)):
+        if stmt.items and isinstance(target := stmt.items[0].optional_vars, ast.Name):
+            return {target.id}
+        return set()
     return set()
 
 
@@ -620,10 +636,11 @@ def unbound(tree: ast.Module, node: ast.AST) -> list[str]:
     """Names ``node``, somewhere in ``tree``, reads that nothing binds before it runs.
 
     Bound means a module-level name or builtin, a parameter of an enclosing
-    function, the target of an enclosing ``for``, ``with`` or ``except``, a
-    name ``node`` binds ahead of its read (a comprehension variable, not an
-    assignment's own target), or a plain assignment, import or ``def`` ahead
-    of it in an enclosing block outside a class body.
+    function, the target of an enclosing ``for`` or ``except``, the target of
+    an earlier or enclosing ``with``, a name ``node`` binds ahead of its read
+    (a comprehension variable, not an assignment's own target), or a plain
+    assignment, import or ``def`` ahead of it in an enclosing block outside a
+    class body.
     """
     parents = {id(child): parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
     bound = module_names(tree) | _own(node)

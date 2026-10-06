@@ -255,6 +255,12 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 
 	switch s.Status.State {
 	case lib.StateCompleted:
+		// Whole, to the adapter whose caller is a program, before the chunked
+		// posts below (DeliverableObserver). A non-text result hands over
+		// nothing: the notice that replaces it is not the deliverable.
+		if result != "" {
+			g.observeTaskDelivered(rec.Key, taskID, result)
+		}
 		if result == "" {
 			result = completedNonTextResult
 		}

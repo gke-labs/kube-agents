@@ -53,6 +53,10 @@ const (
 	defaultWorkerTag        = "latest"
 )
 
+// defaultA2ADoorPrincipalMapPath is the same for the A2A door's map: its own
+// file, keys prefixed a2a:, for the reason the inject door's is.
+const defaultA2ADoorPrincipalMapPath = "/etc/a2a/a2a-door-principal-map/principals"
+
 // The display-mode values, matching the GoogleChatSpec.Mode enum.
 const (
 	displayModeDefault = "default"
@@ -154,6 +158,33 @@ type Config struct {
 	// sender could hold -- the property the Discord mapping table has and
 	// the reason the gateway spec calls that table a feature.
 	InjectPrincipalMapPath string
+
+	// A2ADoorListen is the A2A door's HTTP listen address (A2A_DOOR_LISTEN),
+	// and setting it arms the door. Like the inject door it is a side door,
+	// not a backend: it can be armed beside a real backend or alone, and it
+	// is not counted by the one-real-backend guard because it consumes
+	// nothing and competes for nothing. See a2a/gateway/a2adoor.go.
+	A2ADoorListen string
+
+	// A2ADoorToken is the bearer token the door requires on every RPC
+	// request (A2A_DOOR_TOKEN); the agent card is the one unauthenticated
+	// route. No unauthenticated mode for the RPCs, for the inject door's
+	// reason: the port-forward path is served from inside the pod, past
+	// the NetworkPolicy.
+	A2ADoorToken string
+
+	// A2ADoorPrincipalMapPath is the door's OWN principal map
+	// (A2A_DOOR_PRINCIPAL_MAP): keys prefixed a2a:, values eval-only
+	// identities, never a fallback to the chat map or the inject map. The
+	// developer identity class (ID tokens) arrives as a second resolver
+	// beside this file, not as an entry in it.
+	A2ADoorPrincipalMapPath string
+
+	// A2ADoorPublicURL is the URL the agent card advertises for the door's
+	// JSON-RPC endpoint (A2A_DOOR_PUBLIC_URL): what a client reaches it at,
+	// which behind a port-forward or an ingress is not the listen address.
+	// Empty makes the card advertise the address it was fetched from.
+	A2ADoorPublicURL string
 
 	// DisplayMode is the existing Chat integration's default-vs-debug split
 	// (GoogleChatSpec.Mode), honoured by this relay rather than reinvented:
@@ -372,13 +403,14 @@ type Config struct {
 }
 
 // Backend names the REAL chat backend this config arms: "gchat", "slack",
-// "discord", or "" when the inject side door is the only way in. FromEnv
+// "discord", or "" when a side door (inject, A2A, or both) is the only way
+// in. FromEnv
 // refuses more than one real backend, so the order here only decides what a
 // hand-built Config means.
 //
-// The door is deliberately not one of the answers. It can be armed beside
-// any one backend, so "which backend is this gateway" and "is the door open"
-// are two questions, and collapsing them is what would make the door
+// The doors are deliberately not among the answers. Either can be armed
+// beside any one backend, so "which backend is this gateway" and "is a door
+// open" are two questions, and collapsing them is what would make a door
 // exclusive again.
 func (c *Config) Backend() string {
 	switch {
@@ -388,8 +420,8 @@ func (c *Config) Backend() string {
 		return slackBackend
 	case c.DiscordToken != "":
 		return discordBackend
-	case c.InjectListen != "":
-		// No real backend: the door is the whole of the ingress, and the
+	case c.InjectListen != "" || c.A2ADoorListen != "":
+		// No real backend: a door is the whole of the ingress, and the
 		// attribution on a message that comes through it is the door's own.
 		return ""
 	default:
@@ -403,6 +435,9 @@ func (c *Config) Backend() string {
 
 // InjectArmed reports whether the side door is open.
 func (c *Config) InjectArmed() bool { return c.InjectListen != "" }
+
+// A2ADoorArmed reports whether the A2A door is open.
+func (c *Config) A2ADoorArmed() bool { return c.A2ADoorListen != "" }
 
 // FromEnv loads the config from the environment.
 func FromEnv() (*Config, error) {
@@ -451,6 +486,10 @@ func FromEnv() (*Config, error) {
 	cfg.InjectListen = strings.TrimSpace(os.Getenv("A2A_INJECT_LISTEN"))
 	cfg.InjectToken = strings.TrimSpace(os.Getenv("A2A_INJECT_TOKEN"))
 	cfg.InjectPrincipalMapPath = envOr("A2A_INJECT_PRINCIPAL_MAP", defaultInjectPrincipalMapPath)
+	cfg.A2ADoorListen = strings.TrimSpace(os.Getenv("A2A_DOOR_LISTEN"))
+	cfg.A2ADoorToken = strings.TrimSpace(os.Getenv("A2A_DOOR_TOKEN"))
+	cfg.A2ADoorPrincipalMapPath = envOr("A2A_DOOR_PRINCIPAL_MAP", defaultA2ADoorPrincipalMapPath)
+	cfg.A2ADoorPublicURL = strings.TrimSpace(os.Getenv("A2A_DOOR_PUBLIC_URL"))
 	cfg.DisplayMode = envOr("A2A_CHAT_DISPLAY_MODE", displayModeDebug)
 	if cfg.DisplayMode != displayModeDefault && cfg.DisplayMode != displayModeDebug {
 		return nil, fmt.Errorf("A2A_CHAT_DISPLAY_MODE %q: want %q or %q", cfg.DisplayMode, displayModeDefault, displayModeDebug)
@@ -480,8 +519,9 @@ func FromEnv() (*Config, error) {
 	if cfg.DiscordToken != "" {
 		armed = append(armed, "DISCORD_TOKEN")
 	}
-	// The inject door is NOT in that list, decided 2026-09-17 on the design
-	// doc's review. The guard exists so that arming two backends cannot leave
+	// The doors (inject, A2A) are NOT in that list, decided 2026-09-17 on
+	// the design doc's review for the inject door and holding for its
+	// sibling. The guard exists so that arming two backends cannot leave
 	// one of them silently unconsumed: two processes on one Chat relay
 	// durable split its event deliveries, and the symptom is a gateway that
 	// looks healthy and answers half the messages. A local HTTP door has no
@@ -501,11 +541,11 @@ func FromEnv() (*Config, error) {
 		// inject-only when it does, and says so on the door's read route,
 		// because a next install whose relay URL failed to render looks the
 		// same. The spec's test-backend section states the same decision.
-		if cfg.InjectListen == "" {
-			return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair (Socket Mode), or A2A_INJECT_LISTEN (the dev-only inject side door)")
+		if cfg.InjectListen == "" && cfg.A2ADoorListen == "" {
+			return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair (Socket Mode), A2A_INJECT_LISTEN (the dev-only inject side door), or A2A_DOOR_LISTEN (the A2A door for agent callers)")
 		}
 	default:
-		return nil, fmt.Errorf("more than one chat backend is configured (%s): one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend. The inject side door (A2A_INJECT_LISTEN) is not a backend in this sense and may sit beside any one of them", strings.Join(armed, ", "))
+		return nil, fmt.Errorf("more than one chat backend is configured (%s): one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend. The side doors (A2A_INJECT_LISTEN, A2A_DOOR_LISTEN) are not backends in this sense and may sit beside any one of them", strings.Join(armed, ", "))
 	}
 	// Fail closed: a door with no token would be reachable by anything that
 	// reaches the listener, and the port-forward path the runner uses is
@@ -514,6 +554,9 @@ func FromEnv() (*Config, error) {
 	// Config.InjectToken.
 	if cfg.InjectListen != "" && cfg.InjectToken == "" {
 		return nil, fmt.Errorf("A2A_INJECT_TOKEN is required when A2A_INJECT_LISTEN is set: the inject door authenticates every request with a bearer token, because neither its loopback bind nor the NetworkPolicy in front of it governs the port-forward path its caller uses")
+	}
+	if cfg.A2ADoorListen != "" && cfg.A2ADoorToken == "" {
+		return nil, fmt.Errorf("A2A_DOOR_TOKEN is required when A2A_DOOR_LISTEN is set: the A2A door authenticates every RPC request with a bearer token (the agent card alone is open), for the reason the inject door does; see Config.A2ADoorToken")
 	}
 	// Only when the spawn path is armed: a gateway that spawns nothing has
 	// no session identity to name, and demanding one would break every
