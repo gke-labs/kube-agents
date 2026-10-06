@@ -598,12 +598,50 @@ if [ "${SKIP_HOST_CLUSTER}" != "true" ]; then
     # its fixed paid-tier-3 quota redded every smoke run on 2026-09-02
     # (#1097; diagnosis on #1184). verify_ci_pool_project.py checks the
     # binding, so a project provisioned before this line reports the gap.
+    #
+    # enable_drift_pubsub provisions the drift detector's input and nothing
+    # else: the Log Router sink over the project's GKE clusters, the drift-audit
+    # topic, the pull subscription, and subscriber and viewer on that
+    # subscription for kubeagents-platform-gsa. It is on here because the eval
+    # installs have no other path to it -- hack/ci-deploy.sh is helm over the
+    # release this apply created, with no Terraform in the lease, and a case
+    # that exercises the detector cannot build its own ingress without becoming
+    # the second engine AGENTS.md forbids. Deliberately not enable_drift_detector,
+    # which is the consumer: whether a given lease runs the detector is that
+    # lease's helm upgrade to decide, and pinning it true here would be
+    # overwritten by the next one anyway. This reaches projects onboarded from
+    # here on and no project already registered: verify_ci_pool_project.py does
+    # not check the ingress yet, and section 8 of docs/ci-pool-projects.md
+    # forbids re-running this script on a registered project. So a project
+    # provisioned before this line fails a drift case as broken rather than
+    # reporting the gap, which section 3 of that file states rather than
+    # leaving to be discovered.
+    #
+    # drift_pubsub_topic_publishers is the pool's one departure from what an
+    # install provisions, and it is confined to the pool for the reason the
+    # variable's own description gives: anything that can publish to this topic
+    # can make the detector report a change nobody made, so on a real install
+    # the Log Router sink is the only publisher. A drift case has no other way
+    # to reach the classifier. It cannot make a real write and wait for the
+    # sink -- the export lag is minutes on top of the run's budget, and every
+    # identity a bench run can authenticate as is a *.gserviceaccount.com one
+    # the classifier is right to drop, so the record would never reach the
+    # human tier the case grades. Publishing a synthetic record is what puts
+    # Classify itself under test rather than bypassing it.
+    #
+    # The two runners, same pair and same reason as the project-level grants
+    # above: the presubmit and the nightly run the same script, so a project
+    # granting one leases fine and dies the first night the other draws it.
+    # Topic-scoped, so this is publish on one topic rather than a Pub/Sub role
+    # on the project.
     cat > "${TFVARS}" <<EOF
-project_id     = "${PROJECT_ID}"
-cluster_name   = "${HOST_CLUSTER_NAME}"
-location       = "${REGION}"
-api_server_key = "$(openssl rand -hex 16)"
-model_provider = "vertex_ai"
+project_id          = "${PROJECT_ID}"
+cluster_name        = "${HOST_CLUSTER_NAME}"
+location            = "${REGION}"
+api_server_key      = "$(openssl rand -hex 16)"
+model_provider      = "vertex_ai"
+enable_drift_pubsub = true
+drift_pubsub_topic_publishers = ["${PROW_RUNNER_SA}", "${NIGHTLY_RUNNER_SA}"]
 EOF
 
     KUBE_AGENTS_STATE_BUCKET="${STATE_BUCKET}" \

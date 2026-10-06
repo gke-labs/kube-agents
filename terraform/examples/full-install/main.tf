@@ -500,6 +500,7 @@ module "drift_pubsub" {
   topic_name                     = var.drift_pubsub_topic
   subscription_name              = var.drift_pubsub_subscription
   sink_name                      = var.drift_pubsub_sink
+  topic_publishers               = var.drift_pubsub_topic_publishers
 
   depends_on = [google_project_service.required]
 }

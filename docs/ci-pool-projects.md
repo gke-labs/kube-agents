@@ -62,6 +62,11 @@ KUBE_AGENTS_STATE_PREFIX="full-install/platform-agent-host" \
   ./lifecycle.sh apply
 ```
 
+That is the cluster and nothing else. The script's own tfvars carries more —
+the drift ingress among it (section 3) — so a project stood up from the four
+variables above is a host cluster rather than a pool project. Read the heredoc
+in `scripts/provision_ci_pool_project.sh` for the set it writes.
+
 `api_server_key` is generated the same way `hack/ci-deploy.sh` generates it when unset. It is regenerated on every apply, which is why section 8 forbids re-running the provisioning script after registration.
 
 The managed OpenTelemetry scope is the one step after the apply. The flag is on the GA `gcloud` surface from the version `MIN_GCLOUD_VERSION` in `scripts/installer/min_versions.sh` names (older SDKs carry it under `gcloud beta`), and the provisioning script checks the installed version in its Step 0 so an old SDK fails before the apply rather than after it:
@@ -167,6 +172,16 @@ Every registered project was provisioned before the script ran this step. Measur
   ```
 
 - **The CI health bot's read on the project.** `eval-dashboard-publisher@kube-agents-prow` runs the hourly pool-state scan, the verifier's read-only checks against every registered project ([`docs/ci-health.md`](ci-health.md), "The pool-state scan"). It needs `roles/iam.securityReviewer`, `roles/container.clusterViewer`, `roles/artifactregistry.reader`, `roles/cloudkms.viewer` and `roles/storage.bucketViewer` (`POOL_STATE_READER_ROLES` in the verifier). Section 6's fleet apply grants them (`pool_state_readers`); the verifier fails a project missing one (`--report` carries the binding); a project without them scans as "not checked".
+
+- **The drift detector's audit ingress.** The eval installs run `k8s-operator/cmd/drift-detector`, and it reads one Pub/Sub subscription. [`terraform/modules/drift-pubsub`](../terraform/modules/drift-pubsub/) owns the whole of it — the `platform-agent-drift-audit-sink` Log Router sink over the project's GKE clusters, the `platform-agent-drift-audit` topic, the `platform-agent-drift-audit-sub` pull subscription, and `roles/pubsub.subscriber` plus `roles/pubsub.viewer` for `kubeagents-platform-gsa` on that subscription. `scripts/provision_ci_pool_project.sh` turns the module on with `enable_drift_pubsub = true` in the full-install tfvars; `hack/ci-deploy.sh` creates nothing and only points the detector at the subscription on each lease.
+
+  Both grants are on the subscription rather than the project, which is why they are not in `PLATFORM_GSA_ROLES` above: that set is closed in both directions and read from the project policy, so a project-scoped grant here would fail every project as over-privileged. `roles/pubsub.viewer` is not redundant with subscriber — subscriber carries `subscriptions.consume` but not `subscriptions.get`, and the detector makes exactly that call at startup to read the ack deadline.
+
+  The same tfvars sets `drift_pubsub_topic_publishers` to the same two runner accounts the project-level grants above name, which is the pool's one departure from what an install provisions. On an install the Log Router sink is the only publisher, and that is what makes a record on the topic evidence that the API server saw the call. A drift eval case has to put synthetic records on the topic instead: the classifier drops every `.gserviceaccount.com` principal as automation, so a real cluster write by a bench identity could never reach the human tier the case grades on, and the export would deliver it minutes later in any event. The grant is topic-scoped and goes to the runners, never to `kubeagents-platform-gsa` — the detector must not be reading a stream its own pod can write. No role in `PROW_RUNNER_ROLES` carries `pubsub.topics.publish`, so without this a case dies at its own publish step with a `PermissionDenied`.
+
+  `pubsub.googleapis.com` is deliberately absent from section 1's list and from `REQUIRED_APIS`: the composition enables it as part of the module, and a project missing the ingress needs a composition apply rather than a `gcloud services enable` that would leave it no closer to working.
+
+  **This reaches projects the script onboards from here on, and no project already registered.** Section 8 forbids re-running the script on one, and there is no repair path yet: the script restores whatever `terraform.tfvars` it found on the way out, so nothing per-project persists, and `api_server_key` has no default — a hand-driven apply that does not carry the project's current key forward rotates it and breaks whichever run holds the lease. Until a registered project has the ingress, a drift eval case grades the agent on whichever project Boskos happened to hand the run: the detector starts, the pod reports Ready, it pulls a subscription that does not exist, and the case files no card — which reads as the agent having failed to triage rather than as the project being incomplete.
 
 - **GKE Node Service Account**:
   - `roles/artifactregistry.reader` in `${PROJECT_ID}` to pull operator and agent images. The verifier checks this against the account the host cluster's nodes actually run as, read from `nodePools[].config.serviceAccount` — `default` meaning the Compute default SA. Any role in `AR_PULLER_ROLES` satisfies it, which is `AR_WRITER_ROLES` plus the reader role, since every role that confers push already confers read. Push and pull are separate assertions: a project where only Cloud Build can push fails on this one.
