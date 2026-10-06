@@ -1058,6 +1058,21 @@ DESTRUCTIVE_CHAT_METHODS = frozenset({"delete", "batchdelete", "remove", "purge"
 # list naming it.
 DESTRUCTIVE_SLACK_VERBS = frozenset({"delete", "remove", "kick", "archive"})
 
+# The IAM permission a Pub/Sub pull spends on the subscription. A refused pull
+# names it in the log when the error's own ErrorInfo did not, so the line says
+# what to grant rather than only that something was refused.
+PUBSUB_PULL_PERMISSION = "pubsub.subscriptions.consume"
+# The HTTP status google.api_core gives a PermissionDenied (its ``code``).
+PUBSUB_PERMISSION_DENIED_STATUS = 403
+# Bounds the server's message in a pull-failure log line. Pub/Sub's messages
+# are one sentence ("User not authorized to perform this action.", "Resource
+# not found (resource=...)"); the cap is for the message nobody has seen yet.
+PUBSUB_ERROR_MESSAGE_MAX_CHARS = 160
+# Bounds a subscription path in a log line. The longest legal one is
+# "projects/" + a 30-character project id + "/subscriptions/" + a
+# 255-character name, 309 characters.
+PUBSUB_SUBSCRIPTION_MAX_CHARS = 320
+
 
 class AuthenticationError(Exception):
     """The caller could not be identified.
@@ -2026,6 +2041,66 @@ def _chat_error_fields(exc: Exception) -> dict[str, Any] | None:
     reason = getattr(response, "reason", None)
     if reason:
         fields["reason"] = str(reason)
+    return fields
+
+
+def _pubsub_pull_failure_fields(exc: Exception) -> dict[str, Any]:
+    """Return what a failed Pub/Sub pull can say about itself, for the log.
+
+    google.api_core errors carry the HTTP status as ``code``, and an IAM
+    refusal carries an ErrorInfo whose ``reason`` and ``metadata`` name the
+    refused permission. Read by attribute, so a transport fault without them
+    still yields its type. The server message is kept, sanitized and
+    capped: it is what separates a refusal from a missing subscription. A
+    RetryError's ``cause`` is named by type. The exception's ``str`` is not
+    used, because it also prints the details list.
+    No credential reaches any of these fields: they are what the server said
+    about the caller, never what the caller sent.
+    """
+    fields: dict[str, Any] = {"type": type(exc).__name__}
+    try:
+        status: int | None = int(getattr(exc, "code", None))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        status = None
+    if status is not None:
+        fields["code"] = status
+    reason = getattr(exc, "reason", None)
+    if reason:
+        fields["reason"] = _sanitize_for_logging(str(reason))
+    metadata = getattr(exc, "metadata", None)
+    permission = metadata.get("permission") if hasattr(metadata, "get") else None
+    if permission:
+        fields["permission"] = _sanitize_for_logging(str(permission))
+    elif status == PUBSUB_PERMISSION_DENIED_STATUS:
+        fields["permission"] = f"{PUBSUB_PULL_PERMISSION} (what a pull needs; the error named none)"
+    message = getattr(exc, "message", None)
+    if isinstance(message, str) and message:
+        fields["message"] = _sanitize_for_logging(message, PUBSUB_ERROR_MESSAGE_MAX_CHARS)
+    # A retryable error that outlasts the pull's retry deadline arrives as a
+    # RetryError with no code of its own; the error it gave up on is the
+    # useful part.
+    cause = getattr(exc, "cause", None)
+    if isinstance(cause, BaseException):
+        fields["cause"] = type(cause).__name__
+    return fields
+
+
+def _log_chat_pull_failure(label: str, relay: Any, exc: Exception) -> dict[str, Any]:
+    """Log one failed Chat event pull naming the subscription and the refusal.
+
+    Returns the fields so the caller can hand the type and status back to
+    the puller. The subscription is a resource name, not a credential.
+    """
+    fields = _pubsub_pull_failure_fields(exc)
+    subscription = _sanitize_for_logging(
+        str(getattr(relay, "subscription_path", "")), PUBSUB_SUBSCRIPTION_MAX_CHARS
+    )
+    LOGGER.warning(
+        "%s event pull failed subscription=%s %s",
+        label,
+        subscription,
+        " ".join(f"{key}={value}" for key, value in fields.items()),
+    )
     return fields
 
 
@@ -6233,12 +6308,23 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             if self.a2a_chat_relay is None:
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "a2a chat relay disabled"})
                 return
+            # The subscription rides every answer, so the gateway can name
+            # what it pulls: it is configured with the relay URL only.
+            subscription = getattr(self.a2a_chat_relay, "subscription_path", "")
             try:
                 event = self.a2a_chat_relay.pull()
-                self._json(HTTPStatus.OK, {"event": event})
+                self._json(HTTPStatus.OK, {"event": event, "subscription": subscription})
             except Exception as exc:
-                LOGGER.warning("a2a chat event pull failed: %s", type(exc).__name__)
-                self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "a2a chat event pull failed"})
+                fields = _log_chat_pull_failure("a2a chat", self.a2a_chat_relay, exc)
+                pubsub = {key: fields[key] for key in ("type", "code") if key in fields}
+                self._json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {
+                        "error": "a2a chat event pull failed",
+                        "subscription": subscription,
+                        "pubsub": pubsub,
+                    },
+                )
             return
         if self.path.startswith("/v1/chat/events"):
             if self.chat_relay is None:
@@ -6248,7 +6334,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 event = self.chat_relay.pull()
                 self._json(HTTPStatus.OK, {"event": event})
             except Exception as exc:
-                LOGGER.warning("chat event pull failed: %s", type(exc).__name__)
+                _log_chat_pull_failure("chat", self.chat_relay, exc)
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "chat event pull failed"})
             return
         if self.path != HEALTHZ_PATH:

@@ -259,7 +259,6 @@ class ApplierTest(unittest.TestCase):
             ("        self._bot_user_id: str = \"\"\n", "", "no longer sets _bot_user_id"),
             ("self._team_bot_user_ids, self._other = {}, {}", "self._bot_ids, self._other = {}, {}",
              "no longer sets _team_bot_user_ids"),
-            ("        self._user_name_cache = {}\n", "", "no longer sets _user_name_cache"),
             ("def _resolve_user_name(", "def _user_name(", "_resolve_user_name"),
             ("    async def _resolve_user_name(", "    def _resolve_user_name(",
              "_resolve_user_name is no longer async"),
@@ -665,22 +664,34 @@ class RuntimeTest(unittest.TestCase):
             self._answer(adapter, *_choice())
         self.assertEqual([entry[0] for entry in adapter.log], ["chat_update", "message"])
 
-    def test_the_card_is_looked_up_before_the_rewrite(self):
-        cards = {(CHANNEL, MESSAGE_TS): "t_e0c1"}
-        moments = SimpleNamespace(question_card=lambda channel, ts: cards.get((channel, ts)))
-        adapter = _Adapter()
-        client = _Client(adapter.log)
-        update = client.chat_update
+    def test_the_card_is_looked_up_before_the_name_lookup_and_the_rewrite(self):
+        for during in ("the name lookup", "the rewrite"):
+            with self.subTest(during=during):
+                importlib.reload(runtime)
+                cards = {(CHANNEL, MESSAGE_TS): "t_e0c1"}
+                moments = SimpleNamespace(question_card=lambda channel, ts: cards.get((channel, ts)))
+                adapter = _Adapter()
+                client = _Client(adapter.log)
+                update = client.chat_update
+                resolve = adapter._resolve_user_name
 
-        async def settle_then_update(**kwargs):
-            cards.clear()  # the card moved on and its question was settled meanwhile
-            await update(**kwargs)
+                # The card moves on and its question is settled meanwhile.
+                async def settle_then_update(**kwargs):
+                    if during == "the rewrite":
+                        cards.clear()
+                    await update(**kwargs)
 
-        client.chat_update = settle_then_update
-        adapter._get_client = lambda chat_id, team_id=None: client
-        with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_moments=moments), "gateway.slack_ux_moments": moments}):
-            self._answer(adapter, *_choice())
-        self.assertEqual(adapter.log[-1][1]["text"], "Leave it\n\n" + runtime.CARD_NOTE.format(card="t_e0c1"))
+                async def settle_then_resolve(user_id, chat_id="", team_id=""):
+                    if during == "the name lookup":
+                        cards.clear()
+                    return await resolve(user_id, chat_id=chat_id, team_id=team_id)
+
+                client.chat_update = settle_then_update
+                adapter._resolve_user_name = settle_then_resolve
+                adapter._get_client = lambda chat_id, team_id=None: client
+                with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_moments=moments), "gateway.slack_ux_moments": moments}):
+                    self._answer(adapter, *_choice())
+                self.assertEqual(adapter.log[-1][1]["text"], "Leave it\n\n" + runtime.CARD_NOTE.format(card="t_e0c1"))
 
     def test_the_card_is_looked_up_before_the_clickers_name(self):
         cards = {(CHANNEL, MESSAGE_TS): "t_e0c1"}
@@ -740,6 +751,19 @@ class RuntimeTest(unittest.TestCase):
         with self.assertLogs(runtime.logger, level="WARNING"):
             self._answer(adapter, *_choice(1, "Leave it"))
         self.assertFalse(runtime.answered(CHANNEL, MESSAGE_TS), "a question the click did not rewrite reads settled")
+        self.assertTrue(runtime.clicked(CHANNEL, MESSAGE_TS), "a click whose rewrite failed still answered it")
+        self.assertFalse(runtime.clicked("C0OTHER", MESSAGE_TS))
+        self.assertFalse(runtime.rewriting(CHANNEL, MESSAGE_TS), "a failed rewrite is not still rewriting")
+
+    def test_rewriting_reports_a_click_between_its_record_and_its_rewrite(self):
+        self.assertFalse(runtime.rewriting(CHANNEL, MESSAGE_TS))
+        runtime._answered[(CHANNEL, MESSAGE_TS, runtime.CHOICE_KIND)] = None
+        self.assertTrue(runtime.rewriting(CHANNEL, MESSAGE_TS))
+        self.assertFalse(runtime.rewriting("C0OTHER", MESSAGE_TS))
+        runtime._answered.clear()
+        self._answer(_Adapter(), *_choice())
+        self.assertTrue(runtime.answered(CHANNEL, MESSAGE_TS))
+        self.assertFalse(runtime.rewriting(CHANNEL, MESSAGE_TS), "a landed rewrite is not still rewriting")
 
     def test_two_clicks_at_once_run_one_turn(self):
         adapter = _Adapter()
@@ -762,8 +786,10 @@ class RuntimeTest(unittest.TestCase):
             for _ in range(5):
                 await asyncio.sleep(0)
             self.assertEqual(adapter.log, [], "the first click's rewrite was not held")
+            self.assertTrue(runtime.rewriting(CHANNEL, MESSAGE_TS), "a held rewrite reads as in flight")
             release.set()
             await asyncio.gather(*clicks)
+            self.assertFalse(runtime.rewriting(CHANNEL, MESSAGE_TS))
 
         _run(both())
         turns = [entry[1]["text"] for entry in adapter.log if entry[0] == "message"]
@@ -1002,14 +1028,37 @@ class RuntimeTest(unittest.TestCase):
         self._answer(adapter, *_choice(thread=None))
         self.assertEqual(adapter.log[1][1]["thread_ts"], MESSAGE_TS)
 
-    def test_a_failed_rewrite_posts_the_echo_instead(self):
+    def test_a_failed_rewrite_posts_the_answered_line_instead(self):
         adapter = _Adapter(fail=("chat_update",))
         with self.assertLogs(runtime.logger, level="WARNING"):
             self._answer(adapter, *_choice())
         self.assertEqual([entry[0] for entry in adapter.log], ["chat_postMessage", "message"])
         self.assertEqual(adapter.log[0][1], {"channel": CHANNEL, "thread_ts": THREAD, "text": "✓ Jayanti: Leave it"})
 
-    def test_failed_rewrite_and_echo_still_run_the_turn(self):
+    def test_the_answered_line_names_the_clicker_in_plain_text_and_never_by_id(self):
+        handle = {"id": USER, "username": "jpatil", "name": "jpatil"}
+        cases = (
+            ("the display name", {}, (), None, "Jayanti"),
+            ("a name to escape", {"names": {USER: "Jay <P>"}}, (), None, "Jay &lt;P&gt;"),
+            ("users.info named nobody", {"names": {}}, (), handle, "jpatil"),
+            ("users.info failed", {}, ("names",), handle, "jpatil"),
+            ("no name anywhere", {"names": {}}, (), {"id": USER}, runtime.NAMELESS_CLICKER),
+            ("a failed lookup and no handle", {}, ("names",), None, runtime.NAMELESS_CLICKER),
+        )
+        for case, kwargs, broken, user, name in cases:
+            with self.subTest(case=case):
+                importlib.reload(runtime)
+                adapter = _Adapter(broken=broken, **kwargs)
+                body, action = _choice()
+                if user is not None:
+                    body["user"] = user
+                self._answer(adapter, body, action)
+                update = adapter.log[0][1]
+                self.assertEqual(update["blocks"][-1]["elements"][0]["text"], f"✓ {name}: Leave it")
+                self.assertNotIn("<@", update["text"])
+                self.assertEqual(adapter.named, [(USER, CHANNEL, TEAM)])
+
+    def test_failed_rewrite_and_answered_line_still_run_the_turn(self):
         adapter = _Adapter(fail=("chat_update", "chat_postMessage"))
         with self.assertLogs(runtime.logger, level="WARNING"):
             self._answer(adapter, *_choice())

@@ -5467,6 +5467,161 @@ class GoogleChatRelayTest(unittest.TestCase):
         self.assertIn("type=RuntimeError status=none", "\n".join(captured["logs"]))
 
 
+class ChatEventPullLegibilityTest(unittest.TestCase):
+    """A Chat event pull says which subscription it reads and what refused it.
+
+    gke-labs/kube-agents#2404: a refused pull logged only its exception class,
+    and an empty one said nothing, so an install whose events never arrive
+    looked the same as a quiet one.
+    """
+
+    SUBSCRIPTION = "projects/kagents-dev/subscriptions/a2a-chat-sub"
+    # Stands in for the relay's own credential; it must never reach a log line.
+    CREDENTIAL_MARKER = "ya29.credential-that-must-not-be-logged"
+
+    class PermissionDenied(Exception):
+        """The attributes google.api_core's PermissionDenied carries."""
+
+        def __init__(self, message, reason=None, metadata=None):
+            super().__init__(f"403 {message} [details with {ChatEventPullLegibilityTest.CREDENTIAL_MARKER}]")
+            self.code = HTTPStatus.FORBIDDEN
+            self.message = message
+            self.reason = reason
+            self.metadata = metadata
+
+    def relay(self, pull):
+        relay = types.SimpleNamespace(
+            subscription_path=self.SUBSCRIPTION,
+            _credentials=types.SimpleNamespace(token=self.CREDENTIAL_MARKER),
+        )
+        relay.pull = pull
+        return relay
+
+    def get(self, path, relay):
+        """Drive do_GET on one relay route, returning status, payload and logs."""
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.path = path
+        handler.a2a_chat_relay = relay
+        handler.chat_relay = relay
+        handler._authenticated = lambda: object()
+        captured = {}
+        handler._json = lambda status, payload: captured.update(
+            status=status, payload=payload
+        )
+        with self.assertLogs("credential-proxy", level="DEBUG") as logs:
+            # assertLogs fails on silence; a marker keeps an empty pull legal.
+            credential_proxy.LOGGER.debug("marker")
+            handler.do_GET()
+        captured["logs"] = [line for line in logs.output if not line.endswith("marker")]
+        return captured
+
+    def refuse(self, exc):
+        def pull():
+            raise exc
+
+        return self.relay(pull)
+
+    def test_an_empty_pull_names_the_subscription_to_the_gateway(self):
+        captured = self.get("/v1/chat/a2a/events", self.relay(lambda: None))
+
+        self.assertEqual(HTTPStatus.OK, captured["status"])
+        self.assertEqual(
+            {"event": None, "subscription": self.SUBSCRIPTION}, captured["payload"]
+        )
+
+    def test_a_refused_pull_logs_the_subscription_and_the_refused_permission(self):
+        exc = self.PermissionDenied(
+            "User not authorized to perform this action.",
+            reason="IAM_PERMISSION_DENIED",
+            metadata={"permission": "pubsub.subscriptions.consume", "resource": self.SUBSCRIPTION},
+        )
+
+        captured = self.get("/v1/chat/a2a/events", self.refuse(exc))
+
+        self.assertEqual(1, len(captured["logs"]), captured["logs"])
+        line = captured["logs"][0]
+        self.assertIn("a2a chat event pull failed", line)
+        self.assertIn(f"subscription={self.SUBSCRIPTION}", line)
+        self.assertIn("type=PermissionDenied", line)
+        self.assertIn("code=403", line)
+        self.assertIn("reason=IAM_PERMISSION_DENIED", line)
+        self.assertIn("permission=pubsub.subscriptions.consume message=", line)
+        self.assertIn("message=User not authorized to perform this action.", line)
+        self.assertNotIn(self.CREDENTIAL_MARKER, line)
+        self.assertEqual(HTTPStatus.SERVICE_UNAVAILABLE, captured["status"])
+        self.assertEqual(
+            {
+                "error": "a2a chat event pull failed",
+                "subscription": self.SUBSCRIPTION,
+                "pubsub": {"type": "PermissionDenied", "code": 403},
+            },
+            captured["payload"],
+        )
+        self.assertNotIn(self.CREDENTIAL_MARKER, json.dumps(captured["payload"]))
+
+    def test_a_refusal_without_error_info_names_the_permission_a_pull_needs(self):
+        captured = self.get(
+            "/v1/chat/a2a/events", self.refuse(self.PermissionDenied("User not authorized."))
+        )
+
+        self.assertIn(
+            "permission=pubsub.subscriptions.consume (what a pull needs; the error named none)",
+            captured["logs"][0],
+        )
+
+    def test_a_transport_fault_names_its_type_and_no_permission(self):
+        captured = self.get(
+            "/v1/chat/a2a/events", self.refuse(ConnectionResetError("reset by peer"))
+        )
+
+        line = captured["logs"][0]
+        self.assertIn(f"subscription={self.SUBSCRIPTION}", line)
+        self.assertIn("type=ConnectionResetError", line)
+        self.assertNotIn("permission=", line)
+        self.assertEqual(
+            {"type": "ConnectionResetError"}, captured["payload"]["pubsub"]
+        )
+
+    def test_a_retry_that_ran_out_names_what_it_gave_up_on(self):
+        class RetryError(Exception):
+            def __init__(self, message, cause):
+                super().__init__(message)
+                self.message = message
+                self.cause = cause
+
+        exc = RetryError("Timeout of 20.0s exceeded", ConnectionResetError("reset"))
+
+        captured = self.get("/v1/chat/a2a/events", self.refuse(exc))
+
+        line = captured["logs"][0]
+        self.assertIn("type=RetryError", line)
+        self.assertIn("cause=ConnectionResetError", line)
+
+    def test_a_server_message_cannot_forge_a_log_line(self):
+        exc = self.PermissionDenied("refused\nCRITICAL forged line " + "x" * 500)
+
+        captured = self.get("/v1/chat/a2a/events", self.refuse(exc))
+
+        line = captured["logs"][0]
+        self.assertNotIn("\n", line)
+        message = line.split("message=", 1)[1]
+        self.assertLessEqual(
+            len(message), credential_proxy.PUBSUB_ERROR_MESSAGE_MAX_CHARS
+        )
+
+    def test_the_legacy_pull_names_the_subscription_too(self):
+        captured = self.get(
+            "/v1/chat/events", self.refuse(self.PermissionDenied("User not authorized."))
+        )
+
+        line = captured["logs"][0]
+        self.assertIn("chat event pull failed", line)
+        self.assertIn(f"subscription={self.SUBSCRIPTION}", line)
+        self.assertEqual(
+            {"error": "chat event pull failed"}, captured["payload"]
+        )
+
+
 class SlackRelayTest(unittest.TestCase):
     class FakeResponse:
         """Stands in for slack_sdk's SlackResponse.

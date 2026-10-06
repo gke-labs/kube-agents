@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from admin_console.api.authorization import portal_api_headers
 from admin_console.api.app import create_app
+from admin_console.tests.interaction_state import isolate_interaction_state
 from admin_console.clients.portal_api import PortalApiClient
 from admin_console.connections import CommandResult
 from admin_console.google_chat_integration import GoogleChatIntegrationService
@@ -537,6 +538,9 @@ class FakeIntegration:
 
 
 class GoogleChatIntegrationApiTest(unittest.TestCase):
+    def setUp(self):
+        isolate_interaction_state(self)
+
     def test_api_uses_the_request_target(self):
         targets = []
         client = TestClient(

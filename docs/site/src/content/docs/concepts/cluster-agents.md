@@ -36,7 +36,7 @@ For multi-cluster work the Platform Agent fans out one card per cluster, keeps i
 
 ## Event triage
 
-A Kubernetes event alert arrives as a card like any other. The [event watcher](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/cmd/k8s-event-watcher/README.md) posts the event to the Session KV server, which records the chat thread it alerted in and then opens a session named `k8s-evt-…` on the gateway's default profile — the Planning Agent — whose whole instruction is to file **one** card, to the agent scoped to the cluster that raised the event, carrying the diagnostic brief verbatim.
+A Kubernetes event alert arrives as a card like any other. The [event watcher](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/cmd/k8s-event-watcher/README.md) posts the event to the Session KV server, which records the chat thread it alerted in and then opens a session named `k8s-evt-…` on the gateway's default profile — the Planning Agent — whose whole instruction is to file **one** card, to the agent scoped to the cluster that raised the event, carrying the diagnostic brief verbatim. A stall the `stall-watch` cron job finds takes the same path, with a brief that has the Cluster Agent run `gke-stall-detection` on the namespace.
 
 The Cluster Agent finishes it with `kanban_complete` and nothing else, passing the whole report as `result`. Every card carries a subscription to the session it was filed from, and the notifier posts a subscribed card's `result` to chat when the card turns terminal — so completing the card is the delivery, threaded under the alert it answers.
 
