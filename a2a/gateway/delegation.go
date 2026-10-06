@@ -177,10 +177,22 @@ func capWakeBody(body string) string {
 // liveChild names a child task of this conversation that has not ended: a
 // child entry whose task the gateway still routes. The task index is the
 // liveness the relay itself keeps; relayTerminal retires it on the child's
-// terminal, from the executor or the supervisor.
+// terminal, from the executor or the supervisor, and healActiveTask on the
+// heal that releases one.
+//
+// A lookup that errors cannot rule the child out, so it counts as live: a
+// refused request can be asked again, a second live child cannot be undone.
 func (g *Gateway) liveChild(ctx context.Context, rec *SessionRecord) string {
 	for _, ref := range rec.Tasks {
-		if ref.Role == taskRoleChild && g.sessionForTask(ctx, ref.ID) != "" {
+		if ref.Role != taskRoleChild {
+			continue
+		}
+		key, err := g.lookupTaskSession(ctx, ref.ID)
+		if err != nil {
+			g.log.Error("task index lookup failed; counting the child as live", "taskId", ref.ID, "conversation", rec.Key, "err", err)
+			return ref.ID
+		}
+		if key != "" {
 			return ref.ID
 		}
 	}
@@ -207,13 +219,7 @@ func (g *Gateway) dropFailedChildren(ctx context.Context, rec *SessionRecord, ta
 			kept = append(kept, ref)
 			continue
 		}
-		g.mu.Lock()
-		delete(g.taskSessions, ref.ID)
-		delete(g.relays, ref.ID)
-		g.mu.Unlock()
-		if err := g.reg.DropTask(ctx, ref.ID); err != nil {
-			g.log.Warn("delegation: failed child's index cleanup failed", "taskId", ref.ID, "err", err)
-		}
+		g.retireTaskRoute(ctx, ref.ID)
 	}
 	rec.Tasks = kept
 }

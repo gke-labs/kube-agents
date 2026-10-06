@@ -346,13 +346,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// and is dropped rather than re-rendered (assertion 10 lives in the lib
 	// and the fold; the gateway's job is only to never replay the result at
 	// the room).
-	g.mu.Lock()
-	delete(g.relays, taskID)
-	delete(g.taskSessions, taskID)
-	g.mu.Unlock()
-	if err := g.reg.DropTask(ctx, taskID); err != nil {
-		g.log.Warn("relay: task index cleanup failed", "taskId", taskID, "err", err)
-	}
+	g.retireTaskRoute(ctx, taskID)
 	// Last, after the deliverable is posted and the rolling line edited, so
 	// an observer that treats this as "the task is over" has already been
 	// handed everything the conversation received for it. See TaskObserver.
@@ -490,23 +484,46 @@ func (g *Gateway) post(conversation, text string) {
 // sessionForTask resolves a task to its conversation: the in-memory cache
 // first, the KV task index after a restart.
 func (g *Gateway) sessionForTask(ctx context.Context, taskID string) string {
+	key, err := g.lookupTaskSession(ctx, taskID)
+	if err != nil {
+		g.log.Error("task index lookup failed", "taskId", taskID, "err", err)
+		return ""
+	}
+	return key
+}
+
+// lookupTaskSession is sessionForTask with the KV error returned, for a
+// caller that must not read a failed lookup as "no route" (liveChild).
+func (g *Gateway) lookupTaskSession(ctx context.Context, taskID string) (string, error) {
 	g.mu.Lock()
 	key := g.taskSessions[taskID]
 	g.mu.Unlock()
 	if key != "" {
-		return key
+		return key, nil
 	}
 	key, err := g.reg.SessionForTask(ctx, taskID)
 	if err != nil {
-		g.log.Error("task index lookup failed", "taskId", taskID, "err", err)
-		return ""
+		return "", err
 	}
 	if key != "" {
 		g.mu.Lock()
 		g.taskSessions[taskID] = key
 		g.mu.Unlock()
 	}
-	return key
+	return key, nil
+}
+
+// retireTaskRoute drops a task's routing state, the render cache and the
+// in-memory and KV task index, once the task has ended for the gateway. A
+// straggler for it then finds no route and is dropped.
+func (g *Gateway) retireTaskRoute(ctx context.Context, taskID string) {
+	g.mu.Lock()
+	delete(g.relays, taskID)
+	delete(g.taskSessions, taskID)
+	g.mu.Unlock()
+	if err := g.reg.DropTask(ctx, taskID); err != nil {
+		g.log.Warn("relay: task index cleanup failed", "taskId", taskID, "err", err)
+	}
 }
 
 // withRetry runs f up to n times with a short linear-backoff pause.

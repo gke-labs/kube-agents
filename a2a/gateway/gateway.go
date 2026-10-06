@@ -669,7 +669,9 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// so a task released here ages out with the stream's retention, the
 	// residue Session lifecycle names. The task index stays, as in the
 	// terminal case, so a late start still renders; its key is retired
-	// only if the task ever terminates.
+	// only if the task ever terminates. A delegated child is the exception
+	// in both shapes: its index is the one-live-child rule's liveness, so
+	// the heal retires it (healActiveTask says why).
 	//
 	// This is the heal's only caller. The inject door's read route
 	// (probeConversation) reports the same facts and heals nothing: the
@@ -915,6 +917,17 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		g.mu.Unlock()
 		if rs != nil {
 			g.flushNotices(rec.Key, rs)
+		}
+		// A delegated child's route is retired here, as relayTerminal
+		// retires it: its index is the liveness the one-live-child rule
+		// reads (liveChild), so a healed child left indexed would refuse
+		// every later delegation in the conversation until the reap. The
+		// cost is the late-render path below: a healed child's late events
+		// find no route and are dropped, and so is a late terminal's wake,
+		// which a session the heal has moved past should not get anyway.
+		// A human turn keeps its index, so its late result still posts.
+		if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.Role == taskRoleChild {
+			g.retireTaskRoute(ctx, active.TaskID)
 		}
 		rec.ActiveTask = nil
 		// The same rule as relayTerminal's, for the same terminal reaching

@@ -1077,3 +1077,146 @@ func TestAnOverCapResultIsTruncatedInTheWake(t *testing.T) {
 		t.Fatal("wake body is not a rune-boundary prefix of the result")
 	}
 }
+
+// ---- the child is the conversation's task (spec §3: steer, stop, status, heal)
+
+// TestHumanTextWhileTheChildRunsSteersTheChild: inside FirstEventGrace the
+// child is the active non-detached task, so a human's text is a steer on
+// platform's in subject for the child's task, spawns nothing, and a status ask
+// replays the child.
+func TestHumanTextWhileTheChildRunsSteersTheChild(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	ctx := context.Background()
+	conv := "discord:g1/t-steer"
+	_, _, child := delegated(t, r, spawn, conv, 0)
+	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
+	cexec := r.execFor(t, child, targetPlatform)
+	if err := cexec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	sessionRigTurn(r, conv, "h-2", "and include costs")
+	waitFor(t, "steer on the child's in subject", func() bool {
+		for _, e := range inSubjectEnvelopes(t, r.url, targetPlatform) {
+			if e.TaskID == child.TaskID && e.Kind == lib.KindMessage && e.EnvelopeID != child.EnvelopeID {
+				return envText(t, e) == "and include costs"
+			}
+		}
+		return false
+	})
+	if n := len(spawn.calls()); n != 1 {
+		t.Fatalf("a steer spawned a session: spawns = %d", n)
+	}
+	sessionRigTurn(r, conv, "h-3", "status")
+	waitFor(t, "status names the child", postedContaining(r, "🔎 task `"+child.TaskID+"` is **working**"))
+}
+
+// TestAStopOnTheChildCancelsItOnPlatform: `stop` while the child runs
+// publishes the cancel on platform's in subject for the child, and the
+// child's history entry records it (the mark wakeSession reads).
+func TestAStopOnTheChildCancelsItOnPlatform(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	ctx := context.Background()
+	conv := "discord:g1/t-stop-child"
+	_, session, child := delegated(t, r, spawn, conv, 0)
+	sessionRigTurn(r, conv, "stop-1", "stop")
+	waitFor(t, "cancel on platform's in subject", func() bool {
+		for _, e := range inSubjectEnvelopes(t, r.url, targetPlatform) {
+			if e.Kind == lib.KindCancel && e.TaskID == child.TaskID {
+				return e.To != nil && e.To.Session == targetPlatform
+			}
+		}
+		return false
+	})
+	for _, e := range inSubjectEnvelopes(t, r.url, session) {
+		if e.Kind == lib.KindCancel {
+			t.Fatalf("the cancel went to the delegating session: %+v", e)
+		}
+	}
+	waitFor(t, "cancel on the record", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		cref, _ := rec.TaskRefFor(child.TaskID)
+		return cref.Canceled && rec.ActiveTask != nil && rec.ActiveTask.TaskID == child.TaskID && rec.ActiveTask.Detached
+	})
+}
+
+// TestHealAfterRestartSeesTheChildAsActive: a gateway restart while the child
+// is still running leaves it the conversation's task: the new gateway's heal
+// does not release it, and a status ask reports it.
+func TestHealAfterRestartSeesTheChildAsActive(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	ctx := context.Background()
+	conv := "discord:g1/t-heal"
+	_, _, child := delegated(t, r, spawn, conv, 0)
+	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
+	if err := r.execFor(t, child, targetPlatform).PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "child working on the line", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		return rec.ActiveTask != nil && rec.ActiveTask.TaskID == child.TaskID
+	})
+	r2, spawn2 := restartRig(t, r)
+	sessionRigTurn(r2, conv, "h-9", "status")
+	waitFor(t, "status names the child", postedContaining(r2, "🔎 task `"+child.TaskID+"` is **working**"))
+	rec, _ := r2.g.reg.Get(ctx, conv)
+	if rec.ActiveTask == nil || rec.ActiveTask.TaskID != child.TaskID || rec.Addressee != targetPlatform {
+		t.Fatalf("after the restart active=%+v addressee=%s, want the child on platform", rec.ActiveTask, rec.Addressee)
+	}
+	if n := len(spawn2.calls()); n != 0 {
+		t.Fatalf("a status ask spawned on the new gateway: %d", n)
+	}
+}
+
+// TestAHealedChildNoLongerBlocksADelegation: a child with no first event
+// inside FirstEventGrace is released by the heal, which retires its route as
+// relayTerminal would; the conversation's next delegation mints. The heal
+// does not wake the session (spec §4 wakes on a terminal, and the heal
+// publishes none).
+func TestAHealedChildNoLongerBlocksADelegation(t *testing.T) {
+	const grace = 500 * time.Millisecond
+	r, spawn := startRigWithSpawnerCap(t, "platform", 0, func(c *Config) { c.FirstEventGrace = grace })
+	ctx := context.Background()
+	conv := "discord:g1/t-heal-child"
+	_, _, child := delegated(t, r, spawn, conv, 0)
+	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
+	time.Sleep(grace + 100*time.Millisecond)
+
+	exec2, origin2, _ := sessionTurn(t, r, spawn, conv, "again")
+	waitFor(t, "never-started notice", postedContaining(r, fmt.Sprintf(neverStartedNotice, child.TaskID, grace)))
+	if key, err := r.g.reg.SessionForTask(ctx, child.TaskID); err != nil || key != "" {
+		t.Fatalf("the healed child is still indexed: %q %v", key, err)
+	}
+	_ = exec2.PublishArtifact(ctx, delegateArtifact(t, "platform", "second"))
+	second := awaitSubmission(t, r, targetPlatform, 1)
+	if second.TaskID == child.TaskID {
+		t.Fatal("the second submission is the healed child")
+	}
+	if loggedContaining(r, "delegation refused", "rule="+ruleDelegationBusy)() {
+		t.Fatalf("a healed child refused the next delegation:\n%s", r.logs.String())
+	}
+	waitFor(t, "second child on the record", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		pref, _ := rec.TaskRefFor(origin2.TaskID)
+		return len(pref.Children) == 1 && pref.Children[0] == second.TaskID
+	})
+	if n := len(spawn.calls()); n != 2 {
+		t.Fatalf("spawns = %d, want 2 (the heal must not wake the session)", n)
+	}
+}
+
+// TestLiveChildFailsClosedOnALookupError: an index lookup that errors cannot
+// rule a child out, so liveChild names it (a refusal) and logs, rather than
+// admitting a second live child.
+func TestLiveChildFailsClosedOnALookupError(t *testing.T) {
+	r, _ := startRigWithSpawner(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	rec := &SessionRecord{Key: "discord:g1/t-lookup", Tasks: []TaskRef{
+		{ID: "t-human", Addressee: "chat-x"},
+		{ID: "t-child", Addressee: targetPlatform, Role: taskRoleChild, ParentTaskID: "t-human", Depth: 1},
+	}}
+	if got := r.g.liveChild(ctx, rec); got != "t-child" {
+		t.Fatalf("liveChild on a lookup error = %q, want the child", got)
+	}
+	waitFor(t, "lookup error logged", loggedContaining(r, "task index lookup failed", "t-child"))
+}
