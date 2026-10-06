@@ -30,16 +30,6 @@ def _fail(stderr: str = "boom"):
     return (1, "", stderr)
 
 
-class FleetUnreachablePhrases(unittest.TestCase):
-    def test_a_probe_read_the_cluster_refused_counts_as_unreachable(self):
-        # hack/fleet-kubeconfigs.sh says a role "could not be read" when the
-        # presence probe failed for a reason other than NotFound; the
-        # presence check must excuse it as unreached, not call the fleet
-        # incomplete.
-        line = "deployment/inventory-api could not be read from a.kubeconfig in kube-agents-evals-3 (Error from server (Forbidden): deployments.apps is forbidden), so fixture role 'stalled-controller' could not be checked."
-        self.assertTrue(checker._FLEET_UNREACHABLE.search(line))
-
-
 class RunCmdTest(unittest.TestCase):
     def test_timeout_reports_124_and_does_not_raise(self):
         with mock.patch.object(

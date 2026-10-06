@@ -1009,8 +1009,9 @@ for the on-merge reconcile) has dealt with: `recovery` true when the daily
 passed having reached every project the failed build named, false when it
 failed itself, so its own note is the current story and nothing clears. The
 entry is carried from the previous tick while `build` is still the job's
-latest, so a tick blind to the daily does not re-open the failure, and a
-silence becomes a recovery once a later pass reaches the projects.
+latest, unchanged on a tick blind to either job, so neither re-opens the
+failure, and a silence becomes a recovery once a later pass reaches the
+projects.
 `periodics` notes every watched job whose latest build failed or is stale,
 less those superseded. `periodics_runs` is, per read
 job, `{build, finished_at, passed, summary, dry_run}` of its latest finished build, what

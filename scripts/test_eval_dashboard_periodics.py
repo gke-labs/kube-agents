@@ -295,6 +295,13 @@ class AssessTest(unittest.TestCase):
         self.assertEqual(periodics.assess({POST.job: failed}, NOW, {}, superseded=carried), {})
         newer = self.reading(POST, NOW - timedelta(hours=2), passed=False, build="101", artifact={"outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "lock"}}})
         self.assertEqual(periodics.superseded_jobs({POST.job: newer}, carried), {})
+        # A tick blind to the postsubmit itself (its pointer, finished.json or
+        # report unreadable) carries the entry unchanged; a reading that shows
+        # the build passed, or a newer one, is what ends it.
+        self.assertEqual(periodics.superseded_jobs({}, carried), carried)
+        self.assertEqual(periodics.superseded_jobs({DAILY.job: daily_failed}, carried), carried)
+        passed_post = self.reading(POST, NOW - timedelta(hours=1), passed=True, build="102")
+        self.assertEqual(periodics.superseded_jobs({POST.job: passed_post}, carried), {})
         # And a carried silence becomes a recovery once a later daily reaches the projects.
         silenced = {POST.job: {"build": "100", "recovery": False}}
         self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: reached}, silenced), {POST.job: {"build": "100", "recovery": True}})
@@ -612,6 +619,10 @@ class WorkflowWiring(unittest.TestCase):
         for periodic in periodics.WATCHED:
             self.assertTrue(periodic.stale_after is None or periodic.stale_after >= timedelta(hours=1))
         self.assertIsNone(POST.stale_after, "a job that runs on merges has no cadence to be late against")
+        for job in ("ci-kube-agents-fleet-reconcile", "ci-kube-agents-fleet-reconcile-all"):
+            # Their last build stays in the bucket after Prow drops them; a
+            # merely old one must not read as "stopped running".
+            self.assertIsNone(periodics.WATCHED_BY_JOB[job].stale_after, job)
         self.assertEqual(DAILY.stale_after, timedelta(hours=36))
 
     def test_main_names_what_it_wrote(self):

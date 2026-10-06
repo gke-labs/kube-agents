@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The Prow periodics that keep the pool in shape, read for the CI health bot.
 
-The pull sweep and the two seeded-fleet reconciles run on the build cluster and
+The pull sweep and the seeded-fleet reconciles run on the build cluster and
 report nowhere but TestGrid. This module reads each one's latest finished build
 from the bucket they log to, gs://kube-agents-periodic-logs (`latest-build.txt`,
 then `finished.json`, then the report the job wrote, on every finished build) and turns a failed or overdue run into
@@ -224,14 +224,16 @@ WATCHED = (
     # The hourly and the weekly stay watched until the oss-test-infra change
     # retires them for the daily and the postsubmit below; a follow-up removes
     # these two entries then, so the watch never goes dark between the merges.
+    # No stale window: their last build stays in the bucket after Prow drops
+    # them, and a merely old one must not read as "stopped running".
     Periodic(
-        "ci-kube-agents-fleet-reconcile", "seeded-fleet reconcile (hourly, retiring)", timedelta(hours=3), RECONCILE_ARTIFACT,
+        "ci-kube-agents-fleet-reconcile", "seeded-fleet reconcile (hourly, retiring)", None, RECONCILE_ARTIFACT,
         "Eval seeded fleet", "planted defects are not being re-applied", "planted defects are being re-applied again",
         "runs hourly and re-applies the seeded-fleet stack in the pool projects the scan reports drifted", RECONCILE_EFFECT,
         f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#62-the-scheduled-reconcile",
     ),
     Periodic(
-        "ci-kube-agents-fleet-reconcile-all", "seeded-fleet reconcile (weekly, retiring)", timedelta(hours=192), RECONCILE_ARTIFACT,
+        "ci-kube-agents-fleet-reconcile-all", "seeded-fleet reconcile (weekly, retiring)", None, RECONCILE_ARTIFACT,
         "Eval seeded fleet", "planted defects are not being re-applied", "planted defects are being re-applied again",
         "runs weekly and re-applies the seeded-fleet stack in every free pool project", RECONCILE_EFFECT,
         f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#62-the-scheduled-reconcile",
@@ -765,13 +767,22 @@ def superseded_jobs(readings: dict[str, dict], carried: dict | None = None) -> d
     build a later build of their superseding job has dealt with. Carried in
     health.json and handed back as `carried` next tick, so the decision
     sticks for as long as the failed build is the job's latest: a tick blind
-    to the superseding job, or a later failing one, does not re-open a
-    retired failure as news. A silence becomes a recovery once a later pass
+    to either job, or a later failing daily, does not re-open a retired
+    failure as news. A silence becomes a recovery once a later pass
     reaches the projects; a new failed build is decided afresh."""
     carried = carried if isinstance(carried, dict) else {}
     out = {}
-    for job, reading in readings.items():
-        if not isinstance(reading, dict) or reading.get(KEY_PASSED) or job not in SUPERSEDED_BY:
+    for job in sorted(set(readings) | set(carried)):
+        if job not in SUPERSEDED_BY:
+            continue
+        reading = readings.get(job)
+        if not isinstance(reading, dict):
+            # Blind to this job this tick: the decision stands, as an open
+            # note's start does, until a reading shows a newer or passed build.
+            if isinstance(carried.get(job), dict):
+                out[job] = carried[job]
+            continue
+        if reading.get(KEY_PASSED):
             continue
         build = reading.get(KEY_BUILD)
         before = carried.get(job) if isinstance(carried.get(job), dict) and carried[job].get(SUPERSEDED_KEY_BUILD) == build else None

@@ -1081,8 +1081,8 @@ def render_periodic_clear(health: dict, prev: dict | None) -> str:
         when = clock(parse_iso(run.get("finished_at"))) if run.get("finished_at") else None
         did = run.get("summary")
         # A passed build has a finish time (none is STALE and noted), so
-        # `when` is there. The job by name: the two reconciles share a place
-        # and a presence.
+        # `when` is there. The job by name: the reconciles share a place and
+        # a presence.
         tail = f" `{job}`'s {when} run (build {run.get('build')}): {did}." if did else f" `{job}`'s {when} run (build {run.get('build')}) finished clean."
         lines.append(f"✅ *{words['place']}: {words['presence']}.*{tail}")
     return "\n".join(lines)

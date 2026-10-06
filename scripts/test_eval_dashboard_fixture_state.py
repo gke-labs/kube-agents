@@ -33,7 +33,9 @@ import io
 import json
 import os
 import pathlib
+import re
 import stat
+import subprocess
 import tempfile
 import unittest
 import unittest.mock
@@ -474,6 +476,26 @@ class NotChecked(ScanHarness):
         self.assertEqual(doc["projects"][PROJECT]["summary"]["absent"], 1)
         self.assertEqual((fixture_state.absent_units(doc), fixture_state.absent_projects(doc), fixture_state.unread_units(doc)), (1, 1, 0))
         self.assertEqual(doc["summary"]["absent_projects"], 1)
+
+    def test_the_runner_counts_a_role_it_could_not_read_as_unresolved(self):
+        # The pool verifier excuses such a role only through the runner's
+        # summary line: a 403 on one probe must land in its "could not be
+        # resolved or reached" count, neither written nor unplanted
+        # (hack/fleet-kubeconfigs.sh, the comment above that count).
+        world = healthy_world(PROJECT)
+        world["kubectl_overrides"] = {PROJECT: {"clusterrolebinding/debug-binding": {"__error__": "Forbidden"}}}
+        self.world_path.write_text(json.dumps(world))
+        env = self.environ(**{
+            fixture_state.RUNNER_PROJECT_ENV: PROJECT,
+            fixture_state.RUNNER_DIR_ENV: str(self.workdir / PROJECT / "fleet"),
+            fixture_state.RUNNER_CATALOG_ENV: str(CATALOG),
+            fixture_state.RUNNER_ALLOW_OWN_CREDENTIAL_ENV: "1",
+        })
+        proc = subprocess.run(["bash", str(fixture_state.FLEET_KUBECONFIGS)], env=env, capture_output=True, text=True, timeout=120)
+        summary = re.search(r"(\d+) role\(s\) written to .*, (\d+) on clusters that could not be resolved or reached, (\d+) whose fixtures were not present", proc.stderr)
+        self.assertIsNotNone(summary, proc.stderr)
+        self.assertEqual(tuple(int(n) for n in summary.groups()), (len(self.roles) - 1, 1, 0), proc.stderr)
+        self.assertIn("could not be read from", proc.stderr)
 
     def test_a_probe_the_cluster_refused_is_not_checked_not_absent(self):
         # A 403 or a 5xx on the presence probe says nothing about whether the

@@ -672,6 +672,29 @@ class MainTest(unittest.TestCase):
         self.assertEqual(boskos.acquired, [])
         self.assertIn("could not resolve host", stderr.getvalue())
 
+    def test_a_termination_during_the_main_fetch_exits_as_terminated(self):
+        # Prow aborts a superseded postsubmit; the signal can land in the
+        # up-to-120 s fetch before the first lease. The same exit as inside
+        # the run: the report says terminated, not error, and no traceback.
+        def git(args):
+            if args[:1] == ["fetch"]:
+                raise boskos_pool.Terminated("signal 15")
+            return "tree-aaa" if args[1].startswith("HEAD:") else "commit-111"
+
+        boskos = _Boskos(free=[P7])
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            report = pathlib.Path(tmp) / "r.json"
+            with mock.patch.object(reconcile, "git_output", git), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(
+                reconcile, "tofu_runner", _Tofu({P7: UPDATE_ONLY})
+            ), mock.patch.object(reconcile.signal, "signal"), mock.patch.object(reconcile, "pool_projects", lambda *a, **k: {P7}), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", stderr):
+                rc = reconcile.main(["--all", "--stop-when-moved", "origin/main", "--report", str(report), "--boskos-server", BOSKOS, "--boskos-owner", OWNER])
+            doc = json.loads(report.read_text())
+        self.assertEqual(rc, boskos_pool.TERMINATED_EXIT_CODE)
+        self.assertEqual(boskos.acquired, [])
+        self.assertEqual((doc["exit"], doc["exit_code"]), ("terminated", boskos_pool.TERMINATED_EXIT_CODE))
+        self.assertIn("terminated (signal 15) after 0 project(s)", stderr.getvalue())
+
     def test_a_main_that_moved_before_the_first_project_is_not_reached_and_not_blamed_on_boskos(self):
         def git(args):
             if args[:1] == ["fetch"]:
@@ -1184,6 +1207,19 @@ class _Boskos_failing_one(_Boskos):
         return super().__call__(request, timeout)
 
 
+class _FakeProc:
+    """A child as the registry sees it: alive, counting the interrupts it gets."""
+
+    def __init__(self):
+        self.signals = 0
+
+    def poll(self):
+        return None
+
+    def send_signal(self, sig):
+        self.signals += 1
+
+
 class _Clock:
     """A monotonic clock the tests move by hand."""
 
@@ -1268,13 +1304,13 @@ class BudgetTest(unittest.TestCase):
 class PassTest(unittest.TestCase):
     """`--all` asks for every mapped project by name and keeps asking for the busy ones."""
 
-    def test_every_mapped_project_is_asked_for_by_name_then_one_anonymous_acquire(self):
+    def test_every_mapped_project_is_asked_for_by_name_then_the_stray_check_runs(self):
         boskos = _Boskos(free=[P8, P7])
         tofu = _Tofu({P7: UPDATE_ONLY, P8: UPDATE_ONLY})
         with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
             outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=reconcile.Run())
         self.assertEqual(boskos.acquired, [P7, P8], "sorted, by name")
-        self.assertEqual(boskos.walked, 1, "one anonymous acquire after the pass, for a registration the mapping lacks")
+        self.assertEqual(boskos.walked, 1, "the stray check's first acquire finds the pool empty and ends")
         self.assertEqual(sorted(boskos.released), [P7, P8])
         self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_APPLIED, P8: reconcile.OUTCOME_APPLIED})
 
@@ -1455,6 +1491,26 @@ class AllowlistTest(unittest.TestCase):
         outcome, detail = reconcile.reconcile_project(P7, runner=_Tofu({P7: DELETE}), allow=allow)
         self.assertEqual(outcome, reconcile.OUTCOME_REFUSED)
         self.assertIn("delete google_compute_disk.orphan", detail)
+
+    def test_an_entry_without_an_index_covers_every_instance_of_the_resource(self):
+        # tofu prints each instance of a count or for_each resource with its
+        # index; the natural entry names the resource, and covers them all.
+        instances = _plan((["delete"], "google_compute_disk.orphan_pd[0]"), (["delete"], "google_compute_disk.orphan_pd[1]"), (["delete"], 'kubernetes_network_policy_v1.default_deny["headroom"]'))
+        allow = _allow([("google_compute_disk.orphan_pd", "revert", False), ("kubernetes_network_policy_v1.default_deny", "revert", False)])
+        extras = {}
+        outcome, detail = reconcile.reconcile_project(P7, runner=_Tofu({P7: instances}), allow=allow, extras=extras)
+        self.assertEqual(outcome, reconcile.OUTCOME_APPLIED)
+        self.assertEqual(detail, "0 to add, 0 to change, 0 to replace, 3 to destroy, 0 refused")
+        self.assertEqual(extras["allowlist_unused"], [], "an entry an instance needed is not unused")
+
+    def test_an_indexed_entry_covers_that_instance_alone_and_a_prefix_is_not_a_match(self):
+        instances = _plan((["delete"], "google_compute_disk.orphan_pd[0]"), (["delete"], "google_compute_disk.orphan_pd[1]"), (["delete"], "kubernetes_namespace_v1.seeded_headroom"))
+        allow = _allow([("google_compute_disk.orphan_pd[0]", "revert", False), ("kubernetes_namespace_v1.seeded", "another", False)])
+        outcome, detail = reconcile.reconcile_project(P7, runner=_Tofu({P7: instances}), allow=allow)
+        self.assertEqual(outcome, reconcile.OUTCOME_REFUSED)
+        self.assertIn("delete google_compute_disk.orphan_pd[1]", detail)
+        self.assertIn("delete kubernetes_namespace_v1.seeded_headroom", detail)
+        self.assertNotIn("orphan_pd[0]", detail)
 
     def test_a_replace_on_a_listed_address_is_applied(self):
         allow = _allow([("google_container_node_pool.seeded_a_idle", "one-time rebuild", False)])
@@ -1658,6 +1714,79 @@ class WorkersTest(unittest.TestCase):
         self.assertEqual(peak[0], 2, "both applies ran at the same time")
         self.assertEqual(sorted(boskos.released), [P7, P8])
         self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_APPLIED, P8: reconcile.OUTCOME_APPLIED})
+
+    def test_a_child_is_interrupted_once_whichever_side_of_the_forward_it_registered_on(self):
+        # Registered before the forward: the snapshot carries it, and the
+        # registration says "not missed". Registered after: the snapshot did
+        # not, the registration says so, and the runner sends the one
+        # interrupt. Never both: a second SIGINT ends tofu mid-operation.
+        before, after = _FakeProc(), _FakeProc()
+        try:
+            self.assertFalse(reconcile._children_add(before))
+            reconcile._begin_termination()
+            self.assertEqual(before.signals, 1)
+            self.assertTrue(reconcile._children_add(after), "missed the forward: the runner signals it")
+            self.assertEqual(after.signals, 0)
+        finally:
+            reconcile._children_discard(before)
+            reconcile._children_discard(after)
+            reconcile._TERMINATING.clear()
+
+    def test_the_forward_raises_the_flag_and_snapshots_under_the_registration_lock(self):
+        # One lock hold on each side, so no registration can read the flag
+        # between the forward's set and its snapshot.
+        done = threading.Event()
+        thread = threading.Thread(target=lambda: (reconcile._begin_termination(), done.set()))
+        reconcile._CHILDREN_LOCK.acquire()
+        try:
+            thread.start()
+            self.assertFalse(done.wait(0.3))
+            self.assertFalse(reconcile._TERMINATING.is_set(), "raised only under the lock a registration holds across its check")
+        finally:
+            reconcile._CHILDREN_LOCK.release()
+        try:
+            self.assertTrue(done.wait(5))
+            self.assertTrue(reconcile._TERMINATING.is_set())
+        finally:
+            thread.join(5)
+            reconcile._TERMINATING.clear()
+
+    def test_projects_busy_all_run_read_not_free_whichever_worker_drains_at_the_budget(self):
+        # Two workers: one applies P7 across the budget boundary while the
+        # other polls P8 and P9, busy throughout. The applier reaches the stop
+        # first and drains; the projects the poller asked for all run still
+        # read "not free", not the budget.
+        clock = _Clock()
+        budget_over, p7_released = threading.Event(), threading.Event()
+        p9 = "kube-agents-evals-9"
+
+        class _Boskos_releasing(_Boskos):
+            def __call__(self, request, timeout=None):
+                out = super().__call__(request, timeout)
+                if "/release?" in request.full_url and self.released[-1] == P7:
+                    p7_released.set()
+                return out
+
+        def pause(seconds):
+            clock.now += seconds + 1
+            if clock.now >= 340:
+                budget_over.set()
+                p7_released.wait(10)
+                time.sleep(0.3)
+
+        inner = _Tofu({P7: UPDATE_ONLY})
+
+        def tofu(argv, **kw):
+            if argv[1] == "apply":
+                budget_over.wait(10)
+            return inner(argv, **kw)
+
+        boskos = _Boskos_releasing(free=[P7])
+        with mock.patch.object(reconcile, "clock", clock), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(reconcile, "pause", pause), mock.patch("sys.stdout", io.StringIO()):
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known={P7, P8, p9}, run=reconcile.Run(budget_seconds=400, ceiling_seconds=60, workers=2))
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
+        self.assertEqual(outcomes[P8], (reconcile.OUTCOME_NOT_REACHED, reconcile.REASON_NOT_REACHED_BUSY))
+        self.assertEqual(outcomes[p9], (reconcile.OUTCOME_NOT_REACHED, reconcile.REASON_NOT_REACHED_BUSY))
 
     def test_hold_signals_is_a_no_op_off_the_main_thread(self):
         before = signal.getsignal(signal.SIGINT)

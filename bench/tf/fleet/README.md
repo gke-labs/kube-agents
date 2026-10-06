@@ -44,8 +44,9 @@ Local validation without credentials: `tofu init -backend=false && tofu validate
 Drift is corrected by re-applying this stack with `hack/fleet_reconcile.py`, the fleet's only
 writer: from `main`, under a Boskos lease per project, creates and in-place updates only, plus
 the deletes and replaces `reconcile-allow.json` beside this file declares (one entry per
-address with its reason, reviewed in the pull request that needs it and removed by its
-follow-up; the no-surge pool's replace on a minor roll is the standing one). Its two Prow
+address, or per resource to cover every instance of a `count` or `for_each` one, with its
+reason, reviewed in the pull request that needs it and removed by its follow-up; the no-surge
+pool's replace on a minor roll is the standing one). Its two Prow
 entries in `oss-test-infra` run `main` only: a postsubmit on every merge touching this
 directory, and a daily pass at 08:30 UTC (`docs/ci-pool-projects.md` §6.2, which also states
 the rule for a fixture pull request and for proving a branch on one leased project). A hand

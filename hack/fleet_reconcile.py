@@ -94,6 +94,8 @@ ALLOW_KEYS = frozenset({ALLOW_KEY_ADDRESS, ALLOW_KEY_WHY, ALLOW_KEY_STANDING})
 # The index is the two shapes tofu prints, a count or a quoted key: an
 # approximation here admits an address no plan can ever match.
 ALLOW_INDEX_RE = r'\[(0|[1-9][0-9]*|"(?:[^"\\]|\\.)*")\]'
+# The index tofu prints on an instance of a count or for_each resource.
+_INSTANCE_INDEX_RE = re.compile(ALLOW_INDEX_RE + "$")
 ALLOW_ADDRESS_RE = re.compile(r"^(module\.[A-Za-z0-9_-]+(%s)?\.)*[a-z][a-z0-9_]*\.[A-Za-z_][A-Za-z0-9_-]*(%s)?$" % (ALLOW_INDEX_RE, ALLOW_INDEX_RE))
 AllowEntry = collections.namedtuple("AllowEntry", "address why standing")
 # seeded-b's maintenance exclusion is re-stamped from `timestamp()` on every
@@ -253,11 +255,10 @@ def tofu_runner(argv, cwd=None, timeout=None, **_):
             proc = subprocess.Popen(
                 argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True
             )
-            _children_add(proc)
-            # A termination that landed between the pre-spawn check and this
-            # registration missed the forward; the child gets its interrupt
-            # here, and exits on it instead of at the drain's kill.
-            if terminating():
+            # A termination whose forward ran before this registration missed
+            # the child; it gets its one interrupt here, and exits on it
+            # instead of at the drain's kill.
+            if _children_add(proc):
                 proc.send_signal(signal.SIGINT)
         finally:
             boskos_pool._hold_signals(False)
@@ -308,8 +309,23 @@ _TERMINATING = threading.Event()
 
 
 def _children_add(proc):
+    """Registers the child; True when the termination's forward has already
+    taken its snapshot, so this child missed it and the caller interrupts it.
+    The flag is read in the same lock hold as the add, and the forward sets
+    it and snapshots in one hold too, so exactly one side signals a child:
+    a second interrupt makes tofu exit at once, mid-operation."""
     with _CHILDREN_LOCK:
         _CHILDREN.add(proc)
+        return _TERMINATING.is_set()
+
+
+def _begin_termination():
+    """Raises the terminating flag and interrupts every child registered so
+    far, flag and snapshot in one lock hold with the registration's check."""
+    with _CHILDREN_LOCK:
+        _TERMINATING.set()
+        procs = list(_CHILDREN)
+    _signal(procs)
 
 
 def _children_discard(proc):
@@ -320,6 +336,10 @@ def _children_discard(proc):
 def _children_signal(kill=False):
     with _CHILDREN_LOCK:
         procs = list(_CHILDREN)
+    _signal(procs, kill)
+
+
+def _signal(procs, kill=False):
     for proc in procs:
         try:
             if proc.poll() is None:
@@ -460,10 +480,20 @@ def is_restamp_only(changes):
         change.actions == [ACTION_UPDATE] and change.address == RESTAMP_ADDRESS and change.paths and change.paths <= RESTAMP_PATHS for change in changes
     )
 
+def _listed(address, allowed):
+    """True when the allowlist names the address, or names the resource an
+    instance address belongs to: one entry without an index covers every
+    instance of a count or for_each resource."""
+    if address in allowed:
+        return True
+    resource = _INSTANCE_INDEX_RE.sub("", address)
+    return resource != address and resource in allowed
+
+
 def _applied(actions, address, allowed):
     if actions in APPLIED_ACTIONS:
         return True
-    return (actions in REPLACE_ACTIONS or actions == [ACTION_DELETE]) and address in allowed
+    return (actions in REPLACE_ACTIONS or actions == [ACTION_DELETE]) and _listed(address, allowed)
 
 def refused_changes(changes, allowed=frozenset()):
     """The changes a re-apply must not make: everything but a create, an in-place update, or a delete or replace the allowlist declares."""
@@ -472,8 +502,8 @@ def refused_changes(changes, allowed=frozenset()):
 def describe(changes, allowed=frozenset()):
     add = sum(1 for c in changes if c.actions == [ACTION_CREATE])
     change = sum(1 for c in changes if c.actions == [ACTION_UPDATE])
-    replace = sum(1 for c in changes if c.actions in REPLACE_ACTIONS and c.address in allowed)
-    destroy = sum(1 for c in changes if c.actions == [ACTION_DELETE] and c.address in allowed)
+    replace = sum(1 for c in changes if c.actions in REPLACE_ACTIONS and _listed(c.address, allowed))
+    destroy = sum(1 for c in changes if c.actions == [ACTION_DELETE] and _listed(c.address, allowed))
     refused = sum(1 for c in changes if not _applied(c.actions, c.address, allowed))
     return "%d to add, %d to change, %d to replace, %d to destroy, %d refused" % (add, change, replace, destroy, refused)
 
@@ -520,7 +550,7 @@ def _allowed(allow):
 def unused_allowlist(allow, changes):
     """The non-standing entries this plan did not need: no delete or replace on their address."""
     needed = {c.address for c in changes if c.actions == [ACTION_DELETE] or c.actions in REPLACE_ACTIONS}
-    return sorted(entry.address for entry in allow or () if not entry.standing and entry.address not in needed)
+    return sorted(entry.address for entry in allow or () if not entry.standing and not any(_listed(address, {entry.address}) for address in needed))
 
 def reconcile_project(project, runner=tofu_runner, dry_run=False, timeout=PROJECT_TIMEOUT_SECONDS, allow=None, extras=None):
     """init, plan, inspect, apply, under one deadline. Returns (outcome, detail);
@@ -935,8 +965,9 @@ def reconcile_pool(server, owner, runner=tofu_runner, dry_run=False, known=None,
     Asked for by name rather than taken as Boskos hands them out, so a
     project leased when the run starts is asked for again, every
     POLL_INTERVAL_SECONDS, and reached once free. A registration outside the
-    mapping is never asked for by name; one anonymous acquire after the pass
-    finds one and reds the run (_check_for_stray_registration). What is
+    mapping is never asked for by name; anonymous acquires after the pass,
+    until a project comes round twice, find one and red the run
+    (_check_for_stray_registration). What is
     still busy, or not started, when the budget runs out or main's fleet tree
     moves is `not_reached`, for the next run.
     """
@@ -946,17 +977,20 @@ def reconcile_pool(server, owner, runner=tofu_runner, dry_run=False, known=None,
     run.mapped = len(known)
     run.mapped_names = set(known)
     pending = sorted(known)
+    seen_busy = set()
 
     def drain(reason, outcome=OUTCOME_NOT_REACHED):
-        # Under run.lock.
+        # Under run.lock. A budget that ran out while a project was busy:
+        # the project was busy, the budget only timed the wait, and the
+        # report says the former, whichever worker drains.
         while pending:
             project = pending.pop(0)
-            outcomes[project] = (outcome, reason)
+            why = REASON_NOT_REACHED_BUSY if project in seen_busy and _is_budget_reason(reason) else reason
+            outcomes[project] = (outcome, why)
             _line(project, outcomes[project])
 
     def worker():
         busy = set()
-        polled = False
         while True:
             # The stop check may fetch main; it runs outside the lock so the
             # other workers do not hold their leases waiting on it.
@@ -965,10 +999,7 @@ def reconcile_pool(server, owner, runner=tofu_runner, dry_run=False, known=None,
                 if not pending:
                     return
                 if stop:
-                    # A budget that ran out while this worker was polling busy
-                    # projects: the projects were busy, the budget only timed
-                    # the wait, and the report says the former.
-                    drain(REASON_NOT_REACHED_BUSY if polled and _is_budget_reason(stop) else stop)
+                    drain(stop)
                     return
                 project = pending.pop(0)
             try:
@@ -995,6 +1026,7 @@ def reconcile_pool(server, owner, runner=tofu_runner, dry_run=False, known=None,
             with run.lock:
                 pending.append(project)
                 busy.add(project)
+                seen_busy.add(project)
                 every_remaining_busy = busy >= set(pending)
             if not every_remaining_busy:
                 continue
@@ -1006,7 +1038,6 @@ def reconcile_pool(server, owner, runner=tofu_runner, dry_run=False, known=None,
                     drain(REASON_NOT_REACHED_BUSY if run.budget is not None else REASON_BUSY, OUTCOME_NOT_REACHED if run.budget is not None else OUTCOME_BUSY)
                 return
             pause(wait)
-            polled = True
             busy.clear()
 
     try:
@@ -1094,8 +1125,7 @@ def _run_workers(worker, count):
             for flag in done:
                 flag.wait(WORKER_JOIN_STEP_SECONDS)
     except boskos_pool.Terminated:
-        _TERMINATING.set()
-        _children_signal()
+        _begin_termination()
         deadline = clock() + WORKER_DRAIN_SECONDS
         for flag in done:
             flag.wait(max(0, deadline - clock()))
@@ -1178,6 +1208,11 @@ def main(argv=None):
             # A refused allowlist or an unreadable main ref: reported above,
             # nothing leased, the report still written below.
             code = exc.code if isinstance(exc.code, int) else EXIT_FAILED
+            return code
+        except boskos_pool.Terminated as exc:
+            # The signal landed in the main fetch, before the first lease:
+            # the same exit as one inside the run.
+            code = _terminated(exc, outcomes, error)
             return code
         code = _run(args, outcomes, error, run)
     except BaseException as exc:
@@ -1276,6 +1311,19 @@ def write_report(path, args, outcomes, code, error, started, run=None):
         print("WARNING: could not write the report to %s (%s)" % (path, exc), file=sys.stderr)
 
 
+def _terminated(exc, outcomes, error):
+    """The terminated exit: every project reached has its line above, the one
+    the signal landed in included; the summary says how far the run got."""
+    report(outcomes)
+    interrupted = sorted(p for p, (o, _) in outcomes.items() if o == OUTCOME_INTERRUPTED)
+    message = "terminated (%s) after %d project(s)%s; held projects were released unless named above" % (
+        exc, len(outcomes), "; interrupted in %s" % ", ".join(interrupted) if interrupted else ""
+    )
+    error.append(message)
+    print("ERROR: %s" % message, file=sys.stderr)
+    return boskos_pool.TERMINATED_EXIT_CODE
+
+
 def _run(args, outcomes, error, run):
     """The reconcile itself; returns the exit code and records the run's
     error, if any, in `error` for the report."""
@@ -1319,16 +1367,7 @@ def _run(args, outcomes, error, run):
             return EXIT_FAILED
         return EXIT_OK
     except boskos_pool.Terminated as exc:
-        # Every project reached has its line above, the one the signal landed
-        # in included; the summary says how far the run got.
-        report(outcomes)
-        interrupted = sorted(p for p, (o, _) in outcomes.items() if o == OUTCOME_INTERRUPTED)
-        message = "terminated (%s) after %d project(s)%s; held projects were released unless named above" % (
-            exc, len(outcomes), "; interrupted in %s" % ", ".join(interrupted) if interrupted else ""
-        )
-        error.append(message)
-        print("ERROR: %s" % message, file=sys.stderr)
-        return boskos_pool.TERMINATED_EXIT_CODE
+        return _terminated(exc, outcomes, error)
     except (ReconcileError, boskos_pool.BoskosError) as exc:
         report(outcomes)
         error.append(str(exc))
