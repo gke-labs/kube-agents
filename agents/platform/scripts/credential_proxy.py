@@ -1058,6 +1058,14 @@ DESTRUCTIVE_CHAT_METHODS = frozenset({"delete", "batchdelete", "remove", "purge"
 # list naming it.
 DESTRUCTIVE_SLACK_VERBS = frozenset({"delete", "remove", "kick", "archive"})
 
+# The one Slack method the verb rule above would refuse that the relay forwards.
+# Slack's `reactions.remove` takes off only the calling token's own reaction --
+# the bot's, never a person's -- and adding it again undoes it, so it is not in
+# the class the denylist exists for. The agent takes its arrival reaction off
+# when its answer posts. Matched exactly, before case-folding: `Reactions.Remove`
+# is not this method and stays refused, as every other `*.remove` does.
+SLACK_REMOVE_ALLOWLIST = frozenset({"reactions.remove"})
+
 
 class AuthenticationError(Exception):
     """The caller could not be identified.
@@ -2199,7 +2207,10 @@ class SlackRelay:
     ) -> dict[str, Any]:
         if not method or method.startswith("_"):
             raise ValueError("Slack API method is not available through the relay")
-        if method.rpartition(".")[2].lower() in DESTRUCTIVE_SLACK_VERBS:
+        if (
+            method not in SLACK_REMOVE_ALLOWLIST
+            and method.rpartition(".")[2].lower() in DESTRUCTIVE_SLACK_VERBS
+        ):
             raise ValueError(
                 f"the Slack method {method!r} is not available through the relay"
             )
