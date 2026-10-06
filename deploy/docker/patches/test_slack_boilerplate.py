@@ -13,12 +13,14 @@ exec the patched and unpatched fixtures, and compare what each sends: with the
 flag off, or for any platform but Slack, the two must be identical.
 """
 
+import ast
 import asyncio
 import importlib
 import os
 import shutil
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,10 +37,20 @@ import verify_slack_boilerplate as verifier
 
 DELIVERY = '''\
 """Fixture standing in for cron/scheduler_delivery.py."""
+from dataclasses import dataclass
+
 SENT = []
 
 
-def _prepare_target_delivery(target):
+@dataclass
+class _TargetDelivery:
+    job: dict
+    platform_name: str
+    chat_id: str
+    live_adapter_ready: bool = False
+
+
+def _prepare_target_delivery(target) -> "Optional[_TargetDelivery]":
     return target
 
 
@@ -529,10 +541,14 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+_live_roots = []
+
+
 class _Root:
     """A throwaway Hermes root holding the fixtures and the runtime module."""
 
     def __init__(self):
+        self._cleaned = False
         self.dir = Path(tempfile.mkdtemp())
         for relative, text in FIXTURES.items():
             path = self.dir / relative
@@ -545,6 +561,15 @@ class _Root:
         # On the path for the root's lifetime: the delivery fixture imports
         # gateway.platforms.base when it is called, not when it is loaded.
         sys.path.insert(0, str(self.dir))
+        if _live_roots:
+            self._saved_modules = dict(_live_roots[0]._saved_modules)
+        else:
+            self._saved_modules = {
+                m: sys.modules[m]
+                for m in sys.modules
+                if m.partition(".")[0] in ("gateway", "agent")
+            }
+        _live_roots.append(self)
         self._forget_gateway()
 
     @staticmethod
@@ -559,9 +584,17 @@ class _Root:
         return namespace
 
     def cleanup(self):
-        sys.path.remove(str(self.dir))
+        if self._cleaned:
+            return
+        if str(self.dir) in sys.path:
+            sys.path.remove(str(self.dir))
+        if self in _live_roots:
+            _live_roots.remove(self)
         self._forget_gateway()
+        if not _live_roots:
+            sys.modules.update(self._saved_modules)
         shutil.rmtree(self.dir, ignore_errors=True)
+        self._cleaned = True
 
 
 def _target(platform, live=True):
@@ -588,6 +621,37 @@ class _Adapter:
     async def send(self, chat_id, msg, **kw):
         self.sent.append(msg)
         return SimpleNamespace(success=True)
+
+
+def target_reads(source):
+    """The attributes ``cron_delivery_text`` reads off ``target``.
+
+    Every appearance of ``target`` must be ``target.<attr>`` or
+    ``getattr(target, "<attr>", ...)``; any other (a keyword or positional
+    hand-off, a container, an alias) carries it where this cannot follow, and
+    fails rather than leaving a read unpinned.
+    """
+    fn = next(
+        node for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef) and node.name == "cron_delivery_text"
+    )
+    parents = {child: node for node in ast.walk(fn) for child in ast.iter_child_nodes(node)}
+    read = set()
+    for node in ast.walk(fn):
+        if not (isinstance(node, ast.Name) and node.id == "target"):
+            continue
+        parent = parents[node]
+        if isinstance(parent, ast.Attribute):
+            read.add(parent.attr)
+        elif (
+            isinstance(parent, ast.Call) and ast.unparse(parent.func) == "getattr"
+            and len(parent.args) >= 2 and parent.args[0] is node
+            and isinstance(parent.args[1], ast.Constant)
+        ):
+            read.add(parent.args[1].value)
+        else:
+            raise AssertionError(f"target escapes at line {node.lineno}: {ast.unparse(parent)}")
+    return read
 
 
 class ApplierTest(unittest.TestCase):
@@ -744,6 +808,98 @@ class ApplierTest(unittest.TestCase):
                 self.assertIn(f"reads {name}, which nothing binds", str(caught.exception))
                 path.write_text(patched)
         verifier.check_bound(self.root.dir)
+
+    def test_verifier_refuses_a_renamed_target_field(self):
+        # drive() hands cron_delivery_text a SimpleNamespace, and the helper reads
+        # through getattr with a default, so a rename upstream raises nothing.
+        applier.apply(self.root.dir)
+        path = self.root.dir / applier.DELIVERY
+        patched = path.read_text()
+        for name in verifier.TARGET_FIELDS:
+            with self.subTest(name=name):
+                old = f"    {name}: "
+                self.assertEqual(patched.count(old), 1)
+                path.write_text(patched.replace(old, f"    {name}_v2: "))
+                with self.assertRaises(SystemExit) as caught:
+                    verifier.main(self.root.dir)
+                self.assertIn(f"no longer declares {name},", str(caught.exception))
+        path.write_text(patched)
+        verifier.main(self.root.dir)
+
+    def test_target_fields_are_what_cron_delivery_text_reads(self):
+        # A new getattr in the helper would otherwise go unpinned.
+        self.assertEqual(target_reads(Path(runtime.__file__).read_text()), set(verifier.TARGET_FIELDS))
+
+    def test_target_reads_refuses_target_escaping_the_helper(self):
+        for escape in (
+            "_log(job, target=target)",
+            "_log(*[target])",
+            "_log([target])",
+            "t = target",
+        ):
+            with self.subTest(escape=escape):
+                source = f"def cron_delivery_text(target):\n    getattr(target, 'chat_id', '')\n    {escape}\n"
+                with self.assertRaises(AssertionError):
+                    target_reads(source)
+
+    def test_verifier_refuses_a_target_from_elsewhere(self):
+        applier.apply(self.root.dir)
+        path = self.root.dir / applier.DELIVERY
+        patched = path.read_text()
+        bind = "t = _prepare_target_delivery(target)"
+        indent = patched.split(bind)[0].rsplit("\n", 1)[1]
+        for old, new, detail in (
+            ('-> "Optional[_TargetDelivery]"', '-> "Optional[_SlackTarget]"', "no longer annotated"),
+            ('-> "Optional[_TargetDelivery]"', '-> "Union[_TargetDelivery, _SlackTarget]"', "no longer annotated"),
+            ('-> "Optional[_TargetDelivery]"', '-> "Optional[_TargetDeliveryV2]"', "no longer annotated"),
+            (bind, "t = _prepare_slack_target(target)", "no longer binds t"),
+            (bind, f"{bind}\n{indent}t = target", "no longer binds t"),
+            (bind, f"{bind}\n{indent}def _one(t):\n{indent}    pass", "no longer binds t"),
+            (bind, f"{bind}\n{indent}try:\n{indent}    pass\n{indent}except Exception as t:\n{indent}    pass",
+             "no longer binds t"),
+        ):
+            with self.subTest(detail=detail):
+                self.assertEqual(patched.count(old), 1)
+                path.write_text(patched.replace(old, new))
+                with self.assertRaises(SystemExit) as caught:
+                    verifier.check_target_fields(self.root.dir)
+                self.assertIn(detail, str(caught.exception))
+        path.write_text(patched)
+        verifier.check_target_fields(self.root.dir)
+
+    def test_verifier_accepts_every_spelling_of_optional(self):
+        applier.apply(self.root.dir)
+        path = self.root.dir / applier.DELIVERY
+        patched = path.read_text()
+        for spelling in (
+            '-> "Union[_TargetDelivery, None]"',
+            '-> "typing.Optional[_TargetDelivery]"',
+            '-> "_TargetDelivery | None"',
+        ):
+            with self.subTest(spelling=spelling):
+                path.write_text(patched.replace('-> "Optional[_TargetDelivery]"', spelling))
+                verifier.check_target_fields(self.root.dir)
+
+    def test_verifier_accepts_an_annotated_binding_and_a_nested_forward_reference(self):
+        applier.apply(self.root.dir)
+        path = self.root.dir / applier.DELIVERY
+        patched = path.read_text()
+        for old, new in (
+            ("t = _prepare_target_delivery(target)", "t: _TargetDelivery = _prepare_target_delivery(target)"),
+            ('-> "Optional[_TargetDelivery]"', '-> Optional["_TargetDelivery"]'),
+        ):
+            with self.subTest(new=new):
+                self.assertEqual(patched.count(old), 1)
+                path.write_text(patched.replace(old, new))
+                verifier.check_target_fields(self.root.dir)
+
+    def test_verifier_names_an_unparseable_return_annotation(self):
+        applier.apply(self.root.dir)
+        path = self.root.dir / applier.DELIVERY
+        path.write_text(path.read_text().replace('-> "Optional[_TargetDelivery]"', '-> "Optional[_TargetDelivery"'))
+        with self.assertRaises(SystemExit) as ctx:
+            verifier.check_target_fields(self.root.dir)
+        self.assertIn("does not parse", str(ctx.exception))
 
     def test_verifier_refuses_a_dropped_wrapper(self):
         applier.apply(self.root.dir)
@@ -1238,6 +1394,112 @@ class MissingPresenterTest(unittest.TestCase):
             ), mock.patch.object(runtime.logger, "warning") as warning:
                 runtime.enabled()
                 self.assertEqual(warning.called, warns)
+
+
+class RootTest(unittest.TestCase):
+    def test_root_preserves_external_modules(self):
+        fake_gateway = types.ModuleType("gateway.preexisting")
+        fake_agent = types.ModuleType("agent.preexisting")
+        patcher = mock.patch.dict(
+            sys.modules,
+            {
+                "gateway.preexisting": fake_gateway,
+                "agent.preexisting": fake_agent,
+            },
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        root = _Root()
+        self.addCleanup(root.cleanup)
+        # During the root's lifetime, pre-existing modules are cleared so the
+        # fixture tree imports cleanly.
+        self.assertNotIn("gateway.preexisting", sys.modules)
+        self.assertNotIn("agent.preexisting", sys.modules)
+
+        # Exercising delivery fixture imports gateway modules from root.dir.
+        delivery = root.load(applier.DELIVERY, "cron.scheduler_delivery")
+        delivery["_deliver_result"]({"id": "j1"}, "hello", [_target("slack")])
+        self.assertIn("gateway.platforms.base", sys.modules)
+        added = sys.modules["gateway.platforms.base"]
+
+        root.cleanup()
+        # After cleanup, what the root added is removed, and the pre-existing
+        # stubs are restored.
+        self.assertIsNot(sys.modules.get("gateway.platforms.base"), added)
+        self.assertIs(sys.modules.get("gateway.preexisting"), fake_gateway)
+        self.assertIs(sys.modules.get("agent.preexisting"), fake_agent)
+
+    def test_root_preserves_top_level_package_stubs(self):
+        fake_gateway = types.ModuleType("gateway")
+        patcher = mock.patch.dict(sys.modules, {"gateway": fake_gateway})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        root = _Root()
+        self.addCleanup(root.cleanup)
+        self.assertNotIn("gateway", sys.modules)
+
+        delivery = root.load(applier.DELIVERY, "cron.scheduler_delivery")
+        delivery["_deliver_result"]({"id": "j1"}, "hello", [_target("slack")])
+        self.assertIn("gateway", sys.modules)
+        self.assertIsNot(sys.modules.get("gateway"), fake_gateway)
+        added = sys.modules["gateway.platforms.base"]
+
+        root.cleanup()
+        self.assertIsNot(sys.modules.get("gateway.platforms.base"), added)
+        self.assertIs(sys.modules.get("gateway"), fake_gateway)
+
+    def test_root_cleanup_is_idempotent(self):
+        root = _Root()
+        self.addCleanup(root.cleanup)
+        root.cleanup()
+        # A second call must be a no-op, not a repeat: re-running forget and
+        # restore would evict whatever a newer root has imported since.
+        later = _Root()
+        self.addCleanup(later.cleanup)
+        delivery = later.load(applier.DELIVERY, "cron.scheduler_delivery")
+        delivery["_deliver_result"]({"id": "j1"}, "hello", [_target("slack")])
+        added = sys.modules["gateway.platforms.base"]
+        root.cleanup()
+        self.assertIs(sys.modules.get("gateway.platforms.base"), added)
+
+    def test_overlapping_roots_fifo_cleanup_does_not_leak_stale_modules(self):
+        # When two roots overlap and clean up out-of-order (FIFO), the inner root
+        # must inherit the outer root's baseline rather than snapshot the outer
+        # root's imports, and tearing down the outer root first must not leave
+        # stale deleted paths in sys.modules or lose the baseline on the way out.
+        stub = types.ModuleType("gateway.preexisting")
+        patcher = mock.patch.dict(sys.modules, {"gateway.preexisting": stub})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        outer = _Root()
+        self.addCleanup(outer.cleanup)
+        outer_delivery = outer.load(applier.DELIVERY, "cron.scheduler_delivery")
+        outer_delivery["_deliver_result"]({"id": "j1"}, "hello", [_target("slack")])
+        outer_mod = sys.modules.get("gateway.platforms.base")
+        self.assertIsNotNone(outer_mod)
+
+        inner = _Root()
+        self.addCleanup(inner.cleanup)
+        inner_delivery = inner.load(applier.DELIVERY, "cron.scheduler_delivery")
+        inner_delivery["_deliver_result"]({"id": "j1"}, "hello", [_target("slack")])
+        inner_mod = sys.modules.get("gateway.platforms.base")
+        self.assertIsNot(inner_mod, outer_mod)
+
+        # FIFO teardown: clean outer first, then inner
+        outer.cleanup()
+        # Baseline must stay out until the last live root exits: restoring it
+        # here would shadow inner's gateway package while inner is still live.
+        self.assertNotIn("gateway.preexisting", sys.modules)
+        self.assertIsNot(inner._saved_modules.get("gateway.platforms.base"), outer_mod)
+        self.assertIs(inner._saved_modules.get("gateway.preexisting"), stub)
+
+        inner.cleanup()
+        self.assertIsNot(sys.modules.get("gateway.platforms.base"), outer_mod)
+        self.assertIsNot(sys.modules.get("gateway.platforms.base"), inner_mod)
+        self.assertIs(sys.modules.get("gateway.preexisting"), stub)
 
 
 if __name__ == "__main__":

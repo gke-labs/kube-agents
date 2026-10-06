@@ -288,12 +288,13 @@ func TestTheBrokerPodAuthenticatesItsCallers(t *testing.T) {
 // scoped-identity path fails at the first read.
 func TestTheBrokerMountsEveryPathItsEnvironmentNames(t *testing.T) {
 	agent := brokerPodAgent()
-	agent.Spec.Security = &agentv1alpha1.SecuritySpec{ScopedServiceAccounts: []agentv1alpha1.ScopedServiceAccount{{
-		ProjectID:           "proj",
-		Location:            "us-central1",
-		ClusterName:         "cluster",
-		ServiceAccountEmail: "scoped-agent@proj.iam.gserviceaccount.com",
-	}}}
+	agent.Spec.Security = &agentv1alpha1.SecuritySpec{ScopedServiceAccountPool: &agentv1alpha1.ScopedServiceAccountPoolSpec{
+		Enabled: true,
+		ServiceAccounts: []agentv1alpha1.ScopedServiceAccount{{
+			ProjectID:           "proj",
+			ServiceAccountEmail: "scoped-agent@proj.iam.gserviceaccount.com",
+		}},
+	}}
 	container := buildCredentialProxyContainer(agent)
 	volumes := buildCredentialProxyRuntimeVolumes(agent)
 
@@ -888,6 +889,12 @@ func TestTheBrokerDeclaresItsMetricsListener(t *testing.T) {
 func TestTheSessionCallerIsNamedOnlyUnderTheFlag(t *testing.T) {
 	agent := brokerPodAgent()
 	agent.Spec.Mode = ptr.To("next")
+	// Chat off: under next with Google Chat enabled the A2A gateway is a
+	// caller too (a2aChatArmed), and this test is about the session flag
+	// alone.
+	if agent.Spec.Integration != nil {
+		agent.Spec.Integration.GoogleChat = nil
+	}
 	sessionCaller := "system:serviceaccount:test-ns:test-agent-a2a-session"
 
 	t.Setenv(a2aSessionClusterViewEnvVar, "")

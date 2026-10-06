@@ -257,6 +257,14 @@ class LifecyclePlanTest(unittest.TestCase):
         self.assertLess(destroy_branch.index("guard_release_namespace"),
                         destroy_branch.index("delete_agent_cr"))
 
+    def test_destroy_uninstalls_the_helm_releases_after_the_cr_and_before_terraform(self):
+        """The helm provider's Delete can report a release gone without reaching the cluster."""
+        destroy_branch = re.search(r"^  destroy\)$(.*?)^  \*\)$", self.text,
+                                   re.MULTILINE | re.DOTALL).group(1)
+        call = "\n    uninstall_helm_releases\n"
+        self.assertLess(destroy_branch.index("delete_agent_cr"), destroy_branch.index(call))
+        self.assertLess(destroy_branch.index(call), destroy_branch.index("terraform destroy -var"))
+
     def test_apply_forgets_unmanaged_cluster_kms_before_adopting(self):
         """adopt_kms re-reads state, so the removals have to land first (#1296)."""
         apply_branch = re.search(r"^  apply\)$(.*?)^  destroy\)$", self.text,

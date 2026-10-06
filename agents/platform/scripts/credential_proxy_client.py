@@ -46,7 +46,7 @@ EXIT_SECURITY_POLICY_BLOCKED = getattr(os, "EX_NOPERM", 77)
 
 # `\Z`, not `$`. `$` also matches immediately before a trailing newline, so
 # `re.match` on "nowhere\n" succeeds -- and that value goes on to build the
-# scope key in a log line and a filename in the broker's state dir. `fullmatch`
+# project key in a log line and a filename in the broker's state dir. `fullmatch`
 # at the call site says the same thing twice on purpose: whichever a later
 # reader changes, the other still holds.
 _GKE_CONTEXT_COMPONENT = re.compile(r"^[a-z0-9][a-z0-9-]*\Z")

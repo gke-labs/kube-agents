@@ -226,10 +226,17 @@ check "the data volume is the agent's" "1000" \
 check "the prepare step staged the image trees" "image trees prepared" "$PREPARE_LOG"
 check "and the shell's entrypoint found them mounted read-only" "are read-only mounts" "$logs"
 # Every file, not the top directory: a tree chowned to root at the top and left
-# agent-owned below is writable wherever the mount is not.
+# agent-owned below is writable wherever the mount is not. All six trees, from
+# the same arrays the mounts are built from.
+staged_trees=()
+for home in "${IMAGE_TREE_HOMES[@]}"; do
+  for tree in "${IMAGE_TREES[@]}"; do
+    staged_trees+=("/opt/data/${home:+$home/}$tree")
+  done
+done
 check "every file in the staged trees is root's and writable by nobody else" "all root, go-w" \
-  "$(docker exec "$NAME" sh -c 'out=$(find /opt/data/scripts /opt/data/profiles/platform/skills \( ! -user root -o -perm /022 \) 2>&1) &&
-    [ -z "$out" ] && echo "all root, go-w" || echo "$out"' 2>&1)"
+  "$(docker exec "$NAME" sh -c 'out=$(find "$@" \( ! -user root -o -perm /022 \) 2>&1) &&
+    [ -z "$out" ] && echo "all root, go-w" || echo "$out"' _ "${staged_trees[@]}" 2>&1)"
 
 echo
 echo "== 3. who may log in =="

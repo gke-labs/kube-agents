@@ -44,7 +44,7 @@ spec:
   deployment:
     # Golden fixture: platformagent-tagged.yaml plus a scoped service account
     # pool, and nothing else. Diff the two expected outputs and the whole of
-    # what spec.security.scopedServiceAccounts renders is visible at once --
+    # what spec.security.scopedServiceAccountPool renders is visible at once --
     # which is the property this fixture exists to hold, since the mapping
     # being readable off a manifest rather than inferred from the broker's
     # behaviour is the point of putting it in the CR at all.
@@ -58,23 +58,18 @@ spec:
     # +optional
     serviceAccountAnnotations:
       iam.gke.io/gcp-service-account: "kubeagents-platform-gsa@kube-agents-gkedemos.iam.gserviceaccount.com"
-    # One account per cluster. Deliberately out of sorted order, and
-    # deliberately spanning two projects: the rendered ConfigMap must come back
-    # sorted by scope key, and the second project is what shows that
-    # cross-project membership is a list entry rather than a second deployment.
-    scopedServiceAccounts:
-      - projectId: "example-project"
-        location: "us-central1-a"
-        clusterName: "cluster-b"
-        serviceAccountEmail: "ka-cluster-b-7d2f91a0@example-project.iam.gserviceaccount.com"
-      - projectId: "other-project"
-        location: "europe-west1"
-        clusterName: "cluster-a"
-        serviceAccountEmail: "ka-cluster-a-3e8b04c5@other-project.iam.gserviceaccount.com"
-      - projectId: "example-project"
-        location: "us-central1-a"
-        clusterName: "cluster-a"
-        serviceAccountEmail: "ka-cluster-a-1a2b3c4d@example-project.iam.gserviceaccount.com"
+    # One account per project, armed explicitly. Deliberately out of sorted
+    # order, and deliberately spanning two projects, one of them the host
+    # (harness.projectId): the rendered ConfigMap must come back sorted by
+    # projectId, and the second project is what shows that cross-project
+    # membership is a list entry rather than a second deployment.
+    scopedServiceAccountPool:
+      enabled: true
+      serviceAccounts:
+        - projectId: "other-project"
+          serviceAccountEmail: "ka-other-project-3e8b04c5@example-project.iam.gserviceaccount.com"
+        - projectId: "example-project"
+          serviceAccountEmail: "ka-example-project-1a2b3c4d@example-project.iam.gserviceaccount.com"
 
   # Integration configures platform-specific external connections.
   # +optional

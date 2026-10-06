@@ -1157,6 +1157,23 @@ def _held_run(flag, wake_outcomes):
     return adapter.sent, runner.wakes
 
 
+# The applier pins the binding's text inside the def; this builds a
+# notification through whatever constructor Python actually runs, so an
+# __init__ replaced or wrapped from outside the def is caught too.
+try:
+    _built = notifier._KanbanNotification(
+        _HeldRunner(),
+        {"sub": {"task_id": "t_built", "platform": "Slack", "chat_id": "C1"}, "task": None, "board": None},
+        platform_cls=lambda name: name, sub_fail_counts={},
+    )
+    check(
+        "a constructed notification carries the platform_str the completion call reads",
+        getattr(_built, "platform_str", None) == "slack",
+        f"platform_str is {getattr(_built, 'platform_str', '<unset>')!r}",
+    )
+except Exception as exc:  # noqa: BLE001 -- report, do not crash past the summary
+    check("_KanbanNotification constructs", False, repr(exc))
+
 try:
     _sent, _wakes = _held_run(True, [None])
     check(

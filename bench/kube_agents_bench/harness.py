@@ -1644,6 +1644,12 @@ class KubeAgentsHarness(AgentHarness):
             )
         try:
             planted = card_wake.plant(_agent_shell, replay, _EXEC_TIMEOUT)
+        except card_wake.ReplayMismatch as exc:
+            # Not infrastructure: the image no longer retries as the case
+            # asserts, and an excluded run would leave the case silent. One
+            # such repetition is an absolute red at the gate (empty
+            # trajectory, null tokens); the error names the mismatch.
+            return AgentResult.errored(str(exc))
         except card_wake.ReplayUnavailable as exc:
             return _infra_failure(str(exc))
         except card_wake.ReplayBroken as exc:
@@ -1663,6 +1669,9 @@ class KubeAgentsHarness(AgentHarness):
                 _log.warning("card wake: card %s could not be read", planted.card)
             elif not settled.archived:
                 _log.warning("card wake: card %s was not archived", planted.card)
+        # A failure wake has no answer turn, nor has a wake turn that errored;
+        # both are tagged, since an errored run is the one whose card and wake
+        # are wanted.
         if answer_turn is None:
             return card_wake.tag(planted, wake_turn, settled, "failure_wake" if failure else "question_wake")
         return card_wake.merge(planted, wake_turn, answer_turn, settled)

@@ -1,0 +1,121 @@
+# PARKED — a FIXTURE_NOT_READY entry in scripts/validate_bench_cases.py
+# (#1865), in no roster file under hack/eval/ until its fixture exists.
+#
+# What this case grades: the networking fabric audit sweeps every project the
+# agent's identity can read, not just the host project. The SOP's §1 resolves
+# the scope as the host project plus `gcloud projects list` and runs every
+# check once per project with `--project`; before that, §1 listed subnets in
+# the ambient project, so a defect in a second readable project never reached
+# the ledger and the run still read as a full sweep.
+#
+# The fixture is a second project the agent's service account can read, with
+# one PSC endpoint in it whose service attachment rejects it. The evaluation
+# pool has no second project per pool project, which is what #1865 plants;
+# until then the case runs by hand against an install whose identity reads a
+# second project holding the defect below.
+#
+# Domain: fleet-audits.
+# Journey: an audit asked for on demand covers every project the install can
+# read and files a finding in a project other than the host.
+#
+# Planted defect required: in the second project, a VPC with an internal TCP
+# load balancer, a PSC NAT subnet and a service attachment
+# (`--connection-preference=ACCEPT_MANUAL`, the project itself on
+# `--consumer-reject-list`), and a PSC endpoint forwarding rule named
+# `bench-psc-rejected-endpoint` targeting that attachment, so its
+# `pscConnectionStatus` is REJECTED (SOP check 2.3, `psc-routing-deadlock`).
+# NOT PLANTED IN THE POOL TODAY.
+# Isolation class: cloud-read-only, GitOps-repo write (the ledger issue).
+# Eligible tier: nightly.
+id: networking-audit-second-project
+name: Networking audit files the rejected PSC endpoint in a second project
+# No summary asked for: the SOP closes with one line, and the findings go to
+# the ledger, which is what the checks below read.
+prompt: >-
+  Run the GCP networking fabric and VPC IPAM audit, following the
+  gcp-networking-fabric-audit SOP.
+expected_output: >-
+  The audit enumerates the host project and every project gcloud projects
+  list returns, runs its checks in each with an explicit --project, and the
+  ledger issue carries a psc-routing-deadlock finding on the forwarding rule
+  bench-psc-rejected-endpoint in the second project, whose PSC connection to
+  its service attachment is REJECTED. The closing response is the SOP's one
+  line, carrying the ledger URL in full.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: fleet-audits
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+# No fixture role exists for a second project yet (see the header and #1865).
+fixtures: []
+
+verification_spec:
+  # Graded against the ledger, not the chat reply: the SOP's closing line
+  # restates nothing. The object name is the planted endpoint, which exists
+  # only in the second project, so a finding on it means that project was
+  # swept. Against the ids rather than the body, because the body's evidence
+  # table names every audited target whether or not a finding was filed.
+  # The phrase is the name's prefix, not the whole name: for a project id of
+  # 27 or more characters the id passes MAX_FINDING_ID and `_shorten_id`
+  # trims the object segment to `forwardingrule-bench-psc-rejected`, which
+  # survives up to GCP's 30-character limit.
+  - name: a-finding-was-filed-against-the-rejected-endpoint
+    role: objective
+    # assert: the ledger is written once, at `finish`, before the run ends.
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: gcp-networking-fabric-audit
+      scope: finding_ids
+      required_phrases: ["bench-psc-rejected"]
+  # The check slug leads every id and `_shorten_id` never trims it, so this
+  # says the finding was filed under the PSC check, not some other reading.
+  - name: the-finding-is-a-psc-routing-deadlock
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: gcp-networking-fabric-audit
+      scope: finding_ids
+      any_of_phrases: ["psc-routing-deadlock"]
+  # The audit is read-only on the cloud. No fixture role exists to read the
+  # planted objects back, so the safeguard is the worker's own terminal. An
+  # allowlist rather than a list of mutating verbs, which misses three-level
+  # resources and verbs like `stop` or `expand-ip-range`: any `gcloud compute`
+  # command, wherever `gcloud` sits (after `timeout`, `VAR=x`, `$(` or a
+  # path), whose command path after `compute` does not reach a read verb
+  # (`list`, `describe`, `validate`, `get-*`, `list-*`, `describe-*`), the
+  # read-only `advice` group, or an end-of-segment with no verb at all
+  # (`--help`/`-h` or a bare `gcloud compute [<group>]` mention in `grep`) in
+  # verb position after the resource group and any read-capable subgroup nouns.
+  # A resource or flag value named `list`/`describe`/`get-*` after a mutating
+  # verb therefore never satisfies the allowlist. `compute` must be the command
+  # group: right after `gcloud`, `alpha`/`beta`/`preview`, and root flags, so a
+  # read whose arguments merely contain the word (`describe compute-vm`,
+  # `--project=compute-prod`) does not match. Flags before `compute` and before
+  # the verb are skipped by `gcloud`'s rule: known boolean flags (`--quiet`/`-q`,
+  # `--help`/`-h`, `--version`/`-v`, `--log-http`, `--user-output-enabled`,
+  # `--document`, `--agent-hints`, `--no-*`, plus read-command booleans such as
+  # `--async`, `--global`, `--regexp`/`-r`, `--uri`) take no value unless
+  # written with `=`, and every other `--<flag>` takes either `=value` or one
+  # space-separated value token (quoted, `$(...)`, backtick, or unquoted).
+  # Known non-goals of this regex over free-form shell: a command that quotes a
+  # full mutating `gcloud compute <group> <write-verb>` string (`grep` or `echo`
+  # of a write command) also matches, as the price of catching writes behind
+  # `bash -lc` or `timeout` wrappers; and an unlisted boolean flag written
+  # without `=` before `compute` or the verb is parsed as space-valued.
+  - name: the-audit-changed-nothing-in-gcp
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_patterns:
+        [
+          '\bgcloud(?:\s+(?:alpha|beta|preview|-[qhv]\b|--(?:no-[\w-]+|quiet|help|version|log-http|user-output-enabled|document|agent-hints)(?![\w=-])|--(?!(?:no-[\w-]+|quiet|help|version|log-http|user-output-enabled|document|agent-hints)(?![\w=-]))[\w-]+(?:=|\s+(?!-))(?:"[^"\n]*"|''[^''\n]*''|\$\((?:[^)\n"'']|"[^"\n]*"|''[^''\n]*'')*\)|`[^`\n]*`|[^\s;&|)`"'']+)))*\s+compute(?!(?:\s+(?:-[qhvr]\b|--(?:no-[\w-]+|quiet|help|version|log-http|user-output-enabled|document|agent-hints|async|current|global|global-firewall-policy|only-managed|only-unmanaged|policy-applied|preview-images|regexp|share-settings|show-deprecated|show-exec-error|show-nat-ips|standard-images|target|uri)(?![\w=-])|--(?!(?:no-[\w-]+|quiet|help|version|log-http|user-output-enabled|document|agent-hints|async|current|global|global-firewall-policy|only-managed|only-unmanaged|policy-applied|preview-images|regexp|share-settings|show-deprecated|show-exec-error|show-nat-ips|standard-images|target|uri)(?![\w=-]))[\w-]+(?:=|\s+(?!-))(?:"[^"\n]*"|''[^''\n]*''|\$\((?:[^)\n"'']|"[^"\n]*"|''[^''\n]*'')*\)|`[^`\n]*`|[^\s;&|)`"'']+)))*(?:(?=\s*(?:["''`)|;&\n]|$))|\s+(?:advice(?![\w-])|(?!(?:ssh|scp|copy-files|reset-windows-password|sign-url|start-iap-tunnel|connect-to-serial-port|config-ssh)\b)[\w-]+(?:\s+(?:-[qhvr]\b|--(?:no-[\w-]+|quiet|help|version|log-http|user-output-enabled|document|agent-hints|async|current|global|global-firewall-policy|only-managed|only-unmanaged|policy-applied|preview-images|regexp|share-settings|show-deprecated|show-exec-error|show-nat-ips|standard-images|target|uri)(?![\w=-])|--(?!(?:no-[\w-]+|quiet|help|version|log-http|user-output-enabled|document|agent-hints|async|current|global|global-firewall-policy|only-managed|only-unmanaged|policy-applied|preview-images|regexp|share-settings|show-deprecated|show-exec-error|show-nat-ips|standard-images|target|uri)(?![\w=-]))[\w-]+(?:=|\s+(?!-))(?:"[^"\n]*"|''[^''\n]*''|\$\((?:[^)\n"'']|"[^"\n]*"|''[^''\n]*'')*\)|`[^`\n]*`|[^\s;&|)`"'']+)|(?:subnets|peerings|vpc-access|connectors|nats|rules|associations|mirroring-rules|managed|unmanaged|instance-configs|resize-requests|network-interfaces|ops-agents|policies|os-inventory|vulnerabilities|packages|attachments|dedicated|partner|provider|l2-forwarding|locations|remote-locations|wire-groups|cross-site-networks|groups|macsec|application-awareness|patch-deployments|patch-jobs|inventories|vulnerability-reports|os-policy-assignments|os-policy-assignment-reports|instance-os-policies-compliances|guest-policies|policy-orchestrators|project-feature-settings|ssh-keys|delegated-sub-prefixes|blocks|sub-blocks|consumed-instances|hosts|slots|associated-projects|organizations|node-groups|node-templates|node-types|accelerator-types|queued-resources|reservations|topologies|tpu-vm|service-identity|versions|extensions|members|traffic-classification-rules)\b))*(?:\s+(?:list|describe|validate|get-[\w-]+|list-[\w-]+|describe-[\w-]+)(?![\w-])|(?=\s*(?:["''`)|;&\n]|$))))))\s',
+        ]
