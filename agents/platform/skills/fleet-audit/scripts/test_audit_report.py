@@ -16752,6 +16752,59 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(rc, 0, self.err)
         self.assertEqual(self.stdout_json()["prs_closed"], [])
 
+    def test_a_partial_run_closes_the_pull_request_whose_ids_were_clipped(self):
+        # The compliance collector spells a cluster <project>/<location>/<name>,
+        # which makes the cluster segment the longest and the first clipped.
+        # A scoped declaration on that cluster still matches the clipped id.
+        cluster = "acme-prod/us-central1-a/payments-primary-cluster-with-a-long-name"
+        namespace = "payments"
+        path = f"clusters/{cluster}/{namespace}/default-sa-automount.yaml"
+        worker = make_finding(fid="worker", check="default-sa-automount", obj="Deployment/worker", title="worker", severity="major", cluster=cluster, namespace=namespace, remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        scope = [{"name": cluster, "location": "us-central1-a", "project": "acme-prod"}, {"name": "stage-eu", "location": "europe-west1", "project": "acme-stage"}]
+        previous_body = published_body(make_doc(findings=[worker], audit=AUDIT, clusters=scope), generated_at=NOW)
+        self.declaring_replies(previous_body)
+        worker_id = audit_report.published_id({"check": "default-sa-automount", "cluster": cluster, "namespace": namespace, "object": "Deployment/worker"})
+        self.assertNotEqual(worker_id, audit_report.derive_finding_id({"check": "default-sa-automount", "cluster": cluster, "namespace": namespace, "object": "Deployment/worker"}))
+        self.harness.replies["proposal-list"] = proposals_view(
+            [pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([worker_id]))]
+        )
+        self.touch(path)
+        pathlib.Path(audit_report.declarations_path_for(AUDIT)).parent.mkdir(parents=True, exist_ok=True)
+        audit_report.write_declarations(AUDIT, "acme/fleet", [{"check": "default-sa-automount", audit_report.DECLARATION_CLUSTER_FIELD: cluster, "namespace": namespace, "object": "Deployment/reporter", "repo": "acme/fleet", "path": "knowledge/reporter.md", "excerpt": "needs the token"}])
+        doc = make_doc(findings=[], audit=AUDIT, clusters=[scope[1]], skipped=[{"cluster": cluster, "reason": "control plane unreachable"}])
+        manifest = _full_manifest(names=("stage-eu",), audit=AUDIT)
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
+
+    def test_a_held_run_over_partial_coverage_says_the_shield_closed_the_pull_request(self):
+        # Both gates at once: a gap and an unaccounted previous finding. The
+        # held-over-partial-coverage comment names the shield's close too.
+        path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
+        api = make_finding(fid="api", check="default-sa-automount", obj="Deployment/api", title="api", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        worker = make_finding(fid="worker", check="default-sa-automount", obj="Deployment/worker", title="worker", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        previous_body = published_body(make_doc(findings=[api, worker], audit=AUDIT), generated_at=NOW)
+        self.declaring_replies(previous_body)
+        api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
+        worker_id = derived_id(check="default-sa-automount", obj="Deployment/worker")
+        self.harness.replies["proposal-list"] = proposals_view(
+            [pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([api_id, worker_id]))]
+        )
+        self.touch(path)
+        pathlib.Path(audit_report.declarations_path_for(AUDIT)).parent.mkdir(parents=True, exist_ok=True)
+        audit_report.write_declarations(AUDIT, "acme/fleet", [{"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}])
+        doc = make_doc(findings=[], audit=AUDIT, skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}])
+        manifest = _full_manifest(audit=AUDIT, candidates=[self.account_candidate("Deployment/api"), self.account_candidate("Deployment/worker")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertTrue(payload["partial"])
+        self.assertEqual(payload["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
+        self.assertIn("HELD:", self.err)
+        ledger = " ".join(self.harness.bodies_for("issue-*"))
+        self.assertIn("except the one the compliance shield forbids", ledger)
+        self.assertIn("except the compliance shield's (1)", self.err)
+
     def test_a_worker_cannot_mark_a_sibling_shielded_from_the_document(self):
         # Same pull request, no declaration anywhere: a document that carries
         # the ids under a key of the worker's choosing closes nothing, because
