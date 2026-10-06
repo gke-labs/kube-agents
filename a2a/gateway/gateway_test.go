@@ -2397,6 +2397,65 @@ func TestStartTaskRecordsTheRequester(t *testing.T) {
 	if _, ok := m["grants"]; ok {
 		t.Fatalf("attribution carries grants: %s", ref.Attribution)
 	}
+	// A human turn is the root of any chain: no role, no parent, no
+	// children, depth zero — and none of the four keys written at all.
+	if ref.Role != "" || ref.ParentTaskID != "" || ref.Children != nil || ref.Depth != 0 {
+		t.Fatalf("human turn carries chain fields: %+v", ref)
+	}
+	var stored struct {
+		Tasks []map[string]json.RawMessage `json:"tasks"`
+	}
+	if err := json.Unmarshal([]byte(rawSessionRecord(t, r.g.reg, conv)), &stored); err != nil || len(stored.Tasks) != 1 {
+		t.Fatalf("stored record: %v (%d tasks)", err, len(stored.Tasks))
+	}
+	for _, k := range []string{"role", "parentTaskId", "children", "depth"} {
+		if _, ok := stored.Tasks[0][k]; ok {
+			t.Fatalf("human turn's history entry writes %q", k)
+		}
+	}
+}
+
+// TestStartTaskWithCarriesTheChain: the core a child or wake turn calls
+// rides the correlationId it is handed rather than minting one, stores the
+// requester it is handed verbatim (already hashed), and writes the chain
+// fields onto the history entry.
+func TestStartTaskWithCarriesTheChain(t *testing.T) {
+	r := startRig(t)
+	if r.g.cfg.DelegationDepthMax != 3 {
+		t.Fatalf("New left DelegationDepthMax = %d on a hand-built Config, want 3", r.g.cfg.DelegationDepthMax)
+	}
+	conv := "discord:g1/thread-chain"
+	rec := &SessionRecord{Key: conv, Kind: "group", Addressee: "platform", ContextID: "ctx-chain"}
+	req := TaskRequester{Backend: "discord", Subject: requesterSubject(r.g.ps, "discord", "1001")}
+	taskID, ok := r.g.startTaskWith(context.Background(), rec, taskStart{
+		Text:          "child ask",
+		MessageID:     "",
+		Principal:     "test:bnaylor",
+		Requester:     req,
+		Authority:     Authority{Requester: AuthorityRequester{Principal: "test:bnaylor", Backend: "discord"}},
+		CorrelationID: "corr-parent",
+		Role:          taskRoleChild,
+		ParentTaskID:  "task-parent",
+		Depth:         1,
+	})
+	if !ok || taskID == "" {
+		t.Fatalf("startTaskWith = (%q, %v), want a task id and true", taskID, ok)
+	}
+	env := r.awaitTask(t, "platform")
+	if env.TaskID != taskID || env.CorrelationID != "corr-parent" {
+		t.Fatalf("envelope task %q corr %q, want %q and the parent's corr-parent", env.TaskID, env.CorrelationID, taskID)
+	}
+	if rec.ActiveTask == nil || rec.ActiveTask.CorrelationID != "corr-parent" {
+		t.Fatalf("active task = %+v, want correlationId corr-parent", rec.ActiveTask)
+	}
+	ref := rec.Tasks[len(rec.Tasks)-1]
+	if ref.ID != taskID || ref.CorrelationID != "corr-parent" || ref.Role != taskRoleChild ||
+		ref.ParentTaskID != "task-parent" || ref.Depth != 1 || ref.Children != nil {
+		t.Fatalf("history entry = %+v", ref)
+	}
+	if ref.Requester == nil || *ref.Requester != req {
+		t.Fatalf("requester = %+v, want %+v stored as handed", ref.Requester, req)
+	}
 }
 
 // TestStartTaskHashesAGchatRequester: on Google Chat the author id is the

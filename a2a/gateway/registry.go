@@ -133,7 +133,25 @@ type TaskRef struct {
 	Requester   *TaskRequester  `json:"requester,omitempty"`
 	Attribution json.RawMessage `json:"attribution,omitempty"`
 	StartedAt   time.Time       `json:"startedAt,omitzero"`
+	// Role, ParentTaskID, Children and Depth are the delegation chain. A
+	// child is minted on a session turn's request and names it as parent; a
+	// wake turn is started on the child's terminal and names the child. Depth
+	// counts delegations: a child's is its parent's plus one, a wake inherits
+	// its child's, and a turn at the bound may not delegate again. Children
+	// is a slice although one child runs at a time, so fan-out is one
+	// condition later rather than a record migration. All four are empty on
+	// a human turn and on entries written before they existed.
+	Role         string   `json:"role,omitempty"`
+	ParentTaskID string   `json:"parentTaskId,omitempty"`
+	Children     []string `json:"children,omitempty"`
+	Depth        int      `json:"depth,omitempty"`
 }
+
+// Task roles on TaskRef.Role; the empty role is a human turn.
+const (
+	taskRoleChild = "child"
+	taskRoleWake  = "wake"
+)
 
 // MarkCanceled records a published cancel against the task's history entry.
 func (rec *SessionRecord) MarkCanceled(taskID string) {

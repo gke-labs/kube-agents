@@ -293,6 +293,9 @@ func New(o Options) (*Gateway, error) {
 	if o.Config.MaxSessions <= 0 {
 		o.Config.MaxSessions = defaultMaxSessions
 	}
+	if o.Config.DelegationDepthMax <= 0 {
+		o.Config.DelegationDepthMax = defaultDelegationDepthMax
+	}
 	if o.Config.TaskDeadline <= 0 {
 		o.Config.TaskDeadline = defaultTaskDeadline
 	}
@@ -1430,13 +1433,58 @@ func isMaxBytes(err error) bool {
 	return strings.Contains(msg, maxBytesErrPattern) || strings.Contains(msg, maximumBytesErrPattern)
 }
 
-// startTask mints the identifiers, publishes the submission, and posts the
-// placeholder the relay will edit.
+// taskStart is what startTaskWith needs to open a turn, whoever asked for
+// it: a human message (startTask), a child minted on a session turn's
+// request, or the wake turn started on that child's terminal.
+type taskStart struct {
+	// Text is the turn's ask.
+	Text string
+	// MessageID and Principal feed only the ingress log: the backend message
+	// id the audit chain joins on, and the plaintext principal. A turn the
+	// gateway starts on its own (a child, a wake) has no backend message.
+	MessageID string
+	Principal string
+	// Requester is stored on the history entry as given — backend and the
+	// already-pseudonymized subject. startTask hashes a human's author id;
+	// a child copies its parent turn's entry.
+	Requester TaskRequester
+	// Authority renders the envelope's authority block; its Attribution is
+	// what the history entry keeps.
+	Authority Authority
+	// CorrelationID empty mints a fresh one, which is a human turn: the
+	// originating user interaction. A child rides its parent's (spec §3).
+	CorrelationID string
+	// Role, ParentTaskID and Depth go onto the history entry as the
+	// delegation chain; all zero for a human turn.
+	Role         string
+	ParentTaskID string
+	Depth        int
+}
+
+// startTask opens a turn for a human message.
 func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, backend, principal string, authority Authority) {
+	g.startTaskWith(ctx, rec, taskStart{
+		Text:      msg.Text,
+		MessageID: msg.MessageID,
+		Principal: principal,
+		Requester: TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)},
+		Authority: authority,
+	})
+}
+
+// startTaskWith mints the identifiers, publishes the submission, and posts
+// the placeholder the relay will edit. It reports the task id and true once
+// the submission is on the bus, and "" and false on every path that refused
+// or failed before that.
+func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts taskStart) (string, bool) {
 	taskID := "task-" + randHex(taskIDHexWidth)
 	// correlationId is minted here and nowhere else — the originating user
-	// interaction (payload spec field rule).
-	correlationID := "corr-" + randHex(correlationIDHexWidth)
+	// interaction (payload spec field rule). A turn opened on another
+	// turn's behalf carries that turn's instead.
+	correlationID := ts.CorrelationID
+	if correlationID == "" {
+		correlationID = "corr-" + randHex(correlationIDHexWidth)
+	}
 
 	// The ingress log is the plaintext join: backend message id against
 	// correlationId, so the audit chain runs chat message -> correlationId ->
@@ -1444,9 +1492,9 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	g.log.Info("ingress",
 		"correlationId", correlationID,
 		"taskId", taskID,
-		"backendMessageId", msg.MessageID,
-		"principal", principal,
-		"conversation", msg.Conversation,
+		"backendMessageId", ts.MessageID,
+		"principal", ts.Principal,
+		"conversation", rec.Key,
 		"addressee", rec.Addressee)
 
 	// The root capability, minted before anything is published. The
@@ -1463,7 +1511,7 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		g.log.Error("capability mint failed", "taskId", taskID, "addressee", rec.Addressee, "err", err)
 		if !g.cfg.CapabilityOptional {
 			g.post(rec.Key, "⚠️ not started: could not mint this task's capability")
-			return
+			return "", false
 		}
 		// The mixed-version window, and the only path that reaches an
 		// executor with grants null. Loud: an install left here has the
@@ -1473,17 +1521,17 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		capRef = nil
 	}
 
-	payload, err := messagePayload(msg.Text, taskID, rec.ContextID)
+	payload, err := messagePayload(ts.Text, taskID, rec.ContextID)
 	if err != nil {
 		g.log.Error("message payload build failed", "err", err)
-		return
+		return "", false
 	}
 	env, err := lib.NewMessageEnvelope(gatewayParty, taskID, rec.ContextID, correlationID, payload,
 		lib.WithTo(lib.Party{Session: rec.Addressee}),
-		lib.WithAuthority(authority.Render(capRef)))
+		lib.WithAuthority(ts.Authority.Render(capRef)))
 	if err != nil {
 		g.log.Error("envelope build failed", "err", err)
-		return
+		return "", false
 	}
 
 	// Announced before the placeholder below, deliberately: an adapter that
@@ -1506,12 +1554,16 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	// executor's submitted event must never race the mapping, because the
 	// relay acks what it cannot route and the durable won't redeliver it.
 	rec.ActiveTask = &ActiveTask{TaskID: taskID, CorrelationID: correlationID, StatusMsgID: statusMsgID,
-		Ask: truncateRunes(msg.Text, askCap), SubmittedAt: time.Now(), Capability: capRef}
+		Ask: truncateRunes(ts.Text, askCap), SubmittedAt: time.Now(), Capability: capRef}
+	requester := ts.Requester
 	rec.Tasks = append(rec.Tasks, TaskRef{
 		ID: taskID, Addressee: rec.Addressee, CorrelationID: correlationID, Capability: capRef,
-		Requester:   &TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)},
-		Attribution: authority.Attribution(),
-		StartedAt:   time.Now().UTC(),
+		Requester:    &requester,
+		Attribution:  ts.Authority.Attribution(),
+		StartedAt:    time.Now().UTC(),
+		Role:         ts.Role,
+		ParentTaskID: ts.ParentTaskID,
+		Depth:        ts.Depth,
 	})
 	rec.LastTaskActivity = time.Now().UTC()
 	if len(rec.Tasks) > taskHistoryCap {
@@ -1554,7 +1606,7 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		// stream, which would be a claim about a task the stream has never
 		// heard of.
 		g.observeTaskTerminal(rec.Key, taskID, lib.StateFailed, TerminalFromGateway, "")
-		return
+		return "", false
 	}
 
 	// The submission is on the subject now, which is the first moment
@@ -1576,6 +1628,7 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	if g.spawner != nil && rec.BusSession != "" && rec.Addressee == rec.BusSession {
 		g.ensureSessionPod(ctx, rec, taskID, originSeq)
 	}
+	return taskID, true
 }
 
 // steerTask forwards a message that arrived while the task runs as a

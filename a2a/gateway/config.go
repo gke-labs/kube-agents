@@ -29,6 +29,10 @@ const attributionSaltLen = 32
 // comment carries the sizing rationale.
 const defaultMaxSessions = 10
 
+// defaultDelegationDepthMax is what DelegationDepthMax means when unset; the
+// field's comment carries the rationale.
+const defaultDelegationDepthMax = 3
+
 // defaultGchatTokenPath is where the operator projects the gateway's
 // relay-audience ServiceAccount token when the gchat backend is armed.
 const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token"
@@ -351,6 +355,19 @@ type Config struct {
 	// ignores its own cap and cannot ignore that one), which is also what
 	// bounds the count-then-create race between concurrent conversations.
 	MaxSessions int
+
+	// DelegationDepthMax bounds how deep a delegation chain may run
+	// (A2A_DELEGATION_DEPTH_MAX). A human turn is depth 0, a child its
+	// parent's depth plus one, and a turn already at the bound may not
+	// delegate again. One child at a time means the chain is a line, and
+	// this bounds its length: a harness that delegates in a loop stops at
+	// the bound instead of walking the session cap.
+	//
+	// Zero means 3. FromEnv refuses a value under
+	// 1 rather than clamping it: 0 would be "delegation off", which is a
+	// different switch (A2A_DELEGATE_TOOL on the worker side), not a typo to
+	// paper over.
+	DelegationDepthMax int
 }
 
 // Backend names the REAL chat backend this config arms: "gchat", "slack",
@@ -525,6 +542,12 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_MAX_SESSIONS %q: need an integer >= 1", maxSessions)
 	}
 	cfg.MaxSessions = n
+	depthMax := envOr("A2A_DELEGATION_DEPTH_MAX", strconv.Itoa(defaultDelegationDepthMax))
+	dm, err := strconv.Atoi(depthMax)
+	if err != nil || dm < 1 {
+		return nil, fmt.Errorf("A2A_DELEGATION_DEPTH_MAX %q: need an integer >= 1", depthMax)
+	}
+	cfg.DelegationDepthMax = dm
 	ttl := envOr("A2A_IDLE_TTL", "30m")
 	d, err := time.ParseDuration(ttl)
 	if err != nil {
