@@ -139,8 +139,11 @@ PASTED_BREAKDOWN_REPORT = (
 # the share two to four lines below the id. The table headers that say
 # neither total nor duration are the ones only the data row's own shape (a
 # decimal number or a unit-suffixed duration and a share on one line) can
-# satisfy; the last two put the unit in the header and a bare number in
-# the cell, as a table conventionally does.
+# satisfy; two put the unit in the header and a bare number in the cell,
+# as a table conventionally does. The last two list the helper's facts as
+# one bullet each with the span count (or a start time) first, so the line
+# under the id carries none of the tokens and the share, on its own line
+# with no second number, is reached only through the id's window.
 HEADING_BREAKDOWN_REPORTS = [
     "### Trace 0384e171d360c91c96df3124562dcc59\n\n"
     "| Total duration | Spans | Slowest span | Share |\n|---|---|---|---|\n"
@@ -163,6 +166,15 @@ HEADING_BREAKDOWN_REPORTS = [
     "#### 0384e171d360c91c96df3124562dcc59\n"
     "| Time (s) | Spans | Slowest | % of trace |\n|---|---|---|---|\n"
     "| 2.59 | 1 | api.model-default | 100% |",
+    "1. **0384e171d360c91c96df3124562dcc59**\n"
+    "   - Spans: 1\n"
+    "   - Duration: 2.590s\n"
+    "   - Slowest: `api.model-default` (100%)",
+    "### Trace 0384e171d360c91c96df3124562dcc59\n\n"
+    "- Started: 2026-09-28T16:54:29Z\n"
+    "- Spans: 17\n"
+    "- Slowest span: `api.model-default` (30%)\n"
+    "- Total: 60.917s",
 ]
 
 # A failure that happens to carry a seconds-and-share line but no id the
