@@ -2,12 +2,14 @@
 
 The deploy script retries the `helm upgrade --install` call a bounded number
 of times when the Kubernetes API server responds with a transient 5xx
-(Internal Server Error, the server is currently unable to handle the request, etc.)
+(Internal error occurred:, the server is currently unable to handle the request,
+the server was unable to return a response in the time allotted, etc.)
 during control-plane scaling or cluster startup.
 
 These tests pin:
 * A successful Helm install completes on attempt 1 with no retry.
-* A transient 500 / "unable to handle the request" retries and proceeds to evaluation.
+* Transient API-server 5xx errors (webhook InternalError, client-go 503/504 sentences,
+  etcdserver errors, timeout phrases, and bounded 5xx codes) retry and proceed to evaluation.
 * The retry log explicitly names the attempt and transient 5xx.
 * Persistent 5xx errors exhaust the bounded retries and fail with the helm exit code.
 * Non-5xx errors fail immediately on the first attempt without retrying.
@@ -204,10 +206,13 @@ A2A_OPERATOR_ENV_ARGS=()
         self.assertNotIn("retrying", out)
         self.assertNotIn("retrying", err)
 
-    def test_a_transient_api_server_500_retries_and_succeeds(self):
+    def test_a_transient_api_server_internal_error_webhook_retries_and_succeeds(self):
+        # Real webhook admission failure during fresh cluster setup (500 InternalError)
+        # from bench/upgrade-scenarios/evidence/07/webhook.txt.
         err_msg = (
-            'could not get information about the resource Service "github-token-minter" '
-            '... Internal Server Error: failed to call webhook'
+            'Error from server (InternalError): Internal error occurred: failed calling webhook '
+            '"gate.scen.example.com": failed to call webhook: '
+            'Post "https://absent-hook.scen.svc:443/validate?timeout=5s": no endpoints available for service "absent-hook"'
         )
         responses = [
             (1, "", err_msg),
@@ -221,9 +226,8 @@ A2A_OPERATOR_ENV_ARGS=()
         self.assertIn("attempt 1 of 3", out)
 
     def test_a_transient_unable_to_handle_request_retries_and_succeeds(self):
-        # Exercises 'the server is currently unable to handle the request' without
-        # 'Internal Server Error' (#2382 bot review).
-        err_msg = 'the server is currently unable to handle the request (post configmaps)'
+        # Exercises client-go 503 'the server is currently unable to handle the request'.
+        err_msg = "Error from server (ServiceUnavailable): the server is currently unable to handle the request (post configmaps)"
         responses = [
             (1, "", err_msg),
             (0, "Release kube-agents installed", ""),
@@ -234,35 +238,12 @@ A2A_OPERATOR_ENV_ARGS=()
         self.assertEqual(len(helm_upgrades), 2, f"expected 2 helm calls: {calls}")
         self.assertIn("hit a transient API-server 5xx, retrying", out)
 
-    def test_a_transient_service_unavailable_retries_and_succeeds(self):
-        # Exercises '503 Service Unavailable' without 'Internal Server Error'.
-        err_msg = "Error: 503 Service Unavailable: back-end server is at capacity"
-        responses = [
-            (1, "", err_msg),
-            (0, "Release kube-agents installed", ""),
-        ]
-        rc, calls, out, err = self._run_deploy_block(responses)
-        self.assertEqual(rc, 0, err)
-        helm_upgrades = [c for c in calls if c.startswith("helm upgrade")]
-        self.assertEqual(len(helm_upgrades), 2, f"expected 2 helm calls: {calls}")
-        self.assertIn("hit a transient API-server 5xx, retrying", out)
-
-    def test_a_transient_bad_gateway_retries_and_succeeds(self):
-        # Exercises 'Bad Gateway' without 'Internal Server Error'.
-        err_msg = "Error: Bad Gateway: connection dropped by upstream"
-        responses = [
-            (1, "", err_msg),
-            (0, "Release kube-agents installed", ""),
-        ]
-        rc, calls, out, err = self._run_deploy_block(responses)
-        self.assertEqual(rc, 0, err)
-        helm_upgrades = [c for c in calls if c.startswith("helm upgrade")]
-        self.assertEqual(len(helm_upgrades), 2, f"expected 2 helm calls: {calls}")
-        self.assertIn("hit a transient API-server 5xx, retrying", out)
-
-    def test_a_transient_gateway_timeout_retries_and_succeeds(self):
-        # Exercises 'Gateway Timeout' without 'Internal Server Error'.
-        err_msg = "Error: Gateway Timeout: upstream request timed out"
+    def test_a_transient_server_unable_to_return_response_in_time_retries_and_succeeds(self):
+        # Exercises client-go 504 'the server was unable to return a response in the time allotted, but may still be processing the request'.
+        err_msg = (
+            "Error from server (Timeout): the server was unable to return a response "
+            "in the time allotted, but may still be processing the request (get deployments)"
+        )
         responses = [
             (1, "", err_msg),
             (0, "Release kube-agents installed", ""),
@@ -274,8 +255,34 @@ A2A_OPERATOR_ENV_ARGS=()
         self.assertIn("hit a transient API-server 5xx, retrying", out)
 
     def test_a_transient_an_error_on_the_server_retries_and_succeeds(self):
-        # Exercises 'an error on the server' without 'Internal Server Error' or other signatures.
-        err_msg = "an error on the server has prevented the request from succeeding (post configmaps)"
+        # Exercises client-go 500/502/other when no Status body is returned.
+        err_msg = 'an error on the server ("connection reset by peer") has prevented the request from succeeding (post configmaps)'
+        responses = [
+            (1, "", err_msg),
+            (0, "Release kube-agents installed", ""),
+        ]
+        rc, calls, out, err = self._run_deploy_block(responses)
+        self.assertEqual(rc, 0, err)
+        helm_upgrades = [c for c in calls if c.startswith("helm upgrade")]
+        self.assertEqual(len(helm_upgrades), 2, f"expected 2 helm calls: {calls}")
+        self.assertIn("hit a transient API-server 5xx, retrying", out)
+
+    def test_a_transient_etcdserver_timeout_retries_and_succeeds(self):
+        # Exercises transient etcd control plane failure.
+        err_msg = "etcdserver: leader changed while evaluating transaction"
+        responses = [
+            (1, "", err_msg),
+            (0, "Release kube-agents installed", ""),
+        ]
+        rc, calls, out, err = self._run_deploy_block(responses)
+        self.assertEqual(rc, 0, err)
+        helm_upgrades = [c for c in calls if c.startswith("helm upgrade")]
+        self.assertEqual(len(helm_upgrades), 2, f"expected 2 helm calls: {calls}")
+        self.assertIn("hit a transient API-server 5xx, retrying", out)
+
+    def test_a_transient_bounded_5xx_http_code_retries_and_succeeds(self):
+        # Exercises bounded HTTP status code from upstream ingress or proxy.
+        err_msg = "HTTP response status 502 from control plane load balancer"
         responses = [
             (1, "", err_msg),
             (0, "Release kube-agents installed", ""),
@@ -297,23 +304,30 @@ A2A_OPERATOR_ENV_ARGS=()
         pattern = re.compile(m.group(1))
 
         # Each distinct alternation required by the regex:
+        # 1. an error on the server (client-go 500/502/other when no Status body)
+        # 2. the server is currently unable to handle the request (client-go 503)
+        # 3. the server was unable to return a response in the time allotted (client-go 504)
+        # 4. Internal error occurred: (API server 500 / admission webhook failure)
+        # 5. etcdserver: (etcd transient timeout / leader election)
+        # 6. request did not complete within (API server request timeout)
+        # 7. (^|[^0-9])50[0234]([^0-9]|$) (bounded 5xx HTTP status codes)
         signatures = [
-            "Internal Server Error",
-            "the server is currently unable to handle the request",
-            "an error on the server",
-            "500 Internal Server Error",
-            "502 Bad Gateway",
-            "503 Service Unavailable",
-            "504 Gateway Timeout",
-            "Service Unavailable",
-            "Gateway Timeout",
-            "Bad Gateway",
+            'an error on the server ("connection reset") has prevented the request from succeeding',
+            "the server is currently unable to handle the request (post configmaps)",
+            "the server was unable to return a response in the time allotted, but may still be processing the request",
+            'Error from server (InternalError): Internal error occurred: failed calling webhook "gate.example.com"',
+            "etcdserver: request timed out",
+            "Timeout: request did not complete within the allotted timeout",
+            "HTTP response status 502 from control plane load balancer",
+            "received status 500 from upstream",
+            "proxy error 503 returned",
+            "gateway error 504 returned",
         ]
         for sig in signatures:
             with self.subTest(signature=sig):
                 self.assertTrue(pattern.search(sig), f"pattern must match signature: {sig!r}")
 
-        # Non-matching client errors and operational failures:
+        # Non-matching client errors, operational failures, and unanchored digit runs:
         non_5xx = [
             "release: already exists",
             "cannot re-use a name that is still in use",
@@ -322,20 +336,23 @@ A2A_OPERATOR_ENV_ARGS=()
             "401 Unauthorized",
             "403 Forbidden",
             "invalid chart values",
+            "failed to connect to host:8502 connection refused",
+            "exit status 5000",
+            "replicaCount=2500",
         ]
         for non in non_5xx:
             with self.subTest(non_5xx=non):
                 self.assertFalse(pattern.search(non), f"pattern must NOT match non-5xx: {non!r}")
 
     def test_persistent_5xx_exhausts_retries_and_fails(self):
-        err_msg = "Error: 504 Gateway Timeout: unable to reach control plane"
+        err_msg = "Timeout: request did not complete within the allotted timeout"
         responses = [
-            (1, "", err_msg),
-            (1, "", err_msg),
-            (1, "", err_msg),
+            (42, "", err_msg),
+            (42, "", err_msg),
+            (42, "", err_msg),
         ]
         rc, calls, out, err = self._run_deploy_block(responses)
-        self.assertNotEqual(rc, 0, "persistent 5xx must fail the deploy")
+        self.assertEqual(rc, 42, f"persistent 5xx must fail with helm exit code: {rc}")
         helm_upgrades = [c for c in calls if c.startswith("helm upgrade")]
         self.assertEqual(len(helm_upgrades), 3, f"expected 3 helm calls: {calls}")
         self.assertIn("attempt 1 of 3 hit a transient API-server 5xx, retrying", out)
@@ -387,11 +404,11 @@ A2A_OPERATOR_ENV_ARGS=()
     def test_non_5xx_error_fails_immediately_without_retry(self):
         err_msg = "Error: execution error at (kube-agents/templates/deployment.yaml:10:14): invalid value"
         responses = [
-            (1, "", err_msg),
+            (17, "", err_msg),
             (0, "should not be reached", ""),
         ]
         rc, calls, out, err = self._run_deploy_block(responses)
-        self.assertNotEqual(rc, 0)
+        self.assertEqual(rc, 17, f"non-5xx must fail with helm exit code: {rc}")
         helm_upgrades = [c for c in calls if c.startswith("helm upgrade")]
         self.assertEqual(len(helm_upgrades), 1, f"non-5xx must not retry: {calls}")
         self.assertNotIn("retrying", out)

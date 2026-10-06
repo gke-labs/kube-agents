@@ -88,7 +88,7 @@ readonly HELM_DEPLOYED_STATUS_RE='"status"[[:space:]]*:[[:space:]]*"deployed"'
 # startup can fail the first attempt; retrying proceeds to evaluation (#2382).
 readonly HELM_DEPLOY_ATTEMPTS=3
 readonly HELM_DEPLOY_RETRY_DELAY_SECONDS=5
-readonly HELM_API_SERVER_5XX_RE="Internal Server Error|the server is currently unable to handle the request|an error on the server|50[0234] |Service Unavailable|Gateway Timeout|Bad Gateway"
+readonly HELM_API_SERVER_5XX_RE="an error on the server|the server is currently unable to handle the request|the server was unable to return a response in the time allotted|Internal error occurred:|etcdserver:|request did not complete within|(^|[^0-9])50[0234]([^0-9]|$)"
 
 # The keypair the agent uses to reach its shell sandbox over SSH. Generated per
 # run and thrown away with the lease: nothing outside this cluster ever sees it,
