@@ -718,8 +718,12 @@ fixtures, is the only place a role is tied to a cluster — and it ties the role
 it discovers the leased project's seeded clusters by their labels
 (`environment=seeded`, `managed-by=kube-agents-seeded-fleet`, both applied by
 `bench/tf/fleet/main.tf` and by nothing else in an eval project), matches each to its slot, and
-writes `$BENCH_FLEET_KUBECONFIG_DIR/<role>.kubeconfig`.
-`kube_agents_bench.fleet.kubeconfig_for_role` does the last hop, role name to file path. Adding a
+records each role's slot in `.fleet-context` before it reads anything, writes
+`$BENCH_FLEET_KUBECONFIG_DIR/clusters/<slot>.kubeconfig` for each cluster it reached (recording
+the cluster's name and location beside the slot), and writes `<role>.kubeconfig` once the role's
+objects are confirmed. `kube_agents_bench.fleet.kubeconfig_for_role` does the last hop, role name
+to file path; `slot_kubeconfig_for_role` does the other one, for a `report_contains` check whose
+`fixture_roles` only need the role's cluster to have been reached. Adding a
 fixture means adding a role there; a task.yaml naming a role the catalog lacks, or a check whose
 `namespace` disagrees with its role's, is a test failure in `bench/tests/test_fleet_verifier.py`
 rather than a red presubmit later. The reverse is deliberately not enforced: the catalog describes

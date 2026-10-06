@@ -194,6 +194,14 @@
 # runs measured about 960s), ~20 more serial minutes on the infra lock: the
 # eleven tofu cases come to ~453 serial minutes against the 480m deadline. The
 # case count is unchanged.
+#
+# 2026-10-05 adds upgrades-zonal-control-plane-outage-warned: one case,
+# three units at the 200s default (a read-only chat turn, measured 3-8
+# minutes a repetition on the dev install). Counted from the lists rather
+# than the paragraphs above (the chat-voice trio and the declared-intent
+# trio landed beside each other, each counted without the other): this
+# case, the last entry below, makes it fifty-eight cases (174 units) of a
+# seventy-two-case, 216-unit matrix.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -669,3 +677,10 @@
 # (bench/kube_agents_bench/card_wake.py), so one front-door turn and no
 # worker: filing or unblocking a card fails the case's catastrophic fence.
 ./tasks/chat-voice-failure-leads-with-fact/task.yaml
+
+# The first of the upgrade-failure catalogue's scenario cases (entry 11, the
+# zonal control plane's API gap during its own upgrade). Read-only chat prompt
+# against the seeded clusters' own zonal shape; no planted fixture, nothing to
+# mutate. Nightly from its first merge; a presubmit seat is a later pull
+# request that cites its record.
+./tasks/upgrades-zonal-control-plane-outage-warned/task.yaml

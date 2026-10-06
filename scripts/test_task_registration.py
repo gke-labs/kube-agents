@@ -662,6 +662,82 @@ class TestTheRulesReject(unittest.TestCase):
         # merged, which turned this into a test that asserted nothing.
         self._only("neither bench/tf/fleet/fixtures.json", fixtures=["no-such-fixture"])
 
+    def test_fixture_roles_on_a_report_check_force_a_fixtures_list_too(self):
+        # `report_contains` is not a cluster-reading type, so before
+        # fixture_roles existed it could name no role; now it can, and the
+        # grep contract (one case per role) needs the list.
+        problem = self._only(
+            "declares no 'fixtures:'",
+            fixtures=DELETE,
+            verification_spec=self._entry(check={"type": "report_contains", "required_phrases": ["x"], "fixture_roles": ["crashloop-workload"]}),
+        )
+        # The lead says what the case does: a report check opens no cluster.
+        self.assertIn("names seeded-fleet roles (crashloop-workload)", problem)
+        self.assertNotIn("reads live cluster state", problem)
+
+    def test_a_cluster_reading_check_with_no_fixtures_keeps_the_reading_lead(self):
+        problem = self._only(
+            "declares no 'fixtures:'",
+            fixtures=DELETE,
+            verification_spec=self._entry(check={"type": "fleet_resource_property", "fixture_role": "crashloop-workload", "kind": "deployment", "name": "payments-api", "namespace": "seeded-debug", "property_path": "spec.replicas", "op": "eq", "expected": 1}),
+        )
+        self.assertIn("reads live cluster state (fleet_resource_property)", problem)
+
+    def test_a_parked_case_may_name_the_role_its_issue_plants_in_fixture_roles(self):
+        # FIXTURE_NOT_READY keeps the case off every roster, so the role it
+        # waits for is not in the catalogue yet by definition.
+        with unittest.mock.patch.dict(validator.FIXTURE_NOT_READY, {"made-up-case": "#1 plants role not-yet-planted"}):
+            problems = self._validate(
+                fixtures=["not-yet-planted"],
+                verification_spec=self._entry(check={"type": "report_contains", "required_phrases": ["x"], "fixture_roles": ["not-yet-planted"]}),
+            )
+        self.assertEqual([p for p in problems if "no cluster slot" in p], [], problems)
+
+    def test_a_cluster_placeholder_must_name_a_catalogue_slot(self):
+        problem = self._only(
+            "a slot the fleet catalogue does not declare",
+            verification_spec=self._entry(check={"type": "report_contains", "any_of_patterns": ["(?m)^{cluster:e}: ok$"]}),
+        )
+        self.assertIn("{cluster:e}", problem)
+        # a declared slot and `any` pass; a parked case is not held to the catalogue
+        self.assertEqual(self._validate(verification_spec=self._entry(check={"type": "report_contains", "any_of_patterns": ["(?m)^{cluster:a}: ok$", "(?m)^{cluster:any}: ok$"]})), [])
+        with unittest.mock.patch.dict(validator.FIXTURE_NOT_READY, {"made-up-case": "#1 plants slot e"}):
+            self.assertEqual([p for p in self._validate(verification_spec=self._entry(check={"type": "report_contains", "any_of_patterns": ["(?m)^{cluster:e}: ok$"]})) if "does not declare" in p], [])
+
+    def test_a_cluster_placeholder_outside_report_contains_is_rejected(self):
+        # worker_commands searches its patterns as written, so the placeholder
+        # there is literal text: a forbid that never fires, a requirement that
+        # fails every run.
+        problem = self._only(
+            "which only report_contains expands",
+            verification_spec=self._entry(check={"type": "worker_commands", "forbidden_patterns": ["{cluster:a}"]}),
+        )
+        self.assertIn("worker_commands", problem)
+
+    def test_a_malformed_cluster_placeholder_is_rejected(self):
+        self._only(
+            "malformed cluster placeholder",
+            verification_spec=self._entry(check={"type": "report_contains", "forbidden_patterns": ["{cluster: a}: no"]}),
+        )
+
+    def test_a_slotless_overlay_role_is_rejected_in_fixture_roles(self):
+        # `orphan-disks` is in the overlay with no slot, so `fixtures:` takes
+        # it; the plural asks for a slot the runner never records.
+        problem = self._only(
+            "has no cluster slot in the fleet catalogue",
+            fixtures=["orphan-disks"],
+            verification_spec=self._entry(check={"type": "report_contains", "required_phrases": ["x"], "fixture_roles": ["orphan-disks"]}),
+        )
+        self.assertIn("'fixture_roles:' names 'orphan-disks'", problem)
+
+    def test_a_scalar_fixture_roles_is_rejected_as_a_shape_not_as_letters(self):
+        problem = self._only(
+            "'fixture_roles:' must be a list of role slugs",
+            fixtures=["crashloop-workload"],
+            verification_spec=self._entry(check={"type": "report_contains", "required_phrases": ["x"], "fixture_roles": "crashloop-workload"}),
+        )
+        self.assertNotIn("fixture role 'c'", problem)
+
     def test_a_fixture_role_that_is_not_a_string_is_rejected(self):
         self._only("is not a slug string", fixtures=[["rbac-overgrant"]])
 
