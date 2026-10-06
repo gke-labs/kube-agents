@@ -169,6 +169,9 @@ while j < len(rest):
 key = f"{kind}/{name}" if name else f"{kind}?{selector or ''}"
 answers = dict(world.get("kubectl", {}))
 answers.update(world.get("kubectl_overrides", {}).get(project, {}))
+if isinstance(answers.get(key), dict) and "__error__" in answers[key]:
+    print(f'Error from server ({answers[key]["__error__"]}): {kind} "{name}" is forbidden', file=sys.stderr)
+    sys.exit(1)
 if key not in answers or answers[key] is None:
     if name:
         print(f'Error from server (NotFound): {kind} "{name}" not found', file=sys.stderr)
@@ -462,6 +465,20 @@ class NotChecked(ScanHarness):
         self.assertEqual(doc["projects"][PROJECT]["summary"]["absent"], 1)
         self.assertEqual((fixture_state.absent_units(doc), fixture_state.absent_projects(doc), fixture_state.unread_units(doc)), (1, 1, 0))
         self.assertEqual(doc["summary"]["absent_projects"], 1)
+
+    def test_a_probe_the_cluster_refused_is_not_checked_not_absent(self):
+        # A 403 or a 5xx on the presence probe says nothing about whether the
+        # fixture is there: the runner must not call it never planted.
+        world = healthy_world(PROJECT)
+        world["kubectl_overrides"] = {PROJECT: {"clusterrolebinding/debug-binding": {"__error__": "Forbidden"}}}
+        doc, _ = self.scan(world)
+        states = self.states(doc)
+        self.assertEqual(states["rbac-overgrant"], "not_checked")
+        detail = doc["projects"][PROJECT]["roles"]["rbac-overgrant"]["detail"][0]
+        self.assertIn("could not be read", detail)
+        self.assertIn("Forbidden", detail)
+        self.assertNotIn("never planted", detail)
+        self.assertEqual((fixture_state.absent_units(doc), fixture_state.unread_units(doc)), (0, 1))
 
     def test_a_project_whose_fleet_is_wholly_absent_was_still_checked(self):
         # The runner ran and found no seeded cluster: that is an observation

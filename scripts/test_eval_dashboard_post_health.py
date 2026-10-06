@@ -2006,6 +2006,17 @@ class WatchedPeriodics(RunHarness):
         doc["periodics_read"] = [self.DAILY]
         rendered = post_health.render_digest(doc, T14)
         self.assertIn("🟠 Eval seeded fleet: planted defects are not being re-applied (build 100 failed 9:40 AM ET);", rendered)
+        # A failed on-merge build from weeks ago carries its date in every
+        # digest until the next fleet merge replaces it.
+        post = "post-kube-agents-fleet-reconcile"
+        old_doc = health("GREEN")
+        old_doc["periodics"] = {post: periodic_note(job=post, label="seeded-fleet reconcile (on merge)", finished="2026-09-01T13:10:00+00:00", stale_after_h=None)}
+        self.assertIn("🟠 Eval seeded fleet: planted defects are not being re-applied (build 100 failed on Tue Sep 1 9:10 AM ET);", post_health.render_digest(old_doc, T14))
+        # A postsubmit build with no finish time is not a job that stopped.
+        no_time = health("GREEN")
+        no_time["periodics"] = {post: periodic_note(job=post, label="seeded-fleet reconcile (on merge)", verdict="STALE", finished=None, stale_after_h=None)}
+        self.assertIn("⚪ Eval seeded fleet: seeded-fleet reconcile (on merge)'s latest build cannot be placed in time; build 100 finished at a time its finished.json does not give.", post_health.render_digest(no_time, T14))
+        self.assertNotIn("has stopped running", post_health.render_digest(no_time, T14))
 
     def test_the_digest_line_for_an_unreadable_finish_time_says_so(self):
         doc = health("GREEN")

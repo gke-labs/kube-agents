@@ -171,17 +171,26 @@ for role, spec in sorted(roles.items()):
 # A selector probe must match at least one object: `kubectl get node -l
 # app=nope` exits ZERO with no output, which is the same trap that made the
 # pathless `absent` safeguards read as passes on the wrong cluster.
+# Where the presence probe keeps the last kubectl stderr, so a failed read
+# can be told from NotFound and quoted in the warning.
+_FLEET_PROBE_ERR_FILE="${TMPDIR:-/tmp}/fleet-probe-err.$$"
+trap 'rm -f "$_FLEET_PROBE_ERR_FILE"' EXIT
+
 _fleet_probe_present() {
   local kubeconfig="$1" namespace="$2" probe="$3" kind rest
   case "$probe" in
     *\?*)
       kind="${probe%%\?*}"
       rest="${probe#*\?}"
+      # 0 present, 1 absent (an empty list), 2 the read itself failed: a
+      # 403, a control plane mid-upgrade or a token that could not be minted
+      # says nothing about whether the fixture is there.
       if [ "$namespace" != "-" ] && [ -n "$namespace" ]; then
-        [ -n "$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -n "$namespace" -l "$rest" -o name 2>/dev/null)" ]
+        _FLEET_PROBE_OUT="$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -n "$namespace" -l "$rest" -o name 2>"$_FLEET_PROBE_ERR_FILE")" || return 2
       else
-        [ -n "$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -l "$rest" -o name 2>/dev/null)" ]
+        _FLEET_PROBE_OUT="$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -l "$rest" -o name 2>"$_FLEET_PROBE_ERR_FILE")" || return 2
       fi
+      [ -n "$_FLEET_PROBE_OUT" ]
       ;;
     */*)
       kind="${probe%%/*}"
@@ -189,11 +198,14 @@ _fleet_probe_present() {
       # Spelled out twice rather than built into an array: bash 3.2 (still what
       # macOS ships, and what a contributor runs the tests on) errors on
       # "${empty[@]}" under `set -u`.
+      # 0 present, 1 NotFound, 2 any other failure of the read.
       if [ "$namespace" != "-" ] && [ -n "$namespace" ]; then
-        KUBECONFIG="$kubeconfig" kubectl get "$kind" "$rest" -n "$namespace" >/dev/null 2>&1
+        KUBECONFIG="$kubeconfig" kubectl get "$kind" "$rest" -n "$namespace" >/dev/null 2>"$_FLEET_PROBE_ERR_FILE" && return 0
       else
-        KUBECONFIG="$kubeconfig" kubectl get "$kind" "$rest" >/dev/null 2>&1
+        KUBECONFIG="$kubeconfig" kubectl get "$kind" "$rest" >/dev/null 2>"$_FLEET_PROBE_ERR_FILE" && return 0
       fi
+      grep -q 'NotFound' "$_FLEET_PROBE_ERR_FILE" && return 1
+      return 2
       ;;
     *)
       return 1
@@ -591,13 +603,28 @@ write_fleet_kubeconfigs() {
     # catastrophic `fail` against an agent that never touched anything.
     confirmed=""
     missing=""
+    unreadable=""
+    unreadable_why=""
     for probe in $probes; do
-      if _fleet_probe_present "$slot_config" "$namespace" "$probe"; then
-        confirmed+="${probe}"$'\n'
-      else
-        missing+="${probe} "
-      fi
+      # Captured, not tested in an `if`: the three-way answer needs the code,
+      # and under `set -e` a bare non-zero call would end the script.
+      probe_rc=0
+      _fleet_probe_present "$slot_config" "$namespace" "$probe" || probe_rc=$?
+      case $probe_rc in
+        0) confirmed+="${probe}"$'\n' ;;
+        1) missing+="${probe} " ;;
+        *)
+          unreadable+="${probe} "
+          unreadable_why="$(tail -n 1 "$_FLEET_PROBE_ERR_FILE" 2>/dev/null | tr -d '\r')"
+          ;;
+      esac
     done
+    if [ -n "$unreadable" ]; then
+      # Not "never planted": the read failed, so nothing is known about the
+      # fixture, and the scan records the role as not checked, not absent.
+      echo "WARNING: ${unreadable% } could not be read from ${slot_config##*/} in ${project} (${unreadable_why:-no error text}), so fixture role '${role}' could not be checked. Its checks will report status=error rather than blaming the run." >&2
+      continue
+    fi
     if [ -n "$missing" ]; then
       echo "WARNING: ${missing% } absent from ${slot_config##*/} in ${project}, so fixture role '${role}' was never planted (or has already been destroyed). Its checks will report status=error rather than blaming the run." >&2
       unplanted=$((unplanted + 1))

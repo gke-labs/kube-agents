@@ -8,8 +8,9 @@ holds a project only through Boskos, as many at a time as its workers, and
 gives every one back, on success, on a refusal, on a fault, on SIGTERM. It
 never starts a project its budget cannot fit, and stops when main's fleet
 tree moves. `--drifted` reads exactly the projects the fixture-state scan
-marks drifted. And a project Boskos will not hand over is busy or not reached,
-not failed: the job stays green and the next run gets it.
+marks drifted. A project Boskos will not hand over is busy or not reached, not
+failed, and the next run gets it; only an `--all` run that reached no project
+at all is red, so a day on which nothing applied is never green.
 
 The shared walk in `hack/boskos_pool.py` is covered here for what the sweep's
 tests do not reach: acquiring one project by name.
@@ -668,6 +669,29 @@ class MainTest(unittest.TestCase):
         self.assertEqual(boskos.acquired, [])
         self.assertIn("could not resolve host", stderr.getvalue())
 
+    def test_a_main_that_moved_before_the_first_project_is_not_reached_and_not_blamed_on_boskos(self):
+        def git(args):
+            if args[:1] == ["fetch"]:
+                return ""
+            if args[1].startswith("FETCH_HEAD:"):
+                return "tree-bbb"
+            return "tree-aaa" if args[1].startswith("HEAD:") else "commit-111"
+
+        boskos = _Boskos(free=[P7, P8])
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            report = pathlib.Path(tmp) / "r.json"
+            with mock.patch.object(reconcile, "git_output", git), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(
+                reconcile, "tofu_runner", _Tofu({})
+            ), mock.patch.object(reconcile.signal, "signal"), mock.patch.object(reconcile, "pool_projects", lambda *a, **k: set(KNOWN)), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", stderr):
+                rc = reconcile.main(["--all", "--stop-when-moved", "origin/main", "--report", str(report), "--boskos-server", BOSKOS, "--boskos-owner", OWNER])
+            doc = json.loads(report.read_text())
+        self.assertEqual(rc, reconcile.EXIT_OK, "main moved under the run; the next run takes it, nothing is wrong")
+        self.assertEqual(boskos.acquired, [])
+        self.assertEqual({p: v["outcome"] for p, v in doc["outcomes"].items()}, {P7: reconcile.OUTCOME_NOT_REACHED, P8: reconcile.OUTCOME_NOT_REACHED})
+        self.assertIn("tree-bbb", doc["outcomes"][P7]["detail"])
+        self.assertNotIn("visited no project", stderr.getvalue())
+
     def test_a_main_ref_without_a_remote_is_refused_by_the_parser(self):
         # `--stop-when-moved main` would fetch remote "main", branch "", fail
         # every check and leave the guard off with a warning.
@@ -1238,7 +1262,7 @@ class PassTest(unittest.TestCase):
         with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
             outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=reconcile.Run())
         self.assertEqual(boskos.acquired, [P7, P8], "sorted, by name")
-        self.assertEqual(boskos.walked, 0, "no /acquire of whatever is free")
+        self.assertEqual(boskos.walked, 1, "one anonymous acquire after the pass, for a registration the mapping lacks")
         self.assertEqual(sorted(boskos.released), [P7, P8])
         self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_APPLIED, P8: reconcile.OUTCOME_APPLIED})
 
@@ -1271,13 +1295,13 @@ class PassTest(unittest.TestCase):
         self.assertIn("not free", outcomes[P8][1])
         self.assertLessEqual(clock.now, 400)
 
-    def test_a_registration_outside_the_mapping_is_never_asked_for(self):
+    def test_a_registration_outside_the_mapping_is_never_asked_for_by_name(self):
         boskos = _Boskos(free=["kube-agents-evals-99", P7])
         tofu = _Tofu({P7: UPDATE_ONLY})
-        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()):
             outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known={P7}, run=reconcile.Run())
-        self.assertEqual(list(outcomes), [P7])
-        self.assertEqual(boskos.acquired, [P7])
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
+        self.assertEqual(boskos.acquired[0], P7, "the mapped project first, by name")
 
 
 def _git_whose_fetch_fails(args):
@@ -1507,7 +1531,9 @@ class ReportFieldsTest(unittest.TestCase):
                 reconcile, "tofu_runner", _Tofu({P7: UPDATE_ONLY})
             ), mock.patch.object(reconcile, "publish_applied", lambda *a, **k: published.append(a) or None), mock.patch.object(reconcile.signal, "signal"), mock.patch.object(
                 reconcile, "pool_projects", lambda *a, **k: set(KNOWN)
-            ), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()), mock.patch.dict(os.environ, {"BUILD_ID": "123", "JOB_NAME": "post-x"}):
+            ), mock.patch.object(reconcile, "load_allowlist", lambda path: _allow([("google_compute_disk.gone", "an old revert", False)])), mock.patch(
+                "sys.stdout", io.StringIO()
+            ), mock.patch("sys.stderr", io.StringIO()), mock.patch.dict(os.environ, {"BUILD_ID": "123", "JOB_NAME": "post-x"}):
                 rc = reconcile.main(["--all", "--workers", "1", "--report", str(report), "--boskos-server", BOSKOS, "--boskos-owner", OWNER])
             doc = json.loads(report.read_text())
         self.assertEqual(rc, reconcile.EXIT_OK)
@@ -1517,7 +1543,9 @@ class ReportFieldsTest(unittest.TestCase):
         self.assertEqual(doc["outcomes"][P8]["outcome"], reconcile.OUTCOME_BUSY)
         entry = doc["outcomes"][P7]
         self.assertTrue(entry["started_at"].endswith("Z") and entry["finished_at"] >= entry["started_at"])
-        self.assertEqual(entry["allowlist_unused"], [])
+        # The test's own list, not the committed file: a revert's entry in
+        # that file must not red this test.
+        self.assertEqual(entry["allowlist_unused"], ["google_compute_disk.gone"])
         self.assertEqual(doc["summary"][reconcile.OUTCOME_BUSY], 1)
         self.assertEqual(len(published), 1)
 
@@ -1837,6 +1865,38 @@ class WorkersTest(unittest.TestCase):
         self.assertEqual(outcomes[p9][0], reconcile.OUTCOME_NOT_REACHED, "the other worker stopped rather than leasing on under a failing Boskos")
         self.assertIn("error", outcomes[p9][1])
         self.assertEqual(sorted(boskos.released), [P7])
+
+    def test_a_termination_inside_the_stop_check_still_lists_the_rest_on_the_named_path(self):
+        run = reconcile.Run()
+        calls = []
+
+        def stop_reason():
+            calls.append(1)
+            if len(calls) == 2:
+                raise boskos_pool.Terminated("signal 15")
+            return None
+
+        boskos = _Boskos(free=[P7, P8])
+        outcomes = {}
+        with mock.patch.object(run, "stop_reason", stop_reason), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()):
+            with self.assertRaises(boskos_pool.Terminated):
+                reconcile.reconcile_named([P7, P8], BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known=KNOWN, outcomes=outcomes, run=run)
+        self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_APPLIED, P8: reconcile.OUTCOME_NOT_REACHED})
+
+    def test_a_registration_outside_the_mapping_is_still_found_and_reported(self):
+        # After the by-name pass, one anonymous acquire: a project Boskos
+        # hands out that the mapping lacks is released untouched and failed,
+        # as the walk used to do, so the mismatch reds the run.
+        stray = "kube-agents-evals-99"
+        boskos = _Boskos(free=[P7, stray])
+        tofu = _Tofu({P7: UPDATE_ONLY})
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()):
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known={P7}, run=reconcile.Run())
+        self.assertEqual(outcomes[stray], (reconcile.OUTCOME_FAILED, reconcile.REASON_UNMAPPED))
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
+        self.assertEqual(sorted(boskos.released), [P7, stray])
+        self.assertEqual(boskos.walked, 1)
+        self.assertNotIn(stray, " ".join(" ".join(c) for c in tofu.calls))
 
     def test_a_named_run_that_loses_boskos_records_the_project_and_the_rest(self):
         class _Boskos_failing_one(_Boskos):

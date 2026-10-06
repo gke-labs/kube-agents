@@ -1032,7 +1032,7 @@ def render_periodic(health: dict, prev: dict | None) -> str:
             else:
                 window = f"the {note['stale_after_h']}h window cannot be measured" if note.get("stale_after_h") is not None else "it cannot be placed in time"
                 middle = f"Build {note['build']} finished, but its finished.json gives no time for it, so {window}. Someone check the job."
-            blocks.append("\n".join([f"⚪ *{words['place']}: {words['label']} has stopped running.*", f"{does} {middle}", effect, footer]))
+            blocks.append("\n".join([f"⚪ *{words['place']}: {_stale_headline(words, note)}.*", f"{does} {middle}", effect, footer]))
             continue
         dry = " (a dry run: nothing was applied)" if note.get("dry_run") else ""
         how = f": {note['summary']}" if note.get("summary") else ""
@@ -1076,8 +1076,8 @@ def reconcile_run_lines(health: dict, now: datetime | None = None) -> list[str]:
         finished = parse_iso(run.get("finished_at"))
         if finished is None:
             when = f"{words} (build {run.get('build')}, finish time unknown)"
-        elif now is not None and now - finished > RECONCILE_RUN_DATED_AFTER:
-            when = f"{words} on {finished.astimezone(LOCAL_TZ).strftime('%a %b %-d')} {clock(finished)} (build {run.get('build')})"
+        elif _is_dated(finished, now):
+            when = f"{words} {dated_clock(finished, now)} (build {run.get('build')})"
         else:
             when = f"{words} at {clock(finished)} (build {run.get('build')})"
         verdict = "passed" if run.get("passed") else "failed"
@@ -1087,15 +1087,38 @@ def reconcile_run_lines(health: dict, now: datetime | None = None) -> list[str]:
     return lines
 
 
+def _is_dated(finished: datetime, now: datetime | None) -> bool:
+    return now is not None and now - finished > RECONCILE_RUN_DATED_AFTER
+
+
+def dated_clock(finished: datetime | None, now: datetime | None) -> str:
+    """A finish time for the digest: the clock alone within a day, the
+    weekday and date before it past that, so last month's on-merge run does
+    not read as this morning's."""
+    if finished is None:
+        return "?"
+    if _is_dated(finished, now):
+        return f"on {finished.astimezone(LOCAL_TZ).strftime('%a %b %-d')} {clock(finished)}"
+    return clock(finished)
+
+
+def _stale_headline(words: dict, note: dict) -> str:
+    """"has stopped running" is a claim only about a job with a cadence; a
+    cadence-less job whose build carries no finish time is said as that."""
+    if note.get("stale_after_h") is None and not note.get("finished_at"):
+        return f"{words['label']}'s latest build cannot be placed in time"
+    return f"{words['label']} has stopped running"
+
+
 def periodic_digest_lines(health: dict, now: datetime | None = None) -> list[str]:
     lines = reconcile_run_lines(health, now)
     for job, note in sorted((health.get("periodics") or {}).items()):
         words = _job_words(job, note)
         if note.get("verdict") == periodics.VERDICT_STALE:
             last = f"last finished run {clock(parse_iso(note.get('finished_at')))}" if note.get("finished_at") else f"build {note['build']} finished at a time its finished.json does not give"
-            lines.append(f"⚪ {words['place']}: {words['label']} has stopped running; {last}.")
+            lines.append(f"⚪ {words['place']}: {_stale_headline(words, note)}; {last}.")
         else:
-            lines.append(f"🟠 {words['place']}: {words['absence']} (build {note['build']} failed {clock(parse_iso(note.get('finished_at')))}); {note['history_url']}")
+            lines.append(f"🟠 {words['place']}: {words['absence']} (build {note['build']} failed {dated_clock(parse_iso(note.get('finished_at')), now)}); {note['history_url']}")
     return lines
 
 

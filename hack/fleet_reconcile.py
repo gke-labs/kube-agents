@@ -653,6 +653,7 @@ class Run:
         # about the whole pool (an allowlist entry nobody needs) holds only
         # when visited reaches this.
         self.mapped = None
+        self.mapped_names = None
         self._stop = None
         self._last_main_check = None
 
@@ -836,11 +837,13 @@ def reconcile_named(projects, server, owner, lease=True, runner=tofu_runner, dry
                 _line(project, outcomes[project])
 
     for index, project in enumerate(projects):
-        stop = run.stop_reason()
-        if stop:
-            not_reached(projects[index:], stop)
-            break
         try:
+            # Inside the try: the stop check may fetch main, and a termination
+            # landing there must still leave the rest on the report.
+            stop = run.stop_reason()
+            if stop:
+                not_reached(projects[index:], stop)
+                break
             if not lease:
                 _record(project, outcomes, runner, dry_run, run)
                 continue
@@ -852,9 +855,10 @@ def reconcile_named(projects, server, owner, lease=True, runner=tofu_runner, dry
                 outcomes[project] = (OUTCOME_BUSY, REASON_BUSY)
                 _line(project, outcomes[project])
         except boskos_pool.Terminated:
-            # The project the signal landed in has its line; the rest are
-            # on the report as not reached, so the summary adds up.
-            not_reached(projects[index + 1 :], REASON_NOT_REACHED_TERMINATED)
+            # The project the signal landed in has its line if it was reached;
+            # every project not yet on the record is not reached, so the
+            # summary adds up whichever window the signal landed in.
+            not_reached(projects[index:], REASON_NOT_REACHED_TERMINATED)
             raise
         except Exception as exc:  # noqa: BLE001 -- a Boskos or network fault: on the record, then raised
             if project not in outcomes:
@@ -906,6 +910,7 @@ def reconcile_pool(server, owner, runner=tofu_runner, dry_run=False, known=None,
     outcomes = {} if outcomes is None else outcomes
     run = run or Run()
     run.mapped = len(known)
+    run.mapped_names = set(known)
     pending = sorted(known)
 
     def drain(reason, outcome=OUTCOME_NOT_REACHED):
@@ -976,7 +981,31 @@ def reconcile_pool(server, owner, runner=tofu_runner, dry_run=False, known=None,
         with run.lock:
             drain(run.stop_reason() or REASON_NOT_REACHED_RUN_ERROR % boskos_pool.describe(exc))
         raise
+    if not run.stop_reason():
+        _check_for_stray_registration(server, owner, runner, dry_run, run, outcomes)
     return outcomes
+
+
+def _check_for_stray_registration(server, owner, runner, dry_run, run, outcomes):
+    """One anonymous acquire after the by-name pass. A project Boskos hands
+    out that the mapping lacks is released untouched and failed, as the old
+    walk did: a registration with no mapping row takes a share of every
+    pull request's leases and nothing else watched reports it. A mapped
+    project freed since its turn is simply reconciled."""
+    release_failures = {}
+
+    def visit(project):
+        if project in outcomes or project in (run.mapped_names or ()):
+            _record(project, outcomes, runner, dry_run, run)
+        else:
+            outcomes[project] = (OUTCOME_FAILED, REASON_UNMAPPED)
+            _line(project, outcomes[project])
+
+    try:
+        boskos_pool.acquire_and_hold(server, owner, HOLD_STATE, lambda: boskos_pool.acquire(server, owner, HOLD_STATE), visit, release_failures, heartbeat=True)
+    finally:
+        for project, reason in release_failures.items():
+            _merge_release_failure(outcomes, project, reason)
 
 
 def _run_workers(worker, count):
@@ -1223,7 +1252,8 @@ def _run(args, outcomes, error, run):
             print("ERROR: %s" % error[-1], file=sys.stderr)
             return EXIT_FAILED
         visited = sum(1 for o, _ in outcomes.values() if o in VISITED_OUTCOMES)
-        if args.all and outcomes and visited == 0:
+        all_busy = all(o == OUTCOME_BUSY or (o == OUTCOME_NOT_REACHED and d == REASON_NOT_REACHED_BUSY) for o, d in outcomes.values())
+        if args.all and outcomes and visited == 0 and all_busy:
             # Every project busy or never registered under its mapped name
             # for the whole budget: a green build that applied nothing would
             # hide a pool held all day or a Boskos registration that no longer
