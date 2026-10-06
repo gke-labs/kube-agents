@@ -101,8 +101,8 @@ Harness: `scenarios/02.sh` (the verdict is from the `upg-02b` run); `bash run.sh
 a one-node pool with maxSurge 0 the drained replica was Pending for about four minutes and came back
 only on the rebuilt node.
 
-Fleet: `readiness-surge-blocked` on seeded-b (`no-surge-pool`, `maxSurge` 0 with `maxUnavailable` 1,
-and the workload pinned to it) carries it; seeded-a's `pinned-inference-pool` (autoscaler 1/1) is the
+Fleet: `readiness-surge-blocked` on seeded-b (`no-surge-pool`, `maxSurge` 0 with `maxUnavailable` 1)
+and `readiness-pinned-workload` (the workload pinned to it) carry it; seeded-a's `pinned-inference-pool` (autoscaler 1/1) is the
 ceiling half of the before-signal.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/02.sh`, evidence
@@ -215,7 +215,7 @@ a new pod, its logs and exec kept working; the add-on half was not planted and k
 warning was not captured.
 
 Fleet: no role on `main`; seeded-b's pool takes its control plane's pin on purpose, so the skew
-cannot be planted there.
+cannot be planted there; a standing shape that holds is designed in the catalogue's "How each failure is tested" section.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/10b.sh` (after `10.sh` on the same cluster),
 evidence `bench/upgrade-scenarios/evidence/10b/skew.txt`, and item 10 of the harness README.
@@ -347,8 +347,7 @@ upgrade drained it, and the replacement stayed Pending on PersistentVolume node 
 failing at attach; re-enabling the driver brought it back 22 minutes after it went down. The 1.22
 crossing itself cannot be built.
 
-Fleet: no role on `main`; an in-tree `gcePersistentDisk` volume on seeded-a would carry the
-before-state, with the PD CSI driver left on.
+Fleet: no role on `main`; a standing shape that holds is designed in the catalogue's "How each failure is tested" section.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/19c.sh` (sources `19.sh`), evidence
 `bench/upgrade-scenarios/evidence/19c/csi.txt`, and item 19 of the harness README. Detection, where
@@ -363,8 +362,7 @@ registry; the pod restarted from the node's image cache on the old node and went
 with not found on the rebuilt one. No hostname was retired and the egress-allowlist variant was not
 tested.
 
-Fleet: no role on `main`; a Deployment referencing an image on a retired registry hostname would
-carry the before-state on seeded-a.
+Fleet: no role on `main`; a standing shape that holds is designed in the catalogue's "How each failure is tested" section.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/20d.sh` (sources `20.sh`), evidence
 `bench/upgrade-scenarios/evidence/20d/registry.txt`, and item 20 of the harness README. Detection,
