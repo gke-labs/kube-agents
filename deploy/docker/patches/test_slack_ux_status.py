@@ -1211,11 +1211,14 @@ class PlanTest(_RuntimeCase):
         self.assertEqual(self._sent(adapter), ["suspended", "suspended"])
 
     def test_a_wait_whose_send_failed_ends_when_the_card_runs_again(self):
+        # The wait opened the card's row, so the card runs on it and holds Working… until it settles.
         adapter = _Adapter(_Client(fail={"setStatus"}))
         _run(runtime.settle_row(adapter, _sub(), "blocked"))
         adapter.client.fail.clear()
         _run(runtime.settle_row(adapter, _sub(), "unblocked"))
         _run(adapter._set_thread_status(CHANNEL, TEAM, THREAD, "", "turn"))
+        self.assertEqual(self._sent(adapter)[-1], "processing")
+        _run(runtime.settle_row(adapter, _sub(), "completed"))
         self.assertEqual(self._sent(adapter)[-1], "closed")
 
     def test_a_wait_after_a_restart_sends_the_legacy_setter_only_a_clear(self):
