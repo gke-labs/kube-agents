@@ -1080,16 +1080,26 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     # Wait for the control plane to recover before running recovery calls
     # (CR delete, helm history probe/uninstall) (#2382).
     readyz_start=$SECONDS
+    readyz_ok=0
     while (( SECONDS - readyz_start < APISERVER_READYZ_TIMEOUT_SECONDS )); do
       if kubectl get --raw /readyz >/dev/null 2>&1; then
+        readyz_ok=1
         break
       fi
       sleep "${APISERVER_READYZ_POLL_INTERVAL_SECONDS}"
     done
+    if [ "${readyz_ok}" -eq 0 ]; then
+      echo "WARNING: API server /readyz did not become ready within ${APISERVER_READYZ_TIMEOUT_SECONDS}s; proceeding with recovery calls." >&2
+    fi
     # If the failed attempt left behind a release record with no deployed revision,
     # clear it so the next attempt can install cleanly (#1172, #2382).
     heal_poisoned_release_record "attempt ${attempt} failed before reaching a deployed revision (#1172, #2382)" "retrying"
   else
+    if [ "${attempt}" -lt "${HELM_DEPLOY_ATTEMPTS}" ]; then
+      echo "ERROR: Helm chart deployment attempt ${attempt} failed with an error that is not a transient API-server 5xx; it is not retried (exit ${HELM_EXIT})." >&2
+    else
+      echo "ERROR: Helm chart deployment failed on all ${HELM_DEPLOY_ATTEMPTS} attempts; giving up (exit ${HELM_EXIT})." >&2
+    fi
     rm -f "${HELM_INSTALL_OUT}"
     exit "${HELM_EXIT}"
   fi

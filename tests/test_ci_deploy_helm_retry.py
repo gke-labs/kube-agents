@@ -71,6 +71,7 @@ class CiDeployHelmRetryTest(unittest.TestCase):
         history_exit=None,
         kubectl_delete_exit=0,
         history_responses=None,
+        kubectl_readyz_exit=0,
     ):
         """Run the lifted deploy block with recording stubs.
 
@@ -82,6 +83,7 @@ class CiDeployHelmRetryTest(unittest.TestCase):
         kubectl_delete_exit: exit code for `kubectl delete platformagent`.
         history_responses: list of (exit_code, stdout, stderr) tuples returned
                            sequentially on each `helm history` call.
+        kubectl_readyz_exit: exit code for `kubectl get --raw /readyz`.
         """
         if history_responses is None:
             if history_exit is None:
@@ -174,6 +176,12 @@ case "$1" in
     fi
     exit 0
     ;;
+  get)
+    if [ "$2" = "--raw" ] && [ "$3" = "/readyz" ]; then
+      exit {kubectl_readyz_exit}
+    fi
+    exit 0
+    ;;
   *)
     exit 0
     ;;
@@ -214,11 +222,22 @@ exit 0
                 "LITELLM_GSA_NAME": "litellm-gsa",
             }
 
-            preamble = """
+            sleep_func = ""
+            if kubectl_readyz_exit != 0:
+                sleep_func = f"""
+sleep() {{
+  echo "sleep $*" >> "{log}"
+  if [ "$1" = "2" ]; then
+    (( SECONDS += 35 ))
+  fi
+}}
+"""
+            preamble = f"""
 STEP_START=$SECONDS
 IMAGE_ARGS=()
 GITHUB_MINTER_ARGS=()
 A2A_OPERATOR_ENV_ARGS=()
+{sleep_func}
 """
             proc = subprocess.run(
                 [
@@ -483,6 +502,7 @@ A2A_OPERATOR_ENV_ARGS=()
         self.assertEqual(sleep_calls, ["sleep 5", "sleep 10"], f"expected linear backoff delays: {calls}")
         readyz_calls = [c for c in calls if c.startswith("kubectl get --raw /readyz")]
         self.assertEqual(len(readyz_calls), 2, f"expected readyz checks before recovery: {calls}")
+        self.assertIn("failed on all 3 attempts; giving up", err.lower())
 
     def test_transient_5xx_heals_poisoned_release_record_before_retry(self):
         err_msg = "the server is currently unable to handle the request"
@@ -510,6 +530,28 @@ A2A_OPERATOR_ENV_ARGS=()
         self.assertEqual(sleep_calls, ["sleep 5"])
         self.assertIn("record before retrying", out.lower())
         self.assertIn("cleared the poisoned", out.lower())
+
+    def test_transient_5xx_readyz_timeout_warns_and_proceeds_with_recovery(self):
+        # When attempt 1 fails with 5xx and /readyz does not become ready within the
+        # timeout window, the loop must warn on stderr and proceed with recovery calls (#2382).
+        err_msg = "the server is currently unable to handle the request"
+        responses = [
+            (1, "", err_msg),
+            (0, "Release kube-agents installed", ""),
+        ]
+        history_poisoned = json.dumps([{"revision": 1, "status": "failed"}])
+        rc, calls, out, err = self._run_deploy_block(
+            responses,
+            history_json=history_poisoned,
+            history_exit=0,
+            kubectl_readyz_exit=1,
+        )
+        self.assertEqual(rc, 0, err)
+        readyz_calls = [c for c in calls if c.startswith("kubectl get --raw /readyz")]
+        self.assertGreaterEqual(len(readyz_calls), 1, f"expected readyz check before recovery: {calls}")
+        self.assertIn("warning: api server /readyz did not become ready within 30s; proceeding with recovery calls.", err.lower())
+        uninstalls = [c for c in calls if c.startswith("helm uninstall")]
+        self.assertEqual(len(uninstalls), 1, f"expected poisoned record to be healed even when readyz timed out: {calls}")
 
     def test_transient_5xx_probe_5xx_retries_and_heals_poisoned_release_record(self):
         # When attempt 1 fails with 5xx and the subsequent helm history probe also
@@ -680,6 +722,7 @@ A2A_OPERATOR_ENV_ARGS=()
         helm_upgrades = [c for c in calls if c.startswith("helm upgrade")]
         self.assertEqual(len(helm_upgrades), 1, f"non-5xx must not retry: {calls}")
         self.assertNotIn("retrying", out)
+        self.assertIn("failed with an error that is not a transient api-server 5xx; it is not retried", err.lower())
 
 
 if __name__ == "__main__":
