@@ -271,17 +271,33 @@ class AssessTest(unittest.TestCase):
         # about the fleet, so the older failure is not news beside it.
         failed = self.reading(POST, NOW - timedelta(days=2), passed=False, artifact={"summary": {"refused": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "lock"}}})
         reached = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"summary": {"converged": 35}, "outcomes": {"kube-agents-evals-9": {"outcome": "converged", "detail": ""}}})
-        self.assertEqual(periodics.assess({POST.job: failed, DAILY.job: reached}, NOW, {}), {})
-        self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: reached}), [POST.job])
+        decided = periodics.superseded_jobs({POST.job: failed, DAILY.job: reached})
+        self.assertEqual(decided, {POST.job: {"build": "100", "recovery": True}})
+        self.assertEqual(periodics.assess({POST.job: failed, DAILY.job: reached}, NOW, {}, superseded=decided), {})
         missed = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"summary": {"converged": 34, "not_reached": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "not_reached", "detail": "busy"}}})
-        self.assertIn(POST.job, periodics.assess({POST.job: failed, DAILY.job: missed}, NOW, {}))
-        self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: missed}), [])
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: missed}), {})
+        self.assertIn(POST.job, periodics.assess({POST.job: failed, DAILY.job: missed}, NOW, {}, superseded={}))
+        # A failed daily silences the older note but is no recovery.
         daily_failed = self.reading(DAILY, NOW - timedelta(hours=1), passed=False, artifact={"summary": {"failed": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "lock"}}})
-        notes = periodics.assess({POST.job: failed, DAILY.job: daily_failed}, NOW, {})
+        decided = periodics.superseded_jobs({POST.job: failed, DAILY.job: daily_failed})
+        self.assertEqual(decided, {POST.job: {"build": "100", "recovery": False}})
+        notes = periodics.assess({POST.job: failed, DAILY.job: daily_failed}, NOW, {}, superseded=decided)
         self.assertEqual(sorted(notes), [DAILY.job], "the daily's own note is the current story")
         earlier_daily = self.reading(DAILY, NOW - timedelta(days=3), artifact={"outcomes": {"kube-agents-evals-9": {"outcome": "converged", "detail": ""}}})
-        self.assertIn(POST.job, periodics.assess({POST.job: failed, DAILY.job: earlier_daily}, NOW, {}))
-        self.assertIn(POST.job, periodics.assess({POST.job: failed}, NOW, {}))
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: earlier_daily}), {})
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed}), {})
+        # Sticky for the same failed build: a tick blind to the daily, or a
+        # later failing daily, does not re-open a retired failure as news;
+        # a new failed build is decided afresh.
+        carried = {POST.job: {"build": "100", "recovery": True}}
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed}, carried), carried)
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: daily_failed}, carried), carried)
+        self.assertEqual(periodics.assess({POST.job: failed}, NOW, {}, superseded=carried), {})
+        newer = self.reading(POST, NOW - timedelta(hours=2), passed=False, build="101", artifact={"outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "lock"}}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: newer}, carried), {})
+        # And a carried silence becomes a recovery once a later daily reaches the projects.
+        silenced = {POST.job: {"build": "100", "recovery": False}}
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: reached}, silenced), {POST.job: {"build": "100", "recovery": True}})
 
     def test_a_postsubmit_build_with_no_finish_time_is_still_said_without_a_window(self):
         readings = {POST.job: {"job": POST.job, "build": "9", "finished_at": None, "passed": True, "result": "SUCCESS", "artifact": None}}

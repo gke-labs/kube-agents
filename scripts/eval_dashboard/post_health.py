@@ -980,6 +980,13 @@ def periodic_news(health: dict, prev: dict | None) -> dict[str, dict]:
     }
 
 
+def _superseded_map(health: dict) -> dict:
+    """health.json's `periodics_superseded`: `{job: {build, recovery}}`; an
+    older document's list form reads as nothing decided."""
+    value = health.get("periodics_superseded")
+    return value if isinstance(value, dict) else {}
+
+
 def periodic_clears(health: dict, prev: dict | None) -> list[str]:
     """The jobs the space was told about whose latest read build passed. Read
     and not noted is not enough: a failed build under the job's threshold
@@ -989,12 +996,13 @@ def periodic_clears(health: dict, prev: dict | None) -> list[str]:
     read = set(health.get("periodics_read") or [])
     runs = health.get("periodics_runs") or {}
 
-    superseded = set(health.get("periodics_superseded") or [])
+    superseded = _superseded_map(health)
 
     def recovered(job):
-        # Its own passed build, or the tick's decision that a later build of
-        # the job that supersedes it dealt with its projects.
-        return bool((runs.get(job) or {}).get("passed")) or job in superseded
+        # Its own passed build, or the tick's decision that a later pass of
+        # the job that supersedes it reached its projects. A silence (a
+        # later failed daily) is not a recovery and clears nothing.
+        return bool((runs.get(job) or {}).get("passed")) or bool((superseded.get(job) or {}).get(periodics.SUPERSEDED_KEY_RECOVERY))
 
     return sorted(job for job in told if job in read and job not in current and recovered(job))
 
@@ -1057,11 +1065,11 @@ def render_periodic_clear(health: dict, prev: dict | None) -> str:
     run did when its report says."""
     lines = []
     runs = health.get("periodics_runs") or {}
-    superseded = set(health.get("periodics_superseded") or [])
+    superseded = _superseded_map(health)
     for job in periodic_clears(health, prev):
         words = _job_words(job)
         run = runs.get(job) or {}
-        if job in superseded and not run.get("passed"):
+        if (superseded.get(job) or {}).get(periodics.SUPERSEDED_KEY_RECOVERY) and not run.get("passed"):
             # Cleared by the superseding job's later run: that run is the
             # evidence, not the failed build being cleared.
             other = periodics.SUPERSEDED_BY.get(job, "")

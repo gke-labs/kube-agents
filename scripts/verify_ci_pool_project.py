@@ -954,7 +954,7 @@ _FLEET_COULD_NOT_LOOK = re.compile(r"could not list clusters in", re.I)
 # reason and to the same effect, and so is one skipped because a temporary file
 # could not be created, or dropped because the file gcloud wrote could not be
 # rewritten to the reader's exec credential (a local fault, not a pool state).
-# Sources: the three per-cluster WARNING lines in hack/fleet-kubeconfigs.sh.
+# Sources: the three per-cluster WARNING lines and the per-role read failure in hack/fleet-kubeconfigs.sh.
 #
 # One of these, or _FLEET_COULD_NOT_LOOK, must be present before an unresolved
 # role may be excused: excusing on the *absence* of a "looked and found wrong"

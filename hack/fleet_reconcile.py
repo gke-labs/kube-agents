@@ -93,7 +93,7 @@ ALLOW_KEYS = frozenset({ALLOW_KEY_ADDRESS, ALLOW_KEY_WHY, ALLOW_KEY_STANDING})
 # type, name, optional index. Anything else can never match a plan.
 # The index is the two shapes tofu prints, a count or a quoted key: an
 # approximation here admits an address no plan can ever match.
-ALLOW_INDEX_RE = r'\[(\d+|"(?:[^"\\]|\\.)*")\]'
+ALLOW_INDEX_RE = r'\[(0|[1-9][0-9]*|"(?:[^"\\]|\\.)*")\]'
 ALLOW_ADDRESS_RE = re.compile(r"^(module\.[A-Za-z0-9_-]+(%s)?\.)*[a-z][a-z0-9_]*\.[A-Za-z_][A-Za-z0-9_-]*(%s)?$" % (ALLOW_INDEX_RE, ALLOW_INDEX_RE))
 AllowEntry = collections.namedtuple("AllowEntry", "address why standing")
 # seeded-b's maintenance exclusion is re-stamped from `timestamp()` on every
@@ -124,6 +124,9 @@ TERMINATION_SIGNALS = boskos_pool.TERMINATION_SIGNALS
 # `--all` asks Boskos for the projects still busy again after this long, and
 # re-reads main's fleet tree at most this often, until the budget is spent.
 POLL_INTERVAL_SECONDS = 120
+# The stray check's acquires stop at the first project it sees twice; the
+# bound only matters if Boskos never repeats itself.
+STRAY_CHECK_EXTRA_ACQUIRES = 3
 MAIN_CHECK_INTERVAL_SECONDS = 60
 DEFAULT_WORKERS = 1
 # How long the threads get to return their projects after a termination
@@ -1028,22 +1031,36 @@ def reconcile_pool(server, owner, runner=tofu_runner, dry_run=False, known=None,
 
 
 def _check_for_stray_registration(server, owner, runner, dry_run, run, outcomes):
-    """One anonymous acquire after the by-name pass. A project Boskos hands
-    out that the mapping lacks is released untouched and failed, as the old
-    walk did: a registration with no mapping row takes a share of every
-    pull request's leases and nothing else watched reports it. Every mapped
-    project is already on the record by now (visited, busy or not reached),
-    so one handed back here is released untouched as well."""
+    """Anonymous acquires after the by-name pass, until Boskos hands back a
+    project this check has already seen. A project the mapping lacks is
+    released untouched and failed, as the old walk did: a registration with
+    no mapping row takes a share of every pull request's leases and nothing
+    else watched reports it. Boskos hands out the free project untouched
+    the longest, and a presubmit that leased the stray mid-pass makes it
+    newer than the projects released first, so one acquire is not enough:
+    each release here re-stamps what it got, so the free projects come
+    round once each, the stray among them, before the first repeat. A
+    mapped project is released untouched; the bound covers a pool that
+    never repeats."""
     release_failures = {}
+    seen = set()
+    done = []
 
     def visit(project):
+        if project in seen:
+            done.append(True)
+            return
+        seen.add(project)
         if project in outcomes:
             return
         outcomes[project] = (OUTCOME_FAILED, REASON_UNMAPPED)
         _line(project, outcomes[project])
 
     try:
-        boskos_pool.acquire_and_hold(server, owner, HOLD_STATE, lambda: boskos_pool.acquire(server, owner, HOLD_STATE), visit, release_failures, heartbeat=True)
+        for _ in range(len(outcomes) + STRAY_CHECK_EXTRA_ACQUIRES):
+            got = boskos_pool.acquire_and_hold(server, owner, HOLD_STATE, lambda: boskos_pool.acquire(server, owner, HOLD_STATE), visit, release_failures, heartbeat=True)
+            if got is boskos_pool.NOT_ACQUIRED or done:
+                break
     finally:
         for project, reason in release_failures.items():
             _merge_release_failure(outcomes, project, reason)

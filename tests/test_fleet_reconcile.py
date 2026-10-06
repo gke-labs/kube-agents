@@ -1521,12 +1521,12 @@ class AllowlistTest(unittest.TestCase):
     def test_an_index_is_only_what_tofu_prints(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "allow.json"
-            for bad in ("google_container_node_pool.no_surge_pool[ 0 ]", 'kubernetes_network_policy_v1.default_deny[ "headroom" ]', "kubernetes_network_policy_v1.default_deny['headroom']"):
+            for bad in ("google_container_node_pool.no_surge_pool[ 0 ]", 'kubernetes_network_policy_v1.default_deny[ "headroom" ]', "kubernetes_network_policy_v1.default_deny['headroom']", "google_compute_disk.orphan_pd[01]", "google_compute_disk.orphan_pd[\u0661]"):
                 path.write_text(json.dumps([{"address": bad, "why": "x"}]))
                 with self.assertRaises(reconcile.ReconcileError, msg=bad):
                     reconcile.load_allowlist(path)
-            path.write_text(json.dumps([{"address": "google_container_node_pool.no_surge_pool[0]", "why": "x"}, {"address": 'kubernetes_network_policy_v1.default_deny["headroom"]', "why": "x"}]))
-            self.assertEqual(len(reconcile.load_allowlist(path)), 2)
+            path.write_text(json.dumps([{"address": "google_container_node_pool.no_surge_pool[0]", "why": "x"}, {"address": 'kubernetes_network_policy_v1.default_deny["headroom"]', "why": "x"}, {"address": "google_compute_disk.orphan_pd[10]", "why": "x"}]))
+            self.assertEqual(len(reconcile.load_allowlist(path)), 3)
 
     def test_an_address_with_a_trailing_newline_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1935,7 +1935,7 @@ class WorkersTest(unittest.TestCase):
             outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known={P7}, run=run)
         self.assertEqual(tofu.verbs().count("apply"), 1, "applied once")
         self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
-        self.assertEqual(boskos.released, [P7, P7], "handed back and released untouched")
+        self.assertEqual(boskos.released, [P7, P7, P7], "handed back and released untouched, until the first repeat ends the check")
 
     def test_a_stray_registration_is_not_counted_as_visited(self):
         stray = "kube-agents-evals-99"
@@ -1970,10 +1970,38 @@ class WorkersTest(unittest.TestCase):
         self.assertEqual(boskos.released, [P7], "acquired, never applied, given back")
         self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_NOT_REACHED, P8: reconcile.OUTCOME_NOT_REACHED})
 
+    def test_a_stray_touched_during_the_pass_is_still_found(self):
+        # Boskos hands out the free project untouched the longest. A presubmit
+        # that leased the stray mid-pass makes it newer than the projects the
+        # pass released first, so one acquire returns a mapped project; the
+        # check keeps acquiring, releasing each untouched, until a project
+        # already on the record comes back, and the stray is met before that.
+        stray = "kube-agents-evals-99"
+
+        class _Boskos_stray_newer(_Boskos):
+            def __call__(self, request, timeout=None):
+                out = super().__call__(request, timeout)
+                if "/release?" in request.full_url:
+                    self.free.append(self.released[-1])
+                    if stray not in self.free and stray not in self.acquired:
+                        self.free.append(stray)
+                return out
+
+        boskos = _Boskos_stray_newer(free=[P7])
+        tofu = _Tofu({P7: UPDATE_ONLY})
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()):
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known={P7}, run=reconcile.Run())
+        self.assertEqual(outcomes[stray], (reconcile.OUTCOME_FAILED, reconcile.REASON_UNMAPPED))
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
+        self.assertEqual(tofu.verbs().count("apply"), 1)
+        self.assertEqual(boskos.released, [P7, P7, stray, P7], "the pass, then the check cycles the free pool once: mapped untouched, stray failed, first repeat ends it")
+        self.assertEqual(boskos.walked, 3)
+
     def test_a_registration_outside_the_mapping_is_still_found_and_reported(self):
-        # After the by-name pass, one anonymous acquire: a project Boskos
-        # hands out that the mapping lacks is released untouched and failed,
-        # as the walk used to do, so the mismatch reds the run.
+        # After the by-name pass, anonymous acquires: a project Boskos hands
+        # out that the mapping lacks is released untouched and failed, as
+        # the walk used to do, so the mismatch reds the run. The stray, then
+        # an empty pool, ends the check.
         stray = "kube-agents-evals-99"
         boskos = _Boskos(free=[P7, stray])
         tofu = _Tofu({P7: UPDATE_ONLY})
@@ -1982,7 +2010,7 @@ class WorkersTest(unittest.TestCase):
         self.assertEqual(outcomes[stray], (reconcile.OUTCOME_FAILED, reconcile.REASON_UNMAPPED))
         self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
         self.assertEqual(sorted(boskos.released), [P7, stray])
-        self.assertEqual(boskos.walked, 1)
+        self.assertEqual(boskos.walked, 2)
         self.assertNotIn(stray, " ".join(" ".join(c) for c in tofu.calls))
 
     def test_a_project_outside_the_mapping_is_failed_but_not_counted_visited(self):

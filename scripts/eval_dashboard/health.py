@@ -2333,7 +2333,8 @@ def adjudicate(
     # and the poster, which keys on the verdict, does not re-announce one it
     # has told.
     streaks = periodics.streaks(readings, (prev or {}).get("periodics_streaks"))
-    watched = periodics.assess(readings, pool_clock, prev_notes, streaks=streaks if prev is not None else None)
+    superseded = periodics.superseded_jobs(readings, (prev or {}).get("periodics_superseded"))
+    watched = periodics.assess(readings, pool_clock, prev_notes, streaks=streaks if prev is not None else None, superseded=superseded)
     evidence.extend(periodics.evidence(note) for _, note in sorted(watched.items()))
     # Per job: a job read this tick keeps its start only while it is noted;
     # a job with no reading this tick keeps whatever start it had.
@@ -2369,7 +2370,7 @@ def adjudicate(
         "periodics": watched,
         "periodics_read": sorted(readings),
         "periodics_runs": periodics.runs(readings),
-        "periodics_superseded": periodics.superseded_jobs(readings),
+        "periodics_superseded": superseded,
         "periodics_streaks": streaks,
         "periodics_since": periodics_since,
         "metrics": metrics([run for run in runs if run.finished <= now], now, fixtures, roster),

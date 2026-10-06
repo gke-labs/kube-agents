@@ -131,6 +131,10 @@ RECONCILE_POSTSUBMIT_JOB = "post-kube-agents-fleet-reconcile"
 # A watched job whose failed build is retired by another job's later pass:
 # the postsubmit has no window, and the daily that followed it did its work.
 SUPERSEDED_BY = {RECONCILE_POSTSUBMIT_JOB: RECONCILE_DAILY_JOB}
+SUPERSEDED_RECOVERY = "recovery"
+SUPERSEDED_SILENCE = "silence"
+SUPERSEDED_KEY_BUILD = "build"
+SUPERSEDED_KEY_RECOVERY = "recovery"
 # gsutil's absent-object wording, the set scripts/release/poll_rc_eval_verdict.py
 # settled on for the Prow archive; the same wording here. Never a bare 404,
 # because gsutil echoes the failing URL and a 19-digit build id can contain
@@ -667,7 +671,7 @@ def _thresholded_detail(periodic: Periodic, persistent: dict, artifact: dict | N
     return lines
 
 
-def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, watched=WATCHED, streaks: dict | None = None) -> dict[str, dict]:
+def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, watched=WATCHED, streaks: dict | None = None, superseded: dict | None = None) -> dict[str, dict]:
     """The notes this tick: one per watched job whose latest finished build
     failed, or is older than the job's stale window. `prev_notes` carries each
     open note's `since`. With `streaks` (from streaks()), a failed build is a
@@ -685,7 +689,7 @@ def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, wa
             verdict = VERDICT_FAILED
         else:
             continue
-        if verdict == VERDICT_FAILED and superseded(periodic.job, readings):
+        if verdict == VERDICT_FAILED and periodic.job in (superseded if superseded is not None else superseded_jobs(readings)):
             continue
         before = (prev_notes or {}).get(periodic.job) or {}
         artifact = reading.get(KEY_ARTIFACT) if isinstance(reading.get(KEY_ARTIFACT), dict) else None
@@ -736,30 +740,47 @@ def _reached(artifact, projects: list[str]) -> bool:
     return all(isinstance(outcomes.get(p), dict) and outcomes[p].get(REPORT_KEY_OUTCOME) not in (RECONCILE_OUTCOME_NOT_REACHED, RECONCILE_OUTCOME_BUSY) for p in projects)
 
 
-def superseded(job: str, readings: dict[str, dict]) -> bool:
-    """True when the job's failed build is no longer the story about the
-    fleet: the job that supersedes it (the daily, for the postsubmit) has a
-    later build that either failed itself, so its own note is current, or
-    passed having reached every project the failed build named. A later
-    pass that never reached them (busy, not reached) retires nothing."""
+def _supersession(job: str, readings: dict[str, dict]) -> str | None:
+    """How the superseding job's latest build relates to this job's failed
+    one: SUPERSEDED_RECOVERY when it passed later having reached every
+    project the failed build named, SUPERSEDED_SILENCE when it failed later
+    (its own note is the current story; nothing recovered), None otherwise.
+    A later pass that never reached them (busy, not reached) is None."""
     other = SUPERSEDED_BY.get(job)
     if not other:
-        return False
+        return None
     mine, theirs = readings.get(job), readings.get(other)
     if not isinstance(mine, dict) or not isinstance(theirs, dict):
-        return False
+        return None
     when, later = parse_iso(mine.get(KEY_FINISHED_AT)), parse_iso(theirs.get(KEY_FINISHED_AT))
     if when is None or later is None or later <= when:
-        return False
+        return None
     if not theirs.get(KEY_PASSED):
-        return True
-    return _reached(theirs.get(KEY_ARTIFACT), _named_failures(mine.get(KEY_ARTIFACT)))
+        return SUPERSEDED_SILENCE
+    return SUPERSEDED_RECOVERY if _reached(theirs.get(KEY_ARTIFACT), _named_failures(mine.get(KEY_ARTIFACT))) else None
 
 
-def superseded_jobs(readings: dict[str, dict]) -> list[str]:
-    """The watched jobs whose latest failed build a later build of their
-    superseding job has retired; carried in health.json for the poster."""
-    return sorted(job for job, reading in readings.items() if isinstance(reading, dict) and not reading.get(KEY_PASSED) and superseded(job, readings))
+def superseded_jobs(readings: dict[str, dict], carried: dict | None = None) -> dict[str, dict]:
+    """`{job: {build, recovery}}` for the watched jobs whose latest failed
+    build a later build of their superseding job has dealt with. Carried in
+    health.json and handed back as `carried` next tick, so the decision
+    sticks for as long as the failed build is the job's latest: a tick blind
+    to the superseding job, or a later failing one, does not re-open a
+    retired failure as news. A silence becomes a recovery once a later pass
+    reaches the projects; a new failed build is decided afresh."""
+    carried = carried if isinstance(carried, dict) else {}
+    out = {}
+    for job, reading in readings.items():
+        if not isinstance(reading, dict) or reading.get(KEY_PASSED) or job not in SUPERSEDED_BY:
+            continue
+        build = reading.get(KEY_BUILD)
+        before = carried.get(job) if isinstance(carried.get(job), dict) and carried[job].get(SUPERSEDED_KEY_BUILD) == build else None
+        ground = _supersession(job, readings)
+        if ground is None and before is None:
+            continue
+        recovery = bool((before or {}).get(SUPERSEDED_KEY_RECOVERY)) or ground == SUPERSEDED_RECOVERY
+        out[job] = {SUPERSEDED_KEY_BUILD: build, SUPERSEDED_KEY_RECOVERY: recovery}
+    return out
 
 
 def evidence(note: dict) -> str:

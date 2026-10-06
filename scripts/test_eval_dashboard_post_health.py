@@ -2029,7 +2029,11 @@ class WatchedPeriodics(RunHarness):
         # The tick decided the supersession from both artifacts; the poster
         # reads that decision rather than re-deriving it from the summaries.
         self.assertEqual(post_health.periodic_clears(doc, prev), [])
-        doc["periodics_superseded"] = ["post-kube-agents-fleet-reconcile"]
+        # Silenced by a failed daily: no note, but no recovery either.
+        doc["periodics_superseded"] = {"post-kube-agents-fleet-reconcile": {"build": "7", "recovery": False}}
+        self.assertEqual(post_health.periodic_clears(doc, prev), [])
+        self.assertEqual(post_health.render_periodic_clear(doc, prev), "")
+        doc["periodics_superseded"] = {"post-kube-agents-fleet-reconcile": {"build": "7", "recovery": True}}
         self.assertEqual(post_health.periodic_clears(doc, prev), ["post-kube-agents-fleet-reconcile"])
         # And the clear cites the daily's run, not the postsubmit's failed one.
         text = post_health.render_periodic_clear(doc, prev)

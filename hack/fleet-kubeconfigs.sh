@@ -101,6 +101,9 @@ _FLEET_EXIT_READONLY_UNAVAILABLE=3
 # should be no stricter than they are. A PERMISSION_DENIED is not retried:
 # it is the binding, and it will not change in fifteen seconds.
 _FLEET_MINT_ATTEMPTS=3
+# A presence probe against a control plane that does not answer must not
+# hang the runner: bounded per request, as hack/fleet-fixture-state.py is.
+_FLEET_PROBE_REQUEST_TIMEOUT="${FLEET_PROBE_REQUEST_TIMEOUT:-30s}"
 _FLEET_MINT_RETRY_SECONDS="${FLEET_MINT_RETRY_SECONDS:-5}"
 _FLEET_MINT_DENIED_PATTERN="PERMISSION_DENIED"
 
@@ -187,13 +190,13 @@ _fleet_probe_present() {
       # not read as an object. The error text is fetched by a second call
       # only when the first failed.
       if [ "$namespace" != "-" ] && [ -n "$namespace" ]; then
-        if ! _FLEET_PROBE_OUT="$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -n "$namespace" -l "$rest" -o name 2>/dev/null)"; then
-          _FLEET_PROBE_ERR="$({ KUBECONFIG="$kubeconfig" kubectl get "$kind" -n "$namespace" -l "$rest" -o name >/dev/null; } 2>&1)"
+        if ! _FLEET_PROBE_OUT="$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -n "$namespace" -l "$rest" -o name --request-timeout="$_FLEET_PROBE_REQUEST_TIMEOUT" 2>/dev/null)"; then
+          _FLEET_PROBE_ERR="$({ KUBECONFIG="$kubeconfig" kubectl get "$kind" -n "$namespace" -l "$rest" -o name --request-timeout="$_FLEET_PROBE_REQUEST_TIMEOUT" >/dev/null; } 2>&1)"
           return 2
         fi
       else
-        if ! _FLEET_PROBE_OUT="$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -l "$rest" -o name 2>/dev/null)"; then
-          _FLEET_PROBE_ERR="$({ KUBECONFIG="$kubeconfig" kubectl get "$kind" -l "$rest" -o name >/dev/null; } 2>&1)"
+        if ! _FLEET_PROBE_OUT="$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -l "$rest" -o name --request-timeout="$_FLEET_PROBE_REQUEST_TIMEOUT" 2>/dev/null)"; then
+          _FLEET_PROBE_ERR="$({ KUBECONFIG="$kubeconfig" kubectl get "$kind" -l "$rest" -o name --request-timeout="$_FLEET_PROBE_REQUEST_TIMEOUT" >/dev/null; } 2>&1)"
           return 2
         fi
       fi
@@ -207,9 +210,9 @@ _fleet_probe_present() {
       # "${empty[@]}" under `set -u`.
       # 0 present, 1 NotFound, 2 any other failure of the read.
       if [ "$namespace" != "-" ] && [ -n "$namespace" ]; then
-        _FLEET_PROBE_ERR="$({ KUBECONFIG="$kubeconfig" kubectl get "$kind" "$rest" -n "$namespace" >/dev/null; } 2>&1)" && return 0
+        _FLEET_PROBE_ERR="$({ KUBECONFIG="$kubeconfig" kubectl get "$kind" "$rest" -n "$namespace" --request-timeout="$_FLEET_PROBE_REQUEST_TIMEOUT" >/dev/null; } 2>&1)" && return 0
       else
-        _FLEET_PROBE_ERR="$({ KUBECONFIG="$kubeconfig" kubectl get "$kind" "$rest" >/dev/null; } 2>&1)" && return 0
+        _FLEET_PROBE_ERR="$({ KUBECONFIG="$kubeconfig" kubectl get "$kind" "$rest" --request-timeout="$_FLEET_PROBE_REQUEST_TIMEOUT" >/dev/null; } 2>&1)" && return 0
       fi
       case "$_FLEET_PROBE_ERR" in
         *NotFound*) return 1 ;;

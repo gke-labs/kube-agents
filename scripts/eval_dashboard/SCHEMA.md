@@ -1003,11 +1003,16 @@ unclosed counts its close and its delete, and its label when it carries
 `audit:remediation`). `periodics_read` names the jobs a
 reading arrived for this tick, whether or not they are noted; the poster clears
 a told job on a reading that shows it clean, or when `periodics_superseded`
-lists it: the jobs whose latest failed build a later build of the job that
-supersedes them (the daily, for the on-merge reconcile) has retired, by
-failing itself or by passing having reached every project the failed build
-named. `periodics` notes every watched job whose latest build failed or is
-stale, less those superseded. `periodics_runs` is, per read
+marks it recovered. That map is `{job: {build, recovery}}` for the jobs whose
+latest failed build a later build of the job that supersedes them (the daily,
+for the on-merge reconcile) has dealt with: `recovery` true when the daily
+passed having reached every project the failed build named, false when it
+failed itself, so its own note is the current story and nothing clears. The
+entry is carried from the previous tick while `build` is still the job's
+latest, so a tick blind to the daily does not re-open the failure, and a
+silence becomes a recovery once a later pass reaches the projects.
+`periodics` notes every watched job whose latest build failed or is stale,
+less those superseded. `periodics_runs` is, per read
 job, `{build, finished_at, passed, summary, dry_run}` of its latest finished build, what
 the recovery message and the digest's reconcile run line say. `periodics_streaks` is, per watched job, `{build,
 projects{project: n}, runs}`: the last build counted, each project's
