@@ -219,6 +219,8 @@ class SplitTest(unittest.TestCase):
             "a colon intro over a numbered list": "Here's what I found:\n\n1. web-1 restarted.\n2. web-2 is Pending.",
             "a colon intro over a table": "The node pools:\n| pool | nodes |\n| --- | --- |",
             "a colon intro over code": "Run this:\n```\nkubectl get pods\n```",
+            "a colon intro over a paragraph": "Summary:\n\nAll pods are Running and no node is under memory pressure. Both were checked at 10:02Z.",
+            "a colon intro over label lines": "Current state:\n\nNode: a\nCause: OOM",
             "an overlong sentence": ("word " * 40).strip() + ". Then more.",
             "a single sentence": "Checkout is healthy.",
             "nothing": "",
