@@ -136,6 +136,13 @@ class StageTest(unittest.TestCase):
         self._main()
         self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
 
+    def test_an_archived_ranking_card_counts(self):
+        # How the eval stack presents a settled scan (bench/tf/prebuilt/oobe-first-run-audits).
+        self._file_scan()
+        _board(self.board, [_ranking("archived", key=oobe.PRIORITIZE_KEY + "-oobe-eval-20261006")])
+        self._main()
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+
     def test_an_earlier_runs_ranking_card_does_not_count(self):
         # Left on the board by a run before onboarding was re-armed.
         self._file_scan()

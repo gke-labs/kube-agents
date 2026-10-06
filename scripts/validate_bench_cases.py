@@ -366,6 +366,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # shell sandbox pod, not a seeded-fleet fixture, so it is not in
     # CLUSTER_READING_TYPES below.
     "sandbox_tree_matches_image": (),
+    # This repository, agent-disk-reading. No field: whether every first-run audit has a run
+    # claimed since the stack armed the stage is the whole assertion.
+    "oobe_audits_started": (),
 }
 
 # Check types that read live cluster state. A case using one is asserting on
