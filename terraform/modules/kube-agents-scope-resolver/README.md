@@ -3,13 +3,15 @@
 Resolves the two `spec.scope` selectors that are not Resource Manager containers, a Shared VPC host
 (`sharedVpcHosts`) and a Cloud Monitoring Metrics Scope (`metricsScopes`), to the projects they
 reach, at plan time, so the [`kube-agents-iam`](../kube-agents-iam/README.md) module can bind the
-read roles in each. Nothing is inherited through either, which is why the resolution has to happen
+read roles in each; and, while the scoped service account pool is armed, lists each declared
+folder's and organisation's member projects for that pool (the section below the selectors'). Nothing is inherited through either, which is why the resolution has to happen
 before the bindings are planned ([`docs/designs/multi-project-scope.md`](../../../docs/designs/multi-project-scope.md)
 §6, §10 step 3).
 
 ## What it reads, and as whom
 
-Three `data "http"` reads, the same the reconcile makes each run: the Compute API's
+Three selector reads, the same the reconcile makes each run, and a fourth for the pool while it is
+armed (its own section below): the Compute API's
 `getXpnResources` for a host's attached service projects (a project that is not a Shared VPC host
 resolves to no members, as it does at runtime); the Monitoring API's `metricsScopes.get` for a
 scope's monitored projects, which it names by project number; and Resource Manager v3 to name each
@@ -44,6 +46,41 @@ has to name a monitored project, with the agent's own grant in it, before it can
 entry, so `kube-agents-iam` leaves the grant of a monitored project excluded by ID in place. A service project of a Shared VPC host with such an ID has no number to be excluded by, so it is left out of `members` on its own, listed in `uncarriable_members`, and warned about by a `check` block on every plan, while the host's other service projects are bound as usual; a monitored project the Monitoring API should ever name by such an ID rather than by number takes the same path. IDs and globs are the callers': `kube-agents-iam` withholds the grant of a Shared VPC service
 project an entry names by ID, the reconcile evaluates globs.
 
+## The container read, for the scoped service account pool
+
+While the pool is armed (`list_container_members`, the composition's `scoped_pool_enabled`), the
+module also lists each declared folder's and organisation's members (`folders`, `organizations`,
+numeric IDs), with the Cloud Asset Inventory search the reconcile runs for a container: one
+`searchAllResources` call scoped to it, filtered to `container.googleapis.com/Cluster`, the project
+read out of each asset name. The pool's accounts are Terraform's, one per project, so a member the
+reconcile would discover under the container has to be known at plan time to get one. The members
+get a pool account and nothing else: no binding of their own, since the container's grant is
+inherited, and no place in the resolved-set cap, which counts containers at runtime after the
+explicit projects and the selectors. A project created under the container between applies is
+discovered and gets its profile, and every kubectl for it is refused until the next `upgrade.sh`
+adds its account ([`docs/designs/multi-project-scope.md`](../../../docs/designs/multi-project-scope.md)
+§6). With the pool off no container is read and `container_members` is `{}`.
+
+The read carries the same headers as the selectors' and refuses the same way: the identity needs
+`cloudasset.assets.searchAllResources` on the container (`roles/cloudasset.viewer`, the role the apply
+binds for the agent there) and `cloudasset.googleapis.com` enabled in `quota_project`, which
+`install.sh` enables before a first plan when the pool is armed beside a container; a 403 with the
+API off names the enable command, as the other reads do. A 200 that is not the search document (a
+JSON object whose `results` each name a GKE cluster; an absent `results` key is a container with no
+cluster and lists to an empty list) is refused, a container whose clusters are in more than
+`member_cap` projects, less exact `exclude_projects` entries, is refused, and a `nextPageToken` (more
+than 500 clusters under the container) is refused whatever `member_cap` is, as a Shared VPC host's
+second page is. An exact `exclude_projects` entry drops a member from the pool; a glob is the
+reconcile's alone. A member with a legacy domain-scoped ID is left out, listed in
+`uncarriable_members` under the container's key and warned about by the same `check` block; the
+management project (`quota_project`) is left out of a container's members whatever its ID, and is in
+neither list, since `kube-agents-iam` seeds the pool with it itself. The search is eventually
+consistent and the plan carries no state to grace an index gap with, so a container the index
+answers with no cluster at all is warned about by a second `check` block (applying that answer
+destroys every member's pool account; re-plan later, or pin the projects in `scope.projects`, which
+does not depend on the index), while a shorter but non-empty answer is applied as read, the limit
+the design records.
+
 ## Why a module of its own
 
 The full-install composition calls `kube-agents-iam` with a module-level `depends_on` (the Workload
@@ -61,7 +98,10 @@ told so rather than getting the host bound and its members not.
 is the scope's exclude list; `member_cap` is the declared resolved-set cap (`spec.scope.maxProjects`,
 100 by default), past which a single selector is refused. `members` maps each selector's snapshot name (`sharedVpcHosts/<host>`,
 `metricsScopes/<scope>`) to the sorted project IDs it reaches, the shape `kube-agents-iam` takes and
-the one the reconcile's `fleet_scope.json` `containers` array can be read beside.
+the one the reconcile's `fleet_scope.json` `containers` array can be read beside. `folders` and
+`organizations` are numeric IDs, read only while `list_container_members` is set; `container_members`
+maps each one's snapshot key (`folders/<id>`, `organizations/<id>`) to the sorted project IDs its
+clusters are in, the shape `kube-agents-iam` takes as `scope_container_members`.
 
 [`lifecycle.sh`](../../examples/full-install/lifecycle.sh) in the full-install composition writes a
 gitignored `scope_resolver_lifecycle_override.tf` into this directory for the duration of each
@@ -77,7 +117,8 @@ terraform-test` refuses to run a suite beside such a file and names it; remove t
 `tests/*.tftest.hcl` plan the module with both providers mocked and every HTTP read overridden, so
 no case reaches an API: what each selector resolves to from the documents the APIs answer, which
 answers the postconditions refuse (a read the identity cannot make, a document that is not the one
-read, a second page, a selector past the per-selector cap), and what an exclude entry or a legacy
-ID leaves out. `make terraform-test` runs them, as the `validate` job in `validate.yml` does on every
+read, a second page, a selector past the per-selector cap), what an exclude entry or a legacy
+ID leaves out, and the container read for the pool (`tests/container_members.tftest.hcl`): what a
+folder and an organisation list to, that nothing is read with the pool off, and the answers refused. `make terraform-test` runs them, as the `validate` job in `validate.yml` does on every
 pull request; `mock_provider` needs Terraform 1.7 or newer, above the floor the module declares for an
 install.

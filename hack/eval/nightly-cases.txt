@@ -549,6 +549,11 @@
 # A simple case that can run on kind.
 ./tasks/chat-routing-own-cluster-namespaces/task.yaml
 
+# The front door's answer to "reset our chat history": it names /new (alias
+# /reset) and claims no reset of its own (#2189). `validated: false` until its
+# first observed nightly runs.
+./tasks/chat-reset-history-names-the-command/task.yaml
+
 # The two obtainability-journey probes: CUJ1's Day-0 design discipline and
 # CUJ3's Day-2 window planning, graded on the report and the worker
 # commands through the eval harness (their live siblings under bench/cuj/
@@ -604,6 +609,12 @@
 # second card blocked on the same question. Plants its own cards through
 # card_wake.py; reads no cluster.
 ./tasks/chat-question-typed-answer-fresh-session/task.yaml
+
+# SOUL §1.5 Unblock: an answer by button to a question the gateway posted is
+# carried to the card and then answered with [SILENT], since the click already
+# rewrote the question to show who answered and what. Plants its own card
+# through card_wake.py; reads no cluster.
+./tasks/chat-question-click-answer-stays-silent/task.yaml
 
 # The shell sandbox's copy of the shipped trees (#2096): a card telling the
 # platform worker to append to the shipped gke-basics SKILL.md with a

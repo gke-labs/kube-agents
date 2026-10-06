@@ -4356,11 +4356,13 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// no path, URL, credential or image, and no value of it adds a destination
 	// or a credential. Its writes go only to Slack, in the channels and threads
 	// the gateway already serves, among them a reaction on an ask, a click's
-	// rewrite of the clicked message and its echo, and an incident alert's edit
-	// into its options. Each effect it switches, one per change that ships it:
+	// rewrite of the clicked message (or, when Slack refuses it, the same
+	// answered line posted in the thread), and an incident alert's edit into
+	// its options. Each effect it switches, one per change that ships it:
 	//
 	//   - Clicks: a click on a choice runs as the clicker's turn under the
-	//     adapter's own authorization, echoed in the same thread.
+	//     adapter's own authorization, and the clicked message is rewritten to
+	//     name who chose what.
 	//   - Incident alerts: an incident alert's triage options post as an edit
 	//     of the alert, with a button per option and the report folded; the
 	//     Session KV database is read, read-only, to tell an alert's thread
@@ -4371,8 +4373,12 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	//   - Pull requests and questions: an opened pull request and a question a
 	//     card waits on post in the thread as messages of their own, with
 	//     buttons; the wake for a question already posted carries a note
-	//     telling the Planning Agent not to ask it again, the one effect that
-	//     reaches a model.
+	//     telling the Planning Agent not to ask it again, nor to reply after
+	//     carrying the answer to the card, the one effect that reaches a
+	//     model; once the card resumes, the question's thread is read once
+	//     (conversations.replies, the existing token and scopes) for the first
+	//     reply a person typed, and the names it shows are looked up with
+	//     users.info, cached per user, so the settled question shows who answered.
 	//   - Reactions: which reaction goes on an ask and when it settles.
 	//   - Reports: a fleet-audit cron report and the first inventory report
 	//     post as Block Kit, laid out again as a headline and the top findings

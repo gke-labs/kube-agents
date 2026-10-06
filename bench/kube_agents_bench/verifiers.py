@@ -1032,6 +1032,13 @@ _REPLAY_DECOY_UNREAD_REASON = (
 )
 
 
+_NO_ANSWER_REPLY_REASON = (
+    f"no answer reply on a {card_wake.SETTLED_ENTRY} entry in the trajectory: the prompt "
+    "was not a question replay, or its wake turn or its answer turn errored before replying, "
+    "so no answer reply was recorded to grade"
+)
+
+
 @VERIFIERS.register("replay_card")
 class ReplayCardVerifier(BaseVerifier):
     """Checks the card a card-wake replay planted, as the run left it.
@@ -1125,9 +1132,14 @@ class ReplyIsSilentVerifier(BaseVerifier):
     normalized text: that drops backticks, and the gateway posts a backticked
     ``[SILENT]``. A blank reply fails, because the gateway posts an
     empty-response warning for it.
+
+    ``reply: answer`` grades a question replay's reply to the answer turn
+    instead, which the harness records as the trajectory's
+    ``card_wake_settled`` entry (``args.answer_reply``).
     """
 
     type: Literal["reply_is_silent"]
+    reply: Literal["final", "answer"] = "final"
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
@@ -1140,6 +1152,17 @@ class ReplyIsSilentVerifier(BaseVerifier):
                 reason=_NO_TRANSCRIPT_REASON,
             )
         reply = snap.final_message
+        if self.reply == "answer":
+            entries = [e for e in snap.trajectory if e.get("name") == card_wake.SETTLED_ENTRY]
+            answer_reply = ((entries[-1].get("args") or {}) if entries else {}).get("answer_reply")
+            if not isinstance(answer_reply, str):
+                return VerificationResult(
+                    success=False,
+                    status="error",
+                    elapsed_time=time.monotonic() - start,
+                    reason=_NO_ANSWER_REPLY_REASON,
+                )
+            reply = answer_reply
         if gateway_silence.is_intentional_silence_response(reply):
             return VerificationResult(
                 success=True,

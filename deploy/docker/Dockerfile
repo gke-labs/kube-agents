@@ -776,7 +776,8 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # deploy/docker/patches/slack_ux_status.py.
 #
 # Slack: with KAGE_SLACK_UX on, a click on one of our choice buttons runs as the
-# clicker's own reply in the thread, echoed and marked answered; it passes the
+# clicker's own reply in the thread, the clicked message rewritten to name who
+# chose what; it passes the
 # same authorization as a typed message. Registered after the plugin action
 # handlers by gateway/slack_ux_clicks.py; with the flag off nothing is
 # registered. Also rides this COPY and RUN. See deploy/docker/patches/slack_ux_clicks.py.

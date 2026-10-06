@@ -4175,10 +4175,38 @@ def test_reply_is_silent_without_a_transcript_is_an_error():
     assert ReplyIsSilentVerifier(type="reply_is_silent").verify(5).status == "error"
 
 
+def _settled_with(answer_reply=None):
+    args = {"card": "t_1"} if answer_reply is None else {"card": "t_1", "answer_reply": answer_reply}
+    return [{"name": "card_wake_settled", "args": args, "result": None, "status": "harness"}]
+
+
+def test_reply_is_silent_on_the_answer_grades_the_answer_turns_reply():
+    check = ReplyIsSilentVerifier(type="reply_is_silent", reply="answer")
+    transcript.set("[SILENT]", _settled_with("Unblocked it."), final_message="[SILENT]")
+    res = check.verify(5)
+    assert not res.success and res.status != "error" and "Unblocked it." in res.reason
+    transcript.set("Unblocked it.", _settled_with("[SILENT]"), final_message="Unblocked it.")
+    assert check.verify(5).success
+
+
+def test_reply_is_silent_on_the_answer_without_one_is_an_error():
+    check = ReplyIsSilentVerifier(type="reply_is_silent", reply="answer")
+    for trajectory in ([], _settled_with()):
+        transcript.set("[SILENT]", trajectory, final_message="[SILENT]")
+        assert check.verify(5).status == "error"
+
+
 def test_the_question_wake_case_grades_silence_with_the_gateway_predicate():
     spec = yaml.safe_load((TASKS / "chat-question-wake-stays-silent" / "task.yaml").read_text())
     entries = [e for e in spec["verification_spec"] if e["name"] == "the-wake-reply-is-silent"]
     assert [e["check"] for e in entries] == [{"type": "reply_is_silent"}]
+
+
+def test_the_click_case_grades_the_answer_turns_reply_and_the_wakes():
+    spec = yaml.safe_load((TASKS / "chat-question-click-answer-stays-silent" / "task.yaml").read_text())
+    checks = {e["name"]: e["check"] for e in spec["verification_spec"]}
+    assert checks["the-click-reply-is-silent"] == {"type": "reply_is_silent", "reply": "answer"}
+    assert checks["the-wake-reply-is-silent"] == {"type": "reply_is_silent"}
 
 
 _RETRY_CASE = TASKS / "chat-voice-retry-says-it-is-retried" / "task.yaml"

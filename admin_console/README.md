@@ -35,6 +35,19 @@ ADMIN_PORTAL_PORT=8601 ./scripts/admin_portal.sh
 `ADMIN_PORTAL_STREAMLIT_PORT` may override the private port if its default,
 `ADMIN_PORTAL_PORT + 1`, is occupied.
 
+The console's own dark theme is the default. For a light theme in Google Cloud's
+colours, set `ADMIN_PORTAL_THEME`:
+
+```bash
+ADMIN_PORTAL_THEME=google-cloud ./scripts/admin_portal.sh
+```
+
+Unset or empty means `default`; the launcher accepts `default` and
+`google-cloud` and refuses anything else.
+The palettes live in `theme.py`, except Streamlit's base theme for `default`,
+which stays in `.streamlit/config.toml` at the repository root. The theme
+changes colours only; it adds no Google Cloud logo or font.
+
 This loopback-only launcher is the authentication boundary for the prototype.
 A remotely deployed console still requires application-level authentication
 and authorization as described in the design.
