@@ -2244,6 +2244,11 @@ class ExecRouteCapacityTest(unittest.TestCase):
             mock.patch.object(
                 credential_proxy.vcs_broker, "route_table", return_value={"probe": verb}
             ),
+            # About the slot, not the managed-repository gate the stand-in
+            # broker has no registry for.
+            mock.patch.object(
+                credential_proxy.vcs_broker, "UNGATED_VERBS", frozenset({"probe"})
+            ),
             mock.patch.object(CredentialProxyHandler, "_json", recording),
         ):
             status, body = self.post({}, path="/v1/vcs/probe")
@@ -4569,7 +4574,8 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
             credential_proxy.CommandExecutor
         )
         executor.execute_internal = lambda argv: self.fail("helper was run")
-        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True), \
+                mock.patch.object(credential_proxy, "_provider_forge"):
             with self.assertRaises(RuntimeError) as raised:
                 executor.refresh_forge_credential("gitlab", "gke-agentic/infra")
         self.assertIn("gitlab", str(raised.exception))
@@ -6885,7 +6891,7 @@ class VcsRouteTest(unittest.TestCase):
         # inside the credential refresh, which caught the refusal and logged it.
         with mock.patch.object(
             credential_proxy, "managed_repositories",
-            return_value=frozenset({"acme/managed"}),
+            return_value=frozenset({"github:github.com/acme/managed"}),
         ):
             status, payload = self._handler(
                 "/v1/vcs/publish",
@@ -6896,13 +6902,11 @@ class VcsRouteTest(unittest.TestCase):
         self.assertEqual("REPOSITORY_NOT_MANAGED", payload.get("code"))
 
     def test_capabilities_is_the_one_verb_an_unmanaged_repository_can_be_asked(self):
-        # The handler's gate covers writes only, so a read reaches its verb --
-        # and `capabilities` is the one verb that never asks for the
-        # credential, so it is the one that actually answers for a repository
-        # this install does not manage.
+        # It spends no credential, so it is the one verb the route lets
+        # through for a repository this install does not manage.
         with mock.patch.object(
             credential_proxy, "managed_repositories",
-            return_value=frozenset({"acme/managed"}),
+            return_value=frozenset({"github:github.com/acme/managed"}),
         ):
             status, payload = self._handler(
                 "/v1/vcs/capabilities",
@@ -6912,36 +6916,43 @@ class VcsRouteTest(unittest.TestCase):
         self.assertNotEqual(HTTPStatus.FORBIDDEN, status)
         self.assertNotEqual("REPOSITORY_NOT_MANAGED", payload.get("code"))
 
-    def test_a_credentialed_read_of_an_unmanaged_repository_is_refused_by_the_credential(self):
-        # Review finding: the comment and the test above used to say reads
-        # "stay open". On the shipped forge they do not: every verb that spends
-        # the credential makes it current first, the refresh is where the
-        # managed list is asked (the token is minted per managed repository),
-        # and `BrokeredCredential.ensure` re-raises exactly that refusal. So a
-        # read of an unmanaged repository is a 403 from the credential side,
-        # before any forge call, and this pins that rather than the wish.
-        def refuse(provider, repository):
-            raise PermissionError(f"{repository} is not a repository this install manages")
-
+    def test_a_read_of_an_unmanaged_repository_is_refused_at_the_route(self):
+        # The gate used to cover writes only, and reads were refused because
+        # the one shipped credential happened to ask the managed list while
+        # refreshing. A credential that does not refresh -- a static token,
+        # scoped to a whole group -- would have spent itself on any repository
+        # in that group. The route asks now, before the credential is touched.
+        refreshed = []
         with mock.patch.object(
             credential_proxy, "managed_repositories",
-            return_value=frozenset({"acme/managed"}),
+            return_value=frozenset({"github:github.com/acme/managed"}),
         ):
-            status, payload = self._handler(
-                "/v1/vcs/issue-view",
-                {"repository": "https://github.com/acme/not-ours", "number": 1},
-                self.broker(refresh=refuse),
-            )
-        self.assertEqual(HTTPStatus.FORBIDDEN, status)
-        self.assertEqual("REPOSITORY_NOT_MANAGED", payload.get("code"))
+            for verb, extra in (
+                ("issue-view", {"number": 1}),
+                ("proposal-list", {}),
+                ("clone", {}),
+                ("identity", {}),
+            ):
+                with self.subTest(verb=verb):
+                    status, payload = self._handler(
+                        f"/v1/vcs/{verb}",
+                        {"repository": "https://github.com/acme/not-ours", **extra},
+                        self.broker(refresh=lambda provider, repository: refreshed.append(repository)),
+                    )
+                    self.assertEqual(HTTPStatus.FORBIDDEN, status)
+                    self.assertEqual("REPOSITORY_NOT_MANAGED", payload.get("code"))
+        self.assertEqual([], refreshed)
 
     def test_every_write_verb_is_covered_by_the_gate(self):
         # Named against the route table rather than a hand-written list, so a
         # verb added to the broker and not classified fails here instead of
-        # shipping ungated. `capabilities` and `clone` are reads; the rest of
-        # the split is asserted by name.
+        # shipping ungated. Only `capabilities` passes the route ungated; the
+        # read/write split is still asserted by name, because a write is what
+        # the gate exists for.
         routes = set(vcs_broker.route_table(self.broker()))
         self.assertTrue(vcs_broker.WRITE_VERBS <= routes)
+        self.assertEqual({"capabilities"}, set(vcs_broker.UNGATED_VERBS))
+        self.assertFalse(vcs_broker.UNGATED_VERBS & vcs_broker.WRITE_VERBS)
         unclassified = routes - vcs_broker.WRITE_VERBS
         self.assertEqual(
             {"capabilities", "clone", "identity", "proposal-list", "proposal-view",
@@ -6965,7 +6976,7 @@ class VcsRouteTest(unittest.TestCase):
         broker.publish = refuse
         with mock.patch.object(
             credential_proxy, "managed_repositories",
-            return_value=frozenset({"acme/infra"}),
+            return_value=frozenset({"github:github.com/acme/infra"}),
         ):
             status, payload = self._handler(
                 "/v1/vcs/publish",
@@ -7000,7 +7011,9 @@ class VcsRouteTest(unittest.TestCase):
             raise subprocess.CalledProcessError(128, ["git", "clone"], "", secret)
 
         broker = self.broker(git_runner=explode)
-        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs, mock.patch.object(
+            credential_proxy, "managed_repositories", return_value=frozenset({"github:github.com/acme/infra"})
+        ):
             status, payload = self._handler(
                 "/v1/vcs/clone", {"repository": "acme/infra"}, broker
             )
@@ -7016,7 +7029,9 @@ class VcsRouteTest(unittest.TestCase):
             raise ZeroDivisionError("/etc/broker/private-key.pem line 3")
 
         broker = self.broker(git_runner=explode)
-        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"), mock.patch.object(
+            credential_proxy, "managed_repositories", return_value=frozenset({"github:github.com/acme/infra"})
+        ):
             status, payload = self._handler(
                 "/v1/vcs/clone", {"repository": "acme/infra"}, broker
             )
@@ -8312,6 +8327,62 @@ class ManagedRepositoryGateTest(unittest.TestCase):
         handler._json = lambda status, payload: handler.replies.append((status, payload))
         return handler
 
+    def test_a_registration_on_one_forge_does_not_admit_the_same_path_on_another(self):
+        # Two forges can each have an `acme/infra`; the key carries the
+        # provider and the host.
+        github = mock.Mock(hosts=("github.com",))
+        github.name = "github"
+        other = mock.Mock(hosts=("git.example.test",))
+        other.name = "gitlab"
+        with mock.patch.object(
+            credential_proxy, "managed_repositories",
+            return_value=frozenset({"github:github.com/acme/infra"}),
+        ):
+            self.assertTrue(credential_proxy.repository_is_managed("acme/infra", github))
+            self.assertFalse(credential_proxy.repository_is_managed("acme/infra", other))
+
+    def test_an_entry_typed_for_another_provider_admits_nothing_on_this_one(self):
+        # Review finding: keyed by host alone, a `managed_repos` entry typed
+        # `GitHub` or `gitlab` but naming github.com passed the gate, and the
+        # refresh minted a write token for it. Only `type: github` ever counted.
+        import gitops_workspace
+
+        github = mock.Mock(hosts=("github.com",))
+        github.name = "github"
+        entries = [
+            {"type": "GitHub", "url": "https://github.com/acme/secret"},
+            {"type": "gitlab", "url": "https://github.com/acme/other"},
+        ]
+        with mock.patch.object(gitops_workspace, "get_managed_repo_entries", return_value=entries), \
+                mock.patch.object(credential_proxy, "_managed_repository_cache", None):
+            self.assertFalse(credential_proxy.repository_is_managed("acme/secret", github))
+            self.assertFalse(credential_proxy.repository_is_managed("acme/other", github))
+
+    def test_a_provider_this_install_did_not_build_is_refused_not_defaulted(self):
+        # Review finding: an unknown provider used to fall back to the one
+        # forge's list.
+        executor = CommandExecutor.__new__(CommandExecutor)
+        with mock.patch.object(executor, "_forge_helper", return_value="/x"), \
+                mock.patch.object(
+                    credential_proxy, "managed_repositories",
+                    return_value=frozenset({"github:github.com/acme/infra"}),
+                ):
+            with self.assertRaises(PermissionError):
+                executor.refresh_forge_credential("gitlab", "acme/infra")
+
+    def test_a_bare_path_with_no_one_forge_to_mean_is_refused_as_unreadable(self):
+        handler = self._handler()
+        registry = mock.Mock(default=None)
+        with mock.patch.object(credential_proxy, "forge_registry", return_value=registry), \
+                mock.patch.object(
+                    credential_proxy, "managed_repositories",
+                    return_value=frozenset({"github:github.com/acme/infra"}),
+                ), self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            self.assertFalse(handler._repository_is_permitted("acme/infra"))
+        status, payload = handler.replies[0]
+        self.assertEqual(HTTPStatus.SERVICE_UNAVAILABLE, status)
+        self.assertEqual("MANAGED_REPOSITORIES_UNAVAILABLE", payload["code"])
+
     def test_a_managed_repository_passes_silently(self):
         handler = self._handler()
         with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
@@ -8342,7 +8413,7 @@ class ManagedRepositoryGateTest(unittest.TestCase):
 
     def test_the_comparison_ignores_case(self):
         with mock.patch.object(
-            credential_proxy, "managed_repositories", return_value=frozenset({"gke-labs/kube-agents"})
+            credential_proxy, "managed_repositories", return_value=frozenset({"github:github.com/gke-labs/kube-agents"})
         ):
             self.assertTrue(credential_proxy.repository_is_managed("GKE-Labs/Kube-Agents"))
             self.assertFalse(credential_proxy.repository_is_managed("gke-labs/other"))
@@ -9807,10 +9878,10 @@ class RepositoryRoleTest(unittest.TestCase):
     def _lists(self, managed=(), context=()):
         stack = contextlib.ExitStack()
         stack.enter_context(
-            mock.patch("gitops_workspace.get_managed_github_repos", return_value=list(managed))
+            mock.patch("gitops_workspace.get_managed_repo_keys", return_value=[f"github:github.com/{r}".lower() for r in managed])
         )
         stack.enter_context(
-            mock.patch("gitops_workspace.get_context_github_repos", return_value=list(context))
+            mock.patch("gitops_workspace.get_context_repo_keys", return_value=[f"github:github.com/{r}".lower() for r in context])
         )
         return stack
 
@@ -9822,9 +9893,9 @@ class RepositoryRoleTest(unittest.TestCase):
             self.assertEqual("unregistered", credential_proxy.repository_role("someone/else"))
 
     def test_an_unreadable_context_list_raises_rather_than_answering(self):
-        with mock.patch("gitops_workspace.get_managed_github_repos", return_value=[]):
+        with mock.patch("gitops_workspace.get_managed_repo_keys", return_value=[]):
             with mock.patch(
-                "gitops_workspace.get_context_github_repos",
+                "gitops_workspace.get_context_repo_keys",
                 side_effect=RuntimeError("kubectl exited 1"),
             ):
                 with self.assertRaises(RuntimeError):
@@ -9969,7 +10040,8 @@ class ReadCredentialMintTest(unittest.TestCase):
 
     def test_an_absent_helper_is_a_refusal(self):
         executor = self._executor()
-        with mock.patch.object(credential_proxy, "repository_role", return_value="context"):
+        with mock.patch.object(credential_proxy, "repository_role", return_value="context"), \
+                mock.patch.object(credential_proxy, "_provider_forge"):
             with self.assertRaises(RuntimeError):
                 executor.mint_read_credential("gitlab", "acme/tf-live")
         self.assertEqual([], executor.calls)
@@ -9981,6 +10053,18 @@ class ReadCredentialSelectionTest(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
+
+    def test_a_name_that_resolves_to_no_forge_is_not_logged_as_unreadable_lists(self):
+        # Review finding: a resolution refusal was logged as "the repository
+        # lists could not be read", sending an operator to the ConfigMap.
+        registry = mock.Mock()
+        registry.resolve.side_effect = providers.ForgeUnsupported("names no host")
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            credential = credential_proxy.read_credential_for(registry, "acme/infra")
+        self.assertIsInstance(credential, providers.NoCredential)
+        joined = "\n".join(logs.output)
+        self.assertIn("does not resolve to a forge", joined)
+        self.assertNotIn("could not be read", joined)
 
     def test_only_a_context_repository_gets_a_credential(self):
         registry = providers.Registry({"mint": lambda provider, repo: "token"})

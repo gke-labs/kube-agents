@@ -1,5 +1,6 @@
 import email.message
 import io
+import json
 import os
 import socket
 import subprocess
@@ -192,7 +193,13 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         run.assert_not_called()
         request = urlopen.call_args.args[0]
         self.assertEqual(
-            "http://127.0.0.1:8765/v1/github/refresh", request.full_url
+            "http://127.0.0.1:8765/v1/forge/refresh", request.full_url
+        )
+        # Named with its host and provider: a broker serving more than one
+        # forge refuses a bare owner/name.
+        self.assertEqual(
+            {"provider": "github", "repository": "https://github.com/owner/repository"},
+            json.loads(request.data),
         )
 
     @patch("github_token_refresh.wif_credentials.fetch_identity_token")
@@ -362,7 +369,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
     def test_sandbox_fails_immediately_on_sidecar_502(self, urlopen, sleep):
         # The sidecar has already executed retries internally; client fails fast
         err_502 = urllib.error.HTTPError(
-            "http://127.0.0.1:8765/v1/github/refresh",
+            "http://127.0.0.1:8765/v1/forge/refresh",
             502,
             "Bad Gateway",
             email.message.Message(),
@@ -406,7 +413,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
     @patch("github_token_refresh.urllib.request.urlopen")
     def test_sandbox_fails_immediately_on_4xx_without_retry(self, urlopen, sleep):
         err_403 = urllib.error.HTTPError(
-            "http://127.0.0.1:8765/v1/github/refresh",
+            "http://127.0.0.1:8765/v1/forge/refresh",
             403,
             "Forbidden",
             email.message.Message(),

@@ -22,7 +22,7 @@ With the flag on, :func:`register` adds two listeners:
   whole line the message itself shows ("Fix the first one: <the first row>",
   markup and a row's severity aside) is the turn, so a session that never
   read the message is told what the click is about. Part of a line is not
-  enough: it can say the opposite of the line it came from. The answered line (or its echo) still shows the label. A
+  enough: it can say the opposite of the line it came from. The answered line still shows the label. A
   label that starts like a command (``/`` or ``!``) is sent as text, since a
   choice is an answer. The click goes through the adapter's own interactive
   authorization; an unlisted user's click is logged and changes nothing, and
@@ -30,11 +30,12 @@ With the flag on, :func:`register` adds two listeners:
   ``allowed_channels`` gates channels and group DMs, never a 1:1 DM, which
   only ``disable_dms`` gates, as upstream's message handler does.
   Then the message is rewritten with the choice buttons replaced by
-  a line naming who chose what (the same line goes above the message's text,
-  which is kept: an incident report is in that text and nowhere a later read
-  of the thread looks); only when Slack refuses that rewrite is a short echo
-  ("↳ @user: label") posted in the thread instead, since a bot token cannot
-  post as the user. The label is then offered as the thread's first ask, so
+  a line naming who chose what ("✓ <name>: label", by the clicker's display
+  name, then real name, then handle, never a mention or an id; the same line goes above the
+  message's text, which is kept: an incident report is in that text and
+  nowhere a later read of the thread looks); only when Slack refuses that
+  rewrite is the same line posted in the thread instead, since a bot token
+  cannot post as the user. The label is then offered as the thread's first ask, so
   a session titled from the click reads as the label. The label is fed
   to the adapter's message handler as that user's message in that thread, the
   path a reaction trigger already takes. That path applies the channel and user checks a typed message gets, so a click
@@ -90,7 +91,7 @@ test is the exception: the adapter makes it before any other, so one that
 raises took no turn and that reply does not count. Other choice buttons are
 not checked.
 
-A click that runs is fail-soft: a rewrite, or the echo standing in for it, that fails is logged and the
+A click that runs is fail-soft: a rewrite, or the answered line posted in its place, that fails is logged and the
 turn still runs, because the click was the user's answer. A click dropped for a
 typed apply runs no turn, whether or not its rewrite lands.
 """
@@ -120,10 +121,11 @@ FLAG_ON_VALUES = frozenset({"1", "true", "yes", "on"})
 #: What the adapter's authorization log calls each kind of click.
 CHOICE_KIND = "kage choice"
 
-#: The line that replaces the answered buttons, and the echo posted in the
-#: thread instead when that rewrite fails, so a click always shows once.
-ECHO = "↳ <@{user}>: {label}"
-ANSWERED = "✓ <@{user}>: {label}"
+#: The line that replaces the answered buttons, posted in the thread instead
+#: when that rewrite fails, so a click always shows once; naming the clicker as plain text.
+CLICKED = "✓ {name}: {label}"
+#: The clicker when Slack names them nowhere: never their raw id.
+NAMELESS_CLICKER = "Someone"
 
 #: Joins a label to the shown line its value names.
 TURN_JOIN = ": "
@@ -231,6 +233,8 @@ MESSAGE_BLOCKS_MAX = 50
 _answered: OrderedDict[tuple, None] = OrderedDict()
 #: The keys of ``_answered`` whose rewrite landed.
 _rewritten: OrderedDict[tuple, None] = OrderedDict()
+#: The keys of ``_answered`` whose rewrite failed; one in neither is still rewriting.
+_unrewritten: OrderedDict[tuple, None] = OrderedDict()
 _warned_missing = False
 
 
@@ -276,6 +280,17 @@ def answered(channel_id: str, msg_ts: str) -> bool:
     return (str(channel_id), str(msg_ts), CHOICE_KIND) in _rewritten
 
 
+def clicked(channel_id: str, msg_ts: str) -> bool:
+    """Whether a choice click in this process answered the message, whether or not its rewrite landed."""
+    return (str(channel_id), str(msg_ts), CHOICE_KIND) in _answered
+
+
+def rewriting(channel_id: str, msg_ts: str) -> bool:
+    """Whether a choice click answered the message and its rewrite has neither landed nor failed yet."""
+    key = (str(channel_id), str(msg_ts), CHOICE_KIND)
+    return key in _answered and key not in _rewritten and key not in _unrewritten
+
+
 def _answered_by(other: str) -> bool:
     """Whether ``other`` is one of the buttons a choice click answers: every choice."""
     return bool(_presenter.CHOICE_ACTION_ID_PATTERN.search(other))
@@ -304,6 +319,25 @@ def answered_blocks(blocks: Any, answered: Any, note: str) -> list[dict]:
         out.append(_clamped(block) if isinstance(block, dict) else block)
     note_text = {"type": "mrkdwn", "text": note}
     return out[: MESSAGE_BLOCKS_MAX - 1] + [{"type": "context", "elements": [_clamped_text(note_text)]}]
+
+
+async def clicker_name(adapter: Any, body: dict, user_id: str, channel_id: str, team_id: str) -> str:
+    """The clicker's name as an answered line shows it, escaped: never a mention or their id.
+
+    The adapter's ``_resolve_user_name`` reads ``users.info`` once per user and
+    caches the answer, preferring the display name, then the real name, then the
+    handle. It answers with the id when the call fails, so the click's own
+    handle stands in then.
+    """
+    try:
+        name = str(await adapter._resolve_user_name(user_id, chat_id=channel_id, team_id=team_id) or "").strip()
+    except Exception as exc:  # noqa: BLE001 — the click still answers
+        logger.debug("slack_ux_clicks: could not name %s: %s", user_id, exc)
+        name = ""
+    if not name or name == user_id:
+        user = body.get("user") or {}
+        name = str(user.get("username") or user.get("name") or "").strip()
+    return _presenter._escape(name) if name and name != user_id else NAMELESS_CLICKER
 
 
 def _clamped_text(obj: Any) -> Any:
@@ -675,9 +709,9 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
         return
 
     shown = _presenter._escape(label)
-    note = ANSWERED.format(user=user_id, label=shown)
-    # Before the awaits: a card that moves on in between settles its question and forgets it.
+    # Before the name lookup and the rewrite: a card that moves on during either settles its question and forgets it.
     card = _question_card(channel_id, msg_ts)
+    note = CLICKED.format(name=await clicker_name(adapter, body, user_id, channel_id, team_id), label=shown)
     rewritten = False
     try:
         await client.chat_update(
@@ -695,13 +729,17 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
             "slack_ux_clicks: could not mark %s answered; its buttons stay but further clicks are dropped: %s",
             msg_ts, exc,
         )
+        if key in _answered:
+            _unrewritten[key] = None
+            while len(_unrewritten) > ANSWERED_MAX:
+                _unrewritten.popitem(last=False)
     if not rewritten:
         try:
             await client.chat_postMessage(
-                channel=channel_id, thread_ts=thread_ts, text=ECHO.format(user=user_id, label=shown),
+                channel=channel_id, thread_ts=thread_ts, text=note,
             )
         except Exception as exc:  # noqa: BLE001 — the click still answers
-            logger.warning("slack_ux_clicks: could not echo the click on %s: %s", msg_ts, exc)
+            logger.warning("slack_ux_clicks: could not post the answered line for %s: %s", msg_ts, exc)
     await _title_from_label(adapter, channel_id, team_id, thread_ts, label)
 
     synthetic = {
@@ -710,7 +748,7 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
         "text": _turn_text(_turn(label, value, message), card),
         "channel": channel_id,
         # The click's own ts keeps the deduplicator from conflating this turn
-        # with the echo or the clicked message, as a reaction trigger's does.
+        # with the answered line or the clicked message, as a reaction trigger's does.
         "ts": str(action.get("action_ts") or FALLBACK_TS.format(ts=msg_ts, action=action_id, user=user_id)),
         "thread_ts": thread_ts,
         # Skips the mention requirement only; channel and user checks still apply.

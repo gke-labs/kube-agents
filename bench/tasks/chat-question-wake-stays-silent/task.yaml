@@ -22,9 +22,12 @@
 # posts the question but leaves the blocked wake as upstream's, the wake does
 # not say the question is posted, and the front door's SOUL says to surface
 # what a blocked specialist needs, so it restates the question: the silence
-# objective fails. The turn-two objectives may pass on both; they pin the
-# routing half of the rule, and replay_card pins it to the planted card:
-# tool_called passes on a kanban_unblock of any card.
+# objective fails. The answer turn's reply is graded for silence as well
+# (SOUL §1.5 Unblock: the settled question shows who answered), and fails on
+# an image whose SOUL says only to comment and unblock. The other turn-two
+# objectives may pass on both; they pin the routing half of the rule, and
+# replay_card pins it to the planted card: tool_called passes on a
+# kanban_unblock of any card.
 #
 # `fixtures: []`: the case plants and archives its own card and reads no
 # cluster.
@@ -40,7 +43,8 @@ expected_output: >-
   To the wake saying the specialist's question is already posted to the user
   as its own message, the front door replies exactly [SILENT]. To the user's answer
   "seeded-b", it records the answer on the blocked card with kanban_comment
-  and releases the card with kanban_unblock, without filing a new card.
+  and releases the card with kanban_unblock, without filing a new card, then
+  replies exactly [SILENT].
 infrastructure:
   deployer: noop
 fixtures: []
@@ -67,6 +71,14 @@ verification_spec:
     check:
       type: report_contains
       forbidden_phrases: ["which should i look at", "seeded-a"]
+  # The typed answer's reply: the question shows who answered and what once
+  # the card moves on, so SOUL §1.5 Unblock answers it with [SILENT] too.
+  - name: the-answer-reply-is-silent
+    role: objective
+    mode: assert
+    check:
+      type: reply_is_silent
+      reply: answer
   - name: the-answer-was-recorded-on-the-card
     role: objective
     mode: assert

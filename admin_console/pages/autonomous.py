@@ -153,7 +153,7 @@ def render_execution_groups(groups: tuple[CronExecutionGroup, ...]) -> None:
           padding-left: 18px;
         }
         .ka-cron-history li { margin: 7px 0; }
-        .ka-cron-error { color: #ff8b96; font-size: .78rem; margin-top: 2px; }
+        .ka-cron-error { color: var(--ka-error-text); font-size: .78rem; margin-top: 2px; }
         </style>
         <div class="ka-cron-table-wrap">
           <table class="ka-cron-table">
@@ -340,22 +340,22 @@ def render_calendar(
         """
         <style>
         .ka-calendar { border-collapse: separate; border-spacing: 6px; width: 100%; }
-        .ka-calendar th { color: #8fa1bd; font-size: .75rem; padding: 4px; }
+        .ka-calendar th { color: var(--ka-muted); font-size: .75rem; padding: 4px; }
         .ka-calendar td {
-          background: rgba(21,31,50,.75); border: 1px solid #26344c;
+          background: var(--ka-cell-bg); border: 1px solid var(--ka-border);
           border-radius: 10px; height: 105px; padding: 7px; vertical-align: top;
           width: 14.285%;
         }
         .ka-calendar td.ka-outside { opacity: .3; }
-        .ka-calendar-day { color: #8fa1bd; font-size: .72rem; margin-bottom: 5px; }
+        .ka-calendar-day { color: var(--ka-muted); font-size: .72rem; margin-bottom: 5px; }
         .ka-calendar-event {
-          border-left: 3px solid #7c9cff; font-size: .68rem; line-height: 1.25;
+          border-left: 3px solid var(--ka-accent); font-size: .68rem; line-height: 1.25;
           margin: 4px 0; padding-left: 5px;
         }
-        .ka-calendar-event.success { border-color: #2ed3b7; }
-        .ka-calendar-event.failed, .ka-calendar-event.overdue { border-color: #ff6b7a; }
-        .ka-calendar-event.upcoming { border-color: #b58cff; }
-        .ka-calendar-event.unavailable { border-color: #ffb454; }
+        .ka-calendar-event.success { border-color: var(--ka-success); }
+        .ka-calendar-event.failed, .ka-calendar-event.overdue { border-color: var(--ka-danger); }
+        .ka-calendar-event.upcoming { border-color: var(--ka-violet); }
+        .ka-calendar-event.unavailable { border-color: var(--ka-warning); }
         </style>
         """,
         unsafe_allow_html=True,

@@ -354,7 +354,7 @@ Agents with a user in the loop follow this file.
 three repetitions each — and has blocked merges since 2026-09-02 (oss-test-infra#2677). It takes
 1.5 to 3.5 hours against a 360-minute ceiling, and a push restarts it unless only inert paths
 changed (step 0), so open the pull request early and batch changes. Another pull request merging
-usually does not — the green status is re-pinned to `main`'s new head.
+does not: a retest Tide starts because `main` moved reuses the head's green in minutes.
 
 Two things red it. A case on the `BOOTSTRAP_ADMITTED` roster in `hack/ci-eval-pr.sh` fails **all**
 of its repetitions — one failed repetition out of three does nothing on its own. Or any case,
