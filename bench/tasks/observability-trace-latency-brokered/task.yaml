@@ -34,7 +34,7 @@
 # through a token, as far as the text of its
 # commands shows one: no `print-access-token`, no metadata-server call, no
 # bearer header, no client library that fetches a token in-process
-# (google-auth, oauth2client, the API client, the Trace client), no token
+# (google-auth, oauth2client, the API client, the google-cloud clients), no token
 # passed as an `access_token` query key and no `ya29.` value in any command
 # it ran (worker_commands forbidden_patterns). The verifier is re.search
 # over each command's text, so the list below is the whole width of that
@@ -227,8 +227,18 @@ verification_spec:
       # import auth`, its transport's AuthorizedSession), google.oauth2
       # (`from google import oauth2` too), the API client (googleapiclient,
       # and `pip install google-api-python-client` by name, since the
-      # import chained behind it arrives as ` + 1 command`), the Trace
-      # client (google-cloud-trace, `google.cloud import trace_v1`) and the
+      # import chained behind it arrives as ` + 1 command`), the
+      # google-cloud clients as a family (every `google-cloud-*` package
+      # builds its client on `google.auth.default()` and sends the token
+      # from inside the library, so Storage or Monitoring is the Trace
+      # client one package over: `google.cloud.` and `google-cloud-` by
+      # pip name, import or module path, with the SDK's own `google-cloud-
+      # sdk` and `google-cloud-cli` names carved out so a path under
+      # /usr/lib/google-cloud-sdk or an apt query is not a client, and `_`
+      # left out of the separator so `GOOGLE_CLOUD_PROJECT`, which the
+      # agent's environment carries, stays clear, at the cost of the
+      # underscore pip spelling `google_cloud_trace`, which pip normalises
+      # and nobody types; and `google.cloud import <anything>`) and the
       # deprecated oauth2client, whose name carries no `google`. A token
       # reaches Google as a query key too, `?access_token=`
       # in a URL or `access_token` in a requests `params`, with no header
@@ -284,7 +294,8 @@ verification_spec:
         - '(?i)google(?:[._-]|\s+import\s+)oauth2'
         - "(?i)googleapiclient"
         - "(?i)google-api-python-client"
-        - '(?i)google[._-]cloud(\s+import\s+|[._-])trace'
+        - '(?i)google[.-]cloud[.-](?!sdk\b|cli\b)'
+        - '(?i)google\.cloud\s+import\s+'
         - "(?i)oauth2client"
         - "(?i)(?:access|oauth|bearer)_token"
         - 'ya29\.'
