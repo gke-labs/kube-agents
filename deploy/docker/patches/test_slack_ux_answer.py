@@ -215,6 +215,10 @@ class SplitTest(unittest.TestCase):
             "a bold label and a dash": "**Memory check** \u2014 no node is under pressure. All 3 checked.",
             "a colon inside the bold": "**Memory check:** no node is under pressure. All 3 checked.",
             "a one-word label, colon inside": "**No:** no node is under pressure. All 3 checked.",
+            "a colon intro over a list": "Here are the 3 pods in `default`:\n- web-1\n- web-2\n- web-3",
+            "a colon intro over a numbered list": "Here's what I found:\n\n1. web-1 restarted.\n2. web-2 is Pending.",
+            "a colon intro over a table": "The node pools:\n| pool | nodes |\n| --- | --- |",
+            "a colon intro over code": "Run this:\n```\nkubectl get pods\n```",
             "an overlong sentence": ("word " * 40).strip() + ". Then more.",
             "a single sentence": "Checkout is healthy.",
             "nothing": "",
@@ -223,6 +227,14 @@ class SplitTest(unittest.TestCase):
             with self.subTest(what), self.assertLogs(runtime.logger) as logs:
                 self.assertIsNone(runtime.split(answer))
             self.assertIn("fold is refused", logs.output[0])
+
+    def test_a_colon_inside_the_first_sentence_still_folds(self):
+        answers = {
+            "mid-sentence": ("Two pods restarted: web-1 and web-2.", "- web-1 at 09:58Z\n- web-2 at 10:02Z"),
+        }
+        for what, (lead, rest) in answers.items():
+            with self.subTest(what):
+                self.assertEqual(runtime.split(f"{lead}\n{rest}"), ([(lead, False)], rest))
 
     def test_an_answer_past_the_fold_limit_is_refused(self):
         long = HEADLINE + " " + "x" * runtime.FOLD_TEXT_MAX
@@ -419,6 +431,14 @@ class SendTest(unittest.TestCase):
         with self.assertLogs(runtime.logger):
             self.send(adapter, content="Checkout is healthy.")
         self.assertEqual(adapter.log, [("send", CHANNEL, "Checkout is healthy.", METADATA)])
+
+    def test_a_colon_intro_over_a_list_takes_the_upstream_send(self):
+        adapter = _Adapter()
+        answer = "Here's what I found:\n- web-1 restarted twice.\n- web-2 is Pending."
+        with self.assertLogs(runtime.logger) as logs:
+            self.send(adapter, content=answer)
+        self.assertEqual(adapter.log, [("send", CHANNEL, answer, METADATA)])
+        self.assertIn("colon", logs.output[0])
 
     def test_a_table_in_the_rest_takes_the_upstream_send(self):
         adapter = _Adapter()

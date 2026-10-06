@@ -27,7 +27,8 @@ plain text with its code spans kept as code, so an answer it cannot carry whole
 keeps the upstream post: one whose first line is a heading, a list item, a
 code fence, a quote or a table row, one opening on a bold label, or whose first sentence is longer than ``HEADLINE_MAX``, runs onto
 a second line, or holds a link or a mention. So does one with nothing after
-that sentence, one longer than :data:`FOLD_TEXT_MAX`, a
+that sentence, one whose first line ends in a colon over a list, a table, a
+quote or code (the list is the answer), one longer than :data:`FOLD_TEXT_MAX`, a
 fold ``block_kit`` cannot render or that would hold a block outside
 :data:`FOLD_CHILD_TYPES` (a table or a divider), and an adapter not rendering
 ``rich_blocks``, since upstream would then post text alone. A refused fold
@@ -188,6 +189,10 @@ def split(answer: str) -> tuple[list[tuple[str, bool]], str] | None:
     rest = "\n".join(part for part in (tail, after) if part).strip()
     if not rest:
         return _refuse("nothing follows the first sentence")
+    # "Here's what I found:" over a list is no headline: the list is the answer, so it posts as written.
+    text, code = headline[-1]
+    if not code and text.rstrip().endswith(":") and _not_prose(rest.partition("\n")[0]):
+        return _refuse("the first line ends in a colon and introduces a list, a table, a quote or code")
     # The reopened marker leads whatever the rest is, a wrapped run's second line included.
     return headline, reopen + rest
 
