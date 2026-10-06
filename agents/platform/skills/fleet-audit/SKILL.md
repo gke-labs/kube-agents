@@ -255,7 +255,7 @@ and the issue has no readable block (`start` says so on stderr).
 
 `context_repos` names the repositories registered for **declared intent**: the `context_repos` key
 of `$GITOPS_STATE_CONFIGMAP`, added by an administrator by hand, as `owner/name` slugs. A stream
-whose SOP has a declared-intent step (today `obtainability-audit`, §4a) searches them before it
+whose SOP has a declared-intent step (`obtainability-audit` §4a, `compliance-audit` §3a, `security-patch-orchestrator` §4a) searches them before it
 reports a posture as a finding. They are read and nothing else: the key is separate from
 `managed_repos`, the harness never merges the two, so the broker's push gate, the repository
 resolver and the sweep never see them. The list is empty when nothing is registered or the key
@@ -600,9 +600,9 @@ and say which clusters were not covered. See [The clean run](#the-clean-run) for
 ```
 
 (The `declared` entry and the `declared_intent_searched` list are illustrative and cross streams: a
-real compliance document would be rejected for carrying either. `declared[].check` is validated
+real compliance document would be rejected for the `no-hpa` entry, a check outside its roster. `declared[].check` is validated
 against the stream's `declarable` set in `AUDITS` — its posture checks, a subset of the roster — and
-only `obtainability-audit` has one today, because only its SOP has a step that writes the list. A
+`obtainability-audit`, `compliance-audit` and `security-patch-orchestrator` have one today, because their SOPs have a step that writes the list. A
 non-empty `declared` or `declared_intent_searched` on any other stream exits 2; `[]` validates
 everywhere.)
 
@@ -800,14 +800,15 @@ an optional `cluster`, `object` as `Kind/name` — within the paths each reposit
 case-blind lookup on `(check, cluster, namespace, object)`, then on the fleet-wide
 `(check, namespace, object)`, compared as the finding id is (`deployment/api` joins `Deployment/api`),
 the finding's `cluster` and `title` kept and the note's `repo`, `path` and title as the declaration.
-For `hpa-cannot-scale`, the one slug that names both a posture and a fault, the join moves only the
-`min == max` shape, read off the severity the SOP fixes for it (`major`); a declaration matching the
-`minor` dangling-target fault is reported on stderr and not applied.
+Two slugs name both a posture and a fault, and the join moves only the posture: for
+`hpa-cannot-scale` the `min == max` shape, read off the severity the SOP fixes for it (`major`); for
+`netpol-missing` the `Namespace/<ns>` shape. A declaration matching the `minor` dangling-target fault
+or an allow-all `NetworkPolicy/<name>` is reported on stderr and not applied.
 The worker's half is the `provisioning/` pins HCL and YAML make in the GitOps clone, which have no
 machine-readable form yet; a match there is moved here by the worker with the lines that pin the
 property as `excerpt`. A posture a `declares:` note covers is written to `findings` like any other
-and the join moves it; a candidate the worker leaves out because it found the note itself gives the
-join nothing to move, and the declaration never reaches the ledger.
+and the join moves it; a candidate the worker leaves out because it found the note itself is
+declared by `finish` from the collector's manifest when a note covers it, and logged as such.
 
 What the shape enforces:
 
@@ -821,7 +822,7 @@ What the shape enforces:
   the posture returns as a finding on the next run. A declaration the worker did not read is not
   one it may cite.
 - **It justifies posture, never a fault.** Which checks may move here is the stream's `declarable`
-  set in `AUDITS`, four for the pilot, and the validator rejects any other check with exit 2. A
+  set in `AUDITS`, four for obtainability, two for compliance and six for the patch stream, and the validator rejects any other check with exit 2. A
   drain-blocking budget declared in a repository is a declared bug and stays a finding, and a
   document that lists it under `declared` publishes nothing.
 
@@ -849,12 +850,14 @@ What `finish` does with it:
   `declared_intent_searched`.
 - **It is owed whenever a declarable check ran.** Keyed on `checks_run`, not on the postures in
   `findings`, for the reason above: a candidate left out without a search reads exactly like one a
-  declaration covered. A run on which none of the four checks ran anywhere owes nothing.
+  declaration covered. A run on which none of the stream's declarable checks ran anywhere owes nothing.
 - **Anything less is no search, and the postures are withheld.** A union of the worker's list and
   `start`'s that misses a repository, or no run record: `finish` — real and `--dry-run` — takes every finding whose check is
   declarable out of the document, the dangling-target `hpa-cannot-scale` fault included because it
-  shares its slug with the `min == max` posture, and adds one `coverage_gaps` sentence naming each
-  withheld entry and the repositories not searched. The faults publish; `declared[]` entries publish.
+  shares its slug with the `min == max` posture and nothing on this side tells them apart, and adds
+  one `coverage_gaps` sentence naming each withheld entry and the repositories not searched. The
+  faults publish, the allow-all `NetworkPolicy/<name>` shape of `netpol-missing` among them, since its
+  object tells it apart; `declared[]` entries publish.
   `partial` stays `bool(coverage_gaps)`, so the ledger does not close, `resolved` is `0`, no stale
   pull request is retired, and the withheld ids enter no delta block and no remediation pull
   request. The ledger names the withheld postures under _Declared intent not searched_ below the
@@ -921,7 +924,10 @@ Every row above says "reproduces", and that is not an accident: **a finding that
 is not in the document at all**, so it has no row in the ledger to carry a state. Two further states
 exist in the code — `resolved` and `resolved-merged` — but neither is ever rendered here. A
 resolution is announced in the delta comment, by id and title recovered from the previous run's stored report, and
-the finding's open pull request is closed as stale. A resolution whose fix had already **merged** is
+the finding's open pull request is closed as stale. The compliance stream has a third close: a pull
+request whose remaining findings are all shielded (SOP 2.7, a declared workload sharing the `default`
+ServiceAccount) is closed with that reason, and those findings stay on the ledger as `manual` rather
+than becoming promotable again. A resolution whose fix had already **merged** is
 the ordinary, expected ending, so nothing extra is closed and nothing extra is said.
 
 Three of the five are easy to misread:

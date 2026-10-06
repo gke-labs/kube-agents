@@ -14,7 +14,7 @@ gitops-repo/
 ├── fleet/                         # project-level policy; platform-tier Agent CR + identity
 ├── knowledge/                     # OKF base (§5) — never applied to a cluster
 ├── policy/                        # admission policies (ValidatingAdmissionPolicy; Gatekeeper/Kyverno)
-├── .kube-agents/intent.yaml       # where the obtainability audit looks for declared-intent notes
+├── .kube-agents/intent.yaml       # where the declaring audits look for declared-intent notes
 └── .github/workflows/             # the actuation pipeline config (customer's CI/CD)
 ```
 
@@ -31,13 +31,21 @@ gitops-repo/
   (next bullet); a declaration is a reviewed change, not a comment. `.kube-agents/` is in it
   because `intent.yaml` decides which paths' notes can do that, and removing the file opens the
   whole repository to them, so the bound carries the same review as the notes it bounds.
-- **Declared intent:** the `obtainability-audit` stream reads `clusters/<cluster>/provisioning/`
-  and `knowledge/` before it reports a fixed replica count, a pinned HPA or a missing
-  PodDisruptionBudget as a finding (`agents/platform/governance/obtainability_audit_sop.md` §4a).
+- **Declared intent:** the declaring audit streams read `knowledge/` — and the obtainability
+  stream `clusters/<cluster>/provisioning/` as well — before they report a posture an owner may
+  have chosen: a fixed replica count,
+  a pinned HPA or a missing PodDisruptionBudget (`agents/platform/governance/obtainability_audit_sop.md` §4a),
+  a namespace with no NetworkPolicy or a workload on the default ServiceAccount's token
+  (`compliance_audit_sop.md` §3a, object `Namespace/<ns>` or the workload's `Kind/name`),
+  a cluster off its release channel, without a maintenance window or upgrade notifications, under a
+  change freeze, or a node pool with auto-upgrade or auto-repair off
+  (`security_patch_orchestrator_sop.md` §4a, object `Cluster/<name>` or `NodePool/<pool>`, and `namespace: ""` written out, as that SOP's
+  §4a spells it).
   A choice HCL cannot express — a workload meant to run one replica — goes in an OKF document
   (`type` frontmatter, 06 §5) under `knowledge/` as a `declares:` list in the frontmatter, one item
   per posture with `check` (the slug, `single-replica`), `namespace`, `object` as `Kind/name`, and
-  `cluster` when the choice is one cluster's rather than fleet-wide; the audit reads the
+  `cluster` when the choice is one cluster's rather than fleet-wide, spelled as the qualified
+  `<project>/<location>/<name>` every stream's findings carry, never the bare name; the audit reads the
   frontmatter, never the prose, and lists a match under _Declared intent_ with the file's path
   instead of reporting it. `.kube-agents/intent.yaml` names the paths the audit reads for such
   notes (`knowledge/` here); without it, or when a named path has nothing behind it, the whole

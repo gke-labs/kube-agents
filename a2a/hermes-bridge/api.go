@@ -99,7 +99,9 @@ const (
 	// apiBodyTailBytes bounds the error body quoted in a failed terminal.
 	apiBodyTailBytes = 2048
 	// apiResponseCap bounds a successful response body read: an answer is
-	// text, and anything past this is not one.
+	// text, and anything past this is not one. The read takes one byte more,
+	// so a body over the cap is refused as hermes-api-oversize rather than
+	// cut at the cap and misread as hermes-api-unreadable.
 	apiResponseCap = 8 << 20
 	// apiURLSchemeHTTP and apiURLSchemeHTTPS are the schemes the API URL
 	// may carry; the client cannot send to anything else.
@@ -320,7 +322,7 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	// cancelReq stays set through the body read: the server can send its
 	// headers before the body, and a cancel or shutdown in between must
 	// still end the request.
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, apiResponseCap))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, apiResponseCap+1))
 	run.mu.Lock()
 	run.cancelReq = nil
 	run.mu.Unlock()
@@ -345,6 +347,15 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 		}
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: %s - HTTP %d; session: %s; body tail: %s",
 			reason, resp.StatusCode, sessionID, tail(string(raw), apiBodyTailBytes)), nil)
+		return
+	}
+	if len(raw) > apiResponseCap {
+		// Refused, never truncated: a cut answer would fail to parse and
+		// read as a protocol fault, and a shortened one is worse than a
+		// loud failure.
+		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-api-oversize - HTTP %d; session: %s; "+
+			"the response body is over the %d-byte limit (apiResponseCap in api.go); the answer was refused rather than truncated",
+			resp.StatusCode, sessionID, apiResponseCap), nil)
 		return
 	}
 	var out apiChatResponse

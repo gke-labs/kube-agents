@@ -1082,7 +1082,7 @@ class DeleteAgentCrEndpointTest(unittest.TestCase):
     """
 
     def _run_delete(self, dns_endpoint="gke-abc.us-central1.gke.goog",
-                    allow_external="True", supports_flag=True):
+                    allow_external="True", supports_flag=True, wedged=False):
         """Run delete_agent_cr against stubbed gcloud, kubectl and terraform.
 
         Returns (completed process, recorded get-credentials invocation).
@@ -1091,6 +1091,7 @@ class DeleteAgentCrEndpointTest(unittest.TestCase):
             bin_dir = pathlib.Path(tmp) / "bin"
             bin_dir.mkdir()
             record = pathlib.Path(tmp) / "fetch.args"
+            kubectl_record = pathlib.Path(tmp) / "kubectl.args"
             help_text = "--dns-endpoint" if supports_flag else "--internal-ip"
             gcloud = bin_dir / "gcloud"
             gcloud.write_text(f"""#!/usr/bin/env bash
@@ -1107,7 +1108,18 @@ exit 0
             # which is all these assertions need. What is under test is the
             # command that ran before it, not the deletion itself.
             kubectl = bin_dir / "kubectl"
-            kubectl.write_text("#!/usr/bin/env bash\nexit 0\n")
+            # wedged: one PlatformAgent whose delete times out, which walks the
+            # finalizer patch and both RBAC deletes as well.
+            kubectl.write_text(f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> '{kubectl_record}'
+if [[ "{wedged}" == True ]]; then
+  case "$*" in
+    *"get platformagent"*) echo platformagent.kubeagents.x-k8s.io/agent ;;
+    *"delete platformagent"*) exit 1 ;;
+  esac
+fi
+exit 0
+""")
             kubectl.chmod(0o755)
 
             terraform = bin_dir / "terraform"
@@ -1134,7 +1146,18 @@ exit 0
                 env=get_isolated_test_env(bin_dir=str(bin_dir)),
                 cwd=str(_REPO_ROOT / "terraform" / "examples" / "full-install"),
             )
+            self.kubectl_args = kubectl_record.read_text() if kubectl_record.exists() else ""
             return proc, (record.read_text() if record.exists() else "")
+
+    def test_kubectl_names_the_context_it_fetched(self):
+        # Not the kubeconfig's current context, which another get-credentials
+        # sharing the file can move while the teardown runs.
+        proc, _ = self._run_delete(wedged=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        calls = self.kubectl_args.splitlines()
+        self.assertEqual(len(calls), 5, self.kubectl_args)
+        for call in calls:
+            self.assertTrue(call.startswith("--context gke_test-project_us-central1_test-cluster "), call)
 
     def test_it_uses_the_dns_endpoint_when_one_accepts_external_traffic(self):
         proc, args = self._run_delete()
@@ -1154,6 +1177,183 @@ exit 0
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertNotIn("--dns-endpoint", args)
                 self.assertIn("get-credentials test-cluster", args)
+
+
+class UninstallHelmReleasesTest(unittest.TestCase):
+    """uninstall_helm_releases removes the releases before terraform destroy (#2246).
+
+    hashicorp/helm 3.x's Delete returns early, reporting success, whenever its
+    existence check fails for any reason, so a destroy whose provider cannot
+    reach the cluster leaves the release running. On a cluster this state did
+    not create nothing else removes it, so the step uninstalls the releases this
+    state installed with the helm CLI, and stops the destroy when it cannot.
+    """
+
+    _KUBE_AGENTS = "helm_release.kube_agents"
+    _CERT_MANAGER = "helm_release.cert_manager[0]"
+    _CONTEXT = "gke_test-project_us-central1_test-cluster"
+
+    def _run(self, state=(_KUBE_AGENTS,), helm=True, credentials_rc=0,
+             list_output=None, list_rc=0, uninstall_rc=0, show_rc=0, list_stderr=""):
+        """Run uninstall_helm_releases against stubbed terraform, gcloud and helm.
+
+        `list_output` is what `helm list` prints; by default it names the
+        release it was asked about, i.e. the release is still installed.
+        Returns (completed process, helm calls one per line).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            bin_dir = create_minimal_tools_bin(root)
+            calls = root / "helm.calls"
+            bash = shutil.which("bash")
+
+            state_list = "\n".join(state)
+            # Shaped like `terraform state show` on a helm 3.x release: the
+            # metadata attribute repeats name and namespace ahead of the
+            # top-level ones, with the same values.
+            (bin_dir / "terraform").write_text(f"""#!{bash}
+case "$1" in
+  state)
+    case "$2" in
+      list) printf '%b\\n' '{state_list}' ;;
+      show)
+        [[ {show_rc} == 0 ]] || exit {show_rc}
+        case "$*" in
+          *cert_manager*) name=cert-manager ns=cert-manager ;;
+          *) name=kube-agents ns=kubeagents-system ;;
+        esac
+        printf '    metadata = {{\\n        name = "%s"\\n        namespace = "%s"\\n    }}\\n' "$name" "$ns"
+        printf '    name = "%s"\\n    namespace = "%s"\\n' "$name" "$ns" ;;
+    esac ;;
+  console)
+    read -r expr
+    case "$expr" in
+      *cluster_name*) echo '"test-cluster"' ;;
+      *project_id*)   echo '"test-project"' ;;
+      *location*)     echo '"us-central1"' ;;
+      *)              echo 'null' ;;
+    esac ;;
+esac
+exit 0
+""")
+            (bin_dir / "gcloud").write_text(f"""#!{bash}
+case "$*" in
+  *"get-credentials --help"*) exit 0 ;;
+  *"clusters describe"*) exit 1 ;;
+  *get-credentials*) exit {credentials_rc} ;;
+esac
+exit 0
+""")
+            list_cmd = (f"printf '%s\\n' '{list_output}'" if list_output is not None
+                        else 'for a; do [[ "$prev" == --filter ]] && { a=${a#^}; echo "${a%$}"; }; prev=$a; done')
+            if helm:
+                (bin_dir / "helm").write_text(f"""#!{bash}
+echo "helm $*" >> "{calls}"
+case "$1" in
+  list) {list_cmd}; [[ -z '{list_stderr}' ]] || echo '{list_stderr}' >&2; exit {list_rc} ;;
+  uninstall) [[ {uninstall_rc} == 0 ]] || echo "Error: context deadline exceeded" >&2; exit {uninstall_rc} ;;
+esac
+exit 0
+""")
+            for stub in ("terraform", "gcloud", "helm"):
+                if (bin_dir / stub).exists():
+                    (bin_dir / stub).chmod(0o755)
+
+            script = f'KUBE_AGENTS_SOURCE_ONLY=true source "{_LIFECYCLE_SH}"\nuninstall_helm_releases\n'
+            proc = subprocess.run(
+                [bash, "-c", script],
+                capture_output=True,
+                text=True,
+                env={"PATH": str(bin_dir), "HOME": str(root)},
+                cwd=str(_FULL_INSTALL),
+                timeout=60,
+            )
+            return proc, calls.read_text() if calls.exists() else ""
+
+    def _uninstalls(self, calls):
+        return [line.split() for line in calls.splitlines() if line.startswith("helm uninstall")]
+
+    def test_it_uninstalls_kube_agents_then_cert_manager_in_the_cluster_it_fetched(self):
+        proc, calls = self._run(state=(self._CERT_MANAGER, self._KUBE_AGENTS))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        uninstalls = self._uninstalls(calls)
+        # kube-agents first: its Certificate and Issuer are cert-manager kinds,
+        # removed while cert-manager is still running.
+        self.assertEqual([u[2] for u in uninstalls], ["kube-agents", "cert-manager"], calls)
+        for uninstall, namespace in zip(uninstalls, ("kubeagents-system", "cert-manager")):
+            self.assertIn(f"-n {namespace}", " ".join(uninstall))
+            # Named, not the kubeconfig's current context, which another
+            # get-credentials sharing it can move mid-teardown.
+            self.assertIn(f"--kube-context {self._CONTEXT}", " ".join(uninstall))
+            self.assertIn("--wait", uninstall)
+
+    def test_a_cert_manager_this_state_did_not_install_is_left_alone(self):
+        proc, calls = self._run(state=(self._KUBE_AGENTS,))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual([u[2] for u in self._uninstalls(calls)], ["kube-agents"], calls)
+        self.assertNotIn("cert-manager", calls)
+
+    def test_a_cluster_this_state_created_is_left_to_terraform(self):
+        # Destroying the cluster removes everything in it.
+        for cluster in ("module.gke_cluster.google_container_cluster.autopilot[0]",
+                        "module.gke_cluster.google_container_cluster.standard[0]"):
+            with self.subTest(cluster=cluster):
+                proc, calls = self._run(state=(cluster, self._KUBE_AGENTS), list_rc=1)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(calls, "")
+
+    def test_nothing_in_state_calls_nothing(self):
+        proc, calls = self._run(state=())
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(calls, "")
+
+    def test_a_release_already_gone_is_not_uninstalled(self):
+        # A destroy re-run after one that stopped between the two steps.
+        proc, calls = self._run(list_output="")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("helm list", calls)
+        self.assertEqual(self._uninstalls(calls), [])
+        self.assertIn("already gone", proc.stdout)
+
+    def test_a_warning_on_stderr_is_not_a_release(self):
+        proc, calls = self._run(list_output="", list_stderr="WARNING: Kubernetes configuration file is group-readable")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self._uninstalls(calls), [])
+        self.assertIn("already gone", proc.stdout)
+
+    def test_a_warning_on_stderr_does_not_hide_a_release_that_is_there(self):
+        proc, calls = self._run(list_stderr="WARNING: Kubernetes configuration file is group-readable")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual([u[2] for u in self._uninstalls(calls)], ["kube-agents"], calls)
+
+    def test_a_host_without_helm_warns_and_leaves_it_to_terraform(self):
+        proc, _ = self._run(helm=False)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("helm is not installed", proc.stderr)
+
+    def test_a_cluster_without_credentials_warns_and_calls_no_helm(self):
+        proc, calls = self._run(credentials_rc=1)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(calls, "")
+        self.assertIn("could not fetch credentials", proc.stderr)
+
+    def test_a_state_read_that_fails_stops_the_destroy_and_says_why(self):
+        proc, calls = self._run(show_rc=1)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(calls, "")
+        self.assertIn("terraform state show failed", proc.stderr)
+
+    def test_helm_failing_stops_the_destroy_with_the_hand_run_command(self):
+        # Going on would report success over a release that is still running.
+        for why, kwargs in (("helm list failed", {"list_rc": 1}),
+                            ("helm uninstall failed", {"uninstall_rc": 1})):
+            with self.subTest(why=why):
+                proc, _ = self._run(**kwargs)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn(
+                    f"helm uninstall kube-agents -n kubeagents-system --kube-context {self._CONTEXT} --wait",
+                    proc.stderr,
+                )
 
 
 class MissingEndpointHelperTest(unittest.TestCase):

@@ -225,16 +225,17 @@ namespace, where the managed-Prometheus collector runs, and to no other peer.
 Envoy authenticates
 every caller that is not asking for `/healthz`: the caller presents an
 audience-bound projected ServiceAccount token (one hour; the audience is per
-pod, `kubeagents-credential-proxy` for the sandbox and
-`kubeagents-credential-proxy-chat` for the gateway) as a bearer header, and the
+pod, `kubeagents-credential-proxy` for the sandbox, `kubeagents-credential-proxy-chat` for
+the gateway and, when the next stack takes Google Chat, `kubeagents-credential-proxy-a2a-chat`
+for the A2A gateway) as a bearer header, and the
 runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLERS`.
-That list names the gateway's ServiceAccount and the sandbox's (and, under the
-operator's `A2A_SESSION_CLUSTER_VIEW` flag, a third, the session pods', bound to
-the audience `kubeagents-credential-proxy-session`; see
-[spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)) and does not vary
-on which one presented the token — the audience and the route table it feeds do —
-so the allowlist itself keeps other workloads out rather than telling those two
-apart. The token crosses the cluster network in cleartext;
+That list names the gateway's ServiceAccount and the sandbox's, the A2A gateway's when it
+consumes Google Chat, and, under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session
+pods' (bound to the audience `kubeagents-credential-proxy-session`; see
+[spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)), and does not vary on
+which one presented the token — the audience and the route table it feeds do — so the
+allowlist itself keeps other workloads out rather than telling those callers apart. The token
+crosses the cluster network in cleartext;
 a NetworkPolicy is what keeps it off the wire elsewhere.
 
 The `agent-api-auth` sidecar authenticates the existing PlatformAgent API on port

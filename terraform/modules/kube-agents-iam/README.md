@@ -24,12 +24,20 @@ the grant in your Terraform, where it is reviewed.
 
 ## The scoped service account pool
 
-`scoped_clusters` provisions one service account per named GKE cluster, plus
-`roles/iam.serviceAccountTokenCreator` for the agent bound on each member as a
-resource (never at project level). The members hold no IAM grant of their own
-as of 2026-08-12 — the IAM-Condition scoping they were designed around grants
-nothing for Kubernetes object operations — so the default is `[]` and should
-stay there until per-cluster RBAC lands. The site's
+`scoped_pool_enabled = true` provisions one service account per project the plan can list in
+`scope` (the host project, `scope.projects` less an exact `exclude.projects` entry, and each
+selector's members; a folder's or organisation's members are not listed at plan time yet), keyed
+on the bare project id and created in `project_id`, plus `roles/iam.serviceAccountTokenCreator`
+for the agent bound on each member as a resource (never at project level). Two clusters in one
+project share an account by design (`docs/designs/multi-project-scope.md` §6). Each member's
+description carries the install's identity (`Pool member of <service_account_id> for
+projects/<id>`), and the installer's pre-apply ownership check lists members by it.
+`scoped_pool_max_accounts` bounds how many the plan may create and refuses a pool past it at plan;
+its default of 100 is GCP's default service-account quota, which the agent's own accounts share, so
+set it to the headroom the project has free rather than leaving a large pool at the default. The members hold no IAM grant of their
+own as of 2026-08-12 — the IAM-Condition scoping they were designed around grants nothing for
+Kubernetes object operations — so the default is `false` and should stay there until
+per-cluster RBAC lands. The site's
 [security-and-iam reference](../../../docs/site/src/content/docs/reference/security-and-iam.md)
 owns the topic, including how the mapping reaches the credential broker and
 what the pool does and does not bound.
@@ -88,7 +96,9 @@ is wide; the design is
 `tests/*.tftest.hcl` plan the module against a mocked `google` provider and assert which bindings a
 declaration plans (the intersected allowlist per project, the scoping project and a lookup-only host
 included, nothing in the management project) and which declarations the preconditions refuse,
-the whole-set cap's counting among them; the role set is read from the module's own `scope_roles`
+the whole-set cap's counting among them; which accounts the scoped service account pool derives
+from a declaration, keyed on the project, and the `scoped_pool_max_accounts` refusal
+(`tests/scoped_pool.tftest.hcl`); the role set is read from the module's own `scope_roles`
 rather than spelled out. `make terraform-test` runs them, as the `validate` job in `validate.yml`
 does on every pull request; `mock_provider` needs Terraform 1.7 or newer, above the floor the module declares for
 an install. The repository's `tests/test_scope_iam.py` pins what a plan cannot see, the allowlist

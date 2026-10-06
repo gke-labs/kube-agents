@@ -8,17 +8,20 @@ output "agent_project_roles" {
     Project-level roles actually granted to the agent's own service account.
     Surfaced because the residual ceiling is a security property worth being
     able to assert on rather than infer from which variables were set. It does
-    not yet vary with scoped_clusters -- see the suspended coupling in main.tf.
+    not yet vary with scoped_pool_enabled -- see the suspended coupling in
+    main.tf.
   EOT
   value       = local.agent_project_roles
 }
 
 output "scoped_service_accounts" {
   description = <<-EOT
-    Map from GKE resource name to the email of the service account for it. The
-    key is the same string the credential broker looks up, so this output is
-    directly comparable with the broker's mapping. The accounts hold no IAM
-    grant; see scoped_pool.tf.
+    Map from project id to the email of the pool member for it: one entry per
+    project the plan listed in the scope while scoped_pool_enabled is true,
+    the host project included, and empty otherwise. The key is the same
+    string the credential broker looks up, so this output is directly
+    comparable with the broker's mapping. The accounts hold no IAM grant; see
+    scoped_pool.tf.
   EOT
   value       = { for key in keys(local.scoped_pool) : key => google_service_account.scoped[key].email }
 }

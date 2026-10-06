@@ -181,9 +181,50 @@ spec:
     serviceAccountAnnotations:
       {{- toYaml . | nindent 6 }}
     {{- end }}
-    {{- with .Values.platformAgent.security.scopedServiceAccounts }}
-    scopedServiceAccounts:
-      {{- toYaml . | nindent 6 }}
+    {{- /*
+      Rendered when the pool is armed or carries members, and omitted otherwise, so
+      the default values render the CR the operator reads as "no pool" rather than a
+      present block with the switch off. `enabled` is the arming rule on the CR; the
+      list alone arms nothing, which is why a populated list with the switch off is
+      still rendered: the mapping is declared, visible in the CR, and inert. Armed
+      with no members fails here, as the CRD's own rule would at apply, so the
+      message names the value rather than the CR field.
+    */}}
+    {{- $pool := .Values.platformAgent.security.scopedServiceAccountPool | default dict }}
+    {{- if and $pool.enabled (not $pool.serviceAccounts) }}
+    {{- fail "platformAgent.security.scopedServiceAccountPool.enabled requires at least one serviceAccounts entry; the broker refuses to start on an empty pool" }}
+    {{- end }}
+    {{- /*
+      An armed pool also needs a CRD that knows the field. `helm upgrade` never
+      applies crds/, and an API server serving a CRD from before the pool admits
+      the CR with the block pruned: the operator reads no pool, the broker starts
+      with it off, and every cluster read runs on the agent's own identity while
+      the release record says "armed". `lookup` sees the installed CRD on a live
+      install and nothing under `helm template`, so the guard fires exactly where
+      the pruning would. Only the armed case is guarded: a disabled block pruned
+      the same way changes nothing.
+    */}}
+    {{- if $pool.enabled }}
+    {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+    {{- if $crd }}
+    {{- $props := dict }}
+    {{- range $crd.spec.versions }}
+    {{- if eq .name "v1alpha1" }}
+    {{- $props = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "security" "properties" (dict) . }}
+    {{- end }}
+    {{- end }}
+    {{- if not (hasKey $props "scopedServiceAccountPool") }}
+    {{- fail "platformAgent.security.scopedServiceAccountPool.enabled needs a PlatformAgent CRD that has the field, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- if or $pool.enabled $pool.serviceAccounts }}
+    scopedServiceAccountPool:
+      enabled: {{ $pool.enabled | default false }}
+      {{- with $pool.serviceAccounts }}
+      serviceAccounts:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     {{- end }}
     {{- /*
       Both fields or neither. The operator reads a half-filled block as absent and

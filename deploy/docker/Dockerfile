@@ -494,8 +494,9 @@ RUN cd /opt/hermes && \
 # gateway/kanban_watchers_notifier.py. One applier owns all five anchors in
 # that file -- the handoff, the wake set, the incident row (which shared the
 # wake anchor until upstream split the per-event send loop from the wake step),
-# the completion message, and the wake step's outcome -- so an upstream edit
-# that breaks one fails one build step that names it.
+# the completion message, and the wake step's outcome -- plus an unchanged pin
+# on the `self.platform_str` binding the completion message reads, so an
+# upstream edit that breaks one fails one build step that names it.
 #   * Clip: upstream hard-slices the handoff at 200/160 characters and discards
 #     every line after the first, which delivered a severed GitHub link -- a
 #     ledger URL cut to ".../is" -- on 2026-08-03. Both slices are swapped for a
@@ -545,7 +546,9 @@ RUN cd /opt/hermes && \
 # `self.send_passive = mode != "wake"` is still in the notifier's own source
 # (_KanbanNotification's constructor). That string belongs to upstream and no
 # applier writes it, so a rename is caught there -- before the patched line
-# reaches a notifier tick and raises AttributeError.
+# reaches a notifier tick and raises AttributeError. The applier pins
+# `self.platform_str`'s binding the same way, as an anchor substituted
+# unchanged.
 #
 # The first of those greps carries `passive_delivered=self.send_passive` rather
 # than stopping at `adapter=self.adapter`, and the argument is not cosmetic: it

@@ -953,9 +953,11 @@ CHAT_PLATFORMS = ("google_chat", "slack")
 # Per-platform environment signals, consulted only when no config file settles
 # the question. The relay URL leads each list because the operator sets it on
 # this container exactly when the matching `spec.integration.<p>.enabled` is
-# true (platformagent_manifests.go, the GoogleChat/Slack blocks in
-# buildPodTemplateSpec and renderManagedEnv), so it answers the question rather
-# than approximating it.
+# true and this pod is the platform's consumer (platformagent_manifests.go, the
+# GoogleChat/Slack blocks in buildPodTemplateSpec and renderManagedEnv), so it
+# answers the question rather than approximating it. Under `mode: next` Google
+# Chat moves to the A2A gateway and the variable is absent here, which reads as
+# Chat not being this pod's to post to.
 #
 # SLACK_BOT_TOKEN is kept, and is inert on a deployed pod: a token is a
 # credential, so it lives in the credential-proxy container and never reaches

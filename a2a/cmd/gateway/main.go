@@ -76,23 +76,23 @@ func buildAdapters(cfg *gateway.Config, primary gateway.Adapter, natsOpts []nats
 }
 
 // composeAdapters is the whole stack the gateway drives: the chat backends
-// behind the mux, and the inject door, when armed, beside the mux rather
-// than inside it. The order matters. The gateway finds the door's
+// behind the mux, and the doors (inject, A2A), when armed, beside the mux
+// rather than inside it. The order matters. The gateway finds the door's
 // ProbeSink, TaskObserver and InboundObserver by type assertion on the top
 // of the stack, and the side door implements them for exactly that reason
 // (sidedoor.go). MultiAdapter has no ProbeSink or InboundObserver and its
-// prefix dispatch has no key for an inject: conversation. It does pass
+// prefix dispatch has no key for an inject: or a2a: conversation. It does pass
 // TaskObserver and SessionLookupSink on to the chat backend, which is how
 // the Slack adapter below it learns its session threads.
-func composeAdapters(cfg *gateway.Config, primary gateway.Adapter, door *gateway.InjectAdapter, natsOpts []nats.Option, log *slog.Logger) (gateway.Adapter, error) {
+func composeAdapters(cfg *gateway.Config, primary gateway.Adapter, doors []gateway.DoorSpec, natsOpts []nats.Option, log *slog.Logger) (gateway.Adapter, error) {
 	chat, err := buildAdapters(cfg, primary, natsOpts, log)
 	if err != nil {
 		return nil, err
 	}
-	if door == nil {
+	if len(doors) == 0 {
 		return chat, nil
 	}
-	return gateway.WithSideDoor(chat, door, log), nil
+	return gateway.WithSideDoors(chat, doors, log), nil
 }
 
 // realMain is the gateway from configuration to shutdown. Every failure is
@@ -138,9 +138,9 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	case "slack":
 		adapter, err = gateway.NewSlackAdapter(cfg.SlackBotToken, cfg.SlackAppToken, log)
 	case "":
-		// No real backend: the inject door and the console are the only
-		// ingresses, which is what lets an eval install's gateway start at
-		// all (#1660).
+		// No real backend: the doors (inject, A2A) and the console are the
+		// only ingresses, which is what lets an eval install's gateway start
+		// at all (#1660).
 	default:
 		adapter, err = gateway.NewDiscordAdapter(cfg.DiscordToken, log)
 	}
@@ -152,16 +152,33 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	// of the above, and the composite routes by conversation key. Dev and
 	// eval installs only; the operator renders A2A_INJECT_LISTEN and the
 	// token only under its eval flag. See a2a/gateway/inject.go.
-	var door *gateway.InjectAdapter
+	var doors []gateway.DoorSpec
 	if cfg.InjectArmed() {
-		door, err = gateway.NewInjectAdapter(cfg.InjectListen, cfg.InjectToken, cfg.FirstEventGrace, log)
+		door, err := gateway.NewInjectAdapter(cfg.InjectListen, cfg.InjectToken, cfg.FirstEventGrace, log)
 		if err != nil {
 			log.Error("inject door", "err", err)
 			return err
 		}
+		doors = append(doors, gateway.InjectDoorSpec(door))
+	}
+	// The A2A door is the same kind of thing for an agent caller: armed
+	// beside either backend or alone, routed by its own key prefix, its
+	// callers resolved through its own map. See a2a/gateway/a2adoor.go.
+	if cfg.A2ADoorArmed() {
+		door, err := gateway.NewA2ADoor(cfg.A2ADoorListen, cfg.A2ADoorToken, gateway.A2ADoorOptions{
+			PublicURL:        cfg.A2ADoorPublicURL,
+			DefaultAddressee: cfg.DefaultAddressee,
+			TaskDeadline:     cfg.TaskDeadline,
+			Logger:           log,
+		})
+		if err != nil {
+			log.Error("A2A door", "err", err)
+			return err
+		}
+		doors = append(doors, gateway.A2ADoorSpec(door))
 	}
 
-	adapter, err = composeAdapters(cfg, adapter, door, natsOpts, log)
+	adapter, err = composeAdapters(cfg, adapter, doors, natsOpts, log)
 	if err != nil {
 		log.Error("console adapter", "err", err)
 		return err
@@ -183,6 +200,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		"nats", cfg.NATSURL,
 		"backend", backend,
 		"injectDoor", cfg.InjectArmed(),
+		"a2aDoor", cfg.A2ADoorArmed(),
 		"defaultAddressee", cfg.DefaultAddressee,
 		"spawnSessions", cfg.SpawnSessions,
 		"idleTTL", cfg.IdleTTL.String())

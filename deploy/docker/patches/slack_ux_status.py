@@ -80,12 +80,13 @@ Planning Agent's turn, and the cards would run on.
 Fallback: when posting or editing the plan fails (Slack refuses the blocks, the
 message was deleted), the thread drops to the rolling line until every card
 that rolled a note since has settled or been archived, which is what the
-thread showed before this module. A posted plan holds ``processing`` while
-those cards roll and ``suspended`` while they wait on the user; a plan refused
-on its first post holds no status. A settle still edits a posted plan, best
-effort, so an edit refused once, for a rate limit say, does not leave its rows
-showing as running. Everything here is in process, like the progress-line map:
-a gateway restart forgets the plan, and the next note starts a new one. A
+thread showed before this module. A plan holds ``processing`` while
+those cards roll and ``suspended`` while they wait on the user, clearing the
+session when its cards settle, even if its initial post was refused by Slack.
+A settle still edits a posted plan, best effort, so an edit refused once,
+for a rate limit say, does not leave its rows showing as running. Everything
+here is in process, like the progress-line map: a gateway restart forgets
+the plan, and the next note starts a new one. A
 card that settles with no plan left closes the thread's session, or suspends
 it while the card waits on the user, so the Working… the old process set
 does not stick; it can also clear Working… for another card from before the
@@ -373,10 +374,10 @@ def _plan_session(chat_id: str, thread_ts: str) -> str:
     """The session status the thread's plans hold, or ``""`` when no card runs or waits.
 
     A card runs on a plan touched within :data:`PLAN_HOLD_SECONDS`: a row
-    running, or a card rolling after its posted plan fell back. A set-aside
-    plan is untouched that long unless a card on it was answered since. A
-    card waiting on the user, on any of the thread's plans, holds
-    ``suspended``.
+    running, or a card rolling after its plan fell back (including when its
+    initial post was refused). A set-aside plan is untouched that long
+    unless a card on it was answered since. A card waiting on the user, on
+    any of the thread's plans, holds ``suspended``.
     """
     key = (chat_id, thread_ts)
     plan = _plans.get(key)
@@ -390,11 +391,11 @@ def _plan_session(chat_id: str, thread_ts: str) -> str:
 
 
 def _running(plan: _Plan) -> bool:
-    return bool(plan.ts and plan.rolling - plan.waiting) or _status.running(plan.rows.values())
+    return bool(plan.rolling - plan.waiting) or _status.running(plan.rows.values())
 
 
 def _waiting(plan: _Plan) -> bool:
-    return bool(plan.ts and plan.waiting) or any(
+    return bool(plan.waiting) or any(
         row.status == _status.TASK_PENDING for row in plan.rows.values()
     )
 
@@ -455,15 +456,14 @@ async def _session(adapter: Any, key: tuple, plan: _Plan) -> None:
 
     :func:`_plan_session` reads the current plan and any set aside: a card
     running opens the session, one waiting on the user suspends it, nothing
-    clears it. Sent on every note and settle that moves a posted plan:
+    clears it. Sent on every note and settle that moves a plan:
     :func:`set_thread_status` skips an unchanged status against what
     Slack last accepted, so a refused one is retried and one a Planning Agent
     turn changed is restored. The legacy setter has no such check and costs a
-    call per note, beside the note's own edit. A plan that never posted set no
-    status, so it sends none.
+    call per note, beside the note's own edit. An unposted plan sends status
+    during note delivery and card settlement, keeping the thread's session in
+    sync with its rolling and waiting cards.
     """
-    if not plan.ts:
-        return
     chat_id, thread_ts = key
     wanted = _plan_session(chat_id, thread_ts)
     setter = getattr(adapter, "_set_thread_status", None)
@@ -619,8 +619,9 @@ async def _set_aside(adapter: Any, key: tuple, plan: _Plan) -> None:
             "slack_ux_status: evicting the set-aside plans in %s/%s; resending its session", *old_key,
         )
         posted = next((old for old in reversed(evicted) if old.ts), None)
-        if posted is not None:
-            await _session(adapter, old_key, posted)
+        sender = posted or (evicted[-1] if evicted else None)
+        if sender is not None:
+            await _session(adapter, old_key, sender)
 
 
 async def _keep(adapter: Any, key: tuple, plan: _Plan) -> None:
@@ -634,9 +635,8 @@ async def _keep(adapter: Any, key: tuple, plan: _Plan) -> None:
     while len(_plans) > PLANS_MAX:
         old_key, old = _plans.popitem(last=False)
         _disarm(old)
-        if old.ts:
-            logger.info("slack_ux_status: evicting the plan in %s/%s; closing its session", *old_key)
-            await _session(adapter, old_key, old)
+        logger.info("slack_ux_status: evicting the plan in %s/%s; closing its session", *old_key)
+        await _session(adapter, old_key, old)
 
 
 def _roll(adapter: Any, key: tuple, plan: _Plan, card: str) -> None:
@@ -822,8 +822,7 @@ async def deliver_row(
         _plans.move_to_end(key)  # eviction at PLANS_MAX takes the least active thread
     if plan.fallback:
         _roll(adapter, key, plan, card)
-        if plan.ts:
-            await _session(adapter, key, plan)
+        await _session(adapter, key, plan)
         return False
     row = plan.rows.get(card)
     created = row is None
@@ -847,8 +846,7 @@ async def deliver_row(
         else:
             row.lines, row.steps, row.note, row.status, row.last_event_id = previous
         _roll(adapter, key, plan, card)
-        if plan.ts:
-            await _session(adapter, key, plan)
+        await _session(adapter, key, plan)
         return False
     _arm(adapter, key, plan)
     await _session(adapter, key, plan)
@@ -866,7 +864,7 @@ async def settle_row(adapter: Any, sub: dict, kind: str, result: str = "") -> No
     done = kind == ARCHIVED_KIND or status in (_status.TASK_COMPLETE, _status.TASK_ERROR)
     sender = await _settle_lapsed(adapter, key, card, kind, status, done, result)
     plan = _plans.get(key)
-    if plan is not None and await _settle_current(adapter, key, plan, card, kind, status, done, result) and plan.ts:
+    if plan is not None and await _settle_current(adapter, key, plan, card, kind, status, done, result):
         sender = plan
     if sender is not None:
         await _session(adapter, key, sender)

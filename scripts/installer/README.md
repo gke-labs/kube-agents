@@ -173,7 +173,9 @@ and drops the custom roles; `SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATI
 renders an empty list for it in the scope block, which revokes the read roles in every project,
 folder, organisation or selector member it named and retires those projects' Cluster Agent profiles over the
 reconcile's next two clean runs; `SCOPE_MAX_PROJECTS` absent writes no cap, so the default of 100
-returns and the projects past it read `over-cap` (or the plan is refused, while a selector is declared).
+returns and the projects past it read `over-cap` (or the plan is refused, while a selector is declared);
+`SCOPED_SA_POOL_ENABLED` absent disarms the scoped service account pool, deleting its accounts
+and putting the broker back on the agent's own identity.
 The file `install.sh` writes at the end of a first install carries every one of these, so
 the hazard is a hand edit that deletes a line rather than setting it to `false`. Run
 `./upgrade.sh --plan` before a full upgrade and read any `destroy` line as missing
@@ -327,9 +329,33 @@ exceed it (while a selector is declared or the cap is below its default), and re
 check as part of the declaration, so a cap set on the CR by
 hand is reported like any hand edit until the key records it.
 
+`SCOPED_SA_POOL_ENABLED` and `SCOPED_SA_POOL_MAX_ACCOUNTS` are the scoped service account pool,
+derived from the same scope: with the switch on, the IAM module provisions one reader service
+account in the management project per project the plan lists (the management project,
+`SCOPE_PROJECTS` less an exact `SCOPE_EXCLUDE_PROJECTS` entry, and each selector's members; a
+folder's or organisation's members are not listed at plan time yet, so a cluster under a declared
+container is refused while the pool is armed), and the chart renders the mapping into the CR as
+`spec.security.scopedServiceAccountPool` with `enabled` set from the same key, so declaring
+projects arms nothing on its own. Members carry the install's identity in their description
+(`Pool member of <PLATFORM_AGENT_GSA_NAME> for projects/<id>`), and `check_service_account_ownership`
+lists them by it before every apply, armed or not, so a member left by a lost state is refused
+beside the agent's account rather than 409ing after the agent is deleted. The generator writes `scoped_pool_enabled` on every run, `false`
+by default (a member holds no IAM grant yet, so an armed pool turns every cluster read into a
+`Forbidden`), and `scoped_pool_max_accounts` only when the key is set: the bound on the pool, declared from the
+management project's free service-account quota, 100 (GCP's default quota, not the headroom)
+when unset, with a pool past it refused at plan. `install.sh` takes `--scoped-sa-pool-enabled[=BOOL]` and
+`--scoped-sa-pool-max-accounts=N` and records them on a first install; a flag on a later run
+applies for that run and warns that the next full upgrade regenerates from the file. A misspelt
+switch, or a cap that is not a whole number of at least 1, stops every front door but
+`uninstall.sh`, which exports the switch off and the cap empty before it regenerates, so a typo
+cannot refuse a teardown.
+
 Before a full apply the front doors read the live `PlatformAgent` through the install's own
 kubeconfig context and refuse when it carries a scope that neither the release record nor the
-keys account for, printing the `SCOPE_*` lines that reproduce it; a read that cannot decide (no
+keys account for, printing the `SCOPE_*` lines that reproduce it; the scoped pool's switch
+(`spec.security.scopedServiceAccountPool.enabled`) is weighed with the lists and the cap, so a
+pool armed on the CR that `SCOPED_SA_POOL_ENABLED` does not record is refused the same way, with
+that key among the lines, rather than disarmed by the apply. A read that cannot decide (no
 context, an unreadable CR or release) refuses too, because the apply itself needs no kubeconfig
 and would go ahead over a scope nobody read (`refuse_apply_over_undeclared_scope` in
 `installer_common.sh`; `upgrade.sh --plan` warns instead). An `install.sh` re-run
