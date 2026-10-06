@@ -214,7 +214,8 @@ NOT_A_PLAIN_GREP = [
 # The ways a worker runs the helper: the interpreter with or without a
 # version or a flag (one carrying an argument included), bare or by path,
 # the script path quoted whole or by segment (`"$DIR"/scripts/...`, the
-# ShellCheck idiom, with or without the interpreter), an executable path, after a `cd`, under `timeout`
+# ShellCheck idiom, with or without the interpreter) or led by an unquoted
+# `$DIR`, `${DIR}` or `~` with no interpreter, an executable path, after a `cd`, under `timeout`
 # with or without its own flags or a unit on the duration, `env` bare or
 # as `/usr/bin/env` with or without its flags and assignments, `stdbuf`, or
 # an environment assignment (its value bare, quoted with a space inside, or
@@ -250,6 +251,10 @@ RUNS_THE_HELPER = [
     'python3 "$SKILL_DIR"/scripts/analyze_trace_latency.py --project-id p',
     'python3 "${SKILL_DIR}"/scripts/analyze_trace_latency.py --project-id "$PROJECT" --hours 24',
     '"$SKILL_DIR"/scripts/analyze_trace_latency.py --project-id p',
+    "$SKILL_DIR/scripts/analyze_trace_latency.py --project-id p",
+    '${SKILL_DIR}/scripts/analyze_trace_latency.py --project-id "$PROJECT" --hours 24',
+    "~/skills/kube-agents-observability/scripts/analyze_trace_latency.py --project-id p",
+    "cd /opt/defaults/skills && $SKILL/scripts/analyze_trace_latency.py --project-id p",
 ]
 
 # The ways a worker reads the helper without running it, under `timeout`
@@ -305,6 +310,9 @@ READS_THE_HELPER = [
     'head -40 `dirname "$0"`/scripts/analyze_trace_latency.py',
     "cat `pwd`/../scripts/analyze_trace_latency.py",
     'cat "$SKILL_DIR"/scripts/analyze_trace_latency.py',
+    "cat $SKILL_DIR/scripts/analyze_trace_latency.py",
+    "head -40 ${SKILL_DIR}/scripts/analyze_trace_latency.py",
+    "wc -l ~/skills/kube-agents-observability/scripts/analyze_trace_latency.py",
 ]
 
 # The lines the verifier receives for typed commands above, as the image's
@@ -355,6 +363,8 @@ RENDERED_ROUTE = [
     ("python3 -u /tmp/mine.py scripts/analyze_trace_latency.py --project-id p", "fail"),
     ("python3 -Xscripts/analyze_trace_latency.py /tmp/mine.py --project-id p", "fail"),
     ('PROJECT=$(gcloud config get-value project) python3 scripts/analyze_trace_latency.py --project-id "$PROJECT"', "pass"),
+    ("$SKILL_DIR/scripts/analyze_trace_latency.py --project-id p", "pass"),
+    ("cat $SKILL_DIR/scripts/analyze_trace_latency.py", "fail"),
 ]
 
 
