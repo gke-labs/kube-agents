@@ -908,10 +908,10 @@ SHARED_ACCOUNT_STALE_REASON = (
     "it; the remaining findings are manual, per pod spec."
 )
 SHARED_ACCOUNT_STALE_RESOLUTION = (
-    "The finding has not gone: it stays on the ledger with a manual remediation under the "
-    "shield note, and `/remediate <finding-id>` refuses it while the declaration stands. "
-    "Withdraw the declaration and the next run lists it with the shared-account manifest fix "
-    "again, awaiting `/remediate`."
+    "The finding has not gone: it stays on the ledger, and while the declaration stands the "
+    "shared-account fix is not proposed for it again, by this audit or by `/remediate "
+    "<finding-id>`. Withdraw the declaration and the next run lists it with the shared-account "
+    "manifest fix again, awaiting `/remediate`."
 )
 
 # Harness-side declaration discovery (the obtainability SOP's §4a). `start`
@@ -5547,6 +5547,14 @@ def shield_declared_account_siblings(
                 "did not report, in a namespace with a declared workload; its shared-account pull "
                 "request is closed with the others rather than held open for it."
             )
+    # Every declared 2.7 workload counts as shielded too: a pull request that
+    # covers only declared workloads proposes the fix the declaration forbids,
+    # and on a partial run nothing else would close it.
+    for entry in data.get("declared") or []:
+        if str(entry.get("check", "")) == SHARED_ACCOUNT_CHECK:
+            fid = published_id(entry)
+            if fid not in changed:
+                changed.append(fid)
     return changed
 
 
@@ -8698,12 +8706,24 @@ def render_delta_comment(
     return _clip_comment("\n".join(out))
 
 
+def _no_close_clause(closed_prs) -> str:
+    """How a partial or held comment states the stale-close outcome of this run."""
+    urls = [str(u) for u in (closed_prs or [])]
+    if not urls:
+        return "no remediation pull request has been closed"
+    return (
+        "no remediation pull request has been closed as stale, except the one the "
+        f"compliance shield forbids ({', '.join(urls)}), closed on its declaration"
+    )
+
+
 def render_clean_comment(
     audit_id: str,
     data: dict,
     generated_at: datetime,
     *,
     gaps: list[str] | None = None,
+    closed_prs: list[str] | None = None,
 ) -> str:
     """Comment posted when an audit that previously had findings comes back clean.
 
@@ -8751,7 +8771,7 @@ def render_clean_comment(
             "**This is not an all-clear, and the ledger stays open.** With no "
             "trusted record of the findings this ledger carries, the run cannot "
             "tell whether they were fixed, so nothing has been reported as "
-            "resolved and no remediation pull request has been closed. "
+            f"resolved and {_no_close_clause(closed_prs)}. "
             + LOST_RECORD_WAY_OUT,
             "",
             f"Why the ledger stays open ({len(gaps)}):",
@@ -8766,8 +8786,7 @@ def render_clean_comment(
             "",
             "**This is not an all-clear, and the ledger stays open.** A finding's "
             "absence only means it was fixed if the audit actually looked, so "
-            "nothing has been reported as resolved and no remediation pull request "
-            "has been closed. "
+            f"nothing has been reported as resolved and {_no_close_clause(closed_prs)}. "
             + (
                 # Beside a lost record, complete coverage no longer closes it:
                 # the way out is the one the /remediate answer names too.
@@ -8899,6 +8918,7 @@ def render_held_comment(
     collector: list[str] | None = None,
     carried: list[str] | None = None,
     gaps: list[str] | None = None,
+    closed_prs: list[str] | None = None,
 ) -> str:
     """Comment posted when a clean run is refused its close (`HELD`).
 
@@ -8943,7 +8963,7 @@ def render_held_comment(
         "on that cluster — yet the document neither reports the finding again nor "
         "carries a `resolved_because` entry saying what that check showed. From "
         'here "fixed" and "not written down" are the same absence, so nothing has '
-        "been reported as resolved, no remediation pull request has been closed, "
+        f"been reported as resolved, {_no_close_clause(closed_prs)}, "
         "and the ledger stays open. It closes on the next run that reports each of "
         "these again, or says per finding why it is gone; `start` lists them "
         "under `carried`.",
@@ -10515,7 +10535,13 @@ def close_stale_remediation_prs(
         # an unjoinable body: that is "cannot tell", not "none of them", and the
         # branch rule below is the only one allowed to act on it.
         persisting = [fid for fid in covered if fid in current_ids] if joinable else []
-        only_shielded = bool(persisting) and all(fid in shielded_ids for fid in persisting)
+        # The shield's test runs over what persists *or* is shielded: a declared
+        # workload is neither current nor still flagged, and a pull request
+        # covering only declared workloads is the forbidden fix as well.
+        shield_persisting = (
+            [fid for fid in covered if fid in current_ids or fid in shielded_ids] if joinable else []
+        )
+        only_shielded = bool(shield_persisting) and all(fid in shielded_ids for fid in shield_persisting)
         if shielded_only and not only_shielded:
             continue
         if not orphaned:
@@ -12935,6 +12961,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                         collector=held_collector_ids,
                         carried=held_carried_ids,
                         gaps=gaps,
+                        closed_prs=prs_closed,
                     ),
                     what="held-open comment over partial coverage",
                 )
@@ -12942,13 +12969,14 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 post_comment(
                     repo,
                     existing_issue,
-                    render_clean_comment(audit_id, data, now, gaps=gaps),
+                    render_clean_comment(audit_id, data, now, gaps=gaps, closed_prs=prs_closed),
                     what="partial all-clear comment",
                 )
             log(
                 f"Audit {audit_id} found nothing, but {len(gaps)} coverage gap(s) "
                 f"mean it cannot vouch for the ledger's state; issue #{existing_issue} stays "
-                "open and no remediation pull request was closed."
+                "open and no remediation pull request was closed"
+                + (f", except the compliance shield's ({len(prs_closed)})." if prs_closed else ".")
             )
         elif existing_issue and unaccounted:
             # Zero findings over complete coverage, and the previous body
@@ -12966,6 +12994,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                     now,
                     collector=held_collector_ids,
                     carried=held_carried_ids,
+                    closed_prs=prs_closed,
                 ),
                 what="held-open comment",
             )
@@ -12973,7 +13002,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 f"Audit {audit_id} found nothing, but {len(unaccounted)} previous "
                 "finding(s) under checks it says it ran are neither reported nor "
                 f"explained; issue #{existing_issue} stays open and no remediation "
-                "pull request was closed."
+                "pull request was closed"
+                + (f", except the compliance shield's ({len(prs_closed)})." if prs_closed else ".")
             )
         elif existing_issue:
             post_comment(
