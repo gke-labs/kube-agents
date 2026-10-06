@@ -38,6 +38,33 @@ SYNC_FAILURE_TIMEOUT_SECONDS = 10.0
 THREAD_EXIT_DEADLINE_SECONDS = 5.0
 
 
+class _Stall:
+    """A stubbed lookup the test holds until after reconcile() has returned.
+
+    ``hold()`` is the stub's body: it blocks on ``release`` and sets ``finished`` on the way
+    out. The test releases it only once reconcile() has returned (``assert_run_went_on``),
+    and cleanup releases it on a failing path so a failed assertion does not hold the worker
+    into the next test. ``finished`` still unset at return is the proof the run went on
+    without the lookup; a map that waited for it returns only after
+    SYNC_FAILURE_TIMEOUT_SECONDS, with ``finished`` set and the lookup's result read.
+    """
+
+    def __init__(self, case: unittest.TestCase):
+        self._case = case
+        self.release = threading.Event()
+        self.finished = threading.Event()
+        case.addCleanup(self.release.set)
+
+    def hold(self) -> None:
+        self.release.wait(SYNC_FAILURE_TIMEOUT_SECONDS)
+        self.finished.set()
+
+    def assert_run_went_on(self, what: str) -> None:
+        """Called once reconcile() has returned: the lookup is still held, then released."""
+        self._case.assertFalse(self.finished.is_set(), f"the run waited out {what}")
+        self.release.set()
+
+
 def _identity(project="p", cluster="c", location="us-central1"):
     return {"project": project, "cluster": cluster, "location": location}
 
@@ -1159,25 +1186,18 @@ class ScopeTest(HomesMixin):
     def test_a_listing_still_running_at_the_budget_reads_unreachable_and_the_run_goes_on(self):
         self._write_previous([{"id": "gone", "state": rec.STATE_RETIRING}])
         cuts: dict[str, float] = {}
-        # The slow listing blocks until the test releases it, which it does only once
-        # reconcile() has returned: `finished` still unset at that point is the proof the
-        # run went on without it. A map that waited for it would return only after the
-        # release timeout, with `finished` set and the listing read as ok.
-        release = threading.Event()
-        finished = threading.Event()
-        self.addCleanup(release.set)
+        stall = _Stall(self)
 
         def lister(project, timeout=None):
             cuts[project] = timeout
             if project == "slow":
-                release.wait(SYNC_FAILURE_TIMEOUT_SECONDS)
-                finished.set()
+                stall.hold()
             return [], rec.OUTCOME_OK
         before = set(threading.enumerate())
         with mock.patch.object(rec, "LIST_BUDGET_SECONDS", 0.3), mock.patch.object(rec, "LIST_GRACE_SECONDS", 0.05):
             report, _, deleted = self._run({"projects": ["slow", "quick"]}, lister,
                                            profiles=["cluster-g"], identities={"cluster-g": _identity("gone", "g")})
-        self.assertFalse(finished.is_set(), "the run waited out a listing that was still running at the budget")
+        stall.assert_run_went_on("a listing that was still running at the budget")
         self.assertEqual(report["projects"], {self.MGMT: rec.OUTCOME_OK, "quick": rec.OUTCOME_OK, "slow": rec.OUTCOME_UNREACHABLE})
         # Unreachable switches the scope prune off; the snapshot is still written.
         self.assertEqual((deleted, report["retiring"]), ([], ["gone"]))
@@ -1185,10 +1205,9 @@ class ScopeTest(HomesMixin):
         # The worker's own timeout was cut to the budget left, so no thread outlives the run
         # by more than the grace: the interpreter joins the pool's threads at exit.
         self.assertLessEqual(cuts["slow"], 1.0)
-        # And the pool was shut down, so once its lookup returns the worker exits rather than
-        # idling for more work. Threads, not a count: an earlier test's pool worker can still
-        # be exiting when this starts.
-        release.set()
+        # And once its lookup has returned (it was released above), the worker leaves: no
+        # thread the run started is still alive at the deadline. Threads, not a count: an
+        # earlier test's pool worker can still be exiting when this starts.
         leftover = [t for t in threading.enumerate() if t not in before]
         exit_deadline = time.monotonic() + THREAD_EXIT_DEADLINE_SECONDS
         for thread in leftover:
@@ -1398,24 +1417,18 @@ class ScopeTest(HomesMixin):
         # wait out the stall (the walk used to be sequential at 30 s per stalled cluster).
         ids = {"cluster-a": _identity(self.MGMT, "a"), "cluster-b": _identity(self.MGMT, "b"),
                "cluster-c": _identity(self.MGMT, "c")}
-        # The stalled describe blocks until released after reconcile() returns; `finished`
-        # unset at that point is what proves the run did not wait for it.
-        release = threading.Event()
-        finished = threading.Event()
-        self.addCleanup(release.set)
+        stall = _Stall(self)
 
         def exists(project, cluster, location, timeout=None):
             if cluster == "a":
-                release.wait(SYNC_FAILURE_TIMEOUT_SECONDS)
-                finished.set()
+                stall.hold()
             return True if cluster != "c" else False
 
         listings = {self.MGMT: [(self.MGMT, "b", "us-central1")]}
         with mock.patch.object(rec, "PRUNE_BUDGET_SECONDS", 0.2), mock.patch.object(rec, "PRUNE_SECONDS_PER_DESCRIBE", 0.05), \
                 mock.patch.object(rec, "LIST_GRACE_SECONDS", 0.05):
             report, _, deleted = self._run({}, listings, profiles=list(ids), identities=ids, exists=exists)
-        self.assertFalse(finished.is_set(), "the run waited out a stalled describe")
-        release.set()
+        stall.assert_run_went_on("a stalled describe")
         self.assertEqual(report["skipped_error"], ["cluster-a"])
         self.assertEqual(report["kept"], ["cluster-b"])
         self.assertEqual(deleted, ["cluster-c"])
@@ -1558,17 +1571,12 @@ class ScopeTest(HomesMixin):
     def test_container_searches_share_the_listing_budget_and_the_management_listing_comes_first(self):
         calls: dict[str, float] = {}
         order: list[str] = []
-        # The search blocks until released after reconcile() returns; `finished` unset at
-        # that point is what proves the run did not wait for it.
-        release = threading.Event()
-        finished = threading.Event()
-        self.addCleanup(release.set)
+        stall = _Stall(self)
 
         def search(container, timeout=None):
             order.append(container)
             calls[container] = timeout
-            release.wait(SYNC_FAILURE_TIMEOUT_SECONDS)
-            finished.set()
+            stall.hold()
             return None, rec.OUTCOME_UNREACHABLE
 
         def lister(project, timeout=None):
@@ -1577,8 +1585,7 @@ class ScopeTest(HomesMixin):
             return [], rec.OUTCOME_OK
         with mock.patch.object(rec, "LIST_BUDGET_SECONDS", 0.3), mock.patch.object(rec, "LIST_GRACE_SECONDS", 0.05):
             report, _, _ = self._run({"projects": ["p2"], "folders": ["111111111111"]}, lister, searches=search)
-        self.assertFalse(finished.is_set(), "the run waited out a container search still running at the budget")
-        release.set()
+        stall.assert_run_went_on("a container search still running at the budget")
         # Management first, with its full timeout; the container and the explicit project are
         # cut to the budget left, which is the floor once the container has spent it.
         self.assertEqual(order[0], self.MGMT)
@@ -2967,16 +2974,13 @@ class ScopeTest(HomesMixin):
 
     def test_selector_lookups_share_the_listing_budget_with_the_containers(self):
         calls: dict[str, float] = {}
-        # The container search and the selector lookup both block until released after
-        # reconcile() returns; `finished` unset at that point proves it waited for neither.
-        release = threading.Event()
-        finished = threading.Event()
-        self.addCleanup(release.set)
+        # One stall for the container search and the selector lookup both: `finished` unset
+        # at return proves the run waited for neither.
+        stall = _Stall(self)
 
         def stalled(group, timeout=None):
             calls[group] = timeout
-            release.wait(SYNC_FAILURE_TIMEOUT_SECONDS)
-            finished.set()
+            stall.hold()
             return None, rec.OUTCOME_UNREACHABLE
 
         def lister(project, timeout=None):
@@ -2985,8 +2989,7 @@ class ScopeTest(HomesMixin):
         with mock.patch.object(rec, "LIST_BUDGET_SECONDS", 0.3), mock.patch.object(rec, "LIST_GRACE_SECONDS", 0.05):
             report, _, _ = self._run({"projects": ["p2"], "folders": ["111111111111"], "metricsScopes": ["mon-proj"]},
                                      lister, searches=stalled, selectors=stalled)
-        self.assertFalse(finished.is_set(), "the run waited out a lookup still running at the budget")
-        release.set()
+        stall.assert_run_went_on("a lookup still running at the budget")
         self.assertIsNone(calls[self.MGMT])
         self.assertLessEqual(calls["folders/111111111111"], 1.0)
         self.assertLessEqual(calls[self.SCOPE], 1.0)
