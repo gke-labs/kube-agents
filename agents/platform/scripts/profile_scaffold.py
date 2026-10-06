@@ -38,6 +38,7 @@ DEFAULT_LEGACY_CRON_RISK: str = "low"
 # jobs.json is a profile with no cron roster, and this runs during start-up
 # on a volume that may be mid-restart.
 SCRATCH_SUFFIX: str = ".tmp"
+JSON_INDENT: int = 2
 
 
 
@@ -164,7 +165,7 @@ def read_json(path: Path) -> object | None:
 def write_json_atomic(path: Path, payload: object, *, sort_keys: bool = False) -> None:
     """Write `payload` as JSON to `path` via a scratch sibling and os.replace."""
     scratch = path.with_name(path.name + SCRATCH_SUFFIX)
-    scratch.write_text(json.dumps(payload, indent=2, sort_keys=sort_keys) + "\n", encoding="utf-8")
+    scratch.write_text(json.dumps(payload, indent=JSON_INDENT, sort_keys=sort_keys) + "\n", encoding="utf-8")
     os.replace(scratch, path)
 
 
