@@ -143,27 +143,43 @@ ROLLING_KINDS = ("heartbeat", "status")
 NEEDS_YOU_KIND = "blocked"
 PR_REPORT_KIND = "completed"
 
-#: With ``KAGE_SLACK_UX`` on, a card a worker fanned out folds its report into
-#: its row in the thread's plan rather than posting it, when the card that
-#: created it is still open and subscribed to the same thread and created at
-#: least one other card: that card's own completion is the answer, and
-#: ``kanban_children_settled`` holds it until its children settle. A worker's
-#: only child, a single-cluster delegation, posts its whole report as before.
+#: With ``KAGE_SLACK_UX`` on, a card beneath a fan-out folds its report into
+#: its row in the thread's plan rather than posting it, when its nearest
+#: ancestor that created more than one card is still open and subscribed to the
+#: same thread: that card's own completion is the answer, and
+#: ``kanban_children_settled`` holds it until its children settle. That covers
+#: a card a fanned-out card filed in turn, such as a Platform Agent card per
+#: cluster handing its cluster to the Cluster Agent. A chain with no fan-out
+#: above it, a single-cluster delegation, posts its whole report as before.
 #: Only a completion folds; a failure or a question posts.
 FOLDED_KIND = "completed"
 
-#: One row when the card was created by a worker whose card is still open,
-#: subscribed to the thread and the creator of another card too: the creator
-#: Hermes stamps on the ``created`` event (``hermes_cli/kanban_db.py``), the
-#: open statuses those ``kanban_children_settled`` waits on.
-OPEN_CREATOR_SQL = (
-    "SELECT 1 FROM task_events e "
-    "JOIN tasks t ON t.id = json_extract(e.payload, '$.creator_task_id') "
+#: How many creators up the fold looks for a fan-out. Delegation runs three
+#: deep (Planning Agent, Platform Agent, Cluster Agent); the bound only stops a
+#: malformed chain from walking the board.
+FOLD_ANCESTOR_DEPTH = 8
+
+#: One row when the card's nearest ancestor that created more than one card is
+#: still open and subscribed to the thread: the creators Hermes stamps on each
+#: ``created`` event (``hermes_cli/kanban_db.py``), walked up from the card,
+#: and the open statuses ``kanban_children_settled`` waits on. Parameters: the
+#: card, the depth bound, then the subscription's platform, chat and thread.
+FANNED_OUT_ANCESTOR_SQL = (
+    "WITH RECURSIVE up(id, depth) AS ("
+    "SELECT json_extract(payload, '$.creator_task_id'), 1 FROM task_events "
+    "WHERE task_id = ? AND kind = 'created' "
+    "UNION ALL "
+    "SELECT json_extract(e.payload, '$.creator_task_id'), up.depth + 1 FROM task_events e "
+    "JOIN up ON e.task_id = up.id WHERE e.kind = 'created' AND up.depth < ?"
+    "), fan(id) AS ("
+    "SELECT up.id FROM up WHERE up.id IS NOT NULL AND (SELECT count(*) FROM task_events o "
+    "WHERE o.kind = 'created' AND json_extract(o.payload, '$.creator_task_id') = up.id) > 1 "
+    "ORDER BY up.depth LIMIT 1"
+    ") "
+    "SELECT 1 FROM fan JOIN tasks t ON t.id = fan.id "
     "JOIN kanban_notify_subs s ON s.task_id = t.id "
-    "WHERE e.task_id = ? AND e.kind = 'created' AND t.status NOT IN ('done', 'archived') "
+    "WHERE t.status NOT IN ('done', 'archived') "
     "AND lower(s.platform) = ? AND s.chat_id = ? AND COALESCE(s.thread_id, '') = ? "
-    "AND EXISTS (SELECT 1 FROM task_events o WHERE o.kind = 'created' AND o.task_id != e.task_id "
-    "AND json_extract(o.payload, '$.creator_task_id') = t.id) "
     "LIMIT 1"
 )
 
@@ -523,13 +539,16 @@ async def _settle_plan_row(
         return False
 
 
-def _creator_open(sub: dict, board: Optional[str]) -> bool:
+def _fan_out_open(sub: dict, board: Optional[str]) -> bool:
     from hermes_cli import kanban_db_connect
 
     conn = kanban_db_connect.connect(board=board)
     try:
-        params = (sub["task_id"], str(sub.get("platform") or "").lower(), sub["chat_id"], sub.get("thread_id") or "")
-        return conn.execute(OPEN_CREATOR_SQL, params).fetchone() is not None
+        params = (
+            sub["task_id"], FOLD_ANCESTOR_DEPTH,
+            str(sub.get("platform") or "").lower(), sub["chat_id"], sub.get("thread_id") or "",
+        )
+        return conn.execute(FANNED_OUT_ANCESTOR_SQL, params).fetchone() is not None
     finally:
         conn.close()
 
@@ -540,9 +559,9 @@ async def _folds(sub: dict, board: Optional[str]) -> bool:
     A read that fails posts the report, as it did before the plan.
     """
     try:
-        return await asyncio.to_thread(_creator_open, sub, board)
+        return await asyncio.to_thread(_fan_out_open, sub, board)
     except Exception as exc:  # noqa: BLE001 — fail towards posting the report
-        logger.debug("kanban progress: reading the creator of %s failed: %s", sub.get("task_id"), exc)
+        logger.debug("kanban progress: reading the fan-out above %s failed: %s", sub.get("task_id"), exc)
         return False
 
 
@@ -759,8 +778,8 @@ async def deliver(
     rolling message of its own, with the rolling message as the fallback when
     the plan cannot be posted; ``title`` is the card's, which the row leads with
     in a plan of several or falls back to. See
-    ``gateway/slack_ux_status.py``. One of several cards fanned out by a card
-    still open on the same thread completes into its row and posts nothing, returning
+    ``gateway/slack_ux_status.py``. A card beneath a fan-out still open on the
+    same thread completes into its row and posts nothing, returning
     ``None``, once the plan shows that row complete (:data:`FOLDED_KIND`).
     Every line it posts, holds or edits keeps
     the ``@assignee`` and drops the board tag and ``Kanban <id>``

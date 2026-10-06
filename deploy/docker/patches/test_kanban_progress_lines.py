@@ -1265,7 +1265,7 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
 
 
 class CreatorOpenTest(unittest.IsolatedAsyncioTestCase):
-    """The read that decides whether a fanned-out card's report folds, against a sqlite board."""
+    """The read that decides whether a card beneath a fan-out folds its report, against a sqlite board."""
 
     def setUp(self):
         self.path = Path(tempfile.mkdtemp()) / "kanban.db"
@@ -1313,6 +1313,31 @@ class CreatorOpenTest(unittest.IsolatedAsyncioTestCase):
         # A single-cluster delegation: the Cluster Agent's whole report is the answer's evidence.
         self._set("DELETE FROM task_events WHERE task_id = 't_e0c2'")
         self.assertFalse(await kanban_progress_lines._folds(SLACK_SUB, None))
+
+    def _grandchild(self, creator="t_e0c1"):
+        self._set(
+            "INSERT INTO task_events VALUES ('t_g1', 'created', ?)", f'{{"creator_task_id": "{creator}"}}',
+        )
+        return {**SLACK_SUB, "task_id": "t_g1"}
+
+    async def test_a_card_a_fanned_out_card_filed_folds(self):
+        # A Platform Agent card per cluster handing its cluster to the Cluster Agent:
+        # the per-cluster card's row and the fan-out's answer carry the report.
+        self.assertTrue(await kanban_progress_lines._folds(self._grandchild(), None))
+
+    async def test_a_chain_with_no_fan_out_above_it_does_not(self):
+        # Planning Agent, Platform Agent, Cluster Agent, one card each: a single-cluster delegation.
+        self._set("DELETE FROM task_events WHERE task_id = 't_e0c2'")
+        self.assertFalse(await kanban_progress_lines._folds(self._grandchild(), None))
+
+    async def test_the_nearest_fan_out_decides(self):
+        # t_e0c1 fanned out in turn and has finished: its own answer stands, whatever its creator is doing.
+        sub = self._grandchild()
+        self._set("INSERT INTO task_events VALUES ('t_g2', 'created', '{\"creator_task_id\": \"t_e0c1\"}')")
+        self.assertFalse(await kanban_progress_lines._folds(sub, None))
+        self._set("INSERT INTO kanban_notify_subs VALUES ('t_e0c1', 'slack', ?, ?)", SLACK_SUB["chat_id"], SLACK_SUB["thread_id"])
+        self._set("UPDATE tasks SET status = 'running' WHERE id = 't_e0c1'")
+        self.assertTrue(await kanban_progress_lines._folds(sub, None))
 
     async def test_a_creator_on_another_thread_or_none_does_not(self):
         self.assertFalse(await kanban_progress_lines._folds({**SLACK_SUB, "thread_id": "1790717879.000001"}, None))

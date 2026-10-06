@@ -742,7 +742,7 @@ check(
 # With KAGE_SLACK_UX on, a fanned-out card's completion folds into its plan row
 # when its creator is still open on the same thread and created another card
 # too. A schema drift under
-# OPEN_CREATOR_SQL raises inside _folds, which posts the report instead, so the
+# FANNED_OUT_ANCESTOR_SQL raises inside _folds, which posts the report instead, so the
 # fold would quietly stop and every fanned-out card post its own line again.
 # The read itself runs here, against boards built with hermes_cli.
 print()
@@ -772,7 +772,7 @@ try:
     _fold_sub = {"task_id": _child, "platform": "slack", "chat_id": FOLD_CHANNEL, "thread_id": FOLD_THREAD}
     check(
         "a creator's only child does not fold",
-        not progress_lines._creator_open(_fold_sub, kb.DEFAULT_BOARD),
+        not progress_lines._fan_out_open(_fold_sub, kb.DEFAULT_BOARD),
         "a single-cluster delegation would lose the Cluster Agent's report",
     )
     _conn = kc.connect(board=kb.DEFAULT_BOARD)
@@ -782,13 +782,25 @@ try:
         _conn.close()
     check(
         "a card whose creator is open on the thread folds",
-        progress_lines._creator_open(_fold_sub, kb.DEFAULT_BOARD),
+        progress_lines._fan_out_open(_fold_sub, kb.DEFAULT_BOARD),
         "the creator read found nothing for a card a still-open card created",
+    )
+    _conn = kc.connect(board=kb.DEFAULT_BOARD)
+    try:
+        _grandchild = kb.create_task(
+            _conn, title="seeded-a pods", assignee="cluster-seeded-a", creator_task_id=_child,
+        )
+    finally:
+        _conn.close()
+    check(
+        "a card a fanned-out card filed folds",
+        progress_lines._fan_out_open({**_fold_sub, "task_id": _grandchild}, kb.DEFAULT_BOARD),
+        "the Cluster Agent's report beneath a per-cluster card would post on its own",
     )
     check(
         "a card no card created, or one on another thread, does not fold",
-        not progress_lines._creator_open({**_fold_sub, "task_id": _orphan}, kb.DEFAULT_BOARD)
-        and not progress_lines._creator_open({**_fold_sub, "thread_id": "1790000000.000200"}, kb.DEFAULT_BOARD),
+        not progress_lines._fan_out_open({**_fold_sub, "task_id": _orphan}, kb.DEFAULT_BOARD)
+        and not progress_lines._fan_out_open({**_fold_sub, "thread_id": "1790000000.000200"}, kb.DEFAULT_BOARD),
     )
     _conn = kc.connect(board=kb.DEFAULT_BOARD)
     try:
@@ -797,7 +809,7 @@ try:
         _conn.close()
     check(
         "a card whose creator is done does not fold",
-        not progress_lines._creator_open(_fold_sub, kb.DEFAULT_BOARD),
+        not progress_lines._fan_out_open(_fold_sub, kb.DEFAULT_BOARD),
         "a follow-up filed by a finished card would lose its report",
     )
 except Exception as exc:  # noqa: BLE001 — a drift is the failure this section exists to report

@@ -45,8 +45,7 @@ shows in the plan; a card this process already put on a plan opens no second
 row, so a replayed event or one arriving after its plan was dropped adds
 nothing far down the thread. :func:`settle_row` says whether the plan now
 shows the card complete, which lets ``kanban_progress_lines`` fold the report
-of one of several cards fanned out by another card still open on the thread
-into its row.
+of a card beneath a fan-out still open on the thread into its row.
 Two kinds upstream never posts
 reach the plan through ``kanban_progress_lines.silent_event``:
 ``unblocked`` sets a waiting row, or one that gave up, running again, and
