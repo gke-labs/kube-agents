@@ -461,7 +461,9 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
         "",
         (
             f"First-time environment scan, compiled at {stamp} from the per-cluster audit cards of "
-            f"sweep `{sweep['id']}`. This is the complete findings set; the delivered report is ranked from it."
+            f"sweep `{sweep['id']}`. It carries every entry the audits filed under `findings`, and the delivered "
+            "report is ranked from those alone; a condition an audit recorded only in a structured field (HPA, "
+            "security context, namespace governance, node autoscaling) is not carried forward."
         ),
         "",
         "## Coverage",
@@ -549,6 +551,20 @@ def _sandbox():
     import sandbox_exec  # beside this script in the pod
 
     return sandbox_exec
+
+
+def report_written(data_dir: Path) -> bool | None:
+    """Whether ``INVENTORY.md`` is already where delivery reads it; None when unknown."""
+    try:
+        sx = _sandbox()
+        if not sx.sandbox_enabled():
+            return (data_dir / Path(REPORT_PATH).name).exists()
+        return sx.read_bytes(
+            REPORT_PATH, max_bytes=1, principal=sx.TERMINAL_PRINCIPAL, timeout=SANDBOX_TIMEOUT_SECONDS
+        ) is not None
+    except Exception as e:  # noqa: BLE001 - retry next tick
+        _log(f"cannot tell whether {REPORT_PATH} exists: {e}")
+        return None
 
 
 def covered(state: dict) -> bool:
@@ -757,6 +773,15 @@ def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, roster=None, now:
     ready = settled(state) and not unfiled
     timed_out = not ready and now - filed_at >= deadline(state)
     if not ready and not timed_out:
+        return None
+    # An install upgraded mid-delivery: the previous design's ranking card has
+    # already written the report the user is waiting for, and this sweep has no
+    # hand-off marker. Handing off would replace that report.
+    written = report_written(data_dir)
+    if written is None:
+        return None
+    if written:
+        _log(f"{REPORT_PATH} is already written and sweep {sweep_id} has no hand-off; leaving it for delivery")
         return None
     raw = compose(state, timed_out, now)
     if not write_raw(data_dir, raw):

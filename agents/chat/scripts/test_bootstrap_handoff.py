@@ -274,7 +274,8 @@ class HandOffTest(unittest.TestCase):
         self.scan_marker.write_text(f"task_id={SWEEP}\nfiled_at={NOW - 60}\n")
         self.filed = []
         self.sandbox = types.SimpleNamespace(
-            sandbox_enabled=lambda: False, TERMINAL_PRINCIPAL="agent", run=None)
+            sandbox_enabled=lambda: False, TERMINAL_PRINCIPAL="agent", run=None,
+            read_bytes=lambda *_a, **_k: None)
         patches = [
             mock.patch.object(h, "_board_path", lambda _d: self.board),
             mock.patch.object(h, "_sandbox", lambda: self.sandbox),
@@ -406,7 +407,39 @@ class HandOffTest(unittest.TestCase):
 
     def test_every_cluster_card_archived_cancels_the_hand_off(self):
         _board(self.board, clusters=[(tid, "archived", meta, "") for tid, _, meta, _ in _all_done()])
+        (self.d / "INVENTORY.raw.md").write_text("planted")
         self.assertIsNone(self._run(now=NOW + 10 * h.DEADLINE_SECONDS))
+        self.assertEqual(self.filed, [])
+        self.assertEqual((self.d / "INVENTORY.raw.md").read_text(), "planted")
+        self.assertFalse((self.d / "INVENTORY.md").exists())
+
+    def test_a_report_already_written_is_left_for_delivery(self):
+        # Upgraded mid-delivery: the previous design's sweep wrote both files and
+        # completed with no metadata; the user has not spoken yet.
+        _board(self.board, sweep_meta={}, clusters=[])
+        (self.d / "INVENTORY.raw.md").write_text("old raw")
+        (self.d / "INVENTORY.md").write_text("ranked report")
+        self.assertIsNone(self._run_roster([]))
+        self.assertEqual((self.d / "INVENTORY.md").read_text(), "ranked report")
+        self.assertEqual((self.d / "INVENTORY.raw.md").read_text(), "old raw")
+        self.assertFalse((self.d / h.HANDOFF_MARKER).exists())
+        self.assertEqual(self.filed, [])
+
+    def test_the_report_check_reads_the_sandbox(self):
+        _board(self.board, clusters=_all_done())
+        self.sandbox.sandbox_enabled = lambda: True
+        self.sandbox.run = lambda *_a, **_k: types.SimpleNamespace(returncode=0, stderr="")
+        reads = []
+        self.sandbox.read_bytes = lambda path, **kw: reads.append((path, kw)) or b"#"
+        self.assertIsNone(self._run())
+        self.assertEqual(reads[0][0], h.REPORT_PATH)
+        self.assertEqual(reads[0][1]["principal"], "agent")
+
+        def unreachable(*_a, **_k):
+            raise RuntimeError("ssh exit 255")
+
+        self.sandbox.read_bytes = unreachable
+        self.assertIsNone(self._run())
         self.assertEqual(self.filed, [])
 
     def test_a_raw_file_already_in_place_is_rebuilt_from_the_cards(self):
@@ -625,7 +658,7 @@ class HandOffTest(unittest.TestCase):
 
     def test_an_archived_sweep_is_left_alone_even_past_the_deadline(self):
         _board(self.board, sweep_status="archived", clusters=_all_done())
-        self.assertIsNone(self._run(now=NOW + h.DEADLINE_SECONDS))
+        self.assertIsNone(self._run(now=NOW + 10 * h.DEADLINE_SECONDS))
         self.assertFalse((self.d / "INVENTORY.raw.md").exists())
         self.assertEqual(self.filed, [])
 
