@@ -259,7 +259,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// posts below (DeliverableObserver). A non-text result hands over
 		// nothing: the notice that replaces it is not the deliverable.
 		if result != "" {
-			g.observeTaskDelivered(rec.Key, taskID, result)
+			g.observeDelivered(rec, taskID, result)
 		}
 		if result == "" {
 			result = completedNonTextResult
@@ -380,13 +380,18 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	if s.Status.Message != nil {
 		reason = joinTextParts(s.Status.Message.Parts)
 	}
-	g.observeTaskTerminal(rec.Key, taskID, s.Status.State, source, reason)
+	//
+	// Under the chain's root, and only for the task whose end is the
+	// chain's (observedAs): a turn that delegated and a child end quietly,
+	// and the root's one terminal comes from the wake or, when none runs,
+	// from observeChildEnd below.
+	g.observeEnded(rec, taskID, s.Status.State, source, reason)
 
-	// A delegated child's end wakes the session that asked (spec §4). After
-	// the terminal is announced: an observer correlates tasks by start
-	// order, so the child's end must precede the wake's start.
+	// A delegated child's end wakes the session that asked (spec §4).
 	if ref, ok := rec.TaskRefFor(taskID); ok && ref.Role == taskRoleChild {
-		g.wakeSession(ctx, rec, ref, s.Status.State, result, reason)
+		if woken, why := g.wakeSession(ctx, rec, ref, s.Status.State, result, reason); !woken {
+			g.observeChildEnd(rec, ref, s.Status.State, source, reason, why)
+		}
 	}
 }
 

@@ -262,6 +262,20 @@ type TaskRef struct {
 	ParentTaskID string   `json:"parentTaskId,omitempty"`
 	Children     []string `json:"children,omitempty"`
 	Depth        int      `json:"depth,omitempty"`
+	// RootTaskID is the human (or door) turn a delegation chain started
+	// from: a human turn's own id, copied to its child and the wake after
+	// it, and down a longer chain unchanged. The adapter's observers know
+	// the whole chain by it (observedAs). Empty on entries written before
+	// it existed, which read as their own root.
+	RootTaskID string `json:"rootTaskId,omitempty"`
+}
+
+// rootID is the id the entry's chain is known by outside the gateway.
+func (ref TaskRef) rootID() string {
+	if ref.RootTaskID != "" {
+		return ref.RootTaskID
+	}
+	return ref.ID
 }
 
 // Task roles on TaskRef.Role; the empty role is a human turn.
@@ -331,6 +345,21 @@ func (rec *SessionRecord) TaskRefFor(taskID string) (TaskRef, bool) {
 		}
 	}
 	return TaskRef{}, false
+}
+
+// observedAs is the task id the adapter's observers know taskID by, and
+// whether taskID's own end is the end they are told. A delegation chain is
+// one task to them, its root (TaskRef.RootTaskID): a child is never named,
+// and neither is a turn that delegated, whose end is not the chain's. Every
+// other turn's end is its root's - a human turn is its own root, and a
+// wake that did not delegate ends the chain it continues. An id the record
+// does not hold is passed through as it is.
+func (rec *SessionRecord) observedAs(taskID string) (id string, ends bool) {
+	ref, ok := rec.TaskRefFor(taskID)
+	if !ok {
+		return taskID, true
+	}
+	return ref.rootID(), ref.Role != taskRoleChild && len(ref.Children) == 0
 }
 
 // TaskCanceled reports whether a cancel for the task is on the stream (see

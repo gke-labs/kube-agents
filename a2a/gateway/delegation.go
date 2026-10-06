@@ -24,6 +24,10 @@ const (
 	ruleDelegationDoorUnlisted  = "delegation.door-unlisted"
 )
 
+// reasonWakeNotStarted is the reason token on a delegation chain's root
+// terminal when the child ended and no wake could run (observeChildEnd).
+const reasonWakeNotStarted = "wake-not-started"
+
 // delegatedLineNote suffixes a child's rolling line, so the room can tell the
 // task the session handed on from one a human asked for.
 const delegatedLineNote = "(delegated to platform)"
@@ -185,6 +189,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		LineNote:             delegatedLineNote,
 		SteerAuthors:         parent.SteerAuthors,
 		SteerAuthorsOverflow: parent.SteerAuthorsOverflow,
+		RootTaskID:           parent.rootID(),
 	})
 	if !ok {
 		// startTaskWith has said why, in the log and to the room; the
@@ -395,10 +400,15 @@ func (g *Gateway) flushNotices(conversation string, rs *relayState) {
 // (spec §4): a fresh incarnation and the ordinary spawn, as a human turn
 // gets, with gateway-authored text carrying the outcome and the delegating
 // turn's stored attribution, so the wake runs under the requester who asked.
-// Called from relayTerminal under the session lock, after the child's result
-// or failure is posted, its ActiveTask released and its end announced; the
-// relay writes the record back.
-func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child TaskRef, state lib.TaskState, result, reason string) {
+// Called under the session lock, after the child's result or failure is
+// posted and its ActiveTask released: from relayTerminal on the child's
+// relayed terminal, and from healActiveTask on a terminal the heal found on
+// the stream. The caller writes the record back.
+//
+// It reports whether the wake reached the bus, and when it did not, why, in
+// a phrase for the chain root's terminal reason (observeChildEnd). A stop
+// the requester asked for reports false and no reason.
+func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child TaskRef, state lib.TaskState, result, reason string) (bool, string) {
 	log := g.log.With("child", child.ID, "conversation", rec.Key, "state", string(state))
 	// The gateway published a cancel for the child: the human said stop,
 	// and whatever the executor answered with, waking the session would act
@@ -406,25 +416,25 @@ func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child Tas
 	// below, and wakes.
 	if child.Canceled {
 		log.Info("no wake: the child was stopped by its requester")
-		return
+		return false, ""
 	}
 	// A later turn holds the conversation (the child was stopped and a human
 	// moved on before its end arrived). A fresh incarnation now would retire
 	// that turn's pod.
 	if rec.ActiveTask != nil {
 		log.Info("no wake: another task holds the conversation", "active", rec.ActiveTask.TaskID)
-		return
+		return false, "another task holds the conversation"
 	}
 	if g.spawner == nil {
 		log.Warn("no wake: no session spawner")
-		return
+		return false, "no session spawner"
 	}
 	parent, ok := rec.TaskRefFor(child.ParentTaskID)
 	authority, err := AuthorityFromAttribution(parent.Attribution)
 	if !ok || parent.Requester == nil || len(parent.Attribution) == 0 || err != nil {
 		log.Warn("no wake: the delegating turn's requester is not on record", "parent", child.ParentTaskID)
 		g.post(rec.Key, noticeWakeNoRequester)
-		return
+		return false, "the delegating turn's " + requesterGone
 	}
 	// The session that delegated: the parent's addressee is the incarnation
 	// it ran on, which the mint checked was the record's bus session.
@@ -445,7 +455,7 @@ func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child Tas
 	// posted the standard notice, and the child's result stands as relayed.
 	if !g.freshIncarnation(ctx, rec) {
 		log.Info("no wake: the session could not be started")
-		return
+		return false, "the session could not be started"
 	}
 	rec.seedSessionAuthors(inherited, inheritedUnknown, inheritedSince)
 	// The wake is the delegating turn's successor: the chain's correlation
@@ -467,8 +477,28 @@ func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child Tas
 		Depth:                child.Depth,
 		SteerAuthors:         steered.SteerAuthors,
 		SteerAuthorsOverflow: steered.SteerAuthorsOverflow,
+		RootTaskID:           child.rootID(),
 	})
-	if ok {
-		log.Info("session woken", "wake", wakeID, "session", rec.BusSession)
+	if !ok {
+		return false, "the wake could not be started"
 	}
+	log.Info("session woken", "wake", wakeID, "session", rec.BusSession)
+	return true, ""
+}
+
+// observeChildEnd announces a delegation chain's root terminal when its
+// child ended and no wake runs: the one end the observers are owed, since the
+// turn that delegated and the child both ended quietly (observedAs). A stop
+// the requester asked for is the root canceled; otherwise the root failed,
+// with the child's terminal source and a reason token saying the session was
+// not woken and why. Nothing is delivered: the child's result is the wake's
+// to digest, and it was posted to the conversation.
+func (g *Gateway) observeChildEnd(rec *SessionRecord, child TaskRef, state lib.TaskState, source TerminalSource, reason, why string) {
+	root := child.rootID()
+	if child.Canceled {
+		g.observeTaskTerminal(rec.Key, root, lib.StateCanceled, source, reason)
+		return
+	}
+	g.observeTaskTerminal(rec.Key, root, lib.StateFailed, source,
+		fmt.Sprintf("reason: %s - %s; the delegated task %s ended %s", reasonWakeNotStarted, why, child.ID, state))
 }

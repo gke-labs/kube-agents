@@ -1099,6 +1099,14 @@ func startRigWithSpawnerRoute(t *testing.T, defaultAddressee string) (*rig, *fak
 // when set, edits the Config before New sees it (an allowlist, a depth bound).
 func startRigWithSpawnerCap(t *testing.T, defaultAddressee string, maxSessions int, tweak func(*Config)) (*rig, *fakeSpawner) {
 	t.Helper()
+	return startRigWithSpawnerAdapter(t, defaultAddressee, maxSessions, tweak, nil)
+}
+
+// startRigWithSpawnerAdapter is startRigWithSpawnerCap with the adapter the
+// gateway drives chosen by wrap, which is handed the rig's fake (nil: the
+// fake itself). The rig's posts and edits are still the fake's.
+func startRigWithSpawnerAdapter(t *testing.T, defaultAddressee string, maxSessions int, tweak func(*Config), wrap func(*fakeAdapter) Adapter) (*rig, *fakeSpawner) {
+	t.Helper()
 	s := startServer(t)
 	url := s.ClientURL()
 	provision(t, url)
@@ -1139,7 +1147,11 @@ func startRigWithSpawnerCap(t *testing.T, defaultAddressee string, maxSessions i
 	// that is observable only as its log line (an ignored delegation).
 	logs := &lockedBuffer{}
 	log := slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, logs), nil))
-	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord", Spawner: spawn, Logger: log})
+	var driven Adapter = adapter
+	if wrap != nil {
+		driven = wrap(adapter)
+	}
+	g, err := New(Options{Client: client, Adapter: driven, Config: cfg, Backend: "discord", Spawner: spawn, Logger: log})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -1157,6 +1169,13 @@ func startRigWithSpawnerCap(t *testing.T, defaultAddressee string, maxSessions i
 // whileDown, when given, runs between the two: the bus traffic a gateway that
 // was down never saw.
 func restartRig(t *testing.T, r *rig, whileDown ...func()) (*rig, *fakeSpawner) {
+	t.Helper()
+	return restartRigWrapped(t, r, nil, whileDown...)
+}
+
+// restartRigWrapped is restartRig with the second gateway's adapter chosen
+// by wrap, as startRigWithSpawnerAdapter chooses the first's.
+func restartRigWrapped(t *testing.T, r *rig, wrap func(*fakeAdapter) Adapter, whileDown ...func()) (*rig, *fakeSpawner) {
 	t.Helper()
 	r.stop()
 	select {
@@ -1181,7 +1200,11 @@ func restartRig(t *testing.T, r *rig, whileDown ...func()) (*rig, *fakeSpawner) 
 	cfg := *r.g.cfg
 	logs := &lockedBuffer{}
 	log := slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, logs), nil))
-	g, err := New(Options{Client: client, Adapter: adapter, Config: &cfg, Backend: "discord", Spawner: spawn, Logger: log})
+	var driven Adapter = adapter
+	if wrap != nil {
+		driven = wrap(adapter)
+	}
+	g, err := New(Options{Client: client, Adapter: driven, Config: &cfg, Backend: "discord", Spawner: spawn, Logger: log})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

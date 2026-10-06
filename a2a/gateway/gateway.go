@@ -739,6 +739,15 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// have to spell "stop" to reach a control path. Read after the strip
 	// above, so a post-flip "/session stop" is the stop it unwraps to.
 	stopping := msg.Intent == IntentCancel || isStop(msg.Text)
+	// A program holds a delegation chain's root id only (observedAs), so a
+	// cancel naming the root while the chain runs is a cancel of the task
+	// that is running: the child, or the wake. Published at the root's own
+	// task, it would land on a turn that has already ended.
+	if stopping && msg.TaskID != "" && active != nil && active.TaskID != msg.TaskID {
+		if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.rootID() == msg.TaskID {
+			msg.TaskID = active.TaskID
+		}
+	}
 	switch {
 	case msg.Intent == "" && sessionCmd:
 		if !g.sessionCommand(ctx, rec, msg, backend, sessionRest, principal, authority) {
@@ -935,11 +944,15 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		if task.State == lib.StateCompleted {
 			if art := task.Artifact(lib.ArtifactResult); art != nil {
 				if result := joinTextParts(art.Parts); result != "" {
-					g.observeTaskDelivered(rec.Key, active.TaskID, result)
+					g.observeDelivered(rec, active.TaskID, result)
 				}
 			}
 		}
-		g.observeTaskTerminal(rec.Key, active.TaskID, task.State, source, finalMessageText(task))
+		// Under the chain's root, and not at all for a child: its result
+		// is the wake's to digest, not the root's deliverable, and the
+		// root's end comes from the wake below or, with no wake, from
+		// observeChildEnd.
+		g.observeEnded(rec, active.TaskID, task.State, source, finalMessageText(task))
 		healed, healedSource, healedTask = true, source, task
 	case isTaskNotFound(err) && !active.SubmittedAt.IsZero() &&
 		time.Since(active.SubmittedAt) > g.cfg.FirstEventGrace:
@@ -954,7 +967,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// failed answer decides whether a run is the agent's fault or
 		// the install's. Nothing is published: as handleInbound's comment
 		// says, age is not evidence.
-		g.observeTaskTerminal(rec.Key, active.TaskID, lib.StateFailed, TerminalNeverStarted, "")
+		g.observeEnded(rec, active.TaskID, lib.StateFailed, TerminalNeverStarted, "")
 		healed, healedSource = true, TerminalNeverStarted
 	}
 	if healed {
@@ -997,9 +1010,14 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// child that never started does not: the room has the never-started
 		// notice, and there is no outcome to hand the session. The turn
 		// that ran the heal then routes against the wake as its active task.
-		if child && healedTask != nil {
+		switch {
+		case child && healedTask != nil:
 			result, reason := healedChildOutcome(healedTask)
-			g.wakeSession(ctx, rec, ref, healedTask.State, result, reason)
+			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, result, reason); !woken {
+				g.observeChildEnd(rec, ref, healedTask.State, healedSource, reason, why)
+			}
+		case child:
+			g.observeChildEnd(rec, ref, lib.StateFailed, TerminalNeverStarted, "", "the delegated task never started")
 		}
 		// Write the release now, not at the end of the turn: a turn that
 		// returns early — a cap refusal, on exactly the Delegate that
@@ -1082,8 +1100,18 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 	// a wildcard is a miss, not a replay of the whole addressee. A task
 	// older than the history cap reads as unknown, which is the price.
 	var addressee string
+	// The stream read: taskID's own, except that a delegation chain's root
+	// reads as the chain's running task while one runs - the root is the
+	// one id a program holds (observedAs), and the root's own stream is a
+	// turn that ended when it delegated.
+	read := taskID
+	if active != nil && active.TaskID != taskID {
+		if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.rootID() == taskID {
+			read = active.TaskID
+		}
+	}
 	switch {
-	case active != nil && active.TaskID == taskID:
+	case active != nil && active.TaskID == read:
 		state.Active = true
 		state.SubmittedAt = active.SubmittedAt
 		state.Detached = active.Detached
@@ -1093,7 +1121,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		// Against the addressee the task's own subjects carried: after a
 		// Delegate re-home rec.Addressee is not it (the relay's terminal
 		// replay makes the same choice).
-		addressee = rec.AddresseeFor(taskID)
+		addressee = rec.AddresseeFor(read)
 	default:
 		ref, owned := rec.TaskRefFor(taskID)
 		if !owned {
@@ -1101,7 +1129,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		}
 		addressee = ref.Addressee
 	}
-	task, terminalSubject, terr := g.client.TasksGetAttributed(ctx, addressee, taskID)
+	task, terminalSubject, terr := g.client.TasksGetAttributed(ctx, addressee, read)
 	switch {
 	case terr == nil:
 		state.ExecutorState = task.State
@@ -1125,7 +1153,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 			// only the executor's; a supervisor terminal says an executor
 			// died or never ran, which is the install's.
 			state.TerminalSource = TerminalFromExecutor
-			if terminalSubject == lib.TaskSupervisorSubject(addressee, taskID) {
+			if terminalSubject == lib.TaskSupervisorSubject(addressee, read) {
 				state.TerminalSource = TerminalFromSupervisor
 			}
 			if art := task.Artifact(lib.ArtifactResult); art != nil {
@@ -1143,7 +1171,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		// A transport failure cannot rule out events, so it is not "no
 		// executor": the caller learns that the gateway could not look,
 		// never that nothing is there.
-		return state, fmt.Errorf("reading task %s on %s: %w", taskID, addressee, terr)
+		return state, fmt.Errorf("reading task %s on %s: %w", read, addressee, terr)
 	}
 	return state, nil
 }
@@ -1411,6 +1439,29 @@ func (g *Gateway) observeTaskTerminal(conversation, taskID string, state lib.Tas
 	}
 }
 
+// observeDelivered, observeEnded and observeCancel are the three above as a
+// task of the record is announced: under its chain's root, and only for the
+// task whose end is the chain's (SessionRecord.observedAs). A program behind
+// a door submitted one task, so a delegation it never asked for must not
+// hand it a second task's start, an early "delegated to platform" as its
+// answer, or the end of a task it never heard of.
+func (g *Gateway) observeDelivered(rec *SessionRecord, taskID, result string) {
+	if id, ends := rec.observedAs(taskID); ends {
+		g.observeTaskDelivered(rec.Key, id, result)
+	}
+}
+
+func (g *Gateway) observeEnded(rec *SessionRecord, taskID string, state lib.TaskState, source TerminalSource, reason string) {
+	if id, ends := rec.observedAs(taskID); ends {
+		g.observeTaskTerminal(rec.Key, id, state, source, reason)
+	}
+}
+
+func (g *Gateway) observeCancel(rec *SessionRecord, taskID string) {
+	id, _ := rec.observedAs(taskID)
+	g.observeCancelPublished(rec.Key, id)
+}
+
 // observeTaskDelivered hands a DeliverableObserver the completed task's
 // result whole, before the relay posts it in chunks. See the interface.
 func (g *Gateway) observeTaskDelivered(conversation, taskID, result string) {
@@ -1572,6 +1623,10 @@ type taskStart struct {
 	// parent's and its child's. Empty for a human turn.
 	SteerAuthors         []TaskRequester
 	SteerAuthorsOverflow bool
+	// RootTaskID is the chain's root (TaskRef.RootTaskID): a child's is its
+	// parent's, a wake's its child's. Empty for a human turn, which is its
+	// own.
+	RootTaskID string
 }
 
 // startTask opens a turn for a human message.
@@ -1653,8 +1708,13 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// post belongs to the task it just submitted. Announced after the two
 	// build steps above and before the publish, so the only way to be told
 	// about a task that never reaches the bus is the publish failure, which
-	// announces its own terminal below. See TaskObserver.
-	g.observeTaskStarted(rec.Key, taskID)
+	// announces its own terminal below. See TaskObserver. A child or a
+	// wake is not announced at all: the observers know the chain by its
+	// root (SessionRecord.observedAs), and a second start would replace
+	// or displace the task the caller holds.
+	if ts.Role == "" {
+		g.observeTaskStarted(rec.Key, taskID)
+	}
 
 	// Placeholder first, so the rolling line exists before the first event
 	// can arrive (the demo posts one while the pod cold-starts; same idea).
@@ -1677,6 +1737,10 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		Role:         ts.Role,
 		ParentTaskID: ts.ParentTaskID,
 		Depth:        ts.Depth,
+		RootTaskID:   ts.RootTaskID,
+	}
+	if ref.RootTaskID == "" {
+		ref.RootTaskID = taskID
 	}
 	ref.carrySteerAuthors(TaskRef{SteerAuthors: ts.SteerAuthors, SteerAuthorsOverflow: ts.SteerAuthorsOverflow})
 	rec.Tasks = append(rec.Tasks, ref)
@@ -1724,16 +1788,24 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		// for an answer that cannot come. Nothing is published here — this
 		// is the gateway telling its own adapter, not a terminal on the
 		// stream, which would be a claim about a task the stream has never
-		// heard of.
-		g.observeTaskTerminal(rec.Key, taskID, lib.StateFailed, TerminalFromGateway, "")
+		// heard of. A child or a wake was never announced; its caller says
+		// what the chain's root is owed (handleDelegateRequest leaves the
+		// parent to end as itself, wakeSession ends the root).
+		if ts.Role == "" {
+			g.observeTaskTerminal(rec.Key, taskID, lib.StateFailed, TerminalFromGateway, "")
+		}
 		return "", false
 	}
 
 	// The submission is on the subject now, which is the first moment
 	// anything can be said to have been handed to an executor. An observer
 	// told only about the start above would have to treat a task that never
-	// reached the bus as one that did. See TaskObserver.TaskAccepted.
-	g.observeTaskAccepted(rec.Key, taskID)
+	// reached the bus as one that did. See TaskObserver.TaskAccepted. Not
+	// for a child or a wake, as above: a door waiting on an accept would
+	// otherwise answer a later turn with an id it will never see end.
+	if ts.Role == "" {
+		g.observeTaskAccepted(rec.Key, taskID)
+	}
 
 	// Session-addressed routes get an incarnation; fixed addressees (the
 	// Hermes-first "platform") have their own executor and spawn nothing.
@@ -1845,7 +1917,7 @@ func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority 
 	// conversation's entries, and the line saying the cancel went belongs in
 	// what it reads.
 	g.post(rec.Key, "🛑 cancel sent — the task ends when the executor confirms")
-	g.observeCancelPublished(rec.Key, active.TaskID)
+	g.observeCancel(rec, active.TaskID)
 }
 
 // cancelNamedTask publishes kind:cancel for a task this conversation has
@@ -1899,7 +1971,7 @@ func (g *Gateway) cancelNamedTask(ctx context.Context, rec *SessionRecord, taskI
 	// The post before the signal, as in cancelTask.
 	g.post(rec.Key, fmt.Sprintf("🛑 cancel sent for task `%s`, which this conversation no longer holds — "+
 		"it ends when an executor confirms, if one ever took it", taskID))
-	g.observeCancelPublished(rec.Key, taskID)
+	g.observeCancel(rec, taskID)
 }
 
 // answerStatusByReplay answers "what is it doing" from the stream, not from
