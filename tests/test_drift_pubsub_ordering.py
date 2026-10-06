@@ -28,7 +28,12 @@ pins the values and this file pins the edges between them. Delete any one of
 the three and that suite still passes green -- which is the regression this
 file exists to catch.
 
-The fourth assertion is the specific way the fix gets undone. The grant used to
+That division is why there are only two tests here. The drain's shape and the
+sink's postcondition are values, and the tftest suite reaches both; asserting
+them again here would duplicate it without covering anything the plan cannot
+see.
+
+The second assertion is the specific way the fix gets undone. The grant used to
 read `google_logging_project_sink.drift_audit.writer_identity`, which is what
 ordered it after the sink; it now derives the identity from the project number
 instead. Restoring that reference is the natural resolution of a merge conflict
@@ -50,7 +55,6 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODULE_MAIN = REPO_ROOT / "terraform" / "modules" / "drift-pubsub" / "main.tf"
 
-TOPIC = ("google_pubsub_topic", "drift_audit")
 GRANT = ("google_pubsub_topic_iam_member", "sink_writer")
 DRAIN = ("time_sleep", "sink_drain")
 SINK = ("google_logging_project_sink", "drift_audit")
@@ -124,37 +128,6 @@ class DriftPubsubOrdering(unittest.TestCase):
             "the publish grant reads writer_identity off the sink again, which orders the "
             "grant after the sink and reopens the apply-side window; derive the identity "
             "from the project number instead (local.expected_sink_writer_identity)",
-        )
-
-    def test_the_drain_delays_only_the_destroy(self) -> None:
-        body = _resource_body(self.source, *DRAIN)
-        self.assertRegex(
-            body,
-            r"destroy_duration\s*=",
-            "the drain must set destroy_duration; without it nothing separates deleting the "
-            "sink from deleting the topic",
-        )
-        self.assertNotRegex(
-            body,
-            r"create_duration\s*=",
-            "the drain must not set create_duration; the wait is paid once per destroy and "
-            "an apply-side wait would delay every install for nothing",
-        )
-
-    def test_the_sink_checks_the_identity_the_grant_named(self) -> None:
-        body = _resource_body(self.source, *SINK)
-        self.assertIn(
-            "postcondition",
-            body,
-            "the sink must carry a postcondition comparing its writer_identity to the "
-            "identity the grant named; a derived identity that is wrong otherwise applies "
-            "green over a sink that cannot publish",
-        )
-        self.assertIn(
-            "local.expected_sink_writer_identity",
-            body,
-            "the postcondition must compare against the same local the grant reads, or the "
-            "two can drift apart",
         )
 
 

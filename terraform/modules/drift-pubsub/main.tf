@@ -176,6 +176,26 @@ resource "google_pubsub_subscription" "drift_audit" {
 # the window. local.expected_sink_writer_identity carries the "serviceAccount:" prefix,
 # as writer_identity did.
 #
+# What deriving it costs, which reading it off the sink did not: the member is
+# now a function of a data source, so a caller that defers that read defers the
+# member too. full-install calls this module with
+# depends_on = [google_project_service.required], and a module-level depends_on
+# defers every data source in the module whenever a target has a planned
+# change. Measured on a real project: with the grant already in state, adding
+# one unrelated API to that for_each set plans
+#
+#   data.google_project.this will be read during apply
+#   ~ member = "serviceAccount:service-<n>@gcp-sa-logging..." -> (known after
+#     apply) # forces replacement
+#
+# -- member is ForceNew, so the binding is destroyed and recreated while the
+# sink stays live, which is this file's own window reopened on another trigger.
+# Narrowing the caller's depends_on to the three APIs this module needs does
+# not help; Terraform resolves an indexed depends_on reference to the whole
+# resource, and the same plan results. The fix is a plan-time-known project
+# number passed in from the caller, which is #2487; until then setting
+# sink_writer_identity_override pins the member and sidesteps it.
+#
 # `.id`, never `.name`. A replaced topic or subscription loses its whole IAM
 # policy in GCP, and a binding keyed on the plan-time-known `.name` is left out
 # of the plan that replaced it — green apply, empty policy. chat-pubsub's
@@ -235,7 +255,7 @@ resource "google_logging_project_sink" "drift_audit" {
   lifecycle {
     postcondition {
       condition     = self.writer_identity == local.expected_sink_writer_identity
-      error_message = "sink ${var.sink_name} publishes as ${self.writer_identity}, not the ${local.expected_sink_writer_identity} that roles/pubsub.publisher was granted to, so it cannot write to topic ${var.topic_name}. Set sink_writer_identity_override = \"${self.writer_identity}\" to move the grant and this check onto the identity Logging reported; granting the role by hand will not clear this, because the check compares identities rather than grants. Then open an issue: the module derives the identity from the project number and this project does not follow that form."
+      error_message = "sink ${var.sink_name} publishes as ${self.writer_identity}, not the ${local.expected_sink_writer_identity} that roles/pubsub.publisher was granted to, so it cannot write to topic ${var.topic_name}. Set sink_writer_identity_override = \"${self.writer_identity}\" to move the grant and this check onto the identity Logging reported -- on the full-install composition the variable is drift_pubsub_sink_writer_identity_override, which it passes through. Granting the role by hand will not clear this, because the check compares identities rather than grants. Then open an issue: the module derives the identity from the project number and this project does not follow that form."
     }
   }
 
