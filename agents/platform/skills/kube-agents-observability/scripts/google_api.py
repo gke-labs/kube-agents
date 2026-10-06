@@ -100,6 +100,16 @@ class RelayError(Exception):
     """A relayed read that did not return 2xx; the message is what the helper prints."""
 
 
+class RelayTransportError(RelayError):
+    """A relayed read the broker never answered: no connection, a timeout, or a connection that broke.
+
+    Distinct from a status the broker or Google wrote, which is about the one
+    URL asked for. A transport failure is about the path to the broker, so the
+    next read through the same session fails the same way; a caller looping
+    over reads stops on this rather than waiting out the timeout once per item.
+    """
+
+
 def open_session():
     """The requests-shaped session every helper reads through."""
     try:
@@ -166,26 +176,62 @@ def connect_timeout_exceptions() -> tuple[type[BaseException], ...]:
     return (requests.exceptions.ConnectTimeout,)
 
 
+def never_connected(exc: BaseException) -> bool:
+    """Whether the connect itself failed, so nothing was on the wire.
+
+    A refused connect is the stdlib's `ConnectionRefusedError`, or, through
+    `requests`, a `ConnectionError` wrapping urllib3's `MaxRetryError` whose
+    reason is a `NewConnectionError`. The same `requests` class also carries a
+    connection the broker accepted and then closed before the answer (its
+    reason a `ProtocolError`, a gateway pod rolling under the read), which is
+    not the broker being unreachable, so the wrapped reason is what decides.
+    """
+    if isinstance(exc, ConnectionRefusedError):
+        return True
+    try:
+        import requests
+        import urllib3
+    except ImportError:
+        return False
+    if not isinstance(exc, requests.exceptions.ConnectionError):
+        return False
+    wrapped = exc.args[0] if exc.args else None
+    return isinstance(getattr(wrapped, "reason", None), urllib3.exceptions.NewConnectionError)
+
+
 def get_json(session, url: str, *, params=None) -> dict:
-    """One relayed GET, decoded; raises RelayError with the reason on anything else."""
+    """One relayed GET, decoded; raises RelayError with the reason on anything else.
+
+    The `except` ladder names what it knows: a connect that timed out or was
+    refused is the broker not reached; a read that timed out is the broker
+    not answering; any other transport failure is reported as the failure it
+    was, type and message, rather than diagnosed as the broker being down,
+    since `requests` raises an `OSError` subclass for a connection that broke
+    mid-answer too. All of them are a RelayTransportError.
+    """
     try:
         response = session.get(url, params=params, timeout=RELAY_TIMEOUT)
     except credential_proxy_client.TokenUnavailable as exc:
         raise RelayError(f"no caller token for the credential broker: {exc}") from exc
     except connect_timeout_exceptions() as exc:
-        raise RelayError(
+        raise RelayTransportError(
             f"could not reach the credential broker for {url}: no connection within "
             f"{credential_proxy_client.BROKER_CONNECT_TIMEOUT_SECONDS:g}s, so the path to it is "
             f"closed or the broker is not listening: {exc}"
         ) from exc
     except timeout_exceptions() as exc:
-        raise RelayError(
+        raise RelayTransportError(
             f"the credential broker did not answer within {RELAY_TIMEOUT_SECONDS}s for {url}, "
             f"past its own deadline for the upstream, so the broker or the path to it stalled "
             f"rather than Google: {exc}"
         ) from exc
     except OSError as exc:
-        raise RelayError(f"could not reach the credential broker for {url}: {exc}") from exc
+        if never_connected(exc):
+            raise RelayTransportError(f"could not reach the credential broker for {url}: {exc}") from exc
+        raise RelayTransportError(
+            f"the read of {url} through the credential broker failed before the answer completed: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
     if not HTTP_OK_FIRST <= response.status_code <= HTTP_OK_LAST:
         raise RelayError(describe_failure(url, response))
     try:

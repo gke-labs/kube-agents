@@ -134,13 +134,24 @@ def main(argv=None, session=None) -> int:
     # routes and two IAM permissions, so one can be refused while the other
     # is admitted, and a get can answer a trace whose spans are not indexed
     # yet; either way exit 0 with nothing on stdout would read as success.
+    # A transport failure (the broker not reached, not answering, or the
+    # connection broken) is about the path, not the trace, so the loop stops
+    # there instead of waiting out the same timeout once per remaining trace.
     breakdowns = 0
-    for trace in traces:
+    for position, trace in enumerate(traces):
         trace_id = trace.get("traceId")
         if not trace_id:
             continue
         try:
             detail = google_api.get_trace(session, args.project_id, trace_id)
+        except google_api.RelayTransportError as exc:
+            print(f"Error reading trace {trace_id}: {exc}", file=sys.stderr)
+            print(
+                f"Stopped: the credential broker did not answer that read, and the "
+                f"{len(traces) - position - 1} trace(s) after it would each wait out the same failure.",
+                file=sys.stderr,
+            )
+            break
         except google_api.RelayError as exc:
             print(f"Error reading trace {trace_id}: {exc}", file=sys.stderr)
             continue

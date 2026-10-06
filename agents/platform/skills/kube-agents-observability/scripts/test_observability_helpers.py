@@ -318,6 +318,30 @@ class AnalyzeTraceLatencyTest(BrokerSessionCase):
         self.assertNotIn("Trace ID:", out)
         self.assertNotIn("No traces found", out)
 
+    def test_a_broker_that_stalls_on_a_get_is_not_waited_on_again_for_every_remaining_trace(self):
+        # A read timeout is about the path to the broker, not the trace, so
+        # the loop stops at the first one rather than waiting RELAY_TIMEOUT
+        # once per remaining trace; a 403 or 404 on one id still skips it.
+        three = {"traces": [{"traceId": TRACE_A}, {"traceId": TRACE_B}, {"traceId": "c" * 32}]}
+
+        class StallsOnGets(FakeHttp):
+            def get(self, url, *, params=None, headers=None, timeout=None):
+                if url != RELAYED_TRACES:
+                    self.calls.append({"url": url, "params": params, "headers": headers, "timeout": timeout})
+                    raise TimeoutError("timed out")
+                return super().get(url, params=params, headers=headers, timeout=timeout)
+
+        self.http = StallsOnGets({RELAYED_TRACES: three})
+        session = credential_proxy_client.ApiSession(http=self.http)
+        code, out, err = run(analyze_trace_latency.main, ["--project-id", PROJECT, "--limit", "3"], session=session)
+        self.assertEqual(google_api.EXIT_READ_FAILED, code)
+        self.assertEqual([RELAYED_TRACES, f"{RELAYED_TRACES}/{TRACE_A}"], [call["url"] for call in self.http.calls])
+        self.assertIn(f"Error reading trace {TRACE_A}: the credential broker did not answer within", err)
+        self.assertIn("Stopped: the credential broker did not answer that read, and the 2 trace(s) after it", err)
+        self.assertNotIn(TRACE_B, err)
+        self.assertIn("none of the 3 traces listed could be read with spans", err)
+        self.assertNotIn("Trace ID:", out)
+
     def test_a_recorded_trace_parses_to_the_expected_durations(self):
         # 1.5s + 1s back to back: the trace spans exactly 2.5 seconds. A unit
         # slip would print 2500.000 or 0.003 here.
@@ -681,7 +705,6 @@ class GoogleApiTest(BrokerSessionCase):
         self.assertIn("PERMISSION_DENIED", str(raised.exception))
         self.assertNotIn("the credential broker answered", str(raised.exception))
 
-
     def test_a_dropped_connect_is_reported_as_unreachable_after_the_clients_connect_bound(self):
         # A SYN nobody answers is what a default-deny egress policy does; the
         # shim gives up after BROKER_CONNECT_TIMEOUT_SECONDS and so must the
@@ -699,6 +722,77 @@ class GoogleApiTest(BrokerSessionCase):
         self.assertIn("could not reach", str(raised.exception))
         self.assertIn(f"{credential_proxy_client.BROKER_CONNECT_TIMEOUT_SECONDS:g}s", str(raised.exception))
         self.assertNotIn("did not answer within", str(raised.exception))
+
+    def test_a_connection_that_broke_mid_answer_is_not_reported_as_the_broker_unreached(self):
+        # What requests raises when the broker accepted the connection and
+        # closed it before the answer (a gateway pod rolling under the read):
+        # a ConnectionError, an OSError, wrapping a ProtocolError. The connect
+        # succeeded, so the message says what failed rather than "could not
+        # reach"; it is a transport failure, so a loop over reads stops on it.
+        requests = requests_or_skip(self)
+        import http.client
+        import urllib3
+
+        class Broke:
+            def get(self, url, **kwargs):
+                raise requests.exceptions.ConnectionError(
+                    urllib3.exceptions.ProtocolError(
+                        "Connection aborted.", http.client.RemoteDisconnected("Remote end closed connection without response")
+                    )
+                )
+
+        session = credential_proxy_client.ApiSession(http=Broke())
+        with self.assertRaises(google_api.RelayTransportError) as raised:
+            google_api.get_json(session, google_api.TRACE_LIST_URL.format(project=PROJECT))
+        message = str(raised.exception)
+        self.assertIn("failed before the answer completed: ConnectionError: ", message)
+        self.assertIn("Remote end closed connection without response", message)
+        self.assertNotIn("could not reach", message)
+        self.assertNotIn("did not answer within", message)
+
+    def test_a_refused_connect_through_requests_is_the_broker_not_reached(self):
+        # The same requests class carries a refused connect, wrapping
+        # urllib3's MaxRetryError whose reason is a NewConnectionError; that
+        # one is "could not reach", as the stdlib's ConnectionRefusedError is.
+        requests = requests_or_skip(self)
+        import urllib3
+
+        class Refused:
+            def get(self, url, **kwargs):
+                raise requests.exceptions.ConnectionError(
+                    urllib3.exceptions.MaxRetryError(
+                        None, url, reason=urllib3.exceptions.NewConnectionError(None, "[Errno 111] Connection refused")
+                    )
+                )
+
+        session = credential_proxy_client.ApiSession(http=Refused())
+        with self.assertRaises(google_api.RelayTransportError) as raised:
+            google_api.get_json(session, google_api.TRACE_LIST_URL.format(project=PROJECT))
+        self.assertIn("could not reach the credential broker", str(raised.exception))
+        self.assertIn("Connection refused", str(raised.exception))
+        self.assertNotIn("failed before the answer completed", str(raised.exception))
+
+    def test_every_transport_failure_is_the_transport_subclass_and_a_status_is_not(self):
+        # The analyzer stops its loop on the subclass and skips one trace on
+        # the base class, so the ladder's three transport arms and the
+        # stdlib refusal must raise it and a status the broker wrote must not.
+        for name, exc in (
+            ("timeout", TimeoutError("timed out")),
+            ("refused", ConnectionRefusedError("connection refused")),
+            ("reset", ConnectionResetError("reset by peer")),
+        ):
+            with self.subTest(name):
+                class Raises:
+                    def get(self, url, **kwargs):
+                        raise exc
+
+                session = credential_proxy_client.ApiSession(http=Raises())
+                with self.assertRaises(google_api.RelayTransportError):
+                    google_api.get_json(session, google_api.TRACE_LIST_URL.format(project=PROJECT))
+        session = self.session({RELAYED_TRACES: FakeResponse(403, BROKER_REFUSAL)})
+        with self.assertRaises(google_api.RelayError) as raised:
+            google_api.get_json(session, google_api.TRACE_LIST_URL.format(project=PROJECT))
+        self.assertNotIsInstance(raised.exception, google_api.RelayTransportError)
 
     def test_the_connect_is_bounded_by_the_clients_figure_and_the_read_by_the_helpers(self):
         # requests reads a (connect, read) pair; a scalar would put the read
