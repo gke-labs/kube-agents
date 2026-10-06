@@ -128,7 +128,10 @@
 # (159) of sixty-seven (201), +3 more: the same shape on the card's last
 # attempt. chat-voice-failure-leads-with-fact (the last entry below) makes
 # it fifty-four (162) of sixty-eight (204), +3 more: the same shape on a
-# blocked card.
+# blocked card. Counted from the lists again (fifty-seven here, fourteen in
+# the presubmit file, seventy-one cases and 213 units),
+# chat-fanout-fleet-version-rows makes it fifty-eight (174) of seventy-two
+# (216), +3 more: one front-door turn and a four-card fan-out.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
 # answer it plainly: 1734-2693 serial minutes of work at a realised
@@ -641,3 +644,8 @@
 # (bench/kube_agents_bench/card_wake.py), so one front-door turn and no
 # worker: filing or unblocking a card fails the case's catastrophic fence.
 ./tasks/chat-voice-failure-leads-with-fact/task.yaml
+
+# A fleet question fanned out one card per cluster, each titled with the bare
+# cluster name the Slack plan row renders (agents/platform/SOUL.md, fan-out).
+# deployer: noop; reads the seeded fleet's version-laggard role.
+./tasks/chat-fanout-fleet-version-rows/task.yaml
