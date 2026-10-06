@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The pool of per-cluster service accounts, and the choice between them.
+"""The pool of per-project service accounts, and the choice between them.
 
 GCP has no delegation primitive — no Credential Access Boundary outside Cloud
 Storage, no `actor_token`, no `act` claim — so a broker cannot attenuate the
@@ -43,20 +43,29 @@ at the call site so that removing it is a visible diff:
   the selector; it can also re-point the sidecar's own default with an allowed
   `get-credentials`. So the agent chooses **which cluster** it is asking about.
   What it cannot do is choose the account, because the mapping is a file it
-  cannot write, and asking about a cluster with no entry is a refusal rather
-  than a wider credential. The token and the API server address both come from
-  the same resolved cluster, so naming a different one buys a credential scoped
-  to that different one.
-* **A scope with no member is refused.** There is no widest-member fallback and
-  no ambient fallback, because a fallback to the credential this pool exists to
-  stop using is invisible in every log line that matters.
-* **The mapping key is the GKE resource name, spelled once.** `scope_key`
-  builds `projects/P/locations/L/clusters/C` and Terraform keys the pool on the
-  identical string, so the broker and the provisioner compare one rendering
-  rather than two of the same idea. Every Critical this project has found came
-  from a checker and an enforcer parsing the same input differently. This
-  survived the condition's removal; it is the pool's index, and it was only ever
-  incidentally the condition's operand.
+  cannot write, and asking about a cluster in a project with no entry is a
+  refusal rather than a wider credential. The token and the API server address
+  both come from the same resolved cluster, so naming a different one buys a
+  credential scoped to that different one's project.
+* **A project with no member is refused.** There is no widest-member fallback
+  and no ambient fallback, because a fallback to the credential this pool
+  exists to stop using is invisible in every log line that matters.
+* **The mapping key is the bare project id.** One account per project in the
+  resolved scope, keyed on the string the operator declares in `spec.scope`
+  and Terraform keys the pool on, so the broker and the provisioner compare one
+  rendering rather than two of the same idea. Every Critical this project has
+  found came from a checker and an enforcer parsing the same input differently.
+
+  The key used to be the GKE cluster resource name, one account per cluster.
+  It moved to the project (`docs/designs/multi-project-scope.md` §6) because
+  the estate runs one cluster per project, so the per-cluster cap of 100 was a
+  cap on the fleet, and because the project is the IAM unit the scope
+  declaration is written in: an explicit project gets its account when it gets
+  its grant, from the same input. The cost is accepted and should be read as
+  such: two clusters in one project share an account, so the blast radius of a
+  compromised sandbox is the project rather than the cluster. `select` still
+  takes the full triple, because the broker resolves a cluster and the refusal
+  names it; only the lookup is by project.
 
 Two things this module does *not* do, both worth stating because the obvious
 reading of it overclaims.
@@ -91,22 +100,35 @@ POOL_FLAG_ENV = "CREDENTIAL_PROXY_SCOPED_SA_POOL"
 POOL_FILE_ENV = "CREDENTIAL_PROXY_SCOPED_SA_POOL_FILE"
 DEFAULT_POOL_FILE = "/etc/credential-proxy/scoped-sa-pool.json"
 
+# The one document shape this module reads. Version 1 keyed members on the GKE
+# cluster triple and carried `location` and `clusterName` per entry; it is
+# refused rather than read, because reading its rows as project rows would
+# widen every account to its project without the operator having asked.
+POOL_FILE_VERSION = 2
+
 # The pool file is rendered by the operator into a ConfigMap. It is small by
-# construction — one line per managed cluster — so a bound this far above any
-# real fleet only exists to keep a malformed mount from being read into memory.
+# construction — one line per project in scope — so a bound this far above any
+# real estate only exists to keep a malformed mount from being read into memory.
 MAX_POOL_BYTES = 1 << 20
 
 # Matches `credential_proxy._GKE_CONTEXT_COMPONENT`. The duplication is
 # deliberate: this module must not import the broker (the broker imports it),
 # and a test asserts the two agree on every component it can construct, so a
 # drift between them fails rather than silently admitting a key the other half
-# would reject.
+# would reject. The project id is the key and is checked with this on the way
+# in; the location and cluster are checked with it on the way to a refusal
+# message.
 #
 # `\Z` rather than `$`, for the reason spelled out beside the broker's copy:
 # `$` matches before a trailing newline, so `$` plus `re.match` admits
-# "cluster\n" -- which then goes into the scope key, and the scope key goes
-# into a log line.
+# "cluster\n" -- which then goes into the refusal message, and the refusal
+# message goes into a log line.
 _COMPONENT = re.compile(r"^[a-z0-9][a-z0-9-]*\Z")
+# The CRD's `MaxLength=63` on `projectId`. GCP project ids stop at 30 and GKE
+# cluster names at 40, so nothing real is refused by it; what it buys is that
+# every name the refusal below interpolates has a bound, which is what lets
+# the broker size the refusal's log line instead of truncating it.
+MAX_NAME_COMPONENT_LENGTH = 63
 
 # `<id>@<project>.iam.gserviceaccount.com`.
 #
@@ -144,7 +166,7 @@ CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
 
 class PoolRefusal(Exception):
-    """No pool member covers the scope this request resolved to.
+    """No pool member covers the project this request resolved to.
 
     Distinct from `ValueError` so the handler can answer with a policy refusal
     rather than a malformed-request error: the caller did nothing wrong, the
@@ -189,21 +211,32 @@ def pool_enabled(environ: dict[str, str] | None = None) -> bool:
     }
 
 
-def scope_key(project: str, location: str, cluster: str) -> str:
-    """The GKE resource name, which is also this pool's mapping key.
+def _name_component(name: str, value: object) -> str:
+    """One validated GKE name component, or a `ValueError` naming which.
 
-    Callers pass components that have already been validated as a GKE context;
-    this re-checks them anyway, because the function's whole value is that its
-    output is byte-identical to the operand of an IAM Condition, and a component
-    carrying a slash or a quote would produce a key that silently matches
-    nothing (or, in the Terraform half, an expression that means something else).
+    Applied to the project id when the mapping is read, and to all three
+    components of the triple when a request is selected. The project is the
+    key, so a slash or a quote in it would be a key that silently matches
+    nothing; the location and cluster are not part of the key, and are checked
+    anyway because the refusal embeds them and the refusal reaches a log line.
     """
-    for name, value in (("project", project), ("location", location), ("cluster", cluster)):
-        if not isinstance(value, str) or not _COMPONENT.fullmatch(value):
-            raise ValueError(f"{name} is not a GKE name component: {value!r}")
-    return f"projects/{project}/locations/{location}/clusters/{cluster}"
+    if not isinstance(value, str) or not _COMPONENT.fullmatch(value):
+        raise ValueError(f"{name} is not a GKE name component: {value!r}")
+    if len(value) > MAX_NAME_COMPONENT_LENGTH:
+        # The value is not echoed: it is the thing that is too long.
+        raise ValueError(
+            f"{name} is longer than {MAX_NAME_COMPONENT_LENGTH} characters"
+            f" ({len(value)})"
+        )
+    return value
 
 
+# `scope_key` was removed with the move to per-project members. It built
+# `projects/P/locations/L/clusters/C` as the pool's index and Terraform keyed
+# the pool on the identical string. The resource name is still rendered, in the
+# refusal below, but only so the operator reading the log sees which cluster's
+# request was refused; nothing is looked up by it any more.
+#
 # `iam_condition_expression` was removed on 2026-08-12.
 #
 # It rendered `resource.name == "<key>"` so a test could assert that the broker
@@ -219,24 +252,27 @@ def scope_key(project: str, location: str, cluster: str) -> str:
 
 @dataclass(frozen=True)
 class PoolMember:
-    """One cluster and the service account that may read it."""
+    """One project and the service account that may read its clusters."""
 
-    key: str
+    project_id: str
     service_account: str
 
 
 def parse_pool(document: object) -> dict[str, PoolMember]:
-    """Validate the mapping document and index it by scope key.
+    """Validate the mapping document and index it by project id.
 
     Strict on every field, and specifically strict about duplicates: two entries
-    for one cluster is an ambiguity, and resolving it by last-wins would mean the
-    account a request gets depends on the order the operator happened to render.
+    for one project is an ambiguity, and resolving it by last-wins would mean
+    the account a request gets depends on the order the operator happened to
+    render.
     """
     if not isinstance(document, dict):
         raise PoolConfigurationError("pool file must contain a JSON object")
-    if document.get("version") != 1:
+    if document.get("version") != POOL_FILE_VERSION:
         raise PoolConfigurationError(
-            f"unsupported pool file version: {document.get('version')!r} (expected 1)"
+            f"unsupported pool file version: {document.get('version')!r}"
+            f" (expected {POOL_FILE_VERSION}; version 1 keyed members per cluster"
+            " and is not read)"
         )
     entries = document.get("serviceAccounts")
     if not isinstance(entries, list):
@@ -247,11 +283,7 @@ def parse_pool(document: object) -> dict[str, PoolMember]:
         if not isinstance(entry, dict):
             raise PoolConfigurationError(f"serviceAccounts[{index}] is not an object")
         try:
-            key = scope_key(
-                entry.get("projectId"),
-                entry.get("location"),
-                entry.get("clusterName"),
-            )
+            project_id = _name_component("projectId", entry.get("projectId"))
         except ValueError as error:
             raise PoolConfigurationError(f"serviceAccounts[{index}]: {error}") from error
         email = entry.get("serviceAccountEmail")
@@ -259,11 +291,11 @@ def parse_pool(document: object) -> dict[str, PoolMember]:
             raise PoolConfigurationError(
                 f"serviceAccounts[{index}] has no well-formed serviceAccountEmail: {email!r}"
             )
-        if key in members:
+        if project_id in members:
             raise PoolConfigurationError(
-                f"serviceAccounts[{index}] repeats {key}; a scope maps to one account"
+                f"serviceAccounts[{index}] repeats {project_id}; a project maps to one account"
             )
-        members[key] = PoolMember(key=key, service_account=email)
+        members[project_id] = PoolMember(project_id=project_id, service_account=email)
 
     if not members:
         raise PoolConfigurationError(
@@ -367,20 +399,25 @@ class ScopedServiceAccountPool:
         self._lifetime_seconds = lifetime_seconds
         self._clock = clock or time.time
         self._lock = threading.Lock()
+        # Keyed on the member's project, not on the triple a request resolved
+        # to: every cluster in a project is served by one account, so one token
+        # serves them all and a fleet of N clusters in a project mints once.
         self._tokens: dict[str, tuple[str, float]] = {}
 
     @property
     def scopes(self) -> list[str]:
-        """Every scope the pool covers, for logging and for the startup line."""
+        """Every project the pool covers, sorted, for logging and the startup line."""
         return sorted(self._members)
 
     def select(self, project: str, location: str, cluster: str) -> PoolMember:
-        """The account for one cluster, or a refusal.
+        """The account for the project one cluster is in, or a refusal.
 
         The arguments are three validated strings, not a request and not a
         mapping, and that is the property the signature carries: no field of a
         request reaches this method, because the broker resolves a cluster of
-        its own before it calls.
+        its own before it calls. Only the project is looked up; the location and
+        cluster are kept so the refusal can name the request that was refused,
+        which is the line the operator reads first.
 
         The cluster itself is agent-influenced -- it comes from the
         `current-context` of a kubeconfig in the shared workspace -- and the
@@ -388,26 +425,35 @@ class ScopedServiceAccountPool:
         Read this as "the account is not selectable", not as "the input is
         trusted".
         """
-        key = scope_key(project, location, cluster)
-        member = self._members.get(key)
+        project = _name_component("project", project)
+        location = _name_component("location", location)
+        cluster = _name_component("cluster", cluster)
+        member = self._members.get(project)
         if member is None:
+            # Fixed text 215 characters (the message with every component
+            # empty); four interpolations, each bounded at
+            # MAX_NAME_COMPONENT_LENGTH, so the whole message is at most
+            # 215 + 4 * 63 = 467 and the broker's POOL_REFUSAL_LOG_LENGTH logs
+            # it whole. test_scoped_sa_pool.py pins both numbers; lengthen this
+            # and the log line is cut mid-remedy again.
             raise PoolRefusal(
-                f"no scoped service account is provisioned for {key}."
-                " The broker will not fall back to the ambient credential;"
-                " add the cluster to the pool or exclude it from the fleet."
+                f"no scoped service account for project {project}"
+                f" (cluster projects/{project}/locations/{location}/clusters/{cluster}):"
+                " refused; the broker will not fall back to the ambient credential."
+                " Declare the project in spec.scope and apply, or exclude the cluster."
             )
         return member
 
     def token_for(self, project: str, location: str, cluster: str) -> str:
-        """A short-lived access token for the account this cluster maps to."""
+        """A short-lived access token for the account this cluster's project maps to."""
         member = self.select(project, location, cluster)
         now = self._clock()
         with self._lock:
-            cached = self._tokens.get(member.key)
+            cached = self._tokens.get(member.project_id)
             if cached is not None and cached[1] - self.REFRESH_MARGIN_SECONDS > now:
                 return cached[0]
             token, expiry = self._minter(member.service_account, self._lifetime_seconds)
-            self._tokens[member.key] = (token, expiry)
+            self._tokens[member.project_id] = (token, expiry)
             return token
 
 

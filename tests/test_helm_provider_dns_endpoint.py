@@ -5,7 +5,7 @@ present different certificates: the IP endpoints get one signed by the cluster
 root CA that `cluster_ca_certificate` returns, while the DNS-based endpoint is
 terminated at Google Front End with a certificate from a publicly trusted CA.
 The catch is that a cluster with IP access disabled reports its DNS hostname in
-the same `endpoint` attribute the module folds into `cluster_endpoint`, so the
+the same `endpoint` attribute the module selects into `cluster_endpoint`, so the
 composition can be handed either one without asking for either. Pairing that
 hostname with the cluster CA makes the CA the sole trust anchor and fails every
 handshake with "x509: certificate signed by unknown authority" -- on the first

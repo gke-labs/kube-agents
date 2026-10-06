@@ -528,7 +528,7 @@ data:
         {"id":"github.repo-administration","pattern":"\\bgh\\b(?:\\s+\\S+)*?\\s+(?:secret|variable)\\b(?:\\s+\\S+)*?\\s+(?:set|delete|remove)\\b|\\bgh\\b(?:\\s+\\S+)*?\\s+repo\\b(?:\\s+\\S+)*?\\s+(?:delete|archive|edit)\\b"}
       ]
     }
-  scoped-sa-pool.json: '{"version":1,"serviceAccounts":[{"projectId":"example-project","location":"us-central1-a","clusterName":"cluster-a","serviceAccountEmail":"ka-cluster-a-1a2b3c4d@example-project.iam.gserviceaccount.com"},{"projectId":"example-project","location":"us-central1-a","clusterName":"cluster-b","serviceAccountEmail":"ka-cluster-b-7d2f91a0@example-project.iam.gserviceaccount.com"},{"projectId":"other-project","location":"europe-west1","clusterName":"cluster-a","serviceAccountEmail":"ka-cluster-a-3e8b04c5@other-project.iam.gserviceaccount.com"}]}'
+  scoped-sa-pool.json: '{"version":2,"serviceAccounts":[{"projectId":"example-project","serviceAccountEmail":"ka-example-project-1a2b3c4d@example-project.iam.gserviceaccount.com"},{"projectId":"other-project","serviceAccountEmail":"ka-other-project-3e8b04c5@example-project.iam.gserviceaccount.com"}]}'
 kind: ConfigMap
 metadata:
   labels:
@@ -1329,7 +1329,7 @@ spec:
             - name: HERMES_HOME_MODE
               value: "2770"
             - name: HERMES_WRITE_SAFE_ROOT
-              value: /opt/data:/home/agent
+              value: /opt/data
             - name: TERMINAL_CWD
               value: /opt/data
             - name: CREDENTIAL_PROXY_URL

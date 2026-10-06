@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "kube-agents chart values",
-  "description": "Every key values.yaml declares, closed at each level the templates read, so a misspelt or mistyped key fails `helm lint`, `helm template`, `helm install` and `helm upgrade` before anything renders. Left open, with no property list, because the templates pass them through or hand them to something else that validates them: platformAgent.annotations, platformAgent.networkPolicy, platformAgent.credentials.data, platformAgent.harness.tuning.{default,platform,cluster}, every resources block, both serviceAccountAnnotations maps, the operator.extraEnv and platformAgent.deployment.env items, the platformAgent.security.scopedServiceAccounts items, the litellm.redaction.rules items, litellm.redaction.ip.action, and the global.imagePullSecrets items (a Secret name or {name: ...}; the chart's helper decides). values.yaml documents what each key does.",
+  "description": "Every key values.yaml declares, closed at each level the templates read, so a misspelt or mistyped key fails `helm lint`, `helm template`, `helm install` and `helm upgrade` before anything renders. Left open, with no property list, because the templates pass them through or hand them to something else that validates them: platformAgent.annotations, platformAgent.networkPolicy, platformAgent.credentials.data, platformAgent.harness.tuning.{default,platform,cluster}, every resources block, both serviceAccountAnnotations maps, the operator.extraEnv and platformAgent.deployment.env items, the litellm.redaction.rules items, litellm.redaction.ip.action, and the global.imagePullSecrets items (a Secret name or {name: ...}; the chart's helper decides). values.yaml documents what each key does.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -669,11 +669,33 @@
             "serviceAccountAnnotations": {
               "type": "object"
             },
+            "scopedServiceAccountPool": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "serviceAccounts": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "projectId": {
+                        "type": "string"
+                      },
+                      "serviceAccountEmail": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            },
             "scopedServiceAccounts": {
               "type": "array",
-              "items": {
-                "type": "object"
-              }
+              "maxItems": 0
             },
             "workloadIdentityFederation": {
               "type": "object",

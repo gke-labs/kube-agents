@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects, but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription) - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); not yet the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, or the default flip; the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default, retired by declarative profiles or by gateway-side `AllowedUsers` enforcement, whichever lands first) is built
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects; and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env, its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); not yet the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, or the default flip; the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default, retired by declarative profiles or by gateway-side `AllowedUsers` enforcement, whichever lands first) is built
 
 ## Purpose
 
@@ -895,14 +895,23 @@ that treated the three alike is what this value exists to stop.
 rendered regardless, so any install with neither a Discord token nor a Chat relay carried a
 gateway Deployment that crash-looped forever and nothing could rollout-gate on. The operator
 now asks first: a `mode: next` install with no chat backend - no `discord-bot` Secret in the
-namespace and no door armed - gets no gateway Deployment at all, its `Ready` counts the rest
+namespace, no door armed and `spec.integration.googleChat` not enabled - gets no gateway
+Deployment at all, its `Ready` counts the rest
 of the stack (NATS, the auth callout, the provisioning Job's first completion, the sandbox, the
 broker, today's gateway), and an `A2AGateway` condition (`status: False`, `Reason: NoChatBackend`) names what
 would render it. The rule is creation-only, like the callout ordering gate: a gateway that
 exists keeps reconciling whatever happened to its backend, because deleting it would take
 every session pod that hangs off its UID. An eval install with this door armed has an ingress
 the guard accepts, by the decision recorded above, and the render counts the door as a backend
-for the same reason.
+for the same reason. An install that enables Google Chat under `next` has a backend by that
+fact alone: the render asks the CR before it reads any Secret, and, because the gateway
+refuses two real backends, omits the Discord reference when Chat is armed, so a
+`discord-bot` Secret left in the namespace does not stop a Chat gateway starting. The
+rule is creation-only in this direction too: disabling Google Chat on an install whose gateway
+has no other backend re-renders the existing gateway without one, and it exits on
+`no chat backend` until the admin flips the CR to `today` (which tears the stack down), creates
+a `discord-bot` Secret, or deletes the gateway Deployment and its session pods with it - the
+same shape as removing the Secret from under a Discord gateway, reached through the CR.
 
 ## The Google Chat adapter (added 9/5)
 
@@ -919,19 +928,19 @@ envelope's job rather than `identity`'s. Nothing authorizes on the email today, 
 that lands this adapter is already carrying the string it needs. What the adapter costs is inheriting the existing Chat
 integration's operational surface, and this section records how it sits on it.
 
-**Ingress topology: the existing app registration and topic, a dedicated A2A
-subscription, consumed through the credential proxy.** A Chat app configuration is
+**Ingress topology: the existing app registration, topic and subscription, consumed
+through the credential proxy by whichever brain the mode names.** A Chat app configuration is
 per-GCP-project, so "take Chat events directly" means a second project — not an
-adapter-PR dependency. And two consumers on one subscription split deliveries randomly,
-so the A2A path gets its own subscription on the existing topic: each consumer acks its
-own subscription and the who-acks question dissolves. The subscription is pulled by a
-second `GoogleChatRelay` instance in the credential proxy (routes
+adapter-PR dependency. Two consumers on one subscription split deliveries randomly, so one consumer
+holds it at a time (below), and under `next` the subscription is pulled by the A2A
+`GoogleChatRelay` instance in the credential proxy (routes
 `/v1/chat/a2a/events`, `/v1/chat/a2a/events/ack`, `/v1/chat/a2a/events/nack`), enabled
 only when `A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME` is set alongside the project id. The
 gateway pod stays cloud-credential-free: it authenticates to the proxy the way the
 legacy chat caller does — a projected ServiceAccount token verified by TokenReview —
-but with its OWN audience — whatever `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE` names on the
-proxy; nothing in-tree fixes the string yet, the operator wiring will — conferring
+but with its OWN audience — the one the operator renders as
+`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE` on the proxy, `kubeagents-credential-proxy-a2a-chat` —
+conferring
 the `a2a-chat` role, because the legacy chat caller is the LLM-driven Hermes pod and a
 shared role would let a prompt-injected agent pull and ack the A2A gateway's events,
 silently consuming user asks. The event routes demand `a2a-chat`; `/v1/chat/api`
@@ -967,14 +976,26 @@ backends' ingress semantics closely enough: the Discord websocket redelivers not
 and Slack's Socket Mode, which does redeliver unacked envelopes, carries its own
 in-adapter dedupe ring for exactly that (the Slack section below).
 
-**Coexistence is by activation, not routing.** `mode: next` is additive, so a next
-install still runs the legacy chat consumer. A topic fans out to every subscription:
-an install that enables the A2A subscription while the legacy path is live will answer
-every message twice. The per-install choice of which brain consumes Chat belongs to
-the operator's mode seam (the mode switch's per-component override sketch) and does
-not exist yet; the A2A relay instance arms only on explicit configuration
-(`A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME`), so arming it beside the legacy consumer is a
-stated choice, never a default.
+**Coexistence is by mode.** A topic fans out to every subscription and two consumers on one
+subscription split its deliveries, so exactly one brain consumes an install's Chat, and
+`spec.mode` chooses it: under `today` the Hermes `google_chat` platform pulls the
+subscription through the broker's legacy relay instance; under `next` the operator arms the
+A2A relay instance on the same subscription, gives the gateway the adapter's env and token,
+and renders neither the Hermes platform nor its relay env. One subscription rather than a
+second one for the A2A path, because the unacked backlog then follows the live consumer
+across a flip in either direction, where a second subscription would hold up to seven days
+of stale asks for the legacy consumer to drain on a rollback. The per-install choice of a
+different pairing is the mode switch's per-component override, sketched and not built; the
+predicate the operator consults (`a2aChatArmed`) is where it would be read. What this costs:
+under `next` the Hermes platform is off, so cron findings addressed to the Chat home channel
+have no target until the bus carries them. And the handover is not instantaneous: the pass
+that flips a Chat install to `next` turns the Hermes consumer off while the gateway may still
+be held (the callout gate, a provisioning Job, an image pull), so until the gateway is up
+nobody consumes the subscription - messages wait in it rather than being lost, and the CR
+reads `Provisioning` naming the gateway, which is the signal. In the other direction, a
+message Hermes pulled and had not acked before its pod rolled is redelivered to the A2A
+relay after the subscription's ack deadline; if Hermes replied before acking, that one
+message is answered by both brains, once.
 
 **`verifiedBy: "chat-event-topic-iam"`, and what was actually verified.** The gateway
 verified that the event arrived through the credential proxy from a subscription on the
@@ -1030,9 +1051,9 @@ always present in the snapshot regardless.
 (`GoogleChatSpec.Mode`) is honoured by the relay: under `default` the rolling line
 carries state transitions but never the turn-by-turn narration, with no-op edits
 deduplicated; under `debug` the full rolling line runs. Carried as
-`A2A_CHAT_DISPLAY_MODE`; the operator owns feeding it from the same CR field, and unset
-resolves to `debug` (the historical rendering, so Discord installs are unchanged) while
-the CR field's own default is `default` — the render is what makes the two agree. The
+`A2A_CHAT_DISPLAY_MODE`; the operator feeds it from the same CR field, rendering `default` when
+the field is unset; the gateway's own unset resolves to `debug` (the historical rendering, so
+Discord installs are unchanged), and the render is what makes the two agree. The
 split is the legacy field honoured in the new relay, not a new knob.
 
 **openDirect.** `spaces.findDirectMessage` by user resource name, falling back to
