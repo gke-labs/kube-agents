@@ -40,7 +40,12 @@ gitops-repo/
   a cluster off its release channel, without a maintenance window or upgrade notifications, under a
   change freeze, or a node pool with auto-upgrade or auto-repair off
   (`security_patch_orchestrator_sop.md` §4a, object `Cluster/<name>` or `NodePool/<pool>`, and `namespace: ""` written out, as that SOP's
-  §4a spells it).
+  §4a spells it), a
+  reservation the waste audit would report: headroom above a workload's peak, a kept volume,
+  disk or address, warm node capacity, an idle namespace or standby, a registry with no cleanup
+  policy (`fleet_wide_cost_analysis_sop.md` §3a, object as the finding names it, and `namespace`
+  empty for a node pool, an idle namespace and the project-scoped disk, address and registry
+  repository; a namespace written on any of those five is read as empty).
   A choice HCL cannot express — a workload meant to run one replica — goes in an OKF document
   (`type` frontmatter, 06 §5) under `knowledge/` as a `declares:` list in the frontmatter, one item
   per posture with `check` (the slug, `single-replica`), `namespace`, `object` as `Kind/name`, and

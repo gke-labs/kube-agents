@@ -306,6 +306,25 @@ AUDITS: dict[str, AuditSpec] = {
                 ),
             ),
         ),
+        # §3a of the SOP: the eight checks that judge a reservation an owner
+        # may hold on purpose -- headroom above a workload's peak (3.1), a
+        # volume, disk or address kept for a job, a restore or a cutover
+        # (3.3, 3.4, 3.5), warm node capacity (3.7), a pre-provisioned
+        # namespace (3.10), a standby nothing calls yet (3.13) and a registry
+        # that keeps every image (3.14). The other six are leaks or
+        # misbookings no declaration excuses: a Released volume, a forwarding
+        # rule for a deleted Service, a drain blocker, terminal pods, and a
+        # request below or absent from what the workload uses.
+        declarable=(
+            "overrequest",
+            "unconsumed-pvc",
+            "unattached-disk",
+            "idle-address",
+            "idle-nodepool",
+            "idle-namespace",
+            "idle-workload",
+            "registry-no-cleanup",
+        ),
     ),
     "fleet-consistency-drift": AuditSpec(
         "Fleet Consistency Drift Audit",
@@ -883,6 +902,37 @@ NAMESPACE_SHAPE_KIND = "Namespace"
 # The allow-all fault names the policy; the withhold publishes only that spelling
 # and holds every other, so an object it cannot classify errs toward holding.
 ALLOW_ALL_SHAPE_KIND = "NetworkPolicy"
+# A roll-up names the scope it covers, not an object: the cost SOP's §5
+# collapse gives one `Cluster/<name>` or `Namespace/<name>`, and its 3.5
+# ten-address roll-up `Project/<id>`. The cost stream refuses them the way
+# 2.7 refuses a non-workload with `SHARED_ACCOUNT_WORKLOAD_KINDS`: each of
+# its declarable checks names objects of known kinds, folded as
+# `_object_kind_segment` folds them, and anything else — a scope, or a short
+# spelling like `ns/` a worker may give a §5 collapse — covers no object the
+# check names and is refused on the join, the manifest route and the
+# validator alike. Per check, so the patch stream's `Cluster/<name>`
+# declarations are untouched.
+COST_WORKLOAD_KINDS = frozenset({"deployment", "statefulset", "daemonset", "replicaset", "job", "cronjob", "pod"})
+COST_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
+    "overrequest": COST_WORKLOAD_KINDS,
+    "idle-workload": COST_WORKLOAD_KINDS,
+    "unconsumed-pvc": frozenset({"persistentvolumeclaim"}),
+    "unattached-disk": frozenset({"disk"}),
+    "idle-address": frozenset({"address"}),
+    "idle-nodepool": frozenset({"nodepool"}),
+    "idle-namespace": frozenset({"namespace"}),
+    "registry-no-cleanup": frozenset({"artifactregistryrepository"}),
+}
+# The cost checks whose collector candidate carries no `namespace`: 3.10
+# names the namespace itself, 3.7 a node pool, and 3.4, 3.5 and 3.14 a
+# project's disk, address and registry repository. A worker or a note author
+# given a namespace may write it into the field, which would give the same
+# object a second identity, so the validator empties it on these checks before
+# the id is derived and the parser reads it as empty on a note item. Per check
+# and not per object kind: 3.9 files its pile as `Namespace/<ns>` with the
+# namespace set, and compliance 2.6 does too. Every slug here is the cost
+# stream's alone, so no stream test is needed where it is consulted.
+UNNAMESPACED_CHECKS = frozenset({"idle-namespace", "idle-nodepool", "unattached-disk", "idle-address", "registry-no-cleanup"})
 # 2.7 `default-sa-automount` is declared per workload and fixed per namespace
 # (one `default` ServiceAccount). A fix that merges for an undeclared sibling
 # would take the declared workload's token too, so a namespace holding a
@@ -3228,6 +3278,7 @@ def validate_findings(data: object, audit_id: str) -> dict:
         # `id` the document arrived with is discarded rather than rejected: a
         # worker running against a cached SOP would otherwise fail the whole
         # document, and `exit 2` on an audit publishes nothing at all.
+        fold_unnamespaced_check(finding)
         full_id = derive_finding_id(finding)
         fid = _shorten_id(full_id)
         try:
@@ -3407,6 +3458,7 @@ def validate_findings(data: object, audit_id: str) -> dict:
                     "finding is gone. Say what the command showed — the binding "
                     "deleted, the setting changed — so a reader can weigh it"
                 )
+            fold_unnamespaced_check(entry)
             full_id = derive_finding_id(entry)
             if full_id in seen_ids:
                 raise ValidationError(
@@ -3504,6 +3556,12 @@ def validate_findings(data: object, audit_id: str) -> dict:
                     f"{', '.join(sorted(SHARED_ACCOUNT_WORKLOAD_KINDS))}); the namespace or the "
                     "account covers no workload"
                 )
+            scope_reason = _rollup_scope_reason(check, str(entry["object"]))
+            if scope_reason:
+                raise ValidationError(
+                    f"{where}.object: {str(entry['object'])!r} {scope_reason}; a declaration "
+                    "justifies one object, never a roll-up, so the roll-up stays under `findings`"
+                )
             for field in ("cluster", "object"):
                 if _id_segment(str(entry[field])) == ID_EMPTY_SEGMENT:
                     raise ValidationError(
@@ -3538,6 +3596,7 @@ def validate_findings(data: object, audit_id: str) -> dict:
             # posture cannot be both. A worker that writes the finding *and*
             # the declaration has not decided, and the ledger would report the
             # object as broken in one section and intended in the next.
+            fold_unnamespaced_check(entry)
             full_id = derive_finding_id(entry)
             if full_id in seen_ids:
                 raise ValidationError(
@@ -4916,9 +4975,27 @@ def parse_declarations(
             log(f"WARNING: {item_where}: object must be Kind/name, got {raw_object!r}; skipped.")
             continue
         obj = f"{kind}/{name}"
+        scope_reason = _rollup_scope_reason(check, obj)
+        if scope_reason:
+            # Said here, where every item passes: `finish` refuses the item
+            # on the join too, but only where a finding meets its key, and
+            # silently on the manifest route.
+            log(f"WARNING: {item_where}: {obj!r} {scope_reason}; a declaration names one object, never a roll-up; skipped.")
+            continue
+        namespace = item["namespace"].strip()
+        if namespace and check in UNNAMESPACED_CHECKS:
+            # The finding for these checks carries no namespace (the
+            # validator empties the worker's, `fold_unnamespaced_check`); an
+            # owner who wrote one here meant the same object, and an item
+            # filed as written would join nothing.
+            log(
+                f"NOTE: {item_where}: {check!r} names an object outside any namespace; "
+                f"namespace {namespace!r} is read as empty."
+            )
+            namespace = ""
         entry = {
             "check": check,
-            "namespace": item["namespace"].strip(),
+            "namespace": namespace,
             "object": obj,
             "repo": repo,
             "path": path,
@@ -5236,6 +5313,8 @@ def _declaration_covers(item: dict, scoped: dict, fleet_wide: dict, declarable) 
         return None
     if check == NAMESPACE_SHAPE_CHECK and not _is_namespace_object(str(item.get("object", ""))):
         return None
+    if _rollup_scope_reason(check, str(item.get("object", ""))):
+        return None
     return match
 
 
@@ -5265,6 +5344,10 @@ def declare_collector_candidates(data: dict, declarations: list[dict], manifest:
         if isinstance(cluster, dict)
     }
     declared = list(data.get("declared") or [])
+    # Derived ids on both sides: the validator has already emptied the
+    # namespace a worker wrote onto a 3.7 or 3.10 finding (`fold_unnamespaced_check`),
+    # so a finding or a declared entry and the collector's candidate for the
+    # same object carry one id here.
     known = {derive_finding_id(f) for f in data.get("findings") or []} | {
         derive_finding_id(e) for e in declared
     }
@@ -5303,6 +5386,39 @@ def declare_collector_candidates(data: dict, declarations: list[dict], manifest:
 def _is_namespace_object(obj: str) -> bool:
     """Whether `obj` names a Namespace, on the same folding the join uses."""
     return _object_kind_segment(obj) == _id_segment(NAMESPACE_SHAPE_KIND)
+
+
+def fold_unnamespaced_check(entry: dict) -> None:
+    """Empty `namespace` in place on an entry of a check whose object has none.
+
+    Run before an entry's id is derived, on findings, `declared[]` and
+    `resolved_because` alike: the collector files these checks' candidates
+    with no namespace, and a worker that wrote a namespace into the field
+    would otherwise give the same object a second identity that every
+    derived-id consumer — the duplicate check, `still_flagged_ids`, the
+    unpublished-candidate rows — treats as a different finding. Keyed on the
+    check (`UNNAMESPACED_CHECKS`), never on the object's kind: 3.9's
+    `Namespace/<ns>` pile and compliance 2.6's `Namespace/<ns>` posture carry
+    their namespace, and their ledger ids must not move.
+    """
+    if isinstance(entry, dict) and entry.get("namespace") and str(entry.get("check", "")) in UNNAMESPACED_CHECKS:
+        entry["namespace"] = ""
+
+
+def _rollup_scope_reason(check: str, obj: str) -> str | None:
+    """Why `obj` is not an object `check` names — a roll-up's scope, or a kind the check never files — or None.
+
+    A cost declarable check accepts only the kinds its finding names
+    (`COST_DECLARABLE_OBJECT_KINDS`): `Project/` and `Cluster/` are scopes
+    under every one of them, a `Namespace/` under anything but 3.10 is §5's
+    collapse, and `ns/payments` is a spelling of it a denylist would admit.
+    Another stream's check is not judged here.
+    """
+    kind = _object_kind_segment(obj)
+    allowed = COST_DECLARABLE_OBJECT_KINDS.get(check)
+    if allowed is not None and kind not in allowed:
+        return f"names a `{kind}/`, not one of the kinds a {check} finding names ({', '.join(sorted(allowed))})"
+    return None
 
 
 def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
@@ -5371,6 +5487,16 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
                 f"DECLARATION NOT APPLIED: {finding.get('id', '')} — {check} on "
                 f"{finding.get('object', '')} is the allow-all fault (SOP §2.6), which no "
                 f"declaration excuses; the posture names `{NAMESPACE_SHAPE_KIND}/<ns>`. "
+                f"{match.get('repo', '')}:{match.get('path', '')} stands and the finding publishes."
+            )
+            match = None
+        scope_reason = _rollup_scope_reason(check, str(finding.get("object", ""))) if match is not None else None
+        if scope_reason:
+            # A roll-up carries no object identity of its own; a note that
+            # names its scope would silence every member at once.
+            log(
+                f"DECLARATION NOT APPLIED: {finding.get('id', '')} — {finding.get('object', '')} "
+                f"{scope_reason}; a declaration justifies one object, never a roll-up. "
                 f"{match.get('repo', '')}:{match.get('path', '')} stands and the finding publishes."
             )
             match = None

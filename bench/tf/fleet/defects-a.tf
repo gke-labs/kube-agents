@@ -327,6 +327,95 @@ resource "kubernetes_deployment_v1" "token_sidecar" {
   }
 }
 
+# Declared posture (waste): a workload that reserves far more than it uses,
+# the cost SOP's 3.1 `overrequest`, declared on purpose by the pool
+# repository's knowledge/ note. Two pause replicas requesting 10m / 128Mi
+# each. The memory request is the posture: 256Mi summed clears 3.1's
+# materiality floor (0.125 GiB) and sits above the 64Mi resize floor, so the
+# check names the workload on memory and proposes a resize, while a pause
+# container's near-zero use keeps the peak under 20%. CPU stays at the 10m
+# every other fixture requests: it is below the 50m resize floor, so 3.1
+# drops that dimension, and anything larger does not schedule twice on the
+# slot's default pool, which runs above 90% CPU requested. Burstable, not
+# Guaranteed: a memory limit above the request, no CPU limit. A budget, a
+# default-deny policy and the restricted container settings so no other
+# stream names the namespace. The one declarable cost posture observable
+# on apply day: the other seven are age-gated by a week or more. Its case
+# still needs a ledger to read, which the idle pool supplies from day 7.
+resource "kubernetes_namespace_v1" "seeded_headroom" {
+  metadata {
+    name   = "seeded-headroom"
+    labels = local.fleet_labels
+  }
+  depends_on = [google_container_node_pool.seeded_a_default]
+}
+
+resource "kubernetes_deployment_v1" "burst_ingest" {
+  metadata {
+    name      = "burst-ingest"
+    namespace = kubernetes_namespace_v1.seeded_headroom.metadata[0].name
+  }
+  spec {
+    replicas = 2
+    selector {
+      match_labels = { app = "burst-ingest" }
+    }
+    template {
+      metadata {
+        labels = { app = "burst-ingest" }
+      }
+      spec {
+        topology_spread_constraint {
+          max_skew           = 1
+          topology_key       = "kubernetes.io/hostname"
+          when_unsatisfiable = "ScheduleAnyway"
+          label_selector {
+            match_labels = { app = "burst-ingest" }
+          }
+        }
+        automount_service_account_token = false
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name  = "ingest"
+          image = "registry.k8s.io/pause:3.9"
+          # Compliance SOP 2.11's two container-level settings, as on
+          # token-reader, so no other stream names this workload.
+          security_context {
+            allow_privilege_escalation = false
+            run_as_non_root            = true
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+          resources {
+            requests = { cpu = "10m", memory = "128Mi" }
+            limits   = { memory = "256Mi" }
+          }
+        }
+      }
+    }
+  }
+}
+
+resource "kubernetes_pod_disruption_budget_v1" "burst_ingest" {
+  metadata {
+    name      = "burst-ingest"
+    namespace = kubernetes_namespace_v1.seeded_headroom.metadata[0].name
+  }
+  spec {
+    min_available = "1"
+    selector {
+      match_labels = { app = "burst-ingest" }
+    }
+  }
+}
+
 # Defect (security): the classic over-grant -- cluster-admin bound to a
 # namespace's default ServiceAccount. Asserted by compliance-rbac-overgrant.
 # A ClusterRoleBinding, not a RoleBinding, deliberately: the compliance
@@ -598,6 +687,7 @@ resource "kubernetes_network_policy_v1" "default_deny" {
     capacity    = kubernetes_namespace_v1.seeded_capacity.metadata[0].name
     stall       = kubernetes_namespace_v1.seeded_stall.metadata[0].name
     token       = kubernetes_namespace_v1.seeded_token.metadata[0].name
+    headroom    = kubernetes_namespace_v1.seeded_headroom.metadata[0].name
     # seeded-intent gets none on purpose: its missing policy is the compliance
     # SOP's 2.6 posture the pool repository's declared-intent note covers, the
     # way the same note covers notification-relay's missing budget.
