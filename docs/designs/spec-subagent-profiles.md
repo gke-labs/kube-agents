@@ -172,6 +172,10 @@ spec:
 Everything here is dark content: the dispatcher and the profile CRD render nothing unless
 the mode switch says `next`.
 
+As built, the CRD reserves the name `platform`, because the Hermes bridge is that addressee's
+executor, and `resources` and `concurrency` are required rather than defaulted. The example
+above and the platform worked profile below are design sketches from before the CRD existed.
+
 ## How a profile becomes a pod
 
 **Submission is a message, not an API call.** An orchestrator delegates by publishing a

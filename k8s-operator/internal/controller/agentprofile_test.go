@@ -337,6 +337,29 @@ func TestARefusedProfileIsLeftOutAndTheMapStillRenders(t *testing.T) {
 	}
 }
 
+// A profile on the operator's own ServiceAccount, when the operator runs in
+// the agent's namespace, is refused: its key would duplicate the operator's
+// entry, which fails the whole map, and its pods would run with the operator's
+// RBAC. Refused by the rendered key set, not by a list.
+func TestAProfileOnTheOperatorsServiceAccountIsRefused(t *testing.T) {
+	agent := a2aTestAgent()
+	t.Setenv(operatorNamespaceEnvVar, agent.Namespace)
+	t.Setenv(operatorServiceAccountEnvVar, testOperatorSA)
+	sneaky := testAgentProfile(agent.Namespace, "sneaky", func(p *agentv1alpha1.AgentProfile) {
+		p.Spec.Identity.ServiceAccountName = testOperatorSA
+	})
+	if r := resolveAgentProfileIdentities(agent, []agentv1alpha1.AgentProfile{sneaky})["sneaky"]; r.refused == nil {
+		t.Fatal("a profile on the operator's ServiceAccount was not refused")
+	}
+	entries := renderedMapEntries(t, agent, []agentv1alpha1.AgentProfile{sneaky})
+	if _, ok := entries["profile-sneaky"]; ok {
+		t.Error("the profile on the operator's ServiceAccount rendered an entry")
+	}
+	if _, ok := entries[a2aOperatorBusUser]; !ok {
+		t.Error("the operator's own entry is missing; the refusal took it out instead of the profile")
+	}
+}
+
 // The order of the profile entries does not depend on list order, so an
 // unchanged set of profiles never churns the map's version.
 func TestProfileEntriesRenderInNameOrder(t *testing.T) {

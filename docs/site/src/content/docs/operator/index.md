@@ -82,7 +82,7 @@ spec:
 proxy only bootstraps a kubectl context when it has the complete triple; leave any one out and every
 `kubectl` call the agent makes resolves to `localhost:8080` instead of a cluster.
 
-Full walkthroughs: [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/) and [AgentPlugin CRD](/kube-agents/operator/agentplugin-crd/).
+Full walkthroughs: [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/), [AgentPlugin CRD](/kube-agents/operator/agentplugin-crd/) and [AgentProfile CRD](/kube-agents/operator/agentprofile-crd/).
 
 ## Admission webhooks
 

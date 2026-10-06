@@ -57,7 +57,7 @@ A profile binds to the PlatformAgent in its own namespace. With that agent on `m
 - A bus identity for that ServiceAccount in the auth callout's identity map. Its pods may publish their own task events, read their own task input, and use the topics the profile names. Nothing else.
 - An agent card on `a2a.agents.<name>`, rendered from `spec.description`. Deleting the profile publishes a tombstone in its place before the profile is removed.
 
-A profile may not run as `default` or as a ServiceAccount the operator already uses for the PlatformAgent. Such a profile renders nothing, and its `IdentityReady` condition says why.
+A profile may not run as `default`, as a ServiceAccount the operator already uses (for the PlatformAgent or for itself), or as one another `AgentProfile` already holds. Such a profile renders nothing, and its `IdentityReady` condition says why.
 
 Writing an `AgentProfile` grants a bus identity, so treat create and update on `agentprofiles` like create on RoleBindings in that namespace.
 
@@ -65,9 +65,9 @@ Nothing runs a pod from a profile yet. The dispatcher that turns a task into a J
 
 ## Status
 
-| Field                       | Meaning                                                                                                                                                             |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `status.agentRef`           | The PlatformAgent the profile is bound to.                                                                                                                          |
-| `status.serviceAccountName` | The ServiceAccount its pods run as.                                                                                                                                 |
-| `IdentityReady` condition   | The ServiceAccount and bus identity are rendered, or the reason they are not (`ModeNotNext`, `NoPlatformAgent`, `ServiceAccountRefused`, `ServiceAccountNotFound`). |
-| `CardPublished` condition   | The agent card is on the directory, or why not (`BusUnavailable`, `OperatorBusIdentityUnconfigured`).                                                               |
+| Field                       | Meaning                                                                                                                                                                               |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `status.agentRef`           | The PlatformAgent the profile is bound to.                                                                                                                                            |
+| `status.serviceAccountName` | The ServiceAccount its pods run as.                                                                                                                                                   |
+| `IdentityReady` condition   | The ServiceAccount and bus identity are rendered, or why not (`ModeNotNext`, `NoPlatformAgent`, `MultiplePlatformAgents`, `ServiceAccountRefused`, `ServiceAccountNotFound`).         |
+| `CardPublished` condition   | The agent card is on the directory, or why not (`BusUnavailable`, `OperatorBusIdentityUnconfigured`, `IdentityNotRendered`, or the same mode and binding reasons as `IdentityReady`). |

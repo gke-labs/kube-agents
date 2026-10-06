@@ -504,7 +504,9 @@ Layout:
   NetworkPolicy on the NATS pod granting **4222 to exactly the enumerated bus clients**
   (the auth callout, the agent pod - whose sidecars, the Hermes bridge included, share
   its labels - the A2A gateway, session pods by the spawner's labels, the provision Job,
-  and the hand-applied seed Job), and **no pod-network peer for 8222 or 9222**. The demo's
+  and the hand-applied seed Job; **amended 10/6:** and the operator's own pod, by the
+  `kubeagents.x-k8s.io/a2a-bus-client: operator` label from the operator's namespace,
+  which is usually not the agent's), and **no pod-network peer for 8222 or 9222**. The demo's
   `kubectl port-forward` and the kubelet's readiness probe both enter from the node,
   which NetworkPolicy does not govern, so the ws surface stays reachable through
   kubectl and through nothing else in-cluster. The enumeration is today's client
@@ -579,7 +581,7 @@ reason in the status section above: it would key to the agent's entry. Nor is th
 gateway - also a static `nats.conf` user for now - and there is no audit exporter or
 janitor yet. **Amended 10/6:** the `AgentProfile` CRD adds two kinds of entry. The
 operator has one for itself, keyed on the manager's own ServiceAccount: publish on
-`a2a.agents.*` and direct-get on the directory, for the agent cards, and nothing else. Each
+`a2a.agents.*` and direct-get on the directory, for the agent cards, plus its own inbox. Each
 profile gets one narrowed entry, `narrowing: "profile"`, carrying the profile's name and topic
 grants and no subjects. The callout derives that profile pod's task subjects from the
 profile, and its consumer names and inbox from the attested pod name (see the subagent
@@ -619,7 +621,10 @@ object.
 
 **What ships today is coarser than that sentence, and the gap is deliberate.** The
 condition is on the `PlatformAgent`, not on an `AgentProfile`, because the profile CRD
-does not exist yet.
+did not exist yet. **Amended 10/6:** it exists now, and its conditions (`IdentityReady`,
+`CardPublished`) say whether the profile's entry is rendered, not whether the callout is
+serving it. The per-profile reading of this condition arrives with the dispatcher, which is
+the first thing that needs it.
 
 **Amended 9/16: the second half of the sentence is enforced now (as written here; the
 9/17 amendment narrows what the gate reads).** "Nothing dispatches before that condition

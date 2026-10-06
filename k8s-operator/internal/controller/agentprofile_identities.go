@@ -191,6 +191,15 @@ type agentProfileResolution struct {
 // only after its card is tombstoned.
 func resolveAgentProfileIdentities(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) map[string]agentProfileResolution {
 	reserved := reservedProfileServiceAccounts(agent)
+	// Every key the PlatformAgent's own principals already hold in the map,
+	// the operator's among them when it runs in the agent's namespace. A
+	// profile on one of these would be a duplicate key, which fails the
+	// whole map, so the check is against the rendered set rather than a
+	// list someone has to remember to extend.
+	mapKeys := map[string]string{}
+	for _, id := range calloutIdentities(agent) {
+		mapKeys[id.serviceAccount] = id.user
+	}
 	sorted := append([]agentv1alpha1.AgentProfile(nil), profiles...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
 
@@ -207,6 +216,8 @@ func resolveAgentProfileIdentities(agent *agentv1alpha1.PlatformAgent, profiles 
 			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("profile name %q is the Hermes bridge's addressee", p.Name)}
 		case reserved[sa] != "":
 			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("serviceAccountName %q is %s", sa, reserved[sa])}
+		case mapKeys[a2aServiceAccountName(agent.Namespace, sa)] != "":
+			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("serviceAccountName %q is the bus principal %q's", sa, mapKeys[a2aServiceAccountName(agent.Namespace, sa)])}
 		case claimedBy[sa] != "":
 			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("serviceAccountName %q is already AgentProfile %q's", sa, claimedBy[sa])}
 		default:
