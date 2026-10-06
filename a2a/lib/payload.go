@@ -53,6 +53,17 @@ const (
 	ArtifactDelegate = "delegate"
 )
 
+// DelegateRequest is the ArtifactDelegate data part's shape: one child task
+// to mint, addressee and the task text. It is also the wire shape the
+// session pod's MCP server sends over the adapter's unix socket (the socket
+// hop is how the call gets from the harness's delegate tool to the adapter
+// that actually publishes the artifact), so it is named here, beside
+// ArtifactDelegate, rather than duplicated per caller.
+type DelegateRequest struct {
+	Addressee string `json:"addressee"`
+	Text      string `json:"text"`
+}
+
 // The A2A object shapes below carry only the fields the library consults.
 // Payloads travel as raw bytes end to end (assertion 6); these views are for
 // validation and folding, never re-serialized onto the wire.

@@ -21,7 +21,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -88,6 +90,19 @@ func main() {
 func run() int {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	slog.SetDefault(log)
+
+	// `worker-adapter mcp` is not a task run: it is the stdio MCP server the
+	// harness launches as a subprocess of itself, forwarding the session's
+	// one delegate tool call to this adapter process over a unix socket
+	// (worker-adapter/mcp.go). It has none of the task env below, so it is
+	// dispatched before configFromEnv rather than folded into it.
+	if len(os.Args) > 1 && os.Args[1] == "mcp" {
+		if err := workeradapter.ServeDelegateMCP(context.Background(), os.Stdin, os.Stdout, workeradapter.DelegateSocketPath(), log); err != nil && !errors.Is(err, io.EOF) {
+			fmt.Fprintln(os.Stderr, "mcp:", err)
+			return 1
+		}
+		return 0
+	}
 
 	cfg, ok := configFromEnv(log)
 	if !ok {
