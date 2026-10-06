@@ -2667,8 +2667,9 @@ produce no symptom.
 broker that ran git of its own would have had the same problem one container over. Every git
 in the product is agent-issued: the skills call `gitops_workspace.run_git`, which posts to
 `/v1/exec`, which reaches `CommandExecutor.execute`. The broker's own non-agent-selectable
-path is `execute_internal`, and its only caller is `/v1/github/refresh`, which runs
-`git config --get remote.origin.url` and nothing else. The content workspaces run their git
+path is `execute_internal`, and its only caller is the credential refresh route
+(`/v1/forge/refresh`, with `/v1/github/refresh` kept as an alias), which runs
+the provider's own refresh helper from the broker image and nothing else. The content workspaces run their git
 through `execute_workspace_git`, which shares `_execute` with the agent-facing path — so it
 inherits the same hardened environment — but is not reachable from `/v1/exec` and takes no
 agent-supplied argv: the subcommands are literals in `content_workspace.py`, and the only

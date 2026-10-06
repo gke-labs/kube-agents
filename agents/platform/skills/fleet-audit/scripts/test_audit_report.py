@@ -3613,6 +3613,206 @@ class TestPublishedBodies(HarnessTestCase):
         self.assertTrue(carriers, "the run published nothing at all")
 
 
+class TestNewMarker(HarnessTestCase):
+    """The per-finding `NEW_MARKER` the Slack card reads for its "new" tag.
+
+    Written only where the run can say what the last one filed and looked at;
+    a finding wrongly called new is the failure, so an unknown delta marks
+    nothing.
+    """
+
+    @staticmethod
+    def marked(body):
+        return re.findall(
+            r"<!-- finding:(\S+?) -->\n\n" + re.escape(audit_report.NEW_MARKER), body
+        )
+
+    def remember(self, rendered, filed=(), scope=None):
+        """Leave the store a previous run wrote: `rendered` in its body, `filed` too, over `scope`."""
+        self.seed_report(published_body(make_doc(findings=rendered), generated_at=NOW))
+        latest = self.store_dir() / "latest.json"
+        envelope = json.loads(latest.read_text(encoding="utf-8"))
+        envelope["document"] = {
+            "findings": [
+                {"id": derived_id(fid=f["id"], cluster=f["cluster"])}
+                for f in [*rendered, *filed]
+            ],
+            "scope": scope if scope is not None else make_doc()["scope"],
+        }
+        latest.write_text(json.dumps(envelope), encoding="utf-8")
+
+    def finish(self, doc):
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        (body,) = self.harness.bodies_for("issue-update")
+        return body
+
+    def test_a_first_run_marks_nothing(self):
+        # No ledger to measure against: everything would read as new.
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        (body,) = self.harness.bodies_for("issue-create")
+        self.assertIn("<!-- finding:", body)
+        self.assertNotIn(audit_report.NEW_MARKER, body)
+
+    def test_a_known_delta_marks_the_new_findings_and_only_them(self):
+        alpha = make_finding(fid="a", title="Alpha finding")
+        self.remember([alpha])
+        body = self.finish(make_doc(findings=[alpha, make_finding(fid="b", title="Bravo finding")]))
+        self.assertEqual(self.marked(body), [derived_id(fid="b")])
+        self.assertEqual(body.count(audit_report.NEW_MARKER), 1)
+        # The marker sits between the heading and its `Where:` line, and both
+        # readers of that block still read it.
+        self.assertEqual(self.stdout_json()["new"], 1)
+        locations = audit_report.parse_finding_locations(body)
+        self.assertEqual(set(locations), {derived_id(fid="a"), derived_id(fid="b")})
+        self.assertEqual(locations[derived_id(fid="b")]["title"], "Bravo finding")
+
+    def test_an_unknown_delta_marks_nothing(self):
+        # The ledger is open but its body cannot be read, so there is no memory.
+        alpha = make_finding(fid="a", title="Alpha finding")
+        self.remember([alpha])
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.harness.failures = {"issue-view !comments": 1}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc(findings=[alpha, make_finding(fid="b", title="Bravo finding")])
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        (body,) = self.harness.bodies_for("issue-update")
+        self.assertIn("<!-- finding:", body)
+        self.assertNotIn(audit_report.NEW_MARKER, body)
+
+    def test_a_block_under_another_identity_scheme_marks_nothing(self):
+        # Every id looks new across a scheme change, so none is marked, even
+        # where the last run's scope says it ran the finding's check.
+        alpha = make_finding(fid="a", title="Alpha finding")
+        self.remember([alpha])
+        latest = self.store_dir() / "latest.json"
+        envelope = json.loads(latest.read_text(encoding="utf-8"))
+        envelope["ledger_body"] = '## Findings\n\n<!-- audit-findings: ["a"] -->\n'
+        envelope["current_ids"] = ["a"]
+        envelope["id_scheme"] = None
+        envelope["document"]["findings"] = [{"id": "a"}]
+        latest.write_text(json.dumps(envelope), encoding="utf-8")
+        self.assertNotIn(audit_report.NEW_MARKER, self.finish(make_doc(findings=[alpha])))
+
+    def test_a_finding_the_last_body_cut_for_space_is_not_new(self):
+        # The hidden block names only what the body rendered; the stored
+        # document says `b` was filed too.
+        alpha = make_finding(fid="a", title="Alpha finding")
+        bravo = make_finding(fid="b", title="Bravo finding")
+        self.remember([alpha], filed=[bravo])
+        self.assertNotIn(audit_report.NEW_MARKER, self.finish(make_doc(findings=[alpha, bravo])))
+
+    def test_a_finding_on_a_cluster_the_last_run_skipped_is_not_new(self):
+        alpha = make_finding(fid="a", title="Alpha finding")
+        scope = make_doc(
+            clusters=[{"name": "prod-us-east"}],
+            skipped=[{"cluster": "stage-eu", "reason": "unreachable"}],
+        )["scope"]
+        self.remember([alpha], scope=scope)
+        doc = make_doc(
+            findings=[
+                alpha,
+                make_finding(fid="b", title="Bravo finding", cluster="stage-eu"),
+                make_finding(fid="c", title="Charlie finding"),
+            ]
+        )
+        self.assertEqual(self.marked(self.finish(doc)), [derived_id(fid="c")])
+
+    def test_a_carried_ledger_documents_scope_does_not_count_as_looked_at(self):
+        # A held-open run skipped stage-eu and carried the older run's ledger
+        # document, which reached it; the last run still never looked there.
+        alpha = make_finding(fid="a", title="Alpha finding")
+        skipped = make_doc(
+            clusters=[{"name": "prod-us-east"}],
+            skipped=[{"cluster": "stage-eu", "reason": "unreachable"}],
+        )["scope"]
+        self.remember([alpha], scope=skipped)
+        latest = self.store_dir() / "latest.json"
+        envelope = json.loads(latest.read_text(encoding="utf-8"))
+        reached = make_doc(clusters=[{"name": "prod-us-east"}, {"name": "stage-eu"}])["scope"]
+        envelope["ledger_document"] = {"findings": [], "scope": reached}
+        latest.write_text(json.dumps(envelope), encoding="utf-8")
+        doc = make_doc(
+            findings=[
+                alpha,
+                make_finding(fid="b", title="Bravo finding", cluster="stage-eu"),
+                make_finding(fid="c", title="Charlie finding"),
+            ]
+        )
+        self.assertEqual(self.marked(self.finish(doc)), [derived_id(fid="c")])
+
+    def test_a_finding_whose_check_the_last_run_did_not_run_is_not_new(self):
+        # The last run reached prod-us-east but its netpol check did not run
+        # there (timed out, say), so nothing it found there is known new.
+        alpha = make_finding(fid="a", title="Alpha finding", cluster="stage-eu")
+        others = [c for c in audit_report.audit_checks(AUDIT) if c != "netpol-missing"]
+        scope = make_doc(
+            clusters=[{"name": "prod-us-east", "checks_run": others}, {"name": "stage-eu"}]
+        )["scope"]
+        self.remember([alpha], scope=scope)
+        doc = make_doc(
+            findings=[
+                alpha,
+                make_finding(fid="b", title="Bravo finding"),
+                make_finding(fid="c", title="Charlie finding", cluster="stage-eu"),
+            ]
+        )
+        self.assertEqual(self.marked(self.finish(doc)), [derived_id(fid="c", cluster="stage-eu")])
+
+    def test_the_filed_set_is_everything_the_last_run_filed_and_ran(self):
+        withheld = audit_report.POSTURES_WITHHELD_KEY
+        envelope = {
+            "document": {
+                "findings": [{"id": "a"}, "junk", {"title": "no id"}],
+                withheld: {"findings": [{"id": "w"}]},
+                "scope": {
+                    "clusters": [
+                        {"name": " seeded-a ", "checks_run": [{"check": "rbac"}, "junk"]},
+                        {"checks_run": [{"check": "orphan"}]},
+                        "junk",
+                    ],
+                    "skipped": [{"cluster": "seeded-c", "reason": "x"}],
+                },
+            },
+            "ledger_document": {"findings": [{"id": "carried"}]},
+        }
+        self.assertEqual(
+            audit_report.report_filed(envelope),
+            ({"a", "w", "carried"}, {("seeded-a", "rbac")}),
+        )
+
+    def test_a_memory_without_a_document_files_nothing_knowable(self):
+        # A memory seeded from the issue body cannot say what the body cut.
+        self.assertIsNone(audit_report.report_filed(None))
+        self.assertIsNone(
+            audit_report.report_filed({"ledger_body": "x", "seeded_from_ledger": True})
+        )
+
+    def test_the_marker_is_charged_against_the_body_budget(self):
+        finding = make_finding(fid="a", title="Alpha finding")
+        plain = audit_report.render_finding(finding)
+        marked = audit_report.render_finding(finding, new=True)
+        self.assertEqual(marked[:3] + marked[5:], plain)
+        self.assertEqual(marked[3:5], ["", audit_report.NEW_MARKER])
+        both = [finding, make_finding(fid="b", title="Alpha finding")]
+
+        def cost(f):
+            return len("\n".join(audit_report.render_finding(f))) + 2 + len(str(f["id"])) + 3
+
+        # Room for both unmarked; marking the first leaves no room for the second.
+        budget = sum(cost(f) for f in both)
+        _, omitted = audit_report.select_rendered_findings(both, budget)
+        self.assertEqual(omitted, [])
+        _, omitted = audit_report.select_rendered_findings(both, budget, new_ids={str(finding["id"])})
+        self.assertEqual(len(omitted), 1)
+
+
 class TestFinishClean(HarnessTestCase):
     def test_a_clean_run_with_no_ledger_still_counts_what_was_declared(self):
         # Nothing to open and nothing to close, so the JSON line and the log
@@ -13444,6 +13644,14 @@ class ContentModeTestCase(BaseTestCase):
         )
         managed.start()
         self.addCleanup(managed.stop)
+        # The broker's gate reads the host-keyed list.
+        keyed = patch.object(
+            gitops_workspace,
+            "get_managed_repo_keys",
+            return_value=["github:github.com/acme/fleet"],
+        )
+        keyed.start()
+        self.addCleanup(keyed.stop)
 
         # `open` composes https://github.com/<owner>/<name>.git itself and takes
         # no caller-supplied URL, by design — so the redirect to the local bare

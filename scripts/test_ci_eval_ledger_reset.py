@@ -703,7 +703,10 @@ class CallSiteTest(unittest.TestCase):
         # installation holds, so once issues: write is granted for the reset a
         # bodiless grading mint would hand every unit a write token over every
         # pool repository. The grading mint therefore asks for its reads.
-        mint = lifted("_ledger_token_mint")
+        # The python behind _ledger_token_mint is hack/ledger_token_mint.py,
+        # shared with step 0; the shell function only hands it the retryable code.
+        self.assertIn('python3 "${LEDGER_MINT_SCRIPT}"', lifted("_ledger_token_mint"))
+        mint = (SCRIPT.parent / "ledger_token_mint.py").read_text(encoding="utf-8")
         self.assertIn('os.environ.get("LEDGER_MINT_BODY", "")', mint)
         # And an empty body is refused, never sent: the bodiless mint is the
         # widening one, and nothing in the tree asks for it.

@@ -141,6 +141,13 @@ class Forge:
     # CLI-backed forge grants no forge CLI.
     transport = "http"
     cli = ""
+    # The second half of an "http" declaration: the API root every path is
+    # relative to, per instance because one package serves several hosts, and
+    # the "current user" route with the field that names the login (None when
+    # the forge has no such route). Both are read by the broker, which builds
+    # the transport; nothing here makes a call.
+    api_url = ""
+    whoami_route: tuple[str, str] | None = None
     # The few statuses whose shared guidance this forge disagrees with.
     error_overrides: Mapping[int, Override] = {}
     # Whether `proposal-acknowledge` does anything here. A capability rather

@@ -31,6 +31,7 @@ class FakeRelay:
 
     def __init__(self, tag):
         self.tag = tag
+        self.subscription_path = f"projects/p/subscriptions/{tag}"
         self.events = []
         self.settled = []  # (receipt, acknowledged)
         self.api_calls = []
@@ -92,6 +93,8 @@ class A2AChatIngressSeam(unittest.TestCase):
         status, body = self._get("/v1/chat/a2a/events")
         self.assertEqual(status, 200)
         self.assertEqual(body["event"]["receipt"], "A1")
+        # What the Go adapter logs as the subscription it pulls (#2404).
+        self.assertEqual(body["subscription"], "projects/p/subscriptions/a2a")
 
         status, body = self._get("/v1/chat/events")
         self.assertEqual(status, 200)

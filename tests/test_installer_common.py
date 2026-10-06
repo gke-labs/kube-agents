@@ -3623,9 +3623,13 @@ class ScopeSelectorApisTest(unittest.TestCase):
     APIs the plan-time resolution of that selector reads is off (Resource
     Manager and Monitoring for a Metrics Scope, Compute for a Shared VPC host,
     the composition's own split), since the reads run in the plan and the
-    composition enables the APIs only in the apply that follows. Nothing is
-    called when they are on; a listing that fails enables every API the
-    declared selectors read; an enable that fails is a warning, not an abort."""
+    composition enables the APIs only in the apply that follows. The scoped
+    service account pool armed beside a folder or organisation counts as a
+    third kind: the plan lists the container's members through the Asset API,
+    so that API is enabled first too, with the pool's listing as the reason.
+    Nothing is called when they are on; a listing that fails enables every
+    API the declared selectors and the pool read; an enable that fails is a
+    warning, not an abort."""
 
     ALL = "cloudresourcemanager.googleapis.com monitoring.googleapis.com compute.googleapis.com"
 
@@ -3644,7 +3648,12 @@ class ScopeSelectorApisTest(unittest.TestCase):
                 "esac\nexit 1\n"
             )
             (bin_dir / "gcloud").chmod(0o755)
+            # Every key the helper reads is blanked here, the pool's switch and
+            # the container keys beside the selectors', so a developer's shell
+            # (`set -a; source install.env`) cannot arm the pool in a case that
+            # did not; each case sets its own.
             env = {"PROJECT_ID": "test-project", "SCOPE_SHARED_VPC_HOSTS": "", "SCOPE_METRICS_SCOPES": "",
+                   "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "", "SCOPED_SA_POOL_ENABLED": "",
                    "GCLOUD_LOG": str(log)}
             env.update(keys)
             body = (
@@ -3708,24 +3717,100 @@ class ScopeSelectorApisTest(unittest.TestCase):
         self.assertIn("WARN: Could not enable cloudresourcemanager.googleapis.com in project 'test-project'", proc.stdout)
         self.assertIn("gcloud services enable cloudresourcemanager.googleapis.com --project=test-project", proc.stdout)
 
+    # The scoped service account pool lists a declared folder's or
+    # organisation's members at plan time through the Asset API, which the
+    # composition enables only in the apply that follows, so the pool armed
+    # beside a container is the third reason the plan needs an API on first.
+    POOL_REASON = "lists the declared folder's or organisation's members for the scoped service account pool"
+
+    def test_the_pool_armed_beside_a_container_enables_the_asset_api_and_names_the_pool(self):
+        for keys in ({"SCOPED_SA_POOL_ENABLED": "true", "SCOPE_FOLDERS": "123456789012"},
+                     {"SCOPED_SA_POOL_ENABLED": "yes", "SCOPE_ORGANIZATIONS": "987654321098"},
+                     {"SCOPED_SA_POOL_ENABLED": "True", "SCOPE_FOLDERS": " 123456789012, 123456789013 "}):
+            with self.subTest(keys=keys):
+                proc, calls = self._run(keys)
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertEqual(calls, "services enable cloudasset.googleapis.com --project=test-project\n")
+                self.assertIn("INFO: Enabling cloudasset.googleapis.com in project 'test-project'", proc.stdout)
+                self.assertIn(self.POOL_REASON, proc.stdout)
+                self.assertNotIn("Shared VPC host", proc.stdout)
+
+    def test_the_pool_armed_beside_a_container_and_a_selector_enables_both_and_names_both(self):
+        proc, calls = self._run({"SCOPED_SA_POOL_ENABLED": "true", "SCOPE_FOLDERS": "123456789012",
+                                 "SCOPE_SHARED_VPC_HOSTS": "shared-net-host"}, enabled="monitoring.googleapis.com")
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertEqual(calls, "services enable compute.googleapis.com cloudasset.googleapis.com --project=test-project\n")
+        self.assertIn("INFO: Enabling compute.googleapis.com, cloudasset.googleapis.com in project 'test-project'", proc.stdout)
+        self.assertIn("Shared VPC host or Metrics Scope", proc.stdout)
+        self.assertIn(self.POOL_REASON, proc.stdout)
+
+    def test_the_pool_armed_beside_a_container_with_the_asset_api_on_calls_nothing(self):
+        proc, calls = self._run({"SCOPED_SA_POOL_ENABLED": "true", "SCOPE_FOLDERS": "123456789012"},
+                                enabled="cloudasset.googleapis.com")
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertEqual(calls, "")
+        self.assertNotIn("INFO", proc.stdout)
+
+    def test_a_listing_that_fails_with_the_pool_armed_beside_a_container_enables_the_asset_api(self):
+        proc, calls = self._run({"SCOPED_SA_POOL_ENABLED": "true", "SCOPE_FOLDERS": "123456789012"}, list_fails=True)
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertEqual(calls, "services enable cloudasset.googleapis.com --project=test-project\n")
+        self.assertIn("could not be listed", proc.stdout)
+        self.assertIn(self.POOL_REASON, proc.stdout)
+
+    def test_the_pool_armed_without_a_container_calls_nothing(self):
+        # Explicit projects and selector members need no Asset read: the
+        # resolver lists a selector through its own API, and a project is
+        # named already.
+        for keys in ({"SCOPED_SA_POOL_ENABLED": "true", "SCOPE_PROJECTS": "p2-project"},
+                     {"SCOPED_SA_POOL_ENABLED": "true"},
+                     {"SCOPED_SA_POOL_ENABLED": "true", "SCOPE_FOLDERS": " , "}):
+            with self.subTest(keys=keys):
+                proc, calls = self._run(keys, list_fails=True)
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertEqual(calls, "")
+                self.assertNotIn("INFO", proc.stdout)
+
+    def test_a_container_with_the_pool_off_calls_nothing(self):
+        # The composition enables the Asset API for the reconcile's container
+        # search in the apply; the plan reads nothing under a container unless
+        # the pool is armed, so there is nothing to enable first.
+        for keys in ({"SCOPED_SA_POOL_ENABLED": "false", "SCOPE_FOLDERS": "123456789012"},
+                     {"SCOPED_SA_POOL_ENABLED": "", "SCOPE_ORGANIZATIONS": "987654321098"},
+                     {"SCOPE_FOLDERS": "123456789012", "SCOPE_ORGANIZATIONS": "987654321098"}):
+            with self.subTest(keys=keys):
+                proc, calls = self._run(keys, list_fails=True)
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertEqual(calls, "")
+                self.assertNotIn("INFO", proc.stdout)
+
 
 class ScopeContainerPreflightTest(unittest.TestCase):
     """check_scope_container_access: silent with no container; with one, the
     Asset API must be enabled in the host project or no effective policy may
     deny it, and the applying identity must hold setIamPolicy on every
-    container, asked through testIamPermissions. Every failure is named
-    before the refusal; a probe that cannot decide warns and lets the apply
-    speak; "warn" turns the refusal into a warning."""
+    container, asked through testIamPermissions, and, while the scoped
+    service account pool is armed, cloudasset.assets.searchAllResources there
+    too, since the plan lists the container's members for the pool. Every
+    failure is named before the refusal; a probe that cannot decide warns and
+    lets the apply speak; "warn" turns the refusal into a warning."""
 
     def _run(self, keys=None, mode="", api_enabled=True, policy=None, policy_error=False,
-             probe=None, token=True, curl_present=True, strict=False, env_extra=None, policy_garbage=False):
+             probe=None, token=True, curl_present=True, strict=False, env_extra=None, policy_garbage=False,
+             search_probe=None):
         """probe: a dict from resource ("folders/1") to what curl answers:
         "granted", "denied", "forbidden", "service-disabled", "missing",
-        "garbage", "down". The stubs record what they saw in a log the test
-        folds into proc.stderr: the bearer curl read from its stdin (-H @-),
-        the impersonation flag gcloud saw, the first bytes of a key file it
-        was pointed at, and any CLOUDSDK_AUTH_* override that reached it."""
+        "garbage", "down". search_probe: the same, answered only to a request
+        for the pool's cloudasset.assets.searchAllResources on that resource
+        ("granted" or "denied"); a resource absent from it answers from
+        probe, whose granted body holds setIamPolicy alone. The stubs record
+        what they saw in a log the test folds into proc.stderr: the bearer
+        curl read from its stdin (-H @-), every permission it was asked
+        (PROBED:<permission>), the impersonation flag gcloud saw, the first
+        bytes of a key file it was pointed at, and any CLOUDSDK_AUTH_*
+        override that reached it."""
         probe = probe or {}
+        search_probe = search_probe or {}
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
             bin_dir.mkdir()
@@ -3756,6 +3841,12 @@ class ScopeContainerPreflightTest(unittest.TestCase):
             )
             if curl_present:
                 cases = []
+                # The request body (-d) precedes the URL on curl's argv, so a
+                # search case matches the permission then the resource, and
+                # sits before the resource-only cases.
+                for resource, answer in search_probe.items():
+                    body = {"granted": '{"permissions":["cloudasset.assets.searchAllResources"]}', "denied": "{}"}[answer]
+                    cases.append(f"  *\"cloudasset.assets.searchAllResources\"*\"/{resource}:testIamPermissions\"*) printf '%s\\n%s' '{body}' 200; exit 0 ;;")
                 for resource, answer in probe.items():
                     body, status = {
                         "granted": ('{"permissions":["%s"]}' % ("resourcemanager.folders.setIamPolicy" if resource.startswith("folders") else "resourcemanager.organizations.setIamPolicy"), 200),
@@ -3776,7 +3867,7 @@ class ScopeContainerPreflightTest(unittest.TestCase):
                 (bin_dir / "curl").write_text(
                     "#!/usr/bin/env bash\n"
                     'case "$*" in *"Bearer "*) echo "TOKEN-ON-ARGV" >>"$SCOPE_PROBE_LOG"; exit 99 ;; esac\n'
-                    'for a in "$@"; do case "$a" in @-) echo "BEARER:$(sed -n \'s/^Authorization: Bearer //p\')" >>"$SCOPE_PROBE_LOG" ;; @*) echo "BEARER-FROM-FILE" >>"$SCOPE_PROBE_LOG" ;; esac; done\n'
+                    'for a in "$@"; do case "$a" in @-) echo "BEARER:$(sed -n \'s/^Authorization: Bearer //p\')" >>"$SCOPE_PROBE_LOG" ;; @*) echo "BEARER-FROM-FILE" >>"$SCOPE_PROBE_LOG" ;; "{\\"permissions\\""*) echo "PROBED:$(printf \'%s\' "$a" | sed \'s/.*\\["\\(.*\\)"\\].*/\\1/\')" >>"$SCOPE_PROBE_LOG" ;; esac; done\n'
                     "case \"$*\" in\n" + "\n".join(cases) + "\nesac\nexit 22\n")
             # env is an external binary whose argv any local user can read: the
             # stub records what it was handed, then hands over to the real one.
@@ -3796,7 +3887,7 @@ class ScopeContainerPreflightTest(unittest.TestCase):
             # gcloud's credential variables straight from the environment, so a
             # developer's shell must not reach them; each case sets its own.
             env = {"PROJECT_ID": "test-project", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "",
-                   "SCOPE_PROBE_LOG": str(probe_log)}
+                   "SCOPED_SA_POOL_ENABLED": "", "SCOPE_PROBE_LOG": str(probe_log)}
             env.update({name: "" for name in _GOOGLE_CREDENTIAL_VARIABLES})
             env.update(keys or {})
             env.update(env_extra or {})
@@ -3850,6 +3941,50 @@ class ScopeContainerPreflightTest(unittest.TestCase):
         self.assertIn("INFO: Nothing was changed.", proc.stdout)
         # An organisation is always warned about, bindable or not.
         self.assertIn("WARN: SCOPE_ORGANIZATIONS binds the agent's read roles on the whole organisation", proc.stdout)
+
+    def test_the_pool_armed_beside_a_folder_the_identity_cannot_search_names_the_viewer_role(self):
+        # The plan lists the folder's members for the pool, so setIamPolicy
+        # alone is not enough: the search permission is probed too, and a
+        # folder lacking it is reported with the role that grants it.
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012", "SCOPED_SA_POOL_ENABLED": "true"},
+                         probe={"folders/123456789012": "granted"},
+                         search_probe={"folders/123456789012": "denied"})
+        self._assert_rc(proc, 1)
+        self.assertIn("ERROR: Refusing to apply: the Application Default Credentials (the identity Terraform applies with) cannot list the members of folders/123456789012 (cloudasset.assets.searchAllResources)", proc.stdout)
+        self.assertIn("roles/cloudasset.viewer on the folder for that identity", proc.stdout)
+        self.assertIn("scoped service account pool", proc.stdout)
+        self.assertNotIn("cannot set IAM policy on folders/123456789012", proc.stdout)
+        self.assertIn("PROBED:resourcemanager.folders.setIamPolicy\n", proc.stderr)
+        self.assertIn("PROBED:cloudasset.assets.searchAllResources\n", proc.stderr)
+        # An organisation reads the same way, and the warn mode warns instead.
+        proc = self._run(keys={"SCOPE_ORGANIZATIONS": "987654321098", "SCOPED_SA_POOL_ENABLED": "yes"}, mode="warn",
+                         probe={"organizations/987654321098": "granted"},
+                         search_probe={"organizations/987654321098": "denied"})
+        self._assert_rc(proc, 0)
+        self.assertIn("WARN: An applying run would be refused: the Application Default Credentials (the identity Terraform applies with) cannot list the members of organizations/987654321098 (cloudasset.assets.searchAllResources)", proc.stdout)
+        self.assertIn("roles/cloudasset.viewer on the organisation for that identity", proc.stdout)
+
+    def test_the_pool_armed_beside_a_folder_the_identity_can_bind_and_search_passes_silently(self):
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012", "SCOPED_SA_POOL_ENABLED": "true"},
+                         probe={"folders/123456789012": "granted"},
+                         search_probe={"folders/123456789012": "granted"})
+        self._assert_rc(proc, 0)
+        self.assertNotIn("WARN", proc.stdout)
+        self.assertNotIn("ERROR", proc.stdout)
+        self.assertIn("PROBED:cloudasset.assets.searchAllResources\n", proc.stderr)
+
+    def test_the_pool_off_never_probes_the_search_permission(self):
+        # With the pool off the plan reads no container, so the only
+        # permission asked is setIamPolicy, whatever the search probe would say.
+        for armed in ("false", ""):
+            with self.subTest(armed=armed):
+                proc = self._run(keys={"SCOPE_FOLDERS": "123456789012", "SCOPED_SA_POOL_ENABLED": armed},
+                                 probe={"folders/123456789012": "granted"},
+                                 search_probe={"folders/123456789012": "denied"})
+                self._assert_rc(proc, 0)
+                self.assertNotIn("ERROR", proc.stdout)
+                probed = [line for line in proc.stderr.splitlines() if line.startswith("PROBED:")]
+                self.assertEqual(["PROBED:resourcemanager.folders.setIamPolicy"], probed, proc.stderr)
 
     def test_the_probe_uses_the_credentials_the_provider_would(self):
         # GOOGLE_OAUTH_ACCESS_TOKEN as is; GOOGLE_IMPERSONATE_SERVICE_ACCOUNT

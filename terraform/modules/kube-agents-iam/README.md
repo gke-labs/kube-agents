@@ -25,10 +25,22 @@ the grant in your Terraform, where it is reviewed.
 ## The scoped service account pool
 
 `scoped_pool_enabled = true` provisions one service account per project the plan can list in
-`scope` (the host project, `scope.projects` less an exact `exclude.projects` entry, and each
-selector's members; a folder's or organisation's members are not listed at plan time yet), keyed
+`scope` (the host project, `scope.projects` less an exact `exclude.projects` entry, each
+selector's members, and each declared folder's and organisation's members, handed in through
+`scope_container_members`), keyed
 on the bare project id and created in `project_id`, plus `roles/iam.serviceAccountTokenCreator`
-for the agent bound on each member as a resource (never at project level). Two clusters in one
+for the agent bound on each member as a resource (never at project level). A container's members
+are the [`kube-agents-scope-resolver`](../kube-agents-scope-resolver/README.md) module's
+`container_members` output: listed at plan time with the reconcile's own Cloud Asset Inventory
+search while the pool is armed, and not read while it is off. A member gets a pool account on that
+apply and nothing else -- no per-project binding, because the container's grant is inherited, and
+no place in the `scope.max_projects` count -- so pool membership under a container lags where the
+grant and discovery do not: a project created beneath a declared folder since the last apply is
+refused by the broker until the next apply lists it. With the pool armed, every declared container
+needs an entry (an empty list for one with no clusters) or the plan is refused, so a caller that
+skipped the listing is told rather than getting the container's clusters refused one by one. An
+exact `exclude.projects` entry drops a member from the pool; a glob is the reconcile's alone. Two
+clusters in one
 project share an account by design (`docs/designs/multi-project-scope.md` §6). Each member's
 description carries the install's identity (`Pool member of <service_account_id> for
 projects/<id>`), and the installer's pre-apply ownership check lists members by it.
@@ -97,7 +109,9 @@ is wide; the design is
 declaration plans (the intersected allowlist per project, the scoping project and a lookup-only host
 included, nothing in the management project) and which declarations the preconditions refuse,
 the whole-set cap's counting among them; which accounts the scoped service account pool derives
-from a declaration, keyed on the project, and the `scoped_pool_max_accounts` refusal
+from a declaration, keyed on the project, a container's listed members among them and bound
+nowhere else, the `scoped_pool_max_accounts` refusal and the refusal of an armed pool beside a
+container `scope_container_members` has no entry for
 (`tests/scoped_pool.tftest.hcl`); the role set is read from the module's own `scope_roles`
 rather than spelled out. `make terraform-test` runs them, as the `validate` job in `validate.yml`
 does on every pull request; `mock_provider` needs Terraform 1.7 or newer, above the floor the module declares for

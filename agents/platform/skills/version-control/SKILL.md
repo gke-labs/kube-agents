@@ -61,7 +61,8 @@ ever executed beside the credential.
 
 The script is `scripts/vcs.py`. Every subcommand prints one JSON object on
 stdout. `--repo` takes `owner/name` or a full URL, and the broker decides which
-forge that is.
+forge that is. On an install that serves more than one forge, `owner/name` is
+refused: name the repository by its URL.
 
 Verb names are the version-control concept; the spelling you know is an alias.
 `annotate`/`blame`, `log`/`history`, `files`/`manifest`, `grep`/`search`,
@@ -81,10 +82,10 @@ Verb names are the version-control concept; the spelling you know is an alias.
 
 ## When NOT to Use
 
-- **A repository this install does not manage.** Every verb that spends the
-  credential, `clone` and the list/view verbs included, is refused for a
-  repository outside the install's managed list, because the credential is
-  minted per repository; only `capabilities` answers for one. For "how does
+- **A repository this install does not manage.** Every verb, `clone` and the
+  list/view verbs included, is refused for a repository outside the install's
+  managed list, because the broker refuses every verb but `capabilities` for
+  one. For "how does
   upstream implement this", use **inspect-repository**.
 - **A one-off read of a large repository.** `clone` pulls a whole branch's
   history and there is no shallow option; **inspect-repository** pages a
