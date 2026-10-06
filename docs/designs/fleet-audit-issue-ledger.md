@@ -655,6 +655,15 @@ headroom for the trailing marker and for anything a later section appends.
   would have fit; on a body already truncated it costs the findings its length, which grows with the id count up to the cap: about 3 of 37 rendered findings at 60 ids of 70 characters, about 8 at the cap. That is the price of the record. Above `ALL_FINDINGS_BLOCK_CAP` (12,000
   characters) it is left out rather than truncated, since a partial complete list would be the same
   ambiguity with a different name.
+- **A finding new since the last run is marked where the run knows it.** A `<!-- finding-new -->`
+  line under a finding's heading says the last run did not file it although it ran the finding's
+  check on its cluster, so the Slack card can tag it. It is worked out before rendering, against
+  everything the last run filed in its stored report rather than the hidden block alone: a finding
+  the last body cut for space, or a posture it withheld, is not new, and nor is one whose check that
+  run did not run on its cluster (skipped, timed out, or inapplicable). A finding whose check no
+  `checks_run` entry names is therefore never marked. That makes it narrower than the delta's `new`. A run that cannot say what the last one filed writes none: a first run, a lost
+  or seeded report store, and a previous marker under another identity scheme, where every id would
+  look new. An absent marker never means "not new".
 - **The delta comment is capped and ordered by severity.** Both of its lists cap at 50 rows, and the
   `new` list is sorted severity-first before the cap applies — an alphabetical cut decides what a
   reader sees by the first letter of a finding id, which is how a critical ends up under "…and 40
@@ -953,11 +962,16 @@ says so: a scheduled audit is a cron run on the Platform Agent's own roster
 (`agents/platform/cron/jobs.json`, ticked by `profile-cron-tick`), executed in a process of its own
 with no kanban card behind it and so no completion for a chat subscription to follow. The Platform
 Agent profile holds no chat destination either — it ships no `platforms:` section, and a privileged
-fleet-management profile should not acquire one — so a scheduled run's report reaches humans through
-the Tier 1 ledger and nowhere else. `silent_ok` still earns its keep on the dispatched path, where a
-person is demonstrably waiting; on the scheduled path it currently gates a delivery leg that has no
-destination. If a scheduled chat ping is ever wanted it belongs on the Chat Agent, which owns
-ingress, and it should carry a pointer — title, counts, ledger URL — not the report.
+fleet-management profile should not acquire one — so the Platform Agent's own delivery leg has no
+destination, and the Tier 1 ledger is where a scheduled run's report is read. `silent_ok` still earns
+its keep on the dispatched path, where a person is demonstrably waiting. The scheduled chat ping
+lives on the Chat Agent, which owns ingress: the cron report relay
+([`cron-report-relay.md`](cron-report-relay.md)) posts the run's one line of counts ending with the
+ledger URL. In Slack with `KAGE_SLACK_UX` on that line becomes a card built from the ledger issue:
+a headline carrying the count of the most severe findings present, up to ten critical findings or
+the top two of a lower severity when there are none (tagged new where the body marks it so), a
+count of the rest, any clusters the run did not scan, and a link to the issue; the
+issue stays the report, and the card only summarises what it already says.
 
 ## 8. Labels
 

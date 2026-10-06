@@ -140,7 +140,7 @@ if configuration:
             str(configuration.get("subscriptionPath") or "Not configured"),
             language="text",
         )
-        left.caption("Hermes mode")
+        left.caption("Output mode")
         left.write(str(configuration.get("mode") or "default"))
         left.caption("Allowed users")
         allowed_users = list(configuration.get("allowedUsers") or [])

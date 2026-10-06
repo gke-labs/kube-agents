@@ -106,6 +106,9 @@ ADDED_AFTER_THE_SPLIT = [
     "upgrades-master-behind-offered-elsewhere",  # the patch collector's §3.1 route check, with patch_readiness.py
     "obtainability-planted-orphan-service",  # the obtainability collector's §3.16 check, with collect.py
     "obtainability-declared-intent-no-finding",  # #1341 criterion 4, activated with its declared-no-pdb-workload fixture (#1409)
+    "compliance-declared-intent-no-finding",  # the compliance stream's declared-intent step over the same fixture (#1408)
+    "compliance-declared-token-shields-siblings",  # the compliance stream's other posture, over the declared-token-workload fixture (#1408)
+    "patch-declared-intent-no-finding",  # the patch stream's declared-intent step, over seeded-c's missing upgrade notifications (#1408)
 ]
 # Appended at the tail of the nightly file.
 ADDED_AT_THE_TAIL = [

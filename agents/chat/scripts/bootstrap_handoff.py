@@ -633,7 +633,8 @@ def _prioritize_body() -> str:
         "Rank the onboarding inventory into the report the user receives. Follow the prioritization "
         f"SOP, reading whichever of these exists:\n{paths}\n\n"
         f"Your only input is `{RAW_PATH}`; write the ranked report to `{REPORT_PATH}`. A separate "
-        "delivery job posts that file to the user verbatim. Do not message the user yourself."
+        "delivery job posts that file to the user with no further model editing: verbatim, or on "
+        "Slack laid out again by a fixed script. Do not message the user yourself."
     )
 
 

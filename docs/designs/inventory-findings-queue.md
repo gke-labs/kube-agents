@@ -41,7 +41,8 @@ worker follows `inventory.md` and lists the fleet, while the gate files one audi
 `bootstrap_handoff.py` writes the complete findings to `/opt/data/INVENTORY.raw.md`; a
 second card follows `inventory_prioritize_sop.md`, collapsing duplicates and ranking everything
 before rendering at most five items to `/opt/data/INVENTORY.md`; `bootstrap_delivery.py` posts that
-file to chat verbatim. The cap has one exception, which matters to the argument below: when
+file to chat verbatim (on Slack with `KAGE_SLACK_UX` on, laid out again by a fixed script that keeps
+the top two findings and every critical one, or the whole list when it runs past five, each with its sentence as written). The cap has one exception, which matters to the argument below: when
 critical findings alone exceed five they are never capped and never rolled up, so the list is
 exactly those criticals. A fleet with six criticals gets all six; a fleet with one critical and
 forty gaps gets five.
@@ -1176,7 +1177,8 @@ the smaller change and leaves one vocabulary.
 
 It does not replace the audit ledgers. It builds no new remediation-PR machinery, reusing
 `remediate` wholesale. It leaves the shape of the first-time report alone — the delivered
-`INVENTORY.md` keeps its five-item cap and is still posted verbatim, and its `Also found: N items`
+`INVENTORY.md` keeps its five-item cap and is still posted verbatim (laid out again on Slack
+with `KAGE_SLACK_UX` on, down to the top two findings and every critical one, or the whole list past five, as written), and its `Also found: N items`
 line gains a link to the backlog (§5). What does change is which five: §5 renders the report from
 what the sweep registered, so §4's single scale decides the order and §4.2's thresholds supply the
 severity word, where `inventory_prioritize_sop.md` today preserves the severity each finding was

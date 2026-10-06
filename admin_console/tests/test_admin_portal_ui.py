@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import os
 import tempfile
 import unittest
@@ -1661,6 +1662,44 @@ class AdminPortalFunctionalTest(unittest.TestCase):
                 os.chdir(original_cwd)
 
         self.assertEqual(len(app.exception), 0)
+
+
+class ProductTerminologyTest(unittest.TestCase):
+    """The console names the product, not the agent runtime it is built on (#1864)."""
+
+    def test_console_strings_do_not_show_the_runtime_name(self):
+        console = REPO_ROOT / "admin_console"
+        modules = sorted(
+            path
+            for path in console.rglob("*.py")
+            if "tests" not in path.relative_to(console).parts
+        )
+        self.assertTrue(modules)
+        for module in modules:
+            tree = ast.parse(module.read_text(encoding="utf-8"))
+            # Only real docstrings are skipped: Streamlit renders any other
+            # bare string statement on the page.
+            docstrings = {
+                id(node.body[0].value)
+                for node in ast.walk(tree)
+                if isinstance(
+                    node,
+                    (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef),
+                )
+                and node.body
+                and isinstance(node.body[0], ast.Expr)
+                and isinstance(node.body[0].value, ast.Constant)
+            }
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Constant)
+                    and isinstance(node.value, str)
+                    and id(node) not in docstrings
+                ):
+                    # Case-sensitive on purpose: lowercase "hermes" is the
+                    # runtime's install path and OTel attribute prefix.
+                    with self.subTest(module=module.name, line=node.lineno):
+                        self.assertNotIn("Hermes", node.value)
 
 
 if __name__ == "__main__":
