@@ -159,6 +159,21 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	log.Info("delegation minted", "parent", taskID, "child", childID, "addressee", addressee)
 }
 
+// wakeTruncatedNote follows the "…" truncateRunes leaves on a wake body cut
+// at the cap.
+const wakeTruncatedNote = " (truncated; the full result is in the conversation)"
+
+// capWakeBody bounds the child's result (or failure message) as it goes into
+// the wake's prompt: at most lib.DelegateTextCap bytes, the cap the request
+// direction holds, cut on a rune boundary and marked. The relay has already
+// posted the whole of it to the conversation.
+func capWakeBody(body string) string {
+	if len(body) <= lib.DelegateTextCap {
+		return body
+	}
+	return truncateRunes(body, lib.DelegateTextCap-len("…")-len(wakeTruncatedNote)) + wakeTruncatedNote
+}
+
 // liveChild names a child task of this conversation that has not ended: a
 // child entry whose task the gateway still routes. The task index is the
 // liveness the relay itself keeps; relayTerminal retires it on the child's
@@ -276,7 +291,7 @@ func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child Tas
 	}
 	text := fmt.Sprintf("The task you delegated to %s (task %s) %s.", targetPlatform, child.ID, outcome)
 	if body = strings.TrimSpace(body); body != "" {
-		text += "\n" + body
+		text += "\n" + capWakeBody(body)
 	}
 
 	if rec.Profile == "" {

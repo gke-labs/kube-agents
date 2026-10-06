@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -1047,5 +1048,32 @@ func TestAWakeAfterAGatewayRestartStillCarriesTheRequester(t *testing.T) {
 	_ = json.Unmarshal(origin.Authority, &parent)
 	if auth.Requester != parent.Requester || auth.Via == nil || auth.Via.TaskID != child.TaskID || auth.Via.Session != session {
 		t.Fatalf("wake authority after restart = %+v", auth)
+	}
+}
+
+// TestAnOverCapResultIsTruncatedInTheWake: the wake text carries at most
+// lib.DelegateTextCap bytes of the child's result, cut on a rune boundary and
+// marked, while the conversation still gets the whole result.
+func TestAnOverCapResultIsTruncatedInTheWake(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	_, _, child := delegated(t, r, spawn, "discord:g1/t-wake-big", 0)
+	big := strings.Repeat("é", lib.DelegateTextCap) // two bytes a rune: twice the cap
+	completeTask(t, r.execFor(t, child, targetPlatform), big)
+	waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
+	wake := r.awaitTask(t, spawn.calls()[1].Session)
+	head := "The task you delegated to platform (task " + child.TaskID + ") completed.\n"
+	got := envText(t, wake)
+	body, ok := strings.CutPrefix(got, head)
+	if !ok {
+		t.Fatalf("wake text head = %q", got[:min(len(got), 120)])
+	}
+	if len(body) > lib.DelegateTextCap {
+		t.Fatalf("wake body is %d bytes, over the cap %d", len(body), lib.DelegateTextCap)
+	}
+	if !strings.HasSuffix(body, "… (truncated; the full result is in the conversation)") {
+		t.Fatalf("wake body tail = %q", body[max(0, len(body)-80):])
+	}
+	if !utf8.ValidString(body) || !strings.HasPrefix(body, strings.Repeat("é", 100)) {
+		t.Fatal("wake body is not a rune-boundary prefix of the result")
 	}
 }
