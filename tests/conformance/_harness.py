@@ -377,7 +377,13 @@ SOURCES: dict[str, Source] = {
     ),
     "a2a_session_grants": Source(
         "a2a/authcallout/session.go",
-        ("func sessionGrants", "lib.TaskEventsSubject(pod,"),
+        ("func sessionGrants", "func executorGrants", "lib.TaskEventsSubject(addressee,"),
+    ),
+    # The other narrowing that starts from executorGrants: an AgentProfile's
+    # pods (the A2A profile resource, not a Hermes profile directory).
+    "a2a_profile_grants": Source(
+        "a2a/authcallout/profile_narrowing.go",
+        ("func profileGrants", "executorGrants(profile, pod)"),
     ),
     # What the server actually loads, as opposed to what the Go builders say.
     # The writer-set tests read both and assert they agree: the Go map is what

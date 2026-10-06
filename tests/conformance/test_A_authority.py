@@ -767,11 +767,26 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
 
     @classmethod
     def _session_publish_derivation(cls) -> str:
-        """The literal Publish list `sessionGrants` starts from, as Go source."""
-        body = h.go_function_body(h.text("a2a_session_grants"), "sessionGrants")
+        """Every executor publish grant the callout derives, as Go source.
+
+        That is the Publish literal `executorGrants` starts both narrowings
+        from (session pods and AgentProfile pods), plus the bodies of
+        `sessionGrants` and `profileGrants`, which append to it. The literal
+        alone, not all of `executorGrants`: its consumer filters name `…in`
+        as a READ, which is what the assertions here distinguish. Each
+        narrowing is required to call `executorGrants`, so one that stopped
+        would not silently fall out of what is read.
+        """
+        body = h.go_function_body(h.text("a2a_session_grants"), "executorGrants")
         block = re.search(r"Publish:\s*\[\]string\{(.*?)\n\t*\},", body, re.DOTALL)
-        assert block is not None, "sessionGrants no longer starts from a Publish literal"
-        return block.group(1)
+        assert block is not None, "executorGrants no longer starts from a Publish literal"
+        narrowings = [
+            h.go_function_body(h.text("a2a_session_grants"), "sessionGrants"),
+            h.go_function_body(h.text("a2a_profile_grants"), "profileGrants"),
+        ]
+        for narrowing in narrowings:
+            assert "executorGrants(" in narrowing, "a narrowing no longer starts from executorGrants"
+        return block.group(1) + "\n".join(narrowings)
 
     def test_A3_precondition_the_bus_principals_are_still_rendered_as_data(self) -> None:
         """The principals the writer-set tests iterate, so a moved one is loud.
@@ -869,7 +884,7 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         distinguishes.
         """
         publish = self._session_publish_derivation()
-        self.assertIn("lib.TaskEventsSubject(pod", publish)
+        self.assertIn("lib.TaskEventsSubject(addressee", publish)
         self.assertNotIn("TaskInSubject", publish, "the session's Publish literal reaches its own in subject")
         self.assertNotIn(
             "a2a.tasks.", publish,
