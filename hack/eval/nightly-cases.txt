@@ -199,9 +199,10 @@
 # three units at the 200s default (a read-only chat turn, measured 3-8
 # minutes a repetition on the dev install). Counted from the lists rather
 # than the paragraphs above (the chat-voice trio and the declared-intent
-# trio landed beside each other, each counted without the other): this
-# case, the last entry below, makes it fifty-eight cases (174 units) of a
-# seventy-two-case, 216-unit matrix.
+# trio landed beside each other, each counted without the other, and two
+# chat cases registered since without a paragraph): this case, the last
+# entry below, makes it sixty-one cases (183 units) of a seventy-five-case,
+# 225-unit matrix.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
