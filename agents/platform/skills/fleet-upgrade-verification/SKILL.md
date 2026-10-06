@@ -188,8 +188,8 @@ validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpoints
   API group, operation, resource (with the API's `*`, `*/*` and `pods/*` semantics) and scope;
   `namespaceSelector`, `objectSelector` and `matchConditions` are not evaluated, so a webhook they
   narrow is reported as able to match. The cell names the configuration, the webhook, the reason
-  and what it matches; each JSON finding carries `reason` and `upgrade_path`,
-  split into `blocking` and `outage`. A fail-closed webhook with a URL backend is counted in the
+  and what it matches (an outage cell lists the webhook's own rules); each JSON finding carries
+  `reason`, `upgrade_path` and `rules`, split into `blocking` and `outage`. A fail-closed webhook with a URL backend is counted in the
   JSON (`url_backends`) and never graded, because nothing read here says whether the URL answers;
   GKE installs two on every cluster. Fail-open webhooks are counted in the JSON (`fail_open`).
 - **Maintenance** (`security_patch_orchestrator_sop.md` §3.7 and §3.8), evaluated at `--at`, an

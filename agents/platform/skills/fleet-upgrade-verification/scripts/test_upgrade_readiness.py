@@ -502,7 +502,15 @@ class WebhookScopeTest(unittest.TestCase):
         graded = grade([hook("gate.seeded.invalid", [rule(["configmaps"])], policy="Fail", service=("seeded-upgrade", "nonexistent-admission-gate"))])
         self.assertEqual(graded["blocking"], [])
         self.assertEqual(len(graded["outage"]), 1)
-        self.assertIn("matches none of the operations this rule reads as the upgrade's path", r.describe_webhook_finding(graded["outage"][0]))
+        self.assertIn("matches none of the operations this rule reads as the upgrade's path (its rules: CREATE configmaps)", r.describe_webhook_finding(graded["outage"][0]))
+        self.assertEqual(graded["outage"][0]["rules"], ["CREATE configmaps"])
+
+    def test_an_outage_cell_names_every_rule_with_its_group(self):
+        # GKE's managed Prometheus operator gate, outside the path: the cell says what it does match.
+        hook_rules = [rule(["rules", "clusterrules"], groups=("monitoring.googleapis.com",), operations=("CREATE", "UPDATE")), rule(["configmaps"])]
+        graded = grade([hook("mon.example.com", hook_rules, policy="Fail")])
+        self.assertEqual(graded["outage"][0]["rules"], ["CREATE/UPDATE rules,clusterrules in monitoring.googleapis.com", "CREATE configmaps"])
+        self.assertIn("(its rules: CREATE/UPDATE rules,clusterrules in monitoring.googleapis.com, CREATE configmaps)", r.describe_webhook_finding(graded["outage"][0]))
 
     def test_each_upgrade_path_target(self):
         self.assertEqual(self._path([rule(["pods"])]), ["CREATE pods"])

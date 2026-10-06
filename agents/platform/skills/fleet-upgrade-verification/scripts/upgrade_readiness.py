@@ -190,7 +190,14 @@ UPGRADE_PATH_LABEL = "{operation} {resource}"
 WEBHOOK_NAME_FORMAT = "{config}/{webhook}"
 WEBHOOK_SERVICE_FORMAT = "{namespace}/{name}"
 WEBHOOK_FINDING_FORMAT = "{webhook} ({config_kind}): failurePolicy Fail and {reason}; matches {matches}"
-WEBHOOK_OUTAGE_MATCHES = "none of the operations this rule reads as the upgrade's path; it fails its own requests now and is reported, not graded"
+WEBHOOK_OUTAGE_MATCHES = "none of the operations this rule reads as the upgrade's path (its rules: {rules}); it fails its own requests now and is reported, not graded"
+# A webhook's rules, rendered for the cell so the operator can judge an outage: operations
+# joined by `/`, resources by `,`, with the API groups named when any is not the core group.
+RULE_FORMAT = "{operations} {resources}"
+RULE_GROUP_FORMAT = "{rule} in {groups}"
+RULE_OPERATION_JOIN = "/"
+RULE_RESOURCE_JOIN = ","
+RULE_NONE = "no rules"
 
 
 # ---------------------------------------------------------------------------- PDBs
@@ -780,13 +787,34 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
                 "service": WEBHOOK_SERVICE_FORMAT.format(namespace=service_ref.get("namespace", ""), name=service_ref.get("name", "")),
                 "reason": reason,
                 "upgrade_path": matches,
+                "rules": describe_rules(hook),
             }
             result["blocking" if matches else "outage"].append(finding)
     return result
 
 
+def describe_rules(hook: dict) -> list[str]:
+    """Each of the webhook's rules as `OP/OP resource,resource[ in group,group]`, so a cell
+    that says the webhook is outside the upgrade's path also says what it does match."""
+    out = []
+    for rule in hook.get("rules") or []:
+        if not isinstance(rule, dict):
+            continue
+        operations = RULE_OPERATION_JOIN.join(str(o) for o in rule.get("operations") or [])
+        resources = RULE_RESOURCE_JOIN.join(str(r) for r in rule.get("resources") or [])
+        text = RULE_FORMAT.format(operations=operations, resources=resources).strip()
+        groups = [str(g) for g in rule.get("apiGroups") or [] if g]
+        if groups:
+            text = RULE_GROUP_FORMAT.format(rule=text, groups=RULE_RESOURCE_JOIN.join(groups))
+        out.append(text)
+    return out
+
+
 def describe_webhook_finding(finding: dict) -> str:
-    matches = LIST_SEPARATOR.join(finding["upgrade_path"]) if finding["upgrade_path"] else WEBHOOK_OUTAGE_MATCHES
+    if finding["upgrade_path"]:
+        matches = LIST_SEPARATOR.join(finding["upgrade_path"])
+    else:
+        matches = WEBHOOK_OUTAGE_MATCHES.format(rules=LIST_SEPARATOR.join(finding.get("rules") or []) or RULE_NONE)
     return WEBHOOK_FINDING_FORMAT.format(webhook=finding["webhook"], config_kind=finding["config_kind"], reason=finding["reason"], matches=matches)
 
 

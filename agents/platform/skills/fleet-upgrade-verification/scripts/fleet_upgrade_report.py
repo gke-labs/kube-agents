@@ -216,16 +216,17 @@ KUBECTL_TIMEOUT_SECONDS = 60
 # case the second read against the same kubeconfig would only spend a second timeout to
 # fail the same way.
 UNREACHABLE_MARKERS = ("timed out after", "Unable to connect to the server", "i/o timeout", "connection refused", "no such host")
-WEBHOOK_READ_SKIPPED = "skipped: the PDB read got no answer from the API server"
+WEBHOOK_READ_SKIPPED = f"skipped: the PDB read got no answer from the API server (a connection failure, or the {KUBECTL_TIMEOUT_SECONDS} s deadline)"
 # The member's note names the one cause its reads failed for, so an operator goes to the
 # step that failed: the directory, the credentials, the first read, the second read, or the
-# second read skipped because the first found the API server unreachable. A skipped read is
-# not a failed one: it gets no error row of its own under the table.
+# second read skipped because the first got no answer (a connection failure, or run_cmd's
+# deadline, which the note names rather than calling the server unreachable). A skipped
+# read is not a failed one: it gets no error row of its own under the table.
 NOTE_DIRECTORY_FAILED = "kubeconfig directory could not be created; PDBs and webhooks not graded"
 NOTE_CREDENTIALS_FAILED = "credentials for the cluster could not be fetched; PDBs and webhooks not graded"
 NOTE_PDB_READ_FAILED = "PDB read failed; PDBs not graded"
 NOTE_WEBHOOK_READ_FAILED = "webhook read failed; webhooks not graded"
-NOTE_WEBHOOK_READ_SKIPPED = "webhook read skipped: the PDB read got no answer from the API server; webhooks not graded"
+NOTE_WEBHOOK_READ_SKIPPED = f"webhook read skipped: the PDB read got no answer from the API server (a connection failure, or the {KUBECTL_TIMEOUT_SECONDS} s deadline); webhooks not graded"
 # Two reads, so a failure listing the webhook side (a large EndpointSlice list timing out, a
 # custom role without webhook-configuration reads) costs the webhook rule only, never the PDBs.
 KUBECTL_RESOURCES = "pdb,deploy,statefulset"
