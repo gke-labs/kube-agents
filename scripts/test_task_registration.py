@@ -698,6 +698,10 @@ class TestTheRulesReject(unittest.TestCase):
         # The lead says what the case does: a report check opens no cluster.
         self.assertIn("names seeded-fleet roles (crashloop-workload)", problem)
         self.assertNotIn("reads live cluster state", problem)
+        # The remedy names the role the list has to carry and does not offer
+        # `fixtures: []`, which the undeclared-role rule would refuse next run.
+        self.assertIn("crashloop-workload among them", problem)
+        self.assertNotIn("fixtures: []", problem)
 
     def test_a_cluster_reading_check_with_no_fixtures_keeps_the_reading_lead(self):
         problem = self._only(
@@ -706,6 +710,8 @@ class TestTheRulesReject(unittest.TestCase):
             verification_spec=self._entry(check={"type": "fleet_resource_property", "fixture_role": "crashloop-workload", "kind": "deployment", "name": "payments-api", "namespace": "seeded-debug", "property_path": "spec.replicas", "op": "eq", "expected": 1}),
         )
         self.assertIn("reads live cluster state (fleet_resource_property)", problem)
+        # A fleet check names a role too, so the empty list is not offered here either.
+        self.assertNotIn("fixtures: []", problem)
 
     def test_a_parked_case_may_name_the_role_its_issue_plants_in_fixture_roles(self):
         # FIXTURE_NOT_READY keeps the case off every roster, so the role it
@@ -834,7 +840,7 @@ class TestTheRulesReject(unittest.TestCase):
         self._only("must be a list of entries", verification_spec={"name": "n"})
 
     def test_a_cluster_reading_case_with_no_fixtures_is_rejected(self):
-        self._only(
+        problem = self._only(
             "declares no 'fixtures:'",
             fixtures=DELETE,
             verification_spec=self._entry(
@@ -846,6 +852,17 @@ class TestTheRulesReject(unittest.TestCase):
                 }
             ),
         )
+        # No check names a role, so the empty list is a real way out and is offered.
+        self.assertIn("fixtures: []", problem)
+
+    def test_the_fixture_catalogue_is_parsed_once_per_case(self):
+        # Every entry's placeholders are checked against the catalogue's slots;
+        # the parse is hoisted, so a six-entry case reads the file as often as
+        # a one-entry case: once.
+        entries = [dict(self.VALID["verification_spec"][0], name=f"names-the-thing-{i}") for i in range(6)]
+        with unittest.mock.patch.object(validator, "_catalog", wraps=validator._catalog) as parse:
+            self.assertEqual(self._validate(verification_spec=entries), [])
+        self.assertEqual(parse.call_count, 1)
 
     def test_an_empty_fixtures_list_is_a_declaration(self):
         self.assertEqual(

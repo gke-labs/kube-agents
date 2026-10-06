@@ -515,15 +515,21 @@ REPORT_CHECK_TYPE = "report_contains"
 COMPOUND_CHILDREN_KEY = "checks"
 
 
-def _catalog_slots() -> set[str]:
-    """Cluster slots the catalogue declares, by its `cluster_slots` block and
-    by the slot every role names."""
+def _catalog() -> dict[str, Any]:
+    """bench/tf/fleet/fixtures.json, parsed. The one read of the file: the slot
+    and role readers below take its result, and validate_case() parses it once
+    per case rather than once per check entry."""
     try:
-        data = json.loads(ROLE_CATALOG.read_text(encoding="utf-8"))
+        return json.loads(ROLE_CATALOG.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise CaseError(f"{ROLE_CATALOG}: could not be parsed as JSON: {exc}") from exc
-    slots = set((data.get("cluster_slots") or {}).keys())
-    for spec in (data.get("roles") or {}).values():
+
+
+def _catalog_slots(catalog: dict[str, Any]) -> set[str]:
+    """Cluster slots the catalogue declares, by its `cluster_slots` block and
+    by the slot every role names."""
+    slots = set((catalog.get("cluster_slots") or {}).keys())
+    for spec in (catalog.get("roles") or {}).values():
         if isinstance(spec, dict) and isinstance(spec.get("cluster_slot"), str):
             slots.add(spec["cluster_slot"])
     return slots
@@ -588,13 +594,9 @@ def _strings_under(raw: Any) -> list[str]:
     return []
 
 
-def _catalog_roles() -> dict[str, Any]:
+def _catalog_roles(catalog: dict[str, Any]) -> dict[str, Any]:
     """Roles in bench/tf/fleet/fixtures.json, which owns the vocabulary."""
-    try:
-        data = json.loads(ROLE_CATALOG.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise CaseError(f"{ROLE_CATALOG}: could not be parsed as JSON: {exc}") from exc
-    return data.get("roles") or {}
+    return catalog.get("roles") or {}
 
 
 def _overlay_fixtures() -> list[dict[str, Any]]:
@@ -603,7 +605,7 @@ def _overlay_fixtures() -> list[dict[str, Any]]:
     return [f for f in (data.get("fixtures") or []) if isinstance(f, dict)]
 
 
-def known_fixture_roles() -> set[str]:
+def known_fixture_roles(catalog: dict[str, Any] | None = None) -> set[str]:
     """Every role slug a task.yaml may name.
 
     bench/tf/fleet/fixtures.json is the vocabulary; the overlay contributes
@@ -612,8 +614,11 @@ def known_fixture_roles() -> set[str]:
     place to also complain that the two disagree -- that is a repository-level
     fault, not a fault of the case that happened to name the role, so it is
     reported once by fixture_catalog_disagreements() instead of once per case.
+
+    `catalog` is the parsed catalogue when the caller already holds it
+    (validate_case() reads it once per case); without it the file is read.
     """
-    roles = set(_catalog_roles())
+    roles = set(_catalog_roles(_catalog() if catalog is None else catalog))
     roles |= {f["role"] for f in _overlay_fixtures() if f.get("slot") is None and "role" in f}
     return roles
 
@@ -627,7 +632,7 @@ def fixture_catalog_disagreements() -> list[str]:
     `fixtures:` and the catalogue's in a check's `fixture_role:`, in the same
     file, for the same object.
     """
-    catalog = _catalog_roles()
+    catalog = _catalog_roles(_catalog())
     problems = []
     for entry in _overlay_fixtures():
         role, slot = entry.get("role"), entry.get("slot")
@@ -706,8 +711,9 @@ def bench_cases() -> dict[str, pathlib.Path]:
 
 
 def _fixture_roles_shape(node: Any, where: str, problems: list[str]) -> None:
-    """`fixture_roles:` is a list of role slugs; a scalar would otherwise be
-    walked character by character and reported as a dozen unknown roles."""
+    """`fixture_roles:` is a list of role slugs. `_fixture_roles` reads list
+    entries only, so a scalar would otherwise name no role at all and slip
+    past the undeclared-role and slot checks, to error at run time."""
     if not isinstance(node, dict):
         return
     roles = node.get("fixture_roles")
@@ -778,7 +784,7 @@ def _check_types(node: Any, found: set[str]) -> None:
         _check_types(child, found)
 
 
-def _fixture_roles(node: Any, found: set[str], plural: set[str] | None = None) -> None:
+def _fixture_roles(node: Any, found: set[str], plural: set[str]) -> None:
     """Every `fixture_role:` (and `fixture_roles:` entry) named anywhere in
     one check subtree. `plural` collects the `fixture_roles:` entries on
     their own as well: the runner resolves those to a slot, so they are held
@@ -794,8 +800,7 @@ def _fixture_roles(node: Any, found: set[str], plural: set[str] | None = None) -
         for role in roles:
             if isinstance(role, str):
                 found.add(role)
-                if plural is not None:
-                    plural.add(role)
+                plural.add(role)
     for child in node.get("checks") or []:
         _fixture_roles(child, found, plural)
 
@@ -940,13 +945,15 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
         )
 
     # Fixture roles. Cases address the seeded fleet by role, never by cluster
-    # name or project id -- see docs/designs/bench-fleet-catalog.md.
+    # name or project id -- see docs/designs/bench-fleet-catalog.md. The
+    # catalogue is parsed once here and handed to every reader below.
+    catalog = _catalog()
     fixtures = spec.get("fixtures")
     if fixtures is not None:
         if not isinstance(fixtures, list):
             problems.append("'fixtures:' must be a list of role slugs")
         else:
-            roles = known_fixture_roles()
+            roles = known_fixture_roles(catalog)
             for role in fixtures:
                 if not isinstance(role, str):
                     problems.append(
@@ -979,6 +986,8 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
         used_types: set[str] = set()
         used_roles: set[str] = set()
         slot_roles: set[str] = set()
+        slots = _catalog_slots(catalog)
+        parked = name in FIXTURE_NOT_READY
         for index, entry in enumerate(entries):
             if not isinstance(entry, dict):
                 problems.append(f"verification_spec[{index}]: entry is not a mapping")
@@ -1000,7 +1009,7 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                 _fixture_roles_shape(entry["check"], where, problems)
                 _check_types(entry["check"], used_types)
                 _fixture_roles(entry["check"], used_roles, slot_roles)
-                _cluster_placeholders(entry["check"], where, problems, _catalog_slots(), name in FIXTURE_NOT_READY)
+                _cluster_placeholders(entry["check"], where, problems, slots, parked)
 
         # `fixture_roles:` asks whether a role's slot was reached, which the
         # runner records for catalogue roles only; an overlay role with no
@@ -1008,8 +1017,8 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
         # A case parked in FIXTURE_NOT_READY names the role its issue plants,
         # which is not in the catalogue yet by definition; it is off every
         # roster, so the plural is held to the catalogue only once it runs.
-        if name not in FIXTURE_NOT_READY:
-            for role in sorted(slot_roles - set(_catalog_roles())):
+        if not parked:
+            for role in sorted(slot_roles - set(_catalog_roles(catalog))):
                 problems.append(
                     f"'fixture_roles:' names {role!r}, which has no cluster slot "
                     "in the fleet catalogue; the runner records a slot for "
@@ -1040,13 +1049,21 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                 if reading
                 else "names seeded-fleet roles (" + ", ".join(sorted(used_roles)) + ")"
             )
-            problems.append(
-                lead
-                + " and declares no 'fixtures:'. List the seeded-fleet roles "
-                "it depends on, so the fleet owner replacing a cluster can "
-                "grep for the cases that go quiet, or declare 'fixtures: []' "
-                "for a case that plants its own state"
+            # `fixtures: []` is offered only to a case whose checks name no
+            # role: a named role has to be declared, so for the other case
+            # the empty list is refused on the next run.
+            remedy = (
+                "List the seeded-fleet roles it depends on, "
+                + ", ".join(sorted(used_roles))
+                + " among them, so the fleet owner replacing a cluster can "
+                "grep for the cases that go quiet"
+                if used_roles
+                else "List the seeded-fleet roles it depends on, so the fleet "
+                "owner replacing a cluster can grep for the cases that go "
+                "quiet, or declare 'fixtures: []' for a case that plants its "
+                "own state"
             )
+            problems.append(lead + " and declares no 'fixtures:'. " + remedy)
 
         # The presubmit decides whether a case has a spec by grepping for a
         # `verification_spec:` line with nothing after it (hack/ci-eval-pr.sh,
