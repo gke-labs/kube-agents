@@ -1,8 +1,16 @@
 package gateway
 
 import (
+	"strings"
 	"testing"
 )
+
+var allowlistTestPS = NewPseudonymizer([]byte("test-salt"))
+
+// subjectOf is what a history entry stores for an author on backend.
+func subjectOf(backend, authorID string) string {
+	return requesterSubject(allowlistTestPS, backend, authorID)
+}
 
 func TestTargetAllowsTable(t *testing.T) {
 	cfg := &Config{TargetAllowedUsers: map[string]map[string][]string{
@@ -11,21 +19,23 @@ func TestTargetAllowsTable(t *testing.T) {
 			slackBackend: {"U0ABC"},
 		},
 	}}
-	g := &Gateway{cfg: cfg, targetAllowed: buildTargetAllowed(cfg)}
+	g := &Gateway{cfg: cfg, targetAllowed: buildTargetAllowed(cfg, allowlistTestPS)}
 	for _, tc := range []struct {
 		target, backend, author string
 		want                    bool
 	}{
 		{"platform", gchatBackend, "alice@example.com", true}, // email, case-insensitive
 		{"platform", gchatBackend, "ALICE@EXAMPLE.COM", true},
+		{"platform", gchatBackend, " alice@example.com ", true}, // and trimmed
 		{"platform", gchatBackend, "bob@example.com", false},
 		{"platform", slackBackend, "U0ABC", true},
 		{"platform", slackBackend, "u0abc", false}, // member id, exact
+		{"platform", slackBackend, "", false},      // a blank subject is never a member
 		{"platform", discordBackend, "1001", true}, // no list for the backend: ingress is the gate
 		{"platform", injectBackend, "devops-bench", true},
 		{"other", gchatBackend, "bob@example.com", true}, // no list for the target
 	} {
-		if got := g.targetAllows(tc.target, tc.backend, tc.author); got != tc.want {
+		if got := g.targetAllows(tc.target, tc.backend, subjectOf(tc.backend, tc.author)); got != tc.want {
 			t.Errorf("targetAllows(%q,%q,%q) = %v, want %v", tc.target, tc.backend, tc.author, got, tc.want)
 		}
 	}
@@ -33,9 +43,29 @@ func TestTargetAllowsTable(t *testing.T) {
 
 func TestAnEmptyListIsNoList(t *testing.T) {
 	cfg := &Config{TargetAllowedUsers: map[string]map[string][]string{"platform": {gchatBackend: {" ", ""}}}}
-	g := &Gateway{cfg: cfg, targetAllowed: buildTargetAllowed(cfg)}
-	if !g.targetAllows("platform", gchatBackend, "anyone@example.com") {
+	g := &Gateway{cfg: cfg, targetAllowed: buildTargetAllowed(cfg, allowlistTestPS)}
+	if !g.targetAllows("platform", gchatBackend, subjectOf(gchatBackend, "anyone@example.com")) {
 		t.Fatal("a list of blanks refused a requester; blanks must read as no list")
+	}
+}
+
+// TestTargetAllowedHoldsNoPlaintext: the compiled lists compare against the
+// pseudonym the KV stores, so they hold pseudonyms too, and the raw id is not
+// a member even though it is the configured string.
+func TestTargetAllowedHoldsNoPlaintext(t *testing.T) {
+	cfg := &Config{TargetAllowedUsers: map[string]map[string][]string{
+		"platform": {gchatBackend: {"Alice@Example.com"}, slackBackend: {"U0ABC"}},
+	}}
+	g := &Gateway{cfg: cfg, targetAllowed: buildTargetAllowed(cfg, allowlistTestPS)}
+	for backend, set := range g.targetAllowed["platform"] {
+		for entry := range set {
+			if !strings.HasPrefix(entry, "hmac:") {
+				t.Errorf("%s list holds %q, want only pseudonyms", backend, entry)
+			}
+		}
+	}
+	if g.targetAllows("platform", slackBackend, "U0ABC") {
+		t.Error("a raw member id matched the hashed list; targetAllows must take the stored subject")
 	}
 }
 

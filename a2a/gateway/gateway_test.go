@@ -2374,8 +2374,12 @@ func TestStartTaskRecordsTheRequester(t *testing.T) {
 		return rec != nil && len(rec.Tasks) == 1
 	})
 	ref := rec.Tasks[0]
-	if ref.Requester == nil || ref.Requester.Backend != "discord" || ref.Requester.AuthorID != "1001" {
-		t.Fatalf("requester = %+v", ref.Requester)
+	if want := requesterSubject(r.g.ps, "discord", "1001"); ref.Requester == nil ||
+		ref.Requester.Backend != "discord" || ref.Requester.Subject != want || !strings.HasPrefix(want, "hmac:") {
+		t.Fatalf("requester = %+v, want backend discord and subject %q", ref.Requester, want)
+	}
+	if raw := rawSessionRecord(t, r.g.reg, conv); strings.Contains(raw, `"1001"`) {
+		t.Fatalf("the session KV holds the plaintext author id: %s", raw)
 	}
 	if ref.StartedAt.IsZero() {
 		t.Fatal("startedAt not recorded")
@@ -2392,6 +2396,110 @@ func TestStartTaskRecordsTheRequester(t *testing.T) {
 	}
 	if _, ok := m["grants"]; ok {
 		t.Fatalf("attribution carries grants: %s", ref.Attribution)
+	}
+}
+
+// TestStartTaskHashesAGchatRequester: on Google Chat the author id is the
+// sender's email, and the history entry lands in the session-state KV, which
+// the content posture holds to pseudonyms. The stored requester is the
+// backend plus the normalized id hashed under the install salt; the email
+// appears nowhere in the record, in any case.
+func TestStartTaskHashesAGchatRequester(t *testing.T) {
+	r := startGchatRig(t, []string{"alice@example.com"}, false)
+	conv := "gchat:spaces/S1/threads/T-req"
+	r.adapter.inbox <- InboundMessage{
+		Conversation: conv, Kind: "group",
+		AuthorID: "Alice@Example.com", MessageID: "spaces/S1/messages/M1", Text: "how is the fleet?",
+	}
+	r.awaitTask(t, "platform")
+	waitFor(t, "record with a task", func() bool {
+		rec, _ := r.g.reg.Get(context.Background(), conv)
+		return rec != nil && len(rec.Tasks) == 1
+	})
+	raw := rawSessionRecord(t, r.g.reg, conv)
+	if strings.Contains(strings.ToLower(raw), "alice@example.com") {
+		t.Fatalf("the session KV holds the requester's email: %s", raw)
+	}
+	var stored struct {
+		Tasks []struct {
+			Requester map[string]string `json:"requester"`
+		} `json:"tasks"`
+	}
+	if err := json.Unmarshal([]byte(raw), &stored); err != nil {
+		t.Fatal(err)
+	}
+	if len(stored.Tasks) != 1 {
+		t.Fatalf("tasks = %+v", stored.Tasks)
+	}
+	want := NewPseudonymizer([]byte("test-salt")).Hash("alice@example.com") // trimmed, lowercased, hashed
+	got := stored.Tasks[0].Requester
+	if got["backend"] != gchatBackend || got["subject"] != want || len(got) != 2 {
+		t.Fatalf("requester = %v, want backend %q and subject %q only", got, gchatBackend, want)
+	}
+}
+
+// rawSessionRecord reads a record's bytes as the KV holds them, so a test can
+// assert on what is at rest rather than on the decoded struct.
+func rawSessionRecord(t *testing.T, reg *Registry, sessionKey string) string {
+	t.Helper()
+	kv, err := reg.kv(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := kv.Get(context.Background(), kvKey(sessionKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(entry.Value())
+}
+
+// TestAskTTLBoundaryClearsBothCopies: a copy exactly AskTTL old is past the
+// TTL (>=), for the history entry's requester exactly as for the active
+// task's ask, and a nanosecond younger is not, for either.
+func TestAskTTLBoundaryClearsBothCopies(t *testing.T) {
+	r := startRigWith(t, func(c *Config) { c.AskTTL = time.Minute })
+	conv := "discord:g1/thread-ttl-edge"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "x"}
+	r.awaitTask(t, "platform")
+	ctx := context.Background()
+	var rec *SessionRecord
+	waitFor(t, "record", func() bool {
+		rec, _ = r.g.reg.Get(ctx, conv)
+		return rec != nil && len(rec.Tasks) == 1 && rec.ActiveTask != nil
+	})
+	start := time.Now().UTC().Truncate(time.Second) // survives the JSON round trip exactly
+	rec.Tasks[0].StartedAt = start
+	rec.ActiveTask.SubmittedAt = start
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	r.g.boundAskCopyAt(ctx, rec, start.Add(time.Minute-time.Nanosecond))
+	fresh, _ := r.g.reg.Get(ctx, conv)
+	if fresh.Tasks[0].Requester == nil || fresh.Tasks[0].Attribution == nil {
+		t.Fatalf("requester cleared a nanosecond before the TTL: %+v", fresh.Tasks[0])
+	}
+	if fresh.ActiveTask == nil || fresh.ActiveTask.Ask == "" {
+		t.Fatalf("ask cleared a nanosecond before the TTL: %+v", fresh.ActiveTask)
+	}
+
+	r.g.boundAskCopyAt(ctx, fresh, start.Add(time.Minute))
+	fresh, _ = r.g.reg.Get(ctx, conv)
+	if fresh.Tasks[0].Requester != nil || fresh.Tasks[0].Attribution != nil {
+		t.Fatalf("requester survived at exactly the TTL: %+v", fresh.Tasks[0])
+	}
+	if fresh.ActiveTask == nil || fresh.ActiveTask.Ask != "" {
+		t.Fatalf("ask survived at exactly the TTL: %+v", fresh.ActiveTask)
+	}
+}
+
+func TestTaskRefOmitsAZeroStartedAt(t *testing.T) {
+	raw, err := json.Marshal(TaskRef{ID: "task-legacy", Addressee: "platform"}) // pre-field shape
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "startedAt") {
+		t.Fatalf("a legacy-shaped entry marshals a zero startedAt: %s", raw)
 	}
 }
 

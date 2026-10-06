@@ -208,19 +208,25 @@ type Config struct {
 	// it turns long-running asks into failed tasks sooner.
 	TaskDeadline time.Duration
 
-	// AskTTL bounds the active task's `ask` copy in session-state
-	// (A2A_ASK_TTL). The copy's stated justification — the same text rides
-	// the W-bounded stream and the copy dies at the terminal event — holds
-	// only where a terminal event is guaranteed, and the spec names the
-	// case where it is not (a wedged adapter, until every pod carries its
-	// deadline; fixed-route executors have no janitor until stage 3). So
-	// the record gets an independent bound: the reap scan clears an ask
-	// older than this, leaving the task record itself intact. Unset means
-	// 24h — far above any legitimate task's runtime, well under the
-	// stream's 72h retention, so the KV copy always has the shorter
-	// horizon the content posture claims. Raising it toward the stream
-	// retention erodes exactly that claim; lowering it only trims how long
-	// a status card can echo the ask.
+	// AskTTL bounds the copies of a turn that session-state keeps past the
+	// bus (A2A_ASK_TTL): the active task's `ask` copy, and each task history
+	// entry's requester (backend and pseudonymized subject) and attribution,
+	// aged by the entry's StartedAt. The ask copy's stated justification —
+	// the same text rides the W-bounded stream and the copy dies at the
+	// terminal event — holds only where a terminal event is guaranteed, and
+	// the spec names the case where it is not (a wedged adapter, until every
+	// pod carries its deadline; fixed-route executors have no janitor until
+	// stage 3). So the record gets an independent bound: the reap scan
+	// clears an ask, and a history entry's requester and attribution, once
+	// they are this old (exactly this old included), leaving the task record
+	// and the history entry themselves intact. Unset means 24h — far above
+	// any legitimate task's runtime, well under the stream's 72h retention,
+	// so the KV copies always have the shorter horizon the content posture
+	// claims. Raising it toward the stream retention erodes exactly that
+	// claim; lowering it trims how long a status card can echo the ask, and
+	// how long after a turn a child task can still be minted on its behalf:
+	// past the TTL the entry has no requester to check, so a delegation from
+	// it is refused.
 	AskTTL time.Duration
 
 	// SessionTTL bounds the lifetime of idle session records in session-state
