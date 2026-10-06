@@ -907,6 +907,15 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		healed, healedSource = true, TerminalNeverStarted
 	}
 	if healed {
+		// Notices held for the task's terminal (a delegation refusal)
+		// follow the answer the heal just posted, as relayTerminal posts
+		// them after the deliverable.
+		g.mu.Lock()
+		rs := g.relays[active.TaskID]
+		g.mu.Unlock()
+		if rs != nil {
+			g.flushNotices(rec.Key, rs)
+		}
 		rec.ActiveTask = nil
 		// The same rule as relayTerminal's, for the same terminal reaching
 		// the record by the other route: an executor's end of the task is

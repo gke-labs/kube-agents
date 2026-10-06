@@ -37,6 +37,9 @@ type relayState struct {
 	// drops the narration does not burn a backend edit per progress artifact
 	// re-rendering an unchanged line.
 	lastLine string
+	// notices wait for the task's terminal and post after its deliverable:
+	// a delegation refusal follows the turn's "delegated to platform".
+	notices []string
 }
 
 // relayItem is one queued event with the subject it arrived on. The relay's
@@ -292,6 +295,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			g.post(rec.Key, "🚫 the executor rejected the task")
 		}
 	}
+	g.flushNotices(rec.Key, rs)
 
 	if active := rec.ActiveTask; active != nil && active.TaskID == taskID {
 		if active.StatusMsgID != "" {
@@ -320,12 +324,21 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			rec.LastActivity = now
 			rec.LastTaskActivity = now
 		}
-	} else if active != nil && source == TerminalFromExecutor {
+	} else if ref, ok := rec.TaskRefFor(activeTaskID(rec)); ok && ref.ParentTaskID == taskID {
 		// A session turn that delegated ends after its child became the
-		// active task. Its answer ("delegated to platform") is task activity
-		// for the session-thread rule all the same; LastActivity stays the
-		// active task's business.
-		if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.ParentTaskID == taskID {
+		// active task. Its line closes as any turn's does, from the entry
+		// that kept it. Its answer ("delegated to platform") is task
+		// activity for the session-thread rule all the same; LastActivity
+		// stays the active task's business.
+		if parent, ok := rec.TaskRefFor(taskID); ok && parent.StatusMsgID != "" {
+			progress := rs.progress
+			if g.cfg.DisplayMode == displayModeDefault {
+				progress = ""
+			}
+			g.editLine(rec.Key, parent.StatusMsgID, terminalLine(s.Status.State, progress))
+			setParentLine(rec, taskID, "")
+		}
+		if source == TerminalFromExecutor {
 			rec.LastTaskActivity = time.Now().UTC()
 		}
 	}
@@ -399,6 +412,14 @@ func (g *Gateway) editLine(conversation, messageID, line string) bool {
 		return false
 	}
 	return true
+}
+
+// activeTaskID is the record's active task id, or "".
+func activeTaskID(rec *SessionRecord) string {
+	if rec.ActiveTask == nil {
+		return ""
+	}
+	return rec.ActiveTask.TaskID
 }
 
 // withLineNote suffixes a rolling line with the task's note, if it has one.

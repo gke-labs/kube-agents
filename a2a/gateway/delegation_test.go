@@ -8,6 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -99,6 +102,11 @@ func TestADelegateArtifactMintsAChildToPlatform(t *testing.T) {
 	ctx := context.Background()
 	conv := "discord:g1/thread-del"
 	exec, origin, session := sessionTurn(t, r, spawn, conv, "how is the fleet?")
+	before, _ := r.g.reg.Get(ctx, conv)
+	parentLine := before.ActiveTask.StatusMsgID
+	if parentLine == "" {
+		t.Fatal("the parent turn has no rolling line")
+	}
 	if err := exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "report fleet health")); err != nil {
 		t.Fatal(err)
 	}
@@ -195,9 +203,24 @@ func TestADelegateArtifactMintsAChildToPlatform(t *testing.T) {
 		rec, _ := r.g.reg.Get(ctx, conv)
 		return !rec.LastTaskActivity.Before(stamp)
 	})
+	// The parent's own line closes on its terminal like any turn's, and the
+	// child's is left alone.
+	waitFor(t, "the parent's line reaches its completed line", func() bool {
+		for _, e := range r.adapter.editsOf(parentLine) {
+			if e == terminalLine(lib.StateCompleted, "") {
+				return true
+			}
+		}
+		return false
+	})
 	rec, _ = r.g.reg.Get(ctx, conv)
 	if rec.ActiveTask == nil || rec.ActiveTask.TaskID != child.TaskID {
 		t.Fatalf("parent terminal cleared the child: %+v", rec.ActiveTask)
+	}
+	for _, e := range r.adapter.editsOf(rec.ActiveTask.StatusMsgID) {
+		if strings.Contains(e, "completed") {
+			t.Fatalf("the parent's terminal edited the child's line: %q", e)
+		}
 	}
 	if n := platformSubmissions(t, r); n != 1 {
 		t.Fatalf("platform received %d submissions, want 1", n)
@@ -229,6 +252,9 @@ func TestDelegateAllowlist(t *testing.T) {
 				r.awaitTask(t, targetPlatform)
 				return
 			}
+			// The notice follows the delegating turn's terminal.
+			waitFor(t, "refusal line", loggedContaining(r, "delegation refused", "rule=delegation.allowed-users"))
+			_ = exec.PublishStatus(context.Background(), lib.StateCompleted, true)
 			waitFor(t, "refusal", postedContaining(r, "🚫 not allowed to reach platform from here"))
 			rec, _ := r.g.reg.Get(context.Background(), "discord:g1/t-list")
 			pref, _ := rec.TaskRefFor(origin.TaskID)
@@ -286,10 +312,9 @@ func TestDelegateRefusalsWithANotice(t *testing.T) {
 			if err := exec.PublishArtifact(context.Background(), delegateArtifact(t, tc.addressee, "x")); err != nil {
 				t.Fatal(err)
 			}
+			waitFor(t, "refusal line", loggedContaining(r, "delegation refused", "rule="+tc.rule, origin.TaskID))
+			_ = exec.PublishStatus(context.Background(), lib.StateCompleted, true)
 			waitFor(t, "notice", postedContaining(r, tc.notice))
-			if !loggedContaining(r, "delegation refused", "rule="+tc.rule, origin.TaskID)() {
-				t.Fatalf("no refusal line for %s:\n%s", tc.rule, r.logs.String())
-			}
 			if n := platformSubmissions(t, r); n != 0 {
 				t.Fatalf("a refused request minted %d children", n)
 			}
@@ -480,5 +505,174 @@ func TestTheSessionCannotDelegateForItsChild(t *testing.T) {
 	waitFor(t, "ignore line", loggedContaining(r, "delegation ignored", "rule="+ruleDelegationStale, child.TaskID))
 	if n := platformSubmissions(t, r); n != 1 {
 		t.Fatalf("platform received %d submissions, want 1", n)
+	}
+}
+
+// editsOf is every edit the adapter received for one message, in order.
+func (a *fakeAdapter) editsOf(messageID string) []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []string
+	for _, e := range a.edits {
+		if e.MessageID == messageID {
+			out = append(out, e.Text)
+		}
+	}
+	return out
+}
+
+// postIndex is the position of the first post containing needle, or -1.
+func postIndex(r *rig, needle string) int {
+	for i, p := range r.adapter.postTexts() {
+		if strings.Contains(p, needle) {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestARefusalFollowsTheDelegatingTurnsAnswer: spec §3 - the human sees the
+// session's "delegated to platform" and then the refusal, so the notice waits
+// for the delegating turn's terminal, from the executor or the supervisor.
+func TestARefusalFollowsTheDelegatingTurnsAnswer(t *testing.T) {
+	const notice = "only platform can be delegated to today"
+	for _, supervisor := range []bool{false, true} {
+		name := "executor terminal"
+		if supervisor {
+			name = "supervisor terminal"
+		}
+		t.Run(name, func(t *testing.T) {
+			r, spawn := startRigWithSpawner(t)
+			ctx := context.Background()
+			conv := "discord:g1/t-order"
+			exec, origin, session := sessionTurn(t, r, spawn, conv, "x")
+			_ = exec.PublishArtifact(ctx, delegateArtifact(t, "chat-other-1", "x"))
+			waitFor(t, "refusal line", loggedContaining(r, "delegation refused", "rule="+ruleDelegationTarget))
+			if i := postIndex(r, notice); i >= 0 {
+				t.Fatalf("the notice was posted before the turn's answer: %v", r.adapter.postTexts())
+			}
+			if supervisor {
+				if err := r.g.publishSupervisorTerminal(ctx, session, origin.TaskID, origin.ContextID, origin.CorrelationID, lib.StateFailed, "the pod died"); err != nil {
+					t.Fatal(err)
+				}
+				waitFor(t, "notice", postedContaining(r, notice))
+				if i, j := postIndex(r, "failed"), postIndex(r, notice); i < 0 || j < i {
+					t.Fatalf("posts %v: want the failure, then the notice", r.adapter.postTexts())
+				}
+				return
+			}
+			_ = exec.PublishArtifact(ctx, lib.Artifact{ArtifactID: "a-r", Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "delegated to platform"}}})
+			_ = exec.PublishStatus(ctx, lib.StateCompleted, true)
+			waitFor(t, "notice", postedContaining(r, notice))
+			if i, j := postIndex(r, "delegated to platform"), postIndex(r, notice); i < 0 || j < i {
+				t.Fatalf("posts %v: want the answer, then the notice", r.adapter.postTexts())
+			}
+		})
+	}
+}
+
+// narrowTasksStream takes the platform agent's in subject off TASKS while
+// leaving the events and supervisor subjects (the relay's) and the named
+// session's in subject on it, so a submission to platform fails for real.
+func narrowTasksStream(t *testing.T, url, session string) {
+	t.Helper()
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := js.Stream(ctx, lib.TasksStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := stream.CachedInfo().Config
+	cfg.Subjects = []string{"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor", "a2a.tasks." + session + ".*.in"}
+	if _, err := js.UpdateStream(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestAChildThatCannotReachTheBusLeavesNoChain: a failed child publish
+// leaves the parent the conversation's task with no child, no child entry in
+// the history and no index entry for the child.
+func TestAChildThatCannotReachTheBusLeavesNoChain(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	ctx := context.Background()
+	conv := "discord:g1/t-nobus"
+	exec, origin, session := sessionTurn(t, r, spawn, conv, "x")
+	narrowTasksStream(t, r.url, session)
+	_ = exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "x"))
+	waitFor(t, "publish failure", loggedContaining(r, "task publish failed"))
+	var childID string
+	for _, line := range strings.Split(r.logs.String(), "\n") {
+		if strings.Contains(line, "task publish failed") {
+			for _, f := range strings.Fields(line) {
+				if v, ok := strings.CutPrefix(f, "taskId="); ok {
+					childID = v
+				}
+			}
+		}
+	}
+	if childID == "" || childID == origin.TaskID {
+		t.Fatalf("could not read the failed child's id: %q", childID)
+	}
+	waitFor(t, "record written", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		_, has := rec.TaskRefFor(childID)
+		return !has
+	})
+	rec, _ := r.g.reg.Get(ctx, conv)
+	if rec.ActiveTask == nil || rec.ActiveTask.TaskID != origin.TaskID || rec.Addressee != session {
+		t.Fatalf("active=%+v addressee=%s, want the parent on its session", rec.ActiveTask, rec.Addressee)
+	}
+	pref, _ := rec.TaskRefFor(origin.TaskID)
+	if len(pref.Children) != 0 {
+		t.Fatalf("the parent records a child that never reached the bus: %v", pref.Children)
+	}
+	for _, ref := range rec.Tasks {
+		if ref.Role == taskRoleChild || ref.ParentTaskID != "" {
+			t.Fatalf("a child entry survived the failed publish: %+v", ref)
+		}
+	}
+	if key, err := r.g.reg.SessionForTask(ctx, childID); err != nil || key != "" {
+		t.Fatalf("the failed child is still indexed: %q %v", key, err)
+	}
+}
+
+// TestOneLiveChildPerConversation: decision 3 is per conversation. A stop
+// detaches the child without ending it; a later turn's request is refused,
+// after that turn's answer, naming the running child.
+func TestOneLiveChildPerConversation(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	ctx := context.Background()
+	conv := "discord:g1/t-onelive"
+	exec, _, _ := sessionTurn(t, r, spawn, conv, "x")
+	_ = exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "first"))
+	child := r.awaitTask(t, targetPlatform)
+	_ = exec.PublishStatus(ctx, lib.StateCompleted, true)
+	sessionRigTurn(r, conv, "stop-1", "stop")
+	waitFor(t, "child detached", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		return rec.ActiveTask != nil && rec.ActiveTask.TaskID == child.TaskID && rec.ActiveTask.Detached
+	})
+
+	exec2, origin2, _ := sessionTurn(t, r, spawn, conv, "again")
+	_ = exec2.PublishArtifact(ctx, delegateArtifact(t, "platform", "second"))
+	waitFor(t, "busy refusal", loggedContaining(r, "delegation refused", "rule="+ruleDelegationBusy, origin2.TaskID, "child="+child.TaskID))
+	_ = exec2.PublishStatus(ctx, lib.StateCompleted, true)
+	waitFor(t, "notice", postedContaining(r, "⚠️ delegation refused: a delegated task is still running (task "+child.TaskID+")"))
+	if n := platformSubmissions(t, r); n != 1 {
+		t.Fatalf("platform received %d submissions, want 1", n)
+	}
+	// Retiring the delegating turn's pod is not the child's end: the child
+	// ran on platform, not in that pod, so no supervisor terminal is owed.
+	if key, _ := r.g.reg.SessionForTask(ctx, child.TaskID); key != conv {
+		t.Fatalf("the detached child was retired with the pod: index=%q", key)
 	}
 }

@@ -144,6 +144,10 @@ type TaskRef struct {
 	// is a slice although one child runs at a time, so fan-out is one
 	// condition later rather than a record migration. All four are empty on
 	// a human turn and on entries written before they existed.
+	// StatusMsgID is the rolling-line message of a turn that delegated:
+	// the child takes ActiveTask, and with it the only other copy, so the
+	// parent's line is kept here to close on the parent's terminal.
+	StatusMsgID  string   `json:"statusMsgId,omitempty"`
 	Role         string   `json:"role,omitempty"`
 	ParentTaskID string   `json:"parentTaskId,omitempty"`
 	Children     []string `json:"children,omitempty"`
