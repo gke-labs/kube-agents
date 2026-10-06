@@ -981,49 +981,42 @@ type SecuritySpec struct {
 	// +optional
 	ServiceAccountAnnotations map[string]string `json:"serviceAccountAnnotations,omitempty"`
 
-	// ScopedServiceAccounts maps each GKE cluster the agent may read to the
+	// ScopedServiceAccountPool maps each GCP project the agent may read to the
 	// Google service account that reads it. The credential broker mints a
-	// short-lived token for the account a request's cluster maps to, instead of
-	// using the agent's own identity — which, holding a project-level
+	// short-lived token for the account a request's project maps to, instead
+	// of using the agent's own identity — which, holding a project-level
 	// roles/container.viewer, can read objects in every cluster in the project.
+	//
+	// Keyed on the project, not the cluster. One cluster per project is the
+	// shape of the estate this runs over, the project is the IAM unit a
+	// declaration in spec.scope is written in, and two clusters in one project
+	// share an account by design: the account holds no grant of its own, and
+	// what tells two clusters apart is the per-cluster RBAC that arrives with
+	// the token, not the identity presenting it.
 	//
 	// Each account is provisioned by Terraform, never by this operator. A
 	// controller must not grant authority beyond its requester's, and minting
 	// cloud principals inside the loop that is supposed to bound the agent
 	// would put the grant on the wrong side of that boundary.
 	//
-	// As of 2026-08-12 the accounts hold no IAM grant. They were scoped by an
-	// IAM Condition on the cluster's resource.name, and that was measured to
-	// grant nothing for Kubernetes object operations; removing the condition
-	// without removing the grant would have given every account project-wide
-	// container.viewer. Authority arrives with per-cluster RBAC, and until it
-	// does the pool is off by default.
+	// Arming is explicit and independent of the scope: declaring a project in
+	// spec.scope arms nothing, and listing accounts here arms nothing either.
+	// Only `enabled: true` arms the broker. The composition writes the list
+	// from Terraform's output whether or not the pool is on, so a list that
+	// armed the broker by being non-empty would arm every install that
+	// provisioned an account.
 	//
-	// A cluster absent from this list is REFUSED, not served by a wider
-	// credential. That is the point of the field, and it is also the first thing
-	// an operator will hit: adding a cluster to the fleet without adding it here
-	// produces a refusal naming the missing scope.
+	// A project absent from this list is REFUSED, never served on the ambient
+	// credential. That is the point of the field, and it is also the first
+	// thing an operator will hit: adding a project to spec.scope without an
+	// account here produces a refusal naming the missing project.
 	//
-	// Leaving the list empty keeps the previous behaviour — one identity for
-	// every cluster — and renders CREDENTIAL_PROXY_SCOPED_SA_POOL=0 so that the
-	// mode a deployment is in can be read off the Deployment rather than
-	// inferred from what is absent.
-	//
-	// Keyed on the cluster tuple by the API server, so a repeated cluster is
-	// rejected at admission. Without that a copy-pasted entry whose clusterName
-	// was never changed is admitted, reconciles, changes the ConfigMap hash and
-	// rolls the broker — which then refuses to start, because the broker will
-	// not resolve one cluster to two accounts by taking whichever came last.
-	// The failure is a crashloop with the cause several layers away, so it is
-	// worth catching in `kubectl apply`. Terraform's scoped_clusters already
-	// validates the same thing on its own path.
-	// +kubebuilder:validation:MaxItems=100
-	// +listType=map
-	// +listMapKey=projectId
-	// +listMapKey=location
-	// +listMapKey=clusterName
+	// Absent, or present with enabled false, keeps the previous behaviour —
+	// one identity for every cluster — and renders
+	// CREDENTIAL_PROXY_SCOPED_SA_POOL=0 so that the mode a deployment is in
+	// can be read off the Deployment rather than inferred from what is absent.
 	// +optional
-	ScopedServiceAccounts []ScopedServiceAccount `json:"scopedServiceAccounts,omitempty"`
+	ScopedServiceAccountPool *ScopedServiceAccountPoolSpec `json:"scopedServiceAccountPool,omitempty"`
 
 	// WorkloadIdentityFederation gives the credential proxy a GCP identity that
 	// does not come from the metadata server.
@@ -1256,39 +1249,77 @@ type EgressAllowlistSpec struct {
 	ExtraRules []networkingv1.NetworkPolicyEgressRule `json:"extraRules,omitempty"`
 }
 
-// ScopedServiceAccount binds one GKE cluster to the Google service account
-// permitted to read it.
+// ScopedServiceAccountPoolSpec is the scoped service account pool: the switch
+// that arms it and the project-to-account mapping it serves.
 //
-// The three cluster fields are a tuple rather than a name because they compose
-// into the GKE resource name — projects/P/locations/L/clusters/C — which is the
-// key the credential broker looks the account up by, and the key Terraform
-// files the account under. Keying on the cluster name alone would let a second
-// project reusing a name be served by the first project's account.
+// The two are separate fields so that the mapping can be written before the
+// pool is on. The accounts hold no IAM grant until per-cluster RBAC lands, and
+// an install that provisioned them should be able to carry the list without
+// putting the broker onto identities that read nothing.
+//
+// Enabled with an empty list is refused at admission. The broker refuses to
+// start on an empty pool, which is right — an armed pool with no members would
+// refuse every request — but the failure would be a crashloop several layers
+// from the field, so it is caught in `kubectl apply` instead.
+//
+// The rule guards `has(self.enabled)` first. On the API server the guard is
+// never false: `enabled` carries a default, structural defaulting runs before
+// CEL, so the key is present by the time the rule reads it. It stays because
+// the rule is also evaluated offline, by
+// TestThePoolAdmissionRuleEvaluatesAsDocumented and any validator that does
+// not apply defaults, where a block written without the key would otherwise
+// fail `!self.enabled` with `no such key`; and a guard that is true whenever
+// the key is present costs nothing.
+// +kubebuilder:validation:XValidation:rule="!has(self.enabled) || !self.enabled || (has(self.serviceAccounts) && size(self.serviceAccounts) > 0)",message="scopedServiceAccountPool.enabled requires at least one serviceAccounts entry; the broker refuses to start on an empty pool"
+type ScopedServiceAccountPoolSpec struct {
+	// Enabled arms the credential broker: with it true, every cluster read is
+	// made as the account its project maps to, and a project with no entry is
+	// refused. Default false, and it should stay false until the pool's
+	// accounts hold authority.
+	// +kubebuilder:default=false
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// ServiceAccounts is the mapping, one entry per project.
+	//
+	// Keyed on projectId by the API server, so a repeated project is rejected
+	// at admission. Without that a copy-pasted entry whose projectId was never
+	// changed is admitted, reconciles, changes the ConfigMap hash and rolls
+	// the broker — which then refuses to start, because the broker will not
+	// resolve one project to two accounts by taking whichever came last. The
+	// failure is a crashloop with the cause several layers away, so it is
+	// worth catching in `kubectl apply`.
+	//
+	// No upper bound here: the pool grows with the projects in scope, and the
+	// Terraform module's scoped_pool_max_accounts is the bound an operator
+	// declares on it from the host project's free service-account quota,
+	// which the plan holds the derived set to before any entry reaches this
+	// list. That bound is declared, not read: the quota is shared with the
+	// agent's own accounts and the plan cannot see it.
+	// +listType=map
+	// +listMapKey=projectId
+	// +optional
+	ServiceAccounts []ScopedServiceAccount `json:"serviceAccounts,omitempty"`
+}
+
+// ScopedServiceAccount binds one GCP project to the Google service account
+// permitted to read its clusters.
 //
 // The patterns are the broker's own component regexes, which is the property
-// that matters: they are narrower than GKE's naming rules in places, and being
+// that matters: they are narrower than GCP's naming rules in places, and being
 // identical to what the broker will accept is what stops the API server
 // admitting an entry the broker then refuses. They are enforced here as well as
 // there because a separator or a quote in one of them would produce a key that
 // silently matches nothing.
 type ScopedServiceAccount struct {
-	// ProjectID is the project the cluster lives in, which need not be the
-	// project the agent runs in.
+	// ProjectID is the project whose clusters this account reads, which need
+	// not be the project the agent runs in.
 	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9-]*$`
 	// +kubebuilder:validation:MaxLength=63
 	ProjectID string `json:"projectId"`
 
-	// Location is the cluster's region or zone.
-	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9-]*$`
-	// +kubebuilder:validation:MaxLength=63
-	Location string `json:"location"`
-
-	// ClusterName is the GKE cluster's name.
-	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9-]*$`
-	// +kubebuilder:validation:MaxLength=63
-	ClusterName string `json:"clusterName"`
-
-	// ServiceAccountEmail is the account scoped to this cluster. Terraform's
+	// ServiceAccountEmail is the account scoped to this project. It lives in
+	// the host project, whatever project it reads; Terraform's
 	// `scoped_service_accounts` output is the source of these values.
 	// +kubebuilder:validation:Pattern=`^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9-]{6,30}\.iam\.gserviceaccount\.com$`
 	ServiceAccountEmail string `json:"serviceAccountEmail"`

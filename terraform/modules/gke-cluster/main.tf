@@ -341,11 +341,25 @@ locals {
     data.google_container_cluster.existing[*].name,
   ))
 
-  cluster_endpoint = one(concat(
-    google_container_cluster.autopilot[*].endpoint,
-    google_container_cluster.standard[*].endpoint,
-    data.google_container_cluster.existing[*].endpoint,
-  ))
+  # Picked by the variables rather than folded like cluster_name, because the
+  # endpoint and the CA certificate (outputs.tf) configure the composition's
+  # helm provider, which runs during `terraform destroy`. Since Terraform 1.14
+  # (hashicorp/terraform#37370) a count-0 resource evaluates as unknown, not as
+  # an empty list, in a destroy. A fold with any count-0 member is then unknown,
+  # which is always, so the provider has no host, and hashicorp/helm 3.x's
+  # Delete reads "cluster unreachable" as "already gone" and reports the
+  # release destroyed while it keeps running (#2246). Only the selected branch
+  # of a conditional is evaluated, so [0] on the count-0 side is never indexed.
+  # The conditions mirror the three resources' count expressions. On a cluster
+  # this state did not create the selected branch is the data source, which a
+  # destroy reads only in its refresh, so `terraform destroy -refresh=false`
+  # still leaves the provider without a host; lifecycle.sh destroy uninstalls
+  # the releases with the helm CLI first for that reason.
+  cluster_endpoint = (
+    !var.create_cluster ? data.google_container_cluster.existing[0].endpoint :
+    var.cluster_mode == "autopilot" ? google_container_cluster.autopilot[0].endpoint :
+    google_container_cluster.standard[0].endpoint
+  )
 
   # Which of the control plane's two endpoints `endpoint` gave us, and so which
   # certificate a client dialling it will be offered.

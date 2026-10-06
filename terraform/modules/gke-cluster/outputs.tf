@@ -25,11 +25,13 @@ output "cluster_location" {
 
 output "cluster_ca_certificate" {
   description = "Base64-encoded public CA certificate of the cluster"
-  value = one(concat(
-    google_container_cluster.autopilot[*].master_auth[0].cluster_ca_certificate,
-    google_container_cluster.standard[*].master_auth[0].cluster_ca_certificate,
-    data.google_container_cluster.existing[*].master_auth[0].cluster_ca_certificate,
-  ))
+  # A conditional, not a one(concat(...)) fold, for the reason given at
+  # local.cluster_endpoint in main.tf.
+  value = (
+    !var.create_cluster ? data.google_container_cluster.existing[0].master_auth[0].cluster_ca_certificate :
+    var.cluster_mode == "autopilot" ? google_container_cluster.autopilot[0].master_auth[0].cluster_ca_certificate :
+    google_container_cluster.standard[0].master_auth[0].cluster_ca_certificate
+  )
   sensitive = true
 }
 

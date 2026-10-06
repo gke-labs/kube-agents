@@ -186,6 +186,12 @@ FIXTURE_NOT_READY = {
         "account is denied, as a fixture role of its own; the evaluation fleet has "
         "one project per install today, so the case cannot be red on main"
     ),
+    "networking-audit-second-project": (
+        "#1865: needs a second GCP project per pool project that the agent's "
+        "service account can read, holding a PSC endpoint its service attachment "
+        "rejects; the evaluation fleet has one project per install today, so no "
+        "CI tier can run it; run it by hand against an install with such a project"
+    ),
     "vcs-history-only-fact": (
         "#1253: needs the git-access-ab/r200 branch pushed to every pool "
         "project's GitOps repository; the dev project carries it, the pool does "

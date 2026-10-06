@@ -81,12 +81,12 @@ gcloud compute regions describe <region> --project=<project> --format="json(quot
 # 4. Check Spot Capacity & Preemption Advice History.
 #    One machine type per call -- `--machine-type` is singular. Repeat for each
 #    shape the fleet's Spot ComputeClasses actually request.
-gcloud beta compute advice capacity-history --region=<region> --machine-type=g2-standard-4 --provisioning-model=SPOT --types=PREEMPTION,PRICE --format=json
+gcloud beta compute advice capacity-history --project=<project> --region=<region> --machine-type=g2-standard-4 --provisioning-model=SPOT --types=PREEMPTION,PRICE --format=json
 
 # Or check capacity obtainability for target machine types. This is the sibling
 # command, and it is the one that takes the plural
 # `--instance-selection-machine-types` and `--size`:
-gcloud beta compute advice capacity --region=<region> --provisioning-model=SPOT --size=1 --instance-selection-machine-types="g2-standard-4,n4-standard-4,c3-standard-4" --target-distribution-shape=any --format=json
+gcloud beta compute advice capacity --project=<project> --region=<region> --provisioning-model=SPOT --size=1 --instance-selection-machine-types="g2-standard-4,n4-standard-4,c3-standard-4" --target-distribution-shape=any --format=json
 
 # 5. Autoscaler Visibility Logs (Stage 1 Triage Query)
 gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibility") AND resource.labels.cluster_name="<cluster>" AND resource.labels.location="<location>" AND (jsonPayload.noDecisionStatus.noScaleUp:* OR jsonPayload.resultInfo.results.errorMsg:*)' --project=<project> --freshness=24h --limit=1000 --format=json  # both schemas; see §3.11
@@ -205,7 +205,7 @@ Each `project/<project-id>` entry is covered on the same terms. `gcloud compute 
 #### 3.8 High preemption risk or low obtainability on Spot instances (`spot-scarcity-risk`)
 
 - **Reference:** `skills/gke-compute-classes/references/compute-class-prioritization.md`
-- **Command:** run by the §3 collector — `gcloud beta compute advice capacity-history --region=<region> --machine-type=<machine-type> --provisioning-model=SPOT --types=PREEMPTION,PRICE --format=json`, once per Spot machine shape the fleet requests. `--machine-type` is singular and required, as are `--provisioning-model` and `--types`; the plural `--instance-selection-machine-types`/`--size` spelling belongs to the sibling `gcloud beta compute advice capacity` and this command rejects it.
+- **Command:** run by the §3 collector — `gcloud beta compute advice capacity-history --region=<region> --machine-type=<machine-type> --provisioning-model=SPOT --types=PREEMPTION,PRICE --project=<project> --format=json`, once per Spot machine shape the fleet requests. `--machine-type` is singular and required, as are `--provisioning-model` and `--types`; the plural `--instance-selection-machine-types`/`--size` spelling belongs to the sibling `gcloud beta compute advice capacity` and this command rejects it.
 - **Flag when:** Workloads or ComputeClasses request Spot VM shapes that have high historical preemption rates (>20%) or low obtainability scores in `compute advice`, without alternative family fallbacks. The collector reads the **mean** of the daily `preemptionRate` values, over at least seven of them — one bad afternoon inside a calm month is a zonal incident that already resolved, and a shape with less history than that is reported as unmeasured rather than clean.
 - **Do NOT flag:** Spot configurations that have high obtainability scores or comprehensive multi-family fallbacks; non-production environments.
 - **Severity:** `major`.
@@ -215,7 +215,7 @@ Each `project/<project-id>` entry is covered on the same terms. `gcloud compute 
 #### 3.9 Single-zone node pool, or one at its autoscaling ceiling (`single-zone-nodepool`)
 
 - **Reference:** `skills/gke-compute-classes/references/compute-class-provisioning-methods.md`
-- **Command:** `gcloud container node-pools list --cluster=<cluster> --location=<location> --format=json`
+- **Command:** `gcloud container node-pools list --cluster=<cluster> --location=<location> --project=<project> --format=json`
 - **Flag when:** A Standard mode GKE cluster has autoscaling node pools restricted to a single zone with no Node Auto-Provisioning (NAP) and no untainted zonal pool's fallback — an untainted multi-zone node pool of the same machine type (a tainted zonal pool is flagged regardless; the excerpt says which test failed), or a node pool's live node count is `>= 90%` of its **effective** ceiling — that ceiling is a hard stop, not a soft one, so "close to it" means measurably close, not a judgment call. Effective, because `autoscaling.maxNodeCount` is a _per-location_ limit ("maximum number of nodes for one location in the NodePool", in the API's words) while the live count is a pool total summed over every zone: the pool-wide ceiling is `maxNodeCount` times the zones the pool spans, unless the pool sets the mutually-exclusive `totalMaxNodeCount`, which is already pool-wide. The collector computes this and names the basis in the excerpt.
 - **Do NOT flag:** Autopilot clusters (fully managed multi-zone); an untainted single-zone pool beside an untainted multi-zone pool of the same machine type on the same cluster; a tainted multi-zone pool is no fallback, since the zonal pool's pods do not tolerate its taints.
 - **Severity:** `major`.

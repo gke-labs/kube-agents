@@ -6,6 +6,11 @@ from pathlib import Path
 from command_policy import (
     evaluate,
     GCLOUD_READ_COMMANDS,
+    _GCLOUD_FILE_WRITE_FLAGS,
+    _GCLOUD_IDENTITY_FLAGS,
+    _IMPERSONATION_FLAGS,
+    _KUBECTL_FILE_WRITE_FLAGS,
+    _KUBECTL_IDENTITY_FLAGS,
     _gcloud_asks_for_help,
     _gcloud_words_and_flag,
 )
@@ -1826,6 +1831,114 @@ class TheConfigConnectorSkillStaysInsideThePolicy(unittest.TestCase):
         ):
             with self.subTest(desc=desc):
                 self.assertFalse(evaluate(argv).allowed, desc)
+
+
+class RefusalsSayTheBoundaryIsFinal(unittest.TestCase):
+    """Every categorical refusal says it is a boundary, not an error to fix.
+
+    A refusal that only said what was wrong with this argv read as a failed
+    command, and a model retried the same action through another spelling --
+    another verb, another tool, another identity (#1945). The phrase is
+    asserted literally rather than by importing the constant, so rewording
+    the notice away fails here instead of passing tautologically.
+    """
+
+    BOUNDARY_PHRASE = "permission boundary, not an error to work around"
+    # The two shapes permit different retries, and carrying the wrong one is
+    # itself the defect: a verb refusal telling the model "re-run without the
+    # flag" names a flag the argv does not have. Each shape is pinned by a
+    # phrase the other must not carry, so swapping the constants fails here.
+    ACTION_PHRASE = "refused however it is attempted"
+    FLAG_PHRASE = "may be retried without the flag"
+
+    ACTION_REFUSALS = (
+        (["kubectl", "delete", "pod", "web-0"], "kubernetes.read-only"),
+        (["kubectl", "cluster-info", "dump"], "kubernetes.read-only"),
+        (["gcloud", "projects", "delete", "p"], "gcp.read-only"),
+    )
+    FLAG_REFUSALS = (
+        (["kubectl", "get", "pods", "--as", "system:admin"],
+         "identity.caller-supplied-impersonation"),
+        (["kubectl", "--kuberc", "/workspace/kr.yaml", "get", "pods"],
+         "kubernetes.kuberc-forbidden"),
+        (["kubectl", "get", "pods", "--token", "t"],
+         "kubernetes.identity-change-forbidden"),
+        (["kubectl", "get", "pods", "--profile-output", "/workspace/x"],
+         "kubernetes.file-write-forbidden"),
+        (["gcloud", "--flags-file", "/workspace/f.yaml", "info"],
+         "gcp.flags-file-forbidden"),
+        (["gcloud", "info", "--account", "x@example.com"],
+         "gcp.identity-change-forbidden"),
+        (["gcloud", "info", "--log-http-log-file", "/workspace/l"],
+         "gcp.file-write-forbidden"),
+    )
+
+    def test_action_refusals_state_finality_for_the_action(self):
+        for argv, rule_id in self.ACTION_REFUSALS:
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed)
+                self.assertEqual(rule_id, decision.rule_id)
+                self.assertIn(self.BOUNDARY_PHRASE, decision.message)
+                self.assertIn(self.ACTION_PHRASE, decision.message)
+                self.assertNotIn(self.FLAG_PHRASE, decision.message)
+
+    def test_flag_refusals_permit_only_the_flagless_retry(self):
+        for argv, rule_id in self.FLAG_REFUSALS:
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed)
+                self.assertEqual(rule_id, decision.rule_id)
+                self.assertIn(self.BOUNDARY_PHRASE, decision.message)
+                self.assertIn(self.FLAG_PHRASE, decision.message)
+                self.assertNotIn(self.ACTION_PHRASE, decision.message)
+
+    # Every flag refusal, with the set its rule refuses. A rule whose message
+    # names a subset closes the gap with a catch-all phrase; the phrase is
+    # listed here so the test knows which names may be left out and which may
+    # not, and a flag added to a set fails until its message names it or the
+    # message carries the catch-all.
+    FLAG_RULE_SETS = (
+        (["kubectl", "get", "pods", "--as-uid", "1000"], _IMPERSONATION_FLAGS, None),
+        (["kubectl", "--kuberc", "/workspace/kr.yaml", "get", "pods"], {"--kuberc"}, None),
+        (["kubectl", "get", "pods", "--client-key=/k"], _KUBECTL_IDENTITY_FLAGS,
+         "and the other credential flags"),
+        (["kubectl", "get", "pods", "--output-directory=/tmp/x"], _KUBECTL_FILE_WRITE_FLAGS, None),
+        (["gcloud", "--flags-file=/workspace/f.yaml", "info"], {"--flags-file"}, None),
+        (["gcloud", "info", "--credential-file-override=/k.json"], _GCLOUD_IDENTITY_FLAGS,
+         "and the other identity flags"),
+        (["gcloud", "info", "--log-http-log-file=/tmp/l"], _GCLOUD_FILE_WRITE_FLAGS, None),
+    )
+
+    def test_a_flag_refusal_names_every_flag_its_rule_refuses(self):
+        # The notice says "retried without the flag", so the message must let
+        # the caller identify the flag it passed: every flag in the rule's set
+        # is named as a whole word (so `--as` is not satisfied by `--as-uid`),
+        # or the message carries the rule's catch-all phrase.
+        for argv, flags, catch_all in self.FLAG_RULE_SETS:
+            with self.subTest(argv=argv):
+                message = evaluate(argv).message
+                named = {f for f in flags if re.search(rf"(?<![\w-]){re.escape(f)}(?![\w-])", message)}
+                if catch_all is None:
+                    self.assertEqual(set(flags), named, f"unnamed: {sorted(set(flags) - named)}")
+                else:
+                    self.assertIn(catch_all, message)
+                    self.assertTrue(named, "a catch-all is not a substitute for naming none")
+
+    def test_refusals_a_respelling_answers_do_not_claim_a_boundary(self):
+        # Re-running with a spelling the policy accepts is the legitimate
+        # retry for these, so calling them a boundary would stop retries the
+        # policy permits: a readable flag for the first two, the one allowed
+        # asset type for the third.
+        for argv in (
+            ["kubectl", "--unknown-flag", "get", "pods"],
+            ["gcloud", "--unknown-flag", "container", "clusters", "list"],
+            ["gcloud", "asset", "search-all-resources", "--scope=projects/p"],
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed)
+                self.assertNotIn(self.BOUNDARY_PHRASE, decision.message)
 
 
 if __name__ == "__main__":

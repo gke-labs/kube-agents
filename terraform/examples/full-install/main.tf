@@ -342,16 +342,6 @@ module "gke_backup_plan" {
   encryption_key      = var.backup_encryption_key
 }
 
-locals {
-  # Indexed by the same key the kube-agents-iam module uses, so the emails
-  # coming back out of the module can be rejoined with the tuple that produced
-  # them without re-deriving anything.
-  scoped_pool_entries = {
-    for cluster in var.scoped_clusters :
-    "projects/${cluster.project_id}/locations/${cluster.location}/clusters/${cluster.cluster_name}" => cluster
-  }
-}
-
 # The two scope selectors that are not containers, resolved to projects at
 # plan time. Called with no depends_on and no input a managed resource
 # produces, on purpose: module.kube_agents_iam below carries a module-level
@@ -376,11 +366,14 @@ module "scope_resolver" {
 module "kube_agents_iam" {
   source = "../../modules/kube-agents-iam"
 
-  project_id      = var.project_id
-  namespace       = var.namespace
-  project_roles   = local.agent_project_roles
-  scoped_clusters = var.scoped_clusters
-  scope           = var.scope
+  project_id    = var.project_id
+  namespace     = var.namespace
+  project_roles = local.agent_project_roles
+  scope         = var.scope
+  # The scoped service account pool, derived in the module from the same
+  # scope object: armed by the switch alone, never by the scope.
+  scoped_pool_enabled      = var.scoped_pool_enabled
+  scoped_pool_max_accounts = var.scoped_pool_max_accounts
   # What the selectors resolved to, from the module above; the IAM module
   # binds these and refuses a selector with no entry.
   scope_selector_members = module.scope_resolver.members
@@ -790,19 +783,22 @@ resource "helm_release" "kube_agents" {
         serviceAccountAnnotations = {
           "iam.gke.io/gcp-service-account" = module.kube_agents_iam.service_account_email
         }
-        # The mapping the credential broker selects from. It has to reach the
-        # cluster as data rather than being recomputed there: the broker refuses
-        # a scope it has no entry for, so a second implementation of the naming
-        # rule would turn a mismatch into a refusal at request time instead of a
-        # diff at plan time.
-        scopedServiceAccounts = [
-          for key in sort(keys(module.kube_agents_iam.scoped_service_accounts)) : {
-            projectId           = local.scoped_pool_entries[key].project_id
-            location            = local.scoped_pool_entries[key].location
-            clusterName         = local.scoped_pool_entries[key].cluster_name
-            serviceAccountEmail = module.kube_agents_iam.scoped_service_accounts[key]
-          }
-        ]
+        # The mapping the credential broker selects from, one row per project
+        # the module provisioned a member for. It has to reach the cluster as
+        # data rather than being recomputed there: the broker refuses a
+        # project it has no entry for, so a second implementation of the
+        # naming rule would turn a mismatch into a refusal at request time
+        # instead of a diff at plan time. `enabled` is the arming switch the
+        # operator reads; the list is empty while it is false.
+        scopedServiceAccountPool = {
+          enabled = var.scoped_pool_enabled
+          serviceAccounts = [
+            for project_id in sort(keys(module.kube_agents_iam.scoped_service_accounts)) : {
+              projectId           = project_id
+              serviceAccountEmail = module.kube_agents_iam.scoped_service_accounts[project_id]
+            }
+          ]
+        }
       }
       # The same object the IAM module bound above, so the CR declares no
       # project the module did not also bind. Always rendered, empty lists
