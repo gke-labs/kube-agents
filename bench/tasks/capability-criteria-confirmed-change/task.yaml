@@ -104,9 +104,17 @@ verification_spec:
       # refused -- no confirmer, a key it does not define -- does not count.
       # The verifier counts calls by tool name only, so a run of reads
       # satisfies it too; the declared-line checks below carry the rest.
+      # The worker reaches the tool through the tool_call wrapper, where the
+      # name is namespaced by the server alias (`platform_control`), never
+      # the bare `def` name. Both separator spellings, the way
+      # scripts/test_integration_contracts.py registers every MCP tool.
       type: tool_called
       scope: workers
-      tool_names: ["capability_criteria"]
+      tool_names:
+        [
+          "mcp__platform_control__capability_criteria",
+          "mcp_platform_control_capability_criteria",
+        ]
       require_success: true
       minimum_calls: 2
   - name: the-raised-threshold-line-is-declared
