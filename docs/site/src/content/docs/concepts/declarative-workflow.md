@@ -71,7 +71,7 @@ Each audit stream owns exactly one **GitHub issue**, rewritten in place on every
 
 A run that finds nothing **closes the issue as completed**, and closes any remediation PRs still open for the stream. That is the point of the shape: a closed issue reads as _done_.
 
-Unless the run could not see the whole fleet. A cluster that was skipped, or one that was read but where some checks could not run, makes the run **partial** — and a finding's absence from a cluster nobody looked at is not evidence it was fixed. Over a partial run the ledger stays open with a comment naming the gaps, nothing is announced as resolved, and no remediation PR is retired.
+Unless the run could not see the whole fleet. A cluster that was skipped, or one that was read but where some checks could not run, makes the run **partial** — and a finding's absence from a cluster nobody looked at is not evidence it was fixed. Over a partial run the ledger stays open with a comment naming the gaps, nothing is announced as resolved, and no remediation PR is retired, except one whose fix a repository declaration forbids, which is closed on the declaration alone.
 
 ### Tier 2 — remediation pull requests
 

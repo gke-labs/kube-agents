@@ -5402,9 +5402,7 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
     return moved
 
 
-def _shield_sources(
-    data: dict, declarations: list[dict], candidates: dict[tuple[str, str], set[str]] | None = None
-) -> dict[tuple[str, str], list[tuple[str, str, str]]]:
+def _shield_sources(data: dict, declarations: list[dict]) -> dict[tuple[str, str], list[tuple[str, str, str]]]:
     """Declared 2.7 workloads by `(cluster, namespace)`, folded as the finding id folds them.
 
     Two sources, because each misses what the other has: the document's
@@ -5415,27 +5413,12 @@ def _shield_sources(
     Each value is `(object, repo, path)`, one per folded object (the first
     spelling and the first note that declared it are kept for display), and an
     item whose object is not a workload kind is logged and left out: it covers
-    no workload's token. With `candidates` — the collector's 2.7 workloads,
-    `(namespace, object)` folded to the clusters that carry each — an item
-    naming a workload the collector did not report on the `default` account
-    (a misspelling, a workload on a named account) is left out the same way:
-    it covers no token, so it shields none.
+    no workload's token.
     """
     sources: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
     seen: set[tuple[str, str, str]] = set()
 
     def add(cluster: str, namespace: str, obj: str, repo: str, path: str) -> None:
-        if candidates is not None:
-            on_account = candidates.get((_id_segment(namespace), _id_segment(obj))) or set()
-            if not on_account or (cluster and _id_segment(cluster) not in on_account):
-                log(
-                    f"DECLARATION NOT APPLIED: {SHARED_ACCOUNT_CHECK} on {obj!r} ({repo}:{path}) — "
-                    f"the collector reports no such workload on the `default` ServiceAccount in "
-                    f"{namespace!r}"
-                    + (f" on {cluster}" if cluster else "")
-                    + "; this item covers no token, so it shields nothing."
-                )
-                return
         if _object_kind_segment(obj) not in SHARED_ACCOUNT_WORKLOAD_KINDS:
             log(
                 f"DECLARATION NOT APPLIED: {SHARED_ACCOUNT_CHECK} on {obj!r} ({repo}:{path}) — "
@@ -5501,16 +5484,7 @@ def shield_declared_account_siblings(
     reported; counted as held rather than shielded, it would keep that
     pull request open past the close the shield exists to make.
     """
-    candidates: dict[tuple[str, str], set[str]] | None = None
-    if manifest is not None:
-        candidates = {}
-        for entry, candidate in _candidates(manifest):
-            if str(candidate.get("check", "")) != SHARED_ACCOUNT_CHECK:
-                continue
-            cluster = str(candidate.get("cluster") or entry.get("name") or "")
-            key = (_id_segment(str(candidate.get("namespace") or "")), _id_segment(str(candidate.get("object", ""))))
-            candidates.setdefault(key, set()).add(_id_segment(cluster))
-    shielded_by = _shield_sources(data, list(declarations or []), candidates)
+    shielded_by = _shield_sources(data, list(declarations or []))
     if not shielded_by:
         return []
 
@@ -13359,7 +13333,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
 
     # Retiring a pull request means asserting its finding no longer reproduces.
     # Over incomplete coverage that assertion is unfounded, so nothing is
-    # closed and every open fix survives to the next complete run.
+    # closed and every open fix survives to the next complete run, except the
+    # shield's close, which rests on the declaration and not on this run's read.
     if gaps and not shielded_ids:
         prs_closed = []
         log(

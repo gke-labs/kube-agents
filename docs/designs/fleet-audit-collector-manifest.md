@@ -252,7 +252,7 @@ stay protected, because the stale-close pass reads the still-flagged set whole, 
 nothing the lost body held is protected. The delta comment is skipped. A run with neither a memory
 nor a manifest answers no `/remediate` at all (no refusal, deferral or acknowledgement; the next run
 with a memory answers them, and the deferred marker is what `reply_to_deferrals` guards on, so
-nothing is lost by waiting). A clean run over a lost memory never closes: it files a lost-memory
+nothing is lost by waiting). A clean run over a lost memory never closes the ledger (and retires no pull request but the compliance shield's): it files a lost-memory
 coverage gap, stays open and reports partial — the collector's gap while it still flags something
 the document does not carry, and otherwise the gap saying nothing shows whether the ledger's
 findings were fixed, since a collector covers only its own checks ([report store design
@@ -413,7 +413,7 @@ prints is unchanged.
 For a run where the collector produced no manifest and every check came from the manual fallback.
 The reason, passed through the same redactor as a skipped cluster's reason, is appended to
 `coverage_gaps` as `the collector manifest was waived — <reason>`, which makes the run `partial`:
-nothing is announced resolved, no remediation pull request is retired, and the ledger is not closed,
+nothing is announced resolved, no remediation pull request is retired (the compliance shield's close aside), and the ledger is not closed,
 by the same rule any other gap applies. A document-authored gap shows in the Scope table's rows; the
 waiver has no row, so the ledger body lists it under a _Coverage_ heading in the Scope section and
 the delta comment, when one is posted, repeats it. The other holds the document cannot express —
