@@ -454,7 +454,7 @@ SOURCES: dict[str, Source] = {
     # ask becomes the reserved artifact on the bus.
     "a2a_worker_adapter": Source(
         "a2a/worker-adapter/adapter.go",
-        ("func (a *adapter) publishDelegate(", "lib.ArtifactDelegate"),
+        ("func (a *adapter) publishDelegate(", "func (a *adapter) publishArtifactPart("),
     ),
     # The worker-adapter's own share of the delegate-request check: the
     # length cap, read through the shared constant rather than a hand-copied
@@ -462,7 +462,7 @@ SOURCES: dict[str, Source] = {
     # silently disagree on what "too long" means.
     "a2a_worker_adapter_delegate": Source(
         "a2a/worker-adapter/delegate.go",
-        ("func validateDelegate(", "lib.DelegateTextCap"),
+        ("func validateDelegate(", "text is too long for a delegation"),
     ),
     # The MCP tool schema the session's harness is actually handed. It cannot
     # reference lib.DelegateRequest's json tags -- it is a map[string]any
@@ -481,7 +481,7 @@ SOURCES: dict[str, Source] = {
     # the bus directly).
     "a2a_gateway_relay": Source(
         "a2a/gateway/relay.go",
-        ("case lib.ArtifactDelegate:", "func (g *Gateway) applyArtifact("),
+        ("g.handleDelegateRequest(ctx, rec, subject, taskID, a.Artifact.Parts)", "func (g *Gateway) applyArtifact("),
     ),
     "a2a_gateway_delegation": Source(
         "a2a/gateway/delegation.go",
