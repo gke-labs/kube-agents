@@ -214,8 +214,8 @@ backend), and the eval install has none until stage 2 gives it one; the adapter'
 the guard say so in code and in the gateway spec's test-backend section. What that trades away is
 the guard's no-backend refusal, which on a gateway with the door rendered can no longer tell an
 install that wants no real backend from one whose relay URL failed to render. The adapter's
-guard change drops only that refusal, only when the door is rendered, and keeps the two-backend
-refusal. And the door-alone start is not silent: the gateway logs it and the read route reports
+guard change drops only that refusal, only when a door is rendered (the inject door, or the A2A
+door beside it, which shares the exemption), and keeps the two-backend refusal. And the door-alone start is not silent: the gateway logs it and the read route reports
 the armed backend as inject-only, so stage 2's preflight reads the armed backend and fails the
 run as infrastructure when Chat is not the one, before any case grades. The stage-2 change that
 renders the gateway's relay URL adds it to the operator's golden set, which is where a failed
@@ -301,8 +301,8 @@ and `bus-subscribe-failed` (`spawn-failed` is both), are infrastructure, the cla
 transport gives an exhausted transport retry, because they say the executor lost the task rather
 than the persona failing it, the same line the profiles spec draws with `worker-evicted`; the
 persona's reasons, `hermes-exited-nonzero` and `deadline-exceeded`, the API server's 5xx or failed turn,
-unparseable or broken-off answers (`hermes-api-failed`, `hermes-api-unreadable`,
-`hermes-api-read-failed`), and any reason the harness does not know, are graded failures. A `rejected` terminal, which both executors publish for a
+unparseable, broken-off or oversize answers (`hermes-api-failed`, `hermes-api-unreadable`,
+`hermes-api-read-failed`, `hermes-api-oversize`), and any reason the harness does not know, are graded failures. A `rejected` terminal, which both executors publish for a
 submission with no text parts, is infrastructure and never graded, because it is the harness's
 own defect. A `canceled` terminal after the harness's own cancel is the graded timeout above, and
 `canceled-before-start` the infrastructure outcome above. The rule is the same on both
