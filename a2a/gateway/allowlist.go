@@ -64,7 +64,9 @@ func buildTargetAllowed(cfg *Config, ps *Pseudonymizer) targetAllowed {
 // as a history entry's TaskRequester stores it) came in on backend may reach
 // target. No list for the (target, backend) pair means the ingress allowlist
 // is the only gate, which is today's bound, so the answer is true. Under a
-// list, a blank subject is never a member, and an empty list has none.
+// list, a blank subject is never a member, and an empty list has none. The
+// A2A door's backend is the one exception to the absent-list rule, and the
+// delegation checks it before asking here (doorUnlisted).
 func (g *Gateway) targetAllows(target, backend, subject string) bool {
 	set := g.targetAllowed[target][backend]
 	if set == nil {

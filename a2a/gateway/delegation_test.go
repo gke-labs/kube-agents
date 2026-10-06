@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -30,8 +32,19 @@ func delegateArtifact(t *testing.T, addressee, text string) lib.Artifact {
 // incarnation's executor, the turn's submission and the bus session.
 func sessionTurn(t *testing.T, r *rig, spawn *fakeSpawner, conv, text string) (*lib.TaskExecution, *lib.Envelope, string) {
 	t.Helper()
+	return sessionTurnVia(t, r, spawn, conv, "", text)
+}
+
+// sessionTurnVia is sessionTurn with the message stamped as arriving through
+// backend (InboundMessage.Backend), the way the inject and A2A doors stamp
+// theirs; "" is the rig's own backend.
+func sessionTurnVia(t *testing.T, r *rig, spawn *fakeSpawner, conv, backend, text string) (*lib.TaskExecution, *lib.Envelope, string) {
+	t.Helper()
 	before := len(spawn.calls())
-	sessionRigTurn(r, conv, fmt.Sprintf("%s-%d", conv, before), "/session "+text)
+	r.adapter.inbox <- InboundMessage{
+		Conversation: conv, Kind: "group", AuthorID: "1001",
+		MessageID: fmt.Sprintf("%s-%d", conv, before), Text: "/session " + text, Backend: backend,
+	}
 	waitFor(t, "spawn", func() bool { return len(spawn.calls()) > before })
 	session := spawn.calls()[before].Session
 	origin := r.awaitTask(t, session)
@@ -1779,5 +1792,99 @@ func TestASteerIsNotSentUnlessItsAuthorIsOnRecord(t *testing.T) {
 	}
 	if !loggedContaining(r, "steer author record write failed", origin.TaskID)() {
 		t.Fatalf("no log line for the failed write:\n%s", r.logs.String())
+	}
+}
+
+// armDoorMap arms the A2A door's principal map on a rig whose adapter is the
+// fake, so a turn stamped Backend a2a from author 1001 verifies (the door's
+// own map, a2a:-prefixed, eval: identities only).
+func armDoorMap(t *testing.T, c *Config) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "a2a-door-map")
+	if err := os.WriteFile(path, []byte(a2aPrincipalPrefix+"1001 eval:bnaylor\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c.A2ADoorListen, c.A2ADoorToken, c.A2ADoorPrincipalMapPath = "127.0.0.1:0", "unused", path
+}
+
+// TestTheDoorWithNoListMayNotDelegate: unlike the chat backends, where an
+// absent list leaves the ingress allowlist as the only gate, a turn whose
+// requester came in through the A2A door may delegate only under a list for
+// that backend (gke-labs#2478 is the CR field that would render one). A
+// blank door list is still the ordinary nobody.
+func TestTheDoorWithNoListMayNotDelegate(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		lists map[string][]string
+		rule  string // "" mints
+	}{
+		{"no list at all refuses", nil, ruleDelegationDoorUnlisted},
+		{"chat lists alone refuse", map[string][]string{"discord": {"1001"}, gchatBackend: {"alice@example.com"}}, ruleDelegationDoorUnlisted},
+		{"a door list naming the caller mints", map[string][]string{a2aBackend: {"1001"}}, ""},
+		{"a blank door list is nobody", map[string][]string{a2aBackend: {}}, ruleDelegationAllowedUsers},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, spawn := startRigWithSpawnerCap(t, "platform", 0, func(c *Config) {
+				armDoorMap(t, c)
+				if tc.lists != nil {
+					c.TargetAllowedUsers = map[string]map[string][]string{targetPlatform: tc.lists}
+				}
+			})
+			conv := "a2a:agent-1001/ctx-door"
+			exec, _, _ := sessionTurnVia(t, r, spawn, conv, a2aBackend, "do a thing")
+			if err := exec.PublishArtifact(context.Background(), delegateArtifact(t, "platform", "x")); err != nil {
+				t.Fatal(err)
+			}
+			if tc.rule == "" {
+				r.awaitTask(t, targetPlatform)
+				return
+			}
+			waitFor(t, "refusal line", loggedContaining(r, "delegation refused", "rule="+tc.rule, "backend="+a2aBackend))
+			completeTask(t, exec, "delegated to platform")
+			waitFor(t, "the target-only notice", postedContaining(r, noticeDelegationNotAllowed))
+			if n := platformSubmissions(t, r); n != 0 {
+				t.Fatalf("a door turn with no list minted %d children", n)
+			}
+		})
+	}
+}
+
+// TestADoorAuthorWithNoListRefusesAChatTurnsDelegation: the door's rule holds
+// for everyone the delegation is checked against, not only the requester: a
+// steer author or an incarnation-set member on backend a2a with no list for
+// it refuses, under the door's rule.
+func TestADoorAuthorWithNoListRefusesAChatTurnsDelegation(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		edit  func(rec *SessionRecord, parent string, door TaskRequester)
+		field string
+	}{
+		{"a steer author", func(rec *SessionRecord, parent string, door TaskRequester) {
+			for i := range rec.Tasks {
+				if rec.Tasks[i].ID == parent {
+					rec.Tasks[i].SteerAuthors = append(rec.Tasks[i].SteerAuthors, door)
+				}
+			}
+		}, "steerBackend=" + a2aBackend},
+		{"an incarnation-set member", func(rec *SessionRecord, _ string, door TaskRequester) {
+			rec.addSessionAuthor(door)
+		}, "sessionBackend=" + a2aBackend},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, spawn := startRigWithSpawner(t)
+			conv := "discord:g1/t-door-author"
+			exec, origin, _ := sessionTurn(t, r, spawn, conv, "do a thing")
+			door := TaskRequester{Backend: a2aBackend, Subject: requesterSubject(r.g.ps, a2aBackend, "agent-9")}
+			putRecord(t, r, conv, func(rec *SessionRecord) { tc.edit(rec, origin.TaskID, door) })
+			if err := exec.PublishArtifact(context.Background(), delegateArtifact(t, "platform", "x")); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, "refusal line", loggedContaining(r, "delegation refused", "rule="+ruleDelegationDoorUnlisted, tc.field))
+			completeTask(t, exec, "delegated to platform")
+			waitFor(t, "the target-only notice", postedContaining(r, noticeDelegationNotAllowed))
+			if n := platformSubmissions(t, r); n != 0 {
+				t.Fatalf("minted past a door author with no list: %d", n)
+			}
+		})
 	}
 }

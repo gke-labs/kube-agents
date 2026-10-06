@@ -21,6 +21,7 @@ const (
 	ruleDelegationNoRequester   = "delegation.no-requester"
 	ruleDelegationStale         = "delegation.stale"
 	ruleDelegationMalformed     = "delegation.malformed"
+	ruleDelegationDoorUnlisted  = "delegation.door-unlisted"
 )
 
 // delegatedLineNote suffixes a child's rolling line, so the room can tell the
@@ -121,6 +122,13 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		refuse(ruleDelegationNoRequester, noticeDelegationNoRequester)
 		return
 	}
+	// The A2A door's callers delegate only under a list of their own,
+	// which nothing renders yet (gke-labs#2478): an absent list there is
+	// nobody, where on a chat backend it is everyone the ingress admits.
+	if g.doorUnlisted(addressee, parent.Requester.Backend) {
+		refuse(ruleDelegationDoorUnlisted, noticeDelegationNotAllowed)
+		return
+	}
 	if !g.targetAllows(addressee, parent.Requester.Backend, parent.Requester.Subject) {
 		refuse(ruleDelegationAllowedUsers, noticeDelegationNotAllowed)
 		return
@@ -133,8 +141,8 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		return
 	}
 	for _, a := range parent.SteerAuthors {
-		if !g.targetAllows(addressee, a.Backend, a.Subject) {
-			refuse(ruleDelegationSteerAuthor, noticeDelegationNotAllowed, "steerBackend", a.Backend, "steerAuthor", a.Subject)
+		if rule := g.authorRefusal(addressee, a, ruleDelegationSteerAuthor); rule != "" {
+			refuse(rule, noticeDelegationNotAllowed, "steerBackend", a.Backend, "steerAuthor", a.Subject)
 			return
 		}
 	}
@@ -149,8 +157,8 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		return
 	}
 	for _, a := range sessionAuthors {
-		if !g.targetAllows(addressee, a.Backend, a.Subject) {
-			refuse(ruleDelegationSessionAuthor, noticeDelegationNotAllowed, "sessionBackend", a.Backend, "sessionAuthor", a.Subject)
+		if rule := g.authorRefusal(addressee, a, ruleDelegationSessionAuthor); rule != "" {
+			refuse(rule, noticeDelegationNotAllowed, "sessionBackend", a.Backend, "sessionAuthor", a.Subject)
 			return
 		}
 	}
@@ -193,6 +201,30 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		}
 	}
 	log.Info("delegation minted", "parent", taskID, "child", childID, "addressee", addressee)
+}
+
+// doorUnlisted reports a delegation to target checked against someone who
+// came in through the A2A door when no list for that backend exists. The
+// door is the exception to targetAllows's absent-list rule: a chat backend's
+// ingress allowlist is a list of people an operator chose, while the door's
+// principal map admits programs, so the door delegates only under a list of
+// its own (spec-chatops-gateway.md, "Sessions by default"; the CR field that
+// would render one is gke-labs#2478).
+func (g *Gateway) doorUnlisted(target, backend string) bool {
+	return backend == a2aBackend && g.targetAllowed[target][backend] == nil
+}
+
+// authorRefusal is the rule a steer author or incarnation-set member refuses
+// a delegation to target under, or "" when they pass: the door's rule first,
+// then the target's list under the caller's own rule.
+func (g *Gateway) authorRefusal(target string, a TaskRequester, rule string) string {
+	if g.doorUnlisted(target, a.Backend) {
+		return ruleDelegationDoorUnlisted
+	}
+	if !g.targetAllows(target, a.Backend, a.Subject) {
+		return rule
+	}
+	return ""
 }
 
 // wakeTruncatedNote follows the "…" truncateRunes leaves on a wake body cut

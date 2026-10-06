@@ -123,7 +123,8 @@ type Config struct {
 	// backend -> ids in that backend's vocabulary. Only "platform" is
 	// populated from env today (EnvTargetAllowedUsersGchat/Slack); an absent
 	// pair means all authenticated users, and a present pair whose list is
-	// empty means nobody. See allowlist.go.
+	// empty means nobody. The A2A door's backend ("a2a") is the exception:
+	// no pair for it means nobody (doorUnlisted). See allowlist.go.
 	TargetAllowedUsers map[string]map[string][]string
 
 	// InjectListen is the inject side door's HTTP listen address, and setting
