@@ -115,6 +115,48 @@ class RepAndOutcomeTest(unittest.TestCase):
         self.assertEqual(classify.rep_kind({"result": "fail", "reason": GRADED_FAIL}), "fail")
         self.assertEqual(classify.rep_kind({"result": "pass"}), "pass")
 
+    def test_a_broken_replay_is_a_graded_fail_not_a_storm(self):
+        broken_reasons = (
+            (
+                "the record is not evidence of a real agent run: "
+                "record status is 'error' (failure wake: RuntimeError: posted nothing); "
+                "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+            ),
+            (
+                "the record is not evidence of a real agent run: "
+                "record status is 'error' (question wake: reply is not JSON (Expecting value: line 1 column 1 (char 0))); "
+                "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+            ),
+            (
+                "the record is not evidence of a real agent run: "
+                "record status is 'error' (thread context: none in ''); "
+                "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+            ),
+            (
+                "the record is not evidence of a real agent run: "
+                "record status is 'error' ([bench:card-failure-wake]: replay declares no options); "
+                "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+            ),
+            (
+                "the record is not evidence of a real agent run: "
+                "record status is 'error' (ReplayBroken: plant script failed in the image); "
+                "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+            ),
+            (
+                "the record is not evidence of a real agent run: "
+                "record status is 'error' (ReplayMismatch: circuit breaker did not trip); "
+                "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+            ),
+        )
+        for reason in broken_reasons:
+            self.assertEqual(classify.rep_kind({"result": "fail", "reason": reason}), "fail", reason)
+
+        reps = [{"n": 1, "result": "fail", "reason": broken_reasons[0]}]
+        counts = classify.rep_counts({"name": "chat-voice-failure-leads-with-fact", "result": "fail", "reps": reps})
+        self.assertEqual(counts["fail"], 1)
+        self.assertEqual(counts["infra"], 0)
+        self.assertEqual(classify.outcome_of(counts), "failed")
+
     def test_outcomes(self):
         self.assertEqual(classify.outcome_of(classify.rep_counts(task("a", "ppp"))), "passed")
         self.assertEqual(classify.outcome_of(classify.rep_counts(task("a", "pfp"))), "partial")

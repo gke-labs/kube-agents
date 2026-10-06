@@ -213,6 +213,24 @@ STORM_COOLDOWN = timedelta(minutes=30)
 # in a run are background noise on any day and must not hold GREEN off.
 STORM_RUN_SIGNATURE_REPS = 5
 
+# --- Replay errors (#2328) ---------------------------------------------------
+# A card-wake replay whose plant or turn failed in the image (ReplayBroken) or
+# whose directive/prompt was invalid returns an errored result; at bench-gate
+# it blocks at rung 3. The reason carries "the record is not evidence of a real
+# agent run" and "trajectory is empty", which STORM_REASON_RE matches;
+# recognised before the storm check so a broken replay is classified as a
+# graded fail rather than a storm repetition.
+REPLAY_ERROR_RE = re.compile(
+    r"ReplayBroken"
+    r"|ReplayMismatch"
+    r"|failure wake:"
+    r"|question wake:"
+    r"|thread context:"
+    r"|replay declares"
+    r"|\[bench:(?:card-failure|slack-question)-wake\]",
+    re.IGNORECASE,
+)
+
 # --- Rule 2b: delegation ceiling -> DEGRADED (#1874, #1879) -------------------
 # Incident: the platform agent's kanban dispatcher stalls under load ("ready
 # queue non-empty ... 0 workers spawned", 23 warnings on the 2026-09-21
@@ -620,15 +638,19 @@ def rep_kind(rep: dict) -> str:
     `storm` is what the harness could not grade: an `infra` verdict, or a
     `fail` whose reason is one of the never-ran phrasings (graded `fail`
     before #1184, classified `infra` after it -- the text is the same).
+    A harness-declared replay error (#2328) is a graded fail, not a storm.
     """
     result = rep.get("result")
     if result == REP_RESULT_PASS:
         return REP_PASS
-    if DELEGATION_CEILING_MARKER in (rep.get("reason") or ""):
+    reason = rep.get("reason") or ""
+    if DELEGATION_CEILING_MARKER in reason:
         return REP_CEILING
+    if result != REP_RESULT_INFRA and "KUBE_AGENTS_INFRA_FAILURE" not in reason and REPLAY_ERROR_RE.search(reason):
+        return REP_FAIL
     if result == REP_RESULT_INFRA:
         return REP_STORM
-    if STORM_REASON_RE.search(rep.get("reason") or ""):
+    if STORM_REASON_RE.search(reason):
         return REP_STORM
     return REP_FAIL
 

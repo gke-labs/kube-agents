@@ -153,6 +153,11 @@ the same layout and is collected from the moment it starts running.
       `delegation-ceiling`. The run page, the PR view and the PR comment's
       result cell count it in a case's total and name it apart; the Cases
       page's per-run counts (`render.rep_counts`) still fold it into `infra`.
+      Similarly, a harness-declared card-wake replay error (`ReplayMismatch`
+      or `ReplayBroken`, e.g. `failure wake:`, `question wake:`, `thread context:`
+      in the reason) is recognized by `classify.py` and `health.py` as `fail`,
+      not `storm`: a broken replay is a defect in the image under test, not
+      infrastructure weather (#2328).
     - `reason` — the free text after the first space-padded `--` separator
       (later separators belong to the reason — fail reasons contain the
       delimiter themselves), with the trailing `[OutcomeScore=…]` metrics
