@@ -83,6 +83,12 @@ class SharedNamesTest(unittest.TestCase):
 
 
 class MarkerTest(unittest.TestCase):
+    def test_a_marker_with_a_space_after_the_equals_sign_still_names_the_sweep(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "m"
+            path.write_text("task_id= t_abc\n")
+            self.assertEqual(h._read_marker(path), {"task_id": "t_abc"})
+
     def test_a_hand_written_marker_with_spaces_still_names_the_sweep(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "m"
@@ -234,7 +240,7 @@ class ComposeTest(unittest.TestCase):
     def test_titles_with_no_ascii_words_keep_separate_checks(self):
         meta = {"project": "p", "cluster": "c", "findings": [
             {"namespace": "ns", "workload": "api", "area": "security", "issue": "\u0431\u0435\u0437 \u043f\u0440\u043e\u0431"},
-            {"namespace": "ns", "workload": "api", "area": "security", "issue": "\u0440\u0430\u0431\u043e\u0442\u0430\u0435\u0442 \u043e\u0442 root"}]}
+            {"namespace": "ns", "workload": "api", "area": "security", "issue": "\u0440\u0430\u0431\u043e\u0442\u0430\u0435\u0442 \u043e\u0442 \u043a\u043e\u0440\u043d\u044f"}]}
         checks = [line["check"] for line in h.finding_lines(meta)]
         self.assertEqual(len(set(checks)), 2)
 
@@ -281,7 +287,7 @@ class HandOffTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _file(self, _parse):
+    def _file(self, _parse, stale=None):
         self.filed.append(1)
         return f"t_rank{len(self.filed)}"
 
@@ -419,6 +425,40 @@ class HandOffTest(unittest.TestCase):
             self.assertEqual(self._run_roster(roster, now=NOW - 60 + limit), "t_rank1")
         self.assertIn("Report cluster inventory: t_lost: the gate could not file", (self.d / "INVENTORY.raw.md").read_text())
 
+    def test_an_earlier_runs_open_card_does_not_hold_the_hand_off_forever(self):
+        _board(self.board, clusters=_all_done())
+        conn = sqlite3.connect(self.board)
+        conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?)",
+                     ("t_old", "running", f"{h.CLUSTER_KEY_PREFIX}t_old", "old", SWEEP_CREATED - 100))
+        conn.commit()
+        conn.close()
+        roster = [self._agent(tid) for tid, _, _, _ in _all_done()] + [self._agent("t_old")]
+        sent = []
+        with self._stub_kanban(sent):
+            self.assertIsNone(self._run_roster(roster))
+        self.assertEqual(sent[0], "archive t_old")
+        argv = shlex.split(sent[1])
+        self.assertEqual(argv[argv.index("--idempotency-key") + 1], f"{h.CLUSTER_KEY_PREFIX}t_old")
+
+    def test_an_earlier_runs_ranking_card_is_archived_before_filing(self):
+        _board(self.board, clusters=_all_done())
+        conn = sqlite3.connect(self.board)
+        conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?)",
+                     ("t_oldrank", "blocked", h.PRIORITIZE_KEY, "old ranking", SWEEP_CREATED - 100))
+        conn.commit()
+        conn.close()
+        sent = []
+        with self._stub_kanban(sent, reply='{"id": "t_newrank"}'), \
+                mock.patch.object(h, "file_prioritize", HandOffTest._real_file_prioritize):
+            self.assertEqual(self._run_with_parser(), "t_newrank")
+        self.assertEqual(sent[0], "archive t_oldrank")
+
+    def test_a_failed_or_cancelled_sweep_settles(self):
+        for status in ("failed", "cancelled"):
+            _board(self.board, sweep_status=status, clusters=_all_done())
+            self.assertTrue(h.settled(h.read_board(self.board, SWEEP)), status)
+            self.board.unlink()
+
     def test_the_ranking_card_is_filed_with_its_key(self):
         _board(self.board, clusters=_all_done())
         sent = []
@@ -448,7 +488,7 @@ class HandOffTest(unittest.TestCase):
 
     def test_a_failed_filing_leaves_the_next_tick_to_retry(self):
         _board(self.board, clusters=_all_done())
-        with mock.patch.object(h, "file_prioritize", lambda _p: None):
+        with mock.patch.object(h, "file_prioritize", lambda _p, _stale=None: None):
             self.assertIsNone(self._run())
         self.assertFalse((self.d / h.HANDOFF_MARKER).exists())
         self.assertEqual(self._run(), "t_rank1")

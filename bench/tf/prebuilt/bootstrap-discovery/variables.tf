@@ -50,8 +50,8 @@ variable "agent_container" {
   default     = "platform-agent"
 }
 
-# The sweep's worker writes its files through the shell sandbox, so an
-# earlier run's INVENTORY files are cleared there too. An install without a
+# The onboarding reports live on the shell sandbox, so an earlier run's
+# INVENTORY files are cleared there too. An install without a
 # sandbox matches no pod and skips that step.
 variable "sandbox_selector" {
   type        = string
@@ -63,20 +63,4 @@ variable "sandbox_container" {
   type        = string
   description = "Container inside the shell sandbox pods"
   default     = "shell"
-}
-
-# What step 4 waits for. "handoff", which bootstrap-discovery-fanout sets,
-# returns once the ranking card is filed, or once the sweep and its Cluster
-# Agent cards have settled without one. "fanout" returns as soon as the
-# sweep's worker has filed its Cluster Agent cards and ended a run: a run
-# started by hand that grades only the fan-out does not wait out the audits.
-variable "wait_for" {
-  type        = string
-  description = "End condition for step 4: \"fanout\" or \"handoff\""
-  default     = "fanout"
-
-  validation {
-    condition     = contains(["fanout", "handoff"], var.wait_for)
-    error_message = "wait_for must be \"fanout\" or \"handoff\"."
-  }
 }

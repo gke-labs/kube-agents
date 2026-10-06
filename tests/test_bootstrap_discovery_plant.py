@@ -62,8 +62,7 @@ import unittest
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _MODULE = _REPO_ROOT / "bench" / "tf" / "prebuilt" / "bootstrap-discovery" / "main.tf"
 _HEREDOC_RE = re.compile(r"command\s*=\s*<<-EOT\n(.*?)\n\s*EOT\n", re.S)
-_RUN_STATE_RE = re.compile(r"^run_state\(\) \{\n  agent_py [^\n]*<<'PY'\n(.*?)\nPY\n", re.S | re.M)
-_HANDOFF_STATE_RE = re.compile(r"^  handoff_state\(\) \{\n    agent_py [^\n]*<<'PY'\n(.*?)\nPY\n", re.DOTALL | re.MULTILINE)
+_HANDOFF_STATE_RE = re.compile(r"^handoff_state\(\) \{\n  agent_py [^\n]*<<'PY'\n(.*?)\nPY\n", re.DOTALL | re.MULTILINE)
 _STEP_1_RE = re.compile(r"^state=\"\$\(agent_py [^\n]*<<'PY' \|\| true\n(.*?)\nPY\n", re.S | re.M)
 _STEP_2_RE = re.compile(r"^old_id=\"\$\(agent_py <<'PY'\n(.*?)\nPY\n", re.S | re.M)
 _PLANT_BLOCK = 0
@@ -87,11 +86,9 @@ _INTERPOLATIONS = {
     "local.list_wait": "5",
     "local.pod_wait": "5",
     "local.scan_job": "bootstrap-inventory-scan",
-    "local.rate_limit_block": "provider rate limit: API retries exhausted",
     "local.prioritize_key": "bootstrap-inventory-prioritize",
     "local.handoff_wait": "1800",
     "local.settle_hold": "120",
-    "var.wait_for": "fanout",
     "var.project_id": "kube-agents-evals",
     "var.host_cluster_name": "platform-agent-host",
     "var.host_cluster_location": "us-central1",
@@ -173,7 +170,7 @@ elif ".bootstrap_scan_filed" in stdin:
         sys.stderr.write("error: unable to upgrade connection: container not found\n")
         sys.exit(1)
     print(old_id)
-elif "s/^task_id=//p" in script:
+elif "task_id[[:space:]]*=" in script:
     record("sweep_id")
     if os.environ.get("GATE_FILES") == "1" and bump("sweep_reads") >= 1:
         print("t_new")
@@ -209,16 +206,8 @@ elif "/proc" in stdin:
         print("idle")
 elif "bootstrap-inventory-prioritize" in cmd:
     record("handoff_state")
-    states = os.environ.get("HANDOFF_STATES", "1 0 0").split(";")
+    states = os.environ.get("HANDOFF_STATES", "1 1 0").split(";")
     answer = states[min(bump("handoff_state"), len(states) - 1)]
-    if answer == "fail":
-        sys.stderr.write("error: unable to upgrade connection: container not found\n")
-        sys.exit(1)
-    print(answer)
-elif "task_runs" in stdin:
-    record("run_state")
-    states = os.environ.get("RUN_STATES", "1 1 1 1").split(";")
-    answer = states[min(bump("run_state"), len(states) - 1)]
     if answer == "fail":
         sys.stderr.write("error: unable to upgrade connection: container not found\n")
         sys.exit(1)
@@ -319,52 +308,13 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         completed = subprocess.run(["bash", "-n", str(self._script)], capture_output=True, text=True)
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
-    def test_step_4_waits_past_a_run_that_ended_before_the_fan_out(self):
-        # started, ended, filed, ended after the newest card: a run that ended
-        # with nothing filed, then a retry partway through filing, then done.
-        completed, calls = self._run(GATE_FILES=1, RUN_STATES="1 1 0 0;2 1 1 0;2 2 3 1")
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(len(self._indices(calls, "[run_state]")), 3)
-        self.assertIn("Sweep card t_new filed 3 Cluster Agent card(s)", completed.stdout)
-        self.assertEqual(self._indices(calls, "[archive]"), [])
-
-    def test_step_4_hands_over_on_the_last_good_read_when_later_reads_fail(self):
-        # A worker is running and has filed two cards; then every read fails.
-        completed, calls = self._run(GATE_FILES=1, RUN_STATES="1 0 2 0;fail")
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(len(self._indices(calls, "[run_state]")), 900 // 15 + 1)
-        self.assertIn("Board reads after 0s failed", completed.stderr)
-        self.assertIn("Sweep card t_new has 0 ended run(s) and 2 Cluster Agent card(s)", completed.stdout)
-        self.assertEqual(self._indices(calls, "[archive]"), [])
-
-    def test_step_4_reports_a_board_it_never_read_as_unread(self):
-        completed, calls = self._run(GATE_FILES=1, RUN_STATES="fail")
-        self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("no read of sweep card t_new's runs from the board succeeded", completed.stderr)
-        self.assertNotIn("no worker picked up", completed.stderr)
-        self.assertEqual(len(self._indices(calls, "[open_cards]")), 3)
-
-    def test_step_4_reports_a_sweep_no_worker_picked_up(self):
-        completed, calls = self._run(GATE_FILES=1, RUN_STATES="0 0 0 0")
-        self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("no worker picked up sweep card t_new within 900s", completed.stderr)
-        self.assertNotIn("Board reads after", completed.stderr)
-
-    def test_the_fanout_default_never_reads_the_hand_off(self):
-        completed, calls = self._run(GATE_FILES=1, RUN_STATES="2 2 3 1")
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(self._indices(calls, "[handoff_state]"), [])
-
     def _run_handoff(self, **scenario):
-        script = pathlib.Path(self._dir.name) / "handoff.sh"
-        script.write_text(_render_plant(**{"var.wait_for": "handoff"}))
-        return self._run(script, GATE_FILES=1, **scenario)
+        return self._run(GATE_FILES=1, **scenario)
 
     def test_handoff_returns_once_the_ranking_card_is_keyed(self):
         completed, calls = self._run_handoff(HANDOFF_STATES="1 0 0;1 0 0;1 1 0")
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(len(self._indices(calls, "[handoff_state]")), 3)
-        self.assertEqual(self._indices(calls, "[run_state]"), [])
         self.assertIn("a card keyed bootstrap-inventory-prioritize is on the board after 30s", completed.stdout)
         self.assertEqual(self._indices(calls, "[archive]"), [])
 
@@ -404,12 +354,6 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("no read of sweep card t_new's hand-off from the board succeeded", completed.stderr)
         self.assertEqual(len(self._indices(calls, "[open_cards]")), 3)
-
-    def test_handoff_bash_syntax_is_valid(self):
-        script = pathlib.Path(self._dir.name) / "handoff.sh"
-        script.write_text(_render_plant(**{"var.wait_for": "handoff"}))
-        completed = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True, check=False)
-        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_step_1_refuses_every_state_but_clear_before_re_arming(self):
         # "" is a step-1 read that failed: only the catch-all arm stops it.
@@ -667,6 +611,23 @@ class Step1StateQueryTest(unittest.TestCase):
         self.assertEqual(self._state(markers=[".user_aligned"]), "aligned")
 
 
+class SweepIdReadTest(unittest.TestCase):
+    """Step 3's sed over the marker, run by sh against a data dir."""
+
+    def _sweep_id(self, text):
+        with tempfile.TemporaryDirectory() as home:
+            (pathlib.Path(home) / ".bootstrap_scan_filed").write_text(text)
+            plant = _render_plant(**{"local.home": home})
+            command = re.search(r"^  agent sh -c '(sed -n -E [^']*)'", plant, re.M).group(1)
+            return subprocess.run(["sh", "-c", command], capture_output=True, text=True, check=True).stdout.strip()
+
+    def test_the_gate_marker_reads_as_its_task_id(self):
+        self.assertEqual(self._sweep_id("task_id=t_1\nfiled_at=1\n"), "t_1")
+
+    def test_a_marker_written_by_hand_reads_as_its_task_id(self):
+        self.assertEqual(self._sweep_id("filed_at=1\n  task_id = t_2\ntask_id=t_3\n"), "t_2")
+
+
 class Step2GateQueryTest(unittest.TestCase):
     """Step 2's read of what closed the gate, run under the test interpreter
     against a data dir."""
@@ -690,6 +651,9 @@ class Step2GateQueryTest(unittest.TestCase):
     def test_a_marker_reads_as_its_task_id(self):
         self.assertEqual(self._old_id({".bootstrap_scan_filed": "task_id=t_1\nfiled_at=1\n"}), "t_1")
 
+    def test_a_marker_written_by_hand_reads_as_its_task_id(self):
+        self.assertEqual(self._old_id({".bootstrap_scan_filed": "  task_id = t_1\n"}), "t_1")
+
     def test_a_marker_without_a_task_id_reads_none(self):
         self.assertEqual(self._old_id({".bootstrap_scan_filed": ""}), "none")
 
@@ -706,131 +670,6 @@ class Step2GateQueryTest(unittest.TestCase):
         (self._home / ".bootstrap_scan_filed").mkdir()
         with self.assertRaises(subprocess.CalledProcessError):
             self._old_id()
-
-
-class RunStateQueryTest(unittest.TestCase):
-    """Step 4's board query, run under the test interpreter against a board
-    shaped the way the install's hermes writes it."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls._dir = tempfile.TemporaryDirectory()
-        cls._home = cls._dir.name
-        cls._script = _RUN_STATE_RE.search(_render_plant(**{"local.home": cls._home})).group(1)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls._dir.cleanup()
-
-    def _query(self, runs, children, prioritize_at=None, other_runs=(), other_children=()):
-        board = pathlib.Path(self._home) / "kanban.db"
-        board.unlink(missing_ok=True)
-        cards = [(f"t_child{i}", _CLUSTER_KEY + str(i), at) for i, at in enumerate(children or [])]
-        if prioritize_at is not None:
-            cards.append(("t_prioritize", "bootstrap-inventory-prioritize", prioritize_at))
-        with sqlite3.connect(board) as conn:
-            conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, idempotency_key TEXT)")
-            conn.executemany(
-                "INSERT INTO tasks VALUES (?, ?)", [(tid, key) for tid, key, *_ in cards + list(other_children)]
-            )
-            conn.execute(
-                "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT NOT NULL, "
-                "started_at INTEGER NOT NULL, ended_at INTEGER, outcome TEXT, summary TEXT)"
-            )
-            conn.executemany(
-                "INSERT INTO task_runs (task_id, started_at, ended_at, outcome, summary) VALUES (?, ?, ?, ?, ?)",
-                [(_SWEEP, *run) for run in runs] + list(other_runs),
-            )
-            if children is not None:
-                conn.execute(
-                    "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, "
-                    "creator_id TEXT NOT NULL, created_at INTEGER NOT NULL)"
-                )
-                conn.executemany(
-                    "INSERT INTO kanban_worker_children VALUES (?, ?, ?)",
-                    [(tid, _SWEEP, at) for tid, _, at in cards]
-                    + [(tid, creator, at) for tid, _, creator, at in other_children],
-                )
-        completed = subprocess.run(
-            [
-                sys.executable,
-                "-",
-                _SWEEP,
-                _INTERPOLATIONS["local.cluster_key_like"],
-                _INTERPOLATIONS["local.rate_limit_block"],
-            ],
-            input=self._script,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        return completed.stdout.strip()
-
-    def test_a_board_with_no_children_table_counts_nothing_filed(self):
-        self.assertEqual(self._query([(100, 110, "blocked", "no roster")], None), "1 1 0 0")
-
-    def test_a_run_still_going_counts_no_end(self):
-        self.assertEqual(self._query([(100, None, None, None)], [150, 200]), "1 0 2 0")
-
-    def test_a_run_that_ended_before_the_newest_card_does_not_count(self):
-        self.assertEqual(self._query([(100, 150, "completed", "done")], [120, 200]), "1 1 2 0")
-
-    def test_a_completed_run_ending_with_the_newest_card_counts(self):
-        self.assertEqual(self._query([(100, 200, "completed", "done")], [120, 200]), "1 1 2 1")
-
-    def test_a_prioritize_card_filed_after_the_run_completed_does_not_hold_it(self):
-        # The shape a live sweep left: four cluster cards, the run completed,
-        # then the prioritize card two seconds later.
-        runs = [(295, 458, "completed", "done")]
-        self.assertEqual(self._query(runs, [314, 314, 315, 315], prioritize_at=460), "1 1 4 1")
-
-    def test_a_block_the_worker_chose_counts(self):
-        self.assertEqual(self._query([(100, 210, "blocked", "Waiting for 4 child tasks")], [120, 200]), "1 1 2 1")
-
-    def test_a_run_the_worker_did_not_end_itself_does_not_count(self):
-        prefix = _INTERPOLATIONS["local.rate_limit_block"]
-        for outcome, summary in (
-            ("blocked", prefix + " (failure_reason=rate_limit): 429"),
-            ("reclaimed", "worker process gone"),
-            ("crashed", None),
-            ("timed_out", None),
-        ):
-            with self.subTest(outcome=outcome):
-                self.assertEqual(self._query([(100, 210, outcome, summary)], [120, 200]), "1 1 2 0")
-
-    def test_the_retry_that_completes_counts_after_a_partial_run_was_reclaimed(self):
-        runs = [(100, 210, "reclaimed", None), (220, 400, "completed", "done")]
-        self.assertEqual(self._query(runs, [120, 200, 300, 350]), "2 2 4 1")
-
-    def test_a_run_that_completed_without_filing_a_cluster_card_counts(self):
-        # A build whose worker files only the prioritize card, or nothing, then completes.
-        runs = [(100, 160, "completed", "done")]
-        self.assertEqual(self._query(runs, [], prioritize_at=150), "1 1 0 1")
-        self.assertEqual(self._query(runs, None), "1 1 0 1")
-
-    def test_with_no_cluster_card_only_a_completed_run_counts(self):
-        prefix = _INTERPOLATIONS["local.rate_limit_block"]
-        for outcome, summary in (
-            ("blocked", "Waiting for the roster"),
-            ("blocked", prefix + " (failure_reason=rate_limit): 429"),
-            ("reclaimed", "worker process gone"),
-            ("crashed", None),
-            ("timed_out", None),
-        ):
-            with self.subTest(outcome=outcome, summary=summary):
-                self.assertEqual(self._query([(100, 210, outcome, summary)], [], prioritize_at=150), "1 1 0 0")
-
-    def test_a_run_on_another_card_does_not_count(self):
-        # Re-arming archives the previous sweep card, which keeps its completed run.
-        old = [("t_old_sweep", 50, 900, "completed", "done")]
-        self.assertEqual(self._query([(100, 210, "blocked", "Waiting for the roster")], [], other_runs=old), "1 1 0 0")
-        self.assertEqual(self._query([(100, 150, "completed", "done")], [120, 200], other_runs=old), "1 1 2 0")
-
-    def test_a_card_another_sweep_filed_does_not_count(self):
-        # Re-arming archives the previous sweep's cards; their children rows stay.
-        old = [("t_old_child", _CLUSTER_KEY + "old", "t_old_sweep", 50)]
-        self.assertEqual(self._query([(100, 210, "blocked", "Waiting for the roster")], [], other_children=old), "1 1 0 0")
-        self.assertEqual(self._query([(100, 210, "completed", "done")], [120, 200], other_children=old), "1 1 2 1")
 
 
 class HandoffStateQueryTest(unittest.TestCase):

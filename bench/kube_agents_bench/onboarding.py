@@ -211,10 +211,10 @@ print(json.dumps(out))
 # run; the keyed ranking card; and any ranking-titled platform card without
 # the key, so a fail can say the card was filed unkeyed.
 _HANDOFF_SCRIPT = """
-import json, os, sqlite3, sys
+import json, os, re, sqlite3, sys
 root, board, sentinel, marker, prefix, key, assignee, word, module_dir, module = sys.argv[1:11]
 SQLITE_BUSY_TIMEOUT = 10
-out = {"sweep": None, "clusters": [], "keyed": [], "unkeyed": [], "error": None}
+out = {"sweep": None, "clusters": [], "keyed": [], "unkeyed": [], "error": None, "writer_error": None}
 
 
 def done(error=None):
@@ -224,14 +224,21 @@ def done(error=None):
     sys.exit(0)
 
 
-try:
-    sys.path.insert(0, module_dir)
-    writer = __import__(module)
-except Exception as exc:
-    done("the hand-off module %s cannot be imported from %s: %s" % (module, module_dir, exc))
+_writer = []
+
+
+def writer():
+    # Imported only when a card has findings to list, so a board on an image
+    # without the module still grades the ranking card.
+    if not _writer:
+        sys.path.insert(0, module_dir)
+        _writer.append(__import__(module))
+    return _writer[0]
+
+
 try:
     with open(os.path.join(root, marker)) as fh:
-        ids = [line.strip()[len("task_id="):] for line in fh if line.startswith("task_id=")]
+        ids = [m.group(1) for m in (re.search(r"(?:^|\\s)task_id\\s*=\\s*(\\S+)", line) for line in fh) if m]
 except OSError as exc:
     done("no discovery sweep has been filed: %s" % exc)
 if not ids or not ids[0]:
@@ -259,7 +266,10 @@ try:
                 card["metadata"] = "invalid"
             if isinstance(meta, dict):
                 card["metadata"] = "present"
-                card["listed"] = sorted({line["cluster"] for line in writer.finding_lines(meta)})
+                try:
+                    card["listed"] = sorted({line["cluster"] for line in writer().finding_lines(meta)})
+                except Exception as exc:
+                    out["writer_error"] = "the hand-off module %s from %s failed: %s" % (module, module_dir, exc)
         out["clusters"].append(card)
     out["keyed"] = [
         {"id": tid, "status": status}

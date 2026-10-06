@@ -10,9 +10,8 @@
 # path, so the prompt below only reads the board; the grade comes from the
 # stack and the verifiers.
 #
-# bench/tf/prebuilt/bootstrap-discovery, with wait_for = "handoff", re-arms the
-# gate, waits for the cron job to file a new sweep card, and returns once a
-# card keyed `bootstrap-inventory-prioritize` is on the board, or once the
+# bench/tf/prebuilt/bootstrap-discovery re-arms the gate, waits for the cron
+# job to file a new sweep card, and returns once a card keyed `bootstrap-inventory-prioritize` is on the board, or once the
 # sweep and every Cluster Agent card filed for it have stayed in a final status
 # for the stack's `settle_hold` (120s) without one, or at its
 # `handoff_wait` (1800s). That settle rule is looser than the hand-off's own
@@ -35,12 +34,12 @@
 # would file the sweep.
 #
 # Isolation class: read-only on the cluster; it re-files the onboarding sweep
-# on the install under test, and the destroy archives every card the sweep
-# filed. Eligible tier: nightly -- the fan-out's cards take dispatcher slots
+# on the install under test, and the destroy archives every
+# `bootstrap-inventory-*` card. Eligible tier: nightly -- the fan-out's cards take dispatcher slots
 # that other cases' cards running at the same time would use.
 ---
 id: bootstrap-discovery-fanout
-name: The onboarding sweep files one survey card per Cluster Agent and its hand-off reaches ranking
+name: Onboarding files one survey card per Cluster Agent and its hand-off reaches ranking
 
 # No seeded-fleet dependency: the roster is whatever Cluster Agents the install
 # under test has, and the verifier reads it from there.
@@ -55,8 +54,6 @@ infrastructure:
   # TF_VAR_host_cluster_location, exported by hack/ci-eval-pr.sh), because they
   # name the install the runner deployed and no task may choose a different
   # one. The stack defaults everything else.
-  variables:
-    wait_for: "handoff"
 
 validated: false
 

@@ -14,7 +14,7 @@ path at once.
 **Never block this card, whatever fails** — not for a failed `cluster_preflight.sh`, denied
 permissions, a cluster in `ERROR`, credentials that will not mint, or an MCP tool that errors. This
 overrides `SOUL.md` §6 step 2, your own `AGENTS.md` ("Fail loud, never silent"), and `SOUL.md` §2.
-The hand-off waits for this card to be `done` or `blocked` and then reads its `metadata`. A blocked
+The hand-off waits for this card to finish (`done`, `blocked`, `triage`, `failed` or `cancelled`) and then reads its `metadata`. A blocked
 card has none, so the report names its cluster as a gap carrying only the block reason, and nothing
 re-arms `.bootstrap_scan_filed` to try again — onboarding runs once. Record what failed in `gaps`,
 and complete: the report then shows what you did find and what you could not do.
@@ -26,8 +26,9 @@ from the `check` field the script reports, not the remediation text: a missing `
 missing kubeconfig both say "Re-scaffold the profile", and both leave you as unidentified as a
 context mismatch does. An
 unpinned `kubectl` resolves to the credential proxy's own context, the management cluster, so an
-audit run anyway files another cluster's workloads under your name. Aggregation copies `metadata`
-verbatim and the Platform Agent is forbidden to re-audit, so nothing downstream catches it.
+audit run anyway files another cluster's workloads under your name. The hand-off copies your
+`metadata` into the report verbatim and the ranking stage runs no tooling, so nothing downstream
+catches it.
 
 Check `5`, "Cannot reach the target cluster's API server", is the exception: your identity is
 established and the cluster is simply unreachable, so record it in `gaps` and complete like any

@@ -2,10 +2,11 @@
 """Dispatcher for the ``bootstrap-inventory-scan`` cron job.
 
 First-time onboarding needs a full GKE discovery sweep (control plane options,
-node pools, Workload Identity, running workloads): the sweep fans the audit
-out to the Cluster Agents, ``bootstrap_handoff.py`` writes their findings to
-``INVENTORY.raw.md``, and a second card ranks them into the short report the
-user receives. The audits are LLM work AND privileged work, and the
+node pools, Workload Identity, running workloads): ``bootstrap_handoff.py``
+files one audit card per Cluster Agent and writes their findings to
+``INVENTORY.raw.md``, the sweep card lists the fleet and audits clusters with
+no Cluster Agent, and a second card ranks it all into the short report the user
+receives. The audits are LLM work AND privileged work, and the
 profile this cron runs on can do neither: the Chat Agent's toolsets are
 deliberately stripped to ``mcp-router`` + ``kanban`` (no terminal, no gcloud,
 no kubectl), so it cannot run the sweep itself even as an LLM job.
@@ -119,7 +120,7 @@ CLUSTER_AUDIT_INSTRUCTIONS_PATHS = (
     "/opt/platform-template/governance/cluster_inventory_audit_sop.md",
 )
 # Present only where per-cluster agents are deployed. When absent, the sweep degrades to
-# a single-agent walk of the fleet; when present, the scan fans out one card per cluster.
+# a single-agent walk of the fleet; when present, the gate files one audit card per cluster.
 # Resolved under the data dir rather than hardcoded: `spec.harness.hermes.agentHome` moves
 # the whole tree, and a missing path here silently files the solo sweep.
 RECONCILE_SCRIPT_NAME = "cluster_agent_reconcile.py"
@@ -425,8 +426,8 @@ def ensure_cluster_agents(data_dir: Path) -> bool:
 
     Returns True when the sweep may be filed. False means "not yet, retry on the
     next tick" — the caller must not file the card, because a sweep filed against
-    an empty roster is a sweep with no fan-out, and the marker it writes makes that
-    permanent.
+    an empty roster tells its worker to audit every cluster itself, and the marker
+    it writes keeps that card's instructions for the whole run.
 
     Running the reconcile here rather than asking the sweep's worker to run it (as
     Step 1 of the card body used to) is what makes the result checkable. The worker
@@ -531,7 +532,7 @@ def _task_body() -> str:
         "of these exists:\n"
         f"{instruction_list}\n\n"
         "Audit control plane options, node pools, Workload Identity settings, and running "
-        "workloads. Scale the work out per cluster rather than walking the fleet serially:\n\n"
+        "workloads. The Cluster Agents audit their own clusters; your part is below:\n\n"
         "**Discovery steps run ONCE. If a step does not answer, treat its answer as empty and "
         "move on — do not improvise a different way to get it.** Every step below names the "
         "exact command that answers it. If that command fails, returns nothing, or returns "

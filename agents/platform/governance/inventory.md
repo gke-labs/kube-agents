@@ -76,7 +76,7 @@ it in the raw report beside the Cluster Agents' observability findings, which co
 onboarding gate does all three once the per-cluster cards settle. Waiting is what this card used to
 do, and it has no tool that waits reliably.
 
-Call `kanban_complete` with a short factual `result` (clusters listed, cards filed, clusters you
+Call `kanban_complete` with a short factual `result` (clusters listed, clusters you
 audited) and this `metadata`:
 
 ```json

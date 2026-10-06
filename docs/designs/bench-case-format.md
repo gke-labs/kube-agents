@@ -198,15 +198,15 @@ card-wake replay planted, read before the harness archives it), and `reply_is_si
 (whether the gateway would post the closing message at all, by its own silence rule).
 
 Six read the install under test, all from the same file. `bootstrap_fanout` compares the
-cards the onboarding discovery sweep filed, read from the agent pod's board, against the
+cluster cards filed for the onboarding discovery sweep, read from the agent pod's board, against the
 Cluster Agent profiles on its disk. Its `require` is `one_card_per_cluster_agent` (exactly
 one card per ready profile with a cluster identity, keyed and assigned to it, and no cluster
 card for anything else).
 
 `bootstrap_handoff` reads both ends of the sweep's hand-off to the prioritization stage. Its
 `require` is `raw_report_has_findings_block` (the sandbox's own `inventory_findings.py` parses
-`INVENTORY.raw.md` there, and every Cluster Agent card the sweep filed that completed with
-findings has a block line for its cluster) or `ranking_card_filed` (an unarchived card keyed
+`INVENTORY.raw.md` there, and every cluster the writer's own `finding_lines` lists from the
+completed cluster cards has a block line) or `ranking_card_filed` (an unarchived card keyed
 `bootstrap-inventory-prioritize` was filed at or after the sweep).
 
 `bootstrap_findings` reads the shell sandbox of the install under test:

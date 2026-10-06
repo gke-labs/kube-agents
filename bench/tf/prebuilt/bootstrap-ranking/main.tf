@@ -23,8 +23,8 @@
 # if no worker has picked the card up by then or no read of the board has
 # succeeded.
 #
-# The raw report goes on the sandbox because that is where the sweep's worker
-# writes it: a kanban worker's terminal and file tools both run there. Its
+# The raw report goes on the sandbox because that is where the hand-off writes
+# it and where the ranking card's terminal and file tools run. Its
 # owner is set to the data volume's, the user those tools run as.
 #
 # It refuses an install where a person has connected (`.user_aligned`) or
@@ -34,8 +34,8 @@
 # the ranked report this produces is the one onboarding delivers, and arming
 # delivery with a chat bound would post it there. It also refuses one whose
 # gate has not filed its sweep (no `.bootstrap_scan_filed`), because a sweep
-# filed during the run fans out audits beside the planted card and its
-# hand-off files a ranking card of its own.
+# filed during the run gets its audit cards filed beside the planted card and
+# its hand-off files a ranking card of its own.
 # Open `bootstrap-inventory-*` cards are archived before the plant, so an
 # earlier sweep still running cannot do that either; the sweep marker stays,
 # so the gate files no other.

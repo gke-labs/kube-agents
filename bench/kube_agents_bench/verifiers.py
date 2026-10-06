@@ -3146,6 +3146,8 @@ class BootstrapHandoffVerifier(_OnboardingPollVerifier):
                 f"{where}: the sandbox's parser rejects {raw_file} with exit code {read.get('code')}: {errors}{tail}",
                 raw,
             )
+        if board.get("writer_error"):
+            return "error", str(board["writer_error"]), raw
         items = read["items"]
         covered = {i.get("cluster") for i in items}
         # Which clusters the writer lists comes from the writer itself

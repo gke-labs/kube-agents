@@ -62,7 +62,7 @@ READY_FILES = ("profile.yaml", "USER.md")
 # file, sentinel, scan marker, key prefix, the comma-joined ready files, then
 # the reserved profile names.
 _IN_POD_SCRIPT = r"""
-import json, os, sqlite3, sys
+import json, os, re, sqlite3, sys
 
 ROOT, BOARD, SENTINEL, MARKER, PREFIX, READY = sys.argv[1:7]
 RESERVED = set(sys.argv[7:])
@@ -79,10 +79,10 @@ def fail(message):
 
 try:
     with open(os.path.join(ROOT, MARKER)) as fh:
-        marker = dict(line.strip().split("=", 1) for line in fh if "=" in line)
+        ids = [m.group(1) for m in (re.search(r"(?:^|\s)task_id\s*=\s*(\S+)", line) for line in fh) if m]
 except OSError as exc:
     fail("no discovery sweep has been filed: %s" % exc)
-sweep_id = marker.get("task_id", "")
+sweep_id = ids[0] if ids else ""
 if not sweep_id:
     fail("%s names no task_id" % MARKER)
 
@@ -158,7 +158,7 @@ def command() -> str:
 
 
 def read_fanout(shell: Callable[[str, float], str], timeout: float) -> tuple[dict[str, Any] | None, str]:
-    """The sweep, its worker's children and the roster, or ``None`` and why not.
+    """The sweep, the cluster cards filed for it and the roster, or ``None`` and why not.
 
     ``shell`` is ``harness._agent_shell``, a parameter so the tests can run the
     script locally.

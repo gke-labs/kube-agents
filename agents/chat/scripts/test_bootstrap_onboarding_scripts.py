@@ -591,12 +591,12 @@ class ScanGateTest(unittest.TestCase):
         self.assertEqual(bootstrap_scan_gate.INVENTORY_PATH, "/opt/data/INVENTORY.md")
         self.assertIn("/opt/data/INVENTORY.md", bootstrap_scan_gate._task_body())
 
-    def test_body_drives_per_cluster_fan_out_and_leaves_no_cluster_uncovered(self):
-        """The sweep must scale per cluster and must not leave a hole.
+    def test_body_leaves_cluster_agents_to_the_gate_and_audits_the_rest(self):
+        """The sweep must not leave a hole.
 
         Cluster Agents are pinned read-only to one cluster each. Which clusters
-        get one is reconcile's decision, not this body's, so the body delegates
-        every cluster on the roster and audits only what the roster missed.
+        get one is reconcile's decision, and the gate files their cards, so the
+        body audits only what the roster missed.
         """
         body = bootstrap_scan_gate._task_body()
         self.assertIn(bootstrap_scan_gate.RECONCILE_SCRIPT_NAME, body)  # roster first
@@ -607,13 +607,12 @@ class ScanGateTest(unittest.TestCase):
         self.assertNotIn("aggregation card", body)
         self.assertIn("metadata", body)  # structured child results
 
-    def test_step_2_lists_one_exact_call_per_cluster_agent(self):
+    def test_step_2_lists_each_cluster_agent_the_gate_files(self):
         """The gate reads the roster because the sweep's worker cannot (#1872).
 
         The worker's terminal runs in the shell sandbox, which has no `hermes`,
-        and whose /opt/data/profiles is a mirror without any config.yaml. Sent to
-        read the roster there, the worker blocked on 0.6.0; on main it listed the
-        mirror's directories and fanned out from that.
+        and whose /opt/data/profiles is a mirror without any config.yaml: read
+        there, the roster is either an error or the mirror's directories.
         """
         short = self._cluster_agent("proj", "prod", "us-east4")
         # Long enough that profile_name() truncates and hashes it: the key is the
@@ -1025,9 +1024,9 @@ class ScanGateTest(unittest.TestCase):
         # the one path where no Cluster Agent supplies them.
         self.assertIn("Steps 2 to 4 of the single-cluster audit SOP", body)
 
-    def test_body_propagates_idempotency_keys_to_the_fan_out(self):
-        # The root card is guarded by a marker and a key; the cards it spawns
-        # are guarded only by what these instructions tell the worker to set.
+    def test_cluster_cards_are_keyed_by_profile_name(self):
+        # The gate re-files a missing card every tick until the hand-off; the
+        # key is what keeps a repeat from duplicating one.
         name = self._cluster_agent("proj", "prod", "us-east4")
         keys = [a["key"] for a in bootstrap_scan_gate.cluster_agents()]
         self.assertEqual(keys, [f"{bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX}{name}"])

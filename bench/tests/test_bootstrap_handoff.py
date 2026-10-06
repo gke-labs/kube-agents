@@ -273,7 +273,25 @@ def test_a_writer_the_agent_pod_cannot_import_is_an_error(install, monkeypatch: 
     install(RAW_WITHOUT_BLOCK + _block(METADATA))
     result = _verify("raw_report_has_findings_block")
     assert result.status == "error", result.reason
-    assert "bootstrap_handoff cannot be imported" in result.reason
+    assert "bootstrap_handoff from" in result.reason
+
+
+def test_an_image_without_the_writer_still_grades(install, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # An image from before the hand-off: no module, no raw file, no ranking card.
+    monkeypatch.setattr(onboarding, "HANDOFF_MODULE_DIR", str(tmp_path / "no-scripts"))
+    install(None)
+    raw = _verify("raw_report_has_findings_block")
+    assert raw.status == "fail", raw.reason
+    assert "there is no" in raw.reason
+    ranking = _verify("ranking_card_filed")
+    assert ranking.status == "fail", ranking.reason
+
+
+def test_a_marker_written_by_hand_names_the_sweep(install) -> None:
+    install(RAW_WITHOUT_BLOCK, extra=[_ranking_card()])
+    (Path(onboarding.DATA_ROOT) / discovery.SCAN_MARKER).write_text(f"  task_id = {SWEEP}\nfiled_at={SWEEP_AT}\n")
+    result = _verify("ranking_card_filed")
+    assert result.status == "pass", result.reason
 
 
 def test_a_finding_the_writer_does_not_list_needs_no_line(install) -> None:
@@ -395,11 +413,11 @@ def test_the_stack_waits_for_the_key_the_reader_checks() -> None:
     assert re.search(rf'^\s*prioritize_key\s*=\s*"{onboarding.PRIORITIZE_KEY}"\s*$', main_tf, re.MULTILINE)
 
 
-def test_the_case_runs_the_stack_in_handoff_mode() -> None:
+def test_the_case_runs_the_hand_off_stack() -> None:
     case = yaml.safe_load(TASK.read_text().split("\n---\n", 1)[1])
     infra = case["infrastructure"]
     assert infra["stack"] == "prebuilt/bootstrap-discovery"
-    assert infra["variables"] == {"wait_for": "handoff"}
+    assert "variables" not in infra
     checks = {e["name"]: e["check"] for e in case["verification_spec"]}
     assert checks["raw-report-has-findings-block"] == {"type": "bootstrap_handoff", "require": "raw_report_has_findings_block"}
     assert checks["ranking-card-keyed"] == {"type": "bootstrap_handoff", "require": "ranking_card_filed"}

@@ -8,7 +8,7 @@ Agent, waits for those cards and the sweep to settle, writes
 receives. The sweep's worker only lists the fleet and audits any cluster with
 no Cluster Agent.
 
-It is code rather than SOP text because each of the three steps is mechanical
+It is code rather than SOP text because each of these steps is mechanical
 and the worker could not do them reliably: it has no tool that waits
 (``execute_code`` is blocked in single-query mode, and ``sleep`` in the shell
 sandbox returns early, #1981), so it closed or blocked its card over running
@@ -49,7 +49,7 @@ CLUSTER_AUDIT_INSTRUCTIONS_PATHS = (
 )
 
 HANDOFF_MARKER = ".bootstrap_handoff_filed"
-MARKER_FIELD = re.compile(r"^(\w+)=(\S*)$")
+MARKER_FIELD = re.compile(r"^(\w+)=(\S+)$")
 MARKER_LINE = re.compile(r"^\s*(\w+)\s*=\s*(\S+)\s*$")
 BOARD_FILE = "kanban.db"
 SQLITE_BUSY_TIMEOUT_SECONDS = 10
@@ -65,6 +65,8 @@ TRIAGE = "triage"
 FAILED = "failed"
 CANCELLED = "cancelled"
 SETTLED = (DONE, BLOCKED, TRIAGE, FAILED, CANCELLED)
+# A blocked sweep is not finished: unblocked, it may still list the fleet.
+SWEEP_FINISHED = (DONE, FAILED, CANCELLED)
 ARCHIVED = "archived"
 # How long after the sweep was filed the hand-off stops waiting for unsettled
 # cards and writes what it has, naming the rest as gaps. Seven clusters on two
@@ -180,7 +182,7 @@ def read_board(board: Path, sweep_id: str) -> dict | None:
             _log(f"sweep card {sweep_id} is not on the board")
             return None
         status, created_at = row
-        sweep = {"id": sweep_id, "status": status, "metadata": _metadata(conn, sweep_id),
+        sweep = {"id": sweep_id, "status": status, "created_at": created_at, "metadata": _metadata(conn, sweep_id),
                  "block_reason": _block_reason(conn, sweep_id) if status == BLOCKED else ""}
         clusters = []
         archived = 0
@@ -199,7 +201,17 @@ def read_board(board: Path, sweep_id: str) -> dict | None:
                 "metadata": _metadata(conn, tid) if cstatus == DONE else {},
                 "block_reason": _block_reason(conn, tid) if cstatus in (BLOCKED, TRIAGE) else "",
             })
-        return {"sweep": sweep, "clusters": clusters, "archived_clusters": archived, "archived_keys": archived_keys}
+        # Earlier runs' open onboarding cards: the board answers a create under
+        # one of these keys with that old card instead of filing a new one.
+        stale = {
+            key: tid for tid, key in conn.execute(
+                "SELECT id, idempotency_key FROM tasks WHERE (idempotency_key LIKE ? OR idempotency_key = ?) "
+                "AND created_at < ? AND status != ?",
+                (CLUSTER_KEY_PREFIX + "%", PRIORITIZE_KEY, created_at, ARCHIVED),
+            ).fetchall()
+        }
+        return {"sweep": sweep, "clusters": clusters, "archived_clusters": archived, "archived_keys": archived_keys,
+                "stale_keys": stale}
     except sqlite3.Error as e:
         _log(f"cannot read the board: {e}")
         return None
@@ -212,9 +224,10 @@ def settled(state: dict) -> bool:
 
     A blocked sweep is not settled: it may still list the fleet or audit a
     cluster with no Cluster Agent once unblocked. The deadline hands off what
-    there is, which leaves a person time to unblock it first.
+    there is, which leaves a person time to unblock it first. A failed or
+    cancelled sweep will not, so it settles.
     """
-    return state["sweep"]["status"] == DONE and all(c["status"] in SETTLED for c in state["clusters"])
+    return state["sweep"]["status"] in SWEEP_FINISHED and all(c["status"] in SETTLED for c in state["clusters"])
 
 
 def deadline(state: dict) -> int:
@@ -368,6 +381,8 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
         gaps.append(f"sweep {sweep['id']}: {_cell(gap)}")
     if sweep["status"] == BLOCKED:
         gaps.append(f"sweep {sweep['id']} blocked — {_cell(sweep['block_reason'] or NO_REASON)}")
+    elif sweep["status"] in (FAILED, CANCELLED):
+        gaps.append(f"sweep {sweep['id']} {sweep['status']}: the fleet list and any agent-less audits are missing")
     elif sweep["status"] != DONE:
         gaps.append(
             f"sweep {sweep['id']} was still {_cell(sweep['status'])}: discovery did not finish, so clusters "
@@ -387,7 +402,13 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
     if not fleet:
         gaps.append("the sweep reported no fleet list, so clusters with no Cluster Agent may be missing")
     for agent in state.get("unfiled", []):
-        gaps.append(f"{_cell(agent['title'])}: the gate could not file this Cluster Agent's card")
+        if agent.get("stale_card"):
+            gaps.append(
+                f"{_cell(agent['title'])}: an earlier run's card {agent['stale_card']} holds this Cluster "
+                "Agent's key and could not be archived, so no card was filed for this sweep"
+            )
+        else:
+            gaps.append(f"{_cell(agent['title'])}: the gate could not file this Cluster Agent's card")
     if state.get("archived_clusters"):
         gaps.append(f"{state['archived_clusters']} cluster card(s) were archived before they reported")
     if timed_out:
@@ -565,7 +586,20 @@ def _create(parse_task_id, assignee: str, key: str, title: str, body: str) -> st
     return task_id
 
 
-def file_cluster_cards(state: dict, roster: list, parse_task_id) -> list:
+def _archive(task_id: str) -> bool:
+    """Archive an earlier run's onboarding card so its key can be filed again."""
+    try:
+        from hermes_cli.kanban import run_slash
+
+        run_slash(f"archive {shlex.quote(task_id)}")
+    except Exception as e:  # noqa: BLE001 - retry next tick
+        _log(f"could not archive {task_id}: {e}")
+        return False
+    _log(f"archived {task_id}, an earlier run's card holding an onboarding key")
+    return True
+
+
+def file_cluster_cards(state: dict, roster: list, parse_task_id) -> tuple[int, list]:
     """File a card for every Cluster Agent on the roster that has none for this sweep.
 
     The gate, not the sweep's worker, is the one creator of these cards: asked
@@ -577,9 +611,13 @@ def file_cluster_cards(state: dict, roster: list, parse_task_id) -> list:
     the agents still without a card.
     """
     have = {c["key"] for c in state["clusters"]} | state.get("archived_keys", set())
+    stale = state.get("stale_keys", {})
     filed, unfiled = 0, []
     for agent in roster:
         if agent["key"] in have:
+            continue
+        if agent["key"] in stale and not _archive(stale[agent["key"]]):
+            unfiled.append(dict(agent, stale_card=stale[agent["key"]]))
             continue
         if _create(parse_task_id, agent["name"], agent["key"], agent["title"], _cluster_body(agent)):
             filed += 1
@@ -588,7 +626,10 @@ def file_cluster_cards(state: dict, roster: list, parse_task_id) -> list:
     return filed, unfiled
 
 
-def file_prioritize(parse_task_id) -> str | None:
+def file_prioritize(parse_task_id, stale: dict | None = None) -> str | None:
+    old = (stale or {}).get(PRIORITIZE_KEY)
+    if old and not _archive(old):
+        return None
     return _create(parse_task_id, ASSIGNEE, PRIORITIZE_KEY, PRIORITIZE_TITLE, _prioritize_body())
 
 
@@ -642,7 +683,7 @@ def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, roster=None, now:
         return None
     if not write_raw(data_dir, compose(state, timed_out, now)):
         return None
-    task_id = file_prioritize(parse_task_id)
+    task_id = file_prioritize(parse_task_id, state.get("stale_keys"))
     if not task_id:
         return None
     try:
