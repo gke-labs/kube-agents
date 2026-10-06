@@ -289,6 +289,8 @@ class AssessTest(unittest.TestCase):
             },
             "error": "2 project(s) not reconciled: kube-agents-evals-3, kube-agents-evals-4",
         }
+        artifact["visited"] = 6
+        artifact["mapped"] = 6
         lines = periodics.reconcile_detail(artifact)
         self.assertEqual(lines[0], "kube-agents-evals-3: refused (1 refused: delete x); next: a code change, or an entry in bench/tf/fleet/reconcile-allow.json")
         self.assertEqual(lines[1], "kube-agents-evals-4: failed (tofu apply exited 1: boom); next: nothing by hand, the next run retries it")
@@ -302,9 +304,15 @@ class AssessTest(unittest.TestCase):
     def test_an_allowlist_entry_some_project_still_needed_is_not_called_unused(self):
         artifact = {"outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}, "p2": {"outcome": "applied", "detail": "", "allowlist_unused": []}}}
         self.assertEqual(periodics.reconcile_detail(artifact), [])
-        # A project whose plan was never read carries no verdict and does not veto the others'.
-        artifact = {"outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}, "p2": {"outcome": "busy", "detail": ""}}}
-        self.assertEqual(periodics.reconcile_detail(artifact), ["allowlist: 1 entry no plan needed, remove it: a"])
+        # A project whose plan was never read carries no verdict, and a run
+        # that did not reach every mapped project says nothing about the
+        # allowlist: the projects it missed are the ones that may still need
+        # the entry.
+        artifact = {"visited": 1, "mapped": 2, "outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}, "p2": {"outcome": "busy", "detail": ""}}}
+        self.assertEqual(periodics.reconcile_detail(artifact), [])
+        artifact = {"visited": 2, "mapped": 2, "outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}, "p2": {"outcome": "failed", "detail": "init"}}}
+        self.assertEqual(periodics.reconcile_detail(artifact)[-1], "allowlist: 1 entry no plan needed, remove it: a")
+        self.assertEqual(periodics.reconcile_detail({"outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}}}), [], "no visited/mapped counts, no claim")
 
     def test_runs_carry_whether_the_build_was_a_dry_run(self):
         reading = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"dry_run": True, "summary": {"planned": 3}})

@@ -1687,7 +1687,7 @@ class FixtureDrift(RunHarness):
                 (
                     "🟡 *Smoke gate: flaky* — seeded fixture crashloop-workload out of designed state on 3 pool projects since 9:00 AM ET;"
                     " a red on a case that depends on it from a run that leased one of those projects is the fixture, not the code. Retest once the fleet is re-applied."
-                    " Fleet owner: re-apply bench/tf/fleet in the projects named. Tracking #1300.\n"
+                    " The daily reconcile re-applies bench/tf/fleet in the projects named at 08:30 UTC; a hand run of hack/fleet_reconcile.py --project from main does it sooner. Tracking #1300.\n"
                     f"{post_health.DASHBOARD_URL}#since=2026-09-14T13:00:00Z&view=gate"
                 )
             ],
@@ -1783,6 +1783,16 @@ class FixtureDrift(RunHarness):
         self.assertEqual(
             lines({post: {"build": "7", "finished_at": "2026-09-14T13:10:00+00:00", "passed": False, "summary": "1 refused, 34 converged", "dry_run": False}, "ci-kube-agents-pull-sweep": {"build": "1", "finished_at": "2026-09-14T13:10:00+00:00", "passed": True, "summary": "x"}}),
             ["🔁 *Seeded-fleet reconcile:* on-merge run at 9:10 AM ET (build 7) failed: 1 refused, 34 converged."],
+        )
+        # The postsubmit has no cadence: a run older than a day carries its
+        # day, so last month's merge does not read as this morning's run.
+        self.assertEqual(
+            lines({post: {"build": "7", "finished_at": "2026-09-01T13:10:00+00:00", "passed": True, "summary": "35 visited: 35 converged", "dry_run": False}}),
+            ["🔁 *Seeded-fleet reconcile:* on-merge run on Tue Sep 1 9:10 AM ET (build 7) passed: 35 visited: 35 converged."],
+        )
+        self.assertEqual(
+            lines({daily: {"build": "9", "finished_at": None, "passed": True, "summary": "nothing to do", "dry_run": False}}),
+            ["🔁 *Seeded-fleet reconcile:* daily run (build 9, finish time unknown) passed: nothing to do."],
         )
 
     def test_a_blind_scan_is_said_once_each_way_and_is_never_a_change(self):

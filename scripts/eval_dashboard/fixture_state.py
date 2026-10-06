@@ -465,12 +465,13 @@ def drift_detail(document: dict | None, project: str, role: str) -> list[str]:
 
 
 def checked_projects(document: dict | None) -> int:
-    """Projects on which at least one role was read (healthy or drifted)."""
+    """Projects on which at least one role was read (healthy or drifted) or
+    seen absent: the runner reached the project and said what is there."""
     projects = (document or {}).get(KEY_PROJECTS) if isinstance(document, dict) else None
     count = 0
     for entry in (projects or {}).values() if isinstance(projects, dict) else []:
         roles = (entry or {}).get(KEY_ROLES) if isinstance(entry, dict) else None
-        if any(isinstance(v, dict) and v.get(KEY_STATE) in (ROLE_HEALTHY, ROLE_DRIFTED) for v in (roles or {}).values()):
+        if any(isinstance(v, dict) and v.get(KEY_STATE) in (ROLE_HEALTHY, ROLE_DRIFTED, ROLE_ABSENT) for v in (roles or {}).values()):
             count += 1
     return count
 
@@ -487,6 +488,13 @@ def not_checked_reason(document: dict | None) -> str | None:
         for verdict in (roles or {}).values():
             if isinstance(verdict, dict) and verdict.get(KEY_STATE) == ROLE_NOT_CHECKED and verdict.get(KEY_DETAIL):
                 reasons[str(verdict[KEY_DETAIL][0])] += 1
+    if not reasons:
+        # Nothing failed to read: the commonest absence explains the scan instead.
+        for entry in (projects or {}).values() if isinstance(projects, dict) else []:
+            roles = (entry or {}).get(KEY_ROLES) if isinstance(entry, dict) else None
+            for verdict in (roles or {}).values():
+                if isinstance(verdict, dict) and verdict.get(KEY_STATE) == ROLE_ABSENT and verdict.get(KEY_DETAIL):
+                    reasons[str(verdict[KEY_DETAIL][0])] += 1
     return reasons.most_common(1)[0][0] if reasons else None
 
 

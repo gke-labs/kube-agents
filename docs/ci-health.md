@@ -641,7 +641,7 @@ warning that the fixture is not there (never planted, or no cluster for its
 slot), a rollout the next reconcile finishes; for one not checked, why (the reader
 could not be impersonated, the runner could not list or reach the cluster, its
 read failed). `summary` counts projects, projects checked (at least one role
-read), projects with drift, projects with an absent role, and roles by state. `previous` is the prior
+read, or seen absent), projects with drift, projects with an absent role, and roles by state. `previous` is the prior
 document's `scanned_at` and its `{project: [drifted roles]}` map, carried so
 the adjudicator can ask "drifted last scan too?" from one file.
 

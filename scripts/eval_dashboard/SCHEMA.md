@@ -970,8 +970,9 @@ place, absence, does, effect, runbook}`. `detail` (on `FAILED` only)
 is the report's lines, the projects capped at five (then `and N more`) and the
 run's lines after the cap: for the reconcile the
 projects it refused, failed or was interrupted in, each with its one next
-step, then how many it did not reach and why, then the allowlist entries no
-plan needed, then the run's own `error` line; for the sweep the projects whose sweep failed with GitHub's answer, then
+step, then how many it did not reach and why, then (only for a run whose
+`visited` reached `mapped`) the allowlist entries no plan needed, then the
+run's own `error` line; for the sweep the projects whose sweep failed with GitHub's answer, then
 the writes left for the next run under its budget, then the projects held and
 released unswept after the run stopped, then why the run ended early or its
 `error` line; either says when the report was not a JSON object.
@@ -983,12 +984,13 @@ the link the message is built from, from `WATCHED`. The reconcile's report,
 `fleet-reconcile.json` from `hack/fleet_reconcile.py --report`, is
 `{schema_version, mode, dry_run, commit, fleet_tree, build, job, workers,
 budget_seconds, ceiling_seconds, main_ref, main_check_error, started_at,
-finished_at, exit, exit_code, error, visited, outcomes{project: {outcome,
-detail, started_at, finished_at, allowlist_unused[]?}}, summary}` (`visited`
-counts the projects the run held; `allowlist_unused` is present only when the
-plan was read; `main_check_error` is set when the moved-check could not read
-main; outcomes are applied, converged, unchanged, planned, busy, refused,
-failed, interrupted, not_reached); the sweep's,
+finished_at, exit, exit_code, error, mapped, visited, outcomes{project:
+{outcome, detail, started_at?, finished_at?, allowlist_unused[]?}}, summary}`
+(`mapped` is how many projects the run set out to visit and `visited` how
+many it held; a held project carries its times, and `allowlist_unused` only
+when its plan was read; `main_check_error` is set when the moved-check could
+not read main; outcomes are applied, converged, unchanged, planned, busy,
+refused, failed, interrupted, not_reached); the sweep's,
 `pull-sweep.json` from `hack/ci_sweep_agent_pulls.py --report`, is
 `{schema_version, mode, dry_run, started_at, finished_at, exit, exit_code,
 error, ended_early, projects, closed, failed, unmapped[], skipped[],

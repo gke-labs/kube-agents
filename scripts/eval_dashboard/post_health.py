@@ -228,7 +228,9 @@ STORM_COOLDOWN = timedelta(minutes=30)
 # Where the fleet scan's grant and semantics are written down, for the
 # message that says the scan is blind.
 FIXTURE_SCAN_DOC = "docs/ci-health.md"
-FIXTURE_RECONCILE_HINT = "Fleet owner: re-apply bench/tf/fleet in the projects named."
+FIXTURE_RECONCILE_HINT = "The daily reconcile re-applies bench/tf/fleet in the projects named at 08:30 UTC; a hand run of hack/fleet_reconcile.py --project from main does it sooner."
+# A reconcile run older than this is printed with its date in the digest.
+RECONCILE_RUN_DATED_AFTER = timedelta(days=1)
 # The pool-state scan's message: the scan's document carries the command per
 # project for every named finding, and what was observed for a check that
 # failed without naming one; the bot's own issue does too when it filed one
@@ -1060,25 +1062,33 @@ def render_periodic_clear(health: dict, prev: dict | None) -> str:
     return "\n".join(lines)
 
 
-def reconcile_run_lines(health: dict) -> list[str]:
+def reconcile_run_lines(health: dict, now: datetime | None = None) -> list[str]:
     """One line per reconcile job's latest finished run: when, which build,
     passed or failed, dry run or not, and what it did. The team's answer to
-    "did the fleet get applied", whether or not anything is wrong."""
+    "did the fleet get applied", whether or not anything is wrong. A run
+    older than a day carries its date: the postsubmit has no cadence, and
+    last month's merge must not read as this morning's run."""
     lines = []
     for job, run in sorted((health.get("periodics_runs") or {}).items()):
         words = periodics.RECONCILE_RUN_WORDS.get(job)
         if not words or not isinstance(run, dict):
             continue
-        when = clock(parse_iso(run.get("finished_at")))
+        finished = parse_iso(run.get("finished_at"))
+        if finished is None:
+            when = f"{words} (build {run.get('build')}, finish time unknown)"
+        elif now is not None and now - finished > RECONCILE_RUN_DATED_AFTER:
+            when = f"{words} on {finished.astimezone(LOCAL_TZ).strftime('%a %b %-d')} {clock(finished)} (build {run.get('build')})"
+        else:
+            when = f"{words} at {clock(finished)} (build {run.get('build')})"
         verdict = "passed" if run.get("passed") else "failed"
         dry = " (a dry run: nothing was applied)" if run.get("dry_run") else ""
         did = f": {run['summary']}" if run.get("summary") else ""
-        lines.append(f"🔁 *Seeded-fleet reconcile:* {words} at {when} (build {run.get('build')}) {verdict}{dry}{did}.")
+        lines.append(f"🔁 *Seeded-fleet reconcile:* {when} {verdict}{dry}{did}.")
     return lines
 
 
-def periodic_digest_lines(health: dict) -> list[str]:
-    lines = reconcile_run_lines(health)
+def periodic_digest_lines(health: dict, now: datetime | None = None) -> list[str]:
+    lines = reconcile_run_lines(health, now)
     for job, note in sorted((health.get("periodics") or {}).items()):
         words = _job_words(job, note)
         if note.get("verdict") == periodics.VERDICT_STALE:
@@ -1317,7 +1327,7 @@ def render_digest(health: dict, now: datetime, data: dict | None = None) -> str:
     pool_projects = pool_state_digest_line(health)
     if pool_projects:
         lines.append(pool_projects)
-    lines.extend(periodic_digest_lines(health))
+    lines.extend(periodic_digest_lines(health, now))
     lines.append(dashboard_link(DASHBOARD_VIEW_AGENT, health.get("failing_cases") or [], parse_iso(health.get("since"))))
     return "\n".join(lines)
 

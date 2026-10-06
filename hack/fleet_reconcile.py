@@ -39,6 +39,7 @@ import collections
 import json
 import os
 import pathlib
+import re
 import signal
 import subprocess
 import sys
@@ -87,6 +88,10 @@ ALLOWLIST_FILE = FLEET_DIR / "reconcile-allow.json"
 ALLOW_KEY_ADDRESS = "address"
 ALLOW_KEY_WHY = "why"
 ALLOW_KEY_STANDING = "standing"
+ALLOW_KEYS = frozenset({ALLOW_KEY_ADDRESS, ALLOW_KEY_WHY, ALLOW_KEY_STANDING})
+# A resource address as `tofu show -json` prints it: optional module path,
+# type, name, optional index. Anything else can never match a plan.
+ALLOW_ADDRESS_RE = re.compile(r"^(module\.[A-Za-z0-9_-]+(\[[^\]]+\])?\.)*[a-z][a-z0-9_]*\.[A-Za-z_][A-Za-z0-9_-]*(\[[^\]]+\])?$")
 AllowEntry = collections.namedtuple("AllowEntry", "address why standing")
 # seeded-b's maintenance exclusion is re-stamped from `timestamp()` on every
 # plan (bench/tf/fleet/main.tf), so a converged project still plans one
@@ -184,6 +189,9 @@ REASON_NOT_REACHED_BUDGET = "not started: %ds left in the run's budget, under th
 REASON_NOT_REACHED_MOVED = "not started: bench/tf/fleet on %s is now %s and this run applies %s; the next run takes it"
 REASON_NOT_REACHED_BUSY = "not free in Boskos before the run's budget ran out; the next run takes it"
 REASON_NOT_REACHED_TERMINATED = "not started: the run was terminated; the next run takes it"
+REASON_NOT_REACHED_RUN_ERROR = "not started: the run stopped on an error (%s); the next run takes it"
+REASON_INTERRUPTED_BEFORE = "terminated (%s) before tofu %s started; nothing was changed and nothing is locked"
+REASON_RUN_ERROR = "the run hit an error at this project: %s"
 REASON_RESTAMP = "re-stamp of seeded-b's maintenance exclusion only"
 WARNING_MARKER = "applied.json not written: %s"
 
@@ -315,7 +323,21 @@ def _tail(text):
     return text[-OUTPUT_TAIL_CHARS:] if text else "no output"
 
 
+class TerminatedBeforeTofu(boskos_pool.Terminated):
+    """A termination landed before this step's tofu was started: no child
+    ran, so the project is interrupted with nothing to unlock."""
+
+    def __init__(self, step):
+        super().__init__("a termination landed")
+        self.step = step
+
+
 def _tofu(args, runner, deadline, ok=(0,)):
+    # A worker between two steps, or just out of its acquire, when the
+    # termination landed: the forward reached only the children alive then,
+    # so the next child is simply not started.
+    if terminating():
+        raise TerminatedBeforeTofu(args[0])
     timeout = max(1, deadline - clock())
     result = runner([TOFU] + list(args), cwd=str(FLEET_DIR), timeout=timeout, capture_output=True, text=True)
     if result.returncode not in ok:
@@ -447,7 +469,18 @@ def load_allowlist(path):
     for item in document:
         if not isinstance(item, dict) or not isinstance(item.get(ALLOW_KEY_ADDRESS), str) or not item[ALLOW_KEY_ADDRESS] or not isinstance(item.get(ALLOW_KEY_WHY), str) or not item[ALLOW_KEY_WHY]:
             raise ReconcileError("%s: every entry needs a non-empty %r and %r: %r" % (path, ALLOW_KEY_ADDRESS, ALLOW_KEY_WHY, item))
-        entries.append(AllowEntry(item[ALLOW_KEY_ADDRESS], item[ALLOW_KEY_WHY], bool(item.get(ALLOW_KEY_STANDING, False))))
+        unknown = set(item) - ALLOW_KEYS
+        if unknown:
+            raise ReconcileError("%s: entry %r has keys this script does not read: %s" % (path, item[ALLOW_KEY_ADDRESS], ", ".join(sorted(unknown))))
+        if not ALLOW_ADDRESS_RE.match(item[ALLOW_KEY_ADDRESS]):
+            raise ReconcileError("%s: %r is not a resource address (type.name, optionally module-prefixed or indexed)" % (path, item[ALLOW_KEY_ADDRESS]))
+        standing = item.get(ALLOW_KEY_STANDING, False)
+        # A JSON boolean only: a string "false" is true, and a standing entry
+        # is never reported unused, so the typo would make a revert's entry
+        # silently permanent.
+        if not isinstance(standing, bool):
+            raise ReconcileError("%s: %r's %r must be true or false, not %r" % (path, item[ALLOW_KEY_ADDRESS], ALLOW_KEY_STANDING, standing))
+        entries.append(AllowEntry(item[ALLOW_KEY_ADDRESS], item[ALLOW_KEY_WHY], standing))
     return entries
 
 
@@ -612,8 +645,18 @@ class Run:
         # The last failure of the main-moved check, for the report: a run
         # that could not read main did not prove it had not moved.
         self.main_check_error = None
+        # How many projects the run set out to visit, for the report: a claim
+        # about the whole pool (an allowlist entry nobody needs) holds only
+        # when visited reaches this.
+        self.mapped = None
         self._stop = None
         self._last_main_check = None
+
+    def stop(self, reason):
+        """Stop starting projects for `reason` (sticky; the first one wins)."""
+        with self.lock:
+            if not self._stop:
+                self._stop = reason
 
     def room(self):
         """Seconds left in the budget; None when unbounded."""
@@ -703,6 +746,11 @@ def _record(project, outcomes, runner, dry_run, run=None):
     run.mark(project, started_at=_iso(time.time()))
     try:
         outcome = reconcile_project(project, runner=runner, dry_run=dry_run, timeout=run.ceiling, allow=run.allow, extras=extras)
+    except TerminatedBeforeTofu as exc:
+        outcomes[project] = (OUTCOME_INTERRUPTED, REASON_INTERRUPTED_BEFORE % (exc, exc.step))
+        run.mark(project, finished_at=_iso(time.time()))
+        _line(project, outcomes[project])
+        raise
     except boskos_pool.Terminated as exc:
         outcomes[project] = (OUTCOME_INTERRUPTED, REASON_INTERRUPTED % exc)
         run.mark(project, finished_at=_iso(time.time()))
@@ -754,23 +802,35 @@ def reconcile_named(projects, server, owner, lease=True, runner=tofu_runner, dry
     known = pool_projects() if known is None and lease else known
     outcomes = {} if outcomes is None else outcomes
     run = run or Run()
+    run.mapped = len(projects)
+
+    def not_reached(rest, reason):
+        for project in rest:
+            if project not in outcomes:
+                outcomes[project] = (OUTCOME_NOT_REACHED, reason)
+                _line(project, outcomes[project])
+
     for index, project in enumerate(projects):
         stop = run.stop_reason()
         if stop:
-            for rest in projects[index:]:
-                outcomes[rest] = (OUTCOME_NOT_REACHED, stop)
-                _line(rest, outcomes[rest])
+            not_reached(projects[index:], stop)
             break
-        if not lease:
-            _record(project, outcomes, runner, dry_run, run)
-            continue
-        if project not in known:
-            outcomes[project] = (OUTCOME_FAILED, REASON_UNMAPPED)
-            _line(project, outcomes[project])
-            continue
-        if _hold_named(project, server, owner, runner, dry_run, run, outcomes) is boskos_pool.NOT_ACQUIRED:
-            outcomes[project] = (OUTCOME_BUSY, REASON_BUSY)
-            _line(project, outcomes[project])
+        try:
+            if not lease:
+                _record(project, outcomes, runner, dry_run, run)
+                continue
+            if project not in known:
+                outcomes[project] = (OUTCOME_FAILED, REASON_UNMAPPED)
+                _line(project, outcomes[project])
+                continue
+            if _hold_named(project, server, owner, runner, dry_run, run, outcomes) is boskos_pool.NOT_ACQUIRED:
+                outcomes[project] = (OUTCOME_BUSY, REASON_BUSY)
+                _line(project, outcomes[project])
+        except boskos_pool.Terminated:
+            # The project the signal landed in has its line; the rest are
+            # on the report as not reached, so the summary adds up.
+            not_reached(projects[index + 1 :], REASON_NOT_REACHED_TERMINATED)
+            raise
     return outcomes
 
 
@@ -814,6 +874,7 @@ def reconcile_pool(server, owner, runner=tofu_runner, dry_run=False, known=None,
     known = pool_projects() if known is None else known
     outcomes = {} if outcomes is None else outcomes
     run = run or Run()
+    run.mapped = len(known)
     pending = sorted(known)
 
     def drain(reason, outcome=OUTCOME_NOT_REACHED):
@@ -836,7 +897,20 @@ def reconcile_pool(server, owner, runner=tofu_runner, dry_run=False, known=None,
                     drain(stop)
                     return
                 project = pending.pop(0)
-            if _hold_named(project, server, owner, runner, dry_run, run, outcomes) is not boskos_pool.NOT_ACQUIRED:
+            try:
+                acquired = _hold_named(project, server, owner, runner, dry_run, run, outcomes) is not boskos_pool.NOT_ACQUIRED
+            except boskos_pool.Terminated:
+                raise
+            except Exception as exc:  # noqa: BLE001 -- a Boskos or network fault: on the record, and the run stops
+                # The project is on the report as this run's error, and the
+                # other workers stop leasing under a service that just failed;
+                # the exception itself is raised once they have.
+                if project not in outcomes:
+                    outcomes[project] = (OUTCOME_FAILED, REASON_RUN_ERROR % boskos_pool.describe(exc))
+                    _line(project, outcomes[project])
+                run.stop(REASON_NOT_REACHED_RUN_ERROR % boskos_pool.describe(exc))
+                raise
+            if acquired:
                 busy.clear()
                 continue
             with run.lock:
@@ -855,10 +929,22 @@ def reconcile_pool(server, owner, runner=tofu_runner, dry_run=False, known=None,
             pause(wait)
             busy.clear()
 
-    if run.workers == 1:
-        worker()
-        return outcomes
-    _run_workers(worker, run.workers)
+    try:
+        if run.workers == 1:
+            worker()
+        else:
+            _run_workers(worker, run.workers)
+    except boskos_pool.Terminated:
+        # The single-worker path raises straight out of the hold; the threaded
+        # one may lose the worker that was draining. Either way the projects
+        # never started are on the report before the termination propagates.
+        with run.lock:
+            drain(REASON_NOT_REACHED_TERMINATED)
+        raise
+    except Exception as exc:  # noqa: BLE001 -- re-raised; the report first
+        with run.lock:
+            drain(run.stop_reason() or REASON_NOT_REACHED_RUN_ERROR % boskos_pool.describe(exc))
+        raise
     return outcomes
 
 
@@ -868,29 +954,36 @@ def _run_workers(worker, count):
     release, and raises it on."""
     failures = []
     _TERMINATING.clear()
+    # One flag per worker, set when it has returned its last project. The
+    # waits below are on these, not on Thread.join: on Python 3.12 a join the
+    # termination interrupts marks the thread stopped while it still runs,
+    # and a drain built on join would raise before the holds were released.
+    done = [threading.Event() for _ in range(count)]
 
-    def guarded():
+    def guarded(flag):
         try:
             worker()
         except BaseException as exc:  # noqa: BLE001 -- re-raised in the main thread
             failures.append(exc)
+        finally:
+            flag.set()
 
-    threads = [threading.Thread(target=guarded, name="fleet-reconcile-%d" % i, daemon=True) for i in range(count)]
+    threads = [threading.Thread(target=guarded, args=(flag,), name="fleet-reconcile-%d" % i, daemon=True) for i, flag in enumerate(done)]
     for thread in threads:
         thread.start()
     try:
-        while any(thread.is_alive() for thread in threads):
-            for thread in threads:
-                thread.join(WORKER_JOIN_STEP_SECONDS)
+        while not all(flag.is_set() for flag in done):
+            for flag in done:
+                flag.wait(WORKER_JOIN_STEP_SECONDS)
     except boskos_pool.Terminated:
         _TERMINATING.set()
         _children_signal()
         deadline = clock() + WORKER_DRAIN_SECONDS
-        for thread in threads:
-            thread.join(max(0, deadline - clock()))
+        for flag in done:
+            flag.wait(max(0, deadline - clock()))
         _children_signal(kill=True)
-        for thread in threads:
-            thread.join(WORKER_JOIN_STEP_SECONDS)
+        for flag in done:
+            flag.wait(WORKER_JOIN_STEP_SECONDS)
         raise
     if failures:
         raise failures[0]
@@ -942,6 +1035,10 @@ def main(argv=None):
         parser.error("--no-lease needs --project")
     if args.workers < 1:
         parser.error("--workers must be at least 1")
+    if args.stop_when_moved is not None:
+        remote, _, branch = args.stop_when_moved.partition("/")
+        if not remote or not branch:
+            parser.error("--stop-when-moved takes REMOTE/BRANCH, for example origin/main")
     for sig in TERMINATION_SIGNALS:
         signal.signal(sig, boskos_pool.terminate)
     outcomes = {}
@@ -1024,6 +1121,7 @@ def write_report(path, args, outcomes, code, error, started, run=None):
         "exit": EXIT_NAMES.get(code, EXIT_NAME_ERROR),
         "exit_code": code,
         "error": error,
+        "mapped": run.mapped if run else None,
         "visited": sum(1 for o, _ in outcomes.values() if o in VISITED_OUTCOMES),
         "outcomes": {
             project: dict({"outcome": outcome, "detail": detail}, **extras.get(project, {}))

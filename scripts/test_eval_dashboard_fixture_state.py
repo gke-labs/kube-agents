@@ -463,6 +463,15 @@ class NotChecked(ScanHarness):
         self.assertEqual((fixture_state.absent_units(doc), fixture_state.absent_projects(doc), fixture_state.unread_units(doc)), (1, 1, 0))
         self.assertEqual(doc["summary"]["absent_projects"], 1)
 
+    def test_a_project_whose_fleet_is_wholly_absent_was_still_checked(self):
+        # The runner ran and found no seeded cluster: that is an observation
+        # about the fleet (not applied there), not a read that failed, so the
+        # project counts as checked and a pool of such projects is not "blind".
+        doc = {"projects": {"p1": {"roles": {r: {"state": "absent", "detail": ["project p1 carries no clusters labelled environment=seeded,managed-by=kube-agents-seeded-fleet. Apply bench/tf/fleet/ there"]} for r in ("a", "b")}}}}
+        self.assertEqual(fixture_state.checked_projects(doc), 1)
+        self.assertEqual((fixture_state.absent_units(doc), fixture_state.absent_projects(doc), fixture_state.unread_units(doc)), (2, 1, 0))
+        self.assertIn("carries no clusters labelled", fixture_state.not_checked_reason(doc) or "")
+
     def test_a_slot_with_no_cluster_is_absent_and_a_credential_failure_is_not_checked(self):
         warnings = ["project p has no labelled seeded cluster for slot 'd' (a name ending in '-d'), so every check naming a role on it will report status=error."]
         self.assertEqual(fixture_state.unpublished_state("zonal-skew-volume", "d", warnings), ("absent", warnings[0]))

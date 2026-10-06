@@ -108,6 +108,7 @@ RECONCILE_OUTCOME_NOT_REACHED = "not_reached"
 # The report's outcome names as the message says them.
 RECONCILE_OUTCOME_WORDS = {RECONCILE_OUTCOME_NOT_REACHED: "not reached"}
 REPORT_KEY_VISITED = "visited"
+REPORT_KEY_MAPPED = "mapped"
 REPORT_KEY_ALLOWLIST_UNUSED = "allowlist_unused"
 # The Prow job names (oss-test-infra, kube-agents-periodics.yaml and
 # kube-agents-postsubmits.yaml); a rename there is a rename here.
@@ -410,7 +411,10 @@ def reconcile_detail(artifact: dict | None) -> list[str]:
     not_reached = [e for e in entries.values() if e.get(REPORT_KEY_OUTCOME) == RECONCILE_OUTCOME_NOT_REACHED]
     if not_reached:
         lines.append(f"{len(not_reached)} not reached ({not_reached[0].get(REPORT_KEY_DETAIL) or 'no detail'})")
-    unused = allowlist_unused(entries)
+    # Said only about a run that reached every mapped project: the projects
+    # a partial run missed are the ones that may still need the entry.
+    visited, mapped = artifact.get(REPORT_KEY_VISITED), artifact.get(REPORT_KEY_MAPPED)
+    unused = allowlist_unused(entries) if isinstance(visited, int) and isinstance(mapped, int) and visited == mapped else []
     if unused:
         lines.append(f"allowlist: {len(unused)} {'entry' if len(unused) == 1 else 'entries'} no plan needed, remove {'it' if len(unused) == 1 else 'them'}: {', '.join(unused)}")
     if artifact.get(REPORT_KEY_ERROR):
@@ -512,8 +516,9 @@ def run_summary(periodic: Periodic, artifact: dict | None, passed: bool) -> str 
 
 
 def runs(readings: dict[str, dict], watched=WATCHED) -> dict[str, dict]:
-    """What each read job's latest finished build did, for the recovery message:
-    `{job: {build, finished_at, passed, summary}}`."""
+    """What each read job's latest finished build did, for the recovery message
+    and the digest's run line: `{job: {build, finished_at, passed, summary,
+    dry_run}}`."""
     out = {}
     for periodic in watched:
         reading = readings.get(periodic.job)
