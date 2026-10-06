@@ -52,9 +52,9 @@ const (
 	// map, and every value must carry injectEvalPrincipalPrefix. Same
 	// construction as the inject door (Gateway.resolveA2APrincipal): the
 	// lookup cannot reach an unprefixed entry, and a value outside the eval
-	// namespace is refused rather than honoured. When the developer
-	// identity class lands (ID tokens), it arrives as a second resolver
-	// beside this one, not as a loosening of it.
+	// namespace is refused rather than honoured. The developer identity
+	// class (a2adoor_google.go) is a second resolver beside this one, not a
+	// loosening of it.
 	a2aPrincipalPrefix = "a2a:"
 
 	// a2aKeyPrefix marks every conversation key this door handles. The mux
@@ -273,7 +273,10 @@ type A2ADoor struct {
 	// google verifies the developer class's Google access tokens; nil when
 	// the class is not configured, and then only the static token is
 	// accepted.
-	google           *googleTokenVerifier
+	google *googleTokenVerifier
+	// googleAllowed is the class's allowlist, keyed lower-cased; empty
+	// admits nobody.
+	googleAllowed    map[string]bool
 	publicURL        string
 	publicURLSet     bool
 	agentName        string
@@ -334,7 +337,11 @@ type A2ADoorOptions struct {
 	// not the static token is checked as a Google access token issued for
 	// this client id. Empty leaves the class off.
 	GoogleClientID string
-	Logger         *slog.Logger
+	// GoogleAllowedUsers is the class's allowlist (A2A_DOOR_ALLOWED_USERS):
+	// a verified email off it is refused before the door holds anything for
+	// the caller. Empty admits nobody.
+	GoogleAllowedUsers []string
+	Logger             *slog.Logger
 }
 
 // NewA2ADoor builds the door. The token is required here as well as in
@@ -379,6 +386,7 @@ func NewA2ADoor(listen, token string, o A2ADoorOptions) (*A2ADoor, error) {
 		taskDeadline:     deadline,
 		log:              log,
 		google:           googleVerifierFor(o.GoogleClientID),
+		googleAllowed:    googleAllowlist(o.GoogleAllowedUsers),
 		conversations:    map[string]*a2aConversation{},
 		tasks:            map[string]*a2aTask{},
 		submissions:      map[string]*a2aOutcome{},
@@ -419,8 +427,13 @@ func (d *A2ADoor) Run(ctx context.Context, handler func(InboundMessage)) error {
 	}
 	d.log.Warn("the A2A door is armed: a bearer-token holder that reaches this listener can "+
 		"submit tasks as a mapped eval principal and read the tasks it submitted. "+
-		"Dev and eval installs only until the identity classes land.",
+		"Dev and eval installs only until the door has ingress a customer reaches.",
 		"address", ln.Addr().String(), "rpc", d.publicURL)
+	if d.google != nil {
+		d.log.Warn("the A2A door's Google sign-in is armed: a Google account on the door's allowlist that reaches this listener "+
+			"can submit tasks as itself, and any bearer that is not the door's token is sent to Google's tokeninfo endpoint to be checked",
+			"allowedUsers", len(d.googleAllowed))
+	}
 
 	errs := make(chan error, 1)
 	go func() {
@@ -1472,7 +1485,7 @@ func (d *A2ADoor) taskObjectLocked(task *a2aTask) a2aTaskObject {
 		// artifact on the stream) renders no artifact rather than a guess.
 		artifacts = []lib.Artifact{{ArtifactID: task.id + "-result", Name: lib.ArtifactResult, Parts: textParts(task.result)}}
 	}
-	metadata := map[string]any{"backend": a2aBackend}
+	metadata := map[string]any{"backend": a2aBackendForCaller(task.caller)}
 	if task.resultCutFrom > 0 {
 		metadata["resultTruncatedFrom"] = task.resultCutFrom
 	}

@@ -1065,7 +1065,8 @@ func (g *Gateway) resolveA2APrincipal(authorID string) string {
 // the email is the principal, admitted only if it is on the door's
 // allowlist. The author must carry the class's prefix, so an id that did
 // not come through the door's Google check resolves to nothing even on this
-// arm. The email arrives lower-cased from the verifier and is returned so.
+// arm. The email is returned as Google sent it, case-preserved, for the
+// reason the gchat arm keeps the case: the audit join hashes that string.
 func (g *Gateway) resolveA2AGooglePrincipal(authorID string) string {
 	email, ok := strings.CutPrefix(authorID, a2aGoogleCallerPrefix)
 	if !ok || email == "" {

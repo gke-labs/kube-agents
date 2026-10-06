@@ -166,11 +166,12 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	// callers resolved through its own map. See a2a/gateway/a2adoor.go.
 	if cfg.A2ADoorArmed() {
 		door, err := gateway.NewA2ADoor(cfg.A2ADoorListen, cfg.A2ADoorToken, gateway.A2ADoorOptions{
-			PublicURL:        cfg.A2ADoorPublicURL,
-			DefaultAddressee: cfg.DefaultAddressee,
-			TaskDeadline:     cfg.TaskDeadline,
-			GoogleClientID:   cfg.A2ADoorGoogleClientID,
-			Logger:           log,
+			PublicURL:          cfg.A2ADoorPublicURL,
+			DefaultAddressee:   cfg.DefaultAddressee,
+			TaskDeadline:       cfg.TaskDeadline,
+			GoogleClientID:     cfg.A2ADoorGoogleClientID,
+			GoogleAllowedUsers: cfg.A2ADoorAllowedUsers,
+			Logger:             log,
 		})
 		if err != nil {
 			log.Error("A2A door", "err", err)

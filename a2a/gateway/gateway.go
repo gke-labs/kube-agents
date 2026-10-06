@@ -308,12 +308,7 @@ func New(o Options) (*Gateway, error) {
 			gchatAllowed[strings.ToLower(u)] = true
 		}
 	}
-	a2aGoogleAllowed := map[string]bool{}
-	for _, u := range o.Config.A2ADoorAllowedUsers {
-		if u = strings.TrimSpace(u); u != "" {
-			a2aGoogleAllowed[strings.ToLower(u)] = true
-		}
-	}
+	a2aGoogleAllowed := googleAllowlist(o.Config.A2ADoorAllowedUsers)
 	if o.Config.A2ADoorGoogleClientID != "" && len(a2aGoogleAllowed) == 0 {
 		log.Warn("the A2A door's Google sign-in is armed but A2A_DOOR_ALLOWED_USERS is empty; every Google-verified caller will be dropped at verification")
 	}

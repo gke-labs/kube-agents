@@ -22,15 +22,17 @@ import (
 // the OAuth access token Google issued it for the install's one
 // pre-registered client (the MCP bridge forwards the one Antigravity
 // obtained), the door checks it with Google, and the verified email is the
-// principal - the same string the Google Chat adapter carries for the same
-// person. It sits beside the eval class, never instead of it: a request
+// principal - as Google sent it, case and all, which is the string the
+// Google Chat adapter carries for the same person (it keeps the case for the
+// audit join, and so does this). It sits beside the eval class, never instead of it: a request
 // whose bearer is the door's static token is the eval class exactly as
 // before, and only a bearer that is not reaches this verifier.
 //
 // A Google access token is opaque, so it is checked through the tokeninfo
 // endpoint rather than locally. Nothing here holds a refresh token, a client
-// secret or anyone's credential: the door holds a client id, and the
-// gateway holds the allowlist the verified email must be on.
+// secret or anyone's credential: the door holds a client id and the
+// allowlist the verified email must be on, and the gateway checks the same
+// allowlist again before it resolves the principal.
 
 const (
 	// a2aGoogleBackend names the class in authority blocks and in the
@@ -158,8 +160,8 @@ func newGoogleTokenVerifier(clientID string) *googleTokenVerifier {
 // what the client is told; it never carries the token.
 var errGoogleTokenRefused = errors.New("the Google access token was refused")
 
-// verify returns the verified, lower-cased email the token was issued to,
-// or an error saying why not.
+// verify returns the verified email the token was issued to, as Google
+// sent it, or an error saying why not.
 func (v *googleTokenVerifier) verify(ctx context.Context, token string) (string, error) {
 	key := googleTokenKey(token)
 	if email, ok := v.cached(key); ok {
@@ -181,7 +183,7 @@ func (v *googleTokenVerifier) verify(ctx context.Context, token string) (string,
 	if string(info.EmailVerified) != "true" {
 		return "", fmt.Errorf("%w: it carries no verified email (request the email scope)", errGoogleTokenRefused)
 	}
-	email := strings.ToLower(strings.TrimSpace(string(info.Email)))
+	email := strings.TrimSpace(string(info.Email))
 	if err := googleEmailWellFormed(email); err != nil {
 		return "", fmt.Errorf("%w: %v", errGoogleTokenRefused, err)
 	}
@@ -219,8 +221,15 @@ func (v *googleTokenVerifier) tokeninfo(ctx context.Context, token string) (goog
 	if err != nil {
 		return info, errors.New("the Google access token could not be checked: the tokeninfo answer did not arrive whole")
 	}
-	if resp.StatusCode != http.StatusOK {
+	switch {
+	case resp.StatusCode == http.StatusBadRequest:
+		// Google's answer for a token it does not recognise.
 		return info, fmt.Errorf("%w: Google does not recognise it (invalid, expired or revoked)", errGoogleTokenRefused)
+	case resp.StatusCode != http.StatusOK:
+		// A 5xx or a 429 is Google failing to answer, not a verdict: a
+		// client told to sign in again would loop through a sign-in that
+		// cannot help.
+		return info, fmt.Errorf("the Google access token could not be checked: tokeninfo answered HTTP %d", resp.StatusCode)
 	}
 	if err := json.Unmarshal(body, &info); err != nil {
 		return info, errors.New("the Google access token could not be checked: the tokeninfo answer did not decode")
@@ -324,6 +333,18 @@ func a2aBackendForCaller(caller string) string {
 	return a2aBackend
 }
 
+// googleAllowlist is the door's copy of the class's allowlist, keyed
+// lower-cased; the gateway builds its own from the same config.
+func googleAllowlist(users []string) map[string]bool {
+	allowed := map[string]bool{}
+	for _, u := range users {
+		if u = strings.TrimSpace(u); u != "" {
+			allowed[strings.ToLower(u)] = true
+		}
+	}
+	return allowed
+}
+
 // googleVerifierFor is the verifier for a configured client id, or nil
 // when the class is off.
 func googleVerifierFor(clientID string) *googleTokenVerifier {
@@ -333,7 +354,8 @@ func googleVerifierFor(clientID string) *googleTokenVerifier {
 	return newGoogleTokenVerifier(clientID)
 }
 
-// bearerOf reads the request's bearer token, if it has one.
+// bearerOf reads the request's bearer token, if it has one. The doors'
+// shared bearer check (bearerAuthorized) reads it the same way.
 func bearerOf(r *http.Request) (string, bool) {
 	header := r.Header.Get(authorizationHeader)
 	if len(header) > len(bearerScheme) && strings.EqualFold(header[:len(bearerScheme)], bearerScheme) {
@@ -348,7 +370,8 @@ func bearerOf(r *http.Request) (string, bool) {
 // class, as it always was: ok with no verified caller, and each method
 // names its caller (callerOf). Any other bearer, when the developer class is
 // armed, is checked as a Google access token, and the verified caller is
-// returned. Everything else is the 401 it was before.
+// returned if its email is on the door's allowlist. Everything else is the
+// 401 it was before.
 //
 // A refusal on the token's merits is a 401 a client answers by signing in
 // again; a failure to reach a verdict (Google unreachable, the door's
@@ -363,6 +386,16 @@ func (d *A2ADoor) identify(w http.ResponseWriter, r *http.Request) (verified str
 		return "", d.authorized(w, r)
 	}
 	email, err := d.google.verify(r.Context(), presented)
+	if err == nil && !d.googleAllowed[strings.ToLower(email)] {
+		// Checked here, before the door holds anything for the caller, as
+		// well as by the gateway (resolveA2AGooglePrincipal): an account
+		// off the list must not create conversations or submissions that
+		// would push an allowed developer's out of the door's bounds. A
+		// 403, not a 401: signing in again as the same account cannot help.
+		d.log.Warn("the A2A door refused a Google-verified caller who is not on its allowlist")
+		injectError(w, http.StatusForbidden, "this Google account is not on the A2A door's allowed users list; an admin adds it to A2A_DOOR_ALLOWED_USERS")
+		return "", false
+	}
 	if err != nil {
 		d.log.Warn("the A2A door refused a bearer as a Google access token", "reason", err.Error())
 		if errors.Is(err, errGoogleTokenRefused) {

@@ -84,8 +84,8 @@ func TestGoogleVerifierAdmitsATokenIssuedForTheClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
-	if email != googleTestEmail {
-		t.Errorf("email = %q, want the lower-cased %q", email, googleTestEmail)
+	if email != "Dev@Example.com" {
+		t.Errorf("email = %q, want it as Google sent it, case-preserved (the Chat adapter keeps the case for the audit join)", email)
 	}
 }
 
@@ -141,6 +141,22 @@ func TestGoogleVerifierRefusals(t *testing.T) {
 			t.Fatalf("err = %v, want a refusal", err)
 		}
 	})
+}
+
+// TestGoogleVerifierGoogleErrorIsNotARefusal: a 5xx or a 429 from
+// tokeninfo is Google failing to answer, so the caller is not told its token
+// is bad (which would send it round a sign-in that cannot help).
+func TestGoogleVerifierGoogleErrorIsNotARefusal(t *testing.T) {
+	for _, status := range []int{http.StatusInternalServerError, http.StatusServiceUnavailable, http.StatusTooManyRequests} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(status) }))
+		v := newGoogleTokenVerifier(googleTestClientID)
+		v.tokeninfoURL = srv.URL
+		_, err := v.verify(context.Background(), googleTestToken)
+		srv.Close()
+		if err == nil || errors.Is(err, errGoogleTokenRefused) {
+			t.Errorf("HTTP %d: err = %v, want a failure to check, not a refusal", status, err)
+		}
+	}
 }
 
 // TestGoogleVerifierOutageIsNotARefusalAndLeaksNoToken: an endpoint that
@@ -247,8 +263,11 @@ func startA2AGoogleRig(t *testing.T) (*a2aRig, *fakeTokeninfo) {
 		t.Fatal(err)
 	}
 	r := startA2ARigTuned(t, func(door *A2ADoor) Adapter { return door }, a2aRigTuning{
-		doorOptions: func(o *A2ADoorOptions) { o.GoogleClientID = googleTestClientID },
-		builtDoor:   func(d *A2ADoor) { d.google.tokeninfoURL = f.srv.URL },
+		doorOptions: func(o *A2ADoorOptions) {
+			o.GoogleClientID = googleTestClientID
+			o.GoogleAllowedUsers = []string{"Dev@Example.com"}
+		},
+		builtDoor: func(d *A2ADoor) { d.google.tokeninfoURL = f.srv.URL },
 		config: func(c *Config) {
 			c.A2ADoorGoogleClientID = googleTestClientID
 			c.A2ADoorAllowedUsers = []string{"Dev@Example.com"}
@@ -284,6 +303,9 @@ func TestA2AGoogleCallerStartsATaskAttributedToTheirEmail(t *testing.T) {
 	if authority.Requester.Principal != ps.Hash(googleTestEmail) {
 		t.Errorf("principal = %q, want the pseudonym of %s", authority.Requester.Principal, googleTestEmail)
 	}
+	if task.Metadata["backend"] != a2aGoogleBackend {
+		t.Errorf("task metadata backend = %v, want %q, as the authority block says", task.Metadata["backend"], a2aGoogleBackend)
+	}
 	wantKey := a2aKeyPrefix + a2aGoogleCaller(googleTestEmail) + ":ctx-1"
 	if authority.Audience.Conversation != wantKey {
 		t.Errorf("conversation = %q, want %q", authority.Audience.Conversation, wantKey)
@@ -294,14 +316,21 @@ func TestA2AGoogleCallerStartsATaskAttributedToTheirEmail(t *testing.T) {
 	}
 }
 
-func TestA2AGoogleCallerOffTheAllowlistIsDroppedAndStartsNothing(t *testing.T) {
+// TestA2AGoogleCallerOffTheAllowlistIsRefusedBeforeTheDoorHoldsAnything:
+// a verified account off the list is a 403 at the door, before it creates
+// a conversation or a submission, so a stream of such accounts cannot push
+// an allowed developer's state out of the door's bounds.
+func TestA2AGoogleCallerOffTheAllowlistIsRefusedBeforeTheDoorHoldsAnything(t *testing.T) {
 	r, _ := startA2AGoogleRig(t)
-	resp, status := r.rawRPC(t, googleTestOtherToken, "", a2aMethodSend, sendParams("let me in", "m-1", "", false))
-	if status != http.StatusOK {
-		t.Fatalf("HTTP %d", status)
+	_, status := r.rawRPC(t, googleTestOtherToken, "", a2aMethodSend, sendParams("let me in", "m-1", "", false))
+	if status != http.StatusForbidden {
+		t.Fatalf("HTTP %d, want 403", status)
 	}
-	if resp.Error == nil || resp.Error.Code != a2aErrAuthenticationFail {
-		t.Fatalf("response = %+v, want error %d", resp, a2aErrAuthenticationFail)
+	r.door.mu.Lock()
+	conversations, submissions := len(r.door.conversations), len(r.door.submissions)
+	r.door.mu.Unlock()
+	if conversations != 0 || submissions != 0 {
+		t.Errorf("the door holds %d conversations and %d submissions for a refused account", conversations, submissions)
 	}
 	if envs := inSubjectEnvelopes(t, r.url, "platform"); len(envs) != 0 {
 		t.Fatalf("a caller off the allowlist reached the bus: %d envelopes", len(envs))
@@ -406,6 +435,9 @@ func TestA2AGoogleResolverRequiresTheClassPrefix(t *testing.T) {
 		if got := g.resolveA2AGooglePrincipal(id); got != "" {
 			t.Errorf("%q resolved to %q, want nothing", id, got)
 		}
+	}
+	if got := g.resolveA2AGooglePrincipal(a2aGoogleCaller("Dev@Example.com")); got != "Dev@Example.com" {
+		t.Errorf("a mixed-case allowed email resolved to %q, want it case-preserved", got)
 	}
 	if got := (&Gateway{}).resolveA2AGooglePrincipal(a2aGoogleCaller(googleTestEmail)); got != "" {
 		t.Errorf("an empty allowlist admitted %q", got)

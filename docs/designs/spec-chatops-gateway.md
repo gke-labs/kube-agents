@@ -1330,15 +1330,19 @@ the eval namespace today.
 **Identity, second class: a developer signed in with Google.** A bearer that is not the door's
 static token is checked, when `A2A_DOOR_GOOGLE_CLIENT_ID` is set, as a Google OAuth access token:
 Google's tokeninfo endpoint must answer for it with the install's one pre-registered client as
-its audience or authorized party, a verified email, and an expiry still ahead. The email,
-lower-cased, is the principal - the same string the Google Chat adapter carries for the same
-person - admitted only if it is on the door's own allowlist (`A2A_DOOR_ALLOWED_USERS`; empty
-admits nobody, and there is no allow-all). The authority block records backend `a2a-google` and
+its audience or authorized party, a verified email, and an expiry still ahead. The email, as
+Google sent it, is the principal - the same string the Google Chat adapter carries for the same
+person, case-preserved as Chat keeps it for the audit join - admitted only if it is on the
+door's allowlist (`A2A_DOOR_ALLOWED_USERS`, compared case-insensitively; empty admits nobody, and
+there is no allow-all). The door checks the list before it holds anything for the caller, so an
+account off it cannot fill the door's bounded state, and the gateway checks it again before it
+resolves the principal. The authority block records backend `a2a-google` and
 `verifiedBy` `a2a-google-token`. A request carrying the token may not also name a caller: the
 header or `message.metadata.caller` beside a token is refused, so a token never travels with a
-name that disagrees with it. A token Google refuses is a 401 a client answers by signing in
-again; a check that could not be made (Google unreachable, more checks in flight than the door
-allows) is a 503. An admission is remembered for at most five minutes or until the token
+name that disagrees with it. A token Google refuses (tokeninfo's 400) is a 401 a client answers
+by signing in again; an account off the list is a 403; a check that could not be made (Google
+unreachable or answering with an error of its own, more checks in flight than the door allows)
+is a 503. An admission is remembered for at most five minutes or until the token
 expires, under a byte bound; a refusal is not remembered. This is a verifier beside the eval
 map, never an entry in it: the static token and its map work as before. The roster resolves the
 class's own way, never through the chat principal map that is the gateway's default.
@@ -1360,7 +1364,9 @@ second scheme beside the bearer, `openIdConnect` at Google's OpenID configuratio
 alternative.
 
 **Posture.** Every RPC request carries a bearer token (`A2A_DOOR_TOKEN`, required whenever
-`A2A_DOOR_LISTEN` is set, no unauthenticated mode); the caller map is its own file
+`A2A_DOOR_LISTEN` is set, no unauthenticated mode), or, with the Google class armed, a Google
+access token in its place; any other bearer is then sent to Google's tokeninfo endpoint to be
+checked; the caller map is its own file
 (`A2A_DOOR_PRINCIPAL_MAP`); the card advertises `A2A_DOOR_PUBLIC_URL` when set, and otherwise
 the address the card was fetched from (the request's host, or the forwarded host and scheme
 behind a proxy), since behind a port-forward or an ingress the listen address is reachable by

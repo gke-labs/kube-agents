@@ -471,6 +471,14 @@ class A3TheA2ADoorsGoogleClassAssertsOnlyAVerifiedEmail(unittest.TestCase):
             "a verified email off the door's allowlist is no longer refused",
         )
 
+    def test_A3_the_door_refuses_an_account_off_the_allowlist_before_holding_state(self) -> None:
+        body = h.go_function_body(h.text("a2a_door_google"), "identify")
+        self.assertRegex(
+            body,
+            r"if err == nil && !d\.googleAllowed\[strings\.ToLower\(email\)\] \{[^}]*return \"\", false",
+            "the door no longer refuses a verified account off its allowlist before it creates state for it",
+        )
+
     def test_A3_no_eval_caller_can_spell_a_google_caller(self) -> None:
         found = re.search(r'\ba2aGoogleCallerPrefix\s*=\s*"([^"]*)"', h.text("a2a_door_google"))
         self.assertIsNotNone(found, "a2aGoogleCallerPrefix is no longer a string constant in a2adoor_google.go")

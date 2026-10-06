@@ -1272,6 +1272,15 @@ Mutation(
         "and the install's public client id signs in",
     ),
     Mutation(
+        "A3-a2a-google-door-allowlist-skipped",
+        "a2a/gateway/a2adoor_google.go",
+        ("\tif err == nil && !d.googleAllowed[strings.ToLower(email)] {", "\tif false {"),
+        "test_A3_the_door_refuses_an_account_off_the_allowlist_before_holding_state",
+        "leave the allowlist to the gateway alone, so any Google account that "
+        "can mint a token for the install's client creates door conversations "
+        "and submissions that evict an allowed developer's",
+    ),
+    Mutation(
         "A3-a2a-google-prefix-spellable",
         "a2a/gateway/a2adoor_google.go",
         ('\ta2aGoogleCallerPrefix = ":google:"', '\ta2aGoogleCallerPrefix = "google:"'),
