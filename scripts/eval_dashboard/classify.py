@@ -979,9 +979,10 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
         if result == RUN_ABORTED:
             return dict(base, headline="Aborted before it finished.", lede="Usually a newer push superseded this run; the next one carries the verdict.", verdict=VERDICT_INFRA, setup_death=False, cls=None, do="")
         if result == RUN_SUCCESS:
-            # hack/ci-eval-pr.sh step 0: an inert push is revalidated against
-            # the branch's earlier green and exits before the eval matrix.
-            return dict(base, headline="Green without running the cases.", lede="Only inert paths changed since this branch's last green run, so the gate revalidated that run instead of spending another.", verdict=VERDICT_GREEN, setup_death=False, cls=None, do="")
+            # hack/ci-revalidate.sh, step 0: a retest at a head that already
+            # passed, or an inert push, is revalidated against the branch's
+            # earlier green and exits before the eval matrix.
+            return dict(base, headline="Green without running the cases.", lede="This head already had a green run, or only inert paths changed since the branch's last one, so the gate revalidated that run instead of spending another.", verdict=VERDICT_GREEN, setup_death=False, cls=None, do="")
         when = f" {minutes} minutes in" if minutes is not None else ""
         return dict(
             base,

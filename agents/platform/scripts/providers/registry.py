@@ -14,6 +14,9 @@ does not put a hostname in a shared file.
 
 from __future__ import annotations
 
+import json
+import os
+import re
 from typing import Any, Mapping
 
 import repo_ref
@@ -51,6 +54,63 @@ _UNIMPLEMENTED: tuple[tuple[str, tuple[str, ...], str, tuple[str, ...]], ...] = 
 )
 
 
+# Where the operator mounts the forges this install was configured with. Unset
+# means the install predates per-forge configuration, and each forge class
+# decides what that means for it (see `Forge.for_config`). Set, the file is the
+# whole answer: a forge it does not list is not built.
+FORGES_CONFIG_ENV = "VCS_FORGES_CONFIG"
+# A hostname and nothing else. A port is refused rather than accepted: the
+# repository parser reads a URL's host without its port, so a forge declared at
+# `host:8443` would load and then match no request; until ports are carried
+# through resolution end to end, the misconfiguration stops the build.
+_HOST_RE = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?")
+
+
+def load_forge_entries(path: str | None = None) -> list[dict[str, Any]] | None:
+    """The configured forges, normalised, or None when nothing configures them.
+
+    The file is `{"forges": [{"provider", "host", "tokenPath"?, "allowedPaths"?}]}`.
+    Read at registry construction, never cached across it, so a test or a
+    remount sees the file it names. A file that is named and cannot be read
+    raises: a broker that does not know which forges it serves must not start
+    on a guess.
+    """
+    path = path if path is not None else os.environ.get(FORGES_CONFIG_ENV, "").strip()
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            document = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"the forge configuration {path} could not be read: {exc}") from exc
+    raw = document.get("forges") if isinstance(document, dict) else None
+    if not isinstance(raw, list):
+        raise ValueError(f"the forge configuration {path} has no `forges` list")
+    entries = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"forges[{index}] in {path} is not an object")
+        provider = str(item.get("provider") or "").strip().lower()
+        host = str(item.get("host") or "").strip().lower()
+        if not provider or not _HOST_RE.fullmatch(host):
+            raise ValueError(
+                f"forges[{index}] in {path} needs a provider and a hostname "
+                "(no scheme, path or port)"
+            )
+        allowed = item.get("allowedPaths") or []
+        if not isinstance(allowed, list) or not all(isinstance(p, str) for p in allowed):
+            raise ValueError(f"forges[{index}].allowedPaths in {path} must be a list of paths")
+        entries.append(
+            {
+                "provider": provider,
+                "host": host,
+                "token_path": str(item.get("tokenPath") or "").strip(),
+                "allowed_paths": tuple(p.strip("/") for p in allowed if p.strip("/")),
+            }
+        )
+    return entries
+
+
 def build_forges(config: Mapping[str, Any] | None = None) -> tuple[Forge, ...]:
     """Every forge instance this install has, in registration order."""
     settings = config or {}
@@ -79,18 +139,48 @@ class Registry:
     """
 
     def __init__(self, config: Mapping[str, Any] | None = None) -> None:
-        self.forges = build_forges(config)
+        settings = dict(config or {})
+        if "forges" not in settings:
+            settings["forges"] = load_forge_entries()
+        self.forges = build_forges(settings)
+        # An entry no forge class claims is a misspelt provider, or one this
+        # image predates. Building without it would start a broker that refuses
+        # every request at runtime; like the other misconfigurations, it stops
+        # the build instead.
+        known = {cls.name for cls in AVAILABLE}
+        unclaimed = sorted(
+            {entry.get("provider", "") for entry in settings.get("forges") or ()} - known
+        )
+        if unclaimed:
+            raise ValueError(
+                f"no forge in this image serves provider {', '.join(unclaimed)}; "
+                f"this image serves {', '.join(sorted(known))}"
+            )
+        # One forge per host. A host two forges claim would be answered by
+        # whichever registered first, which is a credential presented by the
+        # order of a list; refusing at construction keeps resolution a
+        # function of the host the repository names and nothing else.
+        claimed: dict[str, Forge] = {}
+        for forge in self.forges:
+            for host in forge.hosts:
+                if host in claimed:
+                    raise ValueError(
+                        f"{host} is configured for both {claimed[host].name} and {forge.name}"
+                    )
+                claimed[host] = forge
         self.stubs = build_stubs(self.forges)
         self.hosts: dict[str, Forge] = {
             host: forge
             for forge in (*self.forges, *self.stubs)
             for host in forge.hosts
         }
-        # What a bare `owner/name` means. The first configured forge, which is
-        # registration order rather than a name in this file: every skill in
-        # this repository has always written bare slugs and meant the forge
-        # this install was built around.
-        self.default = self.forges[0] if self.forges else None
+        # What a bare `owner/name` means: the forge, when there is exactly one.
+        # Every skill in this repository has always written bare slugs and
+        # meant the forge the install was built around, and with one forge
+        # that is still unambiguous. With two it is not, and guessing is how a
+        # token for one forge is spent on a name that belongs to the other, so
+        # a bare name is refused and the caller names the host.
+        self.default = self.forges[0] if len(self.forges) == 1 else None
 
     @property
     def executables(self) -> tuple[str, ...]:
@@ -132,9 +222,18 @@ class Registry:
             first = ref.segments[0].lower()
             if first in self.hosts:
                 host = first
+        if not host and len(self.forges) > 1:
+            served = ", ".join(sorted(h for f in self.forges for h in f.hosts))
+            raise ForgeUnsupported(
+                f"{url!r} names no host, and this install serves more than one forge "
+                f"({served}); name the repository by its URL or as <host>/<path>."
+            )
         forge = self.hosts.get(host) if host else self.default
         if forge is None:
-            known = ", ".join(sorted(self.hosts)) or "none"
+            # The forges built, not every host in the table: a placeholder for
+            # an unconfigured forge is in the table so it can name its gap,
+            # and listing it here would call it configured.
+            known = ", ".join(sorted(h for f in self.forges for h in f.hosts)) or "none"
             raise ForgeUnsupported(
                 f"{host or 'a bare owner/name'} is not a forge this install "
                 f"serves. Configured: {known}."

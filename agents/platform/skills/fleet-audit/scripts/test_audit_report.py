@@ -13644,6 +13644,14 @@ class ContentModeTestCase(BaseTestCase):
         )
         managed.start()
         self.addCleanup(managed.stop)
+        # The broker's gate reads the host-keyed list.
+        keyed = patch.object(
+            gitops_workspace,
+            "get_managed_repo_keys",
+            return_value=["github:github.com/acme/fleet"],
+        )
+        keyed.start()
+        self.addCleanup(keyed.stop)
 
         # `open` composes https://github.com/<owner>/<name>.git itself and takes
         # no caller-supplied URL, by design — so the redirect to the local bare

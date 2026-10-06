@@ -401,9 +401,32 @@ class ScopedPoolCeilingTest(unittest.TestCase):
 
         source = (IAM_MODULE / "scoped_pool.tf").read_text(encoding="utf-8")
         for_each = re.search(
-            r"for (\w+) in local\.scope_listed_projects :\s*\n\s*(\w+) =>", source
+            r"for (\w+) in local\.scoped_pool_projects :\s*\n\s*(\w+) =>", source
         )
-        self.assertIsNotNone(for_each, "the pool no longer iterates local.scope_listed_projects")
+        self.assertIsNotNone(for_each, "the pool no longer iterates local.scoped_pool_projects")
+        # The pool's set is what the plan lists for the resolved-set count plus
+        # the containers' members the resolver listed while the pool is armed
+        # (design §6), as one setunion: a member reaches the pool through this
+        # and nothing else, so a container's member gets an account and no
+        # per-project binding, and scope_listed_projects stays what the
+        # resolved-set cap counts.
+        pool_projects = re.search(
+            r"^\s*scoped_pool_projects\s*=\s*setunion\(\s*local\.scope_listed_projects,\s*local\.scoped_pool_container_members,?\s*\)",
+            source,
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(
+            pool_projects,
+            "local.scoped_pool_projects is no longer setunion(local.scope_listed_projects,"
+            " local.scoped_pool_container_members): a container's listed members would"
+            " then miss the pool, or reach it beside the listed set some other way",
+        )
+        self.assertIn(
+            "lookup(var.scope_container_members, key, [])",
+            source,
+            "the container members are not read from var.scope_container_members by the"
+            " declared container's key",
+        )
         self.assertEqual(
             for_each.group(1),
             for_each.group(2),

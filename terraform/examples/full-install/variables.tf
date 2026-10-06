@@ -124,9 +124,11 @@ variable "scoped_pool_enabled" {
   description = <<-EOT
     Arms the scoped service account pool: one reader service account per
     project the plan can list in `scope` (project_id, scope.projects less an
-    exact exclude.projects entry, and each selector's members; a folder's or
-    organisation's members are not listed at plan time yet), created in
-    project_id by the kube-agents-iam module and keyed on the project id.
+    exact exclude.projects entry, each selector's members, and, while this is
+    true, each folder's and organisation's members as the scope resolver
+    lists them through Cloud Asset Inventory), created in project_id by the
+    kube-agents-iam module and keyed on the project id. A project created
+    under a declared folder since the last apply gets its account on the next.
     False, the default, provisions no pool and leaves the agent's single
     identity in place, whatever `scope` declares.
 

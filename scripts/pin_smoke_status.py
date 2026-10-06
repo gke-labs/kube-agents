@@ -5,8 +5,10 @@ Tide credits a presubmit only against the base SHA it ran on. Crier writes that
 SHA into the commit status as a `BaseSHA:<sha>` suffix, and Tide reads it back
 (`prowJobsFromContexts`) so a result outlives the ProwJob object -- as long as
 the SHA still names the head of `main`. Every merge to `main` therefore turns
-every other pull request's green smoke run stale, and Tide re-runs the 1.5-3.5h
-job for a pull request whose head has not changed (#1179, #1202).
+every other pull request's green smoke run stale, and Tide re-runs the job for a
+pull request whose head has not changed (#1179, #1202). Step 0 of that job,
+hack/ci-revalidate.sh, answers such a retest in minutes from the head's own green
+where it once cost the 1.5-3.5h matrix; the re-pin spares even that.
 
 This re-pins the suffix. On every push to `main` it sweeps the open pull
 requests and re-posts each green smoke status with `BaseSHA:` set to the new
@@ -76,7 +78,7 @@ SUCCESS = "success"
 MAIN_BRANCH = "main"
 MAIN_REF = f"heads/{MAIN_BRANCH}"
 USER_AGENT = "kube-agents-smoke-test-sticky"
-#: Tide's pool wants both; a pull request carrying them is the one a stale base costs hours.
+#: Tide's pool wants both; a pull request carrying them is the one a stale base costs a retest.
 POOL_LABELS = frozenset({"lgtm", "approved"})
 HOLD_LABEL_PREFIX = "do-not-merge"
 SHORT_SHA = 8
@@ -197,7 +199,7 @@ def pin_head(api, sha, main_sha, status_id=None, dry_run=False, check_base=True,
 
 
 def in_tide_pool(pull_request):
-    """Carries the labels Tide merges on and no hold: the ones a stale base costs hours."""
+    """Carries the labels Tide merges on and no hold: the ones a stale base costs a retest."""
     labels = {label.get("name") for label in pull_request.get("labels") or []}
     return POOL_LABELS <= labels and not any(str(name).startswith(HOLD_LABEL_PREFIX) for name in labels)
 
@@ -207,7 +209,7 @@ def sweep(api, main_sha, dry_run=False):
 
     Returns (outcomes, failures). One pull request's failure does not end the
     sweep -- every pull request after it would otherwise wait for the next
-    merge, and a lost pin costs a 1.5-3.5h retest -- but it is counted, so the
+    merge, and a lost pin costs a retest -- but it is counted, so the
     run can exit non-zero and be seen. Each outcome is logged as it happens,
     not after the loop: the log is the only record of the writes this makes,
     and a runner killed mid-sweep must not take the record of the ones already

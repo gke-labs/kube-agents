@@ -465,8 +465,9 @@ def needs_you(reason: str, buttons: bool = True) -> tuple[list[dict], str] | Non
     return blocks, "\n".join([_text(first, detail), *more])
 
 
-def needs_you_settled(blocks: Sequence[dict]) -> list[dict]:
-    """A posted question's ``blocks`` once its card has moved on: no choice buttons, no waiting line."""
+def needs_you_settled(blocks: Sequence[dict], note: str = "") -> list[dict]:
+    """A posted question's ``blocks`` once its card has moved on: no choice buttons, no waiting line,
+    and ``note``, the line naming who answered, as a context line last when there is one."""
     out: list[dict] = []
     for block in blocks or ():
         if not isinstance(block, dict) or block.get("block_id") == _presenter.WAITING_BLOCK_ID:
@@ -480,4 +481,6 @@ def needs_you_settled(blocks: Sequence[dict]) -> list[dict]:
                 continue
             block = {**block, "elements": kept}
         out.append(block)
+    if note:
+        out.append({"type": "context", "elements": [{"type": "mrkdwn", "text": note}]})
     return out

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # Run a GitOps fix-cycle pilot case (gke-labs/kube-agents#1307; TASK=b-0011 or
-# b-0022b, case ./tasks/<TASK>-gitops) from a laptop
+# b-0022b, case ./tasks/<TASK>-gitops, or CASE=<case> for a variant such as
+# b-0022b-gitops-pinned-base) from a laptop
 # against a kube-agents install, end to end: per-run branch, task cluster with
 # Argo CD, agent turn, wait for the PR to merge and Argo to sync, verify, tear
 # down. Everything here is what hack/ci-eval-pr.sh would do for this case once
@@ -15,19 +16,33 @@
 #   2. Makes the run branch the repository's default branch for the run (the
 #      stack switches it and restores it on destroy); the agent's
 #      submit-suggestion re-asks the remote for its default before each PR, so
-#      that is the branch its PR targets.
+#      that is the branch its PR targets. A case that sets
+#      gitops_pin_agent_base_branch is left to its stack instead, which pins
+#      the base on the PlatformAgent and leaves the repository default alone.
+#      Before any of that (right after the case is resolved), a run/** branch
+#      other than this run's in any of the PlatformAgent's
+#      spec.integration.repositories[].baseBranch is refused as a pin leaked by
+#      an earlier run; and, for a case that pins its base on a CRD that
+#      declares that field, so is a base the install already sets on the
+#      GitOps repository's entry, and a PlatformAgent with no such entry when
+#      AGENT_STATE_RESET is not set to write one (the stack would refuse both
+#      only after the task cluster is built).
 #   3. Reads PLATFORM_AGENT_TOKEN and the judge key from the install's secret.
-#   4. Runs `devops-bench ./tasks/<TASK>-gitops --agent-type kubeagents` with
+#   4. Runs `devops-bench ./tasks/<CASE> --agent-type kubeagents` with
 #      the stack and harness pointed at the same run branch.
+#   5. Logs the pull requests opened since the run started with their bases
+#      (how many went onto the default branch), writes the version stamp with
+#      them, and checks for leaks.
 #
 # Inputs (env). Required, with no defaults, because each names an install
 # or a repository of yours:
 #   GCP_PROJECT_ID          project the run's task cluster is created in
 #   AGENT_HOST_CONTEXT      kubectl context of the cluster running the
 #                           platform agent
-#   GITOPS_REPO             https URL of the GitOps repository; rendered into
-#                           the task prompt in place of {{GITOPS_REPO}} and
-#                           handed to the stack and the harness
+#   GITOPS_REPO             https URL of the GitOps repository, on github.com;
+#                           rendered into the task prompt in place of
+#                           {{GITOPS_REPO}} and handed to the stack and the
+#                           harness
 # Optional:
 #   GITOPS_BROKEN_BASE_SHA  commit in GITOPS_REPO that already carries the
 #     task's broken base under tasks/<TASK> (render-broken-base.sh output).
@@ -36,7 +51,11 @@
 #   GITOPS_HISTORY_PARENT_SHA  parent of b-0011's staged history (unset: the
 #     base above)
 #   GCP_LOCATION (us-central1-a)  AGENT_NAMESPACE (kubeagents-system)
-#   TASK (b-0011) which case to run: ./tasks/<TASK>-gitops, stack gitops_task <TASK>
+#   TASK (b-0011, or the case's gitops_task when CASE is set) the stack's
+#     gitops_task; picks the case ./tasks/<TASK>-gitops when CASE is unset
+#   CASE (<TASK>-gitops) the case directory under ./tasks, for a variant of a
+#     task's case (CASE=b-0022b-gitops-pinned-base); a TASK that disagrees
+#     with the case's gitops_task is refused
 #   CLUSTER_NAME (gitops-pilot-<timestamp>; also seeds the run branch name)
 #   GITOPS_TOKEN_FILE (~/.config/gitops-pilot/github-token)
 #   JUDGE_MODEL (gemini-3.1-pro-preview)
@@ -44,9 +63,11 @@
 #     head of the repository, used as the base and b-0011's history parent
 #     only while GITOPS_BROKEN_BASE_SHA is unset (a per-run repository)
 #   AGENT_STATE_RESET=true re-create the PlatformAgent on fresh volumes (with
-#     GITOPS_REPO as its managed repository and the event watcher off unless
-#     AGENT_EVENT_WATCHER=true) before the run, then refuse to run unless its
-#     stores hold nothing but the first-boot discovery card (#1773)
+#     GITOPS_REPO as its managed repository, the event watcher off unless
+#     AGENT_EVENT_WATCHER=true and, on a CRD that declares it, the drift
+#     detector off unless AGENT_DRIFT_DETECTOR=true) before the run, then
+#     refuse to run unless its stores hold nothing but the first-boot
+#     discovery card (#1773)
 #   DEVOPS_BENCH_PIN (empty: the repository's pin) a pip requirement for another
 #     devops-bench, e.g. `devops-bench @ git+https://github.com/pradeepvrd/devops-bench@<sha>`
 #   AGENT_MODEL (read from the install's LiteLLM config: the model behind
@@ -54,13 +75,18 @@
 #   JUDGE_API_KEY (read from the install's secret when unset)
 #   BENCH_VERIFY_TIMEOUT_SEC (120) per-entry cap of the post-run verification
 #     pass; BENCH_VERIFY_TOTAL_BUDGET_SEC is derived from it and the entry count
-#   BASE_BRANCH_MODE: only `default-branch` (env mode is gone; any other value
-#     is refused)
+#   BASE_BRANCH_MODE: accepted only as `default-branch`, for old invocations;
+#     the case's infrastructure.variables decide how the agent gets its base
+#     (step 2)
 #   INTEGRITY_SWEEP_SCRIPT (empty: skipped) path to devops-bench's
 #     integrity-sweep `sweep.py` (kubernetes-sigs/devops-bench#195); run over
 #     the finished record alone, writing integrity-sweep.json and .md beside
 #     it for adjudication (#1773)
-#   BENCH_NO_TEARDOWN=true to keep the cluster and branch for inspection
+#   BENCH_NO_TEARDOWN=true to keep the cluster and branch for inspection; a
+#     case that pins the base also keeps the baseBranch of the PlatformAgent's
+#     GitOps repository entry on the run branch until the destroy is run by
+#     hand, which pins every proposal onto the GitOps repository from that
+#     install to it
 set -euo pipefail
 
 # Per-entry cap for a converging entry in the post-run verification pass
@@ -77,6 +103,8 @@ readonly RENDERED_TASKS_TEMPLATE="gitops-hold.XXXXXX"
 # renders GITOPS_REPO over it (devops-bench renders only its own placeholders).
 readonly PROMPT_REPO_PLACEHOLDER="{{GITOPS_REPO}}"
 readonly STAGED_HISTORY_TASK="b-0011"
+# The task run when neither TASK nor CASE is set.
+readonly DEFAULT_TASK="b-0011"
 # Agent state reset (#1773): everything the agent remembers lives on these
 # claims; the first two are owned by the PlatformAgent and go with it, the
 # shell StatefulSet's two are not and are removed by name.
@@ -102,6 +130,12 @@ readonly RESULTS_DIR="./results"
 # matches the gateway rollout gate over the 905s startupProbe budget (#2087;
 # pilot run 10 on 2026-09-15 saw the startup probe still failing at ten).
 readonly GATEWAY_ROLLOUT_TIMEOUT=1500s
+# The repository and PlatformAgent reader the stack's scripts share, relative
+# to the bench directory (the cd below), and what its `entry` exits with when
+# the PlatformAgent has no gitops entry for the repository.
+readonly GITOPS_REPO_HELPER="./tf/prebuilt/gitops-fix-cycle/scripts/gitops_repo.py"
+readonly NO_GITOPS_ENTRY=3
+readonly GITHUB_URL_PREFIX="https://github.com/"
 
 : "${GCP_PROJECT_ID:?set GCP_PROJECT_ID to the project that hosts the task cluster of a run}"
 : "${AGENT_HOST_CONTEXT:?set AGENT_HOST_CONTEXT to the kubectl context of the cluster running the platform agent}"
@@ -112,22 +146,25 @@ readonly GATEWAY_ROLLOUT_TIMEOUT=1500s
 : "${GITOPS_TOKEN_FILE:=${HOME}/.config/gitops-pilot/github-token}"
 : "${JUDGE_MODEL:=gemini-3.1-pro-preview}"
 
-: "${TASK:=b-0011}"   # devops-bench task id; the case is ./tasks/${TASK}-gitops
-RUN_BRANCH="run/${CLUSTER_NAME}/${TASK}"   # must match the stack's locals.run_branch
 K=(kubectl --context "${AGENT_HOST_CONTEXT}" -n "${AGENT_NAMESPACE}")
 CR="platformagents.kubeagents.x-k8s.io/platform-agent"
 
 cd "$(dirname "$0")/.."
-[ -r "${GITOPS_TOKEN_FILE}" ] || { echo "token file ${GITOPS_TOKEN_FILE} missing (contents read/write and administration on the GitOps repository: the run makes its branch the repository's default)" >&2; exit 1; }
+[ -r "${GITOPS_TOKEN_FILE}" ] || { echo "token file ${GITOPS_TOKEN_FILE} missing (contents read/write on the GitOps repository, and administration for a case whose run makes its branch the repository's default)" >&2; exit 1; }
 [ "${#CLUSTER_NAME}" -le 40 ] || { echo "CLUSTER_NAME ${CLUSTER_NAME} exceeds GKE's 40 chars" >&2; exit 1; }
+# owner/name of GITOPS_REPO, read as the operator and the stack read it, and
+# GITOPS_REPO as its https URL from here on: the prompt, the stack, the reset
+# and the harness (whose repo_slug reads no other spelling) all get that one.
+slug="$(python3 "${GITOPS_REPO_HELPER}" slug "${GITOPS_REPO}")" || exit 1
+GITOPS_REPO="${GITHUB_URL_PREFIX}${slug}"
 
 RENDERED_TASKS=""
 on_exit() {
   if [ -n "${RENDERED_TASKS}" ]; then rm -rf "${RENDERED_TASKS}"; fi
 }
 trap on_exit EXIT
-
-echo "==> run ${CLUSTER_NAME}: branch ${RUN_BRANCH}"
+# Pull requests opened from here on are this run's (see 5).
+RUN_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 # 1. venv -------------------------------------------------------------------
 uv sync -q
@@ -156,8 +193,109 @@ fi
 # restored to `hold`, so every check is scored and the safeguards are
 # sampled through the agent's turn rather than read once at the end. The copy
 # keeps the task's directory name, which is what lands on the result row.
-TASK_SOURCE="./tasks/${TASK}-gitops"
-[ -f "${TASK_SOURCE}/task.yaml" ] || { echo "no case at ${TASK_SOURCE} (TASK=${TASK})" >&2; exit 1; }
+#
+# The case's infrastructure.variables name the stack's task and decide how the
+# agent gets its base (2), so TASK defaults to the case's gitops_task, and a
+# TASK that disagrees with it is refused: the run branch, the staged history
+# and the Argo Application below all key on TASK.
+if [ -z "${CASE:-}" ]; then
+  : "${TASK:=${DEFAULT_TASK}}"
+  CASE="${TASK}-gitops"
+fi
+TASK_SOURCE="./tasks/${CASE}"
+[ -f "${TASK_SOURCE}/task.yaml" ] || { echo "no case at ${TASK_SOURCE} (TASK=${TASK:-unset}, CASE=${CASE})" >&2; exit 1; }
+# case_var <name>: the case's infrastructure.variables.<name> (a boolean as
+# true or false), empty when the case does not set it.
+case_var() {
+  uv run --no-sync python - "${TASK_SOURCE}/task.yaml" "$1" <<'CASEVAR'
+import sys, yaml
+variables = (yaml.safe_load(open(sys.argv[1])).get("infrastructure") or {}).get("variables") or {}
+value = variables.get(sys.argv[2], "")
+print(str(value).lower() if isinstance(value, bool) else value)
+CASEVAR
+}
+case_task="$(case_var gitops_task)"
+[ -n "${case_task}" ] || { echo "${TASK_SOURCE}/task.yaml sets no infrastructure.variables.gitops_task" >&2; exit 1; }
+: "${TASK:=${case_task}}"
+[ "${TASK}" = "${case_task}" ] || { echo "TASK=${TASK} disagrees with ${CASE}'s gitops_task ${case_task}; unset TASK or pick the matching case" >&2; exit 1; }
+RUN_BRANCH="run/${CLUSTER_NAME}/${TASK}"   # must match the stack's locals.run_branch
+case_pin="$(case_var gitops_pin_agent_base_branch)"
+echo "==> run ${CLUSTER_NAME}: case ${CASE}, branch ${RUN_BRANCH}"
+# agent_bases: one line per spec.integration.repositories[] entry of the
+# PlatformAgent that sets baseBranch (an operator without the field has none):
+# its index, repository and base, tab-separated. Fails when the PlatformAgent
+# cannot be read.
+agent_bases() {
+  "${K[@]}" get "${CR}" -o json | python3 -c '
+import json, sys
+for i, r in enumerate((json.load(sys.stdin)["spec"].get("integration") or {}).get("repositories") or []):
+    if r.get("baseBranch"):
+        print("%d\t%s\t%s" % (i, r.get("repository", ""), r["baseBranch"]))'
+}
+# A run/** base on the PlatformAgent that is not this run's was left by an
+# earlier run (agent-base-branch.sh's unpin only warns when its removal fails),
+# unless that run is still in flight. Refused here, before the agent state reset
+# copies the spec forward and before the stack applies: it would point this
+# run's broker at a branch that is gone, and the row would read no_pr. A base
+# outside run/** is the install's own and is left to the stack.
+if ! agent_base_lines="$(agent_bases)"; then
+  echo "cannot read the PlatformAgent's spec.integration.repositories[].baseBranch on ${AGENT_HOST_CONTEXT}, so whether an earlier run left a pin there is unknown" >&2
+  exit 1
+fi
+while IFS=$'\t' read -r base_index base_repo agent_base; do
+  case "${agent_base}" in
+    run/*)
+      if [ "${agent_base}" != "${RUN_BRANCH}" ]; then
+        echo "the PlatformAgent's spec.integration.repositories[${base_index}].baseBranch (${base_repo}) is '${agent_base}', not this run's ${RUN_BRANCH}: a leaked pin from an earlier run (its destroy could not remove it), unless a run on that branch is still in flight. When none is, remove it and rerun:" >&2
+        echo "  kubectl --context ${AGENT_HOST_CONTEXT} -n ${AGENT_NAMESPACE} patch ${CR} --type=json -p '[{\"op\":\"test\",\"path\":\"/spec/integration/repositories/${base_index}/baseBranch\",\"value\":\"${agent_base}\"},{\"op\":\"remove\",\"path\":\"/spec/integration/repositories/${base_index}/baseBranch\"}]'" >&2
+        exit 1
+      fi ;;
+  esac
+done <<<"${agent_base_lines}"
+# crd_declares <path>...: whether a served version of the PlatformAgent CRD
+# declares every dotted <path> (spec.integration.repositories.baseBranch): 0
+# yes, 1 no, anything else when the CRD could not be read.
+crd_declares() {
+  kubectl --context "${AGENT_HOST_CONTEXT}" get crd platformagents.kubeagents.x-k8s.io -o json \
+    | python3 "${GITOPS_REPO_HELPER}" crd-declares "$@"
+}
+# A case that pins its base, on a CRD that declares
+# spec.integration.repositories[].baseBranch, needs the PlatformAgent's gitops
+# entry for this run's repository with no base of its own: the stack refuses
+# to overwrite an install's base, and has nowhere to pin without the entry.
+# Both are refused here, before the agent state reset (which keeps that base)
+# and the task cluster, rather than by the stack after the cluster is built.
+# A missing entry passes with AGENT_STATE_RESET=true, whose reset writes it.
+# On a CRD without the field there is nothing to check: the stack logs that
+# the install pins no base.
+if [ "${case_pin}" = "true" ]; then
+  crd_rc=0
+  crd_declares spec.integration.repositories.baseBranch || crd_rc=$?
+  case "${crd_rc}" in
+    0)
+      entry_rc=0
+      gitops_base="$("${K[@]}" get "${CR}" -o json | python3 "${GITOPS_REPO_HELPER}" entry base "${GITOPS_REPO}")" || entry_rc=$?
+      case "${entry_rc}" in
+        0)
+          if [ -n "${gitops_base}" ] && [ "${gitops_base}" != "${RUN_BRANCH}" ]; then
+            echo "the PlatformAgent's spec.integration.repositories[] entry with role gitops for ${slug} has baseBranch '${gitops_base}', the install's own base: the stack refuses to overwrite it, so ${CASE}, which pins the base to ${RUN_BRANCH}, cannot run on this install" >&2
+            exit 1
+          fi ;;
+        "${NO_GITOPS_ENTRY}")
+          if [ "${AGENT_STATE_RESET:-false}" != "true" ]; then
+            echo "the PlatformAgent has no spec.integration.repositories[] entry with role gitops for ${slug}, so ${CASE} has nowhere to pin its base (the deprecated github alias carries none): rerun with AGENT_STATE_RESET=true, whose reset writes that entry" >&2
+            exit 1
+          fi ;;
+        *)
+          echo "cannot read the PlatformAgent on ${AGENT_HOST_CONTEXT}, so whether ${CASE} can pin its base is unknown" >&2
+          exit 1 ;;
+      esac ;;
+    1) ;;
+    *)
+      echo "cannot read the PlatformAgent CRD on ${AGENT_HOST_CONTEXT}, so whether ${CASE} can pin its base is unknown; nothing was changed" >&2
+      exit 1 ;;
+  esac
+fi
 HOLD_SUPPORTED="$(uv run --no-sync python - <<'PY'
 from devops_bench.verification.spec import parse_entries
 probe = [{"name": "p", "role": "safeguard", "severity": "recoverable", "mode": "hold",
@@ -170,9 +308,9 @@ PY
 render_task_copy() {
   [ -n "${RENDERED_TASKS}" ] && return 0
   RENDERED_TASKS="$(mktemp -d "${TMPDIR:-/tmp}/${RENDERED_TASKS_TEMPLATE}")"
-  mkdir -p "${RENDERED_TASKS}/${TASK}-gitops"
-  cp "${TASK_SOURCE}/task.yaml" "${RENDERED_TASKS}/${TASK}-gitops/task.yaml"
-  TASK_SOURCE="${RENDERED_TASKS}/${TASK}-gitops"
+  mkdir -p "${RENDERED_TASKS}/${CASE}"
+  cp "${TASK_SOURCE}/task.yaml" "${RENDERED_TASKS}/${CASE}/task.yaml"
+  TASK_SOURCE="${RENDERED_TASKS}/${CASE}"
 }
 # 1a. repository ------------------------------------------------------------
 # 1a. repository ------------------------------------------------------------
@@ -185,7 +323,6 @@ render_task_copy() {
 # a per-run repository (#1773), and run-branch.sh commits the broken render on
 # it (b-0011's staged history hangs off that same commit unless
 # GITOPS_HISTORY_PARENT_SHA says otherwise).
-slug="${GITOPS_REPO#https://github.com/}"; slug="${slug%.git}"
 if [ -z "${GITOPS_BROKEN_BASE_SHA:-}" ]; then
   : "${GITOPS_REPO_ROOT_SHA:=$(GH_TOKEN="$(tr -d '\r\n' < "${GITOPS_TOKEN_FILE}")" gh api "repos/${slug}/commits/${REPO_DEFAULT_BRANCH}" --jq .sha)}"
   [ -n "${GITOPS_REPO_ROOT_SHA}" ] || { echo "could not read ${REPO_DEFAULT_BRANCH}'s head in ${GITOPS_REPO}" >&2; exit 1; }
@@ -272,7 +409,13 @@ echo "==> result row model: ${AGENT_MODEL} (LiteLLM alias ${AGENT_MODEL_ALIAS})"
 # Remove the PlatformAgent (the operator garbage-collects everything it owns,
 # the data and session-metadata claims included), remove the shell
 # StatefulSet's claims, re-apply the same spec with the run's repository as
-# its managed repository, and wait for Ready. Then prove the stores are empty
+# its managed repository, and wait for Ready. For a case that pins its base
+# (and for a spec already in that form), the repository goes into the lists
+# form (spec.integration.forges and a repositories[] entry with role gitops)
+# instead of the deprecated github alias, which carries no base, so
+# agent-base-branch.sh has an entry to pin; on a CRD from before the lists form
+# the alias stays, and that install pins no base. An existing gitops entry for
+# the run's repository keeps its baseBranch. Then prove the stores are empty
 # before the card is created; a non-empty store is a refusal, not a warning.
 agent_stores_report() {
   "${K[@]}" exec -i deploy/platform-agent-gateway -c platform-agent -- env ONBOARDING_CARD_PREFIX="${ONBOARDING_CARD_PREFIX}" python3 - <<'STORES'
@@ -321,10 +464,97 @@ bad = [k for k in ("kanban_cards", "front_messages", "platform_messages_outside_
 sys.exit(1 if bad else 0)' || { echo "the agent is not fresh (see the stores above); rerun with AGENT_STATE_RESET=true" >&2; exit 1; }
 }
 reset_agent_state() {
-  local backup pvc waited
+  local backup reapply pvc waited lists="${case_pin:-false}" drift_field=true crd_rc
+  # The CRD is read before anything is deleted, because kubectl apply's field
+  # validation is strict by default: a field the CRD does not declare fails
+  # the re-apply after the PlatformAgent is gone. On a CRD without the lists
+  # form (#2070), a case that pins its base keeps the alias, and
+  # agent-base-branch.sh then logs that the install pins no base (the case's
+  # red). On one without spec.harness.driftDetector (an operator from before
+  # it, which runs no drift detector) nothing is written there.
+  # spec.harness.eventWatcher is declared by every release.
+  if [ "${lists}" = "true" ]; then
+    crd_rc=0
+    crd_declares spec.integration.forges spec.integration.repositories || crd_rc=$?
+    case "${crd_rc}" in
+      0) ;;
+      1)
+        echo "==> the installed PlatformAgent CRD has no spec.integration.forges and repositories, so the reset keeps the github alias, which carries no base: this install pins none"
+        lists=false ;;
+      *)
+        echo "cannot read the PlatformAgent CRD on ${AGENT_HOST_CONTEXT}, so whether the reset can write the lists form is unknown; nothing was reset" >&2
+        exit 1 ;;
+    esac
+  fi
+  crd_rc=0
+  crd_declares spec.harness.driftDetector || crd_rc=$?
+  case "${crd_rc}" in
+    0) ;;
+    1)
+      echo "==> the installed PlatformAgent CRD has no spec.harness.driftDetector, so the reset writes none (the install runs no drift detector)"
+      drift_field=false ;;
+    *)
+      echo "cannot read the PlatformAgent CRD on ${AGENT_HOST_CONTEXT}, so whether the reset can write spec.harness.driftDetector is unknown; nothing was reset" >&2
+      exit 1 ;;
+  esac
   backup="${TMPDIR:-/tmp}/platformagent-$(date +%Y%m%d-%H%M%S).json"
+  reapply="${backup%.json}.reapply.json"
   "${K[@]}" get "${CR}" -o json > "${backup}"
   echo "==> resetting agent state: PlatformAgent saved to ${backup}"
+  # The PlatformAgent to re-apply is built from the backup before anything is
+  # deleted, so a failure building it leaves the PlatformAgent in place.
+  # The event watcher turns Warning events from every watched cluster into
+  # autonomous triage cards; on a benchmark run the prompt must be the only
+  # stimulus (a reset alone made it file four cards about the host), so the
+  # re-applied agent has it off. AGENT_EVENT_WATCHER=true keeps it on. The
+  # drift detector is the same kind of stimulus: it turns the reset's own
+  # deletions on the host into out-of-band-change triage cards (four of them
+  # before the freshness check on a 2026-10-05 run), so it is off too, keeping
+  # its other settings; AGENT_DRIFT_DETECTOR=true keeps it on.
+  python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1])); repo = sys.argv[2]; watcher = sys.argv[3] == "true"; lists = sys.argv[4] == "true"; drift = sys.argv[5] == "true"; drift_field = sys.argv[6] == "true"
+sys.path.insert(0, sys.argv[7])
+import gitops_repo
+d.pop("status", None)
+for k in ("resourceVersion", "uid", "creationTimestamp", "generation", "managedFields", "finalizers", "deletionTimestamp"): d["metadata"].pop(k, None)
+d["metadata"].get("annotations", {}).pop("kubectl.kubernetes.io/last-applied-configuration", None)
+integration = d["spec"].setdefault("integration", {})
+if repo and (lists or integration.get("forges") or integration.get("repositories")):
+    # Also for a spec already in the lists form (a pinned run leaves it so),
+    # beside which the alias would be refused. The alias is one forge named
+    # github with namespace org, and its gitRepo the gitops repository on it;
+    # other forges and repositories are kept.
+    alias = integration.pop("github", None) or {}
+    forges = integration.setdefault("forges", [])
+    forge = next(iter(gitops_repo.github_forges(integration)), None)
+    if forge is None:
+        # Under a name no forge has: the schema keys forges on name, and one
+        # named github may be on another provider, or refused.
+        names = {f.get("name") for f in forges}
+        forge = next(n for n in ["github"] + ["github-%d" % i for i in range(2, len(forges) + 2)] if n not in names)
+        forges.append({"name": forge, "provider": "github", **({"namespace": alias["org"]} if alias.get("org") else {})})
+    # The existing gitops entry for the same repository (resolved as the
+    # operator and agent-base-branch.sh resolve it) keeps its forge, namespace
+    # and baseBranch, so an administrator'"'"'s base survives the reset; one for
+    # another repository is replaced, and a base it held is logged.
+    same = gitops_repo.gitops_entry(integration, repo)
+    gitops = {"forge": forge, "repository": repo, "role": "gitops"}
+    for i, r in enumerate(integration.get("repositories") or []):
+        if r.get("role") != "gitops":
+            continue
+        if same and i == same[0]:
+            gitops.update({k: r[k] for k in ("forge", "namespace", "baseBranch") if k in r})
+        elif r.get("baseBranch"):
+            print("==> the reset replaces the gitops entry %s, and with it its baseBranch %s" % (r.get("repository"), r["baseBranch"]), file=sys.stderr)
+    integration["repositories"] = [gitops] + [
+        r for r in integration.get("repositories") or [] if r.get("role") != "gitops"]
+elif repo:
+    integration.setdefault("github", {})["gitRepo"] = repo
+d["spec"].setdefault("harness", {})["eventWatcher"] = {"enabled": watcher}
+if drift_field:
+    d["spec"]["harness"]["driftDetector"] = {**(d["spec"]["harness"].get("driftDetector") or {}), "enabled": drift}
+print(json.dumps(d))' "${backup}" "${GITOPS_REPO:-}" "${AGENT_EVENT_WATCHER:-false}" "${lists}" "${AGENT_DRIFT_DETECTOR:-false}" "${drift_field}" "${GITOPS_REPO_HELPER%/*}" > "${reapply}"
   "${K[@]}" delete "${CR}" --wait --timeout="${CR_REMOVE_TIMEOUT}"
   for pvc in ${SHELL_PVCS}; do "${K[@]}" delete pvc "${pvc}" --ignore-not-found --wait=false; done
   waited=0
@@ -333,19 +563,7 @@ reset_agent_state() {
     [ "${waited}" -lt "${PVC_GONE_TIMEOUT_SEC}" ] || { echo "agent volumes still present after ${PVC_GONE_TIMEOUT_SEC}s" >&2; "${K[@]}" get pvc >&2; exit 1; }
     sleep "${PVC_POLL_INTERVAL_SEC}"; waited=$((waited + PVC_POLL_INTERVAL_SEC))
   done
-  # The event watcher turns Warning events from every watched cluster into
-  # autonomous triage cards; on a benchmark run the prompt must be the only
-  # stimulus (a reset alone made it file four cards about the host), so the
-  # re-applied agent has it off. AGENT_EVENT_WATCHER=true keeps it on.
-  python3 -c '
-import json, sys
-d = json.load(open(sys.argv[1])); repo = sys.argv[2]; watcher = sys.argv[3] == "true"
-d.pop("status", None)
-for k in ("resourceVersion", "uid", "creationTimestamp", "generation", "managedFields", "finalizers", "deletionTimestamp"): d["metadata"].pop(k, None)
-d["metadata"].get("annotations", {}).pop("kubectl.kubernetes.io/last-applied-configuration", None)
-if repo: d["spec"].setdefault("integration", {}).setdefault("github", {})["gitRepo"] = repo
-d["spec"].setdefault("harness", {})["eventWatcher"] = {"enabled": watcher}
-print(json.dumps(d))' "${backup}" "${GITOPS_REPO:-}" "${AGENT_EVENT_WATCHER:-false}" | "${K[@]}" apply -f -
+  "${K[@]}" apply -f "${reapply}"
   "${K[@]}" wait "${CR}" --for=condition=Ready --timeout="${CR_READY_TIMEOUT}"
   "${K[@]}" rollout status deploy/platform-agent-gateway --timeout="${GATEWAY_ROLLOUT_TIMEOUT}" >/dev/null
   "${K[@]}" rollout status sts/"${SHELL_STATEFULSET}" --timeout="${GATEWAY_ROLLOUT_TIMEOUT}" >/dev/null
@@ -366,7 +584,8 @@ fi
 ./hack/gitops-run-repo.sh check "${slug}"
 
 # 2. agent base branch ------------------------------------------------------
-# The stack makes the run branch the repository's default branch for the run
+# Unless the case pins the base (below), the stack makes the run branch the
+# repository's default branch for the run
 # and restores it on destroy; the agent's submit-suggestion re-asks the remote
 # for its default before each PR (decision 3 in the pilot notes). One run at a
 # time (the stack refuses to switch when the default already points at a
@@ -379,12 +598,28 @@ fi
 # every command runs in platform-agent-shell-0, whose environment does not
 # take spec.deployment.env, so the variable never reaches the process that
 # opens the PR, and that mode is gone.
+# The case's own variables decide how the agent gets its base; the wrapper
+# reads them and logs what the case does. A case that sets
+# gitops_pin_agent_base_branch has its stack set the baseBranch of the
+# PlatformAgent's GitOps repository entry (spec.integration.repositories[]) to
+# the run branch and leave the repository default alone, so the
+# default-branch switch is not exported for it.
+# BENCH_NO_TEARDOWN=true leaves that pin in place until the destroy is run by
+# hand (see 5).
 case "${BASE_BRANCH_MODE:-default-branch}" in
   default-branch) ;;
-  *) echo "BASE_BRANCH_MODE=${BASE_BRANCH_MODE} is not offered: the run branch becomes the repository's default for the run (see the comment above)" >&2; exit 1 ;;
+  *) echo "BASE_BRANCH_MODE=${BASE_BRANCH_MODE} is not offered: the case's variables decide how the agent gets its base (see the comment above)" >&2; exit 1 ;;
 esac
-echo "==> base branch via repository default (stack switches it for the run)"
-export TF_VAR_gitops_switch_default_branch=true
+case_switch="$(case_var gitops_switch_default_branch)"
+if [ "${case_pin}" = "true" ]; then
+  echo "==> base branch via the PlatformAgent's spec.integration.repositories[].baseBranch (${CASE} sets gitops_pin_agent_base_branch: its stack pins the base for the run, and the repository default stays ${REPO_DEFAULT_BRANCH})"
+elif [ "${case_switch}" = "false" ]; then
+  echo "${CASE} sets gitops_switch_default_branch false and pins no base: nothing would make the run branch the agent's base" >&2
+  exit 1
+else
+  echo "==> base branch via repository default (stack switches it for the run)"
+  export TF_VAR_gitops_switch_default_branch=true
+fi
 
 # 3. tokens -----------------------------------------------------------------
 PLATFORM_AGENT_TOKEN="$("${K[@]}" get secret platform-agent-secrets -o jsonpath='{.data.API_SERVER_KEY}' | base64 -d)"
@@ -421,12 +656,25 @@ echo "==> devops-bench ${TASK_SOURCE} (cluster ${CLUSTER_NAME}, argo context ${G
 rc=0
 uv run --no-sync devops-bench "${TASK_SOURCE}" --agent-type kubeagents "$@" || rc=$?
 
-# 5. stamp and leak check (#1773) -------------------------------------------
-# What the row was produced with, beside the record, so a campaign's rows can
-# be shown to share one setup; then the checks that catch a leaked run (a
-# cluster or branch left behind, the default branch still switched).
+# 5. pull requests, stamp and leak check (#1773) ----------------------------
+# The harness waits only for a pull request onto the run branch, so a run whose
+# agent opened its pull request onto the default branch and a run whose agent
+# opened none both record no_pr. The pull requests opened in the repository
+# since the run started, with their bases (hack/gitops-run-prs.sh; null when
+# the listing failed), tell the two apart, and a pull request onto the run
+# branch on an install that pins no base shows an agent that found the branch
+# on its own. Then what the row was produced with,
+# beside the record, so a campaign's rows can be shown to share one setup;
+# then the checks that catch a leaked run (a cluster or branch left behind,
+# the default branch still switched, a baseBranch on the PlatformAgent still
+# pinned).
+gh_token="$(tr -d '\r\n' < "${GITOPS_TOKEN_FILE}")"
+RUN_PRS="$(GH_TOKEN="${gh_token}" ./hack/gitops-run-prs.sh "${slug}" "${RUN_STARTED_AT}" "${REPO_DEFAULT_BRANCH}")" \
+  || RUN_PRS=null
+export RUN_PRS
 run_dir="$(ls -td "${RESULTS_DIR}"/run_* 2>/dev/null | head -1 || true)"
 if [ -n "${run_dir}" ] && [ -n "$(find "${run_dir}" -newer "${TASK_SOURCE}/task.yaml" -name results.json | head -1)" ]; then
+  export STAMP_CASE="${CASE}" STAMP_STARTED="${RUN_STARTED_AT}" STAMP_DEFAULT_BRANCH="${REPO_DEFAULT_BRANCH}"
   export STAMP_TASK="${TASK}" STAMP_CLUSTER="${CLUSTER_NAME}" STAMP_BRANCH="${RUN_BRANCH}" \
     STAMP_REPO="${GITOPS_REPO}" STAMP_ROOT="${GITOPS_BROKEN_BASE_SHA}" \
     STAMP_MODEL="${AGENT_MODEL}" STAMP_JUDGE="${JUDGE_MODEL}" STAMP_PIN="${DEVOPS_BENCH_PIN:-repository pin}" \
@@ -445,6 +693,11 @@ stamp = {
   "kube_agents_commit": sh("git", "rev-parse", "HEAD"),
   "agent_state_reset": e["STAMP_RESET"],
   "agent_stores_before_run": json.loads(e.get("AGENT_STORES") or "null"),
+  "case": e["STAMP_CASE"], "run_started_at": e["STAMP_STARTED"],
+  # Every pull request opened since run_started_at, with its base; null when
+  # the listing failed.
+  "default_branch": e["STAMP_DEFAULT_BRANCH"],
+  "pull_requests": json.loads(e.get("RUN_PRS") or "null"),
 }
 json.dump(stamp, open(sys.argv[1], "w"), indent=2)
 print("==> stamp written to", sys.argv[1])
@@ -463,15 +716,22 @@ if [ -n "${run_dir}" ] && [ -n "${INTEGRITY_SWEEP_SCRIPT:-}" ] && [ -f "${run_di
   rm -rf "${sweep_root}"
 fi
 if [ "${BENCH_NO_TEARDOWN:-false}" != "true" ]; then
-  gh_token="$(tr -d '\r\n' < "${GITOPS_TOKEN_FILE}")"
   repo_slug="${slug}"
   if GH_TOKEN="${gh_token}" gh api "repos/${repo_slug}/git/refs/heads/${RUN_BRANCH}" >/dev/null 2>&1; then
     echo "WARN leak: run branch ${RUN_BRANCH} still exists in ${repo_slug}" >&2
   fi
   default_branch="$(GH_TOKEN="${gh_token}" gh api "repos/${repo_slug}" --jq .default_branch 2>/dev/null || true)"
   [ "${default_branch}" = "${REPO_DEFAULT_BRANCH}" ] || echo "WARN leak: default branch of ${repo_slug} is '${default_branch}', not ${REPO_DEFAULT_BRANCH}" >&2
+  if ! agent_base_lines="$(agent_bases 2>/dev/null)"; then
+    echo "WARN leak: whether a PlatformAgent spec.integration.repositories[].baseBranch still names ${RUN_BRANCH} is unknown (it could not be read); check it by hand" >&2
+  elif cut -f3 <<<"${agent_base_lines}" | grep -qxF "${RUN_BRANCH}"; then
+    echo "WARN leak: a PlatformAgent spec.integration.repositories[].baseBranch still names ${RUN_BRANCH}" >&2
+  fi
   if gcloud container clusters list --project "${GCP_PROJECT_ID}" --filter="name=${CLUSTER_NAME}" --format="value(name)" 2>/dev/null | grep -q .; then
     echo "WARN leak: task cluster ${CLUSTER_NAME} still exists" >&2
   fi
+elif [ "${case_pin}" = "true" ] \
+  && { agent_bases 2>/dev/null || true; } | cut -f3 | grep -qxF "${RUN_BRANCH}"; then
+  echo "WARN BENCH_NO_TEARDOWN=true: the PlatformAgent's spec.integration.repositories[].baseBranch still names ${RUN_BRANCH}, so every proposal onto ${slug} from this install targets it until the stack's destroy is run by hand" >&2
 fi
 exit "${rc}"
