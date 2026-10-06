@@ -44,7 +44,8 @@ said "done" while the disk said "no report" for the whole sweep, which is
 indistinguishable from "never scanned" — and a 1-minute job with no memory of
 its own re-filed the sweep, once a minute, for as long as the real work took.
 The sweep card completes long before the audits do, and the
-raw file and the prioritization card come from the hand-off minutes later, so
+raw file and the prioritization card (or, with nothing audited, the report
+itself) come from the hand-off minutes later, so
 board-done/disk-empty is the normal middle of a sweep. Only a marker written at
 file time covers every case.
 

@@ -5,7 +5,8 @@ gate's tick: it files one ``bootstrap-inventory-cluster-*`` card per Cluster
 Agent, waits for those cards and the sweep to settle, writes
 ``INVENTORY.raw.md`` from their structured ``metadata``, and files the
 ``bootstrap-inventory-prioritize`` card that ranks it into the report the user
-receives. The sweep's worker only lists the fleet and audits any cluster with
+receives — or, when no cluster's audit reached the raw file, writes that report
+itself, saying so, and files no ranking card. The sweep's worker only lists the fleet and audits any cluster with
 no Cluster Agent.
 
 It is code rather than SOP text because each of these steps is mechanical
@@ -17,7 +18,7 @@ children; it typed the raw file by hand and left out the ```findings block
 its idempotency key.
 
 Once-only, like the sweep: ``.bootstrap_handoff_filed`` records which sweep was
-handed off and which ranking card it got. It names the sweep so that a re-armed
+handed off and which ranking card it got (``none`` when it filed none). It names the sweep so that a re-armed
 discovery, which deletes ``.bootstrap_scan_filed`` but may not know this marker,
 still gets its own hand-off.
 """
@@ -115,6 +116,8 @@ LIST_FIELDS = ("findings", "workloads")
 # Recorded as the ranking card when no cluster was audited and none was filed.
 NO_RANKING = "none"
 GAPS_HEADING = "## Gaps"
+# The no-coverage report goes to chat verbatim; the rest stay in the raw file.
+MAX_REPORT_GAPS = 10
 # Placeholders a Cluster Agent writes where a field names more than one object.
 NOT_AN_OBJECT = ("", "multiple", "multiple workloads", "various", "n/a", "none")
 
@@ -320,11 +323,26 @@ def _cell(value) -> str:
     return str(value).replace("|", "/").replace("\n", " ")
 
 
+def _named(meta) -> bool:
+    """An audit the report can list: it names its project and cluster."""
+    return isinstance(meta, dict) and bool(_text(meta.get("cluster")) and _text(meta.get("project")))
+
+
+def _sweep_audits(sweep: dict) -> list:
+    """The sweep's own audits; one object where the SOP asks for a list is one audit."""
+    clusters = sweep["metadata"].get("clusters")
+    return [clusters] if isinstance(clusters, dict) else _list(clusters)
+
+
 def _malformed(meta: dict) -> list[tuple[str, str]]:
-    """The list fields the audit SOP prescribes that a card set to something else."""
-    bad = [(f, type(meta[f]).__name__) for f in LIST_FIELDS if meta.get(f) is not None and not isinstance(meta[f], list)]
+    """The list fields the audit SOP prescribes that a card set to something else.
+
+    An empty value of the wrong type (``{}``, ``""``, ``0``) says "none" and
+    loses nothing, so it is not reported.
+    """
+    bad = [(f, type(meta[f]).__name__) for f in LIST_FIELDS if meta.get(f) and not isinstance(meta[f], list)]
     gaps = meta.get("gaps")
-    if gaps is not None and not isinstance(gaps, (list, str)):
+    if gaps and not isinstance(gaps, (list, str)):
         bad.append(("gaps", type(gaps).__name__))
     return bad
 
@@ -360,7 +378,7 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
     gaps: list[str] = []
     for card in state["clusters"]:
         meta = card["metadata"]
-        if card["status"] == DONE and _text(meta.get("cluster")) and _text(meta.get("project")):
+        if card["status"] == DONE and _named(meta):
             audits.append((meta, card["id"]))
         elif card["status"] == DONE:
             own = "; ".join(_cell(g) for g in _gap_list(meta))
@@ -377,8 +395,8 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
             gaps.append(f"{_cell(card['title'] or card['key'])} ({card['id']}): {card['status']} before it reported")
         else:
             gaps.append(f"{_cell(card['title'] or card['key'])} ({card['id']}): still {_cell(card['status'])} when the hand-off ran")
-    for meta in _list(sweep["metadata"].get("clusters")):
-        if isinstance(meta, dict) and _text(meta.get("cluster")) and _text(meta.get("project")):
+    for meta in _sweep_audits(sweep):
+        if _named(meta):
             audits.append((meta, sweep["id"]))
             gaps.append(
                 f"{_cell(meta.get('cluster'))} ({_cell(meta.get('project'))}): no Cluster Agent, so the sweep "
@@ -535,23 +553,27 @@ def _sandbox():
 
 def covered(state: dict) -> bool:
     """True when at least one cluster's audit reached the report."""
-    def named(meta) -> bool:
-        return isinstance(meta, dict) and bool(_text(meta.get("cluster")) and _text(meta.get("project")))
-
-    return any(c["status"] == DONE and named(c["metadata"]) for c in state["clusters"]) or any(
-        named(m) for m in _list(state["sweep"]["metadata"].get("clusters"))
+    return any(c["status"] == DONE and _named(c["metadata"]) for c in state["clusters"]) or any(
+        _named(m) for m in _sweep_audits(state["sweep"])
     )
 
 
 def no_coverage_report(raw: str) -> str:
     """The delivered report when no cluster was audited: what went wrong, never a clean result."""
-    start = raw.find(GAPS_HEADING)
-    end = raw.find("\n## ", start + len(GAPS_HEADING)) if start >= 0 else -1
-    gaps = raw[start + len(GAPS_HEADING):end if end >= 0 else None].strip() if start >= 0 else ""
+    # A heading on its own line: _cell keeps table and list values on one line.
+    heading = f"\n{GAPS_HEADING}\n"
+    start = raw.find(heading)
+    body = start + len(heading)
+    end = raw.find("\n## ", body) if start >= 0 else -1
+    section = raw[body:end if end >= 0 else None] if start >= 0 else ""
+    lines = [line for line in section.splitlines() if line.strip()]
+    shown = "\n".join(lines[:MAX_REPORT_GAPS])
+    more = len(lines) - MAX_REPORT_GAPS
+    tail = f"\n\n{more} more in the full record." if more > 0 else ""
     return (
         "## Onboarding scan: no cluster was audited\n\n"
         "The first-time scan finished without an audit of any cluster, so this is not a clean result. "
-        f"What it recorded:\n\n{gaps}\n\nThe full record is `{RAW_PATH}`.\n"
+        f"What it recorded:\n\n{shown}{tail}\n\nThe full record is `{RAW_PATH}`.\n"
     )
 
 

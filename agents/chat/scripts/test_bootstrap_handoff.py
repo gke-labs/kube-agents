@@ -358,6 +358,37 @@ class HandOffTest(unittest.TestCase):
         self.assertIsNone(self._run_roster([]))
         self.assertFalse((self.d / "INVENTORY.md").exists())
 
+    def test_the_no_coverage_report_lists_only_the_first_gaps(self):
+        raw = "# r\n\n## Gaps\n\n" + "".join(f"- gap {i}\n" for i in range(25)) + "\n## Machine-Readable Findings\n"
+        report = h.no_coverage_report(raw)
+        self.assertIn("- gap 9\n", report)
+        self.assertNotIn("- gap 10", report)
+        self.assertIn("15 more in the full record.", report)
+        self.assertNotIn("Machine-Readable", report)
+
+    def test_a_sweep_audit_written_as_one_object_counts(self):
+        # A single-cluster install with no Cluster Agents: the sweep's own audit,
+        # written as an object where the SOP asks for a list.
+        audit = {"project": "p", "cluster": "c", "workloads": [], "findings": [], "gaps": []}
+        _board(self.board, sweep_meta={"clusters": audit, "fleet": [{"project": "p", "cluster": "c"}]}, clusters=[])
+        self.assertEqual(self._run_roster([]), "t_rank1")
+        self.assertFalse((self.d / "INVENTORY.md").exists())
+        self.assertNotIn("no audit reported on it", (self.d / "INVENTORY.raw.md").read_text())
+
+    def test_an_empty_value_of_the_wrong_type_is_not_a_gap(self):
+        meta = {"project": "p", "cluster": "c", "workloads": [], "findings": "", "gaps": {}}
+        _board(self.board, clusters=[("t_odd", "done", meta, "")])
+        self.assertEqual(self._run(), "t_rank1")
+        raw = (self.d / "INVENTORY.raw.md").read_text()
+        self.assertNotIn("not a list", raw)
+        self.assertIn("| t_odd | 0 | yes |", raw)
+
+    def test_a_gaps_heading_inside_a_value_is_not_the_section(self):
+        raw = "# r\n\n| x | telemetry ## Gaps\n- not this |\n\n## Gaps\n\n- the real gap\n\n## Machine-Readable Findings\n"
+        report = h.no_coverage_report(raw)
+        self.assertIn("- the real gap", report)
+        self.assertNotIn("not this", report)
+
     def test_a_list_field_of_the_wrong_type_is_a_gap_not_a_clean_cluster(self):
         meta = {"project": "p", "cluster": "c", "workloads": [{"name": "w"}], "findings": "buildkit runs privileged",
                 "gaps": {"reason": "ssh exit 255"}}
