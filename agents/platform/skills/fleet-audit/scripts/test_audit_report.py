@@ -16438,7 +16438,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertTrue(self.harness.forge_calls("proposal-close"))
         comment = " ".join(self.harness.bodies_for("proposal-*"))
         self.assertIn("declared to need the `default` ServiceAccount's token", comment)
-        self.assertIn("The finding has not gone", comment)
+        self.assertIn("Nothing here is announced as fixed", comment)
         self.assertNotIn("If the finding comes back", comment)
 
     def test_a_shielded_sibling_closes_the_pull_request_whose_branch_no_group_owns(self):
@@ -16585,6 +16585,33 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(self.stdout_json()["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
         comment = " ".join(self.harness.bodies_for("proposal-*"))
         self.assertIn("declared to need the `default` ServiceAccount's token", comment)
+        # The held comment and the finish log say the close happened.
+        ledger = " ".join(self.harness.bodies_for("issue-*"))
+        self.assertIn("except the one the compliance shield forbids", ledger)
+        self.assertIn("except the compliance shield's (1)", self.err)
+
+    def test_a_partial_run_closes_the_pull_request_on_a_fleet_wide_declaration_for_the_gap_cluster(self):
+        # The common note shape names no cluster. The pull request's own ids
+        # name one, so the close matches them by namespace and workload.
+        path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
+        api = make_finding(fid="api", check="default-sa-automount", obj="Deployment/api", title="api", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        previous_body = published_body(make_doc(findings=[api], audit=AUDIT), generated_at=NOW)
+        self.declaring_replies(previous_body)
+        api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
+        self.harness.replies["proposal-list"] = proposals_view(
+            [pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([api_id]))]
+        )
+        self.touch(path)
+        pathlib.Path(audit_report.declarations_path_for(AUDIT)).parent.mkdir(parents=True, exist_ok=True)
+        audit_report.write_declarations(AUDIT, "acme/fleet", [{"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}])
+        doc = make_doc(findings=[], audit=AUDIT, clusters=[{"name": "stage-eu", "location": "europe-west1", "project": "acme-stage"}], skipped=[{"cluster": "prod-us-east", "reason": "control plane unreachable"}])
+        manifest = _full_manifest(names=("stage-eu",), audit=AUDIT)
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        self.assertTrue(self.stdout_json()["partial"])
+        self.assertEqual(self.stdout_json()["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
+        comment = " ".join(self.harness.bodies_for("proposal-*"))
+        self.assertIn("declared to need the `default` ServiceAccount's token", comment)
 
     def test_a_partial_run_closes_a_pull_request_whose_workloads_are_all_declared(self):
         # The strongest case: every 2.7 workload on the pull request is now
@@ -16668,7 +16695,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         # not the group's), the shield reason is not among it.
         comment = " ".join(self.harness.bodies_for("proposal-*"))
         self.assertNotIn("declared to need the `default` ServiceAccount's token", comment)
-        self.assertNotIn("The finding has not gone", comment)
+        self.assertNotIn("Nothing here is announced as fixed", comment)
         self.assertNotIn("MANUAL:", self.err)
 
     def replay_ledger(self, body):
