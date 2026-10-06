@@ -534,27 +534,40 @@ gh api repos/gke-labs/kube-agents/rules/branches/release%2F0.8 \
 The runbook section above says why the two differ, which three settings carry a line's
 protection, and what has to follow when `main`'s set changes.
 
-**A green smoke run stays valid when `main` moves — usually.** Tide credits a Prow presubmit only
-against the base SHA it ran on — crier records it as a `BaseSHA:<sha>` suffix on the commit status
-— so on its own every merge to `main` would invalidate every other pull request's green
+**A green smoke run stays valid when `main` moves.** Tide credits a Prow presubmit only against
+the base SHA it ran on — crier records it as a `BaseSHA:<sha>` suffix on the commit status — so on
+its own every merge to `main` would invalidate every other pull request's green
 `pull-kube-agents-smoke-test` and re-run the whole job for a pull request whose head has not
-changed (#1179, #1202). [`smoke-test-sticky.yml`](../.github/workflows/smoke-test-sticky.yml) re-pins that suffix
-to the new head of `main` — for every open pull request against `main` on each push to `main`, and
-for one commit when its green arrives after `main` has already moved — with a note in the
-description saying so, and Tide reads the result as current. It is a race against Tide's roughly
-once-a-minute sync: when the sweep lands first, a pull request green at its own head merges without
-a fresh-base retest, one per sync once no batch is in flight; when Tide's sync lands first it
-starts the retest as before (a batch, when two or more qualify), crier's `pending` is then the
-newer status, and the sweep leaves it alone. A push still starts a fresh run;
+changed (#1179, #1202); the header of `hack/ci-revalidate.sh` keeps the record of what that cost
+over the three weeks before it was answered. Two things answer it.
+[`smoke-test-sticky.yml`](../.github/workflows/smoke-test-sticky.yml) re-pins that suffix to the
+new head of `main` — for every open pull request against `main` on each push to `main`, and for
+one commit when its green arrives after `main` has already moved — with a note in the description
+saying so, and Tide reads the result as current. It is a race against Tide's roughly once-a-minute
+sync, and the sweep sometimes loses it; when it does, Tide starts the retest as before (a
+batch, when two or more qualify), crier's `pending` is then the newer status, and the sweep leaves
+it alone. That retest is what [`hack/ci-revalidate.sh`](../hack/ci-revalidate.sh), the job's step 0,
+makes cheap: before the job leases an evaluation project it looks for a green build of this job at
+the pull request's head, attested by the Prow-posted success status on that head, and reuses its
+verdict whatever `main` has done since — a batch pull by pull, every one or none — so a lost race
+costs the minutes of a pod start and a clone rather than the 1.5 to 3.5 hours of the matrix. A push
+still starts a fresh run, and a run it is: step 0 reuses an earlier head's green only when
+everything since, on the pull request's side and on `main`'s, is inert.
 `/test pull-kube-agents-smoke-test` on the same head posts `pending`, which wins until that run
-reports (`/retest` does not, because it reruns only failed contexts); a red is never touched, and
-an admin `/override` is carried the same way as a green, because crier stamps the same `BaseSHA:`
-suffix on it. What this trades away is testing the combination with the `main`
-it lands on before the merge; until a scheduled eval run on `main` exists, a bad combination is
-found by the next smoke run that actually starts after it — a push or `/test` on whichever pull
-request that is, whose author then sees a red that is not theirs. Prow's own form of this — a `[prow:skip-retest]` sentinel
-written by `/override-sticky` — is upstream but not in the Prow build this repository merges
-through; `scripts/pin_smoke_status.py` says when to switch.
+reports (`/retest` does not, because it reruns only failed contexts), and that run too reuses the
+head's green: a genuine re-run of the matrix at an unchanged head is not something a pull request
+can ask for — a non-inert push is, and `EVAL_SKIP_REVALIDATION=1` in the job's env in
+`oss-test-infra` is the operator's lever. The re-pin never touches a red; step 0 prefers the newest
+green at the head, so a newer red at the same head is overridden on the next trigger, and the
+script's header says why to read such a red as flake or as a real break, not as noise. An admin
+`/override` is carried by the re-pin the same way as a green, because crier stamps the same
+`BaseSHA:` suffix on it, but not by step 0, which reuses only a build that passed. What this trades
+away, on every retest and not only when the sweep wins: the combination of a head with the `main`
+it lands on, and in a batch with the other pulls, is not tested before the merge; the nightly eval
+on `main` is what finds a bad combination, as is the next smoke run that actually starts after it.
+Prow's own form of the re-pin — a `[prow:skip-retest]` sentinel written by `/override-sticky` — is
+upstream but not in the Prow build this repository merges through; `scripts/pin_smoke_status.py`
+says when to switch.
 
 **`mergeStateStatus` cannot answer "is this ready to merge" here, and it is the natural thing to
 reach for.** Every open pull request reads `BLOCKED` or `DIRTY` and none ever reads `CLEAN`, because
@@ -593,7 +606,9 @@ back. `scripts/notify_flaky_check.py` holds the reasoning; the workflow's header
 
 A re-run that fails again records nothing, and neither does a push that happens to go green: only a
 same-commit pass after a failure is evidence the code was innocent. Prow's `/retest` on the smoke
-test is a different system and is not watched; the `presubmit-gate` label is that job's channel.
+test is a different system and is not watched; the `presubmit-gate` label is that job's channel, and
+a smoke green after a red at the same head may be step 0 reusing the older green rather than a pass
+(see "A green smoke run stays valid when `main` moves" above).
 
 ## Who owns an open pull request
 

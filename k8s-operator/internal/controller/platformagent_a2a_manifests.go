@@ -5273,6 +5273,11 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 		// that would make every callout answer be refused.
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.Client},
+		// The callout's budget, after its Deployment for the reason the
+		// verifier's budget below gives: a pass that dies between the two
+		// leaves a budget over terminating pods rather than two running
+		// callouts with none.
+		{&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The capability verifier, after the gateway that submits work and
 		// before the bus it reads through. Its ServiceAccount goes with it:
 		// left behind, it is a mintable bus identity whose grants include the

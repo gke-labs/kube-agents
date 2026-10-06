@@ -106,6 +106,9 @@ class SlackAdapter:
     def _event_declares_bot_sender(self, event: dict) -> bool:
         return False
 
+    async def _resolve_user_name(self, user_id: str, chat_id: str = "", team_id: str = "") -> str:
+        return user_id
+
     def _slack_message_matches_mention_patterns(self, text: str) -> bool:
         return False
 
@@ -254,6 +257,11 @@ class ApplierTest(unittest.TestCase):
             ("        self._bot_user_id: str = \"\"\n", "", "no longer sets _bot_user_id"),
             ("self._team_bot_user_ids, self._other = {}, {}", "self._bot_ids, self._other = {}, {}",
              "no longer sets _team_bot_user_ids"),
+            ("def _resolve_user_name(", "def _user_name(", "_resolve_user_name"),
+            ("    async def _resolve_user_name(", "    def _resolve_user_name(",
+             "_resolve_user_name is no longer async"),
+            ('chat_id: str = "", team_id: str = "") -> str:', 'chat_id: str = "") -> str:',
+             "_resolve_user_name no longer accepts"),
             ("def _is_ignored_channel(self, channel_id)", "def _is_ignored_channel(self)",
              "_is_ignored_channel no longer accepts"),
             ("    def _is_ignored_channel(", "    async def _is_ignored_channel(",
@@ -399,9 +407,12 @@ def _slack_mention_detection_text(event):
 class _Adapter:
     def __init__(
         self, authorized=True, fail=(), allowed_channels=(), disable_dms=False, ignored=(), replies=(), unlisted=(),
-        unheard=(), ignore_other_user_mentions=False, broken=(), api_human_users=(),
+        unheard=(), ignore_other_user_mentions=False, broken=(), api_human_users=(), names=None,
     ):
         self.broken = set(broken)
+        # Upstream answers with the id itself when users.info fails or names nobody.
+        self.names = {USER: "Jayanti"} if names is None else names
+        self.named = []
         self.api_human_users = frozenset(api_human_users)
         self.ignore_other_user_mentions = ignore_other_user_mentions
         self.authorized = authorized
@@ -459,6 +470,12 @@ class _Adapter:
         if event.get("app_id") and not event.get("client_msg_id"):
             return event.get("user") not in self.api_human_users
         return False
+
+    async def _resolve_user_name(self, user_id, chat_id="", team_id=""):
+        self.named.append((user_id, chat_id, team_id))
+        if "names" in self.broken:
+            raise RuntimeError("users.info failed")
+        return self.names.get(user_id, user_id)
 
     def _slack_message_matches_mention_patterns(self, text):
         if "patterns" in self.broken:
@@ -542,9 +559,9 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(
             [[e["action_id"] for e in b["elements"]] for b in actions], [["kage.link.0"]]
         )
-        self.assertEqual(update["blocks"][-1]["elements"][0]["text"], "✓ <@U1>: Leave it")
+        self.assertEqual(update["blocks"][-1]["elements"][0]["text"], "✓ Jayanti: Leave it")
         # The note leads the text; the message's own text stays under it for a later thread read.
-        self.assertEqual(update["text"], "✓ <@U1>: Leave it\n\nfallback")
+        self.assertEqual(update["text"], "✓ Jayanti: Leave it\n\nfallback")
         self.assertEqual(
             turn,
             {
@@ -602,22 +619,34 @@ class RuntimeTest(unittest.TestCase):
             self._answer(adapter, *_choice())
         self.assertEqual([entry[0] for entry in adapter.log], ["chat_update", "message"])
 
-    def test_the_card_is_looked_up_before_the_rewrite(self):
-        cards = {(CHANNEL, MESSAGE_TS): "t_e0c1"}
-        moments = SimpleNamespace(question_card=lambda channel, ts: cards.get((channel, ts)))
-        adapter = _Adapter()
-        client = _Client(adapter.log)
-        update = client.chat_update
+    def test_the_card_is_looked_up_before_the_name_lookup_and_the_rewrite(self):
+        for during in ("the name lookup", "the rewrite"):
+            with self.subTest(during=during):
+                importlib.reload(runtime)
+                cards = {(CHANNEL, MESSAGE_TS): "t_e0c1"}
+                moments = SimpleNamespace(question_card=lambda channel, ts: cards.get((channel, ts)))
+                adapter = _Adapter()
+                client = _Client(adapter.log)
+                update = client.chat_update
+                resolve = adapter._resolve_user_name
 
-        async def settle_then_update(**kwargs):
-            cards.clear()  # the card moved on and its question was settled meanwhile
-            await update(**kwargs)
+                # The card moves on and its question is settled meanwhile.
+                async def settle_then_update(**kwargs):
+                    if during == "the rewrite":
+                        cards.clear()
+                    await update(**kwargs)
 
-        client.chat_update = settle_then_update
-        adapter._get_client = lambda chat_id, team_id=None: client
-        with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_moments=moments), "gateway.slack_ux_moments": moments}):
-            self._answer(adapter, *_choice())
-        self.assertEqual(adapter.log[-1][1]["text"], "Leave it\n\n" + runtime.CARD_NOTE.format(card="t_e0c1"))
+                async def settle_then_resolve(user_id, chat_id="", team_id=""):
+                    if during == "the name lookup":
+                        cards.clear()
+                    return await resolve(user_id, chat_id=chat_id, team_id=team_id)
+
+                client.chat_update = settle_then_update
+                adapter._resolve_user_name = settle_then_resolve
+                adapter._get_client = lambda chat_id, team_id=None: client
+                with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_moments=moments), "gateway.slack_ux_moments": moments}):
+                    self._answer(adapter, *_choice())
+                self.assertEqual(adapter.log[-1][1]["text"], "Leave it\n\n" + runtime.CARD_NOTE.format(card="t_e0c1"))
 
     def test_a_click_on_any_other_message_is_the_label_alone(self):
         moments = SimpleNamespace(question_card=lambda channel, ts: None)
@@ -661,6 +690,19 @@ class RuntimeTest(unittest.TestCase):
         with self.assertLogs(runtime.logger, level="WARNING"):
             self._answer(adapter, *_choice(1, "Leave it"))
         self.assertFalse(runtime.answered(CHANNEL, MESSAGE_TS), "a question the click did not rewrite reads settled")
+        self.assertTrue(runtime.clicked(CHANNEL, MESSAGE_TS), "a click whose rewrite failed still answered it")
+        self.assertFalse(runtime.clicked("C0OTHER", MESSAGE_TS))
+        self.assertFalse(runtime.rewriting(CHANNEL, MESSAGE_TS), "a failed rewrite is not still rewriting")
+
+    def test_rewriting_reports_a_click_between_its_record_and_its_rewrite(self):
+        self.assertFalse(runtime.rewriting(CHANNEL, MESSAGE_TS))
+        runtime._answered[(CHANNEL, MESSAGE_TS, runtime.CHOICE_KIND)] = None
+        self.assertTrue(runtime.rewriting(CHANNEL, MESSAGE_TS))
+        self.assertFalse(runtime.rewriting("C0OTHER", MESSAGE_TS))
+        runtime._answered.clear()
+        self._answer(_Adapter(), *_choice())
+        self.assertTrue(runtime.answered(CHANNEL, MESSAGE_TS))
+        self.assertFalse(runtime.rewriting(CHANNEL, MESSAGE_TS), "a landed rewrite is not still rewriting")
 
     def test_two_clicks_at_once_run_one_turn(self):
         adapter = _Adapter()
@@ -683,8 +725,10 @@ class RuntimeTest(unittest.TestCase):
             for _ in range(5):
                 await asyncio.sleep(0)
             self.assertEqual(adapter.log, [], "the first click's rewrite was not held")
+            self.assertTrue(runtime.rewriting(CHANNEL, MESSAGE_TS), "a held rewrite reads as in flight")
             release.set()
             await asyncio.gather(*clicks)
+            self.assertFalse(runtime.rewriting(CHANNEL, MESSAGE_TS))
 
         _run(both())
         turns = [entry[1]["text"] for entry in adapter.log if entry[0] == "message"]
@@ -703,7 +747,7 @@ class RuntimeTest(unittest.TestCase):
         self._answer(adapter, *_choice(value="Logs & metrics", shown="Logs &amp; metrics &amp;lt;b&amp;gt;"))
         update, turn = (entry[1] for entry in adapter.log)
         self.assertEqual(turn["text"], "Logs & metrics &lt;b&gt;")
-        self.assertEqual(update["blocks"][-1]["elements"][0]["text"], "✓ <@U1>: Logs &amp; metrics &amp;lt;b&amp;gt;")
+        self.assertEqual(update["blocks"][-1]["elements"][0]["text"], "✓ Jayanti: Logs &amp; metrics &amp;lt;b&amp;gt;")
 
     def test_turn_and_answer_carry_the_shown_text_never_the_longer_value(self):
         label = "Yes, roll back checkout-gateway to the previous revision in namespace prod " * 3
@@ -714,7 +758,7 @@ class RuntimeTest(unittest.TestCase):
         self._answer(adapter, *_choice(0, button["value"], shown=shown))
         update, turn = (entry[1] for entry in adapter.log)
         self.assertEqual(turn["text"], shown)
-        self.assertEqual(update["blocks"][-1]["elements"][0]["text"], f"✓ <@U1>: {shown}")
+        self.assertEqual(update["blocks"][-1]["elements"][0]["text"], f"✓ Jayanti: {shown}")
 
     def _card_click(self, value, label="Fix the first one", row="seeded-b and seeded-c admit privileged pods", elements=None):
         if elements is None:
@@ -737,7 +781,7 @@ class RuntimeTest(unittest.TestCase):
         # An existing session in the thread is not re-hydrated with it, so the turn itself names the row the card shows.
         update, turn = self._card_click("Fix the first one: seeded-b and seeded-c admit privileged pods")
         self.assertEqual(turn["text"], "Fix the first one: seeded-b and seeded-c admit privileged pods")
-        self.assertEqual(update["blocks"][-1]["elements"][0]["text"], "✓ <@U1>: Fix the first one")
+        self.assertEqual(update["blocks"][-1]["elements"][0]["text"], "✓ Jayanti: Fix the first one")
 
     def test_a_value_naming_a_line_the_card_does_not_show_sends_the_label(self):
         for value in (
@@ -862,7 +906,7 @@ class RuntimeTest(unittest.TestCase):
                 turn = adapter.log[-1][1]
                 self.assertEqual(turn["text"], runtime.COMMAND_GUARD + label)
                 self.assertFalse(turn["text"].lstrip().startswith(runtime.COMMAND_PREFIXES))
-                self.assertEqual(adapter.log[0][1]["blocks"][-1]["elements"][0]["text"], f"✓ <@U1>: {label}")
+                self.assertEqual(adapter.log[0][1]["blocks"][-1]["elements"][0]["text"], f"✓ Jayanti: {label}")
 
     def test_click_where_a_typed_message_is_ignored_changes_nothing(self):
         cases = {
@@ -923,14 +967,37 @@ class RuntimeTest(unittest.TestCase):
         self._answer(adapter, *_choice(thread=None))
         self.assertEqual(adapter.log[1][1]["thread_ts"], MESSAGE_TS)
 
-    def test_a_failed_rewrite_posts_the_echo_instead(self):
+    def test_a_failed_rewrite_posts_the_answered_line_instead(self):
         adapter = _Adapter(fail=("chat_update",))
         with self.assertLogs(runtime.logger, level="WARNING"):
             self._answer(adapter, *_choice())
         self.assertEqual([entry[0] for entry in adapter.log], ["chat_postMessage", "message"])
-        self.assertEqual(adapter.log[0][1], {"channel": CHANNEL, "thread_ts": THREAD, "text": "↳ <@U1>: Leave it"})
+        self.assertEqual(adapter.log[0][1], {"channel": CHANNEL, "thread_ts": THREAD, "text": "✓ Jayanti: Leave it"})
 
-    def test_failed_rewrite_and_echo_still_run_the_turn(self):
+    def test_the_answered_line_names_the_clicker_in_plain_text_and_never_by_id(self):
+        handle = {"id": USER, "username": "jpatil", "name": "jpatil"}
+        cases = (
+            ("the display name", {}, (), None, "Jayanti"),
+            ("a name to escape", {"names": {USER: "Jay <P>"}}, (), None, "Jay &lt;P&gt;"),
+            ("users.info named nobody", {"names": {}}, (), handle, "jpatil"),
+            ("users.info failed", {}, ("names",), handle, "jpatil"),
+            ("no name anywhere", {"names": {}}, (), {"id": USER}, runtime.NAMELESS_CLICKER),
+            ("a failed lookup and no handle", {}, ("names",), None, runtime.NAMELESS_CLICKER),
+        )
+        for case, kwargs, broken, user, name in cases:
+            with self.subTest(case=case):
+                importlib.reload(runtime)
+                adapter = _Adapter(broken=broken, **kwargs)
+                body, action = _choice()
+                if user is not None:
+                    body["user"] = user
+                self._answer(adapter, body, action)
+                update = adapter.log[0][1]
+                self.assertEqual(update["blocks"][-1]["elements"][0]["text"], f"✓ {name}: Leave it")
+                self.assertNotIn("<@", update["text"])
+                self.assertEqual(adapter.named, [(USER, CHANNEL, TEAM)])
+
+    def test_failed_rewrite_and_answered_line_still_run_the_turn(self):
         adapter = _Adapter(fail=("chat_update", "chat_postMessage"))
         with self.assertLogs(runtime.logger, level="WARNING"):
             self._answer(adapter, *_choice())
@@ -1378,7 +1445,7 @@ class RuntimeTest(unittest.TestCase):
         body, action = _alert_choice(1, "Apply Option B")
         body["message"]["text"] = report
         self._answer(adapter, body, action)
-        self.assertEqual(seen, [[f"✓ <@U1>: Apply Option B\n\n{report}"]])
+        self.assertEqual(seen, [[f"✓ Jayanti: Apply Option B\n\n{report}"]])
 
     def test_the_answered_alert_drops_its_reply_with_line_and_keeps_the_rest(self):
         triage = {
@@ -1391,7 +1458,7 @@ class RuntimeTest(unittest.TestCase):
         alert = incident.message_text(triage, report)
         self.assertEqual(alert.count(presenter.CHOICES_LEAD), 2)
         head = incident.fallback_text(triage).rsplit("\n", 1)[0]
-        for note, check in (("✓ <@U1>: Apply Option B", ()), (runtime.ANSWERED_IN_THREAD, ("typed",))):
+        for note, check in (("✓ Jayanti: Apply Option B", ()), (runtime.ANSWERED_IN_THREAD, ("typed",))):
             with self.subTest(note=note):
                 importlib.reload(runtime)
                 replies = [{"type": "message", "user": "U2", "text": "apply B", "ts": "223.000"}] if check else []
@@ -1408,7 +1475,7 @@ class RuntimeTest(unittest.TestCase):
         adapter = _Adapter()
         self._answer(adapter, body, action)
         update = next(entry[1] for entry in adapter.log if entry[0] == "chat_update")
-        self.assertEqual(update["text"], "✓ <@U1>: Apply Option B\n\nthe report")
+        self.assertEqual(update["text"], "✓ Jayanti: Apply Option B\n\nthe report")
 
     def test_a_headline_quoting_the_reply_with_words_stays(self):
         headline = f"*{presenter.CHOICES_LEAD}nobody answered*"
@@ -1417,7 +1484,7 @@ class RuntimeTest(unittest.TestCase):
         adapter = _Adapter()
         self._answer(adapter, body, action)
         update = next(entry[1] for entry in adapter.log if entry[0] == "chat_update")
-        self.assertEqual(update["text"], f"✓ <@U1>: Apply Option B\n\n{headline}\n\nthe report")
+        self.assertEqual(update["text"], f"✓ Jayanti: Apply Option B\n\n{headline}\n\nthe report")
 
     def test_a_card_questions_reply_with_line_goes_after_a_detail_with_a_blank_line(self):
         body, action = _choice(1, "seeded-b", prefix="kage_needs")
@@ -1426,7 +1493,7 @@ class RuntimeTest(unittest.TestCase):
         adapter = _Adapter()
         self._answer(adapter, body, action)
         update = next(entry[1] for entry in adapter.log if entry[0] == "chat_update")
-        self.assertEqual(update["text"], f"✓ <@U1>: seeded-b\n\n{question}")
+        self.assertEqual(update["text"], f"✓ Jayanti: seeded-b\n\n{question}")
 
     def test_a_card_questions_rewrite_keeps_the_line_naming_its_card(self):
         body, action = _choice(1, "seeded-b", prefix="kage_needs")
@@ -1435,7 +1502,7 @@ class RuntimeTest(unittest.TestCase):
         adapter = _Adapter()
         self._answer(adapter, body, action)
         update = next(entry[1] for entry in adapter.log if entry[0] == "chat_update")
-        self.assertEqual(update["text"], f"✓ <@U1>: seeded-b\n\n{question}")
+        self.assertEqual(update["text"], f"✓ Jayanti: seeded-b\n\n{question}")
 
     def test_typed_apply_keeps_the_report_too(self):
         adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": "apply Option B", "ts": "223.000"}])
@@ -1451,7 +1518,7 @@ class RuntimeTest(unittest.TestCase):
         self._answer(adapter, body, action)
         text = adapter.log[0][1]["text"]
         self.assertLessEqual(len(text), runtime.SLACK_TEXT_MAX)
-        self.assertTrue(text.startswith("✓ <@U1>: Leave it\n\nword word"))
+        self.assertTrue(text.startswith("✓ Jayanti: Leave it\n\nword word"))
         self.assertTrue(text.endswith(presenter.ELLIPSIS))
 
     def test_a_message_with_no_text_is_answered_with_the_note_alone(self):
@@ -1459,7 +1526,7 @@ class RuntimeTest(unittest.TestCase):
         body, action = _choice()
         del body["message"]["text"]
         self._answer(adapter, body, action)
-        self.assertEqual(adapter.log[0][1]["text"], "✓ <@U1>: Leave it")
+        self.assertEqual(adapter.log[0][1]["text"], "✓ Jayanti: Leave it")
 
     def test_two_clicks_during_the_thread_read_run_one_turn(self):
         adapter = _Adapter()

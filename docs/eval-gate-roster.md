@@ -14,8 +14,8 @@ carries the rule: `hack/eval/nightly-cases.txt`, `hack/eval/inject-lane-exclusio
 `hack/eval/inject-lane-safeguards.yaml`, a new
 case directory under `bench/tasks/` and the script itself need only the normal approvers
 ([#1546](https://github.com/gke-labs/kube-agents/issues/1546), decided 2026-09-15). This
-page lives under `docs/` on purpose: the script's step-0 revalidation treats `docs/` as
-inert (and the Prow path filter in `oss-test-infra` does today too), so a review finding
+page lives under `docs/` on purpose: the presubmit's step 0 (`hack/ci-revalidate.sh`) treats
+`docs/` as inert (and the Prow path filter in `oss-test-infra` does today too), so a review finding
 against this prose costs no eval run
 ([#1179](https://github.com/gke-labs/kube-agents/issues/1179)), which is exactly what
 roster-comment edits used to cost.

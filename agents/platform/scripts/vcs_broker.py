@@ -71,6 +71,7 @@ from typing import Any, Callable
 
 from providers import (
     CliTransport,
+    HttpTransport,
     Forge,
     ForgeUnsupported,
     MAX_PAGE_SIZE,
@@ -89,6 +90,11 @@ LOGGER = logging.getLogger("credential-proxy.vcs")
 # under everything else.
 DEFAULT_MAX_CLONE_BYTES = 256 << 20  # 256 MiB
 DEFAULT_MAX_BUNDLE_BYTES = 64 << 20  # 64 MiB
+# The in-process API client's bounds when nothing hands it the executor's: the
+# same order as a forge CLI call is given, and a ceiling on one answer that a
+# page of JSON never approaches.
+DEFAULT_HTTP_TIMEOUT_SECONDS = 60.0
+DEFAULT_HTTP_MAX_BYTES = 8 << 20  # 8 MiB
 
 # How many open proposals the `advance` check reads off a branch. One would
 # settle whether any is open; the rest are read because the second half of the
@@ -276,6 +282,9 @@ class VcsBroker:
         cli_runner: Callable[..., subprocess.CompletedProcess] | None = None,
         refresh: Callable[[str, str], None] | None = None,
         base_branch: str | None = None,
+        http_timeout: float = DEFAULT_HTTP_TIMEOUT_SECONDS,
+        http_max_bytes: int = DEFAULT_HTTP_MAX_BYTES,
+        http_opener: Callable[..., Any] | None = None,
     ) -> None:
         self.scratch_root = Path(scratch_root)
         self.scratch_root.mkdir(parents=True, exist_ok=True)
@@ -288,6 +297,12 @@ class VcsBroker:
         # built them, and a second number this class merely stored would read
         # like a bound it enforces.
         self._cli_runner = cli_runner or git_runner
+        # The in-process transport has no runner to carry its bounds, so the
+        # broker hands them over itself; `build_vcs_broker` passes the same
+        # timeout and output ceiling the CLI runner enforces.
+        self._http_timeout = http_timeout
+        self._http_max_bytes = http_max_bytes
+        self._http_opener = http_opener
         self.max_clone_bytes = _positive_int(
             "CREDENTIAL_PROXY_MAX_CLONE_BYTES", DEFAULT_MAX_CLONE_BYTES
         )
@@ -310,21 +325,30 @@ class VcsBroker:
         return Binding(
             forge,
             repo,
-            lambda: self._transport(forge),
+            lambda: self._transport(forge, repo),
             self._git_for(forge, repo),
         )
 
-    def _transport(self, forge: Forge) -> Transport:
+    def _transport(self, forge: Forge, repo: str) -> Transport:
         """The transport the forge declared, constructed here and never there.
 
         A forge names what it needs; the broker owns everything about how the
-        call is made -- the executable, the timeout, the output ceiling. Only
-        the CLI transport exists so far, because it is the only one a forge in
-        this install declares; the seam is what lets the next one be an
-        in-process HTTP client rather than a second subprocess.
+        call is made -- the executable, the timeout, the output ceiling. A CLI
+        forge gets the runner; an HTTP forge gets an in-process client bounded
+        by the same numbers, presenting its credential's headers for `repo`.
         """
         if forge.transport == "cli" and forge.cli:
             return CliTransport(self._cli_runner, forge.cli, forge.error_overrides)
+        if forge.transport == "http" and forge.api_url:
+            return HttpTransport(
+                forge.api_url,
+                lambda: forge.credential.headers(repo),
+                forge.error_overrides,
+                timeout=self._http_timeout,
+                max_bytes=self._http_max_bytes,
+                whoami_route=forge.whoami_route,
+                opener=self._http_opener,
+            )
         raise ForgeUnsupported(
             f"{forge.name} declares the {forge.transport!r} transport, which "
             "this broker does not build."
@@ -1328,27 +1352,12 @@ class VcsBroker:
         return bound.stamp({"identity": {"login": viewer, "subject": subject, "canWrite": can_write}})
 
 
-# The verbs that leave a mark on the forge, named here so the HTTP layer can
-# refuse an unmanaged repository before one of them runs. The classification
-# lives beside the route table because that is where a new verb gets added, and
-# a verb added to one and not the other is the mistake this placement is meant
-# to make loud.
-#
-# The read verbs are absent from this set on purpose, and what that buys today
-# is narrower than it reads. This set is the HTTP layer's gate, and it covers
-# writes: a write against an unmanaged repository is refused here, before a
-# verb runs. The reads are not gated *here* -- but every verb that spends the
-# credential asks for it through `BrokeredCredential.ensure`, and on the one
-# forge this install ships the credential is minted per managed repository, so
-# the refresh refuses an unmanaged one with the same 403 before any call is
-# made. In practice, then, `capabilities` is the only verb an unmanaged
-# repository can be asked, and `clone`, `proposal-list/view/commits`,
-# `issue-list/view`, `identity` and `branch-view` refuse it too. The intent that reads of a repository this
-# install does not write to should work -- a public upstream, read with no
-# credential at all -- is real and is not implemented by this set; it needs a
-# credential-less read path, which the design lists as open. Until then the
-# managed list is, in effect, a visibility control as well as a write one on
-# that forge, and the test beside this classification says so.
+# The verbs that leave a mark on the forge. Named beside the route table because
+# that is where a new verb gets added, and a verb added to one and not the other
+# is the mistake this placement is meant to make loud. Every one of them, like
+# every read below, is refused at the HTTP layer for a repository this install
+# does not manage; the set is kept because a write is what that refusal exists
+# for, and the classification test reads it.
 WRITE_VERBS = frozenset(
     {
         "publish",
@@ -1365,6 +1374,19 @@ WRITE_VERBS = frozenset(
         "branch-delete",
     }
 )
+
+
+# The verbs the HTTP layer answers for a repository this install does not
+# manage. `capabilities` reports what a forge serves and spends no credential.
+# Every other verb, read or write, is refused at the route first: reads used to
+# be refused only because the one shipped credential asked the managed list
+# while refreshing, and a credential that does not refresh -- a static token
+# scoped to a whole group -- would have been spent on any repository in it.
+# Reading a repository this install does not manage needs a credential-less
+# read path, which the design lists as open; until it exists, the managed list
+# is a visibility control as well as a write one, by design rather than by
+# accident of one forge.
+UNGATED_VERBS = frozenset({"capabilities"})
 
 
 def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
@@ -1403,6 +1425,7 @@ __all__ = [
     "Binding",
     "VcsBroker",
     "AGENT_BRANCH_PREFIX",
+    "UNGATED_VERBS",
     "WRITE_VERBS",
     "max_bundle_bytes",
     "route_table",

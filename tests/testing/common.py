@@ -101,13 +101,22 @@ INSTALLER_HELP_BANNER = "kube-agents Zero-Friction Installer"
 UPGRADER_HELP_BANNER = "Lifecycle Upgrade Engine"
 
 
-def get_isolated_test_env(overrides=None, bin_dir=None):
-    """Returns a sanitized environment for hermetic script execution, free of CI runner pollution."""
+def get_isolated_test_env(overrides=None, bin_dir=None, absent=()):
+    """Returns a sanitized environment for hermetic script execution, free of CI runner pollution.
+
+    `absent` names variables the child must not see even when the developer's
+    shell exports them: a test that relies on a variable being unset has to say
+    so here, because the copy starts from os.environ and an override of None is
+    not the same as no entry. Popped before the overrides, so a caller can name
+    a key in both and the override wins.
+    """
     env = {
         k: v
         for k, v in os.environ.items()
         if not k.startswith(("GITHUB_", "RUNNER_")) and k not in ("CI", "CONTINUOUS_INTEGRATION", "GH_TOKEN")
     }
+    for key in absent:
+        env.pop(key, None)
     if bin_dir:
         env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
     if overrides:

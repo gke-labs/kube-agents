@@ -75,9 +75,10 @@ variable "scoped_pool_enabled" {
   description = <<-EOT
     Arms the scoped service account pool: one reader service account per
     project the plan can list in the scope (the host project, scope.projects
-    less an exact exclude.projects entry, and each selector's members; a
-    folder's or organisation's members are not listed at plan time yet), each
-    created in project_id and keyed on the bare project id -- see
+    less an exact exclude.projects entry, each selector's members, and each
+    declared folder's and organisation's members, which the resolver lists
+    while the pool is armed and hands in through scope_container_members),
+    each created in project_id and keyed on the bare project id -- see
     scoped_pool.tf. False, the default, provisions no pool and leaves the
     agent's single wide identity in place, whatever the scope declares:
     arming is a separate, explicit switch so that declaring projects on its
@@ -91,11 +92,12 @@ variable "scoped_pool_enabled" {
     the ambient credential by default.
 
     Every project the agent is expected to read inside must be listed when
-    the pool is armed. A cluster in one that is not -- under a declared folder
-    or organisation, or added to the scope since the last apply -- is refused
-    by the broker rather than served by a wider credential, which is intended,
-    but it means the listed set and the live fleet are two things that can
-    drift, and the drift shows up as a refusal.
+    the pool is armed. A cluster in one that is not -- created under a
+    declared folder or organisation, or added to the scope, since the last
+    apply -- is refused by the broker rather than served by a wider
+    credential, which is intended, but it means the listed set and the live
+    fleet are two things that can drift, and the drift shows up as a refusal
+    until the next apply lists it.
   EOT
   type        = bool
   nullable    = false
@@ -263,6 +265,36 @@ variable "scope" {
       && length(distinct([for c in var.scope.exclude.clusters : "${c.project_id}/${c.location}/${c.cluster_name}"])) == length(var.scope.exclude.clusters)
     )
     error_message = "scope.projects, scope.folders, scope.organizations, scope.shared_vpc_hosts, scope.metrics_scopes, scope.exclude.projects and scope.exclude.clusters each name an entry once; the CRD rejects a repeat at admission, after IAM has been applied."
+  }
+}
+
+variable "scope_container_members" {
+  description = <<-EOT
+    What each of scope.folders and scope.organizations held at plan time
+    while the scoped service account pool is armed: the
+    kube-agents-scope-resolver module's `container_members` output, a map
+    from the container's key (folders/<id>, organizations/<id>) to the
+    project IDs with a GKE cluster beneath it, as its Asset Inventory search
+    listed them. Feeds the pool alone (scoped_pool.tf): a member gets an
+    account and nothing else, because the container-level grant is inherited
+    and containers are not counted toward the resolved-set cap. With the pool
+    armed, every declared container needs an entry (an empty list for one
+    with no clusters), or the plan is refused (main.tf); with it off the
+    resolver reads no container and this stays empty. A key for a container
+    the scope does not declare adds nothing. Resolved outside this module for
+    the reason scope_selector_members is (scope.tf).
+  EOT
+  type        = map(list(string))
+  nullable    = false
+  default     = {}
+
+  validation {
+    condition = alltrue([
+      for name, members in var.scope_container_members :
+      can(regex("^(folders|organizations)/[0-9]+$", name))
+      && alltrue([for member in members : can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", member))])
+    ])
+    error_message = "Each scope_container_members key is folders/<numeric id> or organizations/<numeric id>, and each member a GCP project ID (^[a-z][a-z0-9-]{4,28}[a-z0-9]$): the resolver module's container_members output as it is."
   }
 }
 
