@@ -2452,6 +2452,31 @@ def report_finding_titles(envelope: dict | None) -> dict[str, str]:
     }
 
 
+def report_finding_places(
+    envelope: dict | None, document: dict | None = None
+) -> dict[str, tuple[str, str, str]]:
+    """{published id: (check, cluster, namespace) segments} for every finding
+    the stored run or this one carries.
+
+    The shield in the stale-close pass matches a pull request's ids against
+    the namespaces `start`'s file declares. A published id over
+    `MAX_FINDING_ID` is clipped, and the string no longer says where its
+    segments ended, so they are re-derived from the finding's own fields, the
+    way the id was. Both of the store's documents, as `report_finding_titles`
+    reads them, and this run's.
+    """
+    envelope = envelope or {}
+    places: dict[str, tuple[str, str, str]] = {}
+    for candidate in (envelope.get("ledger_document"), envelope.get("document"), document):
+        findings = candidate.get("findings") if isinstance(candidate, dict) else None
+        for finding in findings if isinstance(findings, list) else []:
+            if not isinstance(finding, dict):
+                continue
+            check, cluster, namespace, _object = derive_finding_id(finding).split(".")
+            places[published_id(finding)] = (check, cluster, namespace)
+    return places
+
+
 def report_filed(envelope: dict | None) -> tuple[set[str], set[tuple[str, str]]] | None:
     """(every finding id, every (cluster, check) run) the stored run filed, or None.
 
@@ -10495,6 +10520,7 @@ def close_stale_remediation_prs(
     shielded_ids: set[str] | None = None,
     shielded_only: bool = False,
     shielded_namespaces: set[tuple[str, str]] | None = None,
+    finding_places: dict[str, tuple[str, str, str]] | None = None,
 ) -> list[str]:
     """Close every open remediation PR the current findings no longer justify.
 
@@ -10510,12 +10536,14 @@ def close_stale_remediation_prs(
     file declares a 2.7 workload in (the empty cluster for a fleet-wide
     item): a covered id of that check whose cluster and namespace segments
     match is shielded whatever workload it names, so a pull request in such a
-    namespace closes even when this run read none of it. The segments are
-    read off the id, which keeps its four dot-separated parts when shortened;
-    `_shorten_id` takes characters off the end of the longest segments, so a
-    clipped id's cluster or namespace segment is a prefix of the real one,
-    and a clipped id (one ending in the shortening digest) is matched on
-    that prefix rather than on equality.
+    namespace closes even when this run read none of it. Where an id lives
+    comes from `finding_places`, the segments re-derived from the finding's
+    own fields in the stored or current document (`report_finding_places`):
+    an id clipped at `MAX_FINDING_ID` no longer spells them. An id no
+    document carries is read off the string, which is exact for an unclipped
+    id; one shaped like a clipped id (ending in the shortening digest) is not
+    matched at all, since its trimmed segments could equal another
+    namespace's.
 
     Two reasons a pull request is stale, and the second one is why this cannot
     just read the hidden block. A pull request is stale when every finding it
@@ -10540,6 +10568,7 @@ def close_stale_remediation_prs(
     branch_by_finding = branch_by_finding or {}
     shielded_ids = shielded_ids or set()
     shielded_namespaces = shielded_namespaces or set()
+    finding_places = finding_places or {}
     check_segment = _id_segment(SHARED_ACCOUNT_CHECK)
 
     def is_shielded(fid: str) -> bool:
@@ -10547,17 +10576,19 @@ def close_stale_remediation_prs(
             return True
         if not shielded_namespaces:
             return False
-        parts = fid.split(".")
-        if len(parts) != ID_SEGMENTS or parts[0] != check_segment:
+        place = finding_places.get(fid)
+        if place is None:
+            parts = fid.split(".")
+            if len(parts) != ID_SEGMENTS or SHORTENED_ID_SUFFIX.search(fid):
+                return False
+            place = (parts[0], parts[1], parts[2])
+        check, cluster, namespace = place
+        if check != check_segment:
             return False
-        cluster, namespace = parts[1], parts[2]
-        clipped = len(fid) == MAX_FINDING_ID and SHORTENED_ID_SUFFIX.search(fid) is not None
-        for key_cluster, key_namespace in shielded_namespaces:
-            same_namespace = key_namespace == namespace or (clipped and key_namespace.startswith(namespace))
-            same_cluster = not key_cluster or key_cluster == cluster or (clipped and key_cluster.startswith(cluster))
-            if same_namespace and same_cluster:
-                return True
-        return False
+        return any(
+            key_namespace == namespace and (not key_cluster or key_cluster == cluster)
+            for key_cluster, key_namespace in shielded_namespaces
+        )
     live_branches = set(branch_by_finding.values())
     for pr in prs:
         if str(pr.get("state", "")).upper() != "OPEN":
@@ -12675,6 +12706,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # The body's headings name what it rendered; the stored document also names
     # what the body budget cut, which a resolved finding may be.
     previous_titles = {**report_finding_titles(memory), **parse_finding_titles(previous_body)}
+    finding_places = report_finding_places(memory, data)
     # A block written under a different identity scheme cannot be joined
     # against this one: the same finding is spelled differently on the two
     # sides, so every id on the left looks fixed and every id on the right
@@ -12881,6 +12913,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 # worker wrote; a complete run keeps the shield's ids too.
                 shielded_ids=set() if (gaps or unaccounted) else shielded_ids,
                 shielded_namespaces=shielded_namespaces,
+                finding_places=finding_places,
                 # Over a gap or an unaccounted finding only the shield's close
                 # is made; it rests on the declaration, not on this run's read.
                 shielded_only=bool(gaps or unaccounted),
@@ -13453,6 +13486,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             },
             shielded_ids=set() if gaps else shielded_ids,
             shielded_namespaces=shielded_namespaces,
+            finding_places=finding_places,
             shielded_only=bool(gaps),
         )
 

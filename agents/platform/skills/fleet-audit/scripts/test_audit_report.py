@@ -998,7 +998,7 @@ class HarnessTestCase(BaseTestCase):
             "ledger_body": body,
             "current_ids": audit_report.parse_delta_block(body),
             "id_scheme": audit_report.parse_id_scheme(body),
-            "document": {"findings": []},
+            "document": getattr(self, "previous_document", None) or {"findings": []},
         }
         (directory / "latest.json").write_text(json.dumps(envelope), encoding="utf-8")
 
@@ -16754,17 +16754,21 @@ class TestFinishManifestFlag(HarnessTestCase):
 
     def test_a_partial_run_closes_the_pull_request_whose_ids_were_clipped(self):
         # The compliance collector spells a cluster <project>/<location>/<name>,
-        # which makes the cluster segment the longest and the first clipped.
-        # A scoped declaration on that cluster still matches the clipped id.
+        # which makes the cluster segment the longest and the first clipped;
+        # this one's last trim lands on a hyphen, so the published id is
+        # shorter than MAX_FINDING_ID. The stored report's finding says where
+        # the id lives, and a scoped declaration on that cluster matches it.
         cluster = "acme-prod/us-central1-a/payments-primary-cluster-with-a-long-name"
         namespace = "payments"
         path = f"clusters/{cluster}/{namespace}/default-sa-automount.yaml"
-        worker = make_finding(fid="worker", check="default-sa-automount", obj="Deployment/worker", title="worker", severity="major", cluster=cluster, namespace=namespace, remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        worker = make_finding(fid="worker", check="default-sa-automount", obj="Deployment/worker-api", title="worker", severity="major", cluster=cluster, namespace=namespace, remediation={"kind": "manifest", "path": path, "note": "shared file"})
         scope = [{"name": cluster, "location": "us-central1-a", "project": "acme-prod"}, {"name": "stage-eu", "location": "europe-west1", "project": "acme-stage"}]
-        previous_body = published_body(make_doc(findings=[worker], audit=AUDIT, clusters=scope), generated_at=NOW)
+        self.previous_document = make_doc(findings=[worker], audit=AUDIT, clusters=scope)
+        previous_body = published_body(self.previous_document, generated_at=NOW)
         self.declaring_replies(previous_body)
-        worker_id = audit_report.published_id({"check": "default-sa-automount", "cluster": cluster, "namespace": namespace, "object": "Deployment/worker"})
-        self.assertNotEqual(worker_id, audit_report.derive_finding_id({"check": "default-sa-automount", "cluster": cluster, "namespace": namespace, "object": "Deployment/worker"}))
+        worker_id = audit_report.published_id({"check": "default-sa-automount", "cluster": cluster, "namespace": namespace, "object": "Deployment/worker-api"})
+        self.assertNotEqual(worker_id, audit_report.derive_finding_id({"check": "default-sa-automount", "cluster": cluster, "namespace": namespace, "object": "Deployment/worker-api"}))
+        self.assertLess(len(worker_id), audit_report.MAX_FINDING_ID)
         self.harness.replies["proposal-list"] = proposals_view(
             [pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([worker_id]))]
         )
@@ -16776,6 +16780,32 @@ class TestFinishManifestFlag(HarnessTestCase):
         rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
         self.assertEqual(rc, 0, self.err)
         self.assertEqual(self.stdout_json()["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
+
+    def test_a_clipped_id_does_not_close_the_pull_request_on_a_declaration_for_a_longer_namespace(self):
+        # A fleet-wide declaration in `payments-processing`; the pull request
+        # is for `payments` on a long-named cluster, so its id is clipped.
+        # Nothing in `payments` is declared, and the pull request stays open.
+        cluster = "acme-prod/us-central1-a/payments-primary-cluster-with-a-long-name"
+        path = f"clusters/{cluster}/payments/default-sa-automount.yaml"
+        batch = make_finding(fid="batch", check="default-sa-automount", obj="Deployment/batch", title="batch", severity="major", cluster=cluster, namespace="payments", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        scope = [{"name": cluster, "location": "us-central1-a", "project": "acme-prod"}, {"name": "stage-eu", "location": "europe-west1", "project": "acme-stage"}]
+        self.previous_document = make_doc(findings=[batch], audit=AUDIT, clusters=scope)
+        previous_body = published_body(self.previous_document, generated_at=NOW)
+        self.declaring_replies(previous_body)
+        batch_id = audit_report.published_id({"check": "default-sa-automount", "cluster": cluster, "namespace": "payments", "object": "Deployment/batch"})
+        self.assertEqual(len(batch_id), audit_report.MAX_FINDING_ID)
+        self.harness.replies["proposal-list"] = proposals_view(
+            [pr(8, "platform-agent/fix-default-sa", body=audit_report.delta_block([batch_id]))]
+        )
+        self.touch(path)
+        pathlib.Path(audit_report.declarations_path_for(AUDIT)).parent.mkdir(parents=True, exist_ok=True)
+        audit_report.write_declarations(AUDIT, "acme/fleet", [{"check": "default-sa-automount", "namespace": "payments-processing", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api.md", "excerpt": "needs the token"}])
+        doc = make_doc(findings=[], audit=AUDIT, clusters=[scope[1]], skipped=[{"cluster": cluster, "reason": "control plane unreachable"}])
+        manifest = _full_manifest(names=("stage-eu",), audit=AUDIT)
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["prs_closed"], [])
+        self.assertEqual(self.harness.bodies_for("proposal-*"), [])
 
     def test_a_held_run_over_partial_coverage_says_the_shield_closed_the_pull_request(self):
         # Both gates at once: a gap and an unaccounted previous finding. The
