@@ -367,7 +367,8 @@ A2A_OPERATOR_ENV_ARGS=()
         self.assertEqual(rc, 0, err)
         uninstalls = [c for c in calls if c.startswith("helm uninstall")]
         self.assertEqual(len(uninstalls), 0, f"release with deployed revision must not be uninstalled: {calls}")
-        self.assertNotIn("clearing the record", out.lower())
+        self.assertNotIn("cleared the poisoned", out.lower())
+        self.assertNotIn("exists with no deployed revision", out.lower())
 
     def test_transient_5xx_absent_release_does_not_heal_release_record(self):
         # When helm history exits 1 (fresh project or no release yet), heal must not fire.
@@ -380,7 +381,8 @@ A2A_OPERATOR_ENV_ARGS=()
         self.assertEqual(rc, 0, err)
         uninstalls = [c for c in calls if c.startswith("helm uninstall")]
         self.assertEqual(len(uninstalls), 0, f"absent release must not issue uninstall: {calls}")
-        self.assertNotIn("clearing the record", out.lower())
+        self.assertNotIn("cleared the poisoned", out.lower())
+        self.assertNotIn("exists with no deployed revision", out.lower())
 
     def test_non_5xx_error_fails_immediately_without_retry(self):
         err_msg = "Error: execution error at (kube-agents/templates/deployment.yaml:10:14): invalid value"
