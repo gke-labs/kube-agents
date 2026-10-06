@@ -1275,8 +1275,9 @@ class CreatorOpenTest(unittest.IsolatedAsyncioTestCase):
             "CREATE TABLE tasks (id TEXT, status TEXT);"
             "CREATE TABLE task_events (task_id TEXT, kind TEXT, payload TEXT);"
             "CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT);"
-            "INSERT INTO tasks VALUES ('t_parent', 'running'), ('t_e0c1', 'done');"
+            "INSERT INTO tasks VALUES ('t_parent', 'running'), ('t_e0c1', 'done'), ('t_e0c2', 'running');"
             "INSERT INTO task_events VALUES ('t_e0c1', 'created', '{\"creator_task_id\": \"t_parent\"}');"
+            "INSERT INTO task_events VALUES ('t_e0c2', 'created', '{\"creator_task_id\": \"t_parent\"}');"
         )
         conn.execute(
             "INSERT INTO kanban_notify_subs VALUES ('t_parent', 'Slack', ?, ?)",
@@ -1307,6 +1308,11 @@ class CreatorOpenTest(unittest.IsolatedAsyncioTestCase):
             with self.subTest(status=status):
                 self._set("UPDATE tasks SET status = ? WHERE id = 't_parent'", status)
                 self.assertFalse(await kanban_progress_lines._folds(SLACK_SUB, None))
+
+    async def test_a_creators_only_child_does_not(self):
+        # A single-cluster delegation: the Cluster Agent's whole report is the answer's evidence.
+        self._set("DELETE FROM task_events WHERE task_id = 't_e0c2'")
+        self.assertFalse(await kanban_progress_lines._folds(SLACK_SUB, None))
 
     async def test_a_creator_on_another_thread_or_none_does_not(self):
         self.assertFalse(await kanban_progress_lines._folds({**SLACK_SUB, "thread_id": "1790717879.000001"}, None))

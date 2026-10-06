@@ -145,21 +145,25 @@ PR_REPORT_KIND = "completed"
 
 #: With ``KAGE_SLACK_UX`` on, a card a worker fanned out folds its report into
 #: its row in the thread's plan rather than posting it, when the card that
-#: created it is still open and subscribed to the same thread: that card's own
-#: completion is the answer, and ``kanban_children_settled`` holds it until its
-#: children settle. Only a completion folds; a failure or a question posts.
+#: created it is still open and subscribed to the same thread and created at
+#: least one other card: that card's own completion is the answer, and
+#: ``kanban_children_settled`` holds it until its children settle. A worker's
+#: only child, a single-cluster delegation, posts its whole report as before.
+#: Only a completion folds; a failure or a question posts.
 FOLDED_KIND = "completed"
 
-#: One row when the card was created by a worker whose card is still open and
-#: subscribed to the thread: the creator Hermes stamps on the ``created`` event
-#: (``hermes_cli/kanban_db.py``), the open statuses those
-#: ``kanban_children_settled`` waits on.
+#: One row when the card was created by a worker whose card is still open,
+#: subscribed to the thread and the creator of another card too: the creator
+#: Hermes stamps on the ``created`` event (``hermes_cli/kanban_db.py``), the
+#: open statuses those ``kanban_children_settled`` waits on.
 OPEN_CREATOR_SQL = (
     "SELECT 1 FROM task_events e "
     "JOIN tasks t ON t.id = json_extract(e.payload, '$.creator_task_id') "
     "JOIN kanban_notify_subs s ON s.task_id = t.id "
     "WHERE e.task_id = ? AND e.kind = 'created' AND t.status NOT IN ('done', 'archived') "
     "AND lower(s.platform) = ? AND s.chat_id = ? AND COALESCE(s.thread_id, '') = ? "
+    "AND EXISTS (SELECT 1 FROM task_events o WHERE o.kind = 'created' AND o.task_id != e.task_id "
+    "AND json_extract(o.payload, '$.creator_task_id') = t.id) "
     "LIMIT 1"
 )
 
@@ -755,8 +759,8 @@ async def deliver(
     rolling message of its own, with the rolling message as the fallback when
     the plan cannot be posted; ``title`` is the card's, which the row leads with
     in a plan of several or falls back to. See
-    ``gateway/slack_ux_status.py``. A card fanned out by a card still open on
-    the same thread completes into its row and posts nothing, returning
+    ``gateway/slack_ux_status.py``. One of several cards fanned out by a card
+    still open on the same thread completes into its row and posts nothing, returning
     ``None``, once the plan shows that row complete (:data:`FOLDED_KIND`).
     Every line it posts, holds or edits keeps
     the ``@assignee`` and drops the board tag and ``Kanban <id>``

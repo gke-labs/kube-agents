@@ -740,7 +740,8 @@ check(
 
 # --- The fold reads a real board ----------------------------------------------
 # With KAGE_SLACK_UX on, a fanned-out card's completion folds into its plan row
-# when its creator is still open on the same thread. A schema drift under
+# when its creator is still open on the same thread and created another card
+# too. A schema drift under
 # OPEN_CREATOR_SQL raises inside _folds, which posts the report instead, so the
 # fold would quietly stop and every fanned-out card post its own line again.
 # The read itself runs here, against boards built with hermes_cli.
@@ -769,6 +770,16 @@ try:
     finally:
         _conn.close()
     _fold_sub = {"task_id": _child, "platform": "slack", "chat_id": FOLD_CHANNEL, "thread_id": FOLD_THREAD}
+    check(
+        "a creator's only child does not fold",
+        not progress_lines._creator_open(_fold_sub, kb.DEFAULT_BOARD),
+        "a single-cluster delegation would lose the Cluster Agent's report",
+    )
+    _conn = kc.connect(board=kb.DEFAULT_BOARD)
+    try:
+        kb.create_task(_conn, title="seeded-c", assignee="platform", creator_task_id=_creator)
+    finally:
+        _conn.close()
     check(
         "a card whose creator is open on the thread folds",
         progress_lines._creator_open(_fold_sub, kb.DEFAULT_BOARD),
