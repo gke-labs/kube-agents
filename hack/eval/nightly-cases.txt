@@ -224,6 +224,13 @@
 # infra lock, so it is the thirteenth tofu case: ~10 more serial minutes
 # there. With oobe-first-run-audits, the twelfth (~120 at its 2400s hint),
 # the thirteen come to ~583 serial minutes against the 480m deadline.
+# 2026-10-06 adds upgrades-fleet-readiness-failclosed-webhook: one case,
+# three units, a read-only chat turn that runs the readiness script over
+# every cluster in the project (one red repetition on a dev install with
+# thirty-odd clusters took 29 minutes of agent time; the pool projects hold
+# the seeded fleet and the host). Counted from the lists with it, the last
+# entry below: sixty-three cases (189 units) of a seventy-seven-case,
+# 231-unit matrix.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -737,3 +744,13 @@
 # the rows through the Session KV server's findings routes and resolves them on
 # destroy. No fixture; the host install only.
 ./tasks/findings-decision-covers-item/task.yaml
+# The readiness report's fail-closed webhook source: the fleet-upgrade-verification
+# skill's --readiness table grades a fail-closed admission webhook whose
+# backend the API server cannot reach, as a blocker when its rules reach the
+# upgrade's path and as an outage otherwise. The planted gate on seeded-b
+# (role readiness-failclosed-webhook) matches ConfigMaps only, so the case
+# grades the declared line's "no": the gate sits in the no-backend slot and
+# never among the blockers. Read-only chat prompt; nothing to mutate. Nightly
+# from its first merge; a presubmit seat is a later pull request that cites
+# its record.
+./tasks/upgrades-fleet-readiness-failclosed-webhook/task.yaml
