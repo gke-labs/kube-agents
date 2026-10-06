@@ -324,20 +324,20 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			rec.LastActivity = now
 			rec.LastTaskActivity = now
 		}
-	} else if ref, ok := rec.TaskRefFor(activeTaskID(rec)); ok && ref.ParentTaskID == taskID {
-		// A session turn that delegated ends after its child became the
-		// active task. Its line closes as any turn's does, from the entry
+	} else if parent, ok := rec.TaskRefFor(taskID); ok && parent.StatusMsgID != "" {
+		// A session turn that delegated ends after its child took the
+		// active task - while the child runs, or after the child's own
+		// terminal and the wake it started, since nothing orders the two
+		// tasks' events. Its line closes as any turn's does, from the entry
 		// that kept it. Its answer ("delegated to platform") is task
 		// activity for the session-thread rule all the same; LastActivity
 		// stays the active task's business.
-		if parent, ok := rec.TaskRefFor(taskID); ok && parent.StatusMsgID != "" {
-			progress := rs.progress
-			if g.cfg.DisplayMode == displayModeDefault {
-				progress = ""
-			}
-			g.editLine(rec.Key, parent.StatusMsgID, terminalLine(s.Status.State, progress))
-			setParentLine(rec, taskID, "")
+		progress := rs.progress
+		if g.cfg.DisplayMode == displayModeDefault {
+			progress = ""
 		}
+		g.editLine(rec.Key, parent.StatusMsgID, terminalLine(s.Status.State, progress))
+		setParentLine(rec, taskID, "")
 		if source == TerminalFromExecutor {
 			rec.LastTaskActivity = time.Now().UTC()
 		}
@@ -377,6 +377,13 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		reason = joinTextParts(s.Status.Message.Parts)
 	}
 	g.observeTaskTerminal(rec.Key, taskID, s.Status.State, source, reason)
+
+	// A delegated child's end wakes the session that asked (spec §4). After
+	// the terminal is announced: an observer correlates tasks by start
+	// order, so the child's end must precede the wake's start.
+	if ref, ok := rec.TaskRefFor(taskID); ok && ref.Role == taskRoleChild {
+		g.wakeSession(ctx, rec, ref, s.Status.State, result, reason)
+	}
 }
 
 // updateRollingLine edits the task's single status message in place. Under
@@ -412,14 +419,6 @@ func (g *Gateway) editLine(conversation, messageID, line string) bool {
 		return false
 	}
 	return true
-}
-
-// activeTaskID is the record's active task id, or "".
-func activeTaskID(rec *SessionRecord) string {
-	if rec.ActiveTask == nil {
-		return ""
-	}
-	return rec.ActiveTask.TaskID
 }
 
 // withLineNote suffixes a rolling line with the task's note, if it has one.

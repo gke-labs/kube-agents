@@ -300,7 +300,7 @@ func TestDelegateRefusalsWithANotice(t *testing.T) {
 					}
 				}
 			},
-			notice: "⚠️ delegation refused: this turn's requester is no longer on record; ask again", rule: ruleDelegationNoRequester},
+			notice: noticeDelegationNoRequester, rule: ruleDelegationNoRequester},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r, spawn := startRigWithSpawner(t)
@@ -674,5 +674,378 @@ func TestOneLiveChildPerConversation(t *testing.T) {
 	// ran on platform, not in that pod, so no supervisor terminal is owed.
 	if key, _ := r.g.reg.SessionForTask(ctx, child.TaskID); key != conv {
 		t.Fatalf("the detached child was retired with the pod: index=%q", key)
+	}
+}
+
+// ---- the wake-up turn (spec §4) -----------------------------------------
+
+// awaitSubmission waits for the nth (0-based) task submission on addressee.
+func awaitSubmission(t *testing.T, r *rig, addressee string, n int) *lib.Envelope {
+	t.Helper()
+	var env *lib.Envelope
+	waitFor(t, fmt.Sprintf("submission %d on %s", n, addressee), func() bool {
+		i := 0
+		for _, e := range inSubjectEnvelopes(t, r.url, addressee) {
+			if e.Kind != lib.KindMessage {
+				continue
+			}
+			if i == n {
+				env = e
+				return true
+			}
+			i++
+		}
+		return false
+	})
+	return env
+}
+
+// envText is the text of a message envelope's payload.
+func envText(t *testing.T, env *lib.Envelope) string {
+	t.Helper()
+	var m lib.Message
+	if err := json.Unmarshal(env.Payload, &m); err != nil {
+		t.Fatal(err)
+	}
+	return joinTextParts(m.Parts)
+}
+
+// publishFinal publishes a terminal status carrying a reason message, as an
+// executor writes `failed` or `rejected`, from the executor's party.
+func publishFinal(t *testing.T, r *rig, origin *lib.Envelope, addressee string, state lib.TaskState, reason string) {
+	t.Helper()
+	payload, err := json.Marshal(lib.StatusUpdate{
+		TaskID: origin.TaskID, ContextID: origin.ContextID,
+		Status: lib.TaskStatus{State: state, Message: &lib.Message{
+			Role: "agent", MessageID: "msg-final-" + origin.TaskID,
+			Parts: []lib.Part{{Kind: "text", Text: reason}},
+		}},
+		Final: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewStatusUpdateEnvelope(lib.Party{Session: addressee, AgentType: "test-executor"}, origin.TaskID, origin.ContextID, origin.CorrelationID, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.bus.Publish(context.Background(), lib.TaskEventsSubject(addressee, origin.TaskID), env); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// completeTask publishes a result artifact and `completed`.
+func completeTask(t *testing.T, exec *lib.TaskExecution, text string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := exec.PublishArtifact(ctx, lib.Artifact{ArtifactID: "a-r", Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: text}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// delegated runs a session turn that delegates, waits for the chain on the
+// record, and ends the delegating turn as the adapter does. It returns the
+// parent's submission, its bus session and the child's submission (the nth
+// on platform).
+func delegated(t *testing.T, r *rig, spawn *fakeSpawner, conv string, nth int) (*lib.Envelope, string, *lib.Envelope) {
+	t.Helper()
+	exec, origin, session := sessionTurn(t, r, spawn, conv, "how is the fleet?")
+	if err := exec.PublishArtifact(context.Background(), delegateArtifact(t, "platform", "report fleet health")); err != nil {
+		t.Fatal(err)
+	}
+	child := awaitSubmission(t, r, targetPlatform, nth)
+	waitFor(t, "chain on the record", func() bool {
+		rec, _ := r.g.reg.Get(context.Background(), conv)
+		pref, _ := rec.TaskRefFor(origin.TaskID)
+		return len(pref.Children) == 1
+	})
+	completeTask(t, exec, "delegated to platform")
+	return origin, session, child
+}
+
+// TestTheChildsTerminalWakesTheSessionWithTheResult: the child's completed
+// posts its result, then one wake turn starts on a fresh incarnation under
+// the delegating turn's attribution, with the chain and depth on the record.
+func TestTheChildsTerminalWakesTheSessionWithTheResult(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	ctx := context.Background()
+	conv := "discord:g1/t-wake"
+	origin, session, child := delegated(t, r, spawn, conv, 0)
+	completeTask(t, r.execFor(t, child, targetPlatform), "fleet is green")
+
+	waitFor(t, "child result relayed", postedContaining(r, "fleet is green"))
+	waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
+	wakeSession := spawn.calls()[1].Session
+	if wakeSession == session {
+		t.Fatal("the wake reused the retired incarnation")
+	}
+	wake := r.awaitTask(t, wakeSession)
+	want := "The task you delegated to platform (task " + child.TaskID + ") completed.\nfleet is green"
+	if got := envText(t, wake); got != want {
+		t.Fatalf("wake text = %q, want %q", got, want)
+	}
+	if wake.CorrelationID != origin.CorrelationID || wake.ContextID != origin.ContextID {
+		t.Fatalf("wake correlation/context = %s/%s, want %s/%s", wake.CorrelationID, wake.ContextID, origin.CorrelationID, origin.ContextID)
+	}
+	var auth, parent Authority
+	if err := json.Unmarshal(wake.Authority, &auth); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(origin.Authority, &parent); err != nil {
+		t.Fatal(err)
+	}
+	if auth.Requester != parent.Requester || auth.Audience.Conversation != parent.Audience.Conversation {
+		t.Fatalf("wake attribution %+v != parent %+v", auth, parent)
+	}
+	if auth.Via == nil || *auth.Via != (AuthorityVia{TaskID: child.TaskID, Session: session}) {
+		t.Fatalf("wake via = %+v, want task %s session %s", auth.Via, child.TaskID, session)
+	}
+	assertRootCapability(t, r, auth, wake.TaskID, wakeSession)
+
+	waitFor(t, "wake on the record", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		return rec.ActiveTask != nil && rec.ActiveTask.TaskID == wake.TaskID
+	})
+	rec, _ := r.g.reg.Get(ctx, conv)
+	pref, _ := rec.TaskRefFor(origin.TaskID)
+	cref, _ := rec.TaskRefFor(child.TaskID)
+	wref, _ := rec.TaskRefFor(wake.TaskID)
+	if wref.Role != taskRoleWake || wref.ParentTaskID != child.TaskID || wref.Depth != cref.Depth || wref.Depth != 1 || wref.Addressee != wakeSession {
+		t.Fatalf("wake ref = %+v", wref)
+	}
+	if wref.Requester == nil || pref.Requester == nil || *wref.Requester != *pref.Requester {
+		t.Fatalf("wake requester %+v, want the parent's %+v", wref.Requester, pref.Requester)
+	}
+	if rec.Addressee != wakeSession || rec.BusSession != wakeSession {
+		t.Fatalf("addressee=%s busSession=%s, want the wake's incarnation", rec.Addressee, rec.BusSession)
+	}
+	// After the child's result, not before it.
+	if i, j := postIndex(r, "fleet is green"), len(r.adapter.postTexts())-1; i < 0 || r.adapter.postTexts()[j] != "⏳ submitted…" || j < i {
+		t.Fatalf("posts %v: want the result, then the wake's placeholder", r.adapter.postTexts())
+	}
+	if !loggedContaining(r, "session woken", child.TaskID, wake.TaskID)() {
+		t.Fatalf("no woken line:\n%s", r.logs.String())
+	}
+}
+
+// TestAChildsEndWakesWithTheOutcome: failed, rejected and a supervisor's
+// terminals wake the session; a supervisor's canceled on a child nobody
+// stopped is a failure.
+func TestAChildsEndWakesWithTheOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		supervisor bool
+		state      lib.TaskState
+		reason     string
+		outcome    string
+	}{
+		{"executor failed", false, lib.StateFailed, "reason: quota - exceeded", "failed"},
+		{"executor rejected", false, lib.StateRejected, "capability refused: delegate.scope", "was rejected"},
+		{"supervisor failed", true, lib.StateFailed, "executor died", "failed"},
+		{"supervisor canceled nobody asked for", true, lib.StateCanceled, "torn down", "failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, spawn := startRigWithSpawner(t)
+			ctx := context.Background()
+			_, _, child := delegated(t, r, spawn, "discord:g1/t-wake-end", 0)
+			if tc.supervisor {
+				if err := r.g.publishSupervisorTerminal(ctx, targetPlatform, child.TaskID, child.ContextID, child.CorrelationID, tc.state, tc.reason); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				publishFinal(t, r, child, targetPlatform, tc.state, tc.reason)
+			}
+			waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
+			wake := r.awaitTask(t, spawn.calls()[1].Session)
+			want := "The task you delegated to platform (task " + child.TaskID + ") " + tc.outcome + ".\n" + tc.reason
+			if got := envText(t, wake); got != want {
+				t.Fatalf("wake text = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// TestRejectionsCannotGrowTheChainPastTheBound: a wake inherits its child's
+// depth, so a session that delegates on every wake stops at the bound however
+// often platform rejects it.
+func TestRejectionsCannotGrowTheChainPastTheBound(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	ctx := context.Background()
+	conv := "discord:g1/t-wake-loop"
+	_, _, child := delegated(t, r, spawn, conv, 0)
+	for depth := 1; depth <= defaultDelegationDepthMax; depth++ {
+		publishFinal(t, r, child, targetPlatform, lib.StateRejected, "capability refused")
+		waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == depth+1 })
+		wakeSession := spawn.calls()[depth].Session
+		wake := r.awaitTask(t, wakeSession)
+		waitFor(t, "wake on the record", func() bool {
+			rec, _ := r.g.reg.Get(ctx, conv)
+			return rec.ActiveTask != nil && rec.ActiveTask.TaskID == wake.TaskID
+		})
+		rec, _ := r.g.reg.Get(ctx, conv)
+		if wref, _ := rec.TaskRefFor(wake.TaskID); wref.Depth != depth {
+			t.Fatalf("wake %d depth = %d", depth, wref.Depth)
+		}
+		exec := r.execFor(t, wake, wakeSession)
+		_ = exec.PublishStatus(ctx, lib.StateWorking, false)
+		_ = exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "try again"))
+		if depth == defaultDelegationDepthMax {
+			waitFor(t, "depth refusal", loggedContaining(r, "delegation refused", "rule="+ruleDelegationDepth, wake.TaskID))
+			completeTask(t, exec, "delegated to platform")
+			waitFor(t, "depth notice", postedContaining(r, "delegated as deep as it may"))
+			break
+		}
+		child = awaitSubmission(t, r, targetPlatform, depth)
+		waitFor(t, "chain on the record", func() bool {
+			rec, _ := r.g.reg.Get(ctx, conv)
+			w, _ := rec.TaskRefFor(wake.TaskID)
+			return len(w.Children) == 1
+		})
+		completeTask(t, exec, "delegated to platform")
+	}
+	if n := platformSubmissions(t, r); n != defaultDelegationDepthMax {
+		t.Fatalf("platform received %d submissions, want %d", n, defaultDelegationDepthMax)
+	}
+	if n := len(spawn.calls()); n != defaultDelegationDepthMax+1 {
+		t.Fatalf("spawns = %d, want %d", n, defaultDelegationDepthMax+1)
+	}
+}
+
+// TestAHumanStopOnTheChildDoesNotWake: the gateway published the cancel, so
+// the child's canceled is the requester's word and the session stays asleep.
+func TestAHumanStopOnTheChildDoesNotWake(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	ctx := context.Background()
+	conv := "discord:g1/t-wake-stop"
+	_, _, child := delegated(t, r, spawn, conv, 0)
+	sessionRigTurn(r, conv, "stop-1", "stop")
+	waitFor(t, "cancel sent", postedContaining(r, "cancel sent"))
+	_ = r.execFor(t, child, targetPlatform).PublishStatus(ctx, lib.StateCanceled, true)
+	waitFor(t, "canceled relayed", postedContaining(r, "🛑 canceled"))
+	waitFor(t, "no-wake line", loggedContaining(r, "no wake", child.TaskID))
+	if n := len(spawn.calls()); n != 1 {
+		t.Fatalf("a human stop woke the session: spawns = %d", n)
+	}
+	rec, _ := r.g.reg.Get(ctx, conv)
+	for _, ref := range rec.Tasks {
+		if ref.Role == taskRoleWake {
+			t.Fatalf("a wake entry after a human stop: %+v", ref)
+		}
+	}
+}
+
+// TestTheWakeHonoursTheCapAndTheResultStands: the wake counts against
+// MaxSessions; refused, the result is still the conversation's and the
+// standard cap notice says why nothing followed it.
+func TestTheWakeHonoursTheCapAndTheResultStands(t *testing.T) {
+	r, spawn := startRigWithSpawnerCap(t, "platform", 1, nil)
+	ctx := context.Background()
+	conv := "discord:g1/t-wake-cap"
+	_, _, child := delegated(t, r, spawn, conv, 0)
+	// The parent's pod is still on the record, so the wake is a replacing
+	// spawn (limit cap+1): cap+1 live is what refuses it.
+	spawn.setLive(2)
+	completeTask(t, r.execFor(t, child, targetPlatform), "fleet is green")
+	waitFor(t, "result posted", postedContaining(r, "fleet is green"))
+	waitFor(t, "cap notice", postedContaining(r, "🚦 not started: 2 session workers are already running (cap 1)"))
+	if i, j := postIndex(r, "fleet is green"), postIndex(r, "🚦 not started"); j < i {
+		t.Fatalf("posts %v: want the result, then the notice", r.adapter.postTexts())
+	}
+	if n := len(spawn.calls()); n != 1 {
+		t.Fatalf("spawns = %d, want 1", n)
+	}
+	waitFor(t, "child released", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		return rec.ActiveTask == nil
+	})
+	rec, _ := r.g.reg.Get(ctx, conv)
+	for _, ref := range rec.Tasks {
+		if ref.Role == taskRoleWake {
+			t.Fatalf("a wake entry past the cap: %+v", ref)
+		}
+	}
+}
+
+// TestNoWakeWhenTheRequesterAgedOut: AskTTL cleared the delegating turn's
+// requester and attribution while the child ran; the result stands, a notice
+// says the session was not woken, and nothing is spawned.
+func TestNoWakeWhenTheRequesterAgedOut(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/t-wake-ttl"
+	origin, _, child := delegated(t, r, spawn, conv, 0)
+	waitFor(t, "parent terminal folded", postedContaining(r, "delegated to platform"))
+	putRecord(t, r, conv, func(rec *SessionRecord) {
+		for i := range rec.Tasks {
+			if rec.Tasks[i].ID == origin.TaskID {
+				rec.Tasks[i].Requester, rec.Tasks[i].Attribution = nil, nil
+			}
+		}
+	})
+	completeTask(t, r.execFor(t, child, targetPlatform), "fleet is green")
+	waitFor(t, "result posted", postedContaining(r, "fleet is green"))
+	waitFor(t, "notice", postedContaining(r, noticeWakeNoRequester))
+	if n := len(spawn.calls()); n != 1 {
+		t.Fatalf("spawns = %d, want 1", n)
+	}
+}
+
+// TestChildBeforeParentTerminalStillClosesTheParentsLine: the child's
+// terminal can relay before the delegating turn's own; the parent's rolling
+// line still reaches its completed line (keyed on the line the parent's
+// entry keeps, not on which task is active).
+func TestChildBeforeParentTerminalStillClosesTheParentsLine(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	ctx := context.Background()
+	conv := "discord:g1/t-wake-order"
+	exec, origin, _ := sessionTurn(t, r, spawn, conv, "x")
+	before, _ := r.g.reg.Get(ctx, conv)
+	parentLine := before.ActiveTask.StatusMsgID
+	_ = exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "report"))
+	child := r.awaitTask(t, targetPlatform)
+	waitFor(t, "chain on the record", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		pref, _ := rec.TaskRefFor(origin.TaskID)
+		return len(pref.Children) == 1
+	})
+	completeTask(t, r.execFor(t, child, targetPlatform), "fleet is green")
+	waitFor(t, "child result relayed", postedContaining(r, "fleet is green"))
+	completeTask(t, exec, "delegated to platform")
+	waitFor(t, "the parent's line reaches its completed line", func() bool {
+		for _, e := range r.adapter.editsOf(parentLine) {
+			if e == terminalLine(lib.StateCompleted, "") {
+				return true
+			}
+		}
+		return false
+	})
+	waitFor(t, "the kept line is cleared", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		pref, _ := rec.TaskRefFor(origin.TaskID)
+		return pref.StatusMsgID == ""
+	})
+}
+
+// TestAWakeAfterAGatewayRestartStillCarriesTheRequester: the requester and
+// attribution are on the record, so a second gateway wakes the session.
+func TestAWakeAfterAGatewayRestartStillCarriesTheRequester(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/t-wake-restart"
+	origin, session, child := delegated(t, r, spawn, conv, 0)
+	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
+	r2, spawn2 := restartRig(t, r)
+	completeTask(t, r2.execFor(t, child, targetPlatform), "done")
+	waitFor(t, "wake on the new gateway", func() bool { return len(spawn2.calls()) == 1 })
+	wake := r2.awaitTask(t, spawn2.calls()[0].Session)
+	if got := envText(t, wake); !strings.Contains(got, child.TaskID) || !strings.HasSuffix(got, "\ndone") {
+		t.Fatalf("wake text = %q", got)
+	}
+	var auth, parent Authority
+	_ = json.Unmarshal(wake.Authority, &auth)
+	_ = json.Unmarshal(origin.Authority, &parent)
+	if auth.Requester != parent.Requester || auth.Via == nil || auth.Via.TaskID != child.TaskID || auth.Via.Session != session {
+		t.Fatalf("wake authority after restart = %+v", auth)
 	}
 }

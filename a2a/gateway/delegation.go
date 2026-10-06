@@ -25,6 +25,16 @@ const (
 // task the session handed on from one a human asked for.
 const delegatedLineNote = "(delegated to platform)"
 
+// requesterGone is the one spelling of "the turn's requester has aged out of
+// the record" (AskTTL clears it), for the delegation refusal and the wake
+// that cannot run for the same reason.
+const requesterGone = "requester is no longer on record"
+
+const (
+	noticeDelegationNoRequester = "⚠️ delegation refused: this turn's " + requesterGone + "; ask again"
+	noticeWakeNoRequester       = "ℹ️ the delegated task finished, but the delegating turn's " + requesterGone + "; the session was not woken"
+)
+
 // handleDelegateRequest is the gateway's side of the delegation primitive: a
 // session turn's lib.ArtifactDelegate, accepted, checked, and minted as a
 // child task to the platform agent. Called from the relay under the session
@@ -103,7 +113,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	}
 	authority, err := AuthorityFromAttribution(parent.Attribution)
 	if parent.Requester == nil || len(parent.Attribution) == 0 || err != nil {
-		refuse(ruleDelegationNoRequester, "⚠️ delegation refused: this turn's requester is no longer on record; ask again")
+		refuse(ruleDelegationNoRequester, noticeDelegationNoRequester)
 		return
 	}
 	if !g.targetAllows(addressee, parent.Requester.Backend, parent.Requester.Subject) {
@@ -215,5 +225,82 @@ func (g *Gateway) flushNotices(conversation string, rs *relayState) {
 	g.mu.Unlock()
 	for _, n := range notices {
 		g.post(conversation, n)
+	}
+}
+
+// wakeSession starts the session's next turn on a delegated child's terminal
+// (spec §4): a fresh incarnation and the ordinary spawn, as a human turn
+// gets, with gateway-authored text carrying the outcome and the delegating
+// turn's stored attribution, so the wake runs under the requester who asked.
+// Called from relayTerminal under the session lock, after the child's result
+// or failure is posted, its ActiveTask released and its end announced; the
+// relay writes the record back.
+func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child TaskRef, state lib.TaskState, result, reason string) {
+	log := g.log.With("child", child.ID, "conversation", rec.Key, "state", string(state))
+	// The gateway published a cancel for the child: the human said stop,
+	// and whatever the executor answered with, waking the session would act
+	// against it. A canceled nobody asked for (a supervisor's) is a failure
+	// below, and wakes.
+	if child.Canceled {
+		log.Info("no wake: the child was stopped by its requester")
+		return
+	}
+	// A later turn holds the conversation (the child was stopped and a human
+	// moved on before its end arrived). A fresh incarnation now would retire
+	// that turn's pod.
+	if rec.ActiveTask != nil {
+		log.Info("no wake: another task holds the conversation", "active", rec.ActiveTask.TaskID)
+		return
+	}
+	if g.spawner == nil {
+		log.Warn("no wake: no session spawner")
+		return
+	}
+	parent, ok := rec.TaskRefFor(child.ParentTaskID)
+	authority, err := AuthorityFromAttribution(parent.Attribution)
+	if !ok || parent.Requester == nil || len(parent.Attribution) == 0 || err != nil {
+		log.Warn("no wake: the delegating turn's requester is not on record", "parent", child.ParentTaskID)
+		g.post(rec.Key, noticeWakeNoRequester)
+		return
+	}
+	// The session that delegated: the parent's addressee is the incarnation
+	// it ran on, which the mint checked was the record's bus session.
+	authority.Via = &AuthorityVia{TaskID: child.ID, Session: parent.Addressee}
+
+	outcome, body := "completed", result
+	switch state {
+	case lib.StateFailed, lib.StateCanceled: // a canceled the gateway did not publish
+		outcome, body = "failed", reason
+	case lib.StateRejected:
+		outcome, body = "was rejected", reason
+	}
+	text := fmt.Sprintf("The task you delegated to %s (task %s) %s.", targetPlatform, child.ID, outcome)
+	if body = strings.TrimSpace(body); body != "" {
+		text += "\n" + body
+	}
+
+	if rec.Profile == "" {
+		rec.Profile = sessionProfile
+	}
+	// The cap holds and the previous pod is retired here; a refusal has
+	// posted the standard notice, and the child's result stands as relayed.
+	if !g.freshIncarnation(ctx, rec) {
+		log.Info("no wake: the session could not be started")
+		return
+	}
+	// The wake is the delegating turn's successor: the chain's correlation
+	// id (a task spawned in service of another inherits it) and the child's
+	// depth, so depth counts delegations rather than turns.
+	wakeID, ok := g.startTaskWith(ctx, rec, taskStart{
+		Text:          text,
+		Requester:     *parent.Requester,
+		Authority:     authority,
+		CorrelationID: child.CorrelationID,
+		Role:          taskRoleWake,
+		ParentTaskID:  child.ID,
+		Depth:         child.Depth,
+	})
+	if ok {
+		log.Info("session woken", "wake", wakeID, "session", rec.BusSession)
 	}
 }

@@ -211,6 +211,9 @@ type rig struct {
 	// logs is the gateway's log as text, on the rigs that capture it
 	// (startRigWithSpawnerCap); nil elsewhere.
 	logs *lockedBuffer
+	// stop cancels the gateway's context, on the rigs restartRig can
+	// replace (startRigWithSpawnerCap); nil elsewhere.
+	stop context.CancelFunc
 }
 
 // startRig assembles a gateway on an embedded server, with user 1001 mapped
@@ -1142,7 +1145,42 @@ func startRigWithSpawnerCap(t *testing.T, defaultAddressee string, maxSessions i
 	}
 	go func() { _ = g.Run(ctx) }()
 
-	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url, logs: logs}, spawn
+	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url, logs: logs, stop: cancel}, spawn
+}
+
+// restartRig stops r's gateway and starts a second one over the same server,
+// KV and Config, with a fresh adapter, spawner and log: a gateway restart.
+// The first is stopped (context canceled, Run returned, client closed)
+// BEFORE the second starts, because the relay durable is shared and two live
+// gateways would split its deliveries. The executor client is kept.
+func restartRig(t *testing.T, r *rig) (*rig, *fakeSpawner) {
+	t.Helper()
+	r.stop()
+	select {
+	case <-r.adapter.stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the first gateway did not stop")
+	}
+	r.client.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	client, err := lib.Connect(ctx, r.url, lib.WithName("gateway-test-2"), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
+	if err != nil {
+		t.Fatalf("gateway client: %v", err)
+	}
+	t.Cleanup(client.Close)
+	adapter := newFakeAdapter()
+	spawn := &fakeSpawner{}
+	cfg := *r.g.cfg
+	logs := &lockedBuffer{}
+	log := slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, logs), nil))
+	g, err := New(Options{Client: client, Adapter: adapter, Config: &cfg, Backend: "discord", Spawner: spawn, Logger: log})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	go func() { _ = g.Run(ctx) }()
+	return &rig{g: g, adapter: adapter, client: client, bus: r.bus, url: r.url, logs: logs, stop: cancel}, spawn
 }
 
 // TestDelegatePrefixSpawnsSessionWorker: the W4 amendment's flow - a
