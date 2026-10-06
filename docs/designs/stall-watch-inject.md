@@ -51,7 +51,7 @@ stall-watch tick (no_agent, every 30 min)
 
 The payload carries what the old card body carried and nothing more: cluster, project, location,
 namespace, the Cluster Agent profile the watch resolved, when the watch first saw the stall, and one
-`{object, heuristic, stalled_for}` entry per ledger row. Row detail (condition reasons, spec paths,
+`{object, heuristic, stalled_for}` entry per ledger row, up to 500. Row detail (condition reasons, spec paths,
 event messages) stays out, for the reason it stayed out of the card: it is text a tenant writes, and
 the Cluster Agent reads it again when it runs the skill.
 

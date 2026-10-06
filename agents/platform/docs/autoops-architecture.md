@@ -316,7 +316,7 @@ written to the live cluster directly.
   precisely enough to act on from the report alone. This is the safety property of the whole
   architecture, and it is stated in the prompt.
 
-A domain also registers a **skill** in the catalog (`agents/platform/skills/`), which supplies the
+A domain also registers a **skill** (item 3 above says where), which supplies the
 diagnostic procedure — e.g. `gke-workload-troubleshooting` walks pod status → namespace events →
 container logs → service and NetworkPolicy checks → propose a GitOps correction. The persona that runs
 the triage requires the agent to query the catalog and load the matching domain skill before diagnosing

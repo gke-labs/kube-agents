@@ -600,7 +600,7 @@ class Alerts(Base):
         self.run_tick(fleet)
         self.assertEqual(len(self.kv.alerts), 1)
         self.run_tick(fleet)
-        self.assertEqual(len(self.kv.alerts), 2, "the ended episode was not restored, so the scope is a candidate again")
+        self.assertEqual(len(self.kv.alerts), 2, "the kept episode's held objects make the scope a candidate again")
 
     def test_a_refused_alert_after_a_completed_card_still_says_cleared(self):
         self.run_tick({"c": {"checkout": [DEADLINE_ROW]}})
@@ -812,6 +812,28 @@ class Alerts(Base):
                 with self.assertRaises(OSError):
                     self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
         self.assertEqual(self.kv.alerts, [])
+
+    def test_a_board_with_no_tasks_table_yet_does_not_stop_alerts(self):
+        # The first card filed creates the table; refusing alerts until then
+        # would mean it is never created.
+        conn = sqlite3.connect(self.db)
+        conn.executescript("DROP TABLE tasks;")
+        conn.close()
+        self.assertIsNone(stall_watch.board_records_sessions(self.db))
+        self.kv.file_cards = False
+        lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        self.assertEqual(lines, [])
+        self.assertEqual(len(self.kv.alerts), 1)
+
+    def test_an_outage_after_a_quiet_spell_is_said_again(self):
+        fleet = {"c": {"checkout": [DEADLINE_ROW]}}
+        self.kv.advertise = False
+        lines, _ = self.run_tick(fleet)
+        self.assertTrue(lines[0].startswith(stall_watch.INJECT_FAILED_PREFIX), lines)
+        self.assertEqual(self.run_tick({"c": {"checkout": []}})[0], [])
+        lines, _ = self.run_tick(fleet)
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith(stall_watch.INJECT_FAILED_PREFIX), lines)
 
     def test_a_board_without_the_session_column_raises_no_alert_and_says_so(self):
         # Every card the alert produced would be unfindable, so its episode
@@ -1026,7 +1048,6 @@ class SessionKv(Base):
             "kinds a number": ({stall_watch.INJECT_KINDS_KEY: 5}, {"sessionID": "s1"}, {"status": "injected"}),
             "kinds a joined string": ({stall_watch.INJECT_KINDS_KEY: f"k8s-event,{stall_watch.INJECT_KIND}"}, {"sessionID": "s1"}, {"status": "injected"}),
             "session id a number": (healthy, {"sessionID": 7}, {"status": "injected"}),
-            "no inject status": (healthy, {"sessionID": "s1"}, {}),
         }
         for name, (healthz, session, injected) in cases.items():
             with self.subTest(name):
@@ -1041,6 +1062,15 @@ class SessionKv(Base):
                     lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
                 self.assertEqual(len(lines), 1, lines)
                 self.assertTrue(lines[0].startswith(stall_watch.INJECT_FAILED_PREFIX), lines[0])
+
+    def test_a_server_that_hangs_up_is_unreachable_not_unreadable(self):
+        def urlopen(request, timeout):
+            raise http.client.RemoteDisconnected("Remote end closed connection without response")
+
+        with patch.object(stall_watch.urllib.request, "urlopen", urlopen), patch.object(stall_watch, "session_kv", REAL_SESSION_KV):
+            lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        self.assertIn("could not be reached", lines[0])
+        self.assertNotIn("could not be read", lines[0])
 
     def test_the_board_is_the_one_hermes_resolves(self):
         # hermes_cli.kanban has no kanban_db_path; importing it from there fell

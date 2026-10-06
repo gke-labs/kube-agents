@@ -1017,6 +1017,8 @@ def session_kv(path: str, body: dict | None = None, method: str = "") -> dict:
         with urllib.request.urlopen(request, timeout=SESSION_KV_TIMEOUT_SECONDS) as response:
             answer = json.loads(response.read().decode("utf-8") or "{}")
     except http.client.HTTPException as exc:  # a body cut short, a status line that is not HTTP
+        if isinstance(exc, OSError):
+            raise  # RemoteDisconnected: the server went away, which is unreachable
         raise ValueError(f"the Session KV server's answer was malformed: {exc!r}") from exc
     if not isinstance(answer, dict):
         raise ValueError(f"the Session KV server answered {type(answer).__name__}, not a JSON object")
@@ -1170,18 +1172,20 @@ class BoardUnreadable(Exception):
 
 def board_records_sessions(db_path: Path | None = None) -> bool | None:
     """Whether the board's tasks table has the `session_id` column the watch
-    finds an alert's card by; None when the board could not be opened. Without
+    finds an alert's card by; None when the board could not be opened or has no
+    tasks table yet, which the first card filed creates. Without
     the column every alert's card would be unfindable, so its episode would
     never close and the namespace would never be alerted for again."""
     try:
         conn = sqlite3.connect(f"file:{db_path or board_path()}?mode=ro", uri=True, timeout=BOARD_BUSY_TIMEOUT_SECONDS)
         try:
-            return SESSION_COLUMN in {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
         finally:
             conn.close()
     except sqlite3.Error as exc:
         sys.stderr.write(f"stall_watch: could not open the board to check its schema: {exc}\n")
         return None
+    return SESSION_COLUMN in columns if columns else None
 
 
 def card_for_session(session_id: str, assignee: str = "", db_path: Path | None = None) -> str | None:
@@ -1388,7 +1392,7 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
     for scope, episode in episodes.items():
         if not dry_run and episode.get("pending") and scope not in candidates and scope_rows(state, scope):
             candidates[scope] = []
-    raised = held = 0
+    raised = held = wanted = 0
     refusal: str | None = None
     for scope in sorted(candidates, key=lambda sc: (scope_first_seen(state, sc), sc)):
         new_rows = candidates[scope]
@@ -1442,6 +1446,7 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
                 previous = episode
         if not would_raise(state, sweep, scope):
             continue
+        wanted += 1
         if refusal is not None:
             # The server refused this tick's first alert; the rest wait for the
             # next tick rather than each spending a timeout on the same answer.
@@ -1490,6 +1495,10 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
         # one attempt was a refused record proves nothing either way.
         if state.get(INJECT_ERROR_KEY):
             lines.append(INJECT_RECOVERED_LINE)
+        state[INJECT_ERROR_KEY] = None
+    elif not wanted and not dry_run:
+        # Nothing is waiting on the server, so the refusal said earlier no
+        # longer stands for anything; the next one is said again.
         state[INJECT_ERROR_KEY] = None
     open_scopes = {scope_key(e["cluster"], e["namespace"]) for e in state["stalls"].values()}
     for scope in sorted(set(episodes) - open_scopes):

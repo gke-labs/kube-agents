@@ -98,8 +98,8 @@ closed" (without the card clause when the alert produced no card; a card
 filed later still reports the recovery in the alert's thread), "stall
 noticed in `<n>` more namespaces; alerts follow on later ticks, 3 a tick", the
 cleared line naming at most eight objects, and an "alerts not raised" line when the Session
-KV server refuses an alert, said once until the reason changes, with a line
-when alerts are raised again. It also carries the sweep-failed and sweep-recovered lines
+KV server refuses an alert, said once until the reason changes or no stall is
+left waiting on it, with a line when alerts are raised again. It also carries the sweep-failed and sweep-recovered lines
 every roster entry owes. A new stall's notice is the alert the Session KV server
 posts. A namespace whose alert has produced no card a day after it was raised
 (the Planning Agent's turn failed) has its alert raised again, and the new
