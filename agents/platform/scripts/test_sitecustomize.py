@@ -26,6 +26,19 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+# How long the forced import race in FinderMustNotImportTest waits at each
+# checkpoint and for the two threads to return. Under the old hook neither
+# thread ever returns, so a genuine deadlock trips any finite deadline; a
+# healthy run finishes in milliseconds. Sixty seconds rather than five or ten
+# because the Python sweep runs one test process per core, and on a CI runner
+# with four of them the shorter deadlines expired without a hang.
+RACE_DEADLINE_SECONDS = 60
+# The parent's cap on the race subprocess. The child can spend the full
+# deadline at each of its three waits before it reports, so the cap sits
+# above their sum: a cap that fires first kills the child before it prints
+# which deadline passed and where the threads sat.
+RACE_SUBPROCESS_TIMEOUT_SECONDS = 4 * RACE_DEADLINE_SECONDS
+
 # Loaded by path rather than by name, because `import sitecustomize` cannot
 # reach this one. CPython's `site.py` imports whatever `sitecustomize` it finds
 # at interpreter startup, before any test code runs, so `sys.modules` is
@@ -312,7 +325,12 @@ class FinderMustNotImportTest(unittest.TestCase):
                 import sys
                 ctl = sys.modules["_deadlock_ctl"]
                 ctl.started.set()
-                ctl.go.wait(10)
+                # No deadline: A may only go on once B is inside the hook, or
+                # a slow B lets A finish before the race was forced and the
+                # run passes vacuously. The main thread's checkpoint on B
+                # bounds this wait and exits the process, taking this daemon
+                # thread with it.
+                ctl.go.wait()
                 import gateway_helper  # a new module: needs the global import lock
                 """
             )
@@ -320,7 +338,8 @@ class FinderMustNotImportTest(unittest.TestCase):
         (self.root / "gateway_helper.py").write_text("VALUE = 1\n")
         script = textwrap.dedent(
             f"""
-            import importlib, importlib.util, sys, threading, types
+            import faulthandler, importlib, importlib.util, sys, threading, time, traceback, types
+            DEADLINE = {RACE_DEADLINE_SECONDS}
             sys.path.insert(0, {str(self.root)!r})
             spec = importlib.util.spec_from_file_location(
                 "_sc", {str(SCRIPTS_DIR / "sitecustomize.py")!r}
@@ -331,6 +350,15 @@ class FinderMustNotImportTest(unittest.TestCase):
             ctl = types.ModuleType("_deadlock_ctl")
             ctl.started, ctl.go, ctl.in_finder = threading.Event(), threading.Event(), threading.Event()
             sys.modules["_deadlock_ctl"] = ctl
+
+            def fail(phase):
+                # Every thread's stack to stderr, which the parent appends to
+                # its assertion message, so the log says where A and B sat
+                # rather than only that a deadline passed.
+                sys.stdout.flush()
+                faulthandler.dump_traceback(all_threads=True)
+                print("FAILED:", phase, flush=True)
+                sys.exit(1)
 
             # Signals the moment thread B is inside the hook, so A is released
             # only then: the race is forced, not left to a sleep.
@@ -344,22 +372,56 @@ class FinderMustNotImportTest(unittest.TestCase):
             patch.install = lambda: None
             sys.modules["fake_patch"] = patch
             sys.meta_path.insert(0, Signalling(["fake_patch"]))
-            a = threading.Thread(target=lambda: importlib.import_module("gateway"), daemon=True)
+            # A thread that dies with an exception is as "not alive" as one
+            # that returned, so liveness alone would read a regression that
+            # raises in the hook as a pass. Each thread keeps its traceback
+            # for the verdict below.
+            errors = {{}}
+
+            def run(name, module):
+                try:
+                    importlib.import_module(module)
+                except BaseException:
+                    errors[name] = traceback.format_exc()
+
+            a = threading.Thread(name="A", target=run, args=("A", "gateway"), daemon=True)
             b = threading.Thread(
-                target=lambda: importlib.import_module("gateway.platform_registry"), daemon=True
+                name="B", target=run, args=("B", sc.TRIGGER_MODULE), daemon=True
             )
             a.start()
-            assert ctl.started.wait(10)
+            if not ctl.started.wait(DEADLINE):
+                fail("thread A never entered gateway/__init__ within %ds" % DEADLINE)
             b.start()
-            assert ctl.in_finder.wait(10), "thread B never reached the hook"
+            if not ctl.in_finder.wait(DEADLINE):
+                fail("thread B never reached the hook within %ds" % DEADLINE)
             ctl.go.set()
-            a.join(5)
-            b.join(5)
-            print("OK" if not (a.is_alive() or b.is_alive()) else "DEADLOCK", flush=True)
+            # One deadline for both joins: a deadlocked pair is reported after
+            # DEADLINE, not after one per thread.
+            end = time.monotonic() + DEADLINE
+            for t in (a, b):
+                t.join(max(0, end - time.monotonic()))
+            alive = [t.name for t in (a, b) if t.is_alive()]
+            if alive:
+                fail(
+                    "deadlock: thread %s still alive %ds after release"
+                    % (" and ".join(alive), DEADLINE)
+                )
+            for name, tb in errors.items():
+                sys.stderr.write("thread %s raised:\\n%s" % (name, tb))
+            if errors:
+                fail("thread %s raised instead of finishing" % " and ".join(sorted(errors)))
+            # Both returned cleanly: the trigger module must also have run,
+            # or the hook handed back a spec that loaded nothing.
+            if not getattr(sys.modules.get(sc.TRIGGER_MODULE), "EXECUTED", False):
+                fail("the trigger module did not execute")
+            print("OK", flush=True)
             """
         )
         result = subprocess.run(
-            [sys.executable, "-c", script], capture_output=True, text=True, timeout=60
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=RACE_SUBPROCESS_TIMEOUT_SECONDS,
         )
         self.assertEqual(result.stdout.strip(), "OK", result.stdout + result.stderr)
 

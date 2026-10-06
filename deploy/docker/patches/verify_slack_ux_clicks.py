@@ -48,6 +48,10 @@ FLAG_ENV = "KAGE_SLACK_UX"
 
 METHOD = "_register_bolt_handlers"
 PLUGIN_WIRING = "_register_plugin_action_handlers"
+#: The Bolt app ``slack_ux_clicks.register()`` adds its listeners to. It is set
+#: outside ``__init__`` and the stub supplies it, so only this check ties it to
+#: upstream: ``METHOD`` must still wire listeners onto it.
+APP_ATTRIBUTE = "_app"
 GUARD_ALIAS = "_kage_slack_clicks"
 IMPORT_MODULE = "gateway"
 IMPORT_NAME = "slack_ux_clicks"
@@ -304,6 +308,18 @@ def check_adapter(root: Path) -> None:
     methods = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == METHOD]
     if len(methods) != 1:
         raise _fail(f"{ADAPTER} has {len(methods)} def {METHOD}(), expected 1")
+    # A call on it, not a mention: `if self._app is None: return` wires nothing.
+    on_app = any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == APP_ATTRIBUTE
+        and isinstance(node.func.value.value, ast.Name)
+        and node.func.value.value.id == "self"
+        for node in ast.walk(methods[0])
+    )
+    if not on_app:
+        raise _fail(f"{METHOD}() no longer wires listeners onto self.{APP_ATTRIBUTE}, which the runtime adds its listeners to")
     body = methods[0].body
     wired = [i for i, stmt in enumerate(body) if _is_self_call(stmt, PLUGIN_WIRING)]
     if len(wired) != 1:
