@@ -487,9 +487,11 @@ async def _plan_row(
         return False
 
 
-async def _settle_plan_row(plan: Any, adapter: Any, sub: dict, kind: str, result: str = "") -> None:
+async def _settle_plan_row(
+    plan: Any, adapter: Any, sub: dict, kind: str, result: str = "", title: str = "",
+) -> None:
     try:
-        await plan.settle_row(adapter, sub, kind, result)
+        await plan.settle_row(adapter, sub, kind, result, title)
     except Exception as exc:  # noqa: BLE001 — cosmetic, like the rolling settle
         logger.debug("kanban progress: settling the plan row for %s failed: %s", sub.get("task_id"), exc)
 
@@ -725,7 +727,8 @@ async def deliver(
     if kind not in ROLLING_KINDS:
         plan = _slack_plan(quiet)
         if plan is not None:
-            await _settle_plan_row(plan, adapter, sub, kind, result_line(kind, getattr(ev, "payload", None)))
+            result = result_line(kind, getattr(ev, "payload", None))
+            await _settle_plan_row(plan, adapter, sub, kind, result, title)
         if entry and entry["message_id"] and entry["lines"]:
             settled = entry["lines"][-1:] if quiet else entry["lines"]
             try:

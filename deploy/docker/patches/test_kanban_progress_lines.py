@@ -1066,6 +1066,7 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
         self.moves = []
         self.settled = []
         self.results = []
+        self.titles = []
         self.flag = True
         self.plan = True
         self.takes = True
@@ -1078,9 +1079,10 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
                 raise test.takes
             return test.takes
 
-        async def settle_row(adapter, sub, kind, result=""):
+        async def settle_row(adapter, sub, kind, result="", title=""):
             test.settled.append((sub["task_id"], kind))
             test.results.append(result)
+            test.titles.append(title)
 
         async def settle_delegated(adapter, sub, kind, board=None):
             return None
@@ -1126,6 +1128,14 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
         completed = SimpleNamespace(id=3, kind="completed", payload={"summary": "seeded-a · 1.33.4 = default"})
         await deliver(SimpleNamespace(), _Adapter(), SLACK_SUB, "completed", completed, "Done.", None, HEADER)
         self.assertEqual(self.results, ["seeded-a · 1.33.4 = default"])
+
+    async def test_a_terminal_event_names_the_card_for_a_row_it_opens(self):
+        # A card that sent no note gets its row from the settle, led by its title.
+        completed = SimpleNamespace(id=3, kind="completed", payload={"summary": "1.33.4 = default"})
+        await deliver(
+            SimpleNamespace(), _Adapter(), SLACK_SUB, "completed", completed, "Done.", None, HEADER, title="seeded-a",
+        )
+        self.assertEqual(self.titles, ["seeded-a"])
 
     async def test_a_plan_that_refuses_falls_back_to_the_rolling_line(self):
         # The fallback is the flag-on rolling line: the trail settles to its last line.
