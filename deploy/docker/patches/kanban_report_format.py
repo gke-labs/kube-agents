@@ -119,10 +119,12 @@ and Google Chat flattens headings to bold, drops tables, and splits anything
 past 4000 characters across messages:
 
 - Open with one bold sentence that answers what was asked — what is true, or
-  what is wrong and what you want done. Then one or two plain sentences of the
-  evidence that settles it, and an offer only if there is a next step. Say it
-  once: no recap of the lead, and do not narrate the request back or how you
-  investigated.
+  what is wrong and what you want done. Bold the whole sentence through its
+  full stop, never a label or a clause ending in a colon. Then one or two plain
+  sentences of the evidence that settles it, and an offer only if there is a
+  next step. Say it once: the sentences after the lead give evidence, never a
+  second verdict that repeats the lead, and do not narrate the request back or
+  how you investigated.
 - A question gets that paragraph and nothing more: no sections, no list of the
   commands you ran. Use `##` for sections only when the card asks for a list or
   a report. Never `#` — the chat message already shows the card
