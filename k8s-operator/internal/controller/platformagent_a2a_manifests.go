@@ -1038,8 +1038,12 @@ func a2aInjectBackendEnabled() bool {
 }
 
 // a2aTargetAllowlistEnv renders the CR's Chat and Slack allowlists for the
-// gateway. An absent or empty list renders nothing: the gateway reads no var
-// as "all authenticated users", which is what the CR field promises.
+// gateway. An absent list, or the allow-all spelling allowAllUsers accepts,
+// renders nothing: the gateway reads no var as "all authenticated users",
+// which is what the CR field promises. Any other list renders, even one that
+// is blank after trimming: the gateway reads a set-but-empty var as a list
+// with no members, so a list of blanks admits nobody, the rule #2207 set for
+// the Chat ingress list, rather than widening to everyone.
 func a2aTargetAllowlistEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 	integ := agent.Spec.Integration
 	if integ == nil {
@@ -1059,15 +1063,11 @@ func a2aTargetAllowlistEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 		return strings.Join(out, ",")
 	}
 	var env []corev1.EnvVar
-	if integ.GoogleChat != nil {
-		if v := join(integ.GoogleChat.AllowedUsers, true); v != "" {
-			env = append(env, corev1.EnvVar{Name: a2aTargetAllowedUsersGchatEnvVar, Value: v})
-		}
+	if integ.GoogleChat != nil && !allowAllUsers(integ.GoogleChat.AllowedUsers) {
+		env = append(env, corev1.EnvVar{Name: a2aTargetAllowedUsersGchatEnvVar, Value: join(integ.GoogleChat.AllowedUsers, true)})
 	}
-	if integ.Slack != nil {
-		if v := join(integ.Slack.AllowedUsers, false); v != "" {
-			env = append(env, corev1.EnvVar{Name: a2aTargetAllowedUsersSlackEnvVar, Value: v})
-		}
+	if integ.Slack != nil && !allowAllUsers(integ.Slack.AllowedUsers) {
+		env = append(env, corev1.EnvVar{Name: a2aTargetAllowedUsersSlackEnvVar, Value: join(integ.Slack.AllowedUsers, false)})
 	}
 	return env
 }

@@ -1126,7 +1126,7 @@ class C1IsolationIsStructural(unittest.TestCase):
                     "is allowed on an install whose Go suites are green" % (rendered, read),
                 )
                 one(r"Name:\s*%s," % const, a2a_manifests, "the operator's render of %s" % const)
-                one(r"os\.Getenv\(%s\)" % env, allowlist + h.text("a2a_gateway_config"), "the gateway's read of %s" % env)
+                one(r"os\.(?:Getenv|LookupEnv)\(%s\)" % env, allowlist + h.text("a2a_gateway_config"), "the gateway's read of %s" % env)
 
         # The absent-list branch is allow, stated in the function that answers.
         body = allowlist.split("func (g *Gateway) targetAllows")[1].split("\n}\n")[0]

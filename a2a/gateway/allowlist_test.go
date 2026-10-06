@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -41,11 +42,27 @@ func TestTargetAllowsTable(t *testing.T) {
 	}
 }
 
-func TestAnEmptyListIsNoList(t *testing.T) {
-	cfg := &Config{TargetAllowedUsers: map[string]map[string][]string{"platform": {gchatBackend: {" ", ""}}}}
+// TestAnUnsetListIsNoList: no list for the (target, backend) pair leaves the
+// ingress allowlist as the only gate.
+func TestAnUnsetListIsNoList(t *testing.T) {
+	cfg := &Config{TargetAllowedUsers: map[string]map[string][]string{"platform": {slackBackend: {"U0ABC"}}}}
 	g := &Gateway{cfg: cfg, targetAllowed: buildTargetAllowed(cfg, allowlistTestPS)}
 	if !g.targetAllows("platform", gchatBackend, subjectOf(gchatBackend, "anyone@example.com")) {
-		t.Fatal("a list of blanks refused a requester; blanks must read as no list")
+		t.Fatal("a backend with no list refused a requester; no list must read as all authenticated users")
+	}
+}
+
+// TestABlankListIsNobody: a list that is present but blank after trimming
+// admits nobody, the rule #2207 set for the Chat ingress list. The operator
+// renders the var empty for a CR list of blanks so this reaches the gateway.
+func TestABlankListIsNobody(t *testing.T) {
+	cfg := &Config{TargetAllowedUsers: map[string]map[string][]string{"platform": {gchatBackend: {" ", ""}, slackBackend: nil}}}
+	g := &Gateway{cfg: cfg, targetAllowed: buildTargetAllowed(cfg, allowlistTestPS)}
+	if g.targetAllows("platform", gchatBackend, subjectOf(gchatBackend, "anyone@example.com")) {
+		t.Fatal("a list of blanks admitted a requester; a present blank list must admit nobody")
+	}
+	if g.targetAllows("platform", slackBackend, subjectOf(slackBackend, "U0ABC")) {
+		t.Fatal("an empty present list admitted a requester")
 	}
 }
 
@@ -84,13 +101,31 @@ func TestTargetAllowedUsersParseFromEnv(t *testing.T) {
 	if len(got[slackBackend]) != 2 || got[slackBackend][1] != "U0DEF" {
 		t.Fatalf("slack list = %v", got[slackBackend])
 	}
-	t.Setenv(EnvTargetAllowedUsersGchat, "")
+	// Set but empty is a list that admits nobody: the operator renders it
+	// for a CR list of blanks.
+	t.Setenv(EnvTargetAllowedUsersGchat, " , ")
 	t.Setenv(EnvTargetAllowedUsersSlack, "")
 	cfg, err = FromEnv()
 	if err != nil {
 		t.Fatal(err)
 	}
+	lists, ok := cfg.TargetAllowedUsers["platform"]
+	if !ok || len(lists) != 2 {
+		t.Fatalf("set-but-empty env parsed as no lists: %v", lists)
+	}
+	for _, backend := range []string{gchatBackend, slackBackend} {
+		if l, present := lists[backend]; !present || len(l) != 0 {
+			t.Fatalf("%s list = %v (present=%v), want present and empty", backend, l, present)
+		}
+	}
+	// Unset is no list.
+	os.Unsetenv(EnvTargetAllowedUsersGchat)
+	os.Unsetenv(EnvTargetAllowedUsersSlack)
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if lists := cfg.TargetAllowedUsers["platform"]; len(lists) != 0 {
-		t.Fatalf("empty env parsed as lists: %v", lists)
+		t.Fatalf("unset env parsed as lists: %v", lists)
 	}
 }

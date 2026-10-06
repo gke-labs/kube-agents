@@ -49,9 +49,8 @@ func buildTargetAllowed(cfg *Config, ps *Pseudonymizer) targetAllowed {
 					set[subject] = true
 				}
 			}
-			if len(set) == 0 {
-				continue // an empty list is no list: all authenticated users
-			}
+			// An empty set is kept: a list that is present but blank
+			// admits nobody (#2207's rule for the Chat ingress list).
 			if out[target] == nil {
 				out[target] = map[string]map[string]bool{}
 			}
@@ -65,7 +64,7 @@ func buildTargetAllowed(cfg *Config, ps *Pseudonymizer) targetAllowed {
 // as a history entry's TaskRequester stores it) came in on backend may reach
 // target. No list for the (target, backend) pair means the ingress allowlist
 // is the only gate, which is today's bound, so the answer is true. Under a
-// list, a blank subject is never a member.
+// list, a blank subject is never a member, and an empty list has none.
 func (g *Gateway) targetAllows(target, backend, subject string) bool {
 	set := g.targetAllowed[target][backend]
 	if set == nil {

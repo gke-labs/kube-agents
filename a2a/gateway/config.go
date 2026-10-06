@@ -118,7 +118,8 @@ type Config struct {
 	// allowlist a session's delegation is checked against: target ->
 	// backend -> ids in that backend's vocabulary. Only "platform" is
 	// populated from env today (EnvTargetAllowedUsersGchat/Slack); an absent
-	// pair means all authenticated users. See allowlist.go.
+	// pair means all authenticated users, and a present pair whose list is
+	// empty means nobody. See allowlist.go.
 	TargetAllowedUsers map[string]map[string][]string
 
 	// InjectListen is the inject side door's HTTP listen address, and setting
@@ -436,11 +437,13 @@ func FromEnv() (*Config, error) {
 	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
 	cfg.TargetAllowedUsers = map[string]map[string][]string{}
 	platformLists := map[string][]string{}
-	if l := splitList(os.Getenv(EnvTargetAllowedUsersGchat)); len(l) > 0 {
-		platformLists[gchatBackend] = l
+	// Set is a list, even set empty: the operator renders the var empty for
+	// a CR list of blanks, which admits nobody. Unset is no list.
+	if raw, ok := os.LookupEnv(EnvTargetAllowedUsersGchat); ok {
+		platformLists[gchatBackend] = append([]string{}, splitList(raw)...)
 	}
-	if l := splitList(os.Getenv(EnvTargetAllowedUsersSlack)); len(l) > 0 {
-		platformLists[slackBackend] = l
+	if raw, ok := os.LookupEnv(EnvTargetAllowedUsersSlack); ok {
+		platformLists[slackBackend] = append([]string{}, splitList(raw)...)
 	}
 	if len(platformLists) > 0 {
 		cfg.TargetAllowedUsers[targetPlatform] = platformLists
