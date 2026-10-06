@@ -2453,6 +2453,46 @@ func rawSessionRecord(t *testing.T, reg *Registry, sessionKey string) string {
 	return string(entry.Value())
 }
 
+// TestAskTTLBoundaryClearsBothCopies: a copy exactly AskTTL old is past the
+// TTL (>=), for the history entry's requester exactly as for the active
+// task's ask, and a nanosecond younger is not, for either.
+func TestAskTTLBoundaryClearsBothCopies(t *testing.T) {
+	r := startRigWith(t, func(c *Config) { c.AskTTL = time.Minute })
+	conv := "discord:g1/thread-ttl-edge"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "x"}
+	r.awaitTask(t, "platform")
+	ctx := context.Background()
+	var rec *SessionRecord
+	waitFor(t, "record", func() bool {
+		rec, _ = r.g.reg.Get(ctx, conv)
+		return rec != nil && len(rec.Tasks) == 1 && rec.ActiveTask != nil
+	})
+	start := time.Now().UTC().Truncate(time.Second) // survives the JSON round trip exactly
+	rec.Tasks[0].StartedAt = start
+	rec.ActiveTask.SubmittedAt = start
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	r.g.boundAskCopyAt(ctx, rec, start.Add(time.Minute-time.Nanosecond))
+	fresh, _ := r.g.reg.Get(ctx, conv)
+	if fresh.Tasks[0].Requester == nil || fresh.Tasks[0].Attribution == nil {
+		t.Fatalf("requester cleared a nanosecond before the TTL: %+v", fresh.Tasks[0])
+	}
+	if fresh.ActiveTask == nil || fresh.ActiveTask.Ask == "" {
+		t.Fatalf("ask cleared a nanosecond before the TTL: %+v", fresh.ActiveTask)
+	}
+
+	r.g.boundAskCopyAt(ctx, fresh, start.Add(time.Minute))
+	fresh, _ = r.g.reg.Get(ctx, conv)
+	if fresh.Tasks[0].Requester != nil || fresh.Tasks[0].Attribution != nil {
+		t.Fatalf("requester survived at exactly the TTL: %+v", fresh.Tasks[0])
+	}
+	if fresh.ActiveTask == nil || fresh.ActiveTask.Ask != "" {
+		t.Fatalf("ask survived at exactly the TTL: %+v", fresh.ActiveTask)
+	}
+}
+
 func TestTaskRefOmitsAZeroStartedAt(t *testing.T) {
 	raw, err := json.Marshal(TaskRef{ID: "task-legacy", Addressee: "platform"}) // pre-field shape
 	if err != nil {

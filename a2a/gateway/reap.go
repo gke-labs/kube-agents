@@ -168,9 +168,16 @@ func (g *Gateway) reapSession(ctx context.Context, rec *SessionRecord) {
 // older than AskTTL is cleared here, in the same scan that reaps — content
 // only: the task record itself, its serialization, and its detach state are
 // untouched, because this bound is about the copy's horizon, not the
-// task's lifecycle.
+// task's lifecycle. The same pass bounds the history entries' requester and
+// attribution copies by their StartedAt. A copy exactly AskTTL old is past
+// it, on both sides.
 func (g *Gateway) boundAskCopy(ctx context.Context, rec *SessionRecord) {
-	now := time.Now()
+	g.boundAskCopyAt(ctx, rec, time.Now())
+}
+
+// boundAskCopyAt is boundAskCopy at a given instant, so the TTL boundary is
+// testable without a sleep.
+func (g *Gateway) boundAskCopyAt(ctx context.Context, rec *SessionRecord, now time.Time) {
 	active := rec.ActiveTask
 	askExpired := active != nil && active.Ask != "" && !active.SubmittedAt.IsZero() &&
 		now.Sub(active.SubmittedAt) >= g.cfg.AskTTL
@@ -187,10 +194,13 @@ func (g *Gateway) boundAskCopy(ctx context.Context, rec *SessionRecord) {
 		return
 	}
 	changed := false
+	var askTaskID string      // the active task whose ask was cleared, if any
+	var requesterIDs []string // history entries whose requester copy was cleared
 	if askExpired && fresh.ActiveTask != nil && fresh.ActiveTask.TaskID == active.TaskID &&
 		fresh.ActiveTask.Ask != "" && !fresh.ActiveTask.SubmittedAt.IsZero() &&
 		now.Sub(fresh.ActiveTask.SubmittedAt) >= g.cfg.AskTTL {
 		fresh.ActiveTask.Ask = ""
+		askTaskID = fresh.ActiveTask.TaskID
 		changed = true
 	}
 	// The requester copy on the task history is bounded the same way: the
@@ -206,6 +216,7 @@ func (g *Gateway) boundAskCopy(ctx context.Context, rec *SessionRecord) {
 			continue
 		}
 		ref.Requester, ref.Attribution = nil, nil
+		requesterIDs = append(requesterIDs, ref.ID)
 		changed = true
 	}
 	if !changed {
@@ -215,7 +226,8 @@ func (g *Gateway) boundAskCopy(ctx context.Context, rec *SessionRecord) {
 		g.log.Error("ask bound: record write failed", "session", fresh.Key, "err", err)
 		return
 	}
-	g.log.Info("ask bound: cleared copies past their TTL", "session", fresh.Key)
+	g.log.Info("ask bound: cleared copies past their TTL", "session", fresh.Key,
+		"taskId", askTaskID, "requesterTaskIds", requesterIDs)
 }
 
 // requesterExpired reports whether any history entry's requester copy is
