@@ -224,6 +224,10 @@ cases do; the apply step is covered by the unit test above.
   recreated, the file deleted, a `STATE_SCHEMA_VERSION` change) makes every stall still open new,
   three alerts a tick, and leaves the earlier cards open. Matching open cards by title would be the
   only guard, and a ledger loss is rare.
+- **A repeated outage can go unsaid.** The "alerts not raised" line is said once per refusal text and
+  forgotten only when an alert is sent. If an outage's stall clears before the server returns and no
+  alert is sent before the next outage with the same text, the second is not said. Forgetting it on a
+  tick with nothing waiting was tried and repeated the line whenever a sweep skipped the namespace.
 - **A kill between saving the ledger and sending the inject delays the alert a day.** The episode is
   saved with a session that never got the record, and the watch waits the day it gives any session
   that files no card. The window is the inject call itself, at most its 30-second timeout.

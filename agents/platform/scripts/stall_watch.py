@@ -1193,10 +1193,18 @@ def card_for_session(session_id: str, assignee: str = "", db_path: Path | None =
     BoardUnreadable when the board cannot say. Hermes stamps the filing session on `tasks.session_id`;
     the Planning Agent's kanban_create runs in the session the Session KV
     server opened for the alert, so that is the link. A card assigned to the
-    Cluster Agent the record named is preferred over any other the turn filed."""
+    Cluster Agent the record named is preferred over any other the turn filed.
+    A board with no file or no tasks table yet has no card, the reading
+    board_records_sessions gives it too, so the day-later retry and the
+    clearing step still apply."""
+    path = db_path or board_path()
+    if not Path(path).exists():
+        return None
     try:
-        conn = sqlite3.connect(f"file:{db_path or board_path()}?mode=ro", uri=True, timeout=BOARD_BUSY_TIMEOUT_SECONDS)
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=BOARD_BUSY_TIMEOUT_SECONDS)
         try:
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tasks'").fetchone() is None:
+                return None
             row = conn.execute(
                 "SELECT id FROM tasks WHERE session_id = ? ORDER BY assignee = ? DESC, created_at, id LIMIT 1",
                 (session_id, assignee),
@@ -1392,7 +1400,7 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
     for scope, episode in episodes.items():
         if not dry_run and episode.get("pending") and scope not in candidates and scope_rows(state, scope):
             candidates[scope] = []
-    raised = held = wanted = 0
+    raised = held = 0
     refusal: str | None = None
     for scope in sorted(candidates, key=lambda sc: (scope_first_seen(state, sc), sc)):
         new_rows = candidates[scope]
@@ -1446,7 +1454,6 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
                 previous = episode
         if not would_raise(state, sweep, scope):
             continue
-        wanted += 1
         if refusal is not None:
             # The server refused this tick's first alert; the rest wait for the
             # next tick rather than each spending a timeout on the same answer.
@@ -1495,10 +1502,6 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
         # one attempt was a refused record proves nothing either way.
         if state.get(INJECT_ERROR_KEY):
             lines.append(INJECT_RECOVERED_LINE)
-        state[INJECT_ERROR_KEY] = None
-    elif not wanted and not dry_run:
-        # Nothing is waiting on the server, so the refusal said earlier no
-        # longer stands for anything; the next one is said again.
         state[INJECT_ERROR_KEY] = None
     open_scopes = {scope_key(e["cluster"], e["namespace"]) for e in state["stalls"].values()}
     for scope in sorted(set(episodes) - open_scopes):

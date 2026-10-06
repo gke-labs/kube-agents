@@ -825,15 +825,17 @@ class Alerts(Base):
         self.assertEqual(lines, [])
         self.assertEqual(len(self.kv.alerts), 1)
 
-    def test_an_outage_after_a_quiet_spell_is_said_again(self):
-        fleet = {"c": {"checkout": [DEADLINE_ROW]}}
-        self.kv.advertise = False
-        lines, _ = self.run_tick(fleet)
-        self.assertTrue(lines[0].startswith(stall_watch.INJECT_FAILED_PREFIX), lines)
-        self.assertEqual(self.run_tick({"c": {"checkout": []}})[0], [])
-        lines, _ = self.run_tick(fleet)
-        self.assertEqual(len(lines), 1)
-        self.assertTrue(lines[0].startswith(stall_watch.INJECT_FAILED_PREFIX), lines)
+    def test_a_board_with_no_tasks_table_yet_still_clears_and_retries(self):
+        conn = sqlite3.connect(self.db)
+        conn.executescript("DROP TABLE tasks;")
+        conn.close()
+        self.kv.file_cards = False
+        self.assertIsNone(stall_watch.card_for_session("k8s-evt-1", "x", self.db))
+        self.run_tick({"c": {"checkout": [DEADLINE_ROW]}}, now="2026-10-02T12:00:00+00:00")
+        self.run_tick({"c": {"checkout": [DEADLINE_ROW]}}, now="2026-10-03T12:00:00+00:00")
+        self.assertEqual(len(self.kv.alerts), 2, "the day-later retry applies")
+        lines, _ = self.run_tick({"c": {"checkout": []}}, now="2026-10-03T12:30:00+00:00")
+        self.assertEqual(lines, [f"{stall_watch.CLEARED_PREFIX} in {label('c')} / `checkout`: Deployment/checkout-api"])
 
     def test_a_board_without_the_session_column_raises_no_alert_and_says_so(self):
         # Every card the alert produced would be unfindable, so its episode
