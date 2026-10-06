@@ -8,7 +8,8 @@ completion handoff and the wake set — the third carries the incident-store
 call, which used to share the wake anchor and no longer can (below), the
 fourth routes the completion message through ``completion_text`` so
 ``KAGE_SLACK_UX`` can drop its head line on Slack, and the fifth settles the
-failure lines that flag held for the wake.
+failure lines that flag held for the wake. One more anchor is substituted
+unchanged: the ``platform_str`` binding the completion message reads.
 
 Where the sites live, as of v2026.9.14. Upstream's September decomposition
 (``fd2bfa1893``) moved the notifier's per-subscription delivery out of the
@@ -77,6 +78,7 @@ Why the changes are needed is documented in the module docstrings of
 
 from __future__ import annotations
 
+import ast
 import sys
 from pathlib import Path
 
@@ -257,6 +259,15 @@ COMPLETION_CALL = (
     "_kanban_completion_text(n.head, n.title, handoff, n.platform_str)"
 )
 
+#: The completion call reads ``n.platform_str`` ahead of the flag, and no
+#: other anchor holds it. Pinned unchanged and inside
+#: ``_KanbanNotification.__init__``, so an upstream that renames, rewrites,
+#: duplicates or moves the binding fails the build instead of raising
+#: AttributeError on every completion.
+PLATFORM_BINDING = '        self.platform_str = (sub["platform"] or "").lower()\n'
+PLATFORM_CLASS = "_KanbanNotification"
+PLATFORM_METHOD = "__init__"
+
 COMPLETION_PATCHED = (
     f"{HANDOFF_INDENT}# kube-agents patch: see gateway/kanban_notifier.py\n"
     f"{HANDOFF_INDENT}return {COMPLETION_CALL}, wake_handoff, None\n"
@@ -348,8 +359,9 @@ TRAILER = (
     ")\n"
 )
 
-#: Text that only exists after a successful run. All five anchors are
-#: destroyed by their own replacement, so a re-run would already fail on
+#: Text that only exists after a successful run. All five edited anchors
+#: are destroyed by their own replacement (the platform_str pin is not, and
+#: passes a re-run), so a re-run would already fail on
 #: "found 0" — but that message blames upstream drift for what is actually a
 #: duplicated build step, and before the old delivery applier grew this guard a
 #: second pass exited 0 and left a second hook call and a second trailer import
@@ -368,10 +380,87 @@ SENTINELS = (
 )
 
 
+def _bindings(body: list[ast.stmt], name: str) -> list[ast.AST]:
+    """Every statement or target in ``body`` that may bind ``name`` in its scope.
+
+    Branches count, since any of them may run, and so do a tuple target, an
+    import, a loop, ``with`` or ``except`` name and a walrus; a nested scope's
+    body does not, and neither does a bare annotation, which binds nothing.
+    """
+    found, pending = [], list(body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name == name:
+                found.append(node)
+            continue
+        if isinstance(node, ast.Lambda) or (isinstance(node, ast.AnnAssign) and node.value is None):
+            continue
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == name:
+            found.append(node)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            found.extend(a for a in node.names if (a.asname or a.name).split(".")[0] == name)
+        elif isinstance(node, ast.ExceptHandler) and node.name == name:
+            found.append(node)
+        pending.extend(ast.iter_child_nodes(node))
+    return found
+
+
+def _exits(fn: ast.FunctionDef) -> list[ast.stmt]:
+    """The ``return`` and ``raise`` statements of ``fn`` itself, not of a def nested in it."""
+    found, pending = [], list(fn.body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.Return, ast.Raise)):
+            found.append(node)
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            pending.extend(ast.iter_child_nodes(node))
+    return found
+
+
+def expect_platform_binding(patch: patchlib.Patch) -> None:
+    """Assert the one ``PLATFORM_BINDING`` line is a statement of ``_KanbanNotification.__init__``.
+
+    ``substitute`` counts the line anywhere, and as a substring, so a binding
+    moved verbatim into another scope, or nested deeper inside ``__init__``
+    under an ``if``, a ``try`` or a closure, would pass it and leave some
+    instances without ``platform_str``. Only a statement directly in the
+    constructor's body, at the pinned indentation, runs on every construction.
+    The statement found must also be the binding itself, so the text sitting in
+    a comment or a string on another assignment's line does not pass. Python
+    keeps the last binding, so the class and the constructor must each be the
+    only name binding in their scope, in any branch (``_bindings``: defs,
+    classes, stored names, named imports and handlers), and no ``return`` or
+    ``raise`` may come before the binding. A constructor replaced or wrapped
+    without binding the name (an attribute assignment, a decorator, a star
+    import) is not counted here; ``verify_kanban_notifier.py`` constructs a
+    notification at build time and checks ``platform_str`` on it. A subclass
+    upstream constructs in the class's place is outside both.
+    """
+    offset = patch.source.index(PLATFORM_BINDING)
+    lineno = patch.source.count("\n", 0, offset) + 1
+    col = len(PLATFORM_BINDING) - len(PLATFORM_BINDING.lstrip(" "))
+    classes = _bindings(patch._tree().body, PLATFORM_CLASS)
+    methods = _bindings(classes[0].body, PLATFORM_METHOD) if len(classes) == 1 and isinstance(classes[0], ast.ClassDef) else []
+    if len(methods) == 1 and isinstance(methods[0], ast.FunctionDef) and any(
+        isinstance(stmt, ast.Assign) and stmt.lineno == lineno and stmt.col_offset == col
+        and ast.get_source_segment(patch.source, stmt) == PLATFORM_BINDING.strip()
+        for stmt in methods[0].body
+    ) and not any(node.lineno < lineno for node in _exits(methods[0])):
+        return
+    raise patch._fail(
+        f"the platform_str binding at line {lineno} is no longer a statement of "
+        f"{PLATFORM_CLASS}.{PLATFORM_METHOD}'s own body, so the completion call's "
+        f"n.platform_str is not set on every construction. {patch.note}"
+    )
+
+
 def apply(root: Path) -> None:
     """Apply the patch under ``root``, or raise SystemExit with the reason."""
     patch = patchlib.Patch(root, RELATIVE, prefix="kanban_notifier")
     patch.refuse_if_patched(*SENTINELS)
+    patch.substitute(PLATFORM_BINDING, PLATFORM_BINDING, label="platform_str binding")
+    expect_platform_binding(patch)
     for label, anchor, patched in EDITS:
         patch.substitute(anchor, patched, label=label)
     patch.append(TRAILER)

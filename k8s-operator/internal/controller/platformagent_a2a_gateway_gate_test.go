@@ -1156,3 +1156,77 @@ func TestADiscordSecretWithoutATokenIsNotABackend(t *testing.T) {
 		t.Errorf("the reason does not name the missing key: %q", state.gatewayDarkReason)
 	}
 }
+
+// TestChatUnderNextRendersTheGatewayWithoutASecret: the CR's own Chat
+// integration is a backend, so an install that enabled Chat and flipped to
+// next gets its gateway with no discord-bot Secret and no door.
+func TestChatUnderNextRendersTheGatewayWithoutASecret(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	agent := gchatTestAgent("next", true)
+	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	state, err := r.reconcileA2A(ctx, agent)
+	if err != nil {
+		t.Fatalf("reconcileA2A: %v", err)
+	}
+	if state.gatewayDark {
+		t.Fatalf("Chat is enabled under next and the gateway is reported dark: %q", state.gatewayDarkReason)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err != nil {
+		t.Fatalf("the gateway Deployment was not rendered with Chat armed: %v", err)
+	}
+}
+
+// TestAChatInstallPaysNoSecretRead: the Chat answer comes from the CR, so the
+// uncached discord-bot read is never made, on the creating pass or after.
+func TestAChatInstallPaysNoSecretRead(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	agent := gchatTestAgent("next", true)
+	scheme := setupScheme()
+	secretReads := 0
+	funcs := fakeServerSideApplyInterceptors()
+	funcs.Get = func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if _, ok := obj.(*corev1.Secret); ok && key.Name == a2aDiscordBotSecretName {
+			secretReads++
+		}
+		return c.Get(ctx, key, obj, opts...)
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, sandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(funcs).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	for i := 0; i < 2; i++ {
+		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+			t.Fatalf("reconcileA2A %d: %v", i+1, err)
+		}
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err != nil {
+		t.Fatalf("precondition: the gateway renders on Chat alone: %v", err)
+	}
+	if secretReads != 0 {
+		t.Errorf("a Chat install read the discord-bot Secret %d times, want 0: the CR answers the backend question", secretReads)
+	}
+}
+
+// TestTheDarkReasonNamesChat: the remedy an admin reads off the condition
+// names every way to give the gateway a backend, the CR field included.
+func TestTheDarkReasonNamesChat(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	agent := a2aTestAgent()
+	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	state, err := r.reconcileA2A(ctx, agent)
+	if err != nil || !state.gatewayDark {
+		t.Fatalf("precondition: want a dark gateway (state=%+v err=%v)", state, err)
+	}
+	if !strings.Contains(state.gatewayDarkReason, "spec.integration.googleChat") {
+		t.Errorf("the reason does not name the Chat integration as a backend: %q", state.gatewayDarkReason)
+	}
+}

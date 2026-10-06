@@ -290,6 +290,13 @@ API_RELAY_PATH_LOG_LENGTH = 256
 # request, and a ServiceAccount username truncated at the default 64 loses
 # exactly its discriminating part.
 PRINCIPAL_LOG_LENGTH = 512
+# The width a scoped-pool refusal is logged at. The message is fixed text plus
+# four GKE name components, each validated against `[a-z0-9-]` and bounded at
+# `scoped_sa_pool.MAX_NAME_COMPONENT_LENGTH` before it was interpolated, so the
+# whole line is at most 467 characters and fits here whole; at the default 64,
+# or the 256 it was first logged at, the operator's remedy was cut off on
+# every refusal.
+POOL_REFUSAL_LOG_LENGTH = 512
 MILLISECONDS_PER_SECOND = 1000
 
 # The broker's Prometheus surface: a metrics-only TCP listener of its own,
@@ -553,7 +560,8 @@ class ThreadingTCPHTTPServer(HandlerErrorsToLog, ThreadingHTTPServer):
 # (see github_token_refresh.py).  Anyone who can observe pod-to-pod traffic in
 # the namespace can replay it until it expires.  mTLS closes that and is not
 # done here.  buildCredentialProxyNetworkPolicy narrows who can open the
-# connection at all, to the sandbox Pod and the gateway Pod.
+# connection at all, to the sandbox Pod, the gateway Pod and, when the next
+# stack takes Google Chat, the A2A gateway Pod.
 # ---------------------------------------------------------------------------
 
 DEFAULT_CREDENTIAL_PROXY_AUDIENCE = "kubeagents-credential-proxy"
@@ -759,7 +767,7 @@ def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
 ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # Order matters: the a2a family sits under the chat prefix and must be
     # matched first. The api passthrough belongs to both chat consumers —
-    # one credential, two subscriptions — while each side's event routes
+    # one credential, one relay instance per install — while each side's event routes
     # stay its own. _validate_route_roles below enforces that order, and the
     # shape of every entry, at import; do not sort this table.
     ("/v1/chat/a2a/", (CALLER_ROLE_A2A_CHAT,)),
@@ -6056,9 +6064,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     slack_max_request_bytes: int
     enforce_read_only: bool = True
     chat_relay: GoogleChatRelay | None = None
-    # The A2A gateway's own relay instance, on its own subscription. Two
-    # consumers on one subscription split deliveries randomly, so the A2A
-    # routes never touch chat_relay and vice versa; only the /v1/chat/api
+    # The A2A gateway's relay instance. Two consumers on one subscription
+    # split deliveries randomly, so the operator arms exactly one instance per
+    # install (the mode chooses which) and the A2A routes never touch
+    # chat_relay and vice versa; only the /v1/chat/api
     # passthrough is shared, because both instances hold the same app
     # credential and an install may arm either one alone.
     a2a_chat_relay: GoogleChatRelay | None = None
@@ -6626,13 +6635,20 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # generic policy block, and so that a test can assert on the reason
             # rather than on a status code every other gate also returns.
             LOGGER.warning(
-                # The message embeds the scope key, which is built from the
+                # The message embeds the cluster the request resolved to, built from the
                 # `current-context` of a kubeconfig the agent wrote. Same
                 # reasoning as the ValueError handler below: an unsanitised
                 # value here forges log records.
+                #
+                # The cap is raised above the default under the rule in
+                # `_sanitize_for_logging`'s docstring: every variable part of
+                # the message is a name component the pool validated against
+                # `[a-z0-9-]` and its 63-character bound before interpolating
+                # it, so the agent chooses nothing in the line beyond which
+                # cluster it named, and the line fits at the bound.
                 "scoped service account refused request_id=%s reason=%s",
                 request_id,
-                _sanitize_for_logging(str(exc), max_length=256),
+                _sanitize_for_logging(str(exc), max_length=POOL_REFUSAL_LOG_LENGTH),
                 extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_SCOPED_SA_UNMAPPED_SCOPE),
             )
             self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
@@ -7599,8 +7615,8 @@ def chat_relay_subscriptions(project_id: str) -> tuple[str, str]:
     """Return the legacy and A2A Chat subscription names, refusing one shared.
 
     Two relay instances pulling one subscription split its deliveries between
-    them at random — the exact failure the A2A path's own subscription exists
-    to prevent — so pointing both env vars at the same subscription is refused
+    them at random, and the operator arms exactly one instance per install (the
+    mode chooses which), so pointing both env vars at the same subscription is refused
     at startup rather than discovered as every other ask going missing. The
     comparison is on the fully qualified name, the way GoogleChatRelay
     resolves it: a short name and its projects/… spelling are one subscription.
@@ -7617,7 +7633,7 @@ def chat_relay_subscriptions(project_id: str) -> tuple[str, str]:
         raise RuntimeError(
             "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME names the same subscription as "
             "GOOGLE_CHAT_SUBSCRIPTION_NAME; two relay instances on one subscription "
-            "split its deliveries, so the A2A consumer needs its own"
+            "split its deliveries; arm one relay instance per install"
         )
     return chat_subscription, a2a_subscription
 
@@ -7688,7 +7704,7 @@ def serve(args: argparse.Namespace) -> None:
             chat_project, chat_subscription
         )
         LOGGER.info("Google Chat relay enabled project=%s subscription=<redacted>", chat_project)
-    # The A2A gateway's own subscription on the same topic and credential;
+    # The A2A gateway's relay instance on the same topic and credential;
     # armed independently so an install can run either consumer alone.
     if chat_project and a2a_subscription:
         CredentialProxyHandler.a2a_chat_relay = GoogleChatRelay(

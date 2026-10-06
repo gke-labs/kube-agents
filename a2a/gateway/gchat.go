@@ -37,8 +37,8 @@ const (
 	// sits well above both.
 	gchatRelayTimeout = 45 * time.Second
 	// gchatRelayEventsPath is the A2A-dedicated event route — its own
-	// GoogleChatRelay instance on its own subscription, so this consumer
-	// never splits deliveries with the legacy chat path.
+	// GoogleChatRelay instance, the only one the operator arms under next, so
+	// this consumer never splits deliveries with the legacy chat path.
 	gchatRelayEventsPath    = "/v1/chat/a2a/events"
 	gchatRelayEventsAckPath = "/v1/chat/a2a/events/ack"
 	// gchatPullRetryDelay paces re-polls after a pull error, so a relay

@@ -1856,6 +1856,7 @@ class _KanbanNotification:
         self.wake_agent = mode in ("notify+wake", "wake")
         self.send_passive = mode != "wake"
         self.wake_kinds = set()
+        self.platform_str = (sub["platform"] or "").lower()
 
     def build_wake_text(self) -> None:
         task, sub = self.task, self.sub
@@ -2059,6 +2060,104 @@ class ApplyTest(unittest.TestCase):
         self.assertIn("found 0", str(ctx.exception))
         self.assertIn("completion message", str(ctx.exception))
 
+    def test_an_upstream_rename_of_platform_str_fails_loudly(self):
+        # The completion call reads n.platform_str, which only the pinned binding guards, and
+        # evaluates it before completion_text reads the flag: renamed upstream,
+        # every completed event would raise AttributeError with the flag off.
+        renamed = UPSTREAM_NOTIFIER.replace("self.platform_str =", "self.platform_name =")
+        self.assertNotIn("platform_str", renamed)
+        with self.assertRaises(SystemExit) as ctx:
+            patch_tree(renamed)
+        self.assertIn("platform_str", str(ctx.exception))
+
+    def test_a_platform_str_binding_moved_out_of_init_fails_loudly(self):
+        # The line still occurs once, so substitute's count does not see the move.
+        binding = '        self.platform_str = (sub["platform"] or "").lower()\n'
+        moved = UPSTREAM_NOTIFIER.replace(binding, "").replace(
+            "    def build_wake_text(self) -> None:\n        task, sub = self.task, self.sub\n",
+            "    def build_wake_text(self) -> None:\n        task, sub = self.task, self.sub\n" + binding,
+        )
+        self.assertEqual(moved.count(binding), 1)
+        self.assertNotIn(binding, method_source(moved, "__init__"))
+        with self.assertRaises(SystemExit) as ctx:
+            patch_tree(moved)
+        self.assertIn("_KanbanNotification.__init__", str(ctx.exception))
+
+    def test_a_platform_str_binding_nested_inside_init_fails_loudly(self):
+        # Indented deeper, the pinned line is still a substring and still inside
+        # __init__'s span, but some constructions would skip it.
+        binding = '        self.platform_str = (sub["platform"] or "").lower()\n'
+        nested_line = "    " + binding
+        for wrapper in (
+            '        if sub.get("platform"):\n',
+            "        try:\n",
+            "        def _bind():\n",
+        ):
+            with self.subTest(wrapper=wrapper.strip()):
+                tail = "        except KeyError:\n            pass\n" if "try" in wrapper else ""
+                nested = UPSTREAM_NOTIFIER.replace(binding, wrapper + nested_line + tail)
+                self.assertEqual(nested.count(binding), 1)
+                with self.assertRaises(SystemExit) as ctx:
+                    patch_tree(nested)
+                self.assertIn("_KanbanNotification.__init__", str(ctx.exception))
+
+    def test_a_platform_str_binding_carried_by_another_line_fails_loudly(self):
+        # The pinned text in a comment or a string on another assignment's line
+        # still counts once and still lands on an Assign at the pinned column.
+        binding = '        self.platform_str = (sub["platform"] or "").lower()\n'
+        for carrier in (
+            "        self.platform = _norm(sub)  # was:" + binding,
+            '        self.platform = """' + binding + '        """\n',
+        ):
+            with self.subTest(carrier=carrier.strip()):
+                moved = UPSTREAM_NOTIFIER.replace(binding, carrier)
+                self.assertEqual(moved.count(binding), 1)
+                with self.assertRaises(SystemExit) as ctx:
+                    patch_tree(moved)
+                self.assertIn("_KanbanNotification.__init__", str(ctx.exception))
+
+    def test_a_platform_str_binding_python_would_not_keep_or_reach_fails_loudly(self):
+        # The pin matches once, but Python keeps the last class and the last
+        # __init__, and an early exit skips the binding.
+        binding = '        self.platform_str = (sub["platform"] or "").lower()\n'
+        header = "class _KanbanNotification:\n    def __init__(self, runner, d):\n"
+        for why, shape in (
+            ("a second __init__", UPSTREAM_NOTIFIER.replace(
+                binding, binding + "\n    def __init__(self, runner, d):\n        self.runner = runner\n")),
+            ("__init__ rebound", UPSTREAM_NOTIFIER.replace(binding, binding + "\n    __init__ = object.__init__\n")),
+            ("a second class", UPSTREAM_NOTIFIER + "\n\nclass _KanbanNotification:\n    pass\n"),
+            ("an early return", UPSTREAM_NOTIFIER.replace(
+                header, header + "        if not d:\n            return\n")),
+            ("an early raise", UPSTREAM_NOTIFIER.replace(header, header + "        raise TypeError(d)\n")),
+            ("a second __init__ under an if", UPSTREAM_NOTIFIER.replace(binding, binding + (
+                "\n    if _LEGACY:\n        def __init__(self, runner, d):\n            self.runner = runner\n"))),
+            ("__init__ rebound through a tuple", UPSTREAM_NOTIFIER.replace(
+                binding, binding + "\n    _, __init__ = 1, object.__init__\n")),
+            ("__init__ imported", UPSTREAM_NOTIFIER.replace(
+                binding, binding + "\n    from os import getcwd as __init__\n")),
+            ("the class imported after it", UPSTREAM_NOTIFIER + "\nfrom gateway.legacy import _KanbanNotification\n"),
+            ("the class rebound under a try", UPSTREAM_NOTIFIER + (
+                "\ntry:\n    import legacy\nexcept ImportError:\n    _KanbanNotification = None\n")),
+            ("the class renamed behind an alias", UPSTREAM_NOTIFIER.replace(
+                "class _KanbanNotification:", "class _Notification:") + "\n_KanbanNotification = _Notification\n"),
+        ):
+            with self.subTest(why):
+                self.assertEqual(shape.count(binding), 1)
+                with self.assertRaises(SystemExit) as ctx:
+                    patch_tree(shape)
+                self.assertIn("_KanbanNotification.__init__", str(ctx.exception))
+
+    def test_an_exit_after_the_platform_str_binding_or_in_a_nested_def_passes(self):
+        binding = '        self.platform_str = (sub["platform"] or "").lower()\n'
+        header = "class _KanbanNotification:\n    def __init__(self, runner, d):\n"
+        for shape in (
+            UPSTREAM_NOTIFIER.replace(binding, binding + "        if not d:\n            return\n"),
+            UPSTREAM_NOTIFIER.replace(header, header + "        def _check():\n            return d\n"),
+            # A bare annotation binds nothing.
+            UPSTREAM_NOTIFIER.replace(binding, binding + "\n    __init__: object\n"),
+        ):
+            patch_tree(shape)
+
     def test_a_drifted_wake_step_anchor_fails_loudly(self):
         with self.assertRaises(SystemExit) as ctx:
             patch_tree(UPSTREAM_NOTIFIER.replace(*TELL_DRIFT))
@@ -2092,7 +2191,8 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual(target.read_text(), drifted)
 
     def test_applying_twice_fails_rather_than_silently_no_opping(self):
-        # Every anchor is destroyed by its own replacement, so a re-run
+        # Every edited anchor is destroyed by its own replacement (the
+        # platform_str pin is not, and passes a re-run), so a re-run
         # would fail on "found 0" anyway — but that message blames upstream
         # drift for what is really a duplicated build step, and the old delivery
         # applier had an anchor that survived patching and did silently stack.

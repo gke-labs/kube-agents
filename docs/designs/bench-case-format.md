@@ -54,6 +54,11 @@ references.
 `prompt` is what the agent is given. Write it as the user would write it, not as a
 checklist — a prompt that enumerates the answer measures instruction-following rather
 than the journey. `{{CLUSTER_NAME}}` and `{{PROJECT_ID}}` are substituted by the runner.
+A first line of `[bench:card-failure-wake]` or `[bench:slack-question-wake]` makes the run a
+replay of a card's wake rather than an ask
+([`bench/kube_agents_bench/card_wake.py`](../../bench/kube_agents_bench/card_wake.py)); a replay
+runs only over the api transport and errors under any other `AGENT_TRANSPORT`, so the case also
+needs an entry in `hack/eval/inject-lane-exclusions.txt`.
 
 `expected_output` is the judge's reference. It feeds `OutcomeValidity` and, where the
 case declares `documentation.constraints`, `ChecklistScore`. It never gates a case that
@@ -175,7 +180,8 @@ Ten read what the run produced, from this repository
 `devops_bench.verifiers` entry-point group in `bench/pyproject.toml`):
 `report_contains` (phrases in the agent's answer; its `forbidden_patterns` are
 regular expressions, for a banned word whose negated uses are legitimate and
-which no substring can express), `answer_first` (each delivered card result, raw:
+which no substring can express, and its `any_of_patterns` are regular-expression
+alternatives to `any_of_phrases`, for a phrase that must start at a word boundary), `answer_first` (each delivered card result, raw:
 it opens on one bold sentence, has no heading, stays
 under its character and sentence caps, and no later sentence matches a
 `recap_patterns` regex; each of the case's `lead_terms` appears in at least one result's

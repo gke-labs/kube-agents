@@ -610,15 +610,30 @@ When `plugins.stockoutInvestigator.enabled=true`, the chart automatically seeds 
 
 ### Scoped service accounts
 
-`platformAgent.security.scopedServiceAccounts` maps each GKE cluster the agent
-may read to the Google service account that reads it. Empty is the default and
-should stay empty: the accounts hold no IAM grant as of 2026-08-12, so a
-non-empty list arms the credential broker onto identities that can read
-nothing, and every cluster read fails — a mapped cluster gets a powerless
-token and a `Forbidden` from GKE, an unmapped one is refused by the broker
-before any GKE call. The
-`terraform/examples/full-install` composition fills it in from its
-`scoped_service_accounts` output when `scoped_clusters` is set. See the site's
+`platformAgent.security.scopedServiceAccountPool` maps each GCP project the
+agent may read to the Google service account that reads its clusters, and
+`enabled` under it arms the credential broker onto that mapping. The list
+alone arms nothing: the `terraform/examples/full-install` composition fills
+`serviceAccounts` in from its `scoped_service_accounts` output and passes
+`scoped_pool_enabled` through as `enabled`, so the mapping can be declared
+while the switch stays off. Off is the default and should stay off: the
+accounts hold no IAM grant as of 2026-08-12, so an armed pool puts the broker
+onto identities that can read nothing, and every cluster read fails — a mapped
+project gets a powerless token and a `Forbidden` from GKE, an unmapped one is
+refused by the broker before any GKE call. `enabled: true` with an empty list
+is refused at install. So is `enabled: true` against a live `PlatformAgent` CRD
+that predates the field: `helm upgrade` does not apply `crds/`, and an older
+CRD would admit the CR with the block pruned, leaving the broker on the agent's
+own identity while the release record says armed, so the chart looks the CRD
+up and fails the render until `kubectl apply --server-side -f
+charts/kube-agents/crds/` has run. One retired key is tolerated for a
+release: every release the composition applied before the pool moved to
+projects recorded `platformAgent.security.scopedServiceAccounts: []`, and a
+harness- or operator-mode retag re-applies the recorded values over this
+chart after checking them against its schema, so the schema admits that key
+only as an empty list, which renders nothing, and refuses a populated one by
+name — that was a pool armed under the old per-cluster field, and the install
+takes `--upgrade-mode=full` so `install.env` renders the new one. See the site's
 [security-and-iam reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/reference/security-and-iam.md)
 for what the pool does and does not bound.
 

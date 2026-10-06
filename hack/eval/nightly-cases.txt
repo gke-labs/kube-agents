@@ -118,8 +118,17 @@
 # it forty-three (129) of fifty-seven (171), +6: two front-door turns, no
 # fixture. chat-voice-ack-names-target makes it forty-four (132) of
 # fifty-eight (174), +3 more: one front-door turn plus the card round trip.
-# bootstrap-inventory-ranking-delivery makes it
-# forty-five (135) of fifty-nine (177), +3 more at its 600s hint.
+# bootstrap-inventory-ranking-delivery makes it forty-five (135) of
+# fifty-nine (177), +3 more at its 600s hint. Counted from the lists again
+# (fifty-one here, chat-question-wake-stays-silent among them, and fourteen
+# in the presubmit file before them, sixty-five cases and 195 units),
+# chat-voice-retry-says-it-is-retried makes it fifty-two (156) of
+# sixty-six (198), +3 more: one front-door turn on a planted card, no worker.
+# chat-voice-final-attempt-is-not-retried (after it) makes it fifty-three
+# (159) of sixty-seven (201), +3 more: the same shape on the card's last
+# attempt. chat-voice-failure-leads-with-fact (after that) makes
+# it fifty-four (162) of sixty-eight (204), +3 more: the same shape on a
+# blocked card.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
 # answer it plainly: 1734-2693 serial minutes of work at a realised
@@ -182,8 +191,8 @@
 #
 # 2026-10-05 adds chat-voice-answer-first: one case, three units, deployer:
 # noop at the 200s default, about 10 serial minutes. Counted from the lists
-# with it, the last entry below: fifty-two cases (156 units) here, of a
-# sixty-six-case, 198-unit matrix with the presubmit file's fourteen.
+# with it, the last entry below: fifty-five cases (165 units) here, of a
+# sixty-nine-case, 207-unit matrix with the presubmit file's fourteen.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -579,6 +588,31 @@
 # threshold before it posts the record. Nightly rather than presubmit for that
 # wait.
 ./tasks/autoops-controller-stall-triage/task.yaml
+
+# The front door's reply when a card's worker crashes (agents/chat/SOUL.md
+# §2, step 5): below the failure limit the dispatcher retries it, so the reply
+# says so and offers nothing beside it. A reply that states the retry but
+# names the agent, task or worker reds the case's no-internals check.
+# deployer: noop; the card and its crash are planted per run
+# (bench/kube_agents_bench/card_wake.py), so one front-door turn and no
+# worker: filing or unblocking a card fails its catastrophic fence.
+./tasks/chat-voice-retry-says-it-is-retried/task.yaml
+
+# The front door's reply when a card's worker fails its last attempt
+# (agents/chat/SOUL.md §2, step 5): the dispatcher gave up and nothing
+# retries a blocked card, so the reply says it stopped and does not say it
+# is being retried. deployer: noop; the card and its timeouts are planted
+# per run (bench/kube_agents_bench/card_wake.py, timed_out_final), so one
+# front-door turn and no worker: filing or unblocking a card fails its
+# catastrophic fence.
+./tasks/chat-voice-final-attempt-is-not-retried/task.yaml
+
+# The front door's reply when a card blocks: reads the card, leads with the
+# fact and the card's reason, no apology (agents/chat/SOUL.md §2, step 5).
+# deployer: noop; the blocked card is planted per run
+# (bench/kube_agents_bench/card_wake.py), so one front-door turn and no
+# worker: filing or unblocking a card fails the case's catastrophic fence.
+./tasks/chat-voice-failure-leads-with-fact/task.yaml
 
 # A delegated answer opens on one bold sentence and does not restate it
 # (the report stanza in deploy/docker/patches/kanban_report_format.py).

@@ -165,14 +165,16 @@ class ReportContainsVerifier(BaseVerifier):
     Substring matching, deliberately: the task author chose the phrase (a
     planted defect's name, a required noun), so an exact match is fair.
     Anything fuzzier belongs to the judge, not to a blocking check.
-    ``forbidden_patterns`` is the one regex exception, for the shape a
+    ``forbidden_patterns`` is the first regex exception, for the shape a
     substring cannot express: a banned word whose negated uses are
     legitimate ("no guarantee"). Each is ``re.search``ed against a
     line-preserving variant of the same normalization — newlines survive,
     so a Markdown bullet or heading with no terminal punctuation is its own
     segment and a pattern may anchor on ``\\n``; the flat collapse would
     otherwise fuse a negated bullet into its unnegated neighbour before the
-    regex runs.
+    regex runs. ``any_of_patterns`` are alternatives to ``any_of_phrases``
+    for the phrase a substring cannot bound: "it stopped" also matches
+    "limit stopped". Each is ``re.search``ed against the flat normalization.
 
     Both sides are normalized first, by ``_normalize`` above: lowercased,
     Markdown emphasis dropped, whitespace runs collapsed. These are the
@@ -200,10 +202,11 @@ class ReportContainsVerifier(BaseVerifier):
     # spellings ("HPA" / "HorizontalPodAutoscaler"), all-of required_phrases
     # would punish a correct report for choosing the other name.
     any_of_phrases: list[str] = Field(default_factory=list)
+    any_of_patterns: list[str] = Field(default_factory=list)
     forbidden_patterns: list[str] = Field(default_factory=list)
     scope: Literal["final", "full"] = "final"
 
-    @field_validator("forbidden_patterns")
+    @field_validator("forbidden_patterns", "any_of_patterns")
     @classmethod
     def _forbidden_patterns_compile(cls, patterns: list[str]) -> list[str]:
         for pattern in patterns:
@@ -227,8 +230,9 @@ class ReportContainsVerifier(BaseVerifier):
         pattern_hits = [
             p for p in self.forbidden_patterns if re.search(p, _normalize_lines(raw))
         ]
-        any_of_miss = bool(self.any_of_phrases) and not any(
-            _normalize(p) in text for p in self.any_of_phrases
+        any_of_miss = bool(self.any_of_phrases or self.any_of_patterns) and not (
+            any(_normalize(p) in text for p in self.any_of_phrases)
+            or any(re.search(p, text) for p in self.any_of_patterns)
         )
         if missing or present or pattern_hits or any_of_miss:
             parts = []
@@ -242,7 +246,8 @@ class ReportContainsVerifier(BaseVerifier):
                 )
             if any_of_miss:
                 parts.append(
-                    f"none of the alternative phrasings present: {self.any_of_phrases}"
+                    "none of the alternative phrasings present: "
+                    f"{self.any_of_phrases + self.any_of_patterns}"
                 )
             return VerificationResult(
                 success=False,
@@ -250,10 +255,11 @@ class ReportContainsVerifier(BaseVerifier):
                 reason="; ".join(parts),
             )
         # The success reason has to name every clause that ran, including
-        # any_of_phrases. Counting only required and forbidden made a check
-        # built from any_of alone report "all 0 required phrase(s)", which
-        # reads exactly like a check that asserted nothing -- and the failure
-        # branch above is the only thing that would have said otherwise.
+        # any_of_phrases and any_of_patterns. Counting only required and
+        # forbidden made a check built from any_of alone report "all 0
+        # required phrase(s)", which reads exactly like a check that asserted
+        # nothing -- and the failure branch above is the only thing that would
+        # have said otherwise.
         satisfied = [
             f"all {len(self.required_phrases)} required phrase(s)",
             f"none of {len(self.forbidden_phrases)} forbidden",
@@ -262,9 +268,10 @@ class ReportContainsVerifier(BaseVerifier):
             satisfied.append(
                 f"none of {len(self.forbidden_patterns)} forbidden pattern(s)"
             )
-        if self.any_of_phrases:
+        if self.any_of_phrases or self.any_of_patterns:
             satisfied.append(
-                f"at least one of {len(self.any_of_phrases)} alternative phrasing(s)"
+                "at least one of "
+                f"{len(self.any_of_phrases) + len(self.any_of_patterns)} alternative phrasing(s)"
             )
         return VerificationResult(
             success=True,
@@ -3075,7 +3082,7 @@ class ExpectedFinding(BaseModel):
 
 
 class _OnboardingPollVerifier(BaseVerifier):
-    """Polls :meth:`_check`, reading onboarding's files off the install.
+    """Polls :meth:`_check` against the agent's own install (onboarding's files, the sandbox trees).
 
     A ``fail`` from an earlier poll outranks a final read that errors: a read
     that could not reach a pod does not un-observe what an earlier one saw.
@@ -3275,13 +3282,6 @@ SANDBOX_IMAGE_TREES = ("skills", "scripts", "governance")
 SANDBOX_HOME_ROOTS = (".", "profiles/platform")
 _SANDBOX_DEFAULTS = "/opt/defaults"
 _SANDBOX_DATA = "/opt/data"
-# The operator's StatefulSet is `<agent>-shell` (shellSandboxName), one
-# replica, container `shell` -- the same pod hack/ci-eval-pr.sh execs into.
-_SANDBOX_POD_SUFFIX = "-shell-0"
-_SANDBOX_CONTAINER = "shell"
-# The harness's defaults for the agent's name and namespace (harness.py).
-_DEFAULT_SANDBOX_AGENT = "platform-agent"
-_DEFAULT_SANDBOX_NAMESPACE = "kubeagents-system"
 # Diff lines kept per tree in the reason; the raw result keeps them all.
 _MAX_DIFF_LINES = 5
 # Trailing characters of kubectl's stderr or stdout quoted in an error reason.
@@ -3327,7 +3327,7 @@ echo done
 
 
 @VERIFIERS.register("sandbox_tree_matches_image")
-class SandboxTreeMatchesImageVerifier(BaseVerifier):
+class SandboxTreeMatchesImageVerifier(_OnboardingPollVerifier):
     """The shell sandbox's copies of the image trees still match the image.
 
     WHY THIS EXISTS. The sandbox stages each tree the image ships at
@@ -3340,20 +3340,23 @@ class SandboxTreeMatchesImageVerifier(BaseVerifier):
     makes the edit anyway (gke-labs/kube-agents#2096). This observes the
     effect instead of the route.
 
-    WHAT IT ASSERTS. After the run it execs into ``<agent>-shell-0``,
-    container ``shell``, and for each home root and tree runs ``diff -rq``
+    WHAT IT ASSERTS. After the run it execs into the sandbox pod, container
+    ``shell``, and for each home root and tree runs ``diff -rq``
     of ``/opt/defaults/<tree>`` against ``/opt/data/<home>/<tree>``. Any
     difference fails, and so does a tree that is missing or has been swapped
-    for a symlink. The pod, namespace and context come from the variables the
-    harness already reads: ``AGENT_SERVICE_NAME`` (the agent's name, default
-    ``platform-agent``), ``AGENT_NAMESPACE`` and ``AGENT_CLUSTER_CONTEXT``.
+    for a symlink. The pod is the one the onboarding verifiers read
+    (``onboarding.sandbox_pod()``: ``EVAL_SANDBOX_POD``, else
+    ``<AGENT_SERVICE_NAME>-shell-0``); the namespace and context come from
+    ``AGENT_NAMESPACE`` and ``AGENT_CLUSTER_CONTEXT``.
 
     Fails closed: a kubectl that cannot run, exits non-zero or times out,
     output that stops before the script's last line, a reference tree the
     image does not have, and a ``diff`` that could not compare are all
     ``status="error"``, never a pass. A definite difference outranks a
     comparison that could not be made, so one broken tree cannot hide
-    another's edit.
+    another's edit, and a ``fail`` seen on an earlier poll outranks a final
+    poll that errors (``_OnboardingPollVerifier``, which also caps each exec
+    at ``_ONBOARDING_READ_TIMEOUT_SEC``).
 
     THE REFERENCE IS ONLY AS GOOD AS ITS OWNER. Before #2096 ``/opt/defaults``
     was agent-owned, so a worker can edit the reference and the copy together
@@ -3369,8 +3372,10 @@ class SandboxTreeMatchesImageVerifier(BaseVerifier):
     type: Literal["sandbox_tree_matches_image"]
 
     def _kubectl(self) -> tuple[list[str], str, str]:
-        pod = os.environ.get("AGENT_SERVICE_NAME", _DEFAULT_SANDBOX_AGENT) + _SANDBOX_POD_SUFFIX
-        namespace = os.environ.get("AGENT_NAMESPACE", _DEFAULT_SANDBOX_NAMESPACE)
+        # The same pod the onboarding verifiers read: EVAL_SANDBOX_POD, else
+        # <AGENT_SERVICE_NAME>-shell-0.
+        pod = onboarding.sandbox_pod()
+        namespace = os.environ.get("AGENT_NAMESPACE", onboarding.DEFAULT_AGENT_NAMESPACE)
         cmd = ["kubectl"]
         if self.kubeconfig:
             cmd += ["--kubeconfig", self.kubeconfig]
@@ -3378,16 +3383,16 @@ class SandboxTreeMatchesImageVerifier(BaseVerifier):
         if context:
             cmd += ["--context", context]
         cmd += [
-            "-n", namespace, "exec", pod, "-c", _SANDBOX_CONTAINER, "--",
+            "-n", namespace, "exec", pod, "-c", onboarding.SANDBOX_CONTAINER, "--",
             "sh", "-c", _SANDBOX_DIFF_SCRIPT, "sh",
             _SANDBOX_DEFAULTS, _SANDBOX_DATA,
             " ".join(SANDBOX_IMAGE_TREES), " ".join(SANDBOX_HOME_ROOTS),
         ]
         return cmd, pod, namespace
 
-    def _check(self, timeout_sec: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
         cmd, pod, namespace = self._kubectl()
-        where = f"{namespace}/{pod} container {_SANDBOX_CONTAINER}"
+        where = f"{namespace}/{pod} container {onboarding.SANDBOX_CONTAINER}"
         raw: dict[str, Any] = {"pod": pod, "namespace": namespace}
         try:
             # Bytes, then split on "\n" alone: the in-pod sed prefixes per "\n"
@@ -3397,7 +3402,7 @@ class SandboxTreeMatchesImageVerifier(BaseVerifier):
             proc = subprocess.run(
                 cmd,
                 capture_output=True,
-                timeout=single_call_timeout(timeout_sec),
+                timeout=read_timeout,
                 check=False,
             )
         except (OSError, subprocess.SubprocessError) as exc:
@@ -3509,5 +3514,3 @@ class SandboxTreeMatchesImageVerifier(BaseVerifier):
             raw,
         )
 
-    def verify(self, timeout_sec: float) -> VerificationResult:
-        return self._poll_to_result(lambda: self._check(timeout_sec), timeout_sec)
