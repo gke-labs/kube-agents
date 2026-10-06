@@ -110,12 +110,6 @@ class StageTest(unittest.TestCase):
         self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
         self.assertTrue(oobe.read_state(self.d)[oobe.STATE_DONE])
 
-    def test_a_failed_ranking_still_fires(self):
-        self._file_scan()
-        _board(self.board, [_ranking("failed")])
-        self._main()
-        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
-
     def test_waits_while_the_ranking_card_runs(self):
         self._file_scan()
         _board(self.board, [_ranking("running")])
@@ -123,6 +117,7 @@ class StageTest(unittest.TestCase):
         self.assertEqual(self.started, [])
 
     def test_a_blocked_ranking_card_waits_for_the_fallback(self):
+        # A card out of retries ends blocked; Hermes has no failed status.
         self._file_scan()
         _board(self.board, [_ranking("blocked")])
         self._main()
@@ -132,7 +127,7 @@ class StageTest(unittest.TestCase):
 
     def test_waits_while_a_retry_still_runs(self):
         self._file_scan()
-        _board(self.board, [_ranking("failed"), _ranking("running", key=oobe.PRIORITIZE_KEY + "-retry-1", tid="t_retry")])
+        _board(self.board, [_ranking("done"), _ranking("running", key=oobe.PRIORITIZE_KEY + "-retry-1", tid="t_retry")])
         self._main()
         self.assertEqual(self.started, [])
 

@@ -8,7 +8,8 @@ inventory scan finishes, so an operator sees cost, security, reliability and cap
 within about two hours of install. Later it takes over the two bootstrap jobs, so first-run work
 lives in one place.
 
-> **Status:** design. Nothing here is implemented yet. §8 is the build order.
+> **Status:** §4, the first-run audits, is implemented, with the entrypoint's `--assume-retired` entry
+> from §5. The rest of §5, folding in the bootstrap jobs, is not. §8 is the build order.
 
 ## 1. Why
 
@@ -63,19 +64,20 @@ suffixed key). The ranking worker
 writes `/opt/data/INVENTORY.md`, on the sandbox's volume when the shell sandbox is on.
 `bootstrap-inventory-delivery` (`bootstrap_delivery.py`) posts it once a human has spoken
 (`.user_aligned`) and claims `.bootstrap_completed` with `O_CREAT | O_EXCL`; a run five minutes
-later removes both jobs. [#2385 "stop the first inventory scan stalling before ranking"](https://github.com/gke-labs/kube-agents/pull/2385) moves the hand-off
-from the sweep to the ranking card out of the sweep worker's instructions and into code
-(`bootstrap_handoff.py`), so the scan reaches the ranking card with the shell sandbox on. `oobe`
-builds on that code.
+later removes both jobs. With the shell sandbox on, the scan can stall before the ranking card is
+filed ([#2143](https://github.com/gke-labs/kube-agents/issues/2143), which
+[#2385](https://github.com/gke-labs/kube-agents/pull/2385) fixes by moving the hand-off to the
+ranking card into code); on such an install `oobe` fires at the fallback in §4.1.
 
 ## 4. First-run audits
 
 ### 4.1 Trigger
 
-The stage fires when the scan has settled: the ranking card (key `bootstrap-inventory-prioritize`
-or a suffixed retry) is `done`, `failed` or `cancelled`. A failed ranking still leaves the audits
-worth running. The card status is read from the board database, the same SQLite file the hand-off
-already reads for the per-cluster cards; it costs no call into the sandbox.
+The stage fires when the scan has settled: every ranking card filed after the sweep card (key
+`bootstrap-inventory-prioritize` or a suffixed retry) is `done` or `archived`. A ranking card that
+runs out of retries ends `blocked`, which a person may still unblock, so that case waits for the
+fallback below. The card status is read from the board's SQLite file in the agent pod; it costs no
+call into the sandbox.
 
 Two things the trigger must not be:
 
@@ -85,10 +87,9 @@ Two things the trigger must not be:
   sandbox is on, the default. A gate that tests for them on the Chat Agent's volume never fires,
   and testing across the sandbox every minute costs an ssh call per tick.
 
-**Fallback.** If the scan has not settled `OOBE_AUDIT_FALLBACK_SECONDS` (90 minutes) after
-`.bootstrap_scan_filed`, fire anyway. A stuck sweep must not hold the audits back forever. The same
-fallback covers a sweep that audited no cluster, where the hand-off writes the report itself and no
-ranking card is filed.
+**Fallback.** If the scan has not settled `FALLBACK_SECONDS` (90 minutes) after
+`.bootstrap_scan_filed`, fire anyway. A stuck sweep, a blocked ranking card or one never filed must
+not hold the audits back forever.
 
 ### 4.2 Which audits
 
@@ -118,7 +119,7 @@ tick, and only that one: marking an audit due again after it has run starts a se
 
 `hermes cron run` also sets the job's `enabled` back to true (`cron.jobs.trigger_job`), so an
 audit an operator has disabled or paused, or one missing from the Platform Agent's roster, is
-recorded as held and not started. A failed start is retried up to five times; after that the
+recorded as held and not started. A start that fails is tried five times in all; after that the
 audit is left to its schedule, so the stage always finishes and the job always leaves.
 
 ### 4.4 No GitOps repository
@@ -131,14 +132,14 @@ from `/etc/gitops/managed_repos`, which the operator mounts into the gateway con
 With none, it writes the marker with the reason and starts nothing.
 
 It does not exit non-zero. No repository is a configuration the installer offers, not a fault, and
-a failing per-minute job repeats until something changes. The operator is told once instead: the
-installer's "GitOps repository connection skipped" gains "scheduled audits will not run without
-one", and once delivery is a stage of `oobe` (§5) the delivered report carries one line saying the
-audits did not run and why.
+a failing per-minute job repeats until something changes. The operator is told instead: the
+installer's "GitOps repository connection skipped" line says the scheduled audits fail without one,
+and once delivery is a stage of `oobe` (§5) the delivered report is to carry one line saying the
+first-run audits did not run and why.
 
 ### 4.5 What the operator sees
 
-Within about two hours of install, each audit's usual output: a ledger issue in the GitOps
+Each audit's usual output, expected within about two hours of install and not yet measured: a ledger issue in the GitOps
 repository, a one-line summary in the home channel when one is set, and remediation pull requests
 for critical findings whose fix is a manifest, at most five per audit run (`audit_report.py`,
 `AUTO_PROMOTION_CAP`). Few checks qualify: in the compliance audit, two
@@ -169,9 +170,9 @@ The second step moves the scan and delivery into `oobe` as stages, behind the au
   posts nor blocks delivery.
 - **Removal.** Five minutes after `.bootstrap_completed`, `oobe` removes itself and the two disabled
   entries, as `bootstrap_delivery._retire_jobs` does today.
-- **Finished installs.** The entrypoint passes `oobe` in `--assume-retired` when
-  `.bootstrap_completed` exists, beside the two bootstrap ids, so an install that onboarded before
-  this change never gets the job.
+- **Finished installs.** Already in step 1: the entrypoint passes `oobe` in `--assume-retired`
+  when `.bootstrap_completed` exists, beside the two bootstrap ids, so an install that onboarded
+  before the job existed never gets it.
 
 The fold has no behaviour of its own to show: the operator sees the same messages at the same
 times. It rides with the audits stage, whose eval case covers both.
@@ -186,12 +187,13 @@ times. It rides with the audits stage, whose eval case covers both.
 | No GitOps repository    | One line in the installer output, later one line in the report                                           | Re-run the installer with `--gitops-org` and `--gitops-repo` (INSTALL.md), then wait for the schedule |
 | No home channel         | Ledger issues and pull requests appear in the repository with no chat summary                            | Set one (`/sethome`)                                                                                  |
 | Sweep stuck             | Audits start at the 90-minute fallback                                                                   | As today for the report                                                                               |
+| Ranking card blocked    | Audits start at the 90-minute fallback, unless someone unblocks the card first                           | As today for the report                                                                               |
 
 ## 7. Not in this design
 
 - **A combined, prioritized first summary.** Each audit posts its own. How many findings surface,
-  and when, follows the first-24-hour spec's pacing (two criticals in the first report, at most two
-  a day), which [#2451 "pace surfaced findings to the first-24-hour spec"](https://github.com/gke-labs/kube-agents/issues/2451) tracks.
+  and when, follows the pacing [#2451 "pace surfaced findings to the first-24-hour spec"](https://github.com/gke-labs/kube-agents/issues/2451)
+  sets out (two criticals in the first report, at most two a day).
 - **[#1866](https://github.com/gke-labs/kube-agents/issues/1866)'s 30, 45 and 60 minute targets for cost, security and reliability findings, and its
   fixed audit order.** Starting all four at
   scan completion is what removes the wait; an order adds coordination the operator would not see.
@@ -204,16 +206,20 @@ times. It rides with the audits stage, whose eval case covers both.
 
 ## 8. Build order and evaluation
 
-1. **First-run audits stage**, with `oobe` running beside the two bootstrap jobs. This covers the
+1. **First-run audits stage**, with `oobe` running beside the two bootstrap jobs, and the
+   entrypoint entry that keeps it off finished installs. This covers the
    part of [#1866](https://github.com/gke-labs/kube-agents/issues/1866) that removes the wait; §7 lists what it leaves.
 2. **The fold** (§5), in the same pull request when it is ready, otherwise the next one.
 3. **Later:** drop the disabled ids; the report line for a skipped audit; T+0 delivery to the home
    channel.
 
-Eval case `oobe-first-run-audits` (domain `fleet-audits`, registered in `NIGHTLY_TASKS`: each run
-waits on four real audits). The stack re-arms the stage on a long-lived install: it installs the
-`oobe` job, clears `.oobe_audits_fired`, and presents a settled ranking card. The verifier reads the
-Platform Agent's cron run records and passes when all four audit ids ran after the stack applied.
+Eval case `oobe-first-run-audits` (domain `fleet-audits`, in `hack/eval/nightly-cases.txt`: each
+repetition waits for the previous one's four audits to finish). The stack
+(`bench/tf/prebuilt/oobe-first-run-audits`) re-arms the stage on a long-lived install: it files an
+archived stand-in sweep card and an archived ranking card after it, points `.bootstrap_scan_filed`
+at the sweep, clears `.oobe_audits_fired`, and puts back the `oobe` job when the image ships one.
+The verifier reads the Platform Agent's cron run records and passes when all four audits have a run
+claimed since the arm.
 Red on `main`: no audit runs. Green: four, in three repetitions. The no-repository skip is unit-tested,
 not evaluated: the shared install has a repository, and removing it mid-run would break concurrent
 cases.
@@ -225,5 +231,6 @@ cases.
 - **Output volume.** How many pull requests and chat lines a first run produces on a real fleet. If
   it reads as noise, day one narrows to cost and capacity, the two audits the inventory report does
   not overlap.
-- **Eval stack.** How the case presents a settled ranking card without planting state other cases
-  read; the existing `bootstrap-ranking` stack is the model to follow.
+- **CI installs.** A fresh CI install starts the four audits during an eval run, alongside the
+  audit cases that start the same audits on demand. The first nightly shows whether the two collide
+  on a ledger issue.

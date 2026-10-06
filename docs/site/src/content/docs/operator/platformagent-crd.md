@@ -450,7 +450,7 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
   writes into one anonymous bucket, since a specialist carries no gateway identity to scope a
   per-user store by. Carrying memory to the front door needs those settings to be per-process
   rather than per-profile.
-- **First-run onboarding does not follow the gateway.** Its two jobs are on the `default` roster the
+- **First-run onboarding does not follow the gateway.** Its three jobs are on the `default` roster the
   bullet above stops ticking, and its greeting hook — the `bootstrap_onboarding` plugin — resolves
   its once-per-deployment markers from the gateway's home, so on the platform profile it would greet
   an already-onboarded install and promise a report nothing can deliver. The operator therefore

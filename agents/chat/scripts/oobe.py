@@ -60,14 +60,15 @@ PAUSED_STATE = "paused"
 # suffix (inventory.md, step 5; bootstrap_onboarding/README.md), so the prefix counts too.
 PRIORITIZE_KEY = "bootstrap-inventory-prioritize"
 PRIORITIZE_RETRY_PATTERN = PRIORITIZE_KEY + "-%"
-# Statuses a card does not leave on its own. Blocked and triage are not here: a person
-# may unblock the card, and the fallback covers one nobody does.
-FINISHED_STATUSES = ("done", "failed", "cancelled", "archived")
+# Statuses a card does not leave on its own (hermes_cli/kanban_db.py VALID_STATUSES). A card
+# that runs out of retries ends blocked, which a person may still unblock, so it is not here:
+# the fallback covers one nobody does.
+FINISHED_STATUSES = ("done", "archived")
 BOARD_FILE = "kanban.db"
 SQLITE_BUSY_TIMEOUT_SECONDS = 10
 
-# Past the hand-off's own one-hour deadline for the per-cluster cards, plus time for
-# the ranking card. Also covers a sweep that audited no cluster, which files no ranking card.
+# Long enough for a sweep over a large fleet to reach its ranking card and finish it, short
+# enough that a sweep that stalls (#2143) or a ranking card left blocked does not cost the day.
 FALLBACK_SECONDS = 90 * 60
 CRON_RUN_TIMEOUT_SECONDS = 30
 # A job id the roster does not have, or one disabled by hand, fails every attempt;
