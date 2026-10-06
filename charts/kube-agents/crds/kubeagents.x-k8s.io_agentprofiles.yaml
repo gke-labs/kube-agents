@@ -1,0 +1,349 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: agentprofiles.kubeagents.x-k8s.io
+spec:
+  group: kubeagents.x-k8s.io
+  names:
+    kind: AgentProfile
+    listKind: AgentProfileList
+    plural: agentprofiles
+    shortNames:
+      - apr
+    singular: agentprofile
+  scope: Namespaced
+  versions:
+    - additionalPrinterColumns:
+        - jsonPath: .status.serviceAccountName
+          name: ServiceAccount
+          type: string
+        - jsonPath: .status.conditions[?(@.type=="IdentityReady")].status
+          name: Identity
+          type: string
+        - jsonPath: .status.conditions[?(@.type=="CardPublished")].status
+          name: Card
+          type: string
+        - jsonPath: .metadata.creationTimestamp
+          name: Age
+          type: date
+      name: v1alpha1
+      schema:
+        openAPIV3Schema:
+          description: AgentProfile is the Schema for the agentprofiles API.
+          properties:
+            apiVersion:
+              description: |-
+                APIVersion defines the versioned schema of this representation of an object.
+                Servers should convert recognized schemas to the latest internal value, and
+                may reject unrecognized values.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+              type: string
+            kind:
+              description: |-
+                Kind is a string value representing the REST resource this object represents.
+                Servers may infer this from the endpoint the client submits requests to.
+                Cannot be updated.
+                In CamelCase.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+              type: string
+            metadata:
+              type: object
+            spec:
+              description: AgentProfileSpec defines the desired state of AgentProfile.
+              properties:
+                bus:
+                  description: |-
+                    Bus holds topic grants beyond the task subjects every executor gets.
+                    Absent or empty grants no topic at all.
+                  properties:
+                    publishTopics:
+                      description:
+                        PublishTopics are the topics the profile's pods may
+                        write.
+                      items:
+                        maxLength: 134
+                        pattern: ^(shared\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?|agent\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)$
+                        type: string
+                      maxItems: 32
+                      type: array
+                      x-kubernetes-list-type: set
+                    subscribeTopics:
+                      description:
+                        SubscribeTopics are the topics the profile's pods
+                        may read.
+                      items:
+                        maxLength: 134
+                        pattern: ^(shared\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?|agent\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)$
+                        type: string
+                      maxItems: 32
+                      type: array
+                      x-kubernetes-list-type: set
+                  type: object
+                clusterRef:
+                  description: |-
+                    ClusterRef is set on cluster agents only: the cluster this profile is
+                    scoped to, as structured data rather than a parsed name.
+                  properties:
+                    cluster:
+                      minLength: 1
+                      type: string
+                    location:
+                      minLength: 1
+                      type: string
+                    projectId:
+                      minLength: 1
+                      type: string
+                  required:
+                    - cluster
+                    - location
+                    - projectId
+                  type: object
+                concurrency:
+                  description: Concurrency is the most pods this profile runs at once.
+                  format: int32
+                  minimum: 1
+                  type: integer
+                description:
+                  description:
+                    Description is the routing blurb, rendered into the A2A
+                    agent card.
+                  minLength: 1
+                  type: string
+                  x-kubernetes-validations:
+                    - message:
+                        description is the routing blurb the agent card is rendered
+                        from and must not be blank
+                      rule: self.trim().size() > 0
+                harness:
+                  description: Harness is the worker image and its model routing.
+                  properties:
+                    image:
+                      description: |-
+                        Image is the worker image: a harness speaking the headless CLI contract,
+                        wrapped by the bus adapter.
+                      minLength: 1
+                      type: string
+                    maxTurns:
+                      description: MaxTurns is the turn budget.
+                      format: int32
+                      minimum: 0
+                      type: integer
+                    model:
+                      description: Model is the model route, via LiteLLM.
+                      type: string
+                  required:
+                    - image
+                  type: object
+                identity:
+                  description: |-
+                    Identity names the ServiceAccount the profile's pods run as. Absent, the
+                    operator creates one with zero RBAC bindings: the token exists to
+                    authenticate to the bus, not to talk to the API server.
+                  properties:
+                    serviceAccountName:
+                      description: |-
+                        ServiceAccountName is an existing ServiceAccount in the profile's
+                        namespace. Naming one hands this profile's pods whatever RBAC it holds;
+                        absent, the operator creates a ServiceAccount with none.
+                      maxLength: 253
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                      type: string
+                  type: object
+                lifecycle:
+                  description: |-
+                    Lifecycle bounds one task's wall clock and how long the finished Job
+                    lingers.
+                  properties:
+                    activeDeadlineSeconds:
+                      description: |-
+                        ActiveDeadlineSeconds is the hard ceiling on one task's wall clock,
+                        enforced by Kubernetes from Job spawn.
+                      format: int64
+                      minimum: 1
+                      type: integer
+                    ttlSecondsAfterFinished:
+                      description: |-
+                        TTLSecondsAfterFinished is how long a finished Job lingers for
+                        inspection before garbage collection.
+                      format: int32
+                      minimum: 0
+                      type: integer
+                  required:
+                    - activeDeadlineSeconds
+                    - ttlSecondsAfterFinished
+                  type: object
+                persona:
+                  description: |-
+                    Persona is the OCI artifact holding SOUL.md, AGENTS.md, skills and the
+                    persona config, mounted read-only via image volume.
+                  properties:
+                    image:
+                      description: Image is the OCI reference of the persona artifact.
+                      minLength: 1
+                      type: string
+                  required:
+                    - image
+                  type: object
+                queueTimeoutSeconds:
+                  description: |-
+                    QueueTimeoutSeconds is how stale a queued submission may be, by its
+                    JetStream server ingest time, before the dispatcher refuses to run it.
+                    Absent or zero means DefaultAgentProfileQueueTimeoutSeconds.
+                  format: int32
+                  minimum: 0
+                  type: integer
+                resources:
+                  description: Resources is the pod resource class.
+                  properties:
+                    limits:
+                      description: AgentProfileResourceList is a cpu and memory pair.
+                      properties:
+                        cpu:
+                          anyOf:
+                            - type: integer
+                            - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        memory:
+                          anyOf:
+                            - type: integer
+                            - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                      required:
+                        - cpu
+                        - memory
+                      type: object
+                    requests:
+                      description: AgentProfileResourceList is a cpu and memory pair.
+                      properties:
+                        cpu:
+                          anyOf:
+                            - type: integer
+                            - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        memory:
+                          anyOf:
+                            - type: integer
+                            - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                      required:
+                        - cpu
+                        - memory
+                      type: object
+                  required:
+                    - limits
+                    - requests
+                  type: object
+              required:
+                - concurrency
+                - description
+                - harness
+                - lifecycle
+                - persona
+                - resources
+              type: object
+            status:
+              description: AgentProfileStatus defines the observed state of AgentProfile.
+              properties:
+                agentRef:
+                  description: |-
+                    AgentRef is the PlatformAgent this profile is bound to: the one in its
+                    namespace.
+                  type: string
+                conditions:
+                  description:
+                    Conditions represent the latest available observations
+                    of the profile.
+                  items:
+                    description:
+                      Condition contains details for one aspect of the current
+                      state of this API Resource.
+                    properties:
+                      lastTransitionTime:
+                        description: |-
+                          lastTransitionTime is the last time the condition transitioned from one status to another.
+                          This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                        format: date-time
+                        type: string
+                      message:
+                        description: |-
+                          message is a human readable message indicating details about the transition.
+                          This may be an empty string.
+                        maxLength: 32768
+                        type: string
+                      observedGeneration:
+                        description: |-
+                          observedGeneration represents the .metadata.generation that the condition was set based upon.
+                          For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                          with respect to the current state of the instance.
+                        format: int64
+                        minimum: 0
+                        type: integer
+                      reason:
+                        description: |-
+                          reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                          Producers of specific condition types may define expected values and meanings for this field,
+                          and whether the values are considered a guaranteed API.
+                          The value should be a CamelCase string.
+                          This field may not be empty.
+                        maxLength: 1024
+                        minLength: 1
+                        pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                        type: string
+                      status:
+                        description: status of the condition, one of True, False, Unknown.
+                        enum:
+                          - "True"
+                          - "False"
+                          - Unknown
+                        type: string
+                      type:
+                        description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                        maxLength: 316
+                        pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                        type: string
+                    required:
+                      - lastTransitionTime
+                      - message
+                      - reason
+                      - status
+                      - type
+                    type: object
+                  type: array
+                  x-kubernetes-list-map-keys:
+                    - type
+                  x-kubernetes-list-type: map
+                observedGeneration:
+                  description: |-
+                    ObservedGeneration is the .metadata.generation the status was last
+                    computed from.
+                  format: int64
+                  type: integer
+                serviceAccountName:
+                  description: |-
+                    ServiceAccountName is the ServiceAccount the profile's pods run as,
+                    whether named in spec.identity or created by the operator.
+                  type: string
+              type: object
+          type: object
+          x-kubernetes-validations:
+            - message:
+                "AgentProfile name must be a dot-free DNS-1123 label of at most
+                63 characters: it is the addressee token on the task and directory subjects"
+              rule:
+                self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$') && self.metadata.name.size()
+                <= 63
+            - message:
+                "AgentProfile name 'platform' is reserved: the Hermes bridge
+                is the executor for that addressee"
+              rule: self.metadata.name != 'platform'
+      served: true
+      storage: true
+      subresources:
+        status: {}

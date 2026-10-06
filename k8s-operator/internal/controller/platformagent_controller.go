@@ -4461,6 +4461,27 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		}
 	}
 
+	// AgentProfiles feed the identity map, so a profile created, edited or
+	// deleted re-renders it. Registered only when the CRD is installed, like
+	// AgentPlugin's watch above.
+	profileGVK := agentv1alpha1.GroupVersion.WithKind("AgentProfile")
+	if mgr != nil && mgr.GetRESTMapper() != nil {
+		if _, err := mgr.GetRESTMapper().RESTMapping(profileGVK.GroupKind(), profileGVK.Version); err == nil {
+			bld = bld.Watches(
+				&agentv1alpha1.AgentProfile{},
+				handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+					return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
+				}),
+				// The AgentProfile reconciler writes status; only spec
+				// changes, creates and deletes change the map.
+				builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+			)
+		} else {
+			logf.Log.WithName("platformagent-controller").Info(
+				"AgentProfile CRD is not installed on cluster; skipping AgentProfile watch.")
+		}
+	}
+
 	return bld.
 		Watches(
 			&rbacv1.ClusterRoleBinding{},

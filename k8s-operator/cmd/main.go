@@ -290,6 +290,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The AgentProfile reconciler, when the CRD is installed. An operator
+	// upgraded ahead of its CRDs keeps running everything else.
+	profileGVK := agentv1alpha1.GroupVersion.WithKind("AgentProfile")
+	if _, err := mgr.GetRESTMapper().RESTMapping(profileGVK.GroupKind(), profileGVK.Version); err == nil {
+		if err := (&controller.AgentProfileReconciler{
+			Client: mgr.GetClient(),
+			Scheme: mgr.GetScheme(),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create controller", "controller", "agentprofile")
+			os.Exit(1)
+		}
+	} else {
+		setupLog.Info("AgentProfile CRD is not installed on cluster; skipping the AgentProfile controller")
+	}
+
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
 		webhooks := []struct {
 			name      string

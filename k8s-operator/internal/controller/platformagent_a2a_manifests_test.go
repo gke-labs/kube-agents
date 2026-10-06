@@ -3408,7 +3408,7 @@ func TestNoAgentSidePrincipalCanPublishToTheDirectory(t *testing.T) {
 	// this test against the two-argument signature on main.
 	agent := a2aTestAgent()
 	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
-	doc, err := renderA2AAuthMap(agent)
+	doc, err := renderA2AAuthMap(agent, nil)
 	if err != nil {
 		t.Fatalf("rendering the auth map: %v", err)
 	}
@@ -4620,7 +4620,7 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 // which is how a CONSUMER.CREATE grant becomes a read of a stream the subject
 // list withholds), and no reach into the buckets.
 func TestAgentHoldsOnlyTheBlackboard(t *testing.T) {
-	doc, err := renderA2AAuthMap(a2aTestAgent())
+	doc, err := renderA2AAuthMap(a2aTestAgent(), nil)
 	if err != nil {
 		t.Fatalf("rendering the auth map: %v", err)
 	}

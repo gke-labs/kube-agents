@@ -1,0 +1,251 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"fmt"
+	"os"
+	"regexp"
+	"sort"
+
+	"k8s.io/apimachinery/pkg/util/validation"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+)
+
+// The bus identities AgentProfiles add to the map, and the operator's own.
+//
+// "Profile" in this file is the AgentProfile resource (the A2A side's profile),
+// never a Hermes profile directory.
+//
+// A profile's entry is not a static grant set. Every pod of a profile publishes
+// as the profile, but each needs its own consumers and inbox, so the entry
+// narrows on "profile": it carries the profile name and the profile's topics,
+// and the callout derives the subjects from those plus the attested pod name
+// (a2a/authcallout/profile_narrowing.go). The map therefore holds no subject a
+// profile pod can reach, exactly as for the session entry.
+//
+// The operator's entry IS static, and it is the narrowest principal in the map:
+// publish on the directory, read the directory, its own inbox. It exists to
+// publish profile cards and their tombstones, which the spec gives to the
+// operator because a card is presence derived from desired state, and the
+// operator is the one component that holds the desired state.
+
+const (
+	// a2aNarrowingProfile is the callout's NarrowingProfile, duplicated here
+	// because the modules cannot import each other; the fixture contract test
+	// holds the two spellings equal.
+	a2aNarrowingProfile = "profile"
+
+	// agentProfileServiceAccountPrefix names the ServiceAccount the operator
+	// creates for a profile with no spec.identity. The prefix keeps the name
+	// out of the space the PlatformAgent's own ServiceAccounts use
+	// (<agent>-…), so a profile name cannot collide with one by construction.
+	agentProfileServiceAccountPrefix = "agentprofile-"
+
+	// agentProfileMapUserPrefix names a profile's entry in the map. The user
+	// a pod is minted as is its pod name; this is only the entry's label, and
+	// it must be unique in the map.
+	agentProfileMapUserPrefix = "profile-"
+
+	// a2aOperatorBusUser is the operator's NATS user and inbox owner.
+	a2aOperatorBusUser = "operator"
+
+	// operatorNamespaceEnvVar and operatorServiceAccountEnvVar are the
+	// manager's own namespace and ServiceAccount, by the downward API. Both
+	// are needed to key the operator's map entry; with either unset the
+	// operator renders no entry for itself and publishes no cards, and the
+	// AgentProfile's CardPublished condition says so.
+	operatorNamespaceEnvVar      = "POD_NAMESPACE"
+	operatorServiceAccountEnvVar = "OPERATOR_SERVICE_ACCOUNT"
+
+	// a2aOperatorBusClientLabel marks the manager's pod as a bus client, so
+	// the NATS fence can admit it from the operator's namespace. The chart
+	// and the kustomize manager both stamp it.
+	a2aOperatorBusClientLabel      = "kubeagents.x-k8s.io/a2a-bus-client"
+	a2aOperatorBusClientLabelValue = "operator"
+
+	// a2aDirectoryStream is the stream behind a2a.agents.>, and
+	// a2aDirectorySubjectPrefix the subject space it carries.
+	a2aDirectoryStream        = "DIRECTORY"
+	a2aDirectorySubjectPrefix = "a2a.agents."
+)
+
+// agentProfileTopicRE is the CRD's topic-grant pattern, rechecked when the map
+// is rendered: a CRD older than the operator, or one edited on the cluster, is
+// not where the map's safety should rest.
+var agentProfileTopicRE = regexp.MustCompile(agentv1alpha1.AgentProfileTopicPattern)
+
+// isDNS1123LabelToken is the subject-token rule: a DNS-1123 label, which is
+// dot-free by definition.
+func isDNS1123LabelToken(s string) bool {
+	return len(validation.IsDNS1123Label(s)) == 0
+}
+
+// operatorBusPrincipal is the manager's own ServiceAccount, as the downward API
+// reports it. ok is false when the manager was deployed without the two
+// variables, which is an install older than profiles.
+func operatorBusPrincipal() (namespace, serviceAccount string, ok bool) {
+	namespace = os.Getenv(operatorNamespaceEnvVar)
+	serviceAccount = os.Getenv(operatorServiceAccountEnvVar)
+	return namespace, serviceAccount, namespace != "" && serviceAccount != ""
+}
+
+// operatorIdentity is the operator as a bus principal: publish a card or a
+// tombstone on a2a.agents.<profile>, read one back, and its own inbox. The
+// subject is a wildcard over the profile token because a callout grant is
+// fixed for the life of a connection: a profile created after the operator
+// connected must still be publishable without a reconnect. Nothing else: no
+// task plane, no topics, no stream verb beyond the one direct read.
+//
+// The read is DIRECT.GET by subject, which nats.go spells as the subject's
+// trailing tokens, so it is scoped to the directory's own subjects; it is how
+// reconcile tells a missing or stale card from a current one without holding
+// STREAM.INFO.
+func operatorIdentity() (a2aIdentity, bool) {
+	ns, sa, ok := operatorBusPrincipal()
+	if !ok {
+		return a2aIdentity{}, false
+	}
+	inbox := "_INBOX." + a2aOperatorBusUser + ".>"
+	return a2aIdentity{
+		user:           a2aOperatorBusUser,
+		account:        a2aAccountApp,
+		auth:           a2aAuthCallout,
+		serviceAccount: a2aServiceAccountName(ns, sa),
+		comment: "the operator. Publishes each AgentProfile's agent card and its tombstone\n" +
+			"on the directory, and reads one back to tell a missing card from a current\n" +
+			"one. Nothing on the task plane or the blackboard.",
+		publish: []string{
+			a2aDirectorySubjectPrefix + "*",
+			"$JS.API.DIRECT.GET." + a2aDirectoryStream + "." + a2aDirectorySubjectPrefix + "*",
+		},
+		subscribe: []string{inbox},
+	}, true
+}
+
+// agentProfileServiceAccountName is the ServiceAccount a profile's pods run as:
+// the one spec.identity names, or the one the operator creates.
+func agentProfileServiceAccountName(p *agentv1alpha1.AgentProfile) string {
+	if p.Spec.Identity.ServiceAccountName != "" {
+		return p.Spec.Identity.ServiceAccountName
+	}
+	return agentProfileServiceAccountPrefix + p.Name
+}
+
+// reservedProfileServiceAccounts are the ServiceAccounts a profile may not run
+// as. Each is an identity the operator already renders for something else, and
+// two failure modes make naming one a refusal rather than a choice:
+//
+//   - The map is keyed on the ServiceAccount, and a duplicate key makes the
+//     callout refuse the whole map (and keep serving the previous one), so
+//     one profile naming the session SA would freeze every identity change
+//     behind it.
+//   - The ones not in the map carry real authority: the agent's own
+//     ServiceAccount, the callout's (TokenReview), the gateway's (pod create).
+//     A profile is not the route to borrowing them.
+//
+// `default` is reserved because every pod in the namespace that names no
+// ServiceAccount runs as it, so a profile on `default` would hand its bus
+// identity to all of them.
+func reservedProfileServiceAccounts(agent *agentv1alpha1.PlatformAgent) map[string]string {
+	return map[string]string{
+		"default":                             "the namespace's default ServiceAccount, which every pod naming none runs as",
+		agentServiceAccountName(agent):        "the platform agent's own ServiceAccount",
+		a2aSessionServiceAccountName(agent):   "the gateway's session pods' ServiceAccount",
+		a2aProvisionServiceAccountName(agent): "the bus provisioner's ServiceAccount",
+		a2aGatewayName(agent):                 "the A2A gateway's ServiceAccount",
+		a2aVerifierName(agent):                "the capability verifier's ServiceAccount",
+		a2aCalloutName(agent):                 "the auth callout's ServiceAccount",
+		shellSandboxServiceAccountName(agent): "the shell sandbox's ServiceAccount",
+	}
+}
+
+// agentProfileResolution is what the operator decided about one profile's
+// identity: the ServiceAccount it runs as, or why it renders nothing.
+type agentProfileResolution struct {
+	serviceAccount string
+	refused        error
+}
+
+// resolveAgentProfileIdentities decides every profile's ServiceAccount at once,
+// because two of the refusals are relative: two profiles naming one
+// ServiceAccount would be two map entries under one key, so the second by name
+// is refused and the first keeps it. Profiles are taken in name order so the
+// answer does not depend on list order. A terminating profile still holds its
+// identity: its pods may still be running, and the finalizer removes the entry
+// only after its card is tombstoned.
+func resolveAgentProfileIdentities(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) map[string]agentProfileResolution {
+	reserved := reservedProfileServiceAccounts(agent)
+	sorted := append([]agentv1alpha1.AgentProfile(nil), profiles...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
+
+	out := make(map[string]agentProfileResolution, len(sorted))
+	claimedBy := map[string]string{}
+	for i := range sorted {
+		p := &sorted[i]
+		sa := agentProfileServiceAccountName(p)
+		switch {
+		case p.Name == a2aBridgeAddressee:
+			// The CRD refuses this name too; the operator does not rely
+			// on admission alone, because CRD validation can be
+			// bypassed by an older CRD left on the cluster.
+			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("profile name %q is the Hermes bridge's addressee", p.Name)}
+		case reserved[sa] != "":
+			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("serviceAccountName %q is %s", sa, reserved[sa])}
+		case claimedBy[sa] != "":
+			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("serviceAccountName %q is already AgentProfile %q's", sa, claimedBy[sa])}
+		default:
+			claimedBy[sa] = p.Name
+			out[p.Name] = agentProfileResolution{serviceAccount: sa}
+		}
+	}
+	return out
+}
+
+// agentProfileMapEntries renders one narrowed map entry per profile that
+// resolved, in name order. Refused profiles are left out, never rendered with a
+// fault: one bad profile must not fail the map for every other principal.
+func agentProfileMapEntries(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) []a2aAuthMapIdentity {
+	resolved := resolveAgentProfileIdentities(agent, profiles)
+	sorted := append([]agentv1alpha1.AgentProfile(nil), profiles...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
+
+	var out []a2aAuthMapIdentity
+	for i := range sorted {
+		p := &sorted[i]
+		r := resolved[p.Name]
+		if r.refused != nil {
+			continue
+		}
+		entry := a2aAuthMapIdentity{
+			ServiceAccount: a2aServiceAccountName(agent.Namespace, r.serviceAccount),
+			User:           agentProfileMapUserPrefix + p.Name,
+			Account:        a2aAccountApp,
+			Narrowing:      a2aNarrowingProfile,
+			Profile:        p.Name,
+		}
+		if len(p.Spec.Bus.PublishTopics) > 0 || len(p.Spec.Bus.SubscribeTopics) > 0 {
+			entry.Topics = &a2aAuthMapTopics{
+				Publish:   append([]string(nil), p.Spec.Bus.PublishTopics...),
+				Subscribe: append([]string(nil), p.Spec.Bus.SubscribeTopics...),
+			}
+		}
+		out = append(out, entry)
+	}
+	return out
+}

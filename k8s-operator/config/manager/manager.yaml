@@ -40,6 +40,9 @@ spec:
       labels:
         control-plane: controller-manager
         app.kubernetes.io/name: kube-agents-operator
+        # Admits this pod through a mode-next PlatformAgent's NATS fence, from
+        # this namespace only. The callout, not the label, decides who it is.
+        kubeagents.x-k8s.io/a2a-bus-client: operator
     spec:
       securityContext:
         runAsNonRoot: true
@@ -57,6 +60,18 @@ spec:
           env:
             - name: ENABLE_WEBHOOKS
               value: "true"
+            # The manager's own namespace and ServiceAccount key its bus
+            # identity in a mode-next agent's identity map; it publishes
+            # AgentProfile cards with it. Unset, it renders no identity for
+            # itself and publishes no cards.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OPERATOR_SERVICE_ACCOUNT
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.serviceAccountName
             # Private-registry installs: uncomment (or patch via kustomize) to
             # point the images the operator deploys at your own registry.
             # OPERATOR_IMAGE is this container's own image; the A2A next-stack
@@ -130,6 +145,9 @@ spec:
             - mountPath: /tmp/k8s-webhook-server/serving-certs
               name: cert
               readOnly: true
+            - mountPath: /var/run/secrets/a2a-bus
+              name: a2a-bus-token
+              readOnly: true
       serviceAccountName: controller
       terminationGracePeriodSeconds: 10
       volumes:
@@ -137,3 +155,13 @@ spec:
           secret:
             defaultMode: 420
             secretName: kubeagents-webhook-certs
+        # The bus token, audience-bound to the A2A bus and rotated by the
+        # kubelet. It authenticates nothing until a mode-next identity map
+        # carries the operator's entry.
+        - name: a2a-bus-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: a2a-bus
+                  expirationSeconds: 3600
+                  path: token

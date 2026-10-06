@@ -280,18 +280,27 @@ func a2aServiceAccountName(namespace, name string) string {
 // iteration.
 func a2aIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 	ns := agent.Namespace
-	return []a2aIdentity{
+	ids := []a2aIdentity{
 		gatewayIdentity(agent, ns),
 		provisionIdentity(agent, ns),
 		sessionIdentity(agent, ns),
 		agentIdentity(agent, ns),
 		bridgeIdentity(),
 		verifierIdentity(agent, ns),
+	}
+	// The operator, when the manager was deployed knowing its own
+	// ServiceAccount (agentprofile_identities.go). An install whose manager
+	// lacks the downward-API variables renders no entry and publishes no
+	// cards, rather than guessing a name.
+	if op, ok := operatorIdentity(); ok {
+		ids = append(ids, op)
+	}
+	return append(ids,
 		seedIdentity(),
 		webIdentity(),
 		consoleIdentity(),
 		sysIdentity(),
-	}
+	)
 }
 
 // gateway: task requester, chat-session supervisor, session-registry owner.

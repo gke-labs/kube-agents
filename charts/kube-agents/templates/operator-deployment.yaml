@@ -22,6 +22,10 @@ spec:
     metadata:
       labels:
         {{- include "kube-agents.operatorSelectorLabels" . | nindent 8 }}
+        {{- /* Admits this pod through a mode-next PlatformAgent's NATS fence,
+               from this namespace only. The callout, not the label, decides
+               who it is. */}}
+        kubeagents.x-k8s.io/a2a-bus-client: operator
       annotations:
         kubectl.kubernetes.io/default-container: manager
     spec:
@@ -56,6 +60,18 @@ spec:
             # apply time on the missing Certificate CRD. See the chart README.
             - name: ENABLE_WEBHOOKS
               value: {{ .Values.operator.webhooks.enabled | quote }}
+            # The manager's own namespace and ServiceAccount key its bus
+            # identity in a mode-next agent's identity map; it publishes
+            # AgentProfile cards with it. Unset, it renders no identity for
+            # itself and publishes no cards.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OPERATOR_SERVICE_ACCOUNT
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.serviceAccountName
             # The three images the operator resolves for pods the chart never
             # renders: an agent Deployment whose PlatformAgent omits
             # spec.deployment.image, the shell sandbox StatefulSet it renders
@@ -141,8 +157,14 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.operator.resources | nindent 12 }}
-          {{- if .Values.operator.webhooks.enabled }}
           volumeMounts:
+            # The bus token: audience-bound to the A2A bus, rotated by the
+            # kubelet. It authenticates nothing until a mode-next identity map
+            # carries the operator's entry.
+            - mountPath: /var/run/secrets/a2a-bus
+              name: a2a-bus-token
+              readOnly: true
+          {{- if .Values.operator.webhooks.enabled }}
             # controller-runtime's default CertDir. The manager is started
             # without --webhook-cert-path, so this exact path is what it reads
             # (k8s-operator/cmd/main.go overrides it only when that flag is given).
@@ -150,8 +172,15 @@ spec:
               name: cert
               readOnly: true
           {{- end }}
-      {{- if .Values.operator.webhooks.enabled }}
       volumes:
+        - name: a2a-bus-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: a2a-bus
+                  expirationSeconds: 3600
+                  path: token
+      {{- if .Values.operator.webhooks.enabled }}
         - name: cert
           secret:
             defaultMode: 420
