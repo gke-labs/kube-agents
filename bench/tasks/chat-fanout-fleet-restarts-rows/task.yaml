@@ -13,8 +13,8 @@
 # wants "seeded-a · payments-api restarting, OOMKilled".
 #
 # The objectives therefore grade the shape of the fan-out, not only that it
-# happened: the ack, then three kanban_create calls by the platform worker,
-# each titled with a bare seeded cluster name. An install may carry cluster
+# happened: the ack, then a kanban_create call by the platform worker for
+# each seeded cluster, titled with its bare name. An install may carry cluster
 # profiles beyond the seeded three, so the ack's count is not asserted and
 # more than three cards still pass. The answer is graded on what the fleet
 # plants (payments-api crashlooping on slot a), so a fan-out that reads
@@ -66,10 +66,12 @@ verification_spec:
     check:
       type: report_contains
       any_of_patterns: ["checking all \\d+ clusters"]
-  # scope: workers with agent: platform reads the platform worker's own calls,
-  # not the front door's one card. The title pattern is the bare name the
-  # plan row renders; "Check seeded-a" or a card per namespace does not count.
-  - name: one-card-per-cluster-titled-with-its-name
+  # One card per seeded cluster, each its own objective so three cards for one
+  # cluster do not pass. scope: workers with agent: platform reads the
+  # platform worker's own calls, not the front door's one card. The title is
+  # the bare name the plan row renders; "Check seeded-a" or a card per
+  # namespace does not count.
+  - name: a-card-titled-seeded-a
     role: objective
     mode: assert
     check:
@@ -78,8 +80,29 @@ verification_spec:
       scope: workers
       agent: platform
       arguments:
-        title: "seeded-[abc]"
-      minimum_calls: 3
+        title: "seeded-a"
+      require_success: true
+  - name: a-card-titled-seeded-b
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      scope: workers
+      agent: platform
+      arguments:
+        title: "seeded-b"
+      require_success: true
+  - name: a-card-titled-seeded-c
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      scope: workers
+      agent: platform
+      arguments:
+        title: "seeded-c"
       require_success: true
   # "seeded-a" is slot a under the fleet prefix's default, the contract the
   # crashloop cases carry.

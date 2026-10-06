@@ -348,6 +348,7 @@ INJECT_LANE_EXCLUDED = [
     "chat-voice-failure-leads-with-fact",  # #2039: grades the front door's reply to a blocked card's wake; same door
     "chat-question-wake-stays-silent",  # #2039: grades the front door's silence on a posted question's wake; same door
     "chat-question-typed-answer-fresh-session",  # the same for a typed answer in a session the wake never reached
+    "chat-fanout-fleet-restarts-rows",  # #2039: grades the front door's ack and the fan-out under its one card; same door
 ]
 # The directives a case's prompt opens with to replay a wake into the chat
 # front door (bench/kube_agents_bench/card_wake.py); the harness errors such
@@ -362,6 +363,7 @@ INJECT_LANE_EXCLUDED_TIER = {
     "chat-voice-failure-leads-with-fact": "nightly",
     "chat-question-wake-stays-silent": "nightly",
     "chat-question-typed-answer-fresh-session": "nightly",
+    "chat-fanout-fleet-restarts-rows": "nightly",
 }
 
 
