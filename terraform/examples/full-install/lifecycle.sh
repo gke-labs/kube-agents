@@ -174,6 +174,9 @@ readonly MINTER_KMS_KEY_ADDRESS="module.github_minter[0].google_kms_crypto_key.m
 # GCS_OBJECT_ABSENT_PATTERN in scripts/installer/installer_common.sh.
 readonly MINTER_KEY_ABSENT_PATTERN='NOT_FOUND|SERVICE_DISABLED|has not been used in project'
 readonly HELM_RELEASE_ADDRESS="helm_release.kube_agents"
+readonly CERT_MANAGER_RELEASE_ADDRESS="helm_release.cert_manager[0]"
+# The releases' own `timeout = 600` in main.tf, for the uninstall that runs ahead of terraform destroy.
+readonly HELM_UNINSTALL_TIMEOUT="10m"
 readonly AGENT_GSA_ADDRESS="module.kube_agents_iam.google_service_account.agent"
 readonly CHAT_SUBSCRIPTION_ADDRESS="module.chat_pubsub[0].google_pubsub_subscription.chat_events"
 readonly STATE_LOCK_MESSAGE_PATTERN='(Acquiring|Releasing) state lock\.'
@@ -1066,27 +1069,43 @@ guard_minter_key() {
   exit 1
 }
 
-delete_agent_cr() {
-  local namespace cluster location project names
-  namespace=$(tfvar namespace)
+# Fetches credentials for this install's cluster, once per run, for the
+# in-cluster steps of a destroy, and sets CLUSTER_CONTEXT to the kubeconfig
+# context gcloud writes for it, which every kubectl and helm call after it
+# names. Returns 1 when get-credentials fails.
+#
+# Through the helper, so teardown reaches the cluster over the endpoint the
+# install used. Without the flag a cluster whose IP endpoint this host cannot
+# route to gets that IP written into the kubeconfig, and the callers' guard does
+# not catch it: get-credentials is a describe plus a file write, neither of
+# which touches the control plane, so it exits 0. The kubectl after it then
+# reads an unreachable cluster as a namespace holding no PlatformAgent, and
+# teardown reports success having left the finalizer's cluster-scoped RBAC
+# behind — the objects nothing else garbage-collects.
+CLUSTER_CONTEXT=""
+fetch_cluster_credentials() {
+  [[ -n "$CLUSTER_CONTEXT" ]] && return 0
+  local cluster location project
   cluster=$(tfvar cluster_name)
   location=$(tfvar location)
   project=$(tfvar project_id)
-
-  # Through the helper, so teardown reaches the cluster over the endpoint the
-  # install used. Without the flag a cluster whose IP endpoint this host cannot
-  # route to gets that IP written into the kubeconfig, and the guard below does
-  # not catch it: get-credentials is a describe plus a file write, neither of
-  # which touches the control plane, so it exits 0. The kubectl after it then
-  # reads an unreachable cluster as a namespace holding no PlatformAgent, and
-  # teardown reports success having left the finalizer's cluster-scoped RBAC
-  # behind — the objects nothing else garbage-collects.
   GKE_DNS_ENDPOINT_FLAG=""
   gke_dns_endpoint_flag "$cluster" "$location" "$project" || true
   # Unquoted on purpose: empty must contribute no argument. See gke_dns_endpoint.sh.
   # shellcheck disable=SC2086
-  if ! gcloud container clusters get-credentials "$cluster" --location "$location" \
-        --project "$project" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1; then
+  gcloud container clusters get-credentials "$cluster" --location "$location" \
+    --project "$project" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || return 1
+  # gcloud's own naming, as installer_common.sh's gke_context_name has it. Named
+  # rather than read back from current-context, which another get-credentials
+  # sharing this kubeconfig can move under a running teardown.
+  CLUSTER_CONTEXT="gke_${project}_${location}_${cluster}"
+}
+
+delete_agent_cr() {
+  local namespace names
+  namespace=$(tfvar namespace)
+
+  if ! fetch_cluster_credentials; then
     log "cluster unreachable; nothing to delete in-cluster"
     return 0
   fi
@@ -1095,13 +1114,13 @@ delete_agent_cr() {
   # the chart's default, but extra_helm_values can override it, and the admission
   # webhook allows only one PlatformAgent per cluster — so whatever is in the
   # namespace is the one to delete.
-  names=$(kubectl get platformagent -n "$namespace" -o name 2>/dev/null || true)
+  names=$(kubectl --context "$CLUSTER_CONTEXT" get platformagent -n "$namespace" -o name 2>/dev/null || true)
   [[ -n "$names" ]] || { log "no PlatformAgent to delete"; return 0; }
 
   while read -r ref; do
     [[ -n "$ref" ]] || continue
     log "deleting ${ref} and waiting for its finalizer"
-    if kubectl delete "$ref" -n "$namespace" --wait --timeout=180s >/dev/null 2>&1; then
+    if kubectl --context "$CLUSTER_CONTEXT" delete "$ref" -n "$namespace" --wait --timeout=180s >/dev/null 2>&1; then
       log "${ref} deleted cleanly"
       continue
     fi
@@ -1113,16 +1132,97 @@ delete_agent_cr() {
     # normally destroyed moments later, but a destroy can stop between the
     # release and the cluster, so delete the two objects here as well.
     warn "finalizer did not clear in time; removing it so the namespace can terminate"
-    kubectl patch "$ref" -n "$namespace" --type=merge \
+    kubectl --context "$CLUSTER_CONTEXT" patch "$ref" -n "$namespace" --type=merge \
       -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
     # The operator's naming, kubeagents:minimal:<namespace>:<name>, from
     # k8s-operator/internal/controller/platformagent_manifests.go; a bash
     # script cannot import it, so this must move when that does.
-    kubectl delete clusterrolebinding "kubeagents:minimal:${namespace}:${ref##*/}" \
+    kubectl --context "$CLUSTER_CONTEXT" delete clusterrolebinding "kubeagents:minimal:${namespace}:${ref##*/}" \
       --ignore-not-found >/dev/null 2>&1 || true
-    kubectl delete clusterrole "kubeagents:minimal:${namespace}:${ref##*/}" \
+    kubectl --context "$CLUSTER_CONTEXT" delete clusterrole "kubeagents:minimal:${namespace}:${ref##*/}" \
       --ignore-not-found >/dev/null 2>&1 || true
   done <<<"$names"
+}
+
+# Defence in depth for the release teardown on a cluster this state did not
+# create (#2246). terraform destroy uninstalls the releases through the helm
+# provider, and the provider can do nothing and report success: hashicorp/helm
+# 3.x's Delete returns early when its existence check fails, and that check
+# reads ANY error -- a provider with no host, a 403, a timeout -- as "release
+# not found". On a cluster this state created that leak dies with the cluster
+# moments later, so this step only runs when the cluster outlives the destroy.
+# Uninstalled here, the provider's refresh finds the release gone and drops it
+# from state.
+#
+# Only releases this state installed, named from state rather than the
+# configuration: a cert-manager the cluster already ran is not in state and is
+# left alone. kube-agents goes first: its Certificate and Issuer are
+# cert-manager kinds, removed while cert-manager is still running. The
+# PlatformAgent's finalizer is already handled (delete_agent_cr), so the
+# chart's pre-delete hook is a no-op and --wait has nothing left to hang on.
+#
+# helm is not a prerequisite of uninstall.sh or of this script, so a host
+# without it is told and left to Terraform. A cluster that answered gcloud but
+# not Helm stops the destroy here, before Terraform has removed anything:
+# going on would report success over a release that is still running.
+uninstall_helm_releases() {
+  load_state
+  local addr addresses=()
+  for addr in "${CLUSTER_ADDRESSES[@]}"; do
+    in_state "$addr" && return 0
+  done
+  for addr in "$HELM_RELEASE_ADDRESS" "$CERT_MANAGER_RELEASE_ADDRESS"; do
+    in_state "$addr" && addresses+=("$addr")
+  done
+  [[ ${#addresses[@]} -gt 0 ]] || return 0
+
+  if ! command -v helm >/dev/null 2>&1; then
+    warn "helm is not installed; leaving the Helm releases to terraform destroy"
+    return 0
+  fi
+  if ! fetch_cluster_credentials; then
+    warn "could not fetch credentials for the cluster; if it still exists, the Helm releases"
+    warn "this state installed outlive the teardown and need a manual 'helm uninstall'"
+    return 0
+  fi
+
+  local name namespace output line
+  for addr in "${addresses[@]}"; do
+    if ! name=$(state_attr "$addr" name) || ! namespace=$(state_attr "$addr" namespace); then
+      warn "could not read $addr from state (terraform state show failed); re-run destroy, which is safe to re-run"
+      exit 1
+    fi
+    if [[ -z "$name" || -z "$namespace" ]]; then
+      warn "could not read the release name or namespace of $addr from state; leaving it to terraform destroy"
+      continue
+    fi
+    # --all: a release left pending-install or uninstalling is still one to
+    # remove, and the default listing hides it. Exit 0 with no line naming the
+    # release is "not there" (a warning on stderr is not a release); a non-zero
+    # exit is "could not ask". Checked first rather than passing
+    # --ignore-not-found, which older helm 3 releases lack.
+    if ! output=$(helm list --all --short --filter "^${name}\$" \
+                    -n "$namespace" --kube-context "$CLUSTER_CONTEXT" 2>&1); then
+      :
+    elif ! grep -qxF -- "$name" <<<"$output"; then
+      log "Helm release $namespace/$name is already gone"
+      continue
+    elif output=$(helm uninstall "$name" -n "$namespace" --kube-context "$CLUSTER_CONTEXT" \
+                    --wait --timeout "$HELM_UNINSTALL_TIMEOUT" 2>&1); then
+      log "uninstalled Helm release $namespace/$name"
+      continue
+    fi
+    warn "could not uninstall Helm release $namespace/$name from $CLUSTER_CONTEXT; helm said:"
+    while IFS= read -r line; do printf '     %s\n' "$line"; done <<<"$output" >&2
+    warn "This state did not create the cluster, so the release would outlive the teardown."
+    warn "Fix access to the cluster and re-run (destroy is safe to re-run), or remove it by hand:"
+    warn "  helm uninstall $name -n $namespace --kube-context $CLUSTER_CONTEXT --wait"
+    warn "If this host cannot get access back and the cluster's owner will remove the release, drop it"
+    warn "from this install's state instead and re-run destroy: in terraform/examples/full-install, with"
+    warn "the same KUBE_AGENTS_STATE_BUCKET as this run and after a plan has initialised that backend,"
+    warn "  terraform state rm '$addr'"
+    exit 1
+  done
 }
 
 purge_backups() {
@@ -1371,7 +1471,8 @@ case "${1:-}" in
     ensure_init
     # Confirm before the FIRST side effect, not at terraform's own prompt: by
     # the time `terraform destroy` asks, this script has already deleted the
-    # PlatformAgent CR, permanently deleted every backup the plan owns,
+    # PlatformAgent CR, uninstalled the Helm releases on a cluster this state
+    # did not create, permanently deleted every backup the plan owns,
     # cleared deletion_protection, and forgotten the KMS state entries — and
     # answering "no" there undoes none of it. One gate, up front; once passed,
     # -auto-approve is appended so terraform does not present a second gate
@@ -1381,6 +1482,7 @@ case "${1:-}" in
     if [[ "$auto" != "true" ]]; then
       warn "destroy starts with irreversible steps BEFORE terraform runs:"
       warn "  - delete the live PlatformAgent CR (force-clearing its finalizer if wedged)"
+      warn "  - on a cluster this state did not create, uninstall the Helm releases it installed"
       warn "  - permanently delete EVERY backup the backup plan owns"
       warn "  - clear the cluster's deletion protection"
       warn "  - forget the KMS resources from state (kept in GCP, re-adopted on apply)"
@@ -1396,6 +1498,7 @@ case "${1:-}" in
     # finalizer for terraform destroy to trip over.
     guard_release_namespace
     delete_agent_cr
+    uninstall_helm_releases
     purge_backups
     disable_deletion_protection
     forget_kms

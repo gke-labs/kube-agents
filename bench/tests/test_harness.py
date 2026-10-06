@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import shlex
 import subprocess
 import threading
 import time
@@ -23,7 +24,8 @@ from typing import Any
 import pytest
 
 from devops_bench.agents import AGENTS, AgentResult
-from kube_agents_bench import board, harness, transcript, worker_trajectory
+from kube_agents_bench import board, card_wake, harness, transcript, worker_trajectory
+from kube_agents_bench.verifiers import ReplayCardVerifier
 from kube_agents_bench.cases import CaseSpec
 from kube_agents_bench.harness import KubeAgentsHarness
 from kube_agents_bench.parsing import merge_new as _merge_new
@@ -3131,3 +3133,330 @@ def test_an_errored_run_still_stamps_a_start(
 
     assert result.has_errors()
     assert transcript.get().started_at > 0.0
+
+
+# --- The card-wake replays (kube_agents_bench.card_wake) ----------------------
+
+_REPLAY_PROMPT = """[bench:slack-question-wake]
+title: Check checkout-gateway's restarts
+question: Two clusters run checkout-gateway. Which should I look at?
+options: seeded-a | seeded-b
+answer: seeded-b
+"""
+_REPLAY_CARD = "t_5e1ec7ed"
+_REPLAY_WAKE = f"[kanban] Task {_REPLAY_CARD} blocked; needs attention."
+
+
+_REPLAY_SETTLED = {"status": "ready", "comments": [{"author": "default", "body": "seeded-b"}]}
+
+
+def _replay_shell(scripts: list[str], plant_reply: str | None = None):
+    """A stand-in for ``_agent_shell`` answering the plant and archive scripts."""
+    planted = json.dumps({"card": _REPLAY_CARD, "wake": _REPLAY_WAKE, "posted": 1, "error": None})
+    read = json.dumps({"card": _REPLAY_CARD, **_REPLAY_SETTLED, "error": None})
+    archived = json.dumps({"archived": True, "cards": [_REPLAY_CARD], "error": None})
+
+    def shell(script: str, timeout: float) -> str:
+        scripts.append(script)
+        if card_wake.REPLAY_PRESENT not in script:
+            return ""
+        if "create_task" in script:
+            return plant_reply if plant_reply is not None else f"{card_wake.REPLAY_PRESENT}\n{planted}"
+        if shlex.quote(card_wake._READ_SCRIPT) in script:
+            return f"{card_wake.REPLAY_PRESENT}\n{read}"
+        return f"{card_wake.REPLAY_PRESENT}\n{archived}"
+
+    return shell
+
+
+def _archived(scripts: list[str]) -> bool:
+    return any(shlex.quote(card_wake._ARCHIVE_SCRIPT) in s for s in scripts)
+
+
+def _answer_turn() -> bytes:
+    return _turn(
+        *_call("kanban_comment", {"task_id": _REPLAY_CARD, "body": "seeded-b"}, {"ok": True}, "c1"),
+        *_call("kanban_unblock", {"task_id": _REPLAY_CARD}, {"ok": True}, "c2"),
+        _text("Passed seeded-b to the card."),
+        usage={"input_tokens": 300, "output_tokens": 30, "total_tokens": 330},
+    )
+
+
+def test_a_question_wake_sends_the_wake_then_the_answer_on_one_conversation(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    stub_agent.turns = [_turn(_text("[SILENT]")), _answer_turn()]
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert not result.has_errors()
+    assert [r["input"] for r in stub_agent.requests] == [_REPLAY_WAKE, "seeded-b"]
+    assert stub_agent.requests[0]["conversation"] == stub_agent.requests[1]["conversation"]
+    assert result.output == "[SILENT]"
+    assert [s["name"] for s in result.trajectory] == ["kanban_comment", "kanban_unblock", card_wake.SETTLED_ENTRY]
+    assert result.trajectory[-1]["result"] == _REPLAY_SETTLED
+    check = ReplayCardVerifier(type="replay_card", status_not_in=["blocked"], comment_phrases=["seeded-b"])
+    assert check.verify(5.0).success
+    snap = transcript.get()
+    assert snap.final_message == "[SILENT]"
+    assert result.metadata["question_wake"]["answer_output"] == "Passed seeded-b to the card."
+    assert result.metadata["question_wake"]["settled"] == _REPLAY_SETTLED
+    assert _archived(scripts)
+
+
+def test_the_next_run_gets_a_fresh_conversation_after_a_question_wake(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell([]))
+    stub_agent.turns = [_turn(_text("[SILENT]")), _answer_turn(), json.dumps(_RESPONSE).encode()]
+
+    KubeAgentsHarness().run(_REPLAY_PROMPT)
+    KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    conversations = [r["conversation"] for r in stub_agent.requests]
+    assert conversations[0] == conversations[1] != conversations[2]
+
+
+def test_a_question_wake_that_cannot_be_planted_is_infrastructure(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell([], plant_reply=""))
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert result.output == ""
+    assert stub_agent.requests == []
+
+
+def test_a_question_wake_whose_plant_failed_in_the_image_is_an_error_not_infrastructure(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    broken = f'{card_wake.REPLAY_PRESENT}\n{{"error": "RuntimeError: posted nothing"}}'
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell([], plant_reply=broken))
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert result.has_errors()
+    assert not result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "posted nothing" in result.errors[0]
+    assert stub_agent.requests == []
+
+
+def test_a_question_wake_archives_its_card_when_the_wake_turn_errors(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    stub_agent.fail_with = 500
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert result.has_errors()
+    assert len(stub_agent.requests) == 1
+    assert _archived(scripts)
+    assert [s["name"] for s in result.trajectory][-1] == card_wake.SETTLED_ENTRY
+    assert "question_wake" in result.metadata and "failure_wake" not in result.metadata
+
+
+def test_a_question_wake_missing_its_answer_errors_without_planting(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT.replace("answer: seeded-b\n", ""))
+
+    assert result.errors == [f"{card_wake.QUESTION_DIRECTIVE} prompt is missing answer"]
+    assert scripts == []
+    assert stub_agent.requests == []
+
+
+_FAILURE_PROMPT = """[bench:card-failure-wake]
+title: Restart checkout-gateway on seeded-a
+body: Roll the checkout-gateway Deployment on seeded-a.
+outcome: blocked
+reason: Permission denied: container.deployments.update on seeded-a.
+"""
+
+
+def test_a_failure_wake_is_the_runs_only_turn_and_its_reply_is_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    stub_agent.turns = [
+        _turn(
+            *_call("kanban_show", {"task_id": _REPLAY_CARD}, {"status": "blocked"}, "c1"),
+            _text("I couldn't restart checkout-gateway on seeded-a."),
+        )
+    ]
+
+    result = KubeAgentsHarness().run(_FAILURE_PROMPT)
+
+    assert not result.has_errors()
+    assert [r["input"] for r in stub_agent.requests] == [_REPLAY_WAKE]
+    assert result.output == "I couldn't restart checkout-gateway on seeded-a."
+    assert [s["name"] for s in result.trajectory] == ["kanban_show", card_wake.SETTLED_ENTRY]
+    assert result.trajectory[-1]["result"] == _REPLAY_SETTLED
+    assert transcript.get().final_message == "I couldn't restart checkout-gateway on seeded-a."
+    assert result.metadata["failure_wake"]["card"] == _REPLAY_CARD
+    assert result.metadata["failure_wake"]["settled"] == _REPLAY_SETTLED
+    assert _archived(scripts)
+
+
+def test_a_failure_wake_that_errors_keeps_its_card_and_wake_and_archives_the_card(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    stub_agent.fail_with = 500
+
+    result = KubeAgentsHarness().run(_FAILURE_PROMPT)
+
+    assert result.has_errors()
+    assert result.metadata["failure_wake"]["card"] == _REPLAY_CARD
+    assert result.metadata["failure_wake"]["wake"] == _REPLAY_WAKE
+    assert _archived(scripts)
+
+
+def test_a_failure_wake_whose_breaker_disagrees_is_an_errored_run_not_infrastructure(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    mismatch = json.dumps(
+        {"card": None, "wake": None, "posted": 0, "error": None,
+         "mismatch": "BreakerMismatch: card t_1 tripped its failure breaker"}
+    )
+    reply = f"{card_wake.REPLAY_PRESENT}\n{mismatch}"
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell([], plant_reply=reply))
+
+    result = KubeAgentsHarness().run(_FAILURE_PROMPT)
+
+    assert result.errors == ["failure wake: BreakerMismatch: card t_1 tripped its failure breaker"]
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert stub_agent.requests == []
+
+
+def test_a_failure_wake_whose_script_reports_an_error_is_an_errored_run_not_infrastructure(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    failed = json.dumps(
+        {"card": None, "wake": None, "posted": 0, "error": "AttributeError: no build_wake_text",
+         "mismatch": None}
+    )
+    reply = f"{card_wake.REPLAY_PRESENT}\n{failed}"
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell([], plant_reply=reply))
+
+    result = KubeAgentsHarness().run(_FAILURE_PROMPT)
+
+    assert result.errors == ["failure wake: AttributeError: no build_wake_text"]
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert stub_agent.requests == []
+
+
+def test_a_failure_wake_needs_the_api_transport(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    monkeypatch.setenv("AGENT_TRANSPORT", "inject")
+
+    result = KubeAgentsHarness().run(_FAILURE_PROMPT)
+
+    assert result.errors == [f"{card_wake.FAILURE_DIRECTIVE} needs AGENT_TRANSPORT=api, got 'inject'"]
+    assert scripts == []
+
+
+# --- The fresh-session question replay (session: fresh) ----------------------
+
+_FRESH_PROMPT = _REPLAY_PROMPT + "session: fresh\n"
+_FRESH_DECOY = "t_dec0y000"
+_FRESH_POST = {"text": "Two clusters run checkout-gateway. Which should I look at?", "blocks": []}
+_FRESH_CONTEXT = "[Thread context — prior messages in this thread (not yet in conversation history):]\n...\n[End of thread context]\n"
+_FRESH_SETTLED = {**_REPLAY_SETTLED, "decoy_status": "blocked"}
+
+
+def _fresh_shell(scripts: list[str], context_reply: str | None = None):
+    """``_replay_shell`` for a fresh-session replay: a decoy, a post, and the context script."""
+    planted = json.dumps(
+        {"card": _REPLAY_CARD, "decoy": _FRESH_DECOY, "wake": _REPLAY_WAKE, "posted": 1, "post": _FRESH_POST, "error": None}
+    )
+    read = json.dumps({"card": _REPLAY_CARD, **_FRESH_SETTLED, "error": None})
+    archived = json.dumps({"archived": True, "cards": [_REPLAY_CARD, _FRESH_DECOY], "error": None})
+    context = json.dumps({"context": _FRESH_CONTEXT, "error": None})
+
+    def shell(script: str, timeout: float) -> str:
+        scripts.append(script)
+        if "create_task" in script:
+            return f"{card_wake.REPLAY_PRESENT}\n{planted}"
+        if shlex.quote(card_wake._CONTEXT_SCRIPT) in script:
+            return context_reply if context_reply is not None else f"{card_wake.REPLAY_PRESENT}\n{context}"
+        if shlex.quote(card_wake._READ_SCRIPT) in script:
+            return f"{card_wake.REPLAY_PRESENT}\n{read}"
+        return f"{card_wake.REPLAY_PRESENT}\n{archived}"
+
+    return shell
+
+
+def _context_messages(scripts: list[str]) -> list[dict]:
+    command = next(s for s in scripts if shlex.quote(card_wake._CONTEXT_SCRIPT) in s)
+    return json.loads(shlex.split(command)[-1])
+
+
+def test_a_fresh_session_replay_sends_the_answer_on_a_new_conversation_after_the_thread(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _fresh_shell(scripts))
+    stub_agent.turns = [_turn(_text("[SILENT]")), _answer_turn()]
+
+    result = KubeAgentsHarness().run(_FRESH_PROMPT)
+
+    assert not result.has_errors()
+    wake, answer = stub_agent.requests
+    assert wake["input"] == _REPLAY_WAKE
+    assert answer["input"] == (
+        f"{_FRESH_CONTEXT}\n\n[New message]\n[bench-user | Slack user <@UBENCHASKER>] seeded-b"
+    )
+    assert wake["conversation"] != answer["conversation"]
+    # The silent wake reply is not in the thread: the gateway posts nothing for it.
+    messages = _context_messages(scripts)
+    assert [m.get("text") for m in messages] == ["Check checkout-gateway's restarts", _FRESH_POST["text"]]
+    assert result.trajectory[-1]["result"] == _FRESH_SETTLED
+    assert result.metadata["question_wake"]["decoy"] == _FRESH_DECOY
+    check = ReplayCardVerifier(type="replay_card", status_not_in=["blocked"], decoy_status_in=["blocked"])
+    assert check.verify(5.0).success
+    assert _archived(scripts)
+
+
+def test_a_fresh_session_replay_puts_a_posted_wake_reply_in_the_thread(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _fresh_shell(scripts))
+    stub_agent.turns = [_turn(_text("Which cluster: seeded-a or seeded-b?")), _answer_turn()]
+
+    KubeAgentsHarness().run(_FRESH_PROMPT)
+
+    messages = _context_messages(scripts)
+    assert messages[-1]["text"] == "Which cluster: seeded-a or seeded-b?"
+    assert messages[-1]["user"] == card_wake.STUB_BOT
+
+
+def test_a_fresh_session_replay_whose_context_failed_in_the_image_sends_no_answer(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    broken = f'{card_wake.REPLAY_PRESENT}\n{{"error": "ImportError: no adapter"}}'
+    monkeypatch.setattr(harness, "_agent_shell", _fresh_shell(scripts, context_reply=broken))
+    stub_agent.turns = [_turn(_text("[SILENT]"))]
+
+    result = KubeAgentsHarness().run(_FRESH_PROMPT)
+
+    assert result.has_errors()
+    assert "no adapter" in result.errors[0]
+    assert not result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert len(stub_agent.requests) == 1
+    assert _archived(scripts)

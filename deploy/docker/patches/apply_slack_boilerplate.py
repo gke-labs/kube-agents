@@ -36,8 +36,8 @@ provider error reply and interrupting notice (``run_shutdown``'s
 ``_send_notice_logged``) passes on the way to Slack, and
 ``SlackAdapter.edit_message`` does the
 same once its outbound check passes, for a reply that arrives as a streamed or
-edited message. Runs after
-``apply_slack_ux_reactions.py``, which leaves ``send`` alone.
+edited message. Runs after the other adapter patches (reactions, status,
+clicks), none of which touch ``send`` or ``edit_message``.
 
 With the flag off every helper returns its input unchanged, so the calls are
 upstream's. What the flag changes, and why, is in the module docstring of

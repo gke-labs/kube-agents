@@ -13,25 +13,47 @@ import {
   ARTIFACT_PROGRESS,
   ARTIFACT_RESULT,
   TERMINAL_STATES,
+  authorityOf,
   partsText,
   type Artifact,
   type ArtifactUpdate,
   type Envelope,
-  type Kind,
   type Message,
   type StatusUpdate,
   type SubjectInfo,
   type TaskState,
 } from "./protocol.ts";
+import { turnFate, type ConsoleOutFrame } from "./console.ts";
 
-/** The rail tap for this browser. Not an agent; it reports the websocket. */
-export const WEB_SESSION = "you";
 /** The chatops gateway's session name (a2a/gateway/gateway.go). */
 export const GATEWAY_SESSION = "gateway";
 /** No traffic for longer than this and a standing agent reads as idle. */
 export const IDLE_MS = 60_000;
-/** The rail only ever animates a recent window of traffic. */
-export const MAX_PULSES = 200;
+/** A sent turn with no submission on TASKS after this long gets a note. */
+export const PENDING_STALE_MS = 30_000;
+/**
+ * A pending turn this old leaves the attach set; its line keeps its note.
+ * Some turns never become a task (a status question, a refusal, a dropped
+ * frame) and the page cannot tell which, so without a bound they would sit
+ * in `pending` for the life of the tab.
+ */
+export const PENDING_EXPIRE_MS = 10 * 60_000;
+/** Local lines (command output) share one correlation group. */
+export const LOCAL_CORRELATION = "local";
+const STALE_NOTE_GATEWAY =
+  "no task on the bus for this turn yet. Status questions and refused turns are answered by a gateway notice instead of a task; if no notice came, the gateway may be slow or may have dropped it";
+/**
+ * The link itself was down when this fired, so the gateway is not the likely
+ * cause the way `STALE_NOTE_GATEWAY` implies — this turn may never have left
+ * the browser at all.
+ */
+const STALE_NOTE_LINK_DOWN =
+  "no submission on the bus 30s after sending, and the bus link is down right now - that is the likely reason this turn never showed up";
+
+/** Picks the stale note by whether the link is up, so it never blames the gateway for a loss the link itself caused. */
+function staleNote(connection: ConnectionState): string {
+  return connection === "up" ? STALE_NOTE_GATEWAY : STALE_NOTE_LINK_DOWN;
+}
 
 export type AgentStatus = "active" | "idle" | "done" | "closed";
 
@@ -77,6 +99,66 @@ export interface TaskView {
   artifacts: Map<string, ArtifactView>;
   /** ms since epoch of the last event, from envelope ts. */
   lastEventAt: number;
+  /** authority.requester.backend on the submission, when it carried one. */
+  backend?: string;
+  /** authority.audience.conversation on the submission. */
+  conversation?: string;
+  /** ms, envelope ts of the submission. */
+  askAt?: number;
+  /** ms, envelope ts of the first status-update from anyone but the gateway. */
+  firstStatusAt?: number;
+  /** An executor published `submitted` for this task. Both executors do. */
+  sawSubmitted?: boolean;
+  /** ms, envelope ts of the event that first made the task terminal. */
+  endedAt?: number;
+  /** The message text on that terminal status: why the task ended. */
+  reason?: string;
+}
+
+export interface AnomalyCounts {
+  /** `to` disagreed with the subject's addressee. */
+  addressee: number;
+  /** An event arrived after the task's final one. */
+  postFinal: number;
+  /** A task went terminal without its executor ever saying `submitted`. */
+  missingSubmitted: number;
+}
+
+export interface ConversationView {
+  conversation: string;
+  backend: string;
+  /** ms, envelope ts of the newest turn. */
+  lastSeen: number;
+  turns: number;
+}
+
+export interface TopicView {
+  key: string;
+  topic: string;
+  owner?: string;
+  summary: string;
+  /** ms, envelope ts. */
+  at: number;
+  publisher: string;
+}
+
+/** ms from the ask to the executor's first status, once both are known. */
+export function queueMs(t: TaskView): number | undefined {
+  if (t.askAt === undefined || t.firstStatusAt === undefined) return undefined;
+  return Math.max(0, t.firstStatusAt - t.askAt);
+}
+
+/** ms from the executor's first status (or the ask) to the terminal event. */
+export function durationMs(t: TaskView): number | undefined {
+  const start = t.firstStatusAt ?? t.askAt;
+  if (t.endedAt === undefined || start === undefined) return undefined;
+  return Math.max(0, t.endedAt - start);
+}
+
+/** One key per topic subject: the owner's name scopes agent topics. */
+export function topicKey(subject: SubjectInfo, fallback: string): string {
+  if (subject.plane !== "topics") return fallback;
+  return subject.owner !== undefined ? `${subject.owner}/${subject.topic}` : subject.topic;
 }
 
 export type ChatKind =
@@ -87,7 +169,15 @@ export type ChatKind =
   | "status"
   | "topic"
   | "cancel"
-  | "anomaly";
+  | "anomaly"
+  /** Sent from this page, not yet seen on TASKS. */
+  | "pending"
+  /** Sent from this page and settled at once: the gateway never makes a task of it (a stop word, a bare `/session`). */
+  | "sent"
+  /** A frame the gateway posted on this conversation's `.out` subject. */
+  | "notice"
+  /** Produced by the page itself: command output, a send that never left. */
+  | "local";
 
 export interface ChatEntry {
   id: string;
@@ -96,15 +186,8 @@ export interface ChatEntry {
   text: string;
   correlationId: string;
   taskId?: string;
-}
-
-export interface Pulse {
-  /** Monotonically increasing; the rail's animation loop uses it as a watermark. */
-  id: number;
-  fromSession: string;
-  correlationId: string;
-  kind: Kind;
-  at: number;
+  /** A sentence about the entry's delivery, shown under it. */
+  note?: string;
 }
 
 export type ProbeOutcome = "refused" | "sent" | "error";
@@ -115,11 +198,77 @@ export interface ProbeResult {
   at: number;
 }
 
+/** One CONSUMER.INFO answer for a durable the page knows a session by. */
+export interface LivenessReport {
+  session: string;
+  durable: string;
+  stream: string;
+  /** The consumer exists only while its worker runs a task. */
+  perTask: boolean;
+  found: boolean;
+  /** Pull requests outstanding: a process is waiting on the consumer right now. */
+  waiting: number;
+  pending: number;
+  /** ms, the consumer's last delivery. */
+  lastActive?: number;
+  /** Set when the lookup itself failed (not for not-found). */
+  error?: string;
+  checkedAt: number;
+}
+
+export interface StreamStat {
+  bytes: number;
+  /** -1 or 0 means unlimited. */
+  maxBytes: number;
+  msgs: number;
+  consumers: number;
+  /** -1 or 0 means unlimited. */
+  maxConsumers: number;
+  /** ms, the oldest retained message. */
+  firstTs?: number;
+  /** 0 means no age limit. */
+  maxAgeMs: number;
+}
+
+export interface StreamStatView {
+  stat: StreamStat | null;
+  error?: string;
+  at: number;
+}
+
+export interface StreamAttachView {
+  /** null while attached. */
+  error: string | null;
+  /** ms, when the current state (attached, or failing) began. */
+  since: number;
+}
+
+export interface PendingTurn {
+  messageId: string;
+  /** Trimmed, exactly as sent. */
+  text: string;
+  /**
+   * The texts the gateway's submission may carry for this turn: the sent
+   * text, plus the stripped task of a `delegate` or `/session` turn
+   * (console.ts turnFate).
+   */
+  texts: string[];
+  conversation: string;
+  at: number;
+  stale: boolean;
+  /**
+   * A gateway notice reached this conversation after the turn was sent.  It
+   * only words the stale note: the turn may have been answered by a notice
+   * (a full queue, a refusal) rather than dropped.  It does not rank the turn
+   * (pendingMatch says why).
+   */
+  noticed: boolean;
+}
+
 export interface UiState {
   agents: Map<string, AgentView>;
   tasks: Map<string, TaskView>;
   chat: ChatEntry[];
-  pulses: Pulse[];
   streamMsgCount: number;
   connection: ConnectionState;
   /** JetStream taps attached, out of `streamsTotal`. */
@@ -127,6 +276,18 @@ export interface UiState {
   streamsTotal: number;
   /** Latest read-only probe result, if one was run. */
   probe?: ProbeResult;
+  /** Live envelopes seen per `from.agentType`. The strip's LED keys off it. */
+  typePulses: Map<string, number>;
+  anomalies: AnomalyCounts;
+  conversations: Map<string, ConversationView>;
+  topics: Map<string, TopicView>;
+  /** The last tick's wall clock, ms. Zero until the first tick. */
+  now: number;
+  liveness: Map<string, LivenessReport>;
+  streamStats: Map<string, StreamStatView>;
+  streamAttach: Map<string, StreamAttachView>;
+  pending: PendingTurn[];
+  localSeq: number;
 }
 
 export type BusEvent =
@@ -135,22 +296,43 @@ export type BusEvent =
   | { type: "tick"; now: number }
   | { type: "connection"; state: ConnectionState }
   | { type: "streams"; up: number; total: number }
-  | { type: "probe"; result: ProbeResult };
+  | { type: "probe"; result: ProbeResult }
+  | { type: "liveness"; report: LivenessReport }
+  | { type: "streamStat"; name: string; stat: StreamStat | null; error?: string; at: number }
+  | { type: "streamAttach"; stream: string; error: string | null; at: number }
+  | { type: "consoleSent"; messageId: string; text: string; conversation: string; at: number }
+  /**
+   * unconfirmed: the publish may have landed (the flush timed out), so the
+   * turn stays pending and still attaches if its submission arrives.
+   */
+  | { type: "sendFailed"; messageId: string; error: string; unconfirmed?: boolean }
+  | { type: "notice"; frame: ConsoleOutFrame; conversation: string; at: number }
+  | { type: "local"; text: string; at: number }
+  | { type: "clear" };
 
 export const initialState: UiState = {
   agents: new Map(),
   tasks: new Map(),
   chat: [],
-  pulses: [],
   streamMsgCount: 0,
   connection: "connecting",
   streamsUp: 0,
   streamsTotal: 0,
+  typePulses: new Map(),
+  anomalies: { addressee: 0, postFinal: 0, missingSubmitted: 0 },
+  conversations: new Map(),
+  topics: new Map(),
+  now: 0,
+  liveness: new Map(),
+  streamStats: new Map(),
+  streamAttach: new Map(),
+  pending: [],
+  localSeq: 0,
 };
 
 /**
  * Correlation ids get a stable hue so one conversational thread reads as one
- * colour everywhere — chat chips, rail pulses, replay strips. FNV-1a keeps
+ * colour everywhere — chat chips, task rows, transcripts. FNV-1a keeps
  * neighbouring uuids far apart in hue space.
  */
 export function corrColor(corrId: string): string {
@@ -166,8 +348,13 @@ function isTerminal(state: TaskState): boolean {
   return TERMINAL_STATES.includes(state);
 }
 
-function tsMs(env: Envelope): number {
-  return Date.parse(env.ts) || 0;
+/**
+ * The envelope's ts in epoch ms, or undefined when it does not parse.  An
+ * unparseable ts must not read as 1970: queue and run times subtract these.
+ */
+function tsMs(env: Envelope): number | undefined {
+  const ms = Date.parse(env.ts);
+  return Number.isNaN(ms) ? undefined : ms;
 }
 
 function withAgent(
@@ -183,7 +370,7 @@ function withAgent(
 }
 
 /**
- * Every session heard from is a tap on the rail; traffic alone earns one.
+ * Every session heard from becomes an agent entry; traffic alone earns one.
  * Liveness uses the browser's receive clock for live traffic — a publisher
  * whose clock runs behind must not read as idle while it is streaming — and
  * the envelope's own ts for replayed history, which really is old.
@@ -200,7 +387,7 @@ function touchAgent(state: UiState, env: Envelope, live: boolean, at: number): M
     statusLine: prev?.statusLine,
     perTask: prev?.perTask,
     status: prev?.status === "closed" ? "closed" : "active",
-    lastActivity: Math.max(prev?.lastActivity ?? 0, live ? at : tsMs(env)),
+    lastActivity: Math.max(prev?.lastActivity ?? 0, live ? at : (tsMs(env) ?? 0)),
   });
   return agents;
 }
@@ -230,7 +417,7 @@ function upsertTask(
   next.set(env.taskId, {
     ...base,
     ...patch,
-    lastEventAt: Math.max(base.lastEventAt, tsMs(env)),
+    lastEventAt: Math.max(base.lastEventAt, tsMs(env) ?? 0),
   });
   return next;
 }
@@ -271,22 +458,104 @@ function appendChunk(
   return merged;
 }
 
-function reduceMessage(next: UiState, state: UiState, env: Envelope, subject: SubjectInfo): void {
+function reduceMessage(
+  next: UiState,
+  state: UiState,
+  env: Envelope,
+  subject: SubjectInfo,
+  live: boolean,
+): void {
   const payload = env.payload as Message;
   const text = partsText(payload.parts);
   const known = state.tasks.get(env.taskId ?? "");
-  // The first message on a task subject is the submission — the user's ask,
+  const authority = authorityOf(env);
+  // The first message on a task subject is the submission - the user's ask,
   // echoed from the stream so the transcript never trusts local state. A
   // later message on the same task is steering or follow-up input.
   const isSubmission = known === undefined;
-  next.tasks = upsertTask(state.tasks, env, subject, isSubmission ? {} : undefined);
-  next.chat = pushChat(state, env, {
+  next.tasks = upsertTask(
+    state.tasks,
+    env,
+    subject,
+    isSubmission
+      ? { backend: authority.backend, conversation: authority.conversation, askAt: tsMs(env) }
+      : undefined,
+  );
+  const entry: Omit<ChatEntry, "id"> = {
     kind: isSubmission ? "user" : "steer",
     session: env.from.session,
     text,
     correlationId: env.correlationId,
     taskId: env.taskId,
-  });
+  };
+  // A turn this page sent attaches in place: same id, now carrying the
+  // task's correlation. Live traffic always matches. Non-live traffic
+  // matches too, but only a pending turn sent before the envelope's own ts:
+  // a tap re-attach between the send and the submission re-snapshots
+  // lastSeqAtConnect after the submission has already landed, so a turn this
+  // tab really did just send can replay as non-live. Genuinely old history
+  // (from before this page connected) has a ts before any pending turn's
+  // send time, so it still can't match. FIFO within a conversation, so two
+  // identical texts attach in order. Two things outrank age. A turn sent
+  // with exactly this text beats one that only strips to it (a delegate
+  // candidate must not take a plain retry's task). And a turn that has gone
+  // stale ranks below one that has not: it may be a turn the gateway
+  // dropped, and the same words sent again must attach to the resend. A
+  // notice does not demote a turn, because the gateway posts its "submitted"
+  // placeholder as a notice before it publishes the submission, so every
+  // ordinary turn is noticed before its own submission lands.
+  const match =
+    authority.conversation !== undefined
+      ? pendingMatch(state.pending, authority.conversation, text, live, tsMs(env))
+      : -1;
+  if (match >= 0) {
+    const turn = state.pending[match];
+    next.pending = state.pending.filter((_, i) => i !== match);
+    const id = `pending:${turn.messageId}`;
+    const at = state.chat.findIndex((c) => c.id === id);
+    if (at >= 0) {
+      const chat = [...state.chat];
+      chat[at] = { id, ...entry };
+      next.chat = chat;
+    } else {
+      next.chat = pushChat(state, env, entry);
+    }
+  } else {
+    next.chat = pushChat(state, env, entry);
+  }
+
+  if (authority.conversation !== undefined) {
+    const prev = state.conversations.get(authority.conversation);
+    const conversations = new Map(state.conversations);
+    conversations.set(authority.conversation, {
+      conversation: authority.conversation,
+      backend: authority.backend ?? prev?.backend ?? "unknown",
+      lastSeen: Math.max(prev?.lastSeen ?? 0, tsMs(env) ?? 0),
+      turns: (prev?.turns ?? 0) + 1,
+    });
+    next.conversations = conversations;
+  }
+}
+
+function pendingMatch(
+  pending: PendingTurn[],
+  conversation: string,
+  text: string,
+  live: boolean,
+  ts: number | undefined,
+): number {
+  let best = -1;
+  let bestRank = Infinity;
+  for (let i = 0; i < pending.length; i++) {
+    const p = pending[i];
+    if (p.conversation !== conversation || !p.texts.includes(text) || !(live || (ts !== undefined && p.at < ts))) continue;
+    const rank = (p.stale ? 2 : 0) + (p.text === text ? 0 : 1);
+    if (rank < bestRank) {
+      best = i;
+      bestRank = rank;
+    }
+  }
+  return best;
 }
 
 function reduceStatusUpdate(
@@ -298,15 +567,37 @@ function reduceStatusUpdate(
   const payload = env.payload as StatusUpdate;
   const taskState = payload.status?.state ?? "working";
   const final = payload.final === true;
+  const prev = state.tasks.get(env.taskId ?? "");
+  const fromExecutor = env.from.session !== GATEWAY_SESSION;
+  const ts = tsMs(env);
+  const terminal = final || isTerminal(taskState);
+  // A terminal with an unparseable ts leaves endedAt unset, so "already
+  // ended" also reads the state the task is in.
+  const ended = prev !== undefined && (prev.endedAt !== undefined || prev.final || isTerminal(prev.state));
+  const firstTerminal = terminal && !ended;
+  const note = partsText(payload.status?.message?.parts);
+  const sawSubmitted = prev?.sawSubmitted === true || (fromExecutor && taskState === "submitted");
   next.tasks = upsertTask(state.tasks, env, subject, {
     state: taskState,
     final,
-    executor: state.tasks.get(env.taskId ?? "")?.executor ?? env.from.session,
+    executor: prev?.executor ?? env.from.session,
+    firstStatusAt: prev?.firstStatusAt ?? (fromExecutor ? ts : undefined),
+    sawSubmitted,
+    endedAt: prev?.endedAt ?? (terminal ? ts : undefined),
+    reason: firstTerminal && note !== "" ? note : prev?.reason,
   });
+  // Both executors publish `submitted` before anything else. A task that
+  // ended without one skipped a step the spec requires. Counted once, on the
+  // event that first makes it terminal, and only for tasks whose submission
+  // this page saw (a task first seen mid-flight proves nothing). A terminal
+  // the gateway published as supervisor (a spawn that never started, a
+  // cancel) is not the executor skipping a step.
+  if (firstTerminal && fromExecutor && prev?.askAt !== undefined && !sawSubmitted) {
+    next.anomalies = { ...next.anomalies, missingSubmitted: next.anomalies.missingSubmitted + 1 };
+  }
 
   // A status that carries a message (input-required's question, a supervisor's
   // reason) belongs in the transcript.
-  const note = partsText(payload.status?.message?.parts);
   if (note !== "") {
     next.chat = pushChat(state, env, {
       kind: "status",
@@ -326,6 +617,15 @@ function reduceStatusUpdate(
     const agent = next.agents.get(session);
     if (agent && agent.status !== "closed" && agent.perTask) {
       next.agents = withAgent(next.agents, session, { status: "done" });
+      // Its `-in` consumer is gone the moment it retires (durablesFor stops
+      // polling it), so the last reading is stale the instant it is taken.
+      // Dropping it here is belt-and-braces: livenessOf already reads the
+      // agent's status and never shows a retired session as live.
+      if (next.liveness.has(session)) {
+        const liveness = new Map(next.liveness);
+        liveness.delete(session);
+        next.liveness = liveness;
+      }
     }
   }
 }
@@ -377,8 +677,8 @@ function reduceArtifactUpdate(
     });
     next.agents = withAgent(next.agents, env.from.session, { statusLine: text });
   }
-  // thinking/activity stay out of the transcript; they still pulse the rail
-  // and count on the task for replay.
+  // thinking/activity stay out of the transcript; they still count toward the
+  // type's activity LED and count on the task for replay.
 }
 
 /**
@@ -388,17 +688,26 @@ function reduceArtifactUpdate(
  * addressee (assertion 4), and any event after the task's `final` one
  * (assertion 10).
  */
-function anomalyOf(state: UiState, env: Envelope, subject: SubjectInfo): string | null {
+type AnomalyKind = "addressee" | "postFinal";
+
+function anomalyOf(
+  state: UiState,
+  env: Envelope,
+  subject: SubjectInfo,
+): { kind: AnomalyKind; text: string } | null {
   if (
     subject.plane === "tasks" &&
     env.to?.session !== undefined &&
     env.to.session !== subject.addressee
   ) {
-    return `envelope addressed to "${env.to.session}" on ${subject.addressee}'s subject`;
+    return {
+      kind: "addressee",
+      text: `envelope addressed to "${env.to.session}" on ${subject.addressee}'s subject`,
+    };
   }
   const task = env.taskId ? state.tasks.get(env.taskId) : undefined;
   if (task?.final && (env.kind === "status-update" || env.kind === "artifact-update")) {
-    return `${env.kind} after the task's final event`;
+    return { kind: "postFinal", text: `${env.kind} after the task's final event` };
   }
   return null;
 }
@@ -414,24 +723,22 @@ function reduceEnvelope(
   const anomaly = anomalyOf(state, env, subject);
 
   if (live) {
-    const pulse: Pulse = {
-      id: next.streamMsgCount,
-      fromSession: env.from.session,
-      correlationId: env.correlationId,
-      kind: env.kind,
-      at: tsMs(env),
-    };
-    const pulses = [...state.pulses, pulse];
-    next.pulses = pulses.length > MAX_PULSES ? pulses.slice(pulses.length - MAX_PULSES) : pulses;
+    const type = env.from.agentType;
+    if (type !== undefined && type !== "") {
+      const typePulses = new Map(state.typePulses);
+      typePulses.set(type, (typePulses.get(type) ?? 0) + 1);
+      next.typePulses = typePulses;
+    }
   }
 
   // An anomalous envelope is reported and not folded: it must not revive a
   // retired agent, retune a finished task, or append to an answer.
   if (anomaly !== null) {
+    next.anomalies = { ...state.anomalies, [anomaly.kind]: state.anomalies[anomaly.kind] + 1 };
     next.chat = pushChat(state, env, {
       kind: "anomaly",
       session: env.from.session,
-      text: `${anomaly} (${env.kind}, ${env.envelopeId})`,
+      text: `${anomaly.text} (${env.kind}, ${env.envelopeId})`,
       correlationId: env.correlationId,
       taskId: env.taskId,
     });
@@ -443,7 +750,7 @@ function reduceEnvelope(
 
   switch (env.kind) {
     case "message":
-      reduceMessage(next, touched, env, subject);
+      reduceMessage(next, touched, env, subject, live);
       break;
 
     case "status-update":
@@ -478,7 +785,7 @@ function reduceEnvelope(
         agentType: prev?.agentType ?? "profile",
         profile: key,
         status: prev?.status === "closed" ? "active" : (prev?.status ?? "idle"),
-        lastActivity: Math.max(prev?.lastActivity ?? 0, tsMs(env)),
+        lastActivity: Math.max(prev?.lastActivity ?? 0, tsMs(env) ?? 0),
         statusLine: prev?.statusLine,
         perTask: prev?.perTask,
       });
@@ -506,11 +813,54 @@ function reduceEnvelope(
         correlationId: env.correlationId,
         taskId: env.taskId,
       });
+      // No DIRECT.GET on these grants, so "latest" is the newest envelope ts
+      // seen per subject. A replay arriving after a live update never wins.
+      const key = topicKey(subject, topic);
+      const prevTopic = touched.topics.get(key);
+      const topicAt = tsMs(env);
+      if (prevTopic === undefined || (topicAt !== undefined && topicAt >= prevTopic.at)) {
+        const topics = new Map(touched.topics);
+        topics.set(key, {
+          key,
+          topic,
+          owner: subject.plane === "topics" ? subject.owner : undefined,
+          summary,
+          at: topicAt ?? 0,
+          publisher: env.from.session,
+        });
+        next.topics = topics;
+      }
       break;
     }
   }
 
   return next;
+}
+
+function withEntry(chat: ChatEntry[], id: string, patch: Partial<ChatEntry>): ChatEntry[] {
+  const at = chat.findIndex((c) => c.id === id);
+  if (at < 0) return chat;
+  const next = [...chat];
+  next[at] = { ...chat[at], ...patch };
+  return next;
+}
+
+/**
+ * Marks pending turns that have waited too long, and drops the ones past
+ * PENDING_EXPIRE_MS from the attach set. Returns null if none changed.
+ */
+function staleTurns(state: UiState, now: number): Pick<UiState, "pending" | "chat"> | null {
+  let chat = state.chat;
+  let changed = false;
+  const marked = state.pending.map((p) => {
+    if (p.stale || now - p.at <= PENDING_STALE_MS) return p;
+    changed = true;
+    chat = withEntry(chat, `pending:${p.messageId}`, { note: staleNote(state.connection) });
+    return { ...p, stale: true };
+  });
+  const pending = marked.filter((p) => now - p.at <= PENDING_EXPIRE_MS);
+  if (pending.length !== marked.length) changed = true;
+  return changed ? { pending, chat } : null;
 }
 
 export function reduce(state: UiState, event: BusEvent): UiState {
@@ -529,7 +879,12 @@ export function reduce(state: UiState, event: BusEvent): UiState {
         agents ??= new Map(state.agents);
         agents.set(session, { ...agent, status: want });
       }
-      return agents ? { ...state, agents } : state;
+      return {
+        ...state,
+        now: event.now,
+        ...(agents ? { agents } : {}),
+        ...(staleTurns(state, event.now) ?? {}),
+      };
     }
 
     case "connection":
@@ -542,5 +897,105 @@ export function reduce(state: UiState, event: BusEvent): UiState {
 
     case "probe":
       return { ...state, probe: event.result };
+
+    case "liveness": {
+      const liveness = new Map(state.liveness);
+      liveness.set(event.report.session, event.report);
+      return { ...state, liveness };
+    }
+
+    case "streamStat": {
+      const streamStats = new Map(state.streamStats);
+      streamStats.set(event.name, { stat: event.stat, error: event.error, at: event.at });
+      return { ...state, streamStats };
+    }
+
+    case "streamAttach": {
+      const prev = state.streamAttach.get(event.stream);
+      // While failing, keep when the failure started, so the panel can say
+      // "not attached since 12:04" rather than restarting the clock every retry.
+      const since =
+        event.error !== null && prev !== undefined && prev.error !== null ? prev.since : event.at;
+      const streamAttach = new Map(state.streamAttach);
+      streamAttach.set(event.stream, { error: event.error, since });
+      return { ...state, streamAttach };
+    }
+
+    case "consoleSent": {
+      const fate = turnFate(event.text);
+      if (fate.kind === "settled") {
+        // No branch of the gateway makes a task of this turn, so there is
+        // nothing to wait for: its answer, if any, is a notice.
+        const id = `sent:${event.messageId}`;
+        return { ...state, chat: [...state.chat, { id, kind: "sent", text: event.text, correlationId: id }] };
+      }
+      const id = `pending:${event.messageId}`;
+      return {
+        ...state,
+        pending: [
+          ...state.pending,
+          {
+            messageId: event.messageId,
+            text: event.text,
+            texts: fate.texts,
+            conversation: event.conversation,
+            at: event.at,
+            stale: false,
+            noticed: false,
+          },
+        ],
+        chat: [...state.chat, { id, kind: "pending", text: event.text, correlationId: id }],
+      };
+    }
+
+    case "sendFailed": {
+      const failed = { kind: "local" as const, note: `${event.unconfirmed ? "unconfirmed" : "not sent"}: ${event.error}` };
+      return {
+        ...state,
+        pending: event.unconfirmed ? state.pending : state.pending.filter((p) => p.messageId !== event.messageId),
+        chat: withEntry(withEntry(state.chat, `pending:${event.messageId}`, failed), `sent:${event.messageId}`, failed),
+      };
+    }
+
+    case "notice": {
+      const id = `notice:${event.frame.messageId}`;
+      if (state.chat.some((c) => c.id === id)) {
+        return { ...state, chat: withEntry(state.chat, id, { text: event.frame.text }) };
+      }
+      return {
+        ...state,
+        pending: state.pending.map((p) =>
+          p.conversation === event.conversation && p.at <= event.at && !p.noticed ? { ...p, noticed: true } : p,
+        ),
+        chat: [
+          ...state.chat,
+          {
+            id,
+            kind: "notice",
+            session: GATEWAY_SESSION,
+            text: event.frame.text,
+            correlationId: event.conversation,
+          },
+        ],
+      };
+    }
+
+    case "local":
+      return {
+        ...state,
+        localSeq: state.localSeq + 1,
+        chat: [
+          ...state.chat,
+          {
+            id: `local:${state.localSeq}`,
+            kind: "local",
+            text: event.text,
+            correlationId: LOCAL_CORRELATION,
+          },
+        ],
+      };
+
+    case "clear":
+      return { ...state, chat: [], pending: [] };
   }
 }

@@ -13,20 +13,22 @@ package hermesbridge
 // hands each child the entry through hermes's managed scope: a per-task
 // directory holding the operator's managed config.yaml and .env with a
 // hooks.outbound entry added, named by HERMES_MANAGED_DIR in the child's
-// environment. Only the bridge's children carry the hook, so a kanban
-// worker or cron tick under the same profile never POSTs anywhere, and a
-// pod with no bridge has nothing to POST at.
+// environment. Under the subprocess executor only the bridge's children
+// carry the hook, so a kanban worker or cron tick under the same profile
+// never POSTs anywhere, and a pod with no bridge has nothing to POST at.
+// The API executor's turns run in the gateway process, so the operator
+// renders one pod-wide entry instead, signed with the shared ActivitySecret,
+// and a delivery is attributed by its session_id (runForSignature).
 //
-// Correlation is the signature. Nothing in the delivery names the A2A task:
-// hermes's own task_id is the kanban card or a fresh UUID, cwd and profile
-// are shared by every process under the profile, and the URL does not expand
-// environment variables. So each child gets a random key in its environment
-// under ActivitySecretEnv, and a delivery belongs to whichever in-flight task's
-// key verifies its signature - at most Concurrency keys to try. Only the
-// bridge's children carry the hook (it rides each child's own managed
-// scope), so a kanban worker or cron tick under the same profile never
-// delivers; an unsigned or unmatched delivery that does arrive is answered
-// 204 and dropped.
+// Under the subprocess executor, correlation is the signature. Nothing in
+// the delivery names the A2A task: hermes's own task_id is the kanban card or
+// a fresh UUID, cwd and profile are shared by every process under the
+// profile, and the URL does not expand environment variables. So each child
+// gets a random key in its environment under ActivitySecretEnv, and a
+// delivery belongs to whichever in-flight task's key verifies its signature -
+// at most Concurrency keys to try. A child drops the pod-wide entry from the
+// scope it is given, so it never signs a delivery twice; an unsigned or
+// unmatched delivery that does arrive is answered 204 and dropped.
 //
 // Trust boundary, stated: everything in the pod is reachable from the
 // persona's own terminal tool, its environment included. The trace is "as
@@ -51,8 +53,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -374,7 +378,10 @@ type hookDelivery struct {
 	ToolInput  json.RawMessage `json:"tool_input"`
 	Timestamp  string          `json:"timestamp"`
 	DeliveryID string          `json:"delivery_id"`
-	Extra      struct {
+	// SessionID is the hermes session the call ran in, top-level in the
+	// payload; the door attributes an API-executor delivery by it.
+	SessionID string `json:"session_id"`
+	Extra     struct {
 		ToolCallID string      `json:"tool_call_id"`
 		DurationMs json.Number `json:"duration_ms"`
 		Status     string      `json:"status"`
@@ -398,6 +405,7 @@ func (d *hookDelivery) UnmarshalJSON(b []byte) error {
 	d.ToolInput = top["tool_input"]
 	d.Timestamp = lenientString(top["timestamp"])
 	d.DeliveryID = lenientString(top["delivery_id"])
+	d.SessionID = lenientString(top["session_id"])
 	var extra map[string]json.RawMessage
 	if raw, ok := top["extra"]; ok {
 		_ = json.Unmarshal(raw, &extra)
@@ -446,6 +454,19 @@ type activityState struct {
 	// so the hex string is the key, not the bytes it spells.
 	key string
 
+	// sessionID is the API executor's attribution in place of a key: the
+	// delivery is signed with the pod's shared ActivitySecret and names its
+	// session, and inTurn says this task holds that session's turn, so of
+	// two tasks in one conversation only the one whose turn is running
+	// claims the call.
+	sessionID string
+	inTurn    atomic.Bool
+
+	// traced says a delivery can reach this task at all: the door is open
+	// and the task has a key, or, on the API executor, the shared secret
+	// to check a session's delivery against.
+	traced bool
+
 	mu         sync.Mutex
 	open       map[string]ActivityEntry // calls started and not yet ended
 	openOrder  []string                 // their ids, in start order
@@ -483,7 +504,46 @@ func newActivityState(withKey bool) *activityState {
 		// source is unusable), so there is no error to carry.
 		_, _ = rand.Read(raw)
 		a.key = hex.EncodeToString(raw)
+		a.traced = true
 	}
+	return a
+}
+
+// activityHookReaches reports whether a door bound at addr receives the
+// pod-wide hook's POSTs; a variable so a test's door, on a port the kernel
+// picked, can stand in for the hook's.
+var activityHookReaches = doorReceivesHook
+
+// doorReceivesHook reports whether a door bound at addr receives a POST to
+// DefaultActivityListen, the only address the operator's pod-wide hook
+// posts to: the same port, on that host or a wildcard that includes it. A
+// door elsewhere is open, but no API task's call can reach it.
+func doorReceivesHook(addr net.Addr) bool {
+	tcp, ok := addr.(*net.TCPAddr)
+	if !ok {
+		return false
+	}
+	host, port, err := net.SplitHostPort(DefaultActivityListen)
+	if err != nil || strconv.Itoa(tcp.Port) != port {
+		return false
+	}
+	return tcp.IP.IsUnspecified() || tcp.IP.Equal(net.ParseIP(host))
+}
+
+// apiTraced says an API task's calls can reach the door: it is open where
+// the hook posts, and the bridge holds the secret the hook signs with.
+func (b *Bridge) apiTraced() bool {
+	return b.activityLn != nil && b.cfg.ActivitySecret != "" && activityHookReaches(b.activityLn.Addr())
+}
+
+// newSessionActivityState is the API executor's side of the door: no key of
+// its own (the pod's hook signs with the shared secret), the session id to
+// claim deliveries by, and traced when the door can hear the pod-wide hook
+// and holds its secret (apiTraced).
+func newSessionActivityState(sessionID string, traced bool) *activityState {
+	a := newActivityState(false)
+	a.sessionID = sessionID
+	a.traced = traced
 	return a
 }
 
@@ -505,14 +565,20 @@ func (a *activityState) childEnv(url, managedDir string) []string {
 // signed reports whether sig (the X-Hermes-Signature-256 header) is this
 // task's HMAC over body.
 func (a *activityState) signed(sig string, body []byte) bool {
-	if a.key == "" || !strings.HasPrefix(sig, hookSignaturePrefix) {
+	return hookSigned(a.key, sig, body)
+}
+
+// hookSigned reports whether sig is key's HMAC over body, the way hermes
+// signs a delivery. An empty key signs nothing.
+func hookSigned(key, sig string, body []byte) bool {
+	if key == "" || !strings.HasPrefix(sig, hookSignaturePrefix) {
 		return false
 	}
 	got, err := hex.DecodeString(strings.TrimPrefix(sig, hookSignaturePrefix))
 	if err != nil {
 		return false
 	}
-	mac := hmac.New(sha256.New, []byte(a.key))
+	mac := hmac.New(sha256.New, []byte(key))
 	mac.Write(body)
 	return hmac.Equal(got, mac.Sum(nil))
 }
@@ -599,14 +665,15 @@ func (a *activityState) interrupted() []ActivityEntry {
 
 // progressLine is the heartbeat text: what a reader of the rolling line, or
 // of a stalled task's probe, needs to tell slow from stuck. The count only
-// moves on a delivery through the door, so with the door closed the line
+// moves on a delivery through the door, so with no delivery able to reach
+// the task (the door closed, or no secret to check one against) the line
 // says the trace is off rather than reporting zero calls from a persona
 // that may be making them.
 func (a *activityState) progressLine(now time.Time) string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	elapsed := now.Sub(a.startedAt).Round(time.Second)
-	if a.key == "" {
+	if !a.traced {
 		return fmt.Sprintf("running %s, tool trace off", elapsed)
 	}
 	line := fmt.Sprintf("running %s, %d tool call(s)", elapsed, a.calls)
@@ -889,7 +956,8 @@ func redactKeys(v any) any {
 
 // childManagedScope writes the per-task managed directory: the source scope's
 // config.yaml with the door's hooks.outbound entry added (appended to any the
-// source already carries) and its .env verbatim. Returns the directory; the
+// source already carries, less a pod-wide entry of the door's own name) and
+// its .env verbatim. Returns the directory; the
 // caller removes it once the child has exited.
 func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 	if !taskIDPattern.MatchString(taskID) {
@@ -968,7 +1036,15 @@ func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 		if !ok {
 			return "", fmt.Errorf("managed config %s: %s.%s is %T, not a list", src, hooksKey, hooksOutboundKey, v)
 		}
-		outbound = l
+		// The pod's own entry for the API executor carries this name and the
+		// same secret_env, which the child's environment rebinds to its
+		// per-task key: kept, it would deliver each call twice.
+		for _, e := range l {
+			if m, ok := e.(map[string]any); ok && m["name"] == hookEntryName {
+				continue
+			}
+			outbound = append(outbound, e)
+		}
 	}
 	outbound = append(outbound, map[string]any{
 		"name":       hookEntryName,
@@ -1191,7 +1267,11 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// runForSignature finds the in-flight task whose key signed body.
+// runForSignature finds the in-flight task a delivery belongs to: the CLI
+// task whose own key signed body, else, when the pod's shared secret signed
+// it, the API task holding the turn in the session the payload names. The
+// session id is read only after the signature verifies, so an unsigned body
+// cannot pick a task.
 func (b *Bridge) runForSignature(sig string, body []byte) *taskRun {
 	if sig == "" {
 		return nil
@@ -1204,6 +1284,18 @@ func (b *Bridge) runForSignature(sig string, body []byte) *taskRun {
 	b.mu.Unlock()
 	for _, r := range runs {
 		if a := r.act.Load(); a != nil && a.signed(sig, body) {
+			return r
+		}
+	}
+	if !hookSigned(b.cfg.ActivitySecret, sig, body) {
+		return nil
+	}
+	var d hookDelivery
+	if err := json.Unmarshal(body, &d); err != nil || d.SessionID == "" {
+		return nil
+	}
+	for _, r := range runs {
+		if a := r.act.Load(); a != nil && a.sessionID == d.SessionID && a.inTurn.Load() {
 			return r
 		}
 	}

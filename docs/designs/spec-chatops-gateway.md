@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, and the console adapter); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription) - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); not yet the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, or the default flip; the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default, retired by declarative profiles or by gateway-side `AllowedUsers` enforcement, whichever lands first) is built
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects; and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env, its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); not yet the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, or the default flip; the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default, retired by declarative profiles or by gateway-side `AllowedUsers` enforcement, whichever lands first) is built
 
 ## Purpose
 
@@ -825,8 +825,9 @@ terminal status message the bridge and the worker adapter write as `reason: <tok
 because a failed terminal is not always the persona's failure: the harness reads the token and
 classifies the executors' own reasons (`bridge-shutdown`, `bridge-queue-overflow`,
 `bus-publish-failed`, `spawn-failed`, `bridge-died-without-terminal-event`, `hermes-rate-limited`,
-`worker-evicted`, `bus-subscribe-failed`), a `rejected` terminal and a `canceled-before-start` as infrastructure,
-and grades the persona's (`hermes-exited-nonzero`, `deadline-exceeded`) and any reason it does not
+`hermes-api-unreachable`, `hermes-api-refused`, `session-busy`, `worker-evicted`, `bus-subscribe-failed`), a `rejected` terminal and a `canceled-before-start` as infrastructure,
+and grades the persona's (`hermes-exited-nonzero`, `deadline-exceeded`, `hermes-api-failed`,
+`hermes-api-unreadable`, `hermes-api-read-failed`, `hermes-api-oversize`) and any reason it does not
 know; a `canceled` after the harness's own cancel is the graded timeout. An eval install that
 declares the bridge sidecar sets `BRIDGE_CONCURRENCY` to at least the harness's parallelism
 (`EVAL_TASK_PARALLELISM`), because the bridge publishes `submitted` when it queues a task behind
@@ -894,14 +895,23 @@ that treated the three alike is what this value exists to stop.
 rendered regardless, so any install with neither a Discord token nor a Chat relay carried a
 gateway Deployment that crash-looped forever and nothing could rollout-gate on. The operator
 now asks first: a `mode: next` install with no chat backend - no `discord-bot` Secret in the
-namespace and no door armed - gets no gateway Deployment at all, its `Ready` counts the rest
+namespace, no door armed and `spec.integration.googleChat` not enabled - gets no gateway
+Deployment at all, its `Ready` counts the rest
 of the stack (NATS, the auth callout, the provisioning Job's first completion, the sandbox, the
 broker, today's gateway), and an `A2AGateway` condition (`status: False`, `Reason: NoChatBackend`) names what
 would render it. The rule is creation-only, like the callout ordering gate: a gateway that
 exists keeps reconciling whatever happened to its backend, because deleting it would take
 every session pod that hangs off its UID. An eval install with this door armed has an ingress
 the guard accepts, by the decision recorded above, and the render counts the door as a backend
-for the same reason.
+for the same reason. An install that enables Google Chat under `next` has a backend by that
+fact alone: the render asks the CR before it reads any Secret, and, because the gateway
+refuses two real backends, omits the Discord reference when Chat is armed, so a
+`discord-bot` Secret left in the namespace does not stop a Chat gateway starting. The
+rule is creation-only in this direction too: disabling Google Chat on an install whose gateway
+has no other backend re-renders the existing gateway without one, and it exits on
+`no chat backend` until the admin flips the CR to `today` (which tears the stack down), creates
+a `discord-bot` Secret, or deletes the gateway Deployment and its session pods with it - the
+same shape as removing the Secret from under a Discord gateway, reached through the CR.
 
 ## The Google Chat adapter (added 9/5)
 
@@ -918,19 +928,19 @@ envelope's job rather than `identity`'s. Nothing authorizes on the email today, 
 that lands this adapter is already carrying the string it needs. What the adapter costs is inheriting the existing Chat
 integration's operational surface, and this section records how it sits on it.
 
-**Ingress topology: the existing app registration and topic, a dedicated A2A
-subscription, consumed through the credential proxy.** A Chat app configuration is
+**Ingress topology: the existing app registration, topic and subscription, consumed
+through the credential proxy by whichever brain the mode names.** A Chat app configuration is
 per-GCP-project, so "take Chat events directly" means a second project — not an
-adapter-PR dependency. And two consumers on one subscription split deliveries randomly,
-so the A2A path gets its own subscription on the existing topic: each consumer acks its
-own subscription and the who-acks question dissolves. The subscription is pulled by a
-second `GoogleChatRelay` instance in the credential proxy (routes
+adapter-PR dependency. Two consumers on one subscription split deliveries randomly, so one consumer
+holds it at a time (below), and under `next` the subscription is pulled by the A2A
+`GoogleChatRelay` instance in the credential proxy (routes
 `/v1/chat/a2a/events`, `/v1/chat/a2a/events/ack`, `/v1/chat/a2a/events/nack`), enabled
 only when `A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME` is set alongside the project id. The
 gateway pod stays cloud-credential-free: it authenticates to the proxy the way the
 legacy chat caller does — a projected ServiceAccount token verified by TokenReview —
-but with its OWN audience — whatever `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE` names on the
-proxy; nothing in-tree fixes the string yet, the operator wiring will — conferring
+but with its OWN audience — the one the operator renders as
+`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE` on the proxy, `kubeagents-credential-proxy-a2a-chat` —
+conferring
 the `a2a-chat` role, because the legacy chat caller is the LLM-driven Hermes pod and a
 shared role would let a prompt-injected agent pull and ack the A2A gateway's events,
 silently consuming user asks. The event routes demand `a2a-chat`; `/v1/chat/api`
@@ -966,14 +976,26 @@ backends' ingress semantics closely enough: the Discord websocket redelivers not
 and Slack's Socket Mode, which does redeliver unacked envelopes, carries its own
 in-adapter dedupe ring for exactly that (the Slack section below).
 
-**Coexistence is by activation, not routing.** `mode: next` is additive, so a next
-install still runs the legacy chat consumer. A topic fans out to every subscription:
-an install that enables the A2A subscription while the legacy path is live will answer
-every message twice. The per-install choice of which brain consumes Chat belongs to
-the operator's mode seam (the mode switch's per-component override sketch) and does
-not exist yet; the A2A relay instance arms only on explicit configuration
-(`A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME`), so arming it beside the legacy consumer is a
-stated choice, never a default.
+**Coexistence is by mode.** A topic fans out to every subscription and two consumers on one
+subscription split its deliveries, so exactly one brain consumes an install's Chat, and
+`spec.mode` chooses it: under `today` the Hermes `google_chat` platform pulls the
+subscription through the broker's legacy relay instance; under `next` the operator arms the
+A2A relay instance on the same subscription, gives the gateway the adapter's env and token,
+and renders neither the Hermes platform nor its relay env. One subscription rather than a
+second one for the A2A path, because the unacked backlog then follows the live consumer
+across a flip in either direction, where a second subscription would hold up to seven days
+of stale asks for the legacy consumer to drain on a rollback. The per-install choice of a
+different pairing is the mode switch's per-component override, sketched and not built; the
+predicate the operator consults (`a2aChatArmed`) is where it would be read. What this costs:
+under `next` the Hermes platform is off, so cron findings addressed to the Chat home channel
+have no target until the bus carries them. And the handover is not instantaneous: the pass
+that flips a Chat install to `next` turns the Hermes consumer off while the gateway may still
+be held (the callout gate, a provisioning Job, an image pull), so until the gateway is up
+nobody consumes the subscription - messages wait in it rather than being lost, and the CR
+reads `Provisioning` naming the gateway, which is the signal. In the other direction, a
+message Hermes pulled and had not acked before its pod rolled is redelivered to the A2A
+relay after the subscription's ack deadline; if Hermes replied before acking, that one
+message is answered by both brains, once.
 
 **`verifiedBy: "chat-event-topic-iam"`, and what was actually verified.** The gateway
 verified that the event arrived through the credential proxy from a subscription on the
@@ -1029,9 +1051,9 @@ always present in the snapshot regardless.
 (`GoogleChatSpec.Mode`) is honoured by the relay: under `default` the rolling line
 carries state transitions but never the turn-by-turn narration, with no-op edits
 deduplicated; under `debug` the full rolling line runs. Carried as
-`A2A_CHAT_DISPLAY_MODE`; the operator owns feeding it from the same CR field, and unset
-resolves to `debug` (the historical rendering, so Discord installs are unchanged) while
-the CR field's own default is `default` — the render is what makes the two agree. The
+`A2A_CHAT_DISPLAY_MODE`; the operator feeds it from the same CR field, rendering `default` when
+the field is unset; the gateway's own unset resolves to `debug` (the historical rendering, so
+Discord installs are unchanged), and the render is what makes the two agree. The
 split is the legacy field honoured in the new relay, not a new knob.
 
 **openDirect.** `spaces.findDirectMessage` by user resource name, falling back to
@@ -1219,6 +1241,118 @@ one notice, and the rest are silent until the conversation has room again. A NAT
 or a NATS pod not yet rolled onto the new one, refuses the adapter's subscription
 asynchronously; the adapter logs that with the remedy rather than boot-failing,
 because the chat backend beside it is still good.
+
+## The A2A door (added 9/24)
+
+The gateway's ingress for an agent caller: an A2A client (Antigravity, an ADK agent, the MCP
+bridge that fronts Claude, `curl`) that speaks the A2A protocol over HTTP. A second side door
+beside the inject door, built on the same contract, and differing in what it speaks rather
+than in what it may do. This section is the door as `a2a/gateway/a2adoor.go` implements it.
+
+**A side door, again.** The inject door's reasoning holds unchanged. The door holds no bus
+credential, mints no id the bus sees and writes no `authority` block; a verified caller's
+message becomes an `InboundMessage` into `handleInbound`, and from there the turn is a chat
+turn - routed by the same matcher, subject to the same first-event grace, relayed back through
+the same `post`/`edit`. It sits beside the mux with the inject door, under the composite that
+forwards the gateway's probe and observers by conversation prefix, and it is not counted by the
+one-real-backend guard for the reason the inject door is not. Either door alone starts a
+gateway; with both doors and no real backend the default attribution is the inject door's, and
+every message through either stamps its own backend.
+
+**Wire.** JSON-RPC 2.0 over HTTP at `/a2a`, and the agent card at
+`/.well-known/agent-card.json`. Four methods:
+
+- `message/send` is a turn. The door answers with the A2A `Task` once the submission is on the
+  bus (`TaskObserver.TaskAccepted`, the inject door's rule: a caller is never handed an id whose
+  terminal cannot come), or with the gateway's reply as an A2A `Message` when the turn started
+  no task (a status answer, a steer, a refusal). `configuration.blocking: true` holds the call
+  until the task's terminal, bounded, which is the one-call `curl` demo. `message.taskId` names
+  a running task of the caller's own and lands the text on its conversation, where the gateway
+  treats it as a steer. `message.messageId` is the dedupe key: a retry after a dropped
+  connection is answered with the task the first attempt started, and starts nothing.
+- `tasks/get` returns the `Task` as the door holds it. Scoped to the caller: a task another
+  caller started is not found rather than forbidden, so the door confirms no id it will not
+  serve.
+- `tasks/cancel` is a cancel turn on the task's conversation - the same `kind: cancel` envelope
+  the inject door's cancel route and the chat path's `stop` publish - answered once the cancel is
+  on the bus (`TaskObserver.CancelPublished`) with the `Task` as it stands. The executor decides
+  when the task is canceled; the client polls `tasks/get` for that terminal as for any other.
+- `message/stream` is refused as unsupported and the card says `streaming: false`. It lands
+  next, as SSE frames from the same observer hooks.
+
+Only text parts are accepted. A data or file part has no home on a chat turn, so it is refused
+at the door in the protocol's own terms rather than dropped.
+
+**The Task object** is assembled from what the relay posted on the door's conversation, which
+is what a chat user would have read. The rolling progress line (`startTask`'s placeholder, which
+the relay edits) is `status.message`; the state is `submitted` from `TaskStarted`, `working` from
+the first edit, and the terminal state from `TaskTerminal`, whose reason - the executor's
+terminal status message, verbatim, which is `reason: <token>` on a failure - replaces the line
+on a terminal that carries one. Every other post under the task is an agent message in
+`history`, after the caller's own; every message inside the Task carries the binding's
+`kind: "message"`, which the bus payload's own message struct does not. On a completed terminal
+the task's one artifact, named `result` as the bus names it, is the deliverable the relay hands
+the door whole before it posts it in chat-sized chunks (`DeliverableObserver`; the heal path
+hands over the artifact the stream carries), so the chunks stay history and the artifact is
+never inferred from a post's position. The door keeps up to 4 MiB of it; a longer deliverable
+is cut at a rune boundary with `metadata.resultTruncatedFrom` carrying the original length, so a
+client can fall back to `history`, which carries the chunks whole. Everything the door keeps per
+task (the caller's text, the posts, the deliverable) is summed across tasks under a 64 MiB budget;
+past it the oldest tasks are gone whole, the protocol's `not found`, as under the task-count cap.
+A turn's reply is assembled from a per-conversation log bounded in bytes too, and a reply whose
+head fell off it says so in `metadata.postsEvicted`. A completed task the relay
+handed nothing for (a non-text result) renders no artifact. `metadata.terminalSource` carries whose word the terminal
+is, for the reason the inject door's read route carries it. A2A clients read exactly `status`,
+`artifacts` and `history`, so nothing here is invented for them. Not mapped yet: an executor's
+non-final `input-required` reaches `history` as the relay's ask line, not `status.state`, which
+stays `working`; no executor in this tree publishes it, and the streaming change carries status
+events through as they come.
+
+**Conversation.** `a2a:<caller>:<contextId>`, kind `dm`. The caller is part of the key so two
+callers naming the same `contextId` do not share a conversation; a caller that sends none is
+minted one and reads it back on the `Task`. `Roster` is the caller alone, complete;
+`openDirect` returns the caller's last conversation, as on the inject door.
+
+**Identity, first version: the eval class.** The caller names itself - the `X-A2A-Caller` header,
+or `message.metadata.caller` for a client that cannot set headers - and is resolved through the
+door's **own** principal map at the prefixed key `a2a:<caller>`, whose value must be an eval
+identity. The three refusals are the inject door's, and for the same reason: the door takes its
+caller from the request, so the map is the only thing between a token holder and a principal of
+their choosing. An unmapped or unnamed caller is refused with a JSON-RPC error and starts nothing;
+nothing is defaulted. `verifiedBy` is `a2a-bearer`, its own value, so an external agent's
+submission and an eval harness's are distinguishable downstream even though both resolve into
+the eval namespace today.
+
+That is the demo answer and not the product answer. The developer class (an ID token for the
+person whose harness is calling, audience this install's door, principal the same email the
+Google Chat adapter carries) and the unattended class (an organisation's service identity,
+read-only against protected targets) arrive as verifiers beside this map, never as entries in
+it, and each gets its own `verifiedBy`. Validating a token at the door is not the per-user
+token brokerage the permission model declined: the door holds an audience and an allowlist,
+never a refresh token.
+
+**The card is the catalog.** One skill per destination this door routes to, which today is the
+gateway's default addressee. When profiles land the list is rendered from `DIRECTORY` and the
+caller's entitlements, per caller, and it is the same list the router's capability catalog is
+built from. The card is the one unauthenticated route, because discovery reads it to learn which
+security scheme to present; it discloses the endpoint URL, the scheme and the default
+destination's name, none of which a 401 hides.
+
+**Posture.** Every RPC request carries a bearer token (`A2A_DOOR_TOKEN`, required whenever
+`A2A_DOOR_LISTEN` is set, no unauthenticated mode); the caller map is its own file
+(`A2A_DOOR_PRINCIPAL_MAP`); the card advertises `A2A_DOOR_PUBLIC_URL` when set, and otherwise
+the address the card was fetched from (the request's host, or the forwarded host and scheme
+behind a proxy), since behind a port-forward or an ingress the listen address is reachable by
+nobody. The operator renders the door the way
+it renders the inject door, under its own operator-level flag (`A2A_AGENT_DOOR=true`, never a
+CRD field): a loopback bind on its own port, its own one-entry map admitting one caller, a
+token Secret minted once, a ClusterIP Service for the port-forward, and the gateway fence
+under the door's own name, so each door comes and goes with its own flag. The render counts
+the door as a backend the way it counts the inject door (`a2aGatewayBackend`): a `mode: next`
+install with no `discord-bot` Secret and this door armed gets its gateway rather than the
+`NoChatBackend` condition, which is what the gateway's own start-up check already accepts. The
+identity classes above are what will let it be rendered on an install a customer reaches; until
+then it is a dev and eval door like the other.
 
 ## What stage 2 builds from this doc
 

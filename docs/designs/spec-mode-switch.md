@@ -101,7 +101,9 @@ hanging at the dial. Found live during stage 1 bring-up (8/26).
   strips it silently and the author never hears anything. A reservation that only starts
   reserving once the thing exists is not a reservation.
 - `next`: everything above, plus the NATS component and the gateway skeleton. Next is
-  additive - today's path keeps running until stage 4 starts retiring pieces.
+  additive - today's path keeps running until stage 4 starts retiring pieces - with one
+  exception: Google Chat, which `next` moves from the Hermes platform to the A2A gateway
+  (`spec-chatops-gateway.md`, "Coexistence is by mode").
 
 One thing `next` does not ship: long-term audit. The stream is a 72h ring buffer and
 the audit exporter is stage 2 scope, so `next` has no archive - the NATS spec's audit
@@ -144,7 +146,9 @@ should survive chart upgrades.
 ## Switches inside `next`
 
 The A2A gateway's inject door (`spec-chatops-gateway.md`, "The test backend") renders only
-when the OPERATOR carries `A2A_INJECT_BACKEND=true`, on top of `spec.mode: next`. That is not a
+when the OPERATOR carries `A2A_INJECT_BACKEND=true`, on top of `spec.mode: next`, and its A2A
+door for agent callers (`spec-chatops-gateway.md`, "The A2A door") only under
+`A2A_AGENT_DOOR=true`, the same way. That is not a
 second mode mechanism and does not belong in the field this document defines. The door takes the
 principal it acts as out of a request body, so a CRD field would put "render the eval door" in
 the API a cluster's owner edits and the operator would be obliged to honour it. Whether an

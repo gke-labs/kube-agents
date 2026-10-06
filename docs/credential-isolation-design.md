@@ -115,10 +115,13 @@ OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` aler
 `FEEDBACK_PROMPT_*` switch and delay, and the `KAGE_SLACK_UX` flag —
 but only as literal values; all `valueFrom` sources are rejected. A name earns a
 place on that list only if an arbitrary value for it cannot redirect state,
-grant access, or change what code runs. `KAGE_SLACK_UX` is the nearest case: it
-switches between code paths the image already ships, which its comment there lists.
+grant access, or run code the image does not already ship. The list is
 `safeSandboxEnvOverrides` in
-`k8s-operator/internal/controller/platformagent_manifests.go` is the list.
+`k8s-operator/internal/controller/platformagent_manifests.go`. `KAGE_SLACK_UX`
+is the nearest case: it switches between Slack code paths the image already
+ships, adds no destination or credential, and writes only to Slack, in the
+channels and threads the gateway already serves; its comment in
+`safeSandboxEnvOverrides` lists each path.
 Reserved proxy, runtime-loader, and shell-startup variables cannot override the
 operator's managed values.
 
@@ -220,16 +223,17 @@ namespace, where the managed-Prometheus collector runs, and to no other peer.
 Envoy authenticates
 every caller that is not asking for `/healthz`: the caller presents an
 audience-bound projected ServiceAccount token (one hour; the audience is per
-pod, `kubeagents-credential-proxy` for the sandbox and
-`kubeagents-credential-proxy-chat` for the gateway) as a bearer header, and the
+pod, `kubeagents-credential-proxy` for the sandbox, `kubeagents-credential-proxy-chat` for
+the gateway and, when the next stack takes Google Chat, `kubeagents-credential-proxy-a2a-chat`
+for the A2A gateway) as a bearer header, and the
 runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLERS`.
-That list names the gateway's ServiceAccount and the sandbox's (and, under the
-operator's `A2A_SESSION_CLUSTER_VIEW` flag, a third, the session pods', bound to
-the audience `kubeagents-credential-proxy-session`; see
-[spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)) and does not vary
-on which one presented the token — the audience and the route table it feeds do —
-so the allowlist itself keeps other workloads out rather than telling those two
-apart. The token crosses the cluster network in cleartext;
+That list names the gateway's ServiceAccount and the sandbox's, the A2A gateway's when it
+consumes Google Chat, and, under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session
+pods' (bound to the audience `kubeagents-credential-proxy-session`; see
+[spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)), and does not vary on
+which one presented the token — the audience and the route table it feeds do — so the
+allowlist itself keeps other workloads out rather than telling those callers apart. The token
+crosses the cluster network in cleartext;
 a NetworkPolicy is what keeps it off the wire elsewhere.
 
 The `agent-api-auth` sidecar authenticates the existing PlatformAgent API on port
@@ -273,8 +277,8 @@ the server. `session_kv_server.py` runs in the sandbox and binds
 `127.0.0.1:8699`; its callers are the event watcher and the drift detector in
 `agent-api-auth`, the Platform MCP server, the `incident_context` plugin, the
 gateway's kanban notifier, which keys a delivered triage report to the thread it
-went into, the chat adapter's scheduled-report relay, and the two findings
-scripts. Deliberately not stated as a total: the list has grown twice and a
+went into, the chat adapter's scheduled-report relay, the two findings
+scripts, and the `stall-watch` cron script. Deliberately not stated as a total: the list keeps growing and a
 count is the part that goes stale first. The key exists so
 that the server can reject a request that did not come from one of them, which
 means the server has to hold it. The salt is read by the Chat Agent plugins,
@@ -830,7 +834,11 @@ Consequences:
   broker (the captured streams, their decoded text, the JSON body and its
   encoding). The two caps together are therefore what the broker container's
   memory limit is sized against, and they move with that limit in the
-  operator rather than through the CR. The exec and vcs routes hold a slot;
+  operator rather than through the CR. The child processes the slots spawn
+  are outside that arithmetic;
+  [`credential-proxy-child-memory-budget.md`](designs/credential-proxy-child-memory-budget.md)
+  is the design of record, not yet implemented, for the budget that would
+  bring them in. The exec and vcs routes hold a slot;
   the vcs route reads its body, which may carry a bundle of tens of MiB, only
   once admitted, while the exec route's body (at most 1 MiB) is read before.
   The forge refresh (a short call to the minter), the content workspace's git

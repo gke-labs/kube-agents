@@ -330,9 +330,22 @@ REASON_WORKER_EVICTED = "worker-evicted"
 REASON_BUS_SUBSCRIBE_FAILED = "bus-subscribe-failed"
 # The hermes turn gave up on the model provider's rate limit or billing (its
 # retries exhausted the 429 window; exit 75, EX_TEMPFAIL, the code Hermes
-# reserves for both). A quota storm is the install's, not the persona's: the
-# turn never got an answer to grade.
+# reserves for both, or the API server's X-Hermes-Failure-Reason header), or
+# the API server refused the turn at its concurrent-run cap. A quota storm is
+# the install's, not the persona's: the turn never got an answer to grade.
 REASON_HERMES_RATE_LIMITED = "hermes-rate-limited"
+# The bridge's api executor got no response from the pod's Hermes API server:
+# the connection was still refused after the bridge's startup retry window,
+# or the request failed in transport. No answer came back, so there is
+# nothing to grade.
+REASON_HERMES_API_UNREACHABLE = "hermes-api-unreachable"
+# The API server refused the request with a 4xx other than 429 (a wrong key, a
+# missing route, a malformed body): it answers before any agent runs, so the
+# prompt never reached the persona.
+REASON_HERMES_API_REFUSED = "hermes-api-refused"
+# The task waited out its deadline behind an earlier turn in the same session
+# and was never sent: the persona never saw the prompt.
+REASON_SESSION_BUSY = "session-busy"
 INFRASTRUCTURE_REASONS = frozenset(
     {
         REASON_BRIDGE_SHUTDOWN,
@@ -343,14 +356,33 @@ INFRASTRUCTURE_REASONS = frozenset(
         REASON_WORKER_EVICTED,
         REASON_BUS_SUBSCRIBE_FAILED,
         REASON_HERMES_RATE_LIMITED,
+        REASON_HERMES_API_UNREACHABLE,
+        REASON_HERMES_API_REFUSED,
+        REASON_SESSION_BUSY,
     }
 )
 # The persona's reasons, graded: the hermes turn exited non-zero, or ran past
-# the bridge's own deadline. Listed for the record and the tests; an unknown
-# token lands in the same class, so nothing here is consulted to grade.
+# the bridge's own deadline; under the api executor, the API server answered
+# with a 5xx or a failed 200, an unparseable completion, a body that broke
+# off mid-read, or a body over the bridge's read cap -- the turn's own failure, as a non-zero exit is for the subprocess. Listed
+# for the record and the tests; an unknown token lands in the same class, so
+# nothing here is consulted to grade.
 REASON_HERMES_EXITED_NONZERO = "hermes-exited-nonzero"
 REASON_DEADLINE_EXCEEDED = "deadline-exceeded"
-PERSONA_REASONS = frozenset({REASON_HERMES_EXITED_NONZERO, REASON_DEADLINE_EXCEEDED})
+REASON_HERMES_API_FAILED = "hermes-api-failed"
+REASON_HERMES_API_UNREADABLE = "hermes-api-unreadable"
+REASON_HERMES_API_READ_FAILED = "hermes-api-read-failed"
+REASON_HERMES_API_OVERSIZE = "hermes-api-oversize"
+PERSONA_REASONS = frozenset(
+    {
+        REASON_HERMES_EXITED_NONZERO,
+        REASON_DEADLINE_EXCEEDED,
+        REASON_HERMES_API_FAILED,
+        REASON_HERMES_API_UNREADABLE,
+        REASON_HERMES_API_READ_FAILED,
+        REASON_HERMES_API_OVERSIZE,
+    }
+)
 # The two canceled terminals. After this transport's own cancel the executor
 # answers canceled-by-request, which is the graded timeout; a task the bridge
 # cancelled out of its queue before ever spawning answers

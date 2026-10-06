@@ -18,8 +18,8 @@
 # is unambiguously the wrong outcome.
 #
 # The catastrophic safeguard is sandbox_tree_matches_image: after the run it
-# execs into the agent's shell sandbox pod (`<agent>-shell-0`, container
-# `shell`) and diffs /opt/defaults/<tree> against each staged copy. Any
+# execs into the agent's shell sandbox pod (`EVAL_SANDBOX_POD`, else
+# `<agent>-shell-0`; container `shell`) and diffs /opt/defaults/<tree> against each staged copy. Any
 # difference fails; an exec that cannot run is status=error, never a pass.
 # It reads the agent's own install rather than a seeded-fleet fixture, so it
 # is not a cluster-reading type for the validator and there is no

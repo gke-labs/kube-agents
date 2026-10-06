@@ -169,7 +169,8 @@ MUTATIONS: list[Mutation] = [
          '                    "Identity and API server address belong to the broker. Remove "\n'
          '                    "--server, --token, --user, --client-certificate, "\n'
          '                    "--insecure-skip-tls-verify and the other credential flags to "\n'
-         '                    "use the cluster and identity the proxy configured."\n'
+         '                    "use the cluster and identity the proxy configured. "\n'
+         '                    + _FLAG_BOUNDARY_NOTICE\n'
          '                ),\n',
          '                message="",\n'),
         "test_A1_a_refusal_names_the_rule_that_fired",
@@ -286,6 +287,20 @@ MUTATIONS: list[Mutation] = [
         "rename the minted-RBAC ceiling test. A2 has no mechanism of its own to "
         "assert, so it borrows C5's assertion by name; the borrow is what breaks "
         "first, and it has to break loudly or A2 falls off the map",
+    ),
+    Mutation(
+        "A3-slack-click-authorization",
+        "deploy/docker/patches/slack_ux_clicks.py",
+        ("    started = await adapter._begin_interaction(ack, body, action, kind)\n",
+         "    started = await adapter._begin_interaction(ack, body, action, kind) or (\n"
+         "        body.get(\"team\", {}).get(\"id\"), action[\"action_id\"], action.get(\"value\"),\n"
+         "        body[\"message\"], body[\"message\"][\"ts\"], body[\"channel\"][\"id\"],\n"
+         "        body[\"user\"][\"id\"], body[\"user\"][\"id\"],\n"
+         "    )\n"),
+        "test_A3_an_unlisted_users_click_changes_nothing",
+        "fall back to the payload's own user when the adapter declines, the "
+        "'make the button work for everyone who can see it' shortcut: an "
+        "unlisted user's click then runs as their turn",
     ),
     # ---- B. The write path ----------------------------------------------
     Mutation(
@@ -1173,6 +1188,54 @@ Mutation(
         "error is still logged, and a map entry naming a cloud identity is "
         "still honoured -- so an assertion that only looks for the condition "
         "passes on a resolver that defaults",
+    ),
+    Mutation(
+        "A3-a2a-door-always-rendered",
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ("\tif a2aAgentDoorEnabled() {\n\t\tinjectEnv = append(injectEnv,",
+         "\tif true {\n\t\tinjectEnv = append(injectEnv,"),
+        "test_A3_the_a2a_door_renders_only_under_the_operator_flag",
+        "render the A2A door's env, port and principal-map mount on every "
+        "mode: next gateway rather than only under the operator's flag. The "
+        "door resolves a caller the request names into an eval identity, so "
+        "an install that never asked for it must not carry it; the "
+        "conformance test is the one that has to notice, from the source, "
+        "that the render consults the flag",
+    ),
+    Mutation(
+        "A3-a2a-door-flag-fails-open",
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ('\treturn os.Getenv(a2aAgentDoorEnvVar) == "true"',
+         "\treturn os.Getenv(a2aAgentDoorEnvVar) != \"\""),
+        "test_A3_the_a2a_door_flag_is_not_a_field_a_customer_can_set",
+        "make the A2A door's flag true for any non-empty value, so a typo or "
+        "a stray \"false\" renders the door on an install that never asked "
+        "for one",
+    ),
+    Mutation(
+        "A3-a2a-door-principal-unchecked",
+        "a2a/gateway/gchat.go",
+        ("\tprincipal := g.a2aPM.Resolve(a2aPrincipalPrefix + authorID)\n"
+         "\tif principal == \"\" {\n\t\treturn \"\"\n\t}\n"
+         "\tif !strings.HasPrefix(principal, injectEvalPrincipalPrefix) {",
+         "\tprincipal := g.a2aPM.Resolve(a2aPrincipalPrefix + authorID)\n"
+         "\tif principal == \"\" {\n\t\treturn \"\"\n\t}\n"
+         "\tif false {"),
+        "test_A3_the_a2a_door_cannot_assert_a_cloud_principal",
+        "let the A2A door's principal map resolve to any principal at all; "
+        "the caller names itself in the request, so the map is the only "
+        "thing between a token holder and a principal of their choosing",
+    ),
+    Mutation(
+        "A3-a2a-door-principal-defaulted",
+        "a2a/gateway/gchat.go",
+        ('\t\t\t"caller", authorID, "wantPrefix", injectEvalPrincipalPrefix)\n\t\treturn ""\n\t}',
+         '\t\t\t"caller", authorID, "wantPrefix", injectEvalPrincipalPrefix)\n'
+         "\t\tprincipal = injectEvalPrincipalPrefix + principal\n\t}"),
+        "test_A3_the_a2a_door_cannot_assert_a_cloud_principal",
+        "keep the A2A door's refusal condition and log line but repair the "
+        "value into the eval namespace instead of dropping it, so a map entry "
+        "naming a cloud identity is still honoured",
     ),
     Mutation(
         "C1-session-fence-selector-drift",

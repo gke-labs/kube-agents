@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -15,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 const (
@@ -37,8 +40,8 @@ const (
 	// sits well above both.
 	gchatRelayTimeout = 45 * time.Second
 	// gchatRelayEventsPath is the A2A-dedicated event route — its own
-	// GoogleChatRelay instance on its own subscription, so this consumer
-	// never splits deliveries with the legacy chat path.
+	// GoogleChatRelay instance, the only one the operator arms under next, so
+	// this consumer never splits deliveries with the legacy chat path.
 	gchatRelayEventsPath    = "/v1/chat/a2a/events"
 	gchatRelayEventsAckPath = "/v1/chat/a2a/events/ack"
 	// gchatPullRetryDelay paces re-polls after a pull error, so a relay
@@ -55,6 +58,28 @@ const (
 	// unbounded map would only ever be a leak, one entry per message for
 	// the pod's lifetime.
 	gchatSeenCap = 4096
+	// gchatEventCountInterval paces the received-events summary line. An
+	// install whose Chat events never arrive pulls empty forever, and an
+	// empty pull logs nothing, so this line is the only place "zero events"
+	// shows. Fifteen minutes gives four lines in the hour a human looks back
+	// over after Chat says "not responding", and 96 lines a day per gateway
+	// pod, which is quieter than the per-event lines a busy install already
+	// writes. Shorter is noise on a healthy install; an hour would leave a
+	// fresh install with no line at all for its first hour.
+	gchatEventCountInterval = 15 * time.Minute
+	// gchatRelayDetailMaxBytes bounds any one string taken from a relay
+	// response body into a log line or an error. The longest it has to hold
+	// is a full subscription path: "projects/" + a 30-character project id +
+	// "/subscriptions/" + a 255-character name, 309 bytes.
+	gchatRelayDetailMaxBytes = 320
+	// gchatRelayErrorBodyMaxBytes bounds the read of a failed pull's body.
+	// The relay's error bodies are a few hundred bytes; this only stops a
+	// misbehaving relay from making one failed pull an unbounded read.
+	gchatRelayErrorBodyMaxBytes = 4096
+	// gchatSubscriptionUnreported stands in for the subscription in the
+	// summary line until the relay names one, on a served pull or a refused
+	// one; a relay that predates naming it never does.
+	gchatSubscriptionUnreported = "(not reported by the relay)"
 )
 
 const (
@@ -128,6 +153,12 @@ func verifiedByFor(backend string) string {
 		// a Chat message verified by the IAM-locked topic, which is the
 		// whole point of recording the mechanism rather than the table.
 		return injectVerifiedBy
+	case a2aBackend:
+		// The A2A door's own token, and its own value for the same reason:
+		// an external agent's submission and an eval harness's must be
+		// distinguishable downstream even though both resolve through a
+		// door-scoped map into the eval namespace.
+		return a2aVerifiedBy
 	}
 	return "principal-map"
 }
@@ -145,6 +176,8 @@ func unverifiedRemedyFor(backend string) string {
 		return "nothing - only the console credential's own frames are accepted here"
 	case injectBackend:
 		return "the inject door's principal map"
+	case a2aBackend:
+		return "the A2A door's principal map"
 	}
 	return "the principal map"
 }
@@ -283,6 +316,13 @@ type GoogleChatAdapter struct {
 	// presentation, not identity: the conversation key and the session
 	// are unchanged by it.
 	dmThreads map[string]string
+
+	// countInterval paces the received-events summary line
+	// (gchatEventCountInterval; tests shorten it). subscription is the Chat
+	// subscription the relay last said it pulls. Both are read and written
+	// only by Run's goroutine.
+	countInterval time.Duration
+	subscription  string
 }
 
 // NewGoogleChatAdapter builds the adapter against the credential proxy's
@@ -304,6 +344,8 @@ func NewGoogleChatAdapter(relayURL, tokenPath string, log *slog.Logger) (*Google
 		userIDs:    map[string]string{},
 		userEmails: map[string]string{},
 		dmThreads:  map[string]string{},
+
+		countInterval: gchatEventCountInterval,
 	}, nil
 }
 
@@ -365,9 +407,11 @@ func (a *GoogleChatAdapter) relayPost(path string, payload []byte) ([]byte, erro
 		return nil, fmt.Errorf("gchat: reading relay response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		// The relay scrubs Chat error bodies before they get here; carrying
-		// the status forward is enough to tell a refusal from an outage.
-		return nil, fmt.Errorf("gchat: relay %s answered %d", path, resp.StatusCode)
+		// The relay scrubs Chat error bodies before they get here, down to
+		// the Chat status and reason, and those are carried forward: a 502
+		// alone cannot tell a 403 (the app's grant) from a 404 (a space the
+		// app is not in) from an outage.
+		return nil, gchatRelayError(fmt.Sprintf("gchat: relay %s answered %d", path, resp.StatusCode), buf.Bytes())
 	}
 	return buf.Bytes(), nil
 }
@@ -522,16 +566,38 @@ type gchatEnvelope struct {
 // seam's recorded hole is a poison message that is never settled and
 // redelivers forever (tests/integration/test_seam_chat_ingress.py), and an
 // acked-away poison event beats an inbox wedged on one.
+//
+// Run names the relay route it pulls when it starts, the subscription the
+// first time the relay reports one (a refused pull's answer counts), and
+// every countInterval the number of events received: an install that Chat
+// publishes nothing to pulls empty forever, and those lines are what tell it
+// from a quiet one.
 func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage)) error {
+	a.log.Info("gchat event pull starting",
+		"relay", a.relayURL+gchatRelayEventsPath, "summaryEvery", a.countInterval)
+	windowStart := time.Now()
+	var received, emptyPulls, failedPulls int
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if elapsed := time.Since(windowStart); elapsed >= a.countInterval {
+			subscription := a.subscription
+			if subscription == "" {
+				subscription = gchatSubscriptionUnreported
+			}
+			a.log.Info("gchat events received",
+				"events", received, "emptyPulls", emptyPulls, "failedPulls", failedPulls,
+				"interval", elapsed.Round(time.Second), "subscription", subscription)
+			windowStart = time.Now()
+			received, emptyPulls, failedPulls = 0, 0, 0
 		}
 		env, err := a.pullEvent(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+			failedPulls++
 			a.log.Warn("gchat event pull failed", "err", err)
 			select {
 			case <-ctx.Done():
@@ -541,6 +607,7 @@ func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage
 			continue
 		}
 		if env == nil {
+			emptyPulls++
 			// Usually the server-side long poll has already paced this;
 			// the delay only bites on an early-empty synchronous pull.
 			select {
@@ -550,6 +617,7 @@ func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage
 			}
 			continue
 		}
+		received++
 		ev, decodeErr := decodeGchatEvent(env.Data)
 		// Acked before the handler runs, which makes ingress at-most-once —
 		// a deliberate, recorded decision, not an oversight. Acking after a
@@ -593,15 +661,106 @@ func (a *GoogleChatAdapter) pullEvent(ctx context.Context) (*gchatEnvelope, erro
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("gchat: event pull answered %d", resp.StatusCode)
+		// A read error leaves a partial body, which gchatRelayError reads as
+		// nothing; the status alone still goes out.
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, gchatRelayErrorBodyMaxBytes))
+		// The proxy names the subscription on a refused pull too, and an
+		// install whose every pull is refused never sees a 200 to learn it
+		// from.
+		var refused struct {
+			Subscription string `json:"subscription"`
+		}
+		if json.Unmarshal(errBody, &refused) == nil {
+			a.noteSubscription(refused.Subscription)
+		}
+		return nil, gchatRelayError(fmt.Sprintf("gchat: event pull answered %d", resp.StatusCode), errBody)
 	}
 	var body struct {
-		Event *gchatEnvelope `json:"event"`
+		Event        *gchatEnvelope `json:"event"`
+		Subscription string         `json:"subscription"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return nil, fmt.Errorf("gchat: decoding pulled event: %w", err)
 	}
+	a.noteSubscription(body.Subscription)
 	return body.Event, nil
+}
+
+// noteSubscription records the subscription the relay reported pulling and
+// logs it the first time and whenever it changes. The gateway is configured
+// with the relay URL alone; the subscription is the proxy's
+// (A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME), so this is where it learns it.
+func (a *GoogleChatAdapter) noteSubscription(reported string) {
+	subscription := gchatRelayDetail(reported)
+	if subscription == "" || subscription == a.subscription {
+		return
+	}
+	a.subscription = subscription
+	a.log.Info("gchat relay pulls subscription", "subscription", subscription)
+}
+
+// gchatRelayError builds a relay failure from its status line and the error body
+// the credential proxy answered with. The proxy puts the Chat API status and
+// reason under "chat" on a refused API call, and the subscription and the
+// Pub/Sub error type and status on a failed pull; whichever is present is
+// appended, so "answered 502" reads "answered 502: chat 403 Forbidden". A
+// body that is not that shape adds nothing.
+func gchatRelayError(status string, body []byte) error {
+	var parsed struct {
+		Chat *struct {
+			Status int    `json:"status"`
+			Reason string `json:"reason"`
+		} `json:"chat"`
+		Subscription string `json:"subscription"`
+		Pubsub       *struct {
+			Type string `json:"type"`
+			Code int    `json:"code"`
+		} `json:"pubsub"`
+	}
+	if len(body) == 0 || json.Unmarshal(body, &parsed) != nil {
+		return errors.New(status)
+	}
+	var details []string
+	if parsed.Chat != nil && parsed.Chat.Status != 0 {
+		detail := "chat " + strconv.Itoa(parsed.Chat.Status)
+		if reason := gchatRelayDetail(parsed.Chat.Reason); reason != "" {
+			detail += " " + reason
+		}
+		details = append(details, detail)
+	}
+	if parsed.Pubsub != nil {
+		detail := "pubsub"
+		if kind := gchatRelayDetail(parsed.Pubsub.Type); kind != "" {
+			detail += " " + kind
+		}
+		if parsed.Pubsub.Code != 0 {
+			detail += " " + strconv.Itoa(parsed.Pubsub.Code)
+		}
+		if detail != "pubsub" {
+			details = append(details, detail)
+		}
+	}
+	if subscription := gchatRelayDetail(parsed.Subscription); subscription != "" {
+		details = append(details, "subscription "+subscription)
+	}
+	if len(details) == 0 {
+		return errors.New(status)
+	}
+	return errors.New(status + ": " + strings.Join(details, ", "))
+}
+
+// gchatRelayDetail makes one string from a relay response body safe to log: no
+// control, format, or line/paragraph-separator characters (a body that could
+// break a line could forge the next one), cut at gchatRelayDetailMaxBytes
+// with an ellipsis marking the cut.
+func gchatRelayDetail(s string) string {
+	cleaned := strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp) {
+			return -1
+		}
+		return r
+	}, s)
+	return truncateRunes(strings.TrimSpace(cleaned), gchatRelayDetailMaxBytes)
 }
 
 // settle acks one pulled event. Failing to ack only means a redelivery the
@@ -811,6 +970,8 @@ func (g *Gateway) resolvePrincipal(backend, authorID string) string {
 	switch backend {
 	case injectBackend:
 		return g.resolveInjectPrincipal(authorID)
+	case a2aBackend:
+		return g.resolveA2APrincipal(authorID)
 	case consoleBackend:
 		if authorID == consoleAuthor {
 			return consolePrincipal
@@ -860,6 +1021,29 @@ func (g *Gateway) resolveInjectPrincipal(authorID string) string {
 	if !strings.HasPrefix(principal, injectEvalPrincipalPrefix) {
 		g.log.Error("the inject door's principal map maps an author to a principal that is not an eval identity; refusing it",
 			"author", authorID, "wantPrefix", injectEvalPrincipalPrefix)
+		return ""
+	}
+	return principal
+}
+
+// resolveA2APrincipal is the same construction for the A2A door: its own
+// map, the a2a: prefix on the lookup, the eval namespace on the value, and a
+// refusal for anything else. The caller named itself in a header or the
+// message metadata, so the map is the only thing standing between a
+// bearer-token holder and a principal of their choosing, exactly as on the
+// inject door. The developer and unattended identity classes, when they
+// land, resolve through a verifier beside this and never through this map.
+func (g *Gateway) resolveA2APrincipal(authorID string) string {
+	if g.a2aPM == nil {
+		return ""
+	}
+	principal := g.a2aPM.Resolve(a2aPrincipalPrefix + authorID)
+	if principal == "" {
+		return ""
+	}
+	if !strings.HasPrefix(principal, injectEvalPrincipalPrefix) {
+		g.log.Error("the A2A door's principal map maps a caller to a principal that is not an eval identity; refusing it",
+			"caller", authorID, "wantPrefix", injectEvalPrincipalPrefix)
 		return ""
 	}
 	return principal

@@ -293,6 +293,10 @@ bootstrap_install_env() {
   # the environment and records it; a typed --scope-* flag still overrides
   # for one run and is warned about.
   unset SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_SHARED_VPC_HOSTS SCOPE_METRICS_SCOPES SCOPE_MAX_PROJECTS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
+  # The scoped service account pool's switch and cap for the same reason: an
+  # inherited SCOPED_SA_POOL_ENABLED=true would arm the pool for one run, on
+  # accounts the next run from a clean shell deletes again.
+  unset SCOPED_SA_POOL_ENABLED SCOPED_SA_POOL_MAX_ACCOUNTS
   # Checked before sourcing: a stray quote would otherwise abort the run through
   # the ERR trap with a bash parse error and no indication of which file.
   if ! bash -n "$file" 2>/dev/null; then
@@ -512,6 +516,10 @@ PARAM_MODEL_MAX_TOKENS="${MODEL_MAX_TOKENS:-}"
 PARAM_LITELLM_REDACTION_ENABLED="${LITELLM_REDACTION_ENABLED:-}"
 PARAM_LITELLM_REDACTION_IP_ACTION="${LITELLM_REDACTION_IP_ACTION:-}"
 PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS="${LITELLM_REDACTION_IP_ALLOW_CIDRS:-}"
+# Empty takes the SCOPED_SA_POOL_* defaults in installer_common.sh: the pool
+# disarmed, the cap the module's own.
+PARAM_SCOPED_SA_POOL_ENABLED="${SCOPED_SA_POOL_ENABLED:-}"
+PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS="${SCOPED_SA_POOL_MAX_ACCOUNTS:-}"
 PARAM_USER_PROFILE_ENABLED="${USER_PROFILE_ENABLED:-}"
 # Slack, seeded from the loaded configuration exactly as Google Chat is above,
 # and for the same reason: the chat interview reads these rather than the
@@ -621,6 +629,16 @@ Flags for AI Agents & Automation:
                                 unmanaged
   --scope-exclude-clusters=TRIPLES
                                 Clusters to leave unmanaged, each as project/location/cluster
+  --scoped-sa-pool-enabled[=BOOL]
+                                Arm the scoped service account pool: one reader service
+                                account per project in scope, which the credential broker
+                                selects from and refuses a cluster outside of. Members hold
+                                no IAM grant yet, so leave it off (default: false)
+  --scoped-sa-pool-max-accounts=N
+                                The most pool accounts the plan may create in the install's
+                                project: set it to the service-account quota headroom the
+                                project has free (default: the module's 100, GCP's default
+                                quota, which the agent's own accounts already share)
   --enable-gvisor[=true|false]  Enable GKE Sandbox (gVisor) runtime isolation
                                 (default: DEFAULT_ENABLE_GVISOR, currently true)
   --enable-hermes-dashboard[=true|false]
@@ -798,6 +816,7 @@ require_scope_flag_value() {
     --scope-exclude-projects) key="SCOPE_EXCLUDE_PROJECTS" ;;
     --litellm-redaction-ip-action) key="LITELLM_REDACTION_IP_ACTION" ;;
     --litellm-redaction-ip-allow-cidrs) key="LITELLM_REDACTION_IP_ALLOW_CIDRS" ;;
+    --scoped-sa-pool-max-accounts) key="SCOPED_SA_POOL_MAX_ACCOUNTS" ;;
     *) key="SCOPE_EXCLUDE_CLUSTERS" ;;
   esac
   print_error "${flag}= was given an empty value."
@@ -867,6 +886,16 @@ parse_args() {
       --scope-exclude-clusters=*)
         PARAM_SCOPE_EXCLUDE_CLUSTERS="${1#*=}"; SCOPE_FLAG_PASSED="true"
         require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_EXCLUDE_CLUSTERS"; shift ;;
+      --scoped-sa-pool-enabled|--scoped-sa-pool-enabled=*)
+        SCOPE_FLAG_PASSED="true"
+        PARAM_SCOPED_SA_POOL_ENABLED="$(flag_bool_value "$1")"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_SCOPED_SA_POOL_ENABLED"; shift ;;
+      # An empty cap cannot mean "the recorded one" (the flag overrides the
+      # file) and must not mean "no cap" in silence; refused like a scope flag.
+      --scoped-sa-pool-max-accounts=*)
+        SCOPE_FLAG_PASSED="true"
+        PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS="${1#*=}"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS"; shift ;;
       --enable-gvisor|--enable-gvisor=*) PARAM_ENABLE_GVISOR="$(flag_bool_value "$1")"; shift ;;
       # Validated here and again in main(). The second check is not redundant:
       # PARAM_ENABLE_WEBUI is seeded from the recorded value and resolved with
@@ -1989,6 +2018,20 @@ bootstrap_install_env_file() {
       "A later run without it takes the networks the file records, and the model stops seeing the addresses only this run allowed." \
       false \
       "every later install.sh run"
+    # The scoped service account pool: a flag arms or disarms it, or moves its
+    # cap, for this run, and the next upgrade.sh or --menu apply regenerates
+    # from the file and reverses it either way, so the consequence is read in
+    # both directions rather than assuming the flag armed.
+    warn_flag_beats_unrecorded_file_value "$destination" SCOPED_SA_POOL_ENABLED --scoped-sa-pool-enabled \
+      "${PARAM_SCOPED_SA_POOL_ENABLED:-}" \
+      "A later run without it renders the pool from what the file records, so the next upgrade.sh or --menu apply reverses this run's choice: pool accounts this run created are deleted and the broker disarmed, or accounts this run deleted are recreated and the broker re-armed." \
+      true \
+      "every later install.sh run"
+    warn_flag_beats_unrecorded_file_value "$destination" SCOPED_SA_POOL_MAX_ACCOUNTS --scoped-sa-pool-max-accounts \
+      "${PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS:-}" \
+      "A later run without it takes the cap the file records, or the module's 100 when it records none, and refuses a pool past that at plan." \
+      false \
+      "every later install.sh run"
     # The scope keys: a flag applies its declaration for this run, and the
     # next full upgrade regenerates from the file, so a project the file does
     # not name is dropped again, its bindings revoked and its profiles retired.
@@ -2077,6 +2120,8 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" SCOPE_MAX_PROJECTS "${SCOPE_MAX_PROJECTS:-}"
   write_env_var "$tmp" SCOPE_EXCLUDE_PROJECTS "${SCOPE_EXCLUDE_PROJECTS:-}"
   write_env_var "$tmp" SCOPE_EXCLUDE_CLUSTERS "${SCOPE_EXCLUDE_CLUSTERS:-}"
+  write_env_var "$tmp" SCOPED_SA_POOL_ENABLED "${SCOPED_SA_POOL_ENABLED:-$SCOPED_SA_POOL_ENABLED_DEFAULT}"
+  write_env_var "$tmp" SCOPED_SA_POOL_MAX_ACCOUNTS "${SCOPED_SA_POOL_MAX_ACCOUNTS:-}"
   write_env_var "$tmp" GITOPS_ORG "${GITOPS_ORG:-}"
   write_env_var "$tmp" GITOPS_REPO "${GITOPS_REPO:-}"
   write_env_var "$tmp" GITHUB_APP_ID "${GITHUB_APP_ID:-}"
@@ -4498,11 +4543,12 @@ main() {
   print_banner
 
   if [ "${PARAM_MENU_MODE:-false}" = "true" ]; then
-    # The menu reloads install.env and reads the scope keys from it alone; a
-    # flag here would be validated and then dropped without a word.
+    # The menu reloads install.env and reads the scope keys, and the scoped
+    # service account pool's switch and cap, from it alone; a flag here would
+    # be validated and then dropped without a word.
     if [ "$SCOPE_FLAG_PASSED" = "true" ]; then
-      print_error "--menu takes no --scope-* flag: it edits install.env in place and reads the scope keys from there."
-      print_info "Set SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_MAX_PROJECTS, SCOPE_EXCLUDE_PROJECTS or SCOPE_EXCLUDE_CLUSTERS in install.env, or pass the flag to a plain install.sh run."
+      print_error "--menu takes no --scope-* flag, --scoped-sa-pool-enabled or --scoped-sa-pool-max-accounts: it edits install.env in place and reads the scope keys and the pool keys from there."
+      print_info "Set SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_MAX_PROJECTS, SCOPE_EXCLUDE_PROJECTS, SCOPE_EXCLUDE_CLUSTERS, SCOPED_SA_POOL_ENABLED or SCOPED_SA_POOL_MAX_ACCOUNTS in install.env, or pass the flag to a plain install.sh run."
       exit 1
     fi
     run_menu_system
@@ -5053,6 +5099,16 @@ main() {
   if is_truthy "$redaction_enabled" && [ -n "${LITELLM_REDACTION_RULES:-}" ]; then
     hcl_redaction_rules "$LITELLM_REDACTION_RULES" >/dev/null || exit 1
   fi
+  # The scoped service account pool, checked here for the same reason as the
+  # toggle above: a misspelt switch is refused rather than read as off, and a
+  # cap the module would refuse is named with its key before the interview.
+  local scoped_sa_pool_enabled="${PARAM_SCOPED_SA_POOL_ENABLED:-$SCOPED_SA_POOL_ENABLED_DEFAULT}"
+  if ! is_bool_spelling "$scoped_sa_pool_enabled"; then
+    print_error "SCOPED_SA_POOL_ENABLED='${scoped_sa_pool_enabled}' is neither true nor false. Fix it in install.env."
+    exit 1
+  fi
+  local scoped_sa_pool_max_accounts="${PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS:-}"
+  require_scoped_sa_pool_max_accounts "$scoped_sa_pool_max_accounts" || exit 1
 
   # Vertex authenticates with Workload Identity rather than an API key, so these
   # two are the only credentials it needs. The project defaults to the install
@@ -5710,6 +5766,8 @@ main() {
   export SCOPE_MAX_PROJECTS="$scope_max_projects"
   export SCOPE_EXCLUDE_PROJECTS="$scope_exclude_projects"
   export SCOPE_EXCLUDE_CLUSTERS="$scope_exclude_clusters"
+  export SCOPED_SA_POOL_ENABLED="$scoped_sa_pool_enabled"
+  export SCOPED_SA_POOL_MAX_ACCOUNTS="$scoped_sa_pool_max_accounts"
   export GITOPS_ORG="$github_org"
   export GITOPS_REPO="$github_repo"
   # One release of overlap: the agent runtime and the chart still speak
