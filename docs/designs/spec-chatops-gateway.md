@@ -382,8 +382,10 @@ deadline plus a fixed grace for the image pull), so a wedged adapter also lands 
 Sweep's domain instead of holding its bus credential indefinitely. Two ends still have
 no terminal to wait for, and the record carries an independent bound for each rather
 than a justification that assumes a terminal that may not come. The `ask` copy is
-cleared by the reap scan once it is older than `A2A_ASK_TTL` (24 hours by default,
-under the stream's retention, which is what the content posture below needs). A task
+cleared by the reap scan once it is `A2A_ASK_TTL` old (24 hours by default,
+under the stream's retention, which is what the content posture below needs), and the
+same pass clears each task history entry's requester and attribution at the same age,
+so a child task can no longer be minted on behalf of a turn older than that. A task
 with nothing on either of its event subjects - no pod, or a pod that never ran - is
 released from the serialization at the conversation's next turn once it is older than the
 first-event grace (`A2A_FIRST_EVENT_GRACE`, 10 minutes by default), with one line in the
