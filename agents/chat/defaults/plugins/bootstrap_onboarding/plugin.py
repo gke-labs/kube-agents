@@ -201,8 +201,10 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
          target;
       2. triggers the delivery job so the report arrives promptly;
       3. injects a short greeting instruction — never the inventory itself. The
-         report is delivered verbatim by the ``no_agent`` delivery job, so the
-         model only greets the user and offers to start somewhere;
+         report is delivered by the ``no_agent`` delivery job, verbatim, or
+         laid out for Slack when ``KAGE_SLACK_UX`` is on and the job delivers
+         to Slack, so the model only greets the user and offers to start
+         somewhere;
       4. records ``.bootstrap_greeted`` so no later session repeats any of it.
 
     Every later first turn returns None: the chat that primed onboarding owns

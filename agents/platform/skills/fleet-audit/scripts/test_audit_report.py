@@ -18,6 +18,7 @@ import io
 import json
 import fcntl
 import os
+import pathlib
 import stat
 import re
 import shutil
@@ -63,9 +64,14 @@ class GitResult:
 
 
 AUDIT = "compliance-audit"
-# The one stream whose SOP has a declared-intent step, so the one stream on
-# which a `declared` list validates. Every other stream rejects the list.
+# The pilot stream whose SOP has a declared-intent step, so a stream on which
+# a `declared` list validates. Every stream without such a step rejects the
+# list; compliance-audit is the second stream with one.
 DECLARING_AUDIT = "obtainability-audit"
+# A stream whose SOP has no declared-intent step, for the tests about what such a
+# stream rejects and owes; the generic AUDIT is a declaring stream now, and so
+# is the patch stream.
+NON_DECLARING_AUDIT = "ai-security-audit"
 NOW = datetime(2026, 8, 1, 9, 30, tzinfo=timezone.utc)
 # How far the run-record stamp may sit from wall-clock and still be this run's.
 # Wide enough for a loaded CI worker, narrow enough that a hardcoded date fails.
@@ -411,7 +417,7 @@ def make_doc(findings=None, audit=AUDIT, clusters=None, skipped=None):
         }
 
     clusters = [with_checks(cluster) for cluster in clusters]
-    return {
+    doc = {
         "audit": audit,
         "scope": {
             "clusters": clusters,
@@ -419,6 +425,21 @@ def make_doc(findings=None, audit=AUDIT, clusters=None, skipped=None):
         },
         "findings": findings if findings is not None else [make_finding()],
     }
+    # compliance-audit declares two postures, so a document on the generic
+    # stream whose roster ran either owes the declared-intent search record,
+    # or `finish` withholds its netpol findings and the tests below read a
+    # coverage gap where they meant a finding. The generic stream carries the
+    # record by default; DECLARING_AUDIT documents do not, because the tests
+    # about the record itself build those and set it on purpose.
+    declarable = audit_report.audit_declarable_checks(audit)
+    checks_that_ran = {
+        entry["check"] if isinstance(entry, dict) else entry
+        for cluster in clusters
+        for entry in cluster.get("checks_run", [])
+    }
+    if audit == AUDIT and declarable & checks_that_ran:
+        doc[audit_report.DECLARED_INTENT_SEARCHED_KEY] = searched("acme/fleet")
+    return doc
 
 
 THREE_SEVERITIES = [
@@ -821,6 +842,9 @@ class BaseTestCase(unittest.TestCase):
         # it changes holds, `unpublished_candidates` and the lost-store answer.
         # `TestCollectorStreamsRequireAManifest` holds the real set.
         self.patch_attr("COLLECTOR_AUDITS", frozenset())
+        # Off the real filesystem for every test, not only the harness ones:
+        # the default is /opt/data, which no dev machine or CI runner has.
+        self.patch_attr("SCRATCH_DIR", str(self.tmp_path / "scratch"))
 
     @staticmethod
     def forge_through_recorder(verb, payload, repository=None):
@@ -840,6 +864,11 @@ class BaseTestCase(unittest.TestCase):
 
     def run_main(self, argv):
         """Invoke the CLI, capturing stdout/stderr into self.out / self.err."""
+        if argv and argv[0] in ("finish", "remediate") and AUDIT in argv and not Path(audit_report.run_record_path_for(AUDIT)).exists():
+            # The record `start` leaves and `finish` measures the search
+            # against; the generic stream declares postures now, so a run
+            # that never called `start` here needs it or reads as no search.
+            self.record_run(audit=AUDIT)
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = audit_report.main(argv)
@@ -3584,6 +3613,206 @@ class TestPublishedBodies(HarnessTestCase):
         self.assertTrue(carriers, "the run published nothing at all")
 
 
+class TestNewMarker(HarnessTestCase):
+    """The per-finding `NEW_MARKER` the Slack card reads for its "new" tag.
+
+    Written only where the run can say what the last one filed and looked at;
+    a finding wrongly called new is the failure, so an unknown delta marks
+    nothing.
+    """
+
+    @staticmethod
+    def marked(body):
+        return re.findall(
+            r"<!-- finding:(\S+?) -->\n\n" + re.escape(audit_report.NEW_MARKER), body
+        )
+
+    def remember(self, rendered, filed=(), scope=None):
+        """Leave the store a previous run wrote: `rendered` in its body, `filed` too, over `scope`."""
+        self.seed_report(published_body(make_doc(findings=rendered), generated_at=NOW))
+        latest = self.store_dir() / "latest.json"
+        envelope = json.loads(latest.read_text(encoding="utf-8"))
+        envelope["document"] = {
+            "findings": [
+                {"id": derived_id(fid=f["id"], cluster=f["cluster"])}
+                for f in [*rendered, *filed]
+            ],
+            "scope": scope if scope is not None else make_doc()["scope"],
+        }
+        latest.write_text(json.dumps(envelope), encoding="utf-8")
+
+    def finish(self, doc):
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        (body,) = self.harness.bodies_for("issue-update")
+        return body
+
+    def test_a_first_run_marks_nothing(self):
+        # No ledger to measure against: everything would read as new.
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        (body,) = self.harness.bodies_for("issue-create")
+        self.assertIn("<!-- finding:", body)
+        self.assertNotIn(audit_report.NEW_MARKER, body)
+
+    def test_a_known_delta_marks_the_new_findings_and_only_them(self):
+        alpha = make_finding(fid="a", title="Alpha finding")
+        self.remember([alpha])
+        body = self.finish(make_doc(findings=[alpha, make_finding(fid="b", title="Bravo finding")]))
+        self.assertEqual(self.marked(body), [derived_id(fid="b")])
+        self.assertEqual(body.count(audit_report.NEW_MARKER), 1)
+        # The marker sits between the heading and its `Where:` line, and both
+        # readers of that block still read it.
+        self.assertEqual(self.stdout_json()["new"], 1)
+        locations = audit_report.parse_finding_locations(body)
+        self.assertEqual(set(locations), {derived_id(fid="a"), derived_id(fid="b")})
+        self.assertEqual(locations[derived_id(fid="b")]["title"], "Bravo finding")
+
+    def test_an_unknown_delta_marks_nothing(self):
+        # The ledger is open but its body cannot be read, so there is no memory.
+        alpha = make_finding(fid="a", title="Alpha finding")
+        self.remember([alpha])
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.harness.failures = {"issue-view !comments": 1}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc(findings=[alpha, make_finding(fid="b", title="Bravo finding")])
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        (body,) = self.harness.bodies_for("issue-update")
+        self.assertIn("<!-- finding:", body)
+        self.assertNotIn(audit_report.NEW_MARKER, body)
+
+    def test_a_block_under_another_identity_scheme_marks_nothing(self):
+        # Every id looks new across a scheme change, so none is marked, even
+        # where the last run's scope says it ran the finding's check.
+        alpha = make_finding(fid="a", title="Alpha finding")
+        self.remember([alpha])
+        latest = self.store_dir() / "latest.json"
+        envelope = json.loads(latest.read_text(encoding="utf-8"))
+        envelope["ledger_body"] = '## Findings\n\n<!-- audit-findings: ["a"] -->\n'
+        envelope["current_ids"] = ["a"]
+        envelope["id_scheme"] = None
+        envelope["document"]["findings"] = [{"id": "a"}]
+        latest.write_text(json.dumps(envelope), encoding="utf-8")
+        self.assertNotIn(audit_report.NEW_MARKER, self.finish(make_doc(findings=[alpha])))
+
+    def test_a_finding_the_last_body_cut_for_space_is_not_new(self):
+        # The hidden block names only what the body rendered; the stored
+        # document says `b` was filed too.
+        alpha = make_finding(fid="a", title="Alpha finding")
+        bravo = make_finding(fid="b", title="Bravo finding")
+        self.remember([alpha], filed=[bravo])
+        self.assertNotIn(audit_report.NEW_MARKER, self.finish(make_doc(findings=[alpha, bravo])))
+
+    def test_a_finding_on_a_cluster_the_last_run_skipped_is_not_new(self):
+        alpha = make_finding(fid="a", title="Alpha finding")
+        scope = make_doc(
+            clusters=[{"name": "prod-us-east"}],
+            skipped=[{"cluster": "stage-eu", "reason": "unreachable"}],
+        )["scope"]
+        self.remember([alpha], scope=scope)
+        doc = make_doc(
+            findings=[
+                alpha,
+                make_finding(fid="b", title="Bravo finding", cluster="stage-eu"),
+                make_finding(fid="c", title="Charlie finding"),
+            ]
+        )
+        self.assertEqual(self.marked(self.finish(doc)), [derived_id(fid="c")])
+
+    def test_a_carried_ledger_documents_scope_does_not_count_as_looked_at(self):
+        # A held-open run skipped stage-eu and carried the older run's ledger
+        # document, which reached it; the last run still never looked there.
+        alpha = make_finding(fid="a", title="Alpha finding")
+        skipped = make_doc(
+            clusters=[{"name": "prod-us-east"}],
+            skipped=[{"cluster": "stage-eu", "reason": "unreachable"}],
+        )["scope"]
+        self.remember([alpha], scope=skipped)
+        latest = self.store_dir() / "latest.json"
+        envelope = json.loads(latest.read_text(encoding="utf-8"))
+        reached = make_doc(clusters=[{"name": "prod-us-east"}, {"name": "stage-eu"}])["scope"]
+        envelope["ledger_document"] = {"findings": [], "scope": reached}
+        latest.write_text(json.dumps(envelope), encoding="utf-8")
+        doc = make_doc(
+            findings=[
+                alpha,
+                make_finding(fid="b", title="Bravo finding", cluster="stage-eu"),
+                make_finding(fid="c", title="Charlie finding"),
+            ]
+        )
+        self.assertEqual(self.marked(self.finish(doc)), [derived_id(fid="c")])
+
+    def test_a_finding_whose_check_the_last_run_did_not_run_is_not_new(self):
+        # The last run reached prod-us-east but its netpol check did not run
+        # there (timed out, say), so nothing it found there is known new.
+        alpha = make_finding(fid="a", title="Alpha finding", cluster="stage-eu")
+        others = [c for c in audit_report.audit_checks(AUDIT) if c != "netpol-missing"]
+        scope = make_doc(
+            clusters=[{"name": "prod-us-east", "checks_run": others}, {"name": "stage-eu"}]
+        )["scope"]
+        self.remember([alpha], scope=scope)
+        doc = make_doc(
+            findings=[
+                alpha,
+                make_finding(fid="b", title="Bravo finding"),
+                make_finding(fid="c", title="Charlie finding", cluster="stage-eu"),
+            ]
+        )
+        self.assertEqual(self.marked(self.finish(doc)), [derived_id(fid="c", cluster="stage-eu")])
+
+    def test_the_filed_set_is_everything_the_last_run_filed_and_ran(self):
+        withheld = audit_report.POSTURES_WITHHELD_KEY
+        envelope = {
+            "document": {
+                "findings": [{"id": "a"}, "junk", {"title": "no id"}],
+                withheld: {"findings": [{"id": "w"}]},
+                "scope": {
+                    "clusters": [
+                        {"name": " seeded-a ", "checks_run": [{"check": "rbac"}, "junk"]},
+                        {"checks_run": [{"check": "orphan"}]},
+                        "junk",
+                    ],
+                    "skipped": [{"cluster": "seeded-c", "reason": "x"}],
+                },
+            },
+            "ledger_document": {"findings": [{"id": "carried"}]},
+        }
+        self.assertEqual(
+            audit_report.report_filed(envelope),
+            ({"a", "w", "carried"}, {("seeded-a", "rbac")}),
+        )
+
+    def test_a_memory_without_a_document_files_nothing_knowable(self):
+        # A memory seeded from the issue body cannot say what the body cut.
+        self.assertIsNone(audit_report.report_filed(None))
+        self.assertIsNone(
+            audit_report.report_filed({"ledger_body": "x", "seeded_from_ledger": True})
+        )
+
+    def test_the_marker_is_charged_against_the_body_budget(self):
+        finding = make_finding(fid="a", title="Alpha finding")
+        plain = audit_report.render_finding(finding)
+        marked = audit_report.render_finding(finding, new=True)
+        self.assertEqual(marked[:3] + marked[5:], plain)
+        self.assertEqual(marked[3:5], ["", audit_report.NEW_MARKER])
+        both = [finding, make_finding(fid="b", title="Alpha finding")]
+
+        def cost(f):
+            return len("\n".join(audit_report.render_finding(f))) + 2 + len(str(f["id"])) + 3
+
+        # Room for both unmarked; marking the first leaves no room for the second.
+        budget = sum(cost(f) for f in both)
+        _, omitted = audit_report.select_rendered_findings(both, budget)
+        self.assertEqual(omitted, [])
+        _, omitted = audit_report.select_rendered_findings(both, budget, new_ids={str(finding["id"])})
+        self.assertEqual(len(omitted), 1)
+
+
 class TestFinishClean(HarnessTestCase):
     def test_a_clean_run_with_no_ledger_still_counts_what_was_declared(self):
         # Nothing to open and nothing to close, so the JSON line and the log
@@ -4249,12 +4478,13 @@ class TestStart(HarnessTestCase):
                 "carried": [],
                 "context_repos": [],
                 "declared_intent_repos": ["acme/fleet"],
-                # A stream with no declared-intent step searches nothing on
-                # the harness's behalf, and says so with empty lists rather
-                # than by leaving the keys out.
+                # compliance-audit declares two postures, so `start` searches
+                # the GitOps repository for it; this harness stubs no clone,
+                # so the repository is reported unsearched rather than left
+                # out, and `finish` withholds the postures it covers.
                 "declared_intent_searched": [],
                 "declared_intent_sources": [],
-                "declared_intent_unsearched": [],
+                "declared_intent_unsearched": [{"repo": "acme/fleet", "ref": None}],
                 "declarations_path": str(
                     self.tmp_path / "declarations_compliance-audit.json"
                 ),
@@ -5031,7 +5261,7 @@ class TestDeclaredIntent(BaseTestCase):
                 self.validate(doc)
 
     def test_a_stream_without_a_declared_intent_step_rejects_the_list(self):
-        # Eight streams have no §4a. A worker on one of them that writes a
+        # Six streams have no declared-intent step. A worker on one of them that writes a
         # `declared` list has misread a step that does not exist for it, and a
         # hostile document has found a stream with no rule to break; both are
         # rejected whole rather than admitted because the check is on the
@@ -5042,8 +5272,8 @@ class TestDeclaredIntent(BaseTestCase):
             for audit_id, spec in audit_report.AUDITS.items()
             if not spec.declarable
         ]
-        self.assertIn(AUDIT, silent)
-        self.assertEqual(len(silent), len(audit_report.AUDITS) - 1)
+        self.assertIn(NON_DECLARING_AUDIT, silent)
+        self.assertEqual(len(silent), len(audit_report.AUDITS) - 3)
         for audit_id in silent:
             with self.subTest(audit=audit_id):
                 doc = make_doc(audit=audit_id, findings=[])
@@ -5395,6 +5625,321 @@ POSTURE_CHECKS = ("no-pdb", "no-hpa", "hpa-cannot-scale")
 FAULT_CHECKS = ("blocking-pdb", "no-requests")
 
 
+class TestPatchDeclaredShapes(HarnessTestCase):
+    """The patch stream's six postures: the knobs an owner sets, and nothing the fleet drifted into."""
+
+    PATCH_AUDIT = "security-patch-orchestrator"
+
+    def test_the_declarable_set_is_the_six_policy_knobs(self):
+        # Pinned as a literal: the catalogue test only checks the set is a
+        # subset of the roster, and a fault slipping in would pass it.
+        self.assertEqual(
+            audit_report.audit_declarable_checks(self.PATCH_AUDIT),
+            frozenset({"no-channel", "no-autoupgrade", "no-autorepair", "no-maintenance-window", "blocking-exclusion", "no-notifications"}),
+        )
+        for fault in ("master-behind", "pool-skew", "fleet-spread", "stale-image-type"):
+            self.assertNotIn(fault, audit_report.audit_declarable_checks(self.PATCH_AUDIT))
+
+    def _patch_finding(self, fid, check, obj, severity="minor"):
+        return make_finding(fid=fid, check=check, obj=obj, severity=severity, namespace="", cluster="acme-prod/us-east1/prod-us-east", command="gcloud container clusters describe prod-us-east --location=us-east1 --project=acme-prod --format=json", remediation={"kind": "manual", "note": "a human decides"})
+
+    def _patch_doc(self, findings):
+        clusters = [{"name": "acme-prod/us-east1/prod-us-east", "location": "us-east1", "project": "acme-prod"}]
+        return audit_report.validate_findings(make_doc(findings=findings, audit=self.PATCH_AUDIT, clusters=clusters), self.PATCH_AUDIT)
+
+    def test_a_declaration_moves_the_posture_and_not_the_version_lag_on_the_same_cluster(self):
+        # One note names the cluster for both: the knob moves, the lag stays,
+        # because `master-behind` is not in the set and is never looked up.
+        posture = self._patch_finding("notif", "no-notifications", "Cluster/prod-us-east")
+        pool = self._patch_finding("pool", "no-autoupgrade", "NodePool/batch-a", severity="major")
+        lag = self._patch_finding("lag", "master-behind", "Cluster/prod-us-east", severity="major")
+        doc = self._patch_doc([posture, pool, lag])
+        declarations = [
+            {"check": check, "namespace": "", "object": obj, "repo": "acme/fleet", "path": "knowledge/prod-us-east.md", "excerpt": "x"}
+            for check, obj in (("no-notifications", "Cluster/prod-us-east"), ("no-autoupgrade", "NodePool/batch-a"), ("master-behind", "Cluster/prod-us-east"))
+        ]
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, declarations)
+        self.assertEqual(sorted(f["check"] for f in moved), ["no-autoupgrade", "no-notifications"])
+        self.assertEqual([f["check"] for f in doc["findings"]], ["master-behind"])
+        self.assertEqual(sorted(e["check"] for e in doc["declared"]), ["no-autoupgrade", "no-notifications"])
+
+    def test_an_incomplete_search_withholds_the_six_knobs_and_publishes_the_faults(self):
+        # No search record at all: every posture of the six is held, the four
+        # faults publish, and the run reads partial from the caller's side.
+        knobs = [self._patch_finding(f"k{i}", check, obj) for i, (check, obj) in enumerate((
+            ("no-channel", "Cluster/prod-us-east"), ("no-autoupgrade", "NodePool/batch-a"), ("no-autorepair", "NodePool/batch-a"),
+            ("no-maintenance-window", "Cluster/prod-us-east"), ("blocking-exclusion", "Cluster/prod-us-east"), ("no-notifications", "Cluster/prod-us-east")))]
+        faults = [self._patch_finding(f"f{i}", check, obj, severity="major") for i, (check, obj) in enumerate((
+            ("master-behind", "Cluster/prod-us-east"), ("pool-skew", "NodePool/batch-a"), ("fleet-spread", "Cluster/prod-us-east"), ("stale-image-type", "NodePool/batch-a")))]
+        doc = self._patch_doc(knobs + faults)
+        doc.pop(audit_report.DECLARED_INTENT_SEARCHED_KEY, None)
+        with contextlib.redirect_stderr(io.StringIO()):
+            withheld = audit_report.withhold_unsearched_postures(doc, None)
+        self.assertEqual(sorted(f["check"] for f in withheld), sorted(audit_report.audit_declarable_checks(self.PATCH_AUDIT)))
+        self.assertEqual(sorted(f["check"] for f in doc["findings"]), ["fleet-spread", "master-behind", "pool-skew", "stale-image-type"])
+
+    def test_the_validator_rejects_a_declared_version_lag(self):
+        doc = make_doc(findings=[], audit=self.PATCH_AUDIT)
+        doc["declared"] = [make_declared(check="no-channel", cluster="prod-us-east", namespace="", obj="Cluster/prod-us-east")]
+        audit_report.validate_findings(copy.deepcopy(doc), self.PATCH_AUDIT)
+        for fault in ("master-behind", "pool-skew", "fleet-spread", "stale-image-type"):
+            with self.subTest(fault):
+                doc["declared"][0]["check"] = fault
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(copy.deepcopy(doc), self.PATCH_AUDIT)
+                self.assertIn("declared[0].check", str(cm.exception))
+
+
+class TestComplianceDeclaredShapes(HarnessTestCase):
+    """The two compliance postures: which shapes a declaration may move, and what a declared 2.7 workload does to its siblings."""
+
+    def _netpol_declaration(self, obj):
+        return {"check": "netpol-missing", "namespace": "payments", "object": obj, "repo": "acme/fleet", "path": "knowledge/payments.md", "excerpt": "x"}
+
+    def test_a_declaration_moves_the_namespace_posture_and_not_the_allow_all_fault(self):
+        posture = make_finding(fid="ns", severity="major", obj="Namespace/payments", check="netpol-missing")
+        fault = make_finding(fid="open", severity="minor", obj="NetworkPolicy/allow-everything", check="netpol-missing")
+        doc = audit_report.validate_findings(make_doc(findings=[posture, fault], audit=AUDIT), AUDIT)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            moved = audit_report.apply_declarations(doc, [self._netpol_declaration("Namespace/payments"), self._netpol_declaration("NetworkPolicy/allow-everything")])
+        self.assertEqual([f["object"] for f in moved], ["Namespace/payments"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["NetworkPolicy/allow-everything"])
+        self.assertIn("DECLARATION NOT APPLIED", err.getvalue())
+        self.assertIn("allow-all fault", err.getvalue())
+
+    def test_the_validator_rejects_a_declared_entry_naming_a_policy(self):
+        doc = make_doc(findings=[], audit=AUDIT)
+        doc["declared"] = [{"check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments", "object": "NetworkPolicy/allow-everything", "title": "t", "declaration": {"repo": "acme/fleet", "path": "knowledge/payments.md", "excerpt": "x"}}]
+        with self.assertRaises(audit_report.ValidationError) as cm:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("declared[0].object", str(cm.exception))
+        self.assertIn("allow-all", str(cm.exception))
+        # The kind is folded as the join folds it: kubectl's spelling and a
+        # space around the slash are the namespace posture too.
+        for obj in ("Namespace/payments", "namespace/payments", "Namespace / payments", "Namespace payments", "Namespace-payments"):
+            with self.subTest(obj):
+                doc["declared"][0]["object"] = obj
+                audit_report.validate_findings(doc, AUDIT)
+        # A 2.7 entry names the workload that keeps its token; the namespace or
+        # the account covers none, and the shield would ignore the entry.
+        for obj in ("Namespace/payments", "ServiceAccount/default"):
+            with self.subTest(obj):
+                doc["declared"][0].update({"check": "default-sa-automount", "object": obj})
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(doc, AUDIT)
+                self.assertIn("names the workload", str(cm.exception))
+        doc["declared"][0].update({"check": "default-sa-automount", "object": "Deployment/api"})
+        audit_report.validate_findings(doc, AUDIT)
+        doc["declared"][0].update({"check": "netpol-missing", "object": "Namespace/payments"})
+        # A missing object is reported as missing, not as the allow-all shape.
+        del doc["declared"][0]["object"]
+        with self.assertRaises(audit_report.ValidationError) as cm:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertNotIn("allow-all", str(cm.exception))
+
+    def test_the_apply_guard_folds_the_kind_as_the_join_does(self):
+        # Every spelling the join reads as `namespace-payments` is the posture
+        # to the guard too: the join folds every separator, not only `/`.
+        for spelling in ("namespace/payments", "Namespace payments", "Namespace-payments"):
+            with self.subTest(spelling):
+                posture = make_finding(fid="ns", severity="major", obj=spelling, check="netpol-missing")
+                doc = audit_report.validate_findings(make_doc(findings=[posture], audit=AUDIT), AUDIT)
+                with contextlib.redirect_stderr(io.StringIO()):
+                    moved = audit_report.apply_declarations(doc, [self._netpol_declaration("Namespace/payments")])
+                self.assertEqual([f["object"] for f in moved], [spelling])
+        self.assertFalse(audit_report._is_namespace_object("NetworkPolicy/namespace-wide"))
+
+    def _sa_finding(self, fid, obj, namespace="payments", cluster="prod-us-east"):
+        return make_finding(fid=fid, severity="major", obj=obj, check="default-sa-automount", namespace=namespace, cluster=cluster, command="kubectl get sa default -n " + namespace, remediation={"kind": "manifest", "path": f"clusters/{cluster}/{namespace}/default-sa-automount.yaml", "note": "shared file"})
+
+    def test_a_declared_workload_makes_its_siblings_fixes_manual(self):
+        api = self._sa_finding("api", "Deployment/api")
+        worker = self._sa_finding("worker", "Deployment/worker")
+        elsewhere = self._sa_finding("batch", "Deployment/batch", namespace="billing")
+        doc = audit_report.validate_findings(make_doc(findings=[api, worker, elsewhere], audit=AUDIT), AUDIT)
+        declaration = {"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "x"}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            audit_report.apply_declarations(doc, [declaration])
+            changed = audit_report.shield_declared_account_siblings(doc)
+        by_obj = {f["object"]: f for f in doc["findings"]}
+        self.assertEqual(sorted(by_obj), ["Deployment/batch", "Deployment/worker"])
+        self.assertEqual(changed, [by_obj["Deployment/worker"]["id"]])
+        self.assertEqual(by_obj["Deployment/worker"]["remediation"]["kind"], "manual")
+        self.assertEqual(by_obj["Deployment/worker"]["remediation"]["path"], "")
+        self.assertIn("`Deployment/api` declared at acme/fleet:knowledge/api-token.md", by_obj["Deployment/worker"]["remediation"]["note"])
+        self.assertIn("shared file", by_obj["Deployment/worker"]["remediation"]["note"])
+        self.assertEqual(by_obj["Deployment/batch"]["remediation"]["kind"], "manifest")
+        self.assertEqual(audit_report.remediation_groups(doc["findings"]), [[by_obj["Deployment/batch"]]])
+        self.assertIn("MANUAL:", err.getvalue())
+
+    def test_a_sibling_already_manual_still_gains_the_shield_note(self):
+        # 2.7's default is manual (few repositories declare the auto-created
+        # default ServiceAccount); its own note is the shared-account fix, so
+        # the shield text joins it rather than being skipped.
+        api = self._sa_finding("api", "Deployment/api")
+        worker = self._sa_finding("worker", "Deployment/worker")
+        worker["remediation"] = {"kind": "manual", "path": "", "note": "Set automountServiceAccountToken: false on the default ServiceAccount."}
+        doc = audit_report.validate_findings(make_doc(findings=[api, worker], audit=AUDIT), AUDIT)
+        declaration = {"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "x"}
+        with contextlib.redirect_stderr(io.StringIO()):
+            audit_report.apply_declarations(doc, [declaration])
+            changed = audit_report.shield_declared_account_siblings(doc)
+        (left,) = doc["findings"]
+        self.assertEqual(changed, [left["id"]])
+        self.assertEqual(left["remediation"]["kind"], "manual")
+        # The shield comes first: the worker's text is the shared-account fix,
+        # and the renderer clips a long note from the end.
+        self.assertTrue(left["remediation"]["note"].startswith("_(A declared workload shares this namespace's `default` ServiceAccount; turning automount off"))
+        self.assertTrue(left["remediation"]["note"].endswith("Set automountServiceAccountToken: false on the default ServiceAccount."))
+        self.assertIn("`Deployment/api` declared at acme/fleet:knowledge/api-token.md", left["remediation"]["note"])
+
+    def test_the_shield_names_three_declared_workloads_and_counts_the_rest(self):
+        worker = self._sa_finding("worker", "Deployment/worker")
+        doc = audit_report.validate_findings(make_doc(findings=[worker], audit=AUDIT), AUDIT)
+        declarations = [{"check": "default-sa-automount", "namespace": "payments", "object": f"Deployment/api{i}", "repo": "acme/fleet", "path": f"knowledge/api{i}.md", "excerpt": "x"} for i in range(5)]
+        # Declared entries the worker filed by hand, one per declaration.
+        doc["declared"] = [{"check": "default-sa-automount", "cluster": "prod-us-east", "namespace": "payments", "object": d["object"], "title": "t", "declaration": {"repo": d["repo"], "path": d["path"], "excerpt": "x"}} for d in declarations]
+        with contextlib.redirect_stderr(io.StringIO()):
+            audit_report.shield_declared_account_siblings(doc)
+        note = doc["findings"][0]["remediation"]["note"]
+        self.assertIn("`Deployment/api2` declared at acme/fleet:knowledge/api2.md and 2 more.)_", note)
+        self.assertNotIn("api3", note)
+        self.assertLess(note.index("so this stays manual"), note.index("Declared:"))
+
+    def test_a_worker_written_shield_sentence_does_not_mark_a_finding_shielded(self):
+        worker = self._sa_finding("worker", "Deployment/worker")
+        worker["remediation"] = {"kind": "manifest", "path": "clusters/prod-us-east/payments/default-sa-automount.yaml", "note": audit_report.SHARED_ACCOUNT_SHIELD_NOTE.format(declared="`Deployment/x`")}
+        doc = audit_report.validate_findings(make_doc(findings=[worker], audit=AUDIT), AUDIT)
+        self.assertEqual(audit_report.shield_declared_account_siblings(doc), [])
+
+    def test_a_declared_workload_the_worker_left_out_still_shields_its_namespace(self):
+        # The owner declared api; the worker never reported api at all, so
+        # nothing moved to declared[]. The harness's own declarations are the
+        # second source, and worker's shared-account fix still goes manual.
+        worker = self._sa_finding("worker", "Deployment/worker")
+        elsewhere = self._sa_finding("batch", "Deployment/batch", namespace="billing")
+        doc = audit_report.validate_findings(make_doc(findings=[worker, elsewhere], audit=AUDIT), AUDIT)
+        declaration = {"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "x"}
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(audit_report.apply_declarations(doc, [declaration]), [])
+            changed = audit_report.shield_declared_account_siblings(doc, [declaration])
+        by_obj = {f["object"]: f for f in doc["findings"]}
+        self.assertEqual(changed, [by_obj["Deployment/worker"]["id"]])
+        self.assertEqual(by_obj["Deployment/worker"]["remediation"]["kind"], "manual")
+        self.assertIn("`Deployment/api` declared at acme/fleet:knowledge/api-token.md", by_obj["Deployment/worker"]["remediation"]["note"])
+        self.assertEqual(by_obj["Deployment/batch"]["remediation"]["kind"], "manifest")
+        # A declaration scoped to another cluster reaches nothing here; a
+        # fleet-wide one reaches every cluster.
+        scoped = dict(declaration, **{audit_report.DECLARATION_CLUSTER_FIELD: "prod-eu-west"})
+        fresh = audit_report.validate_findings(make_doc(findings=[self._sa_finding("worker", "Deployment/worker")], audit=AUDIT), AUDIT)
+        self.assertEqual(audit_report.shield_declared_account_siblings(fresh, [scoped]), [])
+        # One declared workload named once, whichever source it came from and
+        # however each spelled it: the worker's `deployment/api` and the
+        # owner's `Deployment/api` are one workload to the join.
+        with contextlib.redirect_stderr(io.StringIO()):
+            both = audit_report.validate_findings(make_doc(findings=[self._sa_finding("api", "deployment/api"), self._sa_finding("worker", "Deployment/worker")], audit=AUDIT), AUDIT)
+            audit_report.apply_declarations(both, [declaration])
+            audit_report.shield_declared_account_siblings(both, [declaration])
+        (left,) = both["findings"]
+        self.assertEqual(left["remediation"]["note"].count("declared at acme/fleet:knowledge/api-token.md"), 1)
+        # And it is the owner's spelling that is printed, not the worker's.
+        self.assertIn("`Deployment/api` declared at", left["remediation"]["note"])
+        # Two notes declaring the same workload name it once, under the first.
+        twice = audit_report.validate_findings(make_doc(findings=[self._sa_finding("worker", "Deployment/worker")], audit=AUDIT), AUDIT)
+        second = dict(declaration, path="knowledge/also-api.md")
+        with contextlib.redirect_stderr(io.StringIO()):
+            audit_report.shield_declared_account_siblings(twice, [declaration, second])
+        note = twice["findings"][0]["remediation"]["note"]
+        self.assertEqual(note.count("`Deployment/api` declared at"), 1)
+        self.assertIn("knowledge/api-token.md", note)
+
+    def test_candidates_are_declared_from_the_manifest_under_the_same_shape_rules(self):
+        posture = {"check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments", "object": "Namespace/payments", "severity": "major", "excerpt": "no policy"}
+        fault = {"check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments", "object": "NetworkPolicy/allow-everything", "severity": "minor", "excerpt": "allow all"}
+        reported = {"check": "default-sa-automount", "cluster": "prod-us-east", "namespace": "payments", "object": "Deployment/api", "severity": "major", "excerpt": "automount"}
+        manifest = {"clusters": [{"name": "prod-us-east", "candidates": [posture, fault, reported]}]}
+        declarations = [
+            {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/payments", "repo": "acme/fleet", "path": "knowledge/payments.md", "excerpt": "x"},
+            {"check": "netpol-missing", "namespace": "payments", "object": "NetworkPolicy/allow-everything", "repo": "acme/fleet", "path": "knowledge/payments.md", "excerpt": "x"},
+            {"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "x"},
+        ]
+        api = self._sa_finding("api", "Deployment/api")
+        doc = audit_report.validate_findings(make_doc(findings=[api], audit=AUDIT), AUDIT)
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, declarations)
+            added = audit_report.declare_collector_candidates(doc, declarations, manifest)
+        # api was reported and moved by apply_declarations, so it is not added
+        # again; the namespace posture is declared from the manifest; the
+        # allow-all fault never is.
+        self.assertEqual([f["object"] for f in moved], ["Deployment/api"])
+        self.assertEqual(added, [audit_report._shorten_id(audit_report.derive_finding_id({**posture}))])
+        self.assertEqual(sorted(e["object"] for e in doc["declared"]), ["Deployment/api", "Namespace/payments"])
+        self.assertEqual(audit_report.declare_collector_candidates(doc, declarations, manifest), [])
+        self.assertEqual(audit_report.declare_collector_candidates(doc, declarations, None), [])
+        # A candidate on a cluster the document did not read is not declared:
+        # the validator holds `declared[]` to `scope.clusters`, and so does this.
+        elsewhere = {"clusters": [{"name": "rogue-cluster", "candidates": [dict(posture, cluster="rogue-cluster")]}]}
+        self.assertEqual(audit_report.declare_collector_candidates(doc, declarations, elsewhere), [])
+
+    def test_a_declaration_naming_no_workload_shields_nothing(self):
+        # 2.7 is declared per workload. An item that copies the 2.6 shape, or
+        # names the account, covers no workload's token: logged, not applied.
+        worker = self._sa_finding("worker", "Deployment/worker")
+        for obj in ("Namespace/payments", "ServiceAccount/default"):
+            with self.subTest(obj):
+                doc = audit_report.validate_findings(make_doc(findings=[worker], audit=AUDIT), AUDIT)
+                declaration = {"check": "default-sa-automount", "namespace": "payments", "object": obj, "repo": "acme/fleet", "path": "knowledge/payments.md", "excerpt": "x"}
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(audit_report.shield_declared_account_siblings(doc, [declaration]), [])
+                self.assertEqual(doc["findings"][0]["remediation"]["kind"], "manifest")
+                self.assertIn("DECLARATION NOT APPLIED", err.getvalue())
+                self.assertIn("names no workload", err.getvalue())
+
+    def test_the_shield_folds_cluster_and_namespace_as_the_id_does(self):
+        api = self._sa_finding("api", "Deployment/api")
+        worker = self._sa_finding("worker", "Deployment/worker", namespace="Payments ")
+        doc = audit_report.validate_findings(make_doc(findings=[api, worker], audit=AUDIT), AUDIT)
+        declaration = {"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "x"}
+        with contextlib.redirect_stderr(io.StringIO()):
+            audit_report.apply_declarations(doc, [declaration])
+            changed = audit_report.shield_declared_account_siblings(doc)
+        (left,) = doc["findings"]
+        self.assertEqual(changed, [left["id"]])
+        self.assertEqual(left["remediation"]["kind"], "manual")
+
+    def test_an_incomplete_search_withholds_the_namespace_posture_and_publishes_the_allow_all_fault(self):
+        posture = make_finding(fid="ns", severity="major", obj="Namespace/payments", check="netpol-missing")
+        # A spelling the code cannot classify is held with the postures: the
+        # withhold errs toward holding, the join toward not silencing.
+        odd = make_finding(fid="odd", severity="major", obj="ns/billing", check="netpol-missing", namespace="billing")
+        fault = make_finding(fid="open", severity="minor", obj="NetworkPolicy/allow-everything", check="netpol-missing")
+        doc = audit_report.validate_findings(make_doc(findings=[posture, odd, fault], audit=AUDIT), AUDIT)
+        doc.pop(audit_report.DECLARED_INTENT_SEARCHED_KEY, None)
+        with contextlib.redirect_stderr(io.StringIO()):
+            withheld = audit_report.withhold_unsearched_postures(doc, None)
+        self.assertEqual(sorted(f["object"] for f in withheld), ["Namespace/payments", "ns/billing"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["NetworkPolicy/allow-everything"])
+
+    def test_no_declared_workload_leaves_the_shared_file_alone(self):
+        doc = audit_report.validate_findings(make_doc(findings=[self._sa_finding("api", "Deployment/api"), self._sa_finding("worker", "Deployment/worker")], audit=AUDIT), AUDIT)
+        self.assertEqual(audit_report.shield_declared_account_siblings(doc), [])
+        self.assertEqual(len(audit_report.remediation_groups(doc["findings"])), 1)
+
+    def test_another_streams_posture_in_a_note_is_a_note_not_a_warning(self):
+        text = "---\ntype: decision\ntitle: t\ndeclares:\n  - check: no-pdb\n    namespace: seeded-intent\n    object: Deployment/notification-relay\n  - check: netpol-missing\n    namespace: seeded-intent\n    object: Namespace/seeded-intent\n  - check: bogus\n    namespace: x\n    object: Deployment/y\n---\n"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            entries = audit_report.parse_declarations(text, repo="acme/fleet", path="knowledge/n.md", declarable=audit_report.audit_declarable_checks(AUDIT))
+        self.assertEqual([e["check"] for e in entries], ["netpol-missing"])
+        out = err.getvalue()
+        self.assertIn("NOTE: acme/fleet:knowledge/n.md declares[0]: 'no-pdb' is another stream's posture", out)
+        self.assertIn("WARNING: acme/fleet:knowledge/n.md declares[2]: 'bogus' is not a check a declaration may justify", out)
+
+
 class TestDeclaredIntentSearch(HarnessTestCase):
     """`declared_intent_searched`: the record that the §4a step ran, or the postures are withheld.
 
@@ -5605,7 +6150,7 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         )
 
     def test_other_streams_owe_nothing(self):
-        doc = audit_report.validate_findings(make_doc(), AUDIT)
+        doc = audit_report.validate_findings(make_doc(audit=NON_DECLARING_AUDIT, findings=[]), NON_DECLARING_AUDIT)
         self.assertFalse(audit_report.declared_intent_applies(doc))
         self.assertEqual(audit_report.withhold_unsearched_postures(doc, None), [])
 
@@ -5727,12 +6272,12 @@ class TestDeclaredIntentSearch(HarnessTestCase):
                 self.rejects(doc, DECLARING_AUDIT, "declared_intent_searched[0]", "owner/name@sha")
 
     def test_the_key_is_rejected_on_a_stream_with_no_declared_intent_step(self):
-        doc = make_doc()
+        doc = make_doc(audit=NON_DECLARING_AUDIT, findings=[])
         doc[audit_report.DECLARED_INTENT_SEARCHED_KEY] = searched("acme/fleet")
-        self.rejects(doc, AUDIT, "declared_intent_searched[0]", "no declared-intent step")
+        self.rejects(doc, NON_DECLARING_AUDIT, "declared_intent_searched[0]", "no declared-intent step")
         # `[]` says the same thing as an absent key, everywhere.
         doc[audit_report.DECLARED_INTENT_SEARCHED_KEY] = []
-        audit_report.validate_findings(copy.deepcopy(doc), AUDIT)
+        audit_report.validate_findings(copy.deepcopy(doc), NON_DECLARING_AUDIT)
 
     def test_a_short_sha_is_accepted(self):
         doc = self.doc()
@@ -7137,8 +7682,8 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
 
     def test_a_stream_with_no_declared_intent_step_clones_nothing(self):
         self.context("acme/terraform-live")
-        self.workspace = self.gitops_root / AUDIT / "acme__fleet"
-        rc = self.run_main(["start", "--audit", AUDIT])
+        self.workspace = self.gitops_root / NON_DECLARING_AUDIT / "acme__fleet"
+        rc = self.run_main(["start", "--audit", NON_DECLARING_AUDIT])
         self.assertEqual(rc, 0, self.err)
         payload = json.loads(self.out)
         self.assertEqual(payload["context_repos"], ["acme/terraform-live"])
@@ -15850,6 +16395,162 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertTrue(self.harness.forge_calls("proposal-close"))
         self.assertNotIn("NOT being announced as resolved", self.err)
 
+    def account_candidate(self, obj):
+        return {
+            "check": "default-sa-automount",
+            "cluster": "prod-us-east",
+            "namespace": "payments",
+            "object": obj,
+            "severity": "major",
+            "excerpt": "automountServiceAccountToken unset on the default ServiceAccount",
+        }
+
+    def test_a_shielded_sibling_closes_the_shared_account_pull_request(self):
+        # Run N opened a pull request for api and worker together (the shared
+        # default-sa-automount.yaml); the owner then declared api. Run N+1 moves
+        # api to declared, the shield turns worker manual, and the pull request
+        # that still proposes the shared-account fix is closed with that reason.
+        path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
+        api = make_finding(fid="api", check="default-sa-automount", obj="Deployment/api", title="api", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        worker = make_finding(fid="worker", check="default-sa-automount", obj="Deployment/worker", title="worker", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        previous_body = published_body(make_doc(findings=[api, worker], audit=AUDIT), generated_at=NOW)
+        self.declaring_replies(previous_body)
+        api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
+        worker_id = derived_id(check="default-sa-automount", obj="Deployment/worker")
+        self.harness.replies["proposal-list"] = proposals_view(
+            [pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([api_id, worker_id]))]
+        )
+        self.touch(path)
+        doc = make_doc(findings=[worker], audit=AUDIT)
+        doc["declared"] = [{"check": "default-sa-automount", "cluster": "prod-us-east", "namespace": "payments", "object": "Deployment/api", "title": "api", "declaration": {"repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}}]
+        manifest = _full_manifest(audit=AUDIT, candidates=[self.account_candidate("Deployment/api"), self.account_candidate("Deployment/worker")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
+        self.assertTrue(self.harness.forge_calls("proposal-close"))
+        comment = " ".join(self.harness.bodies_for("proposal-*"))
+        self.assertIn("declared to need the `default` ServiceAccount's token", comment)
+        self.assertIn("The finding has not gone", comment)
+        self.assertNotIn("If the finding comes back", comment)
+
+    def test_a_shielded_sibling_closes_the_pull_request_whose_branch_no_group_owns(self):
+        # The ordinary shape on a real run: another namespace still has a
+        # manifest fix this run, so a live group exists and the pre-declaration
+        # shared-account branch is no group's. Without the shield's exemption
+        # from the stranded rule, that pull request would stay open as "the
+        # only fix there is"; with it, the shielded close still fires.
+        path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
+        other = "clusters/prod-us-east/billing/default-sa-automount.yaml"
+        api = make_finding(fid="api", check="default-sa-automount", obj="Deployment/api", title="api", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        worker = make_finding(fid="worker", check="default-sa-automount", obj="Deployment/worker", title="worker", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        batch = make_finding(fid="batch", check="default-sa-automount", obj="Deployment/batch", title="batch", severity="major", namespace="billing", remediation={"kind": "manifest", "path": other, "note": "shared file"})
+        previous_body = published_body(make_doc(findings=[api, worker, batch], audit=AUDIT), generated_at=NOW)
+        self.declaring_replies(previous_body)
+        api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
+        worker_id = derived_id(check="default-sa-automount", obj="Deployment/worker")
+        self.harness.replies["proposal-list"] = proposals_view(
+            [pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([api_id, worker_id]))]
+        )
+        self.touch(path)
+        self.touch(other)
+        doc = make_doc(findings=[worker, batch], audit=AUDIT)
+        doc["declared"] = [{"check": "default-sa-automount", "cluster": "prod-us-east", "namespace": "payments", "object": "Deployment/api", "title": "api", "declaration": {"repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}}]
+        billing = dict(self.account_candidate("Deployment/batch"), namespace="billing")
+        manifest = _full_manifest(audit=AUDIT, candidates=[self.account_candidate("Deployment/api"), self.account_candidate("Deployment/worker"), billing])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
+        comment = " ".join(self.harness.bodies_for("proposal-*"))
+        self.assertIn("declared to need the `default` ServiceAccount's token", comment)
+        self.assertNotIn("PR #9 covers", self.err)
+
+    def test_a_declared_candidate_the_worker_omits_is_declared_from_the_manifest(self):
+        # The omission SOP §3a warns against: the owner declared api, the worker
+        # read the note and dropped api instead of reporting it. The collector
+        # still emits api's candidate. Without declaring it from the manifest,
+        # api would be held on the ledger beside worker's shield note and the
+        # shared-account pull request would stay open for it.
+        path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
+        api = make_finding(fid="api", check="default-sa-automount", obj="Deployment/api", title="api", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        worker = make_finding(fid="worker", check="default-sa-automount", obj="Deployment/worker", title="worker", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        # cron is undeclared and also omitted this run: still flagged by the
+        # collector, in the shielded namespace, on the same pull request.
+        cron = make_finding(fid="cron", check="default-sa-automount", obj="CronJob/cron", title="cron", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        previous_body = published_body(make_doc(findings=[api, worker, cron], audit=AUDIT), generated_at=NOW)
+        self.declaring_replies(previous_body)
+        api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
+        worker_id = derived_id(check="default-sa-automount", obj="Deployment/worker")
+        cron_id = derived_id(check="default-sa-automount", obj="CronJob/cron")
+        self.harness.replies["proposal-list"] = proposals_view(
+            [pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([api_id, worker_id, cron_id]))]
+        )
+        self.touch(path)
+        audit_report.write_declarations(AUDIT, "acme/fleet", [{"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}])
+        doc = make_doc(findings=[worker], audit=AUDIT)
+        manifest = _full_manifest(audit=AUDIT, candidates=[self.account_candidate("Deployment/api"), self.account_candidate("Deployment/worker"), self.account_candidate("CronJob/cron")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn(f"DECLARED: {api_id}", self.err)
+        self.assertIn("collector candidate the document did not report", self.err)
+        self.assertIn(f"SHIELDED: {cron_id}", self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
+        comment = " ".join(self.harness.bodies_for("proposal-*"))
+        self.assertIn("declared to need the `default` ServiceAccount's token", comment)
+        ledger = " ".join(self.harness.bodies_for("issue-*"))
+        self.assertIn("`payments/Deployment/api`", ledger)
+        self.assertNotIn(f"PR #9 covers", self.err)
+
+    def test_remediate_refuses_a_shielded_sibling_and_a_declared_candidate_it_omitted(self):
+        # The human's route runs the same join: with start's declaration filed
+        # and the manifest given, the sibling is shielded (manual, refused) and
+        # the omitted declared candidate is declared (refused as declared).
+        path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
+        worker = make_finding(fid="worker", check="default-sa-automount", obj="Deployment/worker", title="worker", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        self.touch(path)
+        pathlib.Path(audit_report.declarations_path_for(AUDIT)).parent.mkdir(parents=True, exist_ok=True)
+        audit_report.write_declarations(AUDIT, "acme/fleet", [{"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}])
+        findings_file = self.write_findings(make_doc(findings=[worker], audit=AUDIT))
+        manifest = self.manifest_file(_full_manifest(audit=AUDIT, candidates=[self.account_candidate("Deployment/api"), self.account_candidate("Deployment/worker")]))
+        api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
+        worker_id = derived_id(check="default-sa-automount", obj="Deployment/worker")
+        rc = self.run_main(["remediate", "--audit", AUDIT, "--findings-file", findings_file, "--finding", worker_id, "--manifest-file", manifest, "--repo", "acme/fleet"])
+        self.assertEqual(rc, 2, self.err)
+        self.assertIn("MANUAL:", self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+        rc = self.run_main(["remediate", "--audit", AUDIT, "--findings-file", findings_file, "--finding", api_id, "--manifest-file", manifest, "--repo", "acme/fleet"])
+        self.assertEqual(rc, 2, self.err)
+        self.assertIn("declared", self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+
+    def test_a_worker_cannot_mark_a_sibling_shielded_from_the_document(self):
+        # Same pull request, no declaration anywhere: a document that carries
+        # the ids under a key of the worker's choosing closes nothing, because
+        # the stale-close pass reads the shield's own result, not the document.
+        path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
+        api = make_finding(fid="api", check="default-sa-automount", obj="Deployment/api", title="api", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        worker = make_finding(fid="worker", check="default-sa-automount", obj="Deployment/worker", title="worker", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        previous_body = published_body(make_doc(findings=[api, worker], audit=AUDIT), generated_at=NOW)
+        self.declaring_replies(previous_body)
+        api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
+        worker_id = derived_id(check="default-sa-automount", obj="Deployment/worker")
+        self.harness.replies["proposal-list"] = proposals_view(
+            [pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([api_id, worker_id]))]
+        )
+        self.touch(path)
+        doc = make_doc(findings=[api, worker], audit=AUDIT)
+        doc["remediation_shielded"] = [api_id, worker_id]
+        manifest = _full_manifest(audit=AUDIT, candidates=[self.account_candidate("Deployment/api"), self.account_candidate("Deployment/worker")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        # Whatever else this run says about the pull request (its branch is
+        # not the group's), the shield reason is not among it.
+        comment = " ".join(self.harness.bodies_for("proposal-*"))
+        self.assertNotIn("declared to need the `default` ServiceAccount's token", comment)
+        self.assertNotIn("The finding has not gone", comment)
+        self.assertNotIn("MANUAL:", self.err)
+
     def replay_ledger(self, body):
         """A fresh recorder whose open ledger carries `body`."""
         self.harness = Recorder()
@@ -18033,7 +18734,9 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     output moved with it: the clean-over-a-gap run's stderr says the gaps mean
     it "cannot vouch for the ledger's state", where it said it "cannot speak
     for the fleet", because a lost store record also makes a clean run
-    partial, and the line now covers both causes. Nothing else moved.
+    partial, and the line now covers both causes. Nothing else moved. So
+    is compliance-audit gaining a declared-intent step: its bodies carry the
+    `Declared-intent search:` line every declaring stream's bodies carry.
 
     The move from `gh` to the broker's forge verbs is recorded the same way,
     and is confined to the call surface: every body, the stdout line and every

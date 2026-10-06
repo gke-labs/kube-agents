@@ -55,27 +55,42 @@ ALLOW_UNMAPPED="false"
 readonly GITOPS_SEED_FILE="README.md"
 readonly GITOPS_SEED_MESSAGE="Initial commit"
 readonly GITOPS_SEED_CONTENT="# GitOps Infrastructure Repo"
-# The declared-intent note bench/tasks/obtainability-declared-intent-no-finding
-# reads: the fleet's declared-no-pdb-workload role runs without a budget on
-# purpose, and the case grades that the agent finds this file and says so.
-# The harness reads the frontmatter, not the prose.
+# The declared-intent note the declared-intent cases read (GITOPS_INTENT_NOTE_CASES
+# in scripts/verify_ci_pool_project.py): the fleet's declared-no-pdb-workload role
+# runs without a budget or a NetworkPolicy and declared-token-workload's
+# token-reader keeps its mounted token, all on purpose. The harness reads the
+# frontmatter, not the prose.
 # What `gh api` prints on stderr for a path that is not there; any other failure
 # of the existence read stops the seed rather than writing blind.
 readonly GITOPS_NOTE_ABSENT_PATTERN="HTTP 404"
 readonly GITOPS_INTENT_NOTE_PATH="knowledge/notification-relay-no-pdb.md"
-readonly GITOPS_INTENT_NOTE_MESSAGE="Declare notification-relay's missing PodDisruptionBudget as intended"
+readonly GITOPS_INTENT_NOTE_MESSAGE="Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, and seeded-c's missing upgrade notifications, as intended"
 readonly GITOPS_INTENT_NOTE_CONTENT='---
 type: decision
-title: notification-relay runs without a PodDisruptionBudget on purpose
+title: seeded-intent, seeded-token and seeded-c carry four postures on purpose
 declares:
   - check: no-pdb
     namespace: seeded-intent
     object: Deployment/notification-relay
+  - check: netpol-missing
+    namespace: seeded-intent
+    object: Namespace/seeded-intent
+  - check: default-sa-automount
+    namespace: seeded-token
+    object: Deployment/token-reader
+  - check: no-notifications
+    namespace: ""
+    object: Cluster/seeded-c
 ---
 
 `notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
 it is a stateless relay whose clients retry, and a budget would only slow node drains. The
-obtainability audit lists this posture under Declared intent rather than as a finding.'
+namespace carries no NetworkPolicy by design either: nothing in it accepts traffic. `token-reader`
+in `seeded-token` runs on the default ServiceAccount of its namespace with the token mounted by
+design: it reads the API server with that identity. Its neighbour `token-sidecar` is not declared.
+`seeded-c` publishes no GKE upgrade notifications by design: this fleet learns about upgrades from
+the weekly audit. The obtainability, compliance and upgrade readiness audits list the four postures
+under Declared intent rather than as findings.'
 
 # The host cluster's name is not a preference: scripts/verify_ci_pool_project.py
 # asserts it, hack/ci-env.sh selects it, and the Boskos lease resolves to it.

@@ -144,8 +144,12 @@ def causality_sankey(events: list[ActivityEvent]) -> go.Figure:
         session_label = "session" if session_count == 1 else "sessions"
         source_descriptor = "cron"
         if source.source_type != "cron":
+            # The label names the product, not the runtime (#1864); the
+            # hover detail below keeps the raw attribute name.
             source_descriptor = (
-                source.primary.field if source.primary else "source unavailable"
+                source.primary.field.removeprefix("hermes.")
+                if source.primary
+                else "source unavailable"
             )
         source_label = (
             f"{escape(source.source_id)} ({source_descriptor} · "

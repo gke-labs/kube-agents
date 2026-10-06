@@ -17,12 +17,26 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"net"
 	"reflect"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
 // The verifier's grants are keyed on a ServiceAccount, and grants keyed on an
@@ -261,4 +275,306 @@ func hasEnv(env []corev1.EnvVar, name string) bool {
 		}
 	}
 	return false
+}
+
+// The budget, and what it has to select. obtainability_audit_sop.md §3.3 flags
+// a replicas >= 2 workload with no PDB "whose spec.selector matches
+// spec.template.metadata.labels", and a budget that exists but selects the
+// wrong pods satisfies a test for existence while leaving the finding open.
+// So the assertion is equality with the Deployment's own selector, and that
+// the selector is the verifier's alone: a2aLabels is shared by every workload
+// of the next stack, and a budget keyed on it would count the callout's and
+// the gateway's pods toward the verifier's allowance, letting a drain take
+// both verifiers while the budget reads as satisfied.
+func TestTheVerifierBudgetSelectsTheDeploymentItBudgets(t *testing.T) {
+	agent := identityTestAgent()
+	dep := buildA2AVerifierDeployment(agent)
+	pdb := buildA2AVerifierPDB(agent)
+
+	if pdb.Name != dep.Name || pdb.Namespace != dep.Namespace {
+		t.Errorf("the budget is %s/%s, the Deployment %s/%s; the teardown deletes the budget by the Deployment's name",
+			pdb.Namespace, pdb.Name, dep.Namespace, dep.Name)
+	}
+	// maxUnavailable, never minAvailable (SOP §3.3/§3.4): minAvailable: 1
+	// over a count that has since dropped to one is the budget that blocks
+	// every drain on the cluster.
+	if pdb.Spec.MinAvailable != nil {
+		t.Errorf("the verifier budget sets minAvailable %v; that is the drain-deadlocking shape", pdb.Spec.MinAvailable)
+	}
+	if pdb.Spec.MaxUnavailable == nil || pdb.Spec.MaxUnavailable.IntValue() != 1 {
+		t.Errorf("maxUnavailable = %v, want 1", pdb.Spec.MaxUnavailable)
+	}
+
+	if pdb.Spec.Selector == nil || len(pdb.Spec.Selector.MatchLabels) == 0 {
+		t.Fatal("the verifier budget has an empty selector; in policy/v1 that budgets every pod in the namespace")
+	}
+	if !reflect.DeepEqual(pdb.Spec.Selector, dep.Spec.Selector) {
+		t.Errorf("budget selector %v != Deployment selector %v; the eviction API would consult a budget that does not cover these pods",
+			pdb.Spec.Selector.MatchLabels, dep.Spec.Selector.MatchLabels)
+	}
+	selector, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
+	if err != nil {
+		t.Fatalf("budget selector does not parse: %v", err)
+	}
+	if !selector.Matches(labels.Set(dep.Spec.Template.Labels)) {
+		t.Errorf("budget selector %v does not match the verifier pod labels %v", pdb.Spec.Selector.MatchLabels, dep.Spec.Template.Labels)
+	}
+	// The other next-stack workloads carry the same a2aLabels and must fall
+	// outside this budget — and the verifier's pods must fall outside
+	// theirs. Neither the callout nor the a2a gateway carries a budget of
+	// its own today, so the converse is asserted against the selectors a
+	// budget for either would be built from (a budget copies its
+	// Deployment's selector, as this one does), plus the one other budget
+	// the operator does render in the namespace, the platform PDB on
+	// `app: <agent>-gateway`. A selector of theirs that matched these pods
+	// would count a verifier toward some other workload's allowance.
+	verifierPods := labels.Set(dep.Spec.Template.Labels)
+	for name, other := range map[string]*appsv1.Deployment{
+		"callout": buildA2ACalloutDeployment(agent),
+		"gateway": buildA2AGatewayDeployment(agent),
+	} {
+		if selector.Matches(labels.Set(other.Spec.Template.Labels)) {
+			t.Errorf("the verifier budget also selects the %s pods %v; the budget would be satisfied by the wrong workload's replicas",
+				name, other.Spec.Template.Labels)
+		}
+		theirs, err := metav1.LabelSelectorAsSelector(other.Spec.Selector)
+		if err != nil {
+			t.Fatalf("%s selector does not parse: %v", name, err)
+		}
+		if theirs.Matches(verifierPods) {
+			t.Errorf("the %s selector %v also matches the verifier pods %v; a budget built from it would count a verifier toward the %s allowance",
+				name, other.Spec.Selector.MatchLabels, verifierPods, name)
+		}
+	}
+	platform, err := metav1.LabelSelectorAsSelector(buildPlatformPDB(agent).Spec.Selector)
+	if err != nil {
+		t.Fatalf("platform budget selector does not parse: %v", err)
+	}
+	if platform.Matches(verifierPods) {
+		t.Errorf("the platform budget selects the verifier pods %v; a drain would charge a verifier eviction to the gateway's allowance", verifierPods)
+	}
+
+	// Labelled as part of the next stack, which is how the residue sweep and
+	// the flip to today find it. A budget stamped only with the default
+	// part-of would be invisible to both and survive the flip.
+	if got := pdb.Labels[labelPartOf]; got != a2aPartOf {
+		t.Errorf("budget part-of label = %q, want %q; the teardown sweep lists by that label", got, a2aPartOf)
+	}
+	if got := pdb.Labels[a2aComponentLabel]; got != "verifier" {
+		t.Errorf("budget component label = %q, want verifier", got)
+	}
+}
+
+// The spread. One hostname constraint, advisory, selecting the same pods the
+// budget does. ScheduleAnyway is asserted rather than left to the reader: a
+// DoNotSchedule here would pend the surge pod of a MaxUnavailable 0 /
+// MaxSurge 1 rollout on any cluster with as many nodes as replicas, and the
+// second replica of a single-node dev install forever.
+func TestTheVerifierSpreadsAcrossNodesWithoutRefusingToSchedule(t *testing.T) {
+	agent := identityTestAgent()
+	dep := buildA2AVerifierDeployment(agent)
+	pod := dep.Spec.Template.Spec
+
+	if len(pod.TopologySpreadConstraints) != 1 {
+		t.Fatalf("the verifier pod carries %d topology spread constraints, want 1 on the hostname", len(pod.TopologySpreadConstraints))
+	}
+	spread := pod.TopologySpreadConstraints[0]
+	if spread.TopologyKey != "kubernetes.io/hostname" {
+		t.Errorf("spread topologyKey = %q, want kubernetes.io/hostname; a zone key is satisfied by two pods on one node", spread.TopologyKey)
+	}
+	if spread.MaxSkew != 1 {
+		t.Errorf("spread maxSkew = %d, want 1", spread.MaxSkew)
+	}
+	if spread.WhenUnsatisfiable != corev1.ScheduleAnyway {
+		t.Errorf("spread whenUnsatisfiable = %q, want ScheduleAnyway; DoNotSchedule pends the rollout's surge pod and a single-node install's second replica",
+			spread.WhenUnsatisfiable)
+	}
+	if !reflect.DeepEqual(spread.LabelSelector, dep.Spec.Selector) {
+		t.Errorf("spread selector %v != Deployment selector %v; the scheduler would balance a different pod set", spread.LabelSelector, dep.Spec.Selector)
+	}
+	// Scoped to one ReplicaSet, as the chart's helper is: counted across old
+	// and new pods together, a MaxSurge 1 rollout over two nodes can end
+	// with both new replicas on one node (the argument is on the constant).
+	if !reflect.DeepEqual(spread.MatchLabelKeys, []string{"pod-template-hash"}) {
+		t.Errorf("spread matchLabelKeys = %v, want [pod-template-hash]; without it a rollout can re-co-locate the replicas", spread.MatchLabelKeys)
+	}
+	// Spread is the mechanism, not anti-affinity beside it: two mechanisms on
+	// one key is a second thing to keep in step with the selector.
+	if pod.Affinity != nil && pod.Affinity.PodAntiAffinity != nil {
+		t.Error("the verifier pod carries pod anti-affinity as well as a topology spread; one mechanism, keyed on one selector")
+	}
+}
+
+// reconcileA2AVerifier applies the budget, owned by the CR, selecting the
+// Deployment it applied in the same pass. Through the reconcile rather than
+// the builder so that dropping the object from the owned list — the shape the
+// render had before #2058 — fails.
+func TestReconcileA2AVerifierRendersAnEvictableBudget(t *testing.T) {
+	ctx := context.Background()
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	if err := r.reconcileA2AVerifier(ctx, agent); err != nil {
+		t.Fatalf("reconcileA2AVerifier: %v", err)
+	}
+
+	key := types.NamespacedName{Name: a2aVerifierName(agent), Namespace: agent.Namespace}
+	dep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, key, dep); err != nil {
+		t.Fatalf("the verifier Deployment was not applied: %v", err)
+	}
+	pdb := &policyv1.PodDisruptionBudget{}
+	if err := cl.Get(ctx, key, pdb); err != nil {
+		t.Fatalf("no PodDisruptionBudget %s after reconcileA2AVerifier: %v", key, err)
+	}
+	if pdb.Spec.MaxUnavailable == nil || pdb.Spec.MaxUnavailable.IntValue() != 1 || pdb.Spec.MinAvailable != nil {
+		t.Errorf("budget = maxUnavailable %v / minAvailable %v, want 1 / unset", pdb.Spec.MaxUnavailable, pdb.Spec.MinAvailable)
+	}
+	if !reflect.DeepEqual(pdb.Spec.Selector, dep.Spec.Selector) {
+		t.Errorf("live budget selector %v != live Deployment selector %v", pdb.Spec.Selector, dep.Spec.Selector)
+	}
+	if !metav1.IsControlledBy(pdb, agent) {
+		t.Errorf("the budget is not controlled by the PlatformAgent: %v", pdb.OwnerReferences)
+	}
+}
+
+// The unhealthy-pod policy, on the rendered object and on the one the
+// reconcile applies. The verifier's readiness is the bus connection, and the
+// bus is one replica: with it down, or its PVC Pending, or the provision Job
+// failed, both verifiers are Running and NotReady, and under the default
+// IfHealthyBudget policy the budget then refuses to evict either of them —
+// currentHealthy 0, disruptionsAllowed 0, 429 from the eviction API — for a
+// workload that is already fully down. AlwaysAllow (KEP-3017) is what lets
+// the drain proceed while leaving maxUnavailable: 1 over the ready pods. A
+// nil here is not "unset", it is the default, so the pin is on the value.
+func TestTheVerifierBudgetLetsAnUnreadyPodBeEvicted(t *testing.T) {
+	ctx := context.Background()
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	if err := r.reconcileA2AVerifier(ctx, agent); err != nil {
+		t.Fatalf("reconcileA2AVerifier: %v", err)
+	}
+	applied := &policyv1.PodDisruptionBudget{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aVerifierName(agent), Namespace: agent.Namespace}, applied); err != nil {
+		t.Fatalf("no PodDisruptionBudget after reconcileA2AVerifier: %v", err)
+	}
+
+	for name, pdb := range map[string]*policyv1.PodDisruptionBudget{
+		"rendered": buildA2AVerifierPDB(agent),
+		"applied":  applied,
+	} {
+		got := pdb.Spec.UnhealthyPodEvictionPolicy
+		if got == nil || *got != policyv1.AlwaysAllow {
+			t.Errorf("%s budget unhealthyPodEvictionPolicy = %v, want %s; with the bus down both verifiers are Running/NotReady and the default budget blocks the drain of a workload that is already fully down",
+				name, ptr.Deref(got, "<nil, i.e. IfHealthyBudget>"), policyv1.AlwaysAllow)
+		}
+	}
+}
+
+// The wedge reconcilePodDisruptionBudget already guards against, on the
+// verifier's budget: a hand-set minAvailable that a forced apply cannot
+// remove, so every apply merges to both fields and is refused — and because
+// this step sits ahead of the fences and the provision Job in reconcileA2A,
+// the whole next render fails from then on. Through reconcileA2AVerifier, so
+// that deleting the clearForeignPDBBudgetField call rather than gutting the
+// helper is what reds.
+func TestReconcileA2AVerifierRecoversFromAForeignBudgetField(t *testing.T) {
+	ctx := context.Background()
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	live := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: a2aVerifierName(agent), Namespace: agent.Namespace},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MinAvailable: ptr.To(intstr.FromInt32(1)),
+			Selector:     &metav1.LabelSelector{MatchLabels: a2aVerifierPodSelector(agent)},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, live).
+		WithInterceptorFuncs(pdbSSAInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	if err := r.reconcileA2AVerifier(ctx, agent); err != nil {
+		t.Fatalf("reconcileA2AVerifier did not recover from a foreign budget field: %v", err)
+	}
+	pdb := &policyv1.PodDisruptionBudget{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(live), pdb); err != nil {
+		t.Fatalf("get budget: %v", err)
+	}
+	if pdb.Spec.MinAvailable != nil {
+		t.Errorf("minAvailable survived the reconcile: %v", pdb.Spec.MinAvailable)
+	}
+	if pdb.Spec.MaxUnavailable == nil || pdb.Spec.MaxUnavailable.IntValue() != 1 {
+		t.Errorf("maxUnavailable = %v, want 1", pdb.Spec.MaxUnavailable)
+	}
+	// The hand-made budget carried no policy; the apply that cleared the
+	// foreign field has to land the operator's as well.
+	if got := pdb.Spec.UnhealthyPodEvictionPolicy; got == nil || *got != policyv1.AlwaysAllow {
+		t.Errorf("unhealthyPodEvictionPolicy after recovery = %v, want %s", ptr.Deref(got, "<nil>"), policyv1.AlwaysAllow)
+	}
+}
+
+// The darkness property for the budget by name. The label sweep in
+// TestNothingA2ALabelledSurvivesAFlipToToday lists PodDisruptionBudgets too
+// and is what catches a budget nobody added to the teardown; this is the
+// verifier-specific statement a reader of #2058 looks for — rendered under
+// next, gone under today — through the full Reconcile rather than the step.
+func TestTheVerifierBudgetComesAndGoesWithTheMode(t *testing.T) {
+	ctx := context.Background()
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(agent)}
+	key := types.NamespacedName{Name: a2aVerifierName(agent), Namespace: agent.Namespace}
+
+	// Two passes: the first adds the finalizer, the second renders.
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d under next: %v", i+1, err)
+		}
+	}
+	pdb := &policyv1.PodDisruptionBudget{}
+	if err := cl.Get(ctx, key, pdb); err != nil {
+		t.Fatalf("no verifier budget under mode next: %v", err)
+	}
+
+	fresh := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+	fresh.Spec.Mode = nil
+	if err := cl.Update(ctx, fresh); err != nil {
+		t.Fatalf("flip to today: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after the flip: %v", err)
+	}
+	err := cl.Get(ctx, key, &policyv1.PodDisruptionBudget{})
+	if !errors.IsNotFound(err) {
+		t.Errorf("the verifier budget survives a flip to today (get: %v); a budget over no pods is inert residue until the next verifier is scheduled", err)
+	}
 }

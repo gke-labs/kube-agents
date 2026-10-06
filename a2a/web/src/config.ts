@@ -1,9 +1,12 @@
 /**
- * Where the bus is and how to authenticate to it. Playground posture: the
- * `web` user is read-only by the server's own grants, the listener is plain
- * ws behind kubectl port-forward, and the password travels as a query param
- * or a pasted field — never baked into the bundle.
+ * Where the bus is and how to authenticate to it. The page connects as the
+ * `console` user: the `web` read grants plus publish on `chat.console.*.in`,
+ * which is how the chat pane submits turns. `web` still works (`?user=web`)
+ * and gets the read-only page. The listener is plain ws behind kubectl
+ * port-forward, and the password travels as a query param or a pasted
+ * field, never baked into the bundle.
  */
+import { tokenOf } from "./console.ts";
 
 export interface BusConfig {
   url: string;
@@ -12,9 +15,12 @@ export interface BusConfig {
 }
 
 const STORAGE_KEY = "a2a-web-config";
+const CONVERSATION_KEY = "a2a-web-conversation";
 
 export const DEFAULT_WS_URL = "ws://localhost:9222";
-export const DEFAULT_USER = "web";
+export const DEFAULT_USER = "console";
+/** The user whose grants stop at the read API. No input box for it. */
+export const READ_ONLY_USER = "web";
 
 /**
  * Query params override storage field-by-field; storage remembers the last
@@ -68,5 +74,27 @@ export function saveConfig(config: BusConfig): void {
     sessionStorage.setItem(STORAGE_KEY, JSON.stringify(config));
   } catch {
     // storage denied — the form will ask again next load
+  }
+}
+
+/**
+ * The tab's console conversation. Session storage, so a reload keeps the
+ * same gateway session and a new tab starts its own. A stored value the
+ * gateway would reject is treated as absent.
+ */
+export function loadConversation(): string | null {
+  try {
+    const stored = sessionStorage.getItem(CONVERSATION_KEY);
+    return stored !== null && tokenOf(stored) !== null ? stored : null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveConversation(conversation: string): void {
+  try {
+    sessionStorage.setItem(CONVERSATION_KEY, conversation);
+  } catch {
+    // storage denied - the next load mints a fresh conversation
   }
 }

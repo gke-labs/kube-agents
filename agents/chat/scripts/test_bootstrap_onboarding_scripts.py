@@ -3,7 +3,7 @@
 Run: python3 -m unittest agents/chat/scripts/test_bootstrap_onboarding_scripts.py
 
 Covers the deterministic decision + I/O logic of:
-  - bootstrap_delivery.py  (no_agent delivery of INVENTORY.md, exactly once)
+  - bootstrap_delivery.py  (no_agent delivery of INVENTORY.md, claimed once)
   - bootstrap_scan_gate.py (files the sweep as a kanban task listing a
                             kanban_create call for each ready Cluster Agent;
                             stops re-filing)

@@ -20,7 +20,9 @@ These tests pin:
 * when even the uninstall fails, the record Secrets are deleted by the
   `owner=helm,name=kube-agents` selector with --ignore-not-found;
 * when both clears fail, the guard aborts under `set -e` rather than
-  letting the upgrade fail less legibly with the record still in place.
+  letting the upgrade fail less legibly with the record still in place;
+* at lease time, a transient probe 5xx re-probes and heals the record on success,
+  while a persistent probe 5xx warns and returns 0 rather than aborting under `set -e`.
 
 The guard is lifted from the script's own text and executed under bash with
 stubbed helm/kubectl, the same approach as tests/test_ci_teardown_sweep.py.
@@ -78,6 +80,19 @@ def _head_constants(text):
     )
 
 
+def _shell_function(text, name):
+    """A function of the script, from its `name() {` line to the `}` that
+    closes it in column 0."""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line == f"{name}() {{":
+            for end in range(index, len(lines)):
+                if lines[end] == "}":
+                    return "\n".join(lines[index : end + 1])
+            break
+    raise AssertionError(f"{name}() not found in hack/ci-deploy.sh in the shape this test lifts")
+
+
 def _guard_block(text):
     start = text.find(_GUARD_START)
     assert start != -1, f"{_GUARD_START!r} not found in hack/ci-deploy.sh"
@@ -90,7 +105,12 @@ class CiDeployReleaseGuardTest(unittest.TestCase):
     maxDiff = None
 
     def _run_guard(
-        self, history_json="", history_exit=0, uninstall_exit=0, kubectl_exit=0
+        self,
+        history_json="",
+        history_exit=0,
+        uninstall_exit=0,
+        kubectl_exit=0,
+        history_responses=None,
     ):
         """Run the lifted guard with recording stubs.
 
@@ -98,6 +118,10 @@ class CiDeployReleaseGuardTest(unittest.TestCase):
         answers `history` with the given JSON and exit code and `uninstall`
         with the given exit code; kubectl records and exits as asked.
         """
+        if history_responses is None:
+            stderr = "Error: release: not found\n" if history_exit != 0 else ""
+            history_responses = [(history_exit, history_json, stderr)]
+
         text = _deploy_text()
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = pathlib.Path(tmp)
@@ -105,17 +129,46 @@ class CiDeployReleaseGuardTest(unittest.TestCase):
             bin_dir.mkdir()
             log = tmp_path / "calls.log"
             log.touch()
-            history_file = tmp_path / "history.json"
-            history_file.write_text(history_json, encoding="utf-8")
+
+            history_responses_file = tmp_path / "history_responses.json"
+            history_responses_file.write_text(json.dumps(history_responses), encoding="utf-8")
+            history_index_file = tmp_path / "history_index.txt"
+            history_index_file.write_text("0", encoding="utf-8")
+
             helm_stub = bin_dir / "helm"
             helm_stub.write_text(
-                "#!/usr/bin/env bash\n"
-                f'echo "helm $*" >> "{log}"\n'
-                'case "$1" in\n'
-                f'  history) cat "{history_file}"; exit {history_exit} ;;\n'
-                f"  uninstall) exit {uninstall_exit} ;;\n"
-                "  *) exit 0 ;;\n"
-                "esac\n",
+                f"""#!/usr/bin/env bash
+echo "helm $*" >> "{log}"
+case "$1" in
+  history)
+    h_idx=$(cat "{history_index_file}")
+    h_resp=$(python3 -c '
+import json, sys
+data = json.load(open("{history_responses_file}"))
+idx = int(sys.argv[1])
+if idx < len(data):
+    code, out, err = data[idx]
+else:
+    code, out, err = data[-1]
+if out: sys.stdout.write(out + "\\n")
+if err: sys.stderr.write(err + "\\n")
+sys.exit(code)
+' "$h_idx")
+    h_rc=$?
+    echo $((h_idx + 1)) > "{history_index_file}"
+    if [ -n "$h_resp" ]; then
+        printf "%s\\n" "$h_resp"
+    fi
+    exit $h_rc
+    ;;
+  uninstall)
+    exit {uninstall_exit}
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+""",
                 encoding="utf-8",
             )
             kubectl_stub = bin_dir / "kubectl"
@@ -135,6 +188,8 @@ class CiDeployReleaseGuardTest(unittest.TestCase):
                     "-c",
                     "set -euo pipefail\n"
                     + _head_constants(text)
+                    + "\n"
+                    + _shell_function(text, "heal_poisoned_release_record")
                     + "\n"
                     + _guard_block(text),
                 ],
@@ -196,6 +251,11 @@ class CiDeployReleaseGuardTest(unittest.TestCase):
         self.assertIn(_NAMESPACE, argv)
         # The uninstall succeeded, so the Secret-level fallback stays unused.
         self.assertEqual(self._record_deletes(calls), [])
+        # Lease time never touches the CR: no operator is running to clear its
+        # finalizer, so a --wait delete here would time out and abort the run.
+        self.assertEqual(
+            [c for c in calls if c.startswith("kubectl delete platformagent")], []
+        )
         # And the heal is loud: a later reader of a red run's log must see it.
         self.assertIn("poisoned", out.lower())
 
@@ -222,6 +282,85 @@ class CiDeployReleaseGuardTest(unittest.TestCase):
             history_json=_HISTORY_POISONED, uninstall_exit=1, kubectl_exit=1
         )
         self.assertNotEqual(rc, 0, "a guard that cannot clear the record must abort")
+
+    # --- probe 5xx error handling at lease time --------------------------------
+
+    def test_lease_time_transient_probe_5xx_reprobes_and_heals_poisoned_release_record(self):
+        """At lease time (§5a), a transient 5xx on probe attempt 1 re-probes and heals
+        the poisoned release record when attempt 2 succeeds."""
+        err_msg = "Error: the server is currently unable to handle the request"
+        history_responses = [
+            (1, "", err_msg),
+            (0, _HISTORY_POISONED, ""),
+        ]
+        rc, calls, out, err = self._run_guard(history_responses=history_responses)
+        self.assertEqual(rc, 0, err)
+        uninstalls = self._helm_uninstalls(calls)
+        self.assertEqual(
+            len(uninstalls), 1, f"expected one uninstall: {calls}"
+        )
+        history_calls = [c for c in calls if c.startswith("helm history")]
+        self.assertEqual(len(history_calls), 2, f"expected 2 history calls: {calls}")
+        self.assertEqual(
+            [c for c in calls if c.startswith("kubectl delete platformagent")], []
+        )
+        self.assertIn("probe attempt 1 failed", out.lower())
+        self.assertIn("cleared the poisoned", out.lower())
+
+    def test_lease_time_persistent_probe_5xx_warns_and_proceeds(self):
+        """At lease time (§5a), if the API server persistently 5xx's across all probe
+        attempts, the guard warns and returns 0 rather than aborting under set -e,
+        allowing the run to proceed to step 5c where deploy retries absorb the blip."""
+        err_msg = "Error: the server is currently unable to handle the request"
+        history_responses = [
+            (1, "", err_msg),
+            (1, "", err_msg),
+            (1, "", err_msg),
+        ]
+        rc, calls, out, err = self._run_guard(history_responses=history_responses)
+        self.assertEqual(rc, 0, f"lease-time probe 5xx must not abort under set -e: {err}")
+        self.assertEqual(self._helm_uninstalls(calls), [])
+        self.assertEqual(self._record_deletes(calls), [])
+        history_calls = [c for c in calls if c.startswith("helm history")]
+        self.assertEqual(len(history_calls), 3, f"expected 3 history calls: {calls}")
+        self.assertIn("skipping lease-time release record heal and proceeding to deploy", out.lower())
+
+    def test_lease_time_transient_probe_cluster_unreachable_reprobes_and_heals_poisoned_release_record(self):
+        """At lease time (§5a), a transient connection error on probe attempt 1 re-probes
+        and heals the record once attempt 2 succeeds."""
+        err_msg = 'Error: Kubernetes cluster unreachable: Get "https://10.0.0.1:443/version": dial tcp 10.0.0.1:443: i/o timeout'
+        history_poisoned = json.dumps([{"revision": 1, "status": "failed"}])
+        history_responses = [
+            (1, "", err_msg),
+            (0, history_poisoned, ""),
+        ]
+        rc, calls, out, err = self._run_guard(history_responses=history_responses)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(self._helm_uninstalls(calls)), 1)
+        self.assertEqual(self._record_deletes(calls), [])
+        self.assertEqual(
+            [c for c in calls if c.startswith("kubectl delete platformagent")], []
+        )
+        history_calls = [c for c in calls if c.startswith("helm history")]
+        self.assertEqual(len(history_calls), 2, f"expected 2 history calls: {calls}")
+        self.assertIn("clearing the", out.lower())
+
+    def test_lease_time_persistent_probe_cluster_unreachable_warns_and_proceeds(self):
+        """At lease time (§5a), if probe persistently fails with connection errors across
+        all attempts, the guard warns and returns 0 rather than aborting under set -e."""
+        err_msg = 'Error: Kubernetes cluster unreachable: Get "https://10.0.0.1:443/version": dial tcp 10.0.0.1:443: i/o timeout'
+        history_responses = [
+            (1, "", err_msg),
+            (1, "", err_msg),
+            (1, "", err_msg),
+        ]
+        rc, calls, out, err = self._run_guard(history_responses=history_responses)
+        self.assertEqual(rc, 0, f"lease-time probe connection error must not abort under set -e: {err}")
+        self.assertEqual(self._helm_uninstalls(calls), [])
+        self.assertEqual(self._record_deletes(calls), [])
+        history_calls = [c for c in calls if c.startswith("helm history")]
+        self.assertEqual(len(history_calls), 3, f"expected 3 history calls: {calls}")
+        self.assertIn("skipping lease-time release record heal and proceeding to deploy", out.lower())
 
     # --- the file itself ------------------------------------------------------
 
