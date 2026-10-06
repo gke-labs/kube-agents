@@ -128,6 +128,12 @@ def main(argv=None, session=None) -> int:
     if not traces:
         print("No traces found in the specified window.")
         return 0
+    # One unreadable trace is skipped so the others still print; a listing
+    # whose every get failed is a failed read, not an empty breakdown. The
+    # list and the get are two relay routes and two IAM permissions, so one
+    # can be refused while the other is admitted, and exit 0 with nothing on
+    # stdout would read as success.
+    traces_read = 0
     for trace in traces:
         trace_id = trace.get("traceId")
         if not trace_id:
@@ -137,9 +143,16 @@ def main(argv=None, session=None) -> int:
         except google_api.RelayError as exc:
             print(f"Error reading trace {trace_id}: {exc}", file=sys.stderr)
             continue
+        traces_read += 1
         spans = detail.get("spans") or []
         if spans:
             print_breakdown(trace_id, spans)
+    if traces_read == 0:
+        print(
+            f"Error: none of the {len(traces)} traces listed could be read; no breakdown to report.",
+            file=sys.stderr,
+        )
+        return google_api.EXIT_READ_FAILED
     return 0
 
 

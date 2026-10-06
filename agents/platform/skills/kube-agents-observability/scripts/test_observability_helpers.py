@@ -282,6 +282,23 @@ class AnalyzeTraceLatencyTest(BrokerSessionCase):
         self.assertIn(f"Error reading trace {TRACE_A}", err)
         self.assertIn("Trace ID:", out)
 
+    def test_every_trace_unreadable_is_a_failed_read_not_a_silent_success(self):
+        # The list and the get are two relay routes and two IAM permissions,
+        # so the listing can be admitted while every get is refused; exit 0
+        # with no breakdown on stdout would read as a run that found nothing.
+        session = self.session({
+            RELAYED_TRACES: TRACE_LIST,
+            f"{RELAYED_TRACES}/{TRACE_A}": FakeResponse(403, BROKER_REFUSAL),
+            f"{RELAYED_TRACES}/{TRACE_B}": FakeResponse(403, BROKER_REFUSAL),
+        })
+        code, out, err = run(analyze_trace_latency.main, ["--project-id", PROJECT], session=session)
+        self.assertEqual(google_api.EXIT_READ_FAILED, code)
+        self.assertIn(f"Error reading trace {TRACE_A}", err)
+        self.assertIn(f"Error reading trace {TRACE_B}", err)
+        self.assertIn("none of the 2 traces listed could be read", err)
+        self.assertNotIn("Trace ID:", out)
+        self.assertNotIn("No traces found", out)
+
     def test_a_recorded_trace_parses_to_the_expected_durations(self):
         # 1.5s + 1s back to back: the trace spans exactly 2.5 seconds. A unit
         # slip would print 2500.000 or 0.003 here.
