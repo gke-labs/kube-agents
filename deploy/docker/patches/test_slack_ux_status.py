@@ -932,6 +932,27 @@ class PlanTest(_RuntimeCase):
         _run(runtime.settle_row(adapter, _sub("t_b"), "completed", "1.33.4 = default", "seeded-a"))
         self.assertEqual(self._kinds(adapter).count("post"), posts)
 
+    def test_a_settle_says_whether_the_plan_shows_the_card_complete(self):
+        # True lets a fanned-out card's report fold into its row (kanban_progress_lines).
+        adapter = _Adapter()
+        self._note(adapter, 1, "reading version", title="seeded-c")
+        self.assertTrue(_run(runtime.settle_row(adapter, _sub("t_b"), "completed", "1.33.4 = default", "seeded-a")))
+        self.assertTrue(_run(runtime.settle_row(adapter, _sub(), "completed", "1.32.9", "seeded-c")))
+        self.assertNotIn((CHANNEL, THREAD), runtime._plans, "every row settled, so forgotten")
+
+    def test_a_failed_card_settles_its_row_failed_and_does_not_fold(self):
+        adapter = _Adapter()
+        self._note(adapter, 1, "reading version", title="seeded-c")
+        self.assertFalse(_run(runtime.settle_row(adapter, _sub(), "gave_up", "", "seeded-c")))
+        [task] = self._tasks(adapter)
+        self.assertEqual(task["status"], slack_status.TASK_ERROR)
+
+    def test_a_settle_on_a_fallen_back_plan_does_not_fold(self):
+        adapter = _Adapter(_Client(fail={"post"}))
+        self.assertFalse(self._note(adapter, 1, "reading logs"))
+        self.assertFalse(_run(runtime.settle_row(adapter, _sub(), "completed", "done")))
+        self.assertFalse(_run(runtime.settle_row(adapter, _sub("t_b"), "completed", "1.33.4 = default", "seeded-a")))
+
     def test_a_kind_that_moves_nothing_leaves_the_row(self):
         adapter = _Adapter()
         self._note(adapter, 1, "reading logs")
