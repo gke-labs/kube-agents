@@ -530,6 +530,16 @@ class MainTest(unittest.TestCase):
         self.assertIn("reconciled 2 project(s): 1 applied, 0 converged, 0 unchanged, 0 planned, 0 busy, 0 refused or failed, 1 interrupted, 0 not reached", stdout.getvalue())
         self.assertIn(f"terminated (signal 2) after 2 project(s); interrupted in {P8}", stderr.getvalue())
 
+    def test_the_terminated_line_counts_the_projects_the_run_got_through_not_the_drained_ones(self):
+        # The drain records every pending project as not reached before the
+        # termination propagates; the Chat note quotes this one line.
+        outcomes = {P7: (reconcile.OUTCOME_APPLIED, ""), P8: (reconcile.OUTCOME_INTERRUPTED, ""), "kube-agents-evals-9": (reconcile.OUTCOME_NOT_REACHED, reconcile.REASON_NOT_REACHED_TERMINATED)}
+        error = []
+        with mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+            rc = reconcile._terminated(boskos_pool.Terminated("signal 15"), outcomes, error)
+        self.assertEqual(rc, boskos_pool.TERMINATED_EXIT_CODE)
+        self.assertIn(f"terminated (signal 15) after 2 project(s); interrupted in {P8}", error[0])
+
     def test_drifted_reads_the_scan_resets_strands_and_applies_the_projects_listed(self):
         boskos = _Boskos(free=[P7, P8])
         scan = {"projects": {P8: {"roles": {"idle-pool": {"state": "drifted", "detail": []}}}, P7: {"roles": {"idle-pool": {"state": "healthy", "detail": []}}}}}
@@ -1704,6 +1714,23 @@ class ReportFieldsTest(unittest.TestCase):
             with mock.patch.object(reconcile, "gcloud_runner", gcloud), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
                 reconcile.reconcile_pool(BOSKOS, OWNER, runner=_Tofu({P7: plan}), known={P7}, dry_run=dry, run=reconcile.Run(commit="c", fleet_tree="t", publish=True))
         self.assertEqual(copies, [])
+
+    def test_a_converged_or_unchanged_project_gets_the_marker_too(self):
+        # The daily's usual outcomes once the stack is at main: the marker is
+        # the record of which commit each project is at, applied or not.
+        copies = []
+
+        def gcloud(argv, **kw):
+            copies.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        for tofu, expected in ((_Tofu({P7: RESTAMP_ONLY}), reconcile.OUTCOME_CONVERGED), (_Tofu({}, plan_exit={P7: reconcile.PLAN_NO_CHANGES}), reconcile.OUTCOME_UNCHANGED)):
+            boskos = _Boskos(free=[P7])
+            with mock.patch.object(reconcile, "gcloud_runner", gcloud), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()):
+                outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known={P7}, run=reconcile.Run(commit="c", fleet_tree="t", publish=True))
+            self.assertEqual(outcomes[P7][0], expected)
+        self.assertEqual(len(copies), 2, copies)
+        self.assertTrue(all(any(str(arg).endswith("/applied.json") for arg in argv) for argv in copies), copies)
 
 
 class WorkersTest(unittest.TestCase):

@@ -1319,8 +1319,11 @@ def _terminated(exc, outcomes, error):
     the signal landed in included; the summary says how far the run got."""
     report(outcomes)
     interrupted = sorted(p for p, (o, _) in outcomes.items() if o == OUTCOME_INTERRUPTED)
+    # The drain puts every pending project on the record as not reached
+    # before the termination gets here; those were not got through.
+    reached = sum(1 for o, _ in outcomes.values() if o != OUTCOME_NOT_REACHED)
     message = "terminated (%s) after %d project(s)%s; held projects were released unless named above" % (
-        exc, len(outcomes), "; interrupted in %s" % ", ".join(interrupted) if interrupted else ""
+        exc, reached, "; interrupted in %s" % ", ".join(interrupted) if interrupted else ""
     )
     error.append(message)
     print("ERROR: %s" % message, file=sys.stderr)
