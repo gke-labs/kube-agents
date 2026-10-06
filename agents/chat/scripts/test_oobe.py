@@ -1,0 +1,290 @@
+"""Unit tests for oobe.py, the first-boot job's first-run audits stage.
+
+Run: python3 -m unittest agents/chat/scripts/test_oobe.py
+
+oobe imports gitops_workspace from agents/platform/scripts, which the image copies
+beside the chat scripts; the tests stand in for its repository list rather than
+reading this machine's /etc/gitops.
+"""
+
+import contextlib
+import io
+import json
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).parent.absolute()))
+sys.path.insert(1, str(Path(__file__).resolve().parents[2] / "platform" / "scripts"))
+
+import oobe  # noqa: E402
+
+SWEEP_ID = "t_sweep"
+FILED_AT = 1_000_000
+SWEEP_CREATED_AT = FILED_AT
+NOW_SETTLED = FILED_AT + 600
+NOW_PAST_FALLBACK = FILED_AT + oobe.FALLBACK_SECONDS
+REPOS = ["acme/gitops"]
+
+
+def _board(path: Path, cards: list[tuple[str, str, str, int]]) -> None:
+    """A board with the sweep card plus `cards` as (id, status, idempotency_key, created_at)."""
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE tasks (id TEXT, status TEXT, idempotency_key TEXT, title TEXT, created_at INTEGER, body TEXT)")
+    rows = [(SWEEP_ID, "done", "bootstrap-inventory-scan", SWEEP_CREATED_AT)] + cards
+    conn.executemany("INSERT INTO tasks (id, status, idempotency_key, created_at) VALUES (?, ?, ?, ?)", rows)
+    conn.commit()
+    conn.close()
+
+
+def _ranking(status: str, key: str = oobe.PRIORITIZE_KEY, created_at: int = SWEEP_CREATED_AT + 60, tid: str = "t_rank"):
+    return (tid, status, key, created_at)
+
+
+class StageTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self._tmp.name)
+        self.board = self.d / oobe.BOARD_FILE
+        self.started: list[tuple[list[str], dict]] = []
+        self.failing: set[str] = set()
+        self.repos: list[str] | Exception = list(REPOS)
+        patches = [
+            mock.patch.object(oobe, "board_path", lambda _d: self.board),
+            mock.patch.object(oobe.profile_cron_tick, "hermes_bin", lambda: Path("/opt/hermes/.venv/bin/hermes")),
+            mock.patch.object(oobe.subprocess, "run", self._run),
+            mock.patch.object(oobe, "managed_repositories", self._repos),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _run(self, argv, env=None, **_kwargs):
+        self.started.append((argv, env))
+        code = 1 if argv[-1] in self.failing else 0
+        return subprocess.CompletedProcess(argv, code, stdout="", stderr="no such job" if code else "")
+
+    def _repos(self):
+        if isinstance(self.repos, Exception):
+            raise self.repos
+        return self.repos
+
+    def _file_scan(self, filed_at: int = FILED_AT) -> None:
+        (self.d / oobe.SCAN_FILED_MARKER).write_text(f"task_id={SWEEP_ID}\nfiled_at={filed_at}\n", encoding="utf-8")
+
+    def _main(self, now: float = NOW_SETTLED) -> str:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(oobe.main(self.d, now=now), 0)
+        return out.getvalue()
+
+    def _started_ids(self) -> list[str]:
+        return [argv[-1] for argv, _env in self.started]
+
+    # --- when the stage fires -------------------------------------------------
+
+    def test_nothing_before_the_scan_is_filed(self):
+        _board(self.board, [_ranking("done")])
+        self._main(now=NOW_PAST_FALLBACK)
+        self.assertEqual(self.started, [])
+        self.assertFalse((self.d / oobe.AUDITS_MARKER).exists())
+
+    def test_fires_once_the_ranking_card_is_done(self):
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._main()
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+        self.assertTrue(oobe.read_state(self.d)[oobe.STATE_DONE])
+
+    def test_a_failed_ranking_still_fires(self):
+        self._file_scan()
+        _board(self.board, [_ranking("failed")])
+        self._main()
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+
+    def test_waits_while_the_ranking_card_runs(self):
+        self._file_scan()
+        _board(self.board, [_ranking("running")])
+        self._main()
+        self.assertEqual(self.started, [])
+
+    def test_a_blocked_ranking_card_waits_for_the_fallback(self):
+        self._file_scan()
+        _board(self.board, [_ranking("blocked")])
+        self._main()
+        self.assertEqual(self.started, [])
+        self._main(now=NOW_PAST_FALLBACK)
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+
+    def test_waits_while_a_retry_still_runs(self):
+        self._file_scan()
+        _board(self.board, [_ranking("failed"), _ranking("running", key=oobe.PRIORITIZE_KEY + "-retry-1", tid="t_retry")])
+        self._main()
+        self.assertEqual(self.started, [])
+
+    def test_a_finished_retry_counts(self):
+        self._file_scan()
+        _board(self.board, [_ranking("done", key=oobe.PRIORITIZE_KEY + "-retry-1")])
+        self._main()
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+
+    def test_an_earlier_runs_ranking_card_does_not_count(self):
+        # Left on the board by a run before onboarding was re-armed.
+        self._file_scan()
+        _board(self.board, [_ranking("done", created_at=SWEEP_CREATED_AT - 3600)])
+        self._main()
+        self.assertEqual(self.started, [])
+
+    def test_no_ranking_card_fires_at_the_fallback(self):
+        # A sweep that audited no cluster files no ranking card.
+        self._file_scan()
+        _board(self.board, [])
+        self._main()
+        self.assertEqual(self.started, [])
+        self._main(now=NOW_PAST_FALLBACK)
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+
+    def test_an_unreadable_board_waits_for_the_fallback(self):
+        self._file_scan()
+        self.board.write_text("not a database")
+        self._main()
+        self.assertEqual(self.started, [])
+        self._main(now=NOW_PAST_FALLBACK)
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+
+    def test_a_marker_without_filed_at_falls_back_to_its_age(self):
+        (self.d / oobe.SCAN_FILED_MARKER).write_text(f"task_id={SWEEP_ID}\n", encoding="utf-8")
+        _board(self.board, [])
+        mtime = (self.d / oobe.SCAN_FILED_MARKER).stat().st_mtime
+        self._main(now=mtime + 60)
+        self.assertEqual(self.started, [])
+        self._main(now=mtime + oobe.FALLBACK_SECONDS)
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+
+    # --- how it starts them ---------------------------------------------------
+
+    def test_marks_each_audit_due_on_the_platform_roster(self):
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._main()
+        for argv, env in self.started:
+            self.assertEqual(argv[1:3], ["cron", "run"])
+            self.assertEqual(env["HERMES_HOME"], str(self.d / "profiles" / "platform"))
+
+    def test_prints_nothing(self):
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self.assertEqual(self._main(), "")
+
+    def test_retries_only_the_audit_that_failed_to_start(self):
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self.failing = {"fleet-wide-cost-analysis"}
+        self._main()
+        self.assertFalse(oobe.read_state(self.d)[oobe.STATE_DONE])
+        self.started.clear()
+        self.failing = set()
+        self._main()
+        self.assertEqual(self._started_ids(), ["fleet-wide-cost-analysis"])
+        self.assertTrue(oobe.read_state(self.d)[oobe.STATE_DONE])
+
+    def test_gives_up_on_an_audit_that_never_starts(self):
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self.failing = {"stockout-prevention"}
+        for _ in range(oobe.MAX_TRIGGER_ATTEMPTS):
+            self._main()
+        state = oobe.read_state(self.d)
+        self.assertTrue(state[oobe.STATE_DONE])
+        self.assertEqual(state[oobe.STATE_GAVE_UP], ["stockout-prevention"])
+        self.started.clear()
+        self._main()
+        self.assertEqual(self.started, [])
+
+    def test_a_missing_hermes_binary_is_a_failed_start(self):
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+
+        def missing():
+            raise FileNotFoundError("no hermes")
+
+        with mock.patch.object(oobe.profile_cron_tick, "hermes_bin", missing):
+            self._main()
+        self.assertEqual(self.started, [])
+        self.assertFalse(oobe.read_state(self.d)[oobe.STATE_DONE])
+
+    # --- no GitOps repository -------------------------------------------------
+
+    def test_no_repository_skips_and_finishes(self):
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self.repos = []
+        self._main()
+        self.assertEqual(self.started, [])
+        state = oobe.read_state(self.d)
+        self.assertTrue(state[oobe.STATE_DONE])
+        self.assertEqual(state[oobe.STATE_REASON], oobe.SKIP_NO_REPOSITORY)
+
+    def test_an_unreadable_repository_list_is_retried(self):
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self.repos = RuntimeError("kubectl binary not found in PATH")
+        self._main()
+        self.assertEqual(self.started, [])
+        self.assertFalse((self.d / oobe.AUDITS_MARKER).exists())
+        self.repos = list(REPOS)
+        self._main()
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+
+    # --- once only ------------------------------------------------------------
+
+    def test_once_done_it_removes_itself_and_starts_nothing(self):
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._main()
+        self.started.clear()
+        removed = []
+        jobs = types.ModuleType("cron.jobs")
+        jobs.remove_job = removed.append
+        with mock.patch.dict(sys.modules, {"cron": types.ModuleType("cron"), "cron.jobs": jobs}):
+            self._main()
+        self.assertEqual(self.started, [])
+        self.assertEqual(removed, [oobe.OOBE_JOB_ID])
+
+    def test_a_corrupt_marker_is_read_as_not_started(self):
+        (self.d / oobe.AUDITS_MARKER).write_text("{not json", encoding="utf-8")
+        self.assertEqual(oobe.read_state(self.d), {})
+
+    def test_the_marker_is_json(self):
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._main()
+        state = json.loads((self.d / oobe.AUDITS_MARKER).read_text(encoding="utf-8"))
+        self.assertEqual(state[oobe.STATE_FIRED], list(oobe.FIRST_RUN_AUDITS))
+
+
+class RosterTest(unittest.TestCase):
+    def test_every_audit_is_on_the_platform_roster(self):
+        roster = Path(__file__).resolve().parents[2] / "platform" / "cron" / "jobs.json"
+        ids = {job["id"] for job in json.loads(roster.read_text(encoding="utf-8"))["jobs"] if job.get("enabled")}
+        self.assertLessEqual(set(oobe.FIRST_RUN_AUDITS), ids)
+
+    def test_the_job_is_on_the_chat_roster(self):
+        roster = Path(__file__).resolve().parent.parent / "defaults" / "cron" / "jobs.json"
+        jobs = {job["id"]: job for job in json.loads(roster.read_text(encoding="utf-8"))["jobs"]}
+        job = jobs[oobe.OOBE_JOB_ID]
+        self.assertEqual(job["script"], "oobe.py")
+        self.assertTrue(job["no_agent"])
+        self.assertEqual(job["deliver"], "local")
+
+
+if __name__ == "__main__":
+    unittest.main()

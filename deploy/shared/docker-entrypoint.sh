@@ -1006,12 +1006,14 @@ fi
 # --assume-retired covers the one case the script's ledger cannot know on its first run: a
 # deployment that finished onboarding before this existed has no record that
 # bootstrap_delivery.py:_retire_jobs retired the two onboarding jobs, so they would look new and
-# be reinstalled. .bootstrap_completed is that record.
+# be reinstalled. .bootstrap_completed is that record. `oobe` is seeded on the same record for a
+# different reason: an install that onboarded before the job existed must never get it, or its
+# first boot on this image would start four fleet audits it is not owed.
 CRON_SYNC="/opt/defaults/scripts/cron_jobs_sync.py"
 if [ -f "$CRON_SYNC" ] && [ -f "/opt/defaults/cron/jobs.json" ]; then
     ASSUME_RETIRED=""
     if [ -f "$TARGET_DIR/.bootstrap_completed" ]; then
-        ASSUME_RETIRED="bootstrap-inventory-scan,bootstrap-inventory-delivery"
+        ASSUME_RETIRED="bootstrap-inventory-scan,bootstrap-inventory-delivery,oobe"
     fi
     HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
         "$CRON_SYNC" \
