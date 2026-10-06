@@ -6621,6 +6621,14 @@ def test_a_cluster_placeholder_in_a_phrase_list_fails_at_spec_load(field):
     assert "cluster placeholder" in str(excinfo.value) and field in str(excinfo.value)
 
 
+def test_a_cluster_placeholder_in_tool_calleds_agent_selector_fails_at_spec_load():
+    # The selector is a scalar regex matched as written against agent tags;
+    # the placeholder is not expanded there, so it is refused up front.
+    with pytest.raises(Exception) as excinfo:
+        parse_node({"type": "tool_called", "tool_names": ["x"], "scope": "workers", "agent": "cluster-.*-{cluster:a}"})
+    assert "cluster placeholder" in str(excinfo.value)
+
+
 def test_any_with_no_recorded_slot_says_so_rather_than_naming_a_slot():
     v = parse_node({"type": "report_contains", "any_of_patterns": ["(?m)^{cluster:any}: ok$"]})
     _stash("seeded-a: ok")

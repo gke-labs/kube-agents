@@ -473,13 +473,15 @@ def _cluster_placeholders(node: Any, where: str, problems: list[str], slots: set
     lists: the verifier expands it from the runner's record there and nowhere
     else, so in a phrase list, another check's pattern list or any other
     string list it is literal text that never matches (an inert forbid) or
-    fails every run (a requirement). Every list of strings on the node is
-    read, not a fixed set of keys, so a new field is covered when it lands."""
+    fails every run (a requirement). Every string on the node is read, in a
+    list or on its own (`tool_called`'s `agent` is a scalar run as a regex),
+    not a fixed set of keys, so a new field is covered when it lands; a
+    scalar that carries no placeholder (`type`, `scope`, a role) is left
+    alone."""
     if not isinstance(node, dict):
         return
-    for key, values in node.items():
-        if not isinstance(values, list):
-            continue
+    for key, raw in node.items():
+        values = raw if isinstance(raw, list) else [raw]
         expands = node.get("type") == REPORT_CHECK_TYPE and key in EXPANDING_PATTERN_KEYS
         for pattern in values:
             if not isinstance(pattern, str):

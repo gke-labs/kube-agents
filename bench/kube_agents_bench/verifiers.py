@@ -752,6 +752,14 @@ class ToolCalledVerifier(BaseVerifier):
         if pattern is not None:
             if not pattern:
                 raise ValueError("agent selector pattern cannot be empty")
+            # The selector is matched as written against the trajectory's
+            # agent tags; a cluster placeholder is never expanded here, so it
+            # would compile as literal braces that match no tag.
+            if _CLUSTER_PLACEHOLDER_LOOSE.search(pattern):
+                raise ValueError(
+                    f"agent selector pattern {pattern!r} carries a cluster placeholder, which only "
+                    "report_contains's forbidden_patterns and any_of_patterns expand"
+                )
             compiled = re.compile(pattern)
             if compiled.fullmatch(""):
                 raise ValueError(

@@ -742,6 +742,18 @@ class TestTheRulesReject(unittest.TestCase):
                 )
                 self.assertIn(check["type"], problem)
 
+    def test_a_cluster_placeholder_in_a_scalar_regex_field_is_rejected(self):
+        # tool_called's `agent` is a single string run as a regex, not a
+        # list; the guard reads scalars too, so a placeholder there is
+        # refused rather than compiled as literal text that matches no tag.
+        problem = self._only(
+            "which only report_contains expands",
+            verification_spec=self._entry(check={"type": "tool_called", "tool_names": ["x"], "scope": "workers", "agent": "cluster-.*-{cluster:a}"}),
+        )
+        self.assertIn("'agent'", problem)
+        # a scalar with no placeholder is not read as one
+        self.assertEqual(self._validate(verification_spec=self._entry(check={"type": "tool_called", "tool_names": ["x"], "scope": "workers", "agent": "cluster-.*"})), [])
+
     def test_a_malformed_cluster_placeholder_is_rejected(self):
         self._only(
             "malformed cluster placeholder",
