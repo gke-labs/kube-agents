@@ -231,8 +231,8 @@ _writer = []
 
 
 def writer():
-    # Imported only when a card has findings to list, so a board on an image
-    # without the module still grades the ranking card.
+    # Imported on first use, so a board on an image without the module still
+    # grades: no clusters listed, and ranking cards with ownership unknown.
     if not _writer:
         sys.path.insert(0, module_dir)
         _writer.append(__import__(module))

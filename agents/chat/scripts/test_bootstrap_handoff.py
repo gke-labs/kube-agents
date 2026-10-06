@@ -511,6 +511,16 @@ class HandOffTest(unittest.TestCase):
             self.board.unlink()
             (self.d / h.HANDOFF_MARKER).unlink()
 
+    def test_an_earlier_runs_own_ranking_card_is_replaced(self):
+        # Same body, filed for the previous sweep: not this sweep's card.
+        _board(self.board, clusters=_all_done())
+        self._ranking_card("t_prev", "blocked", SWEEP_CREATED - 100, body=h._prioritize_body())
+        sent = []
+        with self._stub_kanban(sent, reply='{"id": "t_newrank"}'), \
+                mock.patch.object(h, "file_prioritize", HandOffTest._real_file_prioritize):
+            self.assertEqual(self._run_with_parser(), "t_newrank")
+        self.assertEqual(sent[0], "archive t_prev")
+
     def test_the_hand_offs_own_unrecorded_ranking_card_is_kept(self):
         # A tick that filed the card but failed to record it finds it again,
         # whatever became of it, so a blocked one is not re-filed every tick.

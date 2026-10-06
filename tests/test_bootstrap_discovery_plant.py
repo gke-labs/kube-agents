@@ -18,8 +18,8 @@
 waits for the sweep it files. Three behaviours pinned here fail quietly on a
 real install:
 
-  1. Step 4 must not hand over before the hand-off has: it waits for a ranking
-     card that can still run, or for the sweep and its Cluster Agent cards to
+  1. Step 4 must not hand over before the hand-off has: it waits for the
+     hand-off's own ranking card, or for the sweep and its Cluster Agent cards to
      stay settled for the hold, and a failed board read keeps the last state
      rather than ending the wait.
   2. On failure, the exit trap must wait for every gateway pod's gate run to
