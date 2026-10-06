@@ -70,7 +70,8 @@ verification_spec:
   # cluster do not pass. scope: workers with agent: platform reads the
   # platform worker's own calls, not the front door's one card. The title is
   # the bare name the plan row renders; "Check seeded-a" or a card per
-  # namespace does not count.
+  # namespace does not count, and neither does a card assigned to platform,
+  # which nests a second Platform Agent per cluster instead of delegating.
   - name: a-card-titled-seeded-a
     role: objective
     mode: assert
@@ -81,6 +82,7 @@ verification_spec:
       agent: platform
       arguments:
         title: "seeded-a"
+        assignee: "cluster-.+"
       require_success: true
   - name: a-card-titled-seeded-b
     role: objective
@@ -92,6 +94,7 @@ verification_spec:
       agent: platform
       arguments:
         title: "seeded-b"
+        assignee: "cluster-.+"
       require_success: true
   - name: a-card-titled-seeded-c
     role: objective
@@ -103,6 +106,7 @@ verification_spec:
       agent: platform
       arguments:
         title: "seeded-c"
+        assignee: "cluster-.+"
       require_success: true
   # "seeded-a" is slot a under the fleet prefix's default, the contract the
   # crashloop cases carry.
