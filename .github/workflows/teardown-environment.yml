@@ -70,7 +70,7 @@ jobs:
           GH_REPO: ${{ vars.GH_REPO }}
         run: ./scripts/release/resolve_rc_tag.sh
 
-      # The teardown engine has to be the candidate's own, not main's. The four
+      # The teardown engine has to be the candidate's own, not main's. The
       # asymmetric resources lifecycle.sh handles before `terraform destroy` are
       # the ones the candidate's composition created, and a newer lifecycle.sh
       # can expect state layouts this environment was never installed with.

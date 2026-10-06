@@ -791,34 +791,51 @@ platformAgent:
     # Annotations applied to that KSA, e.g. for Workload Identity:
     #   iam.gke.io/gcp-service-account: <GSA>@<project>.iam.gserviceaccount.com
     serviceAccountAnnotations: {}
-    # One Google service account per GKE cluster the agent may read, each
-    # provisioned by Terraform. The credential broker mints a short-lived token
-    # for the account a request's cluster maps to, instead of using the agent's
-    # own identity -- which, with a project-level roles/container.viewer, reads
-    # objects in every cluster in the project.
+    # The scoped service account pool: one Google service account per GCP
+    # project the agent may read, each provisioned by Terraform in the host
+    # project. The credential broker mints a short-lived token for the account
+    # a request's project maps to, instead of using the agent's own identity
+    # -- which, with a project-level roles/container.viewer, reads objects in
+    # every cluster in the project. Two clusters in one project share an
+    # account by design: the project is the IAM unit a scope declaration is
+    # written in, and what tells the clusters apart is per-cluster RBAC.
     #
-    # Empty by default, and it should stay empty until per-cluster RBAC lands.
-    # A pool member holds no IAM grant: the IAM Condition that scoped it grants
+    # `enabled` arms the broker; the list does not. The composition writes
+    # `serviceAccounts` from its `scoped_service_accounts` output whenever the
+    # pool is provisioned, so a list that armed the broker by being non-empty
+    # would arm every install that provisioned an account. Declaring a project
+    # in platformAgent.scope arms nothing either. With `enabled: false` the
+    # list still reaches the CR, declared and inert, the operator renders
+    # nothing from it, and the broker runs on the agent's own identity,
+    # with CREDENTIAL_PROXY_SCOPED_SA_POOL=0 on its container so the mode an
+    # install is in is readable from the Deployment; `enabled: true` renders
+    # the mapping into the broker's ConfigMap and sets it to 1. The key this
+    # block replaced, `scopedServiceAccounts`, is still admitted by the schema
+    # as an empty list for one release, because every earlier release record
+    # carries it empty and a retag re-applies the record; a populated one is
+    # refused by name (values.schema.json). Enabled with
+    # an empty list is refused at `helm install`: the broker refuses to start
+    # on an empty pool.
+    #
+    # Off by default, and it should stay off until per-cluster RBAC lands. A
+    # pool member holds no IAM grant: the IAM Condition that scoped it grants
     # nothing for Kubernetes object operations (measured 2026-08-12) and the
     # un-conditioned binding is project-wide roles/container.viewer, so both
-    # were removed. A non-empty list here arms the broker, which would then
-    # select a powerless identity for every request.
+    # were removed. An armed pool today selects a powerless identity for
+    # every request.
     #
-    # The terraform/examples/full-install composition fills this in from its
-    # `scoped_service_accounts` output; take the values from there rather than
+    # A project that is not listed is REFUSED, never served on the ambient
+    # credential. Take the entries from the composition's output rather than
     # deriving the account names, since the broker matches them exactly.
     #
-    # A cluster that is not listed is REFUSED, not served by a wider credential.
-    # Leaving the list empty keeps the previous single-identity behaviour and
-    # renders CREDENTIAL_PROXY_SCOPED_SA_POOL=0 on the broker container, so the
-    # mode an install is in is readable from the Deployment.
-    #
-    #   scopedServiceAccounts:
-    #     - projectId: my-project
-    #       location: us-east4
-    #       clusterName: my-cluster
-    #       serviceAccountEmail: ka-my-cluster-1a2b3c4d@my-project.iam.gserviceaccount.com
-    scopedServiceAccounts: []
+    #   scopedServiceAccountPool:
+    #     enabled: true
+    #     serviceAccounts:
+    #       - projectId: my-project
+    #         serviceAccountEmail: ka-my-project-1a2b3c4d@host-project.iam.gserviceaccount.com
+    scopedServiceAccountPool:
+      enabled: false
+      serviceAccounts: []
     # Gives the credential proxy a GCP identity that does not come from the
     # metadata server, which is what lets it run beside the shell sandbox.
     #

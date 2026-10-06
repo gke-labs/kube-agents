@@ -471,9 +471,10 @@ func buildCredentialProxyFederationVolume(agent *agentv1alpha1.PlatformAgent) []
 // buildCredentialProxyNetworkPolicy narrows who may reach the endpoint down to
 // the callers that have a reason to: the sandbox, whose wrapped CLIs are the
 // proxy's purpose; the gateway, which pulls chat events from the relay hosted
-// here; and, under the cluster-view flag, the session pods. TokenReview already
-// rejects a caller this pod does not serve; this is the layer that keeps such a
-// caller from opening the connection.
+// here; when the next stack takes Google Chat, the A2A gateway, which pulls the
+// same relay's A2A routes; and, under the cluster-view flag, the session pods.
+// TokenReview already rejects a caller this pod does not serve; this is the
+// layer that keeps such a caller from opening the connection.
 //
 // A second rule admits the managed-Prometheus collector, from its own
 // namespace and to the metrics-only port alone: the runtime serves its counters
@@ -500,6 +501,14 @@ func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *netw
 	callers := []networkingv1.NetworkPolicyPeer{
 		{PodSelector: &metav1.LabelSelector{MatchLabels: shellSandboxSelector(agent)}},
 		{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": agent.Name + "-gateway"}}},
+	}
+	// The A2A gateway pod, while its Google Chat adapter pulls the relay
+	// hosted here. The same condition as allowedBrokerCallers: a peer that
+	// is not a caller is a rule with nobody behind it.
+	if a2aChatArmed(agent) {
+		callers = append(callers, networkingv1.NetworkPolicyPeer{
+			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": a2aGatewayName(agent)}},
+		})
 	}
 	if a2aSessionClusterViewEnabled(agent) {
 		// The session pods, under the cluster-view flag: the same selector

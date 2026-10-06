@@ -7969,7 +7969,8 @@ class RequiredRoleTest(unittest.TestCase):
 
     Reads ``required_roles`` (plural) since this branch: a route can admit more
     than one caller role, because the /v1/chat/api passthrough is shared by the
-    legacy chat relay and the A2A one — one credential, two subscriptions. The
+    legacy chat relay and the A2A one — one credential, one relay instance per
+    install. The
     singular ``required_role`` these tests were written against returned the
     first match and could not express that.
     """
@@ -8680,13 +8681,21 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
     selection first. Both are asserted against a real subprocess reading a real
     file, because the failure mode here is a command that runs perfectly well on
     the wrong identity.
+
+    The pool is keyed on the project, so "mapped" and "unmapped" are properties
+    of the project a cluster is in: `MAPPED` lives in `PROJECT`, which has a
+    member, and `UNMAPPED` lives in `OTHER_PROJECT`, which does not. `project_of`
+    is the one place that split is spelled, and `agent_context` and
+    `ambient_kubeconfig` both go through it.
     """
 
     PROJECT = "kagents-dev"
+    OTHER_PROJECT = "kagents-other"
     LOCATION = "us-east4"
     MAPPED = "mapped-cluster"
     UNMAPPED = "unmapped-cluster"
-    EMAIL = "ka-mapped-cluster-1a2b3c4d@kagents-dev.iam.gserviceaccount.com"
+    EMAIL = "ka-kagents-dev-1a2b3c4d@kagents-host.iam.gserviceaccount.com"
+    OTHER_EMAIL = "ka-kagents-other-99887766@kagents-host.iam.gserviceaccount.com"
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -8703,20 +8712,20 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
             return []
         return self.get_credentials_log.read_text(encoding="utf-8").split()
 
-    def pool(self, *, clusters=(MAPPED,)):
+    def project_of(self, cluster):
+        """Which project a test cluster lives in; the unmapped one is elsewhere."""
+        return self.OTHER_PROJECT if cluster == self.UNMAPPED else self.PROJECT
+
+    def pool(self, *, projects=(PROJECT,)):
         import scoped_sa_pool
 
+        emails = {self.PROJECT: self.EMAIL, self.OTHER_PROJECT: self.OTHER_EMAIL}
         members = scoped_sa_pool.parse_pool(
             {
-                "version": 1,
+                "version": 2,
                 "serviceAccounts": [
-                    {
-                        "projectId": self.PROJECT,
-                        "location": self.LOCATION,
-                        "clusterName": cluster,
-                        "serviceAccountEmail": self.EMAIL,
-                    }
-                    for cluster in clusters
+                    {"projectId": project, "serviceAccountEmail": emails[project]}
+                    for project in projects
                 ],
             }
         )
@@ -8752,7 +8761,7 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
         managed.parent.mkdir(parents=True, exist_ok=True)
         managed.write_text(
             "apiVersion: v1\nkind: Config\n"
-            f"current-context: gke_{self.PROJECT}_{self.LOCATION}_{cluster}\n",
+            f"current-context: gke_{self.project_of(cluster)}_{self.LOCATION}_{cluster}\n",
             encoding="utf-8",
         )
         return managed
@@ -8835,7 +8844,7 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
         The profile's kubeconfig stays in the agent's own pod; the shim reads
         `current-context` out of it there and sends this string.
         """
-        return f"gke_{self.PROJECT}_{self.LOCATION}_{cluster}"
+        return f"gke_{self.project_of(cluster)}_{self.LOCATION}_{cluster}"
 
     def test_a_read_against_a_mapped_cluster_runs_on_that_cluster_s_account(self):
         """The ordinary read, and the assertion that it changed identity.
@@ -8862,6 +8871,25 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
         )
         self.assertNotIn("gke-gcloud-auth-plugin", result.stdout)
         self.assertNotIn("exec:", result.stdout)
+
+    def test_a_second_cluster_in_the_mapped_project_runs_on_the_same_account(self):
+        """One account per project, through the whole join.
+
+        Two clusters in one project share a member by design
+        (`multi-project-scope.md` §6). The per-cluster pool refused this
+        request; the per-project one serves it on the project's account, and
+        mints once for both clusters because the token cache is keyed on the
+        member.
+        """
+        executor = self.executor(self.pool())
+        for cluster in (self.MAPPED, "second-cluster"):
+            result = executor.execute(
+                ["kubectl", "get", "pods"],
+                kubeconfig_context=f"gke_{self.PROJECT}_{self.LOCATION}_{cluster}",
+            )
+            self.assertEqual(0, result.exit_code, result.stderr)
+            self.assertIn("token: TOKEN-1", result.stdout)
+        self.assertEqual([self.EMAIL], self.minted)
 
     def test_an_unmapped_cluster_is_refused_and_nothing_runs(self):
         import scoped_sa_pool
@@ -8928,7 +8956,7 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
 
     def test_that_same_request_succeeds_once_the_default_cluster_is_in_the_pool(self):
         """The refusal above must be about the mapping, not about the path."""
-        executor = self.executor(self.pool(clusters=(self.MAPPED,)))
+        executor = self.executor(self.pool(projects=(self.PROJECT,)))
         managed = Path(executor.environment["KUBECONFIG"])
         managed.parent.mkdir(parents=True, exist_ok=True)
         managed.write_text(
@@ -9044,11 +9072,11 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
     def test_a_flag_pinned_request_selects_once(self):
         """Two selections for one request is not two controls.
 
-        Both clusters mapped, so the old behaviour did not refuse -- it minted
+        Both projects mapped, so the old behaviour did not refuse -- it minted
         twice, once for the cluster argv named and once for the sidecar's, and
         used the first. A test that only checked the exit code saw nothing.
         """
-        executor = self.executor(self.pool(clusters=(self.MAPPED, self.UNMAPPED)))
+        executor = self.executor(self.pool(projects=(self.PROJECT, self.OTHER_PROJECT)))
         self.ambient_kubeconfig(executor, self.UNMAPPED)
         executor.execute(
             [
@@ -9187,14 +9215,9 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
         pool_file.write_text(
             json.dumps(
                 {
-                    "version": 1,
+                    "version": 2,
                     "serviceAccounts": [
-                        {
-                            "projectId": self.PROJECT,
-                            "location": self.LOCATION,
-                            "clusterName": self.MAPPED,
-                            "serviceAccountEmail": self.EMAIL,
-                        }
+                        {"projectId": self.PROJECT, "serviceAccountEmail": self.EMAIL}
                     ],
                 }
             ),
@@ -9216,10 +9239,7 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
                 state_dir=str(Path(self.temp_dir.name) / "auto"),
             )
         self.assertIsNotNone(executor.scoped_pool)
-        self.assertEqual(
-            [f"projects/{self.PROJECT}/locations/{self.LOCATION}/clusters/{self.MAPPED}"],
-            executor.scoped_pool.scopes,
-        )
+        self.assertEqual([self.PROJECT], executor.scoped_pool.scopes)
 
 
 class ScopedServiceAccountOverTheSocketTest(unittest.TestCase):
@@ -9233,9 +9253,10 @@ class ScopedServiceAccountOverTheSocketTest(unittest.TestCase):
     """
 
     PROJECT = "kagents-dev"
+    OTHER_PROJECT = "kagents-other"
     LOCATION = "us-east4"
     MAPPED = "mapped-cluster"
-    EMAIL = "ka-mapped-cluster-1a2b3c4d@kagents-dev.iam.gserviceaccount.com"
+    EMAIL = "ka-kagents-dev-1a2b3c4d@kagents-host.iam.gserviceaccount.com"
     WIDE = "kubeagents-platform-gsa@kagents-dev.iam.gserviceaccount.com"
 
     def setUp(self):
@@ -9251,14 +9272,9 @@ class ScopedServiceAccountOverTheSocketTest(unittest.TestCase):
 
         members = scoped_sa_pool.parse_pool(
             {
-                "version": 1,
+                "version": 2,
                 "serviceAccounts": [
-                    {
-                        "projectId": self.PROJECT,
-                        "location": self.LOCATION,
-                        "clusterName": self.MAPPED,
-                        "serviceAccountEmail": self.EMAIL,
-                    }
+                    {"projectId": self.PROJECT, "serviceAccountEmail": self.EMAIL}
                 ],
             }
         )
@@ -9309,8 +9325,36 @@ class ScopedServiceAccountOverTheSocketTest(unittest.TestCase):
             else:
                 setattr(CredentialProxyHandler, name, value)
 
-    def context_naming(self, cluster):
-        return f"gke_{self.PROJECT}_{self.LOCATION}_{cluster}"
+    def context_naming(self, cluster, project=None):
+        return f"gke_{project or self.PROJECT}_{self.LOCATION}_{cluster}"
+
+    def stub_gcloud(self, context):
+        """A `get-credentials` that writes a kubeconfig for `context`.
+
+        Served requests reach gcloud before kubectl; the refusals above do not,
+        which is why setUp stubs only kubectl.
+        """
+        gcloud = self.stub_dir / "gcloud"
+        gcloud.write_text(
+            textwrap.dedent(
+                f"""\
+                #!/bin/bash
+                ctx="{context}"
+                printf 'apiVersion: v1\\nkind: Config\\ncurrent-context: %s\\nusers:\\n- name: %s\\n  user:\\n    exec:\\n      command: gke-gcloud-auth-plugin\\n' "$ctx" "$ctx" > "$KUBECONFIG"
+                """
+            ),
+            encoding="utf-8",
+        )
+        gcloud.chmod(0o755)
+        CredentialProxyHandler.executor.executables["gcloud"] = str(gcloud)
+
+    def unmapped_context(self):
+        """A cluster in a project the pool has no member for.
+
+        The pool is keyed on the project, so an unknown cluster *name* in the
+        mapped project is served; the refusal needs a project with no entry.
+        """
+        return self.context_naming("nowhere-cluster", project=self.OTHER_PROJECT)
 
     def post(self, body):
         request = urllib.request.Request(
@@ -9330,15 +9374,33 @@ class ScopedServiceAccountOverTheSocketTest(unittest.TestCase):
             {
                 "requestId": "r1",
                 "argv": ["kubectl", "get", "pods"],
-                "kubeconfigContext": self.context_naming("nowhere-cluster"),
+                "kubeconfigContext": self.unmapped_context(),
             }
         )
         self.assertEqual(403, status, body)
         self.assertEqual("gcp.scoped-sa.unmapped-scope", body.get("rule"), body)
+        self.assertIn(f"project {self.OTHER_PROJECT} ", body.get("message", ""))
         self.assertIn(
-            f"projects/{self.PROJECT}/locations/{self.LOCATION}/clusters/nowhere-cluster",
+            f"projects/{self.OTHER_PROJECT}/locations/{self.LOCATION}/clusters/nowhere-cluster",
             body.get("message", ""),
         )
+
+    def test_an_unknown_cluster_name_in_a_mapped_project_is_served(self):
+        """The refusal above is about the project, not the cluster name.
+
+        Without this the previous case passes on a pool still keyed per
+        cluster, and the fleet's second cluster in every project is refused.
+        """
+        self.stub_gcloud(self.context_naming("nowhere-cluster"))
+        status, body = self.post(
+            {
+                "requestId": "r1b",
+                "argv": ["kubectl", "get", "pods"],
+                "kubeconfigContext": self.context_naming("nowhere-cluster"),
+            }
+        )
+        self.assertEqual(200, status, body)
+        self.assertEqual([self.EMAIL], self.minted)
 
     # The vocabulary the /v1/exec handler reads out of the request body. Six
     # keys. Pinned here because the test below used to be a denylist of seven
@@ -9448,6 +9510,35 @@ class ScopedServiceAccountOverTheSocketTest(unittest.TestCase):
         self.assertNotIn("\n", refusals[0], refusals[0])
         self.assertIn("forged", refusals[0], "the message was truncated rather than sanitised")
 
+    def test_the_refusal_is_logged_whole_at_the_longest_names(self):
+        """The log cap on the refusal is sized against the message, not a default.
+
+        A real refusal built by `select` at the bound `_name_component` enforces
+        on every component. If the WARNING is cut before the remedy, the
+        operator reading the log is left without the fix the message exists
+        to carry.
+        """
+        import scoped_sa_pool
+
+        longest = "a" * scoped_sa_pool.MAX_NAME_COMPONENT_LENGTH
+        pool = CredentialProxyHandler.executor.scoped_pool
+
+        def refuse(*args, **kwargs):
+            pool.select(longest, longest, longest)
+
+        with mock.patch.object(CredentialProxyHandler.executor, "execute", refuse):
+            with self.assertLogs("credential-proxy", level="WARNING") as logs:
+                status, body = self.post(
+                    {"requestId": "r6", "argv": ["kubectl", "get", "pods"]}
+                )
+        self.assertEqual(403, status, body)
+        refusals = [line for line in logs.output if "scoped service account refused" in line]
+        self.assertEqual(1, len(refusals), logs.output)
+        self.assertTrue(
+            refusals[0].endswith("or exclude the cluster."),
+            f"the refusal was truncated before its remedy: {refusals[0]!r}",
+        )
+
     def test_the_request_body_cannot_choose_the_account(self):
         """The request body is data, not configuration.
 
@@ -9482,7 +9573,7 @@ class ScopedServiceAccountOverTheSocketTest(unittest.TestCase):
                     {
                         "requestId": "r2",
                         "argv": ["kubectl", "get", "pods"],
-                        "kubeconfigContext": self.context_naming("nowhere-cluster"),
+                        "kubeconfigContext": self.unmapped_context(),
                         field: value,
                     }
                 )
@@ -9497,20 +9588,7 @@ class ScopedServiceAccountOverTheSocketTest(unittest.TestCase):
         and failed for some other reason, so this asserts the account actually
         used on a request that succeeds.
         """
-        gcloud = self.stub_dir / "gcloud"
-        gcloud.write_text(
-            textwrap.dedent(
-                """\
-                #!/bin/bash
-                ctx="gke_kagents-dev_us-east4_mapped-cluster"
-                printf 'apiVersion: v1\\nkind: Config\\ncurrent-context: %s\\nusers:\\n- name: %s\\n  user:\\n    exec:\\n      command: gke-gcloud-auth-plugin\\n' "$ctx" "$ctx" > "$KUBECONFIG"
-                """
-            ),
-            encoding="utf-8",
-        )
-        gcloud.chmod(0o755)
-        CredentialProxyHandler.executor.executables["gcloud"] = str(gcloud)
-
+        self.stub_gcloud(self.context_naming(self.MAPPED))
         status, body = self.post(
             {
                 "requestId": "r3",
