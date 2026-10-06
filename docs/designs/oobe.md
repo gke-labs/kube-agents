@@ -116,6 +116,11 @@ the calling process (`agents/platform/AGENTS.md`).
 `.oobe_audits_fired` records each id as its `cron run` succeeds. A failed one is retried on the next
 tick, and only that one: marking an audit due again after it has run starts a second full run.
 
+`hermes cron run` also sets the job's `enabled` back to true (`cron.jobs.trigger_job`), so an
+audit an operator has disabled or paused, or one missing from the Platform Agent's roster, is
+recorded as held and not started. A failed start is retried up to five times; after that the
+audit is left to its schedule, so the stage always finishes and the job always leaves.
+
 ### 4.4 No GitOps repository
 
 Every audit opens its run against the GitOps repository before it reads anything

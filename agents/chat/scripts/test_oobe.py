@@ -54,6 +54,7 @@ class StageTest(unittest.TestCase):
         self.started: list[tuple[list[str], dict]] = []
         self.failing: set[str] = set()
         self.repos: list[str] | Exception = list(REPOS)
+        self._roster([{"id": job_id, "enabled": True, "state": "scheduled"} for job_id in oobe.FIRST_RUN_AUDITS])
         patches = [
             mock.patch.object(oobe, "board_path", lambda _d: self.board),
             mock.patch.object(oobe.profile_cron_tick, "hermes_bin", lambda: Path("/opt/hermes/.venv/bin/hermes")),
@@ -76,6 +77,11 @@ class StageTest(unittest.TestCase):
         if isinstance(self.repos, Exception):
             raise self.repos
         return self.repos
+
+    def _roster(self, jobs: list[dict]) -> None:
+        cron = self.d / "profiles" / "platform" / "cron"
+        cron.mkdir(parents=True, exist_ok=True)
+        (cron / "jobs.json").write_text(json.dumps({"jobs": jobs, "updated_at": "x"}), encoding="utf-8")
 
     def _file_scan(self, filed_at: int = FILED_AT) -> None:
         (self.d / oobe.SCAN_FILED_MARKER).write_text(f"task_id={SWEEP_ID}\nfiled_at={filed_at}\n", encoding="utf-8")
@@ -227,6 +233,35 @@ class StageTest(unittest.TestCase):
             self._main()
         self.assertEqual(self.started, [])
         self.assertFalse(oobe.read_state(self.d)[oobe.STATE_DONE])
+
+    def test_a_disabled_or_paused_audit_is_left_alone(self):
+        # `hermes cron run` would set enabled back to true.
+        self._roster([
+            {"id": "compliance-audit", "enabled": False},
+            {"id": "obtainability-audit", "enabled": True, "state": "paused", "paused_at": "2026-10-06T00:00:00"},
+            {"id": "fleet-wide-cost-analysis", "enabled": True},
+        ])
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._main()
+        self.assertEqual(self._started_ids(), ["fleet-wide-cost-analysis"])
+        state = oobe.read_state(self.d)
+        self.assertEqual(state[oobe.STATE_HELD], {
+            "compliance-audit": "disabled",
+            "obtainability-audit": "paused",
+            "stockout-prevention": "not on the Platform Agent's roster",
+        })
+        self.assertTrue(state[oobe.STATE_DONE])
+
+    def test_an_unreadable_roster_starts_nothing_and_counts_an_attempt(self):
+        (self.d / "profiles" / "platform" / "cron" / "jobs.json").write_text("{not json")
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._main()
+        self.assertEqual(self.started, [])
+        state = oobe.read_state(self.d)
+        self.assertFalse(state[oobe.STATE_DONE])
+        self.assertEqual(set(state[oobe.STATE_ATTEMPTS]), set(oobe.FIRST_RUN_AUDITS))
 
     # --- no GitOps repository -------------------------------------------------
 

@@ -18,6 +18,9 @@ starts only the ones still missing: marking an audit due again after it has run
 starts a second full run. With no GitOps repository configured every audit fails
 before it reads anything, so the stage records the skip and starts none.
 
+`hermes cron run` also sets a job's `enabled` back to true, so an audit an operator
+has disabled or paused is left alone rather than started.
+
 Once the stage is done, the next run removes the job. Stdout stays empty: the job
 delivers locally and never speaks to the user.
 """
@@ -48,6 +51,10 @@ FIRST_RUN_AUDITS = (
 )
 PLATFORM_PROFILE = "platform"
 PROFILES_DIR = "profiles"
+CRON_DIR = "cron"
+ROSTER_FILE = "jobs.json"
+# Hermes' pause marker on a job record (cron.jobs: is_job_runnable).
+PAUSED_STATE = "paused"
 
 # The ranking card the scan files last. A retry or a hand re-run uses this key with a
 # suffix (inventory.md, step 5; bootstrap_onboarding/README.md), so the prefix counts too.
@@ -71,6 +78,7 @@ STATE_DONE = "done"
 STATE_FIRED = "fired"
 STATE_ATTEMPTS = "attempts"
 STATE_GAVE_UP = "gave_up"
+STATE_HELD = "held"
 STATE_SKIPPED = "skipped"
 STATE_REASON = "reason"
 STATE_AT = "at"
@@ -207,6 +215,31 @@ def trigger(job_id: str, data_dir: Path) -> bool:
     return True
 
 
+def audit_holds(data_dir: Path) -> dict[str, str] | None:
+    """Audits not to start, each with why: absent from the roster, disabled or paused.
+
+    None when the Platform Agent's roster cannot be read.
+    """
+    roster = data_dir / PROFILES_DIR / PLATFORM_PROFILE / CRON_DIR / ROSTER_FILE
+    try:
+        stored = json.loads(roster.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        _log(f"cannot read {roster}: {e}")
+        return None
+    jobs = stored.get("jobs", []) if isinstance(stored, dict) else stored
+    by_id = {job.get("id"): job for job in jobs if isinstance(job, dict)}
+    holds = {}
+    for job_id in FIRST_RUN_AUDITS:
+        job = by_id.get(job_id)
+        if job is None:
+            holds[job_id] = "not on the Platform Agent's roster"
+        elif not job.get("enabled", True):
+            holds[job_id] = "disabled"
+        elif job.get("state") == PAUSED_STATE or job.get("paused_at"):
+            holds[job_id] = "paused"
+    return holds
+
+
 def retire() -> None:
     """Remove this job in-process. Its runs print nothing, so no output is lost with it."""
     try:
@@ -224,10 +257,19 @@ def fire_audits(data_dir: Path, state: dict, now: float) -> dict:
     fired = list(state.get(STATE_FIRED, []))
     attempts = dict(state.get(STATE_ATTEMPTS, {}))
     gave_up = list(state.get(STATE_GAVE_UP, []))
+    held = dict(state.get(STATE_HELD, {}))
+    holds = audit_holds(data_dir)
+
+    def record() -> dict:
+        return {STATE_FIRED: fired, STATE_ATTEMPTS: attempts, STATE_GAVE_UP: gave_up, STATE_HELD: held, STATE_AT: now}
+
     for job_id in FIRST_RUN_AUDITS:
-        if job_id in fired or job_id in gave_up:
+        if job_id in fired or job_id in gave_up or job_id in held:
             continue
-        if trigger(job_id, data_dir):
+        if holds is not None and job_id in holds:
+            _log(f"not starting {job_id}: {holds[job_id]}")
+            held[job_id] = holds[job_id]
+        elif holds is not None and trigger(job_id, data_dir):
             fired.append(job_id)
         else:
             attempts[job_id] = attempts.get(job_id, 0) + 1
@@ -235,9 +277,8 @@ def fire_audits(data_dir: Path, state: dict, now: float) -> dict:
                 _log(f"giving up on {job_id} after {MAX_TRIGGER_ATTEMPTS} attempts; it runs on its own schedule")
                 gave_up.append(job_id)
         # After each audit, so a run killed partway does not start the same audit twice.
-        write_state(data_dir, {STATE_FIRED: fired, STATE_ATTEMPTS: attempts, STATE_GAVE_UP: gave_up, STATE_AT: now})
-    done = all(job_id in fired or job_id in gave_up for job_id in FIRST_RUN_AUDITS)
-    new_state = {STATE_FIRED: fired, STATE_ATTEMPTS: attempts, STATE_GAVE_UP: gave_up, STATE_AT: now, STATE_DONE: done}
+        write_state(data_dir, record())
+    new_state = {**record(), STATE_DONE: all(job_id in fired or job_id in gave_up or job_id in held for job_id in FIRST_RUN_AUDITS)}
     write_state(data_dir, new_state)
     return new_state
 
