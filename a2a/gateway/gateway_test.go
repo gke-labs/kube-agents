@@ -2703,3 +2703,28 @@ func TestAskTTLClearsTheSteerAuthors(t *testing.T) {
 		}
 	}
 }
+
+// TestAskTTLBoundsTheIncarnationSet: the set is hashed ids like the
+// requester copy and is bounded the same way, from its oldest entry; cleared,
+// it is marked incomplete, so the incarnation's delegations fail closed as a
+// cleared requester's do.
+func TestAskTTLBoundsTheIncarnationSet(t *testing.T) {
+	r := startRigWith(t, func(c *Config) { c.AskTTL = time.Minute })
+	conv := "discord:g1/thread-ttl-incarnation"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "x"}
+	r.awaitTask(t, "platform")
+	ctx := context.Background()
+	var rec *SessionRecord
+	waitFor(t, "record", func() bool { rec, _ = r.g.reg.Get(ctx, conv); return rec != nil && len(rec.Tasks) == 1 })
+	rec.BusSession = "chat-x"
+	rec.addSessionAuthor(TaskRequester{Backend: "discord", Subject: "hmac:x"})
+	rec.SessionAuthorsSince = time.Now().Add(-2 * time.Minute)
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	r.g.boundAskCopy(ctx, rec)
+	fresh, _ := r.g.reg.Get(ctx, conv)
+	if len(fresh.SessionAuthors) != 0 || !fresh.SessionAuthorsUnknown {
+		t.Fatalf("incarnation set past the TTL: %+v unknown=%v", fresh.SessionAuthors, fresh.SessionAuthorsUnknown)
+	}
+}

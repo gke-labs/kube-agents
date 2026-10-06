@@ -1624,6 +1624,11 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	}
 	ref.carrySteerAuthors(TaskRef{SteerAuthors: ts.SteerAuthors, SteerAuthorsOverflow: ts.SteerAuthorsOverflow})
 	rec.Tasks = append(rec.Tasks, ref)
+	// Text published to the conversation's own incarnation joins its author
+	// set; a child to platform does not reach the incarnation.
+	if rec.AddressedToOwnSession() {
+		rec.addTurnToSession(requester, ref.SteerAuthors, ref.SteerAuthorsOverflow)
+	}
 	rec.LastTaskActivity = time.Now().UTC()
 	if len(rec.Tasks) > taskHistoryCap {
 		rec.Tasks = rec.Tasks[len(rec.Tasks)-taskHistoryCap:]
@@ -1700,7 +1705,11 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	// stays there if the publish fails: a lost ack does not prove the steer
 	// never arrived, and an author recorded for nothing costs at most a
 	// refused delegation. The caller writes the record back.
-	rec.recordSteerAuthor(active.TaskID, TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)})
+	author := TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)}
+	rec.recordSteerAuthor(active.TaskID, author)
+	if rec.AddressedToOwnSession() {
+		rec.addSessionAuthor(author)
+	}
 	payload, err := messagePayload(msg.Text, active.TaskID, rec.ContextID)
 	if err != nil {
 		g.log.Error("steer payload build failed", "err", err)

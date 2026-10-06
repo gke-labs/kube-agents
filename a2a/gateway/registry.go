@@ -88,6 +88,104 @@ type SessionRecord struct {
 	// session-routed addressees rotate per incarnation. Bounded; the
 	// stream's retention is the real horizon.
 	Tasks []TaskRef `json:"tasks,omitempty"`
+	// SessionAuthors is everyone whose text was published to the
+	// incarnation SessionAuthorsFor names: each turn's requester and each
+	// steer author, stored as TaskRequester (hashed, never the id),
+	// deduplicated, at most sessionAuthorCap. An incarnation's pod keeps what
+	// it was told, so a delegation from it is checked against all of them,
+	// not only the delegating turn's people. The set belongs to one
+	// BusSession: once BusSession moves on (any rotation or retirement), it
+	// is stale and the next add starts the new incarnation's (addSessionAuthor),
+	// which is the one place the reset happens. SessionAuthorsUnknown marks
+	// a set that no longer lists everyone (past the cap, or cleared by the
+	// ask bound); the incarnation's delegations are refused until a fresh
+	// one. SessionAuthorsSince is when the set's oldest entry was added,
+	// what the ask bound ages it by.
+	SessionAuthors        []TaskRequester `json:"sessionAuthors,omitempty"`
+	SessionAuthorsFor     string          `json:"sessionAuthorsFor,omitempty"`
+	SessionAuthorsUnknown bool            `json:"sessionAuthorsUnknown,omitempty"`
+	SessionAuthorsSince   time.Time       `json:"sessionAuthorsSince,omitzero"`
+}
+
+// sessionAuthorCap bounds SessionRecord.SessionAuthors. It holds a turn's
+// requester and a full steer list (1 + steerAuthorCap) with room for what a
+// wake carries over; past it the set is marked and the incarnation refuses
+// to delegate rather than drop an author.
+const sessionAuthorCap = 2 * steerAuthorCap
+
+// currentSessionAuthors makes the set the current incarnation's: a set
+// recorded for an earlier BusSession is dropped. This is the reset, and the
+// only one; every rotation or retirement moves BusSession, so none needs its
+// own.
+func (rec *SessionRecord) currentSessionAuthors() {
+	if rec.SessionAuthorsFor == rec.BusSession {
+		return
+	}
+	rec.SessionAuthors, rec.SessionAuthorsUnknown, rec.SessionAuthorsSince = nil, false, time.Time{}
+	rec.SessionAuthorsFor = rec.BusSession
+}
+
+// addSessionAuthor adds an author to the current incarnation's set: not
+// twice, and past the cap only as the mark.
+func (rec *SessionRecord) addSessionAuthor(a TaskRequester) {
+	if rec.BusSession == "" {
+		return
+	}
+	rec.currentSessionAuthors()
+	for _, have := range rec.SessionAuthors {
+		if have == a {
+			return
+		}
+	}
+	if len(rec.SessionAuthors) >= sessionAuthorCap {
+		rec.SessionAuthorsUnknown = true
+		return
+	}
+	if rec.SessionAuthorsSince.IsZero() {
+		rec.SessionAuthorsSince = time.Now().UTC()
+	}
+	rec.SessionAuthors = append(rec.SessionAuthors, a)
+}
+
+// addTurnToSession adds the people behind text published to the current
+// incarnation: the turn's requester and the steer authors its entry carries
+// (TaskRef.SteerAuthors), the mark if those overflowed.
+func (rec *SessionRecord) addTurnToSession(requester TaskRequester, steer []TaskRequester, steerOverflow bool) {
+	if rec.BusSession == "" {
+		return
+	}
+	rec.addSessionAuthor(requester)
+	for _, a := range steer {
+		rec.addSessionAuthor(a)
+	}
+	if steerOverflow {
+		rec.SessionAuthorsUnknown = true
+	}
+}
+
+// sessionAuthorsOf returns the current incarnation's set, with its mark and
+// age, for a caller about to rotate the incarnation (the wake).
+func (rec *SessionRecord) sessionAuthorsOf() (authors []TaskRequester, unknown bool, since time.Time) {
+	if rec.BusSession == "" || rec.SessionAuthorsFor != rec.BusSession {
+		return nil, false, time.Time{}
+	}
+	return append([]TaskRequester(nil), rec.SessionAuthors...), rec.SessionAuthorsUnknown, rec.SessionAuthorsSince
+}
+
+// seedSessionAuthors starts the current incarnation's set from another's.
+// The age carried is the older of the two, so nothing outlives the bound.
+func (rec *SessionRecord) seedSessionAuthors(authors []TaskRequester, unknown bool, since time.Time) {
+	if rec.BusSession == "" {
+		return
+	}
+	rec.currentSessionAuthors()
+	for _, a := range authors {
+		rec.addSessionAuthor(a)
+	}
+	rec.SessionAuthorsUnknown = rec.SessionAuthorsUnknown || unknown
+	if !since.IsZero() && (rec.SessionAuthorsSince.IsZero() || since.Before(rec.SessionAuthorsSince)) {
+		rec.SessionAuthorsSince = since
+	}
 }
 
 // TaskRequester is the turn's requester as the target's allowlist is checked

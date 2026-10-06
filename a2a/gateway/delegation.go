@@ -12,14 +12,15 @@ import (
 // The rules a delegation is refused or ignored under, as the audit line
 // names them (phase-2 delegation spec §8).
 const (
-	ruleDelegationAllowedUsers = "delegation.allowed-users"
-	ruleDelegationTarget       = "delegation.target"
-	ruleDelegationSteerAuthor  = "delegation.steer-author"
-	ruleDelegationBusy         = "delegation.busy"
-	ruleDelegationDepth        = "delegation.depth"
-	ruleDelegationNoRequester  = "delegation.no-requester"
-	ruleDelegationStale        = "delegation.stale"
-	ruleDelegationMalformed    = "delegation.malformed"
+	ruleDelegationAllowedUsers  = "delegation.allowed-users"
+	ruleDelegationTarget        = "delegation.target"
+	ruleDelegationSteerAuthor   = "delegation.steer-author"
+	ruleDelegationSessionAuthor = "delegation.session-author"
+	ruleDelegationBusy          = "delegation.busy"
+	ruleDelegationDepth         = "delegation.depth"
+	ruleDelegationNoRequester   = "delegation.no-requester"
+	ruleDelegationStale         = "delegation.stale"
+	ruleDelegationMalformed     = "delegation.malformed"
 )
 
 // delegatedLineNote suffixes a child's rolling line, so the room can tell the
@@ -32,10 +33,11 @@ const delegatedLineNote = "(delegated to platform)"
 const requesterGone = "requester is no longer on record"
 
 const (
-	noticeDelegationNoRequester   = "⚠️ delegation refused: this turn's " + requesterGone + "; ask again"
-	noticeDelegationNotAllowed    = "🚫 not allowed to reach " + targetPlatform + " from here"
-	noticeDelegationSteerOverflow = "⚠️ delegation refused: more people steered this turn than can be checked; ask again"
-	noticeWakeNoRequester         = "ℹ️ the delegated task finished, but the delegating turn's " + requesterGone + "; the session was not woken"
+	noticeDelegationNoRequester       = "⚠️ delegation refused: this turn's " + requesterGone + "; ask again"
+	noticeDelegationNotAllowed        = "🚫 not allowed to reach " + targetPlatform + " from here"
+	noticeDelegationSessionIncomplete = "⚠️ delegation refused: this session's authors can no longer all be checked; ask again in a new turn"
+	noticeDelegationSteerOverflow     = "⚠️ delegation refused: more people steered this turn than can be checked; ask again"
+	noticeWakeNoRequester             = "ℹ️ the delegated task finished, but the delegating turn's " + requesterGone + "; the session was not woken"
 )
 
 // handleDelegateRequest is the gateway's side of the delegation primitive: a
@@ -133,6 +135,22 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	for _, a := range parent.SteerAuthors {
 		if !g.targetAllows(addressee, a.Backend, a.Subject) {
 			refuse(ruleDelegationSteerAuthor, noticeDelegationNotAllowed, "steerBackend", a.Backend, "steerAuthor", a.Subject)
+			return
+		}
+	}
+	// And everyone whose text reached this incarnation, on any turn: the
+	// pod keeps what it was told, so an off-list human's earlier turn can
+	// leave the instruction a later on-list turn delegates on. The check
+	// above pinned the parent to rec.BusSession, so the set is the parent's
+	// incarnation's.
+	sessionAuthors, sessionUnknown, _ := rec.sessionAuthorsOf()
+	if sessionUnknown {
+		refuse(ruleDelegationSessionAuthor, noticeDelegationSessionIncomplete, "sessionAuthors", "incomplete")
+		return
+	}
+	for _, a := range sessionAuthors {
+		if !g.targetAllows(addressee, a.Backend, a.Subject) {
+			refuse(ruleDelegationSessionAuthor, noticeDelegationNotAllowed, "sessionBackend", a.Backend, "sessionAuthor", a.Subject)
 			return
 		}
 	}
@@ -385,12 +403,19 @@ func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child Tas
 	if rec.Profile == "" {
 		rec.Profile = sessionProfile
 	}
+	// The wake's pod starts with no memory of the parent's (one task per
+	// pod; the rehydration primer has no reader yet), but its text carries
+	// the child's result, and the child's ask was written by the parent's
+	// incarnation. So the wake's incarnation starts from the parent's set,
+	// taken before freshIncarnation rotates it away.
+	inherited, inheritedUnknown, inheritedSince := rec.sessionAuthorsOf()
 	// The cap holds and the previous pod is retired here; a refusal has
 	// posted the standard notice, and the child's result stands as relayed.
 	if !g.freshIncarnation(ctx, rec) {
 		log.Info("no wake: the session could not be started")
 		return
 	}
+	rec.seedSessionAuthors(inherited, inheritedUnknown, inheritedSince)
 	// The wake is the delegating turn's successor: the chain's correlation
 	// id (a task spawned in service of another inherits it) and the child's
 	// depth, so depth counts delegations rather than turns.

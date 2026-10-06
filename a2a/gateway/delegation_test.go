@@ -1551,3 +1551,153 @@ func TestAHealThatFindsTheChildsTerminalWakesTheSession(t *testing.T) {
 		t.Fatalf("wake entries = %d, want 1", wakes)
 	}
 }
+
+// ---- the session incarnation's authors (task 7b part 4) --------------------
+
+// incarnationAuthors is the record's author set when it is the current
+// incarnation's, else nil.
+func incarnationAuthors(t *testing.T, r *rig, conv string) (*SessionRecord, []TaskRequester) {
+	t.Helper()
+	rec, err := r.g.reg.Get(context.Background(), conv)
+	if err != nil || rec == nil {
+		t.Fatalf("record: %v %v", rec, err)
+	}
+	if rec.SessionAuthorsFor != rec.BusSession {
+		return rec, nil
+	}
+	return rec, rec.SessionAuthors
+}
+
+// TestAnEarlierAuthorInTheIncarnationRefusesTheDelegation: the incarnation's
+// pod keeps what every turn and steer published to it said, so a delegation
+// is checked against everyone in the incarnation's set, not only this turn's
+// people. Today's session pods serve one task, so "an earlier turn in the
+// same incarnation" is put on the record directly; the next turn's fresh
+// incarnation starts clean and the same on-list delegation mints.
+func TestAnEarlierAuthorInTheIncarnationRefusesTheDelegation(t *testing.T) {
+	r, spawn := startRigWithSpawnerCap(t, "platform", 0, func(c *Config) {
+		c.TargetAllowedUsers = map[string]map[string][]string{targetPlatform: {"discord": {"1001"}}}
+	})
+	ctx := context.Background()
+	conv := "discord:g1/t-incarnation"
+	exec, _, session := sessionTurn(t, r, spawn, conv, "first")
+	rec, got := incarnationAuthors(t, r, conv)
+	me := TaskRequester{Backend: "discord", Subject: requesterSubject(r.g.ps, "discord", "1001")}
+	if rec.SessionAuthorsFor != session || len(got) != 1 || got[0] != me {
+		t.Fatalf("incarnation set = %+v for %q, want the requester for %q", got, rec.SessionAuthorsFor, session)
+	}
+	off := TaskRequester{Backend: "discord", Subject: requesterSubject(r.g.ps, "discord", "1002")}
+	putRecord(t, r, conv, func(rec *SessionRecord) { rec.addSessionAuthor(off) })
+	_ = exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "x"))
+	waitFor(t, "refusal line", loggedContaining(r, "delegation refused", "rule="+ruleDelegationSessionAuthor,
+		"sessionBackend=discord", "sessionAuthor="+off.Subject))
+	completeTask(t, exec, "delegated to platform")
+	waitFor(t, "notice", postedContaining(r, noticeDelegationNotAllowed))
+	if i, j := postIndex(r, "delegated to platform"), postIndex(r, noticeDelegationNotAllowed); i < 0 || j < i {
+		t.Fatalf("posts %v: want the answer, then the notice", r.adapter.postTexts())
+	}
+	if n := platformSubmissions(t, r); n != 0 {
+		t.Fatalf("minted past an earlier off-list author: %d", n)
+	}
+
+	exec2, _, session2 := sessionTurn(t, r, spawn, conv, "second")
+	if session2 == session {
+		t.Fatal("the second turn reused the incarnation")
+	}
+	if _, got := incarnationAuthors(t, r, conv); len(got) != 1 || got[0] != me {
+		t.Fatalf("the fresh incarnation's set = %+v, want the requester alone", got)
+	}
+	_ = exec2.PublishArtifact(ctx, delegateArtifact(t, "platform", "x"))
+	r.awaitTask(t, targetPlatform)
+}
+
+// TestTheIncarnationSetRecordsSteersHashed: a steer into the incarnation
+// joins its set as the requester did, hashed, the id nowhere in the record.
+func TestTheIncarnationSetRecordsSteersHashed(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/t-incarnation-steer"
+	_, origin, _ := sessionTurn(t, r, spawn, conv, "first")
+	steerAs(r, conv, "s-1", "1002", "and the costs")
+	awaitSteerAuthors(t, r, conv, origin.TaskID, 1)
+	_, got := incarnationAuthors(t, r, conv)
+	want := []TaskRequester{
+		{Backend: "discord", Subject: requesterSubject(r.g.ps, "discord", "1001")},
+		{Backend: "discord", Subject: requesterSubject(r.g.ps, "discord", "1002")},
+	}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("incarnation set = %+v, want %+v", got, want)
+	}
+	raw := rawSessionRecord(t, r.g.reg, conv)
+	if strings.Contains(raw, `"1001"`) || strings.Contains(raw, `"1002"`) {
+		t.Fatalf("the session KV holds a plaintext author id: %s", raw)
+	}
+}
+
+// TestAWakesIncarnationStartsFromTheParents: the wake's text carries the
+// child's result, and the child's ask was written by the parent's
+// incarnation, so the wake's incarnation starts with the parent's set.
+func TestAWakesIncarnationStartsFromTheParents(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	ctx := context.Background()
+	conv := "discord:g1/t-incarnation-wake"
+	exec, origin, _ := sessionTurn(t, r, spawn, conv, "how is the fleet?")
+	steerAs(r, conv, "s-1", "1002", "and the costs")
+	awaitSteerAuthors(t, r, conv, origin.TaskID, 1)
+	_, parentSet := incarnationAuthors(t, r, conv)
+	_ = exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "report"))
+	child := r.awaitTask(t, targetPlatform)
+	completeTask(t, exec, "delegated to platform")
+	completeTask(t, r.execFor(t, child, targetPlatform), "fleet is green")
+	waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
+	wakeSession := spawn.calls()[1].Session
+	r.awaitTask(t, wakeSession)
+	waitFor(t, "wake incarnation on the record", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		return rec.BusSession == wakeSession && rec.SessionAuthorsFor == wakeSession
+	})
+	_, got := incarnationAuthors(t, r, conv)
+	if len(got) != len(parentSet) || len(got) != 2 {
+		t.Fatalf("wake incarnation set = %+v, want the parent's %+v", got, parentSet)
+	}
+	for i := range got {
+		if got[i] != parentSet[i] {
+			t.Fatalf("wake incarnation set = %+v, want the parent's %+v", got, parentSet)
+		}
+	}
+}
+
+// TestAnIncompleteIncarnationSetRefuses: past the cap, or after the ask
+// bound cleared it, the set no longer lists everyone; the incarnation's
+// delegations are refused until a fresh one.
+func TestAnIncompleteIncarnationSetRefuses(t *testing.T) {
+	var rec SessionRecord
+	rec.BusSession = "chat-a"
+	for i := 0; i < sessionAuthorCap; i++ {
+		rec.addSessionAuthor(TaskRequester{Backend: "discord", Subject: fmt.Sprintf("hmac:%d", i)})
+	}
+	rec.addSessionAuthor(TaskRequester{Backend: "discord", Subject: "hmac:0"})
+	if len(rec.SessionAuthors) != sessionAuthorCap || rec.SessionAuthorsUnknown {
+		t.Fatalf("at the cap: %d, unknown %v", len(rec.SessionAuthors), rec.SessionAuthorsUnknown)
+	}
+	rec.addSessionAuthor(TaskRequester{Backend: "discord", Subject: "hmac:late"})
+	if !rec.SessionAuthorsUnknown {
+		t.Fatal("past the cap the set is not marked")
+	}
+	rec.BusSession = "chat-b" // rotated: the next add starts the new incarnation's set
+	rec.addSessionAuthor(TaskRequester{Backend: "discord", Subject: "hmac:new"})
+	if rec.SessionAuthorsFor != "chat-b" || len(rec.SessionAuthors) != 1 || rec.SessionAuthorsUnknown {
+		t.Fatalf("after rotation: %+v", rec)
+	}
+
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/t-incarnation-cap"
+	exec, _, _ := sessionTurn(t, r, spawn, conv, "x")
+	putRecord(t, r, conv, func(rec *SessionRecord) { rec.SessionAuthorsUnknown = true })
+	_ = exec.PublishArtifact(context.Background(), delegateArtifact(t, "platform", "x"))
+	waitFor(t, "refusal line", loggedContaining(r, "delegation refused", "rule="+ruleDelegationSessionAuthor, "sessionAuthors=incomplete"))
+	completeTask(t, exec, "delegated to platform")
+	waitFor(t, "notice", postedContaining(r, noticeDelegationSessionIncomplete))
+	if n := platformSubmissions(t, r); n != 0 {
+		t.Fatalf("minted on an incomplete set: %d", n)
+	}
+}

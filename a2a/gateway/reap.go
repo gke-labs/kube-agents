@@ -181,7 +181,7 @@ func (g *Gateway) boundAskCopyAt(ctx context.Context, rec *SessionRecord, now ti
 	active := rec.ActiveTask
 	askExpired := active != nil && active.Ask != "" && !active.SubmittedAt.IsZero() &&
 		now.Sub(active.SubmittedAt) >= g.cfg.AskTTL
-	if !askExpired && !g.requesterExpired(rec, now) {
+	if !askExpired && !g.requesterExpired(rec, now) && !g.sessionAuthorsExpired(rec, now) {
 		return
 	}
 	l := g.lockSession(rec.Key)
@@ -220,6 +220,17 @@ func (g *Gateway) boundAskCopyAt(ctx context.Context, rec *SessionRecord, now ti
 		requesterIDs = append(requesterIDs, ref.ID)
 		changed = true
 	}
+	// The incarnation's author set is the same kind of copy (hashed ids a
+	// delegation is checked against) and is bounded the same way, from its
+	// oldest entry. Cleared, it no longer lists everyone, so it is marked
+	// and the incarnation's delegations fail closed, as a cleared
+	// requester's do.
+	sessionAuthorsCleared := false
+	if g.sessionAuthorsExpired(fresh, now) {
+		fresh.SessionAuthors, fresh.SessionAuthorsSince = nil, time.Time{}
+		fresh.SessionAuthorsUnknown = true
+		sessionAuthorsCleared, changed = true, true
+	}
 	if !changed {
 		return
 	}
@@ -228,7 +239,14 @@ func (g *Gateway) boundAskCopyAt(ctx context.Context, rec *SessionRecord, now ti
 		return
 	}
 	g.log.Info("ask bound: cleared copies past their TTL", "session", fresh.Key,
-		"taskId", askTaskID, "requesterTaskIds", requesterIDs)
+		"taskId", askTaskID, "requesterTaskIds", requesterIDs, "sessionAuthors", sessionAuthorsCleared)
+}
+
+// sessionAuthorsExpired reports whether the incarnation's author set is past
+// AskTTL, counted from its oldest entry.
+func (g *Gateway) sessionAuthorsExpired(rec *SessionRecord, now time.Time) bool {
+	return len(rec.SessionAuthors) > 0 && !rec.SessionAuthorsSince.IsZero() &&
+		now.Sub(rec.SessionAuthorsSince) >= g.cfg.AskTTL
 }
 
 // holdsRequesterCopy reports whether the entry holds any of the copies the
