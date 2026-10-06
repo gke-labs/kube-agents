@@ -735,7 +735,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// the gateway's logs (#1318).
 		g.log.Info("routing as steer", "conversation", msg.Conversation, "taskId", active.TaskID,
 			"addressee", rec.Addressee, "taskAge", time.Since(active.SubmittedAt).Round(time.Second))
-		g.steerTask(ctx, rec, msg, authority)
+		g.steerTask(ctx, rec, msg, backend, authority)
 	default:
 		if rest, ok := isDelegate(msg.Text); ok && g.spawner != nil {
 			// The Delegate flow (W4 amendment): this ONE task goes to a
@@ -1210,7 +1210,7 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 		// Already on the route with its own task running: the text is what
 		// a plain message would have been, a steer into that task.
 		msg.Text = rest
-		g.steerTask(ctx, rec, msg, authority)
+		g.steerTask(ctx, rec, msg, backend, authority)
 		return true
 	case running:
 		g.post(rec.Key, "🧵 session route on — a task is still running, so that message was not sent; send it again when the task finishes")
@@ -1484,6 +1484,11 @@ type taskStart struct {
 	// LineNote suffixes the turn's rolling line for as long as it renders;
 	// a child says it was delegated. Empty for a human turn.
 	LineNote string
+	// SteerAuthors and SteerAuthorsOverflow seed the entry's
+	// (TaskRef.SteerAuthors): a child's are its parent's, a wake's its
+	// parent's and its child's. Empty for a human turn.
+	SteerAuthors         []TaskRequester
+	SteerAuthorsOverflow bool
 }
 
 // startTask opens a turn for a human message.
@@ -1581,7 +1586,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	rec.ActiveTask = &ActiveTask{TaskID: taskID, CorrelationID: correlationID, StatusMsgID: statusMsgID,
 		Ask: truncateRunes(ts.Text, askCap), SubmittedAt: time.Now(), Capability: capRef, LineNote: ts.LineNote}
 	requester := ts.Requester
-	rec.Tasks = append(rec.Tasks, TaskRef{
+	ref := TaskRef{
 		ID: taskID, Addressee: rec.Addressee, CorrelationID: correlationID, Capability: capRef,
 		Requester:    &requester,
 		Attribution:  ts.Authority.Attribution(),
@@ -1589,7 +1594,9 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		Role:         ts.Role,
 		ParentTaskID: ts.ParentTaskID,
 		Depth:        ts.Depth,
-	})
+	}
+	ref.carrySteerAuthors(TaskRef{SteerAuthors: ts.SteerAuthors, SteerAuthorsOverflow: ts.SteerAuthorsOverflow})
+	rec.Tasks = append(rec.Tasks, ref)
 	rec.LastTaskActivity = time.Now().UTC()
 	if len(rec.Tasks) > taskHistoryCap {
 		rec.Tasks = rec.Tasks[len(rec.Tasks)-taskHistoryCap:]
@@ -1660,8 +1667,13 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 // follow-up on the same taskId — injected, absorbed at the executor's next
 // turn boundary (decided 8/24). It reuses the task's correlationId; the
 // steer is attributed by its own envelope and authority block.
-func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, authority Authority) {
+func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, backend string, authority Authority) {
 	active := rec.ActiveTask
+	// The steer's author is on the turn's entry before the publish, and
+	// stays there if the publish fails: a lost ack does not prove the steer
+	// never arrived, and an author recorded for nothing costs at most a
+	// refused delegation. The caller writes the record back.
+	rec.recordSteerAuthor(active.TaskID, TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)})
 	payload, err := messagePayload(msg.Text, active.TaskID, rec.ContextID)
 	if err != nil {
 		g.log.Error("steer payload build failed", "err", err)

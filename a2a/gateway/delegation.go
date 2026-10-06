@@ -14,6 +14,7 @@ import (
 const (
 	ruleDelegationAllowedUsers = "delegation.allowed-users"
 	ruleDelegationTarget       = "delegation.target"
+	ruleDelegationSteerAuthor  = "delegation.steer-author"
 	ruleDelegationBusy         = "delegation.busy"
 	ruleDelegationDepth        = "delegation.depth"
 	ruleDelegationNoRequester  = "delegation.no-requester"
@@ -31,8 +32,10 @@ const delegatedLineNote = "(delegated to platform)"
 const requesterGone = "requester is no longer on record"
 
 const (
-	noticeDelegationNoRequester = "⚠️ delegation refused: this turn's " + requesterGone + "; ask again"
-	noticeWakeNoRequester       = "ℹ️ the delegated task finished, but the delegating turn's " + requesterGone + "; the session was not woken"
+	noticeDelegationNoRequester   = "⚠️ delegation refused: this turn's " + requesterGone + "; ask again"
+	noticeDelegationNotAllowed    = "🚫 not allowed to reach " + targetPlatform + " from here"
+	noticeDelegationSteerOverflow = "⚠️ delegation refused: more people steered this turn than can be checked; ask again"
+	noticeWakeNoRequester         = "ℹ️ the delegated task finished, but the delegating turn's " + requesterGone + "; the session was not woken"
 )
 
 // handleDelegateRequest is the gateway's side of the delegation primitive: a
@@ -117,8 +120,21 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		return
 	}
 	if !g.targetAllows(addressee, parent.Requester.Backend, parent.Requester.Subject) {
-		refuse(ruleDelegationAllowedUsers, "🚫 not allowed to reach "+targetPlatform+" from here")
+		refuse(ruleDelegationAllowedUsers, noticeDelegationNotAllowed)
 		return
+	}
+	// Anyone in the room can steer the turn, so everyone who did is checked
+	// as the requester is: otherwise an off-list human steers the session
+	// into delegating under the requester's name.
+	if parent.SteerAuthorsOverflow {
+		refuse(ruleDelegationSteerAuthor, noticeDelegationSteerOverflow, "steerAuthors", "over-cap")
+		return
+	}
+	for _, a := range parent.SteerAuthors {
+		if !g.targetAllows(addressee, a.Backend, a.Subject) {
+			refuse(ruleDelegationSteerAuthor, noticeDelegationNotAllowed, "steerBackend", a.Backend, "steerAuthor", a.Subject)
+			return
+		}
 	}
 	authority.Via = &AuthorityVia{TaskID: taskID, Session: rec.BusSession}
 
@@ -133,14 +149,16 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	setParentLine(rec, taskID, prevActive.StatusMsgID)
 	rec.Addressee = addressee
 	childID, ok := g.startTaskWith(ctx, rec, taskStart{
-		Text:          req.Text,
-		Requester:     *parent.Requester,
-		Authority:     authority,
-		CorrelationID: prevActive.CorrelationID,
-		Role:          taskRoleChild,
-		ParentTaskID:  taskID,
-		Depth:         parent.Depth + 1,
-		LineNote:      delegatedLineNote,
+		Text:                 req.Text,
+		Requester:            *parent.Requester,
+		Authority:            authority,
+		CorrelationID:        prevActive.CorrelationID,
+		Role:                 taskRoleChild,
+		ParentTaskID:         taskID,
+		Depth:                parent.Depth + 1,
+		LineNote:             delegatedLineNote,
+		SteerAuthors:         parent.SteerAuthors,
+		SteerAuthorsOverflow: parent.SteerAuthorsOverflow,
 	})
 	if !ok {
 		// startTaskWith has said why, in the log and to the room; the
@@ -376,14 +394,22 @@ func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child Tas
 	// The wake is the delegating turn's successor: the chain's correlation
 	// id (a task spawned in service of another inherits it) and the child's
 	// depth, so depth counts delegations rather than turns.
+	// The wake reads the child's result, which steers into the child
+	// shaped, and continues the parent's turn: it carries both entries'
+	// steer authors, so a delegation from it is checked against them.
+	var steered TaskRef
+	steered.carrySteerAuthors(parent)
+	steered.carrySteerAuthors(child)
 	wakeID, ok := g.startTaskWith(ctx, rec, taskStart{
-		Text:          text,
-		Requester:     *parent.Requester,
-		Authority:     authority,
-		CorrelationID: child.CorrelationID,
-		Role:          taskRoleWake,
-		ParentTaskID:  child.ID,
-		Depth:         child.Depth,
+		Text:                 text,
+		Requester:            *parent.Requester,
+		Authority:            authority,
+		CorrelationID:        child.CorrelationID,
+		Role:                 taskRoleWake,
+		ParentTaskID:         child.ID,
+		Depth:                child.Depth,
+		SteerAuthors:         steered.SteerAuthors,
+		SteerAuthorsOverflow: steered.SteerAuthorsOverflow,
 	})
 	if ok {
 		log.Info("session woken", "wake", wakeID, "session", rec.BusSession)

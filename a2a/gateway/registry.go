@@ -136,6 +136,18 @@ type TaskRef struct {
 	Requester   *TaskRequester  `json:"requester,omitempty"`
 	Attribution json.RawMessage `json:"attribution,omitempty"`
 	StartedAt   time.Time       `json:"startedAt,omitzero"`
+	// SteerAuthors are the humans who steered this turn other than its
+	// requester, stored as Requester is (backend and requesterSubject: hashed,
+	// never the id), deduplicated, at most steerAuthorCap. Anyone in the room
+	// can steer a running turn, so a delegation from it is checked against
+	// each of them as well as the requester. A child carries its parent's, a
+	// wake its parent's and its child's, so a later delegation in the chain
+	// is checked against everyone who shaped it. SteerAuthorsOverflow marks a
+	// turn steered by more people than the cap holds; its delegation is
+	// refused rather than checked against a list that dropped someone.
+	// Cleared with Requester by the ask bound.
+	SteerAuthors         []TaskRequester `json:"steerAuthors,omitempty"`
+	SteerAuthorsOverflow bool            `json:"steerAuthorsOverflow,omitempty"`
 	// Role, ParentTaskID, Children and Depth are the delegation chain. A
 	// child is minted on a session turn's request and names it as parent; a
 	// wake turn is started on the child's terminal and names the child. Depth
@@ -159,6 +171,48 @@ const (
 	taskRoleChild = "child"
 	taskRoleWake  = "wake"
 )
+
+// steerAuthorCap bounds TaskRef.SteerAuthors. Past it the entry is marked
+// (SteerAuthorsOverflow) and its delegation refused: dropping an author
+// silently would let the one it dropped through the check.
+const steerAuthorCap = 8
+
+// addSteerAuthor records a steer author on the entry: not the requester, not
+// twice, and past the cap only as the overflow mark.
+func (ref *TaskRef) addSteerAuthor(a TaskRequester) {
+	if ref.Requester != nil && *ref.Requester == a {
+		return
+	}
+	for _, have := range ref.SteerAuthors {
+		if have == a {
+			return
+		}
+	}
+	if len(ref.SteerAuthors) >= steerAuthorCap {
+		ref.SteerAuthorsOverflow = true
+		return
+	}
+	ref.SteerAuthors = append(ref.SteerAuthors, a)
+}
+
+// carrySteerAuthors adds every steer author of from (and its overflow mark)
+// to ref: how a child takes its parent's and a wake its parent's and child's.
+func (ref *TaskRef) carrySteerAuthors(from TaskRef) {
+	for _, a := range from.SteerAuthors {
+		ref.addSteerAuthor(a)
+	}
+	ref.SteerAuthorsOverflow = ref.SteerAuthorsOverflow || from.SteerAuthorsOverflow
+}
+
+// recordSteerAuthor adds a steer author to the history entry of taskID.
+func (rec *SessionRecord) recordSteerAuthor(taskID string, a TaskRequester) {
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == taskID {
+			rec.Tasks[i].addSteerAuthor(a)
+			return
+		}
+	}
+}
 
 // MarkCanceled records a published cancel against the task's history entry.
 func (rec *SessionRecord) MarkCanceled(taskID string) {

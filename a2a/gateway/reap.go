@@ -209,13 +209,14 @@ func (g *Gateway) boundAskCopyAt(ctx context.Context, rec *SessionRecord, now ti
 	// itself stays; a delegation from it is refused rather than guessed.
 	for i := range fresh.Tasks {
 		ref := &fresh.Tasks[i]
-		if ref.Requester == nil && ref.Attribution == nil {
+		if !ref.holdsRequesterCopy() {
 			continue
 		}
 		if ref.StartedAt.IsZero() || now.Sub(ref.StartedAt) < g.cfg.AskTTL {
 			continue
 		}
 		ref.Requester, ref.Attribution = nil, nil
+		ref.SteerAuthors, ref.SteerAuthorsOverflow = nil, false
 		requesterIDs = append(requesterIDs, ref.ID)
 		changed = true
 	}
@@ -230,11 +231,17 @@ func (g *Gateway) boundAskCopyAt(ctx context.Context, rec *SessionRecord, now ti
 		"taskId", askTaskID, "requesterTaskIds", requesterIDs)
 }
 
+// holdsRequesterCopy reports whether the entry holds any of the copies the
+// ask bound ages out: the requester, its attribution, the steer authors.
+func (ref TaskRef) holdsRequesterCopy() bool {
+	return ref.Requester != nil || ref.Attribution != nil || len(ref.SteerAuthors) > 0 || ref.SteerAuthorsOverflow
+}
+
 // requesterExpired reports whether any history entry's requester copy is
 // past AskTTL, from the scan's own view of the record.
 func (g *Gateway) requesterExpired(rec *SessionRecord, now time.Time) bool {
 	for _, ref := range rec.Tasks {
-		if (ref.Requester != nil || ref.Attribution != nil) && !ref.StartedAt.IsZero() &&
+		if ref.holdsRequesterCopy() && !ref.StartedAt.IsZero() &&
 			now.Sub(ref.StartedAt) >= g.cfg.AskTTL {
 			return true
 		}

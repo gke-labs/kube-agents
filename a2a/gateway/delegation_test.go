@@ -1290,3 +1290,166 @@ func TestTheWakeFencesTheChildsResult(t *testing.T) {
 		t.Fatalf("an empty body wake = %q, want the header alone", got)
 	}
 }
+
+// ---- steer authors (task 7b part 1) ----------------------------------------
+
+// steerAs sends text into conv as author, which, with a task running, is a
+// steer.
+func steerAs(r *rig, conv, id, author, text string) {
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: author, MessageID: id, Text: text}
+}
+
+// awaitSteerAuthors waits for the task's entry to list n steer authors.
+func awaitSteerAuthors(t *testing.T, r *rig, conv, taskID string, n int) TaskRef {
+	t.Helper()
+	var ref TaskRef
+	waitFor(t, fmt.Sprintf("%d steer authors on %s", n, taskID), func() bool {
+		rec, _ := r.g.reg.Get(context.Background(), conv)
+		if rec == nil {
+			return false
+		}
+		ref, _ = rec.TaskRefFor(taskID)
+		return len(ref.SteerAuthors) == n
+	})
+	return ref
+}
+
+// TestDelegateChecksEverySteerAuthor: anyone in the room can steer the
+// delegating turn, so the mint checks each steer author against the target's
+// list as well as the requester (1001). 1002 steers.
+func TestDelegateChecksEverySteerAuthor(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		lists map[string][]string
+		mint  bool
+	}{
+		{"an off-list steer author refuses", map[string][]string{"discord": {"1001"}}, false},
+		{"an on-list steer author mints", map[string][]string{"discord": {"1001", "1002"}}, true},
+		{"a steer author on a backend with no list mints", map[string][]string{gchatBackend: {"alice@example.com"}}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, spawn := startRigWithSpawnerCap(t, "platform", 0, func(c *Config) {
+				c.TargetAllowedUsers = map[string]map[string][]string{targetPlatform: tc.lists}
+			})
+			ctx := context.Background()
+			conv := "discord:g1/t-steer-author"
+			exec, origin, _ := sessionTurn(t, r, spawn, conv, "do a thing")
+			steerAs(r, conv, "s-1", "1002", "and do it in us-east")
+			// The requester's own steer is not a second author.
+			steerAs(r, conv, "s-2", "1001", "quickly")
+			waitFor(t, "two steers sent", func() bool { return strings.Count(strings.Join(r.adapter.postTexts(), "\n"), "steering sent") == 2 })
+			pref := awaitSteerAuthors(t, r, conv, origin.TaskID, 1)
+			want := TaskRequester{Backend: "discord", Subject: requesterSubject(r.g.ps, "discord", "1002")}
+			if pref.SteerAuthors[0] != want {
+				t.Fatalf("steer author = %+v, want %+v", pref.SteerAuthors[0], want)
+			}
+			if err := exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "x")); err != nil {
+				t.Fatal(err)
+			}
+			if tc.mint {
+				child := r.awaitTask(t, targetPlatform)
+				// The child carries the turn's steer authors, so the wake
+				// after it is checked against them too.
+				waitFor(t, "child entry", func() bool {
+					rec, _ := r.g.reg.Get(ctx, conv)
+					cref, ok := rec.TaskRefFor(child.TaskID)
+					return ok && len(cref.SteerAuthors) == 1 && cref.SteerAuthors[0] == want
+				})
+				return
+			}
+			waitFor(t, "refusal line", loggedContaining(r, "delegation refused", "rule="+ruleDelegationSteerAuthor,
+				"steerBackend=discord", "steerAuthor="+want.Subject))
+			if i := postIndex(r, "not allowed to reach platform"); i >= 0 {
+				t.Fatalf("the notice was posted before the turn's answer: %v", r.adapter.postTexts())
+			}
+			completeTask(t, exec, "delegated to platform")
+			waitFor(t, "refusal notice", postedContaining(r, "🚫 not allowed to reach platform from here"))
+			if i, j := postIndex(r, "delegated to platform"), postIndex(r, "🚫 not allowed"); i < 0 || j < i {
+				t.Fatalf("posts %v: want the answer, then the notice", r.adapter.postTexts())
+			}
+			if strings.Contains(r.logs.String(), "steerAuthor=1002") {
+				t.Fatal("the audit line carries the plaintext steer author")
+			}
+			if n := platformSubmissions(t, r); n != 0 {
+				t.Fatalf("a child was minted past an off-list steer author: %d", n)
+			}
+		})
+	}
+}
+
+// TestASteerIntoTheChildIsCheckedAtTheWakesDelegation: 1002 steers the
+// child on platform; the child's result is what the wake reads, so a
+// delegation from the wake is checked against 1002 too.
+func TestASteerIntoTheChildIsCheckedAtTheWakesDelegation(t *testing.T) {
+	r, spawn := startRigWithSpawnerCap(t, "platform", 0, func(c *Config) {
+		c.TargetAllowedUsers = map[string]map[string][]string{targetPlatform: {"discord": {"1001"}}}
+	})
+	ctx := context.Background()
+	conv := "discord:g1/t-steer-child"
+	_, _, child := delegated(t, r, spawn, conv, 0)
+	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
+	cexec := r.execFor(t, child, targetPlatform)
+	_ = cexec.PublishStatus(ctx, lib.StateWorking, false)
+	steerAs(r, conv, "s-c", "1002", "include costs")
+	awaitSteerAuthors(t, r, conv, child.TaskID, 1)
+	completeTask(t, cexec, "fleet is green")
+	waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
+	wakeSession := spawn.calls()[1].Session
+	wake := r.awaitTask(t, wakeSession)
+	wref := awaitSteerAuthors(t, r, conv, wake.TaskID, 1)
+	if wref.SteerAuthors[0].Subject != requesterSubject(r.g.ps, "discord", "1002") {
+		t.Fatalf("wake steer authors = %+v", wref.SteerAuthors)
+	}
+	wexec := r.execFor(t, wake, wakeSession)
+	_ = wexec.PublishStatus(ctx, lib.StateWorking, false)
+	_ = wexec.PublishArtifact(ctx, delegateArtifact(t, "platform", "again"))
+	waitFor(t, "refusal line", loggedContaining(r, "delegation refused", "rule="+ruleDelegationSteerAuthor, wake.TaskID))
+	// Tasks, not messages: the steer into the child is a message too.
+	tasks := map[string]bool{}
+	for _, e := range inSubjectEnvelopes(t, r.url, targetPlatform) {
+		if e.Kind == lib.KindMessage {
+			tasks[e.TaskID] = true
+		}
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("platform received %d tasks, want 1", len(tasks))
+	}
+}
+
+// TestSteerAuthorsPastTheCapRefuse: past steerAuthorCap the list is not
+// extended and the entry is marked, and a marked entry's delegation is
+// refused rather than checked against a list that dropped someone.
+func TestSteerAuthorsPastTheCapRefuse(t *testing.T) {
+	requester := &TaskRequester{Backend: "discord", Subject: "hmac:r"}
+	ref := TaskRef{Requester: requester}
+	for i := 0; i < steerAuthorCap; i++ {
+		ref.addSteerAuthor(TaskRequester{Backend: "discord", Subject: fmt.Sprintf("hmac:%d", i)})
+	}
+	ref.addSteerAuthor(TaskRequester{Backend: "discord", Subject: "hmac:0"}) // a repeat
+	ref.addSteerAuthor(*requester)                                           // the requester
+	if len(ref.SteerAuthors) != steerAuthorCap || ref.SteerAuthorsOverflow {
+		t.Fatalf("at the cap: %d authors, overflow %v", len(ref.SteerAuthors), ref.SteerAuthorsOverflow)
+	}
+	ref.addSteerAuthor(TaskRequester{Backend: "discord", Subject: "hmac:late"})
+	if len(ref.SteerAuthors) != steerAuthorCap || !ref.SteerAuthorsOverflow {
+		t.Fatalf("past the cap: %d authors, overflow %v", len(ref.SteerAuthors), ref.SteerAuthorsOverflow)
+	}
+
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/t-steer-cap"
+	exec, origin, _ := sessionTurn(t, r, spawn, conv, "x")
+	putRecord(t, r, conv, func(rec *SessionRecord) {
+		for i := range rec.Tasks {
+			if rec.Tasks[i].ID == origin.TaskID {
+				rec.Tasks[i].SteerAuthorsOverflow = true
+			}
+		}
+	})
+	_ = exec.PublishArtifact(context.Background(), delegateArtifact(t, "platform", "x"))
+	waitFor(t, "refusal line", loggedContaining(r, "delegation refused", "rule="+ruleDelegationSteerAuthor, "steerAuthors=over-cap"))
+	completeTask(t, exec, "delegated to platform")
+	waitFor(t, "notice", postedContaining(r, noticeDelegationSteerOverflow))
+	if n := platformSubmissions(t, r); n != 0 {
+		t.Fatalf("minted past the cap: %d", n)
+	}
+}

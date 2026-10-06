@@ -2641,3 +2641,59 @@ func TestAskTTLClearsTheRequesterToo(t *testing.T) {
 		t.Fatalf("the active task's fresh ask was cleared: %+v", fresh.ActiveTask)
 	}
 }
+
+// TestAGchatSteerAuthorIsStoredHashed: the steer author lands in the
+// session-state KV as the requester does, the normalized email hashed, the
+// email nowhere in the record.
+func TestAGchatSteerAuthorIsStoredHashed(t *testing.T) {
+	r := startGchatRig(t, []string{"alice@example.com", "bob@example.com"}, false)
+	conv := "gchat:spaces/S1/threads/T-steer"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "alice@example.com", MessageID: "spaces/S1/messages/M1", Text: "how is the fleet?"}
+	origin := r.awaitTask(t, "platform")
+	waitFor(t, "task on the record", func() bool {
+		rec, _ := r.g.reg.Get(context.Background(), conv)
+		return rec != nil && rec.ActiveTask != nil
+	})
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "Bob@Example.com", MessageID: "spaces/S1/messages/M2", Text: "and the costs"}
+	var ref TaskRef
+	waitFor(t, "steer author on the record", func() bool {
+		rec, _ := r.g.reg.Get(context.Background(), conv)
+		ref, _ = rec.TaskRefFor(origin.TaskID)
+		return len(ref.SteerAuthors) == 1
+	})
+	want := NewPseudonymizer([]byte("test-salt")).Hash("bob@example.com")
+	if ref.SteerAuthors[0] != (TaskRequester{Backend: gchatBackend, Subject: want}) {
+		t.Fatalf("steer author = %+v, want gchat/%s", ref.SteerAuthors[0], want)
+	}
+	if raw := rawSessionRecord(t, r.g.reg, conv); strings.Contains(strings.ToLower(raw), "bob@example.com") {
+		t.Fatalf("the session KV holds the steer author's email: %s", raw)
+	}
+}
+
+// TestAskTTLClearsTheSteerAuthors: the steer authors are bounded with the
+// requester, the overflow mark with them; an entry holding only steer
+// authors (its requester already cleared) is found and cleared too.
+func TestAskTTLClearsTheSteerAuthors(t *testing.T) {
+	r := startRigWith(t, func(c *Config) { c.AskTTL = time.Minute })
+	conv := "discord:g1/thread-ttl-steer"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "x"}
+	r.awaitTask(t, "platform")
+	ctx := context.Background()
+	var rec *SessionRecord
+	waitFor(t, "record", func() bool { rec, _ = r.g.reg.Get(ctx, conv); return rec != nil && len(rec.Tasks) == 1 })
+	old := time.Now().Add(-2 * time.Minute)
+	authors := []TaskRequester{{Backend: "discord", Subject: "hmac:x"}}
+	rec.Tasks[0].StartedAt = old
+	rec.Tasks[0].SteerAuthors, rec.Tasks[0].SteerAuthorsOverflow = authors, true
+	rec.Tasks = append(rec.Tasks, TaskRef{ID: "task-steer-only", Addressee: "platform", StartedAt: old, SteerAuthors: authors})
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	r.g.boundAskCopy(ctx, rec)
+	fresh, _ := r.g.reg.Get(ctx, conv)
+	for _, ref := range fresh.Tasks {
+		if ref.Requester != nil || len(ref.SteerAuthors) != 0 || ref.SteerAuthorsOverflow {
+			t.Fatalf("steer authors survived the TTL: %+v", ref)
+		}
+	}
+}
