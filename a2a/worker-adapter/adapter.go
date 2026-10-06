@@ -284,7 +284,8 @@ type adapter struct {
 // terminal state it published. Context cancellation is the eviction path:
 // SIGTERM from the kubelet lands here, and the contract is flush, publish
 // terminal failed reason worker-evicted, exit 143 (spec-subagent-profiles.md
-// "Evicted").
+// "Evicted"). The one exception is a turn that has delegated: its deliverable
+// was decided at the delegate call, so it completes with it, exit 0.
 func Run(ctx context.Context, cfg Config) (Result, error) {
 	cfg.applyDefaults()
 	if err := cfg.validate(); err != nil {
@@ -637,6 +638,14 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			// Eviction: kubelet SIGTERM landed. Flush what the harness
 			// already produced, state the reason honestly, exit 143.
 			proc.kill(0)
+			// A turn that delegated has its deliverable already: the
+			// one-line result. The SIGTERM is not a failure of it, and is
+			// expected: a child that ends fast wakes the session, and the
+			// wake's fresh incarnation retires this pod while the harness
+			// is still inside KillGrace.
+			if delegated {
+				return a.completeWith(resultText)
+			}
 			state := lib.StateFailed
 			err := a.finalize(state, "reason: worker-evicted - infrastructure delivered SIGTERM before the task finished", resultText)
 			return Result{State: state, Evicted: true}, err
@@ -654,13 +663,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 	// failure with evidence.
 	switch {
 	case sawResult && resultErr == "":
-		if err := a.publishResult(resultText); err != nil {
-			state := lib.StateFailed
-			ferr := a.finalize(state, "reason: bus-publish-failed at result - "+err.Error(), "")
-			return Result{State: state}, ferr
-		}
-		state := lib.StateCompleted
-		return Result{State: state}, a.finalize(state, "", "")
+		return a.completeWith(resultText)
 	case sawResult:
 		state := lib.StateFailed
 		return Result{State: state}, a.finalize(state,
@@ -699,6 +702,19 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		}
 		return Result{State: state}, a.finalize(state, reason, "")
 	}
+}
+
+// completeWith publishes the deliverable and the completed terminal: the
+// harness's clean result, or a delegating turn's one-line result. A result
+// that cannot be published fails the task with the publish error.
+func (a *adapter) completeWith(resultText string) (Result, error) {
+	if err := a.publishResult(resultText); err != nil {
+		state := lib.StateFailed
+		ferr := a.finalize(state, "reason: bus-publish-failed at result - "+err.Error(), "")
+		return Result{State: state}, ferr
+	}
+	state := lib.StateCompleted
+	return Result{State: state}, a.finalize(state, "", "")
 }
 
 // publishAssistant maps one assistant message's content blocks onto the

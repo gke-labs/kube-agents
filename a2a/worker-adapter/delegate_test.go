@@ -225,3 +225,54 @@ while true; do sleep 1; done
 		}
 	}
 }
+
+// TestAnEvictionAfterADelegateCallCompletesTheTurn: once a delegate request is
+// published the turn's deliverable is decided, and the pod can be taken away
+// before the harness has died -- the gateway retires the delegating
+// incarnation when a fast child (one the executor refuses on receipt) wakes
+// the session. The kubelet's SIGTERM then lands in supervise while the stub,
+// which ignores TERM, is still inside KillGrace. The turn ends completed
+// with the delegated result, not failed worker-evicted.
+func TestAnEvictionAfterADelegateCallCompletesTheTurn(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	const session, taskID = "chat-test-del4", "task-del-4"
+	submit(t, c, session, taskID, "find out how the fleet is")
+	sock := delegateSock(t)
+	harness := stub(t, `
+trap '' TERM
+echo '{"type":"system","subtype":"init","session_id":"stub-1"}'
+read first || exit 1
+sleep 120
+`)
+	cfg := adapterConfig(url, taskID, session, harness)
+	cfg.DelegateSocket = sock
+	cfg.TaskDeadline = 2 * time.Minute
+	cfg.KillGrace = time.Minute
+	ctx, evict := context.WithCancel(context.Background())
+	defer evict()
+	done := runAdapter(ctx, cfg)
+
+	if reply := askDelegate(t, sock, lib.DelegateRequest{Addressee: "platform", Text: "how is the fleet?"}); !reply.OK {
+		t.Fatalf("refused: %+v", reply)
+	}
+	evict()
+	out := waitOutcome(t, done, 45*time.Second)
+	if out.err != nil || out.res.State != lib.StateCompleted || out.res.Evicted {
+		t.Fatalf("run: %+v err=%v", out.res, out.err)
+	}
+	task := foldTask(t, c, session, taskID)
+	if task.State != lib.StateCompleted {
+		t.Fatalf("terminal = %q (%s)", task.State, finalText(task))
+	}
+	if r := artifactText(task, lib.ArtifactResult); r != "delegated to platform" {
+		t.Fatalf("result = %q", r)
+	}
+}
+
+func finalText(task *lib.Task) string {
+	if task.FinalMessage == nil || len(task.FinalMessage.Parts) == 0 {
+		return ""
+	}
+	return task.FinalMessage.Parts[0].Text
+}
