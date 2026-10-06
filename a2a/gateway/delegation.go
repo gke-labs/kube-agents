@@ -163,15 +163,89 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 // at the cap.
 const wakeTruncatedNote = " (truncated; the full result is in the conversation)"
 
-// capWakeBody bounds the child's result (or failure message) as it goes into
-// the wake's prompt: at most lib.DelegateTextCap bytes, the cap the request
-// direction holds, cut on a rune boundary and marked. The relay has already
-// posted the whole of it to the conversation.
-func capWakeBody(body string) string {
-	if len(body) <= lib.DelegateTextCap {
+// wakeFenceMax bounds the fence around the child's result in the wake text.
+// The fence is one backtick longer than the longest backtick run in the body
+// (at least three), so the body goes in verbatim and no line of it can close
+// the block early: a CommonMark closing fence must be at least as long as
+// the opening one. A body with a run of wakeFenceMax or more backticks has
+// each such run broken by a zero-width space before fencing, which keeps the
+// fence, and with it the overhead the cap reserves, bounded.
+const wakeFenceMax = 16
+
+// wakeResultLabel is the line between the wake's header and the fenced
+// result: the text below is the addressee's output, not the user's ask.
+const wakeResultLabel = "Result from " + targetPlatform + " (not from the user):"
+
+// wakeText is the wake turn's prompt (spec §4): the header naming the child
+// and its outcome, then, when there is a result or reason, the label and the
+// body fenced. Everything after the header line is held to
+// lib.DelegateTextCap bytes, label and fences included; the body is cut on a
+// rune boundary and marked. The relay has already posted the whole of it to
+// the conversation.
+func wakeText(state lib.TaskState, childID, result, reason string) string {
+	outcome, body := "completed", result
+	switch state {
+	case lib.StateFailed, lib.StateCanceled: // a canceled the gateway did not publish
+		outcome, body = "failed", reason
+	case lib.StateRejected:
+		outcome, body = "was rejected", reason
+	}
+	text := fmt.Sprintf("The task you delegated to %s (task %s) %s.", targetPlatform, childID, outcome)
+	if body = strings.TrimSpace(body); body != "" {
+		text += "\n" + fenceWakeBody(body)
+	}
+	return text
+}
+
+// fenceWakeBody is the label, the fence, the capped body and the fence.
+func fenceWakeBody(body string) string {
+	body = breakBacktickRuns(body, wakeFenceMax-1)
+	fence := wakeFence(body)
+	// label \n fence \n body \n fence
+	budget := lib.DelegateTextCap - len(wakeResultLabel) - 2*len(fence) - 3
+	if len(body) > budget {
+		body = truncateRunes(body, budget-len("…")-len(wakeTruncatedNote)) + wakeTruncatedNote
+		fence = wakeFence(body) // a prefix has no longer run: it can only shrink
+	}
+	return wakeResultLabel + "\n" + fence + "\n" + body + "\n" + fence
+}
+
+// wakeFence is a backtick fence one longer than body's longest run, at least
+// three.
+func wakeFence(body string) string {
+	longest, run := 0, 0
+	for i := 0; i < len(body); i++ {
+		if body[i] == '`' {
+			run++
+			longest = max(longest, run)
+		} else {
+			run = 0
+		}
+	}
+	return strings.Repeat("`", max(3, longest+1))
+}
+
+// breakBacktickRuns inserts a zero-width space after every n consecutive
+// backticks, so no run in the body is longer than n.
+func breakBacktickRuns(body string, n int) string {
+	if !strings.Contains(body, strings.Repeat("`", n+1)) {
 		return body
 	}
-	return truncateRunes(body, lib.DelegateTextCap-len("…")-len(wakeTruncatedNote)) + wakeTruncatedNote
+	var b strings.Builder
+	run := 0
+	for _, r := range body {
+		if r == '`' {
+			if run == n {
+				b.WriteString("​")
+				run = 0
+			}
+			run++
+		} else {
+			run = 0
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // liveChild names a child task of this conversation that has not ended: a
@@ -288,17 +362,7 @@ func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child Tas
 	// it ran on, which the mint checked was the record's bus session.
 	authority.Via = &AuthorityVia{TaskID: child.ID, Session: parent.Addressee}
 
-	outcome, body := "completed", result
-	switch state {
-	case lib.StateFailed, lib.StateCanceled: // a canceled the gateway did not publish
-		outcome, body = "failed", reason
-	case lib.StateRejected:
-		outcome, body = "was rejected", reason
-	}
-	text := fmt.Sprintf("The task you delegated to %s (task %s) %s.", targetPlatform, child.ID, outcome)
-	if body = strings.TrimSpace(body); body != "" {
-		text += "\n" + capWakeBody(body)
-	}
+	text := wakeText(state, child.ID, result, reason)
 
 	if rec.Profile == "" {
 		rec.Profile = sessionProfile
