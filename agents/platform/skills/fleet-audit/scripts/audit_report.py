@@ -10537,13 +10537,15 @@ def close_stale_remediation_prs(
     item): a covered id of that check whose cluster and namespace segments
     match is shielded whatever workload it names, so a pull request in such a
     namespace closes even when this run read none of it. Where an id lives
-    comes from `finding_places`, the segments re-derived from the finding's
-    own fields in the stored or current document (`report_finding_places`):
-    an id clipped at `MAX_FINDING_ID` no longer spells them. An id no
-    document carries is read off the string, which is exact for an unclipped
-    id; one shaped like a clipped id (ending in the shortening digest) is not
-    matched at all, since its trimmed segments could equal another
-    namespace's.
+    comes first from the pull request's own body: the `Where:` line under
+    each covered finding, which `parse_finding_locations` reads back, is the
+    one artifact that always holds a covered id beside its cluster and
+    namespace, whatever the store remembers. Then from `finding_places`, the
+    segments re-derived from the finding's own fields in the stored or
+    current document (`report_finding_places`). An id neither carries is read
+    off the string, which is exact for an unclipped id; one shaped like a
+    clipped id (ending in the shortening digest) is not matched at all, since
+    its trimmed segments could equal another namespace's.
 
     Two reasons a pull request is stale, and the second one is why this cannot
     just read the hidden block. A pull request is stale when every finding it
@@ -10571,12 +10573,21 @@ def close_stale_remediation_prs(
     finding_places = finding_places or {}
     check_segment = _id_segment(SHARED_ACCOUNT_CHECK)
 
-    def is_shielded(fid: str) -> bool:
+    def is_shielded(fid: str, located: dict[str, dict[str, str]]) -> bool:
         if fid in shielded_ids:
             return True
         if not shielded_namespaces:
             return False
-        place = finding_places.get(fid)
+        where = located.get(fid)
+        if where is not None:
+            namespace = str(where.get("namespace") or "")
+            place = (
+                fid.split(".", 1)[0],
+                _id_segment(str(where.get("cluster") or "")),
+                _id_segment(namespace) if namespace.strip() else ID_EMPTY_SEGMENT,
+            )
+        else:
+            place = finding_places.get(fid)
         if place is None:
             parts = fid.split(".")
             if len(parts) != ID_SEGMENTS or SHORTENED_ID_SUFFIX.search(fid):
@@ -10596,6 +10607,7 @@ def close_stale_remediation_prs(
         number = int(pr.get("number", 0))
         head = str(pr.get("headRefName", ""))
         covered = parse_delta_block(str(pr.get("body", "")))
+        located = parse_finding_locations(str(pr.get("body", "")))
         # A body written under a different identity scheme names its findings
         # by ids this run cannot join against, so "none of them still
         # reproduce" is unknowable rather than true — and acting on it closes
@@ -10616,9 +10628,9 @@ def close_stale_remediation_prs(
         # workload is neither current nor still flagged, and a pull request
         # covering only declared workloads is the forbidden fix as well.
         shield_persisting = (
-            [fid for fid in covered if fid in current_ids or is_shielded(fid)] if joinable else []
+            [fid for fid in covered if fid in current_ids or is_shielded(fid, located)] if joinable else []
         )
-        only_shielded = bool(shield_persisting) and all(is_shielded(fid) for fid in shield_persisting)
+        only_shielded = bool(shield_persisting) and all(is_shielded(fid, located) for fid in shield_persisting)
         if shielded_only and not only_shielded:
             continue
         if not orphaned:
@@ -10633,7 +10645,7 @@ def close_stale_remediation_prs(
         # of the fix that exists anywhere. Closing it destroys reviewed work to
         # correct a grouping that never changed, and points the reviewer at a
         # replacement branch that was never pushed.
-        stranded = sorted(fid for fid in persisting if fid not in branch_by_finding and not is_shielded(fid))
+        stranded = sorted(fid for fid in persisting if fid not in branch_by_finding and not is_shielded(fid, located))
         if orphaned and stranded:
             log(
                 f"PR #{number} covers {', '.join(stranded)}, which still "

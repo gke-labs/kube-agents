@@ -16781,6 +16781,32 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(rc, 0, self.err)
         self.assertEqual(self.stdout_json()["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
 
+    def test_a_clipped_id_the_store_forgot_closes_on_the_pull_requests_own_where_line(self):
+        # The store a partial findings run leaves carries no finding for the
+        # unreachable cluster. The pull request's body says where each covered
+        # finding lives, and the close reads that first.
+        cluster = "acme-prod/us-central1-a/payments-primary-cluster-with-a-long-name"
+        namespace = "payments"
+        path = f"clusters/{cluster}/{namespace}/default-sa-automount.yaml"
+        worker = make_finding(fid="worker", check="default-sa-automount", obj="Deployment/worker", title="worker", severity="major", cluster=cluster, namespace=namespace, remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        scope = [{"name": cluster, "location": "us-central1-a", "project": "acme-prod"}, {"name": "stage-eu", "location": "europe-west1", "project": "acme-stage"}]
+        previous_body = published_body(make_doc(findings=[worker], audit=AUDIT, clusters=scope), generated_at=NOW)
+        self.previous_document = make_doc(findings=[], audit=AUDIT, clusters=[scope[1]])
+        self.declaring_replies(previous_body)
+        worker_id = audit_report.published_id({"check": "default-sa-automount", "cluster": cluster, "namespace": namespace, "object": "Deployment/worker"})
+        self.assertEqual(len(worker_id), audit_report.MAX_FINDING_ID)
+        body = audit_report.render_remediation_pr_body(AUDIT, [{**worker, "id": worker_id}], issue_number=42, generated_at=NOW)
+        self.assertEqual(audit_report.parse_delta_block(body), [worker_id])
+        self.harness.replies["proposal-list"] = proposals_view([pr(9, "platform-agent/fix-default-sa", body=body)])
+        self.touch(path)
+        pathlib.Path(audit_report.declarations_path_for(AUDIT)).parent.mkdir(parents=True, exist_ok=True)
+        audit_report.write_declarations(AUDIT, "acme/fleet", [{"check": "default-sa-automount", audit_report.DECLARATION_CLUSTER_FIELD: cluster, "namespace": namespace, "object": "Deployment/reporter", "repo": "acme/fleet", "path": "knowledge/reporter.md", "excerpt": "needs the token"}])
+        doc = make_doc(findings=[], audit=AUDIT, clusters=[scope[1]], skipped=[{"cluster": cluster, "reason": "control plane unreachable"}])
+        manifest = _full_manifest(names=("stage-eu",), audit=AUDIT)
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
+
     def test_a_clipped_id_does_not_close_the_pull_request_on_a_declaration_for_a_longer_namespace(self):
         # A fleet-wide declaration in `payments-processing`; the pull request
         # is for `payments` on a long-named cluster, so its id is clipped.
