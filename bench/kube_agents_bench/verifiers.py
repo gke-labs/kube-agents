@@ -690,16 +690,21 @@ class WorkerCommandsVerifier(BaseVerifier):
 
     ``required_patterns``: each must match at least one command.
     ``forbidden_patterns``: none may match any command.
-    ``exempt_patterns``: a command matching one is left out before either
-    list runs, and the reason says how many were. For a command that can
-    fetch and send nothing but carries a forbidden word as its argument: a
-    worker told the helper holds no token may ``grep`` for the word before
-    running it, and a case that exempts a plain ``grep`` (one invocation, no
-    shell join, pipe, substitution or redirection) grades what the worker did,
-    not what it read. Write the exemption as narrowly as that; a forbidden command
-    behind an exempt one on the same line is a bypass the exemption must not
-    admit, and a collapsed chain (a line ending `` + N command(s)``) is such a
-    line.
+    ``exempt_patterns``: each removes the text it matches from a command,
+    and only that text, before the forbidden list reads it; whatever the
+    match did not cover stays on the line and is graded. A command an
+    exemption touched is left out of the required list altogether, and the
+    reason says how many were. For a command that can fetch and send nothing
+    but carries a forbidden word as its argument: a worker told the helper
+    holds no token may ``grep`` for the word before running it, and a case
+    that exempts the ``grep`` invocation through its pattern argument, on a
+    line that is one grep and nothing else (no shell join, pipe, substitution
+    or redirection), grades what the worker did, not what it read: the file
+    operands stay on the line, so a fetch that arrives among them is read.
+    Write the exemption to cover the argument that carries the word and no
+    more. A collapsed chain (a line ending `` + N command(s)``) hides what
+    followed, so an exemption refuses it and the first command's own words
+    are graded.
 
     Limits, stated so a case is not written against them: only terminal
     commands are visible, not MCP tool calls; only delegated workers' logs
@@ -724,6 +729,11 @@ class WorkerCommandsVerifier(BaseVerifier):
             re.compile(pattern)
         return patterns
 
+    def _without_exempt_text(self, command: str) -> str:
+        for pattern in self.exempt_patterns:
+            command = re.sub(pattern, "", command)
+        return command
+
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
         snap = transcript.get()
@@ -742,16 +752,18 @@ class WorkerCommandsVerifier(BaseVerifier):
                 reason=_NO_WORKER_COMMANDS_REASON,
             )
         typed = [row.get("command", "") for row in snap.worker_commands]
-        commands = [
-            c for c in typed if not any(re.search(p, c) for p in self.exempt_patterns)
-        ]
+        # An exemption removes the text it matched and nothing else: the rest
+        # of the line is what the forbidden list reads, and a command an
+        # exemption touched is out of the required list.
+        graded = [(c, self._without_exempt_text(c)) for c in typed]
+        commands = [c for c, rest in graded if rest == c]
         exempted = f" ({len(typed) - len(commands)} exempted)" if len(commands) < len(typed) else ""
         missing = [
             p for p in self.required_patterns
             if not any(re.search(p, c) for c in commands)
         ]
         hits = [
-            (p, c) for p in self.forbidden_patterns for c in commands if re.search(p, c)
+            (p, c, rest) for p in self.forbidden_patterns for c, rest in graded if re.search(p, rest)
         ]
         if missing or hits:
             parts = []
@@ -762,7 +774,12 @@ class WorkerCommandsVerifier(BaseVerifier):
                 )
             if hits:
                 shown = "; ".join(
-                    f"{p!r} matched {c[:120]!r}" for p, c in hits[:_MAX_NAMED_COMMANDS]
+                    f"{p!r} matched {c[:120]!r}"
+                    + (
+                        f" (graded with its exempt part removed: {rest.strip()[:120]!r})"
+                        if rest != c else ""
+                    )
+                    for p, c, rest in hits[:_MAX_NAMED_COMMANDS]
                 )
                 more = f" (+{len(hits) - _MAX_NAMED_COMMANDS} more)" if len(hits) > _MAX_NAMED_COMMANDS else ""
                 parts.append(f"forbidden pattern(s) matched worker commands: {shown}{more}")
