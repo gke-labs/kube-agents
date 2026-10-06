@@ -26,7 +26,7 @@ the "wow moment that justifies the installation". What they get today:
 | Next Monday 07:50 UTC    | First cost audit                                                    | same                                                  |
 
 The gap between the report and the first audit is up to a day, and up to six days for cost. The
-only way to close it today is to know to run `hermes cron run <id>` inside the pod
+only way to close it today is to know to start an audit by hand inside the pod
 (`agents/platform/AGENTS.md`, "Run the `<x>` cron job now"). The inventory report covers most of
 what the compliance and reliability audits check (`inventory-findings-queue.md` §10), but nothing
 on day one covers cost or capacity, and no pull request opens until the first audit.
@@ -91,6 +91,11 @@ Two things the trigger must not be:
 `.bootstrap_scan_filed`, fire anyway. A stuck sweep, a blocked ranking card or one never filed must
 not hold the audits back forever.
 
+**Not a new install.** If the stage's first look finds a sweep filed more than
+`NEW_INSTALL_SECONDS` (24 hours) earlier, the install onboarded before this job existed but never
+reached delivery, so the entrypoint's `--assume-retired` entry (§5) could not tell it apart from a
+new one. The stage records the skip and starts nothing; the audits run on their schedules.
+
 ### 4.2 Which audits
 
 The four audits [#1866](https://github.com/gke-labs/kube-agents/issues/1866) names (cost, security, reliability, capacity), by their job ids in
@@ -107,17 +112,21 @@ The other five governance jobs keep their schedules.
 
 ### 4.3 Firing
 
-For each audit, `oobe.py` runs `HERMES_HOME=<agent home>/profiles/platform hermes cron run <id>`,
-with `hermes` found beside the running interpreter as `profile_cron_tick.py` finds it. That marks
-the job due; the next `profile-cron-tick` runs it within a minute through the schedule's own path,
-with its prompt, skills and `deliver: chat`, and the per-job lock keeps a run already in flight
-from starting twice. `cronjob(action='run')` is not used: on some runtimes it runs the job inside
-the calling process (`agents/platform/AGENTS.md`).
+For each audit, `oobe.py` calls Hermes' `cron.jobs.trigger_job(<id>)` in a subprocess of the
+gateway's own interpreter with `HERMES_HOME=<agent home>/profiles/platform`, which is where
+`cron.jobs` finds the Platform Agent's store. That sets the job's `next_run_at` to now; the next
+`profile-cron-tick` runs it within a minute through the schedule's own path, with its prompt,
+skills and `deliver: chat`, and the per-job lock keeps a run already in flight from starting twice.
 
-`.oobe_audits_fired` records each id as its `cron run` succeeds. A failed one is retried on the next
+Two routes that look the same are traps. `hermes cron run` runs the whole job synchronously in the
+calling process (`hermes_cli/cron.py`, `_job_action` forces it), so a per-minute script would hold
+a model run open, outside the tick's environment, until it times out. `cronjob(action='run')` does
+the same on some runtimes (`agents/platform/AGENTS.md`).
+
+`.oobe_audits_fired` records each id once it is marked due. A failed one is retried on the next
 tick, and only that one: marking an audit due again after it has run starts a second full run.
 
-`hermes cron run` also sets the job's `enabled` back to true (`cron.jobs.trigger_job`), so an
+`trigger_job` also sets the job's `enabled` back to true and clears a pause, so an
 audit an operator has disabled or paused, or one missing from the Platform Agent's roster, is
 recorded as held and not started. A start that fails is tried five times in all; after that the
 audit is left to its schedule, so the stage always finishes and the job always leaves.
@@ -179,15 +188,15 @@ times. It rides with the audits stage, whose eval case covers both.
 
 ## 6. Failure modes
 
-| Situation               | What the operator sees                                                                                   | Recovery                                                                                              |
-| ----------------------- | -------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| Audits running          | Nothing in chat until each posts its summary; `hermes cron list` in the platform profile shows them      | None needed                                                                                           |
-| `hermes cron run` fails | Nothing; `oobe` logs and retries the missing ids each minute                                             | Automatic                                                                                             |
-| An audit run fails      | The audit's own failure path; `chat-delivery-watch` opens a GitHub issue when reports stop reaching chat | As today                                                                                              |
-| No GitOps repository    | One line in the installer output, later one line in the report                                           | Re-run the installer with `--gitops-org` and `--gitops-repo` (INSTALL.md), then wait for the schedule |
-| No home channel         | Ledger issues and pull requests appear in the repository with no chat summary                            | Set one (`/sethome`)                                                                                  |
-| Sweep stuck             | Audits start at the 90-minute fallback                                                                   | As today for the report                                                                               |
-| Ranking card blocked    | Audits start at the 90-minute fallback, unless someone unblocks the card first                           | As today for the report                                                                               |
+| Situation              | What the operator sees                                                                                   | Recovery                                                                                              |
+| ---------------------- | -------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Audits running         | Nothing in chat until each posts its summary; `hermes cron list` in the platform profile shows them      | None needed                                                                                           |
+| Marking an audit fails | Nothing; `oobe` logs and retries the missing ids each minute                                             | Automatic                                                                                             |
+| An audit run fails     | The audit's own failure path; `chat-delivery-watch` opens a GitHub issue when reports stop reaching chat | As today                                                                                              |
+| No GitOps repository   | One line in the installer output, later one line in the report                                           | Re-run the installer with `--gitops-org` and `--gitops-repo` (INSTALL.md), then wait for the schedule |
+| No home channel        | Ledger issues and pull requests appear in the repository with no chat summary                            | Set one (`/sethome`)                                                                                  |
+| Sweep stuck            | Audits start at the 90-minute fallback                                                                   | As today for the report                                                                               |
+| Ranking card blocked   | Audits start at the 90-minute fallback, unless someone unblocks the card first                           | As today for the report                                                                               |
 
 ## 7. Not in this design
 

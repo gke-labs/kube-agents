@@ -57,7 +57,6 @@ class StageTest(unittest.TestCase):
         self._roster([{"id": job_id, "enabled": True, "state": "scheduled"} for job_id in oobe.FIRST_RUN_AUDITS])
         patches = [
             mock.patch.object(oobe, "board_path", lambda _d: self.board),
-            mock.patch.object(oobe.profile_cron_tick, "hermes_bin", lambda: Path("/opt/hermes/.venv/bin/hermes")),
             mock.patch.object(oobe.subprocess, "run", self._run),
             mock.patch.object(oobe, "managed_repositories", self._repos),
         ]
@@ -184,8 +183,23 @@ class StageTest(unittest.TestCase):
         _board(self.board, [_ranking("done")])
         self._main()
         for argv, env in self.started:
-            self.assertEqual(argv[1:3], ["cron", "run"])
+            self.assertEqual(argv[:3], [sys.executable, "-c", oobe.TRIGGER_SCRIPT])
             self.assertEqual(env["HERMES_HOME"], str(self.d / "profiles" / "platform"))
+
+    def test_the_trigger_marks_the_job_due_and_does_not_run_it(self):
+        # `hermes cron run` runs the job in the calling process; trigger_job only schedules it.
+        self.assertIn("from cron.jobs import trigger_job", oobe.TRIGGER_SCRIPT)
+        self.assertNotIn("cron run", oobe.TRIGGER_SCRIPT)
+
+    def test_the_trigger_script_reports_an_unknown_job(self):
+        cron = self.d / "stub" / "cron"
+        cron.mkdir(parents=True)
+        (cron / "__init__.py").write_text("")
+        (cron / "jobs.py").write_text("def trigger_job(job_id):\n    return {'id': job_id} if job_id == 'known' else None\n")
+        env = {"PYTHONPATH": str(self.d / "stub")}
+        for job_id, code in (("known", 0), ("unknown", 3)):
+            done = subprocess.call([sys.executable, "-c", oobe.TRIGGER_SCRIPT, job_id], env=env)
+            self.assertEqual(done, code)
 
     def test_prints_nothing(self):
         self._file_scan()
@@ -217,17 +231,40 @@ class StageTest(unittest.TestCase):
         self._main()
         self.assertEqual(self.started, [])
 
-    def test_a_missing_hermes_binary_is_a_failed_start(self):
+    def test_a_trigger_that_times_out_is_a_failed_start(self):
         self._file_scan()
         _board(self.board, [_ranking("done")])
 
-        def missing():
-            raise FileNotFoundError("no hermes")
+        def slow(argv, **_kwargs):
+            raise subprocess.TimeoutExpired(argv, oobe.TRIGGER_TIMEOUT_SECONDS)
 
-        with mock.patch.object(oobe.profile_cron_tick, "hermes_bin", missing):
+        with mock.patch.object(oobe.subprocess, "run", slow):
             self._main()
+        state = oobe.read_state(self.d)
+        self.assertEqual(state[oobe.STATE_FIRED], [])
+        self.assertFalse(state[oobe.STATE_DONE])
+
+    # --- an install that is not new -------------------------------------------
+
+    def test_a_sweep_filed_before_the_job_existed_is_skipped(self):
+        # Onboarded but never delivered, so the entrypoint could not tell it is not new.
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._main(now=FILED_AT + oobe.NEW_INSTALL_SECONDS)
         self.assertEqual(self.started, [])
-        self.assertFalse(oobe.read_state(self.d)[oobe.STATE_DONE])
+        state = oobe.read_state(self.d)
+        self.assertTrue(state[oobe.STATE_DONE])
+        self.assertEqual(state[oobe.STATE_REASON], oobe.SKIP_NOT_NEW)
+
+    def test_a_stage_already_under_way_is_not_cut_off_by_age(self):
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self.failing = {"stockout-prevention"}
+        self._main()
+        self.started.clear()
+        self.failing = set()
+        self._main(now=FILED_AT + oobe.NEW_INSTALL_SECONDS)
+        self.assertEqual(self._started_ids(), ["stockout-prevention"])
 
     def test_a_disabled_or_paused_audit_is_left_alone(self):
         # `hermes cron run` would set enabled back to true.
@@ -244,7 +281,7 @@ class StageTest(unittest.TestCase):
         self.assertEqual(state[oobe.STATE_HELD], {
             "compliance-audit": "disabled",
             "obtainability-audit": "paused",
-            "stockout-prevention": "not on the Platform Agent's roster",
+            "stockout-prevention": oobe.HOLD_MISSING,
         })
         self.assertTrue(state[oobe.STATE_DONE])
 

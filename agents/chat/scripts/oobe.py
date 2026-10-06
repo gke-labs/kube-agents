@@ -11,15 +11,22 @@ does not wait for delivery, which needs a human message, and it does not look fo
 the report file, which is on the sandbox's volume when the sandbox is on. A scan
 that has not settled ``FALLBACK_SECONDS`` after its sweep was filed fires anyway.
 
-Each audit is started with ``hermes cron run`` on the Platform Agent's roster, which
-marks it due for the next ``profile-cron-tick``; the audit then runs through its
-schedule's own path. ``.oobe_audits_fired`` records each one started, so a retry
-starts only the ones still missing: marking an audit due again after it has run
-starts a second full run. With no GitOps repository configured every audit fails
-before it reads anything, so the stage records the skip and starts none.
+Each audit is marked due on the Platform Agent's roster with Hermes'
+``cron.jobs.trigger_job``, so the next ``profile-cron-tick`` runs it through its
+schedule's own path. Not ``hermes cron run``: that CLI runs the whole job
+synchronously in the calling process. ``.oobe_audits_fired`` records each one
+marked, so a retry marks only the ones still missing: marking an audit due again
+after it has run starts a second full run. With no GitOps repository configured
+every audit fails before it reads anything, so the stage records the skip and
+marks none.
 
-`hermes cron run` also sets a job's `enabled` back to true, so an audit an operator
+``trigger_job`` also sets a job's ``enabled`` back to true, so an audit an operator
 has disabled or paused is left alone rather than started.
+
+An install whose sweep was filed more than ``NEW_INSTALL_SECONDS`` before the
+stage first looks is not new: it onboarded before this job existed but never
+reached delivery, so the entrypoint could not tell. Its audits run on their
+schedules.
 
 Once the stage is done, the next run removes the job. Stdout stays empty: the job
 delivers locally and never speaks to the user.
@@ -32,8 +39,6 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-
-import profile_cron_tick  # beside this script in the pod
 
 OOBE_JOB_ID = "oobe"
 AUDITS_MARKER = ".oobe_audits_fired"
@@ -70,7 +75,13 @@ SQLITE_BUSY_TIMEOUT_SECONDS = 10
 # Long enough for a sweep over a large fleet to reach its ranking card and finish it, short
 # enough that a sweep that stalls (#2143) or a ranking card left blocked does not cost the day.
 FALLBACK_SECONDS = 90 * 60
-CRON_RUN_TIMEOUT_SECONDS = 30
+# Far past the fallback: a sweep this old was filed before the job existed.
+NEW_INSTALL_SECONDS = 24 * 60 * 60
+SECONDS_PER_MINUTE = 60
+TRIGGER_TIMEOUT_SECONDS = 30
+# Marks one job due and exits non-zero when the store does not have it. Run with
+# HERMES_HOME set to the Platform Agent's home, which is where cron.jobs finds its store.
+TRIGGER_SCRIPT = "import sys\nfrom cron.jobs import trigger_job\nsys.exit(0 if trigger_job(sys.argv[1]) else 3)\n"
 # A job id the roster does not have, or one disabled by hand, fails every attempt;
 # without a bound the stage would never finish and the job never leave.
 MAX_TRIGGER_ATTEMPTS = 5
@@ -84,6 +95,11 @@ STATE_SKIPPED = "skipped"
 STATE_REASON = "reason"
 STATE_AT = "at"
 SKIP_NO_REPOSITORY = "no GitOps repository is configured"
+SKIP_NOT_NEW = "the onboarding sweep was filed before this job existed"
+HOLD_MISSING = "not on the Platform Agent's roster"
+HOLD_DISABLED = "disabled"
+HOLD_PAUSED = "paused"
+DEFAULT_HOME = "/opt/data"
 TMP_SUFFIX = ".tmp"
 
 
@@ -92,7 +108,7 @@ def _log(message: str) -> None:
 
 
 def _data_dir() -> Path:
-    return Path(os.environ.get("HERMES_HOME", "/opt/data"))
+    return Path(os.environ.get("HERMES_HOME", DEFAULT_HOME))
 
 
 def read_state(data_dir: Path) -> dict:
@@ -177,7 +193,7 @@ def scan_settled(data_dir: Path, now: float) -> bool:
     if ranking_settled(board_path(data_dir), sweep_id):
         return True
     if now - filed_at >= FALLBACK_SECONDS:
-        _log(f"the scan has not settled {FALLBACK_SECONDS // 60} minutes after its sweep was filed; starting the audits anyway")
+        _log(f"the scan has not settled {FALLBACK_SECONDS // SECONDS_PER_MINUTE} minutes after its sweep was filed; starting the audits anyway")
         return True
     return False
 
@@ -190,21 +206,20 @@ def managed_repositories() -> list[str]:
 
 
 def trigger(job_id: str, data_dir: Path) -> bool:
-    """Mark one Platform Agent job due, as `hermes cron run` does for an operator."""
-    try:
-        binary = profile_cron_tick.hermes_bin()
-    except FileNotFoundError as e:
-        _log(f"cannot start {job_id}: {e}")
-        return False
+    """Mark one Platform Agent job due for the next profile-cron-tick.
+
+    A subprocess, because cron.jobs takes its store from HERMES_HOME, which here is the
+    Chat Agent's. The interpreter is the gateway's own, the one running this script.
+    """
     env = {**os.environ, "HERMES_HOME": str(data_dir / PROFILES_DIR / PLATFORM_PROFILE)}
     try:
         done = subprocess.run(
-            [str(binary), "cron", "run", job_id],
+            [sys.executable, "-c", TRIGGER_SCRIPT, job_id],
             env=env,
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
-            timeout=CRON_RUN_TIMEOUT_SECONDS,
+            timeout=TRIGGER_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         _log(f"cannot start {job_id}: {e}")
@@ -212,7 +227,7 @@ def trigger(job_id: str, data_dir: Path) -> bool:
     if done.returncode != 0:
         _log(f"cannot start {job_id} (exit {done.returncode}): {(done.stderr or done.stdout or '').strip()}")
         return False
-    _log(f"started {job_id}")
+    _log(f"marked {job_id} due")
     return True
 
 
@@ -233,11 +248,11 @@ def audit_holds(data_dir: Path) -> dict[str, str] | None:
     for job_id in FIRST_RUN_AUDITS:
         job = by_id.get(job_id)
         if job is None:
-            holds[job_id] = "not on the Platform Agent's roster"
+            holds[job_id] = HOLD_MISSING
         elif not job.get("enabled", True):
-            holds[job_id] = "disabled"
+            holds[job_id] = HOLD_DISABLED
         elif job.get("state") == PAUSED_STATE or job.get("paused_at"):
-            holds[job_id] = "paused"
+            holds[job_id] = HOLD_PAUSED
     return holds
 
 
@@ -290,6 +305,11 @@ def main(data_dir: Path | None = None, now: float | None = None) -> int:
     state = read_state(data_dir)
     if state.get(STATE_DONE):
         retire()
+        return 0
+    filed = scan_filed(data_dir)
+    if filed is not None and not state and now - filed[1] >= NEW_INSTALL_SECONDS:
+        _log(f"not starting the first-run audits: {SKIP_NOT_NEW}")
+        write_state(data_dir, {STATE_DONE: True, STATE_SKIPPED: True, STATE_REASON: SKIP_NOT_NEW, STATE_AT: now})
         return 0
     if not scan_settled(data_dir, now):
         return 0

@@ -14,7 +14,7 @@
 
 # The deployer drops an injected variable this stack does not declare and
 # raises on a task.yaml variable it does not declare, so this file and
-# bench/tasks/bootstrap-inventory-ranking-delivery/task.yaml are a matched pair.
+# bench/tasks/oobe-first-run-audits/task.yaml are a matched pair.
 
 variable "host_cluster_name" {
   type        = string

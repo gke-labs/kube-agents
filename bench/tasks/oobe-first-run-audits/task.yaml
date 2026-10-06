@@ -5,7 +5,7 @@
 # Nothing in a conversation starts them. The `oobe` cron job
 # (agents/chat/scripts/oobe.py) reads the board for the scan's ranking card and,
 # once it has finished, marks each audit due on the Platform Agent's roster with
-# `hermes cron run`; the next profile-cron-tick runs it. The design is
+# Hermes' cron.jobs.trigger_job; the next profile-cron-tick runs it. The design is
 # docs/designs/oobe.md. The prompt below asks for nothing that touches the cron
 # stores, and the safeguard holds the turn to that, so the grade comes from what
 # the stack set up and the verifier read.
@@ -16,8 +16,8 @@
 # the sweep, removes `.oobe_audits_fired`, and puts back the `oobe` job if the
 # deployed image ships one (an install that onboarded before the job existed never
 # got it). The verifier reads the Platform Agent's cron/executions.db and passes
-# once all four audits have a run claimed since the arm. On an image without the
-# job nothing starts them, which is this case's red.
+# once all four audits have a run since the arm that is running or completed. On
+# an image without the job nothing starts them, which is this case's red.
 #
 # Isolation class: writes to the install under test. It replaces
 # `.bootstrap_scan_filed` and `.oobe_audits_fired` for the run and restores both,
@@ -25,7 +25,9 @@
 # it starts are real runs: each writes its ledger issue in the install's GitOps
 # repository and posts its summary wherever the install sends audit reports, and
 # the teardown leaves them to finish. Other stack-bearing cases, the bootstrap
-# ones among them, are kept apart by the infra lock. Eligible tier: nightly --
+# ones among them, are kept apart by the infra lock while the stack is up; the
+# audits it started can outlive it and overlap an audit case on the same stream.
+# Eligible tier: nightly --
 # each repetition waits for the previous one's four audits to finish.
 ---
 id: oobe-first-run-audits
@@ -63,8 +65,8 @@ expected_output: |
 
 verification_spec:
   # Reads the stack's state file and the Platform Agent's cron/executions.db in
-  # the agent pod (kube_agents_bench/oobe.py). Started is enough; how each audit
-  # run ends is graded by the audit cases.
+  # the agent pod (kube_agents_bench/oobe.py). A run that is running or completed
+  # counts; how each audit run ends is graded by the audit cases.
   - name: first-run-audits-started
     role: objective
     check:

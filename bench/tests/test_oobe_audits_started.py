@@ -150,8 +150,25 @@ def test_a_missing_audit_is_named(store: Store) -> None:
         store.run(audit, ARMED + timedelta(minutes=1))
     result = _verify()
     assert result.status == "fail"
-    assert oobe.FIRST_RUN_AUDITS[-1] in result.reason
-    assert "started:" in result.reason
+    assert f"no run claimed since {ARMED.isoformat()} for {oobe.FIRST_RUN_AUDITS[-1]}" in result.reason
+
+
+def test_completed_runs_pass(store: Store) -> None:
+    store.arm()
+    for audit in oobe.FIRST_RUN_AUDITS:
+        store.run(audit, ARMED + timedelta(minutes=2), "completed")
+    assert _verify().status == "pass"
+
+
+@pytest.mark.parametrize("status", ["claimed", "skipped", "failed"])
+def test_a_run_that_did_not_get_going_does_not_count(store: Store, status: str) -> None:
+    # A run cut off at its start leaves a claimed or failed row; the skip ledger writes skipped.
+    store.arm()
+    for audit in oobe.FIRST_RUN_AUDITS:
+        store.run(audit, ARMED + timedelta(minutes=2), status)
+    result = _verify()
+    assert result.status == "fail"
+    assert f"({status})" in result.reason
 
 
 def test_another_jobs_run_does_not_count(store: Store) -> None:

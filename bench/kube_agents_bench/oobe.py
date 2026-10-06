@@ -18,7 +18,8 @@
 scan settles, by marking each due on that profile's roster. A started audit leaves a
 row in the profile's ``cron/executions.db``. The case's stack
 (``bench/tf/prebuilt/oobe-first-run-audits``) records when it armed the stage in its
-state file; this passes when every audit has a run claimed at or after that time.
+state file; this passes when every audit has a run claimed at or after that time that is
+running or has completed.
 
 Its own module rather than a section of ``verifiers.py``, registered through the same
 ``devops_bench.verifiers`` entry-point group.
@@ -42,6 +43,9 @@ FIRST_RUN_AUDITS = ("compliance-audit", "obtainability-audit", "fleet-wide-cost-
 STATE_FILE = f"{DATA_ROOT}/.bench-oobe.json"
 PLATFORM_EXECUTIONS_DB = f"{DATA_ROOT}/profiles/platform/cron/executions.db"
 STARTS_READ = "__OOBE_STARTS_READ__"
+# A run that got going: the scheduler has it, or it ended without being skipped or lost.
+# A claimed row the run never left, a skipped one and a failed one say the audit did not run.
+STARTED_STATUSES = ("running", "completed")
 # The gateway Deployment, as the stack names it (variables.tf: agent_deployment). Exec goes
 # there rather than through AGENT_SERVICE_NAME, which can name a tunnel in front of the
 # gateway that has none of its containers.
@@ -113,9 +117,10 @@ def read_starts(shell: Callable[[str, float], str], timeout: float) -> dict[str,
 
 @VERIFIERS.register("oobe_audits_started")
 class OobeAuditsStartedVerifier(_OnboardingPollVerifier):
-    """Passes once every first-run audit has a run claimed since the stack armed the stage.
+    """Passes once every first-run audit has a run since the arm that is running or completed.
 
-    Started is enough: a run's outcome is the audit's own, graded by the audit cases.
+    A row only claimed, skipped or failed does not count: a run cut off at its start leaves
+    exactly that. Past running, the outcome is the audit's own, graded by the audit cases.
     The agent pod unreadable, or a state file or cron store the read cannot use, is
     ``status="error"``.
     """
@@ -131,13 +136,17 @@ class OobeAuditsStartedVerifier(_OnboardingPollVerifier):
         if not read.get("applied_at"):
             return "error", f"there is no {STATE_FILE}: the stack did not arm the stage", read
         armed = datetime.fromisoformat(read["applied_at"]).isoformat()
-        missing = [audit for audit in FIRST_RUN_AUDITS if audit not in read["runs"]]
-        if not missing:
-            return "pass", f"all {len(FIRST_RUN_AUDITS)} first-run audits have a run claimed since {armed}", read
-        started = [audit for audit in FIRST_RUN_AUDITS if audit in read["runs"]]
-        return (
-            "fail",
-            f"no run claimed since {armed} for {', '.join(missing)}"
-            + (f" (started: {', '.join(started)})" if started else ": nothing started the first-run audits"),
-            read,
-        )
+        runs = read["runs"]
+        started = [a for a in FIRST_RUN_AUDITS if runs.get(a, {}).get("status") in STARTED_STATUSES]
+        if len(started) == len(FIRST_RUN_AUDITS):
+            return "pass", f"all {len(FIRST_RUN_AUDITS)} first-run audits are running or done since {armed}", read
+        stalled = [f"{a} ({runs[a].get('status')})" for a in FIRST_RUN_AUDITS if a in runs and a not in started]
+        missing = [a for a in FIRST_RUN_AUDITS if a not in runs]
+        parts = []
+        if missing:
+            parts.append(f"no run claimed since {armed} for {', '.join(missing)}")
+        if stalled:
+            parts.append(f"a run that did not get going for {', '.join(stalled)}")
+        if not started and not stalled:
+            parts.append("nothing started the first-run audits")
+        return "fail", "; ".join(parts), read
