@@ -70,17 +70,23 @@ class CiDeployHelmRetryTest(unittest.TestCase):
         history_json="",
         history_exit=None,
         kubectl_delete_exit=0,
+        history_responses=None,
     ):
         """Run the lifted deploy block with recording stubs.
 
         helm_responses: list of (exit_code, stdout, stderr) tuples returned
                         sequentially on each `helm upgrade --install` call.
+        history_json: default history JSON string if history_responses is omitted.
         history_exit: exit code for `helm history`. Defaults to 0 when history_json
                       is provided, or 1 (absent release) when empty.
         kubectl_delete_exit: exit code for `kubectl delete platformagent`.
+        history_responses: list of (exit_code, stdout, stderr) tuples returned
+                           sequentially on each `helm history` call.
         """
-        if history_exit is None:
-            history_exit = 0 if history_json else 1
+        if history_responses is None:
+            if history_exit is None:
+                history_exit = 0 if history_json else 1
+            history_responses = [(history_exit, history_json, "")]
 
         text = _deploy_text()
         with tempfile.TemporaryDirectory() as tmp:
@@ -96,8 +102,10 @@ class CiDeployHelmRetryTest(unittest.TestCase):
             index_file = tmp_path / "call_index.txt"
             index_file.write_text("0", encoding="utf-8")
 
-            history_file = tmp_path / "history.json"
-            history_file.write_text(history_json, encoding="utf-8")
+            history_responses_file = tmp_path / "history_responses.json"
+            history_responses_file.write_text(json.dumps(history_responses), encoding="utf-8")
+            history_index_file = tmp_path / "history_index.txt"
+            history_index_file.write_text("0", encoding="utf-8")
 
             helm_stub = bin_dir / "helm"
             helm_stub.write_text(
@@ -105,8 +113,25 @@ class CiDeployHelmRetryTest(unittest.TestCase):
 echo "helm $*" >> "{log}"
 case "$1" in
   history)
-    cat "{history_file}"
-    exit {history_exit}
+    h_idx=$(cat "{history_index_file}")
+    h_resp=$(python3 -c '
+import json, sys
+data = json.load(open("{history_responses_file}"))
+idx = int(sys.argv[1])
+if idx < len(data):
+    code, out, err = data[idx]
+else:
+    code, out, err = data[-1]
+if out: sys.stdout.write(out + "\\n")
+if err: sys.stderr.write(err + "\\n")
+sys.exit(code)
+' "$h_idx")
+    h_rc=$?
+    echo $((h_idx + 1)) > "{history_index_file}"
+    if [ -n "$h_resp" ]; then
+        printf "%s\\n" "$h_resp"
+    fi
+    exit $h_rc
     ;;
   uninstall)
     exit 0
@@ -453,6 +478,10 @@ A2A_OPERATOR_ENV_ARGS=()
         self.assertEqual(len(helm_upgrades), 3, f"expected 3 helm calls: {calls}")
         self.assertIn("attempt 1 of 3 hit a transient API-server 5xx, retrying", out)
         self.assertIn("attempt 2 of 3 hit a transient API-server 5xx, retrying", out)
+        sleep_calls = [c for c in calls if c.startswith("sleep")]
+        self.assertEqual(sleep_calls, ["sleep 5", "sleep 10"], f"expected linear backoff delays: {calls}")
+        readyz_calls = [c for c in calls if c.startswith("kubectl get --raw /readyz")]
+        self.assertEqual(len(readyz_calls), 2, f"expected readyz checks before recovery: {calls}")
 
     def test_transient_5xx_heals_poisoned_release_record_before_retry(self):
         err_msg = "the server is currently unable to handle the request"
@@ -474,8 +503,64 @@ A2A_OPERATOR_ENV_ARGS=()
         cr_idx = calls.index(cr_deletes[0])
         uninstall_idx = calls.index(uninstalls[0])
         self.assertLess(cr_idx, uninstall_idx, "CR delete must precede helm uninstall")
+        readyz_calls = [c for c in calls if c.startswith("kubectl get --raw /readyz")]
+        self.assertEqual(len(readyz_calls), 1, f"expected readyz check before recovery: {calls}")
+        sleep_calls = [c for c in calls if c.startswith("sleep")]
+        self.assertEqual(sleep_calls, ["sleep 5"])
         self.assertIn("record before retrying", out.lower())
         self.assertIn("cleared the poisoned", out.lower())
+
+    def test_transient_5xx_probe_5xx_retries_and_heals_poisoned_release_record(self):
+        # When attempt 1 fails with 5xx and the subsequent helm history probe also
+        # experiences a transient 5xx, the probe must wait and re-probe rather than
+        # treating the failure as an absent release (#2382).
+        err_msg = "the server is currently unable to handle the request"
+        responses = [
+            (1, "", err_msg),
+            (0, "Release kube-agents installed", ""),
+        ]
+        history_poisoned = json.dumps([{"revision": 1, "status": "failed"}])
+        history_responses = [
+            (1, "", "Error: the server is currently unable to handle the request"),
+            (0, history_poisoned, ""),
+        ]
+        rc, calls, out, err = self._run_deploy_block(
+            responses,
+            history_responses=history_responses,
+        )
+        self.assertEqual(rc, 0, err)
+        cr_deletes = [c for c in calls if c.startswith("kubectl delete platformagent")]
+        self.assertEqual(len(cr_deletes), 1, f"expected CR delete before uninstall: {calls}")
+        uninstalls = [c for c in calls if c.startswith("helm uninstall")]
+        self.assertEqual(len(uninstalls), 1, f"expected poisoned record to be healed before retry: {calls}")
+        self.assertIn("probe attempt 1 hit a transient api-server 5xx", out.lower())
+        self.assertIn("re-probing in 2s", out.lower())
+        self.assertIn("cleared the poisoned", out.lower())
+
+    def test_transient_5xx_persistent_probe_5xx_aborts_under_set_e(self):
+        # When the helm history probe persistently fails with 5xx across re-probes,
+        # heal_poisoned_release_record must stop under set -e and exit non-zero
+        # rather than proceeding to attempt 2 and failing with 'has no deployed releases' (#2382).
+        err_msg = "the server is currently unable to handle the request"
+        responses = [
+            (1, "", err_msg),
+            (0, "Release kube-agents installed", ""),
+        ]
+        history_responses = [
+            (1, "", "Error: the server is currently unable to handle the request"),
+            (1, "", "Error: the server is currently unable to handle the request"),
+            (1, "", "Error: the server is currently unable to handle the request"),
+        ]
+        rc, calls, out, err = self._run_deploy_block(
+            responses,
+            history_responses=history_responses,
+        )
+        self.assertNotEqual(rc, 0, f"persistent probe 5xx must fail under set -e: {rc}")
+        helm_upgrades = [c for c in calls if c.startswith("helm upgrade")]
+        self.assertEqual(len(helm_upgrades), 1, f"must not issue attempt 2 when probe fails: {calls}")
+        uninstalls = [c for c in calls if c.startswith("helm uninstall")]
+        self.assertEqual(len(uninstalls), 0, f"must not issue uninstall when probe fails: {calls}")
+        self.assertIn("helm history probe failed with api-server 5xx", err.lower())
 
     def test_transient_5xx_cr_delete_failure_aborts_without_uninstall(self):
         # When CR deletion fails or times out, set -e must stop the run immediately

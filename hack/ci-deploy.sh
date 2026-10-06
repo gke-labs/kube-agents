@@ -88,6 +88,7 @@ readonly HELM_DEPLOYED_STATUS_RE='"status"[[:space:]]*:[[:space:]]*"deployed"'
 # startup can fail the first attempt; retrying proceeds to evaluation (#2382).
 readonly HELM_DEPLOY_ATTEMPTS=3
 readonly HELM_DEPLOY_RETRY_DELAY_SECONDS=5
+readonly APISERVER_READYZ_TIMEOUT_SECONDS=30
 readonly HELM_API_SERVER_5XX_RE="an error on the server|the server is currently unable to handle the request|the server was unable to return a response in the time allotted|the server responded with the status code 50[0234]|Internal error occurred:|etcdserver:|request did not complete within|(HTTP( response status)?|status:)[: ]+50[0234]([^0-9]|$)"
 
 # The keypair the agent uses to reach its shell sandbox over SSH. Generated per
@@ -794,9 +795,51 @@ fi
 heal_poisoned_release_record() {
   local reason="${1:-a previous run left this pool project poisoned (#1172)}"
   local action="${2:-installing}"
-  local history_json
-  if history_json="$(helm history "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" -o json 2>/dev/null)" \
-    && ! grep -Eq "${HELM_DEPLOYED_STATUS_RE}" <<<"${history_json}"; then
+  local history_json="" history_err="" history_rc=0
+  local history_probe_attempts=1
+  if [ "${action}" = "retrying" ]; then
+    history_probe_attempts=3
+  fi
+
+  for ((probe_try=1; probe_try<=history_probe_attempts; probe_try++)); do
+    local probe_tmp
+    probe_tmp="$(mktemp)"
+    if history_json="$(helm history "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" -o json 2>"${probe_tmp}")"; then
+      history_rc=0
+      rm -f "${probe_tmp}"
+      break
+    else
+      history_rc=$?
+      history_err="$(cat "${probe_tmp}")"
+      rm -f "${probe_tmp}"
+      # If the release simply does not exist ("release: not found" or no 5xx on non-zero exit),
+      # there is no release to heal; break immediately without retrying.
+      if ! grep -Eq "${HELM_API_SERVER_5XX_RE}" <<<"${history_err}"; then
+        break
+      fi
+      # If retrying and the probe hit an API-server 5xx, wait and re-probe
+      # rather than prematurely treating it as "absent release" (#2382).
+      if [ "${action}" = "retrying" ] && [ "${probe_try}" -lt "${history_probe_attempts}" ]; then
+        echo "WARNING: helm history probe attempt ${probe_try} hit a transient API-server 5xx (${history_err}), re-probing in 2s..."
+        sleep 2
+      fi
+    fi
+  done
+
+  if [ "${history_rc}" -ne 0 ]; then
+    # If the release does not exist (or probe exited non-zero with no 5xx),
+    # there is no release record to heal.
+    if ! grep -Eq "${HELM_API_SERVER_5XX_RE}" <<<"${history_err}"; then
+      return 0
+    fi
+    # If probe failed with an API-server 5xx and re-probes were exhausted,
+    # fail loudly under set -e so the run does not silently skip healing
+    # and fail attempt 2 on "has no deployed releases" (#2382).
+    echo "ERROR: helm history probe failed with API-server 5xx: ${history_err}" >&2
+    return "${history_rc}"
+  fi
+
+  if ! grep -Eq "${HELM_DEPLOYED_STATUS_RE}" <<<"${history_json}"; then
     echo "WARNING: the ${HELM_RELEASE_NAME} release record exists with no deployed revision —"
     echo "         ${reason}. Clearing the"
     echo "         record before ${action}."
@@ -1022,8 +1065,18 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
   fi
 
   if grep -Eq "${HELM_API_SERVER_5XX_RE}" "${HELM_INSTALL_OUT}" && [ "${attempt}" -lt "${HELM_DEPLOY_ATTEMPTS}" ]; then
-    echo "WARNING: Helm chart deployment attempt ${attempt} of ${HELM_DEPLOY_ATTEMPTS} hit a transient API-server 5xx, retrying in ${HELM_DEPLOY_RETRY_DELAY_SECONDS}s..."
-    sleep "${HELM_DEPLOY_RETRY_DELAY_SECONDS}"
+    retry_delay=$((HELM_DEPLOY_RETRY_DELAY_SECONDS * attempt))
+    echo "WARNING: Helm chart deployment attempt ${attempt} of ${HELM_DEPLOY_ATTEMPTS} hit a transient API-server 5xx, retrying in ${retry_delay}s..."
+    sleep "${retry_delay}"
+    # Wait for the control plane to recover before running recovery calls
+    # (CR delete, helm history probe/uninstall) (#2382).
+    readyz_start=$SECONDS
+    while (( SECONDS - readyz_start < APISERVER_READYZ_TIMEOUT_SECONDS )); do
+      if kubectl get --raw /readyz >/dev/null 2>&1; then
+        break
+      fi
+      sleep 2
+    done
     # If the failed attempt left behind a release record with no deployed revision,
     # clear it so the next attempt can install cleanly (#1172, #2382).
     heal_poisoned_release_record "attempt ${attempt} failed before reaching a deployed revision (#1172, #2382)" "retrying"
