@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -206,6 +208,9 @@ type rig struct {
 	client  *lib.Client // the gateway's client
 	bus     *lib.Client // a second client playing the executor
 	url     string
+	// logs is the gateway's log as text, on the rigs that capture it
+	// (startRigWithSpawnerCap); nil elsewhere.
+	logs *lockedBuffer
 }
 
 // startRig assembles a gateway on an embedded server, with user 1001 mapped
@@ -875,7 +880,7 @@ func TestTasklessActiveTaskInsideGraceStillSteers(t *testing.T) {
 // cap returns before the end-of-turn write, and the conversation must not be
 // told it is released while the record still says otherwise.
 func TestTasklessHealPersistsAcrossCapRefusal(t *testing.T) {
-	r, spawn := startRigWithSpawnerCap(t, "platform", 1)
+	r, spawn := startRigWithSpawnerCap(t, "platform", 1, nil)
 	spawn.setLive(1)
 	conv := "discord:g1/thread-taskless-cap"
 	seedTasklessDelegate(t, r, conv, defaultFirstEventGrace+time.Minute)
@@ -1083,12 +1088,13 @@ func startRigWithSpawner(t *testing.T) (*rig, *fakeSpawner) {
 // - RouteSession is the post-flip W4 configuration.
 func startRigWithSpawnerRoute(t *testing.T, defaultAddressee string) (*rig, *fakeSpawner) {
 	t.Helper()
-	return startRigWithSpawnerCap(t, defaultAddressee, 0)
+	return startRigWithSpawnerCap(t, defaultAddressee, 0, nil)
 }
 
 // startRigWithSpawnerCap additionally pins the session-pod cap; 0 keeps the
-// default (New normalizes it), which is what every pre-cap test wants.
-func startRigWithSpawnerCap(t *testing.T, defaultAddressee string, maxSessions int) (*rig, *fakeSpawner) {
+// default (New normalizes it), which is what every pre-cap test wants. tweak,
+// when set, edits the Config before New sees it (an allowlist, a depth bound).
+func startRigWithSpawnerCap(t *testing.T, defaultAddressee string, maxSessions int, tweak func(*Config)) (*rig, *fakeSpawner) {
 	t.Helper()
 	s := startServer(t)
 	url := s.ClientURL()
@@ -1123,13 +1129,20 @@ func startRigWithSpawnerCap(t *testing.T, defaultAddressee string, maxSessions i
 		IdleTTL:          30 * time.Minute,
 		AttributionSalt:  []byte("test-salt"),
 	}
-	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord", Spawner: spawn})
+	if tweak != nil {
+		tweak(cfg)
+	}
+	// The log is captured as well as written, so a test can assert a path
+	// that is observable only as its log line (an ignored delegation).
+	logs := &lockedBuffer{}
+	log := slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, logs), nil))
+	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord", Spawner: spawn, Logger: log})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	go func() { _ = g.Run(ctx) }()
 
-	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url}, spawn
+	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url, logs: logs}, spawn
 }
 
 // TestDelegatePrefixSpawnsSessionWorker: the W4 amendment's flow - a
@@ -1844,7 +1857,7 @@ func TestSessionCommandOnSessionDefaultChangesNothing(t *testing.T) {
 // TestSessionCommandWithTextHonoursTheCap: a refused first turn leaves no
 // half-written record - the cap post is the only reply.
 func TestSessionCommandWithTextHonoursTheCap(t *testing.T) {
-	r, spawn := startRigWithSpawnerCap(t, "platform", 1)
+	r, spawn := startRigWithSpawnerCap(t, "platform", 1, nil)
 	spawn.mu.Lock()
 	spawn.live = 1
 	spawn.mu.Unlock()
