@@ -524,8 +524,9 @@ Nothing crosses as a path any more:
 - **A kubeconfig crosses as a context name, not a file.** The shim reads `current-context`
   in its own pod and sends the string; the broker validates it with `parse_gke_context` and
   regenerates the file itself with `gcloud container clusters get-credentials`. Naming a
-  cluster is not choosing an account: `scoped_sa_pool` maps the name to a service account,
-  and a name with no entry is refused rather than falling back to the wide credential.
+  cluster is not choosing an account: `scoped_sa_pool` maps the cluster's project to a service
+  account, and a cluster in a project with no entry is refused rather than falling back to the
+  wide credential.
 - **A document crosses on fd 0.** `--body-file -` and `kubectl apply -f -` are what a
   caller writes; `reads_stdin` in the shim matches the flag and forwards the stream.
 - **`git` crosses as content.** The broker owns the only checkout, and the agent hands it
@@ -1180,17 +1181,20 @@ is not the answer either: the check is opt-in and an empty value skips it entire
 which drops the guardrail rather than moving it.
 
 The operator therefore writes it out, in `buildPodTemplateSpec` and only when the
-sandbox is enabled, naming `/opt/data` and `/home/agent`. The home was writable when
-this was written and is root-owned now (see
-[The agent home is root-owned](#the-agent-home-is-root-owned)), so a write there
-passes this check and then fails on the directory's mode. The value is written rather
-than left to the image default so the policy is visible in
-the pod spec rather than inherited from a base image two repositories away. It gives up
-no isolation. With `backend: ssh` the file tools cannot reach the agent pod's
-filesystem at all, so the roots they are checked against should describe the filesystem
-they actually write to. `TestSandboxRepointsTheWriteSafeRoot` asserts the variable is
-absent with the sandbox off, is exactly these two paths with it on, and names nothing
-that does not resolve in the sandbox.
+sandbox is enabled, naming the sandbox's writable data directory: `/opt/data`.
+The home is root-owned in the container image (see
+[The agent home is root-owned](#the-agent-home-is-root-owned)) and is not a durable write
+destination, so `/home/agent` is omitted here (#2284). This ensures write attempts naming
+`/home/agent/...` fail fast with "outside HERMES_WRITE_SAFE_ROOT" at the gateway's
+prefix check rather than failing on directory mode in the sandbox, and refusal errors
+do not list the ephemeral home as an allowed root. (Writes to `~` expand in the agent
+process against `HOME` under the data volume — by default `/opt/data/home` — and are
+admitted under `/opt/data`). The value is written rather than left to the image default so
+the policy is visible in the pod spec rather than inherited from a base image two
+repositories away. It gives up no isolation. With `backend: ssh` the file tools cannot
+reach the agent pod's filesystem at all, so the roots they are checked against should
+describe the filesystem they actually write to. `TestSandboxRepointsTheWriteSafeRoot`
+asserts the variable is exactly `shellSandboxDataPath` on the agent container.
 
 One thing this does not cover: the credential denylist that sits alongside the check
 (`~/.ssh`, `~/.aws`, `~/.config/gcloud`, `~/.docker`) is still expressed against the
@@ -1847,11 +1851,12 @@ The operator's StatefulSet does this in two steps, from constants in
 [`shell_sandbox_manifests.go`](../../k8s-operator/internal/controller/shell_sandbox_manifests.go).
 An init container, `prepare-image-trees`, runs the sandbox image with
 `--prepare-image-trees` and mounts only the data volume, at `/opt/data`. For each home
-root, `/opt/data` and `/opt/data/profiles/platform`, it removes a symlink or moves aside
-a non-directory on every path that is about to become a mount point, then replaces
-`skills`, `scripts` and `governance` with fresh copies from `/opt/defaults`, owned by
-root and not writable by group or other. It exits before writing anything to the root
-filesystem. The shell container then mounts each of the six `<home>/<tree>` paths as a
+root, `/opt/data` and `/opt/data/profiles/platform`, it removes a symlink on every path
+that is about to become a mount point and moves aside a non-directory where a home root
+belongs. It then deletes whatever is at `skills`, `scripts` and `governance`, file or
+directory, and puts fresh copies from `/opt/defaults` there, owned by root and not
+writable by group or other. It refuses to run when `/opt/defaults` holds no tree, and it
+exits before writing anything to the root filesystem. The shell container then mounts each of the six `<home>/<tree>` paths as a
 read-only `subPath` of the same volume, and mounts `profiles` and `profiles/platform`
 read-write over themselves. Kubelet resolves a container's `subPath` mounts when it
 creates that container, which is after the init container has finished, and no model
@@ -1870,7 +1875,10 @@ The shell's entrypoint does not assume the mounts are there. The operator sets
 `SANDBOX_IMAGE_TREES=read-only-mounts` on the shell container, and with it set the
 entrypoint requires every `<home>/<tree>` to appear in `/proc/self/mountinfo` as a mount
 point with `ro` in its options, and every directory between `/opt/data` and a home to be
-a mount point. If one does not, it exits 1 naming the path and the sandbox does not start, so a missing mount fails as loudly as a writable one. The cost is
+a mount point. If one does not, it exits 1 naming the path and the sandbox does not
+start, so a missing mount fails as loudly as a writable one. It also refuses to start when
+`/opt/defaults` holds no tree, missing or empty, since the per-tree check would then pass
+with nothing to check. The cost is
 that a mount problem takes the whole shell down instead of running with the gap.
 `SANDBOX_HOME_ROOTS` is set on both containers from the same constant that generates the
 mounts, so the init container stages exactly the paths the shell checks.
@@ -2547,13 +2555,13 @@ API server. Every path on the credentialed listener except `/healthz` requires i
 unidentified caller gets an undifferentiated `401` rather than a reason. `CREDENTIAL_PROXY_ALLOWED_CALLERS` names the
 TokenReview usernames the broker will serve — the sandbox's ServiceAccount, which is where
 every credentialed command originates, the gateway's, because the chat relays go through
-the same listener, and, once the operator renders it, the A2A gateway's. The operator grants
+the same listener, when the next stack takes Google Chat, the A2A gateway's, and, under the
+operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session pods'. The operator grants
 the broker exactly one verb, `create` on `tokenreviews`, to do it.
 
 **The audience is per Pod, and it is what separates the callers.** The sandbox's token is
 minted for `kubeagents-credential-proxy`, the gateway's for
-`kubeagents-credential-proxy-chat`, the A2A gateway's, once rendered, for whatever
-`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE` names, and the `TokenReview` response echoes which
+`kubeagents-credential-proxy-chat`, the A2A gateway's for `kubeagents-credential-proxy-a2a-chat`, and the `TokenReview` response echoes which
 audience it validated. A username cannot do this job: the gateway shares its ServiceAccount with the
 broker because the Workload Identity binding names it, so the two Pods are one identity at
 the `TokenReview` layer. The audience is chosen by the operator, per Pod, and the API server
@@ -2567,7 +2575,14 @@ had and nothing checked. The same table carries a third role, `a2a-chat`, for th
 gateway: `/v1/chat/a2a/**` is that role's alone, `/v1/chat/api` it shares with the chat
 role, and the legacy event routes it cannot reach; [the chatops gateway
 design](spec-chatops-gateway.md) ("The Google Chat adapter") owns why that caller is kept
-apart from the legacy chat one. A `NetworkPolicy` would have expressed the same thing and is not the mechanism
+apart from the legacy chat one. Under the operator's `A2A_SESSION_CLUSTER_VIEW` flag there is
+a fourth, `session`, for the pods the A2A gateway spawns per conversation: their token is
+minted for `kubeagents-credential-proxy-session`, `/v1/exec` admits `(shell, session)`, and
+within that route `ROLE_EXECUTABLES` holds the session to `kubectl` and `gcloud`. Because a
+Pod picks the audience it projects, the role is also bound to the caller:
+`CREDENTIAL_PROXY_SESSION_CALLERS` names the session ServiceAccount, which may present only
+the session audience, and no other caller may present that audience
+([spec-mode-switch.md](spec-mode-switch.md#switches-inside-next) owns the flag). A `NetworkPolicy` would have expressed the same thing and is not the mechanism
 chosen, because it does nothing at all on a CNI that does not implement `NetworkPolicy` and
 `TokenReview` is answered by the API server on every cluster.
 

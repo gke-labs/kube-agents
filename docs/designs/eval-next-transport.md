@@ -4,8 +4,8 @@
 > and the bench harness selects it with `AGENT_TRANSPORT=inject`; the operator renders the door
 > only under its eval flag; `EVAL_MODE_NEXT=1` on the presubmit scripts builds the bridge image,
 > flips the install, declares the sidecar and runs the matrix through the door (The CI flag). The
-> presubmit still runs `today` unless a job sets the flag, and stage 2 (Chat ingress) is not
-> started.
+> presubmit still runs `today` unless a job sets the flag, and stage 2's operator wiring is
+> rendered and its eval-install half is not started.
 > The measurement that motivates the document is on
 > gke-labs/kube-agents#1661; the presubmit run it cites is build `2100310325382352896`. The A2A
 > owner answered the first draft's questions on 2026-09-17 and reviewed the draft the same day;
@@ -214,8 +214,8 @@ backend), and the eval install has none until stage 2 gives it one; the adapter'
 the guard say so in code and in the gateway spec's test-backend section. What that trades away is
 the guard's no-backend refusal, which on a gateway with the door rendered can no longer tell an
 install that wants no real backend from one whose relay URL failed to render. The adapter's
-guard change drops only that refusal, only when the door is rendered, and keeps the two-backend
-refusal. And the door-alone start is not silent: the gateway logs it and the read route reports
+guard change drops only that refusal, only when a door is rendered (the inject door, or the A2A
+door beside it, which shares the exemption), and keeps the two-backend refusal. And the door-alone start is not silent: the gateway logs it and the read route reports
 the armed backend as inject-only, so stage 2's preflight reads the armed backend and fails the
 run as infrastructure when Chat is not the one, before any case grades. The stage-2 change that
 renders the gateway's relay URL adds it to the operator's golden set, which is where a failed
@@ -290,13 +290,19 @@ faults as well as the persona's. The reason rides as the terminal's status messa
 takes the token up to the next space, so `bus-publish-failed at working` reads as
 `bus-publish-failed`, and a message without the prefix is an unknown reason. The executors' own
 reasons, the bridge's `bridge-shutdown`, `bridge-queue-overflow`, `bus-publish-failed`,
-`spawn-failed`, `bridge-died-without-terminal-event` and `hermes-rate-limited` (a turn that gave
-up on the provider's rate limit or billing, Hermes's exit 75) and the worker adapter's `worker-evicted`
+`spawn-failed`, `bridge-died-without-terminal-event`, `hermes-rate-limited` (a turn that gave
+up on the provider's rate limit or billing, Hermes's exit 75 or the API server's
+`X-Hermes-Failure-Reason` header, or the API server's concurrent-run cap answering 429) and
+`hermes-api-unreachable` (the bridge never got a response from the pod's API server),
+`hermes-api-refused` (the API server answered a 4xx other than 429, before any turn ran) and
+`session-busy` (the task's deadline passed while it waited for its session's previous turn, so
+no request was sent), and the worker adapter's `worker-evicted`
 and `bus-subscribe-failed` (`spawn-failed` is both), are infrastructure, the class the api
 transport gives an exhausted transport retry, because they say the executor lost the task rather
 than the persona failing it, the same line the profiles spec draws with `worker-evicted`; the
-persona's reasons, `hermes-exited-nonzero` and `deadline-exceeded`, and any reason the harness
-does not know, are graded failures. A `rejected` terminal, which both executors publish for a
+persona's reasons, `hermes-exited-nonzero` and `deadline-exceeded`, the API server's 5xx or failed turn,
+unparseable, broken-off or oversize answers (`hermes-api-failed`, `hermes-api-unreadable`,
+`hermes-api-read-failed`, `hermes-api-oversize`), and any reason the harness does not know, are graded failures. A `rejected` terminal, which both executors publish for a
 submission with no text parts, is infrastructure and never graded, because it is the harness's
 own defect. A `canceled` terminal after the harness's own cancel is the graded timeout above, and
 `canceled-before-start` the infrastructure outcome above. The rule is the same on both
@@ -311,7 +317,7 @@ consumed; the reply came back as lifecycle events with a `result` artifact and r
 conversation the way the relay posts it. These are the components the measured run had down
 while the job stayed green, the gateway among them.
 
-**What it skips.** Chat, Pub/Sub, the relay's pull from the A2A subscription, the allowed-users
+**What it skips.** Chat, Pub/Sub, the A2A relay instance's pull from the install's subscription, the allowed-users
 gate, an `authority` block that names a real principal, and the reply rendered into the thread.
 
 **Which verifiers work.** `report_contains` reads the answer text and works unchanged.
@@ -348,9 +354,14 @@ the worker checks
 ([`eval-scorer.md`](eval-scorer.md), "The inject lane sets aside what its transport
 cannot show"). A case whose premise
 needs the front door — `agent-kanban-smoke`, which grades
-the chat profile's `kanban_create` — is a different matter: the door addresses `platform`
-directly, so `hack/eval/inject-lane-exclusions.txt` keeps it off this lane's matrix with the
-reason, and the api lane's roster is untouched.
+the chat profile's `kanban_create` — is a different matter: the door addresses `platform`,
+and the bridge's `cli` executor answers it with the platform profile, so
+`hack/eval/inject-lane-exclusions.txt` keeps it off this lane's matrix with the reason, and the
+api lane's roster is untouched. The lane pins that executor: `hack/ci-deploy.sh` sets
+`BRIDGE_EXECUTOR=cli` on the sidecar and its start-line wait requires `"executor":"cli"`. The
+bridge's default `api` executor runs the turn under the pod's API server, whose profile is the
+chat path's own (`default` on a stock install), so it changes which agent answers every case on
+the lane; the pin, and the exclusion, stay until cases have been graded on that executor.
 `ledger_issue_contains` finds the ledger by scanning the final message for a GitHub issue URL, so
 it works on any transport that maps a result into the final message, which both new transports
 do, and its grade depends on that mapping: the fleet-audit cases get the URL from the delegated
@@ -408,8 +419,13 @@ the CR's phase, so a refusal reds the lane rather than parking the CR `Degraded`
 working bus. The
 sidecar also carries the agent container's own environment, mounts, security context and
 resources, derived from the rendered Deployment at deploy time rather than copied into the
-script: the bridge's subprocess stands in for the `hermes chat -q` a kanban worker spawns inside
-the agent container, and that is the environment such a worker inherits. The one mount not
+script: the bridge's `cli` subprocess stands in for the `hermes chat -q` a kanban worker spawns
+inside the agent container, and that is the environment such a worker inherits; under the
+default `api` executor the same copy is what carries `API_SERVER_KEY` into the sidecar, which is
+why the patch pins `BRIDGE_EXECUTOR=cli` rather than leaving the choice to the key. The
+patch adds one more variable of its own, `A2A_ACTIVITY_SECRET` from the creds Secret's
+`bridge-activity-key`, because the agent container gains that entry only when the operator
+renders the sidecar the patch is declaring. The one mount not
 carried is the projected bus token, which the webhook reserves for the agent container. The
 third piece was decided the same day and is built: a look-ahead in the bridge's worker that
 before it spawns replays the task's `in` subject for a trailing `cancel` and finalizes
@@ -487,38 +503,29 @@ harness reads is the eval crew's to decide when the stage is built. The presubmi
 to the customer's door in the same change; the inject adapter stays a dev-only door behind the
 eval flag, and the direct-bus transport stays a diagnostic.
 
-What it adds to the proof: the relay pulls the A2A subscription, the gateway authenticates to the
+What it adds to the proof: the A2A relay instance pulls the install's subscription, the gateway authenticates to the
 broker with its own audience, the gateway mints the session and the `authority` block, the
 allowed-users gate admits the sender, and the reply reaches the thread.
 
-The stage is blocked on product work the status line of
-[`spec-chatops-gateway.md`](spec-chatops-gateway.md), which is canonical for this list, names as
-not yet rendered by the operator: the Google Chat adapter's env, including the relay URL; the
-projected relay token and the `a2a-chat` audience on the broker
-(`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`); the gateway's
-ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`; the broker NetworkPolicy admitting the A2A
-gateway pod; the allowed-users set carried to the gateway (`A2A_GCHAT_ALLOWED_USERS`); and the
-second Pub/Sub subscription with its IAM, which the composition does not yet provision.
+The operator work this stage stood on is rendered: under `next` with Google Chat enabled the
+gateway carries the adapter's env and relay token, the broker arms the A2A relay instance on
+the install's one subscription with the third audience, the gateway's ServiceAccount is a
+broker caller and a NetworkPolicy peer, and the legacy consumer is not rendered (the gateway
+spec's "Coexistence is by mode").
 
-The eval crew owns that operator work (decided 2026-09-17), under three conditions. The change
-cites the gateway spec's sections rather than restating them, and leaves the Google Chat
-adapter's `verifiedBy: chat-event-topic-iam` and its allowed-users gate exactly as "The Google
-Chat adapter" section has them: the gate is the operator-pinned allowed-users set carried as
-environment, and the `verifiedBy` value names a project-IAM boundary, not a per-request proof. It
-lands in the same change that gives the gateway rendered under `next` the credential proxy's chat
-relay URL as its backend, and teaches the operator's own backend check the same (the render
-withholds a gateway it believes has no backend, `a2aGatewayBackend`), so an install with Google
-Chat configured has a gateway that is rendered and starts without a Discord Secret; a render that drops the relay URL leaves a gateway on the door alone,
-which the read route reports as inject-only and the stage's preflight fails as infrastructure
-before any case runs, the guard paragraph in stage 1 saying why the guard no longer catches it.
-And it settles the one-backend guard with the Slack adapter in flight, so the relay URL beside a
-Slack credential is still a refusal and never a collision, while the inject door beside the relay
-URL is not one (stage 1, above), so the install this stage wires runs both transports.
+The operator render kept the three conditions the A2A owner set on it: it cites the gateway
+spec's sections; the Google Chat adapter's `verifiedBy: chat-event-topic-iam` and its
+allowed-users gate are exactly as "The Google Chat adapter" section has them, the gate carried
+as `A2A_GCHAT_ALLOWED_USERS` and `A2A_GCHAT_ALLOW_ALL_USERS` from the CR's list; Google Chat enabled on the CR is a backend the operator's own check (`a2aGatewayBackend`) recognises, so a Chat install's
+gateway renders and starts without a Discord Secret; and the one-backend guard is settled by
+precedence rather than by a guard change: the render omits the Discord reference when Chat is
+armed, the relay URL beside a Slack credential stays the gateway's refusal, and the inject door
+beside the relay URL is not one (stage 1), so the install this stage wires runs both
+transports. A render that drops the relay URL still leaves a gateway on the door alone, which
+the read route reports as inject-only and the stage's preflight fails as infrastructure before
+any case runs.
 
-Two decisions sit beside that list. The legacy Chat consumer still runs under `next`, and a topic
-fans out to every subscription, so an install that arms the A2A subscription beside it answers
-twice; the gateway spec leaves the per-install choice of which consumer takes Chat to the mode
-switch's per-component override, which does not exist. And the eval install runs with
+One decision sits beside that. The eval install runs with
 `GOOGLE_CHAT_ENABLED=false`; enabling it means a Chat app registration and a space per pool
 project, because a Chat app configuration is per GCP project.
 
@@ -535,8 +542,10 @@ artifact, one terminal event with `final: true`, and `cancel` as a real envelope
 dropped connection. The harness returns when the terminal lands, at whatever second it lands,
 and `tasks/get` by replay answers status without a live executor.
 
-The caveat that decides how much of the time cost stage 1 removes: the bridge runs one
-`hermes -p platform chat -Q -q <prompt>` per task and publishes its terminal when that turn ends.
+The caveat that decides how much of the time cost stage 1 removes: the bridge runs one turn
+per task, by default a turn in the conversation's session through the pod's API server and as
+the fallback a `hermes -p platform chat -Q -q <prompt>` subprocess, and publishes its terminal
+when that turn ends.
 Kanban stays the delegation mechanism inside the persona under `next` (decided 2026-09-17).
 Agent-initiated delegation as a child task on the bus is designed and not built:
 [`spec-subagent-profiles.md`](spec-subagent-profiles.md) has an orchestrator delegate by

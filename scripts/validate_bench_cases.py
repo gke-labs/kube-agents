@@ -186,6 +186,12 @@ FIXTURE_NOT_READY = {
         "account is denied, as a fixture role of its own; the evaluation fleet has "
         "one project per install today, so the case cannot be red on main"
     ),
+    "networking-audit-second-project": (
+        "#1865: needs a second GCP project per pool project that the agent's "
+        "service account can read, holding a PSC endpoint its service attachment "
+        "rejects; the evaluation fleet has one project per install today, so no "
+        "CI tier can run it; run it by hand against an install with such a project"
+    ),
     "vcs-history-only-fact": (
         "#1253: needs the git-access-ab/r200 branch pushed to every pool "
         "project's GitOps repository; the dev project carries it, the pool does "
@@ -327,6 +333,7 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "required_phrases",
         "forbidden_phrases",
         "any_of_phrases",
+        "any_of_patterns",
         "forbidden_patterns",
         "required_patterns",
     ),
@@ -342,6 +349,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     "tool_called": ("tool_names",),
     "worker_commands": ("required_patterns", "forbidden_patterns"),
     "worker_agents": ("required_agents",),
+    "replay_card": ("status_in", "status_not_in", "comment_phrases", "decoy_status_in"),
+    # No field: "the gateway would post nothing" is the assertion.
+    "reply_is_silent": (),
     # This repository, agent-disk-reading: the discovery sweep a cron job filed.
     "bootstrap_fanout": ("require",),
     # This repository, sandbox-reading: the findings the onboarding

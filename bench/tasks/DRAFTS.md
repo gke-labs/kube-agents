@@ -276,11 +276,13 @@ One role the catalog still lacks: a **cross-cluster tripwire** on cluster B or C
   never a project: `bench/tf/fleet/fixtures.json` maps the role to a cluster
   inside whichever eval project the run leased (A5). A check on the run's own
   provisioned cluster keeps using plain `resource_property`.
-- Cluster names `seeded-b` (lagging) and `seeded-c` (outlier) survive in four
+- Cluster names `seeded-b` (lagging) and `seeded-c` (outlier, and the cluster
+  whose missing upgrade notifications the pool note declares) survive in a few
   places only, none of them addresses the harness resolves: the upgrade and
-  consistency scenarios' `ledger_issue_contains` **phrase** assertions, and
-  the upgrade and consistency PROBES' prompts, whose question is about one
-  specific cluster by design. All four are a contract with `bench/tf/fleet/`
-  and change with the stack if the names do — they survive the prefix's
-  default and break loudly if it changes. Nothing else may name a cluster,
-  and no check anywhere targets one by name.
+  consistency scenarios' `ledger_issue_contains` **phrase** assertions, the
+  patch stream's declared-intent case's phrases, and the upgrade and
+  consistency PROBES' prompts, whose question is about one specific cluster by
+  design. All of them are a contract with `bench/tf/fleet/` and change with
+  the stack if the names do — they survive the prefix's default and break
+  loudly if it changes. Nothing else may name a cluster, and no check anywhere
+  targets one by name.

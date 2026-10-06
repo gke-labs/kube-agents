@@ -29,8 +29,10 @@ where the two conflict, this document governs.
 Agents **do not review one another's work unless asked to by a human.** Review
 and approval are human responsibilities (assisted by `kube-agents-bot`); merge
 is external automation applied once a human approves (see the root
-`AGENTS.md`). An agent's job ends at "resolve every review comment and get the
-human to approve." The only coordination _between_ agents is the claim, below.
+`AGENTS.md`). A review a human asks you for is a comment, never a verdict: see
+[Hard rules](#hard-rules). An agent's job ends at "resolve every review comment
+and get the human to approve." The only coordination _between_ agents is the
+claim, below.
 
 ## The loop
 
@@ -128,6 +130,20 @@ label, not a comment, is the signal to resume.
   these two - so this is a rule, not a permission. Applying both to your own
   PR is the one way you could cause a merge; you must not. You do not
   self-approve.
+- **Never approve, request changes, or `/lgtm` on any PR.** A review a human
+  asks you for goes in as a comment (`gh pr review --comment`), never as
+  `APPROVE` or `REQUEST_CHANGES`, and never carrying `/lgtm` or `/approve`.
+  Prow reads an approving review as `/lgtm` and a changes-requested one as
+  `/lgtm cancel`: from an account the `OWNERS` files name that moves the merge
+  gate, and from yours it draws a refusal - while the `CHANGES_REQUESTED` left
+  behind stops the automatic reviewer request from asking a human unless
+  `options.robot_accounts` in `.github/auto_request_review.yml` names your
+  account; `/request-review` overrides it either way. Either way it reads as a
+  verdict, and an approver's own PR self-approves, so an `lgtm` there is the
+  whole human half of the gate.
+  `kube-agents-bot` lives by the same rule: an agent's read is not a vote. Say
+  what you found, and leave what it is worth to the human
+  ([`docs/pull-request-workflow.md`, "How a change merges"](../../docs/pull-request-workflow.md#how-a-change-merges)).
 - **Never push to `upstream`.** Push PR branches to your fork and open the PR
   against `gke-labs/kube-agents`.
 - **Never self-authorize.** No unreviewed change reaches tracked state.

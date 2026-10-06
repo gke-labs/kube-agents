@@ -145,6 +145,16 @@ PIPES_CLOSED_POLL_SECONDS = 0.5
 # says which routes hold a slot and why the others take none.
 DEFAULT_MAX_CONCURRENT_COMMANDS = 8
 ENV_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"
+# The session role's own share of that pool. Session pods are opened by chat
+# conversations, and under the cluster-view flag all of them draw on the one
+# pool the platform agent's shell uses, so without a bound of their own a
+# conversation holding slow reads could starve the shell for the slot wait.
+# Counted before the pool is asked, and refused at once rather than queued:
+# a session past its share is answered busy and keeps no place in the line.
+# Deliberately small; CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_COMMANDS is the
+# knob, and the operator's spec.deployment.env reaches it.
+DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS = 2
+ENV_SESSION_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_COMMANDS"
 # How long a request waits for a slot before it is refused with 503. Long
 # enough to ride out a burst of one-shot reads, short enough that a queue held
 # up by long-running commands answers its callers rather than parking them.
@@ -280,6 +290,13 @@ API_RELAY_PATH_LOG_LENGTH = 256
 # request, and a ServiceAccount username truncated at the default 64 loses
 # exactly its discriminating part.
 PRINCIPAL_LOG_LENGTH = 512
+# The width a scoped-pool refusal is logged at. The message is fixed text plus
+# four GKE name components, each validated against `[a-z0-9-]` and bounded at
+# `scoped_sa_pool.MAX_NAME_COMPONENT_LENGTH` before it was interpolated, so the
+# whole line is at most 467 characters and fits here whole; at the default 64,
+# or the 256 it was first logged at, the operator's remedy was cut off on
+# every refusal.
+POOL_REFUSAL_LOG_LENGTH = 512
 MILLISECONDS_PER_SECOND = 1000
 
 # The broker's Prometheus surface: a metrics-only TCP listener of its own,
@@ -393,6 +410,8 @@ AUDIT_STATUS_BUSY = "busy"
 # policy rule. The response body and the audit record name the same constant,
 # so the two cannot drift apart.
 RULE_EXECUTABLE_ALLOWLIST = "executable.allowlist"
+RULE_CALLER_EXECUTABLE = "caller.executable-role"
+RULE_CALLER_KUBECTL_FLAG = "caller.kubectl-flag"
 RULE_GIT_ARGUMENT_REFUSED = "git.argument.refused"
 RULE_GIT_WORKSPACE_LEASE = "git.workspace.lease"
 RULE_SCOPED_SA_UNMAPPED_SCOPE = "gcp.scoped-sa.unmapped-scope"
@@ -541,7 +560,8 @@ class ThreadingTCPHTTPServer(HandlerErrorsToLog, ThreadingHTTPServer):
 # (see github_token_refresh.py).  Anyone who can observe pod-to-pod traffic in
 # the namespace can replay it until it expires.  mTLS closes that and is not
 # done here.  buildCredentialProxyNetworkPolicy narrows who can open the
-# connection at all, to the sandbox Pod and the gateway Pod.
+# connection at all, to the sandbox Pod, the gateway Pod and, when the next
+# stack takes Google Chat, the A2A gateway Pod.
 # ---------------------------------------------------------------------------
 
 DEFAULT_CREDENTIAL_PROXY_AUDIENCE = "kubeagents-credential-proxy"
@@ -585,11 +605,153 @@ DEFAULT_CREDENTIAL_PROXY_CHAT_AUDIENCE = "kubeagents-credential-proxy-chat"
 CALLER_ROLE_SHELL = "shell"
 CALLER_ROLE_CHAT = "chat"
 CALLER_ROLE_A2A_CHAT = "a2a-chat"
+# The session pod the A2A gateway spawns, under the operator's
+# A2A_SESSION_CLUSTER_VIEW flag. Exec route only, and within it kubectl and
+# gcloud only (ROLE_EXECUTABLES): the pod executes model output, and the
+# read-only posture command_policy enforces is the view it gets. A demo aid
+# until declarative profiles carry a session's identity and tools.
+CALLER_ROLE_SESSION = "session"
+
+# The TokenReview user.extra key under which the API server names the Pod a
+# projected token is bound to.
+TOKEN_REVIEW_POD_NAME_EXTRA = "authentication.kubernetes.io/pod-name"
 
 # Every role that exists, for the table check below. Note that two of them
 # nest: "chat" is a substring of "a2a-chat". Nothing here may compare roles in
 # a way that cannot tell those two apart.
-CALLER_ROLES = (CALLER_ROLE_SHELL, CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)
+CALLER_ROLES = (CALLER_ROLE_SHELL, CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT, CALLER_ROLE_SESSION)
+
+# Which executables a role may hand to /v1/exec. A role absent here keeps
+# whatever the route carries (`EXEC_ROUTE_EXECUTABLES`); the session role is
+# narrowed to the two CLIs that reach a cluster read-only. Today the route
+# carries exactly those two, so this check stands behind the route's own
+# refusal: widening the route never widens a session.
+ROLE_EXECUTABLES: dict[str, frozenset[str]] = {
+    CALLER_ROLE_SESSION: frozenset({"kubectl", "gcloud"}),
+}
+
+
+def executable_permitted(role: str, executable: str) -> bool:
+    """Whether ``role`` may run ``executable`` through /v1/exec."""
+    narrowed = ROLE_EXECUTABLES.get(role)
+    return narrowed is None or executable in narrowed
+
+
+# The kubectl flags a session caller may pass. An allowlist, for the reason
+# command_policy gives for the read verbs: the broker runs kubectl in its own
+# container, so any flag that names a file or a URL -- `-f`, `-k`, the
+# `*-file=` output formats, and whatever a future kubectl adds -- is read by
+# the BROKER, and a denylist of spellings is something pflag's grammar walks
+# around (`-Af <path>` clusters a boolean in front of the file flag). Streaming
+# flags (`--watch`, `logs --follow`) are not here either: each holds one of the
+# broker's command slots until the deadline, and a session shares that pool
+# with the platform agent's shell. Everything not listed is refused by name,
+# so a new flag is a review rather than a hole. The shell keeps kubectl's
+# whole surface; its clones and slots are its own.
+SESSION_KUBECTL_VALUE_FLAGS: frozenset[str] = frozenset({
+    "--namespace", "--selector", "--field-selector", "--context", "--kubeconfig",
+    "--output", "--sort-by", "--container", "--tail", "--since", "--since-time",
+    "--limit-bytes", "--chunk-size", "--limit", "--for", "--types", "--verbs",
+    "--api-group", "--template",
+})
+# Verbs a session may not run even though they are reads: both wait by
+# default (`rollout status` watches until the rollout completes, `wait` until
+# its condition or `--timeout`), and the broker lifts its one-shot deadline for
+# them, so each would hold a broker slot for as long as the caller likes.
+# `--timeout` and `--request-timeout` are kept out of the flags above for the
+# same reason: naming a bound is how a caller opts out of the broker's.
+SESSION_KUBECTL_REFUSED_VERBS: frozenset[tuple[str, ...]] = frozenset({("wait",), ("rollout", "status")})
+SESSION_KUBECTL_BOOLEAN_FLAGS: frozenset[str] = frozenset({
+    "--all-namespaces", "--show-labels", "--show-kind", "--no-headers",
+    "--previous", "--timestamps", "--prefix", "--all-containers",
+    "--ignore-not-found", "--ignore-errors", "--show-managed-fields",
+    "--containers", "--namespaced", "--client", "--help",
+})
+# pflag shorthands the session may use, by the long flag they stand for. The
+# cluster walk below reads a single-dash token character by character, as
+# command_policy._kubectl_refuses_identity_change does: each boolean consumes
+# nothing, the first value-taking shorthand swallows the rest of the token or
+# the next argv element.
+SESSION_KUBECTL_SHORTHANDS: dict[str, str] = {
+    "n": "--namespace", "l": "--selector", "o": "--output", "c": "--container",
+    "A": "--all-namespaces", "p": "--previous", "h": "--help",
+}
+# `--output` values that are formats, not files. The `*-file=` variants
+# (`go-template-file`, `jsonpath-file`, `custom-columns-file`, `templatefile`)
+# read the named path on the broker and are not here.
+SESSION_KUBECTL_OUTPUT_FORMATS: frozenset[str] = frozenset({"json", "yaml", "wide", "name"})
+SESSION_KUBECTL_OUTPUT_PREFIXES: tuple[str, ...] = ("jsonpath=", "custom-columns=", "go-template=", "template=")
+
+
+def _session_output_permitted(value: str) -> bool:
+    return value in SESSION_KUBECTL_OUTPUT_FORMATS or value.startswith(SESSION_KUBECTL_OUTPUT_PREFIXES)
+
+
+def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
+    """The first kubectl flag a session caller may not pass, or None.
+
+    Only the session role's kubectl is narrowed; every other role and every
+    other executable keeps the executor's behaviour. Returns the flag as a
+    name (`-f`, `--output`), never the value beside it, for the refusal
+    message and the audit line.
+    """
+    if role != CALLER_ROLE_SESSION or not argv or argv[0] != "kubectl":
+        return None
+    tokens = argv[1:]
+    index = 0
+    pending: str | None = None  # a value-taking flag whose value is the next token
+    words: list[str] = []  # bare words in order: the verb first
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        if pending is not None:
+            if pending == "--output" and not _session_output_permitted(token):
+                return pending
+            pending = None
+            continue
+        if token == "--":
+            break
+        if token.startswith("--"):
+            name, separator, value = token.partition("=")
+            if name in SESSION_KUBECTL_BOOLEAN_FLAGS:
+                continue
+            if name in SESSION_KUBECTL_VALUE_FLAGS:
+                if separator:
+                    if name == "--output" and not _session_output_permitted(value):
+                        return name
+                else:
+                    pending = name
+                continue
+            return name
+        if token.startswith("-") and len(token) > 1:
+            cluster = token[1:]
+            position = 0
+            while position < len(cluster):
+                shorthand = cluster[position]
+                long_name = SESSION_KUBECTL_SHORTHANDS.get(shorthand)
+                if long_name is None:
+                    return "-" + shorthand
+                if long_name in SESSION_KUBECTL_BOOLEAN_FLAGS:
+                    position += 1
+                    continue
+                attached = cluster[position + 1:]
+                if attached.startswith("="):
+                    attached = attached[1:]
+                if attached:
+                    if long_name == "--output" and not _session_output_permitted(attached):
+                        return long_name
+                else:
+                    pending = long_name
+                break
+            continue
+        # A bare word: the verb, a resource, a name. The read-verb policy
+        # downstream decides what the verb may do; the two verbs that wait
+        # are refused here, by name, before it.
+        words.append(token)
+        if len(words) <= 2 and tuple(words) in SESSION_KUBECTL_REFUSED_VERBS:
+            return " ".join(words)
+    return None
+
 
 # Which role each route demands. Checked by prefix, so the trailing slash on
 # the three families is load-bearing: without it "/v1/chatter" would match
@@ -605,7 +767,7 @@ CALLER_ROLES = (CALLER_ROLE_SHELL, CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)
 ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # Order matters: the a2a family sits under the chat prefix and must be
     # matched first. The api passthrough belongs to both chat consumers —
-    # one credential, two subscriptions — while each side's event routes
+    # one credential, one relay instance per install — while each side's event routes
     # stay its own. _validate_route_roles below enforces that order, and the
     # shape of every entry, at import; do not sort this table.
     ("/v1/chat/a2a/", (CALLER_ROLE_A2A_CHAT,)),
@@ -613,7 +775,7 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # 404s anything else under it, so the prefix admits nothing extra today.
     ("/v1/chat/api", (CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)),
     ("/v1/chat/", (CALLER_ROLE_CHAT,)),
-    ("/v1/exec", (CALLER_ROLE_SHELL,)),
+    ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION)),
     ("/v1/forge/", (CALLER_ROLE_SHELL,)),
     # The constant, not a literal: required_roles() answers () on a miss and
     # _role_permits then admits every role, so a prefix spelled twice is a
@@ -917,6 +1079,62 @@ class CommandSlotUnavailable(RuntimeError):
     """
 
 
+def session_slot_limit_from_env() -> int:
+    """The session role's concurrent-command bound, from the env or the default.
+
+    Anything that is not a positive integer falls back to the default with a
+    warning, so a typo narrows rather than opens: the default is the small
+    number, and an unset or broken knob is never "unlimited".
+    """
+    raw = os.getenv(ENV_SESSION_MAX_CONCURRENT_COMMANDS, "").strip()
+    if not raw:
+        return DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value <= 0:
+        LOGGER.warning(
+            "%s=%r is not a positive integer; using the default of %d",
+            ENV_SESSION_MAX_CONCURRENT_COMMANDS, raw, DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS,
+        )
+        return DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS
+    return value
+
+
+class SessionSlots:
+    """The session role's bounded share of the command pool.
+
+    Only CALLER_ROLE_SESSION is counted; every other role passes through to
+    the pool unchanged. A session at its bound is refused immediately with
+    CommandSlotUnavailable, which the exec route already answers as busy, so
+    the shim prints why and the model reports it rather than retrying.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self._in_flight = 0
+        self._lock = threading.Lock()
+
+    @contextlib.contextmanager
+    def acquire(self, role: str) -> Iterator[None]:
+        if role != CALLER_ROLE_SESSION:
+            yield
+            return
+        with self._lock:
+            if self._in_flight >= self.limit:
+                raise CommandSlotUnavailable(
+                    f"the session role is limited to {self.limit} concurrent command(s) through the "
+                    f"credential proxy ({ENV_SESSION_MAX_CONCURRENT_COMMANDS}); try again when one finishes"
+                )
+            self._in_flight += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._in_flight -= 1
+
+
 class CallerHungUp(Exception):
     """The caller closed its connection while its request waited for a slot.
 
@@ -964,6 +1182,12 @@ class Principal:
     be. "" means no role was established, which is the ``NullAuthenticator``
     case and reaches every route, because that authenticator is only sound
     behind a Unix socket where the filesystem is the access control.
+
+    ``pod`` is the name of the Pod the token was projected into, from the
+    TokenReview's ``user.extra``. It is for the audit line, not for policy: a
+    session Pod is one conversation, so it is what traces a brokered command
+    back to the conversation that asked for it. "" when the token is not
+    Pod-bound.
     """
 
     workload: str
@@ -971,11 +1195,18 @@ class Principal:
     groups: tuple[str, ...] = ()
     caller: str | None = None
     role: str = ""
+    pod: str = ""
 
     def describe(self) -> str:
+        # The pod is deliberately NOT here. This string is the `principal`
+        # field of every tool_execution_audit record, and the shell's token is
+        # pod-bound too, so folding the pod in would turn an identity every
+        # log filter keys on into a composite for every brokered command. The
+        # pod travels in the record's own `pod` field (_tool_audit).
+        described = self.workload
         if self.caller:
-            return f"{self.workload} (caller {self.caller})"
-        return self.workload
+            described = f"{described} (caller {self.caller})"
+        return described
 
 
 class NullAuthenticator:
@@ -1014,6 +1245,14 @@ class ServiceAccountAuthenticator:
     the answer rather than guessed from the request. A projected token carries
     exactly one audience, so exactly one can come back; more than one is a
     disagreement with that assumption rather than a wider grant, and is refused.
+
+    ``session_callers`` binds the session role to its ServiceAccounts in both
+    directions, because a pod chooses the audience it projects. A caller named
+    there may present only the session audience, so a session pod that
+    projected the shell audience does not get the shell role; and when the set
+    is non-empty, the session audience is refused to anyone not named in it.
+    Empty leaves the audience alone deciding, which is the pre-binding
+    behaviour an older operator's rendering still gets.
     """
 
     authenticates = True
@@ -1028,6 +1267,7 @@ class ServiceAccountAuthenticator:
         token_file: str,
         timeout_seconds: float = 10.0,
         cache_seconds: float = 60.0,
+        session_callers: frozenset[str] = frozenset(),
     ) -> None:
         if not audience_roles or not all(audience_roles):
             raise ValueError("an audience is required to authenticate callers")
@@ -1037,6 +1277,7 @@ class ServiceAccountAuthenticator:
             raise ValueError("the Kubernetes API server address is not configured")
         self.audience_roles = dict(audience_roles)
         self.allowed_callers = allowed_callers
+        self.session_callers = session_callers
         self.api_host = api_host
         self.api_port = api_port
         self.ca_file = ca_file
@@ -1163,12 +1404,21 @@ class ServiceAccountAuthenticator:
         username = user.get("username") or ""
         if username not in self.allowed_callers:
             raise AuthenticationError("the authenticated caller is not permitted")
+        role = self.audience_roles[matched[0]]
+        if username in self.session_callers and role != CALLER_ROLE_SESSION:
+            raise AuthenticationError("a session caller may present only the session audience")
+        if role == CALLER_ROLE_SESSION and self.session_callers and username not in self.session_callers:
+            raise AuthenticationError("the session audience is only for session callers")
         groups = user.get("groups") or []
+        extra = user.get("extra") or {}
+        pod_names = (extra.get(TOKEN_REVIEW_POD_NAME_EXTRA) or []) if isinstance(extra, dict) else []
+        pod = pod_names[0] if isinstance(pod_names, list) and pod_names else ""
         return Principal(
             workload=username,
             uid=str(user.get("uid") or ""),
             groups=tuple(str(group) for group in groups if isinstance(group, str)),
-            role=self.audience_roles[matched[0]],
+            role=role,
+            pod=pod if isinstance(pod, str) else "",
         )
 
 
@@ -1212,6 +1462,13 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
     # set-to-the-default have to be distinguishable, and after os.getenv applies
     # a default they are not.
     chat_audience = os.getenv("CREDENTIAL_PROXY_CHAT_AUDIENCE", "").strip()
+    # The ServiceAccounts the session role is bound to. Read raw like the
+    # audiences: unset is the older operator's rendering, and means no binding.
+    session_callers = frozenset(
+        caller.strip()
+        for caller in os.getenv("CREDENTIAL_PROXY_SESSION_CALLERS", "").split(",")
+        if caller.strip()
+    )
     if chat_audience and chat_audience != shell_audience:
         audience_roles = {
             shell_audience: CALLER_ROLE_SHELL,
@@ -1232,6 +1489,21 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
             )
         elif a2a_audience:
             audience_roles[a2a_audience] = CALLER_ROLE_A2A_CHAT
+        session_audience = os.getenv("CREDENTIAL_PROXY_SESSION_AUDIENCE", "").strip()
+        if session_audience and session_audience in audience_roles:
+            LOGGER.warning(
+                "CREDENTIAL_PROXY_SESSION_AUDIENCE equals the %s audience; the session "
+                "role needs an audience of its own, so it is not conferred",
+                audience_roles[session_audience] or CALLER_ROLE_SHELL,
+            )
+        elif session_audience:
+            audience_roles[session_audience] = CALLER_ROLE_SESSION
+            if not session_callers:
+                LOGGER.warning(
+                    "CREDENTIAL_PROXY_SESSION_AUDIENCE is set but CREDENTIAL_PROXY_SESSION_CALLERS "
+                    "is not; any allowed caller presenting the session audience gets the session "
+                    "role, and nothing keeps a session caller off the other audiences"
+                )
     else:
         audience_roles = {shell_audience: ""}
         if os.getenv("CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE", "").strip():
@@ -1242,9 +1514,16 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
                 "is not; the a2a-chat role only exists once the chat audience split does, "
                 "so the a2a audience is ignored"
             )
+        if os.getenv("CREDENTIAL_PROXY_SESSION_AUDIENCE", "").strip():
+            LOGGER.warning(
+                "CREDENTIAL_PROXY_SESSION_AUDIENCE is set but CREDENTIAL_PROXY_CHAT_AUDIENCE "
+                "is not; the session role only exists once the chat audience split does, "
+                "so the session audience is ignored"
+            )
     return ServiceAccountAuthenticator(
         audience_roles=audience_roles,
         allowed_callers=allowed,
+        session_callers=session_callers,
         api_host=os.getenv("KUBERNETES_SERVICE_HOST", "").strip(),
         api_port=os.getenv("KUBERNETES_SERVICE_PORT", "443").strip() or "443",
         ca_file=os.getenv(
@@ -5532,6 +5811,7 @@ def _tool_audit(
     exit_code: int | None = None,
     duration_ms: int | None = None,
     rule: str | None = None,
+    pod: str = "",
 ) -> dict[str, Any]:
     """The `audit` mapping of one tool-execution record.
 
@@ -5549,6 +5829,11 @@ def _tool_audit(
         "subcommand": subcommand,
         "status": status,
     }
+    if pod:
+        # The caller's pod, from the TokenReview's pod-name extra: every
+        # session pod shares one ServiceAccount, so this is what ties a
+        # brokered command back to a conversation.
+        record["pod"] = pod
     if exit_code is not None:
         record["exit_code"] = exit_code
     if duration_ms is not None:
@@ -5772,13 +6057,17 @@ def start_metrics_listener(host: str, port: int) -> MetricsServer | None:
 class CredentialProxyHandler(BaseHTTPRequestHandler):
     policy: Policy
     executor: CommandExecutor
+    # The session role's bounded share of the command pool, installed by main
+    # beside the executor; None (the route tests' stand-ins) means unbounded.
+    session_slots: "SessionSlots | None" = None
     max_request_bytes: int
     slack_max_request_bytes: int
     enforce_read_only: bool = True
     chat_relay: GoogleChatRelay | None = None
-    # The A2A gateway's own relay instance, on its own subscription. Two
-    # consumers on one subscription split deliveries randomly, so the A2A
-    # routes never touch chat_relay and vice versa; only the /v1/chat/api
+    # The A2A gateway's relay instance. Two consumers on one subscription
+    # split deliveries randomly, so the operator arms exactly one instance per
+    # install (the mode chooses which) and the A2A routes never touch
+    # chat_relay and vice versa; only the /v1/chat/api
     # passthrough is shared, because both instances hold the same app
     # credential and an install may arm either one alone.
     a2a_chat_relay: GoogleChatRelay | None = None
@@ -6073,7 +6362,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         principal_label = _sanitize_for_logging(principal.describe(), max_length=PRINCIPAL_LOG_LENGTH)
 
         def audit(status: str, **fields: Any) -> dict[str, Any]:
-            return {AUDIT_EXTRA_KEY: _tool_audit(status, request_id, principal_label, tool_label, subcommand_label, **fields)}
+            return {AUDIT_EXTRA_KEY: _tool_audit(status, request_id, principal_label, tool_label, subcommand_label, pod=principal.pod, **fields)}
 
         LOGGER.info(
             "exec request_id=%s principal=%s executable=%s",
@@ -6107,6 +6396,53 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "code": "SECURITY_POLICY_BLOCKED",
                     "rule": RULE_EXECUTABLE_ALLOWLIST,
                     "message": "Executable is not supported by the credential proxy.",
+                },
+            )
+            return
+        if not executable_permitted(principal.role, argv[0]):
+            LOGGER.warning(
+                "executable refused for role request_id=%s role=%s executable=%s",
+                request_id,
+                principal.role,
+                _sanitize_for_logging(argv[0]),
+                extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_CALLER_EXECUTABLE),
+            )
+            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": RULE_CALLER_EXECUTABLE,
+                    "message": (
+                        f"The {principal.role} caller may run only "
+                        f"{', '.join(sorted(ROLE_EXECUTABLES[principal.role]))} through the credential proxy."
+                    ),
+                },
+            )
+            return
+        refused_flag = session_kubectl_flag_refusal(principal.role, argv)
+        if refused_flag is not None:
+            LOGGER.warning(
+                "flag refused for role request_id=%s role=%s executable=%s flag=%s",
+                request_id,
+                principal.role,
+                _sanitize_for_logging(argv[0]),
+                refused_flag,
+                extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_CALLER_KUBECTL_FLAG),
+            )
+            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": RULE_CALLER_KUBECTL_FLAG,
+                    "message": (
+                        f"The {principal.role} caller may pass only kubectl's inspection flags; {refused_flag} "
+                        "is not one of them (file inputs, file-backed output formats and streaming flags are "
+                        "not available to a session)."
+                    ),
                 },
             )
             return
@@ -6212,7 +6548,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
 
             # One slot for the command and its response together; see
             # CommandExecutor.request_slot for why the response is inside it.
-            with self._request_slot():
+            # The session role's own bound is taken first, so a session past
+            # its share never queues for the pool the shell shares.
+            with self._session_slot(principal.role), self._request_slot():
                 result = self.executor.execute(
                     exec_argv,
                     stdin=stdin,
@@ -6297,13 +6635,20 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # generic policy block, and so that a test can assert on the reason
             # rather than on a status code every other gate also returns.
             LOGGER.warning(
-                # The message embeds the scope key, which is built from the
+                # The message embeds the cluster the request resolved to, built from the
                 # `current-context` of a kubeconfig the agent wrote. Same
                 # reasoning as the ValueError handler below: an unsanitised
                 # value here forges log records.
+                #
+                # The cap is raised above the default under the rule in
+                # `_sanitize_for_logging`'s docstring: every variable part of
+                # the message is a name component the pool validated against
+                # `[a-z0-9-]` and its 63-character bound before interpolating
+                # it, so the agent chooses nothing in the line beyond which
+                # cluster it named, and the line fits at the bound.
                 "scoped service account refused request_id=%s reason=%s",
                 request_id,
-                _sanitize_for_logging(str(exc), max_length=256),
+                _sanitize_for_logging(str(exc), max_length=POOL_REFUSAL_LOG_LENGTH),
                 extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_SCOPED_SA_UNMAPPED_SCOPE),
             )
             self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
@@ -7175,6 +7520,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 type(exc).__name__,
             )
 
+    def _session_slot(self, role: str) -> contextlib.AbstractContextManager:
+        """The session role's bounded share, or nothing for every other role."""
+        slots = getattr(self, "session_slots", None)
+        if slots is None:
+            return contextlib.nullcontext()
+        return slots.acquire(role)
+
     def _request_slot(self) -> contextlib.AbstractContextManager:
         """This request's concurrency slot, watched on this connection.
 
@@ -7263,8 +7615,8 @@ def chat_relay_subscriptions(project_id: str) -> tuple[str, str]:
     """Return the legacy and A2A Chat subscription names, refusing one shared.
 
     Two relay instances pulling one subscription split its deliveries between
-    them at random — the exact failure the A2A path's own subscription exists
-    to prevent — so pointing both env vars at the same subscription is refused
+    them at random, and the operator arms exactly one instance per install (the
+    mode chooses which), so pointing both env vars at the same subscription is refused
     at startup rather than discovered as every other ask going missing. The
     comparison is on the fully qualified name, the way GoogleChatRelay
     resolves it: a short name and its projects/… spelling are one subscription.
@@ -7281,7 +7633,7 @@ def chat_relay_subscriptions(project_id: str) -> tuple[str, str]:
         raise RuntimeError(
             "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME names the same subscription as "
             "GOOGLE_CHAT_SUBSCRIPTION_NAME; two relay instances on one subscription "
-            "split its deliveries, so the A2A consumer needs its own"
+            "split its deliveries; arm one relay instance per install"
         )
     return chat_subscription, a2a_subscription
 
@@ -7325,6 +7677,7 @@ def serve(args: argparse.Namespace) -> None:
     )
     executor.bootstrap(os.getenv("CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", ""))
     CredentialProxyHandler.executor = executor
+    CredentialProxyHandler.session_slots = SessionSlots(session_slot_limit_from_env())
     CredentialProxyHandler.base_branch = (
         getattr(args, "base_branch", "")
         or os.getenv("CREDENTIAL_PROXY_BASE_BRANCH", "")
@@ -7351,7 +7704,7 @@ def serve(args: argparse.Namespace) -> None:
             chat_project, chat_subscription
         )
         LOGGER.info("Google Chat relay enabled project=%s subscription=<redacted>", chat_project)
-    # The A2A gateway's own subscription on the same topic and credential;
+    # The A2A gateway's relay instance on the same topic and credential;
     # armed independently so an install can run either consumer alone.
     if chat_project and a2a_subscription:
         CredentialProxyHandler.a2a_chat_relay = GoogleChatRelay(

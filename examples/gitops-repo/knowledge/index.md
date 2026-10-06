@@ -24,8 +24,9 @@ hard enum — add new types by PR):
 | `escalation`        | A cross-tier request not yet a change |
 | `observation`       | A durable finding worth sharing       |
 
-An entry of any type may also carry `declares:`, a list of `{check, namespace, object}` items (plus
-`cluster` for a one-cluster choice) naming a posture the `obtainability-audit` stream lists under
+An entry of any type may also carry `declares:`, a list of `{check, namespace, object}` items (`namespace: ""`
+written out for a cluster-scoped object; plus `cluster` for a one-cluster choice, as the qualified `<project>/<location>/<name>` every stream's
+findings carry) naming a posture a declaring audit stream (`obtainability-audit`, `compliance-audit`, `security-patch-orchestrator`) lists under
 _Declared intent_ instead of reporting (`../README.md`, "Declared intent").
 
 ## Entries

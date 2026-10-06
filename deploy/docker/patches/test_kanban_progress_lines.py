@@ -4,6 +4,7 @@ Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t dep
 """
 
 import ast
+import os
 import shutil
 import sys
 import tempfile
@@ -12,8 +13,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parents[2] / "agents" / "platform" / "scripts"))
+
 import apply_kanban_progress_lines as applier
 import kanban_notifier
+import kanban_progress_lines
+import slack_moments
+import slack_presenter
+import slack_ux_moments
 import kanban_notify_delivery
 from kanban_handoff_clip import ELLIPSIS
 from kanban_progress_lines import (
@@ -1243,6 +1251,373 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
             await self._run(without)
         self.assertEqual((with_module.sent, with_module.edits), (without.sent, without.edits))
         self.assertEqual((self.rows, self.settled), ([], []))
+
+
+class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
+    """KAGE_SLACK_UX on a Slack card: a question and an opened PR get messages of their own.
+
+    ``gateway.slack_ux_moments`` is faked: the real one is covered by
+    ``test_slack_ux_moments.py``; this pins where deliver() calls it and what
+    it falls back to.
+    """
+
+    PR_NOTE = "Opened https://github.com/acme/fleet/pull/7 raising the limit."
+
+    def setUp(self):
+        self.flag = True
+        self.asked = []
+        self.announced = []
+        self.posts_question = True
+        self.settled = []
+        self.questions_settled = []
+        self.asked_event = 0
+        test = self
+
+        async def needs_you(adapter, sub, payload, event_id=0):
+            test.asked.append((sub["task_id"], payload, event_id))
+            if isinstance(test.posts_question, Exception):
+                raise test.posts_question
+            return test.posts_question
+
+        async def pr_opened(adapter, sub, text):
+            test.announced.append((sub["task_id"], text, len(adapter.sent)))
+            return True
+
+        async def settle_delegated(adapter, sub, kind, board=None):
+            test.settled.append((sub["task_id"], kind))
+
+        async def settle_question(adapter, sub):
+            test.questions_settled.append(sub["task_id"])
+
+        reactions = SimpleNamespace(enabled=lambda: test.flag, settle_delegated=settle_delegated)
+        moments = SimpleNamespace(
+            enabled=lambda: test.flag,
+            asked=lambda sub, event_id: event_id == test.asked_event,
+            needs_you=needs_you,
+            pr_opened=pr_opened,
+            settle_question=settle_question,
+        )
+        self.modules = {
+            "gateway": SimpleNamespace(slack_ux_reactions=reactions, slack_ux_moments=moments),
+            "gateway.slack_ux_reactions": reactions,
+            "gateway.slack_ux_moments": moments,
+        }
+        patcher = mock.patch.dict(sys.modules, self.modules)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        wake = mock.patch("kanban_notifier.resolve_wake_kinds", return_value=("blocked",))
+        wake.start()
+        self.addCleanup(wake.stop)
+
+    async def _blocked(self, adapter, payload, sub=SLACK_SUB):
+        self.watcher = SimpleNamespace()
+        ev = SimpleNamespace(id=3, kind="blocked", payload=payload)
+        return await deliver(self.watcher, adapter, sub, "blocked", ev, "⏸ t_e0c1 blocked: which?", None, HEADER)
+
+    async def _notes_then_report(self, adapter, report="Both pods are up.", sub=SLACK_SUB):
+        watcher = SimpleNamespace()
+        for event_id, note in ((1, "Checking seeded-a."), (2, self.PR_NOTE)):
+            await deliver(watcher, adapter, sub, "heartbeat", _beat(event_id, note), "", None, HEADER)
+        return await deliver(watcher, adapter, sub, "completed", _terminal(3), report, None, HEADER)
+
+    async def test_a_needs_input_block_posts_the_question_instead_of_the_line(self):
+        adapter = _Adapter()
+        payload = {"kind": "needs_input", "reason": "Which cluster?"}
+        self.assertIsNone(await self._blocked(adapter, payload))
+        self.assertEqual(self.asked, [("t_e0c1", payload, 3)])
+        self.assertEqual(adapter.sent, [])
+        self.assertEqual(self.settled, [("t_e0c1", "blocked")])
+        self.assertFalse(getattr(self.watcher, kanban_notifier.HELD_ATTR, {}), "the line was also held")
+
+    async def test_a_replayed_block_neither_settles_nor_reposts_its_question(self):
+        self.asked_event = 3
+        adapter = _Adapter()
+        self.assertIsNone(await self._blocked(adapter, {"kind": "needs_input", "reason": "Which cluster?"}))
+        self.assertEqual((self.asked, self.questions_settled, adapter.sent), ([], [], []))
+        self.assertFalse(getattr(self.watcher, kanban_notifier.HELD_ATTR, {}), "the replay held the line")
+
+    async def test_a_failed_replay_check_posts_the_question(self):
+        def asked(sub, event_id):
+            raise RuntimeError("boom")
+
+        self.modules["gateway.slack_ux_moments"].asked = asked
+        self.assertIsNone(await self._blocked(_Adapter(), {"kind": "needs_input", "reason": "Which cluster?"}))
+        self.assertEqual(len(self.asked), 1)
+
+    async def test_a_block_with_no_question_keeps_the_blocked_path(self):
+        for posts in (False, RuntimeError("boom")):
+            with self.subTest(posts=posts):
+                self.posts_question = posts
+                adapter = _Adapter()
+                self.assertIsNone(await self._blocked(adapter, {"kind": "capability", "reason": "no GPU"}))
+                held = getattr(self.watcher, kanban_notifier.HELD_ATTR)
+                self.assertIn(3, held[sub_key(SLACK_SUB)], "the blocked line was not held for the wake")
+
+    async def test_every_event_settles_the_open_question(self):
+        await self._blocked(_Adapter(), {"kind": "needs_input", "reason": "Which cluster?"})
+        self.assertEqual(self.questions_settled, ["t_e0c1"], "a block settles any earlier question first")
+        await self._notes_then_report(_Adapter())
+        self.assertEqual(self.questions_settled, ["t_e0c1"] * 4)
+
+    async def test_a_block_with_no_question_settles_the_earlier_one(self):
+        self.posts_question = False
+        await self._blocked(_Adapter(), {"kind": "capability", "reason": "no GPU"})
+        self.assertEqual(self.questions_settled, ["t_e0c1"])
+
+    async def test_an_unblocked_or_archived_card_settles_its_question(self):
+        # Both format to None upstream, so only silent_event sees them.
+        for kind in ("unblocked", "archived"):
+            await silent_event(SimpleNamespace(sub=SLACK_SUB, adapter=_Adapter()), SimpleNamespace(kind=kind))
+        await silent_event(SimpleNamespace(sub=SLACK_SUB, adapter=_Adapter()), SimpleNamespace(kind="heartbeat"))
+        self.assertEqual(self.questions_settled, ["t_e0c1"] * 2)
+
+    async def test_a_failed_settle_still_delivers(self):
+        async def settle_question(adapter, sub):
+            raise RuntimeError("boom")
+
+        self.modules["gateway.slack_ux_moments"].settle_question = settle_question
+        adapter = _Adapter()
+        result = await self._notes_then_report(adapter)
+        self.assertTrue(result.success)
+        self.assertEqual(len(adapter.sent), 2)
+
+    async def test_other_terminal_kinds_never_ask(self):
+        await self._notes_then_report(_Adapter())
+        self.assertEqual(self.asked, [])
+
+    async def test_an_opened_pr_follows_the_note_and_the_report(self):
+        adapter = _Adapter()
+        await self._notes_then_report(adapter, report=f"Done. {self.PR_NOTE}")
+        self.assertEqual(
+            [(text, sent) for _task, text, sent in self.announced],
+            [("Checking seeded-a.", 1), (self.PR_NOTE, 1), (f"Done. {self.PR_NOTE}", 2)],
+        )
+
+    async def test_a_long_note_is_scanned_whole(self):
+        # The rolling line clips at 300 characters, cutting a url past it whole.
+        note = "Reconciled the overlays. " * 13 + self.PR_NOTE
+        await deliver(SimpleNamespace(), _Adapter(), SLACK_SUB, "heartbeat", _beat(1, note), "", None, HEADER)
+        self.assertEqual([text for _task, text, _sent in self.announced], [note])
+
+    async def test_a_failed_send_announces_nothing(self):
+        class _Refusing(_Adapter):
+            async def send(self, chat_id, content, metadata=None):
+                return _Result(False, error="channel_not_found")
+
+        await self._notes_then_report(_Refusing())
+        self.assertEqual(self.announced, [])
+
+    async def test_other_platforms_never_reach_the_moments(self):
+        await self._notes_then_report(_Adapter(), sub=SUB)
+        await self._blocked(_Adapter(), {"kind": "needs_input", "reason": "Which?"}, sub=SUB)
+        self.assertEqual((self.asked, self.announced), ([], []))
+
+    async def test_flag_off_posts_exactly_what_it_did_before(self):
+        self.flag = False
+        payload = {"kind": "needs_input", "reason": "Which cluster?"}
+        with_module, without = _Adapter(), _Adapter()
+        await self._notes_then_report(with_module)
+        await self._blocked(with_module, payload)
+        with mock.patch.dict(sys.modules, {name: None for name in self.modules}):
+            await self._notes_then_report(without)
+            await self._blocked(without, payload)
+        self.assertEqual((with_module.sent, with_module.edits), (without.sent, without.edits))
+        self.assertEqual((self.asked, self.announced, self.questions_settled), ([], [], []))
+
+
+class _SlackClient:
+    def __init__(self, adapter):
+        self.adapter = adapter
+
+    async def chat_postMessage(self, **kwargs):
+        self.adapter.posts.append(kwargs)
+        return {"ts": "1790717880.000300"}
+
+    async def chat_update(self, **kwargs):
+        self.adapter.updates.append(kwargs)
+
+
+class _SlackAdapter(_Adapter):
+    """A Slack adapter: the moments module posts and updates through its client."""
+
+    def __init__(self):
+        super().__init__()
+        self.posts = []
+        self.updates = []
+
+    def _get_client(self, chat_id, team_id=None):
+        return _SlackClient(self)
+
+
+class TypedAnswerSettlesTheQuestionTest(unittest.IsolatedAsyncioTestCase):
+    """KAGE_SLACK_UX on: a card unblocked by a typed answer takes its question's buttons off.
+
+    Upstream claims ``unblocked`` but formats it to None, so ``_send_pings``
+    skips it before ``deliver`` and only the applier's silent-kind hook passes
+    it on. This runs the applied notifier with the real ``deliver``,
+    ``silent_event`` and ``slack_ux_moments``: the question posts on
+    ``blocked`` and loses its buttons and "waiting on you" on ``unblocked``,
+    not at the card's next delivered event.
+    """
+
+    QUESTION = {"kind": "needs_input", "reason": "Which cluster should I check first?\n- seeded-a\n- seeded-b"}
+
+    def setUp(self):
+        self.flag = "1"
+        test = self
+
+        async def settle_delegated(adapter, sub, kind, board=None):
+            return None
+
+        reactions = SimpleNamespace(
+            enabled=lambda: test.flag == "1", settle_delegated=settle_delegated,
+        )
+        modules = {
+            "gateway": SimpleNamespace(
+                slack_ux_reactions=reactions,
+                slack_ux_moments=slack_ux_moments,
+                kanban_progress_lines=kanban_progress_lines,
+            ),
+            "gateway.slack_ux_reactions": reactions,
+            "gateway.slack_ux_moments": slack_ux_moments,
+            "gateway.kanban_progress_lines": kanban_progress_lines,
+        }
+        for patcher in (
+            mock.patch.dict(sys.modules, modules),
+            mock.patch.object(slack_ux_moments, "_moments", slack_moments),
+            mock.patch.object(slack_ux_moments, "_presenter", slack_presenter),
+            mock.patch.object(slack_ux_moments, "_questions", type(slack_ux_moments._questions)()),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _notification(self, adapter):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root)
+        (root / "gateway").mkdir()
+        (root / "tools").mkdir()
+        # The fixture's _send_pings ends at the skip; upstream sends what it did not skip.
+        (root / applier.NOTIFIER_RELATIVE).write_text(
+            _notifier_source(True) + "            await self._send_event(ev, msg)\n"
+        )
+        (root / applier.SCHEMAS_RELATIVE).write_text(_SCHEMAS_SOURCE)
+        applier.apply(root)
+        path = root / applier.NOTIFIER_RELATIVE
+        namespace = {}
+        exec(compile("from typing import Any, Callable\n" + path.read_text(), str(path), "exec"), namespace)
+        formatters = namespace["_EVENT_FORMATTERS"]
+        formatters["blocked"] = lambda ev, n: (f"⏸ {n.head} blocked", None, None)
+        notification = namespace["_KanbanNotification"](SimpleNamespace(), {})
+        notification.sub, notification.adapter = SLACK_SUB, adapter
+        notification.board_slug, notification.title = "default", "Pick a cluster"
+        # Upstream's format_event, reduced: a kind with no formatter is silent.
+        notification.format_event = lambda ev: (
+            formatters[ev.kind](ev, notification)[0] if ev.kind in formatters else None
+        )
+        return notification
+
+    async def _ask_then_unblock(self, adapter):
+        notification = self._notification(adapter)
+        with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": self.flag}):
+            notification.events = [SimpleNamespace(id=3, kind="blocked", payload=self.QUESTION)]
+            await notification._send_pings()
+            posted = list(adapter.posts)
+            notification.events = [SimpleNamespace(id=4, kind="unblocked", payload=None)]
+            await notification._send_pings()
+        return posted
+
+    async def test_an_unblocked_card_takes_the_buttons_off_its_question(self):
+        adapter = _SlackAdapter()
+        posted = await self._ask_then_unblock(adapter)
+        self.assertEqual(len(posted), 1)
+        self.assertTrue(_choices(posted[0]["blocks"]))
+        self.assertEqual(len(adapter.updates), 1, "the unblock left the question's buttons live")
+        settled = adapter.updates[0]
+        self.assertEqual(settled["ts"], "1790717880.000300")
+        self.assertEqual(_choices(settled["blocks"]), [])
+        self.assertNotIn(
+            slack_presenter.WAITING_BLOCK_ID, [block.get("block_id") for block in settled["blocks"]],
+        )
+        self.assertEqual(adapter.sent, [])
+
+    async def test_flag_off_the_unblock_touches_nothing(self):
+        self.flag = "0"
+        adapter = _SlackAdapter()
+        await self._ask_then_unblock(adapter)
+        self.assertEqual((adapter.posts, adapter.updates), ([], []))
+        self.assertEqual(len(adapter.sent), 1)
+
+
+def _choices(blocks):
+    return [
+        element for block in blocks if block.get("type") == "actions"
+        for element in block.get("elements") or ()
+        if slack_presenter.CHOICE_ACTION_ID_PATTERN.search(str(element.get("action_id") or ""))
+    ]
+
+
+class ReplayedUnblockTest(TypedAnswerSettlesTheQuestionTest):
+    """A rewound claim replays its batch: a replayed ``unblocked`` must not undo the ``blocked`` after it.
+
+    Upstream skips a ping already sent by ``last_ping_event_id``; a silent kind
+    is never recorded there. ``record`` False is a send whose ping record
+    failed, so ``last_ping_event_id`` lags the ``blocked`` that was sent.
+    """
+
+    SECOND = {"kind": "needs_input", "reason": "Which namespace?\n- default\n- prod"}
+
+    def _replaying(self, adapter, record):
+        notification = self._notification(adapter)
+        notification.sub = dict(SLACK_SUB)
+        sent = notification._send_event
+
+        async def send(ev, msg):
+            if ev.id <= notification.sub.get("last_ping_event_id", 0):
+                return  # upstream's dedup, ahead of the send
+            await sent(ev, msg)
+            if record:
+                notification.sub["last_ping_event_id"] = ev.id
+
+        notification._send_event = send
+        return notification
+
+    async def _deliver(self, notification, events):
+        notification.events = events
+        notification.d = {"events": events}
+        await notification._send_pings()
+
+    async def _ask_again_then_replay(self, record):
+        adapter = _SlackAdapter()
+        notification = self._replaying(adapter, record)
+        batch = [
+            SimpleNamespace(id=4, kind="unblocked", payload=None),
+            SimpleNamespace(id=5, kind="blocked", payload=self.SECOND),
+        ]
+        with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "1"}):
+            await self._deliver(notification, [SimpleNamespace(id=3, kind="blocked", payload=self.QUESTION)])
+            await self._deliver(notification, batch)
+            # The wake was not accepted: the claim rewinds and the same batch is delivered again.
+            await self._deliver(notification, batch)
+        return adapter, notification, batch
+
+    async def test_a_replayed_unblock_leaves_the_later_question_open(self):
+        adapter, _notification, _batch = await self._ask_again_then_replay(record=True)
+        self.assertEqual([entry[0] for entry in slack_ux_moments._questions.values()], [5])
+        self.assertEqual(len(adapter.updates), 1, "the replay settled the question the later block posted")
+
+    async def test_the_retried_wake_keeps_its_no_re_ask_note(self):
+        _adapter, notification, batch = await self._ask_again_then_replay(record=True)
+        text = slack_ux_moments.wake_text(notification.sub, batch, ["blocked"], "W")
+        self.assertIn(slack_ux_moments.WAKE_NOTE, text)
+
+    async def test_a_replayed_unblock_leaves_the_question_open_when_the_ping_record_lags(self):
+        # The lagging record re-sends blocked 5; unguarded, the replayed unblock
+        # first settles its question, so the user is asked it a second time.
+        adapter, notification, batch = await self._ask_again_then_replay(record=False)
+        self.assertEqual((len(adapter.posts), len(adapter.updates)), (2, 1))
+        self.assertEqual([entry[0] for entry in slack_ux_moments._questions.values()], [5])
+        text = slack_ux_moments.wake_text(notification.sub, batch, ["blocked"], "W")
+        self.assertIn(slack_ux_moments.WAKE_NOTE, text)
 
 
 if __name__ == "__main__":

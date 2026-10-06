@@ -343,7 +343,8 @@ class InjectLaneExclusionTest(unittest.TestCase):
         excluded = self.excluded_entries()
         self.assertTrue(excluded, "the exclusions file parsed to no entries")
         self.assertEqual(lines_tagged(result, "TASK"), [e for e in presubmit_entries() if e not in excluded])
-        for name in eval_rosters.inject_lane_exclusions():
+        # A nightly-only exclusion has nothing to leave on the presubmit tier.
+        for name in (n for n in eval_rosters.inject_lane_exclusions() if n in eval_rosters.presubmit_cases()):
             self.assertIn(f"AGENT_TRANSPORT=inject: {name} leaves the matrix", result.stdout)
         # The roster FILE is untouched (an exclusion is not a demotion), but
         # the export leaves the dropped names out: a roster name the suite
@@ -366,6 +367,8 @@ class InjectLaneExclusionTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         excluded = self.excluded_entries()
         self.assertEqual(lines_tagged(result, "TASK"), [e for e in presubmit_entries() + nightly_entries() if e not in excluded])
+        for name in eval_rosters.inject_lane_exclusions():
+            self.assertIn(f"AGENT_TRANSPORT=inject: {name} leaves the matrix", result.stdout)
 
     def scratch(self, mutate, env) -> subprocess.CompletedProcess:
         with tempfile.TemporaryDirectory() as tmp:

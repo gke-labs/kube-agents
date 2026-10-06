@@ -106,6 +106,9 @@ ADDED_AFTER_THE_SPLIT = [
     "upgrades-master-behind-offered-elsewhere",  # the patch collector's §3.1 route check, with patch_readiness.py
     "obtainability-planted-orphan-service",  # the obtainability collector's §3.16 check, with collect.py
     "obtainability-declared-intent-no-finding",  # #1341 criterion 4, activated with its declared-no-pdb-workload fixture (#1409)
+    "compliance-declared-intent-no-finding",  # the compliance stream's declared-intent step over the same fixture (#1408)
+    "compliance-declared-token-shields-siblings",  # the compliance stream's other posture, over the declared-token-workload fixture (#1408)
+    "patch-declared-intent-no-finding",  # the patch stream's declared-intent step, over seeded-c's missing upgrade notifications (#1408)
 ]
 # Appended at the tail of the nightly file.
 ADDED_AT_THE_TAIL = [
@@ -148,7 +151,13 @@ ADDED_AFTER_THE_MOVE = [
     "platform-worker-refuses-shipped-skill-edit",  # skill governance, #1848
     "chat-voice-ack-names-target",  # the front door's delegation ack
     "bootstrap-inventory-ranking-delivery",  # the onboarding prioritization stage, #2143
+    "chat-question-wake-stays-silent",  # SOUL §2 step 5's already-posted rule
+    "chat-question-typed-answer-fresh-session",  # a typed answer from a new thread session
     "platform-worker-shell-edit-of-shipped-skill",  # the sandbox's image trees, #2096
+    "autoops-controller-stall-triage",  # the stall watch on the inject path
+    "chat-voice-retry-says-it-is-retried",  # the front door's reply to a crashed card
+    "chat-voice-final-attempt-is-not-retried",  # the front door's reply to a card's last attempt
+    "chat-voice-failure-leads-with-fact",  # the front door's reply to a blocked card
 ]
 
 # Admitted after the split, each by a pull request that cited the record
@@ -333,7 +342,26 @@ class SplitLostNothingTest(unittest.TestCase):
 # are pinned.
 INJECT_LANE_EXCLUDED = [
     "agent-kanban-smoke",  # #2039: grades kanban_create by the front door; the inject door addresses platform directly
+    "chat-voice-retry-says-it-is-retried",  # #2039: grades the front door's reply to a crashed card's wake; the inject door addresses platform directly
+    "chat-voice-final-attempt-is-not-retried",  # the same for a card's last-attempt wake
+    "chat-voice-failure-leads-with-fact",  # #2039: grades the front door's reply to a blocked card's wake; same door
+    "chat-question-wake-stays-silent",  # #2039: grades the front door's silence on a posted question's wake; same door
+    "chat-question-typed-answer-fresh-session",  # the same for a typed answer in a session the wake never reached
 ]
+# The directives a case's prompt opens with to replay a wake into the chat
+# front door (bench/kube_agents_bench/card_wake.py); the harness errors such
+# a run on any transport but api.
+FRONT_DOOR_WAKE_DIRECTIVES = ("[bench:card-failure-wake]", "[bench:slack-question-wake]")
+# Each exclusion's api-lane tier, pinned beside it: an entry is not a
+# demotion, so a case that leaves its tier's file while still excluded reds.
+INJECT_LANE_EXCLUDED_TIER = {
+    "agent-kanban-smoke": "presubmit",
+    "chat-voice-retry-says-it-is-retried": "nightly",
+    "chat-voice-final-attempt-is-not-retried": "nightly",
+    "chat-voice-failure-leads-with-fact": "nightly",
+    "chat-question-wake-stays-silent": "nightly",
+    "chat-question-typed-answer-fresh-session": "nightly",
+}
 
 
 class InjectLaneExclusionsTest(unittest.TestCase):
@@ -383,13 +411,32 @@ class InjectLaneExclusionsTest(unittest.TestCase):
                 self.assertTrue(reason, f"{case}: no reason in the comment block above it")
                 self.assertRegex(reason, eval_rosters.ISSUE_REFERENCE_RE, f"{case}: the reason names no issue")
 
+    def test_every_registered_wake_replay_is_excluded(self):
+        # A replay errors on the inject lane, so an unlisted one reds there
+        # every repetition; the docs' rule is enforced here, on the loaded
+        # prompt's first line as card_wake.parse reads it.
+        import yaml
+
+        excluded = eval_rosters.inject_lane_exclusions()
+        for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):
+            doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+            lines = str(doc.get("prompt") or "").strip().splitlines()
+            if lines and lines[0].strip() in FRONT_DOOR_WAKE_DIRECTIVES:
+                with self.subTest(case=case):
+                    self.assertIn(case, excluded, f"{case} replays a wake but is not in {eval_rosters.INJECT_LANE_EXCLUSIONS_FILE.name}")
+
     def test_an_exclusion_is_not_a_demotion(self):
-        # The api lane's roster is untouched by an entry here: the excluded
-        # case still runs on every pull request and can still red one.
-        for case in INJECT_LANE_EXCLUDED:
-            with self.subTest(case=case):
-                self.assertIn(case, eval_rosters.presubmit_cases())
-                self.assertIn(case, eval_rosters.blocking_roster())
+        # The api lane's roster is untouched by an entry here: an excluded
+        # presubmit case still runs on every pull request and can still red
+        # one, and an excluded nightly case still runs every night.
+        self.assertEqual(sorted(INJECT_LANE_EXCLUDED_TIER), sorted(INJECT_LANE_EXCLUDED))
+        for case, tier in INJECT_LANE_EXCLUDED_TIER.items():
+            with self.subTest(case=case, tier=tier):
+                if tier == "presubmit":
+                    self.assertIn(case, eval_rosters.presubmit_cases())
+                    self.assertIn(case, eval_rosters.blocking_roster())
+                else:
+                    self.assertIn(case, eval_rosters.nightly_cases())
 
 
 # The inject lane's safeguards at their introduction (#2079, 2026-09-28): the

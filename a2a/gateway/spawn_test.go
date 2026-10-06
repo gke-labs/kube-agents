@@ -292,6 +292,92 @@ func TestSpawnedSessionsCarryNoBusPasswordAndAPodBoundTokenInstead(t *testing.T)
 	}
 }
 
+// TestClusterViewProjectsOnlyTheSessionAudience: with the view on, the pod
+// gains exactly one more projected token (the broker's session audience) and
+// the broker env; automount stays false and no default-audience token exists.
+func TestClusterViewProjectsOnlyTheSessionAudience(t *testing.T) {
+	cs := k8sfake.NewSimpleClientset()
+	cfg := &Config{Namespace: "test-ns", WorkerImage: "img", SessionServiceAccount: "agent-a2a-session",
+		TaskDeadline: 15 * time.Minute, NATSURL: "nats://bus:4222",
+		SessionClusterView: true, CredentialProxyURL: "http://agent-credential-proxy.test-ns.svc.cluster.local:8765"}
+	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-9", BusSession: "chat-otter-1a2b", Addressee: "chat-otter-1a2b"}
+	if _, err := s.Spawn(context.Background(), rec, "task-9", "", 1); err != nil {
+		t.Fatal(err)
+	}
+	pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-1a2b", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
+		t.Fatal("automount is not false with the view on")
+	}
+	audiences := map[string]*corev1.ProjectedVolumeSource{}
+	for _, v := range pod.Spec.Volumes {
+		if v.Projected == nil {
+			continue
+		}
+		for _, src := range v.Projected.Sources {
+			if src.ServiceAccountToken != nil {
+				audiences[src.ServiceAccountToken.Audience] = v.Projected
+			}
+		}
+	}
+	if len(audiences) != 2 || audiences[lib.BusTokenAudience] == nil || audiences[credentialProxySessionAudience] == nil {
+		t.Fatalf("projected audiences = %v, want exactly the bus and the session audience", audiences)
+	}
+	if mode := audiences[credentialProxySessionAudience].DefaultMode; mode == nil || *mode != credentialProxyTokenMode {
+		t.Errorf("session token mode = %v, want %o (uid 1000 reads a root-written file)", mode, credentialProxyTokenMode)
+	}
+	c := pod.Spec.Containers[0]
+	env := map[string]string{}
+	for _, e := range c.Env {
+		env[e.Name] = e.Value
+	}
+	if env["CREDENTIAL_PROXY_URL"] != cfg.CredentialProxyURL ||
+		env["CREDENTIAL_PROXY_TOKEN_FILE"] != credentialProxyTokenMountPath+"/"+credentialProxyTokenFile ||
+		env["HERMES_HOME"] != sessionHermesHome || env[lib.EnvClusterView] != "true" {
+		t.Fatalf("cluster-view env = %v", env)
+	}
+	var mounted bool
+	for _, m := range c.VolumeMounts {
+		if m.MountPath == credentialProxyTokenMountPath && m.ReadOnly {
+			mounted = true
+		}
+	}
+	if !mounted {
+		t.Fatal("the session token is not mounted read-only at the path the shim reads")
+	}
+}
+
+// TestNoClusterViewSpawnsTodaysPod: the flag off renders the pod exactly as
+// before - no broker env, one projected audience.
+func TestNoClusterViewSpawnsTodaysPod(t *testing.T) {
+	cs := k8sfake.NewSimpleClientset()
+	cfg := &Config{Namespace: "test-ns", WorkerImage: "img", SessionServiceAccount: "agent-a2a-session",
+		TaskDeadline: 15 * time.Minute, NATSURL: "nats://bus:4222"}
+	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-9", BusSession: "chat-otter-1a2b", Addressee: "chat-otter-1a2b"}
+	if _, err := s.Spawn(context.Background(), rec, "task-9", "", 1); err != nil {
+		t.Fatal(err)
+	}
+	pod, _ := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-1a2b", metav1.GetOptions{})
+	for _, e := range pod.Spec.Containers[0].Env {
+		if strings.HasPrefix(e.Name, "CREDENTIAL_PROXY_") || e.Name == lib.EnvClusterView || e.Name == "HERMES_HOME" {
+			t.Errorf("%s rendered with the view off", e.Name)
+		}
+	}
+	n := 0
+	for _, v := range pod.Spec.Volumes {
+		if v.Projected != nil {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("%d projected volumes with the view off, want 1", n)
+	}
+}
+
 // mintSessionName is load-bearing for the callout in a way it was not before,
 // and it had no test.
 //

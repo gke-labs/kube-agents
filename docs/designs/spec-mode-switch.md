@@ -101,7 +101,9 @@ hanging at the dial. Found live during stage 1 bring-up (8/26).
   strips it silently and the author never hears anything. A reservation that only starts
   reserving once the thing exists is not a reservation.
 - `next`: everything above, plus the NATS component and the gateway skeleton. Next is
-  additive - today's path keeps running until stage 4 starts retiring pieces.
+  additive - today's path keeps running until stage 4 starts retiring pieces - with one
+  exception: Google Chat, which `next` moves from the Hermes platform to the A2A gateway
+  (`spec-chatops-gateway.md`, "Coexistence is by mode").
 
 One thing `next` does not ship: long-term audit. The stream is a 72h ring buffer and
 the audit exporter is stage 2 scope, so `next` has no archive - the NATS spec's audit
@@ -141,10 +143,12 @@ default posture). Until then, flipping it is a `kubectl patch` on the PlatformAg
 Helm 3's three-way merge leaves fields the chart never sets alone, so a patched mode
 should survive chart upgrades.
 
-## One thing inside `next` has its own switch
+## Switches inside `next`
 
 The A2A gateway's inject door (`spec-chatops-gateway.md`, "The test backend") renders only
-when the OPERATOR carries `A2A_INJECT_BACKEND=true`, on top of `spec.mode: next`. That is not a
+when the OPERATOR carries `A2A_INJECT_BACKEND=true`, on top of `spec.mode: next`, and its A2A
+door for agent callers (`spec-chatops-gateway.md`, "The A2A door") only under
+`A2A_AGENT_DOOR=true`, the same way. That is not a
 second mode mechanism and does not belong in the field this document defines. The door takes the
 principal it acts as out of a request body, so a CRD field would put "render the eval door" in
 the API a cluster's owner edits and the operator would be obliged to honour it. Whether an
@@ -152,6 +156,32 @@ install is an eval install is a property of who deployed the operator, which is 
 image overrides are already decided. The operator's render tests check that the flag unset
 renders no part of the door, and the conformance suite that every render site consults the flag
 and that the flag is not a CRD field.
+
+A second switch of the same kind: `A2A_SESSION_CLUSTER_VIEW=true` on the operator, on top of
+`spec.mode: next`, gives the session pods the gateway spawns a temporary read-only view of the
+clusters. The operator names the session ServiceAccount on the credential broker's allowed
+callers, renders a session audience the broker maps to a role that reaches the exec route for
+`kubectl` and `gcloud` only, binds the two so that ServiceAccount may present only that audience
+and no other caller may present it, opens the broker's ingress and the session pod's egress to each
+other, and tells the gateway, whose spawner projects the audience-bound token and enables the
+worker's shell. The session ServiceAccount gains no RBAC in either state; `kubectl` runs in the
+broker, read-only in verbs, and with the broker's permissions: under a `custom` permission set
+with an admin role the broker's allowlist is the only control and `kubectl get secret` returns
+data, as
+[credential isolation](../site/src/content/docs/reference/credential-isolation.md#pod-anatomy)
+says of the platform agent. A session holds at most `CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_COMMANDS` broker commands at once (default 2; the operator's `spec.deployment.env` reaches it), so a conversation cannot take the whole command pool from the platform agent's shell. Operator-level for the reason above: the pod executes model output, and
+widening its fence is a property of who deployed the operator. Under the flag a session reads clusters with the platform agent's broker scope, and the only gate
+between a person and that read is the gateway's ingress allowlist. That differs from the design of
+record ([architecture 02](../architecture/02-agent-personas.md) §2.4,
+[03](../architecture/03-security-model.md) §4a, and "Sessions by default" in
+`spec-chatops-gateway.md`), where a session reaches cluster data only through a gateway-minted
+child task and the gateway checks the target agent's `AllowedUsers` against the requester first.
+Today the two gates admit the same people, because the ingress allowlist is the only human-to-agent
+check the gateway enforces. It is a demo aid with two retirement triggers, whichever lands first:
+declarative profiles carrying a session's identity and tools, and gateway-side `AllowedUsers`
+enforcement ([architecture 07](../architecture/07-implementation-roadmap.md)); once the gateway
+refuses a person for the platform agent, a session with this view would read its clusters anyway,
+so the flag goes before that enforcement ships.
 
 ## Per-feature overrides - sketched, not built
 

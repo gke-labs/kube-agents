@@ -1145,6 +1145,11 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         )
         self.assertNotEqual(redaction_at, -1, "uninstall.sh must blank the LITELLM_REDACTION_* keys")
         self.assertLess(redaction_at, call_at)
+        # The scoped service account pool too: the generator refuses a
+        # misspelt switch or a malformed cap, and the pool goes with the state.
+        pool_at = text.find('export SCOPED_SA_POOL_ENABLED="false" SCOPED_SA_POOL_MAX_ACCOUNTS=""')
+        self.assertNotEqual(pool_at, -1, "uninstall.sh must blank the SCOPED_SA_POOL_* keys")
+        self.assertLess(pool_at, call_at)
 
 
 class UninstallSummaryDisclosureTest(unittest.TestCase):

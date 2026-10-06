@@ -169,7 +169,8 @@ MUTATIONS: list[Mutation] = [
          '                    "Identity and API server address belong to the broker. Remove "\n'
          '                    "--server, --token, --user, --client-certificate, "\n'
          '                    "--insecure-skip-tls-verify and the other credential flags to "\n'
-         '                    "use the cluster and identity the proxy configured."\n'
+         '                    "use the cluster and identity the proxy configured. "\n'
+         '                    + _FLAG_BOUNDARY_NOTICE\n'
          '                ),\n',
          '                message="",\n'),
         "test_A1_a_refusal_names_the_rule_that_fired",
@@ -286,6 +287,20 @@ MUTATIONS: list[Mutation] = [
         "rename the minted-RBAC ceiling test. A2 has no mechanism of its own to "
         "assert, so it borrows C5's assertion by name; the borrow is what breaks "
         "first, and it has to break loudly or A2 falls off the map",
+    ),
+    Mutation(
+        "A3-slack-click-authorization",
+        "deploy/docker/patches/slack_ux_clicks.py",
+        ("    started = await adapter._begin_interaction(ack, body, action, kind)\n",
+         "    started = await adapter._begin_interaction(ack, body, action, kind) or (\n"
+         "        body.get(\"team\", {}).get(\"id\"), action[\"action_id\"], action.get(\"value\"),\n"
+         "        body[\"message\"], body[\"message\"][\"ts\"], body[\"channel\"][\"id\"],\n"
+         "        body[\"user\"][\"id\"], body[\"user\"][\"id\"],\n"
+         "    )\n"),
+        "test_A3_an_unlisted_users_click_changes_nothing",
+        "fall back to the payload's own user when the adapter declines, the "
+        "'make the button work for everyone who can see it' shortcut: an "
+        "unlisted user's click then runs as their turn",
     ),
     # ---- B. The write path ----------------------------------------------
     Mutation(
@@ -1175,6 +1190,54 @@ Mutation(
         "passes on a resolver that defaults",
     ),
     Mutation(
+        "A3-a2a-door-always-rendered",
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ("\tif a2aAgentDoorEnabled() {\n\t\tinjectEnv = append(injectEnv,",
+         "\tif true {\n\t\tinjectEnv = append(injectEnv,"),
+        "test_A3_the_a2a_door_renders_only_under_the_operator_flag",
+        "render the A2A door's env, port and principal-map mount on every "
+        "mode: next gateway rather than only under the operator's flag. The "
+        "door resolves a caller the request names into an eval identity, so "
+        "an install that never asked for it must not carry it; the "
+        "conformance test is the one that has to notice, from the source, "
+        "that the render consults the flag",
+    ),
+    Mutation(
+        "A3-a2a-door-flag-fails-open",
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ('\treturn os.Getenv(a2aAgentDoorEnvVar) == "true"',
+         "\treturn os.Getenv(a2aAgentDoorEnvVar) != \"\""),
+        "test_A3_the_a2a_door_flag_is_not_a_field_a_customer_can_set",
+        "make the A2A door's flag true for any non-empty value, so a typo or "
+        "a stray \"false\" renders the door on an install that never asked "
+        "for one",
+    ),
+    Mutation(
+        "A3-a2a-door-principal-unchecked",
+        "a2a/gateway/gchat.go",
+        ("\tprincipal := g.a2aPM.Resolve(a2aPrincipalPrefix + authorID)\n"
+         "\tif principal == \"\" {\n\t\treturn \"\"\n\t}\n"
+         "\tif !strings.HasPrefix(principal, injectEvalPrincipalPrefix) {",
+         "\tprincipal := g.a2aPM.Resolve(a2aPrincipalPrefix + authorID)\n"
+         "\tif principal == \"\" {\n\t\treturn \"\"\n\t}\n"
+         "\tif false {"),
+        "test_A3_the_a2a_door_cannot_assert_a_cloud_principal",
+        "let the A2A door's principal map resolve to any principal at all; "
+        "the caller names itself in the request, so the map is the only "
+        "thing between a token holder and a principal of their choosing",
+    ),
+    Mutation(
+        "A3-a2a-door-principal-defaulted",
+        "a2a/gateway/gchat.go",
+        ('\t\t\t"caller", authorID, "wantPrefix", injectEvalPrincipalPrefix)\n\t\treturn ""\n\t}',
+         '\t\t\t"caller", authorID, "wantPrefix", injectEvalPrincipalPrefix)\n'
+         "\t\tprincipal = injectEvalPrincipalPrefix + principal\n\t}"),
+        "test_A3_the_a2a_door_cannot_assert_a_cloud_principal",
+        "keep the A2A door's refusal condition and log line but repair the "
+        "value into the eval namespace instead of dropping it, so a map entry "
+        "naming a cloud identity is still honoured",
+    ),
+    Mutation(
         "C1-session-fence-selector-drift",
         "a2a/gateway/spawn.go",
         ('\tsessionRole = "a2a-session"', '\tsessionRole = "a2a-worker"'),
@@ -1209,6 +1272,55 @@ Mutation(
         "so automount staying off would stop meaning anything -- and this is "
         "the quiet version, because the pod keeps exactly one token file at "
         "exactly the path the worker reads",
+    ),
+    Mutation(
+        "C1-session-token-for-a-third-audience",
+        "a2a/gateway/spawn.go",
+        ("Audience:          credentialProxySessionAudience,",
+         'Audience:          "kubeagents-credential-proxy",'),
+        "test_C1_a_session_pod_carries_no_kubernetes_identity",
+        "mint the session pod's broker token for the shell's audience instead "
+        "of the session one. The broker's session-callers binding would refuse "
+        "that token at authentication, so this is the fence test's own layer "
+        "being checked, not the broker's. The fence test "
+        "accepts exactly two audiences by constant name, the bus and the "
+        "broker's session audience; a literal third is a destination the "
+        "fence never admitted, and this is the quiet version because the pod "
+        "still holds exactly two tokens at exactly the paths the clients read",
+    ),
+    Mutation(
+        "C1-session-broker-audience-renamed-in-the-spawner",
+        "a2a/gateway/spawn.go",
+        ('credentialProxySessionAudience        = "kubeagents-credential-proxy-session"',
+         'credentialProxySessionAudience        = "kubeagents-credential-proxy-sessions"'),
+        "test_C1_the_session_broker_audience_and_view_env_agree_across_the_module_boundary",
+        "pluralise the audience in the module that projects it. The operator "
+        "keeps telling the broker to accept the singular, the broker's "
+        "TokenReview names the singular, so every session pod's kubectl is "
+        "refused as an unknown audience -- with both Go suites green, because "
+        "each module's test compares its constant to itself",
+    ),
+    Mutation(
+        "C1-shim-token-env-renamed-in-the-spawner",
+        "a2a/gateway/spawn.go",
+        ('Name: "CREDENTIAL_PROXY_TOKEN_FILE"', 'Name: "CREDENTIAL_PROXY_TOKEN_PATH"'),
+        "test_C1_the_session_broker_audience_and_view_env_agree_across_the_module_boundary",
+        "rename the shim's token-file variable in the module that sets it. The "
+        "shim keeps reading CREDENTIAL_PROXY_TOKEN_FILE, finds nothing, sends no "
+        "Authorization header, and every brokered command from every session "
+        "pod is a 401 -- with the Go suite and the Python suite both green, "
+        "because neither names the other's spelling",
+    ),
+    Mutation(
+        "C1-cluster-view-env-renamed-on-the-gateway-side",
+        "a2a/gateway/config.go",
+        ('os.Getenv("A2A_SESSION_CLUSTER_VIEW")', 'os.Getenv("A2A_SESSION_VIEW")'),
+        "test_C1_the_session_broker_audience_and_view_env_agree_across_the_module_boundary",
+        "shorten the flag's name in the module that reads it. The operator "
+        "still renders the long name, so the gateway reads false and spawns "
+        "today's pod on every flag-on install, and nothing says so: the "
+        "quietest drift of the three, which is why it is pinned beside the "
+        "audience",
     ),
     Mutation(
         "C1-session-account-gets-rbac",

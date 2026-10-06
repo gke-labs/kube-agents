@@ -54,6 +54,11 @@ references.
 `prompt` is what the agent is given. Write it as the user would write it, not as a
 checklist — a prompt that enumerates the answer measures instruction-following rather
 than the journey. `{{CLUSTER_NAME}}` and `{{PROJECT_ID}}` are substituted by the runner.
+A first line of `[bench:card-failure-wake]` or `[bench:slack-question-wake]` makes the run a
+replay of a card's wake rather than an ask
+([`bench/kube_agents_bench/card_wake.py`](../../bench/kube_agents_bench/card_wake.py)); a replay
+runs only over the api transport and errors under any other `AGENT_TRANSPORT`, so the case also
+needs an entry in `hack/eval/inject-lane-exclusions.txt`.
 
 `expected_output` is the judge's reference. It feeds `OutcomeValidity` and, where the
 case declares `documentation.constraints`, `ChecklistScore`. It never gates a case that
@@ -170,14 +175,15 @@ deployment's ready replicas land in a range). A fourth, `fleet_resource_property
 this repository's `resource_property` against the seeded-fleet cluster that carries a
 fixture role, named by `fixture_role:` rather than by cluster.
 
-Seven read what the run produced, from this repository
+Nine read what the run produced, from this repository
 (`bench/kube_agents_bench/verifiers.py`, registered through the
 `devops_bench.verifiers` entry-point group in `bench/pyproject.toml`):
 `report_contains` (phrases in the agent's answer; its `forbidden_patterns` and
 `required_patterns` are regular expressions, for what no substring can express: a
 banned word whose negated uses are legitimate, or a value only the work produces,
 such as a 32-hex trace id, where the words around it are the prompt's own and a
-report of failure would echo them), `tool_called` (calls in the
+report of failure would echo them, and its `any_of_patterns` are regular-expression
+alternatives to `any_of_phrases`, for a phrase that must start at a word boundary), `tool_called` (calls in the
 trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
 published), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier
@@ -185,14 +191,16 @@ repetition's, unless the case sets `accepts_stream_pull_request` and runs on an 
 prefix written to the case's GitOps repository since the repetition started; it
 passes on a write, so a case wraps it in `none` to say the agent wrote nothing
 it was not asked for, and the inject lane appends exactly that entry to every
-case it runs), and `worker_commands` (regular expressions over the terminal commands
+case it runs), `worker_commands` (regular expressions over the terminal commands
 the delegated workers ran, read from each card's worker log before the harness
 purges it; its `exempt_patterns` leave a command out before the required and
 forbidden lists run, for a command that can fetch and send nothing but carries a
-forbidden word as its argument, such as a plain `grep` for it), and `worker_agents`
+forbidden word as its argument, such as a plain `grep` for it), `worker_agents`
 (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
-workers' trajectory entries).
+workers' trajectory entries), `replay_card` (the status and comments of the card a
+card-wake replay planted, read before the harness archives it), and `reply_is_silent`
+(whether the gateway would post the closing message at all, by its own silence rule).
 
 Five read the install under test, all from the same file. `bootstrap_fanout` compares the
 cards the onboarding discovery sweep filed, read from the agent pod's board, against the

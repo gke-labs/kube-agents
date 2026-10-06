@@ -469,10 +469,12 @@ func buildCredentialProxyFederationVolume(agent *agentv1alpha1.PlatformAgent) []
 }
 
 // buildCredentialProxyNetworkPolicy narrows who may reach the endpoint down to
-// the two callers that have a reason to: the sandbox, whose wrapped CLIs are the
-// proxy's purpose, and the gateway, which pulls chat events from the relay
-// hosted here. TokenReview already rejects a caller this pod does not serve;
-// this is the layer that keeps such a caller from opening the connection.
+// the callers that have a reason to: the sandbox, whose wrapped CLIs are the
+// proxy's purpose; the gateway, which pulls chat events from the relay hosted
+// here; when the next stack takes Google Chat, the A2A gateway, which pulls the
+// same relay's A2A routes; and, under the cluster-view flag, the session pods.
+// TokenReview already rejects a caller this pod does not serve; this is the
+// layer that keeps such a caller from opening the connection.
 //
 // A second rule admits the managed-Prometheus collector, from its own
 // namespace and to the metrics-only port alone: the runtime serves its counters
@@ -485,10 +487,37 @@ func buildCredentialProxyFederationVolume(agent *agentv1alpha1.PlatformAgent) []
 // broker. buildAgentEgressNetworkPolicy enumerates the agent Pod's egress and
 // deliberately leaves this one alone.
 //
+// The session-pod peer admitted under the cluster-view flag is the bare
+// part-of/component pair, because the spawner stamps no instance label. The
+// webhook admits one PlatformAgent per cluster, so no other agent's session
+// pods share this namespace; were that rule relaxed, this fence would admit
+// them too, and what refuses them is the broker itself: TokenReview against
+// CREDENTIAL_PROXY_ALLOWED_CALLERS and the session-callers binding.
+//
 // Inert on a cluster whose CNI does not implement NetworkPolicy. It is a control
 // where it is enforced and a statement of intent where it is not.
 func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
 	tcp := corev1.ProtocolTCP
+	callers := []networkingv1.NetworkPolicyPeer{
+		{PodSelector: &metav1.LabelSelector{MatchLabels: shellSandboxSelector(agent)}},
+		{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": agent.Name + "-gateway"}}},
+	}
+	// The A2A gateway pod, while its Google Chat adapter pulls the relay
+	// hosted here. The same condition as allowedBrokerCallers: a peer that
+	// is not a caller is a rule with nobody behind it.
+	if a2aChatArmed(agent) {
+		callers = append(callers, networkingv1.NetworkPolicyPeer{
+			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": a2aGatewayName(agent)}},
+		})
+	}
+	if a2aSessionClusterViewEnabled(agent) {
+		// The session pods, under the cluster-view flag: the same selector
+		// the session fence and the bus fence name, on the credentialed port
+		// only. TokenReview, the session audience and the session-callers
+		// binding keep this peer to the session role; this is the layer
+		// that lets it connect.
+		callers = append(callers, networkingv1.NetworkPolicyPeer{PodSelector: &metav1.LabelSelector{MatchLabels: a2aSessionPodSelector()}})
+	}
 	np := &networkingv1.NetworkPolicy{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
 		ObjectMeta: metav1.ObjectMeta{Name: credentialProxyName(agent), Namespace: agent.Namespace},
@@ -497,10 +526,7 @@ func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *netw
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
 			Ingress: []networkingv1.NetworkPolicyIngressRule{
 				{
-					From: []networkingv1.NetworkPolicyPeer{
-						{PodSelector: &metav1.LabelSelector{MatchLabels: shellSandboxSelector(agent)}},
-						{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": agent.Name + "-gateway"}}},
-					},
+					From: callers,
 					Ports: []networkingv1.NetworkPolicyPort{{
 						Protocol: &tcp,
 						Port:     ptr.To(intstr.FromInt32(credentialProxyPort)),

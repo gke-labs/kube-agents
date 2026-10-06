@@ -22,13 +22,17 @@ published* carry the finding — for the fleet audits, whose SOPs deliberately
 keep the chat reply to one line — is the *pull request* the reply links one
 this run opened rather than an earlier one, and did the run *write* to the
 case's GitOps repository at all (``github_writes``, the question the cluster
-safeguards cannot answer). They read the per-run stash in
+safeguards cannot answer), and what a card-wake replay's planted card ended as
+(``replay_card``, read from the trajectory the harness records), and whether
+the front door's reply is one the gateway would suppress (``reply_is_silent``).
+They read the per-run stash in
 :mod:`kube_agents_bench.transcript`, and they fail closed: an empty
 stash is ``status="error"`` — the check could not be evaluated — never a pass
 or a fail, so ``VerificationCoverage`` drops below 1.0 and the gate catches
 it.
 
-The exception, ``fleet_resource_property``, does read cluster state, and exists
+Two read state instead. ``bootstrap_fanout`` reads the agent pod's board and
+profiles. ``fleet_resource_property`` reads a fleet cluster, and exists
 because upstream's ``resource_property`` reads the WRONG cluster and cannot
 tell a missing fixture from a missing cluster. See
 :class:`FleetResourcePropertyVerifier`.
@@ -70,7 +74,7 @@ from devops_bench.verification.base import (
 )
 from devops_bench.verification.verifiers import ResourcePropertyVerifier
 
-from kube_agents_bench import discovery, github_writes, onboarding, transcript
+from kube_agents_bench import card_wake, discovery, gateway_silence, github_writes, onboarding, transcript
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -87,6 +91,8 @@ __all__ = [
     "GitHubWritesVerifier",
     "LedgerIssueContainsVerifier",
     "PullRequestOpenedVerifier",
+    "ReplayCardVerifier",
+    "ReplyIsSilentVerifier",
     "ReportContainsVerifier",
     "SandboxTreeMatchesImageVerifier",
     "ToolCalledVerifier",
@@ -169,6 +175,9 @@ class ReportContainsVerifier(BaseVerifier):
     ``\\n``; the flat collapse would otherwise fuse a negated bullet into
     its unnegated neighbour before the regex runs. The text is lowercased
     before the regex runs, so a pattern spells its letters in lower case.
+    ``any_of_patterns`` are alternatives to ``any_of_phrases`` for the
+    phrase a substring cannot bound: "it stopped" also matches "limit
+    stopped". Each is ``re.search``ed against the flat normalization.
 
     Both sides are normalized first, by ``_normalize`` above: lowercased,
     Markdown emphasis dropped, whitespace runs collapsed. These are the
@@ -196,12 +205,13 @@ class ReportContainsVerifier(BaseVerifier):
     # spellings ("HPA" / "HorizontalPodAutoscaler"), all-of required_phrases
     # would punish a correct report for choosing the other name.
     any_of_phrases: list[str] = Field(default_factory=list)
+    any_of_patterns: list[str] = Field(default_factory=list)
     forbidden_patterns: list[str] = Field(default_factory=list)
     # Each must match somewhere in the report.
     required_patterns: list[str] = Field(default_factory=list)
     scope: Literal["final", "full"] = "final"
 
-    @field_validator("required_patterns", "forbidden_patterns")
+    @field_validator("required_patterns", "forbidden_patterns", "any_of_patterns")
     @classmethod
     def _patterns_compile(cls, patterns: list[str]) -> list[str]:
         for pattern in patterns:
@@ -225,8 +235,9 @@ class ReportContainsVerifier(BaseVerifier):
         present = [p for p in self.forbidden_phrases if _normalize(p) in text]
         pattern_hits = [p for p in self.forbidden_patterns if re.search(p, lines)]
         pattern_missing = [p for p in self.required_patterns if not re.search(p, lines)]
-        any_of_miss = bool(self.any_of_phrases) and not any(
-            _normalize(p) in text for p in self.any_of_phrases
+        any_of_miss = bool(self.any_of_phrases or self.any_of_patterns) and not (
+            any(_normalize(p) in text for p in self.any_of_phrases)
+            or any(re.search(p, text) for p in self.any_of_patterns)
         )
         if missing or present or pattern_hits or pattern_missing or any_of_miss:
             parts = []
@@ -244,7 +255,8 @@ class ReportContainsVerifier(BaseVerifier):
                 )
             if any_of_miss:
                 parts.append(
-                    f"none of the alternative phrasings present: {self.any_of_phrases}"
+                    "none of the alternative phrasings present: "
+                    f"{self.any_of_phrases + self.any_of_patterns}"
                 )
             return VerificationResult(
                 success=False,
@@ -252,10 +264,11 @@ class ReportContainsVerifier(BaseVerifier):
                 reason="; ".join(parts),
             )
         # The success reason has to name every clause that ran, including
-        # any_of_phrases. Counting only required and forbidden made a check
-        # built from any_of alone report "all 0 required phrase(s)", which
-        # reads exactly like a check that asserted nothing -- and the failure
-        # branch above is the only thing that would have said otherwise.
+        # any_of_phrases and any_of_patterns. Counting only required and
+        # forbidden made a check built from any_of alone report "all 0
+        # required phrase(s)", which reads exactly like a check that asserted
+        # nothing -- and the failure branch above is the only thing that would
+        # have said otherwise.
         satisfied = [
             f"all {len(self.required_phrases)} required phrase(s)",
             f"none of {len(self.forbidden_phrases)} forbidden",
@@ -268,9 +281,10 @@ class ReportContainsVerifier(BaseVerifier):
             satisfied.append(
                 f"all {len(self.required_patterns)} required pattern(s)"
             )
-        if self.any_of_phrases:
+        if self.any_of_phrases or self.any_of_patterns:
             satisfied.append(
-                f"at least one of {len(self.any_of_phrases)} alternative phrasing(s)"
+                "at least one of "
+                f"{len(self.any_of_phrases) + len(self.any_of_patterns)} alternative phrasing(s)"
             )
         return VerificationResult(
             success=True,
@@ -847,6 +861,144 @@ class WorkerAgentsVerifier(BaseVerifier):
             elapsed_time=time.monotonic() - start,
             reason=f"all {len(self.required_agents)} required profile pattern(s) matched; workers ran as {agents}",
         )
+
+
+_NO_REPLAY_CARD_REASON = (
+    f"no {card_wake.SETTLED_ENTRY} entry in the trajectory: the prompt was not a "
+    "card-wake replay, so there is no planted card to read"
+)
+_REPLAY_CARD_UNREAD_REASON = (
+    "the replay's card could not be read before it was archived (the read "
+    "failed, no card carried the run's key, or the agent under test archived "
+    "the planted card itself), so its status and comments are unknown"
+)
+_REPLAY_DECOY_UNREAD_REASON = (
+    "the replay's decoy card could not be read (the prompt was not a "
+    "session: fresh replay, or no card carried the decoy's key), so its status is unknown"
+)
+
+
+@VERIFIERS.register("replay_card")
+class ReplayCardVerifier(BaseVerifier):
+    """Checks the card a card-wake replay planted, as the run left it.
+
+    :mod:`kube_agents_bench.card_wake` reads the planted card's status and
+    comments just before archiving it and records them as the trajectory's
+    ``card_wake_settled`` harness entry. ``tool_called`` sees that the agent
+    called ``kanban_unblock``, not which card it unblocked; this reads the
+    planted card itself.
+
+    ``status_in`` / ``status_not_in``: the card's final status must be one of
+    the first and none of the second. ``comment_phrases``: each must appear,
+    case-insensitively, in at least one of the card's comments.
+    ``decoy_status_in``: a fresh-session replay's decoy card, blocked on the
+    same question, must end in one of these; ``tool_called`` passes on an
+    unblock of the decoy, and this does not.
+
+    Fails closed: no entry (not a replay) or an entry whose card was not read
+    is ``status="error"``.
+    """
+
+    type: Literal["replay_card"]
+    status_in: list[str] = Field(default_factory=list)
+    status_not_in: list[str] = Field(default_factory=list)
+    comment_phrases: list[str] = Field(default_factory=list)
+    decoy_status_in: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _asserts_something(self) -> ReplayCardVerifier:
+        if not (self.status_in or self.status_not_in or self.comment_phrases or self.decoy_status_in):
+            raise ValueError("replay_card needs status_in, status_not_in, comment_phrases or decoy_status_in")
+        return self
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+
+        def error(reason: str) -> VerificationResult:
+            return VerificationResult(
+                success=False, status="error", elapsed_time=time.monotonic() - start, reason=reason
+            )
+
+        snap = transcript.get()
+        if snap is None:
+            return error(_NO_TRANSCRIPT_REASON)
+        entries = [e for e in snap.trajectory if e.get("name") == card_wake.SETTLED_ENTRY]
+        if not entries:
+            return error(_NO_REPLAY_CARD_REASON)
+        settled = entries[-1].get("result")
+        if not isinstance(settled, dict):
+            return error(_REPLAY_CARD_UNREAD_REASON)
+        status = settled.get("status")
+        if not isinstance(status, str):
+            # A card found but not read back: ``status_not_in`` would pass it.
+            return error(_REPLAY_CARD_UNREAD_REASON)
+        comments = [str(c.get("body", "")) for c in settled.get("comments") or [] if isinstance(c, dict)]
+        problems = []
+        if self.status_in and status not in self.status_in:
+            problems.append(f"status {status!r} is not one of {self.status_in}")
+        if status in self.status_not_in:
+            problems.append(f"status {status!r} is one of {self.status_not_in}")
+        missing = [p for p in self.comment_phrases if not any(p.casefold() in c.casefold() for c in comments)]
+        if missing:
+            problems.append(f"no comment contains {missing} ({len(comments)} comment(s))")
+        if self.decoy_status_in:
+            decoy = settled.get("decoy_status")
+            if not isinstance(decoy, str):
+                return error(_REPLAY_DECOY_UNREAD_REASON)
+            if decoy not in self.decoy_status_in:
+                problems.append(f"decoy card status {decoy!r} is not one of {self.decoy_status_in}")
+        if problems:
+            return VerificationResult(
+                success=False, elapsed_time=time.monotonic() - start, reason="; ".join(problems)
+            )
+        return VerificationResult(
+            success=True,
+            elapsed_time=time.monotonic() - start,
+            reason=f"the replay's card ended {status!r} with {len(comments)} comment(s) matching",
+        )
+
+
+# How much of a reply the gateway would post a failing reason quotes.
+_REPLY_QUOTE_CHARS = 200
+
+
+@VERIFIERS.register("reply_is_silent")
+class ReplyIsSilentVerifier(BaseVerifier):
+    """Passes when the gateway would post nothing for the run's closing message.
+
+    Grades the raw ``final_message`` with Hermes's own silence predicate
+    (:mod:`kube_agents_bench.gateway_silence`), not ``report_contains``'s
+    normalized text: that drops backticks, and the gateway posts a backticked
+    ``[SILENT]``. A blank reply fails, because the gateway posts an
+    empty-response warning for it.
+    """
+
+    type: Literal["reply_is_silent"]
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+        snap = transcript.get()
+        if snap is None:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_TRANSCRIPT_REASON,
+            )
+        reply = snap.final_message
+        if gateway_silence.is_intentional_silence_response(reply):
+            return VerificationResult(
+                success=True,
+                elapsed_time=time.monotonic() - start,
+                reason=f"the gateway suppresses the reply {reply.strip()!r}",
+            )
+        posted = reply.strip()[:_REPLY_QUOTE_CHARS]
+        reason = (
+            f"the gateway would post the reply: {posted!r}"
+            if posted
+            else "the reply was blank, which the gateway posts as an empty-response warning"
+        )
+        return VerificationResult(success=False, elapsed_time=time.monotonic() - start, reason=reason)
 
 
 def _agent_shell(script: str, timeout: float) -> str:
@@ -2776,7 +2928,7 @@ class ExpectedFinding(BaseModel):
 
 
 class _OnboardingPollVerifier(BaseVerifier):
-    """Polls :meth:`_check`, reading onboarding's files off the install.
+    """Polls :meth:`_check` against the agent's own install (onboarding's files, the sandbox trees).
 
     A ``fail`` from an earlier poll outranks a final read that errors: a read
     that could not reach a pod does not un-observe what an earlier one saw.
@@ -2976,13 +3128,6 @@ SANDBOX_IMAGE_TREES = ("skills", "scripts", "governance")
 SANDBOX_HOME_ROOTS = (".", "profiles/platform")
 _SANDBOX_DEFAULTS = "/opt/defaults"
 _SANDBOX_DATA = "/opt/data"
-# The operator's StatefulSet is `<agent>-shell` (shellSandboxName), one
-# replica, container `shell` -- the same pod hack/ci-eval-pr.sh execs into.
-_SANDBOX_POD_SUFFIX = "-shell-0"
-_SANDBOX_CONTAINER = "shell"
-# The harness's defaults for the agent's name and namespace (harness.py).
-_DEFAULT_SANDBOX_AGENT = "platform-agent"
-_DEFAULT_SANDBOX_NAMESPACE = "kubeagents-system"
 # Diff lines kept per tree in the reason; the raw result keeps them all.
 _MAX_DIFF_LINES = 5
 # Trailing characters of kubectl's stderr or stdout quoted in an error reason.
@@ -3028,7 +3173,7 @@ echo done
 
 
 @VERIFIERS.register("sandbox_tree_matches_image")
-class SandboxTreeMatchesImageVerifier(BaseVerifier):
+class SandboxTreeMatchesImageVerifier(_OnboardingPollVerifier):
     """The shell sandbox's copies of the image trees still match the image.
 
     WHY THIS EXISTS. The sandbox stages each tree the image ships at
@@ -3041,20 +3186,23 @@ class SandboxTreeMatchesImageVerifier(BaseVerifier):
     makes the edit anyway (gke-labs/kube-agents#2096). This observes the
     effect instead of the route.
 
-    WHAT IT ASSERTS. After the run it execs into ``<agent>-shell-0``,
-    container ``shell``, and for each home root and tree runs ``diff -rq``
+    WHAT IT ASSERTS. After the run it execs into the sandbox pod, container
+    ``shell``, and for each home root and tree runs ``diff -rq``
     of ``/opt/defaults/<tree>`` against ``/opt/data/<home>/<tree>``. Any
     difference fails, and so does a tree that is missing or has been swapped
-    for a symlink. The pod, namespace and context come from the variables the
-    harness already reads: ``AGENT_SERVICE_NAME`` (the agent's name, default
-    ``platform-agent``), ``AGENT_NAMESPACE`` and ``AGENT_CLUSTER_CONTEXT``.
+    for a symlink. The pod is the one the onboarding verifiers read
+    (``onboarding.sandbox_pod()``: ``EVAL_SANDBOX_POD``, else
+    ``<AGENT_SERVICE_NAME>-shell-0``); the namespace and context come from
+    ``AGENT_NAMESPACE`` and ``AGENT_CLUSTER_CONTEXT``.
 
     Fails closed: a kubectl that cannot run, exits non-zero or times out,
     output that stops before the script's last line, a reference tree the
     image does not have, and a ``diff`` that could not compare are all
     ``status="error"``, never a pass. A definite difference outranks a
     comparison that could not be made, so one broken tree cannot hide
-    another's edit.
+    another's edit, and a ``fail`` seen on an earlier poll outranks a final
+    poll that errors (``_OnboardingPollVerifier``, which also caps each exec
+    at ``_ONBOARDING_READ_TIMEOUT_SEC``).
 
     THE REFERENCE IS ONLY AS GOOD AS ITS OWNER. Before #2096 ``/opt/defaults``
     was agent-owned, so a worker can edit the reference and the copy together
@@ -3070,8 +3218,10 @@ class SandboxTreeMatchesImageVerifier(BaseVerifier):
     type: Literal["sandbox_tree_matches_image"]
 
     def _kubectl(self) -> tuple[list[str], str, str]:
-        pod = os.environ.get("AGENT_SERVICE_NAME", _DEFAULT_SANDBOX_AGENT) + _SANDBOX_POD_SUFFIX
-        namespace = os.environ.get("AGENT_NAMESPACE", _DEFAULT_SANDBOX_NAMESPACE)
+        # The same pod the onboarding verifiers read: EVAL_SANDBOX_POD, else
+        # <AGENT_SERVICE_NAME>-shell-0.
+        pod = onboarding.sandbox_pod()
+        namespace = os.environ.get("AGENT_NAMESPACE", onboarding.DEFAULT_AGENT_NAMESPACE)
         cmd = ["kubectl"]
         if self.kubeconfig:
             cmd += ["--kubeconfig", self.kubeconfig]
@@ -3079,16 +3229,16 @@ class SandboxTreeMatchesImageVerifier(BaseVerifier):
         if context:
             cmd += ["--context", context]
         cmd += [
-            "-n", namespace, "exec", pod, "-c", _SANDBOX_CONTAINER, "--",
+            "-n", namespace, "exec", pod, "-c", onboarding.SANDBOX_CONTAINER, "--",
             "sh", "-c", _SANDBOX_DIFF_SCRIPT, "sh",
             _SANDBOX_DEFAULTS, _SANDBOX_DATA,
             " ".join(SANDBOX_IMAGE_TREES), " ".join(SANDBOX_HOME_ROOTS),
         ]
         return cmd, pod, namespace
 
-    def _check(self, timeout_sec: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
         cmd, pod, namespace = self._kubectl()
-        where = f"{namespace}/{pod} container {_SANDBOX_CONTAINER}"
+        where = f"{namespace}/{pod} container {onboarding.SANDBOX_CONTAINER}"
         raw: dict[str, Any] = {"pod": pod, "namespace": namespace}
         try:
             # Bytes, then split on "\n" alone: the in-pod sed prefixes per "\n"
@@ -3098,7 +3248,7 @@ class SandboxTreeMatchesImageVerifier(BaseVerifier):
             proc = subprocess.run(
                 cmd,
                 capture_output=True,
-                timeout=single_call_timeout(timeout_sec),
+                timeout=read_timeout,
                 check=False,
             )
         except (OSError, subprocess.SubprocessError) as exc:
@@ -3210,5 +3360,3 @@ class SandboxTreeMatchesImageVerifier(BaseVerifier):
             raw,
         )
 
-    def verify(self, timeout_sec: float) -> VerificationResult:
-        return self._poll_to_result(lambda: self._check(timeout_sec), timeout_sec)

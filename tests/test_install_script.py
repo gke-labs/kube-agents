@@ -1005,6 +1005,15 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("ON=true ACTION=mask CIDRS=127.0.0.0/8,fd00::/8", proc.stdout)
 
+    def test_parse_args_scoped_sa_pool_flags_are_read(self):
+        cmd = (
+            "parse_args --scoped-sa-pool-enabled --scoped-sa-pool-max-accounts=50; "
+            'echo "ON=$PARAM_SCOPED_SA_POOL_ENABLED MAX=$PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS"'
+        )
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("ON=true MAX=50", proc.stdout)
+
     def test_model_max_tokens_defaults_to_unset(self):
         cmd = 'echo "MAX=[$PARAM_MODEL_MAX_TOKENS]"'
         proc = self._run_install_func(cmd)
@@ -5157,6 +5166,93 @@ class LitellmRedactionPersistsThroughInstallEnvTest(unittest.TestCase):
             self.assertLess(exported, bootstrap)
 
 
+class ScopedSaPoolPersistsThroughInstallEnvTest(unittest.TestCase):
+    """SCOPED_SA_POOL_ENABLED and SCOPED_SA_POOL_MAX_ACCOUNTS follow the gateway
+    redaction keys: a first install records what it exported, the next run
+    reads it back, a flag beats the file for one run and says so, and main()
+    refuses a misspelt switch before anything is written."""
+
+    _bootstrap_with_export = ModelMaxTokensPersistsThroughInstallEnvTest._bootstrap_with_export
+    _read_back = ModelMaxTokensPersistsThroughInstallEnvTest._read_back
+    _bootstrap_over = LitellmRedactionPersistsThroughInstallEnvTest._bootstrap_over
+
+    @staticmethod
+    def _env(overrides):
+        env = get_isolated_test_env(overrides=overrides)
+        for key in ("SCOPED_SA_POOL_ENABLED", "SCOPED_SA_POOL_MAX_ACCOUNTS"):
+            env.pop(key, None)
+        env.update(overrides)
+        return env
+
+    def test_the_first_run_records_the_export_and_the_next_run_reads_it_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(
+                tmp, "export SCOPED_SA_POOL_ENABLED=true SCOPED_SA_POOL_MAX_ACCOUNTS=250"
+            )
+            text = dest.read_text()
+            self.assertIn("SCOPED_SA_POOL_ENABLED=true\n", text)
+            self.assertIn("SCOPED_SA_POOL_MAX_ACCOUNTS=250\n", text)
+            out = self._read_back(
+                dest, 'echo "ON=[$PARAM_SCOPED_SA_POOL_ENABLED] MAX=[$PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS]"'
+            )
+            self.assertIn("ON=[true] MAX=[250]", out)
+
+    def test_an_unset_value_is_recorded_as_the_default_and_reads_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(tmp, ":")
+            text = dest.read_text()
+            self.assertIn("SCOPED_SA_POOL_ENABLED=false\n", text)
+            self.assertIn("SCOPED_SA_POOL_MAX_ACCOUNTS=''\n", text)
+
+    def test_a_flag_over_a_file_that_does_not_record_it_warns_that_the_next_upgrade_reverts_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._bootstrap_over(
+                tmp, "PROJECT_ID=p\n",
+                "PARAM_SCOPED_SA_POOL_ENABLED=true; PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS=250",
+            )
+        self.assertIn("--scoped-sa-pool-enabled=true applies to this run only", out)
+        self.assertIn("records no SCOPED_SA_POOL_ENABLED", out)
+        self.assertIn("Set SCOPED_SA_POOL_ENABLED=true in", out)
+        # The consequence is read per direction: a typed =true is undone by the
+        # next apply deleting the accounts, a typed =false by it recreating them.
+        self.assertIn("accounts this run deleted are recreated and the broker re-armed", out)
+        self.assertIn("--scoped-sa-pool-max-accounts=250 applies to this run only", out)
+        self.assertIn("Set SCOPED_SA_POOL_MAX_ACCOUNTS=250 in", out)
+
+    def test_a_run_that_agrees_with_the_file_is_silent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._bootstrap_over(
+                tmp, "SCOPED_SA_POOL_ENABLED=yes\nSCOPED_SA_POOL_MAX_ACCOUNTS=250\n",
+                "PARAM_SCOPED_SA_POOL_ENABLED=true; PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS=250",
+            )
+        self.assertNotIn("applies to this run only", out)
+
+    def test_main_validates_then_exports_before_the_generator_and_the_bootstrap(self):
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        seed_line = 'local scoped_sa_pool_enabled="${PARAM_SCOPED_SA_POOL_ENABLED:-$SCOPED_SA_POOL_ENABLED_DEFAULT}"'
+        toggle_line = 'if ! is_bool_spelling "$scoped_sa_pool_enabled"; then'
+        cap_line = 'require_scoped_sa_pool_max_accounts "$scoped_sa_pool_max_accounts" || exit 1'
+        export_lines = (
+            'export SCOPED_SA_POOL_ENABLED="$scoped_sa_pool_enabled"',
+            'export SCOPED_SA_POOL_MAX_ACCOUNTS="$scoped_sa_pool_max_accounts"',
+        )
+        for line in (seed_line, toggle_line, cap_line, *export_lines):
+            self.assertIn(line, text[main_start:], f"main() no longer carries: {line}")
+        gitops_step = text.index('print_step "8. GitOps Infrastructure Repository Setup"', main_start)
+        for line in (toggle_line, cap_line):
+            self.assertLess(text.index(line, main_start), gitops_step, line)
+        validated = text.index(cap_line, main_start)
+        generator = text.index('write_tfvars_from_state "$tfvars_file" "$image_tag"', main_start)
+        bootstrap = text.index('bootstrap_install_env_file "$INSTALL_ENV_FILE" "$image_tag"', main_start)
+        self.assertLess(text.index(seed_line, main_start), validated)
+        for line in export_lines:
+            exported = text.index(line, main_start)
+            self.assertLess(validated, exported)
+            self.assertLess(exported, generator)
+            self.assertLess(exported, bootstrap)
+
+
 class FrontDoorsAgreeOnTheRepositoryTest(unittest.TestCase):
     """Each front door clones the install sources before it has a checkout to
     read the URL from, so each carries the URL; this pins the three equal."""
@@ -6833,6 +6929,7 @@ class DomainScopedFlagsTest(unittest.TestCase):
         "--scope-max-projects": ("PARAM_SCOPE_MAX_PROJECTS", "250"),
         "--scope-exclude-projects": ("PARAM_SCOPE_EXCLUDE_PROJECTS", "*-sandbox"),
         "--scope-exclude-clusters": ("PARAM_SCOPE_EXCLUDE_CLUSTERS", "payments-staging/us-central1/scratch"),
+        "--scoped-sa-pool-max-accounts": ("PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS", "50"),
     }
 
     def test_each_value_flag_reaches_its_variable(self):
@@ -8603,6 +8700,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
         "--enable-drift-detector",
         "--enable-hermes-dashboard",
         "--litellm-redaction",
+        "--scoped-sa-pool-enabled",
     ]
 
     def _parse_args(self, *args, **env_overrides):
@@ -8647,6 +8745,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
         "--enable-stockout-investigator": "ENABLE_STOCKOUT_INVESTIGATOR",
         "--enable-drift-detector": "ENABLE_DRIFT_DETECTOR",
         "--litellm-redaction": "LITELLM_REDACTION_ENABLED",
+        "--scoped-sa-pool-enabled": "SCOPED_SA_POOL_ENABLED",
     }
 
     def test_a_spelling_seeded_from_install_env_is_never_judged(self):
@@ -9227,7 +9326,8 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
                           ("--scope-metrics-scopes", "SCOPE_METRICS_SCOPES"),
                           ("--scope-max-projects", "SCOPE_MAX_PROJECTS"),
                           ("--scope-exclude-projects", "SCOPE_EXCLUDE_PROJECTS"),
-                          ("--scope-exclude-clusters", "SCOPE_EXCLUDE_CLUSTERS")):
+                          ("--scope-exclude-clusters", "SCOPE_EXCLUDE_CLUSTERS"),
+                          ("--scoped-sa-pool-max-accounts", "SCOPED_SA_POOL_MAX_ACCOUNTS")):
             for value in ("", ",", " ", " , "):
                 with self.subTest(flag=flag, value=value):
                     proc = subprocess.run(
@@ -9249,7 +9349,8 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
         help_text = proc.stdout + proc.stderr
         for flag in ("--scope-projects=IDS", "--scope-folders=IDS", "--scope-organizations=IDS",
                      "--scope-shared-vpc-hosts=IDS", "--scope-metrics-scopes=IDS", "--scope-max-projects=N",
-                     "--scope-exclude-projects=IDS", "--scope-exclude-clusters=TRIPLES"):
+                     "--scope-exclude-projects=IDS", "--scope-exclude-clusters=TRIPLES",
+                     "--scoped-sa-pool-enabled[=BOOL]", "--scoped-sa-pool-max-accounts=N"):
             with self.subTest(flag=flag):
                 self.assertIn(flag, help_text)
 
@@ -9394,11 +9495,18 @@ print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-cent
         self.assertNotIn(line, proc.stdout)
 
     def test_the_menu_refuses_a_scope_flag(self):
-        proc = subprocess.run(
-            ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\nparse_args --menu --scope-projects=p\necho "PASSED=$SCOPE_FLAG_PASSED"'],
-            capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
-        )
-        self.assertIn("PASSED=true", proc.stdout, proc.stderr)
+        # The pool flags are refused the same way: the menu regenerates from
+        # install.env after the pool keys are unset, so a typed
+        # --scoped-sa-pool-enabled=true would be validated and then dropped
+        # without a word, the operator believing the pool armed.
+        for flag in ("--scope-projects=p", "--scoped-sa-pool-enabled=true", "--scoped-sa-pool-max-accounts=7"):
+            proc = subprocess.run(
+                ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\nparse_args --menu {flag}\necho "PASSED=$SCOPE_FLAG_PASSED"'],
+                capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+            )
+            self.assertIn("PASSED=true", proc.stdout, f"{flag}: {proc.stderr}")
+        self.assertIn("--scoped-sa-pool-enabled", self.text[self.text.index("--menu takes no --scope-* flag"):][:600],
+                      "the menu refusal does not name the pool flags it refuses")
         dispatch = self.text.index('if [ "${PARAM_MENU_MODE:-false}" = "true" ]; then')
         refusal = self.text.index("--menu takes no --scope-* flag")
         run = self.text.index("    run_menu_system\n    exit 0")
