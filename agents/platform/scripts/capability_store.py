@@ -90,6 +90,9 @@ MAX_HISTORY_ENTRIES = 50
 # purpose: writes go through the MCP tool so every one carries a policy check
 # and a changelog line.
 CLI_ACTIONS = ("list", "get", "history")
+# argparse's convention for a usage error, which the CLI follows without argparse.
+USAGE_EXIT_CODE = 2
+JSON_INDENT = 2
 
 # The `actor` a changelog entry records when the caller names none.
 DEFAULT_ACTOR = "agent"
@@ -481,14 +484,14 @@ def main(argv: list[str]) -> int:
     root = cli_root()
     if len(argv) < 2 or argv[1] not in CLI_ACTIONS:
         print(f"usage: capability_store.py {' | '.join(CLI_ACTIONS)} [<name>]", file=sys.stderr)
-        return 2
+        return USAGE_EXIT_CODE
     try:
         if argv[1] == "list":
-            print(json.dumps(list_capabilities(root), indent=2))
+            print(json.dumps(list_capabilities(root), indent=JSON_INDENT))
         elif argv[1] == "get":
-            print(json.dumps(describe(load(root, argv[2])), indent=2, sort_keys=True))
+            print(json.dumps(describe(load(root, argv[2])), indent=JSON_INDENT, sort_keys=True))
         else:
-            print(json.dumps(history(root, argv[2]), indent=2, sort_keys=True))
+            print(json.dumps(history(root, argv[2]), indent=JSON_INDENT, sort_keys=True))
     except (CapabilityError, IndexError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
