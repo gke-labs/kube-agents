@@ -6826,6 +6826,9 @@ def _webhook_line(blockers="PodDisruptionBudget pinned-batch-runner, maintenance
         "haoxuw-gke-dev-seeded-b-us-central1-a: " + _webhook_line().split(": ", 1)[1],
         _webhook_line(hooks="seeded-fail-closed-gate (gate.seeded.invalid)"),
         _webhook_line(blockers="hold-the-minor-lag exclusion"),
+        _webhook_line(blockers="PodDisruptionBudget seeded-upgrade/pinned-batch-runner (maxUnavailable 0), maintenance exclusion hold-the-minor-lag (NO_MINOR_UPGRADES)"),
+        # the right line beside another cluster's line
+        _webhook_line() + "\n" + _webhook_line().replace("seeded-b:", "seeded-a:").replace("no", "yes"),
     ],
 )
 def test_webhook_readiness_declared_line_accepted(text):
@@ -6836,9 +6839,21 @@ def test_webhook_readiness_declared_line_accepted(text):
 @pytest.mark.parametrize(
     "text, failing",
     [
-        # the gate listed among the blockers, in any wording
+        # the gate listed among the blockers, under any of its names or as a webhook,
+        # admission gate or fail-closed anything, whatever the yes/no says
         (_webhook_line(blockers="PDB pinned-batch-runner, seeded-fail-closed-gate"), "seeded-b-does-not-blame-the-gate-for-the-upgrade"),
         (_webhook_line(blockers="the fail-closed webhook and the exclusion"), "seeded-b-does-not-blame-the-gate-for-the-upgrade"),
+        (_webhook_line(blockers="PDB pinned-batch-runner, gate.seeded.invalid"), "seeded-b-does-not-blame-the-gate-for-the-upgrade"),
+        (_webhook_line(blockers="the missing admission Service seeded-upgrade/nonexistent-admission-gate, hold-the-minor-lag"), "seeded-b-does-not-blame-the-gate-for-the-upgrade"),
+        (_webhook_line(blockers="fail-closed-gate, hold-the-minor-lag exclusion"), "seeded-b-does-not-blame-the-gate-for-the-upgrade"),
+        (_webhook_line(blockers="PDB pinned-batch-runner, fail-closed admission gate"), "seeded-b-does-not-blame-the-gate-for-the-upgrade"),
+        (_webhook_line(blockers="PDB pinned-batch-runner, validating webhooks"), "seeded-b-does-not-blame-the-gate-for-the-upgrade"),
+        # a second seeded-b line that contradicts the right one
+        (_webhook_line(blockers="none") + "\n" + _webhook_line(), "seeded-b-names-a-real-blocker"),
+        (_webhook_line(hooks="none") + "\n" + _webhook_line(), "seeded-b-names-the-gate-as-a-webhook-with-no-backend"),
+        (_webhook_line(hooks="some-other-gate") + "\n" + _webhook_line(), "seeded-b-names-the-gate-as-a-webhook-with-no-backend"),
+        (_webhook_line(blocks="yes") + "\n" + _webhook_line(), "seeded-b-does-not-blame-the-gate-for-the-upgrade"),
+        (_webhook_line(blockers="PDB pinned-batch-runner, gate.seeded.invalid") + "\n" + _webhook_line(), "seeded-b-does-not-blame-the-gate-for-the-upgrade"),
         # yes to the question
         (_webhook_line(blocks="yes"), "seeded-b-does-not-blame-the-gate-for-the-upgrade"),
         # the gate not found
