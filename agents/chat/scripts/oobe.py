@@ -9,7 +9,8 @@ for cost). The bootstrap scan and delivery jobs still run beside it.
 The stage fires when the scan's ranking card has finished, read from the board. It
 does not wait for delivery, which needs a human message, and it does not look for
 the report file, which is on the sandbox's volume when the sandbox is on. A scan
-that has not settled ``FALLBACK_SECONDS`` after its sweep was filed fires anyway.
+that has not settled by the hand-off's own deadline plus ``RANKING_ALLOWANCE_SECONDS``
+after its sweep was filed fires anyway.
 
 Each audit is marked due on the Platform Agent's roster with Hermes'
 ``cron.jobs.trigger_job``, so the next ``profile-cron-tick`` runs it through its
@@ -39,6 +40,8 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+import bootstrap_handoff  # beside this script in the pod
 
 OOBE_JOB_ID = "oobe"
 AUDITS_MARKER = ".oobe_audits_fired"
@@ -72,10 +75,12 @@ FINISHED_STATUSES = ("done", "archived")
 BOARD_FILE = "kanban.db"
 SQLITE_BUSY_TIMEOUT_SECONDS = 10
 
-# Long enough for a sweep over a large fleet to reach its ranking card and finish it, short
-# enough that a sweep that stalls (#2143) or a ranking card left blocked does not cost the day.
-FALLBACK_SECONDS = 90 * 60
-# Far past the fallback: a sweep this old was filed before the job existed.
+# The fallback waits out the hand-off's own deadline for this sweep's cluster cards
+# (bootstrap_handoff.deadline), after which it files the ranking card, plus this long for the
+# ranking card to finish. A shorter wait would start the audits beside the ranking card on a
+# large fleet, which is what waiting for the scan avoids.
+RANKING_ALLOWANCE_SECONDS = 30 * 60
+# Far past any fallback: a sweep this old was filed before the job existed.
 NEW_INSTALL_SECONDS = 24 * 60 * 60
 SECONDS_PER_MINUTE = 60
 TRIGGER_TIMEOUT_SECONDS = 30
@@ -152,23 +157,23 @@ def board_path(data_dir: Path) -> Path:
         return data_dir / BOARD_FILE
 
 
-def ranking_settled(board: Path, sweep_id: str) -> bool:
-    """True once this sweep's ranking cards exist and none can still change.
+def read_scan(board: Path, sweep_id: str) -> tuple[bool, int] | None:
+    """Whether this sweep's ranking cards have all finished, and how many cluster cards it has.
 
-    Only cards created after the sweep card count, so an earlier run's ranking card,
-    left on the board after onboarding was re-armed, cannot fire this one.
+    None when the board cannot say. Only cards created after the sweep card count, so an
+    earlier run's cards, left on the board after onboarding was re-armed, cannot fire this one.
     """
     if not sweep_id:
-        return False
+        return None
     try:
         conn = sqlite3.connect(f"file:{board}?mode=ro", uri=True, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)
     except sqlite3.Error as e:
         _log(f"cannot open the board: {e}")
-        return False
+        return None
     try:
         row = conn.execute("SELECT created_at FROM tasks WHERE id = ?", (sweep_id,)).fetchone()
         if row is None:
-            return False
+            return None
         statuses = [
             status
             for (status,) in conn.execute(
@@ -177,12 +182,22 @@ def ranking_settled(board: Path, sweep_id: str) -> bool:
                 (PRIORITIZE_KEY, PRIORITIZE_RETRY_PATTERN, row[0]),
             ).fetchall()
         ]
+        (clusters,) = conn.execute(
+            "SELECT count(*) FROM tasks WHERE idempotency_key LIKE ? AND created_at >= ?",
+            (bootstrap_handoff.CLUSTER_KEY_PREFIX + "%", row[0]),
+        ).fetchone()
     except sqlite3.Error as e:
         _log(f"cannot read the board: {e}")
-        return False
+        return None
     finally:
         conn.close()
-    return bool(statuses) and all(status in FINISHED_STATUSES for status in statuses)
+    return bool(statuses) and all(status in FINISHED_STATUSES for status in statuses), clusters
+
+
+def fallback_seconds(clusters: int) -> int:
+    """How long after the sweep was filed the stage stops waiting for the ranking card."""
+    hand_off = bootstrap_handoff.DEADLINE_SECONDS + bootstrap_handoff.DEADLINE_PER_CARD_SECONDS * clusters
+    return hand_off + RANKING_ALLOWANCE_SECONDS
 
 
 def scan_settled(data_dir: Path, now: float) -> bool:
@@ -190,10 +205,12 @@ def scan_settled(data_dir: Path, now: float) -> bool:
     if filed is None:
         return False
     sweep_id, filed_at = filed
-    if ranking_settled(board_path(data_dir), sweep_id):
+    scan = read_scan(board_path(data_dir), sweep_id)
+    if scan is not None and scan[0]:
         return True
-    if now - filed_at >= FALLBACK_SECONDS:
-        _log(f"the scan has not settled {FALLBACK_SECONDS // SECONDS_PER_MINUTE} minutes after its sweep was filed; starting the audits anyway")
+    wait = fallback_seconds(scan[1] if scan is not None else 0)
+    if now - filed_at >= wait:
+        _log(f"the scan has not settled {wait // SECONDS_PER_MINUTE} minutes after its sweep was filed; starting the audits anyway")
         return True
     return False
 

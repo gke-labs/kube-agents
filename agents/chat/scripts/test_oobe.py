@@ -28,7 +28,7 @@ SWEEP_ID = "t_sweep"
 FILED_AT = 1_000_000
 SWEEP_CREATED_AT = FILED_AT
 NOW_SETTLED = FILED_AT + 600
-NOW_PAST_FALLBACK = FILED_AT + oobe.FALLBACK_SECONDS
+NOW_PAST_FALLBACK = FILED_AT + oobe.fallback_seconds(0)
 REPOS = ["acme/gitops"]
 
 
@@ -159,6 +159,23 @@ class StageTest(unittest.TestCase):
         self._main(now=NOW_PAST_FALLBACK)
         self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
 
+    def test_a_large_fleet_waits_out_the_hand_offs_deadline(self):
+        # The hand-off files the ranking card only after its per-cluster deadline.
+        clusters = [(f"t_c{i}", "running", f"bootstrap-inventory-cluster-c{i}", SWEEP_CREATED_AT + 1) for i in range(10)]
+        self._file_scan()
+        _board(self.board, clusters)
+        self._main(now=NOW_PAST_FALLBACK)
+        self.assertEqual(self.started, [])
+        self._main(now=FILED_AT + oobe.fallback_seconds(10))
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+
+    def test_the_fallback_follows_the_hand_offs_deadline(self):
+        handoff = oobe.bootstrap_handoff
+        self.assertEqual(
+            oobe.fallback_seconds(4),
+            handoff.DEADLINE_SECONDS + 4 * handoff.DEADLINE_PER_CARD_SECONDS + oobe.RANKING_ALLOWANCE_SECONDS,
+        )
+
     def test_an_unreadable_board_waits_for_the_fallback(self):
         self._file_scan()
         self.board.write_text("not a database")
@@ -173,7 +190,7 @@ class StageTest(unittest.TestCase):
         mtime = (self.d / oobe.SCAN_FILED_MARKER).stat().st_mtime
         self._main(now=mtime + 60)
         self.assertEqual(self.started, [])
-        self._main(now=mtime + oobe.FALLBACK_SECONDS)
+        self._main(now=mtime + oobe.fallback_seconds(0))
         self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
 
     # --- how it starts them ---------------------------------------------------

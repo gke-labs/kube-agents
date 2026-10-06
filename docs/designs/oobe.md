@@ -64,10 +64,10 @@ suffixed key). The ranking worker
 writes `/opt/data/INVENTORY.md`, on the sandbox's volume when the shell sandbox is on.
 `bootstrap-inventory-delivery` (`bootstrap_delivery.py`) posts it once a human has spoken
 (`.user_aligned`) and claims `.bootstrap_completed` with `O_CREAT | O_EXCL`; a run five minutes
-later removes both jobs. With the shell sandbox on, the scan can stall before the ranking card is
-filed ([#2143](https://github.com/gke-labs/kube-agents/issues/2143), which
-[#2385](https://github.com/gke-labs/kube-agents/pull/2385) fixes by moving the hand-off to the
-ranking card into code); on such an install `oobe` fires at the fallback in §4.1.
+later removes both jobs. The hand-off from the sweep to the ranking card is code
+(`bootstrap_handoff.py`, which the scan job runs on its ticks): it files the ranking card once the
+per-cluster cards settle, or at its deadline of an hour plus five minutes per cluster card
+(`deadline`). When no cluster was audited it writes the report itself and files no ranking card.
 
 ## 4. First-run audits
 
@@ -87,9 +87,11 @@ Two things the trigger must not be:
   sandbox is on, the default. A gate that tests for them on the Chat Agent's volume never fires,
   and testing across the sandbox every minute costs an ssh call per tick.
 
-**Fallback.** If the scan has not settled `FALLBACK_SECONDS` (90 minutes) after
-`.bootstrap_scan_filed`, fire anyway. A stuck sweep, a blocked ranking card or one never filed must
-not hold the audits back forever.
+**Fallback.** If the scan has not settled by the hand-off's deadline for this sweep plus
+`RANKING_ALLOWANCE_SECONDS` (30 minutes), counted from `.bootstrap_scan_filed`, fire anyway: 90
+minutes for a sweep with no cluster cards, longer by five minutes a card. A stuck sweep, a blocked
+ranking card or one never filed must not hold the audits back forever, and a shorter wait would
+start them beside a large fleet's ranking card.
 
 **Not a new install.** If the stage's first look finds a sweep filed more than
 `NEW_INSTALL_SECONDS` (24 hours) earlier, the install onboarded before this job existed but never
@@ -195,8 +197,8 @@ times. It rides with the audits stage, whose eval case covers both.
 | An audit run fails     | The audit's own failure path; `chat-delivery-watch` opens a GitHub issue when reports stop reaching chat | As today                                                                                              |
 | No GitOps repository   | One line in the installer output, later one line in the report                                           | Re-run the installer with `--gitops-org` and `--gitops-repo` (INSTALL.md), then wait for the schedule |
 | No home channel        | Ledger issues and pull requests appear in the repository with no chat summary                            | Set one (`/sethome`)                                                                                  |
-| Sweep stuck            | Audits start at the 90-minute fallback                                                                   | As today for the report                                                                               |
-| Ranking card blocked   | Audits start at the 90-minute fallback, unless someone unblocks the card first                           | As today for the report                                                                               |
+| Sweep stuck            | Audits start at the fallback                                                                             | As today for the report                                                                               |
+| Ranking card blocked   | Audits start at the fallback, unless someone unblocks the card first                                     | As today for the report                                                                               |
 
 ## 7. Not in this design
 
