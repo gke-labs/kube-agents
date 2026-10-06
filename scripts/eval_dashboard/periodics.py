@@ -100,21 +100,30 @@ RECONCILE_NEXT_STEP = {
     "failed": "nothing by hand, the next run retries it",
     "interrupted": "the next run retries it, and force-unlocks only if it fails on the lock",
 }
-# A `failed` whose detail names the lock owes a hand step before any retry:
-# this script's own words when the ceiling cut the apply, and tofu's when the
-# next run failed on the lock it left.
-RECONCILE_LOCK_MARKERS = ("force-unlock", "Error acquiring the state lock")
+# A `failed` on tofu's own lock error owes a hand step before any retry, and
+# that message carries the lock ID the command needs. The writer keeps the
+# last 600 characters of tofu's output, which can cut the header, so the
+# Lock Info block and the trailer are markers too. The script's own
+# ceiling text ("force-unlock" in its words) is not yet a lock: the next run
+# tells, as the interrupted step says.
+RECONCILE_LOCK_MARKERS = ("Error acquiring the state lock", "Lock Info", "acquires a state lock")
+RECONCILE_CEILING_MARKER = "force-unlock"
 RECONCILE_NEXT_STEP_LOCKED = "tofu force-unlock against that project's state, then the next run retries it"
 RECONCILE_OUTCOME_NOT_REACHED = "not_reached"
 # The report's outcome names as the message says them.
 RECONCILE_OUTCOME_WORDS = {RECONCILE_OUTCOME_NOT_REACHED: "not reached"}
 REPORT_KEY_VISITED = "visited"
 REPORT_KEY_MAPPED = "mapped"
+REPORT_KEY_MODE = "mode"
+REPORT_MODE_ALL = "all"
 REPORT_KEY_ALLOWLIST_UNUSED = "allowlist_unused"
 # The Prow job names (oss-test-infra, kube-agents-periodics.yaml and
 # kube-agents-postsubmits.yaml); a rename there is a rename here.
 RECONCILE_DAILY_JOB = "ci-kube-agents-fleet-reconcile-daily"
 RECONCILE_POSTSUBMIT_JOB = "post-kube-agents-fleet-reconcile"
+# A watched job whose failed build is retired by another job's later pass:
+# the postsubmit has no window, and the daily that followed it did its work.
+SUPERSEDED_BY = {RECONCILE_POSTSUBMIT_JOB: RECONCILE_DAILY_JOB}
 # gsutil's absent-object wording, the set scripts/release/poll_rc_eval_verdict.py
 # settled on for the Prow archive; the same wording here. Never a bare 404,
 # because gsutil echoes the failing URL and a 19-digit build id can contain
@@ -419,7 +428,12 @@ def reconcile_detail(artifact: dict | None) -> list[str]:
         if outcome not in RECONCILE_NAMED_OUTCOMES:
             continue
         detail = str(entry.get(REPORT_KEY_DETAIL) or "no detail")
-        step = RECONCILE_NEXT_STEP_LOCKED if outcome == "failed" and any(marker in detail for marker in RECONCILE_LOCK_MARKERS) else RECONCILE_NEXT_STEP[outcome]
+        step = RECONCILE_NEXT_STEP[outcome]
+        if outcome == "failed":
+            if any(marker in detail for marker in RECONCILE_LOCK_MARKERS):
+                step = RECONCILE_NEXT_STEP_LOCKED
+            elif RECONCILE_CEILING_MARKER in detail:
+                step = RECONCILE_NEXT_STEP["interrupted"]
         lines.append(f"{project}: {outcome} ({detail}); next: {step}")
     # The cap counts projects; the lines after it are one each.
     if len(lines) > DETAIL_LIMIT:
@@ -430,9 +444,12 @@ def reconcile_detail(artifact: dict | None) -> list[str]:
     # Said only about a run that reached every mapped project and read every
     # plan: a project missed, or one that failed before its plan, is the one
     # that may still need the entry.
+    # Said only about an `--all` run, whose `mapped` is the pool; a drifted
+    # or named run's `mapped` is its own list.
     visited, mapped = artifact.get(REPORT_KEY_VISITED), artifact.get(REPORT_KEY_MAPPED)
     with_verdict = sum(1 for e in entries.values() if _allowlist_verdict(e) is not None)
-    unused = allowlist_unused(entries) if isinstance(visited, int) and isinstance(mapped, int) and visited == mapped and with_verdict == visited else []
+    whole_pool = artifact.get(REPORT_KEY_MODE) == REPORT_MODE_ALL and isinstance(visited, int) and isinstance(mapped, int) and visited == mapped and with_verdict == visited
+    unused = allowlist_unused(entries) if whole_pool else []
     if unused:
         lines.append(f"allowlist: {len(unused)} {'entry' if len(unused) == 1 else 'entries'} no plan needed, remove {'it' if len(unused) == 1 else 'them'}: {', '.join(unused)}")
     if artifact.get(REPORT_KEY_ERROR):
@@ -657,6 +674,8 @@ def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, wa
             verdict = VERDICT_FAILED
         else:
             continue
+        if verdict == VERDICT_FAILED and superseded(periodic.job, readings):
+            continue
         before = (prev_notes or {}).get(periodic.job) or {}
         artifact = reading.get(KEY_ARTIFACT) if isinstance(reading.get(KEY_ARTIFACT), dict) else None
         persistent = {}
@@ -687,6 +706,19 @@ def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, wa
             KEY_RUNBOOK: periodic.runbook,
         }
     return notes
+
+
+def superseded(job: str, readings: dict[str, dict]) -> bool:
+    """True when the job's failed build was followed by a passed build of
+    the job that supersedes it (the daily after a failed postsubmit)."""
+    other = SUPERSEDED_BY.get(job)
+    if not other:
+        return False
+    mine, theirs = readings.get(job), readings.get(other)
+    if not isinstance(mine, dict) or not isinstance(theirs, dict) or not theirs.get(KEY_PASSED):
+        return False
+    when, later = parse_iso(mine.get(KEY_FINISHED_AT)), parse_iso(theirs.get(KEY_FINISHED_AT))
+    return when is not None and later is not None and later > when
 
 
 def evidence(note: dict) -> str:

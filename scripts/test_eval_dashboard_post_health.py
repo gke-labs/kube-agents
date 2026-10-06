@@ -2017,6 +2017,16 @@ class WatchedPeriodics(RunHarness):
         no_time["periodics"] = {post: periodic_note(job=post, label="seeded-fleet reconcile (on merge)", verdict="STALE", finished=None, stale_after_h=None)}
         self.assertIn("⚪ Eval seeded fleet: seeded-fleet reconcile (on merge)'s latest build cannot be placed in time; build 100 finished at a time its finished.json does not give.", post_health.render_digest(no_time, T14))
         self.assertNotIn("has stopped running", post_health.render_digest(no_time, T14))
+        # A stale job's last run is by definition more than a day old: dated.
+        stale = health("GREEN")
+        stale["periodics"] = {self.DAILY: periodic_note(verdict="STALE", finished="2026-09-11T13:40:00+00:00")}
+        self.assertIn("⚪ Eval seeded fleet: seeded-fleet reconcile (daily) has stopped running; last finished run on Fri Sep 11 9:40 AM ET.", post_health.render_digest(stale, T14))
+        # A told postsubmit failure clears when the daily passes after it.
+        prev = {"periodics_told": {"post-kube-agents-fleet-reconcile": "FAILED"}}
+        doc = health("GREEN")
+        doc["periodics"], doc["periodics_read"] = {}, ["post-kube-agents-fleet-reconcile", self.DAILY]
+        doc["periodics_runs"] = {"post-kube-agents-fleet-reconcile": {"build": "7", "finished_at": "2026-09-13T13:10:00+00:00", "passed": False, "summary": "1 refused"}, self.DAILY: {"build": "9", "finished_at": "2026-09-14T08:40:00+00:00", "passed": True, "summary": "35 visited: 35 converged"}}
+        self.assertEqual(post_health.periodic_clears(doc, prev), ["post-kube-agents-fleet-reconcile"])
 
     def test_the_digest_line_for_an_unreadable_finish_time_says_so(self):
         doc = health("GREEN")

@@ -9,8 +9,9 @@ gives every one back, on success, on a refusal, on a fault, on SIGTERM. It
 never starts a project its budget cannot fit, and stops when main's fleet
 tree moves. `--drifted` reads exactly the projects the fixture-state scan
 marks drifted. A project Boskos will not hand over is busy or not reached, not
-failed, and the next run gets it; only an `--all` run that reached no project
-at all is red, so a day on which nothing applied is never green.
+failed, and the next run gets it; an `--all` run that reached no project at
+all is red, so a day on which nothing applied is never green, unless main
+moved under it before the first project, which is the next run's work.
 
 The shared walk in `hack/boskos_pool.py` is covered here for what the sweep's
 tests do not reach: acquiring one project by name.
@@ -631,7 +632,9 @@ class MainTest(unittest.TestCase):
             reconcile, "tofu_runner", _Tofu({})
         ), mock.patch.object(reconcile.signal, "signal"), mock.patch.object(reconcile, "pool_projects", lambda *a, **k: set(KNOWN)), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()) as stderr:
             def pause(seconds):
-                clock.now += seconds
+                # A real sleep returns late; the drain then reads the budget,
+                # not the busy arm, and the run must still be red.
+                clock.now += seconds + 1
             with mock.patch.object(reconcile, "pause", pause):
                 rc = reconcile.main(["--all", "--budget-seconds", "7200", "--boskos-server", BOSKOS, "--boskos-owner", OWNER])
         self.assertEqual(rc, reconcile.EXIT_FAILED)
@@ -1504,6 +1507,16 @@ class AllowlistTest(unittest.TestCase):
         with self.assertRaises(SystemExit), mock.patch("sys.stderr", io.StringIO()), mock.patch.object(reconcile.signal, "signal"):
             reconcile.main(["--all", "--allowlist", "/tmp/x.json"])
 
+    def test_an_index_is_only_what_tofu_prints(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "allow.json"
+            for bad in ("google_container_node_pool.no_surge_pool[ 0 ]", 'kubernetes_network_policy_v1.default_deny[ "headroom" ]', "kubernetes_network_policy_v1.default_deny['headroom']"):
+                path.write_text(json.dumps([{"address": bad, "why": "x"}]))
+                with self.assertRaises(reconcile.ReconcileError, msg=bad):
+                    reconcile.load_allowlist(path)
+            path.write_text(json.dumps([{"address": "google_container_node_pool.no_surge_pool[0]", "why": "x"}, {"address": 'kubernetes_network_policy_v1.default_deny["headroom"]', "why": "x"}]))
+            self.assertEqual(len(reconcile.load_allowlist(path)), 2)
+
     def test_an_address_with_a_trailing_newline_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "allow.json"
@@ -1802,6 +1815,23 @@ class WorkersTest(unittest.TestCase):
         self.assertIn("nothing is locked", outcomes[P8][1])
         self.assertEqual(sorted(boskos.released), [P7, P8])
 
+    def test_a_child_started_after_the_termination_landed_is_interrupted_at_once(self):
+        # The forward reaches the children alive at that instant; one whose
+        # Popen was in flight is not in the snapshot, so the runner itself
+        # interrupts it as soon as it is registered.
+        script = "import signal, sys, time; signal.signal(signal.SIGINT, lambda *a: sys.exit(130)); time.sleep(30)"
+        reconcile._TERMINATING.set()
+        started = time.monotonic()
+        try:
+            result = reconcile.tofu_runner([sys.executable, "-c", script], timeout=60)
+        finally:
+            reconcile._TERMINATING.clear()
+        # The interrupt may land before the child installs its handler, in
+        # which case the default action ends it (-2); either way it ends now,
+        # not at the drain's kill.
+        self.assertIn(result.returncode, (130, -signal.SIGINT))
+        self.assertLess(time.monotonic() - started, 10)
+
     def test_a_termination_reaches_the_live_tofu_children_of_the_workers(self):
         # Real children this time: each worker's apply is a process that
         # exits 130 on SIGINT. Signals reach the main thread only, so it is
@@ -1882,6 +1912,58 @@ class WorkersTest(unittest.TestCase):
             with self.assertRaises(boskos_pool.Terminated):
                 reconcile.reconcile_named([P7, P8], BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known=KNOWN, outcomes=outcomes, run=run)
         self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_APPLIED, P8: reconcile.OUTCOME_NOT_REACHED})
+
+    def test_the_stray_check_does_not_reconcile_a_project_this_run_already_applied(self):
+        # Real Boskos frees a released project at once, so the anonymous
+        # acquire usually hands back the first project the pass reconciled.
+        class _Boskos_refreeing(_Boskos):
+            def __call__(self, request, timeout=None):
+                out = super().__call__(request, timeout)
+                if "/release?" in request.full_url:
+                    self.free.append(self.released[-1])
+                return out
+
+        boskos = _Boskos_refreeing(free=[P7])
+        tofu = _Tofu({P7: UPDATE_ONLY})
+        run = reconcile.Run()
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()):
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known={P7}, run=run)
+        self.assertEqual(tofu.verbs().count("apply"), 1, "applied once")
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
+        self.assertEqual(boskos.released, [P7, P7], "handed back and released untouched")
+
+    def test_a_stray_registration_is_not_counted_as_visited(self):
+        stray = "kube-agents-evals-99"
+        boskos = _Boskos(free=[P7, stray])
+        run = reconcile.Run()
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()):
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known={P7}, run=run, outcomes={})
+        with tempfile.TemporaryDirectory() as tmp:
+            report = pathlib.Path(tmp) / "r.json"
+            reconcile.write_report(str(report), argparse.Namespace(project=None, drifted=False, dry_run=False), outcomes, 1, None, 0, run)
+            doc = json.loads(report.read_text())
+        self.assertEqual((doc["visited"], doc["mapped"]), (1, 1))
+        self.assertEqual(doc["outcomes"][stray]["outcome"], reconcile.OUTCOME_FAILED)
+
+    def test_a_termination_across_the_acquire_on_the_single_worker_pool_path_keeps_the_project_on_the_record(self):
+        class _Boskos_signalling_acquire(_Boskos):
+            def __call__(self, request, timeout=None):
+                out = super().__call__(request, timeout)
+                if "/acquirebystate?" in request.full_url:
+                    os.kill(os.getpid(), signal.SIGINT)
+                return out
+
+        boskos = _Boskos_signalling_acquire(free=[P7, P8])
+        previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+        outcomes = {}
+        try:
+            with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()):
+                with self.assertRaises(boskos_pool.Terminated):
+                    reconcile.reconcile_pool(BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known=KNOWN, run=reconcile.Run(), outcomes=outcomes)
+        finally:
+            signal.signal(signal.SIGINT, previous)
+        self.assertEqual(boskos.released, [P7], "acquired, never applied, given back")
+        self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_NOT_REACHED, P8: reconcile.OUTCOME_NOT_REACHED})
 
     def test_a_registration_outside_the_mapping_is_still_found_and_reported(self):
         # After the by-name pass, one anonymous acquire: a project Boskos

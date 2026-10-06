@@ -171,11 +171,6 @@ for role, spec in sorted(roles.items()):
 # A selector probe must match at least one object: `kubectl get node -l
 # app=nope` exits ZERO with no output, which is the same trap that made the
 # pathless `absent` safeguards read as passes on the wrong cluster.
-# Where the presence probe keeps the last kubectl stderr, so a failed read
-# can be told from NotFound and quoted in the warning.
-_FLEET_PROBE_ERR_FILE="${TMPDIR:-/tmp}/fleet-probe-err.$$"
-trap 'rm -f "$_FLEET_PROBE_ERR_FILE"' EXIT
-
 _fleet_probe_present() {
   local kubeconfig="$1" namespace="$2" probe="$3" kind rest
   case "$probe" in
@@ -184,11 +179,13 @@ _fleet_probe_present() {
       rest="${probe#*\?}"
       # 0 present, 1 absent (an empty list), 2 the read itself failed: a
       # 403, a control plane mid-upgrade or a token that could not be minted
-      # says nothing about whether the fixture is there.
+      # says nothing about whether the fixture is there. The error text is
+      # kept in a variable, not a file: this file is sourced by the eval job
+      # under its own EXIT trap, so nothing here may install one.
       if [ "$namespace" != "-" ] && [ -n "$namespace" ]; then
-        _FLEET_PROBE_OUT="$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -n "$namespace" -l "$rest" -o name 2>"$_FLEET_PROBE_ERR_FILE")" || return 2
+        if ! _FLEET_PROBE_OUT="$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -n "$namespace" -l "$rest" -o name 2>&1)"; then _FLEET_PROBE_ERR="$_FLEET_PROBE_OUT"; return 2; fi
       else
-        _FLEET_PROBE_OUT="$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -l "$rest" -o name 2>"$_FLEET_PROBE_ERR_FILE")" || return 2
+        if ! _FLEET_PROBE_OUT="$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -l "$rest" -o name 2>&1)"; then _FLEET_PROBE_ERR="$_FLEET_PROBE_OUT"; return 2; fi
       fi
       [ -n "$_FLEET_PROBE_OUT" ]
       ;;
@@ -200,11 +197,13 @@ _fleet_probe_present() {
       # "${empty[@]}" under `set -u`.
       # 0 present, 1 NotFound, 2 any other failure of the read.
       if [ "$namespace" != "-" ] && [ -n "$namespace" ]; then
-        KUBECONFIG="$kubeconfig" kubectl get "$kind" "$rest" -n "$namespace" >/dev/null 2>"$_FLEET_PROBE_ERR_FILE" && return 0
+        _FLEET_PROBE_ERR="$({ KUBECONFIG="$kubeconfig" kubectl get "$kind" "$rest" -n "$namespace" >/dev/null; } 2>&1)" && return 0
       else
-        KUBECONFIG="$kubeconfig" kubectl get "$kind" "$rest" >/dev/null 2>"$_FLEET_PROBE_ERR_FILE" && return 0
+        _FLEET_PROBE_ERR="$({ KUBECONFIG="$kubeconfig" kubectl get "$kind" "$rest" >/dev/null; } 2>&1)" && return 0
       fi
-      grep -q 'NotFound' "$_FLEET_PROBE_ERR_FILE" && return 1
+      case "$_FLEET_PROBE_ERR" in
+        *NotFound*) return 1 ;;
+      esac
       return 2
       ;;
     *)
@@ -502,7 +501,7 @@ write_fleet_kubeconfigs() {
   chmod 600 "${dir}/${_FLEET_MARKER}" "${dir}/.fleet-context"
 
   local slot cluster location slot_config listing discovered errors named
-  local role namespace probe probes confirmed missing
+  local role namespace probe probes confirmed missing unreadable unreadable_why probe_rc
   local written=0 unresolved=0 unplanted=0 found=0 labelled=0
   if ! listing="$(_fleet_list_seeded_clusters "$project")"; then
     echo "WARNING: could not list clusters in ${project}; every fleet check will report status=error" >&2
@@ -615,14 +614,17 @@ write_fleet_kubeconfigs() {
         1) missing+="${probe} " ;;
         *)
           unreadable+="${probe} "
-          unreadable_why="$(tail -n 1 "$_FLEET_PROBE_ERR_FILE" 2>/dev/null | tr -d '\r')"
+          unreadable_why="$(printf '%s' "$_FLEET_PROBE_ERR" | tail -n 1 | tr -d '\r')"
           ;;
       esac
     done
     if [ -n "$unreadable" ]; then
       # Not "never planted": the read failed, so nothing is known about the
       # fixture, and the scan records the role as not checked, not absent.
+      # Counted with the unreached roles, so the summary line still adds up
+      # to the catalog and the pool verifier excuses it as unreached.
       echo "WARNING: ${unreadable% } could not be read from ${slot_config##*/} in ${project} (${unreadable_why:-no error text}), so fixture role '${role}' could not be checked. Its checks will report status=error rather than blaming the run." >&2
+      unresolved=$((unresolved + 1))
       continue
     fi
     if [ -n "$missing" ]; then

@@ -91,7 +91,10 @@ ALLOW_KEY_STANDING = "standing"
 ALLOW_KEYS = frozenset({ALLOW_KEY_ADDRESS, ALLOW_KEY_WHY, ALLOW_KEY_STANDING})
 # A resource address as `tofu show -json` prints it: optional module path,
 # type, name, optional index. Anything else can never match a plan.
-ALLOW_ADDRESS_RE = re.compile(r"^(module\.[A-Za-z0-9_-]+(\[[^\]]+\])?\.)*[a-z][a-z0-9_]*\.[A-Za-z_][A-Za-z0-9_-]*(\[[^\]]+\])?$")
+# The index is the two shapes tofu prints, a count or a quoted key: an
+# approximation here admits an address no plan can ever match.
+ALLOW_INDEX_RE = r'\[(\d+|"(?:[^"\\]|\\.)*")\]'
+ALLOW_ADDRESS_RE = re.compile(r"^(module\.[A-Za-z0-9_-]+(%s)?\.)*[a-z][a-z0-9_]*\.[A-Za-z_][A-Za-z0-9_-]*(%s)?$" % (ALLOW_INDEX_RE, ALLOW_INDEX_RE))
 AllowEntry = collections.namedtuple("AllowEntry", "address why standing")
 # seeded-b's maintenance exclusion is re-stamped from `timestamp()` on every
 # plan (bench/tf/fleet/main.tf), so a converged project still plans one
@@ -178,6 +181,13 @@ FAILING_OUTCOMES = frozenset({OUTCOME_REFUSED, OUTCOME_FAILED})
 AT_TREE_OUTCOMES = frozenset({OUTCOME_APPLIED, OUTCOME_CONVERGED, OUTCOME_UNCHANGED})
 # A project the run held and planned: everything but the two it never leased.
 VISITED_OUTCOMES = frozenset(OUTCOMES) - {OUTCOME_BUSY, OUTCOME_NOT_REACHED}
+
+
+def visited_count(outcomes, run=None):
+    """How many of the projects the run set out to visit it held: a stray
+    registration recorded failed is outside that set and does not count."""
+    names = run.mapped_names if run is not None and run.mapped_names is not None else None
+    return sum(1 for p, (o, _) in outcomes.items() if o in VISITED_OUTCOMES and (names is None or p in names))
 OUTPUT_TAIL_CHARS = 600
 REASON_UNMAPPED = "not a mapped pool project (gitops_repo_for_project in hack/ci-deploy.sh)"
 # Boskos's 404 does not say which; a mapped project lands here between its
@@ -192,7 +202,7 @@ REASON_NOT_REACHED_TERMINATED = "not started: the run was terminated; the next r
 REASON_NOT_REACHED_RUN_ERROR = "not started: the run stopped on an error (%s); the next run takes it"
 REASON_INTERRUPTED_BEFORE = "terminated (%s) before tofu %s started; nothing was changed and nothing is locked"
 REASON_RUN_ERROR = "the run hit an error at this project: %s"
-REASON_VISITED_NONE = "visited no project of the %d asked for: every one was busy for the whole budget, or is not registered in Boskos under its mapped name"
+REASON_VISITED_NONE = "visited no project of the %d asked for: every one was busy for the whole budget, is not registered in Boskos under its mapped name, or the budget ran out polling them"
 REASON_RESTAMP = "re-stamp of seeded-b's maintenance exclusion only"
 WARNING_MARKER = "applied.json not written: %s"
 
@@ -231,6 +241,11 @@ def tofu_runner(argv, cwd=None, timeout=None, **_):
                 argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True
             )
             _children_add(proc)
+            # A termination that landed between the pre-spawn check and this
+            # registration missed the forward; the child gets its interrupt
+            # here, and exits on it instead of at the drain's kill.
+            if terminating():
+                proc.send_signal(signal.SIGINT)
         finally:
             boskos_pool._hold_signals(False)
         out, err = proc.communicate(timeout=timeout)
@@ -654,6 +669,10 @@ class Run:
         # when visited reaches this.
         self.mapped = None
         self.mapped_names = None
+        # Set when the stop was main moving under the run: nothing is wrong,
+        # the next run does the work, so a run that visited nothing for that
+        # reason is not red.
+        self.main_moved = False
         self._stop = None
         self._last_main_check = None
 
@@ -722,6 +741,7 @@ class Run:
             print("WARNING: could not read %s's fleet tree: %s" % (self.main_ref, exc), file=sys.stderr)
             return None
         if current != self.fleet_tree:
+            self.main_moved = True
             return REASON_NOT_REACHED_MOVED % (self.main_ref, current, self.fleet_tree)
         return None
 
@@ -902,8 +922,9 @@ def reconcile_pool(server, owner, runner=tofu_runner, dry_run=False, known=None,
     Asked for by name rather than taken as Boskos hands them out, so a
     project leased when the run starts is asked for again, every
     POLL_INTERVAL_SECONDS, and reached once free. A registration outside the
-    mapping is never asked for (the pull sweep reports those). What is still
-    busy, or not started, when the budget runs out or main's fleet tree
+    mapping is never asked for by name; one anonymous acquire after the pass
+    finds one and reds the run (_check_for_stray_registration). What is
+    still busy, or not started, when the budget runs out or main's fleet tree
     moves is `not_reached`, for the next run.
     """
     known = pool_projects() if known is None else known
@@ -936,6 +957,11 @@ def reconcile_pool(server, owner, runner=tofu_runner, dry_run=False, known=None,
             try:
                 acquired = _hold_named(project, server, owner, runner, dry_run, run, outcomes) is not boskos_pool.NOT_ACQUIRED
             except boskos_pool.Terminated:
+                # Deferred across the acquire and raised before the visit: the
+                # project was popped, held and released, and never planned.
+                if project not in outcomes:
+                    outcomes[project] = (OUTCOME_NOT_REACHED, REASON_NOT_REACHED_TERMINATED)
+                    _line(project, outcomes[project])
                 raise
             except Exception as exc:  # noqa: BLE001 -- a Boskos or network fault: on the record, and the run stops
                 # The project is on the report as this run's error, and the
@@ -995,11 +1021,16 @@ def _check_for_stray_registration(server, owner, runner, dry_run, run, outcomes)
     release_failures = {}
 
     def visit(project):
-        if project in outcomes or project in (run.mapped_names or ()):
+        if project in outcomes:
+            # Real Boskos frees a released project at once, so this is
+            # usually one the pass just reconciled: released untouched.
+            return
+        if project in (run.mapped_names or ()):
+            # Mapped, busy at its turn, free now: reconciled.
             _record(project, outcomes, runner, dry_run, run)
-        else:
-            outcomes[project] = (OUTCOME_FAILED, REASON_UNMAPPED)
-            _line(project, outcomes[project])
+            return
+        outcomes[project] = (OUTCOME_FAILED, REASON_UNMAPPED)
+        _line(project, outcomes[project])
 
     try:
         boskos_pool.acquire_and_hold(server, owner, HOLD_STATE, lambda: boskos_pool.acquire(server, owner, HOLD_STATE), visit, release_failures, heartbeat=True)
@@ -1204,7 +1235,7 @@ def write_report(path, args, outcomes, code, error, started, run=None):
         "exit_code": code,
         "error": error,
         "mapped": run.mapped if run else None,
-        "visited": sum(1 for o, _ in outcomes.values() if o in VISITED_OUTCOMES),
+        "visited": visited_count(outcomes, run),
         "outcomes": {
             project: dict({"outcome": outcome, "detail": detail}, **extras.get(project, {}))
             for project, (outcome, detail) in sorted(outcomes.items())
@@ -1251,9 +1282,10 @@ def _run(args, outcomes, error, run):
             error.append("%d project(s) not reconciled: %s" % (len(failing), ", ".join(failing)))
             print("ERROR: %s" % error[-1], file=sys.stderr)
             return EXIT_FAILED
-        visited = sum(1 for o, _ in outcomes.values() if o in VISITED_OUTCOMES)
-        all_busy = all(o == OUTCOME_BUSY or (o == OUTCOME_NOT_REACHED and d == REASON_NOT_REACHED_BUSY) for o, d in outcomes.values())
-        if args.all and outcomes and visited == 0 and all_busy:
+        visited = visited_count(outcomes, run)
+        if args.all and outcomes and visited == 0 and not run.main_moved:
+            # Busy for the whole budget, unregistered under the mapped name,
+            # or a budget the poll ate: whichever, nothing applied today.
             # Every project busy or never registered under its mapped name
             # for the whole budget: a green build that applied nothing would
             # hide a pool held all day or a Boskos registration that no longer

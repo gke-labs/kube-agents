@@ -970,9 +970,9 @@ place, absence, does, effect, runbook}`. `detail` (on `FAILED` only)
 is the report's lines, the projects capped at five (then `and N more`) and the
 run's lines after the cap: for the reconcile the
 projects it refused, failed or was interrupted in, each with its one next
-step, then how many it did not reach and why, then (only for a run whose
-`visited` reached `mapped` and whose every visited project carries an
-allowlist verdict) the allowlist entries no plan needed, then the
+step, then how many it did not reach and why, then (only for an `--all`
+run whose `visited` reached `mapped` and whose every visited project carries
+an allowlist verdict) the allowlist entries no plan needed, then the
 run's own `error` line; for the sweep the projects whose sweep failed with GitHub's answer, then
 the writes left for the next run under its budget, then the projects held and
 released unswept after the run stopped, then why the run ended early or its

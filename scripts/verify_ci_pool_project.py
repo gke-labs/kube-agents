@@ -964,7 +964,7 @@ _FLEET_COULD_NOT_LOOK = re.compile(r"could not list clusters in", re.I)
 # the script names a slot no labelled cluster resolved to, and that warning is
 # in the list above, where it fails the check whatever else went unreached.
 _FLEET_UNREACHABLE = re.compile(
-    r"no credentials for seeded cluster|could not create a temporary file|kubeconfig could not be rewritten to",
+    r"no credentials for seeded cluster|could not create a temporary file|kubeconfig could not be rewritten to|could not be read from",
     re.I,
 )
 

@@ -988,7 +988,17 @@ def periodic_clears(health: dict, prev: dict | None) -> list[str]:
     current = health.get("periodics") or {}
     read = set(health.get("periodics_read") or [])
     runs = health.get("periodics_runs") or {}
-    return sorted(job for job in told if job in read and job not in current and (runs.get(job) or {}).get("passed"))
+
+    def recovered(job):
+        own = runs.get(job) or {}
+        if own.get("passed"):
+            return True
+        # A superseding job's later pass is the recovery for one with no window.
+        other = runs.get(periodics.SUPERSEDED_BY.get(job, "")) or {}
+        when, later = parse_iso(own.get("finished_at")), parse_iso(other.get("finished_at"))
+        return bool(other.get("passed")) and when is not None and later is not None and later > when
+
+    return sorted(job for job in told if job in read and job not in current and recovered(job))
 
 
 def _job_words(job: str, note: dict | None = None) -> dict:
@@ -1115,7 +1125,7 @@ def periodic_digest_lines(health: dict, now: datetime | None = None) -> list[str
     for job, note in sorted((health.get("periodics") or {}).items()):
         words = _job_words(job, note)
         if note.get("verdict") == periodics.VERDICT_STALE:
-            last = f"last finished run {clock(parse_iso(note.get('finished_at')))}" if note.get("finished_at") else f"build {note['build']} finished at a time its finished.json does not give"
+            last = f"last finished run {dated_clock(parse_iso(note.get('finished_at')), now)}" if note.get("finished_at") else f"build {note['build']} finished at a time its finished.json does not give"
             lines.append(f"⚪ {words['place']}: {_stale_headline(words, note)}; {last}.")
         else:
             lines.append(f"🟠 {words['place']}: {words['absence']} (build {note['build']} failed {dated_clock(parse_iso(note.get('finished_at')), now)}); {note['history_url']}")

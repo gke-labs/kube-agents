@@ -264,6 +264,16 @@ class AssessTest(unittest.TestCase):
         fresh = {DAILY.job: self.reading(DAILY, NOW - timedelta(hours=35))}
         self.assertEqual(periodics.assess(fresh, NOW, {}), {})
 
+    def test_a_failed_postsubmit_is_retired_once_the_daily_passes_after_it(self):
+        # The postsubmit has no window to retire it; the daily that followed
+        # and converged is the recovery for the same fleet.
+        failed = self.reading(POST, NOW - timedelta(days=2), passed=False, artifact={"summary": {"refused": 1}})
+        later_daily = self.reading(DAILY, NOW - timedelta(hours=1))
+        self.assertEqual(periodics.assess({POST.job: failed, DAILY.job: later_daily}, NOW, {}), {})
+        earlier_daily = self.reading(DAILY, NOW - timedelta(days=3))
+        self.assertIn(POST.job, periodics.assess({POST.job: failed, DAILY.job: earlier_daily}, NOW, {}))
+        self.assertIn(POST.job, periodics.assess({POST.job: failed}, NOW, {}))
+
     def test_a_postsubmit_build_with_no_finish_time_is_still_said_without_a_window(self):
         readings = {POST.job: {"job": POST.job, "build": "9", "finished_at": None, "passed": True, "result": "SUCCESS", "artifact": None}}
         note = periodics.assess(readings, NOW, {})[POST.job]
@@ -291,16 +301,25 @@ class AssessTest(unittest.TestCase):
         }
         artifact["visited"] = 6
         artifact["mapped"] = 6
+        artifact["mode"] = "all"
         lines = periodics.reconcile_detail(artifact)
         self.assertEqual(lines[0], "kube-agents-evals-3: refused (1 refused: delete x); next: a code change, or an entry in bench/tf/fleet/reconcile-allow.json")
         self.assertEqual(lines[1], "kube-agents-evals-4: failed (tofu apply exited 1: boom); next: nothing by hand, the next run retries it")
         # tofu's own lock error counts as locked too, and a non-string detail does not crash the tick.
         locked = {"outcomes": {"p": {"outcome": "failed", "detail": "tofu plan exited 1: Error acquiring the state lock: ConditionNotMet ... Lock Info: ID 1234"}}}
         self.assertTrue(periodics.reconcile_detail(locked)[0].endswith(periodics.RECONCILE_NEXT_STEP_LOCKED))
+        # The 600-character tail the writer keeps can cut the header; the
+        # Lock Info block and the trailer survive it.
+        for tail in ("...  Lock Info:\n  ID: 1234\n  Path: gs://p-tf-state/seeded-fleet/default.tflock", "... OpenTofu acquires a state lock to protect the state from being written by multiple users at the same time."):
+            cut = {"outcomes": {"p": {"outcome": "failed", "detail": "tofu plan exited 1: " + tail}}}
+            self.assertTrue(periodics.reconcile_detail(cut)[0].endswith(periodics.RECONCILE_NEXT_STEP_LOCKED), tail)
         odd = {"outcomes": {"p": {"outcome": "failed", "detail": 1}, "q": {"outcome": "refused", "detail": True}}}
         self.assertEqual(len(periodics.reconcile_detail(odd)), 2)
+        # A ceiling cut is not yet a lock: the runbook says force-unlock only
+        # once the next run fails on it, and that run's message carries the
+        # lock ID the command needs.
         ceiling = {"outcomes": {"p": {"outcome": "failed", "detail": "did not finish within 3600s; tofu was interrupted, and killed if it did not stop within 120s, which leaves the state locked: tofu force-unlock"}}}
-        self.assertEqual(periodics.reconcile_detail(ceiling), ["p: failed (did not finish within 3600s; tofu was interrupted, and killed if it did not stop within 120s, which leaves the state locked: tofu force-unlock); next: tofu force-unlock against that project's state, then the next run retries it"])
+        self.assertEqual(periodics.reconcile_detail(ceiling), ["p: failed (did not finish within 3600s; tofu was interrupted, and killed if it did not stop within 120s, which leaves the state locked: tofu force-unlock); next: the next run retries it, and force-unlocks only if it fails on the lock"])
         self.assertEqual(lines[2], "kube-agents-evals-5: interrupted (terminated (signal 15) while tofu ran; ...: tofu force-unlock); next: the next run retries it, and force-unlocks only if it fails on the lock")
         self.assertEqual(lines[3], "2 not reached (not started: 100s left in the run's budget, under the 3600s per-project ceiling; the next run takes it)")
         # The interrupted project carries no allowlist verdict, so this run
@@ -321,8 +340,12 @@ class AssessTest(unittest.TestCase):
         # no verdict, and that is the project that may still need the entry.
         artifact = {"visited": 2, "mapped": 2, "outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}, "p2": {"outcome": "failed", "detail": "init"}}}
         self.assertFalse(any(line.startswith("allowlist:") for line in periodics.reconcile_detail(artifact)))
-        artifact = {"visited": 2, "mapped": 2, "outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}, "p2": {"outcome": "converged", "detail": "", "allowlist_unused": ["a"]}}}
+        artifact = {"mode": "all", "visited": 2, "mapped": 2, "outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}, "p2": {"outcome": "converged", "detail": "", "allowlist_unused": ["a"]}}}
         self.assertEqual(periodics.reconcile_detail(artifact), ["allowlist: 1 entry no plan needed, remove it: a"])
+        # A drifted or named run's `mapped` is its own list, not the pool: no claim.
+        for mode in ("drifted", "project"):
+            artifact["mode"] = mode
+            self.assertEqual(periodics.reconcile_detail(artifact), [], mode)
         self.assertEqual(periodics.reconcile_detail({"outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}}}), [], "no visited/mapped counts, no claim")
         # A foreign artifact with non-string entries must not kill the tick:
         # a list that is not all strings is no verdict at all.
