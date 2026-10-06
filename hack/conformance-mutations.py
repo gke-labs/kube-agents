@@ -1282,6 +1282,77 @@ Mutation(
         "gateway keeps reading the old name and sees no list",
     ),
     Mutation(
+        "C1-target-allowlist-no-list-denies",
+        "a2a/gateway/allowlist.go",
+        ('\tset := g.targetAllowed[target][backend]\n\tif set == nil {\n\t\treturn true\n\t}',
+         '\tset := g.targetAllowed[target][backend]\n\tif set == nil {\n\t\treturn false\n\t}'),
+        "test_C1_the_target_allowlist_env_names_agree_across_the_module_boundary",
+        "flip the absent-list branch from allow to deny -- a 'tighten the "
+        "default' change that looks safe and instead refuses every "
+        "delegation on a backend nobody configured a target allowlist for, "
+        "contradicting the documented bound (the ingress allowlist is the "
+        "only gate when no target list exists) that every other test here "
+        "assumes",
+    ),
+    Mutation(
+        "C1-target-allowlist-membership-check-loosened",
+        "a2a/gateway/allowlist.go",
+        ('return subject != "" && set[subject]',
+         'return subject != "" || set[subject]'),
+        "test_C1_the_target_allowlist_env_names_agree_across_the_module_boundary",
+        "loosen the membership join from `&&` to `||`: under a configured "
+        "list, any requester with a non-blank subject is admitted whether or "
+        "not they are in the compiled set -- the allowlist stops gating "
+        "anything",
+    ),
+    Mutation(
+        "C1-relay-spells-the-delegate-artifact-by-hand",
+        "a2a/gateway/relay.go",
+        ('case lib.ArtifactDelegate:', 'case "delegate":'),
+        "test_C1_the_delegate_artifact_is_spelled_once",
+        "hand-spell the reserved artifact name in the relay's switch instead "
+        "of referencing lib.ArtifactDelegate -- compiles, routes identically "
+        "today, and stops agreeing with the constant the day its value "
+        "changes",
+    ),
+    Mutation(
+        "C1-worker-adapter-spells-the-delegate-artifact-by-hand",
+        "a2a/worker-adapter/adapter.go",
+        ('a.publishArtifactPart(ctx, lib.ArtifactDelegate,',
+         'a.publishArtifactPart(ctx, "delegate",'),
+        "test_C1_the_delegate_artifact_is_spelled_once",
+        "hand-spell the reserved artifact name at the adapter's one publish "
+        "site instead of referencing lib.ArtifactDelegate",
+    ),
+    Mutation(
+        "C1-delegate-text-cap-hand-spelled-in-delegation",
+        "a2a/gateway/delegation.go",
+        ('len(req.Text) > lib.DelegateTextCap {', 'len(req.Text) > 16*1024 {'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "hand-type the cap in the gateway's own length check instead of "
+        "referencing lib.DelegateTextCap -- agrees with the constant today "
+        "and silently stops the day someone edits only the constant",
+    ),
+    Mutation(
+        "C1-delegate-text-cap-hand-spelled-in-worker-adapter",
+        "a2a/worker-adapter/delegate.go",
+        ('len(req.Text) > lib.DelegateTextCap:', 'len(req.Text) > 16*1024:'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "hand-type the cap in the adapter's validateDelegate instead of "
+        "referencing lib.DelegateTextCap",
+    ),
+    Mutation(
+        "C1-delegate-schema-property-renamed",
+        "a2a/worker-adapter/mcp.go",
+        ('"addressee": map[string]any{"type": "string", "description": "The agent to hand the task to. Today only \\"platform\\"."},',
+         '"target": map[string]any{"type": "string", "description": "The agent to hand the task to. Today only \\"platform\\"."},'),
+        "test_C1_the_delegate_tool_schema_names_agree_with_the_wire_shape",
+        "rename the schema's addressee property to target without touching "
+        "lib.DelegateRequest: the model calls the tool exactly as the schema "
+        "says, the adapter decodes straight into DelegateRequest, and the "
+        "addressee it reads is always empty",
+    ),
+    Mutation(
         "C1-cluster-view-env-renamed-on-the-gateway-side",
         "a2a/gateway/config.go",
         ('os.Getenv("A2A_SESSION_CLUSTER_VIEW")', 'os.Getenv("A2A_SESSION_VIEW")'),
@@ -1373,6 +1444,18 @@ Mutation(
         "widen the session's task-plane grant toward the per-task wildcard the "
         "cards sketched, which puts the executor in its own in-subject writer "
         "set: it can steer and cancel itself as if from the user",
+    ),
+    Mutation(
+        "A3-session-gains-publish-on-anothers-in-subject",
+        "a2a/authcallout/session.go",
+        ('\tg.Publish = append(g.Publish, inbox)\n\treturn g, nil\n}',
+         '\tg.Publish = append(g.Publish, inbox)\n\tg.Publish = append(g.Publish, lib.TaskInSubject("platform", "*"))\n\treturn g, nil\n}'),
+        "test_A3_the_session_grants_no_publish_on_another_addressees_in_subject",
+        "append a literal-addressee grant to the session's Publish list after "
+        "its initial literal, which the narrower in-subject-wildcard mutation "
+        "above would not see: a session that can publish on another "
+        "addressee's `…in` can mint or steer that addressee's tasks as if "
+        "from the user",
     ),
     Mutation(
         "A3-bridge-events-grant-rewildcarded",

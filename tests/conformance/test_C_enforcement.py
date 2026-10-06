@@ -1134,6 +1134,125 @@ class C1IsolationIsStructural(unittest.TestCase):
         self.assertIn("return true", body.split("if set == nil {")[1].split("}")[0],
                       "targetAllows answers an absent list with something other than allow")
 
+        # And the membership check under a list is pinned too: a loosened
+        # join (`||` for `&&`, say) or a dropped blank-subject guard would
+        # admit a subject that is not in the compiled set, or the blank
+        # pseudonym TestABlankListIsNobody relies on reading as "nobody" --
+        # neither of which a rename-only reading of this function would
+        # catch, since both sides still agree on the env names.
+        self.assertIn(
+            'return subject != "" && set[subject]',
+            body,
+            "targetAllows's membership check changed; a looser join or a "
+            "dropped blank-subject guard could admit a requester the "
+            "compiled list does not name",
+        )
+
+    def test_C1_the_delegate_artifact_is_spelled_once(self) -> None:
+        """The reserved artifact name crosses a module boundary in two places.
+
+        `lib.ArtifactDelegate` is defined once in `a2a/lib/payload.go`
+        (spec-a2a-payloads.md, "Reserved artifact names"); the worker-adapter
+        publishes it and the gateway relay switches on it to route a
+        session's delegate ask off the ordinary chat-rendering path. Both
+        are meant to reference the constant rather than the literal
+        `"delegate"`: a hand-spelled literal on either side compiles and
+        passes every Go suite today, because a string literal that happens
+        to equal a constant's value is indistinguishable from the constant at
+        every call site -- and stops agreeing with it silently the day
+        lib.ArtifactDelegate's value changes. `"delegated"` text sits beside
+        both consumers (a chat-facing note on each one) and is excluded
+        rather than mistaken for a reserved-name literal.
+        """
+        payload = h.text("a2a_payload")
+        self.assertIn(
+            'ArtifactDelegate = "delegate"',
+            payload,
+            "lib.ArtifactDelegate's definition moved or changed value; this test compared nothing",
+        )
+        for key, what in (
+            ("a2a_worker_adapter", "the worker-adapter's publish site"),
+            ("a2a_gateway_relay", "the gateway relay's switch"),
+        ):
+            src = h.text(key)
+            self.assertIn("lib.ArtifactDelegate", src, f"{what} no longer references the shared constant")
+            hand_spelled = re.sub(r'"delegated[^"]*"', "", src)
+            self.assertNotIn(
+                '"delegate"', hand_spelled,
+                f"{what} spells the reserved artifact name by hand instead of through lib.ArtifactDelegate",
+            )
+
+    def test_C1_the_delegate_text_cap_is_spelled_once(self) -> None:
+        """Both halves of the length check reference the one constant.
+
+        The worker-adapter refuses an over-length delegate request before it
+        reaches the bus (`validateDelegate`); the gateway ignores one that
+        arrives anyway (`handleDelegateRequest`'s own comment: "the adapter
+        holds the same cap", because the adapter's check is bypassable by
+        anything that can reach the bus directly, so this is a second,
+        independent line of defence rather than a redundant one). Both call
+        `lib.DelegateTextCap`; a hand-typed `16 * 1024` or `16384` on either
+        side compiles, passes every Go suite today, and silently stops
+        agreeing with lib.DelegateTextCap's definition the day someone edits
+        only that constant.
+        """
+        payload = h.text("a2a_payload")
+        self.assertIn(
+            "DelegateTextCap = ",
+            payload,
+            "lib.DelegateTextCap's definition moved; this test compared nothing",
+        )
+        magic_number = re.compile(r"\b16\s*\*\s*1024\b|\b16384\b")
+        for key, what in (
+            ("a2a_worker_adapter_delegate", "the worker-adapter's validateDelegate"),
+            ("a2a_gateway_delegation", "the gateway's handleDelegateRequest"),
+        ):
+            src = h.text(key)
+            self.assertIn("lib.DelegateTextCap", src, f"{what} no longer references the shared cap")
+            self.assertNotRegex(src, magic_number, f"{what} hand-spells the delegate text cap")
+
+    def test_C1_the_delegate_tool_schema_names_agree_with_the_wire_shape(self) -> None:
+        """The MCP tool schema and `lib.DelegateRequest` spell the same two fields.
+
+        The session's harness speaks MCP to the worker-adapter's own server,
+        which answers `tools/list` with `delegateToolSchema` -- a
+        `map[string]any` literal, because that is what an MCP tool definition
+        is on the wire, so it cannot reference `lib.DelegateRequest`'s json
+        tags the way Go code can. The two are independent spellings of one
+        shape: the model calls the tool using the schema's field names, the
+        adapter decodes the call straight into `lib.DelegateRequest`
+        (`callDelegate`'s `Arguments lib.DelegateRequest`), and a rename on
+        either side with nothing on the other is a tool the model calls
+        correctly by its own schema while the adapter quietly reads a field
+        that was never sent -- an empty addressee or an empty text, refused
+        downstream for a reason that looks like a model mistake.
+        """
+        payload = h.text("a2a_payload")
+        struct = payload.split("type DelegateRequest struct {")[1].split("\n}")[0]
+        tags = sorted(re.findall(r'`json:"(\w+)"`', struct))
+        self.assertEqual(
+            ["addressee", "text"],
+            tags,
+            "lib.DelegateRequest's wire shape changed; this test compared nothing",
+        )
+
+        mcp = h.text("a2a_worker_adapter_mcp")
+        schema = mcp.split("var delegateToolSchema")[1].split("\n}\n")[0]
+        properties = sorted(re.findall(r'"(\w+)":\s*map\[string\]any\{"type": "string"', schema))
+        self.assertEqual(
+            tags,
+            properties,
+            "the tool schema's declared properties no longer match lib.DelegateRequest's json tags",
+        )
+        required_block = re.search(r'"required":\s*\[\]string\{([^}]*)\}', schema)
+        self.assertIsNotNone(required_block, "delegateToolSchema's required list moved or changed shape")
+        required = sorted(re.findall(r'"(\w+)"', required_block.group(1)))
+        self.assertEqual(
+            tags,
+            required,
+            "the tool schema's required list no longer matches lib.DelegateRequest's json tags",
+        )
+
     def test_C1_the_reserved_bus_token_file_env_is_spelled_the_same_in_both_modules(
         self,
     ) -> None:

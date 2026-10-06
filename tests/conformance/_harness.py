@@ -442,6 +442,51 @@ SOURCES: dict[str, Source] = {
         "a2a/cmd/a2a/main.go",
         ("func busUser(", "lib.EnvBusUser", "lib.WithKSAToken"),
     ),
+    # --- the delegation primitive ------------------------------------------
+    # The reserved artifact name and its data shape, defined once so the
+    # worker-adapter and the gateway relay never spell either by hand (A3's
+    # "the delegate artifact is spelled once", C1 below).
+    "a2a_payload": Source(
+        "a2a/lib/payload.go",
+        ('ArtifactDelegate = "delegate"', "type DelegateRequest struct {", "DelegateTextCap = "),
+    ),
+    # The worker-adapter's publish site: the one place a session's delegate
+    # ask becomes the reserved artifact on the bus.
+    "a2a_worker_adapter": Source(
+        "a2a/worker-adapter/adapter.go",
+        ("func (a *adapter) publishDelegate(", "lib.ArtifactDelegate"),
+    ),
+    # The worker-adapter's own share of the delegate-request check: the
+    # length cap, read through the shared constant rather than a hand-copied
+    # number, so the adapter and the gateway's second check (below) cannot
+    # silently disagree on what "too long" means.
+    "a2a_worker_adapter_delegate": Source(
+        "a2a/worker-adapter/delegate.go",
+        ("func validateDelegate(", "lib.DelegateTextCap"),
+    ),
+    # The MCP tool schema the session's harness is actually handed. It cannot
+    # reference lib.DelegateRequest's json tags -- it is a map[string]any
+    # literal, by necessity, since that is what go over stdio as the tool
+    # definition -- so its field names and lib.DelegateRequest's are two
+    # independent spellings of the same wire shape, and only a conformance
+    # test can hold them equal.
+    "a2a_worker_adapter_mcp": Source(
+        "a2a/worker-adapter/mcp.go",
+        ("var delegateToolSchema", '"required": []string{"addressee", "text"}'),
+    ),
+    # The gateway's side of the delegate artifact: the switch that routes it
+    # off the ordinary chat-rendering path, and the gateway's own copy of the
+    # length check the adapter already enforces (a defence that matters
+    # exactly because the adapter's is bypassable by anything that can reach
+    # the bus directly).
+    "a2a_gateway_relay": Source(
+        "a2a/gateway/relay.go",
+        ("case lib.ArtifactDelegate:", "func (g *Gateway) applyArtifact("),
+    ),
+    "a2a_gateway_delegation": Source(
+        "a2a/gateway/delegation.go",
+        ("func (g *Gateway) handleDelegateRequest(", "lib.DelegateTextCap"),
+    ),
     # --- supply chain -----------------------------------------------------
     "skill_sync": Source(
         "scripts/sync-upstream-skills.py",

@@ -833,6 +833,36 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
             "the requester can no longer write the in subject; the probe below is then vacuous",
         )
 
+    def test_A3_the_session_grants_no_publish_on_another_addressees_in_subject(self) -> None:
+        """Every `TaskInSubject` call in `sessionGrants` names this session's own pod.
+
+        `_session_publish_derivation` above reads only the function's initial
+        `Publish: []string{...}` literal, because that is where the per-task
+        wildcard mutation it exists to catch would land. It is blind to
+        anything appended to `g.Publish` afterward -- and the delegation
+        primitive's own grants (the capability verify subject, the inbox) are
+        built exactly that way. A line like
+        `g.Publish = append(g.Publish, lib.TaskInSubject("platform", "*"))`
+        would hand the session a requester's grant on another addressee's
+        task -- it could mint or steer that addressee's tasks as if from the
+        user -- and would not appear in that narrower reading at all.
+        Checked over the whole function body instead: every `TaskInSubject`
+        call in it, including the legitimate one (the per-session consumer's
+        read filter, built the same way as the publish grants around it),
+        must name `pod`, the session's own attested name, and nothing else.
+        """
+        body = h.go_function_body(h.text("a2a_session_grants"), "sessionGrants")
+        calls = re.findall(r"TaskInSubject\(\s*([^,]+),", body)
+        self.assertTrue(calls, "sessionGrants calls TaskInSubject nowhere; the probe below is vacuous")
+        for arg in calls:
+            self.assertEqual(
+                "pod",
+                arg.strip(),
+                f"sessionGrants calls TaskInSubject({arg.strip()}, ...): a literal "
+                f"addressee here grants the session a publish on another "
+                f"addressee's in subject",
+            )
+
     def test_A3_the_events_subject_has_no_rendered_writer(self) -> None:
         """A chat session's `…events` has no writer in the rendered map at all.
 
