@@ -86,7 +86,8 @@ class CiDeployHelmRetryTest(unittest.TestCase):
         if history_responses is None:
             if history_exit is None:
                 history_exit = 0 if history_json else 1
-            history_responses = [(history_exit, history_json, "")]
+            stderr = "Error: release: not found\n" if history_exit != 0 else ""
+            history_responses = [(history_exit, history_json, stderr)]
 
         text = _deploy_text()
         with tempfile.TemporaryDirectory() as tmp:
@@ -533,7 +534,7 @@ A2A_OPERATOR_ENV_ARGS=()
         self.assertEqual(len(cr_deletes), 1, f"expected CR delete before uninstall: {calls}")
         uninstalls = [c for c in calls if c.startswith("helm uninstall")]
         self.assertEqual(len(uninstalls), 1, f"expected poisoned record to be healed before retry: {calls}")
-        self.assertIn("probe attempt 1 hit a transient api-server 5xx", out.lower())
+        self.assertIn("probe attempt 1 failed", out.lower())
         self.assertIn("re-probing in 2s", out.lower())
         self.assertIn("cleared the poisoned", out.lower())
 
@@ -560,7 +561,58 @@ A2A_OPERATOR_ENV_ARGS=()
         self.assertEqual(len(helm_upgrades), 1, f"must not issue attempt 2 when probe fails: {calls}")
         uninstalls = [c for c in calls if c.startswith("helm uninstall")]
         self.assertEqual(len(uninstalls), 0, f"must not issue uninstall when probe fails: {calls}")
-        self.assertIn("helm history probe failed with api-server 5xx", err.lower())
+        self.assertIn("helm history probe failed:", err)
+
+    def test_transient_5xx_probe_cluster_unreachable_aborts_under_set_e(self):
+        # When helm history probe fails with a connection error (e.g. cluster unreachable,
+        # dial timeout) rather than "release: not found", retries are exhausted and set -e
+        # stops the run loudly rather than skipping the heal and failing attempt 2 (#2382 bot review).
+        err_msg = "the server is currently unable to handle the request"
+        responses = [
+            (1, "", err_msg),
+            (0, "Release kube-agents installed", ""),
+        ]
+        history_responses = [
+            (1, "", 'Error: Kubernetes cluster unreachable: Get "https://10.0.0.1:443/version": dial tcp 10.0.0.1:443: i/o timeout\n'),
+            (1, "", 'Error: Kubernetes cluster unreachable: Get "https://10.0.0.1:443/version": dial tcp 10.0.0.1:443: i/o timeout\n'),
+            (1, "", 'Error: Kubernetes cluster unreachable: Get "https://10.0.0.1:443/version": dial tcp 10.0.0.1:443: i/o timeout\n'),
+        ]
+        rc, calls, out, err = self._run_deploy_block(
+            responses,
+            history_responses=history_responses,
+        )
+        self.assertNotEqual(rc, 0, f"persistent connection-error probe must fail under set -e: {rc}")
+        helm_upgrades = [c for c in calls if c.startswith("helm upgrade")]
+        self.assertEqual(len(helm_upgrades), 1, f"must not issue attempt 2 when probe fails: {calls}")
+        uninstalls = [c for c in calls if c.startswith("helm uninstall")]
+        self.assertEqual(len(uninstalls), 0, f"must not issue uninstall when probe fails: {calls}")
+        self.assertIn("helm history probe failed:", err)
+        self.assertIn("Kubernetes cluster unreachable", err)
+
+    def test_transient_5xx_probe_cluster_unreachable_reprobes_and_heals_poisoned_release_record(self):
+        # When probe attempt 1 hits a transient connection error but attempt 2 succeeds,
+        # the retry loop heals the poisoned record and succeeds on attempt 2 (#2382 bot review).
+        err_msg = "the server is currently unable to handle the request"
+        responses = [
+            (1, "", err_msg),
+            (0, "Release kube-agents installed", ""),
+        ]
+        history_poisoned = json.dumps([{"revision": 1, "status": "failed"}])
+        history_responses = [
+            (1, "", 'Error: Kubernetes cluster unreachable: Get "https://10.0.0.1:443/version": dial tcp 10.0.0.1:443: i/o timeout\n'),
+            (0, history_poisoned, ""),
+        ]
+        rc, calls, out, err = self._run_deploy_block(
+            responses,
+            history_responses=history_responses,
+        )
+        self.assertEqual(rc, 0, err)
+        helm_upgrades = [c for c in calls if c.startswith("helm upgrade")]
+        self.assertEqual(len(helm_upgrades), 2, f"expected retry attempt 2: {calls}")
+        history_calls = [c for c in calls if c.startswith("helm history")]
+        self.assertEqual(len(history_calls), 2, f"expected re-probe on probe failure: {calls}")
+        uninstalls = [c for c in calls if c.startswith("helm uninstall")]
+        self.assertEqual(len(uninstalls), 1, f"expected poisoned record to be healed: {calls}")
 
     def test_transient_5xx_cr_delete_failure_aborts_without_uninstall(self):
         # When CR deletion fails or times out, set -e must stop the run immediately

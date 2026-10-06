@@ -119,7 +119,8 @@ class CiDeployReleaseGuardTest(unittest.TestCase):
         with the given exit code; kubectl records and exits as asked.
         """
         if history_responses is None:
-            history_responses = [(history_exit, history_json, "")]
+            stderr = "Error: release: not found\n" if history_exit != 0 else ""
+            history_responses = [(history_exit, history_json, stderr)]
 
         text = _deploy_text()
         with tempfile.TemporaryDirectory() as tmp:
@@ -303,7 +304,7 @@ esac
         self.assertEqual(
             [c for c in calls if c.startswith("kubectl delete platformagent")], []
         )
-        self.assertIn("hit a transient api-server 5xx", out.lower())
+        self.assertIn("probe attempt 1 failed", out.lower())
         self.assertIn("cleared the poisoned", out.lower())
 
     def test_lease_time_persistent_probe_5xx_warns_and_proceeds(self):
@@ -318,6 +319,43 @@ esac
         ]
         rc, calls, out, err = self._run_guard(history_responses=history_responses)
         self.assertEqual(rc, 0, f"lease-time probe 5xx must not abort under set -e: {err}")
+        self.assertEqual(self._helm_uninstalls(calls), [])
+        self.assertEqual(self._record_deletes(calls), [])
+        history_calls = [c for c in calls if c.startswith("helm history")]
+        self.assertEqual(len(history_calls), 3, f"expected 3 history calls: {calls}")
+        self.assertIn("skipping lease-time release record heal and proceeding to deploy", out.lower())
+
+    def test_lease_time_transient_probe_cluster_unreachable_reprobes_and_heals_poisoned_release_record(self):
+        """At lease time (§5a), a transient connection error on probe attempt 1 re-probes
+        and heals the record once attempt 2 succeeds."""
+        err_msg = 'Error: Kubernetes cluster unreachable: Get "https://10.0.0.1:443/version": dial tcp 10.0.0.1:443: i/o timeout'
+        history_poisoned = json.dumps([{"revision": 1, "status": "failed"}])
+        history_responses = [
+            (1, "", err_msg),
+            (0, history_poisoned, ""),
+        ]
+        rc, calls, out, err = self._run_guard(history_responses=history_responses)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(self._helm_uninstalls(calls)), 1)
+        self.assertEqual(self._record_deletes(calls), [])
+        self.assertEqual(
+            [c for c in calls if c.startswith("kubectl delete platformagent")], []
+        )
+        history_calls = [c for c in calls if c.startswith("helm history")]
+        self.assertEqual(len(history_calls), 2, f"expected 2 history calls: {calls}")
+        self.assertIn("clearing the", out.lower())
+
+    def test_lease_time_persistent_probe_cluster_unreachable_warns_and_proceeds(self):
+        """At lease time (§5a), if probe persistently fails with connection errors across
+        all attempts, the guard warns and returns 0 rather than aborting under set -e."""
+        err_msg = 'Error: Kubernetes cluster unreachable: Get "https://10.0.0.1:443/version": dial tcp 10.0.0.1:443: i/o timeout'
+        history_responses = [
+            (1, "", err_msg),
+            (1, "", err_msg),
+            (1, "", err_msg),
+        ]
+        rc, calls, out, err = self._run_guard(history_responses=history_responses)
+        self.assertEqual(rc, 0, f"lease-time probe connection error must not abort under set -e: {err}")
         self.assertEqual(self._helm_uninstalls(calls), [])
         self.assertEqual(self._record_deletes(calls), [])
         history_calls = [c for c in calls if c.startswith("helm history")]

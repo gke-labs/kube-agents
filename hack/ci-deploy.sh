@@ -82,6 +82,8 @@ readonly HELM_RELEASE_SECRET_SELECTOR="owner=helm,name=${HELM_RELEASE_NAME}"
 # encoder emits compact `"status":"deployed"`; the pattern tolerates spacing
 # so a Helm formatting change cannot silently blind the guard.
 readonly HELM_DEPLOYED_STATUS_RE='"status"[[:space:]]*:[[:space:]]*"deployed"'
+# What an absent release looks like in `helm history` stderr output ("Error: release: not found").
+readonly HELM_RELEASE_NOT_FOUND_RE="release: not found"
 
 # Bounded retry attempts for the Helm chart install. Transient API-server 5xx
 # errors (500, 502, 503, 504) during Autopilot control-plane scaling or cluster
@@ -89,6 +91,7 @@ readonly HELM_DEPLOYED_STATUS_RE='"status"[[:space:]]*:[[:space:]]*"deployed"'
 readonly HELM_DEPLOY_ATTEMPTS=3
 readonly HELM_DEPLOY_RETRY_DELAY_SECONDS=5
 readonly APISERVER_READYZ_TIMEOUT_SECONDS=30
+readonly APISERVER_READYZ_POLL_INTERVAL_SECONDS=2
 readonly HELM_HISTORY_PROBE_ATTEMPTS=3
 readonly HELM_HISTORY_PROBE_RETRY_DELAY_SECONDS=2
 readonly HELM_API_SERVER_5XX_RE="an error on the server|the server is currently unable to handle the request|the server was unable to return a response in the time allotted|the server responded with the status code 50[0234]|Internal error occurred:|etcdserver:|request did not complete within|(HTTP( response status)?|status:)[: ]+50[0234]([^0-9]|$)"
@@ -810,37 +813,38 @@ heal_poisoned_release_record() {
       history_rc=$?
       history_err="$(cat "${probe_tmp}")"
       rm -f "${probe_tmp}"
-      # If the release simply does not exist ("release: not found" or no 5xx on non-zero exit),
+      # If the release simply does not exist ("release: not found"),
       # there is no release to heal; break immediately without retrying.
-      if ! grep -Eq "${HELM_API_SERVER_5XX_RE}" <<<"${history_err}"; then
+      if grep -Eq "${HELM_RELEASE_NOT_FOUND_RE}" <<<"${history_err}"; then
         break
       fi
-      # If the probe hit an API-server 5xx, wait and re-probe
+      # If the probe failed with any other error (API-server 5xx, cluster unreachable,
+      # connection reset, TLS timeout, auth failure), wait and re-probe
       # rather than prematurely treating it as "absent release" (#2382).
       if [ "${probe_try}" -lt "${HELM_HISTORY_PROBE_ATTEMPTS}" ]; then
-        echo "WARNING: helm history probe attempt ${probe_try} hit a transient API-server 5xx (${history_err}), re-probing in ${HELM_HISTORY_PROBE_RETRY_DELAY_SECONDS}s..."
+        echo "WARNING: helm history probe attempt ${probe_try} failed (${history_err}), re-probing in ${HELM_HISTORY_PROBE_RETRY_DELAY_SECONDS}s..."
         sleep "${HELM_HISTORY_PROBE_RETRY_DELAY_SECONDS}"
       fi
     fi
   done
 
   if [ "${history_rc}" -ne 0 ]; then
-    # If the release does not exist (or probe exited non-zero with no 5xx),
+    # If the release does not exist ("release: not found"),
     # there is no release record to heal.
-    if ! grep -Eq "${HELM_API_SERVER_5XX_RE}" <<<"${history_err}"; then
+    if grep -Eq "${HELM_RELEASE_NOT_FOUND_RE}" <<<"${history_err}"; then
       return 0
     fi
-    # If probe failed with an API-server 5xx and re-probes were exhausted:
+    # If probe failed with an error other than "release: not found" and re-probes were exhausted:
     # On in-loop retry (§5c), fail loudly under set -e so the run does not
     # silently skip healing and fail attempt 2 on "has no deployed releases" (#2382).
     # At lease time (§5a), degrade to the pre-fix behaviour: warn and skip
     # the heal so a transient control-plane blip seconds after creation does not
     # abort the run before chart deployment and its retry loop can run.
     if [ "${action}" = "retrying" ]; then
-      echo "ERROR: helm history probe failed with API-server 5xx: ${history_err}" >&2
+      echo "ERROR: helm history probe failed: ${history_err}" >&2
       return "${history_rc}"
     fi
-    echo "WARNING: helm history probe failed with API-server 5xx after ${HELM_HISTORY_PROBE_ATTEMPTS} attempts (${history_err}); skipping lease-time release record heal and proceeding to deploy."
+    echo "WARNING: helm history probe failed after ${HELM_HISTORY_PROBE_ATTEMPTS} attempts (${history_err}); skipping lease-time release record heal and proceeding to deploy."
     return 0
   fi
 
@@ -1008,7 +1012,7 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Deploying the kube-agents chart ===
 # their statuses. "History succeeds but no revision is deployed" is
 # therefore precisely the state upgrade rejects — including a latest-failed
 # release with an older deployed revision, which upgrades fine and is left
-# alone. One call (or bounded re-probes if the probe hits a transient control-plane 5xx);
+# alone. One call (or bounded re-probes if the probe hits a transient control-plane error);
 # a healthy or absent release costs the probe and nothing more.
 heal_poisoned_release_record
 
@@ -1080,7 +1084,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
       if kubectl get --raw /readyz >/dev/null 2>&1; then
         break
       fi
-      sleep 2
+      sleep "${APISERVER_READYZ_POLL_INTERVAL_SECONDS}"
     done
     # If the failed attempt left behind a release record with no deployed revision,
     # clear it so the next attempt can install cleanly (#1172, #2382).
