@@ -211,6 +211,11 @@ class CiDeployReleaseGuardTest(unittest.TestCase):
         self.assertIn(_NAMESPACE, argv)
         # The uninstall succeeded, so the Secret-level fallback stays unused.
         self.assertEqual(self._record_deletes(calls), [])
+        # Lease time never touches the CR: no operator is running to clear its
+        # finalizer, so a --wait delete here would time out and abort the run.
+        self.assertEqual(
+            [c for c in calls if c.startswith("kubectl delete platformagent")], []
+        )
         # And the heal is loud: a later reader of a red run's log must see it.
         self.assertIn("poisoned", out.lower())
 

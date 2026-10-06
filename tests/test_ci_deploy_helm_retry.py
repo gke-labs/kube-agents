@@ -341,7 +341,7 @@ A2A_OPERATOR_ENV_ARGS=()
         # 5. Internal error occurred: (API server 500 / admission webhook failure)
         # 6. etcdserver: (etcd transient timeout / leader election)
         # 7. request did not complete within (API server request timeout)
-        # 8. (HTTP|status( code)?)[: ]+50[0234]([^0-9]|$) (bounded 5xx HTTP/status codes)
+        # 8. (HTTP( response status)?|status:)[: ]+50[0234]([^0-9]|$) (bounded 5xx HTTP/status codes)
         signatures = [
             'an error on the server ("connection reset") has prevented the request from succeeding',
             "the server is currently unable to handle the request (post configmaps)",
@@ -355,7 +355,7 @@ A2A_OPERATOR_ENV_ARGS=()
             "Timeout: request did not complete within the allotted timeout",
             "HTTP response status 502 from control plane load balancer",
             "HTTP 500 Internal Server Error",
-            "status code 504",
+            "status: 504",
             "status: 503",
         ]
         for sig in signatures:
@@ -388,6 +388,57 @@ A2A_OPERATOR_ENV_ARGS=()
         for non in non_5xx:
             with self.subTest(non_5xx=non):
                 self.assertFalse(pattern.search(non), f"pattern must NOT match non-5xx: {non!r}")
+
+    def test_dropping_any_single_alternation_fails_a_signature(self):
+        # Verify that all 8 alternations are mutually independent: dropping any
+        # single alternation causes at least one representative signature to fail.
+        import re
+
+        text = _deploy_text()
+        m = re.search(r'^readonly HELM_API_SERVER_5XX_RE=["\']([^"\']+)["\']', text, re.MULTILINE)
+        self.assertIsNotNone(m, "HELM_API_SERVER_5XX_RE not found in hack/ci-deploy.sh")
+        assert m is not None
+
+        # Split top-level alternations respecting parenthesis nesting
+        alts = []
+        current = []
+        depth = 0
+        for char in m.group(1):
+            if char == "(":
+                depth += 1
+                current.append(char)
+            elif char == ")":
+                depth -= 1
+                current.append(char)
+            elif char == "|" and depth == 0:
+                alts.append("".join(current))
+                current = []
+            else:
+                current.append(char)
+        if current:
+            alts.append("".join(current))
+
+        self.assertEqual(len(alts), 8, f"expected 8 alternations: {alts}")
+
+        # Unique representative signature for each alternation:
+        alt_signatures = [
+            'an error on the server ("connection reset") has prevented the request from succeeding',
+            "the server is currently unable to handle the request (post configmaps)",
+            "the server was unable to return a response in the time allotted, but may still be processing the request",
+            "the server responded with the status code 502",
+            'Error from server (InternalError): Internal error occurred: failed calling webhook "gate.example.com"',
+            "etcdserver: request timed out",
+            "Timeout: request did not complete within the allotted timeout",
+            "HTTP response status 502 from control plane load balancer",
+        ]
+        for i, alt in enumerate(alts):
+            with self.subTest(dropped_alternation=alt):
+                remaining_alts = [a for j, a in enumerate(alts) if j != i]
+                reduced_pattern = re.compile("|".join(remaining_alts))
+                self.assertFalse(
+                    reduced_pattern.search(alt_signatures[i]),
+                    f"dropping alternation {i} ({alt!r}) must fail to match {alt_signatures[i]!r}",
+                )
 
     def test_persistent_5xx_exhausts_retries_and_fails(self):
         err_msg = "Timeout: request did not complete within the allotted timeout"

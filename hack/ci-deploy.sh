@@ -88,7 +88,7 @@ readonly HELM_DEPLOYED_STATUS_RE='"status"[[:space:]]*:[[:space:]]*"deployed"'
 # startup can fail the first attempt; retrying proceeds to evaluation (#2382).
 readonly HELM_DEPLOY_ATTEMPTS=3
 readonly HELM_DEPLOY_RETRY_DELAY_SECONDS=5
-readonly HELM_API_SERVER_5XX_RE="an error on the server|the server is currently unable to handle the request|the server was unable to return a response in the time allotted|the server responded with the status code 50[0234]|Internal error occurred:|etcdserver:|request did not complete within|(HTTP|status( code)?)[: ]+50[0234]([^0-9]|$)"
+readonly HELM_API_SERVER_5XX_RE="an error on the server|the server is currently unable to handle the request|the server was unable to return a response in the time allotted|the server responded with the status code 50[0234]|Internal error occurred:|etcdserver:|request did not complete within|(HTTP( response status)?|status:)[: ]+50[0234]([^0-9]|$)"
 
 # The keypair the agent uses to reach its shell sandbox over SSH. Generated per
 # run and thrown away with the lease: nothing outside this cluster ever sees it,
@@ -140,6 +140,10 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 # password key in platformagent_a2a_manifests.go). The CR name is the chart's
 # platformAgent.name default, which this deploy does not override.
 readonly PLATFORM_AGENT_CR_NAME="platform-agent"
+# Timeout for deleting the PlatformAgent CR during retry, allowing the live
+# operator to clear its finalizer before uninstallation. Matches
+# charts/kube-agents/values.yaml cleanupHook.timeout (120s).
+readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # The next lane's Prow jobs: its on-demand presubmit and its periodic on
 # main. Section 2b admits the flag on a run whose JOB_NAME is one of these
 # (space-separated, matched whole) or that carries a PULL_NUMBER -- the
@@ -806,7 +810,7 @@ heal_poisoned_release_record() {
     # a --no-hooks uninstall that strands the CR in Terminating.
     if [ "${action}" = "retrying" ]; then
       kubectl delete platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" \
-        --ignore-not-found --wait --timeout=120s
+        --ignore-not-found --wait --timeout="${PLATFORM_AGENT_CR_DELETE_TIMEOUT}"
     fi
 
     # --no-hooks: at lease time (§5a), a leftover release from a failed prior
