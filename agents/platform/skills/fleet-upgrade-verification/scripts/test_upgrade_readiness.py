@@ -554,6 +554,25 @@ class WebhookScopeTest(unittest.TestCase):
         self.assertEqual(self._path([rule(["pods/"])]), ["CREATE pods"])
         self.assertEqual(self._path([rule(["*/"])]), ["CREATE pods", "CREATE nodes"])
 
+    def test_resource_matches_is_the_api_servers_split_and_two_comparisons(self):
+        # k8s.io/apiserver's rules.Matcher: splitResource on the first `/` (no `/` is an empty
+        # subresource), then `res == "*" || res == opRes` and `sub == "*" || sub == opSub`.
+        # Each spelling the API admits, against a resource and a subresource request.
+        table = {
+            "*": {"pods": True, "pods/status": False, "nodes": True, "nodes/status": False},
+            "pods": {"pods": True, "pods/status": False, "nodes": False, "nodes/status": False},
+            "pods/*": {"pods": True, "pods/status": True, "nodes": False, "nodes/status": False},
+            "pods/status": {"pods": False, "pods/status": True, "nodes": False, "nodes/status": False},
+            "*/status": {"pods": False, "pods/status": True, "nodes": False, "nodes/status": True},
+            "*/*": {"pods": True, "pods/status": True, "nodes": True, "nodes/status": True},
+            "pods/": {"pods": True, "pods/status": False, "nodes": False, "nodes/status": False},
+            "*/": {"pods": True, "pods/status": False, "nodes": True, "nodes/status": False},
+        }
+        for spec, expected in table.items():
+            for target, want in expected.items():
+                with self.subTest(spec=spec, target=target):
+                    self.assertEqual(r._resource_matches(spec, target), want)
+
     def test_operation_group_and_scope_must_all_match(self):
         self.assertEqual(self._path([rule(["pods"], operations=("UPDATE",))]), [])
         self.assertEqual(self._path([rule(["pods"], operations=("*",))]), ["CREATE pods", "DELETE pods"])
