@@ -230,8 +230,9 @@ Four ways a workload breaks on a new version:
   writes during an upgrade, not just the pods being moved. Report the backend too — one replica with
   no liveness probe is what turns a slow webhook into a stuck one. `--readiness` already grades the
   case where the backend is unreachable now, on the webhook's rules (pods with their binding,
-  status, eviction and token requests, nodes and their status, bootstrap certificate requests,
-  leases and volume attachments); the selectors, `kube-system` reach and the
+  status, eviction and token requests, nodes and their status, bootstrap certificate requests
+  with their approval and signing, CSINodes, leases and volume attachments); the selectors,
+  `kube-system` reach and the
   would-fail-once-drained backend are still
   unread.
 - **Manifests in Git, and release state, not just live clusters.** Stored Helm release manifests

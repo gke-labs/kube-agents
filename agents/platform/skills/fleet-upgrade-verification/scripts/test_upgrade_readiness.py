@@ -527,7 +527,26 @@ class WebhookScopeTest(unittest.TestCase):
         self.assertEqual(self._path([rule(["serviceaccounts/*"])]), ["CREATE serviceaccounts/token"])
         self.assertEqual(self._path([rule(["serviceaccounts"])]), [])  # the object, not its token subresource
         self.assertEqual(self._path([rule(["certificatesigningrequests"], groups=("certificates.k8s.io",))]), ["CREATE certificatesigningrequests"])
+        # The CSR is useless until approved and signed: both are UPDATEs on its subresources,
+        # which a rule on the bare resource does not reach and a rule on the subresource does.
+        self.assertEqual(self._path([rule(["certificatesigningrequests/approval"], operations=("UPDATE",), groups=("certificates.k8s.io",))]), ["UPDATE certificatesigningrequests/approval"])
+        self.assertEqual(self._path([rule(["certificatesigningrequests/status"], operations=("UPDATE",), groups=("certificates.k8s.io",))]), ["UPDATE certificatesigningrequests/status"])
+        self.assertEqual(self._path([rule(["certificatesigningrequests/*"], operations=("UPDATE",), groups=("certificates.k8s.io",))]), ["UPDATE certificatesigningrequests/approval", "UPDATE certificatesigningrequests/status"])
+        self.assertEqual(self._path([rule(["certificatesigningrequests"], operations=("UPDATE",), groups=("certificates.k8s.io",))]), [])  # the object, not its subresources
+        # The CSINode the kubelet creates before it reports Ready.
+        self.assertEqual(self._path([rule(["csinodes"], groups=("storage.k8s.io",))]), ["CREATE csinodes"])
         self.assertEqual(self._path([rule(["volumeattachments"], groups=("storage.k8s.io",))]), ["CREATE volumeattachments"])
+
+    def test_a_gate_on_csinodes_or_csr_approval_alone_blocks(self):
+        # A new node stays NotReady without its CSINode; a bootstrap CSR nobody can approve or
+        # sign leaves it without a client certificate. Each alone grades the member blocked.
+        graded = grade([
+            hook("csinode.example.com", [rule(["csinodes"], groups=("storage.k8s.io",))], policy="Fail"),
+            hook("approve.example.com", [rule(["certificatesigningrequests/approval"], operations=("UPDATE",), groups=("certificates.k8s.io",))], policy="Fail"),
+            hook("sign.example.com", [rule(["certificatesigningrequests/status"], operations=("UPDATE",), groups=("certificates.k8s.io",))], policy="Fail"),
+        ])
+        self.assertEqual([f["upgrade_path"] for f in graded["blocking"]], [["CREATE csinodes"], ["UPDATE certificatesigningrequests/approval"], ["UPDATE certificatesigningrequests/status"]])
+        self.assertEqual(graded["outage"], [])
 
     def test_a_gate_on_token_requests_or_bootstrap_csrs_alone_blocks(self):
         # Replacement pods stuck in ContainerCreating without a token; a surge node that never joins without its CSR.
@@ -577,7 +596,7 @@ class WebhookScopeTest(unittest.TestCase):
         self.assertEqual(self._path([rule(["pods"], operations=("UPDATE",))]), [])
         self.assertEqual(self._path([rule(["pods"], operations=("*",))]), ["CREATE pods", "DELETE pods"])
         self.assertEqual(self._path([rule(["pods"], groups=("apps",))]), [])
-        self.assertEqual(self._path([rule(["*"], groups=("*",), operations=("*",))]), ["CREATE pods", "DELETE pods", "CREATE nodes", "UPDATE nodes", "DELETE nodes", "CREATE leases", "UPDATE leases", "CREATE certificatesigningrequests", "CREATE volumeattachments"])
+        self.assertEqual(self._path([rule(["*"], groups=("*",), operations=("*",))]), ["CREATE pods", "DELETE pods", "CREATE nodes", "UPDATE nodes", "DELETE nodes", "CREATE leases", "UPDATE leases", "CREATE certificatesigningrequests", "CREATE csinodes", "CREATE volumeattachments"])
         self.assertEqual(self._path([rule(["nodes"], scope="Namespaced")]), [])
         self.assertEqual(self._path([rule(["pods"], scope="Cluster")]), [])
 

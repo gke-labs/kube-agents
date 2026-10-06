@@ -160,8 +160,13 @@ BACKEND_NO_ENDPOINTS = "Service {service} has no ready endpoints on port {port}"
 # cordoned and then deleted. The kubelet's heartbeat lease, created and renewed. The token
 # the kubelet requests for every projected service-account volume before a pod can start
 # (`serviceaccounts/token`), the certificate signing request a new node's kubelet files to
-# bootstrap its TLS identity, and the VolumeAttachment the attach controller creates for a
-# replacement pod's persistent disk. A rule that can match any of these puts the webhook in
+# bootstrap its TLS identity together with its approval and its signing (the `approval` and
+# `status` subresources, written by the approver and the signer; an unsigned request leaves
+# the node without a client certificate), the CSINode the kubelet creates when it starts
+# (the kubelet holds its `Ready` condition on a storage error until the object exists, and
+# exits after about 140 s of retries), and the VolumeAttachment the attach controller
+# creates for a replacement pod's persistent disk. A rule that can match any of these puts
+# the webhook in
 # the upgrade's path; a rule that matches none of them is reported, not graded, because this
 # list is what the rule knows of the path rather than a proof the upgrade is unaffected.
 # `namespaceSelector`, `objectSelector` and `matchConditions` are not evaluated: a webhook
@@ -184,6 +189,9 @@ UPGRADE_PATH_TARGETS = (
     ("coordination.k8s.io", "leases", "UPDATE", SCOPE_NAMESPACED),
     ("", "serviceaccounts/token", "CREATE", SCOPE_NAMESPACED),
     ("certificates.k8s.io", "certificatesigningrequests", "CREATE", SCOPE_CLUSTER),
+    ("certificates.k8s.io", "certificatesigningrequests/approval", "UPDATE", SCOPE_CLUSTER),
+    ("certificates.k8s.io", "certificatesigningrequests/status", "UPDATE", SCOPE_CLUSTER),
+    ("storage.k8s.io", "csinodes", "CREATE", SCOPE_CLUSTER),
     ("storage.k8s.io", "volumeattachments", "CREATE", SCOPE_CLUSTER),
 )
 UPGRADE_PATH_LABEL = "{operation} {resource}"
