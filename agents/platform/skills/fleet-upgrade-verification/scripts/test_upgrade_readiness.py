@@ -502,7 +502,7 @@ class WebhookScopeTest(unittest.TestCase):
         graded = grade([hook("gate.seeded.invalid", [rule(["configmaps"])], policy="Fail", service=("seeded-upgrade", "nonexistent-admission-gate"))])
         self.assertEqual(graded["blocking"], [])
         self.assertEqual(len(graded["outage"]), 1)
-        self.assertIn("matches nothing a node upgrade needs", r.describe_webhook_finding(graded["outage"][0]))
+        self.assertIn("matches none of the operations this rule reads as the upgrade's path", r.describe_webhook_finding(graded["outage"][0]))
 
     def test_each_upgrade_path_target(self):
         self.assertEqual(self._path([rule(["pods"])]), ["CREATE pods"])
@@ -513,6 +513,19 @@ class WebhookScopeTest(unittest.TestCase):
         self.assertEqual(self._path([rule(["nodes"], operations=("CREATE", "UPDATE", "DELETE"))]), ["CREATE nodes", "UPDATE nodes", "DELETE nodes"])
         self.assertEqual(self._path([rule(["nodes/status"], operations=("UPDATE",))]), ["UPDATE nodes/status"])
         self.assertEqual(self._path([rule(["leases"], operations=("CREATE", "UPDATE"), groups=("coordination.k8s.io",))]), ["CREATE leases", "UPDATE leases"])
+        # The kubelet's TokenRequest for every projected token, the new node's bootstrap CSR,
+        # and the attach controller's VolumeAttachment for a replacement pod's disk.
+        self.assertEqual(self._path([rule(["serviceaccounts/token"])]), ["CREATE serviceaccounts/token"])
+        self.assertEqual(self._path([rule(["serviceaccounts/*"])]), ["CREATE serviceaccounts/token"])
+        self.assertEqual(self._path([rule(["serviceaccounts"])]), [])  # the object, not its token subresource
+        self.assertEqual(self._path([rule(["certificatesigningrequests"], groups=("certificates.k8s.io",))]), ["CREATE certificatesigningrequests"])
+        self.assertEqual(self._path([rule(["volumeattachments"], groups=("storage.k8s.io",))]), ["CREATE volumeattachments"])
+
+    def test_a_gate_on_token_requests_or_bootstrap_csrs_alone_blocks(self):
+        # Replacement pods stuck in ContainerCreating without a token; a surge node that never joins without its CSR.
+        graded = grade([hook("tokens.example.com", [rule(["serviceaccounts/token"])], policy="Fail"), hook("csr.example.com", [rule(["certificatesigningrequests"], groups=("certificates.k8s.io",))], policy="Fail")])
+        self.assertEqual([f["upgrade_path"] for f in graded["blocking"]], [["CREATE serviceaccounts/token"], ["CREATE certificatesigningrequests"]])
+        self.assertEqual(graded["outage"], [])
 
     def test_a_gate_on_scheduling_alone_blocks(self):
         # A scheduling-policy webhook on pods/binding stops every replacement pod from being placed.
@@ -521,7 +534,7 @@ class WebhookScopeTest(unittest.TestCase):
 
     def test_resource_wildcards(self):
         self.assertEqual(self._path([rule(["*"])]), ["CREATE pods", "CREATE nodes"])  # `*` covers resources, not subresources
-        self.assertEqual(self._path([rule(["*/*"])]), ["CREATE pods", "CREATE pods/binding", "CREATE pods/eviction", "CREATE nodes"])
+        self.assertEqual(self._path([rule(["*/*"])]), ["CREATE pods", "CREATE pods/binding", "CREATE pods/eviction", "CREATE nodes", "CREATE serviceaccounts/token"])
         # `pods/*` is pods and its subresources, as the API server reads a `*` subresource.
         self.assertEqual(self._path([rule(["pods/*"])]), ["CREATE pods", "CREATE pods/binding", "CREATE pods/eviction"])
         self.assertEqual(self._path([rule(["pods/*"], operations=("DELETE",))]), ["DELETE pods"])
@@ -534,7 +547,7 @@ class WebhookScopeTest(unittest.TestCase):
         self.assertEqual(self._path([rule(["pods"], operations=("UPDATE",))]), [])
         self.assertEqual(self._path([rule(["pods"], operations=("*",))]), ["CREATE pods", "DELETE pods"])
         self.assertEqual(self._path([rule(["pods"], groups=("apps",))]), [])
-        self.assertEqual(self._path([rule(["*"], groups=("*",), operations=("*",))]), ["CREATE pods", "DELETE pods", "CREATE nodes", "UPDATE nodes", "DELETE nodes", "CREATE leases", "UPDATE leases"])
+        self.assertEqual(self._path([rule(["*"], groups=("*",), operations=("*",))]), ["CREATE pods", "DELETE pods", "CREATE nodes", "UPDATE nodes", "DELETE nodes", "CREATE leases", "UPDATE leases", "CREATE certificatesigningrequests", "CREATE volumeattachments"])
         self.assertEqual(self._path([rule(["nodes"], scope="Namespaced")]), [])
         self.assertEqual(self._path([rule(["pods"], scope="Cluster")]), [])
 

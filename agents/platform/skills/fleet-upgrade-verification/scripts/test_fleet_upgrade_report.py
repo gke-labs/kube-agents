@@ -1071,7 +1071,7 @@ class ReadinessTest(unittest.TestCase):
         self.assertIn("no exclusion in effect; no maintenance window", host_row)
         self.assertIn("n/a (Autopilot", host_row)
         b_row = next(l for l in lines if l.startswith("| p1 | seeded-b |") and "| blocked |" in l)
-        self.assertIn("seeded-fail-closed-gate/gate.seeded.invalid (ValidatingWebhookConfiguration): failurePolicy Fail and Service seeded-upgrade/nonexistent-admission-gate does not exist; matches nothing a node upgrade needs", b_row)
+        self.assertIn("seeded-fail-closed-gate/gate.seeded.invalid (ValidatingWebhookConfiguration): failurePolicy Fail and Service seeded-upgrade/nonexistent-admission-gate does not exist; matches none of the operations this rule reads as the upgrade's path", b_row)
         self.assertIn("pod-gate/pods.example.com (ValidatingWebhookConfiguration): failurePolicy Fail and Service gate/pod-hook has no ready endpoints on port 443; matches CREATE pods", host_row)
         self.assertIn("exclusion hold-the-minor-lag (NO_MINOR_UPGRADES) blocks auto-upgrade to 1.35.1-gke.1000 until 2026-12-11T14:35Z", b_row)
         self.assertIn("window daily at 03:00Z for 4h: closed, next opening 2026-09-15T03:00Z", b_row)
@@ -1131,8 +1131,12 @@ class ReadinessTest(unittest.TestCase):
         # kubectl call for seeded-a, two for each of the other members.
         self.assertEqual(len([c for c in fake.calls if c[:2] == ["kubectl", "get"]]), 5)
         self.assertTrue(by_name["seeded-a"]["webhook_read_error"].startswith(report.WEBHOOK_READ_SKIPPED))
-        self.assertEqual([e["cluster"] for e in data["errors"]], ["seeded-a", "seeded-a"])
+        # The skipped read is reported as skipped, not failed: one error row, and a note that says why the webhooks are unread.
+        self.assertEqual([e["cluster"] for e in data["errors"]], ["seeded-a"])
         self.assertIn("- read failed for p1 (us-central1-a) cluster seeded-a: kubectl get pdb,deploy,statefulset -A -o json failed (1)", text)
+        self.assertEqual([l for l in text.splitlines() if l.startswith("- read failed") and "skipped" in l], [])
+        self.assertIn("PDB read failed; PDBs not graded; webhook read skipped: the PDB read could not reach the API server; webhooks not graded", by_name["seeded-a"]["note"])
+        self.assertNotIn("webhook read failed", by_name["seeded-a"]["note"])
         self.assertIn("| read failed | read failed |", text)
         # The version row is unaffected, and the rollout record does not treat the project as unread.
         self.assertEqual({m["cluster"]: m["status"] for m in data["members"]}["seeded-a"], report.STATUS_CURRENT)

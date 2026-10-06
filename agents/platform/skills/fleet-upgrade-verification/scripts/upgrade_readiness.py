@@ -20,9 +20,12 @@ check yet and is stated here:
 - a fail-closed admission webhook whose backend the API server cannot reach (no Service,
   no Service port for the webhook's port, or no ready endpoint behind that port), graded
   on its rules: one that can match what a node upgrade needs (the replacement pods'
-  create, binding and status, the old pods' deletion, the eviction, the nodes' create,
-  cordon, status and deletion, the kubelet's lease) breaks the upgrade; one that matches none of those is a current outage for what it does match
-  and is reported, not graded.
+  create, binding, status and token requests, the old pods' deletion, the eviction, the
+  nodes' create, cordon, status and deletion, the kubelet's bootstrap certificate request
+  and lease, the volume attachments a replacement pod's disks need) breaks the upgrade;
+  one that matches none of those is a current outage for what it does match and is
+  reported, not graded. The list is the rule's reading of the path, not a proof of the
+  upgrade's safety.
 """
 
 import re
@@ -154,10 +157,15 @@ BACKEND_NO_ENDPOINTS = "Service {service} has no ready endpoints on port {port}"
 # pods: the replacement created, bound by the scheduler (`pods/binding`), its status written
 # by the kubelet (`pods/status`), and the old pod deleted once it terminates. The eviction the
 # drain issues. For the nodes: the new one registering and reporting status, the old one
-# cordoned and then deleted. The kubelet's heartbeat lease, created and renewed. A rule that
-# can match any of these puts the webhook in the upgrade's path. `namespaceSelector`, `objectSelector` and
-# `matchConditions` are not evaluated: a webhook they narrow is still reported as able to
-# match, which errs toward naming it.
+# cordoned and then deleted. The kubelet's heartbeat lease, created and renewed. The token
+# the kubelet requests for every projected service-account volume before a pod can start
+# (`serviceaccounts/token`), the certificate signing request a new node's kubelet files to
+# bootstrap its TLS identity, and the VolumeAttachment the attach controller creates for a
+# replacement pod's persistent disk. A rule that can match any of these puts the webhook in
+# the upgrade's path; a rule that matches none of them is reported, not graded, because this
+# list is what the rule knows of the path rather than a proof the upgrade is unaffected.
+# `namespaceSelector`, `objectSelector` and `matchConditions` are not evaluated: a webhook
+# they narrow is still reported as able to match, which errs toward naming it.
 SCOPE_NAMESPACED = "Namespaced"
 SCOPE_CLUSTER = "Cluster"
 SCOPE_ANY = "*"
@@ -175,12 +183,15 @@ UPGRADE_PATH_TARGETS = (
     ("", "nodes", "DELETE", SCOPE_CLUSTER),
     ("coordination.k8s.io", "leases", "CREATE", SCOPE_NAMESPACED),
     ("coordination.k8s.io", "leases", "UPDATE", SCOPE_NAMESPACED),
+    ("", "serviceaccounts/token", "CREATE", SCOPE_NAMESPACED),
+    ("certificates.k8s.io", "certificatesigningrequests", "CREATE", SCOPE_CLUSTER),
+    ("storage.k8s.io", "volumeattachments", "CREATE", SCOPE_CLUSTER),
 )
 UPGRADE_PATH_LABEL = "{operation} {resource}"
 WEBHOOK_NAME_FORMAT = "{config}/{webhook}"
 WEBHOOK_SERVICE_FORMAT = "{namespace}/{name}"
 WEBHOOK_FINDING_FORMAT = "{webhook} ({config_kind}): failurePolicy Fail and {reason}; matches {matches}"
-WEBHOOK_OUTAGE_MATCHES = "nothing a node upgrade needs, so it fails its own requests now without breaking the upgrade"
+WEBHOOK_OUTAGE_MATCHES = "none of the operations this rule reads as the upgrade's path; it fails its own requests now and is reported, not graded"
 
 
 # ---------------------------------------------------------------------------- PDBs
@@ -737,9 +748,12 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
 
     `blocking`: the webhook's rules can match an operation a node upgrade needs, so the
     upgrade cannot complete cleanly while its backend is down (replacement pods refused,
-    the eviction or the cordon refused, the new node unable to register or heartbeat).
-    `outage`: the backend is unreachable but the rules match none of those; its requests
-    fail now and the member is not graded on it. Fail-open webhooks are counted
+    or left without a token or a volume, the eviction or the cordon refused, the new node
+    unable to register, get its certificate or heartbeat). `outage`: the backend is
+    unreachable but the rules match none of those; its requests fail now and the member is
+    not graded on it, with what it does match named so the operator can judge it, because
+    `UPGRADE_PATH_TARGETS` is what this rule knows of the path, not a proof of safety.
+    Fail-open webhooks are counted
     (`fail_open`), and so are fail-closed webhooks with a URL backend (`url_backends`),
     which nothing read here can check.
     """

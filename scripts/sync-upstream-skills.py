@@ -409,7 +409,8 @@ the maintenance window at a given instant (`--at`, default now), and node-pool v
 against the target control plane. Run it before writing the plan and carry its `blocked` rows into
 the checklist rather than asking the operator to check those three by hand. It also grades a
 fourth thing the checklist's admission-webhook item points at: a fail-closed webhook whose
-backend is unreachable and whose rules match pods, evictions, nodes or leases, which is a cause of
+backend is unreachable and whose rules reach the upgrade's path (pods, evictions, nodes, leases, token
+and certificate requests, volume attachments), which is a cause of
 a drain that will not finish. The PDB read costs one
 `get-credentials` and one `kubectl get` per member and leaves a per-member kubeconfig under
 `${{HERMES_HOME:-/opt/data}}/.kubeconfigs/`; an exclusion is reported as holding back automatic

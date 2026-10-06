@@ -198,9 +198,11 @@ PROGRESS_COLUMNS = (
 )
 VERSION_PAIR_SEPARATOR = " / "
 
-# Readiness (`--readiness`). The PDB check needs one kubectl read per member, which needs
-# credentials for that member: `get-credentials` writes a per-target kubeconfig, passed to
-# both commands as KUBECONFIG in the subprocess environment rather than through a flag,
+# Readiness (`--readiness`). The rules need two kubectl reads per member (PDBs with their
+# Deployments and StatefulSets, then webhook configurations with their Services and
+# EndpointSlices), which need credentials for that member: `get-credentials` writes a
+# per-target kubeconfig, passed to all three commands as KUBECONFIG in the subprocess
+# environment rather than through a flag,
 # because the gcloud and kubectl in the agent pod are credential-proxy shims that forward
 # that variable. The directory is `$HERMES_HOME/.kubeconfigs`, the platform AGENTS.md
 # convention, and the file name mirrors `_thread_kubeconfig_path` in
@@ -214,7 +216,15 @@ KUBECTL_TIMEOUT_SECONDS = 60
 # second timeout to fail the same way.
 UNREACHABLE_MARKERS = ("timed out after", "Unable to connect to the server", "i/o timeout", "connection refused", "no such host")
 WEBHOOK_READ_SKIPPED = "skipped: the PDB read could not reach the API server"
+# The member's note names the one cause its reads failed for, so an operator goes to the
+# step that failed: the directory, the credentials, the first read, the second read, or the
+# second read skipped because the first found the API server unreachable. A skipped read is
+# not a failed one: it gets no error row of its own under the table.
 NOTE_DIRECTORY_FAILED = "kubeconfig directory could not be created; PDBs and webhooks not graded"
+NOTE_CREDENTIALS_FAILED = "credentials for the cluster could not be fetched; PDBs and webhooks not graded"
+NOTE_PDB_READ_FAILED = "PDB read failed; PDBs not graded"
+NOTE_WEBHOOK_READ_FAILED = "webhook read failed; webhooks not graded"
+NOTE_WEBHOOK_READ_SKIPPED = "webhook read skipped: the PDB read could not reach the API server; webhooks not graded"
 # Two reads, so a failure listing the webhook side (a large EndpointSlice list timing out, a
 # custom role without webhook-configuration reads) costs the webhook rule only, never the PDBs.
 KUBECTL_RESOURCES = "pdb,deploy,statefulset"
@@ -591,11 +601,12 @@ def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> di
     `webhook_items`/`webhook_error` for the second, and `kubeconfig`. A failed
     `get-credentials` fails both, and so does a kubeconfig directory that cannot be created
     (`directory_error`); a first read that could not reach the API server skips the second
-    rather than spend a second timeout on it; otherwise each read fails alone, grading only
-    its own rule `unknown`, and any failure makes the run exit 1.
+    rather than spend a second timeout on it (`webhook_skipped`, with `webhook_error` saying
+    so); otherwise each read fails alone, grading only its own rule `unknown`, and any
+    failure makes the run exit 1.
     """
     path = kubeconfig_path(kubeconfig_dir, project, cluster.get("name", ""), cluster.get("location", ""))
-    result = {"items": None, "error": None, "webhook_items": None, "webhook_error": None, "credentials_error": None, "directory_error": None, "kubeconfig": path}
+    result = {"items": None, "error": None, "webhook_items": None, "webhook_error": None, "webhook_skipped": False, "credentials_error": None, "directory_error": None, "kubeconfig": path}
     try:
         os.makedirs(kubeconfig_dir, exist_ok=True)
     except OSError as e:
@@ -609,6 +620,7 @@ def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> di
         return result
     result["items"], result["error"] = _kubectl_items(KUBECTL_RESOURCES, env)
     if result["error"] and any(marker in result["error"] for marker in UNREACHABLE_MARKERS):
+        result["webhook_skipped"] = True
         result["webhook_error"] = f"{WEBHOOK_READ_SKIPPED} ({result['error']})"
         return result
     result["webhook_items"], result["webhook_error"] = _kubectl_items(KUBECTL_WEBHOOK_RESOURCES, env)
@@ -632,12 +644,14 @@ def assess_readiness(cluster: dict, member: dict, read: dict, at: datetime) -> d
     if read.get("directory_error"):
         notes.append(NOTE_DIRECTORY_FAILED)
     elif read["credentials_error"]:
-        notes.append("credentials for the cluster could not be fetched; PDBs and webhooks not graded")
+        notes.append(NOTE_CREDENTIALS_FAILED)
     else:
         if read_error:
-            notes.append("PDB read failed; PDBs not graded")
-        if read["webhook_error"]:
-            notes.append("webhook read failed; webhooks not graded")
+            notes.append(NOTE_PDB_READ_FAILED)
+        if read.get("webhook_skipped"):
+            notes.append(NOTE_WEBHOOK_READ_SKIPPED)
+        elif read["webhook_error"]:
+            notes.append(NOTE_WEBHOOK_READ_FAILED)
     if target is None:
         notes.append("no target; exclusion scope and skew not graded")
     if pdbs:
@@ -697,7 +711,9 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
             member = grade_member(cluster, project, explicit_target, cache)
             if readiness_options is not None:
                 read = read_cluster_objects(cluster, project, readiness_options["kubeconfig_dir"])
-                for message in dict.fromkeys(m for m in (read["error"], read["webhook_error"]) if m):   # a credentials failure fills both with one message
+                # A credentials failure fills both slots with one message; a skipped second read is not a failure and gets no row.
+                failed = (read["error"], None if read.get("webhook_skipped") else read["webhook_error"])
+                for message in dict.fromkeys(m for m in failed if m):
                     errors.append({"project": project, "location": member["location"], "cluster": member["cluster"], "message": message})
                 member["readiness"] = assess_readiness(cluster, member, read, readiness_options["at"])
             members.append(member)

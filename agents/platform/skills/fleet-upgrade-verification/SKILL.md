@@ -178,11 +178,13 @@ validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpoints
   when unset), or no ready endpoint sits behind that port in the Service's EndpointSlices (an
   endpoint without a `ready` condition counts as ready, as the API requires). Such a webhook
   rejects every request its rules match, and what it matches decides the grade. When a rule can
-  match something a node upgrade needs — the replacement pods' creation, scheduling (`pods/binding`) and status, the old pods' deletion, the eviction the drain issues, the nodes' registration, cordon, status and deletion, the kubelet's lease — the
+  match something a node upgrade needs — the replacement pods' creation, scheduling (`pods/binding`), status and token requests (`serviceaccounts/token`), the old pods' deletion, the eviction the drain issues, the nodes' registration (with the kubelet's bootstrap certificate signing request), cordon, status and deletion, the kubelet's lease, and the volume attachments a replacement pod's disks need — the
   member is `blocked`: the workloads it gates lose their pods on the drain and cannot get them
   back, a budget over one of them also stalls the drain, and a gate on evictions or nodes stops
   the drain itself. When no rule matches any of those, the webhook is still a current outage for
-  what it does match and the cell names it, but it does not grade the member. Rules are matched on
+  what it does match and the cell names it, but it does not grade the member; that list is what
+  the rule knows of the upgrade's path, not a proof the upgrade is unaffected, which is why the
+  cell names what the webhook does match. Rules are matched on
   API group, operation, resource (with the API's `*`, `*/*` and `pods/*` semantics) and scope;
   `namespaceSelector`, `objectSelector` and `matchConditions` are not evaluated, so a webhook they
   narrow is reported as able to match. The cell names the configuration, the webhook, the reason
@@ -289,8 +291,8 @@ a readiness table, paste it too and name each `blocked` member with what blocks 
 states it: the PDB by `namespace/name` with its field and workload, the exclusion by name with
 its scope and end time and that it holds back automatic upgrades only, the webhook as
 `configuration/webhook` with its configuration kind, why its backend is unreachable and what it
-matches, the pool with its skew. A webhook the cell lists as matching nothing a node upgrade
-needs is an outage to report, not a blocker.
+matches, the pool with its skew. A webhook the cell lists as matching none of the upgrade's path
+is an outage to report, not a blocker, with what it does match named so the operator can judge it.
 Say what the operator has to change before the upgrade can proceed; do not change it, and do not
 propose deleting an exclusion. When the question is a target version's readiness, paste each
 repository's deprecation section too, with its source line, and state the floor and target the
