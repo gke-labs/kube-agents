@@ -5461,8 +5461,14 @@ def _shield_sources(data: dict, declarations: list[dict]) -> dict[tuple[str, str
     return sources
 
 
+def _covered_by(sources: dict[tuple[str, str], list[tuple[str, str, str]]], cluster: str, namespace: str) -> bool:
+    """Whether `sources` (a `_shield_sources` map) names a declared workload in this namespace, scoped or fleet-wide."""
+    ns = _id_segment(namespace)
+    return bool(sources.get((_id_segment(cluster), ns)) or sources.get((_id_segment(""), ns)))
+
+
 def shield_declared_account_siblings(
-    data: dict, declarations: list[dict] | None = None, manifest: dict | None = None
+    data: dict, declarations: list[dict] | None = None, manifest: dict | None = None, trusted: list[str] | None = None
 ) -> list[str]:
     """Keep a declared 2.7 workload's token by making its siblings' fixes manual.
 
@@ -5479,7 +5485,10 @@ def shield_declared_account_siblings(
     Returns the ids shielded, each logged, and nothing in the document
     records them: the findings changed, plus every 2.7 candidate the
     collector still emits in a shielded namespace that the document neither
-    reports nor declares. A 2.7 pull request is one namespace's one file, so
+    reports nor declares. When `trusted` is given, the ids whose namespace a
+    declaration `start` filed covers are appended to it as well: those are
+    the only ones a close over partial coverage may act on, since a
+    `declared[]` entry is the worker's writing. A 2.7 pull request is one namespace's one file, so
     a sibling the worker left out is on the same branch as the ones it
     reported; counted as held rather than shielded, it would keep that
     pull request open past the close the shield exists to make.
@@ -5487,6 +5496,16 @@ def shield_declared_account_siblings(
     shielded_by = _shield_sources(data, list(declarations or []))
     if not shielded_by:
         return []
+    # The namespaces a declaration `start` filed covers, keyed as
+    # `_shield_sources` keys them (the empty cluster for a fleet-wide item).
+    filed_by: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
+    for entry in declarations or []:
+        if _id_segment(str(entry.get("check", ""))) != _id_segment(SHARED_ACCOUNT_CHECK):
+            continue
+        if _object_kind_segment(str(entry.get("object", ""))) not in SHARED_ACCOUNT_WORKLOAD_KINDS:
+            continue
+        key = (_id_segment(str(entry.get(DECLARATION_CLUSTER_FIELD, "") or "")), _id_segment(str(entry.get("namespace") or "")))
+        filed_by.setdefault(key, []).append((str(entry.get("object", "")), str(entry.get("repo", "")), str(entry.get("path", ""))))
 
     def declared_for(cluster: str, namespace: str) -> list[tuple[str, str, str]]:
         # Fleet-wide entries first: a note without `cluster` is the owner's
@@ -5524,6 +5543,8 @@ def shield_declared_account_siblings(
         remediation["path"] = ""
         remediation["note"] = shield + (f" {note}" if note else "")
         changed.append(fid)
+        if trusted is not None and _covered_by(filed_by, str(finding.get("cluster", "")), str(finding.get("namespace") or "")):
+            trusted.append(fid)
         log(
             f"MANUAL: {fid} — {SHARED_ACCOUNT_CHECK} shares its namespace's `default` "
             f"ServiceAccount with a declared workload ({names}); the shared-account fix would "
@@ -5542,6 +5563,8 @@ def shield_declared_account_siblings(
                 continue
             known.add(identity)
             changed.append(_shorten_id(identity))
+            if trusted is not None and _covered_by(filed_by, keyed["cluster"], str(keyed.get("namespace") or "")):
+                trusted.append(_shorten_id(identity))
             log(
                 f"SHIELDED: {_shorten_id(identity)} — a {SHARED_ACCOUNT_CHECK} candidate the document "
                 "did not report, in a namespace with a declared workload; its shared-account pull "
@@ -10932,7 +10955,7 @@ def read_run_record(audit_id: str, repo: str | None = None) -> dict | None:
 
 def join_harness_declarations(
     data: dict, record: dict | None, audit_id: str, repo: str | None, manifest: dict | None = None
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], list[str]]:
     """Fold `start`'s search into the document and apply its declarations.
 
     What `finish` — real and dry — and `remediate` share, in the one order
@@ -10942,10 +10965,12 @@ def join_harness_declarations(
     candidate the document left out is declared from `manifest` (when the
     caller has one), then a declared 2.7 workload's siblings go manual.
     Returns the ids that moved or were declared from the manifest, so a
-    caller can refuse one by name, and the shielded ids for the stale-close
-    pass (the siblings the shield changed, the held candidates it counted,
-    and the declared workloads `start`'s file names); neither list is written
-    into the document, so neither can arrive in it.
+    caller can refuse one by name; the shielded ids for the stale-close pass
+    (the siblings the shield changed, the held candidates it counted, and
+    the declared workloads `start`'s file names); and the subset of those
+    that rest on `start`'s file rather than on the worker's `declared[]`,
+    the only ones a close over partial coverage acts on. None of the three
+    is written into the document, so none can arrive in it.
     Run on a validated document, after `load_findings`, so the ids are the
     derived ones.
     """
@@ -10953,11 +10978,14 @@ def join_harness_declarations(
     declarations = read_declarations(audit_id, repo=repo)
     moved = apply_declarations(data, declarations)
     from_manifest = declare_collector_candidates(data, declarations, manifest)
-    shielded = shield_declared_account_siblings(data, declarations, manifest)
+    trusted: list[str] = []
+    shielded = shield_declared_account_siblings(data, declarations, manifest, trusted=trusted)
     for fid in shield_declaration_ids(data, declarations, manifest):
         if fid not in shielded:
             shielded.append(fid)
-    return [str(finding.get("id", "")) for finding in moved] + from_manifest, shielded
+        if fid not in trusted:
+            trusted.append(fid)
+    return [str(finding.get("id", "")) for finding in moved] + from_manifest, shielded, trusted
 
 
 def load_findings(path: str, audit_id: str) -> dict:
@@ -12536,7 +12564,12 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # order matters: a posture a declaration covers moves to `declared[]`,
     # where it cites the file it was read from, and only what is left is
     # measured against the search record.
-    shielded_ids = set(join_harness_declarations(data, record, audit_id, repo_hint, manifest=manifest)[1])
+    _moved_ids, shielded_list, trusted_list = join_harness_declarations(data, record, audit_id, repo_hint, manifest=manifest)
+    shielded_ids = set(shielded_list)
+    # Over partial coverage the close acts only on ids `start`'s file vouches
+    # for; a complete run keeps the worker's `declared[]` in the set, as the
+    # ledger itself does.
+    partial_shielded_ids = set(trusted_list)
     withheld = withhold_unsearched_postures(data, record)
     if withheld:
         log(
@@ -12855,14 +12888,14 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             )
         prs_closed = (
             []
-            if (gaps or unaccounted) and not shielded_ids
+            if (gaps or unaccounted) and not partial_shielded_ids
             else close_stale_remediation_prs(
                 # No finding is current, but one the collector still flags is
                 # not stale either: a pull request whose finding never reached
                 # a ledger body — opened by `/remediate`, or on a finding the
                 # body budget dropped — is still a fix for a live condition.
                 repo, audit_id, remediation_prs, still_flagged, previous_titles, {}, now,
-                shielded_ids=shielded_ids,
+                shielded_ids=partial_shielded_ids if (gaps or unaccounted) else shielded_ids,
                 # Over a gap or an unaccounted finding only the shield's close
                 # is made; it rests on the declaration, not on this run's read.
                 shielded_only=bool(gaps or unaccounted),
@@ -13401,7 +13434,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # Over incomplete coverage that assertion is unfounded, so nothing is
     # closed and every open fix survives to the next complete run, except the
     # shield's close, which rests on the declaration and not on this run's read.
-    if gaps and not shielded_ids:
+    if gaps and not partial_shielded_ids:
         prs_closed = []
         log(
             "Coverage is partial, so no remediation pull request was closed as "
@@ -13433,7 +13466,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 for group in remediation_groups(findings)
                 for finding in group
             },
-            shielded_ids=shielded_ids,
+            shielded_ids=partial_shielded_ids if gaps else shielded_ids,
             shielded_only=bool(gaps),
         )
 

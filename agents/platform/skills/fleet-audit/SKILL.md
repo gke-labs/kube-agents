@@ -926,8 +926,9 @@ exist in the code — `resolved` and `resolved-merged` — but neither is ever r
 resolution is announced in the delta comment, by id and title recovered from the previous run's stored report, and
 the finding's open pull request is closed as stale. The compliance stream has a third close: a pull
 request whose remaining findings are all shielded (SOP 2.7, a declared workload sharing the `default`
-ServiceAccount) is closed with that reason, on a partial run too, since the reason is the declaration
-and not this run's reading, and those findings stay on the ledger, not proposed again while
+ServiceAccount) is closed with that reason, on a partial run too when a note `start` filed covers the
+namespace, since the reason is the declaration and not this run's reading, and those findings stay
+on the ledger, not proposed again while
 the declaration stands, rather than becoming promotable. A resolution whose fix had already **merged** is
 the ordinary, expected ending, so nothing extra is closed and nothing extra is said.
 
