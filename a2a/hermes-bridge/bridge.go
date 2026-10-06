@@ -47,6 +47,9 @@ const (
 	// so a terminal that kept stderr alone threw the diagnosis away (#2036).
 	stderrTailBytes = 2048
 	stdoutTailBytes = 2048
+	// publishErrTailBytes bounds the publish error a bus-publish-failed
+	// terminal quotes. The tail, because a wrapped error ends in its cause.
+	publishErrTailBytes = 2048
 	// rateLimitedExitCode is EX_TEMPFAIL, the code Hermes exits with when a
 	// turn gave up on the provider's rate limit; the terminal names it so a
 	// quota storm is not graded as the persona's failure.
@@ -1063,6 +1066,14 @@ func failureReason(err error, stdout, stderr string) string {
 	return sb.String()
 }
 
+// resultPublishFailedReason is the terminal message for a result artifact
+// the bus refused: the token, then a bounded tail of the cause, so the
+// reason a person reads says why (an envelope over the bus's maximum, a
+// timeout) and not only that it failed.
+func resultPublishFailedReason(err error) string {
+	return "reason: bus-publish-failed at result - " + tail(err.Error(), publishErrTailBytes)
+}
+
 // tail is the last n bytes of s, cut on a rune boundary so the text part
 // stays valid UTF-8.
 func tail(s string, n int) string {
@@ -1138,7 +1149,7 @@ func (b *Bridge) finalize(run *taskRun, state lib.TaskState, msg string, resultO
 	if resultOutput != nil {
 		if err := b.publishResult(ctx, run, *resultOutput); err != nil {
 			b.cfg.Logger.Error("result publish failed", "task", run.origin.TaskID, "err", err)
-			state, msg = lib.StateFailed, "reason: bus-publish-failed at result"
+			state, msg = lib.StateFailed, resultPublishFailedReason(err)
 		}
 	}
 	err := b.publishTerminal(ctx, run, state, msg)

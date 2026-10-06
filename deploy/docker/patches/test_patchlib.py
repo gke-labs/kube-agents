@@ -717,5 +717,52 @@ def f(a, *rest, key=None, **extra):
         self.assertEqual(patchlib.unbound(tree, assigns[0]), ["value"])
         self.assertEqual(patchlib.unbound(tree, assigns[1]), [])
 
+    def test_with_statement_binds_target_after_block(self):
+        source = """\
+def f():
+    with open("path") as handle:
+        inside = 1
+    hook(handle, inside, free)
+"""
+        tree = ast.parse(source)
+        call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "hook")
+        self.assertEqual(patchlib.unbound(tree, call), ["free", "hook", "inside"])
+
+    def test_async_with_statement_binds_target_after_block(self):
+        source = """\
+async def f():
+    async with lock as handle:
+        inside = 1
+    hook(handle, inside, free)
+"""
+        tree = ast.parse(source)
+        call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "hook")
+        self.assertEqual(patchlib.unbound(tree, call), ["free", "hook", "inside"])
+
+    def test_multi_item_and_destructuring_with_targets_remain_unbound(self):
+        source = """\
+def f():
+    with cm1, open("path") as later_handle:
+        pass
+    with cm2 as (unpack_a, unpack_b):
+        pass
+    hook(later_handle, unpack_a, unpack_b, free)
+"""
+        tree = ast.parse(source)
+        call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "hook")
+        self.assertEqual(patchlib.unbound(tree, call), ["free", "hook", "later_handle", "unpack_a", "unpack_b"])
+
+    def test_module_names_includes_top_level_with_target(self):
+        source = """\
+with open("path") as top_handle:
+    pass
+
+hook(top_handle, free)
+"""
+        tree = ast.parse(source)
+        self.assertIn("top_handle", patchlib.module_names(tree))
+        call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "hook")
+        self.assertEqual(patchlib.unbound(tree, call), ["free", "hook"])
+
 if __name__ == "__main__":
     unittest.main()

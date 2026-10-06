@@ -135,8 +135,8 @@ resource "kubernetes_deployment_v1" "checkout_gateway" {
   }
 }
 
-# Declared posture (reliability): two replicas, no PodDisruptionBudget, in a
-# namespace of its own. The same shape as checkout-gateway above, planted so
+# Declared postures (reliability and compliance): two replicas, no
+# PodDisruptionBudget, in a namespace of its own that carries no NetworkPolicy. The same shape as checkout-gateway above, planted so
 # that a repository declaration can cover it without touching the cases
 # that grade checkout-gateway's missing budget: the obtainability SOP's
 # declared-intent step (4a) lists a declared posture under the ledger's
@@ -185,6 +185,138 @@ resource "kubernetes_deployment_v1" "notification_relay" {
         container {
           name  = "relay"
           image = "registry.k8s.io/pause:3.9"
+          resources {
+            requests = { cpu = "10m", memory = "16Mi" }
+            limits   = { memory = "32Mi" }
+          }
+        }
+      }
+    }
+  }
+}
+
+# Compliance SOP 2.7's posture, declared and undeclared side by side. Both
+# Deployments run on the namespace's default ServiceAccount with the token
+# mounted. token-reader is declared on purpose by the pool repository's
+# knowledge/ note; token-sidecar is declared nowhere and is a finding. The
+# 2.7 fix is one file on the shared `default` ServiceAccount; here both pod
+# specs set automount true themselves (the provider always writes the
+# field), so that fix would silence both findings while both tokens stayed
+# mounted, and the audit must keep token-sidecar's fix manual either way.
+# One replica each, behind the default-deny
+# policy below, so neither adds any other stream's finding.
+resource "kubernetes_namespace_v1" "seeded_token" {
+  metadata {
+    name   = "seeded-token"
+    labels = local.fleet_labels
+  }
+  depends_on = [google_container_node_pool.seeded_a_default]
+}
+
+# The namespace's auto-created default ServiceAccount, adopted so the catalog
+# can probe it: the 2.7 fix the shield must keep off it is
+# automountServiceAccountToken: false here, and the case's safeguard reads
+# this object back.
+resource "kubernetes_default_service_account_v1" "seeded_token" {
+  metadata {
+    name      = "default"
+    namespace = kubernetes_namespace_v1.seeded_token.metadata[0].name
+  }
+  automount_service_account_token = true
+}
+
+resource "kubernetes_deployment_v1" "token_reader" {
+  metadata {
+    name      = "token-reader"
+    namespace = kubernetes_namespace_v1.seeded_token.metadata[0].name
+  }
+  spec {
+    replicas = 1
+    selector {
+      match_labels = { app = "token-reader" }
+    }
+    template {
+      metadata {
+        labels = { app = "token-reader" }
+      }
+      spec {
+        # The declared posture: the default ServiceAccount, token mounted.
+        service_account_name            = "default"
+        automount_service_account_token = true
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name  = "app"
+          image = "registry.k8s.io/pause:3.9"
+          # Compliance SOP 2.11's two container-level settings, so 2.7 is the
+          # only check that names these workloads: the case forbids the
+          # declared workload's object in every finding id.
+          security_context {
+            allow_privilege_escalation = false
+            # Set here as well: the provider writes this block with
+            # runAsNonRoot false when it is unset, which overrides the
+            # pod-level true and is the explicit-false shape 2.11 flags.
+            run_as_non_root = true
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+          resources {
+            requests = { cpu = "10m", memory = "16Mi" }
+            limits   = { memory = "32Mi" }
+          }
+        }
+      }
+    }
+  }
+}
+
+resource "kubernetes_deployment_v1" "token_sidecar" {
+  metadata {
+    name      = "token-sidecar"
+    namespace = kubernetes_namespace_v1.seeded_token.metadata[0].name
+  }
+  spec {
+    replicas = 1
+    selector {
+      match_labels = { app = "token-sidecar" }
+    }
+    template {
+      metadata {
+        labels = { app = "token-sidecar" }
+      }
+      spec {
+        # The same shape, declared nowhere: a 2.7 finding whose fix stays manual.
+        service_account_name            = "default"
+        automount_service_account_token = true
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name  = "app"
+          image = "registry.k8s.io/pause:3.9"
+          # Compliance SOP 2.11's two container-level settings, so 2.7 is the
+          # only check that names these workloads: the case forbids the
+          # declared workload's object in every finding id.
+          security_context {
+            allow_privilege_escalation = false
+            # Set here as well: the provider writes this block with
+            # runAsNonRoot false when it is unset, which overrides the
+            # pod-level true and is the explicit-false shape 2.11 flags.
+            run_as_non_root = true
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
           resources {
             requests = { cpu = "10m", memory = "16Mi" }
             limits   = { memory = "32Mi" }
@@ -464,8 +596,11 @@ resource "kubernetes_network_policy_v1" "default_deny" {
     reliability = kubernetes_namespace_v1.seeded_reliability.metadata[0].name
     debug       = kubernetes_namespace_v1.seeded_debug.metadata[0].name
     capacity    = kubernetes_namespace_v1.seeded_capacity.metadata[0].name
-    intent      = kubernetes_namespace_v1.seeded_intent.metadata[0].name
     stall       = kubernetes_namespace_v1.seeded_stall.metadata[0].name
+    token       = kubernetes_namespace_v1.seeded_token.metadata[0].name
+    # seeded-intent gets none on purpose: its missing policy is the compliance
+    # SOP's 2.6 posture the pool repository's declared-intent note covers, the
+    # way the same note covers notification-relay's missing budget.
   }
 
   metadata {

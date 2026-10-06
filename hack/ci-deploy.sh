@@ -82,6 +82,19 @@ readonly HELM_RELEASE_SECRET_SELECTOR="owner=helm,name=${HELM_RELEASE_NAME}"
 # encoder emits compact `"status":"deployed"`; the pattern tolerates spacing
 # so a Helm formatting change cannot silently blind the guard.
 readonly HELM_DEPLOYED_STATUS_RE='"status"[[:space:]]*:[[:space:]]*"deployed"'
+# What an absent release looks like in `helm history` stderr output ("Error: release: not found").
+readonly HELM_RELEASE_NOT_FOUND_RE="release: not found"
+
+# Bounded retry attempts for the Helm chart install. Transient API-server 5xx
+# errors (500, 502, 503, 504) during Autopilot control-plane scaling or cluster
+# startup can fail the first attempt; retrying proceeds to evaluation (#2382).
+readonly HELM_DEPLOY_ATTEMPTS=3
+readonly HELM_DEPLOY_RETRY_DELAY_SECONDS=5
+readonly APISERVER_READYZ_TIMEOUT_SECONDS=30
+readonly APISERVER_READYZ_POLL_INTERVAL_SECONDS=2
+readonly HELM_HISTORY_PROBE_ATTEMPTS=3
+readonly HELM_HISTORY_PROBE_RETRY_DELAY_SECONDS=2
+readonly HELM_API_SERVER_5XX_RE="an error on the server|the server is currently unable to handle the request|the server was unable to return a response in the time allotted|the server responded with the status code 50[0234]|Internal error occurred:|etcdserver:|request did not complete within|(HTTP( response status)?|status:)[: ]+50[0234]([^0-9]|$)"
 
 # The keypair the agent uses to reach its shell sandbox over SSH. Generated per
 # run and thrown away with the lease: nothing outside this cluster ever sees it,
@@ -133,6 +146,10 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 # password key in platformagent_a2a_manifests.go). The CR name is the chart's
 # platformAgent.name default, which this deploy does not override.
 readonly PLATFORM_AGENT_CR_NAME="platform-agent"
+# Timeout for deleting the PlatformAgent CR during retry, allowing the live
+# operator to clear its finalizer before uninstallation. Matches
+# charts/kube-agents/values.yaml cleanupHook.timeout (120s).
+readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # The next lane's Prow jobs: its on-demand presubmit and its periodic on
 # main. Section 2b admits the flag on a run whose JOB_NAME is one of these
 # (space-separated, matched whole) or that carries a PULL_NUMBER -- the
@@ -780,6 +797,92 @@ else
   BUILD_WORKER_ARGS=(--machine-type=e2-highcpu-8)
 fi
 
+# Heal a poisoned release record with no deployed revision (#1172, #2382).
+# Called before initial deployment (step 5a) and before retrying on transient
+# 5xx errors (step 5c).
+heal_poisoned_release_record() {
+  local reason="${1:-a previous run left this pool project poisoned (#1172)}"
+  local action="${2:-installing}"
+  local history_json="" history_err="" history_rc=0
+
+  for ((probe_try=1; probe_try<=HELM_HISTORY_PROBE_ATTEMPTS; probe_try++)); do
+    local probe_tmp
+    probe_tmp="$(mktemp)"
+    if history_json="$(helm history "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" -o json 2>"${probe_tmp}")"; then
+      history_rc=0
+      rm -f "${probe_tmp}"
+      break
+    else
+      history_rc=$?
+      history_err="$(cat "${probe_tmp}")"
+      rm -f "${probe_tmp}"
+      # If the release simply does not exist ("release: not found"),
+      # there is no release to heal; break immediately without retrying.
+      if grep -Eq "${HELM_RELEASE_NOT_FOUND_RE}" <<<"${history_err}"; then
+        break
+      fi
+      # If the probe failed with any other error (API-server 5xx, cluster unreachable,
+      # connection reset, TLS timeout, auth failure), wait and re-probe
+      # rather than prematurely treating it as "absent release" (#2382).
+      if [ "${probe_try}" -lt "${HELM_HISTORY_PROBE_ATTEMPTS}" ]; then
+        echo "WARNING: helm history probe attempt ${probe_try} failed (${history_err}), re-probing in ${HELM_HISTORY_PROBE_RETRY_DELAY_SECONDS}s..."
+        sleep "${HELM_HISTORY_PROBE_RETRY_DELAY_SECONDS}"
+      fi
+    fi
+  done
+
+  if [ "${history_rc}" -ne 0 ]; then
+    # If the release does not exist ("release: not found"),
+    # there is no release record to heal.
+    if grep -Eq "${HELM_RELEASE_NOT_FOUND_RE}" <<<"${history_err}"; then
+      return 0
+    fi
+    # If probe failed with an error other than "release: not found" and re-probes were exhausted:
+    # On in-loop retry (§5c), fail loudly under set -e so the run does not
+    # silently skip healing and fail attempt 2 on "has no deployed releases" (#2382).
+    # At lease time (§5a), degrade to the pre-fix behaviour: warn and skip
+    # the heal so a transient control-plane blip seconds after creation does not
+    # abort the run before chart deployment and its retry loop can run.
+    if [ "${action}" = "retrying" ]; then
+      echo "ERROR: helm history probe failed: ${history_err}" >&2
+      return "${history_rc}"
+    fi
+    echo "WARNING: helm history probe failed after ${HELM_HISTORY_PROBE_ATTEMPTS} attempts (${history_err}); skipping lease-time release record heal and proceeding to deploy."
+    return 0
+  fi
+
+  if ! grep -Eq "${HELM_DEPLOYED_STATUS_RE}" <<<"${history_json}"; then
+    echo "WARNING: the ${HELM_RELEASE_NAME} release record exists with no deployed revision —"
+    echo "         ${reason}. Clearing the"
+    echo "         record before ${action}."
+    # When retrying (§5c), the failed attempt may have already started the
+    # operator and added the PlatformAgent finalizer. Delete the CR first and
+    # wait for the operator to clear its finalizer before uninstalling (#2382).
+    # Without this, Helm deletes the operator and RBAC first, leaving the CR
+    # stranded on its finalizer and breaking subsequent install attempts.
+    # Timeout matches charts/kube-agents/values.yaml cleanupHook.timeout (120s).
+    # If the deletion times out or fails, stop under set -e so we do not issue
+    # a --no-hooks uninstall that strands the CR in Terminating.
+    if [ "${action}" = "retrying" ]; then
+      kubectl delete platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" \
+        --ignore-not-found --wait --timeout="${PLATFORM_AGENT_CR_DELETE_TIMEOUT}"
+    fi
+
+    # --no-hooks: at lease time (§5a), a leftover release from a failed prior
+    # run never started the operator, so running pre-delete hooks would hang.
+    # On retry (§5c), the CR was verified deleted above, so the hook is redundant.
+    # If even the uninstall cannot clear it, drop the release-record Secrets
+    # directly — with no deployed revision the record is all that blocks the
+    # install. Both failing leaves the record in place, so let set -e stop
+    # the run here, before the upgrade fails less legibly. No --wait and no
+    # hooks means Helm's uninstall timeout would bound nothing, so none is
+    # passed.
+    helm uninstall "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" --no-hooks \
+      || kubectl delete secret -n "${NAMESPACE}" -l "${HELM_RELEASE_SECRET_SELECTOR}" --ignore-not-found
+    echo "✓ Cleared the poisoned ${HELM_RELEASE_NAME} release record"
+  fi
+}
+
 START_TIME=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Deploying ${DEPLOY_SOURCE} to Namespace: ${NAMESPACE} ==="
 
@@ -896,15 +999,15 @@ fi
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Deploying the kube-agents chart ==="
 
-# ─── 5a. Heal a poisoned release record (#1172) ───────────────────────────────
+# ─── 5a. Heal a poisoned release record (#1172, #2382) ─────────────────────────
 # A failed or killed prior run can leave the release record behind with no
 # deployed revision: its teardown's `helm uninstall` failed, or the teardown
 # was killed mid-uninstall — the cause no teardown-side fallback can cover.
 # `helm upgrade --install` below then takes the upgrade path and dies with
 # `UPGRADE FAILED: "kube-agents" has no deployed releases`, instantly
-# failing whichever PR drew this pool project. Heal it here, at lease time,
-# where every cause of the no-deployed-revision state converges. (A release
-# stuck `pending-upgrade` *above* a deployed revision is a different state —
+# failing whichever PR drew this pool project. Heal it here, at lease time
+# or in the 5c retry loop, where causes of the no-deployed-revision state converge.
+# (A release stuck `pending-upgrade` *above* a deployed revision is a different state —
 # upgrade then fails on Helm's in-progress lock, but that run's own teardown
 # uninstall clears it, so it burns one run rather than poisoning the pool.)
 #
@@ -915,25 +1018,9 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Deploying the kube-agents chart ===
 # their statuses. "History succeeds but no revision is deployed" is
 # therefore precisely the state upgrade rejects — including a latest-failed
 # release with an older deployed revision, which upgrades fine and is left
-# alone. One call; a healthy or absent release costs the probe and nothing
-# more.
-if RELEASE_HISTORY_JSON="$(helm history "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" -o json 2>/dev/null)" \
-  && ! grep -Eq "${HELM_DEPLOYED_STATUS_RE}" <<<"${RELEASE_HISTORY_JSON}"; then
-  echo "WARNING: the ${HELM_RELEASE_NAME} release record exists with no deployed revision —"
-  echo "         a previous run left this pool project poisoned (#1172). Clearing the"
-  echo "         record before installing."
-  # --no-hooks: the pre-delete hook waits on an operator a failed install
-  # never started. If even the uninstall cannot clear it, drop the
-  # release-record Secrets directly — with no deployed revision there is
-  # nothing real for Helm to unwind, and the record is all that blocks the
-  # install. Both failing leaves the record in place, so let set -e stop
-  # the run here, before the upgrade fails less legibly. No --wait and no
-  # hooks means Helm's uninstall timeout would bound nothing, so none is
-  # passed.
-  helm uninstall "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" --no-hooks \
-    || kubectl delete secret -n "${NAMESPACE}" -l "${HELM_RELEASE_SECRET_SELECTOR}" --ignore-not-found
-  echo "✓ Cleared the poisoned ${HELM_RELEASE_NAME} release record"
-fi
+# alone. One call (or bounded re-probes if the probe hits a transient control-plane error);
+# a healthy or absent release costs the probe and nothing more.
+heal_poisoned_release_record
 
 API_SERVER_KEY="${API_SERVER_KEY:-$(openssl rand -hex 16)}"
 
@@ -953,32 +1040,77 @@ SANDBOX_KEY_DIR="$(umask 077 && mktemp -d)"
 ssh-keygen -q -t "${SANDBOX_SSH_KEY_TYPE}" -N '' -C "${SANDBOX_SSH_KEY_COMMENT}" \
   -f "${SANDBOX_KEY_DIR}/id_sandbox"
 
+# ─── 5c. Deploy the chart ─────────────────────────────────────────────────────
 # Named in the build log so a run's dispatcher behaviour can be read against
 # the cap it was given without opening the rendered CR.
 echo "Kanban board cap for this install: max_in_progress=${EVAL_KANBAN_MAX_IN_PROGRESS} (spec.harness.tuning.maxInProgress)"
-helm upgrade --install "${HELM_RELEASE_NAME}" ./charts/kube-agents \
-  --namespace "${NAMESPACE}" --create-namespace \
-  "${IMAGE_ARGS[@]}" \
-  --set-string "platformAgent.harness.clusterName=${CLUSTER_NAME}" \
-  --set-string "platformAgent.harness.location=${REGION}" \
-  --set-string "platformAgent.harness.projectId=${PROJECT_ID}" \
-  --set-string "platformAgent.security.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
-  --set-string "platformAgent.integration.github.gitRepo=${GITOPS_REPO}" \
-  "${GITHUB_MINTER_ARGS[@]}" \
-  --set "platformAgent.credentials.create=true" \
-  --set-string "platformAgent.credentials.data.API_SERVER_KEY=${API_SERVER_KEY}" \
-  --set-string "platformAgent.credentials.data.GEMINI_API_KEY=${GEMINI_API_KEY}" \
-  --set-file "platformAgent.credentials.data.SANDBOX_SSH_PRIVATE_KEY=${SANDBOX_KEY_DIR}/id_sandbox" \
-  --set-file "platformAgent.credentials.data.SANDBOX_SSH_PUBLIC_KEY=${SANDBOX_KEY_DIR}/id_sandbox.pub" \
-  --set-string "litellm.modelProvider=${MODEL_PROVIDER}" \
-  --set-string "litellm.modelDefaultName=${MODEL_DEFAULT_NAME}" \
-  --set-string "litellm.vertex.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
-  --set "platformAgent.deployment.availability.runtimeClassName=" \
-  --set "platformAgent.harness.tuning.maxInProgress=${EVAL_KANBAN_MAX_IN_PROGRESS}" \
-  --set-string "platformAgent.deployment.env[0].name=ALERT_DAILY_LIMIT_WARNING" \
-  --set-string "platformAgent.deployment.env[0].value=${EVAL_ALERT_DAILY_LIMIT_WARNING}" \
-  ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"} \
-  --wait --timeout 15m
+
+HELM_INSTALL_OUT="$(mktemp)"
+HELM_EXIT=0
+for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
+  set +e
+  helm upgrade --install "${HELM_RELEASE_NAME}" ./charts/kube-agents \
+    --namespace "${NAMESPACE}" --create-namespace \
+    "${IMAGE_ARGS[@]}" \
+    --set-string "platformAgent.harness.clusterName=${CLUSTER_NAME}" \
+    --set-string "platformAgent.harness.location=${REGION}" \
+    --set-string "platformAgent.harness.projectId=${PROJECT_ID}" \
+    --set-string "platformAgent.security.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --set-string "platformAgent.integration.github.gitRepo=${GITOPS_REPO}" \
+    "${GITHUB_MINTER_ARGS[@]}" \
+    --set "platformAgent.credentials.create=true" \
+    --set-string "platformAgent.credentials.data.API_SERVER_KEY=${API_SERVER_KEY}" \
+    --set-string "platformAgent.credentials.data.GEMINI_API_KEY=${GEMINI_API_KEY}" \
+    --set-file "platformAgent.credentials.data.SANDBOX_SSH_PRIVATE_KEY=${SANDBOX_KEY_DIR}/id_sandbox" \
+    --set-file "platformAgent.credentials.data.SANDBOX_SSH_PUBLIC_KEY=${SANDBOX_KEY_DIR}/id_sandbox.pub" \
+    --set-string "litellm.modelProvider=${MODEL_PROVIDER}" \
+    --set-string "litellm.modelDefaultName=${MODEL_DEFAULT_NAME}" \
+    --set-string "litellm.vertex.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --set "platformAgent.deployment.availability.runtimeClassName=" \
+    --set "platformAgent.harness.tuning.maxInProgress=${EVAL_KANBAN_MAX_IN_PROGRESS}" \
+    --set-string "platformAgent.deployment.env[0].name=ALERT_DAILY_LIMIT_WARNING" \
+    --set-string "platformAgent.deployment.env[0].value=${EVAL_ALERT_DAILY_LIMIT_WARNING}" \
+    ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"} \
+    --wait --timeout 15m 2>&1 | tee "${HELM_INSTALL_OUT}"
+  HELM_EXIT="${PIPESTATUS[0]}"
+  set -e
+
+  if [ "${HELM_EXIT}" -eq 0 ]; then
+    break
+  fi
+
+  if grep -Eq "${HELM_API_SERVER_5XX_RE}" "${HELM_INSTALL_OUT}" && [ "${attempt}" -lt "${HELM_DEPLOY_ATTEMPTS}" ]; then
+    retry_delay=$((HELM_DEPLOY_RETRY_DELAY_SECONDS * attempt))
+    echo "WARNING: Helm chart deployment attempt ${attempt} of ${HELM_DEPLOY_ATTEMPTS} hit a transient API-server 5xx, retrying in ${retry_delay}s..."
+    sleep "${retry_delay}"
+    # Wait for the control plane to recover before running recovery calls
+    # (CR delete, helm history probe/uninstall) (#2382).
+    readyz_start=$SECONDS
+    readyz_ok=0
+    while (( SECONDS - readyz_start < APISERVER_READYZ_TIMEOUT_SECONDS )); do
+      if kubectl get --raw /readyz >/dev/null 2>&1; then
+        readyz_ok=1
+        break
+      fi
+      sleep "${APISERVER_READYZ_POLL_INTERVAL_SECONDS}"
+    done
+    if [ "${readyz_ok}" -eq 0 ]; then
+      echo "WARNING: API server /readyz did not become ready within ${APISERVER_READYZ_TIMEOUT_SECONDS}s; proceeding with recovery calls." >&2
+    fi
+    # If the failed attempt left behind a release record with no deployed revision,
+    # clear it so the next attempt can install cleanly (#1172, #2382).
+    heal_poisoned_release_record "attempt ${attempt} failed before reaching a deployed revision (#1172, #2382)" "retrying"
+  else
+    if [ "${attempt}" -lt "${HELM_DEPLOY_ATTEMPTS}" ]; then
+      echo "ERROR: Helm chart deployment attempt ${attempt} failed with an error that is not a transient API-server 5xx; it is not retried (exit ${HELM_EXIT})." >&2
+    else
+      echo "ERROR: Helm chart deployment failed on all ${HELM_DEPLOY_ATTEMPTS} attempts; giving up (exit ${HELM_EXIT})." >&2
+    fi
+    rm -f "${HELM_INSTALL_OUT}"
+    exit "${HELM_EXIT}"
+  fi
+done
+rm -f "${HELM_INSTALL_OUT}"
 # Deleted here rather than from the EXIT trap, which two later steps replace.
 # A failed install leaves the directory behind in a pod prow destroys with the
 # lease, and nothing uploads it — /logs/artifacts is the only path off this box.
