@@ -167,7 +167,7 @@ VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-gke\.(\d+))?$")
 
 
 class Criteria(NamedTuple):
-    """The four thresholds the audit's criteria store can tune.
+    """The thresholds the audit's criteria store can tune.
 
     One field per key of
     agents/platform/capabilities/security-patch-orchestrator/criteria.schema.json,
