@@ -6078,37 +6078,34 @@ class TestCostDeclaredShapes(HarnessTestCase):
         self.assertEqual(audit_report.declare_collector_candidates(doc, declarations, manifest), [])
         self.assertEqual(len(doc["declared"]), 1)
 
-    def test_a_declaration_covers_a_minor_reservation_and_a_major_one_publishes_with_a_note(self):
-        # The note names the object, not the size, and every cost finding is a
-        # size: a declared pool that grew to a node's worth is `major` and is
-        # reported again, the finding saying the note was read and what brings
-        # the declaration back; the manifest route declares no major candidate.
-        small = make_finding(fid="small", severity="minor", check="idle-nodepool", namespace="", obj="NodePool/warm-batch", remediation={"kind": "gcloud", "note": "gcloud container node-pools update warm-batch --min-nodes=0"})
-        grown = make_finding(fid="grown", severity="major", check="idle-nodepool", namespace="", obj="NodePool/gpu-warm", remediation={"kind": "gcloud", "note": "gcloud container node-pools update gpu-warm --min-nodes=0"})
-        workload = make_finding(fid="wl", severity="major", check="overrequest", obj="Deployment/burst-ingest", remediation={"kind": "manifest", "path": "clusters/prod-us-east/burst.yaml", "note": "resize"})
-        doc = self._doc([small, grown, workload])
-        declarations = [
-            self._declaration("idle-nodepool", "NodePool/warm-batch"),
-            self._declaration("idle-nodepool", "NodePool/gpu-warm"),
-            self._declaration("overrequest", "Deployment/burst-ingest", namespace="payments"),
-        ]
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            moved = audit_report.apply_declarations(doc, declarations)
-        self.assertEqual([f["object"] for f in moved], ["NodePool/warm-batch"])
-        self.assertEqual([f["object"] for f in doc["findings"]], ["NodePool/gpu-warm", "Deployment/burst-ingest"])
-        self.assertEqual(err.getvalue().count("covers a 'minor' reservation only"), 2)
-        pool_note = doc["findings"][0]["remediation"]["note"]
-        self.assertTrue(pool_note.startswith("# Declared at acme/fleet:knowledge/reservations.md"), pool_note)
-        self.assertIn("\ngcloud container node-pools update gpu-warm", pool_note)
-        self.assertEqual(doc["findings"][0]["remediation"]["kind"], "gcloud")
-        wl_note = doc["findings"][1]["remediation"]["note"]
-        self.assertTrue(wl_note.startswith("_(Declared at acme/fleet:knowledge/reservations.md"), wl_note)
-        self.assertTrue(wl_note.endswith(")_ resize"), wl_note)
-        scoped, fleet_wide = audit_report._declaration_lookup(declarations)
-        declarable = audit_report.audit_declarable_checks(self.COST)
-        self.assertIsNone(audit_report._declaration_covers({"check": "idle-nodepool", "namespace": "", "object": "NodePool/gpu-warm", "severity": "major"}, scoped, fleet_wide, declarable))
-        self.assertIsNotNone(audit_report._declaration_covers({"check": "idle-nodepool", "namespace": "", "object": "NodePool/warm-batch", "severity": "minor"}, scoped, fleet_wide, declarable))
+    def test_a_cost_declared_row_carries_the_measured_size_and_grade(self):
+        # A declaration names the object and not its size, so the Declared
+        # intent row says what the collector measured and how it graded it,
+        # MAJOR spelled out, on both routes: that is where a declared
+        # reservation that has grown shows while it stays declared.
+        small = make_finding(fid="small", severity="minor", check="idle-nodepool", namespace="", obj="NodePool/warm-batch", excerpt="2 nodes at <=4% non-DaemonSet allocation\nsecond line")
+        grown = make_finding(fid="grown", severity="major", check="idle-nodepool", namespace="", obj="NodePool/gpu-warm", excerpt="20 nodes (a2-highgpu-1g) at <=3% allocation")
+        doc = self._doc([small, grown])
+        declarations = [self._declaration("idle-nodepool", "NodePool/warm-batch"), self._declaration("idle-nodepool", "NodePool/gpu-warm")]
+        moved = audit_report.apply_declarations(doc, declarations)
+        self.assertEqual(len(moved), 2)
+        self.assertEqual(
+            [e["title"] for e in doc["declared"]],
+            [
+                "NodePool/warm-batch — idle-nodepool, minor: 2 nodes at <=4% non-DaemonSet allocation",
+                "NodePool/gpu-warm — idle-nodepool, MAJOR: 20 nodes (a2-highgpu-1g) at <=3% allocation",
+            ],
+        )
+        again = self._doc([])
+        manifest = {"clusters": [{"name": "prod-us-east", "outcome": "collected", "candidates": [
+            {"check": "idle-nodepool", "namespace": "", "object": "NodePool/gpu-warm", "severity": "major", "excerpt": "20 nodes (a2-highgpu-1g) at <=3% allocation"}
+        ]}]}
+        self.assertEqual(len(audit_report.declare_collector_candidates(again, declarations, manifest)), 1)
+        self.assertEqual(again["declared"][0]["title"], "NodePool/gpu-warm — idle-nodepool, MAJOR: 20 nodes (a2-highgpu-1g) at <=3% allocation")
+        # Another stream's row keeps the finding's own title.
+        other = audit_report.validate_findings(make_doc(findings=[make_finding(check="netpol-missing", title="Namespace has no NetworkPolicy", obj="Namespace/payments")], audit=AUDIT), AUDIT)
+        audit_report.apply_declarations(other, [{"check": "netpol-missing", "namespace": "payments", "object": "Namespace/payments", "repo": "acme/fleet", "path": "knowledge/p.md", "excerpt": "x"}])
+        self.assertEqual(other["declared"][0]["title"], "Namespace has no NetworkPolicy")
 
     def test_a_roll_up_scope_is_not_declarable_on_any_route(self):
         # §3a: a roll-up names a scope, not an object. The 3.5 ten-address
@@ -6124,17 +6121,21 @@ class TestCostDeclaredShapes(HarnessTestCase):
         # what each check names does not.
         short = make_finding(fid="short", severity="major", check="overrequest", obj="ns/payments")
         plural = make_finding(fid="plural", severity="major", check="idle-address", cluster=self.PROJECT, namespace="", obj="projects/acme-prod")
-        doc = self._doc([addresses, claims, requests, short, plural])
+        # 3.1 names whatever controller owns the pod, so a pod-owning custom
+        # resource is an object it files and a declaration for it joins.
+        crd = make_finding(fid="crd", severity="minor", check="overrequest", obj="StrimziPodSet/kafka")
+        doc = self._doc([addresses, claims, requests, short, plural, crd])
         declarations = [
             self._declaration("idle-address", "Project/acme-prod"),
             self._declaration("unconsumed-pvc", "Cluster/prod-us-east"),
             self._declaration("overrequest", "Namespace/payments", namespace="payments"),
             self._declaration("overrequest", "ns/payments", namespace="payments"),
             self._declaration("idle-address", "projects/acme-prod"),
+            self._declaration("overrequest", "StrimziPodSet/kafka", namespace="payments"),
         ]
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            self.assertEqual(audit_report.apply_declarations(doc, declarations), [])
+            self.assertEqual([f["object"] for f in audit_report.apply_declarations(doc, declarations)], ["StrimziPodSet/kafka"])
         self.assertEqual(len(doc["findings"]), 5)
         self.assertEqual(err.getvalue().count("DECLARATION NOT APPLIED"), 5)
         self.assertIn("roll-up", err.getvalue())

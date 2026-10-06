@@ -46,7 +46,7 @@ gitops-repo/
   policy (`fleet_wide_cost_analysis_sop.md` §3a, object as the finding names it, and `namespace`
   empty for a node pool, an idle namespace and the project-scoped disk, address and registry
   repository; a namespace written on any of those five is read as empty; a cost declaration
-  covers a `minor` finding only, and a reservation grown to `major` is reported again).
+  covers the object at any size, and the Declared intent row shows the size the collector measured).
   A choice HCL cannot express — a workload meant to run one replica — goes in an OKF document
   (`type` frontmatter, 06 §5) under `knowledge/` as a `declares:` list in the frontmatter, one item
   per posture with `check` (the slug, `single-replica`), `namespace`, `object` as `Kind/name`, and

@@ -911,11 +911,12 @@ ALLOW_ALL_SHAPE_KIND = "NetworkPolicy"
 # spelling like `ns/` a worker may give a §5 collapse — covers no object the
 # check names and is refused on the join, the manifest route and the
 # validator alike. Per check, so the patch stream's `Cluster/<name>`
-# declarations are untouched.
-COST_WORKLOAD_KINDS = frozenset({"deployment", "statefulset", "daemonset", "replicaset", "job", "cronjob", "pod"})
+# declarations are untouched. 3.1 and 3.13 name whatever controller kind owns
+# the pod — a ReplicationController or a pod-owning custom resource as readily
+# as a Deployment — so for those two only the scope spellings are refused.
+COST_CONTROLLER_CHECKS = frozenset({"overrequest", "idle-workload"})
+SCOPE_KIND_SPELLINGS = frozenset({"project", "projects", "cluster", "clusters", "namespace", "namespaces", "ns"})
 COST_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
-    "overrequest": COST_WORKLOAD_KINDS,
-    "idle-workload": COST_WORKLOAD_KINDS,
     "unconsumed-pvc": frozenset({"persistentvolumeclaim"}),
     "unattached-disk": frozenset({"disk"}),
     "idle-address": frozenset({"address"}),
@@ -923,21 +924,13 @@ COST_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
     "idle-namespace": frozenset({"namespace"}),
     "registry-no-cleanup": frozenset({"artifactregistryrepository"}),
 }
-# A cost declaration names the object and not its size, while every cost
-# finding is about a size. The SOP's severity is its size scale (§3: `minor`
-# by default, `major` for magnitude — a node's worth, 500 GiB, a load
-# balancer), so a declaration covers a `minor` finding only: a reservation
-# that has grown past that publishes under the note that still names it,
-# with the sentence below on its remediation, until it is `minor` again.
-COST_DECLARABLE_SEVERITY = "minor"
-COST_OUTGROWN_NOTE = (
-    "Declared at {repo}:{path}, but a declaration covers a `minor` reservation only; at this size "
-    "the finding is `{severity}` and publishes until it is under the `minor` line again, where the "
-    "declaration applies again."
-)
-# A `gcloud` note renders inside a bash fence, so the sentence rides as a
-# comment line there; `manifest` and `manual` notes render as prose.
-COST_OUTGROWN_SHELL_PREFIX = "# "
+# A cost declaration names the object and not its size, and every cost
+# finding is about a size, so the Declared intent row for one carries what
+# the collector measured and the grade it gave, `MAJOR` spelled out: a
+# declared reservation that has grown shows there each run while it stays
+# declared. The excerpt is clipped to its first line and this many characters.
+COST_DECLARED_EXCERPT_CHARS = 100
+COST_DECLARED_MINOR = "minor"
 # The cost checks whose collector candidate carries no `namespace`: 3.10
 # names the namespace itself, 3.7 a node pool, and 3.4, 3.5 and 3.14 a
 # project's disk, address and registry repository. A worker or a note author
@@ -5330,8 +5323,6 @@ def _declaration_covers(item: dict, scoped: dict, fleet_wide: dict, declarable) 
         return None
     if _rollup_scope_reason(check, str(item.get("object", ""))):
         return None
-    if _cost_outgrown(check, item):
-        return None
     return match
 
 
@@ -5384,7 +5375,11 @@ def declare_collector_candidates(data: dict, declarations: list[dict], manifest:
                 "cluster": keyed["cluster"],
                 "namespace": str(keyed.get("namespace") or ""),
                 "object": str(keyed.get("object", "")),
-                "title": f"{keyed.get('check', '')} on {keyed.get('object', '')}: a collector candidate the document did not report",
+                "title": (
+                    cost_declared_title(str(keyed.get("check", "")), str(keyed.get("object", "")), str(keyed.get("severity", "")), str(keyed.get("excerpt", "")))
+                    if _is_cost_declarable(str(keyed.get("check", "")))
+                    else f"{keyed.get('check', '')} on {keyed.get('object', '')}: a collector candidate the document did not report"
+                ),
                 "declaration": {field: str(match.get(field, "")) for field in DECLARATION_FIELDS},
             }
         )
@@ -5392,7 +5387,7 @@ def declare_collector_candidates(data: dict, declarations: list[dict], manifest:
         log(
             f"DECLARED: {_shorten_id(identity)} — {keyed.get('check', '')} on "
             f"{keyed['cluster']}/{keyed.get('namespace') or '(cluster)'}/{keyed.get('object', '')} "
-            f"is a collector candidate the document did not report and is declared at "
+            f"({keyed.get('severity', '')}) is a collector candidate the document did not report and is declared at "
             f"{match.get('repo', '')}:{match.get('path', '')}; listed under Declared intent."
         )
     if added:
@@ -5422,24 +5417,6 @@ def fold_unnamespaced_check(entry: dict) -> None:
         entry["namespace"] = ""
 
 
-def _cost_outgrown(check: str, item: dict) -> bool:
-    """Whether `item`, a cost finding or candidate, is past the size a declaration covers."""
-    return check in COST_DECLARABLE_OBJECT_KINDS and str(item.get("severity", "")) != COST_DECLARABLE_SEVERITY
-
-
-def note_outgrown_declaration(finding: dict, match: dict) -> None:
-    """Put the outgrown sentence on the finding's remediation, in the kind's rendering."""
-    remediation = finding.setdefault("remediation", {})
-    sentence = COST_OUTGROWN_NOTE.format(
-        repo=match.get("repo", ""), path=match.get("path", ""), severity=finding.get("severity", "")
-    )
-    note = str(remediation.get("note", "")).strip()
-    if str(remediation.get("kind", "")) == "gcloud":
-        remediation["note"] = COST_OUTGROWN_SHELL_PREFIX + sentence + (f"\n{note}" if note else "")
-    else:
-        remediation["note"] = f"_({sentence})_" + (f" {note}" if note else "")
-
-
 def _rollup_scope_reason(check: str, obj: str) -> str | None:
     """Why `obj` is not an object `check` names — a roll-up's scope, or a kind the check never files — or None.
 
@@ -5450,10 +5427,25 @@ def _rollup_scope_reason(check: str, obj: str) -> str | None:
     Another stream's check is not judged here.
     """
     kind = _object_kind_segment(obj)
+    if check in COST_CONTROLLER_CHECKS:
+        if kind in SCOPE_KIND_SPELLINGS:
+            return f"names a roll-up's scope (`{kind}/`), not a controller a {check} finding names"
+        return None
     allowed = COST_DECLARABLE_OBJECT_KINDS.get(check)
     if allowed is not None and kind not in allowed:
         return f"names a `{kind}/`, not one of the kinds a {check} finding names ({', '.join(sorted(allowed))})"
     return None
+
+
+def _is_cost_declarable(check: str) -> bool:
+    return check in COST_CONTROLLER_CHECKS or check in COST_DECLARABLE_OBJECT_KINDS
+
+
+def cost_declared_title(check: str, obj: str, severity: str, excerpt: str) -> str:
+    """The Declared intent row's title for a cost posture: the object, the grade and the measured size."""
+    grade = severity if severity == COST_DECLARED_MINOR else severity.upper()
+    measured = clip_text(str(excerpt or "").strip().splitlines()[0] if str(excerpt or "").strip() else "", COST_DECLARED_EXCERPT_CHARS)
+    return f"{obj} — {check}, {grade}: {measured}" if measured else f"{obj} — {check}, {grade}"
 
 
 def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
@@ -5535,18 +5527,6 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
                 f"{match.get('repo', '')}:{match.get('path', '')} stands and the finding publishes."
             )
             match = None
-        if match is not None and _cost_outgrown(check, finding):
-            # The note names the object, not its size; past `minor` the
-            # reservation is reported, and the finding says why and what
-            # brings the declaration back.
-            log(
-                f"DECLARATION NOT APPLIED: {finding.get('id', '')} — {check} on "
-                f"{finding.get('object', '')} is {finding.get('severity', '')!r}, and a cost declaration "
-                f"covers a {COST_DECLARABLE_SEVERITY!r} reservation only. "
-                f"{match.get('repo', '')}:{match.get('path', '')} stands and the finding publishes with a note."
-            )
-            note_outgrown_declaration(finding, match)
-            match = None
         if match is None or derive_finding_id(finding) in already:
             kept.append(finding)
             continue
@@ -5556,7 +5536,11 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
                 "cluster": str(finding.get("cluster", "")),
                 "namespace": str(finding.get("namespace") or ""),
                 "object": str(finding.get("object", "")),
-                "title": str(finding.get("title", "")),
+                "title": (
+                    cost_declared_title(check, str(finding.get("object", "")), str(finding.get("severity", "")), str((finding.get("evidence") or {}).get("excerpt", "")))
+                    if _is_cost_declarable(check)
+                    else str(finding.get("title", ""))
+                ),
                 "declaration": {
                     field: str(match.get(field, "")) for field in DECLARATION_FIELDS
                 },
@@ -5566,7 +5550,7 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
         log(
             f"DECLARED: {finding.get('id', '')} — {check} on "
             f"{finding.get('cluster', '')}/{finding.get('namespace') or '(cluster)'}/"
-            f"{finding.get('object', '')} is declared at {match.get('repo', '')}:"
+            f"{finding.get('object', '')} ({finding.get('severity', '')}) is declared at {match.get('repo', '')}:"
             f"{match.get('path', '')}; listed under Declared intent, not as a finding."
         )
     if moved:
