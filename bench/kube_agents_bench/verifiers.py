@@ -3081,11 +3081,12 @@ class BootstrapHandoffVerifier(_OnboardingPollVerifier):
       cluster the hand-off's own ``finding_lines`` lists from the done cluster
       cards created at or after the sweep has at least one block line. The sandbox's parser is the oracle, so the
       verdict is what the next stage would make of the file.
-    - ``ranking_card_filed``: the newest card keyed
-      ``bootstrap-inventory-prioritize`` created at or after the sweep is
-      neither archived nor in a status where it will not run (``blocked``,
-      ``triage``, ``failed``, ``cancelled``), such as a card the sweep's worker
-      filed before the raw file existed.
+    - ``ranking_card_filed``: the newest unarchived card keyed
+      ``bootstrap-inventory-prioritize`` created at or after the sweep carries
+      the hand-off's own body (asked of the hand-off module on the agent pod;
+      not checked where the module is absent) and is not in a status where it
+      will not run (``blocked``, ``triage``, ``failed``, ``cancelled``). A card
+      the sweep's worker filed itself fails either way.
 
     Fails closed: either pod unreadable, no sweep marker, a sweep the board
     does not know, a board that cannot be queried, or a parser the sandbox
@@ -3113,6 +3114,13 @@ class BootstrapHandoffVerifier(_OnboardingPollVerifier):
         live = [c for c in board.get("keyed") or [] if c.get("status") != "archived"]
         if live:
             card = live[-1]
+            if card.get("own") is False:
+                return (
+                    "fail",
+                    f"{where}: ranking card {card['id']} keyed {key} was not filed by the hand-off "
+                    "(its body is not the hand-off's), so nothing guarantees it reads the raw file",
+                    board,
+                )
             if card["status"] in onboarding.RANKING_WONT_RUN:
                 return (
                     "fail",

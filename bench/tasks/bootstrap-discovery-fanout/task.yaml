@@ -12,7 +12,7 @@
 #
 # bench/tf/prebuilt/bootstrap-discovery re-arms the gate, waits for the cron
 # job to file a new sweep card, and returns once a card keyed
-# `bootstrap-inventory-prioritize` that can still run is on the board, or once
+# `bootstrap-inventory-prioritize` and filed by the hand-off is on the board, or once
 # the sweep and every Cluster Agent card filed for it have stayed in a final
 # status for the stack's `settle_hold` (120s) without one, or at its
 # `handoff_wait` (1800s). That settle rule is looser than the hand-off's own

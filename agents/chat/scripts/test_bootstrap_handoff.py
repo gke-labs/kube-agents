@@ -42,17 +42,17 @@ def _board(path: Path, sweep_status="done", sweep_meta=None, clusters=None) -> N
     """A board with the columns the hand-off reads, in the board's own names."""
     conn = sqlite3.connect(path)
     conn.executescript(
-        "CREATE TABLE tasks (id TEXT, status TEXT, idempotency_key TEXT, title TEXT, created_at INTEGER);"
+        "CREATE TABLE tasks (id TEXT, status TEXT, idempotency_key TEXT, title TEXT, created_at INTEGER, body TEXT);"
         "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, outcome TEXT, metadata TEXT);"
         "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);"
     )
-    conn.execute("INSERT INTO tasks VALUES (?, ?, 'bootstrap-inventory-scan', 'sweep', ?)",
+    conn.execute("INSERT INTO tasks (id, status, idempotency_key, title, created_at) VALUES (?, ?, 'bootstrap-inventory-scan', 'sweep', ?)",
                  (SWEEP, sweep_status, SWEEP_CREATED))
     if sweep_meta is not None:
         conn.execute("INSERT INTO task_runs (task_id, outcome, metadata) VALUES (?, 'completed', ?)",
                      (SWEEP, json.dumps(sweep_meta)))
     for i, (tid, status, meta, reason) in enumerate(clusters or []):
-        conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?)",
+        conn.execute("INSERT INTO tasks (id, status, idempotency_key, title, created_at) VALUES (?, ?, ?, ?, ?)",
                      (tid, status, f"{h.CLUSTER_KEY_PREFIX}{tid}", f"Report cluster inventory: {tid}",
                       SWEEP_CREATED + 1 + i))
         if meta is not None:
@@ -428,7 +428,7 @@ class HandOffTest(unittest.TestCase):
     def test_an_earlier_runs_open_card_does_not_hold_the_hand_off_forever(self):
         _board(self.board, clusters=_all_done())
         conn = sqlite3.connect(self.board)
-        conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?)",
+        conn.execute("INSERT INTO tasks (id, status, idempotency_key, title, created_at) VALUES (?, ?, ?, ?, ?)",
                      ("t_old", "running", f"{h.CLUSTER_KEY_PREFIX}t_old", "old", SWEEP_CREATED - 100))
         conn.commit()
         conn.close()
@@ -443,7 +443,7 @@ class HandOffTest(unittest.TestCase):
     def test_an_earlier_runs_ranking_card_is_archived_before_filing(self):
         _board(self.board, clusters=_all_done())
         conn = sqlite3.connect(self.board)
-        conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?)",
+        conn.execute("INSERT INTO tasks (id, status, idempotency_key, title, created_at) VALUES (?, ?, ?, ?, ?)",
                      ("t_oldrank", "blocked", h.PRIORITIZE_KEY, "old ranking", SWEEP_CREATED - 100))
         conn.commit()
         conn.close()
@@ -456,7 +456,7 @@ class HandOffTest(unittest.TestCase):
     def test_an_archive_the_board_ignored_is_a_gap_not_a_filed_card(self):
         _board(self.board, clusters=_all_done())
         conn = sqlite3.connect(self.board)
-        conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?)",
+        conn.execute("INSERT INTO tasks (id, status, idempotency_key, title, created_at) VALUES (?, ?, ?, ?, ?)",
                      ("t_old", "running", f"{h.CLUSTER_KEY_PREFIX}t_old", "old", SWEEP_CREATED - 100))
         conn.commit()
         conn.close()
@@ -472,7 +472,7 @@ class HandOffTest(unittest.TestCase):
     def test_a_ranking_card_the_archive_left_is_not_recorded(self):
         _board(self.board, clusters=_all_done())
         conn = sqlite3.connect(self.board)
-        conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?)",
+        conn.execute("INSERT INTO tasks (id, status, idempotency_key, title, created_at) VALUES (?, ?, ?, ?, ?)",
                      ("t_oldrank", "blocked", h.PRIORITIZE_KEY, "old ranking", SWEEP_CREATED - 100))
         conn.commit()
         conn.close()
@@ -490,17 +490,17 @@ class HandOffTest(unittest.TestCase):
             self.board.unlink()
             (self.d / h.HANDOFF_MARKER).unlink()
 
-    def _ranking_card(self, tid, status, created_at):
+    def _ranking_card(self, tid, status, created_at, body="Rank the inventory now."):
         conn = sqlite3.connect(self.board)
-        conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?)",
-                     (tid, status, h.PRIORITIZE_KEY, "early ranking", created_at))
+        conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?)",
+                     (tid, status, h.PRIORITIZE_KEY, "early ranking", created_at, body))
         conn.commit()
         conn.close()
 
-    def test_a_ranking_card_that_will_not_run_is_replaced_whenever_it_was_filed(self):
-        # A sweep worker that filed the key before the raw file existed: the
-        # card is newer than the sweep and blocked.
-        for status in h.WONT_RUN:
+    def test_a_ranking_card_the_hand_off_did_not_file_is_replaced(self):
+        # A sweep worker that filed the key itself: newer than the sweep, in
+        # any status, including running before the raw file exists.
+        for status in ("todo", "running", "blocked", "done"):
             _board(self.board, clusters=_all_done())
             self._ranking_card("t_early", status, SWEEP_CREATED + 50)
             sent = []
@@ -511,15 +511,19 @@ class HandOffTest(unittest.TestCase):
             self.board.unlink()
             (self.d / h.HANDOFF_MARKER).unlink()
 
-    def test_a_ranking_card_still_running_for_this_sweep_is_kept(self):
-        # A tick that filed the card but failed to record it finds it again.
-        _board(self.board, clusters=_all_done())
-        self._ranking_card("t_mine", "running", SWEEP_CREATED + 50)
-        sent = []
-        with self._stub_kanban(sent, reply='{"id": "t_mine"}'), \
-                mock.patch.object(h, "file_prioritize", HandOffTest._real_file_prioritize):
-            self.assertEqual(self._run_with_parser(), "t_mine")
-        self.assertFalse(any(cmd.startswith("archive") for cmd in sent))
+    def test_the_hand_offs_own_unrecorded_ranking_card_is_kept(self):
+        # A tick that filed the card but failed to record it finds it again,
+        # whatever became of it, so a blocked one is not re-filed every tick.
+        for status in ("running", "blocked"):
+            _board(self.board, clusters=_all_done())
+            self._ranking_card("t_mine", status, SWEEP_CREATED + 50, body=h._prioritize_body())
+            sent = []
+            with self._stub_kanban(sent, reply='{"id": "t_mine"}'), \
+                    mock.patch.object(h, "file_prioritize", HandOffTest._real_file_prioritize):
+                self.assertEqual(self._run_with_parser(), "t_mine", status)
+            self.assertFalse(any(cmd.startswith("archive") for cmd in sent), status)
+            self.board.unlink()
+            (self.d / h.HANDOFF_MARKER).unlink()
 
     def test_a_sweep_in_triage_reports_its_reason(self):
         _board(self.board, sweep_status="triage", clusters=_all_done())

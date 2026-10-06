@@ -59,7 +59,7 @@ SWEEP_AT = 1000
 _SCHEMA = (
     (
         "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, assignee TEXT, "
-        "status TEXT NOT NULL, created_at INTEGER NOT NULL, idempotency_key TEXT)"
+        "status TEXT NOT NULL, created_at INTEGER NOT NULL, idempotency_key TEXT, body TEXT)"
     ),
     (
         "CREATE TABLE task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, "
@@ -149,8 +149,8 @@ def install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             for ddl in _SCHEMA:
                 conn.execute(ddl)
             conn.executemany(
-                "INSERT INTO tasks VALUES (:id, :title, :assignee, :status, :created_at, :idempotency_key)",
-                [sweep, *cards, *extra],
+                "INSERT INTO tasks VALUES (:id, :title, :assignee, :status, :created_at, :idempotency_key, :body)",
+                [{"body": None, **card} for card in (sweep, *cards, *extra)],
             )
             conn.executemany(
                 "INSERT INTO task_runs (task_id, status, started_at, ended_at, outcome, metadata) "
@@ -176,8 +176,18 @@ def _ranking_card(**overrides: Any) -> dict[str, Any]:
         "status": "todo",
         "created_at": SWEEP_AT + 600,
         "idempotency_key": onboarding.PRIORITIZE_KEY,
+        "body": _handoff_module()._prioritize_body(),
         **overrides,
     }
+
+
+def _handoff_module():
+    sys.path.insert(0, str(GATE.parent))
+    try:
+        import bootstrap_handoff
+    finally:
+        sys.path.remove(str(GATE.parent))
+    return bootstrap_handoff
 
 
 # --- raw_report_has_findings_block ----------------------------------------
@@ -391,13 +401,25 @@ def test_a_ranking_card_that_will_not_run_fails(install, status: str) -> None:
     assert f"is {status}, so it will not rank the report" in result.reason
 
 
+def test_a_ranking_card_the_hand_off_did_not_file_fails(install) -> None:
+    # A sweep worker's own card: keyed, after the sweep, still running, and no raw file behind it.
+    install(RAW_WITHOUT_BLOCK, extra=[_ranking_card(status="running", body="Rank the inventory now.")])
+    result = _verify("ranking_card_filed")
+    assert result.status == "fail", result.reason
+    assert "was not filed by the hand-off" in result.reason
+
+
+def test_without_the_hand_off_module_the_ranking_card_is_graded_on_status(
+    install, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(onboarding, "HANDOFF_MODULE_DIR", str(tmp_path / "no-scripts"))
+    install(None, extra=[_ranking_card(body="Rank the inventory now.")])
+    assert _verify("ranking_card_filed").status == "pass"
+
+
 def test_the_wont_run_statuses_match_the_hand_off() -> None:
-    sys.path.insert(0, str(GATE.parent))
-    try:
-        import bootstrap_handoff
-    finally:
-        sys.path.remove(str(GATE.parent))
-    assert onboarding.RANKING_WONT_RUN == bootstrap_handoff.WONT_RUN
+    bootstrap_handoff = _handoff_module()
+    assert set(onboarding.RANKING_WONT_RUN) == set(bootstrap_handoff.SETTLED) - {bootstrap_handoff.DONE}
 
 
 # --- the mirrored names and the case --------------------------------------

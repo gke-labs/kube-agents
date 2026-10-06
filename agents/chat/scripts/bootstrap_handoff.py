@@ -65,9 +65,6 @@ TRIAGE = "triage"
 FAILED = "failed"
 CANCELLED = "cancelled"
 SETTLED = (DONE, BLOCKED, TRIAGE, FAILED, CANCELLED)
-# A ranking card in one of these will not rank anything without a person, so
-# the hand-off never takes it for its own, whenever it was filed.
-WONT_RUN = (BLOCKED, TRIAGE, FAILED, CANCELLED)
 # A blocked sweep is not finished: unblocked, it may still list the fleet.
 SWEEP_FINISHED = (DONE, FAILED, CANCELLED)
 ARCHIVED = "archived"
@@ -205,16 +202,17 @@ def read_board(board: Path, sweep_id: str) -> dict | None:
                 "block_reason": _block_reason(conn, tid) if cstatus in (BLOCKED, TRIAGE) else "",
             })
         # Open onboarding cards the board would answer a create with instead of
-        # filing a new one: an earlier run's, and a ranking card that will not
-        # run, such as one a sweep worker filed before the raw file existed.
-        wont_run = ", ".join("?" * len(WONT_RUN))
+        # filing a new one: an earlier run's, and a ranking card this hand-off
+        # did not file, such as one a sweep worker filed before the raw file
+        # existed. The body tells the hand-off's own card apart, so a tick that
+        # filed it but failed to record it still finds it.
         stale = {
-            key: tid for tid, key in conn.execute(
-                "SELECT id, idempotency_key FROM tasks WHERE status != ? AND ("
-                "((idempotency_key LIKE ? OR idempotency_key = ?) AND created_at < ?) "
-                f"OR (idempotency_key = ? AND status IN ({wont_run})))",
-                (ARCHIVED, CLUSTER_KEY_PREFIX + "%", PRIORITIZE_KEY, created_at, PRIORITIZE_KEY, *WONT_RUN),
+            key: tid for tid, key, body, at in conn.execute(
+                "SELECT id, idempotency_key, body, created_at FROM tasks WHERE status != ? "
+                "AND (idempotency_key LIKE ? OR idempotency_key = ?)",
+                (ARCHIVED, CLUSTER_KEY_PREFIX + "%", PRIORITIZE_KEY),
             ).fetchall()
+            if at < created_at or (key == PRIORITIZE_KEY and (body or "") != _prioritize_body())
         }
         return {"sweep": sweep, "clusters": clusters, "archived_clusters": archived, "archived_keys": archived_keys,
                 "stale_keys": stale}
@@ -644,7 +642,7 @@ def file_prioritize(parse_task_id, stale: dict | None = None) -> str | None:
         return None
     task_id = _create(parse_task_id, ASSIGNEE, PRIORITIZE_KEY, PRIORITIZE_TITLE, _prioritize_body())
     if old and task_id == old:
-        _log(f"the board handed back {old}, an earlier run's ranking card the archive did not remove")
+        _log(f"the board handed back {old}, a ranking card the hand-off did not file and the archive did not remove")
         return None
     return task_id
 

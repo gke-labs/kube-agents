@@ -683,19 +683,29 @@ class HandoffStateQueryTest(unittest.TestCase):
     def tearDownClass(cls):
         cls._dir.cleanup()
 
+    def tearDown(self):
+        (pathlib.Path(self._home) / "scripts" / "bootstrap_handoff.py").unlink(missing_ok=True)
+
+    def _hand_off_module(self, body):
+        scripts = pathlib.Path(self._home) / "scripts"
+        scripts.mkdir(exist_ok=True)
+        (scripts / "bootstrap_handoff.py").write_text(f"def _prioritize_body():\n    return {body!r}\n")
+
     def _query(self, sweep_status, cards=(), runs=1, sweep_at=100):
         board = pathlib.Path(self._home) / "kanban.db"
         board.unlink(missing_ok=True)
         with sqlite3.connect(board) as conn:
             conn.execute(
                 "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT NOT NULL, "
-                "created_at INTEGER NOT NULL, idempotency_key TEXT)"
+                "created_at INTEGER NOT NULL, idempotency_key TEXT, body TEXT)"
             )
             conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT NOT NULL)")
-            conn.execute("INSERT INTO tasks VALUES (?, ?, ?, 'bootstrap-inventory-scan')", (_SWEEP, sweep_status, sweep_at))
+            conn.execute(
+                "INSERT INTO tasks VALUES (?, ?, ?, 'bootstrap-inventory-scan', NULL)", (_SWEEP, sweep_status, sweep_at)
+            )
             conn.executemany(
-                "INSERT INTO tasks VALUES (?, ?, ?, ?)",
-                [(f"t_{i}", status, at, key) for i, (key, status, at) in enumerate(cards)],
+                "INSERT INTO tasks VALUES (?, ?, ?, ?, ?)",
+                [(f"t_{i}", c[1], c[2], c[0], c[3] if len(c) > 3 else None) for i, c in enumerate(cards)],
             )
             conn.executemany("INSERT INTO task_runs (task_id) VALUES (?)", [(_SWEEP,)] * runs)
         completed = subprocess.run(
@@ -720,8 +730,12 @@ class HandoffStateQueryTest(unittest.TestCase):
     def test_an_archived_or_older_ranking_card_does_not_count(self):
         key = _INTERPOLATIONS["local.prioritize_key"]
         self.assertEqual(self._query("running", [(key, "archived", 200)]), "1 0 0")
-        for status in ("blocked", "triage", "failed", "cancelled"):
-            self.assertEqual(self._query("running", [(key, status, 200)]), "1 0 0", status)
+
+    def test_only_the_hand_offs_own_ranking_card_counts_where_its_module_is(self):
+        key = _INTERPOLATIONS["local.prioritize_key"]
+        self._hand_off_module("Rank it.")
+        self.assertEqual(self._query("running", [(key, "running", 200, "Rank the inventory now.")]), "1 0 0")
+        self.assertEqual(self._query("running", [(key, "todo", 200, "Rank it.")]), "1 1 0")
         self.assertEqual(self._query("running", [(key, "todo", 50)]), "1 0 0")
 
     def test_settled_needs_the_sweep_and_every_cluster_card_ended(self):

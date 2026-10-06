@@ -163,8 +163,8 @@ MAX_PARSER_ERRORS = 5
 PRIORITIZE_KEY = "bootstrap-inventory-prioritize"
 PRIORITIZE_ASSIGNEE = "platform"
 PRIORITIZE_TITLE_WORD = "Prioritize"
-# bootstrap_handoff.py: WONT_RUN, the statuses in which a ranking card ranks
-# nothing without a person, so the hand-off replaces it.
+# bootstrap_handoff.py: SETTLED less DONE, the statuses in which a ranking card
+# ranks nothing without a person.
 RANKING_WONT_RUN = ("blocked", "triage", "failed", "cancelled")
 HANDOFF_READ = "__ONBOARDING_HANDOFF_BOARD__"
 # Where the agent pod keeps bootstrap_handoff.py. The board read asks the
@@ -274,12 +274,15 @@ try:
                 except Exception as exc:
                     out["writer_error"] = "the hand-off module %s from %s failed: %s" % (module, module_dir, exc)
         out["clusters"].append(card)
-    out["keyed"] = [
-        {"id": tid, "status": status}
-        for tid, status in conn.execute(
-            "SELECT id, status FROM tasks WHERE idempotency_key = ? AND created_at >= ? ORDER BY created_at, id",
-            (key, since))
-    ]
+    out["keyed"] = []
+    for tid, status, body in conn.execute(
+            "SELECT id, status, body FROM tasks WHERE idempotency_key = ? AND created_at >= ? ORDER BY created_at, id",
+            (key, since)):
+        try:
+            own = (body or "") == writer()._prioritize_body()
+        except Exception:
+            own = None
+        out["keyed"].append({"id": tid, "status": status, "own": own})
     out["unkeyed"] = [
         {"id": tid, "status": status, "title": title, "key": ikey}
         for tid, status, title, ikey in conn.execute(

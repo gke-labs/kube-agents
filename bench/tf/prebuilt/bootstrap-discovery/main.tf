@@ -363,21 +363,27 @@ resource "null_resource" "sweep" {
       # in a status nothing more comes from (done, blocked, triage, failed,
       # cancelled, archived), with at least one such card or a sweep that
       # completed (a blocked sweep can still list the fleet once unblocked).
-      # The ranking card is not settled-gated: once one exists that can run,
-      # the hand-off has happened. One that is blocked, triage, failed or
-      # cancelled may be a card the sweep's worker filed early, which the
-      # hand-off replaces. A failed read leaves the last state standing.
+      # The ranking card is not settled-gated: once the hand-off's own exists,
+      # the hand-off has happened. Its own is the one carrying the hand-off
+      # module's body; any other keyed card, such as one the sweep's worker
+      # filed early, is one the hand-off replaces. Where the module is absent
+      # every keyed card counts. A failed read leaves the last state standing.
       handoff_state() {
         agent_py "$sweep" "${local.cluster_key_like}" "${local.prioritize_key}" <<'PY'
       import sqlite3, sys
       sweep, cluster_like, key = sys.argv[1:4]
+      sys.path.insert(0, "${local.home}/scripts")
+      try:
+          from bootstrap_handoff import _prioritize_body
+          own = _prioritize_body()
+      except Exception:
+          own = None
       c = sqlite3.connect("file:${local.home}/kanban.db?mode=ro", uri=True)
       status, since = c.execute("SELECT status, created_at FROM tasks WHERE id = ?", (sweep,)).fetchone()
       started = c.execute("SELECT count(*) FROM task_runs WHERE task_id = ?", (sweep,)).fetchone()[0]
-      keyed = c.execute(
-          "SELECT count(*) FROM tasks WHERE idempotency_key = ? AND created_at >= ? "
-          "AND status NOT IN ('archived', 'blocked', 'triage', 'failed', 'cancelled')",
-          (key, since)).fetchone()[0]
+      keyed = sum(1 for (body,) in c.execute(
+          "SELECT body FROM tasks WHERE idempotency_key = ? AND created_at >= ? AND status != 'archived'",
+          (key, since)) if own is None or (body or "") == own)
       cards = [s for (s,) in c.execute(
           "SELECT status FROM tasks WHERE idempotency_key LIKE ? AND created_at >= ?", (cluster_like, since))]
       ended = ("done", "blocked", "triage", "failed", "cancelled", "archived")
