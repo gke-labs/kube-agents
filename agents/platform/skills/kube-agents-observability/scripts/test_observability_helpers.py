@@ -654,9 +654,33 @@ class GoogleApiTest(BrokerSessionCase):
         session = self.session({RELAYED_TRACES: FakeResponse(504, upstream_timeout)})
         with self.assertRaises(google_api.RelayError) as raised:
             google_api.get_json(session, google_api.TRACE_LIST_URL.format(project=PROJECT))
-        self.assertIn("HTTP 504", str(raised.exception))
-        self.assertIn("UPSTREAM_TIMEOUT", str(raised.exception))
+        self.assertIn("the credential broker answered HTTP 504 (UPSTREAM_TIMEOUT)", str(raised.exception))
+        self.assertIn("the upstream did not answer within the relay deadline", str(raised.exception))
+        self.assertNotIn(" from https://", str(raised.exception))
         self.assertNotIn("could not reach", str(raised.exception))
+
+    def test_a_rejected_caller_token_is_the_brokers_401_not_googles(self):
+        # The body the broker's _authenticated writes carries a string `error`
+        # and no `code`; printed as "HTTP 401 from <Google URL>" it reads as
+        # Google refusing the credential, the reading that sends a worker
+        # after a token of its own.
+        session = self.session({RELAYED_TRACES: FakeResponse(401, {"error": "caller could not be authenticated"})})
+        with self.assertRaises(google_api.RelayError) as raised:
+            google_api.get_json(session, google_api.TRACE_LIST_URL.format(project=PROJECT))
+        message = str(raised.exception)
+        self.assertIn("the credential broker answered HTTP 401 for https://cloudtrace.googleapis.com/", message)
+        self.assertIn("caller could not be authenticated", message)
+        self.assertNotIn(" from https://", message)
+        self.assertNotIn("(", message.split(" for ", 1)[0])
+
+    def test_a_google_error_body_is_still_reported_as_googles_answer(self):
+        session = self.session({RELAYED_TRACES: FakeResponse(403, GOOGLE_DENIED)})
+        with self.assertRaises(google_api.RelayError) as raised:
+            google_api.get_json(session, google_api.TRACE_LIST_URL.format(project=PROJECT))
+        self.assertIn("HTTP 403 from https://cloudtrace.googleapis.com/", str(raised.exception))
+        self.assertIn("PERMISSION_DENIED", str(raised.exception))
+        self.assertNotIn("the credential broker answered", str(raised.exception))
+
 
     def test_a_dropped_connect_is_reported_as_unreachable_after_the_clients_connect_bound(self):
         # A SYN nobody answers is what a default-deny egress policy does; the

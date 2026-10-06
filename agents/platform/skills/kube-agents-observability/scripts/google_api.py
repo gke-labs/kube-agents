@@ -44,9 +44,14 @@ RELAY_TIMEOUT_SECONDS = 150
 RELAY_TIMEOUT = (credential_proxy_client.BROKER_CONNECT_TIMEOUT_SECONDS, RELAY_TIMEOUT_SECONDS)
 
 # The keys of the broker's refusal body (`/v1/gcp` answers 403 the way
-# `/v1/exec` does, naming the api_policy rule) and of a Google API error body.
+# `/v1/exec` does, naming the api_policy rule), of the body the broker
+# writes for its own failures (`error` a string, `code` naming the failure:
+# UPSTREAM_TIMEOUT, RELAY_CREDENTIAL_UNAVAILABLE, API_RELAY_DISABLED; the
+# 401 for a rejected caller token carries no code), and of a Google API
+# error body, whose `error` is always an object.
 BROKER_RULE_KEY = "rule"
 BROKER_MESSAGE_KEY = "message"
+BROKER_CODE_KEY = "code"
 GOOGLE_ERROR_KEY = "error"
 
 # The 2xx range, and how much of an unstructured error body to show.
@@ -119,6 +124,18 @@ def describe_failure(url: str, response) -> str:
         return (
             f"HTTP {response.status_code} from {url}: "
             f"{error.get('status', '')} {error.get('message', '')}".strip()
+        )
+    if isinstance(body, dict) and isinstance(body.get(GOOGLE_ERROR_KEY), str):
+        # The broker answering for itself (relay disabled, its own credential
+        # unobtainable, the upstream slow, unreachable, truncated or over the
+        # response cap, the caller token rejected): the status is the broker's,
+        # not Google's, and saying so keeps a worker from reading a 401 or a
+        # 503 as Google refusing the credential.
+        code = body.get(BROKER_CODE_KEY)
+        code_note = f" ({code})" if isinstance(code, str) and code else ""
+        return (
+            f"the credential broker answered HTTP {response.status_code}{code_note} for {url}: "
+            f"{body[GOOGLE_ERROR_KEY]}"
         )
     text = response.text if isinstance(response.text, str) else ""
     return f"HTTP {response.status_code} from {url}: {text[:ERROR_BODY_PREVIEW_CHARS]}"
