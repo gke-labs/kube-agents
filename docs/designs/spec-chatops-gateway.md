@@ -297,7 +297,14 @@ one, and a wake inherits its child's) - `FromEnv` refuses a configured value und
 rather than read it as "off", which is the worker's own `A2A_DELEGATE_TOOL` switch, a different
 knob. An absent `AllowedUsers`, or one that renders as `[""]`, admits every authenticated user, the
 same as today's ingress door; a list present but blank once its entries are trimmed and split
-admits nobody, the rule #2207 already holds for the Chat ingress list. The target's `AllowedUsers`
+admits nobody, the rule #2207 already holds for the Chat ingress list. The A2A door (backend
+`a2a`) is the exception that fails closed: its principal map admits programs, not people an
+operator listed, so a delegation checked against anyone who came in through it - requester,
+steer author or incarnation-set member - needs a list for that backend, and no list is nobody
+(`delegation.door-unlisted`). Nothing renders one yet (#2478 is the CR field), so a door turn
+cannot delegate today. The inject door is deliberately not held to that rule: it exists only where
+an operator arms it on a dev or eval install, its principal map already names who may use it, and
+live runs and evals delegate through it. The target's `AllowedUsers`
 is checked three times before a mint: against the turn's own
 requester, stored hashed as it came in (the earlier ground work); against every human who steered
 the turn, each stored hashed the same way and capped at eight - past the cap the delegation
@@ -325,9 +332,12 @@ incarnation that asked. The conversation's rolling line for it is the same "work
 task gets, suffixed `(delegated to platform)`; the parent's own line is left in place on the
 parent's history entry and closes on the parent's own terminal, not the child's. From the mint on,
 the child is the conversation's active task: a follow-up steers it, `stop` cancels it, a status ask
-reports it. A heal that finds the child still running releases it from the conversation's
-active-task slot and retires its route the same way a terminal would, so a delegation is not
-blocked forever by a child whose terminal never reached the relay.
+reports it. A heal releases the child from the conversation's active-task slot, and retires its
+route the same way a terminal would, in its two ordinary cases only: the child's terminal is on the
+stream, undelivered by the relay, or the child produced nothing within `A2A_FIRST_EVENT_GRACE`. A
+child still running is left active. A known limit: a child that hangs without ending blocks
+further delegation in its conversation until its terminal arrives (from its executor or the
+supervisor) or the record is reaped.
 
 One exception stands while its flag is on: the session pod's temporary read-only cluster view
 (`spec-mode-switch.md`, "Switches inside `next`") lets a session read clusters through the
@@ -346,7 +356,9 @@ with the child's result as its input, so the session can synthesize or follow up
 the human sends while the child runs steers the child, through the gateway, as follow-ups do
 today (the platform executor refuses steers on the fixed route today, and says so). A session pod
 is therefore busy for seconds per turn, not for the life of the work it delegated, which is also
-what keeps the per-conversation pod cost small.
+what keeps the per-conversation pod cost small. The delegating turn's answer is decided at the
+call, so an eviction that lands before its harness has exited (a fast child's wake retires the
+pod) completes the turn with that answer rather than failing it `worker-evicted`.
 
 **The wake** is one new turn on the delegating session, `via.session` naming the parent's own
 incarnation, started on the child's `completed`, `failed` or `rejected` terminal - a `canceled`
@@ -364,8 +376,21 @@ as a new instruction from the user; a backtick run in the body that could close 
 broken before fencing. A heal that finds the child's terminal already on the stream, undelivered by
 the relay, wakes the session exactly as the relay would have, with the same guards, cap and fence; a
 child that never started has no terminal and does not wake. After a heal wakes the session this
-way, the message that triggered the heal steers the wake, the way any follow-up steers a running
-turn.
+way, the message that triggered the heal is routed against the wake: a follow-up (not a status ask
+or a stop) steers it, the way any follow-up steers a running turn, and a status ask is answered by
+replay.
+
+**To a program behind a door, the chain is one task.** A caller through the A2A door (or the
+inject door) submitted one task, so the gateway tells the adapter's task observers about the chain
+under that task's id, its root (the human or door turn the chain started from, carried on every
+entry of the chain), and never names the child or the wake: no start, accept, deliverable or
+terminal under either id. The turn that delegated ends quietly, and the root's one deliverable and
+terminal come at the chain's end - the wake's result, then the wake's terminal, in that order; when
+no wake runs, the root ends `canceled` for a requester's `stop` and `failed` with
+`reason: wake-not-started - …` otherwise, with nothing delivered. A heal composes with it: a healed
+child's result is not the root's deliverable, the heal's wake delivers as the relay's does. A
+cancel naming the root while the chain runs stops the running task, and the read route reads the
+root as the chain's running task. Chat backends read the posts, which are unchanged.
 
 Transition. `platform` remains the default addressee until the session can hand platform
 topics on to the platform agent without the user noticing. The route is a deploy-time
@@ -1382,7 +1407,10 @@ on a terminal that carries one. Every other post under the task is an agent mess
 the task's one artifact, named `result` as the bus names it, is the deliverable the relay hands
 the door whole before it posts it in chat-sized chunks (`DeliverableObserver`; the heal path
 hands over the artifact the stream carries), so the chunks stay history and the artifact is
-never inferred from a post's position. The door keeps up to 4 MiB of it; a longer deliverable
+never inferred from a post's position. A turn that delegates is one Task through its whole chain
+("Sessions by default"): the child's and the wake's posts land in its `history`, and the wake's
+result is its artifact. A chain that runs past the gateway's task deadline is no longer exempt
+from the door's conversation cap while the caller waits, which is a known limit. The door keeps up to 4 MiB of it; a longer deliverable
 is cut at a rune boundary with `metadata.resultTruncatedFrom` carrying the original length, so a
 client can fall back to `history`, which carries the chunks whole. Everything the door keeps per
 task (the caller's text, the posts, the deliverable) is summed across tasks under a 64 MiB budget;

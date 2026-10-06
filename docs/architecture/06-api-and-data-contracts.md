@@ -256,7 +256,9 @@ gateway compares the turn's pseudonymized backend author id, as the session KV s
 the list's entries pseudonymized the same way, at the mint of that child task (`a2a/gateway/delegation.go`;
 the delegation primitive, built) — along with every steered author of the turn and every author the
 conversation's current incarnation has seen, same comparison, each capped and refused past its cap;
-an absent list is all authenticated users, and a list that is blank after trimming admits nobody).
+an absent list, or one that renders as `[""]`, is all authenticated users, and a list that is blank
+after trimming admits nobody; the A2A door's backend is the exception, where no list is nobody,
+#2478).
 Detail: [spec-chatops-gateway.md](../designs/spec-chatops-gateway.md), "Sessions by default".
 
 ## 3. GitOps repository layout & propose/apply contract
