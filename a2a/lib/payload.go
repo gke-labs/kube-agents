@@ -64,6 +64,11 @@ type DelegateRequest struct {
 	Text      string `json:"text"`
 }
 
+// DelegateTextCap bounds DelegateRequest.Text in bytes: the adapter refuses a
+// longer request before it reaches the bus and the gateway ignores one that
+// arrives anyway, so the two sides cannot disagree on the number.
+const DelegateTextCap = 16 * 1024
+
 // The A2A object shapes below carry only the fields the library consults.
 // Payloads travel as raw bytes end to end (assertion 6); these views are for
 // validation and folding, never re-serialized onto the wire.

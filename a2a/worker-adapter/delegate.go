@@ -11,9 +11,6 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
-// delegateTextCap bounds the task text a session may hand on.
-const delegateTextCap = 16 * 1024
-
 // The listener's budget has to fit inside the MCP client's
 // delegateExchangeTimeout (15s), or the client reports a failure for a
 // request the adapter goes on to publish: up to delegateHandoffWait for
@@ -101,7 +98,7 @@ func validateDelegate(req lib.DelegateRequest) string {
 		return "addressee is required"
 	case strings.TrimSpace(req.Text) == "":
 		return "text is required"
-	case len(req.Text) > delegateTextCap:
+	case len(req.Text) > lib.DelegateTextCap:
 		return "text is too long for a delegation"
 	}
 	return ""

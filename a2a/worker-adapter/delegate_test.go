@@ -126,7 +126,7 @@ echo '{"type":"result","subtype":"success","result":"normal result"}'
 	cfg.DelegateSocket = sock
 	done := runAdapter(context.Background(), cfg)
 
-	reply := askDelegate(t, sock, lib.DelegateRequest{Addressee: "platform", Text: strings.Repeat("x", delegateTextCap+1)})
+	reply := askDelegate(t, sock, lib.DelegateRequest{Addressee: "platform", Text: strings.Repeat("x", lib.DelegateTextCap+1)})
 	if reply.OK || !strings.Contains(reply.Message, "too long") {
 		t.Fatalf("reply = %+v", reply)
 	}
