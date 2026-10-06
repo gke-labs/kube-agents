@@ -1695,20 +1695,32 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	return taskID, true
 }
 
+// noticeSteerNotSent tells the room a steer did not reach the running task.
+const noticeSteerNotSent = "⚠️ could not send that to the running task; it is still working on the original instruction"
+
 // steerTask forwards a message that arrived while the task runs as a
 // follow-up on the same taskId — injected, absorbed at the executor's next
 // turn boundary (decided 8/24). It reuses the task's correlationId; the
 // steer is attributed by its own envelope and authority block.
 func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, backend string, authority Authority) {
 	active := rec.ActiveTask
-	// The steer's author is on the turn's entry before the publish, and
-	// stays there if the publish fails: a lost ack does not prove the steer
-	// never arrived, and an author recorded for nothing costs at most a
-	// refused delegation. The caller writes the record back.
+	// The steer's author is written to the record before the steer is
+	// published, as startTaskWith writes a turn's requester before its
+	// submission: a crash between the two must not leave steer text in the
+	// session with its author off the record, where a delegation would not
+	// check them. A write that fails sends nothing (fail closed). The author
+	// stays recorded if the publish then fails: a lost ack does not prove
+	// the steer never arrived, and an author recorded for nothing costs at
+	// most a refused delegation.
 	author := TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)}
 	rec.recordSteerAuthor(active.TaskID, author)
 	if rec.AddressedToOwnSession() {
 		rec.addSessionAuthor(author)
+	}
+	if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
+		g.log.Error("steer author record write failed; steer not sent", "taskId", active.TaskID, "conversation", rec.Key, "err", err)
+		g.post(rec.Key, noticeSteerNotSent)
+		return
 	}
 	payload, err := messagePayload(msg.Text, active.TaskID, rec.ContextID)
 	if err != nil {
@@ -1727,7 +1739,7 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	}
 	if err := g.client.Publish(ctx, lib.TaskInSubject(rec.Addressee, active.TaskID), env); err != nil {
 		g.log.Error("steer publish failed", "taskId", active.TaskID, "err", err)
-		g.post(rec.Key, "⚠️ could not send that to the running task; it is still working on the original instruction")
+		g.post(rec.Key, noticeSteerNotSent)
 		return
 	}
 	// Say what we know and no more: the steer is on the stream, and what

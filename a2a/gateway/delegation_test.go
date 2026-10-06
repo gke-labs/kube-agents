@@ -1635,18 +1635,39 @@ func TestTheIncarnationSetRecordsSteersHashed(t *testing.T) {
 
 // TestAWakesIncarnationStartsFromTheParents: the wake's text carries the
 // child's result, and the child's ask was written by the parent's
-// incarnation, so the wake's incarnation starts with the parent's set.
+// incarnation, so the wake's incarnation starts with the parent's set: its
+// members, its age and its incomplete mark. What is planted in the parent's
+// set after the mint (a member, an older age, the mark) is nothing the wake's
+// own turn would add, so only the seed can carry it.
 func TestAWakesIncarnationStartsFromTheParents(t *testing.T) {
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-incarnation-wake"
-	exec, origin, _ := sessionTurn(t, r, spawn, conv, "how is the fleet?")
+	exec, origin, session := sessionTurn(t, r, spawn, conv, "how is the fleet?")
 	steerAs(r, conv, "s-1", "1002", "and the costs")
 	awaitSteerAuthors(t, r, conv, origin.TaskID, 1)
-	_, parentSet := incarnationAuthors(t, r, conv)
 	_ = exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "report"))
 	child := r.awaitTask(t, targetPlatform)
+	waitFor(t, "chain on the record", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		pref, _ := rec.TaskRefFor(origin.TaskID)
+		return len(pref.Children) == 1
+	})
 	completeTask(t, exec, "delegated to platform")
+	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
+
+	planted := TaskRequester{Backend: slackBackend, Subject: "hmac:planted"}
+	older := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	putRecord(t, r, conv, func(rec *SessionRecord) {
+		if rec.BusSession != session || rec.SessionAuthorsFor != session {
+			t.Fatalf("the parent's incarnation is not current: bus=%q set for %q", rec.BusSession, rec.SessionAuthorsFor)
+		}
+		rec.addSessionAuthor(planted)
+		rec.SessionAuthorsSince = older
+		rec.SessionAuthorsUnknown = true
+	})
+	_, parentSet := incarnationAuthors(t, r, conv)
+
 	completeTask(t, r.execFor(t, child, targetPlatform), "fleet is green")
 	waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
 	wakeSession := spawn.calls()[1].Session
@@ -1655,14 +1676,20 @@ func TestAWakesIncarnationStartsFromTheParents(t *testing.T) {
 		rec, _ := r.g.reg.Get(ctx, conv)
 		return rec.BusSession == wakeSession && rec.SessionAuthorsFor == wakeSession
 	})
-	_, got := incarnationAuthors(t, r, conv)
-	if len(got) != len(parentSet) || len(got) != 2 {
+	rec, got := incarnationAuthors(t, r, conv)
+	if len(got) != len(parentSet) || len(got) != 3 {
 		t.Fatalf("wake incarnation set = %+v, want the parent's %+v", got, parentSet)
 	}
 	for i := range got {
 		if got[i] != parentSet[i] {
 			t.Fatalf("wake incarnation set = %+v, want the parent's %+v", got, parentSet)
 		}
+	}
+	if !rec.SessionAuthorsSince.Equal(older) {
+		t.Fatalf("wake set age = %v, want the parent's older %v", rec.SessionAuthorsSince, older)
+	}
+	if !rec.SessionAuthorsUnknown {
+		t.Fatal("the parent's incomplete mark did not carry to the wake's incarnation")
 	}
 }
 
@@ -1699,5 +1726,58 @@ func TestAnIncompleteIncarnationSetRefuses(t *testing.T) {
 	waitFor(t, "notice", postedContaining(r, noticeDelegationSessionIncomplete))
 	if n := platformSubmissions(t, r); n != 0 {
 		t.Fatalf("minted on an incomplete set: %d", n)
+	}
+}
+
+// capSessionRecordSize sets the session-state bucket's largest message to
+// the conversation's record as stored now plus slack: enough for the record
+// rewritten with fresh timestamps, not enough for it to grow by an author
+// entry. Reads still work; a write that adds an author fails.
+func capSessionRecordSize(t *testing.T, r *rig, conv string, slack int) {
+	t.Helper()
+	size := len(rawSessionRecord(t, r.g.reg, conv))
+	nc, err := nats.Connect(r.url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	stream, err := js.Stream(ctx, "KV_"+lib.SessionStateBucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := stream.CachedInfo().Config
+	cfg.MaxMsgSize = int32(size + slack)
+	if _, err := js.UpdateStream(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestASteerIsNotSentUnlessItsAuthorIsOnRecord: the steer's author is
+// written to the session record before the steer is published, so a crash
+// between the two cannot leave steer text in the session with its author
+// off the record. A write that fails sends nothing and says so.
+func TestASteerIsNotSentUnlessItsAuthorIsOnRecord(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/t-steer-durable"
+	_, origin, session := sessionTurn(t, r, spawn, conv, "first")
+	waitFor(t, "the turn's record written", func() bool {
+		rec, _ := r.g.reg.Get(context.Background(), conv)
+		return rec != nil && rec.ActiveTask != nil && rec.ActiveTask.TaskID == origin.TaskID
+	})
+	capSessionRecordSize(t, r, conv, 40)
+	steerAs(r, conv, "s-1", "1002", "and the costs")
+	waitFor(t, "the could-not-send line", postedContaining(r, "could not send that to the running task"))
+	for _, e := range inSubjectEnvelopes(t, r.url, session) {
+		if e.TaskID == origin.TaskID && e.Kind == lib.KindMessage && e.EnvelopeID != origin.EnvelopeID {
+			t.Fatalf("the steer was published although its author could not be recorded: %q", envText(t, e))
+		}
+	}
+	if !loggedContaining(r, "steer author record write failed", origin.TaskID)() {
+		t.Fatalf("no log line for the failed write:\n%s", r.logs.String())
 	}
 }
