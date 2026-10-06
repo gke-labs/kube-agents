@@ -324,6 +324,11 @@ class AssessTest(unittest.TestCase):
         artifact = {"visited": 2, "mapped": 2, "outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}, "p2": {"outcome": "converged", "detail": "", "allowlist_unused": ["a"]}}}
         self.assertEqual(periodics.reconcile_detail(artifact), ["allowlist: 1 entry no plan needed, remove it: a"])
         self.assertEqual(periodics.reconcile_detail({"outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}}}), [], "no visited/mapped counts, no claim")
+        # A foreign artifact with non-string entries must not kill the tick:
+        # a list that is not all strings is no verdict at all.
+        for odd in ([["a"]], ["a", 1], [{"x": 1}]):
+            artifact = {"visited": 2, "mapped": 2, "outcomes": {"p1": {"outcome": "applied", "detail": "", "allowlist_unused": odd}, "p2": {"outcome": "applied", "detail": "", "allowlist_unused": ["a"]}}}
+            self.assertEqual(periodics.reconcile_detail(artifact), [], odd)
 
     def test_runs_carry_whether_the_build_was_a_dry_run(self):
         reading = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"dry_run": True, "summary": {"planned": 3}})

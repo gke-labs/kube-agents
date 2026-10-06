@@ -431,7 +431,7 @@ def reconcile_detail(artifact: dict | None) -> list[str]:
     # plan: a project missed, or one that failed before its plan, is the one
     # that may still need the entry.
     visited, mapped = artifact.get(REPORT_KEY_VISITED), artifact.get(REPORT_KEY_MAPPED)
-    with_verdict = sum(1 for e in entries.values() if isinstance(e.get(REPORT_KEY_ALLOWLIST_UNUSED), list))
+    with_verdict = sum(1 for e in entries.values() if _allowlist_verdict(e) is not None)
     unused = allowlist_unused(entries) if isinstance(visited, int) and isinstance(mapped, int) and visited == mapped and with_verdict == visited else []
     if unused:
         lines.append(f"allowlist: {len(unused)} {'entry' if len(unused) == 1 else 'entries'} no plan needed, remove {'it' if len(unused) == 1 else 'them'}: {', '.join(unused)}")
@@ -440,11 +440,21 @@ def reconcile_detail(artifact: dict | None) -> list[str]:
     return lines
 
 
+def _allowlist_verdict(entry: dict) -> set[str] | None:
+    """The project's unused-entry list as a set of addresses, or None when
+    the key is absent or not a list of strings: a foreign shape is no
+    verdict, never a crash of the tick."""
+    value = entry.get(REPORT_KEY_ALLOWLIST_UNUSED)
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return None
+    return set(value)
+
+
 def allowlist_unused(entries: dict) -> list[str]:
     """The allowlist addresses no visited project's plan needed: unused on
     every project that reported the key. One project still needing an entry
     keeps it off the list."""
-    reported = [set(e[REPORT_KEY_ALLOWLIST_UNUSED]) for e in entries.values() if isinstance(e.get(REPORT_KEY_ALLOWLIST_UNUSED), list)]
+    reported = [verdict for verdict in (_allowlist_verdict(e) for e in entries.values()) if verdict is not None]
     if not reported:
         return []
     return sorted(set.intersection(*reported))

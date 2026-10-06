@@ -615,6 +615,39 @@ class MainTest(unittest.TestCase):
         with self.assertRaises(SystemExit), mock.patch("sys.stderr", io.StringIO()):
             reconcile.main(["--all", "--no-lease"])
 
+    def test_workers_are_refused_outside_all(self):
+        # The named and drifted arms walk serially; a worker count there would
+        # be recorded in the report as if it applied.
+        for argv in (["--drifted", "--workers", "4"], ["--project", P7, "--workers", "2"]):
+            with self.assertRaises(SystemExit, msg=argv), mock.patch("sys.stderr", io.StringIO()), mock.patch.object(reconcile.signal, "signal"):
+                reconcile.main(argv)
+
+    def test_an_all_run_that_visited_no_project_is_a_failed_build(self):
+        # Every mapped project busy (or registered under other names) for the
+        # whole budget must not read as a green day on which nothing applied.
+        boskos = _Boskos(free=[])
+        with mock.patch.object(reconcile, "pause", lambda s: None), mock.patch.object(reconcile, "clock", _Clock()) as clock, mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(
+            reconcile, "tofu_runner", _Tofu({})
+        ), mock.patch.object(reconcile.signal, "signal"), mock.patch.object(reconcile, "pool_projects", lambda *a, **k: set(KNOWN)), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()) as stderr:
+            def pause(seconds):
+                clock.now += seconds
+            with mock.patch.object(reconcile, "pause", pause):
+                rc = reconcile.main(["--all", "--budget-seconds", "7200", "--boskos-server", BOSKOS, "--boskos-owner", OWNER])
+        self.assertEqual(rc, reconcile.EXIT_FAILED)
+        self.assertIn("visited no project", stderr.getvalue())
+
+    def test_the_budget_clock_starts_at_the_first_project_not_at_construction(self):
+        # Startup (the main fetch, the Boskos reset) is not charged to the
+        # budget: a budget of exactly one ceiling still starts one project.
+        clock = _Clock()
+        tofu = _tofu_taking(10, clock, {P7: UPDATE_ONLY})
+        boskos = _Boskos(free=[P7])
+        with mock.patch.object(reconcile, "clock", clock), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
+            run = reconcile.Run(budget_seconds=60, ceiling_seconds=60)
+            clock.now += 30  # startup work before the walk
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known={P7}, run=run)
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
+
     def test_a_budget_under_one_ceiling_or_a_ceiling_under_a_second_is_refused_by_the_parser(self):
         # A budget the first project cannot fit would drain every project as
         # not reached and exit green, applying nothing.
@@ -1090,16 +1123,16 @@ SEEDED_B = "google_container_cluster.seeded_b"
 EXCLUSION = {"maintenance_policy": [{"maintenance_exclusion": [{"exclusion_name": "hold-the-minor-lag", "start_time": "2026-10-01T00:00:00Z", "end_time": "2026-12-30T00:00:00Z"}]}], "min_master_version": "1.34.11", "name": "fleet-seeded-b"}
 
 
-def _restamped(before=EXCLUSION, **after_changes):
-    after = json.loads(json.dumps(before))
+def _restamped(**after_changes):
+    after = json.loads(json.dumps(EXCLUSION))
     after["maintenance_policy"][0]["maintenance_exclusion"][0]["start_time"] = "2026-10-05T00:00:00Z"
     after["maintenance_policy"][0]["maintenance_exclusion"][0]["end_time"] = "2027-01-03T00:00:00Z"
     after.update(after_changes)
     return after
 
 
-def _plan_with_diff(address, before, after, actions=("update",), after_unknown=None, extra=()):
-    changes = [{"address": address, "change": {"actions": list(actions), "before": before, "after": after, "after_unknown": after_unknown or {}}}]
+def _plan_with_diff(address, before, after, after_unknown=None, extra=()):
+    changes = [{"address": address, "change": {"actions": ["update"], "before": before, "after": after, "after_unknown": after_unknown or {}}}]
     changes += [{"address": a, "change": {"actions": list(acts)}} for acts, a in extra]
     return json.dumps({"resource_changes": changes})
 
@@ -1292,9 +1325,17 @@ class MainMovedTest(unittest.TestCase):
         tofu = _Tofu({P7: UPDATE_ONLY, P8: UPDATE_ONLY})
         stderr = io.StringIO()
         with mock.patch.object(reconcile, "git_output", _git_whose_fetch_fails), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(reconcile, "MAIN_CHECK_INTERVAL_SECONDS", 0), mock.patch("sys.stderr", stderr):
-            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=reconcile.Run(main_ref="origin/main"))
+            run = reconcile.Run(main_ref="origin/main")
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=run)
         self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_APPLIED, P8: reconcile.OUTCOME_APPLIED})
         self.assertIn("could not resolve host", stderr.getvalue())
+        # The report says the check could not run, since the guard was off.
+        self.assertIn("could not resolve host", run.main_check_error)
+        with tempfile.TemporaryDirectory() as tmp:
+            report = pathlib.Path(tmp) / "r.json"
+            reconcile.write_report(str(report), argparse.Namespace(project=None, drifted=False, dry_run=False), {}, 0, None, 0, run)
+            doc = json.loads(report.read_text())
+        self.assertEqual((doc["main_ref"], "could not resolve host" in doc["main_check_error"]), ("origin/main", True))
 
     def test_without_a_main_ref_git_is_never_fetched(self):
         git = self._git(["tree-aaa"])
@@ -1422,6 +1463,15 @@ class AllowlistTest(unittest.TestCase):
             entries = reconcile.load_allowlist(path)
             self.assertEqual((entries[0].address, entries[0].why, entries[0].standing), ("google_compute_disk.orphan", "revert", False))
             self.assertEqual(entries[1].address, 'module.fleet.kubernetes_network_policy_v1.default_deny["token"]')
+
+    def test_a_project_that_failed_before_its_plan_was_read_reports_no_allowlist_verdict(self):
+        allow = _allow([("google_compute_disk.gone", "old revert", False)])
+        boskos = _Boskos(free=[P7])
+        run = reconcile.Run(allow=allow)
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=_Tofu({}, fail={"init": "backend: bucket not found"}), known={P7}, run=run)
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_FAILED)
+        self.assertNotIn("allowlist_unused", run.extras[P7], "a plan that was not read says nothing about the allowlist")
 
     def test_a_missing_committed_allowlist_means_nothing_may_be_destroyed(self):
         # The default path only: there is no flag to point the run at another
@@ -1788,6 +1838,22 @@ class WorkersTest(unittest.TestCase):
         self.assertIn("error", outcomes[p9][1])
         self.assertEqual(sorted(boskos.released), [P7])
 
+    def test_a_named_run_that_loses_boskos_records_the_project_and_the_rest(self):
+        class _Boskos_failing_one(_Boskos):
+            def __call__(self, request, timeout=None):
+                if "/acquirebystate?" in request.full_url and "names=%s" % P8 in request.full_url:
+                    raise _http_error(500, request.full_url)
+                return super().__call__(request, timeout)
+
+        p9 = "kube-agents-evals-9"
+        boskos = _Boskos_failing_one(free=[P7, P8, p9])
+        outcomes = {}
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()):
+            with self.assertRaises(urllib.error.HTTPError):
+                reconcile.reconcile_named([P7, P8, p9], BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known=KNOWN | {p9}, outcomes=outcomes)
+        self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_APPLIED, P8: reconcile.OUTCOME_FAILED, p9: reconcile.OUTCOME_NOT_REACHED})
+        self.assertIn("500", outcomes[P8][1])
+
     def test_a_single_worker_termination_still_lists_the_pending_projects(self):
         def tofu(argv, **_):
             if argv[1] == "apply":
@@ -1812,29 +1878,6 @@ class WorkersTest(unittest.TestCase):
             with self.assertRaises(boskos_pool.Terminated):
                 reconcile.reconcile_named([P7, P8], BOSKOS, OWNER, runner=tofu, known=KNOWN, outcomes=outcomes)
         self.assertEqual(outcomes[P8][0], reconcile.OUTCOME_NOT_REACHED)
-
-    def test_a_project_that_failed_before_its_plan_was_read_reports_no_allowlist_verdict(self):
-        allow = _allow([("google_compute_disk.gone", "old revert", False)])
-        boskos = _Boskos(free=[P7])
-        run = reconcile.Run(allow=allow)
-        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
-            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=_Tofu({}, fail={"init": "backend: bucket not found"}), known={P7}, run=run)
-        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_FAILED)
-        self.assertNotIn("allowlist_unused", run.extras[P7], "a plan that was not read says nothing about the allowlist")
-
-    def test_the_report_says_when_the_main_moved_check_could_not_run(self):
-        boskos = _Boskos(free=[P7])
-        with mock.patch.object(reconcile, "git_output", _git_whose_fetch_fails), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(reconcile, "MAIN_CHECK_INTERVAL_SECONDS", 0), mock.patch("sys.stderr", io.StringIO()):
-            run = reconcile.Run(main_ref="origin/main")
-            reconcile.reconcile_pool(BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known={P7}, run=run)
-        self.assertIn("could not resolve host", run.main_check_error)
-        with tempfile.TemporaryDirectory() as tmp:
-            report = pathlib.Path(tmp) / "r.json"
-            reconcile.write_report(str(report), argparse.Namespace(project=None, drifted=False, dry_run=False), {}, 0, None, 0, run)
-            doc = json.loads(report.read_text())
-        self.assertEqual(doc["main_ref"], "origin/main")
-        self.assertIn("could not resolve host", doc["main_check_error"])
-
 
 if __name__ == "__main__":
     unittest.main()

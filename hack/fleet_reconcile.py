@@ -192,6 +192,7 @@ REASON_NOT_REACHED_TERMINATED = "not started: the run was terminated; the next r
 REASON_NOT_REACHED_RUN_ERROR = "not started: the run stopped on an error (%s); the next run takes it"
 REASON_INTERRUPTED_BEFORE = "terminated (%s) before tofu %s started; nothing was changed and nothing is locked"
 REASON_RUN_ERROR = "the run hit an error at this project: %s"
+REASON_VISITED_NONE = "visited no project of the %d asked for: every one was busy for the whole budget, or is not registered in Boskos under its mapped name"
 REASON_RESTAMP = "re-stamp of seeded-b's maintenance exclusion only"
 WARNING_MARKER = "applied.json not written: %s"
 
@@ -629,7 +630,10 @@ class Run:
     """
 
     def __init__(self, budget_seconds=None, ceiling_seconds=PROJECT_TIMEOUT_SECONDS, main_ref=None, allow=None, workers=DEFAULT_WORKERS, commit=None, fleet_tree=None, build=None, job=None, publish=False):
-        self.started = clock()
+        # The budget clock starts at the first project, not here: the main
+        # fetch and the Boskos reset before the walk are not charged to it,
+        # so a budget of exactly one ceiling still starts one project.
+        self.started = None
         self.budget = budget_seconds
         self.ceiling = ceiling_seconds
         self.main_ref = main_ref
@@ -660,6 +664,8 @@ class Run:
 
     def room(self):
         """Seconds left in the budget; None when unbounded."""
+        if self.started is None:
+            self.started = clock()
         return None if self.budget is None else self.budget - (clock() - self.started)
 
     def wait_allowance(self, wanted):
@@ -849,6 +855,12 @@ def reconcile_named(projects, server, owner, lease=True, runner=tofu_runner, dry
             # The project the signal landed in has its line; the rest are
             # on the report as not reached, so the summary adds up.
             not_reached(projects[index + 1 :], REASON_NOT_REACHED_TERMINATED)
+            raise
+        except Exception as exc:  # noqa: BLE001 -- a Boskos or network fault: on the record, then raised
+            if project not in outcomes:
+                outcomes[project] = (OUTCOME_FAILED, REASON_RUN_ERROR % boskos_pool.describe(exc))
+                _line(project, outcomes[project])
+            not_reached(projects[index + 1 :], REASON_NOT_REACHED_RUN_ERROR % boskos_pool.describe(exc))
             raise
     return outcomes
 
@@ -1053,6 +1065,8 @@ def main(argv=None):
         parser.error("--no-lease needs --project")
     if args.workers < 1:
         parser.error("--workers must be at least 1")
+    if args.workers > 1 and not args.all:
+        parser.error("--workers applies to --all; --project and --drifted walk their list one at a time")
     if args.stop_when_moved is not None:
         remote, _, branch = args.stop_when_moved.partition("/")
         if not remote or not branch:
@@ -1206,6 +1220,15 @@ def _run(args, outcomes, error, run):
         failing = report(outcomes)
         if failing:
             error.append("%d project(s) not reconciled: %s" % (len(failing), ", ".join(failing)))
+            print("ERROR: %s" % error[-1], file=sys.stderr)
+            return EXIT_FAILED
+        visited = sum(1 for o, _ in outcomes.values() if o in VISITED_OUTCOMES)
+        if args.all and outcomes and visited == 0:
+            # Every project busy or never registered under its mapped name
+            # for the whole budget: a green build that applied nothing would
+            # hide a pool held all day or a Boskos registration that no longer
+            # matches the mapping.
+            error.append(REASON_VISITED_NONE % len(outcomes))
             print("ERROR: %s" % error[-1], file=sys.stderr)
             return EXIT_FAILED
         return EXIT_OK
