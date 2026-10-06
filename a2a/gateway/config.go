@@ -174,6 +174,20 @@ type Config struct {
 	// Empty makes the card advertise the address it was fetched from.
 	A2ADoorPublicURL string
 
+	// A2ADoorGoogleClientID arms the door's developer identity class
+	// (A2A_DOOR_GOOGLE_CLIENT_ID): a bearer that is not A2ADoorToken is
+	// checked with Google as an access token issued for this OAuth client,
+	// the install's one pre-registered client. Empty leaves the class off.
+	// It needs the door: set without A2A_DOOR_LISTEN it is refused.
+	A2ADoorGoogleClientID string
+	// A2ADoorAllowedUsers is the developer class's allowlist
+	// (A2A_DOOR_ALLOWED_USERS, comma-separated emails): a verified email
+	// off it is dropped at verification, as an unlisted Chat sender is.
+	// Empty admits nobody. There is no allow-all, unlike Chat's legacy
+	// posture: a door any Google account can sign in to is not a default
+	// anyone should get by leaving a list blank.
+	A2ADoorAllowedUsers []string
+
 	// DisplayMode is the existing Chat integration's default-vs-debug split
 	// (GoogleChatSpec.Mode), honoured by this relay rather than reinvented:
 	// under "default" the rolling line carries the state but never the
@@ -446,6 +460,12 @@ func FromEnv() (*Config, error) {
 	cfg.A2ADoorToken = strings.TrimSpace(os.Getenv("A2A_DOOR_TOKEN"))
 	cfg.A2ADoorPrincipalMapPath = envOr("A2A_DOOR_PRINCIPAL_MAP", defaultA2ADoorPrincipalMapPath)
 	cfg.A2ADoorPublicURL = strings.TrimSpace(os.Getenv("A2A_DOOR_PUBLIC_URL"))
+	cfg.A2ADoorGoogleClientID = strings.TrimSpace(os.Getenv("A2A_DOOR_GOOGLE_CLIENT_ID"))
+	for _, u := range strings.Split(os.Getenv("A2A_DOOR_ALLOWED_USERS"), ",") {
+		if u = strings.TrimSpace(u); u != "" {
+			cfg.A2ADoorAllowedUsers = append(cfg.A2ADoorAllowedUsers, u)
+		}
+	}
 	cfg.DisplayMode = envOr("A2A_CHAT_DISPLAY_MODE", displayModeDebug)
 	if cfg.DisplayMode != displayModeDefault && cfg.DisplayMode != displayModeDebug {
 		return nil, fmt.Errorf("A2A_CHAT_DISPLAY_MODE %q: want %q or %q", cfg.DisplayMode, displayModeDefault, displayModeDebug)
@@ -510,6 +530,9 @@ func FromEnv() (*Config, error) {
 	// Config.InjectToken.
 	if cfg.InjectListen != "" && cfg.InjectToken == "" {
 		return nil, fmt.Errorf("A2A_INJECT_TOKEN is required when A2A_INJECT_LISTEN is set: the inject door authenticates every request with a bearer token, because neither its loopback bind nor the NetworkPolicy in front of it governs the port-forward path its caller uses")
+	}
+	if cfg.A2ADoorGoogleClientID != "" && cfg.A2ADoorListen == "" {
+		return nil, fmt.Errorf("A2A_DOOR_GOOGLE_CLIENT_ID is set but A2A_DOOR_LISTEN is not: the Google sign-in class is part of the A2A door and has nothing to arm without it")
 	}
 	if cfg.A2ADoorListen != "" && cfg.A2ADoorToken == "" {
 		return nil, fmt.Errorf("A2A_DOOR_TOKEN is required when A2A_DOOR_LISTEN is set: the A2A door authenticates every RPC request with a bearer token (the agent card alone is open), for the reason the inject door does; see Config.A2ADoorToken")

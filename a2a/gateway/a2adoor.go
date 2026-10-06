@@ -268,8 +268,12 @@ type a2aOutcome struct {
 
 // A2ADoor is the adapter. One instance serves one listener.
 type A2ADoor struct {
-	listen           string
-	token            string
+	listen string
+	token  string
+	// google verifies the developer class's Google access tokens; nil when
+	// the class is not configured, and then only the static token is
+	// accepted.
+	google           *googleTokenVerifier
 	publicURL        string
 	publicURLSet     bool
 	agentName        string
@@ -326,7 +330,11 @@ type A2ADoorOptions struct {
 	// TaskDeadline is the gateway's task deadline (A2A_TASK_DEADLINE_SECONDS);
 	// zero takes the config default. See A2ADoor.taskDeadline.
 	TaskDeadline time.Duration
-	Logger       *slog.Logger
+	// GoogleClientID arms the developer identity class: a bearer that is
+	// not the static token is checked as a Google access token issued for
+	// this client id. Empty leaves the class off.
+	GoogleClientID string
+	Logger         *slog.Logger
 }
 
 // NewA2ADoor builds the door. The token is required here as well as in
@@ -370,6 +378,7 @@ func NewA2ADoor(listen, token string, o A2ADoorOptions) (*A2ADoor, error) {
 		defaultAddressee: o.DefaultAddressee,
 		taskDeadline:     deadline,
 		log:              log,
+		google:           googleVerifierFor(o.GoogleClientID),
 		conversations:    map[string]*a2aConversation{},
 		tasks:            map[string]*a2aTask{},
 		submissions:      map[string]*a2aOutcome{},
@@ -485,6 +494,14 @@ func (d *A2ADoor) rpcURLFor(r *http.Request) string {
 // rendered from DIRECTORY and the caller's entitlements, and the card
 // becomes per caller.
 func (d *A2ADoor) card(rpcURL string) a2aAgentCard {
+	// The schemes are alternatives: the static bearer, and Google sign-in
+	// when the developer class is armed.
+	schemes := map[string]a2aScheme{"bearer": {Type: "http", Scheme: "bearer"}}
+	security := []map[string][]string{{"bearer": {}}}
+	if d.google != nil {
+		schemes[a2aGoogleSchemeName] = a2aScheme{Type: "openIdConnect", OpenIDConnectURL: a2aGoogleOpenIDConfigURL}
+		security = append(security, map[string][]string{a2aGoogleSchemeName: {}})
+	}
 	var skills []a2aSkill
 	if d.defaultAddressee != "" {
 		skills = append(skills, a2aSkill{
@@ -515,8 +532,8 @@ func (d *A2ADoor) card(rpcURL string) a2aAgentCard {
 		DefaultInputModes:  []string{a2aTextMediaType},
 		DefaultOutputModes: []string{a2aTextMediaType},
 		Skills:             skills,
-		SecuritySchemes:    map[string]a2aScheme{"bearer": {Type: "http", Scheme: "bearer"}},
-		Security:           []map[string][]string{{"bearer": {}}},
+		SecuritySchemes:    schemes,
+		Security:           security,
 	}
 }
 
@@ -525,7 +542,8 @@ func (d *A2ADoor) card(rpcURL string) a2aAgentCard {
 // on a 200, which is the binding's convention; only the transport-level
 // refusals (no token, wrong method, oversize body) are HTTP statuses.
 func (d *A2ADoor) handleRPC(w http.ResponseWriter, r *http.Request) {
-	if !d.authorized(w, r) {
+	verified, ok := d.identify(w, r)
+	if !ok {
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -558,11 +576,11 @@ func (d *A2ADoor) handleRPC(w http.ResponseWriter, r *http.Request) {
 	var resp rpcResponse
 	switch req.Method {
 	case a2aMethodSend:
-		resp = d.send(r, handler, req)
+		resp = d.send(r, verified, handler, req)
 	case a2aMethodGet:
-		resp = d.get(r, req)
+		resp = d.get(r, verified, req)
 	case a2aMethodCancel:
-		resp = d.cancel(r, handler, req)
+		resp = d.cancel(r, verified, handler, req)
 	case a2aMethodStream:
 		// The card says streaming is off; a client that tries anyway is
 		// told so in the protocol's own terms rather than with a method
@@ -613,12 +631,12 @@ func a2aConversationKey(caller, contextID string) string {
 
 // send is message/send: one turn, answered with the Task it started or the
 // Message the gateway replied with.
-func (d *A2ADoor) send(r *http.Request, handler func(InboundMessage), req rpcRequest) rpcResponse {
+func (d *A2ADoor) send(r *http.Request, verified string, handler func(InboundMessage), req rpcRequest) rpcResponse {
 	var params a2aSendParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		return rpcFail(req.ID, rpcInvalidParams, "params: "+err.Error(), nil)
 	}
-	caller, rerr := callerOf(r, params.Message.Metadata)
+	caller, rerr := d.callerFor(r, verified, params.Message.Metadata)
 	if rerr != nil {
 		return rpcFail(req.ID, rerr.Code, rerr.Message, nil)
 	}
@@ -724,7 +742,7 @@ func (d *A2ADoor) send(r *http.Request, handler func(InboundMessage), req rpcReq
 		AuthorID:     caller,
 		MessageID:    messageID,
 		Text:         text,
-		Backend:      a2aBackend,
+		Backend:      a2aBackendForCaller(caller),
 		TaskID:       msg.TaskID,
 	})
 	taskID, reply, rerr := d.awaitTurn(turnCtx, key, prior, deadline)
@@ -780,12 +798,12 @@ func (d *A2ADoor) answerOutcome(ctx context.Context, id json.RawMessage, o *a2aO
 // get is tasks/get. Scoped to the caller: a task another caller started is
 // not found, not forbidden, so the door does not confirm ids it will not
 // serve.
-func (d *A2ADoor) get(r *http.Request, req rpcRequest) rpcResponse {
+func (d *A2ADoor) get(r *http.Request, verified string, req rpcRequest) rpcResponse {
 	var params a2aIDParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		return rpcFail(req.ID, rpcInvalidParams, "params: "+err.Error(), nil)
 	}
-	caller, rerr := callerOf(r, params.Metadata)
+	caller, rerr := d.callerFor(r, verified, params.Metadata)
 	if rerr != nil {
 		return rpcFail(req.ID, rerr.Code, rerr.Message, nil)
 	}
@@ -806,12 +824,12 @@ func (d *A2ADoor) get(r *http.Request, req rpcRequest) rpcResponse {
 // once the gateway has put the cancel on the bus. The Task returned is the
 // door's current snapshot - the executor decides when the task is canceled,
 // and the client polls tasks/get for that terminal, as it would for any.
-func (d *A2ADoor) cancel(r *http.Request, handler func(InboundMessage), req rpcRequest) rpcResponse {
+func (d *A2ADoor) cancel(r *http.Request, verified string, handler func(InboundMessage), req rpcRequest) rpcResponse {
 	var params a2aIDParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		return rpcFail(req.ID, rpcInvalidParams, "params: "+err.Error(), nil)
 	}
-	caller, rerr := callerOf(r, params.Metadata)
+	caller, rerr := d.callerFor(r, verified, params.Metadata)
 	if rerr != nil {
 		return rpcFail(req.ID, rerr.Code, rerr.Message, nil)
 	}
@@ -849,7 +867,7 @@ func (d *A2ADoor) cancel(r *http.Request, handler func(InboundMessage), req rpcR
 		AuthorID:     caller,
 		MessageID:    messageID,
 		Text:         "stop",
-		Backend:      a2aBackend,
+		Backend:      a2aBackendForCaller(caller),
 		Intent:       IntentCancel,
 		TaskID:       params.ID,
 	})

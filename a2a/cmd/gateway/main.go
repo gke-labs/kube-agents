@@ -169,6 +169,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 			PublicURL:        cfg.A2ADoorPublicURL,
 			DefaultAddressee: cfg.DefaultAddressee,
 			TaskDeadline:     cfg.TaskDeadline,
+			GoogleClientID:   cfg.A2ADoorGoogleClientID,
 			Logger:           log,
 		})
 		if err != nil {

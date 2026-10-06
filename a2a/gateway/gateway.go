@@ -174,6 +174,10 @@ type Gateway struct {
 	// resolution (Config.GchatAllowedUsers, lowercased at build).
 	gchatAllowed  map[string]bool
 	gchatAllowAll bool
+	// a2aGoogleAllowed gates the A2A door's Google-verified callers
+	// (Config.A2ADoorAllowedUsers, lowercased at build). Empty admits
+	// nobody; there is no allow-all.
+	a2aGoogleAllowed map[string]bool
 	// droppedNotices records which unverifiable senders have been told so —
 	// the drop is visible once per sender, not once per message. Per
 	// sender, NOT per conversation: a channel mention mints a fresh
@@ -304,6 +308,15 @@ func New(o Options) (*Gateway, error) {
 			gchatAllowed[strings.ToLower(u)] = true
 		}
 	}
+	a2aGoogleAllowed := map[string]bool{}
+	for _, u := range o.Config.A2ADoorAllowedUsers {
+		if u = strings.TrimSpace(u); u != "" {
+			a2aGoogleAllowed[strings.ToLower(u)] = true
+		}
+	}
+	if o.Config.A2ADoorGoogleClientID != "" && len(a2aGoogleAllowed) == 0 {
+		log.Warn("the A2A door's Google sign-in is armed but A2A_DOOR_ALLOWED_USERS is empty; every Google-verified caller will be dropped at verification")
+	}
 	if backend == gchatBackend && len(gchatAllowed) == 0 && !o.Config.GchatAllowAllUsers {
 		log.Warn("gchat allowlist is empty and allow-all is off; every inbound message will be dropped at verification")
 	}
@@ -332,27 +345,28 @@ func New(o Options) (*Gateway, error) {
 		return nil, err
 	}
 	g := &Gateway{
-		turnBudget:     turnTimeout,
-		cfg:            o.Config,
-		client:         o.Client,
-		reg:            NewRegistry(o.Client),
-		adapter:        o.Adapter,
-		pm:             pm,
-		ps:             NewPseudonymizer(o.Config.AttributionSalt),
-		log:            log,
-		runCtx:         context.Background(),
-		sessionLocks:   map[string]*sessionLockEntry{},
-		taskSessions:   map[string]string{},
-		relays:         map[string]*relayState{},
-		backend:        backend,
-		injectPM:       injectPM,
-		injectAudience: injectAudience,
-		a2aPM:          a2aPM,
-		a2aAudience:    a2aAudience,
-		gchatAllowed:   gchatAllowed,
-		gchatAllowAll:  o.Config.GchatAllowAllUsers,
-		droppedNotices: map[string]bool{},
-		relayDurable:   o.RelayDurable,
+		turnBudget:       turnTimeout,
+		cfg:              o.Config,
+		client:           o.Client,
+		reg:              NewRegistry(o.Client),
+		adapter:          o.Adapter,
+		pm:               pm,
+		ps:               NewPseudonymizer(o.Config.AttributionSalt),
+		log:              log,
+		runCtx:           context.Background(),
+		sessionLocks:     map[string]*sessionLockEntry{},
+		taskSessions:     map[string]string{},
+		relays:           map[string]*relayState{},
+		backend:          backend,
+		injectPM:         injectPM,
+		injectAudience:   injectAudience,
+		a2aPM:            a2aPM,
+		a2aAudience:      a2aAudience,
+		gchatAllowed:     gchatAllowed,
+		gchatAllowAll:    o.Config.GchatAllowAllUsers,
+		a2aGoogleAllowed: a2aGoogleAllowed,
+		droppedNotices:   map[string]bool{},
+		relayDurable:     o.RelayDurable,
 	}
 	g.inbox = newKeyedQueue(func(_ string, batch []InboundMessage) {
 		for _, msg := range batch {
@@ -530,7 +544,7 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	//
 	// A chat turn's caller is a person, for whom a late answer beats none:
 	// the lock first, then a whole turn, as before the door existed.
-	if backend == injectBackend || backend == a2aBackend {
+	if backend == injectBackend || backend == a2aBackend || backend == a2aGoogleBackend {
 		ctx, cancel := context.WithTimeout(g.runCtx, g.turnBudget)
 		defer cancel()
 		g.runTurn(ctx, msg, backend, principal)
@@ -1792,8 +1806,12 @@ func messagePayload(text, taskID, contextID string) ([]byte, error) {
 // be read under the same map the requester's principal was read under, and
 // one backend's map is never a fallback for another's.
 func (g *Gateway) rosterResolver(backend string) func(string) string {
-	if backend == consoleBackend {
-		return func(id string) string { return g.resolvePrincipal(consoleBackend, id) }
+	// Neither has a map: the console's grant and the Google class's verified
+	// email are the mechanism. The Google class must not fall through to
+	// principalMapFor, whose default is the chat map, or a door caller's id
+	// would resolve as a chat identity.
+	if backend == consoleBackend || backend == a2aGoogleBackend {
+		return func(id string) string { return g.resolvePrincipal(backend, id) }
 	}
 	return g.principalMapFor(backend).Resolve
 }
