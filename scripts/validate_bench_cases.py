@@ -512,6 +512,7 @@ CLUSTER_PLACEHOLDER_ANY = "any"
 # every check (its phrase lists included) is searched or matched as written.
 EXPANDING_PATTERN_KEYS = ("forbidden_patterns", "any_of_patterns")
 REPORT_CHECK_TYPE = "report_contains"
+COMPOUND_CHILDREN_KEY = "checks"
 
 
 def _catalog_slots() -> set[str]:
@@ -534,19 +535,21 @@ def _cluster_placeholders(node: Any, where: str, problems: list[str], slots: set
     lists: the verifier expands it from the runner's record there and nowhere
     else, so in a phrase list, another check's pattern list or any other
     string list it is literal text that never matches (an inert forbid) or
-    fails every run (a requirement). Every string on the node is read, in a
-    list or on its own (`tool_called`'s `agent` is a scalar run as a regex),
-    not a fixed set of keys, so a new field is covered when it lands; a
-    scalar that carries no placeholder (`type`, `scope`, a role) is left
-    alone."""
+    fails every run (a requirement). Every string under the node is read: on
+    its own (`tool_called`'s `agent` is a scalar run as a regex), in a list,
+    or inside a mapping however deep (`bootstrap_findings`'s
+    `expected_findings` is a list of `{check, object}` mappings), not a fixed
+    set of keys, so a new field is covered when it lands; a scalar that
+    carries no placeholder (`type`, `scope`, a role) is left alone. The
+    `checks` of a compound node are walked as nodes of their own, under their
+    own `type`."""
     if not isinstance(node, dict):
         return
     for key, raw in node.items():
-        values = raw if isinstance(raw, list) else [raw]
+        if key == COMPOUND_CHILDREN_KEY:
+            continue
         expands = node.get("type") == REPORT_CHECK_TYPE and key in EXPANDING_PATTERN_KEYS
-        for pattern in values:
-            if not isinstance(pattern, str):
-                continue
+        for pattern in _strings_under(raw):
             if not expands:
                 if CLUSTER_PLACEHOLDER_LOOSE.search(pattern):
                     problems.append(
@@ -569,8 +572,20 @@ def _cluster_placeholders(node: Any, where: str, problems: list[str], slots: set
                             f"declare ({', '.join(sorted(slots))}); the runner records no cluster for it, so "
                             "the check would error on every run"
                         )
-    for child in node.get("checks") or []:
+    for child in node.get(COMPOUND_CHILDREN_KEY) or []:
         _cluster_placeholders(child, where, problems, slots, parked)
+
+
+def _strings_under(raw: Any) -> list[str]:
+    """Every string in a value: the scalar itself, a list's items, a mapping's
+    values, nested to any depth, in document order."""
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, list):
+        return [s for item in raw for s in _strings_under(item)]
+    if isinstance(raw, dict):
+        return [s for item in raw.values() for s in _strings_under(item)]
+    return []
 
 
 def _catalog_roles() -> dict[str, Any]:

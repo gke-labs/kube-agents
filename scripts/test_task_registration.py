@@ -778,6 +778,20 @@ class TestTheRulesReject(unittest.TestCase):
         # a scalar with no placeholder is not read as one
         self.assertEqual(self._validate(verification_spec=self._entry(check={"type": "tool_called", "tool_names": ["x"], "scope": "workers", "agent": "cluster-.*"})), [])
 
+    def test_a_cluster_placeholder_inside_a_mapping_is_rejected(self):
+        # bootstrap_findings compares each expected `{check, object}` pair
+        # literally, so a placeholder in a mapping's value is literal text
+        # too; the guard reads strings inside a mapping, at any depth, rather
+        # than stopping at a list's first non-string item.
+        problem = self._only(
+            "which only report_contains expands",
+            verification_spec=self._entry(check={"type": "bootstrap_findings", "expected_findings": [{"check": "x", "object": "{cluster:a}"}]}),
+        )
+        self.assertIn("'expected_findings'", problem)
+        self.assertIn("bootstrap_findings", problem)
+        # a mapping with no placeholder is not read as one
+        self.assertEqual(self._validate(verification_spec=self._entry(check={"type": "bootstrap_findings", "expected_findings": [{"check": "x", "object": "y"}]})), [])
+
     def test_a_malformed_cluster_placeholder_is_rejected(self):
         self._only(
             "malformed cluster placeholder",
