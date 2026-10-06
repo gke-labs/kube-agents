@@ -211,11 +211,12 @@ VERSION_PAIR_SEPARATOR = " / "
 # workspace, which is why the default is not /tmp. `--kubeconfig-dir` overrides it.
 KUBECTL = "kubectl"
 KUBECTL_TIMEOUT_SECONDS = 60
-# Error text from the first `kubectl get` that says the API server itself could not be
-# reached, in which case the second read against the same kubeconfig would only spend a
-# second timeout to fail the same way.
+# Error text from the first `kubectl get` that says no answer came back from the API server
+# (a connection failure, or run_cmd's own deadline, which a slow server also trips), in which
+# case the second read against the same kubeconfig would only spend a second timeout to
+# fail the same way.
 UNREACHABLE_MARKERS = ("timed out after", "Unable to connect to the server", "i/o timeout", "connection refused", "no such host")
-WEBHOOK_READ_SKIPPED = "skipped: the PDB read could not reach the API server"
+WEBHOOK_READ_SKIPPED = "skipped: the PDB read got no answer from the API server"
 # The member's note names the one cause its reads failed for, so an operator goes to the
 # step that failed: the directory, the credentials, the first read, the second read, or the
 # second read skipped because the first found the API server unreachable. A skipped read is
@@ -224,7 +225,7 @@ NOTE_DIRECTORY_FAILED = "kubeconfig directory could not be created; PDBs and web
 NOTE_CREDENTIALS_FAILED = "credentials for the cluster could not be fetched; PDBs and webhooks not graded"
 NOTE_PDB_READ_FAILED = "PDB read failed; PDBs not graded"
 NOTE_WEBHOOK_READ_FAILED = "webhook read failed; webhooks not graded"
-NOTE_WEBHOOK_READ_SKIPPED = "webhook read skipped: the PDB read could not reach the API server; webhooks not graded"
+NOTE_WEBHOOK_READ_SKIPPED = "webhook read skipped: the PDB read got no answer from the API server; webhooks not graded"
 # Two reads, so a failure listing the webhook side (a large EndpointSlice list timing out, a
 # custom role without webhook-configuration reads) costs the webhook rule only, never the PDBs.
 KUBECTL_RESOURCES = "pdb,deploy,statefulset"
@@ -259,6 +260,7 @@ READINESS_COLUMNS = (
 )
 READINESS_NONE_CELL = "none"
 READINESS_READ_FAILED_CELL = "read failed"
+READINESS_READ_SKIPPED_CELL = "read skipped"
 READINESS_NOT_EVALUATED_CELL = "not evaluated"
 READINESS_NO_OPENING_CELL = f"none within {readiness.DAYS_PER_WEEK} days"
 
@@ -676,6 +678,7 @@ def assess_readiness(cluster: dict, member: dict, read: dict, at: datetime) -> d
         "kubeconfig": read["kubeconfig"],
         "read_error": read_error,
         "webhook_read_error": read["webhook_error"],
+        "webhook_read_skipped": bool(read.get("webhook_skipped")),
         "autopilot": autopilot,
         "pdbs": pdbs,
         "webhooks": webhooks,
@@ -796,7 +799,7 @@ def _webhook_cell(r: dict) -> str:
     since they are an outage now even though they do not grade the member."""
     webhooks = r["webhooks"]
     if webhooks is None:
-        return READINESS_READ_FAILED_CELL
+        return READINESS_READ_SKIPPED_CELL if r.get("webhook_read_skipped") else READINESS_READ_FAILED_CELL
     findings = webhooks["blocking"] + webhooks["outage"]
     if not findings:
         return READINESS_NONE_CELL

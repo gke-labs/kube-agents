@@ -1135,9 +1135,11 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual([e["cluster"] for e in data["errors"]], ["seeded-a"])
         self.assertIn("- read failed for p1 (us-central1-a) cluster seeded-a: kubectl get pdb,deploy,statefulset -A -o json failed (1)", text)
         self.assertEqual([l for l in text.splitlines() if l.startswith("- read failed") and "skipped" in l], [])
-        self.assertIn("PDB read failed; PDBs not graded; webhook read skipped: the PDB read could not reach the API server; webhooks not graded", by_name["seeded-a"]["note"])
+        self.assertIn("PDB read failed; PDBs not graded; webhook read skipped: the PDB read got no answer from the API server; webhooks not graded", by_name["seeded-a"]["note"])
         self.assertNotIn("webhook read failed", by_name["seeded-a"]["note"])
-        self.assertIn("| read failed | read failed |", text)
+        self.assertTrue(by_name["seeded-a"]["webhook_read_skipped"])
+        self.assertIn("| read failed | read skipped |", text)
+        self.assertNotIn("| read failed | read failed |", text)
         # The version row is unaffected, and the rollout record does not treat the project as unread.
         self.assertEqual({m["cluster"]: m["status"] for m in data["members"]}["seeded-a"], report.STATUS_CURRENT)
         self.assertEqual(data["rollout"]["missing_members"], [])

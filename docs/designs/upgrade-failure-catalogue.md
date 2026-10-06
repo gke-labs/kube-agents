@@ -434,12 +434,15 @@ case `kube-system`.
 - After: `failed calling webhook` events, Pending pods, drains that never finish.
 - Mitigate before: a `namespaceSelector` that excludes `kube-system`, a timeout of a few seconds, `failurePolicy: Ignore` for webhooks that are not security controls, at least two backend replicas behind a budget, and a valid backend certificate.
 - Mitigate after: set `failurePolicy: Ignore` or remove the webhook configuration to unwedge the cluster, then restore it once the backend is up.
-- Read today: nothing before an upgrade; the upgrade skill's stuck-upgrade steps check whether
-  webhooks are rejecting pod creation on new nodes, after the fact.
+- Read today: the readiness mode of `fleet-upgrade-verification` grades a fail-closed webhook
+  whose backend the API server cannot reach now, `blocked` when its rules reach the upgrade's
+  path and an outage otherwise; the backend that would fail once drained, and the selectors,
+  are unread ([the readiness checks](upgrade-readiness-checks.md)). After the fact, the upgrade
+  skill's stuck-upgrade steps check whether webhooks are rejecting pod creation on new nodes.
 - GKE recommender: `K8S_ADMISSION_WEBHOOK_UNAVAILABLE` flags a webhook whose Service has no endpoints and `K8S_ADMISSION_WEBHOOK_UNSAFE` one that intercepts `kube-system` or cluster-scoped system resources ([webhook insights](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/optimize-webhooks)); the certificate subtypes (`DEPRECATION_K8S_1_23_CERTIFICATE`, `DEPRECATION_K8S_SHA_1_CERTIFICATE`) covered backend certificates the 1.23 and 1.29 removals rejected; `K8S_CRD_WITH_INVALID_CA_BUNDLE` flags CRDs with an invalid CA bundle.
 - Why it is on the list: Jetstack's Open Policy Agent webhook outage in the incidents. The seeded
-  fleet plants the shape as the `readiness-failclosed-webhook` role, a fail-closed webhook whose
-  Service does not exist.
+  fleet plants the shape as the `readiness-failclosed-webhook` role on seeded-b, a fail-closed
+  webhook gating ConfigMaps whose Service does not exist.
 
 ### 8. A default changes in the new minor
 

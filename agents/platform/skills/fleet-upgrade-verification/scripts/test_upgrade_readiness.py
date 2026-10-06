@@ -542,6 +542,9 @@ class WebhookScopeTest(unittest.TestCase):
         # A gate on `leases/*` with a dead backend refuses every kubelet heartbeat: a blocker, not an outage.
         self.assertEqual(self._path([rule(["leases/*"], operations=("CREATE", "UPDATE"), groups=("coordination.k8s.io",))]), ["CREATE leases", "UPDATE leases"])
         self.assertEqual(self._path([rule(["*/eviction"])]), ["CREATE pods/eviction"])
+        # An empty subresource after the slash is the resource itself, as the API server splits it.
+        self.assertEqual(self._path([rule(["pods/"])]), ["CREATE pods"])
+        self.assertEqual(self._path([rule(["*/"])]), ["CREATE pods", "CREATE nodes"])
 
     def test_operation_group_and_scope_must_all_match(self):
         self.assertEqual(self._path([rule(["pods"], operations=("UPDATE",))]), [])

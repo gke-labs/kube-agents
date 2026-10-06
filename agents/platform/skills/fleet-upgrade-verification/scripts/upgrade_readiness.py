@@ -170,7 +170,6 @@ SCOPE_NAMESPACED = "Namespaced"
 SCOPE_CLUSTER = "Cluster"
 SCOPE_ANY = "*"
 WILDCARD = "*"
-ALL_RESOURCES_AND_SUBRESOURCES = "*/*"
 UPGRADE_PATH_TARGETS = (
     ("", "pods", "CREATE", SCOPE_NAMESPACED),
     ("", "pods/binding", "CREATE", SCOPE_NAMESPACED),
@@ -706,20 +705,17 @@ def backend_problem(service_ref: dict, services: list[dict], slices: list[dict])
 
 
 def _resource_matches(spec: str, target: str) -> bool:
-    """RuleWithOperations `resources` semantics, as the API server's matcher reads them:
-    `*` is every resource but no subresource, `*/*` every resource and subresource, and
-    `pods/*` is pods together with every subresource of pods -- a `*` subresource also
-    matches a request that has none, so `leases/*` reaches the lease writes a kubelet
-    heartbeat makes."""
-    if spec == ALL_RESOURCES_AND_SUBRESOURCES:
-        return True
+    """RuleWithOperations `resources` semantics, written as the API server's matcher is
+    (`splitResource`, then two comparisons): the spec's resource is `*` or the target's, and
+    its subresource is `*` or the target's, where no `/` means an empty subresource. So `*`
+    is every resource but no subresource, `*/*` every resource and subresource, `pods/*` pods
+    together with every subresource of pods (a `*` subresource also matches a request that
+    has none, so `leases/*` reaches the lease writes a kubelet heartbeat makes), and `pods/`
+    is `pods`, as the API admits and reads it. Two comparisons leave no spelling to diverge
+    on."""
     resource, _, sub = target.partition("/")
-    spec_resource, slash, spec_sub = spec.partition("/")
-    if spec_resource not in (resource, WILDCARD):
-        return False
-    if not sub:
-        return not slash or spec_sub == WILDCARD
-    return bool(slash) and spec_sub in (sub, WILDCARD)
+    spec_resource, _, spec_sub = spec.partition("/")
+    return spec_resource in (resource, WILDCARD) and spec_sub in (sub, WILDCARD)
 
 
 def upgrade_path_matches(hook: dict) -> list[str]:
