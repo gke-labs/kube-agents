@@ -230,6 +230,10 @@ func (g *Gateway) applyArtifact(ctx context.Context, rec *SessionRecord, rs *rel
 // session's serialization, and retires the task's index — the stream is
 // the durable record; the index only exists to route live events. source is
 // whose word the terminal is, read off the subject it arrived on.
+// completedNonTextResult stands in for a completed task's result that has no
+// text, in the room and in a wake.
+const completedNonTextResult = "(completed with a non-text result; see the stream)"
+
 func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *relayState, taskID string, s lib.StatusUpdate, source TerminalSource) {
 	result := joinTextParts(rs.result)
 	// The console never posts the deliverable (see the StateCompleted arm), so
@@ -252,7 +256,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	switch s.Status.State {
 	case lib.StateCompleted:
 		if result == "" {
-			result = "(completed with a non-text result; see the stream)"
+			result = completedNonTextResult
 		}
 		// The console renders answers straight off TASKS, so posting the
 		// deliverable here too would show it twice and put a burst of

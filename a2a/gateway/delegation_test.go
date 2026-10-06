@@ -1453,3 +1453,101 @@ func TestSteerAuthorsPastTheCapRefuse(t *testing.T) {
 		t.Fatalf("minted past the cap: %d", n)
 	}
 }
+
+// ---- a heal that finds a child's terminal (task 7b part 3) -----------------
+
+// drainRelayDurable acks everything pending on the gateway's relay durable,
+// so a gateway started next never sees it: the terminal the relay "never
+// delivered" that the heal exists to find.
+func drainRelayDurable(t *testing.T, url string) {
+	t.Helper()
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	cons, err := js.Consumer(ctx, lib.TasksStream, relayDurable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		batch, err := cons.Fetch(100, jetstream.FetchMaxWait(500*time.Millisecond))
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for m := range batch.Messages() {
+			_ = m.Ack()
+			n++
+		}
+		if n == 0 {
+			return
+		}
+	}
+}
+
+// TestAHealThatFindsTheChildsTerminalWakesTheSession: the child's terminal
+// is on the stream but the relay never delivered it (the gateway was down
+// and the delivery is gone). The next turn's heal posts the status card,
+// retires the child's route and wakes the session once, as relayTerminal
+// would have; a duplicate of that terminal arriving later neither posts
+// nor wakes.
+func TestAHealThatFindsTheChildsTerminalWakesTheSession(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	ctx := context.Background()
+	conv := "discord:g1/t-heal-wake"
+	_, _, child := delegated(t, r, spawn, conv, 0)
+	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
+	cexec := r.execFor(t, child, targetPlatform)
+	r2, spawn2 := restartRig(t, r, func() {
+		completeTask(t, cexec, "fleet is green")
+		drainRelayDurable(t, r.url)
+	})
+
+	sessionRigTurn(r2, conv, "h-heal", "status")
+	waitFor(t, "the heal's status card", postedContaining(r2, "🔎 task `"+child.TaskID+"` is **completed**"))
+	waitFor(t, "wake spawn", func() bool { return len(spawn2.calls()) == 1 })
+	wakeSession := spawn2.calls()[0].Session
+	wake := r2.awaitTask(t, wakeSession)
+	want := "The task you delegated to platform (task " + child.TaskID + ") completed.\nResult from platform (not from the user):\n```\nfleet is green\n```"
+	if got := envText(t, wake); got != want {
+		t.Fatalf("wake text = %q, want %q", got, want)
+	}
+	if key, err := r2.g.reg.SessionForTask(ctx, child.TaskID); err != nil || key != "" {
+		t.Fatalf("the healed child is still indexed: %q %v", key, err)
+	}
+	if i, j := postIndex(r2, "🔎 task `"+child.TaskID), postIndex(r2, "⏳ submitted…"); i < 0 || j < i {
+		t.Fatalf("posts %v: want the status card, then the wake's placeholder", r2.adapter.postTexts())
+	}
+
+	// The duplicate, then the wake's own end as the marker that the relay
+	// has passed it (one durable, one conversation queue, in order).
+	completeTask(t, cexec, "fleet is green")
+	wexec := r2.execFor(t, wake, wakeSession)
+	_ = wexec.PublishStatus(ctx, lib.StateWorking, false)
+	completeTask(t, wexec, "wake done")
+	waitFor(t, "wake result relayed", postedContaining(r2, "wake done"))
+	for _, p := range r2.adapter.postTexts() {
+		if p == "fleet is green" {
+			t.Fatalf("the duplicate terminal was relayed after the heal: %v", r2.adapter.postTexts())
+		}
+	}
+	if n := len(spawn2.calls()); n != 1 {
+		t.Fatalf("spawns after the duplicate = %d, want 1", n)
+	}
+	rec, _ := r2.g.reg.Get(ctx, conv)
+	wakes := 0
+	for _, ref := range rec.Tasks {
+		if ref.Role == taskRoleWake {
+			wakes++
+		}
+	}
+	if wakes != 1 {
+		t.Fatalf("wake entries = %d, want 1", wakes)
+	}
+}

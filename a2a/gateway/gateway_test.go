@@ -1153,7 +1153,10 @@ func startRigWithSpawnerCap(t *testing.T, defaultAddressee string, maxSessions i
 // The first is stopped (context canceled, Run returned, client closed)
 // BEFORE the second starts, because the relay durable is shared and two live
 // gateways would split its deliveries. The executor client is kept.
-func restartRig(t *testing.T, r *rig) (*rig, *fakeSpawner) {
+//
+// whileDown, when given, runs between the two: the bus traffic a gateway that
+// was down never saw.
+func restartRig(t *testing.T, r *rig, whileDown ...func()) (*rig, *fakeSpawner) {
 	t.Helper()
 	r.stop()
 	select {
@@ -1162,6 +1165,9 @@ func restartRig(t *testing.T, r *rig) (*rig, *fakeSpawner) {
 		t.Fatal("the first gateway did not stop")
 	}
 	r.client.Close()
+	for _, f := range whileDown {
+		f()
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)

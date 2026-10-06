@@ -868,6 +868,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	task, terminalSubject, err := g.client.TasksGetAttributed(ctx, addressee, active.TaskID)
 	healed := false
 	var healedSource TerminalSource
+	var healedTask *lib.Task // the terminal the heal found, shape (a) only
 	switch {
 	case err == nil && task.Final:
 		g.log.Info("healing stale active task", "taskId", active.TaskID, "state", task.State)
@@ -891,7 +892,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 			source = TerminalFromSupervisor
 		}
 		g.observeTaskTerminal(rec.Key, active.TaskID, task.State, source, finalMessageText(task))
-		healed, healedSource = true, source
+		healed, healedSource, healedTask = true, source, task
 	case isTaskNotFound(err) && !active.SubmittedAt.IsZero() &&
 		time.Since(active.SubmittedAt) > g.cfg.FirstEventGrace:
 		g.log.Info("healing an active task with no first event inside the grace",
@@ -921,12 +922,15 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// A delegated child's route is retired here, as relayTerminal
 		// retires it: its index is the liveness the one-live-child rule
 		// reads (liveChild), so a healed child left indexed would refuse
-		// every later delegation in the conversation until the reap. The
-		// cost is the late-render path below: a healed child's late events
-		// find no route and are dropped, and so is a late terminal's wake,
-		// which a session the heal has moved past should not get anyway.
-		// A human turn keeps its index, so its late result still posts.
-		if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.Role == taskRoleChild {
+		// every later delegation in the conversation until the reap. It is
+		// also what keeps the wake below to one: a duplicate of the
+		// terminal the heal found finds no route and is dropped, so it
+		// neither posts nor wakes. A never-started child's late events are
+		// dropped the same way. A human turn keeps its index, so its late
+		// result still posts.
+		ref, known := rec.TaskRefFor(active.TaskID)
+		child := known && ref.Role == taskRoleChild
+		if child {
 			g.retireTaskRoute(ctx, active.TaskID)
 		}
 		rec.ActiveTask = nil
@@ -939,6 +943,16 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 			rec.LastActivity = now
 			rec.LastTaskActivity = now
 		}
+		// A child's terminal found on the stream wakes the session as the
+		// relay would have (spec §4), with the same guards and text, after
+		// the card, the end's announcement and the route's retirement. A
+		// child that never started does not: the room has the never-started
+		// notice, and there is no outcome to hand the session. The turn
+		// that ran the heal then routes against the wake as its active task.
+		if child && healedTask != nil {
+			result, reason := healedChildOutcome(healedTask)
+			g.wakeSession(ctx, rec, ref, healedTask.State, result, reason)
+		}
 		// Write the release now, not at the end of the turn: a turn that
 		// returns early — a cap refusal, on exactly the Delegate that
 		// follows a wedge — would otherwise announce a release it never
@@ -947,6 +961,19 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 			g.log.Error("healed record write failed", "conversation", rec.Key, "err", err)
 		}
 	}
+}
+
+// healedChildOutcome is a healed child's result and reason as relayTerminal
+// hands them to wakeSession: the result artifact's text (the stand-in line
+// for a completed task with none) and the terminal message.
+func healedChildOutcome(task *lib.Task) (result, reason string) {
+	if art := task.Artifact(lib.ArtifactResult); art != nil {
+		result = joinTextParts(art.Parts)
+	}
+	if result == "" && task.State == lib.StateCompleted {
+		result = completedNonTextResult
+	}
+	return result, finalMessageText(task)
 }
 
 // probeConversation is the ConversationProbe the gateway offers a ProbeSink:
