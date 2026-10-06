@@ -16720,6 +16720,38 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(self.stdout_json()["prs_closed"], [])
         self.assertEqual(self.harness.forge_calls("proposal-close"), [])
 
+    def test_a_partial_run_closes_the_pull_request_for_a_declared_workload_it_never_carried(self):
+        # PR #9 was opened for worker alone; reporter, deployed later, is the
+        # declared one and is on no pull request; this run skipped the cluster.
+        # The namespace is what the declaration forbids the fix for, and the
+        # pull request's own ids name the namespace, so it closes.
+        path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
+        worker = make_finding(fid="worker", check="default-sa-automount", obj="Deployment/worker", title="worker", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        previous_body = published_body(make_doc(findings=[worker], audit=AUDIT), generated_at=NOW)
+        self.declaring_replies(previous_body)
+        worker_id = derived_id(check="default-sa-automount", obj="Deployment/worker")
+        self.harness.replies["proposal-list"] = proposals_view(
+            [pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([worker_id]))]
+        )
+        self.touch(path)
+        pathlib.Path(audit_report.declarations_path_for(AUDIT)).parent.mkdir(parents=True, exist_ok=True)
+        audit_report.write_declarations(AUDIT, "acme/fleet", [{"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/reporter", "repo": "acme/fleet", "path": "knowledge/reporter.md", "excerpt": "needs the token"}])
+        doc = make_doc(findings=[], audit=AUDIT, clusters=[{"name": "stage-eu", "location": "europe-west1", "project": "acme-stage"}], skipped=[{"cluster": "prod-us-east", "reason": "control plane unreachable"}])
+        manifest = _full_manifest(names=("stage-eu",), audit=AUDIT)
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        self.assertTrue(self.stdout_json()["partial"])
+        self.assertEqual(self.stdout_json()["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
+        comment = " ".join(self.harness.bodies_for("proposal-*"))
+        self.assertIn("declared to need the `default` ServiceAccount's token", comment)
+        # A pull request in another namespace is untouched by that declaration.
+        self.harness.replies["proposal-list"] = proposals_view(
+            [pr(8, "platform-agent/fix-billing", body=audit_report.delta_block([derived_id(check="default-sa-automount", obj="Deployment/batch", namespace="billing")]))]
+        )
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["prs_closed"], [])
+
     def test_a_worker_cannot_mark_a_sibling_shielded_from_the_document(self):
         # Same pull request, no declaration anywhere: a document that carries
         # the ids under a key of the worker's choosing closes nothing, because
