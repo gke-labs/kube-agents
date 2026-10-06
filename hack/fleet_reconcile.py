@@ -191,8 +191,11 @@ REASON_UNMAPPED = "not a mapped pool project (gitops_repo_for_project in hack/ci
 # Boskos's 404 does not say which; a mapped project lands here between its
 # mapping row and its Boskos registration, and reads busy until registered.
 REASON_BUSY = "not free in Boskos, or not registered there yet"
-REASON_INTERRUPTED = "terminated (%s) while tofu ran; an apply cut past its grace leaves the state locked: tofu force-unlock"
-REASON_CEILING = "did not finish within %ds; tofu was interrupted, and killed if it did not stop within %ds, which leaves the state locked: tofu force-unlock"
+# The runbook's rule (docs/ci-pool-projects.md 6.2): the next run tells
+# whether the state needs force-unlock; the bot keys on that word.
+REASON_INTERRUPTED = "terminated (%s) while tofu ran; an apply cut past its grace leaves the state locked, and the next run tells whether it needs force-unlock"
+REASON_CEILING = "did not finish within %ds; tofu was interrupted, and killed if it did not stop within %ds, which leaves the state locked; the next run tells whether it needs force-unlock"
+REASON_RUNNER = "could not run tofu (%s: %s)"
 REASON_NOT_REACHED_BUDGET = "not started: %ds left in the run's budget, under the %ds per-project ceiling; the next run takes it"
 REASON_NOT_REACHED_BUDGET_MARK = "left in the run's budget"
 REASON_NOT_REACHED_MOVED = "not started: bench/tf/fleet on %s is now %s and this run applies %s; the next run takes it"
@@ -615,7 +618,7 @@ def reconcile_project(project, runner=tofu_runner, dry_run=False, timeout=PROJEC
         except subprocess.TimeoutExpired:
             return OUTCOME_FAILED, REASON_CEILING % (timeout, INTERRUPT_GRACE_SECONDS)
         except (OSError, subprocess.SubprocessError) as exc:
-            return OUTCOME_FAILED, "could not run tofu (%s: %s)" % (type(exc).__name__, exc)
+            return OUTCOME_FAILED, REASON_RUNNER % (type(exc).__name__, exc)
 
 def load_fixture_state(source, runner=subprocess.run):
     """The published scan, from a gs:// object or a local file."""

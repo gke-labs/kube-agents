@@ -1003,11 +1003,16 @@ unclosed counts its close and its delete, and its label when it carries
 `audit:remediation`). `periodics_read` names the jobs a
 reading arrived for this tick, whether or not they are noted; the poster clears
 a told job on a reading that shows it clean, or when `periodics_superseded`
-marks it recovered. That map is `{job: {build, recovery}}` for the jobs whose
-latest failed build a later build of the job that supersedes them (the daily,
-for the on-merge reconcile) has dealt with: `recovery` true when the daily
-passed having reached every project the failed build named, false when it
-failed itself, so its own note is the current story and nothing clears. The
+marks it recovered. That map is `{job: {build, recovery[, by]}}` for the jobs
+whose latest failed build a later build of the job that supersedes them (the
+daily, for the on-merge reconcile) has dealt with: `recovery` true when the
+daily passed having reached every project the failed build named (a project a
+whole pass no longer lists has left the pool and counts), false when it
+failed itself, so its own note is the current story and nothing clears; `by`
+is the daily run a recovery was decided on (`build`, `finished_at`,
+`summary`), what the clear cites. A failed build whose report is absent or
+cut short is never recovered by a pass, and a silence ends when a later daily
+passes without reaching the projects. The
 entry is carried from the previous tick while `build` is still the job's
 latest, unchanged on a tick blind to either job, so neither re-opens the
 failure, and a silence becomes a recovery once a later pass reaches the

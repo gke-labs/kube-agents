@@ -103,9 +103,10 @@ RECONCILE_NEXT_STEP = {
 # A `failed` on tofu's own lock error owes a hand step before any retry, and
 # that message carries the lock ID the command needs. The writer keeps the
 # last 600 characters of tofu's output, which can cut the header, so the
-# Lock Info block and the trailer are markers too. The script's own
-# ceiling text ("force-unlock" in its words) is not yet a lock: the next run
-# tells, as the interrupted step says.
+# Lock Info block and the trailer are markers too. The script's own ceiling
+# and interrupted reasons say the state is locked and that the next run
+# tells whether it needs force-unlock; that word is their marker, and the
+# interrupted step is theirs.
 RECONCILE_LOCK_MARKERS = ("Error acquiring the state lock", "Lock Info", "acquires a state lock")
 RECONCILE_CEILING_MARKER = "force-unlock"
 RECONCILE_NEXT_STEP_LOCKED = "tofu force-unlock against that project's state, then the next run retries it"
@@ -135,6 +136,9 @@ SUPERSEDED_RECOVERY = "recovery"
 SUPERSEDED_SILENCE = "silence"
 SUPERSEDED_KEY_BUILD = "build"
 SUPERSEDED_KEY_RECOVERY = "recovery"
+# The superseding run a recovery was decided on: what the clear cites, read
+# or not on the tick that sends it.
+SUPERSEDED_KEY_BY = "by"
 # gsutil's absent-object wording, the set scripts/release/poll_rc_eval_verdict.py
 # settled on for the Prow archive; the same wording here. Never a bare 404,
 # because gsutil echoes the failing URL and a 19-digit build id can contain
@@ -733,13 +737,37 @@ def _named_failures(artifact) -> list[str]:
     return sorted(p for p, e in outcomes.items() if isinstance(e, dict) and e.get(REPORT_KEY_OUTCOME) in RECONCILE_NAMED_OUTCOMES)
 
 
+def _outcomes(artifact) -> dict | None:
+    """The report's per-project outcomes, or None for a report without them
+    (absent, cut short, or not a reconcile's)."""
+    outcomes = artifact.get(REPORT_KEY_OUTCOMES) if isinstance(artifact, dict) else None
+    return outcomes if isinstance(outcomes, dict) else None
+
+
+def _whole_pass(artifact: dict) -> bool:
+    """An `--all` run that visited every mapped project: its report lists the pool."""
+    visited, mapped = artifact.get(REPORT_KEY_VISITED), artifact.get(REPORT_KEY_MAPPED)
+    return artifact.get(REPORT_KEY_MODE) == REPORT_MODE_ALL and isinstance(visited, int) and isinstance(mapped, int) and visited == mapped
+
+
 def _reached(artifact, projects: list[str]) -> bool:
     """True when the report holds every named project with an outcome that
-    means it was held and planned (not busy, not not_reached)."""
-    outcomes = artifact.get(REPORT_KEY_OUTCOMES) if isinstance(artifact, dict) else None
-    if not isinstance(outcomes, dict):
+    means it was held and planned (not busy, not not_reached). A project a
+    whole pass does not list at all has left the pool (a stray registration
+    removed, a mapping row retired), and counts as dealt with."""
+    outcomes = _outcomes(artifact)
+    if outcomes is None:
         return False
-    return all(isinstance(outcomes.get(p), dict) and outcomes[p].get(REPORT_KEY_OUTCOME) not in (RECONCILE_OUTCOME_NOT_REACHED, RECONCILE_OUTCOME_BUSY) for p in projects)
+    whole = _whole_pass(artifact)
+    for project in projects:
+        entry = outcomes.get(project)
+        if entry is None:
+            if not whole:
+                return False
+            continue
+        if not isinstance(entry, dict) or entry.get(REPORT_KEY_OUTCOME) in (RECONCILE_OUTCOME_NOT_REACHED, RECONCILE_OUTCOME_BUSY):
+            return False
+    return True
 
 
 def _supersession(job: str, readings: dict[str, dict]) -> str | None:
@@ -759,18 +787,27 @@ def _supersession(job: str, readings: dict[str, dict]) -> str | None:
         return None
     if not theirs.get(KEY_PASSED):
         return SUPERSEDED_SILENCE
+    if _outcomes(mine.get(KEY_ARTIFACT)) is None:
+        # A failed build whose report is absent or cut short names no project
+        # because nothing can be read, not because nothing failed: a later
+        # pass cannot be shown to have reached what it does not name.
+        return None
     return SUPERSEDED_RECOVERY if _reached(theirs.get(KEY_ARTIFACT), _named_failures(mine.get(KEY_ARTIFACT))) else None
 
 
 def superseded_jobs(readings: dict[str, dict], carried: dict | None = None) -> dict[str, dict]:
-    """`{job: {build, recovery}}` for the watched jobs whose latest failed
-    build a later build of their superseding job has dealt with. Carried in
-    health.json and handed back as `carried` next tick, so the decision
-    sticks for as long as the failed build is the job's latest: a tick blind
-    to either job, or a later failing daily, does not re-open a retired
-    failure as news. A silence becomes a recovery once a later pass
-    reaches the projects; a new failed build is decided afresh."""
+    """`{job: {build, recovery[, by]}}` for the watched jobs whose latest
+    failed build a later build of their superseding job has dealt with; `by`
+    is the run a recovery was decided on (build, finished_at, summary), what
+    the clear cites. Carried in health.json and handed back as `carried`
+    next tick, so the decision sticks for as long as the failed build is the
+    job's latest: a tick blind to either job, or a later failing daily, does
+    not re-open a retired failure as news. A silence becomes a recovery once
+    a later pass reaches the projects, and ends when a later pass does not
+    reach them (the failure is back in the notes, not as news); a new failed
+    build is decided afresh."""
     carried = carried if isinstance(carried, dict) else {}
+    latest = runs(readings)
     out = {}
     for job in sorted(set(readings) | set(carried)):
         if job not in SUPERSEDED_BY:
@@ -789,8 +826,20 @@ def superseded_jobs(readings: dict[str, dict], carried: dict | None = None) -> d
         ground = _supersession(job, readings)
         if ground is None and before is None:
             continue
-        recovery = bool((before or {}).get(SUPERSEDED_KEY_RECOVERY)) or ground == SUPERSEDED_RECOVERY
-        out[job] = {SUPERSEDED_KEY_BUILD: build, SUPERSEDED_KEY_RECOVERY: recovery}
+        other = SUPERSEDED_BY[job]
+        theirs = readings.get(other)
+        if ground is None and before is not None and not before.get(SUPERSEDED_KEY_RECOVERY) and isinstance(theirs, dict) and theirs.get(KEY_PASSED):
+            # The daily that silenced this failure has passed without
+            # reaching its projects: its own note clears, and the failure
+            # it hid is still open.
+            continue
+        entry = {SUPERSEDED_KEY_BUILD: build, SUPERSEDED_KEY_RECOVERY: bool((before or {}).get(SUPERSEDED_KEY_RECOVERY)) or ground == SUPERSEDED_RECOVERY}
+        if ground == SUPERSEDED_RECOVERY:
+            run = latest.get(other) or {}
+            entry[SUPERSEDED_KEY_BY] = {key: run.get(key) for key in (KEY_BUILD, KEY_FINISHED_AT, KEY_SUMMARY)}
+        elif isinstance((before or {}).get(SUPERSEDED_KEY_BY), dict):
+            entry[SUPERSEDED_KEY_BY] = before[SUPERSEDED_KEY_BY]
+        out[job] = entry
     return out
 
 

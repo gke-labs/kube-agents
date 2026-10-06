@@ -74,6 +74,8 @@
 #                             scripts refuse it in a Prow job.
 #   FLEET_MINT_RETRY_SECONDS  wait between the gate's mint attempts (default
 #                             5; tests set 0)
+#   FLEET_PROBE_REQUEST_TIMEOUT  kubectl --request-timeout on each presence
+#                             probe (default 30s)
 #
 # Output: exports BENCH_FLEET_KUBECONFIG_DIR when sourced; prints it on stdout
 # when executed. Everything else this script says goes to stderr.
@@ -175,31 +177,32 @@ for role, spec in sorted(roles.items()):
 # app=nope` exits ZERO with no output, which is the same trap that made the
 # pathless `absent` safeguards read as passes on the wrong cluster.
 _fleet_probe_present() {
-  local kubeconfig="$1" namespace="$2" probe="$3" kind rest
+  local kubeconfig="$1" namespace="$2" probe="$3" kind rest errors probe_rc
   case "$probe" in
     *\?*)
       kind="${probe%%\?*}"
       rest="${probe#*\?}"
       # 0 present, 1 absent (an empty list), 2 the read itself failed: a
       # 403, a control plane mid-upgrade or a token that could not be minted
-      # says nothing about whether the fixture is there. The error text is
-      # kept in a variable, not a file: this file is sourced by the eval job
-      # under its own EXIT trap, so nothing here may install one.
-      # Presence is decided on stdout alone: a successful empty list can
-      # carry discovery noise or a deprecation warning on stderr, which must
-      # not read as an object. The error text is fetched by a second call
-      # only when the first failed.
+      # says nothing about whether the fixture is there. Presence is decided
+      # on stdout alone: a successful empty list can carry discovery noise or
+      # a deprecation warning on stderr, which must not read as an object.
+      # One call: stdout into the variable, stderr into a file read only when
+      # the read failed and removed on every path, with no trap (this file
+      # is sourced by the eval job under its own EXIT trap).
+      errors="$(mktemp)" || { _FLEET_PROBE_ERR="mktemp failed"; return 2; }
+      probe_rc=0
       if [ "$namespace" != "-" ] && [ -n "$namespace" ]; then
-        if ! _FLEET_PROBE_OUT="$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -n "$namespace" -l "$rest" -o name --request-timeout="$_FLEET_PROBE_REQUEST_TIMEOUT" 2>/dev/null)"; then
-          _FLEET_PROBE_ERR="$({ KUBECONFIG="$kubeconfig" kubectl get "$kind" -n "$namespace" -l "$rest" -o name --request-timeout="$_FLEET_PROBE_REQUEST_TIMEOUT" >/dev/null; } 2>&1)"
-          return 2
-        fi
+        _FLEET_PROBE_OUT="$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -n "$namespace" -l "$rest" -o name --request-timeout="$_FLEET_PROBE_REQUEST_TIMEOUT" 2>"$errors")" || probe_rc=$?
       else
-        if ! _FLEET_PROBE_OUT="$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -l "$rest" -o name --request-timeout="$_FLEET_PROBE_REQUEST_TIMEOUT" 2>/dev/null)"; then
-          _FLEET_PROBE_ERR="$({ KUBECONFIG="$kubeconfig" kubectl get "$kind" -l "$rest" -o name --request-timeout="$_FLEET_PROBE_REQUEST_TIMEOUT" >/dev/null; } 2>&1)"
-          return 2
-        fi
+        _FLEET_PROBE_OUT="$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -l "$rest" -o name --request-timeout="$_FLEET_PROBE_REQUEST_TIMEOUT" 2>"$errors")" || probe_rc=$?
       fi
+      if [ "$probe_rc" -ne 0 ]; then
+        _FLEET_PROBE_ERR="$(cat "$errors")"
+        rm -f "$errors"
+        return 2
+      fi
+      rm -f "$errors"
       [ -n "$_FLEET_PROBE_OUT" ]
       ;;
     */*)

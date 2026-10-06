@@ -274,7 +274,8 @@ class PlanInspectionTest(unittest.TestCase):
         outcome, detail = reconcile.reconcile_project(P7, runner=tofu, timeout=5)
         self.assertEqual(outcome, reconcile.OUTCOME_FAILED)
         self.assertIn("did not finish within 5s", detail)
-        self.assertIn("tofu force-unlock", detail, "a kill at the ceiling leaves the lock; the line says so")
+        self.assertIn("force-unlock", detail, "a kill at the ceiling leaves the lock; the line says so, and that the next run tells")
+        self.assertNotIn(": tofu force-unlock", detail, "no instruction the runbook says not to follow yet")
 
     def test_a_show_that_is_not_json_is_a_failure(self):
         tofu = _Tofu({P7: "<html>"})
@@ -628,7 +629,7 @@ class MainTest(unittest.TestCase):
         # Every mapped project busy (or registered under other names) for the
         # whole budget must not read as a green day on which nothing applied.
         boskos = _Boskos(free=[])
-        with mock.patch.object(reconcile, "pause", lambda s: None), mock.patch.object(reconcile, "clock", _Clock()) as clock, mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(
+        with mock.patch.object(reconcile, "clock", _Clock()) as clock, mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(
             reconcile, "tofu_runner", _Tofu({})
         ), mock.patch.object(reconcile.signal, "signal"), mock.patch.object(reconcile, "pool_projects", lambda *a, **k: set(KNOWN)), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()) as stderr:
             def pause(seconds):
@@ -1558,6 +1559,23 @@ class AllowlistTest(unittest.TestCase):
             self.assertEqual((entries[0].address, entries[0].why, entries[0].standing), ("google_compute_disk.orphan", "revert", False))
             self.assertEqual(entries[1].address, 'module.fleet.kubernetes_network_policy_v1.default_deny["token"]')
 
+    def test_a_malformed_committed_allowlist_stops_the_run_before_the_first_lease(self):
+        # The guard _start documents: the file is read whole first, so a bad
+        # one is one error and zero leases, not 35 held projects each
+        # failing at reconcile_project's own reload.
+        boskos = _Boskos(free=[P7, P8])
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = pathlib.Path(tmp) / "reconcile-allow.json"
+            bad.write_text("not json")
+            with mock.patch.object(reconcile, "ALLOWLIST_FILE", bad), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(
+                reconcile, "tofu_runner", _Tofu({P7: UPDATE_ONLY, P8: UPDATE_ONLY})
+            ), mock.patch.object(reconcile.signal, "signal"), mock.patch.object(reconcile, "pool_projects", lambda *a, **k: set(KNOWN)), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", stderr):
+                rc = reconcile.main(["--all", "--boskos-server", BOSKOS, "--boskos-owner", OWNER])
+        self.assertEqual(rc, reconcile.EXIT_FAILED)
+        self.assertEqual(boskos.acquired, [])
+        self.assertIn(str(bad), stderr.getvalue())
+
     def test_a_project_that_failed_before_its_plan_was_read_reports_no_allowlist_verdict(self):
         allow = _allow([("google_compute_disk.gone", "old revert", False)])
         boskos = _Boskos(free=[P7])
@@ -1689,7 +1707,9 @@ class ReportFieldsTest(unittest.TestCase):
 
 
 class WorkersTest(unittest.TestCase):
-    """N projects at once, each under its own lease; a termination still releases every one."""
+    """The pool pass: N projects at once, each under its own lease, the drain
+    at the budget, the stray check, and a termination that still releases
+    every project and interrupts every child once."""
 
     def test_two_workers_hold_two_projects_at_once(self):
         live, peak, lock = [0], [0], threading.Lock()
@@ -1739,15 +1759,17 @@ class WorkersTest(unittest.TestCase):
         thread = threading.Thread(target=lambda: (reconcile._begin_termination(), done.set()))
         reconcile._CHILDREN_LOCK.acquire()
         try:
-            thread.start()
-            self.assertFalse(done.wait(0.3))
-            self.assertFalse(reconcile._TERMINATING.is_set(), "raised only under the lock a registration holds across its check")
-        finally:
-            reconcile._CHILDREN_LOCK.release()
-        try:
+            try:
+                thread.start()
+                self.assertFalse(done.wait(0.3))
+                self.assertFalse(reconcile._TERMINATING.is_set(), "raised only under the lock a registration holds across its check")
+            finally:
+                reconcile._CHILDREN_LOCK.release()
             self.assertTrue(done.wait(5))
             self.assertTrue(reconcile._TERMINATING.is_set())
         finally:
+            # Unconditional: a flag left set would fail every later test
+            # that reaches _tofu outside _run_workers.
             thread.join(5)
             reconcile._TERMINATING.clear()
 

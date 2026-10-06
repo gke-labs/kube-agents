@@ -1071,9 +1071,11 @@ def render_periodic_clear(health: dict, prev: dict | None) -> str:
         run = runs.get(job) or {}
         if (superseded.get(job) or {}).get(periodics.SUPERSEDED_KEY_RECOVERY) and not run.get("passed"):
             # Cleared by the superseding job's later run: that run is the
-            # evidence, not the failed build being cleared.
+            # evidence, not the failed build being cleared. The run the
+            # decision was made on, carried with it: this tick may not have
+            # read the daily, or may have read a later build.
             other = periodics.SUPERSEDED_BY.get(job, "")
-            theirs = runs.get(other) or {}
+            theirs = (superseded.get(job) or {}).get(periodics.SUPERSEDED_KEY_BY) or runs.get(other) or {}
             when = clock(parse_iso(theirs.get("finished_at"))) if theirs.get("finished_at") else "?"
             did = f": {theirs['summary']}" if theirs.get("summary") else " finished clean"
             lines.append(f"✅ *{words['place']}: {words['presence']}.* `{job}`'s build {run.get('build')} failure is cleared by `{other}`'s {when} run (build {theirs.get('build')}){did}.")

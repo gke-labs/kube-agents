@@ -2039,6 +2039,18 @@ class WatchedPeriodics(RunHarness):
         text = post_health.render_periodic_clear(doc, prev)
         self.assertIn("`post-kube-agents-fleet-reconcile`'s build 7 failure is cleared by `ci-kube-agents-fleet-reconcile-daily`'s 4:40 AM ET run (build 9): 35 visited: 35 converged.", text)
         self.assertNotIn("1 refused", text)
+        # The clear cites the run the decision was made on, carried with it:
+        # this tick may not have read the daily (a retried send), or may have
+        # read a later build that failed.
+        doc["periodics_superseded"] = {"post-kube-agents-fleet-reconcile": {"build": "7", "recovery": True, "by": {"build": "9", "finished_at": "2026-09-14T08:40:00+00:00", "summary": "35 visited: 35 converged"}}}
+        doc["periodics_read"] = ["post-kube-agents-fleet-reconcile"]
+        doc["periodics_runs"] = {"post-kube-agents-fleet-reconcile": {"build": "7", "finished_at": "2026-09-13T13:10:00+00:00", "passed": False, "summary": "1 refused"}}
+        self.assertEqual(post_health.periodic_clears(doc, prev), ["post-kube-agents-fleet-reconcile"])
+        self.assertIn("cleared by `ci-kube-agents-fleet-reconcile-daily`'s 4:40 AM ET run (build 9): 35 visited: 35 converged.", post_health.render_periodic_clear(doc, prev))
+        doc["periodics_runs"][self.DAILY] = {"build": "10", "finished_at": "2026-09-15T08:40:00+00:00", "passed": False, "summary": "3 refused, 32 converged"}
+        text = post_health.render_periodic_clear(doc, prev)
+        self.assertIn("(build 9): 35 visited: 35 converged.", text)
+        self.assertNotIn("3 refused", text)
 
     def test_the_digest_line_for_an_unreadable_finish_time_says_so(self):
         doc = health("GREEN")
