@@ -6078,6 +6078,38 @@ class TestCostDeclaredShapes(HarnessTestCase):
         self.assertEqual(audit_report.declare_collector_candidates(doc, declarations, manifest), [])
         self.assertEqual(len(doc["declared"]), 1)
 
+    def test_a_declaration_covers_a_minor_reservation_and_a_major_one_publishes_with_a_note(self):
+        # The note names the object, not the size, and every cost finding is a
+        # size: a declared pool that grew to a node's worth is `major` and is
+        # reported again, the finding saying the note was read and what brings
+        # the declaration back; the manifest route declares no major candidate.
+        small = make_finding(fid="small", severity="minor", check="idle-nodepool", namespace="", obj="NodePool/warm-batch", remediation={"kind": "gcloud", "note": "gcloud container node-pools update warm-batch --min-nodes=0"})
+        grown = make_finding(fid="grown", severity="major", check="idle-nodepool", namespace="", obj="NodePool/gpu-warm", remediation={"kind": "gcloud", "note": "gcloud container node-pools update gpu-warm --min-nodes=0"})
+        workload = make_finding(fid="wl", severity="major", check="overrequest", obj="Deployment/burst-ingest", remediation={"kind": "manifest", "path": "clusters/prod-us-east/burst.yaml", "note": "resize"})
+        doc = self._doc([small, grown, workload])
+        declarations = [
+            self._declaration("idle-nodepool", "NodePool/warm-batch"),
+            self._declaration("idle-nodepool", "NodePool/gpu-warm"),
+            self._declaration("overrequest", "Deployment/burst-ingest", namespace="payments"),
+        ]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            moved = audit_report.apply_declarations(doc, declarations)
+        self.assertEqual([f["object"] for f in moved], ["NodePool/warm-batch"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["NodePool/gpu-warm", "Deployment/burst-ingest"])
+        self.assertEqual(err.getvalue().count("covers a 'minor' reservation only"), 2)
+        pool_note = doc["findings"][0]["remediation"]["note"]
+        self.assertTrue(pool_note.startswith("# Declared at acme/fleet:knowledge/reservations.md"), pool_note)
+        self.assertIn("\ngcloud container node-pools update gpu-warm", pool_note)
+        self.assertEqual(doc["findings"][0]["remediation"]["kind"], "gcloud")
+        wl_note = doc["findings"][1]["remediation"]["note"]
+        self.assertTrue(wl_note.startswith("_(Declared at acme/fleet:knowledge/reservations.md"), wl_note)
+        self.assertTrue(wl_note.endswith(")_ resize"), wl_note)
+        scoped, fleet_wide = audit_report._declaration_lookup(declarations)
+        declarable = audit_report.audit_declarable_checks(self.COST)
+        self.assertIsNone(audit_report._declaration_covers({"check": "idle-nodepool", "namespace": "", "object": "NodePool/gpu-warm", "severity": "major"}, scoped, fleet_wide, declarable))
+        self.assertIsNotNone(audit_report._declaration_covers({"check": "idle-nodepool", "namespace": "", "object": "NodePool/warm-batch", "severity": "minor"}, scoped, fleet_wide, declarable))
+
     def test_a_roll_up_scope_is_not_declarable_on_any_route(self):
         # §3a: a roll-up names a scope, not an object. The 3.5 ten-address
         # roll-up is `Project/<id>` on the project entry; §5's collapse gives a

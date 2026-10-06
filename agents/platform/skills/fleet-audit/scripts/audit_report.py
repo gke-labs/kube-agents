@@ -923,6 +923,21 @@ COST_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
     "idle-namespace": frozenset({"namespace"}),
     "registry-no-cleanup": frozenset({"artifactregistryrepository"}),
 }
+# A cost declaration names the object and not its size, while every cost
+# finding is about a size. The SOP's severity is its size scale (§3: `minor`
+# by default, `major` for magnitude — a node's worth, 500 GiB, a load
+# balancer), so a declaration covers a `minor` finding only: a reservation
+# that has grown past that publishes under the note that still names it,
+# with the sentence below on its remediation, until it is `minor` again.
+COST_DECLARABLE_SEVERITY = "minor"
+COST_OUTGROWN_NOTE = (
+    "Declared at {repo}:{path}, but a declaration covers a `minor` reservation only; at this size "
+    "the finding is `{severity}` and publishes until it is under the `minor` line again, where the "
+    "declaration applies again."
+)
+# A `gcloud` note renders inside a bash fence, so the sentence rides as a
+# comment line there; `manifest` and `manual` notes render as prose.
+COST_OUTGROWN_SHELL_PREFIX = "# "
 # The cost checks whose collector candidate carries no `namespace`: 3.10
 # names the namespace itself, 3.7 a node pool, and 3.4, 3.5 and 3.14 a
 # project's disk, address and registry repository. A worker or a note author
@@ -5315,6 +5330,8 @@ def _declaration_covers(item: dict, scoped: dict, fleet_wide: dict, declarable) 
         return None
     if _rollup_scope_reason(check, str(item.get("object", ""))):
         return None
+    if _cost_outgrown(check, item):
+        return None
     return match
 
 
@@ -5403,6 +5420,24 @@ def fold_unnamespaced_check(entry: dict) -> None:
     """
     if isinstance(entry, dict) and entry.get("namespace") and str(entry.get("check", "")) in UNNAMESPACED_CHECKS:
         entry["namespace"] = ""
+
+
+def _cost_outgrown(check: str, item: dict) -> bool:
+    """Whether `item`, a cost finding or candidate, is past the size a declaration covers."""
+    return check in COST_DECLARABLE_OBJECT_KINDS and str(item.get("severity", "")) != COST_DECLARABLE_SEVERITY
+
+
+def note_outgrown_declaration(finding: dict, match: dict) -> None:
+    """Put the outgrown sentence on the finding's remediation, in the kind's rendering."""
+    remediation = finding.setdefault("remediation", {})
+    sentence = COST_OUTGROWN_NOTE.format(
+        repo=match.get("repo", ""), path=match.get("path", ""), severity=finding.get("severity", "")
+    )
+    note = str(remediation.get("note", "")).strip()
+    if str(remediation.get("kind", "")) == "gcloud":
+        remediation["note"] = COST_OUTGROWN_SHELL_PREFIX + sentence + (f"\n{note}" if note else "")
+    else:
+        remediation["note"] = f"_({sentence})_" + (f" {note}" if note else "")
 
 
 def _rollup_scope_reason(check: str, obj: str) -> str | None:
@@ -5499,6 +5534,18 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
                 f"{scope_reason}; a declaration justifies one object, never a roll-up. "
                 f"{match.get('repo', '')}:{match.get('path', '')} stands and the finding publishes."
             )
+            match = None
+        if match is not None and _cost_outgrown(check, finding):
+            # The note names the object, not its size; past `minor` the
+            # reservation is reported, and the finding says why and what
+            # brings the declaration back.
+            log(
+                f"DECLARATION NOT APPLIED: {finding.get('id', '')} — {check} on "
+                f"{finding.get('object', '')} is {finding.get('severity', '')!r}, and a cost declaration "
+                f"covers a {COST_DECLARABLE_SEVERITY!r} reservation only. "
+                f"{match.get('repo', '')}:{match.get('path', '')} stands and the finding publishes with a note."
+            )
+            note_outgrown_declaration(finding, match)
             match = None
         if match is None or derive_finding_id(finding) in already:
             kept.append(finding)
