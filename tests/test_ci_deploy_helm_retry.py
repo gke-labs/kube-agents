@@ -280,6 +280,19 @@ A2A_OPERATOR_ENV_ARGS=()
         self.assertEqual(len(helm_upgrades), 2, f"expected 2 helm calls: {calls}")
         self.assertIn("hit a transient API-server 5xx, retrying", out)
 
+    def test_a_transient_server_responded_with_status_code_retries_and_succeeds(self):
+        # Exercises client-go 'the server responded with the status code 50[0234]'.
+        err_msg = "the server responded with the status code 502"
+        responses = [
+            (1, "", err_msg),
+            (0, "Release kube-agents installed", ""),
+        ]
+        rc, calls, out, err = self._run_deploy_block(responses)
+        self.assertEqual(rc, 0, err)
+        helm_upgrades = [c for c in calls if c.startswith("helm upgrade")]
+        self.assertEqual(len(helm_upgrades), 2, f"expected 2 helm calls: {calls}")
+        self.assertIn("hit a transient API-server 5xx, retrying", out)
+
     def test_a_transient_bounded_5xx_http_code_retries_and_succeeds(self):
         # Exercises bounded HTTP status code from upstream ingress or proxy.
         err_msg = "HTTP response status 502 from control plane load balancer"
@@ -307,27 +320,32 @@ A2A_OPERATOR_ENV_ARGS=()
         # 1. an error on the server (client-go 500/502/other when no Status body)
         # 2. the server is currently unable to handle the request (client-go 503)
         # 3. the server was unable to return a response in the time allotted (client-go 504)
-        # 4. Internal error occurred: (API server 500 / admission webhook failure)
-        # 5. etcdserver: (etcd transient timeout / leader election)
-        # 6. request did not complete within (API server request timeout)
-        # 7. (^|[^0-9])50[0234]([^0-9]|$) (bounded 5xx HTTP status codes)
+        # 4. the server responded with the status code 50[0234] (client-go status sentence)
+        # 5. Internal error occurred: (API server 500 / admission webhook failure)
+        # 6. etcdserver: (etcd transient timeout / leader election)
+        # 7. request did not complete within (API server request timeout)
+        # 8. (HTTP|status( code)?)[: ]+50[0234]([^0-9]|$) (bounded 5xx HTTP/status codes)
         signatures = [
             'an error on the server ("connection reset") has prevented the request from succeeding',
             "the server is currently unable to handle the request (post configmaps)",
             "the server was unable to return a response in the time allotted, but may still be processing the request",
+            "the server responded with the status code 502",
+            "the server responded with the status code 503",
+            "the server responded with the status code 504",
+            "the server responded with the status code 500",
             'Error from server (InternalError): Internal error occurred: failed calling webhook "gate.example.com"',
             "etcdserver: request timed out",
             "Timeout: request did not complete within the allotted timeout",
             "HTTP response status 502 from control plane load balancer",
-            "received status 500 from upstream",
-            "proxy error 503 returned",
-            "gateway error 504 returned",
+            "HTTP 500 Internal Server Error",
+            "status code 504",
+            "status: 503",
         ]
         for sig in signatures:
             with self.subTest(signature=sig):
                 self.assertTrue(pattern.search(sig), f"pattern must match signature: {sig!r}")
 
-        # Non-matching client errors, operational failures, and unanchored digit runs:
+        # Non-matching client errors, operational failures, line numbers, and resource quantities:
         non_5xx = [
             "release: already exists",
             "cannot re-use a name that is still in use",
@@ -339,6 +357,16 @@ A2A_OPERATOR_ENV_ARGS=()
             "failed to connect to host:8502 connection refused",
             "exit status 5000",
             "replicaCount=2500",
+            "execution error at (kube-agents/templates/_helpers.tpl:502:14)",
+            "yaml: line 503:",
+            "exceeded quota: requested: cpu=500m",
+            "Invalid value: \"500m\"",
+            "cpu: 500m",
+            "requested: 500Mi",
+            ":502:",
+            "-c504f-",
+            "504s",
+            "pid 503",
         ]
         for non in non_5xx:
             with self.subTest(non_5xx=non):
@@ -367,8 +395,16 @@ A2A_OPERATOR_ENV_ARGS=()
         history_poisoned = json.dumps([{"revision": 1, "status": "failed"}])
         rc, calls, out, err = self._run_deploy_block(responses, history_json=history_poisoned, history_exit=0)
         self.assertEqual(rc, 0, err)
+        cr_deletes = [c for c in calls if c.startswith("kubectl delete platformagent")]
+        self.assertEqual(len(cr_deletes), 1, f"expected CR delete before uninstall: {calls}")
+        self.assertIn("--wait", cr_deletes[0])
+        self.assertIn("--ignore-not-found", cr_deletes[0])
         uninstalls = [c for c in calls if c.startswith("helm uninstall")]
         self.assertEqual(len(uninstalls), 1, f"expected poisoned record to be healed before retry: {calls}")
+        # Verify CR delete precedes helm uninstall
+        cr_idx = calls.index(cr_deletes[0])
+        uninstall_idx = calls.index(uninstalls[0])
+        self.assertLess(cr_idx, uninstall_idx, "CR delete must precede helm uninstall")
         self.assertIn("record before retrying", out.lower())
         self.assertIn("cleared the poisoned", out.lower())
 
@@ -382,6 +418,8 @@ A2A_OPERATOR_ENV_ARGS=()
         history_healthy = json.dumps([{"revision": 1, "status": "deployed"}, {"revision": 2, "status": "failed"}])
         rc, calls, out, err = self._run_deploy_block(responses, history_json=history_healthy, history_exit=0)
         self.assertEqual(rc, 0, err)
+        cr_deletes = [c for c in calls if c.startswith("kubectl delete platformagent")]
+        self.assertEqual(len(cr_deletes), 0, f"healthy release must not delete CR: {calls}")
         uninstalls = [c for c in calls if c.startswith("helm uninstall")]
         self.assertEqual(len(uninstalls), 0, f"release with deployed revision must not be uninstalled: {calls}")
         self.assertNotIn("cleared the poisoned", out.lower())
@@ -396,6 +434,8 @@ A2A_OPERATOR_ENV_ARGS=()
         ]
         rc, calls, out, err = self._run_deploy_block(responses, history_json="", history_exit=1)
         self.assertEqual(rc, 0, err)
+        cr_deletes = [c for c in calls if c.startswith("kubectl delete platformagent")]
+        self.assertEqual(len(cr_deletes), 0, f"absent release must not delete CR: {calls}")
         uninstalls = [c for c in calls if c.startswith("helm uninstall")]
         self.assertEqual(len(uninstalls), 0, f"absent release must not issue uninstall: {calls}")
         self.assertNotIn("cleared the poisoned", out.lower())

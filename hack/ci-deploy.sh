@@ -88,7 +88,7 @@ readonly HELM_DEPLOYED_STATUS_RE='"status"[[:space:]]*:[[:space:]]*"deployed"'
 # startup can fail the first attempt; retrying proceeds to evaluation (#2382).
 readonly HELM_DEPLOY_ATTEMPTS=3
 readonly HELM_DEPLOY_RETRY_DELAY_SECONDS=5
-readonly HELM_API_SERVER_5XX_RE="an error on the server|the server is currently unable to handle the request|the server was unable to return a response in the time allotted|Internal error occurred:|etcdserver:|request did not complete within|(^|[^0-9])50[0234]([^0-9]|$)"
+readonly HELM_API_SERVER_5XX_RE="an error on the server|the server is currently unable to handle the request|the server was unable to return a response in the time allotted|the server responded with the status code 50[0234]|Internal error occurred:|etcdserver:|request did not complete within|(HTTP|status( code)?)[: ]+50[0234]([^0-9]|$)"
 
 # The keypair the agent uses to reach its shell sandbox over SSH. Generated per
 # run and thrown away with the lease: nothing outside this cluster ever sees it,
@@ -796,10 +796,21 @@ heal_poisoned_release_record() {
     echo "WARNING: the ${HELM_RELEASE_NAME} release record exists with no deployed revision —"
     echo "         ${reason}. Clearing the"
     echo "         record before ${action}."
-    # --no-hooks: the pre-delete hook waits on an operator a failed install
-    # never started. If even the uninstall cannot clear it, drop the
-    # release-record Secrets directly — with no deployed revision there is
-    # nothing real for Helm to unwind, and the record is all that blocks the
+    # When retrying (§5c), the failed attempt may have already started the
+    # operator and added the PlatformAgent finalizer. Delete the CR first and
+    # wait for the operator to clear its finalizer before uninstalling (#2382).
+    # Without this, Helm deletes the operator and RBAC first, leaving the CR
+    # stranded on its finalizer and breaking subsequent install attempts.
+    if [ "${action}" = "retrying" ]; then
+      kubectl delete platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" \
+        --ignore-not-found --wait --timeout=60s || true
+    fi
+
+    # --no-hooks: at lease time (§5a), a leftover release from a failed prior
+    # run never started the operator, so running pre-delete hooks would hang.
+    # On retry (§5c), the CR was already deleted above, so the hook is redundant.
+    # If even the uninstall cannot clear it, drop the release-record Secrets
+    # directly — with no deployed revision the record is all that blocks the
     # install. Both failing leaves the record in place, so let set -e stop
     # the run here, before the upgrade fails less legibly. No --wait and no
     # hooks means Helm's uninstall timeout would bound nothing, so none is
