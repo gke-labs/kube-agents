@@ -1320,9 +1320,8 @@ def comment_pending(episode: dict, namespace: str, card: str) -> None:
 
 
 def card_wait_over(episode: dict, now: str) -> bool:
-    """Whether a card-less episode has waited as long as a card is given to
-    appear. Every step that finds no card asks this, so none gives up on a
-    card the others are still waiting for."""
+    """Whether a card-less episode has waited as long as its card is given to
+    appear."""
     if not episode.get(SESSION_KEY):
         return True  # nothing can file a card for it
     try:
@@ -1436,11 +1435,11 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
                 comment_pending(episode, namespace, card)
                 continue
             if status is not None:
-                if not would_raise(state, sweep, scope):
-                    # The finished card's episode stays until a read tick can
-                    # raise the new alert, or the clearing step closes it.
-                    continue
-                end_episode(state, scope)
+                # The finished card's episode is replaced only by an alert that
+                # is sent. Until then the new objects wait as pending, which
+                # keeps the scope a candidate, and a clear still finds it.
+                episode["pending"] = sorted(set(episode.get("pending", [])) | set(object_names(new_rows)))
+                previous = episode
         if not would_raise(state, sweep, scope):
             continue
         if refusal is not None:
@@ -1510,10 +1509,8 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             # Whether a card is open is unknown; ask again next tick.
             continue
         if card is None:
-            if not card_wait_over(episode, now):
-                # The card may still come; it is closed with the cleared line
-                # when it does, or the line is said bare once the wait is over.
-                continue
+            # No card came of the alert, so there is nothing to close. A card
+            # filed later still runs the scan and reports the recovery itself.
             end_episode(state, scope)
             lines.append(f"{CLEARED_PREFIX} in {scope_label_text(scope)}: {cleared}")
             continue
