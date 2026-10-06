@@ -441,8 +441,8 @@ def known_domains() -> set[str]:
 
 
 # `{cluster:<slot>}` in a report_contains pattern, as bench/kube_agents_bench/
-# verifiers.py's _CLUSTER_PLACEHOLDER reads it (this script is stdlib-only, so
-# the regex is restated here; the verifier owns it).
+# verifiers.py's _CLUSTER_PLACEHOLDER reads it (this script does not import
+# the bench package, so the regex is restated here; the verifier owns it).
 CLUSTER_PLACEHOLDER = re.compile(r"\{cluster:([a-z0-9-]+)\}")
 CLUSTER_PLACEHOLDER_LOOSE = re.compile(r"\{\s*cluster\s*:", re.IGNORECASE)
 CLUSTER_PLACEHOLDER_OPENER = "{cluster:"

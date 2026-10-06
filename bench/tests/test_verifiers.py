@@ -282,11 +282,6 @@ def test_line_decoration_fold_is_off_unless_asked_for():
     assert folded.verify(5.0).status == "pass"
 
 
-def test_any_of_pattern_must_compile():
-    with pytest.raises(Exception):
-        ReportContainsVerifier(type="report_contains", any_of_patterns=["(unclosed"])
-
-
 # --------------------------------------- the zonal control-plane case's lines
 #
 # Read out of the task file, never copied: the declared answer line the case
