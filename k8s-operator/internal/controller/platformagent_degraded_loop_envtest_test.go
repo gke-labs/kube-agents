@@ -229,20 +229,29 @@ func TestAParkedRefusalDoesNotReconcileContinuouslyEnvtest(t *testing.T) {
 		cond := meta.FindStatusCondition(pa.Status.Conditions, "Ready")
 		return pa.Status.Phase == "Degraded" && cond != nil && cond.Reason == reasonShellSandboxKeysMissing
 	}
-
 	deadline := time.Now().Add(degradedLoopParkTimeout)
-	var current *agentv1alpha1.PlatformAgent
-	for {
-		current = fetch()
-		if parked(current) {
-			break
+	waitForParked := func(reader client.Reader, label string) *agentv1alpha1.PlatformAgent {
+		t.Helper()
+		for {
+			got := &agentv1alpha1.PlatformAgent{}
+			if err := reader.Get(ctx, key, got); err != nil {
+				t.Fatalf("reading the PlatformAgent back via %s: %v", label, err)
+			}
+			if parked(got) {
+				return got
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("the CR did not park on %s within %s via %s; phase=%q conditions=%+v",
+					reasonShellSandboxKeysMissing, degradedLoopParkTimeout, label, got.Status.Phase, got.Status.Conditions)
+			}
+			time.Sleep(degradedLoopPollInterval)
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("the CR did not park on %s within %s; phase=%q conditions=%+v",
-				reasonShellSandboxKeysMissing, degradedLoopParkTimeout, current.Status.Phase, current.Status.Conditions)
-		}
-		time.Sleep(degradedLoopPollInterval)
 	}
+
+	current := waitForParked(direct, "direct API client")
+	// Wait until the manager's informer cache has also observed the parked status,
+	// ensuring the measurement window starts from a fully synchronized state.
+	waitForParked(mgr.GetClient(), "manager cache")
 	t.Logf("parked on %s after %s; resourceVersion=%s lastReconcileTime=%v",
 		reasonShellSandboxKeysMissing, degradedLoopParkTimeout-time.Until(deadline), current.ResourceVersion, current.Status.LastReconcileTime)
 

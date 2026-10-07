@@ -984,6 +984,12 @@ func TestAHeldProvisionJobReadsProvisioningNamingTheCallout(t *testing.T) {
 // TestARunningGatewayDoesNotReadTheSecret: the backend question costs an
 // uncached Secret read, and it is asked only on the pass that would create
 // the gateway. An install whose gateway exists pays nothing for the gate.
+//
+// The secret-env digest does read the discord-bot Secret on every pass, once,
+// because the rendered gateway takes DISCORD_TOKEN from it as environment
+// (platformagent_secret_hash.go); that read is the stamp's, the same one the
+// agent gateway and the broker pay. So a running pass reads the Secret exactly
+// once, and a gate asked again would make it two.
 func TestARunningGatewayDoesNotReadTheSecret(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
 	agent := a2aTestAgent()
@@ -1022,8 +1028,8 @@ func TestARunningGatewayDoesNotReadTheSecret(t *testing.T) {
 			t.Fatalf("reconcileA2A %d with the gateway running: %v", i+1, err)
 		}
 	}
-	if secretReads != 0 {
-		t.Errorf("a running gateway's reconcile read the discord-bot Secret %d times in three passes, want 0", secretReads)
+	if secretReads != 3 {
+		t.Errorf("a running gateway's reconcile read the discord-bot Secret %d times in three passes, want 3 (the digest's one per pass, the gate's none)", secretReads)
 	}
 }
 

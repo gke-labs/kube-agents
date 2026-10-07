@@ -698,7 +698,9 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 		add("GOOGLE_CHAT_ALLOW_ALL_USERS", strconv.FormatBool(allowAllUsers(gchat.AllowedUsers)))
 	}
 
-	if slack := integration.Slack; slack != nil && slack.Enabled != nil && *slack.Enabled {
+	// legacySlackConsumer, for Chat's reason above: under next the A2A
+	// gateway takes Slack and the Hermes platform is off; see a2aSlackArmed.
+	if slack := integration.Slack; legacySlackConsumer(agent) {
 		add("SLACK_RELAY_URL", credentialProxyBaseURL(agent))
 		add("SLACK_ALLOWED_USERS", strings.Join(slack.AllowedUsers, ","))
 		add("SLACK_ALLOW_ALL_USERS", strconv.FormatBool(allowAllUsers(slack.AllowedUsers)))
@@ -1941,7 +1943,9 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 			cfg.Display.Platforms["google_chat"] = resolveGoogleChatDisplayConfig(gchat.Mode)
 		}
 		if slack := agent.Spec.Integration.Slack; slack != nil && slack.Enabled != nil {
-			cfg.Platforms.Slack.Enabled = *slack.Enabled
+			// On only while Hermes is the Slack consumer; under next the A2A
+			// gateway is, see a2aSlackArmed.
+			cfg.Platforms.Slack.Enabled = legacySlackConsumer(agent)
 		}
 		if teams := agent.Spec.Integration.Teams; teams != nil && teams.Enabled != nil {
 			cfg.Platforms.Teams.Enabled = *teams.Enabled
@@ -2738,7 +2742,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				Value: strconv.FormatBool(allowAllUsers(gchat.AllowedUsers)),
 			})
 		}
-		if slack := integration.Slack; slack != nil && slack.Enabled != nil && *slack.Enabled {
+		// The legacy relay env; under next the A2A gateway carries Slack
+		// instead, see a2aSlackArmed.
+		if slack := integration.Slack; legacySlackConsumer(agent) {
 			envVars = append(envVars, []corev1.EnvVar{
 				{
 					Name:  "SLACK_RELAY_URL",
@@ -4187,7 +4193,12 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 				envVars = append(envVars, corev1.EnvVar{Name: legacyGoogleChatSubscriptionEnvVar, Value: subscription})
 			}
 		}
-		if slack := integration.Slack; slack != nil && slack.Enabled != nil && *slack.Enabled {
+		// The pair arms the broker's own Socket Mode connection
+		// (credential_proxy.py, serve: SlackRelay), the legacy consumer.
+		// Under next the A2A gateway opens the app's connection on the same
+		// refs, and Slack spreads an app's events across every connection it
+		// has open, so the broker is not handed the pair; see a2aSlackArmed.
+		if slack := integration.Slack; legacySlackConsumer(agent) {
 			envVars = append(envVars,
 				corev1.EnvVar{Name: "SLACK_BOT_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(slack.BotTokenSecretRef, defaultPlatformAgentSecrets, "SLACK_BOT_TOKEN")}},
 				corev1.EnvVar{Name: "SLACK_APP_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(slack.AppTokenSecretRef, defaultPlatformAgentSecrets, "SLACK_APP_TOKEN")}},
