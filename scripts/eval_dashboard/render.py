@@ -1118,7 +1118,7 @@ def brief_document(data: dict, health: dict | None, history: list[dict] | None, 
         "pending": pending_builds(data),
         "releases": [compact_release(r) for r in sorted_releases(data)],
         "nightly": nightly.nightly_document(data),
-        "gitlab": forge_lane.gitlab_document(data),
+        "gitlab": forge_lane.gitlab_document(data, now),
         "trend": trend.trend_document(store, data),
     }
 

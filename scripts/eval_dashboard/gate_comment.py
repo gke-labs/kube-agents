@@ -305,7 +305,9 @@ def newest_red_per_pr(data: dict, since: datetime, now: datetime) -> list[dict]:
     """The newest red, lost, deadline-killed or not-evaluated run per pull request among
     those finishing in (since, now]."""
     newest: dict = {}
-    for raw in data.get("runs") or []:
+    # The gate's runs only (tiers.py): a GitLab lane run carries the pull
+    # request number too, and its red is not the gate's.
+    for raw in tiers.presubmit_runs([r for r in data.get("runs") or [] if isinstance(r, dict)]):
         run = health.Run(raw)
         if run.pr is None or not run.finished or not (since < run.finished <= now) or not is_commented_on(run):
             continue

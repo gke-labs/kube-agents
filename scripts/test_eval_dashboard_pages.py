@@ -897,6 +897,7 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("GitLab lane", page)
         self.assertIn("1 run on record: 0 green, 1 not", page)
         self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/2475/pull-kube-agents-smoke-test-gitlab/2097282860221206600"', page)
+        self.assertIn("<th>Prow</th><th>Eval verdict</th>", page, "the result pill sits under Prow, not Job")
         # The gate's own list does not carry it.
         self.assertNotIn('href="run.html#build=2097282860221206600"', page)
 

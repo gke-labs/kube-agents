@@ -883,7 +883,10 @@ first**, the last `RUNS_LISTED` (20), each `{build, job, pr, head_sha,
 project, started, finished, duration_s, result, eval_verdict, green,
 tasks{pass, fail, infra}}` (`green` is Prow's `SUCCESS`; `tasks` counts the
 run's task rows by result); `running[]` the lane's `pending_builds` as
-`{build, first_seen}`; `counts` over every lane run on record. `job` is the
+`{build, first_seen}`, only those first seen inside `RUNNING_MAX_AGE` (8 h,
+the presubmit's ceiling plus upload time) of the reference time, as the Grid's
+columns and the nightly's `running[]` are bounded; `counts` over every lane
+run on record. `job` is the
 name the newest lane run carries, else the default. The Brief's "GitLab
 lane" section is this block and nothing else reads it: the lane's runs are
 in no gate number, no case history and no digest line.

@@ -989,7 +989,7 @@ function gitlabLaneHtml() {
   } else {
     const c = lane.counts || {};
     body = `<p class="mut small">${plural(c.on_record || runs.length, "run")} on record: ${c.green || 0} green, ${c.red || 0} not. These runs are the lane's own and sit outside the gate's numbers above.</p>` +
-      `<table class="rel"><thead><tr><th>Build</th><th>PR</th><th>Job</th><th>Eval verdict</th><th>Cases</th><th>Started</th><th>Took</th></tr></thead><tbody>${runs.map(laneRow).join("")}</tbody></table>${flight}`;
+      `<table class="rel"><thead><tr><th>Build</th><th>PR</th><th>Prow</th><th>Eval verdict</th><th>Cases</th><th>Started</th><th>Took</th></tr></thead><tbody>${runs.map(laneRow).join("")}</tbody></table>${flight}`;
   }
   return `<div class="sec" id="gitlab"><h2>GitLab lane</h2>${body}</div>`;
 }

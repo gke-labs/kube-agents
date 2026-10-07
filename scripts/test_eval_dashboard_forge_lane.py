@@ -2,6 +2,7 @@
 newest first, with their counts, and the lane's builds in flight; a run of
 another tier never enters it."""
 
+import datetime
 import pathlib
 import sys
 import unittest
@@ -48,6 +49,11 @@ class LaneDocumentTest(unittest.TestCase):
             {"build_id": "7", "first_seen": "2026-10-07T16:02:00+00:00", "tier": "nightly"},
         ]}
         self.assertEqual(forge_lane.gitlab_document(data)["running"], [{"build": "5", "first_seen": "2026-10-07T16:00:00+00:00"}])
+        # Past RUNNING_MAX_AGE a listed build is a pod that died without uploading, not one in flight.
+        data["pending_builds"].append({"build_id": "4", "first_seen": "2026-10-07T07:00:00+00:00", "tier": "gitlab"})
+        now = datetime.datetime(2026, 10, 7, 16, 30, tzinfo=datetime.timezone.utc)
+        self.assertEqual([e["build"] for e in forge_lane.gitlab_document(data, now)["running"]], ["5"])
+        self.assertEqual([e["build"] for e in forge_lane.gitlab_document(data)["running"]], ["4", "5"], "without a clock the age is not judged")
 
     def test_the_tier_filter_is_the_shared_one(self):
         self.assertTrue(tiers.is_gitlab({"tier": "gitlab"}))
