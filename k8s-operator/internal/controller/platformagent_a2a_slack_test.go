@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 
@@ -494,6 +495,27 @@ func TestNoEgressPolicySelectsTheGatewayPod(t *testing.T) {
 		buildNetworkPolicy(agent, []string{"10.0.0.0/8"}, netpolProfile{DNSClusterIPs: dns}, false, "", false),
 		buildLiteLLMNetworkPolicy(agent, netpolProfile{DNSClusterIPs: dns}),
 	}
+	if fqdnPolicy := buildFQDNNetworkPolicy(agent); fqdnPolicy != nil {
+		rawSel, _, err := unstructured.NestedMap(fqdnPolicy.Object, "spec", "podSelector")
+		if err != nil {
+			t.Fatalf("buildFQDNNetworkPolicy podSelector: %v", err)
+		}
+		var sel metav1.LabelSelector
+		if rawSel != nil {
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(rawSel, &sel); err != nil {
+				t.Fatalf("buildFQDNNetworkPolicy FromUnstructured: %v", err)
+			}
+		}
+		policies = append(policies, &networkingv1.NetworkPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: fqdnPolicy.GetName(),
+			},
+			Spec: networkingv1.NetworkPolicySpec{
+				PodSelector: sel,
+				PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
+			},
+		})
+	}
 	matched := 0
 	for _, pol := range policies {
 		if pol == nil {
@@ -510,19 +532,6 @@ func TestNoEgressPolicySelectsTheGatewayPod(t *testing.T) {
 		for _, pt := range pol.Spec.PolicyTypes {
 			if pt == networkingv1.PolicyTypeEgress {
 				t.Errorf("%s fences the gateway pod's egress; Slack's websocket and Web API need admitting in it", pol.Name)
-			}
-		}
-	}
-	fqdnPolicy := buildFQDNNetworkPolicy(agent)
-	if fqdnPolicy != nil {
-		matchLabels, ok, err := unstructured.NestedStringMap(fqdnPolicy.Object, "spec", "podSelector", "matchLabels")
-		if err != nil {
-			t.Fatalf("buildFQDNNetworkPolicy matchLabels: %v", err)
-		}
-		if ok {
-			sel := labels.SelectorFromSet(labels.Set(matchLabels))
-			if sel.Matches(gatewayPod) {
-				t.Errorf("%s fences the gateway pod's egress; Slack's websocket and Web API need admitting in it", fqdnPolicy.GetName())
 			}
 		}
 	}
