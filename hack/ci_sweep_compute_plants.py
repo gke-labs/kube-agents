@@ -324,8 +324,8 @@ def sweep_project(
                 continue
 
             cmd = ["gcloud", "compute", "networks", "subnets", "delete", name, f"--project={project}"]
-            if region:
-                region_name = region.split("/")[-1]
+            region_name = resource_name(region)
+            if region_name:
                 cmd.append(f"--region={region_name}")
             cmd.append("--quiet")
 

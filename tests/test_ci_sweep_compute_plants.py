@@ -289,6 +289,37 @@ class SweepProjectTest(unittest.TestCase):
             "--project=my-project", "--quiet",
         ])
 
+    def test_subnet_delete_strips_trailing_slash_from_region_url(self):
+        """Proves subnet delete extracts region name via resource_name even with a trailing slash."""
+        commands_run = []
+
+        def mock_runner(cmd, capture_output=True, text=True, check=False):
+            commands_run.append(cmd)
+            if "list" in cmd and "subnets" in cmd:
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps([{
+                        "name": "bench-subnet-slash",
+                        "description": self.plant_desc,
+                        "creationTimestamp": self.old_ts,
+                        "region": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4/",
+                    }]),
+                    stderr="",
+                )
+            if "list" in cmd:
+                return mock.Mock(returncode=0, stdout="[]", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        res = sweep.sweep_project("my-project", max_age_hours=4.0, runner=mock_runner, now=self.now)
+        self.assertEqual(res["subnets"], ["bench-subnet-slash"])
+
+        delete_cmds = [cmd for cmd in commands_run if "delete" in cmd]
+        self.assertEqual(len(delete_cmds), 1)
+        self.assertEqual(delete_cmds[0], [
+            "gcloud", "compute", "networks", "subnets", "delete", "bench-subnet-slash",
+            "--project=my-project", "--region=us-west4", "--quiet",
+        ])
+
     def test_global_address_command_shape(self):
         commands_run = []
 
