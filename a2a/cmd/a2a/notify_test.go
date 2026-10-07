@@ -96,8 +96,8 @@ func TestNotifyTimesOutWithNoGateway(t *testing.T) {
 	// No gateway at all is "no responders": refused, exit 1. Only a request
 	// that someone received and did not answer is outcome-unknown.
 	err := run([]string{"notify", "--platform", "google_chat", "--timeout", "200ms", "x"})
-	if err == nil || errors.Is(err, errNotifyOutcomeUnknown) || !strings.Contains(err.Error(), "not armed") {
-		t.Errorf("err = %v, want the no-responders refusal, not outcome-unknown", err)
+	if !errors.Is(err, errNotifyRouteUnavailable) || errors.Is(err, errNotifyOutcomeUnknown) {
+		t.Errorf("err = %v, want route-unavailable (nothing posted), not outcome-unknown", err)
 	}
 }
 
@@ -140,6 +140,18 @@ func TestNotifyWithNoAnswerIsOutcomeUnknown(t *testing.T) {
 	}
 }
 
+// An unreachable bus is route-unavailable, like an unarmed route: nothing was
+// posted, and nothing about the destination is known.
+func TestNotifyWithNoBusIsRouteUnavailable(t *testing.T) {
+	t.Setenv("NATS_URL", "nats://127.0.0.1:1")
+	t.Setenv(lib.EnvBusUser, "agent")
+	t.Setenv(lib.EnvBusTokenFile, "")
+	err := run([]string{"notify", "--platform", "google_chat", "x"})
+	if !errors.Is(err, errNotifyRouteUnavailable) {
+		t.Errorf("err = %v, want route-unavailable", err)
+	}
+}
+
 func TestNotifyRefusesAnUnknownPlatform(t *testing.T) {
 	err := run([]string{"notify", "--platform", "telegram", "x"})
 	if err == nil || !strings.Contains(err.Error(), "--platform must be one of") {
@@ -161,5 +173,42 @@ func TestNotifyTextFromArgumentOrStdin(t *testing.T) {
 	}
 	if _, err := notifyText([]string{"a", "b"}, false, strings.NewReader("")); err == nil {
 		t.Error("two arguments accepted")
+	}
+}
+
+// A publish the principal is not granted is dropped by the server and shows
+// up only as the connection's async error. The command must report it as a
+// refusal (exit 1) promptly, not wait out the timeout and exit 3, which the
+// alert path would record as sent.
+func TestNotifyARefusedPublishIsARefusalNotAnUnknown(t *testing.T) {
+	s, err := server.NewServer(&server.Options{
+		Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true,
+		Users: []*server.User{{
+			Username: "agent", Password: "pw",
+			Permissions: &server.Permissions{
+				Publish:   &server.SubjectPermission{Allow: []string{"_INBOX.>"}, Deny: []string{lib.NotifySubjectGchat}},
+				Subscribe: &server.SubjectPermission{Allow: []string{">"}},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go s.Start()
+	if !s.ReadyForConnections(10 * time.Second) {
+		t.Fatal("nats-server not ready")
+	}
+	t.Cleanup(s.Shutdown)
+	notifyEnv(t, s.ClientURL())
+	t.Setenv("NATS_PASSWORD", "pw")
+
+	started := time.Now()
+	err = run([]string{"notify", "--platform", "google_chat", "--timeout", "10s", "x"})
+	if err == nil || errors.Is(err, errNotifyOutcomeUnknown) || errors.Is(err, errNotifyRouteUnavailable) ||
+		!strings.Contains(err.Error(), "refused") {
+		t.Fatalf("err = %v, want a bus refusal: not outcome-unknown, not route-unavailable", err)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Errorf("took %s; a refusal should not wait out the timeout", elapsed)
 	}
 }

@@ -309,3 +309,81 @@ func TestNotifyRefusesWhenTheQueueIsFull(t *testing.T) {
 		t.Errorf("first answer = %s, want the queue-full refusal", msg.Data)
 	}
 }
+
+// Stop answers every accepted request before the connection closes: the post
+// in flight finishes and succeeds, and what is still queued is refused, never
+// left silent (silence reads as "may have posted" and is not retried). A
+// request arriving after Stop is refused, not sent on the closed queue.
+func TestStopAnswersEveryAcceptedRequest(t *testing.T) {
+	s := startServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	client, err := lib.Connect(ctx, s.ClientURL(), lib.WithName("notify-gateway"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	poster := &blockingPoster{release: make(chan struct{})}
+	n, err := NewGchatNotifier(poster, testHome, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := n.Start(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	agent, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agent.Close()
+	in, err := agent.SubscribeSync(lib.NotifyReplyPrefix + ">")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(lib.NotifyRequest{Text: "x"})
+	for i := 0; i < 3; i++ {
+		if err := agent.PublishRequest(lib.NotifySubjectGchat, lib.NotifyReplyPrefix+"s", body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = agent.Flush()
+	time.Sleep(300 * time.Millisecond) // the worker holds the first; two are queued
+
+	stopped := make(chan struct{})
+	go func() { sub.Stop(); close(stopped) }()
+	time.Sleep(100 * time.Millisecond)
+	close(poster.release)
+	select {
+	case <-stopped:
+	case <-time.After(notifyStopGrace):
+		t.Fatal("Stop did not return")
+	}
+
+	var posted, refused int
+	for i := 0; i < 3; i++ {
+		msg, err := in.NextMsg(2 * time.Second)
+		if err != nil {
+			t.Fatalf("answer %d missing: %v", i+1, err)
+		}
+		var got lib.NotifyReply
+		_ = json.Unmarshal(msg.Data, &got)
+		switch {
+		case got.MessageID != "":
+			posted++
+		case got.Error == notifyStoppingRefusal:
+			refused++
+		}
+	}
+	if posted != 1 || refused != 2 {
+		t.Errorf("posted %d, refused %d; want the in-flight post and two stopping refusals", posted, refused)
+	}
+
+	// After Stop: refused under the lock, no panic on the closed queue.
+	_, refusal := n.validate(body)
+	if refusal != nil {
+		t.Fatal(refusal.Error)
+	}
+	n.handle(&nats.Msg{Subject: lib.NotifySubjectGchat, Reply: lib.NotifyReplyPrefix + "late", Data: body})
+}

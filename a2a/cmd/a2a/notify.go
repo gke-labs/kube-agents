@@ -29,9 +29,31 @@ const notifyDefaultTimeout = 60 * time.Second
 // NOTIFY_OUTCOME_UNKNOWN); every other failure exits 1.
 const notifyExitOutcomeUnknown = 3
 
+// notifyPollInterval is how often the wait for an answer checks for a refusal.
+const notifyPollInterval = 250 * time.Millisecond
+
+// notifyPermissionsViolation is how the server spells a refused publish or
+// subscribe in the error the client records (nats.go's PERMISSIONS_ERR).
+const notifyPermissionsViolation = "permissions violation"
+
+// errNotifyRefusedByBus marks a request the server refused for want of a grant.
+var errNotifyRefusedByBus = errors.New("refused by the bus")
+
 // errNotifyOutcomeUnknown marks the failure main reports with
 // notifyExitOutcomeUnknown.
 var errNotifyOutcomeUnknown = errors.New("outcome unknown")
+
+// notifyExitRouteUnavailable is the exit status for "the route is not there
+// right now": nothing subscribes on the subject (the gateway is restarting,
+// or its route is not armed) or the bus cannot be reached. Nothing was posted,
+// and unlike a refusal it says nothing about the destination, so a caller that
+// counts failures against a chat can wait instead (the kanban notifier's
+// stand-in does). Every other failure exits 1.
+const notifyExitRouteUnavailable = 4
+
+// errNotifyRouteUnavailable marks the failure main reports with
+// notifyExitRouteUnavailable.
+var errNotifyRouteUnavailable = errors.New("route unavailable")
 
 const notifyUsage = `usage: a2a notify --platform <platform> [--thread <thread>] [--timeout <d>] [--] [text]
 
@@ -39,8 +61,9 @@ Post text to the install's chat home channel through the A2A gateway: a new
 thread, or a reply on --thread, which must be a thread of the home channel.
 Reads the text from stdin when it is omitted, or "-" with no "--" before it.
 Prints the gateway's answer as JSON (message_id, the field hermes send --json
-prints, and thread_id). Exits 1 when nothing was posted and 3 when the gateway
-did not answer in time, so the post may still land.
+prints, and thread_id). Exits 1 when nothing was posted, 3 when the gateway
+did not answer in time (the post may still land), and 4 when the route is not
+there right now (nothing answering, or the bus unreachable; nothing posted).
 `
 
 func runNotify(args []string) error {
@@ -71,7 +94,7 @@ func runNotify(args []string) error {
 	defer cancel()
 	client, err := connect(ctx, "notify")
 	if err != nil {
-		return err
+		return fmt.Errorf("notify: cannot reach the bus: %v: %w", err, errNotifyRouteUnavailable)
 	}
 	defer client.Close()
 	nc := client.Conn()
@@ -92,7 +115,10 @@ func runNotify(args []string) error {
 	if err := nc.Flush(); err != nil {
 		return fmt.Errorf("notify: flush: %w", err)
 	}
-	msg, err := in.NextMsg(*timeout)
+	msg, err := awaitAnswer(nc, in, *timeout)
+	if errors.Is(err, errNotifyRefusedByBus) {
+		return fmt.Errorf("notify: the bus refused it, so nothing was posted: %v", nc.LastError())
+	}
 	if errors.Is(err, nats.ErrTimeout) {
 		return fmt.Errorf("notify: no answer from the gateway on %s within %s; the post may still land: %w",
 			subject, *timeout, errNotifyOutcomeUnknown)
@@ -101,7 +127,8 @@ func runNotify(args []string) error {
 		// Nothing subscribes on the subject, so the gateway's route is not
 		// armed (no home channel, another backend, or the gateway down).
 		// Nothing was posted.
-		return fmt.Errorf("notify: nothing is answering on %s; the gateway's notify route is not armed", subject)
+		return fmt.Errorf("notify: nothing is answering on %s; the gateway's notify route is not armed: %w",
+			subject, errNotifyRouteUnavailable)
 	}
 	if err != nil {
 		return fmt.Errorf("notify: no answer from the gateway on %s: %w", subject, err)
@@ -118,6 +145,31 @@ func runNotify(args []string) error {
 		fmt.Fprintf(os.Stderr, "a2a: notify: posted partly: %s\n", answer.Error)
 	}
 	return nil
+}
+
+// awaitAnswer waits for the gateway's answer in short slices, checking between
+// them whether the server refused the request. A publish or subscribe the
+// principal is not granted is dropped by the server and reported only to the
+// connection's async error, never as an error from PublishRequest or
+// SubscribeSync, so without this a refusal would wait out the whole timeout
+// and read as "may have posted" (exit 3), which the alert path records as sent.
+func awaitAnswer(nc *nats.Conn, in *nats.Subscription, timeout time.Duration) (*nats.Msg, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		if last := nc.LastError(); errors.Is(last, nats.ErrPermissionViolation) ||
+			(last != nil && strings.Contains(strings.ToLower(last.Error()), notifyPermissionsViolation)) {
+			return nil, errNotifyRefusedByBus
+		}
+		wait := time.Until(deadline)
+		if wait <= 0 {
+			return nil, nats.ErrTimeout
+		}
+		msg, err := in.NextMsg(min(wait, notifyPollInterval))
+		if errors.Is(err, nats.ErrTimeout) {
+			continue
+		}
+		return msg, err
+	}
 }
 
 // notifyText is the positional text, or stdin when it is absent, or "-" with
