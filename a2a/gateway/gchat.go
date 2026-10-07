@@ -164,13 +164,17 @@ func verifiedByFor(backend string) string {
 }
 
 // unverifiedRemedyFor names what an admin edits to admit a sender — the
-// allowlist on gchat, the door's own map on inject, nothing at all on the
-// console, the mapping table everywhere else (Discord's ConfigMap, Slack's
-// a2a-slack-principal-map Secret).
+// allowlist on gchat, both the allowlist and the a2a-slack-principal-map
+// Secret on Slack (a sender needs both, and the notice is the same whichever
+// one refused, so it does not tell a sender which table they are in), the
+// door's own map on inject, nothing at all on the console, the mapping table
+// everywhere else (Discord's ConfigMap).
 func unverifiedRemedyFor(backend string) string {
 	switch backend {
 	case gchatBackend:
 		return "the allowed users list"
+	case slackBackend:
+		return "the allowed users list and the principal map"
 	case consoleBackend:
 		// Cannot happen from a real console frame; a spoofed author id can.
 		return "nothing - only the console credential's own frames are accepted here"
@@ -986,7 +990,9 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 // resolvePrincipal establishes the requester's principal from the backend's
 // identity mechanism. On gchat the Google-asserted email IS the principal,
 // gated by the allowlist (the mapping table other backends need is exactly
-// what that backend exists to not have). On the console the NATS grant is
+// what that backend exists to not have). On Slack the same kind of allowlist
+// gates first and the principal map then resolves, so a sender needs both.
+// On the console the NATS grant is
 // the mechanism: only the console credential can publish on the console
 // subject, so the author is the console principal - but only on a console
 // conversation, so the string "console" arriving on any other backend is
@@ -1014,6 +1020,14 @@ func (g *Gateway) resolvePrincipal(backend, authorID string) string {
 			return authorID
 		}
 		return ""
+	case slackBackend:
+		// Chat's allowlist rule, carried to Slack (spec.integration.slack
+		// .allowedUsers), and then the map: a sender must be listed (or
+		// allow-all) AND mapped. Exact match, no case fold: a Slack member
+		// id is an opaque token, not an address.
+		if !g.slackAllowAll && !g.slackAllowed[authorID] {
+			return ""
+		}
 	}
 	return g.pm.Resolve(authorID)
 }

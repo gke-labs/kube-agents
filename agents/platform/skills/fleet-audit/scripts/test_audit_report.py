@@ -5748,7 +5748,7 @@ class TestDeclaredIntent(BaseTestCase):
                 self.validate(doc)
 
     def test_a_stream_without_a_declared_intent_step_rejects_the_list(self):
-        # Six streams have no declared-intent step. A worker on one of them that writes a
+        # Five streams have no declared-intent step. A worker on one of them that writes a
         # `declared` list has misread a step that does not exist for it, and a
         # hostile document has found a stream with no rule to break; both are
         # rejected whole rather than admitted because the check is on the
@@ -5760,7 +5760,7 @@ class TestDeclaredIntent(BaseTestCase):
             if not spec.declarable
         ]
         self.assertIn(NON_DECLARING_AUDIT, silent)
-        self.assertEqual(len(silent), len(audit_report.AUDITS) - 3)
+        self.assertEqual(len(silent), len(audit_report.AUDITS) - 4)
         for audit_id in silent:
             with self.subTest(audit=audit_id):
                 doc = make_doc(audit=audit_id, findings=[])
@@ -6425,6 +6425,234 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
         out = err.getvalue()
         self.assertIn("NOTE: acme/fleet:knowledge/n.md declares[0]: 'no-pdb' is another stream's posture", out)
         self.assertIn("WARNING: acme/fleet:knowledge/n.md declares[2]: 'bogus' is not a check a declaration may justify", out)
+
+
+class TestCostDeclaredShapes(HarnessTestCase):
+    """The waste stream's declarable postures join on the object as the collector spells it."""
+
+    COST = "fleet-wide-cost-analysis"
+    PROJECT = "project/acme-prod"
+
+    def _declaration(self, check, obj, namespace=""):
+        return {"check": check, "namespace": namespace, "object": obj, "repo": "acme/fleet", "path": "knowledge/reservations.md", "excerpt": "x"}
+
+    def _doc(self, findings):
+        clusters = [
+            {"name": "prod-us-east", "location": "us-east1", "project": "acme-prod"},
+            {"name": self.PROJECT, "location": "global", "project": "acme-prod", "checks_run": list(audit_report.audit_target_checks(self.COST, self.PROJECT))},
+        ]
+        return audit_report.validate_findings(make_doc(findings=findings, audit=self.COST, clusters=clusters), self.COST)
+
+    def test_every_object_shape_the_collector_emits_joins_and_a_fault_does_not(self):
+        # One finding per declarable shape the cost collector files: a node
+        # pool and a namespace with no namespace field (3.7 and 3.10 both carry
+        # none), a workload, a standby and a claim in their namespace (3.1,
+        # 3.13, 3.3), a located disk, address and registry repository on the
+        # project entry (3.4, 3.5, 3.14), and a fault beside them that no note
+        # may move (3.6).
+        pool = make_finding(fid="pool", severity="minor", check="idle-nodepool", namespace="", obj="NodePool/warm-batch")
+        namespace = make_finding(fid="ns", severity="minor", check="idle-namespace", namespace="", obj="Namespace/demo-q1")
+        workload = make_finding(fid="wl", severity="minor", check="overrequest", obj="Deployment/burst-ingest")
+        standby = make_finding(fid="standby", severity="minor", check="idle-workload", obj="StatefulSet/warm-standby")
+        claim = make_finding(fid="pvc", severity="minor", check="unconsumed-pvc", obj="PersistentVolumeClaim/data-old")
+        disk = make_finding(fid="disk", severity="minor", check="unattached-disk", cluster=self.PROJECT, namespace="", obj="Disk/us-east1-b:data-2024")
+        address = make_finding(fid="addr", severity="minor", check="idle-address", cluster=self.PROJECT, namespace="", obj="Address/us-east1:cutover-vip")
+        registry = make_finding(fid="reg", severity="minor", check="registry-no-cleanup", cluster=self.PROJECT, namespace="", obj="ArtifactRegistryRepository/us-east1:releases")
+        fault = make_finding(fid="lb", severity="major", check="orphan-lb", cluster=self.PROJECT, namespace="", obj="ForwardingRule/us-east1:a1b2c3")
+        doc = self._doc([pool, namespace, workload, standby, claim, disk, address, registry, fault])
+        declarations = [
+            self._declaration("idle-nodepool", "NodePool/warm-batch"),
+            self._declaration("idle-namespace", "Namespace/demo-q1"),
+            self._declaration("overrequest", "Deployment/burst-ingest", namespace="payments"),
+            self._declaration("idle-workload", "StatefulSet/warm-standby", namespace="payments"),
+            self._declaration("unconsumed-pvc", "PersistentVolumeClaim/data-old", namespace="payments"),
+            self._declaration("unattached-disk", "Disk/us-east1-b:data-2024"),
+            self._declaration("idle-address", "Address/us-east1:cutover-vip"),
+            self._declaration("registry-no-cleanup", "ArtifactRegistryRepository/us-east1:releases"),
+            self._declaration("orphan-lb", "ForwardingRule/us-east1:a1b2c3"),
+        ]
+        moved = audit_report.apply_declarations(doc, declarations)
+        self.assertEqual(
+            sorted(f["object"] for f in moved),
+            [
+                "Address/us-east1:cutover-vip",
+                "ArtifactRegistryRepository/us-east1:releases",
+                "Deployment/burst-ingest",
+                "Disk/us-east1-b:data-2024",
+                "Namespace/demo-q1",
+                "NodePool/warm-batch",
+                "PersistentVolumeClaim/data-old",
+                "StatefulSet/warm-standby",
+            ],
+        )
+        self.assertEqual([f["object"] for f in doc["findings"]], ["ForwardingRule/us-east1:a1b2c3"])
+        # What the join wrote is what the validator accepts from a worker.
+        audit_report.validate_findings(copy.deepcopy(doc), self.COST)
+        # The join compares the fields as written; an entry that reaches it
+        # with a namespace under 3.10 matches nothing. Neither side arrives
+        # that way: the validator empties the worker's finding and the parser
+        # empties the owner's item (the tests below).
+        again = self._doc([make_finding(fid="ns", severity="minor", check="idle-namespace", namespace="", obj="Namespace/demo-q1")])
+        self.assertEqual(audit_report.apply_declarations(again, [self._declaration("idle-namespace", "Namespace/demo-q1", namespace="demo-q1")]), [])
+
+    def test_the_parser_reads_an_unnamespaced_item_namespace_as_empty_and_skips_a_scope(self):
+        # An owner who writes `namespace: demo-q1` on an idle-namespace item,
+        # or any namespace on a disk, address or registry item, meant the
+        # object itself; filed as written the item would never join. The
+        # parser empties it with a NOTE, per check, so a 3.3 claim in the same
+        # note keeps its namespace; and an item naming a roll-up's scope is
+        # skipped with a WARNING here, where every item passes.
+        text = (
+            "---\ntype: decision\ntitle: kept\ndeclares:\n"
+            "  - check: idle-namespace\n    namespace: demo-q1\n    object: Namespace/demo-q1\n"
+            "  - check: idle-nodepool\n    namespace: kube-system\n    object: NodePool/warm-batch\n"
+            "  - check: unattached-disk\n    namespace: default\n    object: Disk/us-east1-b:data-2024\n"
+            "  - check: idle-address\n    namespace: default\n    object: Address/us-east1:cutover-vip\n"
+            "  - check: registry-no-cleanup\n    namespace: default\n    object: ArtifactRegistryRepository/us-east1:releases\n"
+            "  - check: unconsumed-pvc\n    namespace: payments\n    object: PersistentVolumeClaim/data-old\n"
+            "  - check: idle-address\n    namespace: ''\n    object: Project/acme-prod\n"
+            "  - check: overrequest\n    namespace: payments\n    object: Namespace/payments\n"
+            "---\nkept on purpose\n"
+        )
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            entries = audit_report.parse_declarations(text, repo="acme/fleet", path="knowledge/kept.md", declarable=audit_report.audit_declarable_checks(self.COST))
+        self.assertEqual([e["namespace"] for e in entries], ["", "", "", "", "", "payments"])
+        self.assertEqual(err.getvalue().count("read as empty"), 5)
+        self.assertEqual(err.getvalue().count("never a roll-up; skipped"), 2)
+        finding = make_finding(fid="ns", severity="minor", check="idle-namespace", namespace="demo-q1", obj="Namespace/demo-q1")
+        doc = self._doc([finding])
+        self.assertEqual([f["object"] for f in audit_report.apply_declarations(doc, entries)], ["Namespace/demo-q1"])
+
+    def test_the_validator_empties_the_namespace_of_a_3_7_or_3_10_finding_and_no_other(self):
+        # Every consumer after validation keys on the derived id, so the fold
+        # happens there: the worker's `namespace: demo-q1` and the collector's
+        # `""` are one identity, and a document listing the object as a finding
+        # and as declared under the two spellings is the duplicate the
+        # validator refuses. Per check: 3.9's pile is `Namespace/<ns>` with the
+        # namespace set, and keeps it.
+        finding = make_finding(fid="ns", severity="minor", check="idle-namespace", namespace="demo-q1", obj="Namespace/demo-q1")
+        pool = make_finding(fid="pool", severity="minor", check="idle-nodepool", namespace="kube-system", obj="NodePool/warm-batch")
+        disk = make_finding(fid="disk", severity="minor", check="unattached-disk", cluster=self.PROJECT, namespace="default", obj="Disk/us-east1-b:data-2024")
+        pile = make_finding(fid="pile", severity="minor", check="terminal-pods", namespace="ci", obj="Namespace/ci")
+        doc = self._doc([finding, pool, disk, pile])
+        self.assertEqual([f["namespace"] for f in doc["findings"]], ["", "", "", "ci"])
+        collector = {"check": "idle-namespace", "cluster": "prod-us-east", "namespace": "", "object": "Namespace/demo-q1"}
+        self.assertEqual(doc["findings"][0]["id"], audit_report._shorten_id(audit_report.derive_finding_id(collector)))
+        both = make_doc(findings=[make_finding(fid="ns", severity="minor", check="idle-namespace", namespace="demo-q1", obj="Namespace/demo-q1")], audit=self.COST)
+        both["declared"] = [make_declared(check="idle-namespace", cluster="prod-us-east", namespace="", obj="Namespace/demo-q1")]
+        with self.assertRaises(audit_report.ValidationError) as caught:
+            audit_report.validate_findings(copy.deepcopy(both), self.COST)
+        self.assertIn("listed as a finding and as declared", str(caught.exception))
+        # Compliance keeps its namespace: netpol-missing's id carries it by design.
+        kept = audit_report.validate_findings(make_doc(findings=[make_finding(check="netpol-missing", namespace="payments", obj="Namespace/payments")], audit=AUDIT), AUDIT)
+        self.assertEqual(kept["findings"][0]["namespace"], "payments")
+
+    def test_a_namespaced_3_10_finding_joins_and_the_manifest_route_does_not_declare_it_again(self):
+        # The worker wrote `namespace: demo-q1` on the finding; the collector's
+        # candidate and the note leave it empty. The finding still moves, and
+        # `declare_collector_candidates` sees the moved entry as the same
+        # object rather than declaring the candidate a second time.
+        finding = make_finding(fid="ns", severity="minor", check="idle-namespace", namespace="demo-q1", obj="Namespace/demo-q1")
+        doc = self._doc([finding])
+        declarations = [self._declaration("idle-namespace", "Namespace/demo-q1")]
+        moved = audit_report.apply_declarations(doc, declarations)
+        self.assertEqual([f["object"] for f in moved], ["Namespace/demo-q1"])
+        self.assertEqual(doc["findings"], [])
+        manifest = {"clusters": [{"name": "prod-us-east", "outcome": "collected", "candidates": [
+            {"check": "idle-namespace", "namespace": "", "object": "Namespace/demo-q1", "severity": "minor", "excerpt": "x"}
+        ]}]}
+        self.assertEqual(audit_report.declare_collector_candidates(doc, declarations, manifest), [])
+        self.assertEqual(len(doc["declared"]), 1)
+
+    def test_a_cost_declared_row_carries_the_measured_size_and_grade(self):
+        # A declaration names the object and not its size, so the Declared
+        # intent row says what the collector measured and how it graded it,
+        # MAJOR spelled out, on both routes: that is where a declared
+        # reservation that has grown shows while it stays declared.
+        small = make_finding(fid="small", severity="minor", check="idle-nodepool", namespace="", obj="NodePool/warm-batch", excerpt="2 nodes at <=4% non-DaemonSet allocation\nsecond line")
+        grown = make_finding(fid="grown", severity="major", check="idle-nodepool", namespace="", obj="NodePool/gpu-warm", excerpt="20 nodes (a2-highgpu-1g) at <=3% allocation")
+        doc = self._doc([small, grown])
+        declarations = [self._declaration("idle-nodepool", "NodePool/warm-batch"), self._declaration("idle-nodepool", "NodePool/gpu-warm")]
+        moved = audit_report.apply_declarations(doc, declarations)
+        self.assertEqual(len(moved), 2)
+        self.assertEqual(
+            [e["title"] for e in doc["declared"]],
+            [
+                "NodePool/warm-batch — idle-nodepool, minor: 2 nodes at <=4% non-DaemonSet allocation",
+                "NodePool/gpu-warm — idle-nodepool, MAJOR: 20 nodes (a2-highgpu-1g) at <=3% allocation",
+            ],
+        )
+        again = self._doc([])
+        manifest = {"clusters": [{"name": "prod-us-east", "outcome": "collected", "candidates": [
+            {"check": "idle-nodepool", "namespace": "", "object": "NodePool/gpu-warm", "severity": "major", "excerpt": "20 nodes (a2-highgpu-1g) at <=3% allocation"}
+        ]}]}
+        self.assertEqual(len(audit_report.declare_collector_candidates(again, declarations, manifest)), 1)
+        self.assertEqual(again["declared"][0]["title"], "NodePool/gpu-warm — idle-nodepool, MAJOR: 20 nodes (a2-highgpu-1g) at <=3% allocation")
+        # A row the worker moved itself carries the worker's title until the
+        # candidate it meets on the manifest route rewrites it the same way.
+        own = self._doc([])
+        own["declared"] = [make_declared(check="idle-nodepool", cluster="prod-us-east", namespace="", obj="NodePool/gpu-warm", title="warm pool, declared by hand")]
+        self.assertEqual(audit_report.declare_collector_candidates(own, declarations, manifest), [])
+        self.assertEqual(own["declared"][0]["title"], "NodePool/gpu-warm — idle-nodepool, MAJOR: 20 nodes (a2-highgpu-1g) at <=3% allocation")
+        # Another stream's row keeps the finding's own title.
+        other = audit_report.validate_findings(make_doc(findings=[make_finding(check="netpol-missing", title="Namespace has no NetworkPolicy", obj="Namespace/payments")], audit=AUDIT), AUDIT)
+        audit_report.apply_declarations(other, [{"check": "netpol-missing", "namespace": "payments", "object": "Namespace/payments", "repo": "acme/fleet", "path": "knowledge/p.md", "excerpt": "x"}])
+        self.assertEqual(other["declared"][0]["title"], "Namespace has no NetworkPolicy")
+
+    def test_a_roll_up_scope_is_not_declarable_on_any_route(self):
+        # §3a: a roll-up names a scope, not an object. The 3.5 ten-address
+        # roll-up is `Project/<id>` on the project entry; §5's collapse gives a
+        # check one `Cluster/<name>` or `Namespace/<name>`. A note naming any
+        # of them matches the key exactly and would move every member at once,
+        # so the join, the manifest route and the validator all refuse it.
+        addresses = make_finding(fid="addrs", severity="major", check="idle-address", cluster=self.PROJECT, namespace="", obj="Project/acme-prod")
+        claims = make_finding(fid="claims", severity="major", check="unconsumed-pvc", namespace="", obj="Cluster/prod-us-east")
+        requests = make_finding(fid="reqs", severity="major", check="overrequest", obj="Namespace/payments")
+        # The same scopes under kubectl's short names and the GCP resource
+        # spelling: a denylist of three kinds admits them, the allowlist of
+        # what each check names does not.
+        short = make_finding(fid="short", severity="major", check="overrequest", obj="ns/payments")
+        plural = make_finding(fid="plural", severity="major", check="idle-address", cluster=self.PROJECT, namespace="", obj="projects/acme-prod")
+        # 3.1 names whatever controller owns the pod, so a pod-owning custom
+        # resource is an object it files and a declaration for it joins — a
+        # CloudNativePG `Cluster/pg-main` in its namespace included; the same
+        # kind with no namespace is a §5 collapse and is refused.
+        crd = make_finding(fid="crd", severity="minor", check="overrequest", obj="StrimziPodSet/kafka")
+        pg = make_finding(fid="pg", severity="minor", check="overrequest", namespace="db", obj="Cluster/pg-main")
+        collapse = make_finding(fid="collapse", severity="major", check="overrequest", namespace="", obj="Cluster/prod-us-east")
+        doc = self._doc([addresses, claims, requests, short, plural, crd, pg, collapse])
+        declarations = [
+            self._declaration("idle-address", "Project/acme-prod"),
+            self._declaration("unconsumed-pvc", "Cluster/prod-us-east"),
+            self._declaration("overrequest", "Namespace/payments", namespace="payments"),
+            self._declaration("overrequest", "ns/payments", namespace="payments"),
+            self._declaration("idle-address", "projects/acme-prod"),
+            self._declaration("overrequest", "StrimziPodSet/kafka", namespace="payments"),
+            self._declaration("overrequest", "Cluster/pg-main", namespace="db"),
+            self._declaration("overrequest", "Cluster/prod-us-east"),
+        ]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual([f["object"] for f in audit_report.apply_declarations(doc, declarations)], ["StrimziPodSet/kafka", "Cluster/pg-main"])
+        self.assertEqual(len(doc["findings"]), 6)
+        self.assertEqual(err.getvalue().count("DECLARATION NOT APPLIED"), 6)
+        self.assertIn("roll-up", err.getvalue())
+        scoped, fleet_wide = audit_report._declaration_lookup(declarations)
+        for finding in (addresses, claims, requests, short, plural, collapse):
+            with self.subTest(finding["object"]):
+                self.assertIsNone(audit_report._declaration_covers(finding, scoped, fleet_wide, audit_report.audit_declarable_checks(self.COST)))
+        # A 3.10 namespace is the object itself and still joins.
+        namespace = make_finding(fid="ns", severity="minor", check="idle-namespace", namespace="", obj="Namespace/demo-q1")
+        self.assertIsNotNone(audit_report._declaration_covers(namespace, *audit_report._declaration_lookup([self._declaration("idle-namespace", "Namespace/demo-q1")]), audit_report.audit_declarable_checks(self.COST)))
+        for check, obj, namespace_field in (("idle-address", "Project/acme-prod", ""), ("unconsumed-pvc", "Cluster/prod-us-east", ""), ("overrequest", "Namespace/payments", "payments"), ("overrequest", "ns/payments", "payments"), ("idle-address", "projects/acme-prod", ""), ("overrequest", "Cluster/prod-us-east", "")):
+            with self.subTest(obj):
+                written = self._doc([])
+                written["declared"] = [make_declared(check=check, cluster=self.PROJECT if check == "idle-address" else "prod-us-east", namespace=namespace_field, obj=obj)]
+                with self.assertRaises(audit_report.ValidationError) as caught:
+                    audit_report.validate_findings(copy.deepcopy(written), self.COST)
+                self.assertIn("declared[0].object", str(caught.exception))
+                self.assertIn("never a roll-up", str(caught.exception))
 
 
 class TestDeclaredIntentSearch(HarnessTestCase):

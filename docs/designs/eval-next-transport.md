@@ -599,7 +599,11 @@ what the sidecar carries), waits for the agent Deployment to roll once more and 
 provisioning Job's re-run (the sidecar's `BRIDGE_CONCURRENCY` is an input to the `TASKS`
 budget, so the patch re-renders the Job; the mode patch carried the `maxSessions` that makes
 that run fit, and a refusal now fails the deploy on the CR's `Degraded` phase rather than
-being read past), and ends on the
+being read past; the one `Degraded` it waits out, for up to five minutes, is a pod waiting
+for CPU or memory while Autopilot adds a node, in practice the rolled agent pod, #2414; when
+the pod is the agent's, it reads that pod as it waits (or, once that pod is gone or finished, the agent's live pods) and
+hands off to the agent Deployment's rollout gate once the pod is bound to a node, because the operator watches no Pods and the CR keeps the scheduler's
+message until its next pass), and ends on the
 bridge's own log line that it is consuming `platform` tasks, because a flip without a consuming
 bridge leaves a bus on which nobody answers. It reports the A2A gateway's state and last log
 lines and does not gate on it: the door gives the gateway the backend it lacked, so it now
