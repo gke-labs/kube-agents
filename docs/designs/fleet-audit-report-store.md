@@ -185,7 +185,7 @@ empty:
 - The body is rewritten. Freezing it until a run could read its memory would freeze it for good,
   since only a run that writes the body restores the store. Ids held on the lost body are no longer
   carried; with a manifest their pull requests stay protected by the still-flagged set.
-- A clean run never closes. It files a lost-memory coverage gap, stays open, and reports partial:
+- A clean run never closes the ledger and retires no pull request, the compliance shield's close (a fix a declaration forbids) aside. It files a lost-memory coverage gap, stays open, and reports partial:
   the collector's gap while it still flags something the document does not carry, and otherwise the
   gap saying nothing shows whether the ledger's findings were fixed. A manifest covers only the
   collector's checks, and without one there is nothing, while an empty document would close the

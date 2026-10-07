@@ -767,12 +767,16 @@ agent container mounts no service-account token, the operator grants the agent
 identity no write on anything a watcher could use (the site's
 [security reference](../site/src/content/docs/reference/security-and-iam.md) is
 the canonical account of what it does grant), the credential proxy refuses
-every write verb before RBAC is consulted, and the operator reads nothing the
-pod writes, so a condition or an Event needs a new pod-to-operator path and a
-new grant first. The operator binds no metrics endpoint in the shipped deploy;
-the ones the agent's pods expose are the event watcher's and the credential
-broker's, scraped through the chart's `PodMonitoring`s beside LiteLLM's and
-Hindsight's, and neither carries anything about a report. Those are the next step, with this
+every write verb before RBAC is consulted, and the operator read nothing the
+pod wrote when this was designed, so a condition or an Event needed a new
+pod-to-operator path and a new grant first. One such path exists now: the
+operator reads the event watcher's and the credential broker's metrics
+listeners for the usage counters ([design](usage-counters-producer.md)), and it
+carries integer totals and nothing about a report, so the grant is still the
+missing piece. The operator binds no metrics endpoint of its own in the shipped
+deploy; the ones the agent's pods expose are the event watcher's and the
+credential broker's, scraped through the chart's `PodMonitoring`s beside
+LiteLLM's and Hindsight's, and neither carries anything about a report. Those are the next step, with this
 section as the record of why the first step took the channels it did.
 
 ## Related

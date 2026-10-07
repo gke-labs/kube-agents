@@ -6,6 +6,10 @@ deploy/docker/check_skill_commands.py, so a sync that brings in a command Tirith
 refuses, or changes any line of a block listed in its KNOWN_FINDINGS, comments
 included, fails that build until the list is updated. So does a shell block whose Markdown does not parse as one; that
 fix goes in SKILL_SUBSTITUTIONS below.
+
+docs/designs/upstream-skill-overlays.md is the design, not yet implemented, for
+replacing the string registries below with a pinned upstream copy and a patch
+overlay per skill.
 """
 
 import os

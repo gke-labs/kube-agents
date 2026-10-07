@@ -549,6 +549,48 @@ class BlocksAnswerTest(unittest.TestCase):
         self.assertIn("value", blocks[2]["elements"][0])
 
 
+class PrimaryLinkTest(unittest.TestCase):
+    def test_only_the_first_link_is_primary_and_only_when_asked(self):
+        links = [("Open PR ↗", "https://github.com/a/b/pull/1"), ("Files changed ↗", "https://github.com/a/b/pull/1/files")]
+        styled = [e.get("style") for e in sp.blocks_answer("h", links=links, primary_link=True)[1]["elements"]]
+        self.assertEqual(styled, ["primary", None])
+        plain = sp.blocks_answer("h", links=links, choices=["yes"])
+        self.assertNotIn("style", str(plain))
+
+
+BAR_HEAD = {"type": "section", "text": {"type": "mrkdwn", "text": "*h*"}}
+BAR_REST = [{"type": "context", "elements": []}, {"type": "actions", "elements": []}]
+
+
+class SideBarTest(unittest.TestCase):
+    def test_all_but_the_headline_go_beside_the_bar(self):
+        self.assertEqual(
+            sp.with_side_bar([BAR_HEAD, *BAR_REST], sp.SIDE_BAR_GREEN, "h"),
+            {"blocks": [BAR_HEAD], "attachments": [{"color": "#2EB67D", "fallback": "h", "blocks": BAR_REST}]},
+        )
+
+    def test_nothing_to_bar_sends_an_empty_attachment_list(self):
+        # chat.update keeps a message's attachments unless it is sent some.
+        self.assertEqual(sp.with_side_bar([BAR_HEAD], sp.SIDE_BAR_YELLOW, "h"), {"blocks": [BAR_HEAD], "attachments": []})
+        self.assertEqual(sp.with_side_bar([], sp.SIDE_BAR_YELLOW, ""), {"blocks": [], "attachments": []})
+
+    def test_message_blocks_reads_its_own_then_its_side_bars(self):
+        unfurl = {"blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "preview"}}]}
+        message = {"blocks": [BAR_HEAD], "attachments": ["junk", unfurl, {"color": "ECB22E", "blocks": BAR_REST}]}
+        self.assertEqual(sp.message_blocks(message), [BAR_HEAD, *BAR_REST])
+        self.assertEqual(sp.message_blocks({"blocks": [BAR_HEAD]}), [BAR_HEAD])
+        self.assertEqual(sp.message_blocks(None), [])
+
+    def test_side_bar_color_restores_the_hash_slack_drops(self):
+        self.assertEqual(sp.side_bar_color({"attachments": [{"color": "ECB22E", "blocks": BAR_REST}]}), "#ECB22E")
+        self.assertEqual(sp.side_bar_color({"attachments": [{"color": "#2EB67D", "blocks": BAR_REST}]}), "#2EB67D")
+
+    def test_no_side_bar_without_an_attachment_holding_blocks(self):
+        # A link unfurl is an attachment with no blocks; it is not a bar.
+        for message in ({}, {"attachments": [{"color": "ECB22E"}]}, {"attachments": [{"blocks": BAR_REST}]}, None):
+            self.assertIsNone(sp.side_bar_color(message), message)
+
+
 class FallbackTextTest(unittest.TestCase):
     def test_same_layout_as_mrkdwn(self):
         text = sp.fallback_text(

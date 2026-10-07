@@ -91,7 +91,7 @@ class MultiPageBlockTest(unittest.TestCase):
                     encoding="utf-8",
                 )
             targets = generate_docs.collect_targets(
-                blocks={"example": (tuple(pages), generator)}, files={}
+                blocks={"example": (tuple(pages), generator)}
             )
         self.assertEqual(len(calls), 1, "the generator ran once per block, not per page")
         self.assertEqual([path for path, _, _, _ in targets], pages)
@@ -125,7 +125,6 @@ class MultiPageBlockTest(unittest.TestCase):
                     "first": ((page,), lambda: "NEW FIRST"),
                     "second": ((page,), lambda: "NEW SECOND"),
                 },
-                files={},
             )
         self.assertEqual([block for _, _, _, block in targets], ["first", "second"])
         self.assertTrue(all(changed for _, _, changed, _ in targets))
@@ -160,7 +159,6 @@ class MultiPageBlockTest(unittest.TestCase):
                     "first": ((page,), lambda: "SAME"),
                     "second": ((page,), lambda: "NEW SECOND"),
                 },
-                files={},
             )
         self.assertEqual(
             [(block, changed) for _, _, changed, block in targets],

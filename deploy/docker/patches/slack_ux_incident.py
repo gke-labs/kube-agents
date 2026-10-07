@@ -25,12 +25,17 @@ only: a session already open on it fetches at most the newer replies, which
 skips the edited alert, and a typed ``apply`` there finds the report through
 the ``incidents`` row below.
 
-A button's text is ``apply Option B: <title>`` (``apply: <title>`` for the
-single-fix shape), so a click, which ``slack_ux_clicks`` sends as the
-clicker's message in the thread, is the same reply the report's call to
-action asks for. Typing ``apply`` still works: the ``incidents`` row the
-notifier stores after the send is keyed to the same thread, and the report
-text is untouched, only laid out.
+A button's text is the option's title, with `` (recommended)`` after the
+recommended one's (the single-fix shape has none); its value is the reply the
+report's call to action asks for, ``apply Option B: <title>`` (``apply:
+<title>`` for the single-fix shape), and that is what ``slack_ux_clicks``
+sends as the clicker's message in the thread. Typing ``apply`` still works:
+the ``incidents`` row the notifier stores after the send is keyed to the same
+thread, and the report text is untouched, only laid out.
+
+The event watcher's crashloop alert, posted to a Slack thread with the flag
+on, also records the thread's session title on its routing row, read back by
+:func:`alert_title`; any other alert records none.
 
 Only the first report in a thread takes the alert. ``POST /v1/incidents``
 keeps the first report per thread, and a second one edited over it would
@@ -90,8 +95,14 @@ ALERT_SESSION_LIKE = "k8s-evt-%"
 ACTION_PREFIX = "kage_incident"
 FOLD_TITLE_OPTIONS = "why · what each option does"
 FOLD_TITLE_SINGLE = "why · what the fix does"
-OPTION_LABEL = "apply Option {letter}: {title}"
-SINGLE_LABEL = "apply: {title}"
+OPTION_LABEL = "{title}"
+SINGLE_LABEL = "{title}"
+RECOMMENDED_SUFFIX = " (recommended)"
+#: What a click sends, and what the fallback text offers to type.
+OPTION_REPLY = "apply Option {letter}: {title}"
+SINGLE_REPLY = "apply: {title}"
+#: Where ``session_kv_server._record_alert_title`` puts the thread's session title.
+ALERT_TITLE_KEY = "title"
 LINK_LABEL = "{label} ↗"
 PRIMARY = "primary"
 #: A report longer than this keeps the threaded reply; triage reports are a
@@ -181,10 +192,24 @@ def _unfenced(text: str) -> list[str]:
     return out
 
 
+def _option_choice(letter: str, title: str, recommended: bool) -> tuple[str, str, bool]:
+    """A lettered option's ``(label, reply, recommended)``; the title is clipped before the suffix, so it shows.
+
+    A title's own trailing suffix is dropped: a click strips the suffix from any
+    incident label, and could not tell that one from the one added here.
+    """
+    while title.endswith(RECOMMENDED_SUFFIX):
+        title = title.removesuffix(RECOMMENDED_SUFFIX)
+    label = OPTION_LABEL.format(title=title)
+    if recommended:
+        label = _presenter._clip(label, _presenter.BUTTON_TEXT_MAX - len(RECOMMENDED_SUFFIX)) + RECOMMENDED_SUFFIX
+    return label, OPTION_REPLY.format(letter=letter, title=title), recommended
+
+
 def parse_triage(report: str) -> dict | None:
     """The headline, choices and links of a triage report, or None if it has no option.
 
-    ``choices`` are ``(label, recommended)`` pairs in the report's order.
+    ``choices`` are ``(label, reply, recommended)`` triples in the report's order.
     """
     sections = _sections(report)
     starts = [i for i, (heading, _body) in enumerate(sections) if WHAT_TO_DO.search(heading)]
@@ -196,7 +221,7 @@ def parse_triage(report: str) -> dict | None:
     rest = "\n".join(body for _heading, body in sections[starts[0]:]) if starts else ""
     lines = _unfenced(rest)
     what_to_do = "\n".join(lines)
-    choices: list[tuple[str, bool]] = []
+    options: list[tuple[str, str]] = []
     recommended = RECOMMENDED.search(what_to_do)
     seen = set()
     for line in lines:
@@ -204,8 +229,9 @@ def parse_triage(report: str) -> dict | None:
         if option and option.group(1) not in seen:
             letter = option.group(1)
             seen.add(letter)
-            label = OPTION_LABEL.format(letter=letter, title=_presenter._plain(option.group(2)))
-            choices.append((label, bool(recommended) and recommended.group(1) == letter))
+            options.append((letter, _presenter._plain(option.group(2))))
+    choices = [_option_choice(letter, title, bool(recommended) and recommended.group(1) == letter)
+               for letter, title in options]
     # Fenced lines and headings count here: neither may hide an option from the guard.
     named = "\n".join(f"{heading}\n{body}" for heading, body in sections[starts[0]:]) if starts else ""
     if not set(OPTION_NAMED.findall(named)) <= seen:
@@ -218,7 +244,8 @@ def parse_triage(report: str) -> dict | None:
         # One button stands for one fix; a second fix named anywhere would be left out.
         fixes = [m for m in map(PROPOSED_FIX_LINE.match, lines) if m]
         if len(fixes) == 1 and len(PROPOSED_FIX_NAMED.findall(named)) == 1:
-            choices.append((SINGLE_LABEL.format(title=_presenter._plain(fixes[0].group(1))), True))
+            title = _presenter._plain(fixes[0].group(1))
+            choices.append((SINGLE_LABEL.format(title=title), SINGLE_REPLY.format(title=title), True))
     if not choices:
         return None
     headline, _body = _presenter.split_answer(_section(sections, WHATS_WRONG))
@@ -306,8 +333,8 @@ def render_fold(report: str, mrkdwn_fn: Any = None) -> list[dict] | None:
 def blocks_triage(triage: dict, fold_blocks: list[dict]) -> list[dict]:
     """Headline, option and link buttons, and ``fold_blocks`` folded, as Block Kit."""
     buttons = []
-    for i, (label, recommended) in enumerate(triage["choices"]):
-        button = _presenter._button(label, f"{ACTION_PREFIX}.{_presenter.CHOICE_ACTION}.{i}", value=label)
+    for i, (label, reply, recommended) in enumerate(triage["choices"]):
+        button = _presenter._button(label, f"{ACTION_PREFIX}.{_presenter.CHOICE_ACTION}.{i}", value=reply)
         if recommended:
             button["style"] = PRIMARY
         buttons.append(button)
@@ -330,9 +357,9 @@ def blocks_triage(triage: dict, fold_blocks: list[dict]) -> list[dict]:
 
 
 def fallback_text(triage: dict) -> str:
-    """The headline, the links and the choices, as mrkdwn; :func:`message_text` starts with it."""
+    """The headline, the links and the replies, as mrkdwn; :func:`message_text` starts with it."""
     return _presenter.fallback_text(
-        triage["headline"], links=triage["links"], choices=[label for label, _ in triage["choices"]]
+        triage["headline"], links=triage["links"], choices=[reply for _label, reply, _rec in triage["choices"]]
     )
 
 
@@ -345,21 +372,14 @@ def _db_path() -> str:
     return os.environ.get(DB_PATH_ENV) or DEFAULT_DB_PATH
 
 
-def is_open_alert(chat_id: str, thread_id: str, db_path: str | None = None) -> bool:
-    """Whether ``thread_id`` is an event alert on Slack that no stored report owns yet."""
-    db_path = db_path or _db_path()
-    if not os.path.exists(db_path):
-        return False
-    with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=DB_TIMEOUT_SECONDS)) as conn:
-        if conn.execute(
-            "SELECT 1 FROM incidents WHERE chat_id = ? AND thread_id = ?", (chat_id, thread_id)
-        ).fetchone():
-            return False
-        # The LIKE on metadata narrows the scan; the JSON check below decides.
-        rows = conn.execute(
-            "SELECT metadata FROM session_metadata WHERE session_id LIKE ? AND metadata LIKE '%' || ? || '%'",
-            (ALERT_SESSION_LIKE, thread_id),
-        ).fetchall()
+def _alert_metas(conn: sqlite3.Connection, chat_id: str, thread_id: str) -> list[dict]:
+    """The routing metadata of every event alert on Slack posted as ``thread_id`` in ``chat_id``."""
+    # The LIKE on metadata narrows the scan; the JSON check below decides.
+    rows = conn.execute(
+        "SELECT metadata FROM session_metadata WHERE session_id LIKE ? AND metadata LIKE '%' || ? || '%'",
+        (ALERT_SESSION_LIKE, thread_id),
+    ).fetchall()
+    metas = []
     for (blob,) in rows:
         try:
             meta = json.loads(blob or "")
@@ -371,8 +391,35 @@ def is_open_alert(chat_id: str, thread_id: str, db_path: str | None = None) -> b
             and str(meta.get("thread_id") or "") == thread_id
             and str(meta.get("chat_id") or "") == chat_id
         ):
-            return True
-    return False
+            metas.append(meta)
+    return metas
+
+
+def _read_only(db_path: str) -> sqlite3.Connection:
+    return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=DB_TIMEOUT_SECONDS)
+
+
+def is_open_alert(chat_id: str, thread_id: str, db_path: str | None = None) -> bool:
+    """Whether ``thread_id`` is an event alert on Slack that no stored report owns yet."""
+    db_path = db_path or _db_path()
+    if not os.path.exists(db_path):
+        return False
+    with closing(_read_only(db_path)) as conn:
+        if conn.execute(
+            "SELECT 1 FROM incidents WHERE chat_id = ? AND thread_id = ?", (chat_id, thread_id)
+        ).fetchone():
+            return False
+        return bool(_alert_metas(conn, chat_id, thread_id))
+
+
+def alert_title(chat_id: str, thread_id: str, db_path: str | None = None) -> str:
+    """The session title the event watcher recorded for the alert posted as ``thread_id``, else ""."""
+    db_path = db_path or _db_path()
+    if not os.path.exists(db_path):
+        return ""
+    with closing(_read_only(db_path)) as conn:
+        metas = _alert_metas(conn, chat_id, thread_id)
+    return next((str(meta[ALERT_TITLE_KEY]) for meta in metas if meta.get(ALERT_TITLE_KEY)), "")
 
 
 class _AlertEditor:

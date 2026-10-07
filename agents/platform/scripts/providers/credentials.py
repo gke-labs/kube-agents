@@ -274,6 +274,11 @@ class StaticFileCredential:
         try:
             with open(self._token_path, encoding="utf-8") as handle:
                 token = handle.read().strip()
+        except UnicodeDecodeError:
+            # Bytes that are not text at all -- a UTF-16 export from Windows
+            # tooling -- are no more a token than a second line is, and get
+            # the same refusal below rather than escaping as a bare 500.
+            token = ""
         except OSError as exc:
             raise WorkspaceError(
                 f"the forge credential for {self._host} could not be read: {type(exc).__name__}",

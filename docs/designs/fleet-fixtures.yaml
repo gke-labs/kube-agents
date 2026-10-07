@@ -97,6 +97,20 @@ fixtures:
       so the compliance audit must keep the sibling's fix off the shared
       ServiceAccount the declared workload's token comes from.
 
+  - role: declared-overrequest-workload
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/burst-ingest
+    namespace: seeded-headroom
+    defect: >-
+      Two pause replicas requesting 10m / 128Mi each and using almost none of
+      the memory, behind a budget and a default-deny policy: the waste audit's
+      overrequest posture, which the same knowledge/ note declares on
+      purpose. The one declarable cost check with no multi-day age gate, so
+      the posture is observable on apply day; its case still needs a ledger,
+      which the idle pool supplies from day 7.
+
   - role: stalled-controller
     slot: a
     available_from_day: 0

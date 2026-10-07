@@ -209,10 +209,20 @@ Three KV buckets ride the same JetStream deployment:
   is a statement about grants, not a property the subject list enforces. The residue's
   closes are the residue paragraph's: the callout, or a separate account with an
   export/import.
-- A bucket reserved for capability entries per the capability envelope design
+- `cap` - capability entries per the capability envelope design
   (`docs/architecture/09-capability-envelope.md`), which landed on KV-backed
-  capabilities. Reserved so the account layout allows for it; it arms with the
-  authority work.
+  capabilities. **Armed 9/9**, and the one bucket here whose grant story is a read
+  _denial_ rather than a writer narrowing: the gateway may publish under
+  `$KV.cap.root.*` and may not read the bucket by any route, no broker may read it at
+  all, and the capability verifier is the only principal holding read on an entry. The carve-out
+  is `$JS.API.STREAM.CREATE.KV_cap` and `$JS.API.STREAM.INFO.KV_cap`, held by the
+  callout-authenticated `provision` principal the rendered Job runs as and by the static `seed`
+  identity the hand-applied tooling still uses - the `kv info cap || kv add cap` guard needs both
+  verbs, and neither returns an entry. That asymmetry is
+  the point - the minter must not be able to see what anyone else minted - and because
+  it is a denial it has to be enumerated over every principal on the bus rather than
+  asserted of one. 09 §3 owns the entry shape; the permissions are asserted in
+  `a2a/authcallout` against the config the operator renders.
 
 ## Accounts and connection-time authorization
 
@@ -246,10 +256,10 @@ verification against the API server's `openid/v1/jwks` endpoint as the offline
 alternative.
 
 Status (amended 9/4, the callout armed; amended 9/8, sessions moved; amended 9/15,
-`worker` retired): the render now carries the `auth_callout` block, and a principal
-authenticates one of two ways. **Through the callout**, by presenting a projected
-ServiceAccount token: the bus provisioning Job, every spawned session pod, and the
-platform agent container. **Statically**, from `nats.conf` and listed in `auth_users`:
+`worker` retired; amended 9/9, the verifier added): the render now carries the
+`auth_callout` block, and a principal authenticates one of two ways. **Through the
+callout**, by presenting a projected ServiceAccount token: the bus provisioning Job,
+every spawned session pod, the platform agent container, and the capability verifier. **Statically**, from `nats.conf` and listed in `auth_users`:
 the callout itself, which cannot authenticate through the thing it is; the chatops
 gateway, purely as sequencing, since it has a ServiceAccount and its client program
 lands separately from this render; `web` and `console`, because a browser never can;
@@ -311,7 +321,9 @@ Layout:
   a pull-only principal may hold no task-subject subscribe at all, which is what the
   session grants do. The addressee token in the task subjects (payload spec
   0.4) is what makes these grants expressible - executor-granularity at connect time,
-  with per-task scoping the parked tightening under the authority work. **Amended
+  with per-task scoping still the parked tightening (9/9): the authority work landed
+  the capability envelope, which scopes the task's AUTHORITY per task without narrowing
+  the subject grants, and narrowing those remains separate and unstarted. **Amended
   10/1:** "deny by default" holds per side, and only while that side has entries in
   it. An empty allow list is nats-server's spelling of _unrestricted_, not of
   _nothing_ (`buildPermissionsFromJwt` builds a side's permission object only when
@@ -503,11 +515,14 @@ Layout:
   Amended 8/31: the pod network is fenced too. The operator renders an ingress
   NetworkPolicy on the NATS pod granting **4222 to exactly the enumerated bus clients**
   (the auth callout, the agent pod - whose sidecars, the Hermes bridge included, share
-  its labels - the A2A gateway, session pods by the spawner's labels, the provision Job,
-  and the hand-applied seed Job), and **no pod-network peer for 8222 or 9222**. The demo's
+  its labels - the A2A gateway, the capability verifier, session pods by the spawner's
+  labels, the provision Job,
+  and the hand-applied seed Job), and ~~**no pod-network peer for 8222 or 9222**~~ **no
+  pod-network peer for 8222, and one for 9222: the console server (amended 9/24,
+  below)**. The demo's
   `kubectl port-forward` and the kubelet's readiness probe both enter from the node,
   which NetworkPolicy does not govern, so the ws surface stays reachable through
-  kubectl and through nothing else in-cluster. The enumeration is today's client
+  kubectl and, in-cluster, through the console server alone. The enumeration is today's client
   list, and it must grow with the components this spec designs. The auth callout was
   the first, and it landed in the same change that armed the callout rather than after
   it, for the reason that makes this rule worth having: the callout is itself a bus
@@ -547,6 +562,22 @@ Layout:
   upgrade. Same posture as `web` and stated in the same places: static, published to a
   browser by design, port-forward only.
 
+  **Amended 9/24:** the page is served by an operator-rendered console server
+  (`<agent>-a2a-console`), which answers the browser on its own port, hands the page the
+  `console` password from the creds Secret, and proxies the page's websocket to 9222. It is
+  the one pod-network peer the NATS fence admits on 9222, by label, and its own pod carries
+  a deny-all ingress policy, so it too is reachable only through `kubectl port-forward`.
+  The origin allow-list moves to `http://localhost:8080` and `http://127.0.0.1:8080`, the
+  console server's forwarded address, and the proxy passes the browser's `Origin` through,
+  so the check still sees the page. `same_origin` would still never match, because the bus
+  sees the proxy's `Host`, not the browser's. The server answers only a `Host` naming that
+  forwarded address, so a forward to any other local port gets a refusal naming the right
+  one. The `web` user keeps the same posture it had: a 9222 port-forward and a page that
+  brings its own password. The access gate moves with the credential: before this, reading
+  the `console` password needed `get` on the creds Secret, and now `pods/portforward` to
+  the console pod is enough, because `/config.json` hands the password to the page, and to
+  any other process running locally while the forward is open.
+
 - **Bucket access is subject access.** KV and the Object Store ride internal subjects -
   `$KV.{bucket}.>`, `$O.{bucket}.C.>` / `$O.{bucket}.M.>`, plus the `$JS.API` surface for
   their streams - and the deny-by-default map grants them explicitly per role: the
@@ -572,7 +603,10 @@ callout-authenticated principal, keyed by the ServiceAccount as TokenReview spel
 (`system:serviceaccount:<namespace>:<name>`), rendered into ConfigMap
 `<agent>-a2a-authmap` under key `identities.json`. **Amended 9/8:** that is now two
 entries - the provisioning Job and the session principal. **Amended 9/15:** three, the
-platform agent container having joined them when `worker` was retired; its entry is
+platform agent container having joined them when `worker` was retired. **Amended 9/9:**
+four, the capability verifier having joined them; it is callout-authenticated for the
+same reason the others are, and keying the only read grant on the capability store to a
+ServiceAccount rather than to a password is the point. The agent container's entry is
 keyed on the agent's own ServiceAccount and carries the blackboard grants and nothing
 else. The bridge sidecar is **not** among them and cannot be, for the ServiceAccount
 reason in the status section above: it would key to the agent's entry. Nor is the

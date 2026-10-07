@@ -173,9 +173,10 @@ async def _drive(module, db_path: str, expected_fold: list[dict]) -> None:
         update = adapter.log[0][1]
         buttons = [e for b in update["blocks"] if b.get("type") == "actions" for e in b["elements"]]
         labels = [b["text"]["text"] for b in buttons]
+        values = [b.get("value") for b in buttons[:2]]
         if update["ts"] != ALERT_TS or labels[:2] != [
-            "apply Option A: Roll back to 14:02", "apply Option B: Restore the secret",
-        ]:
+            "Roll back to 14:02", "Restore the secret (recommended)",
+        ] or values != ["apply Option A: Roll back to 14:02", "apply Option B: Restore the secret"]:
             raise _fail(f"the alert edit was {update!r}")
         if buttons[1].get("style") != "primary" or "style" in buttons[0]:
             raise _fail("the recommended option is not the primary button")

@@ -122,7 +122,7 @@ Delegation on the inject path is a seam, not a feature: the kanban poll behind t
 
 ## The gate
 
-devops-bench scores a run; it does not decide whether a pull request may merge. That decision is `bench-gate`, and `hack/ci-eval-pr.sh` is what drives it (when step 0, `hack/ci-revalidate.sh`, has not already reused the pull request's prior green verdict): the shell runs each task `EVAL_REPETITIONS` times (default 3) and hands the resulting run **directories** to the scorer, which reads `results.json` for the scores, `manifest.json` for `setupId`, and `rows.json` for `scoringVersion`.
+devops-bench scores a run; it does not decide whether a pull request may merge. That decision is `bench-gate`, and `hack/ci-eval-pr.sh` is what drives it (when step 0, `hack/ci-revalidate.sh`, has not already reused a verdict the pull request holds: its own prior green, or an admin `/override` at this head): the shell runs each task `EVAL_REPETITIONS` times (default 3) and hands the resulting run **directories** to the scorer, which reads `results.json` for the scores, `manifest.json` for `setupId`, and `rows.json` for `scoringVersion`.
 
 ```bash
 uv run bench-gate case --task ./tasks/<id>/task.yaml \

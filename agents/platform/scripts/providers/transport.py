@@ -31,6 +31,7 @@ from __future__ import annotations
 import http.client
 import json
 import re
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -287,6 +288,39 @@ class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+#: How much of the request's time earlier calls must have spent before a cut is
+#: reported as the request's deadline rather than as the forge being slow.
+_REQUEST_SPENT_SECONDS = 1.0
+
+
+def _unreachable(exc: BaseException) -> str:
+    """Why the forge could not be reached, in words an operator can act on.
+
+    `URLError` carries the reason -- a refused connection, an unknown name, a
+    certificate -- and the type alone says none of it. A certificate that fails
+    verification is named outright, with the verifier's own reason: no retry
+    fixes it, and "unable to get local issuer" (a private CA), "Hostname
+    mismatch" and "certificate has expired" each send the operator somewhere
+    different.
+    """
+    cause = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if isinstance(cause, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(cause):
+        why = (getattr(cause, "verify_message", "") or str(cause)).strip()[:200]
+        return f"the forge's TLS certificate failed verification by this image: {why}"
+    reason = str(cause).strip()[:200]
+    if reason:
+        return f"the forge could not be reached: {type(exc).__name__}: {reason}"
+    return f"the forge could not be reached: {type(exc).__name__}"
+
+
+def _broken_answer(exc: BaseException) -> str:
+    """An answer the forge started and broke off, in words that say it answered."""
+    reason = str(exc).strip()[:200]
+    if reason:
+        return f"the forge's answer could not be read: {type(exc).__name__}: {reason}"
+    return f"the forge's answer could not be read: {type(exc).__name__}"
+
+
 def _settimeout(response: Any, seconds: float) -> None:
     """Shorten the socket timeout under a response to `seconds`, if it has one.
 
@@ -371,6 +405,7 @@ class HttpTransport:
         max_bytes: int,
         whoami_route: tuple[str, str] | None = None,
         opener: Callable[..., Any] | None = None,
+        outer_deadline: Callable[[], float | None] | None = None,
     ) -> None:
         if not base_url.startswith("https://"):
             raise ValueError("a forge API is reached over https only")
@@ -380,6 +415,7 @@ class HttpTransport:
         self._timeout = timeout
         self._max_bytes = max_bytes
         self._whoami_route = whoami_route
+        self._outer_deadline = outer_deadline
         self._open = opener or urllib.request.build_opener(_RefuseRedirect).open
 
     def api(
@@ -414,21 +450,66 @@ class HttpTransport:
         # would never trip it while holding one of the broker's request slots;
         # the deadline is the wall-clock bound the CLI runner gets from its
         # executor.
-        deadline = time.monotonic() + self._timeout
+        #
+        # A verb that loops makes many calls on one request, and the request
+        # holds one broker slot under one shared deadline (`request_slot`);
+        # `outer_deadline` is that one, and no call outlives it.
+        now = time.monotonic()
+        deadline = now + self._timeout
+        outer = self._outer_deadline() if self._outer_deadline else None
+        # Which bound cuts this call decides what a cut is reported as: the
+        # forge being slow, or the request having spent its time on earlier
+        # calls -- the second is the case the shared deadline exists for, and
+        # reporting it as a 300s forge would send the operator after the
+        # wrong thing.
+        slow = f"the forge's answer took longer than {self._timeout:g}s"
+        if outer is not None and outer < deadline:
+            # The shared deadline always cuts the call when it is the sooner
+            # bound. It is named as the cause only when earlier calls spent
+            # real time: the slot is armed with the same timeout a moment
+            # before the first call, so on that call the two differ by the
+            # admission's few milliseconds, and the forge being slow is the
+            # truth.
+            if deadline - outer > _REQUEST_SPENT_SECONDS:
+                slow = "the request's time ran out while the forge was answering"
+            deadline = outer
+        if deadline <= now:
+            raise forge_error(0, "the request's time ran out before this call to the forge")
+        # The opener gets the transport's own timeout unless the request's
+        # deadline is sooner. Not `deadline - now` unconditionally: at
+        # some monotonic clock readings `(now + t) - now` is not `t`, and
+        # the per-receive bound would drift off the one configured.
+        socket_timeout = self._timeout if deadline == now + self._timeout else deadline - now
         try:
-            with self._open(request, timeout=self._timeout) as response:
-                payload = self._read_within(response, deadline)
+            with self._open(request, timeout=socket_timeout) as response:
+                payload = self._read_within(response, deadline, slow=slow)
         except urllib.error.HTTPError as exc:
             return self._refused(exc.code, self._error_text(exc, deadline))
         except WorkspaceError:
             raise
-        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
-            # The call never got a whole answer: refused, timed out, or a
-            # status line, header or chunked body the peer broke. `urllib`
-            # wraps only the send in `URLError`; `http.client` raises the
-            # rest. The default 0 lands on the "did not say why" reading,
-            # which is the truth.
-            raise forge_error(0, f"the forge could not be reached: {type(exc).__name__}") from exc
+        except urllib.error.URLError as exc:
+            # The send failed: a refused connection, an unknown name, a
+            # certificate, a connect timeout. `urllib` wraps only the send.
+            # A connect cut short by the request's shared deadline, after
+            # earlier calls spent it, is the request's time, not the forge.
+            if isinstance(exc.reason, TimeoutError) and slow.startswith("the request's time"):
+                raise forge_error(0, "the request's time ran out while connecting to the forge") from exc
+            raise forge_error(0, _unreachable(exc)) from exc
+        except TimeoutError as exc:
+            # Bare, so not the send: the request went out and the status line
+            # never came back inside the bound. The forge was reached and
+            # stopped, which is `slow`, not a connectivity problem.
+            raise forge_error(0, slow) from exc
+        except http.client.HTTPException as exc:
+            # A status line, header or chunked body the peer broke: it
+            # answered, and the answer could not be read.
+            raise forge_error(0, _broken_answer(exc)) from exc
+        except OSError as exc:
+            # A reset or a dropped connection after the send -- `urllib` wraps
+            # every send-phase failure in `URLError`, above. The forge took the
+            # request and then stopped, which is an answer broken off, not a
+            # forge that could not be reached.
+            raise forge_error(0, _broken_answer(exc)) from exc
         text = payload.decode("utf-8", "replace")
         if raw:
             return text
@@ -456,7 +537,9 @@ class HttpTransport:
             payload = b""
         return payload.decode("utf-8", "replace")
 
-    def _read_within(self, response: Any, deadline: float, cap: int | None = None) -> bytes:
+    def _read_within(
+        self, response: Any, deadline: float, cap: int | None = None, slow: str = ""
+    ) -> bytes:
         """The body, read in chunks until EOF, the ceiling, or the deadline.
 
         `read1` returns what one receive brought rather than waiting for a
@@ -470,16 +553,25 @@ class HttpTransport:
         short of its `Content-Length` would otherwise come back as the whole
         answer -- a truncated diff handed over as the diff. `length` is what
         `http.client` still expected; anything left is a broken answer.
+
+        A stall is reported as one, in `slow`'s words, whichever way it shows:
+        the check between receives, or -- the usual shape, since the socket's
+        timeout is the deadline's remainder -- the receive itself timing out.
+        The forge was reached; it stopped answering.
         """
+        slow = slow or f"the forge's answer took longer than {self._timeout:g}s"
         read = getattr(response, "read1", None) or response.read
         chunks: list[bytes] = []
         size = 0
         while True:
             left = deadline - time.monotonic()
             if left <= 0:
-                raise forge_error(0, f"the forge's answer took longer than {self._timeout:g}s")
+                raise forge_error(0, slow)
             _settimeout(response, left)
-            chunk = read(_READ_CHUNK_BYTES)
+            try:
+                chunk = read(_READ_CHUNK_BYTES)
+            except TimeoutError as exc:
+                raise forge_error(0, slow) from exc
             if not chunk:
                 if getattr(response, "length", None):
                     raise forge_error(0, "the forge closed the connection before its answer was complete")

@@ -1115,7 +1115,7 @@ function whatToDoHtml(run) {
   // A deadline kill keeps its `do` whether or not cases finished before it.
   else if ((!measured(run) || run.cls === "deadline-kill") && run.do) items.push(runDoHtml(run.do));
   else if (run.setup_death || (!measured(run) && run.verdict === "infra")) items.push("<li><b>Retest.</b> Nothing ran, so nothing here is about your change.</li>");
-  else if (!measured(run) && run.verdict === "green") items.push("<li><b>Nothing.</b> The gate revalidated this branch's earlier green run.</li>");
+  else if (!measured(run) && run.verdict === "green") items.push("<li><b>Nothing.</b> The gate revalidated this branch's earlier green run or admin override.</li>");
   else if (!measured(run)) items.push("<li><b>Read the build log.</b> The failure is before the eval loop; a broken image build or deploy on this branch looks like this.</li>");
   else if (run.verdict === "green") items.push("<li><b>Nothing.</b> This run is green.</li>");
   else if (run.verdict === "infra") {
@@ -1460,7 +1460,7 @@ function gridHtml(link) {
     (g.more ? `<div class="more">${plural(g.more, "more held-out case")} passed everything in this window · <button type="button" data-toggle="held">show</button></div><div class="grp-fill"></div>` : "")).join("");
   const legend = `<div class="legend"><span><i class="pass"></i>passed</span><span><i class="fail"></i>failed all reps</span><span><i class="partial"></i>failed some reps</span><span><i class="infra"></i>quota / infra</span><span><i class="died"></i>run died before the cases</span><span><i class="running"></i>still running</span><span><i></i>not in run</span>` +
     (ui.markers.merge ? `<span><i class="mkmerge"></i>merge to main</span>` : "") + (ui.markers.incident ? `<span><i class="mkincident"></i>incident start</span><span><i class="mkrecovered"></i>healthy again</span>` : "") +
-    `<span style="margin-left:auto">${plural(cols.length, "column")} · presubmit runs in start order${hidden ? ` · ${plural(hidden, "run")} without cases (aborted, or green on revalidation) not shown` : ""}</span></div>`;
+    `<span style="margin-left:auto">${plural(cols.length, "column")} · presubmit runs in start order${hidden ? ` · ${plural(hidden, "run")} without cases (aborted, or green on revalidation of an earlier green or an override) not shown` : ""}</span></div>`;
   return `<div class="sec head"><h1>Cases by run</h1><div class="lede">Every case by every presubmit run in the window, in time order. Blocking cases first, by domain; held-out cases that passed everything are folded away. Click a cell for that run's detail.</div></div>${banner}${ctl}` +
     `<div class="gridwrap"><div class="gscroll"><div class="g" style="grid-template-columns:var(--namew) repeat(${cols.length},minmax(var(--colmin),1fr));padding-top:${mk.padTop}px">${mk.lines}${mk.labels}${head}${body}</div></div>${legend}${mk.list}</div>` +
     detailHtml() + footHtml();

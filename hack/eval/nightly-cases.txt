@@ -11,7 +11,9 @@
 # night). The registration lint (scripts/validate_bench_cases.py) reads this
 # file as well as the presubmit one; the domain-coverage lint reads only
 # blocking-roster.txt, so neither an entry here nor a held-out presubmit
-# seat counts as coverage.
+# seat counts as coverage. EVAL_NIGHTLY_PART in the script can split the
+# nightly matrix between two periodics (its comment says how); unset, one
+# job runs all of it, and the budget below prices that.
 #
 # WHO APPROVES. The normal approvers (root OWNERS). Only the presubmit files
 # beside this one carry the eval-crew rule (#1546, decided 2026-09-15).
@@ -405,6 +407,15 @@
 # 213-unit matrix (with the presubmit file's fourteen). deployer: noop,
 # read-only over the seeded fleet.
 ./tasks/patch-declared-intent-no-finding/task.yaml
+
+# The waste stream's declared-intent case (#1408): seeded-headroom's
+# burst-ingest reserves far more than it uses, the 3.1 overrequest posture
+# the same knowledge/ note declares. It runs the waste audit and grades the
+# cost ledger: no finding id for the workload, and a Declared intent row
+# naming the note. Red on the install's build before the change (the finding
+# published with a resize), three greens on the branch's, on a dev install.
+# One case, three units. deployer: noop, read-only over the seeded fleet.
+./tasks/cost-declared-intent-no-finding/task.yaml
 
 # ── Moved here 2026-09-15 from the commented-out state (#1546, #1564) ───────
 # Nine cases; each carries the blocker that kept it parked. None was
