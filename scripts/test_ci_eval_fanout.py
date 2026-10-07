@@ -259,6 +259,9 @@ lock_release() { rmdir "$1" 2>/dev/null || true; }
 mint_ledger_token() { return 0; }
 unit_delegation_timeout() { echo 1800; }
 ledger_audit_id_for_task() { echo ""; }
+task_streams() { ledger_audit_id_for_task "$1"; }
+stream_lock_deadline() { echo 1; }
+release_streams() { local s; for s in $1; do lock_release "${STATE_DIR}/lock-stream-${s}"; done; }
 stream_case_count() { echo 1; }
 stream_stack_wait() { echo 0; }
 _ts_lines() { cat; }

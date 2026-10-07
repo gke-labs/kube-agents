@@ -35,8 +35,11 @@
 #
 # The teardown, and the exit trap on a failed apply, run disarm.py: both markers
 # go back as they were and the `oobe` job comes out if this stack put it there.
-# The audits the stage started are left to finish; each writes its ledger issue in
-# the install's GitOps repository and posts its summary where it always does.
+# The teardown first waits, up to `busy_wait`, for the audits the stage started
+# to finish: the runner holds their four streams' locks until devops-bench returns
+# (the case's `audit_streams`), so an audit case on one of them never runs beside
+# them. Each writes its ledger issue in the install's GitOps repository and posts
+# its summary where it always does.
 
 terraform {
   required_version = ">= 1.5.0"
@@ -66,8 +69,8 @@ locals {
   # The chain runs the four audits one after another (1-15 minutes each), and the stage is
   # done once the last has started.
   chain_wait = 3600
-  # Each audit takes 9-15 minutes on its own (#985); four started together by an
-  # earlier repetition finish well inside this.
+  # Each audit takes 9-15 minutes on its own (#985), and the chain runs one at a time, so
+  # the one still going when the chain is done finishes well inside this.
   busy_wait = 2400
   poll      = 30
   # How long an exec into the agent Deployment waits for a pod when it has none.
@@ -88,6 +91,10 @@ resource "null_resource" "oobe" {
     python        = local.python
     hermes        = local.hermes
     disarm_b64    = local.disarm_b64
+    busy_b64      = local.busy_b64
+    audits        = local.audits
+    busy_wait     = local.busy_wait
+    poll          = local.poll
   }
 
   provisioner "local-exec" {
@@ -212,10 +219,26 @@ resource "null_resource" "oobe" {
       gcloud container clusters get-credentials "${self.triggers.host_cluster}" \
         --location "${self.triggers.host_location}" --project "$project" --quiet
 
-      printf '%s' '${self.triggers.disarm_b64}' | base64 -d | \
+      agent_py() {
         kubectl exec -i -n "${self.triggers.namespace}" "deployment/${self.triggers.deployment}" \
-        -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
-        ${self.triggers.python} - "${self.triggers.home}" "${self.triggers.hermes}"
+          -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
+          ${self.triggers.python} - "$@"
+      }
+
+      # The runner releases the four streams' locks once this returns, so the
+      # audit still going when the chain finished ends first. A count that
+      # cannot be read is not "none running"; past the bound it disarms anyway.
+      elapsed=0
+      until busy="$(printf '%s' '${self.triggers.busy_b64}' | base64 -d | agent_py "${self.triggers.home}" ${self.triggers.audits})" && [ "$busy" = 0 ]; do
+        if [ "$elapsed" -ge ${self.triggers.busy_wait} ]; then
+          echo "WARNING: $${busy:-an unreadable count of} first-run audit(s) still running after $${elapsed}s; disarming anyway." >&2
+          break
+        fi
+        sleep ${self.triggers.poll}
+        elapsed=$((elapsed + ${self.triggers.poll}))
+      done
+
+      printf '%s' '${self.triggers.disarm_b64}' | base64 -d | agent_py "${self.triggers.home}" "${self.triggers.hermes}"
     EOT
   }
 }

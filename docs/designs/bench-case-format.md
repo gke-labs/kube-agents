@@ -111,6 +111,14 @@ defaults to `false`, a case for your own change never carries it, and it must be
 boolean: `"false"` is a string, and truthy, and the validator rejects it.
 `.agents/rules/eval_driven_development.md` has the rule; devops-bench ignores the key.
 
+`audit_streams` is for a case whose stack starts real audit runs without grading their
+ledger: a list of the Platform Agent job ids it starts
+(`audit_streams: [compliance-audit, stockout-prevention]`). The runner holds each one's stream
+lock for the whole unit, beside the stream a `ledger_issue_contains` check names, so an audit
+case on one of those streams never runs beside the case's runs and grades their ledger
+(`hack/ci-eval-pr.sh`, `task_streams`). `oobe-first-run-audits` carries the four it starts.
+devops-bench ignores the key.
+
 `verification_spec` is the exact half of the grade, and the rest of this document is
 mostly about it.
 
@@ -391,7 +399,8 @@ id that disagrees with its directory, a `domain:` that is missing or not in
 case that declares no `fixtures:` at all, a missing, empty or inline `verification_spec`,
 a check that carries no assertion and so can only pass, a missing `owner:` or one written
 as a mention or as something other than a login, an `expected_fail:` that is not a bare YAML
-boolean, and a case that is registered nowhere. It
+boolean, an `audit_streams:` naming a job the Platform Agent does not
+have, and a case that is registered nowhere. It
 also applies the entry vocabulary above — role, the severity pairing, the rejected `hold`
 mode, a positive weight — which devops-bench enforces too, at spec-load time, after the
 lease.

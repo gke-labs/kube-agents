@@ -464,6 +464,35 @@ class StageTest(unittest.TestCase):
         self._main(now=late + 2 * MINUTE)
         self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS[:2]))
 
+    def test_the_mark_is_recorded_before_it_is_made(self):
+        # A restart between the two must leave a record of the mark, not a mark with no record.
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        seen = []
+        run = self._run
+
+        def recording(argv, env=None, **kwargs):
+            seen.append(oobe.read_state(self.d).get(oobe.STATE_CURRENT))
+            return run(argv, env=env, **kwargs)
+
+        with mock.patch.object(oobe.subprocess, "run", recording):
+            self._main()
+        self.assertEqual(seen, [{oobe.CURRENT_JOB: FIRST[0], oobe.CURRENT_MARKED_AT: NOW_SETTLED}])
+
+    def test_a_mark_refused_after_the_store_took_it_is_adopted(self):
+        # The trigger reported a failure (a timeout, say) after committing the mark.
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self.failing.add(FIRST[0])
+        self._main(now=NOW_SETTLED)
+        state = oobe.read_state(self.d)
+        self.assertNotIn(FIRST[0], state[oobe.STATE_FIRED])
+        self.assertIsNone(state[oobe.STATE_CURRENT])
+        self.failing.clear()
+        self._ledger(FIRST[0], "completed", NOW_SETTLED + MINUTE)
+        self._main(now=NOW_SETTLED + 2 * MINUTE)
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS[:2]))
+
     def test_each_mark_time_is_recorded(self):
         self._file_scan()
         _board(self.board, [_ranking("done")])

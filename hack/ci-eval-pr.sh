@@ -964,6 +964,38 @@ ledger_audit_id_for_task() { # <task.yaml, relative to BENCH_DIR or absolute>
   ' "${file}"
 }
 
+# The audit streams a case drives without grading their ledger: the top-level
+# `audit_streams:` list in its task.yaml, for a case whose stack starts real
+# audit runs (oobe-first-run-audits starts four). Its unit holds those streams'
+# locks too, so an audit case on one of them does not run beside it. Read as
+# the key's line and the indented lines under it, so a flow list prettier has
+# wrapped and a block list both read; a comment is dropped.
+declared_audit_streams_for_task() { # <task.yaml, relative to BENCH_DIR or absolute>
+  local file="$1"
+  case "${file}" in /*) ;; *) file="${BENCH_DIR}/${file}" ;; esac
+  [ -f "${file}" ] || return 0
+  awk '
+    function take(line) {
+      sub(/#.*/, "", line)
+      sub(/^[[:space:]]*-[[:space:]]+/, "", line)
+      gsub(/[^A-Za-z0-9_.-]+/, " ", line)
+      out = out " " line
+    }
+    reading && /^[^[:space:]]/ { exit }
+    reading { take($0); next }
+    /^audit_streams:/ { reading = 1; line = $0; sub(/^audit_streams:/, "", line); take(line) }
+    END { n = split(out, ids, " "); s = ""; for (i = 1; i <= n; i++) s = s (s == "" ? "" : " ") ids[i]; print s }
+  ' "${file}"
+}
+
+# Every stream lock a case's unit holds: the stream it grades and any it
+# declares, sorted and each once, so a unit holding several always takes them
+# in the same order and two such units cannot each hold what the other waits on.
+task_streams() { # <task.yaml>
+  { ledger_audit_id_for_task "$1" 2>/dev/null; declared_audit_streams_for_task "$1" | tr ' ' '\n'; } \
+    | awk 'NF' | sort -u | tr '\n' ' ' | sed 's/ $//'
+}
+
 # Returns 0 whatever happens; the reason it could not reset is printed.
 reset_audit_ledgers() { # <label> [audit-id]
   local label="$1" audit_id="${2:-}" scope token out rc=0
@@ -2376,7 +2408,7 @@ stream_case_count() { # <audit-id>
   local n=0 t
   if [ -n "$1" ]; then
     for t in "${TASKS[@]}"; do
-      if [ "$(ledger_audit_id_for_task "${t}" 2>/dev/null)" = "$1" ]; then n=$((n + 1)); fi
+      case " $(task_streams "${t}") " in *" $1 "*) n=$((n + 1)) ;; esac
     done
   fi
   echo $(( n > 1 ? n : 1 ))
@@ -2391,11 +2423,25 @@ stream_stack_wait() { # <audit-id>
   local n=0 i
   if [ -n "$1" ]; then
     for i in "${!TASKS[@]}"; do
-      if [ -n "${TASK_HAS_STACK[i]}" ] \
-        && [ "$(ledger_audit_id_for_task "${TASKS[i]}" 2>/dev/null)" = "$1" ]; then n=$((n + 1)); fi
+      if [ -n "${TASK_HAS_STACK[i]}" ]; then
+        case " $(task_streams "${TASKS[i]}") " in *" $1 "*) n=$((n + 1)) ;; esac
+      fi
     done
   fi
   echo $(( n * INFRA_LOCK_DEADLINE ))
+}
+
+# How long a unit waits for one stream's lock: the single-unit figure times the
+# cases holding the stream, plus the infra queue its stack-bearing ones may hold
+# it through. For the stream a case grades this is the task lock's deadline.
+stream_lock_deadline() { # <task-name> <audit-id>
+  echo $(( $(stream_case_count "$2") * ($(unit_delegation_timeout "$1") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) + $(stream_stack_wait "$2") ))
+}
+
+release_streams() { # <space-separated audit ids>
+  local s
+  # shellcheck disable=SC2086 # audit ids carry no spaces or glob characters
+  for s in $1; do lock_release "${STATE_DIR}/lock-stream-${s}"; done
 }
 
 # ─── Per-case grading and recording, inside the fan-out ─────────────────────
@@ -2536,8 +2582,9 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # queued on lock-infra, and no stream term counts that wait. The infra
   # lock keeps its default: it is taken last, after any stream wait, so it is
   # held only while this unit's own stack is in use.
-  local audit_id lock_deadline
+  local audit_id lock_deadline streams held="" s
   audit_id="$(ledger_audit_id_for_task "${task}")"
+  streams="$(task_streams "${task}")"
   lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) + $(stream_stack_wait "${audit_id}") ))"
   if [ -z "${audit_id}" ] && [ -n "${has_stack}" ]; then
     lock_deadline=$(( lock_deadline + INFRA_LOCK_DEADLINE ))
@@ -2555,13 +2602,18 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # its stream with a stackless one would otherwise sit on the infra lock for
   # the whole of the other's audit, and every tofu unit behind it would run
   # out its INFRA_LOCK_DEADLINE waiting on a lane nothing is using.
-  if [ -n "${audit_id}" ] && ! lock_acquire "${STATE_DIR}/lock-stream-${audit_id}" "${lock_deadline}"; then
-    lock_release "${STATE_DIR}/lock-task-${name}"
-    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the ${audit_id} stream lock" >&2
-    return 0
-  fi
+  # shellcheck disable=SC2086 # audit ids carry no spaces or glob characters
+  for s in ${streams}; do
+    if ! lock_acquire "${STATE_DIR}/lock-stream-${s}" "$(stream_lock_deadline "${name}" "${s}")"; then
+      release_streams "${held}"
+      lock_release "${STATE_DIR}/lock-task-${name}"
+      echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the ${s} stream lock" >&2
+      return 0
+    fi
+    held="${held} ${s}"
+  done
   if [ -n "${has_stack}" ] && ! lock_acquire "${STATE_DIR}/lock-infra" "${INFRA_LOCK_DEADLINE}"; then
-    [ -n "${audit_id}" ] && lock_release "${STATE_DIR}/lock-stream-${audit_id}"
+    release_streams "${streams}"
     lock_release "${STATE_DIR}/lock-task-${name}"
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the infra lock" >&2
     return 0
@@ -2571,7 +2623,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # so at the default EVAL_REPETITIONS=3 a unit can sleep past the hour a token
   # lasts and reach devops-bench holding a dead one.
   if ! mint_ledger_token "${name} rep ${rep}"; then
-    [ -n "${audit_id}" ] && lock_release "${STATE_DIR}/lock-stream-${audit_id}"
+    release_streams "${streams}"
     [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
     lock_release "${STATE_DIR}/lock-task-${name}"
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} could not mint a ledger token" >&2
@@ -2601,7 +2653,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # locks go back, and the repetition grades MISSING, as a unit that could not
   # mint does.
   if [ "$(unit_phase "${name}")" = "1" ] && ! reset_agent_pulls "${name} rep ${rep}"; then
-    [ -n "${audit_id}" ] && lock_release "${STATE_DIR}/lock-stream-${audit_id}"
+    release_streams "${streams}"
     [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
     lock_release "${STATE_DIR}/lock-task-${name}"
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} did not run: the leased repository could not be reset" >&2
@@ -2670,7 +2722,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   for state in "${STATE_DIR}/${name}".rep*.end; do
     [ -e "${state}" ] && finished_reps=$((finished_reps + 1))
   done
-  [ -n "${audit_id}" ] && lock_release "${STATE_DIR}/lock-stream-${audit_id}"
+  release_streams "${streams}"
   [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
   lock_release "${STATE_DIR}/lock-task-${name}"
   # Copied here, not in the grading pass: a Prow deadline that kills the

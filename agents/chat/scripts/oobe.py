@@ -19,8 +19,8 @@ under memory pressure for the best part of an hour. Each is marked due on the
 Platform Agent's roster with Hermes' ``cron.jobs.trigger_job``, so the next
 ``profile-cron-tick`` runs it through its schedule's own path. Not ``hermes cron
 run``: that CLI runs the whole job synchronously in the calling process.
-``.oobe_audits_fired`` records each one marked and the one in flight, so a run
-killed partway marks nothing twice: marking an audit due again after it has run
+``.oobe_audits_fired`` records each one before it is marked, and the mark awaiting
+its run, so a run killed partway marks nothing twice: marking an audit due again after it has run
 starts a second full run. With no GitOps repository configured every audit fails
 before it reads anything, so the stage records the skip and marks none.
 
@@ -437,11 +437,20 @@ def advance_chain(data_dir: Path, state: dict, now: float) -> dict:
             _log(f"not starting {job_id}: {holds[job_id]}")
             held[job_id] = holds[job_id]
             continue
-        if holds is not None and trigger(job_id, data_dir):
+        if holds is not None:
+            # Recorded before it is made: a restart between the two leaves a record of a mark that
+            # may not exist, which the start limit makes again, rather than a mark with no record,
+            # which would be made a second time once its run ended.
             fired.append(job_id)
             marks[job_id] = now
             current = {CURRENT_JOB: job_id, CURRENT_MARKED_AT: now}
-            return save()
+            save()
+            if trigger(job_id, data_dir):
+                return save()
+            # The time stays in `marks`: a mark refused only after the store took it is adopted
+            # once its run turns up, by the check at the top of this loop.
+            fired.remove(job_id)
+            current = None
         attempts[job_id] = attempts.get(job_id, 0) + 1
         if attempts[job_id] >= MAX_TRIGGER_ATTEMPTS:
             _log(f"giving up on {job_id} after {MAX_TRIGGER_ATTEMPTS} attempts; it runs on its own schedule")

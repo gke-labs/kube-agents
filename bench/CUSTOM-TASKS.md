@@ -221,6 +221,10 @@ Every task also carries a top-level `owner:` — a GitHub login without the at s
 `maintainers` — naming who answers when the case flakes. The validator rejects a task without
 one; [CONTRIBUTING.md](CONTRIBUTING.md) says what the owner commits to.
 
+A task whose stack starts real audit runs lists them in a top-level `audit_streams:`, so
+the runner holds those streams' locks while it runs; see
+[bench-case-format.md](../docs/designs/bench-case-format.md).
+
 A task may also carry a top-level `expected_fail: true`, which inverts the presubmit's verdict for
 it: failing is the declared outcome, and _passing_ every repetition is what reports. That is the
 eval-driven-development marker for a gap whose fix is not yours to make — land the case red and

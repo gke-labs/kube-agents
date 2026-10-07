@@ -143,8 +143,8 @@ calling process (`hermes_cli/cron.py`, `_job_action` forces it), so a per-minute
 a model run open, outside the tick's environment, until it times out. `cronjob(action='run')` does
 the same on some runtimes (`agents/platform/AGENTS.md`).
 
-`.oobe_audits_fired` records each id once it is marked due, with when it was marked, and which
-one is in flight. A failed mark is retried on the next tick, and only that one: marking an audit due again
+`.oobe_audits_fired` records each id, and when it was marked, before the mark is made, and the
+mark awaiting its run. A failed mark is retried on the next tick, and only that one: marking an audit due again
 after it has run starts a second full run.
 
 `trigger_job` also sets the job's `enabled` back to true and clears a pause, so an
@@ -253,7 +253,10 @@ at the sweep, clears `.oobe_audits_fired`, and puts back the `oobe` job when the
 the teardown restores both markers and the job as it found them.
 The stack then waits, up to an hour, for the stage to finish its chain, so the verifier's two-minute window opens after the last audit has started. The verifier reads the Platform Agent's cron run records and
 passes when the stage's `.oobe_audits_fired` lists all four audits as marked due and each has a run claimed since the stage marked it that is running or completed (a skipped row is passed over), so a scheduled run that falls in the window does not count, and each started only after the one before it in the chain ended. That is stricter than the stage: a mark that lands on a scheduled run it did not see start, a race the stack's wait for running audits makes rare, reads as no run. Red: on
-an image without the job, no audit runs. Green: four, in three repetitions. The no-repository skip is unit-tested,
+an image without the job, no audit runs. Green: four, in three repetitions. The case's runs are
+real audit runs on four streams, so it declares them (`audit_streams`) and the runner holds their
+locks for the unit, and its teardown waits for the last run to end: the nightly's audit cases on
+those streams never run beside it and grade its ledger. The no-repository skip is unit-tested,
 not evaluated: the shared install has a repository, and removing it mid-run would break concurrent
 cases.
 

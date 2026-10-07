@@ -50,6 +50,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import eval_rosters  # noqa: E402
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+PLATFORM_JOBS_FILE = REPO_ROOT / "agents" / "platform" / "cron" / "jobs.json"
 TASKS_DIR = REPO_ROOT / "bench" / "tasks"
 # The rosters hack/ci-eval-pr.sh reads at startup (#1546): what the presubmit
 # runs, what the nightly adds. A case is registered by being in one of them.
@@ -437,6 +438,13 @@ def _load_yaml(path: pathlib.Path) -> Any:
         raise CaseError(f"{path}: could not be parsed as YAML: {exc}") from exc
 
 
+def platform_job_ids() -> set[str]:
+    """The Platform Agent's cron job ids, the audit streams among them."""
+    data = json.loads(PLATFORM_JOBS_FILE.read_text(encoding="utf-8"))
+    jobs = data.get("jobs", []) if isinstance(data, dict) else data
+    return {job["id"] for job in jobs if isinstance(job, dict) and job.get("id")}
+
+
 def known_domains() -> set[str]:
     """Slugs defined in docs/designs/domains.yaml."""
     data = _load_yaml(DOMAINS_FILE) or {}
@@ -738,6 +746,21 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
             "single hyphens, at most 39 characters) nor the literal "
             f"{OWNER_MAINTAINERS!r}"
         )
+
+    # The audit streams a case drives without grading their ledger. The runner
+    # holds each one's lock for the unit (hack/ci-eval-pr.sh, task_streams); an
+    # id no Platform Agent job has would lock nothing real.
+    if "audit_streams" in spec:
+        streams = spec["audit_streams"]
+        if not isinstance(streams, list) or not streams or not all(isinstance(s, str) for s in streams):
+            problems.append("'audit_streams:' must be a non-empty list of audit job ids")
+        else:
+            unknown = sorted(set(streams) - platform_job_ids())
+            if unknown:
+                problems.append(
+                    f"'audit_streams:' names {', '.join(unknown)}, which "
+                    f"{PLATFORM_JOBS_FILE.relative_to(REPO_ROOT)} does not define"
+                )
 
     # The expected-fail marker. bench-gate inverts a marked case's verdict,
     # and its loader (bench/kube_agents_bench/cases.py, _coerce_bool) refuses

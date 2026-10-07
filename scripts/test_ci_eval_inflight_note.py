@@ -372,11 +372,11 @@ class CallSiteTest(unittest.TestCase):
         # one carrying the worker's findings, and this unit's `start` would
         # carry them into the repetition.
         unit = lifted("run_one_unit")
-        stream_lock = unit.index('lock_acquire "${STATE_DIR}/lock-stream-${audit_id}"')
+        stream_lock = unit.index('lock_acquire "${STATE_DIR}/lock-stream-${s}"')
         reset = unit.index('reset_audit_ledgers "${name} rep ${rep}" "${audit_id}"')
         release = unit.index('release_inflight_note "${name} rep ${rep}" "${audit_id}"')
         launch = unit.index("uv run devops-bench")
-        stream_release = unit.index('lock_release "${STATE_DIR}/lock-stream-${audit_id}"', launch)
+        stream_release = unit.index('release_streams "${streams}"', launch)
         self.assertLess(stream_lock, release)
         self.assertLess(release, reset)
         self.assertLess(reset, launch)

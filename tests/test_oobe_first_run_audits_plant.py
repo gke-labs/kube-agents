@@ -314,6 +314,15 @@ class PlantScriptsTest(unittest.TestCase):
             done = subprocess.run(["bash", "-n"], input=rendered, capture_output=True, text=True, check=False)
             self.assertEqual(done.returncode, 0, done.stderr)
 
+    def test_the_teardown_waits_for_the_audits_before_it_disarms(self):
+        # The runner releases the four streams' locks when devops-bench returns, after the
+        # teardown; the audit still going when the chain finished must end inside them.
+        text = (STACK / "main.tf").read_text()
+        teardown = re.findall(r"command\s+=\s+<<-EOT\n(.*?)\n\s*EOT", text, re.S)[1]
+        wait = teardown.index("self.triggers.busy_b64")
+        self.assertLess(wait, teardown.index("self.triggers.disarm_b64"))
+        self.assertIn("self.triggers.busy_wait", teardown[wait:])
+
     def test_the_stack_names_the_audits_the_stage_starts(self):
         # Read both lists back from source, so a fifth audit added to either is caught.
         stage = ast.parse((REPO / "agents" / "chat" / "scripts" / "oobe.py").read_text())

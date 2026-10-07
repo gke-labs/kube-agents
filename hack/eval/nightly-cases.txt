@@ -132,7 +132,8 @@
 # it fifty-four (162) of sixty-eight (204), +3 more: the same shape on a
 # blocked card. oobe-first-run-audits (the last entry below) makes it
 # sixty-one (183) of seventy-five (225), counted from the lists, +3 more at its 2400s hint: a stack
-# that waits out the previous repetition's audits and the stage's chain, then a turn with no tools.
+# that waits out the previous repetition's audits and the stage's chain, then a turn with no tools,
+# holding the four audit streams' locks throughout, so their audit cases queue behind it.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
 # answer it plainly: 1734-2693 serial minutes of work at a realised

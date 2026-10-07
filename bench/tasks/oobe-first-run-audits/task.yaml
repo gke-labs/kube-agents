@@ -27,10 +27,10 @@
 # `.bootstrap_scan_filed` and `.oobe_audits_fired` for the run and restores both,
 # files two archived cards, and adds and removes the `oobe` job. The four audits
 # it starts are real runs: each writes its ledger issue in the install's GitOps
-# repository and posts its summary wherever the install sends audit reports, and
-# the teardown leaves them to finish. Other stack-bearing cases, the bootstrap
-# ones among them, are kept apart by the infra lock while the stack is up; the
-# audits it started can outlive it and overlap an audit case on the same stream.
+# repository and posts its summary wherever the install sends audit reports. The
+# runner holds their four streams' locks for the unit (`audit_streams` below) and
+# the teardown waits for the last run to end, so no audit case on those streams
+# runs beside them; other stack-bearing cases are kept apart by the infra lock.
 # Eligible tier: nightly -- each repetition runs the four audits one after another
 # and waits for the previous repetition's to finish.
 ---
@@ -55,6 +55,17 @@ domain: fleet-audits
 
 # Who answers when this case flakes -- see bench/CONTRIBUTING.md.
 owner: maintainers
+
+# The streams whose audits the stack starts. The runner holds their locks for the
+# whole unit (hack/ci-eval-pr.sh: task_streams), so no audit case on one of them
+# runs beside these real runs and grades the other's ledger.
+audit_streams:
+  [
+    fleet-wide-cost-analysis,
+    compliance-audit,
+    obtainability-audit,
+    stockout-prevention,
+  ]
 
 # A turn that needs no tools. The session this reaches is the Planning Agent's,
 # which could ask the Platform Agent to start an audit; a run that started would be
