@@ -56,9 +56,10 @@ const (
 	// a2aGoogleTokeninfoURL is Google's token introspection endpoint for
 	// access tokens.
 	a2aGoogleTokeninfoURL = "https://oauth2.googleapis.com/tokeninfo"
-	// a2aGoogleTokeninfoParam carries the token. The URL therefore holds a
-	// credential and is never logged.
-	a2aGoogleTokeninfoParam = "access_token"
+	// a2aGoogleTokeninfoParam carries the token, in a POSTed form body
+	// (a2aGoogleTokeninfoContentType), never in the URL.
+	a2aGoogleTokeninfoParam       = "access_token"
+	a2aGoogleTokeninfoContentType = "application/x-www-form-urlencoded"
 	// a2aGoogleTokeninfoTimeout bounds one check. Past it the request is
 	// refused, never admitted.
 	a2aGoogleTokeninfoTimeout = 5 * time.Second
@@ -255,15 +256,18 @@ func (v *googleTokenVerifier) check(ctx context.Context, key, token string) (str
 // this must not have.
 func (v *googleTokenVerifier) tokeninfo(ctx context.Context, token string) (googleTokeninfo, error) {
 	var info googleTokeninfo
-	u := v.tokeninfoURL + "?" + url.Values{a2aGoogleTokeninfoParam: {token}}.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	// POSTed as a form body, not a query parameter, so the token is in no
+	// URL a proxy, a load balancer or an access log along the way records.
+	form := url.Values{a2aGoogleTokeninfoParam: {token}}.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, v.tokeninfoURL, strings.NewReader(form))
 	if err != nil {
 		return info, errors.New("the Google access token could not be checked")
 	}
+	req.Header.Set("Content-Type", a2aGoogleTokeninfoContentType)
 	resp, err := v.client.Do(req)
 	if err != nil {
-		// Not err itself: a *url.Error quotes the URL, and the URL holds
-		// the token.
+		// Not err itself: a *url.Error carries transport detail the client
+		// has no use for; the token is in the body, never the URL.
 		return info, errors.New("the Google access token could not be checked: Google's tokeninfo endpoint did not answer")
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -442,7 +446,9 @@ func (d *A2ADoor) identify(w http.ResponseWriter, r *http.Request) (verified str
 		// off the list must not create conversations or submissions that
 		// would push an allowed developer's out of the door's bounds. A
 		// 403, not a 401: signing in again as the same account cannot help.
-		d.log.Warn("the A2A door refused a Google-verified caller who is not on its allowlist")
+		// The email is what the admin adds, and the ingress log already
+		// prints an admitted caller's in the clear.
+		d.log.Warn("the A2A door refused a Google-verified caller who is not on its allowlist", "email", email)
 		injectError(w, http.StatusForbidden, "this Google account is not on the A2A door's allowed users list; an admin adds it to A2A_DOOR_ALLOWED_USERS")
 		return "", false
 	}
@@ -450,7 +456,10 @@ func (d *A2ADoor) identify(w http.ResponseWriter, r *http.Request) (verified str
 		d.log.Warn("the A2A door refused a bearer as a Google access token", "reason", err.Error())
 		if errors.Is(err, errGoogleTokenRefused) {
 			w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
-			injectError(w, http.StatusUnauthorized, err.Error())
+			// Said as both doors of the class: a holder of a stale static
+			// token lands here too, and must not be pointed at Google
+			// sign-in alone.
+			injectError(w, http.StatusUnauthorized, "the bearer is neither the A2A door's token nor a Google access token this install accepts: "+err.Error())
 		} else {
 			injectError(w, http.StatusServiceUnavailable, err.Error())
 		}

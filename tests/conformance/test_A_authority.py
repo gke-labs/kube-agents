@@ -494,6 +494,11 @@ class A3TheA2ADoorsGoogleClassAssertsOnlyAVerifiedEmail(unittest.TestCase):
             r'if strings\.Contains\(caller, ":"\) \{\s*return "",',
             "an eval caller may now contain a colon, so it can spell a Google caller",
         )
+        self.assertRegex(
+            caller_of,
+            r'if caller == "" \{\s*return "",',
+            "an eval caller may now be empty, so its conversation key could start a2a:: as a Google caller's does",
+        )
 
     def test_A3_the_google_class_roster_does_not_resolve_through_the_chat_map(self) -> None:
         body = h.go_function_body(h.text("a2a_door_roster"), "rosterResolver")

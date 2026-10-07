@@ -304,7 +304,7 @@ func New(o Options) (*Gateway, error) {
 		// whose lines forgot the a2a: prefix or point outside eval: has
 		// entries and admits nobody.
 		if a2aAudience.Len() == 0 {
-			log.Warn("the A2A door's principal map carries no a2a: entry mapped to an eval: identity; every message through it will be dropped at verification",
+			log.Warn("the A2A door's principal map carries no a2a: entry mapped to an eval: identity; every static-token message through it will be dropped at verification (Google-verified callers are gated by the allowlist instead)",
 				"path", o.Config.A2ADoorPrincipalMapPath, "entries", a2aPM.Len())
 		}
 	}

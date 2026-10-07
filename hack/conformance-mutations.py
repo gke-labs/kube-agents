@@ -1314,6 +1314,14 @@ Mutation(
         "name themselves \":google:<email>\" and read that developer's tasks",
     ),
     Mutation(
+        "A3-a2a-eval-caller-empty-allowed",
+        "a2a/gateway/a2adoor.go",
+        ('\tif caller == "" {', "\tif false {"),
+        "test_A3_no_eval_caller_can_spell_a_google_caller",
+        "let an eval caller be empty, so its conversation key starts a2a:: "
+        "like a Google caller's and the two namespaces meet",
+    ),
+    Mutation(
         "A3-a2a-google-roster-chat-map",
         "a2a/gateway/gateway.go",
         ("\tif backend == consoleBackend || backend == slackBackend || backend == a2aGoogleBackend {",

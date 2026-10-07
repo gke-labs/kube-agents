@@ -1396,8 +1396,9 @@ its audience or authorized party, a verified email, and an expiry still ahead. T
 Google sent it, is the principal - the same string the Google Chat adapter carries for the same
 person, case-preserved as Chat keeps it for the audit join - admitted only if it is on the
 door's allowlist (`A2A_DOOR_ALLOWED_USERS`, compared case-insensitively; empty admits nobody, and
-there is no allow-all). The door checks the list before it holds anything for the caller, so an
-account off it cannot fill the door's bounded state, and the gateway checks it again before it
+there is no allow-all). The door checks the list before it holds any conversation or submission for
+the caller (the verifier's cache of the token's verdict is the one thing kept, bounded in
+bytes), so an account off it cannot fill the door's bounded state, and the gateway checks it again before it
 resolves the principal. The authority block records backend `a2a-google` and
 `verifiedBy` `a2a-google-token`. A request carrying the token may not also name a caller: the
 header or `message.metadata.caller` beside a token is refused, so a token never travels with a

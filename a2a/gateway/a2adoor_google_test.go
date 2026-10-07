@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -44,7 +45,12 @@ func newFakeTokeninfo(t *testing.T) *fakeTokeninfo {
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.calls.Add(1)
 		f.mu.Lock()
-		answer, ok := f.answers[r.URL.Query().Get(a2aGoogleTokeninfoParam)]
+		if r.Method != http.MethodPost || r.URL.Query().Has(a2aGoogleTokeninfoParam) {
+			// The token must travel in the body, never the URL.
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		answer, ok := f.answers[r.PostFormValue(a2aGoogleTokeninfoParam)]
 		f.mu.Unlock()
 		if !ok {
 			w.WriteHeader(http.StatusBadRequest)
@@ -560,4 +566,56 @@ func TestA2AGoogleTurnClockStartsBeforeTheSessionLock(t *testing.T) {
 	if envs := inSubjectEnvelopes(t, r.url, "platform"); len(envs) != 0 {
 		t.Fatalf("a turn whose clock ran out waiting for the lock reached the bus: %d envelopes", len(envs))
 	}
+}
+
+// TestA2AGoogleRefusalsTellTheOperatorWhatToFix: the 403 for an account off
+// the list logs the email the admin would add, and a bearer that is neither
+// the static token nor a token Google accepts is told both doors exist.
+func TestA2AGoogleRefusalsTellTheOperatorWhatToFix(t *testing.T) {
+	f := newFakeTokeninfo(t)
+	f.set(googleTestOtherToken, liveTokeninfo(googleTestClientID, googleTestOtherEmail))
+	logs := &recordingHandler{}
+	door, err := NewA2ADoor("127.0.0.1:0", a2aTestToken, A2ADoorOptions{
+		GoogleClientID: googleTestClientID, GoogleAllowedUsers: []string{googleTestEmail}, Logger: slog.New(logs),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	door.google.tokeninfoURL = f.srv.URL
+	call := func(token string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodPost, a2aRPCPath, nil)
+		r.Header.Set(authorizationHeader, "Bearer "+token)
+		door.identify(w, r)
+		return w
+	}
+	if w := call(googleTestOtherToken); w.Code != http.StatusForbidden {
+		t.Fatalf("off-list account: HTTP %d, want 403", w.Code)
+	}
+	if !recordedAttr(logs, "email", googleTestOtherEmail) {
+		t.Error("the 403's log line does not name the refused email")
+	}
+	w := call("stale-static-token")
+	if w.Code != http.StatusUnauthorized || !strings.Contains(w.Body.String(), "neither the A2A door's token nor a Google access token") {
+		t.Errorf("a stale static token: HTTP %d %q, want a 401 naming both kinds of bearer", w.Code, w.Body.String())
+	}
+}
+
+// recordedAttr reports whether any record h kept carries key=value. A
+// function rather than a recordingHandler method, so it cannot collide with
+// one another change adds.
+func recordedAttr(h *recordingHandler, key, value string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.records {
+		found := false
+		r.Attrs(func(a slog.Attr) bool {
+			found = a.Key == key && a.Value.String() == value
+			return !found
+		})
+		if found {
+			return true
+		}
+	}
+	return false
 }
