@@ -23,6 +23,7 @@ import logging
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH
+import chat_notify
 import findings_queue
 import slack_audit_report
 import slack_blocks_post
@@ -1124,7 +1125,13 @@ def enabled_chat_platforms() -> list[str]:
 
     resolved = []
     for name in CHAT_PLATFORMS:
-        if name in from_managed:
+        # Under next the managed scope says the Hermes platform is off, because
+        # the A2A gateway holds the backend; posts to it go through the
+        # gateway's chat.notify route instead (chat_notify.py), so it is
+        # still a platform this install posts to.
+        if chat_notify.routes(name):
+            enabled = True
+        elif name in from_managed:
             enabled = from_managed[name]
         elif name in from_profile:
             enabled = from_profile[name]
@@ -1187,7 +1194,7 @@ def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
     """
     try:
         res = subprocess.run(
-            ["hermes", "send", "--json", "--to", active_platform, alert_msg],
+            chat_notify.command(active_platform, alert_msg),
             check=True,
             capture_output=True,
             text=True,
@@ -1196,12 +1203,7 @@ def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
         resp = json.loads(res.stdout)
         msg_id = resp.get("message_id", "")
         if msg_id:
-            # Google Chat message IDs contain space and message parts; we extract the thread key.
-            if active_platform == "google_chat" and "/messages/" in msg_id:
-                space_part, msg_part = msg_id.split("/messages/", 1)
-                thread_key = msg_part.split(".")[0]
-                return f"{space_part}/threads/{thread_key}"
-            return msg_id
+            return chat_notify.thread_from_response(active_platform, resp)
         # Sent, but unaddressable. Say which, so the caller does not re-send.
         logger.error(
             f"Alert posted to '{active_platform}' but its response carried no message id; "
@@ -2636,7 +2638,7 @@ def _send_to_chat(
         target = f"{active_platform}:{chat_id}:{thread_id}"
     try:
         res = subprocess.run(
-            ["hermes", "send", "--json", "--to", target, message],
+            chat_notify.command(target, message),
             check=True,
             capture_output=True,
             text=True,
@@ -2655,16 +2657,13 @@ def _send_to_chat(
     if threaded:
         return thread_id
     try:
-        msg_id = (json.loads(res.stdout) or {}).get("message_id", "")
+        resp = json.loads(res.stdout) or {}
     except Exception as exc:
-        logger.error(f"Failed to parse message_id from hermes send: {exc}")
+        logger.error(f"Failed to parse message_id from the send: {exc}")
         return None
-    if not msg_id:
+    if not resp.get("message_id"):
         return None
-    if active_platform == "google_chat" and "/messages/" in msg_id:
-        space_part, msg_part = msg_id.split("/messages/", 1)
-        return f"{space_part}/threads/{msg_part.split('.')[0]}"
-    return msg_id
+    return chat_notify.thread_from_response(active_platform, resp) or None
 
 
 # Tokens that end a turn or open a role in a chat template. None of them has a

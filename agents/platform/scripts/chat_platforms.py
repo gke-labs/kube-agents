@@ -31,6 +31,8 @@
 import os
 import sys
 
+import chat_notify
+
 # The platforms this harness ships an egress path for, in the order a message is
 # posted to them. Google Chat leads because it is where every one of these messages
 # already arrives — a dual-platform install should gain Slack, not have the message
@@ -185,7 +187,13 @@ def enabled_chat_platforms() -> list[str]:
 
     resolved = []
     for name in CHAT_PLATFORMS:
-        if name in from_managed:
+        # Under next the managed scope says the Hermes platform is off, because
+        # the A2A gateway holds the backend; posts to it go through the
+        # gateway's chat.notify route instead (chat_notify.py), so it is
+        # still a platform this install posts to.
+        if chat_notify.routes(name):
+            enabled = True
+        elif name in from_managed:
             enabled = from_managed[name]
         elif name in from_profile:
             enabled = from_profile[name]

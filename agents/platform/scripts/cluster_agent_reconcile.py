@@ -64,6 +64,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import sandbox_exec
+import chat_notify
 from chat_platforms import enabled_chat_platforms
 from cluster_agent_profile import (
     HERMES_BIN,
@@ -2051,7 +2052,7 @@ def _notify(message: str) -> None:
     for platform in enabled_chat_platforms():
         try:
             subprocess.run(
-                [HERMES_BIN, "send", "--to", platform, message],
+                chat_notify.command(platform, message, json_output=False, hermes_bin=HERMES_BIN),
                 capture_output=True, text=True, check=True, timeout=30, env=_run_env(),
             )
         except Exception as e:  # noqa: BLE001 - notification is best-effort; never fail the run
