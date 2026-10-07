@@ -181,9 +181,9 @@ type Config struct {
 	// It needs the door: set without A2A_DOOR_LISTEN it is refused.
 	A2ADoorGoogleClientID string
 	// A2ADoorAllowedUsers is the developer class's allowlist
-	// (A2A_DOOR_ALLOWED_USERS, comma-separated emails): a verified email
-	// off it is dropped at verification, as an unlisted Chat sender is.
-	// Empty admits nobody. There is no allow-all, unlike Chat's legacy
+	// (A2A_DOOR_ALLOWED_USERS, comma-separated emails): the door refuses a
+	// verified email off it (403) before it holds any state for the caller,
+	// and the gateway checks the same list again. Empty admits nobody. There is no allow-all, unlike Chat's legacy
 	// posture: a door any Google account can sign in to is not a default
 	// anyone should get by leaving a list blank.
 	A2ADoorAllowedUsers []string

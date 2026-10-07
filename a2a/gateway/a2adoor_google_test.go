@@ -143,6 +143,55 @@ func TestGoogleVerifierRefusals(t *testing.T) {
 	})
 }
 
+// TestGoogleVerifierCoalescesConcurrentChecksOfOneToken: a burst of
+// requests with one fresh token costs one tokeninfo call, and none of it is
+// refused for want of a slot, even when the burst is wider than the slots.
+func TestGoogleVerifierCoalescesConcurrentChecksOfOneToken(t *testing.T) {
+	release := make(chan struct{})
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		<-release
+		_ = json.NewEncoder(w).Encode(liveTokeninfo(googleTestClientID, googleTestEmail))
+	}))
+	defer srv.Close()
+	v := newGoogleTokenVerifier(googleTestClientID)
+	v.tokeninfoURL = srv.URL
+	burst := 2 * a2aGoogleTokeninfoConcurrency
+	errs := make(chan error, burst)
+	for i := 0; i < burst; i++ {
+		go func() {
+			_, err := v.verify(context.Background(), googleTestToken)
+			errs <- err
+		}()
+	}
+	waitFor(t, "the first check to reach tokeninfo", func() bool { return calls.Load() >= 1 })
+	time.Sleep(100 * time.Millisecond) // let the rest of the burst arrive and join it
+	close(release)
+	for i := 0; i < burst; i++ {
+		if err := <-errs; err != nil {
+			t.Errorf("request %d of the burst: %v", i, err)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("tokeninfo was asked %d times for one token, want 1", got)
+	}
+}
+
+// TestGoogleVerifierReadsANumericExpiry: tokeninfo sends exp as a string
+// today, but a number must parse too, not come back as "1.7598e+09".
+func TestGoogleVerifierReadsANumericExpiry(t *testing.T) {
+	f := newFakeTokeninfo(t)
+	info := liveTokeninfo(googleTestClientID, googleTestEmail)
+	info["exp"] = time.Now().Add(time.Hour).Unix()
+	delete(info, "expires_in")
+	info["email_verified"] = true
+	f.set(googleTestToken, info)
+	if _, err := testVerifier(f).verify(context.Background(), googleTestToken); err != nil {
+		t.Fatalf("a token with a numeric exp and no expires_in was refused: %v", err)
+	}
+}
+
 // TestGoogleVerifierGoogleErrorIsNotARefusal: a 5xx or a 429 from
 // tokeninfo is Google failing to answer, so the caller is not told its token
 // is bad (which would send it round a sign-in that cannot help).

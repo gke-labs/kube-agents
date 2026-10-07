@@ -103,11 +103,23 @@ type googleTokenVerifier struct {
 	now          func() time.Time
 	// inflight holds a slot per check in progress (a2aGoogleTokeninfoConcurrency).
 	inflight chan struct{}
+	// pending is the check in progress for each token key: requests that
+	// arrive with a token already being checked wait for that answer
+	// rather than spending a slot and a tokeninfo call of their own.
+	pendingMu sync.Mutex
+	pending   map[string]*googleTokenCheck
 
 	mu    sync.Mutex
 	cache map[string]googleTokenEntry
 	order []string
 	bytes int
+}
+
+// googleTokenCheck is one tokeninfo check that several requests may wait on.
+type googleTokenCheck struct {
+	done  chan struct{}
+	email string
+	err   error
 }
 
 type googleTokenEntry struct {
@@ -117,7 +129,8 @@ type googleTokenEntry struct {
 }
 
 // googleTokeninfo is the part of the tokeninfo response the door reads. The
-// endpoint sends numbers and booleans as strings; flexString takes either.
+// endpoint sends numbers and booleans as strings; flexString takes either
+// form and keeps a bare number's own text.
 type googleTokeninfo struct {
 	Aud           flexString `json:"aud"`
 	Azp           flexString `json:"azp"`
@@ -127,7 +140,9 @@ type googleTokeninfo struct {
 	ExpiresIn     flexString `json:"expires_in"`
 }
 
-// flexString decodes a JSON string, number or boolean into its text.
+// flexString decodes a JSON string, number or boolean into its text. A
+// number keeps its literal text: decoding it as a float and printing it back
+// would turn an exp of 1759800000 into "1.7598e+09", which ParseInt refuses.
 type flexString string
 
 func (f *flexString) UnmarshalJSON(b []byte) error {
@@ -136,11 +151,16 @@ func (f *flexString) UnmarshalJSON(b []byte) error {
 		*f = flexString(s)
 		return nil
 	}
-	var v any
+	var n json.Number
+	if err := json.Unmarshal(b, &n); err == nil {
+		*f = flexString(n.String())
+		return nil
+	}
+	var v bool
 	if err := json.Unmarshal(b, &v); err != nil {
 		return err
 	}
-	*f = flexString(fmt.Sprint(v))
+	*f = flexString(strconv.FormatBool(v))
 	return nil
 }
 
@@ -151,6 +171,7 @@ func newGoogleTokenVerifier(clientID string) *googleTokenVerifier {
 		client:       &http.Client{Timeout: a2aGoogleTokeninfoTimeout},
 		now:          time.Now,
 		inflight:     make(chan struct{}, a2aGoogleTokeninfoConcurrency),
+		pending:      map[string]*googleTokenCheck{},
 		cache:        map[string]googleTokenEntry{},
 	}
 }
@@ -161,12 +182,41 @@ func newGoogleTokenVerifier(clientID string) *googleTokenVerifier {
 var errGoogleTokenRefused = errors.New("the Google access token was refused")
 
 // verify returns the verified email the token was issued to, as Google
-// sent it, or an error saying why not.
+// sent it, or an error saying why not. Concurrent requests with the same
+// token share one check: a client that opens with a burst (a bridge fanning
+// out tasks/get, parallel sends, a retry storm) costs one tokeninfo call and
+// one slot, not one per request.
 func (v *googleTokenVerifier) verify(ctx context.Context, token string) (string, error) {
 	key := googleTokenKey(token)
 	if email, ok := v.cached(key); ok {
 		return email, nil
 	}
+	v.pendingMu.Lock()
+	if check, ok := v.pending[key]; ok {
+		v.pendingMu.Unlock()
+		select {
+		case <-check.done:
+			return check.email, check.err
+		case <-ctx.Done():
+			return "", errors.New("the Google access token could not be checked: the request ended while its check was in progress")
+		}
+	}
+	check := &googleTokenCheck{done: make(chan struct{})}
+	v.pending[key] = check
+	v.pendingMu.Unlock()
+	// Not on the first requester's context: others may be waiting on this
+	// check, and that one leaving must not fail theirs. The HTTP client's
+	// timeout still bounds it.
+	check.email, check.err = v.check(context.WithoutCancel(ctx), key, token)
+	v.pendingMu.Lock()
+	delete(v.pending, key)
+	v.pendingMu.Unlock()
+	close(check.done)
+	return check.email, check.err
+}
+
+// check is one tokeninfo check for a token not in the cache, under a slot.
+func (v *googleTokenVerifier) check(ctx context.Context, key, token string) (string, error) {
 	select {
 	case v.inflight <- struct{}{}:
 	default:

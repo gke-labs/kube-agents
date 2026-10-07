@@ -445,7 +445,7 @@ class A3TheA2ADoorsGoogleClassAssertsOnlyAVerifiedEmail(unittest.TestCase):
     """
 
     def test_A3_a_google_token_is_bound_to_the_install_client_and_a_verified_email(self) -> None:
-        body = h.go_function_body(h.text("a2a_door_google"), "verify")
+        body = h.go_function_body(h.text("a2a_door_google"), "check")
         self.assertRegex(
             body,
             r"string\(info\.Aud\) != v\.clientID && string\(info\.Azp\) != v\.clientID \{[^}]*return \"\"",

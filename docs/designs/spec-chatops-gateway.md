@@ -1348,7 +1348,7 @@ map, never an entry in it: the static token and its map work as before. The rost
 class's own way, never through the chat principal map that is the gateway's default.
 
 Validating a token at the door is not the per-user token brokerage the permission model
-declined: the door holds a client id and the gateway an allowlist, never a refresh token or a
+declined: the door holds a client id and an allowlist (which the gateway checks again), never a refresh token or a
 client secret. The principal this class asserts is attribution: the task's capability is the
 install's, as it is for every ingress. Still to come as verifiers of their own, each with its
 own `verifiedBy`: JWT access tokens from an OpenID Connect provider (Entra, Okta), and the

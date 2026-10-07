@@ -310,7 +310,7 @@ func New(o Options) (*Gateway, error) {
 	}
 	a2aGoogleAllowed := googleAllowlist(o.Config.A2ADoorAllowedUsers)
 	if o.Config.A2ADoorGoogleClientID != "" && len(a2aGoogleAllowed) == 0 {
-		log.Warn("the A2A door's Google sign-in is armed but A2A_DOOR_ALLOWED_USERS is empty; every Google-verified caller will be dropped at verification")
+		log.Warn("the A2A door's Google sign-in is armed but A2A_DOOR_ALLOWED_USERS is empty; the door refuses every Google-verified caller")
 	}
 	if backend == gchatBackend && len(gchatAllowed) == 0 && !o.Config.GchatAllowAllUsers {
 		log.Warn("gchat allowlist is empty and allow-all is off; every inbound message will be dropped at verification")

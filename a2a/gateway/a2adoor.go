@@ -19,10 +19,11 @@ import (
 // The A2A door: the gateway's ingress for an agent that speaks A2A over HTTP
 // (Antigravity, an ADK client, the MCP bridge, curl). It is a sibling of the
 // inject door and shares its shape - a side door beside the chat backends,
-// authenticated by a bearer token, its callers resolved through a door-scoped
-// principal map into eval identities and nothing else - and differs in what
-// it speaks: JSON-RPC 2.0 in the A2A protocol's method set, and an agent card
-// at the well-known path so a client can find it.
+// whose eval class is authenticated by a bearer token, its callers resolved
+// through a door-scoped principal map into eval identities and nothing else -
+// and differs in what it speaks: JSON-RPC 2.0 in the A2A protocol's method
+// set, and an agent card at the well-known path so a client can find it. Its
+// second class, a developer signed in with Google, is in a2adoor_google.go.
 //
 // Everything a caller does here becomes an ordinary gateway turn. The door
 // holds no bus credential, mints no id the bus sees, writes no authority

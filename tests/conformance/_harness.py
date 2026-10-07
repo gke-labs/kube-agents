@@ -282,7 +282,7 @@ SOURCES: dict[str, Source] = {
     # disjoint from, and the roster arm that keeps it off the chat map.
     "a2a_door_google": Source(
         "a2a/gateway/a2adoor_google.go",
-        ("func (v *googleTokenVerifier) verify", "a2aGoogleCallerPrefix =", ") identify("),
+        ("func (v *googleTokenVerifier) check", "a2aGoogleCallerPrefix =", ") identify("),
     ),
     "a2a_door_google_identity": Source(
         "a2a/gateway/gchat.go",
