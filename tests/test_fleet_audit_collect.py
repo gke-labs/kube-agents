@@ -69,17 +69,19 @@ def namespace(name, labels=None):
     }
 
 
-def deployment(name, ns="default", node_selector=None, node_affinity=None, tolerations=None):
+def deployment(name, ns="default", node_selector=None, node_affinity=None, tolerations=None, resources=None, runtime_class=None):
     spec_template = {
         "metadata": {"labels": {"app": name}},
         "spec": {
-            "containers": [{"name": "app", "resources": {}}],
+            "containers": [{"name": "app", "resources": resources or {}}],
             "nodeSelector": node_selector or {},
             "tolerations": tolerations or [],
         },
     }
     if node_affinity:
         spec_template["spec"]["affinity"] = {"nodeAffinity": node_affinity}
+    if runtime_class:
+        spec_template["spec"]["runtimeClassName"] = runtime_class
     return {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -952,9 +954,77 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
 
         # 3. runtimeClassName constraint
         wl_rc = collect.normalize_workloads({
-            "items": [{"kind": "Deployment", "metadata": {"name": "api-rc", "namespace": "default"}, "spec": {"template": {"spec": {"runtimeClassName": "gvisor"}}}}]
+            "items": [deployment("api-rc", runtime_class="gvisor")]
         })[0]
         hit_rc = collect.check_untargeted_compute_class_workload(wl_rc, ctx)
         self.assertIsNotNone(hit_rc)
         self.assertEqual(hit_rc["single_compute_class"], "")
         self.assertTrue(hit_rc["multiple_compute_classes"])
+
+        # 4. nodeAffinity constraint
+        wl_aff = collect.normalize_workloads({
+            "items": [deployment("api-aff", node_affinity={
+                "requiredDuringSchedulingIgnoredDuringExecution": {
+                    "nodeSelectorTerms": [{"matchExpressions": [{"key": "zone", "operator": "In", "values": ["us-central1-a"]}]}]
+                }
+            })]
+        })[0]
+        hit_aff = collect.check_untargeted_compute_class_workload(wl_aff, ctx)
+        self.assertIsNotNone(hit_aff)
+        self.assertEqual(hit_aff["single_compute_class"], "")
+        self.assertTrue(hit_aff["multiple_compute_classes"])
+
+        # 5. accelerator constraints (positive quantity)
+        wl_gpu = collect.normalize_workloads({
+            "items": [deployment("api-gpu", resources={"limits": {"nvidia.com/gpu": 1}})]
+        })[0]
+        hit_gpu = collect.check_untargeted_compute_class_workload(wl_gpu, ctx)
+        self.assertIsNotNone(hit_gpu)
+        self.assertEqual(hit_gpu["single_compute_class"], "")
+        self.assertTrue(hit_gpu["multiple_compute_classes"])
+
+        wl_tpu = collect.normalize_workloads({
+            "items": [deployment("api-tpu", resources={"requests": {"google.com/tpu": "2"}})]
+        })[0]
+        hit_tpu = collect.check_untargeted_compute_class_workload(wl_tpu, ctx)
+        self.assertIsNotNone(hit_tpu)
+        self.assertEqual(hit_tpu["single_compute_class"], "")
+        self.assertTrue(hit_tpu["multiple_compute_classes"])
+
+    def test_namespace_with_empty_default_compute_class_label_does_not_clear_workload(self):
+        # Empty string label value `cloud.google.com/default-compute-class: ""` names no class
+        # and must not clear workloads from evaluation.
+        ns_empty = namespace("empty-ns", labels={"cloud.google.com/default-compute-class": ""})
+        ctx = {
+            "compute_classes": [self.cc],
+            "node_pools": [self.base_pool],
+            "namespaces": [ns_empty],
+            "nodes": [self.base_node],
+        }
+        wl = collect.normalize_workloads({"items": [deployment("api", ns="empty-ns")]})[0]
+        hit = collect.check_untargeted_compute_class_workload(wl, ctx)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["single_compute_class"], "standard-cc")
+
+    def test_workload_with_zero_accelerator_limit_not_treated_as_scheduling_constraint(self):
+        # Literal 0 / "0" accelerator quantity or non-accelerator resource key
+        # does not treat the CPU workload as having accelerator constraints.
+        ctx = {
+            "compute_classes": [self.cc],
+            "node_pools": [self.base_pool],
+            "namespaces": [self.ns],
+            "nodes": [self.base_node],
+        }
+        wl_zero = collect.normalize_workloads({
+            "items": [deployment("api-zero-gpu", resources={"limits": {"cpu": "500m", "nvidia.com/gpu": 0}})]
+        })[0]
+        hit_zero = collect.check_untargeted_compute_class_workload(wl_zero, ctx)
+        self.assertIsNotNone(hit_zero)
+        self.assertEqual(hit_zero["single_compute_class"], "standard-cc")
+
+        wl_zero_str = collect.normalize_workloads({
+            "items": [deployment("api-zero-str-tpu", resources={"requests": {"google.com/tpu": "0"}})]
+        })[0]
+        hit_zero_str = collect.check_untargeted_compute_class_workload(wl_zero_str, ctx)
+        self.assertIsNotNone(hit_zero_str)
+        self.assertEqual(hit_zero_str["single_compute_class"], "standard-cc")

@@ -3761,9 +3761,9 @@ def _namespace_labels(context: dict, ns: str) -> dict:
 
 def _namespace_has_default_compute_class(context: dict, ns_name: str) -> bool:
     labels = _namespace_labels(context, ns_name)
-    return (
-        DEFAULT_COMPUTE_CLASS_LABEL in labels
-        or DEFAULT_COMPUTE_CLASS_NON_DAEMONSET_LABEL in labels
+    return bool(
+        labels.get(DEFAULT_COMPUTE_CLASS_LABEL)
+        or labels.get(DEFAULT_COMPUTE_CLASS_NON_DAEMONSET_LABEL)
     )
 
 
@@ -3845,6 +3845,29 @@ def _tolerates_pool(tolerations: list[dict], pool: dict) -> bool:
     return all(_tolerates_taint(tolerations, t) for t in taints)
 
 
+_ACCELERATOR_RESOURCE_KEYS = frozenset({
+    "nvidia.com/gpu",
+    "google.com/tpu",
+})
+
+
+def _is_positive_resource_quantity(val: object) -> bool:
+    if val is None:
+        return False
+    if isinstance(val, (int, float)):
+        return val > 0
+    s = str(val).strip()
+    if not s or s == "0":
+        return False
+    try:
+        clean = s.rstrip("mKiMGTPEe")
+        if clean and float(clean) == 0:
+            return False
+    except ValueError:
+        pass
+    return True
+
+
 def _workload_has_scheduling_constraints(template: dict) -> bool:
     if template.get("nodeSelector"):
         return True
@@ -3864,8 +3887,8 @@ def _workload_has_scheduling_constraints(template: dict) -> bool:
         res = c.get("resources") or {}
         reqs = res.get("requests") or {}
         limits = res.get("limits") or {}
-        for k in set(reqs.keys()) | set(limits.keys()):
-            if "gpu" in k or "tpu" in k:
+        for k in _ACCELERATOR_RESOURCE_KEYS:
+            if _is_positive_resource_quantity(reqs.get(k)) or _is_positive_resource_quantity(limits.get(k)):
                 return True
     return False
 

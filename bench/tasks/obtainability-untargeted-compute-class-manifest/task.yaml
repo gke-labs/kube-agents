@@ -7,10 +7,10 @@
 # the answer is merge order rather than a hand-off. Wait for the sibling, then run
 # the loop... The reviewer's thread stays open until this pull request carries its
 # own red"), observing the positive arm of §3.24 requires #2540 to land first to
-# provision the ComputeClass node pool fixture in evaluation pool projects, or
-# maintainer acceptance of the hand-off (assigned to @bnaylor / fleet maintainers).
-# The review thread stays open until the red against main and three greens on the
-# branch are observed and recorded against a cluster carrying the #2540 fixture.
+# provision the ComputeClass node pool fixture in evaluation pool projects.
+# Maintainer @bnaylor reviewed and scoped this PR at commit 7f2e7001; the review
+# thread remains open until #2540 merges and the red against main and three greens
+# on the branch are observed and recorded against a cluster carrying the #2540 fixture.
 # The non-finding collector paths (command recording, CRD inspection, clean run on
 # standard node pools) are verified live on kyber-test.
 #
