@@ -1071,7 +1071,7 @@ def classify_rep(
     if record.error is not None and INFRA_FAILURE_MARKER in str(record.error):
         return rep(
             "infra",
-            "the harness exhausted its retries without reaching the agent "
+            "the harness recorded an infrastructure condition or exhausted its retries "
             f"({INFRA_FAILURE_MARKER}): the record is scored, but there is no "
             "answer in it to grade",
         )

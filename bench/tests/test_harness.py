@@ -1327,6 +1327,7 @@ def test_an_opening_turn_502_with_failure_reason_is_an_agent_error_not_infra(
     assert result.has_errors()
     assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
     assert "HTTP 502" in result.errors[0]
+    assert "tool_error" in result.errors[0]
     assert result.errors[0] in result.output
     assert len(stub_agent.requests) == 1
 
@@ -1342,6 +1343,7 @@ def test_an_opening_turn_502_with_rate_limit_reason_is_infra(
 
     assert result.has_errors()
     assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "rate_limit" in result.errors[0]
     assert len(stub_agent.requests) == 1
 
 
@@ -3513,6 +3515,38 @@ def test_a_status_turn_502_with_rate_limit_on_answer_turn_is_an_agent_error_not_
     assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
     assert "status turn hit infrastructure failure (rate_limit)" in result.errors[0]
     assert len(stub_agent.requests) == 3
+    assert result.output == _FINAL_TEXT
+    assert _archived(scripts)
+
+
+def test_a_status_turn_bare_transport_exhaustion_on_answer_turn_is_infra(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_agent: _StubAgentServer,
+    instant_polls: None,
+    no_cluster_exec: list[str],
+) -> None:
+    """Bare transport exhaustion on status turns during an answer turn is infra.
+
+    When a card-wake answer turn dispatches work and three consecutive status
+    polls fail in transport without an X-Hermes-Failure-Reason header (e.g.
+    bare 502 Bad Gateway while upstream pod is replaced), _await_delegated_work
+    raises _DelegationTransportExhausted with failure_reason=None. Because this
+    is transport failure that never reached an agent, it is classified as
+    infrastructure (_infra_failure) with INFRA_FAILURE_MARKER on both opening
+    and answer turns.
+    """
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    stub_agent.turns = [_turn(_text(_FINAL_TEXT)), _create_turn(), _show_turn("done")]
+    stub_agent.fail_on = frozenset({3, 4, 5})
+    stub_agent.fail_on_status = 502
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "status turns failed in transport 3 times running" in result.errors[0]
+    assert len(stub_agent.requests) == 5
     assert result.output == _FINAL_TEXT
     assert _archived(scripts)
 

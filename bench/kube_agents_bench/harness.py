@@ -1415,8 +1415,14 @@ class _DelegationTransportExhausted(Exception):
     ``rca-remediation-pr`` scored 0.0 for a pod restart while its worker filed
     the real remediation PR). ``_execute`` catches this and replaces the graded
     result wholesale with :func:`_infra_failure`, the same run class the
-    opening turn returns on exhaustion. Carries the marker detail as ``str``.
+    opening turn returns on exhaustion. When raised because a status turn hit
+    an explicit infrastructure failure reason (e.g. rate limit or billing),
+    ``failure_reason`` carries that reason string.
     """
+
+    def __init__(self, message: str, *, failure_reason: str | None = None) -> None:
+        super().__init__(message)
+        self.failure_reason = failure_reason
 
 
 class KubeAgentsHarness(AgentHarness):
@@ -1575,8 +1581,12 @@ class KubeAgentsHarness(AgentHarness):
                 # so the executed and billed turn remains graded and preserved.
                 if exc.failure_reason:
                     if exc.failure_reason in ("rate_limit", "billing") and opening_turn:
-                        return _infra_failure(str(exc))
-                    return AgentResult.errored(str(exc))
+                        return _infra_failure(
+                            f"opening turn hit infrastructure failure ({exc.failure_reason}): {exc}"
+                        )
+                    return AgentResult.errored(
+                        f"agent turn failed with {exc.failure_reason}: {exc}"
+                    )
                 # A 500, a 4xx other than 429, or a body that is not JSON says a handler
                 # answered; that is the agent's own failure and still belongs in
                 # front of the judge. Only a gateway status, an admission-control
@@ -1629,10 +1639,14 @@ class KubeAgentsHarness(AgentHarness):
                     or session_id
                 )
             except _DelegationTransportExhausted as exc:
-                # Not AgentResult.errored, and not the delegating turn's
-                # partial result either: see _infra_failure. The wait died in
-                # transport, so this is the run class, not an answer.
-                if not opening_turn:
+                # When a status turn inside an answer turn hit an infrastructure
+                # failure reason (e.g. rate limit or billing), the turn executed
+                # and the wake reply must be preserved as an errored answer turn
+                # rather than classified as infrastructure. Bare transport
+                # exhaustion (consecutive 502/503/504s, connection drops, or 429s)
+                # dies in transport without reaching the agent and remains
+                # infrastructure on both opening and answer turns.
+                if not opening_turn and exc.failure_reason in ("rate_limit", "billing"):
                     return AgentResult.errored(str(exc))
                 return _infra_failure(str(exc))
 
@@ -2396,7 +2410,8 @@ class KubeAgentsHarness(AgentHarness):
                 if exc.failure_reason in ("rate_limit", "billing"):
                     _purge_card_state(awaited, _EXEC_TIMEOUT)
                     raise _DelegationTransportExhausted(
-                        f"status turn hit infrastructure failure ({exc.failure_reason}): {exc}"
+                        f"status turn hit infrastructure failure ({exc.failure_reason}): {exc}",
+                        failure_reason=exc.failure_reason,
                     ) from exc
                 if exc.failure_reason:
                     result.errors.append(
