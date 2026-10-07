@@ -397,6 +397,18 @@ class StageTest(unittest.TestCase):
         self._main(now=NOW_SETTLED + MINUTE + oobe.RUN_LIMIT_SECONDS)
         self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS[:2]))
 
+    def test_a_claimed_run_holds_the_chain(self):
+        # Claimed by the tick but not yet running is still in flight.
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._main(now=NOW_SETTLED)
+        self._ledger(FIRST[0], "claimed", NOW_SETTLED + MINUTE)
+        self._main(now=NOW_SETTLED + 2 * MINUTE)
+        self.assertEqual(self._started_ids(), FIRST)
+        self._ledger(FIRST[0], "completed", NOW_SETTLED + MINUTE)
+        self._main(now=NOW_SETTLED + 3 * MINUTE)
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS[:2]))
+
     def test_the_first_mark_waits_for_a_scheduled_run(self):
         # The 06:20 compliance run is going when the scan settles.
         self._ledger("compliance-audit", "running", NOW_SETTLED - MINUTE)
