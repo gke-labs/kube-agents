@@ -144,6 +144,11 @@ SEGMENT_LABELS = (
 # number attached.
 SEGMENT_MIN_COVERAGE = 0.5
 
+# Above this share of the sweep's builds raising, the window is reported as
+# unmeasured rather than as a percentile over the builds that did not. Fewer,
+# and the bad builds are named and left out (#2477).
+UNREADABLE_SHARE_LIMIT = 0.5
+
 # What a segment prints in place of a median, and the two column widths the
 # breakdown is laid out on. The label column clears the longest label by a
 # space on purpose: "container start -> lease requested" is exactly as wide as
@@ -938,13 +943,13 @@ def collect_waits(
             datetime.strptime(oldest, DATE_FORMAT).replace(tzinfo=timezone.utc),
         )
 
-    if unreadable and not collected:
-        # Every build raised. Reported as unmeasured, not as a window with no
-        # runs: before the per-build catch this input crashed the job red.
+    if len(unreadable) > read * UNREADABLE_SHARE_LIMIT:
+        # Before the per-build catch this input crashed the job red; it must
+        # not come out as a quiet window over the few builds that did read.
         first = unreadable[0]
         return Source(
-            error=f"none of the {read} builds could be read; first failure, build "
-            f"{first['build_id']}: {first['error']}"
+            error=f"{len(unreadable)} of {read} builds could not be read; first, "
+            f"build {first['build_id']}: {first['error']}"
         )
 
     waits = [w for w in collected if measured_start <= w.created <= window_end]

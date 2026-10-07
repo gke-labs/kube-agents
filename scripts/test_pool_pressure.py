@@ -744,13 +744,15 @@ class SweepUnreadable(unittest.TestCase):
     BAD = BUILDS[1]
     AS_OF = datetime(2026, 8, 27, tzinfo=timezone.utc)
 
-    def _sweep(self, bad=(BAD,)):
+    def _sweep(self, bad=(BAD,), pending=()):
         entries = {build: f"gs://bucket/{build}" for build in self.BUILDS}
 
         def wait_for(path):
             build = int(path.rsplit("/", 1)[1])
             if build in bad:
                 raise UnicodeDecodeError("utf-8", b"\xe2\x86", 0, 2, "unexpected end of data")
+            if build in pending:
+                return None
             moment = pp.snowflake_time(build)
             return pp.Wait(build, "1", moment, moment, 15)
 
@@ -782,8 +784,23 @@ class SweepUnreadable(unittest.TestCase):
         catch must not turn it into a green window with no runs."""
         source = self._sweep(bad=self.BUILDS)
         self.assertFalse(source.ok)
-        self.assertIn("3", source.error)
+        self.assertIn("3 of 3", source.error)
         self.assertIn("UnicodeDecodeError", source.error)
+
+    def test_most_builds_unreadable_is_not_measured_even_with_one_run(self):
+        """One run out of three is a percentile over almost nothing, which the
+        daily floor would otherwise let through as a quiet green window."""
+        source = self._sweep(bad=self.BUILDS[:2])
+        self.assertFalse(source.ok)
+        self.assertIn("2 of 3", source.error)
+
+    def test_one_bad_build_among_builds_still_starting_is_not_a_read_failure(self):
+        """A build with no prowjob.json yet was read and had nothing to say; it
+        does not make the one raising build a bucket-wide failure."""
+        source = self._sweep(bad=(self.BAD,), pending=tuple(b for b in self.BUILDS if b != self.BAD))
+        self.assertTrue(source.ok)
+        self.assertEqual([], source.value.waits)
+        self.assertEqual([str(self.BAD)], [u["build_id"] for u in source.value.unreadable])
 
 
 class FromDirLogHead(unittest.TestCase):
@@ -799,6 +816,9 @@ class FromDirLogHead(unittest.TestCase):
             )
         self.assertTrue(source.ok)
         self.assertEqual(5, len(source.value.waits))
+        # Decoded past the cut, not swallowed: the lease banners are still read.
+        worst = next(w for w in source.value.waits if w.build_id == 2092660728946233344)
+        self.assertIsNotNone(worst.lease_acquired)
 
 
 class EndToEnd(unittest.TestCase):
