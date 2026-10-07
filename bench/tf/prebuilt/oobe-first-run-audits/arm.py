@@ -67,13 +67,18 @@ def save(state):
     write(STATE, json.dumps(state))
 
 
-def archived_card(key, title):
-    """File a card no worker picks up (blocked, unassigned) and archive it at once."""
+def archived_card(state, key, title):
+    """File a card no worker picks up (blocked, unassigned), record it, then archive it.
+
+    Recorded before the archive, so a failed archive leaves a card the disarm can find.
+    """
     out = subprocess.run(
         [hermes, "kanban", "create", "--json", "--initial-status", "blocked", "--idempotency-key", key, title],
         capture_output=True, text=True, check=True,
     ).stdout
     card = json.loads(out[out.find("{"):out.rfind("}") + 1])["id"]
+    state["cards"].append(card)
+    save(state)
     subprocess.run([hermes, "kanban", "archive", card], capture_output=True, text=True, check=True)
     return card
 
@@ -99,12 +104,8 @@ state = {
 }
 save(state)
 
-sweep = archived_card(SWEEP_KEY, "oobe eval: stand-in onboarding sweep")
-state["cards"].append(sweep)
-save(state)
-ranking = archived_card(RANKING_KEY, "oobe eval: stand-in onboarding ranking card")
-state["cards"].append(ranking)
-save(state)
+sweep = archived_card(state, SWEEP_KEY, "oobe eval: stand-in onboarding sweep")
+ranking = archived_card(state, RANKING_KEY, "oobe eval: stand-in onboarding ranking card")
 
 write(SCAN_MARKER, f"task_id={sweep}\nfiled_at={int(datetime.now(timezone.utc).timestamp())}\n")
 try:

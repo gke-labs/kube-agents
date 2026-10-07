@@ -23,6 +23,7 @@ one, that the disarm restores exactly what was there, and which runs count as in
 flight. The provisioners' bash is syntax-checked as Terraform renders it.
 """
 
+import ast
 import json
 import os
 import pathlib
@@ -34,7 +35,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 STACK = REPO / "bench" / "tf" / "prebuilt" / "oobe-first-run-audits"
@@ -42,6 +43,13 @@ AUDITS = ["compliance-audit", "obtainability-audit", "fleet-wide-cost-analysis",
 OOBE_JOB = {"id": "oobe", "script": "oobe.py", "no_agent": True, "schedule": {"kind": "cron", "expr": "* * * * *"}}
 OTHER_JOB = {"id": "profile-cron-tick", "schedule": {"kind": "cron", "expr": "* * * * *"}}
 NOW = datetime.now(timezone.utc).isoformat()
+MINUTE = 60
+# in_flight.py's cutoff, read from source so the test follows it.
+STALE_SECONDS = eval(re.search(r"^STALE_SECONDS = (.+)$", (STACK / "in_flight.py").read_text(), re.M).group(1))
+
+
+def ago(seconds: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
 
 CRON_JOBS_STUB = textwrap.dedent(
     """
@@ -228,6 +236,18 @@ class PlantScriptsTest(unittest.TestCase):
         self.store.write_text(json.dumps([OTHER_JOB]))
         self.assertEqual(self._run("disarm.py", str(self.home)).returncode, 0)
 
+    def test_a_card_left_unarchived_is_recorded_and_archived_by_the_disarm(self):
+        failing = self.hermes.with_name("hermes-no-archive")
+        failing.write_text(HERMES_STUB + "if sys.argv[1:3] == ['kanban', 'archive']:\n    sys.exit(1)\n")
+        failing.chmod(failing.stat().st_mode | stat.S_IXUSR)
+        done = self._run("arm.py", str(self.home), str(failing), "20261006200000", str(self.shipped))
+        self.assertNotEqual(done.returncode, 0)
+        cards = self._state()["cards"]
+        self.assertEqual(len(cards), 1)
+        self.hermes_log.unlink()
+        self.assertEqual(self._run("disarm.py", str(self.home), str(self.hermes)).returncode, 0)
+        self.assertIn(["kanban", "archive", cards[0]], self._hermes_calls())
+
     def test_disarm_with_nothing_armed_changes_nothing(self):
         (self.home / ".bootstrap_scan_filed").write_text("task_id=t_real\n")
         done = self._run("disarm.py", str(self.home))
@@ -260,12 +280,12 @@ class PlantScriptsTest(unittest.TestCase):
             con.executemany(
                 "INSERT INTO executions VALUES (?, ?, ?, ?)",
                 [
-                    ("1", "compliance-audit", "running", NOW),
+                    ("1", "compliance-audit", "running", ago(STALE_SECONDS - MINUTE)),
                     ("2", "obtainability-audit", "claimed", NOW),
                     ("3", "stockout-prevention", "completed", NOW),
                     ("4", "gce-compute-fleet-audit", "running", NOW),
-                    # Cut off by a gateway restart: still running, a day old.
-                    ("5", "fleet-wide-cost-analysis", "running", "2000-01-01T00:00:00+00:00"),
+                    # Cut off by a gateway restart: still running, just past the cutoff.
+                    ("5", "fleet-wide-cost-analysis", "running", ago(STALE_SECONDS + MINUTE)),
                 ],
             )
         done = self._run("in_flight.py", str(self.home), *AUDITS)
@@ -316,10 +336,16 @@ class PlantScriptsTest(unittest.TestCase):
             self.assertEqual(done.returncode, 0, done.stderr)
 
     def test_the_stack_names_the_audits_the_stage_starts(self):
-        stage = (REPO / "agents" / "chat" / "scripts" / "oobe.py").read_text()
-        for audit in AUDITS:
-            self.assertIn(f'"{audit}"', stage)
-        self.assertIn(" ".join(AUDITS), (STACK / "main.tf").read_text())
+        # Read both lists back from source, so a fifth audit added to either is caught.
+        stage = ast.parse((REPO / "agents" / "chat" / "scripts" / "oobe.py").read_text())
+        shipped = next(
+            ast.literal_eval(node.value)
+            for node in stage.body
+            if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "FIRST_RUN_AUDITS" for t in node.targets)
+        )
+        stack = re.search(r'^\s*audits\s*=\s*"([^"]*)"', (STACK / "main.tf").read_text(), re.M).group(1).split()
+        self.assertEqual(list(shipped), stack)
+        self.assertEqual(list(shipped), AUDITS)
 
 
 if __name__ == "__main__":
