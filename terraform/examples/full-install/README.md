@@ -73,8 +73,10 @@ install without the interview.
   ingress ([`drift-pubsub`](../../modules/drift-pubsub) module): a Log Router
   sink exporting GKE audit logs (`drift_pubsub_sink`), the drift-audit Pub/Sub
   topic (`drift_pubsub_topic`) and pull subscription
-  (`drift_pubsub_subscription`), and the sink-writer and agent-GSA IAM on
-  them; and, with `enable_drift_detector = true` alongside it, the
+  (`drift_pubsub_subscription`), the sink-writer and agent-GSA IAM on
+  them, and publisher on the topic for anything
+  `drift_pubsub_topic_publishers` names; and, with
+  `enable_drift_detector = true` alongside it, the
   `spec.harness.driftDetector.enabled` field that starts the consumer. See
   [Drift audit-log ingress](#drift-audit-log-ingress).
 - Optionally (`model_provider = "vertex_ai"`) the Vertex AI / Model Garden path:
@@ -764,10 +766,20 @@ subscription (`drift_pubsub_subscription`, default
 `platform-agent-drift-audit-sub`), `roles/pubsub.publisher` on the topic for
 the sink's writer identity, and `roles/pubsub.subscriber` plus
 `roles/pubsub.viewer` on the subscription for the agent's GSA. It also adds
-`pubsub.googleapis.com` to the enabled APIs. Beyond the three names, only the
-module's two required inputs are passed, so its defaults decide the 31-day
-retention and the cluster scope, which is every GKE cluster in the project; a
-caller that needs the module's other knobs instantiates it directly.
+`pubsub.googleapis.com` to the enabled APIs.
+
+`drift_pubsub_topic_publishers` (default `[]`) grants `roles/pubsub.publisher`
+on the topic to each member it lists, on top of the sink's writer identity.
+Leave it empty unless a test harness has to inject synthetic audit records: the
+detector classifies on the `principalEmail` inside each record and Pub/Sub does
+not attach the publisher's identity to the message, so anything that can
+publish here can make the detector report a change nobody made, under any
+principal it names. Never list the agent's own GSA.
+
+Beyond the three names and that list, only the module's two required inputs are
+passed, so its defaults decide the 31-day retention and the cluster scope,
+which is every GKE cluster in the project; a caller that needs the module's
+other knobs instantiates it directly.
 
 Three outputs, each `null` while the flag is off: `drift_pubsub_topic`,
 `drift_pubsub_subscription`, and `drift_pubsub_subscription_id`, the

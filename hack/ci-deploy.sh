@@ -36,6 +36,89 @@ set -euo pipefail
 # env allowlist letting it through to the container.
 readonly EVAL_ALERT_DAILY_LIMIT_WARNING="0"
 
+# The drift bucket's own ceiling, off for the same reason and by the same
+# mechanism. A drift case spends one inject per audit record that survives the
+# classifier, and the regression it is there to catch — a classifier that stops
+# filtering — spends one per record that should have been dropped, so the
+# failing run is the one that needs the most headroom. A finite ceiling is worse
+# than no ceiling here rather than merely tighter: a repetition that begins with
+# one slot left files a card for the first record and is refused the rest, which
+# is what a working filter looks like from the outside. Uncapped, an unfiltered
+# pipeline files every card it should not have and the case reds.
+#
+# What that costs, stated rather than discovered: one lease deploys one install
+# and runs the whole matrix against it, so this ceiling is off for every case
+# rather than for drift ones, and the board it fills is shared
+# (kanban.max_in_progress is 2). A single human-tier record therefore files
+# unbounded cards and can starve unrelated cases in the same lease. On a leased
+# pool project almost every principal is a service account and the classifier
+# drops it, so the steady state is quiet; the triggers are a maintainer running
+# kubectl against a leased cluster mid-run, a `user:` principal in the project,
+# the classifier regression this setting exists to expose, and the backlog
+# below. Accepted because a finite cap makes that regression green, which is
+# the failure that matters.
+#
+# The backlog is the widest of those and is not bounded by the lease. The sink
+# exports every cluster in the project and the subscription keeps what nothing
+# has acked for terraform/modules/drift-pubsub's default 31 days, never
+# expiring; teardown uninstalls the chart, so no detector pulls between leases.
+# Each lease therefore opens on everything human-tier logged since the last one
+# drained — on a freshly provisioned project, including the provisioning. This
+# script cannot drain it: seeking the subscription needs
+# pubsub.subscriptions.seek, and provision_ci_pool_project.sh gives the runner
+# roles/viewer, which carries get and list and not that. Shortening retention
+# for pool projects is the fix and is a tfvars change rather than one made
+# here; #2491 tracks it.
+readonly EVAL_ALERT_DAILY_LIMIT_DRIFT="0"
+
+# The subscription the drift detector pulls from. The pool project's own
+# provisioning owns the resource: scripts/provision_ci_pool_project.sh sets
+# enable_drift_pubsub in the full-install tfvars, and terraform/modules/
+# drift-pubsub creates the sink, the topic and this subscription and grants
+# kubeagents-platform-gsa subscriber and viewer on it. Nothing is created here
+# — the install has one engine, and a `gcloud pubsub create` beside the module
+# would be a second expression of the same step.
+#
+# The name is restated rather than read back because this helm upgrade replaces
+# the composition's whole value set, the subscription included, so an install
+# that had it loses it unless the deploy puts it back. It has to stay equal to
+# full-install's `drift_pubsub_subscription` default;
+# tests/test_ci_deploy_drift_detector.py pins the two.
+readonly EVAL_DRIFT_SUBSCRIPTION="platform-agent-drift-audit-sub"
+
+# What step 6 waits for to call the detector started, and where. The line is
+# k8s-operator/cmd/drift-detector/main.go's last before the pull loop, so it
+# clears flag parsing, the cluster-name check against the pod's own
+# credentials, and the ack-deadline read -- each of which otherwise exits the
+# process on every start with the pod still Ready. The detector runs in the
+# credential-proxy sidecar, not the agent container
+# (deploy/docker/Dockerfile), so the logs call has to name it.
+readonly EVAL_DRIFT_READY_MARKER="drift-detector: pulling"
+readonly EVAL_DRIFT_READY_CONTAINER="agent-api-auth"
+# 5 minutes. start-services.sh holds the first launch until the Session KV
+# daemon is listening, and backs off between restarts, so this is well clear of
+# a cold start rather than tight against it.
+readonly EVAL_DRIFT_READY_ATTEMPTS=60
+readonly EVAL_DRIFT_READY_INTERVAL_SECONDS=5
+
+# Deliberately not --log-dropped here, though the detector takes it and
+# deploy/shared/start-services.sh will pass it on any install that sets
+# DRIFT_DETECTOR_LOG_DROPPED through spec.deployment.env. One deploy serves the
+# whole eval matrix, so the cost is paid by every lease rather than by drift
+# cases: the post-sink stream runs 1 to 10 records a second and is about 98%
+# system tier (terraform/modules/drift-pubsub/main.tf measures ~60k/day on a
+# two-cluster project, and a pool project carries the host cluster plus the
+# seeded fleet), so a line per drop is most of the audit stream copied into the
+# sidecar's stderr and shipped on to Cloud Logging.
+#
+# A fixture does not need it to tell an empty ingress from an over-eager
+# filter. The detector already prints `idle, no messages delivered in %s
+# (parsed=%d skipped=%d failed=%d)` on a timer and `pull failed, retrying` when
+# the subscription cannot be read (k8s-operator/cmd/drift-detector/
+# subscriber.go), which separates the three states; `skipped` is the count a
+# noise-filter case asserts on. What --log-dropped adds over that is which
+# record and why, and that is worth a targeted rerun rather than every lease.
+
 # The kanban board's worker cap on the eval install. The image ships
 # kanban.max_in_progress: 2 (agents/chat/config.yaml), a floor for an install
 # that has not measured its own worker footprint, and the operator renders a
@@ -1106,6 +1189,10 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set "platformAgent.harness.tuning.maxInProgress=${EVAL_KANBAN_MAX_IN_PROGRESS}" \
     --set-string "platformAgent.deployment.env[0].name=ALERT_DAILY_LIMIT_WARNING" \
     --set-string "platformAgent.deployment.env[0].value=${EVAL_ALERT_DAILY_LIMIT_WARNING}" \
+    --set-string "platformAgent.deployment.env[1].name=ALERT_DAILY_LIMIT_DRIFT" \
+    --set-string "platformAgent.deployment.env[1].value=${EVAL_ALERT_DAILY_LIMIT_DRIFT}" \
+    --set "platformAgent.harness.driftDetector.enabled=true" \
+    --set-string "platformAgent.harness.driftDetector.subscription=${EVAL_DRIFT_SUBSCRIPTION}" \
     ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"} \
     --wait --timeout 15m 2>&1 | tee "${HELM_INSTALL_OUT}"
   HELM_EXIT="${PIPESTATUS[0]}"
@@ -1185,6 +1272,48 @@ if ! kubectl rollout status statefulset/platform-agent-shell -n "${NAMESPACE}" -
   kubectl describe statefulset/platform-agent-shell -n "${NAMESPACE}" || true
   kubectl get pods -n "${NAMESPACE}" || true
   kubectl logs -n "${NAMESPACE}" statefulset/platform-agent-shell --all-containers --tail=50 || true
+  exit 1
+fi
+
+# The detector is the third thing the operator builds from the CR that
+# `helm --wait` cannot see, and the only one whose failure leaves the pod
+# Ready. driftDetectorEnabled returns false without erroring on a numeric
+# projectId or an empty location, and an enabled detector that exits on every
+# start is retried forever by start-services.sh behind a Ready gateway
+# (charts/kube-agents/README.md). Either way every drift case in the lease
+# reds as an agent triage failure with nothing in this log saying the install
+# was wrong -- which is what this gate is for.
+#
+# Deliberately not a check that records are arriving. A project onboarded
+# before the ingress existed reaches the marker and then fails its pulls, and
+# failing the deploy for that would red the whole matrix over a gap only a
+# drift case cares about (docs/ci-pool-projects.md).
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Verifying drift-detector startup ==="
+drift_detector_started=false
+# `grep -F ... >/dev/null` rather than `grep -qF`, and the difference is the
+# whole gate. `-q` exits on the first match, which closes the pipe under a
+# kubectl still writing; kubectl takes SIGPIPE, and the `set -o pipefail` at
+# the top of this script turns that into a failed pipeline. The marker prints
+# once when the detector starts and it keeps logging after that, so the log is
+# past the 64 KiB pipe buffer by the time this runs and the match is an early
+# line -- the shape that fails. Found reads as not found, the loop exhausts,
+# and a healthy install reds every case in the lease, with the message below
+# saying the detector never started. Draining a bounded log costs one read.
+for _ in $(seq "${EVAL_DRIFT_READY_ATTEMPTS}"); do
+  if kubectl logs -n "${NAMESPACE}" deployment/platform-agent-gateway \
+    -c "${EVAL_DRIFT_READY_CONTAINER}" 2>/dev/null |
+    grep -F "${EVAL_DRIFT_READY_MARKER}" >/dev/null; then
+    drift_detector_started=true
+    break
+  fi
+  sleep "${EVAL_DRIFT_READY_INTERVAL_SECONDS}"
+done
+if [[ "${drift_detector_started}" != "true" ]]; then
+  echo "ERROR: drift-detector never reached its pull loop on this install"
+  echo "       (no '${EVAL_DRIFT_READY_MARKER}' in the ${EVAL_DRIFT_READY_CONTAINER} container)"
+  kubectl get platformagent -n "${NAMESPACE}" -o yaml || true
+  kubectl logs -n "${NAMESPACE}" deployment/platform-agent-gateway \
+    -c "${EVAL_DRIFT_READY_CONTAINER}" --tail=100 || true
   exit 1
 fi
 echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
