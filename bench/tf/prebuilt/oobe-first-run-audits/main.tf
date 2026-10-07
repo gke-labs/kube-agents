@@ -26,7 +26,11 @@
 # Before it arms, the apply waits until none of the four audits is still running
 # from an earlier repetition, since an audit already in flight is not started
 # again when it is marked due; it fails if they are still running after
-# `busy_wait`. An earlier run's arm left behind is disarmed first.
+# `busy_wait`. An earlier run's arm left behind is disarmed first. After the arm it
+# waits, up to `ran_wait`, for the put-back job's first run to end: that run comes
+# on the gateway's next minute and the audits start on the tick after it, which
+# together outlast the verifier's two-minute window. On an image without the job
+# there is nothing to wait for.
 #
 # The teardown, and the exit trap on a failed apply, run disarm.py: both markers
 # go back as they were and the `oobe` job comes out if this stack put it there.
@@ -52,6 +56,11 @@ locals {
   arm_b64    = base64encode(file("${path.module}/arm.py"))
   disarm_b64 = base64encode(file("${path.module}/disarm.py"))
   busy_b64   = base64encode(file("${path.module}/in_flight.py"))
+  ran_b64    = base64encode(file("${path.module}/oobe_ran.py"))
+  # arm.py prints this when the image ships no oobe job.
+  no_job   = "ships no oobe job"
+  ran_wait = 300
+  ran_poll = 15
   # Each audit takes 9-15 minutes on its own (#985); four started together by an
   # earlier repetition finish well inside this.
   busy_wait = 2400
@@ -145,7 +154,23 @@ resource "null_resource" "oobe" {
 
       # ---- 3. Arm ---------------------------------------------------------
       arming=1
-      printf '%s' '${local.arm_b64}' | base64 -d | agent_py "${local.home}" "${local.hermes}" "$(date -u +%Y%m%d%H%M%S)"
+      armed="$(printf '%s' '${local.arm_b64}' | base64 -d | agent_py "${local.home}" "${local.hermes}" "$(date -u +%Y%m%d%H%M%S)")"
+      printf '%s\n' "$armed"
+
+      # ---- 4. Wait for the job's first run --------------------------------
+      # Whether or not it ends in time, the verifier decides; this only keeps
+      # its window from opening before the stage has had its turn.
+      if [[ "$armed" != *"${local.no_job}"* ]]; then
+        elapsed=0
+        until ran="$(printf '%s' '${local.ran_b64}' | base64 -d | agent_py "${local.home}")" && [ "$${ran:-0}" -ge 1 ]; do
+          if [ "$elapsed" -ge ${local.ran_wait} ]; then
+            echo "The oobe job has not finished a run $${elapsed}s after the arm; leaving it to the verifier." >&2
+            break
+          fi
+          sleep ${local.ran_poll}
+          elapsed=$((elapsed + ${local.ran_poll}))
+        done
+      fi
     EOT
   }
 

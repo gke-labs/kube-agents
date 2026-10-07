@@ -15,7 +15,8 @@
 # card and an archived ranking card after it, points `.bootstrap_scan_filed` at
 # the sweep, removes `.oobe_audits_fired`, and puts back the `oobe` job if the
 # deployed image ships one (an install that onboarded before the job existed never
-# got it). The verifier reads the Platform Agent's cron/executions.db and passes
+# got it), then waits up to five minutes for that job's first run to end. The
+# verifier reads the Platform Agent's cron/executions.db and passes
 # once all four audits have a run since the arm that is running or completed. On
 # an image without the job nothing starts them, which is this case's red.
 #
