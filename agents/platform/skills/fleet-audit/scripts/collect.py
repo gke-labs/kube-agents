@@ -3723,14 +3723,6 @@ _CONTROLLER_NODE_TAINT_KEYS = {
 
 _AUDITABLE_NODE_POOL_STATUSES = frozenset({"RUNNING", "RUNNING_WITH_ERROR", "RECONCILING"})
 
-_GKE_MANAGED_TAINT_KEYS = frozenset({
-    "nvidia.com/gpu",
-    "google.com/tpu",
-    "kubernetes.io/arch",
-    "sandbox.gke.io/runtime",
-    "node.kubernetes.io/os",
-})
-
 
 def _normalize_taint_effect(effect: str | None) -> str:
     return (effect or "").upper().replace("_", "")
@@ -3742,7 +3734,7 @@ def _pool_has_workload_taints(pool: dict) -> bool:
         effect = _normalize_taint_effect(t.get("effect"))
         if effect in ("NOSCHEDULE", "NOEXECUTE"):
             key = t.get("key", "")
-            if key not in _CONTROLLER_NODE_TAINT_KEYS and key not in _GKE_MANAGED_TAINT_KEYS:
+            if key not in _CONTROLLER_NODE_TAINT_KEYS:
                 return True
     return False
 
@@ -3791,7 +3783,6 @@ def _is_untainted_gp_compute_class(
     if any(
         _normalize_taint_effect(t.get("effect")) in ("NOSCHEDULE", "NOEXECUTE")
         and t.get("key") not in _CONTROLLER_NODE_TAINT_KEYS
-        and t.get("key") not in ("kubernetes.io/arch", "node.kubernetes.io/os")
         for t in taints
     ):
         return False
@@ -3816,15 +3807,67 @@ def _is_untainted_gp_compute_class(
             p for p in node_pools
             if ((p.get("config") or {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL) == name
         ]
-        if cc_pools and all(
-            _pool_has_workload_taints(p)
-            or (p.get("config") or {}).get("sandboxConfig", {}).get("type") == "GVISOR"
-            or any((t.get("key") in ("sandbox.gke.io/runtime", "nvidia.com/gpu", "google.com/tpu")) for t in ((p.get("config") or {}).get("taints") or []))
-            for p in cc_pools
-        ):
+        if cc_pools and all(_pool_has_workload_taints(p) for p in cc_pools):
             return False
 
     return True
+
+
+def _tolerates_taint(tolerations: list[dict], taint: dict) -> bool:
+    for tol in tolerations:
+        op = tol.get("operator", "Equal")
+        key = tol.get("key")
+        taint_effect = _normalize_taint_effect(taint.get("effect"))
+        tol_effect = _normalize_taint_effect(tol.get("effect"))
+        if op == "Exists" and not key:
+            if not tol_effect or tol_effect == taint_effect:
+                return True
+            continue
+        if key == taint.get("key"):
+            if tol_effect and tol_effect != taint_effect:
+                continue
+            if op == "Exists":
+                return True
+            if op == "Equal" and tol.get("value", "") == taint.get("value", ""):
+                return True
+    return False
+
+
+def _tolerates_pool(tolerations: list[dict], pool: dict) -> bool:
+    config = pool.get("config") or {}
+    taints = [
+        t for t in (config.get("taints") or [])
+        if _normalize_taint_effect(t.get("effect")) in ("NOSCHEDULE", "NOEXECUTE")
+        and t.get("key") not in _CONTROLLER_NODE_TAINT_KEYS
+    ]
+    if not taints:
+        return True
+    return all(_tolerates_taint(tolerations, t) for t in taints)
+
+
+def _workload_has_scheduling_constraints(template: dict) -> bool:
+    if template.get("nodeSelector"):
+        return True
+    affinity = template.get("affinity") or {}
+    node_affinity = affinity.get("nodeAffinity") or {}
+    if (
+        node_affinity.get("requiredDuringSchedulingIgnoredDuringExecution")
+        or node_affinity.get("preferredDuringSchedulingIgnoredDuringExecution")
+    ):
+        return True
+    if template.get("tolerations"):
+        return True
+    if template.get("runtimeClassName"):
+        return True
+    containers = list(template.get("containers") or []) + list(template.get("initContainers") or [])
+    for c in containers:
+        res = c.get("resources") or {}
+        reqs = res.get("requests") or {}
+        limits = res.get("limits") or {}
+        for k in set(reqs.keys()) | set(limits.keys()):
+            if "gpu" in k or "tpu" in k:
+                return True
+    return False
 
 
 def check_untargeted_compute_class_workload(workload: dict, context: dict) -> dict | None:
@@ -3889,383 +3932,33 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
     if not untainted_pools:
         return None
 
-    # Workload pod spec must not tolerate the taints on the remaining non-ComputeClass pools with active capacity
+    # If any untainted active pool does not carry a ComputeClass, general capacity is available
+    if any(not ((p.get("config") or {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL) for p in untainted_pools):
+        return None
+
+    # Workload pod spec must not tolerate the taints on any remaining non-ComputeClass pool with active capacity
     non_cc_pools = [
         p for p in node_pools
         if _pool_is_active_capacity(p)
         and not ((p.get("config") or {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL)
     ]
     pod_tolerations = list(template.get("tolerations") or [])
-    # Admission-injected tolerations for GKE-managed taints:
-    sel_arch = node_selector.get("kubernetes.io/arch") or node_selector.get("beta.kubernetes.io/arch")
-    if sel_arch == "arm64":
-        pod_tolerations.append({"key": "kubernetes.io/arch", "value": "arm64", "operator": "Equal"})
-    sel_os = node_selector.get("kubernetes.io/os") or node_selector.get("beta.kubernetes.io/os")
-    if sel_os == "windows":
-        pod_tolerations.append({"key": "node.kubernetes.io/os", "value": "windows", "operator": "Equal"})
-    if template.get("runtimeClassName") == "gvisor":
-        pod_tolerations.append({"key": "sandbox.gke.io/runtime", "value": "gvisor", "operator": "Equal"})
-        node_selector["sandbox.gke.io/runtime"] = "gvisor"
-    def _quantity_positive(val: object) -> bool:
-        if val is None:
-            return False
-        if isinstance(val, (int, float)):
-            return val > 0
-        s = str(val).strip()
-        try:
-            return float(s) > 0
-        except (ValueError, TypeError):
-            pass
-        import re
-        m = re.match(r"^(\d+(?:\.\d+)?)", s)
-        if m:
-            try:
-                return float(m.group(1)) > 0
-            except ValueError:
-                pass
-        return False
-
-    containers = list(template.get("containers") or []) + list(template.get("initContainers") or [])
-    has_gpu_request = False
-    has_tpu_request = False
-    for c in containers:
-        res = c.get("resources") or {}
-        reqs = res.get("requests") or {}
-        limits = res.get("limits") or {}
-        if _quantity_positive(reqs.get("nvidia.com/gpu")) or _quantity_positive(limits.get("nvidia.com/gpu")):
-            pod_tolerations.append({"key": "nvidia.com/gpu", "operator": "Exists"})
-            has_gpu_request = True
-        if _quantity_positive(reqs.get("google.com/tpu")) or _quantity_positive(limits.get("google.com/tpu")):
-            pod_tolerations.append({"key": "google.com/tpu", "operator": "Exists"})
-            has_tpu_request = True
-    required_terms = (node_affinity.get("requiredDuringSchedulingIgnoredDuringExecution") or {}).get("nodeSelectorTerms") or []
-    for term in required_terms:
-        for expr in term.get("matchExpressions") or []:
-            k = expr.get("key")
-            op = expr.get("operator")
-            vals = set(expr.get("values") or [])
-            if op == "In":
-                if k in ("kubernetes.io/arch", "beta.kubernetes.io/arch") and "arm64" in vals:
-                    pod_tolerations.append({"key": "kubernetes.io/arch", "value": "arm64", "operator": "Equal"})
-                if k in ("node.kubernetes.io/os", "beta.kubernetes.io/os") and "windows" in vals:
-                    pod_tolerations.append({"key": "node.kubernetes.io/os", "value": "windows", "operator": "Equal"})
-
-    def _tolerates_taint(tolerations: list[dict], taint: dict) -> bool:
-        for tol in tolerations:
-            op = tol.get("operator", "Equal")
-            key = tol.get("key")
-            taint_effect = (taint.get("effect") or "").upper().replace("_", "")
-            tol_effect = (tol.get("effect") or "").upper().replace("_", "")
-            if op == "Exists" and not key:
-                if not tol_effect or tol_effect == taint_effect:
-                    return True
-                continue
-            if key == taint.get("key"):
-                if tol_effect and tol_effect != taint_effect:
-                    continue
-                if op == "Exists":
-                    return True
-                if op == "Equal" and tol.get("value", "") == taint.get("value", ""):
-                    return True
-        return False
-
-    def _tolerates_pool(tolerations: list[dict], pool: dict) -> bool:
-        config = pool.get("config") or {}
-        taints = [
-            t for t in (config.get("taints") or [])
-            if (t.get("effect") or "").upper().replace("_", "") in ("NOSCHEDULE", "NOEXECUTE")
-            and t.get("key") not in _CONTROLLER_NODE_TAINT_KEYS
-        ]
-        if not taints:
-            return True
-        return all(_tolerates_taint(tolerations, t) for t in taints)
-
-    _GKE_KNOWN_POOL_LABEL_KEYS = frozenset({
-        "cloud.google.com/gke-nodepool",
-        "cloud.google.com/gke-accelerator",
-        "cloud.google.com/gke-spot",
-        "cloud.google.com/gke-preemptible",
-        "cloud.google.com/gke-provisioning",
-        "cloud.google.com/machine-family",
-        "node.kubernetes.io/instance-type",
-        "beta.kubernetes.io/instance-type",
-        "kubernetes.io/os",
-        "beta.kubernetes.io/os",
-        "kubernetes.io/arch",
-        "beta.kubernetes.io/arch",
-        "topology.kubernetes.io/zone",
-        "topology.gke.io/zone",
-        "failure-domain.beta.kubernetes.io/zone",
-        "sandbox.gke.io/runtime",
-        "cloud.google.com/gke-tpu-accelerator",
-        "cloud.google.com/gke-tpu-topology",
-    })
-
-    known_pool_label_keys = set(_GKE_KNOWN_POOL_LABEL_KEYS)
-    for p in node_pools:
-        known_pool_label_keys.update(((p.get("config") or {}).get("labels") or {}).keys())
-
-    def _pool_effective_labels(p: dict) -> dict[str, str]:
-        config = p.get("config") or {}
-        labels = dict(config.get("labels") or {})
-        pool_name = p.get("name")
-        if pool_name:
-            labels["cloud.google.com/gke-nodepool"] = pool_name
-        accelerators = config.get("accelerators") or []
-        if accelerators and isinstance(accelerators, list) and accelerators[0].get("acceleratorType"):
-            labels["cloud.google.com/gke-accelerator"] = accelerators[0]["acceleratorType"]
-        if config.get("spot"):
-            labels["cloud.google.com/gke-spot"] = "true"
-            labels["cloud.google.com/gke-provisioning"] = "spot"
-        elif "spot" in config:
-            labels["cloud.google.com/gke-spot"] = "false"
-        if config.get("preemptible"):
-            labels["cloud.google.com/gke-preemptible"] = "true"
-            labels["cloud.google.com/gke-provisioning"] = "preemptible"
-        elif "preemptible" in config:
-            labels["cloud.google.com/gke-preemptible"] = "false"
-        if "cloud.google.com/gke-provisioning" not in labels:
-            labels["cloud.google.com/gke-provisioning"] = "standard"
-        placement = p.get("placementPolicy") or {}
-        tpu_topology = placement.get("tpuTopology")
-        if tpu_topology:
-            labels["cloud.google.com/gke-tpu-topology"] = str(tpu_topology)
-        machine_type = config.get("machineType") or ""
-        if machine_type:
-            labels["node.kubernetes.io/instance-type"] = machine_type
-            labels["beta.kubernetes.io/instance-type"] = machine_type
-            family = machine_type.split("-")[0].lower()
-            labels["cloud.google.com/machine-family"] = family
-            if family in ("t2a", "c4a", "n4a", "a4x") or "arm" in family:
-                labels["kubernetes.io/arch"] = "arm64"
-                labels["beta.kubernetes.io/arch"] = "arm64"
-            else:
-                labels["kubernetes.io/arch"] = "amd64"
-                labels["beta.kubernetes.io/arch"] = "amd64"
-            _TPU_ACCELERATOR_MAP = {
-                "ct5lp": "tpu-v5-lite-podslice",
-                "ct5p": "tpu-v5p-slice",
-                "ct6e": "tpu-v6e-slice",
-                "ct4p": "tpu-v4-podslice",
-            }
-            for prefix, accel_name in _TPU_ACCELERATOR_MAP.items():
-                if family.startswith(prefix):
-                    labels["cloud.google.com/gke-tpu-accelerator"] = accel_name
-                    break
-        image_type = (config.get("imageType") or "").upper()
-        if image_type.startswith("WINDOWS"):
-            labels["kubernetes.io/os"] = "windows"
-            labels["beta.kubernetes.io/os"] = "windows"
-        elif image_type or "imageType" in config or not config.get("operatingSystem"):
-            labels["kubernetes.io/os"] = "linux"
-            labels["beta.kubernetes.io/os"] = "linux"
-        if (config.get("sandboxConfig") or {}).get("type") == "GVISOR":
-            labels["sandbox.gke.io/runtime"] = "gvisor"
-        return labels
-
-    def _pool_matches_selector(pool: dict, selector: dict[str, str]) -> bool | None:
-        if not selector:
-            return True
-        effective_labels = _pool_effective_labels(pool)
-        has_unknown = False
-        for k, v in selector.items():
-            if k in effective_labels:
-                if effective_labels[k] != v:
-                    return False
-            elif k in ("topology.kubernetes.io/zone", "topology.gke.io/zone", "failure-domain.beta.kubernetes.io/zone"):
-                locations = pool.get("locations") or []
-                if locations:
-                    if v not in locations:
-                        return False
-                else:
-                    has_unknown = True
-            elif k in known_pool_label_keys:
-                return False
-            else:
-                has_unknown = True
-        return None if has_unknown else True
-
-    def _pool_matches_node_affinity(pool: dict, node_affinity: dict) -> bool | None:
-        required = node_affinity.get("requiredDuringSchedulingIgnoredDuringExecution") or {}
-        terms = required.get("nodeSelectorTerms") or []
-        if not terms:
-            return True
-        effective_labels = _pool_effective_labels(pool)
-        locations = pool.get("locations") or []
-        term_results: list[bool | None] = []
-        for term in terms:
-            exprs = term.get("matchExpressions") or []
-            match_fields = term.get("matchFields") or []
-            if not exprs and not match_fields:
-                term_results.append(False)
-                continue
-            if match_fields:
-                term_results.append(None)
-                continue
-            term_match = True
-            term_unknown = False
-            for expr in exprs:
-                k = expr.get("key")
-                op = expr.get("operator")
-                vals = set(expr.get("values") or [])
-                pool_val = effective_labels.get(k)
-                if op == "In":
-                    if k in effective_labels:
-                        if pool_val not in vals:
-                            term_match = False
-                            break
-                    elif k in ("topology.kubernetes.io/zone", "topology.gke.io/zone", "failure-domain.beta.kubernetes.io/zone"):
-                        if locations and not any(loc in vals for loc in locations):
-                            term_match = False
-                            break
-                        elif not locations:
-                            term_unknown = True
-                    elif k in known_pool_label_keys:
-                        term_match = False
-                        break
-                    else:
-                        term_unknown = True
-                elif op == "NotIn":
-                    if k in effective_labels:
-                        if pool_val in vals:
-                            term_match = False
-                            break
-                    elif k in ("topology.kubernetes.io/zone", "topology.gke.io/zone", "failure-domain.beta.kubernetes.io/zone"):
-                        if locations and all(loc in vals for loc in locations):
-                            term_match = False
-                            break
-                        elif not locations:
-                            term_unknown = True
-                    elif k in known_pool_label_keys:
-                        pass
-                    else:
-                        term_unknown = True
-                elif op == "Exists":
-                    if k in effective_labels:
-                        pass
-                    elif k in ("topology.kubernetes.io/zone", "topology.gke.io/zone", "failure-domain.beta.kubernetes.io/zone"):
-                        if locations:
-                            pass
-                        else:
-                            term_unknown = True
-                    elif k in known_pool_label_keys:
-                        term_match = False
-                        break
-                    else:
-                        term_unknown = True
-                elif op == "DoesNotExist":
-                    if k in effective_labels:
-                        term_match = False
-                        break
-                    elif k in ("topology.kubernetes.io/zone", "topology.gke.io/zone", "failure-domain.beta.kubernetes.io/zone"):
-                        if locations:
-                            term_match = False
-                            break
-                        else:
-                            term_unknown = True
-                    elif k in known_pool_label_keys:
-                        pass
-                    else:
-                        term_unknown = True
-                else:
-                    # Gt, Lt, or unsupported operators
-                    term_unknown = True
-            if not term_match:
-                term_results.append(False)
-            elif term_unknown:
-                term_results.append(None)
-            else:
-                term_results.append(True)
-        if any(res is True for res in term_results):
-            return True
-        if any(res is None for res in term_results):
-            return None
-        return False
-
-    def _pool_matches_placement(pool: dict) -> bool | None:
-        config = pool.get("config") or {}
-        if has_gpu_request:
-            accelerators = config.get("accelerators") or []
-            if not accelerators:
-                return False
-        if has_tpu_request:
-            machine_type = (config.get("machineType") or "").lower()
-            is_tpu = machine_type.startswith(("ct", "tpu")) or "-tpu-" in machine_type
-            if not is_tpu:
-                return False
-        sel_match = _pool_matches_selector(pool, node_selector)
-        if sel_match is False:
-            return False
-        aff_match = _pool_matches_node_affinity(pool, node_affinity)
-        if aff_match is False:
-            return False
-        if sel_match is None or aff_match is None:
-            return None
-        return True
-
-    # If the workload can schedule on any non-ComputeClass pool with active capacity, non-CC capacity is available
-    if non_cc_pools and any(
-        _pool_matches_placement(p) is not False and _tolerates_pool(pod_tolerations, p)
-        for p in non_cc_pools
-    ):
+    if non_cc_pools and any(_tolerates_pool(pod_tolerations, p) for p in non_cc_pools):
         return None
 
-    # Treat selector keys the inventory cannot resolve as unknown; do not manufacture a false major
-    active_candidate_pools = [p for p in node_pools if _pool_is_active_capacity(p)]
-    if any(_pool_matches_placement(p) is None for p in active_candidate_pools):
-        return None
-
-    # Workload-conditional ComputeClass determination:
-    schedulable_pools = [
-        p for p in node_pools
-        if _pool_is_active_capacity(p)
-        and _pool_matches_placement(p) is True
-        and _tolerates_pool(pod_tolerations, p)
-    ]
-    if not schedulable_pools:
-        return None
-
-    schedulable_ccs = {
-        ((p.get("config") or {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL)
-        for p in schedulable_pools
-    }
-    schedulable_ccs.discard(None)
-    schedulable_ccs.discard("")
-    if not schedulable_ccs:
-        return None
-
+    # Determine single_compute_class:
+    # Workloads with scheduling constraints route to manual remediation
     untainted_gp_ccs = [cc for cc in compute_classes if _is_untainted_gp_compute_class(cc, node_pools=node_pools)]
-    untainted_gp_names = {cc.get("metadata", {}).get("name") for cc in untainted_gp_ccs}
+    untainted_gp_names = [cc.get("metadata", {}).get("name") for cc in untainted_gp_ccs if cc.get("metadata", {}).get("name")]
 
-    if len(schedulable_ccs) == 1:
-        target_candidate = next(iter(schedulable_ccs))
-        cc_pool_bindings = {
+    if not _workload_has_scheduling_constraints(template) and len(untainted_gp_names) == 1:
+        candidate_cc = untainted_gp_names[0]
+        cc_pool_labels = {
             ((p.get("config") or {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL)
-            for p in node_pools
+            for p in untainted_pools
         }
-        reachable_gp_ccs = set()
-        for cc in untainted_gp_ccs:
-            name = cc.get("metadata", {}).get("name")
-            if name in schedulable_ccs:
-                reachable_gp_ccs.add(name)
-            elif name not in cc_pool_bindings:
-                # NAP-only class: check if workload arch/os is excluded by cc spec
-                spec = cc.get("spec") or {}
-                np_cfg = spec.get("nodePoolConfig") or {}
-                cc_labels = np_cfg.get("labels") or {}
-                if sel_arch and cc_labels.get("kubernetes.io/arch") and cc_labels["kubernetes.io/arch"] != sel_arch:
-                    continue
-                if sel_os and cc_labels.get("kubernetes.io/os") and cc_labels["kubernetes.io/os"] != sel_os:
-                    continue
-                reachable_gp_ccs.add(name)
-
-        if target_candidate in untainted_gp_names:
-            if len(reachable_gp_ccs) <= 1:
-                single_cc = target_candidate
-            else:
-                single_cc = ""
-        elif any(cc.get("metadata", {}).get("name") == target_candidate for cc in compute_classes):
-            single_cc = target_candidate
+        if candidate_cc in cc_pool_labels:
+            single_cc = candidate_cc
         else:
             single_cc = ""
     else:
