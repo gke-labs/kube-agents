@@ -14,7 +14,7 @@
 
 """Undo what arm.py changed, from its state file. Runs in the agent container.
 
-Usage: python3 - <home> [<hermes>] < disarm.py
+Usage: python3 - <home> <hermes> < disarm.py
 
 Puts both markers back as they were. Removes the `oobe` job when arm.py put it there
 and it has not already removed itself, and puts back the job arm.py found in the store
@@ -31,8 +31,7 @@ import sys
 
 from cron.jobs import _jobs_lock, compute_next_run, load_jobs, remove_job, save_jobs
 
-home = sys.argv[1]
-HERMES = sys.argv[2] if len(sys.argv) > 2 else "/opt/hermes/.venv/bin/hermes"
+home, HERMES = sys.argv[1:3]
 STATE = os.path.join(home, ".bench-oobe.json")
 SCAN_MARKER = os.path.join(home, ".bootstrap_scan_filed")
 AUDITS_MARKER = os.path.join(home, ".oobe_audits_fired")

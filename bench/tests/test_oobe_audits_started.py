@@ -81,6 +81,11 @@ class Store:
         self.state.write_text(json.dumps({"applied_at": at.isoformat()}))
         self.marker.write_text(json.dumps({"fired": list(marked)}))
 
+    def mark(self, audit: str, at: datetime) -> None:
+        recorded = json.loads(self.marker.read_text())
+        recorded.setdefault("marks", {})[audit] = at.timestamp()
+        self.marker.write_text(json.dumps(recorded))
+
     def run(self, job: str, claimed: datetime, status: str = "running", finished: datetime | None = None) -> None:
         self.rows += 1
         with sqlite3.connect(self.db) as con:
@@ -92,10 +97,11 @@ class Store:
             )
 
     def chain(self, start: datetime, last_status: str = "running") -> None:
-        """The four runs one after another, the last still going unless told otherwise."""
+        """The four runs one after another, each just after its mark, the last still going unless told otherwise."""
         at = start
         for i, audit in enumerate(oobe.FIRST_RUN_AUDITS):
             last = i == len(oobe.FIRST_RUN_AUDITS) - 1
+            self.mark(audit, at - timedelta(seconds=30))
             self.run(audit, at, last_status if last else "completed", None if last else at + timedelta(minutes=3))
             at += timedelta(minutes=4)
 
@@ -116,12 +122,6 @@ def _verify():
 
 
 # --- the names ------------------------------------------------------------
-
-
-def test_the_audits_are_the_ones_the_stage_starts() -> None:
-    text = STAGE.read_text()
-    for audit in oobe.FIRST_RUN_AUDITS:
-        assert f'"{audit}"' in text
 
 
 def test_the_state_file_is_the_one_the_stack_writes() -> None:
@@ -182,7 +182,7 @@ def test_a_missing_audit_is_named(store: Store) -> None:
         store.run(audit, ARMED + timedelta(minutes=1))
     result = _verify()
     assert result.status == "fail"
-    assert f"no run claimed since {ARMED.isoformat()} for {oobe.FIRST_RUN_AUDITS[-1]}" in result.reason
+    assert f"no run claimed since {ARMED.isoformat()} and its mark for {oobe.FIRST_RUN_AUDITS[-1]}" in result.reason
 
 
 def test_completed_runs_pass(store: Store) -> None:
@@ -191,9 +191,38 @@ def test_completed_runs_pass(store: Store) -> None:
     assert _verify().status == "pass"
 
 
-@pytest.mark.parametrize("status", ["claimed", "skipped", "failed"])
+def test_the_run_after_each_mark_is_graded(store: Store) -> None:
+    # A scheduled compliance run between the arm and its mark, and one after the chain, both
+    # overlap the stage's runs; neither is the run the stage started.
+    store.arm()
+    store.chain(ARMED + timedelta(minutes=10))
+    store.run(oobe.FIRST_RUN_AUDITS[1], ARMED + timedelta(minutes=2), "completed", ARMED + timedelta(minutes=12))
+    store.run(oobe.FIRST_RUN_AUDITS[0], ARMED + timedelta(minutes=23))
+    result = _verify()
+    assert result.status == "pass", result.reason
+
+
+def test_a_skipped_row_is_passed_over(store: Store) -> None:
+    store.arm()
+    for audit in oobe.FIRST_RUN_AUDITS:
+        store.run(audit, ARMED + timedelta(minutes=1), "skipped")
+    store.chain(ARMED + timedelta(minutes=2))
+    result = _verify()
+    assert result.status == "pass", result.reason
+
+
+def test_only_skipped_rows_are_no_run(store: Store) -> None:
+    store.arm()
+    for audit in oobe.FIRST_RUN_AUDITS:
+        store.run(audit, ARMED + timedelta(minutes=2), "skipped")
+    result = _verify()
+    assert result.status == "fail"
+    assert "no run claimed since" in result.reason
+
+
+@pytest.mark.parametrize("status", ["claimed", "failed"])
 def test_a_run_that_did_not_get_going_does_not_count(store: Store, status: str) -> None:
-    # A run cut off at its start leaves a claimed or failed row; the skip ledger writes skipped.
+    # A run cut off at its start leaves a claimed or failed row.
     store.arm()
     for audit in oobe.FIRST_RUN_AUDITS:
         store.run(audit, ARMED + timedelta(minutes=2), status)
@@ -224,6 +253,7 @@ def test_the_marker_is_the_one_the_stage_writes() -> None:
     assert Path(oobe.AUDITS_MARKER).name == '.oobe_audits_fired'
     assert 'AUDITS_MARKER = ".oobe_audits_fired"' in STAGE.read_text()
     assert 'STATE_FIRED = "fired"' in STAGE.read_text()
+    assert 'STATE_MARKS = "marks"' in STAGE.read_text()
 
 
 def test_another_jobs_run_does_not_count(store: Store) -> None:

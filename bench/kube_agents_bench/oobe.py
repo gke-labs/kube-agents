@@ -18,8 +18,8 @@
 scan settles, by marking each due on that profile's roster. A started audit leaves a
 row in the profile's ``cron/executions.db``. The case's stack
 (``bench/tf/prebuilt/oobe-first-run-audits``) records when it armed the stage in its
-state file; this passes when every audit has a run claimed at or after that time that is
-running or has completed.
+state file, and the stage records when it marked each audit; this passes when every audit
+has a run of its own claimed at or after its mark that is running or has completed.
 
 Its own module rather than a section of ``verifiers.py``, registered through the same
 ``devops_bench.verifiers`` entry-point group.
@@ -41,22 +41,23 @@ from kube_agents_bench.worker_trajectory import DATA_ROOT, FALLBACK_PYTHON, HERM
 FIRST_RUN_AUDITS = ("fleet-wide-cost-analysis", "compliance-audit", "obtainability-audit", "stockout-prevention")
 # bench/tf/prebuilt/oobe-first-run-audits/arm.py: STATE.
 STATE_FILE = f"{DATA_ROOT}/.bench-oobe.json"
-# agents/chat/scripts/oobe.py: AUDITS_MARKER and its STATE_FIRED list, what the stage marked due.
-# Still in place when the verifier runs; the teardown restores it.
+# agents/chat/scripts/oobe.py: AUDITS_MARKER, with its STATE_FIRED list (what the stage marked
+# due) and STATE_MARKS (when). Still in place when the verifier runs; the teardown restores it.
 AUDITS_MARKER = f"{DATA_ROOT}/.oobe_audits_fired"
 PLATFORM_EXECUTIONS_DB = f"{DATA_ROOT}/profiles/platform/cron/executions.db"
 STARTS_READ = "__OOBE_STARTS_READ__"
-# A run that got going: the scheduler has it, or it ended without being skipped or lost.
-# A claimed row the run never left, a skipped one and a failed one say the audit did not run.
+# A run that got going: the scheduler has it, or it ended without being lost.
+# A claimed row the run never left and a failed one say the audit did not run.
 STARTED_STATUSES = ("running", "completed")
 # The gateway Deployment, as the stack names it (variables.tf: agent_deployment). Exec goes
 # there rather than through AGENT_SERVICE_NAME, which can name a tunnel in front of the
 # gateway that has none of its containers.
 DEFAULT_AGENT_DEPLOYMENT = "platform-agent-gateway"
 
-# Prints the arm time, the audits the stage recorded marking due, and each audit's newest run
-# claimed at or after the arm. A run the stage did not mark is a scheduled one that fell in the
-# window, not the stage's. A missing
+# Prints the arm time, the audits the stage recorded marking due, and each audit's first run
+# claimed at or after its mark (the arm, for an audit with no mark). A skipped row is passed
+# over: it is a mark that found the audit already running, not a run. A run the stage did not
+# mark is a scheduled one that fell in the window, not the stage's. A missing
 # state file, a sqlite failure or a timestamp that does not parse is printed as an
 # error rather than raised, so the verdict names it instead of reading as an
 # unreachable pod.
@@ -65,7 +66,9 @@ import json, os, sqlite3, sys
 from datetime import datetime
 state, marker, db, sentinel, audits = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]
 SQLITE_BUSY_TIMEOUT = 10
+SKIPPED = "skipped"
 out = {"applied_at": None, "marked": [], "runs": {}, "error": None}
+marks = {}
 try:
     out["applied_at"] = json.load(open(state))["applied_at"]
 except FileNotFoundError:
@@ -73,8 +76,9 @@ except FileNotFoundError:
 except (OSError, ValueError, KeyError, TypeError) as exc:
     out["error"] = "%s: %s" % (state, exc)
 try:
-    fired = json.load(open(marker)).get("fired", [])
-    out["marked"] = [a for a in fired if isinstance(a, str)]
+    recorded = json.load(open(marker))
+    out["marked"] = [a for a in recorded.get("fired", []) if isinstance(a, str)]
+    marks = {a: t for a, t in (recorded.get("marks") or {}).items() if isinstance(t, (int, float))}
 except (OSError, ValueError, AttributeError, TypeError):
     pass
 if out["applied_at"] and not out["error"]:
@@ -82,12 +86,13 @@ if out["applied_at"] and not out["error"]:
         armed = datetime.fromisoformat(out["applied_at"]).timestamp()
         con = sqlite3.connect("file:" + db + "?mode=ro", uri=True, timeout=SQLITE_BUSY_TIMEOUT)
         for audit in audits:
+            since = max(armed, marks.get(audit, armed))
             for status, claimed, finished in con.execute(
                 "SELECT status, claimed_at, finished_at FROM executions WHERE job_id = ? AND claimed_at IS NOT NULL"
-                " ORDER BY claimed_at DESC", (audit,)):
-                if datetime.fromisoformat(claimed).timestamp() >= armed:
+                " ORDER BY claimed_at", (audit,)):
+                if status != SKIPPED and datetime.fromisoformat(claimed).timestamp() >= since:
                     out["runs"][audit] = {"status": status, "claimed_at": claimed, "finished_at": finished}
-                break
+                    break
     except (sqlite3.Error, ValueError, TypeError) as exc:
         out["error"] = "%s: %s" % (db, exc)
 print(sentinel + json.dumps(out))
@@ -140,12 +145,12 @@ def _overlaps(runs: dict[str, dict[str, Any]]) -> list[str]:
 
 @VERIFIERS.register("oobe_audits_started")
 class OobeAuditsStartedVerifier(_OnboardingPollVerifier):
-    """Passes once the stage marked every first-run audit due, each has a run since the arm that
+    """Passes once the stage marked every first-run audit due, each has a run since its mark that
     is running or completed, and each started only after the one before it in the chain ended.
 
-    A row only claimed, skipped or failed does not count: a run cut off at its start leaves
-    exactly that. Nor does a run the stage did not mark: a scheduled run that falls in the
-    window is not the stage's. Past running, the outcome is the audit's own, graded by the audit
+    A row only claimed or failed does not count: a run cut off at its start leaves exactly
+    that. Nor does a run the stage did not mark: a scheduled run that falls in the window is
+    not the stage's. Past running, the outcome is the audit's own, graded by the audit
     cases.
     The agent pod unreadable, or a state file or cron store the read cannot use, is
     ``status="error"``.
@@ -175,7 +180,7 @@ class OobeAuditsStartedVerifier(_OnboardingPollVerifier):
         unmarked = [a for a in running if a not in marked]
         parts = []
         if missing:
-            parts.append(f"no run claimed since {armed} for {', '.join(missing)}")
+            parts.append(f"no run claimed since {armed} and its mark for {', '.join(missing)}")
         if stalled:
             parts.append(f"a run that did not get going for {', '.join(stalled)}")
         if unmarked:

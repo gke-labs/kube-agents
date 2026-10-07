@@ -97,11 +97,14 @@ class StageTest(unittest.TestCase):
     def _started_ids(self) -> list[str]:
         return [argv[-1] for argv, _env in self.started]
 
-    def _ledger(self, job_id: str, status: str, claimed_at: float) -> None:
+    def _ledger(self, job_id: str, status: str, claimed_at: float, replace: bool = True) -> None:
         """A run row in the Platform Agent's cron store, as profile-cron-tick leaves one."""
         db = self.d / "profiles" / "platform" / "cron" / oobe.EXECUTIONS_DB
         with sqlite3.connect(db) as conn:
             conn.execute("CREATE TABLE IF NOT EXISTS executions (id INTEGER PRIMARY KEY, job_id TEXT, status TEXT, claimed_at TEXT)")
+            # A run's row is updated in place as it ends; a new status replaces the job's in-flight row.
+            if replace:
+                conn.execute("DELETE FROM executions WHERE job_id = ? AND status IN ('claimed', 'running')", (job_id,))
             conn.execute(
                 "INSERT INTO executions (job_id, status, claimed_at) VALUES (?, ?, ?)",
                 (job_id, status, datetime.fromtimestamp(claimed_at, timezone.utc).isoformat()),
@@ -376,10 +379,57 @@ class StageTest(unittest.TestCase):
         _board(self.board, [_ranking("done")])
         self._main(now=NOW_SETTLED)
         self._ledger(FIRST[0], "running", NOW_SETTLED + MINUTE)
-        self._main(now=NOW_SETTLED + oobe.RUN_LIMIT_SECONDS - MINUTE)
-        self.assertEqual(self._started_ids(), FIRST)
         self._main(now=NOW_SETTLED + oobe.RUN_LIMIT_SECONDS)
+        self.assertEqual(self._started_ids(), FIRST)
+        self._main(now=NOW_SETTLED + MINUTE + oobe.RUN_LIMIT_SECONDS)
         self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS[:2]))
+
+    def test_the_first_mark_waits_for_a_scheduled_run(self):
+        # The 06:20 compliance run is going when the scan settles.
+        self._ledger("compliance-audit", "running", NOW_SETTLED - MINUTE)
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._main(now=NOW_SETTLED)
+        self.assertEqual(self.started, [])
+        self._ledger("compliance-audit", "completed", NOW_SETTLED - MINUTE)
+        self._main(now=NOW_SETTLED + MINUTE)
+        self.assertEqual(self._started_ids(), FIRST)
+
+    def test_the_next_mark_waits_for_a_scheduled_run(self):
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._main(now=NOW_SETTLED)
+        self._ledger(FIRST[0], "completed", NOW_SETTLED + MINUTE)
+        # A scheduled stockout run starts before the chain reaches it.
+        self._ledger("stockout-prevention", "running", NOW_SETTLED + MINUTE)
+        self._main(now=NOW_SETTLED + 2 * MINUTE)
+        self.assertEqual(self._started_ids(), FIRST)
+        self._ledger("stockout-prevention", "completed", NOW_SETTLED + MINUTE)
+        self._main(now=NOW_SETTLED + 3 * MINUTE)
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS[:2]))
+
+    def test_a_skipped_mark_waits_for_the_scheduled_run_it_found(self):
+        # Marked while its 06:20 run was going: the store records the mark as skipped.
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._main(now=NOW_SETTLED)
+        self._ledger(FIRST[0], "completed", NOW_SETTLED + MINUTE)
+        self._main(now=NOW_SETTLED + 2 * MINUTE)
+        second = oobe.FIRST_RUN_AUDITS[1]
+        self.assertEqual(self._started_ids()[-1], second)
+        self._ledger(second, "running", NOW_SETTLED + MINUTE)
+        self._ledger(second, "skipped", NOW_SETTLED + 3 * MINUTE, replace=False)
+        self._main(now=NOW_SETTLED + 4 * MINUTE)
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS[:2]))
+        self._ledger(second, "completed", NOW_SETTLED + MINUTE)
+        self._main(now=NOW_SETTLED + 5 * MINUTE)
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS[:3]))
+
+    def test_each_mark_time_is_recorded(self):
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._main(now=NOW_SETTLED)
+        self.assertEqual(oobe.read_state(self.d)[oobe.STATE_MARKS], {FIRST[0]: NOW_SETTLED})
 
     def test_retries_an_audit_that_failed_to_start(self):
         self._file_scan()

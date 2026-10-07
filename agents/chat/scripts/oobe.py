@@ -66,7 +66,8 @@ FIRST_RUN_AUDITS = (
     "stockout-prevention",
 )
 EXECUTIONS_DB = "executions.db"
-# A run row in either is still going; any other status has ended.
+# A run row in either is still going; any other status has ended, including the `skipped` row a
+# mark leaves when the audit was already running on its schedule.
 IN_FLIGHT_STATUSES = ("claimed", "running")
 PLATFORM_PROFILE = "platform"
 PROFILES_DIR = "profiles"
@@ -100,8 +101,8 @@ TRIGGER_TIMEOUT_SECONDS = 30
 # Marks one job due and exits non-zero when the store does not have it. Run with
 # HERMES_HOME set to the Platform Agent's home, which is where cron.jobs finds its store.
 TRIGGER_SCRIPT = "import sys\nfrom cron.jobs import trigger_job\nsys.exit(0 if trigger_job(sys.argv[1]) else 3)\n"
-# A job id the roster does not have, or one disabled by hand, fails every attempt;
-# without a bound the stage would never finish and the job never leave.
+# A mark trigger_job refuses, or one never claimed, is retried this many times; without a
+# bound the stage would never finish and the job never leave.
 MAX_TRIGGER_ATTEMPTS = 5
 # A marked audit is claimed on the next profile-cron-tick, a minute or two later; past this
 # with no run, the mark is counted as a failed attempt and made again.
@@ -116,6 +117,8 @@ STATE_ATTEMPTS = "attempts"
 STATE_GAVE_UP = "gave_up"
 STATE_HELD = "held"
 STATE_CURRENT = "current"
+# When each audit was marked due, so the run that answers a mark can be told from a scheduled one.
+STATE_MARKS = "marks"
 CURRENT_JOB = "job"
 CURRENT_MARKED_AT = "marked_at"
 STATE_SKIPPED = "skipped"
@@ -321,36 +324,52 @@ def retire() -> None:
         _log(f"could not remove the {OOBE_JOB_ID} job: {e}")
 
 
-def run_status(data_dir: Path, job_id: str, since: float) -> str | None:
-    """The status of the job's newest run claimed at or after ``since``, or None if there is none.
+def _runs(data_dir: Path, jobs: tuple[str, ...]) -> list[tuple[str, str, float]]:
+    """``(job, status, claimed_at)`` for every run of ``jobs`` in the Platform Agent's cron store.
 
-    Read from the Platform Agent's own cron store; an unreadable store reads as no run yet.
+    An unreadable store reads as no runs.
     """
     ledger = data_dir / PROFILES_DIR / PLATFORM_PROFILE / CRON_DIR / EXECUTIONS_DB
     if not ledger.is_file():
-        return None
+        return []
+    marks = ",".join("?" * len(jobs))
     try:
         conn = sqlite3.connect(
             f"file:{ledger}?mode=ro", uri=True, timeout=bootstrap_handoff.SQLITE_BUSY_TIMEOUT_SECONDS
         )
         try:
             rows = conn.execute(
-                "SELECT status, claimed_at FROM executions WHERE job_id = ? AND claimed_at IS NOT NULL "
-                "ORDER BY claimed_at DESC LIMIT 1",
-                (job_id,),
+                f"SELECT job_id, status, claimed_at FROM executions WHERE job_id IN ({marks}) "
+                "AND claimed_at IS NOT NULL ORDER BY claimed_at",
+                jobs,
             ).fetchall()
         finally:
             conn.close()
     except sqlite3.Error as e:
         _log(f"cannot read {ledger}: {e}")
-        return None
-    for status, claimed in rows:
+        return []
+    runs = []
+    for job_id, status, claimed in rows:
         try:
-            if datetime.fromisoformat(claimed).timestamp() >= since:
-                return status
+            runs.append((job_id, status, datetime.fromisoformat(claimed).timestamp()))
         except (TypeError, ValueError):
-            return None
-    return None
+            continue
+    return runs
+
+
+def run_status(data_dir: Path, job_id: str, since: float) -> str | None:
+    """The status of the first run of ``job_id`` claimed at or after ``since``, or None if there is none."""
+    after = [status for _job, status, claimed in _runs(data_dir, (job_id,)) if claimed >= since]
+    return after[0] if after else None
+
+
+def audits_in_flight(data_dir: Path, now: float) -> set[str]:
+    """The first-run audits with a run still going, scheduled or marked, younger than the run limit."""
+    return {
+        job
+        for job, status, claimed in _runs(data_dir, FIRST_RUN_AUDITS)
+        if status in IN_FLIGHT_STATUSES and now - claimed < RUN_LIMIT_SECONDS
+    }
 
 
 def advance_chain(data_dir: Path, state: dict, now: float) -> dict:
@@ -363,11 +382,12 @@ def advance_chain(data_dir: Path, state: dict, now: float) -> dict:
     gave_up = list(state.get(STATE_GAVE_UP, []))
     held = dict(state.get(STATE_HELD, {}))
     current = state.get(STATE_CURRENT)
+    marks = dict(state.get(STATE_MARKS, {}))
 
     def save(done: bool = False) -> dict:
         new_state = {
             STATE_FIRED: fired, STATE_ATTEMPTS: attempts, STATE_GAVE_UP: gave_up, STATE_HELD: held,
-            STATE_CURRENT: current, STATE_AT: now, STATE_DONE: done,
+            STATE_CURRENT: current, STATE_MARKS: marks, STATE_AT: now, STATE_DONE: done,
         }
         write_state(data_dir, new_state)
         return new_state
@@ -388,12 +408,18 @@ def advance_chain(data_dir: Path, state: dict, now: float) -> dict:
                 gave_up.append(job_id)
             return save()
         if not pending:
-            # The last audit has started; nothing is left to mark.
+            # The last audit has started, or a scheduled run of it was already going; nothing is
+            # left to mark.
             return save(done=True)
         if status in IN_FLIGHT_STATUSES and now - marked_at < RUN_LIMIT_SECONDS:
             return save()
         current = None
 
+    busy = audits_in_flight(data_dir, now)
+    if busy:
+        # One of the four is running on its schedule (a mark that found its audit already running
+        # leaves a skipped row and lands here); the chain waits its turn, as the schedule does.
+        return save()
     holds = audit_holds(data_dir)
     for job_id in pending:
         if holds is not None and job_id in holds:
@@ -402,6 +428,7 @@ def advance_chain(data_dir: Path, state: dict, now: float) -> dict:
             continue
         if holds is not None and trigger(job_id, data_dir):
             fired.append(job_id)
+            marks[job_id] = now
             current = {CURRENT_JOB: job_id, CURRENT_MARKED_AT: now}
             return save()
         attempts[job_id] = attempts.get(job_id, 0) + 1

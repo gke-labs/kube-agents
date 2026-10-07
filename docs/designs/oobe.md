@@ -124,6 +124,9 @@ has ended, whatever its outcome. The shipped schedule staggers the audits for th
 (`autonomous-watchdogs.md`: "Stagger start minutes so two audits never contend for the same
 session"). Four started in the same minute put a fresh CI install's gateway pod under memory
 pressure for the best part of an hour and broke the cluster reads of a case running beside them.
+For the same reason the chain waits while any of the four is running on its schedule, before the
+first mark and between marks; a mark that finds its audit already running counts that run as its
+own.
 A mark the scheduler has not claimed after `START_LIMIT_SECONDS` (10 minutes) is made again, as a
 failed attempt; a run still going after `RUN_LIMIT_SECONDS` (an hour), or a row a gateway restart
 left at running, stops holding the chain. The stage is done once the last audit's run has started.
@@ -171,8 +174,8 @@ repository, a one-line summary in the home channel when one is set, and remediat
 for the findings that auto-promote, at most five per audit run (`audit_report.py`,
 `AUTO_PROMOTION_CAP`): critical findings whose fix is a manifest, and major ones on the checks the
 collector vouches for (`MAJOR_SWEEP_CHECKS`). Each audit's SOP lists its own in §5. A scheduled run with nothing new is silent
-(same section), so the morning after brings no second burst. Whether the four
-run side by side or one after another, and so how long the last one takes, is to be measured; each
+(same section), so the morning after brings no second burst. The four run one after another
+(§4.3), so the last starts once the first three have ended (§9, chain length); each
 takes 9–15 minutes on its own, most of it inside the SOP
 ([#985 "Fleet audit SOPs cost 9–15 min per run"](https://github.com/gke-labs/kube-agents/issues/985)).
 
@@ -221,9 +224,9 @@ times. It rides with the audits stage, whose eval case covers both.
 - **A combined, prioritized first summary.** Each audit posts its own. How many findings surface,
   and when, follows the pacing [#2451 "pace surfaced findings to the first-24-hour spec"](https://github.com/gke-labs/kube-agents/issues/2451)
   sets out (two criticals in the first report, at most two a day).
-- **[#1866](https://github.com/gke-labs/kube-agents/issues/1866)'s 30, 45 and 60 minute targets for cost, security and reliability findings, and its
-  fixed audit order.** Starting all four at
-  scan completion is what removes the wait; an order adds coordination the operator would not see.
+- **[#1866](https://github.com/gke-labs/kube-agents/issues/1866)'s 30, 45 and 60 minute targets for cost, security and reliability findings.** The
+  chain starts at scan completion in #1866's order, so each audit lands as soon as the ones before
+  it end; nothing holds a finding back to meet a target.
 - **Reaching an install with no home channel.** Audit summaries go to the home channel only.
   Posting the report there at T+0 when one is set is a separate change.
 - **Audits without a GitOps repository.** They would need a chat-only mode in the shared fleet-audit
@@ -248,7 +251,7 @@ archived stand-in sweep card and an archived ranking card after it, points `.boo
 at the sweep, clears `.oobe_audits_fired`, and puts back the `oobe` job when the image ships one;
 the teardown restores both markers and the job as it found them.
 The stack then waits, up to an hour, for the stage to finish its chain, so the verifier's two-minute window opens after the last audit has started. The verifier reads the Platform Agent's cron run records and
-passes when the stage's `.oobe_audits_fired` lists all four audits as marked due and each has a run claimed since the arm that is running or completed, so a scheduled run that falls in the window does not count, and each started only after the one before it in the chain ended. Red: on
+passes when the stage's `.oobe_audits_fired` lists all four audits as marked due and each has a run claimed since the stage marked it that is running or completed (a skipped row is passed over), so a scheduled run that falls in the window does not count, and each started only after the one before it in the chain ended. Red: on
 an image without the job, no audit runs. Green: four, in three repetitions. The no-repository skip is unit-tested,
 not evaluated: the shared install has a repository, and removing it mid-run would break concurrent
 cases.

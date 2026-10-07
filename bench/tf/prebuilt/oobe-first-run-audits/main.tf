@@ -86,6 +86,7 @@ resource "null_resource" "oobe" {
     pod_wait      = local.pod_wait
     home          = local.home
     python        = local.python
+    hermes        = local.hermes
     disarm_b64    = local.disarm_b64
   }
 
@@ -135,7 +136,7 @@ resource "null_resource" "oobe" {
           -c "${var.agent_container}" --pod-running-timeout=${local.pod_wait}s -- ${local.python} - "$@"
       }
       disarm() {
-        printf '%s' '${local.disarm_b64}' | base64 -d | agent_py "${local.home}"
+        printf '%s' '${local.disarm_b64}' | base64 -d | agent_py "${local.home}" "${local.hermes}"
       }
       in_flight() {
         printf '%s' '${local.busy_b64}' | base64 -d | agent_py "${local.home}" ${local.audits}
@@ -214,7 +215,7 @@ resource "null_resource" "oobe" {
       printf '%s' '${self.triggers.disarm_b64}' | base64 -d | \
         kubectl exec -i -n "${self.triggers.namespace}" "deployment/${self.triggers.deployment}" \
         -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
-        ${self.triggers.python} - "${self.triggers.home}"
+        ${self.triggers.python} - "${self.triggers.home}" "${self.triggers.hermes}"
     EOT
   }
 }

@@ -199,7 +199,7 @@ class PlantScriptsTest(unittest.TestCase):
     def test_disarm_restores_both_markers_and_removes_the_job_it_added(self):
         (self.home / ".bootstrap_scan_filed").write_text("task_id=t_real\nfiled_at=1\n")
         self.assertEqual(self._arm().returncode, 0)
-        done = self._run("disarm.py", str(self.home))
+        done = self._run("disarm.py", str(self.home), str(self.hermes))
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual((self.home / ".bootstrap_scan_filed").read_text(), "task_id=t_real\nfiled_at=1\n")
         self.assertFalse((self.home / ".oobe_audits_fired").exists())
@@ -209,14 +209,14 @@ class PlantScriptsTest(unittest.TestCase):
     def test_disarm_removes_markers_that_were_not_there(self):
         self.assertEqual(self._arm().returncode, 0)
         (self.home / ".oobe_audits_fired").write_text('{"done": true}\n')
-        self.assertEqual(self._run("disarm.py", str(self.home)).returncode, 0)
+        self.assertEqual(self._run("disarm.py", str(self.home), str(self.hermes)).returncode, 0)
         self.assertFalse((self.home / ".bootstrap_scan_filed").exists())
         self.assertFalse((self.home / ".oobe_audits_fired").exists())
 
     def test_disarm_keeps_a_job_it_did_not_add(self):
         self.store.write_text(json.dumps([OTHER_JOB, OOBE_JOB]))
         self.assertEqual(self._arm().returncode, 0)
-        self.assertEqual(self._run("disarm.py", str(self.home)).returncode, 0)
+        self.assertEqual(self._run("disarm.py", str(self.home), str(self.hermes)).returncode, 0)
         self.assertIn("oobe", self._jobs())
 
     def test_disarm_puts_back_a_job_that_was_there_and_removed_itself(self):
@@ -225,7 +225,7 @@ class PlantScriptsTest(unittest.TestCase):
         self.assertEqual(self._arm().returncode, 0)
         self.assertEqual(self._state()["job_present"]["id"], "oobe")
         self.store.write_text(json.dumps([OTHER_JOB]))
-        done = self._run("disarm.py", str(self.home))
+        done = self._run("disarm.py", str(self.home), str(self.hermes))
         self.assertEqual(done.returncode, 0, done.stderr)
         oobe = next(j for j in json.loads(self.store.read_text()) if j["id"] == "oobe")
         self.assertNotIn("fire_claim", oobe)
@@ -234,7 +234,7 @@ class PlantScriptsTest(unittest.TestCase):
     def test_disarm_tolerates_a_job_that_already_removed_itself(self):
         self.assertEqual(self._arm().returncode, 0)
         self.store.write_text(json.dumps([OTHER_JOB]))
-        self.assertEqual(self._run("disarm.py", str(self.home)).returncode, 0)
+        self.assertEqual(self._run("disarm.py", str(self.home), str(self.hermes)).returncode, 0)
 
     def test_a_card_left_unarchived_is_recorded_and_archived_by_the_disarm(self):
         failing = self.hermes.with_name("hermes-no-archive")
@@ -250,7 +250,7 @@ class PlantScriptsTest(unittest.TestCase):
 
     def test_disarm_with_nothing_armed_changes_nothing(self):
         (self.home / ".bootstrap_scan_filed").write_text("task_id=t_real\n")
-        done = self._run("disarm.py", str(self.home))
+        done = self._run("disarm.py", str(self.home), str(self.hermes))
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual((self.home / ".bootstrap_scan_filed").read_text(), "task_id=t_real\n")
 
@@ -306,7 +306,10 @@ class PlantScriptsTest(unittest.TestCase):
 
     def test_the_provisioners_parse_as_bash(self):
         text = (STACK / "main.tf").read_text()
-        for script in re.findall(r"command\s+=\s+<<-EOT\n(.*?)\n\s*EOT", text, re.S):
+        scripts = re.findall(r"command\s+=\s+<<-EOT\n(.*?)\n\s*EOT", text, re.S)
+        # The apply and the teardown; a pattern that stops matching would otherwise check nothing.
+        self.assertEqual(len(scripts), 2)
+        for script in scripts:
             rendered = re.sub(r"(?<!\$)\$\{[^}]*\}", "X", script).replace("$${", "${")
             done = subprocess.run(["bash", "-n"], input=rendered, capture_output=True, text=True, check=False)
             self.assertEqual(done.returncode, 0, done.stderr)
