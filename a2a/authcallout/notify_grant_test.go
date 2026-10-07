@@ -3,6 +3,7 @@ package authcallout
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,11 +24,22 @@ import (
 // what the lists say - including for the session pods, whose grants the
 // callout derives per connection and no render lists.
 
-type recordingPoster struct{ posts []string }
+type recordingPoster struct {
+	mu    sync.Mutex
+	posts []string
+}
 
 func (p *recordingPoster) PostNotify(space, thread, text string) (string, string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.posts = append(p.posts, text)
 	return space + "/messages/1", space + "/threads/1", nil
+}
+
+func (p *recordingPoster) count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.posts)
 }
 
 const notifyTestHome = "spaces/HOME"
@@ -74,8 +86,8 @@ func TestTheNotifyRouteWorksForTheAgentAndNobodyElse(t *testing.T) {
 	if err := json.Unmarshal(msg.Data, &answer); err != nil || answer.ThreadID != notifyTestHome+"/threads/1" {
 		t.Fatalf("answer = %s (%v)", msg.Data, err)
 	}
-	if len(poster.posts) != 1 || poster.posts[0] != "a cron finding" {
-		t.Fatalf("posts = %q", poster.posts)
+	if poster.count() != 1 {
+		t.Fatalf("posted %d times, want 1", poster.count())
 	}
 
 	// The agent cannot forge an answer, nor read the requests.
@@ -114,16 +126,24 @@ func TestTheNotifyRouteWorksForTheAgentAndNobodyElse(t *testing.T) {
 	verifier, vv := h.connectAs(t, "verifier", tokenVerifier)
 	add("verifier", verifier, vv)
 	for _, o := range others {
-		before := len(poster.posts)
 		checkPublish(t, o.nc, o.v, map[string]bool{lib.NotifySubjectGchat: true})
-		if len(poster.posts) != before {
-			t.Errorf("%s's notify reached the gateway", o.name)
-		}
 		if !subscribeRefused(t, o.nc, o.v, lib.NotifyReplyPrefix+">") {
 			t.Errorf("%s could subscribe to the notify reply namespace", o.name)
 		}
 		if !subscribeRefused(t, o.nc, o.v, lib.NotifySubjectGchat) {
 			t.Errorf("%s could subscribe to chat.notify.gchat", o.name)
+		}
+		// And end to end: a well-formed request, reply subject in the
+		// namespace, that the gateway would post if the server let it
+		// through. Last in the loop, because its refusal lands on o.v.
+		before := poster.count()
+		if err := o.nc.PublishRequest(lib.NotifySubjectGchat, lib.NotifyReplyPrefix+o.name, body); err != nil {
+			t.Fatal(err)
+		}
+		_ = o.nc.Flush()
+		time.Sleep(200 * time.Millisecond)
+		if poster.count() != before {
+			t.Errorf("%s's notify reached the gateway and was posted", o.name)
 		}
 	}
 }

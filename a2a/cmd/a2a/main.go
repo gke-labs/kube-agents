@@ -61,6 +61,9 @@ const cliTimeout = 30 * time.Second
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "a2a: %v\n", err)
+		if errors.Is(err, errNotifyOutcomeUnknown) {
+			os.Exit(notifyExitOutcomeUnknown)
+		}
 		os.Exit(1)
 	}
 }

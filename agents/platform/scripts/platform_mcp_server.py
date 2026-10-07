@@ -907,7 +907,10 @@ def send_notification(message: str, session_id: str = "") -> str:
             # sandbox image does not carry the binary.
             res = subprocess.run(
                 chat_notify.command(target, message, json_output=False),
-                capture_output=True, text=True, check=True, env=_run_env()
+                capture_output=True, text=True, check=True, env=_run_env(),
+                # This process's stdin is the MCP JSON-RPC pipe; a child that
+                # read it would swallow protocol frames.
+                stdin=subprocess.DEVNULL,
             )
             results.append(f"SUCCESS: Notification posted to {platform_name}. Output: {res.stdout.strip()}")
         except subprocess.CalledProcessError as e:

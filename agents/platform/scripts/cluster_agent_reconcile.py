@@ -2054,6 +2054,7 @@ def _notify(message: str) -> None:
             subprocess.run(
                 chat_notify.command(platform, message, json_output=False, hermes_bin=HERMES_BIN),
                 capture_output=True, text=True, check=True, timeout=30, env=_run_env(),
+                stdin=subprocess.DEVNULL,
             )
         except Exception as e:  # noqa: BLE001 - notification is best-effort; never fail the run
             log(f"Failed to post reconcile notification to {platform}: {e}")

@@ -480,8 +480,9 @@ func TestTheHomeChannelReachesTheArmedGateway(t *testing.T) {
 
 // TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed: the agent
 // container is told to send proactive posts through chat.notify exactly when
-// the next stack holds Google Chat, which is exactly when the Hermes platform
-// that used to send them is not rendered. Either mismatch loses the posts.
+// the next stack holds Google Chat AND the home channel is a space name, which
+// is when the gateway arms the route. Telling it with no route behind it
+// would send every post to a subject nobody answers.
 func TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -490,8 +491,12 @@ func TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed(t *testing.T) 
 	}{
 		{"today with chat", gchatTestAgent("", true), false},
 		{"skew with chat", gchatTestAgent("later", true), false},
-		{"next with chat", gchatTestAgent("next", true), true},
-		{"next without chat", gchatTestAgent("next", false), false},
+		{"next with chat", withHome(gchatTestAgent("next", true), "spaces/AAAA"), true},
+		{"next with chat, no home channel", gchatTestAgent("next", true), false},
+		{"next with chat, not a space", withHome(gchatTestAgent("next", true), "spaces/AAAA/threads/B"), false},
+		{"next with chat, bare id", withHome(gchatTestAgent("next", true), "AAAA"), false},
+		{"next without chat", withHome(gchatTestAgent("next", false), "spaces/AAAA"), false},
+		{"today with chat and home", withHome(gchatTestAgent("", true), "spaces/AAAA"), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pod := buildPodTemplateSpec(tc.agent, "h", "h", "h", "h", nil, renderOptions{})
@@ -503,9 +508,14 @@ func TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed(t *testing.T) 
 			if ok && got.Value != "google_chat" {
 				t.Errorf("%s = %q, want google_chat (the platform name the agent-side callers use)", a2aNotifyPlatformEnvVar, got.Value)
 			}
-			if tc.want == legacyChatConsumer(tc.agent) && googleChatEnabled(tc.agent) {
-				t.Errorf("the notify route and the legacy Hermes platform are both %v", tc.want)
+			if tc.want && legacyChatConsumer(tc.agent) {
+				t.Error("the notify route and the legacy Hermes platform both render")
 			}
 		})
 	}
+}
+
+func withHome(agent *agentv1alpha1.PlatformAgent, home string) *agentv1alpha1.PlatformAgent {
+	agent.Spec.Integration.GoogleChat.HomeChannel = home
+	return agent
 }

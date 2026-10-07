@@ -153,6 +153,9 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	// the composite the doors and console wrap it in below. A malformed home
 	// channel leaves the route unarmed rather than the gateway down: chat
 	// ingress matters more than proactive posts.
+	if _, ok := adapter.(*gateway.GoogleChatAdapter); ok && cfg.GchatHomeChannel == "" {
+		log.Info("chat.notify route not armed: no home channel configured")
+	}
 	if gchat, ok := adapter.(*gateway.GoogleChatAdapter); ok && cfg.GchatHomeChannel != "" {
 		notifier, err := gateway.NewGchatNotifier(gchat, cfg.GchatHomeChannel, log)
 		if err != nil {

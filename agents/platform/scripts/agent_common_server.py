@@ -79,7 +79,7 @@ def _run_env(extra: dict[str, str] | None = None) -> dict[str, str]:
        child, whose own environment Hermes has already narrowed to an allowlist
        (`_build_safe_env` in hermes tools/mcp_tool.py, and the `env:` blocks in
        agents/platform/config.yaml), or session_kv_server spawning `hermes send`
-       as the same UID in the same container — a child that could read
+       (or `a2a notify`, under next) as the same UID in the same container — a child that could read
        /proc/self/environ anyway. Note that session_kv_server has two shapes:
        the uvicorn instance the entrypoint backgrounds holds the whole container
        environment, while the fallback instance platform_mcp_server spawns

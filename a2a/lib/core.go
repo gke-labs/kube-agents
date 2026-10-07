@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/nats-io/nats.go"
 )
@@ -54,6 +55,13 @@ func (s *coreSub) start(nc *nats.Conn) error {
 	if s.stopped.Load() {
 		return nil
 	}
+	// A binding on an earlier connection is released first, the way a
+	// durable stops its old consume context: two live bindings would deliver
+	// every message twice if that connection were still up.
+	if s.sub != nil {
+		_ = s.sub.Unsubscribe()
+		s.sub = nil
+	}
 	sub, err := nc.Subscribe(s.subject, s.handler)
 	if err != nil {
 		return fmt.Errorf("subscribe %s: %w", s.subject, err)
@@ -66,17 +74,32 @@ func (s *coreSub) start(nc *nats.Conn) error {
 	return nil
 }
 
-// resubscribeCore re-binds every core subscription on nc. A core subscribe
-// has no server-side state to wait for, so unlike resubscribe there is no
-// retry loop: a failure here is the new connection failing, which the
-// caller answers by dialing again.
+// resubscribeCore re-binds every core subscription on nc, retrying a failed
+// bind (a flush that timed out) for as long as nc is alive, as resubscribe
+// does for durables. Returns false only when nc dies first, which the caller
+// answers by dialing again; it never gives up on a live connection, which
+// would leave it open and its subscriptions bound beside the next one.
 func (c *Client) resubscribeCore(cores []*coreSub, nc *nats.Conn) bool {
-	for _, s := range cores {
-		if err := s.start(nc); err != nil {
-			c.log.Error("nats rebuild core re-subscribe failed", "subject", s.subject, "err", err)
+	pending := cores
+	attempt := 0
+	for len(pending) > 0 {
+		if c.closing.Load() || nc.IsClosed() {
 			return false
 		}
-		c.log.Info("nats rebuild re-subscribed", "subject", s.subject)
+		var failed []*coreSub
+		for _, s := range pending {
+			if err := s.start(nc); err != nil {
+				c.log.Error("nats rebuild core re-subscribe failed; will retry", "subject", s.subject, "err", err)
+				failed = append(failed, s)
+			} else {
+				c.log.Info("nats rebuild re-subscribed", "subject", s.subject)
+			}
+		}
+		pending = failed
+		if len(pending) > 0 {
+			attempt++
+			time.Sleep(fullJitterBackoff(attempt))
+		}
 	}
 	return !nc.IsClosed()
 }

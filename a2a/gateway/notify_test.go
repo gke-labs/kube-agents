@@ -61,7 +61,23 @@ func serveJSON(t *testing.T, n *Notifier, req lib.NotifyRequest) lib.NotifyReply
 	if err != nil {
 		t.Fatal(err)
 	}
-	return n.serve(body)
+	return serveBytes(t, n, body)
+}
+
+// serveBytes runs one request the way the worker does, synchronously, and
+// returns the one answer it gives.
+func serveBytes(t *testing.T, n *Notifier, body []byte) lib.NotifyReply {
+	t.Helper()
+	req, refusal := n.validate(body)
+	if refusal != nil {
+		return *refusal
+	}
+	var answers []lib.NotifyReply
+	n.post(req, func(r lib.NotifyReply) { answers = append(answers, r) })
+	if len(answers) != 1 {
+		t.Fatalf("post answered %d times, want exactly once: %+v", len(answers), answers)
+	}
+	return answers[0]
 }
 
 func TestNotifyRefusesAHomeThatIsNotASpace(t *testing.T) {
@@ -129,7 +145,7 @@ func TestNotifyRefusesMalformedRequests(t *testing.T) {
 		"empty text": []byte(`{"text":"   "}`),
 		"too large":  []byte(`{"text":"` + strings.Repeat("a", notifyMaxBody) + `"}`),
 	} {
-		if got := n.serve(body); got.Error == "" {
+		if got := serveBytes(t, n, body); got.Error == "" {
 			t.Errorf("%s: accepted", name)
 		}
 	}
@@ -158,11 +174,24 @@ func TestNotifyChunksALongReportIntoOneThread(t *testing.T) {
 	}
 }
 
-func TestNotifyReportsAPartialPost(t *testing.T) {
+// A failure after the first chunk does not change the answer: the caller
+// already has where the text started, and is answered once.
+func TestNotifyAnswersOnceWhenALaterChunkFails(t *testing.T) {
 	p := &fakeNotifyPoster{landsIn: testHome + "/threads/T1", failAt: 2}
 	got := serveJSON(t, newTestNotifier(t, p), lib.NotifyRequest{Text: strings.Repeat("x\n", 2000)})
-	if got.Error == "" || got.MessageID == "" || got.ThreadID == "" {
-		t.Errorf("reply = %+v, want the error and where the first part landed", got)
+	if got.Error != "" || got.MessageID == "" || got.ThreadID != testHome+"/threads/T1" {
+		t.Errorf("reply = %+v, want the first chunk's message and thread", got)
+	}
+	if n := len(p.all()); n != 2 {
+		t.Errorf("posted %d chunks, want 2 (the second failed and the rest were not tried)", n)
+	}
+}
+
+func TestNotifyReportsAFirstPostFailure(t *testing.T) {
+	p := &fakeNotifyPoster{failAt: 1}
+	got := serveJSON(t, newTestNotifier(t, p), lib.NotifyRequest{Text: "x"})
+	if got.Error == "" || got.MessageID != "" {
+		t.Errorf("reply = %+v, want the failure and no message", got)
 	}
 }
 
@@ -221,5 +250,62 @@ func TestNotifyAnswersOnlyInTheReplyNamespace(t *testing.T) {
 	}
 	if n := len(p.all()); n != 1 {
 		t.Errorf("posted %d times; the dropped requests must not post", n)
+	}
+}
+
+type blockingPoster struct{ release chan struct{} }
+
+func (b *blockingPoster) PostNotify(space, thread, text string) (string, string, error) {
+	<-b.release
+	return space + "/messages/1", space + "/threads/1", nil
+}
+
+// A full queue is refused at once, over the bus, rather than left to time
+// out: a sender in a loop gets an answer, and the requests already accepted
+// still post.
+func TestNotifyRefusesWhenTheQueueIsFull(t *testing.T) {
+	s := startServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	client, err := lib.Connect(ctx, s.ClientURL(), lib.WithName("notify-gateway"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	poster := &blockingPoster{release: make(chan struct{})}
+	n, err := NewGchatNotifier(poster, testHome, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := n.Start(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Stop()
+	defer close(poster.release)
+
+	agent, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agent.Close()
+	in, err := agent.SubscribeSync(lib.NotifyReplyPrefix + ">")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(lib.NotifyRequest{Text: "x"})
+	// One in the worker's hands, notifyQueueDepth queued, one more refused.
+	for i := 0; i < notifyQueueDepth+2; i++ {
+		if err := agent.PublishRequest(lib.NotifySubjectGchat, lib.NotifyReplyPrefix+"q", body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	msg, err := in.NextMsg(5 * time.Second)
+	if err != nil {
+		t.Fatalf("no refusal while the queue was full: %v", err)
+	}
+	var got lib.NotifyReply
+	if err := json.Unmarshal(msg.Data, &got); err != nil || !strings.Contains(got.Error, "already waiting") {
+		t.Errorf("first answer = %s, want the queue-full refusal", msg.Data)
 	}
 }

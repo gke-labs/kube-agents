@@ -7,26 +7,40 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nuid"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
-// notifyDefaultTimeout bounds the wait for the gateway's answer. A long
-// report goes out as several Chat posts, each a relay round trip.
-const notifyDefaultTimeout = 20 * time.Second
+// notifyDefaultTimeout bounds the wait for the gateway's answer. The gateway
+// answers once the first post has landed, which is one relay call (the
+// gateway bounds each at 45s) plus any notify queued ahead of this one.
+const notifyDefaultTimeout = 60 * time.Second
 
-const notifyUsage = `usage: a2a notify --platform <platform> [--thread <thread>] [--timeout <d>] [text]
+// notifyExitOutcomeUnknown is the exit status for "no answer in time": the
+// post may still land, so a caller must not send it again. The agent-side
+// callers read it (agents/platform/scripts/chat_notify.py,
+// NOTIFY_OUTCOME_UNKNOWN); every other failure exits 1.
+const notifyExitOutcomeUnknown = 3
+
+// errNotifyOutcomeUnknown marks the failure main reports with
+// notifyExitOutcomeUnknown.
+var errNotifyOutcomeUnknown = errors.New("outcome unknown")
+
+const notifyUsage = `usage: a2a notify --platform <platform> [--thread <thread>] [--timeout <d>] [--] [text]
 
 Post text to the install's chat home channel through the A2A gateway: a new
 thread, or a reply on --thread, which must be a thread of the home channel.
-Reads the text from stdin when it is "-" or omitted. Prints the gateway's
-answer as JSON ({"message_id", "thread_id"}, the shape hermes send --json
-prints) and exits non-zero when nothing was posted.
+Reads the text from stdin when it is omitted, or "-" with no "--" before it.
+Prints the gateway's answer as JSON (message_id, the field hermes send --json
+prints, and thread_id). Exits 1 when nothing was posted and 3 when the gateway
+did not answer in time, so the post may still land.
 `
 
 func runNotify(args []string) error {
@@ -42,7 +56,9 @@ func runNotify(args []string) error {
 	if !ok {
 		return fmt.Errorf("notify: --platform must be one of %s", strings.Join(notifyPlatforms(), ", "))
 	}
-	text, err := notifyText(fs.Args(), os.Stdin)
+	// flag drops the "--" it stops at, so whether one was given is read from
+	// the raw arguments: after it, a lone "-" is text, not "read stdin".
+	text, err := notifyText(fs.Args(), slices.Contains(args, "--"), os.Stdin)
 	if err != nil {
 		return err
 	}
@@ -77,8 +93,18 @@ func runNotify(args []string) error {
 		return fmt.Errorf("notify: flush: %w", err)
 	}
 	msg, err := in.NextMsg(*timeout)
+	if errors.Is(err, nats.ErrTimeout) {
+		return fmt.Errorf("notify: no answer from the gateway on %s within %s; the post may still land: %w",
+			subject, *timeout, errNotifyOutcomeUnknown)
+	}
+	if errors.Is(err, nats.ErrNoResponders) {
+		// Nothing subscribes on the subject, so the gateway's route is not
+		// armed (no home channel, another backend, or the gateway down).
+		// Nothing was posted.
+		return fmt.Errorf("notify: nothing is answering on %s; the gateway's notify route is not armed", subject)
+	}
 	if err != nil {
-		return fmt.Errorf("notify: no answer from the gateway on %s within %s: %w", subject, *timeout, err)
+		return fmt.Errorf("notify: no answer from the gateway on %s: %w", subject, err)
 	}
 	var answer lib.NotifyReply
 	if err := json.Unmarshal(msg.Data, &answer); err != nil {
@@ -94,12 +120,13 @@ func runNotify(args []string) error {
 	return nil
 }
 
-// notifyText is the positional text, or stdin when it is "-" or absent.
-func notifyText(args []string, stdin io.Reader) (string, error) {
+// notifyText is the positional text, or stdin when it is absent, or "-" with
+// no "--" before it.
+func notifyText(args []string, terminated bool, stdin io.Reader) (string, error) {
 	switch {
 	case len(args) > 1:
 		return "", errors.New("notify: one text argument (quote it), or none to read stdin")
-	case len(args) == 1 && args[0] != "-":
+	case len(args) == 1 && (terminated || args[0] != "-"):
 		return args[0], nil
 	}
 	data, err := io.ReadAll(stdin)

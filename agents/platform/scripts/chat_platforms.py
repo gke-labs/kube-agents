@@ -177,7 +177,11 @@ def enabled_chat_platforms() -> list[str]:
     An explicit `enabled: false` therefore wins over an environment signal, in either
     file: that combination is an operator or an admin turning a platform off on a pod
     that still has the variables rendered on it, and the file is the more specific
-    statement.
+    statement. The one exception is the platform the operator names in
+    `A2A_NOTIFY_PLATFORM` (chat_notify.py): under `next` the managed scope turns that
+    platform's Hermes consumer off because the A2A gateway holds the backend, and
+    posts reach it through the gateway, so it counts as enabled whatever the files
+    say. The operator renders the variable only then, and reserves it.
 
     Never returns an empty list: an install that resolves to nothing gets
     DEFAULT_PLATFORM, which is what every caller did unconditionally before.

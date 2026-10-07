@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -92,9 +93,50 @@ func TestNotifyFailsWhenTheGatewayPostedNothing(t *testing.T) {
 func TestNotifyTimesOutWithNoGateway(t *testing.T) {
 	s := startNotifyServer(t)
 	notifyEnv(t, s.ClientURL())
+	// No gateway at all is "no responders": refused, exit 1. Only a request
+	// that someone received and did not answer is outcome-unknown.
 	err := run([]string{"notify", "--platform", "google_chat", "--timeout", "200ms", "x"})
-	if err == nil || !strings.Contains(err.Error(), "no answer") {
-		t.Errorf("err = %v, want a timeout naming the missing answer", err)
+	if err == nil || errors.Is(err, errNotifyOutcomeUnknown) || !strings.Contains(err.Error(), "not armed") {
+		t.Errorf("err = %v, want the no-responders refusal, not outcome-unknown", err)
+	}
+}
+
+// Report text that looks like a flag is text once "--" ends the flags: a
+// markdown bullet, a rule, a negative number, and a message that is exactly a
+// valid flag, which would otherwise redirect the post or read stdin.
+func TestNotifyTextThatLooksLikeAFlag(t *testing.T) {
+	for _, text := range []string{"- pod crashlooping\n- node lost", "--- Daily report", "-1 nodes down", "--thread=spaces/H/threads/X", "-"} {
+		s := startNotifyServer(t)
+		notifyEnv(t, s.ClientURL())
+		got, _ := answerNotify(t, s.ClientURL(), lib.NotifyReply{MessageID: "m", ThreadID: "t"})
+		if err := run([]string{"notify", "--platform", "google_chat", "--", text}); err != nil {
+			t.Errorf("%q: %v", text, err)
+			continue
+		}
+		if req := <-got; req.Text != text || req.Thread != "" {
+			t.Errorf("%q arrived as %+v", text, req)
+		}
+	}
+}
+
+// A request someone received and did not answer is outcome-unknown: the post
+// may still land, and main exits notifyExitOutcomeUnknown so the caller does
+// not send it again.
+func TestNotifyWithNoAnswerIsOutcomeUnknown(t *testing.T) {
+	s := startNotifyServer(t)
+	notifyEnv(t, s.ClientURL())
+	nc, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	if _, err := nc.Subscribe(lib.NotifySubjectGchat, func(*nats.Msg) {}); err != nil {
+		t.Fatal(err)
+	}
+	_ = nc.Flush()
+	err = run([]string{"notify", "--platform", "google_chat", "--timeout", "200ms", "x"})
+	if !errors.Is(err, errNotifyOutcomeUnknown) {
+		t.Errorf("err = %v, want outcome-unknown", err)
 	}
 }
 
@@ -106,15 +148,18 @@ func TestNotifyRefusesAnUnknownPlatform(t *testing.T) {
 }
 
 func TestNotifyTextFromArgumentOrStdin(t *testing.T) {
-	if got, _ := notifyText([]string{"hello"}, strings.NewReader("ignored")); got != "hello" {
+	if got, _ := notifyText([]string{"hello"}, false, strings.NewReader("ignored")); got != "hello" {
 		t.Errorf("argument: %q", got)
 	}
 	for _, args := range [][]string{nil, {"-"}} {
-		if got, _ := notifyText(args, strings.NewReader("from stdin")); got != "from stdin" {
+		if got, _ := notifyText(args, false, strings.NewReader("from stdin")); got != "from stdin" {
 			t.Errorf("args %v: %q, want stdin", args, got)
 		}
 	}
-	if _, err := notifyText([]string{"a", "b"}, strings.NewReader("")); err == nil {
+	if got, _ := notifyText([]string{"-"}, true, strings.NewReader("stdin")); got != "-" {
+		t.Errorf(`"-" after "--" = %q, want the literal text`, got)
+	}
+	if _, err := notifyText([]string{"a", "b"}, false, strings.NewReader("")); err == nil {
 		t.Error("two arguments accepted")
 	}
 }

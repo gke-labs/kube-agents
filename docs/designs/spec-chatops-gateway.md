@@ -1072,11 +1072,16 @@ the Chat credential, to post it. The agent container runs `a2a notify`, which pu
 core NATS request on `chat.notify.gchat` carrying `{"text", "thread"?}` with its reply subject
 under `chat.notify.reply.agent.`; the gateway posts the text into the home space
 (`googleChat.homeChannel`, carried as `A2A_GCHAT_HOME_CHANNEL`), as a new thread or as a reply
-on a thread of that space, and answers with the first message's name and the thread it
-landed in, the shape `hermes send --json` prints. The agent-side callers
+on a thread of that space, and answers with `message_id` (the field `hermes send --json`
+prints) and `thread_id`, the thread it landed in, or an `error` naming why nothing was
+posted. The answer goes out once the first part has landed; a long text is chunked, and
+the rest follows into the same thread. A request the gateway took and did not answer in
+time may still post, so `a2a notify` exits with its own status then, and the alert path
+treats that as sent rather than sending again. The agent-side callers
 (`agents/platform/scripts/chat_notify.py`) switch on `A2A_NOTIFY_PLATFORM`, which the operator
-renders exactly when `a2aChatArmed` holds, and send to every other platform through
-`hermes send` as before.
+renders exactly when `a2aChatArmed` holds and `homeChannel` is a space name (the condition
+the gateway arms the route on), and send to every other platform through `hermes send` as
+before.
 
 A notify is not a task. It mints no capability, starts no executor, opens no session and
 carries no `authority` block; the requester rules above do not apply, because nobody

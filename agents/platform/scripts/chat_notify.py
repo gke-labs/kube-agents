@@ -34,6 +34,9 @@ NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
 A2A_CLI = "a2a"
 # The Hermes CLI the today path posts through.
 HERMES_CLI = "hermes"
+# The exit status `a2a notify` uses when the gateway did not answer in time: the
+# post may or may not have landed, so a caller must not post it again.
+NOTIFY_OUTCOME_UNKNOWN = 3
 # A Google Chat message name and the thread it starts: spaces/S/messages/M.M is
 # in thread spaces/S/threads/M when Hermes posted it.
 GCHAT_PLATFORM = "google_chat"
@@ -68,7 +71,15 @@ def command(target: str, message: str, json_output: bool = True, hermes_bin: str
     argv = [A2A_CLI, "notify", "--platform", platform]
     if thread:
         argv += ["--thread", thread]
-    return argv + [message]
+    # "--" ends the flags: a report that opens with a bullet, a rule or a
+    # negative number is text, not an option, and a message that is exactly
+    # "--thread=..." must not redirect the post.
+    return argv + ["--", message]
+
+
+def outcome_unknown(returncode: int) -> bool:
+    """Whether a failed send may still have posted (the gateway did not answer in time)."""
+    return returncode == NOTIFY_OUTCOME_UNKNOWN
 
 
 def thread_from_response(platform: str, response: dict) -> str:

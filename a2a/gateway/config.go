@@ -33,6 +33,10 @@ const defaultMaxSessions = 10
 // relay-audience ServiceAccount token when the gchat backend is armed.
 const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token"
 
+// envGchatHomeChannel carries the Chat home space the chat.notify route posts
+// to (notify.go); the operator renders it from googleChat.homeChannel.
+const envGchatHomeChannel = "A2A_GCHAT_HOME_CHANNEL"
+
 // defaultInjectPrincipalMapPath is where the operator mounts the inject
 // door's own principal map when the door is armed. A file of "id principal"
 // lines rather than a directory of one file per id, because every key carries
@@ -443,7 +447,7 @@ func FromEnv() (*Config, error) {
 		}
 	}
 	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
-	cfg.GchatHomeChannel = strings.TrimSpace(os.Getenv("A2A_GCHAT_HOME_CHANNEL"))
+	cfg.GchatHomeChannel = strings.TrimSpace(os.Getenv(envGchatHomeChannel))
 	cfg.InjectListen = strings.TrimSpace(os.Getenv("A2A_INJECT_LISTEN"))
 	cfg.InjectToken = strings.TrimSpace(os.Getenv("A2A_INJECT_TOKEN"))
 	cfg.InjectPrincipalMapPath = envOr("A2A_INJECT_PRINCIPAL_MAP", defaultInjectPrincipalMapPath)

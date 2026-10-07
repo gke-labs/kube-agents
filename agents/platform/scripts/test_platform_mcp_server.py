@@ -686,7 +686,7 @@ class TestSendNotification(unittest.TestCase):
         self.assertIn("SUCCESS: Notification posted to google_chat", result)
         mock_run.assert_called_once_with(
             ["hermes", "send", "--to", "google_chat", "hello warning"],
-            capture_output=True, text=True, check=True, env={}
+            capture_output=True, text=True, check=True, env={}, stdin=subprocess.DEVNULL
         )
 
     @patch('platform_mcp_server._run_env')
@@ -711,7 +711,7 @@ class TestSendNotification(unittest.TestCase):
         # Verify hermes was called with explicit threaded path target
         mock_run.assert_called_once_with(
             ["hermes", "send", "--to", "slack:space123:thread123", "hello warning"],
-            capture_output=True, text=True, check=True, env={}
+            capture_output=True, text=True, check=True, env={}, stdin=subprocess.DEVNULL
         )
 
     @patch('platform_mcp_server._run_env')
@@ -733,7 +733,7 @@ class TestSendNotification(unittest.TestCase):
         self.assertIn("SUCCESS: Notification posted to google_chat", result)
         mock_run.assert_called_once_with(
             ["hermes", "send", "--to", "google_chat", "hello warning"],
-            capture_output=True, text=True, check=True, env={}
+            capture_output=True, text=True, check=True, env={}, stdin=subprocess.DEVNULL
         )
 
     @patch('platform_mcp_server._run_env')
@@ -754,7 +754,7 @@ class TestSendNotification(unittest.TestCase):
         self.assertIn("SUCCESS: Notification posted to slack", result)
         mock_run.assert_called_once_with(
             ["hermes", "send", "--to", "slack:C12345", "alert"],
-            capture_output=True, text=True, check=True, env={}
+            capture_output=True, text=True, check=True, env={}, stdin=subprocess.DEVNULL
         )
 
     @patch('platform_mcp_server._run_env')
@@ -774,7 +774,7 @@ class TestSendNotification(unittest.TestCase):
         self.assertIn("SUCCESS: Notification posted to google_chat", result)
         mock_run.assert_called_once_with(
             ["hermes", "send", "--to", "google_chat:spaces/AAAA", "alert"],
-            capture_output=True, text=True, check=True, env={}
+            capture_output=True, text=True, check=True, env={}, stdin=subprocess.DEVNULL
         )
 
     @patch('platform_mcp_server._run_env')
@@ -796,11 +796,11 @@ class TestSendNotification(unittest.TestCase):
         self.assertEqual(mock_run.call_count, 2)
         mock_run.assert_any_call(
             ["hermes", "send", "--to", "slack:C12345", "alert"],
-            capture_output=True, text=True, check=True, env={}
+            capture_output=True, text=True, check=True, env={}, stdin=subprocess.DEVNULL
         )
         mock_run.assert_any_call(
             ["hermes", "send", "--to", "google_chat:spaces/AAAA", "alert"],
-            capture_output=True, text=True, check=True, env={}
+            capture_output=True, text=True, check=True, env={}, stdin=subprocess.DEVNULL
         )
 
 

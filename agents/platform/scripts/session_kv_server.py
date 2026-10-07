@@ -1088,6 +1088,13 @@ def enabled_chat_platforms() -> list[str]:
        than dropped because it is the truth on the installs that do write it.
     3. The environment signals above, for an install neither file describes.
 
+    One thing outranks all three: the platform the operator names in
+    ``A2A_NOTIFY_PLATFORM`` (chat_notify.py). Under ``spec.mode: next`` the
+    managed scope says that platform's Hermes consumer is off because the A2A
+    gateway holds the backend, and posts to it go through the gateway instead,
+    so it is still a platform this install posts to. The operator renders the
+    variable only then, and it is reserved against every other source.
+
     Never returns an empty list — an install that resolves to nothing gets
     DEFAULT_CHAT_PLATFORM.
 
@@ -1198,6 +1205,7 @@ def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
             check=True,
             capture_output=True,
             text=True,
+            stdin=subprocess.DEVNULL,
             env=_run_env()
         )
         resp = json.loads(res.stdout)
@@ -1211,6 +1219,11 @@ def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
         )
         return ALERT_SENT_WITHOUT_THREAD
     except subprocess.CalledProcessError as exc:
+        if chat_notify.outcome_unknown(exc.returncode):
+            # The gateway took the request and did not answer in time: the
+            # alert may well be in the channel, so it must not be sent again.
+            logger.error(f"Alert to '{active_platform}' got no answer in time; treating it as sent. Stderr: {exc.stderr}")
+            return ALERT_SENT_WITHOUT_THREAD
         logger.error(f"Failed to post warning alert. Stdout: {exc.stdout}. Stderr: {exc.stderr}. Exc: {exc}")
     except Exception as exc:
         logger.error(f"Failed to post warning alert or parse message_id response: {exc}")
@@ -2642,6 +2655,7 @@ def _send_to_chat(
             check=True,
             capture_output=True,
             text=True,
+            stdin=subprocess.DEVNULL,
             env=_run_env(),
             timeout=timeout,
         )

@@ -81,3 +81,39 @@ func TestSubscribeCoreStopLeavesTheRebuildSet(t *testing.T) {
 		t.Errorf("cores = %d after Stop, want 0", n)
 	}
 }
+
+// A second bind releases the first: a message is delivered once, not once per
+// binding. Re-binding without releasing is how a rebuild that re-dials while
+// the old connection is still up would double every delivery.
+func TestARebindReleasesTheEarlierBinding(t *testing.T) {
+	s := runJetStreamServer(t, -1, t.TempDir(), nil)
+	ctx := testCtx(t)
+	c, err := Connect(ctx, clientURL(s), WithName("core-rebind"))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer c.Close()
+	var heard atomic.Int32
+	sub, err := c.SubscribeCore("core.rebind.test", func(*nats.Msg) { heard.Add(1) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Stop()
+	nc, _ := c.conn()
+	if err := sub.(*coreSub).start(nc); err != nil {
+		t.Fatalf("second bind: %v", err)
+	}
+	other, err := nats.Connect(clientURL(s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	if err := other.Publish("core.rebind.test", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	_ = other.Flush()
+	time.Sleep(300 * time.Millisecond)
+	if got := heard.Load(); got != 1 {
+		t.Errorf("delivered %d times, want 1", got)
+	}
+}
