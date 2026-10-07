@@ -113,6 +113,10 @@ type Config struct {
 	// GchatAllowAllUsers disables the allowlist, stated explicitly —
 	// mirroring the legacy GOOGLE_CHAT_ALLOW_ALL_USERS posture.
 	GchatAllowAllUsers bool
+	// GchatHomeChannel is the install's Chat home space ("spaces/AAA"), the
+	// one place a chat.notify post may land (notify.go). Empty leaves the
+	// notify route unarmed.
+	GchatHomeChannel string
 
 	// InjectListen is the inject side door's HTTP listen address, and setting
 	// it arms the door. DEV AND EVAL ONLY. The door is not a backend in the
@@ -439,6 +443,7 @@ func FromEnv() (*Config, error) {
 		}
 	}
 	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
+	cfg.GchatHomeChannel = strings.TrimSpace(os.Getenv("A2A_GCHAT_HOME_CHANNEL"))
 	cfg.InjectListen = strings.TrimSpace(os.Getenv("A2A_INJECT_LISTEN"))
 	cfg.InjectToken = strings.TrimSpace(os.Getenv("A2A_INJECT_TOKEN"))
 	cfg.InjectPrincipalMapPath = envOr("A2A_INJECT_PRINCIPAL_MAP", defaultInjectPrincipalMapPath)

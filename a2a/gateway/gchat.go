@@ -443,6 +443,33 @@ func (a *GoogleChatAdapter) Post(conversation, text string) (string, error) {
 	return created.Name, nil
 }
 
+// PostNotify writes text into space, as a new thread when thread is empty or
+// as a reply on thread, and returns the created message's resource name and
+// the thread it landed in. It is Post for a caller with no conversation key
+// (the chat.notify route, notify.go), which also needs the thread back so the
+// next notify can reply on it.
+func (a *GoogleChatAdapter) PostNotify(space, thread, text string) (message, landed string, err error) {
+	if !gchatIsSpaceName(space) {
+		return "", "", fmt.Errorf("gchat: not a space name: %q", space)
+	}
+	body := map[string]any{"text": toGchatText(text)}
+	arguments := map[string]any{"parent": space, "body": body}
+	if thread != "" {
+		body["thread"] = map[string]any{"name": thread}
+		arguments["messageReplyOption"] = gchatReplyOption
+	}
+	var created struct {
+		Name   string `json:"name"`
+		Thread struct {
+			Name string `json:"name"`
+		} `json:"thread"`
+	}
+	if err := a.apiCall([]string{"spaces", "messages"}, "create", arguments, &created); err != nil {
+		return "", "", err
+	}
+	return created.Name, created.Thread.Name, nil
+}
+
 // Edit replaces the text of a previously posted message (Adapter.Edit) — the
 // rolling progress line edits one message as artifacts arrive.
 func (a *GoogleChatAdapter) Edit(conversation, messageID, text string) error {
