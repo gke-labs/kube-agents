@@ -70,6 +70,14 @@ _PUBLISHERS_LINE = (
 
 _LOG_DROPPED_ENV = "DRIFT_DETECTOR_LOG_DROPPED"
 
+# The detector's startup line is assembled from two places in main.go: the
+# `commandName` constant every log line is prefixed with, and the format string
+# of the line itself. Render the marker from both rather than repeating it, so
+# a rename on the Go side is a unit failure here and not a dead readiness gate
+# discovered an hour into a lease.
+_DETECTOR_COMMAND_NAME_RE = re.compile(r'^\s*commandName\s*=\s*"([^"]*)"', re.MULTILINE)
+_DETECTOR_PULL_LOG_RE = re.compile(r'log\.Printf\(\s*"%s: (pulling[^"%]*)')
+
 _READY_GATE_START = "drift_detector_started=false"
 _READY_GATE_END = 'echo "✓ Rollout verification finished'
 _GATE_NAMESPACE = "kubeagents-system"
@@ -139,6 +147,32 @@ def _terraform_default(path: pathlib.Path, variable: str) -> str:
 def _head_constants(text: str) -> str:
     """The file-head `readonly` declarations a lifted block reads."""
     return "\n".join(line for line in text.splitlines() if line.startswith("readonly "))
+
+
+def _detector_startup_marker() -> str:
+    """The prefix the detector really prints when it reaches its pull loop.
+
+    Both halves raise rather than returning a partial answer. A format string
+    this cannot parse is a rewrite of the line the readiness gate waits on, and
+    the gate's coupling to it has to be re-checked by hand; reporting that as a
+    marker that happens not to match would say the constant is wrong when it is
+    the derivation that stopped working.
+    """
+    text = _DETECTOR_MAIN.read_text()
+    name = _DETECTOR_COMMAND_NAME_RE.search(text)
+    if name is None:
+        raise AssertionError(
+            "k8s-operator/cmd/drift-detector/main.go declares no commandName constant"
+        )
+    logged = _DETECTOR_PULL_LOG_RE.search(text)
+    if logged is None:
+        raise AssertionError(
+            'no log.Printf("%s: pulling ...") in '
+            "k8s-operator/cmd/drift-detector/main.go: the startup line the eval "
+            "deploy's readiness gate waits on has been restructured, so the gate "
+            "and this derivation both need re-checking against the new line"
+        )
+    return f"{name.group(1)}: {logged.group(1).strip()}"
 
 
 def _ready_gate(text: str) -> str:
@@ -256,6 +290,20 @@ class DetectorIsTurnedOnForEachLeaseTest(unittest.TestCase):
             "points the detector at have drifted apart. The detector would pull "
             "a subscription that does not exist, with the pod Ready and nothing "
             "in the logs saying so.",
+        )
+
+    def test_the_readiness_marker_is_what_the_detector_prints(self) -> None:
+        self.assertEqual(
+            _detector_startup_marker(),
+            _shell_constant(_CI_DEPLOY, "EVAL_DRIFT_READY_MARKER"),
+            "hack/ci-deploy.sh waits for a line the drift detector no longer "
+            "prints. The gate is fail-closed, so this does not pass silently -- "
+            "it fails every eval deploy, roughly an hour into a lease, reporting "
+            "that the detector never started on an install where it started "
+            "fine. The coupling is invisible from the Go side: whoever renames "
+            "commandName or rewrites the pulling log line in "
+            "k8s-operator/cmd/drift-detector/main.go has no reason to know a "
+            "shell constant reads it.",
         )
 
 
