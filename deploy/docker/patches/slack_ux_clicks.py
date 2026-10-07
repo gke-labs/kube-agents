@@ -22,7 +22,13 @@ With the flag on, :func:`register` adds two listeners:
   whole line the message itself shows ("Fix the first one: <the first row>",
   markup and a row's severity aside) is the turn, so a session that never
   read the message is told what the click is about. Part of a line is not
-  enough: it can say the opposite of the line it came from. The answered line still shows the label. A
+  enough: it can say the opposite of the line it came from. The answered line still shows the label.
+  An incident option button is the other exception: it shows the option's
+  title (`` (recommended)`` after the recommended one's) and its value is the
+  reply the report's call to action asks for, ``apply Option B: <that
+  title>``, which is the turn when its title is the one shown, whole or as
+  the clip shows it. The shown title, without the suffix, is what the
+  answered line says and the thread is offered as its ask. A
   label that starts like a command (``/`` or ``!``) is sent as text, since a
   choice is an answer. The click goes through the adapter's own interactive
   authorization; an unlisted user's click is logged and changes nothing, and
@@ -31,12 +37,15 @@ With the flag on, :func:`register` adds two listeners:
   only ``disable_dms`` gates, as upstream's message handler does.
   Then the message is rewritten with the choice buttons replaced by
   a line naming who chose what ("✓ <name>: label", by the clicker's display
-  name, then real name, then handle, never a mention or an id; the same line goes above the
-  message's text, which is kept: an incident report is in that text and
-  nowhere a later read of the thread looks); only when Slack refuses that
-  rewrite is the same line posted in the thread instead, since a bot token
-  cannot post as the user. The label is then offered as the thread's first ask, so
-  a session titled from the click reads as the label. The label is fed
+  name, then real name, then handle, never a mention or an id; the same line
+  goes above the message's text, which is kept: an incident report is in that
+  text and nowhere a later read of the thread looks); only when Slack refuses
+  that rewrite is the same line posted in the thread instead, since a bot token
+  cannot post as the user. The message's first line of text (a question's
+  headline; a failure reply's bold lead) is then offered as the thread's first
+  ask (the label for an incident option or a message with no text), so a thread
+  nobody titled yet is named for the message rather than for the button or the
+  card note in the turn. The label is fed
   to the adapter's message handler as that user's message in that thread, the
   path a reaction trigger already takes. That path applies the channel and user checks a typed message gets, so a click
   can do nothing its clicker could not do by typing the label.
@@ -63,7 +72,10 @@ The rewrite sends back the blocks Slack echoed in the payload, clamped as
 upstream clamps every ``chat.update``: Slack stores ``< > &`` escaped, so an
 echoed text can come back longer than the send path budgeted for. A section or
 context text past ``SECTION_TEXT_MAX`` is clipped and the message is cut to
-``MESSAGE_BLOCKS_MAX`` blocks, keeping the answered note last.
+``MESSAGE_BLOCKS_MAX`` blocks, keeping the answered note last. A message with a
+side bar (``slack_presenter.with_side_bar``) echoes its blocks split between
+its own and its attachment's; the rewrite reads both and puts them back beside
+the same colour, since ``chat.update`` keeps an attachment it is not sent.
 
 An incident alert's option buttons (``kage_incident.choice.<n>``) can also be
 answered by typing: someone replies ``apply Option B`` in the thread, the agent
@@ -168,6 +180,9 @@ ANSWERED_MAX = 512
 #: presenter's choice segment, copied because that module is not imported here.
 INCIDENT_CHOICE_PREFIX = "kage_incident.choice."
 
+#: ``slack_ux_incident.RECOMMENDED_SUFFIX``, copied for the same reason.
+INCIDENT_RECOMMENDED_SUFFIX = " (recommended)"
+
 #: Struck-through text, ``~like this~``: taken back, so removed before a reply is matched.
 #: Each tilde sits at a word's edge, as Slack's own strike needs: ``~3 to ~5`` is not struck.
 TYPED_STRUCK = re.compile(r"(?<![\w~])~(?=\S)[^~\n]+?(?<=\S)~(?![\w~])")
@@ -193,8 +208,9 @@ TYPED_APPLY = re.compile(
     re.IGNORECASE,
 )
 
-#: An incident option button's value, its whole label, ``slack_ux_incident.OPTION_LABEL``
-#: or ``SINGLE_LABEL``: its capital letter, if it has one, and the option's own text.
+#: An incident option button's value, ``slack_ux_incident.OPTION_REPLY`` or ``SINGLE_REPLY``
+#: (and its shown text too, on an alert edited before the button showed only the title): its
+#: capital letter, if it has one, and the option's own text.
 BUTTON_FORM = re.compile(r"apply(?: Option ([A-Z]))?: (.+)", re.DOTALL)
 
 #: What ``slack_presenter._clip`` ends a button's clipped shown text with.
@@ -383,6 +399,13 @@ def _answered_text(note: str, message: dict, question: bool = False) -> str:
     return _presenter._clip(f"{note}\n\n{original}", SLACK_TEXT_MAX) if original else note
 
 
+def _rewrite(message: dict, answered: Any, note: str, text: str) -> dict:
+    """The ``text`` and ``blocks``, and ``attachments`` for a message with a side bar, that answer ``message``."""
+    blocks = answered_blocks(_presenter.message_blocks(message), answered, note)
+    color = _presenter.side_bar_color(message)
+    return {"text": text, **(_presenter.with_side_bar(blocks, color, text) if color else {"blocks": blocks})}
+
+
 def _shown_text(action: dict) -> str:
     """The clicked button's text as Slack displayed it, with Slack's entities decoded."""
     text = action.get("text") or {}
@@ -452,8 +475,18 @@ def _turn(label: str, value: Any, message: dict) -> str:
     want = _comparable(named)
     if not want or "\n" in named:
         return label
-    shown = next((line for line in _shown_lines(message.get("blocks")) if _comparable(line) == want), None)
+    shown = next((line for line in _shown_lines(_presenter.message_blocks(message)) if _comparable(line) == want), None)
     return label if shown is None else label + TURN_JOIN + " ".join(shown.split())
+
+
+def _incident_turn(picked: str, value: Any) -> str:
+    """An incident option's turn: ``value`` when it is a reply naming the title ``picked`` shows, else ``picked``."""
+    form = BUTTON_FORM.fullmatch(value) if isinstance(value, str) else None
+    if form is None:
+        return picked
+    title = form.group(2)
+    clipped = picked.endswith(CLIPPED_END) and title.startswith(picked.removesuffix(CLIPPED_END))
+    return value if picked in (value, title) or clipped else picked
 
 
 def _gated_out(adapter: Any, channel_id: str, body: dict) -> bool:
@@ -488,9 +521,21 @@ def _question_card(channel_id: str, msg_ts: str) -> str:
         return ""
 
 
-async def _title_from_label(adapter: Any, channel_id: str, team_id: str, thread_ts: str, label: str) -> None:
-    """Offer ``label`` as the thread's first ask before the turn runs, so a session
-    titled from the click shows the label and never the card note in the turn.
+def _asked(message: dict) -> str:
+    """The first line of ``message``'s text without the "Reply with one of:" line (a
+    question's headline; a failure reply's bold lead), or ``""`` when it has none.
+
+    Decoded as the button label is, and without the ``*`` a question's headline is
+    stored in, so a title reads "Scale replicas > 3?" rather than ``*…&gt; 3?*``."""
+    line = _without_choices_line(str(message.get("text") or ""), True).split("\n", 1)[0].strip()
+    if len(line) > 2 and line[0] == line[-1] == "*":
+        line = line[1:-1].strip()
+    return _unescape(line)
+
+
+async def _offer_title(adapter: Any, channel_id: str, team_id: str, thread_ts: str, title: str) -> None:
+    """Offer ``title`` as the thread's first ask before the turn runs, so a session
+    titled from the click never shows the card note in the turn.
 
     A channel thread is titled through ``slack_ux_status``; a DM thread only by
     upstream, once, so a DM already titled from its first message keeps it."""
@@ -498,12 +543,12 @@ async def _title_from_label(adapter: Any, channel_id: str, team_id: str, thread_
         try:
             from gateway import slack_ux_status
 
-            slack_ux_status.note_ask(channel_id, thread_ts, label)
+            slack_ux_status.note_ask(channel_id, thread_ts, title)
         except Exception:  # noqa: BLE001 — the title is cosmetic; the click still answers
             pass
     elif hasattr(adapter, "_set_assistant_thread_title"):
         try:
-            await adapter._set_assistant_thread_title(channel_id, thread_ts, label, team_id=team_id)
+            await adapter._set_assistant_thread_title(channel_id, thread_ts, title, team_id=team_id)
         except Exception:  # noqa: BLE001 — as above
             pass
 
@@ -542,7 +587,7 @@ def _option_text(text: str) -> str:
 def _option_texts(message: dict) -> frozenset[tuple[str, str]]:
     """The incident option buttons on ``message``, each as its letter (``""`` for the single
     button's ``apply:``) and its own text: whole, from the value, and as the button shows it,
-    which may be clipped, with and without the clip's ellipsis."""
+    which may be clipped, with and without the clip's ellipsis and the recommended suffix."""
     found = set()
     for block in message.get("blocks") or ():
         if not isinstance(block, dict) or block.get("type") != "actions":
@@ -558,6 +603,11 @@ def _option_texts(message: dict) -> frozenset[tuple[str, str]]:
                 form = BUTTON_FORM.match(label)
                 if form:
                     found.add((form.group(1) or "", _option_text(form.group(2))))
+            value_form = BUTTON_FORM.fullmatch(str(element.get("value") or ""))
+            if value_form and not BUTTON_FORM.match(shown):
+                title = shown.removesuffix(INCIDENT_RECOMMENDED_SUFFIX)
+                for text in (shown, title, title.removesuffix(CLIPPED_END)):
+                    found.add((value_form.group(1) or "", _option_text(text)))
     return frozenset(found)
 
 
@@ -701,13 +751,16 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
         logger.info("slack_ux_clicks: dropping a %s click on %s, already applied in the thread", kind, msg_ts)
         try:
             await client.chat_update(
-                channel=channel_id, ts=msg_ts, text=_answered_text(ANSWERED_IN_THREAD, message),
-                blocks=answered_blocks(message.get("blocks"), _answered_by, ANSWERED_IN_THREAD),
+                channel=channel_id, ts=msg_ts,
+                **_rewrite(message, _answered_by, ANSWERED_IN_THREAD, _answered_text(ANSWERED_IN_THREAD, message)),
             )
         except Exception as exc:  # noqa: BLE001 — the click is dropped either way
             logger.warning("slack_ux_clicks: could not mark %s answered in the thread: %s", msg_ts, exc)
         return
 
+    incident = action_id.startswith(INCIDENT_CHOICE_PREFIX)
+    if incident:
+        label = label.removesuffix(INCIDENT_RECOMMENDED_SUFFIX)
     shown = _presenter._escape(label)
     # Before the name lookup and the rewrite: a card that moves on during either settles its question and forgets it.
     card = _question_card(channel_id, msg_ts)
@@ -716,8 +769,7 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
     try:
         await client.chat_update(
             channel=channel_id, ts=msg_ts,
-            text=_answered_text(note, message, not action_id.startswith(INCIDENT_CHOICE_PREFIX)),
-            blocks=answered_blocks(message.get("blocks"), _answered_by, note),
+            **_rewrite(message, _answered_by, note, _answered_text(note, message, not incident)),
         )
         rewritten = True
         if key in _answered:
@@ -740,12 +792,12 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
             )
         except Exception as exc:  # noqa: BLE001 — the click still answers
             logger.warning("slack_ux_clicks: could not post the answered line for %s: %s", msg_ts, exc)
-    await _title_from_label(adapter, channel_id, team_id, thread_ts, label)
+    await _offer_title(adapter, channel_id, team_id, thread_ts, label if incident else _asked(message) or label)
 
     synthetic = {
         "type": "message",
         "user": user_id,
-        "text": _turn_text(_turn(label, value, message), card),
+        "text": _turn_text(_incident_turn(label, value) if incident else _turn(label, value, message), card),
         "channel": channel_id,
         # The click's own ts keeps the deduplicator from conflating this turn
         # with the answered line or the clicked message, as a reaction trigger's does.

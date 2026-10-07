@@ -1,12 +1,12 @@
 # Producing the PlatformAgent Usage Counters
 
-**Status:** design; the poller is not implemented yet.
+**Status:** implemented. The facts table below is the tree as read on 2026-10-01, before the poller; the sections after it describe what ships.
 
 ## Summary
 
 `PlatformAgent.status.usage` declares cumulative counters, `sessionsTotal`, `eventsIngestedTotal`,
 `toolExecutionsTotal`, `remediationsProposedTotal` and `remediationsAppliedTotal`, and a
-`lastActiveTime`, and nothing writes them. The schema shipped that way on purpose: the agent's
+`lastActiveTime`, and until the poller this document describes nothing wrote them. The schema shipped that way on purpose: the agent's
 ServiceAccount holds no write verb on the status, and the operator, which does, saw no session,
 event or tool call. Two of the counters now have an in-cluster source. The credential broker
 serves `kubeagents_tool_invocations_total` on its metrics-only listener, and the event watcher
@@ -54,8 +54,8 @@ These are the facts the design rests on.
 
 A `UsageCounterPoller`, a manager `Runnable` beside the RBAC self-check, with
 `NeedLeaderElection` returning true: the counters are per cluster, so exactly one operator
-replica advances them. After the manager's first reconcile pass over the CRs, so that the
-rules that admit the operator have been rendered before the first scrape, and then every
+replica advances them. One interval after the leader's election, by which time the first
+reconcile pass has rendered the rules that admit the operator, and then every
 `usageCountersPollInterval` (five minutes, the
 interval the controller already uses for the RBAC re-probe and the pruned-status re-probe, on
 the same reasoning: one status write per interval is a cost nobody notices) it lists the
@@ -141,8 +141,10 @@ handling below runs first, so a new pod's whole sample competes with an old pod'
 and the larger wins, which is still the better estimate of the two. A replica whose entry is behind
 its sibling's marker when it next advances is reset without adding and takes the sibling's
 marker, as the resets section says, so one straddle does not cost the next lone advance, and
-that rule reads the stored markers alone, so it holds across a leader change. It
-makes the layout under-count rather than over-count: informer skew that straddles a poll
+that rule reads the stored markers alone, so it holds across a leader change between
+replicas that both stay live; a former leader that terminates mid-straddle is the exception, in
+the resets section below. It makes the layout under-count rather than over-count: informer skew that
+straddles a poll
 boundary, one replica ahead at one poll and the other catching up by the next, drops the
 catch-up instead of counting it twice, and a replica's events its sibling did not inject, a
 sibling whose daemon dropped them on its daily ceiling or whose dedup snapshot was kept while
@@ -154,19 +156,19 @@ rule.
 
 ## Reach: how the operator gets to the endpoints
 
-The scrape is a direct read of the pod IP, and today the two policies admit the metrics ports
-from the collector's namespace alone. The implementation adds one ingress rule to each policy,
+The scrape is a direct read of the pod IP, and before the poller the two policies admitted the
+metrics ports from the collector's namespace alone. The implementation adds one ingress rule to each policy,
 the same shape as the collector's rule beside it: the operator's namespace by its
 `kubernetes.io/metadata.name` label, and within it pods with
 `app.kubernetes.io/name: kube-agents-operator`, on the metrics port only. The operator renders
-these policies, so it can write the rule once it is told its own namespace, which today it is
-not: the namespace-file read in `main.go` serves image discovery, runs only when the chart has
+these policies, so it can write the rule once it is told its own namespace, which until the
+poller it was not: the namespace-file read in `main.go` serves image discovery, runs only when the chart has
 not set `OPERATOR_IMAGE`, and keeps nothing, and the renderers take the CR and the start-up
 flags alone. Both install paths therefore set a Downward-API `POD_NAMESPACE` on the manager
 container, the pattern the operator already renders for its own callout; `main.go` reads it once
 and hands it to the reconciler beside the other render inputs, and the golden tests fix it to a
 constant so the rendered policies stay deterministic. When it is unset, as under `make run` off
-the cluster, the rule is omitted and one start-up line says so; nothing off the cluster could
+the cluster, the rule is omitted, one start-up line says so and the poller is not started; nothing off the cluster could
 reach a pod IP in any case. The label is the one both install paths put on its pod. A
 deployment that relabels the operator pod breaks the scrape and nothing else; the failure
 section says how that shows.
@@ -179,8 +181,8 @@ nothing secret, but the broker's metrics listener was admitted past the broker's
 reachable-off-pod refusal on the argument that it serves counters to a collector; a pod
 selector keeps that argument true.
 
-Two documents state the current peer set as a security property rather than as a description:
-`docs/security-requirements.md` and `docs/credential-isolation-design.md` both say the broker
+Two documents stated the pre-poller peer set as a security property rather than as a description:
+`docs/security-requirements.md` and `docs/credential-isolation-design.md` both said the broker
 opens 8766 to the collector's namespace and to no other peer. The rule here adds one peer, and
 the implementation rewrites those sentences to say so, with the pod selector as the reason the
 property holds in substance: the listener reaches the collector and the operator, both readers
@@ -202,8 +204,11 @@ each pod it scraped:
   is the recorded one, and the sample is not below the last one;
 - the whole sample, when the pod UID is new, which means created after the document was first
   recorded and not merely absent from it (a new pod starts from zero, so everything it has
-  counted is new), or the body's start time is present and later than the recorded one (the
-  process restarted inside the same pod);
+  counted is new), unless a live gateway sibling's marker is later than the pod's creation,
+  in which case the sibling supplied the events this pod injected in the meantime and the pod
+  is recorded at its sample with the sibling's marker, adding nothing, as a known replica behind
+  its sibling would be; or the body's start time is present and later than the recorded one
+  (the process restarted inside the same pod);
 - nothing, when the body carries a start time earlier than the recorded one, or shows the
   sample falling under an unchanged start time: a counter cannot fall inside one process, so
   each of those is a body that is not the listener's. The body is refused, and because it
@@ -252,13 +257,30 @@ each pod it scraped:
   marker is reset whether its body is an advance or a restart with a later start time, recorded
   at its new sample and start time, taking the sibling's marker and adding nothing, because the
   events its new process replayed are the ones the sibling already supplied. In a poll where
-  both replicas moved, the one whose delta the total took moves its marker; the other's
-  baseline moves to its sample, so its delta is not re-presented, but its marker stays, so its
-  later catch-up is reset rather than counted on top of what the total already took from its
-  sibling. The broker's one pod, and a single gateway pod, have no sibling and
+  both replicas moved, the one whose delta the total took moves its marker, and so does a
+  replica whose delta equalled it, since both injected the same events and neither has a
+  catch-up pending; a replica whose delta was smaller moves its baseline to its sample, so its
+  delta is not re-presented, but its marker stays, so its later catch-up is reset rather than
+  counted on top of what the total already took from its sibling. The broker's one pod, and a single gateway pod, have no sibling and
   always add the difference across a gap. The error this leaves is an under-count, named in the
   sources section: a replica's events that its sibling did not inject are lost whenever it was
-  quiet, or missed, for a poll in which the sibling moved.
+  quiet, or missed, for a poll in which the sibling moved; and a replica reset in a poll in
+  which its sibling was taken keeps the sibling's marker as it was read, one poll behind, until
+  it advances in a poll the sibling does not, so its events in a poll the sibling was missed are
+  lost too. A terminating pod is never read again, so it is not live: its entry is dropped and
+  its marker suppresses no sibling, which is what keeps a rollout from losing the new replica's
+  intervals. The drop runs before the markers are snapshotted, so it has a cost in the
+  mirror case: a replica trailing a leader that then terminates is never reset against the gone
+  leader's marker, and its pending catch-up -- the events the leader already counted -- is taken
+  a second time when it next advances, an over-count of one straddle's events and one of the two
+  places this layout over-counts rather than under-counts -- the re-seed skew straddle below is the
+  other. That cost is accepted: snapshotting the
+  departed markers would close it, but a departed sibling would then suppress a genuinely new
+  replica's first advance when it is read late in a rollout, and a real interval would be lost
+  for good; a bounded one-time double count is preferred to a permanent loss. A reset that took
+  the sibling's marker after the poll would close the missed-sibling
+  loss as well and open an over-count instead, a replica trailing its sibling by one poll having
+  its catch-up counted whenever the sibling is quiet, and the under-count is the one preferred.
 
 Entries for pods that no longer exist are dropped when the baseline is next written; their
 counts are already in the totals.
@@ -300,11 +322,17 @@ carries an owner reference to the CR, without the controller flag, so it is coll
 CR but does not re-enqueue it: the controller `Owns` ConfigMaps with no predicate, and a
 controller-owned one would cost a reconcile on every write. The document also records the UID
 of the CR it was accumulated for, and the poller compares it, and the owner reference's UID,
-with the CR's. A mismatch is treated as absent and overwritten: it is what a CR deleted and
-re-applied under the same name sees while the collector has not yet removed the old ConfigMap,
-or was kept from removing it, and without the check the new CR would inherit a predecessor's
-totals, through the status patch that fires whenever the status is behind. A name is not
-ownership; the finalizer applies the same rule to the data volume. What the poller reads back
+with the CR's. A mismatch means the document is treated as absent and its counters re-seeded,
+and the ConfigMap holding it overwritten: it is what a CR deleted and re-applied under the same
+name sees while the collector has not yet removed the old ConfigMap, or was kept from removing
+it, and without the check the new CR would inherit a predecessor's totals, through the status
+patch that fires whenever the status is behind. The overwrite is gated on ownership: the poller
+rewrites a ConfigMap under the name only when it is the operator's own -- carrying the instance
+label, or an owner reference naming a PlatformAgent of this name, which a predecessor's does on
+a delete-and-recreate. A ConfigMap another writer parked under the name has neither; the poller
+leaves it untouched, records a `UsageConfigMapForeign` Warning on the CR, and `status.usage`
+stays where it was until the object is removed. A name is not ownership; the finalizer applies
+the same rule to the data volume. What the poller reads back
 is bounded before it is used, with a bound of its own for the totals, which honestly outgrow
 any per-pod or per-poll figure: every sample non-negative and finite, every total non-negative,
 finite and below the `int64` headroom the status field has, no total below the status it
@@ -343,6 +371,18 @@ is first stamped by a poll in which something ran. What a fresh install loses is
 between each pod's start and the first poll after it, the under-count this document prefers
 everywhere else.
 
+Recording every pod level is right only where the replicas are level. A re-seed that scrapes two
+gateway replicas at different samples -- informer skew on the shared stream -- records both at the
+seed poll's own time and takes the larger delta on the next joint advance. Where the larger delta
+belongs to a replica catching up from before the seed, it carries that pre-seed backlog on top of
+the interval's own events, and the maximum counts the backlog once. The fold cannot tell that from
+its mirror -- a smaller delta from a replica lagging after the seed on ordinary skew, where the
+larger delta is the true interval and the maximum is exactly right -- because the two produce the
+same deltas; no rule on the deltas separates them, so the plain maximum is the honest choice,
+counting the backlog in the first case rather than losing a real interval in the second. The
+residual is bounded -- one straddle's backlog, counted once -- and is the second place this layout
+over-counts rather than under-counts, beside the terminating-leader straddle earlier in this section.
+
 The ConfigMap is written before the status. A crash between the two leaves the status one poll
 behind the totals, and the next poll repairs it, because the status patch is issued whenever the
 status is behind the ConfigMap, not only when this poll moved a total; the repair stamps the
@@ -350,8 +390,10 @@ time the ConfigMap recorded, not its own, so `lastActiveTime` says when the coun
 rather than when the status caught up. That time is in the ConfigMap for this reason: in the
 poller's memory alone it would die with the process that took it. The other order would
 leave the totals behind the status after a crash, and the next poll would add the interval's
-deltas a second time. Under-counting until the next poll is the error this document prefers
-everywhere; an over-count is permanent.
+deltas a second time. Under-counting until the next poll is the error this document prefers where
+the over-count it trades against would be permanent, as this crash's double-add would be. Two cases
+run the other way, each accepting a bounded over-count because there it is the under-count that
+would be permanent: the terminating-leader straddle and the re-seed skew straddle, both above.
 
 ## Write cadence and the status writers
 
@@ -382,16 +424,18 @@ totals accumulated since the operator was upgraded, not since the last interval,
 the last of them moved. After its own
 patch the poller reads the echo the same way `noteUsageStatusEcho` does: counters it wrote that
 come back absent mean the pruning, recorded in the shared map; counters that come back clear it.
-The echo check moves from a function that knows about `activeInterfaces` to one that takes the
-fields a writer expects to see, and both writers call it.
+The echo check moves from a function that knows about `activeInterfaces` to one that takes
+whether the fields a writer wrote came back, and both writers call it.
 
 ## Failure behaviour
 
 The schema has no field for an error, by design: static enums and integer counts only. An
 install that switched the watcher off is not a failure: the poller reads the same switch the
 reconciler does, scrapes no gateway pod while it is off, and records nothing. The first poll after a start
-waits for the reconcile pass that renders the rules admitting the operator, and a streak
-shorter than two polls records no event, so an upgrade leaves no Warning on a healthy CR.
+runs one interval after election, after the initial reconcile pass has rendered the rules
+admitting the operator; a CR the poll reaches before its rules are applied costs one failed
+poll, and a streak shorter than two polls records no event, so an upgrade leaves no Warning on a
+healthy CR.
 Listeners from a release before this one are not a failure either: the operator moves before the harness on an
 upgrade, and an install can pin the harness image behind the operator, so the first polls after
 an upgrade land on listeners that send no start time; the resets section reads them under the
@@ -405,8 +449,10 @@ NetworkPolicy regime that blocks the rule, a relabelled operator pod, a listener
 proxy environment on the operator pod that a client without the no-proxy transport would obey, is
 a `lastActiveTime` that stops advancing while commands are plainly running and events are
 plainly being triaged. A `kubectl describe`
-of the CR shows the operator's events; the implementation records one warning event per failure
-streak so that the symptom has a cause beside it without a log search.
+of the CR shows the operator's events; the implementation records a warning event from the second
+failing poll of a streak onward, re-recorded every poll with a stable message so the recorder folds
+the repeats into one event with a rising count and a refreshed timestamp, keeping the cause beside
+the symptom past the API server's one-hour event retention rather than an hour after a single write.
 
 ## What stays unwritten, and what lands it
 
@@ -414,7 +460,7 @@ streak so that the symptom has a cause beside it without a log search.
 | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `sessionsTotal`             | The watcher's `k8s_event_watcher_session_creates_total{outcome="ok"}` counts the sessions it opens for triage and nothing else; chat sessions are opened by the gateway, which exports no series for them. A counter named for all sessions that counted half would mislead. | A gateway-side `kubeagents_sessions_total{origin}` beside the watcher's, summed with it. The `session_store` plugin sees every chat session start and is the natural emitter; it needs a listener, which the gateway pod does not have for Hermes-side series today. |
 | `remediationsProposedTotal` | No series counts proposals by verb. The proposal path is the broker's version-control route, through which `proposal-create` reaches the forge provider, and that route is visible only as `kubeagents_credential_proxy_requests_total{endpoint="/v1/vcs"}` by status code.  | A broker series over the version-control route's verbs and the outcomes the forge provider returns, counted the way the exec route counts tool invocations; a `proposal-create` the forge accepted is a proposal.                                                    |
-| `remediationsAppliedTotal`  | An applied remediation is an approved one; approvals are recorded by the `tool_call_audit` plugin's `approval_*` records in the log, not as a metric.                                                                                                                        | Either a Hermes-side series from the same plugin, which has the listener problem above, or a count of the broker's apply-side requests once those are distinguishable from reads. This is the least settled of the three and the last to land.                       |
+| `remediationsAppliedTotal`  | An applied remediation is an approved one; approvals are recorded by the `tool_call_audit` plugin's `approval_*` records in the profile's audit file (`logs/audit.jsonl`), not as a metric.                                                                                  | Either a Hermes-side series from the same plugin, which has the listener problem above, or a count of the broker's apply-side requests once those are distinguishable from reads. This is the least settled of the three and the last to land.                       |
 
 Each lands on the poller's existing path: a new row in the source table, a new series summed,
 and the CRD description changed from "nothing writes it yet". None needs a second mechanism.
@@ -448,8 +494,9 @@ namespace, and above one replica the agent's Role holds `get` and `patch` on eve
 because RBAC cannot say "only your own pod"; so on an HA chart install anything running as the
 agent's ServiceAccount can put the operator's label on a pod of its choosing, the sandbox
 included, and that pod is then admitted to both metrics ports. What it gains is the two
-listeners' counters, which the agent container already reads over its own pod's loopback, and
-the same grant already lets it swap a sibling's image, so the selector argument above holds in
+listeners' counters: the watcher's, which the agent container already reaches over its own pod's
+loopback, and the broker's, to which it has no route today, integers under closed label
+vocabularies; and the same grant already lets it swap a sibling's image, so the selector argument above holds in
 full on the single-replica default and in substance above it; the pages the implementation
 rewrites say so rather than "nothing else".
 
@@ -503,6 +550,8 @@ them.
 
 ## Testing
 
+What shipped beside the poller, kept as the record of what each test is for.
+
 Unit tests, beside the poller, one per branch of the resets section as it stands, each asserting
 the poll after as well as the poll itself: the difference branch (a known pod, the recorded
 start time, a sample not below the last); the whole-sample branch (a pod created after the document was first recorded; a later start
@@ -530,8 +579,9 @@ that the reset pod takes the sibling's marker and the sibling's next lone advanc
 a partial straddle, both replicas moving by different amounts and the lagger catching up alone
 the poll after, asserting the catch-up is reset and the total took the larger delta once; an in-place restart
 of the lagging replica with a later start time, reset rather than taken whole; the
-largest-delta rule across two gateway pods and its agreement with the sum for one; the
-baseline-absent-with-counters-present case; a ConfigMap whose recorded CR UID is not the CR's
+largest-delta rule across two gateway pods and its agreement with the sum for one; a re-seed that
+scrapes two replicas at different samples, taking the larger delta on the next advance and counting
+the furthest replica's pre-seed backlog once; the baseline-absent-with-counters-present case; a ConfigMap whose recorded CR UID is not the CR's
 or whose values fail the read-back bounds, including a total above the `int64` headroom, one
 below the status, and a first-recorded time in the future (treated as absent); a quiet poll writing no ConfigMap; the disabled-watcher
 case (no gateway scrape, no log line); the series selection (the `status` values summed and the
@@ -541,12 +591,13 @@ the ConfigMap's document and returns the next document, so none of these needs a
 
 An envtest, beside the existing `usage_status_envtest_test.go`: a `PlatformAgent` served by
 this release's CRD receives one patch per poll in which a stub source moves and none in which
-it does not; a ConfigMap written with the non-controller owner reference enqueues no reconcile;
-a status left behind the ConfigMap (the crash between the two writes, staged by hand) is
+it does not; a status left behind the ConfigMap (the crash between the two writes, staged by hand) is
 repaired by the next poll without the totals moving and with `lastActiveTime` set to the time
 the ConfigMap recorded, not the repair's; under the CRD without `status.usage`, the
-poller writes the status once per `usageStatusReprobeInterval`, shares the pruning record with
-the Ready writer, and keeps the ConfigMap current throughout.
+poller writes the status once while the pruning record is fresh and once more when it has
+expired, shares that record with the Ready writer, and keeps the ConfigMap current throughout.
+That a ConfigMap written with the non-controller owner reference enqueues no reconcile is a
+unit test against the owner handler `Owns` uses, which needs no API server.
 
 A live check, which is the acceptance criterion: on an install built from the branch,
 `toolExecutionsTotal` rises after commands run from the sandbox and `eventsIngestedTotal` after
@@ -558,6 +609,8 @@ produces no status write; and the two policies show the new rule with the operat
 only peer added.
 
 ## Documents the implementation changes
+
+Each of these landed with the poller; the list is the record of where the facts moved.
 
 - The CRD reference's `status.usage` rows for the two counters and `lastActiveTime`, from
   "declared; nothing writes it yet" to what they count and how often they move, including that

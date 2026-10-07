@@ -17,7 +17,6 @@ limitations under the License.
 package controller
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path"
@@ -1522,6 +1521,7 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 					Env: []corev1.EnvVar{
 						{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: "1024"},
 						{Name: "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS", Value: "64"},
+						{Name: credentialProxyMemoryLimitEnv, Value: "1"},
 						{Name: "UNRESERVED_PASSENGER", Value: "arrived"},
 					},
 				},
@@ -1568,7 +1568,7 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 	// hold it. credential_proxy.py reads a command's output as it streams,
 	// keeps at most the cap per stream and bounds the decoded text to the
 	// same size, so what the broker holds per in-flight request is about six
-	// times the cap, transiently: the two capped stream buffers, their decoded
+	// times the cap (credentialProxyOutputCopiesPerCommand), transiently: the two capped stream buffers, their decoded
 	// text, and the JSON body and its encoding (measured at 48 MiB per request
 	// against the 8 MiB cap for text, 37 MiB for bytes that are not UTF-8).
 	// A request holds its slot until its response is written, and concurrency
@@ -1579,21 +1579,18 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 	// or an OOMKill takes gcloud, kubectl, gh and git away from every agent
 	// the proxy serves.
 	//
-	// The children -- one kubectl or gcloud per in-flight command -- are
-	// outside this arithmetic. A kubectl listing thousands of objects runs to
-	// hundreds of MiB on its own, and the rest of the limit is what holds it.
+	// The children are the second assertion below, in the broker's own terms.
 	//
 	// The resting footprint is the container's own memory request rather than
 	// a measured constant: the ~250Mi the old sidecar held steady was mostly
 	// the event watcher's informer caches, which stayed in the gateway Pod
 	// when #913 moved the proxy out, and the request is upstream's statement
 	// of what this pod holds with nothing in flight.
-	const copiesPerCommand = 6
 	inFlight, err := strconv.ParseInt(env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"], 10, 64)
 	if err != nil || inFlight < 1 {
 		t.Fatalf("proxy concurrency cap %q is not a positive integer", env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"])
 	}
-	burst := int64(capBytes) * copiesPerCommand * inFlight
+	burst := int64(capBytes) * credentialProxyOutputCopiesPerCommand * inFlight
 	steadyStateBytes := proxy.Resources.Requests.Memory().Value()
 	if steadyStateBytes == 0 {
 		t.Fatal("the proxy container declares no memory request, so the burst below has no resting footprint to add to")
@@ -1602,6 +1599,47 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 	if burst+steadyStateBytes > limit {
 		t.Errorf("proxy output cap %d bursts to %d bytes across %d in-flight commands (CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS), which does not fit under the proxy container's %d-byte memory limit with %d bytes of steady state — raise the limit, or lower one of the two caps",
 			capBytes, burst, inFlight, limit, steadyStateBytes)
+	}
+
+	// The child term (docs/designs/credential-proxy-child-memory-budget.md
+	// §2.5), in the broker's own arithmetic: the limit, less the broker's
+	// two fixed reserves, has to admit at least two requests at once, each
+	// with its child reserve and its output allowance, or a listing phase
+	// cannot parallelise at all. The slot cap above is an upper bound on the
+	// count and enters this rule only as that. The four figures and the
+	// floor are declared in credential_proxy_manifests.go as copies of the
+	// broker's (credential_proxy.py: BROKER_RESIDENT_RESERVE_BYTES,
+	// CONTENT_WORKSPACE_RESERVE_BYTES, REQUEST_CHILD_MEMORY_RESERVE_BYTES,
+	// OUTPUT_COPIES_PER_COMMAND, BUDGET_MINIMUM_ADMITTED_REQUESTS), and
+	// tests/test_credential_proxy_sizing_parity.py fails when the two drift.
+	admitted := credentialProxyAdmittedRequests(limit, int64(capBytes))
+	if admitted < credentialProxyMinimumAdmittedRequests {
+		t.Errorf("the proxy's %d-byte limit admits %d requests at once under the child memory budget (%d MiB resident + %d MiB workspace reserves, %d MiB per request plus %d x %d-byte output); at least %d are needed — raise the limit or lower the output cap",
+			limit, admitted, credentialProxyResidentReserveBytes>>20, credentialProxyWorkspaceReserveBytes>>20, credentialProxyRequestReserveBytes>>20, credentialProxyOutputCopiesPerCommand, capBytes, credentialProxyMinimumAdmittedRequests)
+	}
+	if minimum := credentialProxyMinimumMemoryLimitBytes(int64(capBytes)); minimum > limit {
+		t.Errorf("the child memory budget's floor is %d bytes and the proxy's limit is %d", minimum, limit)
+	}
+
+	// The broker budgets against the limit it actually has, read once at start
+	// through the Downward API rather than copied from the Resources block, so
+	// a limit moved by whatever recreates the pod (no CR field sets it today)
+	// is the one it budgets against. A literal here would be the drift the
+	// design forbids.
+	var limitEnv *corev1.EnvVar
+	for i := range proxy.Env {
+		if proxy.Env[i].Name == credentialProxyMemoryLimitEnv {
+			limitEnv = &proxy.Env[i]
+		}
+	}
+	if limitEnv == nil {
+		t.Fatalf("the proxy container does not carry %s, so the broker cannot budget its children", credentialProxyMemoryLimitEnv)
+	}
+	if limitEnv.Value != "" || limitEnv.ValueFrom == nil || limitEnv.ValueFrom.ResourceFieldRef == nil {
+		t.Fatalf("%s must be a resourceFieldRef on the container's own limit, got %#v", credentialProxyMemoryLimitEnv, limitEnv)
+	}
+	if ref := limitEnv.ValueFrom.ResourceFieldRef; ref.ContainerName != credentialProxyContainerName || ref.Resource != containerMemoryLimitResource || ref.Divisor.String() != "1" {
+		t.Errorf("%s reads %s/%s with divisor %s; want %s/%s with divisor 1", credentialProxyMemoryLimitEnv, ref.ContainerName, ref.Resource, ref.Divisor.String(), credentialProxyContainerName, containerMemoryLimitResource)
 	}
 }
 
@@ -2454,79 +2492,354 @@ func TestBuildFluentBitConfigMap(t *testing.T) {
 	}
 }
 
-// The audit lift: the sidecar recognises a tool_call_audit or chat_message_audit
-// line, captures its JSON object and decodes it into top-level fields, in that
-// order and before the record modifier stamps the record. The regex is checked
-// against a line Hermes actually wrote, with fluent-bit's `(?<name>` group syntax
-// translated to Go's, since the two engines agree on everything else in it.
-// Those lines are frozen here: the test holds the regex to the format as
-// sampled and cannot notice a Hermes release that changes it. That check is a
-// live one after an agent image change: jsonPayload.audit_event in Logs
-// Explorer, a key the broker's own records do not carry, as the observability
-// page says.
-func TestFluentBitLiftsAuditRecordsIntoFields(t *testing.T) {
+// The audit trail: the sidecar tails the file the two emitters write, as JSON,
+// with no regex over Hermes' log line anywhere in the configuration. The input
+// has to name every profile's file, so that turning an emitter on for a profile
+// needs no change here, and the json decoder has to be in parsers.conf, because
+// this mount replaces the sidecar's own parsers file and a built-in name would
+// not resolve. Hermes' own log keeps its text input exactly as it was.
+func TestFluentBitTailsTheAuditFileAsJSON(t *testing.T) {
 	cm := buildFluentBitConfigMap(&agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
 	})
 	fbConf := cm.Data["fluent-bit.conf"]
 	parsers := cm.Data["parsers.conf"]
 
-	order := []string{"Parser        gchat_event", "Parser        hermes_audit_line", "Key_Name      audit_json", "Parser        audit_json", "Name              record_modifier"}
-	last := -1
-	for _, needle := range order {
-		at := strings.Index(fbConf, needle)
-		if at < 0 {
-			t.Fatalf("fluent-bit.conf lacks %q", needle)
-		}
-		if at < last {
-			t.Errorf("%q is out of order in fluent-bit.conf; the lift has to capture before it decodes and decode before the record is stamped", needle)
-		}
-		last = at
+	// [SERVICE] names this parsers.conf and only this one: the mount replaces the
+	// sidecar's built-in parsers file, so a second Parsers_File line would pull in
+	// another that audit_json or gchat_event could resolve against instead.
+	services := fluentBitSections(fbConf, "[SERVICE]")
+	if len(services) != 1 {
+		t.Fatalf("fluent-bit.conf has %d [SERVICE] sections, want 1:\n%s", len(services), fbConf)
 	}
-	if !strings.Contains(parsers, "Name    audit_json\n    Format  json") {
-		t.Errorf("parsers.conf lacks the json decoder the lift needs; the sidecar's own parsers.conf is replaced by this mount, so a built-in name would not resolve")
+	if pf := fluentBitValues(services[0], "Parsers_File"); len(pf) != 1 || pf[0] != "parsers.conf" {
+		t.Errorf("[SERVICE] Parsers_File is %v, want exactly [parsers.conf]:\n%s", pf, services[0])
 	}
 
-	var expr string
-	for _, line := range strings.Split(parsers, "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "Regex   ^") {
-			expr = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "Regex"))
+	inputs := fluentBitSections(fbConf, "[INPUT]")
+	if len(inputs) != 2 {
+		t.Fatalf("fluent-bit.conf has %d [INPUT] sections, want 2 (Hermes' logs and the audit file):\n%s", len(inputs), fbConf)
+	}
+	var audit, logs string
+	for _, section := range inputs {
+		switch fluentBitField(section, "Tag") {
+		case "agent.audit":
+			audit = section
+		case "agent.logs":
+			logs = section
 		}
 	}
-	if expr == "" {
-		t.Fatal("parsers.conf has no anchored Regex line for hermes_audit_line")
+	if audit == "" || logs == "" {
+		t.Fatalf("fluent-bit.conf lacks the agent.audit or the agent.logs input:\n%s", fbConf)
 	}
-	re := regexp.MustCompile(strings.ReplaceAll(expr, "(?<", "(?P<"))
-	const sample = `2026-09-28 15:45:43,391 INFO hermes.plugin.tool_call_audit: {"audit_event": "tool_call_end", "duration_ms": 53, "result": "{\"ok\": true}", "task_id": "k8s-evt-a9c4f17a", "tool_name": "kanban_create"}`
-	match := re.FindStringSubmatch(sample)
-	if match == nil {
-		t.Fatalf("the audit regex does not match a line Hermes wrote: %q", sample)
+	for _, want := range []struct{ key, val string }{
+		{"Name", "tail"},
+		{"Path", fluentBitAuditTailPath},
+		{"Parser", "audit_json"},
+		{"Path_Key", "file_path"},
+		{"Read_from_Head", "On"},
+	} {
+		if got := fluentBitField(audit, want.key); got != want.val {
+			t.Errorf("the audit input's %s is %q, want %q:\n%s", want.key, got, want.val, audit)
+		}
 	}
-	captured := match[re.SubexpIndex("audit_json")]
-	var decoded map[string]any
-	if err := json.Unmarshal([]byte(captured), &decoded); err != nil {
-		t.Fatalf("the capture is not the JSON object: %v (%q)", err, captured)
+	if ps := fluentBitValues(audit, "Parser"); len(ps) != 1 {
+		t.Errorf("the audit input has %d Parser lines %v, want exactly 1 (audit_json); a second would override it:\n%s", len(ps), ps, audit)
 	}
-	if decoded["tool_name"] != "kanban_create" {
-		t.Errorf("decoded record = %v, want the plugin's fields", decoded)
+	if p := fluentBitField(logs, "Parser"); p != "" {
+		t.Errorf("the agent.logs input parses its lines with parser %q; Hermes' log stays text:\n%s", p, logs)
 	}
-	if re.MatchString(`2026-09-28 15:45:43,376 WARNING tools.kanban_event_routing: kanban event routing: {"not": "an audit record"}`) {
-		t.Error("the audit regex matches a line from another logger; only the two audit emitters may be lifted")
+	if got, want := fluentBitField(logs, "Path"), fluentBitDataMount+"/logs/*.log"; got != want {
+		t.Errorf("the agent.logs input reads %q, not the front door's logs %q:\n%s", got, want, logs)
 	}
-	if !re.MatchString(`2026-09-28 15:45:43,391 INFO hermes.hook.chat_message_audit: {"audit_event": "chat_message_end"}`) {
-		t.Error("the audit regex does not match the chat_message_audit hook's lines")
+	dbs := regexp.MustCompile(`DB\s+(\S+)`).FindAllStringSubmatch(fbConf, -1)
+	if len(dbs) != 2 || dbs[0][1] == dbs[1][1] {
+		t.Errorf("the two tail inputs must keep their positions in two DB files, got %v", dbs)
 	}
-	// Hermes tags a record emitted on a thread holding a session context with
-	// ` [<session id>]` between the level and the logger name; the tools it
-	// runs inline on the turn thread log that way, and an unmatched line passes
-	// through the sidecar unlifted with no signal.
-	tagged := `2026-09-28 15:45:43,391 INFO [20260928_154543_50074bf0] hermes.plugin.tool_call_audit: {"audit_event": "tool_call_end", "tool_name": "clarify"}`
-	match = re.FindStringSubmatch(tagged)
-	if match == nil {
-		t.Fatalf("the audit regex does not match a session-tagged line: %q", tagged)
+
+	// The path reaches the front door's file and any named profile's, and
+	// nothing else: not Hermes' log, not a rotated backup.
+	for _, path := range []string{
+		"/opt/data/logs/audit.jsonl",
+		"/opt/data/profiles/platform/logs/audit.jsonl",
+		"/opt/data/profiles/cluster-prod-a/logs/audit.jsonl",
+	} {
+		if !fluentBitPathMatches(t, fluentBitAuditTailPath, path) {
+			t.Errorf("the audit input does not reach %s", path)
+		}
 	}
-	if !strings.HasPrefix(match[re.SubexpIndex("audit_json")], `{"audit_event": "tool_call_end"`) {
-		t.Errorf("the capture on a tagged line is not the JSON object: %q", match[re.SubexpIndex("audit_json")])
+	for _, path := range []string{
+		"/opt/data/logs/agent.log",
+		"/opt/data/logs/audit.jsonl.1",
+		"/opt/data/logs/audit.jsonl.lock",
+		"/opt/data/profiles/platform/logs/agent.log",
+	} {
+		if fluentBitPathMatches(t, fluentBitAuditTailPath, path) {
+			t.Errorf("the audit input reaches %s, which is not an audit file", path)
+		}
+	}
+	// Nor does Hermes' text input reach the audit file, its backups or the
+	// emitters' lock file beside it.
+	for _, path := range []string{
+		"/opt/data/logs/audit.jsonl",
+		"/opt/data/logs/audit.jsonl.1",
+		"/opt/data/logs/audit.jsonl.lock",
+	} {
+		if fluentBitPathMatches(t, "/opt/data/logs/*.log", path) {
+			t.Errorf("the agent.logs input reaches %s", path)
+		}
+	}
+
+	// The section counts are fixed: every section the config has is vetted
+	// below, so a new one -- a reinstated regex lift among them -- has to be
+	// added here first and explained. Counted across every ConfigMap key, case-
+	// insensitively, so a section @INCLUDEd from another key or spelled
+	// [filter] is counted too.
+	for _, want := range []struct {
+		header string
+		count  int
+	}{
+		{"[SERVICE]", 1},
+		{"[INPUT]", 2},
+		{"[FILTER]", 2},
+		{"[OUTPUT]", 1},
+		{"[PARSER]", 2},
+	} {
+		if got := fluentBitCount(cm.Data, want.header); got != want.count {
+			t.Errorf("the ConfigMap has %d %s sections across all keys, want %d; a new section must be vetted in this test", got, want.header, want.count)
+		}
+	}
+
+	// The audit input names audit_json; parsers.conf has to decode it as JSON,
+	// not lift fields with a regex. The sidecar's own parsers.conf is replaced
+	// by this mount, so a built-in name would not resolve.
+	var auditParser string
+	for _, section := range fluentBitSections(parsers, "[PARSER]") {
+		if fluentBitField(section, "Name") == "audit_json" {
+			auditParser = section
+		}
+	}
+	if auditParser == "" {
+		t.Errorf("parsers.conf lacks the audit_json parser the audit input names:\n%s", parsers)
+	} else if f := fluentBitField(auditParser, "Format"); !strings.EqualFold(f, "json") {
+		t.Errorf("the audit_json parser's Format is %q, want json; the audit records are JSON, not lifted:\n%s", f, auditParser)
+	}
+	for name, data := range cm.Data {
+		for _, gone := range []string{"hermes_audit_line", "Key_Name      audit_json"} {
+			if strings.Contains(data, gone) {
+				t.Errorf("%s still carries %q; the regex lift is gone and the records are not in Hermes' log", name, gone)
+			}
+		}
+	}
+
+	// No regex lifts fields out of the audit records, under any name: the
+	// records are JSON, decoded by the json parser on the input, and the only
+	// regex is Hermes' own log line. Assert the class over every [FILTER], by
+	// Name -- an unexpected Name is a section this test has not vetted and
+	// fails closed, not a continue that hides a lift.
+	parserFilters, recordModifierFilters := 0, 0
+	for _, section := range fluentBitSections(fbConf, "[FILTER]") {
+		switch name := fluentBitField(section, "Name"); name {
+		case "parser":
+			parserFilters++
+			if match := fluentBitField(section, "Match"); match != "agent.logs" {
+				t.Errorf("a parser FILTER matches %q; a regex parser must not reach the audit records:\n%s", match, section)
+			}
+			if ps := fluentBitValues(section, "Parser"); len(ps) != 1 || ps[0] != "gchat_event" {
+				t.Errorf("a parser FILTER has Parser lines %v, want exactly [gchat_event]; a second parser would run over the stream and the audit lift must not return:\n%s", ps, section)
+			}
+		case "record_modifier":
+			recordModifierFilters++
+			if match := fluentBitField(section, "Match"); match != "agent.*" {
+				t.Errorf("the record_modifier FILTER matches %q, want agent.* (both streams stamped):\n%s", match, section)
+			}
+		default:
+			t.Errorf("unexpected [FILTER] Name %q; a new filter must be vetted here -- is it a regex lift on the audit stream?:\n%s", name, section)
+		}
+	}
+	// Exactly one of each: the [FILTER] count is 2, but that alone allows two
+	// parser filters and no record_modifier -- a second gchat_event parser retagged
+	// onto agent.audit among them. Pin the split.
+	if parserFilters != 1 {
+		t.Errorf("fluent-bit.conf has %d parser [FILTER]s, want exactly 1 (gchat_event over agent.logs)", parserFilters)
+	}
+	if recordModifierFilters != 1 {
+		t.Errorf("fluent-bit.conf has %d record_modifier [FILTER]s, want exactly 1 (stamping agent.*)", recordModifierFilters)
+	}
+	// gchat_event is the only regex-format parser; every other [PARSER] decodes
+	// rather than lifts.
+	for _, section := range fluentBitSections(parsers, "[PARSER]") {
+		name := fluentBitField(section, "Name")
+		if format := fluentBitField(section, "Format"); strings.EqualFold(format, "regex") && name != "gchat_event" {
+			t.Errorf("parsers.conf has a regex parser %q besides gchat_event; the audit records are JSON, not lifted:\n%s", name, section)
+		}
+	}
+
+	// gchat_event is trusted by name above, so its regex is pinned verbatim: a
+	// change to what it captures -- widening it to lift an audit field through the
+	// one parser the guard exempts -- has to be re-vetted here, not merged silently.
+	var gchatParser string
+	for _, section := range fluentBitSections(parsers, "[PARSER]") {
+		if fluentBitField(section, "Name") == "gchat_event" {
+			gchatParser = section
+		}
+	}
+	if gchatParser == "" {
+		t.Errorf("parsers.conf lacks the gchat_event parser:\n%s", parsers)
+	} else if got, want := fluentBitField(gchatParser, "Regex"), `User=(?<gchat_user>[^,\s]+),\s*Session=(?<gchat_session>[^,\s]+)`; got != want {
+		t.Errorf("gchat_event Regex is %q, want %q; a change to the one trusted regex must be re-vetted here", got, want)
+	}
+
+	// No parser merges a decoded field back into the record, and nothing selects a
+	// stream by regex. Decode_Field / Decode_Field_As json <field> takes a JSON
+	// object a line carries and lifts its keys into the record -- the audit lift by
+	// another name; Match_Regex selects streams by pattern where this config matches
+	// by exact tag, so it could reach the audit stream a plain Match does not. The
+	// records are decoded whole by the json-format audit_json parser on the input.
+	// Fail closed on either key across every ConfigMap value.
+	for name, data := range cm.Data {
+		for _, line := range strings.Split(data, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "#") {
+				continue
+			}
+			if f := strings.Fields(line); len(f) >= 1 {
+				switch strings.ToLower(f[0]) {
+				case "decode_field", "decode_field_as":
+					t.Errorf("%s carries %q; a Decode_Field merge lifts a field into the record, the audit records are JSON on the input:\n%s", name, strings.TrimSpace(line), data)
+				case "match_regex":
+					t.Errorf("%s carries %q; a Match_Regex selects streams by regex and this config matches by exact tag -- it could reach the audit stream a plain Match does not:\n%s", name, strings.TrimSpace(line), data)
+				}
+			}
+		}
+	}
+
+	// Both streams are shipped: exactly one stdout output, covering agent.*.
+	outputs := fluentBitSections(fbConf, "[OUTPUT]")
+	if len(outputs) != 1 {
+		t.Fatalf("fluent-bit.conf has %d [OUTPUT] sections, want 1:\n%s", len(outputs), fbConf)
+	}
+	if name := fluentBitField(outputs[0], "Name"); name != "stdout" {
+		t.Errorf("the output is %q, want stdout:\n%s", name, outputs[0])
+	}
+	if match := fluentBitField(outputs[0], "Match"); match != "agent.*" {
+		t.Errorf("the output matches %q, want agent.* (both streams shipped):\n%s", match, outputs[0])
+	}
+}
+
+// fluentBitHeaderRe matches a section-start line and captures its name. fluent-bit
+// opens a section on any line whose first non-space byte is '[', taking the name
+// up to the first ']' and ignoring the rest of the line, so this is a prefix match,
+// not the whole line: [FILTER] # lift opens a live filter and has to be seen as
+// one. A key line never begins with '[' -- a key whose value carries a bracket
+// still starts with the key -- so a prefix match cannot mistake a value for a header.
+var fluentBitHeaderRe = regexp.MustCompile(`^\[([A-Za-z0-9_]+)\]`)
+
+// fluentBitSections returns every section of conf whose header names header
+// (e.g. "[FILTER]"), case-insensitively. A section runs from its header line to
+// the line before the next header, so a blank line, a comment, trailing text
+// after the ']' or the header's casing between sections cannot hide one:
+// fluent-bit opens a section on any line that starts [NAME], needs no separator,
+// ignores what follows the ']', and reads the header case-insensitively.
+func fluentBitSections(conf, header string) []string {
+	var sections []string
+	var cur []string
+	inWanted := false
+	flush := func() {
+		if inWanted && len(cur) > 0 {
+			sections = append(sections, strings.Join(cur, "\n"))
+		}
+	}
+	for _, line := range strings.Split(conf, "\n") {
+		if m := fluentBitHeaderRe.FindStringSubmatch(strings.TrimSpace(line)); m != nil {
+			flush()
+			inWanted = strings.EqualFold("["+m[1]+"]", header)
+			cur = nil
+		}
+		if inWanted {
+			cur = append(cur, line)
+		}
+	}
+	flush()
+	return sections
+}
+
+// fluentBitCount returns how many sections with the given header appear across
+// every value in data. Counting over all keys fails closed when a section is
+// added under any of them, including one @INCLUDEd from another file.
+func fluentBitCount(data map[string]string, header string) int {
+	n := 0
+	for _, conf := range data {
+		n += len(fluentBitSections(conf, header))
+	}
+	return n
+}
+
+// fluentBitValues returns every value set for key in a fluent-bit section, in
+// order, whatever whitespace separates key and value and whatever case the key
+// is written in. Comment lines are skipped. A repeated key -- a second Parser on
+// an input, a second Parsers_File in [SERVICE] -- yields more than one value, so
+// a caller pinning a single-valued key can assert there is exactly one rather
+// than read only the first and miss a duplicate fluent-bit would honour.
+func fluentBitValues(section, key string) []string {
+	var values []string
+	for _, line := range strings.Split(section, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && strings.EqualFold(fields[0], key) {
+			values = append(values, strings.Join(fields[1:], " "))
+		}
+	}
+	return values
+}
+
+// fluentBitField returns the first value fluentBitValues finds for key in a
+// fluent-bit section, or "" if the key is absent. fluent-bit's classic-format
+// keys are case-insensitive, so the test reads them that way.
+func fluentBitField(section, key string) string {
+	if values := fluentBitValues(section, key); len(values) > 0 {
+		return values[0]
+	}
+	return ""
+}
+
+// fluentBitPathMatches reports whether a comma-separated fluent-bit tail Path
+// reaches path. The plugin globs each pattern the way a shell would, which is
+// what filepath.Match implements.
+func fluentBitPathMatches(t *testing.T, patterns, path string) bool {
+	t.Helper()
+	for _, pattern := range strings.Split(patterns, ",") {
+		ok, err := filepath.Match(pattern, path)
+		if err != nil {
+			t.Fatalf("bad tail pattern %q: %v", pattern, err)
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
+// The sidecar tails the file by the name the emitters write it under. The two
+// are in different languages, so this holds the Go constant to the Python one.
+func TestFluentBitAuditFileNameMatchesTheEmitters(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "agents", "chat", "defaults", "plugins", "common", "audit_sink.py")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	for _, want := range []string{
+		fmt.Sprintf("AUDIT_FILE_NAME = %q", auditFileName),
+		`LOGS_DIR_NAME = "logs"`,
+		// The lock file beside the audit file has to stay outside both tail globs
+		// above, which the negative cases in TestFluentBitTailsTheAuditFileAsJSON
+		// check against this suffix.
+		`AUDIT_LOCK_FILE_SUFFIX = ".lock"`,
+	} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("%s does not declare %s; the sidecar would tail a file the emitters never write", path, want)
+		}
 	}
 }
 

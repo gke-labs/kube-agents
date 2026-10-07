@@ -152,25 +152,6 @@ def scan_repo_dirs(root: str, audit_id: str) -> tuple[list[str], list[str]]:
     return dirs, unreadable
 
 
-def _repo_dirs(root: str, audit_id: str) -> list[str]:
-    return scan_repo_dirs(root, audit_id)[0]
-
-
-def repo_ids(root: str, audit_id: str) -> list[str]:
-    """Every `owner/name` the stream has a store for, sorted; [] when none.
-
-    A stream is kept once per repository it publishes to, because an SOP
-    walking `managed_repos` finishes it once per repository and each run's
-    memory is its own ledger's. Only lower-case directories count: the writer
-    spells every one so and `store_path` opens nothing else, so a mixed-case
-    one would list as a repository that never ran. `project_stream` names
-    those in the stream's error. An owner directory that cannot be listed is left out here and
-    named by `scan_repo_dirs`; the stream directory's own OSError other than
-    absence propagates, as in `stream_ids`.
-    """
-    return [repo for repo in _repo_dirs(root, audit_id) if repo == repo.lower()]
-
-
 def store_path(root: str, audit_id: str, repo: str) -> str:
     """The directory one stream keeps for one repository. ValueError for a
     `repo` that is not `owner/name`, so an argument can never walk out of it.
@@ -473,6 +454,9 @@ def project_stream(
     except OSError as exc:
         dirs, unreadable = [], []
         error = error or _failure(f"{audit_id}/", exc)
+    # Only lower-case directories count: the writer spells every one so and
+    # `store_path` opens nothing else, so a mixed-case one would list as a
+    # repository that never ran. The error names those instead.
     ids = [repo for repo in dirs if repo == repo.lower()]
     strays = [repo for repo in dirs if repo != repo.lower()]
     if unreadable:

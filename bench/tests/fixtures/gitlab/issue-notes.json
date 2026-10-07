@@ -1,0 +1,12 @@
+[
+  {
+    "id": 70000001,
+    "body": "/remediate please",
+    "system": false,
+    "author": {
+      "username": "eval-maintainer"
+    },
+    "created_at": "2026-10-01T14:57:34.911Z",
+    "noteable_type": "Issue"
+  }
+]

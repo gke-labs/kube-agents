@@ -107,15 +107,16 @@ readonly EVAL_SANDBOX_EXEC_ROUND_TRIP_SECONDS=60
 readonly EVAL_INFLIGHT_GRACE_SECONDS=300
 readonly EVAL_INFLIGHT_POLL_STEP_SECONDS=5
 
-# ─── Step 0: self-revalidation against this PR's own green history ──────────
+# ─── Step 0: self-revalidation against this PR's own verdicts ──────────────
 # hack/ci-revalidate.sh, which the Prow job also runs before it leases an
 # evaluation project (kube-agents-presubmits.yaml in oss-test-infra). Run
 # here too, first, so a job definition that has not yet hoisted it still
 # saves the eval matrix, and so the next-mode lane that runs this script
 # under its own JOB_NAME is covered the same way. The script's header owns
-# the rules: a green at this head is reused whatever main has done since
-# (#1202), a green at an earlier head when everything since is inert
-# (#1179), and every doubt is a full run. EVAL_SKIP_REVALIDATION=1 is the
+# the rules: a green at this head, whatever main has done since (#1202),
+# or at an earlier head when everything since is inert (#1179), is reused;
+# failing both, an admin /override of this head; and every doubt is a full
+# run. EVAL_SKIP_REVALIDATION=1 is the
 # escape hatch. Run through bash rather than by mode: a script that lost its
 # executable bit would otherwise exit 126 with no "Step 0: full run:" line
 # and every run would go full in silence.
@@ -1430,7 +1431,8 @@ check_case_entries "${PRESUBMIT_CASES_FILE}" "${TASKS[@]}"
 PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${ENTRY}")"; done)"
 
 # ─── The nightly tier (#1021, the catch-all; #1023/#1024 consume it) ─────────
-# The nightly periodic runs the FULL catalog: every presubmit case above,
+# The nightly periodic runs the FULL catalog (or one part of it, under
+# EVAL_NIGHTLY_PART below): every presubmit case above,
 # identically -- same repetitions, same gate, same reporting order -- PLUS
 # the entries of nightly-cases.txt. That file is the default home of a new
 # case (decided 2026-09-15 on #1546/#1564): it lands there, builds its record
@@ -1481,6 +1483,30 @@ case "${EVAL_TIER}" in
     ;;
   *)
     echo "ERROR: EVAL_TIER must be 'presubmit' or 'nightly', got '${EVAL_TIER}'." >&2
+    exit 1
+    ;;
+esac
+
+# Which part of the nightly matrix this run takes, so the nightly can run as
+# two periodics on two leased projects: the cases that request a pull request
+# run one unit at a time after every other unit (unit_phase, below), and on
+# one project that phase and the infra lock's stretch did not fit the 480m
+# deadline together. "all", the default, is the whole matrix; "main" leaves
+# those cases out and "writers" runs them alone. The split is applied after
+# the lane step, which is what names them. A part outside the nightly would
+# silently run a subset of the presubmit, so it stops the job, as does any
+# other value.
+EVAL_NIGHTLY_PART="${EVAL_NIGHTLY_PART:-all}"
+case "${EVAL_NIGHTLY_PART}" in
+  all) ;;
+  main | writers)
+    if [ "${EVAL_TIER}" != "nightly" ]; then
+      echo "ERROR: EVAL_NIGHTLY_PART=${EVAL_NIGHTLY_PART} selects part of the nightly matrix, but EVAL_TIER=${EVAL_TIER}; unset it, or set it to 'all', outside the nightly." >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "ERROR: EVAL_NIGHTLY_PART must be 'all', 'main' or 'writers', got '${EVAL_NIGHTLY_PART}'." >&2
     exit 1
     ;;
 esac
@@ -1641,6 +1667,47 @@ unit_task_path() { # <task-path> <task-name>
     echo "$1"
   fi
 }
+
+# ─── The nightly part ────────────────────────────────────────────────────────
+# EVAL_NIGHTLY_PART (validated at the tier switch) applied to TASKS: after
+# the lane step, which is what names the cases that request a pull request
+# (its log line lists them before this split), and before TASK_NAMES, the
+# stack count, the lock deadlines and the unit queues are built from TASKS,
+# so the run grades and reports only its part. The match is unit_phase's,
+# below. The names left out are kept in NIGHTLY_PART_DROPPED for the
+# BOOTSTRAP_ADMITTED export, as the lane's are.
+# The "Nightly part:" line is the record of which part a night ran, and
+# names the cases the part left out.
+NIGHTLY_PART_DROPPED=""
+if [ "${EVAL_TIER}" = "nightly" ]; then
+  NIGHTLY_MATRIX_SIZE="${#TASKS[@]}"
+  if [ "${EVAL_NIGHTLY_PART}" != "all" ]; then
+    NIGHTLY_PART_KEPT=()
+    for ENTRY in "${TASKS[@]}"; do
+      NAME="$(basename "$(dirname "${ENTRY}")")"
+      case ",${INJECT_LANE_REQUESTING}," in
+        *",${NAME},"*) ENTRY_PART="writers" ;;
+        *) ENTRY_PART="main" ;;
+      esac
+      if [ "${ENTRY_PART}" = "${EVAL_NIGHTLY_PART}" ]; then
+        NIGHTLY_PART_KEPT+=("${ENTRY}")
+      else
+        NIGHTLY_PART_DROPPED="${NIGHTLY_PART_DROPPED}${NAME}
+"
+      fi
+    done
+    TASKS=(${NIGHTLY_PART_KEPT[@]+"${NIGHTLY_PART_KEPT[@]}"})
+    if [ "${#TASKS[@]}" -eq 0 ]; then
+      echo "ERROR: EVAL_NIGHTLY_PART=${EVAL_NIGHTLY_PART} selects no case of the ${NIGHTLY_MATRIX_SIZE}-case nightly matrix (cases that request a pull request: ${INJECT_LANE_REQUESTING:-none}); the run would grade nothing and report green." >&2
+      exit 1
+    fi
+  fi
+  NIGHTLY_PART_LINE="Nightly part: ${EVAL_NIGHTLY_PART} (${#TASKS[@]} of ${NIGHTLY_MATRIX_SIZE} cases)"
+  if [ -n "${NIGHTLY_PART_DROPPED}" ]; then
+    NIGHTLY_PART_LINE="${NIGHTLY_PART_LINE}; left out: $(printf '%s' "${NIGHTLY_PART_DROPPED}" | paste -sd, -)"
+  fi
+  echo "${NIGHTLY_PART_LINE}"
+fi
 
 # Floor for VerificationCorrectness on a repetition of a task that declares a
 # verification_spec. 1.0 while every declared objective is meant to hold
@@ -1934,6 +2001,7 @@ if [ -z "${BLOCKING_ROSTER_ENTRIES}" ]; then
   exit 1
 fi
 BLOCKING_ROSTER_DEFAULT=""
+BLOCKING_ROSTER_ON_LANE=""
 while IFS= read -r NAME; do
   if [ -z "${NAME}" ]; then continue; fi
   if ! grep -qxF -- "${NAME}" <<< "${PRESUBMIT_CASE_NAMES}"; then
@@ -1950,6 +2018,13 @@ while IFS= read -r NAME; do
   if [ -n "${INJECT_LANE_DROPPED:-}" ] && grep -qxF -- "${NAME}" <<< "${INJECT_LANE_DROPPED:-}"; then
     continue
   fi
+  BLOCKING_ROSTER_ON_LANE="true"
+  # A roster case outside this night's part (NIGHTLY_PART_DROPPED, empty
+  # unless EVAL_NIGHTLY_PART names one) leaves the export for the same
+  # reason: the other part's run grades it.
+  if [ -n "${NIGHTLY_PART_DROPPED:-}" ] && grep -qxF -- "${NAME}" <<< "${NIGHTLY_PART_DROPPED:-}"; then
+    continue
+  fi
   BLOCKING_ROSTER_DEFAULT="${BLOCKING_ROSTER_DEFAULT:+${BLOCKING_ROSTER_DEFAULT},}${NAME}"
 done <<< "${BLOCKING_ROSTER_ENTRIES}"
 # The file guard above cannot see the lane's drop: an exclusion list that
@@ -1960,7 +2035,9 @@ done <<< "${BLOCKING_ROSTER_ENTRIES}"
 # the normal approvers, and it must not be able to do what the roster file
 # is guarded against. An explicit BOOTSTRAP_ADMITTED in the job's
 # environment, empty included, is the stated way to mean it, and wins below.
-if [ -z "${BLOCKING_ROSTER_DEFAULT}" ] && [ -n "${INJECT_LANE_DROPPED:-}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
+# Read before the nightly part's drop, which empties the export by design
+# when the part holds no roster case, and is not the lane's doing.
+if [ -z "${BLOCKING_ROSTER_ON_LANE}" ] && [ -n "${INJECT_LANE_DROPPED:-}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
   echo "ERROR: every case in ${BLOCKING_ROSTER_FILE} is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run with rung 4 disarmed for every case. Trim the exclusion list, or set BOOTSTRAP_ADMITTED explicitly if that is the intent." >&2
   exit 1
 fi
@@ -2068,11 +2145,12 @@ unit_cost_hint() {
     # record and then waits for the card. 1040-1080s a repetition on a dev
     # install on 2026-10-02.
     autoops-controller-stall-triage) echo 1100 ;;
-    # Tofu too: the plant waits for the cron job to file the sweep and for the
-    # sweep's worker to file its cards and end its run (up to the stack's
-    # run_wait, 900s), and the agent turn is a board read. 340-520s a
-    # repetition on 2026-09-28.
-    bootstrap-discovery-fanout) echo 600 ;;
+    # Tofu too: the plant waits for the cron job to file the sweep, then for
+    # the gate's hand-off to file the ranking card or for the sweep's Cluster
+    # Agent cards to settle (up to the stack's handoff_wait, 1800s), and the
+    # agent turn is a board read. About 960s a repetition on a dev install on
+    # 2026-10-05; 340-520s when it waited only for the fan-out (2026-09-28).
+    bootstrap-discovery-fanout) echo 1000 ;;
     # Tofu too: the plant files one card and waits for its worker to run the
     # prioritization SOP and end its run (up to the stack's run_wait, 900s),
     # and the agent turn is a board read. Unmeasured; priced below the band

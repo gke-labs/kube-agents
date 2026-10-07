@@ -398,7 +398,8 @@ try:
                 raise RuntimeError("an answer by click needs gateway/slack_ux_moments.py in the image")
             from gateway import slack_ux_clicks as clicks
             post = adapter.posts[0]
-            blocks = post.get("blocks") or []
+            # A question beside a side bar keeps its buttons in the attachment.
+            blocks = clicks._presenter.message_blocks(post)
             shown = [e for b in blocks if b.get("type") == "actions" for e in b.get("elements") or []]
             if not shown:
                 # Usually the case's fault: slack_moments shows 2 to 5 short options after a
@@ -411,7 +412,8 @@ try:
             buttons = [e for e in shown if clicks._shown_text(e) == label]
             if not buttons:
                 raise RuntimeError("the question for card %s has no %r button" % (card, label))
-            message = {"ts": STUB_TS, "text": post.get("text") or "", "blocks": blocks}
+            message = {"ts": STUB_TS, "text": post.get("text") or "", "blocks": post.get("blocks") or [],
+                       "attachments": post.get("attachments") or []}
             turn = clicks._turn(label, buttons[0].get("value"), message)
             out["click"] = clicks._turn_text(turn, moments.question_card(CHANNEL, STUB_TS) or "")
     else:
@@ -435,7 +437,7 @@ try:
         raise RuntimeError("the notifier built no wake for card %s" % card)
     out.update(wake=wake.synth, posted=len(adapter.posts))
     if adapter.posts:
-        out["post"] = {"text": adapter.posts[0].get("text") or "", "blocks": adapter.posts[0].get("blocks") or []}
+        out["post"] = {key: adapter.posts[0].get(key) or default for key, default in (("text", ""), ("blocks", []), ("attachments", []))}
     if DECOY_KEY:
         # Filed after the planted card, so it is the newer of two cards blocked on one question.
         decoy = kb.create_task(conn, title=TITLE, body=BODY, created_by=CREATOR,
@@ -600,7 +602,7 @@ class Failure:
 class Planted:
     """What the plant left on the board: the card, its wake, how many posts the stub took, and the run's key.
 
-    ``post`` is the first post's ``text`` and ``blocks``, ``None`` when the
+    ``post`` is the first post's ``text``, ``blocks`` and ``attachments``, ``None`` when the
     stub took none; ``decoy`` is the fresh-session replay's decoy card;
     ``click`` is the turn an answer by click sends.
     """

@@ -207,6 +207,11 @@ FIXTURE_NOT_READY = {
         "not, so the case fails with the branch absent, which is broken rather "
         "than red"
     ),
+    "obtainability-major-pdb-auto-pr": (
+        "#2228: needs checkout-gateway declared under clusters/seeded-a/ in "
+        "each pool project's *-infra repository, so 3.3's fix is a manifest "
+        "rather than manual"
+    ),
     "cluster-agent-stalled-controller-diagnosis": (
         "#1873: needs the stalled-controller role applied to every pool "
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
@@ -347,6 +352,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # This repository, sandbox-reading: the findings the onboarding
     # prioritization stage extracted.
     "bootstrap_findings": ("expected_findings",),
+    # This repository, agent-disk- and sandbox-reading: the sweep's hand-off to
+    # the prioritization stage.
+    "bootstrap_handoff": ("require",),
     # No field: whether the delivery job claimed and archived the report is
     # the whole assertion.
     "bootstrap_report_read": (),

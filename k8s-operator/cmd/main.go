@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -275,7 +276,30 @@ func main() {
 		}
 	}
 
-	if err := (&controller.PlatformAgentReconciler{
+	// The namespace this pod runs in, for the NetworkPolicy rule that admits
+	// the operator to the gateway's and broker's metrics ports. Both install
+	// paths set it from the Downward API; off the cluster, under `make run`,
+	// it is unset, the rule is not rendered, and the poller is not started:
+	// no pod IP is reachable from there, and a poller that ran anyway would
+	// record a Warning on every CR blaming a NetworkPolicy for the gap.
+	operatorNamespace := os.Getenv(controller.OperatorNamespaceEnv)
+	if operatorNamespace == "" {
+		setupLog.Info("the operator's namespace is unknown; the agent policies will not admit this operator on the metrics ports and status.usage's counters will not advance",
+			"variable", controller.OperatorNamespaceEnv)
+	} else if errs := validation.IsDNS1123Label(operatorNamespace); len(errs) > 0 {
+		// The value becomes kubernetes.io/metadata.name in the metrics rule's
+		// selector, which the API server only ever sets to a namespace's own
+		// (DNS-1123) name, so a value that is not a DNS-1123 label matches no
+		// namespace on any cluster -- and one the selector cannot even carry
+		// would have the API server reject the policy on every reconcile. Clear
+		// it either way, so the rule is not rendered and the poller, which could
+		// reach no pod without it, is not started.
+		setupLog.Info("the operator's namespace is not a valid namespace name (DNS-1123 label); the agent policies will not admit this operator on the metrics ports and status.usage's counters will not advance",
+			"variable", controller.OperatorNamespaceEnv, "value", operatorNamespace)
+		operatorNamespace = ""
+	}
+
+	reconciler := &controller.PlatformAgentReconciler{
 		Client:                   mgr.GetClient(),
 		APIReader:                mgr.GetAPIReader(),
 		RBAC:                     rbacChecker,
@@ -285,9 +309,20 @@ func main() {
 		APIServerCIDROverride:    apiServerCIDR,
 		DNSClusterIPOverride:     dnsClusterIP,
 		MetadataDaemonIPOverride: metadataDaemonIP,
-	}).SetupWithManager(mgr); err != nil {
+		OperatorNamespace:        operatorNamespace,
+	}
+	if err := reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "platformagent")
 		os.Exit(1)
+	}
+	// status.usage's counters, read from the agent pods' metrics listeners on
+	// the leader, off the reconcile path; see
+	// internal/controller/usage_counters_poller.go.
+	if operatorNamespace != "" {
+		if err := mgr.Add(controller.NewUsageCounterPoller(reconciler)); err != nil {
+			setupLog.Error(err, "Failed to add the usage counters poller to the manager")
+			os.Exit(1)
+		}
 	}
 
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {

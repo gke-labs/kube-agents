@@ -710,7 +710,11 @@ class ContentWorkspaceStore:
         # serialises them, so they cannot multiply, and a wait for a slot while
         # holding the lock would stall every verb behind it -- reads that need
         # no subprocess included -- for the whole of the wait. So the timeout
-        # above really is the bound.
+        # above really is the bound. The same holds for the broker's child
+        # memory budget: the store's git takes no reservation either. This
+        # lock is what sizes the budget's fixed term for the store
+        # (`CONTENT_WORKSPACE_RESERVE_BYTES` in credential_proxy.py): one
+        # process tree at a time, so one request's worth.
         #
         # Still the right trade for a single agent Pod publishing one pull
         # request at a time, and a per-workspace lock would still need this one

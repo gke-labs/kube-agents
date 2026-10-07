@@ -10,11 +10,13 @@ gateway. Its callers include the gateway patches for reactions
 session status (``slack_ux_status``, which reads only :func:`enabled`), moments
 (``slack_ux_moments``, which reads :func:`enabled` and lays out through
 ``slack_moments``), incident triage (``slack_ux_incident``), button clicks
-(``slack_ux_clicks``) and the harness-message patch (``slack_boilerplate``,
-which reads only :func:`enabled`); the Chat Agent's ``bootstrap_delivery``,
-which lays out the first inventory report through ``inventory_presenter``; and
-``session_kv_server``'s cron relay, which gates the fleet-audit report on
-:func:`enabled` and lays it out through ``slack_audit_report``.
+(``slack_ux_clicks``), failure replies (``slack_ux_failure``, which bolds
+with ``_first_sentence`` and adds its offer with :func:`blocks_answer`) and
+the harness-message patch (``slack_boilerplate``, which reads only :func:`enabled`);
+the Chat Agent's ``bootstrap_delivery``, which lays out the first inventory
+report through ``inventory_presenter``; and ``session_kv_server``'s cron relay,
+which gates the fleet-audit report on :func:`enabled` and lays it out through
+``slack_audit_report``.
 Every caller reaches it through ``PYTHONPATH=/opt/defaults/scripts``, which the
 operator sets on the agent container.
 
@@ -30,8 +32,12 @@ is the headline, links and choices as plain mrkdwn, for the message's ``text``
 field, with any report rows led by their severity as inline code (a bullet when
 they have none).
 :func:`blocks_answer` lays a headline, links and choices out as blocks; its
-caller is ``slack_moments``, which lays out the messages ``slack_ux_moments``
-posts.
+callers are ``slack_moments``, which lays out the messages ``slack_ux_moments``
+posts, and ``slack_ux_failure``, which adds a failure reply's offer button.
+:func:`with_side_bar` puts every block below the headline in one legacy
+attachment whose ``color`` is the side bar, for ``slack_ux_moments`` posting and
+settling a moment and ``slack_ux_clicks`` rewriting one; :func:`message_blocks`
+and :func:`side_bar_color` read a click's echoed message back.
 
 Reports (:func:`blocks_report`): a headline, the top findings as one group
 between dividers, then the choice buttons and the link buttons. Block Kit has no bordered box a message
@@ -158,6 +164,18 @@ LINK_ACTION_ID_PATTERN = re.compile(r"\.link\.\d+$")
 CHOICE_ACTION_ID_PATTERN = re.compile(r"\.choice\.\d+$")
 #: The block that says a message waits on an answer; a choice click drops it.
 WAITING_BLOCK_ID = "kage_waiting"
+#: A button Slack draws filled in its accent colour, for the one action a message is for.
+PRIMARY_STYLE = "primary"
+#: Side-bar colours, Slack's own green and yellow: something done that is the
+#: user's to act on, and something waiting on them. Block Kit has no colour; a
+#: side bar is a legacy attachment's ``color``.
+SIDE_BAR_GREEN = "#2EB67D"
+SIDE_BAR_YELLOW = "#ECB22E"
+#: How many leading blocks stay above the side bar. Slack shows a message's
+#: ``text`` as its body when it has no top-level blocks, so the headline stays
+#: out of the bar to keep ``text`` the notification and read-back copy only.
+SIDE_BAR_FROM = 1
+HEX_MARK = "#"
 
 CHOICES_LEAD = "Reply with one of: "
 CHOICE_SEPARATOR = " · "
@@ -694,7 +712,9 @@ def _safe_link_url(url: str) -> bool:
         return False
 
 
-def _button(label: str, action_id: str, *, url: str | None = None, value: str | None = None) -> dict | None:
+def _button(
+    label: str, action_id: str, *, url: str | None = None, value: str | None = None, style: str | None = None,
+) -> dict | None:
     """A button, or ``None`` for a ``url`` :func:`_safe_link_url` refuses. Callers drop an unsafe url
     first and this is the backstop: a button with no url would still read as a link button, and a click
     on it would open nothing. ``_actions`` skips ``None``."""
@@ -709,6 +729,8 @@ def _button(label: str, action_id: str, *, url: str | None = None, value: str | 
         button["url"] = url
     if value is not None:
         button["value"] = value[:BUTTON_VALUE_MAX]
+    if style is not None:
+        button["style"] = style
     return button
 
 
@@ -804,10 +826,12 @@ def blocks_answer(
     links: Iterable[Any] = (),
     choices: Iterable[str] = (),
     action_id_prefix: str = "kage",
+    primary_link: bool = False,
 ) -> list[dict]:
     """Block Kit for a message: headline, link buttons, choice buttons.
 
-    ``links`` are ``(label, url)`` pairs or ``{"text", "url"}`` mappings.
+    ``links`` are ``(label, url)`` pairs or ``{"text", "url"}`` mappings; with
+    ``primary_link`` the first is drawn as the message's primary action.
     ``choices`` are labels; each button's ``value`` is its label. Blocks are
     emitted in that order and any part left empty is omitted.
     """
@@ -816,7 +840,10 @@ def blocks_answer(
     if title:
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*{_escape(title)}*"}})
     link_buttons = [
-        _button(label, f"{action_id_prefix}.{LINK_ACTION}.{i}", url=url)
+        _button(
+            label, f"{action_id_prefix}.{LINK_ACTION}.{i}", url=url,
+            style=PRIMARY_STYLE if primary_link and not i else None,
+        )
         for i, (label, url) in enumerate(_link_pairs(links))
     ]
     blocks.extend(_actions(link_buttons))
@@ -826,6 +853,58 @@ def blocks_answer(
     ]
     blocks.extend(_actions(choice_buttons))
     return blocks
+
+
+def with_side_bar(blocks: Sequence[dict], color: str, text: str) -> dict:
+    """``blocks`` as the ``blocks`` and ``attachments`` of a ``chat.postMessage`` or
+    ``chat.update``: all but the first :data:`SIDE_BAR_FROM` go in one attachment
+    with ``color`` as its side bar.
+
+    ``text`` is the message's own, given as the attachment's ``fallback``:
+    without one Slack stores "[no preview available]", which a thread read back
+    shows. The Slack adapter reads a fallback only from an attachment with no
+    text it can extract (``_extract_text_from_slack_attachments``), and drops
+    one the message's text already holds.
+    ``attachments`` is always present, empty when nothing is left for the bar,
+    since ``chat.update`` keeps a message's attachments unless it is sent some.
+    """
+    blocks = list(blocks or ())
+    above, barred = blocks[:SIDE_BAR_FROM], blocks[SIDE_BAR_FROM:]
+    if not above or not barred:
+        return {"blocks": blocks, "attachments": []}
+    return {"blocks": above, "attachments": [{"color": color, "fallback": text, "blocks": barred}]}
+
+
+def _side_bar(message: Any) -> dict | None:
+    """The first attachment of ``message`` with a colour and blocks: a side bar, not an unfurl."""
+    attachments = message.get("attachments") or () if isinstance(message, dict) else ()
+    for attachment in attachments:
+        if isinstance(attachment, dict) and attachment.get("blocks") and attachment.get("color"):
+            return attachment
+    return None
+
+
+def message_blocks(message: Any) -> list[dict]:
+    """The blocks ``message`` shows itself: its own, then its side bar's.
+
+    A click's payload echoes a message :func:`with_side_bar` laid out with its
+    blocks split between the two. Any other attachment, such as a link's
+    unfurl, is not the message's own.
+    """
+    if not isinstance(message, dict):
+        return []
+    bar = _side_bar(message) or {}
+    return [b for b in (*(message.get("blocks") or ()), *(bar.get("blocks") or ())) if isinstance(b, dict)]
+
+
+def side_bar_color(message: Any) -> str | None:
+    """The colour of the side bar of ``message``, else None."""
+    bar = _side_bar(message)
+    if bar is None:
+        return None
+    color = str(bar["color"])
+    # Slack echoes a hex colour without its "#".
+    return color if color.startswith(HEX_MARK) else HEX_MARK + color
 
 
 def fallback_text(

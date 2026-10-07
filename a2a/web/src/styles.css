@@ -431,32 +431,7 @@ body {
 
 .connect-hint code {
   color: var(--ink);
-}
-
-.connect-form label {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  font-size: 10px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--ink-dim);
-}
-
-.connect-form input {
-  background: var(--void);
-  border: 1px solid var(--edge);
-  border-radius: 2px;
-  padding: 9px 12px;
-  color: var(--ink-bright);
-  font-family: var(--mono);
-  font-size: 12px;
-}
-
-.connect-form input:focus {
-  outline: none;
-  border-color: #2c3644;
-  box-shadow: 0 0 0 1px rgba(126, 178, 255, 0.18);
+  overflow-wrap: anywhere;
 }
 
 .connect-form button {

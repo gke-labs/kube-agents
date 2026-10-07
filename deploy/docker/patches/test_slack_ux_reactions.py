@@ -295,10 +295,82 @@ class FlagOffIdentityTest(unittest.TestCase):
         ):
             _run(adapter.on_processing_start(event))
             _run(adapter.on_processing_complete(event, patched["ProcessingOutcome"].SUCCESS))
-        self.assertEqual(
-            adapter.calls,
-            [(CHANNEL, ASK, "hammer_and_wrench", TEAM, False), (CHANNEL, ASK, "white_check_mark", TEAM, False)],
-        )
+            self.assertEqual(adapter.calls, [])
+            adapter._reacting_message_ids = {"m"}
+            _run(adapter.on_processing_start(event))
+            _run(adapter.on_processing_complete(event, patched["ProcessingOutcome"].FAILURE))
+        self.assertEqual(adapter.calls, [(CHANNEL, ASK, "x", TEAM, False)])
+
+
+class DisplayTest(unittest.TestCase):
+    """What an ask shows as shipped: nothing on arrival or success, ❌ on failure."""
+
+    def setUp(self):
+        importlib.reload(runtime)
+        patcher = mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "1"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.boards = []
+
+        async def open_cards(chat_id, thread_id):
+            return self.boards.pop(0) if self.boards else {}
+
+        for name, fake in (("open_cards", open_cards), ("thread_lineage", mock.AsyncMock(return_value={}))):
+            patched = mock.patch.object(runtime, name, fake)
+            patched.start()
+            self.addCleanup(patched.stop)
+
+    def _turn(self, text, after, outcome):
+        adapter = _Stub()
+        self.boards[:] = [{}, after]
+        _run(runtime.on_processing_start(adapter, _event(text)))
+        _run(runtime.on_processing_complete(adapter, _event(text), SimpleNamespace(value=outcome)))
+        return adapter
+
+    def test_a_direct_answer_shows_nothing_on_arrival_or_success_and_x_on_failure(self):
+        for text in ("is seeded-a healthy?", "fix it", "board", "incident: payments-api down"):
+            with self.subTest(text=text):
+                self.assertEqual(self._turn(text, {}, "success").calls, [])
+                self.assertEqual(self._turn(text, {}, "failure").calls, [("x", False)])
+                self.assertEqual(self._turn(text, {}, "cancelled").calls, [])
+
+    def test_a_delegated_answer_shows_x_only_when_its_work_fails(self):
+        card = (runtime.DEFAULT_BOARD, "t_a")
+        sub = {"platform": "slack", "chat_id": CHANNEL, "thread_id": THREAD, "task_id": "t_a"}
+        for kinds, expected in (
+            (("completed",), []),
+            (("blocked",), []),
+            (("blocked", "gave_up"), [("x", False)]),
+        ):
+            with self.subTest(kinds=kinds):
+                runtime._deferred.clear()
+                adapter = self._turn("fix it", {card: runtime._Card("running")}, "success")
+                self.assertEqual(adapter.calls, [])
+                for kind in kinds:
+                    _run(runtime.settle_delegated(adapter, sub, kind))
+                self.assertEqual(adapter.calls, expected)
+
+    def test_a_card_waiting_on_you_shows_nothing_until_its_work_fails(self):
+        # Both other ways an ask can wait on you: a card that blocks before the
+        # turn ends, then a follow-up its worker files that blocks on you too.
+        adapter = _Stub()
+        sub = {"platform": "slack", "chat_id": CHANNEL, "thread_id": THREAD, "task_id": "t_a"}
+        self.boards[:] = [{}]
+        _run(runtime.on_processing_start(adapter, _event("fix it")))
+
+        async def block_then_read(chat_id, thread_id):
+            await runtime.settle_delegated(adapter, sub, "blocked")
+            return _cards("t_a", status="blocked")
+
+        with mock.patch.object(runtime, "open_cards", block_then_read):
+            _run(runtime.on_processing_complete(adapter, _event("fix it"), SimpleNamespace(value="success")))
+        self.assertEqual(adapter.calls, [])
+        self.boards[:] = [_cards("t_b", status="blocked", creator="t_a")]
+        _run(runtime.settle_delegated(adapter, sub, "completed"))
+        self.assertEqual(adapter.calls, [])
+        self.assertEqual(runtime._deferred[(CHANNEL, THREAD)][0].cards, {("default", "t_b")})
+        _run(runtime.settle_delegated(adapter, {**sub, "task_id": "t_b"}, "gave_up"))
+        self.assertEqual(adapter.calls, [("x", False)])
 
 
 class _Stub:
@@ -319,13 +391,21 @@ class _Stub:
 
 
 class RuntimeTest(unittest.TestCase):
-    """The runtime module with the flag on, the board faked."""
+    """The runtime module with the flag on, the board faked, and every reaction shown.
+
+    Which settle an ask reaches is what these tests check, so the arrival
+    reaction, ✅ and ⏸️ are shown here; ``DisplayTest`` checks what ships.
+    """
 
     def setUp(self):
         importlib.reload(runtime)
         patcher = mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "1"})
         patcher.start()
         self.addCleanup(patcher.stop)
+        for name, value in (("SHOW_ARRIVAL", True), ("SHOWN_SETTLES", frozenset(runtime._presenter.SETTLE_REACTIONS))):
+            shown = mock.patch.object(runtime, name, value)
+            shown.start()
+            self.addCleanup(shown.stop)
         self.boards = []
         self.board_args = []
 

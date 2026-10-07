@@ -754,10 +754,12 @@ override identity or correlation fields.
   initial reads, refreshes, and incremental source pages. Logging and Trace
   retain opaque continuation cursors only inside the Streamlit session, append
   two bounded pages per load, and preserve successful earlier pages when a
-  later page fails. Logging uses two queries (the lifted-field form of a record,
-  and the wrapped text form of one the sidecar did not lift; the text query
-  excludes lifted records, and a record both still return is merged by
-  `insertId`) with 500-record pages and a 60-second request timeout; Trace and
+  later page fails. Logging uses two queries (records whose keys are
+  `jsonPayload` fields of their own, the tailed audit file, records lifted
+  before it existed and a record the agent printed to its stdout when the file
+  could not take it, and the wrapped text form of a record in `agent.log`; the
+  text query excludes the field-form records, and a record both still return is
+  merged by `insertId`) with 500-record pages and a 60-second request timeout; Trace and
   each Logging query stop after ten pages, and both sources share a 90-second
   load deadline. Source pagination and ledger pagination remain separate concerns.
 - **Scheduled Cron:** live Hermes job definitions, scheduler heartbeat state,

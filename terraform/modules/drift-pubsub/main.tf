@@ -153,6 +153,24 @@ resource "google_pubsub_topic_iam_member" "sink_writer" {
   member  = google_logging_project_sink.drift_audit.writer_identity
 }
 
+// Nobody, on an install: the sink above is the only publisher, which is what
+// makes a record on this topic evidence that the API server recorded the call.
+// The evaluation pool is the exception and the variable's description says why
+// the exception is confined to it. Topic-scoped and for_each'd over the
+// members, so a project that sets it grants publish on this one topic and the
+// list is the whole of what holds it.
+//
+// `.id` rather than `.name`, for the reason the sink_writer binding above
+// gives.
+resource "google_pubsub_topic_iam_member" "extra_publishers" {
+  for_each = toset(var.topic_publishers)
+
+  project = var.project_id
+  topic   = google_pubsub_topic.drift_audit.id
+  role    = "roles/pubsub.publisher"
+  member  = each.value
+}
+
 resource "google_pubsub_subscription_iam_member" "detector_subscriber" {
   project      = var.project_id
   subscription = google_pubsub_subscription.drift_audit.id

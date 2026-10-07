@@ -16,7 +16,7 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
   producing assertions.
 - `kube_agents_bench/verifiers.py` — the leaf verifiers this repository adds to devops-bench's own, published through the `devops_bench.verifiers` entry-point group.
 - `kube_agents_bench/discovery.py` — reads the onboarding discovery sweep off the agent pod for the `bootstrap_fanout` verifier: the sweep's board rows and the Cluster Agent profiles beside them, in one `kubectl exec`.
-- `kube_agents_bench/onboarding.py` — reads the onboarding prioritization stage's `INVENTORY.items.json` off the shell sandbox pod for the `bootstrap_findings` verifier, for `bootstrap_report_read` the archived report there and the delivery job's marker on the agent pod, and for `bootstrap_delivered` the delivery job's run record on the agent pod, through its own exec into each pod.
+- `kube_agents_bench/onboarding.py` — reads the onboarding prioritization stage's `INVENTORY.items.json` off the shell sandbox pod for the `bootstrap_findings` verifier, the raw file's findings block and the hand-off's board state for `bootstrap_handoff`, for `bootstrap_report_read` the archived report there and the delivery job's marker on the agent pod, and for `bootstrap_delivered` the delivery job's run record on the agent pod, through its own exec into each pod.
 - `kube_agents_bench/fleet.py` — resolves a seeded-fleet fixture ROLE to the kubeconfig that reaches it. Fails loudly rather than falling back to the ambient config; see [tf/fleet/README.md](tf/fleet/README.md).
 - `kube_agents_bench/cases.py`, `scoring.py`, `baselines.py`, `gate.py` — the presubmit's verdict, described under [The gate](#the-gate) below. Nothing devops-bench calls; these read the records it writes.
 - `tasks/` — task definitions. `agent-kanban-smoke` is a no-infrastructure smoke task that exercises the whole pipeline using only toolsets the deployed agent actually ships with. The rest are the Phase 2 domain scenarios; [`tasks/DRAFTS.md`](tasks/DRAFTS.md) is their status page.
@@ -121,7 +121,7 @@ Delegation on the inject path is a seam, not a feature: the kanban poll behind t
 
 ## The gate
 
-devops-bench scores a run; it does not decide whether a pull request may merge. That decision is `bench-gate`, and `hack/ci-eval-pr.sh` is what drives it (when step 0, `hack/ci-revalidate.sh`, has not already reused the pull request's prior green verdict): the shell runs each task `EVAL_REPETITIONS` times (default 3) and hands the resulting run **directories** to the scorer, which reads `results.json` for the scores, `manifest.json` for `setupId`, and `rows.json` for `scoringVersion`.
+devops-bench scores a run; it does not decide whether a pull request may merge. That decision is `bench-gate`, and `hack/ci-eval-pr.sh` is what drives it (when step 0, `hack/ci-revalidate.sh`, has not already reused a verdict the pull request holds: its own prior green, or an admin `/override` at this head): the shell runs each task `EVAL_REPETITIONS` times (default 3) and hands the resulting run **directories** to the scorer, which reads `results.json` for the scores, `manifest.json` for `setupId`, and `rows.json` for `scoringVersion`.
 
 ```bash
 uv run bench-gate case --task ./tasks/<id>/task.yaml \

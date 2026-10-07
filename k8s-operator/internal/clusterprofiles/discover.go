@@ -43,7 +43,38 @@ const (
 	// hiddenPrefix marks a directory entry this scan ignores, so an editor's
 	// or a tool's dot-directory beside the profiles is not read as one.
 	hiddenPrefix = "."
+
+	// clusterProfilePrefix is what the Platform Agent's profile_name puts in
+	// front of every Cluster Agent profile directory, and nothing else carries
+	// it (deploy/shared/sandbox_mirror.py discriminates on the same prefix).
+	// ReadIdentities uses it for the two drops it cannot otherwise place: a
+	// config that is absent, or reads cleanly and carries no cluster_identity
+	// block, is a cluster profile mid-scaffold under the prefix and a
+	// non-cluster profile or a stray directory without it.
+	clusterProfilePrefix = "cluster-"
 )
+
+// reservedProfiles are the Hermes profiles that live under the same directory
+// and are never a cluster's -- cluster_agent_profile.py's RESERVED_PROFILES --
+// so ReadIdentities says nothing about them whatever state they are in.
+var reservedProfiles = map[string]bool{"default": true, "platform": true}
+
+// ErrNoClusterIdentity and ErrNoProfileConfig are the reasons ReadIdentities
+// reports for a cluster- prefixed profile whose config reads cleanly and
+// carries no cluster_identity block, or is absent -- and the reasons a caller
+// supplies for the two drops it does not report: the same two shapes under a
+// name without the prefix.
+var (
+	ErrNoClusterIdentity = errors.New(profileConfigFile + " carries no cluster_identity")
+	ErrNoProfileConfig   = errors.New(profileConfigFile + " is absent")
+)
+
+// ProfileIdentity is one cluster profile's directory name with the identity
+// its config carries, as ReadIdentities lists them.
+type ProfileIdentity struct {
+	Profile  string
+	Identity Identity
+}
 
 // Cluster is one cluster discovered from a profile, addressable and
 // authenticated. Config carries the control-plane address and this process's
@@ -126,6 +157,93 @@ func (d Discoverer) skip(profile string, err error) {
 	}
 }
 
+// ReadIdentities lists the cluster identity of every Cluster Agent profile in
+// dir, reading only the profiles' config files: no credential is minted and the
+// GKE API is not asked anything, so it costs a directory read and is safe to
+// call again while the process runs. It is the scope question -- does a profile
+// name this cluster? -- as distinct from Discover's reachability question, and
+// the two answers differ for every profile Discover skips.
+//
+// Reported to onSkip (nil to ignore), with the directory name and why, is
+// every entry dropped for a reason that could be a cluster profile naming
+// nothing on this read: a config that cannot be read or parsed, a
+// cluster_identity that is present but incomplete, and a cluster- prefixed
+// entry whose config is absent or carries no block at all (the scaffold writes
+// the identity after the template copy, so a read landing between sees exactly
+// this) or which is a symlink leading nowhere. Silent are hidden entries, plain
+// files, the reserved profiles (default and platform, never a cluster's), and
+// an entry without the prefix that has no config, a config with no block, or
+// is a symlink leading nowhere -- the shapes the read cannot tell from a
+// non-cluster profile or an entry that was never a profile (the old
+// plugin-mount layout left one directory per plugin on the volume), which a
+// caller that saw it name a cluster keeps on its own record. A listing that failed on
+// any of these would make one broken profile hide the whole fleet, but a
+// profile dropped here is a cluster the caller will treat as unnamed, and the
+// caller has to be able to say so. Only a directory that cannot be read at all
+// is an error, because then the scope is unknown rather than empty.
+func ReadIdentities(dir string, onSkip func(profile string, err error)) ([]ProfileIdentity, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read profiles dir %s: %w", dir, err)
+	}
+	skip := func(profile string, err error) {
+		if onSkip != nil {
+			onSkip(profile, err)
+		}
+	}
+	var ids []ProfileIdentity
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, hiddenPrefix) || reservedProfiles[name] {
+			continue
+		}
+		clusterProfile := strings.HasPrefix(name, clusterProfilePrefix)
+		if !e.IsDir() {
+			// os.ReadDir types an entry from its own bits, so a profile
+			// reached through a link reports IsDir false; follow it. A link
+			// that leads nowhere is reported under the prefix only, like the
+			// other shapes that could as well be no profile at all.
+			if e.Type()&os.ModeSymlink == 0 {
+				continue
+			}
+			info, err := os.Stat(filepath.Join(dir, name))
+			if err != nil {
+				if clusterProfile {
+					skip(name, fmt.Errorf("symlink cannot be followed: %w", err))
+				}
+				continue
+			}
+			if !info.IsDir() {
+				if clusterProfile {
+					skip(name, errors.New("symlink does not lead to a directory"))
+				}
+				continue
+			}
+		}
+		cfg, err := readProfileConfig(filepath.Join(dir, name, profileConfigFile))
+		if err != nil {
+			skip(name, err)
+			continue
+		}
+		if cfg == nil {
+			if clusterProfile {
+				skip(name, ErrNoProfileConfig)
+			}
+			continue
+		}
+		id := cfg.ClusterIdentity
+		switch {
+		case id.complete():
+			ids = append(ids, ProfileIdentity{Profile: name, Identity: id})
+		case id != (Identity{}):
+			skip(name, fmt.Errorf("cluster_identity is incomplete: %q", id.String()))
+		case clusterProfile:
+			skip(name, ErrNoClusterIdentity)
+		}
+	}
+	return ids, nil
+}
+
 // Discover scans a Hermes profiles directory (normally /opt/data/profiles) and
 // returns one Cluster per Cluster Agent profile found.
 //
@@ -140,6 +258,10 @@ func (d Discoverer) skip(profile string, err error) {
 // carries a complete cluster_identity block. That is how non-cluster profiles
 // ("default", "platform") are skipped: testing for the data we need is more
 // durable than hardcoding a list of names that the Python side may extend.
+// ReadIdentities does name those two, and only to stay silent about them when
+// they are broken: for the scope the question is not "which profiles address a
+// cluster" but "which drops are worth a line", and a reserved profile is never
+// a cluster's whatever state it is in.
 //
 // The identity is also the whole of what a config is built from, and that is a
 // deliberate change of source. Discovery used to require a kubeconfig.yaml

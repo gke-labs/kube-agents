@@ -14,17 +14,13 @@
 
 # The scenario driver for bench/tasks/bootstrap-discovery-fanout: re-arm the
 # onboarding discovery gate on the install under test, wait for the
-# `bootstrap-inventory-scan` cron job to file a fresh sweep card, and return
-# once the sweep's worker has filed Cluster Agent cards and then ended its run
-# itself, or has completed without filing any -- by then it has filed
-# whatever Cluster Agent cards it is going to file, which is what the case
-# grades. Short of that, it hands whatever the worker filed to the verifier
-# at `run_wait`, or fails the apply if no worker has picked the sweep up by
-# then or no read of the board has succeeded. It does not wait for the
-# Cluster Agent cards itself: the worker's SOP polls them to the end inside
-# its run, but a worker can end its run while they are still running
-# (#1981). The destroy archives them, and archiving a running card ends its
-# worker.
+# `bootstrap-inventory-scan` cron job to file a fresh sweep card, then wait for
+# the hand-off to the ranking stage: return once the hand-off's own card keyed
+# `bootstrap-inventory-prioritize` is on the board, or once the sweep and its
+# Cluster Agent cards have all settled without one for `settle_hold`, or at
+# `handoff_wait`. Fail the apply if no worker has picked the sweep up by
+# `run_wait` or no read of the board has succeeded. The destroy archives every
+# card, and archiving a running card ends its worker.
 #
 # Re-arming is the runbook in agents/chat/defaults/plugins/bootstrap_onboarding/
 # README.md §5: the previous run's `bootstrap-inventory-*` cards are archived,
@@ -57,17 +53,26 @@ locals {
   inventory = "${local.home}/INVENTORY.raw.md ${local.home}/INVENTORY.md"
   # The gate as the cron job launches it, and the longest one run of it can
   # take at the default scope cap, which is what this stack installs:
-  # bootstrap_scan_gate.py's RECONCILE_TIMEOUT_SECONDS (240) plus one cron
+  # bootstrap_scan_gate.py's RECONCILE_TIMEOUT_SECONDS (390) plus one cron
   # tick. A declared spec.scope.maxProjects raises the gate's ceiling with
   # the reconcile's budget.
   gate_script = "bootstrap_scan_gate.py"
-  gate_wait   = 300
+  gate_wait   = 450
   scan_job    = "bootstrap-inventory-scan"
   # bootstrap_scan_gate.py's CLUSTER_IDEMPOTENCY_KEY_PREFIX.
   cluster_key_like = "bootstrap-inventory-cluster-%"
-  # deploy/docker/patches/kanban_guardrail_exit.py: RATE_LIMIT_REASON_PREFIX,
-  # the start of the summary on a run the rate-limit guardrail blocked.
-  rate_limit_block = "provider rate limit: API retries exhausted"
+  # bootstrap_scan_gate.py's PRIORITIZE_IDEMPOTENCY_KEY: the ranking card the
+  # hand-off files.
+  prioritize_key = "bootstrap-inventory-prioritize"
+  # The hand-off waits on the sweep's worker and on every Cluster Agent card
+  # the gate filed, each a full single-cluster audit, so it is given well past
+  # run_wait.
+  handoff_wait = 1800
+  # How long the sweep and its Cluster Agent cards stay settled with no
+  # ranking card before the hand-off counts as not made: one gate cron tick
+  # (60s), so a gate that compiles and files after the cards settle gets its
+  # run, plus that much again for the run itself.
+  settle_hold = 120
   # The exit trap's tries at listing the cards it archives, and the wait
   # between them: what failed the apply can fail one listing too.
   list_tries = 3
@@ -242,12 +247,12 @@ resource "null_resource" "sweep" {
         echo idle
       }
       sweep_id() {
-        agent sh -c 'sed -n "s/^task_id=//p" ${local.home}/.bootstrap_scan_filed 2>/dev/null; true' || true
+        agent sh -c 'sed -n -E "s/(^|.*[[:space:]])task_id[[:space:]]*=[[:space:]]*([^[:space:]]+).*/\\2/p" ${local.home}/.bootstrap_scan_filed 2>/dev/null | head -n 1; true' || true
       }
       # A failed listing or rm fails step 2, where the destroy's copy only
-      # reports it: the sandbox's /opt/data outlives its pod, and a report left
-      # there makes the sweep skip discovery
-      # (agents/platform/governance/inventory.md). Every step runs and the
+      # reports it: the sandbox's /opt/data outlives its pod, and a raw file
+      # left there would be graded by raw-report-has-findings-block before this
+      # run's hand-off writes its own. Every step runs and the
       # status covers them all, so step 2 still stops and the trap can name
       # what it left. The listing is checked on its own because a failure
       # inside a `for` word list fails nothing.
@@ -310,11 +315,11 @@ resource "null_resource" "sweep" {
       # anything changes; taken for an open gate, it would have the trap
       # leave this one open.
       old_id="$(agent_py <<'PY'
-      import os
+      import os, re
       home = "${local.home}"
       try:
           with open(home + "/.bootstrap_scan_filed") as fh:
-              ids = [line.strip()[len("task_id="):] for line in fh if line.startswith("task_id=")]
+              ids = [m.group(1) for m in (re.search(r"(?:^|\s)task_id\s*=\s*(\S+)", line) for line in fh) if m]
           print(ids[0] if ids and ids[0] else "none")
       except FileNotFoundError:
           if any(os.path.exists(path) for path in "${local.inventory}".split()):
@@ -353,77 +358,91 @@ resource "null_resource" "sweep" {
       done
       echo "The gate filed sweep card $sweep after $${elapsed}s."
 
-      # ---- 4. Wait for the sweep worker to file its cards -----------------
-      # The SOP has the worker poll its Cluster Agent cards inside its run and
-      # complete after filing the prioritize card; workers also complete
-      # before those cards finish, or block to wait on them. Each ends the
-      # run. A run can also end before the worker has filed them all -- the
-      # guardrail's rate-limit block, retries exhausted (timed_out), a crashed
-      # worker reclaimed -- and the retry's re-creates add no newer card. So
-      # only a run the worker ended itself, completed or blocked other than by
-      # that guardrail, at or after the newest Cluster Agent card counts. With
-      # no Cluster Agent card filed, only a completed run counts: a worker that
-      # blocked can still file them once the block is lifted. The prioritize
-      # card is left out: the worker can file it after its run completes.
-      # Counting ended runs rather than reading the card's status cannot miss
-      # a block the dispatcher lifts between two polls. The board creates
-      # kanban_worker_children when a worker first files a card.
-      run_state() {
-        agent_py "$sweep" "${local.cluster_key_like}" "${local.rate_limit_block}" <<'PY'
+      # ---- 4. Wait for the hand-off to ranking ---------------------------
+      # Settled is the sweep and every Cluster Agent card filed at or after it
+      # in a status nothing more comes from (done, blocked, triage, failed,
+      # cancelled, archived), with at least one such card or a sweep that
+      # completed (a blocked sweep can still list the fleet once unblocked).
+      # The ranking card is not settled-gated: once the hand-off's own exists,
+      # the hand-off has happened. Its own is the one carrying the hand-off
+      # module's body; any other keyed card, such as one the sweep's worker
+      # filed early, is one the hand-off replaces. Where the module is absent
+      # every keyed card counts. A failed read leaves the last state standing.
+      handoff_state() {
+        agent_py "$sweep" "${local.cluster_key_like}" "${local.prioritize_key}" <<'PY'
       import sqlite3, sys
-      sweep, cluster_like, rate_limit = sys.argv[1:4]
+      sweep, cluster_like, key = sys.argv[1:4]
+      sys.path.insert(0, "${local.home}/scripts")
+      try:
+          from bootstrap_handoff import _prioritize_body
+          own = _prioritize_body()
+      except Exception:
+          own = None
       c = sqlite3.connect("file:${local.home}/kanban.db?mode=ro", uri=True)
-      runs = c.execute("SELECT count(*), count(ended_at) FROM task_runs WHERE task_id = ?", (sweep,)).fetchone()
-      filed, newest, after = 0, None, 0
-      if c.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'kanban_worker_children'").fetchone():
-          filed, newest = c.execute(
-              "SELECT count(*), max(w.created_at) FROM kanban_worker_children w JOIN tasks t ON t.id = w.child_id "
-              "WHERE w.creator_id = ? AND t.idempotency_key LIKE ?", (sweep, cluster_like)).fetchone()
-      if newest is not None:
-          ended = c.execute("SELECT outcome, coalesce(summary, '') FROM task_runs WHERE task_id = ? AND ended_at >= ?", (sweep, newest))
-          after = sum(o == "completed" or (o == "blocked" and not s.startswith(rate_limit)) for o, s in ended)
-      else:
-          after = c.execute("SELECT count(*) FROM task_runs WHERE task_id = ? AND outcome = 'completed'", (sweep,)).fetchone()[0]
-      print(runs[0], runs[1], filed, after)
+      status, since = c.execute("SELECT status, created_at FROM tasks WHERE id = ?", (sweep,)).fetchone()
+      started = c.execute("SELECT count(*) FROM task_runs WHERE task_id = ?", (sweep,)).fetchone()[0]
+      keyed = sum(1 for (body,) in c.execute(
+          "SELECT body FROM tasks WHERE idempotency_key = ? AND created_at >= ? AND status != 'archived'",
+          (key, since)) if own is None or (body or "") == own)
+      cards = [s for (s,) in c.execute(
+          "SELECT status FROM tasks WHERE idempotency_key LIKE ? AND created_at >= ?", (cluster_like, since))]
+      ended = ("done", "blocked", "triage", "failed", "cancelled", "archived")
+      settled = status in ended and all(s in ended for s in cards) and (bool(cards) or status != "blocked")
+      print(started, int(keyed > 0), int(settled))
       PY
       }
-      # Only a read of four counts is used: a failed exec or query prints
-      # nothing, and that is not a sweep with no runs. read_at is when the
-      # last one succeeded.
-      counts='^[0-9]+ [0-9]+ [0-9]+ [0-9]+$'
+      triple='^[0-9]+ [01] [01]$'
+      elapsed=0
       read_at=""
-      read_run_state() {
-        out="$(run_state)" || out=""
-        if [[ "$out" =~ $counts ]]; then
-          read -r started ended filed after <<<"$out"
+      started=0
+      keyed=0
+      settled_at=""
+      read_handoff_state() {
+        out="$(handoff_state)" || out=""
+        if [[ "$out" =~ $triple ]]; then
+          read -r started keyed settled <<<"$out"
           read_at=$elapsed
+          if [ "$settled" -eq 0 ]; then
+            settled_at=""
+          elif [ -z "$settled_at" ]; then
+            settled_at=$elapsed
+          fi
         fi
       }
-      elapsed=0
-      after=0
-      read_run_state
-      until [ "$after" -ge 1 ]; do
-        if [ "$elapsed" -ge ${local.run_wait} ]; then
+      picked=""
+      read_handoff_state
+      while :; do
+        if [ "$keyed" -eq 1 ]; then
+          echo "Sweep card $sweep handed off: a card keyed ${local.prioritize_key} is on the board after $${elapsed}s."
+          exit 0
+        fi
+        if [ -n "$settled_at" ] && [ $((elapsed - settled_at)) -ge ${local.settle_hold} ]; then
+          echo "Sweep card $sweep and its Cluster Agent cards have been settled for $((elapsed - settled_at))s with no card keyed ${local.prioritize_key}; handing over to the verifier."
+          exit 0
+        fi
+        if [ -z "$picked" ] && [ "$elapsed" -ge ${local.run_wait} ]; then
           if [ -z "$read_at" ]; then
-            echo "ERROR: no read of sweep card $sweep's runs from the board succeeded in $${elapsed}s, so there is nothing to grade. The read errors are above." >&2
+            echo "ERROR: no read of sweep card $sweep's hand-off from the board succeeded in $${elapsed}s, so there is nothing to grade. The read errors are above." >&2
             exit 1
           fi
-          if [ "$read_at" -lt "$elapsed" ]; then
-            echo "Board reads after $${read_at}s failed; what follows is from the read at $${read_at}s." >&2
-          fi
           if [ "$started" -eq 0 ]; then
-            echo "ERROR: no worker picked up sweep card $sweep within $${read_at}s, so there is no fan-out to grade." >&2
+            echo "ERROR: no worker picked up sweep card $sweep within $${read_at}s, so there is no hand-off to grade." >&2
             agent ${local.hermes} kanban show "$sweep" >&2 || true
             exit 1
           fi
-          echo "Sweep card $sweep has $ended ended run(s) and $filed Cluster Agent card(s) after $${elapsed}s; handing over to the verifier."
+          picked=1
+        fi
+        if [ "$elapsed" -ge ${local.handoff_wait} ]; then
+          if [ "$read_at" -lt "$elapsed" ]; then
+            echo "Board reads after $${read_at}s failed; what follows is from the read at $${read_at}s." >&2
+          fi
+          echo "No card keyed ${local.prioritize_key} and the sweep's cards not settled after $${elapsed}s; handing over to the verifier."
           exit 0
         fi
         sleep ${local.poll}
         elapsed=$((elapsed + ${local.poll}))
-        read_run_state
+        read_handoff_state
       done
-      echo "Sweep card $sweep filed $filed Cluster Agent card(s) and ended a run after $${elapsed}s."
     EOT
   }
 

@@ -843,6 +843,153 @@ class TestDeliveryFailureIsWrittenBack(unittest.TestCase):
         self.assertEqual(self._row(row_id), (1, ""))
 
 
+class TestSlackIncidentAlert(unittest.TestCase):
+    """With KAGE_SLACK_UX on, a crashloop alert on Slack reads as mock 9 does, and its thread is titled."""
+
+    WORKLOAD = "payments-api"
+    CLUSTER = "seeded-debug"
+    CRASH = "Back-off restarting failed container api in pod payments-api-64d8988cb7-r76jr"
+    PULL = 'Back-off pulling image "gcr.io/x/payments:bad"'
+
+    def setUp(self):
+        patcher = patch.dict(os.environ, {"KAGE_SLACK_UX": "1"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _message(self, reason="BackOff", message=CRASH, cluster=CLUSTER):
+        return session_kv_server._slack_alert_message(self.WORKLOAD, cluster, reason, message)
+
+    def _title(self, reason="BackOff", message=CRASH, cluster=CLUSTER):
+        return session_kv_server._alert_session_title(self.WORKLOAD, cluster, reason, message)
+
+    def test_a_crashloop_names_the_workload_in_its_cluster(self):
+        expected = "🚨 **payments-api in seeded-debug keeps crashing.** Looking now."
+        self.assertEqual(self._message(), expected)
+        self.assertEqual(self._message("CrashLoopBackOff", ""), expected)
+
+    def test_anything_but_a_crashloop_keeps_the_alert(self):
+        self.assertIsNone(self._message("BackOff", self.PULL))
+        self.assertIsNone(self._message("OOMKilled", "Memory cgroup out of memory"))
+        self.assertIsNone(self._message("FailedScheduling", "0/3 nodes are available"))
+
+    def test_no_cluster_keeps_the_alert(self):
+        self.assertIsNone(self._message(cluster=""))
+
+    def test_flag_off_keeps_the_alert_and_sets_no_title(self):
+        with patch.dict(os.environ, {"KAGE_SLACK_UX": ""}):
+            self.assertIsNone(self._message())
+            self.assertIsNone(self._title())
+
+    def test_the_title_says_what_happened_in_which_cluster(self):
+        self.assertEqual(self._title(), "payments-api crashloop in seeded-debug")
+        self.assertEqual(self._title("CrashLoopBackOff", ""), "payments-api crashloop in seeded-debug")
+        self.assertIsNone(self._title("BackOff", self.PULL))
+        self.assertIsNone(self._title("OOMKilled", ""))
+        self.assertEqual(self._title(cluster=""), "payments-api crashloop")
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_inject_hands_the_slack_alert_and_title_to_the_troubleshooter(self, trigger):
+        from fastapi.testclient import TestClient
+
+        payload = {
+            "reason": "BackOff", "namespace": "payments", "kind_of_object": "Pod",
+            "name": "payments-api-64d8988cb7-r76jr", "message": self.CRASH, "type": "Warning",
+            "cluster": self.CLUSTER,
+        }
+        with patch.dict(os.environ, {"SESSION_KV_API_KEY": API_KEY}):
+            resp = TestClient(session_kv_server.app, headers=AUTH_HEADERS).post(
+                "/sessions/k8s-evt-crash/inject",
+                json={"message": json.dumps(payload)},
+                headers={"X-Watcher-Features": "policy-filtered"},
+            )
+        self.assertEqual(resp.json()["status"], "injected")
+        self.assertIn("Digging down to the root cause", trigger.call_args.args[1])
+        self.assertEqual(trigger.call_args.kwargs, {
+            "slack_alert_msg": "🚨 **payments-api in seeded-debug keeps crashing.** Looking now.",
+            "alert_title": "payments-api crashloop in seeded-debug",
+        })
+
+
+class TestSlackIncidentAlertDelivery(unittest.TestCase):
+    """The Slack text goes to Slack only, and the title is recorded only for a Slack thread."""
+
+    def setUp(self):
+        patcher = patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat", "slack"])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in ("_register_session_routing", "_record_alert_title", "_create_gateway_session",
+                     "_start_agent_turn", "mark_delivery_failed"):
+            p = patch.object(session_kv_server, name)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _run(self, post):
+        with patch.object(session_kv_server, "_post_initial_alert", side_effect=post) as alert:
+            session_kv_server.trigger_agent_troubleshooter(
+                "s1", "alert", {}, 7, slack_alert_msg="slack alert", alert_title="the title")
+        return alert
+
+    def test_a_slack_thread_gets_the_slack_text_and_the_title(self):
+        alert = self._run(lambda platform, _msg: None if platform == "google_chat" else "1712345678.000100")
+        self.assertEqual([c.args for c in alert.call_args_list],
+                         [("google_chat", "alert"), ("slack", "slack alert")])
+        session_kv_server._record_alert_title.assert_called_once_with("s1", "the title")
+
+    def test_the_title_is_recorded_before_the_turn_starts(self):
+        session_kv_server._start_agent_turn.side_effect = (
+            lambda *_args: session_kv_server._record_alert_title.assert_called_once_with("s1", "the title"))
+        self._run(lambda platform, _msg: None if platform == "google_chat" else "1712345678.000100")
+        session_kv_server._start_agent_turn.assert_called_once()
+
+    def test_a_google_chat_thread_gets_neither(self):
+        alert = self._run(lambda _platform, _msg: "spaces/AAA/threads/T1")
+        self.assertEqual([c.args for c in alert.call_args_list], [("google_chat", "alert")])
+        session_kv_server._record_alert_title.assert_not_called()
+
+
+class TestAlertTitleRecord(unittest.TestCase):
+    def setUp(self):
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            conn.execute("DELETE FROM session_metadata")
+            conn.execute(
+                "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                ("k8s-evt-t1", json.dumps({"platform": "slack", "thread_id": "1.0"})),
+            )
+
+    def test_the_title_joins_the_routing_row(self):
+        import sqlite3
+
+        session_kv_server._record_alert_title("k8s-evt-t1", "payments-api crashloop in seeded-debug")
+        with sqlite3.connect(temp_db_path) as conn:
+            meta = json.loads(conn.execute(
+                "SELECT metadata FROM session_metadata WHERE session_id = ?", ("k8s-evt-t1",)
+            ).fetchone()[0])
+        self.assertEqual(meta, {
+            "platform": "slack", "thread_id": "1.0", "title": "payments-api crashloop in seeded-debug",
+        })
+
+    def test_a_missing_row_is_not_an_error(self):
+        session_kv_server._record_alert_title("k8s-evt-none", "x")
+
+    def test_the_gateway_reads_the_title_recorded(self):
+        import importlib.util
+        import sqlite3
+
+        patches = Path(__file__).resolve().parents[3] / "deploy" / "docker" / "patches"
+        spec = importlib.util.spec_from_file_location("slack_ux_incident_reader", patches / "slack_ux_incident.py")
+        reader = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(reader)
+        with sqlite3.connect(temp_db_path) as conn:
+            conn.execute(
+                "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                ("k8s-evt-t2", json.dumps({"platform": "slack", "chat_id": "C1", "thread_id": "2.0"})),
+            )
+        session_kv_server._record_alert_title("k8s-evt-t2", "payments-api crashloop in seeded-debug")
+        self.assertEqual(reader.alert_title("C1", "2.0", temp_db_path), "payments-api crashloop in seeded-debug")
+
+
 class TestSessionKvServerAuth(unittest.TestCase):
     """The auth boundary, route by route.
 

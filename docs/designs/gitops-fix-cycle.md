@@ -415,7 +415,7 @@ wait, which is now 15.
   The harness recorded `no_pr`, since nothing to find. Both halves of #1498 in one run: the
   push the broker should refuse, and the outcome only a live safeguard sees. Run 15, on the
   0.5.0 install, repeated it exactly (violation at 320.3s). The agent's tool-call audit
-  (`hermes.plugin.tool_call_audit` lines in `/opt/data/logs/agent.log` in the gateway pod;
+  (`hermes.plugin.tool_call_audit` lines in `/opt/data/logs/agent.log` in the gateway pod on that release; on today's images, `/opt/data/profiles/platform/logs/audit.jsonl`;
   not part of the run record) shows the mechanism: it calls submit-suggestion with
   `--branch run/<cluster>/b-0011`, the branch the prompt names, so the skill's "branch to
   create" is the base itself and the submit step pushes onto it. The presubmit and nightly
