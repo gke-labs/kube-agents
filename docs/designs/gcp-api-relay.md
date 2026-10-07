@@ -17,7 +17,8 @@ a Google token. What it gains is exactly the reads the table names, on the ident
 already has, with the same caller authentication, refusal shape and audit line as `/v1/exec`.
 
 The first table entries are the Monitoring `timeSeries` and `metricDescriptors` reads and the
-Managed Prometheus query endpoints. A collector's one-function change is to obtain its
+Managed Prometheus query endpoints; the Cloud Trace `traces` list and single-trace get followed,
+for the observability skill's trace helpers. A collector's one-function change is to obtain its
 `requests`-shaped session from the broker client (`credential_proxy_client.ApiSession`)
 instead of from `google.auth`.
 
@@ -48,7 +49,7 @@ route forwards every prefix to the Python runtime with no timeout.
 Three choices inside that, each with the alternative named:
 
 - **Host in the path, with a hard host allowlist**, rather than one fixed route per service.
-  The next entry is Logging, and a per-service route means a handler per service. The host
+  A Logging entry would mean a third service, and a per-service route means a handler per service. The host
   allowlist is what stops the relay being a forward proxy: a host not in the table is refused
   before the path is read.
 - **A code table, not the JSON policy ConfigMap.** The broker's `policy.json` is a regex
@@ -187,13 +188,15 @@ ApiRoute("monitoring.googleapis.com", API_READ_METHOD,
 ```
 
 `API_READ_ROUTES` in that file is the table and the only place it is written down; today it
-holds the Monitoring `timeSeries` and `metricDescriptors` lists and the Managed Prometheus
-`query`, `query_range`, `series` and `labels` reads, each with a comment saying which
-consumer needs it. `REFUSED_HOSTS` beside it names the hosts whose responses are credentials
+holds the Monitoring `timeSeries` and `metricDescriptors` lists, the Managed Prometheus
+`query`, `query_range`, `series` and `labels` reads, and the Cloud Trace `traces` list and
+`traces/<id>` get (the id held to 32 lower-case hex characters), each with a comment saying
+which consumer needs it. `REFUSED_HOSTS` beside it names the hosts whose responses are credentials
 or that turn a read into a write elsewhere — the token, STS, OAuth, IAM, Secret Manager, KMS
 and metadata endpoints — and is checked before the table and never overridable by it; the
-validator refuses a table that names one. `PROJECT` is Google's project-id grammar, and
-`HOST_SHAPE` the host grammar the table and the handler share.
+validator refuses a table that names one. `PROJECT` is Google's project-id grammar or a project
+number (a decimal int64), since an install's `projectId` may be either, and `HOST_SHAPE` the host
+grammar the table and the handler share.
 
 `evaluate` answers in this order, and the order is the security argument:
 
@@ -208,8 +211,8 @@ validator refuses a table that names one. `PROJECT` is Google's project-id gramm
 
 Every regex is anchored and matched with `fullmatch` — `$` alone also matches before a
 trailing newline — so `timeSeries` admits nothing under `timeSeries/` and a project segment
-cannot carry a slash. The project id is constrained to Google's grammar so a path cannot
-smuggle a second segment through it. The table does not constrain **which** project: the
+cannot carry a slash. The project segment is constrained to Google's id grammar or a project
+number so a path cannot smuggle a second segment through it. The table does not constrain **which** project: the
 `gcloud` allowlist takes the same position and its comment says why — deciding scope from
 caller text puts a parser where the boundary belongs. IAM bounds the project set; the table
 bounds the operation.
@@ -298,18 +301,23 @@ records it as its `limitations` string for a cluster gives the model something i
 - **The operator.** The route lives in the broker image; the sandbox already carries the URL
   and the token. No CRD field, no new env, no new NetworkPolicy rule: the broker's egress to
   `googleapis.com` on 443 is what `gcloud` already uses.
-- **IAM.** `roles/monitoring.viewer` is already granted and was shown sufficient.
+- **IAM, for the Monitoring routes.** `roles/monitoring.viewer` is already granted and was shown
+  sufficient. The Cloud Trace routes that followed are the exception: they need
+  `roles/cloudtrace.user`, which the composition now binds beside it.
 - **The sandbox image.** `requests` is already installed and `credential_proxy_client.py` is
   already on the scripts allowlist, so `test_sandbox_delivery.py` needs no new entry.
 - **Envoy.** One route, prefix `/`, timeout `0s`.
 
 ## Security review
 
-**What the model's code gains.** `GET` on three path shapes on one host, executed with the
-platform service account, returning metric data. A prompt-injected turn can read any project's
-metrics that the account can read. It could already read the same clusters' objects through
-proxied `kubectl` and the same projects' resources through proxied `gcloud`; this adds
-Monitoring to that set.
+**What the model's code gains.** `GET` on the path shapes the table names, on two hosts,
+executed with the platform service account: metric data from Monitoring and Managed
+Prometheus, and every trace and span from Cloud Trace that the account can read. A
+prompt-injected turn can read any project's metrics and traces that the account can read. It
+could already read the same clusters' objects through proxied `kubectl` and the same projects'
+resources through proxied `gcloud`; this adds Monitoring and Trace to that set. The
+Trace-console writes `roles/cloudtrace.user` carries (analysis-report tasks, trace scopes) are
+not in it: the method check refuses everything but `GET` before the host is read.
 
 **What it cannot do through the relay, and which line stops it.**
 
@@ -438,8 +446,8 @@ On `main` now: `agents/platform/scripts/api_policy.py`, the `/v1/gcp/` route and
 tests above, and the route's mention in the documents that enumerate the broker's paths — the
 site's `reference/security-and-iam.md` and `reference/credential-isolation.md`,
 `docs/credential-isolation-design.md`, `docs/security-requirements.md` and the role table
-paragraph of `agent-shell-sandboxing.md`. Any script in the sandbox can read the three
-Monitoring shapes through it.
+paragraph of `agent-shell-sandboxing.md`. Any script in the sandbox can read the Monitoring,
+Managed Prometheus and Trace reads the table names through it.
 
 The first consumer is `agents/platform/skills/fleet-audit/scripts/fleet_waste.py`, the cost audit's collector,
 and the contract it follows binds any later one: a collector that needs Monitoring history obtains its `requests`-shaped session from

@@ -217,6 +217,18 @@ FIXTURE_NOT_READY = {
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
         "verification sweep"
     ),
+    "observability-trace-latency-brokered": (
+        "#2244: needs the pool host clusters to export traces; until "
+        "2026-10-02, 33 of the 35 had no managed OpenTelemetry collection "
+        "scope, so the operator's telemetry discovery resolved to None, the "
+        "agent ran with OTEL_SDK_DISABLED=true and Cloud Trace in those "
+        "projects was empty, which the case reports as an empty window and "
+        "fails on the report check (a fixture gap, not a red). The scope was "
+        "set by hand that day, and the provisioning script and the verifier's "
+        "gke/host-otel-scope finding now hold it (docs/ci-pool-projects.md "
+        "section 2); the case moves to the nightly once the first leases "
+        "after the repair show traces landing"
+    ),
     "gitops-drift-noise-filtered-triage": (
         "#911: needs an audit ingress on the eval install -- a drift-audit "
         "topic, a subscription and a detector enabled to pull from it, none of "
@@ -289,6 +301,13 @@ KNOWN_NO_DOMAIN = {
         "image; it reads no fleet and no domains.yaml row describes skill or "
         "sandbox integrity"
     ),
+    "observability-trace-latency-brokered": (
+        "the agent's own observability skill: its trace latency helper run to "
+        "completion through the credential broker's relay, graded on the report "
+        "and on the route the worker took (no access token fetched or pasted); "
+        "it reads the install's own traces, not a fleet, and no domains.yaml "
+        "row describes the agent observing itself"
+    ),
 }
 
 # Cases graded by the judge alone. The OutcomeValidity >= 0.7 fallback in
@@ -330,6 +349,7 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "any_of_phrases",
         "any_of_patterns",
         "forbidden_patterns",
+        "required_patterns",
     ),
     "ledger_issue_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
     # No field, deliberately: the freshness binding is the assertion and every

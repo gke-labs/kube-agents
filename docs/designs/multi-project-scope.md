@@ -399,7 +399,7 @@ follow the selector type:
 `scope_roles` is a fixed allowlist of read roles intersected with `project_roles`, never
 `project_roles` itself, and it is what every grant outside the host project carries, whether the
 project was named or reached through a container. The allowlist is `container.clusterViewer`,
-`container.viewer`, `compute.viewer`, `monitoring.viewer`, `logging.viewer`, and
+`container.viewer`, `compute.viewer`, `monitoring.viewer`, `logging.viewer` and
 `iam.securityReviewer`: the read roles in the list the composition binds, `local.read_only_roles`
 in `terraform/examples/full-install/main.tf`, which the module default (`variable "project_roles"`
 in `terraform/modules/kube-agents-iam/variables.tf`) mirrors. The intersection matters on the
@@ -415,7 +415,14 @@ plan when `scope.projects`, `scope.folders`, `scope.organizations`, `scope.share
 but cannot get, so a project bound with it alone would read `ok` and fail every profile create.
 
 The default roles outside the allowlist are outside it by design, and so is any role a later
-change adds to the default list that is not a read role. `roles/iam.serviceAccountUser` is
+change adds to the default list that is not a read role. `roles/cloudtrace.user` is the case in
+point: Google's Trace User role carries create, delete and update on analysis-report tasks and
+trace scopes beside `traces.get` and `traces.list`, no predefined Trace role grants the two reads
+alone, and the observability helpers that need the reads look at the host project's own traces
+through the broker's `GET`-only relay, so the role is bound at home and nowhere else (a token minted
+on the annotated ServiceAccount itself, which the gateway Pod and an `AgentPlugin` can do, carries
+its console permissions in the host project with every other role on the identity).
+`roles/iam.serviceAccountUser` is
 `iam.serviceAccounts.actAs`, held so the agent can run jobs as service accounts in its own project;
 inherited across a folder it would let the one agent identity act as every service account in every
 project beneath, including ones created tomorrow. `roles/mcp.toolUser` lets the agent call the GKE
@@ -565,8 +572,8 @@ The architecture documents move from "its one project" to "its declared scope":
 
 What does not change: read-only stays read-only. Every grant outside the host project carries the
 `scope_roles` allowlist of §6 and nothing else; the non-viewer roles in `project_roles`
-(`iam.serviceAccountUser`, `mcp.toolUser`, and whatever a `custom` set adds) stay in the host
-project, and nothing here grants a write anywhere. What does change is how much one credential can
+(`iam.serviceAccountUser`, `mcp.toolUser`, `cloudtrace.user`, and whatever a `custom` set adds)
+stay in the host project, and nothing here grants a write anywhere. What does change is how much one credential can
 read. The
 agent's service account carries `roles/container.viewer`, which "lets an identity read Kubernetes
 objects in every cluster in the project" (`kube-agents-iam/main.tf:30-31`); bound on a folder it
