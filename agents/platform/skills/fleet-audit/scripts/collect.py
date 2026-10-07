@@ -685,8 +685,8 @@ DUMP_COMMAND_KINDS = (
     # volume and no credential of any kind; a claim is a request for storage,
     # not the storage.
     ",persistentvolumeclaims"
-    # `namespaces` serves 3.24 (untargeted-compute-class-workload).
-    ",namespaces"
+    # `namespaces,nodes` serve 3.24 (untargeted-compute-class-workload).
+    ",namespaces,nodes"
 )
 
 # How long a CronJob must have been firing without a success before 3.12 calls
@@ -1435,6 +1435,7 @@ def build_context(dump: dict, workloads: list[dict]) -> dict:
         "workload_keys": workload_keys(dump),
         "compute_classes": [i for i in (dump.get("items") or []) if i.get("kind") == "ComputeClass"],
         "namespaces": [i for i in (dump.get("items") or []) if i.get("kind") == "Namespace"],
+        "nodes": [i for i in (dump.get("items") or []) if i.get("kind") == "Node"],
     }
 
 
@@ -3722,6 +3723,14 @@ _CONTROLLER_NODE_TAINT_KEYS = {
 
 _AUDITABLE_NODE_POOL_STATUSES = frozenset({"RUNNING", "RUNNING_WITH_ERROR", "RECONCILING"})
 
+_GKE_MANAGED_TAINT_KEYS = frozenset({
+    "nvidia.com/gpu",
+    "google.com/tpu",
+    "kubernetes.io/arch",
+    "sandbox.gke.io/runtime",
+    "node.kubernetes.io/os",
+})
+
 
 def _normalize_taint_effect(effect: str | None) -> str:
     return (effect or "").upper().replace("_", "")
@@ -3733,7 +3742,7 @@ def _pool_has_workload_taints(pool: dict) -> bool:
         effect = _normalize_taint_effect(t.get("effect"))
         if effect in ("NOSCHEDULE", "NOEXECUTE"):
             key = t.get("key", "")
-            if key not in _CONTROLLER_NODE_TAINT_KEYS:
+            if key not in _CONTROLLER_NODE_TAINT_KEYS and key not in _GKE_MANAGED_TAINT_KEYS:
                 return True
     return False
 
@@ -3779,7 +3788,12 @@ def _is_untainted_gp_compute_class(
 
     spec = cc.get("spec") or {}
     taints = (spec.get("nodePoolConfig") or {}).get("taints") or []
-    if any((t.get("effect") or "").upper().replace("_", "") in ("NOSCHEDULE", "NOEXECUTE") for t in taints):
+    if any(
+        _normalize_taint_effect(t.get("effect")) in ("NOSCHEDULE", "NOEXECUTE")
+        and t.get("key") not in _CONTROLLER_NODE_TAINT_KEYS
+        and t.get("key") not in _GKE_MANAGED_TAINT_KEYS
+        for t in taints
+    ):
         return False
 
     for prio in spec.get("priorities") or []:
@@ -3847,6 +3861,13 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
     if not node_pools:
         return None
 
+    nodes = context.get("nodes") or []
+    live_nodes_by_pool: dict[str, int] = {}
+    for n in nodes:
+        pool_name = (n.get("metadata", {}).get("labels") or {}).get("cloud.google.com/gke-nodepool") or ""
+        if pool_name:
+            live_nodes_by_pool[pool_name] = live_nodes_by_pool.get(pool_name, 0) + 1
+
     def _pool_is_active_capacity(p: dict) -> bool:
         status = p.get("status")
         if status not in _AUDITABLE_NODE_POOL_STATUSES:
@@ -3854,6 +3875,10 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
         autoscaling = p.get("autoscaling")
         if autoscaling and autoscaling.get("enabled"):
             return True
+        if "nodes" in context:
+            return live_nodes_by_pool.get(p.get("name", ""), 0) > 0
+        if "currentNodeCount" in p:
+            return p["currentNodeCount"] > 0
         if "initialNodeCount" in p:
             return p["initialNodeCount"] > 0
         return False
@@ -3871,7 +3896,40 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
         if _pool_is_active_capacity(p)
         and not ((p.get("config") or {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL)
     ]
-    pod_tolerations = template.get("tolerations") or []
+    pod_tolerations = list(template.get("tolerations") or [])
+    # Admission-injected tolerations for GKE-managed taints:
+    sel_arch = node_selector.get("kubernetes.io/arch") or node_selector.get("beta.kubernetes.io/arch")
+    if sel_arch == "arm64":
+        pod_tolerations.append({"key": "kubernetes.io/arch", "value": "arm64", "operator": "Equal"})
+    sel_os = node_selector.get("kubernetes.io/os") or node_selector.get("beta.kubernetes.io/os")
+    if sel_os == "windows":
+        pod_tolerations.append({"key": "node.kubernetes.io/os", "value": "windows", "operator": "Equal"})
+    if template.get("runtimeClassName") == "gvisor":
+        pod_tolerations.append({"key": "sandbox.gke.io/runtime", "value": "gvisor", "operator": "Equal"})
+    containers = list(template.get("containers") or []) + list(template.get("initContainers") or [])
+    has_gpu_request = False
+    has_tpu_request = False
+    for c in containers:
+        res = c.get("resources") or {}
+        reqs = res.get("requests") or {}
+        limits = res.get("limits") or {}
+        if "nvidia.com/gpu" in reqs or "nvidia.com/gpu" in limits:
+            pod_tolerations.append({"key": "nvidia.com/gpu", "operator": "Exists"})
+            has_gpu_request = True
+        if "google.com/tpu" in reqs or "google.com/tpu" in limits:
+            pod_tolerations.append({"key": "google.com/tpu", "operator": "Exists"})
+            has_tpu_request = True
+    required_terms = (node_affinity.get("requiredDuringSchedulingIgnoredDuringExecution") or {}).get("nodeSelectorTerms") or []
+    for term in required_terms:
+        for expr in term.get("matchExpressions") or []:
+            k = expr.get("key")
+            op = expr.get("operator")
+            vals = set(expr.get("values") or [])
+            if op == "In":
+                if k in ("kubernetes.io/arch", "beta.kubernetes.io/arch") and "arm64" in vals:
+                    pod_tolerations.append({"key": "kubernetes.io/arch", "value": "arm64", "operator": "Equal"})
+                if k in ("node.kubernetes.io/os", "beta.kubernetes.io/os") and "windows" in vals:
+                    pod_tolerations.append({"key": "node.kubernetes.io/os", "value": "windows", "operator": "Equal"})
 
     def _tolerates_taint(tolerations: list[dict], taint: dict) -> bool:
         for tol in tolerations:
@@ -3910,8 +3968,14 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
         "cloud.google.com/gke-preemptible",
         "cloud.google.com/machine-family",
         "node.kubernetes.io/instance-type",
+        "beta.kubernetes.io/instance-type",
         "kubernetes.io/os",
+        "beta.kubernetes.io/os",
         "kubernetes.io/arch",
+        "beta.kubernetes.io/arch",
+        "topology.kubernetes.io/zone",
+        "topology.gke.io/zone",
+        "failure-domain.beta.kubernetes.io/zone",
     })
 
     known_pool_label_keys = set(_GKE_KNOWN_POOL_LABEL_KEYS)
@@ -3938,17 +4002,22 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
         machine_type = config.get("machineType") or ""
         if machine_type:
             labels["node.kubernetes.io/instance-type"] = machine_type
+            labels["beta.kubernetes.io/instance-type"] = machine_type
             family = machine_type.split("-")[0].lower()
             labels["cloud.google.com/machine-family"] = family
-            if family in ("t2a", "c4a", "n4a") or "arm" in family:
+            if family in ("t2a", "c4a", "n4a", "a4x") or "arm" in family:
                 labels["kubernetes.io/arch"] = "arm64"
+                labels["beta.kubernetes.io/arch"] = "arm64"
             else:
                 labels["kubernetes.io/arch"] = "amd64"
+                labels["beta.kubernetes.io/arch"] = "amd64"
         image_type = (config.get("imageType") or "").upper()
         if image_type.startswith("WINDOWS"):
             labels["kubernetes.io/os"] = "windows"
+            labels["beta.kubernetes.io/os"] = "windows"
         elif image_type or "imageType" in config or not config.get("operatingSystem"):
             labels["kubernetes.io/os"] = "linux"
+            labels["beta.kubernetes.io/os"] = "linux"
         return labels
 
     def _pool_matches_selector(pool: dict, selector: dict[str, str]) -> bool | None:
@@ -3960,7 +4029,7 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
             if k in effective_labels:
                 if effective_labels[k] != v:
                     return False
-            elif k in ("topology.kubernetes.io/zone", "topology.gke.io/zone"):
+            elif k in ("topology.kubernetes.io/zone", "topology.gke.io/zone", "failure-domain.beta.kubernetes.io/zone"):
                 locations = pool.get("locations") or []
                 if locations:
                     if v not in locations:
@@ -3983,6 +4052,13 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
         term_results: list[bool | None] = []
         for term in terms:
             exprs = term.get("matchExpressions") or []
+            match_fields = term.get("matchFields") or []
+            if not exprs and not match_fields:
+                term_results.append(False)
+                continue
+            if match_fields:
+                term_results.append(None)
+                continue
             term_match = True
             term_unknown = False
             for expr in exprs:
@@ -3995,7 +4071,7 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
                         if pool_val not in vals:
                             term_match = False
                             break
-                    elif k in ("topology.kubernetes.io/zone", "topology.gke.io/zone"):
+                    elif k in ("topology.kubernetes.io/zone", "topology.gke.io/zone", "failure-domain.beta.kubernetes.io/zone"):
                         if locations and not any(loc in vals for loc in locations):
                             term_match = False
                             break
@@ -4011,7 +4087,7 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
                         if pool_val in vals:
                             term_match = False
                             break
-                    elif k in ("topology.kubernetes.io/zone", "topology.gke.io/zone"):
+                    elif k in ("topology.kubernetes.io/zone", "topology.gke.io/zone", "failure-domain.beta.kubernetes.io/zone"):
                         if locations and all(loc in vals for loc in locations):
                             term_match = False
                             break
@@ -4027,6 +4103,9 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
                     if k in effective_labels:
                         term_match = False
                         break
+                else:
+                    # Gt, Lt, or unsupported operators
+                    term_unknown = True
             if not term_match:
                 term_results.append(False)
             elif term_unknown:
@@ -4040,6 +4119,11 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
         return False
 
     def _pool_matches_placement(pool: dict) -> bool | None:
+        if has_gpu_request or has_tpu_request:
+            config = pool.get("config") or {}
+            accelerators = config.get("accelerators") or []
+            if not accelerators:
+                return False
         sel_match = _pool_matches_selector(pool, node_selector)
         if sel_match is False:
             return False
