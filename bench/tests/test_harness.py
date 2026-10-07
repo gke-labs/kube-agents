@@ -3497,10 +3497,10 @@ def test_a_status_turn_502_with_rate_limit_on_answer_turn_is_an_agent_error_not_
     """A status turn rate_limit on an answer turn remains an agent error, not infra.
 
     When a card-wake answer turn dispatches work and a status poll answers 502
-    carrying X-Hermes-Failure-Reason: rate_limit, _await_delegated_work raises
-    _DelegationTransportExhausted. On opening_turn=False, _execute converts
-    this into an errored result without INFRA_FAILURE_MARKER, preserving the
-    wake turn reply and grading.
+    carrying X-Hermes-Failure-Reason: rate_limit, _await_delegated_work breaks
+    to _settle without raising _DelegationTransportExhausted or purging early.
+    This preserves the answer turn's trajectory, cards, and tokens while
+    keeping the wake turn reply graded without INFRA_FAILURE_MARKER.
     """
     scripts: list[str] = []
     monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
@@ -3517,6 +3517,8 @@ def test_a_status_turn_502_with_rate_limit_on_answer_turn_is_an_agent_error_not_
     assert len(stub_agent.requests) == 3
     assert result.output == _FINAL_TEXT
     assert _archived(scripts)
+    # Settle ran before purging: the answer turn trajectory is preserved
+    assert any(entry.get("name") == "kanban_create" for entry in result.trajectory)
 
 
 def test_a_status_turn_bare_transport_exhaustion_on_answer_turn_is_infra(

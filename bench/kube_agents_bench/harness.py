@@ -1639,15 +1639,6 @@ class KubeAgentsHarness(AgentHarness):
                     or session_id
                 )
             except _DelegationTransportExhausted as exc:
-                # When a status turn inside an answer turn hit an infrastructure
-                # failure reason (e.g. rate limit or billing), the turn executed
-                # and the wake reply must be preserved as an errored answer turn
-                # rather than classified as infrastructure. Bare transport
-                # exhaustion (consecutive 502/503/504s, connection drops, or 429s)
-                # dies in transport without reaching the agent and remains
-                # infrastructure on both opening and answer turns.
-                if not opening_turn and exc.failure_reason in ("rate_limit", "billing"):
-                    return AgentResult.errored(str(exc))
                 return _infra_failure(str(exc))
 
         # GitOps cases (GITOPS_RUN_BRANCH set): the agent's answer is a pull
@@ -2408,6 +2399,14 @@ class KubeAgentsHarness(AgentHarness):
                 status_turn, turn_session = turn(poll, min(timeout, remaining))
             except _TransportError as exc:
                 if exc.failure_reason in ("rate_limit", "billing"):
+                    if not opening_turn:
+                        result.errors.append(
+                            f"status turn hit infrastructure failure ({exc.failure_reason}): {exc}; "
+                            "still waiting on: " + ", ".join(outstanding) + "; "
+                            f"tunnel log: {_tail(_pf_log_path(local_port))}"
+                        )
+                        timed_out = False
+                        break
                     _purge_card_state(awaited, _EXEC_TIMEOUT)
                     raise _DelegationTransportExhausted(
                         f"status turn hit infrastructure failure ({exc.failure_reason}): {exc}",
