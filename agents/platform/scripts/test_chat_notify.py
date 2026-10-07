@@ -196,3 +196,78 @@ class OtherCallersTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+SLACK_ROUTED = {chat_notify.NOTIFY_PLATFORM_ENV: "slack"}
+
+
+class SlackRouteTest(unittest.TestCase):
+    """Slack's half: the same switch, a ts for a thread, and Block Kit through the gateway."""
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("SESSION_KV_DB_PATH", os.path.join(tempfile.mkdtemp(), "sessions.db"))
+        import session_kv_server  # noqa: F401
+        cls.skv = sys.modules["session_kv_server"]
+
+    def test_a_slack_target_goes_through_the_gateway_with_its_ts(self):
+        with mock.patch.dict(os.environ, SLACK_ROUTED):
+            argv = chat_notify.command("slack:C0HOME:1700000000.000100", "drift on prod")
+        self.assertEqual(argv, ["a2a", "notify", "--platform", "slack", "--thread", "1700000000.000100", "--", "drift on prod"])
+
+    def test_slack_threads_come_from_the_answer_or_the_ts(self):
+        self.assertEqual(chat_notify.thread_from_response("slack", {"message_id": "2.2", "thread_id": "1.1"}), "1.1")
+        # The Hermes path names only the message; on Slack its ts is the root.
+        self.assertEqual(chat_notify.thread_from_response("slack", {"message_id": "2.2"}), "2.2")
+
+    def test_blocks_command(self):
+        self.assertEqual(
+            chat_notify.blocks_command("slack", "1.1", "3 findings", "/tmp/b.json"),
+            ["a2a", "notify", "--platform", "slack", "--blocks-file", "/tmp/b.json", "--thread", "1.1", "--", "3 findings"],
+        )
+        self.assertNotIn("--thread", chat_notify.blocks_command("slack", "", "x", "/tmp/b.json"))
+
+    def _gateway_post(self, returncode, stdout, thread=""):
+        seen = {}
+
+        def run(argv, **_kwargs):
+            path = argv[argv.index("--blocks-file") + 1]
+            with open(path, encoding="utf-8") as handle:
+                seen["blocks"] = json.load(handle)
+            seen["path"], seen["argv"] = path, argv
+            return subprocess.CompletedProcess(args=argv, returncode=returncode, stdout=stdout, stderr="refused")
+
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": "*3 findings*"}}]
+        with mock.patch.object(self.skv.subprocess, "run", side_effect=run):
+            post = self.skv._post_audit_blocks_via_gateway("platform", "fleet-audit", blocks, "3 findings", thread, 30)
+        return post, seen, blocks
+
+    def test_audit_blocks_go_through_the_gateway_and_thread_on_its_answer(self):
+        post, seen, blocks = self._gateway_post(0, json.dumps({"message_id": "1.5", "thread_id": "1.5"}))
+        self.assertEqual(post, self.skv.AuditPost("1.5"))
+        self.assertEqual(seen["blocks"], blocks)
+        self.assertEqual(seen["argv"][:4], ["a2a", "notify", "--platform", "slack"])
+        self.assertFalse(os.path.exists(seen["path"]), "the blocks file was left behind")
+
+    def test_audit_blocks_reply_on_a_known_thread(self):
+        post, seen, _ = self._gateway_post(0, json.dumps({"message_id": "1.6", "thread_id": "1.1"}), thread="1.1")
+        self.assertEqual(post, self.skv.AuditPost("1.1"))
+        self.assertIn("--thread", seen["argv"])
+
+    def test_audit_blocks_fall_back_to_text_on_a_refusal_or_an_unknown_outcome(self):
+        for code in (1, chat_notify.NOTIFY_OUTCOME_UNKNOWN):
+            post, seen, _ = self._gateway_post(code, "")
+            self.assertIsNone(post, f"exit {code}")
+            self.assertFalse(os.path.exists(seen["path"]))
+
+    def test_the_audit_report_takes_the_gateway_when_slack_is_routed(self):
+        # No broker relay under next (slack_blocks_post is not configured),
+        # so without the routed check the report would never try blocks.
+        headline = self.skv.AuditHeadline(text="3 findings", issue={"number": 1}, ref=None)
+        with mock.patch.dict(os.environ, SLACK_ROUTED), \
+                mock.patch.object(self.skv.slack_blocks_post, "configured", return_value=False), \
+                mock.patch.object(self.skv.slack_audit_report, "blocks_from_issue", return_value=([{"type": "divider"}], "t")), \
+                mock.patch.object(self.skv, "_post_audit_blocks_via_gateway", return_value=self.skv.AuditPost("9.9")) as via:
+            post = self.skv._post_audit_blocks("platform", "fleet-audit", headline, "m", "", "", float("inf"))
+        self.assertEqual(post, self.skv.AuditPost("9.9"))
+        via.assert_called_once()

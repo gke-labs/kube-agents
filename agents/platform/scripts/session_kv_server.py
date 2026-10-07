@@ -9,6 +9,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import tempfile
 import sys
 import time
 import urllib.error
@@ -2965,7 +2966,8 @@ def _post_audit_blocks(
     missing report. An ok answer with no ts posted:
     ``thread_id`` is then empty and the caller counts the leg as delivered.
     """
-    if headline.issue is None or not slack_blocks_post.configured():
+    routed = chat_notify.routes(SLACK_PLATFORM)
+    if headline.issue is None or not (routed or slack_blocks_post.configured()):
         return None
     threaded = bool(chat_id and thread_id)
     built = slack_audit_report.blocks_from_issue(headline.issue, headline.ref, message)
@@ -2976,6 +2978,10 @@ def _post_audit_blocks(
     if left < AUDIT_BLOCKS_MIN_POST_S:
         logger.warning(f"Relay for {profile}/{job_id}: no time left for the report blocks, posting text")
         return None
+    if routed:
+        return _post_audit_blocks_via_gateway(
+            profile, job_id, blocks, text, thread_id if threaded else "", min(AUDIT_BLOCKS_POST_TIMEOUT_S, left)
+        )
     try:
         ts = slack_blocks_post.post(
             chat_id or _slack_home_channel(),
@@ -2994,6 +3000,54 @@ def _post_audit_blocks(
         logger.warning(f"Relay for {profile}/{job_id}: report blocks may have posted, posting text: {exc!r}")
         return None
     return AuditPost(thread_id if threaded else ts)
+
+
+def _post_audit_blocks_via_gateway(
+    profile: str, job_id: str, blocks: list[dict], text: str, thread_id: str, timeout: float
+) -> AuditPost | None:
+    """Post the audit report's blocks through the gateway's Slack chat.notify route.
+
+    The next-stack half of :func:`_post_audit_blocks`: under ``spec.mode: next``
+    the broker's Slack relay is gone and the gateway holds Slack, so the blocks
+    go as ``a2a notify --blocks-file`` into the home channel (chat_notify.py).
+    Same outcomes as the relay path: None, to post text instead, after a
+    refusal, a failure to send, or a post that may have landed.
+    """
+    path = ""
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(blocks, handle)
+            path = handle.name
+        res = subprocess.run(
+            chat_notify.blocks_command(SLACK_PLATFORM, thread_id, text, path),
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            env=_run_env(),
+            timeout=timeout,
+        )
+    except Exception as exc:
+        logger.warning(f"Relay for {profile}/{job_id}: report blocks may have posted, posting text: {exc!r}")
+        return None
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    if res.returncode != 0:
+        if chat_notify.outcome_unknown(res.returncode):
+            logger.warning(f"Relay for {profile}/{job_id}: report blocks may have posted, posting text: {res.stderr.strip()}")
+        else:
+            logger.warning(f"Relay for {profile}/{job_id}: report blocks not posted, posting text: {res.stderr.strip()}")
+        return None
+    try:
+        resp = json.loads(res.stdout) or {}
+    except ValueError:
+        resp = {}
+    if thread_id:
+        return AuditPost(thread_id)
+    return AuditPost(chat_notify.thread_from_response(SLACK_PLATFORM, resp if isinstance(resp, dict) else {}))
 
 
 def relay_cron_report(
