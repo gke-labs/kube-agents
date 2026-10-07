@@ -88,6 +88,23 @@ class ResourceNameTest(unittest.TestCase):
         self.assertEqual(sweep.resource_name(None), "")
 
 
+class ResourceRegionTest(unittest.TestCase):
+    def test_extract_from_gcp_url(self):
+        self.assertEqual(
+            sweep.resource_region("https://www.googleapis.com/compute/v1/projects/p/regions/us-west4/subnetworks/sub-1"),
+            "us-west4",
+        )
+        self.assertEqual(
+            sweep.resource_region("projects/p/regions/europe-west1/subnetworks/sub-2"),
+            "europe-west1",
+        )
+
+    def test_no_region_in_url_or_empty(self):
+        self.assertEqual(sweep.resource_region("https://www.googleapis.com/compute/v1/projects/p/global/networks/vpc-1"), "")
+        self.assertEqual(sweep.resource_region(""), "")
+        self.assertEqual(sweep.resource_region(None), "")
+
+
 class TimestampAgeTest(unittest.TestCase):
     def setUp(self):
         self.now = datetime(2026, 10, 7, 12, 0, 0, tzinfo=timezone.utc)
@@ -597,6 +614,68 @@ class SweepProjectTest(unittest.TestCase):
         self.assertIn("bench-addr-west", deleted_names)
         self.assertNotIn("bench-addr-east", deleted_names)
 
+    def test_address_with_subnetwork_url_without_region_field_derives_region_for_deletion(self):
+        """Proves an address lacking region key derives region from subnetwork URL and deletes regionally."""
+        commands_run = []
+
+        def mock_runner(cmd, capture_output=True, text=True, check=False):
+            commands_run.append(cmd)
+            if "list" in cmd:
+                if "networks" in cmd and "subnets" not in cmd:
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps([{
+                            "name": "bench-vpc-old",
+                            "description": self.plant_desc,
+                            "creationTimestamp": self.old_ts,
+                        }]),
+                        stderr="",
+                    )
+                if "subnets" in cmd:
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps([{
+                            "name": "bench-sub",
+                            "description": self.plant_desc,
+                            "creationTimestamp": self.old_ts,
+                            "network": "https://www.googleapis.com/compute/v1/projects/p/global/networks/bench-vpc-old",
+                            "region": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4",
+                        }]),
+                        stderr="",
+                    )
+                if "addresses" in cmd:
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps([
+                            # Matches selected subnet: region is in subnetwork URL, missing on address
+                            {
+                                "name": "bench-addr-no-region-key",
+                                "description": self.plant_desc,
+                                "creationTimestamp": self.recent_ts,
+                                "subnetwork": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4/subnetworks/bench-sub",
+                            },
+                            # Has subnetwork URL in a different region: must NOT match selected subnet
+                            {
+                                "name": "bench-addr-other-region",
+                                "description": self.plant_desc,
+                                "creationTimestamp": self.recent_ts,
+                                "subnetwork": "https://www.googleapis.com/compute/v1/projects/p/regions/us-east1/subnetworks/bench-sub",
+                            },
+                        ]),
+                        stderr="",
+                    )
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        res = sweep.sweep_project("my-project", max_age_hours=4.0, runner=mock_runner, now=self.now)
+        self.assertEqual(res["addresses"], ["bench-addr-no-region-key"])
+        self.assertEqual(res["subnets"], ["bench-sub"])
+        self.assertEqual(res["networks"], ["bench-vpc-old"])
+
+        delete_cmds = [cmd for cmd in commands_run if "delete" in cmd]
+        addr_del_cmd = next(cmd for cmd in delete_cmds if "bench-addr-no-region-key" in cmd)
+        self.assertIn("--region=us-west4", addr_del_cmd)
+        self.assertNotIn("--global", addr_del_cmd)
+
     def test_aged_plant_resources_under_non_plant_parent_are_deleted(self):
         """Proves that stamped subnets/addresses under non-plant parents (e.g. default VPC) are deleted by age."""
         commands_run = []
@@ -974,7 +1053,7 @@ class MainCliTest(unittest.TestCase):
         }
         # Default Boskos mocks so CLI tests don't make network requests
         patch_acquire = mock.patch.object(
-            sweep.boskos_pool, "acquire", side_effect=lambda server, owner, state, name=None: name or "p1"
+            sweep.boskos_pool, "acquire", side_effect=lambda server, owner, state, name=None: name or "proj-1"
         )
         patch_acquire.start()
         self.addCleanup(patch_acquire.stop)
@@ -996,7 +1075,7 @@ class MainCliTest(unittest.TestCase):
             mock.patch.object(sweep, "sweep_project", return_value={"addresses": [], "subnets": [], "networks": []}),
             mock.patch.object(sweep, "write_report") as mock_write,
         ):
-            code = sweep.main(["--project", "p1"])
+            code = sweep.main(["--project", "proj-1"])
             self.assertEqual(code, 0)
             mock_write.assert_called_once_with(None, mock.ANY, mock.ANY, 0, None, mock.ANY)
 
@@ -1005,7 +1084,7 @@ class MainCliTest(unittest.TestCase):
             mock.patch.object(sweep.signal, "signal") as mock_signal,
             mock.patch.object(sweep, "sweep_project", return_value={"addresses": [], "subnets": [], "networks": []}),
         ):
-            sweep.main(["--project", "p1"])
+            sweep.main(["--project", "proj-1"])
             installed = {call.args[0]: call.args[1] for call in mock_signal.call_args_list}
             for sig in sweep.boskos_pool.TERMINATION_SIGNALS:
                 self.assertIs(installed.get(sig), sweep.boskos_pool.terminate)
@@ -1017,21 +1096,21 @@ class MainCliTest(unittest.TestCase):
 
         try:
             with (
-                mock.patch.object(sweep, "pool_projects", return_value={"p1"}),
+                mock.patch.object(sweep, "pool_projects", return_value={"proj-1"}),
                 mock.patch.object(sweep, "boskos_reset_stranded"),
-                mock.patch.object(sweep.boskos_pool, "acquire", return_value="p1"),
+                mock.patch.object(sweep.boskos_pool, "acquire", return_value="proj-1"),
                 mock.patch.object(sweep.boskos_pool, "release_settled") as mock_release_settled,
                 mock.patch.object(sweep, "sweep_project", side_effect=sweep.Terminated("signal 15")),
             ):
                 code = sweep.main(["--pool", "--report", report_path])
                 self.assertEqual(code, sweep.TERMINATED_EXIT_CODE)
                 mock_release_settled.assert_called_once()
-                self.assertEqual(mock_release_settled.call_args[0][2], "p1")
+                self.assertEqual(mock_release_settled.call_args[0][2], "proj-1")
                 data = json.loads(pathlib.Path(report_path).read_text(encoding="utf-8"))
                 self.assertEqual(data["exit"], "terminated")
                 self.assertEqual(data["exit_code"], sweep.TERMINATED_EXIT_CODE)
                 self.assertEqual(data["ended_early"], "signal 15")
-                self.assertEqual(data["failures"]["p1"], "signal 15")
+                self.assertEqual(data["failures"]["proj-1"], "signal 15")
         finally:
             pathlib.Path(report_path).unlink(missing_ok=True)
 
@@ -1072,16 +1151,16 @@ class MainCliTest(unittest.TestCase):
 
         try:
             err = sweep.SweepError(
-                "p1: networks: net-1 (inUse)",
+                "proj-1: networks: net-1 (inUse)",
                 deleted={"addresses": ["addr-1"], "subnets": [], "networks": []},
             )
             with mock.patch.object(sweep, "sweep_project", side_effect=err):
-                code = sweep.main(["--project", "p1", "--report", report_path])
+                code = sweep.main(["--project", "proj-1", "--report", report_path])
                 self.assertEqual(code, 1)
                 data = json.loads(pathlib.Path(report_path).read_text(encoding="utf-8"))
                 self.assertEqual(data["exit"], "failed")
-                self.assertEqual(data["deleted"]["p1"]["addresses"], 1)
-                self.assertEqual(data["failures"]["p1"], str(err))
+                self.assertEqual(data["deleted"]["proj-1"]["addresses"], 1)
+                self.assertEqual(data["failures"]["proj-1"], str(err))
         finally:
             pathlib.Path(report_path).unlink(missing_ok=True)
 
@@ -1093,20 +1172,20 @@ class MainCliTest(unittest.TestCase):
             term = sweep.Terminated("signal 15")
             setattr(term, "deleted", {"addresses": ["addr-1"], "subnets": [], "networks": []})
             with mock.patch.object(sweep, "sweep_project", side_effect=term):
-                code = sweep.main(["--project", "p1", "--report", report_path])
+                code = sweep.main(["--project", "proj-1", "--report", report_path])
                 self.assertEqual(code, sweep.TERMINATED_EXIT_CODE)
                 data = json.loads(pathlib.Path(report_path).read_text(encoding="utf-8"))
                 self.assertEqual(data["exit"], "terminated")
-                self.assertEqual(data["deleted"]["p1"]["addresses"], 1)
-                self.assertEqual(data["failures"]["p1"], "signal 15")
+                self.assertEqual(data["deleted"]["proj-1"]["addresses"], 1)
+                self.assertEqual(data["failures"]["proj-1"], "signal 15")
         finally:
             pathlib.Path(report_path).unlink(missing_ok=True)
 
     def test_project_mode_invocation(self):
         with mock.patch.object(sweep, "sweep_project", return_value={"addresses": [], "subnets": [], "networks": []}) as mock_sp:
-            code = sweep.main(["--project", "p1", "--dry-run", "--max-age-hours", "2.5"])
+            code = sweep.main(["--project", "proj-1", "--dry-run", "--max-age-hours", "2.5"])
             self.assertEqual(code, 0)
-            mock_sp.assert_called_once_with("p1", max_age_hours=2.5, dry_run=True)
+            mock_sp.assert_called_once_with("proj-1", max_age_hours=2.5, dry_run=True)
 
     def test_project_mode_not_free_in_boskos_refuses(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as tf:
@@ -1117,27 +1196,27 @@ class MainCliTest(unittest.TestCase):
                 mock.patch.object(sweep.boskos_pool, "acquire", return_value=None),
                 mock.patch.object(sweep, "sweep_project") as mock_sp,
             ):
-                code = sweep.main(["--project", "p1", "--report", report_path])
+                code = sweep.main(["--project", "proj-1", "--report", report_path])
                 self.assertEqual(code, 1)
                 self.assertFalse(mock_sp.called)
                 data = json.loads(pathlib.Path(report_path).read_text(encoding="utf-8"))
                 self.assertEqual(data["exit"], "failed")
-                self.assertEqual(data["failures"]["p1"], "project p1 is not free in Boskos (leased, busy, or not registered there)")
+                self.assertEqual(data["failures"]["proj-1"], "project proj-1 is not free in Boskos (leased, busy, or not registered there)")
         finally:
             pathlib.Path(report_path).unlink(missing_ok=True)
 
     def test_project_mode_acquires_by_name_and_releases(self):
         with (
-            mock.patch.object(sweep.boskos_pool, "acquire", return_value="p1") as mock_acquire,
+            mock.patch.object(sweep.boskos_pool, "acquire", return_value="proj-1") as mock_acquire,
             mock.patch.object(sweep.boskos_pool, "release_settled") as mock_release,
             mock.patch.object(sweep, "sweep_project", return_value={"addresses": [], "subnets": [], "networks": []}),
         ):
-            code = sweep.main(["--project", "p1"])
+            code = sweep.main(["--project", "proj-1"])
             self.assertEqual(code, 0)
             mock_acquire.assert_called_once()
-            self.assertEqual(mock_acquire.call_args.kwargs.get("name"), "p1")
+            self.assertEqual(mock_acquire.call_args.kwargs.get("name"), "proj-1")
             mock_release.assert_called_once()
-            self.assertEqual(mock_release.call_args.args[2], "p1")
+            self.assertEqual(mock_release.call_args.args[2], "proj-1")
 
     def test_project_mode_release_failure_recorded_in_report(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as tf:
@@ -1146,15 +1225,15 @@ class MainCliTest(unittest.TestCase):
         try:
             err = sweep.boskos_pool.BoskosError("release rejected")
             with (
-                mock.patch.object(sweep.boskos_pool, "acquire", return_value="p1"),
+                mock.patch.object(sweep.boskos_pool, "acquire", return_value="proj-1"),
                 mock.patch.object(sweep.boskos_pool, "release_settled", side_effect=err),
                 mock.patch.object(sweep, "sweep_project", return_value={"addresses": [], "subnets": [], "networks": []}),
             ):
-                code = sweep.main(["--project", "p1", "--report", report_path])
+                code = sweep.main(["--project", "proj-1", "--report", report_path])
                 self.assertEqual(code, 1)
                 data = json.loads(pathlib.Path(report_path).read_text(encoding="utf-8"))
                 self.assertEqual(data["exit"], "failed")
-                self.assertEqual(data["failures"]["p1"], "release failed: release rejected")
+                self.assertEqual(data["failures"]["proj-1"], "release failed: release rejected")
         finally:
             pathlib.Path(report_path).unlink(missing_ok=True)
 
@@ -1164,18 +1243,18 @@ class MainCliTest(unittest.TestCase):
 
         try:
             err = sweep.boskos_pool.BoskosError("release rejected")
-            sweep_err = sweep.SweepError("p1: networks: net-1 (inUse)")
+            sweep_err = sweep.SweepError("proj-1: networks: net-1 (inUse)")
             with (
-                mock.patch.object(sweep.boskos_pool, "acquire", return_value="p1"),
+                mock.patch.object(sweep.boskos_pool, "acquire", return_value="proj-1"),
                 mock.patch.object(sweep.boskos_pool, "release_settled", side_effect=err),
                 mock.patch.object(sweep, "sweep_project", side_effect=sweep_err),
             ):
-                code = sweep.main(["--project", "p1", "--report", report_path])
+                code = sweep.main(["--project", "proj-1", "--report", report_path])
                 self.assertEqual(code, 1)
                 data = json.loads(pathlib.Path(report_path).read_text(encoding="utf-8"))
                 self.assertEqual(data["exit"], "failed")
-                self.assertEqual(data["failures"]["p1"], "p1: networks: net-1 (inUse); release failed: release rejected")
-                self.assertNotIn("release failed: release failed", data["failures"]["p1"])
+                self.assertEqual(data["failures"]["proj-1"], "proj-1: networks: net-1 (inUse); release failed: release rejected")
+                self.assertNotIn("release failed: release failed", data["failures"]["proj-1"])
         finally:
             pathlib.Path(report_path).unlink(missing_ok=True)
 
@@ -1186,27 +1265,47 @@ class MainCliTest(unittest.TestCase):
 
         try:
             sweep_err = sweep.SweepError(
-                "p1: networks: net-1 (inUse)",
+                "proj-1: networks: net-1 (inUse)",
                 deleted={"addresses": ["addr-1"], "subnets": [], "networks": []},
             )
             with (
-                mock.patch.object(sweep.boskos_pool, "acquire", return_value="p1"),
+                mock.patch.object(sweep.boskos_pool, "acquire", return_value="proj-1"),
                 mock.patch.object(sweep.boskos_pool, "release_settled", side_effect=sweep.Terminated("signal 15")),
                 mock.patch.object(sweep, "sweep_project", side_effect=sweep_err),
             ):
-                code = sweep.main(["--project", "p1", "--report", report_path])
+                code = sweep.main(["--project", "proj-1", "--report", report_path])
                 self.assertEqual(code, sweep.TERMINATED_EXIT_CODE)
                 data = json.loads(pathlib.Path(report_path).read_text(encoding="utf-8"))
                 self.assertEqual(data["exit"], "terminated")
-                self.assertEqual(data["deleted"]["p1"]["addresses"], 1)
-                self.assertEqual(data["failures"]["p1"], "p1: networks: net-1 (inUse)")
+                self.assertEqual(data["deleted"]["proj-1"]["addresses"], 1)
+                self.assertEqual(data["failures"]["proj-1"], "proj-1: networks: net-1 (inUse)")
                 self.assertIn("signal 15", data["error"])
+        finally:
+            pathlib.Path(report_path).unlink(missing_ok=True)
+
+    def test_project_mode_failure_on_returned_project_sets_exit_code_1_even_if_args_project_differs(self):
+        """Proves that a failure in visit sets exit code 1 when keyed on visited_project."""
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            report_path = tf.name
+
+        try:
+            sweep_err = sweep.SweepError("proj-1: error sweeping")
+            with (
+                mock.patch.object(sweep.boskos_pool, "acquire", return_value="proj-1"),
+                mock.patch.object(sweep.boskos_pool, "release_settled"),
+                mock.patch.object(sweep, "sweep_project", side_effect=sweep_err),
+            ):
+                code = sweep.main(["--project", "proj-1", "--report", report_path])
+                self.assertEqual(code, 1)
+                data = json.loads(pathlib.Path(report_path).read_text(encoding="utf-8"))
+                self.assertEqual(data["exit"], "failed")
+                self.assertEqual(data["failures"]["proj-1"], "proj-1: error sweeping")
         finally:
             pathlib.Path(report_path).unlink(missing_ok=True)
 
     def test_pool_mode_invocation(self):
         with (
-            mock.patch.object(sweep, "pool_projects", return_value={"p1"}),
+            mock.patch.object(sweep, "pool_projects", return_value={"proj-1"}),
             mock.patch.object(sweep, "sweep_pool", return_value=({}, {}, [])) as mock_pool,
         ):
             code = sweep.main(["--pool", "--max-age-hours", "4.0"])
@@ -1229,13 +1328,24 @@ class MainCliTest(unittest.TestCase):
             with self.subTest(val=val):
                 with self.assertRaises(SystemExit) as ctx:
                     with mock.patch("sys.stderr", io.StringIO()):
-                        sweep.main(["--project", "p1", "--max-age-hours", val])
+                        sweep.main(["--project", "proj-1", "--max-age-hours", val])
                 self.assertEqual(ctx.exception.code, 2)
 
     def test_parse_project_name(self):
         self.assertEqual(sweep.parse_project_name("my-project"), "my-project")
         self.assertEqual(sweep.parse_project_name("  trimmed-project  "), "trimmed-project")
-        for val in ["", "   "]:
+        self.assertEqual(sweep.parse_project_name("proj-1"), "proj-1")
+        for val in [
+            "",
+            "   ",
+            "p1,p2",
+            "p1",                # < 6 characters
+            "my-project,",
+            "-leading-hyphen",
+            "trailing-hyphen-",
+            "UPPERCASE-PROJ",
+            "a" * 31,           # > 30 characters
+        ]:
             with self.subTest(val=val):
                 with self.assertRaises(sweep.argparse.ArgumentTypeError):
                     sweep.parse_project_name(val)
@@ -1271,6 +1381,19 @@ class MainCliTest(unittest.TestCase):
                 self.assertIn("could not read ci-deploy.sh", data["error"])
         finally:
             pathlib.Path(report_path).unlink(missing_ok=True)
+
+
+class BoskosAcquireByNameTest(unittest.TestCase):
+    def test_boskos_acquire_rejects_comma_separated_name(self):
+        with self.assertRaises(sweep.boskos_pool.BoskosError) as ctx:
+            sweep.boskos_pool.acquire("http://fake-boskos", "owner", "cleaning", name="proj-1,proj-2")
+        self.assertIn("acquire by name expects a single project name", str(ctx.exception))
+
+    def test_boskos_acquire_mismatched_name_raises_boskos_error(self):
+        with mock.patch.object(sweep.boskos_pool, "_call", return_value=[{"name": "proj-other"}]):
+            with self.assertRaises(sweep.boskos_pool.BoskosError) as ctx:
+                sweep.boskos_pool.acquire("http://fake-boskos", "owner", "cleaning", name="proj-1")
+            self.assertIn("acquire requested 'proj-1' but Boskos returned 'proj-other'", str(ctx.exception))
 
 
 if __name__ == "__main__":

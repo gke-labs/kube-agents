@@ -132,6 +132,8 @@ def acquire(server, owner, hold_state, name=None):
     With `name`, that project and only that one (Boskos's /acquirebystate);
     None then means it is not free.
     """
+    if name is not None and "," in name:
+        raise BoskosError("acquire by name expects a single project name, got %r" % (name,))
     try:
         if name is None:
             resource = _call(
@@ -150,7 +152,10 @@ def acquire(server, owner, hold_state, name=None):
         if exc.code == NO_RESOURCE_CODE:
             return None
         raise
-    return (resource or {}).get("name") or None
+    ret_name = (resource or {}).get("name") or None
+    if name is not None and ret_name is not None and ret_name != name:
+        raise BoskosError("acquire requested %r but Boskos returned %r" % (name, ret_name))
+    return ret_name
 
 
 def release(server, owner, name):

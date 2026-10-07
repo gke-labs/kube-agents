@@ -131,6 +131,18 @@ def resource_name(url_or_name: str | None) -> str:
     return url_or_name.rstrip("/").split("/")[-1]
 
 
+def resource_region(url_or_name: str | None) -> str:
+    """Extract region name from a full GCP URL, URI, or resource path."""
+    if not url_or_name or not isinstance(url_or_name, str):
+        return ""
+    parts = url_or_name.rstrip("/").split("/")
+    if "regions" in parts:
+        idx = parts.index("regions")
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
+    return ""
+
+
 def pool_projects(ci_deploy_script=CI_DEPLOY_SCRIPT) -> set[str]:
     """Set of project IDs mapped in gitops_repo_for_project() in hack/ci-deploy.sh."""
     projects = set()
@@ -232,18 +244,10 @@ def sweep_project(
         for sub in subnets_to_delete
         if sub.get("name")
     }
-    selected_subnet_self_links = {
-        sub.get("selfLink") for sub in subnets_to_delete if sub.get("selfLink")
-    }
     plant_subnet_keys = {
         (resource_name(sub.get("region")), sub.get("name"))
         for sub in raw_subnets
         if sub.get("name") and matches_plant_description(sub.get("description"))
-    }
-    plant_subnet_self_links = {
-        sub.get("selfLink")
-        for sub in raw_subnets
-        if sub.get("selfLink") and matches_plant_description(sub.get("description"))
     }
 
     # 3. Inspect addresses
@@ -255,23 +259,14 @@ def sweep_project(
         addr_name = addr.get("name", "")
         sub_ref = addr.get("subnetwork")
         sub_name = resource_name(sub_ref)
-        addr_region = resource_name(addr.get("region"))
+        addr_region = resource_name(addr.get("region")) or resource_region(sub_ref)
         net_name = resource_name(addr.get("network"))
 
         if net_name and net_name in selected_network_names:
             addresses_to_delete.append(addr)
             continue
 
-        subnet_matches = False
-        if sub_ref and sub_ref in selected_subnet_self_links:
-            subnet_matches = True
-        elif sub_name and (addr_region, sub_name) in selected_subnet_keys:
-            subnet_matches = True
-        elif sub_name and not addr_region and any(k[1] == sub_name for k in selected_subnet_keys):
-            # Standalone or mock fixtures where neither specifies region
-            subnet_matches = True
-
-        if subnet_matches:
+        if sub_name and (addr_region, sub_name) in selected_subnet_keys:
             addresses_to_delete.append(addr)
             continue
 
@@ -281,13 +276,7 @@ def sweep_project(
             continue
 
         # If the address explicitly references an active (unselected) plant subnet, protect it
-        is_young_plant_subnet = False
-        if sub_ref and sub_ref in plant_subnet_self_links:
-            is_young_plant_subnet = True
-        elif sub_name and (addr_region, sub_name) in plant_subnet_keys:
-            is_young_plant_subnet = True
-
-        if is_young_plant_subnet:
+        if sub_name and (addr_region, sub_name) in plant_subnet_keys:
             print(f"  skipping address {addr_name}: parent plant subnet {sub_name} is younger than {max_age_hours}h")
             continue
 
@@ -303,15 +292,14 @@ def sweep_project(
         # Step 1: Delete addresses
         for addr in addresses_to_delete:
             name = addr.get("name", "")
-            region = addr.get("region")
+            region_name = resource_name(addr.get("region")) or resource_region(addr.get("subnetwork"))
             if dry_run:
                 print(f"  would delete address {name} in {project}")
                 deleted["addresses"].append(name)
                 continue
 
             cmd = ["gcloud", "compute", "addresses", "delete", name, f"--project={project}"]
-            if region:
-                region_name = region.split("/")[-1]
+            if region_name:
                 cmd.append(f"--region={region_name}")
             else:
                 cmd.append("--global")
@@ -521,11 +509,20 @@ def parse_max_age_hours(val: str) -> float:
     return v
 
 
+PROJECT_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
+
+
 def parse_project_name(val: str) -> str:
-    """Parse and validate --project: non-empty, non-whitespace project ID."""
+    """Parse and validate --project: legal GCP project ID (6-30 chars, no commas)."""
     cleaned = (val or "").strip()
     if not cleaned:
         raise argparse.ArgumentTypeError("project name cannot be empty")
+    if "," in cleaned:
+        raise argparse.ArgumentTypeError(f"project name cannot contain commas: {cleaned!r}")
+    if not PROJECT_ID_PATTERN.match(cleaned):
+        raise argparse.ArgumentTypeError(
+            f"invalid GCP project ID {cleaned!r}: must match {PROJECT_ID_PATTERN.pattern}"
+        )
     return cleaned
 
 
@@ -575,7 +572,11 @@ def main(argv=None) -> int:
         if args.project is not None:
             boskos_reset_stranded(args.boskos_server)
 
+            visited_project = None
+
             def visit(p: str):
+                nonlocal visited_project
+                visited_project = p
                 print(f"sweeping {p}")
                 try:
                     res = sweep_project(p, max_age_hours=args.max_age_hours, dry_run=args.dry_run)
@@ -606,14 +607,19 @@ def main(argv=None) -> int:
                 heartbeat=True,
             )
 
+            target_project = visited_project or args.project
             if outcome is boskos_pool.NOT_ACQUIRED:
                 code = 1
                 error = f"project {args.project} is not free in Boskos (leased, busy, or not registered there)"
                 run["failures"][args.project] = error
                 print(f"ERROR: {error}", file=sys.stderr)
-            elif args.project in run["failures"]:
+            elif target_project in run["failures"]:
                 code = 1
-                error = run["failures"][args.project]
+                error = run["failures"][target_project]
+                print(f"ERROR: {error}", file=sys.stderr)
+            elif run["failures"]:
+                code = 1
+                error = next(iter(run["failures"].values()))
                 print(f"ERROR: {error}", file=sys.stderr)
         else:
             projects = pool_projects(args.ci_deploy_script)
