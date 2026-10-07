@@ -781,7 +781,14 @@ passed and two more of its optional ones:
 `drift_pubsub_sink_writer_identity_override`, which the module's own
 postcondition tells an operator to set when a project's sink reports a writer
 identity the module did not derive, and `drift_pubsub_sink_drain_duration`,
-the destroy-time wait below. Everything else is left to the module's defaults,
+the destroy-time wait below. Neither has an installer key, so through the
+front doors both are passthrough lines in `install.env`
+(`TF_VAR_drift_pubsub_sink_writer_identity_override`,
+`TF_VAR_drift_pubsub_sink_drain_duration`) rather than entries in
+`terraform.tfvars`, which `write_tfvars_from_state` regenerates wholesale on
+every `install.sh` and `upgrade.sh` run — a hand-added key there is gone on the
+next one, and for the override that means the failure it cleared comes back.
+A hand-driven apply sets them in `terraform.tfvars`. Everything else is left to the module's defaults,
 which decide the 31-day retention and the cluster scope, every GKE cluster in
 the project; a caller that needs the module's remaining knobs instantiates it
 directly.
