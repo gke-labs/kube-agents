@@ -1,0 +1,432 @@
+"""Tests for hack/ci_sweep_compute_plants.py (#2552).
+
+Verifies that:
+1. Resource identification strictly matches the fixed description prefix
+   ("kube-agents-bench plant") and requires creationTimestamp older than max_age_hours.
+2. Deletion order is strictly dependency-ordered:
+   Addresses -> Subnets -> Networks.
+3. Regional vs global addresses are correctly scoped.
+4. Dry-run runs list commands and invokes no delete commands.
+5. Failures (list error, delete failure) are handled and reported without unhandled crashes.
+6. Boskos pool walk, stranded resets, and report generation follow repository standards.
+"""
+
+from datetime import datetime, timedelta, timezone
+import importlib.util
+import io
+import json
+import pathlib
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+_MODULE_PATH = _REPO_ROOT / "hack" / "ci_sweep_compute_plants.py"
+
+_spec = importlib.util.spec_from_file_location("ci_sweep_compute_plants", _MODULE_PATH)
+if _spec is None or _spec.loader is None:
+    raise RuntimeError(f"could not load {_MODULE_PATH}")
+sweep = importlib.util.module_from_spec(_spec)
+sys.modules["ci_sweep_compute_plants"] = sweep
+_spec.loader.exec_module(sweep)
+
+
+class MatchesPlantDescriptionTest(unittest.TestCase):
+    def test_exact_prefix_matches(self):
+        desc = "kube-agents-bench plant (networking-audit-subnet-range-exhaustion); safe to delete"
+        self.assertTrue(sweep.matches_plant_description(desc))
+
+    def test_short_prefix_matches(self):
+        self.assertTrue(sweep.matches_plant_description("kube-agents-bench plant"))
+
+    def test_whitespace_padded_prefix_matches(self):
+        self.assertTrue(sweep.matches_plant_description("   kube-agents-bench plant custom   "))
+
+    def test_unrelated_description_does_not_match(self):
+        self.assertFalse(sweep.matches_plant_description("default VPC network"))
+        self.assertFalse(sweep.matches_plant_description("GKE cluster network"))
+        self.assertFalse(sweep.matches_plant_description("user-created plant"))
+
+    def test_empty_or_none_does_not_match(self):
+        self.assertFalse(sweep.matches_plant_description(""))
+        self.assertFalse(sweep.matches_plant_description("   "))
+        self.assertFalse(sweep.matches_plant_description(None))
+        self.assertFalse(sweep.matches_plant_description(123))  # type: ignore
+
+
+class TimestampAgeTest(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime(2026, 10, 7, 12, 0, 0, tzinfo=timezone.utc)
+
+    def test_parse_timestamp_formats(self):
+        # UTC Z format
+        dt1 = sweep.parse_timestamp("2026-10-07T10:00:00Z")
+        self.assertIsNotNone(dt1)
+        self.assertEqual(dt1.tzinfo, timezone.utc)
+
+        # Offset format
+        dt2 = sweep.parse_timestamp("2026-10-07T05:00:00-07:00")
+        self.assertIsNotNone(dt2)
+        self.assertEqual(dt2.astimezone(timezone.utc), datetime(2026, 10, 7, 12, 0, 0, tzinfo=timezone.utc))
+
+        # Invalid formats
+        self.assertIsNone(sweep.parse_timestamp("not-a-timestamp"))
+        self.assertIsNone(sweep.parse_timestamp(""))
+        self.assertIsNone(sweep.parse_timestamp(None))
+
+    def test_is_older_than_threshold(self):
+        # 5 hours ago, threshold 4 hours -> True
+        five_hours_ago = (self.now - timedelta(hours=5)).isoformat()
+        self.assertTrue(sweep.is_older_than(five_hours_ago, 4.0, now=self.now))
+
+        # 1 hour ago, threshold 4 hours -> False (active run protection)
+        one_hour_ago = (self.now - timedelta(hours=1)).isoformat()
+        self.assertFalse(sweep.is_older_than(one_hour_ago, 4.0, now=self.now))
+
+        # Exactly 4 hours ago -> True
+        four_hours_ago = (self.now - timedelta(hours=4)).isoformat()
+        self.assertTrue(sweep.is_older_than(four_hours_ago, 4.0, now=self.now))
+
+        # Unparseable timestamp -> False (fails safe, never deletes)
+        self.assertFalse(sweep.is_older_than("invalid", 4.0, now=self.now))
+        self.assertFalse(sweep.is_older_than(None, 4.0, now=self.now))
+
+
+class PoolProjectsTest(unittest.TestCase):
+    def test_extracts_mapped_projects(self):
+        script_content = """#!/usr/bin/env bash
+gitops_repo_for_project() {
+  case "$1" in
+    kube-agents-evals) echo "gke-agentic/kube-agents-evals-infra" ;;
+    kube-agents-evals-2) echo "gke-agentic/kube-agents-evals-2-infra" ;;
+  esac
+}
+"""
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tf:
+            tf.write(script_content)
+            temp_path = tf.name
+        try:
+            projects = sweep.pool_projects(temp_path)
+            self.assertEqual(projects, {"kube-agents-evals", "kube-agents-evals-2"})
+        finally:
+            pathlib.Path(temp_path).unlink(missing_ok=True)
+
+    def test_missing_function_raises_sweep_error(self):
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tf:
+            tf.write("#!/usr/bin/env bash\necho hello\n")
+            temp_path = tf.name
+        try:
+            with self.assertRaises(sweep.SweepError):
+                sweep.pool_projects(temp_path)
+        finally:
+            pathlib.Path(temp_path).unlink(missing_ok=True)
+
+
+class ListComputeResourcesTest(unittest.TestCase):
+    def test_successful_list(self):
+        fake_runner = mock.Mock()
+        fake_runner.return_value = mock.Mock(
+            returncode=0,
+            stdout=json.dumps([{"name": "res-1"}]),
+            stderr="",
+        )
+        items = sweep.list_compute_resources("test-proj", "addresses", runner=fake_runner)
+        self.assertEqual(items, [{"name": "res-1"}])
+        fake_runner.assert_called_once_with(
+            ["gcloud", "compute", "addresses", "list", "--project=test-proj", "--format=json"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_list_failure_raises_sweep_error(self):
+        fake_runner = mock.Mock()
+        fake_runner.return_value = mock.Mock(
+            returncode=1,
+            stdout="",
+            stderr="permission denied",
+        )
+        with self.assertRaises(sweep.SweepError) as ctx:
+            sweep.list_compute_resources("test-proj", "networks", runner=fake_runner)
+        self.assertIn("could not list networks in test-proj: permission denied", str(ctx.exception))
+
+    def test_non_json_output_raises_sweep_error(self):
+        fake_runner = mock.Mock()
+        fake_runner.return_value = mock.Mock(
+            returncode=0,
+            stdout="<html>502 Bad Gateway</html>",
+            stderr="",
+        )
+        with self.assertRaises(sweep.SweepError) as ctx:
+            sweep.list_compute_resources("test-proj", "addresses", runner=fake_runner)
+        self.assertIn("is not JSON", str(ctx.exception))
+
+
+class SweepProjectTest(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime(2026, 10, 7, 12, 0, 0, tzinfo=timezone.utc)
+        self.old_ts = (self.now - timedelta(hours=6)).isoformat()
+        self.recent_ts = (self.now - timedelta(hours=1)).isoformat()
+        self.plant_desc = "kube-agents-bench plant (subnet-range-exhaustion); safe to delete"
+
+    def test_dependency_order_addresses_then_subnets_then_networks(self):
+        """Proves addresses are deleted first, then subnets, then networks."""
+        commands_run = []
+
+        def mock_runner(cmd, capture_output=True, text=True, check=False):
+            commands_run.append(cmd)
+            # Handle list calls
+            if "list" in cmd:
+                if "addresses" in cmd:
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps([{
+                            "name": "bench-addr-1",
+                            "description": self.plant_desc,
+                            "creationTimestamp": self.old_ts,
+                            "region": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4",
+                        }]),
+                        stderr="",
+                    )
+                if "subnets" in cmd:
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps([{
+                            "name": "bench-subnet-1",
+                            "description": self.plant_desc,
+                            "creationTimestamp": self.old_ts,
+                            "region": "https://www.googleapis.com/compute/v1/projects/p/regions/us-west4",
+                        }]),
+                        stderr="",
+                    )
+                if "networks" in cmd:
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps([{
+                            "name": "bench-vpc-1",
+                            "description": self.plant_desc,
+                            "creationTimestamp": self.old_ts,
+                        }]),
+                        stderr="",
+                    )
+            # Handle delete calls
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        res = sweep.sweep_project("my-project", max_age_hours=4.0, runner=mock_runner, now=self.now)
+        self.assertEqual(res["addresses"], ["bench-addr-1"])
+        self.assertEqual(res["subnets"], ["bench-subnet-1"])
+        self.assertEqual(res["networks"], ["bench-vpc-1"])
+
+        # Extract only delete commands
+        delete_cmds = [cmd for cmd in commands_run if "delete" in cmd]
+        self.assertEqual(len(delete_cmds), 3)
+
+        # 1st delete must be address
+        self.assertEqual(delete_cmds[0], [
+            "gcloud", "compute", "addresses", "delete", "bench-addr-1",
+            "--project=my-project", "--region=us-west4", "--quiet",
+        ])
+        # 2nd delete must be subnet
+        self.assertEqual(delete_cmds[1], [
+            "gcloud", "compute", "networks", "subnets", "delete", "bench-subnet-1",
+            "--project=my-project", "--region=us-west4", "--quiet",
+        ])
+        # 3rd delete must be network
+        self.assertEqual(delete_cmds[2], [
+            "gcloud", "compute", "networks", "delete", "bench-vpc-1",
+            "--project=my-project", "--quiet",
+        ])
+
+    def test_global_address_command_shape(self):
+        commands_run = []
+
+        def mock_runner(cmd, capture_output=True, text=True, check=False):
+            commands_run.append(cmd)
+            if "list" in cmd and "addresses" in cmd:
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps([{
+                        "name": "bench-global-addr",
+                        "description": self.plant_desc,
+                        "creationTimestamp": self.old_ts,
+                        # No region field
+                    }]),
+                    stderr="",
+                )
+            if "list" in cmd:
+                return mock.Mock(returncode=0, stdout="[]", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        res = sweep.sweep_project("my-project", runner=mock_runner, now=self.now)
+        self.assertEqual(res["addresses"], ["bench-global-addr"])
+
+        delete_cmds = [cmd for cmd in commands_run if "delete" in cmd]
+        self.assertEqual(len(delete_cmds), 1)
+        self.assertEqual(delete_cmds[0], [
+            "gcloud", "compute", "addresses", "delete", "bench-global-addr",
+            "--project=my-project", "--global", "--quiet",
+        ])
+
+    def test_recent_or_unmatched_resources_are_not_touched(self):
+        commands_run = []
+
+        def mock_runner(cmd, capture_output=True, text=True, check=False):
+            commands_run.append(cmd)
+            if "list" in cmd and "addresses" in cmd:
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps([
+                        # Recent plant (1h old) - should NOT be deleted (active eval protection)
+                        {"name": "recent-addr", "description": self.plant_desc, "creationTimestamp": self.recent_ts},
+                        # Old non-plant (6h old) - should NOT be deleted
+                        {"name": "prod-addr", "description": "production IP", "creationTimestamp": self.old_ts},
+                        # Plant with missing timestamp - should NOT be deleted
+                        {"name": "notime-addr", "description": self.plant_desc, "creationTimestamp": ""},
+                    ]),
+                    stderr="",
+                )
+            if "list" in cmd:
+                return mock.Mock(returncode=0, stdout="[]", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        res = sweep.sweep_project("my-project", max_age_hours=4.0, runner=mock_runner, now=self.now)
+        self.assertEqual(res["addresses"], [])
+        self.assertEqual(res["subnets"], [])
+        self.assertEqual(res["networks"], [])
+
+        delete_cmds = [cmd for cmd in commands_run if "delete" in cmd]
+        self.assertEqual(len(delete_cmds), 0)
+
+    def test_dry_run_executes_no_deletes(self):
+        commands_run = []
+
+        def mock_runner(cmd, capture_output=True, text=True, check=False):
+            commands_run.append(cmd)
+            if "list" in cmd and "networks" in cmd and "subnets" not in cmd:
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps([{
+                        "name": "bench-net-1",
+                        "description": self.plant_desc,
+                        "creationTimestamp": self.old_ts,
+                    }]),
+                    stderr="",
+                )
+            if "list" in cmd:
+                return mock.Mock(returncode=0, stdout="[]", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        res = sweep.sweep_project("my-project", dry_run=True, runner=mock_runner, now=self.now)
+        self.assertEqual(res["networks"], ["bench-net-1"])
+
+        delete_cmds = [cmd for cmd in commands_run if "delete" in cmd]
+        self.assertEqual(len(delete_cmds), 0)
+
+    def test_delete_failure_raises_sweep_error_at_end(self):
+        def mock_runner(cmd, capture_output=True, text=True, check=False):
+            if "list" in cmd and "addresses" in cmd:
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps([{
+                        "name": "locked-addr",
+                        "description": self.plant_desc,
+                        "creationTimestamp": self.old_ts,
+                    }]),
+                    stderr="",
+                )
+            if "list" in cmd:
+                return mock.Mock(returncode=0, stdout="[]", stderr="")
+            if "delete" in cmd:
+                return mock.Mock(returncode=1, stdout="", stderr="resourceInUseByAnotherResource")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with self.assertRaises(sweep.SweepError) as ctx:
+            sweep.sweep_project("my-project", runner=mock_runner, now=self.now)
+        self.assertIn("locked-addr", str(ctx.exception))
+        self.assertIn("resourceInUseByAnotherResource", str(ctx.exception))
+
+
+class SweepPoolTest(unittest.TestCase):
+    def test_sweep_pool_walks_boskos_and_cleans(self):
+        visited = []
+
+        def fake_walk(server, owner, state, limit, visit_callback, heartbeat=True, release_failures=None):
+            self.assertEqual(state, "cleaning")
+            self.assertEqual(owner, "test-owner")
+            self.assertTrue(heartbeat)
+            visit_callback("proj-1")
+            visit_callback("proj-unmapped")
+
+        def fake_sweep_project(name, max_age_hours=4.0, dry_run=False, runner=None, now=None):
+            visited.append(name)
+            return {"addresses": ["addr-1"], "subnets": [], "networks": ["net-1"]}
+
+        with (
+            mock.patch.object(sweep.boskos_pool, "walk", side_effect=fake_walk),
+            mock.patch.object(sweep, "boskos_reset_stranded") as mock_reset,
+            mock.patch.object(sweep, "sweep_project", side_effect=fake_sweep_project),
+        ):
+            report = {}
+            deleted, failures, unmapped = sweep.sweep_pool(
+                "http://fake-boskos",
+                "test-owner",
+                4.0,
+                {"proj-1"},
+                report=report,
+            )
+            mock_reset.assert_called_once_with("http://fake-boskos")
+            self.assertEqual(visited, ["proj-1"])
+            self.assertEqual(unmapped, ["proj-unmapped"])
+            self.assertIn("proj-1", deleted)
+            self.assertEqual(deleted["proj-1"]["addresses"], 1)
+            self.assertEqual(deleted["proj-1"]["networks"], 1)
+
+
+class WriteReportTest(unittest.TestCase):
+    def test_report_structure(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            report_path = tf.name
+
+        try:
+            args = mock.Mock(project="p1", dry_run=False, max_age_hours=4.0)
+            run = {
+                "deleted": {"p1": {"addresses": 3, "subnets": 1, "networks": 1}},
+                "failures": {},
+                "unmapped": [],
+                "skipped": [],
+            }
+            sweep.write_report(report_path, args, run, 0, None, 1000.0)
+
+            data = json.loads(pathlib.Path(report_path).read_text(encoding="utf-8"))
+            self.assertEqual(data["schema_version"], 1)
+            self.assertEqual(data["mode"], "project")
+            self.assertFalse(data["dry_run"])
+            self.assertEqual(data["max_age_hours"], 4.0)
+            self.assertEqual(data["exit"], "ok")
+            self.assertEqual(data["exit_code"], 0)
+            self.assertIsNone(data["error"])
+            self.assertEqual(data["deleted"]["p1"]["addresses"], 3)
+        finally:
+            pathlib.Path(report_path).unlink(missing_ok=True)
+
+
+class MainCliTest(unittest.TestCase):
+    def test_project_mode_invocation(self):
+        with mock.patch.object(sweep, "sweep_project", return_value={"addresses": [], "subnets": [], "networks": []}) as mock_sp:
+            code = sweep.main(["--project", "p1", "--dry-run", "--max-age-hours", "2.5"])
+            self.assertEqual(code, 0)
+            mock_sp.assert_called_once_with("p1", max_age_hours=2.5, dry_run=True)
+
+    def test_pool_mode_invocation(self):
+        with (
+            mock.patch.object(sweep, "pool_projects", return_value={"p1"}),
+            mock.patch.object(sweep, "sweep_pool", return_value=({}, {}, [])) as mock_pool,
+        ):
+            code = sweep.main(["--pool", "--max-age-hours", "4.0"])
+            self.assertEqual(code, 0)
+            self.assertTrue(mock_pool.called)
+
+
+if __name__ == "__main__":
+    unittest.main()
