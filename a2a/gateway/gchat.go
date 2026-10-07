@@ -169,14 +169,18 @@ func verifiedByFor(backend string) string {
 
 // unverifiedRemedyFor names what an admin edits to admit a sender — the
 // allowlist on gchat and on Slack (where the principal map is an override,
-// not a gate), the door's own map on inject, nothing at all on the console, the mapping table
+// not a gate, except that a reserved-prefix entry refuses), the door's own
+// map on inject, nothing at all on the console, the mapping table
 // everywhere else (Discord's ConfigMap).
 func unverifiedRemedyFor(backend string) string {
 	switch backend {
 	case gchatBackend:
 		return "the allowed users list"
 	case slackBackend:
-		return "the allowed users list"
+		// The list is the gate; the map is named too for the one refusal it
+		// still makes, a listed member whose entry carries the reserved
+		// slack: prefix (resolveSlackPrincipal).
+		return "the allowed users list (or correct their principal map entry)"
 	case consoleBackend:
 		// Cannot happen from a real console frame; a spoofed author id can.
 		return "nothing - only the console credential's own frames are accepted here"

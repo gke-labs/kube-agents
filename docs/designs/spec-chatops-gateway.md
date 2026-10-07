@@ -1222,8 +1222,9 @@ conversation-scoped dedupe would be no bound at all. The memory is capped and ev
 wholesale at the cap, so the worst an unverified sender can do is make one notice
 repeat. This is gateway behavior, not Slack behavior, so Discord and Google Chat get
 it too - the notice names the remedy for whichever backend it fires on (the allowed-users
-list on Slack and gchat). On Slack only the list refuses: a listed sender the table does
-not name is attributed by member id, not dropped.
+list on Slack and gchat; on Slack it also names the principal map, for the one refusal the
+map still makes, a listed member whose entry carries the reserved `slack:` prefix). A listed
+sender the table does not name is attributed by member id, not dropped.
 
 **Roster.** Channel membership via the members API, one page; past a page the roster
 reports incomplete rather than paging (the roster cap truncates far below it anyway).

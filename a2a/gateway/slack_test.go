@@ -2664,6 +2664,11 @@ func TestSlackMapCannotAssertTheMemberIDPrefix(t *testing.T) {
 	if got := g.resolvePrincipal(slackBackend, ""); got != "" {
 		t.Errorf("an empty member id resolved to %q", got)
 	}
+	// The notice such a member gets must point at the map entry, since they
+	// are already on the list.
+	if remedy := unverifiedRemedyFor(slackBackend); !strings.Contains(remedy, "principal map") {
+		t.Errorf("the Slack remedy %q does not name the principal map", remedy)
+	}
 }
 
 // TestSlackRosterRefusesTheReservedPrefixSilently: the roster resolves every
@@ -2745,4 +2750,43 @@ func TestSlackRosterDoesNotAttributeADisallowedMember(t *testing.T) {
 	if strings.Contains(strings.Join(rec.Roster, ","), ps.Hash("test:two")) {
 		t.Errorf("session record roster %v names the disallowed member's mapped principal", rec.Roster)
 	}
+}
+
+// TestSlackWorkspaceCheckReadsADecodedEvent: the workspace check on events
+// decoded the way Socket Mode delivers them (json into
+// slackevents.MessageEvent), not built by hand. slack-go decodes a plain
+// message's top-level fields into MessageEvent.Message as well, so the
+// message's own team field is read even when user_team is absent.
+func TestSlackWorkspaceCheckReadsADecodedEvent(t *testing.T) {
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	a.teamID = "T0URS"
+	decode := func(raw string) *slackevents.MessageEvent {
+		t.Helper()
+		var m slackevents.MessageEvent
+		if err := json.Unmarshal([]byte(raw), &m); err != nil {
+			t.Fatalf("decoding %s: %v", raw, err)
+		}
+		return &m
+	}
+	for _, tc := range []struct {
+		name, raw string
+		turn      bool
+	}{
+		{"team only, foreign", `{"type":"message","channel":"D1","channel_type":"im","user":"UGUEST","text":"drain node 4","ts":"1.0","team":"T0THER"}`, false},
+		{"user_team, foreign", `{"type":"message","channel":"D2","channel_type":"im","user":"UGUEST","text":"drain node 4","ts":"2.0","team":"T0URS","user_team":"T0THER"}`, false},
+		{"ours", `{"type":"message","channel":"D3","channel_type":"im","user":"U1","text":"how is the fleet","ts":"3.0","team":"T0URS"}`, true},
+		{"no workspace named", `{"type":"message","channel":"D4","channel_type":"im","user":"U1","text":"hello","ts":"4.0"}`, true},
+	} {
+		m := decode(tc.raw)
+		if _, ok := a.inbound(context.Background(), m); ok != tc.turn {
+			t.Errorf("%s: delivered=%v, want %v (Message.Team=%q, UserTeam=%q)", tc.name, ok, tc.turn, teamOf(m), m.UserTeam)
+		}
+	}
+}
+
+func teamOf(m *slackevents.MessageEvent) string {
+	if m.Message == nil {
+		return "<nil Message>"
+	}
+	return m.Message.Team
 }
