@@ -697,7 +697,19 @@ class WebhookScopeTest(unittest.TestCase):
         graded = grade([hook("stale.example.com", [rule(["certificatesigningrequests"], groups=("certificates.k8s.io",), versions=("v1beta1",))], policy="Fail")])
         self.assertEqual(graded["blocking"], [])
         self.assertEqual([f["rules"] for f in graded["outage"]], [["CREATE certificatesigningrequests in certificates.k8s.io at v1beta1"]])
-        self.assertIn("at v1beta1", r.describe_webhook_finding(graded["outage"][0]))
+        # The server serves the write at v1 alone, so it sends this webhook nothing: the cell
+        # says so, and does not report requests failing now.
+        self.assertEqual([f["version_pinned"] for f in graded["outage"]], [["CREATE certificatesigningrequests"]])
+        cell = r.describe_webhook_finding(graded["outage"][0])
+        self.assertIn("matches no request the server sends at a served version (its rules: CREATE certificatesigningrequests in certificates.k8s.io at v1beta1; the server serves CREATE certificatesigningrequests at v1 alone, so it sends this webhook none of them); it is reported, not graded", cell)
+        self.assertNotIn("fails its own requests now", cell)
+        # A dead gate on a resource off the list does fail the requests it matches now.
+        graded = grade([hook("cm.example.com", [rule(["configmaps"])], policy="Fail")])
+        self.assertEqual([f["version_pinned"] for f in graded["outage"]], [[]])
+        self.assertIn("it fails its own requests now", r.describe_webhook_finding(graded["outage"][0]))
+        # A pinned rule beside a served one is a blocker, with nothing pinned.
+        graded = grade([hook("mixed.example.com", [rule(["certificatesigningrequests"], groups=("certificates.k8s.io",), versions=("v1beta1",)), rule(["pods"])], policy="Fail")])
+        self.assertEqual([f["version_pinned"] for f in graded["blocking"]], [[]])
         # A rule on `*` or on the served version alone carries no version suffix.
         for versions in (("*",), ("v1",)):
             with self.subTest(versions=versions):
