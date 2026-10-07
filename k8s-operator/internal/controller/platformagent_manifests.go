@@ -1791,11 +1791,6 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		Approvals struct {
 			CronMode string `json:"cron_mode,omitempty"`
 		} `json:"approvals,omitempty"`
-		Auxiliary struct {
-			TitleGeneration struct {
-				Enabled bool `json:"enabled"`
-			} `json:"title_generation"`
-		} `json:"auxiliary"`
 		Platforms struct {
 			GoogleChat struct {
 				Enabled bool `json:"enabled"`
@@ -1867,16 +1862,6 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	// not declare the key. Leaving it out would silently deny every cron-initiated
 	// approval on a scaffolded cluster profile.
 	cfg.Approvals.CronMode = "approve"
-
-	// Auxiliary tasks. Disable Hermes auxiliary title generation across all profiles
-	// in the pod (issue #2523). Hermes run_agent.py fires a background _generate_session_title
-	// request after the first turn with reasoning_config={"enabled": False}, which maps to
-	// reasoning_effort="minimal". Routed through LiteLLM to Vertex AI Gemini 3.x Flash,
-	// LiteLLM maps this to thinkingLevel="minimal" which Vertex rejects with HTTP 400
-	// (THINKING_LEVEL_MINIMAL not supported). Routed to Claude Sonnet/Opus, LiteLLM maps
-	// it to thinking budget 1024, wasting tokens and an LLM round-trip on every session
-	// for a title kube-agents does not display in chat, PRs, or Session KV feeds.
-	cfg.Auxiliary.TitleGeneration.Enabled = false
 
 	// Terminal. The ssh backend, always: the agent container has no shell tools
 	// of its own, so a `local` terminal here would run the model's commands in

@@ -79,6 +79,30 @@ class ContextFileCapTest(unittest.TestCase):
                 self.assertIs(type(cap), int, f"{CAP_KEY} must be a plain integer, got {cap!r}")
                 self.assertGreater(cap, 0)
 
+    def test_every_profile_disables_auxiliary_title_generation(self):
+        profiles = shipped_profiles()
+        self.assertTrue(profiles, "found no agents/*/config.yaml to check")
+        for profile in profiles:
+            with self.subTest(profile=profile):
+                aux = effective_config(profile).get("auxiliary") or {}
+                title_gen = aux.get("title_generation") or {}
+                self.assertIs(
+                    title_gen.get("enabled"),
+                    False,
+                    f"agents/{profile}/config.yaml does not set auxiliary.title_generation.enabled "
+                    "to false, so Hermes fires a minimal-reasoning title request on every new session (#2523)",
+                )
+
+    def test_shared_defaults_disables_auxiliary_title_generation(self):
+        defaults = _load(SHARED_DEFAULTS)
+        aux = defaults.get("auxiliary") or {}
+        title_gen = aux.get("title_generation") or {}
+        self.assertIs(
+            title_gen.get("enabled"),
+            False,
+            "deploy/shared/defaults/config.yaml does not set auxiliary.title_generation.enabled to false (#2523)",
+        )
+
     def test_every_shipped_context_file_fits_its_profiles_cap(self):
         for profile in shipped_profiles():
             cap = effective_config(profile).get(CAP_KEY)

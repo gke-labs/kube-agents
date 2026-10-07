@@ -3602,38 +3602,6 @@ func TestManagedConfigPinsModelAndPlatformsButNotHomeChannel(t *testing.T) {
 	}
 }
 
-// Issue #2523: Disable Hermes auxiliary title generation across all profiles in the pod.
-// run_agent.py fires a background _generate_session_title request after the first turn
-// with reasoning_effort="minimal". Routed through LiteLLM to Vertex AI Gemini 3.x Flash,
-// Vertex rejects this with HTTP 400 (THINKING_LEVEL_MINIMAL not supported). Routed to
-// Claude Sonnet/Opus, LiteLLM burns up to 1,024 reasoning tokens generating a title
-// that kube-agents does not display anywhere.
-func TestManagedConfigDisablesAuxiliaryTitleGeneration(t *testing.T) {
-	var cfg map[string]any
-	if err := yaml.Unmarshal([]byte(buildConfigMapData(chatAgent(), nil)[managedConfigKey]), &cfg); err != nil {
-		t.Fatalf("managed config does not parse as YAML: %v", err)
-	}
-
-	auxiliary, ok := cfg["auxiliary"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected 'auxiliary' block in managed config, got: %v", cfg)
-	}
-
-	titleGen, ok := auxiliary["title_generation"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected 'title_generation' block in auxiliary config, got: %v", auxiliary)
-	}
-
-	enabled, ok := titleGen["enabled"].(bool)
-	if !ok {
-		t.Fatalf("expected boolean 'enabled' in title_generation config, got: %v", titleGen)
-	}
-
-	if enabled {
-		t.Errorf("auxiliary.title_generation.enabled must be false, got true")
-	}
-}
-
 // The managed .env exists for one reason: gateway/config.py applies env overrides AFTER
 // the managed overlay, so a container env var beats a pinned `platforms.*` leaf. Pinning
 // the same answer in the .env — which load_hermes_dotenv applies last with override=True,
