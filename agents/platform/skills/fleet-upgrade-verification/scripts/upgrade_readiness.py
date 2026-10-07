@@ -252,9 +252,12 @@ WEBHOOK_SERVICE_FORMAT = "{namespace}/{name}"
 WEBHOOK_FINDING_FORMAT = "{webhook} ({config_kind}): failurePolicy Fail and {reason}; matches {matches}"
 WEBHOOK_OUTAGE_MATCHES = "none of the operations this rule reads as the upgrade's path (its rules: {rules}); it fails its own requests now and is reported, not graded"
 # A webhook's rules, rendered for the cell so the operator can judge an outage: operations
-# joined by `/`, resources by `,`, with the API groups named when any is not the core group.
+# joined by `/`, resources by `,`, with the API groups named when any is not the core group,
+# and the core group then named `core` beside the others rather than dropped (a rule on
+# `["", "apps"]` gates core resources too, and a cell that says only `in apps` misreads it).
 RULE_FORMAT = "{operations} {resources}"
 RULE_GROUP_FORMAT = "{rule} in {groups}"
+RULE_CORE_GROUP_NAME = "core"
 RULE_OPERATION_JOIN = "/"
 RULE_RESOURCE_JOIN = ","
 RULE_NONE = "no rules"
@@ -862,9 +865,9 @@ def describe_rules(hook: dict) -> list[str]:
         operations = RULE_OPERATION_JOIN.join(str(o) for o in rule.get("operations") or [])
         resources = RULE_RESOURCE_JOIN.join(str(r) for r in rule.get("resources") or [])
         text = RULE_FORMAT.format(operations=operations, resources=resources).strip()
-        groups = [str(g) for g in rule.get("apiGroups") or [] if g]
-        if groups:
-            text = RULE_GROUP_FORMAT.format(rule=text, groups=RULE_RESOURCE_JOIN.join(groups))
+        groups = [str(g) for g in rule.get("apiGroups") or []]
+        if any(groups):
+            text = RULE_GROUP_FORMAT.format(rule=text, groups=RULE_RESOURCE_JOIN.join(g or RULE_CORE_GROUP_NAME for g in groups))
         out.append(text)
     return out
 

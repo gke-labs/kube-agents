@@ -512,6 +512,12 @@ class WebhookScopeTest(unittest.TestCase):
         self.assertEqual(graded["outage"][0]["rules"], ["CREATE/UPDATE rules,clusterrules in monitoring.googleapis.com", "CREATE configmaps"])
         self.assertIn("(its rules: CREATE/UPDATE rules,clusterrules in monitoring.googleapis.com, CREATE configmaps)", r.describe_webhook_finding(graded["outage"][0]))
 
+    def test_an_outage_cell_names_the_core_group_beside_another(self):
+        # A rule on `["", "apps"]` gates core resources too: the cell says `core,apps`, not `apps`.
+        hook_rules = [rule(["configmaps", "deployments"], groups=("", "apps")), rule(["configmaps"], groups=("",)), rule(["rules"], groups=("monitoring.googleapis.com", ""))]
+        graded = grade([hook("policy.example.com", hook_rules, policy="Fail")])
+        self.assertEqual(graded["outage"][0]["rules"], ["CREATE configmaps,deployments in core,apps", "CREATE configmaps", "CREATE rules in monitoring.googleapis.com,core"])
+
     def test_each_upgrade_path_target(self):
         self.assertEqual(self._path([rule(["pods"])]), ["CREATE pods"])
         self.assertEqual(self._path([rule(["pods/binding"])]), ["CREATE pods/binding"])
