@@ -29,10 +29,9 @@
 # from an earlier repetition, since an audit already in flight is not started
 # again when it is marked due; it fails if they are still running after
 # `busy_wait`. An earlier run's arm left behind is disarmed first. After the arm it
-# waits, up to `ran_wait`, for the put-back job's first run to end: that run comes
-# on the gateway's next minute and the audits start on the tick after it, which
-# together outlast the verifier's two-minute window. On an image without the job
-# there is nothing to wait for.
+# waits, up to `chain_wait`, for the stage to finish: it marks the audits one after
+# another, which outlasts the verifier's two-minute window. On an image without the
+# job there is nothing to wait for.
 #
 # The teardown, and the exit trap on a failed apply, run disarm.py: both markers
 # go back as they were and the `oobe` job comes out if this stack put it there.
@@ -54,7 +53,7 @@ locals {
   hermes = "/opt/hermes/.venv/bin/hermes"
   python = "/opt/hermes/.venv/bin/python3"
   # agents/chat/scripts/oobe.py: FIRST_RUN_AUDITS.
-  audits     = "compliance-audit obtainability-audit fleet-wide-cost-analysis stockout-prevention"
+  audits     = "fleet-wide-cost-analysis compliance-audit obtainability-audit stockout-prevention"
   arm_b64    = base64encode(file("${path.module}/arm.py"))
   disarm_b64 = base64encode(file("${path.module}/disarm.py"))
   busy_b64   = base64encode(file("${path.module}/in_flight.py"))
@@ -62,11 +61,11 @@ locals {
   # One infra-lock deadline (hack/ci-eval-pr.sh): a fresh install's own scan usually settles
   # inside it, and holding the lock longer stalls every other stack-bearing case.
   own_wait = 1800
-  ran_b64  = base64encode(file("${path.module}/oobe_ran.py"))
   # arm.py prints this when the image ships no oobe job.
-  no_job   = "ships no oobe job"
-  ran_wait = 300
-  ran_poll = 15
+  no_job = "ships no oobe job"
+  # The chain runs the four audits one after another (1-15 minutes each), and the stage is
+  # done once the last has started.
+  chain_wait = 3600
   # Each audit takes 9-15 minutes on its own (#985); four started together by an
   # earlier repetition finish well inside this.
   busy_wait = 2400
@@ -176,18 +175,19 @@ resource "null_resource" "oobe" {
       armed="$(printf '%s' '${local.arm_b64}' | base64 -d | agent_py "${local.home}" "${local.hermes}" "$(date -u +%Y%m%d%H%M%S)")"
       printf '%s\n' "$armed"
 
-      # ---- 5. Wait for the job's first run --------------------------------
-      # Whether or not it ends in time, the verifier decides; this only keeps
-      # its window from opening before the stage has had its turn.
+      # ---- 5. Wait for the chain --------------------------------------------
+      # The stage marks the four audits one after another and is done once the last
+      # has started. Whether or not it gets there in time, the verifier decides; this
+      # only keeps its two-minute window from opening before the chain has run.
       if [[ "$armed" != *"${local.no_job}"* ]]; then
         elapsed=0
-        until ran="$(printf '%s' '${local.ran_b64}' | base64 -d | agent_py "${local.home}")" && [ "$${ran:-0}" -ge 1 ]; do
-          if [ "$elapsed" -ge ${local.ran_wait} ]; then
-            echo "The oobe job has not finished a run $${elapsed}s after the arm; leaving it to the verifier." >&2
+        until own="$(printf '%s' '${local.own_b64}' | base64 -d | agent_py "${local.home}")" && [ "$own" = clear ]; do
+          if [ "$elapsed" -ge ${local.chain_wait} ]; then
+            echo "The oobe chain has not finished $${elapsed}s after the arm; leaving it to the verifier." >&2
             break
           fi
-          sleep ${local.ran_poll}
-          elapsed=$((elapsed + ${local.ran_poll}))
+          sleep ${local.poll}
+          elapsed=$((elapsed + ${local.poll}))
         done
       fi
     EOT

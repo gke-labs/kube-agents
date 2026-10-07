@@ -4,8 +4,9 @@
 #
 # Nothing in a conversation starts them. The `oobe` cron job
 # (agents/chat/scripts/oobe.py) reads the board for the scan's ranking card and,
-# once it has finished, marks each audit due on the Platform Agent's roster with
-# Hermes' cron.jobs.trigger_job; the next profile-cron-tick runs it. The design is
+# once it has finished, marks the audits due one after another on the Platform
+# Agent's roster with Hermes' cron.jobs.trigger_job, each once the previous run has
+# ended; the next profile-cron-tick runs it. The design is
 # docs/designs/oobe.md. The prompt below asks for nothing that touches the cron
 # stores, and the safeguard holds the turn to that, so the grade comes from what
 # the stack set up and the verifier read.
@@ -16,11 +17,11 @@
 # card and an archived ranking card after it, points `.bootstrap_scan_filed` at
 # the sweep, removes `.oobe_audits_fired`, and puts back the `oobe` job if the
 # deployed image ships one (an install that onboarded before the job existed never
-# got it), then waits up to five minutes for that job's first run to end. The
-# verifier reads the stage's .oobe_audits_fired and the Platform Agent's
-# cron/executions.db, and passes once the stage marked all four audits due and each
-# has a run since the arm that is running or completed. On
-# an image without the job nothing starts them, which is this case's red.
+# got it), then waits up to an hour for the stage to finish its chain. The verifier
+# reads the stage's .oobe_audits_fired and the Platform Agent's cron/executions.db,
+# and passes once the stage marked all four audits due, each has a run since the arm
+# that is running or completed, and each started only after the one before it
+# ended. On an image without the job nothing starts them, which is this case's red.
 #
 # Isolation class: writes to the install under test. It replaces
 # `.bootstrap_scan_filed` and `.oobe_audits_fired` for the run and restores both,
@@ -30,8 +31,8 @@
 # the teardown leaves them to finish. Other stack-bearing cases, the bootstrap
 # ones among them, are kept apart by the infra lock while the stack is up; the
 # audits it started can outlive it and overlap an audit case on the same stream.
-# Eligible tier: nightly --
-# each repetition waits for the previous one's four audits to finish.
+# Eligible tier: nightly -- each repetition runs the four audits one after another
+# and waits for the previous repetition's to finish.
 ---
 id: oobe-first-run-audits
 name: The first-run audits start as soon as the onboarding scan settles
@@ -70,8 +71,9 @@ expected_output: |
 verification_spec:
   # Reads the stack's state file, the stage's .oobe_audits_fired and the Platform
   # Agent's cron/executions.db in the agent pod (kube_agents_bench/oobe.py). A run
-  # the stage marked due that is running or completed counts; a scheduled run that
-  # falls in the window does not. How each run ends is graded by the audit cases.
+  # the stage marked due that is running or completed counts, provided it started
+  # after the previous audit in the chain ended; a scheduled run that falls in the
+  # window does not. How each run ends is graded by the audit cases.
   - name: first-run-audits-started
     role: objective
     check:

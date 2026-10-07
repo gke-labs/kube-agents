@@ -104,21 +104,31 @@ new one. The stage records the skip and starts nothing; the audits run on their 
 
 ### 4.2 Which audits
 
-The four audits [#1866](https://github.com/gke-labs/kube-agents/issues/1866) names (cost, security, reliability, capacity), by their job ids in
+The four audits [#1866](https://github.com/gke-labs/kube-agents/issues/1866) names, in the order it
+chains them (cost, security, reliability, capacity), by their job ids in
 `agents/platform/cron/jobs.json`:
 
-| Job id                     | Audit                            | Normal schedule (UTC) |
-| -------------------------- | -------------------------------- | --------------------- |
-| `compliance-audit`         | Security and RBAC posture        | Daily 06:20           |
-| `obtainability-audit`      | Workload reliability             | Daily 06:50           |
-| `fleet-wide-cost-analysis` | Fleet waste                      | Mondays 07:50         |
-| `stockout-prevention`      | Stockout prevention and capacity | Daily 09:20           |
+| Order | Job id                     | Audit                            | Normal schedule (UTC) |
+| ----- | -------------------------- | -------------------------------- | --------------------- |
+| 1     | `fleet-wide-cost-analysis` | Fleet waste                      | Mondays 07:50         |
+| 2     | `compliance-audit`         | Security and RBAC posture        | Daily 06:20           |
+| 3     | `obtainability-audit`      | Workload reliability             | Daily 06:50           |
+| 4     | `stockout-prevention`      | Stockout prevention and capacity | Daily 09:20           |
 
 The other five governance jobs keep their schedules.
 
 ### 4.3 Firing
 
-For each audit, `oobe.py` calls Hermes' `cron.jobs.trigger_job(<id>)` in a subprocess of the
+The audits run as a chain, back to back: the next is marked due only once the previous one's run
+has ended, whatever its outcome. The shipped schedule staggers the audits for the same reason
+(`autonomous-watchdogs.md`: "Stagger start minutes so two audits never contend for the same
+session"). Four started in the same minute put a fresh CI install's gateway pod under memory
+pressure for the best part of an hour and broke the cluster reads of a case running beside them.
+A mark the scheduler has not claimed after `START_LIMIT_SECONDS` (10 minutes) is made again, as a
+failed attempt; a run still going after `RUN_LIMIT_SECONDS` (an hour), or a row a gateway restart
+left at running, stops holding the chain. The stage is done once the last audit's run has started.
+
+For each audit in turn, `oobe.py` calls Hermes' `cron.jobs.trigger_job(<id>)` in a subprocess of the
 gateway's own interpreter with `HERMES_HOME=<agent home>/profiles/platform`, which is where
 `cron.jobs` finds the Platform Agent's store. That sets the job's `next_run_at` to now; the next
 `profile-cron-tick` runs it within a minute through the schedule's own path, with its prompt,
@@ -129,8 +139,9 @@ calling process (`hermes_cli/cron.py`, `_job_action` forces it), so a per-minute
 a model run open, outside the tick's environment, until it times out. `cronjob(action='run')` does
 the same on some runtimes (`agents/platform/AGENTS.md`).
 
-`.oobe_audits_fired` records each id once it is marked due. A failed one is retried on the next
-tick, and only that one: marking an audit due again after it has run starts a second full run.
+`.oobe_audits_fired` records each id once it is marked due, and the one in flight with when it was
+marked. A failed mark is retried on the next tick, and only that one: marking an audit due again
+after it has run starts a second full run.
 
 `trigger_job` also sets the job's `enabled` back to true and clears a pause, so an
 audit an operator has disabled or paused, or one missing from the Platform Agent's roster, is
@@ -236,21 +247,20 @@ finish, so it never cuts across a fresh install's real scan, then re-arms the st
 archived stand-in sweep card and an archived ranking card after it, points `.bootstrap_scan_filed`
 at the sweep, clears `.oobe_audits_fired`, and puts back the `oobe` job when the image ships one;
 the teardown restores both markers and the job as it found them.
-The stack then waits for the put-back job's first run to end, so the verifier's two-minute window
-opens after the stage has had its turn. The verifier reads the Platform Agent's cron run records and
-passes when the stage's `.oobe_audits_fired` lists all four audits as marked due and each has a run claimed since the arm that is running or completed, so a scheduled run that falls in the window does not count. Red: on
+The stack then waits, up to an hour, for the stage to finish its chain, so the verifier's two-minute window opens after the last audit has started. The verifier reads the Platform Agent's cron run records and
+passes when the stage's `.oobe_audits_fired` lists all four audits as marked due and each has a run claimed since the arm that is running or completed, so a scheduled run that falls in the window does not count, and each started only after the one before it in the chain ended. Red: on
 an image without the job, no audit runs. Green: four, in three repetitions. The no-repository skip is unit-tested,
 not evaluated: the shared install has a repository, and removing it mid-run would break concurrent
 cases.
 
 ## 9. Open questions
 
-- **Model quota.** `profile-cron-tick` starts the four together, on one tick; on a four-cluster
-  install with `gemini-3.1-flash-lite` they finished in one to eight minutes. A larger fleet or a
-  smaller quota may hit per-minute limits with four audit runs at once.
+- **Chain length.** Each audit took one to eight minutes on a four-cluster install with
+  `gemini-3.1-flash-lite`, so the chain ends within about half an hour of the scan there. On a large
+  fleet the last audit may land an hour or more after the scan.
 - **Output volume.** How many pull requests and chat lines a first run produces on a real fleet. If
   it reads as noise, day one narrows to cost and capacity, the two audits the inventory report does
   not overlap.
-- **CI installs.** A fresh CI install starts the four audits during an eval run, alongside the
-  audit cases that start the same audits on demand. The first nightly shows whether the two collide
-  on a ledger issue.
+- **CI installs.** A fresh CI install runs the chain during an eval run, beside the audit cases
+  that start the same audits on demand. The first smoke run with all four started together showed
+  the cost; the chain keeps it to one audit at a time, as on a scheduled morning.

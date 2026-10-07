@@ -37,8 +37,8 @@ from kube_agents_bench import onboarding
 from kube_agents_bench.verifiers import _OnboardingPollVerifier
 from kube_agents_bench.worker_trajectory import DATA_ROOT, FALLBACK_PYTHON, HERMES_PYTHON
 
-# agents/chat/scripts/oobe.py: FIRST_RUN_AUDITS.
-FIRST_RUN_AUDITS = ("compliance-audit", "obtainability-audit", "fleet-wide-cost-analysis", "stockout-prevention")
+# agents/chat/scripts/oobe.py: FIRST_RUN_AUDITS, in the order the stage chains them.
+FIRST_RUN_AUDITS = ("fleet-wide-cost-analysis", "compliance-audit", "obtainability-audit", "stockout-prevention")
 # bench/tf/prebuilt/oobe-first-run-audits/arm.py: STATE.
 STATE_FILE = f"{DATA_ROOT}/.bench-oobe.json"
 # agents/chat/scripts/oobe.py: AUDITS_MARKER and its STATE_FIRED list, what the stage marked due.
@@ -82,11 +82,11 @@ if out["applied_at"] and not out["error"]:
         armed = datetime.fromisoformat(out["applied_at"]).timestamp()
         con = sqlite3.connect("file:" + db + "?mode=ro", uri=True, timeout=SQLITE_BUSY_TIMEOUT)
         for audit in audits:
-            for status, claimed in con.execute(
-                "SELECT status, claimed_at FROM executions WHERE job_id = ? AND claimed_at IS NOT NULL"
+            for status, claimed, finished in con.execute(
+                "SELECT status, claimed_at, finished_at FROM executions WHERE job_id = ? AND claimed_at IS NOT NULL"
                 " ORDER BY claimed_at DESC", (audit,)):
                 if datetime.fromisoformat(claimed).timestamp() >= armed:
-                    out["runs"][audit] = {"status": status, "claimed_at": claimed}
+                    out["runs"][audit] = {"status": status, "claimed_at": claimed, "finished_at": finished}
                 break
     except (sqlite3.Error, ValueError, TypeError) as exc:
         out["error"] = "%s: %s" % (db, exc)
@@ -127,10 +127,21 @@ def read_starts(shell: Callable[[str, float], str], timeout: float) -> dict[str,
     return parsed
 
 
+def _overlaps(runs: dict[str, dict[str, Any]]) -> list[str]:
+    """Each audit that started before the one before it in the chain had ended."""
+    found = []
+    for earlier, later in zip(FIRST_RUN_AUDITS, FIRST_RUN_AUDITS[1:]):
+        ended = runs[earlier].get("finished_at")
+        began = runs[later]["claimed_at"]
+        if not ended or datetime.fromisoformat(began) < datetime.fromisoformat(ended):
+            found.append(f"{later} started at {began} while {earlier} {'ran until ' + ended if ended else 'had not ended'}")
+    return found
+
+
 @VERIFIERS.register("oobe_audits_started")
 class OobeAuditsStartedVerifier(_OnboardingPollVerifier):
-    """Passes once the stage marked every first-run audit due and each has a run since the arm
-    that is running or completed.
+    """Passes once the stage marked every first-run audit due, each has a run since the arm that
+    is running or completed, and each started only after the one before it in the chain ended.
 
     A row only claimed, skipped or failed does not count: a run cut off at its start leaves
     exactly that. Nor does a run the stage did not mark: a scheduled run that falls in the
@@ -155,7 +166,10 @@ class OobeAuditsStartedVerifier(_OnboardingPollVerifier):
         running = [a for a in FIRST_RUN_AUDITS if runs.get(a, {}).get("status") in STARTED_STATUSES]
         started = [a for a in running if a in marked]
         if len(started) == len(FIRST_RUN_AUDITS):
-            return "pass", f"all {len(FIRST_RUN_AUDITS)} first-run audits were marked due by the stage and are running or done since {armed}", read
+            overlaps = _overlaps(runs)
+            if overlaps:
+                return "fail", f"the first-run audits overlapped instead of running one after another: {'; '.join(overlaps)}", read
+            return "pass", f"all {len(FIRST_RUN_AUDITS)} first-run audits were marked due by the stage and ran one after another since {armed}", read
         stalled = [f"{a} ({runs[a].get('status')})" for a in FIRST_RUN_AUDITS if a in runs and a not in running]
         missing = [a for a in FIRST_RUN_AUDITS if a not in runs]
         unmarked = [a for a in running if a not in marked]

@@ -81,14 +81,23 @@ class Store:
         self.state.write_text(json.dumps({"applied_at": at.isoformat()}))
         self.marker.write_text(json.dumps({"fired": list(marked)}))
 
-    def run(self, job: str, claimed: datetime, status: str = "running") -> None:
+    def run(self, job: str, claimed: datetime, status: str = "running", finished: datetime | None = None) -> None:
         self.rows += 1
         with sqlite3.connect(self.db) as con:
             con.execute(
-                "INSERT INTO executions (id, job_id, source, process_id, pid, status, claimed_at)"
-                " VALUES (?,?,?,?,?,?,?)",
-                (f"{self.rows:032x}", job, "builtin", "p", 1, status, claimed.isoformat()),
+                "INSERT INTO executions (id, job_id, source, process_id, pid, status, claimed_at, finished_at)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (f"{self.rows:032x}", job, "builtin", "p", 1, status, claimed.isoformat(),
+                 finished.isoformat() if finished else None),
             )
+
+    def chain(self, start: datetime, last_status: str = "running") -> None:
+        """The four runs one after another, the last still going unless told otherwise."""
+        at = start
+        for i, audit in enumerate(oobe.FIRST_RUN_AUDITS):
+            last = i == len(oobe.FIRST_RUN_AUDITS) - 1
+            self.run(audit, at, last_status if last else "completed", None if last else at + timedelta(minutes=3))
+            at += timedelta(minutes=4)
 
 
 @pytest.fixture
@@ -130,12 +139,32 @@ def test_the_case_names_this_check_and_the_entry_point_is_registered() -> None:
 # --- the verdict ----------------------------------------------------------
 
 
-def test_every_audit_started_since_the_arm_passes(store: Store) -> None:
+def test_every_audit_started_in_turn_since_the_arm_passes(store: Store) -> None:
+    store.arm()
+    store.chain(ARMED + timedelta(minutes=2))
+    result = _verify()
+    assert result.status == "pass", result.reason
+
+
+def test_audits_that_overlap_fail(store: Store) -> None:
     store.arm()
     for audit in oobe.FIRST_RUN_AUDITS:
         store.run(audit, ARMED + timedelta(minutes=2))
     result = _verify()
-    assert result.status == "pass", result.reason
+    assert result.status == "fail"
+    assert "overlapped" in result.reason
+
+
+def test_the_audit_list_matches_the_stage(store: Store) -> None:
+    import ast
+
+    tree = ast.parse(STAGE.read_text())
+    shipped = next(
+        ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "FIRST_RUN_AUDITS" for t in node.targets)
+    )
+    assert tuple(shipped) == oobe.FIRST_RUN_AUDITS
 
 
 def test_a_run_from_before_the_arm_does_not_count(store: Store) -> None:
@@ -158,8 +187,7 @@ def test_a_missing_audit_is_named(store: Store) -> None:
 
 def test_completed_runs_pass(store: Store) -> None:
     store.arm()
-    for audit in oobe.FIRST_RUN_AUDITS:
-        store.run(audit, ARMED + timedelta(minutes=2), "completed")
+    store.chain(ARMED + timedelta(minutes=2), last_status="completed")
     assert _verify().status == "pass"
 
 

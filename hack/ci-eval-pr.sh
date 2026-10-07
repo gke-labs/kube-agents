@@ -2156,11 +2156,10 @@ unit_cost_hint() {
     # and the agent turn is a board read. Unmeasured; priced below the band
     # above because one card's worker is the whole of the wait.
     bootstrap-inventory-ranking-delivery) echo 600 ;;
-    # Tofu too: the stack waits until the previous repetition's four audits
-    # have finished (9-15 min each, #985; up to its busy_wait, 2400s), then the
-    # verifier waits a minute or two for the oobe tick and the cron tick to
-    # start them. Unmeasured; the first repetition has nothing to wait for.
-    oobe-first-run-audits) echo 1500 ;;
+    # Tofu too: the stack waits for the previous repetition's audits to finish,
+    # then for the stage to run the four one after another (1-15 min each,
+    # #985; up to its chain_wait, 3600s). Unmeasured on CI.
+    oobe-first-run-audits) echo 2400 ;;
     # The nightly-only full audits: 600-1300s a repetition on 2026-08-26,
     # planted-pdb's 962s the one clean measurement. Priced with the 900 band
     # so a nightly run launches them first. fleet-cost-idle-pool joined the

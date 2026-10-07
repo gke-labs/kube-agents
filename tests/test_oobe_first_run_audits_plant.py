@@ -39,7 +39,7 @@ from datetime import datetime, timedelta, timezone
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 STACK = REPO / "bench" / "tf" / "prebuilt" / "oobe-first-run-audits"
-AUDITS = ["compliance-audit", "obtainability-audit", "fleet-wide-cost-analysis", "stockout-prevention"]
+AUDITS = ["fleet-wide-cost-analysis", "compliance-audit", "obtainability-audit", "stockout-prevention"]
 OOBE_JOB = {"id": "oobe", "script": "oobe.py", "no_agent": True, "schedule": {"kind": "cron", "expr": "* * * * *"}}
 OTHER_JOB = {"id": "profile-cron-tick", "schedule": {"kind": "cron", "expr": "* * * * *"}}
 NOW = datetime.now(timezone.utc).isoformat()
@@ -294,37 +294,13 @@ class PlantScriptsTest(unittest.TestCase):
     def test_in_flight_with_no_store_is_zero(self):
         self.assertEqual(self._run("in_flight.py", str(self.home), *AUDITS).stdout.strip(), "0")
 
-    # --- oobe ran ----------------------------------------------------------------
-
-    def _ledger(self, rows):
-        cron = self.home / "cron"
-        cron.mkdir(exist_ok=True)
-        with sqlite3.connect(cron / "executions.db") as con:
-            con.execute("CREATE TABLE IF NOT EXISTS executions (id TEXT, job_id TEXT, status TEXT, claimed_at TEXT)")
-            con.executemany("INSERT INTO executions VALUES (?, ?, ?, ?)", rows)
-
-    def test_oobe_ran_counts_only_runs_that_ended_since_the_arm(self):
-        self.assertEqual(self._arm().returncode, 0)
-        armed = self._state()["applied_at"]
-        self._ledger([
-            ("1", "oobe", "completed", "2026-01-01T00:00:00+00:00"),
-            ("2", "oobe", "running", "2999-01-01T00:00:00+00:00"),
-            ("3", "profile-cron-tick", "completed", "2999-01-01T00:00:00+00:00"),
-        ])
-        self.assertEqual(self._run("oobe_ran.py", str(self.home)).stdout.strip(), "0")
-        self._ledger([("4", "oobe", "completed", armed)])
-        self.assertEqual(self._run("oobe_ran.py", str(self.home)).stdout.strip(), "1")
-
-    def test_oobe_ran_with_no_state_prints_nothing(self):
-        done = self._run("oobe_ran.py", str(self.home))
-        self.assertNotEqual(done.returncode, 0)
-        self.assertEqual(done.stdout, "")
+    # --- the chain wait ----------------------------------------------------------
 
     def test_the_wait_is_skipped_on_an_image_without_the_job(self):
         bare = self.shipped.with_name("bare.json")
         bare.write_text(json.dumps({"jobs": [OTHER_JOB]}))
         self.assertIn("ships no oobe job", self._arm(bare).stdout)
-        self.assertIn('no_job   = "ships no oobe job"', (STACK / "main.tf").read_text())
+        self.assertIn('no_job = "ships no oobe job"', (STACK / "main.tf").read_text())
 
     # --- the provisioners -------------------------------------------------------
 

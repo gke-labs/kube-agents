@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import types
+from datetime import datetime, timezone
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -30,6 +31,8 @@ SWEEP_CREATED_AT = FILED_AT
 NOW_SETTLED = FILED_AT + 600
 NOW_PAST_FALLBACK = FILED_AT + oobe.fallback_seconds(0)
 REPOS = ["acme/gitops"]
+FIRST = [oobe.FIRST_RUN_AUDITS[0]]
+MINUTE = 60
 
 
 def _board(path: Path, cards: list[tuple[str, str, str, int]]) -> None:
@@ -94,6 +97,29 @@ class StageTest(unittest.TestCase):
     def _started_ids(self) -> list[str]:
         return [argv[-1] for argv, _env in self.started]
 
+    def _ledger(self, job_id: str, status: str, claimed_at: float) -> None:
+        """A run row in the Platform Agent's cron store, as profile-cron-tick leaves one."""
+        db = self.d / "profiles" / "platform" / "cron" / oobe.EXECUTIONS_DB
+        with sqlite3.connect(db) as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS executions (id INTEGER PRIMARY KEY, job_id TEXT, status TEXT, claimed_at TEXT)")
+            conn.execute(
+                "INSERT INTO executions (job_id, status, claimed_at) VALUES (?, ?, ?)",
+                (job_id, status, datetime.fromtimestamp(claimed_at, timezone.utc).isoformat()),
+            )
+
+    def _drive(self, now: float = NOW_SETTLED, ticks: int = 20) -> float:
+        """Tick the stage, completing each audit's run a minute after it is marked, until done."""
+        for _ in range(ticks):
+            self._main(now=now)
+            state = oobe.read_state(self.d)
+            if state.get(oobe.STATE_DONE):
+                return now
+            current = state.get(oobe.STATE_CURRENT)
+            if current and current[oobe.CURRENT_MARKED_AT] == now:
+                self._ledger(current[oobe.CURRENT_JOB], "completed", now + MINUTE)
+            now += 2 * MINUTE
+        self.fail("the chain did not finish")
+
     # --- when the stage fires -------------------------------------------------
 
     def test_nothing_before_the_scan_is_filed(self):
@@ -106,8 +132,10 @@ class StageTest(unittest.TestCase):
         self._file_scan()
         _board(self.board, [_ranking("done")])
         self._main()
-        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
-        self.assertTrue(oobe.read_state(self.d)[oobe.STATE_DONE])
+        self.assertEqual(self._started_ids(), FIRST)
+        state = oobe.read_state(self.d)
+        self.assertFalse(state[oobe.STATE_DONE])
+        self.assertEqual(state[oobe.STATE_CURRENT][oobe.CURRENT_JOB], FIRST[0])
 
     def test_waits_while_the_ranking_card_runs(self):
         self._file_scan()
@@ -125,7 +153,7 @@ class StageTest(unittest.TestCase):
                 self._file_scan()
                 _board(self.board, [_ranking(status)])
                 self._main()
-                self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+                self.assertEqual(self._started_ids(), FIRST)
 
     def test_the_hand_offs_no_ranking_record_fires_at_once(self):
         # No cluster audited: the hand-off wrote the report itself and files no ranking card.
@@ -133,7 +161,7 @@ class StageTest(unittest.TestCase):
         _board(self.board, [])
         (self.d / ".bootstrap_handoff_filed").write_text(f"sweep={SWEEP_ID}\ntask_id=none\nfiled_at={FILED_AT}\n")
         self._main()
-        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+        self.assertEqual(self._started_ids(), FIRST)
 
     def test_the_hand_offs_recorded_card_decides(self):
         # Only the card the hand-off filed counts, whatever else sits under the key.
@@ -145,7 +173,7 @@ class StageTest(unittest.TestCase):
         self.board.unlink()
         _board(self.board, [_ranking("running", tid="t_stray"), _ranking("done", tid="t_real")])
         self._main()
-        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+        self.assertEqual(self._started_ids(), FIRST)
 
     def test_a_record_for_another_sweep_is_ignored(self):
         self._file_scan()
@@ -159,7 +187,7 @@ class StageTest(unittest.TestCase):
         (self.d / oobe.SCAN_FILED_MARKER).write_text(f"task_id = {SWEEP_ID}\nfiled_at = {FILED_AT}\n")
         _board(self.board, [_ranking("done")])
         self._main()
-        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+        self.assertEqual(self._started_ids(), FIRST)
 
     def test_a_blocked_ranking_card_waits_for_the_fallback(self):
         # A card a person may still unblock.
@@ -168,7 +196,7 @@ class StageTest(unittest.TestCase):
         self._main()
         self.assertEqual(self.started, [])
         self._main(now=NOW_PAST_FALLBACK)
-        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+        self.assertEqual(self._started_ids(), FIRST)
 
     def test_waits_while_a_retry_still_runs(self):
         self._file_scan()
@@ -180,14 +208,14 @@ class StageTest(unittest.TestCase):
         self._file_scan()
         _board(self.board, [_ranking("done", key=oobe.bootstrap_handoff.PRIORITIZE_KEY + "-retry-1")])
         self._main()
-        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+        self.assertEqual(self._started_ids(), FIRST)
 
     def test_an_archived_ranking_card_counts(self):
         # How the eval stack presents a settled scan (bench/tf/prebuilt/oobe-first-run-audits).
         self._file_scan()
         _board(self.board, [_ranking("archived", key=oobe.bootstrap_handoff.PRIORITIZE_KEY + "-oobe-eval-20261006")])
         self._main()
-        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+        self.assertEqual(self._started_ids(), FIRST)
 
     def test_an_earlier_runs_ranking_card_does_not_count(self):
         # Left on the board by a run before onboarding was re-armed.
@@ -203,7 +231,7 @@ class StageTest(unittest.TestCase):
         self._main()
         self.assertEqual(self.started, [])
         self._main(now=NOW_PAST_FALLBACK)
-        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+        self.assertEqual(self._started_ids(), FIRST)
 
     def test_a_large_fleet_waits_out_the_hand_offs_deadline(self):
         # The hand-off files the ranking card only after its per-cluster deadline.
@@ -213,7 +241,7 @@ class StageTest(unittest.TestCase):
         self._main(now=NOW_PAST_FALLBACK)
         self.assertEqual(self.started, [])
         self._main(now=FILED_AT + oobe.fallback_seconds(10))
-        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+        self.assertEqual(self._started_ids(), FIRST)
 
     def test_the_fallback_follows_the_hand_offs_deadline(self):
         handoff = oobe.bootstrap_handoff
@@ -228,7 +256,7 @@ class StageTest(unittest.TestCase):
         self._main()
         self.assertEqual(self.started, [])
         self._main(now=NOW_PAST_FALLBACK)
-        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+        self.assertEqual(self._started_ids(), FIRST)
 
     def test_a_marker_without_filed_at_falls_back_to_its_age(self):
         (self.d / oobe.SCAN_FILED_MARKER).write_text(f"task_id={SWEEP_ID}\n", encoding="utf-8")
@@ -237,17 +265,24 @@ class StageTest(unittest.TestCase):
         self._main(now=mtime + 60)
         self.assertEqual(self.started, [])
         self._main(now=mtime + oobe.fallback_seconds(0))
-        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+        self.assertEqual(self._started_ids(), FIRST)
 
     # --- how it starts them ---------------------------------------------------
 
     def test_marks_each_audit_due_on_the_platform_roster(self):
         self._file_scan()
         _board(self.board, [_ranking("done")])
-        self._main()
+        self._drive()
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
         for argv, env in self.started:
             self.assertEqual(argv[:3], [sys.executable, "-c", oobe.TRIGGER_SCRIPT])
             self.assertEqual(env["HERMES_HOME"], str(self.d / "profiles" / "platform"))
+
+    def test_the_chain_follows_1866s_order(self):
+        self.assertEqual(
+            oobe.FIRST_RUN_AUDITS,
+            ("fleet-wide-cost-analysis", "compliance-audit", "obtainability-audit", "stockout-prevention"),
+        )
 
     def test_the_trigger_marks_the_job_due_and_does_not_run_it(self):
         # `hermes cron run` runs the job in the calling process; trigger_job only schedules it.
@@ -269,48 +304,112 @@ class StageTest(unittest.TestCase):
         _board(self.board, [_ranking("done")])
         self.assertEqual(self._main(), "")
 
-    def test_retries_only_the_audit_that_failed_to_start(self):
+    # --- the chain ------------------------------------------------------------
+
+    def test_the_next_audit_waits_for_the_previous_run_to_end(self):
         self._file_scan()
         _board(self.board, [_ranking("done")])
-        self.failing = {"fleet-wide-cost-analysis"}
-        self._main()
-        self.assertFalse(oobe.read_state(self.d)[oobe.STATE_DONE])
-        self.started.clear()
-        self.failing = set()
-        self._main()
-        self.assertEqual(self._started_ids(), ["fleet-wide-cost-analysis"])
+        self._main(now=NOW_SETTLED)
+        self.assertEqual(self._started_ids(), FIRST)
+        # Not yet claimed by the scheduler: nothing new.
+        self._main(now=NOW_SETTLED + MINUTE)
+        self.assertEqual(self._started_ids(), FIRST)
+        # Running: still nothing new.
+        self._ledger(FIRST[0], "running", NOW_SETTLED + MINUTE)
+        self._main(now=NOW_SETTLED + 2 * MINUTE)
+        self.assertEqual(self._started_ids(), FIRST)
+        # Ended: the next one is marked.
+        self._ledger(FIRST[0], "completed", NOW_SETTLED + 3 * MINUTE)
+        self._main(now=NOW_SETTLED + 4 * MINUTE)
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS[:2]))
+
+    def test_a_failed_run_still_moves_the_chain_on(self):
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._main(now=NOW_SETTLED)
+        self._ledger(FIRST[0], "failed", NOW_SETTLED + MINUTE)
+        self._main(now=NOW_SETTLED + 2 * MINUTE)
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS[:2]))
+
+    def test_a_run_from_before_the_mark_does_not_count(self):
+        # Yesterday's scheduled run of the same audit is not this mark's.
+        self._ledger(FIRST[0], "completed", NOW_SETTLED - 3600)
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._main(now=NOW_SETTLED)
+        self._main(now=NOW_SETTLED + MINUTE)
+        self.assertEqual(self._started_ids(), FIRST)
+
+    def test_it_is_done_once_the_last_audit_has_started(self):
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._drive()
+        state = oobe.read_state(self.d)
+        self.assertTrue(state[oobe.STATE_DONE])
+        self.assertEqual(state[oobe.STATE_FIRED], list(oobe.FIRST_RUN_AUDITS))
+
+    def test_done_while_the_last_audit_is_still_running(self):
+        # Nothing is left to mark, so the stage need not wait for the last run to end.
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        now = NOW_SETTLED
+        for job_id in oobe.FIRST_RUN_AUDITS:
+            self._main(now=now)
+            status = "running" if job_id == oobe.FIRST_RUN_AUDITS[-1] else "completed"
+            self._ledger(job_id, status, now + MINUTE)
+            now += 2 * MINUTE
+        self._main(now=now)
         self.assertTrue(oobe.read_state(self.d)[oobe.STATE_DONE])
 
-    def test_a_run_killed_partway_does_not_start_an_audit_twice(self):
+    def test_a_mark_never_claimed_is_made_again(self):
         self._file_scan()
         _board(self.board, [_ranking("done")])
-        real_run = self._run
+        self._main(now=NOW_SETTLED)
+        self._main(now=NOW_SETTLED + oobe.START_LIMIT_SECONDS)
+        self._main(now=NOW_SETTLED + oobe.START_LIMIT_SECONDS + MINUTE)
+        self.assertEqual(self._started_ids(), FIRST * 2)
+        self.assertEqual(oobe.read_state(self.d)[oobe.STATE_ATTEMPTS], {FIRST[0]: 1})
 
-        def killed_on_the_second(argv, env=None, **kwargs):
-            if len(self.started) == 1:
-                raise KeyboardInterrupt
-            return real_run(argv, env=env, **kwargs)
+    def test_a_run_that_never_ends_stops_holding_the_chain(self):
+        # A row a gateway restart left at running.
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._main(now=NOW_SETTLED)
+        self._ledger(FIRST[0], "running", NOW_SETTLED + MINUTE)
+        self._main(now=NOW_SETTLED + oobe.RUN_LIMIT_SECONDS - MINUTE)
+        self.assertEqual(self._started_ids(), FIRST)
+        self._main(now=NOW_SETTLED + oobe.RUN_LIMIT_SECONDS)
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS[:2]))
 
-        with mock.patch.object(oobe.subprocess, "run", killed_on_the_second):
-            with self.assertRaises(KeyboardInterrupt):
-                self._main()
-        self.assertEqual(oobe.read_state(self.d)[oobe.STATE_FIRED], [oobe.FIRST_RUN_AUDITS[0]])
-        self.started.clear()
+    def test_retries_an_audit_that_failed_to_start(self):
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self.failing = {FIRST[0]}
         self._main()
-        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS[1:]))
+        self.assertEqual(oobe.read_state(self.d)[oobe.STATE_FIRED], [])
+        self.failing = set()
+        self._main(now=NOW_SETTLED + MINUTE)
+        self.assertEqual(self._started_ids(), FIRST * 2)
+        self.assertEqual(oobe.read_state(self.d)[oobe.STATE_FIRED], FIRST)
+
+    def test_a_run_killed_partway_does_not_start_an_audit_twice(self):
+        # Killed after marking, before the next tick: the mark is in the marker.
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._main(now=NOW_SETTLED)
+        self.started.clear()
+        self._main(now=NOW_SETTLED + MINUTE)
+        self.assertEqual(self.started, [])
 
     def test_gives_up_on_an_audit_that_never_starts(self):
         self._file_scan()
         _board(self.board, [_ranking("done")])
         self.failing = {"stockout-prevention"}
-        for _ in range(oobe.MAX_TRIGGER_ATTEMPTS):
-            self._main()
+        self._drive()
         state = oobe.read_state(self.d)
         self.assertTrue(state[oobe.STATE_DONE])
         self.assertEqual(state[oobe.STATE_GAVE_UP], ["stockout-prevention"])
-        self.started.clear()
-        self._main()
-        self.assertEqual(self.started, [])
+        self.assertEqual(self._started_ids().count("stockout-prevention"), oobe.MAX_TRIGGER_ATTEMPTS)
 
     def test_a_trigger_that_times_out_is_a_failed_start(self):
         self._file_scan()
@@ -323,6 +422,7 @@ class StageTest(unittest.TestCase):
             self._main()
         state = oobe.read_state(self.d)
         self.assertEqual(state[oobe.STATE_FIRED], [])
+        self.assertEqual(state[oobe.STATE_ATTEMPTS], {FIRST[0]: 1})
         self.assertFalse(state[oobe.STATE_DONE])
 
     # --- an install that is not new -------------------------------------------
@@ -337,18 +437,16 @@ class StageTest(unittest.TestCase):
         self.assertTrue(state[oobe.STATE_DONE])
         self.assertEqual(state[oobe.STATE_REASON], oobe.SKIP_NOT_NEW)
 
-    def test_a_stage_already_under_way_is_not_cut_off_by_age(self):
+    def test_a_chain_already_under_way_is_not_cut_off_by_age(self):
         self._file_scan()
         _board(self.board, [_ranking("done")])
-        self.failing = {"stockout-prevention"}
         self._main()
-        self.started.clear()
-        self.failing = set()
+        self._ledger(FIRST[0], "completed", NOW_SETTLED + MINUTE)
         self._main(now=FILED_AT + oobe.NEW_INSTALL_SECONDS)
-        self.assertEqual(self._started_ids(), ["stockout-prevention"])
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS[:2]))
 
     def test_a_disabled_or_paused_audit_is_left_alone(self):
-        # `hermes cron run` would set enabled back to true.
+        # trigger_job would set enabled back to true.
         self._roster([
             {"id": "compliance-audit", "enabled": False},
             {"id": "obtainability-audit", "enabled": True, "state": "paused", "paused_at": "2026-10-06T00:00:00"},
@@ -356,7 +454,7 @@ class StageTest(unittest.TestCase):
         ])
         self._file_scan()
         _board(self.board, [_ranking("done")])
-        self._main()
+        self._drive()
         self.assertEqual(self._started_ids(), ["fleet-wide-cost-analysis"])
         state = oobe.read_state(self.d)
         self.assertEqual(state[oobe.STATE_HELD], {
@@ -374,7 +472,7 @@ class StageTest(unittest.TestCase):
         self.assertEqual(self.started, [])
         state = oobe.read_state(self.d)
         self.assertFalse(state[oobe.STATE_DONE])
-        self.assertEqual(set(state[oobe.STATE_ATTEMPTS]), set(oobe.FIRST_RUN_AUDITS))
+        self.assertEqual(state[oobe.STATE_ATTEMPTS], {FIRST[0]: 1})
 
     # --- no GitOps repository -------------------------------------------------
 
@@ -397,20 +495,20 @@ class StageTest(unittest.TestCase):
         self.assertFalse((self.d / oobe.AUDITS_MARKER).exists())
         self.repos = list(REPOS)
         self._main()
-        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+        self.assertEqual(self._started_ids(), FIRST)
 
     # --- once only ------------------------------------------------------------
 
     def test_once_done_it_removes_itself_and_starts_nothing(self):
         self._file_scan()
         _board(self.board, [_ranking("done")])
-        self._main()
+        now = self._drive()
         self.started.clear()
         removed = []
         jobs = types.ModuleType("cron.jobs")
         jobs.remove_job = removed.append
         with mock.patch.dict(sys.modules, {"cron": types.ModuleType("cron"), "cron.jobs": jobs}):
-            self._main()
+            self._main(now=now + MINUTE)
         self.assertEqual(self.started, [])
         self.assertEqual(removed, [oobe.OOBE_JOB_ID])
 
@@ -423,8 +521,7 @@ class StageTest(unittest.TestCase):
         _board(self.board, [_ranking("done")])
         self._main()
         state = json.loads((self.d / oobe.AUDITS_MARKER).read_text(encoding="utf-8"))
-        self.assertEqual(state[oobe.STATE_FIRED], list(oobe.FIRST_RUN_AUDITS))
-
+        self.assertEqual(state[oobe.STATE_FIRED], FIRST)
 
 class RosterTest(unittest.TestCase):
     def test_every_audit_is_on_the_platform_roster(self):

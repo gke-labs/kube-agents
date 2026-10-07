@@ -2,9 +2,9 @@
 """Dispatcher for the ``oobe`` cron job: the work an install does once, on first boot.
 
 The design is ``docs/designs/oobe.md``. Today the job has one stage, the first-run
-audits: once the onboarding inventory scan has settled, start the four fleet audits
+audits: once the onboarding inventory scan has settled, run the four fleet audits
 that would otherwise wait for their schedules (the next 06:20 UTC, the next Monday
-for cost). The bootstrap scan and delivery jobs still run beside it.
+for cost), one after another. The bootstrap scan and delivery jobs still run beside it.
 
 The stage fires when the scan's ranking card has finished, read from the board. It
 does not wait for delivery, which needs a human message, and it does not look for
@@ -12,14 +12,17 @@ the report file, which is on the sandbox's volume when the sandbox is on. A scan
 that has not settled by the hand-off's own deadline plus ``RANKING_ALLOWANCE_SECONDS``
 after its sweep was filed fires anyway.
 
-Each audit is marked due on the Platform Agent's roster with Hermes'
-``cron.jobs.trigger_job``, so the next ``profile-cron-tick`` runs it through its
-schedule's own path. Not ``hermes cron run``: that CLI runs the whole job
-synchronously in the calling process. ``.oobe_audits_fired`` records each one
-marked, so a retry marks only the ones still missing: marking an audit due again
-after it has run starts a second full run. With no GitOps repository configured
-every audit fails before it reads anything, so the stage records the skip and
-marks none.
+The audits run as a chain, in ``FIRST_RUN_AUDITS`` order: the next is marked due only
+once the previous one's run has ended, so no two overlap. The schedule staggers them
+for the same reason; four started together on a small install's gateway pod put it
+under memory pressure for the best part of an hour. Each is marked due on the
+Platform Agent's roster with Hermes' ``cron.jobs.trigger_job``, so the next
+``profile-cron-tick`` runs it through its schedule's own path. Not ``hermes cron
+run``: that CLI runs the whole job synchronously in the calling process.
+``.oobe_audits_fired`` records each one marked and the one in flight, so a run
+killed partway marks nothing twice: marking an audit due again after it has run
+starts a second full run. With no GitOps repository configured every audit fails
+before it reads anything, so the stage records the skip and marks none.
 
 ``trigger_job`` also sets a job's ``enabled`` back to true, so an audit an operator
 has disabled or paused is left alone rather than started.
@@ -40,6 +43,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import bootstrap_handoff  # beside this script in the pod
@@ -53,13 +57,17 @@ MARKER_FILED_AT = "filed_at"
 # The hand-off's marker (bootstrap_handoff._record): `sweep=`, and `task_id=` its ranking card.
 HANDOFF_SWEEP = "sweep"
 
-# The four audits #1866 names, by their ids in agents/platform/cron/jobs.json.
+# The four audits #1866 names, by their ids in agents/platform/cron/jobs.json, in the
+# order it chains them: cost, security, reliability, capacity.
 FIRST_RUN_AUDITS = (
+    "fleet-wide-cost-analysis",
     "compliance-audit",
     "obtainability-audit",
-    "fleet-wide-cost-analysis",
     "stockout-prevention",
 )
+EXECUTIONS_DB = "executions.db"
+# A run row in either is still going; any other status has ended.
+IN_FLIGHT_STATUSES = ("claimed", "running")
 PLATFORM_PROFILE = "platform"
 PROFILES_DIR = "profiles"
 CRON_DIR = "cron"
@@ -95,12 +103,21 @@ TRIGGER_SCRIPT = "import sys\nfrom cron.jobs import trigger_job\nsys.exit(0 if t
 # A job id the roster does not have, or one disabled by hand, fails every attempt;
 # without a bound the stage would never finish and the job never leave.
 MAX_TRIGGER_ATTEMPTS = 5
+# A marked audit is claimed on the next profile-cron-tick, a minute or two later; past this
+# with no run, the mark is counted as a failed attempt and made again.
+START_LIMIT_SECONDS = 10 * 60
+# Several times the longest audit run (9-15 minutes, #985). A run still going past it, or a
+# row a gateway restart left at running, does not hold the chain any longer.
+RUN_LIMIT_SECONDS = 60 * 60
 
 STATE_DONE = "done"
 STATE_FIRED = "fired"
 STATE_ATTEMPTS = "attempts"
 STATE_GAVE_UP = "gave_up"
 STATE_HELD = "held"
+STATE_CURRENT = "current"
+CURRENT_JOB = "job"
+CURRENT_MARKED_AT = "marked_at"
 STATE_SKIPPED = "skipped"
 STATE_REASON = "reason"
 STATE_AT = "at"
@@ -304,35 +321,96 @@ def retire() -> None:
         _log(f"could not remove the {OOBE_JOB_ID} job: {e}")
 
 
-def fire_audits(data_dir: Path, state: dict, now: float) -> dict:
-    """Start every audit not yet started; the returned state says which and whether the stage is done."""
+def run_status(data_dir: Path, job_id: str, since: float) -> str | None:
+    """The status of the job's newest run claimed at or after ``since``, or None if there is none.
+
+    Read from the Platform Agent's own cron store; an unreadable store reads as no run yet.
+    """
+    ledger = data_dir / PROFILES_DIR / PLATFORM_PROFILE / CRON_DIR / EXECUTIONS_DB
+    if not ledger.is_file():
+        return None
+    try:
+        conn = sqlite3.connect(
+            f"file:{ledger}?mode=ro", uri=True, timeout=bootstrap_handoff.SQLITE_BUSY_TIMEOUT_SECONDS
+        )
+        try:
+            rows = conn.execute(
+                "SELECT status, claimed_at FROM executions WHERE job_id = ? AND claimed_at IS NOT NULL "
+                "ORDER BY claimed_at DESC LIMIT 1",
+                (job_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        _log(f"cannot read {ledger}: {e}")
+        return None
+    for status, claimed in rows:
+        try:
+            if datetime.fromisoformat(claimed).timestamp() >= since:
+                return status
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def advance_chain(data_dir: Path, state: dict, now: float) -> dict:
+    """Move the chain one step: wait on the audit in flight, or mark the next one due.
+
+    The returned state is also written to the marker, and says whether the stage is done.
+    """
     fired = list(state.get(STATE_FIRED, []))
     attempts = dict(state.get(STATE_ATTEMPTS, {}))
     gave_up = list(state.get(STATE_GAVE_UP, []))
     held = dict(state.get(STATE_HELD, {}))
+    current = state.get(STATE_CURRENT)
+
+    def save(done: bool = False) -> dict:
+        new_state = {
+            STATE_FIRED: fired, STATE_ATTEMPTS: attempts, STATE_GAVE_UP: gave_up, STATE_HELD: held,
+            STATE_CURRENT: current, STATE_AT: now, STATE_DONE: done,
+        }
+        write_state(data_dir, new_state)
+        return new_state
+
+    pending = [a for a in FIRST_RUN_AUDITS if a not in fired and a not in gave_up and a not in held]
+    if current:
+        job_id, marked_at = current[CURRENT_JOB], current[CURRENT_MARKED_AT]
+        status = run_status(data_dir, job_id, marked_at)
+        if status is None:
+            if now - marked_at < START_LIMIT_SECONDS:
+                return save()
+            # Never claimed: count it as a failed start and mark it again, or give up on it.
+            attempts[job_id] = attempts.get(job_id, 0) + 1
+            fired.remove(job_id)
+            current = None
+            if attempts[job_id] >= MAX_TRIGGER_ATTEMPTS:
+                _log(f"giving up on {job_id}: never started after {MAX_TRIGGER_ATTEMPTS} marks; it runs on its own schedule")
+                gave_up.append(job_id)
+            return save()
+        if not pending:
+            # The last audit has started; nothing is left to mark.
+            return save(done=True)
+        if status in IN_FLIGHT_STATUSES and now - marked_at < RUN_LIMIT_SECONDS:
+            return save()
+        current = None
+
     holds = audit_holds(data_dir)
-
-    def record() -> dict:
-        return {STATE_FIRED: fired, STATE_ATTEMPTS: attempts, STATE_GAVE_UP: gave_up, STATE_HELD: held, STATE_AT: now}
-
-    for job_id in FIRST_RUN_AUDITS:
-        if job_id in fired or job_id in gave_up or job_id in held:
-            continue
+    for job_id in pending:
         if holds is not None and job_id in holds:
             _log(f"not starting {job_id}: {holds[job_id]}")
             held[job_id] = holds[job_id]
-        elif holds is not None and trigger(job_id, data_dir):
+            continue
+        if holds is not None and trigger(job_id, data_dir):
             fired.append(job_id)
-        else:
-            attempts[job_id] = attempts.get(job_id, 0) + 1
-            if attempts[job_id] >= MAX_TRIGGER_ATTEMPTS:
-                _log(f"giving up on {job_id} after {MAX_TRIGGER_ATTEMPTS} attempts; it runs on its own schedule")
-                gave_up.append(job_id)
-        # After each audit, so a run killed partway does not start the same audit twice.
-        write_state(data_dir, record())
-    new_state = {**record(), STATE_DONE: all(job_id in fired or job_id in gave_up or job_id in held for job_id in FIRST_RUN_AUDITS)}
-    write_state(data_dir, new_state)
-    return new_state
+            current = {CURRENT_JOB: job_id, CURRENT_MARKED_AT: now}
+            return save()
+        attempts[job_id] = attempts.get(job_id, 0) + 1
+        if attempts[job_id] >= MAX_TRIGGER_ATTEMPTS:
+            _log(f"giving up on {job_id} after {MAX_TRIGGER_ATTEMPTS} attempts; it runs on its own schedule")
+            gave_up.append(job_id)
+            continue
+        return save()
+    return save(done=True)
 
 
 def main(data_dir: Path | None = None, now: float | None = None) -> int:
@@ -342,23 +420,25 @@ def main(data_dir: Path | None = None, now: float | None = None) -> int:
     if state.get(STATE_DONE):
         retire()
         return 0
-    filed = scan_filed(data_dir)
-    if filed is not None and not state and now - filed[1] >= NEW_INSTALL_SECONDS:
-        _log(f"not starting the first-run audits: {SKIP_NOT_NEW}")
-        write_state(data_dir, {STATE_DONE: True, STATE_SKIPPED: True, STATE_REASON: SKIP_NOT_NEW, STATE_AT: now})
-        return 0
-    if not scan_settled(data_dir, now):
-        return 0
-    try:
-        repositories = managed_repositories()
-    except Exception as e:  # noqa: BLE001 - an unreadable list is retried, not taken as empty
-        _log(f"cannot read the managed repositories: {e}")
-        return 0
-    if not repositories:
-        _log(f"not starting the first-run audits: {SKIP_NO_REPOSITORY}")
-        write_state(data_dir, {STATE_DONE: True, STATE_SKIPPED: True, STATE_REASON: SKIP_NO_REPOSITORY, STATE_AT: now})
-        return 0
-    fire_audits(data_dir, state, now)
+    if not state:
+        # Not started yet: the checks that decide whether, and when, the chain starts.
+        filed = scan_filed(data_dir)
+        if filed is not None and now - filed[1] >= NEW_INSTALL_SECONDS:
+            _log(f"not starting the first-run audits: {SKIP_NOT_NEW}")
+            write_state(data_dir, {STATE_DONE: True, STATE_SKIPPED: True, STATE_REASON: SKIP_NOT_NEW, STATE_AT: now})
+            return 0
+        if not scan_settled(data_dir, now):
+            return 0
+        try:
+            repositories = managed_repositories()
+        except Exception as e:  # noqa: BLE001 - an unreadable list is retried, not taken as empty
+            _log(f"cannot read the managed repositories: {e}")
+            return 0
+        if not repositories:
+            _log(f"not starting the first-run audits: {SKIP_NO_REPOSITORY}")
+            write_state(data_dir, {STATE_DONE: True, STATE_SKIPPED: True, STATE_REASON: SKIP_NO_REPOSITORY, STATE_AT: now})
+            return 0
+    advance_chain(data_dir, state, now)
     return 0
 
 
