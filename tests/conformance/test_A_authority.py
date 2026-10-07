@@ -457,6 +457,19 @@ class A3TheA2ADoorsGoogleClassAssertsOnlyAVerifiedEmail(unittest.TestCase):
             "a token without a verified email is no longer refused",
         )
 
+    def test_A3_a_bearer_that_is_not_a_google_token_never_leaves_the_cluster(self) -> None:
+        body = h.go_function_body(h.text("a2a_door_google"), "verify")
+        self.assertRegex(
+            body,
+            r"if !strings\.HasPrefix\(token, a2aGoogleAccessTokenPrefix\) \{\s*return \"\",",
+            "a bearer not shaped like a Google access token is no longer refused before it is sent to Google",
+        )
+        self.assertLess(
+            body.index("a2aGoogleAccessTokenPrefix"),
+            body.index("v.check("),
+            "the prefix check no longer runs before the tokeninfo call",
+        )
+
     def test_A3_the_google_class_admits_only_a_prefixed_allowlisted_email(self) -> None:
         body = h.go_function_body(h.text("a2a_door_google_identity"), "resolveA2AGooglePrincipal")
         self.assertIn("strings.CutPrefix(authorID, a2aGoogleCallerPrefix)", body)

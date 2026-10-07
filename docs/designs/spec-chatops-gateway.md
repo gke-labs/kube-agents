@@ -1428,8 +1428,9 @@ alternative.
 
 **Posture.** Every RPC request carries a bearer token (`A2A_DOOR_TOKEN`, required whenever
 `A2A_DOOR_LISTEN` is set, no unauthenticated mode), or, with the Google class armed, a Google
-access token in its place; any other bearer is then sent to Google's tokeninfo endpoint to be
-checked; the caller map is its own file
+access token in its place; a bearer shaped like a Google access token (`ya29.`) is then sent
+to Google's tokeninfo endpoint to be checked, and any other is refused without leaving the
+cluster; the caller map is its own file
 (`A2A_DOOR_PRINCIPAL_MAP`); the card advertises `A2A_DOOR_PUBLIC_URL` when set, and otherwise
 the address the card was fetched from (the request's host, or the forwarded host and scheme
 behind a proxy), since behind a port-forward or an ingress the listen address is reachable by

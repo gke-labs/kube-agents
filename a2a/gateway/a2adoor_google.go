@@ -56,6 +56,15 @@ const (
 	// a2aGoogleTokeninfoURL is Google's token introspection endpoint for
 	// access tokens.
 	a2aGoogleTokeninfoURL = "https://oauth2.googleapis.com/tokeninfo"
+	// a2aGoogleAccessTokenPrefix is how every Google OAuth access token
+	// begins. A bearer without it is refused here, never sent to Google: a
+	// mistyped static token, another door's token or any other secret a
+	// misconfigured client puts in Authorization stays in the cluster, and
+	// junk bearers cost no tokeninfo slot. If Google changes the prefix the
+	// class fails closed until this is updated (decided by bnaylor,
+	// 2026-10-07).
+	a2aGoogleAccessTokenPrefix = "ya29."
+
 	// a2aGoogleTokeninfoParam carries the token, in a POSTed form body
 	// (a2aGoogleTokeninfoContentType), never in the URL.
 	a2aGoogleTokeninfoParam       = "access_token"
@@ -188,6 +197,9 @@ var errGoogleTokenRefused = errors.New("the Google access token was refused")
 // out tasks/get, parallel sends, a retry storm) costs one tokeninfo call and
 // one slot, not one per request.
 func (v *googleTokenVerifier) verify(ctx context.Context, token string) (string, error) {
+	if !strings.HasPrefix(token, a2aGoogleAccessTokenPrefix) {
+		return "", fmt.Errorf("%w: it is not shaped like a Google access token, so it was not sent to Google", errGoogleTokenRefused)
+	}
 	key := googleTokenKey(token)
 	if email, ok := v.cached(key); ok {
 		return email, nil

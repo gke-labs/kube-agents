@@ -214,6 +214,21 @@ func TestGoogleVerifierGoogleErrorIsNotARefusal(t *testing.T) {
 	}
 }
 
+// TestGoogleVerifierNeverSendsANonGoogleBearer: a bearer without Google's
+// access-token prefix is refused locally, and Google is never asked.
+func TestGoogleVerifierNeverSendsANonGoogleBearer(t *testing.T) {
+	f := newFakeTokeninfo(t)
+	v := testVerifier(f)
+	for _, token := range []string{"stale-static-token", "xoxb-1234", "ghp_abc", "eyJhbGciOi.jwt.like", "YA29.upper", ""} {
+		if _, err := v.verify(context.Background(), token); !errors.Is(err, errGoogleTokenRefused) {
+			t.Errorf("%q: err = %v, want a refusal", token, err)
+		}
+	}
+	if got := f.calls.Load(); got != 0 {
+		t.Errorf("tokeninfo was asked %d times for bearers that are not Google access tokens", got)
+	}
+}
+
 // TestGoogleVerifierOutageIsNotARefusalAndLeaksNoToken: an endpoint that
 // cannot be reached is a failure to check, not a verdict on the token, and
 // the error the caller is shown does not quote the URL the token rides in.

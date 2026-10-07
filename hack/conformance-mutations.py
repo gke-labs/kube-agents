@@ -1297,6 +1297,14 @@ Mutation(
         "and submissions that evict an allowed developer's",
     ),
     Mutation(
+        "A3-a2a-google-any-bearer-to-google",
+        "a2a/gateway/a2adoor_google.go",
+        ("\tif !strings.HasPrefix(token, a2aGoogleAccessTokenPrefix) {", "\tif false {"),
+        "test_A3_a_bearer_that_is_not_a_google_token_never_leaves_the_cluster",
+        "send every non-static bearer to Google's tokeninfo again, so a mistyped "
+        "door token or another secret pasted into Authorization leaves the cluster",
+    ),
+    Mutation(
         "A3-a2a-google-prefix-spellable",
         "a2a/gateway/a2adoor_google.go",
         ('\ta2aGoogleCallerPrefix = ":google:"', '\ta2aGoogleCallerPrefix = "google:"'),
