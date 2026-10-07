@@ -512,6 +512,28 @@
           "why": "the shared-account fix anyone applies makes 2.7 stop reporting both workloads while their pod-level automount keeps the tokens mounted, and the case then grades nothing"
         }
       ]
+    },
+    "declared-overrequest-workload": {
+      "cluster_slot": "a",
+      "namespace": "seeded-headroom",
+      "probes": ["deployment/burst-ingest"],
+      "fixture": "burst-ingest Deployment, two pause replicas requesting 10m / 128Mi each and using almost none of the memory, behind a budget and a default-deny policy; the waste audit's overrequest posture a repository declaration covers, so the declared-intent case silences nothing another case grades",
+      "state": [
+        {
+          "subject": "deployment/burst-ingest",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 2,
+          "why": "the posture is a running workload reserving more than it uses; a Pending replica is not measured and the check has nothing to name"
+        },
+        {
+          "subject": "deployment/burst-ingest",
+          "path": "spec.template.spec.containers[0].resources.requests.memory",
+          "op": "eq",
+          "value": "128Mi",
+          "why": "a resize anyone applies removes the posture the declaration covers, and the case then grades nothing"
+        }
+      ]
     }
   }
 }

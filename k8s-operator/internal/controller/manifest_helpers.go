@@ -241,7 +241,7 @@ func deriveAgentImageFromOperator(operatorImage string) string {
 // the second caller: it is an image from the same workflow and the same
 // commit, so an install that mirrored the operator has mirrored it too, and
 // reaching ghcr.io for it on a private-registry install is the same failure
-// this derivation exists to avoid for the agent. The three A2A next-stack
+// this derivation exists to avoid for the agent. The four A2A next-stack
 // images are the third, through a2aReleaseImage, which passes OPERATOR_IMAGE
 // when set and the resolved agent image otherwise; the substitution is the
 // same.

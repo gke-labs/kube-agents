@@ -35,7 +35,8 @@ def main(argv: list[str]) -> int:
     try:
         with open(token_path, encoding="utf-8") as handle:
             token = handle.read().strip()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # Unreadable, or not text: nothing to give git, as for an empty file.
         return 0
     # The rule `providers.credentials.is_token` applies, kept in step by hand:
     # this script imports nothing of the broker's.

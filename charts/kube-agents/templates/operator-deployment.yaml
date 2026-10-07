@@ -56,6 +56,14 @@ spec:
             # apply time on the missing Certificate CRD. See the chart README.
             - name: ENABLE_WEBHOOKS
               value: {{ .Values.operator.webhooks.enabled | quote }}
+            # The namespace this pod runs in. The operator admits its own
+            # pods, in this namespace, to the gateway and broker metrics ports
+            # so that it can read the counters behind status.usage; unset, it
+            # renders no such rule and the counters stay where they are.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             # The three images the operator resolves for pods the chart never
             # renders: an agent Deployment whose PlatformAgent omits
             # spec.deployment.image, the shell sandbox StatefulSet it renders

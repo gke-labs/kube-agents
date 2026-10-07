@@ -152,6 +152,24 @@ STORM_REASON_RE = re.compile(
 # two cannot drift.
 DELEGATION_CEILING_MARKER = "KUBE_AGENTS_DELEGATION_CEILING"
 
+# --- Replay errors (#2328) ---------------------------------------------------
+# A card-wake replay whose plant or turn failed in the image (ReplayBroken) or
+# whose directive/prompt was invalid returns an errored result; at bench-gate
+# it blocks at rung 3. The reason carries "the record is not evidence of a real
+# agent run" and "trajectory is empty", which STORM_REASON_RE matches;
+# recognised before the storm check so a broken replay is classified as a
+# graded fail rather than a storm repetition.
+REPLAY_ERROR_RE = re.compile(
+    r"ReplayBroken"
+    r"|ReplayMismatch"
+    r"|failure wake:"
+    r"|question wake:"
+    r"|thread context:"
+    r"|replay declares"
+    r"|\[bench:(?:card-failure|slack-question)-wake\]",
+    re.IGNORECASE,
+)
+
 # --- Setup death (#1172, #1176) -----------------------------------------------
 # Zero tasks, concluded FAILURE, and over inside this long: the run died at
 # clone or deploy before any case ran (the adjudicator's setup-death rule).
@@ -291,15 +309,19 @@ def rep_kind(rep: dict) -> str:
     rep is one the harness could not grade: an infra verdict, or a fail whose
     reason is a never-ran phrasing. A ceiling rep is one the harness stopped
     watching with the worker still running (its reason leads with
-    DELEGATION_CEILING_MARKER); it reads `infra` too, but is not a storm."""
+    DELEGATION_CEILING_MARKER); it reads `infra` too, but is not a storm.
+    A harness-declared replay error (#2328) is a graded fail, not a storm."""
     result = str(rep.get("result") or "").lower()
     if result == "pass":
         return REP_PASS
-    if DELEGATION_CEILING_MARKER in (rep.get("reason") or ""):
+    reason = rep.get("reason") or ""
+    if DELEGATION_CEILING_MARKER in reason:
         return REP_CEILING
+    if result != "infra" and "KUBE_AGENTS_INFRA_FAILURE" not in reason and REPLAY_ERROR_RE.search(reason):
+        return REP_FAIL
     if result == "infra":
         return REP_STORM
-    if STORM_REASON_RE.search(rep.get("reason") or ""):
+    if STORM_REASON_RE.search(reason):
         return REP_STORM
     return REP_FAIL
 
@@ -980,9 +1002,10 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
             return dict(base, headline="Aborted before it finished.", lede="Usually a newer push superseded this run; the next one carries the verdict.", verdict=VERDICT_INFRA, setup_death=False, cls=None, do="")
         if result == RUN_SUCCESS:
             # hack/ci-revalidate.sh, step 0: a retest at a head that already
-            # passed, or an inert push, is revalidated against the branch's
-            # earlier green and exits before the eval matrix.
-            return dict(base, headline="Green without running the cases.", lede="This head already had a green run, or only inert paths changed since the branch's last one, so the gate revalidated that run instead of spending another.", verdict=VERDICT_GREEN, setup_death=False, cls=None, do="")
+            # passed or was overridden by an admin, or an inert push, is
+            # revalidated against that verdict and exits before the eval
+            # matrix.
+            return dict(base, headline="Green without running the cases.", lede="This head already had a green run or an admin /override, or only inert paths changed since the branch's last green, so the gate revalidated that verdict instead of spending another run.", verdict=VERDICT_GREEN, setup_death=False, cls=None, do="")
         when = f" {minutes} minutes in" if minutes is not None else ""
         return dict(
             base,

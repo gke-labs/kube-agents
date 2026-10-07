@@ -15,6 +15,7 @@ from __future__ import annotations
 import http.client
 import io
 import json
+import ssl
 import tempfile
 import unittest
 import urllib.error
@@ -88,6 +89,14 @@ class RequestTest(unittest.TestCase):
         self.assertEqual("application/json", request.get_header("Accept"))
         self.assertEqual([7.0], opener.timeouts)
 
+    def test_the_configured_timeout_reaches_the_opener_exactly_on_a_large_clock(self):
+        # CI: at some monotonic clock readings
+        # `(now + 7.0) - now` is not 7.0 (CI saw 6.999999999999986).
+        opener = Opener([{}])
+        with mock.patch("providers.transport.time.monotonic", return_value=123.456):
+            transport(opener).api("GET", "projects")
+        self.assertEqual([7.0], opener.timeouts)
+
     def test_the_credential_headers_are_read_per_call(self):
         # A rotated token file is the next call's token, with no restart.
         tokens = iter(["old", "new"])
@@ -142,11 +151,117 @@ class BoundsTest(unittest.TestCase):
         self.assertEqual(502, caught.exception.status)
         self.assertEqual("FORGE_CALL_FAILED", caught.exception.fields["code"])
 
+    def test_a_connect_failure_names_its_reason_and_an_untrusted_certificate_plainly(self):
+        # Review round 2: only the exception type reached the caller and the
+        # log, so a TLS or DNS failure read as "retry once".
+        with self.assertRaises(WorkspaceError) as caught:
+            transport(Opener(urllib.error.URLError("[Errno -2] Name or service not known"))).api("GET", "x")
+        self.assertIn("Name or service not known", caught.exception.fields["detail"])
+        cert = ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+        with self.assertRaises(WorkspaceError) as caught:
+            transport(Opener(urllib.error.URLError(cert))).api("GET", "x")
+        self.assertIn("TLS certificate failed verification", caught.exception.fields["detail"])
+        # Review (#2439): the verifier's own reason was dropped, so an expired
+        # certificate or a hostname mismatch read as a private CA.
+        expired = ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+        expired.verify_message = "certificate has expired"
+        with self.assertRaises(WorkspaceError) as caught:
+            transport(Opener(urllib.error.URLError(expired))).api("GET", "x")
+        self.assertIn("certificate has expired", caught.exception.fields["detail"])
+
+    def test_no_call_outlives_the_requests_shared_deadline(self):
+        # Review round 2: each call took a fresh full timeout, so a verb that
+        # loops could hold a request slot for many times the broker's bound.
+        now = [100.0]
+        opener = Opener({"ok": True}, {"ok": True})
+        api = transport(opener, timeout=30.0, outer_deadline=lambda: 103.0)
+        with mock.patch("providers.transport.time.monotonic", lambda: now[0]):
+            api.api("GET", "projects")
+            self.assertEqual(3.0, opener.timeouts[0])
+            now[0] = 104.0
+            with self.assertRaises(WorkspaceError) as caught:
+                api.api("GET", "projects")
+        self.assertIn("time ran out", caught.exception.fields["detail"])
+        self.assertEqual(1, len(opener.requests))
+
+    def test_a_stall_mid_body_is_reported_as_a_stall_in_the_right_words(self):
+        # Review round 3: the receive timing out inside the read -- the usual
+        # shape of a stall, since the socket's timeout is the deadline's
+        # remainder -- read as "could not be reached", and a cut by the
+        # request's shared deadline was reported as the per-call timeout.
+        class Stalls(_Response):
+            def read1(self, n=-1):
+                raise TimeoutError("timed out")
+
+        with self.assertRaises(WorkspaceError) as caught:
+            transport(Opener(Stalls(b"")), timeout=30.0).api("GET", "projects")
+        self.assertEqual("FORGE_CALL_FAILED", caught.exception.fields["code"])
+        self.assertIn("took longer than 30s", caught.exception.fields["detail"])
+        with mock.patch("providers.transport.time.monotonic", lambda: 100.0):
+            with self.assertRaises(WorkspaceError) as caught:
+                transport(Opener(Stalls(b"")), timeout=30.0, outer_deadline=lambda: 102.0).api(
+                    "GET", "projects"
+                )
+        self.assertIn("request's time ran out while the forge was answering", caught.exception.fields["detail"])
+
+    def test_the_first_call_under_a_slot_stalling_is_the_forge_being_slow(self):
+        # Review: the slot is armed with the same timeout a moment before the
+        # first call, so `outer < deadline` by milliseconds and every stall
+        # read as the request's time running out, even on the only call.
+        class Stalls(_Response):
+            def read1(self, n=-1):
+                raise TimeoutError("timed out")
+
+        with mock.patch("providers.transport.time.monotonic", lambda: 100.0):
+            with self.assertRaises(WorkspaceError) as caught:
+                transport(Opener(Stalls(b"")), timeout=30.0, outer_deadline=lambda: 129.99).api(
+                    "GET", "projects"
+                )
+        self.assertIn("took longer than 30s", caught.exception.fields["detail"])
+
+    def test_a_reset_after_the_send_is_an_answer_broken_off_not_unreachable(self):
+        # Review: `urllib` wraps send-phase failures in URLError, so a bare
+        # OSError is a forge that took the request and then stopped.
+        for raised in (ConnectionResetError("reset by peer"), ssl.SSLEOFError("EOF")):
+            with self.subTest(raised=type(raised).__name__):
+                with self.assertRaises(WorkspaceError) as caught:
+                    transport(Opener(raised)).api("GET", "projects")
+                detail = caught.exception.fields["detail"]
+                self.assertIn("answer could not be read", detail)
+                self.assertNotIn("could not be reached", detail)
+
     def test_a_timeout_is_a_call_failure(self):
         opener = Opener(TimeoutError("timed out"))
         with self.assertRaises(WorkspaceError) as caught:
             transport(opener).api("GET", "projects")
         self.assertEqual("FORGE_CALL_FAILED", caught.exception.fields["code"])
+        # Review round 4: a bare timeout is the wait for the status line --
+        # the forge was reached and stopped -- not "could not be reached".
+        self.assertIn("took longer than 7s", caught.exception.fields["detail"])
+        self.assertNotIn("could not be reached", caught.exception.fields["detail"])
+
+    def test_an_answer_the_forge_broke_off_says_it_answered(self):
+        for raised in (http.client.BadStatusLine("x"), http.client.IncompleteRead(b"{", 9)):
+            with self.subTest(raised=type(raised).__name__):
+                with self.assertRaises(WorkspaceError) as caught:
+                    transport(Opener(raised)).api("GET", "projects")
+                self.assertIn("answer could not be read", caught.exception.fields["detail"])
+
+    def test_a_connect_cut_by_the_requests_spent_deadline_says_so(self):
+        # Review (#2439): the connect arm said "could not be reached" for a
+        # cut the request's own budget made.
+        with mock.patch("providers.transport.time.monotonic", lambda: 100.0):
+            with self.assertRaises(WorkspaceError) as caught:
+                transport(
+                    Opener(urllib.error.URLError(TimeoutError("timed out"))),
+                    timeout=30.0, outer_deadline=lambda: 105.0,
+                ).api("GET", "projects")
+        self.assertIn("request's time ran out while connecting", caught.exception.fields["detail"])
+
+    def test_a_connect_failure_still_reads_as_unreachable(self):
+        with self.assertRaises(WorkspaceError) as caught:
+            transport(Opener(urllib.error.URLError(TimeoutError("timed out")))).api("GET", "projects")
+        self.assertIn("could not be reached", caught.exception.fields["detail"])
 
     def test_a_redirect_is_never_followed(self):
         # The credential rides in a header; a hop would present it to wherever
@@ -343,13 +458,36 @@ class BrokerBuildsItTest(unittest.TestCase):
         return vcs_broker.VcsBroker(self.root, git_runner=lambda *a, **k: None, **kwargs)
 
     def test_an_http_forge_gets_the_in_process_transport_with_the_brokers_bounds(self):
-        opener = Opener({})
-        broker = self.broker(http_timeout=3.0, http_max_bytes=99, http_opener=opener)
+        opener = Opener({}, {})
+        deadline = [None]
+        broker = self.broker(
+            http_timeout=3.0, http_max_bytes=99, http_opener=opener,
+            request_deadline=lambda: deadline[0],
+        )
         built = broker._transport(_HttpForge(), "acme/infra")
         self.assertIsInstance(built, HttpTransport)
         built.api("GET", "user")
         self.assertEqual([3.0], opener.timeouts)
         self.assertEqual(99, built._max_bytes)
+        # Review round 3: the request slot's deadline reaches the transport
+        # too -- with one second left of the request, the 3s call gets one.
+        deadline[0] = 101.0
+        with mock.patch("providers.transport.time.monotonic", lambda: 100.0):
+            built.api("GET", "user")
+        self.assertEqual([3.0, 1.0], opener.timeouts)
+
+    def test_the_reach_question_goes_through_the_forges_own_transport(self):
+        # Review round 3: the one line joining the startup diagnostic to the
+        # forge was replaced by a Mock in every test that reached it.
+        opener = Opener([{"path_with_namespace": "acme/infra"}])
+
+        class _Reaches(_HttpForge):
+            def reach(self, api):
+                return [p["path_with_namespace"] for p in api("GET", "projects")], False
+
+        broker = self.broker(http_opener=opener)
+        self.assertEqual((["acme/infra"], False), broker.credential_reach(_Reaches()))
+        self.assertTrue(opener.requests[0].full_url.endswith("/projects"))
 
     def test_an_http_forge_with_no_api_root_is_refused_by_name(self):
         with self.assertRaises(WorkspaceError) as caught:

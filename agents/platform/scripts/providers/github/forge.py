@@ -94,6 +94,15 @@ class GitHubForge(Forge):
                     raise ValueError(
                         f"{entry.get('host')} is not a {cls.name} host this broker serves"
                     )
+                # Refused rather than ignored: the same key narrows a forge
+                # whose credential reaches a whole host, and accepted here it
+                # would read as narrowing this one. The App installation's
+                # repository selection is what scopes this forge's token.
+                if entry.get("allowed_paths") is not None:
+                    raise ValueError(
+                        f"allowedPaths is not supported for {cls.name}: scope the "
+                        "App installation's repositories instead"
+                    )
         return (cls(refresh=config.get("refresh"), mint=config.get("mint")),)
 
     def read_credential(self, repo: str) -> Credential:

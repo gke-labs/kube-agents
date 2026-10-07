@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -50,6 +51,49 @@ func TestStartMetrics_ServesTheRegistryAndHealthz(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return within 5s of cancellation")
+	}
+}
+
+// The start-time gauge the operator's usage poller reads: present on the
+// watcher's own registry, a plausible time, and the same value on every
+// scrape of one process, because it is set once rather than re-derived.
+func TestNewMetrics_ExportsAConstantProcessStartTime(t *testing.T) {
+	before := time.Now().Add(-time.Second)
+	m := newMetrics()
+	after := time.Now().Add(time.Second)
+	srv, err := startMetrics("127.0.0.1:0", m)
+	if err != nil {
+		t.Fatalf("startMetrics: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = srv.Run(ctx) }()
+	base := "http://" + srv.ln.Addr().String()
+
+	read := func() float64 {
+		t.Helper()
+		for _, line := range strings.Split(httpGet(t, base+"/metrics"), "\n") {
+			if !strings.HasPrefix(line, processStartTimeMetric+" ") {
+				continue
+			}
+			value, err := strconv.ParseFloat(strings.TrimPrefix(line, processStartTimeMetric+" "), 64)
+			if err != nil {
+				t.Fatalf("%s is not a number: %q", processStartTimeMetric, line)
+			}
+			return value
+		}
+		t.Fatalf("/metrics carries no %s line", processStartTimeMetric)
+		return 0
+	}
+	first := read()
+	if start := time.Unix(0, int64(first*float64(time.Second))); start.Before(before) || start.After(after) {
+		t.Errorf("%s = %v, want between %v and %v", processStartTimeMetric, start, before, after)
+	}
+	if second := read(); second != first {
+		t.Errorf("%s moved between two scrapes of one process: %v then %v", processStartTimeMetric, first, second)
+	}
+	if !strings.Contains(httpGet(t, base+"/metrics"), "# TYPE "+processStartTimeMetric+" gauge") {
+		t.Errorf("%s has no gauge TYPE line", processStartTimeMetric)
 	}
 }
 

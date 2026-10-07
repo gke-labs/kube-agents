@@ -57,17 +57,18 @@ readonly GITOPS_SEED_MESSAGE="Initial commit"
 readonly GITOPS_SEED_CONTENT="# GitOps Infrastructure Repo"
 # The declared-intent note the declared-intent cases read (GITOPS_INTENT_NOTE_CASES
 # in scripts/verify_ci_pool_project.py): the fleet's declared-no-pdb-workload role
-# runs without a budget or a NetworkPolicy and declared-token-workload's
-# token-reader keeps its mounted token, all on purpose. The harness reads the
+# runs without a budget or a NetworkPolicy, declared-token-workload's
+# token-reader keeps its mounted token, and declared-overrequest-workload's
+# burst-ingest keeps its headroom, all on purpose. The harness reads the
 # frontmatter, not the prose.
 # What `gh api` prints on stderr for a path that is not there; any other failure
 # of the existence read stops the seed rather than writing blind.
 readonly GITOPS_NOTE_ABSENT_PATTERN="HTTP 404"
 readonly GITOPS_INTENT_NOTE_PATH="knowledge/notification-relay-no-pdb.md"
-readonly GITOPS_INTENT_NOTE_MESSAGE="Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, and seeded-c's missing upgrade notifications, as intended"
+readonly GITOPS_INTENT_NOTE_MESSAGE="Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, and burst-ingest's headroom, as intended"
 readonly GITOPS_INTENT_NOTE_CONTENT='---
 type: decision
-title: seeded-intent, seeded-token and seeded-c carry four postures on purpose
+title: seeded-intent, seeded-token, seeded-c and seeded-headroom carry five postures on purpose
 declares:
   - check: no-pdb
     namespace: seeded-intent
@@ -81,6 +82,9 @@ declares:
   - check: no-notifications
     namespace: ""
     object: Cluster/seeded-c
+  - check: overrequest
+    namespace: seeded-headroom
+    object: Deployment/burst-ingest
 ---
 
 `notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
@@ -89,8 +93,10 @@ namespace carries no NetworkPolicy by design either: nothing in it accepts traff
 in `seeded-token` runs on the default ServiceAccount of its namespace with the token mounted by
 design: it reads the API server with that identity. Its neighbour `token-sidecar` is not declared.
 `seeded-c` publishes no GKE upgrade notifications by design: this fleet learns about upgrades from
-the weekly audit. The obtainability, compliance and upgrade readiness audits list the four postures
-under Declared intent rather than as findings.'
+the weekly audit. `burst-ingest` in `seeded-headroom` requests far more memory than it uses by
+design: it is sized for an ingest burst the measured week does not show. The obtainability,
+compliance, upgrade readiness and waste audits list the five postures under Declared intent rather
+than as findings.'
 
 # The host cluster's name is not a preference: scripts/verify_ci_pool_project.py
 # asserts it, hack/ci-env.sh selects it, and the Boskos lease resolves to it.

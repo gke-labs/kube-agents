@@ -153,6 +153,11 @@ the same layout and is collected from the moment it starts running.
       `delegation-ceiling`. The run page, the PR view and the PR comment's
       result cell count it in a case's total and name it apart; the Cases
       page's per-run counts (`render.rep_counts`) still fold it into `infra`.
+      Similarly, a harness-declared card-wake replay error (`ReplayMismatch`
+      or `ReplayBroken`, e.g. `failure wake:`, `question wake:`, `thread context:`
+      in the reason) is recognized by `classify.py` and `health.py` as `fail`,
+      not `storm`: a broken replay is a defect in the image under test, not
+      infrastructure weather (#2328).
     - `reason` — the free text after the first space-padded `--` separator
       (later separators belong to the reason — fail reasons contain the
       delimiter themselves), with the trailing `[OutcomeScore=…]` metrics
@@ -1112,7 +1117,7 @@ them on 2026-09-08 — and the fields the health adjudicator reads (`build_id`,
 carries one, the how-it-ended fields — `has_build_log`, the `pod_*` trio,
 `merge_conflict`, `eval_verdict` — when the source has them, and per task
 `name`, `result`, `reps[].result` and the first
-96 characters of `reps[].reason`);
+128 characters of `reps[].reason`);
 its `trimmed` key records the source and the cut. Six of its zero-task runs
 carry `result: "failure"` in lowercase, as Prow wrote them on 2026-09-05 —
 the one departure from the `result` vocabulary above seen in the wild, so

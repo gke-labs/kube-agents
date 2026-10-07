@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -117,6 +118,17 @@ type Config struct {
 	// GchatAllowAllUsers disables the allowlist, stated explicitly —
 	// mirroring the legacy GOOGLE_CHAT_ALLOW_ALL_USERS posture.
 	GchatAllowAllUsers bool
+	// SlackAllowedUsers is the Slack backend's ingress allowlist, carried
+	// from spec.integration.slack.allowedUsers the way GchatAllowedUsers is
+	// from Chat's: the gate the legacy path enforces as SLACK_ALLOWED_USERS.
+	// Unlike gchat, Slack also has a mapping table (PrincipalMapPath), and a
+	// sender must pass both: listed (or allow-all) AND mapped. Member ids
+	// compare exactly.
+	SlackAllowedUsers []string
+	// SlackAllowAllUsers disables the Slack allowlist, stated explicitly -
+	// mirroring the legacy SLACK_ALLOW_ALL_USERS posture. The map still
+	// applies.
+	SlackAllowAllUsers bool
 
 	// TargetAllowedUsers is the per-target, per-backend trusted-human
 	// allowlist a session's delegation is checked against: target ->
@@ -446,8 +458,8 @@ func FromEnv() (*Config, error) {
 		NATSUser:         os.Getenv("NATS_USER"),
 		NATSPassword:     os.Getenv("NATS_PASSWORD"),
 		DiscordToken:     os.Getenv("DISCORD_TOKEN"),
-		SlackBotToken:    os.Getenv("SLACK_BOT_TOKEN"),
-		SlackAppToken:    os.Getenv("SLACK_APP_TOKEN"),
+		SlackBotToken:    pyStrip(os.Getenv("SLACK_BOT_TOKEN")),
+		SlackAppToken:    pyStrip(os.Getenv("SLACK_APP_TOKEN")),
 		PrincipalMapPath: envOr("A2A_PRINCIPAL_MAP", "/etc/a2a/principal-map"),
 		DefaultAddressee: envOr("A2A_DEFAULT_ADDRESSEE", "platform"),
 		SpawnSessions:    os.Getenv("A2A_SPAWN_SESSIONS") == "true",
@@ -483,6 +495,12 @@ func FromEnv() (*Config, error) {
 	if len(platformLists) > 0 {
 		cfg.TargetAllowedUsers[targetPlatform] = platformLists
 	}
+	for _, u := range strings.Split(os.Getenv("A2A_SLACK_ALLOWED_USERS"), ",") {
+		if u = strings.TrimSpace(u); u != "" {
+			cfg.SlackAllowedUsers = append(cfg.SlackAllowedUsers, u)
+		}
+	}
+	cfg.SlackAllowAllUsers = os.Getenv("A2A_SLACK_ALLOW_ALL_USERS") == "true"
 	cfg.InjectListen = strings.TrimSpace(os.Getenv("A2A_INJECT_LISTEN"))
 	cfg.InjectToken = strings.TrimSpace(os.Getenv("A2A_INJECT_TOKEN"))
 	cfg.InjectPrincipalMapPath = envOr("A2A_INJECT_PRINCIPAL_MAP", defaultInjectPrincipalMapPath)
@@ -683,6 +701,18 @@ func FromEnv() (*Config, error) {
 		cfg.AttributionSalt = derived
 	}
 	return cfg, nil
+}
+
+// pyStrip trims what Python's str.strip() trims and nothing more. The Slack
+// pair is the one credential the gateway shares with the broker, which reads
+// the same Secret keys with .strip() (credential_proxy.py); reading them the
+// same way keeps a value that worked under `today` (a trailing newline from
+// --from-file or an `echo` without -n) working under `next`. Python's
+// whitespace is Go's unicode.IsSpace plus the four separators U+001C-U+001F.
+func pyStrip(s string) string {
+	return strings.TrimFunc(s, func(r rune) bool {
+		return unicode.IsSpace(r) || (r >= 0x1c && r <= 0x1f)
+	})
 }
 
 func envOr(key, def string) string {
