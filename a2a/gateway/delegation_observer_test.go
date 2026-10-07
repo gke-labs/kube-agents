@@ -536,6 +536,42 @@ func TestASettledChainProbesAsItsLastTask(t *testing.T) {
 			t.Fatalf("settled probe of the root = %+v, want the observer's end %+v", st, end)
 		}
 	})
+	t.Run("a wake that cannot reach the bus reads the observer's end", func(t *testing.T) {
+		r, spawn, obs := startObservedRig(t, doorDelegation(t))
+		conv := "a2a:agent-1001/ctx-settled-nobus"
+		origin, _, child := delegated(t, r, spawn, conv, a2aBackend)
+		// Only platform's submissions reach the stream now, so the wake's,
+		// on a fresh incarnation, fails to publish.
+		narrowTasksStream(t, r.url, targetPlatform)
+		completeTask(t, r.execFor(t, child, targetPlatform), "fleet is green")
+		st, end := settled(t, r, obs, conv, origin.TaskID)
+		if !loggedContaining(r, "task publish failed")() {
+			t.Fatalf("the wake's publish did not fail:\n%s", r.logs.String())
+		}
+		var wakeID string
+		for _, line := range strings.Split(r.logs.String(), "\n") {
+			if strings.Contains(line, "task publish failed") {
+				for _, f := range strings.Fields(line) {
+					if v, ok := strings.CutPrefix(f, "taskId="); ok {
+						wakeID = v
+					}
+				}
+			}
+		}
+		rec, _ := r.g.reg.Get(context.Background(), conv)
+		for _, ref := range rec.Tasks {
+			if ref.Role == taskRoleWake {
+				t.Fatalf("a wake that never reached the bus is on record: %+v", ref)
+			}
+		}
+		if key, err := r.g.reg.SessionForTask(context.Background(), wakeID); wakeID == "" || err != nil || key != "" {
+			t.Fatalf("the failed wake %q is still indexed: %q %v", wakeID, key, err)
+		}
+		if !st.Final || st.ExecutorState != lib.StateFailed || st.Reason != end.text ||
+			!strings.Contains(st.Reason, "the wake could not be started") || st.TerminalSource != end.source {
+			t.Fatalf("settled probe of the root = %+v, want the observer's end %+v", st, end)
+		}
+	})
 	t.Run("a turn that never delegated reads its own stream", func(t *testing.T) {
 		r, spawn, obs := startObservedRig(t, doorDelegation(t))
 		conv := "a2a:agent-1001/ctx-settled-plain"

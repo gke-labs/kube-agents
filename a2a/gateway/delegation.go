@@ -422,6 +422,21 @@ func (g *Gateway) dropFailedChildren(ctx context.Context, rec *SessionRecord, ta
 	}
 }
 
+// dropFailedWake removes the entry and the index of a wake of childID whose
+// submission never reached the bus. A child starts one wake at most, so any
+// wake entry naming it is the failed one.
+func (g *Gateway) dropFailedWake(ctx context.Context, rec *SessionRecord, childID string) {
+	kept := rec.Tasks[:0]
+	for _, ref := range rec.Tasks {
+		if ref.Role != taskRoleWake || ref.ParentTaskID != childID {
+			kept = append(kept, ref)
+			continue
+		}
+		g.retireTaskRoute(ctx, ref.ID)
+	}
+	rec.Tasks = kept
+}
+
 // deferNotice holds a notice for the task until its terminal relays
 // (flushNotices). Render state is cache, so a gateway restart in between
 // loses it; the audit line is the record.
@@ -534,6 +549,12 @@ func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child Tas
 		Request:              parent.Request,
 	})
 	if !ok {
+		// startTaskWith has said why. A wake that never reached the bus
+		// leaves no entry and no route, as a failed child does
+		// (dropFailedChildren): otherwise a read of the settled chain
+		// follows the child to a wake with nothing on its stream, not to
+		// the end observeChildEnd records on the child.
+		g.dropFailedWake(ctx, rec, child.ID)
 		return false, "the wake could not be started"
 	}
 	log.Info("session woken", "wake", wakeID, "session", rec.BusSession)
