@@ -34,12 +34,14 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from datetime import datetime, timezone
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 STACK = REPO / "bench" / "tf" / "prebuilt" / "oobe-first-run-audits"
 AUDITS = ["compliance-audit", "obtainability-audit", "fleet-wide-cost-analysis", "stockout-prevention"]
 OOBE_JOB = {"id": "oobe", "script": "oobe.py", "no_agent": True, "schedule": {"kind": "cron", "expr": "* * * * *"}}
 OTHER_JOB = {"id": "profile-cron-tick", "schedule": {"kind": "cron", "expr": "* * * * *"}}
+NOW = datetime.now(timezone.utc).isoformat()
 
 CRON_JOBS_STUB = textwrap.dedent(
     """
@@ -230,10 +232,12 @@ class PlantScriptsTest(unittest.TestCase):
             con.executemany(
                 "INSERT INTO executions VALUES (?, ?, ?, ?)",
                 [
-                    ("1", "compliance-audit", "running", "x"),
-                    ("2", "obtainability-audit", "claimed", "x"),
-                    ("3", "stockout-prevention", "completed", "x"),
-                    ("4", "gce-compute-fleet-audit", "running", "x"),
+                    ("1", "compliance-audit", "running", NOW),
+                    ("2", "obtainability-audit", "claimed", NOW),
+                    ("3", "stockout-prevention", "completed", NOW),
+                    ("4", "gce-compute-fleet-audit", "running", NOW),
+                    # Cut off by a gateway restart: still running, a day old.
+                    ("5", "fleet-wide-cost-analysis", "running", "2000-01-01T00:00:00+00:00"),
                 ],
             )
         done = self._run("in_flight.py", str(self.home), *AUDITS)

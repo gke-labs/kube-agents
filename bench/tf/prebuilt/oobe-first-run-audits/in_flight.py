@@ -17,18 +17,23 @@
 Usage: python3 - <home> <audit-id>... < in_flight.py
 
 An audit already in flight is not started again when it is marked due, so the
-stage could not be graded until these finish. Prints a count, or nothing when the
-Platform Agent's cron store cannot be read.
+stage could not be graded until these finish. A row claimed more than
+``STALE_SECONDS`` ago is not counted: a gateway restart leaves a cut-off run's row
+at running for good, and no audit takes that long. Prints a count, or nothing when
+the Platform Agent's cron store cannot be read.
 """
 
 import os
 import sqlite3
 import sys
+from datetime import datetime, timedelta, timezone
 
 home, audits = sys.argv[1], sys.argv[2:]
 LEDGER = os.path.join(home, "profiles", "platform", "cron", "executions.db")
 SQLITE_BUSY_TIMEOUT_SECONDS = 10
 IN_FLIGHT = ("claimed", "running")
+# audit_report.py's in-flight note lapses after this long too (INFLIGHT_TTL_SECONDS).
+STALE_SECONDS = 2 * 60 * 60
 
 if not os.path.exists(LEDGER):
     print(0)
@@ -36,10 +41,12 @@ if not os.path.exists(LEDGER):
 conn = sqlite3.connect(f"file:{LEDGER}?mode=ro", uri=True, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)
 try:
     marks = ",".join("?" * len(audits))
-    count = conn.execute(
-        f"SELECT count(*) FROM executions WHERE job_id IN ({marks}) AND status IN (?, ?)",
+    since = datetime.now(timezone.utc) - timedelta(seconds=STALE_SECONDS)
+    rows = conn.execute(
+        f"SELECT claimed_at FROM executions WHERE job_id IN ({marks}) AND status IN (?, ?)",
         (*audits, *IN_FLIGHT),
-    ).fetchone()[0]
+    ).fetchall()
+    count = sum(1 for (claimed,) in rows if claimed and datetime.fromisoformat(claimed) >= since)
 finally:
     conn.close()
 print(count)

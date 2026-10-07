@@ -239,8 +239,9 @@ cases.
 
 ## 9. Open questions
 
-- **Concurrency.** Whether `profile-cron-tick` runs four due jobs together, which sets how long the
-  last audit takes and how hard day one leans on the model quota. Measured in the first live run.
+- **Model quota.** `profile-cron-tick` starts the four together, on one tick; on a four-cluster
+  install with `gemini-3.1-flash-lite` they finished in one to eight minutes. A larger fleet or a
+  smaller quota may hit per-minute limits with four audit runs at once.
 - **Output volume.** How many pull requests and chat lines a first run produces on a real fleet. If
   it reads as noise, day one narrows to cost and capacity, the two audits the inventory report does
   not overlap.
