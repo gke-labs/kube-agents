@@ -504,6 +504,32 @@ const (
 	a2aDiscordBotSecretName = "discord-bot"
 	a2aDiscordBotTokenKey   = "token" // #nosec G101 -- Secret key name, not a credential
 
+	// The Slack backend the operator renders under mode: next when
+	// spec.integration.slack is enabled (a2aSlackArmed): the pair is read
+	// through the CR's botTokenSecretRef and appTokenSecretRef, which the
+	// CRD requires once Slack is enabled. The env names are the gateway's;
+	// docs/README.md says this file must agree with a2a/gateway/config.go.
+	a2aSlackBotTokenEnvVar = "SLACK_BOT_TOKEN" // #nosec G101 -- Environment variable name, not a credential
+	a2aSlackAppTokenEnvVar = "SLACK_APP_TOKEN" // #nosec G101 -- Environment variable name, not a credential
+	// The Slack allowlist the gateway gates a sender on before the map,
+	// carried the way Chat's is (a2aGchatAllowedUsersEnvVar).
+	a2aSlackAllowedUsersEnvVar  = "A2A_SLACK_ALLOWED_USERS"
+	a2aSlackAllowAllUsersEnvVar = "A2A_SLACK_ALLOW_ALL_USERS"
+	// The principal map the gateway resolves Discord and Slack senders
+	// through: one path (A2A_PRINCIPAL_MAP, the gateway's default spelled
+	// out), one volume, and one source in it, the armed backend's table
+	// (a2aPrincipalMapVolumeSource): the admin-owned a2a-slack-principal-map
+	// Secret of spec-chatops-gateway.md, "The Slack adapter", when Slack is
+	// armed, and otherwise the hand-made principal-map ConfigMap that is
+	// Discord's test table. Optional either way, which is the gateway's own
+	// rule for a missing map: it runs, and every sender drops at
+	// verification.
+	a2aPrincipalMapEnvVar          = "A2A_PRINCIPAL_MAP"
+	a2aPrincipalMapDir             = "/etc/a2a/principal-map"
+	a2aPrincipalMapVolume          = "principal-map"
+	a2aPrincipalMapConfigMapName   = "principal-map"
+	a2aSlackPrincipalMapSecretName = "a2a-slack-principal-map" // #nosec G101 -- Secret name, not a credential
+
 	// The Google Chat backend the operator renders under mode: next when
 	// spec.integration.googleChat is enabled (a2aChatArmed). Names are the
 	// gateway's (a2a/gateway/config.go, FromEnv) and the broker's
@@ -1153,6 +1179,50 @@ func legacyChatConsumer(agent *agentv1alpha1.PlatformAgent) bool {
 	return googleChatEnabled(agent) && !a2aChatArmed(agent)
 }
 
+// a2aSlackArmed reports whether this install's Slack is consumed by the next
+// stack: the gateway's Slack backend, on the token pair the CR's
+// spec.integration.slack refs name. It is a2aChatArmed's rule for the same
+// reason: a Slack app's events are spread across every Socket Mode
+// connection it has open, so two consumers on one app split its messages,
+// and the legacy path already opens one (the credential broker's SlackRelay,
+// armed by the same refs). Exactly one consumer holds the app and the mode
+// chooses.
+//
+// One exception, because the gateway runs one real backend per process
+// (a2a/gateway/config.go, FromEnv): when Chat is armed it holds the gateway,
+// as it holds it over the discord-bot Secret, and Slack stays on the legacy
+// consumer rather than reaching nobody. renderMode fails closed, so skew
+// reads as today here too. Unlike Chat, that double-consumes: the frozen
+// gateway holds the pair itself and stays connected beside the re-rendered
+// legacy relay. Accepted and documented in the spec (2026-10-06).
+//
+// The CR alone decides, by decision (2026-10-06): the token Secret is not
+// read, so a multi-workspace bot token (the broker's comma-separated list,
+// which the gateway cannot use) is armed anyway. Such installs must stay on
+// today; the spec's Slack section and the CRD page say so.
+func a2aSlackArmed(agent *agentv1alpha1.PlatformAgent) bool {
+	return renderMode(agent, "gateway") == ModeNext && slackEnabled(agent) && !a2aChatArmed(agent)
+}
+
+// legacySlackConsumer is the complement: the broker's Slack relay pair, the
+// Hermes slack platform and its relay env render exactly when Slack is
+// enabled and the next stack is not taking it. Every legacy Slack render
+// site asks this rather than the enabled flag, so the two Socket Mode
+// consumers cannot both render.
+func legacySlackConsumer(agent *agentv1alpha1.PlatformAgent) bool {
+	return slackEnabled(agent) && !a2aSlackArmed(agent)
+}
+
+// slackEnabled is the enabled test the Slack render sites make, in one place.
+// The status interfaces list still spells it inline, as it does Chat's.
+func slackEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	if agent == nil || agent.Spec.Integration == nil {
+		return false
+	}
+	slack := agent.Spec.Integration.Slack
+	return slack != nil && slack.Enabled != nil && *slack.Enabled
+}
+
 // googleChatEnabled is the enabled test the Chat render sites make, in one
 // place; the status interfaces list (resolveActiveInterfaces in
 // manifest_helpers.go) still spells it inline, since it is about the install
@@ -1165,15 +1235,15 @@ func googleChatEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 	return gchat != nil && gchat.Enabled != nil && *gchat.Enabled
 }
 
-// a2aGchatAllowlist reads the CR's allowed-users list the way the gateway's
-// FromEnv reads the env it becomes, with the gateway's own grammar: the
+// a2aAllowlist reads a CR allowed-users list (Chat's or Slack's) the way the
+// gateway's FromEnv reads the env it becomes, with the gateway's own grammar: the
 // entries joined on commas and split again, each piece trimmed, the empty
 // ones dropped - so the list the gateway sees is the one it would have
 // parsed, and an entry carrying a comma is the two entries it would read.
 // The allow-all decision is NOT made on the result: it is the legacy rule on
 // the raw list (allowAllUsers), so a degenerate list restricts to nobody in
 // both modes instead of widening to everyone in one of them.
-func a2aGchatAllowlist(users []string) []string {
+func a2aAllowlist(users []string) []string {
 	var out []string
 	for _, u := range strings.Split(strings.Join(users, ","), ",") {
 		if u = strings.TrimSpace(u); u != "" {
@@ -2050,12 +2120,12 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 // mode: next and needs its own live test.
 //
 // And the rotation it notices rolls the bus, not the bus's clients. This hash
-// rides the NATS pod template alone; the gateway Deployment and the provision
-// Job take their passwords through valueFrom.secretKeyRef, which a running pod
-// does not re-read, so a repaired credential leaves the gateway holding the old
-// one until something else restarts it. That gap predates this function — the
-// conf digest rolled only the StatefulSet too — and closing it means deciding
-// what a rotation should restart, which is not this function's call.
+// rides the NATS pod template alone; the gateway Deployment takes its password
+// through valueFrom.secretKeyRef, which a running pod does not re-read. The
+// gateway is covered separately: its pod template carries the secret-env digest
+// (stampSecretEnvHash in reconcileA2A), which moves when its password's value
+// does, within secretEnvReprobeInterval. The provision Job holds no password: it
+// authenticates with its projected bus token (a2aBusTokenVolumeSource).
 func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys) string {
 	redacted := renderA2ANATSConf(agent, func(key string) string {
 		return fmt.Sprintf(a2aConfigHashPlaceholder, key)
@@ -4072,11 +4142,68 @@ func buildA2AGatewayNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkin
 	}
 }
 
+// a2aPrincipalMapVolumeSource is the gateway's one principal-map volume, at
+// the one path the gateway reads its map from (A2A_PRINCIPAL_MAP), and it is
+// the armed backend's table and nothing else. The gateway loads that
+// directory as one flat map and resolves a sender against every key in it,
+// with no record of which source a key came from, so whatever else is
+// mounted there can admit a sender too.
+//
+// A Slack-armed gateway reads the a2a-slack-principal-map Secret alone. The
+// hand-made principal-map ConfigMap is not projected beside it, because a
+// Slack-shaped key written into that ConfigMap would resolve a Slack sender:
+// a configmaps write would grant a principal, which is the impersonation
+// primitive spec-chatops-gateway.md, "The mapping table", keeps the table out
+// of a ConfigMap to avoid. The Secret is referenced, never rendered: it is the
+// install admin's to write, through the install path, and no product
+// ServiceAccount holds a verb on it. No DefaultMode: the pod runs as uid 1000
+// with no fsGroup, and a 0400 Secret file would be root's and unreadable.
+//
+// Every other gateway keeps the volume it had before Slack could arm one: the
+// principal-map ConfigMap, Discord's test table, which never maps a real
+// principal. The eval door's map is its own ConfigMap at its own path and is
+// not this volume. Optional either way, for the gateway's own reason: an
+// install without its table runs and drops every sender at verification,
+// visibly.
+func a2aPrincipalMapVolumeSource(agent *agentv1alpha1.PlatformAgent) corev1.Volume {
+	if a2aSlackArmed(agent) {
+		return corev1.Volume{
+			Name: a2aPrincipalMapVolume,
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+				SecretName: a2aSlackPrincipalMapSecretName,
+				Optional:   ptr.To(true),
+			}},
+		}
+	}
+	return corev1.Volume{
+		Name: a2aPrincipalMapVolume,
+		VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+			LocalObjectReference: corev1.LocalObjectReference{Name: a2aPrincipalMapConfigMapName},
+			Optional:             ptr.To(true),
+		}},
+	}
+}
+
+// a2aRequiredSecretRef is the gateway's copy of a token ref from the CR,
+// required whatever the CR's own copy says. The gateway refuses half a
+// Slack pair at boot (a2a/gateway/config.go, FromEnv), so an optional ref
+// whose key is missing would start a pod that exits and restarts; a
+// required one holds the pod at container creation, with the missing
+// Secret or key named in its events. A nil ref (a CR the CRD's CEL rule
+// would refuse today) falls back to the default the legacy broker reads,
+// so the two paths read the same Secret.
+func a2aRequiredSecretRef(ref *corev1.SecretKeySelector, defaultKey string) *corev1.SecretKeySelector {
+	out := defaultSecretRef(ref, defaultPlatformAgentSecrets, defaultKey).DeepCopy()
+	out.Optional = nil
+	return out
+}
+
 // buildA2AGatewayDeployment renders the A2A gateway (the chatops gateway of
 // docs/designs/spec-chatops-gateway.md). Which chat backend it starts on is
 // the install's: the Google Chat env and relay token when a2aChatArmed, the
-// optional discord-bot Secret reference otherwise, and the inject door under
-// its own flag beside either. The render is withheld while none of those is
+// Slack token pair from the CR's refs when a2aSlackArmed, the optional
+// discord-bot Secret reference otherwise, and the inject door under its own
+// flag beside any of them. The render is withheld while none of those is
 // configured (a2aGatewayBackend); once rendered, a pod still crash-loops
 // until the gateway image is reachable.
 func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
@@ -4165,7 +4292,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	// NOT the Discord reference: the gateway refuses two real backends, so
 	// an install with both a discord-bot Secret and Chat enabled under next
 	// gets the one its CR names.
-	discordEnv := []corev1.EnvVar{
+	backendEnv := []corev1.EnvVar{
 		// Created by hand at install time (the bot token is operator input,
 		// never repo content); the reference is optional so the pod
 		// schedules before it.
@@ -4175,20 +4302,40 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			Optional:             ptr.To(true),
 		}}},
 	}
+	// The Slack backend takes the Discord reference's place on the same
+	// terms: the CR names it (a2aSlackArmed), so a discord-bot Secret left in
+	// the namespace cannot make the gateway refuse two backends. The pair is
+	// read through the CR's own refs, the ones the legacy broker reads, which
+	// is why the legacy consumer is off whenever this is on.
+	if a2aSlackArmed(agent) {
+		slack := agent.Spec.Integration.Slack
+		backendEnv = []corev1.EnvVar{
+			{Name: a2aSlackBotTokenEnvVar, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: a2aRequiredSecretRef(slack.BotTokenSecretRef, a2aSlackBotTokenEnvVar)}},
+			{Name: a2aSlackAppTokenEnvVar, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: a2aRequiredSecretRef(slack.AppTokenSecretRef, a2aSlackAppTokenEnvVar)}},
+			// The allowed-users gate, carried on Chat's terms (see the Chat
+			// pair below): normalized the way the gateway reads it, the
+			// allow-all flag the legacy rule on the RAW list. The gateway
+			// admits a Slack sender only if this gate AND the principal map
+			// both pass, so a mapped member the CR does not allow is
+			// refused under next as under today.
+			{Name: a2aSlackAllowedUsersEnvVar, Value: strings.Join(a2aAllowlist(slack.AllowedUsers), ",")},
+			{Name: a2aSlackAllowAllUsersEnvVar, Value: strconv.FormatBool(allowAllUsers(slack.AllowedUsers))},
+		}
+	}
 	var chatEnv []corev1.EnvVar
 	var chatMounts []corev1.VolumeMount
 	var chatVolumes []corev1.Volume
 	if a2aChatArmed(agent) {
 		gchat := agent.Spec.Integration.GoogleChat
-		allowed := a2aGchatAllowlist(gchat.AllowedUsers)
-		discordEnv = nil
+		allowed := a2aAllowlist(gchat.AllowedUsers)
+		backendEnv = nil
 		chatEnv = []corev1.EnvVar{
 			// The relay is the broker; the gateway pod holds no cloud credential.
 			{Name: a2aGchatRelayURLEnvVar, Value: credentialProxyBaseURL(agent)},
 			// The allowed-users gate, carried as environment because
 			// environment is what the agent cannot rewrite, from the same
 			// CR list the legacy pin uses. The list is normalized the way
-			// the gateway reads it (a2aGchatAllowlist); the allow-all flag
+			// the gateway reads it (a2aAllowlist); the allow-all flag
 			// is the legacy consumer's rule on the RAW list (allowAllUsers:
 			// absent, or a single empty string), so one CR means one thing
 			// in both modes. A degenerate list - whitespace or commas only -
@@ -4228,7 +4375,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			Key:                  a2aGatewayPasswordKey,
 		}}},
 	}
-	env = append(env, discordEnv...)
+	env = append(env, backendEnv...)
 	env = append(env, []corev1.EnvVar{
 		// Rendered explicitly even when the CR is silent:
 		// the number a `kubectl describe` reader sees is
@@ -4298,6 +4445,12 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// name, so the render and the spawner must agree
 		// or every session is refused at connect.
 		{Name: "A2A_SESSION_SERVICE_ACCOUNT", Value: a2aSessionServiceAccountName(agent)},
+		// Rendered explicitly at the gateway's default, like
+		// A2A_GCHAT_TOKEN_PATH: the path and the projected
+		// volume below are one fact, and a reader of the live
+		// Deployment sees where the Discord and Slack identity
+		// tables come from.
+		{Name: a2aPrincipalMapEnvVar, Value: a2aPrincipalMapDir},
 	}...)
 	env = append(env, chatEnv...)
 	env = append(env, injectEnv...)
@@ -4351,17 +4504,11 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						Env:        env,
 						Ports:      injectPorts,
 						VolumeMounts: append(append([]corev1.VolumeMount{{
-							Name: "principal-map", MountPath: "/etc/a2a/principal-map", ReadOnly: true,
+							Name: a2aPrincipalMapVolume, MountPath: a2aPrincipalMapDir, ReadOnly: true,
 						}}, chatMounts...), injectMounts...),
 						SecurityContext: hardenedSecurityContext(),
 					}},
-					Volumes: append(append([]corev1.Volume{{
-						Name: "principal-map",
-						VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
-							LocalObjectReference: corev1.LocalObjectReference{Name: "principal-map"},
-							Optional:             ptr.To(true),
-						}},
-					}}, chatVolumes...), injectVolumes...),
+					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent)}, chatVolumes...), injectVolumes...),
 				},
 			},
 		},
@@ -4393,7 +4540,8 @@ type a2aProvisionState struct {
 	gatewayHeld bool
 	// gatewayDark reports that the gateway Deployment was withheld because
 	// the install configures no chat backend for it: no discord-bot Secret,
-	// no door armed and Chat not taken by next (a2aGatewayBackend). gatewayDarkReason is the
+	// no door armed and neither Chat nor Slack taken by next
+	// (a2aGatewayBackend). gatewayDarkReason is the
 	// remedy, for the condition the status writer publishes. A gateway that
 	// already exists is never withheld on this account; see the call site.
 	gatewayDark       bool
@@ -4418,7 +4566,8 @@ type a2aProvisionState struct {
 // A2A door armed on the operator (the agent-caller install, gke-labs#2252
 // step 1, the same decision: the gateway accepts A2A_DOOR_LISTEN as its
 // ingress); the CR's Google Chat integration under next (a2aChatArmed, which
-// needs no read at all); the discord-bot Secret present in the namespace.
+// needs no read at all); its Slack integration under next (a2aSlackArmed, the
+// same); the discord-bot Secret present in the namespace.
 //
 // The Secret is read through a2aReader, uncached, for the reason every other
 // Secret read here is (see removeA2AInjectBackend): the operator ships
@@ -4428,9 +4577,13 @@ func (r *PlatformAgentReconciler) a2aGatewayBackend(ctx context.Context, agent *
 	if a2aInjectBackendEnabled() || a2aAgentDoorEnabled() {
 		return true, "", nil
 	}
-	// Before the Secret read: the answer is on the CR, and a Chat install
-	// should pay nothing for a Secret it never created.
-	if a2aChatArmed(agent) {
+	// Before the Secret read: the answer is on the CR, and a Chat or Slack
+	// install should pay nothing for a Secret it never created. Slack's
+	// token Secret is not read here either: the gateway's refs to it are
+	// required (a2aRequiredSecretRef), so a missing Secret or key holds the
+	// pod at container creation, named in its events, rather than starting
+	// one that exits.
+	if a2aChatArmed(agent) || a2aSlackArmed(agent) {
 		return true, "", nil
 	}
 	secret := &corev1.Secret{}
@@ -4445,14 +4598,15 @@ func (r *PlatformAgentReconciler) a2aGatewayBackend(ctx context.Context, agent *
 		// check exists to prevent. Withheld, with the key named.
 		return false, fmt.Sprintf("the %s Secret in %s carries no %q key, so the A2A gateway has no chat backend and its "+
 			"Deployment is not rendered: put the Discord bot token under that key, or enable spec.integration.googleChat "+
-			"so the next stack takes Google Chat; an eval install arms the inject door (%s=true on the operator) "+
+			"or spec.integration.slack so the next stack takes Google Chat or Slack; an eval install arms the inject door (%s=true on the operator) "+
 			"or the A2A door (%s=true) instead",
 			a2aDiscordBotSecretName, agent.Namespace, a2aDiscordBotTokenKey, a2aInjectBackendEnvVar, a2aAgentDoorEnvVar), nil
 	case !errors.IsNotFound(err):
 		return false, "", err
 	}
 	return false, fmt.Sprintf("no chat backend is configured for the A2A gateway, so its Deployment is not rendered: "+
-		"enable spec.integration.googleChat so the next stack takes Google Chat, or create the %s Secret (key %s) in %s; "+
+		"enable spec.integration.googleChat or spec.integration.slack so the next stack takes Google Chat or Slack, "+
+		"or create the %s Secret (key %s) in %s; "+
 		"an eval install arms the inject door (%s=true on the operator) or the A2A door (%s=true) instead",
 		a2aDiscordBotSecretName, a2aDiscordBotTokenKey, agent.Namespace, a2aInjectBackendEnvVar, a2aAgentDoorEnvVar), nil
 }
@@ -4934,6 +5088,17 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 			return state, err
 		}
 		return state, nil
+	}
+	// The secret-env digest, on the same terms as the agent gateway and the
+	// broker (platformagent_secret_hash.go). On a Slack-armed install this pod,
+	// not the broker, reads the Slack pair, so without it a rotated token would
+	// reach no pod at all; the stamp covers every Secret ref the render carries
+	// (the bus password, the salt, the Discord or Slack tokens, a door's token)
+	// rather than special-casing Slack. After both gates, so a withheld gateway
+	// pays no Secret read; once one exists this is one Get per referenced Secret
+	// per pass, the cost the other two stamped pods already carry.
+	if err := r.stampSecretEnvHash(ctx, agent, dep, &dep.Spec.Template); err != nil {
+		return state, err
 	}
 	if err := r.applyA2AGatewayDeployment(ctx, agent, dep); err != nil {
 		return state, fmt.Errorf("failed to apply A2A gateway Deployment: %w", err)
