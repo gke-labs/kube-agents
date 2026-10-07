@@ -928,11 +928,14 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	var healedSource TerminalSource
 	var healedTask *lib.Task // the terminal the heal found, shape (a) only
 	switch {
-	case err == nil && task.Final && task.Artifact(lib.ArtifactDelegate) != nil && !rec.hasChildren(active.TaskID):
+	case err == nil && task.Final && task.Artifact(lib.ArtifactDelegate) != nil && !rec.delegationHandled(active.TaskID):
 		// A turn that asked to delegate, whose request the relay has not
 		// reached: the stream holds the delegate artifact and the turn's
-		// own terminal ("delegated to platform"), and the record names no
-		// child. That terminal is not the root's end, and the request still
+		// own terminal ("delegated to platform"), and the record shows the
+		// request neither minted nor refused (both are written when they
+		// are made, so a relay whose own write was lost after a refusal
+		// does not have its refusal run again here; that turn heals below
+		// as any lost terminal). That terminal is not the root's end, and the request still
 		// has to be minted or refused. Inside relayLagGrace of the
 		// terminal the relay is the one to settle it - it delivers the
 		// artifact and the terminal in order from its durable - and the
@@ -1110,16 +1113,15 @@ func (g *Gateway) relayLagStart(taskID string, storedAt, now time.Time) time.Tim
 
 // relayUnrelayedDelegation does for a delegating turn what the relay would
 // have done with its two lost events, from the stream's fold: the delegate
-// request through handleDelegateRequest, every check applying, which mints
-// the child or refuses; then the turn's terminal through relayTerminal, so
-// the room, the rolling line and the observers get what the relay would
-// have given them (a turn that minted ends quietly; a refused one ends the
-// root failed). Called under the session lock; the caller writes the record.
-// A relay that delivers the two events late finds the request busy or stale
-// and the terminal's route retired, so neither acts twice.
+// request through runFoldedDelegate - minting the child or refusing, every
+// check applying - then the turn's terminal through relayTerminal, which
+// gives the room, the rolling line and the observers what the relay would
+// have (a turn that minted ends quietly; a
+// refused one ends the root failed). Called under the session lock; the
+// caller writes the record. A relay that delivers the two events late finds
+// the request busy or stale and the terminal's route retired, so neither
+// acts twice.
 func (g *Gateway) relayUnrelayedDelegation(ctx context.Context, rec *SessionRecord, taskID, addressee string, task *lib.Task, terminalSubject string) {
-	subject := lib.TaskEventsSubject(addressee, taskID)
-	g.handleDelegateRequest(ctx, rec, subject, taskID, task.Artifact(lib.ArtifactDelegate).Parts)
 	source := TerminalFromExecutor
 	if terminalSubject == lib.TaskSupervisorSubject(addressee, taskID) {
 		source = TerminalFromSupervisor
@@ -1131,9 +1133,24 @@ func (g *Gateway) relayUnrelayedDelegation(ctx context.Context, rec *SessionReco
 		g.relays[taskID] = rs
 	}
 	g.mu.Unlock()
+	g.runFoldedDelegate(ctx, rec, rs, taskID, addressee, task)
 	status := lib.StatusUpdate{TaskID: taskID, ContextID: task.ContextID,
 		Status: lib.TaskStatus{State: task.State, Message: task.FinalMessage}, Final: true}
 	g.relayTerminal(ctx, rec, rs, taskID, status, source)
+}
+
+// runFoldedDelegate runs the delegate request a task's fold carries, if any,
+// through handleDelegateRequest, as applyArtifact would have run the event:
+// for the relay's terminal and the heal, when the event's own delivery was
+// lost. Marks it run on rs, so it runs once.
+func (g *Gateway) runFoldedDelegate(ctx context.Context, rec *SessionRecord, rs *relayState, taskID, addressee string, task *lib.Task) {
+	art := task.Artifact(lib.ArtifactDelegate)
+	if art == nil {
+		return
+	}
+	rs.sawDelegate = true
+	g.log.Info("running a delegate request read from the stream", "conversation", rec.Key, "taskId", taskID)
+	g.handleDelegateRequest(ctx, rec, lib.TaskEventsSubject(addressee, taskID), taskID, art.Parts)
 }
 
 // healedChildOutcome is a healed child's result and reason as relayTerminal
@@ -1948,7 +1965,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	}
 	g.mu.Lock()
 	g.taskSessions[taskID] = rec.Key
-	g.relays[taskID] = &relayState{}
+	g.relays[taskID] = &relayState{local: true}
 	g.mu.Unlock()
 	if err := g.reg.IndexTask(ctx, taskID, rec.Key); err != nil {
 		g.log.Error("task index write failed", "taskId", taskID, "err", err)

@@ -409,10 +409,24 @@ func (rec *SessionRecord) observedAs(taskID string) (id string, ends bool) {
 	return ref.rootID(), ref.Role != taskRoleChild && len(ref.Children) == 0
 }
 
-// hasChildren reports whether the task's history entry names a child.
-func (rec *SessionRecord) hasChildren(taskID string) bool {
+// delegationHandled reports whether the task's history entry shows a
+// delegate request of its was handled: a child linked, or a refusal marked.
+// Both are written to the record when they are made (startTaskWith's write
+// for a mint, handleDelegateRequest's for a refusal), so the record holds
+// either from the moment the request is decided.
+func (rec *SessionRecord) delegationHandled(taskID string) bool {
 	ref, ok := rec.TaskRefFor(taskID)
-	return ok && len(ref.Children) > 0
+	return ok && (len(ref.Children) > 0 || ref.DelegationRefused != "")
+}
+
+// mayHaveUnhandledDelegate reports whether the task is a session turn - not
+// a child, addressed to the record's own bus session - whose entry shows no
+// delegate request handled: the only kind of task whose fold can carry a
+// delegate request still to run.
+func (rec *SessionRecord) mayHaveUnhandledDelegate(taskID string) bool {
+	ref, ok := rec.TaskRefFor(taskID)
+	return ok && ref.Role != taskRoleChild && rec.BusSession != "" && ref.Addressee == rec.BusSession &&
+		len(ref.Children) == 0 && ref.DelegationRefused == ""
 }
 
 // chainLast follows a delegation chain from the turn that started it to its

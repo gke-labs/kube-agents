@@ -92,6 +92,13 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 				rec.Tasks[i].DelegationRefused = notice
 			}
 		}
+		// Written now, under the session lock the caller holds, as
+		// startTaskWith writes a mint: left to the relay's end-of-batch
+		// write, a failed write would lose the mark, and the turn's
+		// terminal would then end the chain on the hand-off line.
+		if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
+			g.log.Error("session record write failed after a delegation refusal", "conversation", rec.Key, "err", err)
+		}
 	}
 
 	// Only the task the gateway started, from the incarnation that owns it

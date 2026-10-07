@@ -629,6 +629,198 @@ func TestTheRelayLagGraceRunsOnTrustedClocks(t *testing.T) {
 	}
 }
 
+// offTheList is a config tweak whose platform list for the inject door names
+// someone other than the rig's author, so the author's delegation is refused.
+func offTheList(c *Config) {
+	c.TargetAllowedUsers = map[string]map[string][]string{targetPlatform: {injectBackend: {"someone-else"}}}
+}
+
+// TestALostDelegateArtifactIsRunFromTheStreamAtTheTerminal: the first gateway
+// acked the delegate artifact and went down before its batch ran, so the
+// event is gone; the turn's terminal was not yet delivered and is relayed by
+// the next gateway. The relay reads the request off the stream and runs it
+// before ending the turn: it mints the child, and the chain ends once on the
+// wake's result, or it refuses, and the root ends failed. Never is the
+// hand-off line the root's deliverable.
+func TestALostDelegateArtifactIsRunFromTheStreamAtTheTerminal(t *testing.T) {
+	lost := func(t *testing.T, tweak func(*Config), conv string) (*rig, *fakeSpawner, *recordingObserver, *lib.Envelope) {
+		t.Helper()
+		r, spawn, _ := startObservedRig(t, func(c *Config) {
+			armInjectMap(t, c)
+			if tweak != nil {
+				tweak(c)
+			}
+		})
+		exec, origin, _ := sessionTurnVia(t, r, spawn, conv, injectBackend, "how is the fleet?")
+		waitFor(t, "the turn working on the record", func() bool {
+			rec, _ := r.g.reg.Get(context.Background(), conv)
+			return rec != nil && rec.ActiveTask != nil && rec.ActiveTask.TaskID == origin.TaskID
+		})
+		var obs *recordingObserver
+		r2, spawn2 := restartRigWrapped(t, r, func(a *fakeAdapter) Adapter {
+			obs = &recordingObserver{fakeAdapter: a}
+			return obs
+		}, func() {
+			if err := exec.PublishArtifact(context.Background(), delegateArtifact(t, targetPlatform, "report fleet health")); err != nil {
+				t.Fatal(err)
+			}
+			// Acked and never batched: the delivery the crash lost.
+			drainRelayDurable(t, r.url)
+			completeTask(t, exec, "delegated to platform")
+		})
+		return r2, spawn2, obs, origin
+	}
+	assertNoHandOff := func(t *testing.T, obs *recordingObserver) {
+		t.Helper()
+		for _, e := range obs.events() {
+			if e.kind == "delivered" && e.text == "delegated to platform" {
+				t.Fatalf("the hand-off line was the root's deliverable: %v", obs.kinds())
+			}
+		}
+	}
+
+	t.Run("it mints", func(t *testing.T) {
+		conv := injectKeyPrefix + "case-lost-artifact-mint"
+		r2, spawn2, obs, origin := lost(t, nil, conv)
+		child := awaitSubmission(t, r2, targetPlatform, 0)
+		waitFor(t, "the turn's terminal relayed", postedContaining(r2, "delegated to platform"))
+		for _, e := range obs.events() {
+			if e.kind == "terminal" || e.kind == "delivered" {
+				t.Fatalf("the delegating turn's terminal reached the observer: %v", obs.kinds())
+			}
+		}
+		completeTask(t, r2.execFor(t, child, targetPlatform), "fleet is green")
+		waitFor(t, "wake spawn", func() bool { return len(spawn2.calls()) == 1 })
+		wakeSession := spawn2.calls()[0].Session
+		wake := r2.awaitTask(t, wakeSession)
+		wexec := r2.execFor(t, wake, wakeSession)
+		_ = wexec.PublishStatus(context.Background(), lib.StateWorking, false)
+		completeTask(t, wexec, "the fleet is healthy")
+		waitFor(t, "the root's terminal", func() bool { _, ok := obs.terminalFor(origin.TaskID); return ok })
+		assertNoHandOff(t, obs)
+		if end, _ := obs.terminalFor(origin.TaskID); end.state != lib.StateCompleted {
+			t.Fatalf("root terminal = %+v, want the wake's completed", end)
+		}
+	})
+
+	t.Run("it refuses", func(t *testing.T) {
+		conv := injectKeyPrefix + "case-lost-artifact-refuse"
+		r2, _, obs, origin := lost(t, offTheList, conv)
+		waitFor(t, "the root's terminal", func() bool { _, ok := obs.terminalFor(origin.TaskID); return ok })
+		end, _ := obs.terminalFor(origin.TaskID)
+		if end.state != lib.StateFailed || !strings.HasPrefix(end.text, "reason: "+reasonDelegationRefused+" - ") {
+			t.Fatalf("root terminal = %+v, want failed with reason %s", end, reasonDelegationRefused)
+		}
+		assertNoHandOff(t, obs)
+		assertNoDelivery(t, obs)
+		if n := platformSubmissions(t, r2); n != 0 {
+			t.Fatalf("a refused request reached platform: %d", n)
+		}
+	})
+}
+
+// TestARefusalIsOnTheStoreWhenItIsMade: the refusal's mark is written by the
+// refusal itself, under the session lock, not left to the relay's
+// end-of-batch write; so a batch whose own write is lost still leaves it on
+// the store, and the turn's terminal, relayed later, reads it: the root ends
+// failed with the refusal and nothing is delivered. The mint runs here as
+// the relay runs it, and the batch's in-memory record is then dropped
+// unwritten, which is what a failed end-of-batch write leaves behind.
+func TestARefusalIsOnTheStoreWhenItIsMade(t *testing.T) {
+	r, spawn, obs := startObservedRig(t, func(c *Config) {
+		armInjectMap(t, c)
+		offTheList(c)
+	})
+	ctx := context.Background()
+	conv := injectKeyPrefix + "case-refusal-written"
+	exec, origin, session := sessionTurnVia(t, r, spawn, conv, injectBackend, "how is the fleet?")
+	waitFor(t, "the turn working on the record", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		return rec != nil && rec.ActiveTask != nil && rec.ActiveTask.TaskID == origin.TaskID
+	})
+
+	l := r.g.lockSession(conv)
+	l.Lock()
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil || rec == nil {
+		l.Unlock()
+		t.Fatalf("record: %v %v", rec, err)
+	}
+	art := delegateArtifact(t, targetPlatform, "report fleet health")
+	r.g.handleDelegateRequest(ctx, rec, lib.TaskEventsSubject(session, origin.TaskID), origin.TaskID, art.Parts)
+	stored, err := r.g.reg.Get(ctx, conv)
+	l.Unlock()
+	if err != nil || stored == nil {
+		t.Fatalf("stored record: %v %v", stored, err)
+	}
+	if pref, _ := stored.TaskRefFor(origin.TaskID); pref.DelegationRefused == "" {
+		t.Fatalf("the refusal's own write does not carry the mark: %+v", pref)
+	}
+
+	completeTask(t, exec, "delegated to platform")
+	waitFor(t, "the root's terminal", func() bool { _, ok := obs.terminalFor(origin.TaskID); return ok })
+	end, _ := obs.terminalFor(origin.TaskID)
+	if end.state != lib.StateFailed || !strings.HasPrefix(end.text, "reason: "+reasonDelegationRefused+" - ") {
+		t.Fatalf("root terminal = %+v, want failed with reason %s", end, reasonDelegationRefused)
+	}
+	assertNoDelivery(t, obs)
+}
+
+// TestTheHealDoesNotRerunARefusalTheRelayMade: the relay refused the turn's
+// delegation and relayed its terminal, and then lost the write that released
+// the turn, so the store still holds the ended turn active - with the
+// refusal's mark, which the refusal wrote itself. Past the grace, the heal
+// sees the request handled and heals the turn as any lost terminal, rather
+// than running the refusal and the hand-off line a second time.
+func TestTheHealDoesNotRerunARefusalTheRelayMade(t *testing.T) {
+	const grace = time.Second
+	r, spawn, _ := startObservedRig(t, func(c *Config) {
+		armInjectMap(t, c)
+		offTheList(c)
+		c.FirstEventGrace = grace
+	})
+	ctx := context.Background()
+	conv := injectKeyPrefix + "case-refusal-healed"
+	exec, origin, session := sessionTurnVia(t, r, spawn, conv, injectBackend, "how is the fleet?")
+	waitFor(t, "the turn working on the record", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		return rec != nil && rec.ActiveTask != nil && rec.ActiveTask.TaskID == origin.TaskID
+	})
+	l := r.g.lockSession(conv)
+	l.Lock()
+	if err := exec.PublishArtifact(ctx, delegateArtifact(t, targetPlatform, "report fleet health")); err != nil {
+		l.Unlock()
+		t.Fatal(err)
+	}
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil || rec == nil {
+		l.Unlock()
+		t.Fatalf("record: %v %v", rec, err)
+	}
+	r.g.handleDelegateRequest(ctx, rec, lib.TaskEventsSubject(session, origin.TaskID), origin.TaskID,
+		delegateArtifact(t, targetPlatform, "report fleet health").Parts)
+	l.Unlock()
+
+	r2, _ := restartRigWrapped(t, r, nil, func() {
+		completeTask(t, exec, "delegated to platform")
+		// The relay ran these and lost its write: gone from the durable,
+		// and the store still names the ended turn active.
+		drainRelayDurable(t, r.url)
+	})
+	time.Sleep(grace + 200*time.Millisecond)
+	r2.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001",
+		MessageID: "h-refused", Text: "status", Backend: injectBackend}
+	waitFor(t, "the heal's status card", postedContaining(r2, "🔎 task `"+origin.TaskID+"`"))
+	if loggedContaining(r2, "delegation refused", origin.TaskID)() || loggedContaining(r2, "running a delegate request read from the stream")() {
+		t.Fatalf("the heal ran the refused request again:\n%s", r2.logs.String())
+	}
+	for _, p := range r2.adapter.postTexts() {
+		if p == "delegated to platform" {
+			t.Fatalf("the heal posted the hand-off line again: %v", r2.adapter.postTexts())
+		}
+	}
+}
+
 // TestACancelNamingTheRootStopsTheActiveChild: a door caller holds only the
 // root's id, so tasks/cancel names it while the child runs. The cancel goes
 // to the child, the task that is running, and is announced under the root.

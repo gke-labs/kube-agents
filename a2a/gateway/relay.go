@@ -44,6 +44,16 @@ type relayState struct {
 	// with its delegate request unrelayed, for a terminal the replay could
 	// not time (relayLagStart). Zero otherwise.
 	lagSeen time.Time
+	// sawDelegate is set once this gateway has run the task's delegate
+	// request (applyArtifact, or relayTerminal from the fold). A terminal
+	// with it unset reads the fold for a request this process never saw
+	// (relayTerminal).
+	sawDelegate bool
+	// local is set when this gateway started the task (startTaskWith), so
+	// every event of it reached this process's relay: an event acked and
+	// lost before its batch takes a crash, and a restart starts the task's
+	// relay state afresh without it.
+	local bool
 }
 
 // relayItem is one queued event with the subject it arrived on. The relay's
@@ -224,6 +234,7 @@ func (g *Gateway) applyArtifact(ctx context.Context, rec *SessionRecord, rs *rel
 		}
 	case lib.ArtifactDelegate:
 		// A request to the gateway, never rendered to chat.
+		rs.sawDelegate = true
 		g.handleDelegateRequest(ctx, rec, subject, taskID, a.Artifact.Parts)
 	case lib.ArtifactThinking, lib.ArtifactActivity:
 		// Debug/audit views only; never rendered to chat.
@@ -244,13 +255,28 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// replaying the stream to recover it would buy nothing. Checking here and
 	// not there is the difference between skipping the replay and paying for
 	// one whose result is then dropped.
-	if result == "" && s.Status.State == lib.StateCompleted && !isConsoleConversation(rec.Key) {
+	needResult := result == "" && s.Status.State == lib.StateCompleted && !isConsoleConversation(rec.Key)
+	// A session turn that ends completed may have asked to delegate in an
+	// event this process never ran: the artifact's delivery was acked and
+	// lost to a crash before its batch, and only the terminal was
+	// redelivered. Only a task this process did not start (local) can
+	// have lost an event that way. The record is the witness that a request was handled (a
+	// child linked, or a refusal marked, each written when it is made), so
+	// with neither on record and the request never seen here, the fold is
+	// read for it and the request runs first, every check applying, before
+	// the turn ends - otherwise the hand-off line would end the chain.
+	needDelegate := s.Status.State == lib.StateCompleted && !rs.local && !rs.sawDelegate && rec.mayHaveUnhandledDelegate(taskID)
+	if needResult || needDelegate {
 		// Render state is cache; if a restart lost it, the stream still has
 		// everything. Replay against the addressee the task's own subjects
 		// carried - after a Delegate re-home, rec.Addressee is not it.
-		if task, err := g.client.TasksGet(ctx, rec.AddresseeFor(taskID), taskID); err == nil {
-			if art := task.Artifact(lib.ArtifactResult); art != nil {
+		addressee := rec.AddresseeFor(taskID)
+		if task, err := g.client.TasksGet(ctx, addressee, taskID); err == nil {
+			if art := task.Artifact(lib.ArtifactResult); art != nil && needResult {
 				result = joinTextParts(art.Parts)
+			}
+			if needDelegate {
+				g.runFoldedDelegate(ctx, rec, rs, taskID, addressee, task)
 			}
 		} else {
 			g.log.Error("relay: terminal replay fallback failed", "taskId", taskID, "err", err)
