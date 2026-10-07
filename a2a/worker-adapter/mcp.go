@@ -85,10 +85,19 @@ func DelegateSocketPath() string {
 	return DefaultDelegateSocket
 }
 
+// mcpLineMaxBytes is the ceiling on one JSON-RPC line from the harness. It
+// sits far above lib.DelegateTextCap, so a delegate call over the cap still
+// reaches the adapter and is refused with a reason the harness can read; a
+// line over the ceiling stops the server with bufio.ErrTooLong. Not
+// harness.go's scannerMaxBytes: that one bounds the largest answer a worker
+// can return, and the two should be free to move apart. The starting buffer
+// is harness.go's scannerInitialBytes.
+const mcpLineMaxBytes = 4 * 1024 * 1024
+
 // ServeDelegateMCP runs the MCP server until in is closed or ctx ends.
 func ServeDelegateMCP(ctx context.Context, in io.Reader, out io.Writer, socketPath string, log *slog.Logger) error {
 	sc := bufio.NewScanner(in)
-	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	sc.Buffer(make([]byte, 0, scannerInitialBytes), mcpLineMaxBytes)
 	enc := json.NewEncoder(out)
 	for sc.Scan() {
 		if ctx.Err() != nil {
