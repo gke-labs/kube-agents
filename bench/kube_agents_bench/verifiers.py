@@ -228,8 +228,11 @@ def _normalize(text: str) -> str:
 # A footnote marker before a `;`, `,` or `.` inside the line is folded too,
 # since a declared frame's values are separated by `;`; so is a wrap the
 # agent kept from the prompt's template around a value (`<unavailable>`,
-# `"unaffected"`), whitespace before a `:` or `;` or missing after one, and
-# invisible format characters anywhere. A pattern anchored
+# `"unaffected"`) or around a `/`-joined component of the leading name
+# (`seeded-b/<pinned-batch-runner>:`), a parenthetical or bracketed aside
+# between the leading name and its `:` (`seeded-a (us-central1-a):`,
+# `gate (service: x):`), whitespace before a `:` or `;` or missing after
+# one, and invisible format characters anywhere. A pattern anchored
 # with ``^...$`` then spells a declared line once rather than once per
 # rendering -- the reason `_MARKDOWN_NOISE` exists, applied to the line's
 # edges. Other interior punctuation is untouched. Opt-in, because a case
@@ -279,6 +282,26 @@ _TRAIL_FOLD_PASSES = 3
 # what is left is the name with its closer stuck to it before the colon or
 # slash that ends the name.
 _QUOTED_FIRST_NAME = re.compile(r"^([\w/._-]+(?:\s*\([^)\n]*\))?)[\"\u201c\u201d'\u2018\u2019\]>)}]+(?=[:/\s(])")
+# The same wrap on a later `/`-joined component of the name
+# (`seeded-b/<pinned-batch-runner>:`, `seeded-b/"pinned-batch-runner":`,
+# `seeded-b/<ns>/<name>:`): the prompt's template brackets `<object name>`
+# as it brackets each value, and a wrap kept there opens after the `/`,
+# which neither the lead fold (line start) nor `_VALUE_WRAP` (whitespace)
+# reaches. The component is a name, closed by the matching class and
+# followed by what ends a component: `:`, `/`, whitespace, a parenthetical,
+# or the line's end.
+_COMPONENT_WRAP = re.compile(
+    r"(?<=/)[\"'\u201c\u201d\u2018\u2019<\[{(]+([\w._-]+)[\"'\u201c\u201d\u2018\u2019>\]})]+(?=[:/\s(]|$)"
+)
+# A parenthetical or bracketed aside between the leading name and the `:`
+# that ends it (`seeded-a (us-central1-a):`, `pinned-batch-runner
+# [seeded-upgrade]:`, `seeded-fail-closed-gate (service: x):`): a gloss on
+# the name, decoration whatever it holds, so a `:` or `;` inside it is not
+# read as a field's separator and a name inside it is not read as the
+# line's. Only in the name position: a parenthetical after a value (`yes
+# (maxUnavailable 0)`) is the value's and stays, which is what makes a
+# qualified value the wrong value. Repeated, so `name [a] (b):` loses both.
+_NAME_ASIDE = re.compile(r"^([\w/._-]+)(?:\s*(?:\([^()\n]*\)|\[[^\[\]\n]*\]))+(?=\s*:)")
 _MARKDOWN_LINK = re.compile(r"\[([^\]\n]+)\]\([^)\n]*\)")
 # A value the agent kept inside the prompt's own delimiters (`<unavailable>`,
 # `"unaffected"`): a wrap that opens after whitespace and closes at the next
@@ -336,12 +359,12 @@ def _fold_line_decoration(line: str) -> str:
     # Trailing markers and closers first, whatever order they come in, so a
     # linked marker is folded as a marker however the line ends; then every
     # other link is kept as its text, so a linked value stays a value; then
-    # the lead, the quoted name, and the trail once more with the full
-    # closer class.
+    # the lead, the quoted name and its wrapped components, the aside after
+    # the name, and the trail once more with the full closer class.
     footnoted = _LINE_INTERIOR_FOOTNOTE.sub("", _fold_trail_markers(_INVISIBLE.sub("", line)))
     unlinked = _MARKDOWN_LINK.sub(r"\1", footnoted)
     led = _LINE_LEAD_DECORATION.sub("", unlinked, count=1)
-    unquoted = _QUOTED_FIRST_NAME.sub(r"\1", led, count=1)
+    unquoted = _NAME_ASIDE.sub(r"\1", _COMPONENT_WRAP.sub(r"\1", _QUOTED_FIRST_NAME.sub(r"\1", led, count=1)), count=1)
     # The separator's spacing is settled first, so a wrap glued to its
     # separator (`pods:"unaffected"`) has the whitespace the wrap fold opens
     # on; the value wrap then comes off before the trail fold (so a closing

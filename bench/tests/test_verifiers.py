@@ -261,13 +261,41 @@ def test_footnote_fold_is_linear_on_many_overlapping_markers():
 
 
 def test_line_decoration_fold_keeps_interior_punctuation():
+    # A parenthetical after a value is the value's and stays; one between the
+    # leading name and its `:` is a gloss on the name and goes.
     _stash("- pool/a (zone-1): 100% used; 3 of 4 pods (75%) ready.")
     v = ReportContainsVerifier(
         type="report_contains",
         fold_decoration=True,
-        any_of_patterns=[r"(?m)^pool/a \(zone-1\): 100% used; 3 of 4 pods \(75%\) ready$"],
+        any_of_patterns=[r"(?m)^pool/a: 100% used; 3 of 4 pods \(75%\) ready$"],
     )
     assert v.verify(5.0).status == "pass"
+
+
+@pytest.mark.parametrize(
+    "line, folded",
+    [
+        # the prompt's template brackets kept on every slot, the object component included
+        (
+            "<seeded-b>/<pinned-batch-runner>: kind <pdb>; backend: <not applicable>; blocks the upgrade: <yes>",
+            "seeded-b/pinned-batch-runner: kind pdb; backend: not applicable; blocks the upgrade: yes",
+        ),
+        ('seeded-b/"pinned-batch-runner": kind pdb; backend: not applicable; blocks the upgrade: yes', "seeded-b/pinned-batch-runner: kind pdb; backend: not applicable; blocks the upgrade: yes"),
+        ("seeded-b/<seeded-upgrade>/<pinned-batch-runner>: kind pdb", "seeded-b/seeded-upgrade/pinned-batch-runner: kind pdb"),
+        ("seeded-b/\u2018seeded-fail-closed-gate\u2019/[gate.seeded.invalid]: kind webhook", "seeded-b/seeded-fail-closed-gate/gate.seeded.invalid: kind webhook"),
+        # an aside after the name goes whole, a `:` or `;` inside it included; two asides go
+        ("seeded-a/seeded-fail-closed-gate (service: nonexistent-admission-gate): kind webhook; backend: missing; blocks the upgrade: yes", "seeded-a/seeded-fail-closed-gate: kind webhook; backend: missing; blocks the upgrade: yes"),
+        ("seeded-b/pinned-batch-runner [seeded-upgrade] (maxUnavailable: 0; healthy: 1): kind pdb; backend: not applicable; blocks the upgrade: yes", "seeded-b/pinned-batch-runner: kind pdb; backend: not applicable; blocks the upgrade: yes"),
+        ("seeded-a (us-central1-a): control plane is zonal", "seeded-a: control plane is zonal"),
+        ("\u201cseeded-a (us-central1-a)\u201d: control plane is zonal", "seeded-a: control plane is zonal"),
+        # a parenthetical after a value is the value's: with its closer gone to the trail
+        # fold, what is left is not the bare word, so a qualified value is the wrong value
+        ("seeded-b/pinned-batch-runner: kind pdb; backend: not applicable; blocks the upgrade: yes (maxUnavailable 0)", "seeded-b/pinned-batch-runner: kind pdb; backend: not applicable; blocks the upgrade: yes (maxunavailable 0"),
+        ("seeded-b/seeded-fail-closed-gate: kind webhook; backend: missing (Service does not exist); blocks the upgrade: no", "seeded-b/seeded-fail-closed-gate: kind webhook; backend: missing (service does not exist); blocks the upgrade: no"),
+    ],
+)
+def test_line_decoration_fold_unwraps_name_components_and_drops_an_aside_after_the_name(line, folded):
+    assert verifiers._normalize_lines(line, fold_decoration=True) == folded
 
 
 def test_line_decoration_fold_is_off_unless_asked_for():
@@ -6823,6 +6851,18 @@ _WEBHOOK_EXCLUSION_LINE = _webhook_line("hold-the-minor-lag", "exclusion", "not 
 _WEBHOOK_GATE_LINE = _webhook_line("seeded-fail-closed-gate", "webhook", "missing", "no")
 
 
+_WEBHOOK_LINE_SLOTS = re.compile(r"^([^/]+)/([^:]+): kind ([^;]+); backend: ([^;]+); blocks the upgrade: (.+)$")
+
+
+def _webhook_template_brackets(line: str) -> str:
+    """The line with every slot of the prompt's template kept inside its angle brackets."""
+    return _WEBHOOK_LINE_SLOTS.sub(r"<\1>/<\2>: kind <\3>; backend: <\4>; blocks the upgrade: <\5>", line)
+
+
+def _webhook_quoted_object(line: str) -> str:
+    return _WEBHOOK_LINE_SLOTS.sub(r'\1/"\2": kind \3; backend: \4; blocks the upgrade: \5', line)
+
+
 def _webhook_report(pdb: str = _WEBHOOK_PDB_LINE, exclusion: str = _WEBHOOK_EXCLUSION_LINE, gate: str = _WEBHOOK_GATE_LINE, *extra: str) -> str:
     return "\n".join(line for line in (pdb, exclusion, gate, *extra) if line)
 
@@ -6842,6 +6882,10 @@ def _webhook_verdicts(text: str) -> dict[str, str]:
         "\n".join(f"{n}. {line}" for n, line in enumerate(_webhook_report().splitlines(), 1)),
         "\n".join("`" + line.split(":", 1)[0] + "`:" + line.split(":", 1)[1] for line in _webhook_report().splitlines()),
         _webhook_report().replace("kind pdb", "kind <pdb>").replace("backend: missing", "backend: <missing>").replace("upgrade: no", "upgrade: <no>"),
+        # the template's brackets kept on every slot, the cluster and the object included,
+        # or the object alone quoted
+        "\n".join(_webhook_template_brackets(line) for line in _webhook_report().splitlines()),
+        "\n".join(_webhook_quoted_object(line) for line in _webhook_report().splitlines()),
         _webhook_report().replace("kind ", "kind: "),
         # the cluster under its full id, or a context's `_` joins, which the fold makes `-`
         _webhook_report().replace("seeded-b/", "haoxuw-gke-dev-seeded-b-us-central1-a/"),
@@ -6851,6 +6895,12 @@ def _webhook_verdicts(text: str) -> dict[str, str]:
         _webhook_report(pdb=_webhook_line("seeded-upgrade/pinned-batch-runner", "pdb", "not applicable", "yes")),
         _webhook_report(gate=_webhook_line("seeded-fail-closed-gate/gate.seeded.invalid", "webhook", "missing", "no")),
         _webhook_report(pdb=_webhook_line("pinned-batch-runner (seeded-upgrade, maxUnavailable 0)", "pdb", "not applicable", "yes")),
+        # a parenthetical or bracketed aside after the name carrying a `:` or a `;`, as the
+        # readiness table's own cells do; on the gate's line, and on the budget's naming the
+        # gate, which is not the budget's line blaming it
+        _webhook_report(gate=_webhook_line("seeded-fail-closed-gate (service: nonexistent-admission-gate)", "webhook", "missing", "no")),
+        _webhook_report(pdb=_webhook_line("pinned-batch-runner [seeded-upgrade] (maxUnavailable: 0; healthy: 1)", "pdb", "not applicable", "yes")),
+        _webhook_report(pdb=_webhook_line("pinned-batch-runner (unlike seeded-fail-closed-gate)", "pdb", "not applicable", "yes")),
         # the budget's and the exclusion's backend is any word of the closed set
         _webhook_report(pdb=_webhook_line("pinned-batch-runner", "pdb", "ready", "yes"), exclusion=_webhook_line("hold-the-minor-lag", "exclusion", "missing", "yes")),
         # lines about other objects are ignored: a pool, a live webhook, another cluster's
@@ -6881,15 +6931,41 @@ def test_webhook_readiness_declared_lines_accepted(text):
         (_webhook_report(pdb=""), _WEBHOOK_PDB),
         (_webhook_report(exclusion=""), _WEBHOOK_EXCLUSION),
         (_webhook_report(gate=""), _WEBHOOK_GATE),
-        # a second line about the same object that contradicts the right one
+        # a second line about the same object that contradicts the right one: the other
+        # word of the set, or any other value at all -- a hedge, a qualifier, a mark, an
+        # abbreviation, a kind or a backend outside the set. The forbid is the field under a
+        # negative lookahead for the accepted value, so nothing has to be anticipated.
         (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-fail-closed-gate", "webhook", "missing", "yes")), _WEBHOOK_GATE),
         (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-fail-closed-gate", "webhook", "ready", "no")), _WEBHOOK_GATE),
         (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("pinned-batch-runner", "pdb", "not applicable", "no")), _WEBHOOK_PDB),
         (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("hold-the-minor-lag", "exclusion", "not applicable", "no")), _WEBHOOK_EXCLUSION),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("pinned-batch-runner", "pdb", "not applicable", "maybe")), _WEBHOOK_PDB),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("pinned-batch-runner", "pdb", "not applicable", "yes?")), _WEBHOOK_PDB),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("pinned-batch-runner", "pdb", "not applicable", "n/a")), _WEBHOOK_PDB),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("pinned-batch-runner", "pdb", "not applicable", "yes (maxUnavailable 0)")), _WEBHOOK_PDB),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("pinned-batch-runner", "poddisruptionbudget", "not applicable", "yes")), _WEBHOOK_PDB),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("pinned-batch-runner", "pdb", "n/a", "yes")), _WEBHOOK_PDB),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("hold-the-minor-lag", "exclusion", "not applicable", "yes, until it lapses")), _WEBHOOK_EXCLUSION),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-fail-closed-gate", "webhook", "missing", "yes (ConfigMaps only)")), _WEBHOOK_GATE),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-fail-closed-gate", "webhook", "missing", "yes (ConfigMaps only)")), _WEBHOOK_NO_BLAME),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-fail-closed-gate", "webhook", "missing", "probably yes")), _WEBHOOK_GATE),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-fail-closed-gate", "webhook", "missing", "no?")), _WEBHOOK_GATE),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-fail-closed-gate", "webhook", "missing (Service does not exist)", "no")), _WEBHOOK_GATE),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-fail-closed-gate", "webhook", "absent", "no")), _WEBHOOK_GATE),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-fail-closed-gate", "validatingwebhookconfiguration", "missing", "no")), _WEBHOOK_GATE),
         # the gate blamed under another of its names, or under another cluster's
         (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("gate.seeded.invalid", "webhook", "missing", "yes")), _WEBHOOK_NO_BLAME),
         (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-upgrade/nonexistent-admission-gate", "webhook", "missing", "yes")), _WEBHOOK_NO_BLAME),
         (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-fail-closed-gate", "webhook", "missing", "yes", cluster="seeded-a")), _WEBHOOK_NO_BLAME),
+        # the same with a `:` inside a parenthetical after the name, which the fold drops
+        # before either objective reads the line
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate (service: nonexistent-admission-gate)", "webhook", "missing", "yes")), _WEBHOOK_GATE),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate (service: nonexistent-admission-gate)", "webhook", "missing", "yes")), _WEBHOOK_NO_BLAME),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-fail-closed-gate (service: nonexistent-admission-gate)", "webhook", "missing", "yes", cluster="seeded-a")), _WEBHOOK_NO_BLAME),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("gate.seeded.invalid (ns: seeded-upgrade)", "webhook", "missing", "yes")), _WEBHOOK_NO_BLAME),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-fail-closed-gate (timeout: 30s)", "webhook", "missing", "yes")), _WEBHOOK_NO_BLAME),
+        # the gate blamed with a kind or a backend outside the set: still a blame
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-fail-closed-gate", "validatingwebhookconfiguration", "absent", "yes", cluster="seeded-a")), _WEBHOOK_NO_BLAME),
         # a value with anything around it: a hedge, a qualifier, a trailing clause, a mark
         # that is not a closer
         (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "probably no")), _WEBHOOK_GATE),
@@ -6929,6 +7005,10 @@ def test_webhook_readiness_declared_lines_refused(text, failing):
         # in the form at all with the gate blamed under another cluster's name
         (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "yes")), {_WEBHOOK_GATE, _WEBHOOK_NO_BLAME}),
         (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "yes", cluster="seeded-a")), {_WEBHOOK_GATE, _WEBHOOK_NO_BLAME}),
+        # a contradicting second line with an off-set value fails its object's objective alone
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("pinned-batch-runner", "pdb", "not applicable", "maybe")), {_WEBHOOK_PDB}),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-fail-closed-gate", "webhook", "missing", "yes (ConfigMaps only)")), {_WEBHOOK_GATE, _WEBHOOK_NO_BLAME}),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-fail-closed-gate (service: nonexistent-admission-gate)", "webhook", "missing", "yes", cluster="seeded-a")), {_WEBHOOK_NO_BLAME}),
     ],
 )
 def test_webhook_readiness_one_wrong_line_fails_its_own_objective_alone(text, failing):

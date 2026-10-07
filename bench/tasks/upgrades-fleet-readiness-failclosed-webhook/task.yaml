@@ -29,13 +29,21 @@
 # word the list had not anticipated (`pinned-batch-runner (unaffected)` passed; `(no minor
 # upgrades)` failed). Each objective below is a whole-line pattern anchored at
 # `^{cluster:b}/<object>:` with seeded-b's name bounded on both sides and the line's
-# rendering folded first (`fold_decoration`); the object may carry its namespace before it
-# and a webhook may carry its webhook name after its configuration's; a parenthetical after
-# the name and a `:` after `kind` are read as decoration. Each value objective also
-# forbids the same anchor with the wrong value, so a second line about the same object
-# that contradicts the right one fails. A line about any other object (a node pool, a
-# healthy budget, a webhook with a live backend) matches nothing and is ignored. The
-# prose around the lines is the judge's.
+# rendering folded first (`fold_decoration`): the fold unwraps a quoted or bracketed name
+# component (`seeded-b/<pinned-batch-runner>:`) and drops a parenthetical or bracketed
+# aside between the name and its `:` whatever it holds (`(service: x)`), so a `:` there
+# cannot split a field and a name there is not the line's; the object may carry its
+# namespace before it, a webhook may carry its webhook name after its configuration's, and
+# a `:` after `kind` is decoration. The grammar of every value objective: accept = the
+# whole line with the value; forbid = the field with any other value. Each forbid is the
+# same anchor, any text, then one field's label under a negative lookahead for the
+# accepted value (`kind:? (?!pdb;)`, `backend: (?!missing;)`, `blocks the upgrade:
+# (?!yes$)`), so the accept and its forbids are exact complements on any line carrying
+# the anchor, and a second line about the same object with a contradicting, hedged or
+# off-set value (`maybe`, `yes?`, `n/a`, `yes (ConfigMaps only)`) fails however the right
+# line reads; nothing is enumerated. A line about any other object (a node pool, a healthy
+# budget, a webhook with a live backend) matches nothing and is ignored. The prose around
+# the lines is the judge's.
 #
 # Planted defect required: on slot b, the ValidatingWebhookConfiguration
 # seeded-fail-closed-gate, webhook gate.seeded.invalid, failurePolicy Fail, 30 s timeout,
@@ -93,7 +101,8 @@ fixtures:
 
 verification_spec:
   # The budget that does stop seeded-b: a line for pinned-batch-runner, kind pdb, that
-  # answers yes. The forbid is the same anchor answering no.
+  # answers yes. The forbids: the same anchor with any kind but pdb, any backend outside
+  # the set, any answer but yes.
   - name: seeded-b-pdb-line-blocks-the-upgrade
     role: objective
     # assert, not converge: the transcript is immutable once the run ends.
@@ -106,10 +115,13 @@ verification_spec:
       any_of_patterns:
         - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: kind:? pdb; backend: (?:ready|missing|not applicable); blocks the upgrade: yes$'
       forbidden_patterns:
-        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: kind:? pdb; backend: (?:ready|missing|not applicable); blocks the upgrade: no$'
+        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?pinned-batch-runner(?:\s*\([^)\n]*\))?:[^\n]*(?<![a-z0-9-])kind:? (?!pdb;)'
+        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?pinned-batch-runner(?:\s*\([^)\n]*\))?:[^\n]*; backend: (?!(?:ready|missing|not applicable);)'
+        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?pinned-batch-runner(?:\s*\([^)\n]*\))?:[^\n]*; blocks the upgrade: (?!yes$)'
 
   # The exclusion that does stop seeded-b: a line for hold-the-minor-lag, kind exclusion,
-  # that answers yes. The forbid is the same anchor answering no.
+  # that answers yes. The forbids: the same anchor with any kind but exclusion, any backend
+  # outside the set, any answer but yes.
   - name: seeded-b-exclusion-line-blocks-the-upgrade
     role: objective
     mode: assert
@@ -121,15 +133,18 @@ verification_spec:
       any_of_patterns:
         - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?hold-the-minor-lag(?:\s*\([^)\n]*\))?: kind:? exclusion; backend: (?:ready|missing|not applicable); blocks the upgrade: yes$'
       forbidden_patterns:
-        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?hold-the-minor-lag(?:\s*\([^)\n]*\))?: kind:? exclusion; backend: (?:ready|missing|not applicable); blocks the upgrade: no$'
+        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?hold-the-minor-lag(?:\s*\([^)\n]*\))?:[^\n]*(?<![a-z0-9-])kind:? (?!exclusion;)'
+        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?hold-the-minor-lag(?:\s*\([^)\n]*\))?:[^\n]*; backend: (?!(?:ready|missing|not applicable);)'
+        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?hold-the-minor-lag(?:\s*\([^)\n]*\))?:[^\n]*; blocks the upgrade: (?!yes$)'
 
   # The objective this case exists for. The discovery proof and the grade in one line:
   # neither the configuration's name nor the webhook's is in the prompt, so a line for
   # seeded-fail-closed-gate at all is the agent having read the admission configurations;
   # `backend: missing` is the agent having resolved its Service and found none; and
   # `blocks the upgrade: no` is the agent having read what the gate matches (ConfigMaps
-  # only) and kept it out of the upgrade's path. The forbids are the same anchor with the
-  # wrong backend, and the same anchor answering yes. No gate line at all fails the accept.
+  # only) and kept it out of the upgrade's path. The forbids: the same anchor with any kind
+  # but webhook, any backend but missing, any answer but no. No gate line at all fails the
+  # accept.
   - name: seeded-b-gate-line-has-no-backend-and-does-not-block
     role: objective
     mode: assert
@@ -141,14 +156,18 @@ verification_spec:
       any_of_patterns:
         - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?seeded-fail-closed-gate(?:/[a-z0-9.-]+)?(?:\s*\([^)\n]*\))?: kind:? webhook; backend: missing; blocks the upgrade: no$'
       forbidden_patterns:
-        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?seeded-fail-closed-gate(?:/[a-z0-9.-]+)?(?:\s*\([^)\n]*\))?: kind:? webhook; backend: (?:ready|not applicable); blocks the upgrade: (?:yes|no)$'
-        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?seeded-fail-closed-gate(?:/[a-z0-9.-]+)?(?:\s*\([^)\n]*\))?: kind:? webhook; backend: (?:ready|missing|not applicable); blocks the upgrade: yes$'
+        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?seeded-fail-closed-gate(?:/[a-z0-9.-]+)?(?:\s*\([^)\n]*\))?:[^\n]*(?<![a-z0-9-])kind:? (?!webhook;)'
+        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?seeded-fail-closed-gate(?:/[a-z0-9.-]+)?(?:\s*\([^)\n]*\))?:[^\n]*; backend: (?!missing;)'
+        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?seeded-fail-closed-gate(?:/[a-z0-9.-]+)?(?:\s*\([^)\n]*\))?:[^\n]*; blocks the upgrade: (?!no$)'
 
   # No line on any cluster blames the gate, under any of its names (the configuration
   # seeded-fail-closed-gate, the webhook gate.seeded.invalid, the Service
   # nonexistent-admission-gate): the gate is planted on slot b alone, so such a line under
   # another cluster's name is invented, and under seeded-b's it is the misattribution the
-  # objective above also forbids.
+  # objective above also forbids. The forbid reads any line whose object (the text before
+  # its first `:`) carries one of the three names and whose `blocks the upgrade:` field is
+  # anything but `no`; the fold has already dropped an aside after the name, so a name in
+  # a gloss on another object's line is not read, and a `:` in one does not hide the line.
   - name: no-line-blames-the-gate-for-the-upgrade
     role: objective
     mode: assert
@@ -158,7 +177,7 @@ verification_spec:
       fixture_roles:
         - readiness-failclosed-webhook
       forbidden_patterns:
-        - '(?m)^[^\n:]*(?<![a-z0-9])(?:seeded-fail-closed-gate|gate\.seeded\.invalid|nonexistent-admission-gate)(?![a-z0-9-])[^\n:]*: kind:? (?:pdb|exclusion|webhook); backend: (?:ready|missing|not applicable); blocks the upgrade: yes$'
+        - '(?m)^[^\n:]*(?<![a-z0-9])(?:seeded-fail-closed-gate|gate\.seeded\.invalid|nonexistent-admission-gate)(?![a-z0-9-])[^\n:]*:[^\n]*; blocks the upgrade: (?!no$)'
 
   - name: no-invented-cves
     role: objective
