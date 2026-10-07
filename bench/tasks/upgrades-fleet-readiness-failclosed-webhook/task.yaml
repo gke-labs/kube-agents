@@ -3,9 +3,9 @@
 # request its rules match. The table grades the member blocked only when those rules reach
 # a write a node drain or a node join makes (`UPGRADE_PATH_TARGETS` in the skill's
 # `scripts/upgrade_readiness.py` is the list, with the package behind each write); otherwise
-# it names the webhook as a current outage without grading on it. The upgrade-scenario campaign
-# reproduced the pod-gating form end to end on GKE (the drain's replacement pods refused
-# until the webhook was deleted).
+# it names the webhook as a current outage without grading on it. The upgrade-scenario
+# campaign reproduced the pod-gating form end to end on GKE (the drain's replacement pods
+# refused until the webhook was deleted).
 #
 # The planted gate matches ConfigMaps only, so this case grades the second half: the agent
 # must find the webhook and its missing backend unprompted, and must not present it as what
@@ -17,38 +17,25 @@
 # webhook configurations and EndpointSlices any other way and reports the same finding
 # passes.
 #
-# The declared line is what the deterministic checks read, as in the upgrade-scenario
-# cases: the prompt asks for one fixed-form line per cluster, each objective below is a
-# whole-line pattern anchored at both ends with seeded-b's name bounded on both sides, and
-# the line's rendering is folded first (`fold_decoration`). The first objective asks only
-# that the line exist; each of the three value objectives also forbids the frame whose
-# value slot holds the wrong value, so a second seeded-b line that contradicts the right
-# one fails. The prose around the lines is the judge's.
+# The declared lines are what the deterministic checks read, as in the upgrade-scenario
+# cases. The prompt asks for one fixed-form line per object the agent examined, not a list
+# slot per cluster:
 #
-# The frame: each slot runs to the next field's literal label (`; fail-closed webhooks
-# with no backend: `, `; any of them blocks the upgrade: `), never to a bare `;`, so a
-# stray `;` or `:` inside a slot leaves the line a declared line and the slot's own
-# objective says what is wrong with it. The two list slots are comma-separated names, and
-# the prompt says so.
+#   <cluster>/<object>: kind <pdb|exclusion|webhook>; backend: <ready|missing|not applicable>; blocks the upgrade: <yes|no>
 #
-# The blockers slot is graded whole, never item by item. The grammar, once:
-#   - a token is a maximal run of [a-z0-9-], so a hyphenated name is one token:
-#     `no-surge-pool` and the folded scope `no-minor-upgrades` carry no `no`;
-#   - the slot names a real blocker when it carries `pinned-batch-runner` or
-#     `hold-the-minor-lag` as a whole token; what sits around the name is not read, so
-#     `seeded-upgrade/pinned-batch-runner`, `poddisruptionbudget.policy/pinned-batch-runner`
-#     and `pdb (pinned-batch-runner)` all count;
-#   - the real-blocker objective refuses the slot as a whole when it carries a negation
-#     token anywhere (no, not, none, never, without, n't, isn, aren, cannot, nothing, nor,
-#     neither, absent, clear, free of), because a list of names has no room for one, or a
-#     `:` or `;` before the next label, because either mark is the frame's own punctuation
-#     and the readiness table's cell text (`(maxUnavailable: 0; …)`) is not a name;
-#   - the blame objective refuses the slot as a whole when it carries the gate under any
-#     of its names (seeded-fail-closed-gate, gate.seeded.invalid,
-#     nonexistent-admission-gate) or the words webhook, admission, gate or fail-closed,
-#     negated or not: the prose is where the agent says what is not a blocker.
-# Each value objective's forbidden pattern is its accept pattern's slot condition under a
-# negative lookahead in the same frame, so on any one line exactly one of the two matches.
+# Every value is one word from a closed set, so a line has no room for a qualifier, a
+# negation or a description: the earlier shape, a comma-separated blockers slot per
+# cluster, was graded by lists of words around the names, and each review round found a
+# word the list had not anticipated (`pinned-batch-runner (unaffected)` passed; `(no minor
+# upgrades)` failed). Each objective below is a whole-line pattern anchored at
+# `^{cluster:b}/<object>:` with seeded-b's name bounded on both sides and the line's
+# rendering folded first (`fold_decoration`); the object may carry its namespace before it
+# and a webhook may carry its webhook name after its configuration's; a parenthetical after
+# the name and a `:` after `kind` are read as decoration. Each value objective also
+# forbids the same anchor with the wrong value, so a second line about the same object
+# that contradicts the right one fails. A line about any other object (a node pool, a
+# healthy budget, a webhook with a live backend) matches nothing and is ignored. The
+# prose around the lines is the judge's.
 #
 # Planted defect required: on slot b, the ValidatingWebhookConfiguration
 # seeded-fail-closed-gate, webhook gate.seeded.invalid, failurePolicy Fail, 30 s timeout,
@@ -64,11 +51,14 @@ prompt: >-
   For every cluster in this project, check whether it is ready to take the
   upgrade to its release channel's default version, and tell me per cluster
   what would stop the upgrade. Read the state; do not change, upgrade, or
-  remove anything. End your answer with one line per cluster in exactly this
-  form, no other words on the line: "<cluster>: upgrade blockers:
-  <comma-separated names or none>; fail-closed webhooks with no backend:
-  <comma-separated webhook configuration names or none>; any of them blocks
-  the upgrade: <yes|no>". Each item is a name, not a sentence.
+  remove anything. End your answer with one line per object you examined
+  that could stop an upgrade -- every PodDisruptionBudget that would block a
+  node drain, every maintenance exclusion in effect, and every fail-closed
+  admission webhook whose backend you checked -- in exactly this form, no
+  other words on the line: "<cluster>/<object name>: kind
+  <pdb|exclusion|webhook>; backend: <ready|missing|not applicable>; blocks
+  the upgrade: <yes|no>". Name a webhook by its configuration's name, and
+  write "not applicable" as the backend of anything that is not a webhook.
 expected_output: >-
   A per-cluster readiness report read during this run. For seeded-b it names
   the validating webhook configuration seeded-fail-closed-gate (webhook
@@ -76,10 +66,12 @@ expected_output: >-
   calls, seeded-upgrade/nonexistent-admission-gate, does not exist, so every
   request it matches (ConfigMap creation in seeded-upgrade) is rejected now. It
   does not present that webhook as what stops seeded-b's upgrade, because it
-  matches nothing a node upgrade needs; seeded-b's blockers are named
-  separately. It recommends restoring the webhook's backend or narrowing or
-  relaxing the webhook as an operator decision, and performs nothing. It cites
-  no CVE identifiers. No mutation of any kind.
+  matches nothing a node upgrade needs; seeded-b's blockers, the
+  PodDisruptionBudget pinned-batch-runner and the maintenance exclusion
+  hold-the-minor-lag, are named separately. It recommends restoring the
+  webhook's backend or narrowing or relaxing the webhook as an operator
+  decision, and performs nothing. It cites no CVE identifiers. No mutation of
+  any kind.
 infrastructure:
   deployer: noop
 validated: false
@@ -91,18 +83,18 @@ domain: upgrades
 owner: maintainers
 
 # Named by ROLE, not cluster: bench/tf/fleet/fixtures.json. The gate the case is about,
-# plus the budget and the exclusion the real-blocker objective expects seeded-b's line to
-# name. The checks' `fixture_roles` name the gate's role alone: every pattern is about
-# slot b's line, and the three roles share the slot.
+# plus the budget and the exclusion whose lines the first two objectives expect. The
+# checks' `fixture_roles` name the gate's role alone: every pattern is about slot b's
+# lines, and the three roles share the slot.
 fixtures:
   - readiness-failclosed-webhook
   - readiness-drain-blocked
   - version-laggard
 
 verification_spec:
-  # The declared line exists for seeded-b at all: `any of them blocks the upgrade` has to
-  # be answered, in either direction, for the line to count. Existence has no negation.
-  - name: seeded-b-has-a-declared-line
+  # The budget that does stop seeded-b: a line for pinned-batch-runner, kind pdb, that
+  # answers yes. The forbid is the same anchor answering no.
+  - name: seeded-b-pdb-line-blocks-the-upgrade
     role: objective
     # assert, not converge: the transcript is immutable once the run ends.
     mode: assert
@@ -112,12 +104,13 @@ verification_spec:
       fixture_roles:
         - readiness-failclosed-webhook
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: upgrade blockers: (?:(?!; fail-closed webhooks with no backend: )[^\n])+; fail-closed webhooks with no backend: (?:(?!; any of them blocks the upgrade: )[^\n])+; any of them blocks the upgrade: (?:yes|no)$'
+        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: kind:? pdb; backend: (?:ready|missing|not applicable); blocks the upgrade: yes$'
+      forbidden_patterns:
+        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: kind:? pdb; backend: (?:ready|missing|not applicable); blocks the upgrade: no$'
 
-  # The discovery proof. Neither the configuration's name nor the webhook's is in the
-  # prompt; only reading the admission configuration and finding its Service missing puts
-  # the gate in the "no backend" slot.
-  - name: seeded-b-names-the-gate-as-a-webhook-with-no-backend
+  # The exclusion that does stop seeded-b: a line for hold-the-minor-lag, kind exclusion,
+  # that answers yes. The forbid is the same anchor answering no.
+  - name: seeded-b-exclusion-line-blocks-the-upgrade
     role: objective
     mode: assert
     check:
@@ -126,22 +119,18 @@ verification_spec:
       fixture_roles:
         - readiness-failclosed-webhook
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: upgrade blockers: (?:(?!; fail-closed webhooks with no backend: )[^\n])+; fail-closed webhooks with no backend: (?:(?!; any of them blocks the upgrade: )[^\n])*(?<![a-z0-9-])seeded-fail-closed-gate(?![a-z0-9-])(?:(?!; any of them blocks the upgrade: )[^\n])*; any of them blocks the upgrade: (?:yes|no)$'
-      # The negation: seeded-b's frame whose no-backend slot lacks the gate, `none` included.
+        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?hold-the-minor-lag(?:\s*\([^)\n]*\))?: kind:? exclusion; backend: (?:ready|missing|not applicable); blocks the upgrade: yes$'
       forbidden_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: upgrade blockers: (?:(?!; fail-closed webhooks with no backend: )[^\n])+; fail-closed webhooks with no backend: (?!(?:(?!; any of them blocks the upgrade: )[^\n])*(?<![a-z0-9-])seeded-fail-closed-gate(?![a-z0-9-]))(?:(?!; any of them blocks the upgrade: )[^\n])+; any of them blocks the upgrade: (?:yes|no)$'
+        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?hold-the-minor-lag(?:\s*\([^)\n]*\))?: kind:? exclusion; backend: (?:ready|missing|not applicable); blocks the upgrade: no$'
 
-  # The half this case exists for: the planted gate matches ConfigMaps only, so it is an
-  # outage for what it matches, not what stops seeded-b's upgrade (its budget and its
-  # maintenance exclusion do). The gate must not appear among the blockers under any of its
-  # names (the configuration seeded-fail-closed-gate, the webhook gate.seeded.invalid, the
-  # Service nonexistent-admission-gate) nor as a "webhook", "admission", "gate" or
-  # "fail-closed" anything, and the answer to whether any webhook blocks the upgrade must
-  # be no. The slot is a list of names, so a mention of the gate there, negated or not, is
-  # the gate where blockers were asked for; the prose is where the agent says what is not
-  # one. The forbidden patterns are the negation: those terms in the blockers slot, or the
-  # answer yes.
-  - name: seeded-b-does-not-blame-the-gate-for-the-upgrade
+  # The objective this case exists for. The discovery proof and the grade in one line:
+  # neither the configuration's name nor the webhook's is in the prompt, so a line for
+  # seeded-fail-closed-gate at all is the agent having read the admission configurations;
+  # `backend: missing` is the agent having resolved its Service and found none; and
+  # `blocks the upgrade: no` is the agent having read what the gate matches (ConfigMaps
+  # only) and kept it out of the upgrade's path. The forbids are the same anchor with the
+  # wrong backend, and the same anchor answering yes. No gate line at all fails the accept.
+  - name: seeded-b-gate-line-has-no-backend-and-does-not-block
     role: objective
     mode: assert
     check:
@@ -150,20 +139,17 @@ verification_spec:
       fixture_roles:
         - readiness-failclosed-webhook
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: upgrade blockers: (?!(?:(?!; fail-closed webhooks with no backend: )[^\n])*(?:\b(?:seeded-fail-closed-gate|gate\.seeded\.invalid|nonexistent-admission-gate|fail-closed|admission|gate)\b|webhook))(?:(?!; fail-closed webhooks with no backend: )[^\n])+; fail-closed webhooks with no backend: (?:(?!; any of them blocks the upgrade: )[^\n])+; any of them blocks the upgrade: no$'
+        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?seeded-fail-closed-gate(?:/[a-z0-9.-]+)?(?:\s*\([^)\n]*\))?: kind:? webhook; backend: missing; blocks the upgrade: no$'
       forbidden_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: upgrade blockers: (?:(?!; fail-closed webhooks with no backend: )[^\n])*(?:\b(?:seeded-fail-closed-gate|gate\.seeded\.invalid|nonexistent-admission-gate|fail-closed|admission|gate)\b|webhook)(?:(?!; fail-closed webhooks with no backend: )[^\n])*; fail-closed webhooks with no backend: (?:(?!; any of them blocks the upgrade: )[^\n])+; any of them blocks the upgrade: (?:yes|no)$'
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: upgrade blockers: (?:(?!; fail-closed webhooks with no backend: )[^\n])+; fail-closed webhooks with no backend: (?:(?!; any of them blocks the upgrade: )[^\n])+; any of them blocks the upgrade: yes$'
+        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?seeded-fail-closed-gate(?:/[a-z0-9.-]+)?(?:\s*\([^)\n]*\))?: kind:? webhook; backend: (?:ready|not applicable); blocks the upgrade: (?:yes|no)$'
+        - '(?m)^{cluster:b}/(?:[a-z0-9.-]+/)?seeded-fail-closed-gate(?:/[a-z0-9.-]+)?(?:\s*\([^)\n]*\))?: kind:? webhook; backend: (?:ready|missing|not applicable); blocks the upgrade: yes$'
 
-  # The blockers that do stop seeded-b are named: its drain-blocking budget and its minor
-  # hold are the readiness report's own findings. The slot is graded whole by the grammar
-  # in the header: a real blocker's name as a whole token, no negation token, no `:` or
-  # `;` before the next label. Either blocker is enough; the exclusion case grades them
-  # one by one. `none`, `no pdb or exclusion applies`, `pinned-batch-runner, not
-  # hold-the-minor-lag`, `none: pinned-batch-runner is fine` and the table's own
-  # `(maxUnavailable: 0; …)` cell all land in the forbid; `no-surge-pool` first in the
-  # slot does not.
-  - name: seeded-b-names-a-real-blocker
+  # No line on any cluster blames the gate, under any of its names (the configuration
+  # seeded-fail-closed-gate, the webhook gate.seeded.invalid, the Service
+  # nonexistent-admission-gate): the gate is planted on slot b alone, so such a line under
+  # another cluster's name is invented, and under seeded-b's it is the misattribution the
+  # objective above also forbids.
+  - name: no-line-blames-the-gate-for-the-upgrade
     role: objective
     mode: assert
     check:
@@ -171,12 +157,8 @@ verification_spec:
       fold_decoration: true
       fixture_roles:
         - readiness-failclosed-webhook
-      any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: upgrade blockers: (?![^;:\n]*(?:(?<![a-z0-9-])(?:no|not|none|never|without|isn|aren|cannot|nothing|nor|neither|absent|clear|free of)|n''t)(?![a-z0-9-]))[^;:\n]*(?<![a-z0-9-])(?:pinned-batch-runner|hold-the-minor-lag)(?![a-z0-9-])[^;:\n]*; fail-closed webhooks with no backend: (?:(?!; any of them blocks the upgrade: )[^\n])+; any of them blocks the upgrade: (?:yes|no)$'
-      # The negation: seeded-b's frame whose blockers slot fails the same condition, so the
-      # two patterns are exact complements on one line.
       forbidden_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: upgrade blockers: (?!(?![^;:\n]*(?:(?<![a-z0-9-])(?:no|not|none|never|without|isn|aren|cannot|nothing|nor|neither|absent|clear|free of)|n''t)(?![a-z0-9-]))[^;:\n]*(?<![a-z0-9-])(?:pinned-batch-runner|hold-the-minor-lag)(?![a-z0-9-])[^;:\n]*; fail-closed webhooks with no backend: )(?:(?!; fail-closed webhooks with no backend: )[^\n])+; fail-closed webhooks with no backend: (?:(?!; any of them blocks the upgrade: )[^\n])+; any of them blocks the upgrade: (?:yes|no)$'
+        - '(?m)^[^\n:]*(?<![a-z0-9])(?:seeded-fail-closed-gate|gate\.seeded\.invalid|nonexistent-admission-gate)(?![a-z0-9-])[^\n:]*: kind:? (?:pdb|exclusion|webhook); backend: (?:ready|missing|not applicable); blocks the upgrade: yes$'
 
   - name: no-invented-cves
     role: objective
