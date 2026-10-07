@@ -3963,6 +3963,18 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
         and not ((p.get("config") or {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL)
     ]
     pod_tolerations = list(template.get("tolerations") or [])
+    if template.get("runtimeClassName") == "gvisor":
+        pod_tolerations.append({"key": "sandbox.gke.io/runtime", "operator": "Exists"})
+    for container in (template.get("containers") or []) + (template.get("initContainers") or []):
+        resources = container.get("resources") or {}
+        for block in (resources.get("requests") or {}, resources.get("limits") or {}):
+            for res_name in block:
+                if res_name in ("nvidia.com/gpu", "google.com/tpu"):
+                    pod_tolerations.append({"key": res_name, "operator": "Exists"})
+    node_sel = template.get("nodeSelector") or {}
+    for arch_key in ("kubernetes.io/arch", "beta.kubernetes.io/arch"):
+        if arch_key in node_sel:
+            pod_tolerations.append({"key": "kubernetes.io/arch", "operator": "Exists"})
     if non_cc_pools and any(_tolerates_pool(pod_tolerations, p) for p in non_cc_pools):
         return None
 
@@ -7546,7 +7558,7 @@ def _collect_obtainability(cluster: dict, kubeconfig: Path, checks: tuple[CheckS
 
     cc_argv = ["kubectl", "get", "computeclasses", "-A", "-o", "json"]
     cc_parsed, cc_result = run_and_gate(cc_argv, kubeconfig, run=run)
-    if cc_parsed is not None and isinstance(cc_parsed.get("items"), list):
+    if isinstance(cc_parsed, dict) and isinstance(cc_parsed.get("items"), list):
         cc_items = [i for i in cc_parsed["items"] if i.get("kind") == "ComputeClass"]
         dump.setdefault("items", []).extend(cc_items)
         context["compute_classes"] = cc_items
@@ -7567,7 +7579,7 @@ def _collect_obtainability(cluster: dict, kubeconfig: Path, checks: tuple[CheckS
                 commands.pop("untargeted-compute-class-workload", None)
                 stderr = np_result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
                 what = (
-                    f"exited {np_result.rc}" if np_parsed is None
+                    f"exited {np_result.rc}" if np_result.rc != 0
                     else "returned output that is not a JSON list of node pools (rc=0)"
                 )
                 context.setdefault("unevaluated", {})["untargeted-compute-class-workload"] = (
@@ -7577,6 +7589,34 @@ def _collect_obtainability(cluster: dict, kubeconfig: Path, checks: tuple[CheckS
                 )
             else:
                 context["node_pools"] = np_parsed
+                has_default_cc = any(
+                    cc.get("metadata", {}).get("name") == "default"
+                    or (cc.get("metadata", {}).get("annotations") or {}).get("computeclass.cloud.google.com/is-default-class") == "true"
+                    for cc in cc_items
+                )
+                if not has_default_cc:
+                    live_nodes_by_pool = {}
+                    for n in (context.get("nodes") or []):
+                        pname = (n.get("metadata", {}).get("labels") or {}).get("cloud.google.com/gke-nodepool") or ""
+                        if pname:
+                            live_nodes_by_pool[pname] = live_nodes_by_pool.get(pname, 0) + 1
+
+                    def _pool_active(p: dict) -> bool:
+                        if p.get("status") not in _AUDITABLE_NODE_POOL_STATUSES:
+                            return False
+                        autoscaling = p.get("autoscaling")
+                        if autoscaling and autoscaling.get("enabled"):
+                            return True
+                        return live_nodes_by_pool.get(p.get("name", ""), 0) > 0
+
+                    active_pools = [p for p in (np_parsed or []) if _pool_active(p)]
+                    if active_pools and all(_pool_has_workload_taints(p) for p in active_pools):
+                        commands.pop("untargeted-compute-class-workload", None)
+                        context.setdefault("unevaluated", {})["untargeted-compute-class-workload"] = (
+                            f"{UNDETERMINED_PREFIX} all node pools carry workload taints on this cluster, "
+                            "so untargeted workload eligibility could not be evaluated. "
+                            "This check cleared nothing on this cluster."
+                        )
         else:
             context["node_pools"] = []
     elif RESOURCE_TYPE_ABSENT_MARKER in cc_result.stderr:

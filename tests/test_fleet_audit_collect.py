@@ -1075,3 +1075,112 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         hit_zero_str = collect.check_untargeted_compute_class_workload(wl_zero_str, ctx)
         self.assertIsNotNone(hit_zero_str)
         self.assertEqual(hit_zero_str["single_compute_class"], "standard-cc")
+
+    def test_workload_with_gvisor_runtime_class_tolerates_managed_gvisor_tainted_pool(self):
+        # Workload using runtimeClassName: gvisor receives admission toleration for
+        # sandbox.gke.io/runtime and tolerates the unlabelled gvisor node pool, so it
+        # is not flagged as an untargeted compute class workload.
+        gvisor_pool = pool(
+            "gvisor-pool",
+            taints=[{"key": "sandbox.gke.io/runtime", "value": "gvisor", "effect": "NO_SCHEDULE"}],
+        )
+        ctx = {
+            "compute_classes": [self.cc],
+            "node_pools": [self.base_pool, gvisor_pool],
+            "namespaces": [self.ns],
+            "nodes": [self.base_node, node("node-gvisor", labels={"cloud.google.com/gke-nodepool": "gvisor-pool"})],
+        }
+        wl = collect.normalize_workloads({
+            "items": [deployment("gvisor-worker", runtime_class="gvisor")]
+        })[0]
+        hit = collect.check_untargeted_compute_class_workload(wl, ctx)
+        self.assertIsNone(hit)
+
+    def test_collect_obtainability_all_pools_tainted_sets_unevaluated(self):
+        # When all active pools on a ComputeClass cluster carry workload taints and there
+        # is no default ComputeClass, §3.24 cannot evaluate untargeted workload eligibility.
+        spec = collect.CheckSpec(
+            "untargeted-compute-class-workload",
+            "workload",
+            collect.check_untargeted_compute_class_workload,
+            "major",
+            None,
+            "impact description",
+        )
+        fake_dump = {
+            "items": [deployment("api"), node("arm-node", labels={"cloud.google.com/gke-nodepool": "arm-pool"}), self.ns]
+        }
+        tmp_dump = self._create_dump_file(fake_dump)
+        arm_pool = pool(
+            "arm-pool",
+            labels={"cloud.google.com/compute-class": "axion"},
+            taints=[{"key": "kubernetes.io/arch", "value": "arm64", "effect": "NO_SCHEDULE"}],
+        )
+        with patch.object(collect, "dump_state") as mock_dump:
+            mock_dump.return_value = (tmp_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
+            with patch.object(collect, "run_and_gate") as mock_run_and_gate:
+                mock_run_and_gate.side_effect = [
+                    ({"items": [self.cc]}, MagicMock(rc=0, duration_s=0.05, stdout="{}")),
+                    ([arm_pool], MagicMock(rc=0, duration_s=0.08, stdout="[]")),
+                ]
+                cc_context = collect._collect_obtainability(
+                    {"name": "c1", "project": "p1", "location": "l1"},
+                    Path("/fake/kubeconfig"),
+                    (spec,),
+                    run=MagicMock(),
+                )
+                self.assertNotIn("untargeted-compute-class-workload", cc_context.commands)
+                self.assertIn("untargeted-compute-class-workload", cc_context.context.get("unevaluated", {}))
+                self.assertIn("all node pools carry workload taints", cc_context.context["unevaluated"]["untargeted-compute-class-workload"])
+
+    def test_collect_obtainability_computeclasses_bare_json_list_does_not_crash(self):
+        # Bare JSON list returned from kubectl get computeclasses does not crash with AttributeError
+        spec = collect.CheckSpec(
+            "untargeted-compute-class-workload",
+            "workload",
+            collect.check_untargeted_compute_class_workload,
+            "major",
+            None,
+            "impact description",
+        )
+        tmp_dump = self._create_dump_file({"items": []})
+        with patch.object(collect, "dump_state") as mock_dump:
+            mock_dump.return_value = (tmp_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
+            with patch.object(collect, "run_and_gate") as mock_run_and_gate:
+                mock_run_and_gate.return_value = ([], MagicMock(rc=0, duration_s=0.05, stdout="[]", stderr=""))
+                cc_context = collect._collect_obtainability(
+                    {"name": "c1", "project": "p1", "location": "l1"},
+                    Path("/fake/kubeconfig"),
+                    (spec,),
+                    run=MagicMock(),
+                )
+                self.assertNotIn("untargeted-compute-class-workload", cc_context.commands)
+                self.assertIn("untargeted-compute-class-workload", cc_context.context.get("unevaluated", {}))
+
+    def test_collect_obtainability_node_pools_rc0_empty_stdout_reports_not_json_list(self):
+        # rc=0 with empty/truncated stdout reports 'returned output that is not a JSON list', not 'exited 0'
+        spec = collect.CheckSpec(
+            "untargeted-compute-class-workload",
+            "workload",
+            collect.check_untargeted_compute_class_workload,
+            "major",
+            None,
+            "impact description",
+        )
+        tmp_dump = self._create_dump_file({"items": []})
+        with patch.object(collect, "dump_state") as mock_dump:
+            mock_dump.return_value = (tmp_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
+            with patch.object(collect, "run_and_gate") as mock_run_and_gate:
+                mock_run_and_gate.side_effect = [
+                    ({"items": [self.cc]}, MagicMock(rc=0, duration_s=0.05, stdout="{}")),
+                    (None, MagicMock(rc=0, duration_s=0.05, stdout="", stderr="")),
+                ]
+                cc_context = collect._collect_obtainability(
+                    {"name": "c1", "project": "p1", "location": "l1"},
+                    Path("/fake/kubeconfig"),
+                    (spec,),
+                    run=MagicMock(),
+                )
+                reason = cc_context.context.get("unevaluated", {}).get("untargeted-compute-class-workload", "")
+                self.assertIn("returned output that is not a JSON list of node pools (rc=0)", reason)
+                self.assertNotIn("exited 0", reason)
