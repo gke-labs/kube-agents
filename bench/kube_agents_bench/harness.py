@@ -2307,10 +2307,11 @@ class KubeAgentsHarness(AgentHarness):
         stderr (:func:`_pf_log_path`) the transport-failure messages quote.
         Cards filed *during* a status turn join the wait.
 
-        A turn that fails in transport without a failure reason is retried up to
+        A turn that fails in transport or answers with an error is retried up to
         :data:`_MAX_TRANSPORT_FAILURES` times running -- through a fresh
-        tunnel each time, like the opening turn -- while one with an explicit
-        failure reason ends the wait immediately without retrying. A turn
+        tunnel each time on transport loss, or directly on the next poll when
+        the agent answered -- while on an opening turn an infrastructure failure
+        reason (rate limit or billing) ends the wait immediately. A turn
         reporting no outstanding card is tolerated up to :data:`_MAX_SILENT_TURNS`.
 
         Returns:
@@ -2322,8 +2323,8 @@ class KubeAgentsHarness(AgentHarness):
                 an agent, or -- on an opening turn only -- a status turn hit an
                 infrastructure limit (rate limit or billing). The caller replaces
                 the record wholesale with :func:`_infra_failure`. On an answer
-                turn a failure reason never raises: the error is appended and the
-                wait settles, so the wake reply stays graded.
+                turn a failure reason never raises: the error is counted towards
+                answered failures and the wait settles, so the wake reply stays graded.
         """
         # The delegating turn may already have shown a card done, in which case
         # there is nothing to wait on and no reason to sleep a poll interval.
@@ -2404,28 +2405,11 @@ class KubeAgentsHarness(AgentHarness):
             try:
                 status_turn, turn_session = turn(poll, min(timeout, remaining))
             except _TransportError as exc:
-                if exc.failure_reason in ("rate_limit", "billing"):
-                    if not opening_turn:
-                        result.errors.append(
-                            f"status turn hit infrastructure failure ({exc.failure_reason}): {exc}; "
-                            "still waiting on: " + ", ".join(outstanding) + "; "
-                            f"tunnel log: {_tail(_pf_log_path(local_port))}"
-                        )
-                        timed_out = False
-                        break
+                if exc.failure_reason in ("rate_limit", "billing") and opening_turn:
                     _purge_card_state(awaited, _EXEC_TIMEOUT)
                     raise _DelegationTransportExhausted(
                         f"status turn hit infrastructure failure ({exc.failure_reason}): {exc}"
                     ) from exc
-                if exc.failure_reason is not None:
-                    detail = exc.failure_reason or "unknown"
-                    result.errors.append(
-                        f"status turn failed with agent error ({detail}): {exc}; "
-                        "still waiting on: " + ", ".join(outstanding) + "; "
-                        f"tunnel log: {_tail(_pf_log_path(local_port))}"
-                    )
-                    timed_out = False
-                    break
                 transport_failures += 1
                 _log.warning(
                     "status turn failed (%d/%d): %s",
@@ -2471,15 +2455,19 @@ class KubeAgentsHarness(AgentHarness):
                         f"tunnel log: {_tail(_pf_log_path(local_port))}"
                     ) from exc
                 # A handler answered every time (a non-429 4xx, a 500,
-                # non-JSON): that is the agent's own failure, so it stays in
-                # front of the judge as before -- recorded, not just logged,
-                # which is what stops devops-bench promoting the partial
-                # record.
-                result.errors.append(
-                    f"status turns failed in transport {transport_failures} times running; "
+                # non-JSON, or repeated classified failures): that is the
+                # agent's own failure, so it stays in front of the judge as
+                # before -- recorded, not just logged, which is what stops
+                # devops-bench promoting the partial record.
+                report = (
+                    f"status turns failed with answered errors {transport_failures} times running; "
                     "still waiting on: " + ", ".join(outstanding) + "; "
                     f"tunnel log: {_tail(_pf_log_path(local_port))}"
                 )
+                if not opening_turn and exc.failure_reason in ("rate_limit", "billing"):
+                    if not delivered_results(observed, awaited):
+                        report = f"{DELEGATION_CEILING_MARKER}: {report}"
+                result.errors.append(report)
                 timed_out = False
                 break
             transport_failures = 0

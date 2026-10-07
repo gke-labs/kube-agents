@@ -2537,7 +2537,7 @@ def test_status_turns_the_endpoint_answered_still_grade_the_partial_record(
     result = KubeAgentsHarness().run("Find the root cause.")
 
     assert result.has_errors()
-    assert "failed in transport" in result.errors[0]
+    assert "status turns failed with answered errors 3 times running" in result.errors[0]
     assert _TASK_ID in result.errors[0]
     assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
     # The delegation turn survived.
@@ -2547,10 +2547,10 @@ def test_status_turns_the_endpoint_answered_still_grade_the_partial_record(
     assert recorded_pf_resets == []
 
 
-def test_a_status_turn_502_with_tool_error_is_graded_without_retrying(
+def test_a_status_turn_502_with_transient_tool_error_is_retried_and_succeeds(
     stub_agent: _StubAgentServer, instant_polls: None, recorded_pf_resets: list[int]
 ) -> None:
-    """A status turn 502 with an agent failure reason is graded on the first attempt."""
+    """A status turn 502 with an agent failure reason is retried on the next poll interval."""
     stub_agent.turns = [_create_turn(), _show_turn("done")]
     stub_agent.fail_on = frozenset({2})
     stub_agent.fail_on_status = 502
@@ -2558,17 +2558,33 @@ def test_a_status_turn_502_with_tool_error_is_graded_without_retrying(
 
     result = KubeAgentsHarness().run("Find the root cause.")
 
-    assert result.has_errors()
-    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
-    assert "agent error (tool_error)" in result.errors[0]
-    assert len(stub_agent.requests) == 2
+    assert not result.has_errors()
+    assert len(stub_agent.requests) == 3
     assert recorded_pf_resets == []
 
 
-def test_a_status_turn_502_with_empty_failure_reason_is_graded_without_retrying(
+def test_a_status_turn_502_with_persistent_tool_error_is_graded_after_exhaustion(
     stub_agent: _StubAgentServer, instant_polls: None, recorded_pf_resets: list[int]
 ) -> None:
-    """A status turn 502 with present but empty failure reason is graded on attempt 1."""
+    """A status turn 502 with persistent agent failure reason is graded after max failures."""
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    stub_agent.fail_on = frozenset(range(2, 2 + harness._MAX_TRANSPORT_FAILURES))
+    stub_agent.fail_on_status = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "tool_error"}
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "status turns failed with answered errors 3 times running" in result.errors[0]
+    assert len(stub_agent.requests) == 1 + harness._MAX_TRANSPORT_FAILURES
+    assert recorded_pf_resets == []
+
+
+def test_a_status_turn_502_with_transient_empty_failure_reason_is_retried(
+    stub_agent: _StubAgentServer, instant_polls: None, recorded_pf_resets: list[int]
+) -> None:
+    """A status turn 502 with present but empty failure reason is retried on next poll."""
     stub_agent.turns = [_create_turn(), _show_turn("done")]
     stub_agent.fail_on = frozenset({2})
     stub_agent.fail_on_status = 502
@@ -2576,10 +2592,26 @@ def test_a_status_turn_502_with_empty_failure_reason_is_graded_without_retrying(
 
     result = KubeAgentsHarness().run("Find the root cause.")
 
+    assert not result.has_errors()
+    assert len(stub_agent.requests) == 3
+    assert recorded_pf_resets == []
+
+
+def test_a_status_turn_502_with_persistent_empty_failure_reason_is_graded(
+    stub_agent: _StubAgentServer, instant_polls: None, recorded_pf_resets: list[int]
+) -> None:
+    """A status turn 502 with persistent empty failure reason is graded after max failures."""
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    stub_agent.fail_on = frozenset(range(2, 2 + harness._MAX_TRANSPORT_FAILURES))
+    stub_agent.fail_on_status = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": ""}
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
     assert result.has_errors()
     assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
-    assert "agent error (unknown)" in result.errors[0]
-    assert len(stub_agent.requests) == 2
+    assert "status turns failed with answered errors 3 times running" in result.errors[0]
+    assert len(stub_agent.requests) == 1 + harness._MAX_TRANSPORT_FAILURES
     assert recorded_pf_resets == []
 
 
@@ -3531,12 +3563,45 @@ def test_a_status_turn_502_with_rate_limit_on_answer_turn_is_an_agent_error_not_
 ) -> None:
     """A status turn rate_limit on an answer turn remains an agent error, not infra.
 
-    When a card-wake answer turn dispatches work and a status poll answers 502
-    carrying X-Hermes-Failure-Reason: rate_limit, _await_delegated_work breaks
-    to _settle without raising _DelegationTransportExhausted or purging early.
-    This preserves the answer turn's trajectory, cards, and tokens while
-    keeping the wake turn reply graded without INFRA_FAILURE_MARKER.
+    When a card-wake answer turn dispatches work and status polls answer 502
+    carrying X-Hermes-Failure-Reason: rate_limit, _await_delegated_work treats it as
+    an answered failure. Once exhausted without delivered results, it attaches
+    DELEGATION_CEILING_MARKER and breaks to _settle without raising
+    _DelegationTransportExhausted. This preserves the answer turn's trajectory,
+    cards, and tokens while keeping the wake turn reply graded without
+    INFRA_FAILURE_MARKER.
     """
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    stub_agent.turns = [_turn(_text(_FINAL_TEXT)), _create_turn(), _show_turn("done")]
+    stub_agent.fail_on = frozenset({3, 4, 5})
+    stub_agent.fail_on_status = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "rate_limit"}
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "status turns failed with answered errors 3 times running" in result.errors[0]
+    assert harness.DELEGATION_CEILING_MARKER in result.errors[0]
+    assert len(stub_agent.requests) == 5
+    assert result.output == _FINAL_TEXT
+    assert _archived(scripts)
+    # Settle ran before purging: the answer turn trajectory is preserved,
+    # tokens["workers"] is recorded, and the card purge ran.
+    assert any(entry.get("name") == "kanban_create" for entry in result.trajectory)
+    assert "workers" in result.tokens
+    purges = [s for s in scripts if "rm -rf" in s and _TASK_ID in s]
+    assert len(purges) == 1
+
+
+def test_a_status_turn_502_with_transient_rate_limit_on_answer_turn_is_retried(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_agent: _StubAgentServer,
+    instant_polls: None,
+    no_cluster_exec: list[str],
+) -> None:
+    """A transient status turn rate_limit on an answer turn is retried on next poll."""
     scripts: list[str] = []
     monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
     stub_agent.turns = [_turn(_text(_FINAL_TEXT)), _create_turn(), _show_turn("done")]
@@ -3546,14 +3611,9 @@ def test_a_status_turn_502_with_rate_limit_on_answer_turn_is_an_agent_error_not_
 
     result = KubeAgentsHarness().run(_REPLAY_PROMPT)
 
-    assert result.has_errors()
-    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
-    assert "status turn hit infrastructure failure (rate_limit)" in result.errors[0]
-    assert len(stub_agent.requests) == 3
+    assert not result.has_errors()
+    assert len(stub_agent.requests) == 4
     assert result.output == _FINAL_TEXT
-    assert _archived(scripts)
-    # Settle ran before purging: the answer turn trajectory is preserved
-    assert any(entry.get("name") == "kanban_create" for entry in result.trajectory)
 
 
 def test_a_status_turn_bare_transport_exhaustion_on_answer_turn_is_infra(
