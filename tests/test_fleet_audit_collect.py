@@ -1143,6 +1143,16 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         self.assertIsNotNone(hit_zero_str)
         self.assertEqual(hit_zero_str["single_compute_class"], "standard-cc")
 
+        # Zero quantities with SI suffixes (lowercase k, n, u or uppercase Ki, m)
+        # must also parse as zero, not positive quantities.
+        for suffix in ("0k", "0n", "0u", "0m", "0Ki"):
+            wl_suffix = collect.normalize_workloads({
+                "items": [deployment(f"api-zero-{suffix}", resources={"limits": {"nvidia.com/gpu": suffix}})]
+            })[0]
+            hit_suffix = collect.check_untargeted_compute_class_workload(wl_suffix, ctx)
+            self.assertIsNotNone(hit_suffix)
+            self.assertEqual(hit_suffix["single_compute_class"], "standard-cc")
+
     def test_workload_with_gvisor_runtime_class_tolerates_managed_gvisor_tainted_pool(self):
         # Workload using runtimeClassName: gvisor receives admission toleration for
         # sandbox.gke.io/runtime and tolerates the unlabelled gvisor node pool, so it

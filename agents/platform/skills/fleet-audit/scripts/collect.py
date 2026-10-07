@@ -3848,23 +3848,6 @@ _ACCELERATOR_RESOURCE_KEYS = frozenset({
 })
 
 
-def _is_positive_resource_quantity(val: object) -> bool:
-    if val is None:
-        return False
-    if isinstance(val, (int, float)):
-        return val > 0
-    s = str(val).strip()
-    if not s or s == "0":
-        return False
-    try:
-        clean = s.rstrip("mKiMGTPEe")
-        if clean and float(clean) == 0:
-            return False
-    except ValueError:
-        pass
-    return True
-
-
 def _workload_has_scheduling_constraints(template: dict) -> bool:
     if template.get("nodeSelector"):
         return True
@@ -3882,10 +3865,8 @@ def _workload_has_scheduling_constraints(template: dict) -> bool:
     containers = list(template.get("containers") or []) + list(template.get("initContainers") or [])
     for c in containers:
         res = c.get("resources") or {}
-        reqs = res.get("requests") or {}
-        limits = res.get("limits") or {}
         for k in _ACCELERATOR_RESOURCE_KEYS:
-            if _is_positive_resource_quantity(reqs.get(k)) or _is_positive_resource_quantity(limits.get(k)):
+            if _declared(res, "requests", k) or _declared(res, "limits", k):
                 return True
     return False
 
@@ -3967,11 +3948,11 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
         pod_tolerations.append({"key": "sandbox.gke.io/runtime", "operator": "Exists"})
     for container in (template.get("containers") or []) + (template.get("initContainers") or []):
         resources = container.get("resources") or {}
-        for block in (resources.get("requests") or {}, resources.get("limits") or {}):
-            for res_name in block:
-                if res_name in ("nvidia.com/gpu", "google.com/tpu"):
-                    if _is_positive_resource_quantity(block.get(res_name)):
-                        pod_tolerations.append({"key": res_name, "operator": "Exists"})
+        for res_name in _ACCELERATOR_RESOURCE_KEYS:
+            if _declared(resources, "requests", res_name) or _declared(resources, "limits", res_name):
+                tol = {"key": res_name, "operator": "Exists"}
+                if tol not in pod_tolerations:
+                    pod_tolerations.append(tol)
     node_sel = template.get("nodeSelector") or {}
     is_arm64 = False
     for arch_key in ("kubernetes.io/arch", "beta.kubernetes.io/arch"):
