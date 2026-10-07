@@ -92,6 +92,10 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
 
 KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconfigs"
 DEFAULT_TIMEOUT_S = 60
+# The exit status a `Run` reports for a command `subprocess.run` killed on
+# its timeout -- coreutils `timeout`'s, and the one collect.py, fleet_drift.py
+# and patch_readiness.py report, so a timeout reads the same in every manifest.
+TIMEOUT_RC = 124
 # Was 64, sized so every cluster's ten-minute sampling window ran
 # concurrently rather than queuing behind an earlier one. Nothing sleeps any
 # more -- per-cluster work is a handful of subprocess reads and a few HTTP
@@ -368,6 +372,13 @@ NON_JSON_BODY = "HTTP 200 with a body that is not a JSON object"
 NOT_AN_OBJECT_LIST = "returned no JSON list of objects"
 # Also the manifest's `started_at` / `finished_at` form: both are UTC to the second.
 MONITORING_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+SECONDS_PER_HOUR = 3600
+# The precision the usage reads round to before they are digested into the
+# manifest's stdout stand-in: fine enough that a real change in usage moves
+# the digest, coarse enough that float noise between two identical answers
+# does not. vCPU to a tenth of a millicore, memory to a tenth of a MiB.
+USAGE_DIGEST_CPU_DIGITS = 4
+USAGE_DIGEST_MEM_DIGITS = 1
 POD_GROUP_BY_FIELDS = ["resource.labels.namespace_name", "resource.labels.pod_name"]
 # `--oauth2-bearer`, not an `Authorization: Bearer` header: `finish` redacts
 # whatever follows `Bearer`, which cut the published command in half.
@@ -536,10 +547,34 @@ IDLE_WORKLOAD_UTILISATION = 0.2
 IDLE_WORKLOAD_MIN_AGE_DAYS = 14
 
 # The `needs_triage` marker on an idle controller a Service selects. Read by
-# `triage_marked_findings` in audit_report.py, which withholds these from the
+# `triage_markers` in audit_report.py, which withholds these from the
 # automatic sweep -- so the string has to match the one that file names, and
 # the two files carry it separately because neither imports the other.
 IDLE_SERVICE_TRIAGE = "service-fronted"
+
+# The `needs_triage` marker on a sizing finding whose `major` grade the
+# Autopilot bump supplied: an overrequest that is `minor` by magnitude, and
+# every unsized workload on an Autopilot cluster. The bump moves a finding up
+# the ledger because Autopilot bills on requests; it says nothing about
+# whether the resize is safe to merge unread. Neither check is on
+# `MAJOR_SWEEP_CHECKS` in audit_report.py, so a `major` waits regardless; the
+# marker names the reason in the ledger, and keeps a platform attribute from
+# opening pull requests by itself if either check ever joins that list. Same contract as
+# `IDLE_SERVICE_TRIAGE`: `NO_SWEEP_TRIAGE` names it, `/remediate` still opens it.
+AUTOPILOT_BUMP_TRIAGE = "autopilot-bumped"
+
+# The `needs_triage` marker on every §3.13 stand-down a Service does not
+# select (one it does carries `IDLE_SERVICE_TRIAGE`, the more specific
+# reason). The fix is `spec.replicas: 0`, and CPU and memory near zero for a
+# week is not evidence nothing needs the workload, so the marker keeps that
+# pull request out of the sweep at any grade.
+IDLE_STANDDOWN_TRIAGE = "scale-to-zero"
+
+# The `needs_triage` marker on a §3.1 overrequest of a `Guaranteed` pod. The
+# SOP has the model publish it as `manual`, which the sweep never opens; the
+# marker is also in `NO_SWEEP_TRIAGE`, so a `manifest` written anyway stays
+# out of the sweep rather than resting on that instruction alone.
+GUARANTEED_QOS_TRIAGE = "guaranteed-qos"
 
 # `check_underrequest`'s floor is on the overage -- how far sustained usage sits
 # above the request -- rather than on the request, because that overage is the
@@ -913,7 +948,7 @@ def default_run(argv: list[str], *, env: dict | None = None, timeout: int = DEFA
         # `TimeoutExpired` carries whatever the child wrote as bytes, `text=True`
         # notwithstanding, and every consumer of `Run` searches and slices it as
         # str. `collect.py`'s `_text` does the same.
-        return Run(argv, 124, _text(exc.stdout), _text(exc.stderr), time.monotonic() - t0)
+        return Run(argv, TIMEOUT_RC, _text(exc.stdout), _text(exc.stderr), time.monotonic() - t0)
     except Exception as exc:
         return Run(argv, -1, "", str(exc), time.monotonic() - t0)
 
@@ -1314,7 +1349,7 @@ def _pod_series_params(
         "aggregation.perSeriesAligner": primary,
         "aggregation.crossSeriesReducer": REDUCE_SUM,
         "aggregation.groupByFields": POD_GROUP_BY_FIELDS,
-        "secondaryAggregation.alignmentPeriod": f"{window_hours * 3600}s",
+        "secondaryAggregation.alignmentPeriod": f"{window_hours * SECONDS_PER_HOUR}s",
         "secondaryAggregation.perSeriesAligner": secondary,
     }
 
@@ -1485,7 +1520,7 @@ def fetch_usage_peaks(
     # so a digest tracks a real change in usage rather than float noise.
     rendered = json.dumps(
         sorted(
-            (ns, pod, None if cpu is None else round(cpu, 4), None if mem is None else round(mem, 1))
+            (ns, pod, None if cpu is None else round(cpu, USAGE_DIGEST_CPU_DIGITS), None if mem is None else round(mem, USAGE_DIGEST_MEM_DIGITS))
             for (ns, pod), (cpu, mem) in merged.items()
         )
     )
@@ -1543,7 +1578,7 @@ def fetch_memory_means(
     if not means:
         return fail(0, f'no time series for cluster_name="{cluster}" over the trailing {window_hours}h')
 
-    rendered = json.dumps(sorted((ns, pod, round(mem, 1)) for (ns, pod), mem in means.items()))
+    rendered = json.dumps(sorted((ns, pod, round(mem, USAGE_DIGEST_MEM_DIGITS)) for (ns, pod), mem in means.items()))
     return means, True, Run([label], 0, rendered, "", time.monotonic() - started)
 
 
@@ -2555,7 +2590,9 @@ def _drain_blockers(pods: list[dict], pdb_selectors: list[dict]) -> list[str]:
     both, as the autoscaler checks the annotation before either rule; one whose
     `safe-to-evict-local-volumes` lists every local volume is exempt from the
     second. DaemonSet and mirror pods are exempt from both -- they go with the
-    node.
+    node. The caller passes only Running pods no DaemonSet owns (the
+    `pods_by_node` index in `check_idle_nodepool`), so the one exemption
+    tested here is the mirror pod, which that index keeps.
 
     Two more rules pin a node whatever the namespace: a pod annotated
     `safe-to-evict: "false"`, and a bare pod no controller would recreate.
@@ -2585,8 +2622,8 @@ def _drain_blockers(pods: list[dict], pdb_selectors: list[dict]) -> list[str]:
             blockers.append(f"{ns}/{name} (kube-system, no PDB)")
         elif _blocking_local_storage(pod):
             blockers.append(f"{ns}/{name} (local storage, not safe-to-evict)")
-        elif not _is_system_namespace(ns) or _pod_daemonset_owned(pod) or (pod.get("status") or {}).get("phase") in POD_TERMINAL_PHASES:
-            continue  # §3.8's to report, or nothing the autoscaler waits for
+        elif not _is_system_namespace(ns):
+            continue  # §3.8's to report
         elif _safe_to_evict(annotations) is False:
             blockers.append(f'{ns}/{name} (system namespace, safe-to-evict "false")')
         elif not meta.get("ownerReferences"):
@@ -3498,7 +3535,11 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
             entry["oldest_h"], replaced=replaced, controller_h=_controller_hours(context, kind, entry["ns"], name, now), kind=kind
         )
         severity = "major" if delta_cpu >= NODE_WORTH_VCPU or delta_mem_gib >= NODE_WORTH_GIB else "minor"
-        if autopilot and severity == "minor":
+        # Recorded, not just applied: a grade the bump supplied is held out of
+        # the automatic sweep (`AUTOPILOT_BUMP_TRIAGE`), and one the delta
+        # earned on its own is not.
+        bumped = autopilot and severity == "minor"
+        if bumped:
             severity = "major"
 
         # Name the over-requested dimensions in the excerpt. The remediation
@@ -3620,6 +3661,7 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
                 "excerpt": excerpt,
                 "severity": severity,
                 "_guaranteed": guaranteed,
+                "_autopilot_bumped": bumped,
             }
         )
     return hits
@@ -4200,8 +4242,9 @@ def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, 
         # container, so a pod pairing a limited sidecar with an unlimited main
         # container -- every default Istio injection -- has a `mem_lim_total`
         # binding neither. Grading against it published `critical` off the
-        # sidecar's 1Gi while the unlimited container held the memory, and
-        # `critical` + `manifest` is what `finish` promotes unattended.
+        # sidecar's 1Gi while the unlimited container held the memory, and a
+        # `manifest` fix graded at or above `AUTO_PROMOTION_FLOOR` is what
+        # `finish` promotes unattended.
         limited = all(
             parse_mem_mib(str(lim.get("memory", "0")))
             for pod in entry["pods"]
@@ -4405,11 +4448,12 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
         # severity ceiling reserves `critical` for a drain blocker or a
         # last-copy deletion, neither of which a missing request is.
         #
-        # The ceiling is also what keeps this out of the automatic sweep,
-        # which promotes `critical` findings only (`promotion_candidates` in
-        # audit_report.py): a bumped `major` still waits for `/remediate`, so
-        # a *platform* attribute moves this finding up the ledger and never
-        # opens a pull request by itself.
+        # The bumped `major` is the grade the automatic sweep opens on the
+        # checks it clears for `major` (`MAJOR_SWEEP_CHECKS` in audit_report.py),
+        # so the hit says the bump supplied it and the candidate carries
+        # `AUTOPILOT_BUMP_TRIAGE` whichever floor applies: it
+        # still waits for `/remediate`, and a *platform* attribute moves this
+        # finding up the ledger without opening a pull request by itself.
         severity = "major" if autopilot else "minor"
         # §3.1's units are vCPU and GiB, and this check does not use them. The
         # workloads it finds are small by construction -- nobody forgets a
@@ -4461,6 +4505,7 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
                 "object": f"{kind}/{name}",
                 "excerpt": excerpt,
                 "severity": severity,
+                "_autopilot_bumped": autopilot,
             }
         )
     return hits
@@ -5209,15 +5254,21 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
         commands["unsized-workload"] = usage_record
         for hit in check_overrequest(context, usage_peaks, now=now, autopilot=bool(cluster.get("autopilot"))):
             emitted = emit("overrequest", hit)
+            # `guaranteed-qos` wins over the bump marker: §3.1 has that
+            # finding published as `manual`, and the model needs the marker
+            # to know to write it that way. Both keep it out of the sweep.
             if hit.get("_guaranteed"):
-                emitted["needs_triage"] = "guaranteed-qos"
+                emitted["needs_triage"] = GUARANTEED_QOS_TRIAGE
+            elif hit.get("_autopilot_bumped"):
+                emitted["needs_triage"] = AUTOPILOT_BUMP_TRIAGE
             candidates.append(emitted)
         # Same peak read, the complementary population: 3.1 sizes the
         # controllers that declared a request, 3.12 the ones that did not.
-        candidates += [
-            emit("unsized-workload", h)
-            for h in check_unsized(context, usage_peaks, now=now, autopilot=bool(cluster.get("autopilot")))
-        ]
+        for hit in check_unsized(context, usage_peaks, now=now, autopilot=bool(cluster.get("autopilot"))):
+            emitted = emit("unsized-workload", hit)
+            if hit.get("_autopilot_bumped"):
+                emitted["needs_triage"] = AUTOPILOT_BUMP_TRIAGE
+            candidates.append(emitted)
         # Same peak read again, and the population 3.1 drops: a controller
         # whose resize would change nothing because nothing is using it, or
         # one whose resize 3.1 refuses to make because it is `Guaranteed`.
@@ -5249,15 +5300,18 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
             # publishing "a workload nobody is calling" forever with the constant
             # above corrected.
             emitted["impact_authoritative"] = True
-            # The one shape of this finding whose pull request can take a
-            # serving system down, held out of the automatic sweep. Everything
-            # else here reclaims a reservation; a Service-backed stand-down
-            # removes the endpoints behind a name something may still be
-            # calling, and this check has no way to know whether anything is.
-            # `/remediate` still opens it, which is the point -- the judgement
-            # the collector cannot supply is a reader's to supply by name.
+            # Every stand-down is held out of the automatic sweep, under the
+            # more specific of two reasons. A Service-backed one removes the
+            # endpoints behind a name something may still be calling, and this
+            # check has no way to know whether anything is; any other one still
+            # takes the workload to zero on an idle reading
+            # (`IDLE_STANDDOWN_TRIAGE`). `/remediate` still opens either, which
+            # is the point -- the judgement the collector cannot supply is a
+            # reader's to supply by name.
             if hit.get("_selected_by"):
                 emitted["needs_triage"] = IDLE_SERVICE_TRIAGE
+            else:
+                emitted["needs_triage"] = IDLE_STANDDOWN_TRIAGE
             candidates.append(emitted)
     elif metrics_ok:
         missing, present = missing_dimension

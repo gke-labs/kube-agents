@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Deterministic bridge from `INVENTORY.raw.md` to the findings queue.
 
-The onboarding sweep writes a ```findings block into the raw file; this script
+The onboarding hand-off (bootstrap_handoff.py) writes a ```findings block into
+the raw file; this script
 reads it and owns every deterministic step of the prioritization stage:
 `extract` produces the authoritative item list, `register` refuses to send
 anything until every one of those items carries a score, and `ranked` reads
@@ -38,8 +39,8 @@ POST_TIMEOUT_SECONDS = 30
 SOURCE = "inventory"
 
 # ```findings ... ``` -- CommonMark's leading indent and long closing fence are
-# both accepted because the only example the sweep is shown, in `inventory.md`
-# Step 4 item 5, sits indented inside a numbered list.
+# both accepted: bootstrap_handoff.py writes a bare fence, but a raw file typed
+# by a model, as earlier sweeps did, may indent it inside a list.
 BLOCK_RE = re.compile(
     r"^ {0,3}(?P<fence>`{3,})[ \t]*findings[ \t]*$(?P<body>.*?)^ {0,3}(?P=fence)`*[ \t]*$",
     re.MULTILINE | re.DOTALL,

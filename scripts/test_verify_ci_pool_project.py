@@ -3102,15 +3102,23 @@ class LedgerCredentialMatchesCiEvalPrTest(unittest.TestCase):
     """This check must attest the credential hack/ci-eval-pr.sh actually mints.
 
     The App, its installation, and the variable the token lands in are written
-    in three files that do not read each other -- here, hack/ci-eval-pr.sh, and
+    in four files that do not read each other -- here, hack/ci-eval-pr.sh,
+    hack/ledger_token_mint.py (whose defaults are what step 0 mints with, since
+    hack/ci-revalidate.sh exports neither id), and
     bench/kube_agents_bench/verifiers.py. Change one and this check goes on
     reporting a project healthy against a credential CI no longer uses. Parsed
     rather than imported: the verifier is deliberately dependency-free, bench is
-    an installable package, and the third file is shell.
+    an installable package, one file is shell, and the mint runs at import.
     """
 
     def setUp(self):
         self.script = (checker._ROOT / "hack" / "ci-eval-pr.sh").read_text()
+        self.mint = (checker._ROOT / "hack" / "ledger_token_mint.py").read_text()
+
+    def _module_default(self, name):
+        m = re.search(rf'^{name} = "([^"]+)"$', self.mint, re.M)
+        self.assertIsNotNone(m, f"could not find {name} in hack/ledger_token_mint.py")
+        return m.group(1)
 
     def _default(self, name):
         m = re.search(rf'^export {name}="\$\{{{name}:-([^}}]+)\}}"', self.script, re.M)
@@ -3121,6 +3129,12 @@ class LedgerCredentialMatchesCiEvalPrTest(unittest.TestCase):
         self.assertEqual(str(checker.LEDGER_APP_ID), self._default("EVAL_LEDGER_APP_ID"))
         self.assertEqual(
             str(checker.LEDGER_INSTALLATION_ID), self._default("EVAL_LEDGER_INSTALLATION_ID")
+        )
+
+    def test_the_app_and_installation_match_the_mint_modules_defaults(self):
+        self.assertEqual(str(checker.LEDGER_APP_ID), self._module_default("DEFAULT_LEDGER_APP_ID"))
+        self.assertEqual(
+            str(checker.LEDGER_INSTALLATION_ID), self._module_default("DEFAULT_LEDGER_INSTALLATION_ID")
         )
 
     def test_the_probe_asks_for_the_reads_the_grading_mint_asks_for(self):

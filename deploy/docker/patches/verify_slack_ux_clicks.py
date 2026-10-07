@@ -13,8 +13,8 @@ Two things are checked:
    :func:`slack_ux_clicks.answer` unpacks, in that order, plus
    ``_is_ignored_channel``, ``_slack_allowed_channels``, ``_slack_disable_dms``,
    ``_get_client``, ``_handle_slack_message``, ``_is_interactive_user_authorized``,
-   ``_channel_gate_allows``, ``_slack_message_matches_mention_patterns`` and
-   ``_event_declares_bot_sender``, sets
+   ``_channel_gate_allows``, ``_slack_message_matches_mention_patterns``,
+   ``_event_declares_bot_sender`` and ``_resolve_user_name``, sets
    ``_bot_user_id`` and ``_team_bot_user_ids`` in ``__init__``, plus ``_client_for`` for ``slack_ux_incident``;
    the adapter file still defines ``_slack_mention_detection_text(event)`` at module level and still reads the
    ``_hermes_force_process`` marker the click's message carries.
@@ -64,13 +64,14 @@ RUNTIME_MEMBERS = (
     "_begin_interaction", "_is_ignored_channel", "_slack_allowed_channels", "_slack_disable_dms",
     "_get_client", "_handle_slack_message", "_client_for", "_is_interactive_user_authorized",
     "_channel_gate_allows", "_slack_message_matches_mention_patterns", "_event_declares_bot_sender",
+    "_resolve_user_name",
 )
 #: The adapter file's module-level functions the runtime calls, and how: positional arguments, keywords.
 RUNTIME_FUNCTIONS = {"_slack_mention_detection_text": (1, ())}
 #: The instance attributes the runtime reads, set in ``__init__``.
 RUNTIME_ATTRIBUTES = ("_bot_user_id", "_team_bot_user_ids")
 #: The members the runtime awaits; every other one it calls plainly.
-ASYNC_MEMBERS = ("_begin_interaction", "_handle_slack_message", "_channel_gate_allows")
+ASYNC_MEMBERS = ("_begin_interaction", "_handle_slack_message", "_channel_gate_allows", "_resolve_user_name")
 #: The event key whose ``.get()`` makes the message handler skip the mention
 #: requirement for a click's turn. Matched in the AST, so quoting does not matter.
 FORCE_MARKER = "_hermes_force_process"
@@ -89,6 +90,7 @@ CALL_SHAPES = {
     "_is_interactive_user_authorized": ((1, ("channel_id", "team_id")),),
     "_slack_message_matches_mention_patterns": ((1, ()),),
     "_event_declares_bot_sender": ((1, ()),),
+    "_resolve_user_name": ((1, ("chat_id", "team_id")),),
     "_channel_gate_allows": ((0, (
         "channel_id", "routing_text", "bot_uid", "is_mentioned", "is_thread_reply", "event_thread_ts", "user_id",
         "team_id", "is_dm", "force_process",
@@ -98,6 +100,8 @@ CALL_SHAPES = {
 CHANNEL = "C0KAGE"
 TEAM = "T0KAGE"
 USER = "U0KAGE"
+#: The name the stub's ``users.info`` gives ``USER``, which the answered line shows.
+USER_NAME = "Kage Tester"
 MESSAGE_TS = "1700000000.000200"
 THREAD = "1700000000.000100"
 ACTION_TS = "1700000001.000300"
@@ -396,6 +400,9 @@ class _StubAdapter:
     def _event_declares_bot_sender(self, event):
         return bool(event.get("bot_id"))
 
+    async def _resolve_user_name(self, user_id, chat_id="", team_id=""):
+        return USER_NAME if user_id == USER else user_id
+
     async def _channel_gate_allows(
         self, *, channel_id, routing_text, bot_uid, is_mentioned, is_thread_reply, event_thread_ts, user_id,
         team_id, is_dm, force_process,
@@ -457,7 +464,7 @@ async def _drive(module) -> None:
         update, turn = (entry[1] for entry in adapter.log)
         if any(b.get("type") == "actions" for b in update["blocks"]):
             raise _fail("the answered choice buttons are still on the message")
-        if f"<@{USER}>" not in update["text"]:
+        if f"✓ {USER_NAME}: " not in update["text"]:
             raise _fail(f"the answered message does not name the clicker: {update!r}")
         expected = {"user": USER, "text": LABEL, "channel": CHANNEL, "thread_ts": THREAD, "ts": ACTION_TS}
         if {k: turn.get(k) for k in expected} != expected:

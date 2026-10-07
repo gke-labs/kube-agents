@@ -4208,6 +4208,58 @@ class TestCollectCluster(unittest.TestCase):
             next(s for s in collect.OBTAINABILITY_CHECKS if s.slug == "no-pdb").impact,
         )
 
+    def test_a_no_pdb_candidate_carries_the_workloads_selector_verbatim(self):
+        """`finish` writes the PodDisruptionBudget from it (SOP §3.3)."""
+        workload = deployment("api")
+        workload["spec"]["selector"] = {
+            "matchLabels": {"app": "api"},
+            "matchExpressions": [{"key": "tier", "operator": "In", "values": ["web"]}],
+        }
+        result, _ = self.collect([workload])
+        by_slug = {c["check"]: c for c in result["candidates"]}
+        self.assertEqual(by_slug["no-pdb"]["pod_selector"], workload["spec"]["selector"])
+        self.assertNotIn("pod_selector", by_slug["no-requests"])
+
+    def test_a_selector_that_reaches_another_controllers_pods_is_not_carried(self):
+        """A `maxUnavailable` budget over pods with no scale subresource behind
+        them permits no evictions, so `finish` must not write one."""
+        api = deployment("api")
+        api["spec"]["selector"] = {"matchLabels": {"app": "api"}}
+        other = deployment("api-canary")
+        other["spec"]["template"]["metadata"] = {"labels": {"app": "api", "track": "canary"}}
+        other["spec"]["replicas"] = 1
+        result, _ = self.collect([api, other])
+        found = next(c for c in result["candidates"] if c["check"] == "no-pdb" and c["object"] == "Deployment/api")
+        self.assertNotIn("pod_selector", found)
+        self.assertEqual(found["namespace_pdbs"], [])
+        # Another scalable workload: the budget would be valid, so the worker decides.
+        self.assertNotIn("pod_selector_withheld", found)
+
+    def test_a_selector_that_reaches_pods_with_no_scale_behind_them_is_not_carried(self):
+        """A DaemonSet's pods, or a CronJob's Jobs': the disruption controller
+        cannot count them, so a `maxUnavailable` budget over them blocks drains."""
+        labels = {"app": "api"}
+        daemon = deployment("agent")
+        daemon["kind"] = "DaemonSet"
+        daemon["spec"]["template"]["metadata"] = {"labels": labels}
+        migration = {
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": {"name": "migrate", "namespace": "default"},
+            "spec": {"schedule": "0 * * * *", "jobTemplate": {"spec": {"template": {"metadata": {"labels": labels}}}}},
+        }
+        for name, other in (("DaemonSet", daemon), ("CronJob", migration)):
+            with self.subTest(name):
+                api = deployment("api")
+                api["spec"]["selector"] = {"matchLabels": labels}
+                api["spec"]["template"]["metadata"] = {"labels": labels}
+                result, _ = self.collect([api, other])
+                found = next(
+                    c for c in result["candidates"] if c["check"] == "no-pdb" and c["object"] == "Deployment/api"
+                )
+                self.assertNotIn("pod_selector", found)
+                self.assertIn(f"{other['kind']}/{other['metadata']['name']}", found["pod_selector_withheld"])
+
     def test_the_collection_command_is_the_same_across_every_check(self):
         result, _ = self.collect([deployment("api")])
         commands = {c["command"] for c in result["commands"]}
@@ -4370,6 +4422,38 @@ class TestCollectFleet(unittest.TestCase):
         self.assertIn("2 cluster(s) collected, 1 other target(s); 3 candidate(s) to report", line)
         self.assertIn("no-pdb: 2; service-selects-nothing: 1", line)
         self.assertIn("clusters[].candidates", line)
+
+    def test_out_writes_the_manifest_to_the_file_and_only_the_summary_to_stdout(self):
+        manifest = {"clusters": [{"name": "p/l/a", "outcome": "collected", "candidates": [{"check": "no-pdb"}]}]}
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "manifest.json"
+            with patch.object(collect, "collect_fleet", return_value=manifest), \
+                    patch("sys.stdout", new_callable=io.StringIO) as out, \
+                    patch("sys.stderr", new_callable=io.StringIO):
+                self.assertEqual(collect.main(["obtainability-audit", "--out", str(path)]), 0)
+            self.assertEqual(json.loads(path.read_text()), manifest)
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["manifest.json"])
+        self.assertEqual(out.getvalue().strip(), collect.summary_line(manifest))
+
+    def test_a_write_that_dies_part_way_leaves_no_file(self):
+        """A collector killed mid-write, or a second run beside the first, must
+        not leave two documents spliced into one at the path."""
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "manifest.json"
+
+            def interrupted(fd):
+                raise KeyboardInterrupt
+
+            with patch.object(collect.os, "fsync", interrupted):
+                with self.assertRaises(KeyboardInterrupt):
+                    collect.write_manifest_atomically(path, '{"clusters": []}')
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+            path.write_text('{"previous": true}')
+            with patch.object(collect.os, "fsync", interrupted):
+                with self.assertRaises(KeyboardInterrupt):
+                    collect.write_manifest_atomically(path, '{"clusters": []}')
+            self.assertEqual(json.loads(path.read_text()), {"previous": True})
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["manifest.json"])
 
     def test_an_empty_fleet_summary_is_the_count_alone(self):
         manifest = {"clusters": [{"name": "p/l/a", "outcome": "collected", "candidates": []}]}
@@ -7549,6 +7633,40 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertIn("cluster-admin-binding", slugs)
         self.assertIn("netpol-missing", slugs)
         self.assertIn("workload-identity-off", slugs)
+
+    def test_only_netpol_missing_is_marked_default_deny(self):
+        """Its fix writes a default-deny policy, which can cut off callers
+        nobody listed; the marker keeps the sweep from opening it unasked.
+        Every check outside `TRIAGE_BY_SLUG` stays unmarked."""
+        privileged_pod = compliance_pod("bad")
+        privileged_pod["spec"]["containers"][0]["securityContext"] = {"privileged": True}
+        result = self.run_with(
+            workload_items=[privileged_pod],
+            netpol_items=[namespace("default")],
+            describe={"workloadIdentityConfig": {}},
+        )
+        marks = {c["check"]: c["needs_triage"] for c in result["candidates"]}
+        self.assertEqual(marks.pop("netpol-missing"), collect.NETPOL_DEFAULT_DENY_TRIAGE)
+        for slug in collect.TRIAGE_BY_SLUG:
+            marks.pop(slug, None)
+        self.assertTrue(marks)
+        self.assertEqual(set(marks.values()), {None})
+
+    def test_the_default_deny_marker_is_one_the_sweep_withholds(self):
+        """The two files carry the string separately; a drift would mark the
+        finding and let the sweep open it anyway."""
+        import audit_report
+
+        self.assertEqual(collect.NETPOL_DEFAULT_DENY_TRIAGE, "default-deny")
+        self.assertIn(collect.NETPOL_DEFAULT_DENY_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
+
+    def test_every_fix_marker_is_one_the_sweep_withholds(self):
+        import audit_report
+
+        for slug, marker in collect.TRIAGE_BY_SLUG.items():
+            with self.subTest(slug=slug):
+                self.assertIn(slug, {spec.slug for spec in collect.OBTAINABILITY_CHECKS + collect.COMPLIANCE_CHECKS})
+                self.assertIn(marker, audit_report.NO_SWEEP_TRIAGE)
 
     def test_a_gate_failure_on_one_source_fails_the_whole_cluster(self):
         def run(argv, **kwargs):

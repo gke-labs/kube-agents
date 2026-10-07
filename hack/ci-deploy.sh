@@ -118,12 +118,12 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 #     so main's window and dashboard would silently miss it), and refuses a
 #     fan-out the bridge cannot be given as its concurrency, before anything
 #     is built;
-#   - step 4 also builds the A2A gateway, auth callout and worker images from
-#     a2a/Dockerfile.* (the pull request's own builds, the same way the four
-#     images above are; the operator would derive these same references from
-#     its own image, and step 5 names them anyway so the deploy's inputs are
-#     explicit) and the Hermes bridge sidecar image, FROM the
-#     platform-agent image of the same build;
+#   - step 4 also builds the A2A gateway, auth callout, worker and console
+#     images from a2a/Dockerfile.* (the pull request's own builds, the same
+#     way the four images above are; the operator would derive these same
+#     references from its own image, and step 5 names them anyway so the
+#     deploy's inputs are explicit) and the Hermes bridge sidecar image, FROM
+#     the platform-agent image of the same build;
 #   - step 5 passes those references to the operator through the chart's
 #     operator.extraEnv, which the operator reads as its image overrides, and
 #     arms the gateway's inject door the same way (A2A_INJECT_BACKEND=true);
@@ -292,6 +292,42 @@ readonly CR_READY_REASON_PROVISION_FAILED="A2AProvisionFailed"
 # its requeue (30s while a provision Job runs), so the status lags the Job by
 # up to one requeue. Polls of MODE_NEXT_POLL_SECONDS.
 readonly MODE_NEXT_STATUS_ATTEMPTS=12
+# The one Degraded the gate after the sidecar patch waits out rather than
+# failing on (#2414): the operator gives the Ready condition this reason for
+# any pod the scheduler marked Unschedulable, and that includes a pod waiting
+# for the node an Autopilot scale-up is adding. The gate tells that case from
+# the rest by the scheduler's own words in the message, which the operator
+# copies in after "cannot be scheduled onto any available node:" -- a count
+# of nodes short of CPU or memory, as in "1 node(s) didn't match
+# PersistentVolume's node affinity, 2 Insufficient cpu, 2 Insufficient
+# memory". One such count is enough, whatever else the message names: a node
+# counted there is one the pod fits but for capacity, so another node like it
+# places the pod. A message with no such count fails on the first read as
+# before: node affinity or selector only, an untolerated taint only, or the
+# RuntimeClass sentence the operator writes instead of the scheduler's when
+# the CR requests one, none of which a scale-up fixes. So do the rarer
+# shortfalls a new node would also fix (Too many pods, Insufficient
+# ephemeral-storage): none of #2414's runs showed one, and widening the match
+# is for when one turns up in a log.
+readonly CR_READY_REASON_POD_UNSCHEDULABLE="PodUnschedulable"
+readonly SCHEDULER_CAPACITY_SHORTFALL_RE='[0-9]+ Insufficient (cpu|memory)'
+# How many more reads, MODE_NEXT_POLL_SECONDS apart, that Degraded gets before
+# the gate fails on it: five minutes, for the scheduler to place the pod. The
+# CR's status does not say when it has: the operator watches no Pods, so an
+# assignment wakes nothing, and the status keeps the scheduler's message
+# until the operator's next pass, which no Pod event starts: in practice the
+# Deployment's status moving once the pod is Ready, or the steady-state
+# requeue (fifteen minutes) once the provision Job is done. So while it
+# forgives that Degraded about an agent pod the gate
+# also reads the agent's pods, and the first one bound to a node ends the
+# wait: the image pulls and the agent's start on the new node are the next
+# gate's to time, on its rollout budget for the same Deployment, not this
+# window's. The three runs in #2414 had the pod assigned within seconds; five
+# minutes leaves room for a scale-up that takes a few minutes rather than one,
+# and is half that rollout budget. Reads that return nothing count against
+# the same window, the first read included, so it also bounds how long the
+# gate tolerates a CR it cannot read.
+readonly MODE_NEXT_UNSCHEDULABLE_ATTEMPTS=60
 readonly A2A_PART_OF_SELECTOR="app.kubernetes.io/part-of=a2a-next"
 readonly A2A_PROVISION_JOB_SELECTOR="kubeagents.x-k8s.io/a2a-component=provision"
 readonly A2A_NATS_POD_SELECTOR="app=${PLATFORM_AGENT_CR_NAME}-a2a-nats"
@@ -306,16 +342,19 @@ readonly MODE_NEXT_ENTRYPOINT_SCAN_LINES=400
 readonly MODE_NEXT_ENTRYPOINT_MATCH_LINES=40
 # The operator's override variables (a2aGatewayImage and a2aWorkerImage in
 # platformagent_a2a_manifests.go, a2aCalloutImage in platformagent_a2a_callout.go,
-# a2aVerifierImage in platformagent_a2a_verifier.go) and the repository names
+# a2aVerifierImage in platformagent_a2a_verifier.go, a2aConsoleImage in
+# platformagent_a2a_console.go) and the repository names
 # step 4 pushes the builds under.
 readonly A2A_GATEWAY_IMAGE_ENV_VAR="A2A_GATEWAY_IMAGE"
 readonly A2A_CALLOUT_IMAGE_ENV_VAR="A2A_CALLOUT_IMAGE"
 readonly A2A_WORKER_IMAGE_ENV_VAR="A2A_WORKER_IMAGE"
 readonly A2A_VERIFIER_IMAGE_ENV_VAR="A2A_VERIFIER_IMAGE"
+readonly A2A_CONSOLE_IMAGE_ENV_VAR="A2A_CONSOLE_IMAGE"
 readonly A2A_GATEWAY_IMAGE_NAME="a2a-gateway"
 readonly A2A_CALLOUT_IMAGE_NAME="a2a-authcallout"
 readonly A2A_WORKER_IMAGE_NAME="a2a-worker"
 readonly A2A_VERIFIER_IMAGE_NAME="a2a-verifier"
+readonly A2A_CONSOLE_IMAGE_NAME="a2a-console"
 # The bridge image goes to the CR as the sidecar's image, not to the operator:
 # the operator renders no bridge, so its images.json entry has no override.
 readonly A2A_BRIDGE_IMAGE_NAME="hermes-bridge"
@@ -384,7 +423,7 @@ A2A_OPERATOR_ENV_ARGS=()
 # not rendered on either path.
 if [ -n "${RC_COMMIT_SHA:-}" ]; then
   # The release pipeline publishes the A2A images beside the others, and the
-  # operator derives the three it renders from the agent image, but this path
+  # operator derives the four it renders from the agent image, but this path
   # still builds no bridge sidecar image and step 6b declares none from
   # GHCR, so a candidate run under next would come up with nobody consuming
   # platform tasks; refuse the pair here rather than forty minutes in.
@@ -916,14 +955,14 @@ else
   # The postsubmit's mode=max cache manifests; CACHE_IMAGE stays the fallback.
   export BUILDCACHE_IMAGE="${BUILDCACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agents/platform-agent:buildcache}"
   export PROXY_BUILDCACHE_IMAGE="${PROXY_BUILDCACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agents/credential-proxy:buildcache}"
-  # Under EVAL_MODE_NEXT=1 the same build also produces the three first-party
+  # Under EVAL_MODE_NEXT=1 the same build also produces the four first-party
   # A2A images and the Hermes bridge sidecar, in its `a2a` and `a2a-bridge`
   # steps; with the
   # substitutions absent that step is a no-op and the build is the four-image
   # one above. Empty otherwise, so the command below is byte-for-byte what it
-  # was. The three references go to the operator through operator.extraEnv
+  # was. The four references go to the operator through operator.extraEnv
   # in step 5: the operator reads its A2A image overrides from its own
-  # environment; without them it would derive the same three references
+  # environment; without them it would derive the same five references
   # from its own image (the operator image is this build's, under the same
   # repository and tag), so the overrides are belt and braces that keep the
   # deploy's inputs explicit and byte-pinned by the tests. The same
@@ -937,8 +976,9 @@ else
     A2A_CALLOUT_URI="${AR_REPO}/${A2A_CALLOUT_IMAGE_NAME}:${TAG}"
     A2A_WORKER_URI="${AR_REPO}/${A2A_WORKER_IMAGE_NAME}:${TAG}"
     A2A_VERIFIER_URI="${AR_REPO}/${A2A_VERIFIER_IMAGE_NAME}:${TAG}"
+    A2A_CONSOLE_URI="${AR_REPO}/${A2A_CONSOLE_IMAGE_NAME}:${TAG}"
     A2A_BRIDGE_URI="${AR_REPO}/${A2A_BRIDGE_IMAGE_NAME}:${TAG}"
-    A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI}"
+    A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI}"
     A2A_OPERATOR_ENV_ARGS=(
       --set-string "operator.extraEnv[0].name=${A2A_GATEWAY_IMAGE_ENV_VAR}"
       --set-string "operator.extraEnv[0].value=${A2A_GATEWAY_URI}"
@@ -952,10 +992,12 @@ else
       # reads as a broken product rather than a missing override.
       --set-string "operator.extraEnv[3].name=${A2A_VERIFIER_IMAGE_ENV_VAR}"
       --set-string "operator.extraEnv[3].value=${A2A_VERIFIER_URI}"
-      --set-string "operator.extraEnv[4].name=${A2A_INJECT_BACKEND_ENV_VAR}"
-      --set-string "operator.extraEnv[4].value=${A2A_INJECT_BACKEND_ON}"
+      --set-string "operator.extraEnv[4].name=${A2A_CONSOLE_IMAGE_ENV_VAR}"
+      --set-string "operator.extraEnv[4].value=${A2A_CONSOLE_URI}"
+      --set-string "operator.extraEnv[5].name=${A2A_INJECT_BACKEND_ENV_VAR}"
+      --set-string "operator.extraEnv[5].value=${A2A_INJECT_BACKEND_ON}"
     )
-    echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout, worker and verifier images and the Hermes bridge sidecar"
+    echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout, worker, verifier and console images and the Hermes bridge sidecar"
   fi
   gcloud builds submit --config="deploy/docker/cloudbuild-ci.yaml" \
     --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}" \
@@ -1259,10 +1301,20 @@ wait_agent_generation_past() {
   echo "Agent Deployment generation ${before} -> ${after} at $((SECONDS - MODE_NEXT_START))s after ${what}"
 }
 
-# The CR's Ready condition as "<reason>: <message>", or nothing when the CR
-# carries none, for the two readers below and the artifact log.
+# The CR's phase, a tab, then its Ready condition as "<reason>: <message>"
+# (nothing for either the CR does not carry), in one read. The operator writes
+# the phase and the condition in one status update, so a reader that needs
+# both takes them from this one read, never from two that can straddle that
+# update and pair a stale phase with a fresh condition.
+cr_phase_and_ready_condition() {
+  kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o jsonpath='{.status.phase}{"\t"}{range .status.conditions[?(@.type=="Ready")]}{.reason}{": "}{.message}{end}' 2>/dev/null || true
+}
+
+# The CR's Ready condition alone, for the reader below that needs only that.
 cr_ready_condition() {
-  kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.reason}{": "}{.message}{end}' 2>/dev/null || true
+  local pair
+  pair="$(cr_phase_and_ready_condition)"
+  printf '%s' "${pair#*$'\t'}"
 }
 
 # Waits for the A2A provisioning Job to reach a terminal condition and stops
@@ -1369,21 +1421,139 @@ wait_provision_job() {
   fi
 }
 
-# Reads the CR's phase and Ready condition after a provisioning Job completed
-# and stops the deploy on a refusal the Job's own conditions did not show:
-# phase Degraded, or Ready carrying the reason a refused provision is given.
-# One read: a Degraded here is a refusal already written, not a lag. Prints
-# the condition either way, so the artifact says what the CR said.
+# Reads the CR's phase and Ready condition, in one read, after a provisioning
+# Job completed and stops the deploy on a refusal the Job's own conditions did
+# not show: phase Degraded, or Ready carrying the reason a refused provision is
+# given.
+# A refusal is already written when the Job is done, not a lag, so it fails
+# on the first read that answers, and so does every other Degraded but one: a
+# pod waiting for CPU or memory (CR_READY_REASON_POD_UNSCHEDULABLE with a
+# count matching SCHEDULER_CAPACITY_SHORTFALL_RE), which an Autopilot scale-up
+# clears on its own (#2414). That one is re-read up to
+# MODE_NEXT_UNSCHEDULABLE_ATTEMPTS times, with a line per read, and fails as
+# any other Degraded does if it is still there at the end or turns into
+# something else. When the condition is about an agent pod, every read that
+# returns it, the first and the last included, also reads the agent's pods,
+# in one read, and a live pod bound to a node (the one the condition names,
+# while it is listed) ends the gate as a hand-off to the
+# agent Deployment's rollout gate that follows it, because the condition can
+# outlive the wait it describes (the window's constant says why). A read
+# that returns nothing, the first read included, is one more re-read against
+# that window, never a pass: the read swallows a failed GET, and the CR
+# carries a status once its provisioning Job has run, so nothing read is no
+# answer. A window that ends with no read answering
+# fails as a CR that could not be read. Prints the condition either way, so
+# the artifact says what the CR said.
 gate_cr_not_degraded() {
-  local what="$1" phase condition
-  phase="$(kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-  condition="$(cr_ready_condition)"
-  if [ "${phase}" = "${CR_PHASE_DEGRADED}" ] || [[ "${condition}" == "${CR_READY_REASON_PROVISION_FAILED}: "* ]]; then
+  local what="$1" pair phase="" condition="" rereads=0 answered="" capacity="" unanswered="" gate_start=$SECONDS
+  local agent_pods pod_line pod_node="" pod_name="" named_pod line_name line_node line_phase line_deleted rest fallback_name fallback_node named_listed
+  while :; do
+    # One read, so the phase and the condition are one object version's.
+    pair="$(cr_phase_and_ready_condition)"
+    if [ -z "${pair//$'\t'/}" ]; then
+      # Nothing read: a GET the API dropped (the read swallows the failure)
+      # or a status read back empty. One more poll against the window, never
+      # a pass. phase and condition keep the last answering read's, so a
+      # window that ends here fails on it, or, with none, as unread.
+      if [ "${rereads}" -lt "${MODE_NEXT_UNSCHEDULABLE_ATTEMPTS}" ]; then
+        rereads=$((rereads + 1))
+        if [ -n "${answered}" ]; then
+          echo "the read of ${PLATFORM_AGENT_CR_NAME} after ${what} returned nothing, $((SECONDS - gate_start))s in; re-read ${rereads}/${MODE_NEXT_UNSCHEDULABLE_ATTEMPTS} in ${MODE_NEXT_POLL_SECONDS}s (last Ready condition: ${condition})"
+        elif [ "${rereads}" -eq 1 ]; then
+          echo "the first read of ${PLATFORM_AGENT_CR_NAME} after ${what} returned nothing; re-read ${rereads}/${MODE_NEXT_UNSCHEDULABLE_ATTEMPTS} in ${MODE_NEXT_POLL_SECONDS}s (no read has answered yet)"
+        else
+          echo "the read of ${PLATFORM_AGENT_CR_NAME} after ${what} returned nothing again, $((SECONDS - gate_start))s in; re-read ${rereads}/${MODE_NEXT_UNSCHEDULABLE_ATTEMPTS} in ${MODE_NEXT_POLL_SECONDS}s (no read has answered yet)"
+        fi
+        sleep "${MODE_NEXT_POLL_SECONDS}"
+        continue
+      fi
+      if [ -z "${answered}" ]; then
+        echo "ERROR: could not read ${PLATFORM_AGENT_CR_NAME} after ${what}: all $((rereads + 1)) reads in $((SECONDS - gate_start))s returned nothing, so there is no phase or Ready condition to judge"
+        echo "--- provisioning Job pod logs ---"
+        kubectl logs -n "${NAMESPACE}" -l "${A2A_PROVISION_JOB_SELECTOR}" --tail="${MODE_NEXT_DIAG_LOG_LINES}" || true
+        dump_mode_next_state
+        exit 1
+      fi
+      unanswered="; the last read returned nothing, so this is the last one that answered"
+    else
+      answered="true"
+      phase="${pair%%$'\t'*}"
+      condition="${pair#*$'\t'}"
+      if [ "${phase}" != "${CR_PHASE_DEGRADED}" ] && [[ "${condition}" != "${CR_READY_REASON_PROVISION_FAILED}: "* ]]; then
+        break
+      fi
+      if [ "${phase}" = "${CR_PHASE_DEGRADED}" ] && [[ "${condition}" == "${CR_READY_REASON_POD_UNSCHEDULABLE}: Pod ${AGENT_DEPLOYMENT_NAME}-"* ]] &&
+        [[ "${condition}" =~ ${SCHEDULER_CAPACITY_SHORTFALL_RE} ]]; then
+        # The condition may be stale: the operator watches no Pods, so the
+        # scheduler binding the agent pod wakes nothing, and the status keeps
+        # the old message until the operator's next pass. So the pods
+        # themselves, by the label the operator lists the agent's pods by, in
+        # one read a line per pod: name, node, phase, deletion timestamp.
+        # Like the operator's scan, a pod being deleted is skipped, and so is
+        # one that is Failed or Succeeded (an evicted or admission-rejected
+        # pod keeps its node until pod GC, and Recreate does not wait for
+        # it). The pod the condition names ("Pod <name> cannot be
+        # scheduled..."), while it is listed and live, decides alone; once it
+        # is not, the first live pod bound to a node does. Bound is the end of
+        # what this gate forgives; the agent Deployment's rollout gate, which
+        # runs next, decides the rest. Nothing listed, no live pod bound, or a
+        # dropped read (the read swallows the failure) is one more poll like
+        # any other here.
+        named_pod="${condition#"${CR_READY_REASON_POD_UNSCHEDULABLE}: Pod "}"
+        named_pod="${named_pod%% *}"
+        pod_name="" pod_node="" fallback_name="" fallback_node="" named_listed=""
+        agent_pods="$(kubectl get pods -n "${NAMESPACE}" -l "app=${AGENT_DEPLOYMENT_NAME}" -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.nodeName}{"\t"}{.status.phase}{"\t"}{.metadata.deletionTimestamp}{"\n"}{end}' 2>/dev/null || true)"
+        while IFS= read -r pod_line; do
+          [[ "${pod_line}" == *$'\t'*$'\t'*$'\t'* ]] || continue
+          line_name="${pod_line%%$'\t'*}"
+          rest="${pod_line#*$'\t'}"
+          line_node="${rest%%$'\t'*}"
+          rest="${rest#*$'\t'}"
+          line_phase="${rest%%$'\t'*}"
+          line_deleted="${rest#*$'\t'}"
+          [ -n "${line_deleted}" ] && continue
+          case "${line_phase}" in Failed | Succeeded) continue ;; esac
+          if [ "${line_name}" = "${named_pod}" ]; then
+            named_listed="true" pod_name="${line_name}" pod_node="${line_node}"
+            break
+          fi
+          if [ -n "${line_node}" ] && [ -z "${fallback_node}" ]; then
+            fallback_name="${line_name}" fallback_node="${line_node}"
+          fi
+        done <<<"${agent_pods}"
+        if [ -z "${named_listed}" ]; then
+          pod_name="${fallback_name}" pod_node="${fallback_node}"
+        fi
+        [ -n "${pod_node}" ] && break
+      fi
+      if [ "${phase}" = "${CR_PHASE_DEGRADED}" ] && [ "${rereads}" -lt "${MODE_NEXT_UNSCHEDULABLE_ATTEMPTS}" ] &&
+        [[ "${condition}" == "${CR_READY_REASON_POD_UNSCHEDULABLE}: "* ]] && [[ "${condition}" =~ ${SCHEDULER_CAPACITY_SHORTFALL_RE} ]]; then
+        rereads=$((rereads + 1))
+        capacity="true"
+        echo "${PLATFORM_AGENT_CR_NAME} is ${phase} after ${what} on a pod waiting for CPU or memory, $((SECONDS - gate_start))s in; re-read ${rereads}/${MODE_NEXT_UNSCHEDULABLE_ATTEMPTS} in ${MODE_NEXT_POLL_SECONDS}s (Ready condition: ${condition})"
+        sleep "${MODE_NEXT_POLL_SECONDS}"
+        continue
+      fi
+    fi
+    if [ -n "${capacity}" ]; then
+      echo "the wait for capacity ended after ${rereads} re-reads, $((SECONDS - gate_start))s${unanswered}"
+    elif [ "${rereads}" -gt 0 ]; then
+      echo "${PLATFORM_AGENT_CR_NAME} answered after ${rereads} reads that returned nothing, $((SECONDS - gate_start))s"
+    fi
     echo "ERROR: ${PLATFORM_AGENT_CR_NAME} is ${phase:-unphased} after ${what}; Ready condition: ${condition:-none}"
     echo "--- provisioning Job pod logs ---"
     kubectl logs -n "${NAMESPACE}" -l "${A2A_PROVISION_JOB_SELECTOR}" --tail="${MODE_NEXT_DIAG_LOG_LINES}" || true
     dump_mode_next_state
     exit 1
+  done
+  if [ -n "${pod_node}" ]; then
+    echo "✓ the wait for capacity handed off after ${rereads} re-reads, $((SECONDS - gate_start))s: the agent pod was scheduled on ${pod_node} (${pod_name}); the rollout gate decides from here (${PLATFORM_AGENT_CR_NAME} still reads ${phase}; Ready condition: ${condition})"
+    return 0
+  fi
+  if [ -n "${capacity}" ]; then
+    echo "✓ the wait for capacity cleared after ${rereads} re-reads, $((SECONDS - gate_start))s"
+  elif [ "${rereads}" -gt 0 ]; then
+    echo "✓ ${PLATFORM_AGENT_CR_NAME} answered after ${rereads} reads that returned nothing, $((SECONDS - gate_start))s"
   fi
   echo "✓ ${PLATFORM_AGENT_CR_NAME} is ${phase:-unphased} after ${what} (Ready condition: ${condition:-none})"
 }
@@ -1534,7 +1704,9 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   # for, and the CR read after it: a refusal here used to park the CR
   # Degraded over a working bus while this step went on to a green bridge
   # line (#2077). The first patch's maxSessions was sized so this budget
-  # fits; this is the guard for a budget that moves.
+  # fits; this is the guard for a budget that moves. The same patch rolls
+  # the agent pod, which can wait a minute for a node on Autopilot; the gate
+  # waits that one Degraded out and no other (#2414).
   wait_provision_job "the sidecar patch" "${FIRST_PROVISION_JOB}" "${SIDECAR_CR_GENERATION}"
   gate_cr_not_degraded "the sidecar patch"
   gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"

@@ -227,7 +227,7 @@ says what the check _is_ and what counts as a violation, so read the whole file 
 
 `workspace` is where your manifests go. **Every `remediation.path` is resolved against it**, so a
 manifest written anywhere else is a file the harness will never find — the finding degrades to a
-manual one and no pull request opens. `start` scrubs that directory before handing it to you;
+manual one, or, for a fix the sweep would open, `finish` refuses until it is there. `start` scrubs that directory before handing it to you;
 `finish` does not, which is what lets the files you write in between survive.
 
 `mode` is `content` or `directory`, and it changes one thing you can see: in `content` mode the
@@ -255,7 +255,7 @@ and the issue has no readable block (`start` says so on stderr).
 
 `context_repos` names the repositories registered for **declared intent**: the `context_repos` key
 of `$GITOPS_STATE_CONFIGMAP`, added by an administrator by hand, as `owner/name` slugs. A stream
-whose SOP has a declared-intent step (`obtainability-audit` §4a, `compliance-audit` §3a, `security-patch-orchestrator` §4a) searches them before it
+whose SOP has a declared-intent step (`obtainability-audit` §4a, `compliance-audit` §3a, `security-patch-orchestrator` §4a, `fleet-wide-cost-analysis` §3a) searches them before it
 reports a posture as a finding. They are read and nothing else: the key is separate from
 `managed_repos`, the harness never merges the two, so the broker's push gate, the repository
 resolver and the sweep never see them. The list is empty when nothing is registered or the key
@@ -363,6 +363,13 @@ a branch it does not have falls back to the base, which is what a first round wa
 
 All three exit 2 in directory mode, where the clone already holds the file.
 
+`audit_report.py draft --audit <audit-id> --manifest-file <manifest> [--out <path>]` starts the
+findings document from the collector's manifest: `scope.clusters` with each collected target's
+`checks_run` copied from the commands it ran, `scope.skipped` for every target it could not read, and
+one finding per candidate carrying its evidence, impact and severity. It leaves each finding's
+`recommendation` empty and its `remediation` `manual`, because those are the judgement the collector
+cannot make: write them, and `finish` has nothing else to reject.
+
 ### Step 3 — `finish`
 
 ```bash
@@ -370,7 +377,8 @@ All three exit 2 in directory mode, where the clone already holds the file.
   --audit <audit-id> \
   --findings-file <findings_path> \
   [--repo "<owner>/<repo>"] \
-  [--manifest-file <path> | --no-collector-manifest "<why>"]
+  [--manifest-file <path> | --no-collector-manifest "<why>"] \
+  [--decline-fix <finding-id> "<why>" ...]
 ```
 
 The last pair belongs to a stream whose SOP runs a collector (the repository's collector-manifest
@@ -398,7 +406,8 @@ slug anywhere else.
 The script validates the document, reconciles every finding against the pull requests already open
 for this stream, rewrites (or opens) the ledger issue, comments the delta, opens pull requests for
 the fixes that qualify, and closes the ones whose findings have stopped reproducing. It prints one
-JSON line — `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`,
+JSON line — `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_still_open` (remediation
+pull requests already open on findings this run still carries; empty on a clean run), `prs_closed`,
 `partial`, `coverage_gaps`, `silent_ok`, `declared`, the number of postures a repository
 declaration kept off the ledger (it never decides silence), `postures_withheld`, the ids of the
 posture findings `finish` held back because the document recorded no complete declared-intent
@@ -409,13 +418,13 @@ findings a clean run was refused its close over (empty on every other outcome; s
 `unpublished_candidates`, `wholly_unpublished_checks` and `uncorroborated_findings` — which are
 absent on every other run:
 
-- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
+- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_still_open":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
   — the stream had no open ledger.
-- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
+- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_still_open":["…"],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
   — the existing ledger was rewritten.
-- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_still_open":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
   — zero findings; the ledger closed as completed and its open fixes closed with it.
-- `{"status":"HELD","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":["cluster-admin-binding.acme-prod-us-east1-prod-us-east._.clusterrolebinding-debug-binding"]}`
+- `{"status":"HELD","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_still_open":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":["cluster-admin-binding.acme-prod-us-east1-prod-us-east._.clusterrolebinding-debug-binding"]}`
   — zero findings, but the ledger was **not** closed, for one of two reasons. Either it carried
   findings whose checks this run's own `checks_run` says ran again, and the document neither reports
   nor explains them (their ids are in `unaccounted`); or `unaccounted` is empty and the issue's
@@ -425,7 +434,9 @@ absent on every other run:
 
 Add `--dry-run` to validate and print the rendered ledger body — and every PR body it _would_ open —
 to stdout with **zero** git or forge side effects. It applies the same grouping and the same
-degradation as the real run, so the branch names it names are the branch names it would create. It
+degradation as the real run, so the branch names it names are the branch names it would create,
+except a PodDisruptionBudget `finish` would write for a declared `no-pdb` finding, which only the
+real run plans. It
 resolves every `remediation.path` against the same `workspace` directory the real run uses, not against
 the directory you happen to be standing in, so "the manifest is missing" is a finding of the dry run
 and not a surprise at publish time. Use it whenever you are unsure your document is well formed.
@@ -437,8 +448,10 @@ already published stands, and the re-run finishes the rest. What reaches exit 2:
 document failed a field rule, the file named by `--findings-file` is missing or is not valid JSON,
 `--audit` is not one of the registered ids above, the document contradicts the collector manifest
 named by `--manifest-file`, that manifest is missing or malformed, `--manifest-file` was given an
-empty path, `--no-collector-manifest` was given a blank reason, or a collector stream was given
-neither. A manifest that finished before
+empty path, `--no-collector-manifest` was given a blank reason, a collector stream was given
+neither, a `--decline-fix` named a fix the refusal did not list, or, on a run `start` opened, a fix
+the sweep would open is neither written nor declined (see
+"Write every `manifest` remediation file" below). A manifest that finished before
 this run's `start` opened reaches exit 2 too: the collector writes to a fixed path that is not
 scrubbed between runs, so a run whose collector never ran finds the previous one's manifest sitting
 there, and cross-checking against a week-old reading of the fleet is worse than cross-checking
@@ -472,7 +485,7 @@ A check the cluster's shape rules out is not a gap. Declaring it in that cluster
 `checks_not_applicable` (below) takes it out of the denominator, so a cluster that ran everything
 that _can_ apply to it is a fully covered cluster. Without that, a fleet of Autopilot clusters is
 permanently partial: the ledger never closes, `resolved` is pinned at `0`, and no stale remediation
-pull request is ever cleaned up.
+pull request is ever cleaned up, the shield's close (SOP 2.7) aside.
 
 It does not mean "the description was truncated." A ledger too long for GitHub's body limit says so
 in its own body and still carries true totals in its title; the audit saw everything, so nothing
@@ -483,7 +496,7 @@ A gap changes what the run is _allowed to conclude_, because a finding's absence
 cluster is not evidence that it was fixed. Over a partial run the harness:
 
 - reports `resolved: 0` and posts no "resolved" delta, rather than announcing fixes it cannot see;
-- closes **no** remediation pull request as stale, so a fix survives to the next complete run;
+- closes **no** remediation pull request as stale, so a fix survives to the next complete run, except the shield's close (SOP 2.7), which rests on the declaration rather than on this run's reading;
 - does **not** close the ledger, even with zero findings — the issue stays open and gains a comment
   naming the gaps. `status` is `CLEAN` where the run accounted for every finding the previous
   ledger held, and `HELD` where it did not, which is a separate refusal that a gap neither causes
@@ -602,7 +615,7 @@ and say which clusters were not covered. See [The clean run](#the-clean-run) for
 (The `declared` entry and the `declared_intent_searched` list are illustrative and cross streams: a
 real compliance document would be rejected for the `no-hpa` entry, a check outside its roster. `declared[].check` is validated
 against the stream's `declarable` set in `AUDITS` — its posture checks, a subset of the roster — and
-`obtainability-audit`, `compliance-audit` and `security-patch-orchestrator` have one today, because their SOPs have a step that writes the list. A
+`obtainability-audit`, `compliance-audit`, `security-patch-orchestrator` and `fleet-wide-cost-analysis` have one today, because their SOPs have a step that writes the list. A
 non-empty `declared` or `declared_intent_searched` on any other stream exits 2; `[]` validates
 everywhere.)
 
@@ -822,7 +835,7 @@ What the shape enforces:
   the posture returns as a finding on the next run. A declaration the worker did not read is not
   one it may cite.
 - **It justifies posture, never a fault.** Which checks may move here is the stream's `declarable`
-  set in `AUDITS`, four for obtainability, two for compliance and six for the patch stream, and the validator rejects any other check with exit 2. A
+  set in `AUDITS`, four for obtainability, two for compliance, six for the patch stream and eight for the waste audit, and the validator rejects any other check with exit 2. A
   drain-blocking budget declared in a repository is a declared bug and stays a finding, and a
   document that lists it under `declared` publishes nothing.
 
@@ -859,7 +872,7 @@ What `finish` does with it:
   faults publish, the allow-all `NetworkPolicy/<name>` shape of `netpol-missing` among them, since its
   object tells it apart; `declared[]` entries publish.
   `partial` stays `bool(coverage_gaps)`, so the ledger does not close, `resolved` is `0`, no stale
-  pull request is retired, and the withheld ids enter no delta block and no remediation pull
+  pull request is retired (except the shield's close (SOP 2.7), which rests on the declaration rather than on this run's reading), and the withheld ids enter no delta block and no remediation pull
   request. The ledger names the withheld postures under _Declared intent not searched_ below the
   Scope table, the clean comment lists them, and the JSON line carries their ids as
   `postures_withheld`.
@@ -926,8 +939,10 @@ exist in the code — `resolved` and `resolved-merged` — but neither is ever r
 resolution is announced in the delta comment, by id and title recovered from the previous run's stored report, and
 the finding's open pull request is closed as stale. The compliance stream has a third close: a pull
 request whose remaining findings are all shielded (SOP 2.7, a declared workload sharing the `default`
-ServiceAccount) is closed with that reason, and those findings stay on the ledger as `manual` rather
-than becoming promotable again. A resolution whose fix had already **merged** is
+ServiceAccount) is closed with that reason, on a partial run too when a note `start` filed covers the
+namespace, since the reason is the declaration and not this run's reading, and those findings stay
+on the ledger, not proposed again while
+the declaration stands, rather than becoming promotable. A resolution whose fix had already **merged** is
 the ordinary, expected ending, so nothing extra is closed and nothing extra is said.
 
 Three of the five are easy to misread:
@@ -970,10 +985,17 @@ the record, and `finish` reports the count as `declared`.
 A pull request is opened for a finding only when its remediation is a `manifest` — there is nothing
 to put in a diff otherwise. Three paths lead there:
 
-- **Auto-promotion.** A finding that is `critical`, is a `manifest`, has no live pull request on
-  its branch — and, on a run that passed `--manifest-file`, is neither uncorroborated nor
-  triage-marked by the collector — is promoted automatically by `finish` — **at most five per run**. The surplus is named
-  in the ledger as awaiting `/remediate`, so nothing is silently dropped. "Live" excludes a pull
+- **Auto-promotion.** A finding graded `critical` — or `major` on one of the checks in
+  `MAJOR_SWEEP_CHECKS` (`no-pdb`, `unbound-sa-automount`, `ccc-no-ondemand-floor`) where the
+  collector's candidate is at least `major` — that is a `manifest`, has no live pull request on its branch — and, on a run that passed
+  `--manifest-file`, is neither uncorroborated nor triage-marked by the collector — is promoted
+  automatically by `finish` — **at most five per run**. Every other `major` finding is held to the `critical` floor:
+  a SOP's grade says how bad the finding is, not whether its fix is safe to open unasked. The collector marks a fix that scales a controller to zero, writes a
+  default-deny NetworkPolicy, resizes a `Guaranteed` pod, needs a new ComputeClass, owes its
+  `major` to the Autopilot bump, turns off a namespace's default ServiceAccount token, rewrites
+  or deletes a Service, or enforces spreading; the ledger names each with its marker and reason.
+  The surplus is named in the ledger as awaiting `/remediate`, and so is every manifest finding
+  the floor passed over, as below the floor, so nothing is silently dropped. "Live" excludes a pull
   request the harness itself closed as stale (that one is re-openable) and includes one a human
   closed or merged (those are not).
 - **`/remediate <finding-id>`**, or `/remediate all`, commented on the ledger by someone with write
@@ -1053,7 +1075,7 @@ per id:
 
 **It opens exactly what you name, and nothing else.** The auto-promotion sweep does not ride along:
 one `--finding` produces one pull request (or one, shared, for the group that path belongs to), never
-five more for critical findings the requester never mentioned and cannot tell apart from the one they
+five more for findings the requester never mentioned and cannot tell apart from the one they
 did. Auto-promotion happens in `finish`, where the whole fleet is being reported on anyway.
 
 It prints one JSON line — `status`, `prs_opened`, `already_open`, `superseded`, and `refused`:
@@ -1159,7 +1181,7 @@ every binding, `debug-binding` included — and the document neither reports the
 carries a `resolved_because` entry for it, nor lists it under `declared`, the run either saw it gone
 or left it out, and from the document the two are the same absence. The ledger stays open and gets
 a comment naming each such finding and the check that ran (plus any `resolved_because` reasons and
-declared postures the document does carry), no remediation pull request is closed, and `finish` returns
+declared postures the document does carry), no remediation pull request is closed (except the shield's close (SOP 2.7), which rests on the declaration rather than on this run's reading), and `finish` returns
 `status: "HELD"` with `resolved: 0`, `silent_ok: false` and the ids in `unaccounted`. Report it as
 you would a partial run — the ledger URL and the held ids — and on the next run either report the
 finding or, if you re-ran its check and saw the object gone, say so in `resolved_because`. On a
@@ -1193,7 +1215,9 @@ ledger URL never reached the operator who had asked for it.
 Two rules follow, and they are the whole rule:
 
 - On a **scheduled** run, `silent_ok: true` → the final response is exactly `[SILENT]`. Otherwise
-  report, and every report carries `issue_url` in full.
+  report, and every report carries `issue_url` in full, with every URL in `prs_opened` and
+  `prs_still_open`: a fix already waiting for review answers "was a fix proposed?" as much as one
+  this run opened.
 - **An on-demand run is never silent.** `silent_ok` is the _scheduled_ verdict — it answers "would a
   channel want this?", and it cannot know a person asked. If someone dispatched this job, from a
   kanban card or straight from chat, they are waiting on the answer and
@@ -1226,7 +1250,7 @@ after the close lands, so that a record older than the issue is never trusted; a
 after either delete leaves the run after it one of these. A held-open run only comments, so a failed
 store write there keeps the record, which still describes the body. It holds nothing it
 cannot name: the body is rewritten from this document, and a findings run leaves the next run a
-trusted record. A clean run never closes: the ledger stays open with a coverage gap saying the store
+trusted record. A clean run never closes the ledger (the shield's close of a shared-account pull request aside): the ledger stays open with a coverage gap saying the store
 had no trusted record, `partial: true` and `silent_ok: false`, and it stays open run after run until a
 findings run rewrites the body or a human who has checked the findings closes the issue. Say so in
 your report: the gap names both ways out only when the collector flags nothing, and otherwise says
@@ -1266,10 +1290,29 @@ lost rather than that the run did not see the whole fleet, unless a coverage gap
 - **Never hand-write a body, title, commit message, or timestamp.** They are generated so that the
   diff between two runs is meaningful.
 - **Write every `manifest` remediation file before calling `finish`**, under the `workspace`
-  directory. A path that is not on disk does not fail the run — that one finding degrades to
-  `manual`, keeps its evidence and recommendation, and says in the ledger that the fix was named but
-  not written. The report still publishes. Do not rely on this: a degraded finding is a fix a human
-  now has to apply by hand.
+  directory. For a finding the sweep would open, `finish` exits 2 listing each
+  one whose file is missing, at the path it named, and each `manual` one the collector clears for
+  the `major` sweep whose candidate carries a `declaration`, at the declared file. An edit to the object goes in that file; a new object, such
+  as a PodDisruptionBudget, goes in a new file in its directory, never over it. Write them, set
+  `kind: manifest` and `path`, and run `finish` again. A declared `no-pdb` finding is the exception:
+  `finish` writes its PodDisruptionBudget from the collector's `pod_selector` if you did not, and a
+  `--decline-fix` for it is ignored unless its reason carries the URL (`https://…/pull/<n>`) of the
+  pull request already carrying it:
+  leave it `manual`, and never name its declaration's file. One
+  whose candidate carries `pod_selector_withheld` (its selector also reaches a DaemonSet's, Job's or
+  CronJob's pods) is neither written nor refused: that budget would permit no evictions. A finding the SOP itself makes `manual`, or
+  one a pull request already carries, stays `manual`: pass `--decline-fix <id> "<why>"` and the
+  reason is published on its ledger row. Every `finish` refuses until each listed fix is written or
+  declined, so re-running it unchanged only refuses again; a `--dry-run` does not refuse. A declined
+  fix, like a missing file on a `finish` with no run record, degrades to `manual`, keeps its
+  evidence and recommendation, and says so in the ledger. The report still publishes. Do not rely
+  on this: a declined or degraded finding is a fix a human now has to apply by hand.
+- **Never publish a `gcloud` fix against a field a Config Connector declaration holds.** Write the
+  declaration's file as a `manifest` instead. Where `finish` finds a `ContainerCluster` or
+  `ContainerNodePool` whose `spec` carries the field the command's flag writes, in the GitOps repo
+  (its clone, or through the broker in content mode) or in a context repo `start` still has checked
+  out, it degrades the finding to `manual`, naming the file above the fenced command — because the
+  command would be reverted on the next reconcile. A content-mode `--dry-run` does not preview it.
 - **Never report a cluster you could not read as clean.** Put it in `scope.skipped`, or name what
   did not run in that cluster's `limitations`. Both make the run `partial`, which is the mechanism
   that stops the harness from closing fixes and retiring the ledger on evidence it never gathered.

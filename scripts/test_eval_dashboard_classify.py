@@ -392,7 +392,8 @@ class StormAndSetupTest(unittest.TestCase):
         self.assertTrue(classify.is_setup_death(dict(legacy, duration_s=120)))
 
     def test_a_zero_task_green_is_a_revalidated_push(self):
-        # hack/ci-eval-pr.sh step 0: inert paths changed, the earlier green stands.
+        # hack/ci-revalidate.sh, step 0: the head already passed, or only inert
+        # paths changed since the branch's last green, and that green stands.
         verdict = classify_run(run(1, 913, T0, minutes=4, result="SUCCESS"), [])
         self.assertEqual((verdict["verdict"], verdict["headline"]), ("green", "Green without running the cases."))
 

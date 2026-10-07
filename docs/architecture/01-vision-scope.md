@@ -17,8 +17,8 @@ Kubernetes operations** — the long-term north star is that humans express _int
 carry out fleet management, tenancy, and troubleshooting, so that direct use of `kubectl`,
 `gcloud`, and the cloud console becomes the exception rather than the rule.
 
-It serves **three layered audiences**, mapped onto the project → cluster → namespace containment
-hierarchy: **platform teams** who own a project, **cluster administrators** who own a cluster, and
+It serves **three layered audiences**, mapped onto the scope → cluster → namespace containment
+hierarchy: **platform teams** who own a scope (one project by default), **cluster administrators** who own a cluster, and
 **developer teams** who operate within a namespace. **SRE is not a fourth agent** — it is a class
 of critical user journeys (reliability, incident response, capacity, observability) that spans all
 three personas, segmented by each persona's scope (see §3). The system is architected to be
@@ -68,13 +68,13 @@ assume more of the presentation layer as trust, safety, and coverage grow.
 ## 3. Who it's for (tri-layered audiences & agents)
 
 The audience model is three layers, each served by a dedicated agent persona whose scope maps onto
-a level of the Kubernetes containment hierarchy (project → cluster → namespace):
+a level of the containment hierarchy (scope → cluster → namespace, the scope being one or more projects):
 
-| Layer                | Agent persona            | Cardinality     | User                   | Scope of action                                                                                                                                            |
-| -------------------- | ------------------------ | --------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Project / fleet**  | **Platform Agent**       | 1 per project   | Platform teams         | Fleet lifecycle, cluster provisioning, cross-cluster governance, global RBAC & policy, cost/capacity, compliance audits.                                   |
-| **Cluster**          | **Cluster Admin Agent**  | 1 per cluster   | Cluster administrators | Cluster-level operations: node pools, cluster add-ons, namespace/tenant provisioning within the cluster, cluster-scoped policy and quotas.                 |
-| **Namespace / team** | **Developer Team Agent** | 1 per namespace | Developer teams        | Self-service within a single namespace: workload onboarding, scaling, troubleshooting, observability — constrained by the boundaries the layers above set. |
+| Layer                | Agent persona            | Cardinality                                         | User                   | Scope of action                                                                                                                                            |
+| -------------------- | ------------------------ | --------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Scope / fleet**    | **Platform Agent**       | 1 per install, over a scope of one or more projects | Platform teams         | Fleet lifecycle, cluster provisioning, cross-cluster governance, global RBAC & policy, cost/capacity, compliance audits.                                   |
+| **Cluster**          | **Cluster Admin Agent**  | 1 per cluster                                       | Cluster administrators | Cluster-level operations: node pools, cluster add-ons, namespace/tenant provisioning within the cluster, cluster-scoped policy and quotas.                 |
+| **Namespace / team** | **Developer Team Agent** | 1 per namespace                                     | Developer teams        | Self-service within a single namespace: workload onboarding, scaling, troubleshooting, observability — constrained by the boundaries the layers above set. |
 
 **SRE is a cross-cutting concern, not a persona.** Reliability work — incident response, capacity
 planning, observability, rollout safety — appears as critical user journeys at every layer, scoped
@@ -85,7 +85,7 @@ The same SRE CUJ is served by whichever persona owns the scope it applies to.
 
 The three layers are related by **strict containment**, mirroring their resource scope:
 
-- The **Platform Agent** operates at the project level and defines/oversees the clusters within it.
+- The **Platform Agent** operates over its declared scope — one project by default, otherwise the projects `spec.scope` resolves to — and defines/oversees the clusters within it.
 - The **Cluster Admin Agent** operates within one cluster and defines/oversees the namespaces
   within it — bounded by project-level policy from the Platform Agent.
 - The **Developer Team Agent** operates within one namespace and cannot cross it — bounded by the
@@ -118,7 +118,7 @@ Portability is a design constraint, not a current feature. See the delta and its
 
 - Establish intent-driven, agent-mediated operations as the primary interface to a K8s fleet.
 - Serve platform, cluster-admin, and developer-team users as three distinct, layered personas
-  (1 per project / 1 per cluster / 1 per namespace) with enforced containment boundaries.
+  (1 per install over a scope of one or more projects / 1 per cluster / 1 per namespace) with enforced containment boundaries.
 - Keep all infrastructure mutation declarative, reviewable, and auditable.
 - Make proactive detection and remediation of fleet drift a first-class behavior.
 - Keep core concepts cloud-agnostic even while GKE is the first supported target.

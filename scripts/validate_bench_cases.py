@@ -180,6 +180,15 @@ FIXTURE_NOT_READY = {
         "b-0022b); parked for the same reason as b-0011-gitops; run it locally "
         "with TASK=b-0022b bench/hack/run-gitops-pilot.sh"
     ),
+    "b-0022b-gitops-pinned-base": (
+        "#1307: needs a leaderboard GitOps repository and its credentials in "
+        "the pool projects, as b-0011-gitops does, and also an install the case "
+        "may change: it sets the PlatformAgent's "
+        "spec.integration.repositories[].baseBranch (#1970) on the agent host "
+        "for the run, which a shared CI install cannot allow. The entry stays "
+        "until both exist. Run it locally with AGENT_STATE_RESET=true "
+        "CASE=b-0022b-gitops-pinned-base bench/hack/run-gitops-pilot.sh"
+    ),
     "scope-second-project-denied": (
         "#1865: needs a second GCP project per pool project, declared in the "
         "harness install's spec.scope.projects, whose listing the agent's service "
@@ -197,6 +206,11 @@ FIXTURE_NOT_READY = {
         "project's GitOps repository; the dev project carries it, the pool does "
         "not, so the case fails with the branch absent, which is broken rather "
         "than red"
+    ),
+    "obtainability-major-pdb-auto-pr": (
+        "#2228: needs checkout-gateway declared under clusters/seeded-a/ in "
+        "each pool project's *-infra repository, so 3.3's fix is a manifest "
+        "rather than manual"
     ),
     "cluster-agent-stalled-controller-diagnosis": (
         "#1873: needs the stalled-controller role applied to every pool "
@@ -350,13 +364,17 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     "worker_commands": ("required_patterns", "forbidden_patterns"),
     "worker_agents": ("required_agents",),
     "replay_card": ("status_in", "status_not_in", "comment_phrases", "decoy_status_in"),
-    # No field: "the gateway would post nothing" is the assertion.
+    # No assertion field: "the gateway would post nothing" is the assertion; `reply` only picks
+    # which reply is graded.
     "reply_is_silent": (),
     # This repository, agent-disk-reading: the discovery sweep a cron job filed.
     "bootstrap_fanout": ("require",),
     # This repository, sandbox-reading: the findings the onboarding
     # prioritization stage extracted.
     "bootstrap_findings": ("expected_findings",),
+    # This repository, agent-disk- and sandbox-reading: the sweep's hand-off to
+    # the prioritization stage.
+    "bootstrap_handoff": ("require",),
     # No field: whether the delivery job claimed and archived the report is
     # the whole assertion.
     "bootstrap_report_read": (),

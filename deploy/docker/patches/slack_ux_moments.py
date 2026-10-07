@@ -30,7 +30,8 @@ The wake still runs, since it is how the Planning Agent learns which card an
 answer belongs to, but :func:`wake_text` adds a note that the question is
 already posted, so it says nothing now and only takes the answer, typed or
 clicked (``gateway/slack_ux_clicks.py``), to the card with ``kanban_comment``
-and ``kanban_unblock``. A click's turn names the card, which
+and ``kanban_unblock``, and says nothing after that either: the question
+shows who answered and what. A click's turn names the card, which
 :func:`question_card` looks up. A typed answer can open a session the wake
 never reached, which knows the thread only by reading it back, so the
 question's ``text`` names the card too, above its buttons' "Reply with one
@@ -40,13 +41,29 @@ and anywhere blocks cannot render. Other block kinds keep the line.
 
 When the card moves on, any event of it, :func:`settle_question` takes the
 buttons and "waiting on you" off the question, so a typed answer does not
-leave them live. A question a click already answered was rewritten by the
-click and is left alone; one whose rewrite failed is settled here. The
+leave them live. An event that means the card resumed (:data:`ANSWERED_KINDS`)
+also reads the thread for that answer: the first reply after the question
+from a person the adapter would answer, not a bot, and through its channel gate,
+that no other question in the thread was shown with, and for a question retried
+after the card asked again, before the card's next question it still holds, becomes
+the same "✓ <name>: <words>" line a click leaves (the words as plain text on
+one line, without the agent's own mentions it opens with, any other unlabeled one as ``@`` and
+the person's name, clipped to ``TYPED_ANSWER_MAX``).
+A card that moved on any other way, or with nobody replying, a read that fails, or a question a click answered whose rewrite
+failed (the click posted its line in the thread) settles without the line. A question a click already answered
+was rewritten by the click and is left alone, as is one whose rewrite is still
+in flight, until the card's next event; one whose rewrite failed is settled here. The
 notifier delivers at least once, so a ``blocked`` event replayed after its
 question posted (:func:`asked`) neither settles nor reposts it. A question
 whose settle failed when the card asked again is kept and retried with the
-card's next settle. The open questions are held in process, so a restart
+card's next settle, and one whose card resumed before a failed settle still reads
+its answer on the retry, whatever event brings it. The open questions are held in process, so a restart
 leaves the buttons of any it forgot.
+
+Each moment carries a side bar, green for a PR and yellow for a question: a
+legacy attachment holding every block below the headline. A settle sends the
+attachment again, since ``chat.update`` would otherwise keep the old one, buttons
+and all; a question settled down to its headline alone loses the bar.
 
 Fail-soft: a moment that cannot be posted is logged, and the caller falls back
 to what it did before.
@@ -56,6 +73,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from collections import OrderedDict
 from collections.abc import Iterable
 from typing import Any
@@ -89,6 +107,48 @@ WAKE_NOTE = (
     "in this notification needs saying, reply with exactly [SILENT]. When the user answers, "
     "typed or clicked, carry the answer to the card with kanban_comment, then kanban_unblock."
 )
+#: Added after :data:`WAKE_NOTE` for a question in a thread, the only place its answered line shows.
+WAKE_NOTE_ANSWERED = (
+    "Once kanban_unblock succeeds, reply with exactly [SILENT] unless they also asked something "
+    "else: the question already shows who answered and what. If it failed, say so."
+)
+
+#: The answered line a typed answer gets, as ``slack_ux_clicks.CLICKED``, and the
+#: name it shows when the answerer's name lookup raises.
+ANSWERED = "✓ {who}: {label}"
+NAMELESS = "Someone"
+
+#: The card events that mean its question was answered: it was unblocked, so it resumed.
+#: Any other (archived, dragged to done, gave up) settles the question without a typed line.
+ANSWERED_KINDS = frozenset({"unblocked", "heartbeat"})
+#: What :func:`settle_question` assumes when it is not told the event.
+UNBLOCKED_KIND = "unblocked"
+
+#: A typed answer's words on its answered line are clipped to this.
+TYPED_ANSWER_MAX = 80
+
+#: Slack's most replies one ``conversations.replies`` page returns; the settle reads one
+#: page after a question, looking for its typed answer.
+REPLIES_READ_MAX = 1000
+
+#: The reply subtypes a person typing leaves, besides none: "also send to channel", a file
+#: with a comment, a ``/me``. A join or any other event in the thread is not an answer.
+TYPED_SUBTYPES = frozenset({"thread_broadcast", "file_share", "me_message"})
+
+#: A Slack entity in a reply's text: a link, a mention or a special mention, with an optional label.
+SLACK_ENTITY = re.compile(r"<([^<>|]*)(?:\|([^<>]*))?>")
+
+#: An unlabeled user mention inside a reply's words, shown as ``@`` and the person's name.
+USER_MENTION = re.compile(r"<@([A-Z0-9]+)>")
+#: The most distinct mentions a reply's names are looked up for. Each shows as at least ``@``
+#: and one character, so a later one starts past ``TYPED_ANSWER_MAX`` and is clipped off.
+MENTIONS_NAMED_MAX = TYPED_ANSWER_MAX // 2
+#: The characters that would end an entity's label early, read as spaces in a name put in one.
+MENTION_LABEL_UNSAFE = str.maketrans("|<>", "   ")
+
+#: A user mention a reply opens with, and the separators around it. The agent's, which a
+#: channel may require, addresses the reply and is not part of the answer its line shows.
+LEADING_MENTION = re.compile(r"^[\s,:]*<@([A-Z0-9]+)(?:\|[^<>]*)?>[\s,:]*")
 
 #: Added to a question's ``text``, so a session the wake never reached reads its card in the thread.
 QUESTION_CARD_NOTE = "(Question from card {card}.)"
@@ -102,6 +162,10 @@ _announced: OrderedDict[tuple, None] = OrderedDict()
 _questions: OrderedDict[tuple, tuple] = OrderedDict()
 #: ``(subscription, ts)`` -> the entry of a question asked again before its settle succeeded.
 _unsettled: OrderedDict[tuple, tuple] = OrderedDict()
+#: ``(channel, ts)`` of a question whose card resumed but whose settle failed: its retry still reads the answer.
+_resumed: OrderedDict[tuple, None] = OrderedDict()
+#: ``(channel, thread, reply ts)`` of a typed reply already shown as a question's answer, never credited twice.
+_credited: OrderedDict[tuple, None] = OrderedDict()
 _warned_missing = False
 
 
@@ -137,8 +201,9 @@ def _remember(mapping: OrderedDict, key: tuple, value: Any) -> None:
         mapping.popitem(last=False)
 
 
-async def _post(adapter: Any, sub: dict, blocks: list[dict], text: str) -> str | None:
-    """Post in the card's thread; the message's ts ("" if Slack gave none), None on failure."""
+async def _post(adapter: Any, sub: dict, blocks: list[dict], text: str, color: str) -> str | None:
+    """Post in the card's thread beside a ``color`` side bar; the message's ts ("" if
+    Slack gave none), None on failure."""
     chat_id = str(sub.get("chat_id") or "")
     if not (chat_id and hasattr(adapter, "_get_client")):
         return None
@@ -148,7 +213,7 @@ async def _post(adapter: Any, sub: dict, blocks: list[dict], text: str) -> str |
             channel=chat_id,
             thread_ts=sub.get("thread_id") or None,
             text=text,
-            blocks=blocks,
+            **_presenter.with_side_bar(blocks, color, text),
         )
     except Exception as exc:  # noqa: BLE001 — the caller falls back
         logger.warning("slack_ux_moments: posting in %s failed: %s", chat_id, exc)
@@ -167,7 +232,7 @@ async def pr_opened(adapter: Any, sub: dict, text: str) -> bool:
         if key in _announced:
             continue
         blocks, fallback = _moments.pr_opened(url, repo, number, line)
-        if await _post(adapter, sub, blocks, fallback) is None:
+        if await _post(adapter, sub, blocks, fallback, _moments.PR_SIDE_BAR) is None:
             continue
         _remember(_announced, key, None)
         posted = True
@@ -195,7 +260,7 @@ async def needs_you(adapter: Any, sub: dict, payload: Any, event_id: int = 0) ->
     earlier = _questions.get(key)
     blocks, text = moment
     text = _with_card(text, key[0], any(b.get("type") == "actions" for b in blocks))
-    ts = await _post(adapter, sub, blocks, text)
+    ts = await _post(adapter, sub, blocks, text, _moments.NEEDS_YOU_SIDE_BAR)
     if ts is None:
         # The earlier question keeps its slot, so it is settled once, from there.
         return False
@@ -238,15 +303,25 @@ def question_card(channel: str, ts: str) -> str | None:
     return None
 
 
-def _clicked(channel: str, ts: str) -> bool:
-    """Whether a click in this process already answered the message."""
+def _clicked(channel: str, ts: str, rewritten: bool = True) -> bool:
+    """Whether a click in this process already answered the message, and with ``rewritten`` rewrote it."""
     try:
         from gateway import slack_ux_clicks
     except ImportError:
         return False
     try:
-        return bool(slack_ux_clicks.answered(channel, ts))
+        return bool((slack_ux_clicks.answered if rewritten else slack_ux_clicks.clicked)(channel, ts))
     except Exception:  # noqa: BLE001 — read as unanswered; the settle is cosmetic
+        return False
+
+
+def _rewriting(channel: str, ts: str) -> bool:
+    """Whether a click in this process answered the message and is still rewriting it."""
+    try:
+        from gateway import slack_ux_clicks
+
+        return bool(slack_ux_clicks.rewriting(channel, ts))
+    except Exception:  # noqa: BLE001 — read as not rewriting, as before the click tracked it
         return False
 
 
@@ -257,43 +332,215 @@ def _without_choices(text: str) -> str:
     return body.rstrip("\n") if body and last.startswith(_presenter.CHOICES_LEAD) else text
 
 
-async def _settled(adapter: Any, sub: dict, entry: tuple) -> bool:
-    """Rewrite one question without its buttons; True once it needs nothing more."""
+async def _who(adapter: Any, reply: dict, channel: str, team_id: str) -> str:
+    """The answerer's name as a click's answered line gives it: never a mention or their id.
+
+    The reply's own ``user_profile`` stands in for a click's handle when ``users.info``
+    names nobody, which the adapter caches for a user whose lookup once failed.
+    """
+    profile = reply.get("user_profile") or {}
+    shown = profile.get("display_name") or profile.get("real_name") or profile.get("name") or ""
+    try:
+        from gateway import slack_ux_clicks
+
+        return await slack_ux_clicks.clicker_name(
+            adapter, {"user": {"name": str(shown)}}, str(reply["user"]), channel, team_id,
+        )
+    except Exception:  # noqa: BLE001 — the line still names someone
+        return NAMELESS
+
+
+def _after(ts: Any, since: str) -> bool:
+    try:
+        return float(ts) > float(since)
+    except (TypeError, ValueError):
+        return False
+
+
+async def _by_a_person(adapter: Any, reply: Any, channel: str, team_id: str, thread: str) -> bool:
+    """Whether ``reply`` is a person the adapter would answer typing, as a click's check asks it:
+    not a bot, authorized, and through the channel gate with its mention rules. A group DM is asked
+    as a channel, since the subscription does not say which it is, so there it may count too few.
+    Without the clicks module, whose gate check this borrows, no reply counts."""
+    if not (isinstance(reply, dict) and reply.get("user") and str(reply.get("text") or "").strip()):
+        return False
+    if reply.get("bot_id") or (reply.get("subtype") and reply.get("subtype") not in TYPED_SUBTYPES):
+        return False
+    try:
+        from gateway import slack_ux_clicks
+
+        return (
+            not adapter._event_declares_bot_sender(reply)
+            and bool(adapter._is_interactive_user_authorized(reply["user"], channel_id=channel, team_id=team_id))
+            and await slack_ux_clicks._gateway_hears(adapter, reply, channel, team_id, thread, False)
+        )
+    except Exception:  # noqa: BLE001 — not counted; the question settles without the line
+        return False
+
+
+def _plain(text: str) -> str:
+    """``text`` with Slack's entities as their label or inner text, and its three escapes decoded."""
+    text = SLACK_ENTITY.sub(lambda m: m.group(2) or m.group(1), text)
+    for raw, escaped in reversed(_presenter.MRKDWN_ESCAPES):
+        text = text.replace(escaped, raw)
+    return text
+
+
+async def _named_mentions(adapter: Any, text: str, channel: str, team_id: str) -> str:
+    """``text`` with each unlabeled user mention labeled with the person's name, so it reads as ``@name``.
+
+    The adapter's cached ``users.info`` lookup, as for the line's name; a lookup that fails leaves the id,
+    as does a mention past the first :data:`MENTIONS_NAMED_MAX`, which the clip drops anyway.
+    """
+    names = {}
+    for user_id in list(dict.fromkeys(USER_MENTION.findall(text)))[:MENTIONS_NAMED_MAX]:
+        try:
+            names[user_id] = str(await adapter._resolve_user_name(user_id, chat_id=channel, team_id=team_id) or "")
+        except Exception:  # noqa: BLE001 — the mention keeps its id
+            names[user_id] = ""
+
+    def label(match: re.Match) -> str:
+        user_id = match.group(1)
+        name = " ".join(names.get(user_id, "").translate(MENTION_LABEL_UNSAFE).split())
+        return f"<@{user_id}|@{name}>" if name and name != user_id else match.group(0)
+
+    return USER_MENTION.sub(label, text)
+
+
+def _unaddressed(adapter: Any, text: str, team_id: str) -> str:
+    """``text`` less the agent's own mentions it opens with; a reply that is nothing else stays whole."""
+    bot = adapter._team_bot_user_ids.get(team_id, adapter._bot_user_id)
+    rest = text
+    while bot and (match := LEADING_MENTION.match(rest)) and match.group(1) == bot:
+        rest = rest[match.end():]
+    return rest or text
+
+
+async def _typed_note(
+    adapter: Any, client: Any, sub: dict, channel: str, ts: str, until: str = ""
+) -> tuple[str, tuple | None]:
+    """The answered line for the first reply a person typed after the question, and before
+    ``until`` when given, that no other question was credited with, and its :data:`_credited`
+    key, reserved there until the caller releases it; ``("", None)`` for none."""
+    thread = str(sub.get("thread_id") or "")
+    if not thread:
+        return "", None
+    try:
+        response = await client.conversations_replies(channel=channel, ts=thread, oldest=ts, limit=REPLIES_READ_MAX)
+        replies = [
+            r for r in response.get("messages") or []
+            if _after((r or {}).get("ts"), ts) and not (until and not _after(until, r["ts"]))
+        ]
+    except Exception as exc:  # noqa: BLE001 — cosmetic; the question settles without the line
+        logger.info("slack_ux_moments: reading the answer to %s failed: %s", ts, exc)
+        return "", None
+    team_id = str(sub.get("team_id") or "")
+    for reply in sorted(replies, key=lambda r: float(r["ts"])):
+        credit = (channel, thread, str(reply["ts"]))
+        if credit in _credited or not await _by_a_person(adapter, reply, channel, team_id, thread):
+            continue
+        if credit in _credited:
+            # Another card's settle took it during the check.
+            continue
+        _remember(_credited, credit, None)
+        try:
+            text = str(reply["text"])
+            text = await _named_mentions(adapter, _unaddressed(adapter, text, team_id), channel, team_id)
+            words = _presenter._clip(" ".join(_plain(text).split()), TYPED_ANSWER_MAX)
+            who = await _who(adapter, reply, channel, team_id)
+        except BaseException:
+            _credited.pop(credit, None)
+            raise
+        return ANSWERED.format(who=who, label=_presenter._escape(words)), credit
+    return "", None
+
+
+async def _settled(adapter: Any, sub: dict, entry: tuple, kind: str = UNBLOCKED_KIND, until: str = "") -> bool:
+    """Rewrite one question without its buttons, under its typed answer's line; True once it needs nothing more.
+
+    ``until`` is the ts of the card's next question, if it asked again: a reply after it answers that one.
+    """
     _event_id, channel, ts, blocks, text = entry
     if not ts or _clicked(channel, ts):
         return True
+    note, credit, shown = "", None, False
     try:
         client = adapter._get_client(channel, team_id=sub.get("team_id") or None)
+        # A click whose rewrite failed posted its own line; a later reply is not the answer.
+        # So does a card that moved on unanswered, unless it resumed on an event whose settle failed.
+        if kind in ANSWERED_KINDS:
+            _remember(_resumed, (channel, ts), None)
+        answered = (channel, ts) in _resumed and not _clicked(channel, ts, rewritten=False)
+        if answered:
+            note, credit = await _typed_note(adapter, client, sub, channel, ts, until)
+        if _clicked(channel, ts):
+            # A click during the read rewrote the question with its own line.
+            return True
+        if _rewriting(channel, ts):
+            # Its rewrite takes the buttons off; one that fails is settled on the card's next event.
+            return False
+        if _clicked(channel, ts, rewritten=False):
+            # One whose rewrite failed posted its line in the thread, and is the answer.
+            note = ""
+        settled_text = _without_choices(text)
+        question_text = f"{note}\n\n{settled_text}" if note else settled_text
         await client.chat_update(
-            channel=channel, ts=ts, text=_without_choices(text), blocks=_moments.needs_you_settled(blocks)
+            channel=channel,
+            ts=ts,
+            text=question_text,
+            **_presenter.with_side_bar(
+                _moments.needs_you_settled(blocks, note), _moments.NEEDS_YOU_SIDE_BAR, question_text
+            ),
         )
+        shown = bool(note)
     except Exception as exc:  # noqa: BLE001 — cosmetic; the next event retries
         logger.warning("slack_ux_moments: settling the question %s failed: %s", ts, exc)
         return False
+    finally:
+        if credit is not None and not shown:
+            # Not shown on this question, so the reply is free for another.
+            _credited.pop(credit, None)
+    _resumed.pop((channel, ts), None)
     return True
 
 
-async def settle_question(adapter: Any, sub: dict) -> None:
+async def settle_question(adapter: Any, sub: dict, kind: str = UNBLOCKED_KIND, event_id: int = 0) -> None:
     """Take the buttons and "waiting on you" off the card's open question, if it has one.
+
+    ``kind`` is the card event that moved it on; only one in :data:`ANSWERED_KINDS` puts a
+    typed reply's line on the question. Given the event's ``event_id``, a question posted
+    for that event or a later one is left alone: the event is older than the question.
 
     The question is forgotten only once the rewrite succeeds (or a click has
     answered it), so a failed rewrite is retried on the card's next event and
     a click in between still names the card. Earlier questions of the card
-    whose settle failed are retried too.
+    whose settle failed are retried too, each reading only the replies before
+    the card asked again.
     """
     key = _sub_key(sub)
-    for stale_key, stale in [item for item in _unsettled.items() if item[0][0] == key]:
-        if await _settled(adapter, sub, stale) and _unsettled.get(stale_key) is stale:
+    def newer(entry: tuple) -> bool:
+        return bool(event_id) and int(entry[0] or 0) >= int(event_id)
+
+    stales = [item for item in _unsettled.items() if item[0][0] == key]
+    asked_at = [e[2] for _k, e in stales] + [e[2] for e in [_questions.get(key)] if e is not None]
+
+    def next_asked(entry: tuple) -> str:
+        return min((t for t in asked_at if _after(t, entry[2])), key=float, default="")
+
+    for stale_key, stale in stales:
+        if (not newer(stale) and await _settled(adapter, sub, stale, kind, next_asked(stale))
+                and _unsettled.get(stale_key) is stale):
             _unsettled.pop(stale_key, None)
     entry = _questions.get(key)
-    if entry is None:
+    if entry is None or newer(entry):
         return
-    if await _settled(adapter, sub, entry) and _questions.get(key) is entry:
+    if await _settled(adapter, sub, entry, kind) and _questions.get(key) is entry:
         _questions.pop(key, None)
 
 
 def wake_text(sub: dict, events: Iterable[Any], wake_kinds: Any, text: str) -> str:
-    """``text`` with :data:`WAKE_NOTE` added when the wake is for a question this posted.
+    """``text`` with :data:`WAKE_NOTE` added when the wake is for a question this posted,
+    and :data:`WAKE_NOTE_ANSWERED` after it when that question is in a thread.
 
     Matched on the ``blocked`` event's id, so a notifier retry of the same
     delivery gets the note again and a later block that posted no question
@@ -310,7 +557,9 @@ def wake_text(sub: dict, events: Iterable[Any], wake_kinds: Any, text: str) -> s
             for ev in events or ()
             if getattr(ev, "kind", None) == BLOCKED_KIND
         }
-        return f"{text}\n\n{WAKE_NOTE}" if entry[0] in blocked else text
+        if entry[0] not in blocked:
+            return text
+        return f"{text}\n\n{WAKE_NOTE} {WAKE_NOTE_ANSWERED}" if sub.get("thread_id") else f"{text}\n\n{WAKE_NOTE}"
     except Exception:
         logger.debug("slack_ux_moments: reading the posted question failed", exc_info=True)
         return text

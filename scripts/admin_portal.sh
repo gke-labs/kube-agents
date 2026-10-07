@@ -10,6 +10,7 @@ readonly REPO_ROOT
 readonly REQUIREMENTS="${REPO_ROOT}/admin_console/requirements.txt"
 readonly PORT="${ADMIN_PORTAL_PORT:-8501}"
 readonly HOST="127.0.0.1"
+readonly THEME="${ADMIN_PORTAL_THEME:-default}"
 
 fail() {
   echo "Error: $*" >&2
@@ -28,6 +29,10 @@ fi
 if [[ "${PORT}" == "${STREAMLIT_PORT}" ]]; then
   fail "ADMIN_PORTAL_PORT and ADMIN_PORTAL_STREAMLIT_PORT must differ."
 fi
+case "${THEME}" in
+  default | google-cloud) ;;
+  *) fail "ADMIN_PORTAL_THEME must be default or google-cloud." ;;
+esac
 
 command -v gcloud >/dev/null 2>&1 ||
   fail "gcloud is required. Install the Google Cloud CLI, then run: gcloud auth login"
@@ -106,6 +111,7 @@ else
   echo "Configured gcloud project: none (select one in the portal)"
 fi
 echo "Local-only listener: ${HOST}:${PORT}"
+echo "Theme: ${THEME}"
 echo "Launch: ${PORTAL_URL}"
 echo
 echo "Press Ctrl-C to stop the portal."
@@ -115,6 +121,7 @@ export KUBE_AGENTS_ADMIN_USER="${active_account}"
 export KUBE_AGENTS_GCLOUD_PROJECT="${active_project}"
 export KUBE_AGENTS_PORTAL_API_URL="${PORTAL_URL}/api/v1"
 export ADMIN_PORTAL_STREAMLIT_PORT="${STREAMLIT_PORT}"
+export ADMIN_PORTAL_THEME="${THEME}"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 # FastAPI owns the public loopback listener and lifecycle. Streamlit binds a

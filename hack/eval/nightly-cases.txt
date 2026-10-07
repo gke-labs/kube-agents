@@ -188,6 +188,12 @@
 # unit_cost_hint figures and three repetitions (~378 without it), against the
 # 480m deadline. Whether that fits is the eval crew's call, on the first nights'
 # record.
+# 2026-10-05 extends bootstrap-discovery-fanout to wait for the gate's
+# hand-off to ranking and grade it, rather than adding a second tofu case that
+# would re-arm a second sweep. Its hint goes from 600s to 1000s (dev-install
+# runs measured about 960s), ~20 more serial minutes on the infra lock: the
+# eleven tofu cases come to ~453 serial minutes against the 480m deadline. The
+# case count is unchanged.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -395,6 +401,15 @@
 # read-only over the seeded fleet.
 ./tasks/patch-declared-intent-no-finding/task.yaml
 
+# The waste stream's declared-intent case (#1408): seeded-headroom's
+# burst-ingest reserves far more than it uses, the 3.1 overrequest posture
+# the same knowledge/ note declares. It runs the waste audit and grades the
+# cost ledger: no finding id for the workload, and a Declared intent row
+# naming the note. Red on the install's build before the change (the finding
+# published with a resize), three greens on the branch's, on a dev install.
+# One case, three units. deployer: noop, read-only over the seeded fleet.
+./tasks/cost-declared-intent-no-finding/task.yaml
+
 # ── Moved here 2026-09-15 from the commented-out state (#1546, #1564) ───────
 # Nine cases; each carries the blocker that kept it parked. None was
 # activatable as a presubmit seat then and none is now; what changed is
@@ -544,6 +559,11 @@
 # A simple case that can run on kind.
 ./tasks/chat-routing-own-cluster-namespaces/task.yaml
 
+# The front door's answer to "reset our chat history": it names /new (alias
+# /reset) and claims no reset of its own (#2189). `validated: false` until its
+# first observed nightly runs.
+./tasks/chat-reset-history-names-the-command/task.yaml
+
 # The two obtainability-journey probes: CUJ1's Day-0 design discipline and
 # CUJ3's Day-2 window planning, graded on the report and the worker
 # commands through the eval harness (their live siblings under bench/cuj/
@@ -553,11 +573,13 @@
 ./tasks/obtainability-design-quota-vs-capacity/task.yaml
 ./tasks/obtainability-window-planning-probe/task.yaml
 
-# The onboarding discovery sweep's fan-out (#1872): re-arms the
-# bootstrap-inventory-scan gate on the install under test and grades the
-# cards the sweep's worker files against the Cluster Agent roster. Nightly
-# rather than presubmit because the fan-out's cards take dispatcher slots
-# from whatever else is running.
+# The onboarding discovery sweep's fan-out (#1872) and the gate's hand-off to
+# ranking: re-arms the bootstrap-inventory-scan gate on the install under test,
+# grades the cluster cards filed for the sweep against the Cluster Agent roster,
+# then the raw report's findings block (parsed by the sandbox's own
+# inventory_findings.py) and the keyed bootstrap-inventory-prioritize card.
+# Nightly rather than presubmit because the sweep's cards take dispatcher slots
+# from whatever else is running, for up to the stack's 1800s handoff_wait.
 ./tasks/bootstrap-discovery-fanout/task.yaml
 
 # The first-install hello, both variants: the greeting's shape (one message,
@@ -599,6 +621,12 @@
 # second card blocked on the same question. Plants its own cards through
 # card_wake.py; reads no cluster.
 ./tasks/chat-question-typed-answer-fresh-session/task.yaml
+
+# SOUL §1.5 Unblock: an answer by button to a question the gateway posted is
+# carried to the card and then answered with [SILENT], since the click already
+# rewrote the question to show who answered and what. Plants its own card
+# through card_wake.py; reads no cluster.
+./tasks/chat-question-click-answer-stays-silent/task.yaml
 
 # The shell sandbox's copy of the shipped trees (#2096): a card telling the
 # platform worker to append to the shipped gke-basics SKILL.md with a

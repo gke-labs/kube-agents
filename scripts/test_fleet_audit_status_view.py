@@ -1147,7 +1147,20 @@ class TestDashboard(unittest.TestCase):
 
     def test_a_narrow_width_drops_columns_and_says_which(self):
         out = self.render(self.two(), width=100)
-        self.assertIn("dropped to fit 100 columns", out)
+        self.assertIn("dropped to fit 100 columns; --width for a wider table", out)
+
+    def test_the_shared_renderer_names_no_callers_flag(self):
+        # The hint is the caller's; a table rendered without one says only
+        # what was dropped.
+        columns = [
+            terminal_table.Column("ALPHA"),
+            terminal_table.Column("BETA", expendable=1),
+        ]
+        rows = [[("a" * 30,), ("b" * 30,)]]
+        out = terminal_table.render_table(
+            columns, rows, view.Palette(False), 40, view.BOX_UNICODE
+        )
+        self.assertEqual(out[-1], "  BETA dropped to fit 40 columns")
 
 
 class TestContextDiscovery(unittest.TestCase):

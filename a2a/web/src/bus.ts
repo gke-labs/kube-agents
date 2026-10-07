@@ -222,8 +222,9 @@ export async function startBus(
   opts: BusOptions = {},
 ): Promise<BusHandle> {
   // No waitOnFirstConnect: a wrong password or absent port-forward should
-  // reject out to the connect form immediately, not hang the page. Once up,
-  // an unlimited reconnect budget means a NATS restart mid-demo heals itself.
+  // reject out to the not-connected screen immediately, not hang the page.
+  // Once up, an unlimited reconnect budget means a NATS restart mid-demo
+  // heals itself.
   const nc: NatsConnection = await connect({
     servers: config.url,
     user: config.user,

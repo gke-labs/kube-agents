@@ -1,0 +1,29 @@
+{
+  "payload": {
+    "number": 1,
+    "body": "Confirmed on staging."
+  },
+  "responses": [
+    {
+      "id": 50087905,
+      "type": null,
+      "body": "/remediate please",
+      "author": {
+        "id": 50031807,
+        "username": "example-maintainer",
+        "name": "Example Maintainer",
+        "state": "active",
+        "avatar_url": "https://gitlab.com/uploads/-/system/user/avatar/2001/avatar.png",
+        "web_url": "https://gitlab.com/example-maintainer"
+      },
+      "created_at": "2026-10-01T14:57:34.911Z",
+      "updated_at": "2026-10-01T14:57:34.911Z",
+      "system": false,
+      "noteable_id": 3001,
+      "noteable_type": "Issue",
+      "noteable_iid": 1,
+      "resolvable": false,
+      "internal": false
+    }
+  ]
+}

@@ -3206,6 +3206,29 @@ def test_a_question_wake_sends_the_wake_then_the_answer_on_one_conversation(
     assert _archived(scripts)
 
 
+_CLICK_TURN = f"seeded-b\n\n(Clicked on the question from card {_REPLAY_CARD}.)"
+
+
+def test_an_answer_by_click_sends_the_click_turn_not_the_typed_answer(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    planted = json.dumps(
+        {"card": _REPLAY_CARD, "wake": _REPLAY_WAKE, "posted": 1, "click": _CLICK_TURN, "error": None}
+    )
+    scripts: list[str] = []
+    monkeypatch.setattr(
+        harness, "_agent_shell", _replay_shell(scripts, plant_reply=f"{card_wake.REPLAY_PRESENT}\n{planted}")
+    )
+    stub_agent.turns = [_turn(_text("[SILENT]")), _answer_turn()]
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT + "answer_by: click\n")
+
+    assert not result.has_errors()
+    assert [r["input"] for r in stub_agent.requests] == [_REPLAY_WAKE, _CLICK_TURN]
+    assert stub_agent.requests[0]["conversation"] == stub_agent.requests[1]["conversation"]
+    assert result.trajectory[-1]["args"]["answer_reply"] == "Passed seeded-b to the card."
+
+
 def test_the_next_run_gets_a_fresh_conversation_after_a_question_wake(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
 ) -> None:
@@ -3259,6 +3282,20 @@ def test_a_question_wake_archives_its_card_when_the_wake_turn_errors(
     assert _archived(scripts)
     assert [s["name"] for s in result.trajectory][-1] == card_wake.SETTLED_ENTRY
     assert "question_wake" in result.metadata and "failure_wake" not in result.metadata
+
+
+def test_a_wake_turn_that_replied_with_a_parse_warning_still_gets_its_answer(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    stub_agent.turns = [_turn("junk", _text("[SILENT]")), _answer_turn()]  # type: ignore[arg-type]
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert [r["input"] for r in stub_agent.requests] == [_REPLAY_WAKE, "seeded-b"]
+    assert result.output == "[SILENT]"
+    assert result.trajectory[-1]["args"]["answer_reply"] == "Passed seeded-b to the card."
 
 
 def test_a_question_wake_missing_its_answer_errors_without_planting(
@@ -3443,6 +3480,20 @@ def test_a_fresh_session_replay_puts_a_posted_wake_reply_in_the_thread(
     messages = _context_messages(scripts)
     assert messages[-1]["text"] == "Which cluster: seeded-a or seeded-b?"
     assert messages[-1]["user"] == card_wake.STUB_BOT
+
+
+def test_a_fresh_session_replay_sends_the_answer_after_a_wake_that_warned(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _fresh_shell(scripts))
+    stub_agent.turns = [_turn("junk", _text("[SILENT]")), _answer_turn()]  # type: ignore[arg-type]
+
+    result = KubeAgentsHarness().run(_FRESH_PROMPT)
+
+    wake, answer = stub_agent.requests
+    assert wake["conversation"] != answer["conversation"]
+    assert result.trajectory[-1]["args"]["answer_reply"] == "Passed seeded-b to the card."
 
 
 def test_a_fresh_session_replay_whose_context_failed_in_the_image_sends_no_answer(

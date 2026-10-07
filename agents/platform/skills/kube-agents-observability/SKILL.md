@@ -24,6 +24,10 @@ Audit, verify, and troubleshoot the logging, metrics, and distributed tracing ob
   ```bash
   kubectl exec <pod-name> -c <agent-container-name> -n kubeagents-system -- tail -n 100 /opt/data/logs/agent.log
   ```
+- The tool-call audit trail is not in `agent.log`: it is one JSON object per line in `/opt/data/logs/audit.jsonl` for the front door and `/opt/data/profiles/<profile>/logs/audit.jsonl` for a named profile; in Logs Explorer, `jsonPayload.audit_event:*`, with `jsonPayload.file_path` naming the profile's file.
+  ```bash
+  kubectl exec <pod-name> -c <agent-container-name> -n kubeagents-system -- tail -n 20 /opt/data/logs/audit.jsonl
+  ```
 
 ### 2. Inspect Sidecar Log Aggregator (Fluent-bit)
 

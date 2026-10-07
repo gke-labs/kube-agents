@@ -520,6 +520,15 @@ def test_a_repository_outside_the_pinned_owner_is_an_error(env, github, monkeypa
     assert not github.calls, "a misconfigured run makes no call"
 
 
+def test_a_github_repository_is_read_exactly_as_given(env, github, monkeypatch):
+    # Slashes are not stripped on GitHub: `/owner/name` was never `owner/name`.
+    stash()
+    monkeypatch.setenv(github_writes.GITOPS_REPO_ENV_VAR, "/gke-agentic/kube-agents-evals-21-infra")
+    res = check().verify(5.0)
+    assert res.status == "error"
+    assert not github.calls
+
+
 def test_the_leaf_refuses_a_negative_allowance():
     with pytest.raises(ValidationError):
         check(requested_pull_requests=-1)
