@@ -11668,6 +11668,15 @@ def close_stale_remediation_prs(
             [fid for fid in covered if fid in current_ids or is_shielded(fid, located)] if joinable else []
         )
         only_shielded = bool(shield_persisting) and all(is_shielded(fid, located) for fid in shield_persisting)
+        # The shield's reason is for a pull request something still holds open
+        # under the shield: a persisting finding, or one the shield demoted or
+        # counted this run. On a complete run a covered finding that resolved
+        # is announced resolved by the delta, so a pull request none of whose
+        # findings persist takes the default reason, as it did before. A
+        # partial run cannot tell resolved from unread, so its close keeps it.
+        shield_reason = only_shielded and (
+            shielded_only or bool(persisting) or any(fid in shielded_ids for fid in shield_persisting)
+        )
         if shielded_only and not only_shielded:
             continue
         if not orphaned:
@@ -11719,7 +11728,7 @@ def close_stale_remediation_prs(
         # run actually established, so that is what the comment says.
         reason = ""
         resolution = ""
-        if only_shielded:
+        if shield_reason:
             reason = SHARED_ACCOUNT_STALE_REASON
             resolution = SHARED_ACCOUNT_STALE_RESOLUTION
         elif persisting or not joinable:

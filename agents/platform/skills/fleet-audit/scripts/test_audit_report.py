@@ -18499,6 +18499,36 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertIn("except the one the compliance shield forbids", ledger)
         self.assertIn("except the compliance shield's (1)", self.err)
 
+    def test_a_complete_run_closes_a_resolved_siblings_pull_request_with_the_default_reason(self):
+        # The owner declared api and fixed worker per pod spec. The complete
+        # run announces worker resolved; the pull request that covered both
+        # closes with the default reason, not the shield's "nothing here is
+        # announced as fixed", which would contradict the delta.
+        path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
+        api = make_finding(fid="api", check="default-sa-automount", obj="Deployment/api", title="api", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        worker = make_finding(fid="worker", check="default-sa-automount", obj="Deployment/worker", title="worker", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        previous_body = published_body(make_doc(findings=[api, worker], audit=AUDIT), generated_at=NOW)
+        self.declaring_replies(previous_body)
+        api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
+        worker_id = derived_id(check="default-sa-automount", obj="Deployment/worker")
+        self.harness.replies["proposal-list"] = proposals_view(
+            [pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([api_id, worker_id]))]
+        )
+        self.touch(path)
+        pathlib.Path(audit_report.declarations_path_for(AUDIT)).parent.mkdir(parents=True, exist_ok=True)
+        audit_report.write_declarations(AUDIT, "acme/fleet", [{"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}])
+        doc = make_doc(findings=[], audit=AUDIT)
+        doc["resolved_because"] = [entry for entry in resolved_for(previous_body) if entry["object"] == "Deployment/worker"]
+        manifest = _full_manifest(audit=AUDIT, candidates=[self.account_candidate("Deployment/api")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertFalse(payload["partial"])
+        self.assertEqual(payload["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
+        comment = " ".join(self.harness.bodies_for("proposal-*"))
+        self.assertIn("audit no longer", comment)
+        self.assertNotIn("Nothing here is announced as fixed", comment)
+
     def test_a_partial_run_closes_the_pull_request_on_a_fleet_wide_declaration_for_the_gap_cluster(self):
         # The common note shape names no cluster. The pull request's own ids
         # name one, so the close matches them by namespace and workload.
