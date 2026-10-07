@@ -28,6 +28,11 @@ const (
 // terminal when the child ended and no wake could run (observeChildEnd).
 const reasonWakeNotStarted = "wake-not-started"
 
+// reasonDelegationRefused is the reason token on the root terminal an
+// observer is told for a turn whose delegate request the gateway refused
+// (TaskRef.refusedEnd).
+const reasonDelegationRefused = "delegation-refused"
+
 // delegatedLineNote suffixes a child's rolling line, so the room can tell the
 // task the session handed on from one a human asked for.
 const delegatedLineNote = "(delegated to platform)"
@@ -76,9 +81,17 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	// A refusal's notice waits for the delegating turn's terminal, so the
 	// room reads the session's "delegated to platform" first and the
 	// refusal after it (spec §3).
+	// The refusal is also marked on the turn's entry, durable, so the end
+	// an observer is told and the read route's report agree that the turn
+	// did not hand off (TaskRef.refusedEnd).
 	refuse := func(rule, notice string, extra ...any) {
 		log.Warn("delegation refused", append(append([]any{"rule", rule}, audit...), extra...)...)
 		g.deferNotice(taskID, notice)
+		for i := range rec.Tasks {
+			if rec.Tasks[i].ID == taskID {
+				rec.Tasks[i].DelegationRefused = notice
+			}
+		}
 	}
 
 	// Only the task the gateway started, from the incarnation that owns it

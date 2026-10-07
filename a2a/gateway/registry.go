@@ -287,6 +287,26 @@ type TaskRef struct {
 	// terminal observeChildEnd announced, kept so the read route reports
 	// the same end for a settled chain (probeConversation). Nil otherwise.
 	ChainEnd *ChainEnd `json:"chainEnd,omitempty"`
+	// DelegationRefused is the notice the room was posted when the gateway
+	// refused this turn's delegate request (handleDelegateRequest's refuse;
+	// an ignored request does not set it). The turn's own `completed`
+	// answer is then only the hand-off line, so toward an observer the
+	// turn ends failed with the refusal as its reason and no deliverable
+	// (refusedEnd), and the read route reports the same. Empty otherwise.
+	DelegationRefused string `json:"delegationRefused,omitempty"`
+}
+
+// refusedEnd is the end an observer is told for a turn whose delegation
+// the gateway refused, given the turn's own terminal state: a `completed`
+// is only the hand-off line, so it is the root failed with a
+// reason: delegation-refused token and the notice. Any other state stands.
+// ok is false when the turn's delegation was not refused or its state
+// stands.
+func (ref TaskRef) refusedEnd(state lib.TaskState) (lib.TaskState, string, bool) {
+	if ref.DelegationRefused == "" || state != lib.StateCompleted {
+		return state, "", false
+	}
+	return lib.StateFailed, "reason: " + reasonDelegationRefused + " - " + ref.DelegationRefused, true
 }
 
 // ChainEnd is a delegation chain's root terminal as the gateway announced it

@@ -1231,6 +1231,14 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		// never that nothing is there.
 		return state, fmt.Errorf("reading task %s on %s: %w", read, addressee, terr)
 	}
+	// A turn whose delegation the gateway refused: its own completed is
+	// the hand-off line, and the observers were told the root failed with
+	// the refusal (observeEnded). Report the same.
+	if ref, ok := rec.TaskRefFor(read); ok && chainEnd == nil && state.Final {
+		if refused, why, ok := ref.refusedEnd(state.ExecutorState); ok {
+			state.ExecutorState, state.Result, state.Reason = refused, "", why
+		}
+	}
 	if chainEnd != nil {
 		// The child's own stream is not the root's end: the wake that
 		// would have digested it never ran. Report what the observers
@@ -1515,14 +1523,26 @@ func (g *Gateway) observeTaskTerminal(conversation, taskID string, state lib.Tas
 // a door submitted one task, so a delegation it never asked for must not
 // hand it a second task's start, an early "delegated to platform" as its
 // answer, or the end of a task it never heard of.
+// A turn whose delegation the gateway refused delivers nothing: its answer
+// is the hand-off line, not a result (TaskRef.refusedEnd).
 func (g *Gateway) observeDelivered(rec *SessionRecord, taskID, result string) {
+	if ref, ok := rec.TaskRefFor(taskID); ok && ref.DelegationRefused != "" {
+		return
+	}
 	if id, ends := rec.observedAs(taskID); ends {
 		g.observeTaskDelivered(rec.Key, id, result)
 	}
 }
 
+// A turn whose delegation the gateway refused ends failed with the refusal
+// as its reason, where its own terminal says completed (TaskRef.refusedEnd).
 func (g *Gateway) observeEnded(rec *SessionRecord, taskID string, state lib.TaskState, source TerminalSource, reason string) {
 	if id, ends := rec.observedAs(taskID); ends {
+		if ref, ok := rec.TaskRefFor(taskID); ok {
+			if refused, why, ok := ref.refusedEnd(state); ok {
+				state, reason = refused, why
+			}
+		}
 		g.observeTaskTerminal(rec.Key, id, state, source, reason)
 	}
 }

@@ -167,16 +167,90 @@ func TestADelegatingTurnIsOneTaskToTheObserver(t *testing.T) {
 	}
 }
 
-// TestARefusedDelegationLeavesTheParentsOwnEnd: no child was minted (a door
-// turn with no list), so nothing is withheld: the turn's own deliverable and
-// terminal reach the observer as any turn's do.
-func TestARefusedDelegationLeavesTheParentsOwnEnd(t *testing.T) {
-	r, spawn, obs := startObservedRig(t, func(c *Config) { armDoorMap(t, c) })
-	exec, origin, _ := sessionTurnVia(t, r, spawn, "a2a:agent-1001/ctx-refused", a2aBackend, "do a thing")
-	if err := exec.PublishArtifact(context.Background(), delegateArtifact(t, "platform", "x")); err != nil {
+// TestARefusedDelegationEndsTheRootFailed: the gateway refused the turn's
+// delegate request, so its `completed` answer is only the hand-off line.
+// Toward an observer the root ends failed with a delegation-refused reason
+// carrying the room's notice, and nothing is delivered; the read route
+// reports the same end once the chain settles. The room still gets the
+// turn's line and the notice.
+func TestARefusedDelegationEndsTheRootFailed(t *testing.T) {
+	for _, tc := range []struct {
+		name, rule, backend, conv string
+		tweak                     func(t *testing.T) func(*Config)
+		before                    func(t *testing.T, r *rig, conv, taskID string)
+	}{
+		{"the door with no list", ruleDelegationDoorUnlisted, a2aBackend, "a2a:agent-1001/ctx-refused",
+			func(t *testing.T) func(*Config) { return func(c *Config) { armDoorMap(t, c) } }, nil},
+		{"a requester off the list", ruleDelegationAllowedUsers, injectBackend, injectKeyPrefix + "case-refused-list",
+			func(t *testing.T) func(*Config) {
+				return func(c *Config) {
+					armInjectMap(t, c)
+					c.TargetAllowedUsers = map[string]map[string][]string{targetPlatform: {injectBackend: {"someone-else"}}}
+				}
+			}, nil},
+		{"the depth bound", ruleDelegationDepth, injectBackend, injectKeyPrefix + "case-refused-depth",
+			func(t *testing.T) func(*Config) { return func(c *Config) { armInjectMap(t, c) } },
+			func(t *testing.T, r *rig, conv, taskID string) {
+				putRecord(t, r, conv, func(rec *SessionRecord) {
+					for i := range rec.Tasks {
+						if rec.Tasks[i].ID == taskID {
+							rec.Tasks[i].Depth = r.g.cfg.DelegationDepthMax
+						}
+					}
+				})
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, spawn, obs := startObservedRig(t, tc.tweak(t))
+			exec, origin, _ := sessionTurnVia(t, r, spawn, tc.conv, tc.backend, "do a thing")
+			if tc.before != nil {
+				tc.before(t, r, tc.conv, origin.TaskID)
+			}
+			if err := exec.PublishArtifact(context.Background(), delegateArtifact(t, "platform", "x")); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, "refusal line", loggedContaining(r, "delegation refused", "rule="+tc.rule))
+			completeTask(t, exec, "delegated to platform")
+			waitFor(t, "the turn's terminal", func() bool { _, ok := obs.terminalFor(origin.TaskID); return ok })
+			end, _ := obs.terminalFor(origin.TaskID)
+			notice, ok := strings.CutPrefix(end.text, "reason: "+reasonDelegationRefused+" - ")
+			if end.state != lib.StateFailed || !ok || notice == "" {
+				t.Fatalf("root terminal = %+v, want failed with reason %s and the notice", end, reasonDelegationRefused)
+			}
+			waitFor(t, "the same notice posted to the room", postedContaining(r, notice))
+			assertOnlyRoot(t, obs, origin.TaskID)
+			assertNoDelivery(t, obs)
+			if platformSubmissions(t, r) != 0 {
+				t.Fatal("a refused delegation reached platform")
+			}
+
+			waitFor(t, "the turn released", func() bool {
+				rec, _ := r.g.reg.Get(context.Background(), tc.conv)
+				return rec.ActiveTask == nil
+			})
+			st, err := r.g.probeConversation(context.Background(), tc.conv, origin.TaskID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !st.Final || st.ExecutorState != lib.StateFailed || st.Result != "" || st.Reason != end.text || st.TerminalSource != end.source {
+				t.Fatalf("probe of the root = %+v, want the observer's end %+v", st, end)
+			}
+		})
+	}
+}
+
+// TestAnIgnoredDelegationLeavesTheParentsOwnEnd: a request the gateway
+// ignores (here, blank text: malformed) is not a refusal, so nothing is
+// withheld: the turn's own deliverable and terminal reach the observer as
+// any turn's do.
+func TestAnIgnoredDelegationLeavesTheParentsOwnEnd(t *testing.T) {
+	r, spawn, obs := startObservedRig(t, func(c *Config) { armInjectMap(t, c) })
+	conv := injectKeyPrefix + "case-ignored"
+	exec, origin, _ := sessionTurnVia(t, r, spawn, conv, injectBackend, "do a thing")
+	if err := exec.PublishArtifact(context.Background(), delegateArtifact(t, "platform", " ")); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "refusal line", loggedContaining(r, "delegation refused", "rule="+ruleDelegationDoorUnlisted))
+	waitFor(t, "ignore line", loggedContaining(r, "delegation ignored", "rule="+ruleDelegationMalformed))
 	completeTask(t, exec, "delegated to platform")
 	waitFor(t, "the turn's terminal", func() bool { _, ok := obs.terminalFor(origin.TaskID); return ok })
 	want := []string{"started:" + origin.TaskID, "accepted:" + origin.TaskID,
@@ -186,6 +260,13 @@ func TestARefusedDelegationLeavesTheParentsOwnEnd(t *testing.T) {
 	}
 	if ev := obs.events(); ev[2].text != "delegated to platform" || ev[3].state != lib.StateCompleted {
 		t.Fatalf("deliverable %q, terminal %+v", ev[2].text, ev[3])
+	}
+	waitFor(t, "the turn released", func() bool {
+		rec, _ := r.g.reg.Get(context.Background(), conv)
+		return rec.ActiveTask == nil
+	})
+	if st, err := r.g.probeConversation(context.Background(), conv, origin.TaskID); err != nil || st.ExecutorState != lib.StateCompleted || st.Result != "delegated to platform" {
+		t.Fatalf("probe of an ignored delegation's turn = %+v %v", st, err)
 	}
 }
 
