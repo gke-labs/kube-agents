@@ -28,7 +28,9 @@ name: Smoke Test Sticky Status
 # An admin `/override` is re-pinned like a green -- crier stamps the same
 # `BaseSHA:` suffix on it -- so a plain `/override` holds for the head it was
 # given until a push whenever the sweep wins the race below; when it loses,
-# the overridden job reruns, reds, and the override has to be repeated.
+# step 0 reads the override off the head and reuses it as it does a green,
+# so the override holds either way until a push (this Prow has no
+# `/override-cancel`; step 0 would honour one).
 # Upstream's `/override-sticky` has no race, and this Prow does not have it.
 #
 # It races Tide's sync loop: a sync that sees the stale statuses before the

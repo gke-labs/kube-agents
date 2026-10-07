@@ -376,14 +376,14 @@ GITOPS_SEED_CONTENT = "# GitOps Infrastructure Repo"
 # declared-intent cases (GITOPS_INTENT_NOTE_CASES) fail on a project whose
 # repository lacks it.
 GITOPS_INTENT_NOTE_PATH = "knowledge/notification-relay-no-pdb.md"
-GITOPS_INTENT_NOTE_MESSAGE = "Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, and seeded-c's missing upgrade notifications, as intended"
+GITOPS_INTENT_NOTE_MESSAGE = "Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, and burst-ingest's headroom, as intended"
 # The script's GITOPS_INTENT_NOTE_CONTENT, byte for byte, so the repair this
 # verifier prints is the note provisioning seeds; a test pins the two copies
 # to each other. The body read back is judged by the audit's parser, not
 # compared to this text.
 GITOPS_INTENT_NOTE_CONTENT = """---
 type: decision
-title: seeded-intent, seeded-token and seeded-c carry four postures on purpose
+title: seeded-intent, seeded-token, seeded-c and seeded-headroom carry five postures on purpose
 declares:
   - check: no-pdb
     namespace: seeded-intent
@@ -397,6 +397,9 @@ declares:
   - check: no-notifications
     namespace: ""
     object: Cluster/seeded-c
+  - check: overrequest
+    namespace: seeded-headroom
+    object: Deployment/burst-ingest
 ---
 
 `notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
@@ -405,8 +408,10 @@ namespace carries no NetworkPolicy by design either: nothing in it accepts traff
 in `seeded-token` runs on the default ServiceAccount of its namespace with the token mounted by
 design: it reads the API server with that identity. Its neighbour `token-sidecar` is not declared.
 `seeded-c` publishes no GKE upgrade notifications by design: this fleet learns about upgrades from
-the weekly audit. The obtainability, compliance and upgrade readiness audits list the four postures
-under Declared intent rather than as findings."""
+the weekly audit. `burst-ingest` in `seeded-headroom` requests far more memory than it uses by
+design: it is sized for an ingest burst the measured week does not show. The obtainability,
+compliance, upgrade readiness and waste audits list the five postures under Declared intent rather
+than as findings."""
 # The declarations the audits' parser (audit_report.py parse_declarations) must
 # find in the note's `declares` list, each with the stream whose `declarable`
 # set is the policy for it. A file that has the path but not these declares
@@ -421,12 +426,14 @@ GITOPS_INTENT_NOTE_CASES = (
     "compliance-declared-intent-no-finding",
     "compliance-declared-token-shields-siblings",
     "patch-declared-intent-no-finding",
+    "cost-declared-intent-no-finding",
 )
 GITOPS_INTENT_NOTE_DECLARATIONS = (
     ("obtainability-audit", {"check": "no-pdb", "namespace": "seeded-intent", "object": "Deployment/notification-relay"}),
     ("compliance-audit", {"check": "netpol-missing", "namespace": "seeded-intent", "object": "Namespace/seeded-intent"}),
     ("compliance-audit", {"check": "default-sa-automount", "namespace": "seeded-token", "object": "Deployment/token-reader"}),
     ("security-patch-orchestrator", {"check": "no-notifications", "namespace": "", "object": "Cluster/seeded-c"}),
+    ("fleet-wide-cost-analysis", {"check": "overrequest", "namespace": "seeded-headroom", "object": "Deployment/burst-ingest"}),
 )
 
 # Mirrors terraform/modules/github-minter/main.tf: the key is ASYMMETRIC_SIGN /
@@ -2549,10 +2556,9 @@ def _note_declaration_problem(body: str, repo_slug: str, audit=None) -> Optional
     """
     if audit is None:
         audit = _load_audit_report()
-    # One parse over the union of the streams' declarable sets, so the two
-    # items are read in one pass and neither draws the other stream's note on
-    # stderr; each stream's item is then matched among the entries of its own
-    # check. The policy is still the audit's: a slug that leaves its stream's
+    # One parse over the union of the streams' declarable sets, so the items
+    # are read in one pass and none draws another stream's note on stderr;
+    # each stream's item is then matched among the entries of its own check. The policy is still the audit's: a slug that leaves its stream's
     # set leaves the union, and this check rejects the note the day the audit does.
     declarable_by_stream = {stream: audit.audit_declarable_checks(stream) for stream, _ in GITOPS_INTENT_NOTE_DECLARATIONS}
     for stream, wanted_item in GITOPS_INTENT_NOTE_DECLARATIONS:

@@ -279,10 +279,16 @@ func buildLiteLLMNetworkPolicy(agent *agentv1alpha1.PlatformAgent, profile netpo
 //  3. With no endpoint at all, managedOTelCollectorNamespace ("gke-managed-otel").
 func litellmOTLPCollectorNamespace(agent *agentv1alpha1.PlatformAgent) string {
 	if ns := trimmedAnnotation(agent, AnnotationOTLPCollectorNamespace); ns != "" {
-		if errs := validation.IsValidLabelValue(ns); len(errs) == 0 {
+		// A DNS-1123 label, not merely a valid label value: this value is written
+		// into a kubernetes.io/metadata.name selector (buildLiteLLMNetworkPolicy's
+		// OTLP peer), which the API server only ever sets to a namespace's own
+		// DNS-1123 name. A valid-label-value-but-not-DNS-1123 namespace (uppercase,
+		// say) would pass IsValidLabelValue and emit a rule whose selector matches
+		// no namespace -- an OTLP egress rule that silently admits nothing.
+		if errs := validation.IsDNS1123Label(ns); len(errs) == 0 {
 			return ns
 		}
-		logf.Log.Info("Ignoring invalid annotation value: must be a valid label value", "annotation", AnnotationOTLPCollectorNamespace, "value", ns)
+		logf.Log.Info("Ignoring invalid annotation value: must be a DNS-1123 label", "annotation", AnnotationOTLPCollectorNamespace, "value", ns)
 	}
 	if agent != nil && agent.Spec.Telemetry != nil && agent.Spec.Telemetry.OTLPEndpoint != "" {
 		return otlpCollectorNamespace(agent.Spec.Telemetry.OTLPEndpoint)

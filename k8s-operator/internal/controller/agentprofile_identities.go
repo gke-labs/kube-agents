@@ -68,7 +68,7 @@ const (
 	// are needed to key the operator's map entry; with either unset the
 	// operator renders no entry for itself and publishes no cards, and the
 	// AgentProfile's CardPublished condition says so.
-	operatorNamespaceEnvVar      = "POD_NAMESPACE"
+	operatorNamespaceEnvVar      = OperatorNamespaceEnv
 	operatorServiceAccountEnvVar = "OPERATOR_SERVICE_ACCOUNT"
 
 	// a2aOperatorBusClientLabel marks the manager's pod as a bus client, so

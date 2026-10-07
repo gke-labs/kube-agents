@@ -255,7 +255,7 @@ and the issue has no readable block (`start` says so on stderr).
 
 `context_repos` names the repositories registered for **declared intent**: the `context_repos` key
 of `$GITOPS_STATE_CONFIGMAP`, added by an administrator by hand, as `owner/name` slugs. A stream
-whose SOP has a declared-intent step (`obtainability-audit` §4a, `compliance-audit` §3a, `security-patch-orchestrator` §4a) searches them before it
+whose SOP has a declared-intent step (`obtainability-audit` §4a, `compliance-audit` §3a, `security-patch-orchestrator` §4a, `fleet-wide-cost-analysis` §3a) searches them before it
 reports a posture as a finding. They are read and nothing else: the key is separate from
 `managed_repos`, the harness never merges the two, so the broker's push gate, the repository
 resolver and the sweep never see them. The list is empty when nothing is registered or the key
@@ -485,7 +485,7 @@ A check the cluster's shape rules out is not a gap. Declaring it in that cluster
 `checks_not_applicable` (below) takes it out of the denominator, so a cluster that ran everything
 that _can_ apply to it is a fully covered cluster. Without that, a fleet of Autopilot clusters is
 permanently partial: the ledger never closes, `resolved` is pinned at `0`, and no stale remediation
-pull request is ever cleaned up.
+pull request is ever cleaned up, the shield's close (SOP 2.7) aside.
 
 It does not mean "the description was truncated." A ledger too long for GitHub's body limit says so
 in its own body and still carries true totals in its title; the audit saw everything, so nothing
@@ -496,7 +496,7 @@ A gap changes what the run is _allowed to conclude_, because a finding's absence
 cluster is not evidence that it was fixed. Over a partial run the harness:
 
 - reports `resolved: 0` and posts no "resolved" delta, rather than announcing fixes it cannot see;
-- closes **no** remediation pull request as stale, so a fix survives to the next complete run;
+- closes **no** remediation pull request as stale, so a fix survives to the next complete run, except the shield's close (SOP 2.7), which rests on the declaration rather than on this run's reading;
 - does **not** close the ledger, even with zero findings — the issue stays open and gains a comment
   naming the gaps. `status` is `CLEAN` where the run accounted for every finding the previous
   ledger held, and `HELD` where it did not, which is a separate refusal that a gap neither causes
@@ -615,7 +615,7 @@ and say which clusters were not covered. See [The clean run](#the-clean-run) for
 (The `declared` entry and the `declared_intent_searched` list are illustrative and cross streams: a
 real compliance document would be rejected for the `no-hpa` entry, a check outside its roster. `declared[].check` is validated
 against the stream's `declarable` set in `AUDITS` — its posture checks, a subset of the roster — and
-`obtainability-audit`, `compliance-audit` and `security-patch-orchestrator` have one today, because their SOPs have a step that writes the list. A
+`obtainability-audit`, `compliance-audit`, `security-patch-orchestrator` and `fleet-wide-cost-analysis` have one today, because their SOPs have a step that writes the list. A
 non-empty `declared` or `declared_intent_searched` on any other stream exits 2; `[]` validates
 everywhere.)
 
@@ -835,7 +835,7 @@ What the shape enforces:
   the posture returns as a finding on the next run. A declaration the worker did not read is not
   one it may cite.
 - **It justifies posture, never a fault.** Which checks may move here is the stream's `declarable`
-  set in `AUDITS`, four for obtainability, two for compliance and six for the patch stream, and the validator rejects any other check with exit 2. A
+  set in `AUDITS`, four for obtainability, two for compliance, six for the patch stream and eight for the waste audit, and the validator rejects any other check with exit 2. A
   drain-blocking budget declared in a repository is a declared bug and stays a finding, and a
   document that lists it under `declared` publishes nothing.
 
@@ -872,7 +872,7 @@ What `finish` does with it:
   faults publish, the allow-all `NetworkPolicy/<name>` shape of `netpol-missing` among them, since its
   object tells it apart; `declared[]` entries publish.
   `partial` stays `bool(coverage_gaps)`, so the ledger does not close, `resolved` is `0`, no stale
-  pull request is retired, and the withheld ids enter no delta block and no remediation pull
+  pull request is retired (except the shield's close (SOP 2.7), which rests on the declaration rather than on this run's reading), and the withheld ids enter no delta block and no remediation pull
   request. The ledger names the withheld postures under _Declared intent not searched_ below the
   Scope table, the clean comment lists them, and the JSON line carries their ids as
   `postures_withheld`.
@@ -939,8 +939,10 @@ exist in the code — `resolved` and `resolved-merged` — but neither is ever r
 resolution is announced in the delta comment, by id and title recovered from the previous run's stored report, and
 the finding's open pull request is closed as stale. The compliance stream has a third close: a pull
 request whose remaining findings are all shielded (SOP 2.7, a declared workload sharing the `default`
-ServiceAccount) is closed with that reason, and those findings stay on the ledger as `manual` rather
-than becoming promotable again. A resolution whose fix had already **merged** is
+ServiceAccount) is closed with that reason, on a partial run too when a note `start` filed covers the
+namespace, since the reason is the declaration and not this run's reading, and those findings stay
+on the ledger, not proposed again while
+the declaration stands, rather than becoming promotable. A resolution whose fix had already **merged** is
 the ordinary, expected ending, so nothing extra is closed and nothing extra is said.
 
 Three of the five are easy to misread:
@@ -1179,7 +1181,7 @@ every binding, `debug-binding` included — and the document neither reports the
 carries a `resolved_because` entry for it, nor lists it under `declared`, the run either saw it gone
 or left it out, and from the document the two are the same absence. The ledger stays open and gets
 a comment naming each such finding and the check that ran (plus any `resolved_because` reasons and
-declared postures the document does carry), no remediation pull request is closed, and `finish` returns
+declared postures the document does carry), no remediation pull request is closed (except the shield's close (SOP 2.7), which rests on the declaration rather than on this run's reading), and `finish` returns
 `status: "HELD"` with `resolved: 0`, `silent_ok: false` and the ids in `unaccounted`. Report it as
 you would a partial run — the ledger URL and the held ids — and on the next run either report the
 finding or, if you re-ran its check and saw the object gone, say so in `resolved_because`. On a
@@ -1248,7 +1250,7 @@ after the close lands, so that a record older than the issue is never trusted; a
 after either delete leaves the run after it one of these. A held-open run only comments, so a failed
 store write there keeps the record, which still describes the body. It holds nothing it
 cannot name: the body is rewritten from this document, and a findings run leaves the next run a
-trusted record. A clean run never closes: the ledger stays open with a coverage gap saying the store
+trusted record. A clean run never closes the ledger (the shield's close of a shared-account pull request aside): the ledger stays open with a coverage gap saying the store
 had no trusted record, `partial: true` and `silent_ok: false`, and it stays open run after run until a
 findings run rewrites the body or a human who has checked the findings closes the issue. Say so in
 your report: the gap names both ways out only when the collector flags nothing, and otherwise says

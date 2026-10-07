@@ -6126,8 +6126,10 @@ func TestA2AInjectBackendIsOffWithoutTheFlag(t *testing.T) {
 		if e.Name == a2aInjectListenEnvVar {
 			t.Errorf("%s is rendered without the flag", a2aInjectListenEnvVar)
 		}
-		if e.Name == "A2A_PRINCIPAL_MAP" {
-			t.Errorf("A2A_PRINCIPAL_MAP is repointed without the flag: %+v", e)
+		// The chat map's path is rendered explicitly at the gateway's
+		// default; what the flag must not do is move it.
+		if e.Name == a2aPrincipalMapEnvVar && e.Value != a2aPrincipalMapDir {
+			t.Errorf("%s is repointed without the flag: %+v", a2aPrincipalMapEnvVar, e)
 		}
 	}
 	if len(container.Ports) != 0 {

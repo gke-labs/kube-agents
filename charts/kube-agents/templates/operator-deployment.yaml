@@ -60,10 +60,13 @@ spec:
             # apply time on the missing Certificate CRD. See the chart README.
             - name: ENABLE_WEBHOOKS
               value: {{ .Values.operator.webhooks.enabled | quote }}
-            # The manager's own namespace and ServiceAccount key its bus
-            # identity in a mode-next agent's identity map; it publishes
-            # AgentProfile cards with it. Unset, it renders no identity for
-            # itself and publishes no cards.
+            # The namespace this pod runs in. The operator admits its own
+            # pods, in this namespace, to the gateway and broker metrics ports
+            # so that it can read the counters behind status.usage; unset, it
+            # renders no such rule and the counters stay where they are.
+            # It and OPERATOR_SERVICE_ACCOUNT also key the manager's own bus
+            # identity in a mode-next agent's identity map, which it publishes
+            # AgentProfile cards with; unset, it renders no identity for itself.
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:

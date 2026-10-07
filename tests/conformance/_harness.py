@@ -263,6 +263,18 @@ SOURCES: dict[str, Source] = {
         "a2a/gateway/gchat.go",
         ("func (g *Gateway) resolveInjectPrincipal", "injectEvalPrincipalPrefix"),
     ),
+    # D1's identity-table check reads the two Roles the next stack mints that
+    # no golden renders (every golden is `mode: today`): the gateway's and the
+    # callout's. Anchored on the rule each one grants, so the extractor that
+    # reads them cannot return an empty body and pass.
+    "a2a_gateway_role": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ("func buildA2AGatewayRole(", '[]string{"deployments"},', "a2aSlackPrincipalMapSecretName ="),
+    ),
+    "a2a_callout_role": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_callout.go",
+        ("func buildA2ACalloutRole(", '[]string{"configmaps"},'),
+    ),
     # The A2A door is the inject door's sibling for an agent caller, gated and
     # resolved the same way; A3 reads the same two seams for it.
     "a2a_door_render": Source(

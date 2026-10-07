@@ -773,23 +773,31 @@ required_release_images_in_text() {
 # The candidate's list wins in both directions.
 #
 # When that list cannot be read -- no commit named, a commit this repository
-# does not have, no such file at it, or an array the parse above does not
-# accept -- this checkout's array is printed instead and one line on stderr
-# names the reason. That is the behaviour every rung had before this helper,
+# does not have, no such file at it, a `git show` of it that fails, or an
+# array the parse above does not accept -- this checkout's array is printed
+# instead and one line on stderr names the reason. That is the behaviour every rung had before this helper,
 # so the fallback never refuses or accepts anything the old gate did not; the
 # one shape it never takes is an empty list, which would pass the gate with
 # nothing checked. Always exits 0; a caller that reads nothing back has a
 # broken pipe, not an empty list, and must fail rather than proceed.
 # Arguments: $1 = candidate commit-ish
 required_release_images_at() {
-  local sha="${1:-}" names="" fallback_reason=""
+  local sha="${1:-}" text="" names="" fallback_reason=""
+  # The file is read whole before it is parsed, not piped into the parse. The
+  # parse stops at the list's closing `)` near the top of a file far larger
+  # than a pipe buffer, so `git show` would die on SIGPIPE mid-write and, under
+  # the pipefail this file sets, every candidate would read as unreadable
+  # (#2542). Captured, git show's own status still says whether the read
+  # failed, and a failed read falls back like any other unreadable list.
   if [ -z "${sha}" ]; then
     fallback_reason="no candidate commit named"
   elif ! git rev-parse --verify --quiet "${sha}^{commit}" >/dev/null 2>&1; then
     fallback_reason="commit ${sha:0:7} is not in this repository"
   elif ! git cat-file -e "${sha}:${REQUIRED_RELEASE_IMAGES_PATH}" 2>/dev/null; then
     fallback_reason="${sha:0:7} has no ${REQUIRED_RELEASE_IMAGES_PATH}"
-  elif ! names="$(git show "${sha}:${REQUIRED_RELEASE_IMAGES_PATH}" 2>/dev/null | required_release_images_in_text)"; then
+  elif ! text="$(git show "${sha}:${REQUIRED_RELEASE_IMAGES_PATH}" 2>/dev/null)"; then
+    fallback_reason="git show could not read ${REQUIRED_RELEASE_IMAGES_PATH} at ${sha:0:7}"
+  elif ! names="$(required_release_images_in_text <<<"${text}")"; then
     fallback_reason="${REQUIRED_RELEASE_IMAGES_PATH} at ${sha:0:7} has no readable ${REQUIRED_RELEASE_IMAGES_NAME}"
   fi
   if [ -n "${fallback_reason}" ]; then

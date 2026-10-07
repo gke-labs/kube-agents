@@ -85,6 +85,15 @@ const (
 	// shutdown line, matching unattributedListSeparator, which renders the other
 	// name-and-count list that line's neighbour prints.
 	unreachableListSeparator = ", "
+
+	// injectHeldOutOfScopeMarker is appended to the DRIFT line of a record the
+	// inject will hold because its cluster is outside the install's scope
+	// (DriftEvent.OutOfScope). On the DRIFT line rather than only on the hold
+	// line that follows it, because the DRIFT line is the one an operator
+	// greps for: a record that was seen and not escalated has to be readable
+	// as such from that line alone, or every unreachable DRIFT line in a run
+	// reads as a card that was sent.
+	injectHeldOutOfScopeMarker = "inject=held_out_of_scope"
 )
 
 // joinOutcome says what happened when the detector tried to enrich a record
@@ -123,8 +132,14 @@ const (
 	// The fan-in shrank this rather than removing it, and what is left is the
 	// useful part: a cluster in the project with no Cluster Agent profile and no
 	// credential flag naming it -- one not onboarded, or one whose profile was
-	// skipped at discovery. joiner.UnreachableClusters names them, because after
-	// the fan-in the count alone no longer says which.
+	// skipped at discovery. joiner.UnreachableClusters and OutOfScopeClusters
+	// name them, one list per disposition, because after the fan-in the count
+	// alone no longer says which.
+	//
+	// Still forwarded, and whether it is then injected is not decided here:
+	// DriftEvent.OutOfScope carries that, set when no readable Cluster Agent
+	// profile names the cluster, so a detector stays loud about a cluster it
+	// was meant to reach and quiet about the rest of the project.
 	joinUnreachable joinOutcome = "unreachable"
 
 	// joinFailed is any other lookup error: RBAC, a network fault, a timeout,
@@ -140,14 +155,21 @@ type joinCounts struct {
 	Gone        int
 	Unreachable int
 	Failed      int
+
+	// OutOfScope is the subset of Unreachable that was marked for the inject
+	// to hold -- see DriftEvent.OutOfScope. Not a sixth outcome: the record's
+	// Outcome stays joinUnreachable, and this count exists because a run that
+	// held every unreachable record and one that forwarded them all print the
+	// same Unreachable.
+	OutOfScope int
 }
 
 // String renders the tally for the shutdown line, always printing every
 // outcome. A zero that is absent reads as a category that did not apply; a zero
 // that is printed reads as one that did not happen, and those differ.
 func (c joinCounts) String() string {
-	return fmt.Sprintf("enriched=%d no_object=%d gone=%d unreachable=%d failed=%d",
-		c.Enriched, c.NoObject, c.Gone, c.Unreachable, c.Failed)
+	return fmt.Sprintf("enriched=%d no_object=%d gone=%d unreachable=%d out_of_scope=%d failed=%d",
+		c.Enriched, c.NoObject, c.Gone, c.Unreachable, c.OutOfScope, c.Failed)
 }
 
 // DriftEvent is an audit record plus what the live object says about it. It is
@@ -180,6 +202,38 @@ type DriftEvent struct {
 
 	// LookupError is the error behind a joinFailed outcome, nil otherwise.
 	LookupError error
+
+	// OutOfScope is set by the joiner on a joinUnreachable record whose
+	// cluster the install's scope does not name: the profiles directory was
+	// read and no readable Cluster Agent profile in it carries this identity
+	// (scopeIndex says what "readable" covers and how a drop is logged). The
+	// record is logged and not escalated: driftInjectHandler.Handle writes
+	// the DRIFT line with injectHeldOutOfScopeMarker, counts the hold, and
+	// sends nothing.
+	//
+	// The clusters this describes are the ones in the project the reconcile
+	// never onboarded -- excluded by spec.scope, or simply not profiled. The
+	// subscription is project-wide, so their records arrive regardless, and
+	// each one injected is a card that says a change happened on a cluster
+	// nobody profiled, with no owners and no lookup error, spending a unit of
+	// the fleet-wide daily drift budget that the profiled clusters then do
+	// not have. Past the ceiling the daemon suppresses silently, so a channel
+	// gone quiet reads the same as one with nothing to report.
+	//
+	// Not set for an unreachable record from a cluster a profile does name.
+	// Those are inside the scope and the join still could not read them --
+	// every profile skipped at discovery for a 403, or a profile the
+	// reconcile wrote after discovery ran -- and they are forwarded and
+	// injected exactly as before this field existed, because a thin card is
+	// the symptom an operator acts on and a silent hold would turn the
+	// README's named IAM gap into a detector that looks healthy and reports
+	// nothing. Not set either when the scope is unknown: no --profiles-dir,
+	// or a directory that cannot be read (scopeIndex has both), and not for
+	// a record whose identity is incomplete, which no scope could name. The
+	// size of the join is not the test, because a deployed detector always
+	// joins its own cluster and so always has one; what separates a scope
+	// boundary from a misconfiguration is whether a profile names the cluster.
+	OutOfScope bool
 }
 
 // driftEventHandler consumes an enriched record. logDriftEvent is one; with
@@ -248,8 +302,8 @@ func (c clusterIdentity) String() string {
 // whichever registered cluster happens to share the parts it does carry, and
 // enriching it from that cluster's object of the same name.
 //
-// Keeping the partial identity out of the unreachable-cluster list is a
-// separate job, done by noteUnreachable: refusing the record here produces the
+// Keeping the partial identity out of the unreachable-cluster lists is a
+// separate job, done by noteCluster: refusing the record here produces the
 // same joinUnreachable outcome a missed lookup would, so this test cannot be
 // what stops "proj//" being named there.
 func (c clusterIdentity) complete() bool {
@@ -300,22 +354,42 @@ type joiner struct {
 	next   driftEventHandler
 	counts joinCounts
 
-	// unreachable counts records per cluster this process cannot read, so the
-	// shutdown report can name them. Capped at maxUnreachableClusters; past
-	// that, new clusters are counted under unreachableOverflowLabel.
+	// scope says whether a Cluster Agent profile names a cluster, for the
+	// out-of-scope hold on an unreachable record. nil when the detector was
+	// started without --profiles-dir, and then nothing is ever held.
+	scope scopeIndex
+
+	// injected reports whether the inject already sent a card for an insertId,
+	// so a record redelivered after its cluster left the scope is not marked
+	// held -- the inject would count it a duplicate and send nothing, and a
+	// DRIFT line carrying the hold marker, a held count and a named cluster
+	// would all say a card was withheld that was in fact sent. realMain always
+	// wires the inject handler's hook, which answers false while the inject is
+	// off; nil is the joiner built without one, in tests, and means never.
+	injected func(insertID string) bool
+
+	// unreachable counts records per cluster this process cannot read and did
+	// not hold, and held counts the ones it did (DriftEvent.OutOfScope), so
+	// the shutdown report can name each set with what became of its records.
+	// Each capped at maxUnreachableClusters; past that, new clusters are
+	// counted under unreachableOverflowLabel.
 	unreachable map[string]int
+	held        map[string]int
 }
 
 // newJoiner builds the handler. An empty or nil cluster set is legal and
 // documented on the field: the detector supports running with no cluster access
-// at all.
-func newJoiner(clusters map[clusterIdentity]objectGetter, gitopsManagers map[string]bool, next driftEventHandler) *joiner {
+// at all. A nil scope is legal for the same reason and documented on its field.
+func newJoiner(clusters map[clusterIdentity]objectGetter, gitopsManagers map[string]bool, scope scopeIndex, injected func(insertID string) bool, next driftEventHandler) *joiner {
 	return &joiner{
 		clusters:       clusters,
 		gitopsManagers: gitopsManagers,
+		scope:          scope,
+		injected:       injected,
 		timeout:        joinRequestTimeout,
 		next:           next,
 		unreachable:    map[string]int{},
+		held:           map[string]int{},
 	}
 }
 
@@ -355,7 +429,19 @@ func (j *joiner) Handle(ctx context.Context, record AuditRecord) {
 		j.counts.Gone++
 	case joinUnreachable:
 		j.counts.Unreachable++
-		j.noteUnreachable(recordIdentity(record))
+		// Marked here and not in join, which classifies one record against
+		// the routing table: whether a cluster the table lacks is outside the
+		// install's scope is a question for the profiles directory, not the
+		// table, and the field's doc comment has the argument for asking it
+		// this way.
+		identity := recordIdentity(record)
+		if j.outOfScope(identity) && !j.alreadyInjected(record.InsertID) {
+			event.OutOfScope = true
+			j.counts.OutOfScope++
+			j.noteCluster(j.held, identity)
+		} else {
+			j.noteCluster(j.unreachable, identity)
+		}
 	case joinFailed:
 		j.counts.Failed++
 	}
@@ -363,8 +449,25 @@ func (j *joiner) Handle(ctx context.Context, record AuditRecord) {
 	j.next(ctx, event)
 }
 
-// noteUnreachable records one sighting of a cluster this process has no client
-// for, so UnreachableClusters can name it.
+// alreadyInjected is the injected hook with nil meaning never.
+func (j *joiner) alreadyInjected(insertID string) bool {
+	return j.injected != nil && j.injected(insertID)
+}
+
+// outOfScope decides the hold for one unreachable record: true only when the
+// scope is known and names no profile for the cluster. DriftEvent.OutOfScope
+// lists the cases that answer false and why each must.
+func (j *joiner) outOfScope(identity clusterIdentity) bool {
+	if j.scope == nil || !identity.complete() {
+		return false
+	}
+	profiled, known := j.scope.Profiled(identity)
+	return known && !profiled
+}
+
+// noteCluster records one sighting of a cluster this process has no client
+// for, in whichever of the two shutdown lists the record's disposition puts
+// it, so UnreachableClusters or OutOfScopeClusters can name it.
 //
 // Keyed on the rendered identity rather than the struct because the overflow
 // bucket is a label and not a cluster, and a map keyed on clusterIdentity has
@@ -375,37 +478,44 @@ func (j *joiner) Handle(ctx context.Context, record AuditRecord) {
 // missing a part renders as "proj//", which is not a cluster anyone can act on.
 // The count still moves, so nothing is hidden -- a gap between the unreachable
 // total and the sum of the named entries is how this shows up.
-func (j *joiner) noteUnreachable(identity clusterIdentity) {
+func (j *joiner) noteCluster(counts map[string]int, identity clusterIdentity) {
 	if !identity.complete() {
 		return
-	}
-	if j.unreachable == nil {
-		j.unreachable = map[string]int{}
 	}
 	name := identity.String()
 	// A cluster already being counted keeps counting past the cap; only a new
 	// name folds into the overflow bucket, which is how classify.go bounds its
 	// principal set without distorting the counts it already holds.
-	if _, known := j.unreachable[name]; !known && len(j.unreachable) >= maxUnreachableClusters {
+	if _, known := counts[name]; !known && len(counts) >= maxUnreachableClusters {
 		name = unreachableOverflowLabel
 	}
-	j.unreachable[name]++
+	counts[name]++
 }
 
 // UnreachableClusters renders "cluster=count" entries for the shutdown line,
-// most frequent first.
+// most frequent first: the clusters the join could not read whose records were
+// forwarded without ownership, because a profile names them or the scope was
+// never known.
 //
 // The count alone says how much the join missed; this says which cluster to go
-// and onboard, which is the difference between a number and an action. Empty
+// and look at, which is the difference between a number and an action. Empty
 // when nothing was missed, so the caller can leave the clause off entirely.
-func (j *joiner) UnreachableClusters() []string {
-	names := make([]string, 0, len(j.unreachable))
-	for name := range j.unreachable {
+func (j *joiner) UnreachableClusters() []string { return renderClusterCounts(j.unreachable) }
+
+// OutOfScopeClusters is UnreachableClusters for the held set: the clusters no
+// readable profile names, whose records were logged and not escalated. These
+// are the ones to onboard, to exclude, or whose profile the scope's log named
+// as not reading.
+func (j *joiner) OutOfScopeClusters() []string { return renderClusterCounts(j.held) }
+
+func renderClusterCounts(counts map[string]int) []string {
+	names := make([]string, 0, len(counts))
+	for name := range counts {
 		names = append(names, name)
 	}
 	sort.Slice(names, func(a, b int) bool {
-		if j.unreachable[names[a]] != j.unreachable[names[b]] {
-			return j.unreachable[names[a]] > j.unreachable[names[b]]
+		if counts[names[a]] != counts[names[b]] {
+			return counts[names[a]] > counts[names[b]]
 		}
 		return names[a] < names[b]
 	})
@@ -415,7 +525,7 @@ func (j *joiner) UnreachableClusters() []string {
 		// location and cluster come out of the audit record rather than from
 		// anything this process validated, so an unquoted one could forge what
 		// reads as a separate log line.
-		out = append(out, fmt.Sprintf("%q=%d", name, j.unreachable[name]))
+		out = append(out, fmt.Sprintf("%q=%d", name, counts[name]))
 	}
 	return out
 }
@@ -691,6 +801,13 @@ func logDriftEvent(_ context.Context, event DriftEvent) {
 	}
 	if event.LookupError != nil {
 		line += fmt.Sprintf(" lookup_error=%q", event.LookupError)
+	}
+	// Appended here, where the DRIFT line is built, rather than by the inject
+	// handler that acts on the flag: the line is identical with the inject on
+	// and off, and the marker says what the handler will do with the record,
+	// which is the fact an operator reading only DRIFT lines needs.
+	if event.OutOfScope {
+		line += " " + injectHeldOutOfScopeMarker
 	}
 
 	log.Print(line)

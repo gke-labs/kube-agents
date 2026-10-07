@@ -174,6 +174,11 @@ type Gateway struct {
 	// resolution (Config.GchatAllowedUsers, lowercased at build).
 	gchatAllowed  map[string]bool
 	gchatAllowAll bool
+	// slackAllowed and slackAllowAll gate the slack backend's identity
+	// resolution ahead of the principal map (Config.SlackAllowedUsers,
+	// case preserved: Slack member ids compare exactly).
+	slackAllowed  map[string]bool
+	slackAllowAll bool
 	// droppedNotices records which unverifiable senders have been told so —
 	// the drop is visible once per sender, not once per message. Per
 	// sender, NOT per conversation: a channel mention mints a fresh
@@ -259,9 +264,10 @@ func New(o Options) (*Gateway, error) {
 	// does not use one either: its grant is the mechanism, since only the
 	// console credential may publish on the console subject. And a gateway
 	// whose only ingress is the side door uses the door's map below instead
-	// of this one. Slack is the case that matters operationally: nothing
-	// renders its map yet (#2099), so a Slack gateway whose map path is
-	// missing would otherwise pass boot silently and drop every sender.
+	// of this one. Slack is the case that matters operationally: the
+	// operator projects its map Secret as optional, so a Slack gateway on
+	// an install that never created it would otherwise pass boot silently
+	// and drop every sender.
 	// Naming the backend matters, because the other ingresses beside it
 	// keep working.
 	if (backend == discordBackend || backend == slackBackend) && pm.Len() == 0 {
@@ -307,6 +313,15 @@ func New(o Options) (*Gateway, error) {
 	if backend == gchatBackend && len(gchatAllowed) == 0 && !o.Config.GchatAllowAllUsers {
 		log.Warn("gchat allowlist is empty and allow-all is off; every inbound message will be dropped at verification")
 	}
+	slackAllowed := map[string]bool{}
+	for _, u := range o.Config.SlackAllowedUsers {
+		if u = strings.TrimSpace(u); u != "" {
+			slackAllowed[u] = true
+		}
+	}
+	if backend == slackBackend && len(slackAllowed) == 0 && !o.Config.SlackAllowAllUsers {
+		log.Warn("slack allowlist is empty and allow-all is off; every inbound message will be dropped at verification")
+	}
 	if o.RelayDurable == "" {
 		o.RelayDurable = relayDurable
 	}
@@ -351,6 +366,8 @@ func New(o Options) (*Gateway, error) {
 		a2aAudience:    a2aAudience,
 		gchatAllowed:   gchatAllowed,
 		gchatAllowAll:  o.Config.GchatAllowAllUsers,
+		slackAllowed:   slackAllowed,
+		slackAllowAll:  o.Config.SlackAllowAllUsers,
 		droppedNotices: map[string]bool{},
 		relayDurable:   o.RelayDurable,
 	}
@@ -1787,13 +1804,20 @@ func messagePayload(text, taskID, contextID string) ([]byte, error) {
 // leave H("console") in a snapshot whose requester.principal is
 // H("nats:console") - the requester missing from its own audience.
 //
+// Slack goes the same way for a different reason: its requester passes the
+// allowlist before the map (resolvePrincipal), and a roster read under the
+// map alone would name a mapped member the allowlist refuses by the
+// principal the gateway just declined to grant them. Through
+// resolvePrincipal that member is recorded by backend id instead, like any
+// unmapped one.
+//
 // Every other backend resolves in its OWN map rather than in whichever one
 // the gateway happens to hold, which is principalMapFor: the roster has to
 // be read under the same map the requester's principal was read under, and
 // one backend's map is never a fallback for another's.
 func (g *Gateway) rosterResolver(backend string) func(string) string {
-	if backend == consoleBackend {
-		return func(id string) string { return g.resolvePrincipal(consoleBackend, id) }
+	if backend == consoleBackend || backend == slackBackend {
+		return func(id string) string { return g.resolvePrincipal(backend, id) }
 	}
 	return g.principalMapFor(backend).Resolve
 }
