@@ -527,6 +527,77 @@ func TestADelegateAfterTheTerminalMintsNothing(t *testing.T) {
 	}
 }
 
+// TestAStoppedTurnDoesNotDelegate: a human's stop on the session turn means
+// no child, whichever reaches the gateway first. Stop first: the adapter's
+// delegate call raced its cancel and the artifact relays after the stop.
+// Artifact first: it is on the stream when the gateway handles the stop
+// (a relay behind, or a restart), and its relay batch runs after. Either
+// way the relay finds the turn detached and canceled, ignores the request
+// as stale, posts nothing about it, and nothing reaches platform.
+func TestAStoppedTurnDoesNotDelegate(t *testing.T) {
+	assertIgnored := func(t *testing.T, r *rig, taskID string) {
+		t.Helper()
+		waitFor(t, "ignore line", loggedContaining(r, "delegation ignored", "rule="+ruleDelegationStale, "stopped=true", taskID))
+		if n := platformSubmissions(t, r); n != 0 {
+			t.Fatalf("a stopped turn minted %d children", n)
+		}
+		if postedContaining(r, "delegation refused")() {
+			t.Fatalf("a stopped turn's delegation posted a refusal: %v", r.adapter.postTexts())
+		}
+	}
+	t.Run("stop first", func(t *testing.T) {
+		r, spawn := startRigWithSpawner(t)
+		ctx := context.Background()
+		conv := "discord:g1/t-stop-then-del"
+		exec, origin, _ := sessionTurn(t, r, spawn, conv, "x")
+		sessionRigTurn(r, conv, "stop-1", "stop")
+		waitFor(t, "cancel sent", postedContaining(r, "cancel sent"))
+		if err := exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "report fleet health")); err != nil {
+			t.Fatal(err)
+		}
+		assertIgnored(t, r, origin.TaskID)
+	})
+	t.Run("artifact first", func(t *testing.T) {
+		r, spawn := startRigWithSpawner(t)
+		ctx := context.Background()
+		conv := "discord:g1/t-del-then-stop"
+		exec, origin, _ := sessionTurn(t, r, spawn, conv, "x")
+		waitFor(t, "the turn on the record", func() bool {
+			rec, _ := r.g.reg.Get(ctx, conv)
+			return rec != nil && rec.ActiveTask != nil && rec.ActiveTask.TaskID == origin.TaskID
+		})
+		// The session lock holds the relay's batch for the artifact back
+		// until the stop has been handled, as a lagging relay or a restart
+		// would: the stop runs here as routeTurn runs it.
+		l := r.g.lockSession(conv)
+		l.Lock()
+		if err := exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "report fleet health")); err != nil {
+			l.Unlock()
+			t.Fatal(err)
+		}
+		rec, err := r.g.reg.Get(ctx, conv)
+		if err != nil || rec == nil || rec.ActiveTask == nil {
+			l.Unlock()
+			t.Fatalf("record: %+v %v", rec, err)
+		}
+		r.g.cancelTask(ctx, rec, Authority{})
+		err = r.g.reg.Put(ctx, rec)
+		l.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, "cancel on the session's subject", func() bool {
+			for _, e := range inSubjectEnvelopes(t, r.url, rec.Addressee) {
+				if e.Kind == lib.KindCancel && e.TaskID == origin.TaskID {
+					return true
+				}
+			}
+			return false
+		})
+		assertIgnored(t, r, origin.TaskID)
+	})
+}
+
 // TestADelegateFromAFixedRoutePlatformTaskIsIgnored: platform may not
 // delegate to itself; only the conversation's own session may ask.
 func TestADelegateFromAFixedRoutePlatformTaskIsIgnored(t *testing.T) {

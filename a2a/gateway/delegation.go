@@ -100,6 +100,16 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		ignore(ruleDelegationStale)
 		return
 	}
+	// A turn the human stopped is not a live request, whichever reached
+	// the gateway first: the stop, or the artifact the adapter published
+	// before its cancel arrived. The stop turn and this relay batch
+	// serialize on the session lock, so this is the one place the check
+	// holds without a race. Ignored rather than refused: the human said
+	// stop, and a notice about a delegation they stopped says nothing new.
+	if rec.ActiveTask.Detached || parent.Canceled {
+		ignore(ruleDelegationStale, "stopped", true)
+		return
+	}
 	// The adapter holds the same cap and refuses blank text; a request that
 	// breaks either reached the bus some other way.
 	if !parsed || strings.TrimSpace(req.Text) == "" || len(req.Text) > lib.DelegateTextCap {

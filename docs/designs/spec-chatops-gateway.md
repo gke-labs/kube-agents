@@ -283,12 +283,17 @@ is advertised or served, and it governs the tool even over an explicit `A2A_ALLO
 override, so an operator overriding the harness's tool list does not have to re-name it to keep
 it off; `A2A_DELEGATE_SOCKET` names the unix socket the tool and the adapter agree on (a path in
 the pod's scratch volume by default). A call reaching the adapter after the turn has already
-ended - the deadline hit, a `stop` canceled it, or an earlier call this turn already delegated -
-is refused there, inside the same turn, and never reaches the gateway.
+ended - the deadline hit, the adapter received a `stop`'s cancel, or an earlier call this turn
+already delegated - is refused there, inside the same turn, and never reaches the gateway. The
+adapter knows of a `stop` only once its cancel arrives, so a call that raced the cancel, or an
+artifact already on the stream when the gateway handles the `stop`, still reaches the gateway; the
+gateway's own check below ignores it.
 
 **The gateway acts on it only from the task it started**, addressed to the record's current
-incarnation and still that incarnation's active task; a straggler from a retired incarnation, or an
-event after the active task has moved on, is ignored and logged under one rule (`delegation.stale`),
+incarnation and still that incarnation's active task, and only while that task has not been
+stopped; a straggler from a retired incarnation, an event after the active task has moved on, or a
+request from a turn the human stopped (whichever of the two the gateway handled first) is ignored
+and logged under one rule (`delegation.stale`),
 never relayed - a different rule from a part that fails to parse, is blank, or is over the text cap,
 which is ignored and logged separately (`delegation.malformed`). Only `platform` can be the
 addressee today.
