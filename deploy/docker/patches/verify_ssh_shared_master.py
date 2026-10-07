@@ -6,9 +6,10 @@ The applier proves its anchors matched once; this imports the patched modules an
 behave: a shared environment's ``cleanup()`` runs no ``ssh -O exit`` and ``close_master()`` does,
 a probe's ``cleanup()`` still closes its private master, and the terminal result carries the hint
 only for an ssh exit 255 without the cwd marker. The two inserted statements are also checked with
-``patchlib.unbound``: the ``__init__`` mark is never executed here (the instances are built with
-``__new__``), so an upstream rename of ``probe_only`` would otherwise pass this gate and raise
-``NameError`` on every construction.
+``patchlib.unbound`` for ``probe_only``, ``env_type`` and ``result`` (``returncode`` and
+``failure_hint`` are pinned by the anchor line itself): the ``__init__`` mark is never executed here
+(the instances are built with ``__new__``), so an upstream rename of ``probe_only`` would otherwise
+pass this gate and raise ``NameError`` on every construction.
 
 Usage::
 

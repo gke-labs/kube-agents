@@ -22,9 +22,10 @@ Three anchored edits in two files:
 - ``terminal_tool_result.py``: a foreground ssh result with exit 255 and no cwd marker gets a ``hint``, the
   way exit 124 has one, unless upstream already attached a hint to the output (``Permission
   denied``). The wrapper prints the marker after the command and exits with its code, so a
-  command's own 255 carries the marker (unless the command text itself ends the wrapper shell
-  early: a top-level ``exit`` or ``exec``, ``set -e``, a closed stdout) and a cut connection, or
-  one ssh never opened, does not.
+  command's own 255 carries the marker (unless the command text keeps the marker from being
+  printed: a top-level ``exit`` or ``exec``, or a failing command under ``set -e``, ends the
+  wrapper shell first, and a closed stdout drops the printf) and a cut connection, or one ssh
+  never opened, does not.
 
 The eviction path (``_evict_environment_for_task``) is left alone: at v2026.9.14 nothing reaches it
 with a registered ssh environment, because a connection failure during construction fires before
