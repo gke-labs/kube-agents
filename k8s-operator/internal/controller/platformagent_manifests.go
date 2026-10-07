@@ -4328,6 +4328,16 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		driftDetectorClusterNameEnv,
 		driftDetectorSubscriptionEnv,
 		driftDetectorGitopsManagersEnv,
+		// Not every DRIFT_DETECTOR_* name belongs on this list, and the six
+		// above are not here for being drift variables. They are here because
+		// buildAgentAPIAuthSidecar appends each one after this merge, so an
+		// unreserved name would duplicate and stall the apply, as the note
+		// above says. DRIFT_DETECTOR_LOG_DROPPED is read by
+		// deploy/shared/start-services.sh and written by nothing, so it is
+		// absent on purpose: adding it for symmetry with its siblings is the
+		// one edit that stops an operator setting it through
+		// spec.deployment.env from reaching the detector at all, and nothing
+		// in the render would fail to say so.
 		"KSA_TOKEN_FILE",
 		"TOKEN_BROKER_URL",
 	} {
@@ -4449,9 +4459,16 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// tunes it (DRIFT_QUOTA_KEY in session_kv_server.py). It earns the same
 		// place here for the same reason the others do — it bounds a count of
 		// chat messages and reaches nothing else.
-		"ALERT_DAILY_LIMIT_DRIFT":     {},
-		"ALERT_DAILY_LIMIT_INFO":      {},
-		"ALERT_DAILY_LIMIT_WARNING":   {},
+		"ALERT_DAILY_LIMIT_DRIFT":   {},
+		"ALERT_DAILY_LIMIT_INFO":    {},
+		"ALERT_DAILY_LIMIT_WARNING": {},
+		// Deliberately no DRIFT_DETECTOR_LOG_DROPPED here, though
+		// deploy/shared/start-services.sh reads it. This list governs the agent
+		// sandbox container; the detector runs in the credential-proxy sidecar
+		// (deploy/docker/Dockerfile), which takes spec.deployment.env through
+		// mergeCredentialProxyEnv instead — a denylist, so an unreserved name
+		// passes through without being named anywhere. An entry here would copy
+		// the variable into a container that never reads it.
 		"EOD_EXCLUDE_NAMESPACES":      {},
 		"FEEDBACK_PROMPT_DELAY":       {},
 		"FEEDBACK_PROMPT_ENABLED":     {},
