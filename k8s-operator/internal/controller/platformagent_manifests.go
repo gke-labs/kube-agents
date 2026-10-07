@@ -1858,8 +1858,9 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		// the volume with.
 		Database *managedDatabaseConfig `json:"database,omitempty"`
 		// Hooks carries the bridge activity door's pod-wide entry under
-		// mode next with a bridge declared (a2aActivityHook); absent
-		// otherwise, so a default install's config is unchanged.
+		// mode next with an api-executor bridge in the pod, rendered or
+		// declared (a2aActivityHook); absent otherwise, so a today
+		// install's config is unchanged.
 		Hooks *managedHooks `json:"hooks,omitempty"`
 	}{}
 

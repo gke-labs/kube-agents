@@ -297,7 +297,7 @@ readonly BRIDGE_QUEUE_CAPACITY=1024
 # A2A_RESERVE_PER_WORKER * (the bridge workers the pod runs, rendered or
 # declared); provisioning never edits a stream that exists, and a later
 # render whose budget exceeds the live stream is refused. The operator
-# renders the bridge from the first next render, with the BRIDGE_CONCURRENCY
+# budgets the bridge from the first next render, with the BRIDGE_CONCURRENCY
 # step 4 hands it, so the first provision already counts the lane's workers
 # and there is no second render to fit. Section 2b still sizes
 # spec.harness.tuning.maxSessions from these four so the lane's budget stays
@@ -1323,8 +1323,9 @@ echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
 # mode alone does not give it. The inject door's Service and token Secret are
 # waited for (the operator renders them only with the flag step 5 set on it;
 # hack/ci-eval-pr.sh reads that Secret). The bridge sidecar is the
-# operator's: it renders it into the agent pod from the first next render,
-# with the image, BRIDGE_CONCURRENCY and executor pin step 5 set on it
+# operator's: it budgets it from the first next render and adds it to the
+# agent pod once the bus is provisioned, with the image, BRIDGE_CONCURRENCY
+# and executor pin step 5 set on it
 # (a2a/docs/hermes-bridge.md, "Where it runs"), so the mode patch is the only
 # patch and the first provisioning Job already budgets the bridge's workers:
 # no second render re-measures that budget against the stream the Job

@@ -48,15 +48,20 @@ container; `NATS_URL` for the `<agent>-a2a-nats` Service; `NATS_USER=bridge` and
 optional. The `api` executor needs the pod's `API_SERVER_KEY`, which the copy carries
 ([Executors](#executors)).
 
-The image is `A2A_BRIDGE_IMAGE` when that is set. Unset, it is the agent image's registry
-and tag with the last path segment swapped for `hermes-bridge`: the bridge is built `FROM`
-the platform-agent image of the same commit, so the two containers are one build. Three
+The image is `A2A_BRIDGE_IMAGE` when that is set. Unset, and when the agent container runs
+the release `platform-agent` image by tag, it is that image's registry and tag with the last
+path segment swapped for `hermes-bridge`: the bridge is built `FROM` the platform-agent image
+of the same commit, so the two containers are one build. Otherwise - an agent image under a
+custom repository name, which has no bridge published beside it, or one pinned by digest
+alone, which the swap cannot carry over - it is the image the other release A2A images
+resolve to, derived from the operator image the way `A2A_GATEWAY_IMAGE` and the rest are
+when unset. An install that runs a custom agent image sets `A2A_BRIDGE_IMAGE`. Three
 operator settings shape the rendered bridge. The operator reads them from its own
 environment, as it reads `A2A_INJECT_BACKEND`; no CR field carries them.
 
 | Operator env             | What it sets                      | Unset                                                                       |
 | ------------------------ | --------------------------------- | --------------------------------------------------------------------------- |
-| `A2A_BRIDGE_IMAGE`       | the bridge's image                | derived from the agent image, as above                                      |
+| `A2A_BRIDGE_IMAGE`       | the bridge's image                | derived as above                                                            |
 | `A2A_BRIDGE_CONCURRENCY` | the bridge's `BRIDGE_CONCURRENCY` | the bridge's default, 2                                                     |
 | `A2A_BRIDGE_EXECUTOR`    | the bridge's `BRIDGE_EXECUTOR`    | not rendered, so the bridge's shipped default decides: `api`, given the key |
 
@@ -64,6 +69,35 @@ The TASKS consumer reserve reads the same `A2A_BRIDGE_CONCURRENCY` the bridge is
 ([sizing](#sizing-against-the-eval-harness)), and the `api` executor's pod-wide hook is
 rendered by the same rule as for a declared bridge ([Executors](#executors)): the operator
 counts a rendered bridge exactly like a declared one.
+
+**It enters the pod once the bus is provisioned.** The rendered bridge is withheld from the
+agent pod until the CR's `BusProvisioned` condition is `True`: before that it has no bus to
+connect to and no runtime-state bucket, exits, and would hold the agent pod in
+`CrashLoopBackOff` through the bring-up. The TASKS consumer reserve does not wait; it counts
+the bridge from the first `next` render, so the one provisioning Job is already sized for it
+and the bridge's arrival does not re-render the Job. The cost is a second roll. On a fresh
+`next` install, and on a flip from `today` back to `next`, the agent pod rolls once for the
+mode and again when the bridge arrives after the Job. The agent Deployment's strategy is
+`Recreate` at one replica (`resolveDeploymentReplicasAndStrategy`), so each roll is a brief
+agent outage: the old pod stops before the new one starts. Once `BusProvisioned` has been
+`True` the bridge stays in the pod on later renders.
+
+**It doubles the agent container's share of the pod.** The rendered container copies the
+agent container's resources, so the pod carries two of them. With the defaults (requests 1
+CPU and 2Gi, limits 3 CPU and 8Gi) the bridge adds another 1 CPU/2Gi of requests and 3
+CPU/8Gi of limits, roughly doubling the agent pod's requests, and a node or namespace quota
+sized for the `today` pod may not schedule the `next` one. `spec.deployment.resources` sizes
+both containers together; no setting sizes the bridge alone.
+
+**"Declared bridge" means two things.** The render's opt-out keys on the container name: a
+sidecar named `hermes-bridge` on `spec.deployment.sidecars` is the declared bridge, and the
+operator then renders none. The TASKS reserve and the activity hook key on the env instead:
+they count every sidecar whose `env` sets `BRIDGE_CONCURRENCY`, under any name, plus the
+rendered bridge when there is one. So a bus-client sidecar under another name that sets
+`BRIDGE_CONCURRENCY` does not suppress the rendered bridge: the pod runs both, the reserve is
+sized for the sum of their workers, and if that sidecar consumes `platform` tasks the two
+compete for them. To replace the rendered
+bridge with a sidecar of its own, a CR names that sidecar `hermes-bridge`.
 
 **A CR-declared bridge wins.** A CR that declares a sidecar named `hermes-bridge` on
 `spec.deployment.sidecars` keeps it, and the operator then renders none, so an install that

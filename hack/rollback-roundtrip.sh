@@ -696,7 +696,7 @@ assert_nats_on_claim() {
 # Only CR-declared sidecars: the operator's rendered bridge is not on
 # spec.deployment.sidecars, is removed with the mode, and needs no unset. A
 # hand-declared one is still copied into the pod under today and crash-loops
-# there (a2a/docs/hermes-bridge.md, "Rolling back to today"), so the
+# there (a2a/docs/hermes-bridge.md, "What a declared sidecar costs"), so the
 # whole of spec.deployment.sidecars is unset before the flip to today and
 # declared again after the flip forward, not only the sidecars that look like
 # they talk to the bus: a sidecar is an ordinary corev1.Container

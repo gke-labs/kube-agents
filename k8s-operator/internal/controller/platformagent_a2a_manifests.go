@@ -3705,6 +3705,9 @@ func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
 		}
 		if defaulted {
 			source = fmt.Sprintf("the render reads from spec.deployment.sidecars (%s; an entry it cannot read as a count, a valueFrom or a reference to one among them, counts as the bridge's default of %d)", a2aBridgeConcurrencyEnvVar, a2aBridgeDefaultConcurrency)
+			if a2aBridgeRendered(agent) {
+				source = fmt.Sprintf("the operator's rendered bridge runs (%s in the operator's environment, which this render could not read as a count, so the bridge's default of %d)", a2aBridgeConcurrencyOperatorEnvVar, a2aBridgeDefaultConcurrency)
+			}
 			countIs = "That count is"
 		}
 		noun, noLower := "workers", ""

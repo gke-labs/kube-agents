@@ -257,3 +257,13 @@ func TestARefusalForARenderedBridgeNamesTheOperatorSetting(t *testing.T) {
 		t.Error("the provision script's notes do not name the operator setting for a rendered bridge")
 	}
 }
+
+// An operator setting the render cannot read as a count is reported against
+// that setting, not against a CR sidecar.
+func TestAnUnreadableOperatorSettingIsReportedAgainstItself(t *testing.T) {
+	t.Setenv(a2aBridgeConcurrencyOperatorEnvVar, "lots")
+	status := a2aProvisionRefusalStatus(a2aTestAgent())
+	if !strings.Contains(status, a2aBridgeConcurrencyOperatorEnvVar) || strings.Contains(status, "spec.deployment.sidecars") {
+		t.Errorf("refusal status = %q; want the operator setting named, not a CR sidecar", status)
+	}
+}

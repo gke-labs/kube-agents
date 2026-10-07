@@ -828,9 +828,10 @@ classifies the executors' own reasons (`bridge-shutdown`, `bridge-queue-overflow
 `hermes-api-unreachable`, `hermes-api-refused`, `session-busy`, `worker-evicted`, `bus-subscribe-failed`), a `rejected` terminal and a `canceled-before-start` as infrastructure,
 and grades the persona's (`hermes-exited-nonzero`, `deadline-exceeded`, `hermes-api-failed`,
 `hermes-api-unreadable`, `hermes-api-read-failed`, `hermes-api-oversize`) and any reason it does not
-know; a `canceled` after the harness's own cancel is the graded timeout. An eval install that
-declares the bridge sidecar sets `BRIDGE_CONCURRENCY` to at least the harness's parallelism
-(`EVAL_TASK_PARALLELISM`), because the bridge publishes `submitted` when it queues a task behind
+know; a `canceled` after the harness's own cancel is the graded timeout. An eval install's bridge
+runs at least the harness's parallelism (`EVAL_TASK_PARALLELISM`) in workers - the operator
+renders the bridge, so the setting is the operator's `A2A_BRIDGE_CONCURRENCY`, or
+`BRIDGE_CONCURRENCY` on a bridge sidecar the install declares itself - because the bridge publishes `submitted` when it queues a task behind
 its cap and `working` only when it spawns, and a unit queued for the whole budget is
 infrastructure, not a graded answer.
 
