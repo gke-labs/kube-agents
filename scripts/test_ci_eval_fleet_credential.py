@@ -29,6 +29,17 @@ def call_site() -> str:
     return match.group(0)
 
 
+class SourcingTest(unittest.TestCase):
+    def test_sourcing_the_runner_leaves_the_callers_exit_trap_alone(self):
+        # ci-eval-pr.sh installs its artifact-collecting EXIT trap and then
+        # sources this file at top level; a trap set at file scope here
+        # would replace it, and the eval job would lose its exit-time dumps.
+        runner = REPO_ROOT / "hack" / "fleet-kubeconfigs.sh"
+        proc = run_bash(f'trap "echo mine" EXIT; source "{runner}"; trap -p EXIT')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("echo mine", proc.stdout)
+
+
 def run_bash(script: str, **env: str) -> subprocess.CompletedProcess:
     """Run under an explicit environment: the developer's shell may export the
     very variables under test (the opt-in, the reader, Prow's JOB_NAME), and

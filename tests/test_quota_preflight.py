@@ -114,6 +114,22 @@ _EPHEMERAL_SET_GIB = 3
 _RETAINED_PVC_COUNT = 2
 _RETAINED_STORAGE_GIB = 11
 _MILLICORES_PER_CORE = 1000
+# The credential proxy's footprint.yaml entry (the operator's defaults), and an override
+# of the one key an install raises (#2324). The preflight merges the override over the
+# entry per key, as the operator does, so only the overridden number moves.
+_PROXY_MEMORY_LIMIT_BYTES = 1 * 1024**3
+_PROXY_MEMORY_REQUEST_BYTES = 512 * 1024**2
+_PROXY_CPU_LIMIT_MILLIS = 1000
+_PROXY_OVERRIDE_MEMORY_LIMIT_BYTES = 2 * 1024**3
+_PROXY_OVERRIDE_CPU_LIMIT_MILLIS = 2000
+_PROXY_FLOAT_CPU_LIMIT = 1.5
+_PROXY_FLOAT_CPU_LIMIT_MILLIS = 1500
+# The operator renders no ephemeral-storage request on the proxy, so the API server sets it
+# to the limit: footprint.yaml's 2Gi request is that defaulting, and it follows an override
+# of the limit alone.
+_PROXY_EPHEMERAL_LIMIT_BYTES = 2 * 1024**3
+_PROXY_OVERRIDE_EPHEMERAL_LIMIT_BYTES = 10 * 1024**3
+_PROXY_VALUE = "platformAgent.deployment.credentialProxy.resources"
 
 
 def _parse_gib_or_mib(quantity: str) -> int:
@@ -178,8 +194,8 @@ class PreflightDecisionTest(unittest.TestCase):
         finally:
             pathlib.Path(values_path).unlink(missing_ok=True)
 
-    def _requirements(self, sets: list[str] | None = None) -> dict:
-        res = self._render({"probe": {"emitRequirements": True}}, sets)
+    def _requirements(self, sets: list[str] | None = None, values: dict | None = None) -> dict:
+        res = self._render({"probe": {"emitRequirements": True}, **(values or {})}, sets)
         self.assertEqual(res.returncode, 0, f"render failed:\n{res.stderr}")
         for doc in yaml.safe_load_all(res.stdout):
             if doc and doc.get("metadata", {}).get("name") == "probe-requirements":
@@ -195,6 +211,115 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertEqual(req["limitsMemory"], _DEFAULT_LIMITS_MEMORY_BYTES)
         self.assertEqual(req["requestsEphemeral"], _DEFAULT_REQUESTS_EPHEMERAL_BYTES)
         self.assertEqual(req["limitsEphemeral"], _DEFAULT_LIMITS_EPHEMERAL_BYTES)
+
+    def test_credential_proxy_memory_limit_override_moves_only_that_total(self) -> None:
+        """The one key an install raises moves limits.memory by its difference and nothing else.
+
+        The override is merged over the footprint entry per key, as
+        resolveCredentialProxyResources does in the operator: the request, the CPU pair and
+        ephemeral storage keep the footprint's numbers rather than falling back to the
+        override's limit.
+        """
+        base = self._requirements()
+        raised = self._requirements([f"{_PROXY_VALUE}.limits.memory={_PROXY_OVERRIDE_MEMORY_LIMIT_BYTES}"])
+        self.assertEqual(
+            raised["limitsMemory"] - base["limitsMemory"],
+            _PROXY_OVERRIDE_MEMORY_LIMIT_BYTES - _PROXY_MEMORY_LIMIT_BYTES,
+        )
+        for key in ("pods", "requestsCpu", "limitsCpu", "requestsMemory",
+                    "requestsEphemeral", "limitsEphemeral", "persistentVolumeClaims"):
+            self.assertEqual(raised[key], base[key], key)
+
+    def test_credential_proxy_request_and_cpu_overrides_are_each_counted(self) -> None:
+        base = self._requirements()
+        raised = self._requirements([
+            f"{_PROXY_VALUE}.requests.memory={_PROXY_MEMORY_LIMIT_BYTES}",
+            f"{_PROXY_VALUE}.limits.cpu={_PROXY_OVERRIDE_CPU_LIMIT_MILLIS}m",
+        ])
+        self.assertEqual(
+            raised["requestsMemory"] - base["requestsMemory"],
+            _PROXY_MEMORY_LIMIT_BYTES - _PROXY_MEMORY_REQUEST_BYTES,
+        )
+        self.assertEqual(
+            raised["limitsCpu"] - base["limitsCpu"],
+            _PROXY_OVERRIDE_CPU_LIMIT_MILLIS - _PROXY_CPU_LIMIT_MILLIS,
+        )
+        # A request the override does not name keeps the footprint's, not the new limit.
+        self.assertEqual(raised["requestsCpu"], base["requestsCpu"])
+        self.assertEqual(raised["limitsMemory"], base["limitsMemory"])
+
+    def test_credential_proxy_cpu_written_as_a_float_is_counted(self) -> None:
+        # A values file's `cpu: 1.5` arrives as a YAML float, not the string `--set` gives.
+        base = self._requirements()
+        raised = self._requirements(values={"platformAgent": {"deployment": {"credentialProxy": {
+            "resources": {"limits": {"cpu": _PROXY_FLOAT_CPU_LIMIT, "memory": str(_PROXY_OVERRIDE_MEMORY_LIMIT_BYTES)}}}}}})
+        self.assertEqual(
+            raised["limitsCpu"] - base["limitsCpu"],
+            _PROXY_FLOAT_CPU_LIMIT_MILLIS - _PROXY_CPU_LIMIT_MILLIS,
+        )
+        self.assertEqual(
+            raised["limitsMemory"] - base["limitsMemory"],
+            _PROXY_OVERRIDE_MEMORY_LIMIT_BYTES - _PROXY_MEMORY_LIMIT_BYTES,
+        )
+
+    def test_credential_proxy_quantities_in_the_crds_dotted_forms_are_counted(self) -> None:
+        # `2.Gi` and `.5Ki` are in the CRD's grammar and resource.ParseQuantity reads
+        # them; the preflight parses them as 2Gi and 512 cores rather than refusing.
+        base = self._requirements()
+        raised = self._requirements(values={"platformAgent": {"deployment": {"credentialProxy": {
+            "resources": {"limits": {"memory": "2.Gi", "cpu": ".5Ki"}}}}}})
+        self.assertEqual(
+            raised["limitsMemory"] - base["limitsMemory"],
+            _PROXY_OVERRIDE_MEMORY_LIMIT_BYTES - _PROXY_MEMORY_LIMIT_BYTES,
+        )
+        self.assertEqual(raised["limitsCpu"] - base["limitsCpu"], 512 * 1000 - _PROXY_CPU_LIMIT_MILLIS)
+
+    def test_credential_proxy_ephemeral_limit_alone_moves_the_request_with_it(self) -> None:
+        """An override of limits.ephemeral-storage alone is counted as a request of the same size.
+
+        The operator renders no ephemeral-storage request, so the API server defaults it to
+        the limit; counting the footprint's 2Gi against a 10Gi limit passes a quota with 2
+        to 10Gi of request headroom that then refuses the pod.
+        """
+        base = self._requirements()
+        raised = self._requirements([f"{_PROXY_VALUE}.limits.ephemeral-storage={_PROXY_OVERRIDE_EPHEMERAL_LIMIT_BYTES}"])
+        moved = _PROXY_OVERRIDE_EPHEMERAL_LIMIT_BYTES - _PROXY_EPHEMERAL_LIMIT_BYTES
+        self.assertEqual(raised["limitsEphemeral"] - base["limitsEphemeral"], moved)
+        self.assertEqual(raised["requestsEphemeral"] - base["requestsEphemeral"], moved)
+        # An explicit request still wins over the defaulting.
+        explicit = self._requirements([
+            f"{_PROXY_VALUE}.limits.ephemeral-storage={_PROXY_OVERRIDE_EPHEMERAL_LIMIT_BYTES}",
+            f"{_PROXY_VALUE}.requests.ephemeral-storage=4Gi",
+        ])
+        self.assertEqual(explicit["requestsEphemeral"] - base["requestsEphemeral"],
+                         4 * 1024**3 - _PROXY_EPHEMERAL_LIMIT_BYTES)
+
+    def test_credential_proxy_null_override_key_keeps_the_default(self) -> None:
+        # `memory: null` is how a values file drops a key; it means "not set", as on the CR.
+        base = self._requirements()
+        nulled = self._requirements([f"{_PROXY_VALUE}.limits.memory=null"])
+        self.assertEqual(nulled, base)
+
+    def test_credential_proxy_override_the_preflight_cannot_parse_fails_naming_the_key(self) -> None:
+        # Helm renders quota-preflight.yaml before the CR template, so the preflight's own
+        # read of the override is the first to see it. The CR template is removed from this
+        # copy, so the message can only come from kube-agents.credentialProxyFootprint.
+        with tempfile.TemporaryDirectory() as tmp:
+            chart = pathlib.Path(tmp) / "kube-agents"
+            shutil.copytree(self.chart, chart)
+            (chart / "templates" / "platform-agent-cr.yaml").unlink()
+            original, self.chart = self.chart, chart
+            try:
+                for value in ("-1Gi", "abc", "2GB"):
+                    res = self._render({"probe": {"emitRequirements": True}},
+                                       [f"{_PROXY_VALUE}.limits.memory={value}"])
+                    self.assertNotEqual(res.returncode, 0, res.stdout)
+                    self.assertIn(f"{_PROXY_VALUE}.limits.memory is", res.stderr)
+                    self.assertNotIn("cannot parse quantity", res.stderr)
+                res = self._render({"probe": {"emitRequirements": True}}, [f"{_PROXY_VALUE}.limits=2Gi"])
+                self.assertIn(f"{_PROXY_VALUE}.limits is 2Gi, which is not a map", res.stderr)
+            finally:
+                self.chart = original
 
     def test_disabling_the_dashboard_drops_it_from_the_total(self) -> None:
         """The flag is harness.hermes.dashboardEnabled, one level deeper than harness.

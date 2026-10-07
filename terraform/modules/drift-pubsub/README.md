@@ -1,10 +1,25 @@
 # Drift Audit-Log Pub/Sub Routing Module
 
-Reusable Terraform module for provisioning the GKE audit log → Pub/Sub delivery path the drift detector consumes: the Log Router sink, the drift-audit topic and pull subscription, and the IAM bindings that let the sink publish and the detector subscribe.
+Reusable Terraform module for provisioning the GKE audit log → Pub/Sub delivery path the drift detector consumes: the Log Router sink, the drift-audit topic and pull subscription, and the IAM bindings that let the sink publish and the detector subscribe — plus, where `topic_publishers` is set, publisher on the topic for each member it names.
 
 The detector cannot read audit logs from the Kubernetes API. On GKE the control plane is managed, so the API server's audit backend is not the operator's to configure and the stream surfaces only in Cloud Logging — hence a sink rather than an informer.
 
 The sink's writer-identity grant is load-bearing: without `roles/pubsub.publisher` on the topic the sink is silently inert. Log Router raises no error, the topic receives nothing, and from the detector's side that is indistinguishable from "no drift happened."
+
+## Why the sink is created last and destroyed first
+
+Cloud Logging starts exporting the moment a sink exists and keeps exporting for some minutes after one is deleted, because the Log Router holds sink configuration on a fleet that converges on its own schedule. An export that lands outside the window where the topic exists and the grant is in place mails an "[ACTION REQUIRED] Cloud Logging sink configuration error" to every principal holding `roles/owner` on the project. Both orderings are arranged around that:
+
+- **On apply**, the grant names the Logging service agent as `service-<project-number>@gcp-sa-logging.iam.gserviceaccount.com`, derived rather than read from `google_logging_project_sink.drift_audit.writer_identity`. Reading it from the sink is what orders the grant after the sink; deriving it puts the grant first. `google_project_service_identity` asks Service Usage for the agent up front, since otherwise the first sink in a project is what creates it and the grant has nothing to bind. Enabling `logging.googleapis.com` is not enough on its own: in a project with the API on and no sink ever created, granting the role to that agent fails with "Service account … does not exist" until the Service Usage call is made. The call returns an _empty_ identity for Logging — no email — so it reads as though it achieved nothing; the minting is a side effect of making it.
+- **On destroy**, `time_sleep.sink_drain` holds for `sink_drain_duration` (120s by default) between deleting the sink and removing the topic and the grant. Revoking publish early trades `topic_not_found` for `topic_permission_denied`, so both sit on the far side of the wait. Changing the duration takes an apply to land before the destroy that should honour it: `time_sleep` reads `destroy_duration` from state, since a provider's delete is handed prior state and no configuration. A caller that raises it and goes straight to `terraform destroy` waits the value already recorded.
+
+Neither closes the window completely. Google documents no bound on how long the Log Router takes to stop exporting, so 120s is a chosen margin rather than a measured convergence time, and the apply side still depends on IAM propagation. They take the email from every run to rarely. Renaming `topic_name` on a live install is a third case neither covers: that replaces the topic under a sink which stays live and is only updated in place, and the drain does not participate because nothing is being destroyed.
+
+Deriving the identity means a project where Logging returns some other writer identity would be granted the wrong principal and left with an inert sink. The sink carries a `postcondition` comparing the two, so that fails the apply naming both. A postcondition runs after the resource is created and does not roll it back, so the failed apply leaves the sink live and exporting as an identity that holds no publish role: `topic_permission_denied` on every export, and the owner-wide mail this section exists to prevent, now continuous rather than momentary. Deleting the sink stops it immediately, and granting the role by hand stops it without clearing the check. Because a postcondition is re-evaluated on later plans, such a project would also be unable to apply anything in the composition — `sink_writer_identity_override` is the way out, moving the grant and the check together onto the identity Logging reported. The full-install composition passes it through as `drift_pubsub_sink_writer_identity_override`, which is the name the error gives an operator who reached it from there; `sink_drain_duration` is exposed the same way. Neither has an installer key, so an install driven by `install.sh` or `upgrade.sh` sets them as `TF_VAR_` passthrough lines in `install.env` — the front doors regenerate `terraform.tfvars` on every run, so an override added to that file by hand survives one apply and is dropped by the next, which puts the sink back in the state this paragraph describes. A hand-driven apply uses `terraform.tfvars`.
+
+Deriving it also makes the grant's `member` a function of a data source, where reading it off the sink made it a function of a resource already in state. A caller that defers that read defers the member with it, and `member` is ForceNew: with `depends_on = [google_project_service.required]` on the module — which is how full-install calls it — any plan that adds or removes an API leaves `data.google_project.this` unread until apply, and the binding is planned for replacement while the sink stays live. That is this section's own window on another trigger, unfixed; setting the override pins the member and avoids it meanwhile. Narrowing the caller's `depends_on` to the APIs this module needs does not work, because Terraform resolves an indexed `depends_on` reference to the whole resource.
+
+The three `depends_on` edges that carry all of this are pinned by [`tests/test_drift_pubsub_ordering.py`](../../../tests/test_drift_pubsub_ordering.py); removing one is otherwise invisible, since no plan can show the ordering.
 
 ## What this module does not do
 
@@ -34,6 +49,8 @@ Set the variable to `false` to export the unfiltered stream while debugging.
 ## Prerequisites
 
 The caller must have `pubsub.googleapis.com` and `logging.googleapis.com` enabled on the project. [`full-install`](../../examples/full-install/) enables both when it instantiates this module (`enable_drift_pubsub = true`; `logging.googleapis.com` is unconditional there, and `pubsub.googleapis.com` is enabled whenever any of its Pub/Sub-backed features is on). A standalone caller enables them itself: no module in this repository calls `google_project_service`.
+
+Two more follow from the ordering above, and `full-install` already satisfies both. The module reads the project number, so `cloudresourcemanager.googleapis.com` must be enabled and the applying identity needs `resourcemanager.projects.get`; and it mints the Logging service agent through Service Usage, so it takes a `google-beta` provider configuration from the root.
 
 ## Usage
 
@@ -66,6 +83,23 @@ drift-detector --project my-gcp-project --subscription "$(terraform output -raw 
 The flag takes either form — this fully-qualified path, or the bare `subscription_name`, which it
 qualifies with `--project`. `--project` is required either way, because the detector's credentials
 are resolved against it.
+
+`topic_publishers` defaults to empty, which leaves the sink's writer identity as the topic's only
+publisher — the shape the section above assumes. Each member listed here takes
+`roles/pubsub.publisher` on the topic as well:
+
+```hcl
+  topic_publishers = ["serviceAccount:bench-runner@my-gcp-project.iam.gserviceaccount.com"]
+```
+
+Weigh that against what the detector does with what arrives. It reads
+`protoPayload.authenticationInfo.principalEmail` out of each record and classifies on it, and
+Pub/Sub does not attach the publishing identity to the message, so the detector cannot tell a
+record the sink exported from one a listed member composed. Anything that can publish here can
+therefore make the detector report a change nobody made, under any principal it chooses. The
+intended use is a test harness injecting synthetic audit records on a project set aside for it;
+on an install carrying real traffic, leave it empty. Never list the detector's own
+`detector_service_account_email` — the agent would be writing the stream its own pod reads.
 
 Lowering `ack_deadline_seconds` below its 60s default means passing the detector a matching
 `--batch-join-budget`. The detector holds a whole batch while it reads live objects, and the two

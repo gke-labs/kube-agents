@@ -184,6 +184,12 @@ differently at each:
   has. Only the switch is written on every reconcile. The other five appear when it is on, so that
   an install that will never run the detector does not carry the harness triple twice under a
   second set of names.
+- `DRIFT_DETECTOR_LOG_DROPPED` is the one the operator does not write. The entrypoint reads it and
+  turns it into `--log-dropped`; an install that wants it sets it under `spec.deployment.env`,
+  which reaches this sidecar through `mergeCredentialProxyEnv` — a denylist, so a name the
+  operator reserves nowhere passes through. The six above are all reserved there, because the
+  operator appends each after that merge and a duplicate would stall the apply; adding this one
+  beside them for symmetry is what would quietly cut the route.
 
 **The field is off unless something turns it on, where the watcher is on unless something switches
 it off** — but through `install.sh` both end up on, because the installer sets this field by
@@ -208,9 +214,10 @@ Enabling it is necessary and not sufficient: the operator also requires `spec.ha
 the pod's credentials actually reach and a disagreement stops the process. A half-filled harness
 leaves the detector off rather than looping.
 
-Two flags reach the CR, `subscription` and `gitopsManagers`; the rest are fixed by where the process
-runs. `--in-cluster` and `--profiles-dir` are always on, so a deployed detector joins its own cluster
-and every Cluster Agent profile in the project without being asked.
+Two flags reach `spec.harness.driftDetector`, `subscription` and `gitopsManagers`, and
+`--log-dropped` reaches the CR a layer out through `spec.deployment.env`; the rest are fixed by
+where the process runs. `--in-cluster` and `--profiles-dir` are always on, so a deployed detector
+joins its own cluster and every Cluster Agent profile in the project without being asked.
 
 Application Default Credentials need `roles/pubsub.subscriber` on the subscription — inside the
 agent pod, the Workload Identity the `drift-pubsub` module grants it to. Add `roles/pubsub.viewer`

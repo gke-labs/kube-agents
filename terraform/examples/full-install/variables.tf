@@ -706,6 +706,24 @@ variable "drift_pubsub_sink" {
   default     = "platform-agent-drift-audit-sink"
 }
 
+variable "drift_pubsub_topic_publishers" {
+  description = "IAM members granted roles/pubsub.publisher on the drift topic, on top of the sink's own writer identity. Only used when enable_drift_pubsub is true, and empty on an install: the Log Router is what should be putting audit records on this topic, and a member here can make the detector report a change nobody made. The evaluation pool sets it to its CI runners so a bench case can publish synthetic records and exercise the classifier, which it cannot reach any other way — every identity a bench run can authenticate as is a service account the classifier is right to drop. The agent's own service account does not belong here; it already reads this stream."
+  type        = list(string)
+  default     = []
+}
+
+variable "drift_pubsub_sink_writer_identity_override" {
+  description = "The principal to grant roles/pubsub.publisher on the drift topic, overriding the service-<project-number>@gcp-sa-logging.iam.gserviceaccount.com the drift-pubsub module derives. Include the \"serviceAccount:\" prefix. Only used when enable_drift_pubsub is true. Exists because the module derives that identity rather than reading it off the sink, so the grant can precede the sink: a project where Logging reports some other writer identity fails the sink's postcondition, and with nothing to set here it would fail it on every later plan of this composition too, taking the whole apply with it. The failed apply leaves the sink created and exporting without the publish role, which mails every project owner until this is set or the sink is deleted, so it is the fix to reach for first rather than at leisure. Through the install.sh / upgrade.sh front doors, set it as a TF_VAR_drift_pubsub_sink_writer_identity_override line in install.env rather than in terraform.tfvars: write_tfvars_from_state regenerates that file wholesale on every front-door run and never writes this key, so a hand-added one is lost on the next run and the failure returns. A hand-driven apply sets it in terraform.tfvars instead. Leave null unless an apply has told you to set it; the error names the value to use."
+  type        = string
+  default     = null
+}
+
+variable "drift_pubsub_sink_drain_duration" {
+  description = "How long a destroy waits, after deleting the drift sink, before removing the topic and the sink's publish grant. Only used when enable_drift_pubsub is true. Cloud Logging keeps exporting for some minutes after a sink is deleted, and an export that lands in that gap mails every project owner a sink configuration error. The module's 120s default is a chosen margin rather than a measured convergence time, so raise it if the mail still arrives and lower it only to trade that risk for a faster teardown. Through the install.sh / upgrade.sh front doors, set it as a TF_VAR_drift_pubsub_sink_drain_duration line in install.env; the front doors regenerate terraform.tfvars wholesale on every run and never write this key, so a hand-added one does not survive. Setting it is not enough on its own: time_sleep reads destroy_duration from state when it is destroyed, because a provider's delete is handed prior state and no configuration, and uninstall.sh runs no apply before the destroy -- so a value raised and taken straight to uninstall.sh waits the 120s already in state and the mail arrives anyway. Run upgrade.sh (or lifecycle.sh apply) in between. Raising it after a teardown has already mailed is therefore too late for that teardown; the time to set it is at install."
+  type        = string
+  default     = "120s"
+}
+
 variable "enable_drift_detector" {
   description = "Start the drift detector. Sets spec.harness.driftDetector.enabled on the PlatformAgent, which is what makes k8s-operator/cmd/drift-detector run: the binary ships in the images and stays stopped until this is true. Requires enable_drift_pubsub, which a helm_release precondition enforces: the harness block carrying this field is written only when the ingress is on, so without it the composition would accept this variable and render nothing — an apply that succeeds, provisions nothing and starts nothing. Also requires project_id to be the project ID rather than the project number, a second precondition, because the operator refuses to start the detector on a numeric one (driftDetectorEnabled in k8s-operator/internal/controller/platformagent_manifests.go) and the ingress would bill for a stream nothing reads. The installer front doors turn this and enable_drift_pubsub on together from one ENABLE_DRIFT_DETECTOR key; the two variables are separate so that a hand-driven apply can still provision the audit-log ingress on its own."
   type        = bool

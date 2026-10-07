@@ -120,5 +120,6 @@ answers the postconditions refuse (a read the identity cannot make, a document t
 read, a second page, a selector past the per-selector cap), what an exclude entry or a legacy
 ID leaves out, and the container read for the pool (`tests/container_members.tftest.hcl`): what a
 folder and an organisation list to, that nothing is read with the pool off, and the answers refused. `make terraform-test` runs them, as the `validate` job in `validate.yml` does on every
-pull request; `mock_provider` needs Terraform 1.7 or newer, above the floor the module declares for an
+pull request; the suites need Terraform 1.11 or newer (`mock_provider` from 1.7, `override_during`
+from 1.11), above the floor the module declares for an
 install.

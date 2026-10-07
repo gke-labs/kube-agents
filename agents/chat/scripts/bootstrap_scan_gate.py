@@ -144,13 +144,13 @@ SCOPE_GAP_NAMED_LIMIT = 20
 # the reconcile itself and waits for it, rather than racing it.
 RECONCILE_ATTEMPTS_MARKER = ".bootstrap_reconcile_attempts"
 # At the default cap with few profiles: the reconcile bounds its listing phase to its
-# listing budget (150 s at a cap of 100) and its prune's describes to theirs (60 s), writes
+# listing budget (300 s at a cap of 100) and its prune's describes to theirs (60 s), writes
 # its snapshot after, and the settle time covers the creates. A declared
 # `spec.scope.maxProjects` scales the listing budget and the profiles on the volume the
 # prune's, so `_reconcile_timeout_seconds` reads both the way the reconcile does and adds
 # the settle time; this constant is the floor, and the ceiling when there is no declaration
 # to read (the scope file's variable unset) or the reconcile cannot be imported.
-RECONCILE_TIMEOUT_SECONDS = 240
+RECONCILE_TIMEOUT_SECONDS = 390
 RECONCILE_SETTLE_SECONDS = 30
 # `cluster_agent_reconcile.EXIT_ALREADY_RUNNING`. Mutual exclusion lives in that
 # script, because the hourly `cluster-agent-reconcile` job runs it too and the

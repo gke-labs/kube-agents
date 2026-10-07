@@ -57,7 +57,8 @@ import (
 
 // credentialProxyContainerName is the broker container, the one that opens the
 // credentialed and the metrics-only listeners; the usage counters poller reads
-// the metrics port off this container and no other.
+// the metrics port off this container and no other, and the Downward API
+// reference that hands the broker its memory limit names it too.
 const credentialProxyContainerName = "envoy-credential-proxy" // #nosec G101 -- Container name, not a credential.
 
 const (
@@ -90,26 +91,24 @@ const (
 	// while the pod warms. On Standard the ceiling is the 1-CPU limit and the
 	// request is scheduling weight, which matters only on a contended node.
 	//
-	// Memory is set by the CPU. Nothing here holds cluster state. What the
-	// container holds is Envoy (53 to 66Mi resident on a live install, 85Mi in
-	// the report that led to the bounds below), the broker process, and one
-	// child process per in-flight request. The broker's own share is bounded:
-	// credential_proxy.py keeps at most CREDENTIAL_PROXY_MAX_OUTPUT_BYTES of
-	// each stream, bounds the decoded text to the same size (output that is
-	// not UTF-8 would otherwise triple), holds about six times that per
-	// request at peak (the two buffers, their decoded text, the JSON body and
-	// its encoding; 48Mi measured against the 8 MiB cap, 37Mi for output that
-	// is not UTF-8), and admits at most CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS
-	// requests at once, each holding its slot until its response is written --
-	// 384Mi at the 8 MiB cap and the default of eight, which the cap test in
-	// platformagent_manifests_test.go asserts against the 1Gi limit alongside
-	// this request. The term that varies is the children: kubectl 1.35 listing
-	// 4,000 pods measured 432Mi resident for -o json and 1,281Mi for -o yaml.
-	// On a cgroup v2 node the kubelet arms the group OOM killer for the
-	// container, so one such child past the limit takes Envoy and the broker
-	// down with it -- a container restart, not one failed command. An install
-	// whose clusters make that routine moves credentialProxyMaxConcurrentCommands
-	// and the limit together; neither is a CR field today.
+	// Memory. Nothing here holds cluster state. What the container holds is
+	// Envoy (53 to 66Mi resident on a live install), the broker process (104Mi
+	// measured), the broker's bounded share of each in-flight request's
+	// output (about six times CREDENTIAL_PROXY_MAX_OUTPUT_BYTES, 48Mi against
+	// the 8 MiB cap), and the child processes: about 102Mi per request for a
+	// gcloud listing or a kubectl with its auth plugin, measured on a
+	// 143-cluster install. The broker budgets the children itself: it reads
+	// this container's limit through credentialProxyMemoryLimitEnv, reserves
+	// credentialProxyRequestReserveBytes per admitted request, and admits a
+	// request only when the reservations plus the output allowance of the
+	// slots in use fit the limit less credentialProxyResidentReserveBytes and
+	// credentialProxyWorkspaceReserveBytes -- four at once at the 1Gi below,
+	// with the slot cap as the upper bound. The sizing test in
+	// platformagent_manifests_test.go and ValidateCredentialProxyResources
+	// hold the limit to at least two. An install raises the limit through
+	// spec.deployment.credentialProxy.resources (resolveCredentialProxyResources
+	// merges it over these defaults per key), which raises the admitted count;
+	// the caps stay here.
 	//
 	// Autopilot enforces a CPU:memory ratio between 1:1 and 1:6.5 GiB per vCPU
 	// and raises the smaller request to meet it, so a 500m pod is admitted at
@@ -121,7 +120,129 @@ const (
 	// Autopilot for the 256Mi the admission added.
 	credentialProxyCPURequest    = "500m"
 	credentialProxyMemoryRequest = "512Mi"
+	// The limits. CPU is the ceiling a mint or a listing may burst to on
+	// Standard; memory is what the comment above sizes; ephemeral storage
+	// bounds the content workspace (the broker's own clone of a repository
+	// under its state emptyDir) together with /tmp, so a runaway clone fills
+	// the container's allowance rather than the node's disk. A CR override
+	// that sets only limits.memory keeps all three of the others.
+	credentialProxyCPULimit              = "1"
+	credentialProxyMemoryLimit           = "1Gi"
+	credentialProxyEphemeralStorageLimit = "2Gi"
+	// The emptyDir sizeLimits of the broker's /tmp and of its state volume (the
+	// content workspace and vcs scratch). The kubelet evicts the pod when either
+	// fills, whatever the container's ephemeral-storage limit, so each is sized
+	// as the larger of its default here and that merged limit
+	// (credentialProxyEmptyDirSizeLimit): an override that raises the limit past
+	// a volume's default widens the volume with it, and the default render keeps
+	// these figures.
+	credentialProxyTmpSizeLimit    = "2Gi"
+	credentialProxyStateSizeLimit  = "5Gi"
+	credentialProxyTmpVolumeName   = "credential-proxy-tmp"   // #nosec G101 -- Volume name, not a credential
+	credentialProxyStateVolumeName = "credential-proxy-state" // #nosec G101 -- Volume name, not a credential
+	// credentialProxyMemoryLimitEnv carries the container's own memory limit
+	// in bytes to the broker, which derives its child memory budget from it
+	// (credential_proxy.py, child_memory_limit_bytes). A resourceFieldRef the
+	// broker reads once at start, so a limit changed by whatever recreates the
+	// pod (spec.deployment.credentialProxy.resources, a VPA eviction) is the
+	// one it budgets against; an in-place resize is not seen until the next
+	// start. In the base env list and so reserved in mergeCredentialProxyEnv,
+	// because a CR that could set it would detach the budget from the limit.
+	credentialProxyMemoryLimitEnv = "CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES" // #nosec G101 -- Env var name, not a credential
+	// The child memory budget's terms, in bytes, as the broker declares them
+	// (credential_proxy.py: BROKER_RESIDENT_RESERVE_BYTES,
+	// CONTENT_WORKSPACE_RESERVE_BYTES, REQUEST_CHILD_MEMORY_RESERVE_BYTES,
+	// OUTPUT_COPIES_PER_COMMAND). The sizing test reads them, and
+	// tests/test_credential_proxy_sizing_parity.py holds them, and
+	// credentialProxyMinimumAdmittedRequests below, equal to the broker's;
+	// they are declared here rather than in the test so that
+	// ValidateCredentialProxyResources reads the same copy. The design
+	// (docs/designs/credential-proxy-child-memory-budget.md §2.2) is why each
+	// is the size it is. Change the Python side in the same commit.
+	credentialProxyResidentReserveBytes   int64 = 192 << 20
+	credentialProxyWorkspaceReserveBytes  int64 = 128 << 20
+	credentialProxyRequestReserveBytes    int64 = 128 << 20
+	credentialProxyOutputCopiesPerCommand int64 = 6
+	// credentialProxyMinimumAdmittedRequests is the floor the sizing test
+	// and ValidateCredentialProxyResources hold the limit to: fewer than two and a
+	// listing phase cannot parallelise at all. The broker's counterpart is
+	// BUDGET_MINIMUM_ADMITTED_REQUESTS in credential_proxy.py.
+	credentialProxyMinimumAdmittedRequests int64 = 2
+	// credentialProxyMemoryFloorBytesAtDefaultCap is
+	// credentialProxyMinimumMemoryLimitBytes at credentialProxyOutputCapBytes,
+	// 672 MiB, declared as a literal so that the copies elsewhere can be
+	// compared with it as text. TestCredentialProxyBudgetArithmeticAtTheDefaults
+	// holds it to the function, and tests/test_credential_proxy_sizing_parity.py
+	// holds it equal to the broker's CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP
+	// and the chart's kube-agents.credentialProxyMemoryFloorBytes.
+	credentialProxyMemoryFloorBytesAtDefaultCap int64 = 704643072
 )
+
+// credentialProxyOutputCapBytes is credentialProxyMaxOutputBytes as a count.
+// The constant is a string because it is rendered into the container's env;
+// the budget arithmetic below needs the number. resource.MustParse at package
+// scope fails the binary at init on a malformed literal, which the sizing test
+// reaches before any install does.
+var credentialProxyOutputCapBytes = ptr.To(resource.MustParse(credentialProxyMaxOutputBytes)).Value()
+
+// credentialProxyRequestCostBytes is what one admitted request costs the
+// broker's child memory budget: its child reserve plus the output the broker
+// itself may hold for it.
+func credentialProxyRequestCostBytes(outputCapBytes int64) int64 {
+	return credentialProxyRequestReserveBytes + credentialProxyOutputCopiesPerCommand*outputCapBytes
+}
+
+// credentialProxyAdmittedRequests is how many requests the broker admits at
+// once under a memory limit, the number its startup line prints.
+func credentialProxyAdmittedRequests(limitBytes, outputCapBytes int64) int64 {
+	budget := limitBytes - credentialProxyResidentReserveBytes - credentialProxyWorkspaceReserveBytes
+	if budget <= 0 {
+		return 0
+	}
+	return budget / credentialProxyRequestCostBytes(outputCapBytes)
+}
+
+// credentialProxyMinimumMemoryLimitBytes is the smallest limit that admits
+// credentialProxyMinimumAdmittedRequests at once.
+func credentialProxyMinimumMemoryLimitBytes(outputCapBytes int64) int64 {
+	return credentialProxyResidentReserveBytes + credentialProxyWorkspaceReserveBytes +
+		credentialProxyMinimumAdmittedRequests*credentialProxyRequestCostBytes(outputCapBytes)
+}
+
+// resolveCredentialProxyResources merges the CR's override over the defaults.
+//
+// Per key rather than wholesale, which is the opposite of what
+// spec.deployment.resources does for the agent container, and on purpose: the
+// one setting an install reaches for is the memory limit (#2324), and a
+// wholesale replacement would make "raise the limit to 2Gi" silently drop the
+// CPU request Autopilot sizes the pod by and the ephemeral-storage limit that
+// bounds the content workspace. Each key the override carries wins; each it
+// omits keeps the operator's value. Claims, the fourth map on
+// ResourceRequirements, are not carried: the proxy pod names no ResourceClaim.
+func resolveCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec) corev1.ResourceRequirements {
+	resolved := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(credentialProxyCPURequest),
+			corev1.ResourceMemory: resource.MustParse(credentialProxyMemoryRequest),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:              resource.MustParse(credentialProxyCPULimit),
+			corev1.ResourceMemory:           resource.MustParse(credentialProxyMemoryLimit),
+			corev1.ResourceEphemeralStorage: resource.MustParse(credentialProxyEphemeralStorageLimit),
+		},
+	}
+	if deployment == nil || deployment.CredentialProxy == nil || deployment.CredentialProxy.Resources == nil {
+		return resolved
+	}
+	override := deployment.CredentialProxy.Resources
+	for name, quantity := range override.Requests {
+		resolved.Requests[name] = quantity.DeepCopy()
+	}
+	for name, quantity := range override.Limits {
+		resolved.Limits[name] = quantity.DeepCopy()
+	}
+	return resolved
+}
 
 // credentialProxyFederation returns the federation config when it is complete.
 //
@@ -345,17 +466,13 @@ func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent) corev1.Co
 			TimeoutSeconds:      5,
 			FailureThreshold:    3,
 		},
-		Resources: corev1.ResourceRequirements{
-			// Sized where the constants are declared: CPU for the warm-up
-			// after an eviction, memory for Envoy, the broker's bounded share
-			// and one child process per in-flight request. Lower than the
-			// sidecar's limit, which sized for the event watcher's informer
-			// caches; nothing here holds cluster state.
-			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(credentialProxyCPURequest), corev1.ResourceMemory: resource.MustParse(credentialProxyMemoryRequest)},
-			Limits: corev1.ResourceList{
-				corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi"), corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
-			},
-		},
+		// Sized where the constants are declared: CPU for the warm-up after an
+		// eviction, memory for Envoy, the broker's bounded share and the child
+		// processes the broker budgets against this limit. Lower than the
+		// sidecar's limit, which sized for the event watcher's informer
+		// caches; nothing here holds cluster state.
+		// spec.deployment.credentialProxy.resources overrides any key of it.
+		Resources:       resolveCredentialProxyResources(agent.Spec.Deployment),
 		VolumeMounts:    volumeMounts,
 		SecurityContext: securityContext,
 	}
@@ -598,10 +715,35 @@ var (
 // broker Deployment's volume list. The 0400 mode the projections carry is
 // readable because that pod sets an fsGroup, which is what makes kubelet apply
 // group ownership to a projected file.
+//
+// The /tmp and state emptyDirs are widened here, not in
+// buildCredentialProxyVolumes, because the gateway pod shares the /tmp volume's
+// definition and sizes its own container independently of the broker's
+// override.
 func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 	volumes := filterVolumes(buildCredentialProxyVolumes(agent), credentialProxyRuntimeVolumeNames)
+	ephemeralLimit := resolveCredentialProxyResources(agent.Spec.Deployment).Limits[corev1.ResourceEphemeralStorage]
+	for i := range volumes {
+		emptyDir := volumes[i].EmptyDir
+		switch volumes[i].Name {
+		case credentialProxyTmpVolumeName:
+			emptyDir.SizeLimit = credentialProxyEmptyDirSizeLimit(credentialProxyTmpSizeLimit, ephemeralLimit)
+		case credentialProxyStateVolumeName:
+			emptyDir.SizeLimit = credentialProxyEmptyDirSizeLimit(credentialProxyStateSizeLimit, ephemeralLimit)
+		}
+	}
 	volumes = append(volumes, buildGitopsStateVolume(agent))
 	return append(volumes, buildCredentialProxyFederationVolume(agent)...)
+}
+
+// credentialProxyEmptyDirSizeLimit is the larger of a volume's default
+// sizeLimit and the container's merged ephemeral-storage limit.
+func credentialProxyEmptyDirSizeLimit(defaultSize string, ephemeralLimit resource.Quantity) *resource.Quantity {
+	size := resource.MustParse(defaultSize)
+	if ephemeralLimit.Cmp(size) > 0 {
+		size = ephemeralLimit.DeepCopy()
+	}
+	return &size
 }
 
 // buildAgentAPIAuthVolumes is the gateway pod's remaining share. The data volume

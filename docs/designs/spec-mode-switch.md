@@ -87,6 +87,14 @@ rollout does replace the agent pods; what preservation guarantees is that the
 replacements keep the credential and the route, so the bridge reconnects instead of
 hanging at the dial. Found live during stage 1 bring-up (8/26).
 
+A deliberate flip back to `today` is the other half, and it does clean up: the A2A stack
+is torn down, with two objects kept so a later flip forward reuses them. The bus creds
+Secret `<agent>-a2a-nats-creds` stays, because re-enabling `next` must not re-roll the
+credentials. The JetStream PVC `data-<agent>-a2a-nats-0` stays, because flipping a mode
+is not license to destroy the file store. `hack/rollback-roundtrip.sh` checks both
+against a live install: it flips `next` to `today` and back, asserts the two keep their
+UIDs and the agent answers on each side, and the next lane runs it after its matrix.
+
 ## What the operator renders
 
 - `today`: exactly what it renders now. A normal install cannot tell this feature exists

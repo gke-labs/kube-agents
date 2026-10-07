@@ -22,16 +22,15 @@ environments and their secrets and variables, release runbooks, or the evaluatio
 
 `contributing.md` is the one exception. The CLA and community guidelines have to be reachable from
 the public site, so the page stays, points at the repository's `CONTRIBUTING.md` for everything
-else, and is the one site row `docs-check-map` lets name contributors.
+else, and is the one site page written for contributors.
 
 Three shapes give a maintainer page away when the subject does not:
 
 - It describes which workflow runs when, or which repository secret or variable feeds it.
 - It addresses the reader as someone changing the source — "when changing this code", "before you
   edit", a test name, a Go symbol.
-- Its map row in `docs/README.md` wants to say the audience is maintainers, CI engineers, or
-  contributors. The site table's audience cell may not name those readers; a page for them goes in
-  the section of the map that matches its new home.
+- Its one-line summary would say the audience is maintainers, CI engineers, or contributors. A
+  page for those readers goes to the home the `AGENTS.md` table names for it, not to the site.
 
 ## Identifiers the site never carries
 
@@ -77,13 +76,11 @@ on is touched, and a review pass raises it on that line, not on the backlog arou
   derives no project ID, so a moved site root or a reworded export cannot turn it green. Neither
   the denylist nor this file spells out the values: refer to them by shape or by the file that
   holds them.
-- `make docs-check-map` (`scripts/check_docs_map.py`) rejects a site row whose audience cell names
-  maintainers, CI engineers, or contributors, and fails when it finds no published-site table at
-  all, so a reworded heading cannot turn the check green with nothing read.
 - The `review-docs-drift` skill asks the reader question of every hunk under `docs/site/`, and the
   `review-adversarial` skill treats a site hunk that arrives with a CI change as a prompt to ask
-  whether the page is a runbook. Neither check reads prose for you: a page can describe the
-  maintainers' Prow setup without naming one identifier, and only the reader question catches it.
+  whether the page is a runbook. The identifier check does not read prose for you, and nothing
+  mechanical reads a page's audience: a page can describe the maintainers' Prow setup without
+  naming one identifier, and only the reader question catches it.
 
 ## Write it straight
 

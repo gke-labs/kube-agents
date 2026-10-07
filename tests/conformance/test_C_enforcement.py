@@ -1340,6 +1340,76 @@ class C1IsolationIsStructural(unittest.TestCase):
             "across the module boundary is not the name the operator refuses",
         )
 
+    # The fourth cross-module literal: the operator renders the static
+    # principal names into the callout under this name, and the callout reads
+    # it back to refuse narrowed pods named after them.
+    RESERVED_PRINCIPALS_ENV = "A2A_RESERVED_PRINCIPALS"
+
+    def test_C1_the_callouts_reserved_principals_env_is_spelled_the_same_in_both_modules(
+        self,
+    ) -> None:
+        """The operator writes the static principal list; the callout reads it.
+
+        The callout refuses a narrowed pod named after a static nats.conf user,
+        and it learns those names only from this variable: they are in no
+        identity map, and the callout does not read nats.conf. Two Go modules,
+        no shared package, so each holds its own literal.
+
+        A drift is loud rather than silent, because the callout refuses to
+        start without the variable. But both Go suites stay green through a
+        rename on one side, and the failure lands at the next operator
+        upgrade: the new callout pods exit, never go Ready, and the rollout
+        stalls on every `spec.mode: next` install.
+        """
+        operator = h.text("operator_a2a_callout")
+        callout = h.text("a2a_callout_main")
+
+        operator_env = re.findall(r'a2aCalloutReservedPrincipalsEnvVar\s*=\s*"([^"]+)"', operator)
+        callout_env = re.findall(r'envReservedPrincipals\s*=\s*"([^"]+)"', callout)
+
+        # Anti-vacuity, both halves.
+        self.assertEqual(
+            len(operator_env),
+            1,
+            "a2aCalloutReservedPrincipalsEnvVar is not a single string constant "
+            "in platformagent_a2a_callout.go; this test compared nothing",
+        )
+        self.assertEqual(
+            len(callout_env),
+            1,
+            "envReservedPrincipals is not a single string constant in "
+            "a2a/cmd/authcallout/main.go; this test compared nothing",
+        )
+
+        self.assertEqual(
+            operator_env[0],
+            callout_env[0],
+            "the operator renders %r and the callout reads %r: the callout "
+            "refuses to start, and the next operator upgrade stalls the callout "
+            "rollout on every spec.mode: next install" % (operator_env[0], callout_env[0]),
+        )
+        self.assertEqual(
+            operator_env[0],
+            self.RESERVED_PRINCIPALS_ENV,
+            "the reserved principals env var was renamed; a callout image and "
+            "an operator from either side of the rename cannot run together",
+        )
+
+        # Both halves use the constant this test compared.
+        self.assertIn(
+            "os.LookupEnv(envReservedPrincipals)",
+            _go_code(callout, "run"),
+            "the callout's run() no longer reads envReservedPrincipals, so the "
+            "name compared here is not the name the callout resolves",
+        )
+        self.assertIn(
+            "Name: a2aCalloutReservedPrincipalsEnvVar",
+            _go_code(operator, "buildA2ACalloutDeployment"),
+            "buildA2ACalloutDeployment no longer renders "
+            "a2aCalloutReservedPrincipalsEnvVar by that constant, so the name "
+            "compared here is not the name the operator writes",
+        )
+
     def test_C1_the_agent_principal_carries_no_static_bus_password(self) -> None:
         """The other half of the same change, and what it was for.
 
