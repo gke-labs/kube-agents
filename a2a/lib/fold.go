@@ -76,6 +76,10 @@ type Task struct {
 	// detail]`), and a reader classifying a failed terminal needs it from
 	// the fold as much as from the live event.
 	FinalMessage *Message
+	// FinalAt is the terminal status-update's envelope timestamp, as its
+	// publisher stamped it; zero before the final event or when the
+	// envelope carried none.
+	FinalAt time.Time
 	// SubmittedMissing reports that the first event folded was not a
 	// `submitted` status-update — assertion 9's observation, the sibling of
 	// PostFinalDropped for assertion 10.
@@ -156,6 +160,7 @@ func FoldTask(taskID string, events []*Envelope) (*Task, error) {
 			task.StatusHistory = append(task.StatusHistory, s.Status.State)
 			if s.Final {
 				task.FinalMessage = s.Status.Message
+				task.FinalAt = env.TS
 			}
 		case KindArtifactUpdate:
 			var a ArtifactUpdate

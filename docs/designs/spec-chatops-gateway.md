@@ -391,7 +391,11 @@ the relay, wakes the session exactly as the relay would have, with the same guar
 child that never started has no terminal and does not wake. After a heal wakes the session this
 way, the message that triggered the heal is routed against the wake: a follow-up (not a status ask
 or a stop) steers it, the way any follow-up steers a running turn, and a status ask is answered by
-replay.
+replay. A heal that finds the delegating turn itself final on the stream, its delegate request and
+its own terminal not yet relayed, leaves both to the relay for `A2A_FIRST_EVENT_GRACE` after that
+terminal, the same window the never-started heal waits; past it the relay's delivery is taken as
+lost, and the heal runs the request itself, every check applying, then relays the turn's terminal,
+so the chain is minted or refused as the relay would have done it.
 
 **To a program behind a door, the chain is one task.** A caller through the A2A door (or the
 inject door) submitted one task, so the gateway tells the adapter's task observers about the chain

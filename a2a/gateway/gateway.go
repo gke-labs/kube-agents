@@ -930,16 +930,30 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	switch {
 	case err == nil && task.Final && task.Artifact(lib.ArtifactDelegate) != nil && !rec.hasChildren(active.TaskID):
 		// A turn that asked to delegate, whose request the relay has not
-		// reached yet: the stream holds the delegate artifact and the
-		// turn's own terminal ("delegated to platform"), and the record
-		// names no child. That terminal is not the root's end, and the
-		// relay is the one to settle it - it delivers the artifact and the
-		// terminal in order from its durable, minting the child or saying
-		// why not. Healed here, the root would be announced ended on the
-		// hand-off line and the relay's mint would then find no active task.
-		// probeConversation reads the same fold as the chain running.
-		g.log.Info("active task's delegate request not relayed yet; leaving it to the relay",
-			"conversation", rec.Key, "taskId", active.TaskID, "state", task.State)
+		// reached: the stream holds the delegate artifact and the turn's
+		// own terminal ("delegated to platform"), and the record names no
+		// child. That terminal is not the root's end, and the request still
+		// has to be minted or refused. Inside relayLagGrace of the
+		// terminal the relay is the one to settle it - it delivers the
+		// artifact and the terminal in order from its durable - and the
+		// heal leaves it alone (probeConversation reads the same fold as the
+		// chain running). Past it, the relay's delivery is taken as lost
+		// (an ack on enqueue and a crash, or a failed end-of-batch write),
+		// and the heal does the relay's work itself rather than leave the
+		// conversation wedged on a turn nothing will release.
+		if !task.FinalAt.IsZero() && time.Since(task.FinalAt) <= g.relayLagGrace() {
+			g.log.Info("active task's delegate request not relayed yet; leaving it to the relay",
+				"conversation", rec.Key, "taskId", active.TaskID, "state", task.State,
+				"sinceTerminal", time.Since(task.FinalAt).Round(time.Second), "grace", g.relayLagGrace())
+			return
+		}
+		g.log.Info("healing an active task whose delegate request the relay never delivered",
+			"conversation", rec.Key, "taskId", active.TaskID, "state", task.State, "grace", g.relayLagGrace())
+		g.relayUnrelayedDelegation(ctx, rec, active.TaskID, addressee, task, terminalSubject)
+		if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
+			g.log.Error("healed record write failed", "conversation", rec.Key, "err", err)
+		}
+		return
 	case err == nil && task.Final:
 		g.log.Info("healing stale active task", "taskId", active.TaskID, "state", task.State)
 		g.post(rec.Key, formatTaskStatus(task, active.Ask, active.SubmittedAt))
@@ -1051,6 +1065,46 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 			g.log.Error("healed record write failed", "conversation", rec.Key, "err", err)
 		}
 	}
+}
+
+// relayLagGrace is how long after a delegating turn's terminal reached the
+// stream the heal leaves its delegate request to the relay
+// (healActiveTask). It reuses FirstEventGrace (10 minutes by default): both
+// bound how long the gateway waits on a delivery it expects before acting
+// on the stream itself, and a relay that is that far behind on one
+// conversation is as broken as an executor that has not started in that
+// long. One knob, so an install that shortens one for a fast eval loop
+// shortens both.
+func (g *Gateway) relayLagGrace() time.Duration {
+	return g.cfg.FirstEventGrace
+}
+
+// relayUnrelayedDelegation does for a delegating turn what the relay would
+// have done with its two lost events, from the stream's fold: the delegate
+// request through handleDelegateRequest, every check applying, which mints
+// the child or refuses; then the turn's terminal through relayTerminal, so
+// the room, the rolling line and the observers get what the relay would
+// have given them (a turn that minted ends quietly; a refused one ends the
+// root failed). Called under the session lock; the caller writes the record.
+// A relay that delivers the two events late finds the request busy or stale
+// and the terminal's route retired, so neither acts twice.
+func (g *Gateway) relayUnrelayedDelegation(ctx context.Context, rec *SessionRecord, taskID, addressee string, task *lib.Task, terminalSubject string) {
+	subject := lib.TaskEventsSubject(addressee, taskID)
+	g.handleDelegateRequest(ctx, rec, subject, taskID, task.Artifact(lib.ArtifactDelegate).Parts)
+	source := TerminalFromExecutor
+	if terminalSubject == lib.TaskSupervisorSubject(addressee, taskID) {
+		source = TerminalFromSupervisor
+	}
+	g.mu.Lock()
+	rs, ok := g.relays[taskID]
+	if !ok {
+		rs = &relayState{}
+		g.relays[taskID] = rs
+	}
+	g.mu.Unlock()
+	status := lib.StatusUpdate{TaskID: taskID, ContextID: task.ContextID,
+		Status: lib.TaskStatus{State: task.State, Message: task.FinalMessage}, Final: true}
+	g.relayTerminal(ctx, rec, rs, taskID, status, source)
 }
 
 // healedChildOutcome is a healed child's result and reason as relayTerminal
