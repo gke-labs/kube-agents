@@ -131,7 +131,7 @@
 # attempt. chat-voice-failure-leads-with-fact (after it) makes
 # it fifty-four (162) of sixty-eight (204), +3 more: the same shape on a
 # blocked card. oobe-first-run-audits (the last entry below) makes it
-# fifty-five (165) of sixty-nine (207), +3 more at its 1500s hint: a stack
+# sixty (180) of seventy-four (222), counted from the lists, +3 more at its 1500s hint: a stack
 # that waits out the previous repetition's audits, then a turn with no tools.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)

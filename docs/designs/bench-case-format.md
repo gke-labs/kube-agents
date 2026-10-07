@@ -225,7 +225,7 @@ staged skills, scripts and governance against the copies the sandbox runs, so a 
 grade an edit to them by its effect. `oobe_audits_started`, in its own module
 (`bench/kube_agents_bench/oobe.py`), reads the stack's state file and the Platform Agent's
 `cron/executions.db` in the agent pod, and passes when each of the four first-run audits has a
-run claimed since the stack armed the `oobe` job's first-run stage.
+run claimed since the stack armed the `oobe` job's first-run stage that is running or completed.
 
 Two limits are worth knowing before choosing one. `tool_called` defaults to
 `scope: router`, the delegating turn's calls only — the harness appends the delegated

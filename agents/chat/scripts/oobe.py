@@ -64,8 +64,9 @@ ROSTER_FILE = "jobs.json"
 # Hermes' pause marker on a job record (cron.jobs: is_job_runnable).
 PAUSED_STATE = "paused"
 
-# The ranking card the scan files last. A retry or a hand re-run uses this key with a
-# suffix (inventory.md, step 5; bootstrap_onboarding/README.md), so the prefix counts too.
+# The ranking card the hand-off files last (bootstrap_handoff.PRIORITIZE_KEY). An automatic retry
+# reuses the key; a re-run by hand adds a suffix (bootstrap_onboarding/README.md), so the prefix
+# counts too.
 PRIORITIZE_KEY = "bootstrap-inventory-prioritize"
 PRIORITIZE_RETRY_PATTERN = PRIORITIZE_KEY + "-%"
 # Statuses a card does not leave on its own (hermes_cli/kanban_db.py VALID_STATUSES). A card
