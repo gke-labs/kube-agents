@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -244,10 +245,10 @@ func TestSlackRunAuthTestHonoursCancel(t *testing.T) {
 
 // TestSlackEmptyPrincipalMapWarnsAtBoot: the boot-time warning for an empty
 // map fires for every backend whose identity join IS the map — Slack as
-// much as Discord — and not for gchat, which never reads it. Nothing renders
-// the Slack map yet, so a Slack gateway with a missing map file is the
-// ordinary case until #2099, and it must not pass boot silently and then
-// drop every sender.
+// much as Discord — and not for gchat, which never reads it. The operator
+// projects the Slack map Secret as optional, so a Slack gateway on an
+// install that never created it has a missing map, and it must not pass
+// boot silently and then drop every sender.
 func TestSlackEmptyPrincipalMapWarnsAtBoot(t *testing.T) {
 	s := startServer(t)
 	url := s.ClientURL()
@@ -345,6 +346,8 @@ func TestSlackGatewayDoesNotAdoptOnATasklessTurn(t *testing.T) {
 		DefaultAddressee: "platform",
 		IdleTTL:          30 * time.Minute,
 		AttributionSalt:  []byte("test-salt"),
+		// The CR-level gate is not under test here; the map is.
+		SlackAllowAllUsers: true,
 	}
 	g, err := New(Options{Client: client, Adapter: a, Config: cfg, Backend: slackBackend, Logger: slog.Default()})
 	if err != nil {
@@ -2164,6 +2167,8 @@ func TestSlackGatewayAdoptsThreadOnStartedTaskAndSurvivesRestart(t *testing.T) {
 		DefaultAddressee: "platform",
 		IdleTTL:          30 * time.Minute,
 		AttributionSalt:  []byte("test-salt"),
+		// The CR-level gate is not under test here; the map is.
+		SlackAllowAllUsers: true,
 	}
 	g, err := New(Options{Client: client, Adapter: a, Config: cfg, Backend: slackBackend, Logger: slog.Default()})
 	if err != nil {
@@ -2254,6 +2259,8 @@ func TestSlackGatewayIdleThreadNeedsAFreshMention(t *testing.T) {
 		DefaultAddressee: "platform",
 		IdleTTL:          ttl,
 		AttributionSalt:  []byte("test-salt"),
+		// The CR-level gate is not under test here; the map is.
+		SlackAllowAllUsers: true,
 	}
 	g, err := New(Options{Client: client, Adapter: a, Config: cfg, Backend: slackBackend, Logger: slog.Default()})
 	if err != nil {
@@ -2365,6 +2372,8 @@ func TestSlackGatewayDetachedTaskIsNotARunningTask(t *testing.T) {
 		DefaultAddressee: "platform",
 		IdleTTL:          ttl,
 		AttributionSalt:  []byte("test-salt"),
+		// The CR-level gate is not under test here; the map is.
+		SlackAllowAllUsers: true,
 	}
 	g, err := New(Options{Client: client, Adapter: a, Config: cfg, Backend: slackBackend, Logger: slog.Default()})
 	if err != nil {
@@ -2411,5 +2420,167 @@ func TestSlackGatewayDetachedTaskIsNotARunningTask(t *testing.T) {
 	}
 	if held, _, err := a.sessions(ctx, conv); err != nil || !held {
 		t.Fatalf("a running task must keep the thread a session thread past any TTL: held=%v err=%v", held, err)
+	}
+}
+
+// startSlackGateRig is startGchatRig for the Slack backend: a principal map
+// file mapping U1 and U2 (both would resolve), the Slack allowlist pair as
+// given, and a fake adapter whose roster is the two of them.
+func startSlackGateRig(t *testing.T, allowed []string, allowAll bool) *rig {
+	t.Helper()
+	s := startServer(t)
+	url := s.ClientURL()
+	provision(t, url)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	mapFile := filepath.Join(t.TempDir(), "principal-map")
+	if err := os.WriteFile(mapFile, []byte("U1 test:one\nU2 test:two\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test"))
+	if err != nil {
+		t.Fatalf("gateway client: %v", err)
+	}
+	t.Cleanup(client.Close)
+	bus, err := lib.Connect(ctx, url, lib.WithName("executor-test"))
+	if err != nil {
+		t.Fatalf("executor client: %v", err)
+	}
+	t.Cleanup(bus.Close)
+
+	adapter := newFakeAdapter()
+	adapter.roster = []string{"U1", "U2"}
+	cfg := &Config{
+		NATSURL:            url,
+		PrincipalMapPath:   mapFile,
+		DefaultAddressee:   "platform",
+		IdleTTL:            30 * time.Minute,
+		AttributionSalt:    []byte("test-salt"),
+		SlackAllowedUsers:  allowed,
+		SlackAllowAllUsers: allowAll,
+	}
+	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: slackBackend})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	go func() { _ = g.Run(ctx) }()
+	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url}
+}
+
+func slackAuthorityOf(t *testing.T, r *rig) Authority {
+	t.Helper()
+	origin := r.awaitTask(t, "platform")
+	var auth Authority
+	if err := json.Unmarshal(origin.Authority, &auth); err != nil {
+		t.Fatalf("authority block: %v", err)
+	}
+	return auth
+}
+
+// TestSlackMappedAndAllowedSenderIsAdmitted: the sender passes both gates
+// and resolves through the map, as before the allowlist was carried.
+func TestSlackMappedAndAllowedSenderIsAdmitted(t *testing.T) {
+	r := startSlackGateRig(t, []string{"U1"}, false)
+	r.adapter.inbox <- InboundMessage{Conversation: "slack:D1", Kind: "dm", AuthorID: "U1", MessageID: "1.0", Text: "how is the fleet?"}
+	auth := slackAuthorityOf(t, r)
+	if want := NewPseudonymizer([]byte("test-salt")).Hash("test:one"); auth.Requester.Principal != want {
+		t.Errorf("principal = %q, want the mapped principal's hash %q", auth.Requester.Principal, want)
+	}
+}
+
+// TestSlackMappedButDisallowedSenderDropsVisiblyOnce: Chat's rule, carried
+// to Slack. A member the map resolves but spec.integration.slack.allowedUsers
+// does not list is refused exactly as an unmapped sender is (the same
+// once-per-sender notice, naming the sender's id), and no task is published.
+// Member ids compare exactly: "u2" is not "U2".
+func TestSlackMappedButDisallowedSenderDropsVisiblyOnce(t *testing.T) {
+	r := startSlackGateRig(t, []string{"U1", "u2"}, false)
+	for _, id := range []string{"1.0", "2.0"} {
+		r.adapter.inbox <- InboundMessage{Conversation: "slack:D2", Kind: "dm", AuthorID: "U2", MessageID: id, Text: "do a thing"}
+	}
+	waitFor(t, "the unverified-sender notice", func() bool { return len(r.adapter.postTexts()) >= 1 })
+	time.Sleep(200 * time.Millisecond)
+	posts := r.adapter.postTexts()
+	if len(posts) != 1 {
+		t.Fatalf("posts = %v, want exactly one notice for two messages", posts)
+	}
+	if !strings.Contains(posts[0], "can't verify") || !strings.Contains(posts[0], "U2") {
+		t.Errorf("notice %q should be the unverified-sender notice naming the sender", posts[0])
+	}
+	if want := "an admin has to add you to " + unverifiedRemedyFor(slackBackend) + "."; !strings.HasSuffix(posts[0], want) {
+		t.Errorf("notice %q should be the one an unmapped Slack sender gets, ending %q", posts[0], want)
+	}
+	if !strings.Contains(posts[0], "allowed users list") {
+		t.Errorf("notice %q should name the Slack allowlist among the remedies", posts[0])
+	}
+	if got := len(inSubjectEnvelopes(t, r.url, "platform")); got != 0 {
+		t.Errorf("%d task envelopes published for a disallowed sender", got)
+	}
+}
+
+// TestSlackUnmappedButAllowedSenderGetsTheSameNotice: the other half of the
+// pair - listed but not mapped - drops with the identical notice, so the
+// notice does not tell a sender which of the two tables refused them.
+func TestSlackUnmappedButAllowedSenderGetsTheSameNotice(t *testing.T) {
+	r := startSlackGateRig(t, []string{"U1", "U9"}, false)
+	r.adapter.inbox <- InboundMessage{Conversation: "slack:D9", Kind: "dm", AuthorID: "U9", MessageID: "1.0", Text: "do a thing"}
+	waitFor(t, "the unverified-sender notice", func() bool { return len(r.adapter.postTexts()) >= 1 })
+	posts := r.adapter.postTexts()
+	want := "⛔ I can't verify who you are on slack (id U9), so I can't take asks from you yet — an admin has to add you to " + unverifiedRemedyFor(slackBackend) + "."
+	if posts[0] != want {
+		t.Errorf("notice = %q, want %q", posts[0], want)
+	}
+}
+
+// TestSlackAllowAllAdmitsEveryMappedSender: allow-all lifts the list, never
+// the map: a mapped sender is admitted, an unmapped one still drops.
+func TestSlackAllowAllAdmitsEveryMappedSender(t *testing.T) {
+	r := startSlackGateRig(t, nil, true)
+	r.adapter.inbox <- InboundMessage{Conversation: "slack:D2", Kind: "dm", AuthorID: "U2", MessageID: "1.0", Text: "hello"}
+	auth := slackAuthorityOf(t, r)
+	if want := NewPseudonymizer([]byte("test-salt")).Hash("test:two"); auth.Requester.Principal != want {
+		t.Errorf("principal = %q, want %q", auth.Requester.Principal, want)
+	}
+	if p := r.g.resolvePrincipal(slackBackend, "U9"); p != "" {
+		t.Errorf("allow-all admitted an unmapped sender as %q; the map is still a gate", p)
+	}
+}
+
+// TestSlackEmptyAllowlistWithoutAllowAllDropsEveryone: Chat's posture for
+// the shape the operator renders from a degenerate CR list.
+func TestSlackEmptyAllowlistWithoutAllowAllDropsEveryone(t *testing.T) {
+	r := startSlackGateRig(t, nil, false)
+	for _, id := range []string{"U1", "U2"} {
+		if p := r.g.resolvePrincipal(slackBackend, id); p != "" {
+			t.Errorf("%s resolved to %q with an empty allowlist and allow-all off", id, p)
+		}
+	}
+}
+
+// TestSlackRosterDoesNotAttributeADisallowedMember: the roster is read under
+// the same gate as the requester, so a mapped member the allowlist refuses
+// is recorded by backend id, not named by the principal the map would give.
+func TestSlackRosterDoesNotAttributeADisallowedMember(t *testing.T) {
+	r := startSlackGateRig(t, []string{"U1"}, false)
+	r.adapter.inbox <- InboundMessage{Conversation: "slack:C1/1.0", Kind: "group", AuthorID: "U1", MessageID: "1.0", Text: "how is the fleet?"}
+	auth := slackAuthorityOf(t, r)
+	ps := NewPseudonymizer([]byte("test-salt"))
+	roster := strings.Join(auth.Audience.Roster, ",")
+	if !strings.Contains(roster, ps.Hash("test:one")) {
+		t.Errorf("roster %v is missing the allowed requester's principal", auth.Audience.Roster)
+	}
+	if strings.Contains(roster, ps.Hash("test:two")) {
+		t.Errorf("roster %v names the disallowed member's mapped principal", auth.Audience.Roster)
+	}
+	if !strings.Contains(roster, ps.Hash("U2")) {
+		t.Errorf("roster %v should carry the disallowed member by backend id", auth.Audience.Roster)
+	}
+	rec, err := r.g.reg.Get(context.Background(), "slack:C1/1.0")
+	if err != nil || rec == nil {
+		t.Fatalf("record: %v %v", rec, err)
+	}
+	if strings.Contains(strings.Join(rec.Roster, ","), ps.Hash("test:two")) {
+		t.Errorf("session record roster %v names the disallowed member's mapped principal", rec.Roster)
 	}
 }

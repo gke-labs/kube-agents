@@ -46,6 +46,12 @@ MOCK_GROWN_RELEASE_IMAGES = MOCK_REQUIRED_RELEASE_IMAGES + ["backported-image"]
 REQUIRED_RELEASE_IMAGES_BLOCK_RE = re.compile(r"REQUIRED_RELEASE_IMAGES=\((.*?)\)", re.S)
 REQUIRED_RELEASE_IMAGES_ENTRY_RE = re.compile(r"^\s*\"([^\"\s]+)\"\s*$", re.M)
 REQUIRED_RELEASE_IMAGES_PATH = "scripts/release/common.sh"
+# The Linux default pipe capacity. The real common.sh is larger than this and
+# lists its images near the top, so a reader that stops at the list's closing
+# `)` while the file is still being piped to it kills the writer with SIGPIPE
+# (#2542). A fixture standing in for it has to be larger too.
+PIPE_BUFFER_BYTES = 64 * 1024
+PIPE_BUFFER_PADDING_LINE = "# padding past the pipe buffer, as the real common.sh runs on past its list\n"
 
 
 def parse_required_release_images(common_sh_text):
@@ -67,21 +73,25 @@ def parse_required_release_images(common_sh_text):
     return required
 
 
-def write_required_release_images(repo_dir, images):
-    """Writes a scripts/release/common.sh under repo_dir carrying only the
-    list, in the shape the wiring test reads. Returns its path."""
+def write_required_release_images(repo_dir, images, larger_than=0):
+    """Writes a scripts/release/common.sh under repo_dir carrying the list, in
+    the shape the wiring test reads, then comment lines until the file is more
+    than `larger_than` bytes. Returns its path."""
     path = pathlib.Path(repo_dir) / REQUIRED_RELEASE_IMAGES_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     body = "".join(f'  "{img}"\n' for img in images)
-    path.write_text(f"#!/usr/bin/env bash\nexport REQUIRED_RELEASE_IMAGES=(\n{body})\n")
+    text = f"#!/usr/bin/env bash\nexport REQUIRED_RELEASE_IMAGES=(\n{body})\n"
+    if larger_than:
+        text += PIPE_BUFFER_PADDING_LINE * (larger_than // len(PIPE_BUFFER_PADDING_LINE) + 1)
+    path.write_text(text)
     return path
 
 
-def commit_required_release_images(repo_dir, git, images, message="build: set the release image list"):
+def commit_required_release_images(repo_dir, git, images, message="build: set the release image list", larger_than=0):
     """Commits a scripts/release/common.sh listing `images` at HEAD of the
     mock repository and returns the new commit: a candidate whose own list is
     `images`, whatever the checkout running the scripts lists."""
-    write_required_release_images(repo_dir, images)
+    write_required_release_images(repo_dir, images, larger_than)
     git("add", REQUIRED_RELEASE_IMAGES_PATH)
     git("commit", "-m", message)
     return git("rev-parse", "HEAD").stdout.strip()

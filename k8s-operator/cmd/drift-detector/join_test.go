@@ -233,7 +233,7 @@ func TestJoinOutcomes(t *testing.T) {
 			}
 
 			var forwarded []DriftEvent
-			j := newJoiner(joinSet(tc.getter), nil, func(_ context.Context, e DriftEvent) {
+			j := newJoiner(joinSet(tc.getter), nil, nil, nil, func(_ context.Context, e DriftEvent) {
 				forwarded = append(forwarded, e)
 			})
 			j.Handle(context.Background(), record)
@@ -260,7 +260,7 @@ func TestJoinOutcomes(t *testing.T) {
 func TestJoinForwardsTheLookupError(t *testing.T) {
 	wantErr := errors.New("deployments.apps is forbidden")
 	var got DriftEvent
-	j := newJoiner(joinSet(&stubGetter{err: wantErr}), nil, func(_ context.Context, e DriftEvent) { got = e })
+	j := newJoiner(joinSet(&stubGetter{err: wantErr}), nil, nil, nil, func(_ context.Context, e DriftEvent) { got = e })
 	j.Handle(context.Background(), joinRecord())
 
 	if !errors.Is(got.LookupError, wantErr) {
@@ -273,7 +273,7 @@ func TestJoinPassesTheAuditResourceStraightThrough(t *testing.T) {
 	// so that no RESTMapper is needed here. If that ever changes, this is the
 	// test that says what depended on it.
 	stub := &stubGetter{obj: &unstructured.Unstructured{}}
-	j := newJoiner(joinSet(stub), nil, func(context.Context, DriftEvent) {})
+	j := newJoiner(joinSet(stub), nil, nil, nil, func(context.Context, DriftEvent) {})
 	record := joinRecord()
 	j.Handle(context.Background(), record)
 
@@ -286,7 +286,7 @@ func TestJoinPassesTheAuditResourceStraightThrough(t *testing.T) {
 }
 
 func TestJoinCountsEveryOutcome(t *testing.T) {
-	j := newJoiner(joinSet(&stubGetter{err: notFound()}), nil, func(context.Context, DriftEvent) {})
+	j := newJoiner(joinSet(&stubGetter{err: notFound()}), nil, knownScope(), nil, func(context.Context, DriftEvent) {})
 
 	j.Handle(context.Background(), joinRecord()) // gone
 
@@ -303,8 +303,181 @@ func TestJoinCountsEveryOutcome(t *testing.T) {
 	if counts.Gone != 1 || counts.Unreachable != 1 || counts.NoObject != 2 {
 		t.Errorf("counts = %+v, want gone=1 unreachable=1 no_object=2", counts)
 	}
+	// The scope names prod-a only, so the prod-b record is unreachable and out
+	// of scope both: the second count is a subset of the first, never a sixth
+	// outcome.
+	if counts.OutOfScope != 1 {
+		t.Errorf("counts = %+v, want out_of_scope=1", counts)
+	}
 	if counts.Enriched != 0 || counts.Failed != 0 {
 		t.Errorf("counts = %+v, want enriched and failed at zero", counts)
+	}
+}
+
+// stubScope is a scopeIndex with a fixed answer.
+type stubScope struct {
+	profiled map[clusterIdentity]bool
+	unknown  bool
+}
+
+func (s stubScope) Profiled(identity clusterIdentity) (bool, bool) {
+	if s.unknown {
+		return false, false
+	}
+	return s.profiled[identity], true
+}
+
+// knownScope is a readable profiles directory naming joinRecord's cluster and
+// nothing else, which is a deployed install's view after onboarding prod-a.
+func knownScope() stubScope {
+	return stubScope{profiled: map[clusterIdentity]bool{recordIdentity(joinRecord()): true}}
+}
+
+// An unreachable record from a cluster no readable profile names is out of scope, and
+// the event says so: the inject reads the flag, the DRIFT line is still
+// written, and nothing is dropped here. The join forwards every outcome; what
+// the flag changes is downstream.
+func TestJoinMarksAnUnreachableRecordOutOfScopeWhenNoProfileNamesItsCluster(t *testing.T) {
+	var got []DriftEvent
+	j := newJoiner(joinSet(&stubGetter{obj: &unstructured.Unstructured{}}), nil, knownScope(), nil, func(_ context.Context, e DriftEvent) {
+		got = append(got, e)
+	})
+
+	elsewhere := joinRecord()
+	elsewhere.Cluster = "prod-b"
+	j.Handle(context.Background(), elsewhere)
+
+	if len(got) != 1 {
+		t.Fatalf("forwarded %d event(s), want 1 -- the join must still forward an out-of-scope record", len(got))
+	}
+	if got[0].Outcome != joinUnreachable {
+		t.Errorf("Outcome = %q, want %q", got[0].Outcome, joinUnreachable)
+	}
+	if !got[0].OutOfScope {
+		t.Errorf("OutOfScope = false, want true: the scope was read and no readable profile names prod-b")
+	}
+	if c := j.Counts(); c.Unreachable != 1 || c.OutOfScope != 1 {
+		t.Errorf("counts = %+v, want unreachable=1 out_of_scope=1", c)
+	}
+	if held := j.OutOfScopeClusters(); len(held) != 1 || !strings.Contains(held[0], "prod-b") {
+		t.Errorf("OutOfScopeClusters() = %v, want prod-b named for the shutdown line", held)
+	}
+	if u := j.UnreachableClusters(); len(u) != 0 {
+		t.Errorf("UnreachableClusters() = %v, want empty: a held cluster is named on the out-of-scope line, not twice", u)
+	}
+}
+
+// A record redelivered after its card was sent is the inject's duplicate, not
+// the join's hold, even when its cluster has since left the scope: marking it
+// would put the hold marker on a DRIFT line, a count on the held tally and a
+// name on the shutdown line for a card that was in fact sent.
+func TestJoinDoesNotMarkARedeliveredRecordAlreadyInjected(t *testing.T) {
+	var got []DriftEvent
+	sent := map[string]bool{"redelivered-1": true}
+	j := newJoiner(joinSet(&stubGetter{obj: &unstructured.Unstructured{}}), nil, knownScope(), func(id string) bool { return sent[id] }, func(_ context.Context, e DriftEvent) {
+		got = append(got, e)
+	})
+
+	elsewhere := joinRecord()
+	elsewhere.Cluster = "prod-b"
+	elsewhere.InsertID = "redelivered-1"
+	j.Handle(context.Background(), elsewhere)
+	fresh := elsewhere
+	fresh.InsertID = "fresh-2"
+	j.Handle(context.Background(), fresh)
+
+	if len(got) != 2 || got[0].OutOfScope || !got[1].OutOfScope {
+		t.Fatalf("OutOfScope = %v, want [false true]: the redelivered record is the inject's duplicate, the fresh one is held", []bool{got[0].OutOfScope, got[1].OutOfScope})
+	}
+	if c := j.Counts(); c.Unreachable != 2 || c.OutOfScope != 1 {
+		t.Errorf("counts = %+v, want unreachable=2 out_of_scope=1", c)
+	}
+	if held := j.OutOfScopeClusters(); len(held) != 1 || !strings.Contains(held[0], "=1") {
+		t.Errorf("OutOfScopeClusters() = %v, want prod-b held once", held)
+	}
+	if u := j.UnreachableClusters(); len(u) != 1 || !strings.Contains(u[0], "=1") {
+		t.Errorf("UnreachableClusters() = %v, want prod-b once, for the redelivered record the inject will count a duplicate", u)
+	}
+}
+
+// The cases that must not be held, each the deployed shape of a cluster the
+// install meant to reach or a scope it cannot see. The size of the join is
+// never the test: a deployed detector always joins its own cluster, so every
+// case here runs with one cluster in the join and the record naming another.
+func TestJoinDoesNotMarkOutOfScope(t *testing.T) {
+	prodB := clusterIdentity{Project: "example-project", Location: "us-central1", Cluster: "prod-b"}
+	for _, tc := range []struct {
+		name   string
+		scope  scopeIndex
+		record func() AuditRecord
+	}{
+		{
+			// A profile names it and the join still has no client for it:
+			// every profile skipped at discovery for a 403, or a profile the
+			// reconcile wrote after discovery ran. The thin card is the
+			// symptom the operator acts on, exactly as before the hold.
+			name:  "a profile names the cluster",
+			scope: stubScope{profiled: map[clusterIdentity]bool{prodB: true}},
+			record: func() AuditRecord {
+				r := joinRecord()
+				r.Cluster = prodB.Cluster
+				return r
+			},
+		},
+		{
+			name:  "the profiles directory cannot be read",
+			scope: stubScope{unknown: true},
+			record: func() AuditRecord {
+				r := joinRecord()
+				r.Cluster = prodB.Cluster
+				return r
+			},
+		},
+		{
+			name:  "no --profiles-dir declared a scope",
+			scope: nil,
+			record: func() AuditRecord {
+				r := joinRecord()
+				r.Cluster = prodB.Cluster
+				return r
+			},
+		},
+		{
+			// No scope could name an identity with a part missing, and the
+			// record's own cluster= is not one anyone can profile.
+			name:  "the record's cluster identity is incomplete",
+			scope: knownScope(),
+			record: func() AuditRecord {
+				r := joinRecord()
+				r.Location = ""
+				return r
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got []DriftEvent
+			j := newJoiner(joinSet(&stubGetter{obj: &unstructured.Unstructured{}}), nil, tc.scope, nil, func(_ context.Context, e DriftEvent) {
+				got = append(got, e)
+			})
+
+			j.Handle(context.Background(), tc.record())
+
+			if len(got) != 1 {
+				t.Fatalf("forwarded %d event(s), want 1", len(got))
+			}
+			if got[0].Outcome != joinUnreachable {
+				t.Errorf("Outcome = %q, want %q", got[0].Outcome, joinUnreachable)
+			}
+			if got[0].OutOfScope {
+				t.Errorf("OutOfScope = true, want false: the record is unreachable, not out of scope")
+			}
+			if c := j.Counts(); c.Unreachable != 1 || c.OutOfScope != 0 {
+				t.Errorf("counts = %+v, want unreachable=1 out_of_scope=0", c)
+			}
+			if held := j.OutOfScopeClusters(); len(held) != 0 {
+				t.Errorf("OutOfScopeClusters() = %v, want empty", held)
+			}
+		})
 	}
 }
 
@@ -317,6 +490,12 @@ func TestJoinCountsStringAlwaysNamesEveryOutcome(t *testing.T) {
 			t.Errorf("joinCounts.String() = %q, want it to name %q", got, outcome)
 		}
 	}
+	// Not an outcome, but printed beside unreachable for the same reason: a
+	// run that held every unreachable record and one that forwarded them all
+	// print the same unreachable count.
+	if !strings.Contains(got, "out_of_scope=") {
+		t.Errorf("joinCounts.String() = %q, want it to name out_of_scope", got)
+	}
 }
 
 func TestJoinBoundsTheLookup(t *testing.T) {
@@ -328,7 +507,7 @@ func TestJoinBoundsTheLookup(t *testing.T) {
 	// also means the rest of it would pass against a joiner whose default was
 	// never set -- so the value the running binary actually uses is checked
 	// here, where newJoiner is the only place it comes from.
-	if def := newJoiner(joinSet(nil), nil, nil).timeout; def != joinRequestTimeout {
+	if def := newJoiner(joinSet(nil), nil, nil, nil, nil).timeout; def != joinRequestTimeout {
 		t.Errorf("newJoiner timeout = %s, want %s", def, joinRequestTimeout)
 	}
 
@@ -336,7 +515,7 @@ func TestJoinBoundsTheLookup(t *testing.T) {
 	defer close(blocked)
 
 	var got DriftEvent
-	j := newJoiner(joinSet(&stubGetter{block: blocked}), nil, func(_ context.Context, e DriftEvent) { got = e })
+	j := newJoiner(joinSet(&stubGetter{block: blocked}), nil, nil, nil, func(_ context.Context, e DriftEvent) { got = e })
 	j.timeout = time.Millisecond
 
 	done := make(chan struct{})
@@ -450,7 +629,7 @@ func TestReconciledBy(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			j := newJoiner(joinSet(nil), tc.managers, func(context.Context, DriftEvent) {})
+			j := newJoiner(joinSet(nil), tc.managers, nil, nil, func(context.Context, DriftEvent) {})
 			claim, manager := j.reconciledBy(tc.owners, changedAt)
 
 			if claim != tc.wantClaim {
@@ -483,7 +662,7 @@ func TestReconciledByIgnoresAStatusWriteAnsweringASpecChange(t *testing.T) {
 	suspendedAt := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
 	statusWrittenAt := suspendedAt.Add(4 * time.Second)
 
-	j := newJoiner(joinSet(nil), map[string]bool{manager: true}, func(context.Context, DriftEvent) {})
+	j := newJoiner(joinSet(nil), map[string]bool{manager: true}, nil, nil, func(context.Context, DriftEvent) {})
 
 	claim, claimed := j.reconciledBy([]fieldOwner{
 		{Manager: "flux-cli", UpdatedAt: suspendedAt, Paths: []string{"spec.suspend"}},
@@ -507,7 +686,7 @@ func TestReconciledByDoesNotInventAClaimFromTwoMissingTimes(t *testing.T) {
 	// field is a plain time.Time, so an absent or null `timestamp` decodes to
 	// the zero value without error. A genuinely malformed one fails
 	// json.Unmarshal and is nacked before it reaches here.
-	j := newJoiner(joinSet(nil), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
+	j := newJoiner(joinSet(nil), map[string]bool{"argocd-controller": true}, nil, nil, func(context.Context, DriftEvent) {})
 
 	claim, manager := j.reconciledBy([]fieldOwner{{Manager: "argocd-controller"}}, time.Time{})
 	if claim {
@@ -529,7 +708,7 @@ func TestReconciledByDoesNotClaimAgainstAChangeWithNoTimestamp(t *testing.T) {
 	// covered both.
 	wroteLongBefore := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	j := newJoiner(joinSet(nil), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
+	j := newJoiner(joinSet(nil), map[string]bool{"argocd-controller": true}, nil, nil, func(context.Context, DriftEvent) {})
 
 	claim, manager := j.reconciledBy(
 		[]fieldOwner{{Manager: "argocd-controller", UpdatedAt: wroteLongBefore}},
@@ -552,7 +731,7 @@ func TestReconciledByDeclinesAWriteInTheChangesOwnSecond(t *testing.T) {
 	changedAt := time.Date(2026, 9, 16, 12, 0, 0, 600_000_000, time.UTC)
 	sameSecond := changedAt.Truncate(time.Second) // what the API server returns
 
-	j := newJoiner(joinSet(nil), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
+	j := newJoiner(joinSet(nil), map[string]bool{"argocd-controller": true}, nil, nil, func(context.Context, DriftEvent) {})
 
 	if claim, manager := j.reconciledBy([]fieldOwner{{Manager: "argocd-controller", UpdatedAt: sameSecond}}, changedAt); claim {
 		t.Errorf("Reconciled = true by %q, want no claim: the write in the change's own second may be the change", manager)
@@ -569,7 +748,7 @@ func TestReconciledByClaimsAWriteFromTheNextSecond(t *testing.T) {
 	changedAt := time.Date(2026, 9, 16, 12, 0, 0, 600_000_000, time.UTC)
 	reconciledAt := changedAt.Truncate(time.Second).Add(time.Second)
 
-	j := newJoiner(joinSet(nil), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
+	j := newJoiner(joinSet(nil), map[string]bool{"argocd-controller": true}, nil, nil, func(context.Context, DriftEvent) {})
 
 	claim, manager := j.reconciledBy([]fieldOwner{{Manager: "argocd-controller", UpdatedAt: reconciledAt}}, changedAt)
 	if !claim {
@@ -591,7 +770,7 @@ func TestReconciledByFloorsTheManagerSideToo(t *testing.T) {
 	changedAt := time.Date(2026, 9, 16, 12, 0, 0, 200_000_000, time.UTC)
 	sameSecond := changedAt.Add(700 * time.Millisecond)
 
-	j := newJoiner(joinSet(nil), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
+	j := newJoiner(joinSet(nil), map[string]bool{"argocd-controller": true}, nil, nil, func(context.Context, DriftEvent) {})
 
 	if claim, manager := j.reconciledBy([]fieldOwner{{Manager: "argocd-controller", UpdatedAt: sameSecond}}, changedAt); claim {
 		t.Errorf("Reconciled = true by %q, want no claim: %v and %v are the same second", manager, sameSecond, changedAt)
@@ -607,7 +786,7 @@ func TestReconciledByDoesNotLetAnApplyReconcileItself(t *testing.T) {
 	const manager = "kustomize-controller"
 	changedAt := time.Date(2026, 9, 17, 9, 30, 12, 250_000_000, time.UTC)
 
-	j := newJoiner(joinSet(nil), map[string]bool{manager: true}, func(context.Context, DriftEvent) {})
+	j := newJoiner(joinSet(nil), map[string]bool{manager: true}, nil, nil, func(context.Context, DriftEvent) {})
 
 	claim, claimed := j.reconciledBy([]fieldOwner{
 		{Manager: manager, Operation: "Apply", UpdatedAt: changedAt.Truncate(time.Second), Paths: []string{"spec.replicas"}},
@@ -624,7 +803,7 @@ func TestReconciledByStillDeclinesAWriteFromAnEarlierSecond(t *testing.T) {
 	changedAt := time.Date(2026, 9, 16, 12, 0, 1, 600_000_000, time.UTC)
 	earlier := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 
-	j := newJoiner(joinSet(nil), map[string]bool{"argocd-controller": true}, func(context.Context, DriftEvent) {})
+	j := newJoiner(joinSet(nil), map[string]bool{"argocd-controller": true}, nil, nil, func(context.Context, DriftEvent) {})
 
 	if claim, manager := j.reconciledBy([]fieldOwner{{Manager: "argocd-controller", UpdatedAt: earlier}}, changedAt); claim {
 		t.Errorf("Reconciled = true by %q, want no claim for a write from the previous second", manager)
@@ -640,7 +819,7 @@ func TestJoinSetsReconciledFromTheLiveObject(t *testing.T) {
 	)
 
 	var got DriftEvent
-	j := newJoiner(joinSet(&stubGetter{obj: obj}), parseGitopsManagers("argocd-controller"),
+	j := newJoiner(joinSet(&stubGetter{obj: obj}), parseGitopsManagers("argocd-controller"), nil, nil,
 		func(_ context.Context, e DriftEvent) { got = e })
 
 	record := joinRecord()
@@ -871,6 +1050,16 @@ func TestLogDriftEventFormat(t *testing.T) {
 				Outcome: joinUnreachable,
 			},
 			want:    []string{"DRIFT", "cluster=prod-b", "join=unreachable"},
+			notWant: []string{"owners=", "lookup_error=", "inject="},
+		},
+		{
+			name: "an out-of-scope record is still a DRIFT line, and says the inject was held",
+			event: DriftEvent{
+				Record:     AuditRecord{Cluster: "prod-b", Timestamp: changedAt},
+				Outcome:    joinUnreachable,
+				OutOfScope: true,
+			},
+			want:    []string{"DRIFT", "cluster=prod-b", "join=unreachable", injectHeldOutOfScopeMarker},
 			notWant: []string{"owners=", "lookup_error="},
 		},
 	} {

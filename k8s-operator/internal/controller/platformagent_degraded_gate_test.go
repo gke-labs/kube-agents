@@ -27,6 +27,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -283,5 +284,137 @@ func TestAPrunedObservedGenerationDoesNotWriteDegradedEveryPass(t *testing.T) {
 	degrade()
 	if counter.writes != 1 {
 		t.Errorf("%d status writes across three unchanged refusals under a pruning CRD, want 1: this is the write-every-pass loop", counter.writes)
+	}
+}
+
+// TestStaleCacheLaggingInformerDoesNotWriteStatusDegraded verifies that an in-flight
+// reconcile pass reading from a lagging informer cache (which has not yet observed
+// an earlier status update) checks the live object via APIReader and avoids issuing
+// a duplicate, conflicting status update.
+func TestStaleCacheLaggingInformerDoesNotWriteStatusDegraded(t *testing.T) {
+	agent := observedGenerationAgent(1)
+	agent.Status.Phase = "Degraded"
+	agent.Status.ObservedGeneration = 1
+	now := metav1.Now()
+	agent.Status.LastReconcileTime = &now
+	agent.Status.Conditions = []metav1.Condition{{
+		Type:               "Ready",
+		Status:             metav1.ConditionFalse,
+		Reason:             reasonRuntimeClassNotFound,
+		Message:            "RuntimeClass 'gvisor' is not configured",
+		ObservedGeneration: 1,
+		LastTransitionTime: now,
+	}}
+	counter := &statusWriteCounter{}
+	scheme := setupScheme()
+	base := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(agent).
+		WithInterceptorFuncs(counter.interceptors()).
+		Build()
+
+	// Cached client simulates a lagging informer cache: returning the agent with
+	// un-updated status (empty phase and conditions).
+	cached := interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if err := cl.Get(ctx, key, obj, opts...); err != nil {
+				return err
+			}
+			if pa, ok := obj.(*agentv1alpha1.PlatformAgent); ok {
+				// The pre-write copy: behind the store on resourceVersion as well as
+				// status, so adopting only one of the two is a failure here.
+				pa.ResourceVersion = "1"
+				pa.Status.Phase = ""
+				pa.Status.Conditions = nil
+				pa.Status.ObservedGeneration = 0
+				pa.Status.LastReconcileTime = nil
+			}
+			return nil
+		},
+	})
+
+	r := &PlatformAgentReconciler{Client: cached, APIReader: base, Scheme: scheme}
+	ctx := context.Background()
+
+	staleAgent := &agentv1alpha1.PlatformAgent{}
+	if err := cached.Get(ctx, client.ObjectKeyFromObject(agent), staleAgent); err != nil {
+		t.Fatalf("reading stale agent: %v", err)
+	}
+
+	if err := r.updateStatusDegraded(ctx, staleAgent, reasonRuntimeClassNotFound, "RuntimeClass 'gvisor' is not configured", workloadNotRendered); err != nil {
+		t.Fatalf("updateStatusDegraded failed: %v", err)
+	}
+
+	if counter.writes != 0 {
+		t.Fatalf("updateStatusDegraded made %d status writes on a stale cache pass, want 0: the live object already held matching status", counter.writes)
+	}
+	if staleAgent.Status.Phase != "Degraded" {
+		t.Fatalf("updateStatusDegraded did not adopt live status into agent; phase=%q, want Degraded", staleAgent.Status.Phase)
+	}
+	if staleAgent.ResourceVersion != agent.ResourceVersion {
+		t.Fatalf("updateStatusDegraded did not adopt live resourceVersion into agent; got %q, want %q", staleAgent.ResourceVersion, agent.ResourceVersion)
+	}
+}
+
+func TestStaleCacheLaggingInformerRefusesAdoptionOnGenerationMismatch(t *testing.T) {
+	agent := observedGenerationAgent(2)
+	agent.Status.Phase = "Degraded"
+	agent.Status.ObservedGeneration = 2
+	now := metav1.Now()
+	agent.Status.LastReconcileTime = &now
+	agent.Status.Conditions = []metav1.Condition{{
+		Type:               "Ready",
+		Status:             metav1.ConditionFalse,
+		Reason:             reasonRuntimeClassNotFound,
+		Message:            "RuntimeClass 'gvisor' is not configured",
+		ObservedGeneration: 2,
+		LastTransitionTime: now,
+	}}
+	counter := &statusWriteCounter{}
+	scheme := setupScheme()
+	base := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(agent).
+		WithInterceptorFuncs(counter.interceptors()).
+		Build()
+
+	// Cached client simulates an agent whose generation in cache was 1 (prior to a spec update),
+	// with pre-write resourceVersion "1".
+	cached := interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if err := cl.Get(ctx, key, obj, opts...); err != nil {
+				return err
+			}
+			if pa, ok := obj.(*agentv1alpha1.PlatformAgent); ok {
+				pa.Generation = 1
+				pa.ResourceVersion = "1"
+				pa.Status.Phase = ""
+				pa.Status.Conditions = nil
+				pa.Status.ObservedGeneration = 0
+				pa.Status.LastReconcileTime = nil
+			}
+			return nil
+		},
+	})
+
+	r := &PlatformAgentReconciler{Client: cached, APIReader: base, Scheme: scheme}
+	ctx := context.Background()
+
+	staleAgent := &agentv1alpha1.PlatformAgent{}
+	if err := cached.Get(ctx, client.ObjectKeyFromObject(agent), staleAgent); err != nil {
+		t.Fatalf("reading stale agent: %v", err)
+	}
+
+	// liveAgentSatisfies should refuse adoption because live.Generation (2) != staleAgent.Generation (1).
+	satisfied := r.liveAgentSatisfies(ctx, staleAgent, func(live *agentv1alpha1.PlatformAgent) bool {
+		return live.Status.Phase == "Degraded"
+	})
+	if satisfied {
+		t.Fatalf("liveAgentSatisfies adopted live state despite generation mismatch (live=2, cached=1)")
+	}
+	if staleAgent.ResourceVersion != "1" {
+		t.Fatalf("staleAgent adopted live resourceVersion %q on generation mismatch; want %q", staleAgent.ResourceVersion, "1")
 	}
 }

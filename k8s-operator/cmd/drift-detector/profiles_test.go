@@ -550,7 +550,7 @@ func TestJoinRoutesEachRecordToItsOwnCluster(t *testing.T) {
 	getterA := &stubGetter{obj: managedFieldsObject(entry("kubectl-edit", "Update", "", `{"f:spec":{}}`, nil))}
 	getterB := &stubGetter{obj: managedFieldsObject(entry("kubectl-edit", "Update", "", `{"f:spec":{}}`, nil))}
 
-	j := newJoiner(map[clusterIdentity]objectGetter{a: getterA, b: getterB}, nil,
+	j := newJoiner(map[clusterIdentity]objectGetter{a: getterA, b: getterB}, nil, nil, nil,
 		func(context.Context, DriftEvent) {})
 
 	recordA := joinRecord()
@@ -581,7 +581,7 @@ func TestJoinRoutesEachRecordToItsOwnCluster(t *testing.T) {
 func TestJoinRefusesAPartialIdentityEvenWhenItIsAKey(t *testing.T) {
 	partial := clusterIdentity{Project: "example-project"}
 	getter := &stubGetter{obj: managedFieldsObject()}
-	j := newJoiner(map[clusterIdentity]objectGetter{partial: getter}, nil, func(context.Context, DriftEvent) {})
+	j := newJoiner(map[clusterIdentity]objectGetter{partial: getter}, nil, nil, nil, func(context.Context, DriftEvent) {})
 
 	record := joinRecord()
 	record.Location = ""
@@ -603,7 +603,7 @@ func TestJoinRefusesAPartialIdentityEvenWhenItIsAKey(t *testing.T) {
 }
 
 func TestUnreachableClustersNamesThemMostFrequentFirst(t *testing.T) {
-	j := newJoiner(nil, nil, func(context.Context, DriftEvent) {})
+	j := newJoiner(nil, nil, nil, nil, func(context.Context, DriftEvent) {})
 
 	record := joinRecord()
 	j.Handle(context.Background(), record)
@@ -624,11 +624,11 @@ func TestUnreachableClustersNamesThemMostFrequentFirst(t *testing.T) {
 }
 
 // An outcome that is not unreachable must not name a cluster: a lookup that
-// failed on RBAC is a cluster the join reached, and listing it under
-// "no credentials and no Cluster Agent profile" would send an operator to
-// onboard a cluster that is already onboarded.
+// failed on RBAC is a cluster the join reached, and listing it among the
+// clusters the join could not read would send an operator to look for a
+// credential a cluster already has.
 func TestUnreachableClustersExcludesTheClustersTheJoinReached(t *testing.T) {
-	j := newJoiner(joinSet(&stubGetter{err: errors.New("forbidden")}), nil, func(context.Context, DriftEvent) {})
+	j := newJoiner(joinSet(&stubGetter{err: errors.New("forbidden")}), nil, nil, nil, func(context.Context, DriftEvent) {})
 	j.Handle(context.Background(), joinRecord())
 
 	if got := j.Counts().Failed; got != 1 {
@@ -644,7 +644,7 @@ func TestUnreachableClustersExcludesTheClustersTheJoinReached(t *testing.T) {
 // behaviour as classify.go's principal list: a cluster already counted keeps
 // counting past the cap, and only a new name folds into the overflow bucket.
 func TestUnreachableClustersCapsTheNameSet(t *testing.T) {
-	j := newJoiner(nil, nil, func(context.Context, DriftEvent) {})
+	j := newJoiner(nil, nil, nil, nil, func(context.Context, DriftEvent) {})
 
 	record := joinRecord()
 	for i := 0; i < maxUnreachableClusters; i++ {
