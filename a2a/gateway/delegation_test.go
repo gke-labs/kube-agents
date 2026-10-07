@@ -106,8 +106,8 @@ func platformSubmissions(t *testing.T, r *rig) int {
 	return n
 }
 
-// TestADelegateArtifactMintsAChildToPlatform is the spec's first gateway
-// test, with no allowlist configured (no list allows): the child carries the
+// TestADelegateArtifactMintsAChildToPlatform is the basic mint, with no
+// allowlist configured (no list allows): the child carries the
 // parent's correlationId, contextId and attribution plus a via, its root
 // capability resolves for platform, it is the active task, the chain is on
 // the record, and the parent's own terminal does not disturb it.
@@ -725,7 +725,7 @@ func postIndex(r *rig, needle string) int {
 	return -1
 }
 
-// TestARefusalFollowsTheDelegatingTurnsAnswer: spec §3 - the human sees the
+// TestARefusalFollowsTheDelegatingTurnsAnswer: the human sees the
 // session's "delegated to platform" and then the refusal, so the notice waits
 // for the delegating turn's terminal, from the executor or the supervisor.
 func TestARefusalFollowsTheDelegatingTurnsAnswer(t *testing.T) {
@@ -840,7 +840,8 @@ func TestAChildThatCannotReachTheBusLeavesNoChain(t *testing.T) {
 	}
 }
 
-// TestOneLiveChildPerConversation: decision 3 is per conversation. A stop
+// TestOneLiveChildPerConversation: one live child at a time holds per
+// conversation, whichever turn asked. A stop
 // detaches the child without ending it; a later turn's request is refused,
 // after that turn's answer, naming the running child.
 func TestOneLiveChildPerConversation(t *testing.T) {
@@ -1405,8 +1406,8 @@ func TestHealAfterRestartSeesTheChildAsActive(t *testing.T) {
 // TestAHealedChildNoLongerBlocksADelegation: a child with no first event
 // inside FirstEventGrace is released by the heal, which retires its route as
 // relayTerminal would; the conversation's next delegation mints. The heal
-// does not wake the session (spec §4 wakes on a terminal, and the heal
-// publishes none).
+// does not wake the session (a wake follows a child's terminal, and a child
+// that never started has none).
 func TestAHealedChildNoLongerBlocksADelegation(t *testing.T) {
 	const grace = 500 * time.Millisecond
 	r, spawn := startRigWithSpawnerCap(t, "platform", 0, func(c *Config) { c.FirstEventGrace = grace })
@@ -1436,6 +1437,19 @@ func TestAHealedChildNoLongerBlocksADelegation(t *testing.T) {
 	})
 	if n := len(spawn.calls()); n != 2 {
 		t.Fatalf("spawns = %d, want 2 (the heal must not wake the session)", n)
+	}
+	// Two spawns is also what a heal-wake makes: the wake spawns, and the
+	// turn's "/session again" then steers into it. The second spawn's task
+	// is the human's turn only if it reads the human's text, and no wake
+	// entry is on the record.
+	if got := envText(t, origin2); got != "again" {
+		t.Fatalf("the second spawn's task reads %q, want the human's turn", got)
+	}
+	rec, _ := r.g.reg.Get(ctx, conv)
+	for _, ref := range rec.Tasks {
+		if ref.Role == taskRoleWake {
+			t.Fatalf("the heal woke the session for a child that never started: %+v", ref)
+		}
 	}
 }
 
@@ -2259,5 +2273,33 @@ func TestTheWakesAskStaysWithinItsCapAfterRunsAreBroken(t *testing.T) {
 	}
 	if !strings.HasSuffix(got, wakeAskTruncatedNote) {
 		t.Fatalf("the cut ask is not marked: %q", got[len(got)-40:])
+	}
+}
+
+// TestAConsoleWakeCarriesTheResultAfterRenderStateIsLost: the console never
+// posts a deliverable, but a child's result also feeds its wake. With the
+// child's result relayed before a restart and its terminal after it, the
+// relay's render state is gone, and the wake still carries the result read
+// from the stream, not the non-text stand-in.
+func TestAConsoleWakeCarriesTheResultAfterRenderStateIsLost(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := consoleKeyPrefix + "t-wake-lost"
+	_, _, child := delegated(t, r, spawn, conv, "")
+	cexec := r.execFor(t, child, targetPlatform)
+	r2, spawn2 := restartRig(t, r, func() {
+		if err := cexec.PublishArtifact(context.Background(), lib.Artifact{ArtifactID: "a-r", Name: lib.ArtifactResult,
+			Parts: []lib.Part{{Kind: "text", Text: "fleet is green"}}}); err != nil {
+			t.Fatal(err)
+		}
+		drainRelayDurable(t, r.url)
+	})
+	if err := cexec.PublishStatus(context.Background(), lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "wake spawn", func() bool { return len(spawn2.calls()) == 1 })
+	wake := r2.awaitTask(t, spawn2.calls()[0].Session)
+	text := envText(t, wake)
+	if !strings.Contains(text, "fleet is green") || strings.Contains(text, completedNonTextResult) {
+		t.Fatalf("the console wake does not carry the child's result: %q", text)
 	}
 }

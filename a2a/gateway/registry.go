@@ -252,8 +252,10 @@ type TaskRef struct {
 	// counts delegations: a child's is its parent's plus one, a wake inherits
 	// its child's, and a turn at the bound may not delegate again. Children
 	// is a slice although one child runs at a time, so fan-out is one
-	// condition later rather than a record migration. All four are empty on
-	// a human turn and on entries written before they existed.
+	// condition later rather than a record migration. Role, ParentTaskID and
+	// Depth are empty on a human turn, and Children is empty on one that did
+	// not delegate; all four are empty on entries written before they
+	// existed.
 	// StatusMsgID is the rolling-line message of a turn that delegated:
 	// the child takes ActiveTask, and with it the only other copy, so the
 	// parent's line is kept here to close on the parent's terminal.
