@@ -3895,13 +3895,46 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
             return True
         return all(_tolerates_taint(tolerations, t) for t in taints)
 
-    if non_cc_pools and any(_tolerates_pool(pod_tolerations, p) for p in non_cc_pools):
+    def _pool_matches_selector(pool: dict, selector: dict[str, str]) -> bool:
+        if not selector:
+            return True
+        labels = (pool.get("config") or {}).get("labels") or {}
+        return all(labels.get(k) == v for k, v in selector.items())
+
+    # If the workload can schedule on any non-ComputeClass pool, non-CC capacity is available
+    if non_cc_pools and any(
+        _pool_matches_selector(p, node_selector) and _tolerates_pool(pod_tolerations, p)
+        for p in non_cc_pools
+    ):
         return None
+
+    # Workload-conditional ComputeClass determination:
+    schedulable_pools = [
+        p for p in node_pools
+        if _pool_matches_selector(p, node_selector) and _tolerates_pool(pod_tolerations, p)
+    ]
+    schedulable_ccs = {
+        ((p.get("config") or {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL)
+        for p in schedulable_pools
+    }
+    schedulable_ccs.discard(None)
+    schedulable_ccs.discard("")
 
     pool_target_cc = next(iter(pool_ccs)) if len(pool_ccs) == 1 else ""
     untainted_gp_ccs = [cc for cc in compute_classes if _is_untainted_gp_compute_class(cc, node_pools=node_pools)]
-    if len(untainted_gp_ccs) == 1 and pool_target_cc and untainted_gp_ccs[0].get("metadata", {}).get("name") == pool_target_cc:
-        single_cc = pool_target_cc
+
+    if len(schedulable_ccs) == 1:
+        target_candidate = next(iter(schedulable_ccs))
+        if (
+            target_candidate == pool_target_cc
+            and len(untainted_gp_ccs) == 1
+            and untainted_gp_ccs[0].get("metadata", {}).get("name") == pool_target_cc
+        ):
+            single_cc = pool_target_cc
+        elif any(cc.get("metadata", {}).get("name") == target_candidate for cc in compute_classes):
+            single_cc = target_candidate
+        else:
+            single_cc = ""
     else:
         single_cc = ""
 

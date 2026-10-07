@@ -488,6 +488,56 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         hit_not_tol = collect.check_untargeted_compute_class_workload(wl_not_tolerating, ctx)
         self.assertIsNotNone(hit_not_tol)
 
+    def test_workload_pinned_to_tainted_compute_class_pool_resolves_to_that_pool_class(self):
+        base_pool = pool(
+            "base-pool",
+            labels={collect.COMPUTE_CLASS_LABEL: "base", "cloud.google.com/gke-nodepool": "base-pool"},
+        )
+        batch_pool = pool(
+            "batch-pool",
+            labels={collect.COMPUTE_CLASS_LABEL: "batch", "cloud.google.com/gke-nodepool": "batch-pool"},
+            taints=[{"key": collect.COMPUTE_CLASS_LABEL, "value": "batch", "effect": "NO_SCHEDULE"}],
+        )
+        cc_base = compute_class("base")
+        cc_batch = compute_class("batch")
+        ctx = {
+            "compute_classes": [cc_base, cc_batch],
+            "node_pools": [base_pool, batch_pool],
+            "namespaces": [self.ns],
+        }
+
+        # Workload pinned to batch-pool by nodepool selector and tolerating batch taint:
+        wl_batch = collect.normalize_workloads({
+            "items": [deployment(
+                "batch-worker",
+                node_selector={"cloud.google.com/gke-nodepool": "batch-pool"},
+                tolerations=[{"key": collect.COMPUTE_CLASS_LABEL, "value": "batch", "operator": "Equal", "effect": "NoSchedule"}],
+            )]
+        })[0]
+        hit_batch = collect.check_untargeted_compute_class_workload(wl_batch, ctx)
+        self.assertIsNotNone(hit_batch)
+        self.assertEqual(hit_batch["single_compute_class"], "batch")
+
+        # Unpinned workload (no selector, no tolerations) can only land on base-pool:
+        wl_unpinned = collect.normalize_workloads({
+            "items": [deployment("generic-worker")]
+        })[0]
+        hit_unpinned = collect.check_untargeted_compute_class_workload(wl_unpinned, ctx)
+        self.assertIsNotNone(hit_unpinned)
+        self.assertEqual(hit_unpinned["single_compute_class"], "base")
+
+        # Workload with selector matching batch-pool but lacking toleration cannot schedule anywhere:
+        wl_conflicted = collect.normalize_workloads({
+            "items": [deployment(
+                "conflicted-worker",
+                node_selector={"cloud.google.com/gke-nodepool": "batch-pool"},
+            )]
+        })[0]
+        hit_conflicted = collect.check_untargeted_compute_class_workload(wl_conflicted, ctx)
+        self.assertIsNotNone(hit_conflicted)
+        self.assertEqual(hit_conflicted["single_compute_class"], "")
+        self.assertTrue(hit_conflicted["multiple_compute_classes"])
+
     def test_transient_controller_and_cloud_provider_taints_on_non_cc_nodes(self):
         ca_pool = pool(
             "non-cc-ca",
