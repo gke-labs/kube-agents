@@ -1274,7 +1274,7 @@ Mutation(
     Mutation(
         "A3-slack-map-asserts-member-prefix",
         "a2a/gateway/gchat.go",
-        ("\t\tif strings.HasPrefix(principal, slackMemberPrincipalPrefix) {", "\t\tif false {"),
+        ("\t\tif strings.HasPrefix(mapped, slackMemberPrincipalPrefix) {", "\t\tif false {"),
         "test_A3_the_slack_map_cannot_assert_a_member_id_principal",
         "honour a map value that carries the reserved slack: prefix, so a map "
         "entry can name a principal that claims to be some other member's id",

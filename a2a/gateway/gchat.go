@@ -1014,18 +1014,37 @@ func (g *Gateway) resolvePrincipal(backend, authorID string) string {
 // a mistaken entry a lockout rather than a principal that misstates how it
 // was established. Empty means drop.
 func (g *Gateway) resolveSlackPrincipal(authorID string) string {
+	principal, reserved := g.slackPrincipal(authorID)
+	if reserved {
+		g.log.Error("the Slack principal map maps a member to a principal carrying the reserved member-id prefix; refusing it",
+			"member", authorID, "prefix", slackMemberPrincipalPrefix)
+	}
+	return principal
+}
+
+// slackRosterPrincipal is the same rule for a roster member, silently: the
+// roster resolves every channel member twice on every turn, and a refusal
+// there is not an admission decision (the member is recorded by raw id), so
+// logging it would repeat one mistaken map entry on every turn in every
+// channel the member is in. The requester path logs it once per message.
+func (g *Gateway) slackRosterPrincipal(authorID string) string {
+	principal, _ := g.slackPrincipal(authorID)
+	return principal
+}
+
+// slackPrincipal is the Slack rule both paths share: empty for an unlisted
+// member or a refused map entry, and reserved reports the second.
+func (g *Gateway) slackPrincipal(authorID string) (principal string, reserved bool) {
 	if authorID == "" || (!g.slackAllowAll && !g.slackAllowed[authorID]) {
-		return ""
+		return "", false
 	}
-	if principal := g.pm.Resolve(authorID); principal != "" {
-		if strings.HasPrefix(principal, slackMemberPrincipalPrefix) {
-			g.log.Error("the Slack principal map maps a member to a principal carrying the reserved member-id prefix; refusing it",
-				"member", authorID, "prefix", slackMemberPrincipalPrefix)
-			return ""
+	if mapped := g.pm.Resolve(authorID); mapped != "" {
+		if strings.HasPrefix(mapped, slackMemberPrincipalPrefix) {
+			return "", true
 		}
-		return principal
+		return mapped, false
 	}
-	return slackMemberPrincipalPrefix + authorID
+	return slackMemberPrincipalPrefix + authorID, false
 }
 
 // slackVerifiedByFor names the mechanism behind one Slack principal: the

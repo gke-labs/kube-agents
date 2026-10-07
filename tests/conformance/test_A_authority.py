@@ -440,10 +440,10 @@ class A3TheGatewaysSlackPrincipalComesFromSlackOrTheMap(unittest.TestCase):
     """
 
     def test_A3_an_unlisted_slack_sender_resolves_to_nothing(self) -> None:
-        body = h.go_function_body(h.text("a2a_slack_identity"), "resolveSlackPrincipal")
+        body = h.go_function_body(h.text("a2a_slack_identity"), "slackPrincipal")
         self.assertRegex(
             body,
-            r'if authorID == "" \|\| \(!g\.slackAllowAll && !g\.slackAllowed\[authorID\]\) \{\s*return ""',
+            r'if authorID == "" \|\| \(!g\.slackAllowAll && !g\.slackAllowed\[authorID\]\) \{\s*return "", false',
             "a Slack sender off the allowlist (or with no member id) is no longer refused",
         )
 
@@ -464,10 +464,10 @@ class A3TheGatewaysSlackPrincipalComesFromSlackOrTheMap(unittest.TestCase):
         self.assertIn('return team != "" && (s.teamID == "" || team != s.teamID)', other)
 
     def test_A3_the_slack_map_cannot_assert_a_member_id_principal(self) -> None:
-        body = h.go_function_body(h.text("a2a_slack_identity"), "resolveSlackPrincipal")
+        body = h.go_function_body(h.text("a2a_slack_identity"), "slackPrincipal")
         self.assertRegex(
             body,
-            r"if strings\.HasPrefix\(principal, slackMemberPrincipalPrefix\) \{[^}]*return \"\"",
+            r"if strings\.HasPrefix\(mapped, slackMemberPrincipalPrefix\) \{\s*return \"\", true",
             "a map value carrying the reserved slack: prefix is no longer refused",
         )
 

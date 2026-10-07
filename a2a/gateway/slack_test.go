@@ -2666,6 +2666,34 @@ func TestSlackMapCannotAssertTheMemberIDPrefix(t *testing.T) {
 	}
 }
 
+// TestSlackRosterRefusesTheReservedPrefixSilently: the roster resolves every
+// channel member on every turn, so a reserved-prefix map entry is refused
+// there without a log line; the requester path is where it is logged.
+func TestSlackRosterRefusesTheReservedPrefixSilently(t *testing.T) {
+	mapFile := filepath.Join(t.TempDir(), "principal-map")
+	if err := os.WriteFile(mapFile, []byte("U5 "+slackMemberPrincipalPrefix+"U1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pm, err := LoadPrincipalMap(mapFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := &recordingHandler{}
+	g := &Gateway{pm: pm, slackAllowAll: true, log: slog.New(logs)}
+	if got := g.rosterResolver(slackBackend)("U5"); got != "" {
+		t.Errorf("the roster resolved a reserved-prefix entry to %q", got)
+	}
+	if _, found := logs.level("reserved member-id prefix"); found {
+		t.Error("the roster path logged the reserved-prefix refusal; it must be silent")
+	}
+	if got := g.resolvePrincipal(slackBackend, "U5"); got != "" {
+		t.Errorf("the requester path resolved a reserved-prefix entry to %q", got)
+	}
+	if lvl, found := logs.level("reserved member-id prefix"); !found || lvl != slog.LevelError {
+		t.Errorf("the requester path's refusal: found=%t level=%v, want ERROR", found, lvl)
+	}
+}
+
 // TestSlackAllowAllAdmitsEverySender: allow-all lifts the list, the only
 // gate: a mapped sender is attributed by the map, an unmapped one by member
 // id.

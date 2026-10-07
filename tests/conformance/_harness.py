@@ -297,7 +297,7 @@ SOURCES: dict[str, Source] = {
     ),
     "a2a_slack_identity": Source(
         "a2a/gateway/gchat.go",
-        ("func (g *Gateway) resolveSlackPrincipal", "slackMemberPrincipalPrefix"),
+        ("func (g *Gateway) slackPrincipal(", "slackMemberPrincipalPrefix"),
     ),
     # labelPartOf lives here rather than beside the fence, so resolving the
     # operator's side of the pair needs both files.

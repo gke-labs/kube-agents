@@ -1831,8 +1831,11 @@ func (g *Gateway) verifiedByOf(backend, principal string) string {
 // be read under the same map the requester's principal was read under, and
 // one backend's map is never a fallback for another's.
 func (g *Gateway) rosterResolver(backend string) func(string) string {
-	if backend == consoleBackend || backend == slackBackend {
+	if backend == consoleBackend {
 		return func(id string) string { return g.resolvePrincipal(backend, id) }
+	}
+	if backend == slackBackend {
+		return g.slackRosterPrincipal
 	}
 	return g.principalMapFor(backend).Resolve
 }
