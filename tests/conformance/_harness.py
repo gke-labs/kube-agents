@@ -291,6 +291,10 @@ SOURCES: dict[str, Source] = {
     ),
     # The gateway's Slack identity rule: the allowlist gates, the map
     # overrides, and the member id is the principal otherwise.
+    "a2a_slack_ingress": Source(
+        "a2a/gateway/slack.go",
+        ("func (s *SlackAdapter) inbound(", "func (s *SlackAdapter) foreignSender("),
+    ),
     "a2a_slack_identity": Source(
         "a2a/gateway/gchat.go",
         ("func (g *Gateway) resolveSlackPrincipal", "slackMemberPrincipalPrefix"),

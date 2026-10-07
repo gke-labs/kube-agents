@@ -144,6 +144,10 @@ func verifiedByFor(backend string) string {
 	case consoleBackend:
 		return consoleVerifiedBy
 	case slackBackend:
+		// The map-joined case. A Slack requester's mechanism depends on its
+		// principal, so the authority path asks verifiedByOf, which sends
+		// Slack to slackVerifiedByFor; this arm is what a caller with no
+		// principal in hand gets.
 		return slackVerifiedBy
 	case injectBackend:
 		// Its own value, not "principal-map" and deliberately nothing a real
@@ -164,10 +168,8 @@ func verifiedByFor(backend string) string {
 }
 
 // unverifiedRemedyFor names what an admin edits to admit a sender — the
-// allowlist on gchat, both the allowlist and the a2a-slack-principal-map
-// Secret on Slack (a sender needs both, and the notice is the same whichever
-// one refused, so it does not tell a sender which table they are in), the
-// door's own map on inject, nothing at all on the console, the mapping table
+// allowlist on gchat and on Slack (where the principal map is an override,
+// not a gate), the door's own map on inject, nothing at all on the console, the mapping table
 // everywhere else (Discord's ConfigMap).
 func unverifiedRemedyFor(backend string) string {
 	switch backend {
@@ -964,7 +966,8 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 // identity mechanism. On gchat the Google-asserted email IS the principal,
 // gated by the allowlist (the mapping table other backends need is exactly
 // what that backend exists to not have). On Slack the same kind of allowlist
-// gates first and the principal map then resolves, so a sender needs both.
+// is the gate, and the principal map, when it names the sender, overrides
+// the member-id principal (resolveSlackPrincipal).
 // On the console the NATS grant is
 // the mechanism: only the console credential can publish on the console
 // subject, so the author is the console principal - but only on a console

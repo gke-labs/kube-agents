@@ -4274,10 +4274,11 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			{Name: a2aSlackAppTokenEnvVar, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: a2aRequiredSecretRef(slack.AppTokenSecretRef, a2aSlackAppTokenEnvVar)}},
 			// The allowed-users gate, carried on Chat's terms (see the Chat
 			// pair below): normalized the way the gateway reads it, the
-			// allow-all flag the legacy rule on the RAW list. The gateway
-			// admits a Slack sender only if this gate AND the principal map
-			// both pass, so a mapped member the CR does not allow is
-			// refused under next as under today.
+			// allow-all flag the legacy rule on the RAW list. This is the
+			// gateway's only Slack admission gate (beside refusing another
+			// workspace's member): the principal map overrides attribution,
+			// so a mapped member the CR does not allow is refused under next
+			// as under today.
 			{Name: a2aSlackAllowedUsersEnvVar, Value: strings.Join(a2aAllowlist(slack.AllowedUsers), ",")},
 			{Name: a2aSlackAllowAllUsersEnvVar, Value: strconv.FormatBool(allowAllUsers(slack.AllowedUsers))},
 		}

@@ -25,6 +25,8 @@ import (
 // fakeSlackAPI fakes the five Web API calls the adapter makes; tests assert
 // on what was posted/updated.
 type fakeSlackAPI struct {
+	// team is the team id auth.test answers with.
+	team     string
 	posted   []struct{ channel, thread, text string }
 	updated  []struct{ channel, ts, text string }
 	members  []string
@@ -33,7 +35,7 @@ type fakeSlackAPI struct {
 }
 
 func (f *fakeSlackAPI) AuthTestContext(context.Context) (*slack.AuthTestResponse, error) {
-	return &slack.AuthTestResponse{UserID: "UBOT", User: "kage"}, nil
+	return &slack.AuthTestResponse{UserID: "UBOT", User: "kage", TeamID: f.team}, nil
 }
 
 func (f *fakeSlackAPI) PostMessage(channelID string, options ...slack.MsgOption) (string, string, error) {
@@ -718,6 +720,57 @@ func slackMsg(channelType, channel, user, text, ts, threadTS string) *slackevent
 	return &slackevents.MessageEvent{
 		ChannelType: channelType, Channel: channel, User: user,
 		Text: text, TimeStamp: ts, ThreadTimeStamp: threadTS,
+	}
+}
+
+// TestSlackRefusesAnotherWorkspacesMember: a message whose sender belongs
+// to another workspace (Slack Connect) is not a turn, whatever the
+// allowlist says; a sender of ours in a shared channel, and any message
+// that names no sender workspace, still is.
+func TestSlackRefusesAnotherWorkspacesMember(t *testing.T) {
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	a.teamID = "T0URS"
+	ctx := context.Background()
+	foreign := slackMsg("im", "D1", "UGUEST", "drain node 4", "1.0", "")
+	foreign.UserTeam = "T0THER"
+	if _, ok := a.inbound(ctx, foreign); ok {
+		t.Error("a DM from another workspace's member was delivered as a turn")
+	}
+	mention := slackMsg("channel", "C1", "UGUEST", "<@UBOT> drain node 4", "2.0", "")
+	mention.UserTeam = "T0THER"
+	if _, ok := a.inbound(ctx, mention); ok {
+		t.Error("a mention from another workspace's member in a shared channel was delivered as a turn")
+	}
+	ours := slackMsg("channel", "C1", "U1", "<@UBOT> how is the fleet?", "3.0", "")
+	ours.UserTeam = "T0URS"
+	if _, ok := a.inbound(ctx, ours); !ok {
+		t.Error("our own member's mention in a shared channel was refused")
+	}
+	if _, ok := a.inbound(ctx, slackMsg("im", "D2", "U2", "hello", "4.0", "")); !ok {
+		t.Error("a DM that names no sender workspace was refused")
+	}
+	// No team id from auth.test: a message that names a sender workspace
+	// cannot be shown to be ours, so it is refused.
+	a.teamID = ""
+	unknown := slackMsg("im", "D3", "U3", "hello", "5.0", "")
+	unknown.UserTeam = "T0URS"
+	if _, ok := a.inbound(ctx, unknown); ok {
+		t.Error("with no team id known, a message naming a sender workspace was delivered")
+	}
+}
+
+// TestSlackConnectedRecordsTheTeam: auth.test's team id is what the
+// workspace check compares against.
+func TestSlackConnectedRecordsTheTeam(t *testing.T) {
+	api := &fakeSlackAPI{team: "T0URS"}
+	a := newTestSlackAdapter(api)
+	auth, err := api.AuthTestContext(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.connected(auth)
+	if a.teamID != "T0URS" {
+		t.Errorf("teamID = %q, want auth.test's T0URS", a.teamID)
 	}
 }
 

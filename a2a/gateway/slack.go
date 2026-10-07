@@ -111,6 +111,8 @@ const (
 	// reserved: a map entry whose value carries it is refused, so the map
 	// can never assert a principal that claims to be a bare member id.
 	slackMemberPrincipalPrefix = "slack:"
+	// slackChannelTypeIM is a direct message's channel_type.
+	slackChannelTypeIM = "im"
 )
 
 // Slack token prefixes, checked at construction so a swapped pair fails at
@@ -144,6 +146,10 @@ type SlackAdapter struct {
 	sm        *socketmode.Client // nil in unit tests
 	log       *slog.Logger
 	botUserID string
+	// teamID is the bot's own workspace, from auth.test. A message whose
+	// sender belongs to another workspace (a Slack Connect channel shared
+	// with another organisation) is not a turn: see inbound.
+	teamID string
 
 	mu sync.Mutex
 	// sessions is the gateway's session registry as a read (SessionLookup),
@@ -166,7 +172,7 @@ type SlackAdapter struct {
 	// ask's own thread and a thread someone else rooted alike, once a
 	// verified sender's ask has started a task there — and a miss consults
 	// the registry for the same fact and caches its answer. Nothing is
-	// derived from the root message: a channel mention from an unmapped
+	// derived from the root message: a channel mention from an unverified
 	// sender roots nothing. A session thread stays one while its session is
 	// active or has been active within the idle TTL, and no longer: a
 	// cached true carries the moment it expires in sessionExpiresAt --
@@ -272,7 +278,7 @@ func (s *SlackAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Durat
 // gateway's word, after it verified the sender and minted the session, and
 // it is the only word: a channel ask's own thread becomes a session thread
 // here when the gateway starts the task, the same as a thread someone else
-// rooted, and a mention on its own -- a channel mention from an unmapped
+// rooted, and a mention on its own -- a channel mention from an unverified
 // sender, a bare "<@bot>" from anyone -- records nothing. A DM is the whole
 // session and needs no record. Called on the conversation's inbox worker
 // under the session lock (TaskObserver): record and return.
@@ -411,8 +417,7 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 	if err != nil {
 		return fmt.Errorf("slack auth.test: %w", err)
 	}
-	s.botUserID = auth.UserID
-	s.log.Info("slack connected", "user", auth.User, "botUserID", auth.UserID)
+	s.connected(auth)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -851,6 +856,39 @@ func (s *SlackAdapter) setMark(key string, isSession, force bool, until time.Tim
 	}
 }
 
+// connected records who the bot is from auth.test: its own user id, which
+// the ingress filter drops its own posts by, and its workspace, which
+// foreignSender compares a shared channel's senders against.
+func (s *SlackAdapter) connected(auth *slack.AuthTestResponse) {
+	s.botUserID = auth.UserID
+	s.teamID = auth.TeamID
+	s.log.Info("slack connected", "user", auth.User, "botUserID", auth.UserID, "team", auth.TeamID)
+}
+
+// foreignSender reports a message whose sender belongs to a workspace other
+// than the bot's. Slack names the sender's workspace (user_team) only on a
+// message in a channel shared between workspaces, so a message that names
+// none came from a channel only our members can post in. One that names
+// another workspace is a Slack Connect guest's, and is refused before the
+// allowlist is consulted: the member id is the principal for an unmapped
+// sender, so admission must not reach past the install's own workspace, and
+// under allow-all nothing else would stop it. Fail-closed when auth.test
+// gave no team id. Silent to the sender, as a bot's or an edit's drop is;
+// logged at Info when it addressed the bot, so an admin can see why a guest
+// got no answer. Under Enterprise Grid a member of a sister workspace in a
+// shared channel is refused too, since the event does not carry the
+// sender's enterprise.
+func (s *SlackAdapter) foreignSender(m *slackevents.MessageEvent) bool {
+	if m.UserTeam == "" || (s.teamID != "" && m.UserTeam == s.teamID) {
+		return false
+	}
+	if m.ChannelType == slackChannelTypeIM || slackMentionsBot(m.Text, s.botUserID) {
+		s.log.Info("slack: ignoring a message from another workspace's member",
+			"senderTeam", m.UserTeam, "team", s.teamID, "channel", m.Channel)
+	}
+	return true
+}
+
 // inbound normalizes one message event, or reports it not-a-turn. The
 // affordance rule, deterministic: DMs carry every message; a channel
 // message must mention the bot, and the ask's own ts becomes the session
@@ -859,11 +897,15 @@ func (s *SlackAdapter) setMark(key string, isSession, force bool, until time.Tim
 // gateway has started a task in, which a mention alone does not make it,
 // the channel ask's own thread included: the gateway starting the task
 // there does (TaskStarted), the same as for any other thread, and a channel
-// mention from an unmapped sender roots nothing. Everything else — bots,
-// our own posts, edits and other subtypes, redeliveries — is not a turn.
+// mention from an unverified sender roots nothing. Everything else — bots,
+// our own posts, edits and other subtypes, redeliveries, and a sender from
+// another workspace — is not a turn.
 func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent) (InboundMessage, bool) {
 	if !slackTurnSubtypes[m.SubType] || m.BotID != "" || m.User == "" || m.User == s.botUserID ||
 		m.Channel == "" || m.TimeStamp == "" {
+		return InboundMessage{}, false
+	}
+	if s.foreignSender(m) {
 		return InboundMessage{}, false
 	}
 	if s.alreadySeen(m.Channel + "/" + m.TimeStamp) {

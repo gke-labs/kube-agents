@@ -17,8 +17,9 @@ import (
 // identity never maps to a real cloud principal, full stop. For Slack it is
 // the admin-owned a2a-slack-principal-map Secret, joining the immutable
 // user_id to an IdP-sourced principal (spec-chatops-gateway.md, "The Slack
-// adapter"). A sender with no entry cannot be verified and their message is
-// dropped at ingress.
+// adapter"). A Discord sender with no entry cannot be verified and their
+// message is dropped at ingress; on Slack the map is an override, and a
+// listed sender with no entry is attributed by member id.
 type PrincipalMap struct {
 	mu sync.RWMutex
 	m  map[string]string

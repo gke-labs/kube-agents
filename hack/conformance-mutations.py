@@ -1263,6 +1263,15 @@ Mutation(
         "member of the workspace is admitted as slack:<member id>",
     ),
     Mutation(
+        "A3-slack-foreign-workspace-admitted",
+        "a2a/gateway/slack.go",
+        ("\tif s.foreignSender(m) {\n\t\treturn InboundMessage{}, false\n\t}\n", ""),
+        "test_A3_another_workspaces_member_is_not_a_turn",
+        "drop the workspace check, so under allow-all a Slack Connect guest from "
+        "another organisation is admitted as slack:<member id> with the install's "
+        "capability",
+    ),
+    Mutation(
         "A3-slack-map-asserts-member-prefix",
         "a2a/gateway/gchat.go",
         ("\t\tif strings.HasPrefix(principal, slackMemberPrincipalPrefix) {", "\t\tif false {"),
