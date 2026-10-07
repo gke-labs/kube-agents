@@ -362,6 +362,14 @@ type PlatformAgentReconciler struct {
 	// (e.g. from KUBERNETES_METADATA_DAEMON_IP or --kubernetes-metadata-daemon-ip).
 	MetadataDaemonIPOverride string
 
+	// OperatorNamespace is the namespace this operator's pods run in, from
+	// POD_NAMESPACE (OperatorNamespaceEnv), which both install paths set on
+	// the manager container from the Downward API. The gateway and broker
+	// NetworkPolicies admit the operator's pods in it on the metrics ports,
+	// for the usage counters poller (usage_counters_poller.go); empty, as
+	// under `make run` off the cluster, renders no such rule.
+	OperatorNamespace string
+
 	// otelEndpoint caches the discovered OpenTelemetry collector, cluster-wide — there
 	// is one collector per cluster, not one per agent. Unlike the ImageVolume
 	// capability this expires (otelDiscoveryTTL): a Service can appear or move at any
@@ -2252,7 +2260,7 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	objs := []client.Object{
 		buildCredentialProxyService(agent),
 		proxy,
-		buildCredentialProxyNetworkPolicy(agent),
+		credentialProxyNetworkPolicyWithOperatorPeer(agent, r.OperatorNamespace),
 	}
 	for _, obj := range objs {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
@@ -3721,33 +3729,42 @@ func (r *PlatformAgentReconciler) usageStatusPruned(agent *agentv1alpha1.Platfor
 	return time.Since(recorded.(time.Time)) < usageStatusReprobeInterval
 }
 
-// noteUsageStatusEcho reads the server's copy of the status back after a
-// write. controller-runtime decodes the response into agent through a decoder
-// that zeroes the target first (apiutil's target-zeroing decoder), so a
-// status.usage the served CRD does not know comes back empty although a
-// non-empty list was just written — a merging decoder would leave the written
-// list in place and this check would never fire. That emptiness is the
-// pruning, recorded with the time so the gate skips the field until the next
-// probe, and logged once per record. An echo that carries the field clears the
-// record. A resolved list that is itself empty says nothing either way and is
-// left alone: nil and empty compare equal in the gate, so it cannot loop.
+// noteUsageStatusEcho reads the server's copy of the status back after the
+// Ready writer's write. controller-runtime decodes the response into agent
+// through a decoder that zeroes the target first (apiutil's target-zeroing
+// decoder), so a status.usage the served CRD does not know comes back empty
+// although a non-empty list was just written — a merging decoder would leave
+// the written list in place and this check would never fire. A resolved list
+// that is itself empty says nothing either way and is left alone: nil and
+// empty compare equal in the gate, so it cannot loop. noteUsageEcho records
+// what the echo said.
 func (r *PlatformAgentReconciler) noteUsageStatusEcho(ctx context.Context, agent *agentv1alpha1.PlatformAgent, written []string) {
-	key := client.ObjectKeyFromObject(agent)
 	if len(written) == 0 {
 		return
 	}
-	if len(agent.Status.Usage.ActiveInterfaces) == 0 {
-		// Said once per record, not once per write: a status write for any
-		// other reason while the record is fresh re-records silently.
-		fresh := r.usageStatusPruned(agent)
-		r.prunedUsageStatus.Store(key, time.Now())
-		if !fresh {
-			logf.FromContext(ctx).Info("the served CRD has no status.usage; apply this release's CRD to get status.usage.activeInterfaces, which is probed again after the interval",
-				"platformagent", key.String(), "reprobeAfter", usageStatusReprobeInterval.String())
-		}
+	r.noteUsageEcho(ctx, agent, len(agent.Status.Usage.ActiveInterfaces) != 0)
+}
+
+// noteUsageEcho is the one record both status.usage writers keep: echoed
+// false is a write whose status.usage fields came back absent, the pruning,
+// recorded with the time so that each writer skips the field until the next
+// probe and logged once per record; echoed true clears it. The Ready writer
+// calls it with whether activeInterfaces came back, the usage counters poller
+// with whether the counters did.
+func (r *PlatformAgentReconciler) noteUsageEcho(ctx context.Context, agent *agentv1alpha1.PlatformAgent, echoed bool) {
+	key := client.ObjectKeyFromObject(agent)
+	if echoed {
+		r.prunedUsageStatus.Delete(key)
 		return
 	}
-	r.prunedUsageStatus.Delete(key)
+	// Said once per record, not once per write: a status write for any
+	// other reason while the record is fresh re-records silently.
+	fresh := r.usageStatusPruned(agent)
+	r.prunedUsageStatus.Store(key, time.Now())
+	if !fresh {
+		logf.FromContext(ctx).Info("the served CRD has no status.usage; apply this release's CRD to get status.usage, which is probed again after the interval",
+			"platformagent", key.String(), "reprobeAfter", usageStatusReprobeInterval.String())
+	}
 }
 
 // forgetUsageStatus drops the CR's pruning record when the CR goes away, so the
