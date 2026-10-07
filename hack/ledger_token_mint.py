@@ -2,7 +2,7 @@
 """Mint a one-hour GitHub installation token from the ledger-reader App's key.
 
 Shared by hack/ci-eval-pr.sh (grading's reads and the two resets) and by step 0,
-hack/ci-revalidate.sh (the status attestation read). Everything secret or
+hack/ci-revalidate.sh (its status reads: the /override check and the attestation). Everything secret or
 caller-specific arrives through the environment, never argv:
 
   EVAL_LEDGER_APP_KEY_FILE   the App's private key (PEM); required

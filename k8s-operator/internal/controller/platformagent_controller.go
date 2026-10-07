@@ -362,6 +362,14 @@ type PlatformAgentReconciler struct {
 	// (e.g. from KUBERNETES_METADATA_DAEMON_IP or --kubernetes-metadata-daemon-ip).
 	MetadataDaemonIPOverride string
 
+	// OperatorNamespace is the namespace this operator's pods run in, from
+	// POD_NAMESPACE (OperatorNamespaceEnv), which both install paths set on
+	// the manager container from the Downward API. The gateway and broker
+	// NetworkPolicies admit the operator's pods in it on the metrics ports,
+	// for the usage counters poller (usage_counters_poller.go); empty, as
+	// under `make run` off the cluster, renders no such rule.
+	OperatorNamespace string
+
 	// otelEndpoint caches the discovered OpenTelemetry collector, cluster-wide — there
 	// is one collector per cluster, not one per agent. Unlike the ImageVolume
 	// capability this expires (otelDiscoveryTTL): a Service can appear or move at any
@@ -2244,7 +2252,9 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	// model-provider keys are read out of a Secret as environment, so it needs
 	// the same digest — see platformagent_secret_hash.go. Stamping only the
 	// gateway would have left the credentials most likely to be rotated
-	// reaching a container that never restarts.
+	// reaching a container that never restarts. (On a Slack-armed next install
+	// the Slack pair is read by the A2A gateway instead, which reconcileA2A
+	// stamps.)
 	proxy := buildCredentialProxyDeployment(agent, policyHash)
 	if err := r.stampSecretEnvHash(ctx, agent, proxy, &proxy.Spec.Template); err != nil {
 		return err
@@ -2252,7 +2262,7 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	objs := []client.Object{
 		buildCredentialProxyService(agent),
 		proxy,
-		buildCredentialProxyNetworkPolicy(agent),
+		credentialProxyNetworkPolicyWithOperatorPeer(agent, r.OperatorNamespace),
 	}
 	for _, obj := range objs {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
@@ -3319,11 +3329,37 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 		a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown) {
 		return nil
 	}
+	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
+		wantLive := wantBusProvisioned(live, a2a)
+		return a2aGatewayConditionCurrent(live, dark) && busProvisionedConditionCurrent(live, wantLive)
+	}) {
+		return nil
+	}
 	now := metav1.Now()
 	setA2AGatewayCondition(agent, dark, now)
 	setBusProvisionedCondition(agent, want, a2a.jobName, now)
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	return r.Status().Update(ctx, agent)
+}
+
+// liveAgentSatisfies checks whether the uncached live object already satisfies pred.
+// If it does, live status and ResourceVersion are adopted into agent (so subsequent
+// deferred writers operate on the fresh version), and returns true. If the live object
+// is from a different generation, adoption is refused.
+func (r *PlatformAgentReconciler) liveAgentSatisfies(ctx context.Context, agent *agentv1alpha1.PlatformAgent, pred func(*agentv1alpha1.PlatformAgent) bool) bool {
+	if r.APIReader == nil {
+		return false
+	}
+	live := &agentv1alpha1.PlatformAgent{}
+	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(agent), live); err != nil {
+		return false
+	}
+	if live.Generation == agent.Generation && pred(live) {
+		agent.Status = *live.Status.DeepCopy()
+		agent.ResourceVersion = live.ResourceVersion
+		return true
+	}
+	return false
 }
 
 // updateStatusReady writes the agent's status and returns the phase it settled on, so
@@ -3721,33 +3757,42 @@ func (r *PlatformAgentReconciler) usageStatusPruned(agent *agentv1alpha1.Platfor
 	return time.Since(recorded.(time.Time)) < usageStatusReprobeInterval
 }
 
-// noteUsageStatusEcho reads the server's copy of the status back after a
-// write. controller-runtime decodes the response into agent through a decoder
-// that zeroes the target first (apiutil's target-zeroing decoder), so a
-// status.usage the served CRD does not know comes back empty although a
-// non-empty list was just written — a merging decoder would leave the written
-// list in place and this check would never fire. That emptiness is the
-// pruning, recorded with the time so the gate skips the field until the next
-// probe, and logged once per record. An echo that carries the field clears the
-// record. A resolved list that is itself empty says nothing either way and is
-// left alone: nil and empty compare equal in the gate, so it cannot loop.
+// noteUsageStatusEcho reads the server's copy of the status back after the
+// Ready writer's write. controller-runtime decodes the response into agent
+// through a decoder that zeroes the target first (apiutil's target-zeroing
+// decoder), so a status.usage the served CRD does not know comes back empty
+// although a non-empty list was just written — a merging decoder would leave
+// the written list in place and this check would never fire. A resolved list
+// that is itself empty says nothing either way and is left alone: nil and
+// empty compare equal in the gate, so it cannot loop. noteUsageEcho records
+// what the echo said.
 func (r *PlatformAgentReconciler) noteUsageStatusEcho(ctx context.Context, agent *agentv1alpha1.PlatformAgent, written []string) {
-	key := client.ObjectKeyFromObject(agent)
 	if len(written) == 0 {
 		return
 	}
-	if len(agent.Status.Usage.ActiveInterfaces) == 0 {
-		// Said once per record, not once per write: a status write for any
-		// other reason while the record is fresh re-records silently.
-		fresh := r.usageStatusPruned(agent)
-		r.prunedUsageStatus.Store(key, time.Now())
-		if !fresh {
-			logf.FromContext(ctx).Info("the served CRD has no status.usage; apply this release's CRD to get status.usage.activeInterfaces, which is probed again after the interval",
-				"platformagent", key.String(), "reprobeAfter", usageStatusReprobeInterval.String())
-		}
+	r.noteUsageEcho(ctx, agent, len(agent.Status.Usage.ActiveInterfaces) != 0)
+}
+
+// noteUsageEcho is the one record both status.usage writers keep: echoed
+// false is a write whose status.usage fields came back absent, the pruning,
+// recorded with the time so that each writer skips the field until the next
+// probe and logged once per record; echoed true clears it. The Ready writer
+// calls it with whether activeInterfaces came back, the usage counters poller
+// with whether the counters did.
+func (r *PlatformAgentReconciler) noteUsageEcho(ctx context.Context, agent *agentv1alpha1.PlatformAgent, echoed bool) {
+	key := client.ObjectKeyFromObject(agent)
+	if echoed {
+		r.prunedUsageStatus.Delete(key)
 		return
 	}
-	r.prunedUsageStatus.Delete(key)
+	// Said once per record, not once per write: a status write for any
+	// other reason while the record is fresh re-records silently.
+	fresh := r.usageStatusPruned(agent)
+	r.prunedUsageStatus.Store(key, time.Now())
+	if !fresh {
+		logf.FromContext(ctx).Info("the served CRD has no status.usage; apply this release's CRD to get status.usage, which is probed again after the interval",
+			"platformagent", key.String(), "reprobeAfter", usageStatusReprobeInterval.String())
+	}
 }
 
 // forgetUsageStatus drops the CR's pruning record when the CR goes away, so the
@@ -4275,6 +4320,26 @@ const (
 	workloadNotRendered workloadRenderState = false
 )
 
+// degradedStatusCurrent reports whether the given PlatformAgent's status matches
+// what updateStatusDegraded would write. The comparison is keyed on phase, the Ready
+// condition's status, reason, message, and observedGeneration, plus the rendered-gated
+// VolumesDropped condition.
+func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message string, rendered workloadRenderState, hostPathDroppedMsg string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
+	if existing == nil ||
+		agent.Status.Phase != "Degraded" ||
+		existing.Status != metav1.ConditionFalse ||
+		existing.Reason != reason ||
+		existing.Message != message ||
+		existing.ObservedGeneration != agent.Generation {
+		return false
+	}
+	if !rendered {
+		return true
+	}
+	return hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg)
+}
+
 // updateStatusDegraded parks the agent on a refusal: phase Degraded, and a
 // Ready=False condition carrying the reason and message. It writes only when
 // something it is about to write differs from what the status already holds.
@@ -4321,7 +4386,6 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 	// same reason: a term no write can satisfy would make every requeue tick a
 	// status write (#1392).
 	hostPathDroppedMsg := ""
-	hostPathDroppedUnchanged := true
 	if rendered {
 		// Qualified the same way updateStatusReady qualifies it. That function
 		// reads the roll off the gateway workload it fetches anyway; this one
@@ -4342,15 +4406,16 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 			oldPods = r.gatewayRollIncomplete(ctx, agent)
 		}
 		hostPathDroppedMsg = hostPathDroppedMessage(agent, oldPods)
-		hostPathDroppedUnchanged = hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg)
 	}
-	if existing := meta.FindStatusCondition(agent.Status.Conditions, "Ready"); existing != nil &&
-		agent.Status.Phase == "Degraded" &&
-		existing.Status == metav1.ConditionFalse &&
-		existing.Reason == reason &&
-		existing.Message == message &&
-		existing.ObservedGeneration == agent.Generation &&
-		hostPathDroppedUnchanged {
+	if degradedStatusCurrent(agent, reason, message, rendered, hostPathDroppedMsg) {
+		return nil
+	}
+
+	// If the cached agent missed the status condition due to watch event lag,
+	// check the live object before attempting an Update that would conflict (409).
+	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
+		return degradedStatusCurrent(live, reason, message, rendered, hostPathDroppedMsg)
+	}) {
 		return nil
 	}
 

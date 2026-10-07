@@ -255,7 +255,7 @@ and the issue has no readable block (`start` says so on stderr).
 
 `context_repos` names the repositories registered for **declared intent**: the `context_repos` key
 of `$GITOPS_STATE_CONFIGMAP`, added by an administrator by hand, as `owner/name` slugs. A stream
-whose SOP has a declared-intent step (`obtainability-audit` §4a, `compliance-audit` §3a, `security-patch-orchestrator` §4a) searches them before it
+whose SOP has a declared-intent step (`obtainability-audit` §4a, `compliance-audit` §3a, `security-patch-orchestrator` §4a, `fleet-wide-cost-analysis` §3a) searches them before it
 reports a posture as a finding. They are read and nothing else: the key is separate from
 `managed_repos`, the harness never merges the two, so the broker's push gate, the repository
 resolver and the sweep never see them. The list is empty when nothing is registered or the key
@@ -615,7 +615,7 @@ and say which clusters were not covered. See [The clean run](#the-clean-run) for
 (The `declared` entry and the `declared_intent_searched` list are illustrative and cross streams: a
 real compliance document would be rejected for the `no-hpa` entry, a check outside its roster. `declared[].check` is validated
 against the stream's `declarable` set in `AUDITS` — its posture checks, a subset of the roster — and
-`obtainability-audit`, `compliance-audit` and `security-patch-orchestrator` have one today, because their SOPs have a step that writes the list. A
+`obtainability-audit`, `compliance-audit`, `security-patch-orchestrator` and `fleet-wide-cost-analysis` have one today, because their SOPs have a step that writes the list. A
 non-empty `declared` or `declared_intent_searched` on any other stream exits 2; `[]` validates
 everywhere.)
 
@@ -835,7 +835,7 @@ What the shape enforces:
   the posture returns as a finding on the next run. A declaration the worker did not read is not
   one it may cite.
 - **It justifies posture, never a fault.** Which checks may move here is the stream's `declarable`
-  set in `AUDITS`, four for obtainability, two for compliance and six for the patch stream, and the validator rejects any other check with exit 2. A
+  set in `AUDITS`, four for obtainability, two for compliance, six for the patch stream and eight for the waste audit, and the validator rejects any other check with exit 2. A
   drain-blocking budget declared in a repository is a declared bug and stays a finding, and a
   document that lists it under `declared` publishes nothing.
 

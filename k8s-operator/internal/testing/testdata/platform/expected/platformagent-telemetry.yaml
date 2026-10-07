@@ -1158,6 +1158,16 @@ spec:
       ports:
         - port: 8766
           protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kubeagents-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kube-agents-operator
+      ports:
+        - port: 8766
+          protocol: TCP
   podSelector:
     matchLabels:
       app: platformagent-credential-proxy
@@ -1932,6 +1942,16 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 9095
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kubeagents-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kube-agents-operator
       ports:
         - port: 9095
           protocol: TCP

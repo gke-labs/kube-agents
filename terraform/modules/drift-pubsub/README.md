@@ -1,6 +1,6 @@
 # Drift Audit-Log Pub/Sub Routing Module
 
-Reusable Terraform module for provisioning the GKE audit log → Pub/Sub delivery path the drift detector consumes: the Log Router sink, the drift-audit topic and pull subscription, and the IAM bindings that let the sink publish and the detector subscribe.
+Reusable Terraform module for provisioning the GKE audit log → Pub/Sub delivery path the drift detector consumes: the Log Router sink, the drift-audit topic and pull subscription, and the IAM bindings that let the sink publish and the detector subscribe — plus, where `topic_publishers` is set, publisher on the topic for each member it names.
 
 The detector cannot read audit logs from the Kubernetes API. On GKE the control plane is managed, so the API server's audit backend is not the operator's to configure and the stream surfaces only in Cloud Logging — hence a sink rather than an informer.
 
@@ -66,6 +66,23 @@ drift-detector --project my-gcp-project --subscription "$(terraform output -raw 
 The flag takes either form — this fully-qualified path, or the bare `subscription_name`, which it
 qualifies with `--project`. `--project` is required either way, because the detector's credentials
 are resolved against it.
+
+`topic_publishers` defaults to empty, which leaves the sink's writer identity as the topic's only
+publisher — the shape the section above assumes. Each member listed here takes
+`roles/pubsub.publisher` on the topic as well:
+
+```hcl
+  topic_publishers = ["serviceAccount:bench-runner@my-gcp-project.iam.gserviceaccount.com"]
+```
+
+Weigh that against what the detector does with what arrives. It reads
+`protoPayload.authenticationInfo.principalEmail` out of each record and classifies on it, and
+Pub/Sub does not attach the publishing identity to the message, so the detector cannot tell a
+record the sink exported from one a listed member composed. Anything that can publish here can
+therefore make the detector report a change nobody made, under any principal it chooses. The
+intended use is a test harness injecting synthetic audit records on a project set aside for it;
+on an install carrying real traffic, leave it empty. Never list the detector's own
+`detector_service_account_email` — the agent would be writing the stream its own pod reads.
 
 Lowering `ack_deadline_seconds` below its 60s default means passing the detector a matching
 `--batch-join-budget`. The detector holds a whole batch while it reads live objects, and the two
