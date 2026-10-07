@@ -276,8 +276,8 @@ python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 harness itself, one pinning a deliberate redundancy in the shorthand
 handling), zero genuine survivors, zero stale — measured 2026-09-25 against
 this branch on `main` at `525b37e7`, plus `A3-slack-click-authorization`,
-KILLED when it was added on 2026-09-30, and `D1-gateway-role-reaches-secrets` and
-`D1-platform-role-reaches-secrets`, both KILLED when they were added on 2026-10-05;
+KILLED when it was added on 2026-09-30, and `D1-platform-role-reaches-secrets`,
+KILLED when it was added on 2026-10-05;
 re-run the harness rather than trusting these numbers, which is the sentence this
 paragraph exists to make cheap.
 Note that the summary line the harness prints accounts for 113 of the 115: a
