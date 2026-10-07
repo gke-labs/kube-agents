@@ -54,8 +54,21 @@ readonly EVAL_ALERT_DAILY_LIMIT_WARNING="0"
 # pool project almost every principal is a service account and the classifier
 # drops it, so the steady state is quiet; the triggers are a maintainer running
 # kubectl against a leased cluster mid-run, a `user:` principal in the project,
-# and the classifier regression this setting exists to expose. Accepted because
-# a finite cap makes that regression green, which is the failure that matters.
+# the classifier regression this setting exists to expose, and the backlog
+# below. Accepted because a finite cap makes that regression green, which is
+# the failure that matters.
+#
+# The backlog is the widest of those and is not bounded by the lease. The sink
+# exports every cluster in the project and the subscription keeps what nothing
+# has acked for terraform/modules/drift-pubsub's default 31 days, never
+# expiring; teardown uninstalls the chart, so no detector pulls between leases.
+# Each lease therefore opens on everything human-tier logged since the last one
+# drained — on a freshly provisioned project, including the provisioning. This
+# script cannot drain it: seeking the subscription needs
+# pubsub.subscriptions.seek, and provision_ci_pool_project.sh gives the runner
+# roles/viewer, which carries get and list and not that. Shortening retention
+# for pool projects is the fix and is a tfvars change rather than one made
+# here; #2491 tracks it.
 readonly EVAL_ALERT_DAILY_LIMIT_DRIFT="0"
 
 # The subscription the drift detector pulls from. The pool project's own
