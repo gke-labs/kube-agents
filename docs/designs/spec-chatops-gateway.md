@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects; and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env (the home channel the chat.notify route posts to included), its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and, when `spec.integration.slack` is enabled under `next` and Chat is not, the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` through the CR's `botTokenSecretRef` and `appTokenSecretRef`, and the CR's `allowedUsers` as `A2A_SLACK_ALLOWED_USERS` and `A2A_SLACK_ALLOW_ALL_USERS`), with the legacy consumer - the broker's Socket Mode relay and the Hermes slack platform - not rendered, so one Slack app has one Socket Mode connection; and the `a2a-slack-principal-map` Secret, mounted alone at the gateway's one principal-map path (the hand-made `principal-map` ConfigMap is not mounted on a Slack gateway); of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); not yet the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, or the default flip; the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default, retired by declarative profiles or by gateway-side `AllowedUsers` enforcement, whichever lands first) is built
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects; and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env (the home channel the chat.notify route posts to included), its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and, when `spec.integration.slack` is enabled under `next` and Chat is not, the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` through the CR's `botTokenSecretRef` and `appTokenSecretRef`, and the CR's `allowedUsers` as `A2A_SLACK_ALLOWED_USERS` and `A2A_SLACK_ALLOW_ALL_USERS`, and the home channel the chat.notify route posts to as `A2A_SLACK_HOME_CHANNEL`), with the legacy consumer - the broker's Socket Mode relay and the Hermes slack platform - not rendered, so one Slack app has one Socket Mode connection; and the `a2a-slack-principal-map` Secret, mounted alone at the gateway's one principal-map path (the hand-made `principal-map` ConfigMap is not mounted on a Slack gateway); of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); not yet the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, or the default flip; the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default, retired by declarative profiles or by gateway-side `AllowedUsers` enforcement, whichever lands first) is built
 
 ## Purpose
 
@@ -1088,13 +1088,28 @@ renders exactly when `a2aChatArmed` holds and `homeChannel` is a space name (the
 the gateway arms the route on), and send to every other platform through `hermes send` as
 before.
 
+Slack has the same route on its own subject, `chat.notify.slack`, armed when the gateway holds
+Slack (`a2aSlackArmed`) and `slack.homeChannel`, carried as `A2A_SLACK_HOME_CHANNEL`, is a
+channel id (`C...`, or `G...` for a private channel); `A2A_NOTIFY_PLATFORM` is then `slack`.
+Chat holds the single-backend gateway when both are enabled, so at most one platform is ever
+routed. A Slack `thread` is the thread root's `ts`, which names no channel, so the gateway
+checks it only for shape and posts every request into the home channel: the channel is the
+whole bound, and a `ts` from elsewhere can only ever thread (or fail to thread) there. Slack
+also takes Block Kit: a request may carry `blocks`, a JSON array posted as one message with
+`text` as its notification and fallback (the fleet audit's report card,
+`a2a notify --blocks-file`). A backend without blocks, Chat today, refuses such a request
+rather than dropping them, and Slack's own refusal (`invalid_blocks`) comes back as the
+`error`, so the caller falls back to text. The blocks are the agent's, posted as written, as
+the broker's Slack relay posted them under `today`.
+
 A notify is not a task. It mints no capability, starts no executor, opens no session and
 carries no `authority` block; the requester rules above do not apply, because nobody
 requested it. What bounds it is where it may land and who may send it. Where: the home space
 only, and a thread of another space, or anything that is not a thread of the home space, is
-refused before any post. Who: the agent principal alone publishes `chat.notify.gchat` and
-reads `chat.notify.reply.agent.>`; the gateway alone reads the first and publishes the
-second. The answer does not go to the agent's `_INBOX` for the reason the verifier's does not:
+refused before any post (on Slack, the home channel only, which the gateway sets on every
+post). Who: the agent principal alone publishes `chat.notify.gchat` and `chat.notify.slack`
+and reads `chat.notify.reply.agent.>`; the gateway alone reads the first two and publishes the
+third. The answer does not go to the agent's `_INBOX` for the reason the verifier's does not:
 the agent reads its JetStream replies there, and a gateway able to publish into it could
 forge them; a request whose reply subject is outside the namespace is dropped unanswered.
 The agent could already post the same text to the same channel through `hermes send` under
