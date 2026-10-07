@@ -213,7 +213,7 @@ FIXTURE_NOT_READY = {
         "rather than manual"
     ),
     "obtainability-untargeted-compute-class-manifest": (
-        "#2527: needs a ComputeClass cluster without default ComputeClass and with "
+        "#2540: needs a ComputeClass cluster without default ComputeClass and with "
         "an untargeted workload declared in GitOps in each pool project, so 3.24's "
         "manifest fix is verifiable end-to-end"
     ),

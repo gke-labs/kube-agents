@@ -3716,6 +3716,9 @@ _CONTROLLER_NODE_TAINT_KEYS = {
     "node.kubernetes.io/disk-pressure",
     "node.kubernetes.io/pid-pressure",
     "node.kubernetes.io/network-unavailable",
+    "ToBeDeletedByClusterAutoscaler",
+    "cloud.google.com/impending-node-termination",
+    "node.cloudprovider.kubernetes.io/uninitialized",
 }
 
 
@@ -3723,7 +3726,7 @@ def _node_has_workload_taints(node: dict) -> bool:
     for t in (node.get("spec", {}).get("taints") or []):
         if t.get("effect") in ("NoSchedule", "NoExecute"):
             key = t.get("key", "")
-            if key not in _CONTROLLER_NODE_TAINT_KEYS and not key.startswith("node.kubernetes.io/"):
+            if key not in _CONTROLLER_NODE_TAINT_KEYS:
                 return True
     return False
 
@@ -3868,7 +3871,10 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
             op = tol.get("operator", "Equal")
             key = tol.get("key")
             if op == "Exists" and not key:
-                return True
+                effect = tol.get("effect")
+                if not effect or effect == taint.get("effect"):
+                    return True
+                continue
             if key == taint.get("key"):
                 effect = tol.get("effect")
                 if effect and effect != taint.get("effect"):
@@ -3884,7 +3890,6 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
             t for t in (node.get("spec", {}).get("taints") or [])
             if t.get("effect") in ("NoSchedule", "NoExecute")
             and t.get("key") not in _CONTROLLER_NODE_TAINT_KEYS
-            and not t.get("key", "").startswith("node.kubernetes.io/")
         ]
         if not taints:
             return True
@@ -7454,9 +7459,13 @@ def _collect_obtainability(cluster: dict, kubeconfig: Path, checks: tuple[CheckS
     cc_argv = ["kubectl", "get", "computeclasses", "-A", "-o", "json"]
     cc_parsed, cc_result = run_and_gate(cc_argv, kubeconfig, run=run)
     context = build_context(dump, workloads)
+    commands = {spec.slug: record for spec in checks}
     if cc_parsed is not None and isinstance(cc_parsed.get("items"), list):
         dump.setdefault("items", []).extend(cc_parsed["items"])
         context["compute_classes"] = cc_parsed["items"]
+        commands["untargeted-compute-class-workload"] = _record(
+            f"KUBECONFIG={kubeconfig} {shlex.join(cc_argv)}", cc_result
+        )
     elif RESOURCE_TYPE_ABSENT_MARKER in cc_result.stderr:
         context.setdefault("not_applicable", {})["untargeted-compute-class-workload"] = (
             "ComputeClass CRD is not installed on this cluster: "
@@ -7470,7 +7479,7 @@ def _collect_obtainability(cluster: dict, kubeconfig: Path, checks: tuple[CheckS
             "are configured was not established. This check cleared nothing on this cluster."
         )
 
-    return CollectedContext(context, workloads, {spec.slug: record for spec in checks})
+    return CollectedContext(context, workloads, commands)
 
 
 # check slug -> which named collection(s) it reads. Only the keys are used:

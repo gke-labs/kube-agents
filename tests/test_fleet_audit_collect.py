@@ -330,6 +330,154 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         hit_pref = collect.check_untargeted_compute_class_workload(wl_pref, ctx)
         self.assertIsNotNone(hit_pref)
 
+        dne_affinity = {
+            "requiredDuringSchedulingIgnoredDuringExecution": {
+                "nodeSelectorTerms": [
+                    {
+                        "matchExpressions": [
+                            {
+                                "key": "cloud.google.com/compute-class",
+                                "operator": "DoesNotExist",
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+        wl_dne = collect.normalize_workloads({
+            "items": [deployment("api-dne", node_affinity=dne_affinity)]
+        })[0]
+        hit_dne = collect.check_untargeted_compute_class_workload(wl_dne, ctx)
+        self.assertIsNotNone(hit_dne)
+
+    def test_the_dump_asks_for_nodes_and_namespaces(self):
+        self.assertIn("nodes", collect.DUMP_COMMAND_KINDS)
+        self.assertIn("namespaces", collect.DUMP_COMMAND_KINDS)
+
+    def test_dedicated_taint_on_compute_class_is_excluded(self):
+        dedicated_cc = compute_class("dedicated", taints=[{"key": "team", "effect": "NoSchedule"}])
+        wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
+        ctx = {
+            "compute_classes": [self.cc, dedicated_cc],
+            "nodes": [self.base_node],
+            "namespaces": [self.ns],
+        }
+        hit = collect.check_untargeted_compute_class_workload(wl, ctx)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["single_compute_class"], "standard-cc")
+        self.assertFalse(hit["multiple_compute_classes"])
+
+    def test_compute_class_referencing_tainted_manual_nodepool_is_excluded(self):
+        manual_pool_cc = compute_class("manual-pool-cc", priorities=[{"nodepools": ["pool-a"]}])
+        pool_a_node = node(
+            "node-pool-a",
+            labels={"cloud.google.com/gke-nodepool": "pool-a", "cloud.google.com/compute-class": "standard-cc"},
+            taints=[{"key": "workload-specific", "value": "true", "effect": "NoSchedule"}],
+        )
+        wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
+        ctx = {
+            "compute_classes": [self.cc, manual_pool_cc],
+            "nodes": [self.base_node, pool_a_node],
+            "namespaces": [self.ns],
+        }
+        hit = collect.check_untargeted_compute_class_workload(wl, ctx)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["single_compute_class"], "standard-cc")
+        self.assertFalse(hit["multiple_compute_classes"])
+
+    def test_compute_class_with_all_labeled_nodes_carrying_workload_taint_is_excluded(self):
+        custom_cc = compute_class("custom-tainted")
+        custom_node = node(
+            "custom-node",
+            labels={"cloud.google.com/compute-class": "custom-tainted"},
+            taints=[{"key": "workload-pin", "value": "special", "effect": "NoSchedule"}],
+        )
+        wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
+        ctx = {
+            "compute_classes": [self.cc, custom_cc],
+            "nodes": [self.base_node, custom_node],
+            "namespaces": [self.ns],
+        }
+        hit = collect.check_untargeted_compute_class_workload(wl, ctx)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["single_compute_class"], "standard-cc")
+        self.assertFalse(hit["multiple_compute_classes"])
+
+    def test_tolerations_keyless_exists_with_effect_distinction(self):
+        dedicated_non_cc = node(
+            "non-cc-dedicated",
+            labels={"node-role": "worker"},
+            taints=[{"key": "dedicated-pool", "effect": "NoSchedule"}],
+        )
+        # Pod tolerates Exists with effect NoExecute -> does NOT tolerate NoSchedule -> flags
+        wl_noexec = collect.normalize_workloads({
+            "items": [deployment("api-noexec", tolerations=[{"operator": "Exists", "effect": "NoExecute"}])]
+        })[0]
+        ctx = {
+            "compute_classes": [self.cc],
+            "nodes": [self.base_node, dedicated_non_cc],
+            "namespaces": [self.ns],
+        }
+        hit = collect.check_untargeted_compute_class_workload(wl_noexec, ctx)
+        self.assertIsNotNone(hit)
+
+        # Pod tolerates Exists with effect NoSchedule -> DOES tolerate NoSchedule -> does not flag
+        wl_nosched = collect.normalize_workloads({
+            "items": [deployment("api-nosched", tolerations=[{"operator": "Exists", "effect": "NoSchedule"}])]
+        })[0]
+        hit_nosched = collect.check_untargeted_compute_class_workload(wl_nosched, ctx)
+        self.assertIsNone(hit_nosched)
+
+    def test_transient_controller_and_cloud_provider_taints_on_non_cc_nodes(self):
+        ca_node = node(
+            "non-cc-ca",
+            labels={"node-role": "worker"},
+            taints=[{"key": "ToBeDeletedByClusterAutoscaler", "effect": "NoSchedule"}],
+        )
+        wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
+        ctx_ca = {
+            "compute_classes": [self.cc],
+            "nodes": [self.base_node, ca_node],
+            "namespaces": [self.ns],
+        }
+        self.assertIsNone(collect.check_untargeted_compute_class_workload(wl, ctx_ca))
+
+        spot_node = node(
+            "non-cc-spot",
+            labels={"node-role": "worker"},
+            taints=[{"key": "cloud.google.com/impending-node-termination", "effect": "NoSchedule"}],
+        )
+        ctx_spot = {
+            "compute_classes": [self.cc],
+            "nodes": [self.base_node, spot_node],
+            "namespaces": [self.ns],
+        }
+        self.assertIsNone(collect.check_untargeted_compute_class_workload(wl, ctx_spot))
+
+        uninit_node = node(
+            "non-cc-uninit",
+            labels={"node-role": "worker"},
+            taints=[{"key": "node.cloudprovider.kubernetes.io/uninitialized", "effect": "NoSchedule"}],
+        )
+        ctx_uninit = {
+            "compute_classes": [self.cc],
+            "nodes": [self.base_node, uninit_node],
+            "namespaces": [self.ns],
+        }
+        self.assertIsNone(collect.check_untargeted_compute_class_workload(wl, ctx_uninit))
+
+        win_node = node(
+            "non-cc-win",
+            labels={"node-role": "worker"},
+            taints=[{"key": "node.kubernetes.io/os", "value": "windows", "effect": "NoSchedule"}],
+        )
+        ctx_win = {
+            "compute_classes": [self.cc],
+            "nodes": [self.base_node, win_node],
+            "namespaces": [self.ns],
+        }
+        self.assertIsNotNone(collect.check_untargeted_compute_class_workload(wl, ctx_win))
+
     def test_collect_obtainability_crd_absent_sets_not_applicable(self):
         spec = collect.CheckSpec(
             "untargeted-compute-class-workload",
@@ -362,6 +510,8 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
                     run=MagicMock(),
                 )
                 self.assertIn("untargeted-compute-class-workload", cc_context.context.get("not_applicable", {}))
+                self.assertEqual([self.base_node], cc_context.context.get("nodes"))
+                self.assertEqual([self.ns], cc_context.context.get("namespaces"))
             tmp_dump.unlink(missing_ok=True)
 
     def test_collect_obtainability_timeout_sets_unevaluated(self):
@@ -396,6 +546,48 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
                     run=MagicMock(),
                 )
                 self.assertIn("untargeted-compute-class-workload", cc_context.context.get("unevaluated", {}))
+                self.assertEqual([self.base_node], cc_context.context.get("nodes"))
+                self.assertEqual([self.ns], cc_context.context.get("namespaces"))
+            tmp_dump.unlink(missing_ok=True)
+
+    def test_collect_obtainability_success_records_computeclasses_command(self):
+        spec = collect.CheckSpec(
+            "untargeted-compute-class-workload",
+            "workload",
+            collect.check_untargeted_compute_class_workload,
+            "major",
+            None,
+            "impact description",
+        )
+        fake_dump = {
+            "items": [deployment("api"), self.base_node, self.ns]
+        }
+        import json
+        from unittest.mock import patch, MagicMock
+
+        with patch.object(collect, "dump_state") as mock_dump:
+            tmp_dump = Path("/tmp/test_dump.json")
+            tmp_dump.write_text(json.dumps(fake_dump), encoding="utf-8")
+            mock_dump.return_value = (tmp_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
+
+            with patch.object(collect, "run_and_gate") as mock_run_and_gate:
+                mock_run_and_gate.return_value = (
+                    {"items": [self.cc]},
+                    MagicMock(rc=0, duration_s=0.05, stdout="{}"),
+                )
+                cc_context = collect._collect_obtainability(
+                    {"name": "c1", "project": "p1", "location": "l1"},
+                    Path("/fake/kubeconfig"),
+                    (spec,),
+                    run=MagicMock(),
+                )
+                self.assertEqual([self.base_node], cc_context.context.get("nodes"))
+                self.assertEqual([self.ns], cc_context.context.get("namespaces"))
+                self.assertEqual([self.cc], cc_context.context.get("compute_classes"))
+                cmd_rec = cc_context.commands.get("untargeted-compute-class-workload")
+                self.assertIsNotNone(cmd_rec)
+                self.assertIn("kubectl get computeclasses -A -o json", cmd_rec["command"])
+                self.assertEqual(0, cmd_rec["rc"])
             tmp_dump.unlink(missing_ok=True)
 
 

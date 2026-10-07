@@ -1,6 +1,10 @@
 # FIXTURE NOT READY -- an entry in scripts/validate_bench_cases.py
-# FIXTURE_NOT_READY (#2527), in no roster file under hack/eval/ until its
+# FIXTURE_NOT_READY (#2540), in no roster file under hack/eval/ until its
 # fixture exists in the pool.
+#
+# Dev install (kyber-test) lacks ComputeClass cluster/CRD setup (standard GKE 1.36
+# without ComputeClass CRDs), so a live dev cluster run of the evaluation loop cannot
+# be executed before pool fixture provisioning under #2540.
 #
 # Domain: reliability (obtainability-audit).
 # Journey: Workload reliability inspection flags workload missing
