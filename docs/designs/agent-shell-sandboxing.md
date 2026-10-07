@@ -338,8 +338,9 @@ foreground and background-spawn paths catch their own errors. A prompt-time
 probe's master is its own and is closed as before. The terminal tool also labels
 the shape when it does occur: a foreground ssh result with exit 255 and no cwd marker (the
 wrapper prints the marker after the command, so a command's own 255 carries one
-unless the command text itself ends the wrapper shell early: a top-level `exit`
-or `exec`, `set -e`, a closed stdout) gets a
+unless the command text keeps the marker from being printed: a top-level `exit`
+or `exec`, or a failing command under `set -e`, ends the wrapper shell first, and
+a closed stdout drops the printf) gets a
 `hint`, unless upstream already attached a hint to the output, saying the
 connection was closed under the command or never opened, and that it may have
 run. A per-environment `ControlPath` would remove the sharing itself and is
