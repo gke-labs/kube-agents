@@ -37,7 +37,7 @@ def node(name, labels=None, taints=None):
     }
 
 
-def pool(name, labels=None, taints=None, autoscaling=None, status="RUNNING", machine_type=None, image_type=None):
+def pool(name, labels=None, taints=None, autoscaling=None, status="RUNNING", machine_type=None, image_type=None, initial_node_count=1):
     config = {}
     if labels is not None:
         config["labels"] = labels
@@ -47,7 +47,7 @@ def pool(name, labels=None, taints=None, autoscaling=None, status="RUNNING", mac
         config["machineType"] = machine_type
     if image_type is not None:
         config["imageType"] = image_type
-    res = {"name": name, "status": status, "config": config}
+    res = {"name": name, "status": status, "config": config, "initialNodeCount": initial_node_count}
     if autoscaling is not None:
         res["autoscaling"] = autoscaling
     return res
@@ -382,6 +382,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
             labels={},
             taints=[],
             autoscaling={"enabled": True, "minNodeCount": 0, "maxNodeCount": 5},
+            initial_node_count=0,
         )
         wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
         ctx = {
@@ -930,6 +931,43 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
         self.assertIsNotNone(hit)
         self.assertEqual(hit["single_compute_class"], "win-cc")
+
+    def test_workload_selecting_amd64_on_n4_pool_is_flagged_with_matching_class(self):
+        n4_pool = pool("n4-pool", machine_type="n4-standard-4", labels={"cloud.google.com/compute-class": "n4-cc"})
+        cc_n4 = compute_class("n4-cc")
+        wl = collect.normalize_workloads({
+            "items": [deployment("amd64-api", node_selector={"kubernetes.io/arch": "amd64"})]
+        })[0]
+        ctx = {
+            "compute_classes": [cc_n4],
+            "node_pools": [n4_pool],
+            "namespaces": [self.ns],
+        }
+        hit = collect.check_untargeted_compute_class_workload(wl, ctx)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["single_compute_class"], "n4-cc")
+
+    def test_workload_selecting_user_label_matches_compute_class_pool_when_untainted_unlabelled_pool_exists(self):
+        base_pool = pool("base-pool", labels={"cloud.google.com/compute-class": "base", "tier": "web"})
+        legacy_pool = pool("legacy-pool", labels={"tier": "batch"})
+        cc_base = compute_class("base")
+        wl_web = collect.normalize_workloads({
+            "items": [deployment("web", node_selector={"tier": "web"})]
+        })[0]
+        wl_unconstrained = collect.normalize_workloads({
+            "items": [deployment("generic")]
+        })[0]
+        ctx = {
+            "compute_classes": [cc_base],
+            "node_pools": [base_pool, legacy_pool],
+            "namespaces": [self.ns],
+        }
+        hit_web = collect.check_untargeted_compute_class_workload(wl_web, ctx)
+        self.assertIsNotNone(hit_web)
+        self.assertEqual(hit_web["single_compute_class"], "base")
+
+        hit_unconstrained = collect.check_untargeted_compute_class_workload(wl_unconstrained, ctx)
+        self.assertIsNone(hit_unconstrained)
 
 
 if __name__ == "__main__":

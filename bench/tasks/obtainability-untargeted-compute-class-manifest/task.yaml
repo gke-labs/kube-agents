@@ -2,11 +2,16 @@
 # FIXTURE_NOT_READY (#2540), in no roster file under hack/eval/ until its
 # fixture exists in the pool.
 #
-# Finding path (eval case loop on planted untargeted workload on ComputeClass cluster)
-# is not live-tested on dev install (kyber-test) because kyber-test lacks a custom
-# ComputeClass-backed cluster and dirty pool fixture (#2540). The non-finding collector
-# path (command recording, zero-finding verification on untainted pools) is exercised
-# live on kyber-test.
+# Parked under FIXTURE_NOT_READY (#2540) because the evaluation pool infrastructure
+# (a GKE cluster provisioned with custom ComputeClasses and untainted node pools
+# labeled cloud.google.com/compute-class) does not exist in the evaluation pool
+# projects. Provisioning this infrastructure in pool projects is tracked by #2540
+# (assigned to fleet/infra maintainers). The contributor dev cluster (kyber-test)
+# lacks custom ComputeClass node pools in gcloud container node-pools list, so live
+# execution of the positive finding loop is deferred to #2540 per
+# .agents/rules/pre_pr_review.md ("code path that needs infrastructure you do not
+# have"). The negative/non-finding paths (command recording, CRD inspection, clean
+# run on unlabeled pools) are verified live on kyber-test.
 #
 # Domain: reliability (obtainability-audit).
 # Journey: Workload reliability inspection flags planted untargeted workload

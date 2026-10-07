@@ -3848,7 +3848,7 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
         return None
 
     def _pool_is_active_capacity(p: dict) -> bool:
-        status = p.get("status", "RUNNING")
+        status = p.get("status")
         if status not in _AUDITABLE_NODE_POOL_STATUSES:
             return False
         autoscaling = p.get("autoscaling")
@@ -3856,9 +3856,7 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
             return True
         if "initialNodeCount" in p:
             return p["initialNodeCount"] > 0
-        if autoscaling is not None and not autoscaling.get("enabled"):
-            return False
-        return True
+        return False
 
     untainted_pools = [
         p for p in node_pools
@@ -3866,15 +3864,6 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
     ]
     if not untainted_pools:
         return None
-
-    # Every untainted general-purpose node pool in the cluster carries cloud.google.com/compute-class=<name>
-    pool_ccs: set[str] = set()
-    for p in untainted_pools:
-        labels = (p.get("config") or {}).get("labels") or {}
-        val = labels.get(COMPUTE_CLASS_LABEL)
-        if not val:
-            return None
-        pool_ccs.add(val)
 
     # Workload pod spec must not tolerate the taints on the remaining non-ComputeClass pools with active capacity
     non_cc_pools = [
@@ -3953,10 +3942,7 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
             labels["cloud.google.com/machine-family"] = family
             if family in ("t2a", "c4a", "n4a") or "arm" in family:
                 labels["kubernetes.io/arch"] = "arm64"
-            elif family in (
-                "n1", "n2", "n2d", "c2", "c2d", "c3", "c3d",
-                "m1", "m2", "m3", "a2", "a3", "g2", "e2"
-            ):
+            else:
                 labels["kubernetes.io/arch"] = "amd64"
         image_type = (config.get("imageType") or "").upper()
         if image_type.startswith("WINDOWS"):
@@ -4092,6 +4078,8 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
     }
     schedulable_ccs.discard(None)
     schedulable_ccs.discard("")
+    if not schedulable_ccs:
+        return None
 
     untainted_gp_ccs = [cc for cc in compute_classes if _is_untainted_gp_compute_class(cc, node_pools=node_pools)]
     untainted_gp_names = {cc.get("metadata", {}).get("name") for cc in untainted_gp_ccs}
