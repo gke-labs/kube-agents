@@ -1000,6 +1000,12 @@ spec:
               value: "8388608"
             - name: CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS
               value: "8"
+            - name: CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  containerName: envoy-credential-proxy
+                  divisor: "1"
+                  resource: limits.memory
             - name: CREDENTIAL_PROXY_STATE_DIR
               value: /var/lib/credential-proxy
             - name: CREDENTIAL_PROXY_UNIX_SOCKET

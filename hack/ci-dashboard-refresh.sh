@@ -48,6 +48,15 @@
 #                              Empty disables the nightly scan. Not used on
 #                              the EVAL_DASHBOARD_FROM_DIR path, which is
 #                              offline by definition.
+#   EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX  the same for the nightly's writers
+#                              periodic, the second job of a night split
+#                              across two (default below: the writers job's;
+#                              until it has run there the prefix holds no
+#                              objects, which collect.py notes and carries
+#                              on). Its runs count as the writers part only
+#                              when the prefix's last segment is
+#                              ci-kube-agents-eval-nightly-writers. Empty
+#                              disables it; offline as above.
 #   EVAL_DASHBOARD_SINCE_DAYS  sweep bound when no usable prior data exists
 #                              (default 14).
 #   EVAL_DASHBOARD_STALE_AFTER_S  freshness-badge threshold written into
@@ -124,6 +133,7 @@ trap 'exit 143' TERM INT
 
 EVAL_DASHBOARD_PR_GLOB="${EVAL_DASHBOARD_PR_GLOB:-gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*}"
 EVAL_DASHBOARD_NIGHTLY_PREFIX="${EVAL_DASHBOARD_NIGHTLY_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/}"
+EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX="${EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers/}"
 # The release-candidate archive, which feeds the Brief's release-candidate table.
 # post-kube-agents-eval-rc is a postsubmit, so its builds land under logs/
 # rather than pr-logs/. Set to the empty string to leave the section on its
@@ -195,10 +205,10 @@ BUDGET="${EVAL_DASHBOARD_TIMEOUT:-900}"
 TIMEOUT_CMD=(timeout "${BUDGET}")
 command -v timeout >/dev/null 2>&1 || TIMEOUT_CMD=()
 
-# Single quotes on purpose: $1..${10} are the child bash's own positionals, so
+# Single quotes on purpose: $1..${11} are the child bash's own positionals, so
 # no value ever meets an outer expansion. --merge-with always points at the
 # prior path; when the download above left nothing there, collect.py treats
-# it as a first run and bounds the sweep itself. The nightly prefix rides
+# it as a first run and bounds the sweep itself. The nightly prefixes ride
 # only with the GCS source: the from-dir path is the offline one.
 rc=0
 # shellcheck disable=SC2016
@@ -209,6 +219,7 @@ ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} bash -c '
   else
     src_args=(--pr-glob "$4")
     [ -n "$8" ] && src_args+=(--nightly-prefix "$8")
+    [ -n "${11}" ] && src_args+=(--nightly-writers-prefix "${11}")
   fi
   # The RC source. ${10} is the offline one and wins outright; the bucket glob
   # in $9 is only armed on the bucket path, so EVAL_DASHBOARD_FROM_DIR stays
@@ -243,6 +254,7 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
   "${EVAL_DASHBOARD_SINCE_DAYS}" "${EVAL_DASHBOARD_FROM_DIR:-}" \
   "${EVAL_DASHBOARD_STALE_AFTER_S}" "${EVAL_DASHBOARD_NIGHTLY_PREFIX}" \
   "${EVAL_DASHBOARD_RC_GLOB}" "${EVAL_DASHBOARD_RC_FROM_DIR:-}" \
+  "${EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX}" \
   >>"${REFRESH_LOG}" 2>&1 || rc=$?
 
 # The full stage log always goes to stdout too: on a periodic, the build log

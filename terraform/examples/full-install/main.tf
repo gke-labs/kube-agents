@@ -502,6 +502,20 @@ module "drift_pubsub" {
   sink_name                      = var.drift_pubsub_sink
   topic_publishers               = var.drift_pubsub_topic_publishers
 
+  # Exposed because the module's sink postcondition names them in its error:
+  # a project whose sink reports some other writer identity fails that check on
+  # every plan from then on, and the operator it tells to set the override has
+  # only this composition to set it in.
+  sink_writer_identity_override = var.drift_pubsub_sink_writer_identity_override
+  sink_drain_duration           = var.drift_pubsub_sink_drain_duration
+
+  # Defers data.google_project.this inside the module to apply time whenever
+  # any member of required_apis has a planned change, which makes the sink's
+  # publish grant "(known after apply)" and -- member being ForceNew -- plans
+  # it for replacement while the sink stays live. See the note on the grant in
+  # the module's main.tf; narrowing this list to the three APIs the module
+  # needs does not help, because Terraform resolves an indexed depends_on
+  # reference to the whole resource.
   depends_on = [google_project_service.required]
 }
 

@@ -776,10 +776,35 @@ not attach the publisher's identity to the message, so anything that can
 publish here can make the detector report a change nobody made, under any
 principal it names. Never list the agent's own GSA.
 
-Beyond the three names and that list, only the module's two required inputs are
-passed, so its defaults decide the 31-day retention and the cluster scope,
-which is every GKE cluster in the project; a caller that needs the module's
-other knobs instantiates it directly.
+Beyond the three names and that list, the module's two required inputs are
+passed and two more of its optional ones:
+`drift_pubsub_sink_writer_identity_override`, which the module's own
+postcondition tells an operator to set when a project's sink reports a writer
+identity the module did not derive, and `drift_pubsub_sink_drain_duration`,
+the destroy-time wait below. Neither has an installer key, so through the
+front doors both are passthrough lines in `install.env`
+(`TF_VAR_drift_pubsub_sink_writer_identity_override`,
+`TF_VAR_drift_pubsub_sink_drain_duration`) rather than entries in
+`terraform.tfvars`, which `write_tfvars_from_state` regenerates wholesale on
+every `install.sh` and `upgrade.sh` run — a hand-added key there is gone on the
+next one, and for the override that means the failure it cleared comes back.
+A hand-driven apply sets them in `terraform.tfvars`. Everything else is left to the module's defaults,
+which decide the 31-day retention and the cluster scope, every GKE cluster in
+the project; a caller that needs the module's remaining knobs instantiates it
+directly.
+
+The module creates the sink after its publish grant and holds a wait between
+deleting the sink and deleting the topic — `drift_pubsub_sink_drain_duration`,
+two minutes by default — so that Cloud Logging never routes to a topic it
+cannot reach and mails every project owner about it. That wait is why a
+destroy of this configuration pauses once the sink is gone. Raising it takes
+an apply to land before the destroy that should honour it: `time_sleep` reads
+`destroy_duration` from state, since a provider's delete is handed prior state
+and no configuration, and `uninstall.sh` runs no apply of its own. Setting the
+variable and going straight to `uninstall.sh` waits whatever an earlier apply
+recorded, so run `upgrade.sh` in between.
+[The module's README](../../modules/drift-pubsub/README.md#why-the-sink-is-created-last-and-destroyed-first)
+is canonical for both orderings.
 
 Three outputs, each `null` while the flag is off: `drift_pubsub_topic`,
 `drift_pubsub_subscription`, and `drift_pubsub_subscription_id`, the

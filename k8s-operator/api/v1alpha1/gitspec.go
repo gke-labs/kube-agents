@@ -80,6 +80,9 @@ type ResolvedRepository struct {
 	Namespace string
 	// Role is one of the RepositoryRole constants.
 	Role string
+	// BaseBranch is the branch every pull request onto the repository must
+	// target, as declared, or empty.
+	BaseBranch string
 }
 
 // deprecatedAliasForgeName is the forge the `github` alias declares, so an
@@ -169,6 +172,7 @@ func resolveLists(forges []ForgeSpec, repositories []RepositorySpec) *ResolvedIn
 			Repository: strings.TrimSpace(r.Repository),
 			Namespace:  strings.TrimSpace(r.Namespace),
 			Role:       strings.TrimSpace(r.Role),
+			BaseBranch: strings.TrimSpace(r.BaseBranch),
 		})
 	}
 	return resolved

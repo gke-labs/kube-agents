@@ -213,7 +213,9 @@ one zone" is a true statement about a real cluster, and the second is a size up 
 capacity fixture needs one node that is always full and one that is always roomier, which no
 placement of GKE's own pods can be trusted to produce; every shared-core E2 size reports the same
 allocatable CPU, so the step up has to be to a dedicated-core size. Still two nodes' worth of
-standing cost rather than a regional control plane's.
+standing cost rather than a regional control plane's. What the fleet must grow beyond slot `d`
+before the rest of the anomaly-detection checks can be built eval-first, and which checks it cannot
+serve at all, is [`anomaly-fleet-fixtures.md`](anomaly-fleet-fixtures.md).
 
 Carrying the label makes `d` a fourth voter in the drift cohort, so the arithmetic is worked
 rather than avoided. The planted facet is `authorized-networks`, base `critical`, and the ladder

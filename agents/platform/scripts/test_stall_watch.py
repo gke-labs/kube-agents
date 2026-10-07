@@ -1542,6 +1542,17 @@ class Projects(Base):
         self.assertIn("timed out", self.ledger()["unreadable"][f"{stall_watch.LISTING_SCOPE} {self.OTHER}"])
         self.assertEqual({e["cluster"] for e in self.ledger()["stalls"].values()}, {cid("d", project=self.OTHER)})
 
+    def test_the_listing_pool_is_the_proxys_admitted_count_and_the_budget_keeps_the_per_listing_share(self):
+        # Every listing is a gcloud the credential proxy runs, and it admits four at once at
+        # the operator's default limit; a wider pool only queues the rest behind its admission
+        # bound. The budget keeps the 12 s per listing the 150 s budget gave at eight wide, and
+        # the listing still fits inside the tick budget with the scans' share left over.
+        self.assertEqual(stall_watch.LIST_WORKERS, 4)
+        self.assertEqual(stall_watch.LIST_BUDGET_SECONDS, 300)
+        # A hundred projects (the scope's cap) in waves of LIST_WORKERS: 12 s per wave either way.
+        self.assertEqual(stall_watch.LIST_BUDGET_SECONDS * stall_watch.LIST_WORKERS, 150 * 8)
+        self.assertLess(stall_watch.LIST_BUDGET_SECONDS + stall_watch.LIST_GRACE_SECONDS, stall_watch.TICK_BUDGET_SECONDS)
+
     def test_a_malformed_identity_file_holds_its_rows_and_names_its_profile(self):
         self.run_tick({"c": {"catalog": []}, f"{self.OTHER}:d": {"checkout": [DEPLOYMENT_ROW]}})
         home = self.profile_dir("d", project=self.OTHER)

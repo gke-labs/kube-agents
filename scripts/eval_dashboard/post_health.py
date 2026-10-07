@@ -228,7 +228,9 @@ STORM_COOLDOWN = timedelta(minutes=30)
 # Where the fleet scan's grant and semantics are written down, for the
 # message that says the scan is blind.
 FIXTURE_SCAN_DOC = "docs/ci-health.md"
-FIXTURE_RECONCILE_HINT = "Fleet owner: re-apply bench/tf/fleet in the projects named."
+FIXTURE_RECONCILE_HINT = "The daily reconcile re-applies bench/tf/fleet in the projects named at 08:30 UTC; a hand run of hack/fleet_reconcile.py --project from main does it sooner."
+# A reconcile run older than this is printed with its date in the digest.
+RECONCILE_RUN_DATED_AFTER = timedelta(days=1)
 # The pool-state scan's message: the scan's document carries the command per
 # project for every named finding, and what was observed for a check that
 # failed without naming one; the bot's own issue does too when it filed one
@@ -978,6 +980,13 @@ def periodic_news(health: dict, prev: dict | None) -> dict[str, dict]:
     }
 
 
+def _superseded_map(health: dict) -> dict:
+    """health.json's `periodics_superseded`: `{job: {build, recovery}}`; an
+    older document's list form reads as nothing decided."""
+    value = health.get("periodics_superseded")
+    return value if isinstance(value, dict) else {}
+
+
 def periodic_clears(health: dict, prev: dict | None) -> list[str]:
     """The jobs the space was told about whose latest read build passed. Read
     and not noted is not enough: a failed build under the job's threshold
@@ -986,7 +995,16 @@ def periodic_clears(health: dict, prev: dict | None) -> list[str]:
     current = health.get("periodics") or {}
     read = set(health.get("periodics_read") or [])
     runs = health.get("periodics_runs") or {}
-    return sorted(job for job in told if job in read and job not in current and (runs.get(job) or {}).get("passed"))
+
+    superseded = _superseded_map(health)
+
+    def recovered(job):
+        # Its own passed build, or the tick's decision that a later pass of
+        # the job that supersedes it reached its projects. A silence (a
+        # later failed daily) is not a recovery and clears nothing.
+        return bool((runs.get(job) or {}).get("passed")) or bool((superseded.get(job) or {}).get(periodics.SUPERSEDED_KEY_RECOVERY))
+
+    return sorted(job for job in told if job in read and job not in current and recovered(job))
 
 
 def _job_words(job: str, note: dict | None = None) -> dict:
@@ -1028,8 +1046,9 @@ def render_periodic(health: dict, prev: dict | None) -> str:
             if note.get("finished_at"):
                 middle = f"Its last finished run was {when} (build {note['build']}); nothing has finished in {note['stale_after_h']}h. If the next one doesn't land, it needs checking."
             else:
-                middle = f"Build {note['build']} finished, but its finished.json gives no time for it, so the {note['stale_after_h']}h window cannot be measured. Someone check the job."
-            blocks.append("\n".join([f"⚪ *{words['place']}: {words['label']} has stopped running.*", f"{does} {middle}", effect, footer]))
+                window = f"the {note['stale_after_h']}h window cannot be measured" if note.get("stale_after_h") is not None else "it cannot be placed in time"
+                middle = f"Build {note['build']} finished, but its finished.json gives no time for it, so {window}. Someone check the job."
+            blocks.append("\n".join([f"⚪ *{words['place']}: {_stale_headline(words, note)}.*", f"{does} {middle}", effect, footer]))
             continue
         dry = " (a dry run: nothing was applied)" if note.get("dry_run") else ""
         how = f": {note['summary']}" if note.get("summary") else ""
@@ -1046,28 +1065,88 @@ def render_periodic_clear(health: dict, prev: dict | None) -> str:
     run did when its report says."""
     lines = []
     runs = health.get("periodics_runs") or {}
+    superseded = _superseded_map(health)
     for job in periodic_clears(health, prev):
         words = _job_words(job)
         run = runs.get(job) or {}
+        if (superseded.get(job) or {}).get(periodics.SUPERSEDED_KEY_RECOVERY) and not run.get("passed"):
+            # Cleared by the superseding job's later run: that run is the
+            # evidence, not the failed build being cleared. The run the
+            # decision was made on, carried with it: this tick may not have
+            # read the daily, or may have read a later build.
+            other = periodics.SUPERSEDED_BY.get(job, "")
+            theirs = (superseded.get(job) or {}).get(periodics.SUPERSEDED_KEY_BY) or runs.get(other) or {}
+            when = clock(parse_iso(theirs.get("finished_at"))) if theirs.get("finished_at") else "?"
+            did = f": {theirs['summary']}" if theirs.get("summary") else " finished clean"
+            lines.append(f"✅ *{words['place']}: {words['presence']}.* `{job}`'s build {run.get('build')} failure is cleared by `{other}`'s {when} run (build {theirs.get('build')}){did}.")
+            continue
         when = clock(parse_iso(run.get("finished_at"))) if run.get("finished_at") else None
         did = run.get("summary")
-        # A clear needs a passed build on record, and a passed build has a
-        # finish time (none is STALE and noted), so `when` is always there.
-        # The job by name: the two reconciles share a place and a presence.
+        # A passed build has a finish time (none is STALE and noted), so
+        # `when` is there. The job by name: the reconciles share a place and
+        # a presence.
         tail = f" `{job}`'s {when} run (build {run.get('build')}): {did}." if did else f" `{job}`'s {when} run (build {run.get('build')}) finished clean."
         lines.append(f"✅ *{words['place']}: {words['presence']}.*{tail}")
     return "\n".join(lines)
 
 
-def periodic_digest_lines(health: dict) -> list[str]:
+def reconcile_run_lines(health: dict, now: datetime | None = None) -> list[str]:
+    """One line per reconcile job's latest finished run: when, which build,
+    passed or failed, dry run or not, and what it did. The team's answer to
+    "did the fleet get applied", whether or not anything is wrong. A run
+    older than a day carries its date: the postsubmit has no cadence, and
+    last month's merge must not read as this morning's run."""
     lines = []
+    for job, run in sorted((health.get("periodics_runs") or {}).items()):
+        words = periodics.RECONCILE_RUN_WORDS.get(job)
+        if not words or not isinstance(run, dict):
+            continue
+        finished = parse_iso(run.get("finished_at"))
+        if finished is None:
+            when = f"{words} (build {run.get('build')}, finish time unknown)"
+        elif _is_dated(finished, now):
+            when = f"{words} {dated_clock(finished, now)} (build {run.get('build')})"
+        else:
+            when = f"{words} at {clock(finished)} (build {run.get('build')})"
+        verdict = "passed" if run.get("passed") else "failed"
+        dry = " (a dry run: nothing was applied)" if run.get("dry_run") else ""
+        did = f": {run['summary']}" if run.get("summary") else ""
+        lines.append(f"🔁 *Seeded-fleet reconcile:* {when} {verdict}{dry}{did}.")
+    return lines
+
+
+def _is_dated(finished: datetime, now: datetime | None) -> bool:
+    return now is not None and now - finished > RECONCILE_RUN_DATED_AFTER
+
+
+def dated_clock(finished: datetime | None, now: datetime | None) -> str:
+    """A finish time for the digest: the clock alone within a day, the
+    weekday and date before it past that, so last month's on-merge run does
+    not read as this morning's."""
+    if finished is None:
+        return "?"
+    if _is_dated(finished, now):
+        return f"on {finished.astimezone(LOCAL_TZ).strftime('%a %b %-d')} {clock(finished)}"
+    return clock(finished)
+
+
+def _stale_headline(words: dict, note: dict) -> str:
+    """"has stopped running" is a claim only about a job with a cadence; a
+    cadence-less job whose build carries no finish time is said as that."""
+    if note.get("stale_after_h") is None and not note.get("finished_at"):
+        return f"{words['label']}'s latest build cannot be placed in time"
+    return f"{words['label']} has stopped running"
+
+
+def periodic_digest_lines(health: dict, now: datetime | None = None) -> list[str]:
+    lines = reconcile_run_lines(health, now)
     for job, note in sorted((health.get("periodics") or {}).items()):
         words = _job_words(job, note)
         if note.get("verdict") == periodics.VERDICT_STALE:
-            last = f"last finished run {clock(parse_iso(note.get('finished_at')))}" if note.get("finished_at") else f"build {note['build']} finished at a time its finished.json does not give"
-            lines.append(f"⚪ {words['place']}: {words['label']} has stopped running; {last}.")
+            last = f"last finished run {dated_clock(parse_iso(note.get('finished_at')), now)}" if note.get("finished_at") else f"build {note['build']} finished at a time its finished.json does not give"
+            lines.append(f"⚪ {words['place']}: {_stale_headline(words, note)}; {last}.")
         else:
-            lines.append(f"🟠 {words['place']}: {words['absence']} (build {note['build']} failed {clock(parse_iso(note.get('finished_at')))}); {note['history_url']}")
+            lines.append(f"🟠 {words['place']}: {words['absence']} (build {note['build']} failed {dated_clock(parse_iso(note.get('finished_at')), now)}); {note['history_url']}")
     return lines
 
 
@@ -1160,11 +1239,19 @@ def fixture_digest_line(health: dict) -> str | None:
         )
     unchecked = f", {total - checked} not checked" if total > checked else ""
     unread = int(block.get("unread_units") or 0)
+    absent = int(block.get("absent_units") or 0)
+    # A project counts as checked when one role was read or seen absent. A fixture the stack
+    # has not planted there (or something destroyed) is absent: a rollout the
+    # next reconcile finishes, said apart from a read that failed, which is
+    # not a fixture in its designed state either way.
+    clauses = []
+    if absent:
+        absent_projects = int(block.get("absent_projects") or 0)
+        clauses.append(f"{absent} {plural(absent, 'fixture')} absent on {absent_projects} {plural(absent_projects, 'project')} (not applied there yet, or destroyed), the next reconcile plants them")
     if unread:
-        # A project counts as checked when one role was read; a role the scan
-        # could not read (never planted, or its probe failed) is not a fixture
-        # in its designed state.
-        return f"🧭 *Seeded fleet:* {checked} of {total} pool projects checked at {when}, no drift in what was read; {unread} {plural(unread, 'role')} not read{unchecked}."
+        clauses.append(f"{unread} {plural(unread, 'role')} not read")
+    if clauses:
+        return f"🧭 *Seeded fleet:* {checked} of {total} pool projects checked at {when}, no drift in what was read; {'; '.join(clauses)}{unchecked}."
     return f"🧭 *Seeded fleet:* {checked} of {total} pool projects checked at {when}, every fixture in its designed state{unchecked}."
 
 
@@ -1291,7 +1378,7 @@ def render_digest(health: dict, now: datetime, data: dict | None = None) -> str:
     pool_projects = pool_state_digest_line(health)
     if pool_projects:
         lines.append(pool_projects)
-    lines.extend(periodic_digest_lines(health))
+    lines.extend(periodic_digest_lines(health, now))
     lines.append(dashboard_link(DASHBOARD_VIEW_AGENT, health.get("failing_cases") or [], parse_iso(health.get("since"))))
     return "\n".join(lines)
 

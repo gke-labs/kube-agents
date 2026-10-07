@@ -175,6 +175,152 @@ spec:
         {{- end }}
       {{- end }}
     {{- end }}
+    {{- /*
+      Checked here, on the operator's defaults with the override merged over
+      them, for the reason the shell sandbox's guard above gives: an override
+      the operator refuses would install cleanly and sit Degraded, the proxy at
+      its defaults, with no Helm error to read. So the render fails on what the
+      operator refuses and the values alone decide (ValidateCredentialProxyResources
+      in k8s-operator/internal/controller/credential_proxy_validation.go): a
+      key the CRD does not declare, which the API server would prune silently
+      (`limit:` for `limits:`), claims, a resource name the container does not
+      declare, a negative quantity, a zero limit, a memory limit under the
+      floor, and a request above its limit. The zero, floor and crossed-pair
+      checks compare float64 figures strictly (kube-agents.quantityExact), which
+      Sprig scales in decimal arithmetic, so 1005m equals 1.005. That matches
+      the operator's Quantity.Cmp for every decimal value the chart admits: a
+      quantity with more than 15 significant digits is refused before these
+      run. The residues, a binary-suffixed value within float64 rounding of a
+      decimal one and digits below a nano-unit, are in quantityExact's comment. The
+      defaults and the floor are kube-agents.credentialProxyDefaults and
+      kube-agents.credentialProxyMemoryFloorBytes. A quantity outside the
+      CRD's grammar, or inside it in a form resource.ParseQuantity does not read
+      (a fractional exponent), fails the render naming the key: dropping it
+      would skip the checks above while the CRD admitted it. The checks that
+      read no parsed value live in kube-agents.credentialProxyResourcesCheck,
+      which the quota preflight calls too; the rest follow here.
+    */}}
+    {{- $proxyPrefix := "platformAgent.deployment.credentialProxy.resources" }}
+    {{- $proxyResources := ((.Values.platformAgent.deployment.credentialProxy | default dict).resources) | default dict }}
+    {{- include "kube-agents.credentialProxyResourcesCheck" $proxyResources }}
+    {{- /*
+      Rendered only when a key is set. An empty block would write
+      `credentialProxy: {resources: {}}` onto every CR, which an API server
+      serving a CRD from before the field prunes silently and a reader mistakes
+      for an override. The operator merges what is here over its defaults per
+      key, so a block carrying only limits.memory is complete as written.
+
+      Each quantity is quoted rather than passed through toYaml, for the reason
+      env[].value is above: a values file's `cpu: 1.5` arrives as a float, and
+      the CRD types a quantity as int-or-string, so the API server refuses the
+      bare number. An unset leaf is skipped by kube-agents.compactFields' rule:
+      null (`memory: null`, Helm's way to drop a key) or the empty string, which
+      the CRD's quantity pattern refuses. A map holding nothing else writes no
+      block either.
+    */}}
+    {{- $proxyQuantities := dict }}
+    {{- range $side := list "limits" "requests" }}
+      {{- $set := dict }}
+      {{- range $name, $quantity := (index $proxyResources $side) | default dict }}
+        {{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) }}
+          {{- $_ := set $set $name $quantity }}
+        {{- end }}
+      {{- end }}
+      {{- if $set }}
+        {{- $_ := set $proxyQuantities $side $set }}
+      {{- end }}
+    {{- end }}
+    {{- $proxyDefaults := include "kube-agents.credentialProxyDefaults" . | fromJson }}
+    {{- $proxyFloor := include "kube-agents.credentialProxyMemoryFloorBytes" . | int64 }}
+    {{- $proxyMerged := dict "requests" (dict) "limits" (dict) }}
+    {{- $proxyRendered := dict "requests" (dict) "limits" (dict) }}
+    {{- range $side := list "requests" "limits" }}
+      {{- range $name, $raw := index $proxyDefaults $side }}
+        {{- $_ := set (index $proxyMerged $side) $name $raw }}
+      {{- end }}
+    {{- end }}
+    {{- range $side, $set := $proxyQuantities }}
+      {{- range $name, $quantity := $set }}
+        {{- $raw := toString $quantity | trim }}
+        {{- $_ := set (index $proxyMerged $side) $name $raw }}
+        {{- $_ := set (index $proxyRendered $side) $name $raw }}
+      {{- end }}
+    {{- end }}
+    {{- if $proxyQuantities }}
+    {{- $proxyParsed := dict "requests" (dict) "limits" (dict) }}
+    {{- range $side, $set := $proxyMerged }}
+      {{- range $name, $raw := $set }}
+        {{- if eq $name "cpu" }}
+        {{- $_ := set (index $proxyParsed $side) $name (include "kube-agents.parseCpuMillis" $raw | int64) }}
+        {{- else }}
+        {{- $_ := set (index $proxyParsed $side) $name (include "kube-agents.parseBytes" $raw | int64) }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+    {{- /* Every check below compares the quantityExact figures, never the
+           integers above: parseCpuMillis and parseBytes round (a milli-byte limit
+           half a byte under the floor rounds up onto it), and the operator
+           compares the quantities themselves. */}}
+    {{- range $name, $rawLimit := $proxyMerged.limits }}
+      {{- if eq (include "kube-agents.quantityExact" (dict "raw" $rawLimit "cpu" (eq $name "cpu") "key" (printf "%s.limits.%s" $proxyPrefix $name)) | float64) 0.0 }}
+      {{- fail (printf "%s.limits.%s is %s; a limit of zero leaves the container none, and the operator refuses it. Omit the key to keep the default (%s)" $proxyPrefix $name $rawLimit (index $proxyDefaults.limits $name)) }}
+      {{- end }}
+    {{- end }}
+    {{- if and (hasKey $proxyMerged.limits "memory") (lt (include "kube-agents.quantityExact" (dict "raw" $proxyMerged.limits.memory "cpu" false "key" (printf "%s.limits.memory" $proxyPrefix)) | float64) (float64 $proxyFloor)) }}
+    {{- fail (printf "%s.limits.memory is %s, under the %dMi floor at which the credential proxy's child memory budget admits two commands at once; below it the broker turns the budget off, and the operator refuses it. Set at least %dMi" $proxyPrefix $proxyMerged.limits.memory (div $proxyFloor 1048576) (div $proxyFloor 1048576)) }}
+    {{- end }}
+    {{- range $name, $rawRequest := $proxyMerged.requests }}
+      {{- if hasKey $proxyMerged.limits $name }}
+      {{- $isCpu := eq $name "cpu" }}
+      {{- $request := include "kube-agents.quantityExact" (dict "raw" $rawRequest "cpu" $isCpu "key" (printf "%s.requests.%s" $proxyPrefix $name)) | float64 }}
+      {{- $limit := include "kube-agents.quantityExact" (dict "raw" (index $proxyMerged.limits $name) "cpu" $isCpu "key" (printf "%s.limits.%s" $proxyPrefix $name)) | float64 }}
+      {{- if gt $request $limit }}
+      {{- $setRequest := hasKey ((index $proxyQuantities "requests") | default dict) $name }}
+      {{- $setLimit := hasKey ((index $proxyQuantities "limits") | default dict) $name }}
+      {{- $req := index $proxyMerged.requests $name }}
+      {{- $lim := index $proxyMerged.limits $name }}
+      {{- if and $setRequest $setLimit }}
+      {{- fail (printf "%s.requests.%s (%s) exceeds limits.%s (%s); a request above its limit is refused by the API server, and by the operator" $proxyPrefix $name $req $name $lim) }}
+      {{- else if $setRequest }}
+      {{- fail (printf "%s.requests.%s (%s) exceeds the operator's default limits.%s (%s), which the override does not raise; set limits.%s as well" $proxyPrefix $name $req $name $lim $name) }}
+      {{- else }}
+      {{- fail (printf "%s.limits.%s (%s) is below the operator's default requests.%s (%s), which the override does not lower; set requests.%s as well" $proxyPrefix $name $lim $name $req $name) }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- /*
+      The same CRD guard as the scoped pool's below, for the same reason:
+      `helm upgrade` never applies crds/, and an API server serving a CRD from
+      before spec.deployment.credentialProxy admits the CR with the block
+      pruned. The proxy keeps the operator's defaults while the release record
+      carries the override, and nothing says so. `lookup` is empty under
+      `helm template`, so the guard fires only against a live install.
+    */}}
+    {{- if $proxyQuantities }}
+    {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+    {{- if $crd }}
+    {{- $deploymentProps := dict }}
+    {{- range $crd.spec.versions }}
+    {{- if .storage }}
+    {{- $deploymentProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "deployment" "properties" (dict) . }}
+    {{- end }}
+    {{- end }}
+    {{- if not (hasKey $deploymentProps "credentialProxy") }}
+    {{- fail "platformAgent.deployment.credentialProxy.resources is set, but the installed PlatformAgent CRD predates spec.deployment.credentialProxy and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
+    {{- end }}
+    {{- end }}
+    credentialProxy:
+      resources:
+        {{- range $side := keys $proxyQuantities | sortAlpha }}
+        {{ $side }}:
+          {{- $set := index $proxyRendered $side }}
+          {{- range $name := keys $set | sortAlpha }}
+          {{ $name }}: {{ index $set $name | quote }}
+          {{- end }}
+        {{- end }}
+    {{- end }}
   security:
     serviceAccountName: {{ .Values.platformAgent.security.serviceAccountName | quote }}
     {{- with .Values.platformAgent.security.serviceAccountAnnotations }}
@@ -327,15 +473,23 @@ spec:
   host is not github.com), and a schemeless user is not empty; and a run of `/` around the path, which the
   operator trims, is allowed, except that an scp remote's colon takes at most
   one (`github.com://` reads to the operator as a scheme separator). Anything else -- another host, a deeper path,
-  an owner GitHub would not accept, a name that is `.`, `..` or `.git` once
-  its `.git` suffix is dropped, or starts with `-`, a GitHub host followed
+  an owner GitHub would not accept, a name that is `.`, `..` or `.git`, or
+  still ends in `.git`, once its `.git` suffix is dropped, a name over GitHub's
+  100 characters, or one that starts with `-`, a GitHub host followed
   only by `/` (`github.com/`; `github.com` and `/github.com` are a name), a value over the CRD's
   2048 characters -- would be refused by the
   operator against `github.gitRepo`, a key the values file never set, and a forge with neither a namespace nor a repository
   would fold into no key at all. Those render as the lists, so the refusal
   names the entry the administrator wrote. A credentialsRef with an empty name
-  is unset, as values.yaml's example writes it.
+  is unset, as values.yaml's example writes it. A repository that sets
+  baseBranch renders as the lists too: the alias has nowhere to put it.
   */}}
+  {{- $pinned := false }}
+  {{- range $repos }}
+  {{- if .baseBranch }}
+  {{- $pinned = true }}
+  {{- end }}
+  {{- end }}
   {{- $asAlias := false }}
   {{- if eq (len $forges) 1 }}
   {{- $f := first $forges }}
@@ -351,9 +505,10 @@ spec:
   {{- $repo = (first .).repository | default "" }}
   {{- $owner := `[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?/` }}
   {{- $github := `(?i:(https?|ssh|git)://([!-"$-.0->@-Z\\^-~]*@)?((www|ssh)\.)?github\.com/+|([!-"$-.0-9;->@-~]+@)?((www|ssh)\.)?github\.com(:/?|/+))` }}
-  {{- $plain = and (le (len $repo) 2048) (regexMatch (printf `^(%s%s|/*(%s)?)[A-Za-z0-9_.][A-Za-z0-9_.-]*/*$` $github $owner $owner) $repo) (not (has (trimSuffix ".git" (base $repo)) (list "" "." ".." ".git"))) (not (and (hasSuffix "/" $repo) (has (lower (trimAll "/" $repo)) (list "github.com" "www.github.com" "ssh.github.com")))) }}
+  {{- $name := trimSuffix ".git" (base $repo) }}
+  {{- $plain = and (le (len $repo) 2048) (regexMatch (printf `^(%s%s|/*(%s)?)[A-Za-z0-9_.][A-Za-z0-9_.-]*/*$` $github $owner $owner) $repo) (not (has $name (list "" "." ".." ".git"))) (le (len $name) 100) (not (hasSuffix ".git" $name)) (not (and (hasSuffix "/" $repo) (has (lower (trimAll "/" $repo)) (list "github.com" "www.github.com" "ssh.github.com")))) }}
   {{- end }}
-  {{- $asAlias = and (eq ($f.provider | default "github") "github") (not ($f.credentialsRef | default dict).name) (le (len $repos) 1) $onlyGitOps $plain (or $f.namespace $repo) }}
+  {{- $asAlias = and (eq ($f.provider | default "github") "github") (not ($f.credentialsRef | default dict).name) (le (len $repos) 1) $onlyGitOps (not $pinned) $plain (or $f.namespace $repo) }}
   {{- end }}
   {{- $aliasOrg := "" }}
   {{- $aliasRepo := "" }}
@@ -368,7 +523,9 @@ spec:
   Anything else needs the list fields, which a CRD from before them would
   prune the same way. `lookup` sees the installed CRD on a live install and
   sees nothing under `helm template`, so the guard fires exactly where the
-  pruning would happen.
+  pruning would happen. repositories[].baseBranch is newer than the lists, and
+  a CRD that prunes it leaves the broker enforcing no base with nothing to say
+  so, so it gets the same guard.
   */}}
   {{- if $listed }}
   {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
@@ -381,6 +538,9 @@ spec:
   {{- end }}
   {{- if not (hasKey $props "forges") }}
   {{- fail "platformAgent.integration.forges needs a PlatformAgent CRD that has the field, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
+  {{- end }}
+  {{- if and $pinned (not (hasKey (dig "repositories" "items" "properties" (dict) $props) "baseBranch")) }}
+  {{- fail "platformAgent.integration.repositories[].baseBranch needs a PlatformAgent CRD that has the field, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
   {{- end }}
   {{- end }}
   {{- end }}
@@ -421,6 +581,9 @@ spec:
         namespace: {{ . | quote }}
         {{- end }}
         role: {{ .role | quote }}
+        {{- with .baseBranch }}
+        baseBranch: {{ . | quote }}
+        {{- end }}
       {{- end }}
     {{- end }}
     {{- else if $githubSet }}
