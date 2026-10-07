@@ -178,6 +178,61 @@ class RepKinds(unittest.TestCase):
         self.assertEqual(health.rep_kind({"result": "fail", "reason": None}), "fail")
         self.assertEqual(health.rep_kind({"result": "pass", "reason": None}), "pass")
 
+    def test_a_broken_replay_is_a_graded_fail_not_a_storm(self):
+        broken_reasons = (
+            (
+                "the record is not evidence of a real agent run: "
+                "record status is 'error', not 'success' (failure wake: RuntimeError: posted nothing); "
+                "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+            ),
+            (
+                "the record is not evidence of a real agent run: "
+                "record status is 'error', not 'success' (question wake: reply is not JSON (Expecting value: line 1 column 1 (char 0))); "
+                "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+            ),
+            (
+                "the record is not evidence of a real agent run: "
+                "record status is 'error', not 'success' (thread context: none in ''); "
+                "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+            ),
+            (
+                "the record is not evidence of a real agent run: "
+                "record status is 'error', not 'success' ([bench:card-failure-wake]: replay declares no options); "
+                "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+            ),
+            (
+                "the record is not evidence of a real agent run: "
+                "record status is 'error', not 'success' (ReplayBroken: plant script failed in the image); "
+                "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+            ),
+            (
+                "the record is not evidence of a real agent run: "
+                "record status is 'error', not 'success' (ReplayMismatch: circuit breaker did not trip); "
+                "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+            ),
+        )
+        for reason in broken_reasons:
+            self.assertEqual(health.rep_kind({"result": "fail", "reason": reason}), "fail", reason)
+
+        reps = [{"n": 1, "result": "fail", "reason": broken_reasons[0]}, {"n": 2, "result": "fail", "reason": broken_reasons[1]}]
+        t = health.Task({"name": "chat-voice-failure-leads-with-fact", "result": "fail", "reps": reps})
+        self.assertEqual(t.fails, 2)
+        self.assertEqual(t.storms, 0)
+        self.assertTrue(t.collapsed)
+
+    def test_infra_dropout_with_replay_phrase_is_a_storm_not_a_fail(self):
+        # A genuine infra failure (result == "infra" or KUBE_AGENTS_INFRA_FAILURE in reason)
+        # must remain a storm even when the reason carries a replay error phrase.
+        wake_reason = (
+            "the record is not evidence of a real agent run: "
+            "record status is 'error', not 'success' (failure wake: RuntimeError: connection lost); "
+            "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+        )
+        self.assertEqual(health.rep_kind({"result": "infra", "reason": wake_reason}), "storm")
+
+        infra_marker_reason = f"KUBE_AGENTS_INFRA_FAILURE: {wake_reason}"
+        self.assertEqual(health.rep_kind({"result": "fail", "reason": infra_marker_reason}), "storm")
+
     def test_collapse_ignores_storm_reps_and_needs_a_graded_fail(self):
         self.assertTrue(health.Task(task("x", "fff")).collapsed)
         self.assertTrue(health.Task(task("x", "ffe")).collapsed, "an empty record is not a pass")
@@ -1284,7 +1339,7 @@ class PeriodicNote(unittest.TestCase):
     """The watched Prow periodics ride beside the state as notes, never as a
     state: a failed or overdue run is evidence and a `periodics` entry."""
 
-    WEEKLY = "ci-kube-agents-fleet-reconcile-all"
+    DAILY = "ci-kube-agents-fleet-reconcile-daily"
     SWEEP = "ci-kube-agents-pull-sweep"
 
     def judge(self, readings, prev=None, now=T0):
@@ -1292,24 +1347,24 @@ class PeriodicNote(unittest.TestCase):
 
     def test_a_failed_reconcile_is_a_note_with_its_projects_and_the_state_stays_green(self):
         artifact = {"dry_run": True, "outcomes": {"kube-agents-evals-3": {"outcome": "refused", "detail": "delete google_container_cluster.seeded_b"}}}
-        result = self.judge({self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(hours=1), passed=False, artifact=artifact)})
+        result = self.judge({self.DAILY: periodic_reading(self.DAILY, T0 - timedelta(hours=1), passed=False, artifact=artifact)})
         self.assertEqual(result["state"], "GREEN", "a failed periodic is a note, not a state")
-        note = result["periodics"][self.WEEKLY]
+        note = result["periodics"][self.DAILY]
         self.assertEqual((note["verdict"], note["build"], note["since"], note["dry_run"]), ("FAILED", "100", health.iso(T0), True))
-        self.assertEqual(note["detail"], ["kube-agents-evals-3: refused (delete google_container_cluster.seeded_b)"])
-        self.assertEqual(result["periodics_read"], [self.WEEKLY])
-        self.assertTrue(any("seeded-fleet reconcile (weekly): build 100 failed" in line for line in result["evidence"]), result["evidence"])
+        self.assertEqual(note["detail"], ["kube-agents-evals-3: refused (delete google_container_cluster.seeded_b); next: a code change, or an entry in bench/tf/fleet/reconcile-allow.json"])
+        self.assertEqual(result["periodics_read"], [self.DAILY])
+        self.assertTrue(any("seeded-fleet reconcile (daily): build 100 failed" in line for line in result["evidence"]), result["evidence"])
         # The episode's start carries through the previous health.json.
-        again = self.judge({self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(hours=1), passed=False, build="100")}, prev=result, now=T0 + timedelta(hours=1))
-        self.assertEqual(again["periodics"][self.WEEKLY]["since"], health.iso(T0))
+        again = self.judge({self.DAILY: periodic_reading(self.DAILY, T0 - timedelta(hours=1), passed=False, build="100")}, prev=result, now=T0 + timedelta(hours=1))
+        self.assertEqual(again["periodics"][self.DAILY]["since"], health.iso(T0))
 
     def test_a_clean_fresh_pool_writes_no_note_and_names_what_it_read(self):
-        result = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(minutes=10)), self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(days=2))})
+        result = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(minutes=10)), self.DAILY: periodic_reading(self.DAILY, T0 - timedelta(hours=20))})
         self.assertEqual(result["periodics"], {})
-        self.assertEqual(result["periodics_read"], [self.WEEKLY, self.SWEEP])
+        self.assertEqual(result["periodics_read"], [self.DAILY, self.SWEEP])
         self.assertFalse(any("reconcile" in line or "sweep" in line for line in result["evidence"]))
         # What each read job's latest build did, for the recovery message.
-        self.assertEqual(sorted(result["periodics_runs"]), [self.WEEKLY, self.SWEEP])
+        self.assertEqual(sorted(result["periodics_runs"]), [self.DAILY, self.SWEEP])
         self.assertEqual(result["periodics_streaks"][self.SWEEP], {"build": "100", "projects": {}, "runs": 0})
 
         self.assertEqual(result["periodics_runs"][self.SWEEP]["passed"], True)
@@ -1345,31 +1400,31 @@ class PeriodicNote(unittest.TestCase):
         self.assertEqual((blind["periodics"], blind["periodics_read"]), ({}, []))
 
     def test_an_episodes_start_survives_a_blind_tick_and_ends_on_a_clean_reading(self):
-        failing = {self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(hours=1), passed=False)}
+        failing = {self.DAILY: periodic_reading(self.DAILY, T0 - timedelta(hours=1), passed=False)}
         first = self.judge(failing)
-        self.assertEqual(first["periodics_since"], {self.WEEKLY: health.iso(T0)})
+        self.assertEqual(first["periodics_since"], {self.DAILY: health.iso(T0)})
         blind = self.judge(None, prev=first, now=T0 + timedelta(hours=1))
-        self.assertEqual((blind["periodics"], blind["periodics_since"]), ({}, {self.WEEKLY: health.iso(T0)}))
+        self.assertEqual((blind["periodics"], blind["periodics_since"]), ({}, {self.DAILY: health.iso(T0)}))
         again = self.judge(failing, prev=blind, now=T0 + timedelta(hours=2))
-        self.assertEqual(again["periodics"][self.WEEKLY]["since"], health.iso(T0), "the start is not the blind tick's end")
-        clean = self.judge({self.WEEKLY: periodic_reading(self.WEEKLY, T0 + timedelta(hours=2))}, prev=again, now=T0 + timedelta(hours=3))
+        self.assertEqual(again["periodics"][self.DAILY]["since"], health.iso(T0), "the start is not the blind tick's end")
+        clean = self.judge({self.DAILY: periodic_reading(self.DAILY, T0 + timedelta(hours=2))}, prev=again, now=T0 + timedelta(hours=3))
         self.assertEqual((clean["periodics"], clean["periodics_since"]), ({}, {}))
         # Blind to one job, not another: the unread job's start survives.
         partial = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 + timedelta(hours=1))}, prev=first, now=T0 + timedelta(hours=1))
-        self.assertEqual(partial["periodics_since"], {self.WEEKLY: health.iso(T0)})
+        self.assertEqual(partial["periodics_since"], {self.DAILY: health.iso(T0)})
         self.assertEqual(partial["periodics_read"], [self.SWEEP])
         # A job no longer watched leaves the carry.
         retired = dict(first, periodics_since={**first["periodics_since"], "ci-kube-agents-retired": health.iso(T0)})
-        self.assertEqual(self.judge(None, prev=retired, now=T0 + timedelta(hours=1))["periodics_since"], {self.WEEKLY: health.iso(T0)})
+        self.assertEqual(self.judge(None, prev=retired, now=T0 + timedelta(hours=1))["periodics_since"], {self.DAILY: health.iso(T0)})
 
     def test_staleness_is_measured_on_the_wall_clock_not_the_data_horizon(self):
         # A stalled archive freezes data.json's generated_at with the jobs; the
         # dead-man's switch has to read the time it is.
-        reading = {self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(days=9))}
+        reading = {self.DAILY: periodic_reading(self.DAILY, T0 - timedelta(days=9))}
         frozen = health.adjudicate(data(), T0 - timedelta(days=8), None, health.Roster.fixed(ADMITTED), periodics_readings=reading)
         self.assertEqual(frozen["periodics"], {}, "on the data's own horizon the run is a day old")
         live = health.adjudicate(data(), T0 - timedelta(days=8), None, health.Roster.fixed(ADMITTED), wall_clock=T0, periodics_readings=reading)
-        self.assertEqual(live["periodics"][self.WEEKLY]["verdict"], "STALE")
+        self.assertEqual(live["periodics"][self.DAILY]["verdict"], "STALE")
 
 
 class PoolNote(unittest.TestCase):
@@ -1581,6 +1636,14 @@ class PoolNote(unittest.TestCase):
         self.assertIsNone(health.pool_wait_p50_s(artifact, T0))
         artifact["trend"]["days"][-1]["judged"] = True
         self.assertEqual(health.pool_wait_p50_s(artifact, T0), 2400)
+
+    def test_the_digest_wait_is_withheld_when_the_producer_could_not_measure(self):
+        # The producer reports the days that did read under an UNMEASURED
+        # verdict; the headline must not print a typical wait above the note
+        # that says the wait is unknown.
+        artifact = pressure(verdict="UNMEASURED", today_p50=40.0)
+        self.assertTrue(artifact["trend"]["days"][-1]["judged"])
+        self.assertIsNone(health.pool_wait_p50_s(artifact, T0))
 
     def test_a_quiet_night_falls_back_to_the_last_day_the_producer_judged(self):
         # A night with no runs at all already prints yesterday's median, because
@@ -2229,6 +2292,18 @@ class CommandLine(unittest.TestCase):
             self.assertNotIn("n", trimmed["runs"][0]["tasks"][0]["reps"][0])
             self.assertEqual(health.load_json(out)["runs"], trimmed["runs"])
 
+    def test_trim_preserves_card_wake_replay_error_phrase_for_rep_kind(self):
+        full_reason = (
+            "the record is not evidence of a real agent run: "
+            "record status is 'error', not 'success' (failure wake: RuntimeError: posted nothing); "
+            "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+        )
+        doc = data(run(1, 1, T0, tasks=[{"name": "card-wake-test", "result": "fail", "reps": [{"result": "fail", "reason": full_reason}]}]))
+        trimmed_doc = health.trim(doc, T0 - timedelta(hours=1), T0 + timedelta(hours=1), "test")
+        trimmed_rep = trimmed_doc["runs"][0]["tasks"][0]["reps"][0]
+        self.assertEqual(health.rep_kind(trimmed_rep), "fail")
+        self.assertLessEqual(len(trimmed_rep["reason"]), health.TRIM_REASON_CHARS)
+
 
 # --------------------------------------------------------------------------- #
 # Rule 3c: fixture drift (the hourly seeded-fleet scan)
@@ -2304,7 +2379,7 @@ class FixtureDrift(unittest.TestCase):
         self.assertEqual(
             result["advice"],
             f"A red on a case that depends on {DRIFT_ROLE} from a run that leased {project(1)} is the fixture, not your change;"
-            " retest once the fleet owner has re-applied bench/tf/fleet there (README, State and reconcile).",
+            " retest after the daily reconcile has re-applied bench/tf/fleet there (08:30 UTC) and the scan that follows reads it healthy.",
         )
         self.assertEqual(result["failing_cases"], [])
 

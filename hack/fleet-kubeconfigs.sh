@@ -74,6 +74,8 @@
 #                             scripts refuse it in a Prow job.
 #   FLEET_MINT_RETRY_SECONDS  wait between the gate's mint attempts (default
 #                             5; tests set 0)
+#   FLEET_PROBE_REQUEST_TIMEOUT  kubectl --request-timeout on each presence
+#                             probe (default 30s)
 #
 # Output: exports BENCH_FLEET_KUBECONFIG_DIR when sourced; prints it on stdout
 # when executed. Everything else this script says goes to stderr.
@@ -101,6 +103,9 @@ _FLEET_EXIT_READONLY_UNAVAILABLE=3
 # should be no stricter than they are. A PERMISSION_DENIED is not retried:
 # it is the binding, and it will not change in fifteen seconds.
 _FLEET_MINT_ATTEMPTS=3
+# A presence probe against a control plane that does not answer must not
+# hang the runner: bounded per request, as hack/fleet-fixture-state.py is.
+_FLEET_PROBE_REQUEST_TIMEOUT="${FLEET_PROBE_REQUEST_TIMEOUT:-30s}"
 _FLEET_MINT_RETRY_SECONDS="${FLEET_MINT_RETRY_SECONDS:-5}"
 _FLEET_MINT_DENIED_PATTERN="PERMISSION_DENIED"
 
@@ -172,16 +177,33 @@ for role, spec in sorted(roles.items()):
 # app=nope` exits ZERO with no output, which is the same trap that made the
 # pathless `absent` safeguards read as passes on the wrong cluster.
 _fleet_probe_present() {
-  local kubeconfig="$1" namespace="$2" probe="$3" kind rest
+  local kubeconfig="$1" namespace="$2" probe="$3" kind rest errors probe_rc
   case "$probe" in
     *\?*)
       kind="${probe%%\?*}"
       rest="${probe#*\?}"
+      # 0 present, 1 absent (an empty list), 2 the read itself failed: a
+      # 403, a control plane mid-upgrade or a token that could not be minted
+      # says nothing about whether the fixture is there. Presence is decided
+      # on stdout alone: a successful empty list can carry discovery noise or
+      # a deprecation warning on stderr, which must not read as an object.
+      # One call: stdout into the variable, stderr into a file read only when
+      # the read failed and removed on every path, with no trap (this file
+      # is sourced by the eval job under its own EXIT trap).
+      errors="$(mktemp)" || { _FLEET_PROBE_ERR="mktemp failed"; return 2; }
+      probe_rc=0
       if [ "$namespace" != "-" ] && [ -n "$namespace" ]; then
-        [ -n "$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -n "$namespace" -l "$rest" -o name 2>/dev/null)" ]
+        _FLEET_PROBE_OUT="$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -n "$namespace" -l "$rest" -o name --request-timeout="$_FLEET_PROBE_REQUEST_TIMEOUT" 2>"$errors")" || probe_rc=$?
       else
-        [ -n "$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -l "$rest" -o name 2>/dev/null)" ]
+        _FLEET_PROBE_OUT="$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -l "$rest" -o name --request-timeout="$_FLEET_PROBE_REQUEST_TIMEOUT" 2>"$errors")" || probe_rc=$?
       fi
+      if [ "$probe_rc" -ne 0 ]; then
+        _FLEET_PROBE_ERR="$(cat "$errors")"
+        rm -f "$errors"
+        return 2
+      fi
+      rm -f "$errors"
+      [ -n "$_FLEET_PROBE_OUT" ]
       ;;
     */*)
       kind="${probe%%/*}"
@@ -189,11 +211,16 @@ _fleet_probe_present() {
       # Spelled out twice rather than built into an array: bash 3.2 (still what
       # macOS ships, and what a contributor runs the tests on) errors on
       # "${empty[@]}" under `set -u`.
+      # 0 present, 1 NotFound, 2 any other failure of the read.
       if [ "$namespace" != "-" ] && [ -n "$namespace" ]; then
-        KUBECONFIG="$kubeconfig" kubectl get "$kind" "$rest" -n "$namespace" >/dev/null 2>&1
+        _FLEET_PROBE_ERR="$({ KUBECONFIG="$kubeconfig" kubectl get "$kind" "$rest" -n "$namespace" --request-timeout="$_FLEET_PROBE_REQUEST_TIMEOUT" >/dev/null; } 2>&1)" && return 0
       else
-        KUBECONFIG="$kubeconfig" kubectl get "$kind" "$rest" >/dev/null 2>&1
+        _FLEET_PROBE_ERR="$({ KUBECONFIG="$kubeconfig" kubectl get "$kind" "$rest" --request-timeout="$_FLEET_PROBE_REQUEST_TIMEOUT" >/dev/null; } 2>&1)" && return 0
       fi
+      case "$_FLEET_PROBE_ERR" in
+        *NotFound*) return 1 ;;
+      esac
+      return 2
       ;;
     *)
       return 1
@@ -490,7 +517,7 @@ write_fleet_kubeconfigs() {
   chmod 600 "${dir}/${_FLEET_MARKER}" "${dir}/.fleet-context"
 
   local slot cluster location slot_config listing discovered errors named
-  local role namespace probe probes confirmed missing
+  local role namespace probe probes confirmed missing unreadable unreadable_why probe_rc
   local written=0 unresolved=0 unplanted=0 found=0 labelled=0
   if ! listing="$(_fleet_list_seeded_clusters "$project")"; then
     echo "WARNING: could not list clusters in ${project}; every fleet check will report status=error" >&2
@@ -591,13 +618,31 @@ write_fleet_kubeconfigs() {
     # catastrophic `fail` against an agent that never touched anything.
     confirmed=""
     missing=""
+    unreadable=""
+    unreadable_why=""
     for probe in $probes; do
-      if _fleet_probe_present "$slot_config" "$namespace" "$probe"; then
-        confirmed+="${probe}"$'\n'
-      else
-        missing+="${probe} "
-      fi
+      # Captured, not tested in an `if`: the three-way answer needs the code,
+      # and under `set -e` a bare non-zero call would end the script.
+      probe_rc=0
+      _fleet_probe_present "$slot_config" "$namespace" "$probe" || probe_rc=$?
+      case $probe_rc in
+        0) confirmed+="${probe}"$'\n' ;;
+        1) missing+="${probe} " ;;
+        *)
+          unreadable+="${probe} "
+          unreadable_why="$(printf '%s' "$_FLEET_PROBE_ERR" | tail -n 1 | tr -d '\r')"
+          ;;
+      esac
     done
+    if [ -n "$unreadable" ]; then
+      # Not "never planted": the read failed, so nothing is known about the
+      # fixture, and the scan records the role as not checked, not absent.
+      # Counted with the unreached roles, so the summary line still adds up
+      # to the catalog and the pool verifier excuses it as unreached.
+      echo "WARNING: ${unreadable% } could not be read from ${slot_config##*/} in ${project} (${unreadable_why:-no error text}), so fixture role '${role}' could not be checked. Its checks will report status=error rather than blaming the run." >&2
+      unresolved=$((unresolved + 1))
+      continue
+    fi
     if [ -n "$missing" ]; then
       echo "WARNING: ${missing% } absent from ${slot_config##*/} in ${project}, so fixture role '${role}' was never planted (or has already been destroyed). Its checks will report status=error rather than blaming the run." >&2
       unplanted=$((unplanted + 1))

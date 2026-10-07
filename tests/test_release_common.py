@@ -6,6 +6,7 @@ resolution, Git tag lookup, and declarative release registries.
 
 import os
 import pathlib
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -34,6 +35,7 @@ from tests.testing.release import (
     MOCK_LINE_PATCH_RELEASE_TAG,
     MOCK_TARGET_RELEASE_LINE,
     MOCK_TARGET_RELEASE_TAG,
+    PIPE_BUFFER_BYTES,
     REQUIRED_RELEASE_IMAGES_PATH,
     commit_required_release_images,
     create_mock_docker_binary,
@@ -2400,6 +2402,101 @@ class RequiredReleaseImagesAtCandidateTest(unittest.TestCase):
             self.assertIn(f"Promoted {img} to {MOCK_TARGET_RELEASE_TAG}", proc.stdout)
         for img in set(MOCK_REQUIRED_RELEASE_IMAGES) - set(MOCK_CANDIDATE_RELEASE_IMAGES):
             self.assertNotIn(f"Promoting {img}", proc.stdout, f"{img} is not in the candidate's list")
+
+    # #2542: the real scripts/release/common.sh is over 64 KiB and lists its
+    # images near the top. Piping `git show` into the parse, which stops at the
+    # list's closing `)`, killed `git show` with SIGPIPE; under pipefail the read
+    # failed on every real commit and every rung fell back to this checkout's
+    # list, refusing a candidate published before #2304 added a2a-console. The
+    # small fixtures above fit in the buffer and never saw it.
+
+    _CHECKOUT_FALLBACK = (
+        f"using the {len(MOCK_REQUIRED_RELEASE_IMAGES)} this checkout's {REQUIRED_RELEASE_IMAGES_PATH} lists"
+    )
+
+    def _assert_read_at(self, proc, sha, images):
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn(self._CHECKOUT_FALLBACK, proc.stderr)
+        self.assertIn(f"the {len(images)} {REQUIRED_RELEASE_IMAGES_PATH} lists at {sha[:7]}", proc.stderr)
+        self.assertEqual(proc.stdout.split(), images)
+
+    def _assert_fell_back(self, proc, reason):
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(reason, proc.stderr)
+        self.assertIn(self._CHECKOUT_FALLBACK, proc.stderr)
+        self.assertEqual(proc.stdout.split(), MOCK_REQUIRED_RELEASE_IMAGES)
+
+    def test_a_candidate_list_near_the_top_of_a_large_file_is_the_candidates(self):
+        """Red before the fix: the read died on SIGPIPE and fell back."""
+        _, repo_dir, git = self._repo()
+        candidate = commit_required_release_images(
+            repo_dir, git, MOCK_CANDIDATE_RELEASE_IMAGES, larger_than=2 * PIPE_BUFFER_BYTES
+        )
+        size = int(git("cat-file", "-s", f"{candidate}:{REQUIRED_RELEASE_IMAGES_PATH}").stdout)
+        self.assertGreater(size, 2 * PIPE_BUFFER_BYTES)
+
+        proc = self._run(f'required_release_images_at "{candidate}"', cwd=repo_dir)
+        self._assert_read_at(proc, candidate, MOCK_CANDIDATE_RELEASE_IMAGES)
+
+    def test_the_real_common_sh_reads_back_as_the_array_bash_sources(self):
+        """This checkout's own common.sh, committed as a candidate, reads back
+        through `git show` as the array sourcing it gives, without falling
+        back. The size check keeps the case meaning something: below the pipe
+        buffer the bug cannot show. Above it, whether the old pipe died
+        depended on how much the reader drained before it stopped, so on the
+        old code this case was red on Linux and only sometimes on macOS; the
+        padded case above is the one that is red every time."""
+        real = _COMMON_SH.read_bytes()
+        self.assertGreater(len(real), PIPE_BUFFER_BYTES, "common.sh no longer exceeds a pipe buffer; pad the case")
+        _, repo_dir, git = self._repo()
+        path = pathlib.Path(repo_dir) / REQUIRED_RELEASE_IMAGES_PATH
+        path.parent.mkdir(parents=True)
+        path.write_bytes(real)
+        git("add", REQUIRED_RELEASE_IMAGES_PATH)
+        git("commit", "-m", "build: this checkout's common.sh")
+        candidate = git("rev-parse", "HEAD").stdout.strip()
+
+        sourced = self._run('printf "%s\\n" "${REQUIRED_RELEASE_IMAGES[@]}"', cwd=repo_dir)
+        self.assertEqual(sourced.returncode, 0, sourced.stderr)
+        proc = self._run(f'required_release_images_at "{candidate}"', cwd=repo_dir)
+        self._assert_read_at(proc, candidate, sourced.stdout.split())
+
+    def test_a_large_file_without_the_array_still_falls_back(self):
+        _, repo_dir, git = self._repo()
+        path = pathlib.Path(repo_dir) / REQUIRED_RELEASE_IMAGES_PATH
+        path.parent.mkdir(parents=True)
+        path.write_text("#!/usr/bin/env bash\n" + "# no list in this file\n" * PIPE_BUFFER_BYTES)
+        git("add", REQUIRED_RELEASE_IMAGES_PATH)
+        git("commit", "-m", "build: a large common.sh without the array")
+        no_array = git("rev-parse", "HEAD").stdout.strip()
+
+        proc = self._run(f'required_release_images_at "{no_array}"', cwd=repo_dir)
+        self._assert_fell_back(
+            proc, f"{REQUIRED_RELEASE_IMAGES_PATH} at {no_array[:7]} has no readable REQUIRED_RELEASE_IMAGES"
+        )
+
+    def test_a_failed_git_show_falls_back_even_when_it_printed_a_list(self):
+        """A read that fails is not trusted for what it did print. The stub
+        `git show` writes the candidate's whole file and then exits 1, so only
+        git show's own exit status tells this from a good read."""
+        temp_dir, repo_dir, git = self._repo()
+        candidate = commit_required_release_images(
+            repo_dir, git, MOCK_CANDIDATE_RELEASE_IMAGES, larger_than=2 * PIPE_BUFFER_BYTES
+        )
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
+        bin_dir = pathlib.Path(temp_dir.name) / "bin"
+        bin_dir.mkdir()
+        stub = bin_dir / "git"
+        stub.write_text(
+            "#!/usr/bin/env bash\n"
+            f'if [ "$1" = "show" ]; then "{real_git}" "$@"; exit 1; fi\n'
+            f'exec "{real_git}" "$@"\n'
+        )
+        stub.chmod(0o755)
+
+        proc = self._run(f'required_release_images_at "{candidate}"', cwd=repo_dir, bin_dir=str(bin_dir))
+        self._assert_fell_back(proc, f"git show could not read {REQUIRED_RELEASE_IMAGES_PATH} at {candidate[:7]}")
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ Given a pull request (a branch diff against `main`), determine whether the repos
 Your two navigation instruments are:
 
 - **`AGENTS.md` (repo root)** — owns the documentation RULES: the canonical-home table (one home per fact), the generated-region rule, link-don't-summarise, no PR-status prose, verify-identifiers-against-source.
-- **`docs/README.md`** — the documentation MAP: what lives where, what each document covers, which files carry generated regions and from which sources, and which source files own the identifiers that docs state as fact.
+- **`docs/README.md`** — the documentation MAP: what lives where (a directory tree), which files carry generated regions and from which sources, and which source files own the identifiers that docs state as fact. It carries no per-document rows; what a document covers is the document's own business.
 
 This skill deliberately holds no repository facts of its own — no file lists, no agent topology, no counts. Facts live in the two instruments above and in the sources they point to; when this skill and a source disagree, the source wins and this skill needs fixing.
 
@@ -28,13 +28,13 @@ Read both before reviewing the diff.
   - **Source of a generated region?** Check the generated-regions table in the map (`docs/README.md` §2). If the changed file — or its frontmatter or comment banner — feeds a generated region, that region must be regenerated (`make docs-generate`) and committed.
   - **Source of documented identifiers?** Check the identifier-sources table in the map (`docs/README.md` §2). If the changed file owns names, defaults, versions, section numbering, or baked paths that docs state as fact, find every doc that states a fact about the changed item.
   - **Doc file?** → review it under step 3.
-  - **Anything else** (code, scripts, workflows, examples) → check the map for pages that describe that component.
+  - **Anything else** (code, scripts, workflows, examples) → find the pages that describe that component (step 2).
 
 ## 2. Find the affected docs (code → docs)
 
 For each changed source item:
 
-- Look it up in `docs/README.md` to find the pages that document that area; then `git grep` the identifier (old AND new spelling) across `*.md`/`*.mdx` to catch pages the map's summaries don't surface.
+- Find the pages that document that area: the tree in `docs/README.md` names the directory that holds them, and a `git grep` for the identifier (old AND new spelling) across `*.md`/`*.mdx` finds every page that states it. The map carries no per-document summaries, so a page that describes the component in prose without naming it is found only by reading the directory the tree points at.
 - A doc sentence that names a file, flag, default, section number, count, or identifier is a **testable assertion** — test it against the PR's version of the source, not against other docs and not against your memory.
 - Pay specific attention to known drift magnets. Each is a category of claim to re-verify, not a fact to assume — the current truth lives in the named source, and this skill deliberately does not restate it:
   - Identifiers that have a source-of-truth file (service-account and namespace names, permission-set defaults, versions) — verify against the identifier-sources table in the map, never against other docs.
@@ -57,21 +57,21 @@ For every doc the PR adds or edits:
 
 ## 4. Check the instruments themselves
 
-- **`docs/README.md` (the map):** if the PR adds, moves, renames, or deletes a doc that no collapsed family row's glob already covers, the map must reflect it — tree section and inventory table. A file landing inside an existing family (a new skill, SOP, or reference) needs no map edit, only `make docs-generate`. The map is hand-maintained; `make docs-check` (`docs-check-map`) enforces presence and shape — an inventory entry per tracked doc outside root-level dot-directories, no dead paths in the path column, single-space table padding, and no published-site row whose audience cell names maintainers, CI engineers, or contributors (the CLA page excepted). The map states no counts by design. A file _deleted_ from inside a family glob is invisible to those checks — the glob still matches the survivors — and is caught instead by the generated `docs/family-roster.txt`, which `docs-check-generated` fails on until it is regenerated; if the PR removes a family member, expect the deleted roster line in the diff and check the row still describes what is left. The row summaries and the identifier-sources table have no mechanical guard, so verify those here. Also spot-check that map entries touching the PR's area are still accurate.
-- **Map churn is a finding.** The map is the repository's most conflict-prone file. A map diff that rewrites rows the PR did not author — re-aligned table columns, re-wrapped cells — is Blocking: it conflicts with every other open PR that adds a row. The correct diff is the inserted rows and nothing else.
+- **`docs/README.md` (the map):** the directory tree plus the generated-regions and identifier-sources tables, with no per-document rows. If the PR adds a document, the document must be linked from the page that owns its topic: `make docs-check` (`docs-check-links`) fails a tracked document no reader reaches — the root files, every `README.md`, the site's sidebar pages, the design documents code cites, and the uniform families its `LINK_EXEMPT_FAMILY_GLOBS` name are reached without a link — and the fix is the link, never a new entry in its `UNLINKED_ALLOWLIST`. If the PR links or deletes a document on that allowlist, the entry goes in the same PR; the check fails a stale one. A new uniform family is a glob added to the checker, argued in the pull request, and a directory added, moved, or emptied is a tree edit. The map states no counts by design. The tables have no mechanical guard beyond compactness (`tests/test_docs_map_compact.py`), so verify here that the identifier-sources rows touching the PR's area still name the right source.
+- **Map churn is a finding.** The map's two tables are edited from several branches a week. A map diff that rewrites rows the PR did not author — re-aligned table columns, re-wrapped cells — is Blocking: it conflicts with every other open PR that adds a row. The correct diff is the inserted rows and nothing else.
 - **Map staleness window:** the map stores no "last verified" stamp; derive the delta from git instead — everything that changed since the map itself was last touched is the map's unreviewed backlog:
 
   ```bash
   git diff --name-status "$(git log -1 --format=%H -- docs/README.md)"..HEAD -- '*.md' '*.mdx'
   ```
 
-  If that list contains adds/renames/deletes the map does not reflect, the map is stale even if this PR didn't cause it — report it either way.
+  If that list contains a directory added, moved, or emptied that the tree does not reflect, or a moved file that an identifier-sources row still names by its old path, the map is stale even if this PR didn't cause it — report it either way. A single document added, renamed, or deleted is the reachability check's business, not the map's.
 
 - **`AGENTS.md`:** if the PR changes the repo layout, the docs toolchain (`scripts/generate_docs.py`, checkers in `hack/`/`scripts/`), or where a category of content lives, the layout section and canonical-home table need the same update. If the PR invalidates a rule's example, fix the example.
 
 ## 5. Run the mechanical gates
 
-- `make docs-check` at the PR's HEAD — generated tables current, relative links resolve (targets must be git-tracked, and so must a `docs/designs/…` or `docs/architecture/…` path cited from code), terminology matches source, map inventory current and its tables un-re-aligned, no maintainer identifier on a site page (`docs-check-audience`), `AGENTS.md` plus `CLAUDE.md` inside their context budget.
+- `make docs-check` at the PR's HEAD — generated tables current, relative links resolve (targets must be git-tracked, and so must a `docs/designs/…` or `docs/architecture/…` path cited from code) and a reader reaches every tracked document, terminology matches source, no maintainer identifier on a site page (`docs-check-audience`), `AGENTS.md` plus `CLAUDE.md` inside their context budget. The map's tables staying compact is `tests/test_docs_map_compact.py`'s check, under `make test-python`.
 - If the PR touched a generated-table source: run `make docs-generate` and confirm `git status` is clean afterwards (a dirty tree means the PR forgot to commit regenerated tables).
 - `npx prettier --check` on changed `.md`/`.json`/`.yaml` files (note: the generated `skills/index.mdx` is intentionally prettier-exempt).
 - If site pages changed: `cd docs/site && npm run build`.

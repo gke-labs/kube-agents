@@ -399,7 +399,9 @@ event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar'
 port 9095, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
 tool-invocation and request metrics from its metrics-only port 8766. The
 operator's policies on both pods admit the collector's namespace, `gke-gmp-system`,
-on those ports either way; the value only decides whether a scrape is configured.
+and the operator's own pods on those ports either way; the value only decides whether a
+scrape is configured, and the operator's own read of the two counters into `status.usage`
+does not depend on it.
 It is a tri-state: `null`,
 the default, renders them when the cluster serves the `PodMonitoring` API and
 nothing elsewhere, so an install off GKE, or on a GKE cluster with Managed
@@ -495,6 +497,15 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   declared and none is GitHub fails the render, since minty issues GitHub App
   tokens only.
   GitOps repositories can also be registered in the ConfigMap by cluster administrators.
+  `platformAgent.integration.repositories[].baseBranch`, on a gitops or
+  managed repository, names the branch every pull request onto it must
+  target, enforced by the credential broker; unset means the repository's
+  own default branch. A context repository may not set it. The alias has no
+  place for it, so a repository that sets one renders as the lists, and on a
+  live install the render fails unless the installed CRD has the field. A
+  repository registered only in the ConfigMap is not pinned. The
+  [PlatformAgent CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/)
+  describes what the broker does with it.
 
 Chat, Slack, and Teams each need a one-time manual registration that no install
 automation can perform (the Chat app on the Chat API console page pointed at

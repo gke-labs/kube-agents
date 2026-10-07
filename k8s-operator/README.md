@@ -132,6 +132,11 @@ Start the operator controller process. Because admission webhooks require TLS ce
 ENABLE_WEBHOOKS=false make run
 ```
 
+Off the cluster `POD_NAMESPACE` is unset, so the operator renders no NetworkPolicy rule admitting
+itself to the agent pods' metrics ports and does not start the poller behind `status.usage`'s
+counters; it says so in one start-up line, and the counters stay where they are until the operator
+runs in the cluster.
+
 Or directly run the main entry point:
 
 ```bash

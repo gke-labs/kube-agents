@@ -706,6 +706,12 @@ variable "drift_pubsub_sink" {
   default     = "platform-agent-drift-audit-sink"
 }
 
+variable "drift_pubsub_topic_publishers" {
+  description = "IAM members granted roles/pubsub.publisher on the drift topic, on top of the sink's own writer identity. Only used when enable_drift_pubsub is true, and empty on an install: the Log Router is what should be putting audit records on this topic, and a member here can make the detector report a change nobody made. The evaluation pool sets it to its CI runners so a bench case can publish synthetic records and exercise the classifier, which it cannot reach any other way — every identity a bench run can authenticate as is a service account the classifier is right to drop. The agent's own service account does not belong here; it already reads this stream."
+  type        = list(string)
+  default     = []
+}
+
 variable "enable_drift_detector" {
   description = "Start the drift detector. Sets spec.harness.driftDetector.enabled on the PlatformAgent, which is what makes k8s-operator/cmd/drift-detector run: the binary ships in the images and stays stopped until this is true. Requires enable_drift_pubsub, which a helm_release precondition enforces: the harness block carrying this field is written only when the ingress is on, so without it the composition would accept this variable and render nothing — an apply that succeeds, provisions nothing and starts nothing. Also requires project_id to be the project ID rather than the project number, a second precondition, because the operator refuses to start the detector on a numeric one (driftDetectorEnabled in k8s-operator/internal/controller/platformagent_manifests.go) and the ingress would bill for a stream nothing reads. The installer front doors turn this and enable_drift_pubsub on together from one ENABLE_DRIFT_DETECTOR key; the two variables are separate so that a hand-driven apply can still provision the audit-log ingress on its own."
   type        = bool

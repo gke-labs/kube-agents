@@ -4,6 +4,7 @@ import ast
 import os
 import tempfile
 import unittest
+from concurrent.futures import wait
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -653,14 +654,19 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         return app.session_state[CONNECTION_CONTROLLER_KEY]
 
     def finish_connection_job(self, app: AppTest) -> AppTest:
-        """Wait on the dependency itself, then let the UI consume its result."""
+        """Wait on the dependency itself, then let the UI consume its result.
+
+        A future that finished with an exception counts as done: the UI, not
+        the test, is what reads it, so the helper does not re-raise it.
+        """
         if CONNECTION_CONTROLLER_KEY not in app.session_state:
             app = app.run()
         controller = self.controller(app)
         if controller.job is None:
             return app
         job = controller.job
-        job.future.result(timeout=20)
+        done, _ = wait([job.future], timeout=20)
+        self.assertIn(job.future, done, "connection job did not finish in time")
         return app.run()
 
     def connect_project(self, app: AppTest) -> AppTest:
@@ -1006,6 +1012,12 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         )
 
     def test_revalidation_exception_retains_suspended_target(self):
+        release_check = Event()
+
+        def crashed_check(*args, **kwargs):
+            release_check.wait(timeout=20)
+            raise RuntimeError("probe crashed")
+
         app = self.app(connected=True)
         self.controller(app).verified_at = datetime(2020, 1, 1, tzinfo=UTC)
         save_connection(
@@ -1015,9 +1027,12 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         )
         with patch(
             "admin_console.connections.run_connection_checks",
-            side_effect=RuntimeError("probe crashed"),
+            side_effect=crashed_check,
         ):
             app = app.run()
+            self.assertIsNotNone(self.controller(app).job)
+            release_check.set()
+            app = self.finish_connection_job(app)
 
         self.assertIsNone(self.controller(app).connected_target)
         saved = load_connection("admin@example.com")

@@ -262,12 +262,15 @@ required `recommendation` object:
   reviewer's argument is worth more than the forty-fifth minor finding, so the field stays required
   and the renderer learns to truncate.
 
-### 3.3 Stale remediation PRs are auto-closed — over complete coverage
+### 3.3 Stale remediation PRs are auto-closed — over complete coverage, with one exception
 
 When a **complete** run no longer reproduces a finding that has an open remediation PR, the PR is
 closed with a generated comment naming the date and each finding it was opened for. Over a partial
 run nothing is closed (§7.4): retiring a fix asserts that its finding is gone, and an audit that
-could not read the cluster has no standing to assert it.
+could not read the cluster has no standing to assert it. The one exception is the compliance
+stream's shield close: a pull request whose remaining findings share a namespace with a declared
+2.7 workload proposes a fix the declaration forbids, so it is closed on the declaration, over a
+partial run too, with a comment that says the findings stay on the ledger.
 
 The comment does **not** print the command that no longer reproduces, or its output, and an earlier
 draft of this section promising both was wrong about what is knowable at that moment. A resolved
@@ -494,11 +497,11 @@ whose SOP runs a collector must pass one; on any other stream the steps below ar
 5. Clean run → answer every unanswered `/remediate` on the ledger, then close the ledger issue as
    completed, close every open remediation PR for the stream, print `CLEAN`. **Unless the run is
    partial**, in which case the status is still `CLEAN` but the issue stays open with a comment
-   naming the gaps and no PR is retired. **And unless the previous body carried a finding whose
+   naming the gaps and no PR is retired (the shield's close of §3.3 aside). **And unless the previous body carried a finding whose
    check this run's `checks_run` says ran again on that cluster** and the document neither reports
    nor lists under `resolved_because` — then the status is `HELD`, the issue stays open with a
-   comment naming each such finding and the check that ran, no PR is retired, and `resolved` is `0`
-   (#1683).
+   comment naming each such finding and the check that ran, no PR is retired (the shield's close of
+   §3.3 aside), and `resolved` is `0` (#1683).
 
    The answers come **before** the close, and that ordering is the whole of the rule. "Every
    `/remediate` gets exactly one answer" cannot have the clean run as its exception: this is the one
@@ -515,7 +518,7 @@ whose SOP runs a collector must pass one; on any other stream the steps below ar
 7. Auto-promote every eligible manifest finding at or above the severity floor (§3.1) — at most
    five per run, the surplus named in the ledger as awaiting `/remediate` (§13 Q4) — and every
    authorised `/remediate` target, which is uncapped, by invoking the same code path as `remediate`.
-8. Close stale PRs (§3.3), unless partial; comment once on `pr-merged-persists` PRs; answer every
+8. Close stale PRs (§3.3), unless partial, when only the shield's close is made; comment once on `pr-merged-persists` PRs; answer every
    `/remediate` exactly once, with an acknowledgement or a refusal. Each "once" guard reads the
    hidden markers of §3.1.
 
@@ -929,7 +932,7 @@ clean run that is clean only because the harness took the postures out says so (
 
 Routing the roster shortfall through `coverage_gaps` rather than gating it separately is the whole
 economy of the change. Everything below already keys off `partial`, so an incomplete run inherits
-the full set of withheld conclusions — no resolved claims, no stale-closes, no ledger closure, not
+the full set of withheld conclusions — no resolved claims, no stale-closes but the shield's, no ledger closure, not
 `[SILENT]` — without a second mechanism to keep in step with the first.
 
 The reason this needs a name is that the whole ledger rests on one inference: _a finding that was in
@@ -943,7 +946,7 @@ coverage, and nothing else:
 
 - `resolved` is reported as `0` and no resolved-delta is posted. Findings that genuinely were fixed
   are simply reported the next time the fleet is fully readable.
-- No remediation PR is stale-closed. Every open fix survives to the next complete run.
+- No remediation PR is stale-closed, the shield's close of §3.3 aside. Every other open fix survives to the next complete run.
 - Zero findings does not close the ledger. `status` is still `CLEAN` — the audit found nothing, and
   saying otherwise would be its own lie — but the issue stays open and gains a comment naming the
   gaps, so the stream self-heals the day the unreadable clusters come back.

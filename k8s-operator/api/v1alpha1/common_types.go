@@ -1453,6 +1453,7 @@ type ForgeSpec struct {
 
 // RepositorySpec declares one repository on a declared forge, and what the
 // agent does with it.
+// +kubebuilder:validation:XValidation:rule="!has(self.baseBranch) || size(self.baseBranch) == 0 || self.role != 'context'",message="baseBranch may not be set on a context repository: it is never written, and its branch pin is the ref in the gitops-state ConfigMap"
 type RepositorySpec struct {
 	// Forge is the name of the entry in Forges this repository lives on.
 	// +kubebuilder:validation:MinLength=1
@@ -1478,6 +1479,32 @@ type RepositorySpec struct {
 	// it writes to, "context" for one it only reads.
 	// +kubebuilder:validation:Enum=gitops;managed;context
 	Role string `json:"role"`
+
+	// BaseBranch is the branch every pull request onto this repository must
+	// target. The credential broker enforces it: it refuses a proposal onto
+	// any other branch, and a clone that names no branch checks it out. Empty
+	// means the repository's own default branch. It may be set on a "gitops"
+	// or a "managed" repository, not on a "context" one, which is never
+	// written and whose branch pin is the ref in the gitops-state ConfigMap.
+	// The deprecated GitHub alias has no place for it: pinning the GitOps
+	// repository's base takes Forges and Repositories.
+	//
+	// The schema holds it to the branch names the broker accepts
+	// (providers/validate.validate_branch), because the chart installs the
+	// operator with its webhook off. Like the broker, it also holds it to one
+	// spelling per branch, the name or refs/heads/ and the name: a value
+	// starting with heads/, or with refs/heads/ followed by refs/heads/ or
+	// heads/, is refused, because the broker would read it as another branch.
+	// +kubebuilder:validation:MaxLength=200
+	// +kubebuilder:validation:Pattern=`^$|^[A-Za-z0-9][A-Za-z0-9._/-]*$`
+	// +kubebuilder:validation:XValidation:rule="self != 'HEAD'",message="baseBranch may not be HEAD"
+	// +kubebuilder:validation:XValidation:rule="!self.startsWith('refs/heads/') || (self.matches('^refs/heads/[A-Za-z0-9]') && self != 'refs/heads/HEAD')",message="baseBranch after refs/heads/ must start with a letter or digit and may not be HEAD"
+	// +kubebuilder:validation:XValidation:rule="!self.startsWith('heads/')",message="baseBranch may not start with heads/: write the branch name, or refs/heads/ and the name"
+	// +kubebuilder:validation:XValidation:rule="!self.startsWith('refs/heads/refs/heads/') && !self.startsWith('refs/heads/heads/')",message="baseBranch may carry one refs/heads/ prefix, not refs/heads/ followed by refs/heads/ or heads/"
+	// +kubebuilder:validation:XValidation:rule="!self.contains('..') && !self.contains('/.') && !self.contains('//') && !self.contains('@{') && !self.contains('.lock/')",message="baseBranch must be a git branch name: no '..', '/.', '//', '@{' or '.lock/'"
+	// +kubebuilder:validation:XValidation:rule="!self.endsWith('/') && !self.endsWith('.') && !self.endsWith('.lock')",message="baseBranch must be a git branch name: it may not end in '/', '.' or '.lock'"
+	// +optional
+	BaseBranch string `json:"baseBranch,omitempty"`
 }
 
 // GitHubSpec contains the configuration for the GitHub integration.
@@ -1827,24 +1854,36 @@ type AgentStatus struct {
 // ever written here, so the whole struct is safe to read with the same access
 // as the rest of the status.
 //
-// Today the operator writes ActiveInterfaces, from the spec, on every Ready status
-// update. The counters and LastActiveTime are declared so that the schema names
-// them, but nothing writes them yet — the agent's own ServiceAccount holds no
-// write verb on this status, and the operator has no producer for them — so each
-// is absent (omitempty) on every install until one exists.
+// The operator writes ActiveInterfaces, from the spec, on every Ready status
+// update, and ToolExecutionsTotal, EventsIngestedTotal and LastActiveTime from
+// the broker's and the event watcher's metrics listeners, which it reads every
+// five minutes on the leader; the agent's own ServiceAccount holds no write
+// verb on this status. The other counters are declared so that the schema
+// names them, but nothing writes them yet, and each is absent (omitempty)
+// until a series exists for it.
 type AgentUsageStatus struct {
 	// SessionsTotal is the cumulative number of interactive sessions handled.
 	// Nothing writes it yet.
 	// +optional
 	SessionsTotal int64 `json:"sessionsTotal,omitempty"`
 
-	// EventsIngestedTotal is the cumulative count of cluster events ingested and evaluated.
-	// Nothing writes it yet.
+	// EventsIngestedTotal is the cumulative count of cluster events the event
+	// watcher accepted for triage: past its reason filter and its dedup
+	// window, and not turned away by the agent. Read from the watcher's
+	// k8s_event_watcher_events_injected_total every five minutes, kept
+	// monotonic across pod, process and operator restarts, and across gateway
+	// replicas counted once rather than once per replica; it under-counts
+	// rather than over-counts when a listener cannot be read. Events the
+	// watcher merely observed are not counted.
 	// +optional
 	EventsIngestedTotal int64 `json:"eventsIngestedTotal,omitempty"`
 
-	// ToolExecutionsTotal is the cumulative count of CLI and diagnostic tool invocations.
-	// Nothing writes it yet.
+	// ToolExecutionsTotal is the cumulative count of CLI and diagnostic tool
+	// invocations the credential broker ran, successful or not, plus requests
+	// it rejected or failed on before running: its success and error outcomes.
+	// Read from the broker's kubeagents_tool_invocations_total every five
+	// minutes and kept monotonic the same way; commands refused by policy,
+	// busy and abandoned are not counted.
 	// +optional
 	ToolExecutionsTotal int64 `json:"toolExecutionsTotal,omitempty"`
 
@@ -1869,8 +1908,13 @@ type AgentUsageStatus struct {
 	// +optional
 	ActiveInterfaces []string `json:"activeInterfaces,omitempty"`
 
-	// LastActiveTime is the timestamp of the most recent interaction or event triage.
-	// Nothing writes it yet.
+	// LastActiveTime is the time of the last poll in which a counter above
+	// moved: a brokered command ran, or an event was accepted for triage.
+	// Until SessionsTotal has a source, a chat turn that runs no brokered
+	// command does not move it. Scheduled maintenance jobs that run brokered
+	// commands do move it, though -- the Controller Stall Watch cron runs some
+	// every 30 minutes by default -- so it marks agent activity of any origin,
+	// not human or operator use alone. Advances at most once per five minutes.
 	// +optional
 	LastActiveTime *metav1.Time `json:"lastActiveTime,omitempty"`
 }

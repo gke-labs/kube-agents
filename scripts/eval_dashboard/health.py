@@ -213,6 +213,24 @@ STORM_COOLDOWN = timedelta(minutes=30)
 # in a run are background noise on any day and must not hold GREEN off.
 STORM_RUN_SIGNATURE_REPS = 5
 
+# --- Replay errors (#2328) ---------------------------------------------------
+# A card-wake replay whose plant or turn failed in the image (ReplayBroken) or
+# whose directive/prompt was invalid returns an errored result; at bench-gate
+# it blocks at rung 3. The reason carries "the record is not evidence of a real
+# agent run" and "trajectory is empty", which STORM_REASON_RE matches;
+# recognised before the storm check so a broken replay is classified as a
+# graded fail rather than a storm repetition.
+REPLAY_ERROR_RE = re.compile(
+    r"ReplayBroken"
+    r"|ReplayMismatch"
+    r"|failure wake:"
+    r"|question wake:"
+    r"|thread context:"
+    r"|replay declares"
+    r"|\[bench:(?:card-failure|slack-question)-wake\]",
+    re.IGNORECASE,
+)
+
 # --- Rule 2b: delegation ceiling -> DEGRADED (#1874, #1879) -------------------
 # Incident: the platform agent's kanban dispatcher stalls under load ("ready
 # queue non-empty ... 0 workers spawned", 23 warnings on the 2026-09-21
@@ -515,7 +533,7 @@ ADVICE_LOST_PODS = (
 UNKNOWN_NODE = "(name unknown)"
 ADVICE_FIXTURE_DRIFT = (
     "A red on a case that depends on {roles} from a run that leased {projects} is the fixture, not your change;"
-    " retest once the fleet owner has re-applied bench/tf/fleet there (README, State and reconcile)."
+    " retest after the daily reconcile has re-applied bench/tf/fleet there (08:30 UTC) and the scan that follows reads it healthy."
 )
 ADVICE_POOL_DRIFT = (
     "A 403 or a missing-resource red from a run that leased {projects} is the pool project's shape, not your change"
@@ -565,9 +583,9 @@ STEP_RE = re.compile(r"(\d+)([mh])")
 # fixture is a week of real data.json, ten times smaller compressed.
 GZIP_SUFFIX = ".gz"
 # How many characters of a repetition's reason the fixture trimmer keeps:
-# every phrase STORM_REASON_RE matches sits inside the first 96 characters
-# of the harness's phrasings, and the dashboard keeps 300.
-TRIM_REASON_CHARS = 96
+# every phrase STORM_REASON_RE and REPLAY_ERROR_RE matches sits inside the
+# first 128 characters of the harness's phrasings, and the dashboard keeps 300.
+TRIM_REASON_CHARS = 128
 # The optional run fields (SCHEMA.md) the trimmer carries when the source has
 # them; absent stays absent: how the build ended, and the eval's own verdict,
 # which is what tells a deadline kill from a long red.
@@ -620,15 +638,19 @@ def rep_kind(rep: dict) -> str:
     `storm` is what the harness could not grade: an `infra` verdict, or a
     `fail` whose reason is one of the never-ran phrasings (graded `fail`
     before #1184, classified `infra` after it -- the text is the same).
+    A harness-declared replay error (#2328) is a graded fail, not a storm.
     """
     result = rep.get("result")
     if result == REP_RESULT_PASS:
         return REP_PASS
-    if DELEGATION_CEILING_MARKER in (rep.get("reason") or ""):
+    reason = rep.get("reason") or ""
+    if DELEGATION_CEILING_MARKER in reason:
         return REP_CEILING
+    if result != REP_RESULT_INFRA and "KUBE_AGENTS_INFRA_FAILURE" not in reason and REPLAY_ERROR_RE.search(reason):
+        return REP_FAIL
     if result == REP_RESULT_INFRA:
         return REP_STORM
-    if STORM_REASON_RE.search(rep.get("reason") or ""):
+    if STORM_REASON_RE.search(reason):
         return REP_STORM
     return REP_FAIL
 
@@ -1135,6 +1157,8 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
         "unknown": False,
         "scanned_at": None,
         "unread_units": 0,
+        "absent_units": 0,
+        "absent_projects": 0,
         "roles": [],
         "projects": [],
         "drift": {},
@@ -1168,6 +1192,10 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
     out["partial"] = bool(scope_key) and state_doc.get(scope_key) == getattr(module, "SCOPE_SELECTED", None)
     out["checked"] = module.checked_projects(state_doc)
     out["unread_units"] = module.unread_units(state_doc)
+    # The fleet scan tells a fixture the stack has not planted from a read
+    # that failed; the pool scan has no such state.
+    out["absent_units"] = module.absent_units(state_doc) if hasattr(module, "absent_units") else 0
+    out["absent_projects"] = module.absent_projects(state_doc) if hasattr(module, "absent_projects") else 0
     if scanned_at is None or now - scanned_at > FIXTURE_STATE_MAX_AGE:
         out["stale"] = True
         age = f"{int((now - scanned_at).total_seconds() // 3600)}h" if scanned_at else "of unknown age"
@@ -1583,6 +1611,10 @@ def pool_wait_p50_s(artifact: dict | None, now: datetime) -> int | None:
         return None
     measured = parse_iso(artifact.get("window_end"))
     if measured is None or now - measured > POOL_STALE_AFTER:
+        return None
+    # An UNMEASURED artifact still carries the days that did read; the headline
+    # must not quote one above the note that says the wait is unknown.
+    if artifact.get("verdict") == POOL_UNMEASURED:
         return None
     # The newest judged row, not the newest row. The producer withholds a
     # verdict below its sample floor, and at 13:00 UTC today's row holds only
@@ -2327,7 +2359,8 @@ def adjudicate(
     # and the poster, which keys on the verdict, does not re-announce one it
     # has told.
     streaks = periodics.streaks(readings, (prev or {}).get("periodics_streaks"))
-    watched = periodics.assess(readings, pool_clock, prev_notes, streaks=streaks if prev is not None else None)
+    superseded = periodics.superseded_jobs(readings, (prev or {}).get("periodics_superseded"))
+    watched = periodics.assess(readings, pool_clock, prev_notes, streaks=streaks if prev is not None else None, superseded=superseded)
     evidence.extend(periodics.evidence(note) for _, note in sorted(watched.items()))
     # Per job: a job read this tick keeps its start only while it is noted;
     # a job with no reading this tick keeps whatever start it had.
@@ -2363,6 +2396,7 @@ def adjudicate(
         "periodics": watched,
         "periodics_read": sorted(readings),
         "periodics_runs": periodics.runs(readings),
+        "periodics_superseded": superseded,
         "periodics_streaks": streaks,
         "periodics_since": periodics_since,
         "metrics": metrics([run for run in runs if run.finished <= now], now, fixtures, roster),
@@ -2399,6 +2433,8 @@ def scan_block(scan_result: dict) -> dict | None:
         "projects": scan_result["total"],
         "checked": scan_result["checked"],
         "unread_units": scan_result.get("unread_units", 0),
+        "absent_units": scan_result.get("absent_units", 0),
+        "absent_projects": scan_result.get("absent_projects", 0),
         "drifted": scan_result["current"],
         "passes_leases": scan_result.get("passes_leases", []),
         "reds_runs": scan_result.get("reds_runs", []),

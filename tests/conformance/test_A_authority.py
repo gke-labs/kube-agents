@@ -499,7 +499,7 @@ class A3TheA2ADoorsGoogleClassAssertsOnlyAVerifiedEmail(unittest.TestCase):
         body = h.go_function_body(h.text("a2a_door_roster"), "rosterResolver")
         self.assertRegex(
             body,
-            r"if backend == consoleBackend \|\| backend == a2aGoogleBackend \{\s*return func",
+            r"if backend == consoleBackend[^{]*\|\| backend == a2aGoogleBackend \{\s*return func",
             "the Google class's roster falls through to principalMapFor, whose default is the chat map",
         )
 

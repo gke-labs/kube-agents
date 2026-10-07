@@ -213,13 +213,17 @@ direct-push finding below for why). The exception is `b-0022b-gitops-pinned-base
 paragraph names the repository and path but not the branch, so the base can only come from
 the install (pinned-base mode, below).
 
-The PR base. `submit-suggestion` resolves it as `CREDENTIAL_PROXY_BASE_BRANCH`, else
-`GITOPS_BASE_BRANCH`, else the remote's advertised default branch (`git remote set-head
-origin --auto`), else `main` (`agents/platform/scripts/gitops_workspace.py`; content mode
-reads the same pair in `content_workspace.py`). The agent used directory mode in the
-measured runs. The pilot makes that the run branch in **default-branch mode** (pilot only; used
-for runs 14 onward): the stack makes the run branch the repository's default branch for
-the run and restores the original on destroy. Works because the skill re-asks the remote
+The PR base. `submit-suggestion prepare` takes it from the credential broker's clone: the
+`baseBranch` of the GitOps repository's `spec.integration.repositories` entry when it sets
+one, else the remote's default branch, and a round onto an open proposal keeps that proposal's
+target. With a
+base set, the broker refuses a proposal onto any other branch of that repository
+([version control](version-control-support.md#the-shape)). The measured runs used the earlier directory-mode `submit-suggestion`; today
+`gitops_workspace.resolve_base_branch` (fleet-audit's clone path and inspect-repository) resolves
+the same way: the broker's base, else the remote's advertised default, else `main`.
+**Default-branch mode** sets no base and makes the run branch the default instead (pilot
+only; used for runs 14 onward and by the cases that do not pin): the stack makes the run branch the repository's default
+branch for the run and restores the original on destroy. Works because `prepare` clones afresh
 before every PR; one run at a time.
 
 **Pinned-base mode** (`gitops_pin_agent_base_branch`, set in the case's own variables; used
@@ -282,9 +286,9 @@ into the agent container (each change rolled the agent pod, whose cold start too
 to over 10 minutes). That mode is gone: on the shell-sandbox layout every command the
 agent runs executes in `platform-agent-shell-0`, whose environment is built from scratch
 and does not take `spec.deployment.env` (`docs/designs/agent-shell-sandboxing.md`), so the
-variable reaches the gateway container and never the process that opens the PR. The
-per-run base is the credential broker's to enforce (#1498; its direct-push half landed as
-#1669, the base-branch half is #1848).
+variable reaches the gateway container and never the process that opens the PR. A per-run
+base now goes in the GitOps repository's `baseBranch`, which the operator renders into the
+credential broker and never into the sandbox; pinned-base mode (above) sets it per run.
 
 Both of those modes (env and default-branch) were advisory from the agent's point of view:
 in run 7 a session ran

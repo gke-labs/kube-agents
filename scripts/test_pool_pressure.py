@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -689,6 +690,237 @@ class SweepDeadline(unittest.TestCase):
         self.assertTrue(summary["trend"]["truncated"])
         self.assertEqual("2026-08-27", summary["trend"]["window_start"][:10])
         self.assertIn("ran out of time", pp.render(summary))
+
+
+class LogHead(unittest.TestCase):
+    """The ranged read stops at a byte count, which can fall inside a character.
+
+    Build 2107550359353298944 (#2477) put byte 65535 in the middle of an arrow,
+    and the text-mode decode took the whole sweep down with it.
+    """
+
+    LEASE_BANNER = "=== [2026-10-06T19:46:00Z] Leasing GCP Project from Boskos ===\n"
+
+    def _read(self, body: bytes) -> str:
+        """_read_log_head through a gcloud stub that serves `body` by range."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "build-log.txt")
+            with open(log, "wb") as fh:
+                fh.write(body)
+            stub = os.path.join(tmp, "gcloud")
+            with open(stub, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "#!/usr/bin/env python3\n"
+                    "import sys\n"
+                    "first, last = map(int, sys.argv[sys.argv.index('-r') + 1].split('-'))\n"
+                    f"sys.stdout.buffer.write(open({log!r}, 'rb').read()[first:last + 1])\n"
+                )
+            os.chmod(stub, 0o755)
+            path = tmp + os.pathsep + os.environ["PATH"]
+            with unittest.mock.patch.dict(os.environ, {"PATH": path}):
+                return pp._read_log_head("gs://bucket/build")
+
+    def test_a_head_cut_inside_a_character_still_yields_the_text_before_it(self):
+        banner = self.LEASE_BANNER.encode("utf-8")
+        arrow = "→".encode("utf-8")
+        self.assertEqual(3, len(arrow))
+        # Bytes 65534 and 65535 are the arrow's first two; its third is past the range.
+        filler = b"x" * (pp.BUILD_LOG_HEAD_BYTES - 2 - len(banner))
+        head = self._read(banner + filler + arrow + b" past the cut\n")
+        self.assertTrue(head.startswith(self.LEASE_BANNER))
+        self.assertGreaterEqual(len(head), pp.BUILD_LOG_HEAD_BYTES - 2)
+        self.assertIsNotNone(pp.lease_window(head)[0])
+
+    def test_a_banner_after_a_bare_carriage_return_still_starts_a_line(self):
+        """run_cmd's text mode read a lone \r as a line end; the bytes-mode
+        read has to do the same or BANNER_PATTERN's ^ misses the banner."""
+        head = self._read(b"pulling 100%\r" + self.LEASE_BANNER.encode("utf-8"))
+        self.assertNotIn("\r", head)
+        self.assertIsNotNone(pp.lease_window(head)[0])
+
+
+class SweepUnreadable(unittest.TestCase):
+    """A build whose read raises is named and skipped; the sweep goes on.
+
+    The periodic writes nothing when the sweep raises, so one bad log blanked
+    the TestGrid tab for a week (#2477).
+    """
+
+    # Three builds from the breach fixture day, 2026-08-26.
+    BUILDS = (2092660728946233344, 2092616949556056064, 2092526388937494528)
+    BAD = BUILDS[1]
+    AS_OF = datetime(2026, 8, 27, tzinfo=timezone.utc)
+
+    @staticmethod
+    def _build(moment: datetime) -> int:
+        """A build ID whose snowflake encodes `moment`."""
+        millis = int(moment.timestamp() * pp.MILLIS_PER_SECOND) - pp.SNOWFLAKE_EPOCH_MS
+        return millis << pp.SNOWFLAKE_TIMESTAMP_SHIFT
+
+    def _day(self, days_back: int, count: int) -> list:
+        """`count` builds in the last hours of the day `days_back` before AS_OF."""
+        return [self._build(self.AS_OF - timedelta(days=days_back, hours=h))
+                for h in range(1, count + 1)]
+
+    def _sweep(self, bad=(BAD,), pending=(), builds=BUILDS, days=1, slow=(), suffix=""):
+        entries = {build: f"gs://bucket/{build}{suffix}" for build in builds}
+
+        def wait_for(path):
+            build = int(path.rstrip("/").rsplit("/", 1)[1])
+            if build in bad:
+                raise UnicodeDecodeError("utf-8", b"\xe2\x86", 0, 2, "unexpected end of data")
+            if build in pending:
+                return None
+            moment = pp.snowflake_time(build)
+            waited = timedelta(minutes=60 if build in slow else 0)
+            return pp.Wait(build, "1", moment, moment + waited, 15)
+
+        with unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/gcloud"), \
+                unittest.mock.patch.object(pp, "_index_entries_from_gcs",
+                                           return_value=(entries, None)), \
+                unittest.mock.patch.object(pp, "_wait_from_gcs", side_effect=wait_for):
+            return pp.collect_waits(self.AS_OF - timedelta(days=days), self.AS_OF)
+
+    def _summary(self, source, days=1):
+        return pp.summarise(
+            self.AS_OF - timedelta(days=days), self.AS_OF, 15, 45, 45,
+            source, pp.Source(error="not read"), pp.Source(error="not read"),
+        )
+
+    def test_the_other_builds_are_still_measured(self):
+        sweep = self._sweep().value
+        self.assertEqual(3, sweep.builds_read)
+        self.assertEqual(sorted(b for b in self.BUILDS if b != self.BAD),
+                         sorted(w.build_id for w in sweep.waits))
+
+    def test_the_unreadable_build_is_named_in_the_output(self):
+        source = self._sweep()
+        self.assertEqual([str(self.BAD)], [u["build_id"] for u in source.value.unreadable])
+        self.assertIn("UnicodeDecodeError", source.value.unreadable[0]["error"])
+        summary = pp.summarise(
+            self.AS_OF - timedelta(days=1), self.AS_OF, 15, 45, 45,
+            source, pp.Source(error="not read"), pp.Source(error="not read"),
+        )
+        self.assertEqual([str(self.BAD)], [u["build_id"] for u in summary["trend"]["unreadable"]])
+        self.assertIn(str(self.BAD), pp.render(summary))
+
+    def test_every_build_unreadable_is_not_measured_rather_than_quiet(self):
+        """Before the per-build catch this input crashed the job red; the
+        catch must not turn it into a green window with no runs."""
+        builds = self._day(0, 12)
+        source = self._sweep(bad=builds, builds=builds)
+        self.assertFalse(source.ok)
+        self.assertIn(f"10 of the newest {pp.UNREADABLE_SAMPLE_BUILDS}", source.error)
+        self.assertIn("UnicodeDecodeError", source.error)
+        # The counts and the list travel with the error, not only one example.
+        self.assertEqual(12, source.value.builds_read)
+        self.assertEqual(sorted(str(b) for b in builds),
+                         sorted(u["build_id"] for u in source.value.unreadable))
+        summary = self._summary(source)
+        self.assertEqual(pp.VERDICT_UNMEASURED, summary["verdict"])
+        self.assertEqual(0, summary["trend"]["runs"])
+        self.assertEqual(12, summary["trend"]["builds_read"])
+        self.assertEqual(12, len(summary["trend"]["unreadable"]))
+        self.assertIn(str(builds[-1]), pp.render(summary))
+
+    def test_a_failure_that_starts_now_is_not_measured_and_still_shows_the_rest(self):
+        """Seven of twenty-four builds raising is a small share of the window,
+        but they are most of the newest ten, so the reader is broken now. The
+        builds that did read are still reported, under that verdict."""
+        older, newest = self._day(1, 12), self._day(0, 12)
+        source = self._sweep(bad=newest[:7], builds=older + newest, days=2)
+        self.assertFalse(source.ok)
+        self.assertIn(f"7 of the newest {pp.UNREADABLE_SAMPLE_BUILDS}", source.error)
+        summary = self._summary(source, days=2)
+        self.assertEqual(pp.VERDICT_UNMEASURED, summary["verdict"])
+        self.assertEqual(17, summary["trend"]["runs"])
+        self.assertEqual(["2026-08-25", "2026-08-26"], [d["day"] for d in summary["trend"]["days"]])
+        self.assertEqual(7, len(summary["trend"]["unreadable"]))
+        out = pp.render(summary)
+        self.assertIn("COULD NOT MEASURE", out)
+        self.assertIn("2026-08-25", out)
+        # The table under the verdict is a measurement of what did read, and
+        # the lines around it say so rather than calling the trend unmeasured.
+        self.assertNotIn("Trend not measured", out)
+        self.assertEqual(2, out.count("builds that did read"))
+
+    def test_unreadable_builds_older_than_the_newest_ten_do_not_fail_the_sweep(self):
+        """Most of a past day raising is named and left out; it says nothing
+        about whether the reader works now, so it must not keep the run red
+        for the week that day stays in the window."""
+        older, newest = self._day(1, 12), self._day(0, 12)
+        source = self._sweep(bad=older[:8], builds=older + newest, days=2)
+        self.assertTrue(source.ok)
+        self.assertEqual(16, len(source.value.waits))
+        self.assertEqual(8, len(source.value.unreadable))
+
+    def test_half_of_the_newest_builds_raising_is_still_measured(self):
+        """Five of the newest ten is not more than half: the share, not only
+        the count, decides."""
+        older, newest = self._day(1, 3), self._day(0, 12)
+        source = self._sweep(bad=newest[2:7], builds=older + newest, days=2)
+        self.assertTrue(source.ok)
+        self.assertEqual(10, len(source.value.waits))
+        self.assertEqual(5, len(source.value.unreadable))
+
+    def test_an_index_path_not_ending_in_the_build_id_does_not_crash_the_sweep(self):
+        """The build ID comes from the index file's name, which the reader
+        checks; the body is whatever Prow wrote and is never parsed."""
+        source = self._sweep(suffix="/")
+        self.assertTrue(source.ok)
+        self.assertEqual([str(self.BAD)], [u["build_id"] for u in source.value.unreadable])
+
+    def test_builds_after_the_window_are_not_the_newest_ten_on_a_replay(self):
+        """An --as-of replay walks the slack slice after the window and drops
+        it from the numbers; it must not be the population the reader is
+        judged on either."""
+        after = [self._build(self.AS_OF + timedelta(hours=h)) for h in range(1, 7)]
+        newest = self._day(0, 12)
+        source = self._sweep(bad=after, builds=newest + after)
+        self.assertTrue(source.ok)
+        self.assertEqual(12, len(source.value.waits))
+        self.assertEqual(6, len(source.value.unreadable))
+
+    def test_a_breach_among_the_readable_builds_outranks_could_not_measure(self):
+        older, newest = self._day(1, 12), self._day(0, 10)
+        source = self._sweep(bad=newest, builds=older + newest, days=2, slow=older)
+        self.assertFalse(source.ok)
+        summary = self._summary(source, days=2)
+        self.assertEqual(pp.VERDICT_BREACH, summary["verdict"])
+        self.assertEqual(["2026-08-25"], summary["trend"]["breached_days"])
+
+    def test_one_bad_build_on_the_newest_day_among_many_is_measured(self):
+        older, newest = self._day(1, 3), self._day(0, 7)
+        source = self._sweep(bad=newest[:1], builds=older + newest, days=2)
+        self.assertTrue(source.ok)
+        self.assertEqual(9, len(source.value.waits))
+        self.assertEqual([str(newest[0])], [u["build_id"] for u in source.value.unreadable])
+
+    def test_one_bad_build_among_builds_still_starting_is_not_a_read_failure(self):
+        """A build with no prowjob.json yet was read and had nothing to say; it
+        does not make the one raising build a bucket-wide failure."""
+        source = self._sweep(bad=(self.BAD,), pending=tuple(b for b in self.BUILDS if b != self.BAD))
+        self.assertTrue(source.ok)
+        self.assertEqual([], source.value.waits)
+        self.assertEqual([str(self.BAD)], [u["build_id"] for u in source.value.unreadable])
+
+
+class FromDirLogHead(unittest.TestCase):
+    def test_a_fixture_log_cut_inside_a_character_still_replays(self):
+        """The re-capture recipe takes the same 64 KiB range the live path
+        reads, so a fixture can carry the same cut (#2477)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            shutil.copytree(BREACH_DIR, tmp, dirs_exist_ok=True)
+            with open(os.path.join(tmp, "logs", "worst-queue-stall.txt"), "ab") as fh:
+                fh.write("→".encode("utf-8")[:2])
+            source = pp._collect_waits_from_dir(
+                tmp, BREACH_AS_OF - timedelta(days=1), BREACH_AS_OF
+            )
+        self.assertTrue(source.ok)
+        self.assertEqual(5, len(source.value.waits))
+        # Decoded past the cut, not swallowed: the lease banners are still read.
+        worst = next(w for w in source.value.waits if w.build_id == 2092660728946233344)
+        self.assertIsNotNone(worst.lease_acquired)
 
 
 class EndToEnd(unittest.TestCase):

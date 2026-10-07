@@ -902,6 +902,22 @@ Mutation(
         "log the hint raw, which is the state the sanitiser was added to fix",
     ),
     Mutation(
+        "D1-gateway-role-reaches-secrets",
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ('Resources: []string{"pods"},', 'Resources: []string{"pods", "secrets"},'),
+        "test_D1_no_product_role_can_write_the_identity_table",
+        "let the gateway's spawner Role read and write Secrets beside pods, "
+        "which is the shortcut that puts its own identity table in its hands",
+    ),
+    Mutation(
+        "D1-platform-role-reaches-secrets",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("      - configmaps\n      - serviceaccounts", "      - configmaps\n      - secrets\n      - serviceaccounts"),
+        "test_D1_no_product_role_can_write_the_identity_table",
+        "add secrets to the platform agent's minimal ClusterRole in the default golden, "
+        "beside the configmaps it already reads",
+    ),
+    Mutation(
         "D2-workflow-mode",
         "k8s-operator/api/v1alpha1/common_types.go",
         ("type SecuritySpec struct {", "type SecuritySpec struct {\n\tWorkflowMode string `json:\"workflowMode,omitempty\"`"),
@@ -1300,8 +1316,8 @@ Mutation(
     Mutation(
         "A3-a2a-google-roster-chat-map",
         "a2a/gateway/gateway.go",
-        ("\tif backend == consoleBackend || backend == a2aGoogleBackend {",
-         "\tif backend == consoleBackend {"),
+        ("\tif backend == consoleBackend || backend == slackBackend || backend == a2aGoogleBackend {",
+         "\tif backend == consoleBackend || backend == slackBackend {"),
         "test_A3_the_google_class_roster_does_not_resolve_through_the_chat_map",
         "send the Google class's roster through principalMapFor, whose default "
         "is the chat map, so a door caller's id resolves as a chat identity",

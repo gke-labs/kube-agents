@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Verify that relative links in Markdown resolve to files that exist.
+"""Verify that relative links in Markdown resolve, and that every document is linked.
 
 This catches the failure mode that actually occurs in this repository: a
 relative path that was correct when written and silently broke when a file
-moved or a directory was renamed.
+moved or a directory was renamed. It also catches the opposite: a document
+that nothing points at, which no reader will find and no review will re-read.
 
 Scope is deliberately narrow and offline:
 
@@ -26,7 +27,32 @@ Scope is deliberately narrow and offline:
   cites something like ``docs/x.md``, outside the two directories, as the
   existing ones do, or assembles the path from parts at runtime the way
   this script's own tests do; a literal in a tracked file is a citation
-  like any other.
+  like any other;
+* every tracked ``.md``/``.mdx`` outside a root-level dot-directory must be
+  reachable from where a reader starts. The starting points are the documents
+  a reader reaches without a link: files at the repository root (the front
+  door), any ``README.md`` (its directory reaches it), the tooling under the
+  root dot-directories, the site pages Starlight's sidebar lists (read from
+  ``SITE_CONFIG``: every page under an ``autogenerate`` directory, every
+  page an entry names by ``link:``, ``slug:`` or the bare-string shorthand,
+  and the ``404`` page it serves by convention), the uniform
+  families in ``LINK_EXEMPT_FAMILY_GLOBS``, which a reader reaches by
+  browsing the directory and which no page links one by one, and every
+  design document a code file cites. From there, reach follows links: a
+  relative link, a site route (``/kube-agents/...``), or a repository blob
+  URL (the form the generated skill catalogue uses; the URL itself is not
+  fetched or validated), however the link is written -- a Markdown link, a
+  reference-style definition, an autolink, or an HTML or JSX ``href``
+  attribute, which is how the site's hub pages link their sections
+  (``<LinkCard href=...>``). A link inside a fenced block, an inline code
+  span, an HTML comment or an MDX comment is a specimen or a leftover, not
+  a link: it reaches nothing and is not reported as broken either. A
+  document linked only from documents no reader
+  reaches is as unreachable as one linked from nowhere, and is reported the
+  same way. The documents that were unreachable when the rule arrived are
+  named in ``UNLINKED_ALLOWLIST``; the list only shrinks -- an entry that
+  becomes reachable, becomes exempt by shape, or is deleted fails the check
+  until it is dropped.
 
 Standard library only, so it runs in CI and in a bare clone.
 
@@ -40,6 +66,8 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from itertools import islice
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -56,8 +84,30 @@ CODE_GLOBS = ("*.py", "*.go", "*.sh", "*Dockerfile*", "*.yaml", "*.yml", "*.tf",
 # The docs site's dependency tree carries its own Markdown and scripts.
 VENDORED_DIR = "node_modules"
 
-# [text](target) but not ![image](target) handled separately; both are checked.
-LINK_RE = re.compile(r"!?\[[^\]]*\]\(\s*([^)\s]+)(?:\s+\"[^\"]*\")?\s*\)")
+# `[text](target)` and `![alt](target)` alike; both are checked. A title after
+# the target, in each spelling CommonMark admits. An image wrapped in a link,
+# `[![alt](image)](target)`, has its own pattern: LINK_RE reads the image,
+# whose `]` ends the outer text, and resumes after the image's `)`, so the
+# outer target went unread, which the reachability rule turned into a false
+# report for a document the badge form alone links.
+LINK_TITLE_RE = r"""(?:"[^"]*"|'[^']*'|\([^)]*\))"""
+LINK_DESTINATION_RE = rf"\(\s*(?P<target>[^)\s]+)(?:\s+{LINK_TITLE_RE})?\s*\)"
+IMAGE_RE = rf"!\[[^\]]*\]\(\s*[^)\s]+(?:\s+{LINK_TITLE_RE})?\s*\)"
+LINK_RE = re.compile(rf"!?\[[^\]]*\]{LINK_DESTINATION_RE}")
+LINKED_IMAGE_RE = re.compile(rf"\[{IMAGE_RE}\]{LINK_DESTINATION_RE}")
+# The other ways a document links another, read for the same two rules. An
+# HTML or JSX `href` attribute: `<LinkCard href="/kube-agents/..."/>` is how
+# the site's hub pages link their sections, and `<a href>` reads the same; an
+# `href={expression}` names no file and is skipped. A reference-style
+# definition, `[label]: target`, alone on its line with at most a title
+# after it, so a footnote (`[^1]: prose`) and a paragraph that happens to open
+# with a bracketed word are not read as one. An autolink, `<https://...>`,
+# which reaches a document only when it is a repository blob URL.
+HREF_RE = re.compile(r"""\bhref=(?P<quote>["'])(?P<target>[^\n]*?)(?P=quote)""")
+# A definition stands at most three spaces in: four columns is indented code,
+# and a tab reaches the fourth column, so a tab-indented one is code too.
+REFERENCE_DEFINITION_RE = re.compile(rf"""^ {{0,3}}\[(?!\^)[^\]]+\]:\s*<?(?P<target>[^\s<>]+)>?(?:\s+{LINK_TITLE_RE})?\s*\Z""")
+AUTOLINK_RE = re.compile(r"<(?P<target>https?://[^\s<>]+)>")
 
 SKIP_PREFIXES = (
     "http://",
@@ -69,12 +119,23 @@ SKIP_PREFIXES = (
     "/kube-agents/",  # Starlight route, not a filesystem path
 )
 
+# A link to a file in this repository on GitHub, as the generated skill
+# catalogue writes them. Read only for the linked-from-somewhere rule: the
+# path after the prefix is the file the link reaches. Whether that file exists
+# is not checked here -- an absolute URL is a remote resource to this script,
+# and the catalogue is regenerated from the tree on every `make docs-generate`.
+REPO_BLOB_URL_PREFIXES = (
+    "https://github.com/gke-labs/kube-agents/blob/main/",
+    "https://github.com/gke-labs/kube-agents/tree/main/",
+)
+
 # Fenced code blocks: links inside them are illustrative, not navigable.
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
 
 # Inline code spans, for the same reason a fenced block is skipped: what is
-# inside one is a specimen, not a link. Backtick runs of any length, matched
-# shortest-first and longest-delimiter-first so ``a `b` c`` closes correctly.
+# inside one is a specimen, not a link. Backtick runs of any length, closed by
+# a run of exactly the same length, so ``a `b` c`` closes correctly, and a run
+# whose closer never comes is text.
 #
 # This is not hypothetical tidiness. Seven documents quote the fleet-audit
 # finding-id pattern `^[a-z0-9]([a-z0-9._-]{0,98}[a-z0-9])?$`, and the `](`
@@ -82,10 +143,74 @@ FENCE_RE = re.compile(r"^\s*(```|~~~)")
 # which is not a file. The checker reported seven broken links in seven
 # correct documents.
 #
-# Deliberately line-scoped: a span left unclosed on its line stays visible to
-# LINK_RE, which is the safe direction to be wrong in, and line numbers in the
-# report keep meaning what they say.
-INLINE_CODE_RE = re.compile(r"(?<!`)(`+)(?!`).+?(?<!`)\1(?!`)")
+# A span may wrap onto the next line but not across a blank line or into a
+# new block, as a Markdown renderer reads one, so the lines outside fences are
+# read a paragraph at a time, and a paragraph ends where a heading, a list
+# item, a table row, a blockquote or a thematic break begins, and again after
+# a heading, a table row or a thematic break, which are one line long: a
+# renderer parses each of those inline on its own, so a lone backtick in one
+# list item never pairs with one in the next and hides the link between
+# them, while a span that wraps onto a plain continuation line is still one
+# span. A blockquote's lines are read with their markers removed, as a
+# renderer reads them, so a span or a comment may wrap from one `>` line to
+# the next, and a quoted heading, list item or marker-only line still ends the
+# paragraph inside the quote. Reading a span one line at a time was wrong in
+# the unsafe direction once comments were stripped too: a `<!--` quoted in a span that wraps
+# stayed visible and opened a comment that swallowed the rest of the
+# document, links included. A block boundary is believed at any indent, in
+# spaces or tabs, for the reason a comment opener is (below): CommonMark
+# measures an item's indent from the enclosing item, the checker tracks no
+# items, and an item nested four spaces under `10.` is an item to a renderer.
+BACKTICK_RUN_RE = re.compile(r"`+")
+ONE_LINE_BLOCK = r"#{1,6}(?:\s|$)|\||(?P<rule>[-*_])(?:\s*(?P=rule)){2,}\s*$"
+ONE_LINE_BLOCK_RE = re.compile(rf"^[ \t]*(?:{ONE_LINE_BLOCK})")
+BLOCK_OPENER_RE = re.compile(rf"^[ \t]*(?:[-*+](?:\s|$)|\d{{1,9}}[.)](?:\s|$)|>|{ONE_LINE_BLOCK})")
+QUOTE_MARKER_RE = re.compile(r"^[ \t]*>[ \t]?")
+
+# HTML and MDX comments, for the same reason again: a link an author commented
+# out instead of deleting renders nowhere, so it reaches no document -- the
+# rule the sidebar read applies to a JavaScript comment, one file over -- and
+# it is not a broken link either. A comment may span lines and paragraphs; the
+# lines inside one are dropped and the report's line numbers keep meaning what
+# they say. An MDX comment is one only in an `.mdx` file; in a `.md` file the
+# same characters render as text. Spans and comments are read in one pass,
+# left to right, and whichever opens first wins, as a renderer decides it: a
+# `<!--` quoted inside a span is a specimen, and a backtick inside a comment
+# is part of the comment. An opener with no closer is text, as an unclosed
+# backtick run is, and where the closer may be depends on where the opener
+# stands, as a renderer decides it: an opener that is the first content of its
+# line (CommonMark's HTML block) may close in any later paragraph; one in the
+# middle of a prose line is inline HTML, which cannot cross a blank line, so
+# it is a comment only when its closer is in the same paragraph. The block
+# form is believed at any indent, in spaces or tabs, and behind the markers
+# that open a container block, a blockquote's `>` and a list item's bullet or
+# number: CommonMark allows three spaces measured from the enclosing item, the
+# item's or quote's content is a block sequence of its own, and the checker
+# tracks neither, so an opener alone on its line four spaces in under a
+# numbered item, or opening an item or a quote, is the block it renders as,
+# not inline HTML that keeps the links it hides. An HTML block runs to the end
+# of the line its closer is on, so what follows the closer there is raw HTML
+# and not a link, while inline HTML ends at its closer and the rest of its
+# line is prose; an MDX comment is an expression, which ends at its closer
+# either way. Otherwise a bare `<!--` in prose, or one whose closer an edit
+# lost, blanked the rest of the document up to the next comment, which most
+# documents hold (a prettier-ignore, a generated-region marker), and the
+# broken-link check went green over links it never read. (CommonMark reads an
+# unclosed opener at the start of a line as an HTML block that runs to the
+# end of the document; the checker does not, because that is the quiet
+# failure, and a link the renderer would hide is reported rather than missed.)
+HTML_COMMENT = ("<!--", "-->")
+MDX_COMMENT = ("{/*", "*/}")
+MDX_SUFFIX = ".mdx"
+# What may stand before an opener on its line for it to open a block rather
+# than inline HTML: indentation and any sequence of container markers, a
+# blockquote's `>` or a list marker with the whitespace that makes it one, in
+# any order, since an item may open a quote and items nest.
+BLOCK_PREFIX_RE = re.compile(r"^[ \t]*(?:>[ \t]*|(?:[-*+]|\d{1,9}[.)])[ \t]+)*$")
+# What a span or a comment leaves behind: a space, not "", so what stood
+# either side of it cannot be glued into a link that was never written, plus
+# every line break it covered, so line numbers hold.
+SPECIMEN_REPLACEMENT = " "
 
 # A design or architecture document named from code. The match ends at `.md`,
 # so a trailing `)`, `.`, `,`, `:12`, `#anchor`, a closing backtick or a
@@ -93,6 +218,117 @@ INLINE_CODE_RE = re.compile(r"(?<!`)(`+)(?!`).+?(?<!`)\1(?!`)")
 # from matching as `.md`. A glob (`*.md`) or an f-string (`{name}.md`) contains
 # a character outside the class and is skipped, which is the safe direction.
 CITATION_RE = re.compile(r"docs/(?:designs|architecture)/[A-Za-z0-9_./-]+?\.md(?![A-Za-z0-9_])")
+
+# --- The linked-from-somewhere rule ----------------------------------------- #
+
+# A README is reached by the directory it sits in: GitHub renders it when the
+# directory is browsed, and every other tool that shows a tree does the same.
+README_NAME = "README.md"
+
+# The published site. Starlight's sidebar is what reaches a page there, and
+# the sidebar is hand-written in the site config: a group is either a list of
+# entries, one per page, or `autogenerate`d from a directory, which lists
+# every page under it. Both forms are read from the config, so a page added
+# to a hand-listed group without a sidebar entry is reported, not exempted:
+# it would publish with no navigation to it. The `404` page is served by name
+# and listed nowhere.
+SITE_CONTENT_DIR = "docs/site/src/content/docs/"
+SITE_CONFIG = "docs/site/astro.config.mjs"
+# The config is JavaScript, and an entry commented out is an entry gone: a
+# `// { label: ..., link: ... }` line or a `/* ... */` group is not
+# navigation, so comments are removed before the sidebar patterns run.
+# String literals are matched first and kept whole, so the `//` inside a
+# quoted URL is never read as a comment. A line comment leaves its newline;
+# a block comment becomes one space, so what it separated stays separate.
+JS_STRING_RE = r"""'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\.|[^`\\])*`"""
+JS_STRING_OR_COMMENT_RE = re.compile(
+    rf"""(?P<string>{JS_STRING_RE})|(?P<block>/\*.*?\*/)|(?P<line>//[^\n]*)""",
+    re.DOTALL,
+)
+JS_BLOCK_COMMENT_REPLACEMENT = " "
+# The sidebar is the `sidebar: [...]` array, cut at its matching bracket so
+# that a bare string elsewhere in the config (`customCss`, a theme list) is
+# never read as an entry. Brackets inside string literals do not count.
+SITE_SIDEBAR_START_RE = re.compile(r"\bsidebar:\s*\[")
+SIDEBAR_TOKEN_RE = re.compile(rf"{JS_STRING_RE}|[\[\]]", re.DOTALL)
+SIDEBAR_OPEN, SIDEBAR_CLOSE = "[", "]"
+# Starlight's grammar for an entry that names a page, each read after comment
+# stripping: `link: '/route/'` (a site route; an `https://` link is not a
+# page), `slug: 'dir/page'` (the content slug), the bare-string shorthand for
+# a slug (an array element that is a string), and an `autogenerate` object
+# whose `directory` key sits anywhere inside it (`collapsed` may come first).
+# A value is quoted with any of JavaScript's three quote characters; a
+# template literal that interpolates names no page and is skipped.
+JS_QUOTED_VALUE_RE = r"""(?P<quote>['"`])(?P<value>[^'"`\n]*)(?P=quote)"""
+JS_INTERPOLATION = "${"
+SITE_AUTOGENERATE_RE = re.compile(rf"autogenerate:\s*\{{[^}}]*?\bdirectory:\s*{JS_QUOTED_VALUE_RE}")
+SITE_SIDEBAR_LINK_RE = re.compile(rf"\blink:\s*{JS_QUOTED_VALUE_RE}")
+SITE_SIDEBAR_SLUG_RE = re.compile(rf"\bslug:\s*{JS_QUOTED_VALUE_RE}")
+SITE_SIDEBAR_SHORTHAND_RE = re.compile(rf"(?<=[\[,])\s*{JS_QUOTED_VALUE_RE}\s*(?=[,\]])")
+SITE_ROUTE_PREFIX = "/kube-agents/"  # the Astro `base`; a sidebar `link:` omits it
+SITE_ROUTE_SEPARATOR = "/"  # a `link:` value starts with it; a slug is wrapped in it to make a route
+SITE_PAGE_SUFFIXES = (".md", ".mdx")
+SITE_INDEX_STEM = "index"
+SITE_CONVENTION_PAGES = frozenset({"404.md"})
+
+# Uniform families a reader reaches by browsing the directory and that no page
+# links member by member: the agents' runtime material (personas, SOPs, skills
+# and their references, the onboarding templates), the GitOps template's
+# per-directory documents, and the integrity sweep's report and adjudication
+# written beside each committed run record under a bench task's `evidence/`,
+# named file by file so a note of another kind there still owes a link. `*`
+# stays inside one path segment; `**` crosses segments; neither matches a
+# segment that starts with a dot, so a nested dot-directory
+# (`examples/gitops-repo/.github/`) is content a family does not cover. A new
+# document in one of these directories needs no link; a new family needs a line
+# here, argued in the pull request.
+LINK_EXEMPT_FAMILY_GLOBS = (
+    "agents/chat/defaults/onboarding/*.md",
+    "agents/cluster/*.md",
+    "agents/cluster/skills/*/SKILL.md",
+    "agents/platform/governance/*.md",
+    "agents/platform/skills/*/SKILL.md",
+    "agents/platform/skills/*/references/*.md",
+    "bench/tasks/*/evidence/*/integrity-sweep-adjudication.md",
+    "bench/tasks/*/evidence/*/integrity-sweep.md",
+    "examples/gitops-repo/*/**",
+)
+
+# What the family globs' wildcards compile to. A segment is what sits between
+# slashes; `(?!\.)` at its start is the shell rule that a wildcard skips a
+# dot-entry.
+GLOB_STAR_RE = r"(?!\.)[^/]*"
+GLOB_DOUBLE_STAR_RE = r"(?:(?!\.)[^/]*/)*(?!\.)[^/]*"
+
+# Documents no reader reached when the rule arrived. Each stays here until it
+# is linked from the page that owns its topic or deleted; the check fails on
+# an entry that is either, or that a shape now exempts, so the list can only
+# shrink. Do not add to it: a new document is linked from where its readers
+# start.
+UNLINKED_ALLOWLIST = frozenset(
+    {
+        "a2a/persona/platform/skills/a2a-topics/SKILL.md",
+        "agents/chat/AGENTS.md",
+        "docs/designs/fleet-anomaly-detection-checks.md",
+    }
+)
+
+# This script names the allowlist's paths as literals, which the citation scan
+# above reads as citations. They are the list, not a reader's path to the
+# document, so this file is not a source for the linked-from-somewhere rule.
+# Its citations are still checked for existence like any other file's, so a
+# deleted design document is reported here as a broken citation as well.
+SELF = Path(__file__).resolve()
+
+# What a link target loses before it names a file: a `#fragment`, and the
+# `?plain=1` GitHub appends when a Markdown file's URL is copied from its
+# rendered view.
+LINK_SUFFIX_RE = re.compile(r"[#?].*\Z")
+
+UNLINKED_MESSAGE = "no reader reaches it -- link it from the page that owns its topic"
+ALLOWLIST_LINKED_MESSAGE = "in UNLINKED_ALLOWLIST but is now reachable -- drop the entry"
+ALLOWLIST_EXEMPT_MESSAGE = "in UNLINKED_ALLOWLIST but is now exempt by shape -- drop the entry"
+ALLOWLIST_UNTRACKED_MESSAGE = "in UNLINKED_ALLOWLIST but is not tracked -- drop the entry"
 
 
 def tracked_paths() -> set[Path]:
@@ -143,46 +379,430 @@ def strip_code_fences(text: str) -> list[tuple[int, str]]:
     return kept
 
 
-def check_file(path: Path, tracked: set[Path]) -> list[str]:
-    problems: list[str] = []
-    for lineno, line in strip_code_fences(path.read_text(encoding="utf-8")):
-        # A space, not "", so stripping a span cannot glue a stray `[text]`
-        # onto a following `(target)` and invent a link that was never written.
-        line = INLINE_CODE_RE.sub(" ", line)
-        for raw in LINK_RE.findall(line):
+def unquoted(line: str) -> tuple[int, str]:
+    """A line's blockquote depth and its content with the quote markers removed."""
+    depth = 0
+    while m := QUOTE_MARKER_RE.match(line):
+        line = line[m.end() :]
+        depth += 1
+    return depth, line
+
+
+def paragraphs(lines: list[tuple[int, str]]) -> Iterator[tuple[list[int], str]]:
+    """Group the lines into paragraphs: runs of adjacent non-blank lines, joined by newlines.
+
+    A blank line, a line a fence removed, a line that opens a new block (a
+    heading, a list item, a table row, a blockquote, a thematic break) or the
+    line after a one-line block (a heading, a table row, a thematic break)
+    ends one; a blank line is a paragraph of its own so that a comment still
+    runs across it. Two lines of one blockquote are read with their markers
+    removed, as a renderer reads a quote's content, so the next `>` line
+    continues the paragraph unless what follows its marker would end one.
+    """
+    numbers: list[int] = []
+    body: list[str] = []
+    for lineno, line in lines:
+        depth, content = unquoted(line)
+        previous_depth, previous = unquoted(body[-1]) if body else (0, "")
+        if depth and depth == previous_depth:
+            this_text, previous_text = content, previous  # inside one quote: the markers are not content
+        else:
+            this_text, previous_text = line, body[-1] if body else ""
+        ends = numbers and (
+            this_text.strip() == ""
+            or previous_text.strip() == ""
+            or lineno != numbers[-1] + 1
+            or BLOCK_OPENER_RE.match(this_text)
+            or ONE_LINE_BLOCK_RE.match(previous)
+        )
+        if ends:
+            yield numbers, "\n".join(body)
+            numbers, body = [], []
+        numbers.append(lineno)
+        body.append(line)
+    if numbers:
+        yield numbers, "\n".join(body)
+
+
+def blanked(text: str) -> str:
+    """The replacement for a dropped span or comment: a space and the line breaks it covered."""
+    return SPECIMEN_REPLACEMENT + "\n" * text.count("\n")
+
+
+def closing_run(text: str, run: str, start: int) -> int:
+    """Where a backtick run of exactly `run`'s length closes the span, or -1."""
+    position = text.find(run, start)
+    while position >= 0:
+        before = text[position - 1] if position else ""
+        after = text[position + len(run) : position + len(run) + 1]
+        if before != "`" and after != "`":
+            return position
+        position = text.find(run, position + len(run))
+    return -1
+
+
+def opens_a_block(text: str, position: int) -> bool:
+    """Whether only indentation and container markers stand between the line's start and `position`."""
+    return BLOCK_PREFIX_RE.match(text[text.rfind("\n", 0, position) + 1 : position]) is not None
+
+
+def comment_end(text: str, position: int, to_line_end: bool) -> int:
+    """Where the comment whose closer ends at `position` ends: there, or at the end of that line."""
+    if not to_line_end:
+        return position
+    newline = text.find("\n", position)
+    return len(text) if newline < 0 else newline
+
+
+def strip_specimens(lines: list[tuple[int, str]], comments: tuple[tuple[str, str], ...]) -> Iterator[tuple[int, str]]:
+    """The lines with every inline code span and every comment removed.
+
+    A comment opener is believed only where its closer can be: in this
+    paragraph or a later one for an opener that opens a block, in this
+    paragraph alone for one in the middle of a line. An opener nothing there
+    closes is text. An HTML comment that opens a block takes the rest of its
+    closer's line with it. The paragraphs are held as a list so the remainder
+    of the document can be searched before a block opener is believed.
+    """
+    closer: str | None = None
+    to_line_end = False
+    grouped = list(paragraphs(lines))
+    for index, (numbers, text) in enumerate(grouped):
+        kept: list[str] = []
+        at = 0
+        while at < len(text):
+            if closer is not None:
+                end = text.find(closer, at)
+                if end < 0:
+                    kept.append(blanked(text[at:]))
+                    break
+                stop = comment_end(text, end + len(closer), to_line_end)
+                kept.append(blanked(text[at:stop]))
+                at = stop
+                closer = None
+                continue
+            run = BACKTICK_RUN_RE.search(text, at)
+            openers = [(text.find(opener, at), opener, close) for opener, close in comments]
+            first_opener = min((found for found in openers if found[0] >= 0), default=None)
+            if run is None and first_opener is None:
+                kept.append(text[at:])
+                break
+            if run is not None and (first_opener is None or run.start() < first_opener[0]):
+                kept.append(text[at : run.start()])
+                end = closing_run(text, run.group(), run.end())
+                if end < 0:
+                    kept.append(run.group())
+                    at = run.end()
+                else:
+                    kept.append(blanked(text[run.start() : end + len(run.group())]))
+                    at = end + len(run.group())
+                continue
+            start, opener, close = first_opener
+            after = start + len(opener)
+            block = opens_a_block(text, start)
+            closed_here = close in text[after:]
+            closed_later = block and any(close in later for _, later in islice(grouped, index + 1, None))
+            if not closed_here and not closed_later:
+                kept.append(text[at:after])  # an opener nothing closes is text
+                at = after
+                continue
+            closer = close
+            to_line_end = block and (opener, close) == HTML_COMMENT
+            kept.append(text[at:start] + SPECIMEN_REPLACEMENT)
+            at = after
+        yield from zip(numbers, "".join(kept).split("\n"))
+
+
+def line_links(line: str) -> Iterator[str]:
+    """Every link target written on one line, in each form a document links another."""
+    for pattern in (LINK_RE, LINKED_IMAGE_RE, HREF_RE, AUTOLINK_RE):
+        for match in pattern.finditer(line):
+            yield match.group("target")
+    definition = REFERENCE_DEFINITION_RE.match(line)
+    if definition:
+        yield definition.group("target")
+
+
+def markdown_links(path: Path) -> Iterator[tuple[int, str]]:
+    """Yield (line number, link target) for every navigable link in a document."""
+    comments = (HTML_COMMENT, MDX_COMMENT) if path.suffix == MDX_SUFFIX else (HTML_COMMENT,)
+    for lineno, line in strip_specimens(strip_code_fences(path.read_text(encoding="utf-8")), comments):
+        for raw in line_links(line):
             target = raw.strip()
-            if not target or target.startswith(SKIP_PREFIXES):
-                continue
-            # drop any anchor, then percent-decode
-            file_part = unquote(target.split("#", 1)[0])
-            if not file_part:
-                continue
-            resolved = (
-                (REPO / file_part.lstrip("/"))
-                if file_part.startswith("/")
-                else (path.parent / file_part)
-            )
-            if resolved.resolve() not in tracked and not resolved.is_dir():
-                rel = path.relative_to(REPO)
-                problems.append(f"{rel}:{lineno}: broken link -> {target}")
-    return problems
+            if target:
+                yield lineno, target
 
 
-def check_code_file(path: Path, tracked: set[Path]) -> list[str]:
-    """Report every design-document path cited in a code file that is not tracked.
+def file_part(target: str) -> str:
+    """A link target without its fragment or query, percent-decoded."""
+    return unquote(LINK_SUFFIX_RE.sub("", target))
+
+
+def site_route_page(route: str) -> Path:
+    """The content file a site route denotes.
+
+    ``/overview/architecture/`` is ``overview/architecture.mdx`` or ``.md``
+    under the content root, or ``overview/architecture/index.*``; ``/`` is
+    the root ``index.*``. The first candidate on disk wins; when none is,
+    the first is returned so the route resolves to nothing that is tracked.
+    """
+    stem = file_part(route)
+    if stem.startswith(SITE_ROUTE_PREFIX):
+        stem = stem[len(SITE_ROUTE_PREFIX) :]
+    stem = stem.strip("/") or SITE_INDEX_STEM
+    content = REPO / SITE_CONTENT_DIR
+    candidates = [content / f"{stem}{suffix}" for suffix in SITE_PAGE_SUFFIXES]
+    candidates += [content / stem / f"{SITE_INDEX_STEM}{suffix}" for suffix in SITE_PAGE_SUFFIXES]
+    return next((c for c in candidates if c.is_file()), candidates[0])
+
+
+def link_target(path: Path, target: str) -> Path | None:
+    """The file a link denotes, unresolved, or None when it names no file here.
+
+    A repository blob URL denotes the path after its prefix and a site route
+    denotes a page under the content root; any other absolute URL, a mail or
+    phone link and a bare anchor denote nothing on disk. A leading ``/`` is
+    repository-root-relative; anything else is relative to the linking
+    document.
+    """
+    for prefix in REPO_BLOB_URL_PREFIXES:
+        if target.startswith(prefix):
+            return REPO / file_part(target[len(prefix) :])
+    if target.startswith(SITE_ROUTE_PREFIX):
+        return site_route_page(target)
+    if target.startswith(SKIP_PREFIXES):
+        return None
+    part = file_part(target)
+    if not part:
+        return None
+    if part.startswith("/"):
+        return REPO / part.lstrip("/")
+    return path.parent / part
+
+
+def code_citations(path: Path) -> Iterator[tuple[int, str]]:
+    """Yield (line number, cited path) for every design-document path in a code file.
 
     Citations are repository-root paths by convention, so nothing is resolved
     relative to the citing file. Code fences and inline code are not stripped
     here: in a comment, backticks are how a path is quoted, not a sign that it
     is a specimen.
     """
-    problems: list[str] = []
     for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         for m in CITATION_RE.finditer(line):
-            cited = m.group(0)
-            if (REPO / cited).resolve() not in tracked:
-                rel = path.relative_to(REPO)
-                problems.append(f"{rel}:{lineno}: broken citation -> {cited}")
+            yield lineno, m.group(0)
+
+
+def check_file(path: Path, tracked: set[Path], links: Iterable[tuple[int, str]] | None = None) -> list[str]:
+    """Report every relative link in a document whose target is not tracked.
+
+    ``links`` is the document's links when the caller has read them already;
+    ``main()`` reads each document once and hands the same links here and to
+    ``reached_files()``.
+    """
+    problems: list[str] = []
+    for lineno, target in markdown_links(path) if links is None else links:
+        if target.startswith(REPO_BLOB_URL_PREFIXES) or target.startswith(SKIP_PREFIXES):
+            continue  # a remote resource or a Starlight route; existence is not checked here
+        resolved = link_target(path, target)
+        if resolved is None:
+            continue
+        if resolved.resolve() not in tracked and not resolved.is_dir():
+            rel = path.relative_to(REPO)
+            problems.append(f"{rel}:{lineno}: broken link -> {target}")
+    return problems
+
+
+def check_code_file(path: Path, tracked: set[Path], citations: Iterable[tuple[int, str]] | None = None) -> list[str]:
+    """Report every design-document path cited in a code file that is not tracked.
+
+    ``citations`` is the file's citations when the caller has read them already.
+    """
+    problems: list[str] = []
+    for lineno, cited in code_citations(path) if citations is None else citations:
+        if (REPO / cited).resolve() not in tracked:
+            rel = path.relative_to(REPO)
+            problems.append(f"{rel}:{lineno}: broken citation -> {cited}")
+    return problems
+
+
+def glob_to_regex(pattern: str) -> re.Pattern[str]:
+    """Translate a family glob to a regex.
+
+    `**` crosses slashes and `*` does not; like a shell glob, neither matches
+    a segment that starts with a dot, so a wildcard never reaches into a
+    nested dot-directory.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(pattern):
+        if pattern.startswith("**", i):
+            out.append(GLOB_DOUBLE_STAR_RE)
+            i += 2
+        elif pattern[i] == "*":
+            out.append(GLOB_STAR_RE)
+            i += 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    return re.compile("".join(out) + r"\Z")
+
+
+FAMILY_PATTERNS = tuple(glob_to_regex(glob) for glob in LINK_EXEMPT_FAMILY_GLOBS)
+
+
+def strip_js_comments(text: str) -> str:
+    """``text`` with its JavaScript line and block comments removed, string literals intact."""
+
+    def keep_or_drop(match: re.Match[str]) -> str:
+        if match.group("string") is not None:
+            return match.group("string")
+        if match.group("block") is not None:
+            return JS_BLOCK_COMMENT_REPLACEMENT
+        return ""
+
+    return JS_STRING_OR_COMMENT_RE.sub(keep_or_drop, text)
+
+
+def sidebar_array(text: str) -> str:
+    """The ``sidebar: [...]`` array in comment-stripped config text, or "" when there is none.
+
+    A sidebar assembled elsewhere and passed in by name is not an array here
+    and reads as empty, which reports every hand-listed page: the loud
+    direction, and the signal to teach this function the new shape.
+    """
+    start = SITE_SIDEBAR_START_RE.search(text)
+    if start is None:
+        return ""
+    opened = start.end() - 1
+    depth = 0
+    for token in SIDEBAR_TOKEN_RE.finditer(text, opened):
+        if token.group() == SIDEBAR_OPEN:
+            depth += 1
+        elif token.group() == SIDEBAR_CLOSE:
+            depth -= 1
+            if depth == 0:
+                return text[opened : token.end()]
+    return text[opened:]
+
+
+def sidebar_values(pattern: re.Pattern[str], text: str) -> Iterator[str]:
+    """The quoted values ``pattern`` finds in ``text``, skipping template literals that interpolate."""
+    for match in pattern.finditer(text):
+        value = match.group("value")
+        if JS_INTERPOLATION not in value:
+            yield value
+
+
+def site_sidebar() -> tuple[frozenset[str], frozenset[Path]]:
+    """The autogenerated directories and the pages the sidebar lists, from the site config.
+
+    Both are empty when there is no site config, which leaves every site page
+    but the convention ones to be reached by a link like any other document.
+    A commented-out entry or group is read as absent. A page is listed by a
+    ``link:`` route, a ``slug:``, or the bare-string shorthand for one.
+    """
+    config = REPO / SITE_CONFIG
+    if not config.is_file():
+        return frozenset(), frozenset()
+    text = sidebar_array(strip_js_comments(config.read_text(encoding="utf-8")))
+    directories = frozenset(
+        SITE_CONTENT_DIR + d.strip(SITE_ROUTE_SEPARATOR) + SITE_ROUTE_SEPARATOR
+        for d in sidebar_values(SITE_AUTOGENERATE_RE, text)
+    )
+    routes = [r for r in sidebar_values(SITE_SIDEBAR_LINK_RE, text) if r.startswith(SITE_ROUTE_SEPARATOR)]
+    for pattern in (SITE_SIDEBAR_SLUG_RE, SITE_SIDEBAR_SHORTHAND_RE):
+        routes += [SITE_ROUTE_SEPARATOR + slug + SITE_ROUTE_SEPARATOR for slug in sidebar_values(pattern, text)]
+    pages = frozenset(site_route_page(route).resolve() for route in routes)
+    return directories, pages
+
+
+def reached_by_shape(rel: str, site_directories: frozenset[str]) -> bool:
+    """True for a document a reader reaches without anyone linking it.
+
+    ``rel`` is repository-relative with forward slashes. Root-level
+    dot-directories are tooling, not documentation, and are out of scope by
+    the same rule as before; a dot-directory nested inside a documented area
+    (``examples/gitops-repo/.github/``) is content and stays in scope, which
+    ``glob_to_regex`` keeps true for the families: a wildcard does not match
+    a segment that starts with a dot.
+    """
+    if "/" not in rel or rel.startswith("."):
+        return True
+    if rel.rsplit("/", 1)[1] == README_NAME:
+        return True
+    if rel.startswith(SITE_CONTENT_DIR):
+        return rel.startswith(tuple(site_directories)) or rel[len(SITE_CONTENT_DIR) :] in SITE_CONVENTION_PAGES
+    return any(pattern.match(rel) for pattern in FAMILY_PATTERNS)
+
+
+def reached_files(
+    markdown: list[Path],
+    code: list[Path],
+    links: Mapping[Path, Sequence[tuple[int, str]]] | None = None,
+    citations: Mapping[Path, Sequence[tuple[int, str]]] | None = None,
+    sidebar: tuple[frozenset[str], frozenset[Path]] | None = None,
+) -> set[Path]:
+    """Every document a reader reaches, resolved.
+
+    Reach starts at the documents a reader arrives at without a link -- the
+    shapes above, the sidebar's pages, and every design document a code file
+    cites -- and follows links from there. An allowlisted document is a dead
+    end: nothing is reached through it, so a document linked only from one is
+    reported rather than hidden behind the entry. ``links`` (by resolved
+    document), ``citations`` (by code file) and ``sidebar`` are what the
+    caller has read already; each is read here when it is not given.
+    """
+    site_directories, sidebar_pages = site_sidebar() if sidebar is None else sidebar
+    tracked = {path.resolve(): path.relative_to(REPO).as_posix() for path in markdown}
+    reached: set[Path] = set(sidebar_pages)
+    for resolved, rel in tracked.items():
+        if rel not in UNLINKED_ALLOWLIST and reached_by_shape(rel, site_directories):
+            reached.add(resolved)
+    for path in code:
+        if path.resolve() == SELF:
+            continue
+        for _, cited in code_citations(path) if citations is None else citations[path]:
+            reached.add((REPO / cited).resolve())
+    queue = [p for p in reached if p in tracked and tracked[p] not in UNLINKED_ALLOWLIST]
+    while queue:
+        source = queue.pop()
+        for _, target in markdown_links(source) if links is None else links[source]:
+            resolved = link_target(source, target)
+            if resolved is None:
+                continue
+            resolved = resolved.resolve()
+            if resolved in reached:
+                continue
+            reached.add(resolved)
+            if resolved in tracked and tracked[resolved] not in UNLINKED_ALLOWLIST:
+                queue.append(resolved)
+    return reached
+
+
+def check_unlinked(markdown: list[Path], reached: set[Path], site_directories: frozenset[str] | None = None) -> list[str]:
+    """Report every document no reader reaches, and every allowlist entry that is stale.
+
+    ``site_directories`` is the sidebar's autogenerated set when the caller has
+    read the site config already.
+    """
+    if site_directories is None:
+        site_directories, _ = site_sidebar()
+    problems: list[str] = []
+    tracked_rel = {path.relative_to(REPO).as_posix() for path in markdown}
+    for rel in sorted(UNLINKED_ALLOWLIST - tracked_rel):
+        problems.append(f"{rel}: {ALLOWLIST_UNTRACKED_MESSAGE}")
+    for path in markdown:
+        rel = path.relative_to(REPO).as_posix()
+        linked = path.resolve() in reached
+        if rel in UNLINKED_ALLOWLIST:
+            if linked:
+                problems.append(f"{rel}: {ALLOWLIST_LINKED_MESSAGE}")
+            elif reached_by_shape(rel, site_directories):
+                problems.append(f"{rel}: {ALLOWLIST_EXEMPT_MESSAGE}")
+            continue
+        if not linked:
+            problems.append(f"{rel}: {UNLINKED_MESSAGE}")
     return problems
 
 
@@ -192,25 +812,37 @@ def main() -> int:
         print("ERROR: no Markdown files found.", file=sys.stderr)
         return 1
 
+    # Each document, code file and the site config is read once; the broken-link
+    # checks and the reachability walk read the same links and citations.
     tracked = tracked_paths()
     problems: list[str] = []
+    links = {f.resolve(): tuple(markdown_links(f)) for f in files}
     for f in files:
-        problems.extend(check_file(f, tracked))
+        problems.extend(check_file(f, tracked, links[f.resolve()]))
 
     code = tracked_code()
+    citations = {f: tuple(code_citations(f)) for f in code}
     for f in code:
-        problems.extend(check_code_file(f, tracked))
+        problems.extend(check_code_file(f, tracked, citations[f]))
+
+    sidebar = site_sidebar()
+    problems.extend(check_unlinked(files, reached_files(files, code, links, citations, sidebar), sidebar[0]))
 
     print(
         f"Checked relative links in {len(files)} Markdown files "
-        f"and design-doc citations in {len(code)} code files."
+        f"and design-doc citations in {len(code)} code files, "
+        f"and that a reader reaches every document "
+        f"({len(UNLINKED_ALLOWLIST)} allowlisted)."
     )
     if problems:
-        print(f"\n{len(problems)} broken link(s) or citation(s):\n", file=sys.stderr)
+        print(
+            f"\n{len(problems)} broken link(s), citation(s) or unreachable document(s):\n",
+            file=sys.stderr,
+        )
         for p in problems:
             print(f"    {p}", file=sys.stderr)
         return 1
-    print("All relative links and design-doc citations resolve.")
+    print("All relative links and design-doc citations resolve, and a reader reaches every document.")
     return 0
 
 

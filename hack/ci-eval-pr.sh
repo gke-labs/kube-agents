@@ -22,6 +22,11 @@
 
 set -euo pipefail
 
+# Wall clock at this script's entry, before the lease heartbeat, the cluster
+# auth and section 1: the fallback job start for the rollback round trip's
+# start-by bound when BUILD_ID does not give one (job_started_epoch).
+EVAL_SCRIPT_STARTED_EPOCH="$(date +%s)"
+
 # The eval rosters, three files beside this script under hack/eval/ (#1546):
 # what every pull request runs, what can red one on a graded failure, and
 # what the nightly adds. Section 6 reads the first and third into TASKS and
@@ -69,10 +74,12 @@ readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
 # from the Secret the operator renders beside the door -- <agent>-a2a-inject,
 # key `token` (a2aInjectName and a2aInjectTokenKey in the operator; the deploy
 # already waited for it). Unset, the matrix runs over the agent API exactly
-# as before. Three places read the flag: section 4 below; the baseline
+# as before. Four places read the flag: section 4 below; the baseline
 # recorder (its decision, EVAL_IS_MAIN_RUN, and the log line at the record
-# step after the fan-out); and the dashboard publisher's gate, which mirrors
-# the recorder's. A flagged run passes neither: the next lane's periodic on
+# step after the fan-out); the dashboard publisher's gate, which mirrors
+# the recorder's; and the rollback round trip after the suite verdict
+# (run_rollback_roundtrip, below). A flagged run passes neither the recorder
+# nor the publisher: the next lane's periodic on
 # main runs under it with no PULL_NUMBER, the shape both otherwise write
 # from, and a next-mode sample in today's window would be indistinguishable
 # once written (VersionKey in bench/kube_agents_bench/baselines.py carries
@@ -86,6 +93,28 @@ readonly EVAL_INJECT_TOKEN_SECRET_KEY="token"
 # fan-out on one listener that the first unit to finish tears down. The base
 # sits clear of the API range (28642 + seq) for any matrix this job runs.
 readonly EVAL_INJECT_LOCAL_PORT_BASE=29099
+
+# The rollback round trip under EVAL_MODE_NEXT=1 (run_rollback_roundtrip, after
+# the suite verdict is computed): hack/rollback-roundtrip.sh flips the install
+# next -> today -> next and checks the JetStream PVC and the bus creds Secret
+# come through it (cutover condition 6, #2461). Reported beside the verdict,
+# never in it: its own log section and artifacts, no case, no effect on the
+# exit status. It starts only while the JOB is young enough that its own
+# bound still ends inside the presubmit's 360m deadline, measured from the
+# job's start (job_started_epoch), not from the eval's, so a slow deploy in
+# front counts against it too. The arithmetic: start by 15600s (260m), plus
+# the 3600s bound, plus the 60s kill grace, ends by 19260s; the 360m deadline
+# is 21600s, which leaves 2340s (39m) for the verdict line, the EXIT trap's
+# artifact collection and the teardown's 10m uninstall bound
+# (hack/ci-teardown.sh, RELEASE_UNINSTALL_TIMEOUT). The bound kills a run that
+# outlives it, after a grace for its port-forwards to close.
+readonly EVAL_ROLLBACK_SCRIPT="rollback-roundtrip.sh"
+readonly EVAL_ROLLBACK_JOB_DEADLINE_SECONDS=21600
+readonly EVAL_ROLLBACK_START_BY_SECONDS=15600
+readonly EVAL_ROLLBACK_TIMEOUT_SECONDS=3600
+readonly EVAL_ROLLBACK_KILL_AFTER_SECONDS=60
+readonly EVAL_ROLLBACK_LOG="rollback-roundtrip.log"
+readonly EVAL_ROLLBACK_RESULTS="rollback-roundtrip.txt"
 
 # release_inflight_note (beside the ledger reset, section 5): the sandbox
 # pod's shell container, the scratch directory audit_report.py writes its
@@ -107,15 +136,16 @@ readonly EVAL_SANDBOX_EXEC_ROUND_TRIP_SECONDS=60
 readonly EVAL_INFLIGHT_GRACE_SECONDS=300
 readonly EVAL_INFLIGHT_POLL_STEP_SECONDS=5
 
-# ─── Step 0: self-revalidation against this PR's own green history ──────────
+# ─── Step 0: self-revalidation against this PR's own verdicts ──────────────
 # hack/ci-revalidate.sh, which the Prow job also runs before it leases an
 # evaluation project (kube-agents-presubmits.yaml in oss-test-infra). Run
 # here too, first, so a job definition that has not yet hoisted it still
 # saves the eval matrix, and so the next-mode lane that runs this script
 # under its own JOB_NAME is covered the same way. The script's header owns
-# the rules: a green at this head is reused whatever main has done since
-# (#1202), a green at an earlier head when everything since is inert
-# (#1179), and every doubt is a full run. EVAL_SKIP_REVALIDATION=1 is the
+# the rules: a green at this head, whatever main has done since (#1202),
+# or at an earlier head when everything since is inert (#1179), is reused;
+# failing both, an admin /override of this head; and every doubt is a full
+# run. EVAL_SKIP_REVALIDATION=1 is the
 # escape hatch. Run through bash rather than by mode: a script that lost its
 # executable bit would otherwise exit 126 with no "Step 0: full run:" line
 # and every run would go full in silence.
@@ -1430,7 +1460,8 @@ check_case_entries "${PRESUBMIT_CASES_FILE}" "${TASKS[@]}"
 PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${ENTRY}")"; done)"
 
 # ─── The nightly tier (#1021, the catch-all; #1023/#1024 consume it) ─────────
-# The nightly periodic runs the FULL catalog: every presubmit case above,
+# The nightly periodic runs the FULL catalog (or one part of it, under
+# EVAL_NIGHTLY_PART below): every presubmit case above,
 # identically -- same repetitions, same gate, same reporting order -- PLUS
 # the entries of nightly-cases.txt. That file is the default home of a new
 # case (decided 2026-09-15 on #1546/#1564): it lands there, builds its record
@@ -1481,6 +1512,30 @@ case "${EVAL_TIER}" in
     ;;
   *)
     echo "ERROR: EVAL_TIER must be 'presubmit' or 'nightly', got '${EVAL_TIER}'." >&2
+    exit 1
+    ;;
+esac
+
+# Which part of the nightly matrix this run takes, so the nightly can run as
+# two periodics on two leased projects: the cases that request a pull request
+# run one unit at a time after every other unit (unit_phase, below), and on
+# one project that phase and the infra lock's stretch did not fit the 480m
+# deadline together. "all", the default, is the whole matrix; "main" leaves
+# those cases out and "writers" runs them alone. The split is applied after
+# the lane step, which is what names them. A part outside the nightly would
+# silently run a subset of the presubmit, so it stops the job, as does any
+# other value.
+EVAL_NIGHTLY_PART="${EVAL_NIGHTLY_PART:-all}"
+case "${EVAL_NIGHTLY_PART}" in
+  all) ;;
+  main | writers)
+    if [ "${EVAL_TIER}" != "nightly" ]; then
+      echo "ERROR: EVAL_NIGHTLY_PART=${EVAL_NIGHTLY_PART} selects part of the nightly matrix, but EVAL_TIER=${EVAL_TIER}; unset it, or set it to 'all', outside the nightly." >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "ERROR: EVAL_NIGHTLY_PART must be 'all', 'main' or 'writers', got '${EVAL_NIGHTLY_PART}'." >&2
     exit 1
     ;;
 esac
@@ -1641,6 +1696,47 @@ unit_task_path() { # <task-path> <task-name>
     echo "$1"
   fi
 }
+
+# ─── The nightly part ────────────────────────────────────────────────────────
+# EVAL_NIGHTLY_PART (validated at the tier switch) applied to TASKS: after
+# the lane step, which is what names the cases that request a pull request
+# (its log line lists them before this split), and before TASK_NAMES, the
+# stack count, the lock deadlines and the unit queues are built from TASKS,
+# so the run grades and reports only its part. The match is unit_phase's,
+# below. The names left out are kept in NIGHTLY_PART_DROPPED for the
+# BOOTSTRAP_ADMITTED export, as the lane's are.
+# The "Nightly part:" line is the record of which part a night ran, and
+# names the cases the part left out.
+NIGHTLY_PART_DROPPED=""
+if [ "${EVAL_TIER}" = "nightly" ]; then
+  NIGHTLY_MATRIX_SIZE="${#TASKS[@]}"
+  if [ "${EVAL_NIGHTLY_PART}" != "all" ]; then
+    NIGHTLY_PART_KEPT=()
+    for ENTRY in "${TASKS[@]}"; do
+      NAME="$(basename "$(dirname "${ENTRY}")")"
+      case ",${INJECT_LANE_REQUESTING}," in
+        *",${NAME},"*) ENTRY_PART="writers" ;;
+        *) ENTRY_PART="main" ;;
+      esac
+      if [ "${ENTRY_PART}" = "${EVAL_NIGHTLY_PART}" ]; then
+        NIGHTLY_PART_KEPT+=("${ENTRY}")
+      else
+        NIGHTLY_PART_DROPPED="${NIGHTLY_PART_DROPPED}${NAME}
+"
+      fi
+    done
+    TASKS=(${NIGHTLY_PART_KEPT[@]+"${NIGHTLY_PART_KEPT[@]}"})
+    if [ "${#TASKS[@]}" -eq 0 ]; then
+      echo "ERROR: EVAL_NIGHTLY_PART=${EVAL_NIGHTLY_PART} selects no case of the ${NIGHTLY_MATRIX_SIZE}-case nightly matrix (cases that request a pull request: ${INJECT_LANE_REQUESTING:-none}); the run would grade nothing and report green." >&2
+      exit 1
+    fi
+  fi
+  NIGHTLY_PART_LINE="Nightly part: ${EVAL_NIGHTLY_PART} (${#TASKS[@]} of ${NIGHTLY_MATRIX_SIZE} cases)"
+  if [ -n "${NIGHTLY_PART_DROPPED}" ]; then
+    NIGHTLY_PART_LINE="${NIGHTLY_PART_LINE}; left out: $(printf '%s' "${NIGHTLY_PART_DROPPED}" | paste -sd, -)"
+  fi
+  echo "${NIGHTLY_PART_LINE}"
+fi
 
 # Floor for VerificationCorrectness on a repetition of a task that declares a
 # verification_spec. 1.0 while every declared objective is meant to hold
@@ -1934,6 +2030,7 @@ if [ -z "${BLOCKING_ROSTER_ENTRIES}" ]; then
   exit 1
 fi
 BLOCKING_ROSTER_DEFAULT=""
+BLOCKING_ROSTER_ON_LANE=""
 while IFS= read -r NAME; do
   if [ -z "${NAME}" ]; then continue; fi
   if ! grep -qxF -- "${NAME}" <<< "${PRESUBMIT_CASE_NAMES}"; then
@@ -1950,6 +2047,13 @@ while IFS= read -r NAME; do
   if [ -n "${INJECT_LANE_DROPPED:-}" ] && grep -qxF -- "${NAME}" <<< "${INJECT_LANE_DROPPED:-}"; then
     continue
   fi
+  BLOCKING_ROSTER_ON_LANE="true"
+  # A roster case outside this night's part (NIGHTLY_PART_DROPPED, empty
+  # unless EVAL_NIGHTLY_PART names one) leaves the export for the same
+  # reason: the other part's run grades it.
+  if [ -n "${NIGHTLY_PART_DROPPED:-}" ] && grep -qxF -- "${NAME}" <<< "${NIGHTLY_PART_DROPPED:-}"; then
+    continue
+  fi
   BLOCKING_ROSTER_DEFAULT="${BLOCKING_ROSTER_DEFAULT:+${BLOCKING_ROSTER_DEFAULT},}${NAME}"
 done <<< "${BLOCKING_ROSTER_ENTRIES}"
 # The file guard above cannot see the lane's drop: an exclusion list that
@@ -1960,7 +2064,9 @@ done <<< "${BLOCKING_ROSTER_ENTRIES}"
 # the normal approvers, and it must not be able to do what the roster file
 # is guarded against. An explicit BOOTSTRAP_ADMITTED in the job's
 # environment, empty included, is the stated way to mean it, and wins below.
-if [ -z "${BLOCKING_ROSTER_DEFAULT}" ] && [ -n "${INJECT_LANE_DROPPED:-}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
+# Read before the nightly part's drop, which empties the export by design
+# when the part holds no roster case, and is not the lane's doing.
+if [ -z "${BLOCKING_ROSTER_ON_LANE}" ] && [ -n "${INJECT_LANE_DROPPED:-}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
   echo "ERROR: every case in ${BLOCKING_ROSTER_FILE} is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run with rung 4 disarmed for every case. Trim the exclusion list, or set BOOTSTRAP_ADMITTED explicitly if that is the intent." >&2
   exit 1
 fi
@@ -2889,6 +2995,107 @@ announce_suite_verdict() {
   return 1
 }
 
+# When the job started, for the rollback round trip's start-by bound: sets
+# EVAL_JOB_STARTED_EPOCH and EVAL_JOB_STARTED_FROM (what it was read from).
+# Prow's BUILD_ID is a Twitter snowflake whose top bits are milliseconds since
+# a fixed epoch, and it decodes to the pod's pendingTime within seconds
+# (scripts/pool_pressure.py, SNOWFLAKE_*, which scripts/test_pool_pressure.py
+# holds to recorded prowjobs): before the clone, the build and the deploy, so
+# an age read from it is never short. Without one that decodes to a time in
+# the last day, the fallback is this script's own entry less an allowance for
+# the deploy that ran before it as a separate script (about 45m on the next
+# lane), so the start-by arithmetic holds on that path too.
+readonly EVAL_SNOWFLAKE_EPOCH_MS=1288834974657
+readonly EVAL_SNOWFLAKE_TIMESTAMP_SHIFT=22
+readonly EVAL_JOB_START_MAX_AGE_SECONDS=86400
+readonly EVAL_JOB_START_DEPLOY_ALLOWANCE_SECONDS=2700
+job_started_epoch() {
+  local now decoded
+  now="$(date +%s)"
+  EVAL_JOB_STARTED_EPOCH=$((EVAL_SCRIPT_STARTED_EPOCH - EVAL_JOB_START_DEPLOY_ALLOWANCE_SECONDS))
+  EVAL_JOB_STARTED_FROM="this script's start less ${EVAL_JOB_START_DEPLOY_ALLOWANCE_SECONDS}s for the deploy; BUILD_ID gave none"
+  if [[ "${BUILD_ID:-}" =~ ^[0-9]{15,19}$ ]]; then
+    decoded=$((((10#${BUILD_ID} >> EVAL_SNOWFLAKE_TIMESTAMP_SHIFT) + EVAL_SNOWFLAKE_EPOCH_MS) / 1000))
+    if [ "${decoded}" -le "${now}" ] && [ $((now - decoded)) -le "${EVAL_JOB_START_MAX_AGE_SECONDS}" ]; then
+      EVAL_JOB_STARTED_EPOCH="${decoded}"
+      EVAL_JOB_STARTED_FROM="BUILD_ID ${BUILD_ID}"
+    fi
+  fi
+}
+
+# The rollback round trip, under EVAL_MODE_NEXT=1 only (the constants at the
+# top say why it runs and how long it may). Called after the suite step has
+# written eval-verdict.json and eval-verdict.md and captured SUITE_STATUS,
+# and before the final line announces them, so it can change neither: it
+# runs in a child process whose status it reports and then drops, and it
+# always returns 0. Its own section of this log, its own artifacts
+# (EVAL_ROLLBACK_LOG, the transcript; EVAL_ROLLBACK_RESULTS, the PASS/FAIL
+# lines and an outcome), and no case in the matrix.
+#
+# The flip replaces the agent pod, whose log and diagnostics the EXIT trap
+# collects, so the eval's are taken first; the gateway log collector keeps
+# the first capture of a process, so the trap does not overwrite it with the
+# replacement pod's. The pod and event watches keep running through the
+# round trip, and the diagnostics collector is re-armed under a prefix
+# before it starts: whatever ends the run after that (a pass, a failure, the
+# deadline's TERM), the EXIT trap stops the watch, whose tails then cover
+# the flip, and writes a rollback-* snapshot beside the eval's.
+#
+# The round trip runs in the background and is waited on, so a SIGTERM (the
+# job's deadline) reaches this script's trap during the wait rather than
+# after an hour: the handler here passes it on to the round trip, which
+# reports itself interrupted, and then exits 143 as the global trap does, so
+# the EXIT trap's collection still runs inside the grace period. The start-by
+# bound is on the job's age, so that handler is for a deadline that moved,
+# not for a slow deploy.
+run_rollback_roundtrip() {
+  if [ "${EVAL_MODE_NEXT:-}" != "1" ]; then
+    return 0
+  fi
+  local log="${ARTIFACT_DIR}/${EVAL_ROLLBACK_LOG}" results="${ARTIFACT_DIR}/${EVAL_ROLLBACK_RESULTS}"
+  local now job_age status=0 outcome
+  local -a bound=()
+  profile_begin "rollback round trip (report-only)"
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Rollback round trip (next -> today -> next), reported beside the eval verdict and not part of it ==="
+  : >"${results}" || true
+  job_started_epoch
+  now="$(date +%s)"
+  job_age=$((now - EVAL_JOB_STARTED_EPOCH))
+  if [ "${job_age}" -gt "${EVAL_ROLLBACK_START_BY_SECONDS}" ]; then
+    echo "SKIPPED: not enough time left in the job: it started ${job_age}s ago (${EVAL_JOB_STARTED_FROM}), past the ${EVAL_ROLLBACK_START_BY_SECONDS}s start-by bound, so the round trip's ${EVAL_ROLLBACK_TIMEOUT_SECONDS}s bound would not end inside the job's ${EVAL_ROLLBACK_JOB_DEADLINE_SECONDS}s deadline with room for the verdict and the teardown" | tee -a "${results}"
+    echo "OUTCOME: skipped" >>"${results}" || true
+    return 0
+  fi
+  echo "the job started ${job_age}s ago (${EVAL_JOB_STARTED_FROM}); inside the ${EVAL_ROLLBACK_START_BY_SECONDS}s start-by bound" | tee -a "${results}"
+  collect_gateway_log
+  collect_agent_pod_diagnostics --keep-watch
+  # Both read by collect_agent_pod_diagnostics (hack/ci-env.sh).
+  # shellcheck disable=SC2034
+  AGENT_DIAG_COLLECTED=""
+  # shellcheck disable=SC2034
+  AGENT_DIAG_PREFIX="rollback-"
+  if command -v timeout >/dev/null 2>&1; then
+    bound=(timeout --kill-after="${EVAL_ROLLBACK_KILL_AFTER_SECONDS}" "${EVAL_ROLLBACK_TIMEOUT_SECONDS}")
+  fi
+  # Streamed as it runs, and kept whole in its own file. timeout passes a
+  # TERM it receives on to the script.
+  ROLLBACK_KUBE_CONTEXT="${AGENT_CLUSTER_CONTEXT:-}" ROLLBACK_RESULTS_FILE="${results}" \
+    ${bound[@]+"${bound[@]}"} bash "${SCRIPT_DIR}/${EVAL_ROLLBACK_SCRIPT}" "${TARGET_NAMESPACE}" "${AGENT_SERVICE_NAME}" \
+    > >(tee "${log}") 2>&1 &
+  EVAL_ROLLBACK_PID=$!
+  trap 'kill -TERM "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; wait "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; exit 143' TERM INT
+  wait "${EVAL_ROLLBACK_PID}" || status=$?
+  trap 'exit 143' TERM INT
+  if [ "${status}" -eq 0 ]; then
+    outcome="passed"
+  else
+    outcome="failed (exit ${status})"
+  fi
+  echo "OUTCOME: ${outcome}" >>"${results}" || true
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Rollback round trip ${outcome}; report-only, so the eval verdict below is unchanged by it (transcript: ${log}) ==="
+  return 0
+}
+
 TOTAL_DURATION=$((SECONDS - START_TIME))
 SUITE_STATUS=0
 # From here the run writes its own verdict; the EXIT trap's cut-off report
@@ -2898,5 +3105,6 @@ EVAL_SUITE_REACHED=1
   "${CASE_RESULTS[@]}" \
   --markdown-out "${ARTIFACT_DIR}/eval-verdict.md" \
   --json-out "${ARTIFACT_DIR}/eval-verdict.json") || SUITE_STATUS=$?
+run_rollback_roundtrip || true
 announce_suite_verdict "${SUITE_STATUS}" "${ARTIFACT_DIR}/eval-verdict.json" \
   "${ARTIFACT_DIR}/eval-verdict.md" "${TOTAL_DURATION}" || exit $?

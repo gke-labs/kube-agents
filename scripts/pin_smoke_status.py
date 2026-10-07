@@ -38,10 +38,15 @@ success ProwJob the plugin creates; whichever is the latest, Tide reads it the
 way it reads a green, and so does this (a bare one has no base, which is a
 stale one). So a plain `/override` holds for the head it was given until a
 push whenever the sweep wins the race above, instead of having to be repeated
-after every merge to `main` (#1202). A lost race costs an override more than
-it costs a green: the retest is of a job that was overridden because it cannot
-pass, so it comes back red and the override has to be given again. Upstream's
-`/override-sticky` sentinel has no race, which is one more reason to switch.
+after every merge to `main` (#1202). A lost race no longer costs the override:
+the retest's step 0 (hack/ci-revalidate.sh) reads the status the Prow bot
+posts for the admin's `/override`, the one pointing at that comment, and
+reuses it as it does a green, so the retest exits green in
+seconds instead of running the job that was overridden because it cannot
+pass; the override then holds until a push (step 0 would honour an
+`/override-cancel`, which this Prow build lacks). Upstream's
+`/override-sticky` sentinel has no race at all, which is one more reason to
+switch.
 
 What it will not do: touch a status that is not `success`, pin a pull request
 that does not target `main` (Tide keys the base SHA on the pull request's own
