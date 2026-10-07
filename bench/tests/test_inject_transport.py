@@ -150,6 +150,11 @@ class _StubGatewayHandler(BaseHTTPRequestHandler):
         self.server.submissions.append(request)
         self.server.calls.append("submit")
         attempts = len(self.server.submissions)
+        if self.server.status_turn_status is not None and harness._INJECT_STATUS_TURN_SUFFIX in str(
+            request.get("messageId") or ""
+        ):
+            self._respond(self.server.status_turn_status, {"error": "status turn failed"})
+            return
         if self.server.submit_status is not None and (
             self.server.submit_failures < 0 or attempts <= self.server.submit_failures
         ):
@@ -296,6 +301,9 @@ class _StubGatewayServer(ThreadingHTTPServer):
     # bounds how many leading POSTs do (-1: all of them).
     submit_status: int | None = None
     submit_failures: int = -1
+    # Non-None makes a status-turn POST (carrying _INJECT_STATUS_TURN_SUFFIX)
+    # answer with that status instead.
+    status_turn_status: int | None = None
     # How many leading POSTs the stub accepts -- recorded, the task started
     # -- and then drops the connection on before the status line, which is
     # a tunnel dying between the door's accept and its reply.
@@ -2529,3 +2537,22 @@ def test_the_trace_is_taken_only_from_a_read_about_this_task() -> None:
     assert broken is not None
     task._note(fold, "task-1", broken)
     assert fold.activity_summary == {"calls": 1, "dropped": 0}
+
+
+def test_inject_status_turns_answered_failure_preserves_answered_count_without_infra(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When inject status turns answer with HTTP errors, answered=True propagates to the failure report."""
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "30")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0")
+    monkeypatch.setattr(harness, "delegated_task_ids", lambda _trajectory: ["t_1"])
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "")
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "the fleet is fine")
+    stub_gateway.status_turn_status = 500
+
+    result = KubeAgentsHarness().run("check the pods")
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "status turns failed with 3 answered, 0 in transport" in result.errors[0]
+    assert "t_1" in result.errors[0]
