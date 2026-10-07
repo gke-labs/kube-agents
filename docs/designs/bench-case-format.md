@@ -119,11 +119,11 @@ boolean: `"false"` is a string, and truthy, and the validator rejects it.
 ledger: a list of the Platform Agent job ids it starts
 (`audit_streams: [compliance-audit, stockout-prevention]`). The runner holds each one's stream
 lock for the whole unit, beside the stream a `ledger_issue_contains` check names
-(`hack/ci-eval-pr.sh`, `task_streams`), and releases them when devops-bench returns. So the
-stack's teardown has to wait for those runs to end as well; then an audit case on one of those
-streams does not run beside the case's runs and grade their ledger. `oobe-first-run-audits`
-carries the four it starts, and its teardown waits up to 40 minutes. devops-bench ignores the
-key.
+(`hack/ci-eval-pr.sh`, `task_streams`, reading the key with the YAML parser the lint uses), and
+releases them when devops-bench returns. A run that outlasts the unit is covered by the next
+unit on the stream, which waits for it first (`wait_platform_runs`), so an audit case does not
+run beside the case's runs and grade their ledger. `oobe-first-run-audits` carries the four it
+starts. devops-bench ignores the key.
 
 `verification_spec` is the exact half of the grade, and the rest of this document is
 mostly about it.

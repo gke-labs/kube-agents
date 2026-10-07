@@ -12,8 +12,7 @@
 # the stack set up and the verifier read.
 #
 # bench/tf/prebuilt/oobe-first-run-audits waits for the install's own first-run
-# stage to finish, then until none of the four audits is still running from an
-# earlier repetition, then files an archived stand-in sweep
+# stage to finish, then files an archived stand-in sweep
 # card and an archived ranking card after it, points `.bootstrap_scan_filed` at
 # the sweep, removes `.oobe_audits_fired`, and puts back the `oobe` job if the
 # deployed image ships one (an install that onboarded before the job existed never
@@ -28,12 +27,14 @@
 # files two archived cards, and adds and removes the `oobe` job. The four audits
 # it starts are real runs: each writes its ledger issue in the install's GitOps
 # repository and posts its summary wherever the install sends audit reports. The
-# runner holds their four streams' locks for the unit (`audit_streams` below) and
-# the teardown waits up to 40 minutes for the last run to end, so no audit case on
-# those streams runs beside them; a failed apply disarms without waiting. Other
-# stack-bearing cases are kept apart by the infra lock.
-# Eligible tier: nightly -- each repetition runs the four audits one after another
-# and waits for the previous repetition's to finish.
+# runner holds their four streams' locks for the unit (`audit_streams` below), and
+# every unit on one of those streams first waits up to 40 minutes for a run the
+# install started there, so no audit case runs beside them and the next repetition
+# arms only once they have ended. Other stack-bearing cases are kept apart by the
+# infra lock.
+# Eligible tier: nightly -- each repetition runs the four audits one after another,
+# after the previous repetition's have finished (the runner waits for them; run by
+# hand, the stage itself holds its first mark until they end).
 ---
 id: oobe-first-run-audits
 name: The first-run audits start as soon as the onboarding scan settles

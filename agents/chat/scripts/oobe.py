@@ -27,6 +27,10 @@ before it reads anything, so the stage records the skip and marks none.
 ``trigger_job`` also sets a job's ``enabled`` back to true, so an audit an operator
 has disabled or paused is left alone rather than started.
 
+A read that fails is never taken as an answer: a tick that cannot read the Platform
+Agent's run ledger or roster marks nothing and spends no attempt, and the next tick
+reads again.
+
 An install whose sweep was filed more than ``NEW_INSTALL_SECONDS`` ago while the
 stage has started nothing is not new: it onboarded before this job existed but
 never reached delivery, so the entrypoint could not tell. Its audits run on their
@@ -38,6 +42,7 @@ delivers locally and never speaks to the user.
 """
 
 import json
+import math
 import os
 import sqlite3
 import subprocess
@@ -174,7 +179,10 @@ def scan_filed(data_dir: Path) -> tuple[str, float] | None:
     try:
         filed_at = float(fields.get(MARKER_FILED_AT, ""))
     except ValueError:
-        # Hand-written or truncated: the marker's own age is the next best clock.
+        filed_at = math.nan
+    if not 0 < filed_at <= time.time():
+        # Hand-written, truncated, or not epoch seconds (milliseconds, nan, inf), any of which
+        # would stop both clocks: the marker's own age is the next best one.
         filed_at = marker.stat().st_mtime
     return fields.get(MARKER_TASK_ID, ""), filed_at
 
@@ -329,10 +337,10 @@ def retire() -> None:
         _log(f"could not remove the {OOBE_JOB_ID} job: {e}")
 
 
-def _runs(data_dir: Path, jobs: tuple[str, ...]) -> list[tuple[str, str, float]]:
+def _runs(data_dir: Path, jobs: tuple[str, ...]) -> list[tuple[str, str, float]] | None:
     """``(job, status, claimed_at)`` for every run of ``jobs`` in the Platform Agent's cron store.
 
-    An unreadable store reads as no runs.
+    None when the store cannot be read; a store not yet created has no runs.
     """
     ledger = data_dir / PROFILES_DIR / PLATFORM_PROFILE / CRON_DIR / EXECUTIONS_DB
     if not ledger.is_file():
@@ -353,7 +361,7 @@ def _runs(data_dir: Path, jobs: tuple[str, ...]) -> list[tuple[str, str, float]]
             conn.close()
     except sqlite3.Error as e:
         _log(f"cannot read {ledger}: {e}")
-        return []
+        return None
     runs = []
     for job_id, status, claimed, skip_reason in rows:
         if status == SKIPPED_STATUS and skip_reason != SKIP_ALREADY_RUNNING:
@@ -365,19 +373,15 @@ def _runs(data_dir: Path, jobs: tuple[str, ...]) -> list[tuple[str, str, float]]
     return runs
 
 
-def run_status(data_dir: Path, job_id: str, since: float) -> str | None:
+def run_status(runs: list[tuple[str, str, float]], job_id: str, since: float) -> str | None:
     """The status of the first run of ``job_id`` claimed at or after ``since``, or None if there is none."""
-    after = [status for _job, status, claimed in _runs(data_dir, (job_id,)) if claimed >= since]
+    after = [status for job, status, claimed in runs if job == job_id and claimed >= since]
     return after[0] if after else None
 
 
-def audits_in_flight(data_dir: Path, now: float) -> set[str]:
+def audits_in_flight(runs: list[tuple[str, str, float]], now: float) -> set[str]:
     """The first-run audits with a run still going, scheduled or marked, younger than the run limit."""
-    return {
-        job
-        for job, status, claimed in _runs(data_dir, FIRST_RUN_AUDITS)
-        if status in IN_FLIGHT_STATUSES and now - claimed < RUN_LIMIT_SECONDS
-    }
+    return {job for job, status, claimed in runs if status in IN_FLIGHT_STATUSES and now - claimed < RUN_LIMIT_SECONDS}
 
 
 def advance_chain(data_dir: Path, state: dict, now: float) -> dict:
@@ -400,10 +404,14 @@ def advance_chain(data_dir: Path, state: dict, now: float) -> dict:
         write_state(data_dir, new_state)
         return new_state
 
+    runs = _runs(data_dir, FIRST_RUN_AUDITS)
+    if runs is None:
+        # Not "nothing running": a mark made on a failed read can start an audit beside a live one.
+        return save()
     pending = [a for a in FIRST_RUN_AUDITS if a not in fired and a not in gave_up and a not in held]
     if current:
         job_id, marked_at = current[CURRENT_JOB], current[CURRENT_MARKED_AT]
-        status = run_status(data_dir, job_id, marked_at)
+        status = run_status(runs, job_id, marked_at)
         if status is None:
             if now - marked_at < START_LIMIT_SECONDS:
                 return save()
@@ -421,36 +429,38 @@ def advance_chain(data_dir: Path, state: dict, now: float) -> dict:
             return save(done=True)
         current = None
 
-    busy = audits_in_flight(data_dir, now)
+    busy = audits_in_flight(runs, now)
     if busy:
         # One of the four has a run going, whatever started it, including the run a mark found
         # already going; the chain waits its turn, as the schedule does.
         return save()
     holds = audit_holds(data_dir)
+    if holds is None:
+        # The Platform tick rewrites the roster every minute; a torn read is retried, not an attempt.
+        return save()
     for job_id in pending:
-        if job_id in marks and run_status(data_dir, job_id, marks[job_id]) is not None:
+        if job_id in marks and run_status(runs, job_id, marks[job_id]) is not None:
             # A mark the scheduler claimed only after it was counted as never started: that run
             # was this audit's, and marking it again would start a second.
             fired.append(job_id)
             continue
-        if holds is not None and job_id in holds:
+        if job_id in holds:
             _log(f"not starting {job_id}: {holds[job_id]}")
             held[job_id] = holds[job_id]
             continue
-        if holds is not None:
-            # Recorded before it is made: a restart between the two leaves a record of a mark that
-            # may not exist, which the start limit makes again, rather than a mark with no record,
-            # which would be made a second time once its run ended.
-            fired.append(job_id)
-            marks[job_id] = now
-            current = {CURRENT_JOB: job_id, CURRENT_MARKED_AT: now}
-            save()
-            if trigger(job_id, data_dir):
-                return save()
-            # The time stays in `marks`: a mark refused only after the store took it is adopted
-            # once its run turns up, by the check at the top of this loop.
-            fired.remove(job_id)
-            current = None
+        # Recorded before it is made: a restart between the two leaves a record of a mark that
+        # may not exist, which the start limit makes again, rather than a mark with no record,
+        # which would be made a second time once its run ended.
+        fired.append(job_id)
+        marks[job_id] = now
+        current = {CURRENT_JOB: job_id, CURRENT_MARKED_AT: now}
+        save()
+        if trigger(job_id, data_dir):
+            return save()
+        # The time stays in `marks`: a mark refused only after the store took it is adopted
+        # once its run turns up, by the check at the top of this loop.
+        fired.remove(job_id)
+        current = None
         attempts[job_id] = attempts.get(job_id, 0) + 1
         if attempts[job_id] >= MAX_TRIGGER_ATTEMPTS:
             _log(f"giving up on {job_id} after {MAX_TRIGGER_ATTEMPTS} attempts; it runs on its own schedule")

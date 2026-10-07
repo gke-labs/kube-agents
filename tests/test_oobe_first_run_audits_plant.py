@@ -15,41 +15,36 @@
 """The oobe-first-run-audits plant's in-pod scripts, run against stubs.
 
 `bench/tf/prebuilt/oobe-first-run-audits` arms the first-run audits stage with
-arm.py, undoes it with disarm.py, and waits on in_flight.py. Each runs here as it
+arm.py and undoes it with disarm.py. Each runs here as it
 does in the pod, `python3 - <args> < script`, against a stub `cron.jobs` over a
 JSON job store and a stub `hermes` that files and archives cards. Pinned: what the
 arm changes and records, that it puts back the `oobe` job only when the image ships
-one, that the disarm restores exactly what was there, and which runs count as in
-flight. The provisioners' bash is syntax-checked as Terraform renders it.
+one, and that the disarm restores exactly what was there. The provisioners' bash
+is syntax-checked as Terraform renders it, and the teardown is run against failing
+stubs.
 """
 
-import ast
 import json
 import os
 import pathlib
 import re
-import sqlite3
 import stat
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
-from datetime import datetime, timedelta, timezone
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 STACK = REPO / "bench" / "tf" / "prebuilt" / "oobe-first-run-audits"
-AUDITS = ["fleet-wide-cost-analysis", "compliance-audit", "obtainability-audit", "stockout-prevention"]
 OOBE_JOB = {"id": "oobe", "script": "oobe.py", "no_agent": True, "schedule": {"kind": "cron", "expr": "* * * * *"}}
 OTHER_JOB = {"id": "profile-cron-tick", "schedule": {"kind": "cron", "expr": "* * * * *"}}
-NOW = datetime.now(timezone.utc).isoformat()
-MINUTE = 60
-# in_flight.py's cutoff, read from source so the test follows it.
-STALE_SECONDS = eval(re.search(r"^STALE_SECONDS = (.+)$", (STACK / "in_flight.py").read_text(), re.M).group(1))
+HEREDOC = re.compile(r"command\s+=\s+<<-EOT\n(.*?)\n\s*EOT", re.S)
 
 
-def ago(seconds: int) -> str:
-    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+def render(script: str) -> str:
+    """A provisioner's bash as Terraform hands it over, every interpolation a placeholder."""
+    return re.sub(r"(?<!\$)\$\{[^}]*\}", "X", script).replace("$${", "${")
 
 CRON_JOBS_STUB = textwrap.dedent(
     """
@@ -270,63 +265,6 @@ class PlantScriptsTest(unittest.TestCase):
         (self.home / ".oobe_audits_fired").unlink()
         self.assertEqual(self._run("own_stage.py", str(self.home)).stdout.strip(), "clear")
 
-    # --- in flight --------------------------------------------------------------
-
-    def test_in_flight_counts_only_running_first_run_audits(self):
-        db = self.home / "profiles" / "platform" / "cron"
-        db.mkdir(parents=True)
-        with sqlite3.connect(db / "executions.db") as con:
-            con.execute("CREATE TABLE executions (id TEXT, job_id TEXT, status TEXT, claimed_at TEXT)")
-            con.executemany(
-                "INSERT INTO executions VALUES (?, ?, ?, ?)",
-                [
-                    ("1", "compliance-audit", "running", ago(STALE_SECONDS - MINUTE)),
-                    ("2", "obtainability-audit", "claimed", NOW),
-                    ("3", "stockout-prevention", "completed", NOW),
-                    ("4", "gce-compute-fleet-audit", "running", NOW),
-                    # Cut off by a gateway restart: still running, just past the cutoff.
-                    ("5", "fleet-wide-cost-analysis", "running", ago(STALE_SECONDS + MINUTE)),
-                ],
-            )
-        done = self._run("in_flight.py", str(self.home), *AUDITS)
-        self.assertEqual(done.stdout.strip(), "2", done.stderr)
-
-    def test_in_flight_counts_an_audit_marked_and_not_yet_claimed(self):
-        # The next profile-cron-tick starts it, so it is as good as running.
-        cron = self.home / "profiles" / "platform" / "cron"
-        cron.mkdir(parents=True)
-        roster = [
-            {"id": "compliance-audit", "enabled": True, "next_run_at": ago(MINUTE)},
-            {"id": "obtainability-audit", "enabled": True, "next_run_at": ago(-60 * MINUTE)},
-            {"id": "stockout-prevention", "enabled": False, "next_run_at": ago(MINUTE)},
-            {"id": "fleet-wide-cost-analysis", "enabled": True, "state": "paused", "next_run_at": ago(MINUTE)},
-            {"id": "gce-compute-fleet-audit", "enabled": True, "next_run_at": ago(MINUTE)},
-        ]
-        (cron / "jobs.json").write_text(json.dumps({"jobs": roster}))
-        done = self._run("in_flight.py", str(self.home), *AUDITS)
-        self.assertEqual(done.stdout.strip(), "1", done.stderr)
-
-    def test_in_flight_reads_odd_timestamps_as_the_tick_does(self):
-        # A naive stamp is local time; one that does not parse is due; a missing one is not.
-        cron = self.home / "profiles" / "platform" / "cron"
-        cron.mkdir(parents=True)
-        naive_past = (datetime.now() - timedelta(minutes=1)).replace(microsecond=0).isoformat()
-        roster = [
-            {"id": "compliance-audit", "enabled": True, "next_run_at": naive_past},
-            {"id": "obtainability-audit", "enabled": True, "next_run_at": "not a time"},
-            {"id": "stockout-prevention", "enabled": True},
-            {"id": "fleet-wide-cost-analysis", "enabled": True, "next_run_at": None},
-        ]
-        (cron / "jobs.json").write_text(json.dumps({"jobs": roster}))
-        with sqlite3.connect(cron / "executions.db") as con:
-            con.execute("CREATE TABLE executions (id TEXT, job_id TEXT, status TEXT, claimed_at TEXT)")
-            con.execute("INSERT INTO executions VALUES ('1', 'stockout-prevention', 'running', 'garbled')")
-        done = self._run("in_flight.py", str(self.home), *AUDITS)
-        self.assertEqual(done.stdout.strip(), "3", done.stderr)
-
-    def test_in_flight_with_no_store_is_zero(self):
-        self.assertEqual(self._run("in_flight.py", str(self.home), *AUDITS).stdout.strip(), "0")
-
     # --- the chain wait ----------------------------------------------------------
 
     def test_the_wait_is_skipped_on_an_image_without_the_job(self):
@@ -338,39 +276,35 @@ class PlantScriptsTest(unittest.TestCase):
     # --- the provisioners -------------------------------------------------------
 
     def test_the_provisioners_parse_as_bash(self):
-        text = (STACK / "main.tf").read_text()
-        scripts = re.findall(r"command\s+=\s+<<-EOT\n(.*?)\n\s*EOT", text, re.S)
+        scripts = HEREDOC.findall((STACK / "main.tf").read_text())
         # The apply and the teardown; a pattern that stops matching would otherwise check nothing.
         self.assertEqual(len(scripts), 2)
         for script in scripts:
-            rendered = re.sub(r"(?<!\$)\$\{[^}]*\}", "X", script).replace("$${", "${")
-            done = subprocess.run(["bash", "-n"], input=rendered, capture_output=True, text=True, check=False)
+            done = subprocess.run(["bash", "-n"], input=render(script), capture_output=True, text=True, check=False)
             self.assertEqual(done.returncode, 0, done.stderr)
 
-    def test_the_teardown_disarms_then_waits_for_the_audits(self):
-        # The runner releases the four streams' locks when devops-bench returns, after the
-        # teardown. Disarmed first, the oobe job marks nothing more; the audit still going,
-        # or marked and not yet claimed, then ends inside the locks.
-        text = (STACK / "main.tf").read_text()
-        teardown = re.findall(r"command\s+=\s+<<-EOT\n(.*?)\n\s*EOT", text, re.S)[1]
-        wait = teardown.index("self.triggers.busy_b64")
-        self.assertLess(teardown.index("self.triggers.disarm_b64"), wait)
-        self.assertIn("self.triggers.busy_wait", teardown[wait:])
-        # Under errexit a failed disarm would end the script before the wait.
-        disarm = teardown[teardown.index("self.triggers.disarm_b64"):wait]
-        self.assertIn("|| echo", disarm)
-
-    def test_the_stack_names_the_audits_the_stage_starts(self):
-        # Read both lists back from source, so a fifth audit added to either is caught.
-        stage = ast.parse((REPO / "agents" / "chat" / "scripts" / "oobe.py").read_text())
-        shipped = next(
-            ast.literal_eval(node.value)
-            for node in stage.body
-            if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "FIRST_RUN_AUDITS" for t in node.targets)
+    def test_the_teardown_still_disarms_when_the_credentials_cannot_be_fetched(self):
+        # Every step is best effort: a failed get-credentials warns and the disarm is still
+        # tried; a failed disarm warns and the teardown ends. The runner, not the teardown,
+        # waits for the audits the stage started.
+        teardown = HEREDOC.findall((STACK / "main.tf").read_text())[1]
+        self.assertNotIn("set -e", teardown)
+        self.assertNotIn("busy", teardown)
+        bin_dir = pathlib.Path(self._tmp.name) / "bin"
+        bin_dir.mkdir()
+        calls = pathlib.Path(self._tmp.name) / "calls"
+        for tool, code in (("gcloud", 1), ("kubectl", 1)):
+            stub = bin_dir / tool
+            stub.write_text(f'#!/bin/sh\necho {tool} >> "{calls}"\ncat > /dev/null\nexit {code}\n')
+            stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+        done = subprocess.run(
+            ["bash", "-c", render(teardown)],
+            capture_output=True, text=True, check=False,
+            env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
         )
-        stack = re.search(r'^\s*audits\s*=\s*"([^"]*)"', (STACK / "main.tf").read_text(), re.M).group(1).split()
-        self.assertEqual(list(shipped), stack)
-        self.assertEqual(list(shipped), AUDITS)
+        self.assertEqual(calls.read_text().split(), ["gcloud", "kubectl"], done.stderr)
+        self.assertIn("could not fetch credentials", done.stderr)
+        self.assertIn("could not disarm", done.stderr)
 
 
 if __name__ == "__main__":

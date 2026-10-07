@@ -25,21 +25,22 @@
 #
 # Before it arms, the apply waits for the install's own first-run stage to finish
 # (a fresh install has the job pending until its own scan settles), failing after
-# `own_wait`. It then waits until none of the four audits is still running
-# from an earlier repetition, since an audit already in flight is not started
-# again when it is marked due; it fails if they are still running after
-# `busy_wait`. An earlier run's arm left behind is disarmed first. After the arm it
+# `own_wait`. An earlier run's arm left behind is disarmed first. After the arm it
 # waits, up to `chain_wait`, for the stage to finish: it marks the audits one after
 # another, which outlasts the verifier's two-minute window. On an image without the
 # job there is nothing to wait for.
 #
+# Waiting on running audits is the runner's job, not this stack's: it holds the
+# four streams' locks for the unit (the case's `audit_streams`), and every unit on
+# one of them, the next repetition of this case included, first waits out a run
+# the install started there (hack/ci-eval-pr.sh: wait_platform_runs). So an audit
+# still going from an earlier repetition is finished before this apply, and the
+# last one the stage starts is finished before an audit case on its stream runs.
+#
 # The teardown, and the exit trap on a failed apply, run disarm.py: both markers
 # go back as they were and the `oobe` job comes out if this stack put it there.
-# The teardown then waits, up to `busy_wait`, for the audits the stage started
-# to finish, marked ones not yet claimed included: the runner holds their four streams' locks until devops-bench returns
-# (the case's `audit_streams`), so an audit case on one of them never runs beside
-# them. Each writes its ledger issue in the install's GitOps repository and posts
-# its summary where it always does.
+# The audits the stage started are left to finish. Each writes its ledger issue in
+# the install's GitOps repository and posts its summary where it always does.
 
 terraform {
   required_version = ">= 1.5.0"
@@ -52,14 +53,11 @@ terraform {
 }
 
 locals {
-  home   = "/opt/data"
-  hermes = "/opt/hermes/.venv/bin/hermes"
-  python = "/opt/hermes/.venv/bin/python3"
-  # agents/chat/scripts/oobe.py: FIRST_RUN_AUDITS.
-  audits     = "fleet-wide-cost-analysis compliance-audit obtainability-audit stockout-prevention"
+  home       = "/opt/data"
+  hermes     = "/opt/hermes/.venv/bin/hermes"
+  python     = "/opt/hermes/.venv/bin/python3"
   arm_b64    = base64encode(file("${path.module}/arm.py"))
   disarm_b64 = base64encode(file("${path.module}/disarm.py"))
-  busy_b64   = base64encode(file("${path.module}/in_flight.py"))
   own_b64    = base64encode(file("${path.module}/own_stage.py"))
   # One infra-lock deadline (hack/ci-eval-pr.sh): a fresh install's own scan usually settles
   # inside it, and holding the lock longer stalls every other stack-bearing case.
@@ -69,10 +67,7 @@ locals {
   # The chain runs the four audits one after another (1-15 minutes each), and the stage is
   # done once the last has started.
   chain_wait = 3600
-  # Each audit takes 9-15 minutes on its own (#985), and the chain runs one at a time, so
-  # the one still going when the chain is done finishes well inside this.
-  busy_wait = 2400
-  poll      = 30
+  poll       = 30
   # How long an exec into the agent Deployment waits for a pod when it has none.
   # A pod created in that time is not running yet and fails the exec anyway.
   pod_wait = 5
@@ -91,10 +86,6 @@ resource "null_resource" "oobe" {
     python        = local.python
     hermes        = local.hermes
     disarm_b64    = local.disarm_b64
-    busy_b64      = local.busy_b64
-    audits        = local.audits
-    busy_wait     = local.busy_wait
-    poll          = local.poll
   }
 
   provisioner "local-exec" {
@@ -145,9 +136,6 @@ resource "null_resource" "oobe" {
       disarm() {
         printf '%s' '${local.disarm_b64}' | base64 -d | agent_py "${local.home}" "${local.hermes}"
       }
-      in_flight() {
-        printf '%s' '${local.busy_b64}' | base64 -d | agent_py "${local.home}" ${local.audits}
-      }
 
       # ---- 1. Finish an earlier run's teardown ----------------------------
       disarm
@@ -165,25 +153,12 @@ resource "null_resource" "oobe" {
         elapsed=$((elapsed + ${local.poll}))
       done
 
-      # ---- 3. Wait for an earlier repetition's audits ---------------------
-      # Only a count is used: a failed exec or query prints nothing, and that
-      # is not "none running".
-      elapsed=0
-      until busy="$(in_flight)" && [ "$busy" = 0 ]; do
-        if [ "$elapsed" -ge ${local.busy_wait} ]; then
-          echo "ERROR: $${busy:-an unreadable count of} first-run audit(s) still running on ${var.host_cluster_name} after $${elapsed}s. An audit in flight is not started again, so this repetition could not be graded." >&2
-          exit 1
-        fi
-        sleep ${local.poll}
-        elapsed=$((elapsed + ${local.poll}))
-      done
-
-      # ---- 4. Arm ---------------------------------------------------------
+      # ---- 3. Arm ---------------------------------------------------------
       arming=1
       armed="$(printf '%s' '${local.arm_b64}' | base64 -d | agent_py "${local.home}" "${local.hermes}" "$(date -u +%Y%m%d%H%M%S)")"
       printf '%s\n' "$armed"
 
-      # ---- 5. Wait for the chain --------------------------------------------
+      # ---- 4. Wait for the chain --------------------------------------------
       # The stage marks the four audits one after another and is done once the last
       # has started. Whether or not it gets there in time, the verifier decides; this
       # only keeps its two-minute window from opening before the chain has run.
@@ -205,8 +180,10 @@ resource "null_resource" "oobe" {
     when        = destroy
     on_failure  = continue
     interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      set -euo pipefail
+    # Best effort, with no errexit: each step that fails says so and the next still
+    # runs. A disarm that cannot run is finished by the next apply's step 1.
+    command = <<-EOT
+      set -uo pipefail
       kubeconfig_dir="$(mktemp -d)"
       trap 'rm -rf "$kubeconfig_dir"' EXIT
       KUBECONFIG="$kubeconfig_dir/config"
@@ -217,33 +194,14 @@ resource "null_resource" "oobe" {
         project="$(gcloud config get-value project 2>/dev/null || true)"
       fi
       gcloud container clusters get-credentials "${self.triggers.host_cluster}" \
-        --location "${self.triggers.host_location}" --project "$project" --quiet
+        --location "${self.triggers.host_location}" --project "$project" --quiet \
+        || echo "WARNING: could not fetch credentials for ${self.triggers.host_cluster}; the disarm below will likely fail too." >&2
 
-      agent_py() {
-        kubectl exec -i -n "${self.triggers.namespace}" "deployment/${self.triggers.deployment}" \
+      printf '%s' '${self.triggers.disarm_b64}' | base64 -d \
+        | kubectl exec -i -n "${self.triggers.namespace}" "deployment/${self.triggers.deployment}" \
           -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
-          ${self.triggers.python} - "$@"
-      }
-
-      # Disarmed first, so the oobe job marks nothing more; then the runner,
-      # which releases the four streams' locks once this returns, waits for
-      # the audit still going, or marked and not yet claimed, to end. A count
-      # that cannot be read is not "none running"; past the bound it stops
-      # waiting.
-      # A failed disarm still waits: with the stage armed, the count below
-      # includes what it goes on marking, and the wait is bounded either way.
-      printf '%s' '${self.triggers.disarm_b64}' | base64 -d | agent_py "${self.triggers.home}" "${self.triggers.hermes}" \
-        || echo "WARNING: could not disarm the oobe stage; waiting for its audits anyway." >&2
-
-      elapsed=0
-      until busy="$(printf '%s' '${self.triggers.busy_b64}' | base64 -d | agent_py "${self.triggers.home}" ${self.triggers.audits})" && [ "$busy" = 0 ]; do
-        if [ "$elapsed" -ge ${self.triggers.busy_wait} ]; then
-          echo "WARNING: $${busy:-an unreadable count of} first-run audit(s) still running after $${elapsed}s; releasing the locks anyway." >&2
-          break
-        fi
-        sleep ${self.triggers.poll}
-        elapsed=$((elapsed + ${self.triggers.poll}))
-      done
+          ${self.triggers.python} - "${self.triggers.home}" "${self.triggers.hermes}" \
+        || echo "WARNING: could not disarm the oobe stage on ${self.triggers.host_cluster}; the next run of this case disarms it before it arms." >&2
     EOT
   }
 }

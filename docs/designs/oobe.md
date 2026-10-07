@@ -253,12 +253,14 @@ archived stand-in sweep card and an archived ranking card after it, points `.boo
 at the sweep, clears `.oobe_audits_fired`, and puts back the `oobe` job when the image ships one;
 the teardown restores both markers and the job as it found them.
 The stack then waits, up to an hour, for the stage to finish its chain, so the verifier's two-minute window opens after the last audit has started. The verifier reads the Platform Agent's cron run records and
-passes when the stage's `.oobe_audits_fired` lists all four audits as marked due and each has a run claimed since the stage marked it that is running or completed (a skipped row is passed over), so a scheduled run that falls in the window does not count, and each started only after the one before it in the chain ended. That is stricter than the stage: a mark that lands on a scheduled run it did not see start, a race the stack's wait for running audits makes rare, reads as no run. Red: on
+passes when the stage's `.oobe_audits_fired` lists all four audits as marked due and each has a run claimed since the stage marked it that is running or completed (a skipped row is passed over), so a scheduled run that falls in the window does not count, and each started only after the one before it in the chain ended. That is stricter than the stage: a mark that lands on a scheduled run it did not see start, a race the runner's wait for running audits makes rare, reads as no run. Red: on
 an image without the job, no audit runs. Green: four, in three repetitions. The case's runs are
 real audit runs on four streams, so it declares them (`audit_streams`) and the runner holds their
-locks for the unit, and its teardown waits up to 40 minutes for the last run to end, so the
-nightly's audit cases on those streams do not run beside it and grade its ledger. A run still going
-past that, or an apply that fails and disarms at once, can outlast the locks. The no-repository skip is unit-tested,
+locks for the unit. Every unit on an audit stream first waits, up to 40 minutes, for a run the
+install started there (`wait_platform_runs` in `hack/ci-eval-pr.sh`), so the nightly's audit cases
+do not run beside this case's last audit and grade its ledger, and the next repetition does not arm
+while it runs. The same wait covers the fresh CI install's own first-run audits and any scheduled
+run. A run still going past that bound can still overlap. The no-repository skip is unit-tested,
 not evaluated: the shared install has a repository, and removing it mid-run would break concurrent
 cases.
 

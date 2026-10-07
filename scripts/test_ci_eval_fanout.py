@@ -208,7 +208,8 @@ class DelegationCeilingTest(unittest.TestCase):
         # task lock while queued on lock-infra. The in-flight grace a
         # ledger-writing unit may spend before its run is in the per-case
         # figure too, so a holder that spends it does not push its waiter past
-        # the deadline.
+        # the deadline, and so is the wait for a run the install started on
+        # the unit's streams (wait_platform_runs).
         unit = lifted("run_one_unit")
         deadline = 'lock_deadline="$(stream_lock_deadline "${name}" "${audit_id}")"'
         ledgerless_stack = (
@@ -222,6 +223,8 @@ class DelegationCeilingTest(unittest.TestCase):
         self.assertIsNotNone(grace)
         allowance = re.search(r"^readonly UNIT_LOCK_ALLOWANCE_SECONDS=\d+$", SCRIPT.read_text(encoding="utf-8"), re.M)
         self.assertIsNotNone(allowance)
+        run_wait = re.search(r"^readonly EVAL_PLATFORM_RUN_WAIT_SECONDS=\d+$", SCRIPT.read_text(encoding="utf-8"), re.M)
+        self.assertIsNotNone(run_wait)
         self.assertIn('lock_acquire "${STATE_DIR}/lock-task-${name}" "${lock_deadline}"', unit)
         computed = deadline + "; " + ledgerless_stack + '; echo "${lock_deadline}"'
         body = "\n".join(
@@ -230,6 +233,7 @@ class DelegationCeilingTest(unittest.TestCase):
                 lifted("stream_lock_deadline"),
                 grace.group(0),
                 allowance.group(0),
+                run_wait.group(0),
                 'export AGENT_DELEGATION_TIMEOUT="2700"',
                 "INFRA_LOCK_DEADLINE=900",
                 'stream_case_count() { echo "${CASES_ON_STREAM}"; }',
@@ -241,7 +245,7 @@ class DelegationCeilingTest(unittest.TestCase):
                 "CASES_ON_STREAM=1 STACK_WAIT=0 name=capacity-pinned-pool-probe audit_id= has_stack=1\n" + computed,
             ]
         )
-        self.assertEqual(run_bash(body).stdout.split(), ["3900", "3600", "7800", "4800", "4500"])
+        self.assertEqual(run_bash(body).stdout.split(), ["6300", "6000", "12600", "7200", "6900"])
 
 
 class PerCaseGradingTest(unittest.TestCase):

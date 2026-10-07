@@ -14,6 +14,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import types
 from datetime import datetime, timezone
 import unittest
@@ -282,6 +283,20 @@ class StageTest(unittest.TestCase):
         self.assertEqual(self.started, [])
         self._main(now=mtime + oobe.fallback_seconds(0))
         self.assertEqual(self._started_ids(), FIRST)
+
+    def test_a_filed_at_that_is_not_epoch_seconds_falls_back_to_its_age(self):
+        # Milliseconds, nan and inf would each switch off the fallback and the not-new rule.
+        _board(self.board, [])
+        for value in (int(time.time() * 1000), "nan", "inf", "-5"):
+            with self.subTest(filed_at=value):
+                self.started.clear()
+                (self.d / oobe.AUDITS_MARKER).unlink(missing_ok=True)
+                (self.d / oobe.SCAN_FILED_MARKER).write_text(f"task_id={SWEEP_ID}\nfiled_at={value}\n", encoding="utf-8")
+                mtime = (self.d / oobe.SCAN_FILED_MARKER).stat().st_mtime
+                self._main(now=mtime + 60)
+                self.assertEqual(self.started, [])
+                self._main(now=mtime + oobe.fallback_seconds(0))
+                self.assertEqual(self._started_ids(), FIRST)
 
     # --- how it starts them ---------------------------------------------------
 
@@ -594,15 +609,41 @@ class StageTest(unittest.TestCase):
         })
         self.assertTrue(state[oobe.STATE_DONE])
 
-    def test_an_unreadable_roster_starts_nothing_and_counts_an_attempt(self):
-        (self.d / "profiles" / "platform" / "cron" / "jobs.json").write_text("{not json")
+    def test_an_unreadable_roster_starts_nothing_and_spends_no_attempt(self):
+        roster = self.d / "profiles" / "platform" / "cron" / "jobs.json"
+        good = roster.read_text()
+        roster.write_text("{not json")
         self._file_scan()
         _board(self.board, [_ranking("done")])
-        self._main()
+        for minute in range(oobe.MAX_TRIGGER_ATTEMPTS + 1):
+            self._main(now=NOW_SETTLED + minute * MINUTE)
         self.assertEqual(self.started, [])
         state = oobe.read_state(self.d)
         self.assertFalse(state[oobe.STATE_DONE])
-        self.assertEqual(state[oobe.STATE_ATTEMPTS], {FIRST[0]: 1})
+        self.assertEqual((state[oobe.STATE_ATTEMPTS], state[oobe.STATE_GAVE_UP]), ({}, []))
+        roster.write_text(good)
+        self._main(now=NOW_SETTLED + 10 * MINUTE)
+        self.assertEqual(self._started_ids(), FIRST)
+
+    def test_an_unreadable_ledger_is_not_nothing_running(self):
+        # Cost seen running clears `current`, so only the in-flight read holds the chain; a read
+        # that fails must hold it too, not mark compliance beside the live cost run.
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._main(now=NOW_SETTLED)
+        self._ledger(FIRST[0], "running", NOW_SETTLED + MINUTE)
+        self._main(now=NOW_SETTLED + 2 * MINUTE)
+        self.assertIsNone(oobe.read_state(self.d)[oobe.STATE_CURRENT])
+        ledger = self.d / "profiles" / "platform" / "cron" / oobe.EXECUTIONS_DB
+        rows = ledger.read_bytes()
+        ledger.write_text("not a database")
+        self._main(now=NOW_SETTLED + 3 * MINUTE)
+        self.assertEqual(self._started_ids(), FIRST)
+        self.assertEqual(oobe.read_state(self.d)[oobe.STATE_ATTEMPTS], {})
+        ledger.write_bytes(rows)
+        self._ledger(FIRST[0], "completed", NOW_SETTLED + 4 * MINUTE)
+        self._main(now=NOW_SETTLED + 5 * MINUTE)
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS[:2]))
 
     # --- no GitOps repository -------------------------------------------------
 

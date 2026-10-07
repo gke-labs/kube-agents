@@ -135,6 +135,17 @@ readonly EVAL_SANDBOX_EXEC_TIMEOUT="30s"
 readonly EVAL_SANDBOX_EXEC_ROUND_TRIP_SECONDS=60
 readonly EVAL_INFLIGHT_GRACE_SECONDS=300
 readonly EVAL_INFLIGHT_POLL_STEP_SECONDS=5
+# wait_platform_runs (beside release_inflight_note): the gateway's agent
+# container, the interpreter it runs the read with and the home holding the
+# Platform Agent's cron store, how long a unit waits for a run the install started on
+# one of its streams, and how often it looks. The wait outlasts one audit run
+# (9-15 minutes, #985) started just before the unit, with room for the
+# scheduler to claim a mark first.
+readonly EVAL_GATEWAY_CONTAINER="platform-agent"
+readonly EVAL_GATEWAY_PYTHON="/opt/hermes/.venv/bin/python3"
+readonly EVAL_GATEWAY_HOME="/opt/data"
+readonly EVAL_PLATFORM_RUN_WAIT_SECONDS=2400
+readonly EVAL_PLATFORM_RUN_POLL_SECONDS=30
 # What a unit's lock deadline allows past its delegation timeout, for the
 # stack, the verifier and the state writes around the run.
 readonly UNIT_LOCK_ALLOWANCE_SECONDS=600
@@ -996,37 +1007,15 @@ ledger_audit_id_for_task() { # <task.yaml, relative to BENCH_DIR or absolute>
   ' "${file}"
 }
 
-# The audit streams a case drives without grading their ledger: the top-level
-# `audit_streams:` list in its task.yaml, for a case whose stack starts real
-# audit runs (oobe-first-run-audits starts four). Its unit holds those streams'
-# locks too, so an audit case on one of them does not run beside it. Read as
-# the key's line and the indented lines under it, so a flow list prettier has
-# wrapped and a block list both read; a comment is dropped.
-declared_audit_streams_for_task() { # <task.yaml, relative to BENCH_DIR or absolute>
-  local file="$1"
-  case "${file}" in /*) ;; *) file="${BENCH_DIR}/${file}" ;; esac
-  [ -f "${file}" ] || return 0
-  awk '
-    function take(line) {
-      sub(/#.*/, "", line)
-      sub(/^[[:space:]]*-[[:space:]]+/, "", line)
-      gsub(/[^A-Za-z0-9_.-]+/, " ", line)
-      out = out " " line
-    }
-    /^[[:space:]]*(#|$)/ { next }
-    reading && /^[^[:space:]]/ { exit }
-    reading { take($0); next }
-    /^audit_streams:/ { reading = 1; line = $0; sub(/^audit_streams:/, "", line); take(line) }
-    END { n = split(out, ids, " "); s = ""; for (i = 1; i <= n; i++) s = s (s == "" ? "" : " ") ids[i]; print s }
-  ' "${file}"
-}
-
-# Every stream lock a case's unit holds: the stream it grades and any it
-# declares, sorted and each once, so a unit holding several always takes them
-# in the same order and two such units cannot each hold what the other waits on.
-task_streams() { # <task.yaml>
-  { ledger_audit_id_for_task "$1" 2>/dev/null; declared_audit_streams_for_task "$1" | tr ' ' '\n'; } \
-    | awk 'NF' | sort -u | tr '\n' ' ' | sed 's/ $//'
+# Every stream lock a case's unit holds: the stream it grades and the ones its
+# task.yaml declares in `audit_streams:` (a case whose stack starts real audit
+# runs; oobe-first-run-audits starts four), read with the YAML parser by
+# kube_agents_bench.audit_streams once before the fan-out. Sorted and each
+# once, so a unit holding several always takes them in the same order and two
+# such units cannot each hold what the other waits on.
+task_streams() { # <graded audit id> <declared audit ids>
+  # shellcheck disable=SC2086 # audit ids carry no spaces or glob characters
+  printf '%s\n' "$1" $2 | awk 'NF' | sort -u | tr '\n' ' ' | sed 's/ $//'
 }
 
 # Returns 0 whatever happens; the reason it could not reset is printed.
@@ -1202,6 +1191,49 @@ release_inflight_note() { # <label> <audit-id>
     # next write to the closed stream, which comes after its rm.
     [ "${rc}" -eq 124 ] && out="timed out after ${budget}s; the loop left in the pod may still remove the note${out:+; ${out}}"
     echo "WARNING: In-flight note (${label}): kubectl exec into ${ns}/${pod} exited ${rc} (${out}); the ${audit_id} stream keeps whatever note is on the sandbox, and a repetition refused at start prints START REFUSED naming it." >&2
+  fi
+  return 0
+}
+
+# A unit on an audit stream first waits for a run of that audit the install
+# started for itself: a scheduled one, or one the `oobe` stage marked due on a
+# fresh install or under oobe-first-run-audits. That run writes the stream's
+# ledger issue as the unit's own would, so resetting the ledger or clearing
+# the in-flight note under it would grade the unit against what two runs
+# wrote. hack/ci_platform_runs.py does the counting in the gateway (a mark not
+# yet claimed counts, an unreadable store counts as busy) and stops after
+# EVAL_PLATFORM_RUN_WAIT_SECONDS; the unit then runs as it did before the
+# wait. Pinned to AGENT_CLUSTER_CONTEXT and refused for a context that does
+# not name PROJECT_ID, as release_inflight_note is. Called once the unit holds
+# its stream locks and before the infra lock, so no other unit on the stream
+# starts during the wait and no tofu unit queues behind it.
+# Returns 0 whatever happens; the reason it could not wait is printed.
+wait_platform_runs() { # <label> <space-separated audit ids>
+  local label="$1" streams="$2" ns ctx out rc=0
+  ns="${TARGET_NAMESPACE:-}"
+  ctx="${AGENT_CLUSTER_CONTEXT:-}"
+  [ -n "${streams}" ] || return 0
+  if [ -z "${PROJECT_ID:-}" ] || [ -z "${ctx}" ] || [ -z "${ns}" ] || ! command -v kubectl >/dev/null 2>&1; then
+    echo "Platform runs (${label}): skipped, PROJECT_ID, AGENT_CLUSTER_CONTEXT, TARGET_NAMESPACE or kubectl is missing; not waiting on ${streams}"
+    return 0
+  fi
+  case "${ctx}" in
+    "gke_${PROJECT_ID}_"*) ;;
+    *)
+      echo "WARNING: Platform runs (${label}): skipped, AGENT_CLUSTER_CONTEXT=${ctx} does not name PROJECT_ID=${PROJECT_ID}; not waiting on ${streams}" >&2
+      return 0 ;;
+  esac
+  local bound=(timeout --foreground "$((EVAL_PLATFORM_RUN_WAIT_SECONDS + EVAL_SANDBOX_EXEC_ROUND_TRIP_SECONDS))")
+  command -v timeout >/dev/null 2>&1 || bound=()
+  # shellcheck disable=SC2086 # audit ids carry no spaces or glob characters
+  out="$(${bound[@]+"${bound[@]}"} kubectl --context "${ctx}" -n "${ns}" exec -i "deployment/${AGENT_SERVICE_NAME}-gateway" \
+    -c "${EVAL_GATEWAY_CONTAINER}" --request-timeout="${EVAL_SANDBOX_EXEC_TIMEOUT}" -- \
+    "${EVAL_GATEWAY_PYTHON}" - "${EVAL_GATEWAY_HOME}" "${EVAL_PLATFORM_RUN_WAIT_SECONDS}" "${EVAL_PLATFORM_RUN_POLL_SECONDS}" ${streams} \
+    < "${SCRIPT_DIR}/ci_platform_runs.py" 2>&1)" || rc=$?
+  if [ "${rc}" -eq 0 ]; then
+    echo "Platform runs (${label}) on ${streams}: ${out}"
+  else
+    echo "WARNING: Platform runs (${label}): kubectl exec into ${ns}/${AGENT_SERVICE_NAME}-gateway exited ${rc} (${out}); not waiting on ${streams}" >&2
   fi
   return 0
 }
@@ -2221,9 +2253,10 @@ unit_cost_hint() {
     # and the agent turn is a board read. Unmeasured; priced below the band
     # above because one card's worker is the whole of the wait.
     bootstrap-inventory-ranking-delivery) echo 600 ;;
-    # Tofu too: the stack waits for the previous repetition's audits to finish,
-    # then for the stage to run the four one after another (1-15 min each,
-    # #985; up to its chain_wait, 3600s). Unmeasured on CI.
+    # Tofu too: the unit waits for the previous repetition's audits to finish
+    # (wait_platform_runs), then the stack waits for the stage to run the four
+    # one after another (1-15 min each, #985; up to its chain_wait, 3600s).
+    # Unmeasured on CI.
     oobe-first-run-audits) echo 2400 ;;
     # The nightly-only full audits: 600-1300s a repetition on 2026-08-26,
     # planted-pdb's 962s the one clean measurement. Priced with the 900 band
@@ -2348,13 +2381,24 @@ unit_delegation_timeout() {
 # units would trample. Per TASK, not per repetition, so repetitions stay
 # comparable. Seeded-cluster reuse is opted into by the task's own stack --
 # only a stack declaring `variable "reuse_existing_cluster"` knows to plan
-# nothing when handed an existing cluster's name.
+# nothing when handed an existing cluster's name. The stream locks each
+# task's units hold (task_streams) are decided here too, from one YAML read
+# of every task's `audit_streams:`; a file that will not read stops the run,
+# since a unit that held none of its declared locks would run beside the
+# audit cases they keep out.
 TASK_NAMES=()
 TASK_REUSE=()
 TASK_HAS_STACK=()
+TASK_STREAMS=()
+if ! DECLARED_STREAMS="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.audit_streams "${TASKS[@]}")"; then
+  echo "ERROR: could not read the matrix's audit_streams (kube_agents_bench.audit_streams, above); the fan-out cannot tell which stream locks each unit holds, so the run does not start." >&2
+  exit 1
+fi
 for TASK in "${TASKS[@]}"; do
   TASK_NAME="$(basename "$(dirname "${TASK}")")"
   TASK_NAMES+=("${TASK_NAME}")
+  TASK_STREAMS+=("$(task_streams "$(ledger_audit_id_for_task "${TASK}" 2>/dev/null)" \
+    "$(printf '%s\n' "${DECLARED_STREAMS}" | awk -v c="${TASK_NAME}" '$1 == c { $1 = ""; print; exit }')")")
   TASK_STACK="$(task_stack "${BENCH_DIR}/${TASK}")"
   if [ -n "${TASK_STACK}" ]; then TASK_HAS_STACK+=("true"); else TASK_HAS_STACK+=(""); fi
   if [ -n "${SEEDED_TASK_CLUSTER}" ] && [ -n "${TASK_STACK}" ] \
@@ -2443,8 +2487,8 @@ lock_release() { rmdir "$1" 2>/dev/null || true; }
 stream_case_count() { # <audit-id>
   local n=0 t
   if [ -n "$1" ]; then
-    for t in "${TASKS[@]}"; do
-      case " $(task_streams "${t}") " in *" $1 "*) n=$((n + 1)) ;; esac
+    for t in "${TASK_STREAMS[@]}"; do
+      case " ${t} " in *" $1 "*) n=$((n + 1)) ;; esac
     done
   fi
   echo $(( n > 1 ? n : 1 ))
@@ -2460,7 +2504,7 @@ stream_stack_wait() { # <audit-id>
   if [ -n "$1" ]; then
     for i in "${!TASKS[@]}"; do
       if [ -n "${TASK_HAS_STACK[i]}" ]; then
-        case " $(task_streams "${TASKS[i]}") " in *" $1 "*) n=$((n + 1)) ;; esac
+        case " ${TASK_STREAMS[i]} " in *" $1 "*) n=$((n + 1)) ;; esac
       fi
     done
   fi
@@ -2469,9 +2513,11 @@ stream_stack_wait() { # <audit-id>
 
 # How long a unit waits for one stream's lock: the single-unit figure times the
 # cases holding the stream, plus the infra queue its stack-bearing ones may hold
-# it through. For the stream a case grades, or none, it is the task lock's too.
+# it through. The single-unit figure counts the holder's wait for the
+# install's own runs (wait_platform_runs) as well as its in-flight grace. For
+# the stream a case grades, or none, it is the task lock's too.
 stream_lock_deadline() { # <task-name> <audit-id>
-  echo $(( $(stream_case_count "$2") * ($(unit_delegation_timeout "$1") + UNIT_LOCK_ALLOWANCE_SECONDS + EVAL_INFLIGHT_GRACE_SECONDS) + $(stream_stack_wait "$2") ))
+  echo $(( $(stream_case_count "$2") * ($(unit_delegation_timeout "$1") + UNIT_LOCK_ALLOWANCE_SECONDS + EVAL_INFLIGHT_GRACE_SECONDS + EVAL_PLATFORM_RUN_WAIT_SECONDS) + $(stream_stack_wait "$2") ))
 }
 
 release_streams() { # <space-separated audit ids>
@@ -2582,8 +2628,8 @@ finish_case() { # <task-path> <task-name>
   lock_release "${STATE_DIR}/lock-grade"
 }
 
-run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:true|empty> <seq>
-  local task="$1" name="$2" rep="$3" reuse="$4" has_stack="$5" seq="$6"
+run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:true|empty> <seq> <streams>
+  local task="$1" name="$2" rep="$3" reuse="$4" has_stack="$5" seq="$6" streams="${7:-}"
   local log="/tmp/eval_${name}_rep${rep}.log"
   # A distinct local port per unit: the harness's port-forward is owned by
   # the process that spawned it and its atexit teardown would drop a shared
@@ -2618,9 +2664,8 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # queued on lock-infra, and no stream term counts that wait. The infra
   # lock keeps its default: it is taken last, after any stream wait, so it is
   # held only while this unit's own stack is in use.
-  local audit_id lock_deadline streams held="" s
+  local audit_id lock_deadline held="" s
   audit_id="$(ledger_audit_id_for_task "${task}")"
-  streams="$(task_streams "${task}")"
   lock_deadline="$(stream_lock_deadline "${name}" "${audit_id}")"
   if [ -z "${audit_id}" ] && [ -n "${has_stack}" ]; then
     lock_deadline=$(( lock_deadline + INFRA_LOCK_DEADLINE ))
@@ -2633,7 +2678,8 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # state files are written, released with the task lock below: two cases on
   # one stream (the consistency pair, the patch pair, the obtainability pair)
   # must not reset and rewrite each other's ledger mid-run. A unit holds every
-  # stream task_streams names, in its sorted order, the declared ones too.
+  # stream task_streams names, in its sorted order, the declared ones too,
+  # and then waits out a run the install started on one of them.
   # Each with its stream's scaled deadline: a waiter here outlasts the other
   # cases' units on the stream, infra queue included. Taken before the infra lock, not after: a stack-bearing unit that shares
   # its stream with a stackless one would otherwise sit on the infra lock for
@@ -2649,6 +2695,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     fi
     held="${held} ${s}"
   done
+  wait_platform_runs "${name} rep ${rep}" "${streams}"
   if [ -n "${has_stack}" ] && ! lock_acquire "${STATE_DIR}/lock-infra" "${INFRA_LOCK_DEADLINE}"; then
     release_streams "${streams}"
     lock_release "${STATE_DIR}/lock-task-${name}"
@@ -2849,7 +2896,7 @@ launch_units() { # <queue: "REP COST IDX" lines> <parallelism> <seconds before e
     sleep "${pause}"
     echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/${EVAL_REPETITIONS}"
     UNIT_SEQ=$((${UNIT_SEQ:-0} + 1))
-    run_one_unit "${TASKS[IDX]}" "${TASK_NAMES[IDX]}" "${REP}" "${TASK_REUSE[IDX]}" "${TASK_HAS_STACK[IDX]}" "${UNIT_SEQ}" &
+    run_one_unit "${TASKS[IDX]}" "${TASK_NAMES[IDX]}" "${REP}" "${TASK_REUSE[IDX]}" "${TASK_HAS_STACK[IDX]}" "${UNIT_SEQ}" "${TASK_STREAMS[IDX]}" &
   done <<EOF_UNIT_QUEUE
 ${queue}
 EOF_UNIT_QUEUE
