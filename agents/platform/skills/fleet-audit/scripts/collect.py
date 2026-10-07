@@ -3724,17 +3724,8 @@ _CONTROLLER_NODE_TAINT_KEYS = {
 def _pool_has_workload_taints(pool: dict) -> bool:
     config = pool.get("config") or {}
     for t in (config.get("taints") or []):
-        effect = (t.get("effect") or "").upper()
-        if effect in ("NO_SCHEDULE", "NO_EXECUTE", "NOSCHEDULE", "NOEXECUTE"):
-            key = t.get("key", "")
-            if key not in _CONTROLLER_NODE_TAINT_KEYS:
-                return True
-    return False
-
-
-def _node_has_workload_taints(node: dict) -> bool:
-    for t in (node.get("spec", {}).get("taints") or []):
-        if t.get("effect") in ("NoSchedule", "NoExecute"):
+        effect = (t.get("effect") or "").upper().replace("_", "")
+        if effect in ("NOSCHEDULE", "NOEXECUTE"):
             key = t.get("key", "")
             if key not in _CONTROLLER_NODE_TAINT_KEYS:
                 return True
@@ -3778,7 +3769,6 @@ def _namespace_has_default_compute_class(context: dict, ns_name: str) -> bool:
 def _is_untainted_gp_compute_class(
     cc: dict,
     node_pools: list[dict] | None = None,
-    nodes: list[dict] | None = None,
 ) -> bool:
     name = cc.get("metadata", {}).get("name", "")
     if name in ("autopilot", "autopilot-spot", "default") or name.startswith("autopilot-"):
@@ -3789,7 +3779,7 @@ def _is_untainted_gp_compute_class(
 
     spec = cc.get("spec") or {}
     taints = (spec.get("nodePoolConfig") or {}).get("taints") or []
-    if any((t.get("effect") or "").upper() in ("NO_SCHEDULE", "NO_EXECUTE", "NOSCHEDULE", "NOEXECUTE") for t in taints):
+    if any((t.get("effect") or "").upper().replace("_", "") in ("NOSCHEDULE", "NOEXECUTE") for t in taints):
         return False
 
     for prio in spec.get("priorities") or []:
@@ -3798,18 +3788,6 @@ def _is_untainted_gp_compute_class(
         for dim in prio.get("dimension") or []:
             if "nvidia.com/gpu" in str(dim) or "tpu" in str(dim):
                 return False
-
-    if not node_pools and nodes:
-        node_pools = [
-            {
-                "name": (n.get("metadata", {}).get("labels") or {}).get("cloud.google.com/gke-nodepool") or n.get("metadata", {}).get("name", ""),
-                "config": {
-                    "labels": n.get("metadata", {}).get("labels") or {},
-                    "taints": n.get("spec", {}).get("taints") or [],
-                },
-            }
-            for n in nodes
-        ]
 
     if node_pools:
         manual_pools = set()
@@ -3865,18 +3843,7 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
         if annotations.get("computeclass.cloud.google.com/is-default-class") == "true":
             return None
 
-    node_pools = context.get("node_pools")
-    if node_pools is None and context.get("nodes"):
-        node_pools = [
-            {
-                "name": (n.get("metadata", {}).get("labels") or {}).get("cloud.google.com/gke-nodepool") or n.get("metadata", {}).get("name", ""),
-                "config": {
-                    "labels": n.get("metadata", {}).get("labels") or {},
-                    "taints": n.get("spec", {}).get("taints") or [],
-                },
-            }
-            for n in context.get("nodes") or []
-        ]
+    node_pools = context.get("node_pools") or []
     if not node_pools:
         return None
 
@@ -3904,8 +3871,8 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
         for tol in tolerations:
             op = tol.get("operator", "Equal")
             key = tol.get("key")
-            taint_effect = (taint.get("effect") or "").upper()
-            tol_effect = (tol.get("effect") or "").upper()
+            taint_effect = (taint.get("effect") or "").upper().replace("_", "")
+            tol_effect = (tol.get("effect") or "").upper().replace("_", "")
             if op == "Exists" and not key:
                 if not tol_effect or tol_effect == taint_effect:
                     return True
@@ -3923,7 +3890,7 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
         config = pool.get("config") or {}
         taints = [
             t for t in (config.get("taints") or [])
-            if (t.get("effect") or "").upper() in ("NO_SCHEDULE", "NO_EXECUTE", "NOSCHEDULE", "NOEXECUTE")
+            if (t.get("effect") or "").upper().replace("_", "") in ("NOSCHEDULE", "NOEXECUTE")
             and t.get("key") not in _CONTROLLER_NODE_TAINT_KEYS
         ]
         if not taints:
@@ -7499,31 +7466,45 @@ def _collect_obtainability(cluster: dict, kubeconfig: Path, checks: tuple[CheckS
         cc_items = [i for i in cc_parsed["items"] if i.get("kind") == "ComputeClass"]
         dump.setdefault("items", []).extend(cc_items)
         context["compute_classes"] = cc_items
-        commands["untargeted-compute-class-workload"] = _record(
-            f"KUBECONFIG={kubeconfig} {shlex.join(cc_argv)}", cc_result
-        )
-        if cc_items and not cluster.get("autopilot"):
-            np_argv = [
-                "gcloud", "container", "node-pools", "list",
-                "--cluster", cluster["name"],
-                "--location", cluster["location"],
-                "--project", cluster["project"],
-                "--format", "json",
-            ]
-            np_parsed, np_result = run_and_gate(np_argv, kubeconfig, run=run)
-            if np_parsed is None:
-                raise GateFailure(
-                    f"node-pools list gate failed (rc={np_result.rc}): {np_result.stderr.strip()[:ERROR_EXCERPT_CHARS]}"
-                )
-            context["node_pools"] = np_parsed if isinstance(np_parsed, list) else []
+        if cluster.get("autopilot"):
+            commands.pop("untargeted-compute-class-workload", None)
+            context.setdefault("not_applicable", {})["untargeted-compute-class-workload"] = (
+                "Autopilot clusters manage node provisioning automatically and do not support "
+                "user-managed node pools bound to custom ComputeClasses."
+            )
         else:
-            context["node_pools"] = []
+            commands["untargeted-compute-class-workload"] = _record(
+                f"KUBECONFIG={kubeconfig} {shlex.join(cc_argv)}", cc_result
+            )
+            if cc_items:
+                np_argv = [
+                    "gcloud", "container", "node-pools", "list",
+                    "--cluster", cluster["name"],
+                    "--location", cluster["location"],
+                    "--project", cluster["project"],
+                    "--format", "json",
+                ]
+                np_parsed, np_result = run_and_gate(np_argv, kubeconfig, run=run)
+                if np_parsed is None:
+                    commands.pop("untargeted-compute-class-workload", None)
+                    stderr = np_result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
+                    context.setdefault("unevaluated", {})["untargeted-compute-class-workload"] = (
+                        f"{UNDETERMINED_PREFIX} `gcloud container node-pools list` exited {np_result.rc} "
+                        f"({stderr}), so node pool inventory could not be verified. "
+                        "This check cleared nothing on this cluster."
+                    )
+                else:
+                    context["node_pools"] = np_parsed if isinstance(np_parsed, list) else []
+            else:
+                context["node_pools"] = []
     elif RESOURCE_TYPE_ABSENT_MARKER in cc_result.stderr:
+        commands.pop("untargeted-compute-class-workload", None)
         context.setdefault("not_applicable", {})["untargeted-compute-class-workload"] = (
             "ComputeClass CRD is not installed on this cluster: "
             f"`kubectl get computeclasses -A` answered that the server does not serve the type."
         )
     else:
+        commands.pop("untargeted-compute-class-workload", None)
         stderr = cc_result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
         context.setdefault("unevaluated", {})["untargeted-compute-class-workload"] = (
             f"{UNDETERMINED_PREFIX} `kubectl get computeclasses -A` exited {cc_result.rc} "

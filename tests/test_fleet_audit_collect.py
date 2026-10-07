@@ -82,8 +82,8 @@ def deployment(name, ns="default", node_selector=None, node_affinity=None, toler
 class TestUntargetedComputeClassWorkload(unittest.TestCase):
     def setUp(self):
         self.cc = compute_class("standard-cc")
-        self.base_node = node(
-            "node-1",
+        self.base_pool = pool(
+            "pool-1",
             labels={"cloud.google.com/compute-class": "standard-cc"},
             taints=[],
         )
@@ -93,7 +93,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
         ctx = {
             "compute_classes": [self.cc],
-            "nodes": [self.base_node],
+            "node_pools": [self.base_pool],
             "namespaces": [self.ns],
         }
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
@@ -107,7 +107,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
         ctx = {
             "compute_classes": [self.cc, default_cc],
-            "nodes": [self.base_node],
+            "node_pools": [self.base_pool],
             "namespaces": [self.ns],
         }
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
@@ -118,7 +118,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
         ctx = {
             "compute_classes": [self.cc],
-            "nodes": [self.base_node],
+            "node_pools": [self.base_pool],
             "namespaces": [labeled_ns],
         }
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
@@ -129,7 +129,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
         ctx = {
             "compute_classes": [self.cc],
-            "nodes": [self.base_node],
+            "node_pools": [self.base_pool],
             "namespaces": [labeled_ns],
         }
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
@@ -141,7 +141,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         })[0]
         ctx = {
             "compute_classes": [self.cc],
-            "nodes": [self.base_node],
+            "node_pools": [self.base_pool],
             "namespaces": [self.ns],
         }
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
@@ -168,35 +168,35 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         })[0]
         ctx = {
             "compute_classes": [self.cc],
-            "nodes": [self.base_node],
+            "node_pools": [self.base_pool],
             "namespaces": [self.ns],
         }
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
         self.assertIsNone(hit)
 
     def test_negative_workload_tolerating_dedicated_tainted_pool(self):
-        gpu_node = node(
-            "gpu-node",
+        gpu_pool = pool(
+            "gpu-pool",
             labels={"accelerator": "nvidia-t4"},
-            taints=[{"key": "nvidia.com/gpu", "value": "present", "effect": "NoSchedule"}],
+            taints=[{"key": "nvidia.com/gpu", "value": "present", "effect": "NO_SCHEDULE"}],
         )
         wl = collect.normalize_workloads({
             "items": [deployment("gpu-worker", tolerations=[{"key": "nvidia.com/gpu", "operator": "Exists"}])]
         })[0]
         ctx = {
             "compute_classes": [self.cc],
-            "nodes": [self.base_node, gpu_node],
+            "node_pools": [self.base_pool, gpu_pool],
             "namespaces": [self.ns],
         }
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
         self.assertIsNone(hit)
 
     def test_negative_cluster_with_untainted_nodes_lacking_compute_class(self):
-        general_node = node("standard-node", labels={"node-role": "worker"}, taints=[])
+        general_pool = pool("standard-pool", labels={"node-role": "worker"}, taints=[])
         wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
         ctx = {
             "compute_classes": [self.cc],
-            "nodes": [self.base_node, general_node],
+            "node_pools": [self.base_pool, general_pool],
             "namespaces": [self.ns],
         }
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
@@ -206,7 +206,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
         ctx = {
             "compute_classes": [],
-            "nodes": [self.base_node],
+            "node_pools": [self.base_pool],
             "namespaces": [self.ns],
         }
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
@@ -216,7 +216,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
         ctx = {
             "compute_classes": [self.cc],
-            "nodes": [self.base_node],
+            "node_pools": [self.base_pool],
             "namespaces": [self.ns],
         }
         spec = collect.CheckSpec(
@@ -245,7 +245,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
         ctx = {
             "compute_classes": [burst_cc],
-            "nodes": [self.base_node],  # labeled standard-cc
+            "node_pools": [self.base_pool],  # labeled standard-cc
             "namespaces": [self.ns],
         }
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
@@ -254,15 +254,15 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         self.assertTrue(hit["multiple_compute_classes"])
 
     def test_controller_cordon_taint_on_non_cc_node_does_not_cause_false_major(self):
-        cordoned_non_cc_node = node(
+        cordoned_non_cc_pool = pool(
             "non-cc-1",
             labels={"node-role": "worker"},
-            taints=[{"key": "node.kubernetes.io/unschedulable", "effect": "NoSchedule"}],
+            taints=[{"key": "node.kubernetes.io/unschedulable", "effect": "NO_SCHEDULE"}],
         )
         wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
         ctx = {
             "compute_classes": [self.cc],
-            "nodes": [self.base_node, cordoned_non_cc_node],
+            "node_pools": [self.base_pool, cordoned_non_cc_pool],
             "namespaces": [self.ns],
         }
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
@@ -274,7 +274,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
         ctx = {
             "compute_classes": [self.cc, gpu_cc, tpu_cc],
-            "nodes": [self.base_node],
+            "node_pools": [self.base_pool],
             "namespaces": [self.ns],
         }
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
@@ -288,7 +288,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
         ctx = {
             "compute_classes": [self.cc, ap_cc, ap_spot_cc],
-            "nodes": [self.base_node],
+            "node_pools": [self.base_pool],
             "namespaces": [self.ns],
         }
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
@@ -317,7 +317,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         })[0]
         ctx = {
             "compute_classes": [self.cc],
-            "nodes": [self.base_node],
+            "node_pools": [self.base_pool],
             "namespaces": [self.ns],
         }
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
@@ -393,7 +393,7 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
         ctx = {
             "compute_classes": [self.cc, dedicated_cc],
-            "nodes": [self.base_node],
+            "node_pools": [self.base_pool],
             "namespaces": [self.ns],
         }
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
@@ -403,15 +403,15 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
 
     def test_compute_class_referencing_tainted_manual_nodepool_is_excluded(self):
         manual_pool_cc = compute_class("manual-pool-cc", priorities=[{"nodepools": ["pool-a"]}])
-        pool_a_node = node(
-            "node-pool-a",
+        pool_a = pool(
+            "pool-a",
             labels={"cloud.google.com/gke-nodepool": "pool-a", "cloud.google.com/compute-class": "standard-cc"},
-            taints=[{"key": "workload-specific", "value": "true", "effect": "NoSchedule"}],
+            taints=[{"key": "workload-specific", "value": "true", "effect": "NO_SCHEDULE"}],
         )
         wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
         ctx = {
             "compute_classes": [self.cc, manual_pool_cc],
-            "nodes": [self.base_node, pool_a_node],
+            "node_pools": [self.base_pool, pool_a],
             "namespaces": [self.ns],
         }
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
@@ -421,15 +421,15 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
 
     def test_compute_class_with_all_labeled_nodes_carrying_workload_taint_is_excluded(self):
         custom_cc = compute_class("custom-tainted")
-        custom_node = node(
-            "custom-node",
+        custom_pool = pool(
+            "custom-pool",
             labels={"cloud.google.com/compute-class": "custom-tainted"},
-            taints=[{"key": "workload-pin", "value": "special", "effect": "NoSchedule"}],
+            taints=[{"key": "workload-pin", "value": "special", "effect": "NO_SCHEDULE"}],
         )
         wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
         ctx = {
             "compute_classes": [self.cc, custom_cc],
-            "nodes": [self.base_node, custom_node],
+            "node_pools": [self.base_pool, custom_pool],
             "namespaces": [self.ns],
         }
         hit = collect.check_untargeted_compute_class_workload(wl, ctx)
@@ -438,24 +438,24 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         self.assertFalse(hit["multiple_compute_classes"])
 
     def test_tolerations_keyless_exists_with_effect_distinction(self):
-        dedicated_non_cc = node(
+        dedicated_non_cc = pool(
             "non-cc-dedicated",
             labels={"node-role": "worker"},
-            taints=[{"key": "dedicated-pool", "effect": "NoSchedule"}],
+            taints=[{"key": "dedicated-pool", "effect": "NO_SCHEDULE"}],
         )
-        # Pod tolerates Exists with effect NoExecute -> does NOT tolerate NoSchedule -> flags
+        # Pod tolerates Exists with effect NoExecute -> does NOT tolerate NO_SCHEDULE -> flags
         wl_noexec = collect.normalize_workloads({
             "items": [deployment("api-noexec", tolerations=[{"operator": "Exists", "effect": "NoExecute"}])]
         })[0]
         ctx = {
             "compute_classes": [self.cc],
-            "nodes": [self.base_node, dedicated_non_cc],
+            "node_pools": [self.base_pool, dedicated_non_cc],
             "namespaces": [self.ns],
         }
         hit = collect.check_untargeted_compute_class_workload(wl_noexec, ctx)
         self.assertIsNotNone(hit)
 
-        # Pod tolerates Exists with effect NoSchedule -> DOES tolerate NoSchedule -> does not flag
+        # Pod tolerates Exists with effect NoSchedule -> DOES tolerate NO_SCHEDULE -> does not flag
         wl_nosched = collect.normalize_workloads({
             "items": [deployment("api-nosched", tolerations=[{"operator": "Exists", "effect": "NoSchedule"}])]
         })[0]
@@ -463,51 +463,51 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
         self.assertIsNone(hit_nosched)
 
     def test_transient_controller_and_cloud_provider_taints_on_non_cc_nodes(self):
-        ca_node = node(
+        ca_pool = pool(
             "non-cc-ca",
             labels={"node-role": "worker"},
-            taints=[{"key": "ToBeDeletedByClusterAutoscaler", "effect": "NoSchedule"}],
+            taints=[{"key": "ToBeDeletedByClusterAutoscaler", "effect": "NO_SCHEDULE"}],
         )
         wl = collect.normalize_workloads({"items": [deployment("api")]})[0]
         ctx_ca = {
             "compute_classes": [self.cc],
-            "nodes": [self.base_node, ca_node],
+            "node_pools": [self.base_pool, ca_pool],
             "namespaces": [self.ns],
         }
         self.assertIsNone(collect.check_untargeted_compute_class_workload(wl, ctx_ca))
 
-        spot_node = node(
+        spot_pool = pool(
             "non-cc-spot",
             labels={"node-role": "worker"},
-            taints=[{"key": "cloud.google.com/impending-node-termination", "effect": "NoSchedule"}],
+            taints=[{"key": "cloud.google.com/impending-node-termination", "effect": "NO_SCHEDULE"}],
         )
         ctx_spot = {
             "compute_classes": [self.cc],
-            "nodes": [self.base_node, spot_node],
+            "node_pools": [self.base_pool, spot_pool],
             "namespaces": [self.ns],
         }
         self.assertIsNone(collect.check_untargeted_compute_class_workload(wl, ctx_spot))
 
-        uninit_node = node(
+        uninit_pool = pool(
             "non-cc-uninit",
             labels={"node-role": "worker"},
-            taints=[{"key": "node.cloudprovider.kubernetes.io/uninitialized", "effect": "NoSchedule"}],
+            taints=[{"key": "node.cloudprovider.kubernetes.io/uninitialized", "effect": "NO_SCHEDULE"}],
         )
         ctx_uninit = {
             "compute_classes": [self.cc],
-            "nodes": [self.base_node, uninit_node],
+            "node_pools": [self.base_pool, uninit_pool],
             "namespaces": [self.ns],
         }
         self.assertIsNone(collect.check_untargeted_compute_class_workload(wl, ctx_uninit))
 
-        win_node = node(
+        win_pool = pool(
             "non-cc-win",
             labels={"node-role": "worker"},
-            taints=[{"key": "node.kubernetes.io/os", "value": "windows", "effect": "NoSchedule"}],
+            taints=[{"key": "node.kubernetes.io/os", "value": "windows", "effect": "NO_SCHEDULE"}],
         )
         ctx_win = {
             "compute_classes": [self.cc],
-            "nodes": [self.base_node, win_node],
+            "node_pools": [self.base_pool, win_pool],
             "namespaces": [self.ns],
         }
         self.assertIsNotNone(collect.check_untargeted_compute_class_workload(wl, ctx_win))
@@ -645,9 +645,40 @@ class TestUntargetedComputeClassWorkload(unittest.TestCase):
                     (spec,),
                     run=MagicMock(),
                 )
-                # On Autopilot, node-pools list is skipped because it returns 400
+                # On Autopilot, node-pools list is skipped because it returns 400; check is marked not_applicable
                 self.assertEqual(1, mock_run_and_gate.call_count)
-                self.assertEqual([], cc_context.context.get("node_pools"))
+                self.assertIn("untargeted-compute-class-workload", cc_context.context.get("not_applicable", {}))
+                self.assertNotIn("untargeted-compute-class-workload", cc_context.commands)
+
+    def test_collect_obtainability_node_pools_failure_sets_unevaluated(self):
+        spec = collect.CheckSpec(
+            "untargeted-compute-class-workload",
+            "workload",
+            collect.check_untargeted_compute_class_workload,
+            "major",
+            None,
+            "impact description",
+        )
+        fake_dump = {"items": [deployment("api"), self.ns]}
+        tmp_dump = self._create_dump_file(fake_dump)
+        cc_stdout = json.dumps({"items": [self.cc]})
+        with patch.object(collect, "dump_state") as mock_dump:
+            mock_dump.return_value = (tmp_dump, MagicMock(rc=0, duration_s=0.1, stdout="{}"), True)
+
+            with patch.object(collect, "run_and_gate") as mock_run_and_gate:
+                mock_run_and_gate.side_effect = [
+                    ({"items": [self.cc]}, MagicMock(rc=0, duration_s=0.05, stdout=cc_stdout)),
+                    (None, MagicMock(rc=1, stderr="ERROR: (gcloud.container.node-pools.list) Quota exceeded")),
+                ]
+                cc_context = collect._collect_obtainability(
+                    {"name": "c1", "project": "p1", "location": "l1"},
+                    Path("/fake/kubeconfig"),
+                    (spec,),
+                    run=MagicMock(),
+                )
+                # A failure on node-pools list does not gate-fail the cluster; it sets unevaluated
+                self.assertIn("untargeted-compute-class-workload", cc_context.context.get("unevaluated", {}))
+                self.assertNotIn("untargeted-compute-class-workload", cc_context.commands)
 
 
 if __name__ == "__main__":
