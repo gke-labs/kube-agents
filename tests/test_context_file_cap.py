@@ -19,8 +19,9 @@ Two ways that comes back, one check each:
 
 The rule itself is not restated here: what Hermes does with the pinned value is checked
 against the Hermes the image ships, by the build-time assertion in deploy/docker/Dockerfile
-(the platform stage's last RUN). This file is the half that needs no Hermes, so it runs in
-CI, where hermes-agent is not installed.
+(the platform stage's last RUN). That same RUN also asserts that Hermes auto-titling is
+disabled (_auto_title_enabled() is False) for each profile config (#2523). This file is the
+half that needs no Hermes, so it runs in CI, where hermes-agent is not installed.
 """
 
 import pathlib
