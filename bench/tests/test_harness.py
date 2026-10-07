@@ -201,10 +201,14 @@ class _StubAgentHandler(BaseHTTPRequestHandler):
         headers = {}
         if self.server.session_id:
             headers["X-Hermes-Session-Id"] = self.server.session_id
+        fail_headers = dict(getattr(self.server, "fail_headers", {}))
+        if self.server.session_id:
+            fail_headers.setdefault("X-Hermes-Session-Id", self.server.session_id)
         if len(self.server.requests) in self.server.fail_on:
             self._respond(
                 self.server.fail_on_status,
                 json.dumps({"error": {"message": "agent went away"}}).encode(),
+                fail_headers,
             )
         elif (
             self.server.fail_after is not None
@@ -213,7 +217,7 @@ class _StubAgentHandler(BaseHTTPRequestHandler):
             self._respond(503, json.dumps({"error": {"message": "agent went away"}}).encode())
         elif self.server.fail_with is not None:
             body = json.dumps({"error": {"message": "agent exploded"}}).encode()
-            self._respond(self.server.fail_with, body, headers)
+            self._respond(self.server.fail_with, body, fail_headers)
         elif self.server.turns:
             # A multi-turn script; the last entry repeats once exhausted so an
             # over-eager poll loop shows up as extra requests, not a 500.
@@ -259,6 +263,7 @@ class _StubAgentServer(ThreadingHTTPServer):
     # Status the ``fail_on`` ordinals answer with. 503 by default so the
     # dropped-keepalive tests read as they did before 502 became interesting.
     fail_on_status: int = 503
+    fail_headers: dict[str, str] = {}
     raw_body: bytes | None = None
     session_id: str | None = _SESSION_ID
     session_row: dict[str, Any] = _SESSION_ROW
@@ -278,6 +283,7 @@ def stub_agent(monkeypatch: pytest.MonkeyPatch) -> Generator[_StubAgentServer, N
     server.get_auths = []
     server.requests = []
     server.turns = []
+    server.fail_headers = {}
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     monkeypatch.setenv("AGENT_LOCAL_PORT", str(server.server_address[1]))
@@ -1303,6 +1309,27 @@ def test_an_opening_turn_500_is_infrastructure_not_an_answer(
     assert "agent exploded" in result.errors[0]
     assert result.output == ""
     assert result.trajectory == []
+    assert len(stub_agent.requests) == 1
+
+
+def test_an_opening_turn_500_with_failure_reason_is_an_agent_error_not_infra(
+    stub_agent: _StubAgentServer,
+) -> None:
+    """An opening-turn 5xx carrying X-Hermes-Failure-Reason is graded, not infra.
+
+    When the agent turn ran and failed, the server sets X-Hermes-Failure-Reason
+    (via apply_api_failure_reason_header). Because a turn executed, the 5xx is
+    a graded agent failure rather than an unexecuted infrastructure crash.
+    """
+    stub_agent.fail_with = 500
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "tool_error"}
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "HTTP 500" in result.errors[0]
+    assert result.errors[0] in result.output
     assert len(stub_agent.requests) == 1
 
 
@@ -3319,7 +3346,7 @@ def test_a_card_wake_answer_turn_500_is_an_agent_error_not_infra(
     On a question-wake repetition, the wake turn has already executed,
     replied, and been billed. A subsequent 500 on the answer turn does not
     discard the graded wake reply as infrastructure; it returns an errored
-    turn so the wake reply remains graded.
+    turn so the wake reply remains graded, preserving the wake turn reply.
     """
     scripts: list[str] = []
     monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
@@ -3332,6 +3359,32 @@ def test_a_card_wake_answer_turn_500_is_an_agent_error_not_infra(
     assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
     assert "HTTP 500" in result.errors[0]
     assert len(stub_agent.requests) == 2
+    assert result.output == _FINAL_TEXT
+    assert _archived(scripts)
+
+
+def test_a_fresh_session_replay_answer_turn_500_is_an_agent_error_not_infra(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    """A 5xx on a fresh-session answer turn remains an agent error, not infra.
+
+    When session: fresh is requested, the answer turn runs via
+    _execute_fresh_answer. A 500 on request 2 must remain an errored agent
+    turn rather than being classified as infrastructure, preserving the wake
+    turn's reply and grading.
+    """
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _fresh_shell(scripts))
+    stub_agent.fail_on = frozenset({2})
+    stub_agent.fail_on_status = 500
+
+    result = KubeAgentsHarness().run(_FRESH_PROMPT)
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "HTTP 500" in result.errors[0]
+    assert len(stub_agent.requests) == 2
+    assert result.output == _FINAL_TEXT
     assert _archived(scripts)
 
 

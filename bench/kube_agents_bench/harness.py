@@ -142,7 +142,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -617,6 +617,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({}))
 
 _SESSION_ID_HEADER = "X-Hermes-Session-Id"
+_FAILURE_REASON_HEADER = "X-Hermes-Failure-Reason"
 
 # The session lookup only refines accounting, so it never inherits the agent's
 # (minutes-long) budget: a hung route would be billed as the agent's latency.
@@ -1207,10 +1208,12 @@ class _TransportError(RuntimeError):
         message: str,
         *,
         status_code: int | None = None,
+        headers: Any = None,
         retryable: bool = False,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.headers = headers
         self.retryable = retryable
 
 
@@ -1224,12 +1227,13 @@ class _TransportError(RuntimeError):
 # exhaustion both turn paths deliberately end in _infra_failure rather than
 # grading a partial record: see _DelegationTransportExhausted for why settling
 # the cards into a record that is about to be replaced wholesale is not a
-# Every other status is an answer about the request itself and
-# repeating the request cannot change it, 500 included: a handler that raised
-# will raise again. On the opening turn, where no envelope came back, an
-# unretryable 5xx (such as 500) is classified as infrastructure rather than
-# an answer (#2430), following the inject lane's door-500 precedent
-# (test_inject_transport.py).
+# rescue. A client error (non-429 4xx) or a body that is not JSON is an
+# answer about the request itself and repeating the request cannot change it:
+# a handler that raised will raise again, so those remain graded agent errors.
+# On the opening turn, an unretryable 5xx (such as 500) where the server failed
+# before running the agent turn and without setting X-Hermes-Failure-Reason is
+# classified as infrastructure rather than an agent answer (#2430); a 5xx that
+# carries a failure reason or occurs on subsequent turns remains graded.
 _RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
 
 
@@ -1272,6 +1276,7 @@ def _post_turn(
         raise _TransportError(
             f"HTTP {exc.code} from agent endpoint: {_http_error_detail(exc)}",
             status_code=exc.code,
+            headers=exc.headers,
             retryable=exc.code in _RETRYABLE_STATUSES,
         ) from exc
     except (OSError, http.client.HTTPException, ValueError) as exc:
@@ -1552,14 +1557,25 @@ class KubeAgentsHarness(AgentHarness):
                 result, session_id = _post_turn(url, body, headers, timeout)
                 break
             except _TransportError as exc:
-                # An HTTP 5xx on the opening turn returns no reply envelope.
-                # Rather than grading the door crash as an agent answer, the gate
-                # treats an opening-turn 5xx as infrastructure (#2430), mirroring
-                # the inject lane's door-500 precedent (test_inject_transport.py).
-                # Subsequent turns (such as a card-wake answer turn where the
-                # wake turn already replied and billed) follow the standard
-                # errored path so executed work remains graded.
-                if opening_turn and exc.status_code is not None and 500 <= exc.status_code < 600:
+                # An HTTP 5xx on the opening turn where the server failed
+                # before running the agent turn and without setting
+                # X-Hermes-Failure-Reason returns no reply envelope and no
+                # executed turn. Rather than grading the door crash as an
+                # agent answer, the gate treats this unexecuted 5xx as
+                # infrastructure (#2430). If the server set X-Hermes-Failure-Reason
+                # (meaning the agent turn ran and failed), or if this is a
+                # subsequent turn (such as a card-wake answer turn where the
+                # wake turn already replied and billed), the error follows the
+                # standard errored path so executed work remains graded.
+                has_failure_reason = bool(
+                    exc.headers and exc.headers.get(_FAILURE_REASON_HEADER)
+                )
+                if (
+                    opening_turn
+                    and exc.status_code is not None
+                    and 500 <= exc.status_code < 600
+                    and not has_failure_reason
+                ):
                     if not exc.retryable:
                         return _infra_failure(str(exc))
                 # A 4xx other than 429, or a body that is not JSON says a handler
