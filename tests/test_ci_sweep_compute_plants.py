@@ -1289,9 +1289,9 @@ class MainCliTest(unittest.TestCase):
             report_path = tf.name
 
         try:
-            sweep_err = sweep.SweepError("proj-1: error sweeping")
+            sweep_err = sweep.SweepError("proj-other: error sweeping")
             with (
-                mock.patch.object(sweep.boskos_pool, "acquire", return_value="proj-1"),
+                mock.patch.object(sweep.boskos_pool, "acquire", return_value="proj-other"),
                 mock.patch.object(sweep.boskos_pool, "release_settled"),
                 mock.patch.object(sweep, "sweep_project", side_effect=sweep_err),
             ):
@@ -1299,7 +1299,7 @@ class MainCliTest(unittest.TestCase):
                 self.assertEqual(code, 1)
                 data = json.loads(pathlib.Path(report_path).read_text(encoding="utf-8"))
                 self.assertEqual(data["exit"], "failed")
-                self.assertEqual(data["failures"]["proj-1"], "proj-1: error sweeping")
+                self.assertEqual(data["failures"]["proj-other"], "proj-other: error sweeping")
         finally:
             pathlib.Path(report_path).unlink(missing_ok=True)
 
@@ -1390,10 +1390,14 @@ class BoskosAcquireByNameTest(unittest.TestCase):
         self.assertIn("acquire by name expects a single project name", str(ctx.exception))
 
     def test_boskos_acquire_mismatched_name_raises_boskos_error(self):
-        with mock.patch.object(sweep.boskos_pool, "_call", return_value=[{"name": "proj-other"}]):
+        with (
+            mock.patch.object(sweep.boskos_pool, "_call", return_value=[{"name": "proj-other"}]),
+            mock.patch.object(sweep.boskos_pool, "release") as mock_release,
+        ):
             with self.assertRaises(sweep.boskos_pool.BoskosError) as ctx:
                 sweep.boskos_pool.acquire("http://fake-boskos", "owner", "cleaning", name="proj-1")
             self.assertIn("acquire requested 'proj-1' but Boskos returned 'proj-other'", str(ctx.exception))
+            mock_release.assert_called_once_with("http://fake-boskos", "owner", "proj-other")
 
 
 if __name__ == "__main__":

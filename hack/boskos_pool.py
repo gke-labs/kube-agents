@@ -154,6 +154,10 @@ def acquire(server, owner, hold_state, name=None):
         raise
     ret_name = (resource or {}).get("name") or None
     if name is not None and ret_name is not None and ret_name != name:
+        try:
+            release(server, owner, ret_name)
+        except Exception:
+            pass
         raise BoskosError("acquire requested %r but Boskos returned %r" % (name, ret_name))
     return ret_name
 
