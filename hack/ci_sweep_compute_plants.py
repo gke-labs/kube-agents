@@ -20,11 +20,13 @@ networking audit evaluations (SOP 2.1) to file false positive critical
 `subnet-ip-exhaustion` findings.
 
 This script sweeps Compute addresses, subnets, and networks whose
-`description` starts with `kube-agents-bench plant`. Gating is rooted on the
-VPC network: plant networks older than `max_age_hours` (default: 4 hours) are
-selected along with their child plant subnets and internal addresses, while
-plant subnets and addresses attached to non-plant networks (or orphaned) are
-gated on their own creation timestamp.
+`description` starts with `kube-agents-bench plant`. In `--project` mode, it
+acquires the named project from Boskos out of `free` into `cleaning` and refuses
+if it is leased or busy, ensuring active evaluation runs are not swept. Gating is
+rooted on the VPC network: plant networks older than `max_age_hours` (default: 4 hours,
+with unparseable or missing timestamps treated as old) are selected along with their
+child plant subnets and internal addresses, while plant subnets and addresses attached
+to non-plant networks (or orphaned) are gated on their own creation timestamp.
 
 Deletion order is strictly dependency-ordered:
 1. Addresses go first (releasing in-use IP reservations on the subnet).
@@ -98,10 +100,15 @@ def parse_timestamp(ts_str: str | None) -> datetime | None:
 
 
 def is_older_than(ts_str: str | None, max_age_hours: float, now: datetime | None = None) -> bool:
-    """Check if the given GCP creationTimestamp is older than max_age_hours."""
+    """Check if the given GCP creationTimestamp is older than max_age_hours.
+
+    An unreadable or missing creationTimestamp on a plant resource is treated
+    as old so an unparseable timestamp does not leave leftover plant leaks
+    unselected forever.
+    """
     dt = parse_timestamp(ts_str)
     if dt is None:
-        return False
+        return True
     if now is None:
         now = datetime.now(timezone.utc)
     return (now - dt).total_seconds() >= max_age_hours * SECONDS_PER_HOUR
@@ -515,7 +522,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=description)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--pool", action="store_true", help="sweep every project Boskos reports free")
-    mode.add_argument("--project", help="sweep one project, without asking Boskos")
+    mode.add_argument("--project", help="sweep one project after acquiring it from Boskos")
     parser.add_argument(
         "--max-age-hours",
         type=parse_max_age_hours,
@@ -554,13 +561,30 @@ def main(argv=None) -> int:
 
     try:
         if args.project:
-            try:
-                res = sweep_project(args.project, max_age_hours=args.max_age_hours, dry_run=args.dry_run)
-                run["deleted"][args.project] = {
+            boskos_reset_stranded(args.boskos_server)
+            release_failures = {}
+
+            def visit(p):
+                res = sweep_project(p, max_age_hours=args.max_age_hours, dry_run=args.dry_run)
+                run["deleted"][p] = {
                     "addresses": len(res.get("addresses", [])),
                     "subnets": len(res.get("subnets", [])),
                     "networks": len(res.get("networks", [])),
                 }
+
+            outcome = None
+            try:
+                outcome = boskos_pool.acquire_and_hold(
+                    args.boskos_server,
+                    args.boskos_owner,
+                    BOSKOS_SWEEP_STATE,
+                    lambda: boskos_pool.acquire(
+                        args.boskos_server, args.boskos_owner, BOSKOS_SWEEP_STATE, name=args.project
+                    ),
+                    visit,
+                    release_failures,
+                    heartbeat=True,
+                )
             except SweepError as exc:
                 code = 1
                 error = str(exc)
@@ -583,6 +607,19 @@ def main(argv=None) -> int:
                     }
                 run["failures"][args.project] = str(exc)
                 raise
+            finally:
+                if args.project in release_failures:
+                    code = 1
+                    err_msg = f"release failed: {release_failures[args.project]}"
+                    run["failures"][args.project] = err_msg
+                    if not error:
+                        error = err_msg
+
+            if outcome is boskos_pool.NOT_ACQUIRED:
+                code = 1
+                error = f"project {args.project} is not free in Boskos (leased or busy)"
+                run["failures"][args.project] = error
+                print(f"ERROR: {error}", file=sys.stderr)
         else:
             projects = pool_projects(args.ci_deploy_script)
             deleted, failures, unmapped = sweep_pool(
