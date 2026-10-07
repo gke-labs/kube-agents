@@ -1332,6 +1332,23 @@ def test_an_opening_turn_502_with_failure_reason_is_an_agent_error_not_infra(
     assert len(stub_agent.requests) == 1
 
 
+def test_an_opening_turn_502_with_empty_failure_reason_is_an_agent_error_not_infra(
+    stub_agent: _StubAgentServer,
+) -> None:
+    """An opening-turn 502 with present but empty failure reason is graded on attempt 1."""
+    stub_agent.fail_with = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": ""}
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "HTTP 502" in result.errors[0]
+    assert "unknown" in result.errors[0]
+    assert result.errors[0] in result.output
+    assert len(stub_agent.requests) == 1
+
+
 def test_an_opening_turn_502_with_rate_limit_reason_is_infra(
     stub_agent: _StubAgentServer,
 ) -> None:
@@ -2548,6 +2565,24 @@ def test_a_status_turn_502_with_tool_error_is_graded_without_retrying(
     assert recorded_pf_resets == []
 
 
+def test_a_status_turn_502_with_empty_failure_reason_is_graded_without_retrying(
+    stub_agent: _StubAgentServer, instant_polls: None, recorded_pf_resets: list[int]
+) -> None:
+    """A status turn 502 with present but empty failure reason is graded on attempt 1."""
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    stub_agent.fail_on = frozenset({2})
+    stub_agent.fail_on_status = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": ""}
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "agent error (unknown)" in result.errors[0]
+    assert len(stub_agent.requests) == 2
+    assert recorded_pf_resets == []
+
+
 def test_a_status_turn_502_with_rate_limit_is_infra_without_retrying(
     stub_agent: _StubAgentServer,
     instant_polls: None,
@@ -3532,7 +3567,7 @@ def test_a_status_turn_bare_transport_exhaustion_on_answer_turn_is_infra(
     When a card-wake answer turn dispatches work and three consecutive status
     polls fail in transport without an X-Hermes-Failure-Reason header (e.g.
     bare 502 Bad Gateway while upstream pod is replaced), _await_delegated_work
-    raises _DelegationTransportExhausted with failure_reason=None. Because this
+    raises _DelegationTransportExhausted. Because this
     is transport failure that never reached an agent, it is classified as
     infrastructure (_infra_failure) with INFRA_FAILURE_MARKER on both opening
     and answer turns.
