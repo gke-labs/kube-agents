@@ -502,6 +502,17 @@ class TestTheValidatorItself(unittest.TestCase):
             self.assertIn("rejected", dirty.getvalue())
 
 
+class TestTheCatalogueDeclaresEverySlot(unittest.TestCase):
+    def test_every_role_names_a_declared_cluster_slot(self):
+        # `_catalog_slots` reads the `cluster_slots` block alone; a role on a slot the block
+        # does not declare would make every `{cluster:<slot>}` for it a finding.
+        catalog = validator._catalog()
+        declared = validator._catalog_slots(catalog)
+        named = {spec["cluster_slot"] for spec in catalog["roles"].values() if isinstance(spec, dict) and "cluster_slot" in spec}
+        self.assertTrue(named, "no role names a slot")
+        self.assertLessEqual(named, declared, f"roles name slots the catalogue's cluster_slots block does not declare: {sorted(named - declared)}")
+
+
 class TestTheRulesReject(unittest.TestCase):
     """Every rule, against a case built to break exactly that rule.
 
@@ -797,6 +808,37 @@ class TestTheRulesReject(unittest.TestCase):
         self.assertIn("bootstrap_findings", problem)
         # a mapping with no placeholder is not read as one
         self.assertEqual(self._validate(verification_spec=self._entry(check={"type": "bootstrap_findings", "expected_findings": [{"check": "x", "object": "y"}]})), [])
+
+    def test_a_recursive_anchor_in_a_check_field_is_walked_once(self):
+        # `safe_load` builds the cycle (`&m [{object: *m}]` is a list whose one mapping holds
+        # the list); the walker reads each container once on the way down and stops.
+        loop: list = []
+        loop.append({"check": "{cluster:a}", "object": loop, "again": {"deep": loop, "s": "y"}})
+        self.assertEqual(validator._strings_under(loop), ["{cluster:a}", "y"])
+        text = yaml.safe_dump(self.VALID).replace(
+            "verification_spec:",
+            "verification_spec:\n- name: loops\n  role: objective\n  check:\n    type: bootstrap_findings\n    expected_findings: &m\n    - check: x\n      object: *m\n",
+        )
+        problems = self._validate(text=text)  # no RecursionError; whatever else the shape earns is a finding
+        self.assertIsInstance(problems, list)
+
+    def test_a_self_aliasing_checks_list_is_a_finding_not_a_traceback(self):
+        # The compound-check walker has no bottom on `checks: &c [*c]`; validate_all turns the
+        # RecursionError into that case's finding so the other cases still report.
+        text = yaml.safe_dump(self.VALID).replace(
+            "verification_spec:",
+            "verification_spec:\n- name: loops\n  role: objective\n  check: &c\n    type: all_of\n    checks: [*c]\n",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "made-up-case" / "task.yaml"
+            path.parent.mkdir()
+            path.write_text(text)
+            with self.assertRaises(RecursionError):
+                validator.validate_case("made-up-case", path, registered={"made-up-case"})
+            with unittest.mock.patch.object(validator, "bench_cases", return_value={"made-up-case": path}), unittest.mock.patch.object(validator, "registered_cases", return_value={"made-up-case"}):
+                results = validator.validate_all()
+        self.assertEqual(len(results["made-up-case"]), 1, results)
+        self.assertIn("aliased from inside its own value", results["made-up-case"][0])
 
     def test_a_malformed_cluster_placeholder_is_rejected(self):
         self._only(

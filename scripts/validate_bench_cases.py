@@ -526,13 +526,10 @@ def _catalog() -> dict[str, Any]:
 
 
 def _catalog_slots(catalog: dict[str, Any]) -> set[str]:
-    """Cluster slots the catalogue declares, by its `cluster_slots` block and
-    by the slot every role names."""
-    slots = set((catalog.get("cluster_slots") or {}).keys())
-    for spec in (catalog.get("roles") or {}).values():
-        if isinstance(spec, dict) and isinstance(spec.get("cluster_slot"), str):
-            slots.add(spec["cluster_slot"])
-    return slots
+    """Cluster slots the catalogue declares in its `cluster_slots` block, the
+    one place a slot is defined; every role's `cluster_slot` names one of them
+    (scripts/test_task_registration.py pins that)."""
+    return set((catalog.get("cluster_slots") or {}).keys())
 
 
 def _cluster_placeholders(node: Any, where: str, problems: list[str], slots: set[str], parked: bool) -> None:
@@ -582,16 +579,19 @@ def _cluster_placeholders(node: Any, where: str, problems: list[str], slots: set
         _cluster_placeholders(child, where, problems, slots, parked)
 
 
-def _strings_under(raw: Any) -> list[str]:
+def _strings_under(raw: Any, ancestors: frozenset[int] = frozenset()) -> list[str]:
     """Every string in a value: the scalar itself, a list's items, a mapping's
-    values, nested to any depth, in document order."""
+    values, nested to any depth, in document order. A container already on the
+    path down to it is not entered again: `safe_load` builds a list or mapping
+    that a YAML anchor aliases from inside itself, and walking that cycle would
+    end in a RecursionError rather than a finding."""
     if isinstance(raw, str):
         return [raw]
-    if isinstance(raw, list):
-        return [s for item in raw for s in _strings_under(item)]
-    if isinstance(raw, dict):
-        return [s for item in raw.values() for s in _strings_under(item)]
-    return []
+    if not isinstance(raw, (list, dict)) or id(raw) in ancestors:
+        return []
+    below = ancestors | {id(raw)}
+    items = raw if isinstance(raw, list) else raw.values()
+    return [s for item in items for s in _strings_under(item, below)]
 
 
 def _catalog_roles(catalog: dict[str, Any]) -> dict[str, Any]:
@@ -1199,6 +1199,11 @@ def validate_all() -> dict[str, list[str]]:
             results[name] = validate_case(name, path, registered=registered)
         except CaseError as exc:
             results[name] = [str(exc)]
+        except RecursionError:
+            # A YAML anchor aliased from inside itself (`checks: &c [*c]`) gives a
+            # rule that walks the tree no bottom; one such file is a finding
+            # against that case, not a traceback that hides every other case's.
+            results[name] = [f"{path}: a YAML anchor is aliased from inside its own value, so the file has no finite shape to validate; break the cycle"]
     for name, problems in greet_phrase_collisions(cases).items():
         results[name].extend(problems)
     # The retired parking state: a case path inside a roster-file comment. It
