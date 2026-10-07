@@ -22,8 +22,9 @@ networking audit evaluations (SOP 2.1) to file false positive critical
 This script provides out-of-band cleanup (manually via `--project`
 or `--pool`, and designed for a future Prow periodic on `main`) to sweep Compute
 addresses, subnets, and networks whose `description` starts with
-`kube-agents-bench plant` and whose creation timestamp is older than
-`max_age_hours` (default: 4 hours). Note: this sweeper is currently inert
+`kube-agents-bench plant`. Gating is rooted on the VPC network: plant networks
+older than `max_age_hours` (default: 4 hours) are selected along with their matching
+child subnets and internal addresses. Note: this sweeper is currently inert
 until bench planter stacks in #2468 land with the matching description prefix.
 
 Deletion order is strictly dependency-ordered:
@@ -480,7 +481,7 @@ def main(argv=None) -> int:
         "--max-age-hours",
         type=float,
         default=DEFAULT_MAX_AGE_HOURS,
-        help=f"minimum age in hours of plant resources to sweep (default: {DEFAULT_MAX_AGE_HOURS})",
+        help=f"minimum age in hours of plant networks to sweep (default: {DEFAULT_MAX_AGE_HOURS})",
     )
     parser.add_argument("--dry-run", action="store_true", help="report what would be deleted, delete nothing")
     parser.add_argument(

@@ -2,7 +2,8 @@
 
 Verifies that:
 1. Resource identification strictly matches the fixed description prefix
-   ("kube-agents-bench plant") and requires creationTimestamp older than max_age_hours.
+   ("kube-agents-bench plant") with age gating rooted on the parent VPC network
+   (and standalone/orphan resources).
 2. Deletion order is strictly dependency-ordered:
    Addresses -> Subnets -> Networks.
 3. Regional vs global addresses are correctly scoped.
@@ -806,6 +807,11 @@ class WriteReportTest(unittest.TestCase):
 class MainCliTest(unittest.TestCase):
     def setUp(self):
         super().setUp()
+        # No --report and no ARTIFACTS from the shell: a main() run here writes no file.
+        env = {k: v for k, v in sweep.os.environ.items() if k != sweep.ARTIFACTS_ENV}
+        env_patch = mock.patch.dict(sweep.os.environ, env, clear=True)
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
         self._orig_signals = {
             sig: sweep.signal.getsignal(sig)
             for sig in sweep.boskos_pool.TERMINATION_SIGNALS
@@ -815,6 +821,16 @@ class MainCliTest(unittest.TestCase):
         for sig, handler in self._orig_signals.items():
             sweep.signal.signal(sig, handler)
         super().tearDown()
+
+    def test_main_without_report_or_artifacts_writes_no_file(self):
+        """A run without --report and without ARTIFACTS writes no report file."""
+        with (
+            mock.patch.object(sweep, "sweep_project", return_value={"addresses": [], "subnets": [], "networks": []}),
+            mock.patch.object(sweep, "write_report") as mock_write,
+        ):
+            code = sweep.main(["--project", "p1"])
+            self.assertEqual(code, 0)
+            mock_write.assert_called_once_with(None, mock.ANY, mock.ANY, 0, None, mock.ANY)
 
     def test_signals_installed(self):
         with (
