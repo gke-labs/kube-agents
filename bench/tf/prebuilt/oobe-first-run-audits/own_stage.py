@@ -25,19 +25,15 @@ import json
 import os
 import sys
 
-from cron.jobs import load_jobs
+from cron.jobs import is_job_runnable, load_jobs
 
 home = sys.argv[1]
 AUDITS_MARKER = os.path.join(home, ".oobe_audits_fired")
 JOB_ID = "oobe"
 DONE_KEY = "done"
-PAUSED_STATE = "paused"
 
 # A disabled or paused job never runs, so it never finishes: nothing to wait for.
-present = any(
-    job.get("id") == JOB_ID and job.get("enabled", True) and job.get("state") != PAUSED_STATE and not job.get("paused_at")
-    for job in load_jobs()
-)
+present = any(job.get("id") == JOB_ID and is_job_runnable(job) for job in load_jobs())
 try:
     with open(AUDITS_MARKER, encoding="utf-8") as fh:
         done = bool(json.load(fh).get(DONE_KEY))

@@ -260,12 +260,12 @@ passes when the stage's `.oobe_audits_fired` lists all four audits as marked due
 an image without the job, no audit runs. Green: four, in three repetitions. The case's runs are
 real audit runs on four streams, so it declares them (`audit_streams`) and the runner holds their
 locks for the unit. Every unit on an audit stream first waits, up to 40 minutes, while the install
-has a run of that audit claimed, running or marked due, a pending stage is to mark it next, or a
+has a run of that audit claimed, running or marked due, a stage under way is to mark it next, or a
 stage this case armed and could not disarm has still to run it (`wait_platform_runs` in
 `hack/ci-eval-pr.sh`). That keeps the nightly's audit cases from running beside this case's last
 audit or a run the fresh CI install started itself, and holds the next repetition's arm until the
-last run ends. A fresh install's chain is waited on only for the audit it marks next, which costs a
-case at most about one audit run: an audit the chain reaches later, after the case's run holds the
+last run ends. A fresh install's chain is waited on only once it has started, and only for the audit
+it marks next, which costs a case at most about one audit run: an audit the chain reaches later, after the case's run holds the
 stream's in-flight note, has its `start` refused, and only between two repositories of a run can
 the install's run take the stream and leave the case's run partial. Waiting out the whole chain
 would hold every audit case on those streams for most of an hour on every CI run. The no-repository skip is unit-tested,

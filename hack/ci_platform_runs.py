@@ -13,11 +13,12 @@ claimed, since the next profile-cron-tick starts it. A row claimed more than
 at running for good, and no audit takes that long. Anything it cannot read counts
 as busy, so a failed read is waited out rather than taken as idle.
 
-While the Chat Agent's `oobe` stage is pending, the audit it marks next counts
-too, before it is marked: a unit that started then would have its own worker's
+While the Chat Agent's `oobe` stage has started its chain and is not done, the
+audit it marks next counts too, before it is marked: a unit that started then would have its own worker's
 `start` refused once the stage's run took the stream's in-flight note. Only the
-next one: waiting out the whole chain would hold every audit case on those streams
-for most of an hour. While the oobe-first-run-audits stack has the stage armed (its
+next one, and only once the chain has started (before that the stage waits on the
+onboarding scan, for as long as an hour and more): waiting out the scan or the whole
+chain would hold every audit case on those streams for most of an hour. While the oobe-first-run-audits stack has the stage armed (its
 state file is there: the chain overran or the teardown could not disarm), every
 audit the stage has still to run counts. An audit has had its turn once the stage
 has marked it and its run has ended, or it was held or given up on. The stage's
@@ -129,6 +130,8 @@ def stage_pending():
     remaining = [audit for audit in stage_audits() if audit not in had_turn]
     if os.path.exists(STACK_STATE):
         return {f"{audit} (armed oobe stage)" for audit in remaining if audit in audits}
+    if not state:
+        return set()
     return {f"{audit} (oobe stage, next)" for audit in remaining[:1] if audit in audits}
 
 

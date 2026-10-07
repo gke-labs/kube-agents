@@ -68,6 +68,10 @@ CRON_JOBS_STUB = textwrap.dedent(
 
     def remove_job(job_id):
         save_jobs([j for j in load_jobs() if j.get("id") != job_id])
+
+    # The pinned Hermes' contract (tests/test_bootstrap_ranking_plant.py, is_job_runnable).
+    def is_job_runnable(job):
+        return job.get("enabled", True) and job.get("state") != "paused" and not job.get("paused_at")
     """
 )
 

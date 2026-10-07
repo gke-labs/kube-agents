@@ -155,10 +155,11 @@ class PlatformRunsTest(unittest.TestCase):
             (self.home / ".oobe_audits_fired").write_text(json.dumps(state))
 
     def test_a_fresh_installs_own_stage_holds_only_the_audit_it_marks_next(self):
-        # Not started yet: cost is next. Once cost has run, compliance is.
+        # Still waiting on its scan: nothing held. Under way: only the next audit.
         self._stage(armed=False)
+        self.assertEqual(self._wait(), "none going")
+        self._stage({"fired": [], "current": None, "at": 1}, armed=False)
         self.assertEqual(self._wait(), "still going after 0s, the run goes ahead: fleet-wide-cost-analysis (oobe stage, next)")
-        self.assertEqual(self._wait(audits=["compliance-audit"]), "none going")
         self._stage({"fired": ["fleet-wide-cost-analysis"], "current": None}, armed=False)
         self.assertEqual(self._wait(), "still going after 0s, the run goes ahead: compliance-audit (oobe stage, next)")
 
@@ -167,7 +168,7 @@ class PlatformRunsTest(unittest.TestCase):
         self.assertEqual(self._wait(), "still going after 0s, the run goes ahead: fleet-wide-cost-analysis (oobe stage, next)")
 
     def test_a_roster_whose_jobs_are_not_a_list_holds(self):
-        self._stage(armed=False)
+        self._stage({"fired": []}, armed=False)
         (self.home / "cron" / "jobs.json").write_text(json.dumps({"jobs": {"oobe": {}}}))
         self.assertIn("still going after 0s, the run goes ahead: unreadable", self._wait())
 
@@ -189,8 +190,8 @@ class PlatformRunsTest(unittest.TestCase):
         )
 
     def test_an_audit_the_stage_has_marked_and_left_no_longer_holds(self):
-        # Cost marked and seen running (current cleared), compliance held: only the two it
-        # has still to mark hold; cost's own run is the ledger's to report.
+        # Cost's run has ended (current cleared), compliance held: only the two it has still
+        # to mark hold.
         self._stage({"fired": ["fleet-wide-cost-analysis"], "held": {"compliance-audit": "disabled"}, "current": None})
         self.assertEqual(
             self._wait(),

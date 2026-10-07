@@ -72,7 +72,8 @@ FIRST_RUN_AUDITS = (
 )
 EXECUTIONS_DB = "executions.db"
 # A run row in either is still going; any other status has ended.
-IN_FLIGHT_STATUSES = ("claimed", "running")
+CLAIMED_STATUS = "claimed"
+IN_FLIGHT_STATUSES = (CLAIMED_STATUS, "running")
 # The cron store's skip ledger (deploy/docker/patches/cron_skip_ledger.py) writes a skipped row with
 # its reason. A mark skipped because the audit was already running is answered by that run; a skip
 # for any other reason (a shutdown, a lost claim) ran nothing and is read as no claim at all.
@@ -426,14 +427,15 @@ def advance_chain(data_dir: Path, state: dict, now: float) -> dict:
                 _log(f"giving up on {job_id}: never started after {MAX_TRIGGER_ATTEMPTS} marks; it runs on its own schedule")
                 gave_up.append(job_id)
             return save()
+        if job_id in audits_in_flight(runs, now) and (pending or status == CLAIMED_STATUS):
+            # Kept as the mark awaiting its run, until the run ends (the last audit: until it is
+            # running): a claim the store later closes as skipped for another reason then reads as
+            # never claimed and is marked again.
+            return save()
         if not pending:
             # The last audit has started, or a scheduled run of it was already going; nothing is
             # left to mark.
             return save(done=True)
-        if job_id in audits_in_flight(runs, now):
-            # Kept as the mark awaiting its run until the run ends: a claim the store later closes
-            # as skipped for another reason then reads as never claimed and is marked again.
-            return save()
         current = None
 
     busy = audits_in_flight(runs, now)

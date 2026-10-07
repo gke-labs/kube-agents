@@ -492,6 +492,31 @@ class StageTest(unittest.TestCase):
         self._main(now=NOW_SETTLED + oobe.START_LIMIT_SECONDS + MINUTE)
         self.assertEqual(self._started_ids(), FIRST * 2)
 
+    def test_the_last_audits_claim_later_closed_as_skipped_is_made_again(self):
+        # Done only once the last audit is running: a lost claim on it is marked again.
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        now = NOW_SETTLED
+        last = oobe.FIRST_RUN_AUDITS[-1]
+        while True:
+            self._main(now=now)
+            current = oobe.read_state(self.d).get(oobe.STATE_CURRENT)
+            if current and current[oobe.CURRENT_JOB] == last:
+                break
+            if current and current[oobe.CURRENT_MARKED_AT] == now:
+                self._ledger(current[oobe.CURRENT_JOB], "completed", now + MINUTE)
+            now += 2 * MINUTE
+        self._ledger(last, "claimed", now + MINUTE)
+        self._main(now=now + 2 * MINUTE)
+        self.assertFalse(oobe.read_state(self.d)[oobe.STATE_DONE])
+        self._ledger(last, "skipped", now + MINUTE, skip_reason="fire_claim_lost")
+        self._main(now=now + oobe.START_LIMIT_SECONDS)
+        self._main(now=now + oobe.START_LIMIT_SECONDS + MINUTE)
+        self.assertEqual(self._started_ids().count(last), 2)
+        self._ledger(last, "running", now + oobe.START_LIMIT_SECONDS + 2 * MINUTE)
+        self._main(now=now + oobe.START_LIMIT_SECONDS + 3 * MINUTE)
+        self.assertTrue(oobe.read_state(self.d)[oobe.STATE_DONE])
+
     def test_a_mark_claimed_late_is_not_made_again(self):
         # The scheduler claims the mark after the start limit counted it as never started.
         self._file_scan()
